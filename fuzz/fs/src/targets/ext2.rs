@@ -14,6 +14,7 @@ use crate::image::ext2::{self as img, Geometry, Style};
 use crate::machine::disk::{self, Media};
 use crate::model::{Data, Node};
 use crate::targets::fsops::{self, Fs, Limits, Model, NAME_MAX};
+use fs::vfs::{OPEN_CREATE, OPEN_WRITE};
 use crate::{reached, Input};
 
 /// When the images are made: before the kernel's wall clock starts.
@@ -82,11 +83,28 @@ pub fn geometry(r: &mut Input) -> Geometry {
     g
 }
 
-/// The biggest file the driver maps: past its double indirect block there
-/// is nothing, and ext2 without the large-file feature ends at 4 GiB.
+/// The biggest file a driver makes, as Linux's ext2 sets its `s_maxbytes`
+/// (`ext2_max_size`): what the tree maps, unless a file that size written
+/// whole would count more than i_blocks holds -- 2^32 - 1 units of 512
+/// bytes, its indirect blocks among them, as with blocks of 4 KiB -- and
+/// then that many blocks less those it takes to map them, counted as Linux
+/// counts them.
 pub fn max_file(bs: u64) -> u64 {
     let ppb = bs / 4;
-    ((12 + ppb + ppb * ppb) * bs).min(u32::MAX as u64)
+    let mapped = img::tree_blocks(bs);
+    let countable = u32::MAX as u64 / (bs / 512);
+    let meta = 1 + (1 + ppb) + (1 + ppb + ppb * ppb);
+    if mapped + meta <= countable {
+        return mapped * bs;
+    }
+    let rest = countable - 12 - ppb;
+    let meta = if rest < ppb * ppb {
+        2 + rest.div_ceil(ppb)
+    } else {
+        let rest = rest - ppb * ppb;
+        2 + ppb + 1 + rest.div_ceil(ppb) + rest.div_ceil(ppb * ppb)
+    };
+    (countable - meta) * bs
 }
 
 /// A name for the image's own tree: none the format forbids.
@@ -99,37 +117,113 @@ fn tree_name(r: &mut Input) -> Vec<u8> {
     }
 }
 
+/// Where a far file's size ends: past the double indirect block's tree, past
+/// 2 and 4 GiB, and at the end of what a file can be.
+fn far_edge(r: &mut Input, bs: u64) -> u64 {
+    let ppb = bs / 4;
+    let edge = r.pick(&[(12 + ppb + ppb * ppb) * bs, img::LARGE_FILE_SIZE, 1 << 32, max_file(bs)]);
+    (edge + r.below(3) - 1).min(max_file(bs))
+}
+
 /// What a file of the image's holds: nothing, a little, a block's worth
 /// either side of an edge -- the direct blocks' end, the indirect block's
-/// -- or a few pieces far apart, with holes between.
+/// -- or a few pieces far apart, with holes between; now and then far
+/// apart indeed, past every edge a size and a tree have.
 fn content(r: &mut Input, bs: u64, budget: &mut u64) -> Data {
     let ppb = bs / 4;
-    let len = match r.u8() % 8 {
+    let len = match r.u8() % 9 {
         0 => 0,
         1 => r.below(100),
         2 => bs + r.below(3) - 1,
         3 => 12 * bs + r.below(3) - 1,
         4 => (12 + ppb) * bs + r.below(3) - 1,
+        5 => far_edge(r, bs),
         _ => r.below(8 * bs),
     };
     let mut d = Data::new();
-    if r.u8() % 4 == 0 && len > 3 * bs {
-        /* Sparse: a few pieces, the rest holes. */
+    /* Past a few megabytes a file is sparse, or it would not fit */
+    if len > 1 << 22 || (r.u8() % 4 == 0 && len > 3 * bs) {
+        /* Sparse: a few pieces, the rest holes -- one of a far file's at
+         * its end. */
         for _ in 0..r.range(1, 4) {
             let at = r.below(len);
             let n = r.below(bs * 2).min(len - at);
             d.write(at, &crate::input::noise(r.u32(), n as usize));
         }
+        if len > 1 << 22 && r.bool() {
+            let n = r.below(bs * 2).min(len);
+            d.write(len - n, &crate::input::noise(r.u32(), n as usize));
+        }
         d.truncate(len);
     } else {
         d = Data::from(&crate::input::noise(r.u32(), len as usize));
     }
-    let blocks = d.nonzero_blocks(bs).len() as u64 + 2;
+    let data = d.nonzero_blocks(bs);
+    let blocks = data.len() as u64 + img::indirect_blocks(&data, bs) + 2;
     if blocks > *budget {
         return Data::new();
     }
     *budget -= blocks;
     d
+}
+
+/// A file written a chunk at a time until a write runs out of room -- part
+/// way, most often, having taken blocks past the file's end that it must
+/// give back -- held to the model as every write is. The kernel's size of
+/// it says when: no more than a device of `dev_bytes` holds.
+fn fill(f: &mut Fs, r: &mut Input, dev_bytes: u64) {
+    let i = f.model.open.len();
+    f.open(b"/fill", OPEN_WRITE | OPEN_CREATE);
+    if f.model.open.len() != i + 1 {
+        return;
+    }
+    let chunk = crate::input::noise(r.u32(), r.pick(&[16384usize, 65536]));
+    let h = f.model.open[i].0;
+    for _ in 0..dev_bytes / chunk.len() as u64 + 2 {
+        let size = f.vfs.size(h);
+        f.write(i, &chunk);
+        if f.vfs.size(h) < size + chunk.len() {
+            reached("a write ran out of room, filling the filesystem");
+            break;
+        }
+    }
+    f.close(i);
+}
+
+/// The blocks a tree's files take written whole, holes and all.
+fn dense_blocks(node: &Node, bs: u64) -> u64 {
+    match node {
+        Node::File(d) => d.len().div_ceil(bs),
+        Node::Dir(c) => c.values().map(|n| dense_blocks(n, bs)).sum(),
+    }
+}
+
+/// Whether the image's own tree had a file of 2 GiB or more, which has
+/// mkfs give the image large_file.
+fn made_large(node: &Node) -> bool {
+    match node {
+        Node::File(d) => d.len() >= img::LARGE_FILE_SIZE,
+        Node::Dir(c) => c.values().any(made_large),
+    }
+}
+
+/// What the files a run left reached of a size's words and of the tree.
+fn far_reached(node: &Node, bs: u64) {
+    match node {
+        Node::File(d) => {
+            if d.len() >= img::LARGE_FILE_SIZE {
+                reached("a file of 2 GiB or more, at the end");
+            }
+            if d.len() > u32::MAX as u64 {
+                reached("a file past 4 GiB, at the end");
+            }
+            let ppb = bs / 4;
+            if d.nonzero_blocks(bs).last().is_some_and(|b| *b >= 12 + ppb + ppb * ppb) {
+                reached("data under the triple indirect block, at the end");
+            }
+        }
+        Node::Dir(c) => c.values().for_each(|n| far_reached(n, bs)),
+    }
 }
 
 fn dir(r: &mut Input, depth: u32, bs: u64, budget: &mut u64, inodes: &mut u64) -> Node {
@@ -173,7 +267,11 @@ pub fn ext2(r: &mut Input) {
     let mut budget = data_blocks / 2;
     let mut inodes = (g.inodes() as u64).saturating_sub(img::FIRST_INO as u64 + 2) / 2;
     let tree = dir(r, 0, bs, &mut budget, &mut inodes);
-    let style = Style { holes: r.bool(), slack: r.bool(), scatter: r.pick(&[0, 0, 4, 16]) };
+    let mut style = Style { holes: r.bool(), slack: r.bool(), scatter: r.pick(&[0, 0, 4, 16]) };
+    /* A tree that does not fit written whole has its holes left holes */
+    if dense_blocks(&tree, bs) > data_blocks / 2 {
+        style.holes = true;
+    }
     let made = match img::mkfs(&g, &tree, &style, MKFS_TIME, r.u64()) {
         Ok(made) => made,
         Err(_) => return,
@@ -245,6 +343,13 @@ pub fn ext2(r: &mut Input) {
     let mut f = Fs { vfs, model: Model::new(want, read_only, Limits::fixed(max_file(bs), usize::MAX)),
                      strict: !faults };
 
+    /* Now and then the filesystem filled to its last block first, through a
+     * file of its own: the writes after it run out of room part way, which
+     * is what has a write give back what it took past the end of a file. */
+    if !read_only && f.strict && r.chance(6) {
+        fill(&mut f, r, dev_bytes);
+    }
+
     let mut ops = 0;
     while r.more() && ops < 200 {
         ops += 1;
@@ -286,6 +391,11 @@ pub fn ext2(r: &mut Input) {
     }
     invariant!(c.corrupt.is_empty(), "the image after a clean unmount is corrupt: {:?}", c.corrupt);
     invariant!(c.unclean.is_empty(), "the image after a clean unmount is not clean: {:?}", c.unclean);
+    far_reached(&f.model.tree, bs);
+    let ro_compat = img::rd32(&media.bytes(img::SB_OFFSET, 1024), img::sb::FEATURE_RO_COMPAT);
+    if !g.large_file && ro_compat & img::RO_COMPAT_LARGE_FILE != 0 && !made_large(&tree) {
+        reached("large_file set by the driver, for a file it made");
+    }
     if let Some(t) = &c.tree {
         if let Some(diff) = f.model.tree.diff(t) {
             panic!("invariant: the image after a clean unmount holds another tree than the model's: {}", diff);

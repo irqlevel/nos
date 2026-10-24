@@ -1,7 +1,7 @@
 //! The shell's storage commands -- what the console, the UDP shell and an
 //! SSH session run: `mount`, `umount`, `format`, `ls`, `cat`, `write`,
-//! `append`, `mkdir`, `touch`, `cp -r`, `rm`, `mv`, `stat`, `sync`,
-//! `fstest`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
+//! `append`, `mkdir`, `touch`, `cp -r`, `rm`, `mv`, `stat`, `truncate`,
+//! `sync`, `fstest`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
 //! with arguments of every kind, over a ramfs root and an ext2 and a nanofs
 //! on disks. First the kernel's own self-test on each filesystem, which
 //! must pass; then whatever the input types. And at the end, every disk no
@@ -31,6 +31,16 @@ fn size(r: &mut Input) -> String {
     r.pick(&["0", "1", "4K", "64K", "300K", "1M", "1025K", "abc", "99999999999999999999M", "-1", "4k"]).to_string()
 }
 
+/// What `truncate` is given: sizes a file may be cut or grown to, and ones
+/// that are no size -- past a word, not a number. None so big that a `cat`
+/// or a `cp` of the file after it would read gigabytes of holes (the far
+/// file of `fstest` is for those), nor that a ramfs would ask the host for:
+/// it gets terabytes there, untouched, until they are zeroed.
+fn truncate_size(r: &mut Input) -> String {
+    r.pick(&["0", "1", "100", "4095", "4K", "5000", "64K", "300K", "1M", "3M", "0G", "0T", "16777216T",
+             "99999999999999999999T", "x", "-1", "1Q", ""]).to_string()
+}
+
 fn text(r: &mut Input) -> String {
     let n = r.below(80) as usize;
     (0..n).map(|_| (b'a' + r.u8() % 26) as char).collect()
@@ -39,7 +49,8 @@ fn text(r: &mut Input) -> String {
 /// A command line of the shell's, arguments and all.
 fn line(r: &mut Input) -> String {
     let p = path(r);
-    match r.u8() % 22 {
+    match r.u8() % 23 {
+        21 => format!("truncate {} {}", p, truncate_size(r)),
         0 => format!("ls {}", p),
         1 => format!("cat {}", p),
         2 => format!("write {} {}", p, text(r)),

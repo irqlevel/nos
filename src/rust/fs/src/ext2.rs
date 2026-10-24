@@ -1,10 +1,11 @@
 //! ext2, read and write: the filesystem the kernel boots its root from.
 //!
 //! Rev 1 images with the filetype dirent feature, block sizes up to a page,
-//! direct, single- and double-indirect blocks. What it will not parse it
-//! refuses at mount rather than misreading -- ext3 and ext4 share ext2's
-//! magic, so the magic alone says little -- and what it could read but not
-//! safely write it mounts read-only.
+//! direct, single-, double- and triple-indirect blocks, and files past
+//! 4 GiB -- as big as Linux's ext2 makes them (`max_size`). What it will not
+//! parse it refuses at mount rather than misreading -- ext3 and ext4 share
+//! ext2's magic, so the magic alone says little -- and what it could read
+//! but not safely write it mounts read-only.
 //!
 //! Every call arrives with the VFS lock held (see `FsOps`), so there is no
 //! locking here: two calls never overlap on the same filesystem.
@@ -66,10 +67,12 @@ const INCOMPAT_SUPPORTED: u32 = INCOMPAT_FILETYPE;
 
 /* FeatureRoCompat bits this driver maintains when writing. SparseSuper only
  * changes where the backup superblocks are (this driver updates the primary
- * alone, as Linux does); LargeFile allows a 64-bit size, which is refused
- * rather than produced. Anything else -- gdt_csum with its group checksums
- * and uninitialised-group flags above all -- would be silently broken by a
- * write, so an image carrying it is mounted read-only. */
+ * alone, as Linux does); LargeFile lets a regular file's size be 64 bits,
+ * which this driver reads and writes -- and sets the bit itself when it
+ * makes the first file that needs it, as Linux does (`allow_size`).
+ * Anything else -- gdt_csum with its group checksums and uninitialised-group
+ * flags above all -- would be silently broken by a write, so an image
+ * carrying it is mounted read-only. */
 const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 const RO_COMPAT_WRITABLE: u32 = RO_COMPAT_SPARSE_SUPER | RO_COMPAT_LARGE_FILE;
@@ -86,8 +89,28 @@ const INODE_FLAG_INDEX: u32 = 0x0000_1000;
 const MAX_LOG_BLOCK_SIZE: u32 = 2;
 
 const DIRECT_BLOCKS: u32 = 12;
+/// The inode's slot for the single indirect block; the double and the
+/// triple one's are the next two
 const INDIRECT_SLOT: usize = 12;
-const DINDIRECT_SLOT: usize = 13;
+
+/// The levels of indirect block a file's tree has. A block of level 0 is
+/// an indirect block, whose entries point at data blocks; one of level 1 a
+/// double indirect block, pointing at blocks of level 0; one of level 2 a
+/// triple indirect block. The inode's slot for level `l` is
+/// `INDIRECT_SLOT + l`.
+const LEVELS: usize = 3;
+
+/// What an indirect block of each level is called, in a trace
+const LEVEL_NAMES: [&str; LEVELS] = ["indirect", "double indirect", "triple indirect"];
+
+/// A regular file this big or bigger needs large_file: a size past what a
+/// signed 32-bit word holds, which is where Linux and e2fsck draw the line.
+const LARGE_FILE_SIZE: u64 = 1 << 31;
+
+/* A file here can be past 4 GiB, and the VFS has sizes and offsets as
+ * usize: what a 64-bit word holds, which the kernel is on both
+ * architectures. */
+const _: () = assert!(usize::BITS >= 64);
 
 const SUPER_BLOCK_OFFSET: usize = 1024;
 const SUPER_BLOCK_SIZE: usize = 1024;
@@ -176,7 +199,9 @@ struct Inode {
     block: [u32; 15],
     generation: u32,
     file_acl: u32,
-    dir_acl: u32,
+    /// A regular file's size, its high 32 bits (i_size_high); a
+    /// directory's i_dir_acl, which nothing sets
+    size_high: u32,
     frag_addr: u32,
     osd2: [u8; 12],
 }
@@ -185,6 +210,23 @@ const _: () = assert!(core::mem::size_of::<Inode>() == INODE_SIZE);
 
 /* As the superblock: integers, and a size with no room for padding. */
 unsafe impl Pod for Inode {}
+
+/// A regular file's size, both of its words; anything else's -- a
+/// directory's -- the low word alone, as Linux reads one.
+fn size_of(inode: &Inode) -> u64 {
+    if inode.mode & MODE_TYPE_MASK == MODE_FILE {
+        u64::from(inode.size_high) << 32 | u64::from(inode.size)
+    } else {
+        u64::from(inode.size)
+    }
+}
+
+/// A file's size, into both of its words. Only a regular file's is set past
+/// 4 GiB; a directory's is set here only to 0, when it is removed.
+fn set_size(inode: &mut Inode, size: u64) {
+    inode.size = size as u32;
+    inode.size_high = (size >> 32) as u32;
+}
 
 /// What `probe` reads off an unmounted superblock: enough to pick a root
 /// filesystem by label or UUID.
@@ -330,8 +372,10 @@ impl Io {
     /// A block number read off the disk (an inode or indirect block pointer)
     /// must land inside the filesystem and past the boot block; anything else
     /// is corruption, and following it would read or overwrite metadata.
+    /// Block 0 is the boot block whatever the block size -- of 4 KiB blocks,
+    /// where the first data block is 0, it holds the superblock too.
     fn is_data_block(&self, block: u32) -> bool {
-        block >= self.first_data_block && block < self.block_count
+        block != 0 && block >= self.first_data_block && block < self.block_count
     }
 
     fn flush(&self) -> bool {
@@ -365,24 +409,15 @@ pub struct Ext2 {
      * superblock and the group descriptors; `itab` caches the inode table
      * block last used, so that a file written a piece at a time does not
      * read its inode back from the disk for every piece; `data` the data
-     * block read-modify-write and directory blocks; `ind` and `dind` cache
-     * the indirect and doubly-indirect block last used, so a sequential pass
-     * over a file does not re-read them per data block; `bitmap` holds the
-     * bitmap block being allocated from. */
+     * block read-modify-write and directory blocks; `ptrs` caches the
+     * indirect block of each level last used, so a sequential pass over a
+     * file does not re-read them per data block; `bitmap` holds the bitmap
+     * block being allocated from. */
     tmp: DmaBuffer,
     itab: DmaBuffer,
     itab_block: u32,
     data: DmaBuffer,
-    ind: DmaBuffer,
-    ind_block: u32,
-    dind: DmaBuffer,
-    dind_block: u32,
-    /// Pointers set in `ind` or `dind` that are not on disk yet: a write
-    /// that allocates fills them in and puts each block down once, after
-    /// the flush that puts what they point at on the medium first
-    /// (`retire_pointers`).
-    ind_dirty: bool,
-    dind_dirty: bool,
+    ptrs: [PtrCache; LEVELS],
     bitmap: DmaBuffer,
     bitmap_block: u32,
     bitmap_dirty: bool,
@@ -394,6 +429,32 @@ pub struct Ext2 {
     /// with the buffer, so that no read or write allocates.
     batch: DmaBuffer,
     pieces: Vec<Piece>,
+}
+
+/// The indirect block of one level a walk down a file's tree last went
+/// through, cached.
+struct PtrCache {
+    buf: DmaBuffer,
+    /// The block it holds; 0 for none
+    block: u32,
+    /// Pointers set in it that are not on disk yet: a write that allocates
+    /// fills them in and puts each block down once, after the flush that
+    /// puts what they point at on the medium first (`retire_pointers`).
+    dirty: bool,
+}
+
+impl PtrCache {
+    fn new() -> Option<PtrCache> {
+        Some(PtrCache { buf: DmaBuffer::new(1)?, block: 0, dirty: false })
+    }
+}
+
+/// Where a logical block of a file is mapped: in a slot of the inode's
+/// own, or in the tree under the indirect slot of `level` (`LEVELS`), at
+/// `rel` blocks from the first logical block that tree maps.
+enum Place {
+    Direct(usize),
+    Tree { level: usize, rel: u64 },
 }
 
 /// The data path's buffer: `BATCH_PAGES`, or the largest run of pages that
@@ -490,12 +551,7 @@ impl Ext2 {
             itab: DmaBuffer::new(1)?,
             itab_block: 0,
             data: DmaBuffer::new(1)?,
-            ind: DmaBuffer::new(1)?,
-            ind_block: 0,
-            dind: DmaBuffer::new(1)?,
-            dind_block: 0,
-            ind_dirty: false,
-            dind_dirty: false,
+            ptrs: [PtrCache::new()?, PtrCache::new()?, PtrCache::new()?],
             bitmap: DmaBuffer::new(1)?,
             bitmap_block: 0,
             bitmap_dirty: false,
@@ -842,10 +898,10 @@ impl Ext2 {
 
         self.gdt = Vec::new();
         self.itab_block = 0;
-        self.ind_block = 0;
-        self.dind_block = 0;
-        self.ind_dirty = false;
-        self.dind_dirty = false;
+        for cache in &mut self.ptrs {
+            cache.block = 0;
+            cache.dirty = false;
+        }
         self.bitmap_block = 0;
         self.bitmap_dirty = false;
         self.meta_dirty = false;
@@ -1022,6 +1078,42 @@ impl Ext2 {
         None
     }
 
+    /// Whether group `g` starts with a copy of the superblock and the group
+    /// descriptors: every group, or with sparse_super groups 0 and 1 and the
+    /// powers of 3, 5 and 7.
+    fn has_super(&self, g: u32) -> bool {
+        if self.sb.feature_ro_compat & RO_COMPAT_SPARSE_SUPER == 0 || g <= 1 {
+            return true;
+        }
+        [3u32, 5, 7].iter().any(|&base| {
+            let mut n = g;
+            while n % base == 0 {
+                n /= base;
+            }
+            n == 1
+        })
+    }
+
+    /// Whether `block` is the filesystem's own: the boot block, or in its
+    /// group a copy of the superblock and the descriptors, a bitmap or the
+    /// inode table -- what a damaged bitmap may have free, and an allocation
+    /// must never hand out: written over, the filesystem is gone.
+    fn is_metadata(&self, block: u32) -> bool {
+        if !self.io.is_data_block(block) {
+            return true;
+        }
+        let g = (block - self.sb.first_data_block) / self.sb.blocks_per_group;
+        let start = self.sb.first_data_block + g * self.sb.blocks_per_group;
+        if self.has_super(g) && u64::from(block) <= u64::from(start) + self.gdt_blocks as u64 {
+            return true;
+        }
+        let table = u64::from(self.gd_inode_table(g));
+        let table_blocks = (u64::from(self.sb.inodes_per_group) * self.inode_size as u64)
+            .div_ceil(self.block_size() as u64);
+        block == self.gd_block_bitmap(g) || block == self.gd_inode_bitmap(g)
+            || (u64::from(block) >= table && u64::from(block) < table + table_blocks)
+    }
+
     /// A free block, from `goal_group` if it has one (keeping a file near its
     /// inode), else from the first group that does. None when the disk is full.
     fn alloc_block(&mut self, goal_group: u32) -> Option<u32> {
@@ -1036,16 +1128,27 @@ impl Ext2 {
             }
 
             let count = self.blocks_in_group(g);
-            if let Some(idx) = self.free_bit_from(0, count) {
+            let mut from = 0;
+            while let Some(idx) = self.free_bit_from(from, count) {
                 let bs = self.block_size();
                 bit_set(&mut self.bitmap.as_mut_slice()[..bs], idx as usize);
                 self.bitmap_dirty = true;
-                self.allocations += 1;
                 let free = self.gd_free_blocks(g);
                 self.gd_set_free_blocks(g, free.saturating_sub(1));
                 self.sb.free_block_count = self.sb.free_block_count.saturating_sub(1);
                 self.meta_dirty = true;
-                return Some(self.sb.first_data_block + g * self.sb.blocks_per_group + idx);
+                let block = self.sb.first_data_block + g * self.sb.blocks_per_group + idx;
+                /* Free in a damaged bitmap, and the filesystem's own: kept in
+                 * use, as Linux keeps a block "in system zone", and the next
+                 * one looked for */
+                if self.is_metadata(block) {
+                    trace!(0, "ext2: block {} is the filesystem's own and was free in its bitmap: marked in use",
+                        block);
+                    from = idx + 1;
+                    continue;
+                }
+                self.allocations += 1;
+                return Some(block);
             }
 
             /* The descriptor's count and the bitmap disagree: trust the
@@ -1090,14 +1193,7 @@ impl Ext2 {
         /* A cached indirect block that is no longer one: whatever it held
          * that is not on disk is nobody's now, and written later it would
          * land in whatever the block is next. */
-        if self.ind_block == block {
-            self.ind_block = 0;
-            self.ind_dirty = false;
-        }
-        if self.dind_block == block {
-            self.dind_block = 0;
-            self.dind_dirty = false;
-        }
+        self.forget_ptrs(block);
         true
     }
 
@@ -1192,7 +1288,7 @@ impl Ext2 {
     /// marked in use, before anything on it does. Nothing to do, and no
     /// flush, when no pointer is waiting.
     fn retire_pointers(&mut self) -> bool {
-        if !self.ind_dirty && !self.dind_dirty {
+        if !self.ptrs.iter().any(|cache| cache.dirty) {
             return true;
         }
         if !self.flush_bitmap_as(false) || !self.io.flush() {
@@ -1205,136 +1301,169 @@ impl Ext2 {
     /// The cached indirect blocks with pointers not yet on disk, written
     /// plainly: the caller has flushed what they point at to the medium.
     fn write_pointers(&mut self) -> bool {
-        if self.ind_dirty {
-            if !self.write_ind(self.ind_block) {
-                return false;
+        for level in 0..LEVELS {
+            if self.ptrs[level].dirty {
+                if !self.write_ptrs(level) {
+                    return false;
+                }
+                self.ptrs[level].dirty = false;
             }
-            self.ind_dirty = false;
-        }
-        if self.dind_dirty {
-            if !self.write_dind(self.dind_block) {
-                return false;
-            }
-            self.dind_dirty = false;
         }
         true
     }
 
-    fn load_ind(&mut self, block: u32) -> bool {
-        if self.ind_block == block {
-            return true;
-        }
-        /* What the buffer holds that the disk does not goes down first. */
-        if !self.retire_pointers() {
-            return false;
-        }
-        if !self.io.read_block(block, self.ind.as_mut_slice()) {
-            trace!(0, "ext2: read of indirect block {} failed", block);
-            self.ind_block = 0;
-            return false;
-        }
-        self.ind_block = block;
-        true
-    }
-
-    fn load_dind(&mut self, block: u32) -> bool {
-        if self.dind_block == block {
+    /// The indirect block `block` into the cache of its level, unless it is
+    /// there already. What the caches hold that the disk does not goes down
+    /// first.
+    fn load_ptrs(&mut self, level: usize, block: u32) -> bool {
+        if self.ptrs[level].block == block {
             return true;
         }
         if !self.retire_pointers() {
             return false;
         }
-        if !self.io.read_block(block, self.dind.as_mut_slice()) {
-            trace!(0, "ext2: read of double indirect block {} failed", block);
-            self.dind_block = 0;
+        let cache = &mut self.ptrs[level];
+        cache.block = 0;
+        if !self.io.read_block(block, cache.buf.as_mut_slice()) {
+            trace!(0, "ext2: read of {} block {} failed", LEVEL_NAMES[level], block);
             return false;
         }
-        self.dind_block = block;
+        cache.block = block;
         true
     }
 
     /* Indirect blocks go down with a plain write. One with pointers an
-     * allocation set waits in its buffer, marked dirty, until the flush that
+     * allocation set waits in its cache, marked dirty, until the flush that
      * puts what they point at on the medium (`retire_pointers`); one freshly
      * allocated is written zeroed at once, so that whatever comes to point
      * at it finds no pointer it did not set. Every path that commits an
      * inode flushes the device first, so they are on disk before the inode
      * that leads to them. */
 
-    fn write_ind(&self, block: u32) -> bool {
-        if self.io.write_block(block, self.ind.as_slice(), false) {
+    fn write_ptrs(&self, level: usize) -> bool {
+        let cache = &self.ptrs[level];
+        /* A cache that holds no block has nothing to put anywhere: written,
+         * it would land on block 0 -- of 4 KiB blocks, the superblock's. */
+        assert!(cache.block != 0, "ext2: a write of an indirect block cache that holds no block");
+        if self.io.write_block(cache.block, cache.buf.as_slice(), false) {
             return true;
         }
-        trace!(0, "ext2: write of indirect block {} failed", block);
+        trace!(0, "ext2: write of {} block {} failed", LEVEL_NAMES[level], cache.block);
         false
     }
 
-    fn write_dind(&self, block: u32) -> bool {
-        if self.io.write_block(block, self.dind.as_slice(), false) {
-            return true;
+    fn ptr(&self, level: usize, index: u32) -> u32 {
+        rd_u32(self.ptrs[level].buf.as_slice(), index as usize * 4)
+    }
+
+    /// An entry an allocation sets: it waits in the cache for the flush that
+    /// puts what it points at on the medium first.
+    fn set_ptr(&mut self, level: usize, index: u32, v: u32) {
+        let cache = &mut self.ptrs[level];
+        wr_u32(cache.buf.as_mut_slice(), index as usize * 4, v);
+        cache.dirty = true;
+    }
+
+    /// An entry a release clears: the release puts the block down itself,
+    /// ahead of the flush that comes before its inode (`release_tail`).
+    fn clear_ptr(&mut self, level: usize, index: u32) {
+        wr_u32(self.ptrs[level].buf.as_mut_slice(), index as usize * 4, 0);
+    }
+
+    /// Forget `block` wherever it is cached, with whatever was waiting in
+    /// it: it is no indirect block any more.
+    fn forget_ptrs(&mut self, block: u32) {
+        for cache in &mut self.ptrs {
+            if cache.block == block {
+                cache.block = 0;
+                cache.dirty = false;
+            }
         }
-        trace!(0, "ext2: write of double indirect block {} failed", block);
-        false
     }
 
-    fn ind_ptr(&self, index: u32) -> u32 {
-        rd_u32(self.ind.as_slice(), index as usize * 4)
-    }
-
-    fn set_ind_ptr(&mut self, index: u32, v: u32) {
-        wr_u32(self.ind.as_mut_slice(), index as usize * 4, v);
-    }
-
-    fn dind_ptr(&self, index: u32) -> u32 {
-        rd_u32(self.dind.as_slice(), index as usize * 4)
-    }
-
-    fn set_dind_ptr(&mut self, index: u32, v: u32) {
-        wr_u32(self.dind.as_mut_slice(), index as usize * 4, v);
+    /// A fresh indirect block of `level`, zeroed in its cache and on disk,
+    /// for a level of the tree that was missing. What the caches have
+    /// waiting goes down first.
+    fn fresh_ptrs(&mut self, level: usize, goal_group: u32) -> Option<u32> {
+        if !self.retire_pointers() {
+            return None;
+        }
+        let block = self.alloc_block(goal_group)?;
+        let bs = self.block_size();
+        let cache = &mut self.ptrs[level];
+        cache.buf.as_mut_slice()[..bs].fill(0);
+        cache.block = block;
+        if !self.write_ptrs(level) {
+            return None;
+        }
+        Some(block)
     }
 
     fn block_units(&self) -> u32 {
         (self.block_size() / BLOCKS_UNIT as usize) as u32
     }
 
-    /// The biggest a file can be: what the direct, single- and
-    /// double-indirect blocks map -- this driver does not do the triple
-    /// indirect block -- and what a 32-bit size holds.
+    /// How many logical blocks an indirect block of `level` maps.
+    fn span(&self, level: usize) -> u64 {
+        u64::from(self.ptrs_per_block).pow(level as u32 + 1)
+    }
+
+    /// The first logical block the tree under the inode's indirect slot of
+    /// `level` maps; for `LEVELS`, the first that none does.
+    fn tree_start(&self, level: usize) -> u64 {
+        let mut start = u64::from(DIRECT_BLOCKS);
+        for below in 0..level {
+            start += self.span(below);
+        }
+        start
+    }
+
+    /// Where logical block `logical` is mapped; None past what the triple
+    /// indirect block maps.
+    fn place(&self, logical: u64) -> Option<Place> {
+        if logical < u64::from(DIRECT_BLOCKS) {
+            return Some(Place::Direct(logical as usize));
+        }
+        /* At each level past the first, the block is past the trees of the
+         * levels before it */
+        for level in 0..LEVELS {
+            let rel = logical - self.tree_start(level);
+            if rel < self.span(level) {
+                return Some(Place::Tree { level, rel });
+            }
+        }
+        None
+    }
+
+    /// The biggest a file can be, as Linux's ext2 has it (`ext2_max_size`):
+    /// what the direct blocks and the trees of every level map -- unless a
+    /// file that size written whole would count more blocks than its
+    /// i_blocks holds, 2^32 - 1 units of 512 bytes with the indirect blocks
+    /// among them, as one of 4 KiB blocks would. Then it is that many blocks,
+    /// less what it takes to map them.
     fn max_size(&self) -> u64 {
         let bs = self.block_size() as u64;
-        let ppb = self.ptrs_per_block as u64;
-        ((DIRECT_BLOCKS as u64 + ppb + ppb * ppb) * bs).min(u32::MAX as u64)
-    }
-
-    /// A fresh block, zeroed in the `ind` buffer and on disk, for an indirect
-    /// level that was missing. The buffer's last block goes down first if it
-    /// has pointers waiting.
-    fn fresh_ind(&mut self, goal_group: u32) -> Option<u32> {
-        if !self.retire_pointers() {
-            return None;
-        }
-        let block = self.alloc_block(goal_group)?;
-        let bs = self.block_size();
-        self.ind.as_mut_slice()[..bs].fill(0);
-        self.ind_block = block;
-        if !self.write_ind(block) {
-            return None;
-        }
-        Some(block)
-    }
-
-    fn fresh_dind(&mut self, goal_group: u32) -> Option<u32> {
-        if !self.retire_pointers() {
-            return None;
-        }
-        let block = self.alloc_block(goal_group)?;
-        let bs = self.block_size();
-        self.dind.as_mut_slice()[..bs].fill(0);
-        self.dind_block = block;
-        if !self.write_dind(block) {
-            return None;
-        }
-        Some(block)
+        let ppb = u64::from(self.ptrs_per_block);
+        let mapped = self.tree_start(LEVELS);
+        let countable = u64::from(u32::MAX) / u64::from(self.block_units());
+        /* The indirect blocks a file mapping all of it has */
+        let meta = 1 + (1 + ppb) + (1 + ppb + ppb * ppb);
+        let blocks = if mapped + meta <= countable {
+            mapped
+        } else {
+            /* Linux's count of them: the single indirect block; the double
+             * one and those under it; and the triple one and those under it,
+             * for the rest */
+            let rest = countable - u64::from(DIRECT_BLOCKS) - ppb;
+            let meta = if rest < ppb * ppb {
+                1 + 1 + rest.div_ceil(ppb)
+            } else {
+                let rest = rest - ppb * ppb;
+                1 + (1 + ppb) + 1 + rest.div_ceil(ppb) + rest.div_ceil(ppb * ppb)
+            };
+            countable - meta
+        };
+        blocks * bs
     }
 
     /// The physical block behind logical block `logical` of `inode`, and
@@ -1342,259 +1471,268 @@ impl Ext2 {
     /// a missing data block is allocated, and so is a missing indirect block
     /// on the way, zeroed on disk; without it a hole comes back as block 0.
     /// None means an I/O error or corruption: an on-disk pointer that points
-    /// outside the filesystem, or a file that needs the triple-indirect
-    /// block, which this driver does not do -- failing beats silently
-    /// answering with zeros for the block's data.
+    /// outside the filesystem, or a block past what the triple indirect
+    /// block maps -- failing beats silently answering with zeros for the
+    /// block's data.
     fn map_block(
         &mut self, inode: &mut Inode, goal_group: u32, logical: u32, allocate: bool,
     ) -> Option<(u32, bool)> {
         let units = self.block_units();
 
-        /* Direct blocks (0..11) */
-        if logical < DIRECT_BLOCKS {
-            let slot = inode.block[logical as usize];
-            if slot != 0 {
-                if !self.io.is_data_block(slot) {
-                    trace!(0, "ext2: direct block {} points outside the filesystem", slot);
-                    return None;
+        let (top, rel) = match self.place(u64::from(logical)) {
+            /* Direct blocks (0..11) */
+            Some(Place::Direct(slot)) => {
+                let b = inode.block[slot];
+                if b != 0 {
+                    if !self.io.is_data_block(b) {
+                        trace!(0, "ext2: direct block {} points outside the filesystem", b);
+                        return None;
+                    }
+                    return Some((b, false));
                 }
-                return Some((slot, false));
+                if !allocate {
+                    return Some((0, false));
+                }
+                let b = self.alloc_block(goal_group)?;
+                inode.block[slot] = b;
+                inode.blocks = inode.blocks.saturating_add(units);
+                return Some((b, true));
             }
+            Some(Place::Tree { level, rel }) => (level, rel),
+            None => {
+                trace!(0, "ext2: logical block {} is past what the triple indirect block maps", logical);
+                return None;
+            }
+        };
+
+        /* The top of the tree, in the inode */
+        let slot = INDIRECT_SLOT + top;
+        let mut block = inode.block[slot];
+        if block == 0 {
             if !allocate {
                 return Some((0, false));
             }
-
-            let b = self.alloc_block(goal_group)?;
-            inode.block[logical as usize] = b;
+            block = self.fresh_ptrs(top, goal_group)?;
+            inode.block[slot] = block;
             inode.blocks = inode.blocks.saturating_add(units);
-            return Some((b, true));
+        } else if !self.io.is_data_block(block) {
+            trace!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
+            return None;
         }
 
-        let ppb = self.ptrs_per_block;
-        let mut rel = logical - DIRECT_BLOCKS;
-        let ind_block;
-        let ind_index;
-
-        if rel < ppb {
-            /* Single indirect (12) */
-            ind_index = rel;
-            let existing = inode.block[INDIRECT_SLOT];
-            if existing == 0 {
-                if !allocate {
-                    return Some((0, false));
-                }
-                let b = self.fresh_ind(goal_group)?;
-                inode.block[INDIRECT_SLOT] = b;
-                inode.blocks = inode.blocks.saturating_add(units);
-                ind_block = b;
-            } else if !self.io.is_data_block(existing) {
-                trace!(0, "ext2: indirect block {} points outside the filesystem", existing);
+        /* Down it a level at a time: each level's block loaded, and its
+         * entry on the way to the logical block followed -- or, missing,
+         * made when allocating */
+        let ppb = u64::from(self.ptrs_per_block);
+        let mut level = top;
+        loop {
+            if !self.load_ptrs(level, block) {
                 return None;
-            } else {
-                ind_block = existing;
             }
-        } else if ((rel - ppb) as u64) < ppb as u64 * ppb as u64 {
-            /* Double indirect (13) */
-            rel -= ppb;
-            let l1_index = rel / ppb;
-            ind_index = rel % ppb;
+            let index = (rel / ppb.pow(level as u32) % ppb) as u32;
+            let next = self.ptr(level, index);
+            if next != 0 && !self.io.is_data_block(next) {
+                trace!(0, "ext2: block {} in {} block {} points outside the filesystem", next,
+                    LEVEL_NAMES[level], block);
+                return None;
+            }
 
-            let existing = inode.block[DINDIRECT_SLOT];
-            let dind_block = if existing == 0 {
+            if level == 0 {
+                if next != 0 {
+                    return Some((next, false));
+                }
                 if !allocate {
                     return Some((0, false));
                 }
-                let b = self.fresh_dind(goal_group)?;
-                inode.block[DINDIRECT_SLOT] = b;
+                let b = self.alloc_block(goal_group)?;
+                self.set_ptr(0, index, b);
+                inode.blocks = inode.blocks.saturating_add(units);
+                return Some((b, true));
+            }
+
+            block = if next != 0 {
+                next
+            } else if !allocate {
+                return Some((0, false));
+            } else {
+                /* This level's block stays loaded: `fresh_ptrs` puts down
+                 * what it has waiting, and keeps it. */
+                let b = self.fresh_ptrs(level - 1, goal_group)?;
+                self.set_ptr(level, index, b);
                 inode.blocks = inode.blocks.saturating_add(units);
                 b
-            } else if !self.io.is_data_block(existing) {
-                trace!(0, "ext2: double indirect block {} points outside the filesystem", existing);
-                return None;
-            } else {
-                existing
             };
-
-            if !self.load_dind(dind_block) {
-                return None;
-            }
-
-            let existing = self.dind_ptr(l1_index);
-            if existing == 0 {
-                if !allocate {
-                    return Some((0, false));
-                }
-                /* The double indirect block stays loaded: `fresh_ind` puts
-                 * down what it has waiting, and keeps it. */
-                let b = self.fresh_ind(goal_group)?;
-                self.set_dind_ptr(l1_index, b);
-                self.dind_dirty = true;
-                inode.blocks = inode.blocks.saturating_add(units);
-                ind_block = b;
-            } else if !self.io.is_data_block(existing) {
-                trace!(0, "ext2: indirect block {} points outside the filesystem", existing);
-                return None;
-            } else {
-                ind_block = existing;
-            }
-        } else {
-            trace!(0, "ext2: triple indirect is not supported (logical block {})", logical);
-            return None;
+            level -= 1;
         }
-
-        if !self.load_ind(ind_block) {
-            return None;
-        }
-
-        let slot = self.ind_ptr(ind_index);
-        if slot != 0 {
-            if !self.io.is_data_block(slot) {
-                trace!(0, "ext2: block {} points outside the filesystem", slot);
-                return None;
-            }
-            return Some((slot, false));
-        }
-        if !allocate {
-            return Some((0, false));
-        }
-
-        let b = self.alloc_block(goal_group)?;
-        self.set_ind_ptr(ind_index, b);
-        self.ind_dirty = true;
-        inode.blocks = inode.blocks.saturating_add(units);
-        Some((b, true))
     }
 
     /// Walk the file's blocks downward from `last_kept - 1` to `from_block`,
-    /// clearing each pointer and collecting the block for release, an
-    /// indirect block too once its last entry is gone. Stops when the batch
-    /// is full; `last_kept` says where to resume. Modified indirect blocks
-    /// are written before returning, so the inode the caller commits next
-    /// leads to a consistent tree.
+    /// clearing each pointer and collecting the block for release -- an
+    /// indirect block too, once the walk has come down to the first block it
+    /// maps, which leaves nothing in it. A missing indirect block is a run of
+    /// holes, stepped over whole: a sparse file of terabytes costs what it
+    /// has, not what it could have. Stops when the batch is full; `last_kept`
+    /// says where to resume. The indirect blocks it changed and keeps are
+    /// written before it returns, so the inode the caller commits next leads
+    /// to a consistent tree.
     fn release_tail(
         &mut self, inode: &mut Inode, from_block: u32, batch: &mut Vec<u32>, last_kept: &mut u32,
     ) -> bool {
+        /* What an allocation left waiting goes down now, in its own order,
+         * and not mixed in with what this writes */
+        if !self.retire_pointers() {
+            return false;
+        }
         let units = self.block_units();
-        let ppb = self.ptrs_per_block;
-        let mut ind_dirty = false;
-        let mut dind_dirty = false;
+        let ppb = u64::from(self.ptrs_per_block);
+        let from = u64::from(from_block);
+        let mut at = u64::from(*last_kept);
+        /* The cached indirect blocks this round cleared entries of, by level */
+        let mut changed = [false; LEVELS];
 
-        while *last_kept > from_block && batch.len() < FREE_BATCH {
-            let logical = *last_kept - 1;
-
-            if logical < DIRECT_BLOCKS {
-                let p = inode.block[logical as usize];
-                if p != 0 {
-                    batch.push(p);
-                    inode.block[logical as usize] = 0;
-                    inode.blocks = inode.blocks.saturating_sub(units);
+        /* Room for a data block, and an indirect block of each level that the
+         * walk can come down to the first block of with it */
+        while at > from && batch.len() + 1 + LEVELS <= FREE_BATCH {
+            let logical = at - 1;
+            let (top, rel) = match self.place(logical) {
+                Some(Place::Direct(slot)) => {
+                    let p = inode.block[slot];
+                    if p != 0 {
+                        batch.push(p);
+                        inode.block[slot] = 0;
+                        inode.blocks = inode.blocks.saturating_sub(units);
+                    }
+                    at = logical;
+                    continue;
                 }
-            } else if logical - DIRECT_BLOCKS < ppb {
-                let i = logical - DIRECT_BLOCKS;
-                let ind_block = inode.block[INDIRECT_SLOT];
-                if ind_block != 0 && self.io.is_data_block(ind_block) {
-                    if !self.load_ind(ind_block) {
-                        return false;
-                    }
-                    if self.ind_ptr(i) != 0 {
-                        batch.push(self.ind_ptr(i));
-                        self.set_ind_ptr(i, 0);
-                        ind_dirty = true;
-                        inode.blocks = inode.blocks.saturating_sub(units);
-                    }
-                    if i == 0 {
-                        /* Nothing is left behind this indirect block */
-                        if batch.len() >= FREE_BATCH {
-                            /* Batch full: keep the empty indirect block for
-                             * the next round rather than leak it */
-                            break;
-                        }
-                        batch.push(ind_block);
-                        inode.block[INDIRECT_SLOT] = 0;
-                        inode.blocks = inode.blocks.saturating_sub(units);
-                        self.ind_block = 0;
-                        ind_dirty = false;
-                    }
-                } else if ind_block != 0 {
-                    trace!(0, "ext2: indirect block {} points outside the filesystem, dropped",
-                        ind_block);
-                    inode.block[INDIRECT_SLOT] = 0;
+                Some(Place::Tree { level, rel }) => (level, rel),
+                /* Past what the trees map there is nothing to release */
+                None => {
+                    at = self.tree_start(LEVELS);
+                    continue;
                 }
-            } else if ((logical - DIRECT_BLOCKS - ppb) as u64) < ppb as u64 * ppb as u64 {
-                let rel = logical - DIRECT_BLOCKS - ppb;
-                let i1 = rel / ppb;
-                let i2 = rel % ppb;
-                let dind_block = inode.block[DINDIRECT_SLOT];
-                if dind_block != 0 && self.io.is_data_block(dind_block) {
-                    if !self.load_dind(dind_block) {
-                        return false;
-                    }
-                    let ind_block = self.dind_ptr(i1);
-                    if ind_block != 0 && self.io.is_data_block(ind_block) {
-                        if !self.load_ind(ind_block) {
-                            return false;
-                        }
-                        if self.ind_ptr(i2) != 0 {
-                            batch.push(self.ind_ptr(i2));
-                            self.set_ind_ptr(i2, 0);
-                            ind_dirty = true;
-                            inode.blocks = inode.blocks.saturating_sub(units);
-                        }
-                        if i2 == 0 {
-                            if batch.len() >= FREE_BATCH {
-                                break;
-                            }
-                            batch.push(ind_block);
-                            self.set_dind_ptr(i1, 0);
-                            dind_dirty = true;
-                            inode.blocks = inode.blocks.saturating_sub(units);
-                            self.ind_block = 0;
-                            ind_dirty = false;
-                        }
-                    } else if ind_block != 0 {
-                        trace!(0, "ext2: indirect block {} points outside the filesystem, dropped",
-                            ind_block);
-                        self.set_dind_ptr(i1, 0);
-                        dind_dirty = true;
-                    }
+            };
 
-                    if rel == 0 {
-                        if batch.len() >= FREE_BATCH {
-                            break;
-                        }
-                        batch.push(dind_block);
-                        inode.block[DINDIRECT_SLOT] = 0;
+            /* Down the tree to the logical block, noting each level's block
+             * and the first logical block it maps: to the data block, or to
+             * the first level missing, which is where a run of holes is */
+            let slot = INDIRECT_SLOT + top;
+            let mut block = inode.block[slot];
+            if block != 0 && !self.io.is_data_block(block) {
+                trace!(0, "ext2: {} block {} points outside the filesystem, dropped", LEVEL_NAMES[top], block);
+                inode.block[slot] = 0;
+                block = 0;
+            }
+            let mut first = self.tree_start(top);
+            if block == 0 {
+                at = first.max(from);
+                continue;
+            }
+
+            let mut path = [(0u32, 0u64); LEVELS];
+            let mut level = top;
+            loop {
+                path[level] = (block, first);
+                if !self.release_load(level, block, &mut changed) {
+                    return false;
+                }
+                let below = ppb.pow(level as u32);
+                let index = (rel / below % ppb) as u32;
+                let next = self.ptr(level, index);
+
+                if level == 0 {
+                    if next != 0 {
+                        batch.push(next);
+                        self.clear_ptr(0, index);
+                        changed[0] = true;
                         inode.blocks = inode.blocks.saturating_sub(units);
-                        self.dind_block = 0;
-                        dind_dirty = false;
                     }
-                } else if dind_block != 0 {
-                    trace!(0, "ext2: double indirect block {} points outside the filesystem, dropped",
-                        dind_block);
-                    inode.block[DINDIRECT_SLOT] = 0;
+                    at = logical;
+                    break;
+                }
+
+                let child_first = first + u64::from(index) * below;
+                let valid = next != 0 && self.io.is_data_block(next);
+                if next != 0 && !valid {
+                    trace!(0, "ext2: {} block {} points outside the filesystem, dropped",
+                        LEVEL_NAMES[level - 1], next);
+                    self.clear_ptr(level, index);
+                    changed[level] = true;
+                }
+                if !valid {
+                    /* A run of holes: all that the missing block would map */
+                    at = child_first.max(from);
+                    break;
+                }
+                block = next;
+                first = child_first;
+                level -= 1;
+            }
+
+            /* Each block on the way whose first logical block the walk has
+             * come down to has nothing left in it: it goes too, from the
+             * bottom up, and so does the entry that leads to it */
+            for l in level..=top {
+                let (b, first) = path[l];
+                if at != first {
+                    break;
+                }
+                batch.push(b);
+                if l == top {
+                    inode.block[slot] = 0;
+                } else {
+                    let index = ((first - path[l + 1].1) / self.span(l)) as u32;
+                    self.clear_ptr(l + 1, index);
+                    changed[l + 1] = true;
+                }
+                inode.blocks = inode.blocks.saturating_sub(units);
+                self.forget_ptrs(b);
+                /* A cache that holds nothing has nothing to put down */
+                for x in 0..LEVELS {
+                    if self.ptrs[x].block == 0 {
+                        changed[x] = false;
+                    }
                 }
             }
-            /* Past what this driver maps there is nothing to release */
-
-            *last_kept = logical;
         }
 
-        if ind_dirty && self.ind_block != 0 && !self.write_ind(self.ind_block) {
-            return false;
+        /* What this round changed in the blocks it keeps goes down ahead of
+         * the caller's flush, and the inode after it */
+        for level in 0..LEVELS {
+            if changed[level] && !self.write_ptrs(level) {
+                return false;
+            }
         }
-        if dind_dirty && self.dind_block != 0 && !self.write_dind(self.dind_block) {
-            return false;
-        }
+        *last_kept = at as u32;
         true
+    }
+
+    /// The indirect block `block` into the cache of its level for a release:
+    /// what the release changed in the block there before goes down first.
+    fn release_load(&mut self, level: usize, block: u32, changed: &mut [bool; LEVELS]) -> bool {
+        if self.ptrs[level].block != block && changed[level] {
+            if !self.write_ptrs(level) {
+                return false;
+            }
+            changed[level] = false;
+        }
+        self.load_ptrs(level, block)
     }
 
     /* ---- data ---- */
 
     fn read_inode_data(&mut self, inode: &Inode, buf: &mut [u8], offset: usize) -> bool {
-        let file_size = inode.size as usize;
-        if offset >= file_size {
+        let file_size = size_of(inode);
+        if offset as u64 >= file_size {
             return false;
         }
+        /* Past it a block's number would not fit the word that numbers
+         * them: no file of this filesystem's is that big */
+        if file_size > self.max_size() {
+            trace!(0, "ext2: a file of {} bytes is past what one can be here", file_size);
+            return false;
+        }
+        let file_size = file_size as usize;
 
         let bs = self.block_size();
         let len = buf.len().min(file_size - offset);
@@ -1660,11 +1798,13 @@ impl Ext2 {
     }
 
     /// Which pointer block leads to logical block `logical`: 0 for the
-    /// inode's own, 1 for the single indirect block, and 2 on for the double
-    /// indirect block's, one each. A batch of a write stays inside one: a
-    /// write that moves on to another indirect block puts the one it leaves
-    /// down after a flush (`retire_pointers`), and what that block points at
-    /// has to be on the disk by then -- written, not waiting in the batch.
+    /// inode's own, 1 for the single indirect block, and 2 on for the
+    /// indirect blocks under the double and the triple indirect blocks, one
+    /// each -- each maps the next run of a block's worth of pointers. A
+    /// batch of a write stays inside one: a write that moves on to another
+    /// indirect block puts the one it leaves down after a flush
+    /// (`retire_pointers`), and what that block points at has to be on the
+    /// disk by then -- written, not waiting in the batch.
     fn pointer_block(&self, logical: u32) -> u64 {
         let logical = logical as u64;
         let direct = DIRECT_BLOCKS as u64;
@@ -1751,36 +1891,39 @@ impl Ext2 {
             }
         }
 
-        let end = offset + data.len();
-        if end > inode.size as usize {
-            inode.size = end as u32;
+        let end = offset as u64 + data.len() as u64;
+        if end > size_of(inode) {
+            set_size(inode, end);
         }
         inode.modify_time = wall_clock_secs() as u32;
         true
     }
 
-    /// Shrink (or grow, sparsely) an inode to `new_size`, releasing the
-    /// blocks past it in batches: each batch is cut off the tree, the inode
-    /// committed without it, and only then are its blocks freed in the
-    /// bitmap, so a crash leaks at most one batch to e2fsck and never leaves
-    /// a block both in use and free.
-    fn truncate_inode(&mut self, ino: u32, inode: &mut Inode, new_size: usize) -> bool {
-        if new_size as u64 > self.max_size() {
+    /// Cut an inode down to `new_size`, or grow it there sparsely. Cut, it
+    /// loses every block past the new end -- all its tree has there, past
+    /// its old size too, as Linux's truncate has it -- in batches: each batch
+    /// is cut off the tree, the inode committed without it, and only then
+    /// are its blocks freed in the bitmap, so a crash leaks at most one batch
+    /// to e2fsck and never leaves a block both in use and free.
+    fn truncate_inode(&mut self, ino: u32, inode: &mut Inode, new_size: u64) -> bool {
+        if new_size > self.max_size() {
             trace!(0, "ext2: size {} is too large", new_size);
             return false;
         }
 
         inode.modify_time = wall_clock_secs() as u32;
-        if new_size >= inode.size as usize {
+        let old_size = size_of(inode);
+        set_size(inode, new_size);
+        if new_size > old_size {
             /* Growth is a hole: reads see zeros, no block is spent */
-            inode.size = new_size as u32;
             return true;
         }
 
-        let bs = self.block_size();
-        let keep_blocks = ((new_size + bs - 1) / bs) as u32;
-        let mut last_kept = ((inode.size as usize + bs - 1) / bs) as u32;
-        inode.size = new_size as u32;
+        let bs = self.block_size() as u64;
+        let keep_blocks = new_size.div_ceil(bs) as u32;
+        /* From the end of what the tree maps, a run of holes stepped over
+         * whole: a block of 4 KiB numbers its trees within a 32-bit word */
+        let mut last_kept = self.tree_start(LEVELS).min(u64::from(u32::MAX)) as u32;
 
         let mut batch: Vec<u32> = Vec::new();
         if batch.try_reserve_exact(FREE_BATCH).is_err() {
@@ -1792,6 +1935,10 @@ impl Ext2 {
             batch.clear();
             if !self.release_tail(inode, keep_blocks, &mut batch, &mut last_kept) {
                 return false;
+            }
+            if batch.is_empty() {
+                /* Holes to the end: nothing to free, nor to commit for it */
+                break;
             }
 
             if !self.io.flush() || !self.write_inode(ino, inode) {
@@ -1805,7 +1952,7 @@ impl Ext2 {
 
         /* The kept tail block: zero what lies past the new end, or a later
          * write inside that block would leave old bytes in the gap */
-        let tail = new_size % bs;
+        let tail = (new_size % bs) as usize;
         if tail != 0 {
             let (phys, _) = match self.map_block(inode, 0, keep_blocks - 1, false) {
                 Some(mapped) => mapped,
@@ -1815,7 +1962,7 @@ impl Ext2 {
                 if !self.io.read_block(phys, self.data.as_mut_slice()) {
                     return false;
                 }
-                self.data.as_mut_slice()[tail..bs].fill(0);
+                self.data.as_mut_slice()[tail..bs as usize].fill(0);
                 if !self.io.write_block(phys, self.data.as_slice(), false) {
                     return false;
                 }
@@ -1998,9 +2145,10 @@ impl Ext2 {
                     let mode = child.mode & MODE_TYPE_MASK;
                     is_dir = mode == MODE_DIR;
                     is_file = mode == MODE_FILE;
-                    size = child.size as usize;
-                    if is_file && child.dir_acl != 0 {
-                        trace!(0, "ext2: inode {} is over 4 GiB, skipped", ino);
+                    size = size_of(&child);
+                    if is_file && size > self.max_size() {
+                        trace!(0, "ext2: inode {} is {} bytes, past what a file can be here, skipped", ino,
+                            size);
                         is_file = false;
                     }
                 }
@@ -2032,7 +2180,7 @@ impl Ext2 {
         }
 
         let kind = if is_dir { Kind::Dir } else { Kind::File };
-        self.new_vnode(Some(dir), name, kind, ino, size).is_some()
+        self.new_vnode(Some(dir), name, kind, ino, size as usize).is_some()
     }
 
     /// Put (ino, name) into `dir`: in the first slack big enough in a block
@@ -2104,7 +2252,12 @@ impl Ext2 {
             }
         }
 
-        /* No room: a new block holding this one entry */
+        /* No room: a new block holding this one entry -- while the size
+         * the directory is given, its low word alone, holds it */
+        let Some(grown) = dir_inode.size.checked_add(bs as u32) else {
+            trace!(0, "ext2: directory {} is as big as one can be", dir_ino);
+            return false;
+        };
         let (phys, _) = match self.map_block(dir_inode, goal_group, dir_blocks, true) {
             Some(mapped) => mapped,
             None => return false,
@@ -2118,7 +2271,7 @@ impl Ext2 {
             return false;
         }
 
-        dir_inode.size += bs as u32;
+        dir_inode.size = grown;
         true
     }
 
@@ -2313,6 +2466,9 @@ impl Ext2 {
             trace!(0, "ext2: inode {} is not a regular file", ino);
             return false;
         }
+        if !self.allow_size(end) {
+            return false;
+        }
 
         let before = inode;
         let allocations = self.allocations;
@@ -2344,18 +2500,20 @@ impl Ext2 {
 
         /* A write that failed part way -- the disk full, a block that would
          * not read -- may have allocated blocks past the file's end, which
-         * it never got to move. They go again, and the file keeps the size
-         * it had: nothing is left past it for e2fsck to find. */
-        if !ok && self.allocations != allocations && end > before.size as u64 {
-            inode.size = end as u32;
-            if !self.truncate_inode(ino, &mut inode, before.size as usize)
+         * it never got to move, and written past the end into the last
+         * block, what the batch held when it stopped short, allocating
+         * nothing for it. Both go again, and the file keeps the size it
+         * had: nothing is left past it for e2fsck to find, nor for the file
+         * to show once it grows over it. */
+        if !ok && end > size_of(&before) {
+            if !self.truncate_inode(ino, &mut inode, size_of(&before))
                 || !self.flush_bitmap() || !self.commit_meta()
             {
                 trace!(0, "ext2: the blocks a failed write took past the end of inode {} were not given back", ino);
             }
         }
 
-        self.tree[file].size = inode.size as usize;
+        self.tree[file].size = size_of(&inode) as usize;
         ok
     }
 
@@ -2385,6 +2543,17 @@ impl Ext2 {
             return false;
         }
 
+        /* Refused whole, as a write past the end is, before anything has
+         * changed */
+        let size = size as u64;
+        if size > self.max_size() {
+            trace!(0, "ext2: a size of {} is past what a file can be here", size);
+            return false;
+        }
+        if !self.allow_size(size) {
+            return false;
+        }
+
         let ok = self.truncate_inode(ino, &mut inode, size);
 
         if !self.io.flush() || !self.write_inode(ino, &inode) || !self.flush_bitmap()
@@ -2394,8 +2563,28 @@ impl Ext2 {
             return false;
         }
 
-        self.tree[file].size = inode.size as usize;
+        self.tree[file].size = size_of(&inode) as usize;
         ok
+    }
+
+    /// Ready the filesystem for a regular file of `size` bytes. One of 2 GiB
+    /// or more needs large_file, which Linux sets in the superblock when it
+    /// makes the first such file, and e2fsck wants of a filesystem that has
+    /// one; set here, the superblock is on the medium before this returns,
+    /// and so before any inode that needs it. False when it could not be
+    /// written: nothing may be made that big then.
+    fn allow_size(&mut self, size: u64) -> bool {
+        if size < LARGE_FILE_SIZE || self.sb.feature_ro_compat & RO_COMPAT_LARGE_FILE != 0 {
+            return true;
+        }
+        self.sb.feature_ro_compat |= RO_COMPAT_LARGE_FILE;
+        if self.write_super(true) {
+            trace!(0, "ext2: a file of 2 GiB or more: large_file set");
+            return true;
+        }
+        self.sb.feature_ro_compat &= !RO_COMPAT_LARGE_FILE;
+        trace!(0, "ext2: the superblock with large_file set could not be written");
+        false
     }
 
     /// The name a create is given, checked: empty and over-long ones are
@@ -2850,6 +3039,12 @@ impl FileSystem for Ext2 {
 
     fn sync(&mut self) -> bool {
         Ext2::sync(self)
+    }
+
+    /// A hole costs no block: a file is as big as its tree and its i_blocks
+    /// let it be.
+    fn sparse_max(&self) -> usize {
+        if self.mounted { self.max_size() as usize } else { 0 }
     }
 }
 

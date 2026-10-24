@@ -176,6 +176,14 @@ and then lets `e2fsck -fn` judge the image. The boot-time `fstest=on` checks
 that the driver reads back what it wrote; this checks the other half, that
 what is left on the disk is still a filesystem a checker calls clean.
 
+And files past 4 GiB. The image starts without `large_file`, which nos has
+to set itself; a file is grown by `truncate` to 5 GiB and a line appended at
+its end, another grown past 6 GiB and cut back to 1 MiB, and `fstest` runs
+its far file on the root. Then, besides e2fsck, debugfs reads them off the
+image: `large_file` set, the far file's size, its last block under the
+triple indirect block (`TIND`) and the line nos wrote there where `bmap`
+says it is, and the file cut back holding no block at all.
+
 It ends with a `poweroff`, which has to unmount the root, switch the machine
 off and get there with nothing panicked. Until `7908bf6` the arm64 halt
 faulted in the static destructors -- an exiting CPU left its one WFI -- and
@@ -864,7 +872,8 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   anywhere else;
 - `ext2` and `nanofs`: sound images mounted, read-only and not, and worked
   through the VFS -- opens with every flag, reads, writes and seeks at every
-  edge of a block and of the indirect blocks, truncates both ways, creates,
+  edge of a block and of the indirect blocks of every level, across 2 and
+  4 GiB and at the end of what a file can be, truncates both ways, creates,
   renames, removes, chains of directories forty deep -- each call's answer
   held to a model of the tree and the files open on it (`targets/fsops.rs`,
   the VFS's rules and the filesystem's limits written down), the tree read
@@ -872,9 +881,14 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   leaves clean and holding the model's tree, and mounted again, the same. A
   call the filesystem refused for want of room is held to having changed
   nothing -- a write to having left the file its size, a first part of the
-  new data in it at most. Every power cut is at worst unclean -- which is
-  what ext2's commit order and nanofs's copy-on-write promise -- and so is
-  a run in which requests failed;
+  new data in it at most -- and now and then the filesystem is filled to its
+  last block first, so that writes run out of room part way. Its images have
+  files past 4 GiB, sparse, under the triple indirect block, and filesystems
+  with `large_file` and without it, which the driver must set for the first
+  file of 2 GiB or more; the checker holds a large file without the flag,
+  and a size past what its tree maps, unclean, as e2fsck does. Every power
+  cut is at worst unclean -- which is what ext2's commit order and nanofs's
+  copy-on-write promise -- and so is a run in which requests failed;
 - `ext2bad` and `nanofsbad`: sound images with a few fields made what they
   must not be -- the superblock's geometry, a group's descriptor, an inode's
   mode, size, links and block pointers (outside, into the metadata, into
@@ -972,6 +986,34 @@ What it found on its first day, each fixed:
   256 reads of all 256 blocks; now once after a mount or a write;
 - `fstest / 1` underflowed the big file's patch offset -- a panic from any
   shell.
+
+And when ext2 learnt files past 4 GiB (the triple indirect block,
+`large_file`, a walk of a truncate that steps over holes), each fixed:
+
+- a write that ran out of room on the block after the last one wrote the
+  last block's tail past the end of the file -- the batch it stopped short
+  holds what was meant for it -- and, having allocated nothing, gave nothing
+  back: the file growing over that tail later showed the bytes of a write
+  that had failed, where it should read zeros. Found once the target filled
+  the filesystem first; a failed write that would have grown the file now
+  cuts it back to its size, which zeroes that tail;
+- a damaged bitmap that has the filesystem's own blocks free -- the boot
+  block, a copy of the superblock, a bitmap, the inode table -- had the
+  allocator hand them out, and the first indirect block made written over
+  the superblock. They are marked in use and stepped over now, as Linux's
+  ext2 does a block "in system zone";
+- and one in reading the code rather than by an input: a cached indirect
+  block freed by a truncate kept the flag that said pointers were waiting
+  in it, which a commit that failed at its flush leaves set, and the next
+  flush of the caches would have written it to block 0 -- with 4 KiB
+  blocks, the superblock. Freeing one forgets it whole now, a cache that
+  holds no block is never written, and an attempt is a panic naming it.
+
+A control run of each of five mistakes in the new code -- `large_file`
+never set, an empty triple indirect block kept, a size's high word not
+written, a run of holes stepped over a block too far, a truncate walked from
+the old size rather than the tree's end -- was found by the gate's own
+inputs, at the 31st, 16th, 3rd, 13th and 40th.
 
 What it leaves, known: after a device error in the middle of a create or a
 rename, the directory in memory may disagree with the one on disk until the

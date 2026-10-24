@@ -49,8 +49,8 @@ fi
 # Scratch disks: exercise virtio-blk (modern), virtio-scsi (legacy) and the
 # Rust NVMe/MSI-X path on every smoke boot. The virtio-blk one carries an
 # ext2 root filesystem (label nos, 1 KiB blocks so the boot-time fstest
-# reaches the double-indirect blocks), which root=auto mounts on / and
-# fstest=on exercises.
+# reaches the double-indirect blocks, and its far file the triple), which
+# root=auto mounts on / and fstest=on exercises.
 scripts/mkrootfs.sh "$TMPDIR_SMOKE/root.img" 64 "" 1024 > /dev/null \
     || fail "cannot make the root filesystem image"
 qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/scsi0.qcow2" 256M
@@ -82,10 +82,12 @@ QEMU_PID=$!
 #   "After test"                    - Test::Test() self-tests passed (early boot, BSP)
 #   "Preempt is now on"             - SMP bringup + scheduler alive
 #   "MountRootFs: mounted ext2 on /" - the root image was found and mounted rw
+#   "a sparse file past 4 GiB"      - and took ext2 past 2 and 4 GiB, into the
+#                                     triple indirect block's tree
 #   "fstest: passed"                - the filesystem self-test ran on it
 #   "boot: complete"                - shells started, kernel reached the idle loop
-MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext2 on /" "fstest: passed"
-         "EntropySource registered: rng0" "EntropySource registered: rng1" "boot: complete")
+MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext2 on /" "a sparse file past 4 GiB"
+         "fstest: passed" "EntropySource registered: rng0" "EntropySource registered: rng1" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do

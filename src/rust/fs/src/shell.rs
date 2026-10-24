@@ -299,6 +299,28 @@ pub fn stat(args: &str, out: &mut Output) {
     }
 }
 
+/// Cut a file to a size, or grow it there with a hole -- a guest's disk
+/// image made blank, of any size the filesystem holds. A file that is not
+/// there is made first, as truncate(1) makes one.
+pub fn truncate(args: &str, out: &mut Output) {
+    let mut tokens = args_of(args);
+    let (path, size) = match (tokens.next(), tokens.next().and_then(parse_bytes)) {
+        (Some(path), Some(size)) => (path, size),
+        _ => { let _ = writeln!(out, "usage: truncate <path> <size[K|M|G|T]>"); return; }
+    };
+
+    let vfs = match vfs_instance() { Some(vfs) => vfs, None => return };
+    if stat_of(path).is_none() && !vfs.create(path.as_bytes(), false) {
+        let _ = writeln!(out, "truncate failed");
+        return;
+    }
+    if vfs.truncate(path.as_bytes(), size) {
+        let _ = writeln!(out, "{}: {} bytes", path, size);
+    } else {
+        let _ = writeln!(out, "truncate failed");
+    }
+}
+
 pub fn sync(_args: &str, out: &mut Output) {
     match vfs_instance() {
         Some(vfs) if vfs.sync() => { let _ = writeln!(out, "synced"); }
@@ -469,15 +491,23 @@ pub fn cp(args: &str, out: &mut Output) {
 const DEFAULT_BIG_SIZE: usize = 300 * 1024;
 const MAX_BIG_SIZE: usize = 1024 * 1024 * 1024;
 
-/// A count with an optional K or M suffix, as the shell has always taken it.
-fn parse_size(text: &str) -> Option<usize> {
-    let (digits, mult) = match text.as_bytes().last() {
-        Some(b'K') | Some(b'k') => (&text[..text.len() - 1], 1024),
-        Some(b'M') | Some(b'm') => (&text[..text.len() - 1], 1024 * 1024),
-        _ => (text, 1),
+/// A count of bytes with an optional K, M, G or T suffix, each 1024 times
+/// the one before.
+fn parse_bytes(text: &str) -> Option<usize> {
+    let (digits, shift) = match text.as_bytes().last() {
+        Some(b'K') | Some(b'k') => (&text[..text.len() - 1], 10),
+        Some(b'M') | Some(b'm') => (&text[..text.len() - 1], 20),
+        Some(b'G') | Some(b'g') => (&text[..text.len() - 1], 30),
+        Some(b'T') | Some(b't') => (&text[..text.len() - 1], 40),
+        _ => (text, 0),
     };
-    let size: usize = digits.parse().ok()?;
-    let size = size.checked_mul(mult)?;
+    let count: usize = digits.parse().ok()?;
+    count.checked_mul(1 << shift)
+}
+
+/// The big file's size: a count with a suffix, inside what the test takes.
+fn parse_size(text: &str) -> Option<usize> {
+    let size = parse_bytes(text)?;
     if !(crate::selftest::MIN_BIG_SIZE..=MAX_BIG_SIZE).contains(&size) { None } else { Some(size) }
 }
 
@@ -520,6 +550,7 @@ pub fn register_all() {
         ("append", "append <path> <text> - append text to file", append),
         ("mv", "mv <old> <new> - rename or move a file or directory", mv),
         ("stat", "stat <path> - show type, size and inode", stat),
+        ("truncate", "truncate <path> <size> - cut a file to size, or grow it there sparsely", truncate),
         ("sync", "sync - flush filesystems to disk", sync),
         ("fstest", "fstest [dir] [size] - filesystem self-test", fstest),
     ];

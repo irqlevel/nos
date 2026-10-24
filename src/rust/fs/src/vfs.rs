@@ -87,6 +87,14 @@ pub trait FileSystem: Send {
     fn sync(&mut self) -> bool {
         true
     }
+
+    /// The biggest a file here can be while it costs only what is written
+    /// of it, its holes nothing: how far past its end a test may write
+    /// (`selftest`). 0 where a file's whole size is paid for -- in memory,
+    /// or in blocks of its own.
+    fn sparse_max(&self) -> usize {
+        0
+    }
 }
 
 /// What `stat` answers.
@@ -975,6 +983,16 @@ impl Vfs {
     pub fn truncate(&self, path: &[u8], size: usize) -> bool {
         let mut inner = self.inner.lock();
         Self::truncate_locked(&mut inner, path, size).is_some()
+    }
+
+    /// `FileSystem::sparse_max` of the filesystem `path` is on: 0 when no
+    /// mount holds it.
+    pub fn sparse_max(&self, path: &[u8]) -> usize {
+        let inner = self.inner.lock();
+        match Self::find_mount(&inner, path) {
+            Some((index, _)) => inner.mounts[index].as_ref().map_or(0, |mount| mount.fs.sparse_max()),
+            None => 0,
+        }
     }
 
     fn truncate_locked(inner: &mut Inner, path: &[u8], size: usize) -> Option<()> {
