@@ -1,0 +1,15 @@
+[package]
+name = "hvboot"
+version = "0.1.0"
+edition = "2021"
+description = "The loader a guest of nos's hypervisor is started in by PVH: it boots the kernel its own disk's GRUB would"
+
+# A staticlib, linked by the Makefile with hvboot.ld into the PVH ELF hv
+# loads -- built on its own, as a module is, with flags of its own (the
+# Makefile's hvboot rule): static, the small code model, nothing of the
+# kernel's.
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]

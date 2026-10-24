@@ -208,6 +208,50 @@ pub fn real_mode(s: &mut vmcb::Save, vector: u8, efer: u64) {
     s.g_pat = PAT_RESET;
 }
 
+/// What a PVH image starts from (`crate::pvh`): its 32-bit entry.
+pub struct ProtectedMode {
+    pub entry: u32,
+}
+
+/* The PVH entry's segment selectors, which the ABI leaves unspecified: a
+ * boot GDT's usual code and data slots, should the image look. Its TSS is
+ * the 32-bit kind, 0x68 bytes at 0. */
+const PVH_CODE_SELECTOR: u16 = 0x10;
+const PVH_DATA_SELECTOR: u16 = 0x18;
+const PVH_TSS_LIMIT: u32 = 0x67;
+
+/// The state the PVH entry is started in, into `s`: what reset leaves, as
+/// [`real_mode`] puts it, but in 32-bit protected mode -- CS a flat 32-bit
+/// execute/read segment and the others flat read/write data, base 0 and a
+/// 4 GiB limit; a busy 32-bit TSS; CR0 with PE and ET alone, so paging off;
+/// interrupts off; and `RIP` at `p.entry`. `efer` as for `real_mode`.
+pub fn protected_mode(s: &mut vmcb::Save, p: &ProtectedMode, efer: u64) {
+    real_mode(s, 0, efer);
+    let flat = 0xFFFF_FFFF;
+    let code = Segment {
+        selector: PVH_CODE_SELECTOR,
+        attrib: attrib::P | attrib::S | attrib::CODE | attrib::WRITE_OR_READ | attrib::ACCESSED | attrib::DB
+            | attrib::G,
+        limit: flat,
+        base: 0,
+    };
+    let data = Segment {
+        selector: PVH_DATA_SELECTOR,
+        attrib: attrib::P | attrib::S | attrib::WRITE_OR_READ | attrib::ACCESSED | attrib::DB | attrib::G,
+        limit: flat,
+        base: 0,
+    };
+    s.cs = code;
+    s.ds = data;
+    s.es = data;
+    s.ss = data;
+    s.fs = data;
+    s.gs = data;
+    s.tr = Segment { attrib: attrib::P | attrib::TYPE_TSS64_BUSY, limit: PVH_TSS_LIMIT, ..Segment::default() };
+    s.cr0 = CR0_PE | CR0_ET;
+    s.rip = u64::from(p.entry);
+}
+
 /// The general-purpose registers out of reset: all 0 but EDX, which holds
 /// the processor's signature -- family, model and stepping, CPUID leaf 1's
 /// EAX -- as the guest's CPUID gives it.
@@ -440,6 +484,15 @@ impl Vcpu {
         s.rsp = l.stack;
         s.rax = 0;
         s.g_pat = PAT_RESET;
+    }
+
+    /// The PVH entry's state ([`protected_mode`]): the CR4 the guest
+    /// believes it has 0, as the ABI asks -- the VMCB's keeps MCE.
+    pub fn protected_mode(&mut self, p: &ProtectedMode) {
+        protected_mode(self.save_mut(), p, EFER_SVME);
+        self.cr4 = 0;
+        self.save_mut().cr4 = CR4_MCE;
+        *self.guest.debug_addrs_mut() = [0; 4];
     }
 
     /// Where INIT and then a start-up IPI with `vector` leave a CPU: real

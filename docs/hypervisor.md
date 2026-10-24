@@ -510,12 +510,13 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
-                                load a Linux bzImage and run it on a vCPU --
-                                on cpus of them, each on a host CPU of its
-                                own -- for secs, then print its console and
-                                how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+                                load a Linux bzImage -- or a PVH ELF, such as
+                                hvboot, which boots the guest's own kernel
+                                -- and run it on a vCPU -- on cpus of them,
+                                each on a host CPU of its own -- for secs,
+                                then print its console and how it ended
+    hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -2436,6 +2437,137 @@ gates](testing.md)): manual, since the images are downloads; `--internet`
 adds what needs the test machine's own way out, a name looked up and a
 mirror fetched from.
 
+## A guest's own kernel: PVH and hvboot
+
+A guest booted as above runs the kernel it was handed, at every restart
+again: its own `/boot` is never read, so a distribution's kernel updates
+are never booted, and its kernel and initrd have to be taken out of the
+image first. A guest booted by **hvboot** runs the kernel its own disk's
+GRUB would, as a cloud's does:
+
+```
+$ hv start /lib/hvboot mem=1024 disk=/vms/ubuntu/ubuntu.raw disk=/vms/ubuntu/seed.iso:ro net restart
+hv: vm 0 started on cpu 3 -- /lib/hvboot, 1024 MiB, 1 cpu, cmdline "console=ttyS0 nolapic ip=10.0.100.2::10.0.100.1:255.255.255.0:::off:10.0.2.3", restarted when it resets
+$ hv console 0
+hvboot: started by PVH: 1023 MiB of RAM, its command line "console=ttyS0 nolapic ip=10.0.100.2::10.0.100.1:255.255.255.0:::off:10.0.2.3 tsc_early_khz=1000019"
+hvboot: vda16/grub/grub.cfg: "Ubuntu", the default, 0
+hvboot: vda16/vmlinuz-6.8.0-147-generic: boot protocol 2.15, 14710 KiB at 0x1000000, initrd 29988 KiB at 0x3e2b6000, read in 497 ms
+hvboot: its command line: BOOT_IMAGE=/vmlinuz-6.8.0-147-generic root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0 console=ttyS0 nolapic ip=10.0.100.2::10.0.100.1:255.255.255.0:::off:10.0.2.3 tsc_early_khz=1000019
+[    0.000000] Linux version 6.8.0-147-generic (buildd@lcy02-amd64-...) ...
+```
+
+-- Ubuntu 24.04's cloud image as it ships, made raw, and its NoCloud seed:
+no kernel, initrd or command line taken out of it. hvboot is at the kernel
+0.6 s after the VM starts, under TCG; the guest at its login prompt 150 s
+in, as with its kernel taken out by hand (138 s), the rest of the boot
+being the guest's own. Debian 13's `nocloud` image boots the same way,
+hvboot at the kernel 0.6 s in and the login prompt 34 s in, its root
+found by the PARTUUID its own grub.cfg gives and its systemd credentials
+the VM's `cmdline=`, which goes after the entry's line. After `apt upgrade` installs a kernel and
+`update-grub` names it, the next boot -- a restart included, the VM being
+built again from its files -- boots that one.
+
+**PVH** (`hv::pvh`) is how hv starts it. `hv boot` and `hv start` take an
+ELF as well as a bzImage, and tell them apart by the file's first bytes:
+an ELF is booted by the x86/HVM direct boot ABI Xen made (its
+`docs/misc/pvh.pandoc`), which Linux's `vmlinux`, QEMU's `-kernel`, Cloud
+Hypervisor and the firmware written for them -- rust-hypervisor-firmware,
+OVMF's `CloudHv` -- speak. Its loadable segments go at their physical
+addresses; the entry is the one its `Xen` note of type 18
+(`XEN_ELFNOTE_PHYS32_ENTRY`) names; and hv lays out an `hvm_start_info`
+where a bzImage's zero page would be -- the command line (with what hv adds
+a bzImage's: the TSC's rate, `noapic`, `ip=`), the initrd as its one
+module, the ACPI RSDP, and the memory map, the same e820 a bzImage is given
+(`linux::e820_entries`, one list for both). A guest of several CPUs gets
+the same MP table. Its first CPU starts at the entry in 32-bit protected
+mode -- flat segments, paging and interrupts off, `EBX` at the start info:
+what reset leaves but for CR0's PE (`svm::protected_mode`, for both
+backends). Paging off takes unrestricted guest under VT-x, as a guest of
+several CPUs' real-mode start does already, and a start where the CPU has
+none is refused, saying so.
+
+The image is a file of nos's, and its headers are checked before anything
+in them is used: ELF32 or ELF64, at most 64 program headers and 4 KiB of
+notes read; a segment outside the file or outside the guest's RAM above the
+tables written below 1 MiB, two segments over the same bytes, an entry that
+is not in a segment's file bytes, or two entries -- each refused.
+`hv-fuzz.py`'s `pvh` target holds the reader to that over ELFs of either
+class made from its input, the start info to what the guest was given --
+its magic, its one module, a memory map of RAM up to the guest's last byte
+in order -- and the entry to paging off. hv's unsafe count is still 4.
+
+**hvboot** (`src/rust/hvboot`, built by `make` and kept as `/lib/hvboot`
+in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
+the guest. It reads:
+
+- its start info: the memory map, the RSDP, and its command line --
+  `hvboot.entry=` (an entry by number, `N>M`, title or id, as GRUB's
+  `default` takes one), `hvboot.disk=N` (look on that disk alone) and
+  `hvboot.verbose` its own, every other word for the kernel (`start.rs`);
+- the guest's legacy virtio disks on PCI bus 0, a request at a time with
+  the interrupt never taken: each poll reads the ISR, a port, and the exit
+  that takes is where hv hands back what is done -- a request not answered
+  in 30 s is said, not waited on (`virtio.rs`);
+- each disk's partitions, from its GPT -- header and array each checked by
+  their CRC -- or an MBR, an XBOOTLDR partition (a /boot of its own, as
+  Ubuntu's) first, and a disk with no table looked at whole (`gpt.rs`);
+- ext2, ext3 and ext4, read-only: extents and block maps, 64-bit
+  descriptors, flex_bg, htree directories read as the linear ones they
+  also are, inline data, symlinks, holes; an incompatible feature it does
+  not read is refused by name, and the journal is not replayed, as GRUB
+  does not replay it (`ext.rs`);
+- the first `/boot/grub/grub.cfg` or `/grub/grub.cfg` (or grub2's) on
+  them, and grubenv beside it: the menu, submenus too, each entry's `linux`,
+  `initrd` and the `search` or `set root` naming its filesystem -- by UUID,
+  label, file or `hdN,gptM` -- and the default, grubenv's `next_entry` and
+  `saved_entry` where the script defers to them, as grub-mkconfig's does.
+  It is not GRUB's interpreter: it reads the script's words as GRUB does --
+  quotes, escapes, comments, variables -- and its blocks, but runs no
+  condition; every branch of an `if` is read, the last `search` and `linux`
+  an entry has win, and a variable has a value only where a `set` outside a
+  condition gives it one. What it cannot place it says (`grub.rs`).
+
+It loads the kernel at its `pref_address` and the initrds high, one after
+another at GRUB's 4-byte alignment, into RAM the memory map has, clear of
+itself; builds the zero page -- the start info's memory map as its e820,
+the RSDP -- and the command line GRUB would give, `BOOT_IMAGE=` first, then
+its own line's words after the entry's; resets the disks; and enters the
+kernel's 64-bit entry, as hv enters a bzImage (`bzimage.rs`, `boot.rs`).
+Whatever it cannot do it says on the console and turns the guest off through
+its ACPI -- the VM stops with "the guest powered itself off", the reason in
+its console, rather than sitting halted with nothing said; a fault in it is
+said too, with where it happened.
+
+It runs in the guest, and what it reads is the guest's own: a bug in it is
+the guest's, not nos's, and the host's half of this is the PVH loader
+above. Its parsers -- `gpt`, `ext`, `grub`, `bzimage` -- are plain Rust over
+byte slices with no `unsafe`; its 29 unsafe sites are the platform's, in
+ports, physical memory, the heap, the virtio rings, the IDT and the jump.
+The parsers are compiled for the host too (`fuzz/hvboot`): read off Ubuntu
+24.04's and Debian 13's images, the kernels and initrds come out byte for
+byte as `debugfs` reads them, and `scripts/hvboot-test.py` holds them to
+the entry GRUB would boot on disks it makes -- GPT, MBR and none; ext4,
+ext3, ext2 of 1 KiB blocks into the double indirect ones; a default, a
+`next_entry`, a `saved_entry` into a submenu -- and fuzzes each disk's
+metadata.
+
+What it does not do: boot what is not Linux -- Windows has no boot
+protocol of its own to be entered by, and needs firmware, which OVMF's
+`CloudHv` on the same PVH would be; read XFS or btrfs, so not a /boot of
+the RHEL family's, nor an LVM or LUKS one; read BLS entries (`blscfg`);
+or EFI -- the kernel is entered by the boot protocol, as hv enters a
+bzImage, and has no EFI runtime. And the image is still to be made raw: the
+disk is a file of nos's, as any guest's.
+
+The gates are `hv-fuzz.py` (the `pvh` target), `hv-test.py` (hvboot
+started by PVH with no disk: it reads the start info, says it has no disk
+and turns the guest off, on whichever backend the machine has),
+`hvboot-test.py` (host, in CI) and `hv-distro-test.py --ubuntu ...
+--debian ... --hvboot` (manual): the same checks as without, a guest
+provisioned, networked, rebooted -- hvboot run again -- and shut down, and
+two more: hvboot reached the kernel, and booted the entry the image's own
+grub.cfg makes its default.
+
 ## More than one CPU
 
 `cpus=N` on `hv boot` and `hv start` gives a guest N CPUs, up to 16. Each is
@@ -3913,10 +4045,10 @@ someone else's; then speed.
    that raises its own past 1500 loses those frames; MSI-X entries start
    unmasked, their table being zeroed guest memory; VT-x never loads the
    PDPTE fields, so a 32-bit PAE guest that turns paging on faults.
-4. **The guest's kernel is nos's file.** `hv start` boots the bzImage and
-   initrd it is given, at every restart again, so a distribution's own
-   kernel updates are never booted. A small loader that reads the guest
-   disk's `/boot` -- its BLS entries, or `grub.cfg` -- would close it.
+4. ~~**The guest's kernel is nos's file.**~~ A guest booted by hvboot
+   boots the kernel its own disk's `grub.cfg` names, at every restart
+   again ([A guest's own kernel](#a-guests-own-kernel-pvh-and-hvboot)); one
+   booted by its bzImage still boots that. BLS entries are not read yet.
 
 #### Speed
 

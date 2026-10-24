@@ -325,6 +325,12 @@ pub mod svm {
         pub tss_selector: u16,
         pub tss: u64,
     }
+
+    /// As svm.rs's: a PVH image's 32-bit entry.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct ProtectedMode {
+        pub entry: u32,
+    }
 }
 
 pub mod machine {
@@ -361,7 +367,7 @@ pub mod vm {
 
     use crate::machine::Machine;
     use crate::memory::GuestMemory;
-    use crate::svm::{Exit, Io, LongMode};
+    use crate::svm::{Exit, Io, LongMode, ProtectedMode};
     use crate::x86::svm::vmcb::{attrib, Save, Segment, Vmcb};
     use crate::x86::svm::{GuestRegs, Kick};
 
@@ -556,6 +562,43 @@ pub mod vm {
             s.rsp = l.stack;
             s.rflags = 2;
             self.cr4 = CR4_PAE | CR4_MCE;
+            self.debug_addrs = [0; 4];
+        }
+
+        /// As svm.rs's: the PVH entry -- flat 32-bit code and data, paging
+        /// off, the guest's CR4 0 and the register's MCE.
+        pub fn protected_mode(&mut self, p: &ProtectedMode) {
+            let flat = 0xFFFF_FFFF;
+            let code = Segment {
+                selector: 0x10,
+                attrib: attrib::P | attrib::S | attrib::CODE | attrib::WRITE_OR_READ | attrib::ACCESSED | attrib::DB
+                    | attrib::G,
+                limit: flat,
+                base: 0,
+            };
+            let data = Segment {
+                selector: 0x18,
+                attrib: attrib::P | attrib::S | attrib::WRITE_OR_READ | attrib::ACCESSED | attrib::DB | attrib::G,
+                limit: flat,
+                base: 0,
+            };
+            let s = &mut self.save;
+            s.cs = code;
+            s.ds = data;
+            s.es = data;
+            s.ss = data;
+            s.fs = data;
+            s.gs = data;
+            s.efer = 1 << 12;
+            s.cr0 = 0x11;
+            s.cr3 = 0;
+            s.cr4 = CR4_MCE;
+            s.dr6 = DR6_RESET;
+            s.dr7 = DR7_RESET;
+            s.rip = u64::from(p.entry);
+            s.rsp = 0;
+            s.rflags = 2;
+            self.cr4 = 0;
             self.debug_addrs = [0; 4];
         }
 

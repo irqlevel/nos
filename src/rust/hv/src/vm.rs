@@ -11,7 +11,7 @@ use hvarch::{Ext, Result};
 
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
-use crate::svm::{Exit, Io, LongMode};
+use crate::svm::{Exit, Io, LongMode, ProtectedMode};
 
 /// Why a guest was not entered.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +88,11 @@ impl Backend {
     }
     pub fn long_mode(&mut self, l: &LongMode) {
         match self { Backend::Svm(v) => v.long_mode(l), Backend::Vmx(v) => v.long_mode(l) }
+    }
+    /// The PVH entry's state (`crate::pvh`): 32-bit protected mode, paging
+    /// off -- under VT-x only with unrestricted guest ([`Self::runs_real_mode`]).
+    pub fn protected_mode(&mut self, p: &ProtectedMode) {
+        match self { Backend::Svm(v) => v.protected_mode(p), Backend::Vmx(v) => v.protected_mode(p) }
     }
     pub fn skip_io(&mut self, io: &Io) {
         match self { Backend::Svm(v) => v.skip_io(io), Backend::Vmx(v) => v.skip_io(io) }
