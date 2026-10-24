@@ -6,6 +6,13 @@
 //! state machine runs under that connection's lock alone; the blocking calls
 //! -- connect, accept, send, receive -- sleep in a task and look again.
 //!
+//! A connection buffers 8 KiB each way in its slot: enough for a shell, or a
+//! request and its answer, and all that a connection someone else opens is
+//! ever given. One this machine opens to fetch in bulk asks for more
+//! (`Receive::Bulk`) -- a receive buffer of up to 512 KiB from the heap, and
+//! its window scaled to match (RFC 7323) when the peer agrees: a transfer
+//! moves a window a round trip, and 8 KiB a round trip is 200 KiB/s at 40 ms.
+//!
 //! What is written down here rather than left to be rediscovered:
 //!
 //! - **Nothing traces or prints under a connection's lock.** A trace is
@@ -21,7 +28,27 @@
 //!   never advance anything, and the retransmit count would give up on a peer
 //!   that is merely slow to read -- a suspended ssh client -- as a dead one,
 //!   in under a minute. The persist timer probes instead.
+//! - **Nothing is allocated or freed under a lock.** A bulk buffer comes from
+//!   the heap before `connect` takes one, and goes back once the connection
+//!   is done with it: the timer takes it out under the locks and drops it
+//!   after them.
+//! - **The window offered never shrinks.** A scaled window is said in units
+//!   of two to the shift, rounded down; one unit of the buffer is kept spare,
+//!   so that the edge offered before can always be kept, rounded up, inside
+//!   it (`offer_window`).
+//! - **What arrives ahead of a hole is kept**, in the receive buffer where it
+//!   belongs, as up to `MAX_OOO` stretches, and taken in whole when the hole
+//!   fills. Dropped, one lost segment of a window of hundreds of kilobytes
+//!   would cost everything sent after it.
+//! - **A reset, a SYN or an acknowledgement a blind attacker could guess is
+//!   answered, not obeyed** (RFC 5961): a RST counts only at exactly
+//!   RCV.NXT, a SYN on a synchronized connection is answered with an ACK, and
+//!   so is an acknowledgement of nothing sent, or of what is older than the
+//!   peer's largest window. A window of 512 KiB is 64 times as easy to land
+//!   a guess in as one of 8 KiB.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::nic::Nic;
@@ -33,8 +60,23 @@ use crate::wire::{self, eth, ip, tcp as seg, Mac, ETH_HDR_LEN, ETH_TYPE_IP,
                   IP_HDR_LEN, IP_PROTO_TCP};
 
 pub const MAX_CONNECTIONS: usize = 64;
-pub const SEND_BUF: usize = 8192;
-pub const RECV_BUF: usize = 8192;
+/// What a slot buffers each way, in the slot itself.
+const RING_BUF: usize = 8192;
+pub const SEND_BUF: usize = RING_BUF;
+pub const RECV_BUF: usize = RING_BUF;
+
+/// A bulk connection's receive buffer: the first of these the heap has --
+/// the largest block the page allocator hands out (128 pages), then less.
+const BULK_SIZES: [usize; 3] = [512 * 1024, 256 * 1024, 128 * 1024];
+/// The most bulk buffers out at once, whoever asks: 4 MiB of heap.
+const MAX_BULK: usize = 8;
+/* Every one more than 16 bits say, so that its shift is never 0: a
+ * connection scales exactly when this end's shift is not 0. */
+const _: () = assert!(BULK_SIZES[BULK_SIZES.len() - 1] > u16::MAX as usize);
+
+/// The stretches of what arrived ahead of a hole that a connection keeps.
+/// Past that a segment ahead of one is dropped, as before there were any.
+const MAX_OOO: usize = 8;
 
 pub const DEFAULT_MSS: u16 = 536;
 pub const OUR_MSS: u16 = 1460;
@@ -49,7 +91,8 @@ const TIME_WAIT_MS: u64 = 60_000;
 const FIN_WAIT2_TIMEOUT_MS: u64 = 60_000;
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 const TIMER_PERIOD_MS: u64 = 200;
-/// The least time between two ACKs for segments from outside the window.
+/// The least time between two ACKs for segments from outside the window --
+/// and for the challenges RFC 5961 answers a guess with.
 const OOW_ACK_GAP_MS: u64 = 500;
 const DEFAULT_TTL: u8 = 64;
 
@@ -130,18 +173,99 @@ fn before_eq(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) <= 0
 }
 
+/* ---- what a connection may take in ---- */
+
+/// How much a connection may take in before its program reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Receive {
+    /// The slot's own 8 KiB, the window unscaled: what a connection that
+    /// talks rather than fetches -- a shell, a request and its answer --
+    /// needs.
+    Small,
+    /// A buffer from the heap, as big as one comes (`BULK_SIZES`), and the
+    /// window scaled to it when the peer agrees: a download. The slot's own
+    /// when the heap has none to give, or `MAX_BULK` are out already.
+    Bulk,
+}
+
+/// How many bulk buffers are out.
+static BULK_OUT: AtomicUsize = AtomicUsize::new(0);
+
+/// A bulk connection's receive buffer: counted while it lives, so that no
+/// more than `MAX_BULK` are ever out, and dropped only where no lock is
+/// held.
+struct BulkBuf(Box<[u8]>);
+
+impl BulkBuf {
+    /// The largest of `BULK_SIZES` the heap has -- none once `MAX_BULK` are
+    /// out. Allocates: no lock may be held.
+    fn new() -> Option<BulkBuf> {
+        /* Counted before it is taken: two connects at once cannot both have
+         * the last one. */
+        if BULK_OUT.fetch_add(1, Ordering::AcqRel) >= MAX_BULK {
+            BULK_OUT.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        for size in BULK_SIZES {
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(size).is_ok() {
+                bytes.resize(size, 0);
+                return Some(BulkBuf(bytes.into_boxed_slice()));
+            }
+        }
+        BULK_OUT.fetch_sub(1, Ordering::AcqRel);
+        None
+    }
+}
+
+impl Drop for BulkBuf {
+    fn drop(&mut self) {
+        BULK_OUT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The least shift that says a window as big as `size` in the 16 bits a
+/// segment has for one.
+fn wscale_for(size: usize) -> u8 {
+    let mut shift = 0;
+    while size >> shift > u16::MAX as usize && shift < seg::MAX_WSCALE {
+        shift += 1;
+    }
+    shift
+}
+
 /* ---- the byte ring a connection buffers with ---- */
 
+/// What a connection holds one way. `head` and `tail` only grow: what is
+/// buffered lies between them, at their remainders by the size, and the
+/// free space after the tail.
 struct Ring {
-    data: [u8; SEND_BUF],
+    /// The slot's own bytes
+    data: [u8; RING_BUF],
+    /// A bulk connection's, in their place
+    bulk: Option<BulkBuf>,
     head: usize,
     tail: usize,
     size: usize,
 }
 
 impl Ring {
-    const fn new(size: usize) -> Ring {
-        Ring { data: [0; SEND_BUF], head: 0, tail: 0, size }
+    const fn new() -> Ring {
+        Ring { data: [0; RING_BUF], bulk: None, head: 0, tail: 0, size: RING_BUF }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.bulk {
+            Some(bulk) => &bulk.0,
+            None => &self.data,
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.bulk {
+            Some(bulk) => &mut bulk.0,
+            None => &mut self.data,
+        }
     }
 
     fn used(&self) -> usize {
@@ -152,23 +276,35 @@ impl Ring {
         self.size - self.used()
     }
 
-    fn write(&mut self, src: &[u8]) -> usize {
-        let len = src.len().min(self.free());
-        for i in 0..len {
-            let at = (self.tail + i) % self.size;
-            self.data[at] = src[i];
+    /// As much of `src` as fits into the free space, from `offset` bytes
+    /// past the tail, with the tail left where it is: what arrived ahead of
+    /// a hole goes where it belongs. The bytes copied. Two copies at most,
+    /// either side of the wrap -- a byte at a time, each with a division,
+    /// was a CPU's worth at the rates a bulk buffer takes.
+    fn put(&mut self, offset: usize, src: &[u8]) -> usize {
+        let free = self.free();
+        if offset >= free {
+            return 0;
         }
-        self.tail += len;
+        let len = src.len().min(free - offset);
+        let size = self.size;
+        let at = (self.tail + offset) % size;
+        let first = len.min(size - at);
+        let bytes = self.bytes_mut();
+        bytes[at..at + first].copy_from_slice(&src[..first]);
+        bytes[..len - first].copy_from_slice(&src[first..len]);
         len
     }
 
-    fn read(&mut self, dst: &mut [u8]) -> usize {
-        let len = dst.len().min(self.used());
-        for i in 0..len {
-            let at = (self.head + i) % self.size;
-            dst[i] = self.data[at];
-        }
-        self.head += len;
+    /// `len` bytes past the tail, which `put` left there, made part of what
+    /// is buffered.
+    fn commit(&mut self, len: usize) {
+        self.tail += len.min(self.free());
+    }
+
+    fn write(&mut self, src: &[u8]) -> usize {
+        let len = self.put(0, src);
+        self.tail += len;
         len
     }
 
@@ -179,10 +315,17 @@ impl Ring {
             return 0;
         }
         let len = dst.len().min(used - offset);
-        for i in 0..len {
-            let at = (self.head + offset + i) % self.size;
-            dst[i] = self.data[at];
-        }
+        let at = (self.head + offset) % self.size;
+        let first = len.min(self.size - at);
+        let bytes = self.bytes();
+        dst[..first].copy_from_slice(&bytes[at..at + first]);
+        dst[first..len].copy_from_slice(&bytes[..len - first]);
+        len
+    }
+
+    fn read(&mut self, dst: &mut [u8]) -> usize {
+        let len = self.peek(dst, 0);
+        self.head += len;
         len
     }
 
@@ -193,6 +336,23 @@ impl Ring {
     fn reset(&mut self) {
         self.head = 0;
         self.tail = 0;
+    }
+
+    /// A bulk buffer in place of the slot's own, for a connection being set
+    /// up: nothing is buffered yet.
+    fn attach(&mut self, bulk: BulkBuf) {
+        assert!(self.bulk.is_none() && self.used() == 0, "tcp: a bulk buffer onto a ring in use");
+        self.size = bulk.0.len();
+        self.bulk = Some(bulk);
+        self.reset();
+    }
+
+    /// The bulk buffer back, if there is one, for the caller to drop once no
+    /// lock is held -- and the slot's own in its place, empty.
+    fn detach(&mut self) -> Option<BulkBuf> {
+        self.size = RING_BUF;
+        self.reset();
+        self.bulk.take()
     }
 }
 
@@ -218,15 +378,35 @@ struct Inner {
     /// Its acknowledgement number
     snd_wl2: u32,
     rcv_nxt: u32,
+    /// What the receive buffer has free: how far past RCV.NXT a segment's
+    /// data may go and still be kept
     rcv_wnd: u32,
-    /// What our last outgoing segment advertised
+    /// What our last outgoing segment advertised, in bytes
     advertised_wnd: u32,
+    /// The right edge of the window last offered: no later offer falls
+    /// short of it
+    rcv_adv: u32,
     iss: u32,
     irs: u32,
     peer_mss: u16,
 
+    /// The shift each end applies to the windows it advertises, once both
+    /// SYNs said so (RFC 7323): this end's to what it offers, the peer's to
+    /// what it is offered. 0 on a connection that does not scale.
+    rcv_wscale: u8,
+    snd_wscale: u8,
+    /// The shift this end's SYN offers -- a bulk connection's -- if any
+    wscale_offer: Option<u8>,
+    /// The largest window the peer has offered: how far below SND.UNA an
+    /// acknowledgement may still be one of its (RFC 5961 5.2)
+    max_snd_wnd: u32,
+
     send_buf: Ring,
     recv_buf: Ring,
+    /// What arrived ahead of a hole: stretches of the stream [start, end),
+    /// in sequence numbers, each in the receive buffer where it belongs
+    ooo: [(u32, u32); MAX_OOO],
+    ooo_len: usize,
 
     rto_ms: u64,
     retransmit_at: u64,
@@ -256,10 +436,12 @@ impl Inner {
             nic: None, peer_mac: [0; 6],
             state: State::Free,
             snd_una: 0, snd_nxt: 0, snd_wnd: 0, snd_wl1: 0, snd_wl2: 0,
-            rcv_nxt: 0, rcv_wnd: RECV_BUF as u32, advertised_wnd: RECV_BUF as u32,
+            rcv_nxt: 0, rcv_wnd: RECV_BUF as u32, advertised_wnd: RECV_BUF as u32, rcv_adv: 0,
             iss: 0, irs: 0, peer_mss: DEFAULT_MSS,
-            send_buf: Ring::new(SEND_BUF),
-            recv_buf: Ring::new(RECV_BUF),
+            rcv_wscale: 0, snd_wscale: 0, wscale_offer: None, max_snd_wnd: 0,
+            send_buf: Ring::new(),
+            recv_buf: Ring::new(),
+            ooo: [(0, 0); MAX_OOO], ooo_len: 0,
             rto_ms: INITIAL_RTO_MS,
             retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
@@ -284,11 +466,20 @@ impl Inner {
         self.rcv_nxt = 0;
         self.rcv_wnd = RECV_BUF as u32;
         self.advertised_wnd = RECV_BUF as u32;
+        self.rcv_adv = 0;
         self.iss = 0;
         self.irs = 0;
         self.peer_mss = DEFAULT_MSS;
+        self.rcv_wscale = 0;
+        self.snd_wscale = 0;
+        self.wscale_offer = None;
+        self.max_snd_wnd = 0;
+        /* A bulk buffer goes back before its slot does, outside the locks
+         * this runs under: one still here would be dropped under them. */
+        assert!(self.recv_buf.bulk.is_none(), "tcp: a slot handed out again with its bulk buffer");
         self.send_buf.reset();
         self.recv_buf.reset();
+        self.ooo_len = 0;
         self.rto_ms = INITIAL_RTO_MS;
         self.retransmit_at = 0;
         self.retransmit_count = 0;
@@ -613,21 +804,39 @@ impl Tcp {
 impl Tcp {
     /// One segment of this connection. The caller holds its lock.
     ///
-    /// A SYN carries the maximum segment size option, which makes the header
-    /// 24 bytes instead of 20.
+    /// A SYN carries the maximum segment size option, and the window scale
+    /// when this end offers one: a header of 24 bytes, or 28, instead of 20.
     fn send_segment(&'static self, inner: &mut Inner, flags: u8, data: &[u8]) {
         let nic = match inner.nic {
             Some(nic) => nic,
             None => return,
         };
 
-        let with_mss = flags & seg::SYN != 0;
-        let hdr_len = if with_mss { 24 } else { seg::HDR_LEN };
+        let syn = flags & seg::SYN != 0;
+        let wscale = if syn { inner.wscale_offer } else { None };
+        let mut hdr_len = seg::HDR_LEN;
+        if syn {
+            hdr_len += seg::OPT_MSS_LEN as usize;
+        }
+        if wscale.is_some() {
+            /* A NOP before it keeps the header a whole number of words */
+            hdr_len += 1 + seg::OPT_WS_LEN as usize;
+        }
         let tcp_len = hdr_len + data.len();
         let frame_len = ETH_HDR_LEN + IP_HDR_LEN + tcp_len;
         if frame_len > MAX_FRAME {
             return;
         }
+
+        /* A SYN's window is never scaled (RFC 7323 2.2): it says what fits
+         * in 16 bits, and the scaling starts after it. */
+        let window = if syn {
+            let window = inner.rcv_wnd.min(u16::MAX as u32);
+            inner.advertised_wnd = window;
+            window as u16
+        } else {
+            offer_window(inner)
+        };
 
         let mut frame = [0u8; MAX_FRAME];
         eth::write(&mut frame, &inner.peer_mac, &nic.mac(), ETH_TYPE_IP);
@@ -638,13 +847,19 @@ impl Tcp {
 
         let at = ETH_HDR_LEN + IP_HDR_LEN;
         seg::write(&mut frame[at..], inner.local_port, inner.remote_port,
-            inner.snd_nxt, inner.rcv_nxt, hdr_len, flags, inner.rcv_wnd as u16);
+            inner.snd_nxt, inner.rcv_nxt, hdr_len, flags, window);
 
-        if with_mss {
+        if syn {
             let opt = at + seg::HDR_LEN;
             frame[opt] = seg::OPT_MSS;
             frame[opt + 1] = seg::OPT_MSS_LEN;
             frame[opt + 2..opt + 4].copy_from_slice(&OUR_MSS.to_be_bytes());
+            if let Some(shift) = wscale {
+                frame[opt + 4] = seg::OPT_NOP;
+                frame[opt + 5] = seg::OPT_WS;
+                frame[opt + 6] = seg::OPT_WS_LEN;
+                frame[opt + 7] = shift;
+            }
         }
         if !data.is_empty() {
             frame[at + hdr_len..at + tcp_len].copy_from_slice(data);
@@ -655,7 +870,6 @@ impl Tcp {
         wire::set_be16(&mut frame[at..], seg::CHECKSUM, sum);
 
         nic.send_raw(&frame[..frame_len]);
-        inner.advertised_wnd = inner.rcv_wnd;
         self.tx_segments.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -713,7 +927,8 @@ impl Tcp {
             && (before(inner.snd_una, ack) || before(inner.snd_wl1, segment_seq)
                 || (inner.snd_wl1 == segment_seq && before_eq(inner.snd_wl2, ack)))
         {
-            inner.snd_wnd = wnd as u32;
+            inner.snd_wnd = (wnd as u32) << inner.snd_wscale;
+            inner.max_snd_wnd = inner.max_snd_wnd.max(inner.snd_wnd);
             inner.snd_wl1 = segment_seq;
             inner.snd_wl2 = ack;
         }
@@ -736,21 +951,142 @@ impl Tcp {
         inner.retransmit_at = if inner.snd_una == inner.snd_nxt { 0 } else { now + inner.rto_ms };
     }
 
-    /// Payload in order into the receive buffer, and the acknowledgement it
-    /// requires -- a duplicate one when the segment was out of order. Shared
-    /// by ESTABLISHED and the FIN-WAIT states, because the peer may keep
-    /// sending after our FIN (RFC 793 half-close).
+    /// A segment's data into the receive buffer, and the acknowledgement it
+    /// requires. In order, it is taken -- and with it whatever had come
+    /// ahead of it and now joins up; ahead of a hole, it is kept where it
+    /// belongs for when the hole fills, and the acknowledgement is a
+    /// duplicate, which is what has the peer send the hole again (RFC 5681
+    /// 4.2). Shared by ESTABLISHED and the FIN-WAIT states, because the peer
+    /// may keep sending after our FIN (RFC 793 half-close).
     fn process_payload(&'static self, conn: &Conn, inner: &mut Inner, seq: u32,
         payload: &[u8])
     {
-        if seq == inner.rcv_nxt {
-            let written = inner.recv_buf.write(payload);
-            inner.rcv_nxt = inner.rcv_nxt.wrapping_add(written as u32);
+        let mut seq = seq;
+        let mut data = payload;
+
+        /* What was taken already -- a retransmission's start -- cut off */
+        if before(seq, inner.rcv_nxt) {
+            let taken = inner.rcv_nxt.wrapping_sub(seq) as usize;
+            data = &data[taken.min(data.len())..];
+            seq = inner.rcv_nxt;
+        }
+
+        if !data.is_empty() {
+            /* Not before RCV.NXT now, and in the window: a small number */
+            let offset = seq.wrapping_sub(inner.rcv_nxt) as usize;
+            if offset == 0 {
+                let written = inner.recv_buf.write(data);
+                inner.rcv_nxt = inner.rcv_nxt.wrapping_add(written as u32);
+                take_ooo(inner);
+                conn.data_ready.store(true, Ordering::Release);
+            } else {
+                let kept = inner.recv_buf.put(offset, data);
+                if kept != 0 {
+                    keep_ooo(inner, seq, seq.wrapping_add(kept as u32));
+                }
+            }
             inner.rcv_wnd = inner.recv_buf.free() as u32;
-            conn.data_ready.store(true, Ordering::Release);
         }
 
         self.send_ack(inner);
+    }
+
+    /// The acknowledgement RFC 5961 answers a guess with -- a reset or a
+    /// SYN in the window, an acknowledgement of nothing sent -- and RFC 9293
+    /// a segment from outside the window: it says where this end is, which
+    /// is news to a guess and a prompt to the real peer. At most one a half
+    /// second, as Linux limits these (tcp_invalid_ratelimit): two ends that
+    /// each find the other's segments outside their window -- both windows
+    /// shut, data outstanding both ways -- would otherwise answer each
+    /// other's answers for as long as they last.
+    fn challenge(&'static self, inner: &mut Inner, now: u64) {
+        if now >= inner.oow_ack_at.saturating_add(OOW_ACK_GAP_MS) {
+            inner.oow_ack_at = now;
+            self.send_ack(inner);
+        }
+    }
+}
+
+/// The window to advertise in a segment that is no SYN, as its field says
+/// it; and, kept, the right edge it offers. As much as the receive buffer
+/// has free, in units of two to this end's shift and rounded down -- and
+/// never short of the edge offered before: a window that shrinks takes back
+/// room the peer was promised (RFC 9293 3.8.6.2.2), and a peer with data in
+/// flight to it has it dropped. A scaled window keeps one unit of the buffer
+/// spare, which is what makes the old edge, rounded up to a unit, always fit:
+/// it was offered with a unit spare, and since then the window and the edge
+/// have come down together, or the window has grown.
+fn offer_window(inner: &mut Inner) -> u16 {
+    let shift = inner.rcv_wscale;
+    let unit = 1usize << shift;
+    let free = inner.recv_buf.free();
+    let room = if shift == 0 { free } else { free.saturating_sub(unit) };
+    let mut units = (room >> shift).min(u16::MAX as usize);
+
+    let owed = inner.rcv_adv.wrapping_sub(inner.rcv_nxt);
+    if (owed as i32) > 0 {
+        units = units.max((owed as usize).div_ceil(unit).min(u16::MAX as usize));
+    }
+
+    let window = (units << shift) as u32;
+    let edge = inner.rcv_nxt.wrapping_add(window);
+    if before(inner.rcv_adv, edge) {
+        inner.rcv_adv = edge;
+    }
+    inner.advertised_wnd = window;
+    units as u16
+}
+
+/// A stretch [start, end) of what arrived ahead of a hole, with the ones
+/// kept already: folded into every one it overlaps or touches, or, with no
+/// room left for another, not kept -- its bytes then lie in the buffer's
+/// free space uncounted, and come again.
+fn keep_ooo(inner: &mut Inner, start: u32, end: u32) {
+    let (mut start, mut end) = (start, end);
+    let mut i = 0;
+    while i < inner.ooo_len {
+        let (s, e) = inner.ooo[i];
+        if before_eq(s, end) && before_eq(start, e) {
+            if before(s, start) {
+                start = s;
+            }
+            if before(end, e) {
+                end = e;
+            }
+            inner.ooo_len -= 1;
+            inner.ooo[i] = inner.ooo[inner.ooo_len];
+        } else {
+            i += 1;
+        }
+    }
+    if inner.ooo_len < MAX_OOO {
+        inner.ooo[inner.ooo_len] = (start, end);
+        inner.ooo_len += 1;
+    }
+}
+
+/// What was kept ahead of a hole and starts at RCV.NXT, or before it, now:
+/// taken in as far as it goes -- its bytes are in the buffer already, where
+/// the stream has them -- and anything RCV.NXT has passed forgotten.
+fn take_ooo(inner: &mut Inner) {
+    let mut i = 0;
+    while i < inner.ooo_len {
+        let (s, e) = inner.ooo[i];
+        if before_eq(s, inner.rcv_nxt) {
+            if before(inner.rcv_nxt, e) {
+                /* Within the free space, where it was put: the buffer has
+                 * room for all of it, and is not trusted to. */
+                let len = (e.wrapping_sub(inner.rcv_nxt) as usize).min(inner.recv_buf.free());
+                inner.recv_buf.commit(len);
+                inner.rcv_nxt = inner.rcv_nxt.wrapping_add(len as u32);
+            }
+            inner.ooo_len -= 1;
+            inner.ooo[i] = inner.ooo[inner.ooo_len];
+            /* RCV.NXT moved: every stretch is looked at again */
+            i = 0;
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -793,17 +1129,23 @@ impl Tcp {
         let now = now_ms();
         let len = payload.len() as u32;
 
-        /* A reset is valid in every state but LISTEN, and only in window --
-         * without that check any host that can guess the four addresses
-         * could tear the connection down blind. */
+        /* A reset is valid in every state but LISTEN -- and then only at
+         * exactly RCV.NXT (RFC 5961 3.2). Anywhere else in the window it is
+         * answered: a peer that really reset answers that with a reset at
+         * the edge, and a host that only guessed the four addresses and a
+         * number in the window learns nothing it can use. Taken anywhere in
+         * the window, as it was, one guess in 8,192 of the sequence space
+         * tore a bulk connection down blind. */
         if flags & seg::RST != 0 && inner.state != State::Listen {
-            let acceptable = if inner.state == State::SynSent {
+            if inner.state == State::SynSent {
                 /* Here it is only valid if it acknowledges our SYN */
-                flags & seg::ACK_FLAG != 0 && ack == inner.snd_nxt
-            } else {
-                seq == inner.rcv_nxt || seq.wrapping_sub(inner.rcv_nxt) < inner.rcv_wnd
-            };
-            if !acceptable {
+                if flags & seg::ACK_FLAG == 0 || ack != inner.snd_nxt {
+                    return Event::None;
+                }
+            } else if seq != inner.rcv_nxt {
+                if seq.wrapping_sub(inner.rcv_nxt) < inner.rcv_wnd {
+                    self.challenge(inner, now);
+                }
                 return Event::None;
             }
 
@@ -821,22 +1163,36 @@ impl Tcp {
          * Without this a segment from anywhere in the sequence space set the
          * send window, and an off-path host with the four addresses could
          * shut a connection's window, or open it past what the peer can
-         * take, and hold the peer's own updates off as older than its. */
+         * take, and hold the peer's own updates off as older than its. The
+         * ACK is also what a zero-window probe is sent to hear. */
         if matches!(inner.state, State::Established | State::FinWait1 | State::FinWait2
             | State::CloseWait | State::Closing | State::LastAck)
         {
             let seg_len = len + (flags & seg::SYN != 0) as u32 + (flags & seg::FIN != 0) as u32;
             if !acceptable(inner, seq, seg_len) {
-                /* The ACK is what a zero-window probe is sent to hear. At
-                 * most one a half second, as Linux limits these
-                 * (tcp_invalid_ratelimit): two ends that each find the
-                 * other's segments outside their window -- both windows
-                 * shut, data outstanding both ways -- would otherwise
-                 * answer each other's answers for as long as they last. */
-                if now >= inner.oow_ack_at.saturating_add(OOW_ACK_GAP_MS) {
-                    inner.oow_ack_at = now;
-                    self.send_ack(inner);
-                }
+                self.challenge(inner, now);
+                return Event::None;
+            }
+
+            /* A SYN on a synchronized connection (RFC 5961 4.2): the peer
+             * starting over, which answers this ACK with a reset at the
+             * edge -- or a guess. Never a reason to drop the connection, as
+             * a SYN in the window once was. */
+            if flags & seg::SYN != 0 {
+                self.challenge(inner, now);
+                return Event::None;
+            }
+
+            /* An acknowledgement of nothing this end sent, or of what is
+             * older than any window the peer has offered: no segment of the
+             * peer's, and dropped whole, data and all (RFC 5961 5.2, RFC
+             * 9293 3.10.7.4). The data of a guess that landed in the window
+             * would otherwise be taken into the stream. */
+            if flags & seg::ACK_FLAG != 0
+                && (before(inner.snd_nxt, ack)
+                    || before(ack, inner.snd_una.wrapping_sub(inner.max_snd_wnd)))
+            {
+                self.challenge(inner, now);
                 return Event::None;
             }
         }
@@ -856,11 +1212,24 @@ impl Tcp {
 
                     inner.irs = seq;
                     inner.rcv_nxt = seq.wrapping_add(1);
+                    inner.rcv_adv = inner.rcv_nxt;
                     inner.snd_una = ack;
+                    /* A SYN's window is never scaled */
                     inner.snd_wnd = wnd as u32;
+                    inner.max_snd_wnd = inner.snd_wnd;
                     inner.snd_wl1 = seq;
                     inner.snd_wl2 = ack;
                     inner.peer_mss = seg::parse_mss(segment, OUR_MSS, DEFAULT_MSS);
+                    /* Scaled both ways from here when both SYNs said so
+                     * (RFC 7323 2.2) -- and not at all when the peer's did
+                     * not: the window this end offers stays within 16 bits,
+                     * whatever its buffer. */
+                    if let (Some(ours), Some(theirs)) =
+                        (inner.wscale_offer, seg::parse_wscale(segment))
+                    {
+                        inner.rcv_wscale = ours;
+                        inner.snd_wscale = theirs;
+                    }
                     inner.state = State::Established;
                     inner.rto_ms = INITIAL_RTO_MS;
                     inner.retransmit_at = 0;
@@ -874,7 +1243,8 @@ impl Tcp {
             State::SynReceived => {
                 if flags & seg::ACK_FLAG != 0 && ack == inner.snd_nxt {
                     inner.snd_una = ack;
-                    inner.snd_wnd = wnd as u32;
+                    inner.snd_wnd = (wnd as u32) << inner.snd_wscale;
+                    inner.max_snd_wnd = inner.max_snd_wnd.max(inner.snd_wnd);
                     inner.snd_wl1 = seq;
                     inner.snd_wl2 = ack;
                     inner.state = State::Established;
@@ -886,25 +1256,6 @@ impl Tcp {
             }
 
             State::Established => {
-                /* RFC 793: a SYN in window here is an error -- reset. A
-                 * retransmitted handshake SYN sits below the window and is
-                 * ignored. */
-                if flags & seg::SYN != 0
-                    && (seq == inner.rcv_nxt
-                        || seq.wrapping_sub(inner.rcv_nxt) < inner.rcv_wnd)
-                {
-                    let saved = inner.snd_nxt;
-                    if let Some(nic) = inner.nic {
-                        self.send_rst(&nic, &inner.peer_mac, inner.local_ip,
-                            inner.remote_ip, inner.local_port, inner.remote_port,
-                            saved, 0);
-                    }
-                    inner.state = State::Closed;
-                    conn.conn_ready.store(true, Ordering::Release);
-                    conn.data_ready.store(true, Ordering::Release);
-                    return Event::None;
-                }
-
                 if flags & seg::ACK_FLAG != 0 {
                     self.process_ack(inner, seq, ack, wnd, now);
                 }
@@ -1022,12 +1373,19 @@ impl Tcp {
     /// `connect` spins on the connection's lock, which goes up just before
     /// the line. Written under the lock, the "connected" line once held it
     /// for 25-33 ms on real hardware, forced disk log writes included.
-    fn trace_event(&self, event: Event, local_port: u16, remote_port: u16, peer_mss: u16) {
+    fn trace_event(&self, event: Event, local_port: u16, remote_port: u16, peer_mss: u16,
+        receive: (usize, u8, u8))
+    {
+        let (recv_size, rcv_wscale, snd_wscale) = receive;
         match event {
             Event::Rst => trace!(0, "tcp: reset received, {} -> {}",
                 local_port, remote_port),
-            Event::Connected => trace!(0, "tcp: connected {} -> {}, mss {}",
-                local_port, remote_port, peer_mss),
+            /* Whether the window is scaled is what says how fast it can go */
+            Event::Connected if rcv_wscale != 0 => trace!(0,
+                "tcp: connected {} -> {}, mss {}, receive {} KiB, window scale {}/{}",
+                local_port, remote_port, peer_mss, recv_size / 1024, rcv_wscale, snd_wscale),
+            Event::Connected => trace!(0, "tcp: connected {} -> {}, mss {}, receive {} KiB",
+                local_port, remote_port, peer_mss, recv_size / 1024),
             Event::Accepted => trace!(0, "tcp: accepted {} <- {}",
                 local_port, remote_port),
             Event::None => {}
@@ -1109,9 +1467,10 @@ impl Tcp {
 
             let event = self.handle(conn, &mut inner, segment, payload);
             let peer_mss = inner.peer_mss;
+            let receive = (inner.recv_buf.size, inner.rcv_wscale, inner.snd_wscale);
             drop(inner);
 
-            self.trace_event(event, local_port, remote_port, peer_mss);
+            self.trace_event(event, local_port, remote_port, peer_mss, receive);
             return;
         }
 
@@ -1149,10 +1508,14 @@ impl Tcp {
             inner.state = State::SynReceived;
             inner.irs = seg::seq(segment);
             inner.rcv_nxt = inner.irs.wrapping_add(1);
+            inner.rcv_adv = inner.rcv_nxt;
             inner.iss = initial_sequence();
             inner.snd_nxt = inner.iss;
             inner.snd_una = inner.iss;
+            /* Unscaled: this end offers no window scale on a connection it
+             * did not open, so neither end scales (RFC 7323 1.3) */
             inner.snd_wnd = seg::window(segment) as u32;
+            inner.max_snd_wnd = inner.snd_wnd;
             inner.snd_wl1 = inner.irs;
             inner.snd_wl2 = 0;
             inner.peer_mss = seg::parse_mss(segment, OUR_MSS, DEFAULT_MSS);
@@ -1262,13 +1625,19 @@ fn initial_sequence() -> u32 {
 
 impl Tcp {
     /// An active open. Blocks until the connection is up, or the timeout
-    /// passes. `src_port` of 0 takes an ephemeral one.
-    pub fn connect(&'static self, nic: &Nic, dst_ip: u32, dst_port: u16, src_port: u16)
-        -> Option<&'static Conn>
+    /// passes. `src_port` of 0 takes an ephemeral one; `receive` says how
+    /// much it may take in before the caller reads.
+    pub fn connect(&'static self, nic: &Nic, dst_ip: u32, dst_port: u16, src_port: u16,
+        receive: Receive) -> Option<&'static Conn>
     {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
         }
+
+        /* A bulk buffer comes from the heap before any lock is taken -- and,
+         * should the connect go no further, goes back after the last one is
+         * let go of: it is the first thing here, so the last dropped. */
+        let bulk = if receive == Receive::Bulk { BulkBuf::new() } else { None };
 
         /* Resolved before any lock is taken: it sleeps. Off-subnet goes to
          * the gateway. */
@@ -1332,6 +1701,13 @@ impl Tcp {
         inner.state = State::SynSent;
         /* The caller holds this until it closes it */
         inner.owned_by_app = true;
+        /* Moved in, not allocated: the lock is held. Its SYN offers the
+         * shift that says the whole of it. */
+        if let Some(bulk) = bulk {
+            inner.wscale_offer = Some(wscale_for(bulk.0.len()));
+            inner.recv_buf.attach(bulk);
+            inner.rcv_wnd = inner.recv_buf.free() as u32;
+        }
 
         self.send_segment(&mut inner, seg::SYN, &[]);
         inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
@@ -1764,6 +2140,9 @@ impl Tcp {
     pub fn process_retransmits(&'static self) {
         let now = now_ms();
         let mut any_cleanup = false;
+        /* Bulk buffers given back: taken out under the locks, dropped once
+         * none is held */
+        let mut released: [Option<BulkBuf>; MAX_CONNECTIONS] = [const { None }; MAX_CONNECTIONS];
 
         /* What each connection owes, with only its own lock */
         for i in 0..MAX_CONNECTIONS {
@@ -1772,6 +2151,17 @@ impl Tcp {
 
             if inner.state == State::Free {
                 continue;
+            }
+
+            /* A bulk buffer goes back once nothing will be read from it, nor
+             * taken into it, again: its program has let the connection go,
+             * and the connection takes no data in -- not for the minute of
+             * TIME-WAIT either. */
+            if !inner.owned_by_app && matches!(inner.state, State::TimeWait | State::Closed) {
+                if let Some(bulk) = inner.recv_buf.detach() {
+                    inner.rcv_wnd = inner.recv_buf.free() as u32;
+                    released[i] = Some(bulk);
+                }
             }
 
             /* TIME-WAIT out, and FIN-WAIT-2 out when the peer never sends
@@ -1917,6 +2307,12 @@ impl Tcp {
                 if inner.need_cleanup && inner.state == State::Closed
                     && !inner.owned_by_app
                 {
+                    /* Closed by its program since the walk above passed it:
+                     * its bulk buffer goes back now, never with the slot. */
+                    if let Some(bulk) = inner.recv_buf.detach() {
+                        assert!(released[i].is_none(), "tcp: a slot's bulk buffer given back twice");
+                        released[i] = Some(bulk);
+                    }
                     inner.state = State::Free;
                     inner.need_cleanup = false;
                     pool.free(i);
@@ -1928,6 +2324,9 @@ impl Tcp {
                  * next tick tries again once it has closed it. */
             }
         }
+
+        /* No lock is held from here: the heap may have them back. */
+        drop(released);
     }
 
     /* ---- what the shell reports ---- */
@@ -1964,6 +2363,14 @@ impl Tcp {
                 send_used: inner.send_buf.used(),
                 in_flight: inner.snd_nxt.wrapping_sub(inner.snd_una) as usize,
                 recv_used: inner.recv_buf.used(),
+                recv_size: inner.recv_buf.size,
+                window: inner.advertised_wnd as usize,
+                /* This end's shift is never 0 on a connection that scales */
+                scales: if inner.rcv_wscale != 0 {
+                    Some((inner.rcv_wscale, inner.snd_wscale))
+                } else {
+                    None
+                },
             })
         }
     }
@@ -1993,6 +2400,12 @@ pub struct ConnInfo {
     pub send_used: usize,
     pub in_flight: usize,
     pub recv_used: usize,
+    /// The receive buffer: the slot's own, or a bulk connection's
+    pub recv_size: usize,
+    /// The window last offered, in bytes
+    pub window: usize,
+    /// This end's shift and the peer's, on a connection that scales
+    pub scales: Option<(u8, u8)>,
 }
 
 impl Tcp {

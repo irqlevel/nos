@@ -38,7 +38,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `netpool` | Show the recycled net frame pool: frames in the ring, in per-CPU caches, in flight |
 | `netconsole` | Show netconsole target, buffered bytes, drop/send counters |
 | `icmpstat` | Show ICMP statistics |
-| `tcpstat` | Show TCP connections and statistics |
+| `tcpstat` | Show TCP connections and statistics: each connection's state, `snd=` what waits to go and what is in flight, `rcv=` what waits to be read of how big a buffer -- 8 KiB, or a bulk connection's up to 512 KiB -- `wnd=` the window last offered, and `scale=` this end's shift and the peer's when the window is scaled (RFC 7323) |
 | `wget [-o <path>] <url> [path]` | Fetch a URL via HTTP or HTTPS GET (follows redirects, including http→https). With a path — `-o` and the trailing argument are the same thing — the body is streamed to that file as it arrives, with no cap but the filesystem's — a VM's disk image of gigabytes is fine, and a disk that fills ends the download as a failed write — with a progress line now and then (how much, of how much when the server said, and how fast: every 2 s at first, every 30 s at most) and the time it took at the end. Without one it is printed, and kept in memory, so it is capped at 32 KiB. HTTPS verifies the certificate chain against the built-in roots and the wall clock; see [HTTPS](tls.md) |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip\|hostname>` | Send 5 ICMP echo requests with RTT (resolves hostnames via DNS) |

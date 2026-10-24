@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use net::tcp::{Conn, TCP};
+use net::tcp::{Conn, Receive, TCP};
 use netwire::{icmp, tcp as seg, IP_PROTO_ICMP, IP_PROTO_TCP};
 
 use crate::machine::{sched, ETH0_MAC};
@@ -159,10 +159,21 @@ impl State {
             1 => Some(r.pick(&[0u16, 1, 88, 535, 65535])),
             _ => Some(r.pick(&[1460u16, 536, 1200])),
         };
-        self.w.peers.tcp.accept_window = r.pick(&[8192u32, 65535, 1024, 100, 0, 3000]);
+        self.w.peers.tcp.accept_window = r.pick(&[8192u32, 65535, 1024, 100, 0, 3000, 1 << 20, 300_000]);
+        /* A peer that scales, at a shift of every size -- past RFC 7323's
+         * largest too -- or one that does not. */
+        self.w.peers.tcp.accept_ws = match r.u8() % 4 {
+            0 => None,
+            1 => Some(r.pick(&[0u8, 1, 14, 15, 255])),
+            _ => Some(r.pick(&[7u8, 2, 9])),
+        };
+        /* A connection of the slot's own buffer, or one that fetches in
+         * bulk: its own buffer and the window scaled to it. */
+        let receive = if r.bool() { Receive::Bulk } else { Receive::Small };
         let nic = self.nic;
         let ip = self.peer_ip;
-        let app = App::spawn("connect", r.below(4) as u32, move || TCP.connect(&nic, ip, port, 0).map(conn_word));
+        let app = App::spawn("connect", r.below(4) as u32,
+                             move || TCP.connect(&nic, ip, port, 0, receive).map(conn_word));
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
                                 fragile: self.lossy, call: Some(Call::Connect(app)) });
     }
@@ -418,13 +429,25 @@ impl State {
         if ep.st == S::SynSent {
             return;
         }
+        /* A blind reset (RFC 5961 3): past the edge of everything the peer
+         * has sent, so never at the machine's RCV.NXT, and in its window as
+         * often as not -- a number an attacker lands on once in 2^32 over
+         * the window. Answered, never obeyed: it changes nothing. */
+        if r.u8() < 48 {
+            let seq = ep.snd_nxt.wrapping_add(1 + r.below(4096) as u32);
+            let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, seq, 0, seg::RST, 0, &[], &[], Sum::Right);
+            let f = frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s);
+            self.w.net.inject(f);
+            crate::common::runner::reached("tcp: a blind reset past the edge of the window");
+            return;
+        }
         let far = r.u8() < 160;
         let any = r.u8() & 0x3F;
         let flags = r.pick(&[seg::ACK_FLAG, seg::ACK_FLAG | seg::PSH, seg::RST, seg::RST | seg::ACK_FLAG, seg::SYN,
                              seg::FIN | seg::ACK_FLAG, seg::SYN | seg::ACK_FLAG, any]);
         /* Far: a sequence number and an acknowledgement at least a
          * megabyte from anything either end has sent -- and with the
-         * window the machine offers never more than 64 KiB, out of it. */
+         * window the machine offers never more than 512 KiB, out of it. */
         let (seq, ack) = if far {
             let away = 0x0010_0000 + r.below(0x3000_0000) as u32;
             let seq = if r.bool() { ep.snd_nxt.wrapping_add(away) } else { ep.snd_una.wrapping_sub(away) };
@@ -644,9 +667,10 @@ fn wind_down(st: &mut State) {
      * accept does. */
     /* A peer that offered no room at all offers some now: a call blocked
      * on its window would otherwise be blocked for good, as it is meant
-     * to be. */
+     * to be. Room its window can say, too: one that scales by 2^14 says
+     * 8 KiB as nothing at all. */
     for ep in st.w.peers.tcp.eps.iter_mut() {
-        ep.rcv_cap = ep.rcv_cap.max(8192);
+        ep.rcv_cap = ep.rcv_cap.max(8192).max(2 << ep.rcv_shift);
     }
     /* A peer that has let its end go -- reset it, or given up on it --
      * while the machine's reset or the peer's never arrived: its host

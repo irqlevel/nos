@@ -324,8 +324,17 @@ fn run(r: &mut Input, tls: bool) {
     lan.add(SERVER_IP, SERVER_MAC);
     let mut tcp = Tcp::new(server_ip, server_mac);
     tcp.serve = if tls { [PORTS, TLS_PORTS].concat() } else { PORTS.to_vec() };
-    tcp.accept_window = r.pick(&[65535u32, 8192, 1024, 100]);
+    /* Now and then a server that keeps its window shut for good: the request
+     * never goes, and the GET must come back saying so rather than wait on
+     * it for ever. */
+    let shut = r.u8() < 8;
+    tcp.accept_window = if shut { 0 } else { r.pick(&[65535u32, 8192, 1024, 100]) };
     tcp.accept_mss = Some(r.pick(&[1460u16, 536, 100, 1]));
+    /* The client asks for a bulk window: a server that scales -- by no more
+     * than its buffer can say a window in, as a server picks its shift -- or
+     * one that does not. */
+    let most = 31u32.saturating_sub(tcp.accept_window.leading_zeros()) as u8;
+    tcp.accept_ws = if r.bool() { Some(r.pick(&[7u8, 0, 14]).min(most)) } else { None };
 
     /* The URL, and the chain of answers behind it: well made, each a
      * redirect to the next until the last, or with something broken in. */
@@ -406,7 +415,13 @@ fn run(r: &mut Input, tls: bool) {
     let done = w.wait_app(&app, 600 * SEC);
     invariant!(done, "the GET of {} never returned", url);
     let got = app.take().expect("done");
-    judge(&w, &url, &got, cap, tls, cert, corrupt);
+    if shut {
+        invariant!(got.ok == 0 && got.body.is_empty(), "a GET from a server whose window never opened came back ok \
+                   {}, status {}, with {} bytes", got.ok, got.status, got.body.len());
+        crate::common::runner::reached("http: a server that never opens its window, given up on");
+    } else {
+        judge(&w, &url, &got, cap, tls, cert, corrupt);
+    }
 
     /* Everything the client opened, closed: the server hangs up too, and
      * the timers run out. */
