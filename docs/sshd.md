@@ -219,8 +219,8 @@ never accepted, a listener's backlog is capped, and `Abort` resets a
 connection. And a shut window is probed by the persist timer alone: `Send`
 used to push a byte of data into it, whose retransmits the peer's duplicate
 ACKs never answered, so a connection to a client that was only slow to read
--- the client's TCP window is 64 KiB at most here, since nos's TCP offers no
-window scaling, far below OpenSSH's channel window -- was aborted as dead
+-- the client's TCP window is 64 KiB at most here, since nos scales no window
+on a connection it did not open, far below OpenSSH's channel window -- was aborted as dead
 within a minute.
 
 ## Testing

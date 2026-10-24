@@ -15,7 +15,7 @@ use kcore::trace;
 use tls::TlsStream;
 
 use crate::abi;
-use crate::tcp::{Conn, TCP};
+use crate::tcp::{Conn, Receive, TCP};
 
 /// A body kept in memory rather than streamed. The heap cannot serve a
 /// single allocation larger than half a megabyte, so anything bigger has to
@@ -38,6 +38,10 @@ pub const MAX_HOST_LEN: usize = 128;
 pub const MAX_URL_LEN: usize = 2048;
 
 const RECV_TIMEOUT_MS: u64 = 10_000;
+/// How long a send may make no progress: a peer whose window stays shut --
+/// on purpose, or one so scaled that its buffer never adds up to a unit --
+/// would otherwise hold the request, and the shell with it, for good.
+const SEND_TIMEOUT_MS: u64 = 10_000;
 const MAX_REDIRECTS: u32 = 5;
 
 
@@ -99,16 +103,23 @@ enum Transport {
 /// crate cannot name `Conn`, so it takes anything that sends and receives.
 struct TcpPipe(&'static Conn);
 
-impl tls::Transport for TcpPipe {
-    fn send_all(&mut self, mut buf: &[u8]) -> bool {
-        while !buf.is_empty() {
-            let sent = TCP.send(self.0, buf, 0);
-            if sent <= 0 {
-                return false;
-            }
-            buf = &buf[sent as usize..];
+/// All of `buf` onto the connection, or false: the connection gone, or
+/// nothing taken for `SEND_TIMEOUT_MS`. Each call that moves some of it
+/// waits afresh, so a slow peer is waited on and a shut one is not.
+fn send_all(conn: &'static Conn, mut buf: &[u8]) -> bool {
+    while !buf.is_empty() {
+        let sent = TCP.send(conn, buf, SEND_TIMEOUT_MS);
+        if sent <= 0 {
+            return false;
         }
-        true
+        buf = &buf[sent as usize..];
+    }
+    true
+}
+
+impl tls::Transport for TcpPipe {
+    fn send_all(&mut self, buf: &[u8]) -> bool {
+        send_all(self.0, buf)
     }
 
     fn recv(&mut self, buf: &mut [u8], timeout_ms: u64) -> isize {
@@ -122,7 +133,8 @@ impl tls::Transport for TcpPipe {
 impl Transport {
     fn send(&mut self, data: &[u8]) -> bool {
         match self {
-            Transport::Plain(conn) => TCP.send(conn, data, 0) > 0,
+            /* All of it: a request cut short is some other request */
+            Transport::Plain(conn) => send_all(*conn, data),
             Transport::Tls(stream) => stream.send(data) == data.len() as isize,
         }
     }
@@ -724,7 +736,9 @@ fn exchange(
         }
     };
 
-    let conn = match TCP.connect(nic, ip, parsed.port, 0) {
+    /* A body may be gigabytes: a window of 8 KiB a round trip would take
+     * hours over one */
+    let conn = match TCP.connect(nic, ip, parsed.port, 0, Receive::Bulk) {
         Some(conn) => conn,
         None => {
             trace!(0, "http: the connection could not be made");
