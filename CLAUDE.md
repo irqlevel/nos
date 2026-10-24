@@ -65,7 +65,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 | After touching | Run (`scripts/`) |
 |---|---|
 | a mapping path | `wx-test.sh [--arch x86_64\|aarch64]` |
-| the panic path, `panic=N`, a reset (`Hal::ResetNow`) | `panic-test.sh [--arch x86_64\|aarch64]` |
+| the panic path, `panic=N`, a reset (`Hal::ResetNow`); what a panic does off a task's stack -- the lock path's `PreemptCurrentTask`, x86's double-fault stack, a read the report cannot be sure of (`Panicker::RecoverFault`) | `panic-test.sh [--arch x86_64\|aarch64]`: its third boot panics from a stack that is no task's -- a real double fault on x86 -- and the report must reach a netconsole collector before `panic=1` resets the machine |
 | the halt: what `poweroff` stops and in which order, `Cpu::Park`, the static destructors | `ext2-test.py`, `nanofs-test.py`, `sshd-test.py` (arm64): each powers off, and the machine must switch itself off with nothing panicked on the way down. On x86-64 only `image-test.py`'s power-off, which a panic would pass -- `panic=10` and `-no-reboot` end QEMU too |
 | the block layer, the partition tables | `parttest.py [--arch aarch64\|x86_64]`; a batch (`Disk::write_pieces`, a driver's `write_pieces`/`read_pieces`): `hv-linux-test.py --disk` and `--disk --nvme-root` |
 | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through | `netblk-test.py [--arch x86_64\|aarch64]` (`--arch aarch64` on a Mac) |

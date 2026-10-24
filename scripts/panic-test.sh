@@ -6,6 +6,19 @@
 # reset is QEMU exiting by itself. A server whose only console is the
 # network has nothing else to bring it back from a panic: the system image
 # boots nos with panic=10, after which GRUB boots the server's own system.
+#
+# And a third boot, the panic a running machine has from a stack that is no
+# task's, with preemption on: x86's double fault, a real one (`panic df`: a
+# stack pointer nothing can use, so the report runs on the IST stack and the
+# stack it came from cannot be read), and on arm64, whose exceptions have no
+# stack of their own, a panic run on a static one (`panic offstack`), each
+# typed at the UDP shell. With the netconsole on, its report has to reach a
+# collector -- on the Hetzner boxes the only console there is -- and panic=1
+# has to reset the machine. Until the lock path stopped asking which task
+# held a lock once a panic had begun, such a report stopped at its first
+# lock, a panic inside the panic: on the network nothing, and no reset; and
+# a double fault's stopped again at the walk of the stack it came from,
+# until a fault in that walk came back to the report.
 # Usage: scripts/panic-test.sh [--skip-build] [--arch x86_64|aarch64]
 # Env:   PANIC_TIMEOUT  seconds to wait for each boot to panic (default 120)
 #        PANIC_HVF      set to 1 to run the arm64 boots under hvf (Apple Silicon)
@@ -29,6 +42,10 @@ PANIC_TIMEOUT="${PANIC_TIMEOUT:-120}"
 # long it must still be there without: the wait, a reset, and room to spare.
 RESET_WITHIN=20
 STAYS_FOR=8
+# The third boot's UDP shell, and the collector its netconsole sends to
+SHELL_PORT=9103
+NC_PORT=6670
+OFFSTACK_ARGS="panic=1 dhcp=auto udpshell=$SHELL_PORT netconsole=10.0.2.2:$NC_PORT"
 TMPDIR_PT="$(mktemp -d)"
 QEMU_PID=""
 
@@ -58,12 +75,15 @@ fi
 # ISO of its own; arm64 takes -append and needs none.
 if [ "$ARCH" = "x86_64" ]; then
     [ -f bin/kernel64.elf ] || fail "bin/kernel64.elf not found"
-    echo "panic-test: building the two ISOs (docker)..."
-    docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src nos-builder bash -c '
+    echo "panic-test: building the three ISOs (docker)..."
+    docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src -e OFFSTACK_ARGS="$OFFSTACK_ARGS" nos-builder bash -c '
         set -e
-        for name in reset stays; do
-            args="wxprobe=text"
-            [ "$name" = reset ] && args="$args panic=1"
+        for name in reset stays offstack; do
+            case "$name" in
+                reset) args="wxprobe=text panic=1" ;;
+                stays) args="wxprobe=text" ;;
+                offstack) args="$OFFSTACK_ARGS" ;;
+            esac
             root="out/x86_64/panic-iso"
             rm -rf "$root"
             mkdir -p "$root/boot/grub"
@@ -146,6 +166,113 @@ for NAME in reset stays; do
     wait "$QEMU_PID" 2>/dev/null
     QEMU_PID=""
 done
+
+# The third boot, driven from Python: QEMU its child, the netconsole's
+# collector, the command typed once the collector has heard from the machine
+# (its address resolved, which the report's flush needs), and what came out.
+ACCEL="${ACCEL_OPTS:-}"
+python3 - "$ARCH" "$TMPDIR_PT/panic-offstack.log" "out/x86_64/panic-offstack.iso" \
+    "$SHELL_PORT" "$NC_PORT" "$PANIC_TIMEOUT" "$RESET_WITHIN" "$OFFSTACK_ARGS" "$ACCEL" <<'PY' || exit 1
+import os, re, socket, struct, subprocess, sys, threading, time
+
+arch, log, iso = sys.argv[1], sys.argv[2], sys.argv[3]
+shell_port, nc_port, timeout, reset_within = (int(a) for a in sys.argv[4:8])
+args, accel = sys.argv[8], sys.argv[9].split()
+SHELL_MAGIC = 0x4E4F5348
+SHELL_HDR = struct.Struct("!IIHHHH")   # scripts/udpsh.py
+NC_HDR = 8                             # "NOSC" and the datagram's number
+
+got = []
+done = threading.Event()
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("0.0.0.0", nc_port))
+sock.settimeout(0.5)
+
+
+def collect():
+    while not done.is_set():
+        try:
+            data, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            continue
+        got.append(data[NC_HDR:].decode(errors="replace"))
+
+
+threading.Thread(target=collect, daemon=True).start()
+
+if arch == "x86_64":
+    argv = ["qemu-system-x86_64", "-display", "none", "-no-reboot", "-m", "1G", "-smp", "2",
+            "-cdrom", iso, "-serial", "file:" + log,
+            "-device", "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off"]
+    command, said = "panic df", "EXC: DoubleFault"
+else:
+    argv = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-smp", "2", "-m", "1024",
+            "-no-reboot"] + accel + ["-kernel", "nos-arm64.img", "-append", args,
+            "-global", "virtio-mmio.force-legacy=false", "-device", "virtio-net-device,netdev=n0",
+            "-serial", "file:" + log, "-display", "none"]
+    command, said = "panic offstack", "off a task's stack"
+argv += ["-netdev", "user,id=n0,hostfwd=udp::%d-:%d" % (shell_port, shell_port)]
+p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def serial():
+    return open(log, errors="replace").read() if os.path.exists(log) else ""
+
+
+def until(cond, secs):
+    end = time.time() + secs
+    while time.time() < end and not cond() and p.poll() is None:
+        time.sleep(0.5)
+    return cond()
+
+
+def fail(why):
+    print("PANIC-TEST FAIL: offstack: " + why)
+    print("--- last 20 lines of serial log ---")
+    print("".join(serial().splitlines(True)[-20:]), end="")
+    sys.exit(1)
+
+
+try:
+    print("panic-test: %s %s, then %s (log: %s)" % (arch, args, command, log))
+    if not until(lambda: "boot: complete" in serial(), timeout):
+        fail("no boot within %ds" % timeout)
+    if not until(lambda: got, 60):
+        fail("the collector heard nothing from the netconsole")
+    body = command.encode()
+    shell = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for seq in (1, 2, 3):
+        shell.sendto(SHELL_HDR.pack(SHELL_MAGIC, seq, 0, 0, len(body), 0) + body,
+                     ("127.0.0.1", shell_port))
+        if until(lambda: "PANIC:" in serial(), 10):
+            break
+    else:
+        fail("no panic after %r" % command)
+    start = time.time()
+    if not until(lambda: p.poll() is not None, reset_within):
+        fail("still running %ds after the panic, with panic=1" % reset_within)
+    print("panic-test: reset %ds after the panic" % (time.time() - start))
+    time.sleep(1)
+    text, sent = serial(), "".join(got)
+    if said not in text:
+        fail("the panic is not the one asked for: no %r" % said)
+    if "resetting the machine in 1 s" not in text:
+        fail("it reset without saying so")
+    if said not in sent or "Backtrace" not in sent:
+        fail("its report never reached the netconsole's collector")
+    if arch == "x86_64":
+        if "the stack it came from cannot be read" not in text:
+            fail("the walk of the stack it came from did not say it could not be read")
+        if not re.search(r"Cpu \d+ backtrace:", text) or not re.search(r"Cpu \d+ backtrace:", sent):
+            fail("the other CPU's stack is not in the report")
+    print("panic-test: its report reached the collector, %d bytes of it" % len(sent))
+finally:
+    done.set()
+    if p.poll() is None:
+        p.kill()
+        p.wait()
+PY
 
 echo "panic-test: OK ($ARCH)"
 exit 0

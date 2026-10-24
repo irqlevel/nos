@@ -874,6 +874,17 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
     DumpStackTrace(where.Frames, where.Count, con);
 }
 
+/* A stack that is no task's, for `panic offstack`: the panic path from
+   where there is no task to ask about -- x86's double fault's stack, a
+   parked CPU's -- with preemption on, as a running system has it. */
+static char OffStack[4 * Const::PageSize] __attribute__((aligned(16)));
+
+static void PanicOffStack(void* ctx)
+{
+    (void)ctx;
+    Panic("user requested panic, off a task's stack");
+}
+
 static void CmdPanic(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -907,13 +918,27 @@ static void CmdPanic(const char* args, Stdlib::Printer& con)
         con.Printf("triggering invalid opcode...\n");
         Hal::UndefInstr();
     }
+    else if (Stdlib::StrCmp(type, "df") == 0)
+    {
+        con.Printf("triggering double fault...\n");
+        if (!Hal::DoubleFault())
+            con.Printf("no double fault here: an exception has no stack of its own on this architecture\n");
+    }
+    else if (Stdlib::StrCmp(type, "offstack") == 0)
+    {
+        con.Printf("panicking on a stack that is no task's...\n");
+        InterruptDisable();
+        Hal::RunOnStack((ulong)&OffStack[sizeof(OffStack)], PanicOffStack, nullptr);
+    }
     else
     {
-        con.Printf("usage: panic [pf|div0|ud]\n");
+        con.Printf("usage: panic [pf|div0|ud|df|offstack]\n");
         con.Printf("  (no arg) - direct panic\n");
         con.Printf("  pf       - page fault (null deref)\n");
         con.Printf("  div0     - divide by zero\n");
         con.Printf("  ud       - invalid opcode\n");
+        con.Printf("  df       - double fault, on its own stack (x86-64)\n");
+        con.Printf("  offstack - panic on a stack that is no task's\n");
     }
 }
 
@@ -1379,7 +1404,7 @@ static const CmdEntry Commands[] = {
     { "rc",        CmdRc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "bt",        CmdBt,        "bt <pid> - show task backtrace" },
-    { "panic",     CmdPanic,     "panic [pf|div0|ud] - trigger kernel panic" },
+    { "panic",     CmdPanic,     "panic [pf|div0|ud|df|offstack] - trigger kernel panic" },
     { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  CmdPoweroff,  nullptr },
     { "reboot",    CmdReboot,    "reboot - reset system" },

@@ -85,6 +85,24 @@ static inline __attribute__((always_inline)) void UndefInstr()
     asm volatile("udf #0");
 #endif
 }
+
+/* A double fault, for real (panic testing): the stack pointer loaded with
+   an address no access can use, and a push -- a fault the CPU cannot
+   deliver onto that stack either, so it raises #DF, on the stack of its own
+   the IST gives it (x86-64; it does not return). arm64 delivers an
+   exception onto whatever stack it is on and has no such fault: there it
+   returns false, having done nothing. */
+static inline __attribute__((always_inline)) bool DoubleFault()
+{
+#if defined(__x86_64__)
+    static const ulong NonCanonical = 0x8000000000000000UL;
+    asm volatile("movq %0, %%rsp\n\t"
+                 "pushq %%rax" :: "r"(NonCanonical) : "memory");
+    __builtin_unreachable();
+#elif defined(__aarch64__)
+    return false;
+#endif
+}
 }
 
 #ifdef __cplusplus

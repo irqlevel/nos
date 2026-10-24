@@ -40,13 +40,26 @@ bool PreemptIsOn()
     return (PreemptActive.Get() != 0) ? true : false;
 }
 
+Task* PreemptCurrentTask()
+{
+    Task* task = Task::TryGetCurrentTask();
+    if (likely(task != nullptr))
+        return task;
+
+    if (Panicker::GetInstance().IsActive())
+        return nullptr;
+
+    /* What is wrong with this stack, said by the BugOn that finds it */
+    return Task::GetCurrentTask();
+}
+
 void PreemptDisable()
 {
     if (likely(PreemptIsOn()))
     {
-        auto task = Task::GetCurrentTask();
-        BugOn(!task);
-        task->PreemptDisableCounter.Inc();
+        Task* task = PreemptCurrentTask();
+        if (task != nullptr)
+            task->PreemptDisableCounter.Inc();
     }
 }
 
@@ -73,8 +86,9 @@ void PreemptEnable()
 {
     if (likely(PreemptIsOn()))
     {
-        auto task = Task::GetCurrentTask();
-        BugOn(!task);
+        Task* task = PreemptCurrentTask();
+        if (task == nullptr)
+            return;
         BugOn(!task->PreemptDisableCounter.Get());
         if (task->PreemptDisableCounter.DecAndTest())
             PreemptRunPending(task);

@@ -63,7 +63,10 @@ private:
     } __attribute((packed));
 
     static const ulong TssEntryBase = 2; /* null, code, then TSS pairs */
-    static const ulong DfStackSize = 4096;
+    /* What a double fault's report runs on, all of it: one, the netconsole
+       sending it, went 5688 bytes deep here (StackProbe, on a build for the
+       purpose) -- past the page this was, into the next CPU's. */
+    static const ulong DfStackSize = 4 * Const::PageSize;
 
     u64 Base;
     u16 Limit;
