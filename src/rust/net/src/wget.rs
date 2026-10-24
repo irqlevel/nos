@@ -1,16 +1,20 @@
 //! `wget`: an HTTP or HTTPS GET, to the console or straight to a file.
 //!
 //! The body never has to exist in memory when it is going to a file: it
-//! arrives in TCP-sized pieces and leaves in blocks, so a 20 MB download
-//! costs one buffer. That is the whole reason the client takes a sink.
+//! arrives in TCP-sized pieces and leaves in blocks, so a download of
+//! gigabytes -- a VM's disk image -- costs one buffer, as a small one does.
+//! That is the whole reason the client takes a sink, and why a file has no
+//! cap but the filesystem's: a disk that fills ends the download as a write
+//! that failed.
 
 use core::fmt::Write;
 
 use kcore::cmd::Output;
+use kcore::consts::NS_PER_SEC;
 use fs::vfs::{Open, MAX_PATH, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE};
 
 use crate::device::DEVICES;
-use crate::http::{self, Response, MAX_BODY, MAX_URL_LEN};
+use crate::http::{self, Response, MAX_URL_LEN};
 
 /// The longest URL a command line can carry (the UDP shell takes 255-byte
 /// commands, the console 80). Redirect targets run far longer -- a GitHub
@@ -21,9 +25,18 @@ const MAX_ARG_URL: usize = 256;
 /// What the body is written to the file in.
 const WRITE_BUF: usize = 64 * 1024;
 
-/// Progress line every this many bytes; a big download over a slow link
-/// otherwise looks like a hang.
-const REPORT_STEP: usize = 1024 * 1024;
+/// How far apart the progress lines are: a tenth of the time the download
+/// has taken so far, from two seconds to thirty -- often at first, when
+/// someone is watching whether it goes at all, and seldom an hour in. A line
+/// a megabyte, what there was, is thousands of them for an image of
+/// gigabytes, and the UDP shell, which sends a command's output once it is
+/// over, keeps 32 KiB of it: past that the line saying how it ended was lost.
+const REPORT_MIN_NS: u64 = 2 * NS_PER_SEC;
+const REPORT_MAX_NS: u64 = 30 * NS_PER_SEC;
+const REPORT_SHARE: u64 = 10;
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
 
 /// How much of an in-memory body the console is given.
 const MAX_DISPLAY: usize = 4096;
@@ -40,10 +53,19 @@ struct FileSink<'a> {
     buf: alloc::boxed::Box<[u8]>,
     used: usize,
     written: usize,
-    reported: usize,
+    /// The body's length, when the server said it; 0 when it did not
+    length: usize,
+    /// When the download began, and when progress was last told, in
+    /// nanoseconds since boot
+    started: u64,
+    reported: u64,
 }
 
 impl http::Sink for FileSink<'_> {
+    fn length(&mut self, len: usize) {
+        self.length = len;
+    }
+
     fn take(&mut self, data: &[u8]) -> usize {
         let before = self.written;
         let mut taken = 0;
@@ -62,10 +84,12 @@ impl http::Sink for FileSink<'_> {
             }
         }
 
-        let total = self.written + self.used;
-        if total - self.reported >= REPORT_STEP {
-            self.reported = total - (total % REPORT_STEP);
-            let _ = writeln!(self.out, "wget: {} KB", total / 1024);
+        let now = kcore::time::boot_time_ns();
+        let every = (now.saturating_sub(self.started) / REPORT_SHARE)
+            .clamp(REPORT_MIN_NS, REPORT_MAX_NS);
+        if now.saturating_sub(self.reported) >= every {
+            self.reported = now;
+            self.progress(now);
         }
 
         taken
@@ -88,6 +112,41 @@ impl FileSink<'_> {
 
         self.written += len;
         true
+    }
+
+    /// The progress line: how much, of how much when the server said, and
+    /// how fast since the start.
+    fn progress(&mut self, now: u64) {
+        let total = self.written + self.used;
+        let _ = write!(self.out, "wget: {} MiB", total as u64 / MIB);
+        if self.length != 0 {
+            let percent = (total as u128 * 100 / self.length as u128).min(100);
+            let _ = write!(self.out, " of {} MiB, {}%", self.length as u64 / MIB, percent);
+        }
+        let _ = writeln!(self.out, ", {}", Rate::of(total, now.saturating_sub(self.started)));
+    }
+}
+
+/// Bytes over a time, as a rate: MiB/s to a tenth from one up, KiB/s below.
+struct Rate(u64);
+
+impl Rate {
+    fn of(bytes: usize, ns: u64) -> Rate {
+        if ns == 0 {
+            return Rate(0);
+        }
+        let per_sec = bytes as u128 * NS_PER_SEC as u128 / ns as u128;
+        Rate(u64::try_from(per_sec).unwrap_or(u64::MAX))
+    }
+}
+
+impl core::fmt::Display for Rate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 >= MIB {
+            write!(f, "{}.{} MiB/s", self.0 / MIB, self.0 % MIB * 10 / MIB)
+        } else {
+            write!(f, "{} KiB/s", self.0 / KIB)
+        }
     }
 }
 
@@ -234,10 +293,11 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
     buf.resize(WRITE_BUF, 0);
 
     let mut location = [0u8; MAX_LOCATION];
+    let started = kcore::time::boot_time_ns();
     let (resp, written, flushed) = {
         let mut sink = FileSink {
             file: &file, out, buf: buf.into_boxed_slice(),
-            used: 0, written: 0, reported: 0,
+            used: 0, written: 0, length: 0, started, reported: started,
         };
         let resp = http::get_with_location(nic, url.as_bytes(), &mut sink, &mut location);
         let flushed = sink.flush();
@@ -248,8 +308,8 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
      * the filesystem from removing it. */
     drop(file);
 
-    /* Nothing landed -- a failed request, or a body refused before the first
-     * byte: do not leave an empty file behind. */
+    /* Nothing landed -- a failed request, or an answer with no body: do not
+     * leave an empty file behind. */
     if written == 0 {
         vfs.remove(path.as_bytes());
     }
@@ -266,13 +326,11 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
     }
 
     if resp.truncated != 0 {
-        if resp.body_len >= MAX_BODY {
-            let _ = writeln!(out, "wget: body over the {} MB limit", MAX_BODY / (1024 * 1024));
-        } else {
-            let _ = writeln!(out, "wget: incomplete, {} bytes saved to {}", written, path);
-        }
+        let _ = writeln!(out, "wget: incomplete, {} bytes saved to {}", written, path);
         return;
     }
 
-    let _ = writeln!(out, "saved {} bytes to {}", written, path);
+    let ns = kcore::time::boot_time_ns().saturating_sub(started);
+    let _ = writeln!(out, "saved {} bytes to {} in {}.{} s, {}", written, path,
+        ns / NS_PER_SEC, ns % NS_PER_SEC / (NS_PER_SEC / 10), Rate::of(written, ns));
 }

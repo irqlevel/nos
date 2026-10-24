@@ -2120,9 +2120,9 @@ What it reaches the folder with is three calls of the file ABI made for it:
 
 **What it does not do yet:** read the file again at `hv restart`, which
 boots with what the start read -- `hv stop` and `hv start` take a changed
-file; start a VM when the module loads; make or take away a disk --
-`truncate` makes one, `rm` takes a folder away; or fetch an image from the
-network, wget's 20 MiB being too few for one.
+file; start a VM when the module loads; or make, fetch or take away a disk
+-- `truncate` makes one, `wget` fetches a raw image into the folder, `rm`
+takes a folder away.
 
 **Checked by:** `hv-linux-test.py`'s VM phase, which makes a folder with `hv
 create` -- and is refused a second time -- boots it by its name, types at it
