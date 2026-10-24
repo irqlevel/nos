@@ -59,4 +59,15 @@ static inline __attribute__((always_inline)) u64 ReadCycleCounter()
     return cnt;
 }
 
+// Halts this CPU for good, touching no memory -- no stack, no data: one
+// loop of two instructions, so that a wakeup only halts it again. WFI ends
+// at any pending interrupt, even a masked one. For a CPU whose stack and
+// everything else may be freed under it (Cpu::Park).
+static inline __attribute__((always_inline, noreturn)) void HaltForever()
+{
+    asm volatile("1: wfi\n\t"
+                 "b 1b" ::: "memory");
+    __builtin_unreachable();
+}
+
 }

@@ -188,7 +188,12 @@ It ends with a `poweroff`, which has to unmount the root, switch the machine
 off and get there with nothing panicked. Until `7908bf6` the arm64 halt
 faulted in the static destructors -- an exiting CPU left its one WFI -- and
 this test, `nanofs-test.py` and `sshd-test.py` stopped reading the log at
-`Stopping cpu`; now these three are what judges the arm64 halt.
+`Stopping cpu`; now these three are what judges the arm64 halt. Once they
+looked, they found it faulting still, in two runs of three: a parked CPU's
+halt was a call, whose frame record every wakeup from WFI wrote onto the
+stack the CPU had been interrupted on -- one the boot CPU frees. A parked CPU
+stands on a stack of its own now, and halts in a loop that touches no memory
+(`Cpu::Park`).
 
 ### `nanofs-test.py` -- nanofs
 
