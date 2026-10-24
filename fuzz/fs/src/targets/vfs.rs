@@ -516,7 +516,102 @@ impl World {
             next.extend_from_slice(b".new");
             (next.len() < MAX_PATH && m.stat(&next).is_some()).then_some(next)
         };
-        match r.u8() % 5 {
+        match r.u8() % 8 {
+            5 => {
+                /* The directory an entry at a time, as kcore::fs::list reads
+                 * it: every entry of the model's, and nothing else. */
+                let mut got: Vec<(Vec<u8>, bool, u64)> = Vec::new();
+                let mut index = 0usize;
+                let mut whole = false;
+                let end = loop {
+                    let mut name = [0u8; 300];
+                    /* Now and then too little room for the name -- and then
+                     * asked again with room for all of it. */
+                    let cap = if !whole && r.u8() % 8 == 0 { r.below(8) as usize } else { name.len() };
+                    let (mut kind, mut size) = (0u32, 0u64);
+                    // SAFETY: `text` is its own length, `name` takes `cap`, the rest are locals.
+                    let len = unsafe {
+                        fs::files::kernel_dir_entry(text.as_ptr(), text.len(), index, name.as_mut_ptr(), cap, &mut kind,
+                                                    &mut size)
+                    };
+                    if len < 0 {
+                        break len;
+                    }
+                    let len = len as usize;
+                    invariant!(kind == fs::files::ENTRY_FILE || kind == fs::files::ENTRY_DIR,
+                               "kernel_dir_entry of {} says entry {} is a kind {}", text, index, kind);
+                    if len > cap {
+                        /* Cut to the room given: asked again whole. */
+                        reached("a directory's entry cut to its caller's room");
+                        whole = true;
+                        continue;
+                    }
+                    whole = false;
+                    got.push((name[..len].to_vec(), kind == fs::files::ENTRY_DIR, size));
+                    index += 1;
+                    invariant!(index < 100_000, "kernel_dir_entry of {} goes on past {} entries", text, index);
+                };
+                got.sort();
+                let want: Option<Vec<(Vec<u8>, bool, u64)>> = match m.resolve(&p) {
+                    fsops::Res::Node(n) => match m.node(&n) {
+                        Some(Node::Dir(c)) => Some(c.iter().map(|(k, v)| {
+                            (k.clone(), v.is_dir(), match v { Node::File(d) => d.len(), _ => 0 })
+                        }).collect()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match want {
+                    Some(want) => {
+                        invariant!(end == fs::files::ENTRY_END, "kernel_dir_entry of the directory {} ends with {}",
+                                   text, end);
+                        invariant!(got == want, "kernel_dir_entry lists {} as {:?}, and the model has {:?}", text,
+                                   got.iter().map(|e| show(&e.0)).collect::<Vec<_>>(),
+                                   want.iter().map(|e| show(&e.0)).collect::<Vec<_>>());
+                        if !got.is_empty() {
+                            reached("a directory listed through the file ABI");
+                        }
+                    }
+                    None => invariant!(end == fs::files::ENTRY_NO_DIR && got.is_empty(),
+                                       "kernel_dir_entry of {}, no directory, gave {} entries and {}", text,
+                                       got.len(), end),
+                }
+            }
+            6 => {
+                let data = crate::input::noise(r.u32(), fsops::length(r));
+                // SAFETY: both are their own lengths.
+                let got = unsafe { fs::files::kernel_file_append(text.as_ptr(), text.len(), data.as_ptr(), data.len()) };
+                /* The file opened to append -- made when it is not there --
+                 * written at its end, and closed. */
+                let want = match m.open(&p, fs::vfs::OPEN_WRITE | fs::vfs::OPEN_CREATE | fs::vfs::OPEN_APPEND) {
+                    Some(opened) => {
+                        let at = m.size(&opened.path);
+                        if let Some(d) = m.file_mut(&opened.path) {
+                            d.write(at, &data);
+                        }
+                        0
+                    }
+                    None => -1,
+                };
+                invariant!(got == want, "kernel_file_append of {} gave {}, and the model {}", text, got, want);
+                if want == 0 && !data.is_empty() {
+                    reached("a log's lines appended through the file ABI");
+                }
+            }
+            7 => {
+                let q = fsops::path(r, m);
+                let Ok(to) = std::str::from_utf8(&q) else { return };
+                if q.is_empty() || q.len() >= MAX_PATH {
+                    return;
+                }
+                // SAFETY: both are their own lengths.
+                let got = unsafe { fs::files::kernel_file_rename(text.as_ptr(), text.len(), to.as_ptr(), to.len()) };
+                let want = if m.rename(&p, &q) { 0 } else { -1 };
+                invariant!(got == want, "kernel_file_rename of {} to {} gave {}, and the model {}", text, to, got, want);
+                if want == 0 {
+                    reached("a file renamed through the file ABI");
+                }
+            }
             0 => {
                 // SAFETY: `text` is its own length.
                 let got = unsafe { fs::files::kernel_file_size(text.as_ptr(), text.len()) };

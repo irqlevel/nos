@@ -97,9 +97,11 @@ namespace
 const ulong Tag = 'Kmod';
 
 /* kmod::ModuleInfo (src/rust/kmod/src/lib.rs): the header the module! macro
-   puts in every module and exports as nos_module_info */
+   puts in every module and exports as nos_module_info. Version 2: the init
+   is handed the module's parameters, and insmod's output to say why it
+   refuses them. */
 const u32 InfoMagic = 0x4D534F4E; /* "NOSM" */
-const u32 InfoVersion = 1;
+const u32 InfoVersion = 2;
 const ulong InfoAbiLen = 64;
 const ulong InfoNameLen = 32;
 const char InfoSymbol[] = "nos_module_info";
@@ -110,7 +112,9 @@ struct ModuleInfo
     u32 Version;
     char Abi[InfoAbiLen];
     char Name[InfoNameLen];
-    void* (*Init)();
+    /* params: what insmod's line had after the path, paramsLen bytes of
+       it, NUL-terminated; it and out are valid while the init runs */
+    void* (*Init)(const char* params, ulong paramsLen, Stdlib::Printer* out);
     void (*Exit)(void* instance);
 };
 
@@ -1013,14 +1017,15 @@ Stdlib::Error Stage(const void* image, ulong size, LoadedModule*& module, const 
    it, who may stop waiting before the task is done. */
 struct ModuleJob
 {
-    ModuleJob(bool unload, const char* arg)
+    ModuleJob(bool unload, const char* arg, const char* params)
         : Refs(2)
         , State(JobRunning)
         , Unload(unload)
         , Result(Stdlib::Error::Success)
     {
-        /* StartJob has seen to it that arg fits */
+        /* StartJob has seen to it that both fit */
         Stdlib::MemCpy(Arg, arg, Stdlib::StrLen(arg) + 1);
+        Stdlib::MemCpy(Params, params, Stdlib::StrLen(params) + 1);
         Output[0] = '\0';
     }
 
@@ -1029,6 +1034,8 @@ struct ModuleJob
     bool Unload;
     int Result;
     char Arg[ModuleTable::PathMax + 1];
+    /* A load's parameters for its init; "" for an unload */
+    char Params[ModuleTable::ParamsMax + 1];
     char Output[JobOutputSize];
 };
 
@@ -1044,7 +1051,7 @@ void RunJob(void* ctx)
     auto& modules = ModuleTable::GetInstance();
 
     Stdlib::BufferPrinter out(job->Output, sizeof(job->Output));
-    Stdlib::Error err = job->Unload ? modules.Unload(job->Arg, out) : modules.LoadFile(job->Arg, out);
+    Stdlib::Error err = job->Unload ? modules.Unload(job->Arg, out) : modules.LoadFile(job->Arg, job->Params, out);
     job->Result = err.GetCode();
 
     /* Handed over -- unless whoever started this has stopped waiting, and then
@@ -1089,8 +1096,15 @@ void ModuleTable::Remove(LoadedModule* module)
     Lock.UnlockIrqRestore(flags);
 }
 
-Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& out)
+Stdlib::Error ModuleTable::Load(const void* image, ulong size, const char* params, Stdlib::Printer& out)
 {
+    const ulong paramsLen = Stdlib::StrLen(params);
+    if (paramsLen > ParamsMax)
+    {
+        out.Printf("module: the parameters are longer than %lu\n", ParamsMax);
+        return MakeError(Stdlib::Error::InvalidValue);
+    }
+
     LoadedModule* module;
     const ModuleInfo* info;
     Stdlib::Error err = Stage(image, size, module, info, out);
@@ -1130,7 +1144,7 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
     const ulong functions = module->SymbolCount;
 
     module->Exit = info->Exit;
-    module->Instance = info->Init();
+    module->Instance = info->Init(params, paramsLen, &out);
     const bool live = (module->Instance != nullptr);
 
     {
@@ -1155,7 +1169,7 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
     return MakeSuccess();
 }
 
-Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
+Stdlib::Error ModuleTable::LoadFile(const char* path, const char* params, Stdlib::Printer& out)
 {
     const ulong pathLen = Stdlib::StrLen(path);
     const long got = kernel_file_size(path, pathLen);
@@ -1187,7 +1201,7 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
     Stdlib::Error err;
     if (done == (long)size)
     {
-        err = Load(data, size, out);
+        err = Load(data, size, params, out);
     }
     else
     {
@@ -1293,26 +1307,55 @@ void ModuleTable::UnloadAll()
         Trace(0, "module: %lu left loaded: permanent, or in another task's hands", left);
 }
 
-void ModuleTable::StartLoad(const char* path, Stdlib::Printer& out)
+/* Whether c separates insmod's words */
+static bool IsBlank(char c)
 {
-    StartJob(false, path, out);
+    return c == ' ' || c == '\t';
+}
+
+void ModuleTable::StartLoad(const char* args, Stdlib::Printer& out)
+{
+    /* The path is the first word, the parameters everything after it but
+       the blanks between: handed to the module's init as they are */
+    ulong pathLen = 0;
+    while (args[pathLen] != '\0' && !IsBlank(args[pathLen]))
+        pathLen++;
+    const char* params = args + pathLen;
+    while (IsBlank(*params))
+        params++;
+
+    if (pathLen > PathMax)
+    {
+        out.Printf("insmod: the path is longer than %lu\n", PathMax);
+        return;
+    }
+    if (Stdlib::StrLen(params) > ParamsMax)
+    {
+        out.Printf("insmod: the parameters are longer than %lu\n", ParamsMax);
+        return;
+    }
+
+    char path[PathMax + 1];
+    Stdlib::MemCpy(path, args, pathLen);
+    path[pathLen] = '\0';
+    StartJob(false, path, params, out);
 }
 
 void ModuleTable::StartUnload(const char* name, Stdlib::Printer& out)
 {
-    StartJob(true, name, out);
+    StartJob(true, name, "", out);
 }
 
-void ModuleTable::StartJob(bool unload, const char* arg, Stdlib::Printer& out)
+void ModuleTable::StartJob(bool unload, const char* arg, const char* params, Stdlib::Printer& out)
 {
     const char* what = unload ? "rmmod" : "insmod";
-    if (Stdlib::StrLen(arg) > PathMax)
+    if (Stdlib::StrLen(arg) > PathMax || Stdlib::StrLen(params) > ParamsMax)
     {
         out.Printf("%s: %s is too long\n", what, arg);
         return;
     }
 
-    ModuleJob* job = Mm::TAlloc<ModuleJob, Tag>(unload, arg);
+    ModuleJob* job = Mm::TAlloc<ModuleJob, Tag>(unload, arg, params);
     Task* task = (job != nullptr) ? Mm::TAlloc<Task, Tag>(what) : nullptr;
     if (task == nullptr || !task->Start(RunJob, job))
     {

@@ -342,6 +342,9 @@ def aarch64(t):
         sh = Shell()
         sh.run("wget http://10.0.2.2:%d/sshd.ko /sshd.ko" % HTTP_PORT)
         sh.run("wget http://10.0.2.2:%d/big.txt /big.txt" % HTTP_PORT)
+        out = sh.run("insmod /sshd.ko port=2222")
+        check("a module that takes no parameters refuses one, and says so",
+              "takes no parameters" in out and "loaded" not in out and "sshd" not in sh.run("lsmod"), out)
         check("insmod", "loaded" in sh.run("insmod /sshd.ko"))
         check("with no keys, sshd start says nobody can log in", "nobody can log in" in sh.run("sshd start"))
         sh.run("sshd stop")

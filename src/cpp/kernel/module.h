@@ -44,12 +44,15 @@ public:
         return Instance;
     }
 
-    /* Load the module in the file at path. What goes wrong is said on out. */
-    Stdlib::Error LoadFile(const char* path, Stdlib::Printer& out);
+    /* Load the module in the file at path, its init handed params -- what
+       insmod's line had after the path, "" for none: the module's to take
+       or refuse. What goes wrong is said on out. */
+    Stdlib::Error LoadFile(const char* path, const char* params, Stdlib::Printer& out);
 
-    /* Load a module from an image in memory, 8-byte aligned. The image is
-       only read, and not needed once this returns. */
-    Stdlib::Error Load(const void* image, ulong size, Stdlib::Printer& out);
+    /* Load a module from an image in memory, 8-byte aligned, its init
+       handed params. The image is only read, and not needed once this
+       returns. */
+    Stdlib::Error Load(const void* image, ulong size, const char* params, Stdlib::Printer& out);
 
     Stdlib::Error Unload(const char* name, Stdlib::Printer& out);
 
@@ -63,8 +66,9 @@ public:
        for at most ShellWaitMs. What it says is printed on out if it is done
        by then; if not, it carries on in the background -- lsmod shows the
        module loading or unloading meanwhile -- and the kernel log says how
-       it ended. */
-    void StartLoad(const char* path, Stdlib::Printer& out);
+       it ended. insmod's args are the path, its first word, and the
+       module's parameters, the rest of the line. */
+    void StartLoad(const char* args, Stdlib::Printer& out);
     void StartUnload(const char* name, Stdlib::Printer& out);
 
     bool IsLoaded(const char* name);
@@ -86,6 +90,8 @@ public:
     /* The longest module name: kmod's NAME_LEN, less the NUL */
     static const ulong NameMax = 31;
     static const ulong PathMax = 255;
+    /* The longest a module's parameters may be, as insmod gives them */
+    static const ulong ParamsMax = 255;
 
     /* How long insmod and rmmod wait for their task before they leave it to
        finish on its own */
@@ -99,7 +105,7 @@ private:
     ModuleTable& operator=(const ModuleTable& other) = delete;
     ModuleTable& operator=(ModuleTable&& other) = delete;
 
-    void StartJob(bool unload, const char* arg, Stdlib::Printer& out);
+    void StartJob(bool unload, const char* arg, const char* params, Stdlib::Printer& out);
     LoadedModule* FindLocked(const char* name);
     void Remove(LoadedModule* module);
 

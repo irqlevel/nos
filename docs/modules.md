@@ -91,6 +91,50 @@ To add a module:
    -- not to `default-members`, which is what the kernel's own build compiles;
 3. add `<name>` to `MODULES` in the `Makefile`.
 
+### Parameters
+
+What `insmod` is given after the path is the module's: `insmod /hv.ko
+vms=/data/vms` hands `vms=/data/vms` to hv's init. A module that takes
+parameters is declared with `init_with_params`, and its init is lent them --
+and `insmod`'s output, to say what it makes of them:
+
+```rust
+fn init(params: &kmod::Params, out: &mut kcore::cmd::Output)
+    -> kcore::error::Result<Box<dyn kmod::Module>> {
+    for (key, value) in params.words() {
+        match (key, value) {
+            ("vms", Some(path)) => { /* ... */ }
+            _ => {
+                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder> is", key);
+                return Err(kcore::error::Error::InvalidValue);
+            }
+        }
+    }
+    // ...
+}
+
+kmod::module!(name: "hv", init_with_params: init);
+```
+
+`Params::words` splits them at blanks, each `key=value` or a word alone, so
+a value has no blank in it; `text` is all of them as typed. They are lent
+for the init's call: what a module keeps of them, it copies. A parameter a
+module has not got should fail the load, said on `out`, as hv's and
+`modtest`'s do -- a word meant for it dropped without a sound is a setting
+the machine goes on without, and nobody told. A module declared with
+`init` takes none, and refuses any:
+
+```
+$ insmod /sshd.ko port=2222
+sshd: takes no parameters, and was given "port=2222"
+module: sshd: init failed
+insmod: /sshd.ko failed, error 502
+```
+
+They are at most 255 bytes (`ModuleTable::ParamsMax`). Since its init takes
+them, the module's header is at layout version 2, and a module built before
+is refused with `header version 1, this kernel reads 2`: rebuild it.
+
 ## Building
 
 ```
@@ -153,7 +197,7 @@ release's `SHA256SUMS` covers the modules too, for `sha256` to check.
 
 ## Loading
 
-`insmod <path>` reads a `.ko` off any mounted filesystem -- put it on the root
+`insmod <path> [params]` reads a `.ko` off any mounted filesystem -- put it on the root
 filesystem with `wget` from a web server on the build host, or build it into
 a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
 (`kernel/module.cpp`) then:
@@ -195,8 +239,9 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
    shot down, and on arm64 the new code is cleaned from the data cache and
    invalidated in every CPU's instruction cache (`Hal::SyncInstructionCache`),
    which x86 does not need.
-7. **runs its init**. A second module by the same name is refused before
-   this, and an init that fails leaves nothing behind.
+7. **runs its init**, lending it the parameters and `insmod`'s output
+   ([Parameters](#parameters)). A second module by the same name is refused
+   before this, and an init that fails leaves nothing behind.
 
 `rmmod <name>` runs the module's exit -- dropping its state -- and only then
 unmaps and frees its pages. A command the module registered is taken away
@@ -564,7 +609,10 @@ kernel heap, a kernel object created and destroyed through the export table
 command the module registered through the shell's dispatcher, has the
 symbolizer name the function whose address the command prints, checks a
 second copy is refused, unloads it and checks the command went with it,
-twice; and last feeds the loader damaged copies -- truncated, another
+twice -- the second time given `answer=7`, which the command must answer
+with, so what `insmod` was given has reached the init whole; then has a
+parameter `modtest` has not got refused by its init, and parameters longer
+than 255 bytes by the loader; and last feeds the loader damaged copies -- truncated, another
 machine's, an import the kernel lacks, no header, a bad magic, another kernel
 interface -- each of which it must refuse.
 

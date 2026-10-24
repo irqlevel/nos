@@ -48,6 +48,7 @@ pub static ALL: &[Target] = &[
     Target { name: "platform", run: crate::platform::platform, max_len: 16384 },
     Target { name: "policy", run: crate::policymodel::policy_target, max_len: 1024 },
     Target { name: "place", run: crate::placemodel::place_target, max_len: 2048 },
+    Target { name: "config", run: crate::configmodel::config_target, max_len: 4096 },
 ];
 
 /// The input, read as a stream of choices: past its end every read is 0, and

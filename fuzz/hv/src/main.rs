@@ -104,9 +104,14 @@ pub mod smp;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
 #[path = "../../../src/rust/modules/hv/src/net.rs"]
 pub mod switch;
+/// A VM's vm.toml, from the module: what an operator writes, read and
+/// written back.
+#[path = "../../../src/rust/modules/hv/src/config.rs"]
+pub mod vmconfig;
 #[path = "../../../src/rust/hv/src/walk.rs"]
 pub mod walk;
 
+mod configmodel;
 mod guestnet;
 mod netrx;
 mod offloadmodel;

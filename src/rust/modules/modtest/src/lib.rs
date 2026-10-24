@@ -4,7 +4,9 @@
 //! loader (TestModules in kernel/test.cpp). Its init does what a module does
 //! and checks every result: a check that fails fails the init, the load and
 //! the boot test. What it leaves behind is a shell command, which the test
-//! runs through the kernel's dispatcher and reads the answer of.
+//! runs through the kernel's dispatcher and reads the answer of. It takes
+//! one parameter, `answer=N`, the number the command answers with, so the
+//! test can see what `insmod` was given reach the init.
 
 extern crate alloc;
 
@@ -12,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use kcore::cmd::Command;
+use kcore::cmd::{Command, Output};
 use kcore::error::{Error, Result};
 
 /* Initialized data, zeroed data, and a table of function pointers. The first
@@ -74,7 +76,25 @@ fn check(ok: bool, what: &str) -> Result<()> {
     Err(Error::InvalidValue)
 }
 
-fn init() -> Result<Box<dyn kmod::Module>> {
+/// `answer=N`, if it was given; what else was, refused as a module refuses
+/// a parameter it has not got.
+fn answer_given(params: &kmod::Params, out: &mut Output) -> Result<Option<u32>> {
+    let mut answer = None;
+    for (key, value) in params.words() {
+        match (key, value.map(str::parse::<u32>)) {
+            ("answer", Some(Ok(n))) if answer.is_none() => answer = Some(n),
+            _ => {
+                let _ = writeln!(out, "modtest: \"{}\" is not a parameter of modtest's -- answer=N is, once", key);
+                return Err(Error::InvalidValue);
+            }
+        }
+    }
+    Ok(answer)
+}
+
+fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>> {
+    let given = answer_given(params, out)?;
+
     let data: u32 = DATA.iter().map(|v| v.load(Ordering::Relaxed)).sum();
     check(data == 10, ".data")?;
 
@@ -103,7 +123,7 @@ fn init() -> Result<Box<dyn kmod::Module>> {
 
     /* Where one of its functions landed, for the test to name through the
        kernel's symbolizer -- the way a backtrace through this module would */
-    let answer = shape.area() + data;
+    let answer = given.unwrap_or(shape.area() + data);
     let probe = double as fn(u32) -> u32 as usize;
     let cmd = Command::register("modtest", "modtest - the loader self-test module's command", move |args, out| {
         let _ = writeln!(out, "modtest: answer {} args '{}' double at {}", answer, args, probe);
@@ -113,4 +133,4 @@ fn init() -> Result<Box<dyn kmod::Module>> {
     Ok(Box::new(ModTest { _cmd: cmd }))
 }
 
-kmod::module!(name: "modtest", init: init);
+kmod::module!(name: "modtest", init_with_params: init);
