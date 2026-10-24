@@ -395,9 +395,14 @@ impl Netconsole {
         /* Skip whatever the drain task produces, IRQs taken on top of it
          * included: the transmit path traces, and capturing that would make
          * the loop generate its own work forever. Those lines still reach
-         * the kernel log and the console. */
+         * the kernel log and the console. Asked without a complaint: this
+         * runs wherever a line is traced or a panic printed, on stacks that
+         * are no task's too -- x86's double fault's, a parked CPU's -- where
+         * current_id()'s would be a panic inside the panic, and the report
+         * would stop at its first line, before the netconsole had any of
+         * it. */
         let drain = self.drain_id.load(Ordering::Acquire);
-        if drain != 0 && kcore::task::current_id() == drain {
+        if drain != 0 && kcore::task::current_id_or_none() == drain {
             return;
         }
 

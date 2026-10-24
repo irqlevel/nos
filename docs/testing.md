@@ -755,7 +755,8 @@ own, TCP's flags in combinations that mean something. The targets:
   end, and exactly what the command printed;
 - `netconsole`: the kernel log to a collector that is there, beyond the
   gateway or not yet, from a machine without an address, whose NIC stalls,
-  logging past what the ring holds and from tasks in the middle of a send:
+  logging past what the ring holds, from tasks in the middle of a send and
+  from interrupt handlers, where there is no task to ask about:
   the datagrams numbered with no gap of the machine's making, each line at
   most once, in order, and all of it in the end but what the ring says it
   dropped;
@@ -821,7 +822,15 @@ What it found on its first day, each fixed:
   interrupts off, whenever the device had no address -- the guard of a
   `match`'s scrutinee lives to the end of the match -- and every line any
   CPU traced waited behind it; and a batch whose records the ring evicted
-  while it was on its way was sent again.
+  while it was on its way was sent again;
+- and later, by a panic made to run on a parked CPU's stack rather than by
+  an input: netconsole asked which task was logging in the way that
+  complains off a task's stack, so a panic reported from one -- x86's
+  double fault's, a parked CPU's -- panicked inside itself at its first
+  line, before the netconsole had any of it, and went no further. It asks
+  the way that answers 0 there now, and the target logs from interrupt
+  handlers, where the machine's stand-in for the kernel makes the same
+  complaint: put back, the old call is found at the first input.
 
 ### `fs-fuzz.py` -- everything a disk hands the kernel, fuzzed
 
