@@ -1,12 +1,11 @@
 #pragma once
 
 #include <lib/stdlib.h>
+#include <hal/context.h>
 #include "atomic.h"
 
 namespace Kernel
 {
-
-struct Context;
 
 class Panicker
 {
@@ -28,6 +27,14 @@ public:
        CPU's stack, in which case it has been recorded and the caller must
        not go on to panic about the NMI itself. */
     bool CollectRemoteStack();
+
+    /* Called first by the handlers of the faults a read can raise -- x86's
+       page fault, general protection fault and stack fault, arm64's sync
+       exception. When the fault is the panicking CPU's own, in a read its
+       report could not be sure of (ProbeCpu, see DoPanicCtx), it does not
+       return: it resumes the report past that read. Otherwise it returns,
+       and the fault is reported as any other. */
+    void RecoverFault();
 
 private:
 
@@ -65,6 +72,12 @@ private:
        200 characters (RUSTUB=1, docs/build.md). */
     char Message[512];
     Atomic Active;
+
+    /* A read of memory that may not be there, by the CPU making the report:
+       that CPU's index in ProbeCpu while it lasts, -1 otherwise, and in
+       ProbeJump where a fault in it resumes. */
+    JmpContext ProbeJump;
+    Atomic ProbeCpu;
 
     Atomic Collecting;
     ulong RemoteFrame[RemoteCpuCount][RemoteFrameCount];

@@ -342,7 +342,11 @@ the page allocator's 8-page bucket hands out blocks aligned to their own
 size. The bottom page is a tripwire: a stack pointer inside it is a
 `BugOn`, not a silent corruption. There is deliberately no `Trace()` in
 `GetCurrentTask` — tracing takes a lock, which calls `PreemptDisable`, which
-calls `GetCurrentTask`.
+calls `GetCurrentTask`. Every lock asks that way (`PreemptCurrentTask`) until a
+panic has begun; from then on a stack that is no task's -- x86's double
+fault's, a static one -- has nothing to count, since the panic switches to no
+task again, and the `BugOn` there would be a panic inside the panic that only
+spins, the report stopped at its first lock.
 
 Stacks are filled with a pattern before first use, so `stacks` can report
 each task's high-water mark: what is still intact is what the task never
