@@ -40,6 +40,7 @@ pub static ALL: &[Target] = &[
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
+    Target { name: "pvh", run: pvh, max_len: 4096 },
     Target { name: "acpi", run: acpi, max_len: 512 },
     Target { name: "dhcp", run: dhcp, max_len: 1024 },
     Target { name: "switch", run: crate::guestnet::switch_target, max_len: 8192 },
@@ -1223,6 +1224,229 @@ fn linux(r: &mut Input) {
     let _ = build(&memory, &h, &first, &l, &cmdline, cpus, firmware, &routes[..r.below(3) as usize], r.bool());
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &l);
+}
+
+/* ---- what a guest's image decides: a PVH ELF ---- */
+
+/// The file the PVH loader reads: its bytes, a read past the end short, as
+/// a file's is -- and every read short, when the input says, as a file's
+/// may be.
+struct ElfFile<'a> {
+    bytes: &'a [u8],
+    short: bool,
+}
+
+impl crate::pvh::ReadAt for ElfFile<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
+        let Some(rest) = usize::try_from(offset).ok().and_then(|o| self.bytes.get(o..)) else { return Ok(0) };
+        let n = rest.len().min(buf.len()).min(if self.short { 7 } else { usize::MAX });
+        buf[..n].copy_from_slice(&rest[..n]);
+        Ok(n)
+    }
+}
+
+/* The ELF the target makes: a header of either class, its program headers
+ * right after it, and a body the segments and the note are cut from. */
+const PVH_PT_LOAD: u32 = 1;
+const PVH_PT_NOTE: u32 = 4;
+
+fn put_at(f: &mut [u8], at: usize, bytes: &[u8]) {
+    if let Some(dst) = f.get_mut(at..at + bytes.len()) {
+        dst.copy_from_slice(bytes);
+    }
+}
+
+/// An image that parses more often than random bytes would: a well-formed
+/// ELF -- loadable segments, mostly above 1 MiB and apart, and the `Xen`
+/// note naming an entry, mostly in one of them -- with the input's values
+/// where they decide the layout, and a few of its bytes anywhere.
+fn elf_image(r: &mut Input) -> Vec<u8> {
+    let wide = r.u8() < 200;
+    let (ehdr, phdr) = if wide { (64usize, 56usize) } else { (52usize, 32usize) };
+    let phnum = r.below(7) as usize;
+    let body_at = ehdr + phnum * phdr;
+    let body = 0x200 + r.below(0x2000) as usize;
+    let mut f = vec![0u8; body_at + body];
+
+    put_at(&mut f, 0, &[0x7F, b'E', b'L', b'F', if wide { 2 } else { 1 }, 1, 1]);
+    let machine: u16 = if r.u8() < 240 { if wide { 62 } else { 3 } } else { r.u16() };
+    put_at(&mut f, 18, &machine.to_le_bytes());
+    let phoff = if r.u8() < 240 { ehdr as u64 } else { r.value64() };
+    let phentsize = if r.u8() < 240 { phdr as u16 } else { r.u16() };
+    let count = if r.u8() < 240 { phnum as u16 } else { r.u16() };
+    if wide {
+        put_at(&mut f, 32, &phoff.to_le_bytes());
+        put_at(&mut f, 54, &phentsize.to_le_bytes());
+        put_at(&mut f, 56, &count.to_le_bytes());
+    } else {
+        put_at(&mut f, 28, &(phoff as u32).to_le_bytes());
+        put_at(&mut f, 42, &phentsize.to_le_bytes());
+        put_at(&mut f, 44, &count.to_le_bytes());
+    }
+
+    /* The note, somewhere in the body: "Xen", type 18, a 4- or 8-byte
+     * entry -- mostly the first segment's first byte. */
+    let note_at = body_at + (r.below((body - 24) as u64) as usize & !3);
+    let first_paddr = 0x10_0000 + (r.below(64) << 20);
+    let entry = if r.u8() < 200 { first_paddr + r.below(0x100) } else { r.value64() };
+    let desc8 = r.u8() < 64;
+    let descsz: u32 = if desc8 { 8 } else { 4 };
+    put_at(&mut f, note_at, &4u32.to_le_bytes());
+    put_at(&mut f, note_at + 4, &descsz.to_le_bytes());
+    put_at(&mut f, note_at + 8, &(if r.u8() < 240 { 18u32 } else { r.u32() }).to_le_bytes());
+    put_at(&mut f, note_at + 12, if r.u8() < 240 { b"Xen\0" } else { b"Nos\0" });
+    if desc8 {
+        put_at(&mut f, note_at + 16, &entry.to_le_bytes());
+    } else {
+        put_at(&mut f, note_at + 16, &(entry as u32).to_le_bytes());
+    }
+    let note_len = 16 + descsz as u64;
+
+    let mut paddr = first_paddr;
+    let file_end = (body_at + body) as u64;
+    for i in 0..phnum {
+        let at = ehdr + i * phdr;
+        let note = i == 0 && r.u8() < 230;
+        let (kind, offset, filesz, memsz) = if note {
+            (PVH_PT_NOTE, note_at as u64, note_len, note_len)
+        } else {
+            let offset = if r.u8() < 230 { (body_at as u64) + r.below(body as u64) } else { r.value64() };
+            let filesz = if r.u8() < 230 { r.below(file_end - offset.min(file_end)) } else { r.value64() };
+            let memsz = if r.u8() < 230 { filesz.saturating_add(r.below(1 << 20)) } else { r.value64() };
+            (if r.u8() < 240 { PVH_PT_LOAD } else { r.u32() }, offset, filesz, memsz)
+        };
+        let this = if note { 0 } else if r.u8() < 220 { paddr } else { r.value64() };
+        if !note {
+            paddr = paddr.saturating_add(memsz.max(1)).saturating_add(r.below(0x1000) * 0x1000);
+        }
+        put_at(&mut f, at, &kind.to_le_bytes());
+        if wide {
+            put_at(&mut f, at + 8, &offset.to_le_bytes());
+            put_at(&mut f, at + 24, &this.to_le_bytes());
+            put_at(&mut f, at + 32, &filesz.to_le_bytes());
+            put_at(&mut f, at + 40, &memsz.to_le_bytes());
+        } else {
+            put_at(&mut f, at + 4, &(offset as u32).to_le_bytes());
+            put_at(&mut f, at + 12, &(this as u32).to_le_bytes());
+            put_at(&mut f, at + 16, &(filesz as u32).to_le_bytes());
+            put_at(&mut f, at + 20, &(memsz as u32).to_le_bytes());
+        }
+    }
+    for _ in 0..r.below(4) {
+        let at = r.below(f.len() as u64) as usize;
+        f[at] = r.u8();
+    }
+    f
+}
+
+/// How deep the `pvh` target's inputs got -- parsed, planned, built -- for
+/// `HV_FUZZ_STATS`.
+static PVH_PARSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PVH_PLANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PVH_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn report() {
+    use std::sync::atomic::Ordering::Relaxed;
+    println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
+             PVH_BUILT.load(Relaxed));
+}
+
+fn pvh(r: &mut Input) {
+    use crate::pvh::{build, plan, set_entry, Image, MAX_SEGMENTS, START_INFO};
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = elf_image(r);
+    let file_len = if r.u8() < 240 { f.len() as u64 } else { r.value64() };
+    let mut file = ElfFile { bytes: &f, short: r.u8() < 32 };
+    let Ok(image) = Image::parse(&mut file, file_len) else { return };
+    PVH_PARSED.fetch_add(1, Relaxed);
+
+    /* What the module streams by: each segment's bytes in the file, the
+     * segments apart, and the entry an instruction the file holds. */
+    let segs = image.segments();
+    invariant!(!segs.is_empty() && segs.len() <= MAX_SEGMENTS, "{} segments", segs.len());
+    for (i, s) in segs.iter().enumerate() {
+        invariant!(s.filesz <= s.memsz, "a segment of {:#x} file bytes in {:#x}", s.filesz, s.memsz);
+        invariant!(s.offset.checked_add(s.filesz).is_some_and(|e| e <= file_len),
+                   "a segment's bytes at {:#x}, {:#x} of them, in a file of {:#x}", s.offset, s.filesz, file_len);
+        invariant!(s.paddr.checked_add(s.memsz).is_some(), "a segment at {:#x} of {:#x} bytes", s.paddr, s.memsz);
+        for t in &segs[i + 1..] {
+            invariant!(s.paddr + s.memsz <= t.paddr || t.paddr + t.memsz <= s.paddr,
+                       "segments over each other: {:#x}+{:#x} and {:#x}+{:#x}", s.paddr, s.memsz, t.paddr, t.memsz);
+        }
+    }
+    let e = u64::from(image.entry);
+    invariant!(segs.iter().any(|s| e >= s.paddr && e - s.paddr < s.filesz),
+               "the entry {:#x} in no segment's file bytes", e);
+
+    let mem_bytes = match r.u8() % 8 {
+        0 => r.value64() & !0xFFF,
+        1 => 1 << 40,
+        _ => (16 + r.below(4096 - 16 + 1)) << 20,
+    };
+    let initrd_len = match r.u8() % 4 {
+        0 => r.value64(),
+        1 => 0,
+        _ => r.below(64 << 20),
+    };
+    let Ok(l) = plan(&image, mem_bytes, initrd_len) else { return };
+    PVH_PLANNED.fetch_add(1, Relaxed);
+    for s in segs {
+        invariant!(s.paddr >= 1 << 20 && s.paddr + s.memsz <= mem_bytes,
+                   "a segment at {:#x} of {:#x} bytes, in {:#x} of RAM, over the tables below 1 MiB", s.paddr, s.memsz,
+                   mem_bytes);
+    }
+    let image_end = segs.iter().map(|s| s.paddr + s.memsz).max().unwrap_or(0);
+    if l.initrd_len != 0 {
+        invariant!(l.initrd_addr % 0x1000 == 0 && l.initrd_addr >= image_end
+                   && l.initrd_addr.checked_add(l.initrd_len).is_some_and(|e| e <= mem_bytes),
+                   "an initrd at {:#x} of {:#x} bytes, the image to {:#x}, in {:#x}", l.initrd_addr, l.initrd_len,
+                   image_end, mem_bytes);
+    }
+    if mem_bytes > 4096 << 20 {
+        return;
+    }
+
+    let memory = GuestMemory::with_size(mem_bytes);
+    let cmdline: Vec<u8> = (0..r.below(2100)).map(|_| r.u8()).collect();
+    let firmware = r.bool().then_some(crate::linux::Firmware { rsdp: crate::acpi::AREA, start: crate::acpi::AREA,
+                                                               end: crate::acpi::AREA_END });
+    let routes = [crate::acpi::Route { slot: 1, irq: 11 }, crate::acpi::Route { slot: 2, irq: 10 }];
+    let cpus = 1 + r.below(16) as u32;
+    if build(&memory, &l, &cmdline, cpus, firmware, &routes[..r.below(3) as usize], r.bool()).is_ok() {
+        PVH_BUILT.fetch_add(1, Relaxed);
+        /* What the image is told: the start info's magic and its memory
+         * map -- RAM up to the guest's last byte, below the 640 KiB hole and
+         * from 1 MiB, entries apart and in order -- and an initrd as the
+         * one module there is. */
+        let mut si = [0u8; 56];
+        memory.read(START_INFO, &mut si).expect("the start info");
+        let at32 = |o: usize| u32::from_le_bytes(si[o..o + 4].try_into().unwrap());
+        let at64 = |o: usize| u64::from_le_bytes(si[o..o + 8].try_into().unwrap());
+        invariant!(at32(0) == 0x336E_C578 && at32(4) == 1, "a start info of magic {:#x}, version {}", at32(0), at32(4));
+        invariant!(at32(12) == u32::from(l.initrd_len != 0), "{} modules, for an initrd of {}", at32(12), l.initrd_len);
+        let (map, n) = (at64(40), at32(48) as usize);
+        invariant!((2..=3).contains(&n), "a memory map of {} entries", n);
+        let mut end = 0u64;
+        let mut ram_top = 0u64;
+        for i in 0..n {
+            let mut ent = [0u8; 24];
+            memory.read(map + (i * 24) as u64, &mut ent).expect("a memory map entry");
+            let addr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+            let size = u64::from_le_bytes(ent[8..16].try_into().unwrap());
+            let kind = u32::from_le_bytes(ent[16..20].try_into().unwrap());
+            invariant!(addr >= end && size != 0 && matches!(kind, 1 | 2),
+                       "memory map entry {}: {:#x}+{:#x}, type {}, after {:#x}", i, addr, size, kind, end);
+            end = addr + size;
+            if kind == 1 {
+                ram_top = end;
+            }
+        }
+        invariant!(ram_top == mem_bytes, "RAM to {:#x} in a guest of {:#x}", ram_top, mem_bytes);
+    }
+    let mut vcpu = crate::vm::Backend::default();
+    set_entry(&mut vcpu, &image);
+    invariant!(vcpu.save().rip == e && vcpu.regs().rbx == START_INFO && vcpu.save().cr0 & (1 << 31) == 0,
+               "the PVH entry at {:#x}, EBX {:#x}, CR0 {:#x}", vcpu.save().rip, vcpu.regs().rbx, vcpu.save().cr0);
 }
 
 /* ---- the ACPI tables, for any machine the host could describe ---- */

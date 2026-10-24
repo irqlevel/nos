@@ -74,6 +74,7 @@ use crate::devices::virtio::Raise;
 use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
+use crate::pvh;
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::mmio;
@@ -920,6 +921,30 @@ impl LinuxGuest {
         let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
         linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         linux::set_entry(bsp.cpu.backend_mut(), &layout);
+        self.loaded = true;
+        Ok(())
+    }
+
+    /// As [`Self::load`], for a PVH image (`crate::pvh`) whose segments, and
+    /// initrd, the caller has streamed in: its start info, command line and
+    /// memory map, the MP and ACPI tables, and its first CPU at the image's
+    /// 32-bit entry. Paging is off there, which under VT-x takes
+    /// unrestricted guest: without it, `NoUnrestrictedGuest`.
+    pub fn load_pvh(&mut self, bsp: &mut GuestCpu, image: &pvh::Image, layout: pvh::Layout, cmdline: &[u8])
+        -> Result<()>
+    {
+        if bsp.index != 0 || self.loaded {
+            return Err(Error::BadAddress);
+        }
+        if !bsp.cpu.backend().runs_real_mode() {
+            return Err(Error::NoUnrestrictedGuest);
+        }
+        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let (n, msix) = self.pci_routes(&mut routes)?;
+        let ioapic = self.has_ioapic();
+        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        pvh::build(&self.memory, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
+        pvh::set_entry(bsp.cpu.backend_mut(), image);
         self.loaded = true;
         Ok(())
     }

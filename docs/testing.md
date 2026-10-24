@@ -125,14 +125,15 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry |
+| `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
 
@@ -1357,7 +1358,47 @@ exist are each refused. Its last loads are of hv's one parameter: a load
 with none keeps the VMs' folders in `/vms`, a parameter hv has not got and
 a `vms=` that is no absolute path refuse the load, each saying why, and
 `vms=/data/vms/` is kept -- its slash let go -- as `hv` and `hv vms` must
-say. On arm64, which runs no Linux guest yet, a parameter is refused.
+say. On arm64, which runs no Linux guest yet, a parameter is refused. On
+x86-64 it loads hv once more and `hv boot`s hvboot with no disk: a PVH
+image ([A guest's own kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)),
+started at its 32-bit entry with paging off -- under VT-x, by unrestricted
+guest -- which has to say it read the start info hv laid out (its RAM, and
+its command line), that it has no disk, and turn the guest off through its
+ACPI.
+
+### `hvboot-test.py` -- what hvboot would boot, decided on the host
+
+hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
+configuration, and boots the entry GRUB would: get any of that wrong and
+the guest boots something else -- an older kernel, the recovery entry --
+with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
+(`src/rust/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs`), into a host
+program, and the gate runs it over disks it makes: a GPT whose /boot is a
+partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
+MBR whose /boot is on the root filesystem (as Debian's), and a disk that is
+one filesystem whole; ext4 with extents, ext3, and ext2 with 1 KiB blocks,
+whose 6 MiB kernel runs into the double-indirect blocks. On each, a
+grub.cfg written as grub-mkconfig writes Ubuntu's -- `load_env`, the
+`next_entry` conditional, `$menuentry_id_option`, `search --fs-uuid` in both
+branches of an `if`, a submenu, the firmware entry inside an `if` -- and the
+cases GRUB decides among: no grubenv, the first entry; `hvboot.entry=1>1`,
+the submenu's recovery entry; grubenv's `next_entry=1>2`, an older kernel
+with two initrds, joined at GRUB's 4-byte alignment; GRUB_DEFAULT=saved
+with `saved_entry` naming a submenu's entry by both their ids; and a
+`saved_entry` that names no entry, which boots the first and says so. Each
+must give the entry, the command line (`BOOT_IMAGE=` first) and the kernel
+and initrd bytes, read by hvboot's own reader, as they were written. The
+partition tables are the script's own, written by the UEFI specification's
+layout and CRCs; the filesystems are mke2fs's.
+
+Then each disk is fuzzed: the sectors a clean run reads as metadata --
+tables, superblocks, descriptors, inodes, extent and directory blocks,
+grub.cfg -- have up to eight bytes changed at random, a disk at a time, and
+the code is held to never panicking (overflow checks on), never reading
+outside the disk and always ending. `--image <disk.raw>` does the same for
+a distribution's image: Ubuntu 24.04's and Debian 13's were read so on
+2026-10-24 -- their kernels and initrds as `debugfs` reads them, byte for
+byte -- and fuzzed for 50,000 disks each, with no finding.
 
 In between it runs guests. Before `hv on`, and bound to a CPU the extension
 is off for, a guest is not run, and says which CPU. With it on everywhere,
@@ -1864,6 +1905,18 @@ no unit failed, its root read-write and kept across a reboot, the network
 and the way out, `hv stop` turning it off -- but its network comes up from
 the `ip=` hv gives a networked guest, which its initramfs sets and
 cloud-init keeps, rather than by DHCP.
+
+`--hvboot` boots Debian's and Ubuntu's images the way a disk boots, with
+nothing taken out of them: the VM's kernel is hvboot (`out/x86_64/hvboot`,
+which `make` builds), which reads the image's own grub.cfg, picks the entry
+GRUB would boot, and boots its kernel and initrd off the image's own /boot
+([A guest's own kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)).
+The VM's command line is only what the profile adds after the entry's --
+Debian's credentials; Ubuntu, nothing. The checks are the same, and two
+more: hvboot reached the kernel -- the last line it prints before the jump
+-- and its console says it booted the default entry of the image's own
+grub.cfg. Both, under TCG on the Mac (2026-10-24): 23 of 23, hvboot at the
+kernel 0.6 s after the VM starts.
 
 `--cpus N` gives each guest N CPUs, and their local APICs -- the command
 line then without the `nolapic` a guest of one CPU is given -- and every

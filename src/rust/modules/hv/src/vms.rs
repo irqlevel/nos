@@ -60,7 +60,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> | <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -933,7 +933,7 @@ impl Vms {
         table.vms.iter().find(|vm| vm.name.as_deref() == Some(name)).map(|vm| (vm.shared.id, vm.shared.running()))
     }
 
-    /// `hv start <bzImage> [words]`, or `hv start <name|folder>`: a guest by
+    /// `hv start <kernel> [words]`, or `hv start <name|folder>`: a guest by
     /// its kernel's path and the words after it, or a VM from its folder --
     /// a name's under `root` -- built, put on a vCPU task, and come back.
     pub fn start(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, root: &str, args: &str,
