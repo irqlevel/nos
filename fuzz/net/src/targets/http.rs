@@ -223,9 +223,10 @@ fn broken(r: &mut Input) -> Answer {
             format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{}\r\nabc\r\n0\r\n\r\n",
                     d.to_string().repeat(digits)).into_bytes()
         }
-        /* A content length longer than any number, or past the cap. */
+        /* A content length longer than any number, or past 32 bits: the
+         * client has no cap, and a length kept in 32 would say 1. */
         2 => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\nbody",
-                     r.pick(&["99999999999999999999999999", "20971521", "18446744073709551616", "-1", "0x10"]))
+                     r.pick(&["99999999999999999999999999", "4294967297", "18446744073709551616", "-1", "0x10"]))
             .into_bytes(),
         /* A redirect to a URL with a port longer than any number, or none. */
         3 => format!("HTTP/1.1 302 Found\r\nLocation: http://{}:{}/x\r\n\r\n", Ipv4(SERVER_IP),

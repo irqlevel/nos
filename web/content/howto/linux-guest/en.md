@@ -121,7 +121,7 @@ cp linux/arch/x86/boot/bzImage guest/initrd rootdir/
 nos/scripts/mkrootfs.sh root.img 256 rootdir
 ```
 
-`mkrootfs.sh` labels the filesystem `nos`. The ISO boots nos with `root=auto`, which mounts the filesystem with that label read-write on `/`. On a Mac, the script runs `mkfs.ext2` in the `nos-builder` container that `build-iso-docker.sh` created. Everything the guests use must be in `rootdir/` when you make the image. The disk and Alpine sections below add files: put them in `rootdir/` and run `mkrootfs.sh` again before the next boot. You can also download a file of up to 20 MiB from inside nos with `wget <url> <path>`.
+`mkrootfs.sh` labels the filesystem `nos`. The ISO boots nos with `root=auto`, which mounts the filesystem with that label read-write on `/`. On a Mac, the script runs `mkfs.ext2` in the `nos-builder` container that `build-iso-docker.sh` created. Everything the guests use must be in `rootdir/` when you make the image. The disk and Alpine sections below add files: put them in `rootdir/` and run `mkrootfs.sh` again before the next boot. You can also download a file from inside nos with `wget <url> <path>`, even a disk image of several gigabytes.
 
 ## 4. Boot nos
 
