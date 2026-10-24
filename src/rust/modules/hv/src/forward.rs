@@ -29,7 +29,7 @@ use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
 
 use crate::net;
 
-const MAX_FORWARDS: usize = 8;
+pub const MAX_FORWARDS: usize = 8;
 const MAX_CONNS: usize = 8;
 /// How long the listener waits for a connection before it looks at its stop
 /// flag; and a relay's wait on each side before it looks at the other.

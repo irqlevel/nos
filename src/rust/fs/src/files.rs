@@ -14,7 +14,7 @@ use kcore::cmd::Output;
 use kcore::trace;
 
 use crate::paths::Path;
-use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_READ, OPEN_WRITE};
+use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_WRITE};
 use crate::vnode::Kind;
 use crate::vfs_instance;
 
@@ -540,6 +540,97 @@ pub unsafe extern "C" fn kernel_dir_create(path: *const u8, path_len: usize) -> 
         Some(_) => -1,
         None => if vfs.create(path.as_bytes(), true) { 0 } else { -1 },
     }
+}
+
+/// What `kernel_dir_entry` says an entry is.
+pub const ENTRY_FILE: u32 = 1;
+pub const ENTRY_DIR: u32 = 2;
+/// What it answers past the last entry, and for a path that names no
+/// directory -- which an empty directory is not.
+pub const ENTRY_END: isize = -1;
+pub const ENTRY_NO_DIR: isize = -2;
+
+/// The `index`'th entry of the directory at `path`: the length of its name,
+/// the name into `name` -- as much of it as `cap` holds -- its kind into
+/// `kind` (`ENTRY_FILE`, `ENTRY_DIR`) and a file's size into `size`;
+/// `ENTRY_END` past the last entry, `ENTRY_NO_DIR` when the path names no
+/// directory. The directory is looked up afresh for every call, so nothing
+/// is held between them: what an index names may change as the directory
+/// does.
+///
+/// # Safety
+/// `path` points at `path_len` readable bytes, `name` at `cap` writable
+/// ones; `kind` and `size` are writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dir_entry(
+    path: *const u8, path_len: usize, index: usize, name: *mut u8, cap: usize, kind: *mut u32, size: *mut u64,
+) -> isize {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return ENTRY_NO_DIR,
+    };
+    if (name.is_null() && cap != 0) || kind.is_null() || size.is_null() {
+        return ENTRY_NO_DIR;
+    }
+    match stat(vfs, path.as_bytes()) {
+        Some(st) if st.kind == Kind::Dir => {}
+        _ => return ENTRY_NO_DIR,
+    }
+
+    let Some(entry) = vfs.read_dir(path.as_bytes(), index) else { return ENTRY_END };
+    let full = entry.name();
+    let n = full.len().min(cap);
+    if n != 0 {
+        unsafe { core::slice::from_raw_parts_mut(name, n) }.copy_from_slice(&full[..n]);
+    }
+    unsafe {
+        *kind = if entry.kind == Kind::Dir { ENTRY_DIR } else { ENTRY_FILE };
+        *size = entry.size as u64;
+    }
+    full.len() as isize
+}
+
+/// Appends `data` to the file at `path`, making the file when there is none:
+/// 0, or -1 -- also for a write cut short, which may have left a first part
+/// of `data` at the end. Not synced: a log's lines, put on the medium by the
+/// filesystem's own sync. Not for a file `kernel_file_write` keeps, whose
+/// content may be at `<path>.new` (`locate`).
+///
+/// # Safety
+/// `path` points at `path_len` bytes; `data` at `len`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_append(
+    path: *const u8, path_len: usize, data: *const u8, len: usize,
+) -> i32 {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    if data.is_null() && len != 0 {
+        return -1;
+    }
+
+    let file = match Open::new(vfs, path.as_bytes(), OPEN_WRITE | OPEN_CREATE | OPEN_APPEND) {
+        Some(file) => file,
+        None => return -1,
+    };
+    if len == 0 || file.write(unsafe { bytes(data, len) }) { 0 } else { -1 }
+}
+
+/// Renames `from` to `to`, both on one filesystem: 0, or -1 -- also when
+/// something is at `to` already, or anything under `from` is open.
+///
+/// # Safety
+/// `from` points at `from_len` readable bytes, `to` at `to_len`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_rename(
+    from: *const u8, from_len: usize, to: *const u8, to_len: usize,
+) -> i32 {
+    let (vfs, from, to) = match (vfs_instance(), unsafe { ffi_path(from, from_len) }, unsafe { ffi_path(to, to_len) }) {
+        (Some(vfs), Some(from), Some(to)) => (vfs, from, to),
+        _ => return -1,
+    };
+    if vfs.rename(from.as_bytes(), to.as_bytes()) { 0 } else { -1 }
 }
 
 /// What a caller outside Rust wants written: nothing, for a length of 0,

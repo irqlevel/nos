@@ -719,57 +719,81 @@ impl Switch {
     /// A free port for `vm`: its number, or why there is none. The first
     /// VM on a port gives it its inbox's room, taken here with no lock held.
     pub fn claim(&self, vm: &Arc<Shared>) -> Result<usize, &'static str> {
-        for (i, p) in self.ports.ports.iter().enumerate() {
-            let roomless = {
-                let inbox = p.inbox.lock();
-                if inbox.owner.is_some() {
-                    continue;
-                }
-                inbox.frames.is_empty()
-            };
-            let mut room = Vec::new();
-            let mut sends = Vec::new();
-            if roomless {
-                room.try_reserve_exact(INBOX_FRAMES).map_err(|_| "out of memory for its port's inbox")?;
-                room.resize(INBOX_FRAMES, [0u8; FRAME]);
-                sends.try_reserve_exact(WHOLE_SENDS).map_err(|_| "out of memory for its port's inbox")?;
-                for _ in 0..WHOLE_SENDS {
-                    let mut send = Vec::new();
-                    send.try_reserve_exact(SEND).map_err(|_| "out of memory for its port's inbox")?;
-                    send.resize(SEND, 0);
-                    sends.push(send);
-                }
-            }
-            let mut inbox = p.inbox.lock();
-            /* Taken, or given its room, by another start meanwhile: the room
-             * taken here goes after the lock, and the next port is tried. */
-            if inbox.owner.is_none() && !(inbox.frames.is_empty() && room.is_empty()) {
-                if inbox.frames.is_empty() {
-                    core::mem::swap(&mut inbox.frames, &mut room);
-                    core::mem::swap(&mut inbox.sends, &mut sends);
-                }
-                /* An Arc clone under the lock: a count going up, nothing
-                 * allocated. */
-                inbox.owner = Some(vm.clone());
-                inbox.clear();
-                p.waiting.store(0, Ordering::Release);
-                p.dropped.store(0, Ordering::Relaxed);
-                p.spoofed.store(0, Ordering::Relaxed);
-                p.on_backlog.store(0, Ordering::Relaxed);
-                p.over_share.store(0, Ordering::Relaxed);
-                p.flooded.store(0, Ordering::Relaxed);
-                p.quiet_until.store(0, Ordering::Release);
-                p.takes_partial.store(false, Ordering::Release);
-                p.takes_whole.store(false, Ordering::Release);
-                *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
-                self.ports.in_use.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.ports.ports.len() {
+            if self.take(i, vm)? {
                 return Ok(i);
             }
-            drop(inbox);
-            drop(room);
-            drop(sends);
         }
         Err("every port of the switch is taken")
+    }
+
+    /// Port `port` for `vm`, and no other: what a VM with its own address
+    /// asks for (`port=`), the address and the MAC being the port's. Why
+    /// not, when it is taken or there is no such port.
+    pub fn claim_at(&self, port: usize, vm: &Arc<Shared>) -> Result<usize, &'static str> {
+        if port >= self.ports.ports.len() {
+            return Err("there is no such port on the switch");
+        }
+        if self.take(port, vm)? {
+            Ok(port)
+        } else {
+            Err("that port of the switch is another VM's")
+        }
+    }
+
+    /// Port `i` for `vm` if it is free: whether it was, or that its room
+    /// could not be had.
+    fn take(&self, i: usize, vm: &Arc<Shared>) -> Result<bool, &'static str> {
+        let Some(p) = self.ports.ports.get(i) else { return Ok(false) };
+        let roomless = {
+            let inbox = p.inbox.lock();
+            if inbox.owner.is_some() {
+                return Ok(false);
+            }
+            inbox.frames.is_empty()
+        };
+        let mut room = Vec::new();
+        let mut sends = Vec::new();
+        if roomless {
+            room.try_reserve_exact(INBOX_FRAMES).map_err(|_| "out of memory for its port's inbox")?;
+            room.resize(INBOX_FRAMES, [0u8; FRAME]);
+            sends.try_reserve_exact(WHOLE_SENDS).map_err(|_| "out of memory for its port's inbox")?;
+            for _ in 0..WHOLE_SENDS {
+                let mut send = Vec::new();
+                send.try_reserve_exact(SEND).map_err(|_| "out of memory for its port's inbox")?;
+                send.resize(SEND, 0);
+                sends.push(send);
+            }
+        }
+        let mut inbox = p.inbox.lock();
+        /* Taken, or given its room, by another start meanwhile: the room
+         * taken here goes after the lock, and the port is not this VM's. */
+        if inbox.owner.is_none() && !(inbox.frames.is_empty() && room.is_empty()) {
+            if inbox.frames.is_empty() {
+                core::mem::swap(&mut inbox.frames, &mut room);
+                core::mem::swap(&mut inbox.sends, &mut sends);
+            }
+            /* An Arc clone under the lock: a count going up, nothing
+             * allocated. */
+            inbox.owner = Some(vm.clone());
+            inbox.clear();
+            p.waiting.store(0, Ordering::Release);
+            p.dropped.store(0, Ordering::Relaxed);
+            p.spoofed.store(0, Ordering::Relaxed);
+            p.on_backlog.store(0, Ordering::Relaxed);
+            p.over_share.store(0, Ordering::Relaxed);
+            p.flooded.store(0, Ordering::Relaxed);
+            p.quiet_until.store(0, Ordering::Release);
+            p.takes_partial.store(false, Ordering::Release);
+            p.takes_whole.store(false, Ordering::Release);
+            *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
+            self.ports.in_use.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
+        }
+        drop(inbox);
+        drop(room);
+        drop(sends);
+        Ok(false)
     }
 
     /// The port given up, and its VM with it -- dropped here, the lock down.
