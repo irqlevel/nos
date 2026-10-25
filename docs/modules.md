@@ -495,6 +495,59 @@ calling task's identity (`kcore::task::current_id`). And it carries its own
 copy of the cryptography the TLS client uses: modules share nothing with the
 kernel but the exported functions.
 
+## edit
+
+`edit` (`src/rust/modules/edit`) is a text editor, for a person at an SSH
+session with a terminal: `edit /etc/rc`, from the shell `ssh <host>` gives,
+or `ssh -t <host> edit /etc/rc`. The image's `/etc/rc` loads it after sshd;
+on a machine whose `/etc/rc` came before that, `insmod /lib/modules/edit.ko`
+does, and a line saying so in `/etc/rc` keeps it -- an edit, now, of `/etc/rc`
+itself. The editor is a crate with no kernel in it, `src/rust/edit`, which
+`scripts/edit-test.py` runs on the host; the module is its seat in the
+kernel: the command, the file read and written, and the session's terminal
+-- the keys typed (`Output::read_input`) and its size, which the session
+tells the command it runs (`Output::terminal`, [sshd](sshd.md#the-shell-behind-it)).
+The console and the UDP shell have no terminal to lend, and `edit` says so
+there rather than draw on nothing.
+
+The keys are a Mac's habits on Control -- a terminal keeps Command for
+itself, and sends Option as characters unless told otherwise -- and nothing
+needs a key a Mac keyboard lacks:
+
+| Keys | |
+|---|---|
+| `^S` (`^O`) / `^Q` | save / quit, asked first when there are changes: `y` saves and leaves, `n` leaves without, `Esc` goes back |
+| `^F` | find: the match found as it is typed, `Enter` or `↓` the next, `↑` the one before, `Esc` leaves it selected; a term with no capital letter matches either case |
+| `^G` | go to a line |
+| `^Z` / `^Y` | undo / redo; a run of typing, of deletes or a paste is one step |
+| `^X` (`^K`) / `^C` / `^V` | cut / copy / paste the selection -- or, with none, the cursor's line, pasted back above the cursor's; cuts one after another collect their lines |
+| Shift with any move | selects |
+| `^A` / `^E` | the line's first character that is not blank, then its start / its end -- `⌘←` / `⌘→` under iTerm2's Natural Text Editing |
+| `⌥←` / `⌥→` | a word back / on |
+| `^W` / `^U` | delete the word before / everything before on the line -- `⌥⌫` / `⌘⌫` under Natural Text Editing |
+| `fn-⌫`, `^D` | delete forward |
+| `PgUp` / `PgDn`, `⌥↑` / `⌥↓` | a page up / down, where the terminal passes them on (Terminal.app with Shift); the trackpad scrolls as arrows |
+| `Esc` | the selection gone; `^L` draws the screen again |
+
+`⌘C` and `⌘V` are the terminal's: a selection made with the mouse copies out
+of the editor, and a paste comes in bracketed, whole, as text -- a `^S` or an
+`ESC` in it is not a key, and a pasted `y` answers no question.
+
+A file is its bytes, and comes back out as it went in: a file saved
+untouched is the same file -- CR LF line ends, no newline at the end, NUL
+bytes, invalid UTF-8 all kept. What is not text is shown for what it is,
+in reverse: a control character as `^X`, a byte that is no UTF-8 in hex, a
+direction or zero-width mark as `?`. A save is `kcore::fs::write`, which
+writes the new content whole and syncs it before it takes the old one's
+place, so a full disk or a crash leaves the old file and not half of the
+new one; a file that changed on disk since it was read is asked about before
+it is written over; and a session that ends under changes not saved -- the
+connection gone -- leaves them in `<file>.save`, or the first `.save.1` to
+`.save.9` not taken, never over a file that is there, and the kernel log
+says where. A file is held whole in kernel memory, and over 16 MiB is not
+opened; an edit that cannot have the memory it needs is not made, and says
+so, rather than panic the kernel.
+
 ## hv
 
 `hv` (`src/rust/modules/hv`) is the [hypervisor](hypervisor.md), the

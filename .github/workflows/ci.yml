@@ -96,6 +96,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/diskimage-test.py
 
+      # The editor runs in the kernel on a person's files: a byte changed on
+      # a save, an undo that gives back the wrong text, a screen drawn wrong
+      # after a resize -- each looks like an editor that works. Its crate on
+      # the host: key sessions held to what they leave, files saved back
+      # byte for byte, random sessions on a terminal of the test's own.
+      - name: Editor test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/edit-test.py
+
       # What is on a disk is whoever wrote it's to choose, and a panic, a
       # write where nothing may write or an image left corrupt there is
       # anyone's to cause: the block and filesystem layers fuzzed on the

@@ -5,6 +5,16 @@
 namespace Stdlib
 {
 
+/* A terminal, as its client last said: its width in columns and height in
+   rows (0 where it did not say), and how many times it has said they
+   changed. kcore's CmdTerminal on the Rust side: three 32-bit words. */
+struct TerminalInfo
+{
+    unsigned int Cols;
+    unsigned int Rows;
+    unsigned int Changes;
+};
+
 class Printer
 {
 public:
@@ -24,6 +34,15 @@ public:
         (void)len;
         (void)timeoutNs;
         return -1;
+    }
+
+    /* The terminal of the person at the other end, for a command that
+       draws on it: false, info untouched, where there is none. Only an SSH
+       session's printer knows one (kernel_cmd_dispatch_io). */
+    virtual bool Terminal(TerminalInfo& info)
+    {
+        (void)info;
+        return false;
     }
 };
 

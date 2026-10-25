@@ -149,11 +149,12 @@ swallowing panic messages whole.
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
-| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations; on arm64 the halt |
+| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, and `hv create` of VMs from a web server's images; on both, `hv convert` |
+| `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/rust/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
@@ -310,13 +311,21 @@ from inside a session -- and first an `insmod` given a parameter, which a
 module that takes none must refuse, saying so; then it puts the module in `/etc/rc`, reboots, and
 checks it came back by itself with the same host key, and that `poweroff`
 unloads it before the first filesystem is unmounted and then switches the
-machine off with nothing panicked on the way. On x86-64 it boots an
+machine off with nothing panicked on the way. Between the two, `edit.ko`:
+`ssh -t` run on a pty of the test's own, of a size it sets -- the status bar
+must be drawn on the row before the last of that size, the terminal the
+session was told reaching the command -- then typed at and saved, the file
+then written by somebody else and saved over after the question, the pty
+resized and the screen drawn again whole at the new size, `^Q`, the file
+read back; then the connection killed under a change, which must turn up in
+`<file>.save` with the file as it was saved; and `edit` with no terminal
+must say it needs one. On x86-64 it boots an
 ext2 root that already carries the module, a key and an `/etc/rc`, and logs
 in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
 
-45 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
+59 checks pass, 14 of them the editor's. `poweroff unloads sshd before the unmount` used to fail: from
 the VFS's move to Rust (`edae1ef`) it waited for `unmounting / (ext2)`, a line
 only the C++ VFS printed, where the Rust one prints `vfs: unmounting /`. One
 check still fails now and then under load, `connections past
@@ -853,7 +862,11 @@ own, TCP's flags in combinations that mean something. The targets:
   Every packet the server sends is opened and checked, its key exchange
   signed by its host key over the hash both ends made; a login is had
   exactly when the known key signs the right session; a command's output
-  comes back whole; a client that breaks the protocol is told so;
+  comes back whole; a client that breaks the protocol is told so. Now and
+  then the command is `term`, which prints the terminal its session lends
+  it -- run with none, or after a pty-req of a size and window-changes to
+  others, sizes of 0 and of `u32::MAX` among them -- and must say the last
+  size sent and how many changes there were, as `edit` is told them;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
   that lines repeat and a search finds them, with runs of one key past the
@@ -1675,6 +1688,56 @@ under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
 half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
+
+### `edit-test.py` -- the editor, decided on the host
+
+`edit` is a full-screen editor run in the kernel (`src/rust/modules/edit`,
+[edit](modules.md#edit)) over a crate with no kernel in it,
+`src/rust/edit`. `fuzz/edit` compiles that crate, as it is, into a host
+program that runs it the way the module does -- the bytes a terminal sends
+through the key decoder, its saves and quits answered, its frames drawn on a
+terminal of the test's own, which does with them what xterm does: wraps text
+at the right edge, scrolls at the bottom, and takes the last column's
+character with an erase sent while the cursor waits to wrap. The editor
+never means any of those, so any is a failure, as is a sequence the editor
+does not send or a character it shows a stand-in for sent as it is. Then:
+
+- sessions of keys, each held to what it must leave in the file, at the
+  cursor, in the clipboard and on the screen: typing; `^A` to the indent
+  and then the start, `^E`; Enter, Backspace, Delete, `^D`; a selection cut,
+  pasted and undone, typed over and given back by one undo; lines cut in a
+  run and pasted back above the cursor's; undo and redo, typing one step
+  and Enter the end of it; Option's words, `^W`, `^U`, Option-Delete; find
+  -- next, back, round the end, either case or one, not found and the
+  cursor where it was; going to a line; the questions before a quit, a
+  pasted `y` answering none; a save over a file changed on disk; a paste
+  that is text, a `^S` and an `ESC` sequence in it included, one undo step,
+  64 KiB pieces and all; moves, the column kept through a short line, and
+  every sequence a terminal sends a key as; the screen -- the status bar,
+  the keys, control bytes as `^X` and invalid UTF-8 in hex in reverse, a
+  wide character's two columns, a long line's `>`, a line exactly as wide as
+  the terminal drawn whole, a terminal too small; a new file;
+- 2000 files of random bytes -- CRs, newlines, NULs, invalid UTF-8, a
+  newline at the end or not -- each read and written back byte for byte;
+- sessions of random keys on random files and terminals: characters, CJK,
+  emoji, combining marks, every special key with every modifier, Control
+  letters and the questions' answers, pastes with control bytes, ESC and CR
+  LF in them, cut short or not ended, garbage, pauses inside sequences,
+  resizes to terminals from 1x1 up, and someone else writing the file.
+  After every one the editor keeps its promises (`Editor::check`: the
+  cursor and the selection in the text where glyphs start, the history's
+  sizes its own) and the terminal has had nothing it would not take; now and
+  then what was drawn a row at a time must be what a full redraw draws, and
+  undoing every step must give back the file as it was read, and redoing as
+  many the file as it was.
+
+A failure names its seed and session, and `--session N` runs that session
+again. The gate is a fixed seed, 19 cases, 2000 files and 3000 sessions,
+about ten seconds; `--seconds` is a campaign. It found, while the editor was
+written, that a screen resized and resized back between two frames is drawn
+at the size it had and not redrawn -- a terminal does not keep its screen
+through that -- which is why a session counts its window-changes for the
+command ([sshd](sshd.md#the-shell-behind-it)). Needs cargo.
 
 ### `diskimage-test.py` -- what `hv convert` makes of an image, decided on the host
 

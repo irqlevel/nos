@@ -880,6 +880,9 @@ struct PipeState {
     /// it would wait for itself.
     go: bool,
     done: bool,
+    /// The client's terminal, as the session last heard: what the command is
+    /// told when it asks (`Output::terminal`).
+    term: Option<ssh::Terminal>,
 }
 
 impl Pipe {
@@ -890,7 +893,7 @@ impl Pipe {
         typed.try_reserve_exact(TYPED_ROOM).ok()?;
         Some(Pipe {
             state: Mutex::new(PipeState {
-                out, typed, wants: false, closed: false, gone: false, go: false, done: false,
+                out, typed, wants: false, closed: false, gone: false, go: false, done: false, term: None,
             })?,
             to_session: Event::new()?,
             to_command: Event::new()?,
@@ -954,6 +957,11 @@ impl kcore::cmd::Session for CommandSide {
             self.0.to_command.wait_for(Duration::from_nanos(core::cmp::min(left, TEND_MS * NS_PER_MS)));
         }
     }
+
+    fn terminal(&mut self) -> Option<kcore::cmd::Terminal> {
+        let term = self.0.state.lock().term;
+        term.map(|t| kcore::cmd::Terminal { cols: t.cols, rows: t.rows, changes: t.changes })
+    }
 }
 
 /// What the command's task is started with.
@@ -996,7 +1004,11 @@ fn run_beside(shared: &Shared, id: u64, line: &str, io: &mut dyn ssh::Io) -> boo
         })
     };
     set_command(task.id());
-    pipe.state.lock().go = true;
+    {
+        let mut st = pipe.state.lock();
+        st.term = io.terminal();
+        st.go = true;
+    }
     pipe.to_command.signal();
 
     let mut chunk = [0u8; OUT_CHUNK];
@@ -1029,11 +1041,18 @@ fn run_beside(shared: &Shared, id: u64, line: &str, io: &mut dyn ssh::Io) -> boo
         }
         if wants && room > 0 {
             let room = core::cmp::min(room, typed.len());
-            match io.read(&mut typed[..room], TEND_MS) {
-                Some(0) => {}
+            let got = io.read(&mut typed[..room], TEND_MS);
+            /* A window-change taken in with the typing is the command's to
+               know at once */
+            let term = io.terminal();
+            match got {
+                Some(0) => pipe.state.lock().term = term,
                 Some(k) => {
                     /* Within the room counted above: only this side adds */
-                    pipe.state.lock().typed.extend(&typed[..k]);
+                    let mut st = pipe.state.lock();
+                    st.typed.extend(&typed[..k]);
+                    st.term = term;
+                    drop(st);
                     pipe.to_command.signal();
                 }
                 None => {
@@ -1055,6 +1074,8 @@ fn run_beside(shared: &Shared, id: u64, line: &str, io: &mut dyn ssh::Io) -> boo
             open = false;
             pipe.state.lock().gone = true;
             pipe.to_command.signal();
+        } else {
+            pipe.state.lock().term = io.terminal();
         }
     }
     /* Its task has returned, or is about to: the handle waits for it */
@@ -1076,6 +1097,10 @@ impl kcore::cmd::Session for SessionIo<'_> {
 
     fn read(&mut self, buf: &mut [u8], timeout_ns: u64) -> Option<usize> {
         self.0.read(buf, timeout_ns.div_ceil(kcore::consts::NS_PER_MS))
+    }
+
+    fn terminal(&mut self) -> Option<kcore::cmd::Terminal> {
+        self.0.terminal().map(|t| kcore::cmd::Terminal { cols: t.cols, rows: t.rows, changes: t.changes })
     }
 }
 

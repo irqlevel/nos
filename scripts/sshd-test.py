@@ -5,7 +5,11 @@ aarch64 (HVF on an Apple Silicon Mac unless --tcg): boots nos-arm64.img from
 an ext2 root, loads sshd.ko over the UDP shell, and has the ssh client work
 it -- commands, a shell with a terminal and one without, 3 MiB of output
 through the client's window with rekeys in the middle, a key it has to
-refuse, sessions at once, a stop and an rmmod from inside a session. Then it
+refuse, sessions at once, a stop and an rmmod from inside a session -- and
+loads edit.ko and works the editor through `ssh -t` on a pty of the test's
+own: the terminal's size reaching the command, a resize drawn again whole, a
+save, a write over a file changed meanwhile asked about, and changes kept in
+<file>.save when the connection goes. Then it
 puts the module in /etc/rc, reboots, and checks it came back by itself with
 the same host key, and that poweroff unloads it before the filesystems go and
 then switches the machine off with nothing panicking on the way.
@@ -22,11 +26,14 @@ ARCH=aarch64` done first.
 """
 
 import argparse
+import fcntl
 import functools
 import http.server
 import os
 import platform
+import pty
 import re
+import select
 import shutil
 import signal
 import socket
@@ -34,6 +41,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 
@@ -272,6 +280,147 @@ class Test:
         rc, out, _ = self.ssh(["uptime"])
         check("a login after the probes", rc == 0 and uptime_like(out), out)
 
+    def editor(self, sh, slow):
+        """edit (modules/edit) through a terminal of the test's own: the size
+        the session was told, a resize, a save, a write over a file changed
+        meanwhile, and the changes kept when the connection goes."""
+        sh.run("wget http://10.0.2.2:%d/edit.ko /edit.ko" % HTTP_PORT)
+        check("insmod edit", "loaded" in sh.run("insmod /edit.ko"))
+        path = "/etc/edit-test.conf"
+        rc, out, _ = self.ssh(["edit", path])
+        check("edit with no terminal says it needs one", rc == 0 and "needs a terminal" in out, out)
+
+        def holds(name):
+            """What the file at `name` holds -- cat ends what it prints with
+            a newline of its own, which is taken off."""
+            rc, out, _ = self.ssh(["cat", name])
+            return out[:-1] if rc == 0 and out.endswith("\n") else None
+
+        with Terminal(self, ["edit", path], cols=100, rows=30) as e:
+            # The status bar on the row before the last of the terminal's
+            # own size: the size the session was told reached the command
+            check("edit draws at the terminal's size, a new file", e.wait(b"[new]", 30 * slow) and
+                  b"\x1b[29;1H" in e.seen and b"\x1b[30;1H" in e.seen, repr(e.seen[-300:]))
+            e.type(b"hello\rworld")
+            e.type(b"\x13")
+            check("^S saves", e.wait(b"saved", 20 * slow), repr(e.seen[-300:]))
+            out = holds(path)
+            check("the file is what was typed, a newline at the end of a new one", out == "hello\nworld\n", repr(out))
+
+            # Written by someone else meanwhile: asked about, then written over
+            sh.run("write %s changed" % path)
+            e.since_now()
+            e.type(b"!\x13")
+            check("a save over a file changed on disk asks first", e.wait(b"Write over it?", 20 * slow),
+                  repr(e.seen[-300:]))
+            e.type(b"y")
+            check("and writes it on a yes", e.wait(b"saved", 20 * slow), repr(e.seen[-300:]))
+
+            # A resize: the window-change reaches the command, which draws the
+            # whole screen again at the new size
+            e.since_now()
+            e.resize(60, 20)
+            check("a resize draws everything again, at the new size", e.wait(b"\x1b[2J", 20 * slow) and
+                  e.wait(b"\x1b[19;1H", 10 * slow), repr(e.seen[e.mark:][-300:]))
+            e.since_now()
+            e.type(b"\x11")
+            check("^Q leaves, and gives the terminal back", e.exited(20 * slow) and e.wait(b"\x1b[?1049l", 5),
+                  repr(e.seen[-200:]))
+        out = holds(path)
+        check("the file is what was saved", out == "hello\nworld!\n", repr(out))
+
+        with Terminal(self, ["edit", path], cols=80, rows=24) as e:
+            e.wait(b"line 1/2", 30 * slow)
+            e.type(b"x")
+            check("a change shows", e.wait(b"[modified]", 20 * slow), repr(e.seen[-300:]))
+            # The connection gone under changes not saved
+        start = time.time()
+        out = None
+        while time.time() - start < 20 * slow:
+            out = holds(path + ".save")
+            if out is not None and out.startswith("x"):
+                break
+            time.sleep(1)
+        check("changes left when the connection went are in <file>.save", out == "xhello\nworld!\n", repr(out))
+        out = holds(path)
+        check("and the file is as it was saved", out == "hello\nworld!\n", repr(out))
+        sh.run("rmmod edit")
+        check("rmmod edit", "edit" not in sh.run("lsmod"))
+
+
+class Terminal:
+    """`ssh -t` on a terminal of the test's own: a pty of a size the test
+    sets, and changes -- which ssh tells the server in a window-change --
+    typed at as a person types, everything it shows kept."""
+
+    def __init__(self, t, args, cols, rows):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            os.environ["TERM"] = "xterm-256color"
+            os.execvp("ssh", ["ssh", "-p", str(SSH_PORT), "-i", t.key, "-o", "IdentitiesOnly=yes",
+                              "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+                              "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR", "-t",
+                              "root@127.0.0.1"] + args)
+        self.seen = b""
+        self.mark = 0
+        self.status = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.kill()
+        os.close(self.fd)
+
+    def read(self, timeout):
+        """What came within `timeout`: None when nothing did, b"" once ssh is gone."""
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return None
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError:
+            data = b""
+        self.seen += data
+        return data
+
+    def since_now(self):
+        """What `wait` looks for from here on must come after this."""
+        self.mark = len(self.seen)
+
+    def wait(self, marker, timeout=30):
+        start = time.time()
+        while time.time() - start < timeout:
+            if marker in self.seen[self.mark:]:
+                return True
+            if self.read(0.2) == b"":
+                break
+        return marker in self.seen[self.mark:]
+
+    def type(self, data):
+        os.write(self.fd, data)
+
+    def resize(self, cols, rows):
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+    def exited(self, timeout):
+        start = time.time()
+        while time.time() - start < timeout:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid == self.pid:
+                self.status = status
+                self.pid = 0
+                return True
+            self.read(0.2)
+        return False
+
+    def kill(self):
+        if self.pid:
+            os.kill(self.pid, signal.SIGKILL)
+            os.waitpid(self.pid, 0)
+            self.pid = 0
+
 
 def serve_http(directory):
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
@@ -327,6 +476,7 @@ def aarch64(t):
     with open(os.path.join(t.tmp, "big.txt"), "w") as f:
         f.write(("x" * 63 + "\n") * (BIG // 64))
     shutil.copy(pt.module_path("aarch64", "sshd"), os.path.join(t.tmp, "sshd.ko"))
+    shutil.copy(pt.module_path("aarch64", "edit"), os.path.join(t.tmp, "edit.ko"))
     serve_http(t.tmp)
 
     hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not t.tcg
@@ -362,6 +512,7 @@ def aarch64(t):
 
         t.battery(sh)
         t.probes(sh)
+        t.editor(sh, slow)
 
         # The keys: listed, denied -- and the login with it refused -- and
         # allowed again, the file read back
