@@ -35,6 +35,85 @@ long GetPreemptDeferredIdleCount()
     return PreemptsDeferredIdle.Get();
 }
 
+void SchedStats::Bump(Atomic& counter, ulong by)
+{
+    counter.Set((long)((ulong)counter.Get() + by));
+}
+
+void SchedStats::Raise(Atomic& max, ulong value)
+{
+    if ((ulong)max.Get() < value)
+        max.Set((long)value);
+}
+
+ulong SchedStats::Bucket(ulong ns)
+{
+    ulong us = ns / Const::NanoSecsInUsec;
+    if (us == 0)
+        return 0;
+
+    ulong bucket = Stdlib::SizeOfInBits<ulong>() - (ulong)__builtin_clzl(us);
+    return Stdlib::Min(bucket, Buckets - 1);
+}
+
+ulong SchedStats::BucketLimitUs(ulong bucket)
+{
+    return 1UL << Stdlib::Min(bucket, Buckets - 1);
+}
+
+void SchedStats::Wake(ulong ns)
+{
+    Bump(WakeHist[Bucket(ns)], 1);
+    Raise(WakeMax, ns);
+}
+
+void SchedStats::Delay(ulong ns)
+{
+    Bump(DelayHist[Bucket(ns)], 1);
+}
+
+void SchedStats::Decision(ulong cycles, ulong walked)
+{
+    Bump(Decisions, 1);
+    Bump(DecisionCycles, cycles);
+    Raise(DecisionMax, cycles);
+    Bump(Walked, walked);
+    Raise(WalkMax, walked);
+}
+
+void SchedStats::Look(ulong runnable)
+{
+    Bump(Looks, 1);
+    Bump(RunnableSum, runnable);
+    Raise(RunnableMax, runnable);
+    if (runnable >= 2)
+        Bump(Crowded, 1);
+}
+
+void SchedStats::Read(Snapshot& out)
+{
+    for (ulong i = 0; i < Buckets; i++)
+    {
+        out.Wake[i] = (ulong)WakeHist[i].Get();
+        out.Delay[i] = (ulong)DelayHist[i].Get();
+    }
+    out.WakeMaxNs = (ulong)WakeMax.Get();
+    out.Decisions = (ulong)Decisions.Get();
+    out.DecisionCycles = (ulong)DecisionCycles.Get();
+    out.DecisionMaxCycles = (ulong)DecisionMax.Get();
+    out.Walked = (ulong)Walked.Get();
+    out.WalkMax = (ulong)WalkMax.Get();
+    out.Looks = (ulong)Looks.Get();
+    out.Runnable = (ulong)RunnableSum.Get();
+    out.RunnableMax = (ulong)RunnableMax.Get();
+    out.Crowded = (ulong)Crowded.Get();
+}
+
+void TaskQueue::ReadStats(SchedStats::Snapshot& out)
+{
+    Stats.Read(out);
+}
+
 TaskQueue::TaskQueue()
 {
     Stdlib::AutoLock lock(Lock);
@@ -123,6 +202,43 @@ void TaskQueue::SwitchComplete(void* ctx)
     curr->TaskQueue->SwitchComplete(curr);
 }
 
+void TaskQueue::NoteRun(Task* next, ulong now)
+{
+    /* The idle task waits for nothing: it runs when nobody else can */
+    if (next->IsIdle())
+        return;
+
+    /* When it left the CPU, or started: UpdateRuntime stamped it then, and
+       it has not run since */
+    ulong out = next->RunStartTime.GetValue();
+
+    if (next->SwitchedOutRunnable)
+    {
+        if (now > out)
+            Stats.Delay(now - out);
+        return;
+    }
+
+    /* Still blocked: a sleeper the walk runs because its time has come, and
+       that time is when it was woken. Otherwise whoever unblocked it said
+       when -- unless that was before it left the CPU, a wakeup for the wait
+       before this one, or one that came while it was still on its way out */
+    ulong woke;
+    if (next->IsBlocked())
+    {
+        woke = (ulong)next->SleepUntil.Get();
+    }
+    else
+    {
+        woke = (ulong)next->WakeTime.Get();
+        if (woke < out)
+            woke = 0;
+    }
+
+    if (woke != 0 && now >= woke)
+        Stats.Wake(now - woke);
+}
+
 void TaskQueue::Switch(Task* next, Task* curr)
 {
     SwitchContextCounter.Inc();
@@ -136,10 +252,13 @@ void TaskQueue::Switch(Task* next, Task* curr)
 
     curr->ContextSwitches.Inc();
     curr->UpdateRuntime();
+    curr->SwitchedOutRunnable = !curr->IsBlocked();
 
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
-    next->RunStartTime = GetBootTime();
+    Stdlib::Time now = GetBootTime();
+    NoteRun(next, now.GetValue());
+    next->RunStartTime = now;
     next->Prev = curr;
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
@@ -162,12 +281,17 @@ static bool SleepIsOver(Task* cand, ulong* now)
 ulong TaskQueue::EarliestDeadline(ulong now)
 {
     ulong earliest = ~0UL;
+    ulong runnable = 0;
 
     for (auto entry = TaskList.Flink; entry != &TaskList; entry = entry->Flink)
     {
         Task* task = CONTAINING_RECORD(entry, Task, ListEntry);
         if (!task->IsBlocked())
+        {
+            if (!task->IsIdle())
+                runnable++;
             continue;
+        }
 
         /* One whose time has come is SelectNext's to run, now or at its
            turn: nothing to fire for */
@@ -176,6 +300,7 @@ ulong TaskQueue::EarliestDeadline(ulong now)
             earliest = until;
     }
 
+    Stats.Look(runnable);
     return earliest;
 }
 
@@ -197,7 +322,7 @@ void TaskQueue::WakeSleepers(Task* curr)
         cpu.LocalTimerWake((ulong)curr->SleepUntil.Get());
 }
 
-Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
+Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle, ulong& walked)
 {
     Task* next = nullptr;
     Task* idle = nullptr;
@@ -208,6 +333,7 @@ Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
         currEntry = currEntry->Flink)
     {
         Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
+        walked++;
         if (cand == curr)
         {
             BugOn(cand->State.Get() == Task::StateExited);
@@ -264,6 +390,7 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
     ScheduleCounter.Inc();
 
     ulong flags = Hal::IrqSave();
+    u64 began = Hal::ReadCycleCounter();
 
     /* Whatever reschedule was put off until now, this is it */
     curr->PreemptPending.Set(0);
@@ -271,6 +398,7 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
 
     Task* next = nullptr;
     ulong exitedRetries = 0;
+    ulong walked = 0;
     for (;;) {
         curr->Lock.Lock();
         BugOn(TaskList.IsEmpty());
@@ -285,7 +413,7 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
             BugOn(TaskCount.Get() < 0);
         }
 
-        next = SelectNext(curr, keepOverIdle);
+        next = SelectNext(curr, keepOverIdle, walked);
         if (next != nullptr)
         {
             next->Lock.Lock();
@@ -319,6 +447,9 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
        when this CPU's timer is to fire, so that the walk that runs the
        sleeper comes then and not at the next tick */
     WakeSleepers(curr);
+
+    /* What deciding cost, the locks' waits included, and not the switch */
+    Stats.Decision(Hal::ReadCycleCounter() - began, walked);
 
     if (next == nullptr)
     {

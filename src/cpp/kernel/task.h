@@ -226,6 +226,15 @@ public:
        and runs it, and the task unblocks itself. 0 while it is not asleep. */
     Atomic SleepUntil;
 
+    /* When an Unblock() last took the flag down: the start of the wait for
+       the CPU that SchedStats measures at the switch in. Written by the
+       waker, from any CPU and any context. */
+    Atomic WakeTime;
+
+    /* It left the CPU able to run -- displaced, not blocked: the wait until
+       it runs again is a delay, not a wakeup's (SchedStats). Under Lock. */
+    bool SwitchedOutRunnable;
+
     Stdlib::Time RunStartTime;
     Stdlib::Time Runtime;
     Stdlib::Time StartTime;

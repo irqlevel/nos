@@ -426,12 +426,52 @@ task's `FlagIdleBit`, making it an ordinary task for what remains of its
 life: it takes its turn, sees the flag, unmounts the filesystems while the
 soft IRQs still run, and halts.
 
+## What it is measured by
+
+Each queue counts what its CPU's scheduler does, as it does it
+(`SchedStats` in `kernel/sched.h`), and `sched [ms]` prints a window of it:
+
+- **A wakeup's wait**: from the moment a task could run again until it ran.
+  For a task unblocked by someone, that moment is the `Unblock()` that took
+  its flag down -- stamped there (`Task::WakeTime`), from whatever CPU and
+  context the waker is in, and only by the call that cleared the flag. For
+  one asleep until a deadline the walk ran, it is the deadline. A stamp from
+  before the task last left its CPU is not this wait's -- a wakeup that came
+  while it was on its way out, or the one before -- and is not counted.
+- **A delay**: a task displaced while it could still run -- by the tick, or
+  an IPI -- waits until it runs again. Kept apart from wakeups: it is the
+  round robin's own turn-taking, where a wakeup's wait is latency someone is
+  waiting on.
+- **A decision**: what `TaskQueue::Schedule` cost from the moment it turned
+  interrupts off until it switched or returned -- the queue lock's wait
+  included, the switch not -- in cycles, and how many entries its walk
+  looked at.
+- **The queue at the timer**: each time the CPU's timer has the queue looked
+  at for sleepers (`EarliestDeadline`), how many tasks there could run, the
+  one on the CPU included and the idle task not -- and whether two or more
+  could, which is where a woken task has to wait its turn behind another.
+
+Waits go into log2 buckets of microseconds, so a percentile is a bucket's
+bound ("<256us"), and the longest since boot is kept exactly. The counters
+are the owning CPU's to write, under its queue lock, with no locked
+instruction; `sched` reads them from another CPU a word at a time, so a
+reading is a moment's and not a consistent whole. The idle task's turns are
+nobody's wait and are not counted.
+
+Two things a reading says about the machine rather than the scheduler.
+Under a hypervisor a wakeup that has to bring a halted vCPU back -- an IPI
+to a CPU in its idle task's `hlt` or `wfi` -- waits for the host to run that
+vCPU again, which is part of the number. And the boot's own
+`TestLocateOnCpu` keeps the highest CPU deaf for a tenth of a second on
+purpose, so that CPU's longest wait since boot is about that.
+
 ## Looking at it from the shell
 
 | Command | Shows |
 |---|---|
 | `ps` | Every task: pid, state, flags, accumulated runtime, context switches, name |
 | `top [ms]` | Per-task CPU use over a window, as a percentage per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the migration count and the deferred reschedules |
+| `sched [ms]` | Per CPU over a window: wakeups and how long they waited for the CPU, displaced tasks' delays, decisions and their cost, the walk's length, and how many tasks could run at the timer ([above](#what-it-is-measured-by)) |
 | `stacks` | High-water mark of every task stack and every static boot stack |
 | `bt <pid>` | Where a task is and its stack trace (`Task::Locate`, [above](#waiting-for-one-to-end)): read off its stack when it is off its CPU, caught by an IPI on the CPU running it, or the CPUs that would not answer one named |
 | `profile` | Where the time actually goes — see [Profiler](profiler.md) |

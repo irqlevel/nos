@@ -22,6 +22,8 @@ Task::Task()
     , State(0)
     , Flags(0)
     , SleepUntil(0)
+    , WakeTime(0)
+    , SwitchedOutRunnable(false)
     , Prev(nullptr)
     , Magic(TaskMagic)
     , CpuAffinity(~(0UL))
@@ -111,7 +113,12 @@ void Task::Block()
 
 void Task::Unblock()
 {
-    Flags.ClearBit(FlagBlockedBit);
+    /* The clear stays a locked operation whether or not the flag is up: it
+       orders the waker's publishing of the work before it, which a plain
+       read of the flag would not on arm64. The clock only for a wakeup that
+       took the flag down. */
+    if (Flags.ClearBit(FlagBlockedBit))
+        WakeTime.Set((long)GetBootTime().GetValue());
 }
 
 bool Task::IsBlocked()
