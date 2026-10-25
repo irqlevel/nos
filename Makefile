@@ -148,6 +148,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/idt.cpp  \
     src/cpp/kernel/cpu.cpp  \
     src/cpp/kernel/cmd.cpp  \
+    src/cpp/kernel/line_editor.cpp \
     src/cpp/kernel/input.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
@@ -246,6 +247,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/module.cpp \
     src/cpp/kernel/test.cpp \
     src/cpp/kernel/cmd.cpp \
+    src/cpp/kernel/line_editor.cpp \
     src/cpp/kernel/input.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
