@@ -2,7 +2,7 @@
 title: "Linux-гость под гипервизором nos"
 description: "Соберите маленькое ядро Linux и initramfs на BusyBox, загрузите hv.ko в nos и запускайте Linux-гостей: вводите команды, подключайте к сети, останавливайте."
 order: 6
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 Гипервизор nos — это загружаемый модуль `hv.ko`. К концу руководства он будет запускать настоящих Linux-гостей внутри nos, а сам nos будет работать в QEMU:
@@ -362,7 +362,7 @@ hv exec 0 cat /etc/alpine-release; uname -r
 
 initramfs Alpine загружает `virtio_blk`, находит ISO на `vda` и ставит в tmpfs базовую систему из пакетов на ISO. Затем OpenRC, система инициализации Alpine, доводит загрузку до приглашения входа на `ttyS0`. getty (программа, которая выводит это приглашение) позицию курсора не спрашивает, поэтому входите через `hv send`: эта команда вводит текст сразу. После первого `send` и `exec` вводит строки сразу.
 
-Когда гость подключён к коммутатору, initramfs Alpine настраивает `eth0` по `ip=` и записывает DNS-сервер nos в `resolv.conf`, так что `apk` добирается до своих зеркал через NAT. `reboot` в госте сбрасывает его, а опция `restart` загружает снова. Чтобы дождаться приглашения входа в следующей загрузке, используйте `hv wait 0 boot=1 login:`. Загружается и облачный образ Debian, см. [A distribution](/docs/hypervisor#a-distribution).
+Когда гость подключён к коммутатору, initramfs Alpine настраивает `eth0` по `ip=` и записывает DNS-сервер nos в `resolv.conf`, так что `apk` добирается до своих зеркал через NAT. `reboot` в госте сбрасывает его, а опция `restart` загружает снова. Чтобы дождаться приглашения входа в следующей загрузке, используйте `hv wait 0 boot=1 login:`. Загружается и облачный образ Debian, см. [A distribution](/docs/hypervisor#a-distribution). Как сделать ВМ из облачного образа дистрибутива по одной только ссылке, ничего не доставая из образа вручную, рассказано в руководстве [ВМ из облачного образа](/howto/cloud-vm).
 
 ## На сервере
 
@@ -394,4 +394,5 @@ initramfs Alpine загружает `virtio_blk`, находит ISO на `vda` 
 
 - Всё это может проделать за вас гейт проекта. `nos/scripts/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` загружает гостя и прогоняет долгоживущие VM, а `--disk`, `--net`, `--cpus N` и `--attach` покрывают остальное. `nos/scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` проверяет Alpine. Оба скрипта используют `nos.iso` и модули, собранные в дереве ([Гейты: как проверять изменения в nos](/howto/run-the-gates)).
 - [Гипервизор](/hypervisor) и справочник: [A Linux guest](/docs/hypervisor#a-linux-guest), [Guests that stay up](/docs/hypervisor#guests-that-stay-up), [More than one CPU](/docs/hypervisor#more-than-one-cpu).
+- [ВМ из облачного образа](/howto/cloud-vm): облачный образ Debian по ссылке, со своим ядром и в папке, которая переживает перезагрузки.
 - [Установка nos на выделенный сервер](/howto/install-on-a-server), чтобы запускать гостей на настоящем железе.

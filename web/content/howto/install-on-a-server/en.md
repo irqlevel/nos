@@ -2,7 +2,7 @@
 title: "Install nos on a dedicated server"
 description: "Install the nos system image on a spare partition of a Linux server, boot it once through the server's own GRUB, and log in over SSH."
 order: 5
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 By the end of this guide, a bare-metal x86-64 server runs nos from its own partition. The kernel and all the modules come from a release's system image, the server's own GRUB boots them, and nos's SSH server lets you in with the key you gave it. The server's Linux stays installed and remains the default. nos boots once when you ask for it, and the boot after that is Linux again.
@@ -35,7 +35,7 @@ nos runs only on hardware it has drivers for, and on a server the network is the
 | An NVMe or virtio disk for nos's partition (virtio-scsi also works) | These are the only disks nos can read. On a SATA disk or behind a RAID controller, GRUB still loads the kernel through the firmware, but nos then finds no root filesystem. That means no modules, no `/etc/rc` and no sshd. |
 | A network card that nos has a driver for: Realtek RTL8168 or RTL8125, Intel 82576, I210 or I211 (the `igb` driver), or virtio-net | With any other card, nos boots, but nobody can reach it. |
 | DHCP on that network | nos has no static IP configuration. |
-| A plain partition of at least 64 MiB (256 MiB is comfortable; guest disk images need more) | It can't be a member of an md RAID, an LVM volume or encrypted, because nos reads none of those. A server whose disks are mirrored end to end has no such partition. Leave room for one when you install the server (Hetzner's `installimage` takes a partition list), or create one from free space. |
+| A plain partition of at least 64 MiB (256 MiB is comfortable; guests' disks need more: a VM made from a cloud image takes one to two GiB to begin with) | It can't be a member of an md RAID, an LVM volume or encrypted, because nos reads none of those. A server whose disks are mirrored end to end has no such partition. Leave room for one when you install the server (Hetzner's `installimage` takes a partition list), or create one from free space. |
 | Linux that boots with GRUB 2, under BIOS or UEFI, with **Secure Boot off** | nos is a Multiboot2 kernel. With Secure Boot on, GRUB runs locked down and refuses to load such a kernel. |
 | e2fsprogs, util-linux, GRUB's tools (`grub-editenv`, plus `update-grub` or `grub-mkconfig`), and squashfs support in the kernel or `unsquashfs` | `nos-install` runs these. Stock Ubuntu and Debian have them all. |
 
@@ -237,5 +237,6 @@ If you want to stay in nos across reboots, make it the server's default: set `GR
 
 - [Connect to a running nos](/howto/connect): SSH, the UDP shell, and what you can do once you are in.
 - [Boot a Linux guest](/howto/linux-guest): on the server, the hypervisor module is already at `/lib/modules/hv.ko`.
+- [Make a VM from a cloud image](/howto/cloud-vm): `hv create <name> <url>`, with hvboot at `/lib/hvboot` in an image built from master.
 - [Write a loadable module](/howto/write-a-module), and keep your own modules outside `/lib/modules`.
 - [Install: nos on a server](/docs/install) is the full reference, and [Real hardware](/docs/real-hardware) describes the machines nos runs on.

@@ -217,7 +217,7 @@ const en: Dictionary = {
             },
             {
                 title: "A hypervisor of its own",
-                text: "It supports both AMD-V and Intel VT-x and ships as a module you can load and unload. Unmodified Linux, Alpine and Debian boot as guests with several CPUs, virtio disks and networking through a NAT switch.",
+                text: "It supports both AMD-V and Intel VT-x and ships as a module you can load and unload. Unmodified Linux, Alpine, Debian and Ubuntu boot as guests with several CPUs, virtio disks and networking through a NAT switch. A VM lives in a folder, and one command makes it from a cloud image's URL.",
                 href: "/hypervisor",
             },
             {
@@ -337,7 +337,7 @@ const en: Dictionary = {
     howto: {
         title: "How-to guides",
         description:
-            "Step-by-step guides: build nos, run it, connect to it, debug it, install it on a server, boot Linux under its hypervisor, write a module, and run the tests.",
+            "Step-by-step guides: build nos, run it, connect to it, debug it, install it on a server, boot Linux under its hypervisor, make a VM from a cloud image, write a module, and run the tests.",
         allGuides: "All guides",
         guide: "Guide",
     },
@@ -451,7 +451,7 @@ const ru: Dictionary = {
             },
             {
                 title: "Собственный гипервизор",
-                text: "Поддерживает и AMD-V, и Intel VT-x и поставляется как модуль, который можно загрузить и выгрузить. Немодифицированные Linux, Alpine и Debian загружаются гостями с несколькими CPU, дисками virtio и сетью через коммутатор с NAT.",
+                text: "Поддерживает и AMD-V, и Intel VT-x и поставляется как модуль, который можно загрузить и выгрузить. Немодифицированные Linux, Alpine, Debian и Ubuntu загружаются гостями с несколькими CPU, дисками virtio и сетью через коммутатор с NAT. ВМ живёт в папке, а одна команда делает её из облачного образа по ссылке.",
                 href: "/hypervisor",
             },
             {
@@ -572,7 +572,7 @@ const ru: Dictionary = {
     howto: {
         title: "Руководства",
         description:
-            "Пошаговые руководства: собрать nos, запустить, подключиться, отладить, поставить на сервер, загрузить Linux под его гипервизором, написать модуль и прогнать тесты.",
+            "Пошаговые руководства: собрать nos, запустить, подключиться, отладить, поставить на сервер, загрузить Linux под его гипервизором, сделать ВМ из облачного образа, написать модуль и прогнать тесты.",
         allGuides: "Все руководства",
         guide: "Руководство",
     },
