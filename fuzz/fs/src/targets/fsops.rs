@@ -724,6 +724,29 @@ impl Fs {
                    if got { "succeeded" } else { "failed" }, if want { "does it" } else { "does not" }));
     }
 
+    /// A file cut or grown through a handle (`Vfs::set_length`, a module's
+    /// `File::set_len`): only one open for writing, as a disk image is
+    /// given its disk's size before anything is written into it.
+    pub fn set_length(&mut self, i: usize, size: u64) {
+        let Some((h, o)) = self.model.open.get(i).cloned() else { return };
+        let Ok(s) = usize::try_from(size) else { return };
+        say(format_args!("set_length {} to {}", show(&join(&o.path)), size));
+        let old = self.model.size(&o.path);
+        let got = self.vfs.set_length(h, s);
+        let want = o.flags & OPEN_WRITE != 0 && !self.model.read_only && size <= self.model.limits.max_file
+            && matches!(self.model.node(&o.path), Some(Node::File(_)));
+        self.check(got == want, format_args!("set_length {} to {} {}, where the model {}", show(&join(&o.path)), size,
+                   if got { "succeeded" } else { "failed" }, if want { "does it" } else { "does not" }));
+        if got && want {
+            if let Some(d) = self.model.file_mut(&o.path) {
+                d.truncate(size);
+            }
+            if size > old {
+                reached("a file grown through its handle");
+            }
+        }
+    }
+
     pub fn rename(&mut self, from: &[u8], to: &[u8]) {
         say(format_args!("rename {} to {}", show(from), show(to)));
         let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
@@ -1020,6 +1043,12 @@ pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
         13 => {
             let p = path(r, &f.model);
             f.remove(&p);
+        }
+        14 if r.bool() => {
+            let i = pick_open(r);
+            let size = f.model.open.get(i).map_or(0, |(_, o)| f.model.size(&o.path));
+            let to = offset(r, size, block, f.model.limits.span);
+            f.set_length(i, to);
         }
         14 => {
             let p = path(r, &f.model);

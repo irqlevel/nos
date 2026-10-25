@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang lld llvm nasm cppcheck \
             grub2-common grub-pc-bin grub-efi-amd64-bin xorriso mtools \
-            qemu-system-x86 qemu-system-arm squashfs-tools parted e2fsprogs
+            qemu-system-x86 qemu-system-arm qemu-utils squashfs-tools parted e2fsprogs
           # The pinned nightly, not whatever nightly is today: src/rust/vendor
           # only resolves against the one src/rust/rust-toolchain.toml names.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -85,6 +85,16 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hvboot-test.py
+
+      # A cloud's image is a download, and `hv convert` reads it in the
+      # kernel: a cluster read wrong is a guest's disk with the wrong bytes
+      # in it, and nothing to say so. Converted on the host and held to
+      # qemu-img's reading, the decoder to zlib's, the metadata fuzzed.
+      - name: Disk image converter test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/diskimage-test.py
 
       # What is on a disk is whoever wrote it's to choose, and a panic, a
       # write where nothing may write or an image left corrupt there is

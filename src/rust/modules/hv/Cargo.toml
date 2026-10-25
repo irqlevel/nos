@@ -18,3 +18,6 @@ hv = { path = "../../hv" }
 # The frame formats: the guests' switch answers DHCP itself, and a module
 # cannot link the network layer to borrow them.
 netwire = { path = "../../netwire" }
+# A cloud's qcow2 image made a raw disk (`hv convert`): no kernel in it, so
+# fuzz/diskimage runs the same code on the host.
+diskimage = { path = "../../diskimage" }

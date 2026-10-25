@@ -220,6 +220,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "diskimage"
+version = "0.1.0"
+
+[[package]]
 name = "ecdsa"
 version = "0.16.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,6 +523,7 @@ dependencies = [
 name = "mod-hv"
 version = "0.1.0"
 dependencies = [
+ "diskimage",
  "hv",
  "kcore",
  "kmod",
