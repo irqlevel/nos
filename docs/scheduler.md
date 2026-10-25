@@ -465,6 +465,25 @@ vCPU again, which is part of the number. And the boot's own
 `TestLocateOnCpu` keeps the highest CPU deaf for a tenth of a second on
 purpose, so that CPU's longest wait since boot is about that.
 
+### A woken task behind spinners
+
+`sched probe` makes the case a scheduler is chosen by and measures it:
+spinners pinned to one CPU that never yield, a waiter pinned beside them
+asleep on an `Event`, and the shell's task on another CPU signalling it a
+sample at a time. With the round robin above, under HVF on four vCPUs:
+
+| Spinners | Waited, p50 | Their shares of the CPU, per mille |
+|---|---|---|
+| 0 | <32us | -- |
+| 1 | <8us | 995 |
+| 2 | <8.1ms | 248, 743 |
+| 4 | <32.7ms | 82, 247, 331, 331 |
+
+A woken task waits behind every task that is ahead of it in the list, a
+tick each -- the IPI that comes for it switches the CPU to whichever runnable
+task is first, which is not the one woken -- and those early switches make
+the turns unequal too.
+
 ## Looking at it from the shell
 
 | Command | Shows |
