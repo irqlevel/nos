@@ -5,6 +5,7 @@
 mod disklog;
 mod ext2;
 mod ext2bad;
+mod find;
 mod fsops;
 mod nanofs;
 mod part;

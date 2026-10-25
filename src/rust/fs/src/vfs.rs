@@ -118,6 +118,18 @@ impl DirEntry {
     }
 }
 
+/// Why a directory had no entry to give, other than having no more.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirError {
+    /// The path names nothing: no mount holds it, or something on the way
+    /// to it is missing or not a directory
+    NotFound,
+    /// It names a file
+    NotDir,
+    /// The filesystem could not read the directory's entries
+    Unreadable,
+}
+
 /// What `mounts` shows of one mount.
 pub struct MountInfo {
     path: [u8; MAX_PATH],
@@ -475,6 +487,15 @@ impl Vfs {
         }
     }
 
+    /// Which mount a path is on -- the one the VFS resolves it through --
+    /// as an identity no other mount has had or will have: for a walk that
+    /// keeps to one filesystem (`find -xdev`).
+    pub fn mount_id(&self, path: &[u8]) -> Option<u64> {
+        let inner = self.inner.lock();
+        let (index, _) = Self::find_mount(&inner, path)?;
+        Some(inner.mounts[index].as_ref()?.id)
+    }
+
     pub fn mount_count(&self) -> usize {
         self.inner.lock().count
     }
@@ -630,20 +651,33 @@ impl Vfs {
         })
     }
 
-    /// The index'th entry of the directory at `path`.
+    /// The index'th entry of the directory at `path`; `None` past the last,
+    /// and for anything that is not a directory it can read.
     pub fn read_dir(&self, path: &[u8], index: usize) -> Option<DirEntry> {
+        self.dir_entry(path, index).ok().flatten()
+    }
+
+    /// The index'th entry of the directory at `path`: `Ok(None)` past the
+    /// last, and an error that says why when there is no directory to read
+    /// -- so that one the filesystem cannot read is told from an empty one.
+    pub fn dir_entry(&self, path: &[u8], index: usize) -> Result<Option<DirEntry>, DirError> {
         let mut inner = self.inner.lock();
 
-        let resolved = Self::resolve(&mut inner, path)?;
-        let dir = resolved.node?;
-        let fs = &mut inner.mounts[resolved.mount].as_mut()?.fs;
+        let resolved = Self::resolve(&mut inner, path).ok_or(DirError::NotFound)?;
+        let dir = resolved.node.ok_or(DirError::NotFound)?;
+        let fs = &mut inner.mounts[resolved.mount].as_mut().ok_or(DirError::NotFound)?.fs;
 
-        if !fs.tree().get(dir)?.is_dir() || !fs.load_dir(dir) {
-            return None;
+        if !fs.tree().get(dir).ok_or(DirError::NotFound)?.is_dir() {
+            return Err(DirError::NotDir);
+        }
+        if !fs.load_dir(dir) {
+            return Err(DirError::Unreadable);
         }
 
         let tree = fs.tree();
-        let child = tree.get(tree.children(dir).nth(index)?)?;
+        let Some(child) = tree.children(dir).nth(index).and_then(|child| tree.get(child)) else {
+            return Ok(None);
+        };
 
         let mut entry = DirEntry {
             name: [0; NAME_MAX],
@@ -652,7 +686,7 @@ impl Vfs {
             size: if child.is_file() { child.size } else { 0 },
         };
         entry.name[..entry.name_len].copy_from_slice(child.name());
-        Some(entry)
+        Ok(Some(entry))
     }
 
     pub fn open(&self, path: &[u8], flags: usize) -> Option<Handle> {

@@ -23,6 +23,12 @@ and after it the machine has to switch itself off with nothing panicking.
 Until 7908bf6 it could not -- an exiting CPU left its one WFI, and the static
 destructors faulted after the unmount -- and this test looked away from it.
 
+`find` walks a tree made for it there, and is held to what each test
+should pick out of it: by name and by path, by type, size and emptiness,
+by depth, with `!`, `-o` and parentheses; with what it walked in order,
+procfs entered at /proc unless `-xdev` keeps it out, and what it refuses
+said.
+
 And a file past 4 GiB: the image starts without large_file, which nos has
 to set when it makes its first file of 2 GiB or more; one is grown by
 `truncate` and written at its end, past 5 GiB, where the size takes both of
@@ -108,9 +114,71 @@ def shell_work(sh):
              "big.txt" in listing and "renamed.txt" in listing
              and "inner" in listing and "tree" not in listing, listing)
 
+    find_work(sh)
     far_work(sh)
 
     sh.run("sync")
+
+
+def find_paths(sh, args):
+    """What `find` prints: the paths, in order, and the lines that say
+    something went wrong."""
+    out = sh.run("find " + args)
+    lines = [l for l in out.splitlines() if l.strip()]
+    return [l for l in lines if not l.startswith("find: ")], [l for l in lines if l.startswith("find: ")], out
+
+
+def find_work(sh):
+    """`find` over a tree made for it: what each expression picks out."""
+    t = "/work/find"
+    for cmd in ["mkdir %s", "write %s/a.txt x", "write %s/B.TXT yy", "touch %s/empty.txt", "mkdir %s/sub",
+                "write %s/sub/c.log some-log-line", "mkdir %s/sub/deep", "write %s/sub/deep/d.txt deep-down",
+                "mkdir %s/void"]:
+        sh.run(cmd % t)
+
+    def under(*names):
+        return {t + n for n in names}
+
+    every = under("", "/a.txt", "/B.TXT", "/empty.txt", "/sub", "/sub/c.log", "/sub/deep", "/sub/deep/d.txt", "/void")
+    paths, errors, out = find_paths(sh, t)
+    pt.check("find walks the whole tree, itself included", set(paths) == every and len(paths) == len(every)
+             and not errors, out)
+    pt.check("and prints a directory before what is in it",
+             all(paths.index(p.rsplit("/", 1)[0]) < paths.index(p) for p in paths if p != t), out)
+
+    cases = [
+        ("-name *.txt", under("/a.txt", "/empty.txt", "/sub/deep/d.txt"), "by name"),
+        ("-iname *.txt", under("/a.txt", "/B.TXT", "/empty.txt", "/sub/deep/d.txt"), "by name, whatever the case"),
+        ("-name [ab]*", under("/a.txt"), "by a class"),
+        ("-path */sub/* ! -type d", under("/sub/c.log", "/sub/deep/d.txt"), "by path, and not"),
+        ("-type d", under("", "/sub", "/sub/deep", "/void"), "by type"),
+        ("-empty", under("/empty.txt", "/void"), "what is empty"),
+        ("-type f -size +1", under("/B.TXT", "/sub/c.log", "/sub/deep/d.txt"), "files over a byte"),
+        ("-size -2", under("/a.txt", "/empty.txt"), "files under two bytes, and no directory"),
+        ("-size 13c", under("/sub/c.log"), "a file of thirteen bytes"),
+        ("-mindepth 1 -maxdepth 1", under("/a.txt", "/B.TXT", "/empty.txt", "/sub", "/void"), "one level down"),
+        ("-maxdepth 0", under(""), "the start alone"),
+        ("( -name a* -o -name c* ) -type f", under("/a.txt", "/sub/c.log"), "with -o in parentheses"),
+        ("-not -name *.* -a -mindepth 1", under("/sub", "/sub/deep", "/void"), "with -not and -a"),
+    ]
+    for args, want, what in cases:
+        paths, errors, out = find_paths(sh, "%s %s" % (t, args))
+        pt.check("find %s: %s" % (args, what), set(paths) == want and len(paths) == len(want) and not errors, out)
+
+    # Across a mount: into procfs at /proc, unless -xdev keeps it out
+    paths, errors, out = find_paths(sh, "/ -path /proc/*")
+    pt.check("find goes into the procfs mounted at /proc",
+             {"/proc/version", "/proc/cmdline", "/proc/interrupts"} <= set(paths) and not errors, out)
+    paths, errors, out = find_paths(sh, "/ -xdev -path /proc*")
+    pt.check("and -xdev keeps it to the root's filesystem", paths == ["/proc"] and not errors, out)
+
+    # What it cannot do, it says
+    out = sh.run("find /work/nothing -name x")
+    pt.check("find says a path is not there", "find: /work/nothing: not found" in out, out)
+    out = sh.run("find %s -bogus" % t)
+    pt.check("find refuses a test it does not know", "unknown test '-bogus'" in out and t not in out, out)
+    out = sh.run("find %s ( -name a*" % t)
+    pt.check("find refuses a '(' left open", "not closed" in out and t not in out, out)
 
 
 def far_work(sh):

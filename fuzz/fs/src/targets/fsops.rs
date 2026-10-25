@@ -1083,6 +1083,7 @@ pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
                 f.create(&p, true);
             }
         }
+        19 if r.chance(64) => crate::targets::find::find(f, r),
         _ => f.compare(),
     }
 }
