@@ -43,6 +43,12 @@ const TABLE: u64 = READ | WRITE | EXECUTE;
 const PAGE: u64 = READ | WRITE | EXECUTE | MEMTYPE_WB;
 /// The same page, read-only: a write to it is an EPT violation.
 const PAGE_RO: u64 = READ | MEMTYPE_WB;
+/// An entry of the level above the last that is a page itself, 2 MiB of
+/// guest memory (bit 7): read, write, execute, write-back, as a page is.
+/// Only where the CPU says it walks them (`IA32_VMX_EPT_VPID_CAP` bit 16,
+/// `hvarch::x86::Caps::nested_2m`).
+const PAGE_SIZE_BIT: u64 = 1 << 7;
+const HUGE_PAGE: u64 = PAGE | PAGE_SIZE_BIT;
 
 /// The EPT pointer's own bits, below the PML4 address: write-back (2:0 = 6),
 /// a page-walk length of four (5:3 = 3), and nothing else -- no accessed or
@@ -51,6 +57,13 @@ const EPTP_BITS: u64 = 6 | (3 << 3);
 
 /// No table below this entry yet.
 const NONE: u32 = u32::MAX;
+/// No table below this entry ever: it is a 2 MiB page itself.
+const LEAF: u32 = u32::MAX - 1;
+/// The level whose entries are 2 MiB pages, or the last-level tables that
+/// split them into 4 KiB ones.
+const DIRECTORY: usize = 2;
+/// What a 2 MiB page's address must be a multiple of.
+const HUGE_BYTES: u64 = 1 << 21;
 
 /// Levels from the top: which bits of an address index each one.
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
@@ -111,14 +124,23 @@ impl Ept {
     /// The last-level table that maps `gpa`, making the levels above it as
     /// needed when `make` says so.
     fn last_level(&mut self, gpa: u64, make: bool) -> Result<usize> {
+        self.table_at(gpa, SHIFTS.len() - 1, make)
+    }
+
+    /// The table of level `depth` (0 the top) on the way to `gpa`, making
+    /// the levels above it as needed when `make` says so. An entry on the
+    /// way that is a 2 MiB page has no table below it, and refuses.
+    fn table_at(&mut self, gpa: u64, depth: usize, make: bool) -> Result<usize> {
         if gpa >= MAX_GPA {
             return Err(Error::BadAddress);
         }
         let mut table = 0usize;
-        for level in 0..SHIFTS.len() - 1 {
+        for level in 0..depth {
             let i = index(gpa, level);
             let next = self.tables[table].next[i];
-            table = if next != NONE {
+            table = if next == LEAF {
+                return Err(Error::BadAddress);
+            } else if next != NONE {
                 next as usize
             } else if make {
                 let child = Table::new(level + 1 == SHIFTS.len() - 1)?;
@@ -165,6 +187,51 @@ impl Ept {
     /// As [`set`](Self::set), but read-only for the guest.
     pub fn set_ro(&mut self, gpa: u64, hpa: u64) -> Result<()> {
         self.set_entry(gpa, hpa, PAGE_RO)
+    }
+
+    /// Make every table `[gpa, gpa + size)` will need to be mapped 2 MiB at
+    /// a time ([`set_huge`](Self::set_huge)) -- the levels down to the one
+    /// whose entries are its pages, and none below: whole 2 MiB, and none
+    /// of it split into 4 KiB pages already.
+    pub fn prepare_huge(&mut self, gpa: u64, size: u64) -> Result<()> {
+        let end = gpa.checked_add(size).ok_or(Error::BadAddress)?;
+        if gpa % HUGE_BYTES != 0 || size % HUGE_BYTES != 0 {
+            return Err(Error::BadAddress);
+        }
+        let mut at = gpa;
+        while at < end {
+            let dir = self.table_at(at, DIRECTORY, true)?;
+            if self.tables[dir].next[index(at, DIRECTORY)] != NONE {
+                return Err(Error::BadAddress);
+            }
+            at += HUGE_BYTES;
+        }
+        Ok(())
+    }
+
+    /// Map the 2 MiB at `gpa` to the host's 2 MiB at `hpa`, both aligned to
+    /// it, with one entry. The tables have been made by `prepare_huge`; an
+    /// entry already there -- a page, or a table of 4 KiB ones -- is refused
+    /// rather than replaced, as [`set`](Self::set) refuses.
+    pub fn set_huge(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        if gpa % HUGE_BYTES != 0 || hpa % HUGE_BYTES != 0 || hpa & !ADDRESS != 0 {
+            return Err(Error::BadAddress);
+        }
+        let dir = self.table_at(gpa, DIRECTORY, false)?;
+        let i = index(gpa, DIRECTORY);
+        if self.tables[dir].next[i] != NONE {
+            return Err(Error::BadAddress);
+        }
+        let page = &mut self.tables[dir].page;
+        match page.load::<u64>(i * ENTRY_BYTES) {
+            Some(0) => {}
+            _ => return Err(Error::BadAddress),
+        }
+        if !page.store::<u64>(i * ENTRY_BYTES, hpa | HUGE_PAGE) {
+            return Err(Error::BadAddress);
+        }
+        self.tables[dir].next[i] = LEAF;
+        Ok(())
     }
 
     fn set_entry(&mut self, gpa: u64, hpa: u64, bits: u64) -> Result<()> {

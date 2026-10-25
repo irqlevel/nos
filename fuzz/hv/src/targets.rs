@@ -1186,10 +1186,12 @@ fn linux(r: &mut Input) {
     }
     let Ok(h) = Header::parse(&first) else { return };
     h.pm_offset();
-    /* Whole pages, as guest memory is made of; `mem=` is in MiB. */
+    /* Whole pages, as guest memory is made of; `mem=` is in MiB -- below
+     * the devices' pages, and past them up to 32 GiB. */
     let mem_bytes = match r.u8() % 8 {
         0 => r.value64() & !0xFFF,
         1 => 1 << 40,
+        2 => (4064 + r.below(32768 - 4064 + 1)) << 20,
         _ => (64 + r.below(4096 - 64 + 1)) << 20,
     };
     let kernel_len = if r.u8() < 224 { r.below(32 << 20) } else { r.value64() };
@@ -1200,30 +1202,67 @@ fn linux(r: &mut Input) {
     };
     let Ok(l) = plan(&h, mem_bytes, kernel_len, initrd_len) else { return };
     /* What the loader streams the kernel and the initrd by, and writes its
-     * own tables around: inside memory, apart, and clear of the tables. */
+     * own tables around: inside the RAM below 4 GiB -- under the devices'
+     * pages, whatever is past them -- apart, and clear of the tables. */
+    let low = crate::linux::Ram::of(mem_bytes).low;
     let kernel_end = l.kernel_addr.checked_add(l.kernel_len);
-    invariant!(kernel_end.is_some_and(|e| e <= mem_bytes), "a kernel at {:#x} of {:#x} bytes in {:#x}",
-               l.kernel_addr, l.kernel_len, mem_bytes);
+    invariant!(kernel_end.is_some_and(|e| e <= low), "a kernel at {:#x} of {:#x} bytes in {:#x} of RAM below 4 GiB",
+               l.kernel_addr, l.kernel_len, low);
     if l.initrd_len != 0 {
-        invariant!(l.initrd_addr.checked_add(l.initrd_len).is_some_and(|e| e <= mem_bytes),
-                   "an initrd at {:#x} of {:#x} bytes in {:#x}", l.initrd_addr, l.initrd_len, mem_bytes);
+        invariant!(l.initrd_addr.checked_add(l.initrd_len).is_some_and(|e| e <= low),
+                   "an initrd at {:#x} of {:#x} bytes in {:#x} of RAM below 4 GiB", l.initrd_addr, l.initrd_len, low);
         invariant!(kernel_end.is_some_and(|e| l.initrd_addr >= e), "the initrd at {:#x} inside the kernel, to {:#x}",
                    l.initrd_addr, kernel_end.unwrap_or(0));
     }
     invariant!(l.kernel_addr >= 1 << 20,
                "the kernel at {:#x}, over the tables the loader writes below 1 MiB", l.kernel_addr);
-    if mem_bytes > 4096 << 20 {
+    if mem_bytes > crate::run::MAX_MEM_BYTES {
         return;
     }
-    let memory = GuestMemory::with_size(mem_bytes);
+    let Some(memory) = GuestMemory::with_ram(mem_bytes) else { return };
     let cmdline: Vec<u8> = (0..r.below(512)).map(|_| r.u8()).collect();
     let firmware = r.bool().then_some(Firmware { rsdp: crate::acpi::AREA, start: crate::acpi::AREA,
                                                  end: crate::acpi::AREA_END });
     let routes = [crate::acpi::Route { slot: 1, irq: 11 }, crate::acpi::Route { slot: 2, irq: 10 }];
     let cpus = 1 + r.below(16) as u32;
-    let _ = build(&memory, &h, &first, &l, &cmdline, cpus, firmware, &routes[..r.below(3) as usize], r.bool());
+    if build(&memory, &h, &first, &l, &cmdline, cpus, firmware, &routes[..r.below(3) as usize], r.bool()).is_ok() {
+        /* The zero page's memory map: RAM the guest has, every byte of it. */
+        let mut n = [0u8; 1];
+        memory.read(0x7000 + 0x1e8, &mut n).expect("the e820 count");
+        e820_held(&memory, 0x7000 + 0x2d0, 20, usize::from(n[0]), mem_bytes);
+    }
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &l);
+}
+
+/// A memory map of `n` entries at `map`, `stride` bytes apart, held to the
+/// guest it describes: entries apart and in order, each RAM or reserved,
+/// RAM only where the guest has memory, all of its RAM there, and the last
+/// of it where `linux::Ram` ends it.
+fn e820_held(memory: &GuestMemory, map: u64, stride: usize, n: usize, mem_bytes: u64) {
+    let ram = crate::linux::Ram::of(mem_bytes);
+    invariant!((2..=crate::linux::E820_ENTRIES).contains(&n), "a memory map of {} entries", n);
+    let mut end = 0u64;
+    let mut ram_top = 0u64;
+    let mut high = false;
+    for i in 0..n {
+        let mut ent = [0u8; 20];
+        memory.read(map + (i * stride) as u64, &mut ent).expect("a memory map entry");
+        let addr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(ent[8..16].try_into().unwrap());
+        let kind = u32::from_le_bytes(ent[16..20].try_into().unwrap());
+        invariant!(addr >= end && size != 0 && matches!(kind, 1 | 2),
+                   "memory map entry {}: {:#x}+{:#x}, type {}, after {:#x}", i, addr, size, kind, end);
+        end = addr + size;
+        if kind == 1 {
+            invariant!(memory.backs(addr, size), "RAM at {:#x}+{:#x} in the map, where the guest has none", addr, size);
+            ram_top = end;
+            high |= addr == crate::linux::HIGH_RAM_START && size == ram.high;
+        }
+    }
+    invariant!(Some(ram_top) == ram.end(), "RAM to {:#x} in a guest of {:#x}", ram_top, mem_bytes);
+    invariant!(high == (ram.high != 0), "a guest of {:#x} whose map says {} of its {:#x} from 4 GiB", mem_bytes,
+               if high { "all" } else { "nothing" }, ram.high);
 }
 
 /* ---- what a guest's image decides: a PVH ELF ---- */
@@ -1381,8 +1420,10 @@ fn pvh(r: &mut Input) {
     let mem_bytes = match r.u8() % 8 {
         0 => r.value64() & !0xFFF,
         1 => 1 << 40,
+        2 => (4064 + r.below(32768 - 4064 + 1)) << 20,
         _ => (16 + r.below(4096 - 16 + 1)) << 20,
     };
+    let low = crate::linux::Ram::of(mem_bytes).low;
     let initrd_len = match r.u8() % 4 {
         0 => r.value64(),
         1 => 0,
@@ -1390,23 +1431,25 @@ fn pvh(r: &mut Input) {
     };
     let Ok(l) = plan(&image, mem_bytes, initrd_len) else { return };
     PVH_PLANNED.fetch_add(1, Relaxed);
+    /* All of it in the RAM below 4 GiB, which a 32-bit entry with paging
+     * off reaches: under the devices' pages, whatever is past them. */
     for s in segs {
-        invariant!(s.paddr >= 1 << 20 && s.paddr + s.memsz <= mem_bytes,
-                   "a segment at {:#x} of {:#x} bytes, in {:#x} of RAM, over the tables below 1 MiB", s.paddr, s.memsz,
-                   mem_bytes);
+        invariant!(s.paddr >= 1 << 20 && s.paddr + s.memsz <= low,
+                   "a segment at {:#x} of {:#x} bytes, in {:#x} of RAM below 4 GiB, over the tables below 1 MiB",
+                   s.paddr, s.memsz, low);
     }
     let image_end = segs.iter().map(|s| s.paddr + s.memsz).max().unwrap_or(0);
     if l.initrd_len != 0 {
         invariant!(l.initrd_addr % 0x1000 == 0 && l.initrd_addr >= image_end
-                   && l.initrd_addr.checked_add(l.initrd_len).is_some_and(|e| e <= mem_bytes),
-                   "an initrd at {:#x} of {:#x} bytes, the image to {:#x}, in {:#x}", l.initrd_addr, l.initrd_len,
-                   image_end, mem_bytes);
+                   && l.initrd_addr.checked_add(l.initrd_len).is_some_and(|e| e <= low),
+                   "an initrd at {:#x} of {:#x} bytes, the image to {:#x}, in {:#x} of RAM below 4 GiB", l.initrd_addr,
+                   l.initrd_len, image_end, low);
     }
-    if mem_bytes > 4096 << 20 {
+    if mem_bytes > crate::run::MAX_MEM_BYTES {
         return;
     }
 
-    let memory = GuestMemory::with_size(mem_bytes);
+    let Some(memory) = GuestMemory::with_ram(mem_bytes) else { return };
     let cmdline: Vec<u8> = (0..r.below(2100)).map(|_| r.u8()).collect();
     let firmware = r.bool().then_some(crate::linux::Firmware { rsdp: crate::acpi::AREA, start: crate::acpi::AREA,
                                                                end: crate::acpi::AREA_END });
@@ -1425,23 +1468,7 @@ fn pvh(r: &mut Input) {
         invariant!(at32(0) == 0x336E_C578 && at32(4) == 1, "a start info of magic {:#x}, version {}", at32(0), at32(4));
         invariant!(at32(12) == u32::from(l.initrd_len != 0), "{} modules, for an initrd of {}", at32(12), l.initrd_len);
         let (map, n) = (at64(40), at32(48) as usize);
-        invariant!((2..=3).contains(&n), "a memory map of {} entries", n);
-        let mut end = 0u64;
-        let mut ram_top = 0u64;
-        for i in 0..n {
-            let mut ent = [0u8; 24];
-            memory.read(map + (i * 24) as u64, &mut ent).expect("a memory map entry");
-            let addr = u64::from_le_bytes(ent[0..8].try_into().unwrap());
-            let size = u64::from_le_bytes(ent[8..16].try_into().unwrap());
-            let kind = u32::from_le_bytes(ent[16..20].try_into().unwrap());
-            invariant!(addr >= end && size != 0 && matches!(kind, 1 | 2),
-                       "memory map entry {}: {:#x}+{:#x}, type {}, after {:#x}", i, addr, size, kind, end);
-            end = addr + size;
-            if kind == 1 {
-                ram_top = end;
-            }
-        }
-        invariant!(ram_top == mem_bytes, "RAM to {:#x} in a guest of {:#x}", ram_top, mem_bytes);
+        e820_held(&memory, map, 24, n, mem_bytes);
     }
     let mut vcpu = crate::vm::Backend::default();
     set_entry(&mut vcpu, &image);

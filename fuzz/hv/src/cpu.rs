@@ -24,6 +24,7 @@ pub enum Error {
     Unmapped,
     BadAddress,
     NoUnrestrictedGuest,
+    NoHugePages,
 }
 
 impl core::fmt::Display for Error {
@@ -53,6 +54,11 @@ pub struct Caps {
 impl Caps {
     pub fn vendor(&self) -> Vendor {
         self.vendor
+    }
+    /// 2 MiB entries in the nested table: what the fuzzer's memory makes no
+    /// difference of, keeping every region as pages it was written in.
+    pub fn nested_2m(&self) -> bool {
+        true
     }
 }
 

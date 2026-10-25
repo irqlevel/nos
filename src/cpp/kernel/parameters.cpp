@@ -18,6 +18,16 @@ static const ulong NetFrameCountMax = 65536;
    a typo from being taken for a number. */
 static const ulong NetconsoleTailKbMax = 1024;
 
+/* hugepages=: a share in percent is at most the whole machine; a size is
+   in MiB or GiB, and at most what the most RAM this kernel addresses is --
+   past that it is a typo, not a machine. Either is cut down at boot to what
+   the machine can spare (PageTable::ReserveHugePool). */
+static const ulong HugePoolPercentMax = 100;
+static const ulong HugePoolMaxGiB = 512;
+static const ulong PercentWhole = 100;
+/* "1024G" and a NUL: the longest value worth reading. */
+static const size_t HugePoolValueMax = 16;
+
 Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
@@ -38,6 +48,8 @@ Parameters::Parameters()
     , NetconsolePort(0)
     , NetconsoleTailKb(0)
     , NetFrameCount(0)
+    , HugePoolPercent(0)
+    , HugePoolBytes(0)
     , RxPoll(false)
     , LogLevel(DefaultLogLevel)
     , DnsEnabled(false)
@@ -173,6 +185,58 @@ ulong Parameters::GetNetconsoleTailKb()
 ulong Parameters::GetNetFrameCount()
 {
     return NetFrameCount;
+}
+
+ulong Parameters::GetHugePoolBytes(ulong totalBytes)
+{
+    if (HugePoolPercent != 0)
+    {
+        /* Both bounded -- the percent by HugePoolPercentMax, the machine by
+           what one PDPT maps -- so the product cannot wrap. */
+        return totalBytes / PercentWhole * HugePoolPercent;
+    }
+    return HugePoolBytes;
+}
+
+/* "50%", "32G", "512M": a share of RAM or a size, into HugePoolPercent or
+   HugePoolBytes. False, and neither set, for anything else. */
+bool Parameters::ParseHugePool(const char* value)
+{
+    const size_t len = Stdlib::StrLen(value);
+    if (len < 2 || len >= HugePoolValueMax)
+        return false;
+    /* Everything but the last character, which says what the number is. */
+    char digits[HugePoolValueMax];
+    Stdlib::StrnCpy(digits, value, len);
+    ulong n = 0;
+    if (!Stdlib::ParseUlong(digits, n) || n == 0)
+        return false;
+
+    switch (value[len - 1])
+    {
+    case '%':
+        if (n > HugePoolPercentMax)
+            return false;
+        HugePoolPercent = n;
+        HugePoolBytes = 0;
+        return true;
+    case 'G':
+    case 'g':
+        if (n > HugePoolMaxGiB)
+            return false;
+        HugePoolBytes = n * Const::GB;
+        HugePoolPercent = 0;
+        return true;
+    case 'M':
+    case 'm':
+        if (n > HugePoolMaxGiB * Const::GB / Const::MB)
+            return false;
+        HugePoolBytes = n * Const::MB;
+        HugePoolPercent = 0;
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool Parameters::IsRxPollEnabled()
@@ -513,6 +577,11 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         {
             Trace(0, "Invalid netframes %s", value);
         }
+    }
+    else if (Stdlib::StrCmp(key, "hugepages") == 0)
+    {
+        if (!ParseHugePool(value))
+            Trace(0, "Invalid hugepages %s: a share of RAM (50%%) or a size (32G, 512M)", value);
     }
     else if (Stdlib::StrCmp(key, "nctail") == 0)
     {

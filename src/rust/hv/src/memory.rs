@@ -6,7 +6,9 @@ use alloc::vec::Vec;
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
-use kcore::frame::{Frame, Run};
+#[cfg(target_arch = "x86_64")]
+use kcore::frame::{Frame, HUGE_PAGES};
+use kcore::frame::{FramePage, Run, HUGE_SIZE};
 use kcore::pod::{self, Pod};
 use kcore::sync::Mutex;
 
@@ -47,6 +49,18 @@ impl SecondLevel {
             SecondLevel::Ept(t) => t.set_ro(gpa, hpa),
         }
     }
+    fn prepare_huge(&mut self, gpa: u64, size: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.prepare_huge(gpa, size),
+            SecondLevel::Ept(t) => t.prepare_huge(gpa, size),
+        }
+    }
+    fn set_huge(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set_huge(gpa, hpa),
+            SecondLevel::Ept(t) => t.set_huge(gpa, hpa),
+        }
+    }
     fn nested(&self) -> hvarch::x86::svm::Nested {
         match self {
             SecondLevel::Npt(t) => t.nested(),
@@ -84,7 +98,9 @@ pub const XAPIC_PAGE: u64 = 0xFEE0_0000;
 
 /// A guest's memory.
 ///
-/// Its pages are [`Frame`]s: RAM the kernel handed out by address and mapped
+/// Its pages are [`Frame`]s -- or, given from the huge pool (`add_huge`),
+/// 2 MiB blocks of it, each one entry of the nested table where the CPU
+/// walks those: RAM the kernel handed out by address and mapped
 /// nowhere, so that the guest's nested table is the only mapping of it there
 /// is, and a guest of any size costs pages and no kernel address space. The
 /// guest writes it whenever it runs, on whatever CPU it runs on, so nothing
@@ -137,9 +153,12 @@ struct Absent {
 struct Region {
     base: u64,
     size: u64,
-    /// One frame a page, in order: shared with every mapping of some of
-    /// them (`GuestMemory::map`), which keeps them until it is undone.
+    /// Its pages, in order -- frames of their own, or blocks of the huge
+    /// pool: shared with every mapping of some of them (`GuestMemory::map`),
+    /// which keeps them until it is undone.
     frames: Run,
+    /// They are the huge pool's.
+    huge: bool,
 }
 
 impl Region {
@@ -147,11 +166,11 @@ impl Region {
         gpa >= self.base && len <= self.size && gpa - self.base <= self.size - len
     }
 
-    /// The frame `gpa` is in, and where in it: None for an address outside
+    /// The page `gpa` is in, and where in it: None for an address outside
     /// the region.
-    fn frame(&self, gpa: u64) -> Option<(&Frame, usize)> {
+    fn page(&self, gpa: u64) -> Option<(FramePage<'_>, usize)> {
         let page = usize::try_from(gpa.checked_sub(self.base)? / PAGE).ok()?;
-        Some((self.frames.frame(page)?, (gpa % PAGE) as usize))
+        Some((self.frames.page(page)?, (gpa % PAGE) as usize))
     }
 }
 
@@ -184,10 +203,35 @@ impl GuestMemory {
         })
     }
 
-    /// Give the guest `size` bytes of zeroed memory at `base`. Both are whole
-    /// pages, and the range is clear of every region already given.
+    /// Give the guest `size` bytes of zeroed memory at `base`, a frame a
+    /// page. Both are whole pages, and the range is clear of every region
+    /// already given.
     pub fn add(&mut self, base: u64, size: u64) -> Result<()> {
-        if size == 0 || base % PAGE != 0 || size % PAGE != 0 {
+        let pages = self.check_new(base, size, PAGE)?;
+        /* The kernel zeroes every frame it hands out: what the guest finds
+         * in its memory is what it was given, never what the host left
+         * there. A failure part way drops what was taken. */
+        let frames = Run::new(pages).ok_or(Error::NoMemory)?;
+        self.place(base, size, frames, false, false)
+    }
+
+    /// Give the guest `size` bytes of zeroed memory at `base` from the huge
+    /// pool (`hugepages=`), a block of it every 2 MiB: both whole blocks,
+    /// and the range clear of every region already given. Each block is one
+    /// entry of the nested table where `leaves_2m` says the CPU walks those
+    /// (`hvarch::x86::Caps::nested_2m`), and 512 where it does not -- the
+    /// pool's memory either way. `NoHugePages` when the pool has not that
+    /// many free, the blocks taken by then going back.
+    pub fn add_huge(&mut self, base: u64, size: u64, leaves_2m: bool) -> Result<()> {
+        let pages = self.check_new(base, size, HUGE_SIZE)?;
+        let frames = Run::new_huge(pages).ok_or(Error::NoHugePages)?;
+        self.place(base, size, frames, true, leaves_2m)
+    }
+
+    /// How many pages `[base, base + size)` is, when it is whole multiples
+    /// of `unit`, below `MAX_GPA` and clear of every region already given.
+    fn check_new(&self, base: u64, size: u64, unit: u64) -> Result<usize> {
+        if size == 0 || base % unit != 0 || size % unit != 0 {
             return Err(Error::BadAddress);
         }
         match base.checked_add(size) {
@@ -197,21 +241,28 @@ impl GuestMemory {
         if self.regions.iter().any(|r| base < r.base + r.size && r.base < base + size) {
             return Err(Error::BadAddress);
         }
+        usize::try_from(size / PAGE).map_err(|_| Error::NoMemory)
+    }
 
-        /* The kernel zeroes every frame it hands out: what the guest finds
-         * in its memory is what it was given, never what the host left
-         * there. A failure part way drops what was taken. */
-        let pages = usize::try_from(size / PAGE).map_err(|_| Error::NoMemory)?;
-        let frames = Run::new(pages).ok_or(Error::NoMemory)?;
+    /// `frames` made the guest's at `base`: a region, and the nested
+    /// table's entries for it -- a block of the pool one entry where
+    /// `leaves_2m`, every other page one of its own.
+    fn place(&mut self, base: u64, size: u64, frames: Run, huge: bool, leaves_2m: bool) -> Result<()> {
         /* The tables next, which is all that can fail for want of memory:
          * a failure there leaves empty tables and no page mapped. */
         #[cfg(target_arch = "x86_64")]
         let mut table = self.table.lock();
         #[cfg(target_arch = "x86_64")]
-        table.prepare(base, size)?;
+        if leaves_2m {
+            table.prepare_huge(base, size)?;
+        } else {
+            table.prepare(base, size)?;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = leaves_2m;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.regions.push(Region { base, size, frames });
+        self.regions.push(Region { base, size, frames, huge });
 
         /* Owned first, mapped after, so every page the table points at is
          * this value's from before the moment it is reachable. */
@@ -219,9 +270,15 @@ impl GuestMemory {
         {
             let region = self.regions.last().expect("just pushed");
             let mut gpa = base;
-            for frame in region.frames.iter() {
-                table.set(gpa, frame.phys())?;
-                gpa += PAGE;
+            for e in region.frames.extents() {
+                if leaves_2m && e.pages == HUGE_PAGES {
+                    table.set_huge(gpa, e.phys)?;
+                } else {
+                    for k in 0..e.pages as u64 {
+                        table.set(gpa + k * PAGE, e.phys + k * PAGE)?;
+                    }
+                }
+                gpa += e.pages as u64 * PAGE;
             }
         }
         Ok(())
@@ -298,6 +355,11 @@ impl GuestMemory {
         self.regions.iter().map(|r| r.size).sum()
     }
 
+    /// How much of it is the huge pool's.
+    pub fn huge_size(&self) -> u64 {
+        self.regions.iter().filter(|r| r.huge).map(|r| r.size).sum()
+    }
+
     /// The region `[gpa, gpa + len)` lies whole in.
     fn region(&self, gpa: u64, len: usize) -> Result<usize> {
         let len = len as u64;
@@ -309,9 +371,9 @@ impl GuestMemory {
         let region = &self.regions[self.region(gpa, buf.len())?];
         let mut done = 0usize;
         while done < buf.len() {
-            let (frame, off) = region.frame(gpa + done as u64).ok_or(Error::Unmapped)?;
+            let (page, off) = region.page(gpa + done as u64).ok_or(Error::Unmapped)?;
             let n = (buf.len() - done).min(PAGE_SIZE - off);
-            if !frame.read(off, &mut buf[done..done + n]) {
+            if !page.read(off, &mut buf[done..done + n]) {
                 return Err(Error::Unmapped);
             }
             done += n;
@@ -326,9 +388,9 @@ impl GuestMemory {
         let region = &self.regions[self.region(gpa, data.len())?];
         let mut done = 0usize;
         while done < data.len() {
-            let (frame, off) = region.frame(gpa + done as u64).ok_or(Error::Unmapped)?;
+            let (page, off) = region.page(gpa + done as u64).ok_or(Error::Unmapped)?;
             let n = (data.len() - done).min(PAGE_SIZE - off);
-            if !frame.write(off, &data[done..done + n]) {
+            if !page.write(off, &data[done..done + n]) {
                 return Err(Error::Unmapped);
             }
             done += n;
@@ -339,15 +401,15 @@ impl GuestMemory {
     /// The 16-bit word at `gpa`, read as one access with acquire order --
     /// whole, where `read` copies a byte at a time and another of the
     /// guest's CPUs may be storing the word meanwhile: a virtqueue's indices
-    /// (`kcore::frame::Frame::load_u16`). An address that is not even is
+    /// (`kcore::frame::FramePage::load_u16`). An address that is not even is
     /// refused, as one outside the guest's memory is.
     pub fn read_u16(&self, gpa: u64) -> Result<u16> {
         if gpa % 2 != 0 {
             return Err(Error::BadAddress);
         }
         let region = &self.regions[self.region(gpa, 2)?];
-        let (frame, off) = region.frame(gpa).ok_or(Error::Unmapped)?;
-        frame.load_u16(off).ok_or(Error::Unmapped)
+        let (page, off) = region.page(gpa).ok_or(Error::Unmapped)?;
+        page.load_u16(off).ok_or(Error::Unmapped)
     }
 
     /// `value` stored at `gpa` as one access with release order: what was
@@ -358,8 +420,8 @@ impl GuestMemory {
             return Err(Error::BadAddress);
         }
         let region = &self.regions[self.region(gpa, 2)?];
-        let (frame, off) = region.frame(gpa).ok_or(Error::Unmapped)?;
-        if frame.store_u16(off, value) { Ok(()) } else { Err(Error::Unmapped) }
+        let (page, off) = region.page(gpa).ok_or(Error::Unmapped)?;
+        if page.store_u16(off, value) { Ok(()) } else { Err(Error::Unmapped) }
     }
 
     /// The guest's pages from `gpa`, as many as `len` bytes reach,

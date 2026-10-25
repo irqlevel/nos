@@ -122,6 +122,18 @@ impl Caps {
         }
     }
 
+    /// The nested table may map 2 MiB of a guest's memory with one entry:
+    /// always under AMD-V, whose nested table is the host's own long-mode
+    /// format and its PS bit with it; under VT-x where the CPU says its EPT
+    /// walk takes them.
+    pub fn nested_2m(&self) -> bool {
+        match &self.detail {
+            Detail::Svm(_) => true,
+            Detail::Vmx(caps) => caps.ept_2m(),
+            Detail::None => false,
+        }
+    }
+
     /// The CPUID vendor string, or "?" if it is not text.
     pub fn vendor_id(&self) -> &str {
         core::str::from_utf8(&self.vendor_id).unwrap_or("?")
@@ -220,6 +232,7 @@ impl Caps {
         }
 
         feature(out, "x2APIC", self.x2apic, "the host's; a guest's is MSR exits either way")?;
+        feature(out, "2 MiB nested pages", self.nested_2m(), "a guest's memory from the huge pool a block an entry")?;
         feature(out, "1 GiB pages", self.gb_pages, "guest memory in one nested entry a gigabyte")?;
         Ok(())
     }

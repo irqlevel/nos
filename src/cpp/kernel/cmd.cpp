@@ -1131,6 +1131,7 @@ static void CmdMemusage(const char* args, Stdlib::Printer& con)
 
     con.Printf("freePages: %lu\n", pt.GetFreePagesCount());
     con.Printf("totalPages: %lu\n", pt.GetTotalPagesCount());
+    con.Printf("hugePages: %lu free of %lu\n", pt.GetHugePoolFree(), pt.GetHugePoolBlocks());
 }
 
 static void CmdMemcheck(const char* args, Stdlib::Printer& con)
@@ -1174,6 +1175,13 @@ static void CmdMeminfo(const char* args, Stdlib::Printer& con)
         con.Printf("unused: %lu MiB above the bootstrap map\n", unused / Const::MB);
     con.Printf("pages: %lu free of %lu\n",
         pt.GetFreePagesCount(), pt.GetTotalPagesCount());
+    /* The huge pool is neither: its pages left the free list at boot, for
+       guests' memory alone (hugepages=). */
+    if (pt.GetHugePoolBlocks() != 0)
+        con.Printf("huge pool: %lu 2MiB pages free of %lu (%lu MiB of %lu)\n",
+            pt.GetHugePoolFree(), pt.GetHugePoolBlocks(),
+            pt.GetHugePoolFree() * Mm::PageTable::HugeFrameSize / Const::MB,
+            pt.GetHugePoolBlocks() * Mm::PageTable::HugeFrameSize / Const::MB);
 }
 
 static void CmdIrqstat(const char* args, Stdlib::Printer& con)

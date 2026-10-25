@@ -295,7 +295,12 @@ machine.
 
 - `meminfo` — the firmware memory map, and how much of it the kernel
   actually uses (RAM reported vs. RAM reachable).
-- `memusage` — free and total page counts.
+- `memusage` — free and total page counts, and the huge pool's free and
+  total blocks.
+- `meminfo` and the huge pool: with `hugepages=`, a line for the pool --
+  2 MiB blocks reserved at boot right after the free list is built, kept for
+  guests' memory and out of every other allocation ([The
+  hypervisor](hypervisor.md#how-much-of-it-and-where)).
 - `heapbench` (a module, `insmod /heapbench.ko`; [Modules](modules.md)) —
   what an allocation and a free cost, size by size, on one CPU and on all.
 - `memcheck` — `CheckFreeList` walks every descriptor and reports any page

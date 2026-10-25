@@ -334,6 +334,20 @@ nos.iso: build/grub.cfg $(KERNEL)
 	$(MKRESCUE) -o nos.iso iso
 	rm -rf iso
 
+# nos.iso with TEST_ISO_ARGS added to its kernel's command line, for a gate
+# that needs a parameter nos.iso does not give -- `make nos-test.iso
+# TEST_ISO_ARGS=hugepages=6G`, then `hv-linux-test.py --nos-iso nos-test.iso`.
+# Phony: what it holds is the variable's, which make cannot see change.
+.PHONY: nos-test.iso
+nos-test.iso: build/grub.cfg $(KERNEL)
+	rm -rf iso-test
+	mkdir -p iso-test/boot/grub
+	cp $(KERNEL) iso-test/boot/kernel64.elf
+	sed 's|^\(\s*multiboot2 /boot/kernel64.elf\)|\1 $(TEST_ISO_ARGS)|' build/grub.cfg > iso-test/boot/grub/grub.cfg
+	grep -q 'multiboot2 /boot/kernel64.elf .*$(TEST_ISO_ARGS)' iso-test/boot/grub/grub.cfg
+	$(MKRESCUE) -o nos-test.iso iso-test
+	rm -rf iso-test
+
 $(OUT)/%.o: src/cpp/%.asm
 	@mkdir -p $(dir $@)
 	$(ASM) -felf64 $< -o $@

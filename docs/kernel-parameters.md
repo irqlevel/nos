@@ -30,6 +30,10 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `hwp=off` — x86-64: leave every CPU's clock where firmware left it, rather than turning on hardware P-states (HWP) and letting the CPU pick its own up to its turbo. Firmware's is usually the base clock: the EX44's cores ran at 2.5 GHz with it, their turbo being 4.8. See [Boot](boot.md)
 - `ucode=off` — x86-64: load no microcode from the module GRUB put beside the kernel (`module2 /boot/ucode ucode`, which [Install](install.md) sets up); every CPU runs the revision firmware loaded. See [Boot](boot.md)
 
+## Memory
+
+- `hugepages=N%` / `hugepages=NG` / `hugepages=NM` — reserve that share of RAM, or that much of it, at boot as the huge pool: 2 MiB blocks, physically contiguous and aligned, taken off the free list right after it is built -- before anything has fragmented it -- the highest first, and kept for guests' memory alone (e.g. `hugepages=50%`, `hugepages=32G`). With a pool, every guest's memory is the pool's, each block one entry of its nested page table -- 2 MiB of TLB where a frame gives 4 KiB -- and a guest the pool has not room for does not start, saying how many blocks it wanted and how many are free; without one, a guest's memory is 4 KiB frames, as it always was. What is asked is cut down to leave twice the kernel's reserve free (a sixteenth of RAM, and no less than 64 MiB, twice over), and the boot says what it took: `mm: hugepages: N 2MiB blocks reserved (M MiB) of K asked`. `meminfo`, `memusage` and `hv info` show the pool. A block is the pool's for as long as the machine is up, guest or no guest. See [The hypervisor](hypervisor.md#how-much-of-it-and-where)
+
 ## Console and logging
 
 - `console=serial` — shell input and output on the serial port only

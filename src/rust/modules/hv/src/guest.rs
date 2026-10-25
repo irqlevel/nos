@@ -353,6 +353,30 @@ impl hv::pvh::ReadAt for FileAt<'_> {
     }
 }
 
+/// Whether a guest's memory is the huge pool's: whenever the kernel has one
+/// (`hugepages=`), every byte of every guest -- or the guest does not start.
+pub fn from_pool() -> bool {
+    kcore::frame::huge_pool().blocks != 0
+}
+
+/// Whether the huge pool has a guest of `mem_bytes` in it: whole 2 MiB
+/// blocks, and that many of them free -- or what to tell the user.
+fn pool_has(mem_bytes: u64) -> Result<(), String> {
+    const MIB: u64 = 1024 * 1024;
+    let block = kcore::frame::HUGE_SIZE;
+    if mem_bytes % block != 0 {
+        return Err(alloc::format!("mem= must be a multiple of {} MiB: the guest's memory is the huge pool's (hugepages=)",
+                                  block / MIB));
+    }
+    let pool = kcore::frame::huge_pool();
+    let want = mem_bytes / block;
+    if pool.free < want {
+        return Err(alloc::format!("{} MiB wants {} 2 MiB pages of the huge pool, which has {} of {} free ({} MiB)",
+                                  mem_bytes / MIB, want, pool.free, pool.blocks, pool.free * block / MIB));
+    }
+    Ok(())
+}
+
 /// Read the kernel file's headers and plan where it goes in a guest of
 /// `spec.mem_bytes`, beside an initrd of `initrd_len` bytes.
 fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
@@ -406,8 +430,18 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     };
     let image = plan(spec, initrd_len)?;
 
-    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
-        .map_err(|e| alloc::format!("no guest: {}", e))?;
+    let huge = from_pool();
+    if huge {
+        pool_has(spec.mem_bytes)?;
+    }
+    let (mut guest, mut cpus) =
+        LinuxGuest::new(machine, spec.mem_bytes, huge, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+            .map_err(|e| match e {
+                /* Another guest took the blocks between the look and the
+                 * taking: said as the look would have said it. */
+                hv::Error::NoHugePages => pool_has(spec.mem_bytes).err().unwrap_or_else(|| alloc::format!("no guest: {}", e)),
+                e => alloc::format!("no guest: {}", e),
+            })?;
     if let Some(on) = spec.apicv {
         guest.set_apicv(on);
     }

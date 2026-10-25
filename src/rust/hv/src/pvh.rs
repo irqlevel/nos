@@ -337,19 +337,22 @@ pub struct Layout {
 
 /// Check the image fits a guest of `mem_bytes`, and place an initrd of
 /// `initrd_len` bytes: every segment in RAM above the tables below 1 MiB,
-/// the initrd as high as it goes, page-aligned and clear of the image.
+/// the initrd as high as it goes, page-aligned and clear of the image --
+/// all of it in the RAM below 4 GiB ([`linux::Ram`]), which is all a PVH
+/// entry's 32 bits with paging off reach.
 pub fn plan(image: &Image, mem_bytes: u64, initrd_len: u64) -> Result<Layout> {
+    let low = linux::Ram::of(mem_bytes).low;
     for s in image.segments() {
         /* Below 1 MiB are the start info, the command line, the MP table
          * and the ACPI tables this writes; past the end, nothing at all. */
-        if s.paddr < linux::ONE_MIB || s.end().is_none_or(|end| end > mem_bytes) {
+        if s.paddr < linux::ONE_MIB || s.end().is_none_or(|end| end > low) {
             return Err(Error::BadAddress);
         }
     }
     let (initrd_addr, initrd_len) = if initrd_len == 0 {
         (0, 0)
     } else {
-        let addr = mem_bytes.checked_sub(initrd_len).ok_or(Error::NoMemory)? & !0xFFF;
+        let addr = low.checked_sub(initrd_len).ok_or(Error::NoMemory)? & !0xFFF;
         if addr < round_up(image.end(), 0x1000).ok_or(Error::BadAddress)? {
             return Err(Error::NoMemory);
         }
@@ -394,7 +397,7 @@ pub fn build(
         memory.write(modlist, &m)?;
     }
 
-    let mut map = [linux::E820Entry::default(); linux::E820_LOW_ENTRIES];
+    let mut map = [linux::E820Entry::default(); linux::E820_ENTRIES];
     let n = linux::e820_entries(layout.mem_bytes, firmware, &mut map)?;
     for (i, e) in map[..n].iter().enumerate() {
         let mut entry = [0u8; MEMMAP_ENTRY_BYTES];
@@ -404,7 +407,7 @@ pub fn build(
         memory.write(memmap + (i * MEMMAP_ENTRY_BYTES) as u64, &entry)?;
     }
     const _: () = assert!(START_INFO as usize + START_INFO_BYTES + MODULE_BYTES
-        + linux::E820_LOW_ENTRIES * MEMMAP_ENTRY_BYTES <= CMDLINE as usize);
+        + linux::E820_ENTRIES * MEMMAP_ENTRY_BYTES <= CMDLINE as usize);
 
     let mut si = [0u8; START_INFO_BYTES];
     si[SI_MAGIC..SI_MAGIC + 4].copy_from_slice(&START_INFO_MAGIC.to_le_bytes());

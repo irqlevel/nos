@@ -151,8 +151,9 @@ impl Boot {
         };
         let host = Arc::new(BootHost { console, unloading: self.unloading.clone() });
 
-        let _ = writeln!(report, "hv: booting {} -- {} MiB, {} cpu{}, cmdline \"{}\"",
-                         self.spec.kernel, self.spec.mem_bytes / (1024 * 1024), self.spec.cpus,
+        let _ = writeln!(report, "hv: booting {} -- {} MiB{}, {} cpu{}, cmdline \"{}\"",
+                         self.spec.kernel, self.spec.mem_bytes / (1024 * 1024),
+                         if guest::from_pool() { " of the huge pool" } else { "" }, self.spec.cpus,
                          if self.spec.cpus == 1 { "" } else { "s" }, self.spec.cmdline);
 
         let secs = self.spec.secs.unwrap_or(DEFAULT_SECS);
