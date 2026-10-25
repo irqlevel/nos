@@ -295,6 +295,12 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    if (!Test::TestEevdf())
+    {
+        Panic("EEVDF test failed");
+        return;
+    }
+
     Trace(0, "After test");
     Ubsan::Announce();
 
