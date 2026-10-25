@@ -493,7 +493,7 @@ const MAX_BIG_SIZE: usize = 1024 * 1024 * 1024;
 
 /// A count of bytes with an optional K, M, G or T suffix, each 1024 times
 /// the one before.
-fn parse_bytes(text: &str) -> Option<usize> {
+pub(crate) fn parse_bytes(text: &str) -> Option<usize> {
     let (digits, shift) = match text.as_bytes().last() {
         Some(b'K') | Some(b'k') => (&text[..text.len() - 1], 10),
         Some(b'M') | Some(b'm') => (&text[..text.len() - 1], 20),
@@ -538,6 +538,7 @@ pub fn register_all() {
         ("umount", "umount <path> - unmount filesystem", umount),
         ("mounts", "mounts - list mount points", mounts),
         ("ls", "ls [path] - list directory (default /)", ls),
+        ("find", "find [path...] [expression] - files and directories under a path, by name, type, size", crate::find::find),
         ("cat", "cat <path> - show file content", cat),
         ("write", "write <path> <text> - write to file", write),
         ("mkdir", "mkdir <path> - create directory", mkdir),

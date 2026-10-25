@@ -216,6 +216,13 @@ and then lets `e2fsck -fn` judge the image. The boot-time `fstest=on` checks
 that the driver reads back what it wrote; this checks the other half, that
 what is left on the disk is still a filesystem a checker calls clean.
 
+`find` walks a tree made for it on the root, and each expression is held to
+the paths it should pick out -- by name, case or not, by a class and by
+path, by type, size and emptiness, by depth, with `!`, `-a`, `-o` and
+parentheses -- a directory printed before what is in it; into the procfs
+at `/proc`, and kept out of it by `-xdev`; and a path that is not there, a
+test it does not know and a `(` left open said.
+
 And files past 4 GiB. The image starts without `large_file`, which nos has
 to set itself; a file is grown by `truncate` to 5 GiB and a line appended at
 its end, another grown past 6 GiB and cut back to 1 MiB, and `fstest` runs
@@ -951,7 +958,17 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   call the filesystem refused for want of room is held to having changed
   nothing -- a write to having left the file its size, a first part of the
   new data in it at most -- and now and then the filesystem is filled to its
-  last block first, so that writes run out of room part way. Its images have
+  last block first, so that writes run out of room part way. Now and then
+  `find` runs over the tree as the shell runs it, with an expression of the
+  input's -- or words that are none, nested too deep, too long -- and what
+  it prints is held to a model of its own (`targets/find.rs`): a parser
+  that builds a tree where the kernel's emits postfix, patterns matched by
+  dynamic programming where the kernel's go back to the last `*`, a walk
+  of the model's tree; every path the model gives and no other, a
+  directory before what is in it, a name that is not text and a path too
+  long said where they are, and an expression the model refuses refused.
+  Control runs with `-size -N` taking N itself, and with a `*` gone back to
+  only once, failed at the 1189th input and the 13th. Its images have
   files past 4 GiB, sparse, under the triple indirect block, and filesystems
   with `large_file` and without it, which the driver must set for the first
   file of 2 GiB or more; the checker holds a large file without the flag,
@@ -991,7 +1008,7 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   control run with the node's key left out of a ramfs file's identity
   failed at the first input, and one with the mount left out at the 41st;
 - `shell`: the storage commands the console, the UDP shell and SSH run --
-  `mount`, `format`, `cp -r`, `fstest`, `diskwrite` and the rest -- with
+  `mount`, `format`, `cp -r`, `find`, `fstest`, `diskwrite` and the rest -- with
   arguments of every kind, after `fstest` has passed on ramfs, ext2 and
   nanofs as each came; every disk no command wrote to raw clean at the end;
 - `rootfs`: `root=` none, `auto`, a device, a label, a UUID, over disks and

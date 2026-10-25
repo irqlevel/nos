@@ -17,6 +17,7 @@ extern crate alloc;
 
 pub mod ext2;
 pub mod files;
+pub mod find;
 pub mod nanofs;
 pub mod paths;
 pub mod procfs;
