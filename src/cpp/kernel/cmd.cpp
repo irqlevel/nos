@@ -11,6 +11,7 @@
 #include "parameters.h"
 #include "console.h"
 #include "mutex.h"
+#include "event.h"
 #include "task.h"
 #include "stack_probe.h"
 #include "symtab.h"
@@ -404,6 +405,604 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
         "%lu since boot, %lu on an idle task\n",
         (ulong)(deferred1 - deferred0), (ulong)(deferredIdle1 - deferredIdle0),
         (ulong)deferred1, (ulong)deferredIdle1);
+}
+
+/* A wait as the SchedStats bucket it fell in, an upper bound: "<4us" */
+static void SchedBucketText(ulong bucket, char* buf, size_t size)
+{
+    if (bucket == ~0UL)
+    {
+        Stdlib::SnPrintf(buf, size, "-");
+        return;
+    }
+
+    static const ulong UsInMs = 1000;
+    static const ulong UsInSec = 1000 * UsInMs;
+
+    /* The last bucket has no upper bound: everything from its floor up */
+    bool last = (bucket + 1 >= SchedStats::Buckets);
+    ulong us = last ? SchedStats::BucketLimitUs(bucket - 1) : SchedStats::BucketLimitUs(bucket);
+    const char* rel = last ? ">=" : "<";
+
+    if (us < UsInMs)
+        Stdlib::SnPrintf(buf, size, "%s%luus", rel, us);
+    else if (us < UsInSec)
+        Stdlib::SnPrintf(buf, size, "%s%lu.%lums", rel, us / UsInMs, (us % UsInMs) / (UsInMs / 10));
+    else
+        Stdlib::SnPrintf(buf, size, "%s%lu.%lus", rel, us / UsInSec, (us % UsInSec) / (UsInSec / 10));
+}
+
+/* Nanoseconds, short: "410ns", "6.2us", "1.3ms", "2.1s" */
+static void SchedNsText(ulong ns, char* buf, size_t size)
+{
+    if (ns < Const::NanoSecsInUsec)
+        Stdlib::SnPrintf(buf, size, "%luns", ns);
+    else if (ns < Const::NanoSecsInMs)
+        Stdlib::SnPrintf(buf, size, "%lu.%luus", ns / Const::NanoSecsInUsec,
+            (ns % Const::NanoSecsInUsec) / 100);
+    else if (ns < Const::NanoSecsInSec)
+        Stdlib::SnPrintf(buf, size, "%lu.%lums", ns / Const::NanoSecsInMs,
+            (ns % Const::NanoSecsInMs) / (100 * Const::NanoSecsInUsec));
+    else
+        Stdlib::SnPrintf(buf, size, "%lu.%lus", ns / Const::NanoSecsInSec,
+            (ns % Const::NanoSecsInSec) / (100 * Const::NanoSecsInMs));
+}
+
+/* The bucket that the given per mille of a histogram's entries are at or
+   under; ~0UL for an empty one */
+static ulong SchedPercentile(const ulong* hist, ulong permille)
+{
+    ulong count = 0;
+    for (ulong i = 0; i < SchedStats::Buckets; i++)
+        count += hist[i];
+    if (count == 0)
+        return ~0UL;
+
+    ulong want = (count * permille + 999) / 1000;
+    ulong seen = 0;
+    for (ulong i = 0; i < SchedStats::Buckets; i++)
+    {
+        seen += hist[i];
+        if (seen >= want)
+            return i;
+    }
+    return SchedStats::Buckets - 1;
+}
+
+/* One line of `sched`: what a window's difference of two snapshots says,
+   and the since-boot maxima of the later one */
+static void SchedLine(const char* who, ulong tasks, const SchedStats::Snapshot& d,
+    const SchedStats::Snapshot& now, Stdlib::Printer& con)
+{
+    ulong wakes = 0, delays = 0;
+    for (ulong i = 0; i < SchedStats::Buckets; i++)
+    {
+        wakes += d.Wake[i];
+        delays += d.Delay[i];
+    }
+
+    char w50[16], w99[16], w999[16], wmax[16], d50[16], d99[16], cavg[16], cmax[16];
+    SchedBucketText(SchedPercentile(d.Wake, 500), w50, sizeof(w50));
+    SchedBucketText(SchedPercentile(d.Wake, 990), w99, sizeof(w99));
+    SchedBucketText(SchedPercentile(d.Wake, 999), w999, sizeof(w999));
+    SchedNsText(now.WakeMaxNs, wmax, sizeof(wmax));
+    SchedBucketText(SchedPercentile(d.Delay, 500), d50, sizeof(d50));
+    SchedBucketText(SchedPercentile(d.Delay, 990), d99, sizeof(d99));
+
+    ulong decisions = d.Decisions;
+    SchedNsText((decisions != 0) ? CycleCounterDeltaToNs(d.DecisionCycles) / decisions : 0,
+        cavg, sizeof(cavg));
+    SchedNsText(CycleCounterDeltaToNs(now.DecisionMaxCycles), cmax, sizeof(cmax));
+
+    /* Tenths, so averages keep a decimal without floats */
+    ulong touch10 = (decisions != 0) ? (d.Touched * 10) / decisions : 0;
+    ulong run10 = (d.Looks != 0) ? (d.Runnable * 10) / d.Looks : 0;
+    ulong crowded = (d.Looks != 0) ? (d.Crowded * 100) / d.Looks : 0;
+
+    con.Printf("%-4s %5lu %7lu %7s %7s %7s %7s %6lu %7s %7s %7lu %7s %7s %3lu.%lu %4lu %3lu.%lu %3lu %3lu%%\n",
+        who, tasks, wakes, w50, w99, w999, wmax, delays, d50, d99,
+        decisions, cavg, cmax, touch10 / 10, touch10 % 10, now.TouchedMax,
+        run10 / 10, run10 % 10, now.RunnableMax, crowded);
+}
+
+static void SchedSum(SchedStats::Snapshot& into, const SchedStats::Snapshot& s)
+{
+    for (ulong i = 0; i < SchedStats::Buckets; i++)
+    {
+        into.Wake[i] += s.Wake[i];
+        into.Delay[i] += s.Delay[i];
+    }
+    into.WakeMaxNs = Stdlib::Max(into.WakeMaxNs, s.WakeMaxNs);
+    into.Decisions += s.Decisions;
+    into.DecisionCycles += s.DecisionCycles;
+    into.DecisionMaxCycles = Stdlib::Max(into.DecisionMaxCycles, s.DecisionMaxCycles);
+    into.Touched += s.Touched;
+    into.TouchedMax = Stdlib::Max(into.TouchedMax, s.TouchedMax);
+    into.Looks += s.Looks;
+    into.Runnable += s.Runnable;
+    into.RunnableMax = Stdlib::Max(into.RunnableMax, s.RunnableMax);
+    into.Crowded += s.Crowded;
+}
+
+/* d = b - a, the counters' part; the maxima are b's, since boot */
+static void SchedDiff(SchedStats::Snapshot& d, const SchedStats::Snapshot& a,
+    const SchedStats::Snapshot& b)
+{
+    for (ulong i = 0; i < SchedStats::Buckets; i++)
+    {
+        d.Wake[i] = b.Wake[i] - a.Wake[i];
+        d.Delay[i] = b.Delay[i] - a.Delay[i];
+    }
+    d.WakeMaxNs = b.WakeMaxNs;
+    d.Decisions = b.Decisions - a.Decisions;
+    d.DecisionCycles = b.DecisionCycles - a.DecisionCycles;
+    d.DecisionMaxCycles = b.DecisionMaxCycles;
+    d.Touched = b.Touched - a.Touched;
+    d.TouchedMax = b.TouchedMax;
+    d.Looks = b.Looks - a.Looks;
+    d.Runnable = b.Runnable - a.Runnable;
+    d.RunnableMax = b.RunnableMax;
+    d.Crowded = b.Crowded - a.Crowded;
+}
+
+/* `sched probe`: how long a woken task waits for a CPU that others keep
+   busy -- the case a scheduler is chosen by. Spinners pinned to one CPU that
+   never yield, so only the tick takes it from them; a waiter pinned beside
+   them, asleep on an Event; and this command's task, on another CPU,
+   signalling it a sample at a time and waiting to hear that it ran. Each
+   wait is from the Signal() to the waiter running: the waker's IPI, and
+   whatever the scheduler makes it wait behind. */
+struct SchedProbe
+{
+    Event Ev;
+    Atomic Stop;
+    /* When the signal being answered was sent */
+    Atomic SentAt;
+    Atomic Answered;
+    /* The waiter's own, read once it has exited: its exit and the join
+       order them */
+    ulong Hist[SchedStats::Buckets];
+    ulong MaxNs;
+    ulong Count;
+    /* The lags the waiter was placed with as it woke, virtual ns */
+    s64 LagMin;
+    s64 LagMax;
+    s64 LagSum;
+
+    static const ulong Tag = 'SPrb';
+};
+
+static const ulong SchedProbeMaxSpinners = 16;
+static const ulong SchedProbeMaxMs = 60000;
+/* How long the waiter waits before it looks at Stop again */
+static const ulong SchedProbeWaitNs = 100 * Const::NanoSecsInMs;
+/* A signal not answered in this long is counted as such, and the probe
+   moves on */
+static const ulong SchedProbeAnswerNs = Const::NanoSecsInSec;
+/* Between one answer and the next signal: the waiter is asleep again by
+   then */
+static const ulong SchedProbeGapNs = 2 * Const::NanoSecsInMs;
+
+static void SchedProbeSpin(void* ctx)
+{
+    auto* p = static_cast<SchedProbe*>(ctx);
+    while (p->Stop.Get() == 0)
+        Pause();
+}
+
+static void SchedProbeWaiter(void* ctx)
+{
+    auto* p = static_cast<SchedProbe*>(ctx);
+    while (p->Stop.Get() == 0)
+    {
+        if (!p->Ev.WaitFor(SchedProbeWaitNs))
+            continue;
+
+        ulong now = GetBootTime().GetValue();
+        ulong sent = (ulong)p->SentAt.Get();
+        if (sent != 0 && now >= sent)
+        {
+            ulong ns = now - sent;
+            p->Hist[SchedStats::Bucket(ns)]++;
+            p->MaxNs = Stdlib::Max(p->MaxNs, ns);
+            p->Count++;
+
+            /* The lag it was placed with as it woke */
+            s64 lag = Task::GetCurrentTask()->Sched.PlacedLag;
+            p->LagMin = Stdlib::Min(p->LagMin, lag);
+            p->LagMax = Stdlib::Max(p->LagMax, lag);
+            p->LagSum += lag;
+        }
+        p->SentAt.Set(0);
+        p->Answered.Set(1);
+    }
+}
+
+/* Runtime of task so far, under its lock as every UpdateRuntime() is made */
+static ulong SchedProbeRuntime(Task* task)
+{
+    Stdlib::AutoLock lock(task->Lock);
+    return task->Runtime.GetValue();
+}
+
+static void CmdSchedProbe(const char* args, Stdlib::Printer& con)
+{
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+    ulong self = cpus.GetCurrentCpuId();
+
+    ulong spinners = 2;
+    ulong ms = 2000;
+    /* The highest CPU that is not this one, unless told: this task signals
+       from here */
+    ulong cpu = ~0UL;
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if ((mask & (1UL << i)) && i != self)
+            cpu = i;
+    }
+
+    const char* end;
+    for (const char* tok = Stdlib::NextToken(args, end); tok; tok = Stdlib::NextToken(end, end))
+    {
+        /* Zeroed: the prefixes are compared over their whole length, past
+           the end of a token shorter than one */
+        char buf[32] = {};
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        ulong value;
+        bool ok = false;
+        if (Stdlib::MemCmp(buf, "spinners=", 9) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 9, value) && value <= SchedProbeMaxSpinners;
+            if (ok)
+                spinners = value;
+        }
+        else if (Stdlib::MemCmp(buf, "ms=", 3) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 3, value) && value != 0 && value <= SchedProbeMaxMs;
+            if (ok)
+                ms = value;
+        }
+        else if (Stdlib::MemCmp(buf, "cpu=", 4) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 4, value) && value < MaxCpus && (mask & (1UL << value));
+            if (ok)
+                cpu = value;
+        }
+
+        if (!ok)
+        {
+            con.Printf("usage: sched probe [spinners=0-%lu] [ms=1-%lu] [cpu=N]\n",
+                SchedProbeMaxSpinners, SchedProbeMaxMs);
+            return;
+        }
+    }
+
+    if (cpu == ~0UL)
+    {
+        con.Printf("sched probe: needs a second cpu\n");
+        return;
+    }
+
+    auto* p = Mm::TAlloc<SchedProbe, SchedProbe::Tag>();
+    if (p == nullptr)
+    {
+        con.Printf("sched probe: out of memory\n");
+        return;
+    }
+    Stdlib::MemSet(p->Hist, 0, sizeof(p->Hist));
+    p->MaxNs = 0;
+    p->LagMin = (s64)(~0UL >> 1);
+    p->LagMax = -(s64)(~0UL >> 1);
+    p->LagSum = 0;
+    p->Count = 0;
+
+    /* The waiter first, the spinners after it */
+    Task* tasks[SchedProbeMaxSpinners + 1] = {};
+    ulong started = 0;
+    bool ok = true;
+    for (ulong i = 0; ok && i <= spinners; i++)
+    {
+        char name[TaskNameLen];
+        if (i == 0)
+            Stdlib::SnPrintf(name, sizeof(name), "probe/wait");
+        else
+            Stdlib::SnPrintf(name, sizeof(name), "probe/spin%lu", i - 1);
+
+        Task* task = Mm::TAlloc<Task, SchedProbe::Tag>(name);
+        if (task == nullptr)
+        {
+            ok = false;
+            break;
+        }
+        task->SetCpuAffinity(1UL << cpu);
+        if (!task->Start((i == 0) ? SchedProbeWaiter : SchedProbeSpin, p))
+        {
+            task->Put();
+            ok = false;
+            break;
+        }
+        tasks[started++] = task;
+    }
+
+    ulong runAt[SchedProbeMaxSpinners + 1] = {};
+    ulong sent = 0, unanswered = 0;
+    ulong t0 = GetBootTime().GetValue();
+    for (ulong i = 0; i < started; i++)
+        runAt[i] = SchedProbeRuntime(tasks[i]);
+
+    ulong until = t0 + ms * Const::NanoSecsInMs;
+    while (ok && GetBootTime().GetValue() < until)
+    {
+        p->Answered.Set(0);
+        p->SentAt.Set((long)GetBootTime().GetValue());
+        p->Ev.Signal();
+        sent++;
+
+        ulong giveUp = GetBootTime().GetValue() + SchedProbeAnswerNs;
+        while (p->Answered.Get() == 0 && GetBootTime().GetValue() < giveUp)
+            Sleep(Const::NanoSecsInMs);
+        if (p->Answered.Get() == 0)
+            unanswered++;
+
+        Sleep(SchedProbeGapNs);
+    }
+    ulong elapsed = GetBootTime().GetValue() - t0;
+
+    ulong ran[SchedProbeMaxSpinners + 1] = {};
+    for (ulong i = 0; i < started; i++)
+        ran[i] = SchedProbeRuntime(tasks[i]) - runAt[i];
+
+    p->Stop.Set(1);
+    p->Ev.Signal();
+    for (ulong i = 0; i < started; i++)
+    {
+        tasks[i]->Wait();
+        tasks[i]->Put();
+    }
+
+    if (!ok)
+    {
+        con.Printf("sched probe: could not start its tasks\n");
+    }
+    else
+    {
+        char w50[16], w90[16], w99[16], wmax[16];
+        SchedBucketText(SchedPercentile(p->Hist, 500), w50, sizeof(w50));
+        SchedBucketText(SchedPercentile(p->Hist, 900), w90, sizeof(w90));
+        SchedBucketText(SchedPercentile(p->Hist, 990), w99, sizeof(w99));
+        SchedNsText(p->MaxNs, wmax, sizeof(wmax));
+
+        con.Printf("sched probe: cpu %lu, %lu spinners, %lu ms: %lu signals, %lu answered, %lu not in %lu ms\n",
+            cpu, spinners, ms, sent, p->Count, unanswered, SchedProbeAnswerNs / Const::NanoSecsInMs);
+        con.Printf("  waited p50 %s p90 %s p99 %s max %s\n", w50, w90, w99, wmax);
+        if (p->Count != 0)
+            con.Printf("  woken with lag (virtual us): min %ld avg %ld max %ld\n",
+                (long)(p->LagMin / (s64)Const::NanoSecsInUsec),
+                (long)(p->LagSum / (s64)p->Count / (s64)Const::NanoSecsInUsec),
+                (long)(p->LagMax / (s64)Const::NanoSecsInUsec));
+        con.Printf("  ran, per mille of the window:");
+        for (ulong i = 0; i < started && elapsed != 0; i++)
+            con.Printf(" %s %lu", tasks[i]->GetName(), (ran[i] * 1000) / elapsed);
+        con.Printf("\n");
+    }
+
+    p->~SchedProbe();
+    Mm::Free(p);
+}
+
+/* `sched queue [cpu]`: what EEVDF has of each task on a CPU's queue that
+   can run, the one on the CPU first -- its nice and slice, its lag (V less
+   its virtual runtime: what it is owed), how far past V its deadline is,
+   and whether it is eligible. Copied under the queue's lock, printed after. */
+static const ulong SchedQueueMax = 64;
+
+static void CmdSchedQueue(const char* args, Stdlib::Printer& con)
+{
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+    ulong cpu = cpus.GetCurrentCpuId();
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+    if (tok)
+    {
+        char buf[16];
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+        if (!Stdlib::ParseUlong(buf, cpu) || cpu >= MaxCpus || !(mask & (1UL << cpu)))
+        {
+            con.Printf("usage: sched queue [cpu]\n");
+            return;
+        }
+    }
+
+    auto* views = (TaskQueue::EntityView*)Mm::Alloc(SchedQueueMax * sizeof(TaskQueue::EntityView), SchedProbe::Tag);
+    if (views == nullptr)
+    {
+        con.Printf("sched: out of memory\n");
+        return;
+    }
+
+    ulong n = cpus.GetCpu(cpu).GetTaskQueue().View(views, SchedQueueMax);
+    con.Printf("cpu %lu: %lu that can run, lag and deadline in virtual us from V\n", cpu, n);
+    con.Printf("  %-6s %-5s %6s %9s %10s %10s %s\n", "pid", "nice", "slice", "lag", "deadline", "eligible", "name");
+    for (ulong i = 0; i < n; i++)
+    {
+        auto& e = views[i];
+        con.Printf("%s %-6lu %-5ld %6lu %9ld %10ld %10s %s\n", e.OnCpu ? "*" : " ", e.Pid, e.Nice,
+            e.SliceNs / Const::NanoSecsInUsec, (long)(e.Lag / (s64)Const::NanoSecsInUsec),
+            (long)(e.Deadline / (s64)Const::NanoSecsInUsec), e.Eligible ? "yes" : "no", e.Name);
+    }
+
+    Mm::Free(views);
+}
+
+/* `sched nice <pid> <nice>` and `sched slice <pid> <us>`: a task's share of
+   its CPU, and how soon after it can it runs and for how long at a time */
+static void CmdSchedSet(const char* args, Stdlib::Printer& con, bool nice)
+{
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+    char buf[24] = {};
+    ulong pid = 0;
+    if (tok)
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+    bool ok = tok && Stdlib::ParseUlong(buf, pid);
+
+    tok = ok ? Stdlib::NextToken(end, end) : nullptr;
+    long value = 0;
+    if (tok)
+    {
+        char vbuf[24] = {};
+        Stdlib::TokenCopy(tok, end, vbuf, sizeof(vbuf));
+        bool negative = (vbuf[0] == '-');
+        ulong magnitude = 0;
+        ok = Stdlib::ParseUlong(negative ? vbuf + 1 : vbuf, magnitude) && magnitude < (1UL << 32);
+        value = negative ? -(long)magnitude : (long)magnitude;
+    }
+    else
+    {
+        ok = false;
+    }
+
+    const long sliceMinUs = (long)(SchedEntity::MinSliceNs / Const::NanoSecsInUsec);
+    const long sliceMaxUs = (long)(SchedEntity::MaxSliceNs / Const::NanoSecsInUsec);
+    if (!ok || (nice && (value < SchedEntity::NiceMin || value > SchedEntity::NiceMax)) ||
+        (!nice && (value < sliceMinUs || value > sliceMaxUs)))
+    {
+        con.Printf("usage: sched nice <pid> <%ld..%ld> | sched slice <pid> <%ld..%ld us>\n",
+            SchedEntity::NiceMin, SchedEntity::NiceMax, sliceMinUs, sliceMaxUs);
+        return;
+    }
+
+    ObjectPtr<Task> task(TaskTable::GetInstance().Lookup(pid));
+    if (!task)
+    {
+        con.Printf("task %lu not found\n", pid);
+        return;
+    }
+
+    if (nice)
+    {
+        SetTaskNice(task.Get(), value);
+        con.Printf("%s (pid %lu): nice %ld\n", task->GetName(), pid, value);
+    }
+    else
+    {
+        SetTaskSlice(task.Get(), (ulong)value * Const::NanoSecsInUsec);
+        con.Printf("%s (pid %lu): slice %ld us\n", task->GetName(), pid, value);
+    }
+}
+
+/* What each CPU's scheduler did over a window (SchedStats): how long a woken
+   task waited for the CPU -- at the median, the 99th and the 99.9th
+   percentile, the buckets' bounds, and the longest since boot, exactly --
+   how long one displaced while it could still run waited to run again, what
+   a decision cost (the average, and the most since boot), how many tasks it
+   touched, and how many tasks could run at the CPU's timer: on average, the
+   most since boot, and how often two or more. */
+static void CmdSched(const char* args, Stdlib::Printer& con)
+{
+    static const ulong DefaultIntervalMs = 1000;
+    static const ulong MaxIntervalMs = 10000;
+    static const ulong Tag = 'Schd';
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+
+    ulong intervalMs = DefaultIntervalMs;
+    if (tok)
+    {
+        char buf[16];
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        if (Stdlib::StrCmp(buf, "probe") == 0)
+        {
+            CmdSchedProbe(end, con);
+            return;
+        }
+        if (Stdlib::StrCmp(buf, "queue") == 0)
+        {
+            CmdSchedQueue(end, con);
+            return;
+        }
+        if (Stdlib::StrCmp(buf, "nice") == 0 || Stdlib::StrCmp(buf, "slice") == 0)
+        {
+            CmdSchedSet(end, con, buf[0] == 'n');
+            return;
+        }
+
+        ulong ms;
+        if (!Stdlib::ParseUlong(buf, ms) || ms == 0 || ms > MaxIntervalMs)
+        {
+            con.Printf("usage: sched [interval-ms, 1-%lu] | sched probe [spinners=N] [ms=M] [cpu=N] | "
+                "sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us>\n",
+                MaxIntervalMs);
+            return;
+        }
+        intervalMs = ms;
+    }
+
+    /* Three of them a CPU: before, after, and the difference */
+    ulong bytes = 3 * MaxCpus * sizeof(SchedStats::Snapshot);
+    auto* snaps = (SchedStats::Snapshot*)Mm::Alloc(bytes, Tag);
+    if (!snaps)
+    {
+        con.Printf("sched: out of memory\n");
+        return;
+    }
+    SchedStats::Snapshot* before = &snaps[0];
+    SchedStats::Snapshot* after = &snaps[MaxCpus];
+    SchedStats::Snapshot* diff = &snaps[2 * MaxCpus];
+
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (mask & (1UL << i))
+            cpus.GetCpu(i).GetTaskQueue().ReadStats(before[i]);
+    }
+
+    Sleep(intervalMs * Const::NanoSecsInMs);
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (mask & (1UL << i))
+            cpus.GetCpu(i).GetTaskQueue().ReadStats(after[i]);
+    }
+
+    con.Printf("sched: %lu ms window; waits are bucket bounds, max since boot\n", intervalMs);
+    con.Printf("%-4s %5s %7s %7s %7s %7s %7s %6s %7s %7s %7s %7s %7s %5s %4s %5s %3s %4s\n",
+        "cpu", "tasks", "wakeups", "p50", "p99", "p99.9", "max", "delays", "p50", "p99",
+        "decide", "avg", "max", "touch", "max", "run", "max", "2+");
+
+    SchedStats::Snapshot total;
+    Stdlib::MemSet(&total, 0, sizeof(total));
+    SchedStats::Snapshot totalNow;
+    Stdlib::MemSet(&totalNow, 0, sizeof(totalNow));
+    ulong totalTasks = 0;
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (!(mask & (1UL << i)))
+            continue;
+
+        SchedDiff(diff[i], before[i], after[i]);
+        ulong tasks = (ulong)cpus.GetCpu(i).GetTaskQueue().GetTaskCount();
+        char who[8];
+        Stdlib::SnPrintf(who, sizeof(who), "%lu", i);
+        SchedLine(who, tasks, diff[i], after[i], con);
+
+        SchedSum(total, diff[i]);
+        SchedSum(totalNow, after[i]);
+        totalTasks += tasks;
+    }
+
+    SchedLine("all", totalTasks, total, totalNow, con);
+
+    Mm::Free(snaps);
 }
 
 /* Sampled on the per-CPU tick, so the resolution is the tick rate: enough
@@ -1389,6 +1988,7 @@ static const CmdEntry Commands[] = {
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
+    { "sched",     CmdSched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },

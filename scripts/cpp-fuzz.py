@@ -23,8 +23,9 @@ memory map and the free-page scan's questions of it), grubenv (the GRUB
 environment block), module (the module loader), pagetable (the page tables
 and the physical page allocator), heap (the kernel heap), cmdline (the
 command line), multiboot (Multiboot2's tags), acpi (the ACPI tables, over
-an emulated TmpMap window) and format (the kernel's printf, against the
-host's). docs/testing.md says what each checks.
+an emulated TmpMap window), format (the kernel's printf, against the
+host's) and eevdf (the scheduler's rules, against a model of EEVDF's).
+docs/testing.md says what each checks.
 
 By default every target runs its own number of inputs from a fixed seed, the
 same every time: the gate, a minute and a half. A campaign is `--seconds` a
