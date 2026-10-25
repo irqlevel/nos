@@ -342,7 +342,14 @@ a server would -- under Linux, as root, on a block device, the partitions as
 loop devices: under `sudo` on Linux and in CI, in the nos-builder image with
 `--privileged` on a Mac -- with `--ssh-key` and `--boot-once`, then builds
 the host's `grub.cfg` the way `grub-mkconfig` would, the machine's entry
-first and what `/etc/grub.d/42_nos` prints after it.
+first and what `/etc/grub.d/42_nos` prints after it. Every file of the
+image must be on the partition then as it is in the image, `nos-install`
+aside -- compared file by file against the image, not against
+`nos-install`'s own list of what goes where, which is what left
+`/lib/hvboot` out of v0.0.26's installs -- and before that, a copy of the
+image with a file added must be refused by the file's name with the
+partition left blank: an image holding something `nos-install` does not
+know where to put is not poured without it.
 
 The first boot must be nos, once -- the entry from the image's `nos.cfg`,
 the root mounted by UUID read-write -- with sshd started by the image's
@@ -356,7 +363,8 @@ the kernel has to find it and say why it loads nothing under QEMU, whose
 CPU is a hypervisor's. The second boot must be the host's own entry: GRUB
 cleared the flag. Then `nos-install update`, finding the partition through the GRUB
 entry, over what nos wrote: e2fsck finds the partition clean, the host key
-nos made stays, the old kernel and modules go to `.prev`, the UDP shell it
+nos made stays, every file of the image is there again, the old kernel,
+modules, hvboot and `/VERSION` go to `.prev`, the UDP shell it
 is asked for goes into the kernel parameters and a boot is armed; the third
 boot must answer with the same host key and, now, on the UDP shell. Last,
 `status`, `rollback` and `uninstall`, and e2fsck once more. Needs
