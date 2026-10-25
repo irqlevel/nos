@@ -168,7 +168,7 @@ fn said(e: Error<kcore::error::Error>, from: &str, to: &str) -> String {
 }
 
 /// Why a file that is not qcow2 is not converted, and what to do with it.
-fn refused(from: &str, format: Format) -> String {
+pub(crate) fn refused(from: &str, format: Format) -> String {
     match format {
         Format::Raw => alloc::format!("{} is {} already -- a guest is given it as it is: disk={}", from,
                                       format.name(), from),

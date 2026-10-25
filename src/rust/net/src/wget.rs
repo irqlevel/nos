@@ -50,6 +50,8 @@ const MAX_LOCATION: usize = 256;
 struct FileSink<'a> {
     file: &'a Open<'static>,
     out: &'a mut Output,
+    /// What its lines begin with: the command's name.
+    who: &'static str,
     buf: alloc::boxed::Box<[u8]>,
     used: usize,
     written: usize,
@@ -106,7 +108,7 @@ impl FileSink<'_> {
         self.used = 0;
 
         if !self.file.write(&self.buf[..len]) {
-            let _ = writeln!(self.out, "wget: write failed after {} bytes", self.written);
+            let _ = writeln!(self.out, "{}: write failed after {} bytes", self.who, self.written);
             return false;
         }
 
@@ -118,7 +120,7 @@ impl FileSink<'_> {
     /// how fast since the start.
     fn progress(&mut self, now: u64) {
         let total = self.written + self.used;
-        let _ = write!(self.out, "wget: {} MiB", total as u64 / MIB);
+        let _ = write!(self.out, "{}: {} MiB", self.who, total as u64 / MIB);
         if self.length != 0 {
             let percent = (total as u128 * 100 / self.length as u128).min(100);
             let _ = write!(self.out, " of {} MiB, {}%", self.length as u64 / MIB, percent);
@@ -271,6 +273,38 @@ pub fn wget(args: &str, out: &mut Output) {
     }
 }
 
+/// What a body streamed into a file came to.
+struct Download {
+    resp: Response,
+    /// A redirect's target that was not followed.
+    location: [u8; MAX_LOCATION],
+    /// What reached the file, and whether the last of it did.
+    written: usize,
+    flushed: bool,
+    /// How long it all took.
+    ns: u64,
+}
+
+/// `url`'s answer streamed into `file`, progress told as `who`'s -- or None
+/// out of memory.
+fn download(nic: &crate::nic::Nic, url: &str, file: &Open<'static>, who: &'static str, out: &mut Output)
+            -> Option<Download> {
+    let mut buf = alloc::vec::Vec::new();
+    buf.try_reserve_exact(WRITE_BUF).ok()?;
+    buf.resize(WRITE_BUF, 0);
+
+    let mut location = [0u8; MAX_LOCATION];
+    let started = kcore::time::boot_time_ns();
+    let mut sink = FileSink {
+        file, out, who, buf: buf.into_boxed_slice(),
+        used: 0, written: 0, length: 0, started, reported: started,
+    };
+    let resp = http::get_with_location(nic, url.as_bytes(), &mut sink, &mut location);
+    let flushed = sink.flush();
+    Some(Download { resp, location, written: sink.written, flushed,
+                    ns: kcore::time::boot_time_ns().saturating_sub(started) })
+}
+
 /// Downloads to a file, streaming. Says why on the way out when it fails.
 fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
     /* A file to write from the beginning, made if it is missing and emptied
@@ -285,24 +319,11 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
         None => { let _ = writeln!(out, "wget: cannot open {} for writing", path); return; }
     };
 
-    let mut buf = alloc::vec::Vec::new();
-    if buf.try_reserve_exact(WRITE_BUF).is_err() {
+    let Some(got) = download(nic, url, &file, "wget", out) else {
         let _ = writeln!(out, "wget: out of memory");
         return;
-    }
-    buf.resize(WRITE_BUF, 0);
-
-    let mut location = [0u8; MAX_LOCATION];
-    let started = kcore::time::boot_time_ns();
-    let (resp, written, flushed) = {
-        let mut sink = FileSink {
-            file: &file, out, buf: buf.into_boxed_slice(),
-            used: 0, written: 0, length: 0, started, reported: started,
-        };
-        let resp = http::get_with_location(nic, url.as_bytes(), &mut sink, &mut location);
-        let flushed = sink.flush();
-        (resp, sink.written, flushed)
     };
+    let Download { resp, location, written, flushed, ns } = got;
 
     /* The handle goes before the file may be taken away: an open one keeps
      * the filesystem from removing it. */
@@ -330,7 +351,99 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
         return;
     }
 
-    let ns = kcore::time::boot_time_ns().saturating_sub(started);
     let _ = writeln!(out, "saved {} bytes to {} in {}.{} s, {}", written, path,
         ns / NS_PER_SEC, ns % NS_PER_SEC / (NS_PER_SEC / 10), Rate::of(written, ns));
+}
+
+/* ---- a download a module asks for ---- */
+
+/// Why `fetch` left no file: the request's failure (`http::Failure`), an
+/// answer that is not a body, or the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fetch {
+    /// The URL is none this client fetches, or too long.
+    Url,
+    Resolve,
+    Connect,
+    Tls,
+    /// The request did not go, or no whole answer came back.
+    Answer,
+    Redirects,
+    NoMemory,
+    /// No network device to fetch through.
+    NoDevice,
+    /// An answer other than 2xx -- a 404's page is no body of the URL's --
+    /// or a redirect that leads to no http: the status.
+    Status(u16),
+    /// There is a file at the path already, which is not written over.
+    Exists,
+    /// The file could not be made.
+    Create,
+    /// A write failed: a full filesystem, most likely.
+    Write,
+    /// The body was cut short: an idle timeout, or a peer that closed early.
+    Cut,
+}
+
+impl From<http::Failure> for Fetch {
+    fn from(f: http::Failure) -> Fetch {
+        match f {
+            http::Failure::Url | http::Failure::None => Fetch::Url,
+            http::Failure::Resolve => Fetch::Resolve,
+            http::Failure::Connect => Fetch::Connect,
+            http::Failure::Tls => Fetch::Tls,
+            http::Failure::Answer => Fetch::Answer,
+            http::Failure::Redirects => Fetch::Redirects,
+            http::Failure::NoMemory => Fetch::NoMemory,
+        }
+    }
+}
+
+/// `url`'s body, by HTTP or HTTPS, in a new file at `path` -- made here, never
+/// one that is there -- its progress told on `out` as wget's is, but as
+/// `who`'s: the body's length, or why not, and then no file. Only a 2xx
+/// answer is a body: what a server says with a 404 is no image.
+pub fn fetch(url: &str, path: &str, who: &'static str, out: &mut Output) -> Result<u64, Fetch> {
+    if url.is_empty() || url.len() >= MAX_URL_LEN {
+        return Err(Fetch::Url);
+    }
+    let dev = DEVICES.find(b"eth0").ok_or(Fetch::NoDevice)?;
+    let nic = dev.as_nic();
+    let vfs = fs::vfs_instance().ok_or(Fetch::Create)?;
+    if path.is_empty() || path.len() >= MAX_PATH {
+        return Err(Fetch::Create);
+    }
+    if vfs.stat(path.as_bytes()).is_some() {
+        return Err(Fetch::Exists);
+    }
+    /* Made, then opened: `create` refuses a path that is there, so what is
+     * written is this download's own file, and its to remove. */
+    if !vfs.create(path.as_bytes(), false) {
+        return Err(Fetch::Create);
+    }
+    let Some(file) = Open::new(vfs, path.as_bytes(), OPEN_WRITE) else {
+        vfs.remove(path.as_bytes());
+        return Err(Fetch::Create);
+    };
+
+    let got = download(&nic, url, &file, who, out);
+    /* Closed before it may be removed. */
+    drop(file);
+    let result = match got {
+        None => Err(Fetch::NoMemory),
+        Some(d) if d.resp.ok == 0 => Err(Fetch::from(d.resp.failure)),
+        Some(d) if d.resp.url_too_long != 0 => Err(Fetch::Url),
+        Some(d) if !(200..300).contains(&d.resp.status) => Err(Fetch::Status(d.resp.status.clamp(0, 999) as u16)),
+        Some(d) if !d.flushed => Err(Fetch::Write),
+        Some(d) if d.resp.truncated != 0 => Err(Fetch::Cut),
+        Some(d) => {
+            let _ = writeln!(out, "{}: {} bytes in {}.{} s, {}", who, d.written, d.ns / NS_PER_SEC,
+                             d.ns % NS_PER_SEC / (NS_PER_SEC / 10), Rate::of(d.written, d.ns));
+            Ok(d.written as u64)
+        }
+    };
+    if result.is_err() {
+        vfs.remove(path.as_bytes());
+    }
+    result
 }

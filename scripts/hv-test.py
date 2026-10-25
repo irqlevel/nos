@@ -117,6 +117,37 @@ CONVERT = [
 # sector written.
 CONVERT_SIZE = 6 * 1024 * 1024 + 3 * 512
 
+
+def create_script(port):
+    """What `hv create <name> <url>` is asked, from the test's web server --
+    which QEMU's user network puts at 10.0.2.2 for nos -- and what each must
+    answer (create_checks): a qcow2 image downloaded, made a disk and grown
+    to size=, given the seed and a vm.toml; the same name again refused; a
+    raw image taken as it is; a URL with nothing at it, a file that is no
+    image and a size= under the image's refused, each leaving nothing."""
+    url = "http://10.0.2.2:%d/" % port
+    return [
+        "hv create c1 %simg.qcow2 size=16M mem=512 password=nos" % url,
+        "ls /vms/c1",
+        "sha256 /vms/c1/disk.raw",
+        "cat /vms/c1/vm.toml",
+        "hv create c1 %simg.qcow2" % url,
+        "hv create c2 %sraw.img" % url,
+        "sha256 /vms/c2/disk.raw",
+        "hv create c3 %smissing.qcow2" % url,
+        "hv create c4 %snotes.txt" % url,
+        "hv create c5 %simg.qcow2 size=1M" % url,
+        "ls /vms",
+        "hv vms",
+    ]
+
+
+# The size hv create grows the disk to, and a raw image's.
+CREATE_SIZE = 16 * 1024 * 1024
+RAW_SIZE = 2 * 1024 * 1024
+# The key nos's sshd lets in, which hv create gives cloud-init.
+TEST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVub3QtYS1yZWFsLWtleS1qdXN0LWEtdGVzdA hv-test"
+
 # One line a command, in the order /etc/rc runs them. The test indexes the
 # output by position, so the two lists are one thing.
 SCRIPT = [
@@ -161,11 +192,11 @@ SCRIPT = [
     "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 34
     "rmmod hv",             # 35
 ] + [
-    # `hv convert`, a cloud's qcow2 image made a raw disk (CONVERT, below).
+    # `hv convert`, a cloud's qcow2 image made a raw disk (CONVERT, above),
+    # and then `hv create` of a VM from a URL (create_script, below) --
+    # whose lines need the port of the test's web server -- and an rmmod.
     "insmod /hv.ko",        # 36
-] + CONVERT + [
-    "rmmod hv",             # 36 + len(CONVERT) + 1
-]
+] + CONVERT
 
 # hvboot, as `make` builds it: the PVH image the script boots.
 HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
@@ -298,6 +329,71 @@ def convert_images(tmp, rootdir):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def create_images(tmp, rootdir):
+    """What the web server serves `hv create`: the compressed image the
+    convert checks have, a raw disk -- a partition table's signature, and
+    random bytes -- and a file that is no image. The SHA-256 the two disks
+    must have once made: the first's grown to CREATE_SIZE, the second's as
+    it is."""
+    www = os.path.join(tmp, "www")
+    os.makedirs(www)
+    shutil.copy(os.path.join(rootdir, "img.qcow2"), www)
+    rng = random.Random(11)
+    raw = bytearray(rng.randbytes(RAW_SIZE))
+    raw[510:512] = b"\x55\xaa"
+    with open(os.path.join(www, "raw.img"), "wb") as f:
+        f.write(raw)
+    with open(os.path.join(www, "notes.txt"), "w") as f:
+        f.write("no disk here\n" * 100)
+    with open(os.path.join(tmp, "convert.raw"), "rb") as f:
+        disk = f.read()
+    grown = hashlib.sha256(disk + bytes(CREATE_SIZE - len(disk))).hexdigest()
+    return www, grown, hashlib.sha256(raw).hexdigest()
+
+
+def web_server(root):
+    """A web server on the test machine serving `root`, which QEMU's user
+    network puts at 10.0.2.2 for nos: the server, and its port."""
+    import functools
+    import http.server
+    import threading
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=root))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+def create_checks(out, grown, raw):
+    """What `hv create <name> <url>` answered to create_script, in order."""
+    pt.check("hv create from a URL: a qcow2 image downloaded, made a 16 MiB disk, its seed given the key and a "
+             "password, and a vm.toml written",
+             "/vms/c1/vm.toml written -- hv start c1 boots it: hvboot, a 16 MiB disk, cloud-init given 1 key and a "
+             "password" in out[0], out[0])
+    pt.check("its folder: the disk, the seed and the vm.toml -- the download gone",
+             all(f in out[1] for f in ("disk.raw", "seed.iso", "vm.toml")) and "img.qcow2" not in out[1]
+             and re.search(r"65536 seed\.iso", out[1]) is not None, out[1])
+    pt.check("the disk is the one the image was made of, grown with zeros to size= (its SHA-256)", grown in out[2],
+             out[2] + "\nwant " + grown)
+    pt.check("the vm.toml boots it by hvboot -- the system image's, unless told -- the disk first and the seed "
+             "read-only, on the switch, restarted",
+             all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true", "restart = true")),
+             out[3])
+    pt.check("a name that has a vm.toml is refused", "is there already -- not written over" in out[4], out[4])
+    pt.check("a raw image is taken as it is", "/vms/c2/vm.toml written" in out[5] and "a 2 MiB disk" in out[5], out[5])
+    pt.check("byte for byte", raw in out[6], out[6] + "\nwant " + raw)
+    pt.check("a URL with nothing at it is refused, saying so", "the server answered 404" in out[7], out[7])
+    pt.check("a file that is no image is refused, saying so", "is no image this knows" in out[8], out[8])
+    pt.check("a size= under the image's disk is refused", "is less than the image's disk" in out[9], out[9])
+    pt.check("and those three left nothing behind",
+             "c1" in out[10] and "c2" in out[10] and not any(n in out[10] for n in ("c3", "c4", "c5")), out[10])
+    pt.check("hv vms lists the two made", "c1  not running" in out[11] and "c2  not running" in out[11], out[11])
+
+
 def convert_checks(out, digest):
     """What `hv convert` answered to CONVERT, in order."""
     size_mib = -(-CONVERT_SIZE // (1024 * 1024))
@@ -325,13 +421,18 @@ def rootfs(tmp, arch, rc=None):
     /etc/rc when one is wanted. The image, and the SHA-256 of the disk the
     images are of."""
     rootdir = os.path.join(tmp, "rootdir")
-    os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
+    os.makedirs(os.path.join(rootdir, "etc", "ssh"), exist_ok=True)
     shutil.copy(module(arch), rootdir)
+    with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
+        f.write("# the key hv create gives cloud-init\n%s\n" % TEST_KEY)
     digest = convert_images(tmp, rootdir)
     if arch == "x86_64":
         if not os.path.exists(HVBOOT):
             sys.exit("no %s -- make first" % HVBOOT)
         shutil.copy(HVBOOT, os.path.join(rootdir, "hvboot"))
+        # And where the system image keeps it, which hv create boots by.
+        os.makedirs(os.path.join(rootdir, "lib"), exist_ok=True)
+        shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
     if rc is not None:
         with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
             f.write("# scripts/hv-test.py\n" + "\n".join(rc) + "\n")
@@ -409,7 +510,16 @@ def x86(args):
 
     tmp = tempfile.mkdtemp(prefix="nos-hv-")
     log = os.path.join(tmp, "serial.log")
-    image, digest = rootfs(tmp, "x86_64", SCRIPT)
+    # The images hv create downloads, served before the script is written:
+    # its lines say the server's port. The convert checks' images are made
+    # into a root of their own first, for it to take one.
+    staged = os.path.join(tmp, "staged")
+    os.makedirs(staged)
+    convert_images(tmp, staged)
+    www, grown, raw = create_images(tmp, staged)
+    server, port = web_server(www)
+    script = SCRIPT + create_script(port) + ["rmmod hv"]
+    image, digest = rootfs(tmp, "x86_64", script)
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
     print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
@@ -423,7 +533,10 @@ def x86(args):
             "-cpu", "host" if kvm else "max",
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
-            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
+            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
+            # The network hv create downloads through: the web server above.
+            "-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-netdev", "user,id=net0"]
     if kvm:
         argv += ["-enable-kvm"]
 
@@ -432,13 +545,14 @@ def x86(args):
         if not pt.check("boots", pt.wait_log(log, "boot: complete", 400)):
             return
         if not pt.check("the boot script runs to the end",
-                        pt.wait_log(log, "> " + SCRIPT[-1], 200)):
+                        pt.wait_log(log, "> " + script[-1], 200)):
             return
         # The last command's own output lands after the marker above -- which
         # is the first `rmmod hv`'s too: the end of the script is waited for.
         pt.wait_log(log, "rc: /etc/rc done", 600)
-        x86_checks(blocks(log), digest)
+        x86_checks(blocks(log), script, digest, grown, raw)
     finally:
+        server.shutdown()
         pt.kill(p)
         if args.keep:
             print("log at " + log)
@@ -499,8 +613,8 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
 
 
-def x86_checks(ran, digest):
-    if not pt.check("every line of the script ran", [c for c, _ in ran] == SCRIPT,
+def x86_checks(ran, script, digest, grown, raw):
+    if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
         return
     out = [text for _, text in ran]
@@ -612,7 +726,10 @@ def x86_checks(ran, digest):
 
     pt.check("hv loads for hv convert", "hv loaded at" in out[36], out[36])
     convert_checks(out[37:37 + len(CONVERT)], digest)
-    pt.check("and unloads after it", "hv unloaded" in out[37 + len(CONVERT)], out[37 + len(CONVERT)])
+    at = 37 + len(CONVERT)
+    created = len(script) - 1 - at
+    create_checks(out[at:at + created], grown, raw)
+    pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
 
 
 def arm64(args):
