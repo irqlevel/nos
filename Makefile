@@ -485,8 +485,10 @@ nos-arm64.img: $(KERNEL)
 	cp $(KERNEL) bin/kernel-arm64.elf
 
 # The system image (docs/install.md): the kernel, every module built with it,
-# the GRUB entries that boot it, the default /etc/rc and nos-install, in one
-# read-only squashfs that nos-install pours onto a server's partition. x86-64
+# hvboot, the GRUB entries that boot it, the default /etc/rc and nos-install,
+# in one read-only squashfs that nos-install pours onto a server's partition.
+# A file added to it is added to nos-install's LAYOUT too -- and to SYSTEM,
+# when an update replaces it -- or nos-install refuses the image. x86-64
 # only: what boots it is the machine's own GRUB, over Multiboot2. Owners,
 # times and modes are fixed, so the same build makes the same bytes and the
 # image's sha256 names what is in it. The revision in its VERSION is read

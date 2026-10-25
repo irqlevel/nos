@@ -33,10 +33,11 @@
 #
 # Install pours the image onto a plain partition as an ext2 filesystem that
 # nos mounts read-write as its root -- the kernel in /boot, the modules built
-# with it in /lib/modules, /etc/rc, the grubenv -- and adds the entry to this
-# machine's GRUB that boots it. The machine's default does not change: nos
-# boots once when asked (boot, --boot-once), and the boot after that is the
-# default again, so a nos that never comes up is a reset away from it.
+# with it in /lib/modules, hvboot in /lib, /etc/rc, the grubenv -- and adds
+# the entry to this machine's GRUB that boots it. The machine's default does
+# not change: nos boots once when asked (boot, --boot-once), and the boot
+# after that is the default again, so a nos that never comes up is a reset
+# away from it.
 #
 # For a test: NOS_GRUB_D in place of /etc/grub.d, NOS_UPDATE_GRUB in place of
 # update-grub (true: nothing), NOS_ALLOW_ANY_DISK=1 not to ask what the
@@ -59,6 +60,17 @@ CMDLINE_MAX=191
 # What nos's ext2 reads and writes (docs/filesystems.md): any other feature
 # is a filesystem it mounts read-only, or not at all
 EXT2_FEATURES_OK=" ext_attr resize_inode dir_index filetype sparse_super large_file "
+# What of an image goes where. The system is replaced whole by an update,
+# and what it replaces is kept as .prev, all of it together, for rollback:
+# the kernel, the modules built with it, hvboot -- the loader hv boots a
+# guest's own kernel with (docs/hypervisor.md), which an image older than it
+# does not have -- and the VERSION that names them, last. GRUB's entries are
+# replaced, /etc/rc goes in the first time only, and nos-install stays in
+# the image. An image holding anything else is refused: poured, that part
+# would be left out without a word, as /lib/hvboot was by v0.0.26's own
+# nos-install, so a file the image gains is added here too
+SYSTEM="boot/kernel64.elf lib/modules lib/hvboot VERSION"
+LAYOUT=" $SYSTEM boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
 
 die() { echo "nos-install: $*" >&2; exit 1; }
 warn() { echo "nos-install: WARNING: $*" >&2; }
@@ -149,6 +161,16 @@ open_image() {
     arch=$(version_of "$IMG/VERSION" arch)
     [ "$arch" = "$(uname -m)" ] ||
         die "the image is for ${arch:-an unknown machine}, this machine is $(uname -m)"
+
+    local p unknown=
+    while IFS= read -r p; do
+        case "$LAYOUT" in
+            *" $p "*) ;;
+            *) unknown="$unknown /$p" ;;
+        esac
+    done < <(cd "$IMG" && find . -mindepth 1 -path ./lib/modules -prune -o -print | sed 's|^\./||')
+    [ -z "$unknown" ] ||
+        die "the image has$unknown, which this nos-install would leave out: run the nos-install in that image"
 }
 
 # A value of a VERSION file: version, revision, arch, module_abi
@@ -372,29 +394,36 @@ compose_cmdline() {
         die "the kernel parameters are ${#CMDLINE} characters, past the $CMDLINE_MAX left of the kernel's 255"
 }
 
-# A file or directory of the image into place: the new one beside the old
-# first, then the old one to .prev and the new one in its stead
+# A part of the system from the image into place: the new one beside the old
+# first, then the old one to .prev and the new one in its stead. A part the
+# image does not have goes to .prev all the same, with nothing in its place,
+# and a .prev with no part on the partition before it is let go of: .prev is
+# the install before this one, no more and no less (rollback)
 replace() {
     local from=$1 to=$2
     rm -rf "$to.new"
-    cp -r "$from" "$to.new"
-    sync -f "$(dirname "$to")"
+    if [ -e "$from" ]; then
+        cp -r "$from" "$to.new"
+        sync -f "$(dirname "$to")"
+    fi
+    rm -rf "$to.prev"
     if [ -e "$to" ]; then
-        rm -rf "$to.prev"
         mv -T "$to" "$to.prev"
     fi
-    mv -T "$to.new" "$to"
+    if [ -e "$to.new" ]; then
+        mv -T "$to.new" "$to"
+    fi
 }
 
 put_system() {
-    local mnt=$1 line
+    local mnt=$1 line p
     mkdir -p "$mnt/boot/grub" "$mnt/lib" "$mnt/etc/ssh"
 
-    # The kernel, its modules and the VERSION that names them go together,
-    # and what was there goes to .prev together (rollback)
-    replace "$IMG/boot/kernel64.elf" "$mnt/boot/kernel64.elf"
-    replace "$IMG/lib/modules" "$mnt/lib/modules"
-    replace "$IMG/VERSION" "$mnt/VERSION"
+    # The system goes together, and what was there goes to .prev together
+    # (SYSTEM, rollback)
+    for p in $SYSTEM; do
+        replace "$IMG/$p" "$mnt/$p"
+    done
     rm -rf "$mnt/boot/grub/nos.cfg.new"
     cp "$IMG/boot/grub/nos.cfg" "$mnt/boot/grub/nos.cfg.new"
     mv -T "$mnt/boot/grub/nos.cfg.new" "$mnt/boot/grub/nos.cfg"
@@ -719,14 +748,22 @@ cmd_rollback() {
     fsck_partition "$PART" "before anything is written"
     mount_partition "$PART"
     m=$MNT
+    # Every image has a kernel, modules and a VERSION; one older than hvboot
+    # has no hvboot, and then it is its absence that trades places
     for p in boot/kernel64.elf lib/modules VERSION; do
         [ -e "$m/$p.prev" ] || die "nothing to go back to: no /$p.prev on $PART"
     done
-    for p in boot/kernel64.elf lib/modules VERSION; do
+    for p in $SYSTEM; do
         rm -rf "$m/$p.back"
-        mv -T "$m/$p" "$m/$p.back"
-        mv -T "$m/$p.prev" "$m/$p"
-        mv -T "$m/$p.back" "$m/$p.prev"
+        if [ -e "$m/$p" ]; then
+            mv -T "$m/$p" "$m/$p.back"
+        fi
+        if [ -e "$m/$p.prev" ]; then
+            mv -T "$m/$p.prev" "$m/$p"
+        fi
+        if [ -e "$m/$p.back" ]; then
+            mv -T "$m/$p.back" "$m/$p.prev"
+        fi
     done
     say "$PART: $(describe "$m/VERSION"), and $(describe "$m/VERSION.prev") is the one to go back to"
     unmount_partition "$PART"
