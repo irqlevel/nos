@@ -22,7 +22,8 @@ kernel has them. Each input runs in a process of its own, forked from one
 booted machine.
 
 The targets: stack (frames of every kind), tcp, http, https, dns, dhcp,
-icmp (ping and ARP), udpshell, netconsole and ssh. Each holds what it drives
+icmp (ping and ARP), udpshell, netconsole, ssh and terminal (the SSH
+session's line editor, against a model of it). Each holds what it drives
 to what the protocol, and this stack of itself, says: a frame no stack
 should send, a byte of a stream delivered that was never sent, a lease kept
 past its end, an ARP cache holding what nobody said, a log line twice, a

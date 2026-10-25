@@ -84,10 +84,17 @@ class Monitor:
 
     def type(self, text):
         """One key at a time, as someone at the keyboard would."""
+        keys = []
         for ch in text:
             key = KEYS.get(ch)
             if key is None:
                 raise ValueError("no key for %r" % ch)
+            keys.append(key)
+        self.keys(keys)
+
+    def keys(self, names):
+        """Keys by the monitor's names for them: `up`, `ctrl-r`."""
+        for key in names:
             self.sock.sendall(("sendkey %s\n" % key).encode())
             time.sleep(0.08)
         self.drain()
@@ -118,8 +125,14 @@ class Console:
 
     def run(self, mon, cmd, timeout=30):
         """Type a command and hand back what the shell printed for it."""
+        return self.press(mon, [KEYS[ch] for ch in cmd + "\n"], cmd, timeout)
+
+    def press(self, mon, keys, label, timeout=30):
+        """Press keys, Enter the last of them, and hand back what the shell
+        printed for the line they made."""
         before = len(self.text())
-        mon.type(cmd + "\n")
+        mon.keys(keys)
+        cmd = label
 
         # The shell prints its answer and then a fresh prompt.
         start = time.time()
@@ -241,6 +254,18 @@ def main():
               "before %s after %s" % (before, after))
         check("with no transfer errors",
               re.search(r"errors [1-9]", out) is None, out)
+
+        # The shell's line editor, from the keyboard (kernel/line_editor.h):
+        # an arrow is what a terminal sends for it, Ctrl and a letter its
+        # control byte. What was run is usb, uptime, usb: Up twice is
+        # uptime, and then ^R and "us" find usb. A keyboard that dropped the
+        # arrows ran an empty line; one that took Ctrl for nothing ran "rus".
+        out = con.press(mon, ["up", "up", "ret"], "<Up> <Up> <Enter>")
+        check("Up on the usb keyboard brings back a command run before",
+              re.search(r"^\d+\.\d+\s*$", out, re.M) is not None, out or "(nothing)")
+        out = con.press(mon, ["ctrl-r", "u", "s", "ret"], "<^R> us <Enter>")
+        check("and ^R finds one by what it holds",
+              "xhci" in out, out or "(nothing)")
 
         # Hot-plug. The kernel's own trace does not reach the console once
         # the shell has taken it, so the shell is what is asked.

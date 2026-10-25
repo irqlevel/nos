@@ -5,6 +5,7 @@
 #include "task.h"
 
 #include "input.h"
+#include "line_editor.h"
 
 #include <drivers/serial.h>
 #include <lib/stdlib.h>
@@ -79,8 +80,6 @@ public:
 private:
     bool DispatchDynamic(const char* cmd, Stdlib::Printer& out);
 
-    void ProcessCmd(const char *cmd);
-
     Cmd();
     ~Cmd();
     Cmd(const Cmd& other) = delete;
@@ -97,15 +96,9 @@ private:
     void Run();
     static void RunFunc(void *ctx);
 
-    static const size_t CmdSizeMax = 80;
-
-    struct KeyEvent {
-        char Char;
-        u8 Code;
-    };
-
-    Stdlib::RingBuffer<KeyEvent, Const::PageSize> Buf;
-    char CmdLine[CmdSizeMax + 1];
+    /* What is typed, a terminal's bytes, until the shell's task takes it */
+    Stdlib::RingBuffer<char, Const::PageSize> Buf;
+    LineEditor Editor;
     SpinLock Lock;
     Task *TaskPtr;
     bool Shutdown;

@@ -8,7 +8,12 @@ namespace Kernel
 
 /* Source-agnostic keyboard sink. The legacy 8042 driver and the USB HID
    boot-keyboard driver both publish decoded characters here, so consumers
-   (the shell) do not care which controller a key came from. */
+   (the shell) do not care which controller a key came from. What they send
+   is what a terminal would for the key: its character, BS for Backspace,
+   the control byte for Ctrl and a letter (^R is 0x12), and an escape
+   sequence a byte at a time for an arrow (ESC [ A is Up) -- so the shell's
+   editor reads a keyboard as it reads a serial port. `code` is the key's
+   PS/2 set-1 make code, the same for every byte of a sequence. */
 class KeyboardObserver
 {
 public:

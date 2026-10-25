@@ -24,7 +24,8 @@ environment block), module (the module loader), pagetable (the page tables
 and the physical page allocator), heap (the kernel heap), cmdline (the
 command line), multiboot (Multiboot2's tags), acpi (the ACPI tables, over
 an emulated TmpMap window), format (the kernel's printf, against the
-host's) and eevdf (the scheduler's rules, against a model of EEVDF's).
+host's), eevdf (the scheduler's rules, against a model of EEVDF's) and
+lineedit (the console shell's line editor, what a terminal types at it).
 docs/testing.md says what each checks.
 
 By default every target runs its own number of inputs from a fixed seed, the

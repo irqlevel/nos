@@ -97,3 +97,31 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
+
+## Line editing
+
+At the console -- the screen with its PS/2 or USB keyboard, or a terminal on
+the serial port -- and in an [SSH](sshd.md) session with a terminal, a line
+is edited with the same keys:
+
+| Key | What it does |
+|-----|--------------|
+| Enter | Runs the line |
+| Backspace | Takes back the last character |
+| Up, Down (^P, ^N) | Back through the last 32 lines run, and forward again to the one being typed |
+| ^R | Searches back through them for a line that holds what is typed after it, as bash's `(reverse-i-search)'query': line`. ^R again finds the next older one, Backspace takes a character off the query, Enter runs what was found, ^G puts back the line from before the search, and any other key -- an arrow, ^U -- keeps what was found, to be edited |
+| ^C | Drops the line |
+| ^U | Clears it |
+
+A line of nothing but spaces is not kept, nor the same line twice running.
+The console's history is its own and each SSH session's is its own; none
+outlives the boot. Over SSH, ^L also clears the screen and ^D on an empty
+line logs out. A console line is at most 80 characters, an SSH one 255.
+
+The keyboards send what a terminal would -- an arrow as ESC [ A..D, Ctrl and
+a letter as its control byte -- so the console's editor
+(`src/cpp/kernel/line_editor.cpp`) reads a keyboard as it reads the serial
+port; the screen knows only text and Backspace, and a line is redrawn by
+erasing back to where it changed. `scripts/udpsh.py`, the UDP shell's
+client, edits on the host with readline -- the same keys -- and keeps its
+history in `~/.nos_udpsh_history`.
