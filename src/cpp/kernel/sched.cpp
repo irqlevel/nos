@@ -86,13 +86,13 @@ void SchedStats::Delay(ulong ns)
     Bump(DelayHist[Bucket(ns)], 1);
 }
 
-void SchedStats::Decision(ulong cycles, ulong walked)
+void SchedStats::Decision(ulong cycles, ulong touched)
 {
     Bump(Decisions, 1);
     Bump(DecisionCycles, cycles);
     Raise(DecisionMax, cycles);
-    Bump(Walked, walked);
-    Raise(WalkMax, walked);
+    Bump(Touched, touched);
+    Raise(TouchedMax, touched);
 }
 
 void SchedStats::Look(ulong runnable)
@@ -115,8 +115,8 @@ void SchedStats::Read(Snapshot& out)
     out.Decisions = Load(Decisions);
     out.DecisionCycles = Load(DecisionCycles);
     out.DecisionMaxCycles = Load(DecisionMax);
-    out.Walked = Load(Walked);
-    out.WalkMax = Load(WalkMax);
+    out.Touched = Load(Touched);
+    out.TouchedMax = Load(TouchedMax);
     out.Looks = Load(Looks);
     out.Runnable = Load(RunnableSum);
     out.RunnableMax = Load(RunnableMax);

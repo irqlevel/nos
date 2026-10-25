@@ -495,13 +495,13 @@ static void SchedLine(const char* who, ulong tasks, const SchedStats::Snapshot& 
     SchedNsText(CycleCounterDeltaToNs(now.DecisionMaxCycles), cmax, sizeof(cmax));
 
     /* Tenths, so averages keep a decimal without floats */
-    ulong walk10 = (decisions != 0) ? (d.Walked * 10) / decisions : 0;
+    ulong touch10 = (decisions != 0) ? (d.Touched * 10) / decisions : 0;
     ulong run10 = (d.Looks != 0) ? (d.Runnable * 10) / d.Looks : 0;
     ulong crowded = (d.Looks != 0) ? (d.Crowded * 100) / d.Looks : 0;
 
     con.Printf("%-4s %5lu %7lu %7s %7s %7s %7s %6lu %7s %7s %7lu %7s %7s %3lu.%lu %4lu %3lu.%lu %3lu %3lu%%\n",
         who, tasks, wakes, w50, w99, w999, wmax, delays, d50, d99,
-        decisions, cavg, cmax, walk10 / 10, walk10 % 10, now.WalkMax,
+        decisions, cavg, cmax, touch10 / 10, touch10 % 10, now.TouchedMax,
         run10 / 10, run10 % 10, now.RunnableMax, crowded);
 }
 
@@ -516,8 +516,8 @@ static void SchedSum(SchedStats::Snapshot& into, const SchedStats::Snapshot& s)
     into.Decisions += s.Decisions;
     into.DecisionCycles += s.DecisionCycles;
     into.DecisionMaxCycles = Stdlib::Max(into.DecisionMaxCycles, s.DecisionMaxCycles);
-    into.Walked += s.Walked;
-    into.WalkMax = Stdlib::Max(into.WalkMax, s.WalkMax);
+    into.Touched += s.Touched;
+    into.TouchedMax = Stdlib::Max(into.TouchedMax, s.TouchedMax);
     into.Looks += s.Looks;
     into.Runnable += s.Runnable;
     into.RunnableMax = Stdlib::Max(into.RunnableMax, s.RunnableMax);
@@ -537,8 +537,8 @@ static void SchedDiff(SchedStats::Snapshot& d, const SchedStats::Snapshot& a,
     d.Decisions = b.Decisions - a.Decisions;
     d.DecisionCycles = b.DecisionCycles - a.DecisionCycles;
     d.DecisionMaxCycles = b.DecisionMaxCycles;
-    d.Walked = b.Walked - a.Walked;
-    d.WalkMax = b.WalkMax;
+    d.Touched = b.Touched - a.Touched;
+    d.TouchedMax = b.TouchedMax;
     d.Looks = b.Looks - a.Looks;
     d.Runnable = b.Runnable - a.Runnable;
     d.RunnableMax = b.RunnableMax;
@@ -899,8 +899,8 @@ static void CmdSchedSet(const char* args, Stdlib::Printer& con, bool nice)
    task waited for the CPU -- at the median, the 99th and the 99.9th
    percentile, the buckets' bounds, and the longest since boot, exactly --
    how long one displaced while it could still run waited to run again, what
-   a decision cost (the average, and the most since boot), how far its walk
-   went, and how many tasks could run at the CPU's timer: on average, the
+   a decision cost (the average, and the most since boot), how many tasks it
+   touched, and how many tasks could run at the CPU's timer: on average, the
    most since boot, and how often two or more. */
 static void CmdSched(const char* args, Stdlib::Printer& con)
 {
@@ -976,7 +976,7 @@ static void CmdSched(const char* args, Stdlib::Printer& con)
     con.Printf("sched: %lu ms window; waits are bucket bounds, max since boot\n", intervalMs);
     con.Printf("%-4s %5s %7s %7s %7s %7s %7s %6s %7s %7s %7s %7s %7s %5s %4s %5s %3s %4s\n",
         "cpu", "tasks", "wakeups", "p50", "p99", "p99.9", "max", "delays", "p50", "p99",
-        "decide", "avg", "max", "walk", "max", "run", "max", "2+");
+        "decide", "avg", "max", "touch", "max", "run", "max", "2+");
 
     SchedStats::Snapshot total;
     Stdlib::MemSet(&total, 0, sizeof(total));
