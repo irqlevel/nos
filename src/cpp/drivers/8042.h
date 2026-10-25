@@ -46,11 +46,31 @@ private:
     /* Bound on the ReadData drain loop (stuck status bit) */
     static const size_t MaxDrainIterations = 4096;
 
+    /* Set-1 scan codes: a key's make code, its break code the same with
+       CodeBreak set; behind CodeExtended, the right Ctrl and the arrows */
+    static const u8 CodeBreak = 0x80;
+    static const u8 CodeExtended = 0xE0;
+    static const u8 CodeCtrl = 0x1D;
+    static const u8 CodeLeftShift = 0x2A;
+    static const u8 CodeRightShift = 0x36;
+    static const u8 CodeUp = 0x48;
+    static const u8 CodeLeft = 0x4B;
+    static const u8 CodeRight = 0x4D;
+    static const u8 CodeDown = 0x50;
+
+    /* Ctrl keeps a letter's low five bits: 'r' (0x72) is ^R (0x12) */
+    static const u8 CtrlMask = 0x1F;
+
+    /* What a terminal sends for an arrow, which the shell's editor reads:
+       nullptr for any other extended key */
+    static const char* ArrowSequence(u8 code);
+
     SpinLock Lock;
     Stdlib::RingBuffer<u8, Const::PageSize> Buf;
 
     int IntVector;
     u8 Mod;
+    u8 Ctrl;
     u8 Extended; /* set after a 0xE0 prefix byte */
 
     Atomic InterruptCounter;

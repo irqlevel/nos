@@ -26,7 +26,8 @@ extern crate alloc;
 mod cipher;
 mod connection;
 pub mod keys;
-mod terminal;
+/// Public for the net fuzzer, which holds the editor to a model of its own
+pub mod terminal;
 mod transport;
 mod wire;
 

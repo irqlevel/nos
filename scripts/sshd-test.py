@@ -160,6 +160,13 @@ class Test:
         check("a shell with a terminal: prompt, commands, exit", rc == 0 and uptime_like(out) and "$ " in out,
               repr(out[-300:]))
         check("line ends CR LF on a terminal", "\r\n" in out, repr(out[:200]))
+        # The line editor's history (shell-commands.md#line-editing): Up
+        # twice runs uptime again, ^R and "vers" version
+        rc, out, _ = self.ssh([], stdin=b"uptime\rversion\r\x1b[A\x1b[A\r\x12vers\rexit\r", tty=True)
+        check("Up and ^R through a terminal's history",
+              rc == 0 and len(re.findall(r"^\d+\.\d+\r?$", out, re.M)) == 2 and
+              len(re.findall(r"nos \S+ \(", out)) == 2 and "(reverse-i-search)'vers': version" in out,
+              repr(out[-600:]))
         rc, out, _ = self.ssh([], stdin=b"uptime\nversion\n")
         check("a shell without one: no prompt, EOF ends it", rc == 0 and uptime_like(out) and "$ " not in out,
               repr(out[-300:]))
