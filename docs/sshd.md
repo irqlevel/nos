@@ -141,9 +141,11 @@ cut at 32 KiB. Some commands print holding a spinlock with interrupts off
 (`ps`, `stacks`, `arp`), when sending -- waiting for the client, allocating --
 is not allowed: their output waits for them to return, and what would pass
 the buffer meanwhile is dropped, with a note saying how much. With a terminal, the client's side is raw and the line editing is the
-server's: printable characters, Backspace, Enter, Up and Down through the last
-32 lines, ^C to drop the line, ^U to clear it, ^L to clear the screen, ^D on an
-empty line to log out; line ends are made CR LF. `exit` and `logout` end the
+server's: printable characters, Backspace, Enter, Up and Down (^P and ^N)
+through the last 32 lines, ^R to search back through them as bash does, ^C to
+drop the line, ^U to clear it, ^L to clear the screen, ^D on an empty line to
+log out ([Line editing](shell-commands.md#line-editing)); line ends are made
+CR LF. `exit` and `logout` end the
 session. The exit status is always 0: the kernel's commands have none.
 
 A command runs on a task of its own, beside its session, and cannot be

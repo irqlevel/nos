@@ -38,7 +38,7 @@ HEAP := fuzz/cpp/common/heap.cpp
 # keeps of them, whose constructors are kernel/eevdf.cpp's
 CPU := fuzz/cpp/common/cpu.cpp src/cpp/kernel/eevdf.cpp
 
-TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format ucode eevdf
+TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format ucode eevdf lineedit
 
 SRC_fdt := $(COMMON) fuzz/cpp/targets/fdt.cpp \
            src/cpp/arch/arm64/fdt.cpp src/cpp/arch/arm64/board.cpp
@@ -61,6 +61,7 @@ SRC_acpi := $(COMMON) $(CPU) fuzz/cpp/targets/acpi.cpp src/cpp/drivers/acpi.cpp 
 SRC_format := $(COMMON) fuzz/cpp/targets/format.cpp
 SRC_ucode := $(COMMON) fuzz/cpp/targets/ucode.cpp src/cpp/arch/x86_64/microcode_file.cpp
 SRC_eevdf := $(COMMON) fuzz/cpp/targets/eevdf.cpp src/cpp/kernel/eevdf.cpp
+SRC_lineedit := $(COMMON) fuzz/cpp/targets/lineedit.cpp src/cpp/kernel/line_editor.cpp
 # The kernel heap itself: no heap.cpp under it
 SRC_heap := $(COMMON) $(CPU) fuzz/cpp/targets/heap.cpp \
             src/cpp/mm/allocator.cpp src/cpp/mm/pool.cpp src/cpp/mm/page_allocator.cpp \
