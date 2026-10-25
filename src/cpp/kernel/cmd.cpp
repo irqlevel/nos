@@ -11,6 +11,7 @@
 #include "parameters.h"
 #include "console.h"
 #include "mutex.h"
+#include "event.h"
 #include "task.h"
 #include "stack_probe.h"
 #include "symtab.h"
@@ -544,6 +545,235 @@ static void SchedDiff(SchedStats::Snapshot& d, const SchedStats::Snapshot& a,
     d.Crowded = b.Crowded - a.Crowded;
 }
 
+/* `sched probe`: how long a woken task waits for a CPU that others keep
+   busy -- the case a scheduler is chosen by. Spinners pinned to one CPU that
+   never yield, so only the tick takes it from them; a waiter pinned beside
+   them, asleep on an Event; and this command's task, on another CPU,
+   signalling it a sample at a time and waiting to hear that it ran. Each
+   wait is from the Signal() to the waiter running: the waker's IPI, and
+   whatever the scheduler makes it wait behind. */
+struct SchedProbe
+{
+    Event Ev;
+    Atomic Stop;
+    /* When the signal being answered was sent */
+    Atomic SentAt;
+    Atomic Answered;
+    /* The waiter's own, read once it has exited: its exit and the join
+       order them */
+    ulong Hist[SchedStats::Buckets];
+    ulong MaxNs;
+    ulong Count;
+
+    static const ulong Tag = 'SPrb';
+};
+
+static const ulong SchedProbeMaxSpinners = 16;
+static const ulong SchedProbeMaxMs = 60000;
+/* How long the waiter waits before it looks at Stop again */
+static const ulong SchedProbeWaitNs = 100 * Const::NanoSecsInMs;
+/* A signal not answered in this long is counted as such, and the probe
+   moves on */
+static const ulong SchedProbeAnswerNs = Const::NanoSecsInSec;
+/* Between one answer and the next signal: the waiter is asleep again by
+   then */
+static const ulong SchedProbeGapNs = 2 * Const::NanoSecsInMs;
+
+static void SchedProbeSpin(void* ctx)
+{
+    auto* p = static_cast<SchedProbe*>(ctx);
+    while (p->Stop.Get() == 0)
+        Pause();
+}
+
+static void SchedProbeWaiter(void* ctx)
+{
+    auto* p = static_cast<SchedProbe*>(ctx);
+    while (p->Stop.Get() == 0)
+    {
+        if (!p->Ev.WaitFor(SchedProbeWaitNs))
+            continue;
+
+        ulong now = GetBootTime().GetValue();
+        ulong sent = (ulong)p->SentAt.Get();
+        if (sent != 0 && now >= sent)
+        {
+            ulong ns = now - sent;
+            p->Hist[SchedStats::Bucket(ns)]++;
+            p->MaxNs = Stdlib::Max(p->MaxNs, ns);
+            p->Count++;
+        }
+        p->SentAt.Set(0);
+        p->Answered.Set(1);
+    }
+}
+
+/* Runtime of task so far, under its lock as every UpdateRuntime() is made */
+static ulong SchedProbeRuntime(Task* task)
+{
+    Stdlib::AutoLock lock(task->Lock);
+    return task->Runtime.GetValue();
+}
+
+static void CmdSchedProbe(const char* args, Stdlib::Printer& con)
+{
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+    ulong self = cpus.GetCurrentCpuId();
+
+    ulong spinners = 2;
+    ulong ms = 2000;
+    /* The highest CPU that is not this one, unless told: this task signals
+       from here */
+    ulong cpu = ~0UL;
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if ((mask & (1UL << i)) && i != self)
+            cpu = i;
+    }
+
+    const char* end;
+    for (const char* tok = Stdlib::NextToken(args, end); tok; tok = Stdlib::NextToken(end, end))
+    {
+        /* Zeroed: the prefixes are compared over their whole length, past
+           the end of a token shorter than one */
+        char buf[32] = {};
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        ulong value;
+        bool ok = false;
+        if (Stdlib::MemCmp(buf, "spinners=", 9) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 9, value) && value <= SchedProbeMaxSpinners;
+            if (ok)
+                spinners = value;
+        }
+        else if (Stdlib::MemCmp(buf, "ms=", 3) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 3, value) && value != 0 && value <= SchedProbeMaxMs;
+            if (ok)
+                ms = value;
+        }
+        else if (Stdlib::MemCmp(buf, "cpu=", 4) == 0)
+        {
+            ok = Stdlib::ParseUlong(buf + 4, value) && value < MaxCpus && (mask & (1UL << value));
+            if (ok)
+                cpu = value;
+        }
+
+        if (!ok)
+        {
+            con.Printf("usage: sched probe [spinners=0-%lu] [ms=1-%lu] [cpu=N]\n",
+                SchedProbeMaxSpinners, SchedProbeMaxMs);
+            return;
+        }
+    }
+
+    if (cpu == ~0UL)
+    {
+        con.Printf("sched probe: needs a second cpu\n");
+        return;
+    }
+
+    auto* p = Mm::TAlloc<SchedProbe, SchedProbe::Tag>();
+    if (p == nullptr)
+    {
+        con.Printf("sched probe: out of memory\n");
+        return;
+    }
+    Stdlib::MemSet(p->Hist, 0, sizeof(p->Hist));
+    p->MaxNs = 0;
+    p->Count = 0;
+
+    /* The waiter first, the spinners after it */
+    Task* tasks[SchedProbeMaxSpinners + 1] = {};
+    ulong started = 0;
+    bool ok = true;
+    for (ulong i = 0; ok && i <= spinners; i++)
+    {
+        char name[TaskNameLen];
+        if (i == 0)
+            Stdlib::SnPrintf(name, sizeof(name), "probe/wait");
+        else
+            Stdlib::SnPrintf(name, sizeof(name), "probe/spin%lu", i - 1);
+
+        Task* task = Mm::TAlloc<Task, SchedProbe::Tag>(name);
+        if (task == nullptr)
+        {
+            ok = false;
+            break;
+        }
+        task->SetCpuAffinity(1UL << cpu);
+        if (!task->Start((i == 0) ? SchedProbeWaiter : SchedProbeSpin, p))
+        {
+            task->Put();
+            ok = false;
+            break;
+        }
+        tasks[started++] = task;
+    }
+
+    ulong runAt[SchedProbeMaxSpinners + 1] = {};
+    ulong sent = 0, unanswered = 0;
+    ulong t0 = GetBootTime().GetValue();
+    for (ulong i = 0; i < started; i++)
+        runAt[i] = SchedProbeRuntime(tasks[i]);
+
+    ulong until = t0 + ms * Const::NanoSecsInMs;
+    while (ok && GetBootTime().GetValue() < until)
+    {
+        p->Answered.Set(0);
+        p->SentAt.Set((long)GetBootTime().GetValue());
+        p->Ev.Signal();
+        sent++;
+
+        ulong giveUp = GetBootTime().GetValue() + SchedProbeAnswerNs;
+        while (p->Answered.Get() == 0 && GetBootTime().GetValue() < giveUp)
+            Sleep(Const::NanoSecsInMs);
+        if (p->Answered.Get() == 0)
+            unanswered++;
+
+        Sleep(SchedProbeGapNs);
+    }
+    ulong elapsed = GetBootTime().GetValue() - t0;
+
+    ulong ran[SchedProbeMaxSpinners + 1] = {};
+    for (ulong i = 0; i < started; i++)
+        ran[i] = SchedProbeRuntime(tasks[i]) - runAt[i];
+
+    p->Stop.Set(1);
+    p->Ev.Signal();
+    for (ulong i = 0; i < started; i++)
+    {
+        tasks[i]->Wait();
+        tasks[i]->Put();
+    }
+
+    if (!ok)
+    {
+        con.Printf("sched probe: could not start its tasks\n");
+    }
+    else
+    {
+        char w50[16], w90[16], w99[16], wmax[16];
+        SchedBucketText(SchedPercentile(p->Hist, 500), w50, sizeof(w50));
+        SchedBucketText(SchedPercentile(p->Hist, 900), w90, sizeof(w90));
+        SchedBucketText(SchedPercentile(p->Hist, 990), w99, sizeof(w99));
+        SchedNsText(p->MaxNs, wmax, sizeof(wmax));
+
+        con.Printf("sched probe: cpu %lu, %lu spinners, %lu ms: %lu signals, %lu answered, %lu not in %lu ms\n",
+            cpu, spinners, ms, sent, p->Count, unanswered, SchedProbeAnswerNs / Const::NanoSecsInMs);
+        con.Printf("  waited p50 %s p90 %s p99 %s max %s\n", w50, w90, w99, wmax);
+        con.Printf("  ran, per mille of the window:");
+        for (ulong i = 0; i < started && elapsed != 0; i++)
+            con.Printf(" %s %lu", tasks[i]->GetName(), (ran[i] * 1000) / elapsed);
+        con.Printf("\n");
+    }
+
+    p->~SchedProbe();
+    Mm::Free(p);
+}
+
 /* What each CPU's scheduler did over a window (SchedStats): how long a woken
    task waited for the CPU -- at the median, the 99th and the 99.9th
    percentile, the buckets' bounds, and the longest since boot, exactly --
@@ -566,10 +796,17 @@ static void CmdSched(const char* args, Stdlib::Printer& con)
         char buf[16];
         Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
 
+        if (Stdlib::StrCmp(buf, "probe") == 0)
+        {
+            CmdSchedProbe(end, con);
+            return;
+        }
+
         ulong ms;
         if (!Stdlib::ParseUlong(buf, ms) || ms == 0 || ms > MaxIntervalMs)
         {
-            con.Printf("usage: sched [interval-ms, 1-%lu]\n", MaxIntervalMs);
+            con.Printf("usage: sched [interval-ms, 1-%lu] | sched probe [spinners=N] [ms=M] [cpu=N]\n",
+                MaxIntervalMs);
             return;
         }
         intervalMs = ms;
@@ -1619,7 +1856,7 @@ static const CmdEntry Commands[] = {
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
-    { "sched",     CmdSched,     "sched [ms] - what each cpu's scheduler did over a window: wakeup waits, decisions, queue lengths" },
+    { "sched",     CmdSched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] - what each cpu's scheduler did over a window; how long a woken task waits behind spinners" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },

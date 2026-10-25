@@ -35,15 +35,20 @@ long GetPreemptDeferredIdleCount()
     return PreemptsDeferredIdle.Get();
 }
 
-void SchedStats::Bump(Atomic& counter, ulong by)
+void SchedStats::Bump(ulong& counter, ulong by)
 {
-    counter.Set((long)((ulong)counter.Get() + by));
+    __atomic_store_n(&counter, __atomic_load_n(&counter, __ATOMIC_RELAXED) + by, __ATOMIC_RELAXED);
 }
 
-void SchedStats::Raise(Atomic& max, ulong value)
+void SchedStats::Raise(ulong& max, ulong value)
 {
-    if ((ulong)max.Get() < value)
-        max.Set((long)value);
+    if (__atomic_load_n(&max, __ATOMIC_RELAXED) < value)
+        __atomic_store_n(&max, value, __ATOMIC_RELAXED);
+}
+
+ulong SchedStats::Load(const ulong& counter)
+{
+    return __atomic_load_n(&counter, __ATOMIC_RELAXED);
 }
 
 ulong SchedStats::Bucket(ulong ns)
@@ -94,19 +99,19 @@ void SchedStats::Read(Snapshot& out)
 {
     for (ulong i = 0; i < Buckets; i++)
     {
-        out.Wake[i] = (ulong)WakeHist[i].Get();
-        out.Delay[i] = (ulong)DelayHist[i].Get();
+        out.Wake[i] = Load(WakeHist[i]);
+        out.Delay[i] = Load(DelayHist[i]);
     }
-    out.WakeMaxNs = (ulong)WakeMax.Get();
-    out.Decisions = (ulong)Decisions.Get();
-    out.DecisionCycles = (ulong)DecisionCycles.Get();
-    out.DecisionMaxCycles = (ulong)DecisionMax.Get();
-    out.Walked = (ulong)Walked.Get();
-    out.WalkMax = (ulong)WalkMax.Get();
-    out.Looks = (ulong)Looks.Get();
-    out.Runnable = (ulong)RunnableSum.Get();
-    out.RunnableMax = (ulong)RunnableMax.Get();
-    out.Crowded = (ulong)Crowded.Get();
+    out.WakeMaxNs = Load(WakeMax);
+    out.Decisions = Load(Decisions);
+    out.DecisionCycles = Load(DecisionCycles);
+    out.DecisionMaxCycles = Load(DecisionMax);
+    out.Walked = Load(Walked);
+    out.WalkMax = Load(WalkMax);
+    out.Looks = Load(Looks);
+    out.Runnable = Load(RunnableSum);
+    out.RunnableMax = Load(RunnableMax);
+    out.Crowded = Load(Crowded);
 }
 
 void TaskQueue::ReadStats(SchedStats::Snapshot& out)
