@@ -149,7 +149,7 @@ What holds it:
   first bound takes: at a fixed rhythm they settled just before a slice
   ended, and the broken order above waited 153 us at the median, under the
   bound, where at random points it waits 1.3 ms. Under HVF a wakeup waits
-  4-8 us at the median, under TCG 18-25 us, and the share is 2.9-3.0; with
+  4-8 us at the median, under TCG 18-26 us, and the share is 2.9-3.1; with
   the round robin a wakeup behind two spinners waited 8 ms, and the two
   shared the CPU half and half.
 
@@ -725,9 +725,12 @@ On the EX44's silicon (`cpu=40`, a P-core), where the round robin had given
 HVF's numbers: under 2 us at the median beside one, two and four spinners,
 p99 under 64 us, the shares 998; 498, 499; 250, 249, 249, 249 -- and the
 boot's `TestEevdf` there, on an E-core, 1 us beside one spinner and two, and
-3.0 for the share. What it costs a machine at rest is what the round robin
-did: a decision 1.2-1.6 us on each CPU, and `blkload`'s random reads 26768
-IOPS at qd=1, 180610 at qd=8. The longest wait of each run there, 5-7 ms,
+3.0 for the share. What it costs a machine at rest is about what the round
+robin did: a decision 1.2-1.6 us on each CPU, where the round robin's took
+1.5, and `blkload`'s random reads 26768 IOPS at qd=1, 180610 at qd=8. Under
+HVF, the three measured side by side at rest, a decision costs 1.0 us, the
+round robin's 0.74 and the run queue's before EEVDF 0.66: V and every
+eligibility are reckoned from scratch, two to four times a decision. The longest wait of each run there, 5-7 ms,
 comes with no spinner at all, as it did with the round robin: it is not the
 queue's.
 
