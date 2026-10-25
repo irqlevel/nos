@@ -66,7 +66,16 @@ void Cpu::Idle()
        path); safe here because interrupts are enabled. */
     GetTaskQueue().ReapExited();
 
+    /* The last resort from here until it wakes: an interrupt that finds
+       something else to run switches to it and leaves this task in its
+       place, rather than in the turns (Task::SetIdling). Not before the
+       reap, whose frees may wait for other CPUs. */
+    Task* self = Task::TryGetCurrentTask();
+    if (self != nullptr)
+        self->SetIdling(true);
     Hlt();
+    if (self != nullptr)
+        self->SetIdling(false);
 }
 
 ulong Cpu::GetState()

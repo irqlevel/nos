@@ -283,6 +283,18 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    if (!Test::TestWakeStorm())
+    {
+        Panic("Wake storm test failed");
+        return;
+    }
+
+    if (!Test::TestIdleTakesTurns())
+    {
+        Panic("Idle task turn test failed");
+        return;
+    }
+
     Trace(0, "After test");
     Ubsan::Announce();
 
