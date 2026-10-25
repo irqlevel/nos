@@ -162,7 +162,15 @@ also read what is typed while it runs: the session hands it the channel's
 data raw, as the keys are pressed, and flushes what it has printed before
 each wait, a prompt with no line end included. `hv attach` is one such command: the console of a
 guest, typed at through `ssh -t`. What a command does not read is the line
-editor's once it returns. And there is one user: whatever name the client
+editor's once it returns. A command may ask for the terminal too
+(`Output::terminal`): the width and height the client gave in its pty-req and
+in each window-change since -- taken in as the session tends the connection,
+so a resize reaches the command while it runs -- and how many window-changes
+there have been, which a command that draws on the terminal goes by to draw
+it again whole: a terminal made smaller and then as large again between two
+looks has the size it had, and not the screen. `edit` is that command
+([edit](modules.md#edit)). Without a terminal -- `ssh host cmd`, no `-t` --
+there is none to ask for. And there is one user: whatever name the client
 gives, a key in the list logs in, and what it can do is what the console
 can.
 

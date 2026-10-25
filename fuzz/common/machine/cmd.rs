@@ -62,6 +62,7 @@ pub fn unregister(handle: usize) {
 struct Printer {
     sink: ffi::cmd::CmdSink,
     source: Option<ffi::cmd::CmdSource>,
+    terminal: Option<ffi::cmd::CmdTerminalOf>,
     ctx: usize,
 }
 
@@ -89,10 +90,26 @@ pub fn printer_read(out: usize, buf: &mut [u8], timeout_ns: u64) -> isize {
     }
 }
 
+/// The terminal of the session the printer's command runs in, as the session
+/// says: none from the console or the UDP shell.
+pub fn printer_terminal(out: usize) -> Option<ffi::cmd::CmdTerminal> {
+    // SAFETY: as in `printer_write`.
+    let p = unsafe { &*(out as *const Printer) };
+    let terminal = p.terminal?;
+    let mut t = ffi::cmd::CmdTerminal::default();
+    // SAFETY: the dispatcher's function and its context, alive for the call;
+    // `t` is a local.
+    let known = sched::kernel(|| unsafe { terminal(p.ctx as *mut core::ffi::c_void, &mut t) });
+    known.then_some(t)
+}
+
 /// Runs a command line: its first word the command, the rest its
 /// arguments, as cmd.cpp splits it.
-pub fn dispatch(line: &[u8], sink: ffi::cmd::CmdSink, source: Option<ffi::cmd::CmdSource>, ctx: usize) {
-    let printer = Printer { sink, source, ctx };
+pub fn dispatch(
+    line: &[u8], sink: ffi::cmd::CmdSink, source: Option<ffi::cmd::CmdSource>,
+    terminal: Option<ffi::cmd::CmdTerminalOf>, ctx: usize,
+) {
+    let printer = Printer { sink, source, terminal, ctx };
     let out = &printer as *const Printer as usize;
     let text = String::from_utf8_lossy(line).into_owned();
     let trimmed = text.trim_start();
@@ -135,7 +152,7 @@ pub fn run(line: &str) -> String {
         sched::harness(|| out.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(bytes));
     }
     let out: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-    dispatch(line.as_bytes(), sink, None, &out as *const Mutex<Vec<u8>> as usize);
+    dispatch(line.as_bytes(), sink, None, None, &out as *const Mutex<Vec<u8>> as usize);
     let bytes = out.into_inner().unwrap_or_else(|e| e.into_inner());
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -173,6 +190,12 @@ fn builtin(name: &str, args: &str, out: usize) {
             sched::harness(|| sched::sleep_ns(ms * 1_000_000));
             say(b"awake\n");
         }
+        /* What the session told it of its terminal: a command that draws
+         * on one, as `edit` does. */
+        "term" => match printer_terminal(out) {
+            Some(t) => say(format!("term {} {} {}\n", t.cols, t.rows, t.changes).as_bytes()),
+            None => say(b"term none\n"),
+        },
         /* What is typed at it, back, until it has had `n` bytes or nothing
          * more comes: a command that reads, as `hv attach` does. */
         "type" => {

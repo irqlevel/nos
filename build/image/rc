@@ -3,6 +3,8 @@
 #
 # sshd makes its host key on the first start and keeps it in
 # /etc/ssh/ssh_host_ed25519_key; it lets in the keys in
-# /etc/ssh/authorized_keys (nos-install --ssh-key).
+# /etc/ssh/authorized_keys (nos-install --ssh-key). edit is the text
+# editor, for an ssh session with a terminal: edit /etc/rc.
 insmod /lib/modules/sshd.ko
 sshd start
+insmod /lib/modules/edit.ko
