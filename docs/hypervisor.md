@@ -2140,7 +2140,11 @@ silence -- or hold less than the download and the disk at once on nos's
 root while it converts. `scripts/hv-test.py` (x86-64) makes VMs so from a
 web server of the test's own, and `scripts/hv-distro-test.py --create
 <url>` makes and boots one, cloud-init provisioned by the seed
-([Testing](testing.md)).
+([Testing](testing.md)): Debian 13's genericcloud image, fetched by nos
+itself through Debian's redirect, booted by hvboot off its own /boot, its
+root grown into the 4 GiB disk, and cloud-init done from `DataSourceNoCloud
+[seed=/dev/vdb]` 50 s after the VM started -- its user logged in with the
+seed's password, nos's key in its authorized_keys.
 
 ### Where the folders are
 
