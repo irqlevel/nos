@@ -70,10 +70,12 @@ public:
     typedef void (*SinkFn)(void* ctx, const unsigned char* buf, unsigned long len);
     typedef long (*SourceFn)(void* ctx, unsigned char* buf, unsigned long len,
         unsigned long long timeoutNs);
+    typedef bool (*TerminalFn)(void* ctx, Stdlib::TerminalInfo* info);
 
-    SinkPrinter(SinkFn fn, SourceFn src, void* ctx, unsigned char* buf, unsigned long size)
+    SinkPrinter(SinkFn fn, SourceFn src, TerminalFn term, void* ctx, unsigned char* buf, unsigned long size)
         : Fn(fn)
         , Src(src)
+        , Term(term)
         , Ctx(ctx)
         , Buf(buf)
         , Size(size)
@@ -121,6 +123,16 @@ public:
 
         Flush();
         return Src(Ctx, buf, len, timeoutNs);
+    }
+
+    /* From the session's own, for a command that asks: the session keeps
+       it under a lock that sleeps, so not where the caller may not */
+    virtual bool Terminal(Stdlib::TerminalInfo& info) override
+    {
+        if (Term == nullptr || !Kernel::PreemptCanBlock())
+            return false;
+
+        return Term(Ctx, &info);
     }
 
     /* The command has returned: what is left goes, and what was lost is
@@ -184,6 +196,7 @@ private:
 
     SinkFn Fn;
     SourceFn Src;
+    TerminalFn Term;
     void* Ctx;
     unsigned char* Buf;
     unsigned long Size;
@@ -1625,10 +1638,11 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
 /* kernel_cmd_dispatch and kernel_cmd_dispatch_io: a command line run as the
    console would run it, what it prints handed to sink(ctx, ...) as
    SinkPrinter passes it on, and -- given a source -- what is typed while it
-   runs read from source(ctx, ...). Sleeps as long as the command runs: task
-   context only, with no lock held. */
+   runs read from source(ctx, ...), and the terminal it is typed at from
+   term(ctx, ...). Sleeps as long as the command runs: task context only,
+   with no lock held. */
 static void DispatchTo(const unsigned char* line, unsigned long len,
-    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, void* ctx)
+    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, SinkPrinter::TerminalFn term, void* ctx)
 {
     if (line == nullptr || sink == nullptr)
         return;
@@ -1655,7 +1669,7 @@ static void DispatchTo(const unsigned char* line, unsigned long len,
     Stdlib::MemCpy(cmd, line, len);
     cmd[len] = '\0';
 
-    SinkPrinter out(sink, source, ctx, buf, SinkBufferSize);
+    SinkPrinter out(sink, source, term, ctx, buf, SinkBufferSize);
     Kernel::Cmd::Dispatch(cmd, out);
     out.Finish();
     Kernel::Mm::Free(buf);
@@ -1666,15 +1680,16 @@ static void DispatchTo(const unsigned char* line, unsigned long len,
 void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
     SinkPrinter::SinkFn sink, void* ctx)
 {
-    DispatchTo(line, len, sink, nullptr, ctx);
+    DispatchTo(line, len, sink, nullptr, nullptr, ctx);
 }
 
 /* The same with someone to type: an SSH session's command can read what the
-   client types while it runs (kernel_printer_read) */
+   client types while it runs (kernel_printer_read), and ask what terminal
+   it is typed at (kernel_printer_terminal) */
 void kernel_cmd_dispatch_io(const unsigned char* line, unsigned long len,
-    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, void* ctx)
+    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, SinkPrinter::TerminalFn term, void* ctx)
 {
-    DispatchTo(line, len, sink, source, ctx);
+    DispatchTo(line, len, sink, source, term, ctx);
 }
 
 /* What is typed at a command, for one that asks: see Printer::ReadInput */
@@ -1685,6 +1700,16 @@ long kernel_printer_read(void* out, unsigned char* buf, unsigned long len,
         return -1;
 
     return static_cast<Stdlib::Printer*>(out)->ReadInput(buf, len, timeoutNs);
+}
+
+/* The terminal a command is typed at, for one that draws on it: see
+   Printer::Terminal. info is untouched when there is none */
+bool kernel_printer_terminal(void* out, Stdlib::TerminalInfo* info)
+{
+    if (out == nullptr || info == nullptr)
+        return false;
+
+    return static_cast<Stdlib::Printer*>(out)->Terminal(*info);
 }
 
 /* What procfs puts in its files: the kernel's version, the command line it

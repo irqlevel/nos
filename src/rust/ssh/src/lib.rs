@@ -99,6 +99,25 @@ pub trait Io {
     /// channel closed, the client gone, the session failing -- which it
     /// then ends on.
     fn idle(&mut self, timeout_ms: u64) -> bool;
+    /// The client's terminal, for a command that draws on it: `None` when
+    /// the session asked for none (`ssh host cmd`, without `-t`). Its size
+    /// is what the client said last -- in its pty-req, then each
+    /// window-change, as it is taken in by `read` and `idle` -- 0 where it
+    /// said nothing.
+    fn terminal(&self) -> Option<Terminal> {
+        None
+    }
+}
+
+/// A client's terminal, as it last said.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Terminal {
+    pub cols: u32,
+    pub rows: u32,
+    /// How many times it has said its size changed: a terminal made smaller
+    /// and then as large again between two looks has lost what was on its
+    /// screen, which the size alone does not show.
+    pub changes: u32,
 }
 
 /// How a server behaves: the same for all its sessions.
