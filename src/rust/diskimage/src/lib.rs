@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod detect;
 pub mod inflate;
+pub mod iso;
 pub mod qcow2;
 mod sparse;
 

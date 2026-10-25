@@ -58,8 +58,29 @@ pub trait Sink {
     fn length(&mut self, _len: usize) {}
 }
 
-/// What a GET turned out to be. The C++ side declares the same struct.
-#[repr(C)]
+/// Why a request came to nothing: what a `Response` whose `ok` is 0 says
+/// of it, for whoever has to tell someone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    None,
+    /// Not a URL this client fetches, or one -- or a redirect's target --
+    /// longer than MAX_URL_LEN.
+    Url,
+    /// Its host has no address the resolver found.
+    Resolve,
+    /// No connection to it.
+    Connect,
+    /// The TLS handshake was refused: a certificate that did not verify,
+    /// or no protocol in common.
+    Tls,
+    /// The request did not go, or no whole answer to it came back.
+    Answer,
+    /// One redirect too many.
+    Redirects,
+    NoMemory,
+}
+
+/// What a GET turned out to be.
 pub struct Response {
     pub status: i32,
     pub content_length: usize,
@@ -73,13 +94,15 @@ pub struct Response {
     pub tls_failed: u32,
     /// A URL, or a redirect's target, longer than MAX_URL_LEN
     pub url_too_long: u32,
+    /// Why `ok` is 0.
+    pub failure: Failure,
 }
 
 impl Response {
     fn new() -> Response {
         Response {
             status: 0, content_length: 0, body_len: 0,
-            ok: 0, truncated: 0, tls_failed: 0, url_too_long: 0,
+            ok: 0, truncated: 0, tls_failed: 0, url_too_long: 0, failure: Failure::None,
         }
     }
 
@@ -724,6 +747,7 @@ fn exchange(
         Some(parsed) => parsed,
         None => {
             trace!(0, "http: that is not a url this client can fetch");
+            resp.failure = Failure::Url;
             return 0;
         }
     };
@@ -732,6 +756,7 @@ fn exchange(
         Some(ip) => ip,
         None => {
             trace!(0, "http: the host could not be resolved");
+            resp.failure = Failure::Resolve;
             return 0;
         }
     };
@@ -742,6 +767,7 @@ fn exchange(
         Some(conn) => conn,
         None => {
             trace!(0, "http: the connection could not be made");
+            resp.failure = Failure::Connect;
             return 0;
         }
     };
@@ -757,6 +783,7 @@ fn exchange(
             None => {
                 trace!(0, "http: the tls handshake was refused");
                 resp.tls_failed = 1;
+                resp.failure = Failure::Tls;
                 TCP.close(conn);
                 return 0;
             }
@@ -769,10 +796,14 @@ fn exchange(
     if send_request(&mut transport, &parsed) {
         match recv_response(&mut transport, sink, resp, location) {
             Some(len) => redirect_len = len,
-            None => trace!(0, "http: no answer to the request"),
+            None => {
+                trace!(0, "http: no answer to the request");
+                resp.failure = Failure::Answer;
+            }
         }
     } else {
         trace!(0, "http: the request could not be sent");
+        resp.failure = Failure::Answer;
     }
 
     /* The session says goodbye before the connection under it goes. */
@@ -792,6 +823,7 @@ pub fn get_with_location(
     if url.is_empty() || url.len() >= MAX_URL_LEN {
         trace!(0, "http: a url longer than {} characters", MAX_URL_LEN - 1);
         resp.url_too_long = 1;
+        resp.failure = Failure::Url;
         return resp;
     }
 
@@ -820,6 +852,7 @@ pub fn get_with_location(
         if attempt == MAX_REDIRECTS {
             trace!(0, "http: too many redirects");
             resp = Response::new();
+            resp.failure = Failure::Redirects;
             break;
         }
 

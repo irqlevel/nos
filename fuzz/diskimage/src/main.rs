@@ -20,6 +20,12 @@
 //! <crc32 of the output>` or `fault <what>`, for the script to hold to
 //! zlib's.
 //!
+//!     diskimage-test iso <out.iso> <label> <name>=<file>...
+//!
+//! makes the ISO 9660 image `hv create` gives cloud-init (`diskimage::iso`)
+//! of those files, for the script to read back with xorriso, bsdtar, blkid
+//! and Linux's isofs.
+//!
 //!     diskimage-test fuzz <image> [--seed N] [--iterations N] [--slow-ms N]
 //!
 //! converts the image with bytes of its header, its tables and its clusters
@@ -202,6 +208,45 @@ fn convert(from: &str, to: &str) -> i32 {
                     3
                 }
             }
+        }
+    }
+}
+
+/* ---- iso ---- */
+
+/// `iso <out> <label> <name>=<file>...`: the image of those files.
+fn iso(out: &str, label: &str, specs: &[String]) -> i32 {
+    let mut named = Vec::new();
+    for spec in specs {
+        let Some((name, path)) = spec.split_once('=') else {
+            println!("error: {} is not <name>=<file>", spec);
+            return 3;
+        };
+        match std::fs::read(path) {
+            Ok(data) => named.push((name.to_string(), data)),
+            Err(e) => {
+                println!("error: {}: {}", path, e);
+                return 3;
+            }
+        }
+    }
+    let files: Vec<diskimage::iso::File> =
+        named.iter().map(|(name, data)| diskimage::iso::File { name, data }).collect();
+    let when = diskimage::iso::When { year: 2026, month: 10, day: 25, hour: 12, minute: 0, second: 0 };
+    match diskimage::iso::image(label, &files, when) {
+        Ok(img) => match std::fs::write(out, &img) {
+            Ok(()) => {
+                println!("ok {} bytes", img.len());
+                0
+            }
+            Err(e) => {
+                println!("error: {}: {}", out, e);
+                3
+            }
+        },
+        Err(e) => {
+            println!("refused: {}", e);
+            2
         }
     }
 }
@@ -495,12 +540,14 @@ fn main() {
     let code = match args.get(1).map(String::as_str) {
         Some("convert") if args.len() == 4 => convert(&args[2], &args[3]),
         Some("inflate") if args.len() == 4 => inflate(&args[2], &args[3]),
+        Some("iso") if args.len() >= 4 => iso(&args[2], &args[3], &args[4..]),
         Some("fuzz") if args.len() >= 3 => {
             fuzz(&args[2], flag("--seed", 1), flag("--iterations", 1000), u128::from(flag("--slow-ms", 5000)))
         }
         _ => {
             eprintln!("usage: diskimage-test convert <image> <disk.raw>\n       diskimage-test inflate <cases> <answers>\n       \
-                       diskimage-test fuzz <image> [--seed N] [--iterations N] [--slow-ms N]");
+                       diskimage-test fuzz <image> [--seed N] [--iterations N] [--slow-ms N]\n       \
+                       diskimage-test iso <out.iso> <label> <name>=<file>...");
             3
         }
     };

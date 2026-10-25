@@ -4,8 +4,9 @@
 //! There used to be fifty more of those names here: one per call a C++ view
 //! of the layer made. The views are gone and so are they. What is left is
 //! what C++ genuinely still calls -- the tracer and the panic path into
-//! netconsole, boot into TCP -- and the TCP calls a loadable module binds by
-//! name, which have to be a C ABI because a module is linked on its own.
+//! netconsole, boot into TCP -- and the TCP calls and the HTTP download a
+//! loadable module binds by name, which have to be a C ABI because a module
+//! is linked on its own.
 
 use alloc::boxed::Box;
 use crate::nic::Nic;
@@ -242,6 +243,49 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
     match TCP.connect(&nic, ip, port, 0, Receive::Small) {
         Some(conn) => conn as *const Conn as ConnPtr,
         None => core::ptr::null_mut(),
+    }
+}
+
+/// A download, for a module: what `url` answers with, by HTTP or HTTPS, in a
+/// new file at `path`, through the image's own client -- TLS, and the bulk
+/// receive window `kernel_tcp_connect` does not give -- its progress printed
+/// on `out` (`wget::fetch`). The body's length, or an `HTTP_FETCH_` code.
+///
+/// # Safety
+/// `url` and `path` point at `url_len` and `path_len` bytes, and `out` is
+/// the printer a command handler or a module's init was given, live for the
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_http_fetch(
+    url: *const u8, url_len: usize, path: *const u8, path_len: usize, out: *mut core::ffi::c_void,
+) -> i64 {
+    use ffi::http::*;
+    use crate::wget::Fetch;
+
+    if url.is_null() || path.is_null() || out.is_null() {
+        return HTTP_FETCH_URL;
+    }
+    let url = unsafe { core::slice::from_raw_parts(url, url_len) };
+    let path = unsafe { core::slice::from_raw_parts(path, path_len) };
+    let (Ok(url), Ok(path)) = (core::str::from_utf8(url), core::str::from_utf8(path)) else {
+        return HTTP_FETCH_URL;
+    };
+    let mut out = unsafe { kcore::cmd::Output::from_raw(out) };
+    match crate::wget::fetch(url, path, "download", &mut out) {
+        Ok(len) => i64::try_from(len).unwrap_or(i64::MAX),
+        Err(Fetch::Url) => HTTP_FETCH_URL,
+        Err(Fetch::Resolve) => HTTP_FETCH_RESOLVE,
+        Err(Fetch::Connect) => HTTP_FETCH_CONNECT,
+        Err(Fetch::Tls) => HTTP_FETCH_TLS,
+        Err(Fetch::Answer) => HTTP_FETCH_ANSWER,
+        Err(Fetch::Redirects) => HTTP_FETCH_REDIRECTS,
+        Err(Fetch::NoMemory) => HTTP_FETCH_NO_MEMORY,
+        Err(Fetch::NoDevice) => HTTP_FETCH_NO_DEVICE,
+        Err(Fetch::Exists) => HTTP_FETCH_EXISTS,
+        Err(Fetch::Create) => HTTP_FETCH_CREATE,
+        Err(Fetch::Write) => HTTP_FETCH_WRITE,
+        Err(Fetch::Cut) => HTTP_FETCH_CUT,
+        Err(Fetch::Status(status)) => HTTP_FETCH_STATUS - i64::from(status),
     }
 }
 

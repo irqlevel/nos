@@ -13,6 +13,7 @@ pub mod time;
 pub mod sync;
 pub mod task;
 pub mod tcp;
+pub mod http;
 pub mod io;
 pub mod dma;
 pub mod frame;

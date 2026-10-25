@@ -22,6 +22,7 @@ pub mod block;
 pub mod disklog;
 pub mod net;
 pub mod tcp;
+pub mod http;
 pub mod acpi;
 pub mod cmd;
 pub mod fs;

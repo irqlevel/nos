@@ -2082,6 +2082,66 @@ the files it names are not there yet. `hv start /some/where/web` boots a
 folder anywhere by its path, the folder's name the VM's. `hv vms` lists the
 folders under `/vms`, what each boots, and which run.
 
+### A VM of a cloud's image
+
+`hv create <name> <url>` makes the folder of a distribution's cloud image
+(`modules/hv/src/cloud.rs`), for `hv start <name>` to boot it as a cloud
+does -- with nothing done anywhere but on nos:
+
+```
+$ hv create noble https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img size=20G mem=2048 cpus=2 forward=2201:22
+hv: https://cloud-images.ubuntu.com/... -- into /vms/noble/ubuntu-24.04-server-cloudimg-amd64.img
+download: ... MiB of 592 MiB, ...%, ... MiB/s
+hv: /vms/noble/ubuntu-24.04-server-cloudimg-amd64.img: qcow2 version 3, a disk of 3584 MiB in clusters of 64 KiB -- into /vms/noble/disk.raw
+hv: /vms/noble/disk.raw: 1785 MiB written of 3584 MiB, the rest holes -- 27971 clusters inflated, 692 copied, 0 zeros, 28681 not there -- in ... s
+hv: /vms/noble/vm.toml written -- hv start noble boots it: hvboot, a 20480 MiB disk, cloud-init given 1 key
+$ hv start noble
+```
+
+- **The image** is fetched by the kernel's own HTTP client -- the one
+  `wget` is -- through `kcore::http::fetch` (the export
+  `kernel_http_fetch`, since a module cannot link the network layer): TLS
+  with the certificate checked, redirects followed, and the bulk receive
+  window a download of gigabytes needs, which a module's own TCP
+  connection is not given. Only a 2xx answer is a body -- "the server
+  answered 404" otherwise -- a body cut short is no image, and a file there
+  already is not written over; a failed download leaves no file.
+- **The disk**: a qcow2 image is converted ([A disk from a cloud's
+  image](#a-disk-from-a-clouds-image)) and the download removed; a raw one
+  is taken as it is; anything else is refused by what it is. `size=` (K,
+  M, G, T) grows it with a hole -- never under what the image holds -- for
+  the guest to grow its root into: cloud-init's growpart does, on its first
+  boot.
+- **The seed**: `seed.iso`, the VM's second disk, read-only -- an ISO 9660
+  labelled `cidata` with Rock Ridge's names (`diskimage::iso`), which
+  cloud-init's NoCloud finds by its label. Its meta-data names the machine
+  after the VM, with an instance-id of its own (`nos-<name>-<time>`), so
+  that cloud-init takes it for a new machine; its user-data gives the
+  image's own user -- `ubuntu`, `debian` -- the keys nos's sshd lets in
+  (`/etc/ssh/authorized_keys`), and with `password=` a password, for its
+  console. Every string in it is YAML's double-quoted, so that a key's
+  comment is never read as YAML.
+- **The vm.toml**, written last: hvboot as its kernel (`/lib/hvboot`, the
+  system image's, or `hvboot=`), which boots the kernel the image's own
+  GRUB would ([A guest's own kernel](#a-guests-own-kernel-pvh-and-hvboot));
+  `disks = ["disk.raw", "seed.iso:ro"]`, a `disk=` given after them; on
+  the switch; booted again when it reboots itself; 1024 MiB unless `mem=`
+  says otherwise. The other words are `hv start`'s, but a kernel and an
+  initrd: `cpus=`, `port=`, `forward=` -- `forward=2201:22` for its own
+  sshd -- `cmdline=`, which hvboot puts after the entry's own line.
+- **Nothing is left of a failure**: what the command made -- the download,
+  the disk, the seed, and the folder when it made that too -- goes, and
+  why it failed is said.
+
+What it does not do yet: check the image against its distribution's
+`SHA256SUMS` (TLS's certificate is what vouches for the bytes now), resume
+a download that broke off -- the client gives up after ten seconds of
+silence -- or hold less than the download and the disk at once on nos's
+root while it converts. `scripts/hv-test.py` (x86-64) makes VMs so from a
+web server of the test's own, and `scripts/hv-distro-test.py --create
+<url>` makes and boots one, cloud-init provisioned by the seed
+([Testing](testing.md)).
+
 ### Where the folders are
 
 `/vms`, unless `insmod` says otherwise: `insmod /hv.ko vms=/data/vms` keeps

@@ -125,8 +125,8 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry; on both, `hv convert` |
-| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, and `hv create` of VMs from a web server's images; on both, `hv convert` |
+| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
@@ -134,7 +134,7 @@ swallowing panic messages whole.
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
 
@@ -1372,7 +1372,16 @@ qcow2 images qemu-img made of a disk the test makes -- compressed, version
 to the disk by the SHA-256 `sha256` prints; a second conversion over the
 first refused; an image cut short refused as one, with nothing of it left
 behind; a disk that is raw already refused, saying so. The host needs
-qemu-img for it.
+qemu-img for it. And on x86-64, whose nos it gives a NIC on QEMU's user
+network for it, `hv create <name> <url>`
+([A VM of a cloud's image](hypervisor.md#a-vm-of-a-clouds-image)) from a web
+server of the test's own at 10.0.2.2: the compressed image downloaded,
+made a disk, grown to `size=` -- the disk held to the image's grown with
+zeros by its SHA-256 -- its folder holding the disk, the seed and a
+vm.toml that boots it by hvboot, the download gone; a raw image taken as it
+is; and a name that has a vm.toml, a URL with nothing at it (404), a file
+that is no image and a `size=` under the image's each refused, the last
+three leaving no folder behind.
 
 ### `hvboot-test.py` -- what hvboot would boot, decided on the host
 
@@ -1615,6 +1624,16 @@ host program, and the gate holds it to QEMU's own reading:
   only their compressed data changed, converted by qemu-img too -- the two
   must give the same answer every time, and where both convert one, the
   same disk.
+
+And the seed `hv create` gives cloud-init (`diskimage/src/iso.rs`): ISO 9660
+images of a cloud-init seed, of an empty file beside names alike in 8.3,
+and of eight files of 1 MiB in all, each read back by Rock Ridge's names
+-- by xorriso, or libarchive's bsdtar where there is no xorriso -- every
+byte its own, labelled `cidata`; where there is blkid, `LABEL=cidata
+TYPE=iso9660`, which is what cloud-init looks for; and where the host lets
+the script mount (Linux, root or sudo), Linux's isofs reading every file
+by its name. A label or a name it may not have, two files of one name,
+nine files and more than 1 MiB are refused.
 
 `--image <qcow2>` converts a distribution's image and holds it to `qemu-img
 compare`, writing no second copy: Ubuntu 24.04's, serial 20261017, was
@@ -1984,6 +2003,24 @@ one must come online; with `--ioapic` too, an IO-APIC, and the serial
 console's interrupts -- the getty's, the shell's -- must have come through
 its pin 4 ([The IO-APIC](hypervisor.md#the-io-apic)): a distribution's own
 kernel, not one built for the gate, routing by it.
+
+`--create <url>` is a VM the way a cloud makes one, with nothing done on the
+host: `hv create cloud <url> size=4G password=...` has nos fetch the image
+itself, over HTTPS and through its redirects, make it the disk and grow it,
+write cloud-init's seed -- the key the test put in nos's
+`/etc/ssh/authorized_keys`, the password -- and the vm.toml
+([A VM of a cloud's image](hypervisor.md#a-vm-of-a-clouds-image)); `hv start
+cloud` boots it by hvboot. cloud-init must print that it finished; the
+image's own user (`debian`, `ubuntu`) logs in on the console with the seed's
+password; `cloud-init status --long` says done, from NoCloud; the machine
+is named `cloud`; the user's authorized_keys has nos's key; the disk is the
+size create grew it to and the root grew into it; the seed is a disk
+labelled `cidata`; the user may sudo; and `hv stop`'s power button turns it
+off. Debian's genericcloud image is the small one to run it with:
+
+```sh
+scripts/hv-distro-test.py --create https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+```
 
 ## The hardware NIC drivers
 

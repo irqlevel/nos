@@ -32,6 +32,12 @@ impl Output {
         Self { printer }
     }
 
+    /// The printer, for a call that prints on it from the kernel's side
+    /// (`http::fetch`): live as long as this is.
+    pub(crate) fn raw(&mut self) -> *mut c_void {
+        self.printer
+    }
+
     /// Bytes as they are, for output that is not text -- a file `cat` prints,
     /// which is whatever was written to it.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
