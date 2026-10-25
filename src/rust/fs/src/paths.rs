@@ -53,6 +53,19 @@ impl Path {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Back to the first `len` bytes: the directory a walk returns to, by
+    /// the length `len` gave there. A cut that is no shorter, or that would
+    /// fall inside a character, leaves the path as it is.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len && self.as_str().is_char_boundary(len) {
+            self.len = len;
+        }
+    }
 }
 
 /// The name after the last slash: what a copy into a directory is called.

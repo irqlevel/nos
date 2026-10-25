@@ -1,5 +1,5 @@
 //! The shell's storage commands -- what the console, the UDP shell and an
-//! SSH session run: `mount`, `umount`, `format`, `ls`, `cat`, `write`,
+//! SSH session run: `mount`, `umount`, `format`, `ls`, `find`, `cat`, `write`,
 //! `append`, `mkdir`, `touch`, `cp -r`, `rm`, `mv`, `stat`, `truncate`,
 //! `sync`, `fstest`, `disks`, `partitions`, `diskread`, `diskwrite`, `disklog` --
 //! with arguments of every kind, over a ramfs root and an ext2 and a nanofs
@@ -49,8 +49,11 @@ fn text(r: &mut Input) -> String {
 /// A command line of the shell's, arguments and all.
 fn line(r: &mut Input) -> String {
     let p = path(r);
-    match r.u8() % 23 {
+    match r.u8() % 24 {
         21 => format!("truncate {} {}", p, truncate_size(r)),
+        22 => format!("find {} {}", p, r.pick(&["", "-xdev", "-type d", "-name f*", "-mindepth 1 -maxdepth 2", "-empty",
+                                                "-size +1K -o -type d", "-xdev -path /e*", "! ( -name a -o -iname B )",
+                                                "-name", "( -type f", "/n -name x"])),
         0 => format!("ls {}", p),
         1 => format!("cat {}", p),
         2 => format!("write {} {}", p, text(r)),
