@@ -1508,6 +1508,65 @@ nos's root judged by `e2fsck`, and the image, taken back out of it, judged
 too and holding what the guest wrote. It needs a guest kernel with PCI,
 legacy virtio-pci, virtio-blk and ext4.
 
+## A disk from a cloud's image
+
+A cloud image comes as QEMU's qcow2 -- Ubuntu's
+`ubuntu-24.04-server-cloudimg-amd64.img`, Debian's `genericcloud`,
+Fedora's -- and a guest's disk here is a raw file. `hv convert <image>
+<disk>` makes the one the other (`modules/hv/src/image.rs`, over the
+`diskimage` crate, which has no kernel in it):
+
+```
+$ hv convert /img.qcow2 /img.raw
+hv: /img.qcow2: qcow2 version 3, a disk of 7 MiB in clusters of 64 KiB -- into /img.raw
+hv: /img.raw: 2 MiB written of 7 MiB, the rest holes -- 34 clusters inflated, 8 copied, 0 zeros, 55 not there -- in 0.0 s
+```
+
+-- a progress line every few seconds on a big one, as wget's. Ubuntu 24.04's
+image (serial 20261017, its SHA-256 the one `SHA256SUMS` gives) converts, by
+the same code on the host, to a disk `qemu-img compare` calls identical.
+
+**The holes are kept.** The disk is a new file, grown to the image's size
+with a hole (`File::set_len`), and only its blocks that are not all zeros
+are written: Ubuntu's 3.5 GiB disk costs the 1.7 GiB it holds, and grows as
+its guest writes. `truncate` it bigger, for a guest to grow its root into
+(cloud-init's growpart does): hvboot reads the image's GPT from its primary
+header, wherever the disk ends.
+
+**What it reads**: versions 2 and 3; clusters of 512 bytes to 2 MiB;
+clusters stored whole, compressed by zlib -- 27,971 of the 28,663 that
+Ubuntu's image has data in -- all zeros, or not there; and extended L2 entries, their
+subclusters each of those. A compressed cluster is inflated by a DEFLATE
+decoder of the crate's own (`diskimage/src/inflate.rs`) whose every rule is
+zlib's, checked in zlib's order -- what it needs of a stream's bits before it
+calls a code bad included: QEMU reads those clusters through zlib, so a
+cluster QEMU reads must give its bytes here and one QEMU refuses must be
+refused. Internal snapshots are left out: the disk is the image as it is
+now.
+
+**What it refuses, saying why**: an overlay on a backing file, which it does
+not contain; encryption, AES or LUKS; an external data file; zstd
+compression; an image QEMU marked corrupt; features it does not know; a disk
+that is there already, which is not written over; and a file that is no
+qcow2 -- by what it is: a raw disk is given to a guest as it is, an ISO
+read-only, a gzip or xz stream is unpacked first, a VMDK, VHD, VHDX or VDI
+is converted elsewhere. A conversion that fails leaves no disk behind.
+
+**The image is a download, and untrusted.** Its every offset is held to the
+format's alignment and to the file, every table to the bounds QEMU puts on
+it, and nothing it says makes the converter read, write or hold more than
+64 KiB at once, whatever its cluster size -- a 2 MiB cluster is never one
+allocation. QEMU reads past a file's end as zeros; here a table or a cluster
+that *starts* past it, and a compressed one that runs past its last sector
+and does not decode, are refused, asking "is the image whole?": what has
+them is a download cut short, and a disk of zeros where its data should be
+is a failure nobody would hear of. Its gate is `scripts/diskimage-test.py`
+(host, in CI): images qemu-img and qemu-io write, of every version, cluster
+size and kind, converted and held byte for byte to what qemu-img reads; the
+refusals; the decoder against zlib over streams made and broken at random;
+and the images' metadata fuzzed. `hv-test.py` converts in nos, on both
+architectures, and holds the disk to its SHA-256 ([Testing](testing.md)).
+
 ## A network
 
 `net`, on `hv start`, gives the guest a NIC on the guests' switch, and with

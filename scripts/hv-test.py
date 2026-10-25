@@ -51,6 +51,10 @@ KVM it is whatever the host CPU has):
   - `insmod` given a parameter hv has not got, or a `vms=` that is no
     absolute path, refuses the load and says why; given `vms=<folder>`,
     `hv` and `hv vms` say that folder
+  - `hv convert` makes qcow2 images qemu-img made of a disk made here --
+    compressed, and version 2 -- the disk they were made of, as its SHA-256
+    has it; refuses to write over a disk, an image cut short (leaving
+    nothing behind) and a disk that is raw already (on arm64 too)
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
@@ -60,6 +64,7 @@ its first hundred instructions:
   - the module loads, says so, and refuses to run anything
   - `hv info` reports the exception level and what stage-2 would offer
   - `hv on` and `hv run` are refused rather than attempted
+  - `hv convert`, which needs no guest, does what it does on x86-64
   - it unloads
 
     scripts/hv-test.py [--arch x86_64|aarch64] [--tcg] [--keep]
@@ -68,9 +73,11 @@ Exit code 0 = every check passed.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
@@ -88,6 +95,27 @@ SHELL_PORT = pt.SHELL_PORT
 CPUS = 4
 ALL_CPUS = "0-%d" % (CPUS - 1)
 ALL_MASK = "0x%x" % ((1 << CPUS) - 1)
+
+# What `hv convert` is asked, with hv loaded -- on x86-64 from the boot
+# script, on arm64 one at a time -- and what each must answer: images
+# qemu-img made of a disk made here (convert_images), converted on nos's own
+# ext2 and held to the disk by its SHA-256; a second conversion over the
+# first refused; an image cut short refused and nothing left of it; a disk
+# that is raw already refused, saying so; and the usage.
+CONVERT = [
+    "hv convert /img.qcow2 /img.raw",
+    "sha256 /img.raw",
+    "hv convert /img.qcow2 /img.raw",
+    "hv convert /v2.qcow2 /v2.raw",
+    "sha256 /v2.raw",
+    "hv convert /cut.qcow2 /cut.raw",
+    "ls /",
+    "hv convert /disk.raw /disk2.raw",
+    "hv convert",
+]
+# The disk the images are of: not a whole number of clusters, its last
+# sector written.
+CONVERT_SIZE = 6 * 1024 * 1024 + 3 * 512
 
 # One line a command, in the order /etc/rc runs them. The test indexes the
 # output by position, so the two lists are one thing.
@@ -132,6 +160,11 @@ SCRIPT = [
     # second CPU waiting for a start-up IPI that never comes.
     "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 34
     "rmmod hv",             # 35
+] + [
+    # `hv convert`, a cloud's qcow2 image made a raw disk (CONVERT, below).
+    "insmod /hv.ko",        # 36
+] + CONVERT + [
+    "rmmod hv",             # 36 + len(CONVERT) + 1
 ]
 
 # hvboot, as `make` builds it: the PVH image the script boots.
@@ -230,12 +263,71 @@ def module(arch):
     return ko
 
 
+def convert_images(tmp, rootdir):
+    """What `hv convert` is given, in the root: qcow2 images qemu-img made of
+    a disk made here -- compressed, version 3, clusters of 64 KiB; and
+    version 2, of 4 KiB, stored -- the first cut short two thirds into its
+    data, and a disk that is raw already. The disk's SHA-256: what `sha256`
+    must print of each conversion."""
+    if shutil.which("qemu-img") is None:
+        sys.exit("hv-test needs qemu-img (QEMU's, beside qemu-system-*) for the hv convert checks")
+    rng = random.Random(7)
+    disk = os.path.join(tmp, "convert.raw")
+    with open(disk, "wb") as f:
+        f.truncate(CONVERT_SIZE)
+        for _ in range(24):
+            at = rng.randrange(CONVERT_SIZE)
+            n = min(rng.choice([1, 512, 4096, 65536, 100000, rng.randrange(1, 300000)]), CONVERT_SIZE - at)
+            f.seek(at)
+            f.write(rng.randbytes(n) if rng.random() < 0.5 else (b"nos hv convert " * (n // 15 + 1))[:n])
+        f.seek(CONVERT_SIZE - 512)
+        f.write(rng.randbytes(512))
+    img = os.path.join(rootdir, "img.qcow2")
+    subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", "-c", disk, img], check=True)
+    subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2", "-o", "compat=0.10,cluster_size=4k", disk,
+                    os.path.join(rootdir, "v2.qcow2")], check=True)
+    # Past the L2 table at 0x40000, two thirds into the clusters after it:
+    # clusters start past the cut, whatever the one it lands in holds.
+    cut = os.path.join(rootdir, "cut.qcow2")
+    shutil.copy(img, cut)
+    data = 0x50000
+    os.truncate(cut, data + (os.path.getsize(img) - data) * 2 // 3)
+    with open(os.path.join(rootdir, "disk.raw"), "wb") as f:
+        f.write(bytes(510) + b"\x55\xaa" + bytes(4096))
+    with open(disk, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def convert_checks(out, digest):
+    """What `hv convert` answered to CONVERT, in order."""
+    size_mib = -(-CONVERT_SIZE // (1024 * 1024))
+    m = re.search(r"hv: /img\.raw: \d+ MiB written of %d MiB, the rest holes -- (\d+) clusters inflated" % size_mib,
+                  out[0])
+    pt.check("hv convert: a compressed qcow2 image made a raw disk, its compressed clusters inflated",
+             "qcow2 version 3" in out[0] and m is not None and int(m.group(1)) > 0, out[0])
+    pt.check("and the disk is the one the image was made of, byte for byte (its SHA-256)", digest in out[1],
+             out[1] + "\nwant " + digest)
+    pt.check("a conversion over a disk that is there is refused", "is there already -- not written over" in out[2],
+             out[2])
+    pt.check("a version 2 image of 4 KiB clusters converts", "qcow2 version 2" in out[3] and "MiB written" in out[3],
+             out[3])
+    pt.check("to the same disk", digest in out[4], out[4] + "\nwant " + digest)
+    pt.check("an image cut short is refused, as one", "is the image whole?" in out[5] and "written of" not in out[5],
+             out[5])
+    pt.check("and leaves no disk behind", "cut.raw" not in out[6] and "img.raw" in out[6], out[6])
+    pt.check("a disk that is raw already is refused, saying so", "raw disk" in out[7] and "already" in out[7], out[7])
+    pt.check("and hv convert alone says how it is used", "hv convert <image> <disk>" in out[8], out[8])
+
+
 def rootfs(tmp, arch, rc=None):
     """A root filesystem carrying hv.ko -- and on x86-64 hvboot, the PVH
-    image the script boots -- and an /etc/rc when one is wanted."""
+    image the script boots -- the images `hv convert` is given, and an
+    /etc/rc when one is wanted. The image, and the SHA-256 of the disk the
+    images are of."""
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
     shutil.copy(module(arch), rootdir)
+    digest = convert_images(tmp, rootdir)
     if arch == "x86_64":
         if not os.path.exists(HVBOOT):
             sys.exit("no %s -- make first" % HVBOOT)
@@ -247,7 +339,7 @@ def rootfs(tmp, arch, rc=None):
     image = os.path.join(tmp, "root.img")
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
-    return image
+    return image, digest
 
 
 def blocks(log):
@@ -317,7 +409,7 @@ def x86(args):
 
     tmp = tempfile.mkdtemp(prefix="nos-hv-")
     log = os.path.join(tmp, "serial.log")
-    image = rootfs(tmp, "x86_64", SCRIPT)
+    image, digest = rootfs(tmp, "x86_64", SCRIPT)
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
     print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
@@ -342,9 +434,10 @@ def x86(args):
         if not pt.check("the boot script runs to the end",
                         pt.wait_log(log, "> " + SCRIPT[-1], 200)):
             return
-        # The last command's own output lands after the marker above.
-        pt.wait_log(log, "rc: /etc/rc done", 60)
-        x86_checks(blocks(log))
+        # The last command's own output lands after the marker above -- which
+        # is the first `rmmod hv`'s too: the end of the script is waited for.
+        pt.wait_log(log, "rc: /etc/rc done", 600)
+        x86_checks(blocks(log), digest)
     finally:
         pt.kill(p)
         if args.keep:
@@ -406,7 +499,7 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
 
 
-def x86_checks(ran):
+def x86_checks(ran, digest):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == SCRIPT,
                     "\n".join(c for c, _ in ran)):
         return
@@ -517,13 +610,17 @@ def x86_checks(ran):
                  "hvboot: cannot boot: no virtio disk" in pvh and "the guest powered itself off" in pvh, pvh)
     pt.check("and hv unloads after it", "hv unloaded" in out[35], out[35])
 
+    pt.check("hv loads for hv convert", "hv loaded at" in out[36], out[36])
+    convert_checks(out[37:37 + len(CONVERT)], digest)
+    pt.check("and unloads after it", "hv unloaded" in out[37 + len(CONVERT)], out[37 + len(CONVERT)])
+
 
 def arm64(args):
     """The arm64 boot has a remote shell on its command line, so the checks
     run one command at a time rather than from a script."""
     tmp = tempfile.mkdtemp(prefix="nos-hv-")
     log = os.path.join(tmp, "serial.log")
-    image = rootfs(tmp, "aarch64")
+    image, digest = rootfs(tmp, "aarch64")
 
     hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not args.tcg
     accel = ["-accel", "hvf", "-cpu", "host"] if hvf else ["-accel", "tcg", "-cpu", "cortex-a72"]
@@ -560,6 +657,8 @@ def arm64(args):
         pt.check("hv on is refused rather than attempted", "cannot turn it on" in on, on)
         guests = sh.run("hv run all")
         pt.check("and so is hv run", "no guest can run here" in guests, guests)
+        # What needs no guest runs here as on x86-64: a disk made of an image.
+        convert_checks([sh.run(cmd) for cmd in CONVERT], digest)
 
         pt.check("it unloads", "hv unloaded" in sh.run("rmmod hv"))
         pt.check("and leaves no module behind", "no modules loaded" in sh.run("lsmod"))

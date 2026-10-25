@@ -23,6 +23,7 @@
 //!     hv start /bzImage initrd=/initrd          -- one that runs until stopped
 //!     hv exec 0 uname -a                        -- a line typed at its shell
 //!     hv stop 0        -- its power button pressed: it shuts down, or is stopped
+//!     hv convert /noble.img /noble.raw          -- a cloud's qcow2 image made a raw disk
 //!     hv off
 //!     rmmod hv         -- stops every guest still running first, where it is
 //!
@@ -45,6 +46,7 @@ mod disk;
 mod guest;
 #[cfg(target_arch = "x86_64")]
 mod forward;
+mod image;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(target_arch = "x86_64")]
@@ -67,7 +69,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -116,6 +118,9 @@ hv stop <vm|all> [secs=N]          press its power button and give it secs (30) 
                                    the list -- secs=0 stops it without asking
 hv forward [add <port> <vm> <guest-port> | del <port>]
                                    a port of nos's relayed to a guest's (net guests)
+hv convert <image> <disk>          a qcow2 image -- a cloud's, as QEMU writes them -- made
+                                   the raw disk a guest is given: a new file, its holes
+                                   kept, and removed again if the conversion fails
 ";
 
 /// What the command works on: the machine, and the guests started on it.
@@ -333,6 +338,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "on" => switch(state, words.next(), true, out),
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
+        "convert" => image::command(rest, out),
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]

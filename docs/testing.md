@@ -125,7 +125,8 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry; on both, `hv convert` |
+| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
@@ -1364,7 +1365,14 @@ image ([A guest's own kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot))
 started at its 32-bit entry with paging off -- under VT-x, by unrestricted
 guest -- which has to say it read the start info hv laid out (its RAM, and
 its command line), that it has no disk, and turn the guest off through its
-ACPI.
+ACPI. Last, on both architectures, `hv convert`
+([A disk from a cloud's image](hypervisor.md#a-disk-from-a-clouds-image)):
+qcow2 images qemu-img made of a disk the test makes -- compressed, version
+3, and version 2 of 4 KiB clusters -- converted on nos's own ext2 and held
+to the disk by the SHA-256 `sha256` prints; a second conversion over the
+first refused; an image cut short refused as one, with nothing of it left
+behind; a disk that is raw already refused, saying so. The host needs
+qemu-img for it.
 
 ### `hvboot-test.py` -- what hvboot would boot, decided on the host
 
@@ -1559,6 +1567,58 @@ under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
 half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
+
+### `diskimage-test.py` -- what `hv convert` makes of an image, decided on the host
+
+`hv convert` makes a cloud's qcow2 image the raw disk a guest is given
+([A disk from a cloud's image](hypervisor.md#a-disk-from-a-clouds-image)):
+code in the kernel reading a download. Get a cluster wrong and the guest
+boots a disk with the wrong bytes in it -- a filesystem that fsck finds
+damaged, or that only one file in a thousand is wrong in -- with nothing to
+say so. `fuzz/diskimage` compiles the `diskimage` crate, as it is, into a
+host program, and the gate holds it to QEMU's own reading:
+
+- a disk made here -- zeros, with pieces of random, text and repeated bytes
+  at random places, a byte to hundreds of KiB, its last sector written and
+  its size no whole number of clusters -- made a qcow2 image by qemu-img in
+  every version (2 and 3), every cluster size (512 bytes, 4 KiB, 64 KiB,
+  2 MiB), stored and compressed, and with extended L2 entries; each
+  converted, and the disk held byte for byte to the one it was made of, no
+  more written than its blocks that are not zeros;
+- images qemu-io writes into: zero clusters, discarded ones and a write
+  inside a cluster; an internal snapshot and writes after it; metadata
+  preallocated, in version 3 and in version 2; an image left dirty
+  (`abort` with lazy refcounts), which is said to be; subclusters written,
+  zeroed and discarded -- each converted and held to what `qemu-img
+  compare` reads, its size the image's;
+- what must be refused, and that a refusal leaves no disk behind: an
+  overlay on a backing file, LUKS and AES, zstd, an external data file, a
+  corrupt mark, an incompatible feature it does not know, version 4,
+  clusters of 256 bytes; an image cut short inside a compressed cluster's
+  stream, halfway through its clusters, and before its L2 table, each as
+  "is the image whole?"; a raw disk, an ISO, a gzip stream, a VMDK, VHDX,
+  VDI and VHD; and a disk that is there already, which is not written over;
+- the DEFLATE decoder (`diskimage/src/inflate.rs`) against Python's zlib --
+  the zlib QEMU decodes compressed clusters with: streams zlib makes at
+  every level and strategy, with flushes inside, asked for the bytes they
+  hold, fewer and more; the same with a bit, a byte or the end changed;
+  streams the script writes itself, block by block -- stored, fixed and
+  dynamic, their codes complete, single, empty or broken, repeats before
+  any length or past the end, matches too far back, symbols no stream may
+  hold, the end of block missing; and noise. Each is asked for a number of
+  bytes, as QEMU asks for a cluster, and every answer -- good or bad, and
+  the bytes of every good one -- must be zlib's;
+- each of five images with its header, L1 and L2 tables and clusters
+  changed at random, up to eight bytes at a time, or cut short: no panic
+  (overflow checks on), no read outside the image, no write outside the
+  disk or out of order, every run ending; and the compressed images with
+  only their compressed data changed, converted by qemu-img too -- the two
+  must give the same answer every time, and where both convert one, the
+  same disk.
+
+`--image <qcow2>` converts a distribution's image and holds it to `qemu-img
+compare`, writing no second copy: Ubuntu 24.04's, serial 20261017, was
+identical on 2026-10-25. Needs cargo, qemu-img and qemu-io.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 
