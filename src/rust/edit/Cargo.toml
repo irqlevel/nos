@@ -1,0 +1,13 @@
+[package]
+name = "edit"
+version = "0.1.0"
+edition = "2021"
+
+# A text editor for a terminal, with no kernel in it: the keys a terminal
+# sends in, the file's text, and the screen out as escape sequences. The edit
+# module (modules/edit) runs it in an SSH session; fuzz/edit runs the same
+# code on the host (scripts/edit-test.py). No dependency, and nothing in it
+# is unsafe (`forbid`).
+[lib]
+
+[dependencies]

@@ -269,6 +269,9 @@ pub struct Plan {
     /// Messages of no protocol, sent after the login.
     pub unknown: bool,
     pub global: bool,
+    /// For a command: a terminal asked for first, of the first size, then
+    /// told each of the others in a window-change.
+    pub term: Option<Vec<(u32, u32)>>,
 }
 
 /* ---- the client ---- */
@@ -826,10 +829,18 @@ impl Client {
     }
 
     fn request(&mut self, tcp: &mut Tcp, net: &mut Net, kind: &[u8], extra: &[u8]) {
+        self.request_with(tcp, net, kind, extra, true);
+    }
+
+    fn request_quiet(&mut self, tcp: &mut Tcp, net: &mut Net, kind: &[u8], extra: &[u8]) {
+        self.request_with(tcp, net, kind, extra, false);
+    }
+
+    fn request_with(&mut self, tcp: &mut Tcp, net: &mut Net, kind: &[u8], extra: &[u8], want_reply: bool) {
         let mut m = vec![CHANNEL_REQUEST];
         put_u32(&mut m, self.server_channel.unwrap_or(0));
         put_string(&mut m, kind);
-        m.push(1);
+        m.push(u8::from(want_reply));
         m.extend_from_slice(extra);
         self.send(tcp, net, &m);
     }
@@ -857,6 +868,22 @@ impl Client {
         }
         match self.plan.run.clone() {
             Run::Exec(cmd, _) => {
+                for (i, &(cols, rows)) in self.plan.term.clone().unwrap_or_default().iter().enumerate() {
+                    let mut t = Vec::new();
+                    if i == 0 {
+                        put_string(&mut t, b"xterm");
+                    }
+                    for v in [cols, rows, 0, 0] {
+                        put_u32(&mut t, v);
+                    }
+                    if i == 0 {
+                        put_string(&mut t, b"");
+                        self.request(tcp, net, b"pty-req", &t);
+                    } else {
+                        /* Asks for no answer (RFC 4254 6.7) */
+                        self.request_quiet(tcp, net, b"window-change", &t);
+                    }
+                }
                 let mut e = Vec::new();
                 put_string(&mut e, cmd.as_bytes());
                 self.request(tcp, net, b"exec", &e);

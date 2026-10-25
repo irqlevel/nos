@@ -57,6 +57,29 @@ impl Output {
         };
         usize::try_from(n).ok().map(|n| n.min(buf.len()))
     }
+
+    /// The terminal the person at the other end types at, for a command
+    /// that draws on it: `None` where there is none -- the console, the UDP
+    /// shell, `/etc/rc`, an SSH session without one (`ssh host cmd`, no
+    /// `-t`). Takes a lock: task context, none held.
+    pub fn terminal(&mut self) -> Option<Terminal> {
+        let mut t = cmd::CmdTerminal::default();
+        /* `t` is a local the call fills, and the printer the kernel's */
+        let known = unsafe { cmd::kernel_printer_terminal(self.printer, &mut t) };
+        known.then_some(Terminal { cols: t.cols, rows: t.rows, changes: t.changes })
+    }
+}
+
+/// A terminal, as its client last said: its width in columns and its height
+/// in rows -- 0 where it did not say -- and how many times it has said they
+/// changed. A command that draws on it draws everything again when that
+/// count moves, even to the size it had: a terminal made smaller and then as
+/// large again has lost what was on its screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Terminal {
+    pub cols: u32,
+    pub rows: u32,
+    pub changes: u32,
 }
 
 type Handler = dyn Fn(&str, &mut Output) + Send + Sync;
@@ -118,6 +141,11 @@ pub trait Session {
     /// `Some(0)` when the time passed with nothing, `None` when no more
     /// will come.
     fn read(&mut self, buf: &mut [u8], timeout_ns: u64) -> Option<usize>;
+    /// The terminal typed at, for a command that asks (`Output::terminal`):
+    /// `None` without one.
+    fn terminal(&mut self) -> Option<Terminal> {
+        None
+    }
 }
 
 /// Runs a shell command line as the console would, its output going to
@@ -127,7 +155,9 @@ pub trait Session {
 pub fn dispatch_session(line: &str, session: &mut dyn Session) {
     let mut session = session;
     let ctx = &mut session as *mut &mut dyn Session as *mut c_void;
-    unsafe { cmd::kernel_cmd_dispatch_io(line.as_ptr(), line.len(), session_sink, session_source, ctx) };
+    unsafe {
+        cmd::kernel_cmd_dispatch_io(line.as_ptr(), line.len(), session_sink, session_source, session_terminal, ctx)
+    };
 }
 
 /// # Safety
@@ -147,6 +177,23 @@ unsafe extern "C" fn session_source(ctx: *mut c_void, buf: *mut u8, len: usize, 
     match session.read(buf, timeout_ns) {
         Some(n) => n.min(len) as isize,
         None => -1,
+    }
+}
+
+/// # Safety
+/// As `session_sink`, with `term` a `CmdTerminal` to fill. Called by the
+/// command, on its own task, as the other two are.
+unsafe extern "C" fn session_terminal(ctx: *mut c_void, term: *mut cmd::CmdTerminal) -> bool {
+    if term.is_null() {
+        return false;
+    }
+    let session = unsafe { &mut *(ctx as *mut &mut dyn Session) };
+    match session.terminal() {
+        Some(t) => {
+            unsafe { term.write(cmd::CmdTerminal { cols: t.cols, rows: t.rows, changes: t.changes }) };
+            true
+        }
+        None => false,
     }
 }
 

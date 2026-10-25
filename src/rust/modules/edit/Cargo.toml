@@ -1,0 +1,13 @@
+[package]
+name = "mod-edit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_edit"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }
+edit = { path = "../../edit" }
