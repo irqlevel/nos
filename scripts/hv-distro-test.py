@@ -739,9 +739,10 @@ def create(args):
     stop = "hv stop %s secs=300" % name
     rc = (["insmod /hv.ko", "hv on", make, "ls /vms/" + name, "cat /vms/%s/vm.toml" % name, "hv start " + name]
           + done
-          # cloud-init's lines overwrote the login prompt: a newline for a
-          # fresh one, then the user.
-          + [r"hv send %s \n" % name] + login + checks + [stop, "hv vms", hvl.RC_LAST])
+          # The serial getty's first prompt can come after cloud-init's last
+          # line -- Debian's does -- and what is typed before it opens the
+          # port it throws away: the user only once its prompt is there.
+          + ["hv wait %s secs=%d login:" % (name, WAIT_MAX)] + login + checks + [stop, "hv vms", hvl.RC_LAST])
     boot = argparse.Namespace(bzimage=HVBOOT, initrd=None, root_mib=args.create_root_mib, deadline=args.deadline)
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
             "-netdev", "user,id=net0"]

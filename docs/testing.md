@@ -2022,6 +2022,14 @@ off. Debian's genericcloud image is the small one to run it with:
 scripts/hv-distro-test.py --create https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
 ```
 
+12 of 12 under TCG on the Mac (2026-10-25): the image fetched in 35.5 s
+(9.1 MiB/s), converted in 51.5 s (907 MiB of 3,072 written), and cloud-init
+done 49.9 s after the VM started, from `DataSourceNoCloud [seed=/dev/vdb]`.
+The user is typed only once the serial getty's own prompt is there:
+Debian's comes after cloud-init's last line, and agetty throws away what
+was typed before it opened the port -- the first run lost the user that
+way, and logged in as the password.
+
 ## The hardware NIC drivers
 
 `tcp-test.py` and `netload-test.py` take `--nic igb` (and so does
