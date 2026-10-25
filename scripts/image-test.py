@@ -4,7 +4,10 @@
 What a release image has to do on a server, and that no other test does
 (docs/install.md). nos-install, run as on a server -- under Linux, as root,
 on a block device, from the image mounted -- makes the ext2 nos boots from,
-writes the GRUB entry and arms one boot. The entry, run as grub-mkconfig
+writes the GRUB entry and arms one boot; every file of the image must then
+be on the partition as it is in the image, and an image holding a file
+nos-install does not know where to put must be refused before anything is
+written, rather than poured without it. The entry, run as grub-mkconfig
 runs it, finds that partition by its UUID, takes its menu entries from the
 image there and boots nos once. nos mounts the partition as its root by the
 UUID, runs the image's /etc/rc, whose sshd makes a host key and lets in the
@@ -14,8 +17,9 @@ for. The machine's microcode -- a made-up Intel CPU's, from a made-up
 it to the kernel as the module `ucode`, and the kernel finds it and says why
 it loads nothing under QEMU. The boot after that is the machine's own entry
 again: GRUB cleared the flag. Then nos-install update over what nos has
-written: the kernel and its modules replaced and the old ones kept for a
-rollback, /etc and the host key kept, and the kernel parameters it is given
+written: the kernel, its modules and hvboot replaced -- every file of the
+image there again -- and the old ones kept for a rollback, with their
+VERSION, /etc and the host key kept, and the kernel parameters it is given
 -- the UDP shell -- taken; and status, rollback and uninstall.
 
 The disk: an MBR with a "host" partition holding GRUB as a server's /boot
@@ -116,10 +120,22 @@ unmount_last() {
     umount "${MOUNTS[-1]}"
     unset 'MOUNTS[-1]'
 }
-# nos-install as a server runs it: from the image, mounted
+# nos-install as a server runs it: from the image, mounted -- or from the
+# copy of it IMG_DIR names
 nos_install() {
     NOS_GRUB_D="$T/grub.d" NOS_UPDATE_GRUB=true NOS_ALLOW_ANY_DISK=1 \
-        NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/img/nos-install" "$@"
+        NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/${IMG_DIR:-img}/nos-install" "$@"
+}
+# same_as_image DIR WHEN: every file of the image is in DIR as it is in the
+# image -- nos-install aside, which stays in it -- or the ones that are not
+# are named. Not from nos-install's list of what goes where: a file it leaves
+# out is one that list does not have
+same_as_image() {
+    local f bad=0
+    while IFS= read -r f; do
+        cmp -s "img/$f" "$1/$f" || { echo "$2: not on the partition as in the image: /$f"; bad=1; }
+    done < <(cd img && find . -type f ! -path ./nos-install | sed 's|^\./||' | sort)
+    [ "$bad" = 1 ] || echo "$2: every file of the image"
 }
 mount_at "$IMAGE" img loop,ro
 cp img/VERSION img-version.out
@@ -138,9 +154,23 @@ mount_at "$HOST" host
 mkdir -p host/boot/grub grub.d
 cp -r /usr/lib/grub/i386-pc host/boot/grub/
 
+# An image with a file in it that nos-install does not know is refused,
+# before anything is written
+cp -r img stray
+touch stray/lib/stray
+if IMG_DIR=stray nos_install install "$NOS" --ssh-key id_test.pub > stray.out 2>&1; then
+    echo "stray: installed"
+fi
+cat stray.out
+[ -n "$(blkid -p -o value -s TYPE "$NOS" || true)" ] || echo "stray: the partition is as it was"
+rm -rf stray
+
 nos_install install "$NOS" --ssh-key id_test.pub --boot-once > install.out 2>&1 ||
     { cat install.out; exit 1; }
 cat install.out
+mount_at "$NOS" part ro
+same_as_image part install
+unmount_last
 
 # grub.cfg as grub-mkconfig makes it: the header, the machine's own entry
 # first, then what /etc/grub.d/42_nos prints
@@ -182,8 +212,9 @@ cat update.out
 mount_at "$NOS" part ro
 grub-editenv part/grubenv list > grubenv2.out
 sha256sum part/etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1 > hostkey2.sum
-ls part/boot part/lib > layout2.out
+ls part part/boot part/lib > layout2.out
 cat part/VERSION > version2.out
+same_as_image part update
 """
 
 FINAL = r"""
@@ -385,6 +416,11 @@ def run(tmp, image):
     ok, out = linux.run("nos-install install", PREPARE)
     if not check("nos-install install", ok):
         return linux
+    check("an image with a file nos-install does not know is refused, by its name, before anything is written",
+          "stray: installed" not in out and "the image has /lib/stray, which" in out and
+          "stray: the partition is as it was" in out, [line for line in out.splitlines() if "stray" in line])
+    check("install puts every file of the image on the partition, as it is in the image",
+          "install: every file of the image" in out, [line for line in out.splitlines() if line.startswith("install: ")])
     check("install puts the machine's microcode beside the kernel",
           "intel-ucode/%s, revision 0x%x" % (FAKE_UCODE_NAME, FAKE_UCODE_REVISION) in out, out)
     want = expected_version(linux.read("img-version.out"))
@@ -437,9 +473,11 @@ def run(tmp, image):
     check("update leaves the GRUB entry as it was: the partition is the same", "wrote" not in out, out)
     check("the host key nos made is on the partition", linux.read("hostkey1.sum").strip() not in ("", "none"))
     check("update keeps the host key", linux.read("hostkey1.sum") == linux.read("hostkey2.sum"))
-    layout = linux.read("layout2.out")
-    check("update keeps the old kernel and modules for a rollback",
-          "kernel64.elf.prev" in layout and "modules.prev" in layout, layout)
+    check("so does update", "update: every file of the image" in out,
+          [line for line in out.splitlines() if line.startswith("update: ")])
+    layout = linux.read("layout2.out").split()
+    check("update keeps the old kernel, modules, hvboot and VERSION for a rollback",
+          all(p in layout for p in ("kernel64.elf.prev", "modules.prev", "hvboot.prev", "VERSION.prev")), layout)
     env2 = linux.read("grubenv2.out")
     check("update takes the UDP shell it was given, and arms a boot",
           "nos_cmdline=udpshell=9000" in env2 and "nos_next=nos" in env2, env2)
