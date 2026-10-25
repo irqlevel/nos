@@ -11,8 +11,8 @@ namespace Kernel
 
 /* What one CPU's scheduler did, counted as it does it: how long a task that
    was woken waited for the CPU, how long one displaced while it could still
-   run waited to run again, what a decision cost, how far its walk went, and
-   how many tasks could run each time the CPU's timer had the queue looked
+   run waited to run again, what a decision cost, how many tasks it touched,
+   and how many tasks could run each time the CPU's timer had the queue looked
    at. Written only by the CPU that owns the queue, under its lock; read
    from anywhere with no lock, a counter at a time (`sched`), so a reading
    is a moment's and not a consistent whole. */
@@ -35,9 +35,10 @@ public:
         ulong Decisions;
         ulong DecisionCycles;
         ulong DecisionMaxCycles;
-        /* Entries the walk looked at, summed over the decisions */
-        ulong Walked;
-        ulong WalkMax;
+        /* Tasks a decision touched -- itself, and each it put on the run
+           list -- summed over the decisions */
+        ulong Touched;
+        ulong TouchedMax;
         /* Looks at the queue the timer made, the tasks they found able to
            run -- the one on the CPU included, the idle task not -- summed,
            the most, and how many found two or more */
@@ -52,7 +53,7 @@ public:
 
     void Wake(ulong ns);
     void Delay(ulong ns);
-    void Decision(ulong cycles, ulong walked);
+    void Decision(ulong cycles, ulong touched);
     void Look(ulong runnable);
 
     void Read(Snapshot& out);
@@ -81,8 +82,8 @@ private:
     ulong Decisions = 0;
     ulong DecisionCycles = 0;
     ulong DecisionMax = 0;
-    ulong Walked = 0;
-    ulong WalkMax = 0;
+    ulong Touched = 0;
+    ulong TouchedMax = 0;
     ulong Looks = 0;
     ulong RunnableSum = 0;
     ulong RunnableMax = 0;
@@ -294,7 +295,7 @@ private:
 };
 
 
-/* The reschedule for a task that has already taken itself out of the walk:
+/* The reschedule for a task that is taking itself off the run list:
    blocked (Event::Wait), exited (Task::Exit), or sleeping long enough that
    halting the CPU cannot overshoot the deadline (Sleep). When nothing else
    is runnable the CPU goes to the idle task, which halts it until the next
