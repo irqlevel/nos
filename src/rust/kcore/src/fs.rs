@@ -110,6 +110,14 @@ impl File {
         Ok(())
     }
 
+    /// The file, open for writing, cut to `size` bytes or grown to them --
+    /// with a hole, on a filesystem that has them: a disk image given its
+    /// disk's size before anything is written into it, so that what is
+    /// never written costs nothing and reads as zeros.
+    pub fn set_len(&self, size: u64) -> Result<()> {
+        if fs::kernel_file_set_length(self.handle, size) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
     /// Everything written to the file's filesystem, on its disk's medium: a
     /// guest's flush.
     pub fn sync(&self) -> Result<()> {

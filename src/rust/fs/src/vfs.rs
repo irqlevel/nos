@@ -857,6 +857,34 @@ impl Vfs {
         data.is_empty() || fs.write(node, data, offset)
     }
 
+    /// The file cut to `size` bytes, or grown to it -- with a hole, where
+    /// the filesystem has them -- through a handle open for writing: a disk
+    /// image made the size of its disk before anything is written into it.
+    /// The handle's position is not moved.
+    pub fn set_length(&self, handle: Handle, size: usize) -> bool {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node, flags) = match inner.file(handle) {
+            Some(file) => (file.mount_id, file.node, file.flags),
+            None => return false,
+        };
+        if flags & OPEN_WRITE == 0 {
+            trace!(0, "vfs: that handle is not open for writing");
+            return false;
+        }
+        match inner.mount_by_id(mount_id) {
+            Some(mount) if !mount.read_only => {
+                mount.fs.tree().get(node).is_some_and(|found| found.is_file()) && mount.fs.truncate(node, size)
+            }
+            Some(_) => {
+                trace!(0, "vfs: that mount is read-only");
+                false
+            }
+            None => false,
+        }
+    }
+
     /// The filesystem the file is on, synced: everything written to it on
     /// its disk's medium.
     pub fn sync_file(&self, handle: Handle) -> bool {

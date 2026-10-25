@@ -58,6 +58,9 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, within the file's size -- never
     /// growing it: `len`, or -1. Not synced.
     pub fn kernel_file_pwrite(file: usize, offset: u64, data: *const u8, len: usize) -> isize;
+    /// Cuts the file, open for writing, to `size` bytes or grows it there --
+    /// with a hole, where the filesystem has them: 0, or -1.
+    pub safe fn kernel_file_set_length(file: usize, size: u64) -> i32;
     /// Everything written to the file's filesystem on its disk's medium: 0,
     /// or -1.
     pub safe fn kernel_file_fsync(file: usize) -> i32;

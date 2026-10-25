@@ -435,6 +435,19 @@ pub unsafe extern "C" fn kernel_file_pwrite(file: usize, offset: u64, data: *con
     if vfs.write_within(handle, offset, unsafe { bytes(data, len) }) { len_signed } else { -1 }
 }
 
+/// The open file -- open for writing -- cut or grown to `size` bytes, grown
+/// with a hole where its filesystem has them: a disk image given its disk's
+/// size before it is written (`hv convert`). 0, or -1 for a word that is no
+/// open file, a file not open for writing, a size the filesystem cannot
+/// hold, or a full disk.
+#[no_mangle]
+pub extern "C" fn kernel_file_set_length(file: usize, size: u64) -> i32 {
+    match (vfs_instance(), Handle::from_raw(file), usize::try_from(size)) {
+        (Some(vfs), Some(handle), Ok(size)) if vfs.set_length(handle, size) => 0,
+        _ => -1,
+    }
+}
+
 /// Everything written to the open file's filesystem so far on its disk's
 /// medium -- what a guest's flush asks of the image under it: 0, or -1.
 #[no_mangle]

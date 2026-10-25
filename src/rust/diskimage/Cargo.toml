@@ -1,0 +1,15 @@
+[package]
+name = "diskimage"
+version = "0.1.0"
+edition = "2021"
+
+# A disk image of another hypervisor's -- QEMU's qcow2, which is what clouds
+# ship theirs in -- read and written out as the raw disk a guest of hv's is
+# given. Plain Rust over a source and a sink of the caller's, with no kernel
+# in it: the hv module links it, and fuzz/diskimage runs the same code on the
+# host against qemu-img and zlib. No dependency -- the DEFLATE a compressed
+# cluster is in is decoded here -- so it builds offline, and nothing in it is
+# unsafe (`forbid`).
+[lib]
+
+[dependencies]
