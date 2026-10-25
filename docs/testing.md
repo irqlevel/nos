@@ -103,7 +103,11 @@ Silicon, about four times as fast.
 The x86-64 smoke boot attaches virtio-blk (modern), virtio-scsi (legacy),
 NVMe, virtio-net and virtio-rng, so it covers the Rust drivers and the MSI-X
 path as well as the C++ underneath them. The arm64 one attaches virtio-mmio
-blk, net and rng. Both boot with `fstest=on`.
+blk, net and rng. Both boot with `fstest=on`. The arm64 one boots with
+`hugepages=64M` too: the huge pool reserved right after the free list, and a
+block of it handed out, written through its pages and given back by the
+frames' selftest (`huge frame selftest: passed`) -- x86's boots nos.iso,
+whose command line the hv gates share, and their guests are 4 KiB frames.
 
 **Every refactor step must keep both green**, and CI
 (`.github/workflows/ci.yml`) runs `make check`, a build *and* a smoke boot
@@ -162,7 +166,7 @@ swallowing panic messages whole.
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
@@ -725,7 +729,8 @@ spun its host CPU, its sleep computed from a deadline already past. Reading
 the run loop for it turned up a fourth: a guest of more than 4064 MiB had
 RAM over its IO-APIC's and local APIC's pages, which in xAPIC mode or with
 an IO-APIC left it with devices it could not reach and nothing to say so --
-guest RAM now ends below them (`run::MAX_MEM_BYTES`). And a fifth, not live
+guest RAM below 4 GiB now ends below them (`linux::LOW_RAM_END`), the rest
+from 4 GiB. And a fifth, not live
 but one check from it: the DHCP server's `is_request` read a frame's
 EtherType before anything had checked the frame held one -- an index out
 of range on a guest's runt frame, which only the switch's own length check
@@ -1230,7 +1235,12 @@ what its header says it does:
   and in a window with two slots left -- are held to `page_table.h`'s
   rules: every page's reference count, every translation, every page free,
   held, a table or the machine's and never two, pages handed out zeroed, a
-  map that fails leaving nothing of its own, no TmpMap slot left behind;
+  map that fails leaving nothing of its own, no TmpMap slot left behind.
+  A machine of more than 4 MiB may reserve a huge pool (`hugepages=`) right
+  after its free list, as the boot does, and hand its 2 MiB blocks out and
+  back: the highest free blocks taken and the pages kept left free, a block
+  of the pool never on the free list nor anyone else's, zeroed each time it
+  is handed out, and the pool's counts its bitmaps';
 - `heap`: `Mm::Alloc` and `Mm::Free`, the pools, the page runs and the three
   ways a driver maps pages, over a page table as `page_table.h` promises it
   and a VA region of the host's -- mapped VA is memory, the rest poisoned --
@@ -1831,6 +1841,21 @@ an early console on, PCI, ACPI and SMP off is enough -- and run
 
 ```sh
 scripts/hv-linux-test.py --bzimage /path/to/bzImage
+```
+
+A guest's memory as the platform lays it out past 4 GiB, and from the
+huge pool: `--mem` in MiB past 4064 gives the guest RAM from 4 GiB as well as
+below the devices' pages, which its memory map must say and its kernel must
+take, and `--nos-mem` (QEMU's `-m` for nos, 2G by default) has to be the
+guest's and the kernel's reserve more; `--nos-iso` boots nos from another
+ISO than nos.iso -- `make nos-test.iso TEST_ISO_ARGS=hugepages=5G` is
+nos.iso with that on its command line -- so that every guest's memory is the
+huge pool's, 2 MiB an entry of its nested table, and a guest the pool has no
+room for is refused. Together:
+
+```sh
+make nos-test.iso TEST_ISO_ARGS=hugepages=5G
+scripts/hv-linux-test.py --bzimage <bzImage> --initrd <cpio> --nos-iso nos-test.iso --nos-mem 8G --mem 4608
 ```
 
 The initramfs `--initrd` takes is a static BusyBox and an `/init` that

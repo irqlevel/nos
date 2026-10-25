@@ -1445,7 +1445,11 @@ pub fn platform(r: &mut Input) {
     let cpus = 1 + r.below(4) as u32;
     let x2apic = r.bool();
     let ioapic = cpus > 1 && r.bool();
-    let mem_bytes = r.pick(&[64 * MIB, 128 * MIB, 256 * MIB, 3072 * MIB, 4064 * MIB, 4096 * MIB]);
+    /* Under the devices' pages, up to them, past them -- RAM from 4 GiB --
+     * a guest of 8, 16 and 32 GiB, and one past the most there is. */
+    let mem_bytes = r.pick(&[64 * MIB, 128 * MIB, 256 * MIB, 3072 * MIB, 4064 * MIB, 4096 * MIB, 8192 * MIB,
+                             16384 * MIB, 32768 * MIB, crate::run::MAX_MEM_BYTES + 2 * MIB]);
+    let huge = r.bool();
     let vmx = r.bool();
     /* The host whose CPUID the policy shapes, before the guest is made --
      * which asks it what CR4 may take: an AMD CPU under AMD-V, an Intel one
@@ -1457,12 +1461,34 @@ pub fn platform(r: &mut Input) {
     machine.vapic = vmx && r.bool();
     machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
-    let made = LinuxGuest::new(&machine, mem_bytes, cpus, Arc::new(doorbells), x2apic, ioapic);
+    let made = LinuxGuest::new(&machine, mem_bytes, huge, cpus, Arc::new(doorbells), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {
-        invariant!(made.is_err(), "a guest of {} MiB made, its RAM over its devices' pages", mem_bytes / MIB);
+        invariant!(made.is_err(), "a guest of {} MiB made, past the most there is", mem_bytes / MIB);
+        return;
+    }
+    /* RAM past what the guest is told an address reaches is RAM it cannot
+     * use: refused, never given. */
+    let ram = linux::Ram::of(mem_bytes);
+    let reach = 1u64 << crate::policy::phys_bits();
+    if ram.end().is_none_or(|end| end > reach) {
+        invariant!(made.is_err(), "a guest of {} MiB made, its RAM past the {:#x} its addresses reach",
+                   mem_bytes / MIB, reach);
         return;
     }
     let Ok((mut guest, mut vcpus)) = made else { return };
+    /* Its RAM where the platform has it: below the devices' pages and from
+     * 4 GiB, every byte of it, the huge pool's when asked. */
+    let memory = guest.memory();
+    invariant!(memory.size() >= mem_bytes && memory.huge_size() == if huge { mem_bytes } else { 0 },
+               "a guest of {} MiB with {} MiB of memory, {} of it the pool's", mem_bytes / MIB,
+               memory.size() / MIB, memory.huge_size() / MIB);
+    for (base, size) in ram.regions() {
+        invariant!(memory.backs(base, size), "a guest of {} MiB without its RAM at {:#x}+{:#x}", mem_bytes / MIB,
+                   base, size);
+    }
+    invariant!(!memory.backs(linux::LOW_RAM_END, 1) && !memory.backs(0xFEC0_0000, 1)
+               && !memory.backs(0xFEE0_0000, 1), "a guest of {} MiB with RAM over its devices' pages",
+               mem_bytes / MIB);
     /* The guest's CPUs' interrupts the CPU's as it asked, or by default --
      * where the CPU takes them posted too. */
     if r.bool() {

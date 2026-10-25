@@ -942,6 +942,10 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
+    /* The huge pool (hugepages=), now: the free list will never again be as
+       whole as it is before the kernel's own allocations begin. */
+    pt.ReserveHugePool(Parameters::GetInstance().GetHugePoolBytes(pt.GetTotalPagesCount() * Const::PageSize));
+
     /* W^X: the image mapping is the one executable thing the page table
        was built with (everything else is already NX), so split it here into
        .text RX, .rodata RO+NX, .data/.bss RW+NX */
