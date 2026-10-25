@@ -335,6 +335,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         }
         "info" => {
             let _ = machine.caps().report(out);
+            pool_report(out);
             status(machine, out);
             #[cfg(target_arch = "x86_64")]
             vms_status(state, out);
@@ -550,6 +551,19 @@ fn ask_spec_ctrl(answer: &AtomicU32) {
         Some(false) => SPEC_UNDONE,
     };
     answer.store(held, Ordering::Release);
+}
+
+/// The huge pool a guest's memory comes from, when the kernel has one.
+fn pool_report(out: &mut Output) {
+    const MIB: u64 = 1024 * 1024;
+    let pool = kcore::frame::huge_pool();
+    if pool.blocks == 0 {
+        let _ = writeln!(out, "  {:<21}none -- hugepages= not given: a guest's memory is 4 KiB frames", "huge pool");
+    } else {
+        let _ = writeln!(out, "  {:<21}{} of {} 2 MiB pages free ({} of {} MiB): every guest's memory", "huge pool",
+                         pool.free, pool.blocks, pool.free * kcore::frame::HUGE_SIZE / MIB,
+                         pool.blocks * kcore::frame::HUGE_SIZE / MIB);
+    }
 }
 
 fn status(machine: &Machine, out: &mut Output) {
