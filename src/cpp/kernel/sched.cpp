@@ -134,11 +134,11 @@ TaskQueue::TaskQueue()
     , StallPid(0)
     , StallWaitedMs(0)
     , StallRunnable(0)
+    , IdleCounted(false)
     , IdleTask(nullptr)
 {
     Stdlib::AutoLock lock(Lock);
     TaskList.Init();
-    RunList.Init();
     SleepList.Init();
     ExitedList.Init();
 
@@ -282,6 +282,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
     Stdlib::Time now = GetBootTime();
     NoteRun(next, now.GetValue());
     next->RunStartTime = now;
+    next->Sched.ExecStart = now.GetValue();
     next->Prev = curr;
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
@@ -307,22 +308,86 @@ void TaskQueue::PushWake(Task* task)
     }
 }
 
+Task* TaskQueue::TaskOf(SchedEntity* se)
+{
+    return (se != nullptr) ? CONTAINING_RECORD(se, Task, Sched) : nullptr;
+}
+
+void TaskQueue::Account(Task* curr, ulong now, bool exited)
+{
+    /* On the CPU is curr, or nothing counted: the idle task idling, or an
+       exited task gone already, at a look before this one */
+    SchedEntity* se = &curr->Sched;
+    BugOn(Eevdf.Current() != nullptr && Eevdf.Current() != se);
+
+    if (Eevdf.Current() == se)
+    {
+        if (exited)
+            Eevdf.Leave(se);
+        else
+            Eevdf.Charge(now);
+    }
+    CountIdle(curr, now);
+}
+
+void TaskQueue::CountIdle(Task* curr, ulong now)
+{
+    if (curr != IdleTask)
+        return;
+
+    if (curr->IsIdling() && IdleCounted)
+    {
+        Eevdf.Leave(&curr->Sched);
+        IdleCounted = false;
+    }
+    else if (!curr->IsIdling() && !IdleCounted)
+    {
+        Eevdf.JoinCurrent(&curr->Sched);
+        curr->Sched.ExecStart = now;
+        IdleCounted = true;
+    }
+}
+
+void TaskQueue::ArmSlice(ulong now)
+{
+    /* Alone on the CPU, the current one's slice ends deciding nothing: it
+       would keep the CPU. A task that joins later is a decision of its own
+       -- a wakeup's, a deadline's, the tick's -- which arms it then. A
+       guest's vCPU on a core of its own would otherwise leave its guest
+       every slice for nothing. */
+    if (Eevdf.Current() == nullptr || Eevdf.IsEmpty())
+        return;
+
+    ulong ns = Stdlib::Max(Eevdf.RealUntilDeadline(), MinArmNs);
+    CpuTable::GetInstance().GetCurrentCpu().LocalTimerWake(now + ns);
+}
+
 void TaskQueue::Enqueue(Task* task)
 {
     RunnableCount.Inc();
-    Requeue(task);
+    Eevdf.Join(&task->Sched);
+    NoteQueued(task);
 }
 
 void TaskQueue::Requeue(Task* task)
 {
-    BugOn(!task->RunEntry.IsEmpty());
+    BugOn(Eevdf.Current() != &task->Sched);
+    Eevdf.PutBack();
+    NoteQueued(task);
+}
+
+void TaskQueue::NoteQueued(Task* task)
+{
     task->QueuedAt = GetBootTime().GetValue();
     task->StallReported = false;
-    RunList.InsertTail(&task->RunEntry);
 }
 
 void TaskQueue::Asleep(Task* task)
 {
+    /* The lag it goes with, V counting it still: it is current */
+    BugOn(Eevdf.Current() != &task->Sched);
+    Eevdf.Leave(&task->Sched);
+
     RunnableCount.Dec();
     BugOn(RunnableCount.Get() < 0);
 
@@ -418,26 +483,45 @@ void TaskQueue::ReleaseIdle(Task* curr)
     if (IdleTask == nullptr || IdleTask->IsIdle())
         return;
 
-    /* Counted from now on, as any task that can run. On the CPU, it takes
-       its place on the run list when it leaves it; in its place as the last
-       resort, now; on the run list already -- displaced while it ran
-       something other than its idling -- where it is. */
+    /* Counted from now on, as any task that can run. Counted already -- on
+       the CPU or on the run list, running something other than its idling
+       -- it stays where it is; idling on the CPU, it is placed as a task
+       waking, and takes the run list when it leaves the CPU; in its place
+       as the last resort, it is placed and on the run list now. */
     Task* task = IdleTask;
     IdleTask = nullptr;
-    RunnableCount.Inc();
-    if (task != curr && task->RunEntry.IsEmpty())
-        Requeue(task);
+    bool counted = IdleCounted;
+    IdleCounted = false;
+
+    if (counted)
+    {
+        RunnableCount.Inc();
+    }
+    else if (task == curr)
+    {
+        RunnableCount.Inc();
+        Eevdf.JoinCurrent(&task->Sched);
+        task->Sched.ExecStart = GetBootTime().GetValue();
+    }
+    else
+    {
+        Enqueue(task);
+    }
 }
 
 void TaskQueue::CheckStalls(ulong now)
 {
-    if (RunList.IsEmpty())
-        return;
-
-    /* The run list is in the order of its turns: its head has waited
-       longest */
-    Task* task = CONTAINING_RECORD(RunList.Flink, Task, RunEntry);
-    if (task->StallReported || now < task->QueuedAt + StallReportNs)
+    /* The run list is in no order of waiting: the one waiting longest is
+       looked for, the list as long as this CPU has tasks that can run */
+    Task* task = nullptr;
+    auto& list = Eevdf.Entries();
+    for (auto entry = list.Flink; entry != &list; entry = entry->Flink)
+    {
+        Task* cand = TaskOf(CONTAINING_RECORD(entry, SchedEntity, Entry));
+        if (!cand->StallReported && (task == nullptr || cand->QueuedAt < task->QueuedAt))
+            task = cand;
+    }
+    if (task == nullptr || now < task->QueuedAt + StallReportNs)
         return;
 
     /* Said once the locks are down (ReportStall): the trace path ends in the
@@ -462,7 +546,7 @@ void TaskQueue::ReportStall()
         StallName, StallPid, StallWaitedMs, CpuTable::GetInstance().GetCurrentCpuId(), StallRunnable);
 }
 
-void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
+void TaskQueue::Schedule(Task* curr, ScheduleReason why)
 {
     ScheduleCounter.Inc();
 
@@ -478,7 +562,12 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     bool fired = cpu.LocalTimerTakeWalk();
 
+    /* Only the idle task to hand the CPU to: a task polling with
+       YieldToRunnable, or one an interrupt landed on, keeps it instead */
+    bool keepOverIdle = (why != ScheduleReason::Voluntary);
+
     Task* next = nullptr;
+    bool nextQueued = false;
     bool exited = false;
     long run = Task::RunQueued;
     ulong now = 0;
@@ -488,16 +577,20 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
         curr->Lock.Lock();
         BugOn(TaskList.IsEmpty());
 
+        /* curr charged for what it ran, gone from the count if it has
+           exited, and the idle task in it or out of it as it runs something
+           or idles: V is the queue's as it is now before anything joins it */
+        now = GetBootTime().GetValue();
+        exited = (curr->State.Get() == Task::StateExited);
+        ReleaseIdle(curr);
+        Account(curr, now, exited);
+
         /* What can run that could not at the last look: the woken, and the
-           sleepers whose time has come */
+           sleepers whose time has come, each placed by the lag it brings */
         DrainWakes(touched);
-        if (!SleepList.IsEmpty() || fired)
-            now = GetBootTime().GetValue();
         if (!SleepList.IsEmpty())
             WakeDue(now, touched);
-        ReleaseIdle(curr);
 
-        exited = (curr->State.Get() == Task::StateExited);
         if (exited && curr->TaskQueue != nullptr)
         {
             BugOn(curr->TaskQueue != this);
@@ -516,12 +609,32 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
         BugOn(!exited && run != Task::RunQueued && run != Task::RunBlocking);
         bool runnable = !exited && run == Task::RunQueued;
 
-        if (!RunList.IsEmpty())
+        SchedEntity* current = Eevdf.Current();
+        if (!Eevdf.IsEmpty())
         {
-            /* The head: the one whose turn it is. Everything on the list can
-               run, so there is nothing to walk past. */
-            next = CONTAINING_RECORD(RunList.Flink, Task, RunEntry);
-            next->RunEntry.RemoveInit();
+            SchedEntity* best;
+            if (runnable && why == ScheduleReason::Preempt && current != nullptr)
+            {
+                /* An interrupt's: curr among the candidates, and it keeps
+                   the CPU unless another eligible task's deadline comes
+                   sooner -- its slice done, or a wakeup owed more */
+                best = Eevdf.Pick(true);
+                next = (best == current) ? nullptr : TaskOf(best);
+            }
+            else
+            {
+                /* curr lets the others go -- yields, sleeps, exits -- or is
+                   the idle task idling, which keeps nothing from anybody:
+                   the eligible one whose deadline is soonest of the rest. A
+                   task that can still run goes behind them first. */
+                if (runnable && current != nullptr)
+                    Eevdf.Yield();
+                best = Eevdf.Pick(false);
+                next = TaskOf(best);
+            }
+            /* On the run list until curr has left the CPU (below): the
+               queue takes it only then */
+            nextQueued = (next != nullptr);
         }
         else if (!(runnable && keepOverIdle) && IdleTask != nullptr && IdleTask != curr)
         {
@@ -564,13 +677,14 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
 
         /* curr leaves the CPU. Blocking, it goes to sleep -- unless an
            Unblock() made it Queued since it looked, and then it has not.
-           Runnable, it takes the run list's tail -- the idle task too, while
-           it runs the boot or a test, and only while it idles is its place
-           its own (Task::SetIdling). Kept apart whatever it ran, it used to
-           be the last resort with the boot in it: a task the boot started on
-           its own CPU that never blocked -- the ring selftest's producer --
-           took that CPU at the first tick and kept it, and the boot never got
-           as far as starting the consumer the producer waited for. */
+           Runnable, it goes back on the run list -- the idle task too, while
+           it runs the boot or a test and is counted, and only while it idles
+           is its place its own (Task::SetIdling). Kept apart whatever it ran,
+           it used to be the last resort with the boot in it: a task the boot
+           started on its own CPU that never blocked -- the ring selftest's
+           producer -- took that CPU at the first tick and kept it, and the
+           boot never got as far as starting the consumer the producer waited
+           for. */
         if (!exited)
         {
             if (run == Task::RunBlocking &&
@@ -581,11 +695,16 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
             }
             else
             {
-                if (curr != IdleTask || !curr->IsIdling())
+                if (Eevdf.Current() != nullptr)
                     Requeue(curr);
                 curr->SwitchedOutRunnable = true;
             }
         }
+
+        /* The idle task, as the last resort, is not counted and takes
+           nothing */
+        if (nextQueued)
+            Eevdf.Take(&next->Sched);
     }
 
     /* This CPU's timer at the soonest sleeper's deadline -- curr's, if it has
@@ -593,6 +712,10 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
        at the next tick. A deadline later than the timer has is no change. */
     if (!SleepList.IsEmpty())
         cpu.LocalTimerWake((ulong)CONTAINING_RECORD(SleepList.Flink, Task, SleepEntry)->SleepUntil.Get());
+
+    /* And at the end of the slice of whoever runs now, so that the next
+       decision comes when its deadline does */
+    ArmSlice(now);
 
     if (fired)
     {
@@ -634,7 +757,7 @@ void TaskQueue::Insert(Task* task)
 
     BugOn(task->TaskQueue != nullptr);
     BugOn(!(task->ListEntry.IsEmpty()));
-    BugOn(!task->RunEntry.IsEmpty());
+    BugOn(!task->Sched.Entry.IsEmpty());
     BugOn(task->RunState.Get() != Task::RunQueued);
 
     task->TaskQueue = this;
@@ -670,7 +793,11 @@ void TaskQueue::Remove(Task* task)
         BugOn(task == IdleTask);
         BugOn(!task->SleepEntry.IsEmpty());
 
-        task->RunEntry.RemoveInit();
+        /* It takes its lag with it, to be placed by on the queue it goes to.
+           Not current: displaced, and back on the run list, where the
+           decision that switched it out put it (SwitchComplete moves it). */
+        BugOn(Eevdf.Current() == &task->Sched);
+        Eevdf.Leave(&task->Sched);
         RunnableCount.Dec();
         BugOn(RunnableCount.Get() < 0);
 
@@ -697,8 +824,8 @@ void TaskQueue::Clear()
         /* What waits on the run and sleep lists is on the task list too, and
            goes with it: unlinked, so that no task is left pointing into
            lists that are gone */
-        while (!RunList.IsEmpty())
-            RunList.RemoveHead()->Init();
+        Eevdf.Clear();
+        IdleCounted = false;
         while (!SleepList.IsEmpty())
             SleepList.RemoveHead()->Init();
     }
@@ -739,7 +866,7 @@ long TaskQueue::GetSwitchContextCounter()
     return SwitchContextCounter.Get();
 }
 
-static void ScheduleCurrent(bool keepOverIdle)
+static void ScheduleCurrent(ScheduleReason why)
 {
     if (unlikely(!PreemptIsOn()))
     {
@@ -777,22 +904,147 @@ static void ScheduleCurrent(bool keepOverIdle)
         return;
     }
 
-    curr->TaskQueue->Schedule(curr, keepOverIdle);
+    curr->TaskQueue->Schedule(curr, why);
 }
 
 void Schedule()
 {
-    ScheduleCurrent(false);
+    ScheduleCurrent(ScheduleReason::Voluntary);
 }
 
 void Preempt()
 {
-    ScheduleCurrent(true);
+    ScheduleCurrent(ScheduleReason::Preempt);
 }
 
 void YieldToRunnable()
 {
-    ScheduleCurrent(true);
+    ScheduleCurrent(ScheduleReason::Yield);
+}
+
+bool TaskQueue::SetNice(Task* task, long nice)
+{
+    /* The task's lock too, in the scheduler's order: TaskQueue is written
+       under it everywhere, Clear's included, which does not hold this one */
+    Stdlib::AutoLock lock(Lock);
+    Stdlib::AutoLock lock2(task->Lock);
+    if (task->TaskQueue != this)
+        return false;
+
+    /* Its weight from now on: V and every eligibility are reckoned from
+       scratch at the next decision, and it is charged at it from then */
+    task->Sched.SetNice(nice);
+    return true;
+}
+
+ulong TaskQueue::View(EntityView* out, ulong max)
+{
+    Stdlib::AutoLock lock(Lock);
+
+    SchedEntity* curr = Eevdf.Current();
+    u64 v = Eevdf.V();
+    ulong count = 0;
+
+    /* curr first, then the list */
+    SchedEntity* first = curr;
+    auto& list = Eevdf.Entries();
+    Stdlib::ListEntry* entry = list.Flink;
+    for (;;)
+    {
+        SchedEntity* se;
+        if (first != nullptr)
+        {
+            se = first;
+            first = nullptr;
+        }
+        else if (entry != &list)
+        {
+            se = CONTAINING_RECORD(entry, SchedEntity, Entry);
+            entry = entry->Flink;
+        }
+        else
+        {
+            break;
+        }
+
+        if (count == max)
+            break;
+
+        Task* task = TaskOf(se);
+        EntityView& e = out[count++];
+        Stdlib::SnPrintf(e.Name, sizeof(e.Name), "%s", task->GetName());
+        e.Pid = task->Pid;
+        e.Nice = se->Nice;
+        e.SliceNs = se->SliceNs;
+        e.Lag = (s64)(v - se->VRuntime);
+        e.Deadline = (s64)(se->Deadline - v);
+        e.Eligible = Eevdf.IsEligible(se);
+        e.OnCpu = (se == curr);
+    }
+    return count;
+}
+
+bool TaskQueue::SetSlice(Task* task, ulong sliceNs)
+{
+    Stdlib::AutoLock lock(Lock);
+    Stdlib::AutoLock lock2(task->Lock);
+    if (task->TaskQueue != this)
+        return false;
+
+    /* The next deadline it is given is a slice of this past its VRuntime */
+    task->Sched.SetSlice(sliceNs);
+    return true;
+}
+
+/* The queue a task is on is read under the task's lock, and looked at again
+   under both, the queue's first: the order the scheduler takes them in, so
+   the task's is let go before the queue's is taken. A task on no queue --
+   not started, or exited -- is set under its own lock, which Insert takes
+   too. */
+static TaskQueue* QueueOf(Task* task)
+{
+    Stdlib::AutoLock lock(task->Lock);
+    return task->TaskQueue;
+}
+
+void SetTaskNice(Task* task, long nice)
+{
+    for (;;)
+    {
+        TaskQueue* queue = QueueOf(task);
+        if (queue == nullptr)
+        {
+            Stdlib::AutoLock lock(task->Lock);
+            if (task->TaskQueue == nullptr)
+            {
+                task->Sched.SetNice(nice);
+                return;
+            }
+            continue;
+        }
+        if (queue->SetNice(task, nice))
+            return;
+    }
+}
+
+void SetTaskSlice(Task* task, ulong sliceNs)
+{
+    for (;;)
+    {
+        TaskQueue* queue = QueueOf(task);
+        if (queue == nullptr)
+        {
+            Stdlib::AutoLock lock(task->Lock);
+            if (task->TaskQueue == nullptr)
+            {
+                task->Sched.SetSlice(sliceNs);
+                return;
+            }
+            continue;
+        }
+        if (queue->SetSlice(task, sliceNs))
+            return;
+    }
 }
 
 /* Sleep blocks. The task is off its queue's run list until its time has

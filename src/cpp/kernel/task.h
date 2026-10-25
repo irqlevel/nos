@@ -9,6 +9,7 @@
 #include "spin_lock.h"
 #include "panic.h"
 #include "object_table.h"
+#include "eevdf.h"
 
 namespace Kernel
 {
@@ -243,9 +244,12 @@ public:
     Stdlib::ListEntry ListEntry;
     Stdlib::ListEntry TableListEntry;
 
-    /* On its queue's run list while runnable and off the CPU, and on its
-       sleep list while asleep until a deadline: both under the queue's lock */
-    Stdlib::ListEntry RunEntry;
+    /* What its queue's EEVDF knows of it -- its weight, slice, virtual
+       runtime, deadline and lag -- and its place on the queue's run list
+       (Sched.Entry) while it can run and is off the CPU; and its place on
+       the sleep list while asleep until a deadline. All under the queue's
+       lock; set from elsewhere through SetTaskNice and SetTaskSlice. */
+    SchedEntity Sched;
     Stdlib::ListEntry SleepEntry;
 
     /* RunQueued, RunBlocking, RunSleeping or RunWaking (above) */

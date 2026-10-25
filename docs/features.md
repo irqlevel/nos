@@ -7,7 +7,7 @@ Everything the kernel does today, by subsystem. For where the code lives see
 - **virtio, entirely in Rust** — the split virtqueue, the transport contract and both buses (virtio-pci modern *and* legacy, virtio-mmio v2) are `src/rust/virtio`, and every device on them — **blk**, **net**, **scsi**, **rng** — is a Rust driver in `src/rust/drivers/`. No virtio code is left in C++
 - **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot, **legacy BIOS and UEFI firmware**) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
 - **SMP** — up to 64 CPUs (20 exercised on real hardware); AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64, APs started one at a time, `maxcpus=N` to cap them
-- **Preemptive multitasking** — per-CPU task queues, round-robin scheduling, load-balanced task placement
+- **Preemptive multitasking** — per-CPU task queues, EEVDF scheduling (a weight from each task's nice, a slice of its own, lag kept across sleeps and moves, a slice's end on the one-shot local timer), load-balanced task placement
 - **Virtual memory** — 4-level paging (4 KB pages), high-half kernel at `0xFFFF800001000000`, TLB shootdown across CPUs via IPI
 - **Page allocator** — fixed-size block allocator (1–128 contiguous pages), pool allocator (32 B – 2 KB), `new`/`delete` support
 - **ACPI** — RSDP, RSDT/XSDT, MADT, FADT, HPET and WDAT parsing: LAPIC/IOAPIC discovery, IRQ→GSI routing, the reset register, the century register, the HPET's base, a firmware-owned watchdog

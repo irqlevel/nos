@@ -34,8 +34,11 @@ COMMON := fuzz/cpp/common/runner.cpp fuzz/cpp/common/kernel.cpp \
           src/cpp/lib/stdlib.cpp src/cpp/lib/format.cpp src/cpp/lib/list_entry.cpp \
           src/cpp/kernel/atomic.cpp
 HEAP := fuzz/cpp/common/heap.cpp
+# The stand-in CPU table and scheduler; a task and a queue hold what EEVDF
+# keeps of them, whose constructors are kernel/eevdf.cpp's
+CPU := fuzz/cpp/common/cpu.cpp src/cpp/kernel/eevdf.cpp
 
-TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format ucode
+TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format ucode eevdf
 
 SRC_fdt := $(COMMON) fuzz/cpp/targets/fdt.cpp \
            src/cpp/arch/arm64/fdt.cpp src/cpp/arch/arm64/board.cpp
@@ -44,21 +47,22 @@ SRC_memmap := $(COMMON) fuzz/cpp/targets/memmap.cpp \
 SRC_grubenv := $(COMMON) fuzz/cpp/targets/grubenv.cpp \
                src/cpp/lib/grub_env.cpp
 # kernel/module.cpp is the target's own file's: it includes it
-SRC_module := $(COMMON) $(HEAP) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/module.cpp \
+SRC_module := $(COMMON) $(HEAP) $(CPU) fuzz/cpp/targets/module.cpp \
               src/cpp/lib/error.cpp
-SRC_pagetable := $(COMMON) $(HEAP) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/pagetable.cpp \
+SRC_pagetable := $(COMMON) $(HEAP) $(CPU) fuzz/cpp/targets/pagetable.cpp \
                  src/cpp/mm/page_table.cpp src/cpp/mm/memory_map.cpp src/cpp/lib/error.cpp
 SRC_cmdline := $(COMMON) fuzz/cpp/targets/cmdline.cpp src/cpp/kernel/parameters.cpp
 # arch/x86_64/grub.cpp is the target's own file's: it includes it
 SRC_multiboot := $(COMMON) fuzz/cpp/targets/multiboot.cpp src/cpp/mm/memory_map.cpp \
                  src/cpp/kernel/parameters.cpp
-SRC_acpi := $(COMMON) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/acpi.cpp src/cpp/drivers/acpi.cpp \
+SRC_acpi := $(COMMON) $(CPU) fuzz/cpp/targets/acpi.cpp src/cpp/drivers/acpi.cpp \
             src/cpp/lib/error.cpp
 # lib/format.cpp is COMMON's
 SRC_format := $(COMMON) fuzz/cpp/targets/format.cpp
 SRC_ucode := $(COMMON) fuzz/cpp/targets/ucode.cpp src/cpp/arch/x86_64/microcode_file.cpp
+SRC_eevdf := $(COMMON) fuzz/cpp/targets/eevdf.cpp src/cpp/kernel/eevdf.cpp
 # The kernel heap itself: no heap.cpp under it
-SRC_heap := $(COMMON) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/heap.cpp \
+SRC_heap := $(COMMON) $(CPU) fuzz/cpp/targets/heap.cpp \
             src/cpp/mm/allocator.cpp src/cpp/mm/pool.cpp src/cpp/mm/page_allocator.cpp \
             src/cpp/mm/va_allocator.cpp src/cpp/lib/bitmap.cpp src/cpp/lib/error.cpp
 

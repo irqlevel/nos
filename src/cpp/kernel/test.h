@@ -22,6 +22,10 @@ bool TestWakeStorm();
    blocks: from the BSP */
 bool TestIdleTakesTurns();
 
+/* EEVDF: a wakeup beside spinners runs at once, and spinners share the CPU
+   by their weights -- on a CPU other than the BSP's, from the BSP */
+bool TestEevdf();
+
 }
 
 }

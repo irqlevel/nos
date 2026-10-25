@@ -38,7 +38,6 @@ Task::Task()
 {
     RefCounter.Set(1);
     ListEntry.Init();
-    RunEntry.Init();
     SleepEntry.Init();
     Name[0] = '\0';
 }
@@ -55,7 +54,7 @@ Task::~Task()
 {
     BugOn(TaskQueue != nullptr);
     BugOn(StackPtr != nullptr);
-    BugOn(!RunEntry.IsEmpty());
+    BugOn(!Sched.Entry.IsEmpty());
     BugOn(!SleepEntry.IsEmpty());
     Trace(TaskLL, "task 0x%p %s dtor", this, Name);
 }

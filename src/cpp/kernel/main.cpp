@@ -677,6 +677,12 @@ void BpStartup(void* ctx)
             return;
         }
 
+        if (!Test::TestEevdf())
+        {
+            Panic("EEVDF test failed");
+            return;
+        }
+
         rust_test();
 
         if (!SoftIrq::GetInstance().Init())
