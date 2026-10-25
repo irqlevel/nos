@@ -101,6 +101,16 @@ public:
        to raise it on the machine in question and watch `netpool` for misses. */
     ulong GetNetFrameCount();
 
+    /* hugepages=N% | NG | NM -- the huge pool (mm/page_table.h,
+       ReserveHugePool): that share of the machine's RAM, or that much of
+       it, reserved at boot in 2MiB blocks for guests' memory, each block
+       one entry of a guest's nested page table. 0, the default, reserves
+       none, and a guest's memory is 4KiB frames as it always was; with a
+       pool, a guest's memory is the pool's or the guest does not start.
+       What is asked past what the machine can spare is cut down to it, and
+       the boot says so. The bytes for a machine of totalBytes of RAM. */
+    ulong GetHugePoolBytes(ulong totalBytes);
+
     /* rxpoll=on -- have the tick look at the receive path as well as the
        NIC's own interrupt. Off by default: it is a hypothesis about a driver
        stall, not a proven fix, and on the machine it was meant to help the
@@ -196,6 +206,9 @@ private:
     u16 NetconsolePort;
     ulong NetconsoleTailKb;
     ulong NetFrameCount;
+    /* hugepages=: a share of RAM in percent, or bytes -- one of the two. */
+    ulong HugePoolPercent;
+    ulong HugePoolBytes;
     bool RxPoll;
     int LogLevel;
     bool DnsEnabled;
@@ -206,5 +219,6 @@ private:
     bool Parsed;
 
     static bool ParseUuid(const char* text, u8* out);
+    bool ParseHugePool(const char* value);
 };
 }

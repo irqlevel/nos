@@ -68,14 +68,17 @@ void Sleep(ulong nanoSecs)
     Fuzz::HostHalUnreachable("Sleep");
 }
 
+/* Interrupts off and back, as the kernel's: what a caller that needs them
+   off for its CPU's frame slot (PageTable::MapFrameSlot) is checked for.
+   One task at a time, so there is no preemption to hold off. */
 ulong PreemptIrqSave()
 {
-    return 0;
+    return Hal::IrqSave();
 }
 
 void PreemptIrqRestore(ulong flags)
 {
-    (void)flags;
+    Hal::IrqRestore(flags);
 }
 
 }

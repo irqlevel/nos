@@ -54,6 +54,8 @@ const MSR_VMX_EXIT: u32 = 0x483;
 
 /* IA32_VMX_EPT_VPID_CAP: INVEPT and INVVPID are there, and which of their
  * types. */
+/// The EPT walk takes an entry of the level above the last as a 2 MiB page.
+pub const EPT_CAP_2M_PAGES: u64 = 1 << 16;
 pub const EPT_CAP_INVEPT: u64 = 1 << 20;
 pub const EPT_CAP_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
 pub const EPT_CAP_INVEPT_ALL_CONTEXT: u64 = 1 << 26;
@@ -240,6 +242,11 @@ impl Caps {
         self.has(SEC_VPID)
             && self.ept_vpid & (EPT_CAP_INVVPID | EPT_CAP_INVVPID_ALL_CONTEXT)
                 == EPT_CAP_INVVPID | EPT_CAP_INVVPID_ALL_CONTEXT
+    }
+
+    /// An EPT may map 2 MiB with one entry.
+    pub fn ept_2m(&self) -> bool {
+        self.ept_vpid & EPT_CAP_2M_PAGES != 0
     }
 
     pub fn invvpid_single_context(&self) -> bool {

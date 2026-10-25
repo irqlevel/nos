@@ -1130,7 +1130,8 @@ impl Vms {
         }
         kernel.push_str(&spec.kernel);
         let _ = write!(task_name, "hv/vm{}", id);
-        let _ = write!(said, "{}, {} MiB, {} cpu{}, cmdline \"{}\"{}", spec.kernel, mem_mib, spec.cpus,
+        let _ = write!(said, "{}, {} MiB{}, {} cpu{}, cmdline \"{}\"{}", spec.kernel, mem_mib,
+                       if guest::from_pool() { " of the huge pool" } else { "" }, spec.cpus,
                        if spec.cpus == 1 { "" } else { "s" }, spec.cmdline,
                        if spec.restart { ", restarted when it resets" } else { "" });
 
