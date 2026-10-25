@@ -157,6 +157,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/exception.cpp    \
     src/cpp/kernel/dmesg.cpp    \
     src/cpp/kernel/sched.cpp    \
+    src/cpp/kernel/eevdf.cpp    \
     src/cpp/kernel/preempt.cpp  \
     src/cpp/kernel/time.cpp \
     src/cpp/arch/x86_64/tsc.cpp \
@@ -231,6 +232,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/watchdog.cpp \
     src/cpp/kernel/task.cpp \
     src/cpp/kernel/sched.cpp \
+    src/cpp/kernel/eevdf.cpp \
     src/cpp/kernel/cpu.cpp \
     src/cpp/kernel/timer.cpp \
     src/cpp/kernel/mutex.cpp \

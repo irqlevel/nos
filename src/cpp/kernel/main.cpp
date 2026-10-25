@@ -665,6 +665,24 @@ void BpStartup(void* ctx)
             return;
         }
 
+        if (!Test::TestWakeStorm())
+        {
+            Panic("Wake storm test failed");
+            return;
+        }
+
+        if (!Test::TestIdleTakesTurns())
+        {
+            Panic("Idle task turn test failed");
+            return;
+        }
+
+        if (!Test::TestEevdf())
+        {
+            Panic("EEVDF test failed");
+            return;
+        }
+
         rust_test();
 
         if (!SoftIrq::GetInstance().Init())

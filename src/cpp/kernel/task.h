@@ -9,6 +9,7 @@
 #include "spin_lock.h"
 #include "panic.h"
 #include "object_table.h"
+#include "eevdf.h"
 
 namespace Kernel
 {
@@ -128,6 +129,10 @@ public:
         Kind What;
         bool Blocked;
         bool Asleep;
+        /* Woken (RunWaking), and not yet put back on its queue's run list:
+           a moment's state, and a task found in it for long is a wakeup
+           its CPU has not taken */
+        bool Waking;
         ulong Cpu;
         ulong Pc;
         ulong SilentCpus;
@@ -174,18 +179,46 @@ public:
        allows, or nullptr to say it is already on the right one. */
     void SetIdle();
     /* Back to an ordinary task: scheduled in its turn, not only when
-       nothing else on its queue can run (see TaskQueue::SelectNext) */
+       nothing else on its queue can run (see TaskQueue::ReleaseIdle) */
     void ClearIdle();
     bool IsIdle();
+
+    /* The idle task is the last resort only while it idles -- inside
+       Cpu::Idle, about to halt or halted. Running anything else -- the
+       boot, its self-tests, the shutdown -- it is a task like any other and
+       takes its turn: it used to be the last resort whatever it ran, and a
+       task the boot started on the boot CPU that never blocked kept the
+       boot itself off that CPU for as long as it ran. Set and cleared by
+       the idle task itself, read by its own CPU's scheduler. */
+    void SetIdling(bool idling);
+    bool IsIdling();
 
     /* A task that has asked not to be scheduled until someone wakes it.
        Block() is called by the task itself, immediately before the Schedule()
        that switches it out; Unblock() may be called from any CPU and from
-       hard IRQ context -- both are a single atomic bit operation and take no
-       lock. */
+       hard IRQ context. Both are locked operations on one word, RunState,
+       and take no lock: an Unblock() that finds the task already off its
+       CPU puts it back on its queue's run list by way of that queue's wake
+       stack (TaskQueue::PushWake), which takes none either. */
     void Block();
     void Unblock();
     bool IsBlocked();
+
+    /* Where a task is with its queue -- RunState's values. Queued: it can
+       run, and is on its queue's run list or on the CPU. Blocking: it has
+       called Block() and is still on its CPU -- its Schedule() has not taken
+       it off. Sleeping: that Schedule() has, and it is on no list but the
+       sleep list, if it is asleep until a deadline. Waking: an Unblock()
+       found it Sleeping and is handing it back (TaskQueue::PushWake). Each
+       move is a compare-and-swap, so of an Unblock() and the Schedule() that
+       takes the task off, or of a deadline and an Unblock(), exactly one
+       wins: Blocking -> Queued is the waker's, Blocking -> Sleeping its
+       CPU's, Sleeping -> Waking a waker's, Sleeping -> Queued the deadline's,
+       Waking -> Queued its CPU's, as it puts it on the run list. */
+    static const long RunQueued = 0;
+    static const long RunBlocking = 1;
+    static const long RunSleeping = 2;
+    static const long RunWaking = 3;
 
     TaskQueue* SelectNextTaskQueue();
 
@@ -199,13 +232,38 @@ public:
        resort it is, rather than as one more task to take a turn. */
     static const long FlagIdleBit = 2;
 
-    /* Set while a task is waiting to be woken. The scheduler passes over it
-       entirely -- unlike the idle task, which is merely last. */
+    /* The idle task inside Cpu::Idle (SetIdling) */
+    static const long FlagIdlingBit = 4;
+
+    /* Shown in ps's flags while the task is blocked, as it always was; what
+       says so is RunState */
     static const long FlagBlockedBit = 3;
 
 public:
+    /* On its queue's list of every task it is home to, or the exited list */
     Stdlib::ListEntry ListEntry;
     Stdlib::ListEntry TableListEntry;
+
+    /* What its queue's EEVDF knows of it -- its weight, slice, virtual
+       runtime, deadline and lag -- and its place on the queue's run list
+       (Sched.Entry) while it can run and is off the CPU; and its place on
+       the sleep list while asleep until a deadline. All under the queue's
+       lock; set from elsewhere through SetTaskNice and SetTaskSlice. */
+    SchedEntity Sched;
+    Stdlib::ListEntry SleepEntry;
+
+    /* RunQueued, RunBlocking, RunSleeping or RunWaking (above) */
+    Atomic RunState;
+
+    /* The next on the wake stack it is on (TaskQueue::PushWake): the
+       waker's to write before the push publishes it, its queue's CPU's to
+       read once it has taken the stack */
+    Task* WakeNext;
+
+    /* When it went on the run list, and whether a wait that long has been
+       reported (TaskQueue::CheckStalls): under the queue's lock */
+    ulong QueuedAt;
+    bool StallReported;
 
     TaskQueue* TaskQueue;
     SpinLock Lock;
@@ -225,6 +283,15 @@ public:
        has come (TaskQueue::SelectNext) -- the tick's walk at the latest --
        and runs it, and the task unblocks itself. 0 while it is not asleep. */
     Atomic SleepUntil;
+
+    /* When an Unblock() last took the flag down: the start of the wait for
+       the CPU that SchedStats measures at the switch in. Written by the
+       waker, from any CPU and any context. */
+    Atomic WakeTime;
+
+    /* It left the CPU able to run -- displaced, not blocked: the wait until
+       it runs again is a delay, not a wakeup's (SchedStats). Under Lock. */
+    bool SwitchedOutRunnable;
 
     Stdlib::Time RunStartTime;
     Stdlib::Time Runtime;
