@@ -251,6 +251,61 @@ public:
     ulong MapFrameSlot(ulong phyAddr);
     void UnmapFrameSlot(ulong virtAddr);
 
+    /* The pages no allocation for a guest may take: what the kernel goes on
+       needing once guests have the rest -- its heap, the pages their nested
+       tables are made of, a module loaded later. A sixteenth of the
+       machine, and no less than 64 MiB. Without it a guest given more
+       memory than the machine had free took the last page, and the next
+       allocation anywhere that may not fail -- a plain `new`, a Rust Box --
+       panicked the host under every other guest. kernel_frame_alloc keeps
+       it free; ReserveHugePool keeps twice it, the kernel's own boot being
+       still to come out of what it leaves. */
+    static const ulong KernelReserveMinBytes = 64 * Const::MB;
+    static const ulong KernelReserveFraction = 16;
+    ulong GetKernelReservePages();
+
+    /* The huge pool (hugepages=): 2MiB blocks -- physically contiguous runs
+       of HugeFramePages pages, aligned to their size -- reserved at boot for
+       guests' memory, so that a guest's nested table maps each with one
+       entry, and its TLB holds 2MiB where it held 4KiB. Taken off the free
+       list right after SetupFreePagesList, before anything has had the
+       chance to fragment it, and kept out of every other allocation for as
+       long as the machine is up: a block of the pool is on no free list and
+       in no FreePagesCount, and its pages' descriptors are as a page handed
+       out has them (self-pointing), so AllocContiguousPages and
+       CheckFreeList take none of them for free. What is in the pool and what
+       of it is free are two bitmaps of their own, not the descriptors' list
+       entries, which those two read as "on the free list".
+
+       ReserveHugePool: once, at boot, with the bytes hugepages= asks for.
+       Takes whole free blocks, the highest first -- low memory is what the
+       kernel and a device that addresses 32 bits want -- as many as that is,
+       and never so many that fewer than twice GetKernelReservePages pages
+       are left free. How many blocks it took. ReserveHugePoolKeeping is the
+       same with the pages to leave free said: what the page table fuzzer's
+       machine of a few MiB calls it with.
+
+       AllocHugeFrame: a block of the pool, zeroed as AllocPage zeroes a
+       page -- what a guest finds in its memory is what it was given, never
+       what the last guest left there: its physical address, or 0 when none
+       is free.
+
+       FreeHugeFrame: a block back into the pool. An address that is no
+       block of the pool, or one already back, is a panic, as FreeFrame's
+       double free is; FreeFrame of a page inside a block is one too, the
+       free list and the pool never sharing a page.
+
+       GetHugePoolBlocks, GetHugePoolFree: how many blocks the pool has, and
+       how many of them are free. */
+    static const ulong HugeFramePages = 512;
+    static const ulong HugeFrameSize = HugeFramePages * Const::PageSize;
+    ulong ReserveHugePool(ulong bytes);
+    ulong ReserveHugePoolKeeping(ulong bytes, ulong keepPages);
+    ulong AllocHugeFrame();
+    void FreeHugeFrame(ulong phyAddr);
+    ulong GetHugePoolBlocks();
+    ulong GetHugePoolFree();
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -350,6 +405,31 @@ private:
     Stdlib::ListEntry FreePagesList;
     ulong FreePagesCount;
     ulong TotalPagesCount;
+
+    /* The huge pool's two bitmaps, a bit a 2MiB block of physical memory:
+       in the pool, written only by ReserveHugePool before there is another
+       CPU, and free in it, under Lock. Sized for the most RAM the bootstrap
+       map can reach on either arch, one PDPT of 1GiB blocks: 512 GiB, 32
+       KiB a bitmap. */
+    static const ulong HugePoolMaxBytes = 512 * Const::GB;
+    static const ulong HugePoolMaxBlocks = HugePoolMaxBytes / HugeFrameSize;
+    static const ulong HugePoolWordBits = 8 * sizeof(ulong);
+    static const ulong HugePoolWords = HugePoolMaxBlocks / HugePoolWordBits;
+    ulong HugePoolIn[HugePoolWords];
+    ulong HugePoolFreeBits[HugePoolWords];
+    ulong HugePoolCount;
+    ulong HugePoolFreeCount;
+    /* The word AllocHugeFrame looks in first: where the last block came
+       from, so that a guest taking thousands of blocks does not scan past
+       the ones it took already for each. */
+    ulong HugePoolHint;
+
+    /* The block phyAddr is in, when it is one the pool has: false for an
+       address past the bitmaps or in no block of the pool. */
+    bool HugePoolBlockOf(ulong phyAddr, ulong& block);
+    static bool HugePoolTest(const ulong* bits, ulong block);
+    static void HugePoolSet(ulong* bits, ulong block, bool value);
+    bool HugeBlockFree(ulong block);
 };
 
 }

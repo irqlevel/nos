@@ -15,6 +15,8 @@ use crate::pod::{self, Pod};
 use crate::{Error, Result, Vendor};
 
 const PAGE: u64 = 4096;
+/// A block of the huge pool, as kcore::frame has it.
+const HUGE: u64 = 2 << 20;
 /// As hv/src/memory.rs has them.
 pub const MAX_GPA: u64 = 1 << 48;
 const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
@@ -47,6 +49,8 @@ type Pages = HashMap<u64, Box<[u8; PAGE as usize]>, BuildHasherDefault<PageHash>
 struct Region {
     base: u64,
     size: u64,
+    /// The huge pool's (`add_huge`).
+    huge: bool,
 }
 
 impl Region {
@@ -269,8 +273,28 @@ impl GuestMemory {
         m
     }
 
+    /// A guest's RAM of `mem_bytes`, as `LinuxGuest::new` lays it out
+    /// (`linux::Ram`): None for one no region could hold.
+    pub fn with_ram(mem_bytes: u64) -> Option<GuestMemory> {
+        let mut m = GuestMemory::new(Vendor::Svm).expect("memory");
+        for (base, size) in crate::linux::Ram::of(mem_bytes).regions() {
+            m.add(base, size).ok()?;
+        }
+        Some(m)
+    }
+
     pub fn add(&mut self, base: u64, size: u64) -> Result<()> {
-        if size == 0 || base % PAGE != 0 || size % PAGE != 0 {
+        self.add_region(base, size, PAGE, false)
+    }
+
+    /// As the real one gives the huge pool's: whole 2 MiB blocks, clear of
+    /// every other region -- kept as any region is, a page at a time.
+    pub fn add_huge(&mut self, base: u64, size: u64, _leaves_2m: bool) -> Result<()> {
+        self.add_region(base, size, HUGE, true)
+    }
+
+    fn add_region(&mut self, base: u64, size: u64, unit: u64, huge: bool) -> Result<()> {
+        if size == 0 || base % unit != 0 || size % unit != 0 {
             return Err(Error::BadAddress);
         }
         match base.checked_add(size) {
@@ -280,12 +304,22 @@ impl GuestMemory {
         if self.regions.iter().any(|r| base < r.base + r.size && r.base < base + size) {
             return Err(Error::BadAddress);
         }
-        self.regions.push(Region { base, size });
+        self.regions.push(Region { base, size, huge });
         Ok(())
     }
 
     pub fn size(&self) -> u64 {
         self.regions.iter().map(|r| r.size).sum()
+    }
+
+    pub fn huge_size(&self) -> u64 {
+        self.regions.iter().filter(|r| r.huge).map(|r| r.size).sum()
+    }
+
+    /// Whether `[gpa, gpa + len)` is in one region: what the targets hold
+    /// a memory map's RAM to.
+    pub fn backs(&self, gpa: u64, len: u64) -> bool {
+        self.regions.iter().any(|r| r.contains(gpa, len))
     }
 
     fn inside(&self, gpa: u64, len: usize) -> Result<()> {

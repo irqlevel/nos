@@ -20,9 +20,16 @@
 //! through the window maps and unmaps a page, a TLB flush, at every access:
 //! frames of a [`Run`] mapped together for as long as a [`Mapped`] lives,
 //! which holds a share of the run so that none of them is freed under it.
+//!
+//! A [`HugeFrame`] is the same thing 2 MiB at a time: a block of the huge
+//! pool the kernel reserves at boot (`hugepages=`), 512 pages in a row and
+//! aligned to their size, which a guest's nested table maps with one entry.
+//! Its pages are copied into and out of a page at a time, as a frame's are
+//! ([`FramePage`]).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use ffi::frame;
@@ -50,13 +57,66 @@ impl Frame {
         self.phys
     }
 
+    /// The page, to copy into and out of: borrowed from this frame, which
+    /// keeps it allocated for as long as the borrow lasts.
+    #[inline]
+    pub fn page(&self) -> FramePage<'_> {
+        FramePage { phys: self.phys, _owner: PhantomData }
+    }
+
+    /// Copy `buf.len()` bytes out of the page from `offset`
+    /// ([`FramePage::read`]).
+    #[inline]
+    pub fn read(&self, offset: usize, buf: &mut [u8]) -> bool {
+        self.page().read(offset, buf)
+    }
+
+    /// Copy `data` into the page at `offset` ([`FramePage::write`]).
+    #[inline]
+    pub fn write(&self, offset: usize, data: &[u8]) -> bool {
+        self.page().write(offset, data)
+    }
+
+    /// The 16-bit word at `offset`, loaded as one access with acquire order
+    /// ([`FramePage::load_u16`]).
+    #[inline]
+    pub fn load_u16(&self, offset: usize) -> Option<u16> {
+        self.page().load_u16(offset)
+    }
+
+    /// `value` stored at `offset` as one access with release order
+    /// ([`FramePage::store_u16`]).
+    #[inline]
+    pub fn store_u16(&self, offset: usize, value: u16) -> bool {
+        self.page().store_u16(offset, value)
+    }
+}
+
+/// One page of RAM someone owns -- a [`Frame`], or a page of a
+/// [`HugeFrame`] -- borrowed from its owner, which keeps it allocated for as
+/// long as the borrow lasts: what the host copies into and out of, through
+/// the kernel's temporary window, and never holds a reference into.
+#[derive(Clone, Copy)]
+pub struct FramePage<'a> {
+    phys: u64,
+    _owner: PhantomData<&'a ()>,
+}
+
+impl FramePage<'_> {
+    /// Its physical address.
+    #[inline]
+    pub fn phys(&self) -> u64 {
+        self.phys
+    }
+
     /// Copy `buf.len()` bytes out of the page from `offset`. False, and
     /// nothing read, when that is not inside the page.
     pub fn read(&self, offset: usize, buf: &mut [u8]) -> bool {
         if !inside(offset, buf.len()) {
             return false;
         }
-        /* The page is this value's, and `buf` is writable for its length. */
+        /* The page is the owner's, borrowed for `self`'s life, and `buf` is
+         * writable for its length. */
         unsafe { frame::kernel_frame_read(self.phys, offset, buf.as_mut_ptr(), buf.len()) == 0 }
     }
 
@@ -75,7 +135,8 @@ impl Frame {
         if !inside(offset, data.len()) {
             return false;
         }
-        /* The page is this value's, and `data` is readable for its length. */
+        /* The page is the owner's, borrowed for `self`'s life, and `data` is
+         * readable for its length. */
         unsafe { frame::kernel_frame_write(self.phys, offset, data.as_ptr(), data.len()) == 0 }
     }
 
@@ -90,7 +151,8 @@ impl Frame {
             return None;
         }
         let mut value = 0u16;
-        /* The page is this value's, and `value` is a word to write. */
+        /* The page is the owner's, borrowed for `self`'s life, and `value` is
+         * a word to write. */
         (unsafe { frame::kernel_frame_load16(self.phys, offset, &mut value) } == 0).then_some(value)
     }
 
@@ -101,7 +163,7 @@ impl Frame {
         if offset % 2 != 0 || !inside(offset, 2) {
             return false;
         }
-        /* The page is this value's. */
+        /* The page is the owner's, borrowed for `self`'s life. */
         unsafe { frame::kernel_frame_store16(self.phys, offset, value) == 0 }
     }
 }
@@ -122,55 +184,155 @@ impl Drop for Frame {
     }
 }
 
-/// Frames in a table of a page's worth each, so that no one allocation of
-/// the table outgrows a page however many frames there are.
-const PIECE: usize = PAGE_SIZE / core::mem::size_of::<Frame>();
+/// The pages of a [`HugeFrame`]: 2 MiB of them.
+pub const HUGE_PAGES: usize = 512;
+/// A huge frame's bytes, and the alignment of its physical address.
+pub const HUGE_SIZE: u64 = (HUGE_PAGES * PAGE_SIZE) as u64;
+
+/// A block of the huge pool, owned: 2 MiB of RAM -- [`HUGE_PAGES`] pages in a
+/// row, aligned to their size -- handed out zeroed and mapped nowhere, back
+/// into the pool when dropped. What a guest's nested table maps with one
+/// entry where a [`Frame`] takes one each.
+pub struct HugeFrame {
+    phys: u64,
+}
+
+impl HugeFrame {
+    /// A zeroed block of the pool, or None when it has none free -- or there
+    /// is no pool, `hugepages=` not given.
+    pub fn new() -> Option<Self> {
+        match frame::kernel_frame_alloc_huge() {
+            0 => None,
+            phys => Some(Self { phys }),
+        }
+    }
+
+    /// Its physical address: what a table that maps it is told.
+    #[inline]
+    pub fn phys(&self) -> u64 {
+        self.phys
+    }
+
+    /// Its page `i`, to copy into and out of: None past its last.
+    #[inline]
+    pub fn page(&self, i: usize) -> Option<FramePage<'_>> {
+        (i < HUGE_PAGES).then(|| FramePage { phys: self.phys + (i * PAGE_SIZE) as u64, _owner: PhantomData })
+    }
+}
+
+impl Drop for HugeFrame {
+    fn drop(&mut self) {
+        /* The address `new` was given, back once: a `HugeFrame` is neither
+         * `Clone` nor `Copy`, and this is the only place it goes back. That
+         * no table still maps it is the owner's to keep, as for a `Frame`. */
+        unsafe { frame::kernel_frame_free_huge(self.phys) }
+    }
+}
+
+/// The huge pool as it stands: its blocks, 0 with no `hugepages=`, and how
+/// many of them are free.
+#[derive(Clone, Copy, Debug)]
+pub struct HugePool {
+    pub blocks: u64,
+    pub free: u64,
+}
+
+/// The huge pool, this instant.
+pub fn huge_pool() -> HugePool {
+    HugePool { blocks: frame::kernel_frame_huge_blocks(), free: frame::kernel_frame_huge_free() }
+}
+
+/// A run's pages [`HUGE_PAGES`] at a time: one block of the pool, or that
+/// many frames -- fewer in a run's last piece -- each a page of its own, in a
+/// table of a page's worth so that no one allocation of it outgrows a page
+/// however many frames there are.
+enum Piece {
+    Huge(HugeFrame),
+    Pages(Vec<Frame>),
+}
+
+const _: () = assert!(HUGE_PAGES * core::mem::size_of::<Frame>() == PAGE_SIZE);
+
+/// Pages a table maps with one entry: the first one's address and how many
+/// are in a row from it -- 1 for a frame, [`HUGE_PAGES`] for a block of the
+/// pool, its address aligned to [`HUGE_SIZE`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub phys: u64,
+    pub pages: usize,
+}
 
 /// The most frames one [`Mapped`] maps: a queue of 256 entries' rings are
 /// three pages.
 pub const MAPPED_MAX: usize = 4;
 
-/// Frames owned together, and shared: a region of a guest's memory, which
+/// Pages owned together, and shared: a region of a guest's memory, which
 /// a mapping of some of them holds a share of ([`Mapped`]), so that they go
-/// back to the free list only once every mapping of them is undone --
-/// whichever of the run's holders goes last.
+/// back to the free list -- or to the pool -- only once every mapping of
+/// them is undone, whichever of the run's holders goes last.
 #[derive(Clone)]
 pub struct Run {
-    pieces: Arc<Vec<Vec<Frame>>>,
+    pieces: Arc<Vec<Piece>>,
 }
 
 impl Run {
     /// `count` zeroed frames, or None when they cannot all be had -- those
     /// taken by then going back as the attempt is dropped.
     pub fn new(count: usize) -> Option<Run> {
-        let mut pieces: Vec<Vec<Frame>> = Vec::new();
-        pieces.try_reserve_exact(count.div_ceil(PIECE)).ok()?;
+        let mut pieces: Vec<Piece> = Vec::new();
+        pieces.try_reserve_exact(count.div_ceil(HUGE_PAGES)).ok()?;
         let mut left = count;
         while left > 0 {
-            let n = left.min(PIECE);
+            let n = left.min(HUGE_PAGES);
             let mut piece = Vec::new();
             piece.try_reserve_exact(n).ok()?;
             for _ in 0..n {
                 piece.push(Frame::new()?);
             }
-            pieces.push(piece);
+            pieces.push(Piece::Pages(piece));
             left -= n;
         }
         Some(Run { pieces: Arc::new(pieces) })
     }
 
-    /// Its `i`th frame, None past its end.
+    /// `count` zeroed pages, every one of them the huge pool's: whole
+    /// blocks, so a multiple of [`HUGE_PAGES`], or None -- as it is when the
+    /// pool cannot give them all, the blocks taken by then going back.
+    pub fn new_huge(count: usize) -> Option<Run> {
+        if count % HUGE_PAGES != 0 {
+            return None;
+        }
+        let blocks = count / HUGE_PAGES;
+        let mut pieces: Vec<Piece> = Vec::new();
+        pieces.try_reserve_exact(blocks).ok()?;
+        for _ in 0..blocks {
+            pieces.push(Piece::Huge(HugeFrame::new()?));
+        }
+        Some(Run { pieces: Arc::new(pieces) })
+    }
+
+    /// Its page `i`, to copy into and out of: None past its end.
     #[inline]
-    pub fn frame(&self, i: usize) -> Option<&Frame> {
-        self.pieces.get(i / PIECE)?.get(i % PIECE)
+    pub fn page(&self, i: usize) -> Option<FramePage<'_>> {
+        match self.pieces.get(i / HUGE_PAGES)? {
+            Piece::Huge(block) => block.page(i % HUGE_PAGES),
+            Piece::Pages(frames) => frames.get(i % HUGE_PAGES).map(Frame::page),
+        }
     }
 
-    /// Its frames, in order.
-    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
-        self.pieces.iter().flatten()
+    /// Its pages in order, as a table maps them: a block of the pool one
+    /// extent of [`HUGE_PAGES`], a frame one of its own.
+    pub fn extents(&self) -> impl Iterator<Item = Extent> + '_ {
+        self.pieces.iter().flat_map(|piece| {
+            let (block, frames): (Option<Extent>, &[Frame]) = match piece {
+                Piece::Huge(b) => (Some(Extent { phys: b.phys(), pages: HUGE_PAGES }), &[]),
+                Piece::Pages(f) => (None, f.as_slice()),
+            };
+            block.into_iter().chain(frames.iter().map(|f| Extent { phys: f.phys(), pages: 1 }))
+        })
     }
 
-    /// Its frames `first..first + count`, `MAPPED_MAX` at most, mapped into
+    /// Its pages `first..first + count`, `MAPPED_MAX` at most, mapped into
     /// the kernel's space together in that order: None when they are not
     /// all its own, or there is no address left for them.
     pub fn map(&self, first: usize, count: usize) -> Option<Mapped> {
@@ -179,9 +341,9 @@ impl Run {
         }
         let mut phys = [0u64; MAPPED_MAX];
         for (k, p) in phys.iter_mut().take(count).enumerate() {
-            *p = self.frame(first.checked_add(k)?)?.phys();
+            *p = self.page(first.checked_add(k)?)?.phys();
         }
-        /* Frames of this run, `count` of them in `phys`: the mapping made
+        /* Pages of this run, `count` of them in `phys`: the mapping made
          * holds a share of the run, which keeps them allocated until after
          * its `drop` has undone it. */
         let va = unsafe { frame::kernel_frames_map(phys.as_ptr(), count) };

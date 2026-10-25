@@ -92,6 +92,10 @@ pub enum Error {
     /// VT-x without unrestricted guest: a guest CPU cannot run in real
     /// mode, which is how every CPU but the first of a guest starts.
     NoUnrestrictedGuest,
+    /// The kernel has a huge pool (`hugepages=`), and not as many of its
+    /// 2 MiB blocks free as the guest's memory: with a pool, a guest's
+    /// memory is the pool's, or the guest does not start.
+    NoHugePages,
 }
 
 impl core::fmt::Display for Error {
@@ -108,6 +112,7 @@ impl core::fmt::Display for Error {
             Error::Unmapped => "no guest memory at that address",
             Error::BadAddress => "not a guest physical address that can be given memory",
             Error::NoUnrestrictedGuest => "VT-x without unrestricted guest cannot start a guest's other CPUs, which start in real mode",
+            Error::NoHugePages => "not that many 2 MiB pages free in the huge pool",
         })
     }
 }
@@ -131,6 +136,7 @@ impl Error {
             Error::Unmapped => 9,
             Error::BadAddress => 10,
             Error::NoUnrestrictedGuest => 11,
+            Error::NoHugePages => 12,
         }
     }
 
@@ -149,6 +155,7 @@ impl Error {
             9 => Error::Unmapped,
             10 => Error::BadAddress,
             11 => Error::NoUnrestrictedGuest,
+            12 => Error::NoHugePages,
             _ => Error::EnableFailed,
         }
     }

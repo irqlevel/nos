@@ -9,8 +9,21 @@ unsafe extern "C" {
     /// is a leak, not undefined behaviour.
     pub safe fn kernel_frame_alloc() -> u64;
     /// Back onto the free list. The kernel panics on an address that is not
-    /// a page, and on a page that is on the free list already.
+    /// a page, on a page that is on the free list already, and on a page of
+    /// the huge pool.
     pub fn kernel_frame_free(phys: u64);
+    /// A block of the huge pool (`hugepages=`): 512 pages, physically
+    /// contiguous and aligned to their 2 MiB, zeroed -- its physical
+    /// address, or 0 when the pool has none free or there is no pool. Sound
+    /// anywhere, as `kernel_frame_alloc` is.
+    pub safe fn kernel_frame_alloc_huge() -> u64;
+    /// A block back into the pool. The kernel panics on an address that is
+    /// no block of the pool, and on a block that is back already.
+    pub fn kernel_frame_free_huge(phys: u64);
+    /// How many blocks the pool has -- 0 with no `hugepages=` -- and how
+    /// many of them are free. Values only.
+    pub safe fn kernel_frame_huge_blocks() -> u64;
+    pub safe fn kernel_frame_huge_free() -> u64;
     /// Copy `len` bytes out of the frame at `offset` into `buf`: 0, or -1
     /// with nothing copied when that is not inside one page of RAM.
     pub fn kernel_frame_read(phys: u64, offset: usize, buf: *mut u8, len: usize) -> i32;

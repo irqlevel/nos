@@ -64,6 +64,8 @@ struct Expected
     std::vector<uint8_t> RootUuid = std::vector<uint8_t>(Parameters::UuidBytes, 0);
     bool UbsanWarn = false;
     bool UbsanSet = false;
+    /* hugepages=: a share in percent, or bytes -- the last one said */
+    ulong HugePercent = 0, HugeBytes = 0;
     std::string Kept;
 };
 
@@ -239,6 +241,29 @@ void Take(Expected& e, const std::string& token)
         if (Number(value, n) && n > 0 && n <= 1024)
             e.TailKb = n;
     }
+    else if (key == "hugepages")
+    {
+        /* A number and what it is: % of RAM, G or M of it; at most 100%,
+           512 GiB, and a value shorter than 16 */
+        if (value.size() < 2 || value.size() >= 16 || !Number(value.substr(0, value.size() - 1), n) || n == 0)
+            return;
+        const char unit = value.back();
+        if (unit == '%' && n <= 100)
+        {
+            e.HugePercent = n;
+            e.HugeBytes = 0;
+        }
+        else if ((unit == 'G' || unit == 'g') && n <= 512)
+        {
+            e.HugeBytes = n << 30;
+            e.HugePercent = 0;
+        }
+        else if ((unit == 'M' || unit == 'm') && n <= 512 * 1024)
+        {
+            e.HugeBytes = n << 20;
+            e.HugePercent = 0;
+        }
+    }
     else if (key == "loglevel")
     {
         if (Number(value, n) && n <= static_cast<unsigned long long>(Kernel::MaxTraceLevel))
@@ -326,7 +351,11 @@ Expected Read(const std::string& line)
 
 const char* const Words[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
-                             "nctail", "loglevel", "root", "fstest", "disklog", "dns"};
+                             "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages"};
+
+const char* const HugeValues[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
+                                  "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
+                                  "99999999999999G", "9999999999999M", "5x", "-1G"};
 
 const char* const BadIps[] = {"1.2.3", "1.2.3.4.5", "01.2.3.4", "1..2.3", "a.b.c.d", "1.2.3.4:5",
                               "255.255.255.255"};
@@ -356,6 +385,13 @@ std::string Value(Fuzz::Input& in, const std::string& key)
         if (in.Chance(24))
             ip = in.Pick(BadIps);
         return ip + (in.Chance(16) ? "" : ":") + std::to_string(in.Below(70000));
+    }
+    if (key == "hugepages")
+    {
+        if (in.Chance(128))
+            return in.Pick(HugeValues);
+        const char* units[] = {"%", "G", "M", "g", "m", "K", ""};
+        return std::to_string(in.Chance(16) ? in.Value32() : in.Below(600)) + in.Pick(units);
     }
     if (key == "root")
     {
@@ -452,6 +488,16 @@ void Run(Fuzz::Input& in)
     INVARIANT(p.IsRxPollEnabled() == e.RxPoll && p.IsDnsEnabled() == e.Dns && p.IsRootReadOnly() == e.Ro &&
         p.IsFsTest() == e.FsTest && p.IsDiskLogOn() == e.DiskLog, "rxpoll, dns, ro, fstest or disklog wrong");
     INVARIANT(p.GetLogLevel() == e.LogLevel, "loglevel %d, not %d", p.GetLogLevel(), e.LogLevel);
+    /* The pool asked of a machine of some size: the share of it, or the
+       bytes, whichever the line said last */
+    {
+        const ulong total = (in.Chance(64) ? (512UL << 30) : (static_cast<ulong>(in.Range(1, 1024)) << 26));
+        const ulong want = e.HugePercent != 0 ? total / 100 * e.HugePercent : e.HugeBytes;
+        INVARIANT(p.GetHugePoolBytes(total) == want, "hugepages= asks %lu bytes of %lu, not %lu",
+            p.GetHugePoolBytes(total), total, want);
+        if (want != 0)
+            Fuzz::Reached(e.HugePercent != 0 ? "hugepages= a share" : "hugepages= a size");
+    }
     const Parameters::RootSpec& root = p.GetRoot();
     INVARIANT(root.Mode == e.RootMode, "root mode %d, not %d", root.Mode, e.RootMode);
     INVARIANT(memchr(root.Value, 0, sizeof(root.Value)) != nullptr, "the root's value is unterminated");

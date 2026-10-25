@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use kcore::consts::{MAX_CPUS, PAGE_SIZE};
-use kcore::frame::Frame;
+use kcore::frame::{huge_pool, Frame, HugeFrame, HUGE_PAGES, HUGE_SIZE};
 use kcore::trace;
 
 /// The byte the test writes at `at`: a different run on every line of the
@@ -88,4 +88,45 @@ pub fn selftest() {
     assert!(bad == 0, "frame selftest: cpus {:#x} read the frame back wrong", bad);
 
     trace!(0, "frame selftest: passed on cpus {:#x}", online);
+    huge_selftest();
+}
+
+/// A block of the huge pool, when the boot reserved one (`hugepages=`):
+/// handed out aligned and zeroed -- its first page, one in the middle and its
+/// last read at their ends -- written through its pages and read back, its
+/// page past the last refused, and back into the pool, whose count of free
+/// blocks says so each way.
+fn huge_selftest() {
+    let pool = huge_pool();
+    if pool.blocks == 0 {
+        return;
+    }
+    let Some(block) = HugeFrame::new() else {
+        /* Nothing has taken one yet: a pool with none to hand out has lost
+         * its blocks, or never had them. */
+        panic!("huge frame selftest: a pool of {} blocks, {} free, hands out none", pool.blocks, pool.free);
+    };
+    assert!(huge_pool().free + 1 == pool.free, "huge frame selftest: a block handed out, and the pool's free count {} \
+        where it was {}", huge_pool().free, pool.free);
+    assert!(block.phys() % HUGE_SIZE == 0, "huge frame selftest: a block at {:#x}, not aligned", block.phys());
+
+    for i in [0, HUGE_PAGES / 2, HUGE_PAGES - 1] {
+        let Some(page) = block.page(i) else { panic!("huge frame selftest: no page {} in a block", i) };
+        let mut probe = [0xFFu8; 64];
+        for at in [0, PAGE_SIZE - probe.len()] {
+            assert!(page.read(at, &mut probe) && probe.iter().all(|&b| b == 0),
+                "huge frame selftest: page {} of a fresh block is not zeroed at {}", i, at);
+        }
+        let mark = [pattern(i); 64];
+        assert!(page.write(PAGE_SIZE - mark.len(), &mark), "huge frame selftest: a write to page {} refused", i);
+        assert!(page.read(PAGE_SIZE - probe.len(), &mut probe) && probe == mark,
+            "huge frame selftest: page {} read back wrong", i);
+    }
+    assert!(block.page(HUGE_PAGES).is_none(), "huge frame selftest: a page past the block's last");
+
+    let at = block.phys();
+    drop(block);
+    assert!(huge_pool().free == pool.free, "huge frame selftest: a block given back, and the pool's free count {} \
+        where it was {}", huge_pool().free, pool.free);
+    trace!(0, "huge frame selftest: passed, a block of {} at {:#x} -- the pool {} of them", HUGE_SIZE, at, pool.blocks);
 }

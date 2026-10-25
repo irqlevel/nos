@@ -104,13 +104,17 @@ const NIC_IRQ: u8 = 10;
 /// of the local APIC's page, the IO-APIC's address the MP table gives, and
 /// the page read of an absent device finds.
 const MSIX_PAGES: u32 = 0xFE00_0000;
-/// The most RAM a guest has: one region from 0, ending below the devices'
-/// pages -- the MSI-X tables', the IO-APIC's, the local APIC's. Past them it
-/// would cover them, and the guest would read and write its devices'
-/// registers as memory, none of them hearing of it: an APIC in xAPIC mode
-/// that is not there, with nothing to say so. More RAM than this is a hole
-/// below 4 GiB and RAM above it, as a PC has.
-pub const MAX_MEM_BYTES: u64 = MSIX_PAGES as u64;
+/// The most RAM a guest has: the most this kernel can take of a machine,
+/// one PDPT of 1 GiB blocks (`BuiltinPageTable::MapHighRam`) -- no guest is
+/// bigger than its host. Laid out as `linux::Ram` says: up to the devices'
+/// pages from 0, the rest from 4 GiB, and all of it below what the guest is
+/// told a physical address is (`policy::phys_bits`).
+pub const MAX_MEM_BYTES: u64 = 512 << 30;
+/* The RAM below 4 GiB ends where the devices' pages begin: past them it
+ * would cover them, and the guest would read and write its devices'
+ * registers as memory, none of them hearing of it -- an APIC in xAPIC mode
+ * that is not there, with nothing to say so. */
+const _: () = assert!(linux::LOW_RAM_END <= MSIX_PAGES as u64);
 /// The MSI-X entries each kind of device offers: one for configuration
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
@@ -651,16 +655,31 @@ impl LinuxGuest {
     /// interrupt remapping is not one the architecture has, and Linux,
     /// finding its firmware left one so, turns it off -- through a page it
     /// has not mapped, 6.1 and 6.18 alike, and faults.
-    pub fn new(machine: &Machine, mem_bytes: u64, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool, ioapic: bool)
-        -> Result<(Self, Vec<GuestCpu>)>
+    ///
+    /// Its RAM is laid out as `linux::Ram` says, and is the huge pool's
+    /// when `huge` -- every byte of it, 2 MiB a block, or `NoHugePages` --
+    /// and frames of its own when not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(machine: &Machine, mem_bytes: u64, huge: bool, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool,
+               ioapic: bool) -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
         if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) || mem_bytes > MAX_MEM_BYTES {
             return Err(Error::BadAddress);
         }
+        let ram = linux::Ram::of(mem_bytes);
+        if ram.end().is_none_or(|end| end > 1u64 << crate::policy::phys_bits()) {
+            return Err(Error::BadAddress);
+        }
         let x2apic = x2apic && !ioapic;
         let mut memory = GuestMemory::new(machine.caps().vendor())?;
-        memory.add(0, mem_bytes)?;
+        for (base, size) in ram.regions() {
+            if huge {
+                memory.add_huge(base, size, machine.caps().nested_2m())?;
+            } else {
+                memory.add(base, size)?;
+            }
+        }
 
         let mut vcpus = Vec::new();
         vcpus.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
@@ -2350,7 +2369,7 @@ impl LinuxGuest {
 /// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
 /// the page the function's BAR 1 names, where the guest writes its table
 /// and the device reads it. None for a guest with no APIC to take a
-/// message. RAM never reaches it (`MAX_MEM_BYTES`).
+/// message. RAM never reaches it (`linux::LOW_RAM_END`).
 fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option<u32>> {
     if !apic {
         return Ok(None);

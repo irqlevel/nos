@@ -53,6 +53,10 @@ fi
 scripts/mkrootfs.sh "$TMPDIR_SMOKE/root.img" 64 "" 1024 > /dev/null \
     || fail "cannot make the root filesystem image"
 
+# hugepages=64M: the huge pool reserved at boot, and a block of it handed
+# out, written and given back by the frames' selftest -- on every arm64
+# boot, here and in CI's UB-sanitized one. x86's nos.iso boots without one:
+# the hv gates that boot it give their guests 4 KiB frames.
 echo "smoke-arm64: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 qemu-system-aarch64 \
     -M virt,gic-version=3 \
@@ -60,7 +64,7 @@ qemu-system-aarch64 \
     -m 1024 \
     $ACCEL_OPTS \
     -kernel nos-arm64.img \
-    -append "root=auto fstest=on" \
+    -append "root=auto fstest=on hugepages=64M" \
     -global virtio-mmio.force-legacy=false \
     -drive "file=$TMPDIR_SMOKE/root.img,format=raw,id=hd,if=none" \
     -device virtio-blk-device,drive=hd \

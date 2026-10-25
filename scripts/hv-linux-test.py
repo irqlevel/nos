@@ -730,8 +730,8 @@ def attach(args):
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "128", rootdir],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel_args(args) + [
-            "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", nos_mem(args), "-smp", NOS_SMP] + accel_args(args) + [
+            "-cdrom", nos_iso(args), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
             "-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
@@ -812,6 +812,20 @@ def accel_args(args):
     return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", qemu_cpu or "max"]
 
 
+def nos_iso(args):
+    """The ISO nos boots from: nos.iso, or --nos-iso's -- `make nos-test.iso
+    TEST_ISO_ARGS=...` for a parameter nos.iso does not give, a huge pool's
+    (`hugepages=`) above all. By getattr, as --nos-mem: hv-distro-test.py
+    boots through boot_rc with arguments of its own."""
+    iso = getattr(args, "nos_iso", None)
+    return os.path.abspath(iso) if iso else os.path.join(ROOT, "nos.iso")
+
+
+def nos_mem(args):
+    """nos's own RAM, QEMU's -m: --nos-mem's, or 2G."""
+    return getattr(args, "nos_mem", None) or "2G"
+
+
 def boot_rc(args, tmp, rc, extra=None, qemu=None):
     """nos with /etc/rc and the guest's files on its root, under TCG, run
     until rc's last line has printed. The QEMU process and the serial log;
@@ -837,8 +851,8 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
         root_device = ["-device", "nvme,serial=nosroot,drive=drive0"]
     else:
         root_device = ["-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel_args(args) + [
-            "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", nos_mem(args), "-smp", NOS_SMP] + accel_args(args) + [
+            "-cdrom", nos_iso(args), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image] + root_device + (qemu or [])
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t0 = time.time()
@@ -1254,8 +1268,8 @@ def run(args):
     accel = accel_args(args)
     print("accelerator: %s" % ("KVM, the host's %s (nested)" % ("Intel VT-x" if hvt.host_has_vmx() else "AMD-V")
                                if "-enable-kvm" in accel else "TCG, -cpu %s (AMD-V)" % accel[1]))
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel + [
-            "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", nos_mem(args), "-smp", NOS_SMP] + accel + [
+            "-cdrom", nos_iso(args), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
 
@@ -1332,6 +1346,10 @@ def main():
     ap.add_argument("--noapicv", action="store_true",
                     help="the guest's interrupts injected by the run loop, the CPU delivering none (hv's `noapicv`)")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
+    ap.add_argument("--nos-iso", help="boot nos from this ISO instead of nos.iso: `make nos-test.iso "
+                                      "TEST_ISO_ARGS=hugepages=6G` makes one whose guests' memory is the huge pool's")
+    ap.add_argument("--nos-mem", default="2G",
+                    help="nos's own RAM, QEMU's -m (default 2G): more for a guest of --mem past it, and its pool")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
     ap.add_argument("--expect", action="append", default=[], help="extra text the console must contain (repeatable)")
@@ -1377,8 +1395,8 @@ def main():
         if version is None or version < hvt.TCG_REAL_MODE:
             sys.exit("--cpus under TCG needs QEMU %d.%d or later: a guest's other CPUs start in real mode, "
                      "which an older TCG does not put through the nested page table" % hvt.TCG_REAL_MODE)
-    if not os.path.exists(os.path.join(ROOT, "nos.iso")):
-        sys.exit("build nos.iso first (make)")
+    if not os.path.exists(nos_iso(args)):
+        sys.exit("build %s first (make%s)" % (nos_iso(args), " nos-test.iso" if args.nos_iso else ""))
 
     if args.attach or args.disk or args.net:
         if not args.initrd:

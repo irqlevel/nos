@@ -1125,7 +1125,7 @@ fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, false) {
+    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 2, Arc::new(doorbells), true, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -1604,7 +1604,7 @@ fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bo
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, true) {
+    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 2, Arc::new(doorbells), true, true) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -2104,7 +2104,7 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         false
     };
     let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -2326,7 +2326,7 @@ struct DrRun {
 fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Result<DrRun, String> {
     let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
     let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
-    let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false).map_err(made)?;
+    let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
     let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
     let m = guest.memory();
     one_cpu_board(m, &mut bsp, DR_CODE)
@@ -2593,7 +2593,7 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         false
     };
     let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -2908,7 +2908,7 @@ fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         false
     };
     let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };

@@ -22,7 +22,10 @@
 // have it, every mapping's translation, every page either free, the
 // sequence's, a table, or the machine's own, and never two; a page handed out
 // zeroed; a map that fails leaving nothing mapped; no TmpMap slot left behind
-// by any path.
+// by any path. A machine of more than 4 MiB may have a huge pool reserved
+// (hugepages=), its 2MiB blocks handed out and given back: a block of it
+// never on the free list, never another's, zeroed when handed out, and the
+// pool's counts its bitmaps'.
 #include "host.h"
 
 /* The page table and the memory map are singletons with private
@@ -212,6 +215,8 @@ struct PageState
         Free,
         Held,    /* the sequence's */
         Table,   /* a page table's, the kernel's own */
+        Pool,    /* in a block of the huge pool, free there */
+        Huge,    /* in a block of the huge pool the sequence holds */
     };
     Kind State;
     long Ref;
@@ -233,8 +238,13 @@ std::map<ulong, Tmp> Tmps;
 size_t TmpSlots;
 /* Leaves whose protection the sequence set: va -> (writable, executable) */
 std::map<ulong, std::pair<bool, bool>> Prot;
+/* The pool's blocks, by their first page's address: whether the sequence
+   holds each */
+std::map<ulong, bool> PoolBlocks;
 
 const ulong ReservedPages = 8;
+const ulong HugePages = PageTable::HugeFramePages;
+const ulong HugeBytes = PageTable::HugeFrameSize;
 
 PageTable& Pt()
 {
@@ -332,6 +342,21 @@ void Check(const char* after)
     }
     INVARIANT(Pt().FreePagesCount == onList, "FreePagesCount %lu with %lu on the list, after %s",
         Pt().FreePagesCount, onList, after);
+
+    /* The pool as the model has it, in its counts and its bitmaps */
+    ulong poolFree = 0;
+    for (const auto& b : PoolBlocks)
+    {
+        const ulong block = b.first / HugeBytes;
+        INVARIANT(Pt().HugePoolTest(Pt().HugePoolIn, block), "block 0x%lx not in the pool's bitmap, after %s", b.first,
+            after);
+        INVARIANT(Pt().HugePoolTest(Pt().HugePoolFreeBits, block) == !b.second, "block 0x%lx %s by the bitmap, after %s",
+            b.first, b.second ? "free" : "held", after);
+        poolFree += !b.second;
+    }
+    INVARIANT(Pt().GetHugePoolBlocks() == PoolBlocks.size() && Pt().GetHugePoolFree() == poolFree,
+        "the pool says %lu blocks, %lu free, where it has %zu, %lu free, after %s", Pt().GetHugePoolBlocks(),
+        Pt().GetHugePoolFree(), PoolBlocks.size(), poolFree, after);
 
     /* Tables the walk from the root finds are pages that left the free list
        for the kernel itself: the model learns of them here */
@@ -840,11 +865,109 @@ void MapMmio(Fuzz::Input& in)
     Fuzz::Reached("an MMIO map");
 }
 
+/* The huge pool, reserved as the boot reserves it: whole free blocks, the
+   highest first, leaving keep pages free. */
+void ReservePool(Fuzz::Input& in)
+{
+    const ulong keep = in.Below(M.Pages);
+    const ulong want = in.Chance(8) ? in.Value32() : in.Below(4) + in.Chance(192);
+    const ulong before = Pt().FreePagesCount;
+    const ulong got = Pt().ReserveHugePoolKeeping(want * HugeBytes, keep);
+    INVARIANT(got <= want, "%lu blocks reserved of %lu asked", got, want);
+    INVARIANT(got == 0 || Pt().FreePagesCount >= keep, "the pool left %lu pages free, under the %lu kept",
+        Pt().FreePagesCount, keep);
+    INVARIANT(before - Pt().FreePagesCount == got * HugePages, "%lu pages left the free list for %lu blocks",
+        before - Pt().FreePagesCount, got);
+    for (ulong block = 0; block < M.Pages / HugePages; block++)
+    {
+        if (!Pt().HugePoolTest(Pt().HugePoolIn, block))
+            continue;
+        for (ulong i = block * HugePages; i < (block + 1) * HugePages; i++)
+        {
+            INVARIANT(Pages[i].State == PageState::Free, "page %lu reserved for the pool, and not free (state %d)", i,
+                Pages[i].State);
+            Pages[i].State = PageState::Pool;
+        }
+        PoolBlocks[block * HugeBytes] = false;
+    }
+    INVARIANT(PoolBlocks.size() == got, "%zu blocks in the bitmap, %lu said reserved", PoolBlocks.size(), got);
+    /* Highest first: a block still free is below every block the pool
+       took, and is left only when the pool had all it asked or the pages
+       kept stopped it */
+    const bool limited = Pt().FreePagesCount < keep + HugePages;
+    for (ulong block = 0; block < M.Pages / HugePages; block++)
+    {
+        bool free = true;
+        for (ulong i = block * HugePages; i < (block + 1) * HugePages && free; i++)
+            free = Pages[i].State == PageState::Free;
+        if (!free)
+            continue;
+        INVARIANT(got == want || limited, "block %lu left free with %lu of %lu reserved and room for more", block, got,
+            want);
+        INVARIANT(PoolBlocks.empty() || block * HugeBytes < PoolBlocks.begin()->first,
+            "block %lu left free above block 0x%lx of the pool", block, PoolBlocks.begin()->first);
+    }
+    if (got != 0 && got < want)
+        Fuzz::Reached("a pool cut short");
+    if (got != 0)
+        Fuzz::Reached("a huge pool");
+}
+
+void AllocHuge(Fuzz::Input& in)
+{
+    (void)in;
+    ulong poolFree = 0;
+    for (const auto& b : PoolBlocks)
+        poolFree += !b.second;
+    const ulong phys = Pt().AllocHugeFrame();
+    if (phys == 0)
+    {
+        INVARIANT(poolFree == 0, "AllocHugeFrame failed with %lu blocks free", poolFree);
+        return;
+    }
+    auto it = PoolBlocks.find(phys);
+    INVARIANT(it != PoolBlocks.end() && !it->second, "AllocHugeFrame handed out 0x%lx, no free block of the pool",
+        phys);
+    it->second = true;
+    for (ulong i = 0; i < HugePages; i++)
+    {
+        PageState& st = Pages[Index(phys) + i];
+        INVARIANT(st.State == PageState::Pool, "page %lu of a block handed out is not the pool's (state %d)",
+            Index(phys) + i, st.State);
+        st.State = PageState::Huge;
+        CheckZeroed(phys + i * PageBytes, "AllocHugeFrame");
+    }
+    /* What a guest would write there: the next one handed it must find
+       zeros again */
+    memset(M.Phys + phys, in.U8() | 1, HugeBytes);
+    Fuzz::Reached("a huge frame");
+}
+
+void FreeHuge(Fuzz::Input& in)
+{
+    std::vector<ulong> held;
+    for (const auto& b : PoolBlocks)
+    {
+        if (b.second)
+            held.push_back(b.first);
+    }
+    if (held.empty())
+        return;
+    const ulong phys = held[in.Below(held.size())];
+    Pt().FreeHugeFrame(phys);
+    PoolBlocks[phys] = false;
+    for (ulong i = 0; i < HugePages; i++)
+        Pages[Index(phys) + i].State = PageState::Pool;
+    Fuzz::Reached("a huge frame back");
+}
+
 /* ---- a machine as Setup leaves one ---- */
 
 void Boot(Fuzz::Input& in)
 {
-    M.Pages = 48 + in.Below(in.Chance(32) ? 960 : 160);
+    /* Small, and now and then past 4 MiB: room for a block of the huge
+       pool, the first 2MiB being the machine's own */
+    M.Pages = in.Chance(24) ? 1024 + in.Below(1536) : 48 + in.Below(in.Chance(32) ? 960 : 160);
     void* mem = nullptr;
     INVARIANT(posix_memalign(&mem, PageBytes, M.Pages * PageBytes) == 0, "no host memory");
     M.Phys = static_cast<uint8_t*>(mem);
@@ -889,6 +1012,10 @@ void Boot(Fuzz::Input& in)
     INVARIANT(root != nullptr, "no page for the root");
     pt.Root = root->GetPhyAddress();
     Pages[Index(pt.Root)].State = PageState::Table;
+
+    /* The pool, right after the free list as the boot reserves it */
+    if (M.Pages >= 2 * HugePages && in.Chance(192))
+        ReservePool(in);
 }
 
 void Run(Fuzz::Input& in)
@@ -935,6 +1062,13 @@ void Run(Fuzz::Input& in)
         case 14:
             if (in.Chance(64))
                 Crowd(in);
+            else if (!PoolBlocks.empty() && in.Chance(192))
+            {
+                if (in.Bool())
+                    AllocHuge(in);
+                else
+                    FreeHuge(in);
+            }
             else
                 Frame(in);
             break;
@@ -956,6 +1090,7 @@ void Reset()
     Maps.clear();
     Mmio.clear();
     Prot.clear();
+    PoolBlocks.clear();
     Pages.clear();
     if (M.Window != nullptr)
     {

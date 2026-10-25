@@ -102,6 +102,49 @@ const LOW_TOP: u64 = 0x9_FC00;
 /// below it -- and a PVH image's (`crate::pvh`) too.
 pub(crate) const ONE_MIB: u64 = 0x10_0000;
 
+/// Where a guest's RAM below 4 GiB ends: where the platform's device pages
+/// begin -- the MSI-X tables' (`run::MSIX_PAGES`), then the IO-APIC's and
+/// the local APIC's. RAM past them would cover them, and the guest would
+/// read and write its devices' registers as memory, none of them hearing of
+/// it. A multiple of 2 MiB, so that the huge pool's blocks end with it.
+pub const LOW_RAM_END: u64 = 0xFE00_0000;
+/// Where the rest of a guest's RAM is, past the devices' pages: from 4 GiB,
+/// as a PC's firmware puts what does not fit below them.
+pub const HIGH_RAM_START: u64 = 1 << 32;
+const _: () = assert!(LOW_RAM_END % (2 << 20) == 0 && LOW_RAM_END < HIGH_RAM_START);
+
+/// A guest's RAM as the platform lays it out: from 0 up to `LOW_RAM_END` at
+/// most -- the hole at 640 KiB inside it the e820 map's to say -- and the
+/// rest from `HIGH_RAM_START`. What the guest's memory regions are made as,
+/// what its memory map says, and what everything written below 4 GiB --
+/// the kernel, the initrd, a PVH image's segments -- has to fit under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ram {
+    /// Below 4 GiB, from 0.
+    pub low: u64,
+    /// From `HIGH_RAM_START`; 0 for a guest that fits below.
+    pub high: u64,
+}
+
+impl Ram {
+    /// `mem_bytes` of RAM, laid out.
+    pub fn of(mem_bytes: u64) -> Ram {
+        let low = mem_bytes.min(LOW_RAM_END);
+        Ram { low, high: mem_bytes - low }
+    }
+
+    /// The first address past the guest's RAM, or None for RAM past the
+    /// 64-bit space.
+    pub fn end(&self) -> Option<u64> {
+        if self.high == 0 { Some(self.low) } else { HIGH_RAM_START.checked_add(self.high) }
+    }
+
+    /// Its regions, each a base and a size, an empty one left out.
+    pub fn regions(&self) -> impl Iterator<Item = (u64, u64)> {
+        [(0, self.low), (HIGH_RAM_START, self.high)].into_iter().filter(|&(_, size)| size != 0)
+    }
+}
+
 /* The MP table: its floating pointer in that last KiB below 640 KiB, the
  * second place a kernel looks ("the top 1K of base RAM"), and the table
  * after it. The e820 map ends RAM before it, so the kernel keeps its hands
@@ -166,8 +209,9 @@ const PTE_WRITE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 const PAGE_2MIB: u64 = 2 * 1024 * 1024;
 /// How many GiB of guest physical addresses the identity map covers: four
-/// page-directory pages of 2 MiB entries, which is every address a guest of
-/// up to this much RAM has. A page-table page is 512 entries, so one covers
+/// page-directory pages of 2 MiB entries, every address below 4 GiB -- where
+/// everything the 64-bit entry touches is (`Ram::low`); the kernel maps the
+/// rest of its RAM itself. A page-table page is 512 entries, so one covers
 /// 1 GiB.
 const IDENTITY_GIB: u64 = 4;
 
@@ -285,6 +329,10 @@ pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -
          * decompress -- init_size alone is megabytes. */
         return Err(Error::BadAddress);
     }
+    /* The kernel and the initrd below 4 GiB, where the identity map and the
+     * boot protocol's 32-bit fields reach: in the RAM below the devices'
+     * pages, whatever is above them. */
+    let low = Ram::of(mem_bytes).low;
     let kernel_addr = header.pref_address;
     /* The header's to say, and so the image's: one that asks for an address
      * below 1 MiB would be loaded over the zero page, the page tables and
@@ -298,16 +346,17 @@ pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -
     let after_kernel = kernel_addr
         .checked_add(header.init_size.max(kernel_len))
         .ok_or(Error::BadAddress)?;
-    if after_kernel >= mem_bytes {
+    if after_kernel >= low {
         return Err(Error::NoMemory);
     }
 
     let (initrd_addr, initrd_len) = if initrd_len == 0 {
         (0, 0)
     } else {
-        /* As high as it will go: below the top of RAM and below the
-         * header's initrd ceiling, page-aligned, and clear of the kernel. */
-        let ceiling = mem_bytes.min(header.initrd_addr_max.saturating_add(1));
+        /* As high as it will go: below the top of the RAM under 4 GiB and
+         * below the header's initrd ceiling, page-aligned, and clear of the
+         * kernel. */
+        let ceiling = low.min(header.initrd_addr_max.saturating_add(1));
         let addr = ceiling
             .checked_sub(initrd_len)
             .ok_or(Error::NoMemory)?
@@ -500,16 +549,18 @@ pub(crate) struct E820Entry {
 }
 
 /// How many entries [`e820_entries`] makes at most.
-pub(crate) const E820_LOW_ENTRIES: usize = 3;
-const _: () = assert!(E820_LOW_ENTRIES <= E820_MAX_ENTRIES);
+pub(crate) const E820_ENTRIES: usize = 4;
+const _: () = assert!(E820_ENTRIES <= E820_MAX_ENTRIES);
 
 /// The memory map a guest of `mem_bytes` reads instead of asking a BIOS:
 /// low RAM, the hole at 640 KiB -- in which the firmware's tables, when
-/// there are any, are reserved -- and the rest of RAM from 1 MiB up. Into
-/// `out`; how many entries.
-pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut [E820Entry; E820_LOW_ENTRIES])
+/// there are any, are reserved -- the rest of the RAM below 4 GiB from
+/// 1 MiB up, and what did not fit there from 4 GiB ([`Ram`]). Into `out`;
+/// how many entries.
+pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut [E820Entry; E820_ENTRIES])
     -> Result<usize>
 {
+    let ram = Ram::of(mem_bytes);
     let mut n = 0;
     out[n] = E820Entry { addr: 0, size: LOW_TOP, kind: E820_RAM };
     n += 1;
@@ -520,8 +571,12 @@ pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut
         out[n] = E820Entry { addr: f.start, size: f.end - f.start, kind: E820_RESERVED };
         n += 1;
     }
-    if mem_bytes > ONE_MIB {
-        out[n] = E820Entry { addr: ONE_MIB, size: mem_bytes - ONE_MIB, kind: E820_RAM };
+    if ram.low > ONE_MIB {
+        out[n] = E820Entry { addr: ONE_MIB, size: ram.low - ONE_MIB, kind: E820_RAM };
+        n += 1;
+    }
+    if ram.high != 0 {
+        out[n] = E820Entry { addr: HIGH_RAM_START, size: ram.high, kind: E820_RAM };
         n += 1;
     }
     Ok(n)
@@ -529,7 +584,7 @@ pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut
 
 /// The memory map, [`e820_entries`], into the zero page.
 fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
-    let mut entries = [E820Entry::default(); E820_LOW_ENTRIES];
+    let mut entries = [E820Entry::default(); E820_ENTRIES];
     let n = e820_entries(mem_bytes, firmware, &mut entries)?;
     put8(m, BOOT_PARAMS + BP_E820_ENTRIES as u64, n as u8)?;
     for (i, e) in entries[..n].iter().enumerate() {

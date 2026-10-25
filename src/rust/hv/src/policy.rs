@@ -327,6 +327,23 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     }
 }
 
+/// The width of a physical address the guest is told -- leaf 0x80000008's
+/// EAX bits 7:0, the host's -- below `1 << which` its RAM must end, or it
+/// cannot reach it: an entry of its own page table with an address bit past
+/// the width is a reserved bit, and a fault. 36 where the leaf is not there,
+/// as the architecture has a CPU without it; and never past the 52 bits the
+/// architecture has at most, whatever a CPU -- or a hypervisor under this
+/// one -- says (hv-fuzz found the shift by a width of 64 or more).
+pub fn phys_bits() -> u32 {
+    match cpuid(LEAF_EXT_ADDRESS, 0, 0, false).eax & EXT8_EAX_PHYS_BITS {
+        0 => DEFAULT_PHYS_BITS,
+        bits => bits.min(MAX_PHYS_BITS),
+    }
+}
+const EXT8_EAX_PHYS_BITS: u32 = 0xFF;
+const DEFAULT_PHYS_BITS: u32 = 36;
+const MAX_PHYS_BITS: u32 = 52;
+
 /// A register of a CPUID answer.
 #[derive(Clone, Copy)]
 enum Word {

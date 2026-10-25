@@ -550,6 +550,10 @@ extern "C" void MainArm64(void* dtb)
     if (!pt.SetupFreePagesList())
         Panic("Can't setup free pages list");
 
+    /* The huge pool (hugepages=), now: the free list will never again be as
+       whole as it is before the kernel's own allocations begin. */
+    pt.ReserveHugePool(Parameters::GetInstance().GetHugePoolBytes(pt.GetTotalPagesCount() * Const::PageSize));
+
     /* W^X: kernel text is RX, everything else in the image is RW+NX.
        Runs after the free-pages list so the walk sees the final image
        mapping. The image is the only executable mapping the page table was
