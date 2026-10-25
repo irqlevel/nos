@@ -9,6 +9,7 @@
 #include "parameters.h"
 #include "module.h"
 #include "cmd.h"
+#include "line_editor.h"
 #include "elf.h"
 #include "symtab.h"
 #include "event.h"
@@ -2367,6 +2368,222 @@ static void FlipAfter(u8* buf, ulong size, const char* marker, ulong offset)
     }
 }
 
+/* What the console shows of the line being edited: the editor prints text
+   and Backspace alone, and this is the row they make. Backspace on an empty
+   row would have erased the line above it, and a row past what the editor
+   ever shows is a redraw that forgot what was there: either breaks it. */
+class EditorScreen final : public Stdlib::Printer
+{
+public:
+    EditorScreen()
+        : Len(0)
+        , Broken(false)
+    {
+        Row[0] = '\0';
+    }
+
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
+    {
+        va_list args;
+        va_start(args, fmt);
+        VPrintf(fmt, args);
+        va_end(args);
+    }
+
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
+    {
+        char text[RowMax + 1];
+        if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
+            return;
+        PrintString(text);
+    }
+
+    virtual void PrintString(const char *s) override
+    {
+        for (; *s != '\0'; s++)
+        {
+            if (*s == '\n')
+                Len = 0;
+            else if (Len < RowMax)
+                Row[Len++] = *s;
+            else
+                Broken = true;
+            Row[Len] = '\0';
+        }
+    }
+
+    virtual void Backspace() override
+    {
+        if (Len == 0)
+            Broken = true;
+        else
+            Row[--Len] = '\0';
+    }
+
+    /* The row is want, and nothing broke on the way */
+    bool Shows(const char* want, ulong step) const
+    {
+        if (!Broken && Stdlib::StrCmp(Row, want) == 0)
+            return true;
+        Trace(0, "TestLineEditor: step %lu shows '%s'%s, not '%s'", step, Row,
+            Broken ? " (broken)" : "", want);
+        return false;
+    }
+
+private:
+    static const ulong RowMax = 256;
+
+    char Row[RowMax + 1];
+    ulong Len;
+    bool Broken;
+};
+
+/* Types keys at the editor as the shell does: a line it ends is counted and
+   kept in line, and the next prompt shown */
+static void TypeAt(LineEditor& ed, EditorScreen& screen, const char* keys, ulong& lines, const char*& line)
+{
+    for (; *keys != '\0'; keys++)
+    {
+        if (ed.Key(*keys, screen))
+        {
+            lines++;
+            line = ed.GetLine();
+            ed.Prompt(screen);
+        }
+    }
+}
+
+static bool TestLineEditorOn(LineEditor& ed)
+{
+    EditorScreen screen;
+    ulong lines = 0;
+    const char* line = "";
+
+    ed.Prompt(screen);
+    if (!screen.Shows("$", 1))
+        return false;
+
+    /* Three lines run, a blank one not kept, the same line twice kept once */
+    TypeAt(ed, screen, "echo one\necho two\n   \nls\nls\n", lines, line);
+    if (lines != 5 || Stdlib::StrCmp(line, "ls") != 0 || !screen.Shows("$", 2))
+        return false;
+
+    /* Up goes back to the oldest and no further, Down forward to what was
+       being typed; ^P and ^N are the same; an edited line runs as edited */
+    TypeAt(ed, screen, "dr\x1b[A", lines, line);
+    if (!screen.Shows("$ls", 3))
+        return false;
+    TypeAt(ed, screen, "\x1b[A\x1bOA\x1b[A", lines, line);
+    if (!screen.Shows("$echo one", 4))
+        return false;
+    TypeAt(ed, screen, "\x0e\x0e", lines, line);
+    if (!screen.Shows("$ls", 5))
+        return false;
+    TypeAt(ed, screen, "\x1b[B", lines, line);
+    if (!screen.Shows("$dr", 6))
+        return false;
+    TypeAt(ed, screen, "\x1b[B\x10\x7f\x08ls -l\n", lines, line);
+    if (lines != 6 || Stdlib::StrCmp(line, "ls -l") != 0 || !screen.Shows("$", 7))
+        return false;
+
+    /* ^R finds the newest line holding the query, ^R again an older one, and
+       Enter runs it; history: echo one, echo two, ls, ls -l */
+    TypeAt(ed, screen, "\x12" "ech", lines, line);
+    if (!screen.Shows("(reverse-i-search)'ech': echo two", 8))
+        return false;
+    TypeAt(ed, screen, "\x12", lines, line);
+    if (!screen.Shows("(reverse-i-search)'ech': echo one", 9))
+        return false;
+    TypeAt(ed, screen, "\x12", lines, line);
+    if (!screen.Shows("(failed reverse-i-search)'ech': echo one", 10))
+        return false;
+    TypeAt(ed, screen, "\n", lines, line);
+    if (lines != 7 || Stdlib::StrCmp(line, "echo one") != 0 || !screen.Shows("$", 11))
+        return false;
+
+    /* A query that fails, made shorter, finds again from the newest line;
+       ^G puts back the line from before the search */
+    TypeAt(ed, screen, "x\x12lz", lines, line);
+    if (!screen.Shows("(failed reverse-i-search)'lz': ls -l", 12))
+        return false;
+    TypeAt(ed, screen, "\x08", lines, line);
+    if (!screen.Shows("(reverse-i-search)'l': ls -l", 13))
+        return false;
+    TypeAt(ed, screen, "\x7f", lines, line);
+    if (!screen.Shows("(reverse-i-search)'': x", 14))
+        return false;
+    TypeAt(ed, screen, "two\x07", lines, line);
+    if (!screen.Shows("$x", 15))
+        return false;
+
+    /* Any other key keeps what was found, to be edited, and Up and Down go
+       on from it; Down past the newest gives back the line from before */
+    TypeAt(ed, screen, "\x12two\x1b[D", lines, line);
+    if (!screen.Shows("$echo two", 16))
+        return false;
+    TypeAt(ed, screen, "\x1b[A", lines, line);
+    if (!screen.Shows("$echo one", 17))
+        return false;
+    TypeAt(ed, screen, "\x1b[B\x1b[B\x1b[B\x1b[B", lines, line);
+    if (!screen.Shows("$echo one", 18))
+        return false;
+    TypeAt(ed, screen, "\x1b[B", lines, line);
+    if (!screen.Shows("$x", 19))
+        return false;
+
+    /* ^C drops the line and ^U clears it; a sequence a control key cuts
+       short leaves the key to be itself */
+    TypeAt(ed, screen, "\x03", lines, line);
+    if (lines != 7 || !screen.Shows("$", 20))
+        return false;
+    TypeAt(ed, screen, "abc\x15" "def\x1b[\n", lines, line);
+    if (lines != 8 || Stdlib::StrCmp(line, "def") != 0 || !screen.Shows("$", 21))
+        return false;
+
+    /* A line stops at LineMax */
+    for (ulong i = 0; i < LineEditor::LineMax + 10; i++)
+        TypeAt(ed, screen, "a", lines, line);
+    TypeAt(ed, screen, "\n", lines, line);
+    if (lines != 9 || Stdlib::StrLen(line) != LineEditor::LineMax)
+        return false;
+
+    /* Of more lines than it keeps, the oldest go */
+    for (ulong i = 0; i < LineEditor::HistoryMax + 8; i++)
+    {
+        char cmd[16];
+        Stdlib::SnPrintf(cmd, sizeof(cmd), "c%lu\n", i);
+        TypeAt(ed, screen, cmd, lines, line);
+    }
+    for (ulong i = 0; i < LineEditor::HistoryMax + 4; i++)
+        TypeAt(ed, screen, "\x10", lines, line);
+    if (!screen.Shows("$c8", 22))
+        return false;
+    TypeAt(ed, screen, "\x15", lines, line);
+
+    return screen.Shows("$", 23);
+}
+
+/* The console's line editor (kernel/line_editor.h): history, Up and Down,
+   ^R's search, all on a screen of text and Backspace. cpp-fuzz.py's
+   lineedit target holds it to a model over random keys. */
+Stdlib::Error TestLineEditor()
+{
+    Trace(0, "TestLineEditor: started");
+
+    LineEditor* ed = new (Mm::NoThrow) LineEditor();
+    if (ed == nullptr)
+        return MakeError(Stdlib::Error::NoMemory);
+
+    bool ok = TestLineEditorOn(*ed);
+    delete ed;
+
+    if (!ok)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestLineEditor: complete");
+    return MakeSuccess();
+}
+
 /* The loader end to end, on modtest.ko. Loaded, the module runs its own
    checks in its init and adds a shell command, which answers through the
    dispatcher; a second copy is refused; unloaded, the command goes with it.
@@ -2623,6 +2840,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestGrubEnv();
+    if (!err.Ok())
+        return err;
+
+    err = TestLineEditor();
     if (!err.Ok())
         return err;
 

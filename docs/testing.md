@@ -69,6 +69,14 @@ slices, since at a fixed rhythm a lag reckoned wrong slipped under the bound
 -- and a spinner of nice 0 has 2.4 to 3.9 times the CPU of one of nice 5,
 for 3.06. Its line gives both medians and the share; a control run with the
 lag reckoned wrong waited 1256 us beside one spinner and failed the boot.
+`TestLineEditor` types at the console's line editor
+([line editing](shell-commands.md#line-editing)) on a screen of text and
+Backspace, as the console is: lines run and kept, Up and Down through them
+to the line being typed, ^R's search -- found, found again, failed, made
+shorter, given up with ^G, kept to be edited -- ^C and ^U, a line past 80
+characters and a history past 32 lines, each step held to what the screen
+must show; `cpp-fuzz.py`'s `lineedit` target holds it to a model over random
+keys.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
@@ -144,15 +152,15 @@ swallowing panic messages whole.
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
-| `usb-test.py` | x86-64 | `drivers/usb/` |
+| `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, and `hv create` of VMs from a web server's images; on both, `hv convert` |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
-| `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
+| `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -290,7 +298,8 @@ sixty-fourth.
 
 End to end against OpenSSH's own client (see [sshd](sshd.md)). On arm64 it
 loads `sshd.ko` over the UDP shell and has `ssh` work it: commands, a shell
-with a terminal and one without, 3 MiB of output through the client's window
+with a terminal and one without, Up and ^R through a terminal's history,
+3 MiB of output through the client's window
 with rekeys in the middle, a command that prints nothing for five seconds
 while the client asks every second whether the server is there (`ssh -o
 ServerAliveInterval=1 -o ServerAliveCountMax=2 ... top 5000` -- a session
@@ -307,7 +316,7 @@ in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
 
-44 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
+45 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
 the VFS's move to Rust (`edae1ef`) it waited for `unmounting / (ext2)`, a line
 only the C++ VFS printed, where the Rust one prints `vfs: unmounting /`. One
 check still fails now and then under load, `connections past
@@ -467,7 +476,11 @@ device that is neither, then **types at the kernel through QEMU's monitor**
 and reads the shell's answer off the serial console. It is built to catch
 the one failure that looks like success: a driver that enumerates perfectly
 and delivers no report leaves every boot-log check passing, and fails on "a
-command typed on the usb keyboard reaches the shell".
+command typed on the usb keyboard reaches the shell". Then the line editor's
+keys, which only a keyboard's decoding makes what a terminal sends: Up twice
+must run the command before the last, and ^R and two letters one found by
+what it holds -- a keyboard that dropped the arrows runs an empty line, and
+one that took Ctrl for nothing types an `r`.
 
 ### `insn-test.py` -- the MMIO decoder, against the assembler
 
@@ -832,7 +845,18 @@ own, TCP's flags in combinations that mean something. The targets:
   Every packet the server sends is opened and checked, its key exchange
   signed by its host key over the hash both ends made; a login is had
   exactly when the known key signs the right session; a command's output
-  comes back whole; a client that breaks the protocol is told so.
+  comes back whole; a client that breaks the protocol is told so;
+- `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
+  at with any byte -- weighted to the keys it acts on and a few letters, so
+  that lines repeat and a search finds them, with runs of one key past the
+  longest line and the history's end. Every key is held to a model of the
+  editor: the line Enter runs, a logout on ^D on an empty line and on
+  nothing else, and what a terminal of one row shows once it has acted on
+  the echo -- text, CR, LF, Backspace, erase to the end of the line and
+  clear the screen, anything else a finding -- the prompt and the line, or
+  the search's prompt, its query and what it found, exactly. A search that
+  skipped its newest candidate and an erase that left its character behind
+  each failed the first input.
 
 At the end of every input the machine must hold nothing: no TCP slot, no
 frame out of the pool, no task. A finding is any of that, a panic, a spin
@@ -1268,7 +1292,18 @@ what its header says it does:
   both or neither, and the list's count is the model's. A third of the
   inputs are tasks that never sleep, run long enough for slices and quanta to
   even out: each must have had the CPU in proportion to its weight. A `Leave`
-  that reckoned V without the leaver in it failed the first input.
+  that reckoned V without the leaver in it failed the first input;
+- `lineedit`: the console shell's line editor (`kernel/line_editor.cpp`),
+  what a terminal on the serial port types at it: any byte, weighted to the
+  keys it acts on and a few letters, so that lines repeat and a search finds
+  them, with runs of one key past the longest line and the history's end.
+  Every key is held to a model in `std::string`: the line Enter hands the
+  shell, and what the screen shows -- built from the editor's output, text
+  and Backspace alone, as the console's is -- the prompt and the line, or
+  the search's prompt, its query and what it found, exactly; a Backspace on
+  an empty row, which erases the line above, is a finding too. A redraw one
+  Backspace short failed the first input, and a search that kept no line
+  to come back to the tenth.
 
 The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
 thing: inputs run in batches, one after another in a process forked for the
