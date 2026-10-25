@@ -721,6 +721,16 @@ have their weights' shares, equal ones here, to the per mille. The probe's
 `woken with lag` line says what the waiter was owed as it woke, the virtual
 microseconds its placement brought (`SchedEntity::PlacedLag`).
 
+On the EX44's silicon (`cpu=40`, a P-core), where the round robin had given
+HVF's numbers: under 2 us at the median beside one, two and four spinners,
+p99 under 64 us, the shares 998; 498, 499; 250, 249, 249, 249 -- and the
+boot's `TestEevdf` there, on an E-core, 1 us beside one spinner and two, and
+3.0 for the share. What it costs a machine at rest is what the round robin
+did: a decision 1.2-1.6 us on each CPU, and `blkload`'s random reads 26768
+IOPS at qd=1, 180610 at qd=8. The longest wait of each run there, 5-7 ms,
+comes with no spinner at all, as it did with the round robin: it is not the
+queue's.
+
 ## Looking at it from the shell
 
 | Command | Shows |
