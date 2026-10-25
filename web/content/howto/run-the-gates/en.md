@@ -1,7 +1,7 @@
 ---
 title: "Run the gates: test a change the way nos does"
 description: "What to run after changing nos, and how to read the result: boot self-tests, smoke boots on both architectures, UB-checked builds, subsystem gates, fuzzers."
-order: 8
+order: 9
 updated: 2026-10-22
 ---
 

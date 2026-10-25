@@ -1,7 +1,7 @@
 ---
 title: "Write a loadable kernel module in Rust"
 description: "Create a nos kernel module in Rust with kmod and kcore, give it a shell command, build the .ko and load it into a running kernel."
-order: 7
+order: 8
 updated: 2026-10-22
 ---
 

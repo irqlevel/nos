@@ -44,7 +44,7 @@ A kernel service reaches Rust in three steps: a C++ function in `rust_ffi.cpp` (
 
 **Modules** are how optional things ship: a server, a load generator, a diagnostic tool. A module is a Rust crate built into a `.ko` file and loaded into a running kernel with `insmod`. The loader links it against an export table generated from the `ffi` declarations. It gives each segment the permissions its header asks for, but never writable and executable at once. It also refuses a module built against a different kernel interface. The SSH server is a module. So is `netblk`, which serves an NVMe disk over UDP with zero copies, and so is the hypervisor.
 
-**The hypervisor** is three crates. `hvarch` drives the CPU's virtualization extension and holds nearly all of the hypervisor's `unsafe`: 201 sites. `hv` holds everything above it (guest memory, the loop that handles guest exits, the emulated devices): about 12,000 lines of code with 4 `unsafe` sites. `modules/hv` holds the shell commands and has no `unsafe` at all. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor whatsoever.
+**The hypervisor** is three crates. `hvarch` drives the CPU's virtualization extension and holds nearly all of the hypervisor's `unsafe`: 203 sites. `hv` holds everything above it (guest memory, the loop that handles guest exits, the emulated devices): about 13,000 lines of code with 4 `unsafe` sites. `modules/hv` holds the shell commands and has no `unsafe` at all. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor whatsoever.
 
 The details are in [Rust in the kernel](/docs/rust) and [Project layout](/docs/project-layout).
 
@@ -60,7 +60,7 @@ The full list is in [Features](/docs/features). In short:
 - **Ways into a machine with no screen**: the SSH server (with Ed25519 keys); a UDP shell, which stays off unless you ask for it; netconsole, which sends the kernel log over UDP; and a disk log for a boot that dies before its network is up.
 - **Observability**: dmesg, backtraces with symbol names, a sampling profiler on the PMU (the CPU's performance counters), `top`, and a lock watchdog.
 - **Randomness**: a ChaCha20 pool seeded from every entropy source the machine has.
-- **The hypervisor**: AMD-V and Intel VT-x. Linux guests get up to 16 CPUs, virtio disks and NICs, a switch with DHCP and NAT, ACPI tables, emulated MMIO and an IO-APIC. Alpine, Debian and Ubuntu boot as they ship ([more](/hypervisor)).
+- **The hypervisor**: AMD-V and Intel VT-x. Linux guests get up to 16 CPUs, virtio disks and NICs, a switch with DHCP and NAT, ACPI tables, emulated MMIO and an IO-APIC. Alpine, Debian and Ubuntu boot as they ship. A VM kept in a folder outlasts a reboot, and `hv create` makes one from a cloud image's URL ([more](/hypervisor)).
 - **A system image for servers**: `nos-install` writes it to a partition next to the server's own Linux, then boots nos once through the server's own GRUB ([Install](/docs/install)).
 
 ## Where it runs
@@ -95,7 +95,7 @@ The roadmap has six stages, numbered in the order they are being done:
 | 0 | nos boots on real server hardware and stays manageable | The demo works: the EX44 and the AX41 get an address over DHCP, answer a shell over the network and stream their log, and a system image sets up a new server |
 | 1 | New code in Rust, with `unsafe` confined to a few places | A discipline rather than a milestone, and everything written since follows it |
 | 2 | A HAL, and arm64 under QEMU and HVF | The arm64 port landed in July 2026, and both architectures have stayed green in CI ever since. Real arm64 hardware is deferred |
-| 3 | A Rust hypervisor boots Linux to a shell | The current stage. All four demos are done, and since then guests have gained SMP, disks, networking, ACPI and VT-x. Before any guest can belong to someone else, the list from a code review has to be worked through. On arm64 the backend only reports what EL2 offers |
+| 3 | A Rust hypervisor boots Linux to a shell | The current stage. All four demos are done, and since then guests have gained SMP, disks, networking, ACPI and VT-x, folders that outlast a reboot and VMs made from a cloud image's URL. Before any guest can belong to someone else, the list from a code review has to be worked through. On arm64 the backend only reports what EL2 offers |
 | 4 | An HTTP control plane for VMs | Not started. The VM lifecycle it will serve already exists as shell commands: `hv start`, `list`, `attach`, `stop` |
 | 5 | Live update of the host kernel under running guests | Not started. It requires all VM state to be kept as plain serializable data, and the hypervisor has followed that rule since its first line |
 
