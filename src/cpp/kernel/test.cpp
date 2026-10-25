@@ -3332,6 +3332,290 @@ bool TestTaskLocate()
     return TestJoinReport();
 }
 
+/* The boot runs in its CPU's idle task, and the idle task is the last resort
+   only while it idles (Task::SetIdling): running the boot, it takes its turn
+   like any other task. A task pinned to this CPU that never blocks, only
+   yields, and a sleep of a millisecond here: it must come back in about that,
+   and not when the other task gives up. With the idle task the last resort
+   whatever it ran, the boot came back only then -- the ring selftest's
+   producer, started on the boot CPU, kept the boot from starting its
+   consumer for the thirty seconds it waited for one, one boot in a few
+   hundred under HVF. */
+static const ulong TurnSpinMaxNs = 2 * Const::NanoSecsInSec;
+static const ulong TurnSleepNs = Const::NanoSecsInMs;
+static const ulong TurnMaxNs = 200 * Const::NanoSecsInMs;
+
+struct TurnProbe
+{
+    Atomic Stop;
+};
+
+static void TurnSpinTask(void* ctx)
+{
+    auto* p = static_cast<TurnProbe*>(ctx);
+    ulong until = GetBootTime().GetValue() + TurnSpinMaxNs;
+    while (p->Stop.Get() == 0 && GetBootTime().GetValue() < until)
+        YieldToRunnable();
+}
+
+bool TestIdleTakesTurns()
+{
+    Task* self = Task::GetCurrentTask();
+    if (!self->IsIdle())
+        return true;
+
+    auto* p = Mm::TAlloc<TurnProbe, Tag>();
+    Task* task = Mm::TAlloc<Task, Tag>("turn-spin");
+    bool ok = (p != nullptr && task != nullptr);
+    if (ok)
+        task->SetCpuAffinity(1UL << CpuTable::GetInstance().GetCurrentCpuId());
+    if (ok && task->Start(TurnSpinTask, p))
+    {
+        ulong start = GetBootTime().GetValue();
+        Sleep(TurnSleepNs);
+        ulong took = GetBootTime().GetValue() - start;
+
+        p->Stop.Set(1);
+        task->Wait();
+
+        ok = (took <= TurnMaxNs);
+        if (!ok)
+            Trace(0, "TestIdleTakesTurns: a sleep of %lu us in the idle task took %lu us beside a task that yields",
+                TurnSleepNs / Const::NanoSecsInUsec, took / Const::NanoSecsInUsec);
+    }
+    else
+    {
+        ok = false;
+    }
+
+    if (task != nullptr)
+        task->Put();
+    if (p != nullptr)
+    {
+        p->~TurnProbe();
+        Mm::Free(p);
+    }
+    return ok;
+}
+
+/* Wakeups that cross CPUs and land in every window a task's run state has
+   (Task::RunState): a ring of tasks, two a CPU, each pinned to its own,
+   passing one token round -- each waits on an event of its own and signals
+   the next's, which is always on another CPU. Half wait with a deadline,
+   half without; every StormNapEvery passes the holder sleeps before it
+   passes the token on, so a sleeper's deadline races the signals that come
+   for it; and a yielder on every CPU keeps a run list there to wait behind.
+   One lost wakeup stops the token for good -- the untimed waits have no
+   deadline to rescue them -- and the test fails after StormStallNs without
+   a pass, naming the task the token was sent to and where it is. It does
+   not clean up then: a task that cannot be woken cannot be joined, and the
+   boot panics on the failure. */
+static const ulong StormMaxTasks = 32;
+static const ulong StormHops = 3000;
+static const ulong StormNapEvery = 64;
+static const ulong StormNapNs = Const::NanoSecsInMs;
+static const ulong StormWaitNs = 50 * Const::NanoSecsInMs;
+static const ulong StormStallNs = 2 * Const::NanoSecsInSec;
+static const ulong StormMaxNs = 60 * Const::NanoSecsInSec;
+/* How long a yielder spins between its yields */
+static const ulong StormYieldSpins = 200;
+
+struct StormProbe;
+
+struct StormSlot
+{
+    Event Ev;
+    StormProbe* Probe;
+    ulong Index;
+    Task* Worker;
+};
+
+struct StormProbe
+{
+    StormSlot Slots[StormMaxTasks];
+    Task* Yielders[MaxCpus];
+    ulong Count;
+    Atomic Hops;
+    /* The slot the token was sent to last */
+    Atomic Holder;
+    Atomic Stop;
+};
+
+static void StormTaskFunc(void* ctx)
+{
+    auto* slot = static_cast<StormSlot*>(ctx);
+    StormProbe* p = slot->Probe;
+    bool timed = (slot->Index % 2) == 0;
+
+    while (p->Stop.Get() == 0)
+    {
+        if (timed)
+        {
+            if (!slot->Ev.WaitFor(StormWaitNs))
+                continue;
+        }
+        else
+        {
+            slot->Ev.Wait();
+        }
+
+        if (p->Stop.Get() != 0)
+            break;
+
+        /* The token is this task's alone until it signals the next */
+        long hop = p->Hops.Get() + 1;
+        p->Hops.Set(hop);
+        if ((ulong)hop % StormNapEvery == 0)
+            Sleep(StormNapNs);
+
+        ulong next = (slot->Index + 1) % p->Count;
+        p->Holder.Set((long)next);
+        p->Slots[next].Ev.Signal();
+    }
+}
+
+static void StormYieldFunc(void* ctx)
+{
+    auto* p = static_cast<StormProbe*>(ctx);
+    while (p->Stop.Get() == 0)
+    {
+        for (ulong i = 0; i < StormYieldSpins; i++)
+            Pause();
+        YieldToRunnable();
+    }
+}
+
+static Task* StormStart(const char* name, ulong cpu, Task::Func func, void* ctx)
+{
+    Task* task = Mm::TAlloc<Task, Tag>(name);
+    if (task == nullptr)
+        return nullptr;
+
+    task->SetCpuAffinity(1UL << cpu);
+    if (!task->Start(func, ctx))
+    {
+        task->Put();
+        return nullptr;
+    }
+    return task;
+}
+
+bool TestWakeStorm()
+{
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+    ulong cpuList[MaxCpus];
+    ulong cpuCount = 0;
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (mask & (1UL << i))
+            cpuList[cpuCount++] = i;
+    }
+    if (cpuCount == 0)
+        return false;
+
+    auto* p = Mm::TAlloc<StormProbe, Tag>();
+    if (p == nullptr)
+    {
+        Trace(0, "TestWakeStorm: no memory");
+        return false;
+    }
+
+    p->Count = Stdlib::Min(2 * cpuCount, StormMaxTasks);
+    for (ulong i = 0; i < MaxCpus; i++)
+        p->Yielders[i] = nullptr;
+
+    bool ok = true;
+    for (ulong i = 0; i < p->Count; i++)
+    {
+        StormSlot& slot = p->Slots[i];
+        slot.Probe = p;
+        slot.Index = i;
+        char name[TaskNameLen];
+        Stdlib::SnPrintf(name, sizeof(name), "storm%lu", i);
+        slot.Worker = ok ? StormStart(name, cpuList[i % cpuCount], StormTaskFunc, &slot) : nullptr;
+        ok = ok && (slot.Worker != nullptr);
+    }
+    /* Not on this CPU: this runs in its idle task, the last resort, which a
+       task that can always run would keep off it for as long as it ran */
+    ulong self = cpus.GetCurrentCpuId();
+    for (ulong i = 0; ok && i < cpuCount; i++)
+    {
+        if (cpuList[i] == self)
+            continue;
+
+        char name[TaskNameLen];
+        Stdlib::SnPrintf(name, sizeof(name), "storm-yield%lu", cpuList[i]);
+        p->Yielders[i] = StormStart(name, cpuList[i], StormYieldFunc, p);
+        ok = (p->Yielders[i] != nullptr);
+    }
+
+    if (ok)
+    {
+        ulong start = GetBootTime().GetValue();
+        ulong lastHops = 0;
+        ulong lastAt = start;
+
+        p->Holder.Set(0);
+        p->Slots[0].Ev.Signal();
+
+        while ((ulong)p->Hops.Get() < StormHops)
+        {
+            Sleep(Const::NanoSecsInMs);
+            ulong now = GetBootTime().GetValue();
+            ulong hops = (ulong)p->Hops.Get();
+            if (hops != lastHops)
+            {
+                lastHops = hops;
+                lastAt = now;
+                continue;
+            }
+
+            if (now - lastAt < StormStallNs && now - start < StormMaxNs)
+                continue;
+
+            ulong holder = (ulong)p->Holder.Get();
+            Task::Where where;
+            p->Slots[holder].Worker->Locate(where);
+            char what[2 * SymbolTable::DescribeMax];
+            where.Describe(what, sizeof(what));
+            Trace(0, "TestWakeStorm: the token stopped after %lu of %lu passes, %lu ms without one: sent to %s, which is %s",
+                hops, StormHops, (now - lastAt) / Const::NanoSecsInMs,
+                p->Slots[holder].Worker->GetName(), what);
+            return false;
+        }
+
+        Trace(0, "TestWakeStorm: %lu passes among %lu tasks on %lu cpus in %lu ms",
+            (ulong)p->Hops.Get(), p->Count, cpuCount,
+            (GetBootTime().GetValue() - start) / Const::NanoSecsInMs);
+    }
+    else
+    {
+        Trace(0, "TestWakeStorm: could not start its tasks");
+    }
+
+    p->Stop.Set(1);
+    for (ulong i = 0; i < p->Count; i++)
+    {
+        if (p->Slots[i].Worker == nullptr)
+            continue;
+        p->Slots[i].Ev.Signal();
+        p->Slots[i].Worker->Wait();
+        p->Slots[i].Worker->Put();
+    }
+    for (ulong i = 0; i < cpuCount; i++)
+    {
+        if (p->Yielders[i] == nullptr)
+            continue;
+        p->Yielders[i]->Wait();
+        p->Yielders[i]->Put();
+    }
+
+    p->~StormProbe();
+    Mm::Free(p);
+    return ok;
+}
+
 bool TestMultiTasking()
 {
     if (!TestSpinLockPreempt())

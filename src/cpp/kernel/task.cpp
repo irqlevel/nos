@@ -17,7 +17,11 @@ namespace Kernel
 {
 
 Task::Task()
-    : TaskQueue(nullptr)
+    : RunState(RunQueued)
+    , WakeNext(nullptr)
+    , QueuedAt(0)
+    , StallReported(false)
+    , TaskQueue(nullptr)
     , Rsp(0)
     , State(0)
     , Flags(0)
@@ -34,6 +38,8 @@ Task::Task()
 {
     RefCounter.Set(1);
     ListEntry.Init();
+    RunEntry.Init();
+    SleepEntry.Init();
     Name[0] = '\0';
 }
 
@@ -49,6 +55,8 @@ Task::~Task()
 {
     BugOn(TaskQueue != nullptr);
     BugOn(StackPtr != nullptr);
+    BugOn(!RunEntry.IsEmpty());
+    BugOn(!SleepEntry.IsEmpty());
     Trace(TaskLL, "task 0x%p %s dtor", this, Name);
 }
 
@@ -106,24 +114,58 @@ bool Task::IsIdle()
     return Flags.TestBit(FlagIdleBit);
 }
 
-void Task::Block()
+void Task::SetIdling(bool idling)
 {
-    Flags.SetBit(FlagBlockedBit);
+    if (idling)
+        Flags.SetBit(FlagIdlingBit);
+    else
+        Flags.ClearBit(FlagIdlingBit);
 }
 
+bool Task::IsIdling()
+{
+    return Flags.TestBit(FlagIdlingBit);
+}
+
+/* The sleeper's half of the handshake every wait here makes: the state goes
+   up first, and the task looks for its work only after -- a locked
+   operation, sequentially consistent, so the look cannot be made before the
+   state is seen by a waker, who publishes the work first and looks at the
+   state after (Unblock). A wakeup landing anywhere in between is either
+   found by the look or finds the task Blocking, and puts it back. */
+void Task::Block()
+{
+    /* The task itself, running: Queued, and nobody else moves it from there */
+    long was = RunState.Cmpxchg(RunBlocking, RunQueued);
+    BugOn(was != RunQueued);
+}
+
+/* The waker's half: whatever it finds, a locked operation -- a failed
+   compare-and-swap included -- so that the work it published before is
+   ordered before the look, which a plain read would not be on arm64.
+   Blocking: the task never left its CPU, and the Schedule() that would take
+   it off finds it Queued and keeps it runnable. Sleeping: it left, and this
+   call, having won it from any other waker and from its deadline, hands it
+   back to its queue. Queued or Waking: someone was first, and nothing is
+   left to do. A Sleeping task stays on the queue it slept on -- nothing
+   moves one -- so the queue read here is the one it is waiting on. */
 void Task::Unblock()
 {
-    /* The clear stays a locked operation whether or not the flag is up: it
-       orders the waker's publishing of the work before it, which a plain
-       read of the flag would not on arm64. The clock only for a wakeup that
-       took the flag down. */
-    if (Flags.ClearBit(FlagBlockedBit))
-        WakeTime.Set((long)GetBootTime().GetValue());
+    long was = RunState.Cmpxchg(RunQueued, RunBlocking);
+    if (was != RunSleeping)
+        return;
+
+    if (RunState.Cmpxchg(RunWaking, RunSleeping) != RunSleeping)
+        return;
+
+    WakeTime.Set((long)GetBootTime().GetValue());
+    TaskQueue->PushWake(this);
 }
 
 bool Task::IsBlocked()
 {
-    return Flags.TestBit(FlagBlockedBit);
+    long state = RunState.Get();
+    return state == RunBlocking || state == RunSleeping;
 }
 
 void Task::Exit()
@@ -366,6 +408,7 @@ bool Task::LocateSwitched(Where& where)
     where.What = Where::Switched;
     where.Blocked = IsBlocked();
     where.Asleep = where.Blocked && SleepUntil.Get() != 0;
+    where.Waking = (RunState.Get() == RunWaking);
     where.Count = count;
     return true;
 }
@@ -375,6 +418,7 @@ void Task::LocateLocked(Where& where, ulong answerNs)
     where.What = Where::Unknown;
     where.Blocked = false;
     where.Asleep = false;
+    where.Waking = false;
     where.Cpu = 0;
     where.Pc = 0;
     where.SilentCpus = 0;
@@ -433,7 +477,8 @@ void Task::Where::Describe(char* buf, size_t size)
         break;
     case Switched:
         Stdlib::SnPrintf(buf, size, "%s",
-            Asleep ? "asleep" : (Blocked ? "blocked" : "runnable, waiting for a cpu"));
+            Asleep ? "asleep" : (Blocked ? "blocked" :
+            (Waking ? "woken, and not yet back on its cpu's run list" : "runnable, waiting for a cpu")));
         break;
     case Running:
         if (Pc != 0 && SymbolTable::GetInstance().Describe(Pc, pc, sizeof(pc)))
@@ -669,6 +714,7 @@ TaskQueue* Task::SelectNextTaskQueue()
     class TaskQueue* current = TaskQueue;
 
     class TaskQueue* best = nullptr;
+    long bestLoad = 0;
     long bestCount = 0;
 
     for (ulong i = 0; i < MaxCpus; i++)
@@ -676,16 +722,24 @@ TaskQueue* Task::SelectNextTaskQueue()
         if (!(cpuMask & (1UL << i)))
             continue;
 
+        /* What could run there is what a task placed there competes with:
+           tasks asleep on a CPU cost it nothing. They used to be counted
+           like any other, and a CPU home to a dozen sleepers looked busier
+           than one with two tasks spinning. Of two CPUs as busy, the one
+           home to fewer tasks, so that new ones -- most of which sleep --
+           spread out rather than all go where the first CPU is. */
         auto& cand = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
+        long load = cand.GetRunnableCount();
         long count = cand.GetTaskCount();
 
         /* The queue this task is already on competes like any other. It used
            to be skipped outright, which meant every task was moved to another
            CPU on every context switch -- not balancing, just motion, and it
            threw away whatever the task had warm in that core's caches. */
-        if (best == nullptr || count < bestCount)
+        if (best == nullptr || load < bestLoad || (load == bestLoad && count < bestCount))
         {
             best = &cand;
+            bestLoad = load;
             bestCount = count;
         }
     }
@@ -700,11 +754,11 @@ TaskQueue* Task::SelectNextTaskQueue()
     if (best == current)
         return nullptr;
 
-    /* This task is still counted on its own queue, so moving it takes one
-       off that side and puts one on the other: a difference of one would
-       only be reversed on the next switch, and the task would trade places
-       forever. Move for two. */
-    if (bestCount + MigrateThreshold > current->GetTaskCount())
+    /* This task is runnable and still counted on its own queue, so moving
+       it takes one off that side and puts one on the other: a difference of
+       one would only be reversed on the next switch, and the task would
+       trade places forever. Move for two. */
+    if (bestLoad + MigrateThreshold > current->GetRunnableCount())
         return nullptr;
 
     return best;
@@ -871,8 +925,11 @@ void TaskTable::Ps(Stdlib::Printer& printer)
             }
 
             Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
+            ulong flags = (ulong)task->Flags.Get();
+            if (task->IsBlocked())
+                flags |= 1UL << Task::FlagBlockedBit;
             printer.Printf("%lu %lu 0x%lX %lu.%lu %lu %s\n",
-                task->Pid, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
+                task->Pid, task->State.Get(), flags, task->Runtime.GetSecs(),
                 task->Runtime.GetUsecs(), task->ContextSwitches.Get(), task->GetName());
         }
     }

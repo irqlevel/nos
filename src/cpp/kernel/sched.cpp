@@ -35,6 +35,15 @@ long GetPreemptDeferredIdleCount()
     return PreemptsDeferredIdle.Get();
 }
 
+/* Runnable tasks reported for having waited TaskQueue::StallReportNs for
+   their CPU (TaskQueue::CheckStalls) */
+static Atomic StallReports;
+
+long GetStallReportCount()
+{
+    return StallReports.Get();
+}
+
 void SchedStats::Bump(ulong& counter, ulong by)
 {
     __atomic_store_n(&counter, __atomic_load_n(&counter, __ATOMIC_RELAXED) + by, __ATOMIC_RELAXED);
@@ -120,14 +129,24 @@ void TaskQueue::ReadStats(SchedStats::Snapshot& out)
 }
 
 TaskQueue::TaskQueue()
+    : StallPending(false)
+    , StallName{}
+    , StallPid(0)
+    , StallWaitedMs(0)
+    , StallRunnable(0)
+    , IdleTask(nullptr)
 {
     Stdlib::AutoLock lock(Lock);
     TaskList.Init();
+    RunList.Init();
+    SleepList.Init();
     ExitedList.Init();
 
+    WakeHead.Set(0);
     SwitchContextCounter.Set(0);
     ScheduleCounter.Set(0);
     TaskCount.Set(0);
+    RunnableCount.Set(0);
 }
 
 void TaskQueue::ReapExited()
@@ -158,35 +177,47 @@ void TaskQueue::SwitchComplete(Task* curr)
     prev->Lock.Unlock();
     Lock.Unlock();
 
+    ReportStall();
+
     if (prev->State.Get() != Task::StateExited)
     {
-        /* Not a task asleep until a deadline: this CPU's timer has just been
-           armed for it (WakeSleepers), and no other CPU's would be -- moved,
-           it would run at its new CPU's next tick. Asleep, it costs no CPU
-           anything to balance; it moves, if it should, once it runs. */
-        bool sleeping = prev->IsBlocked() && prev->SleepUntil.Get() != 0;
-        auto taskQueue = sleeping ? nullptr : prev->SelectNextTaskQueue();
-        if (taskQueue != nullptr)
-        {
-            TaskMigrations.Inc();
-            prev->Get();
-            prev->TaskQueue->Remove(prev);
-            taskQueue->Insert(prev);
-            prev->Put();
-        }
+        /* Only one that can still run -- displaced, not asleep -- is
+           weighed for a lighter CPU. One asleep stays on the queue its
+           wakeups go to (Task::Unblock) and whose timer is armed for its
+           deadline; it moves, if it should, once it runs. Its state cannot
+           change under this: a Queued task is moved from there only by
+           itself, and it is not running. */
+        bool runnable = prev->RunState.Get() == Task::RunQueued && !prev->IsIdle();
+        auto taskQueue = runnable ? prev->SelectNextTaskQueue() : nullptr;
 
         /* Schedule()'s count should be the only one left: the locks
            TaskQueue::Schedule took in prev were released above, in this
            task, and handed their counts back to prev -- a RawSpinLock
            remembers whose preemption it disabled. Anything more would be a
            lock prev still holds, which Schedule() never switches away from,
-           or a count gone astray; either way SelectNext would pass prev over
-           for good, a task that silently never runs again. Checked before
-           the Dec, while that last count still keeps prev off every CPU:
-           after it, prev may already be running elsewhere -- it may just
-           have been moved -- and taking locks of its own. */
+           or a count gone astray. Checked while that last count still keeps
+           prev off every CPU. */
         BugOn(prev->PreemptDisableCounter.Get() != 1);
-        prev->PreemptDisableCounter.Dec();
+
+        if (taskQueue != nullptr)
+        {
+            /* Off this queue, its count down while it is on none, and only
+               then onto the other: a decision never finds a task whose count
+               is up -- here, prev's comes down before this CPU decides
+               again -- so none has one to pass over. It used to be inserted
+               there first, and every walk had to skip a task whose count was
+               up. */
+            TaskMigrations.Inc();
+            prev->Get();
+            prev->TaskQueue->Remove(prev);
+            prev->PreemptDisableCounter.Dec();
+            taskQueue->Insert(prev);
+            prev->Put();
+        }
+        else
+        {
+            prev->PreemptDisableCounter.Dec();
+        }
     } else {
 
         prev->PreemptDisableCounter.Dec();
@@ -224,23 +255,11 @@ void TaskQueue::NoteRun(Task* next, ulong now)
         return;
     }
 
-    /* Still blocked: a sleeper the walk runs because its time has come, and
-       that time is when it was woken. Otherwise whoever unblocked it said
-       when -- unless that was before it left the CPU, a wakeup for the wait
-       before this one, or one that came while it was still on its way out */
-    ulong woke;
-    if (next->IsBlocked())
-    {
-        woke = (ulong)next->SleepUntil.Get();
-    }
-    else
-    {
-        woke = (ulong)next->WakeTime.Get();
-        if (woke < out)
-            woke = 0;
-    }
-
-    if (woke != 0 && now >= woke)
+    /* Whoever woke it said when: an Unblock(), or its deadline (WakeDue) --
+       unless that was before it left the CPU, a wakeup for the wait before
+       this one */
+    ulong woke = (ulong)next->WakeTime.Get();
+    if (woke != 0 && woke >= out && now >= woke)
         Stats.Wake(now - woke);
 }
 
@@ -257,7 +276,6 @@ void TaskQueue::Switch(Task* next, Task* curr)
 
     curr->ContextSwitches.Inc();
     curr->UpdateRuntime();
-    curr->SwitchedOutRunnable = !curr->IsBlocked();
 
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
@@ -268,126 +286,180 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
-/* Whether cand, a blocked task, is one asleep in Sleep() whose time has
-   come. The clock is read at most once a walk, and only by a walk that meets
-   such a task: *now is 0 until then. */
-static bool SleepIsOver(Task* cand, ulong* now)
+/* A Treiber stack that is only ever pushed onto and taken whole, never
+   popped: there is no ABA -- a task pushed again after the take is a new
+   entry on what was an empty stack -- and the push is all a waker does, from
+   whatever context it is in. The compare-and-swap that publishes the entry
+   is sequentially consistent, so the WakeNext written before it is seen by
+   the CPU that takes the stack. A task is on one stack at a time: only the
+   Unblock() that made it Waking pushes it, and only DrainWakes takes it off
+   that state. */
+void TaskQueue::PushWake(Task* task)
 {
-    ulong until = (ulong)cand->SleepUntil.Get();
+    long head = WakeHead.Get();
+    for (;;)
+    {
+        task->WakeNext = reinterpret_cast<Task*>(head);
+        long seen = WakeHead.Cmpxchg(reinterpret_cast<long>(task), head);
+        if (seen == head)
+            return;
+        head = seen;
+    }
+}
+
+void TaskQueue::Enqueue(Task* task)
+{
+    RunnableCount.Inc();
+    Requeue(task);
+}
+
+void TaskQueue::Requeue(Task* task)
+{
+    BugOn(!task->RunEntry.IsEmpty());
+    task->QueuedAt = GetBootTime().GetValue();
+    task->StallReported = false;
+    RunList.InsertTail(&task->RunEntry);
+}
+
+void TaskQueue::Asleep(Task* task)
+{
+    RunnableCount.Dec();
+    BugOn(RunnableCount.Get() < 0);
+
+    ulong until = (ulong)task->SleepUntil.Get();
     if (until == 0)
-        return false;
-
-    if (*now == 0)
-        *now = GetBootTime().GetValue();
-
-    return *now >= until;
-}
-
-ulong TaskQueue::EarliestDeadline(ulong now)
-{
-    ulong earliest = ~0UL;
-    ulong runnable = 0;
-
-    for (auto entry = TaskList.Flink; entry != &TaskList; entry = entry->Flink)
-    {
-        Task* task = CONTAINING_RECORD(entry, Task, ListEntry);
-        if (!task->IsBlocked())
-        {
-            if (!task->IsIdle())
-                runnable++;
-            continue;
-        }
-
-        /* One whose time has come is SelectNext's to run, now or at its
-           turn: nothing to fire for */
-        ulong until = (ulong)task->SleepUntil.Get();
-        if (until > now && until < earliest)
-            earliest = until;
-    }
-
-    Stats.Look(runnable);
-    return earliest;
-}
-
-void TaskQueue::WakeSleepers(Task* curr)
-{
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-
-    /* After the timer fired, the walk: it was armed for the deadline it
-       fired at, or the tick, and others may be due before the next tick.
-       Otherwise every task asleep here armed it as it blocked, and only the
-       one blocking now can need it sooner. */
-    if (cpu.LocalTimerTakeWalk())
-    {
-        cpu.LocalTimerWake(EarliestDeadline(GetBootTime().GetValue()));
         return;
-    }
 
-    if (curr->IsBlocked())
-        cpu.LocalTimerWake((ulong)curr->SleepUntil.Get());
+    /* Soonest first. From the tail, where a later deadline mostly goes; the
+       list is as long as this CPU has sleepers, a handful */
+    auto* pos = SleepList.Blink;
+    while (pos != &SleepList &&
+           (ulong)CONTAINING_RECORD(pos, Task, SleepEntry)->SleepUntil.Get() > until)
+        pos = pos->Blink;
+
+    /* After pos, which is before the one that follows it */
+    pos->Flink->InsertTail(&task->SleepEntry);
 }
 
-Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle, ulong& walked)
+void TaskQueue::DrainWakes(ulong& touched)
 {
-    Task* next = nullptr;
-    Task* idle = nullptr;
-    ulong now = 0;
+    if (WakeHead.Get() == 0)
+        return;
 
-    for (auto currEntry = TaskList.Flink;
-        currEntry != &TaskList;
-        currEntry = currEntry->Flink)
+    /* The whole stack at once. Only this CPU takes it to 0, so it is not 0
+       again until it is taken. */
+    long head = WakeHead.Get();
+    for (;;)
     {
-        Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
-        walked++;
-        if (cand == curr)
-        {
-            BugOn(cand->State.Get() == Task::StateExited);
-            cand->ListEntry.Remove();
-            TaskList.InsertTail(&cand->ListEntry);
+        long seen = WakeHead.Cmpxchg(0, head);
+        if (seen == head)
             break;
-        }
-
-        if (cand->PreemptDisableCounter.Get() != 0)
-        {
-            continue;
-        }
-
-        /* Asked to be left alone until woken. Skipped outright, and not
-           kept as a fallback the way idle is: a blocked task has nothing to
-           run. The flag is cleared by whoever has work for it, which is what
-           brings it back into this walk -- except for a task asleep in
-           Sleep(), which nobody wakes: this walk runs it once its time has
-           come, and it clears the flag itself. */
-        if (cand->IsBlocked() && !SleepIsOver(cand, &now))
-        {
-            continue;
-        }
-
-        /* The idle task takes its turn only when there is no other turn to
-           take. It used to sit in this list as an equal, so a reschedule --
-           and every raise of a softirq from an interrupt handler forces one,
-           by way of the IPI -- could pick it over the task that had just
-           been given work. It then halted the CPU, and the work waited for
-           whatever interrupt came next. */
-        if (cand->IsIdle())
-        {
-            if (idle == nullptr)
-                idle = cand;
-            continue;
-        }
-
-        next = cand;
-        break;
+        head = seen;
     }
 
-    /* Only the idle task to hand the CPU to: a task polling with
-       YieldToRunnable, or one an interrupt landed on (Preempt), keeps it
-       instead -- unless it cannot run itself */
-    if (next == nullptr && keepOverIdle &&
-        curr->State.Get() != Task::StateExited && !curr->IsBlocked())
-        return nullptr;
+    /* The one pushed last is on top: turned over, they take their turns in
+       the order they were woken */
+    Task* order = nullptr;
+    for (Task* task = reinterpret_cast<Task*>(head); task != nullptr;)
+    {
+        Task* below = task->WakeNext;
+        task->WakeNext = order;
+        order = task;
+        task = below;
+    }
 
-    return (next != nullptr) ? next : idle;
+    while (order != nullptr)
+    {
+        Task* task = order;
+        order = task->WakeNext;
+        task->WakeNext = nullptr;
+        touched++;
+
+        /* Off its CPU for good before it can be pushed: it was made
+           Sleeping by the Schedule() that switched it out on this CPU, whose
+           next one this is */
+        BugOn(task->TaskQueue != this);
+        BugOn(task->State.Get() == Task::StateRunning);
+
+        /* Woken before its deadline: off the sleep list too */
+        if (!task->SleepEntry.IsEmpty())
+            task->SleepEntry.RemoveInit();
+
+        long was = task->RunState.Cmpxchg(Task::RunQueued, Task::RunWaking);
+        BugOn(was != Task::RunWaking);
+        Enqueue(task);
+    }
+}
+
+void TaskQueue::WakeDue(ulong now, ulong& touched)
+{
+    while (!SleepList.IsEmpty())
+    {
+        Task* task = CONTAINING_RECORD(SleepList.Flink, Task, SleepEntry);
+        ulong until = (ulong)task->SleepUntil.Get();
+        if (until > now)
+            return;
+
+        task->SleepEntry.RemoveInit();
+        touched++;
+
+        /* Unless an Unblock() won it first: then it is Waking, on the wake
+           stack, and the next drain puts it on the run list */
+        if (task->RunState.Cmpxchg(Task::RunQueued, Task::RunSleeping) == Task::RunSleeping)
+        {
+            task->WakeTime.Set((long)until);
+            Enqueue(task);
+        }
+    }
+}
+
+void TaskQueue::ReleaseIdle(Task* curr)
+{
+    if (IdleTask == nullptr || IdleTask->IsIdle())
+        return;
+
+    /* Counted from now on, as any task that can run. On the CPU, it takes
+       its place on the run list when it leaves it; in its place as the last
+       resort, now; on the run list already -- displaced while it ran
+       something other than its idling -- where it is. */
+    Task* task = IdleTask;
+    IdleTask = nullptr;
+    RunnableCount.Inc();
+    if (task != curr && task->RunEntry.IsEmpty())
+        Requeue(task);
+}
+
+void TaskQueue::CheckStalls(ulong now)
+{
+    if (RunList.IsEmpty())
+        return;
+
+    /* The run list is in the order of its turns: its head has waited
+       longest */
+    Task* task = CONTAINING_RECORD(RunList.Flink, Task, RunEntry);
+    if (task->StallReported || now < task->QueuedAt + StallReportNs)
+        return;
+
+    /* Said once the locks are down (ReportStall): the trace path ends in the
+       console and, with disklog=on, in a disk write, and none of that is for
+       under the queue's lock */
+    task->StallReported = true;
+    StallReports.Inc();
+    Stdlib::SnPrintf(StallName, sizeof(StallName), "%s", task->GetName());
+    StallPid = task->Pid;
+    StallWaitedMs = (now - task->QueuedAt) / Const::NanoSecsInMs;
+    StallRunnable = RunnableCount.Get();
+    StallPending = true;
+}
+
+void TaskQueue::ReportStall()
+{
+    if (likely(!StallPending))
+        return;
+
+    StallPending = false;
+    Trace(0, "sched: %s (pid %lu) could run, and has waited %lu ms for cpu %lu, with %ld that can run there",
+        StallName, StallPid, StallWaitedMs, CpuTable::GetInstance().GetCurrentCpuId(), StallRunnable);
 }
 
 void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
@@ -401,14 +473,32 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
     curr->PreemptPending.Set(0);
     Lock.Lock();
 
+    /* The timer fired since the last look: the queue is counted for
+       SchedStats and looked at for a task left waiting too long */
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    bool fired = cpu.LocalTimerTakeWalk();
+
     Task* next = nullptr;
+    bool exited = false;
+    long run = Task::RunQueued;
+    ulong now = 0;
     ulong exitedRetries = 0;
-    ulong walked = 0;
+    ulong touched = 1;
     for (;;) {
         curr->Lock.Lock();
         BugOn(TaskList.IsEmpty());
 
-        if (curr->State.Get() == Task::StateExited && curr->TaskQueue != nullptr)
+        /* What can run that could not at the last look: the woken, and the
+           sleepers whose time has come */
+        DrainWakes(touched);
+        if (!SleepList.IsEmpty() || fired)
+            now = GetBootTime().GetValue();
+        if (!SleepList.IsEmpty())
+            WakeDue(now, touched);
+        ReleaseIdle(curr);
+
+        exited = (curr->State.Get() == Task::StateExited);
+        if (exited && curr->TaskQueue != nullptr)
         {
             BugOn(curr->TaskQueue != this);
             BugOn(curr->ListEntry.IsEmpty());
@@ -416,27 +506,41 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
             curr->ListEntry.RemoveInit();
             TaskCount.Dec();
             BugOn(TaskCount.Get() < 0);
+            RunnableCount.Dec();
+            BugOn(RunnableCount.Get() < 0);
         }
 
-        next = SelectNext(curr, keepOverIdle, walked);
-        if (next != nullptr)
+        /* On its CPU, a task is Queued, or Blocking on its way to sleep:
+           only this CPU makes it anything else, and only as it leaves */
+        run = curr->RunState.Get();
+        BugOn(!exited && run != Task::RunQueued && run != Task::RunBlocking);
+        bool runnable = !exited && run == Task::RunQueued;
+
+        if (!RunList.IsEmpty())
         {
-            next->Lock.Lock();
-            next->ListEntry.Remove();
-            if (curr->TaskQueue != nullptr)
-            {
-                BugOn(curr->TaskQueue != this);
-                curr->ListEntry.Remove();
-                TaskList.InsertTail(&curr->ListEntry);
-            }
-            TaskList.InsertTail(&next->ListEntry);
-            break;
+            /* The head: the one whose turn it is. Everything on the list can
+               run, so there is nothing to walk past. */
+            next = CONTAINING_RECORD(RunList.Flink, Task, RunEntry);
+            next->RunEntry.RemoveInit();
+        }
+        else if (!(runnable && keepOverIdle) && IdleTask != nullptr && IdleTask != curr)
+        {
+            /* The idle task takes its turn only when there is no other turn
+               to take, and not over a task an interrupt landed on, or one
+               polling with YieldToRunnable, that can still run itself. It
+               used to sit in the walk as an equal, so a reschedule -- and
+               every raise of a softirq from an interrupt handler forces one,
+               by way of the IPI -- could pick it over the task that had just
+               been given work. It then halted the CPU, and the work waited
+               for whatever interrupt came next. */
+            next = IdleTask;
         }
 
-        if (curr->State.Get() != Task::StateExited)
-        {
+        /* Nothing to switch to: curr keeps the CPU -- runnable, or blocking
+           with no idle task to go to, when it comes back from Schedule()
+           still Blocking, unblocks itself, and looks again */
+        if (next != nullptr || !exited)
             break;
-        }
 
         /* An exited task can't be returned to: drop the locks and wait
            for a runnable candidate (the idle task at the latest) */
@@ -448,19 +552,64 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
         Lock.Lock();
     }
 
-    /* Before the switch, whichever way it goes: a sleeper's deadline is
-       when this CPU's timer is to fire, so that the walk that runs the
-       sleeper comes then and not at the next tick */
-    WakeSleepers(curr);
+    if (next != nullptr)
+    {
+        next->Lock.Lock();
+
+        /* Nothing that could not run is ever on the run list, and no task
+           with preemption disabled is ever on one when a decision is made
+           (SwitchComplete): what was passed over is now a report */
+        BugOn(next->RunState.Get() != Task::RunQueued);
+        BugOn(next->PreemptDisableCounter.Get() != 0);
+
+        /* curr leaves the CPU. Blocking, it goes to sleep -- unless an
+           Unblock() made it Queued since it looked, and then it has not.
+           Runnable, it takes the run list's tail -- the idle task too, while
+           it runs the boot or a test, and only while it idles is its place
+           its own (Task::SetIdling). Kept apart whatever it ran, it used to
+           be the last resort with the boot in it: a task the boot started on
+           its own CPU that never blocked -- the ring selftest's producer --
+           took that CPU at the first tick and kept it, and the boot never got
+           as far as starting the consumer the producer waited for. */
+        if (!exited)
+        {
+            if (run == Task::RunBlocking &&
+                curr->RunState.Cmpxchg(Task::RunSleeping, Task::RunBlocking) == Task::RunBlocking)
+            {
+                Asleep(curr);
+                curr->SwitchedOutRunnable = false;
+            }
+            else
+            {
+                if (curr != IdleTask || !curr->IsIdling())
+                    Requeue(curr);
+                curr->SwitchedOutRunnable = true;
+            }
+        }
+    }
+
+    /* This CPU's timer at the soonest sleeper's deadline -- curr's, if it has
+       just gone to sleep until one -- so that the sleeper runs then, and not
+       at the next tick. A deadline later than the timer has is no change. */
+    if (!SleepList.IsEmpty())
+        cpu.LocalTimerWake((ulong)CONTAINING_RECORD(SleepList.Flink, Task, SleepEntry)->SleepUntil.Get());
+
+    if (fired)
+    {
+        Stats.Look((ulong)RunnableCount.Get());
+        CheckStalls(now);
+    }
 
     /* What deciding cost, the locks' waits included, and not the switch */
-    Stats.Decision(Hal::ReadCycleCounter() - began, walked);
+    Stats.Decision(Hal::ReadCycleCounter() - began, touched);
 
     if (next == nullptr)
     {
         curr->UpdateRuntime();
         curr->Lock.Unlock();
         Lock.Unlock();
+
+        ReportStall();
 
         /* The count down before interrupts come back on, not after: one
            waiting to be taken -- the IPI for a task woken meanwhile -- would
@@ -485,10 +634,24 @@ void TaskQueue::Insert(Task* task)
 
     BugOn(task->TaskQueue != nullptr);
     BugOn(!(task->ListEntry.IsEmpty()));
+    BugOn(!task->RunEntry.IsEmpty());
+    BugOn(task->RunState.Get() != Task::RunQueued);
 
     task->TaskQueue = this;
     TaskList.InsertTail(&task->ListEntry);
     TaskCount.Inc();
+
+    /* The idle task has a place of its own, apart from the run list. It is
+       made one before it is inserted (Cpu::Run), and is already running:
+       Task::Run inserts it from its own stack. */
+    if (task->IsIdle())
+    {
+        BugOn(IdleTask != nullptr);
+        IdleTask = task;
+        return;
+    }
+
+    Enqueue(task);
 }
 
 void TaskQueue::Remove(Task* task)
@@ -499,6 +662,18 @@ void TaskQueue::Remove(Task* task)
 
         BugOn(task->TaskQueue != this);
         BugOn(task->ListEntry.IsEmpty());
+
+        /* Only a task that can run is moved (SwitchComplete): one asleep
+           stays where its wakeups and its deadline go, and the idle task
+           where it is */
+        BugOn(task->RunState.Get() != Task::RunQueued);
+        BugOn(task == IdleTask);
+        BugOn(!task->SleepEntry.IsEmpty());
+
+        task->RunEntry.RemoveInit();
+        RunnableCount.Dec();
+        BugOn(RunnableCount.Get() < 0);
+
         task->TaskQueue = nullptr;
         task->ListEntry.RemoveInit();
         TaskCount.Dec();
@@ -515,6 +690,17 @@ void TaskQueue::Clear()
         Stdlib::AutoLock lock(Lock);
         taskList.MoveTailList(&TaskList);
         TaskCount.Set(0);
+        RunnableCount.Set(0);
+        IdleTask = nullptr;
+        WakeHead.Set(0);
+
+        /* What waits on the run and sleep lists is on the task list too, and
+           goes with it: unlinked, so that no task is left pointing into
+           lists that are gone */
+        while (!RunList.IsEmpty())
+            RunList.RemoveHead()->Init();
+        while (!SleepList.IsEmpty())
+            SleepList.RemoveHead()->Init();
     }
 
     if (taskList.IsEmpty())
@@ -541,6 +727,11 @@ TaskQueue::~TaskQueue()
 long TaskQueue::GetTaskCount()
 {
     return TaskCount.Get();
+}
+
+long TaskQueue::GetRunnableCount()
+{
+    return RunnableCount.Get();
 }
 
 long TaskQueue::GetSwitchContextCounter()
@@ -604,11 +795,11 @@ void YieldToRunnable()
     ScheduleCurrent(true);
 }
 
-/* Sleep blocks. The task is out of the scheduler's walk until its time has
-   come, and the walk on its CPU notices that and runs it: at the scheduling
-   point the CPU's timer makes at the deadline -- armed for it as the task
-   blocks (TaskQueue::WakeSleepers) -- or at any sooner one that finds the
-   time has come. That used to be the tick's, 100 times a second, at the
+/* Sleep blocks. The task is off its queue's run list until its time has
+   come, on the queue's sleep list, soonest first, and the scheduling point
+   its CPU's timer makes at the deadline -- armed for it as the task goes to
+   sleep -- or any sooner one that finds the time has come puts it back
+   (TaskQueue::WakeDue). That used to be the tick's, 100 times a second, at the
    latest, and a sleep of a millisecond took ten. It used to poll, too, a loop
    around Schedule() that left it runnable: alone on its CPU it let the CPU
    halt until the tick, but two on one CPU handed it to each other without

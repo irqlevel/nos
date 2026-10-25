@@ -48,7 +48,16 @@ interrupts off, which must be named as that CPU's after the tenth of a
 second the test waits for it; one spinning on that CPU, caught there by the
 IPI -- through the slot the deaf CPU answered late, which has to be
 reusable -- each held to frames naming the function it is in; and a join
-of 50 ms reported at a report interval of 20.
+of 50 ms reported at a report interval of 20. After it `TestWakeStorm`
+passes a token round a ring of tasks, two a CPU, each pinned to its own and
+each pass a wakeup on another CPU -- half the waits with a deadline, a sleep
+now and then racing the signal that comes for it, a task yielding on every
+other CPU -- and fails the boot when the token stops for two seconds, naming
+the task it was sent to and where that task is: a wakeup lost is a task
+asleep for good, which nothing else would report
+([blocking and waking](scheduler.md#blocking-and-waking)). Its line says how
+many passes in how long; a control run that dropped one wakeup in 1500
+failed the boot at the 1633rd.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.

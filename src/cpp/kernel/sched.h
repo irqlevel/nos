@@ -106,10 +106,13 @@ public:
 
     long GetSwitchContextCounter();
 
-    /* How many tasks sit on this queue. Maintained by every membership
-       change, which is not the same set as every list operation: SelectNext
-       rotates the list without changing what is on it. */
+    /* How many tasks this queue is home to -- runnable, running, asleep, the
+       idle task -- maintained by every change of home */
     long GetTaskCount();
+
+    /* How many of them could run now: the one on the CPU included, the idle
+       task not. What the load balancer weighs (Task::SelectNextTaskQueue). */
+    long GetRunnableCount();
 
     /* Free tasks that exited on this queue's CPU. Must be called with
        interrupts enabled (it frees stacks, which triggers a blocking TLB
@@ -118,24 +121,60 @@ public:
 
     void ReadStats(SchedStats::Snapshot& out);
 
+    /* A task this queue is home to, found asleep by an Unblock() that has
+       just made it Task::RunWaking: handed back from any CPU and any
+       context, a hard IRQ handler's included, without a lock -- pushed onto
+       a stack this queue's CPU takes whole at its next Schedule() and puts
+       on the run list (DrainWakes). That Schedule() is the waker's to bring
+       about, as it always was: Event::Signal and SoftIrq::Raise send the IPI. */
+    void PushWake(Task* task);
+
 private:
     TaskQueue(const TaskQueue &other) = delete;
     TaskQueue(TaskQueue&& other) = delete;
     TaskQueue& operator=(const TaskQueue& other) = delete;
     TaskQueue& operator=(TaskQueue&& other) = delete;
 
-    /* walked counts the entries looked at, for SchedStats */
-    Task* SelectNext(Task* curr, bool keepOverIdle, ulong& walked);
+    /* Everything below is under Lock, interrupts off, on this queue's CPU */
 
-    /* The soonest deadline after now of a task blocked on this queue until
-       one (Sleep, Event::WaitFor) -- what this CPU's timer is to fire for
-       before its next tick -- or ~0 when there is none. Under Lock. */
-    ulong EarliestDeadline(ulong now);
+    /* The tasks woken since the last look (PushWake), onto the run list in
+       the order they were woken; touched counts them, for SchedStats */
+    void DrainWakes(ulong& touched);
 
-    /* This CPU's timer brought forward to what is asleep here: after it
-       fired, to the soonest deadline of all (EarliestDeadline); otherwise to
-       curr's, blocking now. Under Lock, interrupts off. */
-    void WakeSleepers(Task* curr);
+    /* The sleepers whose deadline is not after now, onto the run list */
+    void WakeDue(ulong now, ulong& touched);
+
+    /* A task that could not run and now can: to the run list's tail, and
+       counted */
+    void Enqueue(Task* task);
+
+    /* curr, displaced while it can still run and counted already: to the run
+       list's tail -- what makes the turns a round robin */
+    void Requeue(Task* task);
+
+    /* curr, gone to sleep: no longer counted, and on the sleep list if it is
+       asleep until a deadline */
+    void Asleep(Task* task);
+
+    /* The idle task made an ordinary one (Task::ClearIdle, at a shutdown):
+       out of its place as the last resort, and into its turn */
+    void ReleaseIdle(Task* curr);
+
+    /* A runnable task that has waited StallReportNs for this CPU is a
+       report, once a wait: a scheduler that can starve one says so. Noted
+       under the lock, and said by ReportStall once this CPU holds none of
+       the scheduler's locks -- the keep path's end, or SwitchComplete. */
+    void CheckStalls(ulong now);
+    void ReportStall();
+
+    static const ulong StallReportNs = 5 * Const::NanoSecsInSec;
+
+    /* The stall noted and not yet said: this CPU's alone */
+    bool StallPending;
+    char StallName[TaskNameLen];
+    ulong StallPid;
+    ulong StallWaitedMs;
+    long StallRunnable;
 
     /* Spins allowed in Schedule while an exited task waits for a
        runnable candidate before declaring the queue broken */
@@ -148,7 +187,28 @@ private:
     static void SwitchComplete(void* ctx);
 
     using ListEntry = Stdlib::ListEntry;
+
+    /* Every task this queue is home to (Task::ListEntry) */
     ListEntry TaskList;
+
+    /* The runnable ones, but for the one on the CPU and the idle task, in
+       the order they take their turns (Task::RunEntry). Only runnable tasks:
+       one blocked is off it until woken, so a decision is its head, and
+       never a walk past tasks that cannot run. */
+    ListEntry RunList;
+
+    /* The tasks asleep until a deadline -- Sleep(), Event::WaitFor() --
+       soonest first (Task::SleepEntry): what this CPU's timer is armed for,
+       and what WakeDue looks at the head of */
+    ListEntry SleepList;
+
+    /* The CPU's idle task, kept apart from the run list: the last resort,
+       taken only when nothing else can run */
+    Task* IdleTask;
+
+    /* PushWake's stack, a Task* and 0 for none, linked by Task::WakeNext */
+    Atomic WakeHead;
+
     SpinLock Lock;
 
     /* Tasks that exited on this CPU, pending a stack free with interrupts
@@ -159,6 +219,7 @@ private:
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
     Atomic TaskCount;
+    Atomic RunnableCount;
 
     /* The waits next has just ended, as it is switched in at now: woken,
        or displaced while runnable (SchedStats). Under Lock. */
@@ -212,5 +273,9 @@ long GetTaskMigrationCount();
    on, and how many of those landed on an idle task (see ScheduleCurrent). */
 long GetPreemptDeferredCount();
 long GetPreemptDeferredIdleCount();
+
+/* Runnable tasks reported since boot for having waited too long for their
+   CPU (TaskQueue::CheckStalls) */
+long GetStallReportCount();
 
 }
