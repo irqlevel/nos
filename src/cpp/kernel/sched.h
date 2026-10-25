@@ -9,6 +9,83 @@
 namespace Kernel
 {
 
+/* What one CPU's scheduler did, counted as it does it: how long a task that
+   was woken waited for the CPU, how long one displaced while it could still
+   run waited to run again, what a decision cost, how far its walk went, and
+   how many tasks could run each time the CPU's timer had the queue looked
+   at. Written only by the CPU that owns the queue, under its lock; read
+   from anywhere with no lock, a counter at a time (`sched`), so a reading
+   is a moment's and not a consistent whole. */
+class SchedStats final
+{
+public:
+    /* Log2 buckets of microseconds: bucket 0 is under 1 us, bucket k is
+       [2^(k-1), 2^k) us, and the last holds everything from 2^(Buckets-2) us
+       up -- about 4 s */
+    static const ulong Buckets = 24;
+
+    struct Snapshot
+    {
+        /* Woken: unblocked by someone, or asleep until a deadline that
+           came -- from then until it ran */
+        ulong Wake[Buckets];
+        ulong WakeMaxNs;
+        /* Displaced while it could still run, until it ran again */
+        ulong Delay[Buckets];
+        ulong Decisions;
+        ulong DecisionCycles;
+        ulong DecisionMaxCycles;
+        /* Entries the walk looked at, summed over the decisions */
+        ulong Walked;
+        ulong WalkMax;
+        /* Looks at the queue the timer made, the tasks they found able to
+           run -- the one on the CPU included, the idle task not -- summed,
+           the most, and how many found two or more */
+        ulong Looks;
+        ulong Runnable;
+        ulong RunnableMax;
+        ulong Crowded;
+    };
+
+    constexpr SchedStats() = default;
+    ~SchedStats() = default;
+
+    void Wake(ulong ns);
+    void Delay(ulong ns);
+    void Decision(ulong cycles, ulong walked);
+    void Look(ulong runnable);
+
+    void Read(Snapshot& out);
+
+    static ulong Bucket(ulong ns);
+    /* What bucket's entries are under, in microseconds */
+    static ulong BucketLimitUs(ulong bucket);
+
+private:
+    SchedStats(const SchedStats& other) = delete;
+    SchedStats(SchedStats&& other) = delete;
+    SchedStats& operator=(const SchedStats& other) = delete;
+    SchedStats& operator=(SchedStats&& other) = delete;
+
+    /* One writer, so a load and a store and no locked instruction: what a
+       reader on another CPU sees is the value before or the value after */
+    static void Bump(Atomic& counter, ulong by);
+    static void Raise(Atomic& max, ulong value);
+
+    Atomic WakeHist[Buckets];
+    Atomic WakeMax;
+    Atomic DelayHist[Buckets];
+    Atomic Decisions;
+    Atomic DecisionCycles;
+    Atomic DecisionMax;
+    Atomic Walked;
+    Atomic WalkMax;
+    Atomic Looks;
+    Atomic RunnableSum;
+    Atomic RunnableMax;
+    Atomic Crowded;
+};
+
 class TaskQueue
 {
 public:
@@ -36,13 +113,16 @@ public:
        shootdown) -- see SwitchComplete. */
     void ReapExited();
 
+    void ReadStats(SchedStats::Snapshot& out);
+
 private:
     TaskQueue(const TaskQueue &other) = delete;
     TaskQueue(TaskQueue&& other) = delete;
     TaskQueue& operator=(const TaskQueue& other) = delete;
     TaskQueue& operator=(TaskQueue&& other) = delete;
 
-    Task* SelectNext(Task* curr, bool keepOverIdle);
+    /* walked counts the entries looked at, for SchedStats */
+    Task* SelectNext(Task* curr, bool keepOverIdle, ulong& walked);
 
     /* The soonest deadline after now of a task blocked on this queue until
        one (Sleep, Event::WaitFor) -- what this CPU's timer is to fire for
@@ -76,6 +156,12 @@ private:
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
     Atomic TaskCount;
+
+    /* The waits next has just ended, as it is switched in at now: woken,
+       or displaced while runnable (SchedStats). Under Lock. */
+    void NoteRun(Task* next, ulong now);
+
+    SchedStats Stats;
 };
 
 
