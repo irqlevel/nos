@@ -214,6 +214,8 @@ struct Channel {
     consumed: u32,
     /// A terminal was asked for: the client's side is raw.
     pty: bool,
+    /// Its size, as the client last said.
+    term: crate::Terminal,
     mode: Mode,
     eof_in: bool,
     close_in: bool,
@@ -287,6 +289,10 @@ impl crate::Io for CommandIo<'_, '_, '_> {
                 false
             }
         }
+    }
+
+    fn terminal(&self) -> Option<crate::Terminal> {
+        self.session.channel.as_ref().filter(|c| c.pty).map(|c| c.term)
     }
 }
 
@@ -477,6 +483,7 @@ impl<'s, 'a> Session<'s, 'a> {
                     local_window: WINDOW,
                     consumed: 0,
                     pty: false,
+                    term: crate::Terminal::default(),
                     mode: Mode::Idle,
                     eof_in: false,
                     close_in: false,
@@ -504,11 +511,27 @@ impl<'s, 'a> Session<'s, 'a> {
 
         let mut next = Next::None;
         let granted = match kind {
+            /* The terminal's name, then its width in characters and its
+               height in rows (RFC 4254 6.2), which a command that draws on
+               it is told */
             b"pty-req" => {
                 channel.pty = true;
+                let _name = r.string();
+                if let (Some(cols), Some(rows)) = (r.u32(), r.u32()) {
+                    channel.term.cols = cols;
+                    channel.term.rows = rows;
+                }
                 true
             }
-            b"window-change" => true,
+            /* The width and the height again, changed (6.7) */
+            b"window-change" => {
+                if let (Some(cols), Some(rows)) = (r.u32(), r.u32()) {
+                    channel.term.cols = cols;
+                    channel.term.rows = rows;
+                    channel.term.changes = channel.term.changes.wrapping_add(1);
+                }
+                true
+            }
             b"shell" if idle => {
                 channel.mode = Mode::Shell;
                 next = Next::Shell;

@@ -219,9 +219,31 @@ fn plan(r: &mut Input) -> Plan {
         1 => window / 2 + 1,
         _ => window,
     };
-    Plan { tries, brk, run, window, max_packet, adjust_after: adjust_after.max(1),
-           rekey_after: (r.u8() < 48).then(|| 1 + r.below(8) as usize), answers_keepalive: r.u8() < 224,
-           unknown: r.u8() < 32, global: r.u8() < 32 }
+    let rekey_after = (r.u8() < 48).then(|| 1 + r.below(8) as usize);
+    let (answers_keepalive, unknown, global) = (r.u8() < 224, r.u8() < 32, r.u8() < 32);
+    /* `term`, which says what the session told it of its terminal, run with
+     * one or without: the size the client gave, and the changes it sent
+     * after, in the model -- the output made CR LF, as a terminal's is */
+    let mut term = None;
+    let run = match run {
+        Run::Exec(..) if r.u8() < 48 => {
+            let want = if r.u8() < 192 {
+                let sizes: Vec<(u32, u32)> = (0..1 + r.below(4))
+                    .map(|_| (r.pick(&[0u32, 1, 80, 132, 1000, u32::MAX]), r.pick(&[0u32, 1, 24, 50, u32::MAX])))
+                    .collect();
+                let (cols, rows) = sizes[sizes.len() - 1];
+                let said = format!("term {} {} {}\r\n", cols, rows, sizes.len() - 1);
+                term = Some(sizes);
+                said
+            } else {
+                "term none\n".to_string()
+            };
+            Run::Exec("term".to_string(), Some(want.into_bytes()))
+        }
+        other => other,
+    };
+    Plan { tries, brk, run, window, max_packet, adjust_after: adjust_after.max(1), rekey_after, answers_keepalive,
+           unknown, global, term }
 }
 
 /// What a client's connection must have come to, now that it is over.

@@ -417,21 +417,41 @@ pub unsafe extern "C" fn kernel_printer_read(out: *mut c_void, buf: *mut u8, len
 }
 
 /// # Safety
+/// `out` is a printer this fuzzer handed a command; `term` is a
+/// `CmdTerminal` to fill.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_printer_terminal(out: *mut c_void, term: *mut ffi::cmd::CmdTerminal) -> bool {
+    if term.is_null() {
+        return false;
+    }
+    match cmd::printer_terminal(out as usize) {
+        Some(t) => {
+            // SAFETY: the caller's struct, checked not null.
+            unsafe { term.write(t) };
+            true
+        }
+        None => false,
+    }
+}
+
+/// # Safety
 /// `line` is `len` bytes; `sink(ctx, ...)` is sound to call while this runs.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_cmd_dispatch(line: *const u8, len: usize, sink: ffi::cmd::CmdSink, ctx: *mut c_void) {
     // SAFETY: the caller's line.
     let line = unsafe { core::slice::from_raw_parts(line, len) }.to_vec();
-    cmd::dispatch(&line, sink, None, ctx as usize)
+    cmd::dispatch(&line, sink, None, None, ctx as usize)
 }
 
 /// # Safety
-/// As `kernel_cmd_dispatch`, and `source(ctx, ...)` too.
+/// As `kernel_cmd_dispatch`, and `source(ctx, ...)` and `terminal(ctx, ...)`
+/// too.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_cmd_dispatch_io(
-    line: *const u8, len: usize, sink: ffi::cmd::CmdSink, source: ffi::cmd::CmdSource, ctx: *mut c_void,
+    line: *const u8, len: usize, sink: ffi::cmd::CmdSink, source: ffi::cmd::CmdSource,
+    terminal: ffi::cmd::CmdTerminalOf, ctx: *mut c_void,
 ) {
     // SAFETY: the caller's line.
     let line = unsafe { core::slice::from_raw_parts(line, len) }.to_vec();
-    cmd::dispatch(&line, sink, Some(source), ctx as usize)
+    cmd::dispatch(&line, sink, Some(source), Some(terminal), ctx as usize)
 }
