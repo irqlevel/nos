@@ -63,6 +63,7 @@ What is in it:
 | `/boot/kernel64.elf` | the kernel |
 | `/boot/grub/nos.cfg` | its GRUB entries, `nos` and `nos (next)`, with the command line the kernel was built to read |
 | `/lib/modules/*.ko` | every module built with that kernel, so every one of them loads into it ([Modules](modules.md)) |
+| `/lib/hvboot` | the loader `hv` boots a guest's own kernel with, of the same build as `hv.ko`: the kernel of every VM `hv create <name> <url>` makes ([The hypervisor](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)) |
 | `/etc/rc` | the default boot script: `insmod /lib/modules/sshd.ko`, `sshd start` |
 | `/nos-install` | the installer, the one that knows this image |
 | `/VERSION` | `version=`, `revision=` (what `version` prints in nos), `arch=`, `module_abi=` |
@@ -92,7 +93,9 @@ well, a booted nos has no way in at all.
 What `install` does, in order, stopping at the first thing that is wrong:
 
 1. Checks the image (`/VERSION`, the kernel, the modules; for this machine's
-   architecture) and the partition: a block device, not a disk with
+   architecture; nothing in it this `nos-install` does not know where to
+   put, which it would leave out -- an image newer than it, whose own
+   `nos-install` does) and the partition: a block device, not a disk with
    partitions on it, not held by md, LVM or the device mapper, not one of the
    running system's filesystems. Warns when the disk is not NVMe or virtio,
    when no network card nos drives is there, when Secure Boot is on.
@@ -101,11 +104,12 @@ What `install` does, in order, stopping at the first thing that is wrong:
    One that has an ext2 nos can write keeps everything on it; one with
    anything else is refused, unless `--format` says to make a new
    filesystem in its place -- which loses what was there.
-3. Mounts it and puts the kernel, the modules, `nos.cfg` and `/VERSION`
-   there. On a partition that had them, the old ones go to `.prev`, the
-   three together, for `rollback`. `/etc` is the machine's: the image's
-   `/etc/rc` goes in only where there is none, and the keys are added to
-   `/etc/ssh/authorized_keys`. The machine's microcode -- Intel's file for
+3. Mounts it and puts the kernel, the modules, hvboot, `nos.cfg` and
+   `/VERSION` there. On a partition that had them, the old ones but
+   `nos.cfg` go to `.prev`, together, for `rollback`. `/etc` is the
+   machine's: the image's `/etc/rc` goes in only where there is none, and
+   the keys are added to `/etc/ssh/authorized_keys`. The machine's
+   microcode -- Intel's file for
    its CPU from `/lib/firmware/intel-ucode`, which the server's own system
    keeps current -- goes to `/boot/ucode`, which GRUB loads beside the
    kernel; with none there (an AMD CPU, no `intel-microcode` package), nos
@@ -194,8 +198,8 @@ mount -o loop,ro nos-x86_64.squashfs /mnt
 ```
 
 `update` finds the partition through `42_nos` and puts the new kernel,
-modules and `nos.cfg` there; the old kernel, modules and `/VERSION` go to
-`.prev` together, and the microcode is taken again from the server's
+modules, hvboot and `nos.cfg` there; the old kernel, modules, hvboot and
+`/VERSION` go to `.prev` together, and the microcode is taken again from the server's
 `/lib/firmware`. `/etc` -- `rc`, the keys, the host key -- and everything
 else on the partition stay. The kernel parameters stay too, unless
 `--udpshell`, `--netconsole` or `--cmdline` is given: then those replace them
@@ -204,8 +208,9 @@ replaced together, since a kernel refuses a module built against another
 kernel interface. `/lib/modules` is the image's: a module of your own goes
 somewhere else.
 
-`nos-install rollback` swaps the current kernel, modules and `/VERSION` with
-the `.prev` ones. `nos-install status` says what is installed and what was,
+`nos-install rollback` swaps the current kernel, modules, hvboot and
+`/VERSION` with the `.prev` ones -- back to an image older than hvboot,
+none. `nos-install status` says what is installed and what was,
 the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
 takes `42_nos` out and nos out of the menu, and leaves the partition alone.
 
@@ -233,6 +238,7 @@ On the partition, which is nos's root:
 | `/boot/kernel64.elf.next` | you, from inside nos | a kernel tried once |
 | `/boot/grub/nos.cfg` | the image | the entries `nos` and `nos-next` |
 | `/lib/modules/`, `/lib/modules.prev/` | the image | the kernel's modules, and the ones before them |
+| `/lib/hvboot`, `.prev` | the image | the loader of a guest's own kernel, and the one before it |
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
 | `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
 | `/grubenv` | nos-install | `nos_cmdline`, this machine's kernel parameters; `nos_next`, the one-shot flag |
