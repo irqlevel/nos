@@ -57,7 +57,18 @@ the task it was sent to and where that task is: a wakeup lost is a task
 asleep for good, which nothing else would report
 ([blocking and waking](scheduler.md#blocking-and-waking)). Its line says how
 many passes in how long; a control run that dropped one wakeup in 1500
-failed the boot at the 1633rd.
+failed the boot at the 1633rd. `TestIdleTakesTurns` has the boot, which runs
+in the boot CPU's idle task, sleep a millisecond beside a task pinned to that
+CPU that only yields, and fails it if the sleep takes 200 ms: the idle task is
+the last resort only while it idles ([the idle task](scheduler.md#the-idle-task)).
+And `TestEevdf`, on a CPU other than the boot's, holds EEVDF's two promises
+([who runs next](scheduler.md#who-runs-next-eevdf)): a task woken beside one
+task that never blocks, and beside two, runs within half a millisecond and a
+millisecond at the median -- signalled at random points of the spinners'
+slices, since at a fixed rhythm a lag reckoned wrong slipped under the bound
+-- and a spinner of nice 0 has 2.4 to 3.9 times the CPU of one of nice 5,
+for 3.06. Its line gives both medians and the share; a control run with the
+lag reckoned wrong waited 1256 us beside one spinner and failed the boot.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
@@ -1096,7 +1107,9 @@ kernel does is its C++ memory management, whose error paths -- a table that
 cannot be allocated half way down a walk, a heap with no page left -- no boot
 takes. A read past an end, an index out of range or a wrap in any of them is
 a boot that dies without a word, or a page handed out that something still
-uses; and in C++ the language does not stop it where it happens. So
+uses; and in C++ the language does not stop it where it happens. The
+scheduler's rules are here too: one reckoned wrong is a task that waits,
+which nothing reports. So
 `fuzz/cpp` builds each of them for the host from the kernel's own sources,
 as they are, under the address and undefined-behaviour sanitizers, over
 stand-ins for the kernel around them (`fuzz/cpp/common/`: the tracer, the
@@ -1221,7 +1234,24 @@ what its header says it does:
   reader taking an int as a long reads the other half of its slot: what
   fits must be the host's output byte for byte and its length, and what
   does not, the host's output cut where `VsnPrintf` cuts it and marked with
-  `...`.
+  `...`;
+- `eevdf`: the scheduler's rules (`kernel/eevdf.cpp`): one CPU's queue and
+  a handful of tasks of random weights and slices, some that never sleep and
+  some that sleep, wake, yield and move away and back -- and one that joins
+  on the CPU, as the idle task does when it starts to run something -- with
+  time going by a tick, a slice's end or a random quantum at a time, and
+  every decision made in `TaskQueue::Schedule`'s order: the next picked while
+  the last is still current, the last gone or back on the list, the next
+  taken. Every step is held to a model of EEVDF computed from scratch in 128
+  bits: the one picked is eligible and no eligible one's deadline is sooner;
+  a task that joins has the lag it left with, clamped, within the rounding of
+  its inflation; one that leaves the lag V gives it, V counting everything
+  on the queue, the one picked next among them; one that ran is charged what
+  its weight says; every task on the queue is on its list or current, never
+  both or neither, and the list's count is the model's. A third of the
+  inputs are tasks that never sleep, run long enough for slices and quanta to
+  even out: each must have had the CPU in proportion to its weight. A `Leave`
+  that reckoned V without the leaver in it failed the first input.
 
 The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
 thing: inputs run in batches, one after another in a process forked for the

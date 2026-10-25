@@ -1,9 +1,11 @@
 # Scheduler
 
-Preemptive round-robin over per-CPU run queues, with no priorities and no
-user space. Everything in this kernel that is not an interrupt handler runs
-as a `Task`: the shell, the softirq workers, the USB poll loop, the DHCP
-client, and each CPU's idle loop. The code is `kernel/sched.cpp`,
+Preemptive, over per-CPU run queues, by EEVDF -- earliest eligible virtual
+deadline first, Linux's fair class since 6.6 -- with a weight from each
+task's nice, a slice of its own, and no user space. Everything in this
+kernel that is not an interrupt handler runs as a `Task`: the shell, the
+softirq workers, the USB poll loop, the DHCP client, a guest's vCPUs, and
+each CPU's idle loop. The code is `kernel/sched.cpp`, `kernel/eevdf.cpp`,
 `kernel/task.cpp` and `kernel/preempt.cpp`, with the context switch itself in
 `arch/x86_64/asm.asm` and `arch/arm64/asm.S`.
 
@@ -11,11 +13,12 @@ client, and each CPU's idle loop. The code is `kernel/sched.cpp`,
 
 One `TaskQueue` per CPU, owned by that CPU's `Cpu` object, under one
 spinlock. It is home to every task that runs on that CPU, and keeps them in
-the places a decision needs, so that a decision is never a walk:
+the places a decision needs, so that a decision never passes over a task
+that cannot run:
 
-- **The run list** -- the tasks that can run, but for the one on the CPU,
-  in the order of their turns. Only those: a task that blocks is off it
-  until it is woken, so the next to run is the list's head.
+- **The run list** -- the tasks that can run, with what EEVDF knows of each
+  ([below](#who-runs-next-eevdf)), and the one on the CPU as the queue's
+  current. Only those: a task that blocks is off it until it is woken.
 - **The sleep list** -- the tasks asleep until a deadline (`Sleep()`,
   `Event::WaitFor()`), soonest first: what the CPU's timer is armed for, and
   what each decision looks at the head of.
@@ -29,24 +32,126 @@ the places a decision needs, so that a decision is never a walk:
 - And a list of every task the queue is home to, asleep or not, which only
   its bookkeeping walks.
 
-`Schedule()` takes the wake stack and puts what was on it on the run list,
-puts the sleepers whose time has come there too, and switches to the run
-list's head; the task it displaces, if it can still run, goes to the tail,
-which is what makes the turns a round robin. With nothing on the run list
-the CPU keeps a task that can still run when an interrupt asked
-(`Preempt()`) or it is polling (`YieldToRunnable()`), and otherwise goes to
-the idle task -- for a voluntary `Schedule()`, and for a task that has just
-blocked.
+`Schedule()` takes the wake stack and places what was on it on the run list
+by the lag each brings, does the same for the sleepers whose time has come,
+and switches to the eligible task whose deadline is soonest; the task it
+displaces, if it can still run, goes back on the list, where its virtual
+runtime and deadline say. With nothing on the run list the CPU keeps a task
+that can still run when an interrupt asked (`Preempt()`) or it is polling
+(`YieldToRunnable()`), and otherwise goes to the idle task -- for a
+voluntary `Schedule()`, and for a task that has just blocked.
 
 Before, the queue was one list of every task, blocked and asleep ones
 included, and each decision walked it from the head, past every task that
 could not run, the idle task and any task whose preemption count was up --
-and once more after the timer fired, for the soonest sleeper. Both walks
-are gone: what a decision touches is the head of two lists and whatever was
-woken since the last one.
+and once more after the timer fired, for the soonest sleeper. A decision
+walks only the run list now, which holds nothing that cannot run, and the
+head of the sleep list; the turns were a round robin until EEVDF took them.
 
 Tasks move between queues only when the load balancer says so, and only
 while they can run.
+
+## Who runs next: EEVDF
+
+Each task is owed a share of its CPU in proportion to its weight, and
+virtual time is what it has had of it (`kernel/eevdf.h`):
+
+- **Weight**, from the task's nice, -20 to 19: 1024 at nice 0, each step
+  about 1.25 times the next -- Linux's `sched_prio_to_weight`, so that one
+  nice apart is about ten per cent of the CPU between two tasks that both
+  want all of it. A nanosecond on the CPU advances a task's virtual runtime
+  by 1024/weight virtual nanoseconds, a heavier task's slower.
+- **V**, the weighted average of the virtual runtime of every task on the
+  queue -- the run list's and the current one's: where a task would be had
+  it had exactly its share. Its **lag**, V less its virtual runtime, is what
+  it is owed, and it is **eligible** while that is not negative.
+- **Slice**, how long it asks to run at a time -- 3 ms unless set, 100 us to
+  100 ms -- and its **virtual deadline**, where its virtual runtime will be
+  when it has had the slice. The weight decides how much of the CPU a task
+  gets, and the slice how soon after it is eligible it gets it: a short
+  slice is an early deadline, latency without a larger share.
+
+The next to run is the eligible task whose deadline is soonest. On an
+interrupt -- the tick, a slice's end, the IPI a wakeup sends (`Preempt()`)
+-- the task on the CPU is one of the candidates and keeps the CPU unless
+another eligible one's deadline is sooner: its slice done, or a wakeup owed
+more. A task that blocks or yields lets the rest go first, and one that
+yields has its deadline put at least a slice past V -- bounded, so that a
+task yielding without end does not push it without end. While another task
+waits on the list, the CPU's timer is armed for the end of the running
+task's slice too ([below](#the-local-timer)), so the next decision comes
+when its deadline does and not at the next tick; alone on its CPU, a task's
+slice would end deciding nothing, and the timer is not armed for it.
+
+**Lag is kept** across a sleep and a move to another CPU. A task leaves its
+queue with its lag, clamped to two slices or a tick, the longer, and joins
+the next with it: its virtual runtime that far behind V. Joining moves V by
+the weight it adds, which would take part of the lag away, so the lag is
+made larger by (W + w) / W first, and once in the task has the lag it left
+with (Linux's `place_entity` has the derivation). Neither sleeping nor
+moving is a way to be owed more or to owe less: a task that waited for the
+CPU before it slept is owed that when it wakes, and runs at once; one that
+had more than its share owes it. A new task joins with no lag and half a
+slice, to run soon but not a whole slice ahead of everybody.
+
+**Everything is integers.** The kernel keeps no floating point, so a
+weight's inverse is fixed point ((1024 << 32) / weight), and V and every
+eligibility are reckoned with 128-bit multiplications -- never a division the
+compiler would make a library call of -- as Linux's `vruntime_eligible`
+does: relative to the smallest virtual runtime on the queue, a task is
+eligible when its distance from it times the queue's load is at most the
+weighted sum of everyone's, so that virtual times may wrap. And **every
+decision is reckoned from scratch**: V and every eligibility computed over
+the run list as it is, nothing kept between decisions that could drift. A
+decision is O(n) in the tasks that can run on its CPU, which are few.
+
+**The queue owns the task on the CPU** (`EevdfQueue::Current`). A task on
+the queue is on the run list or current, and counted in V either way: it
+joins the list -- new, woken, moved here -- or the CPU, as the idle task
+does when it starts to run something; goes from one to the other; and
+leaves from either. A decision picks the next while the last is still
+current, then the last goes to sleep or back on the list, then the next is
+taken, and `Take` refuses -- a `BugOn` -- while anything is still current.
+That order was a comment once, and was broken: the next was taken off the
+list before the last left the CPU, so the lag a task went to sleep with was
+reckoned from a V without the next in it. Beside one spinner that V was the
+sleeper's own virtual runtime, so it went to sleep owed nothing, every time,
+and at every wakeup waited out what was left of the spinner's slice -- 1.3
+ms at the median. Now no order of the calls can leave a task out of V.
+
+The idle task shares the CPU only while it runs something other than its
+idling ([below](#the-idle-task)): it joins the count as it stops idling,
+placed as a task waking, and leaves it, its lag kept, when it idles again.
+
+`sched queue [cpu]` prints what EEVDF has of each task a CPU's queue can
+run -- nice, slice, lag, how far past V its deadline is, whether it is
+eligible -- and `sched nice <pid> <n>` and `sched slice <pid> <us>` set a
+task's; in the kernel, `SetTaskNice` and `SetTaskSlice`.
+
+What holds it:
+
+- `cpp-fuzz.py`'s `eevdf` target ([testing](testing.md#cpp-fuzzpy----what-the-c-is-handed-and-the-memory-under-everything-fuzzed))
+  drives the queue -- `kernel/eevdf.cpp`, compiled for the host -- in
+  `Schedule()`'s order, with tasks of random weights and slices that run,
+  sleep, wake, yield and move away and back, and holds every step to a model
+  computed from scratch in 128 bits: the one picked eligible, and no
+  eligible one's deadline sooner; a task that joins has the lag it left with,
+  one that leaves the lag V gives it, one that ran is charged what its weight
+  says; every task on the queue on its list or current, never both or
+  neither; and over a long run of tasks that never sleep, each has had the
+  CPU in proportion to its weight. A `Leave` that reckoned V without the
+  leaver in it failed its first input.
+- The boot's `TestEevdf`, on a CPU other than the boot's: a task woken beside
+  one task that never blocks, and beside two, must run within half a
+  millisecond and within a millisecond at the median, and a spinner of nice
+  0 beside one of nice 5 must have between 2.4 and 3.9 times its CPU, for
+  3.06. The signals come at random points of the spinners' slices, which the
+  first bound takes: at a fixed rhythm they settled just before a slice
+  ended, and the broken order above waited 153 us at the median, under the
+  bound, where at random points it waits 1.3 ms. Under HVF a wakeup waits
+  4-8 us at the median, under TCG 18-25 us, and the share is 2.9-3.0; with
+  the round robin a wakeup behind two spinners waited 8 ms, and the two
+  shared the CPU half and half.
 
 ## The context switch
 
@@ -146,7 +251,7 @@ landing on a running task could do the same to it.
 The tick or an IPI can land on a task with preemption off -- inside a
 spinlock, most often -- where the reschedule cannot be made. It used to be
 dropped: the task went on, and whatever the reschedule was for waited for the
-next tick or IPI. For the tick's own round-robin that costs nothing; for the
+next tick or IPI. For the tick's own turn-taking that costs nothing; for the
 IPI a wakeup sends, the wakeup is lost. `SoftIrq::Raise` in an interrupt
 handler unblocks its CPU's softirq task and sends the CPU an IPI to switch to
 it. Landing on the idle task inside the lock `ReapExited()` takes -- a few
@@ -313,12 +418,14 @@ exiting on a CPU whose idle task is blocked has nothing to switch to.
 
 Each CPU's timer -- the local APIC's on x86-64, the generic timer's CNTV on
 arm64 -- is one-shot (`Cpu::LocalTimer*`, `hal/timer.h`). It is armed for
-the earlier of two things: the CPU's next tick, on a 100 Hz grid that the
-tick keeps however the interrupts in between fall, and the soonest deadline
-of a task asleep on the CPU until one -- `Sleep()`, `Event::WaitFor()`. An
-interrupt at the tick does the tick's work, as the periodic timer's did; one
-before it only reschedules, and the decision that follows puts the sleeper
-whose time has come back on the run list.
+the earliest of three things: the CPU's next tick, on a 100 Hz grid that the
+tick keeps however the interrupts in between fall; the soonest deadline of a
+task asleep on the CPU until one -- `Sleep()`, `Event::WaitFor()`; and,
+while another task waits on the run list, the end of the running task's
+slice. An interrupt at the tick does the tick's work, as the periodic
+timer's did; one before it only reschedules, and the decision that follows
+puts the sleeper whose time has come back on the run list, or gives the CPU
+to the task whose deadline has come.
 
 Who arms it for what:
 
@@ -328,6 +435,13 @@ Who arms it for what:
   held: a write of the local APIC's initial count, or of CNTV's compare
   value, when the deadline is sooner than what the timer has, and nothing
   otherwise.
+- And to the end of the slice of whoever runs from there on, if another
+  task waits on the run list (`TaskQueue::ArmSlice`): its deadline, in
+  nanoseconds on the CPU at its weight, and no sooner than 50 us from now.
+  Alone on its CPU a task's slice would end deciding nothing, and a guest's
+  vCPU on a core of its own would leave its guest every 3 ms for it; a task
+  that joins later comes with a decision of its own -- a wakeup's, a
+  deadline's, the tick's -- which arms it then.
 - The interrupt re-arms it for the tick only, and leaves a flag; the next
   `Schedule()` on the CPU -- the `Preempt()` at the end of the same handler,
   as a rule -- brings it forward again, and the flag is what has the queue
@@ -401,13 +515,16 @@ Two rules keep it from thrashing:
 
 A task on a run list longer than `TaskQueue::StallReportNs` -- five seconds
 -- is reported, once a wait: `sched: <name> (pid N) could run, and has
-waited M ms for cpu C, with K that can run there`. The run list is in the
-order of its turns, so its head has waited longest, and the look is one
-comparison each time the CPU's timer has the queue looked at. The report is
-noted under the queue's lock and said once the CPU holds none of the
-scheduler's locks: the trace ends in the console and, with `disklog=on`, in
-a disk write. A round robin cannot starve a task; a scheduler with
-priorities can, and this is what says so.
+waited M ms for cpu C, with K that can run there`. The run list is in no
+order of waiting, so each time the CPU's timer has the queue looked at, the
+look walks it for the task that has waited longest. The report is noted
+under the queue's lock and said once the CPU holds none of the scheduler's
+locks: the trace ends in the console and, with `disklog=on`, in a disk
+write. EEVDF starves no task -- one that waits falls behind V, is eligible,
+and its deadline comes -- but a weight can make a wait long by design:
+beside a spinner of nice -20, one of nice 19 has 15/88776 of the CPU, a
+3 ms slice every 18 seconds, and this says so. So would a scheduler gone
+wrong.
 
 Affinity is a `ulong` bitmask, which is one of the reasons `MaxCpus` is 64.
 Idle tasks and softirq tasks are pinned to their own CPU; everything else
@@ -502,8 +619,10 @@ about to halt or halted (`Task::SetIdling`), an interrupt that finds
 something else to run switches to it and leaves the idle task in its place,
 to run again only when nothing else can. Running anything else -- the boot
 and its self-tests, which are what the bring-up function runs before its
-loop, or the shutdown -- it is a task like any other, displaced to the run
-list's tail and taking its turn. It used to be the last resort whatever it
+loop, or the shutdown -- it is a task like any other, counted in V and
+displaced back to the run list to take its turns: it joins the count as it
+stops idling, placed as a task waking, and leaves it, its lag kept, as it
+idles again. It used to be the last resort whatever it
 ran, and a task the boot started on the boot CPU that never blocked kept the
 boot itself off that CPU for as long as it ran: the ring selftest's producer,
 pinned to the boot CPU and polling for a consumer the boot had not started
@@ -541,15 +660,15 @@ Each queue counts what its CPU's scheduler does, as it does it
   stamp from before the task last left its CPU is not this wait's -- the
   wakeup before -- and is not counted.
 - **A delay**: a task displaced while it could still run -- by the tick, or
-  an IPI -- waits until it runs again. Kept apart from wakeups: it is the
-  round robin's own turn-taking, where a wakeup's wait is latency someone is
-  waiting on.
+  an IPI, a slice's end -- waits until it runs again. Kept apart from
+  wakeups: it is the turn-taking's own, where a wakeup's wait is latency
+  someone is waiting on.
 - **A decision**: what `TaskQueue::Schedule` cost from the moment it turned
   interrupts off until it switched or returned -- the queue lock's wait
   included, the switch not -- in cycles, and how many tasks it touched: one
-  for the head it took, and one for each task it put back on the run list,
-  woken or due. When the decision walked the queue, this column was how far
-  the walk went.
+  for itself, and one for each task it put on the run list, woken or due.
+  Its walks of the run list, for V and for the pick, are as long as the
+  queue at the timer, below.
 - **The queue at the timer**: each time the CPU's timer has the queue looked
   at, how many tasks there could run, the one on the CPU included and the
   idle task not -- and whether two or more could, which is where a woken
@@ -574,7 +693,7 @@ purpose, so that CPU's longest wait since boot is about that.
 `sched probe` makes the case a scheduler is chosen by and measures it:
 spinners pinned to one CPU that never yield, a waiter pinned beside them
 asleep on an `Event`, and the shell's task on another CPU signalling it a
-sample at a time. With the round robin above, under HVF on four vCPUs:
+sample at a time. With the round robin there was, under HVF on four vCPUs:
 
 | Spinners | Waited, p50 | Their shares of the CPU, per mille |
 |---|---|---|
@@ -583,10 +702,24 @@ sample at a time. With the round robin above, under HVF on four vCPUs:
 | 2 | <8.1ms | 248, 743 |
 | 4 | <32.7ms | 82, 247, 331, 331 |
 
-A woken task waits behind every task that is ahead of it in the list, a
-tick each -- the IPI that comes for it switches the CPU to whichever runnable
-task is first, which is not the one woken -- and those early switches make
-the turns unequal too.
+A woken task waited behind every task that was ahead of it in the list, a
+tick each -- the IPI that came for it switched the CPU to whichever runnable
+task was first, which was not the one woken -- and those early switches made
+the turns unequal too. With EEVDF, the same machine:
+
+| Spinners | Waited, p50 | p99 | Their shares of the CPU, per mille |
+|---|---|---|---|
+| 0 | <32us | <128us | -- |
+| 1 | <32us | <128us | 998 |
+| 2 | <32us | <256us | 498, 497 |
+| 4 | <16us | <512us | 249, 250, 249, 249 |
+| 8 | <16us | <1.0ms | 124 each |
+
+The waiter wakes owed what it waited for the last time, and its deadline is
+the soonest, so the IPI that comes for it gives it the CPU; and the spinners
+have their weights' shares, equal ones here, to the per mille. The probe's
+`woken with lag` line says what the waiter was owed as it woke, the virtual
+microseconds its placement brought (`SchedEntity::PlacedLag`).
 
 ## Looking at it from the shell
 
@@ -594,7 +727,10 @@ the turns unequal too.
 |---|---|
 | `ps` | Every task: pid, state, flags, accumulated runtime, context switches, name |
 | `top [ms]` | Per-task CPU use over a window, as a percentage per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the migration count and the deferred reschedules |
-| `sched [ms]` | Per CPU over a window: wakeups and how long they waited for the CPU, displaced tasks' delays, decisions and their cost, the walk's length, and how many tasks could run at the timer ([above](#what-it-is-measured-by)) |
+| `sched [ms]` | Per CPU over a window: wakeups and how long they waited for the CPU, displaced tasks' delays, decisions and their cost, the tasks each touched, and how many tasks could run at the timer ([above](#what-it-is-measured-by)) |
+| `sched probe [spinners=N] [ms=M] [cpu=N]` | How long a woken task waits beside tasks that never yield, the lag it woke with, and each task's share ([above](#a-woken-task-behind-spinners)) |
+| `sched queue [cpu]` | What EEVDF has of each task a CPU can run, the one on it first: nice, slice, lag and deadline from V, eligible or not ([above](#who-runs-next-eevdf)) |
+| `sched nice <pid> <n>`, `sched slice <pid> <us>` | A task's nice, -20 to 19, and its slice, 100 us to 100 ms |
 | `stacks` | High-water mark of every task stack and every static boot stack |
 | `bt <pid>` | Where a task is and its stack trace (`Task::Locate`, [above](#waiting-for-one-to-end)): read off its stack when it is off its CPU, caught by an IPI on the CPU running it, or the CPUs that would not answer one named |
 | `profile` | Where the time actually goes — see [Profiler](profiler.md) |

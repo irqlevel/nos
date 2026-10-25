@@ -89,6 +89,18 @@ private:
     ulong Crowded = 0;
 };
 
+/* Why a decision is made: a voluntary Schedule() -- curr blocking, exiting,
+   or letting others run; YieldToRunnable() -- curr polling, and giving the
+   CPU to whoever else can use it, never to the idle task; Preempt() -- an
+   interrupt's, the tick, a slice's end, an IPI for a wakeup, where curr
+   keeps the CPU unless another is due it */
+enum class ScheduleReason
+{
+    Voluntary,
+    Yield,
+    Preempt,
+};
+
 class TaskQueue
 {
 public:
@@ -98,9 +110,32 @@ public:
     void Insert(Task* task);
     void Remove(Task* task);
 
-    /* keepOverIdle: curr keeps the CPU rather than hand it to the idle
-       task, when the idle task is all there is (YieldToRunnable, Preempt) */
-    void Schedule(Task* curr, bool keepOverIdle = false);
+    void Schedule(Task* curr, ScheduleReason why);
+
+    /* A task's nice and slice (SchedEntity), set under this queue's lock --
+       false when the task is not this queue's, and the caller looks again
+       (SetTaskNice, SetTaskSlice) */
+    bool SetNice(Task* task, long nice);
+    bool SetSlice(Task* task, ulong sliceNs);
+
+    /* What EEVDF has of one task on this queue: `sched queue` */
+    struct EntityView
+    {
+        char Name[TaskNameLen];
+        ulong Pid;
+        long Nice;
+        ulong SliceNs;
+        /* V less its VRuntime, and its deadline less V: virtual ns */
+        s64 Lag;
+        s64 Deadline;
+        bool Eligible;
+        bool OnCpu;
+    };
+
+    /* The queue as it is, copied under its lock into out -- the one on the
+       CPU first, if it is counted -- for printing after: at most max, the
+       count returned */
+    ulong View(EntityView* out, ulong max);
 
     void Clear();
 
@@ -144,17 +179,41 @@ private:
     /* The sleepers whose deadline is not after now, onto the run list */
     void WakeDue(ulong now, ulong& touched);
 
-    /* A task that could not run and now can: to the run list's tail, and
-       counted */
+    /* A task that could not run and now can -- new, woken, moved here:
+       placed by its lag (EevdfQueue::Join), onto the run list, and counted */
     void Enqueue(Task* task);
 
-    /* curr, displaced while it can still run and counted already: to the run
-       list's tail -- what makes the turns a round robin */
+    /* curr, current and displaced while it can still run: back on the run
+       list where its virtual runtime and deadline say */
     void Requeue(Task* task);
 
-    /* curr, gone to sleep: no longer counted, and on the sleep list if it is
-       asleep until a deadline */
+    /* A task has gone on the run list now: what CheckStalls times */
+    void NoteQueued(Task* task);
+
+    /* curr, gone to sleep: its lag kept, no longer counted, and on the
+       sleep list if it is asleep until a deadline */
     void Asleep(Task* task);
+
+    /* curr as a decision finds it: charged for what it has run at its
+       weight if it is current, gone from the queue if it has exited, and
+       the idle task in the count or out of it (CountIdle) */
+    void Account(Task* curr, ulong now, bool exited);
+
+    /* The idle task joins the count when it stops idling -- placed as a
+       task waking, from the lag it left with -- and leaves it, its lag kept,
+       when it idles again: idling, it is not one of the tasks that share the
+       CPU, only what runs when none of them can */
+    void CountIdle(Task* curr, ulong now);
+
+    static Task* TaskOf(SchedEntity* se);
+
+    /* The slice the current one is given, when another waits for the CPU:
+       this CPU's timer brought forward to when its deadline comes, so that
+       its slice ends then and not at the next tick. No sooner than MinArmNs
+       from now. */
+    void ArmSlice(ulong now);
+
+    static const ulong MinArmNs = 50 * Const::NanoSecsInUsec;
 
     /* The idle task made an ordinary one (Task::ClearIdle, at a shutdown):
        out of its place as the last resort, and into its turn */
@@ -191,11 +250,17 @@ private:
     /* Every task this queue is home to (Task::ListEntry) */
     ListEntry TaskList;
 
-    /* The runnable ones, but for the one on the CPU and the idle task, in
-       the order they take their turns (Task::RunEntry). Only runnable tasks:
-       one blocked is off it until woken, so a decision is its head, and
-       never a walk past tasks that cannot run. */
-    ListEntry RunList;
+    /* The runnable ones (Task::Sched.Entry), the one on the CPU among them
+       as the queue's current, and the rules a decision over them is made
+       by: EEVDF (kernel/eevdf.h). The idle task is one of them only while it
+       runs something other than its idling. Only runnable tasks: one blocked
+       is off it until woken, so a decision never passes over a task that
+       cannot run. */
+    EevdfQueue Eevdf;
+
+    /* The idle task is counted -- it runs something other than its idling,
+       or waits for its turn to (CountIdle) */
+    bool IdleCounted;
 
     /* The tasks asleep until a deadline -- Sleep(), Event::WaitFor() --
        soonest first (Task::SleepEntry): what this CPU's timer is armed for,
@@ -277,5 +342,12 @@ long GetPreemptDeferredIdleCount();
 /* Runnable tasks reported since boot for having waited too long for their
    CPU (TaskQueue::CheckStalls) */
 long GetStallReportCount();
+
+/* A task's nice (its share of its CPU, SchedEntity::SetNice) and slice (how
+   soon after it can it runs, and for how long at a time), wherever it is:
+   under its queue's lock, the queue looked up again if it moved meanwhile.
+   From task context. */
+void SetTaskNice(Task* task, long nice);
+void SetTaskSlice(Task* task, ulong sliceNs);
 
 }
