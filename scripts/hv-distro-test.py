@@ -75,6 +75,18 @@ boot. The command line the VM is given is only what the profile adds to the
 entry's: Debian's credentials. The checks are the same, and two more: hvboot
 reached the kernel, and says which entry of whose grub.cfg it booted.
 
+With `--create <url>`, a VM the way a cloud makes one, and nothing done on
+the host: `hv create cloud <url> size=4G password=...` has nos fetch the
+image itself -- over HTTPS, through its redirects -- make it the VM's disk
+and grow it, write cloud-init's NoCloud seed with the key nos's sshd lets
+in and the password, and a vm.toml booting it by hvboot; `hv start cloud`
+boots it. cloud-init must find the seed and run to its end; the image's own
+user logs in on its console with the seed's password; its datasource is
+NoCloud, its name the seed's, its key nos's, its root grown into the disk,
+its user allowed sudo; and its power button turns it off. Debian's
+genericcloud image is the small one (`--create
+https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2`).
+
 All three boot with the machine's ACPI tables: their kernels find the PCI
 host bridge, their devices' interrupts and the PM timer through them.
 `--acpi-off` boots them with `acpi=off` instead -- the MP table, PCI by
@@ -676,6 +688,117 @@ def cloud(args, d):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# --create: a VM of a cloud's image by its URL, made by nos itself. The VM's
+# name, the password its seed gives the image's own user, and the key nos's
+# sshd lets in, which the seed hands on.
+CREATE_NAME = "cloud"
+CREATE_PASSWORD = "nos-create"
+CREATE_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHVub3QtYS1yZWFsLWtleS1qdXN0LWEtdGVzdA hv-distro-test"
+# What cloud-init's last stage prints on the console when it is done --
+# after which the password its seed gave is the user's.
+CLOUD_INIT_DONE = "finished at"
+# The longest one `hv wait` waits.
+WAIT_MAX = 600
+
+
+def create(args):
+    """`hv create <name> <url>`, as a cloud makes a VM: the image fetched by
+    nos itself -- over HTTPS, through its redirects -- made the VM's disk and
+    grown to --create-gib, cloud-init's NoCloud seed made by nos with the
+    key nos's sshd lets in and a password, and a vm.toml that boots it by
+    hvboot. Then booted: cloud-init must find the seed and finish, the
+    image's own user log in on the console with that password, its root
+    have grown into the disk, its key be the one nos gave, and the power
+    button turn it off."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvcreate-")
+    name = CREATE_NAME
+    user = args.create_user or ("ubuntu" if "ubuntu" in args.create else "debian")
+    prompt = "%s@%s:~$" % (user, name)
+    os.makedirs(os.path.join(tmp, "rootdir", "etc", "ssh"))
+    with open(os.path.join(tmp, "rootdir", "etc", "ssh", "authorized_keys"), "w") as f:
+        f.write(CREATE_KEY + "\n")
+    # hvboot where the system image keeps it: what hv create boots by.
+    os.makedirs(os.path.join(tmp, "rootdir", "lib"))
+    shutil.copy(HVBOOT, os.path.join(tmp, "rootdir", "lib", "hvboot"))
+
+    x = lambda line, secs=60: "hv exec %s secs=%d %s" % (name, secs, line)
+    make = ("hv create %s %s size=%dG mem=%d password=%s%s"
+            % (name, args.create, args.create_gib, args.create_mem, CREATE_PASSWORD, machine_opt(args)))
+    # `hv wait` waits at most WAIT_MAX at a time: as many as the boot may
+    # take, each returning at once once the text has been seen.
+    done = ["hv wait %s secs=%d %s" % (name, WAIT_MAX, CLOUD_INIT_DONE)] * -(-args.create_boot_secs // WAIT_MAX)
+    login = [r"hv send %s %s\n" % (name, user), "hv wait %s secs=120 Password:" % name,
+             r"hv send %s %s\n" % (name, CREATE_PASSWORD), "hv wait %s secs=120 %s" % (name, prompt)]
+    checks = [x("cloud-init status --long", 600),
+              x("hostname"),
+              x("cat .ssh/authorized_keys"),
+              x("lsblk -bdno SIZE /dev/vda"),
+              x("df -B1 --output=size /"),
+              x("ls /dev/disk/by-label"),
+              x("sudo -n true && echo sudo-ok")]
+    stop = "hv stop %s secs=300" % name
+    rc = (["insmod /hv.ko", "hv on", make, "ls /vms/" + name, "cat /vms/%s/vm.toml" % name, "hv start " + name]
+          + done
+          # cloud-init's lines overwrote the login prompt: a newline for a
+          # fresh one, then the user.
+          + [r"hv send %s \n" % name] + login + checks + [stop, "hv vms", hvl.RC_LAST])
+    boot = argparse.Namespace(bzimage=HVBOOT, initrd=None, root_mib=args.create_root_mib, deadline=args.deadline)
+    qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-netdev", "user,id=net0"]
+    print("  (hv create %s %s, on nos's ext2 root of %d MiB)" % (name, args.create, args.create_root_mib))
+    p, log, image = hvl.boot_rc(boot, tmp, rc, qemu=qemu)
+    try:
+        txt = open(log, errors="replace").read()
+        if p is None or p.poll() is not None or not hvl.RC_DONE.search(txt):
+            return
+        secs = hvl.sections(txt)
+
+        def out(line, occurrence=0):
+            return hvl.output_of(secs, line, occurrence) or ""
+
+        made = out(make)
+        for line in made.splitlines():
+            if line.startswith(("download:", "hv: /vms")) and ("bytes in" in line or "written" in line):
+                print("  (%s)" % line.strip())
+        pt.check("nos fetches the image, makes it the VM's disk, grown, and writes its seed and vm.toml",
+                 "/vms/%s/vm.toml written -- hv start %s boots it: hvboot, a %d MiB disk, cloud-init given 1 key "
+                 "and a password" % (name, name, args.create_gib * 1024) in made, made[-3000:])
+        listing = out("ls /vms/" + name)
+        pt.check("its folder holds the disk, the seed and the vm.toml",
+                 all(f in listing for f in ("disk.raw", "seed.iso", "vm.toml")), listing)
+        waited = "\n".join(out(done[0], i) for i in range(len(done)))
+        m = re.search(r'printed "%s", (\d+) ms in' % CLOUD_INIT_DONE, waited)
+        pt.check("hvboot boots the image's own kernel, and cloud-init runs to its end", m is not None, waited[-3000:])
+        if m:
+            print("  (cloud-init done %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
+        pt.check("the image's own user logs in on its console, with the password nos's seed gave it",
+                 "printed \"%s\"" % prompt in out(login[3]), out(login[1]) + out(login[3]))
+        status = out(checks[0])
+        pt.check("cloud-init says it is done, its datasource NoCloud -- the seed",
+                 re.search(r"status: done", status) is not None and "NoCloud" in status, status[-1500:])
+        pt.check("the machine has the name the seed gave it", re.search(r"(?m)^%s\s*$" % name, out(checks[1]))
+                 is not None, out(checks[1]))
+        key = CREATE_KEY.split()[1]
+        pt.check("its user has the key nos's sshd lets in", key in out(checks[2]), out(checks[2]))
+        size = args.create_gib << 30
+        m = re.search(r"(?m)^(\d+)\s*$", out(checks[3]))
+        pt.check("its disk is the size create grew it to", m is not None and int(m.group(1)) == size, out(checks[3]))
+        m = re.search(r"(?m)^\s*(\d+)\s*$", out(checks[4]))
+        pt.check("and its root grew into it (cloud-init's growpart)",
+                 m is not None and int(m.group(1)) > size * 3 // 4, out(checks[4]))
+        pt.check("the seed is a disk labelled cidata", "cidata" in out(checks[5]), out(checks[5]))
+        pt.check("its user may sudo, as the image's own default user", "sudo-ok" in out(checks[6]), out(checks[6]))
+        pt.check("hv stop presses its power button, and it shuts itself down",
+                 "the guest powered itself off" in out(stop), out(stop)[-1200:])
+    finally:
+        if p is not None:
+            pt.kill(p)
+        if args.keep or pt.failures:
+            print("log at " + log)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 # hvboot, as `make` builds it beside the modules; and the line it prints last,
 # before it jumps into the kernel.
 HVBOOT = os.path.join(hvl.ROOT, "out", "x86_64", "hvboot")
@@ -750,10 +873,21 @@ def main():
                     help="boot the cloud images with hvboot as the VM's kernel (out/x86_64/hvboot, make builds it): "
                          "their own kernel and initrd, off their own /boot, by their own grub.cfg -- nothing taken "
                          "out of them")
+    ap.add_argument("--create", metavar="URL",
+                    help="hv create a VM of the cloud image at URL -- qcow2 or raw, fetched by nos itself -- and "
+                         "boot it: cloud-init provisioned from nos's seed")
+    ap.add_argument("--create-user", help="the image's own user (ubuntu or debian, by the URL, unless told)")
+    ap.add_argument("--create-gib", type=int, default=4, help="the size hv create grows the VM's disk to, GiB")
+    ap.add_argument("--create-mem", type=int, default=1024, help="the created VM's RAM in MiB")
+    ap.add_argument("--create-root-mib", type=int, default=8192,
+                    help="nos's root filesystem for --create, MiB: the download, the disk and what the guest writes")
+    ap.add_argument("--create-boot-secs", type=int, default=2400,
+                    help="how long the created VM has to boot and finish cloud-init, seconds")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
-    if not args.iso and not args.debian and not args.ubuntu:
-        sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, --ubuntu <cloudimg.raw>")
+    if not args.iso and not args.debian and not args.ubuntu and not args.create:
+        sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, --ubuntu <cloudimg.raw>, "
+                 "--create <url>")
     if args.ioapic and args.cpus < 2:
         sys.exit("hv-distro-test: --ioapic needs --cpus 2 or more")
     tools = []
@@ -766,7 +900,7 @@ def main():
     for tool in tools:
         if shutil.which(tool) is None:
             sys.exit("hv-distro-test needs %s" % tool)
-    if args.hvboot and not os.path.exists(HVBOOT):
+    if (args.hvboot or args.create) and not os.path.exists(HVBOOT):
         sys.exit("no %s: build it first (make)" % HVBOOT)
     for path in (args.iso, args.debian, args.ubuntu):
         if path and not os.path.exists(path):
@@ -777,6 +911,8 @@ def main():
         debian(args)
     if args.ubuntu:
         ubuntu(args)
+    if args.create:
+        create(args)
     print()
     if pt.failures:
         print("FAILED: " + ", ".join(pt.failures))

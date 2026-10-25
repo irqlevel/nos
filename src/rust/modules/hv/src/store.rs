@@ -35,9 +35,11 @@ const PATH_MAX: usize = 255;
 /// folder and the longest name hv writes there.
 const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + vmlog::LONGEST_NAME);
 
-const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] \
-                            [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] \
-                            [net] [port=N] [forward=nos:guest]... [cmdline=...]";
+pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] \
+                            [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] \
+                            [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]\n\
+                            hv create <name> <http(s)://image> [size=N[K|M|G|T]] [password=...] [hvboot=path] \
+                            [the words hv start takes, but a kernel and initrd=]";
 
 /// A VM's folder: the name it is known by, and its path.
 pub struct Folder {
@@ -79,7 +81,7 @@ pub fn root(path: &str) -> Result<String, String> {
 }
 
 /// Makes the folder, and the folders above it that are missing.
-fn make_dirs(path: &str) -> kcore::error::Result<()> {
+pub(crate) fn make_dirs(path: &str) -> kcore::error::Result<()> {
     for (i, _) in path.match_indices('/').skip(1) {
         kcore::fs::create_dir(&path[..i])?;
     }
@@ -87,7 +89,7 @@ fn make_dirs(path: &str) -> kcore::error::Result<()> {
 }
 
 /// `<dir>/<file>`, or None out of memory.
-fn join(dir: &str, file: &str) -> Option<String> {
+pub(crate) fn join(dir: &str, file: &str) -> Option<String> {
     let mut s = String::new();
     s.try_reserve(dir.len() + file.len() + 1).ok()?;
     s.push_str(dir.trim_end_matches('/'));
@@ -177,6 +179,12 @@ pub fn create(root: &str, args: &str, out: &mut Output) {
     if !valid_name(name) {
         let _ = writeln!(out, "hv: \"{}\" is not a name a vm can have -- a letter or a digit, then letters, digits, \
                                . _ and -, at most {}", name, NAME_MAX);
+        return;
+    }
+    /* A cloud's image, by its URL: downloaded, made a disk, given a seed. */
+    let first = rest.split_ascii_whitespace().next().unwrap_or("");
+    if crate::cloud::is_url(first) {
+        crate::cloud::create(root, name, first, rest[first.len()..].trim_start(), out);
         return;
     }
     let given = match guest::words(rest, CREATE_USAGE) {

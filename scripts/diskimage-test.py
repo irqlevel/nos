@@ -757,6 +757,94 @@ def gate_inflate(args, tmp):
           % (kinds["ok"], kinds["fault"]), not wrong and len(ours) == len(cases), detail)
 
 
+# ---- the seed: an ISO 9660 image of a few files ----
+
+def read_back(iso, into):
+    """The files of an ISO by the names a Rock Ridge reader gives them --
+    xorriso's or libarchive's, whichever the host has: name -> bytes."""
+    os.makedirs(into, exist_ok=True)
+    if shutil.which("xorriso"):
+        r = sh(["xorriso", "-osirrox", "on", "-indev", iso, "-extract", "/", into])
+    elif shutil.which("bsdtar"):
+        r = sh(["bsdtar", "-xf", iso, "-C", into])
+    else:
+        return None, "no xorriso or bsdtar to read it with"
+    # The image's root is read-only, and an extraction takes its mode along.
+    os.chmod(into, 0o755)
+    if r.returncode != 0:
+        return None, r.stdout + r.stderr
+    got = {}
+    for name in os.listdir(into):
+        with open(os.path.join(into, name), "rb") as f:
+            got[name] = f.read()
+    return got, ""
+
+
+def gate_iso(tmp):
+    rng = random.Random(5)
+    cases = {
+        "a cloud-init seed": {"meta-data": b"instance-id: nos-noble-1\nlocal-hostname: noble\n",
+                              "user-data": b"#cloud-config\nhostname: noble\nssh_authorized_keys:\n"
+                                           b"  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI test\n"},
+        "an empty file, and names alike in 8.3": {"user-data": b"", "user_data": b"x", "user.data": b"y" * 3000,
+                                                    "user-dat": rng.randbytes(5000)},
+        "eight files, one of 1 MiB less the rest": dict(
+            [("f%d-%s" % (i, "n" * 50), rng.randbytes(rng.randint(1, 9000))) for i in range(7)]),
+    }
+    big = cases["eight files, one of 1 MiB less the rest"]
+    big["the-last.one"] = rng.randbytes((1 << 20) - sum(len(v) for v in big.values()))
+    have_blkid = shutil.which("blkid") is not None
+    mount = sys.platform.startswith("linux") and (os.geteuid() == 0 or sh(["sudo", "-n", "true"]).returncode == 0)
+    for what, files in cases.items():
+        d = os.path.join(tmp, "iso-" + str(len(files)))
+        os.makedirs(d, exist_ok=True)
+        specs = []
+        for i, (name, data) in enumerate(files.items()):
+            p = os.path.join(d, "in%d" % i)
+            with open(p, "wb") as f:
+                f.write(data)
+            specs.append("%s=%s" % (name, p))
+        iso = os.path.join(d, "seed.iso")
+        r = sh([BIN, "iso", iso, "cidata"] + specs)
+        if not check("an ISO made: %s" % what, r.returncode == 0, r.stdout + r.stderr):
+            continue
+        got, why = read_back(iso, os.path.join(d, "out"))
+        check("  read back by Rock Ridge's names, every byte its own", got == files,
+              why or "got %s" % sorted(got or {}))
+        with open(iso, "rb") as f:
+            pvd = f.read(17 * 2048)[16 * 2048:]
+        check("  labelled cidata, a volume of ISO 9660",
+              pvd[1:6] == b"CD001" and pvd[40:72].rstrip(b" ") == b"cidata", repr(pvd[:72]))
+        if have_blkid:
+            b = sh(["blkid", "-o", "export", iso]).stdout
+            check("  as blkid sees it -- what cloud-init looks for", "LABEL=cidata" in b and "TYPE=iso9660" in b, b)
+        if mount:
+            m = os.path.join(d, "mnt")
+            os.makedirs(m, exist_ok=True)
+            pre = [] if os.geteuid() == 0 else ["sudo", "-n"]
+            r = sh(pre + ["mount", "-o", "loop,ro", "-t", "iso9660", iso, m])
+            if check("  mounted by Linux's isofs", r.returncode == 0, r.stdout + r.stderr):
+                seen = {}
+                for name in os.listdir(m):
+                    with open(os.path.join(m, name), "rb") as f:
+                        seen[name] = f.read()
+                sh(pre + ["umount", m])
+                check("  which reads every file by its name", seen == files, "got %s" % sorted(seen))
+    for what, label, specs, word in (
+            ("a label of a space", "ci data", ["a=" + BIN], "label"),
+            ("a name with a slash", "cidata", ["a/b=" + BIN], "no name"),
+            ("two files of one name", "cidata", ["a=" + BIN, "a=" + BIN], "no name"),
+            ("nine files", "cidata", ["f%d=%s" % (i, BIN) for i in range(9)], "more than 8"),
+    ):
+        r = sh([BIN, "iso", os.path.join(tmp, "refused.iso"), label] + specs)
+        check("an ISO refused: %s" % what, r.returncode == 2 and word in r.stdout, r.stdout + r.stderr)
+    big_file = os.path.join(tmp, "big.bin")
+    with open(big_file, "wb") as f:
+        f.write(bytes((1 << 20) + 1))
+    r = sh([BIN, "iso", os.path.join(tmp, "refused.iso"), "cidata", "big=" + big_file])
+    check("an ISO refused: more than 1 MiB of files", r.returncode == 2 and "bytes of files" in r.stdout, r.stdout)
+
+
 # ---- fuzzing ----
 
 def gate_fuzz(args, images):
@@ -866,6 +954,7 @@ def main():
             plain = next(p for p in made if p.endswith("v3-64k.qcow2"))
             compressed = next(p for p in made if p.endswith("v3-64k-c.qcow2"))
             gate_refusals(tmp, plain, compressed)
+            gate_iso(tmp)
             gate_inflate(args, tmp)
             fuzzed = [p for p in made if os.path.basename(p) in
                       ("v3-64k-c.qcow2", "v2-4k.qcow2", "v3-512-c.qcow2", "v3-64k-extended.qcow2", "v2-64k-c.qcow2")]
