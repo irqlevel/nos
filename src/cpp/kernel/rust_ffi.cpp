@@ -672,24 +672,38 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 
 /* ---- Frames: pages of RAM mapped nowhere (kcore::frame) ---- */
 
-/* The RAM frames may not take: what the kernel goes on needing once guests
-   have the rest -- its heap, the pages their nested tables are made of, a
-   module loaded later. A sixteenth of the machine, and no less than 64 MiB.
-   Without it a guest given more memory than the machine had free took the
-   last page, and the next allocation anywhere that may not fail -- a plain
-   `new`, a Rust Box -- panicked the host under every other guest. */
-static const unsigned long FrameReserveMinBytes = 64ul << 20;
-static const unsigned long FrameReserveFraction = 16;
-
 unsigned long kernel_frame_alloc()
 {
     auto& pt = Kernel::Mm::PageTable::GetInstance();
-    const unsigned long keep = Stdlib::Max(FrameReserveMinBytes / Const::PageSize,
-        pt.GetTotalPagesCount() / FrameReserveFraction);
     /* AllocPageKeeping zeroes what it hands out, through the temp map, as
-       AllocPage does. */
-    Kernel::Mm::Page* page = pt.AllocPageKeeping(keep);
+       AllocPage does; it leaves the kernel its reserve (GetKernelReservePages). */
+    Kernel::Mm::Page* page = pt.AllocPageKeeping(pt.GetKernelReservePages());
     return page ? page->GetPhyAddress() : 0;
+}
+
+/* A block of the huge pool, zeroed: its address, or 0 when the pool has
+   none free -- or is not there, hugepages= not given. */
+unsigned long kernel_frame_alloc_huge()
+{
+    return Kernel::Mm::PageTable::GetInstance().AllocHugeFrame();
+}
+
+/* Back into the pool: a panic for an address that is no block of it, or
+   one back already. */
+void kernel_frame_free_huge(unsigned long phys)
+{
+    Kernel::Mm::PageTable::GetInstance().FreeHugeFrame(phys);
+}
+
+/* The pool's blocks, and how many of them are free. */
+unsigned long kernel_frame_huge_blocks()
+{
+    return Kernel::Mm::PageTable::GetInstance().GetHugePoolBlocks();
+}
+
+unsigned long kernel_frame_huge_free()
+{
+    return Kernel::Mm::PageTable::GetInstance().GetHugePoolFree();
 }
 
 void kernel_frame_free(unsigned long phys)

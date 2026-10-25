@@ -21,7 +21,9 @@ hv: AMD-V (SVM) -- ready
   pause filter         no
   SVM lock             no
   x2APIC               yes  -- the host's; a guest's is MSR exits either way
+  2 MiB nested pages   yes  -- a guest's memory from the huge pool a block an entry
   1 GiB pages          yes  -- guest memory in one nested entry a gigabyte
+  huge pool            none -- hugepages= not given: a guest's memory is 4 KiB frames
 hv: AMD-V (SVM) on for cpu none of 0-3
 $ hv on
 hv: turned on for cpu 0-3
@@ -629,6 +631,64 @@ Two rules make it the one place that decides what a guest can reach:
   table. "The guest can reach host memory it was not given" is then not a
   mistake a caller can make, and the one `unsafe` call that enters a guest
   has that as a type's invariant rather than a comment's promise.
+
+### How much of it, and where
+
+A Linux guest has from 64 MiB to 512 GiB (`mem=`, in MiB; `memory =` in a
+`vm.toml`), laid out as a PC's firmware lays out a machine's (`linux::Ram`):
+RAM from 0 up to 0xFE000000 at most (`linux::LOW_RAM_END`), where the
+devices' pages begin -- the MSI-X tables', then the IO-APIC's and the local
+APIC's, which RAM must not cover -- and the rest of it from 4 GiB. Its
+memory map says so, an entry for each, the hole at 640 KiB as before
+(`linux::e820_entries`, for a bzImage's zero page and a PVH start info
+alike); everything the loader writes -- the kernel, the initrd, a PVH
+image's segments -- is put below the devices' pages, where the identity map
+and the boot protocol's 32-bit fields reach, and the kernel finds the rest
+in the map. A guest of up to 4064 MiB has the machine it always had. Its RAM
+must also end below what it is told a physical address is (CPUID
+0x80000008, the host's -- `policy::phys_bits`), or it could not reach it: a
+guest that would not fit there is refused rather than given RAM it cannot
+use. 512 GiB is the most RAM this kernel can take of a machine, so no guest
+is bigger than its host could be; what is refused below that is the host's
+memory, the kernel's reserve kept (a sixteenth of RAM, no less than 64 MiB).
+
+Where its pages come from is the boot's to say. With no `hugepages=`, a
+guest's memory is frames taken a page at a time, as it always was, each a
+4 KiB entry of the nested table. With one, the kernel reserves the huge
+pool at boot -- 2 MiB blocks, physically contiguous and aligned, taken off
+the free list right after it is built, before anything has fragmented it,
+the highest first, and never so many that less than twice the kernel's
+reserve is left (`PageTable::ReserveHugePool`, [Kernel
+parameters](kernel-parameters.md#memory)) -- and every guest's memory is
+the pool's: a block every 2 MiB (`kcore::frame::HugeFrame`, a `Run` of
+them), zeroed when it is handed out, and mapped with one entry of the level
+above the last -- PS in AMD's nested table, bit 7 in Intel's EPT, where the
+CPU says its walk takes them (`IA32_VMX_EPT_VPID_CAP` bit 16;
+`Caps::nested_2m`, which `hv info` reports) and 512 entries where it does
+not. The guest pages its own memory as it likes, 4 KiB pages and all; what
+changes is the host's half of every walk, a level shorter, and what the TLB
+keeps of a translation, 2 MiB where the guest's own page is that large --
+Linux's map of all of its memory, for one. A guest the pool has not room for
+does not start, and says so: `mem=` a multiple of 2 MiB, and the blocks it
+wants free (`hv start` checks before it takes any, and `LinuxGuest::new`
+refuses with `NoHugePages` if another guest took them in between). There is
+no falling back to frames: with a pool, a guest's memory is the pool's, so
+that what a guest is given does not change with what ran before it. The
+pool is the pool for as long as the machine is up, guest or no guest, which
+is the price: what it holds is no use to the kernel.
+
+The kernel's half (`mm/page_table.cpp`): two bitmaps, a bit a 2 MiB block of
+the most RAM the bootstrap map can reach, one saying what is in the pool --
+written once, at boot, before there is another CPU -- and one what of it is
+free, under the page allocator's lock. A block of the pool is on no free
+list and in no count of free pages, its pages' descriptors as a page handed
+out has them, so nothing else can take a page of it; `FreeFrame` of a page
+inside one and `FreeHugeFrame` of anything that is no block handed out are
+panics. `cpp-fuzz.py`'s `pagetable` target reserves pools on machines of
+more than 4 MiB, hands their blocks out and back, and holds every step to a
+model; every arm64 smoke boot reserves one (`hugepages=64M`) and has the
+frames' selftest hand a block out, write it through its pages and give it
+back.
 
 ### The nested page table
 
@@ -3154,8 +3214,9 @@ one page: the vector table at its start, the pending bits after it. That
 page is guest memory -- a region of its own, at 0xFE000000 and a page a PCI
 slot, in the MMIO window and not in the e820 map -- so a guest writes its
 table with plain `mov`s and makes no exit doing it, and no instruction has
-to be decoded. A guest's RAM ends below these pages, at 4064 MiB at most
-(`run::MAX_MEM_BYTES`, what `mem=` is bounded by): more would run over them,
+to be decoded. A guest's RAM below 4 GiB ends below these pages
+(`linux::LOW_RAM_END`), the rest of it from 4 GiB ([How much of it, and
+where](#how-much-of-it-and-where)): more below them would run over them,
 and over the IO-APIC's and the local APIC's, and the guest would read and
 write its devices' registers as memory, none of them hearing of it -- an
 APIC in xAPIC mode that is not there, and nothing to say so. The device

@@ -69,6 +69,9 @@ PageTable::PageTable()
     , HighestPhyAddr(0)
     , FreePagesCount(0)
     , TotalPagesCount(0)
+    , HugePoolCount(0)
+    , HugePoolFreeCount(0)
+    , HugePoolHint(0)
 {
     Trace(0, "PageTable 0x%p", this);
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
@@ -76,6 +79,11 @@ PageTable::PageTable()
         TmpMapPageArray[i] = nullptr;
     }
     TmpMapL1Page = nullptr;
+    for (ulong i = 0; i < HugePoolWords; i++)
+    {
+        HugePoolIn[i] = 0;
+        HugePoolFreeBits[i] = 0;
+    }
 }
 
 PageTable::~PageTable()
@@ -1038,6 +1046,11 @@ bool PageTable::IsFrameAddress(ulong phyAddr)
 void PageTable::FreeFrame(ulong phyAddr)
 {
     BugOn(!IsFrameAddress(phyAddr));
+    /* A page of the huge pool goes back with its block, into the pool: on
+       the free list too it would be handed out twice. */
+    ulong block = 0;
+    if (HugePoolBlockOf(phyAddr, block))
+        Panic("FreeFrame: page 0x%lX is in block %lu of the huge pool", phyAddr, block);
 
     Stdlib::AutoLock lock(Lock);
 
@@ -1047,6 +1060,157 @@ void PageTable::FreeFrame(ulong phyAddr)
        make the list a loop. */
     BugOn(page->ListEntry.Flink != &page->ListEntry);
     FreePageNoLock(page);
+}
+
+ulong PageTable::GetKernelReservePages()
+{
+    /* TotalPagesCount is set once, by Setup. */
+    return Stdlib::Max(KernelReserveMinBytes / Const::PageSize,
+        TotalPagesCount / KernelReserveFraction);
+}
+
+bool PageTable::HugePoolTest(const ulong* bits, ulong block)
+{
+    return ((bits[block / HugePoolWordBits] >> (block % HugePoolWordBits)) & 1) != 0;
+}
+
+void PageTable::HugePoolSet(ulong* bits, ulong block, bool value)
+{
+    const ulong mask = 1UL << (block % HugePoolWordBits);
+    ulong& word = bits[block / HugePoolWordBits];
+    word = value ? (word | mask) : (word & ~mask);
+}
+
+bool PageTable::HugePoolBlockOf(ulong phyAddr, ulong& block)
+{
+    if (phyAddr >= HugePoolMaxBytes)
+        return false;
+    block = phyAddr / HugeFrameSize;
+    /* Written only before there is another CPU: read without the lock. */
+    return HugePoolTest(HugePoolIn, block);
+}
+
+/* Whether every page of the block is on the free list: a descriptor at its
+   own address for each, and none self-pointing. Under Lock. */
+bool PageTable::HugeBlockFree(ulong block)
+{
+    const ulong first = block * HugeFramePages;
+    if (first >= PageArrayCount || PageArrayCount - first < HugeFramePages)
+        return false;
+    for (ulong i = first; i < first + HugeFramePages; i++)
+    {
+        Page* page = &PageArray[i];
+        if (page->GetPhyAddress() != i * Const::PageSize || page->ListEntry.Flink == &page->ListEntry)
+            return false;
+    }
+    return true;
+}
+
+ulong PageTable::ReserveHugePool(ulong bytes)
+{
+    return ReserveHugePoolKeeping(bytes, 2 * GetKernelReservePages());
+}
+
+ulong PageTable::ReserveHugePoolKeeping(ulong bytes, ulong keepPages)
+{
+    const ulong want = bytes / HugeFrameSize;
+    if (want == 0)
+        return 0;
+
+    Stdlib::AutoLock lock(Lock);
+
+    /* Once: a second call would find the bitmaps another CPU may be
+       reading without the lock. */
+    BugOn(HugePoolCount != 0);
+    const ulong blocks = Stdlib::Min(PageArrayCount / HugeFramePages, HugePoolMaxBlocks);
+    for (ulong block = blocks; block-- > 0 && HugePoolCount < want;)
+    {
+        if (FreePagesCount < keepPages || FreePagesCount - keepPages < HugeFramePages)
+            break;
+        if (!HugeBlockFree(block))
+            continue;
+        for (ulong i = 0; i < HugeFramePages; i++)
+            PageArray[block * HugeFramePages + i].ListEntry.RemoveInit();
+        FreePagesCount -= HugeFramePages;
+        HugePoolSet(HugePoolIn, block, true);
+        HugePoolSet(HugePoolFreeBits, block, true);
+        HugePoolCount++;
+    }
+    HugePoolFreeCount = HugePoolCount;
+    /* Said either way: a pool cut short is guests that will not start. */
+    Trace(0, "mm: hugepages: %lu 2MiB blocks reserved (%lu MiB) of %lu asked, %lu MiB left free",
+        HugePoolCount, HugePoolCount * HugeFrameSize / Const::MB, want,
+        FreePagesCount * Const::PageSize / Const::MB);
+    return HugePoolCount;
+}
+
+ulong PageTable::AllocHugeFrame()
+{
+    ulong block = 0;
+    {
+        Stdlib::AutoLock lock(Lock);
+        if (HugePoolFreeCount == 0)
+            return 0;
+        bool found = false;
+        for (ulong n = 0; n < HugePoolWords && !found; n++)
+        {
+            const ulong w = (HugePoolHint + n) % HugePoolWords;
+            const ulong bits = HugePoolFreeBits[w];
+            if (bits == 0)
+                continue;
+            /* bits is not 0: its lowest set bit is a free block. */
+            block = w * HugePoolWordBits + static_cast<ulong>(__builtin_ctzl(bits));
+            found = true;
+        }
+        /* The count said one was free and no bit says which: the two have
+           come apart, and a block handed out of that is anyone's. */
+        if (!found)
+            Panic("AllocHugeFrame: %lu blocks free by the count, none by the bitmap", HugePoolFreeCount);
+        BugOn(!HugePoolTest(HugePoolIn, block));
+        HugePoolSet(HugePoolFreeBits, block, false);
+        HugePoolFreeCount--;
+        HugePoolHint = block / HugePoolWordBits;
+    }
+
+    /* Zeroed off the lock, a page at a time through this CPU's frame slot,
+       as kernel_frame_read copies: interrupts off for one page's stores and
+       no longer, and no TmpMapLock for each of the 512. */
+    const ulong phys = block * HugeFrameSize;
+    for (ulong i = 0; i < HugeFramePages; i++)
+    {
+        ulong flags = PreemptIrqSave();
+        ulong va = MapFrameSlot(phys + i * Const::PageSize);
+        Stdlib::MemSet(reinterpret_cast<void*>(va), 0, Const::PageSize);
+        UnmapFrameSlot(va);
+        PreemptIrqRestore(flags);
+    }
+    return phys;
+}
+
+void PageTable::FreeHugeFrame(ulong phyAddr)
+{
+    ulong block = 0;
+    if (phyAddr % HugeFrameSize != 0 || !HugePoolBlockOf(phyAddr, block))
+        Panic("FreeHugeFrame: 0x%lX is no block of the huge pool", phyAddr);
+
+    Stdlib::AutoLock lock(Lock);
+    if (HugePoolTest(HugePoolFreeBits, block))
+        Panic("FreeHugeFrame: block 0x%lX freed twice", phyAddr);
+    BugOn(HugePoolFreeCount >= HugePoolCount);
+    HugePoolSet(HugePoolFreeBits, block, true);
+    HugePoolFreeCount++;
+}
+
+ulong PageTable::GetHugePoolBlocks()
+{
+    /* Set once, by ReserveHugePool, before there is another CPU. */
+    return HugePoolCount;
+}
+
+ulong PageTable::GetHugePoolFree()
+{
+    Stdlib::AutoLock lock(Lock);
+    return HugePoolFreeCount;
 }
 
 /* Sentinel for TmpMapPageArray when page was mapped without a Page struct (e.g. reserved ACPI region). */
