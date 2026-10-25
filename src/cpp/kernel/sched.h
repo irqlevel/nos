@@ -67,23 +67,26 @@ private:
     SchedStats& operator=(const SchedStats& other) = delete;
     SchedStats& operator=(SchedStats&& other) = delete;
 
-    /* One writer, so a load and a store and no locked instruction: what a
-       reader on another CPU sees is the value before or the value after */
-    static void Bump(Atomic& counter, ulong by);
-    static void Raise(Atomic& max, ulong value);
+    /* One writer, so a relaxed load and a relaxed store and no locked
+       instruction -- Atomic's Set is a lock xchg on x86, five of them a
+       decision: a reader on another CPU sees the value before or the value
+       after, never a torn one */
+    static void Bump(ulong& counter, ulong by);
+    static void Raise(ulong& max, ulong value);
+    static ulong Load(const ulong& counter);
 
-    Atomic WakeHist[Buckets];
-    Atomic WakeMax;
-    Atomic DelayHist[Buckets];
-    Atomic Decisions;
-    Atomic DecisionCycles;
-    Atomic DecisionMax;
-    Atomic Walked;
-    Atomic WalkMax;
-    Atomic Looks;
-    Atomic RunnableSum;
-    Atomic RunnableMax;
-    Atomic Crowded;
+    ulong WakeHist[Buckets] = {};
+    ulong WakeMax = 0;
+    ulong DelayHist[Buckets] = {};
+    ulong Decisions = 0;
+    ulong DecisionCycles = 0;
+    ulong DecisionMax = 0;
+    ulong Walked = 0;
+    ulong WalkMax = 0;
+    ulong Looks = 0;
+    ulong RunnableSum = 0;
+    ulong RunnableMax = 0;
+    ulong Crowded = 0;
 };
 
 class TaskQueue
