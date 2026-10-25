@@ -2,7 +2,7 @@
 title: "Boot a Linux guest under the nos hypervisor"
 description: "Build a small Linux kernel and a BusyBox initramfs, load hv.ko into nos, and run Linux guests: type commands into them, network them, stop them."
 order: 6
-updated: 2026-10-22
+updated: 2026-10-25
 ---
 
 nos's hypervisor is a loadable module, `hv.ko`. By the end of this guide, it will run real Linux guests inside nos, with nos itself running in QEMU:
@@ -362,7 +362,7 @@ hv exec 0 cat /etc/alpine-release; uname -r
 
 Alpine's initramfs loads `virtio_blk`, finds the ISO on `vda` and installs the base system from the ISO's packages into a tmpfs. Then OpenRC, Alpine's init system, brings it up to a login prompt on `ttyS0`. A getty (the program behind a login prompt) does not ask for the cursor position, so log in with `hv send`, which types right away. After the first `send`, `exec` also types its lines right away.
 
-On the switch, Alpine's initramfs configures `eth0` from `ip=` and writes nos's DNS server to `resolv.conf`, so `apk` reaches its mirrors through NAT. `reboot` in the guest resets it, and the `restart` option boots it again. To wait for the next boot's login prompt, use `hv wait 0 boot=1 login:`. Debian's cloud image boots too; see [A distribution](/docs/hypervisor#a-distribution).
+On the switch, Alpine's initramfs configures `eth0` from `ip=` and writes nos's DNS server to `resolv.conf`, so `apk` reaches its mirrors through NAT. `reboot` in the guest resets it, and the `restart` option boots it again. To wait for the next boot's login prompt, use `hv wait 0 boot=1 login:`. Debian's cloud image boots too; see [A distribution](/docs/hypervisor#a-distribution). To make a VM of a distribution's cloud image from its URL alone, with nothing taken out of the image by hand, see [Make a VM from a cloud image](/howto/cloud-vm).
 
 ## On a server
 
@@ -394,4 +394,5 @@ On a server installed from the system image ([Install nos on a server](/howto/in
 
 - Let the project's gates do all of this. `nos/scripts/hv-linux-test.py --bzimage linux/arch/x86/boot/bzImage --initrd guest/initrd` boots a guest and runs the long-lived VMs, and `--disk`, `--net`, `--cpus N` and `--attach` cover the rest. `nos/scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso` covers Alpine. Both use the `nos.iso` and the modules built in the tree ([Run the gates](/howto/run-the-gates)).
 - [The hypervisor](/hypervisor), and in the reference: [A Linux guest](/docs/hypervisor#a-linux-guest), [Guests that stay up](/docs/hypervisor#guests-that-stay-up), [More than one CPU](/docs/hypervisor#more-than-one-cpu).
+- [Make a VM from a cloud image](/howto/cloud-vm): Debian's cloud image from its URL, booting its own kernel and kept in a folder across reboots.
 - [Install nos on a server](/howto/install-on-a-server) to run guests on real hardware.
