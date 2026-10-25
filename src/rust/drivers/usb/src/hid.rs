@@ -19,10 +19,12 @@ const KBD_LL: u32 = 3;
 pub const REPORT_SIZE: usize = 8;
 
 /// The HID Keyboard/Keypad usage page (0x07) against a character and the
-/// PS/2 set-1 make code the rest of the kernel already speaks. Consumers such
-/// as the shell key off the scan code (0x0E is backspace), so keeping the
+/// PS/2 set-1 make code the rest of the kernel already speaks: the character
+/// is what a terminal sends for the key (BS for Backspace), and keeping the
 /// legacy codes makes a USB keyboard indistinguishable from the 8042 one. A
-/// zero character means "no printable character" and is never delivered.
+/// zero character means "no printable character" and is never delivered --
+/// but for the arrows, which are what a terminal sends for them
+/// (`arrow_sequence`).
 struct Key {
     normal: u8,
     shifted: u8,
@@ -114,10 +116,10 @@ static KEYMAP: &[Key] = &[
     /* 0x4C */ k(0, 0, 0x00),           /* Delete       */
     /* 0x4D */ k(0, 0, 0x00),           /* End          */
     /* 0x4E */ k(0, 0, 0x00),           /* PageDown     */
-    /* 0x4F */ k(0, 0, 0x00),           /* Right arrow  */
-    /* 0x50 */ k(0, 0, 0x00),           /* Left arrow   */
-    /* 0x51 */ k(0, 0, 0x00),           /* Down arrow   */
-    /* 0x52 */ k(0, 0, 0x00),           /* Up arrow     */
+    /* 0x4F */ k(0, 0, 0x4D),           /* Right arrow  */
+    /* 0x50 */ k(0, 0, 0x4B),           /* Left arrow   */
+    /* 0x51 */ k(0, 0, 0x50),           /* Down arrow   */
+    /* 0x52 */ k(0, 0, 0x48),           /* Up arrow     */
     /* 0x53 */ k(0, 0, 0x45),           /* NumLock      */
     /* 0x54 */ k(b'/', b'/', 0x35),     /* Keypad /     */
     /* 0x55 */ k(b'*', b'*', 0x37),
@@ -138,11 +140,32 @@ static KEYMAP: &[Key] = &[
     /* 0x64 */ k(b'\\', b'|', 0x56),    /* non-US \ / | */
 ];
 
+const MOD_LEFT_CTRL: u8 = 1 << 0;
 const MOD_LEFT_SHIFT: u8 = 1 << 1;
+const MOD_RIGHT_CTRL: u8 = 1 << 4;
 const MOD_RIGHT_SHIFT: u8 = 1 << 5;
+
+/// Ctrl keeps a letter's low five bits: 'r' (0x72) is ^R (0x12).
+const CTRL_MASK: u8 = 0x1F;
 
 const USAGE_ERROR_ROLLOVER: u8 = 0x01;
 const USAGE_CAPS_LOCK: u8 = 0x39;
+const USAGE_RIGHT: u8 = 0x4F;
+const USAGE_LEFT: u8 = 0x50;
+const USAGE_DOWN: u8 = 0x51;
+const USAGE_UP: u8 = 0x52;
+
+/// What a terminal sends for an arrow, which the shell's line editor reads
+/// as it reads the serial port.
+fn arrow_sequence(usage: u8) -> Option<&'static [u8]> {
+    match usage {
+        USAGE_UP => Some(b"\x1b[A"),
+        USAGE_DOWN => Some(b"\x1b[B"),
+        USAGE_RIGHT => Some(b"\x1b[C"),
+        USAGE_LEFT => Some(b"\x1b[D"),
+        _ => None,
+    }
+}
 
 /// Auto-repeat: the hold before the first repeat, then the period.
 const REPEAT_DELAY_NS: u64 = 400 * 1000 * 1000;
@@ -189,6 +212,14 @@ impl BootKeyboard {
             return false;
         }
 
+        if let Some(seq) = arrow_sequence(usage) {
+            trace!(KBD_LL, "UsbKbd: usage 0x{:X} arrow", usage);
+            for &b in seq {
+                kcore::input::key(b, entry.ps2);
+            }
+            return true;
+        }
+
         let shift = modifiers & (MOD_LEFT_SHIFT | MOD_RIGHT_SHIFT) != 0;
         let mut c = if shift { entry.shifted } else { entry.normal };
 
@@ -199,6 +230,15 @@ impl BootKeyboard {
 
         if c == 0 {
             return false;
+        }
+
+        /* Ctrl and a letter is the letter's control byte, as a terminal
+         * sends it; Ctrl and anything else is nothing */
+        if modifiers & (MOD_LEFT_CTRL | MOD_RIGHT_CTRL) != 0 {
+            if !c.is_ascii_alphabetic() {
+                return false;
+            }
+            c &= CTRL_MASK;
         }
 
         trace!(KBD_LL, "UsbKbd: usage 0x{:X} char {}", usage, c as char);

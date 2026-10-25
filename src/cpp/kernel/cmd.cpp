@@ -2032,7 +2032,6 @@ Cmd::Cmd()
     , ScriptRunning(false)
     , DynamicGeneration(0)
 {
-    CmdLine[0] = '\0';
     Stdlib::MemSet(Dynamic, 0, sizeof(Dynamic));
 }
 
@@ -2239,13 +2238,6 @@ void Cmd::DynamicHelp(Stdlib::Printer& out)
     }
 }
 
-void Cmd::ProcessCmd(const char *cmd)
-{
-    auto& con = Console::GetInstance();
-    Dispatch(cmd, con);
-    con.Printf("$");
-}
-
 bool Cmd::RunScript(const char* path, Stdlib::Printer& out, ScriptStep step, void* stepCtx)
 {
     bool running;
@@ -2432,9 +2424,6 @@ void Cmd::ShowBanner(Stdlib::Printer& out)
 
 void Cmd::Run()
 {
-    size_t pos = 0;
-    bool overflow = false;
-
     auto& con = Console::GetInstance();
 
     /* Wait for startup trace output to settle before suppressing console */
@@ -2449,76 +2438,40 @@ void Cmd::Run()
 
     RunBootScript();
 
-    con.Printf("$");
+    Editor.Prompt(con);
 
     while (!Task::GetCurrentTask()->IsStopping())
     {
-        KeyEvent keyEvent = {};
-        bool hasEvent = false;
-        bool backspace = false;
+        char c = 0;
+        bool hasKey = false;
         {
             Stdlib::AutoLock lock(Lock);
             if (!Buf.IsEmpty())
             {
-                keyEvent = Buf.Get();
-                hasEvent = true;
-                backspace = (keyEvent.Code == 0xE) ? true : false;
+                c = Buf.Get();
+                hasKey = true;
             }
         }
 
-        if (hasEvent)
+        /* Everything typed is taken before the task sleeps again: an arrow
+           is three bytes, and a line may be pasted */
+        if (!hasKey)
         {
-            if (backspace)
-            {
-                if (pos > 0)
-                    con.Backspace();
-            }
-            else
-            {
-                con.Printf("%c", keyEvent.Char);
-            }
-
-            if (keyEvent.Char == '\n')
-            {
-                CmdLine[pos] = '\0';
-                if (!overflow)
-                {
-                    ProcessCmd(CmdLine);
-                }
-                else
-                {
-                    con.Printf("command too large\n");
-                    con.Printf("$");
-                    overflow = false;
-                }
-                Stdlib::MemSet(CmdLine, 0, sizeof(CmdLine));
-                pos = 0;
-            }
-            else
-            {
-                if (pos < (Stdlib::ArraySize(CmdLine) - 1))
-                {
-                    if (backspace)
-                    {
-                        if (pos > 0)
-                        {
-                            pos--;
-                            CmdLine[pos] = '\0';
-                        }
-                    }
-                    else
-                    {
-                        CmdLine[pos++] = keyEvent.Char;
-                    }
-                }
-                else
-                {
-                    overflow = true;
-                }
-            }
+            Sleep(10 * Const::NanoSecsInMs);
+            continue;
         }
 
-        Sleep(10 * Const::NanoSecsInMs);
+        if (Editor.Key(c, con))
+        {
+            /* A line of nothing but spaces is a new prompt, as over SSH */
+            const char* line = Editor.GetLine();
+            const char* word = line;
+            while (*word == ' ')
+                word++;
+            if (*word != '\0')
+                Dispatch(line, con);
+            Editor.Prompt(con);
+        }
     }
 
     Tracer::GetInstance().SetConsoleSuppressed(false);
@@ -2532,15 +2485,15 @@ void Cmd::RunFunc(void *ctx)
 
 void Cmd::OnChar(char c, u8 code)
 {
+    /* The editor reads the character: the keyboards send a terminal's
+       bytes, the serial ports are one */
+    (void)code;
+
     Stdlib::AutoLock lock(Lock);
     if (!Active)
         return;
 
-    KeyEvent e;
-    e.Char = c;
-    e.Code = code;
-
-    if (!Buf.Put(e))
+    if (!Buf.Put(c))
     {
         Trace(0, "Can't save char");
         return;

@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """UDP shell client for nos kernel."""
 
+import os
 import socket
 import struct
 import sys
+
+# The host's line editing for the prompt: Up and Down through the commands
+# sent, ^R to search them, kept in a file from one run to the next. Where
+# Python was built without it, the prompt is a plain one.
+try:
+    import readline
+except ImportError:
+    readline = None
+
+HISTORY_FILE = os.path.expanduser("~/.nos_udpsh_history")
+HISTORY_MAX = 1000
 
 MAGIC = 0x4E4F5348  # "NOSH"
 HDR_FMT = '!IIHHHH'  # Magic, SeqNo, ChunkIdx, Flags, PayloadLen, Reserved
@@ -107,6 +119,13 @@ class UdpShellClient:
         self.connect()
         print(f"nos udp shell -> {self.host}:{self.port}")
 
+        if readline is not None:
+            try:
+                readline.read_history_file(HISTORY_FILE)
+            except OSError:
+                pass
+            readline.set_history_length(HISTORY_MAX)
+
         while True:
             try:
                 cmd = input("$ ")
@@ -118,6 +137,12 @@ class UdpShellClient:
                 continue
 
             self.execute(cmd)
+
+        if readline is not None:
+            try:
+                readline.write_history_file(HISTORY_FILE)
+            except OSError:
+                pass
 
         self.close()
 
