@@ -79,7 +79,7 @@ echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 QEMU_PID=$!
 
 # Success requires all of these, which the kernel prints in this order:
-#   "After test"                    - Test::Test() self-tests passed (early boot, BSP)
+#   "After test"                    - test::test() self-tests passed (early boot, BSP)
 #   "Preempt is now on"             - SMP bringup + scheduler alive
 #   "MountRootFs: mounted ext2 on /" - the root image was found and mounted rw
 #   "a sparse file past 4 GiB"      - and took ext2 past 2 and 4 GiB, into the

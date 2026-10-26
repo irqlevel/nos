@@ -10,32 +10,32 @@ the ITS. Drivers see the same two functions on both.
 `kernel/interrupt.h` is the whole surface:
 
 ```cpp
-Interrupt::Register(handler, irq, vector);       // edge, pinned to the BSP
-Interrupt::RegisterLevel(handler, irq, vector);  // level, shared, balanced
+Interrupt::register_handler(handler, irq, vector);       // edge, pinned to the BSP
+Interrupt::register_level(handler, irq, vector);  // level, shared, balanced
 ```
 
-`Register` is for the edge-triggered system lines — the PIT or HPET tick,
+`register_handler` is for the edge-triggered system lines — the PIT or HPET tick,
 the 8042 keyboard, the serial port. They stay on the CPU that registered
 them (the BSP) because timekeeping and the tick depend on it, and they own
 their GSI and their vector exclusively: a second registration on either is
 refused loudly rather than silently reprogramming the pin.
 
-`RegisterLevel` is for PCI INTx lines. They may be shared — several devices
+`register_level` is for PCI INTx lines. They may be shared — several devices
 on one GSI chain onto one vector, up to eight — and their destination CPU is
 chosen by `IrqBalance`. Chaining a level handler onto a GSI already owned by
 an edge handler is refused, because it would reprogram the pin and feed the
 edge handler phantom interrupts.
 
-A handler is an object with a `GetHandlerFn()` (the assembly stub to put in
-the IDT) and an `OnInterrupt(ctx)` (used by the shared and arm64 dispatch
+A handler is an object with a `get_handler_fn()` (the assembly stub to put in
+the IDT) and an `on_interrupt(ctx)` (used by the shared and arm64 dispatch
 paths). Handlers must **not** signal EOI when they are dispatched through
 the shared path — the dispatcher does it.
 
 The x86 backend is `kernel/interrupt.cpp` (IDT + IOAPIC); the arm64 backend
 is `arch/arm64/interrupt_arm64.cpp` (GIC INTIDs). IRQ *routing* is
 deliberately not abstracted in the HAL yet — only the CPU-side operations
-are (`hal/irqchip.h`: `IrqEoi`, `SendIpi`, `GetCurrentCpuHwId`,
-`IrqIsInService`, `SendNmiIpi`).
+are (`hal/irqchip.h`: `irq_eoi`, `send_ipi`, `get_current_cpu_hw_id`,
+`irq_is_in_service`, `send_nmi_ipi`).
 
 ## x86-64: the IDT
 
@@ -47,10 +47,10 @@ are (`hal/irqchip.h`: `IrqEoi`, `SendIpi`, `GetCurrentCpuHwId`,
 | `0x20`, `0x21`, `0x24` | Tick (PIT or HPET), 8042 keyboard, serial |
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots) |
-| `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::AllocVector` |
-| `0xFC` | Posted-interrupt notification (`Hal::PostedVector`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
+| `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::alloc_vector` |
+| `0xFC` | Posted-interrupt notification (`hal::POSTED_VECTOR`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
 | `0xFD` | Local APIC timer — this CPU's tick, and the deadline of a task asleep on it: one-shot ([the local timer](scheduler.md#the-local-timer)) |
-| `0xFE` | IPI (`Hal::IpiVector`) |
+| `0xFE` | IPI (`hal::IPI_VECTOR`) |
 | `0xFF` | Local APIC spurious vector |
 
 Every slot starts out pointing at a per-vector `DummyInterruptStub`, 256 of
@@ -79,26 +79,26 @@ possible: it carries the interrupted RIP, the original RSP and the frame
 pointer, so a stack walk can start exactly where the interrupt landed rather
 than guessing how many of its own frames to skip.
 
-Shared vectors switch to `SharedInterruptStub`, whose dispatcher asks the
-local APIC which vector is actually in service (`IrqIsInService`) before
+Shared vectors switch to `shared_interrupt_stub`, whose dispatcher asks the
+local APIC which vector is actually in service (`irq_is_in_service`) before
 calling anything, so handlers of unrelated shared vectors do not see phantom
 interrupts.
 
 ## x86-64: IOAPIC routing
 
-`Interrupt::Register` programs the redirection entry directly. The IOAPIC
+`Interrupt::register_handler` programs the redirection entry directly. The IOAPIC
 driven is one: the MADT's whose pins start at GSI 0, the legacy IRQs' (or,
 on a machine with none such, the first listed) -- a machine may have several,
 as AMD's does, the FCH's at GSI 0 and the GNB's past it, and the driver
 takes a GSI for the index of its pin. An override naming a GSI past 255, or
 an IRQ overridden once already, is left out and said.
-`RegisterLevel` first asks ACPI for the GSI the ISA IRQ maps to and for the
+`register_level` first asks ACPI for the GSI the ISA IRQ maps to and for the
 MADT polarity flags (bits [1:0]: 00 = bus default, 01 = active high,
 11 = active low; PCI's bus default is active low), then asks `IrqBalance`
 for a destination CPU.
 
 The PIC is remapped out of the exception vectors and then masked entirely,
-early in `Main2`.
+early in `main2`.
 
 ## MSI-X
 
@@ -107,21 +107,21 @@ early in `Main2`.
 message the ITS translates). The table setup and the BAR mapping are
 identical; only the message composition and the interrupt install differ.
 
-`Setup()` finds capability ID 0x11 in PCI config space, reads the table size
+`setup()` finds capability ID 0x11 in PCI config space, reads the table size
 from the message-control word (`(ctrl & 0x7FF) + 1` entries), and reads the
 BIR and offset from the next dword. The table itself lives in one of the
 device's BARs, so it size-probes that BAR (both halves, if it is 64-bit —
 probing only the low half computes a bogus size for BARs above 4 GB), maps
-it with `MapMmioRegion`, and masks every entry.
+it with `map_mmio_region`, and masks every entry.
 
-`EnableVector(index, handler)` then, in this order:
+`enable_vector(index, handler)` then, in this order:
 
-1. Allocates a CPU vector from `0x40` upward, atomically (`Cmpxchg` on a
+1. Allocates a CPU vector from `0x40` upward, atomically (`cmpxchg` on a
    shared counter, so concurrent device init cannot double-allocate).
 2. Asks `IrqBalance` for the destination CPU. This happens **before** the
-   entry lock is taken, because `Balance()` nests the two locks the other
-   way round (IrqBalance → `Retarget` → entry lock).
-3. Writes the entry: address `0xFEE00000 | (apicId << 12)`, upper address 0,
+   entry lock is taken, because `balance()` nests the two locks the other
+   way round (IrqBalance → `retarget` → entry lock).
+3. Writes the entry: address `0xFEE00000 | (apic_id << 12)`, upper address 0,
    data = the vector, control = masked.
 4. Installs the IDT descriptor and calls back into the handler.
 5. Unmasks the entry.
@@ -129,9 +129,9 @@ it with `MapMmioRegion`, and masks every entry.
    sets MSI-X Enable and **clears Function Mask** — firmware may have left
    it set, which would keep every vector masked after the enable.
 
-`Retarget(index, apicId)` masks the entry, rewrites the address and restores
+`retarget(index, apic_id)` masks the entry, rewrites the address and restores
 the previous control word: the address must not change while the entry is
-unmasked. `EntryLock` serialises all of that against a concurrent `Mask`.
+unmasked. `entry_lock_` serialises all of that against a concurrent `mask`.
 
 Rust drivers reach the same table through the FFI
 (`kernel_msix_create` / `kernel_msix_register_handler` / …); their vectors land
@@ -141,12 +141,12 @@ out an ISR that is mid-call.
 
 ## arm64: GICv3, and the ITS
 
-INTIDs are the identity here — `Interrupt::Register`'s `irq` argument *is*
+INTIDs are the identity here — `Interrupt::register_handler`'s `irq` argument *is*
 the GIC INTID, and the `vector` argument is ignored. The ranges in use are
 SGI 1 (the IPI), PPI 27 (the generic timer), SPI 33/34 (PL011, RTC),
 SPI 48–79 (virtio-mmio), and LPIs from 8192 up (MSI).
 
-All IRQs arrive at `ArmIrqEntry`, which loops:
+All IRQs arrive at `arm_irq_entry`, which loops:
 
 - Read `ICC_IAR1_EL1`. INTIDs 1020–1023 mean "nothing (more) to
   acknowledge"; an empty *first* read is a genuine spurious interrupt, an
@@ -156,9 +156,9 @@ All IRQs arrive at `ArmIrqEntry`, which loops:
   wedging the CPU interface against every interrupt of equal or lower
   priority.
 - The IPI and the timer tick EOI themselves, because their handlers may
-  `Schedule()` away and never come back to the loop.
-- LPIs go to `Its::HandleLpi`, everything else to the registered handlers,
-  and `ArmIrqEntry` writes EOIR afterwards.
+  `schedule()` away and never come back to the loop.
+- LPIs go to `Its::handle_lpi`, everything else to the registered handlers,
+  and `arm_irq_entry` writes EOIR afterwards.
 
 The **ITS** (`arch/arm64/its.cpp`) is what makes PCIe MSI work. At boot it
 maps its registers, provisions the device and collection tables and a
@@ -177,7 +177,7 @@ machine still boots and runs.
 
 `IrqBalance` records every device IRQ at registration time and spreads them
 round-robin across the running CPUs once SMP bring-up completes
-(`Balance()`, called from `BpStartup` right after `StartAll`). Devices that
+(`balance()`, called from `bp_startup` right after `start_all`). Devices that
 register later join the rotation immediately. System IRQs are not recorded
 and stay on the BSP.
 
@@ -191,9 +191,9 @@ after the BSP so device IRQs prefer the other cores.
 
 ## IPIs, and the NMI
 
-`Hal::SendIpi(cpu, vector)` is a LAPIC ICR write on x86 and an SGI on arm64.
+`hal::send_ipi(cpu, vector)` is a LAPIC ICR write on x86 and an SGI on arm64.
 The IPI handler runs any queued `IPITask`s for this CPU and ends in
-`Schedule()`, which is what makes an IPI a reschedule request — and also why
+`schedule()`, which is what makes an IPI a reschedule request — and also why
 a softirq raise on the CPU that is already running the softirq task must
 *not* send one.
 
@@ -208,7 +208,7 @@ overflow, which is a profiler sample and the one kind of NMI this kernel
 must return from. Anything else panics. On AMD parts a counter interrupt can
 arrive just after the overflow that caused it was already handled, so one
 such NMI per handled sample is swallowed and counted (`lscpu` reports the
-total). arm64 has no NMI — `Hal::NmiIpiSupported()` answers false and the
+total). arm64 has no NMI — `hal::nmi_ipi_supported()` answers false and the
 panic path skips remote stack capture.
 
 ## Deferred work: SoftIrq
@@ -223,7 +223,7 @@ that finishes kicks the losers rather than leaving them until the next tick.
 The wake protocol (pending bit, then unblock; block, then re-check) is the
 one described in [Scheduler](scheduler.md).
 
-`SoftIrq::Init()` runs late in boot, and several things depend on it: until
+`SoftIrq::init()` runs late in boot, and several things depend on it: until
 it exists a block read returns without having read anything, which is why
 partition probing for the disks that came up under `rust_init` and the
 disk-log setup happen after it rather than next to the driver init.

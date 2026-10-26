@@ -17,7 +17,7 @@ Writing TLS ourselves was never the plan. It is a certificate parser, a chain bu
 
 ## rustls without std
 
-The kernel's Rust is `no_std`. It links `core` and `alloc` but not the standard library, so there are no files, sockets, clocks or OS randomness to call. rustls works in this mode, but its usual `read_tls` and `write_tls` take `std::io` traits. So the [`tls` crate](https://github.com/irqlevel/nos/blob/master/src/rust/tls/src/lib.rs) drives rustls's unbuffered API instead. `process_tls_records` returns one state at a time, such as bytes to send or a handshake waiting for the peer. Our loop does the reading, writing and buffering that `std::io` would have done.
+The kernel's Rust is `no_std`. It links `core` and `alloc` but not the standard library, so there are no files, sockets, clocks or OS randomness to call. rustls works in this mode, but its usual `read_tls` and `write_tls` take `std::io` traits. So the [`tls` crate](https://github.com/irqlevel/nos/blob/master/src/crates/tls/src/lib.rs) drives rustls's unbuffered API instead. `process_tls_records` returns one state at a time, such as bytes to send or a handshake waiting for the peer. Our loop does the reading, writing and buffering that `std::io` would have done.
 
 One rule matters more than the rest: call `process_tls_records` once per turn. It consumes records as it goes. Calling it again just to ask "are we blocked?" processes the next record twice, and the connection dies a round trip later with `InappropriateMessage { got_type: ChangeCipherSpec }` ([HTTPS](/docs/tls#the-unbuffered-api)). The primitives come from rustls-rustcrypto, a provider built on the RustCrypto crates, which implement them in plain Rust.
 
@@ -40,7 +40,7 @@ pub trait Transport {
 }
 ```
 
-[`http.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/net/src/http.rs) hands `TlsStream` a `TcpPipe`, a wrapper around its connection that calls TCP directly. Dropping the TLS stream only sends close_notify, the message that ends a TLS session cleanly, and the HTTP client closes the connection itself.
+[`http.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/http.rs) hands `TlsStream` a `TcpPipe`, a wrapper around its connection that calls TCP directly. Dropping the TLS stream only sends close_notify, the message that ends a TLS session cleanly, and the HTTP client closes the connection itself.
 
 ## Certificates and the clock
 
@@ -102,7 +102,7 @@ With the pool, `wget https://github.com/robots.txt` returned 200. With `hwrng=of
 
 The kernel keeps SSE and the x87 FPU off, because its context switch saves neither's registers. Two tasks using them would share one set and silently corrupt each other's values. So the kernel's Rust is built for soft-float targets, `x86_64-unknown-none` and `aarch64-unknown-none-softfloat`. On a soft-float target, the compiler turns floating-point math into calls to helpers such as `__muldf3`, which work in integer registers. The helpers come from `compiler_builtins`, Rust's library of compiler intrinsics, and since 22 September the C++ calls them too, built with `-mno-80387` as well as `-mno-sse` ([bec20c2](https://github.com/irqlevel/nos/commit/bec20c2)).
 
-The RustCrypto crates choose SSE2 or AVX2 at run time, and they compile those paths unconditionally. LLVM cannot compile them for a target with SSE off, so the build stopped with `Do not know how to split the result of this operator`. Each crate has a documented switch to a portable, constant-time software backend, and [`.cargo/config.toml`](https://github.com/irqlevel/nos/blob/master/src/rust/.cargo/config.toml) sets the switches for both targets:
+The RustCrypto crates choose SSE2 or AVX2 at run time, and they compile those paths unconditionally. LLVM cannot compile them for a target with SSE off, so the build stopped with `Do not know how to split the result of this operator`. Each crate has a documented switch to a portable, constant-time software backend, and [`.cargo/config.toml`](https://github.com/irqlevel/nos/blob/master/src/crates/.cargo/config.toml) sets the switches for both targets:
 
 ```toml
 [target.x86_64-unknown-none]
@@ -111,7 +111,7 @@ rustflags = ["-Ccode-model=large", "-Cforce-frame-pointers=yes", "--cfg", "aes_f
 
 A build error is the friendly form of this trap. The next day, while adding a `sha256` shell command, we found the quiet form ([6d3ffd5](https://github.com/irqlevel/nos/commit/6d3ffd5)). sha2 has no such cfg. It picks SHA-NI, the CPU's SHA instructions, by CPUID at run time, and it builds without complaint. But SHA-NI instructions are SSE instructions, and the CPU allows them only when CR4.OSFXSR is set.
 
-An application processor (AP) is any CPU other than the one the machine booted on. It starts from INIT, which clears CR4, and the boot code set only PAE and MCE on it: the AX41 logged `cr4=0x60` on every AP. So the first block hashed on an AP would have been an invalid opcode, in the TLS client too. Now [`kernel/Cargo.toml`](https://github.com/irqlevel/nos/blob/master/src/rust/kernel/Cargo.toml) asks for sha2's `force-soft` feature, which covers TLS as well, because a crate is built once for the whole graph.
+An application processor (AP) is any CPU other than the one the machine booted on. It starts from INIT, which clears CR4, and the boot code set only PAE and MCE on it: the AX41 logged `cr4=0x60` on every AP. So the first block hashed on an AP would have been an invalid opcode, in the TLS client too. Now [`kernel/Cargo.toml`](https://github.com/irqlevel/nos/blob/master/src/crates/kernel/Cargo.toml) asks for sha2's `force-soft` feature, which covers TLS as well, because a crate is built once for the whole graph.
 
 ## Three details in the HTTP client
 

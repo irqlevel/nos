@@ -7,7 +7,7 @@ The build is parameterized by `ARCH` (default `x86_64`, or `aarch64`); objects g
 Requires clang, nasm, ld, grub-mkrescue with `xorriso` + `mtools`, and a **nightly**
 rustup toolchain with the `rust-src` component — the Rust staticlib uses `-Z build-std`
 to rebuild `core`/`alloc` with `-Ccode-model=large`, and `#![feature(alloc_error_handler)]`
-for its out-of-memory hook; `src/rust/rust-toolchain.toml` pins the exact nightly:
+for its out-of-memory hook; `src/crates/rust-toolchain.toml` pins the exact nightly:
 
 ```sh
 make
@@ -24,7 +24,7 @@ hand-written lists, `CXX_SRC_x86_64` and `CXX_SRC_aarch64` (plus `ASM_SRC_*`
 for NASM and `ASM_S_SRC_*` for GNU-as). A new `.cpp` that is in neither is
 silently not compiled, and portable code has to be added to **both**. Common
 driver code that names an x86-only entry point gets an unreachable link stub
-in `src/cpp/arch/arm64/x86_driver_stubs.cpp` rather than an `#ifdef`.
+in `src/base/arch/arm64/x86_driver_stubs.cpp` rather than an `#ifdef`.
 
 **Dependency files go stale.** After moving, renaming or deleting a header,
 run a clean build, or delete the `.d` files in `out/` that still name the
@@ -68,10 +68,10 @@ asks of the code that -O0 never did:
   `Atomic`, an asm with a `"memory"` clobber, or a volatile access; a call
   the compiler cannot see into is enough only while it stays that way
 - a publish to another CPU is release/acquire (`__atomic_store_n`/
-  `__atomic_load_n`) or `Hal::SmpWmb`/`SmpRmb`: plain stores may be
+  `__atomic_load_n`) or `hal::smp_wmb`/`smp_rmb`: plain stores may be
   reordered by the compiler now, not only by an arm64 CPU
 - a function called after its caller moved the stack pointer is
-  `noinline` (`Main2`, `ApMain2`, after `ALLOC_CPU_STACK`)
+  `noinline` (`main2`, `ap_main2`, after `ALLOC_CPU_STACK`)
 - an endless loop has a side effect in it (`Pause()`): an empty one is one
   the compiler may assume ends, and take out
 
@@ -89,11 +89,11 @@ or a function-local static, constructed on first use.
 ## No network during a build
 
 The Rust dependencies (rustls and what it brings, see [HTTPS](tls.md)) are
-vendored in `src/rust/vendor` and cargo is run with `--offline`, so a build
+vendored in `src/crates/vendor` and cargo is run with `--offline`, so a build
 never reaches crates.io — a machine with no internet, or a CI runner with none,
 builds the same as any other.
 
-After adding, removing or bumping a dependency in `src/rust`, refresh that
+After adding, removing or bumping a dependency in `src/crates`, refresh that
 directory and commit it together with `Cargo.lock`:
 
 ```sh
@@ -109,7 +109,7 @@ covers *std's* dependencies as well — and those move from one nightly to the
 next. On a floating `nightly` the offline build eventually fails in resolution,
 naming a crate the kernel does not compile and never will: `hermit-abi`, which
 only std wants and only on `cfg(target_os = "hermit")`, going 0.5.2 → 0.5.3 is
-enough to stop the build. `src/rust/rust-toolchain.toml` is where the version
+enough to stop the build. `src/crates/rust-toolchain.toml` is where the version
 lives; the Dockerfile and both CI workflows install whatever it names. Bumping
 it and re-running `scripts/vendor.sh` is one commit, not two.
 
@@ -149,7 +149,7 @@ round. `version` says `+ubsan`.
 
 The first report is a panic, with the site:
 
-    PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/cpp/...
+    PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/base/...
 
 which makes every gate a UB check over the code it drives: build with
 `UBSAN=1`, and run the gate on the images as they are (`--skip-build` where it
@@ -168,7 +168,7 @@ What its first boots found, all in code that had passed every gate:
 
 - `CONTAINING_RECORD` and `OFFSET_OF` were `&((type*)0)->field`, a member
   access through a null pointer. They are `__builtin_offsetof` now.
-- On x86 `Hal::RunOnStack` entered the boot and idle bodies with RSP 8 off the
+- On x86 `hal::run_on_stack` entered the boot and idle bodies with RSP 8 off the
   ABI's 16-byte boundary, and chasing that found the same in every exception
   stub under an error code, `#GP` and `#PF` among them. Nothing had faulted
   because the kernel uses no SSE. The stubs pad now, and NASM refuses to
@@ -179,7 +179,7 @@ What its first boots found, all in code that had passed every gate:
   it, which every AP walks as it turns its MMU on: each AP took a translation
   fault with no vector to go to, and was only ever "still not running". The
   plain build had 248 bytes of its 16 KiB to spare. It has 32 KiB now, as on
-  x86, and a guard page between it and the tables, which `CpuTable::StartAll`
+  x86, and a guard page between it and the tables, which `CpuTable::start_all`
   checks before it starts an AP.
 
 ## Rust UB checks
@@ -196,7 +196,7 @@ wraps where it was not meant to. The flag turns both on by building the
 `release` profile with `debug-assertions` (which `-Zub-checks` follows) and
 `overflow-checks`, through cargo's `--config`; it must go through the
 profile and not `RUSTFLAGS`, which would replace the per-target rustflags in
-`src/rust/.cargo/config.toml` and drop `-Ccode-model=large`, the frame
+`src/crates/.cargo/config.toml` and drop `-Ccode-model=large`, the frame
 pointers and the crates' software-backend cfgs. `-Z build-std` puts the
 checks inside `core` as well as this tree's crates: the staticlib grows from
 about 12 MB to about 16 MB.
@@ -271,9 +271,9 @@ the loader a guest of the hypervisor is started in, by PVH, to boot the
 kernel on its own disk ([A guest's own
 kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)). It is a
 program of the guest's, not the kernel's, so it is built as a module is --
-its own target directory (`src/rust/target/hvboot`) and flags of its own:
+its own target directory (`src/crates/target/hvboot`) and flags of its own:
 static, the small code model, compiler-builtins' `memcpy` and friends --
-and then linked by `ld.lld` with `src/rust/hvboot/hvboot.ld`, at 1 MiB,
+and then linked by `ld.lld` with `src/crates/hvboot/hvboot.ld`, at 1 MiB,
 into an ELF with the `Xen` note PVH names its entry by. Offline, as
 everything is: it has no dependencies but `core` and `alloc`.
 
@@ -288,7 +288,7 @@ adapts to whichever firmware it woke up under.
 |---|---|---|
 | GRUB platform | `i386-pc` El Torito image + MBR boot code | ESP with `bootx64.efi` |
 | Console | EGA text at `0xB8000` (`drivers/vga.cpp`) | GOP pixel framebuffer, 8x16 font (`drivers/fb_console.cpp`) |
-| Keyboard | 8042 PS/2 | USB HID over xHCI (`src/rust/drivers/usb`); real UEFI laptops often have no 8042 at all |
+| Keyboard | 8042 PS/2 | USB HID over xHCI (`src/crates/drivers/usb`); real UEFI laptops often have no 8042 at all |
 
 The multiboot2 header asks GRUB for a framebuffer but marks both the console and
 framebuffer tags optional, so BIOS boots keep legacy text mode while UEFI boots

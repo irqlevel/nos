@@ -76,7 +76,7 @@ qemu-system-aarch64 \
 QEMU_PID=$!
 
 # Printed in this order on a healthy boot:
-#   "Self test passed"                - Test::Test() green (mm/lib self-tests)
+#   "Self test passed"                - test::test() green (mm/lib self-tests)
 #   "Cpus started"                    - every DTB CPU came up via PSCI CPU_ON
 #   "After test"                      - multitasking test green with SMP on
 #   "MountRootFs: mounted ext2 on /"  - the root image was found and mounted rw

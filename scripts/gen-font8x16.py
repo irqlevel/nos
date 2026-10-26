@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/cpp/drivers/font8x16.cpp -- the 8x16 bitmap font used by the
+"""Generate src/base/drivers/font8x16.cpp -- the 8x16 bitmap font used by the
 framebuffer console (drivers/fb_console.cpp).
 
 The glyphs are rasterized from DejaVu Sans Mono (Bitstream Vera derived,
@@ -13,7 +13,7 @@ cropped.
 The generated file is checked in, so the build needs neither python nor the
 font. Re-run only to regenerate it:
 
-    python3 scripts/gen-font8x16.py > src/cpp/drivers/font8x16.cpp
+    python3 scripts/gen-font8x16.py > src/base/drivers/font8x16.cpp
 """
 
 import sys
@@ -65,8 +65,8 @@ def main():
               "   Glyphs rasterized from DejaVu Sans Mono (Bitstream Vera\n"
               "   derived, permissive license) into 8x16 monochrome cells. */\n\n"
               '#include "font8x16.h"\n\n'
-              "namespace Kernel\n{\n\n"
-              "const u8 Font8x16[Font8x16GlyphCount][Font8x16Height] = {\n")
+              "namespace kernel\n{\n\n"
+              "const u8 FONT8X16[FONT8X16_GLYPH_COUNT][FONT8X16_HEIGHT] = {\n")
     for code in range(FIRST, LAST + 1):
         rows = tall[code][origin:origin + HEIGHT]
         name = chr(code) if code not in (0x27, 0x5C) else "\\" + chr(code)

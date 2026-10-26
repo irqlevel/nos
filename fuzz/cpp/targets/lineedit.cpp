@@ -23,346 +23,346 @@
 namespace
 {
 
-using Kernel::LineEditor;
+using kernel::LineEditor;
 
-const char CtrlC = 0x03;
-const char CtrlG = 0x07;
-const char Bs = 0x08;
-const char Lf = 0x0A;
-const char Cr = 0x0D;
-const char CtrlN = 0x0E;
-const char CtrlP = 0x10;
-const char CtrlR = 0x12;
-const char CtrlU = 0x15;
-const char Esc = 0x1B;
-const char Del = 0x7F;
+const char CTRL_C = 0x03;
+const char CTRL_G = 0x07;
+const char BS = 0x08;
+const char LF = 0x0A;
+const char CR = 0x0D;
+const char CTRL_N = 0x0E;
+const char CTRL_P = 0x10;
+const char CTRL_R = 0x12;
+const char CTRL_U = 0x15;
+const char ESC = 0x1B;
+const char DEL = 0x7F;
 
-bool Printable(char c)
+bool printable(char c)
 {
     return c >= ' ' && c <= '~';
 }
 
 /* The one row of the screen the editor draws on: its text and Backspace */
-class Screen final : public Stdlib::Printer
+class Screen final : public stdlib::Printer
 {
 public:
-    std::string Row;
+    std::string row_;
 
-    virtual void Printf(const char *fmt, ...) override
+    virtual void printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
-        VPrintf(fmt, args);
+        v_printf(fmt, args);
         va_end(args);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    virtual void v_printf(const char *fmt, va_list args) override
     {
         char text[512];
         vsnprintf(text, sizeof(text), fmt, args);
-        PrintString(text);
+        print_string(text);
     }
 
-    virtual void PrintString(const char *s) override
+    virtual void print_string(const char *s) override
     {
         for (; *s != '\0'; s++)
         {
-            INVARIANT(*s == '\n' || Printable(*s), "the editor printed byte 0x%02X", (unsigned)(unsigned char)*s);
+            INVARIANT(*s == '\n' || printable(*s), "the editor printed byte 0x%02X", (unsigned)(unsigned char)*s);
             if (*s == '\n')
-                Row.clear();
+                row_.clear();
             else
-                Row += *s;
+                row_ += *s;
         }
     }
 
-    virtual void Backspace() override
+    virtual void backspace() override
     {
-        INVARIANT(!Row.empty(), "a Backspace on an empty row: the line above is erased");
-        Row.pop_back();
+        INVARIANT(!row_.empty(), "a Backspace on an empty row: the line above is erased");
+        row_.pop_back();
     }
 };
 
 /* line_editor.h, read in std::string */
 struct Model
 {
-    enum { EscNone, EscStart, EscSequence } EscState = EscNone;
-    std::string Line;
-    std::vector<std::string> History;
-    size_t Browse = 0;
-    std::string Draft;
-    bool Searching = false;
-    bool Failed = false;
-    std::string Query;
-    size_t Match = 0;
-    std::string Saved;
+    enum { EscNone, EscStart, EscSequence } esc_state = EscNone;
+    std::string line;
+    std::vector<std::string> history;
+    size_t browse = 0;
+    std::string draft;
+    bool searching = false;
+    bool failed = false;
+    std::string query;
+    size_t match = 0;
+    std::string saved;
     /* What Enter handed the shell, when the last key ended a line */
-    bool Ended = false;
-    std::string Done;
+    bool ended = false;
+    std::string done;
 
-    size_t Count() const { return History.size(); }
+    size_t count() const { return history.size(); }
 
-    void Older()
+    void older()
     {
-        if (Browse == 0)
+        if (browse == 0)
             return;
-        if (Browse == Count())
-            Draft = Line;
-        Browse--;
-        Line = History[Browse];
+        if (browse == count())
+            draft = line;
+        browse--;
+        line = history[browse];
     }
 
-    void Newer()
+    void newer()
     {
-        if (Browse >= Count())
+        if (browse >= count())
             return;
-        Browse++;
-        Line = (Browse == Count()) ? Draft : History[Browse];
+        browse++;
+        line = (browse == count()) ? draft : history[browse];
     }
 
     /* The newest line older than below that holds the query */
-    void Find(size_t below)
+    void find(size_t below)
     {
         for (size_t i = below; i > 0; i--)
         {
-            if (History[i - 1].find(Query) != std::string::npos)
+            if (history[i - 1].find(query) != std::string::npos)
             {
-                Match = i - 1;
-                Failed = false;
-                Line = History[Match];
+                match = i - 1;
+                failed = false;
+                line = history[match];
                 return;
             }
         }
-        Failed = true;
+        failed = true;
     }
 
-    void Enter()
+    void enter()
     {
-        Ended = true;
-        Done = Line;
-        bool blank = Line.find_first_not_of(' ') == std::string::npos;
-        if (!blank && (History.empty() || History.back() != Line))
+        ended = true;
+        done = line;
+        bool blank = line.find_first_not_of(' ') == std::string::npos;
+        if (!blank && (history.empty() || history.back() != line))
         {
-            if (History.size() == LineEditor::HistoryMax)
-                History.erase(History.begin());
-            History.push_back(Line);
+            if (history.size() == LineEditor::HISTORY_MAX)
+                history.erase(history.begin());
+            history.push_back(line);
         }
-        Line.clear();
-        Draft.clear();
-        Browse = Count();
+        line.clear();
+        draft.clear();
+        browse = count();
     }
 
-    void Cancel()
+    void cancel()
     {
-        Searching = false;
-        Line.clear();
-        Draft.clear();
-        Browse = Count();
+        searching = false;
+        line.clear();
+        draft.clear();
+        browse = count();
     }
 
-    void Key(char c)
+    void key(char c)
     {
-        Ended = false;
+        ended = false;
 
-        if (EscState == EscStart)
+        if (esc_state == EscStart)
         {
-            EscState = EscNone;
+            esc_state = EscNone;
             if (c == '[' || c == 'O')
             {
-                EscState = EscSequence;
+                esc_state = EscSequence;
                 return;
             }
-            if (Printable(c))
+            if (printable(c))
                 return;
         }
-        else if (EscState == EscSequence)
+        else if (esc_state == EscSequence)
         {
             if (c >= 0x20 && c <= 0x3F)
                 return;
-            EscState = EscNone;
+            esc_state = EscNone;
             if (c >= 0x40 && c <= 0x7E)
             {
                 if (c == 'A')
-                    Older();
+                    older();
                 else if (c == 'B')
-                    Newer();
+                    newer();
                 return;
             }
         }
 
-        if (Searching)
+        if (searching)
         {
-            if (Printable(c))
+            if (printable(c))
             {
-                if (Query.size() < LineEditor::LineMax)
+                if (query.size() < LineEditor::LINE_LEN_MAX)
                 {
-                    Query += c;
-                    Find(Match < Count() ? Match + 1 : Count());
+                    query += c;
+                    find(match < count() ? match + 1 : count());
                 }
                 return;
             }
-            if (c == CtrlR)
+            if (c == CTRL_R)
             {
-                Find(Match);
+                find(match);
                 return;
             }
-            if (c == Bs || c == Del)
+            if (c == BS || c == DEL)
             {
-                if (!Query.empty())
+                if (!query.empty())
                 {
-                    Query.pop_back();
-                    Line = Saved;
-                    Match = Count();
-                    Failed = false;
-                    if (!Query.empty())
-                        Find(Count());
+                    query.pop_back();
+                    line = saved;
+                    match = count();
+                    failed = false;
+                    if (!query.empty())
+                        find(count());
                 }
                 return;
             }
-            if (c == CtrlG)
+            if (c == CTRL_G)
             {
-                Line = Saved;
-                Searching = false;
+                line = saved;
+                searching = false;
                 return;
             }
-            if (c == CtrlC)
+            if (c == CTRL_C)
             {
-                Cancel();
+                cancel();
                 return;
             }
-            Searching = false;
-            if (Match < Count())
+            searching = false;
+            if (match < count())
             {
-                if (Browse == Count())
-                    Draft = Saved;
-                Browse = Match;
+                if (browse == count())
+                    draft = saved;
+                browse = match;
             }
         }
 
         switch (c)
         {
-        case Cr:
-        case Lf:
-            Enter();
+        case CR:
+        case LF:
+            enter();
             break;
-        case Bs:
-        case Del:
-            if (!Line.empty())
-                Line.pop_back();
+        case BS:
+        case DEL:
+            if (!line.empty())
+                line.pop_back();
             break;
-        case CtrlC:
-            Cancel();
+        case CTRL_C:
+            cancel();
             break;
-        case CtrlU:
-            Line.clear();
+        case CTRL_U:
+            line.clear();
             break;
-        case CtrlR:
-            Searching = true;
-            Failed = false;
-            Query.clear();
-            Match = Count();
-            Saved = Line;
+        case CTRL_R:
+            searching = true;
+            failed = false;
+            query.clear();
+            match = count();
+            saved = line;
             break;
-        case CtrlP:
-            Older();
+        case CTRL_P:
+            older();
             break;
-        case CtrlN:
-            Newer();
+        case CTRL_N:
+            newer();
             break;
-        case Esc:
-            EscState = EscStart;
+        case ESC:
+            esc_state = EscStart;
             break;
         default:
-            if (Printable(c) && Line.size() < LineEditor::LineMax)
-                Line += c;
+            if (printable(c) && line.size() < LineEditor::LINE_LEN_MAX)
+                line += c;
             break;
         }
     }
 
     /* What the screen shows after the key */
-    std::string Shown() const
+    std::string shown() const
     {
-        if (Searching)
-            return std::string(Failed ? LineEditor::FailedText : LineEditor::SearchText) + Query +
-                   LineEditor::QueryEndText + Line;
-        return std::string(LineEditor::PromptText) + Line;
+        if (searching)
+            return std::string(failed ? LineEditor::FAILED_TEXT : LineEditor::SEARCH_TEXT) + query +
+                   LineEditor::QUERY_END_TEXT + line;
+        return std::string(LineEditor::PROMPT_TEXT) + line;
     }
 };
 
 /* The keys the editor acts on, and letters few enough to repeat */
-const char Keys[] = {Cr, Lf, Bs, Del, CtrlC, CtrlG, CtrlN, CtrlP, CtrlR, CtrlR, CtrlU, Esc, Esc, '[', 'O',
+const char KEYS[] = {CR, LF, BS, DEL, CTRL_C, CTRL_G, CTRL_N, CTRL_P, CTRL_R, CTRL_R, CTRL_U, ESC, ESC, '[', 'O',
                      'A', 'B', 'C', 'D', '1', ';', '\t', 0};
-const char Letters[] = "ab c";
+const char LETTERS[] = "ab c";
 
-char NextKey(Fuzz::Input& in)
+char next_key(fuzz::Input& in)
 {
-    switch (in.Below(8))
+    switch (in.below(8))
     {
     case 0:
     case 1:
-        return in.Pick(Keys);
+        return in.pick(KEYS);
     case 2:
-        return static_cast<char>(in.U8());
+        return static_cast<char>(in.u8());
     default:
-        return Letters[in.Below(sizeof(Letters) - 1)];
+        return LETTERS[in.below(sizeof(LETTERS) - 1)];
     }
 }
 
-void Run(Fuzz::Input& in)
+void run(fuzz::Input& in)
 {
     LineEditor* ed = new LineEditor();
     Model m;
     Screen screen;
 
-    ed->Prompt(screen);
-    INVARIANT(screen.Row == m.Shown(), "the first prompt shows '%s'", screen.Row.c_str());
+    ed->prompt(screen);
+    INVARIANT(screen.row_ == m.shown(), "the first prompt shows '%s'", screen.row_.c_str());
 
-    while (in.More())
+    while (in.more())
     {
-        /* Now and then a run of one key: a line past LineMax, a history
-           past HistoryMax, Up past its oldest line */
-        size_t times = in.Chance(16) ? in.Range(1, 2 * LineEditor::LineMax) : 1;
-        char c = NextKey(in);
+        /* Now and then a run of one key: a line past LINE_LEN_MAX, a history
+           past HISTORY_MAX, Up past its oldest line */
+        size_t times = in.chance(16) ? in.range(1, 2 * LineEditor::LINE_LEN_MAX) : 1;
+        char c = next_key(in);
         if (times > 1)
-            Fuzz::Reached("a run of one key");
+            fuzz::reached("a run of one key");
 
         for (size_t i = 0; i < times; i++)
         {
-            bool ended = ed->Key(c, screen);
-            m.Key(c);
-            Fuzz::Say("key 0x%02X: '%s'", (unsigned)(unsigned char)c, screen.Row.c_str());
+            bool ended = ed->key(c, screen);
+            m.key(c);
+            fuzz::say("key 0x%02X: '%s'", (unsigned)(unsigned char)c, screen.row_.c_str());
 
-            INVARIANT(ended == m.Ended, "key 0x%02X %s a line, the model says it %s",
-                      (unsigned)(unsigned char)c, ended ? "ended" : "did not end", m.Ended ? "did" : "did not");
+            INVARIANT(ended == m.ended, "key 0x%02X %s a line, the model says it %s",
+                      (unsigned)(unsigned char)c, ended ? "ended" : "did not end", m.ended ? "did" : "did not");
             if (ended)
             {
-                INVARIANT(ed->GetLine() == m.Done, "Enter ran '%s', the model '%s'", ed->GetLine(), m.Done.c_str());
-                INVARIANT(screen.Row.empty(), "Enter left '%s' on the line it ended", screen.Row.c_str());
-                Fuzz::Reached("a line run");
-                if (m.Count() == LineEditor::HistoryMax)
-                    Fuzz::Reached("a full history");
-                ed->Prompt(screen);
+                INVARIANT(ed->get_line() == m.done, "Enter ran '%s', the model '%s'", ed->get_line(), m.done.c_str());
+                INVARIANT(screen.row_.empty(), "Enter left '%s' on the line it ended", screen.row_.c_str());
+                fuzz::reached("a line run");
+                if (m.count() == LineEditor::HISTORY_MAX)
+                    fuzz::reached("a full history");
+                ed->prompt(screen);
             }
 
-            INVARIANT(screen.Row == m.Shown(), "after key 0x%02X the screen shows '%s', the model '%s'",
-                      (unsigned)(unsigned char)c, screen.Row.c_str(), m.Shown().c_str());
+            INVARIANT(screen.row_ == m.shown(), "after key 0x%02X the screen shows '%s', the model '%s'",
+                      (unsigned)(unsigned char)c, screen.row_.c_str(), m.shown().c_str());
 
-            if (m.Searching && m.Failed)
-                Fuzz::Reached("a search that failed");
-            if (m.Searching && m.Match < m.Count())
-                Fuzz::Reached("a search that found a line");
-            if (!m.Searching && m.Browse < m.Count())
-                Fuzz::Reached("a line from the history");
-            if (m.Line.size() == LineEditor::LineMax)
-                Fuzz::Reached("a line at LineMax");
+            if (m.searching && m.failed)
+                fuzz::reached("a search that failed");
+            if (m.searching && m.match < m.count())
+                fuzz::reached("a search that found a line");
+            if (!m.searching && m.browse < m.count())
+                fuzz::reached("a line from the history");
+            if (m.line.size() == LineEditor::LINE_LEN_MAX)
+                fuzz::reached("a line at LINE_LEN_MAX");
         }
     }
     delete ed;
 }
 
-void Reset()
+void reset()
 {
 }
 
 }
 
-const Fuzz::Target Fuzz::TheTarget = {"lineedit", Reset, Run, 4096, 20000};
+const fuzz::Target fuzz::THE_TARGET = {"lineedit", reset, run, 4096, 20000};

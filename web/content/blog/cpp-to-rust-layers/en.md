@@ -11,7 +11,7 @@ tags:
   - modules
 ---
 
-On 17 September 2026 the kernel's block layer, network stack and filesystems were written in C++. `src/cpp/net` held 8,909 lines, `src/cpp/fs` 6,849 and `src/cpp/block` 877, and the virtio bus with its four drivers took another 4,839. Rust had been in the tree since March, but only at the edges: four disk and network drivers plugged into C++ tables, the TLS and SSH protocol crates, and a few loadable modules.
+On 17 September 2026 the kernel's block layer, network stack and filesystems were written in C++. `src/base/net` held 8,909 lines, `src/base/fs` 6,849 and `src/base/block` 877, and the virtio bus with its four drivers took another 4,839. Rust had been in the tree since March, but only at the edges: four disk and network drivers plugged into C++ tables, the TLS and SSH protocol crates, and a few loadable modules.
 
 By the evening of the 18th all three directories were gone. Judging by the commit timestamps, that took under nine hours. That night and the next day, the new Rust code shed most of its `unsafe`. Here is how it went, and how we showed that nothing broke.
 
@@ -40,7 +40,7 @@ nanofs, nos's own small filesystem, has no `e2fsck`, so its gate parses the imag
 
 ## The C++ views go
 
-After each port, what was left in C++ was a *view*: a class that wraps a handle and the calls on it. The directories emptied thanks to one rule. A C++ caller declares the `kernel_*` or `rust_*` functions it calls right where it calls them, with no shared header. Thirteen network shell commands and seventeen filesystem ones moved into the crates that own their data. Then the commits read like obituaries: [`3a57641`](https://github.com/irqlevel/nos/commit/3a57641) "fs: src/cpp/fs is gone", [`2192392`](https://github.com/irqlevel/nos/commit/2192392) "block: src/cpp/block is gone too", [`d2c0ef2`](https://github.com/irqlevel/nos/commit/d2c0ef2) "net: src/cpp/net is gone". The xHCI driver followed the same evening. Some round trips disappeared on the way. The TCP calls that the SSH server uses had been C++ over the C++ view, and the view called straight back into Rust: "three hops for a Rust-to-Rust call, on every byte sshd sent".
+After each port, what was left in C++ was a *view*: a class that wraps a handle and the calls on it. The directories emptied thanks to one rule. A C++ caller declares the `kernel_*` or `rust_*` functions it calls right where it calls them, with no shared header. Thirteen network shell commands and seventeen filesystem ones moved into the crates that own their data. Then the commits read like obituaries: [`3a57641`](https://github.com/irqlevel/nos/commit/3a57641) "fs: src/base/fs is gone", [`2192392`](https://github.com/irqlevel/nos/commit/2192392) "block: src/base/block is gone too", [`d2c0ef2`](https://github.com/irqlevel/nos/commit/d2c0ef2) "net: src/base/net is gone". The xHCI driver followed the same evening. Some round trips disappeared on the way. The TCP calls that the SSH server uses had been C++ over the C++ view, and the view called straight back into Rust: "three hops for a Rust-to-Rust call, on every byte sshd sent".
 
 The code moved; it did not grow. `scripts/sloc.py` counts lines of code only, and by its count C++ went from 52,366 lines to 33,858 and Rust from 10,964 to 29,310. The total went from 64,776 to 64,605.
 
@@ -69,7 +69,7 @@ unsafe impl Send for ArpTable {}
         let cache = unsafe { &mut *self.cache.get() };
 ```
 
-And after, in [`net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/net/src/arp.rs):
+And after, in [`net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/arp.rs):
 
 ```rust
 pub struct ArpTable {
@@ -81,7 +81,7 @@ pub struct ArpTable {
         let cache = self.cache.lock();
 ```
 
-The `unsafe` now appears once per lock type, in the guard's `Deref` in [`kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/kcore/src/sync.rs). This was not cosmetic. TCP had been reading other connections' state under the pool lock without taking their own locks, and the old shape hid that behind the same `unsafe` as everything else. The lock order is now pool, then connection.
+The `unsafe` now appears once per lock type, in the guard's `Deref` in [`kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/sync.rs). This was not cosmetic. TCP had been reading other connections' state under the pool lock without taking their own locks, and the old shape hid that behind the same `unsafe` as everything else. The lock order is now pool, then connection.
 
 Each pattern that used to need `unsafe` got a type in `kcore`, and the type's own comment explains why it is sound. `Once` is for something there is only one of, `CpuLocal` for per-CPU state, `RxOwned` for what only the receive path touches, and `kcore::pod` for on-disk structures. (ext2's superblock says `unsafe impl Pod` once, and every read after that is bounds-checked.) A filesystem's tree became an arena of ids, each a slot plus a generation, so a stale id finds nothing. A handle that comes from outside is looked up, never dereferenced:
 

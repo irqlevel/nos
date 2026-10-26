@@ -77,10 +77,10 @@ static TRACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 pub static ECHO_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The level the kernel traces at unless told otherwise
-/// (`Parameters::DefaultLogLevel`): what reaches the log and whatever the
+/// (`Parameters::DEFAULT_LOG_LEVEL`): what reaches the log and whatever the
 /// C++ tracer hands it on to.
 const LOG_LEVEL: u32 = 1;
-/// A line of the log at most: `Tracer::Output`'s buffer, its NUL aside. A
+/// A line of the log at most: `Tracer::output`'s buffer, its NUL aside. A
 /// longer one is cut, "..." where it was.
 const LINE_MAX: usize = 255;
 

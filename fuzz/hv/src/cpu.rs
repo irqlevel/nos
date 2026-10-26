@@ -62,7 +62,7 @@ impl Caps {
     }
 }
 
-#[path = "../../../src/rust/hvarch/src/x86/svm/vmcb.rs"]
+#[path = "../../../src/crates/hvarch/src/x86/svm/vmcb.rs"]
 pub mod vmcb;
 
 /// `kcore::cpu::timer_at`: the host CPU's own timer armed to interrupt it by

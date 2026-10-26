@@ -132,7 +132,7 @@ forwarding, `env`.
 
 ## The shell behind it
 
-A command line goes to `Cmd::Dispatch`, as the console's and the UDP shell's
+A command line goes to `Cmd::dispatch`, as the console's and the UDP shell's
 do. What it prints waits in a 64 KiB buffer and goes out on the channel where
 that may be done: a command that prints a line now and then is seen as it
 prints, one that prints everything at once goes out when it returns, in
@@ -196,7 +196,7 @@ can.
 
 ## How it is put together
 
-- `src/rust/ssh` -- the protocol, and nothing of the kernel: the transport
+- `src/crates/ssh` -- the protocol, and nothing of the kernel: the transport
   (version exchange, packets, key exchange), authentication, the session
   channel and the line editor. What it needs of the machine comes in through
   two traits: `Link` (the connection, the clock, the random pool, whether the
@@ -204,7 +204,7 @@ can.
   The cryptography is the vendored RustCrypto and dalek crates the TLS client
   already uses; a module being a build of its own, `sha2` is asked for its
   software backend here as well as in the kernel crate.
-- `src/rust/modules/sshd` -- the kernel's side: the `sshd` command, the files,
+- `src/crates/modules/sshd` -- the kernel's side: the `sshd` command, the files,
   a listener task, a task for each connection, and one for each command a
   connection runs, with 16 KiB of its output and 4 KiB of typing between the
   two (`run_beside`); with no memory for those, the command runs on the

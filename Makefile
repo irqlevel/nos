@@ -18,7 +18,7 @@ GIT_DIRTY = $(shell git status --porcelain -uno 2>/dev/null | head -1 | grep -q 
 # works this out on the host and passes it in.
 GIT_DESC ?= $(GIT_REV)$(GIT_DIRTY)
 # UBSAN=1: the kernel's C++ built with clang's undefined-behaviour sanitizer,
-# the handlers in src/cpp/kernel/ubsan.cpp (docs/build.md). A flavour of its
+# the handlers in src/base/kernel/ubsan.cpp (docs/build.md). A flavour of its
 # own: its objects live apart, so switching keeps the other's, and the final
 # images -- named alike in both -- are relinked on a switch (the flavour
 # stamp below), so a plain build never ships an instrumented kernel made
@@ -73,7 +73,7 @@ RUST_TARGET = $(RUST_TARGET_$(ARCH))
 LDSCRIPT = $(LDSCRIPT_$(ARCH))
 KERNEL = $(KERNEL_$(ARCH))
 
-CPPFLAGS = -I$(CURDIR)/src/cpp -I$(CURDIR)/src/cpp/lib -I$(OUT)
+CPPFLAGS = -I$(CURDIR)/src/base -I$(CURDIR)/src/base/lib -I$(OUT)
 CXXFLAGS = --target=$(TARGET) -std=c++20 -g3 -ggdb3 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Wformat=2 -Werror $(ARCH_CXXFLAGS_$(ARCH)) -DKERNEL_VERSION=\"$(VERSION)\"
 # Optimised. Until 2026-10 the C++ had no -O at all, so clang's -O0; the
 # rest keeps what a stack walk needs whatever the optimiser does -- every
@@ -105,201 +105,201 @@ AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
 CXX_SRC_x86_64 =   \
-    src/cpp/arch/x86_64/grub.cpp    \
-    src/cpp/arch/x86_64/microcode.cpp \
-    src/cpp/arch/x86_64/microcode_file.cpp \
-    src/cpp/arch/x86_64/cpu_start.cpp \
-    src/cpp/arch/x86_64/pci_x86.cpp \
-    src/cpp/arch/x86_64/hal_x86.cpp \
-    src/cpp/arch/x86_64/hal_random.cpp \
-    src/cpp/arch/x86_64/builtin_pt.cpp \
-    src/cpp/drivers/serial.cpp  \
-    src/cpp/arch/x86_64/pic.cpp \
-    src/cpp/drivers/pit.cpp \
-    src/cpp/drivers/hpet.cpp \
-    src/cpp/drivers/8042.cpp    \
-    src/cpp/drivers/acpi.cpp    \
-    src/cpp/arch/x86_64/lapic.cpp   \
-	src/cpp/arch/x86_64/pmu.cpp	\
-	src/cpp/arch/x86_64/percpu.cpp	\
-    src/cpp/arch/x86_64/ioapic.cpp  \
-    src/cpp/drivers/vga.cpp \
-    src/cpp/drivers/font8x16.cpp \
-    src/cpp/drivers/fb_console.cpp \
-    src/cpp/drivers/screen.cpp \
-    src/cpp/drivers/pci.cpp \
-    src/cpp/drivers/msix.cpp \
-    src/cpp/drivers/rtc.cpp \
-    src/cpp/kernel/icxxabi.cpp    \
-    src/cpp/kernel/interrupt.cpp   \
-    src/cpp/kernel/interrupt_stats.cpp \
-    src/cpp/kernel/task.cpp \
-    src/cpp/kernel/test.cpp \
-    src/cpp/kernel/main.cpp \
-    src/cpp/kernel/trace.cpp \
-    src/cpp/kernel/timer.cpp    \
-    src/cpp/kernel/panic.cpp    \
-    src/cpp/kernel/ubsan.cpp \
-    src/cpp/kernel/debug.cpp    \
-    src/cpp/kernel/atomic.cpp   \
-    src/cpp/arch/x86_64/gdt.cpp  \
-    src/cpp/arch/x86_64/gdt_descriptor.cpp   \
-    src/cpp/arch/x86_64/idt_descriptor.cpp   \
-    src/cpp/arch/x86_64/idt.cpp  \
-    src/cpp/kernel/cpu.cpp  \
-    src/cpp/kernel/cmd.cpp  \
-    src/cpp/kernel/line_editor.cpp \
-    src/cpp/kernel/input.cpp \
-    src/cpp/kernel/mutex.cpp \
-    src/cpp/kernel/wait_group.cpp \
-    src/cpp/kernel/event.cpp \
-    src/cpp/kernel/softirq.cpp \
-    src/cpp/kernel/irq_balance.cpp \
-    src/cpp/arch/x86_64/exception.cpp    \
-    src/cpp/kernel/dmesg.cpp    \
-    src/cpp/kernel/sched.cpp    \
-    src/cpp/kernel/eevdf.cpp    \
-    src/cpp/kernel/preempt.cpp  \
-    src/cpp/kernel/time.cpp \
-    src/cpp/arch/x86_64/tsc.cpp \
-    src/cpp/kernel/spin_lock.cpp \
-    src/cpp/kernel/watchdog.cpp \
-    src/cpp/kernel/object_table.cpp \
-    src/cpp/kernel/parameters.cpp \
-    src/cpp/kernel/raw_spin_lock.cpp \
-    src/cpp/kernel/profiler.cpp \
-    src/cpp/kernel/raw_rw_spin_lock.cpp \
-    src/cpp/kernel/rw_mutex.cpp \
-    src/cpp/kernel/stack_trace.cpp \
-    src/cpp/kernel/stack_probe.cpp \
-    src/cpp/kernel/symtab.cpp \
-    src/cpp/kernel/pass1_tables.cpp \
-    src/cpp/kernel/rust_ffi.cpp \
-    src/cpp/kernel/module.cpp \
-    src/cpp/lib/stdlib.cpp  \
-    src/cpp/lib/format.cpp \
-    src/cpp/lib/bitmap.cpp \
-    src/cpp/lib/checksum.cpp \
-    src/cpp/lib/grub_env.cpp \
-    src/cpp/lib/list_entry.cpp  \
-    src/cpp/lib/error.cpp   \
-    src/cpp/mm/memory_map.cpp   \
-    src/cpp/mm/new.cpp  \
-    src/cpp/mm/allocator.cpp   \
-    src/cpp/mm/page_allocator.cpp  \
-    src/cpp/mm/va_allocator.cpp \
-    src/cpp/mm/pool.cpp    \
-    src/cpp/mm/page_table.cpp \
-    src/cpp/mm/block_allocator.cpp \
+    src/base/arch/x86_64/grub.cpp    \
+    src/base/arch/x86_64/microcode.cpp \
+    src/base/arch/x86_64/microcode_file.cpp \
+    src/base/arch/x86_64/cpu_start.cpp \
+    src/base/arch/x86_64/pci_x86.cpp \
+    src/base/arch/x86_64/hal_x86.cpp \
+    src/base/arch/x86_64/hal_random.cpp \
+    src/base/arch/x86_64/builtin_pt.cpp \
+    src/base/drivers/serial.cpp  \
+    src/base/arch/x86_64/pic.cpp \
+    src/base/drivers/pit.cpp \
+    src/base/drivers/hpet.cpp \
+    src/base/drivers/8042.cpp    \
+    src/base/drivers/acpi.cpp    \
+    src/base/arch/x86_64/lapic.cpp   \
+	src/base/arch/x86_64/pmu.cpp	\
+	src/base/arch/x86_64/percpu.cpp	\
+    src/base/arch/x86_64/ioapic.cpp  \
+    src/base/drivers/vga.cpp \
+    src/base/drivers/font8x16.cpp \
+    src/base/drivers/fb_console.cpp \
+    src/base/drivers/screen.cpp \
+    src/base/drivers/pci.cpp \
+    src/base/drivers/msix.cpp \
+    src/base/drivers/rtc.cpp \
+    src/base/kernel/icxxabi.cpp    \
+    src/base/kernel/interrupt.cpp   \
+    src/base/kernel/interrupt_stats.cpp \
+    src/base/kernel/task.cpp \
+    src/base/kernel/test.cpp \
+    src/base/kernel/main.cpp \
+    src/base/kernel/trace.cpp \
+    src/base/kernel/timer.cpp    \
+    src/base/kernel/panic.cpp    \
+    src/base/kernel/ubsan.cpp \
+    src/base/kernel/debug.cpp    \
+    src/base/kernel/atomic.cpp   \
+    src/base/arch/x86_64/gdt.cpp  \
+    src/base/arch/x86_64/gdt_descriptor.cpp   \
+    src/base/arch/x86_64/idt_descriptor.cpp   \
+    src/base/arch/x86_64/idt.cpp  \
+    src/base/kernel/cpu.cpp  \
+    src/base/kernel/cmd.cpp  \
+    src/base/kernel/line_editor.cpp \
+    src/base/kernel/input.cpp \
+    src/base/kernel/mutex.cpp \
+    src/base/kernel/wait_group.cpp \
+    src/base/kernel/event.cpp \
+    src/base/kernel/softirq.cpp \
+    src/base/kernel/irq_balance.cpp \
+    src/base/arch/x86_64/exception.cpp    \
+    src/base/kernel/dmesg.cpp    \
+    src/base/kernel/sched.cpp    \
+    src/base/kernel/eevdf.cpp    \
+    src/base/kernel/preempt.cpp  \
+    src/base/kernel/time.cpp \
+    src/base/arch/x86_64/tsc.cpp \
+    src/base/kernel/spin_lock.cpp \
+    src/base/kernel/watchdog.cpp \
+    src/base/kernel/object_table.cpp \
+    src/base/kernel/parameters.cpp \
+    src/base/kernel/raw_spin_lock.cpp \
+    src/base/kernel/profiler.cpp \
+    src/base/kernel/raw_rw_spin_lock.cpp \
+    src/base/kernel/rw_mutex.cpp \
+    src/base/kernel/stack_trace.cpp \
+    src/base/kernel/stack_probe.cpp \
+    src/base/kernel/symtab.cpp \
+    src/base/kernel/pass1_tables.cpp \
+    src/base/kernel/rust_ffi.cpp \
+    src/base/kernel/module.cpp \
+    src/base/lib/stdlib.cpp  \
+    src/base/lib/format.cpp \
+    src/base/lib/bitmap.cpp \
+    src/base/lib/checksum.cpp \
+    src/base/lib/grub_env.cpp \
+    src/base/lib/list_entry.cpp  \
+    src/base/lib/error.cpp   \
+    src/base/mm/memory_map.cpp   \
+    src/base/mm/new.cpp  \
+    src/base/mm/allocator.cpp   \
+    src/base/mm/page_allocator.cpp  \
+    src/base/mm/va_allocator.cpp \
+    src/base/mm/pool.cpp    \
+    src/base/mm/page_table.cpp \
+    src/base/mm/block_allocator.cpp \
 
 CXX_SRC_aarch64 = \
-    src/cpp/arch/arm64/main_arm64.cpp \
-    src/cpp/arch/arm64/fdt.cpp \
-    src/cpp/arch/arm64/board.cpp \
-    src/cpp/arch/arm64/pl011.cpp \
-    src/cpp/arch/arm64/stdlib_c.cpp \
-    src/cpp/arch/arm64/cpu_arm64.cpp \
-    src/cpp/arch/arm64/cpu_start_arm64.cpp \
-    src/cpp/arch/arm64/hal_arm64.cpp \
-    src/cpp/arch/arm64/hal_random.cpp \
-    src/cpp/arch/arm64/time_arm64.cpp \
-    src/cpp/arch/arm64/builtin_pt.cpp \
-    src/cpp/arch/arm64/gicv3.cpp \
-    src/cpp/arch/arm64/exception_arm64.cpp \
-    src/cpp/arch/arm64/interrupt_arm64.cpp \
-    src/cpp/arch/arm64/generic_timer.cpp \
-    src/cpp/arch/arm64/pci_ecam.cpp \
-    src/cpp/arch/arm64/its.cpp \
-    src/cpp/arch/arm64/msix_its.cpp \
-    src/cpp/arch/arm64/x86_driver_stubs.cpp \
-    src/cpp/drivers/pci.cpp \
-    src/cpp/kernel/icxxabi.cpp \
-    src/cpp/kernel/trace.cpp \
-    src/cpp/kernel/dmesg.cpp \
-    src/cpp/kernel/panic.cpp \
-    src/cpp/kernel/ubsan.cpp \
-    src/cpp/kernel/debug.cpp \
-    src/cpp/kernel/stack_trace.cpp \
-    src/cpp/kernel/stack_probe.cpp \
-    src/cpp/kernel/symtab.cpp \
-    src/cpp/kernel/pass1_tables.cpp \
-    src/cpp/kernel/atomic.cpp \
-    src/cpp/kernel/spin_lock.cpp \
-    src/cpp/kernel/raw_spin_lock.cpp \
-    src/cpp/kernel/profiler.cpp \
-    src/cpp/kernel/raw_rw_spin_lock.cpp \
-    src/cpp/kernel/preempt.cpp \
-    src/cpp/kernel/parameters.cpp \
-    src/cpp/kernel/watchdog.cpp \
-    src/cpp/kernel/task.cpp \
-    src/cpp/kernel/sched.cpp \
-    src/cpp/kernel/eevdf.cpp \
-    src/cpp/kernel/cpu.cpp \
-    src/cpp/kernel/timer.cpp \
-    src/cpp/kernel/mutex.cpp \
-    src/cpp/kernel/wait_group.cpp \
-    src/cpp/kernel/event.cpp \
-    src/cpp/kernel/rw_mutex.cpp \
-    src/cpp/kernel/object_table.cpp \
-    src/cpp/kernel/softirq.cpp \
-    src/cpp/kernel/interrupt_stats.cpp \
-    src/cpp/kernel/rust_ffi.cpp \
-    src/cpp/kernel/module.cpp \
-    src/cpp/kernel/test.cpp \
-    src/cpp/kernel/cmd.cpp \
-    src/cpp/kernel/line_editor.cpp \
-    src/cpp/kernel/input.cpp \
-    src/cpp/lib/stdlib.cpp \
-    src/cpp/lib/format.cpp \
-    src/cpp/lib/error.cpp \
-    src/cpp/lib/bitmap.cpp \
-    src/cpp/lib/checksum.cpp \
-    src/cpp/lib/grub_env.cpp \
-    src/cpp/lib/list_entry.cpp \
-    src/cpp/mm/memory_map.cpp \
-    src/cpp/mm/new.cpp \
-    src/cpp/mm/allocator.cpp \
-    src/cpp/mm/page_allocator.cpp \
-    src/cpp/mm/va_allocator.cpp \
-    src/cpp/mm/pool.cpp \
-    src/cpp/mm/page_table.cpp \
-    src/cpp/mm/block_allocator.cpp \
+    src/base/arch/arm64/main_arm64.cpp \
+    src/base/arch/arm64/fdt.cpp \
+    src/base/arch/arm64/board.cpp \
+    src/base/arch/arm64/pl011.cpp \
+    src/base/arch/arm64/stdlib_c.cpp \
+    src/base/arch/arm64/cpu_arm64.cpp \
+    src/base/arch/arm64/cpu_start_arm64.cpp \
+    src/base/arch/arm64/hal_arm64.cpp \
+    src/base/arch/arm64/hal_random.cpp \
+    src/base/arch/arm64/time_arm64.cpp \
+    src/base/arch/arm64/builtin_pt.cpp \
+    src/base/arch/arm64/gicv3.cpp \
+    src/base/arch/arm64/exception_arm64.cpp \
+    src/base/arch/arm64/interrupt_arm64.cpp \
+    src/base/arch/arm64/generic_timer.cpp \
+    src/base/arch/arm64/pci_ecam.cpp \
+    src/base/arch/arm64/its.cpp \
+    src/base/arch/arm64/msix_its.cpp \
+    src/base/arch/arm64/x86_driver_stubs.cpp \
+    src/base/drivers/pci.cpp \
+    src/base/kernel/icxxabi.cpp \
+    src/base/kernel/trace.cpp \
+    src/base/kernel/dmesg.cpp \
+    src/base/kernel/panic.cpp \
+    src/base/kernel/ubsan.cpp \
+    src/base/kernel/debug.cpp \
+    src/base/kernel/stack_trace.cpp \
+    src/base/kernel/stack_probe.cpp \
+    src/base/kernel/symtab.cpp \
+    src/base/kernel/pass1_tables.cpp \
+    src/base/kernel/atomic.cpp \
+    src/base/kernel/spin_lock.cpp \
+    src/base/kernel/raw_spin_lock.cpp \
+    src/base/kernel/profiler.cpp \
+    src/base/kernel/raw_rw_spin_lock.cpp \
+    src/base/kernel/preempt.cpp \
+    src/base/kernel/parameters.cpp \
+    src/base/kernel/watchdog.cpp \
+    src/base/kernel/task.cpp \
+    src/base/kernel/sched.cpp \
+    src/base/kernel/eevdf.cpp \
+    src/base/kernel/cpu.cpp \
+    src/base/kernel/timer.cpp \
+    src/base/kernel/mutex.cpp \
+    src/base/kernel/wait_group.cpp \
+    src/base/kernel/event.cpp \
+    src/base/kernel/rw_mutex.cpp \
+    src/base/kernel/object_table.cpp \
+    src/base/kernel/softirq.cpp \
+    src/base/kernel/interrupt_stats.cpp \
+    src/base/kernel/rust_ffi.cpp \
+    src/base/kernel/module.cpp \
+    src/base/kernel/test.cpp \
+    src/base/kernel/cmd.cpp \
+    src/base/kernel/line_editor.cpp \
+    src/base/kernel/input.cpp \
+    src/base/lib/stdlib.cpp \
+    src/base/lib/format.cpp \
+    src/base/lib/error.cpp \
+    src/base/lib/bitmap.cpp \
+    src/base/lib/checksum.cpp \
+    src/base/lib/grub_env.cpp \
+    src/base/lib/list_entry.cpp \
+    src/base/mm/memory_map.cpp \
+    src/base/mm/new.cpp \
+    src/base/mm/allocator.cpp \
+    src/base/mm/page_allocator.cpp \
+    src/base/mm/va_allocator.cpp \
+    src/base/mm/pool.cpp \
+    src/base/mm/page_table.cpp \
+    src/base/mm/block_allocator.cpp \
 
 CXX_SRC = $(CXX_SRC_$(ARCH))
 
 # NASM sources (x86 only)
 ASM_SRC_x86_64 =    \
-    src/cpp/arch/x86_64/boot64.asm \
-    src/cpp/arch/x86_64/asm.asm \
-    src/cpp/arch/x86_64/stdlib_asm.asm
+    src/base/arch/x86_64/boot64.asm \
+    src/base/arch/x86_64/asm.asm \
+    src/base/arch/x86_64/stdlib_asm.asm
 ASM_SRC_aarch64 =
 ASM_SRC = $(ASM_SRC_$(ARCH))
 
 # GNU-as sources assembled by clang (arm64 only)
 ASM_S_SRC_x86_64 =
 ASM_S_SRC_aarch64 = \
-    src/cpp/arch/arm64/boot.S \
-    src/cpp/arch/arm64/asm.S \
-    src/cpp/arch/arm64/vectors.S \
-    src/cpp/arch/arm64/string.S
+    src/base/arch/arm64/boot.S \
+    src/base/arch/arm64/asm.S \
+    src/base/arch/arm64/vectors.S \
+    src/base/arch/arm64/string.S
 ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
 
-OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))
-DEPS = $(patsubst src/cpp/%.cpp,$(OUT)/%.d,$(CXX_SRC))
+OBJS = $(patsubst src/base/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/base/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/base/%.S,$(OUT)/%.o,$(ASM_S_SRC))
+DEPS = $(patsubst src/base/%.cpp,$(OUT)/%.d,$(CXX_SRC))
 
-RUST_LIB_x86_64 = src/rust/target/x86_64-unknown-none/release/libkernel.a
-RUST_LIB_aarch64 = src/rust/target/aarch64-unknown-none-softfloat/release/libkernel.a
+RUST_LIB_x86_64 = src/crates/target/x86_64-unknown-none/release/libkernel.a
+RUST_LIB_aarch64 = src/crates/target/aarch64-unknown-none-softfloat/release/libkernel.a
 RUST_LIB = $(RUST_LIB_$(ARCH))
 
 # Cargo works out what to recompile, but make has to know when to call it at
 # all: without these prerequisites the $(RUST_LIB) rule never re-runs once the
 # archive exists, and a plain `make` after editing Rust silently links the
 # stale staticlib.  Hence `make rust && make nocheck` in scripts/smoke-test.sh.
-RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
-    $(wildcard src/rust/Cargo.toml src/rust/Cargo.lock src/rust/*/Cargo.toml \
-        src/rust/drivers/*/Cargo.toml src/rust/modules/*/Cargo.toml \
-        src/rust/.cargo/config.toml \
-        src/rust/rust-toolchain.toml)
+RUST_SRC = $(shell find src/crates -name '*.rs' -not -path 'src/crates/target/*') \
+    $(wildcard src/crates/Cargo.toml src/crates/Cargo.lock src/crates/*/Cargo.toml \
+        src/crates/drivers/*/Cargo.toml src/crates/modules/*/Cargo.toml \
+        src/crates/.cargo/config.toml \
+        src/crates/rust-toolchain.toml)
 
 .PHONY: all check nocheck clean rust smoke modules image hvboot
 
@@ -321,7 +321,7 @@ nocheck: nos-arm64.img modules
 endif
 
 check: $(CXX_SRC)
-	cppcheck --error-exitcode=22 --inline-suppr -q src/cpp || exit 1
+	cppcheck --error-exitcode=22 --inline-suppr -q src/base || exit 1
 
 nos.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso
@@ -348,10 +348,10 @@ nos-test.iso: build/grub.cfg $(KERNEL)
 	$(MKRESCUE) -o nos-test.iso iso-test
 	rm -rf iso-test
 
-$(OUT)/%.o: src/cpp/%.asm
+$(OUT)/%.o: src/base/%.asm
 	@mkdir -p $(dir $@)
 	$(ASM) -felf64 $< -o $@
-$(OUT)/%.o: src/cpp/%.S
+$(OUT)/%.o: src/base/%.S
 	@mkdir -p $(dir $@)
 	$(CC) --target=$(TARGET) $(CPPFLAGS) -c $< -o $@
 # Rewritten only when the revision changes, so an unchanged tree does not
@@ -368,7 +368,7 @@ $(OUT)/version_gen.h.stamp:
 $(OUT)/version_gen.h: $(OUT)/version_gen.h.stamp
 	@test -f $@
 
-$(OUT)/%.o: src/cpp/%.cpp | $(OUT)/version_gen.h
+$(OUT)/%.o: src/base/%.cpp | $(OUT)/version_gen.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
@@ -389,16 +389,16 @@ $(FLAVOR_STAMP).check:
 $(FLAVOR_STAMP): $(FLAVOR_STAMP).check
 	@test -f $@
 
-# --offline: every dependency source is vendored in src/rust/vendor, so a
+# --offline: every dependency source is vendored in src/crates/vendor, so a
 # build that wants the network is a build with a dependency that was never
 # vendored -- fail saying so rather than quietly fetching it (scripts/vendor.sh).
 rust:
-	cd src/rust && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
+	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
 
 $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
-	cd src/rust && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
+	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) $(RUST_UB_CFG)
 
-# Loadable kernel modules (docs/modules.md): the crates under src/rust/modules,
+# Loadable kernel modules (docs/modules.md): the crates under src/crates/modules,
 # each built on its own into a position-independent staticlib -- the module,
 # kmod, kcore, core and alloc, everything but the kernel functions it calls --
 # and linked into an ELF shared object, a .ko, for kernel/module.cpp to load.
@@ -424,21 +424,21 @@ MODULE_LDEMU_aarch64 = aarch64elf
 MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
     -z separate-loadable-segments -z max-page-size=4096 -z norelro \
     -z noexecstack -z now --build-id=none --hash-style=sysv \
-    --version-script=src/rust/kmod/module.ver -u nos_module_info
+    --version-script=src/crates/kmod/module.ver -u nos_module_info
 # The kernel interface a module is built against, and which the loader holds
 # it to: a digest of the ffi crate's sources.
-MODULE_FFI_SRC = $(sort $(wildcard src/rust/ffi/src/*.rs))
+MODULE_FFI_SRC = $(sort $(wildcard src/crates/ffi/src/*.rs))
 MODULE_ABI := $(shell cat $(MODULE_FFI_SRC) | sha256sum | cut -c1-64)
 
 modules: $(MODULE_KO)
 
-$(OUT)/modules/%.ko: $(RUST_SRC) src/rust/kmod/module.ver $(FLAVOR_STAMP)
+$(OUT)/modules/%.ko: $(RUST_SRC) src/crates/kmod/module.ver $(FLAVOR_STAMP)
 	@mkdir -p $(dir $@)
-	cd src/rust && NOS_MODULE_ABI=$(MODULE_ABI) cargo build --offline --release \
+	cd src/crates && NOS_MODULE_ABI=$(MODULE_ABI) cargo build --offline --release \
 	    --target $(RUST_TARGET) -p mod-$* --target-dir target/modules \
 	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
-	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/rust/target/modules/$(RUST_TARGET)/release/libmod_$*.a
+	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/crates/target/modules/$(RUST_TARGET)/release/libmod_$*.a
 	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); print a " " $$0 }' > $@.syms
 	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
 	@rm -f $@.elf $@.syms
@@ -453,7 +453,7 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/rust/kmod/module.ver $(FLAVOR_STAMP)
 HVBOOT = $(OUT)/hvboot
 HVBOOT_RUSTFLAGS = ["-Ccode-model=small","-Crelocation-model=static"]
 HVBOOT_LDFLAGS = -m elf_x86_64 -static -nostdlib --gc-sections --build-id=none -z noexecstack \
-    -z max-page-size=4096 -T src/rust/hvboot/hvboot.ld
+    -z max-page-size=4096 -T src/crates/hvboot/hvboot.ld
 
 ifeq ($(ARCH),x86_64)
 hvboot: $(HVBOOT)
@@ -461,12 +461,12 @@ else
 hvboot:
 endif
 
-$(HVBOOT): $(RUST_SRC) src/rust/hvboot/hvboot.ld $(FLAVOR_STAMP)
+$(HVBOOT): $(RUST_SRC) src/crates/hvboot/hvboot.ld $(FLAVOR_STAMP)
 	@mkdir -p $(dir $@)
-	cd src/rust && cargo build --offline --release --target $(RUST_TARGET) -p hvboot --target-dir target/hvboot \
+	cd src/crates && cargo build --offline --release --target $(RUST_TARGET) -p hvboot --target-dir target/hvboot \
 	    --config 'target.$(RUST_TARGET).rustflags=$(HVBOOT_RUSTFLAGS)' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
-	ld.lld $(HVBOOT_LDFLAGS) -o $@ src/rust/target/hvboot/$(RUST_TARGET)/release/libhvboot.a
+	ld.lld $(HVBOOT_LDFLAGS) -o $@ src/crates/target/hvboot/$(RUST_TARGET)/release/libhvboot.a
 
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
 $(OUT)/kernel/module.o: $(MODULE_FFI_SRC)
@@ -485,7 +485,7 @@ $(OUT)/module_exports.S: $(OUT)/pass1.elf $(MODULE_FFI_SRC) build/module-exports
 $(OUT)/module_exports.o: $(OUT)/module_exports.S
 	$(CC) --target=$(TARGET) -c $< -o $@
 
-# The boot self-test (TestModules in kernel/test.cpp) loads modtest.ko out of
+# The boot self-test (test_modules in kernel/test.cpp) loads modtest.ko out of
 # the kernel's own image, which this puts it in.
 $(OUT)/modtest_blob.S: $(OUT)/modules/modtest.ko
 	@printf '/* generated by the Makefile; do not edit */\n    .section .rodata.nos_modtest_ko, "a"\n    .balign 16\n    .globl nos_modtest_ko\nnos_modtest_ko:\n    .incbin "%s"\nnos_modtest_ko_end:\n    .balign 8\n    .globl nos_modtest_ko_size\nnos_modtest_ko_size:\n    .quad nos_modtest_ko_end - nos_modtest_ko\n' '$(CURDIR)/$<' > $@
@@ -560,16 +560,16 @@ $(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_export
 # The symbol table stack traces name frames by (kernel/symtab.cpp): every
 # function of an ELF's text, in address order. $(call symtab,elf,cpp)
 define symtab
-@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $(2)
+@printf '#include "kernel/symtab.h"\nnamespace kernel {\nconst SymEntry SymbolTable::SYMBOLS[] = {\n' > $(2)
 @$(NM) -Cn $(1) | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $(2)
-@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $(2)
+@printf '};\nconst size_t SymbolTable::SYMBOL_COUNT = sizeof(SYMBOLS)/sizeof(SYMBOLS[0]);\n}\n' >> $(2)
 endef
 
 $(OUT)/symtab_data.cpp: $(OUT)/pass2.elf
 	@echo "Generating symbol table..."
 	$(call symtab,$<,$@)
 
-$(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/cpp/kernel/symtab.h
+$(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/base/kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP)
@@ -582,4 +582,4 @@ $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)
 
 clean:
 	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso nos-*.squashfs
-	cd src/rust && cargo clean 2>/dev/null || true
+	cd src/crates && cargo clean 2>/dev/null || true
