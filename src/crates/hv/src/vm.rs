@@ -142,6 +142,24 @@ impl Backend {
     pub fn fp_loads(&self) -> u64 {
         match self { Backend::Svm(v) => v.fp_loads(), Backend::Vmx(v) => v.fp_loads() }
     }
+    /// The guest's MSRs that its save area does not hold, which its entries
+    /// make the CPU's, and the IBPBs it asked for (`hvarch::x86::msrs`).
+    pub fn own_msrs(&self) -> crate::policy::Own {
+        let m = match self { Backend::Svm(v) => v.msrs(), Backend::Vmx(v) => v.msrs() };
+        crate::policy::Own { tsc_aux: m.tsc_aux(), spec_ctrl: m.spec_ctrl(), ibpbs: m.ibpbs() }
+    }
+    /// Make `own` the guest's, for a WRMSR the policy performed -- an IBPB
+    /// asked for where its count is one more: false, and nothing changed,
+    /// for a value the CPU's MSR cannot hold, or a count moved otherwise --
+    /// which the policy never makes, and an entry would fault on.
+    pub fn set_own_msrs(&mut self, own: &crate::policy::Own) -> bool {
+        let m = match self { Backend::Svm(v) => v.msrs_mut(), Backend::Vmx(v) => v.msrs_mut() };
+        let ibpb = own.ibpbs != m.ibpbs();
+        if ibpb && own.ibpbs != m.ibpbs().wrapping_add(1) {
+            return false;
+        }
+        m.set(own.tsc_aux, own.spec_ctrl, ibpb)
+    }
     /// Answer the guest's `mov` to or from CR8 ([`Exit::Cr8`]) from the
     /// shadow task-priority register and step past it. AMD-V keeps that
     /// shadow itself (`V_TPR`, under `V_INTR_MASKING`) and never exits for

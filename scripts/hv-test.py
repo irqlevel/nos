@@ -87,6 +87,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -242,18 +243,33 @@ GUESTS = {
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
     # The host performs every access, 11 of them, or on QEMU's TCG -- which
-    # stops no read of CR4 -- the 5 writes; and refuses PKE, PAE cleared and
+    # stops no read of CR4 -- the 5 writes; and refuses a bit its CPUID does
+    # not offer -- PKE where it has no PKU, CET where it has -- PAE cleared and
     # bit 32. A CPU may refuse the last two itself, before its intercept, as
     # the AX41's Zen 2 does under KVM: then 9 and 1, and the guest says so.
-    "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
+    "cr4": [r"while the CPU's CR4 kept MCE; (?:PKE|CET), PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:(?:11|5) of CR4 performed, 3 refused|9 of CR4 performed, 1 refused\b.*\n(?:.*\n)*.*"
             r"2 of them the CPU's own, before its intercept)"],
     # Every MSR comes to the policy on both backends, so this one says the
     # same under either.
-    "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
-            r"CPUID offers no speculation control and no PMU, and says a hypervisor is there",
+    "msr": [r"VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
+            r"CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, and says a hypervisor is there",
             r"\b5 rdmsr, 3 wrmsr, 4 refused"],
+    # Two VMs, one after the other on the CPU the guests run on: offered
+    # exactly the speculation controls the host switches -- none under
+    # QEMU's TCG, which has none, every access a #GP -- and where it has
+    # them, SPEC_CTRL its own: the second reads 0 where the first left its
+    # own, each runs under its bits over the host's and the CPU's is the
+    # host's alone after; three IBPBs asked each, all answered before the
+    # next entry. Which the CPU has is `hv info`'s to say, and checked
+    # against it below (`check_controls`).
+    "spec": [r"(?:no speculation control offered, as the CPU has none: every access to SPEC_CTRL and PRED_CMD a #GP"
+             r"|SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+ offered, as the host switches them; vm B read "
+             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own and ran under it over the "
+             r"host's, bit 62 refused, the CPU's the host's alone after; [03] IBPBs asked each, all answered before "
+             r"the next entry; PRED_CMD's read and bit 1 a #GP)",
+             r"\b4 and 4 rdmsr, 6 and 6 wrmsr"],
     # Two VMs, one after the other on the CPU the guests run on: the second
     # must read 0 where the first left its own, and each one's breakpoint,
     # on an instruction of its own, fire -- DR0-DR3 made its own before each
@@ -275,6 +291,23 @@ GUESTS = {
             r"YMM0-15 0 at each CPU's start, and its YMM registers, MXCSR and control word its own at all 64 of "
             r"its turns",
             r"cpu 0: \d+ \(\d XSETBV, [56] refused;.*cpu 1: \d+ \(\d XSETBV, [56] refused;"],
+    # Two VMs, one after the other on the CPU the guests run on: the second
+    # must read TSC_AUX as 0 where the first left its own -- each one's put
+    # into the CPU before its entries (`hvarch::x86::msrs`) -- by RDTSCP,
+    # RDPID and RDMSR, each where its CPUID offers it and a #UD where not.
+    # Which are offered is `hv info`'s to say, and checked against it below
+    # (`check_offers`); INVPCID is on neither QEMU's TCG nor a Zen 2.
+    # Two CPUs taking turns on the CPU the guests run on, by IPI, as avx's
+    # do: where PKU is offered -- as `hv info` says, checked below
+    # (`check_pkru`) -- each has to find PKRU 0 as it starts and its own at
+    # every turn, whatever its XCR0 says of PKRU; RDPKRU a #UD before PKE.
+    "pkru": [r"(?:PKU offered, OSPKE with CR4.PKE, XCR0 0x203 and 1, PKRU's component of 8 bytes at \d+; PKRU 0 "
+             r"at each CPU's start, and its own at all 64 of its turns, put back \d+ and \d+ times"
+             r"|no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all 64 turns each taken)"],
+    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said; vm B read TSC_AUX as 0 where "
+               r"vm A had left its own, each read back the value it wrote -- bit 32 refused -- and INVPCID "
+               r"(?:ran types 0 to 3, 4 a #GP|was a #UD)",
+               r"\b3 and 3 rdmsr, 2 and 2 wrmsr, 1 and 1 refused"],
 }
 
 # Five of the guests test a mechanism each vendor has its own way: AMD-V's
@@ -296,7 +329,7 @@ GUESTS_VMX = {
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
     "cr4": [r"it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- while the CPU's CR4 "
             r"kept MCE",
-            r"PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+            r"(?:PKE|CET) and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
             r"\b3 of CR4 performed, 2 refused"],
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
@@ -535,7 +568,7 @@ def x86(args):
     convert_images(tmp, staged)
     www, grown, raw = create_images(tmp, staged)
     server, port = web_server(www)
-    script = SCRIPT + create_script(port) + ["rmmod hv"]
+    script = SCRIPT + create_script(port) + ["rmmod hv", RC_LAST]
     image, digest = rootfs(tmp, "x86_64", script)
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
@@ -564,9 +597,9 @@ def x86(args):
         if not pt.check("the boot script runs to the end",
                         pt.wait_log(log, "> " + script[-1], 200)):
             return
-        # The last command's own output lands after the marker above -- which
-        # is the first `rmmod hv`'s too: the end of the script is waited for.
-        pt.wait_log(log, "rc: /etc/rc done", 600)
+        # The last command's own output lands after the marker above: the
+        # end of the script is waited for by it (`RC_DONE`).
+        wait_done(log, 600)
         x86_checks(blocks(log), script, digest, grown, raw)
     finally:
         server.shutdown()
@@ -575,6 +608,25 @@ def x86(args):
             print("log at " + log)
         else:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# The last line of the x86-64 script, and how the console shows it has run:
+# its echo and the line it prints. Once the shell has the console, the
+# kernel's own "rc: /etc/rc done" goes to dmesg and not to the console --
+# waited for, every run idled ten minutes at the end -- so the end is marked
+# with a command's output instead, as hv-linux-test's is.
+RC_LAST = "version"
+RC_DONE = re.compile(r"(?m)^> version\n.+\n")
+
+
+def wait_done(log, timeout):
+    """Wait for the script's last command to have printed (`RC_DONE`)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if RC_DONE.search(open(log, errors="replace").read()):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def guest_report(text, name):
@@ -625,12 +677,50 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         if name in ("smp", "posted"):
             # Its first CPU there, its second on another CPU of its own.
             good = good and re.search(r"ran on\s+cpu %d and (?!%d,)\d+," % (cpu, cpu), report) is not None
-        elif name == "avx":
+        elif name in ("avx", "pkru"):
             # Both its CPUs there.
             good = good and re.search(r"ran on\s+cpu %d and cpu %d," % (cpu, cpu), report) is not None
         elif name != "refused":
             good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
+
+
+def check_offers(info, text, cpu):
+    """The tscaux guest was offered RDTSCP, RDPID and INVPCID as `hv info`
+    says they run in a guest -- which its own check holds the instructions
+    to."""
+    said = [m.group(1) if m else None for m in
+            (re.search(r"%s in a guest\s+(yes|no)" % name, info) for name in ("RDTSCP", "RDPID", "INVPCID"))]
+    report = guest_report(text, "tscaux")
+    m = re.search(r"RDTSCP (yes|no), RDPID (yes|no), INVPCID (yes|no), as its CPUID said", report)
+    pt.check("  tscaux on cpu %d offered RDTSCP, RDPID and INVPCID as hv info says they run (%s)"
+             % (cpu, ", ".join(str(s) for s in said)),
+             m is not None and list(m.groups()) == said, report or text)
+
+
+def check_pkru(info, text, cpu):
+    """The pkru guest was offered PKU exactly where `hv info` says a guest's
+    PKRU is switched."""
+    pku = re.search(r"PKU in a guest\s+yes", info) is not None
+    report = guest_report(text, "pkru")
+    offered = "PKU offered, OSPKE" in report
+    pt.check("  pkru on cpu %d offered PKU %s, as hv info says" % (cpu, "yes" if pku else "no"),
+             offered == pku and ("no PKU offered" in report) != pku, report or text)
+
+
+def check_controls(info, text, cpu):
+    """The spec guest was offered speculation controls exactly where `hv
+    info` says a guest has them of its own -- on a CPU that has them, which
+    QEMU's TCG does not -- and asked for its IBPBs where it has IBPB."""
+    spec_ctrl = re.search(r"SPEC_CTRL in a guest\s+yes", info) is not None
+    ibpb = re.search(r"IBPB in a guest\s+yes", info) is not None
+    report = guest_report(text, "spec")
+    m = re.search(r"SPEC_CTRL (0x[0-9a-f]+) and PRED_CMD (0x[0-9a-f]+) offered", report)
+    offered = (m is not None and int(m.group(1), 16) != 0, m is not None and int(m.group(2), 16) != 0)
+    asked = re.search(r"\b([03]) IBPBs asked each", report)
+    good = offered == (spec_ctrl, ibpb) and (asked is None or (asked.group(1) == "3") == ibpb)
+    pt.check("  spec on cpu %d offered SPEC_CTRL %s and IBPB %s, as hv info says a guest has them"
+             % (cpu, "yes" if spec_ctrl else "no", "yes" if ibpb else "no"), good, report or text)
 
 
 def x86_checks(ran, script, digest, grown, raw):
@@ -649,6 +739,8 @@ def x86_checks(ran, script, digest, grown, raw):
              re.search(r"(nested paging|extended page tables)\s+yes", info) is not None, info)
     pt.check("and AVX for a guest, its YMM registers and XCR0 switched with it",
              re.search(r"AVX in a guest\s+yes", info) is not None, info)
+    pt.check("and RDTSCP, its TSC_AUX switched with it -- every CPU this runs on has it",
+             re.search(r"RDTSCP in a guest\s+yes", info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
@@ -676,6 +768,12 @@ def x86_checks(ran, script, digest, grown, raw):
     print("APIC virtualization: %s, posted interrupts: %s" % ("yes" if apicv else "no", "yes" if posted else "no"))
     check_all_guests(out[12], 0, backend, apicv, posted)
     check_all_guests(out[13], CPUS - 1, backend, apicv, posted)
+    check_offers(info, out[12], 0)
+    check_offers(info, out[13], CPUS - 1)
+    check_controls(info, out[12], 0)
+    check_controls(info, out[13], CPUS - 1)
+    check_pkru(info, out[12], 0)
+    check_pkru(info, out[13], CPUS - 1)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
@@ -695,8 +793,8 @@ def x86_checks(ran, script, digest, grown, raw):
                                 or m.group(4) is not None and int(m.group(4)) >= switches), out[14])
     # Read back from every CPU's register, where `hv on` set one: what it
     # set is still there after the guests.
-    pt.check("and every CPU's IA32_SPEC_CTRL still has what hv on set there",
-             "IA32_SPEC_CTRL" not in out[14], out[14])
+    pt.check("and every CPU's IA32_SPEC_CTRL is what the host runs with there: what hv on set kept, no guest's "
+             "bits left over it", "IA32_SPEC_CTRL on cpu" not in out[14], out[14])
 
     pt.check("a second insmod is refused", "loaded at" not in out[15], out[15])
     pt.check("a CPU that does not exist is refused", "is not a CPU" in out[16], out[16])
@@ -749,7 +847,8 @@ def x86_checks(ran, script, digest, grown, raw):
     pt.check("hv loads for hv convert", "hv loaded at" in out[36], out[36])
     convert_checks(out[37:37 + len(CONVERT)], digest)
     at = 37 + len(CONVERT)
-    created = len(script) - 1 - at
+    # Of what is left: the creates, then `rmmod hv` and `RC_LAST`.
+    created = len(script) - 2 - at
     create_checks(out[at:at + created], grown, raw)
     pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
 

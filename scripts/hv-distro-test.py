@@ -541,6 +541,15 @@ def cloud(args, d):
     # OSXSAVE, what a distribution built for it needs -- AVX's state
     # switched for the guest (`hvarch::x86::fp`) and offered by its CPUID.
     hwcaps_line = x("/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v")
+    # What its kernel makes of the instructions and the speculation
+    # controls it is shown: RDTSCP, RDPID and INVPCID where they run in a
+    # guest, PKU where its PKRU is switched, IBRS, IBPB, STIBP and SSBD where
+    # its SPEC_CTRL and PRED_CMD are its own -- and so what it says of
+    # Spectre v2 and the store bypass.
+    flags_line = x("grep -o -w -e rdtscp -e rdpid -e invpcid -e pku -e ospke -e ibpb -e ibrs -e ibrs_enhanced "
+                   "-e stibp -e ssbd /proc/cpuinfo | sort -u | xargs")
+    mitigations_line = x("cat /sys/devices/system/cpu/vulnerabilities/spectre_v2 "
+                         "/sys/devices/system/cpu/vulnerabilities/spec_store_bypass")
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % d.password, "hv wait 0 secs=120 " + d.prompt]
@@ -558,7 +567,9 @@ def cloud(args, d):
              x("systemctl --failed --no-legend --no-pager | wc -l"),
              x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
              x("date -u +%s"),
-             hwcaps_line]
+             hwcaps_line,
+             flags_line,
+             mitigations_line]
           + clock_lines(0, x)
           + [marker_line]
           # networkd, given its .network as a credential, asks the switch's
@@ -630,6 +641,12 @@ def cloud(args, d):
                  out(rc[base + 4]))
         pt.check("glibc finds the CPU x86-64-v3: AVX and AVX2, FMA, F16C, BMI and the rest of it",
                  re.search(r"x86-64-v3 \(supported, searched\)", out(hwcaps_line)) is not None, out(hwcaps_line))
+        flags = out(flags_line).strip()
+        print("  (its kernel's flags of them: %s)" % " / ".join(flags.splitlines())[:400])
+        print("  (and its Spectre v2 and store bypass: %s)"
+              % " / ".join(out(mitigations_line).strip().splitlines())[:600])
+        pt.check("its kernel takes RDTSCP, which runs in every guest here", re.search(r"\brdtscp\b", flags) is not None,
+                 flags)
         rate = clock_rate(out, clock_lines(0, x))
         pt.check("idle, its clock keeps the host's time (no tick lost)",
                  rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)

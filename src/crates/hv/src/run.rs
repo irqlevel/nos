@@ -2348,14 +2348,15 @@ impl LinuxGuest {
         }
 
         let v = gc.cpu.backend_mut();
+        let mut own = v.own_msrs();
         if write {
-            if crate::policy::wrmsr(v.save_mut(), msr, value) {
+            if crate::policy::wrmsr(v.save_mut(), &mut own, msr, value) && v.set_own_msrs(&own) {
                 v.skip_msr();
             } else {
                 self.msr_fault(gc, msr, value, true);
             }
         } else {
-            match crate::policy::rdmsr(v.save(), msr) {
+            match crate::policy::rdmsr(v.save(), &own, msr) {
                 Some(value) => {
                     let (save, regs) = v.save_and_regs_mut();
                     set_msr_read(save, regs, value);

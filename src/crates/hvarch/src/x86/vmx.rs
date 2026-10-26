@@ -36,10 +36,12 @@ pub const CR4_VMXE: u64 = 1 << 13;
 pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 pub const SEC_EPT: u32 = 1 << 1;
+pub const SEC_ENABLE_RDTSCP: u32 = 1 << 3;
 pub const SEC_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 pub const SEC_VPID: u32 = 1 << 5;
 pub const SEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
 pub const SEC_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
+pub const SEC_ENABLE_INVPCID: u32 = 1 << 12;
 
 /// The primary control the two above are built on: CR8 and the virtual
 /// APIC's task priority in a page of the guest's own.
@@ -373,9 +375,11 @@ pub unsafe fn enable(vmxon_phys: u64) -> Result<()> {
         return Err(Error::EnableFailed);
     }
     /* The host's x87, SSE and AVX control bits as every entry wants them,
-     * once, and IA32_XSS 0 (`super::fp`); and
-     * what keeps a guest's speculation off the host's (`super::spec`). */
+     * once, and IA32_XSS 0 (`super::fp`); what the CPU holds in TSC_AUX,
+     * for the entries to load over (`super::msrs`); and what keeps a
+     * guest's speculation off the host's (`super::spec`). */
     unsafe { super::fp::on() };
+    unsafe { super::msrs::on() };
     unsafe { super::spec::on(true) };
     Ok(())
 }
@@ -397,6 +401,7 @@ pub unsafe fn disable() -> bool {
         return false;
     }
     unsafe { super::spec::off() };
+    unsafe { super::msrs::off() };
     unsafe { super::fp::off() };
     unsafe { asm!("vmxoff", options(nostack)) };
     /* Out of VMX operation, nothing is current. */
@@ -422,6 +427,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use kcore::consts::MAX_CPUS;
 
 use super::fp::GuestFp;
+use super::msrs::GuestMsrs;
 use super::svm::{GuestRegs, Kick, NotRun, Profile, VECTOR_AC, VECTOR_DB, VECTOR_MC};
 use super::svm::vmcb::{Save, Segment};
 
@@ -840,6 +846,8 @@ pub struct Guest {
     regs: GuestRegs,
     /// Its x87, SSE and AVX registers and its XCR0 (`super::fp`).
     fp: GuestFp,
+    /// Its TSC_AUX (`super::msrs`).
+    msrs: GuestMsrs,
 
     /* Control values, decided once from the CPU's capabilities. */
     basic: u64,
@@ -1023,6 +1031,7 @@ impl Guest {
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
             fp,
+            msrs: GuestMsrs::new(),
             basic: caps.basic,
             pin: 0,
             proc1: 0,
@@ -1124,6 +1133,16 @@ impl Guest {
     /// that held another guest's.
     pub fn fp_loads(&self) -> u64 {
         self.fp.loads()
+    }
+
+    /// The guest's MSRs the extension does not switch (`super::msrs`): its
+    /// TSC_AUX and IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &GuestMsrs {
+        &self.msrs
+    }
+
+    pub fn msrs_mut(&mut self) -> &mut GuestMsrs {
+        &mut self.msrs
     }
 
     /// The policy has written the whole shadow -- every control register,
@@ -1509,6 +1528,15 @@ impl Guest {
         if self.vpid != 0 {
             want2 |= PROC2_ENABLE_VPID;
         }
+        /* RDTSCP and RDPID, INVPCID: run in the guest where its CPUID offers
+         * them (`super::offers`), each a #UD otherwise. */
+        let offers = super::offers();
+        if offers.rdtscp || offers.rdpid {
+            want2 |= PROC2_ENABLE_RDTSCP;
+        }
+        if offers.invpcid {
+            want2 |= PROC2_ENABLE_INVPCID;
+        }
         self.proc2 = adjust(want2, MSR_VMX_PROCBASED_CTLS2);
         /* DR7 saved at the exit and loaded at the entry: the guest's own,
          * its breakpoints armed while it runs and none of them after. */
@@ -1530,8 +1558,10 @@ impl Guest {
 
         /* What a guest is run with is what it was promised: the host's
          * controls, and the guest's own -- a VPID handed out, a real-mode
-         * CPU -- where the flags above say it has them. */
-        let promised2 = want2 & (PROC2_UNRESTRICTED_GUEST | PROC2_ENABLE_VPID);
+         * CPU, the instructions its CPUID offers -- where the flags above
+         * say it has them. */
+        let promised2 =
+            want2 & (PROC2_UNRESTRICTED_GUEST | PROC2_ENABLE_VPID | PROC2_ENABLE_RDTSCP | PROC2_ENABLE_INVPCID);
         /* With a virtual APIC: the TPR shadow, and the two controls its
          * x2APIC mode turns on, which the CPU said it had (`Caps::apicv`) --
          * asked again here, of the CPU the guest runs on. */
@@ -2339,10 +2369,13 @@ impl Guest {
          * by its own DR7 once the entry loads it: the host's enables
          * none, nothing in this kernel writing it and every VM exit
          * leaving it with all four off (`svm::LoadedDebugAddrs`). And
-         * another guest than the last on this CPU: the predictors it
-         * trained are not to steer this one (`super::spec`). */
+         * another guest CPU than the last on this CPU, or this one after
+         * an IBPB it asked for: the predictors trained before are not to
+         * steer it (`super::spec`). */
         unsafe { entries.debug_addrs.load(&self.debug_addrs) };
-        entries.spec.entering(nested.id);
+        if entries.spec.entering(self.msrs.id(), self.msrs.ibpbs()) {
+            self.msrs.barrier();
+        }
         let speculation = entries.spec.vmx_entry();
         let t1 = stamp(timed);
         unsafe { self.write_guest_state() };
@@ -2415,6 +2448,9 @@ impl Guest {
          * with interrupts off since. CR2 is the guest's likewise -- VMX
          * keeps no guest CR2 -- so save the host's and restore it after. */
         unsafe { self.fp.load(cpu) };
+        /* TSC_AUX the guest's likewise, for its RDTSCP and RDPID
+         * (`super::msrs`). */
+        unsafe { self.msrs.load(cpu) };
         let host_cr2 = cpu::read_cr2();
         unsafe { cpu::write_cr2(self.save.cr2) };
 
@@ -2436,8 +2472,13 @@ impl Guest {
             | if speculation.verw() { RUN_VERW } else { 0 }
             | if spec_ctrl.is_some() { RUN_SPEC_CTRL } else { 0 };
         let t3 = stamp(timed);
+        /* Its IA32_SPEC_CTRL over the host's, put back after the exit --
+         * by the stub itself for legacy IBRS (`super::spec`). */
+        let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
+        self.msrs.ran(ran_with);
         speculation.flush_l1d();
         let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
+        entries.spec.exited(spec_ctrl.is_some());
         let t4 = stamp(timed);
 
         self.save.cr2 = cpu::read_cr2();
