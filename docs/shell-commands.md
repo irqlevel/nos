@@ -122,7 +122,7 @@ line logs out. A console line is at most 80 characters, an SSH one 255.
 
 The keyboards send what a terminal would -- an arrow as ESC [ A..D, Ctrl and
 a letter as its control byte -- so the console's editor
-(`src/cpp/kernel/line_editor.cpp`) reads a keyboard as it reads the serial
+(`src/base/kernel/line_editor.cpp`) reads a keyboard as it reads the serial
 port; the screen knows only text and Backspace, and a line is redrawn by
 erasing back to where it changed. `scripts/udpsh.py`, the UDP shell's
 client, edits on the host with readline -- the same keys -- and keeps its

@@ -21,7 +21,7 @@ Zero-copy here means that no CPU instruction reads or writes the payload. The de
 
 Every NIC driver in nos receives into 2 KiB frames from the kernel's frame pool and puts the packet at the frame's first byte. A pool frame sits inside one page, and its data is 8-byte aligned. Every header in front of netblk's payload is a whole number of 4-byte dwords.
 
-An NVMe command describes its memory with PRP entries (physical region pages), and the first one may start at any dword-aligned address. So a received payload is already a buffer the disk can DMA from. A fresh pool frame that the disk has read into, behind room for the headers, is already a packet ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/rust/modules/netblk/src/lib.rs)):
+An NVMe command describes its memory with PRP entries (physical region pages), and the first one may start at any dword-aligned address. So a received payload is already a buffer the disk can DMA from. A fresh pool frame that the disk has read into, behind room for the headers, is already a packet ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/crates/modules/netblk/src/lib.rs)):
 
 ```rust
 OP_READ => {

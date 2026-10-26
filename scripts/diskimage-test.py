@@ -2,8 +2,8 @@
 """Disk image converter test: what `hv convert` makes of a qcow2 image,
 decided on the host.
 
-`hv convert` (src/rust/modules/hv/src/image.rs) makes a cloud's qcow2 image
-the raw disk a guest is given, through src/rust/diskimage -- a download,
+`hv convert` (src/crates/modules/hv/src/image.rs) makes a cloud's qcow2 image
+the raw disk a guest is given, through src/crates/diskimage -- a download,
 read by code in the kernel. fuzz/diskimage compiles that crate, as it is,
 into a host program, and this holds it to QEMU's own reading:
 

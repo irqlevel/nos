@@ -3,7 +3,7 @@
 Space-separated `key=value` pairs. Set them on the GRUB command line on
 x86-64 (`build/grub.cfg`, the `multiboot2` line) or with QEMU `-append` on
 arm64 (`scripts/qemu-arm64.sh`). Parsing lives in
-`src/cpp/kernel/parameters.cpp`.
+`src/base/kernel/parameters.cpp`.
 
 Nothing on the command line stops the boot. An unknown key, a known key with
 a value it does not recognise, and a parameter that cannot be parsed at all
@@ -55,7 +55,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
-- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/rust/net/src/device.rs`)
+- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/net/src/device.rs`)
 
 ## Devices and filesystems
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""insn test: the hypervisor's MMIO decoder (src/rust/hv/src/insn.rs) and its
-guest page walker (src/rust/hv/src/walk.rs), checked on the host.
+"""insn test: the hypervisor's MMIO decoder (src/crates/hv/src/insn.rs) and its
+guest page walker (src/crates/hv/src/walk.rs), checked on the host.
 
 The decoder turns the bytes of a guest's instruction -- what the guest put
 in its own memory -- into the access the hypervisor performs for it: which

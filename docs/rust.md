@@ -3,7 +3,7 @@
 Everything that sits on the fundamentals is Rust: every driver, the virtio
 bus, the block layer, the network layer, the filesystems, the TLS client,
 the SSH protocol and every loadable module. It is a cargo workspace,
-`src/rust/`, that compiles to a `#![no_std]` `staticlib` (`libkernel.a`)
+`src/crates/`, that compiles to a `#![no_std]` `staticlib` (`libkernel.a`)
 linked into the kernel; the crates are listed one by one in
 [Project layout](project-layout.md), and modules have a page of their own,
 [Loadable modules](modules.md).
@@ -51,7 +51,7 @@ the net layer asks C++ what the command line said and replays the log. A
 `kernel_*` name defined in Rust that no module imports and no C++ calls has
 no reason to exist.
 
-On the C++ side there is no `src/cpp/{block,net,fs}` and no C++ view of any
+On the C++ side there is no `src/base/{block,net,fs}` and no C++ view of any
 of those layers. A C++ file that needs one declares the `rust_*` /
 `kernel_*` calls it makes where it makes them: the tracer and the panic path
 into netconsole and the disk log, the idle path into the receive poll, boot
@@ -88,10 +88,10 @@ and there is no C name for a module to bind. A module *uses* disks and NICs
 Three steps, and a module gets the service by the same three, because the
 module export table is generated from the `ffi` declarations:
 
-1. the C++ function in `src/cpp/kernel/rust_ffi.cpp`;
-2. its raw declaration in `src/rust/ffi/src/<module>.rs` (+ `pub mod` in
+1. the C++ function in `src/base/kernel/rust_ffi.cpp`;
+2. its raw declaration in `src/crates/ffi/src/<module>.rs` (+ `pub mod` in
    `ffi/src/lib.rs`);
-3. the safe wrapper in `src/rust/kcore/src/<module>.rs` (+ `pub mod` in
+3. the safe wrapper in `src/crates/kcore/src/<module>.rs` (+ `pub mod` in
    `kcore/src/lib.rs`).
 
 **`ffi/`** holds `extern "C"` declarations and `#[repr(C)]` structs and no
@@ -221,7 +221,7 @@ able to say why.
 | `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
 | `trace` | `trace!(level, "fmt {}", arg)`; level 0 is always visible |
 | `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()`, `cycle_counter()` |
-| `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/rust/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
+| `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/crates/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
 | `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (made on first use; racing makers get the same one) |
 | `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |

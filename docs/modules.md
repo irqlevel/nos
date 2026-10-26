@@ -23,7 +23,7 @@ against that API and refuses anything it does not recognise.
 
 ## Writing one
 
-A module lives in `src/rust/modules/<name>/`. `hello` is the smallest one
+A module lives in `src/crates/modules/<name>/`. `hello` is the smallest one
 worth reading:
 
 ```rust
@@ -85,9 +85,9 @@ shell](udp-shell.md); the handler gets the rest of the command line and an
 
 To add a module:
 
-1. `src/rust/modules/<name>/Cargo.toml`, a `staticlib` whose library is named
+1. `src/crates/modules/<name>/Cargo.toml`, a `staticlib` whose library is named
    `mod_<name>`, depending on `kmod` and `kcore` (copy `hello`'s);
-2. add `modules/<name>` to the workspace `members` in `src/rust/Cargo.toml`
+2. add `modules/<name>` to the workspace `members` in `src/crates/Cargo.toml`
    -- not to `default-members`, which is what the kernel's own build compiles;
 3. add `<name>` to `MODULES` in the `Makefile`.
 
@@ -144,7 +144,7 @@ make modules ARCH=aarch64    # out/aarch64/modules/<name>.ko
 
 `make` and `make nocheck` build them too. Each module is compiled on its own,
 with its own copy of `core`, `alloc`, `kcore` and `kmod`, into a target
-directory of its own (`src/rust/target/modules`), because it is compiled with
+directory of its own (`src/crates/target/modules`), because it is compiled with
 flags the kernel's Rust is not:
 
 - `-Crelocation-model=pic`, since nobody knows where it will be loaded;
@@ -306,7 +306,7 @@ that was not.
 
 ## blkload
 
-`blkload` (`src/rust/modules/blkload`) runs a short load test against a block
+`blkload` (`src/crates/modules/blkload`) runs a short load test against a block
 device -- a disk, or one of its partitions, by the name `disks` gives it --
 and reports IOPS, bandwidth and latency. Under QEMU, against its emulated
 NVMe disk:
@@ -374,7 +374,7 @@ release, or build both from one tree.
 
 ## netload
 
-`netload` (`src/rust/modules/netload`) is a UDP load test from either end of
+`netload` (`src/crates/modules/netload`) is a UDP load test from either end of
 the wire, so that [`profile`](profiler.md) has something to look at other
 than an idle machine: an idle twenty-CPU box spends about 0.06% of a core on
 anything at all, and the paths worth seeing -- the frame pool, the driver
@@ -467,7 +467,7 @@ are the `netwire` crate's, which the network layer is built on too.
 
 ## netblk
 
-`netblk` (`src/rust/modules/netblk`) serves an NVMe disk, or a partition of
+`netblk` (`src/crates/modules/netblk`) serves an NVMe disk, or a partition of
 one, over UDP, zero-copy both ways: `netblk start nvme0 7000`, then
 `scripts/netblk.py <host> 7000 ...` from anywhere else. Its own page is
 [netblk](netblk.md). It takes its requests through the same listener netload
@@ -479,9 +479,9 @@ an interrupt handler still on its way out of the module's code.
 
 ## sshd
 
-`sshd` (`src/rust/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
+`sshd` (`src/crates/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
 start`, and an OpenSSH client logs in to the kernel's shell. The protocol is a
-crate of its own, `src/rust/ssh`, which knows nothing of the kernel; the
+crate of its own, `src/crates/ssh`, which knows nothing of the kernel; the
 module is the kernel's side -- a listener task, a task for each connection,
 the files it keeps under `/etc/ssh`. Its page is [sshd](sshd.md). Nothing loads
 a module at boot by itself, so a machine that is to be reached only through
@@ -497,12 +497,12 @@ kernel but the exported functions.
 
 ## edit
 
-`edit` (`src/rust/modules/edit`) is a text editor, for a person at an SSH
+`edit` (`src/crates/modules/edit`) is a text editor, for a person at an SSH
 session with a terminal: `edit /etc/rc`, from the shell `ssh <host>` gives,
 or `ssh -t <host> edit /etc/rc`. The image's `/etc/rc` loads it after sshd;
 on a machine whose `/etc/rc` came before that, `insmod /lib/modules/edit.ko`
 does, and a line saying so in `/etc/rc` keeps it -- an edit, now, of `/etc/rc`
-itself. The editor is a crate with no kernel in it, `src/rust/edit`, which
+itself. The editor is a crate with no kernel in it, `src/crates/edit`, which
 `scripts/edit-test.py` runs on the host; the module is its seat in the
 kernel: the command, the file read and written, and the session's terminal
 -- the keys typed (`Output::read_input`) and its size, which the session
@@ -550,7 +550,7 @@ so, rather than panic the kernel.
 
 ## hv
 
-`hv` (`src/rust/modules/hv`) is the [hypervisor](hypervisor.md), the
+`hv` (`src/crates/modules/hv`) is the [hypervisor](hypervisor.md), the
 beginning of [stage 3](../plans/03-hypervisor.md). It is two crates --
 `hvarch`, the CPU's virtualization extension and all of the hypervisor's
 `unsafe`, and `hv`, everything above it, which has three sites -- plus this
@@ -589,7 +589,7 @@ is sound because `run_on` does not return until the handler has run.
 
 ## heapbench
 
-`heapbench` (`src/rust/modules/heapbench`) times the kernel heap as Rust code
+`heapbench` (`src/crates/modules/heapbench`) times the kernel heap as Rust code
 reaches it -- `Box`, `Vec`, `String` go through the global allocator to
 `kernel_alloc`, and so does everything it allocates. Each workload runs on
 one CPU and then on N at once, a task bound to each CPU, and reports the
@@ -652,7 +652,7 @@ could not name.
 ## Testing
 
 The boot self-test loads a module on both architectures. `modtest`
-(`src/rust/modules/modtest`) is built with the kernel and embedded in its
+(`src/crates/modules/modtest`) is built with the kernel and embedded in its
 image (`out/<arch>/modtest_blob.S`); `test_modules` in `kernel/test.cpp` loads
 it, and its init checks what a loader can get wrong -- initialised data,
 `.bss` (a megabyte of it, past the 512 KiB images were once held to), a
@@ -669,7 +669,7 @@ than 255 bytes by the loader; and last feeds the loader damaged copies -- trunca
 machine's, an import the kernel lacks, no header, a bad magic, another kernel
 interface -- each of which it must refuse.
 
-`slowexit` (`src/rust/modules/slowexit`) is never loaded by the kernel itself:
+`slowexit` (`src/crates/modules/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
 shell's wait by hand or from a script.
 

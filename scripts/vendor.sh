@@ -1,15 +1,15 @@
 #!/bin/bash
-# Refresh src/rust/vendor, the checked-in copy of every Rust dependency, so
+# Refresh src/crates/vendor, the checked-in copy of every Rust dependency, so
 # that a build never reaches crates.io (the Makefile passes --offline).
 #
-# Run this after adding, removing or bumping a dependency in src/rust, and
+# Run this after adding, removing or bumping a dependency in src/crates, and
 # commit the result together with Cargo.toml/Cargo.lock. It needs network
 # access itself, once.
 #
 # It belongs to one nightly. -Z build-std resolves the compiler's own library
 # workspace alongside ours (--sync below), so what lands here depends on the
 # toolchain that ran the script -- and std's dependencies move between
-# nightlies. src/rust/rust-toolchain.toml therefore pins a dated channel, and
+# nightlies. src/crates/rust-toolchain.toml therefore pins a dated channel, and
 # bumping that pin and re-running this script are one commit, not two.
 #
 #   scripts/vendor.sh
@@ -28,13 +28,13 @@
 # fails loudly (an empty crate root), and the fix is to run this script again.
 set -eu
 
-cd "$(dirname "$0")/../src/rust"
+cd "$(dirname "$0")/../src/crates"
 
 # --sync the standard library's own workspace as well: -Z build-std resolves
 # it alongside ours (see .cargo/config.toml), and it has crates.io
 # dependencies of its own -- resolution fails without them even though
 # core and alloc never build one.
-STD_MANIFEST="$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml"
+STD_MANIFEST="$(rustc --print sysroot)/lib/rustlib/src/crates/library/Cargo.toml"
 [ -f "$STD_MANIFEST" ] || { echo "vendor: no rust-src component ($STD_MANIFEST)" >&2; exit 1; }
 
 echo "vendor: for $(rustc --version)"
@@ -91,4 +91,4 @@ print(f"vendor: {len(keep)} packages kept whole, {stripped} emptied")
 PY
 
 du -sh vendor
-echo "vendor: done -- commit src/rust/vendor along with Cargo.lock"
+echo "vendor: done -- commit src/crates/vendor along with Cargo.lock"

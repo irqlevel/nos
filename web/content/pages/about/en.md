@@ -25,7 +25,7 @@ Safety here is not something tested for afterwards. Every design and every line 
 
 ## How it is built
 
-The source tree has two halves with a hard line between them. **C++ covers the fundamentals**: booting and bringing up each architecture, the HAL (hardware abstraction layer), page tables and allocators, the scheduler, locks, interrupt dispatch, timers, the core of the shell, the module loader, and the few drivers that everything else stands on (serial, consoles, timers, the 8042, PCI, MSI-X, ACPI). **Everything built on top of them is Rust**: the drivers for disks, network cards, USB and virtio, the block layer, the network stack, the filesystems, TLS, SSH, the random pool and the hypervisor. There is no `src/cpp/net`, `src/cpp/fs` or `src/cpp/block` any more. Those layers moved to Rust on 18 September 2026 ([how](/blog/cpp-to-rust-layers)).
+The source tree has two halves with a hard line between them. **C++ covers the fundamentals**: booting and bringing up each architecture, the HAL (hardware abstraction layer), page tables and allocators, the scheduler, locks, interrupt dispatch, timers, the core of the shell, the module loader, and the few drivers that everything else stands on (serial, consoles, timers, the 8042, PCI, MSI-X, ACPI). **Everything built on top of them is Rust**: the drivers for disks, network cards, USB and virtio, the block layer, the network stack, the filesystems, TLS, SSH, the random pool and the hypervisor. There is no `src/base/net`, `src/base/fs` or `src/base/block` any more. Those layers moved to Rust on 18 September 2026 ([how](/blog/cpp-to-rust-layers)).
 
 ```text
 modules/*     sshd, netblk, netload, blkload, hv ...   loadable .ko, Rust only

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate src/cpp/drivers/font8x16.cpp -- the 8x16 bitmap font used by the
+"""Generate src/base/drivers/font8x16.cpp -- the 8x16 bitmap font used by the
 framebuffer console (drivers/fb_console.cpp).
 
 The glyphs are rasterized from DejaVu Sans Mono (Bitstream Vera derived,
@@ -13,7 +13,7 @@ cropped.
 The generated file is checked in, so the build needs neither python nor the
 font. Re-run only to regenerate it:
 
-    python3 scripts/gen-font8x16.py > src/cpp/drivers/font8x16.cpp
+    python3 scripts/gen-font8x16.py > src/base/drivers/font8x16.cpp
 """
 
 import sys

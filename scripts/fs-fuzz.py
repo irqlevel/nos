@@ -48,7 +48,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, 'out', 'fs-fuzz')
-VENDOR = os.path.join(ROOT, 'src', 'rust', 'vendor')
+VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
 # The gate's seed. How many inputs of each target it runs is the target's
 # own (targets/mod.rs).
@@ -58,7 +58,7 @@ GATE_SEED = '1'
 def main():
     args = sys.argv[1:]
     # The kernel's vendored crates, as the kernel's own build takes them: the
-    # fuzzer's manifest is outside src/rust, whose .cargo/config.toml says so
+    # fuzzer's manifest is outside src/crates, whose .cargo/config.toml says so
     # for the kernel -- and makes any build under it a kernel build -- so it
     # is said here, and cargo is run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',

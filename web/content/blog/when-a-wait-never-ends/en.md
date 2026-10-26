@@ -11,7 +11,7 @@ One wait was still silent, though, and it was the one that every stop makes. Unt
 
 ## The join behind every stop
 
-A join is one task waiting for another to finish. In nos that is `Task::Wait`, and every stop path in the kernel goes through it. A Rust `TaskHandle` waits for its task when it is dropped ([task.rs](https://github.com/irqlevel/nos/blob/master/src/rust/kcore/src/task.rs)). `hv stop` waits for the guest's task in `finish()`. A guest's disk, `FileDisk`, waits for its own disk task when it goes away. `rmmod` and the host's shutdown end in joins too.
+A join is one task waiting for another to finish. In nos that is `Task::Wait`, and every stop path in the kernel goes through it. A Rust `TaskHandle` waits for its task when it is dropped ([task.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/task.rs)). `hv stop` waits for the guest's task in `finish()`. A guest's disk, `FileDisk`, waits for its own disk task when it goes away. `rmmod` and the host's shutdown end in joins too.
 
 Here is the whole of the old join:
 
@@ -66,7 +66,7 @@ The first line says who waits (the shell, pid 12), for which task (`hv/vm3/vda`,
 
 ## Finding a task: Task::Locate
 
-The hard part of the report is where the task is. It can be in one of three places, and `Task::Locate` handles each differently ([task.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/task.cpp)).
+The hard part of the report is where the task is. It can be in one of three places, and `Task::Locate` handles each differently ([task.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/task.cpp)).
 
 **Off its CPU.** A task that is blocked, asleep, or runnable and waiting for its turn runs nowhere. Its last context switch saved its registers on its own stack, including the frame pointer, which starts the chain linking each stack frame to its caller's. Locate reads the saved one and walks the chain, staying inside the bounds of the task's stack.
 

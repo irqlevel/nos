@@ -2679,7 +2679,7 @@ class made from its input, the start info to what the guest was given --
 its magic, its one module, a memory map of RAM up to the guest's last byte
 in order -- and the entry to paging off. hv's unsafe count is still 4.
 
-**hvboot** (`src/rust/hvboot`, built by `make` and kept as `/lib/hvboot`
+**hvboot** (`src/crates/hvboot`, built by `make` and kept as `/lib/hvboot`
 in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
 the guest. It reads:
 

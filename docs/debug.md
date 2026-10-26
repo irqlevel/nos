@@ -68,5 +68,5 @@ The boot sequence itself, and what each marker means, is in
 The self-tests every boot runs, the smoke boots, and the gate each subsystem
 has for what a smoke boot cannot notice are in [Tests and gates](testing.md).
 The two lines worth knowing by heart: to run a single self-test, edit
-`Test()` in `src/cpp/kernel/test.cpp` to call only that function; and gate
+`Test()` in `src/base/kernel/test.cpp` to call only that function; and gate
 on a script's exit code, never on grepping its output.

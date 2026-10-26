@@ -13,10 +13,10 @@ edition = "2021"
 
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/rust/ffi" }
-kcore = { path = "../../src/rust/kcore" }
-block = { path = "../../src/rust/block" }
-fs = { path = "../../src/rust/fs" }
+ffi = { path = "../../src/crates/ffi" }
+kcore = { path = "../../src/crates/kcore" }
+block = { path = "../../src/crates/block" }
+fs = { path = "../../src/crates/fs" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.

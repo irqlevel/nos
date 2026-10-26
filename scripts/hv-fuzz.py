@@ -6,10 +6,10 @@ port it writes, every MSR, every byte of its virtio rings and MSI-X tables,
 the instruction behind an MMIO fault -- and so a panic, an overflow or a
 loop that never ends in any of them is one a guest can cause, on the host,
 under everyone else's guests. fuzz/hv is a host program built from
-the hypervisor's own sources (src/rust/hv/src/{devices/*,lapic,acpi,insn,
+the hypervisor's own sources (src/crates/hv/src/{devices/*,lapic,acpi,insn,
 walk,linux,mmio,policy,smp,run}.rs, hvarch's VMCB layout, the module's
-switch and DHCP server, src/rust/modules/hv/src/{net,dhcp}.rs, and NAT,
-src/rust/net/src/nat.rs) over stand-ins for the kernel, its network layer
+switch and DHCP server, src/crates/modules/hv/src/{net,dhcp}.rs, and NAT,
+src/crates/net/src/nat.rs) over stand-ins for the kernel, its network layer
 and the CPU, with overflow checks on as a RUSTUB=1 kernel has them. Each
 target turns random bytes into what a guest does to one device, or to the
 guests' network -- or, for `platform`, to the whole machine: a Linux

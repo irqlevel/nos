@@ -1,7 +1,7 @@
 # Randomness
 
 Everything in the kernel that needs random bytes asks one pool, the `random`
-crate (`src/rust/random`): the TLS client for its handshake keys, TCP for its
+crate (`src/crates/random`): the TLS client for its handshake keys, TCP for its
 initial sequence numbers, DHCP and DNS for their ids, the SSH server for its
 keys, the shell's `random` command, anything later that needs a token or a
 nonce. It is one ChaCha20 generator, seeded from every entropy source the
@@ -60,8 +60,8 @@ what a generator is for — sources contribute, the generator answers.
 |---|---|---|
 | `rdseed` / `rdrand` | x86-64, `arch/x86_64/hal_random.cpp` | the CPU's own DRBG. RDSEED taps the conditioned output of the physical noise source and is what another generator wants to be keyed from; RDRAND is the AES-CTR DRBG downstream of it — faster, never dry, one more deterministic step from the noise |
 | `rndr` | arm64, `arch/arm64/hal_random.cpp` | FEAT_RNG, the same idea (RNDRRS reseeds before answering, RNDR does not). Optional from Armv8.5 and **not implemented by Apple's M-series**, so no arm64 machine nos runs on today has it |
-| `rng0`… | `src/rust/drivers/virtio_rng` | virtio-rng, i.e. the host's entropy. Present under QEMU, absent on bare metal — exactly the wrong way round from the CPU instruction, which is why both exist |
-| `jitter` | `src/rust/random/src/jitter.rs` | timing jitter, the fallback (below) |
+| `rng0`… | `src/crates/drivers/virtio_rng` | virtio-rng, i.e. the host's entropy. Present under QEMU, absent on bare metal — exactly the wrong way round from the CPU instruction, which is why both exist |
+| `jitter` | `src/crates/random/src/jitter.rs` | timing jitter, the fallback (below) |
 
 `hal/random.h` is the seam for the CPU instruction, so common code never asks
 which architecture it is on. `hal::probe_hw_random()` runs once on the BSP and is
@@ -70,7 +70,7 @@ FEAT_RNG is an undefined-instruction trap, and CPUID has to be checked before
 RDRAND for the same reason. It also honours `hwrng=off`.
 
 The probe answering "yes" is not enough. `cpu::self_test()`
-(`src/rust/random/src/cpu.rs`) draws eight values and refuses the instruction unless at least half of them arrive
+(`src/crates/random/src/cpu.rs`) draws eight values and refuses the instruction unless at least half of them arrive
 and at least two differ — which is what a broken RDRAND looks like (some AMD
 parts answer `0xFFFF'FFFF'FFFF'FFFF` forever after a resume) and what a
 hypervisor that stubs the instruction out looks like too. In both cases the
@@ -105,7 +105,7 @@ it, the counter is too coarse to see this much work, or is not running.
 ## The generator
 
 Both halves are Linux's construction, in miniature. ChaCha20's block function
-(`src/rust/random/src/chacha20.rs`, RFC 8439, checked at boot against the
+(`src/crates/random/src/chacha20.rs`, RFC 8439, checked at boot against the
 RFC's own test vector by `random::selftest`) is the only primitive.
 
 ```

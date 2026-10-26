@@ -15,7 +15,7 @@ This had bitten us before. Until QEMU 9.2, TCG did not run a guest with paging o
 
 Under AMD-V, nos intercepted no control register, so a guest owned its CR4. It could clear CR4.MCE, and according to Linux's source, a kernel built without `X86_MCE` does. A machine check while that guest ran would then not be an exception but a shutdown. The host would see what looked like a triple fault in the guest, restart it, and never hear about the #MC.
 
-The fix, [6576c12](https://github.com/irqlevel/nos/commit/6576c12191e9e65f61da2e4b2e285762ad54b70c), has two halves. The first is in `hvarch`, the crate that keeps the host's CPU in the host's hands. On every entry it forces MCE into the CR4 the guest runs with and intercepts every CR4 write, whatever the policy above asked for ([`svm.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/svm.rs)):
+The fix, [6576c12](https://github.com/irqlevel/nos/commit/6576c12191e9e65f61da2e4b2e285762ad54b70c), has two halves. The first is in `hvarch`, the crate that keeps the host's CPU in the host's hands. On every entry it forces MCE into the CR4 the guest runs with and intercepts every CR4 write, whatever the policy above asked for ([`svm.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/svm.rs)):
 
 ```rust
 const HOST_CR: u32 = vmcb::intercept::cr::WRITE_CR4;
@@ -25,13 +25,13 @@ const HOST_CR: u32 = vmcb::intercept::cr::WRITE_CR4;
             c.intercept_cr |= HOST_CR;
 ```
 
-In `hv`, the safe half, the reads are intercepted too, so the guest reads back the CR4 it wrote while the real register keeps MCE ([`cr.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/cr.rs)). The proof is a built-in guest, `cr4`, with its own #GP handler. It clears MCE and tries three things that must each raise a #GP: setting PKE (which its CPUID never offers), clearing PAE in long mode and setting bit 32. It also sets PGE through R9 and reads CR4 back after each write. The VMCB, the block of memory that tells an AMD CPU how to run a guest, lists what to intercept. On a CPU that does what the VMCB asks, the host performs all eleven accesses: six reads and five writes.
+In `hv`, the safe half, the reads are intercepted too, so the guest reads back the CR4 it wrote while the real register keeps MCE ([`cr.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/cr.rs)). The proof is a built-in guest, `cr4`, with its own #GP handler. It clears MCE and tries three things that must each raise a #GP: setting PKE (which its CPUID never offers), clearing PAE in long mode and setting bit 32. It also sets PGE through R9 and reads CR4 back after each write. The VMCB, the block of memory that tells an AMD CPU how to run a guest, lists what to intercept. On a CPU that does what the VMCB asks, the host performs all eleven accesses: six reads and five writes.
 
 ### What TCG did
 
 Under `hv-test.py` on TCG, no read caused a VM exit (a switch from the guest back to the hypervisor). The guest read the real register, with MCE set no matter what it had written, and the host performed only the writes. Yet the VMCB did ask: `READ_CR4`, bit 4 of the CR intercept word, is set for every guest.
 
-The answer was in QEMU's x86 decoder. In 10.2, `decode_op` in `target/i386/tcg/decode-new.c.inc` checks a `mov` from *any* control register against CR0's read intercept. It adds the register's number to the exit code only when that code is not zero. But SVM numbers these exits from zero up, as nos's VMCB layout shows ([`vmcb.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/svm/vmcb.rs)):
+The answer was in QEMU's x86 decoder. In 10.2, `decode_op` in `target/i386/tcg/decode-new.c.inc` checks a `mov` from *any* control register against CR0's read intercept. It adds the register's number to the exit code only when that code is not zero. But SVM numbers these exits from zero up, as nos's VMCB layout shows ([`vmcb.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/svm/vmcb.rs)):
 
 ```rust
     /// A `mov` from CR4, and one to it: a control register's reads at
@@ -50,7 +50,7 @@ A CR0 read is exit code 0x000, the one code that fails the "not zero" test. So u
 
 The tempting workaround is to intercept CR0 reads as well. That would catch the CR4 reads on TCG, but on a real CPU the same intercept also catches SMSW, an instruction a guest's user processes may run. Real hardware would pay for the emulator's slip, so we did not do it.
 
-Instead, the test learned where it runs. CPUID leaf 0x4000_0000 carries the signature of the hypervisor underneath, and QEMU's TCG signs itself `TCGTCGTCGTCG` ([`guests.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/guests.rs)):
+Instead, the test learned where it runs. CPUID leaf 0x4000_0000 carries the signature of the hypervisor underneath, and QEMU's TCG signs itself `TCGTCGTCGTCG` ([`guests.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/guests.rs)):
 
 ```rust
 fn under_qemu_tcg() -> bool {

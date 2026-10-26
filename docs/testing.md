@@ -14,12 +14,12 @@ each gate does, and the failure it is there for.
 
 ## Self-tests at boot
 
-Self-tests live in `src/cpp/kernel/test.cpp`; each is a
+Self-tests live in `src/base/kernel/test.cpp`; each is a
 `stdlib::Error TestXxx()` function. They run early in boot, from
 `test::test()` (called in `main.cpp:main2`, and from `main_arm64.cpp`) and
 `test::test_multi_tasking()`, and a failing one returns a non-success
 `stdlib::Error`. The Rust side's run from the same place, through
-`rust_test` (`src/rust/kernel/src/lib.rs`) -- among them the frame test
+`rust_test` (`src/crates/kernel/src/lib.rs`) -- among them the frame test
 (`kernel/src/frames.rs`): a page mapped nowhere, written a piece at a time at
 every alignment and read back on every running CPU, each through its own
 slot of the temporary window, which is how every copy of a guest's memory is
@@ -158,8 +158,8 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, and `hv create` of VMs from a web server's images; on both, `hv convert` |
-| `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/rust/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
-| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/rust/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
+| `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
+| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
@@ -437,7 +437,7 @@ given -- a handler the listener owns, frames lent, the end of a batch told
 
 And the tick's receive poll, which nothing but `rxpoll=on` turns on. When
 that stopped being true nothing showed: the switch lived in the C++ function
-the tick called, went with `src/cpp/net`, and from then on every tick
+the tick called, went with `src/base/net`, and from then on every tick
 polled. Under a flood the receive softirq ran on two CPUs in turn -- the
 BSP, whose tick it is, and the one the NIC interrupts -- with an IPI at
 each handover, and on the AX41 took 70% of each of two CPUs where it had
@@ -1183,7 +1183,7 @@ stand-ins for the kernel around them (`fuzz/cpp/common/`: the tracer, the
 panic path -- a panic is a finding --, the locks, which hold the kernel's
 rules -- one taken twice, one let go of when not held, an allocation with one
 held are findings --, the heap with each block counted and able to fail) and
-a HAL of the host's own (`fuzz/cpp/host/`), which comes before `src/cpp` on
+a HAL of the host's own (`fuzz/cpp/host/`), which comes before `src/base` on
 the include path and takes the place of each arch's inline one: no
 privileged instruction, and the MMU's hooks -- a TLB flush, an entry made
 valid -- where a target that models the MMU sees what the kernel did to its
@@ -1511,7 +1511,7 @@ hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would: get any of that wrong and
 the guest boots something else -- an older kernel, the recovery entry --
 with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
-(`src/rust/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs`), into a host
+(`src/crates/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs`), into a host
 program, and the gate runs it over disks it makes: a GPT whose /boot is a
 partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
 MBR whose /boot is on the root filesystem (as Debian's), and a disk that is
@@ -1701,9 +1701,9 @@ cannot run here and names the exception level, and refuses `hv on` and
 
 ### `edit-test.py` -- the editor, decided on the host
 
-`edit` is a full-screen editor run in the kernel (`src/rust/modules/edit`,
+`edit` is a full-screen editor run in the kernel (`src/crates/modules/edit`,
 [edit](modules.md#edit)) over a crate with no kernel in it,
-`src/rust/edit`. `fuzz/edit` compiles that crate, as it is, into a host
+`src/crates/edit`. `fuzz/edit` compiles that crate, as it is, into a host
 program that runs it the way the module does -- the bytes a terminal sends
 through the key decoder, its saves and quits answered, its frames drawn on a
 terminal of the test's own, which does with them what xterm does: wraps text

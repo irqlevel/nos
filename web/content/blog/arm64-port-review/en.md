@@ -13,7 +13,7 @@ nos got its arm64 port on July 16 and 17. By the evening of the 17th it booted o
 
 The reason was the development loop. We develop nos on an Apple Silicon Mac, where x86 nos runs under QEMU's TCG, which emulates the CPU in software. arm64 nos runs under HVF, Apple's hypervisor framework, on the Mac's own cores. The arm64 smoke boot took 16 seconds under TCG and 4 under HVF ([4171bc2](https://github.com/irqlevel/nos/commit/4171bc2)), and that gain is why the roadmap moved arm64 ahead of the hypervisor ([the plan](https://github.com/irqlevel/nos/blob/master/plans/02-hal-arm64.md)).
 
-First the x86 code moved behind a HAL, a hardware abstraction layer, without changing what it did. x86 had to pass a new boot smoke test ([4fe3796](https://github.com/irqlevel/nos/commit/4fe3796)) after every step. The x86-specific code moved to `src/cpp/arch/x86_64/`, and common code switched to the headers in `src/cpp/hal/`, each of which picks its backend at compile time ([mmu.h](https://github.com/irqlevel/nos/blob/master/src/cpp/hal/mmu.h)):
+First the x86 code moved behind a HAL, a hardware abstraction layer, without changing what it did. x86 had to pass a new boot smoke test ([4fe3796](https://github.com/irqlevel/nos/commit/4fe3796)) after every step. The x86-specific code moved to `src/base/arch/x86_64/`, and common code switched to the headers in `src/base/hal/`, each of which picks its backend at compile time ([mmu.h](https://github.com/irqlevel/nos/blob/master/src/base/hal/mmu.h)):
 
 ```cpp
 #if defined(__x86_64__)
@@ -29,7 +29,7 @@ Then came the arm64 side, in six milestones: "hello" on the serial port, memory 
 
 ## A barrier no x86 test can check
 
-The x86 kernel had one barrier macro, `Barrier()`: an empty `asm` with a memory clobber, which only stops the compiler. Commit [be3767b](https://github.com/irqlevel/nos/commit/be3767b) replaced every use of it with a barrier that says what it orders, then deleted the macro, so new code has to choose ([barrier.h](https://github.com/irqlevel/nos/blob/master/src/cpp/hal/barrier.h)):
+The x86 kernel had one barrier macro, `Barrier()`: an empty `asm` with a memory clobber, which only stops the compiler. Commit [be3767b](https://github.com/irqlevel/nos/commit/be3767b) replaced every use of it with a barrier that says what it orders, then deleted the macro, so new code has to choose ([barrier.h](https://github.com/irqlevel/nos/blob/master/src/base/hal/barrier.h)):
 
 ```cpp
 #if defined(__x86_64__)
@@ -68,7 +68,7 @@ bool VirtQueue::GetUsed(u32& id, u32& len)
 
 The first barrier keeps earlier loads ahead of the index load, but says nothing about the index load and the ring loads, which both come after it. The ring loads take their slot from `LastUsedIdx`, the driver's own counter, not from the index just read, so no address dependency makes the CPU wait. All that links them is the `if`, a control dependency. On arm64 that orders a load before later stores, but not before later loads: the CPU predicts the branch and issues the next load early. So a fresh index can pair with a stale ring entry. The same goes for whatever the caller reads next, such as a disk request's status byte or a received frame.
 
-x86 never reorders a load with another load, so this cannot happen there. Two Rust drivers had the same pattern. NVMe's `read_cqe` checked a completion entry's phase bit, which the controller flips on every pass around the queue, and then read the entry. r8168's `harvest` checked a receive descriptor's OWN bit, which says whether the NIC or the driver holds it, and then handed out a frame whose address came from a shadow array. Both now call `kcore::barrier::dma_rmb()` right after the check ([nvme](https://github.com/irqlevel/nos/blob/master/src/rust/drivers/nvme/src/queue.rs), [r8168](https://github.com/irqlevel/nos/blob/master/src/rust/drivers/r8168/src/desc.rs)).
+x86 never reorders a load with another load, so this cannot happen there. Two Rust drivers had the same pattern. NVMe's `read_cqe` checked a completion entry's phase bit, which the controller flips on every pass around the queue, and then read the entry. r8168's `harvest` checked a receive descriptor's OWN bit, which says whether the NIC or the driver holds it, and then handed out a frame whose address came from a shadow array. Both now call `kcore::barrier::dma_rmb()` right after the check ([nvme](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/nvme/src/queue.rs), [r8168](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/r8168/src/desc.rs)).
 
 ## The right instruction for the wrong audience
 
@@ -76,7 +76,7 @@ The second bug was a barrier that did emit an instruction, just the wrong one. T
 
 The `ish` names a shareability domain. Arm groups everything that observes memory into domains, and a barrier promises an order only to observers in the domain it names. The inner-shareable domain is typically the CPUs that run one operating system. The outer-shareable domain is wider and can include other bus masters, such as a PCIe device doing DMA. So `dmb ish` ordered the NVMe command before the doorbell as other CPUs see it, and promised nothing to the controller that actually reads it.
 
-The fix is a new module, `kcore::barrier`, the Rust half of `Hal::DmaWmb` and `Hal::DmaRmb` ([barrier.rs](https://github.com/irqlevel/nos/blob/master/src/rust/kcore/src/barrier.rs)):
+The fix is a new module, `kcore::barrier`, the Rust half of `Hal::DmaWmb` and `Hal::DmaRmb` ([barrier.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/barrier.rs)):
 
 ```rust
 pub fn dma_wmb() {
@@ -100,7 +100,7 @@ pub fn dma_wmb() {
 
 TLBI is the arm64 instruction that removes entries from the TLB, the CPU's cache of address translations. Its `is` forms broadcast the invalidation to every CPU in the inner-shareable domain. So on the afternoon of the 17th, arm64 stopped sending IPIs for TLB shootdowns ([e531dc3](https://github.com/irqlevel/nos/commit/e531dc3), [Paging](/docs/paging#tlb-shootdown-and-the-deadlock-it-can-cause)), and one instruction in `Hal::TlbFlushPage` became the whole shootdown of a page.
 
-The operand of `tlbi vaae1is` carries the page number, VA[55:12], in bits 43:0. ARMv8.4 added FEAT_TTL, which makes bits 47:44 a hint: the page size and table level of the entry being removed, so the CPU can narrow the search. Zero means no hint. The code passed `virtAddr >> 12`, and kernel addresses in nos start with 0xFFFF8, so the shift left 0b1111 in the hint field. That reads as "64 KiB pages, level 3", and nos uses 4 KiB pages. When the hint does not match the entry, the architecture allows the CPU to invalidate nothing. The fix is a mask ([hal_mmu_inline.h](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/hal_mmu_inline.h)):
+The operand of `tlbi vaae1is` carries the page number, VA[55:12], in bits 43:0. ARMv8.4 added FEAT_TTL, which makes bits 47:44 a hint: the page size and table level of the entry being removed, so the CPU can narrow the search. Zero means no hint. The code passed `virtAddr >> 12`, and kernel addresses in nos start with 0xFFFF8, so the shift left 0b1111 in the hint field. That reads as "64 KiB pages, level 3", and nos uses 4 KiB pages. When the hint does not match the entry, the architecture allows the CPU to invalidate nothing. The fix is a mask ([hal_mmu_inline.h](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/hal_mmu_inline.h)):
 
 ```cpp
 asm volatile(
@@ -147,8 +147,8 @@ After it, each NVMe I/O produced exactly one LPI 8192, and the ITS became the de
 
 The review sorted its findings into three groups. The first holds the bugs that bite on QEMU and HVF today: the barriers, the TLBI, and the boot identity map that left kernel text writable and executable at its physical address ([W^X everywhere](/blog/wx-everywhere)). The last holds latent bugs, such as a page allocator that handed out the device tree's memory as free pages. The group in the middle, bugs that real hardware would hit but QEMU tolerates, reads like a list of what QEMU quietly does for you. Two examples:
 
-- QEMU's PSCI preserves registers x4 to x17 across a firmware call. The calling convention lets firmware clobber them, and TF-A (Trusted Firmware-A) does, so `PsciCall` now declares them clobbered ([cpu_start_arm64.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/cpu_start_arm64.cpp)).
-- QEMU numbers CPUs one after another in the lowest affinity field of MPIDR, the register that identifies a CPU, and `SendSgi` took that field for the CPU's index. On hardware with clusters an IPI would reach the wrong CPU, so the affinity now comes from the device tree's CPU list. A `dsb ishst` before the send also makes the work queued for the target visible before the IPI arrives ([gicv3.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/gicv3.cpp)).
+- QEMU's PSCI preserves registers x4 to x17 across a firmware call. The calling convention lets firmware clobber them, and TF-A (Trusted Firmware-A) does, so `PsciCall` now declares them clobbered ([cpu_start_arm64.cpp](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/cpu_start_arm64.cpp)).
+- QEMU numbers CPUs one after another in the lowest affinity field of MPIDR, the register that identifies a CPU, and `SendSgi` took that field for the CPU's index. On hardware with clusters an IPI would reach the wrong CPU, so the affinity now comes from the device tree's CPU list. A `dsb ishst` before the send also makes the work queued for the target visible before the IPI arrives ([gicv3.cpp](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/gicv3.cpp)).
 
 ## What stays
 
