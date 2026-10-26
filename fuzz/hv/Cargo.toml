@@ -13,7 +13,7 @@ edition = "2021"
 [dependencies]
 # What is on the wire, and nothing else: the guests' DHCP server is built on
 # it. No dependencies of its own, so this still builds offline.
-netwire = { path = "../../src/rust/netwire" }
+netwire = { path = "../../src/crates/netwire" }
 
 # What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
 # guest that can cause one can bring down the host that runs it.

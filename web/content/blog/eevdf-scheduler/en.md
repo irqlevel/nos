@@ -84,7 +84,7 @@ Blocking used to be one bit in the task's flags. `Block()` set it, `Unblock()` c
 | Sleeping | switched out by its CPU, on no run list |
 | Waking | an `Unblock()` found it Sleeping and is handing it back |
 
-Here is the waker's side ([task.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/task.cpp)):
+Here is the waker's side ([task.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/task.cpp)):
 
 ```cpp
 void Task::Unblock()
@@ -121,7 +121,7 @@ A lost wakeup is the worst kind of scheduler bug: a task asleep forever, and no 
 
 ## Step 2: EEVDF
 
-EEVDF stands for Earliest Eligible Virtual Deadline First. Ion Stoica and Hussein Abdel-Wahab described it in 1995, and since Linux 6.6 it decides who runs among Linux's ordinary tasks. In nos it is [eevdf.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/eevdf.cpp), a few hundred lines that know nothing of tasks, locks or CPUs, only entities and the queue they are on ([0ce9d2f](https://github.com/irqlevel/nos/commit/0ce9d2ffc63966bfa03ac821ed391eed5229bfb2)). It works like this:
+EEVDF stands for Earliest Eligible Virtual Deadline First. Ion Stoica and Hussein Abdel-Wahab described it in 1995, and since Linux 6.6 it decides who runs among Linux's ordinary tasks. In nos it is [eevdf.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/eevdf.cpp), a few hundred lines that know nothing of tasks, locks or CPUs, only entities and the queue they are on ([0ce9d2f](https://github.com/irqlevel/nos/commit/0ce9d2ffc63966bfa03ac821ed391eed5229bfb2)). It works like this:
 
 - Every task has a **weight**, from its nice value, -20 to 19. The table is Linux's: 1024 at nice 0, and each step about 1.25 times the next, so that one nice apart is about ten per cent of the CPU between two tasks that both want all of it.
 - Every task has a **virtual runtime**, the CPU time it has had, scaled: a nanosecond on the CPU adds 1024/weight virtual nanoseconds to it, so a heavier task's grows more slowly.
@@ -179,7 +179,7 @@ The first version of EEVDF in the scheduler had a bug of ordering. The queue was
 
 Beside one spinner that V was the sleeper's own virtual runtime, so the sleeper went to sleep owed nothing, every single time. At every wakeup it had to wait out whatever was left of the spinner's slice, up to the whole 3 ms, while beside two spinners a wakeup took a few microseconds, because there V still counted the other one. That inversion was the clue. A line added to `sched probe` to print the lag the waiter woke with confirmed it: zero, beside one spinner, every time.
 
-The first fix moved the removal after the sleep and left a comment explaining why the order mattered. The project's own rules ask for better than that: between two designs, take the one where the bug cannot be written over the one where a comment asks nobody to write it. So the queue now owns the task on the CPU ([eevdf.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/eevdf.cpp)). A task on the queue is either on the list or current, counted in V either way, and never neither. Five calls move it, `Join`, `JoinCurrent`, `Leave`, `PutBack` and `Take`, and `Take` refuses with a `BugOn`, a kernel panic that names the line, while anything is still current:
+The first fix moved the removal after the sleep and left a comment explaining why the order mattered. The project's own rules ask for better than that: between two designs, take the one where the bug cannot be written over the one where a comment asks nobody to write it. So the queue now owns the task on the CPU ([eevdf.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/eevdf.cpp)). A task on the queue is either on the list or current, counted in V either way, and never neither. Five calls move it, `Join`, `JoinCurrent`, `Leave`, `PutBack` and `Take`, and `Take` refuses with a `BugOn`, a kernel panic that names the line, while anything is still current:
 
 ```cpp
 void EevdfQueue::Leave(SchedEntity* se)
@@ -215,7 +215,7 @@ That leaves a decision one order to be made in: pick the next task while the las
 
 ## A test that passed with the bug in it
 
-Each boot runs `TestEevdf` on a CPU other than the boot's ([test.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp)). A wakeup beside one spinner and beside two must take under half a millisecond and under a millisecond at the median, and a spinner at nice 0 must get 2.4 to 3.9 times the CPU of one at nice 5. The weights say 3.06.
+Each boot runs `TestEevdf` on a CPU other than the boot's ([test.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/test.cpp)). A wakeup beside one spinner and beside two must take under half a millisecond and under a millisecond at the median, and a spinner at nice 0 must get 2.4 to 3.9 times the CPU of one at nice 5. The weights say 3.06.
 
 To make sure the test would catch the bug, the bug was put back. The test passed, at 153 µs, comfortably under its bound. It signalled the waiter at a fixed rhythm, a millisecond's poll and a 2 ms gap, against a 3 ms slice, and the wakeups had settled just before the end of a slice, where waiting out "the rest of the slice" costs almost nothing. Now the test waits a random part of a slice between signals, drawn from a fixed seed:
 

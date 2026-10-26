@@ -1,4 +1,4 @@
-# The editor (src/rust/edit) on the host, as the edit module runs it: key
+# The editor (src/crates/edit) on the host, as the edit module runs it: key
 # sessions with what they must leave in the file and on the screen, files
 # read and written back byte for byte, and sessions of random keys on a
 # terminal of the test's own, the editor held to its promises after every
@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-edit = { path = "../../src/rust/edit" }
+edit = { path = "../../src/crates/edit" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: an overflow in the editor
 # is a bug of its own, and in the kernel a panic.

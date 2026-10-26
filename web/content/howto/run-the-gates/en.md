@@ -36,11 +36,11 @@ If you pipe a check's output, for example through `tail`, the pipeline's exit st
 
 ## 1. Self-tests at every boot
 
-Every boot runs the kernel's self-tests before going any further. They live in [`src/cpp/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp), and each one is a `Stdlib::Error TestXxx()` function:
+Every boot runs the kernel's self-tests before going any further. They live in [`src/base/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/test.cpp), and each one is a `stdlib::Error TestXxx()` function:
 
-- **When they run.** `Test::Test()` runs early in boot, called from `Main2` in `main.cpp` and from `main_arm64.cpp`. `Test::TestMultiTasking()` runs later. A failing test returns a non-success `Stdlib::Error`.
+- **When they run.** `test::test()` runs early in boot, called from `main2` in `main.cpp` and from `main_arm64.cpp`. `test::test_multi_tasking()` runs later. A failing test returns a non-success `stdlib::Error`.
 - **The Rust side** runs from the same place, through `rust_test`. Its tests include the frame test, which writes a page through each CPU's slot in the temporary mapping window, and a test of the lock-free ring.
-- **`TestModules`** loads the `modtest` module embedded in the kernel image, then feeds the module loader damaged copies of it.
+- **`test_modules`** loads the `modtest` module embedded in the kernel image, then feeds the module loader damaged copies of it.
 - **`fstest=on`** on the kernel command line runs the filesystem self-test on `/` once it is mounted, and prints `fstest: passed` or `fstest: FAILED`.
 
 To add a test, write a `TestXxx()` and register it in the `Test()` dispatcher. To run a single test, edit `Test()` so that it calls only that function, then rebuild and boot. `./scripts/qemu.sh` writes the serial console to `nos.log`, so that is the file to watch.
@@ -74,7 +74,7 @@ make nocheck RUSTUB=1
 make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 ```
 
-- **`UBSAN=1`** builds the C++ with clang's undefined-behaviour sanitizer. It catches shifts past the width of the type, signed overflow, out-of-bounds indexes into arrays whose size the compiler knows, null or misaligned accesses, invalid `bool` and `enum` values, and falling off the end of a function. Its object files are kept apart, in `out/$(ARCH)-ubsan/`. A report looks like `PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/cpp/...`. Boot with `ubsan=warn` to collect every report instead of stopping at the first.
+- **`UBSAN=1`** builds the C++ with clang's undefined-behaviour sanitizer. It catches shifts past the width of the type, signed overflow, out-of-bounds indexes into arrays whose size the compiler knows, null or misaligned accesses, invalid `bool` and `enum` values, and falling off the end of a function. Its object files are kept apart, in `out/$(ARCH)-ubsan/`. A report looks like `PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/base/...`. Boot with `ubsan=warn` to collect every report instead of stopping at the first.
 - **`RUSTUB=1`** turns on overflow checks and `core`'s checks of its own unsafe preconditions (`ptr::read` of an unaligned or null pointer, a bad `slice::from_raw_parts`, `get_unchecked` past the end and others), in the kernel's Rust and in every module. A report starts with `RUST PANIC: panicked at` and names the precondition. It does not analyse your own `unsafe` code: out-of-bounds raw pointers, aliasing and data races go unchecked.
 - **The two are independent**, and you can set both at once. `version` then says `+ubsan` and `+rustub`.
 
@@ -170,7 +170,7 @@ If you hit a failure that looked like success along the way, write the gate that
 
 **A time-bound check of `hv-linux-test.py --cpus 2` fails on a busy machine.** The restarting guest's six resets within a minute and the log flood within `--vm-secs` are checks of this kind. Before you blame your change, run the gate again on a quiet machine.
 
-**A build suddenly wants the network.** Builds run offline: the Rust dependencies are vendored (their sources are in the tree), and the toolchain is pinned in `src/rust/rust-toolchain.toml`. So there are two possible causes. If a dependency was never vendored, run `scripts/vendor.sh` and commit what it produces. If the `nos-builder` image is older than the pin, rebuild it with `docker build --platform linux/amd64 -t nos-builder .`.
+**A build suddenly wants the network.** Builds run offline: the Rust dependencies are vendored (their sources are in the tree), and the toolchain is pinned in `src/crates/rust-toolchain.toml`. So there are two possible causes. If a dependency was never vendored, run `scripts/vendor.sh` and commit what it produces. If the `nos-builder` image is older than the pin, rebuild it with `docker build --platform linux/amd64 -t nos-builder .`.
 
 ## Next steps
 

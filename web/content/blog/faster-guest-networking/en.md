@@ -27,7 +27,7 @@ Each step is a commit whose message records the measurement: the runs, the sprea
 
 With APIC virtualization, a VT-x CPU delivers interrupts to a guest in x2APIC mode and handles the guest's EOIs by itself. Neither needs a VM exit (the CPU leaving the guest and handing control back to the hypervisor). The Intel round turned this on only for guests that asked for it (`apicv`). The reason was IPIs from other CPUs and MSIs from devices: they still went into the target vCPU's mailbox in the hypervisor. To receive one, a CPU running its guest had to be kicked out of it. That costs an IPI plus an exit, which is more than the EOI exit it saved. With `apicv` the guests exited 25–50% less often, yet the test still took 5.88 s on average, against 5.70 without it.
 
-Posted interrupts remove that kick ([89a4c5a](https://github.com/irqlevel/nos/commit/89a4c5a92bc5fbb86d5338edfc52238047ed19ce)). Every guest CPU gets a 64-byte descriptor, [`PostedInterrupts`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/vmx.rs), that its VMCS points to (the VMCS is the structure that describes a guest CPU to VT-x). The descriptor holds one request bit per interrupt vector and an ON bit that says a notification is pending. To send a fixed, edge-triggered interrupt, the sender sets the vector's bit:
+Posted interrupts remove that kick ([89a4c5a](https://github.com/irqlevel/nos/commit/89a4c5a92bc5fbb86d5338edfc52238047ed19ce)). Every guest CPU gets a 64-byte descriptor, [`PostedInterrupts`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/vmx.rs), that its VMCS points to (the VMCS is the structure that describes a guest CPU to VT-x). The descriptor holds one request bit per interrupt vector and an ON bit that says a notification is pending. To send a fixed, edge-triggered interrupt, the sender sets the vector's bit:
 
 ```rust
     pub fn post(&self, vector: u8) -> bool {
@@ -52,7 +52,7 @@ The watch that had looked like a win watched only the mailbox. The switch rings 
 
 Each CPU's timer (the local APIC timer on x86-64, the generic timer on arm64) used to tick periodically at 100 Hz. A task blocked until a deadline ran at the first tick after it, so a 1 ms sleep took 10 ms. A halted guest's vCPU waits the same way for the next edge of its guest's timer, so `usleep 1000` in a guest took 10 ms. Now the timer is one-shot ([dc416b9](https://github.com/irqlevel/nos/commit/dc416b9100208afbc2530be4b46d1ba267286e26)). It is armed for whichever comes first: the next tick, or the earliest deadline of a task sleeping on that CPU ([The local timer](/docs/scheduler#the-local-timer)). At every boot, a self-test on every CPU sleeps for a millisecond 21 times and fails the boot if the median is over 5 ms. Under QEMU it measures 1.007–1.07 ms with HVF and 1.1–2.4 ms with TCG. As a control, we took the arming out, and the result was 10.0 ms.
 
-Then, before every entry into the guest, the hypervisor arms its host CPU's timer for the guest's next timer edge ([415d29d](https://github.com/irqlevel/nos/commit/415d29d689e96f9e40755d96ad231fc05d51da43)). That way even a guest that computes without exiting is pulled out on time ([`run.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/run.rs)):
+Then, before every entry into the guest, the hypervisor arms its host CPU's timer for the guest's next timer edge ([415d29d](https://github.com/irqlevel/nos/commit/415d29d689e96f9e40755d96ad231fc05d51da43)). That way even a guest that computes without exiting is pulled out on time ([`run.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/run.rs)):
 
 ```rust
             let edge = pit_edge.unwrap_or(u64::MAX)
@@ -69,7 +69,7 @@ A real millisecond has a cost of its own ([4696f48](https://github.com/irqlevel/
 
 ## Receive interrupts at least 100 µs apart
 
-With the new timer in place, moderation takes just a few lines in the device ([4445a2d](https://github.com/irqlevel/nos/commit/4445a2d892a63fd9383c58d6b6a608d1c3f8a6dd)). It works like interrupt throttling in a real NIC. A frame goes into the guest's buffers at once, but its interrupt waits until enough time has passed since the previous one. Then a single interrupt covers every frame that came in meanwhile ([`net.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/devices/net.rs)):
+With the new timer in place, moderation takes just a few lines in the device ([4445a2d](https://github.com/irqlevel/nos/commit/4445a2d892a63fd9383c58d6b6a608d1c3f8a6dd)). It works like interrupt throttling in a real NIC. A frame goes into the guest's buffers at once, but its interrupt waits until enough time has passed since the previous one. Then a single interrupt covers every frame that came in meanwhile ([`net.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/devices/net.rs)):
 
 ```rust
     fn rx_interrupt(&mut self, mem: &GuestMemory, now: u64) -> Raise {
@@ -102,7 +102,7 @@ A 200 µs window is faster still, but it costs latency. A hundred small HTTP fet
 
 ## Offloads in both directions
 
-Offloads let a guest's network driver hand some of its work to the device. The guest's virtio-net now offers `VIRTIO_NET_F_CSUM` and `HOST_TSO4` ([9595afb](https://github.com/irqlevel/nos/commit/9595afb6773c8f2bb479a82eaa133fd9a9b3c84b)). With them, a driver can leave checksums to the device and hand it TCP over IPv4 as a single send of up to 64 KiB. The device cuts the send into frames of at most 1514 bytes before they reach the switch. So nos's network stack, NAT and the other guests still see whole frames with correct checksums. The device checks every offset and length the driver gives against the frame before using it, and one limit is there to protect the host ([`offload.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/devices/offload.rs)):
+Offloads let a guest's network driver hand some of its work to the device. The guest's virtio-net now offers `VIRTIO_NET_F_CSUM` and `HOST_TSO4` ([9595afb](https://github.com/irqlevel/nos/commit/9595afb6773c8f2bb479a82eaa133fd9a9b3c84b)). With them, a driver can leave checksums to the device and hand it TCP over IPv4 as a single send of up to 64 KiB. The device cuts the send into frames of at most 1514 bytes before they reach the switch. So nos's network stack, NAT and the other guests still see whole frames with correct checksums. The device checks every offset and length the driver gives against the frame before using it, and one limit is there to protect the host ([`offload.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/devices/offload.rs)):
 
 ```rust
 /// The least segment size a send may ask to be cut by: a send is then 256
@@ -119,9 +119,9 @@ But `dd | nc` got 7% slower: 4.45 s against 4.15, five runs each. When we offere
 
 ## Keeping the rings mapped while the queue is up
 
-Every access to guest memory used to be a copy through the CPU's own slot in a window of the kernel's address space. The page was mapped into the slot, the bytes copied, then the slot unmapped and its TLB entry flushed. A virtio NIC's rings alone needed that a dozen times per frame. Now a queue's rings (three pages for 256 entries) stay mapped while the queue is up ([23fdb63](https://github.com/irqlevel/nos/commit/23fdb63ebf6849edf5a8ecc784ea79991f71c859)). The code still reaches them one value at a time: a volatile load or store at a checked, aligned offset, with acquire or release ordering for the indexes. There is still no reference into guest memory. The mapping, [`kcore::frame::Mapped`](https://github.com/irqlevel/nos/blob/master/src/rust/kcore/src/frame.rs), holds a share of its region's frames, so none of them can be freed while it is mapped. The six `unsafe` sites this needed are all in `kcore`, in its frame run and its mapping, each with the reason it is sound.
+Every access to guest memory used to be a copy through the CPU's own slot in a window of the kernel's address space. The page was mapped into the slot, the bytes copied, then the slot unmapped and its TLB entry flushed. A virtio NIC's rings alone needed that a dozen times per frame. Now a queue's rings (three pages for 256 entries) stay mapped while the queue is up ([23fdb63](https://github.com/irqlevel/nos/commit/23fdb63ebf6849edf5a8ecc784ea79991f71c859)). The code still reaches them one value at a time: a volatile load or store at a checked, aligned offset, with acquire or release ordering for the indexes. There is still no reference into guest memory. The mapping, [`kcore::frame::Mapped`](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/frame.rs), holds a share of its region's frames, so none of them can be freed while it is mapped. The six `unsafe` sites this needed are all in `kcore`, in its frame run and its mapping, each with the reason it is sound.
 
-The copy window had done two things by accident, and now they had to be done on purpose. First, its INVLPG instruction is serializing. It happened to sit between the device publishing the used index and the device reading the driver's flags ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/devices/virtio.rs)):
+The copy window had done two things by accident, and now they had to be done on purpose. First, its INVLPG instruction is serializing. It happened to sit between the device publishing the used index and the device reading the driver's flags ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/devices/virtio.rs)):
 
 ```rust
     pub fn wants_interrupt(&self, mem: &GuestMemory) -> bool {

@@ -23,81 +23,81 @@
 #include <stdio.h>
 #include <string.h>
 
-namespace Fuzz
+namespace fuzz
 {
 
 namespace
 {
 
 /* Spin locks held right now, by the only task there is. */
-long SpinLocksHeld;
+long spin_locks_held;
 
 /* The kernel's clock: it moves a microsecond each time it is read. */
-ulong ClockNs;
+ulong clock_ns;
 
 }
 
 /* The host HAL's state (fuzz/cpp/host). */
-bool InterruptsOn = true;
-u64 Cycles;
-ulong CurrentCpu;
+bool interrupts_on = true;
+u64 cycles;
+ulong current_cpu;
 
-void HostHalUnreachable(const char* what)
+void host_hal_unreachable(const char* what)
 {
-    Finding(__FILE__, __LINE__, "%s: nothing the fuzzed code may call", what);
+    finding(__FILE__, __LINE__, "%s: nothing the fuzzed code may call", what);
 }
 
 /* No MMU to tell, unless the target models one (targets/mm.cpp). */
-__attribute__((weak)) void HostTlbFlushPage(ulong virtAddr)
+__attribute__((weak)) void host_tlb_flush_page(ulong virt_addr)
 {
-    (void)virtAddr;
+    (void)virt_addr;
 }
 
-__attribute__((weak)) void HostTlbFlushAll()
-{
-}
-
-__attribute__((weak)) void HostPteMadeValid()
+__attribute__((weak)) void host_tlb_flush_all()
 {
 }
 
-__attribute__((weak)) ulong HostGetTranslationRoot()
+__attribute__((weak)) void host_pte_made_valid()
+{
+}
+
+__attribute__((weak)) ulong host_get_translation_root()
 {
     return 0;
 }
 
-__attribute__((weak)) void HostSetTranslationRoot(ulong phys)
+__attribute__((weak)) void host_set_translation_root(ulong phys)
 {
     (void)phys;
 }
 
 /* The kernel heap's, when the target has heap.cpp's. */
-__attribute__((weak)) void HeapReset()
+__attribute__((weak)) void heap_reset()
 {
 }
 
-void ResetKernel()
+void reset_kernel()
 {
-    SpinLocksHeld = 0;
-    InterruptsOn = true;
-    CurrentCpu = 0;
-    HeapReset();
+    spin_locks_held = 0;
+    interrupts_on = true;
+    current_cpu = 0;
+    heap_reset();
 }
 
-long HeldSpinLocks()
+long held_spin_locks()
 {
-    return SpinLocksHeld;
+    return spin_locks_held;
 }
 
-void CheckNoLocksHeld(const char* when)
+void check_no_locks_held(const char* when)
 {
-    INVARIANT(SpinLocksHeld == 0, "%ld spin locks still held %s", SpinLocksHeld, when);
+    INVARIANT(spin_locks_held == 0, "%ld spin locks still held %s", spin_locks_held, when);
 }
 
 /* The kernel's own formatting, as its tracer and panic path do it. */
-static void Format(char* buf, size_t size, const char* fmt, va_list args)
+static void format(char* buf, size_t size, const char* fmt, va_list args)
 {
-    Stdlib::VsnPrintf(buf, size, fmt, args);
+    stdlib::vsn_printf(buf, size, fmt, args);
 }
 
 }
@@ -108,8 +108,8 @@ extern "C" {
 
 /* The kernel image's bounds, which the linker script gives the kernel; a
    target that places a kernel image of its own defines them (mm.cpp). */
-__attribute__((weak)) char KernelStart;
-__attribute__((weak)) char KernelEnd;
+__attribute__((weak)) char kernel_start;
+__attribute__((weak)) char kernel_end;
 
 void asm_memset(void* p, unsigned char c, size_t n)
 {
@@ -148,75 +148,75 @@ const char* asm_strstr(const char* h, const char* n)
 
 /* ---- the atomics of hal/cpu.h, which each arch has in assembly ---- */
 
-void AtomicInc(volatile long* p)
+void atomic_inc(volatile long* p)
 {
     __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST);
 }
 
-void AtomicDec(volatile long* p)
+void atomic_dec(volatile long* p)
 {
     __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST);
 }
 
-void AtomicAdd(volatile long* p, long delta)
+void atomic_add(volatile long* p, long delta)
 {
     __atomic_add_fetch(p, delta, __ATOMIC_SEQ_CST);
 }
 
-long AtomicRead(volatile long* p)
+long atomic_read(volatile long* p)
 {
     return __atomic_load_n(p, __ATOMIC_SEQ_CST);
 }
 
-void AtomicWrite(volatile long* p, long v)
+void atomic_write(volatile long* p, long v)
 {
     __atomic_store_n(p, v, __ATOMIC_SEQ_CST);
 }
 
-long AtomicReadAndDec(volatile long* p)
+long atomic_read_and_dec(volatile long* p)
 {
     return __atomic_fetch_sub(p, 1, __ATOMIC_SEQ_CST);
 }
 
-long AtomicReadAndInc(volatile long* p)
+long atomic_read_and_inc(volatile long* p)
 {
     return __atomic_fetch_add(p, 1, __ATOMIC_SEQ_CST);
 }
 
-long AtomicCmpxchg(volatile long* p, long exchange, long comparand)
+long atomic_cmpxchg(volatile long* p, long exchange, long comparand)
 {
     long expected = comparand;
     __atomic_compare_exchange_n(p, &expected, exchange, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return expected;
 }
 
-long AtomicTestAndSetBit(volatile long* p, ulong bit)
+long atomic_test_and_set_bit(volatile long* p, ulong bit)
 {
     long mask = 1L << bit;
     return (__atomic_fetch_or(p, mask, __ATOMIC_SEQ_CST) & mask) != 0;
 }
 
-long AtomicTestAndClearBit(volatile long* p, ulong bit)
+long atomic_test_and_clear_bit(volatile long* p, ulong bit)
 {
     long mask = 1L << bit;
     return (__atomic_fetch_and(p, ~mask, __ATOMIC_SEQ_CST) & mask) != 0;
 }
 
-long AtomicTestBit(volatile long* p, ulong bit)
+long atomic_test_bit(volatile long* p, ulong bit)
 {
     return (__atomic_load_n(p, __ATOMIC_SEQ_CST) >> bit) & 1;
 }
 
 }
 
-namespace Kernel
+namespace kernel
 {
 
 /* ---- the tracer: its lines on stderr under --trace ---- */
 
 Tracer::Tracer()
-    : Level(0)
-    , ConsoleSuppressed(false)
+    : level_(0)
+    , console_suppressed_(false)
 {
 }
 
@@ -224,49 +224,49 @@ Tracer::~Tracer()
 {
 }
 
-void Tracer::Output(const char* fmt, ...)
+void Tracer::output(const char* fmt, ...)
 {
     char line[1024];
     va_list args;
     va_start(args, fmt);
-    Fuzz::Format(line, sizeof(line), fmt, args);
+    fuzz::format(line, sizeof(line), fmt, args);
     va_end(args);
-    if (Fuzz::Tracing())
+    if (fuzz::tracing())
         fputs(line, stderr);
 }
 
-void Tracer::Output(Stdlib::Error& err, const char* fmt, ...)
+void Tracer::output(stdlib::Error& err, const char* fmt, ...)
 {
     (void)err;
     char line[1024];
     va_list args;
     va_start(args, fmt);
-    Fuzz::Format(line, sizeof(line), fmt, args);
+    fuzz::format(line, sizeof(line), fmt, args);
     va_end(args);
-    if (Fuzz::Tracing())
+    if (fuzz::tracing())
         fputs(line, stderr);
 }
 
-void Tracer::SetLevel(int level)
+void Tracer::set_level(int level)
 {
-    Level = level;
+    level_ = level;
 }
 
-int Tracer::GetLevel()
+int Tracer::get_level()
 {
     /* Every line formatted, whatever it would have been: a trace a level
        hides is still a call whose arguments must be sound. */
-    return MaxTraceLevel;
+    return MAX_TRACE_LEVEL;
 }
 
-void Tracer::SetConsoleSuppressed(bool suppressed)
+void Tracer::set_console_suppressed(bool suppressed)
 {
-    ConsoleSuppressed = suppressed;
+    console_suppressed_ = suppressed;
 }
 
-bool Tracer::IsConsoleSuppressed()
+bool Tracer::is_console_suppressed()
 {
-    return ConsoleSuppressed;
+    return console_suppressed_;
 }
 
 /* ---- the panic path: a finding, at the place the panic names ---- */
@@ -279,12 +279,12 @@ Panicker::~Panicker()
 {
 }
 
-void Panicker::DoPanic(const char* fmt, ...)
+void Panicker::do_panic(const char* fmt, ...)
 {
     char msg[1024];
     va_list args;
     va_start(args, fmt);
-    Fuzz::Format(msg, sizeof(msg), fmt, args);
+    fuzz::format(msg, sizeof(msg), fmt, args);
     va_end(args);
 
     /* "PANIC:func():file,line: what" -- the place is file:line */
@@ -305,94 +305,94 @@ void Panicker::DoPanic(const char* fmt, ...)
     size_t n = strlen(msg);
     while (n > 0 && msg[n - 1] == '\n')
         msg[--n] = '\0';
-    Fuzz::Finding(file, line, "kernel panic: %s", msg);
+    fuzz::finding(file, line, "kernel panic: %s", msg);
 }
 
-void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char* fmt, ...)
+void Panicker::do_panic_ctx(Context* ctx, bool has_error_code, const char* fmt, ...)
 {
     (void)ctx;
-    (void)hasErrorCode;
+    (void)has_error_code;
     char msg[1024];
     va_list args;
     va_start(args, fmt);
-    Fuzz::Format(msg, sizeof(msg), fmt, args);
+    fuzz::format(msg, sizeof(msg), fmt, args);
     va_end(args);
-    Fuzz::Finding("panic", 0, "kernel panic: %s", msg);
+    fuzz::finding("panic", 0, "kernel panic: %s", msg);
 }
 
-bool Panicker::IsActive()
+bool Panicker::is_active()
 {
     return false;
 }
 
 /* ---- the clock ---- */
 
-Stdlib::Time GetBootTime()
+stdlib::Time get_boot_time()
 {
-    Fuzz::ClockNs += 1000;
-    return Stdlib::Time(Fuzz::ClockNs);
+    fuzz::clock_ns += 1000;
+    return stdlib::Time(fuzz::clock_ns);
 }
 
 /* ---- the locks: one task, and the rules checked ---- */
 
 RawSpinLock::RawSpinLock(bool watched)
-    : Value(0)
-    , Watched(watched)
-    , PreemptTask(nullptr)
-    , WatchdogReported(0)
-    , WatchdogLockTime(0)
+    : value_(0)
+    , watched_(watched)
+    , preempt_task_(nullptr)
+    , watchdog_reported_(0)
+    , watchdog_lock_time_(0)
 {
-    WatchdogListEntry.Init();
+    watchdog_list_entry_.init();
 }
 
 RawSpinLock::~RawSpinLock()
 {
 }
 
-void RawSpinLock::Lock()
+void RawSpinLock::lock()
 {
-    INVARIANT(Value.Get() == 0, "a spin lock taken by the task that holds it: a deadlock");
-    Value.Set(1);
-    Fuzz::SpinLocksHeld++;
+    INVARIANT(value_.get() == 0, "a spin lock taken by the task that holds it: a deadlock");
+    value_.set(1);
+    fuzz::spin_locks_held++;
 }
 
-void RawSpinLock::Unlock()
+void RawSpinLock::unlock()
 {
-    INVARIANT(Value.Get() == 1, "a spin lock let go of that is not held");
-    Value.Set(0);
-    Fuzz::SpinLocksHeld--;
+    INVARIANT(value_.get() == 1, "a spin lock let go of that is not held");
+    value_.set(0);
+    fuzz::spin_locks_held--;
 }
 
-bool RawSpinLock::TryLock()
+bool RawSpinLock::try_lock()
 {
-    if (Value.Get() != 0)
+    if (value_.get() != 0)
         return false;
-    Value.Set(1);
-    Fuzz::SpinLocksHeld++;
+    value_.set(1);
+    fuzz::spin_locks_held++;
     return true;
 }
 
-ulong RawSpinLock::LockIrqSave()
+ulong RawSpinLock::lock_irq_save()
 {
-    Lock();
+    lock();
     return 0;
 }
 
-void RawSpinLock::UnlockIrqRestore(ulong flags)
+void RawSpinLock::unlock_irq_restore(ulong flags)
 {
     (void)flags;
-    Unlock();
+    unlock();
 }
 
-ulong RawSpinLock::TryLockIrqSave(bool& acquired)
+ulong RawSpinLock::try_lock_irq_save(bool& acquired)
 {
-    acquired = TryLock();
+    acquired = try_lock();
     return 0;
 }
 
 SpinLock::SpinLock()
-    : RawLock(true)
-    , Owner(nullptr)
+    : raw_lock_(true)
+    , owner_(nullptr)
 {
 }
 
@@ -401,41 +401,41 @@ SpinLock::~SpinLock()
 }
 
 /* The owner is the one task there is: the lock's own address stands for it */
-void SpinLock::Lock()
+void SpinLock::lock()
 {
-    RawLock.Lock();
-    Owner = this;
+    raw_lock_.lock();
+    owner_ = this;
 }
 
-void SpinLock::Unlock()
+void SpinLock::unlock()
 {
-    Owner = nullptr;
-    RawLock.Unlock();
+    owner_ = nullptr;
+    raw_lock_.unlock();
 }
 
-void SpinLock::Lock(ulong& flags)
+void SpinLock::lock(ulong& flags)
 {
-    flags = RawLock.LockIrqSave();
-    Owner = this;
+    flags = raw_lock_.lock_irq_save();
+    owner_ = this;
 }
 
-void SpinLock::Unlock(ulong flags)
+void SpinLock::unlock(ulong flags)
 {
-    Owner = nullptr;
-    RawLock.UnlockIrqRestore(flags);
+    owner_ = nullptr;
+    raw_lock_.unlock_irq_restore(flags);
 }
 
-void SpinLock::SharedLock(ulong& flags)
+void SpinLock::shared_lock(ulong& flags)
 {
-    Lock(flags);
+    lock(flags);
 }
 
-void SpinLock::SharedUnlock(ulong flags)
+void SpinLock::shared_unlock(ulong flags)
 {
-    Unlock(flags);
+    unlock(flags);
 }
 
-void SpinLock::Unwatch()
+void SpinLock::unwatch()
 {
 }
 

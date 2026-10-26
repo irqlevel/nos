@@ -28,7 +28,7 @@ GRUB sets a video mode only when the kernel's Multiboot2 header asks for one. So
 
 The screen stayed dark. Without a video driver loaded, GRUB cannot set a mode, so it boots the kernel with no framebuffer and no warning. In the commit's words, a missing `insmod all_video` in `grub.cfg` was "the actual reason UEFI boots came up blind even with the header tag".
 
-The console, [`FbTerm`](https://github.com/irqlevel/nos/blob/master/src/cpp/drivers/fb_console.cpp), draws an 8x16 font. It keeps a copy of the character grid in RAM and never reads the framebuffer back, because reads from it are slow. Even so, it could not keep up with the kernel log, since the framebuffer was mapped uncached and every store was a bus transaction of its own. Now one entry of the PAT, the x86 table of memory types, is set to write-combining, which lets the CPU gather stores into bursts. The framebuffer uses that type ([6ebed66](https://github.com/irqlevel/nos/commit/6ebed66)).
+The console, [`FbTerm`](https://github.com/irqlevel/nos/blob/master/src/base/drivers/fb_console.cpp), draws an 8x16 font. It keeps a copy of the character grid in RAM and never reads the framebuffer back, because reads from it are slow. Even so, it could not keep up with the kernel log, since the framebuffer was mapped uncached and every store was a bus transaction of its own. Now one entry of the PAT, the x86 table of memory types, is set to write-combining, which lets the CPU gather stores into bursts. The framebuffer uses that type ([6ebed66](https://github.com/irqlevel/nos/commit/6ebed66)).
 
 The framebuffer even broke a self-test. Mapping it moved the kernel's virtual address cursor, so a later test's mapping needed a fresh page-table page, and the kernel never gives those back. The free-page count came back one short, and the UEFI boot panicked long before the shell ([e6afd72](https://github.com/irqlevel/nos/commit/e6afd72)):
 
@@ -62,7 +62,7 @@ if now_ms() >= deadline {
 }
 ```
 
-The keyboard speaks the HID boot protocol: a fixed 8-byte report, simple enough for a BIOS to read without parsing the device's HID report descriptor. Byte 0 holds the modifier keys, byte 1 is reserved, and bytes 2 to 7 hold the codes of up to six keys held down. A report lists the keys that are down, so the [driver](https://github.com/irqlevel/nos/blob/master/src/rust/drivers/usb/src/hid.rs) compares it with the previous one to find presses. It maps HID codes onto the PS/2 scan codes the rest of the kernel speaks, so to the shell 0x0E still means backspace. It also repeats a held key itself, because a boot keyboard never does.
+The keyboard speaks the HID boot protocol: a fixed 8-byte report, simple enough for a BIOS to read without parsing the device's HID report descriptor. Byte 0 holds the modifier keys, byte 1 is reserved, and bytes 2 to 7 hold the codes of up to six keys held down. A report lists the keys that are down, so the [driver](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/usb/src/hid.rs) compares it with the previous one to find presses. It maps HID codes onto the PS/2 scan codes the rest of the kernel speaks, so to the shell 0x0E still means backspace. It also repeats a held key itself, because a boot keyboard never does.
 
 There is no interrupt handler. A `usb` task wakes every 4 ms, drains the event ring, notices hot-plug and queues the next report, which keeps the keyboard independent of interrupt routing on unfamiliar hardware. Every wait has a timeout, so a dead device cannot hang the task.
 
@@ -89,7 +89,7 @@ The test is built around a failure that looks like success, and a control experi
 
 ## The port to Rust
 
-The C++ became a Rust crate, `src/rust/drivers/usb`, with a file each for the registers, the rings, the USB descriptors, the per-device state, the HID decoder and [the controller](https://github.com/irqlevel/nos/blob/master/src/rust/drivers/usb/src/controller.rs) ([00a24ef](https://github.com/irqlevel/nos/commit/00a24ef)). It passed 17 of 17 on the first run, and its boot log matched the C++ line for line, down to the slot numbers and route strings.
+The C++ became a Rust crate, `src/crates/drivers/usb`, with a file each for the registers, the rings, the USB descriptors, the per-device state, the HID decoder and [the controller](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/usb/src/controller.rs) ([00a24ef](https://github.com/irqlevel/nos/commit/00a24ef)). It passed 17 of 17 on the first run, and its boot log matched the C++ line for line, down to the slot numbers and route strings.
 
 Two things came out differently on purpose. The C++ read a descriptor by pointing a packed struct at a DMA buffer. The Rust reads each field out of a byte slice at a named offset, because a packed struct over DMA is a misaligned read waiting to happen. And the C++ `usb` command read the device array outside its lock, so the shell could see a report count in the middle of a write. Now the USB task publishes what the command prints, under a lock of its own.
 

@@ -54,14 +54,14 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, 'out', 'net-fuzz')
-VENDOR = os.path.join(ROOT, 'src', 'rust', 'vendor')
+VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
 # The gate's seed. How many inputs of each target it runs is the target's
 # own (targets/mod.rs): an input of ssh is a hundred of icmp.
 GATE_SEED = '1'
 
 # The RustCrypto crates on the software backends the kernel builds them with
-# (src/rust/.cargo/config.toml): the code fuzzed is the code the kernel runs
+# (src/crates/.cargo/config.toml): the code fuzzed is the code the kernel runs
 # -- and on x86-64, curve25519-dalek's SIMD backend would want proc macros
 # whose vendored build scripts are empty.
 RUSTFLAGS = ['--cfg', 'aes_force_soft', '--cfg', 'polyval_force_soft', '--cfg', 'poly1305_force_soft',
@@ -71,7 +71,7 @@ RUSTFLAGS = ['--cfg', 'aes_force_soft', '--cfg', 'polyval_force_soft', '--cfg', 
 def main():
     args = sys.argv[1:]
     # The kernel's vendored crates, as the kernel's own build takes them: the
-    # fuzzer's manifest is outside src/rust, whose .cargo/config.toml says so
+    # fuzzer's manifest is outside src/crates, whose .cargo/config.toml says so
     # for the kernel -- and makes any build under it a kernel build -- so it
     # is said here, and cargo is run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',

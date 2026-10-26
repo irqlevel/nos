@@ -5,9 +5,9 @@
 // blank lines and name=value lines, then '#' to the end -- every call is held
 // to what grub_env.h says it does: Set and Unset change exactly the line the
 // model says, or say no and change nothing, room counted to the byte; Get
-// and ForEach give back what the model holds. Over any block, a Set that
+// and for_each give back what the model holds. Over any block, a Set that
 // says yes is what Get gives back, one that says no leaves every byte as it
-// was, and a block Set or Unset wrote is one ForEach reads to its end, with
+// was, and a block Set or Unset wrote is one for_each reads to its end, with
 // the newline and the '#' padding GRUB's own writer looks for.
 #include "host.h"
 
@@ -24,24 +24,24 @@
 namespace
 {
 
-using Stdlib::GrubEnvBlock;
+using stdlib::GrubEnvBlock;
 
 struct Var
 {
-    std::string Name;
-    std::string Value;
+    std::string name;
+    std::string value;
 };
 
-const char* const Names[] = {"a", "b", "saved_entry", "next_entry", "nos_next", "x_1", "A", "aa", "boot_once"};
+const char* const NAMES[] = {"a", "b", "saved_entry", "next_entry", "nos_next", "x_1", "A", "aa", "boot_once"};
 
 /* Names GRUB would not take. */
-const char* const BadNames[] = {"", "a b", "a=b", "a\\b", "a\nb", "-x", "a.b"};
+const char* const BAD_NAMES[] = {"", "a b", "a=b", "a\\b", "a\nb", "-x", "a.b"};
 
 /* Names a block may have all the same. */
-const char* const OddNames[] = {"a-b", "x.y", "with space",
+const char* const ODD_NAMES[] = {"a-b", "x.y", "with space",
                                 "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn"};
 
-std::string Escape(const std::string& v)
+std::string escape(const std::string& v)
 {
     std::string e;
     for (char c : v)
@@ -53,9 +53,9 @@ std::string Escape(const std::string& v)
     return e;
 }
 
-bool ValidName(const std::string& n)
+bool valid_name(const std::string& n)
 {
-    if (n.empty() || n.size() > GrubEnvBlock::MaxNameLen)
+    if (n.empty() || n.size() > GrubEnvBlock::MAX_NAME_LEN)
         return false;
     for (char c : n)
     {
@@ -66,234 +66,234 @@ bool ValidName(const std::string& n)
 }
 
 /* A name to ask about: one GRUB takes, one it does not, one the block has. */
-std::string Name(Fuzz::Input& in, const std::vector<Var>& vars)
+std::string pick_name(fuzz::Input& in, const std::vector<Var>& vars)
 {
-    switch (in.U8() % 8)
+    switch (in.u8() % 8)
     {
     case 0:
-        return std::string(in.Range(60, 70), 'a');
+        return std::string(in.range(60, 70), 'a');
     case 1:
-        return in.Pick(BadNames);
+        return in.pick(BAD_NAMES);
     case 2:
     case 3:
         if (!vars.empty())
-            return vars[in.Below(vars.size())].Name;
+            return vars[in.below(vars.size())].name;
         [[fallthrough]];
     default:
-        return Names[in.Below(sizeof(Names) / sizeof(Names[0]))];
+        return NAMES[in.below(sizeof(NAMES) / sizeof(NAMES[0]))];
     }
 }
 
 /* A name a line of a block may have: one GRUB takes, mostly. */
-std::string LineName(Fuzz::Input& in)
+std::string line_name(fuzz::Input& in)
 {
-    if (in.Chance(20))
-        return in.Pick(OddNames);
-    return Names[in.Below(sizeof(Names) / sizeof(Names[0]))];
+    if (in.chance(20))
+        return in.pick(ODD_NAMES);
+    return NAMES[in.below(sizeof(NAMES) / sizeof(NAMES[0]))];
 }
 
-std::string Value(Fuzz::Input& in)
+std::string pick_value(fuzz::Input& in)
 {
-    size_t n = in.Chance(16) ? in.Range(250, 600) : in.Below(40);
+    size_t n = in.chance(16) ? in.range(250, 600) : in.below(40);
     std::string v;
     for (size_t i = 0; i < n; i++)
     {
-        uint8_t c = in.U8();
+        uint8_t c = in.u8();
         v += (c < 48) ? "\\\n=#\r "[c % 6] : static_cast<char>('a' + c % 26);
     }
     return v;
 }
 
-std::string Cut(const std::string& v, size_t n)
+std::string cut(const std::string& v, size_t n)
 {
     return v.substr(0, std::min(n, v.size()));
 }
 
-/* ForEach's visit, kept. */
+/* for_each's visit, kept. */
 struct Visits
 {
-    std::vector<Var> Seen;
-    size_t StopAfter;
+    std::vector<Var> seen;
+    size_t stop_after;
 };
 
-bool Visit(const char* name, const char* value, void* ctx)
+bool visit(const char* name, const char* value, void* ctx)
 {
     auto* v = static_cast<Visits*>(ctx);
-    v->Seen.push_back({name, value});
-    return v->Seen.size() < v->StopAfter;
+    v->seen.push_back({name, value});
+    return v->seen.size() < v->stop_after;
 }
 
-bool Tail(const char* b, size_t size)
+bool tail(const char* b, size_t size)
 {
     size_t pos = size;
-    while (pos > GrubEnvBlock::SignatureLen && b[pos - 1] == '#')
+    while (pos > GrubEnvBlock::SIGNATURE_LEN && b[pos - 1] == '#')
         pos--;
     return b[pos - 1] == '\n';
 }
 
-void CheckReadsAsModel(GrubEnvBlock& env, const std::vector<Var>& vars, const char* after)
+void check_reads_as_model(GrubEnvBlock& env, const std::vector<Var>& vars, const char* after)
 {
     Visits v{{}, ~0UL};
-    INVARIANT(env.ForEach(Visit, &v), "ForEach calls a block the model reads malformed, after %s", after);
-    INVARIANT(v.Seen.size() == vars.size(), "ForEach visits %zu variables, not %zu, after %s", v.Seen.size(),
+    INVARIANT(env.for_each(visit, &v), "for_each calls a block the model reads malformed, after %s", after);
+    INVARIANT(v.seen.size() == vars.size(), "for_each visits %zu variables, not %zu, after %s", v.seen.size(),
         vars.size(), after);
     for (size_t i = 0; i < vars.size(); i++)
     {
-        INVARIANT(v.Seen[i].Name == vars[i].Name && v.Seen[i].Value == Cut(vars[i].Value, GrubEnvBlock::MaxValueLen),
-            "ForEach's variable %zu is '%s', not '%s', after %s", i, v.Seen[i].Name.c_str(), vars[i].Name.c_str(),
+        INVARIANT(v.seen[i].name == vars[i].name && v.seen[i].value == cut(vars[i].value, GrubEnvBlock::MAX_VALUE_LEN),
+            "for_each's variable %zu is '%s', not '%s', after %s", i, v.seen[i].name.c_str(), vars[i].name.c_str(),
             after);
     }
 }
 
-void Run(Fuzz::Input& in)
+void run(fuzz::Input& in)
 {
     size_t size;
-    switch (in.U8() % 4)
+    switch (in.u8() % 4)
     {
     case 0:
-        size = GrubEnvBlock::MinSize + in.Below(64);
+        size = GrubEnvBlock::MIN_SIZE + in.below(64);
         break;
     case 1:
-        size = GrubEnvBlock::MinSize + in.Below(4096);
+        size = GrubEnvBlock::MIN_SIZE + in.below(4096);
         break;
     default:
-        size = GrubEnvBlock::DefaultSize;
+        size = GrubEnvBlock::DEFAULT_SIZE;
         break;
     }
     /* The block alone in its allocation: a step past either end is ASan's. */
     char* b = static_cast<char*>(malloc(size));
-    GrubEnvBlock::Format(b, size);
+    GrubEnvBlock::format(b, size);
     GrubEnvBlock env(b, size);
 
     /* The model holds while the block is one it can read. */
     std::vector<Var> vars;
-    size_t used = GrubEnvBlock::SignatureLen;
+    size_t used = GrubEnvBlock::SIGNATURE_LEN;
     bool modelled = true;
-    switch (in.U8() % 8)
+    switch (in.u8() % 8)
     {
     case 0:
         /* Bytes: whatever a disk holds past the signature. */
-        for (size_t i = GrubEnvBlock::SignatureLen; i < size && in.More(); i++)
-            b[i] = static_cast<char>(in.U8());
+        for (size_t i = GrubEnvBlock::SIGNATURE_LEN; i < size && in.more(); i++)
+            b[i] = static_cast<char>(in.u8());
         modelled = false;
-        Fuzz::Reached("a block of bytes");
+        fuzz::reached("a block of bytes");
         break;
     default:
     {
         /* Lines grub-editenv could have written. */
-        for (size_t lines = in.Below(10); lines > 0; lines--)
+        for (size_t lines = in.below(10); lines > 0; lines--)
         {
             std::string line;
             Var var;
-            bool isVar = false;
-            switch (in.U8() % 8)
+            bool is_var = false;
+            switch (in.u8() % 8)
             {
             case 0:
                 line = "# a comment, a\\b in it\n";
                 break;
             case 1:
-                line = in.Chance(128) ? "\n" : "\r\n";
+                line = in.chance(128) ? "\n" : "\r\n";
                 break;
             default:
-                var = {LineName(in), Value(in)};
-                line = var.Name + "=" + Escape(var.Value) + "\n";
-                isVar = true;
+                var = {line_name(in), pick_value(in)};
+                line = var.name + "=" + escape(var.value) + "\n";
+                is_var = true;
                 break;
             }
             if (used + line.size() > size)
                 break;
             memcpy(b + used, line.data(), line.size());
             used += line.size();
-            if (isVar)
+            if (is_var)
                 vars.push_back(var);
         }
-        if (in.Chance(40))
+        if (in.chance(40))
         {
             /* And then damaged: a line with no '=', a byte of anything, an
                escape where the last newline was. */
-            size_t at = GrubEnvBlock::SignatureLen + in.Below(size - GrubEnvBlock::SignatureLen);
-            switch (in.U8() % 3)
+            size_t at = GrubEnvBlock::SIGNATURE_LEN + in.below(size - GrubEnvBlock::SIGNATURE_LEN);
+            switch (in.u8() % 3)
             {
             case 0:
                 if (used + 2 <= size)
-                    memcpy(b + GrubEnvBlock::SignatureLen, "b\n", 2);
+                    memcpy(b + GrubEnvBlock::SIGNATURE_LEN, "b\n", 2);
                 break;
             case 1:
-                b[at] = static_cast<char>(in.U8());
+                b[at] = static_cast<char>(in.u8());
                 break;
             default:
-                if (used > GrubEnvBlock::SignatureLen + 1)
+                if (used > GrubEnvBlock::SIGNATURE_LEN + 1)
                     b[used - 2] = '\\';
                 break;
             }
             modelled = false;
-            Fuzz::Reached("a block damaged");
+            fuzz::reached("a block damaged");
         }
         break;
     }
     }
     if (modelled)
     {
-        CheckReadsAsModel(env, vars, "the block was written");
-        Fuzz::Reached("a block the model reads");
+        check_reads_as_model(env, vars, "the block was written");
+        fuzz::reached("a block the model reads");
     }
 
     std::vector<char> before(size);
-    for (int ops = 0; ops < 24 && in.More(); ops++)
+    for (int ops = 0; ops < 24 && in.more(); ops++)
     {
-        std::string name = Name(in, vars);
+        std::string name = pick_name(in, vars);
         memcpy(before.data(), b, size);
-        switch (in.U8() % 4)
+        switch (in.u8() % 4)
         {
         case 0:
         {
-            std::string value = Value(in);
-            bool said = env.Set(name.c_str(), value.c_str());
-            Fuzz::Say("Set('%s', '%s') = %d", name.c_str(), value.c_str(), said);
+            std::string value = pick_value(in);
+            bool said = env.set(name.c_str(), value.c_str());
+            fuzz::say("set('%s', '%s') = %d", name.c_str(), value.c_str(), said);
             if (modelled)
             {
                 /* The model's answer, room counted to the byte. */
                 bool want = false;
-                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.Name == name; });
-                if (ValidName(name))
+                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.name == name; });
+                if (valid_name(name))
                 {
-                    size_t newLen = Escape(value).size();
+                    size_t new_len = escape(value).size();
                     if (it != vars.end())
                     {
-                        size_t oldLen = Escape(it->Value).size();
-                        want = newLen <= oldLen || newLen - oldLen <= size - used;
+                        size_t old_len = escape(it->value).size();
+                        want = new_len <= old_len || new_len - old_len <= size - used;
                         if (want)
                         {
-                            used = used + newLen - oldLen;
-                            it->Value = value;
+                            used = used + new_len - old_len;
+                            it->value = value;
                         }
                     }
                     else
                     {
-                        want = name.size() + 1 + newLen + 1 <= size - used;
+                        want = name.size() + 1 + new_len + 1 <= size - used;
                         if (want)
                         {
-                            used += name.size() + 1 + newLen + 1;
+                            used += name.size() + 1 + new_len + 1;
                             vars.push_back({name, value});
                         }
                     }
                 }
-                INVARIANT(said == want, "Set('%s') of %zu bytes said %d where the model says %d", name.c_str(),
+                INVARIANT(said == want, "set('%s') of %zu bytes said %d where the model says %d", name.c_str(),
                     value.size(), said, want);
                 if (said)
-                    CheckReadsAsModel(env, vars, "a Set");
+                    check_reads_as_model(env, vars, "a Set");
             }
             if (said)
             {
-                char got[GrubEnvBlock::MaxValueLen + 1];
-                INVARIANT(env.Get(name.c_str(), got, sizeof(got)), "a Set of '%s' that said yes is not there to Get",
+                char got[GrubEnvBlock::MAX_VALUE_LEN + 1];
+                INVARIANT(env.get(name.c_str(), got, sizeof(got)), "a Set of '%s' that said yes is not there to Get",
                     name.c_str());
-                INVARIANT(Cut(value, GrubEnvBlock::MaxValueLen) == got, "Get('%s') gives back other than Set put",
+                INVARIANT(cut(value, GrubEnvBlock::MAX_VALUE_LEN) == got, "get('%s') gives back other than Set put",
                     name.c_str());
                 Visits v{{}, ~0UL};
-                INVARIANT(env.ForEach(Visit, &v), "a block Set wrote is one ForEach calls malformed");
-                INVARIANT(Tail(b, size), "a Set left no newline before the padding");
-                Fuzz::Reached("a Set");
+                INVARIANT(env.for_each(visit, &v), "a block Set wrote is one for_each calls malformed");
+                INVARIANT(tail(b, size), "a Set left no newline before the padding");
+                fuzz::reached("a Set");
             }
             else
             {
@@ -304,26 +304,26 @@ void Run(Fuzz::Input& in)
         }
         case 1:
         {
-            bool said = env.Unset(name.c_str());
-            Fuzz::Say("Unset('%s') = %d", name.c_str(), said);
+            bool said = env.unset(name.c_str());
+            fuzz::say("unset('%s') = %d", name.c_str(), said);
             if (modelled)
             {
-                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.Name == name; });
-                bool want = ValidName(name) && it != vars.end();
-                INVARIANT(said == want, "Unset('%s') said %d where the model says %d", name.c_str(), said, want);
+                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.name == name; });
+                bool want = valid_name(name) && it != vars.end();
+                INVARIANT(said == want, "unset('%s') said %d where the model says %d", name.c_str(), said, want);
                 if (want)
                 {
-                    used -= name.size() + 1 + Escape(it->Value).size() + 1;
+                    used -= name.size() + 1 + escape(it->value).size() + 1;
                     vars.erase(it);
-                    CheckReadsAsModel(env, vars, "an Unset");
+                    check_reads_as_model(env, vars, "an Unset");
                 }
             }
             if (said)
             {
                 Visits v{{}, ~0UL};
-                INVARIANT(env.ForEach(Visit, &v), "a block Unset wrote is one ForEach calls malformed");
-                INVARIANT(Tail(b, size), "an Unset left no newline before the padding");
-                Fuzz::Reached("an Unset");
+                INVARIANT(env.for_each(visit, &v), "a block Unset wrote is one for_each calls malformed");
+                INVARIANT(tail(b, size), "an Unset left no newline before the padding");
+                fuzz::reached("an Unset");
             }
             else
             {
@@ -334,17 +334,17 @@ void Run(Fuzz::Input& in)
         }
         case 2:
         {
-            size_t cap = 1 + in.Below(GrubEnvBlock::MaxValueLen + 1);
+            size_t cap = 1 + in.below(GrubEnvBlock::MAX_VALUE_LEN + 1);
             std::vector<char> got(cap);
-            bool found = env.Get(name.c_str(), got.data(), cap);
+            bool found = env.get(name.c_str(), got.data(), cap);
             if (modelled)
             {
-                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.Name == name; });
-                bool want = ValidName(name) && it != vars.end();
-                INVARIANT(found == want, "Get('%s') found %d where the model says %d", name.c_str(), found, want);
+                auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.name == name; });
+                bool want = valid_name(name) && it != vars.end();
+                INVARIANT(found == want, "get('%s') found %d where the model says %d", name.c_str(), found, want);
                 if (found)
-                    INVARIANT(Cut(Cut(it->Value, GrubEnvBlock::MaxValueLen), cap - 1) == got.data(),
-                        "Get('%s') into %zu bytes gives back other than the model's value", name.c_str(), cap);
+                    INVARIANT(cut(cut(it->value, GrubEnvBlock::MAX_VALUE_LEN), cap - 1) == got.data(),
+                        "get('%s') into %zu bytes gives back other than the model's value", name.c_str(), cap);
             }
             if (found)
                 INVARIANT(strlen(got.data()) < cap, "Get wrote past what it was given");
@@ -352,13 +352,13 @@ void Run(Fuzz::Input& in)
         }
         default:
         {
-            Visits v{{}, 1 + in.Below(8)};
-            bool whole = env.ForEach(Visit, &v);
+            Visits v{{}, 1 + in.below(8)};
+            bool whole = env.for_each(visit, &v);
             if (modelled)
             {
-                INVARIANT(whole, "ForEach calls a block the model reads malformed");
-                for (size_t i = 0; i < v.Seen.size(); i++)
-                    INVARIANT(i < vars.size() && v.Seen[i].Name == vars[i].Name, "ForEach visits past the model");
+                INVARIANT(whole, "for_each calls a block the model reads malformed");
+                for (size_t i = 0; i < v.seen.size(); i++)
+                    INVARIANT(i < vars.size() && v.seen[i].name == vars[i].name, "for_each visits past the model");
             }
             break;
         }
@@ -368,10 +368,10 @@ void Run(Fuzz::Input& in)
     free(b);
 }
 
-void Reset()
+void reset()
 {
 }
 
 }
 
-const Fuzz::Target Fuzz::TheTarget = {"grubenv", Reset, Run, 2048, 200000};
+const fuzz::Target fuzz::THE_TARGET = {"grubenv", reset, run, 2048, 200000};

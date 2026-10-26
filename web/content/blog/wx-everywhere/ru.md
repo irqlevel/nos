@@ -11,7 +11,7 @@ W^X (write xor execute, «либо запись, либо исполнение»
 
 ## Как разрезали образ ядра
 
-Начали 17 июля с образа ядра: arm64 в [329a8e7](https://github.com/irqlevel/nos/commit/329a8e7), x86-64 в тот же день в [47ca40e](https://github.com/irqlevel/nos/commit/47ca40e). В оба скрипта линкера добавили выровненные по странице символы между секциями: `KernelText` после `.text` и `KernelRodata` после `.rodata`. Ближе к концу загрузки, когда настоящая таблица страниц уже работает, `ProtectRange` обходит листовые записи образа и переписывает их права. Листовая запись — это запись последнего уровня таблицы страниц, здесь каждая отображает страницу в 4 КиБ ([main.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/main.cpp)):
+Начали 17 июля с образа ядра: arm64 в [329a8e7](https://github.com/irqlevel/nos/commit/329a8e7), x86-64 в тот же день в [47ca40e](https://github.com/irqlevel/nos/commit/47ca40e). В оба скрипта линкера добавили выровненные по странице символы между секциями: `KernelText` после `.text` и `KernelRodata` после `.rodata`. Ближе к концу загрузки, когда настоящая таблица страниц уже работает, `ProtectRange` обходит листовые записи образа и переписывает их права. Листовая запись — это запись последнего уровня таблицы страниц, здесь каждая отображает страницу в 4 КиБ ([main.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/main.cpp)):
 
 ```cpp
 pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
@@ -33,7 +33,7 @@ pt.ProtectRange(r1, e - r1, true, false);    /* RW+NX */
 
 Никто этого не замечал, потому что ничего не ломается. Отсутствующий бит NX не виден, пока кто-нибудь не исполнит данные, а ни одна smoke-загрузка не делает этого нарочно. Проект больше всего боится именно таких отказов: тех, что выглядят как успех.
 
-Исправление ([b54a189](https://github.com/irqlevel/nos/commit/b54a189), 17 сентября) ставит NX на каждую листовую запись, которую ядро создаёт во время работы ([page_table.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/mm/page_table.cpp)):
+Исправление ([b54a189](https://github.com/irqlevel/nos/commit/b54a189), 17 сентября) ставит NX на каждую листовую запись, которую ядро создаёт во время работы ([page_table.cpp](https://github.com/irqlevel/nos/blob/master/src/base/mm/page_table.cpp)):
 
 ```cpp
 page->Get();
@@ -93,7 +93,7 @@ static void WxProbeHeap()
 
 ## Модули: решает заголовок программы
 
-Загружаемые модули ([модули](/docs/modules)) — единственное место, где nos кладёт в память новый код во время работы, поэтому правило для них самое строгое. `.ko` линкуется с `-z separate-loadable-segments -z max-page-size=4096`, чтобы каждый сегмент начинался со своей страницы: права ведь назначаются постранично. Ещё до того, как что-либо отобразить, загрузчик отвергает сегмент, который просит и запись, и исполнение ([module.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/module.cpp)):
+Загружаемые модули ([модули](/docs/modules)) — единственное место, где nos кладёт в память новый код во время работы, поэтому правило для них самое строгое. `.ko` линкуется с `-z separate-loadable-segments -z max-page-size=4096`, чтобы каждый сегмент начинался со своей страницы: права ведь назначаются постранично. Ещё до того, как что-либо отобразить, загрузчик отвергает сегмент, который просит и запись, и исполнение ([module.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/module.cpp)):
 
 ```cpp
 if ((ph.Flags & Elf::PfW) != 0 && (ph.Flags & Elf::PfX) != 0)

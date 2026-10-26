@@ -1,5 +1,5 @@
 # hvboot's parsers on the host: its partition tables, ext2/3/4 reader, GRUB
-# configuration and bzImage header (src/rust/hvboot/src/{gpt,ext,grub,
+# configuration and bzImage header (src/crates/hvboot/src/{gpt,ext,grub,
 # bzimage,crc32}.rs), compiled from their own sources and run over a disk
 # image -- what hvboot would boot off it, and the kernel and initrd read out
 # by its own reader, to compare with what e2fsprogs reads -- and over random

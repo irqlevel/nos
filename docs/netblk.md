@@ -214,7 +214,7 @@ is the Ethernet CRC of each hop.
   completions it polls for them instead, for 50 µs, because a wakeup costs an
   interrupt, an IPI and a context switch; with `poll=` it goes on polling for
   the next request too. Polling gives the CPU to any other task runnable there
-  and never to the idle task (`YieldToRunnable`). A plain yield would: idle
+  and never to the idle task (`yield_to_runnable`). A plain yield would: idle
   halts the CPU until the next interrupt that CPU itself takes -- the tick,
   when the disk's and the NIC's land elsewhere -- and a completion finding the
   worker runnable rather than blocked sends it no IPI. A plain spin starves
@@ -268,10 +268,10 @@ the kernel did not have:
   would otherwise take every ID back the moment it came free, and a filesystem
   on another partition of the disk would wait out its retries and fail.
 - **An event** (`kernel/event.h`) a task can block on and anyone can signal,
-  hard IRQ handlers included -- `WaitGroup` spins on `Schedule()` instead.
-- **Polling that neither halts nor hogs the CPU.** `YieldToRunnable()` gives
+  hard IRQ handlers included -- `WaitGroup` spins on `schedule()` instead.
+- **Polling that neither halts nor hogs the CPU.** `yield_to_runnable()` gives
   the CPU to another task runnable on it and returns at once when there is
-  none, where `Schedule()` would hand it to the idle task.
+  none, where `schedule()` would hand it to the idle task.
 - **For Rust**, in `kcore`: `ring::LocklessRing`, `sync::Event`,
   `task::yield_to_runnable`, `task::spawn_on_with` (the worker, pinned, holding
   the instance's state rather than a pointer to it), `cpu::synchronize`,
@@ -366,7 +366,7 @@ disk worked, and a window of 1 ran at 1 700 IOPS, p99 9.4 ms.)
 On arm64 the test runs under TCG, and there the worker used to lose a whole
 tick now and then -- the server's p99 was 10.7 ms -- which x86 under KVM does
 not show. The cause was the scheduler's. The tick and the IPI handler ended in
-`Schedule()`, which hands the CPU to the idle task when nothing else is
+`schedule()`, which hands the CPU to the idle task when nothing else is
 runnable, even while the task the interrupt landed on can still run; the idle
 task only halts, and a worker that is runnable rather than blocked gets no IPI
 from the requests and completions meant for it, so it waited for the next

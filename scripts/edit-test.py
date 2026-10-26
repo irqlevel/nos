@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Editor test: `edit` (src/rust/edit), decided on the host.
+"""Editor test: `edit` (src/crates/edit), decided on the host.
 
-The edit module runs src/rust/edit in an SSH session; fuzz/edit compiles that
+The edit module runs src/crates/edit in an SSH session; fuzz/edit compiles that
 crate, as it is, into a host program that runs it the same way -- the bytes
 a terminal sends through the key decoder, the editor's saves and quits
 answered, its frames drawn on a terminal of the test's own, which does what

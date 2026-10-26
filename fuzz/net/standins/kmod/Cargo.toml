@@ -11,4 +11,4 @@ edition = "2021"
 [lib]
 
 [dependencies]
-kcore = { path = "../../../../src/rust/kcore" }
+kcore = { path = "../../../../src/crates/kcore" }

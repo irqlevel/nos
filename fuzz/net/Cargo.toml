@@ -13,13 +13,13 @@ edition = "2021"
 
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/rust/ffi" }
-kcore = { path = "../../src/rust/kcore" }
-netwire = { path = "../../src/rust/netwire" }
-net = { path = "../../src/rust/net" }
-tls = { path = "../../src/rust/tls" }
-fs = { path = "../../src/rust/fs" }
-ssh = { path = "../../src/rust/ssh" }
+ffi = { path = "../../src/crates/ffi" }
+kcore = { path = "../../src/crates/kcore" }
+netwire = { path = "../../src/crates/netwire" }
+net = { path = "../../src/crates/net" }
+tls = { path = "../../src/crates/tls" }
+fs = { path = "../../src/crates/fs" }
+ssh = { path = "../../src/crates/ssh" }
 # What the sshd module's source needs of a module's runtime.
 kmod = { path = "standins/kmod" }
 # The other end of the protocols the kernel speaks: the fuzzer's TLS server

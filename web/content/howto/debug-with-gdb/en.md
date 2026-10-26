@@ -74,7 +74,7 @@ At LLDB's prompt, connect with `gdb-remote 1234`.
 
 ## Read a panic
 
-A panic report goes to the serial port and the screen. When netconsole and the disk log are on, it goes to them too. The CPU that panicked stops the other CPUs. The machine then stays stopped with the report on its console, unless it was booted with `panic=N`. In that case it resets N seconds (1–3600) after the report has gone out. Here is the shape of the report, line by line, as [`kernel/panic.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/panic.cpp) prints it:
+A panic report goes to the serial port and the screen. When netconsole and the disk log are on, it goes to them too. The CPU that panicked stops the other CPUs. The machine then stays stopped with the report on its console, unless it was booted with `panic=N`. In that case it resets N seconds (1–3600) after the report has gone out. Here is the shape of the report, line by line, as [`kernel/panic.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/panic.cpp) prints it:
 
 ```text
 PANIC:<function>():<file>,<line>: <message>
@@ -88,7 +88,7 @@ Cpu <index> backtrace:
   [0] 0x<address> <function>+0x<offset>
 ```
 
-- The first line says where the panic happened and why. For a broken invariant caught by `BugOn`, it says `BUG`. For a CPU exception, it shows what the CPU reported: `EXC: PageFault cr2 0x... rip 0x... rsp 0x... err 0x... cr3 0x...` on x86-64, or `sync exception: ... (esr 0x... ec 0x... iss 0x...) far 0x... elr 0x...` on arm64. A Rust panic starts with `RUST PANIC: panicked at <file>:<line>:<column>:`, followed by its message.
+- The first line says where the panic happened and why. For a broken invariant caught by `BUG_ON`, it says `BUG`. For a CPU exception, it shows what the CPU reported: `EXC: PageFault cr2 0x... rip 0x... rsp 0x... err 0x... cr3 0x...` on x86-64, or `sync exception: ... (esr 0x... ec 0x... iss 0x...) far 0x... elr 0x...` on arm64. A Rust panic starts with `RUST PANIC: panicked at <file>:<line>:<column>:`, followed by its message.
 - `Backtrace` is the stack of the CPU that panicked. The kernel resolves the names itself, from a symbol table built into the image, so you don't need a symbol file. Each frame is a return address, named after the call just before it.
 - A frame in a module's code ends with the module's name in brackets. When any module is loaded, the report also has a `Modules:` line with each module's address range. It lets you place a frame that nothing else could name.
 - On x86-64 the kernel asks the other CPUs for their stacks by sending them an NMI. Each answer follows as `Cpu N backtrace:`. A CPU that doesn't answer is named too (`Cpu N did not answer the NMI`).
@@ -99,7 +99,7 @@ Here is an example from [Backtraces](/docs/modules#backtraces):
 ```text
 Backtrace:
   [0] 0xFFFF800012DA1C40 mod_hello::init::{closure#0}+0x3c [hello]
-  [1] 0xFFFF80000104A2F1 Kernel::Cmd::DispatchDynamic+0xd1
+  [1] 0xFFFF80000104A2F1 kernel::Cmd::dispatch_dynamic+0xd1
 ...
 Modules: hello 0xFFFF800012DA0000+0x5000
 ```
@@ -119,13 +119,13 @@ A line is printed if its level is no higher than the current trace level. The tr
 - `loglevel=N` on the kernel command line. It's the only way to get more detail from the boot itself.
 - `loglevel N` in the shell, on a running kernel. Run `loglevel` alone to see the current level. The command works over the UDP shell and SSH too, which matters on a machine with no other console.
 
-The noisier subsystems trace at their own levels, which are constants at the top of [`src/cpp/kernel/trace.h`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/trace.h):
+The noisier subsystems trace at their own levels, which are constants at the top of [`src/base/kernel/trace.h`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/trace.h):
 
 | Level | Constants | What you see at that level |
 |---|---|---|
-| 0 | `ExcLL`, `AcpiLL`, `CmdLL`, `LapicLL`, `IoApicLL` | always printed |
-| 3 | `KbdLL`, `UsbLL`, `TestLL`, `IcmpLL`, `TaskLL`, `ModuleLL` | keyboard and USB, the multitasking self-test, three lines per ping, every task's creation and teardown, what each module import was bound to |
-| 4 | `PageAllocatorLL`, `AllocatorLL`, `PoolLL`, `MmIoLL` | the allocators (every allocation) and MMIO; very noisy |
+| 0 | `EXC_LL`, `ACPI_LL`, `CMD_LL`, `LAPIC_LL`, `IO_APIC_LL` | always printed |
+| 3 | `KBD_LL`, `USB_LL`, `TEST_LL`, `ICMP_LL`, `TASK_LL`, `MODULE_LL` | keyboard and USB, the multitasking self-test, three lines per ping, every task's creation and teardown, what each module import was bound to |
+| 4 | `PAGE_ALLOCATOR_LL`, `ALLOCATOR_LL`, `POOL_LL`, `MM_IO_LL` | the allocators (every allocation) and MMIO; very noisy |
 
 To see one subsystem without the rest, lower its constant and rebuild. Rust code traces with `trace!(level, ...)` on the same scale.
 
@@ -188,7 +188,7 @@ The first undefined operation in the C++ panics and names its site. In the Rust,
 
 ## Run the boot self-tests
 
-The self-tests run on every boot, from `Test()` in [`src/cpp/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp). A failing test panics with `Self test failed`. To run just one test, edit `Test()` so that it calls only that function, then rebuild, boot and watch `nos.log`.
+The self-tests run on every boot, from `Test()` in [`src/base/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/test.cpp). A failing test panics with `Self test failed`. To run just one test, edit `Test()` so that it calls only that function, then rebuild, boot and watch `nos.log`.
 
 ## Troubleshooting
 

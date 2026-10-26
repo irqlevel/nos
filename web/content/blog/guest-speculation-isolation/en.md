@@ -18,9 +18,9 @@ The run stub is the assembly routine that enters a guest and takes control back 
 
 The guest was misinformed as well. The CPUID policy, the hypervisor's rules for what a guest sees in CPUID and the MSRs, passed EBX of leaf 0x80000008 through nearly whole. That told a guest on AMD it had IBPB, IBRS, STIBP and SSBD, the CPU's speculation controls. Yet every MSR the policy did not name read as 0 and swallowed writes. So the guest wrote `PRED_CMD` and `SPEC_CTRL` into nothing while its sysfs said it was mitigated, which is a failure that passes in silence.
 
-[61256c8](https://github.com/irqlevel/nos/commit/61256c852980267fbb8b1a0d37112154e21376db) made the [policy](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/policy.rs) an allow-list. No speculation control is offered until its MSR is switched with the guest, that is, given the guest's value on entry and the host's on exit. And `hv-fuzz` checks every answer against a model of what each CPUID bit promises.
+[61256c8](https://github.com/irqlevel/nos/commit/61256c852980267fbb8b1a0d37112154e21376db) made the [policy](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/policy.rs) an allow-list. No speculation control is offered until its MSR is switched with the guest, that is, given the guest's value on entry and the host's on exit. And `hv-fuzz` checks every answer against a model of what each CPUID bit promises.
 
-What follows is the world switch as it stands now: [`hvarch::x86::spec`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/spec.rs) and the two run stubs, written with KVM's as the reference.
+What follows is the world switch as it stands now: [`hvarch::x86::spec`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/spec.rs) and the two run stubs, written with KVM's as the reference.
 
 ## After every exit: registers and the return stack
 
@@ -46,7 +46,7 @@ Then, before the host's first `ret`, the stub refills the return stack buffer (R
         "lfence",
 ```
 
-In AMD-V's [`vmrun_stub`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/svm.rs) this runs while GIF, AMD-V's global interrupt flag, is still clear. So nothing runs between `#vmexit` and the fill: no interrupt, not even an NMI. VT-x's [`vmx_launch_stub`](https://github.com/irqlevel/nos/blob/master/src/rust/hvarch/src/x86/vmx.rs) does the same with interrupts off, which is how an exit leaves them.
+In AMD-V's [`vmrun_stub`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/svm.rs) this runs while GIF, AMD-V's global interrupt flag, is still clear. So nothing runs between `#vmexit` and the fill: no interrupt, not even an NMI. VT-x's [`vmx_launch_stub`](https://github.com/irqlevel/nos/blob/master/src/crates/hvarch/src/x86/vmx.rs) does the same with interrupts off, which is how an exit leaves them.
 
 ## Between two guests: an IBPB
 
@@ -133,7 +133,7 @@ What a guest is told about its CPU decides how it protects itself. Until [d2b01b
 
 Now `ARCH_CAPABILITIES` reads as the host's, except for bits that are not facts about the CPU. `IBRS_ALL` stays out, because `SPEC_CTRL` does not belong to the guest. With that, Alpine reports Meltdown, MDS and L1TF as "Not affected", and RFDS as "Mitigation: Clear Register File". Under all of this, nos now loads the machine's own microcode, which takes the EX44 from 0x3a to 0x3e ([8a6e8af](https://github.com/irqlevel/nos/commit/8a6e8afa0312174e6aa32bf74e2e42d289bbe931)). A mitigation is only as good as the microcode under it.
 
-Hyper-threads are the other neighbourhood. Two threads of one core share its execution units, caches and buffers, and MDS, L1TF and port contention attacks all rely on that sharing. Since [7cceb6f](https://github.com/irqlevel/nos/commit/7cceb6fd6c869164707594c415a0becd9f7fdf26), a guest's cores are its own: whole cores where no other guest has a vCPU or a disk task ([`hv::place`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/place.rs)). That has a price. On the AX41, two busy loops in a guest took 14.7 s on one core's two threads and 9.7 s on two cores. For a machine whose guests are all your own, there is `hv cores shared`.
+Hyper-threads are the other neighbourhood. Two threads of one core share its execution units, caches and buffers, and MDS, L1TF and port contention attacks all rely on that sharing. Since [7cceb6f](https://github.com/irqlevel/nos/commit/7cceb6fd6c869164707594c415a0becd9f7fdf26), a guest's cores are its own: whole cores where no other guest has a vCPU or a disk task ([`hv::place`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/place.rs)). That has a price. On the AX41, two busy loops in a guest took 14.7 s on one core's two threads and 9.7 s on two cores. For a machine whose guests are all your own, there is `hv cores shared`.
 
 ## What is still open
 

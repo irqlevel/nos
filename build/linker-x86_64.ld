@@ -22,7 +22,7 @@ SECTIONS
 	ASSERT(. <= 0x80000, "trampolinedata (AP boot stacks) runs into the top of low memory")
 
 	. = 0xFFFF800001000000;
-	KernelStart = .;
+	kernel_start = .;
 
 	.multiboot : AT (ADDR (.multiboot) - 0xFFFF800000000000) {
 		*(.multiboot)
@@ -35,10 +35,10 @@ SECTIONS
 		*(.ltext.*)
 	}
 
-	/* W^X boundaries (page-aligned): [KernelStart, KernelText) = RX,
-	   [KernelText, KernelRodata) = RO+NX, [KernelRodata, KernelEnd) = RW+NX */
+	/* W^X boundaries (page-aligned): [kernel_start, kernel_text) = RX,
+	   [kernel_text, kernel_rodata) = RO+NX, [kernel_rodata, kernel_end) = RW+NX */
 	. = ALIGN(4K);
-	KernelText = .;
+	kernel_text = .;
 
 	.rodata ALIGN(4K) : AT (ADDR (.rodata) - 0xFFFF800000000000) {
 		*(.rodata)
@@ -48,7 +48,7 @@ SECTIONS
 	}
 
 	. = ALIGN(4K);
-	KernelRodata = .;
+	kernel_rodata = .;
 
 	.data ALIGN(4K) : AT (ADDR (.data) - 0xFFFF800000000000) {
 		*(.data)
@@ -65,7 +65,7 @@ SECTIONS
 		*(.lbss.*)
 	}
 
-        KernelEnd = .;
+        kernel_end = .;
 
 	/* Static constructors and destructors, which this kernel never runs: a
 	   global whose initialisation needs code at startup is left as zeroes,

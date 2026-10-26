@@ -1,4 +1,4 @@
-# The disk image converter (src/rust/diskimage) on the host, as the hv
+# The disk image converter (src/crates/diskimage) on the host, as the hv
 # module runs it: images made by qemu-img converted here and by qemu-img,
 # to compare; its DEFLATE decoder held to zlib's answers; and images with
 # their metadata changed at random, the code held to never panicking,
@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-diskimage = { path = "../../src/rust/diskimage" }
+diskimage = { path = "../../src/crates/diskimage" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: what is converted is a
 # download, and an overflow on what it says is a bug of its own.

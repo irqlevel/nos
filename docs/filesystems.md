@@ -7,7 +7,7 @@ is in [Shell commands](shell-commands.md).
 
 ## What is mounted at boot
 
-`rust_mount_root_fs()` (`src/rust/fs/src/rootfs.rs`) runs late in the boot, after the disks
+`rust_mount_root_fs()` (`src/crates/fs/src/rootfs.rs`) runs late in the boot, after the disks
 that appear during `rust_init` (NVMe) have been probed for partitions, and
 does what `root=` on the command line asks:
 
@@ -35,7 +35,7 @@ mount; the smoke tests boot with it and assert `fstest: passed`.
 
 ## The file API
 
-Rust reaches files through `crate::vfs_instance()` (`src/rust/fs/src/vfs.rs`),
+Rust reaches files through `crate::vfs_instance()` (`src/crates/fs/src/vfs.rs`),
 and C++ through the `kernel_vfs_*` calls it exports -- there is no C++ view
 of the layer, so a file that needs one declares the calls it makes where it
 makes them (`kernel/module.cpp` reading a `.ko`, `kernel/cmd.cpp` for
@@ -117,7 +117,7 @@ pointer and a length.
 
 ## ext2
 
-`src/rust/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
+`src/crates/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
 direct, single-, double- and triple-indirect blocks, sparse files, files past
 4 GiB (`large_file`, a regular file's size in both of its inode's words),
 directories of any size. A file is as big as Linux's ext2 lets one be
@@ -234,7 +234,7 @@ a sequential pass does not re-read its indirect blocks per data block.
 
 ## nanofs, ramfs, procfs
 
-nanofs (`src/rust/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
+nanofs (`src/crates/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
 1024 inodes, 64 MiB of data, files up to 1 MiB, every write copy-on-write
 with the inode committed last. It predates ext2 write support and remains
 for what it is good at — a small, self-verifying store (`format nanofs`,
@@ -247,8 +247,8 @@ piece. Mounted read-only it writes nothing, not even the bitmap repair the
 mount makes of a reachable inode or block marked free. `format` and `mount`
 refuse a device smaller than the layout (69 MB) before touching it.
 
-ramfs (`src/rust/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
-layout puts on `/`, and what `TestVfs` exercises at every boot: a file is
+ramfs (`src/crates/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
+layout puts on `/`, and what `test_vfs` exercises at every boot: a file is
 one buffer that doubles as it grows. procfs (`procfs.rs`) is a ramfs whose
 `/proc/interrupts` is regenerated on each lookup -- the VFS looks a file up
 before it reads it or reports its size, so refreshing there keeps the two
@@ -288,7 +288,7 @@ driver left it as it should.
 
 `fstest [dir] [size]` from the shell (`size` at least 8 KiB), or `fstest=on`
 at boot, runs
-The self-test (`src/rust/fs/src/selftest.rs`) runs in a directory it makes and removes: write
+The self-test (`src/crates/fs/src/selftest.rs`) runs in a directory it makes and removes: write
 and read back, append, write at an offset, truncate both ways with the gap
 checked for zeros, rename, move into a subdirectory, `readdir`, the
 operations that must fail, a file of `size` bytes (300 KiB by default)
@@ -306,5 +306,5 @@ both architectures. `crc32 <path>` checks a file against its copy on the
 host, and `truncate <path> <size>` cuts a file, or grows it with a hole -- a
 guest's blank disk image of any size the filesystem holds.
 
-`TestVfs` in `kernel/test.cpp` runs the same test on a ramfs at every boot,
+`test_vfs` in `kernel/test.cpp` runs the same test on a ramfs at every boot,
 before any disk is up.

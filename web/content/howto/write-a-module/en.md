@@ -5,7 +5,7 @@ order: 8
 updated: 2026-10-22
 ---
 
-By the end of this guide you will have a module of your own. It is a crate under `src/rust/modules/` that builds into a `.ko` file and registers a shell command. You will load it into a running nos with `insmod` and remove it again with `rmmod`, without rebuilding or rebooting the kernel.
+By the end of this guide you will have a module of your own. It is a crate under `src/crates/modules/` that builds into a `.ko` file and registers a shell command. You will load it into a running nos with `insmod` and remove it again with `rmmod`, without rebuilding or rebooting the kernel.
 
 You need:
 
@@ -23,7 +23,7 @@ You need:
 
 ## Start with the smallest real module: `hello`
 
-`src/rust/modules/hello/` contains two files. The first is `Cargo.toml`:
+`src/crates/modules/hello/` contains two files. The first is `Cargo.toml`:
 
 ```toml
 [package]
@@ -40,7 +40,7 @@ kmod = { path = "../../kmod" }
 kcore = { path = "../../kcore" }
 ```
 
-The second is [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hello/src/lib.rs), shown here without its doc comment:
+The second is [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hello/src/lib.rs), shown here without its doc comment:
 
 ```rust
 #![no_std]
@@ -96,10 +96,10 @@ What each part does:
 Copy `hello` and give the copy a name of its own. This guide uses `greet`:
 
 ```sh
-cp -r src/rust/modules/hello src/rust/modules/greet
+cp -r src/crates/modules/hello src/crates/modules/greet
 ```
 
-In `src/rust/modules/greet/Cargo.toml`, rename the package to `mod-<name>` and the library to `mod_<name>`. The Makefile expects exactly these names: it builds the package `mod-greet` and links `libmod_greet.a`.
+In `src/crates/modules/greet/Cargo.toml`, rename the package to `mod-<name>` and the library to `mod_<name>`. The Makefile expects exactly these names: it builds the package `mod-greet` and links `libmod_greet.a`.
 
 ```diff
  [package]
@@ -114,7 +114,7 @@ In `src/rust/modules/greet/Cargo.toml`, rename the package to `mod-<name>` and t
  crate-type = ["staticlib"]
 ```
 
-Add the crate to the workspace's `members` in `src/rust/Cargo.toml` (the line is shortened here). Leave `default-members` alone, because that list is what the kernel's own build compiles.
+Add the crate to the workspace's `members` in `src/crates/Cargo.toml` (the line is shortened here). Leave `default-members` alone, because that list is what the kernel's own build compiles.
 
 ```diff
 -members = [..., "modules/hv", "modules/heapbench"]
@@ -128,7 +128,7 @@ Add the name to `MODULES` in the `Makefile`:
 +MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench greet
 ```
 
-Finally, in `src/rust/modules/greet/src/lib.rs`, change the command's name and help text, and set the module's name in `kmod::module!(name: "greet", init: init)`.
+Finally, in `src/crates/modules/greet/src/lib.rs`, change the command's name and help text, and set the module's name in `kmod::module!(name: "greet", init: init)`.
 
 ### Reach the kernel through `kcore`
 
@@ -158,7 +158,7 @@ Modules follow the project's conventions. These rules matter most:
 - **Never allocate or free memory while holding a spin lock.** The page allocator flushes the TLB of every other CPU (a TLB shootdown) and waits for all of them to answer. A CPU spinning on your lock has interrupts off, so it can never answer. The two wait for each other until, ten seconds later, the kernel panics and names the CPUs that never answered. Instead, collect what needs freeing under the lock, unlock, and only then free it.
 - **Be careful with objects that wait when dropped.** A UDP listener, a `TaskHandle` or an interrupt handle waits for its callbacks when it is dropped. Keep each one in its own `Lock<Option<..>>`: `take()` it under the lock, and drop it after you unlock. If you drop it while holding the lock its wait needs, you get a deadlock.
 - **Never run `rmmod` from the module's own command.** The unload would wait for that command, and the command would wait for the unload.
-- **A module can call only what `ffi` declares.** A new kernel service takes three steps: the C++ function in `src/cpp/kernel/rust_ffi.cpp`, its declaration in `src/rust/ffi`, and the safe wrapper in `src/rust/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). This changes the interface digest, so the kernel and every module have to be rebuilt together.
+- **A module can call only what `ffi` declares.** A new kernel service takes three steps: the C++ function in `src/base/kernel/rust_ffi.cpp`, its declaration in `src/crates/ffi`, and the safe wrapper in `src/crates/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). This changes the interface digest, so the kernel and every module have to be rebuilt together.
 
 ## Build it
 
@@ -173,7 +173,7 @@ These commands produce `out/x86_64/modules/greet.ko` and `out/aarch64/modules/gr
 docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src nos-builder make modules
 ```
 
-Each module is compiled separately into `src/rust/target/modules`, with its own copy of `core`, `alloc`, `kcore` and `kmod`. A module needs flags that the kernel's Rust does not use:
+Each module is compiled separately into `src/crates/target/modules`, with its own copy of `core`, `alloc`, `kcore` and `kmod`. A module needs flags that the kernel's Rust does not use:
 
 - **position-independent code**, because nobody knows in advance where the module will be loaded;
 - **on x86, the small code model**, while the kernel itself uses the large one;
@@ -227,7 +227,7 @@ module: hello unloaded
 
 ## What the loader checks
 
-`insmod` passes the file to the loader in `src/cpp/kernel/module.cpp`. The loader goes through the steps below in order and refuses the module at the first one that fails:
+`insmod` passes the file to the loader in `src/base/kernel/module.cpp`. The loader goes through the steps below in order and refuses the module at the first one that fails:
 
 1. **The file.** It must be a little-endian ELF64 shared object for this CPU, with its headers inside the file and no thread-local or interpreter segment. Every loadable segment must be page-aligned, lie inside the file, not overlap the others, and **never be both writable and executable**.
 2. **The imports, before anything is mapped.** The loader looks up each undefined symbol in the kernel's export table. If the kernel cannot provide them all, the loader refuses the module and lists everything that is missing.
@@ -274,5 +274,5 @@ Backtraces name the frames in a module's code the same way as the kernel's own, 
 
 - [Loadable kernel modules](/docs/modules): the reference, which also describes the larger modules `blkload`, `netload`, `netblk`, `sshd`, `heapbench` and `hv`.
 - [Rust in the kernel](/docs/rust): the layers, where `unsafe` goes, and what `kcore` has.
-- The source of the real modules: [`src/rust/modules`](https://github.com/irqlevel/nos/blob/master/src/rust/modules).
+- The source of the real modules: [`src/crates/modules`](https://github.com/irqlevel/nos/blob/master/src/crates/modules).
 - [Boot a Linux guest](/howto/linux-guest): the biggest module of all, the hypervisor.

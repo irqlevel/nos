@@ -1,0 +1,399 @@
+extern main_x86_64
+extern ap_main
+
+global Start32
+global ap_start16
+
+; Must equal kernel::MAX_CPUS (kernel/cpu.h). Each CPU gets one CPU_STACK_SIZE
+; page of .trampolinedata to run on between the SIPI and the switch to its
+; real stack in kernel/main.cpp, so this directly sizes a low-memory
+; reservation: 64 CPUs put the end of .trampolinedata at 0x55000. The linker
+; script asserts it stays clear of the top of low memory.
+%define MAX_CPUS 64
+%define CPU_STACK_SIZE 4096
+
+; Control-register bits touched by enable_paging (SDM Vol. 3, 2.5)
+%define CR0_PG (1 << 31)
+%define CR0_CD (1 << 30)
+%define CR0_NW (1 << 29)
+%define CR0_NE (1 << 5)
+%define CR4_MCE (1 << 6)
+%define CR4_PAE (1 << 5)
+
+section .trampolinedata nobits
+align 4096
+p4_table:
+    resb 4096
+align 4096
+p3_low_table:
+    resb 4096
+align 4096
+p2_low_table:
+    resb 4 * 4096
+align 4096
+p3_high_table:
+    resb 4096
+align 4096
+p2_high_table:
+    resb 4 * 4096
+align 4096
+stack_bottom:
+    resb CPU_STACK_SIZE * MAX_CPUS
+stack_top:
+
+section .trampolinerodata
+gdt64:
+    dq 0 ; zero entry
+.code: equ $ - gdt64 ; new
+    dq (1<<43) | (1<<44) | (1<<47) | (1<<53) ; code segment
+.pointer:
+    dw $ - gdt64 - 1
+    dq gdt64
+
+gdt32:
+    dq 0x0000000000000000       ; Null Descriptor
+.code equ $ - gdt32                 ; Code segment
+    dq 0x00cf9a000000ffff
+.data equ $ - gdt32                 ; Data segment
+    dq 0x00cf92000000ffff
+.desc:
+    dw $ - gdt32 - 1            ; 16-bit Size (Limit)
+    dd gdt32                    ; 32-bit Base Address
+
+BITS 16
+section .trampoline
+ap_start16:
+    lgdt [gdt32.desc]
+    mov eax, cr0
+    or al, 0x01
+    mov cr0, eax
+    jmp gdt32.code:ap_start32_stub         ; Jump to 32-bit code
+ap_start32_stub:
+    BITS 32
+    jmp gdt32.code:ap_start32         ; Jump to 32-bit code
+
+BITS 32
+section .multiboot
+align 8
+multiboot_header:
+    dd 0xe85250d6                ; magic number (multiboot 2)
+    dd 0                         ; architecture 0 (protected mode i386)
+    dd multiboot_header_end - multiboot_header  ; header length
+    ; checksum
+    dd -(0xe85250d6 + 0 + (multiboot_header_end - multiboot_header))
+
+align 8
+    ; console flags tag: we can also live with EGA text (bit 1), and do
+    ; not require a console at all (bit 0 clear) -- this is what lets GRUB
+    ; keep legacy text mode on BIOS if it cannot set a graphics mode.
+    dw 4    ; type: console flags
+    dw 1    ; flags: optional
+    dd 12   ; size
+    dd 2    ; console_flags: EGA text supported
+
+align 8
+    ; framebuffer request tag: without it GRUB only ever tries EGA text,
+    ; which does not exist under UEFI -- it then reports no framebuffer at
+    ; all and everything written to 0xB8000 lands in plain RAM.
+    ; A modest fixed mode is requested on purpose: the console grid stays
+    ; readable (128x48 cells of the 8x16 font) and one scroll repaints a
+    ; bounded number of pixels over uncached framebuffer memory. GRUB falls
+    ; back to the firmware's own mode if this one is unavailable.
+    dw 5    ; type: framebuffer
+    dw 1    ; flags: optional
+    dd 20   ; size
+    dd 1024 ; width
+    dd 768  ; height
+    dd 32   ; depth
+
+align 8
+    ; required end tag
+    dw 0    ; type
+    dw 0    ; flags
+    dd 8    ; size
+multiboot_header_end:
+
+section .trampoline
+align 4
+stack_counter:
+    dd 0
+align 8
+mbinfo:
+    dq 0
+align 8
+mbsig:
+    dq 0
+
+%macro AllocStack 0
+    xor eax, eax
+    inc eax
+    lock xadd dword [stack_counter], eax
+    cmp eax, MAX_CPUS
+    jge .nostack
+    mov ebx, CPU_STACK_SIZE
+    mul ebx
+    mov edx, stack_top
+    sub edx, eax
+    mov eax, edx
+    jmp .out
+.nostack:
+    xor eax, eax
+    mov al, "3"
+    jmp error
+.out:
+%endmacro
+
+; Prints `ERR: ` and the given error code to screen and hangs.
+; parameter: error code (in ascii) in al
+error:
+    mov dword [0xb8000], 0x4f524f45
+    mov dword [0xb8004], 0x4f3a4f52
+    mov dword [0xb8008], 0x4f204f20
+    mov byte  [0xb800a], al
+    cli
+    hlt
+
+check_multiboot:
+    cmp eax, 0x36d76289
+    jne .no_multiboot
+    ret
+
+.no_multiboot:
+    mov al, "0"
+    jmp error
+
+check_cpuid:
+    ; Check if CPUID is supported by attempting to flip the ID bit (bit 21)
+    ; in the FLAGS register. If we can flip it, CPUID is available.
+
+    ; Copy FLAGS in to EAX via stack
+    pushfd
+    pop eax
+
+    ; Copy to ECX as well for comparing later on
+    mov ecx, eax
+
+    ; Flip the ID bit
+    xor eax, 1 << 21
+
+    ; Copy EAX to FLAGS via the stack
+    push eax
+    popfd
+
+    ; Copy FLAGS back to EAX (with the flipped bit if CPUID is supported)
+    pushfd
+    pop eax
+
+    ; Restore FLAGS from the old version stored in ECX (i.e. flipping the
+    ; ID bit back if it was ever flipped).
+    push ecx
+    popfd
+
+    ; Compare EAX and ECX. If they are equal then that means the bit
+    ; wasn't flipped, and CPUID isn't supported.
+    cmp eax, ecx
+    je .no_cpuid
+    ret
+.no_cpuid:
+    mov al, "1"
+    jmp error
+
+check_long_mode:
+    ; test if extended processor info in available
+    mov eax, 0x80000000    ; implicit argument for cpuid
+    cpuid                  ; get highest supported argument
+    cmp eax, 0x80000001    ; it needs to be at least 0x80000001
+    jb .no_long_mode       ; if it's less, the CPU is too old for long mode
+
+    ; use extended info to test if long mode is available
+    mov eax, 0x80000001    ; argument for extended processor info
+    cpuid                  ; returns various feature bits in ecx and edx
+    test edx, 1 << 29      ; test if the LM-bit is set in the D-register
+    jz .no_long_mode       ; If it's not set, there is no long mode
+    ret
+.no_long_mode:
+    mov al, "2"
+    jmp error
+
+setup_low_page_tables:
+    ; map first P4 entry to P3 table
+    mov eax, p3_low_table
+    or eax, 0b00011 ; present + writable
+    mov [p4_table], eax
+
+    mov ebx, 0
+    mov edi, 0
+    mov esi, p2_low_table
+.map_p3_table:
+    ; map first P3 entry to P2 table
+
+    mov eax, esi
+    or eax, 0b00011 ; present + writable
+    mov [p3_low_table + edi * 8], eax
+
+   ; map each P2 entry to a huge 2MiB page
+    mov ecx, 0         ; counter variable
+
+.map_p2_table:
+    ; map ecx-th P2 entry to a huge page that starts at address 2MiB*ecx
+    mov eax, 0x200000  ; 2MiB
+    mul ecx            ; start address of ecx-th page
+
+    add eax, ebx
+
+    ; Write-back cacheable: MTRRs keep MMIO holes (LAPIC, IOAPIC, PCI)
+    ; uncached on real hardware. Mapping RAM with PCD set would run the
+    ; whole kernel uncached on bare metal.
+    or eax, 0b10000011 ; present + writable + huge
+    mov [esi + ecx * 8], eax ; map ecx-th entry
+
+    inc ecx            ; increase counter
+    cmp ecx, 512       ; if counter == 512, the whole P2 table is mapped
+    jne .map_p2_table  ; else map the next entry
+    inc edi
+    add esi, 4096
+    add ebx, 0x40000000 ; 1GB
+    cmp edi, 4
+    jne .map_p3_table
+
+    ret
+
+setup_high_page_tables:
+    ; map first P4 entry to P3 table
+    mov eax, p3_high_table
+    or eax, 0b00011 ; present + writable
+    mov [p4_table + 256 * 8], eax
+
+    mov ebx, 0
+    mov edi, 0
+    mov esi, p2_high_table
+.map_p3_table:
+    ; map first P3 entry to P2 table
+
+    mov eax, esi
+    or eax, 0b00011 ; present + writable
+    mov [p3_high_table + edi * 8], eax
+
+   ; map each P2 entry to a huge 2MiB page
+    mov ecx, 0         ; counter variable
+
+.map_p2_table:
+    ; map ecx-th P2 entry to a huge page that starts at address 2MiB*ecx
+    mov eax, 0x200000  ; 2MiB
+    mul ecx            ; start address of ecx-th page
+
+    add eax, ebx
+
+    or eax, 0b10000011 ; present + writable + huge (write-back, see above)
+    mov [esi + ecx * 8], eax ; map ecx-th entry
+
+    inc ecx            ; increase counter
+    cmp ecx, 512       ; if counter == 512, the whole P2 table is mapped
+    jne .map_p2_table  ; else map the next entry
+    inc edi
+    add esi, 4096
+    add ebx, 0x40000000 ; 1GB
+    cmp edi, 4
+    jne .map_p3_table
+
+    ret
+
+enable_paging:
+    ; load P4 to cr3 register (cpu uses this to access the P4 table)
+    mov eax, p4_table
+    mov cr3, eax
+
+    ; PAE (bit 5), and MCE (bit 6) so a machine check raises #MC instead of
+    ; putting the processor into shutdown -- which the platform turns into a
+    ; reset, indistinguishable from a spontaneous reboot. INIT clears cr4, so
+    ; an AP arrives here with neither bit set while the firmware left both on
+    ; for the BSP.
+    mov eax, cr4
+    or eax, CR4_PAE | CR4_MCE
+    mov cr4, eax
+
+    ; set the long mode bit in the EFER MSR (model specific register)
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
+
+    ; Enable paging, and clear CD/NW in the same write. A processor comes out
+    ; of RESET *and out of INIT* with CD=NW=1 (SDM Vol. 3, "Processor State
+    ; After Reset or INIT"): caches disabled, no-fill mode. Firmware clears
+    ; them for the BSP long before GRUB runs, so only the APs arrive here that
+    ; way -- and only on real hardware, because KVM and TCG both ignore CD.
+    ; Left set, every AP runs uncached, and the SDM requires the two logical
+    ; processors of one core to hold identical CD/NW, so the BSP's hyperthread
+    ; sibling coming up with caches off is undefined behaviour outright.
+    ;
+    ; And NE, native x87 error reporting, which INIT clears as well: nothing
+    ; here uses the x87, but VMX operation requires the bit (it is set in
+    ; IA32_VMX_CR0_FIXED0 on every part), and `vmxon` with it clear is a #GP
+    ; rather than a failure. GRUB leaves the BSP's as firmware had it, so
+    ; without this a machine could take VMX on one CPU and not the next.
+    mov eax, cr0
+    and eax, ~(CR0_CD | CR0_NW) & 0xFFFFFFFF
+    or eax, CR0_PG | CR0_NE
+    mov cr0, eax
+
+    ret
+
+Start32:
+    mov [mbsig], eax
+    mov [mbinfo], ebx
+    AllocStack
+    mov esp, eax
+    mov eax, [mbsig]
+    call check_multiboot
+    call check_cpuid
+    call check_long_mode
+    call setup_low_page_tables
+    call setup_high_page_tables
+    call enable_paging
+    ; load the 64-bit GDT
+    lgdt [gdt64.pointer]
+    jmp gdt64.code:long_mode_start
+
+ap_start32:
+    ; The far jump above reloaded only CS. SS/DS/ES still hold the
+    ; post-INIT real-mode descriptor caches (base 0, limit 0xFFFF, B=0),
+    ; so a 32-bit push would truncate ESP mod 64K and the write would land
+    ; inside the boot page tables. Load the 32-bit data descriptor before
+    ; touching the stack or memory.
+    mov ax, gdt32.data
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    AllocStack
+    mov esp, eax
+    call enable_paging
+    ; load the 64-bit GDT
+    lgdt [gdt64.pointer]
+    jmp gdt64.code:long_mode_ap_start
+
+BITS 64
+long_mode_start:
+    ; load 0 into all data segment registers
+    mov ax, 0
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+start64:
+    mov rdi, [mbinfo]
+    mov rax, main_x86_64
+    call rax
+
+long_mode_ap_start:
+    ; load 0 into all data segment registers
+    mov ax, 0
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+ap_start64:
+    mov rax, ap_main
+    call rax

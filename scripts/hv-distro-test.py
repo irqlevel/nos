@@ -68,7 +68,7 @@ gives a networked guest, and cloud-init keeps it.
 
 With `--hvboot`, Debian's and Ubuntu's images boot the way a disk boots,
 nothing taken out of them: the VM's kernel is hvboot (out/x86_64/hvboot,
-src/rust/hvboot), which hv starts by PVH and which reads the image's own
+src/crates/hvboot), which hv starts by PVH and which reads the image's own
 grub.cfg, picks the entry GRUB would boot and boots its kernel and initrd
 off the image's own /boot -- so the image's kernel updates are its own to
 boot. The command line the VM is given is only what the profile adds to the

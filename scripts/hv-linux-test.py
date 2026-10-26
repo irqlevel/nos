@@ -551,7 +551,7 @@ FLOOD_LINES = 20000
 # and just after: the newest line alone, through a filter it does not match.
 FLOOD_BEFORE = "dmesg 1 flood-before"
 FLOOD_AFTER = "dmesg 1 flood-after"
-# dmesg's slots (`Dmesg::MaxMsgs`, src/cpp/kernel/dmesg.h): how many more
+# dmesg's slots (`Dmesg::MAX_MSGS`, src/base/kernel/dmesg.h): how many more
 # lines it can have taken than its count of lines pushed out grew by.
 DMESG_SLOTS = 2048
 

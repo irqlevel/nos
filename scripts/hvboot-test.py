@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """hvboot test: what hvboot boots off a guest's disk, decided on the host.
 
-hvboot (src/rust/hvboot) is the loader hv starts a guest in by PVH; it reads
+hvboot (src/crates/hvboot) is the loader hv starts a guest in by PVH; it reads
 the guest's own partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would. fuzz/hvboot compiles that
-code -- src/rust/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs, as they are --
+code -- src/crates/hvboot/src/{gpt,ext,grub,bzimage,crc32}.rs, as they are --
 into a host program, and this runs it over disks made here:
 
   - GPT with a /boot of its own (an XBOOTLDR partition, as Ubuntu's image

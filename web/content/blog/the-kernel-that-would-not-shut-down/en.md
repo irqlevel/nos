@@ -19,7 +19,7 @@ That changed on September 9, when nos got a read-write ext2 root filesystem ([7e
 
 The quietest failure came first: `poweroff` did nothing. The shell's `poweroff` and `reboot` only set a flag, and the BSP's idle task (the boot CPU's task of last resort) checks it between halts. "Last resort" was new. Since September 5 the scheduler picks an idle task only when nothing else on its CPU can run ([021cbbf](https://github.com/irqlevel/nos/commit/021cbbf3a19f9327ee37584418e8ee4e6f4f66e7)).
 
-At the time, though, `Sleep()` yielded the CPU instead of blocking. A CPU that carried the shell, the DHCP client and the USB poll task always had something runnable. Its idle task never got a turn, and the request sat unseen. On a two-CPU QEMU that happened every time. The ext2 commit of September 9 fixed this too: a request now clears the idle task's `FlagIdleBit`, so from then on that task takes turns like any other ([`cmd.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/cmd.cpp), [Scheduler](/docs/scheduler#the-idle-task)):
+At the time, though, `Sleep()` yielded the CPU instead of blocking. A CPU that carried the shell, the DHCP client and the USB poll task always had something runnable. Its idle task never got a turn, and the request sat unseen. On a two-CPU QEMU that happened every time. The ext2 commit of September 9 fixed this too: a request now clears the idle task's `FlagIdleBit`, so from then on that task takes turns like any other ([`cmd.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/cmd.cpp), [Scheduler](/docs/scheduler#the-idle-task)):
 
 ```cpp
 static void WakeShutdownWatch()
@@ -33,7 +33,7 @@ static void WakeShutdownWatch()
 
 The order of the halt needed work too. Unmounting ext2 writes the superblock, and a block request completes through the BLK_IO soft IRQ, the deferred half of interrupt handling. So the unmount moved ahead of `SoftIrq::Stop()`. Two days later the disk log, which copies the kernel log to a raw partition, turned out to have the same problem ([0d70452](https://github.com/irqlevel/nos/commit/0d704526d5d421c69576d2e79a1af453a4e666df)). With a log area prepared, 0 of 3 poweroffs under QEMU finished. The serial output stopped after the APs (the secondary CPUs) exited: the kernel was waiting on a disk log write that never completed. Now the disk log stops after the unmount and before the soft IRQs.
 
-Here is the x86 order as it stands today, from [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/main.cpp):
+Here is the x86 order as it stands today, from [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/main.cpp):
 
 ```text
 BpStartup, once the request is seen
@@ -70,7 +70,7 @@ The report is where we went wrong. The panic path writes to the PL011 serial por
 
 The single halt was old. It came in 2018 with a commit called "kernel: fix crash on shutdown" ([28ba855](https://github.com/irqlevel/nos/commit/28ba855c298d452d91abadd1362a6a47bd1fd42a)), which replaced an endless spin loop with it. On x86 a halt with interrupts off lasts until the first NMI (non-maskable interrupt). The arm64 port runs the same code, and WFI makes no such promise.
 
-The fix ([7908bf6](https://github.com/irqlevel/nos/commit/7908bf6f5ddf8006aeda5cba5dfdbdb93259b526)) gives an exiting CPU one place to end, `Cpu::Park()`. This is how it looks today, with the `Parked` flag from a fix described below ([`cpu.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/cpu.cpp)):
+The fix ([7908bf6](https://github.com/irqlevel/nos/commit/7908bf6f5ddf8006aeda5cba5dfdbdb93259b526)) gives an exiting CPU one place to end, `Cpu::Park()`. This is how it looks today, with the `Parked` flag from a fix described below ([`cpu.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/cpu.cpp)):
 
 ```cpp
 void Cpu::Park()
@@ -103,7 +103,7 @@ Leaked objects at halt would be harmless if nothing touched them, but the watchd
 
 The fault address said exactly that. In the case we caught, the leaked objects were the soft IRQ tasks, `softirq/N`, allocated with the tag `'SIrq'` and left on their CPUs' exited lists at the halt. `Cpu::~Cpu` faulted with cr2 (the register that holds the faulting address) equal to a task's address plus 0x68. That is the `Blink` field of the task's `Lock.RawLock.WatchdogListEntry`. Which static faulted depended on which bucket the leaked lock had landed in.
 
-The fix ([a51290e](https://github.com/irqlevel/nos/commit/a51290e256fce4e488e59dda2c1c7bd963d95e16)) deletes the two loops and puts a comment in their place that begins "The pages stay mapped" ([`pool.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/mm/pool.cpp)):
+The fix ([a51290e](https://github.com/irqlevel/nos/commit/a51290e256fce4e488e59dda2c1c7bd963d95e16)) deletes the two loops and puts a comment in their place that begins "The pages stay mapped" ([`pool.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/mm/pool.cpp)):
 
 ```diff
 -    while (!FreePageList.IsEmpty())

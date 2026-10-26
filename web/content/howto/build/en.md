@@ -11,7 +11,7 @@ You need:
 
 - a clone of the repository;
 - either Docker, which is how nos is built on macOS (Apple Silicon included), or a Linux machine with the toolchain installed. The reference system is Ubuntu 22.04: the builder image and CI both run on it;
-- disk space: about 4.7 GB for the builder image, plus a couple of gigabytes for the build outputs of both architectures under `out/` and `src/rust/target/`;
+- disk space: about 4.7 GB for the builder image, plus a couple of gigabytes for the build outputs of both architectures under `out/` and `src/crates/target/`;
 - network access to install the toolchain. The build itself never touches the network.
 
 ```sh
@@ -86,12 +86,12 @@ sudo apt-get install -y build-essential clang lld llvm nasm \
     python3 curl
 ```
 
-The Rust toolchain must be a dated nightly with the `rust-src` component. Run the following from the repository root. CI uses the same command, and it installs the exact nightly named in [`src/rust/rust-toolchain.toml`](https://github.com/irqlevel/nos/blob/master/src/rust/rust-toolchain.toml):
+The Rust toolchain must be a dated nightly with the `rust-src` component. Run the following from the repository root. CI uses the same command, and it installs the exact nightly named in [`src/crates/rust-toolchain.toml`](https://github.com/irqlevel/nos/blob/master/src/crates/rust-toolchain.toml):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --component rust-src --default-toolchain \
-    "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src/rust/rust-toolchain.toml)"
+    "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src/crates/rust-toolchain.toml)"
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
@@ -105,7 +105,7 @@ make
 |---|---|
 | `make` | runs `make check`, then builds `nos.iso` and the modules |
 | `make nocheck` | the same without cppcheck |
-| `make check` | runs only cppcheck over `src/cpp`; any finding fails it |
+| `make check` | runs only cppcheck over `src/base`; any finding fails it |
 | `make rust` | builds only the Rust staticlib, `libkernel.a` |
 | `make modules` | builds only the modules |
 | `make nocheck ARCH=aarch64` | builds the arm64 kernel, its image and its modules |
@@ -133,9 +133,9 @@ A module loads only into a kernel built from the same tree. The loader checks a 
 
 ## How the toolchain is pinned and dependencies are vendored
 
-- `src/rust/rust-toolchain.toml` pins a dated nightly (`nightly-2026-08-30` at the time of writing) with `rust-src`. The kernel's Rust needs nightly for two things: `-Z build-std`, which rebuilds `core` and `alloc` with the large code model, and the `alloc_error_handler` feature.
-- The external crates are vendored, that is, their sources are kept in the repository under `src/rust/vendor`, and the Makefile runs cargo with `--offline`. They include rustls, the RustCrypto crates behind TLS and SSH, and the crates that std itself depends on. No build ever reaches crates.io. If a build asks for the network, some dependency was never vendored, and cargo fails with an error instead of downloading it.
-- After you add, remove or bump a dependency in `src/rust`, run `scripts/vendor.sh`. It is the only step that needs the network. Commit the updated `src/rust/vendor` together with `Cargo.lock`. If you bump the toolchain pin, re-run `scripts/vendor.sh` in the same commit: the vendored set includes std's own dependencies, and those change from one nightly to the next.
+- `src/crates/rust-toolchain.toml` pins a dated nightly (`nightly-2026-08-30` at the time of writing) with `rust-src`. The kernel's Rust needs nightly for two things: `-Z build-std`, which rebuilds `core` and `alloc` with the large code model, and the `alloc_error_handler` feature.
+- The external crates are vendored, that is, their sources are kept in the repository under `src/crates/vendor`, and the Makefile runs cargo with `--offline`. They include rustls, the RustCrypto crates behind TLS and SSH, and the crates that std itself depends on. No build ever reaches crates.io. If a build asks for the network, some dependency was never vendored, and cargo fails with an error instead of downloading it.
+- After you add, remove or bump a dependency in `src/crates`, run `scripts/vendor.sh`. It is the only step that needs the network. Commit the updated `src/crates/vendor` together with `Cargo.lock`. If you bump the toolchain pin, re-run `scripts/vendor.sh` in the same commit: the vendored set includes std's own dependencies, and those change from one nightly to the next.
 - The Dockerfile and both CI workflows read the pin from that one file, so the version lives in exactly one place.
 
 ## Build with undefined-behaviour checks
@@ -149,7 +149,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 `UBSAN=1` builds the C++ with clang's undefined-behaviour sanitizer. `RUSTUB=1` turns on two kinds of checks in the Rust: `core`'s checks of its own unsafe preconditions, and arithmetic overflow checks. You can use the flags separately or together. The first check that fails causes a panic that names its site:
 
 ```text
-PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/cpp/...
+PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/base/...
 ```
 
 The output files keep their usual names. The instrumented C++ objects go to `out/<arch>-ubsan/`. A stamp file in `out/` makes the build relink the images whenever you switch flavour, so a plain build never ships an instrumented kernel. The `version` command adds `+ubsan` or `+rustub` to its output. To collect every C++ report during a boot instead of panicking on the first one, boot with `ubsan=warn`. For details, see [UBSan](/docs/build#ubsan) and [Rust UB checks](/docs/build#rust-ub-checks).
@@ -160,7 +160,7 @@ For both `x86_64` and `aarch64`, CI ([`ci.yml`](https://github.com/irqlevel/nos/
 
 Two things to watch for:
 
-- **Source lists are explicit.** The Makefile lists every C++ file in `CXX_SRC_x86_64` and `CXX_SRC_aarch64`, and the assembly files in `ASM_SRC_*` and `ASM_S_SRC_*`. A new `.cpp` file that isn't in a list is silently not compiled, so add portable code to both lists. If common code calls an entry point that exists only on x86, add an unreachable link stub to [`x86_driver_stubs.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/x86_driver_stubs.cpp) rather than an `#ifdef`.
+- **Source lists are explicit.** The Makefile lists every C++ file in `CXX_SRC_x86_64` and `CXX_SRC_aarch64`, and the assembly files in `ASM_SRC_*` and `ASM_S_SRC_*`. A new `.cpp` file that isn't in a list is silently not compiled, so add portable code to both lists. If common code calls an entry point that exists only on x86, add an unreachable link stub to [`x86_driver_stubs.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/x86_driver_stubs.cpp) rather than an `#ifdef`.
 - **Judge a run by its exit code.** Before you send a change, build both architectures and boot both:
 
 ```sh

@@ -182,7 +182,7 @@ between the three.
 is not in the hypervisor.** VMX operation requires `CR0.NE` (bit 5; it is in
 `IA32_VMX_CR0_FIXED0` on every Intel part), and `nos` never sets it. The APs
 come out of INIT with `CR0 = 0x60000010`, NE clear, and the boot path adds
-PE and PG (`boot64.asm`) and WP (`EnableWxSupport`) and nothing else; the BSP
+PE and PG (`boot64.asm`) and WP (`enable_wx_support`) and nothing else; the BSP
 has whatever GRUB and the firmware left, which Multiboot2 calls undefined.
 `vmxon` does not fail on that -- it faults, and this kernel panics on a #GP
 -- so `vmx::enable` checks the fixed bits on each CPU before it, the error
@@ -196,7 +196,7 @@ bit:
 The check is per CPU and not part of the machine-wide verdict, because the
 registers are per CPU: a verdict that changed with the CPU `insmod` happened
 to run on would be no verdict. The fix is one bit on every CPU, beside where
-`EnableWxSupport` sets WP -- what every other x86-64 kernel does. NE chooses
+`enable_wx_support` sets WP -- what every other x86-64 kernel does. NE chooses
 native `#MF` over the PC's FERR#/IRQ 13 for x87 errors, and this kernel has
 no x87 code to raise one: the C++ is built with `-mno-80387`, so there is no
 x87 instruction in the image and none can appear, and the Rust targets are
@@ -610,7 +610,7 @@ Two rules make it the one place that decides what a guest can reach:
   rule: a device reads and writes them at every request, and a copy maps
   and unmaps a page -- a TLB flush -- at every access, a dozen a frame. So
   they are mapped while the queue is up (`GuestMemory::map`, three pages
-  a queue, through `Mm::MapPages`) and still reached a value at a time --
+  a queue, through `mm::map_pages`) and still reached a value at a time --
   one volatile load or store at a checked, aligned offset, an index with
   acquire or release (`kcore::frame::Mapped`). The mapping holds a share of
   its region's frames (`kcore::frame::Run`), so none is freed while it is
@@ -658,7 +658,7 @@ guest's memory is frames taken a page at a time, as it always was, each a
 pool at boot -- 2 MiB blocks, physically contiguous and aligned, taken off
 the free list right after it is built, before anything has fragmented it,
 the highest first, and never so many that less than twice the kernel's
-reserve is left (`PageTable::ReserveHugePool`, [Kernel
+reserve is left (`PageTable::reserve_huge_pool`, [Kernel
 parameters](kernel-parameters.md#memory)) -- and every guest's memory is
 the pool's: a block every 2 MiB (`kcore::frame::HugeFrame`, a `Run` of
 them), zeroed when it is handed out, and mapped with one entry of the level
@@ -682,8 +682,8 @@ the most RAM the bootstrap map can reach, one saying what is in the pool --
 written once, at boot, before there is another CPU -- and one what of it is
 free, under the page allocator's lock. A block of the pool is on no free
 list and in no count of free pages, its pages' descriptors as a page handed
-out has them, so nothing else can take a page of it; `FreeFrame` of a page
-inside one and `FreeHugeFrame` of anything that is no block handed out are
+out has them, so nothing else can take a page of it; `free_frame` of a page
+inside one and `free_huge_frame` of anything that is no block handed out are
 panics. `cpp-fuzz.py`'s `pagetable` target reserves pools on machines of
 more than 4 MiB, hands their blocks out and back, and holds every step to a
 model; every arm64 smoke boot reserves one (`hugepages=64M`) and has the
@@ -875,7 +875,7 @@ stgi                      with IF still clear: the interrupt that ended the turn
 The `vmsave`/`vmload` of the host's state is not optional here: this
 kernel keeps its per-CPU data at the GS base. Taken out on purpose, the
 first thing the host does after a guest's exit is a page fault at address 0
-in `Hal::GetCurrentCpuHwId()` -- the gate's `hv run` panics the kernel.
+in `hal::get_current_cpu_hw_id()` -- the gate's `hv run` panics the kernel.
 
 ### The exits
 
@@ -986,7 +986,7 @@ which CPU: `hv: guest exits not run -- the extension is not on for cpu 2`.
 ## What the extension costs while it is on
 
 - **On Intel, a CPU in VMX root operation ignores INIT.** It cannot be
-  brought back up through the INIT/SIPI sequence `CpuTable::StartAll` starts
+  brought back up through the INIT/SIPI sequence `CpuTable::start_all` starts
   APs with until `vmxoff`. Nothing in `nos` re-INITs a running CPU today;
   kexec-style live update (stage 5) will have to.
 - **On AMD, `EFER.SVME` only enables the instructions**, and costs nothing
@@ -1727,7 +1727,7 @@ interrupts off over storage taken when the port is first claimed, and kept
 for the next VM on it; a full one drops, counted in `hv list`. A frame put in wakes the guest's vCPU:
 a halted guest waits on its VM's event, until its timer's next edge or
 something for it -- a frame, a key typed at `hv attach` or `hv send` --
-whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
+whichever comes first (`Event::wait_for`, [the scheduler](scheduler.md#blocking-and-waking)).
 
 **What the guests share is shared out.** `hv0`'s backlog -- the 256 frames
 handed in and not yet taken by the stack's receive pass
@@ -2081,7 +2081,7 @@ booted again -- is the control plane's to decide.
 **Idle guests cost their CPU next to nothing, sharing one or not.** A halted
 vCPU sleeps until its guest's next timer edge, and `Sleep()` blocks
 ([the scheduler](scheduler.md#blocking-and-waking)): it used to be a loop
-around `Schedule()`, and two halted guests on one CPU of the AX41 handed it to
+around `schedule()`, and two halted guests on one CPU of the AX41 handed it to
 each other without end -- 46% of it each, the idle task never running -- where
 one alone took 0.1%. Blocking, the same two take 0.1% each, and sixteen idle
 guests on the AX41's twelve CPUs -- four of them carrying two -- keep the
@@ -2612,7 +2612,7 @@ the page allocator's lock for more than ten seconds, with every other CPU
 idle, and the watchdog panicked the machine: each page was zeroed under the
 lock, and QEMU throws away its translations of a page that held a guest's
 code as the page is written -- a guest that had run for half a minute took
-36 s to rebuild. The zeroing is done off the lock now (`PageTable::AllocPage`).
+36 s to rebuild. The zeroing is done off the lock now (`PageTable::alloc_page`).
 
 The gate is `scripts/hv-distro-test.py --iso alpine-virt-*-x86_64.iso
 [--debian debian-*-nocloud-amd64.raw] [--internet]` ([Tests and
@@ -2679,7 +2679,7 @@ class made from its input, the start info to what the guest was given --
 its magic, its one module, a memory map of RAM up to the guest's last byte
 in order -- and the entry to paging off. hv's unsafe count is still 4.
 
-**hvboot** (`src/rust/hvboot`, built by `make` and kept as `/lib/hvboot`
+**hvboot** (`src/crates/hvboot`, built by `make` and kept as `/lib/hvboot`
 in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
 the guest. It reads:
 
@@ -3129,7 +3129,7 @@ untaken.
 **A timer's edge, on time.** A guest's timers -- the PIT's channel 0 and
 each CPU's local APIC timer -- have their next edge armed on the host CPU
 the vCPU runs on: as its task sleeps, halted, until the edge
-(`Event::WaitFor`, whose deadline arms the CPU's one-shot timer -- [the
+(`Event::wait_for`, whose deadline arms the CPU's one-shot timer -- [the
 local timer](scheduler.md#the-local-timer)), and before each entry into
 the guest (`kcore::cpu::timer_at`), so that a guest computing with no exit
 is taken out of it at the edge, by a host interrupt, and handed its own then.
@@ -3202,7 +3202,7 @@ which Linux sets on every CPU and nos did not, and the firmware had not:
 the RDTSC ran ahead of a cache line on its way from the other CCX, and the
 time that took looked like a warp. nos sets the bit on every CPU now, the
 BSP's boot log saying when the firmware left it clear
-(`Hal::SetupSerializingLfence`); a guest of four CPUs across both CCXs (13,
+(`hal::setup_serializing_lfence`); a guest of four CPUs across both CCXs (13,
 11, 9 and 5) keeps its TSC.
 
 ### Device interrupts, by MSI-X
@@ -3570,7 +3570,7 @@ read-only through a loop device; the image had 0.3 GiB of holes filled on
 the way. What bounded the rate then was ext2 writing a request's blocks one
 4 KiB command at a time, each synchronous: the disk's task was at a whole
 CPU while the guest wrote, `profile` putting most of it in the NVMe
-driver's `WaitGroup::Wait` yielding until the command completed.
+driver's `WaitGroup::wait` yielding until the command completed.
 
 Booted once more with a file's blocks going to the disk in batches, 32
 commands in flight at once (63a7bb2, [Filesystems](filesystems.md)):
@@ -3588,9 +3588,9 @@ third as much CPU reading the boot in. `e2fsck` found `nosenv` and the
 guest's ext4 clean again. What bounds the guest now is its vCPU, at 85% of
 its CPU while `dd` writes: two thirds of that is copying each request's
 data out of guest memory, a page at a time through the kernel's temporary
-window and eight bytes at a time inside it (`FrameCopy`, a `MemCpy` call a
+window and eight bytes at a time inside it (`frame_copy`, a `mem_cpy` call a
 word), and a fifth the guest itself running. A page's part of a copy is
-one `MemCpy` now: under TCG the guest's 48 MiB `dd ... conv=fsync` onto a
+one `mem_cpy` now: under TCG the guest's 48 MiB `dd ... conv=fsync` onto a
 whole image takes 0.42 s where it took 0.64, and reading it back 0.24 s
 where it took 0.44, on virtio-blk and on NVMe alike.
 
@@ -3841,7 +3841,7 @@ someone else's; then speed.
    `store_u16` and the kernel's `kernel_frame_load16` and `store16` -- the
    load an acquire and the store a release. What it was: `read_u16` of
    `avail.idx` and `Queue::push`'s store of `used.idx` go through
-   `GuestMemory::read` and `write` to `FrameCopy`, whose `MemCpy` is a
+   `GuestMemory::read` and `write` to `frame_copy`, whose `mem_cpy` is a
    `rep movsb` of two bytes: nothing makes the two one access. When a
    driver on another CPU moves the index across a multiple of 256 while the
    host reads it, 0x0100 can be read as 0x01FF -- `Broken::Overrun`, the
@@ -3929,7 +3929,7 @@ someone else's; then speed.
    - ~~Nothing keeps host memory back~~ -- done: a frame is not taken
      past a reserve the kernel keeps for itself, a sixteenth of the machine
      and no less than 64 MiB (`kernel_frame_alloc`, over
-     `PageTable::AllocPageKeeping`), so a guest too large is refused out of
+     `PageTable::alloc_page_keeping`), so a guest too large is refused out of
      memory rather than taking the last page; and `guest::build` reads and
      plans the image before it takes any of the guest's memory. The size of
      the reserve is a guess to revisit. What it was: `mem=` was checked
@@ -4297,14 +4297,14 @@ someone else's; then speed.
 - ~~`finish` and `FileDisk::drop` wait for their tasks with no deadline: a
   disk task stuck in a read hangs `hv stop`, `rmmod` and the host's
   shutdown with nothing said.~~ Done for every join in the kernel
-  (`Task::Wait`, [Scheduler](scheduler.md#waiting-for-one-to-end)): a wait
+  (`Task::wait`, [Scheduler](scheduler.md#waiting-for-one-to-end)): a wait
   still going after ten seconds is reported -- who waits, for which task
   (`hv/vm3`, `hv/vm3/vda`, `hv/vm3/cpu1`), for how long, and where that task
   is, its frames named, or the CPU it is on that takes no interrupt -- and
   again each time the wait has doubled. It still waits: a task that has
   not exited is still using what its waiter would free.
 - Stage 4 needs what the shell's strings stand in for today: a typed
-  `start(Spec) -> Result<Id>` and status, names, VM definitions kept across
+  `start(Spec) -> Result<id>` and status, names, VM definitions kept across
   a reboot, images handled -- claims, copies -- and quotas.
 - Stage 5's constraints, above, do not hold yet. Guest memory is frames of
   4 KiB from the general allocator, with no machine-wide table of who owns

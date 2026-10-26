@@ -60,7 +60,7 @@ mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
 pub use devices::offload;
 pub use netwire as wire;
-#[path = "../../../src/rust/kcore/src/pod.rs"]
+#[path = "../../../src/crates/kcore/src/pod.rs"]
 pub mod pod;
 mod cpu;
 pub use cpu::{machine, svm, vm, x86, Caps, Error, Ext, Result, Vendor};
@@ -69,48 +69,48 @@ pub mod memory;
 /* ---- the hypervisor's own sources ---- */
 
 pub mod devices;
-#[path = "../../../src/rust/hv/src/acpi.rs"]
+#[path = "../../../src/crates/hv/src/acpi.rs"]
 pub mod acpi;
-#[path = "../../../src/rust/hv/src/cr.rs"]
+#[path = "../../../src/crates/hv/src/cr.rs"]
 pub mod cr;
-#[path = "../../../src/rust/hv/src/dr.rs"]
+#[path = "../../../src/crates/hv/src/dr.rs"]
 pub mod dr;
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
-#[path = "../../../src/rust/modules/hv/src/dhcp.rs"]
+#[path = "../../../src/crates/modules/hv/src/dhcp.rs"]
 pub mod dhcp;
-#[path = "../../../src/rust/hv/src/insn.rs"]
+#[path = "../../../src/crates/hv/src/insn.rs"]
 pub mod insn;
-#[path = "../../../src/rust/hv/src/lapic.rs"]
+#[path = "../../../src/crates/hv/src/lapic.rs"]
 pub mod lapic;
-#[path = "../../../src/rust/hv/src/linux.rs"]
+#[path = "../../../src/crates/hv/src/linux.rs"]
 pub mod linux;
-#[path = "../../../src/rust/hv/src/pvh.rs"]
+#[path = "../../../src/crates/hv/src/pvh.rs"]
 pub mod pvh;
-#[path = "../../../src/rust/hv/src/mmio.rs"]
+#[path = "../../../src/crates/hv/src/mmio.rs"]
 pub mod mmio;
 /// NAT, from the net crate: what a guest's packets for the world, and the
 /// world's answers, go through. Its `use kcore::trace` is the kernel's macro;
 /// here `trace!` is the one above, in scope already, and the import unused.
 #[allow(unused_imports)]
-#[path = "../../../src/rust/net/src/nat.rs"]
+#[path = "../../../src/crates/net/src/nat.rs"]
 pub mod nat;
-#[path = "../../../src/rust/hv/src/place.rs"]
+#[path = "../../../src/crates/hv/src/place.rs"]
 pub mod place;
-#[path = "../../../src/rust/hv/src/policy.rs"]
+#[path = "../../../src/crates/hv/src/policy.rs"]
 pub mod policy;
-#[path = "../../../src/rust/hv/src/run.rs"]
+#[path = "../../../src/crates/hv/src/run.rs"]
 pub mod run;
-#[path = "../../../src/rust/hv/src/smp.rs"]
+#[path = "../../../src/crates/hv/src/smp.rs"]
 pub mod smp;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
-#[path = "../../../src/rust/modules/hv/src/net.rs"]
+#[path = "../../../src/crates/modules/hv/src/net.rs"]
 pub mod switch;
 /// A VM's vm.toml, from the module: what an operator writes, read and
 /// written back.
-#[path = "../../../src/rust/modules/hv/src/config.rs"]
+#[path = "../../../src/crates/modules/hv/src/config.rs"]
 pub mod vmconfig;
-#[path = "../../../src/rust/hv/src/walk.rs"]
+#[path = "../../../src/crates/hv/src/walk.rs"]
 pub mod walk;
 
 mod configmodel;

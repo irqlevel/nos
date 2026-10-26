@@ -21,7 +21,7 @@ tags: [safety, boot, debugging, testing]
 
 ## Неверно и незаметно
 
-Два других — нет. Это спинлок конфигурационного пространства в `Pci` и `Pl011::OutLock`, спинлок вывода консоли на arm64. Оба имеют тип `RawSpinLock`, а конструктор `RawSpinLock` делает настоящую работу: регистрирует спинлок в watchdog блокировок ([raw_spin_lock.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/raw_spin_lock.cpp)).
+Два других — нет. Это спинлок конфигурационного пространства в `Pci` и `Pl011::OutLock`, спинлок вывода консоли на arm64. Оба имеют тип `RawSpinLock`, а конструктор `RawSpinLock` делает настоящую работу: регистрирует спинлок в watchdog блокировок ([raw_spin_lock.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/raw_spin_lock.cpp)).
 
 ```cpp
 RawSpinLock::RawSpinLock(bool watched)
@@ -45,7 +45,7 @@ RawSpinLock::RawSpinLock(bool watched)
 
 Исправление ([6f83be8](https://github.com/irqlevel/nos/commit/6f83be8)) переводит каждый глобальный объект в одну из трёх форм, которым при старте не нужен никакой код.
 
-**`constexpr`-конструктор и тривиальный деструктор.** Это для типов, у которых создание сводится к записи значений. Такие конструктор и деструктор получили `Atomic` и `RawRwSpinLock`, и теперь их статические экземпляры инициализирует компилятор ([atomic.h](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/atomic.h)):
+**`constexpr`-конструктор и тривиальный деструктор.** Это для типов, у которых создание сводится к записи значений. Такие конструктор и деструктор получили `Atomic` и `RawRwSpinLock`, и теперь их статические экземпляры инициализирует компилятор ([atomic.h](https://github.com/irqlevel/nos/blob/master/src/base/kernel/atomic.h)):
 
 ```cpp
     constexpr Atomic()
@@ -74,7 +74,7 @@ struct RustIrqSlot
 };
 ```
 
-**Статическая переменная внутри функции.** Это для объекта, конструктор которого действительно должен что-то сделать. Оба спинлока теперь создаются при первом использовании ([pci.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/drivers/pci.cpp), [pl011.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/pl011.cpp)):
+**Статическая переменная внутри функции.** Это для объекта, конструктор которого действительно должен что-то сделать. Оба спинлока теперь создаются при первом использовании ([pci.cpp](https://github.com/irqlevel/nos/blob/master/src/base/drivers/pci.cpp), [pl011.cpp](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/pl011.cpp)):
 
 ```cpp
 Kernel::RawSpinLock& ConfigLock()
@@ -84,7 +84,7 @@ Kernel::RawSpinLock& ConfigLock()
 }
 ```
 
-Первое использование компилятор защищает вызовом `__cxa_guard_acquire`. В nos эта функция выключает вытеснение и прерывания и только потом захватывает атомарный бит ([icxxabi.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/icxxabi.cpp)). Поэтому если два CPU наперегонки придут к первому обращению к PCI, спинлок всё равно будет создан один раз.
+Первое использование компилятор защищает вызовом `__cxa_guard_acquire`. В nos эта функция выключает вытеснение и прерывания и только потом захватывает атомарный бит ([icxxabi.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/icxxabi.cpp)). Поэтому если два CPU наперегонки придут к первому обращению к PCI, спинлок всё равно будет создан один раз.
 
 Мы перечитали изменение и с другой стороны: что может сломать новая форма. Создание спинлока консоли ничего не печатает, потому что не печатают ни конструктор watchdog, ни `RegisterSpinLock`. Значит, первая напечатанная строка не может рекурсивно войти в создание собственного спинлока. А `Panic` пишет по пути, который вообще не берёт блокировок. После исправления команда `watchdog` на arm64 насчитала 816 наблюдаемых блокировок вместо прежних 814, в той же точке той же загрузки.
 

@@ -44,7 +44,7 @@ detection. Under QEMU user networking the host is `10.0.2.2`,
 so `netconsole=10.0.2.2:6666 dhcp=auto` plus a collector on the host works with
 no port forwarding (outbound UDP needs none).
 
-The stream carries the kernel log (everything `Trace()` writes, which is what
+The stream carries the kernel log (everything `trace()` writes, which is what
 `dmesg` holds), not the interactive shell's own console echo. Lines the
 netconsole task itself produces are deliberately not captured -- feeding the TX
 path's own traces back into the ring would make the drain loop generate its own

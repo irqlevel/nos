@@ -1,0 +1,7 @@
+# Mechanical renames: `git blame --ignore-revs-file .git-blame-ignore-revs`, and
+# GitHub's blame, skip them.
+
+# C++: names in snake_case -- the code
+2aa55e484409f311b6f0a1dce3b897f0d273e130
+# C++: names in snake_case -- comments, messages, docs
+e4bbc402b07faab86e5e4d39e71dce498c74a0ab

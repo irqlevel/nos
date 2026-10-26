@@ -1,0 +1,53 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdarg.h>
+
+static_assert(sizeof(char) == 1, "Invalid size");
+
+typedef unsigned long size_t;
+typedef long ssize_t;
+
+typedef unsigned long ulong;
+
+typedef int8_t s8;
+typedef int16_t s16;
+typedef int32_t s32;
+typedef int64_t s64;
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+#define likely(x)       __builtin_expect((x),1)
+#define unlikely(x)     __builtin_expect((x),0)
+
+/* A function that takes a format string and the arguments it names, checked
+   at every call as printf's are: fmtIndex is the format's parameter -- from
+   1, and the implicit this is the first of a member function -- and
+   firstArg the first argument's, or 0 for a va_list. stdlib::vsn_printf
+   reads each argument as C's printf does, the length modifiers included,
+   so what -Wformat accepts is what gets printed; and -Werror makes the rest
+   -- a ulong under %u, a string under %d, an argument too few -- a build
+   that fails, where it was a value read from half a register or past the
+   last one passed. */
+#define PRINTF_FORMAT(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
+
+/* __builtin_offsetof, what offsetof is: the old &((type*)0)->field made a
+   member access through a null pointer, which is undefined behaviour -- the
+   first report the UBSan build made (docs/build.md). Some of the types an
+   intrusive list runs through are not standard-layout (Task has a vtable),
+   where offsetof is conditionally supported rather than undefined: clang
+   defines it for every type without a virtual base, and refuses one with.
+   So -Winvalid-offsetof is quiet here and nowhere else. */
+#define OFFSET_OF(type, field)  \
+            _Pragma("clang diagnostic push") \
+            _Pragma("clang diagnostic ignored \"-Winvalid-offsetof\"") \
+            ((unsigned long)__builtin_offsetof(type, field)) \
+            _Pragma("clang diagnostic pop")
+
+#define CONTAINING_RECORD(addr, type, field)    \
+            ((type*)((unsigned long)(addr) - OFFSET_OF(type, field)))
+
+

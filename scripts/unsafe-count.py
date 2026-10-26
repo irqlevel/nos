@@ -15,7 +15,7 @@ import os
 import re
 import sys
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rust")
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "crates")
 
 BLOCK = re.compile(r"unsafe\s*\{")
 FN = re.compile(r"unsafe\s+(?:extern\s+\"C\"\s+)?fn\s")

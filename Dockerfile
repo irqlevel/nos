@@ -25,12 +25,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# src/rust/rust-toolchain.toml names the exact nightly, and the exactness is
-# the point: src/rust/vendor holds the dependency sources that this one
+# src/crates/rust-toolchain.toml names the exact nightly, and the exactness is
+# the point: src/crates/vendor holds the dependency sources that this one
 # nightly's own library workspace resolves to, and no other (see the comment
 # there). Installing it here, rather than "nightly", keeps the image
 # self-contained -- no build has to fetch a toolchain at run time.
-COPY src/rust/rust-toolchain.toml /tmp/rust-toolchain.toml
+COPY src/crates/rust-toolchain.toml /tmp/rust-toolchain.toml
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     --component rust-src --default-toolchain \
     "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' /tmp/rust-toolchain.toml)"

@@ -7,9 +7,9 @@
 //! page tables built here by hand. The two files are compiled as they are in
 //! the hypervisor -- they are plain code over slices.
 #![allow(dead_code)]
-#[path = "../../../src/rust/hv/src/insn.rs"]
+#[path = "../../../src/crates/hv/src/insn.rs"]
 mod insn;
-#[path = "../../../src/rust/hv/src/walk.rs"]
+#[path = "../../../src/crates/hv/src/walk.rs"]
 mod walk;
 
 use insn::{decode, decode_mov_cr, decode_mov_dr, Access, Extend, Insn, Mode, MovCr, MovDr, Reg};

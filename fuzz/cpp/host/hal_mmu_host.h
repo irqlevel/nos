@@ -1,4 +1,4 @@
-// The Hal:: MMU wrappers of hal/mmu.h, for a process on the host. Nothing
+// The hal:: MMU wrappers of hal/mmu.h, for a process on the host. Nothing
 // here translates by itself: what the kernel does to its page tables is made
 // real by whatever target models the MMU (fuzz/cpp/targets/mm.cpp), at the
 // points where the hardware would see it -- a TLB flush, an entry made
@@ -8,49 +8,49 @@
 
 #include <include/types.h>
 
-namespace Fuzz
+namespace fuzz
 {
-void HostTlbFlushPage(ulong virtAddr);
-void HostTlbFlushAll();
-void HostPteMadeValid();
-ulong HostGetTranslationRoot();
-void HostSetTranslationRoot(ulong phys);
+void host_tlb_flush_page(ulong virt_addr);
+void host_tlb_flush_all();
+void host_pte_made_valid();
+ulong host_get_translation_root();
+void host_set_translation_root(ulong phys);
 }
 
-namespace Hal
+namespace hal
 {
 
-static inline void TlbFlushPage(ulong virtAddr)
+static inline void tlb_flush_page(ulong virt_addr)
 {
-    Fuzz::HostTlbFlushPage(virtAddr);
+    fuzz::host_tlb_flush_page(virt_addr);
 }
 
-static inline void TlbFlushAll()
+static inline void tlb_flush_all()
 {
-    Fuzz::HostTlbFlushAll();
+    fuzz::host_tlb_flush_all();
 }
 
-static inline bool TlbShootdownNeedsIpi()
+static inline bool tlb_shootdown_needs_ipi()
 {
     return true;
 }
 
-static inline void PteMadeValid()
+static inline void pte_made_valid()
 {
-    Fuzz::HostPteMadeValid();
+    fuzz::host_pte_made_valid();
 }
 
-static inline ulong GetTranslationRoot()
+static inline ulong get_translation_root()
 {
-    return Fuzz::HostGetTranslationRoot();
+    return fuzz::host_get_translation_root();
 }
 
-static inline void SetTranslationRoot(ulong phys)
+static inline void set_translation_root(ulong phys)
 {
-    Fuzz::HostSetTranslationRoot(phys);
+    fuzz::host_set_translation_root(phys);
 }
 
-static inline void PteWriteBarrier()
+static inline void pte_write_barrier()
 {
     asm volatile("" ::: "memory");
 }

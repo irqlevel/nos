@@ -20,7 +20,7 @@
 //! one that never logs in is let go when the login grace runs out; and once
 //! every client has gone and the server stops, the machine holds nothing.
 
-#[path = "../../../../src/rust/modules/sshd/src/lib.rs"]
+#[path = "../../../../src/crates/modules/sshd/src/lib.rs"]
 #[allow(unused_attributes, dead_code, clippy::all)]
 mod sshd;
 

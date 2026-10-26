@@ -23,7 +23,7 @@ against that API and refuses anything it does not recognise.
 
 ## Writing one
 
-A module lives in `src/rust/modules/<name>/`. `hello` is the smallest one
+A module lives in `src/crates/modules/<name>/`. `hello` is the smallest one
 worth reading:
 
 ```rust
@@ -85,9 +85,9 @@ shell](udp-shell.md); the handler gets the rest of the command line and an
 
 To add a module:
 
-1. `src/rust/modules/<name>/Cargo.toml`, a `staticlib` whose library is named
+1. `src/crates/modules/<name>/Cargo.toml`, a `staticlib` whose library is named
    `mod_<name>`, depending on `kmod` and `kcore` (copy `hello`'s);
-2. add `modules/<name>` to the workspace `members` in `src/rust/Cargo.toml`
+2. add `modules/<name>` to the workspace `members` in `src/crates/Cargo.toml`
    -- not to `default-members`, which is what the kernel's own build compiles;
 3. add `<name>` to `MODULES` in the `Makefile`.
 
@@ -131,7 +131,7 @@ module: sshd: init failed
 insmod: /sshd.ko failed, error 502
 ```
 
-They are at most 255 bytes (`ModuleTable::ParamsMax`). Since its init takes
+They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). Since its init takes
 them, the module's header is at layout version 2, and a module built before
 is refused with `header version 1, this kernel reads 2`: rebuild it.
 
@@ -144,7 +144,7 @@ make modules ARCH=aarch64    # out/aarch64/modules/<name>.ko
 
 `make` and `make nocheck` build them too. Each module is compiled on its own,
 with its own copy of `core`, `alloc`, `kcore` and `kmod`, into a target
-directory of its own (`src/rust/target/modules`), because it is compiled with
+directory of its own (`src/crates/target/modules`), because it is compiled with
 flags the kernel's Rust is not:
 
 - `-Crelocation-model=pic`, since nobody knows where it will be loaded;
@@ -213,13 +213,13 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
 3. **maps the image**: pages of its own, which need not be physically
    contiguous, mapped writable into one run of kernel virtual addresses --
    from a window of 16 MiB blocks set aside for runs the page allocator's own
-   blocks, 512 KiB at most, cannot hold (`Mm::MapLargePages`). The segments
+   blocks, 512 KiB at most, cannot hold (`mm::map_large_pages`). The segments
    are copied in; the zeroed tail of the last is `.bss`. The function names
    from `.nos_syms` go into the same pages, past the segments, indexed by
    offset.
 4. **relocates it**: every `RELA` section the loader is meant to see (`.rela.dyn`,
    `.rela.plt`). Three kinds of relocation reach it, and the architecture
-   says which is which (`Hal::ClassifyModuleReloc`):
+   says which is which (`hal::classify_module_reloc`):
 
    | Meaning | x86-64 | arm64 |
    |---|---|---|
@@ -237,7 +237,7 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
 6. **protects it**: each segment gets the permissions its program header
    asks for -- read-only, read-execute or read-write -- every CPU's TLB is
    shot down, and on arm64 the new code is cleaned from the data cache and
-   invalidated in every CPU's instruction cache (`Hal::SyncInstructionCache`),
+   invalidated in every CPU's instruction cache (`hal::sync_instruction_cache`),
    which x86 does not need.
 7. **runs its init**, lending it the parameters and `insmod`'s output
    ([Parameters](#parameters)). A second module by the same name is refused
@@ -260,7 +260,7 @@ while its init runs, so a second `insmod` of it is refused, as is an `rmmod`
 of one still loading or already unloading.
 
 `insmod` and `rmmod` each hand the work to a task of their own and wait for it
-at most five seconds (`ModuleTable::ShellWaitMs`). What the loader says is
+at most five seconds (`ModuleTable::SHELL_WAIT_MS`). What the loader says is
 printed when it is done by then. When it is not -- an unload waiting on a
 command, say -- the shell says so and gets its prompt back; `lsmod` shows the
 module as unloading meanwhile, and the kernel log says how it ended:
@@ -306,7 +306,7 @@ that was not.
 
 ## blkload
 
-`blkload` (`src/rust/modules/blkload`) runs a short load test against a block
+`blkload` (`src/crates/modules/blkload`) runs a short load test against a block
 device -- a disk, or one of its partitions, by the name `disks` gives it --
 and reports IOPS, bandwidth and latency. Under QEMU, against its emulated
 NVMe disk:
@@ -374,7 +374,7 @@ release, or build both from one tree.
 
 ## netload
 
-`netload` (`src/rust/modules/netload`) is a UDP load test from either end of
+`netload` (`src/crates/modules/netload`) is a UDP load test from either end of
 the wire, so that [`profile`](profiler.md) has something to look at other
 than an idle machine: an idle twenty-CPU box spends about 0.06% of a core on
 anything at all, and the paths worth seeing -- the frame pool, the driver
@@ -467,7 +467,7 @@ are the `netwire` crate's, which the network layer is built on too.
 
 ## netblk
 
-`netblk` (`src/rust/modules/netblk`) serves an NVMe disk, or a partition of
+`netblk` (`src/crates/modules/netblk`) serves an NVMe disk, or a partition of
 one, over UDP, zero-copy both ways: `netblk start nvme0 7000`, then
 `scripts/netblk.py <host> 7000 ...` from anywhere else. Its own page is
 [netblk](netblk.md). It takes its requests through the same listener netload
@@ -479,9 +479,9 @@ an interrupt handler still on its way out of the module's code.
 
 ## sshd
 
-`sshd` (`src/rust/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
+`sshd` (`src/crates/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
 start`, and an OpenSSH client logs in to the kernel's shell. The protocol is a
-crate of its own, `src/rust/ssh`, which knows nothing of the kernel; the
+crate of its own, `src/crates/ssh`, which knows nothing of the kernel; the
 module is the kernel's side -- a listener task, a task for each connection,
 the files it keeps under `/etc/ssh`. Its page is [sshd](sshd.md). Nothing loads
 a module at boot by itself, so a machine that is to be reached only through
@@ -497,12 +497,12 @@ kernel but the exported functions.
 
 ## edit
 
-`edit` (`src/rust/modules/edit`) is a text editor, for a person at an SSH
+`edit` (`src/crates/modules/edit`) is a text editor, for a person at an SSH
 session with a terminal: `edit /etc/rc`, from the shell `ssh <host>` gives,
 or `ssh -t <host> edit /etc/rc`. The image's `/etc/rc` loads it after sshd;
 on a machine whose `/etc/rc` came before that, `insmod /lib/modules/edit.ko`
 does, and a line saying so in `/etc/rc` keeps it -- an edit, now, of `/etc/rc`
-itself. The editor is a crate with no kernel in it, `src/rust/edit`, which
+itself. The editor is a crate with no kernel in it, `src/crates/edit`, which
 `scripts/edit-test.py` runs on the host; the module is its seat in the
 kernel: the command, the file read and written, and the session's terminal
 -- the keys typed (`Output::read_input`) and its size, which the session
@@ -550,7 +550,7 @@ so, rather than panic the kernel.
 
 ## hv
 
-`hv` (`src/rust/modules/hv`) is the [hypervisor](hypervisor.md), the
+`hv` (`src/crates/modules/hv`) is the [hypervisor](hypervisor.md), the
 beginning of [stage 3](../plans/03-hypervisor.md). It is two crates --
 `hvarch`, the CPU's virtualization extension and all of the hypervisor's
 `unsafe`, and `hv`, everything above it, which has three sites -- plus this
@@ -589,7 +589,7 @@ is sound because `run_on` does not return until the handler has run.
 
 ## heapbench
 
-`heapbench` (`src/rust/modules/heapbench`) times the kernel heap as Rust code
+`heapbench` (`src/crates/modules/heapbench`) times the kernel heap as Rust code
 reaches it -- `Box`, `Vec`, `String` go through the global allocator to
 `kernel_alloc`, and so does everything it allocates. Each workload runs on
 one CPU and then on N at once, a task bound to each CPU, and reports the
@@ -635,12 +635,12 @@ after it -- in the panic report, in `bt` and in the profiler's call chains:
 ```
 Backtrace:
   [0] 0xFFFF800012DA1C40 mod_hello::init::{closure#0}+0x3c [hello]
-  [1] 0xFFFF80000104A2F1 Kernel::Cmd::DispatchDynamic+0xd1
+  [1] 0xFFFF80000104A2F1 kernel::Cmd::dispatch_dynamic+0xd1
 ...
 Modules: hello 0xFFFF800012DA0000+0x5000
 ```
 
-`SymbolTable::Describe` asks the kernel's table first -- which now answers
+`SymbolTable::describe` asks the kernel's table first -- which now answers
 only for an address in the kernel's text, rather than naming whatever lies
 past its last function after that function -- and then the module table,
 whose names come from each module's `.nos_syms`. The name is copied out under
@@ -652,8 +652,8 @@ could not name.
 ## Testing
 
 The boot self-test loads a module on both architectures. `modtest`
-(`src/rust/modules/modtest`) is built with the kernel and embedded in its
-image (`out/<arch>/modtest_blob.S`); `TestModules` in `kernel/test.cpp` loads
+(`src/crates/modules/modtest`) is built with the kernel and embedded in its
+image (`out/<arch>/modtest_blob.S`); `test_modules` in `kernel/test.cpp` loads
 it, and its init checks what a loader can get wrong -- initialised data,
 `.bss` (a megabyte of it, past the 512 KiB images were once held to), a
 table of function pointers, a trait object's vtable, allocations from the
@@ -669,14 +669,14 @@ than 255 bytes by the loader; and last feeds the loader damaged copies -- trunca
 machine's, an import the kernel lacks, no header, a bad magic, another kernel
 interface -- each of which it must refuse.
 
-`slowexit` (`src/rust/modules/slowexit`) is never loaded by the kernel itself:
+`slowexit` (`src/crates/modules/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
 shell's wait by hand or from a script.
 
 ## Limits
 
 - A module's image, function names included, is at most 16 MiB
-  (`PageTable::MaxLargeMapPages` pages), and so is the `.ko` file. The window
+  (`PageTable::MAX_LARGE_MAP_PAGES` pages), and so is the `.ko` file. The window
   they are mapped from holds 63 such runs at a time.
 - A module that registers a block device, a net device or a softirq handler
   cannot be unloaded (above).

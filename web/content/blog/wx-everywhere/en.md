@@ -11,7 +11,7 @@ Keeping that promise took two months of work on both architectures. Part of that
 
 ## Splitting the image three ways
 
-We started with the kernel image on July 17: arm64 in [329a8e7](https://github.com/irqlevel/nos/commit/329a8e7), and x86-64 the same afternoon in [47ca40e](https://github.com/irqlevel/nos/commit/47ca40e). Both linker scripts got page-aligned symbols between the sections: `KernelText` after `.text` and `KernelRodata` after `.rodata`. Late in boot, once the real page table is live, `ProtectRange` walks the image's leaf entries and rewrites their permissions. A leaf is a last-level page-table entry, and here each one maps a 4 KiB page ([main.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/main.cpp)):
+We started with the kernel image on July 17: arm64 in [329a8e7](https://github.com/irqlevel/nos/commit/329a8e7), and x86-64 the same afternoon in [47ca40e](https://github.com/irqlevel/nos/commit/47ca40e). Both linker scripts got page-aligned symbols between the sections: `KernelText` after `.text` and `KernelRodata` after `.rodata`. Late in boot, once the real page table is live, `ProtectRange` walks the image's leaf entries and rewrites their permissions. A leaf is a last-level page-table entry, and here each one maps a 4 KiB page ([main.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/main.cpp)):
 
 ```cpp
 pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
@@ -33,7 +33,7 @@ By September, CLAUDE.md (the project's rulebook) said that executing from a heap
 
 Nobody had noticed, because nothing breaks. A missing NX bit is invisible until something executes data, and no smoke boot does that on purpose. It is exactly the kind of failure this project fears most: one that looks like success.
 
-The fix ([b54a189](https://github.com/irqlevel/nos/commit/b54a189), September 17) puts NX on every leaf the kernel writes at run time ([page_table.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/mm/page_table.cpp)):
+The fix ([b54a189](https://github.com/irqlevel/nos/commit/b54a189), September 17) puts NX on every leaf the kernel writes at run time ([page_table.cpp](https://github.com/irqlevel/nos/blob/master/src/base/mm/page_table.cpp)):
 
 ```cpp
 page->Get();
@@ -93,7 +93,7 @@ Then we tested the test. We took the one `SetNoExecute()` back out of `MapRangeL
 
 ## Modules: the program header decides
 
-Loadable modules ([Modules](/docs/modules)) are the only place where nos puts new code into memory at run time, so they get the strictest form of the rule. A `.ko` is linked with `-z separate-loadable-segments -z max-page-size=4096`, so that every segment starts on a page of its own. That matters because permissions are set per page. Before it maps anything, the loader rejects a segment that asks to be both writable and executable ([module.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/module.cpp)):
+Loadable modules ([Modules](/docs/modules)) are the only place where nos puts new code into memory at run time, so they get the strictest form of the rule. A `.ko` is linked with `-z separate-loadable-segments -z max-page-size=4096`, so that every segment starts on a page of its own. That matters because permissions are set per page. Before it maps anything, the loader rejects a segment that asks to be both writable and executable ([module.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/module.cpp)):
 
 ```cpp
 if ((ph.Flags & Elf::PfW) != 0 && (ph.Flags & Elf::PfX) != 0)
