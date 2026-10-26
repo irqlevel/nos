@@ -87,6 +87,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -567,7 +568,7 @@ def x86(args):
     convert_images(tmp, staged)
     www, grown, raw = create_images(tmp, staged)
     server, port = web_server(www)
-    script = SCRIPT + create_script(port) + ["rmmod hv"]
+    script = SCRIPT + create_script(port) + ["rmmod hv", RC_LAST]
     image, digest = rootfs(tmp, "x86_64", script)
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
@@ -596,9 +597,9 @@ def x86(args):
         if not pt.check("the boot script runs to the end",
                         pt.wait_log(log, "> " + script[-1], 200)):
             return
-        # The last command's own output lands after the marker above -- which
-        # is the first `rmmod hv`'s too: the end of the script is waited for.
-        pt.wait_log(log, "rc: /etc/rc done", 600)
+        # The last command's own output lands after the marker above: the
+        # end of the script is waited for by it (`RC_DONE`).
+        wait_done(log, 600)
         x86_checks(blocks(log), script, digest, grown, raw)
     finally:
         server.shutdown()
@@ -607,6 +608,25 @@ def x86(args):
             print("log at " + log)
         else:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# The last line of the x86-64 script, and how the console shows it has run:
+# its echo and the line it prints. Once the shell has the console, the
+# kernel's own "rc: /etc/rc done" goes to dmesg and not to the console --
+# waited for, every run idled ten minutes at the end -- so the end is marked
+# with a command's output instead, as hv-linux-test's is.
+RC_LAST = "version"
+RC_DONE = re.compile(r"(?m)^> version\n.+\n")
+
+
+def wait_done(log, timeout):
+    """Wait for the script's last command to have printed (`RC_DONE`)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if RC_DONE.search(open(log, errors="replace").read()):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def guest_report(text, name):
@@ -827,7 +847,8 @@ def x86_checks(ran, script, digest, grown, raw):
     pt.check("hv loads for hv convert", "hv loaded at" in out[36], out[36])
     convert_checks(out[37:37 + len(CONVERT)], digest)
     at = 37 + len(CONVERT)
-    created = len(script) - 1 - at
+    # Of what is left: the creates, then `rmmod hv` and `RC_LAST`.
+    created = len(script) - 2 - at
     create_checks(out[at:at + created], grown, raw)
     pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
 
