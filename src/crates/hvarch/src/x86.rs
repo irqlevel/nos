@@ -307,6 +307,7 @@ impl Caps {
             (false, false) => (false, "no XSAVE: FXSAVE's x87 and SSE alone"),
         };
         feature(out, "AVX in a guest", avx, note)?;
+        feature(out, "PKU in a guest", offered & fp::XCR0_PKRU != 0, "its PKRU switched with it")?;
         /* What of RDTSCP, RDPID and INVPCID it runs as the CPU has them
          * (`offers`). */
         let runs = offers();

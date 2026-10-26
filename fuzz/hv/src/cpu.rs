@@ -202,8 +202,36 @@ pub mod x86 {
                     _ => {}
                 }
             }
+            /* PKU and PKRU's component as a CPU with them has them, now and
+             * then -- Intel's offset or AMD's, and once in a while a size no
+             * CPU gives it -- for `fp`'s `offered` to take or leave. */
+            if host() & HOST_PKU != 0 {
+                match (leaf, sub) {
+                    (7, 0) => r.ecx |= ECX7_PKU,
+                    (0xD, 0) => r.eax |= XCR0_PKRU_BIT,
+                    (0xD, 9) => {
+                        r.eax = if host() & HOST_PKRU_ODD != 0 { r.eax } else { PKRU_BYTES };
+                        r.ebx = if host() & HOST_PKRU_AMD != 0 { PKRU_OFFSET_AMD } else { PKRU_OFFSET_INTEL };
+                        r.ecx &= 0b10;
+                        r.edx = 0;
+                    }
+                    _ => {}
+                }
+            }
             Some(r)
         }
+
+        /* PKU: leaf 7 ECX's, XCR0's bit, PKRU's size and its offsets on an
+         * Intel CPU and an AMD one; and which host has it, where, and with a
+         * size no CPU gives it. */
+        const ECX7_PKU: u32 = 1 << 3;
+        const XCR0_PKRU_BIT: u32 = 1 << 9;
+        const PKRU_BYTES: u32 = 8;
+        const PKRU_OFFSET_INTEL: u32 = 2688;
+        const PKRU_OFFSET_AMD: u32 = 2432;
+        const HOST_PKU: u64 = 1 << 44;
+        const HOST_PKRU_AMD: u64 = 1 << 45;
+        const HOST_PKRU_ODD: u64 = 1 << 48;
 
         /* Leaf 1 ECX's XSAVE and AVX, and AVX's component's size and offset
          * in leaf 0xD. */
@@ -292,6 +320,7 @@ pub mod x86 {
         pub const XCR0_X87: u64 = 1 << 0;
         pub const XCR0_SSE: u64 = 1 << 1;
         pub const XCR0_AVX: u64 = 1 << 2;
+        pub const XCR0_PKRU: u64 = 1 << 9;
 
         pub fn offered() -> u64 {
             const ECX_XSAVE: u32 = 1 << 26;
@@ -307,7 +336,10 @@ pub mod x86 {
             }
             let fits = cpu::cpuid_count(0xD, 2).map_or(false, |c| c.eax == 256 && c.ebx == 576);
             let avx = features.ecx & ECX_AVX != 0 && has & XCR0_AVX != 0 && fits;
-            XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 }
+            let pkru_fits = cpu::cpuid_count(0xD, 9).map_or(false, |c| c.eax == 8 && c.ebx >= 832);
+            let pkru = has & XCR0_PKRU != 0 && pkru_fits
+                && cpu::cpuid_count(7, 0).map_or(false, |c| c.ecx & (1 << 3) != 0);
+            XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 } | if pkru { XCR0_PKRU } else { 0 }
         }
     }
 

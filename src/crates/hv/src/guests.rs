@@ -758,7 +758,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
         .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME,
-                TSCAUX_NAME, SPEC_NAME]
+                TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
             .into_iter())
 }
 
@@ -805,6 +805,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == SPEC_NAME {
         return Some(run_spec_guest(machine, out));
+    }
+    if name == PKRU_NAME {
+        return Some(run_pkru(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -2528,7 +2531,7 @@ const AVX_ABOUT: &str = "two CPUs taking turns on one host CPU, by IPI: each tur
  * and would drop the first's IPIs -- reads leaf 1's ECX, runs an XSETBV
  * with CR4.OSXSAVE clear -- a #UD -- sets OSFXSR, OSXMMEXCPT and OSXSAVE,
  * reads leaf 1's ECX and XCR0 again and leaf 0xD, runs five XSETBVs a CPU
- * refuses -- no x87, AVX without SSE, PKRU, bit 32, XCR1: a #GP each, its
+ * refuses -- no x87, AVX without SSE, AVX-512, bit 32, XCR1: a #GP each, its
  * handler counting and stepping past -- and its own, of the x87, SSE and
  * AVX; then reads XCR0, leaf 0xD's first three subleaves and leaf 7, stores
  * YMM0-15 as it started, and loads its own x87 control word, MXCSR and a
@@ -2614,7 +2617,7 @@ const AVX_CODE: &[u8] = &[
     0x0F, 0x01, 0xD1,                                       // 11b: xsetbv
     0xB8, 0x05, 0x00, 0x00, 0x00,                           // 11e: mov eax, 5 ; AVX without SSE
     0x0F, 0x01, 0xD1,                                       // 123: xsetbv
-    0xB8, 0x07, 0x02, 0x00, 0x00,                           // 126: mov eax, 0x207 ; PKRU, not offered
+    0xB8, 0xE7, 0x00, 0x00, 0x00,                           // 126: mov eax, 0xE7 ; AVX-512, not offered
     0x0F, 0x01, 0xD1,                                       // 12b: xsetbv
     0xB8, 0x07, 0x00, 0x00, 0x00,                           // 12e: mov eax, 7
     0xBA, 0x01, 0x00, 0x00, 0x00,                           // 133: mov edx, 1 ; bit 32
@@ -3060,8 +3063,18 @@ fn check_avx(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], loads: [u
                                        {:#x} after its own: wanted 1, 1 and 7", i, s.xcr0[0], s.xcr0[1], s.xcr0[2]));
         }
     }
+    /* What is offered -- PKRU among it, where the CPU switches that -- and
+     * the area's size for all of it: AVX's end, or PKRU's past it, at the
+     * offset the host's CPUID gives it. */
+    let offered = hvarch::x86::fp::offered();
+    let all = if offered & hvarch::x86::fp::XCR0_PKRU != 0 {
+        hvarch::x86::cpu::cpuid_count(0xD, 9)
+            .map_or(XSAVE_WITH_AVX, |c| XSAVE_WITH_AVX.max(c.ebx.saturating_add(c.eax)))
+    } else {
+        XSAVE_WITH_AVX
+    };
     for (i, s) in seen.iter().enumerate() {
-        let want = [[7, XSAVE_LEGACY, XSAVE_WITH_AVX, 0], [7, XSAVE_WITH_AVX, XSAVE_WITH_AVX, 0]];
+        let want = [[offered as u32, XSAVE_LEGACY, all, 0], [offered as u32, XSAVE_WITH_AVX, all, 0]];
         let compacted = if s.leaf_d1[0] & LEAF_D1_XSAVEC != 0 { XSAVE_WITH_AVX } else { 0 };
         if s.leaf_d0 != want || s.leaf_d1[0] & LEAF_D1_NOT_OFFERED != 0 || s.leaf_d1[1..] != [compacted, 0, 0]
             || s.leaf_d2 != [256, XSAVE_LEGACY, 0, 0]
@@ -3963,6 +3976,416 @@ fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, w
     })
 }
 
+/* ---- pkru: a guest's PKRU its own ---- */
+
+const PKRU_NAME: &str = "pkru";
+const PKRU_ABOUT: &str = "two CPUs taking turns on one host CPU, by IPI: each finds RDPKRU a #UD with CR4.PKE clear, \
+                          and where its CPUID offers PKU sets PKE -- OSPKE with it -- one with PKRU in its XCR0 and \
+                          one without, reads PKRU's component in leaf 0xD, finds PKRU 0 as it starts, and at every \
+                          one of 64 turns finds its PKRU as it left it";
+
+/* The avx guest's machine of two CPUs (`smp_board`), both of whose tasks
+ * run on the one host CPU the guest is run on, the second brought up by
+ * `AVX_AP_CODE` into this code's second way in -- so that each entry of one
+ * finds the other's PKRU in the CPU, and has its own put back. Each CPU
+ * turns its local APIC on, reads leaf 7's ECX, runs an RDPKRU with CR4.PKE
+ * clear -- a #UD -- and sets OSFXSR, OSXMMEXCPT and OSXSAVE; then, where
+ * its CPUID offers PKU: sets PKE, reads leaf 7's ECX again, makes XCR0 the
+ * host's word at +0x44 -- the first's with PKRU in it, the second's the x87
+ * alone -- reads leaf 0xD's subleaves 0 and 9, PKRU as it starts, and loads
+ * the host's word at +0x40 into PKRU. Then 64 turns each, a turn the other's
+ * IPI: PKRU checked against what it left -- a turn that finds otherwise
+ * counted -- its word one key more and loaded, and the other's turn sent.
+ * Each ends with its mark and halts. Assembled from this source with clang,
+ * the offsets in the comments its listing's. */
+const PKRU_CODE: &[u8] = &[
+    0xEB, 0x15,                                             // 00: start: jmp bsp ; the first CPU's way in
+    0x41, 0xBD, 0x00, 0x78, 0x00, 0x00,                     // 02: ap: mov r13d, 0x7800 ; the second's: its results
+    0x45, 0x31, 0xF6,                                       // 08: xor r14d, r14d ; its peer: APIC ID 0
+    0xE8, 0x9C, 0x00, 0x00, 0x00,                           // 0b: call setup
+    0xE8, 0x6F, 0x01, 0x00, 0x00,                           // 10: call send ; up: the first CPU's turn
+    0xEB, 0x65,                                             // 15: jmp rounds
+    0x48, 0x8D, 0x05, 0x89, 0x01, 0x00, 0x00,               // 17: bsp: lea rax, [rip + ud] ; gate 6, #UD
+    0xBF, 0x60, 0x60, 0x00, 0x00,                           // 1e: mov edi, 0x6060
+    0xE8, 0xB4, 0x01, 0x00, 0x00,                           // 23: call gate
+    0x48, 0x8D, 0x05, 0x83, 0x01, 0x00, 0x00,               // 28: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0x60, 0x00, 0x00,                           // 2f: mov edi, 0x60D0
+    0xE8, 0xA3, 0x01, 0x00, 0x00,                           // 34: call gate
+    0x48, 0x8D, 0x05, 0x81, 0x01, 0x00, 0x00,               // 39: lea rax, [rip + ipi] ; gate 0x40, its peer's IPI
+    0xBF, 0x00, 0x64, 0x00, 0x00,                           // 40: mov edi, 0x6400
+    0xE8, 0x92, 0x01, 0x00, 0x00,                           // 45: call gate
+    0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 4a: mov r13d, 0x7000 ; its results
+    0x41, 0xBE, 0x01, 0x00, 0x00, 0x00,                     // 50: mov r14d, 1 ; its peer: APIC ID 1
+    0xE8, 0x51, 0x00, 0x00, 0x00,                           // 56: call setup
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // 5b: mov ecx, 0x830 ; ICR, to APIC ID 1
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // 60: mov edx, 1
+    0xB8, 0x00, 0x45, 0x00, 0x00,                           // 65: mov eax, 0x4500 ; INIT, asserted
+    0x0F, 0x30,                                             // 6a: wrmsr
+    0xB8, 0x00, 0x85, 0x00, 0x00,                           // 6c: mov eax, 0x8500 ; INIT, de-asserted
+    0x0F, 0x30,                                             // 71: wrmsr
+    0xB8, 0x09, 0x06, 0x00, 0x00,                           // 73: mov eax, 0x0609 ; start-up at 0x9000
+    0x0F, 0x30,                                             // 78: wrmsr
+    0x0F, 0x30,                                             // 7a: wrmsr ; and again, as the MP protocol has it
+    0x45, 0x31, 0xFF,                                       // 7c: rounds: xor r15d, r15d ; a turn: from its peer's IPI
+    0xE8, 0x10, 0x01, 0x00, 0x00,                           // 7f: .round: call wait
+    0xE8, 0xC6, 0x00, 0x00, 0x00,                           // 84: call verify
+    0xE8, 0xDB, 0x00, 0x00, 0x00,                           // 89: call bump
+    0xE8, 0xF1, 0x00, 0x00, 0x00,                           // 8e: call send
+    0x41, 0xFF, 0xC7,                                       // 93: inc r15d
+    0x45, 0x89, 0x7D, 0x70,                                 // 96: mov dword [r13 + 0x70], r15d
+    0x41, 0x83, 0xFF, 0x40,                                 // 9a: cmp r15d, 64
+    0x72, 0xDF,                                             // 9e: jb .Lround
+    0x41, 0xC7, 0x45, 0x7C, 0x50, 0x4B, 0x52, 0x55,         // a0: mov dword [r13 + 0x7C], 0x55524B50 ; 'PKRU'
+    0xFA,                                                   // a8: cli
+    0xF4,                                                   // a9: .dead: hlt
+    0xEB, 0xFD,                                             // aa: jmp .Ldead
+    0x0F, 0x01, 0x1D, 0x4F, 0x01, 0x00, 0x00,               // ac: setup: lidt [rip + idtr]
+    0xB9, 0x0F, 0x08, 0x00, 0x00,                           // b3: mov ecx, 0x80F ; SVR: its APIC on, or IPIs drop
+    0xB8, 0xFF, 0x01, 0x00, 0x00,                           // b8: mov eax, 0x1FF
+    0x31, 0xD2,                                             // bd: xor edx, edx
+    0x0F, 0x30,                                             // bf: wrmsr
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // c1: mov eax, 7
+    0x31, 0xC9,                                             // c6: xor ecx, ecx
+    0x0F, 0xA2,                                             // c8: cpuid
+    0x41, 0x89, 0x4D, 0x00,                                 // ca: mov dword [r13 + 0x00], ecx ; leaf 7 ECX: PKU, no OSPKE
+    0x31, 0xC9,                                             // ce: xor ecx, ecx
+    0x0F, 0x01, 0xEE,                                       // d0: rdpkru ; CR4.PKE clear: a #UD
+    0x0F, 0x20, 0xE0,                                       // d3: mov rax, cr4
+    0x48, 0x0D, 0x00, 0x06, 0x04, 0x00,                     // d6: or rax, 0x40600 ; OSFXSR, OSXMMEXCPT and OSXSAVE
+    0x0F, 0x22, 0xE0,                                       // dc: mov cr4, rax
+    0x41, 0xF7, 0x45, 0x00, 0x08, 0x00, 0x00, 0x00,         // df: test dword [r13 + 0x00], 8 ; and where it has PKU:
+    0x74, 0x65,                                             // e7: jz .Lnopku
+    0x48, 0x0D, 0x00, 0x00, 0x40, 0x00,                     // e9: or rax, 0x400000 ; PKE
+    0x0F, 0x22, 0xE0,                                       // ef: mov cr4, rax
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // f2: mov eax, 7
+    0x31, 0xC9,                                             // f7: xor ecx, ecx
+    0x0F, 0xA2,                                             // f9: cpuid
+    0x41, 0x89, 0x4D, 0x04,                                 // fb: mov dword [r13 + 0x04], ecx ; leaf 7 ECX: OSPKE with it
+    0x41, 0x8B, 0x45, 0x44,                                 // ff: mov eax, dword [r13 + 0x44] ; its XCR0
+    0x31, 0xC9,                                             // 103: xor ecx, ecx
+    0x31, 0xD2,                                             // 105: xor edx, edx
+    0x0F, 0x01, 0xD1,                                       // 107: xsetbv
+    0x0F, 0x01, 0xD0,                                       // 10a: xgetbv
+    0x41, 0x89, 0x45, 0x08,                                 // 10d: mov dword [r13 + 0x08], eax ; XCR0 now
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // 111: mov eax, 0xD
+    0x31, 0xC9,                                             // 116: xor ecx, ecx
+    0x0F, 0xA2,                                             // 118: cpuid
+    0x41, 0x89, 0x45, 0x10,                                 // 11a: mov dword [r13 + 0x10], eax ; leaf 0xD: what is offered,
+    0x41, 0x89, 0x5D, 0x14,                                 // 11e: mov dword [r13 + 0x14], ebx ; the area for its XCR0
+    0x41, 0x89, 0x4D, 0x18,                                 // 122: mov dword [r13 + 0x18], ecx ; and for all of it
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // 126: mov eax, 0xD
+    0xB9, 0x09, 0x00, 0x00, 0x00,                           // 12b: mov ecx, 9
+    0x0F, 0xA2,                                             // 130: cpuid
+    0x41, 0x89, 0x45, 0x20,                                 // 132: mov dword [r13 + 0x20], eax ; subleaf 9, PKRU's: its size
+    0x41, 0x89, 0x5D, 0x24,                                 // 136: mov dword [r13 + 0x24], ebx ; and its offset
+    0x31, 0xC9,                                             // 13a: xor ecx, ecx
+    0x0F, 0x01, 0xEE,                                       // 13c: rdpkru
+    0x41, 0x89, 0x45, 0x28,                                 // 13f: mov dword [r13 + 0x28], eax ; PKRU as it starts
+    0x41, 0x8B, 0x45, 0x40,                                 // 143: mov eax, dword [r13 + 0x40] ; and its own
+    0x31, 0xC9,                                             // 147: xor ecx, ecx
+    0x31, 0xD2,                                             // 149: xor edx, edx
+    0x0F, 0x01, 0xEF,                                       // 14b: wrpkru
+    0xC3,                                                   // 14e: .nopku: ret
+    0x41, 0xF7, 0x45, 0x00, 0x08, 0x00, 0x00, 0x00,         // 14f: verify: test dword [r13 + 0x00], 8 ; its PKRU as it left it?
+    0x74, 0x0F,                                             // 157: jz .Lok
+    0x31, 0xC9,                                             // 159: xor ecx, ecx
+    0x0F, 0x01, 0xEE,                                       // 15b: rdpkru
+    0x41, 0x3B, 0x45, 0x40,                                 // 15e: cmp eax, dword [r13 + 0x40]
+    0x74, 0x04,                                             // 162: je .Lok
+    0x41, 0xFF, 0x45, 0x74,                                 // 164: inc dword [r13 + 0x74]
+    0xC3,                                                   // 168: .ok: ret
+    0x41, 0xF7, 0x45, 0x00, 0x08, 0x00, 0x00, 0x00,         // 169: bump: test dword [r13 + 0x00], 8 ; its PKRU, one key more
+    0x74, 0x10,                                             // 171: jz .Lsame
+    0x41, 0x83, 0x45, 0x40, 0x04,                           // 173: add dword [r13 + 0x40], 4
+    0x41, 0x8B, 0x45, 0x40,                                 // 178: mov eax, dword [r13 + 0x40]
+    0x31, 0xC9,                                             // 17c: xor ecx, ecx
+    0x31, 0xD2,                                             // 17e: xor edx, edx
+    0x0F, 0x01, 0xEF,                                       // 180: wrpkru
+    0xC3,                                                   // 183: .same: ret
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // 184: send: mov ecx, 0x830 ; to its peer, vector 0x40
+    0x44, 0x89, 0xF2,                                       // 189: mov edx, r14d
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // 18c: mov eax, 0x40
+    0x0F, 0x30,                                             // 191: wrmsr
+    0xC3,                                                   // 193: ret
+    0xFB,                                                   // 194: wait: sti ; until its peer's IPI
+    0xF4,                                                   // 195: hlt
+    0xFA,                                                   // 196: cli
+    0x41, 0x83, 0x7D, 0x78, 0x00,                           // 197: cmp dword [r13 + 0x78], 0
+    0x74, 0xF6,                                             // 19c: je wait
+    0x41, 0xC7, 0x45, 0x78, 0x00, 0x00, 0x00, 0x00,         // 19e: mov dword [r13 + 0x78], 0
+    0xC3,                                                   // 1a6: ret
+    0x41, 0xFF, 0x45, 0x0C,                                 // 1a7: ud: inc dword [r13 + 0x0C] ; counted, and past it
+    0x48, 0x83, 0x04, 0x24, 0x03,                           // 1ab: add qword [rsp], 3
+    0x48, 0xCF,                                             // 1b0: iretq
+    0x41, 0xFF, 0x45, 0x2C,                                 // 1b2: gp: inc dword [r13 + 0x2C] ; counted, and past it
+    0x48, 0x83, 0xC4, 0x08,                                 // 1b6: add rsp, 8
+    0x48, 0x83, 0x04, 0x24, 0x03,                           // 1ba: add qword [rsp], 3
+    0x48, 0xCF,                                             // 1bf: iretq
+    0x41, 0xC7, 0x45, 0x78, 0x01, 0x00, 0x00, 0x00,         // 1c1: ipi: mov dword [r13 + 0x78], 1 ; its peer is done
+    0x50,                                                   // 1c9: push rax
+    0x51,                                                   // 1ca: push rcx
+    0x52,                                                   // 1cb: push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // 1cc: mov ecx, 0x80B ; EOI
+    0x31, 0xC0,                                             // 1d1: xor eax, eax
+    0x31, 0xD2,                                             // 1d3: xor edx, edx
+    0x0F, 0x30,                                             // 1d5: wrmsr
+    0x5A,                                                   // 1d7: pop rdx
+    0x59,                                                   // 1d8: pop rcx
+    0x58,                                                   // 1d9: pop rax
+    0x48, 0xCF,                                             // 1da: iretq
+    0x66, 0x89, 0x07,                                       // 1dc: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 1df: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 1e5: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 1eb: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 1ef: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 1f3: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 1f7: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 1fa: mov dword [rdi + 12], 0
+    0xC3,                                                   // 201: ret
+    0x0F, 0x04,                                             // 202: idtr: dw 0x41 * 16 - 1 ; gates to 0x40
+    0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 204: dq 0x6000
+];
+
+/* What each CPU leaves at its results -- the first's at `RESULTS`, the
+ * second's 0x800 bytes on: leaf 7's ECX before PKE and with it at +0 and +4;
+ * XCR0 at +8; its #UDs and #GPs at +0xC and +0x2C; leaf 0xD's subleaf 0
+ * EAX, EBX and ECX at +0x10; subleaf 9's EAX and EBX at +0x20; PKRU as it
+ * started at +0x28; its turns, and those that found its PKRU otherwise, at
+ * +0x70 and +0x74; 'PKRU' at +0x7C once done. What the host gives it: its
+ * PKRU at +0x40, its XCR0 at +0x44. */
+const PK_RESULTS: [u64; 2] = [RESULTS, RESULTS + 0x800];
+const PK_LEAF7: u64 = 0x00;
+const PK_XCR0: u64 = 0x08;
+const PK_UD: u64 = 0x0C;
+const PK_LEAF_D0: u64 = 0x10;
+const PK_LEAF_D9: u64 = 0x20;
+const PK_FIRST: u64 = 0x28;
+const PK_GP: u64 = 0x2C;
+const PK_OWN: u64 = 0x40;
+const PK_WANT_XCR0: u64 = 0x44;
+const PK_TURNS: u64 = 0x70;
+const PK_WRONG: u64 = 0x74;
+const PK_DONE: u64 = 0x7C;
+const PK_MARK: u32 = u32::from_le_bytes(*b"PKRU");
+const PK_TURNS_EACH: u32 = 64;
+/// Each CPU's own: its first PKRU -- keys' rights in a pattern of its own,
+/// key 0's left alone -- and its XCR0, the first's with PKRU in it.
+const PK_CPUS: [(u32, u32); 2] = [(0x5555_5554, 0x203), (0xAAAA_AAA8, 0x1)];
+/// Leaf 7 ECX: PKU, and OSPKE.
+const LEAF7_PKU: u32 = 1 << 3;
+const LEAF7_OSPKE: u32 = 1 << 4;
+/// XSAVE's standard area for the x87 and SSE alone, and with AVX's after them.
+const PK_LEGACY: u32 = 576;
+const PK_WITH_AVX: u32 = 832;
+const PKRU_BUDGET_MS: u64 = 10_000;
+
+/// Run the pkru guest: its two CPUs on tasks of their own, both on the CPU
+/// this runs on, through the run loop a Linux guest's go through.
+#[inline(never)]
+fn run_pkru(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", PKRU_NAME, PKRU_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", PKRU_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 2, Arc::new(doorbells), true, false) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    let m = guest.memory();
+    let board = smp_board(m, &mut bsp, PKRU_CODE, AVX_AP_CODE).and_then(|_| {
+        for (&at, &(pkru, xcr0)) in PK_RESULTS.iter().zip(PK_CPUS.iter()) {
+            m.write_obj(at + PK_OWN, &pkru)?;
+            m.write_obj(at + PK_WANT_XCR0, &xcr0)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = board {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let guest = Arc::new(guest);
+    let (Some(ran0), Some(ran1)) =
+        (kcore::sync::Mutex::new((Counts::default(), 0)), kcore::sync::Mutex::new((Counts::default(), 0)))
+    else {
+        return fail(out, "out of memory");
+    };
+    let ran = [Arc::new(ran0), Arc::new(ran1)];
+
+    /* Both on this CPU: the second first, waiting for its start-up IPI, so
+     * that the first never starts a CPU that has no task. */
+    let here = 1u64 << kcore::cpu::id();
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(PKRU_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let second = AvxCpu { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let Some(second) = kcore::task::spawn_on_with("hv/pkru/cpu1", here, second, avx_cpu) else {
+        return fail(out, "no task for its second CPU");
+    };
+    let first = AvxCpu { guest: guest.clone(), cpu: bsp, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = kcore::task::spawn_on_with("hv/pkru/cpu0", here, first, avx_cpu);
+    if first.is_none() {
+        guest.stop(GuestStop::Requested);
+    }
+    /* Dropping each handle waits for its task. */
+    drop(second);
+    let Some(first) = first else { return fail(out, "no task for its first CPU") };
+    drop(first);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let (counts, loads): ([Counts; 2], [u64; 2]) = {
+        let (a, b) = (*ran[0].lock(), *ran[1].lock());
+        ([a.0, b.0], [a.1, b.1])
+    };
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", PKRU_NAME,
+                         cpu);
+        return false;
+    }
+    let hosts: alloc::vec::Vec<Option<u32>> = guest.cpu_states().iter().map(|&(_, h)| h).collect();
+    let on = |c: Option<&Option<u32>>| match c {
+        Some(Some(h)) => alloc::format!("cpu {}", h),
+        _ => String::from("no cpu"),
+    };
+    let _ = writeln!(out, "  ran on     {} and {}, {} us", on(hosts.first()), on(hosts.get(1)),
+                     ns / kcore::consts::NS_PER_US);
+    let _ = writeln!(out, "  exits      cpu 0: {} ({} IPIs sent, {} hlt); cpu 1: {} ({} IPIs sent, {} hlt)",
+                     counts[0].exits, counts[0].ipi_sent, counts[0].hlt, counts[1].exits, counts[1].ipi_sent,
+                     counts[1].hlt);
+    let _ = writeln!(out, "  registers  put back into the CPU {} times for cpu 0, {} for cpu 1", loads[0], loads[1]);
+    let mut says = String::new();
+    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_pkru(guest.memory(), &stopped, loads, &hosts) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", PKRU_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", PKRU_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// What one CPU of the pkru guest left, read out of its results.
+struct PkruSeen {
+    leaf7: [u32; 2],
+    xcr0: u32,
+    ud: u32,
+    gp: u32,
+    leaf_d0: [u32; 3],
+    leaf_d9: [u32; 2],
+    first: u32,
+    turns: u32,
+    wrong: u32,
+    done: u32,
+}
+
+fn pkru_seen(m: &GuestMemory, at: u64) -> core::result::Result<PkruSeen, String> {
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    let word = |off: u64| m.read_obj::<u32>(at + off).map_err(unread);
+    Ok(PkruSeen {
+        leaf7: [word(PK_LEAF7)?, word(PK_LEAF7 + 4)?],
+        xcr0: word(PK_XCR0)?,
+        ud: word(PK_UD)?,
+        gp: word(PK_GP)?,
+        leaf_d0: [word(PK_LEAF_D0)?, word(PK_LEAF_D0 + 4)?, word(PK_LEAF_D0 + 8)?],
+        leaf_d9: [word(PK_LEAF_D9)?, word(PK_LEAF_D9 + 4)?],
+        first: word(PK_FIRST)?,
+        turns: word(PK_TURNS)?,
+        wrong: word(PK_WRONG)?,
+        done: word(PK_DONE)?,
+    })
+}
+
+/// Both CPUs ran on one host CPU to their halt; each found RDPKRU a #UD with
+/// CR4.PKE clear; and where PKU is switched for a guest (`fp::offered`),
+/// each was told PKU and no OSPKE, then OSPKE with PKE set, made XCR0 its
+/// own -- PKRU in the first's, not in the second's -- was told leaf 0xD's
+/// components and sizes, PKRU's at the host's offset, found PKRU 0 as it
+/// started, though the other's was in the CPU, and at every one of its 64
+/// turns its own as it left it, put back by the host each time the other had
+/// had the CPU. Where PKU is not switched, it was told no PKU, and only took
+/// its turns.
+fn check_pkru(m: &GuestMemory, stopped: &Stopped, loads: [u64; 2], hosts: &[Option<u32>])
+    -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    if hosts.len() != 2 || hosts[0].is_none() || hosts[0] != hosts[1] {
+        return Err(alloc::format!("its CPUs ran on {:?}: not both on one host CPU", hosts));
+    }
+    let seen = [pkru_seen(m, PK_RESULTS[0])?, pkru_seen(m, PK_RESULTS[1])?];
+    for (i, s) in seen.iter().enumerate() {
+        if s.done != PK_MARK || s.turns != PK_TURNS_EACH {
+            return Err(alloc::format!("cpu {} did not take all its turns: {} of {}, its mark {:#x}", i, s.turns,
+                                      PK_TURNS_EACH, s.done));
+        }
+    }
+    let offered = hvarch::x86::fp::offered();
+    let pku = offered & hvarch::x86::fp::XCR0_PKRU != 0;
+    for (i, s) in seen.iter().enumerate() {
+        if s.ud != 1 || s.gp != 0 {
+            return Err(alloc::format!("cpu {} took {} #UDs and {} #GPs: wanted one, its RDPKRU with CR4.PKE clear, \
+                                       and none", i, s.ud, s.gp));
+        }
+        if s.leaf7[0] & (LEAF7_PKU | LEAF7_OSPKE) != if pku { LEAF7_PKU } else { 0 } {
+            return Err(alloc::format!("cpu {}'s leaf 7 ECX was {:#x} before CR4.PKE: wanted PKU {}, and no OSPKE",
+                                      i, s.leaf7[0], if pku { "offered" } else { "not offered" }));
+        }
+    }
+    if !pku {
+        return Ok(alloc::format!("no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all {} turns each \
+                                  taken", PK_TURNS_EACH));
+    }
+    /* The area's sizes, as a CPU computes them: AVX's end, or PKRU's past it,
+     * at the offset the host's CPUID gives it. */
+    let (pkru_size, pkru_offset) = hvarch::x86::cpu::cpuid_count(0xD, 9).map_or((0, 0), |c| (c.eax, c.ebx));
+    let size = |xcr0: u64| {
+        let avx = if xcr0 & hvarch::x86::fp::XCR0_AVX != 0 { PK_WITH_AVX } else { PK_LEGACY };
+        if xcr0 & hvarch::x86::fp::XCR0_PKRU != 0 { avx.max(pkru_offset.saturating_add(pkru_size)) } else { avx }
+    };
+    for (i, (s, &(_, xcr0))) in seen.iter().zip(PK_CPUS.iter()).enumerate() {
+        if s.leaf7[1] & (LEAF7_PKU | LEAF7_OSPKE) != LEAF7_PKU | LEAF7_OSPKE || s.xcr0 != xcr0 {
+            return Err(alloc::format!("cpu {}'s leaf 7 ECX was {:#x} with CR4.PKE, and its XCR0 {:#x}: wanted PKU \
+                                       and OSPKE, and {:#x}", i, s.leaf7[1], s.xcr0, xcr0));
+        }
+        let want_d0 = [offered as u32, size(u64::from(xcr0)), size(offered)];
+        if s.leaf_d0 != want_d0 || s.leaf_d9 != [pkru_size, pkru_offset] {
+            return Err(alloc::format!("cpu {}'s leaf 0xD: subleaf 0 {:#x?}, subleaf 9 {:#x?}: wanted {:#x?} and {:#x?}",
+                                      i, s.leaf_d0, s.leaf_d9, want_d0, [pkru_size, pkru_offset]));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if s.first != 0 {
+            return Err(alloc::format!("cpu {} found PKRU {:#x} as it started: another's", i, s.first));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if s.wrong != 0 {
+            return Err(alloc::format!("cpu {} found its PKRU other than it left it at {} of its {} turns", i,
+                                      s.wrong, s.turns));
+        }
+    }
+    for (i, &n) in loads.iter().enumerate() {
+        if n < u64::from(PK_TURNS_EACH) {
+            return Err(alloc::format!("cpu {}'s registers were put back into the CPU {} times, fewer than its {} \
+                                       turns: the CPUs did not take turns on it", i, n, PK_TURNS_EACH));
+        }
+    }
+    Ok(alloc::format!("PKU offered, OSPKE with CR4.PKE, XCR0 0x203 and 1, PKRU's component of {} bytes at {}; PKRU \
+                       0 at each CPU's start, and its own at all {} of its turns, put back {} and {} times",
+                      pkru_size, pkru_offset, PK_TURNS_EACH, loads[0], loads[1]))
+}
+
 /* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */
 
 const CR4_NAME: &str = "cr4";
@@ -3972,7 +4395,8 @@ const CR4_ABOUT: &str = "a guest's CR4: MCE cleared in what it reads back and ke
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
  * handler counts each, keeps its error code and steps over the 3-byte `mov`
  * that raised it. It reads CR4; writes PAE alone, MCE cleared; then PAE and
- * PKE, which its CPUID never offers; then 0, PAE cleared in long mode;
+ * a bit its CPUID does not offer, which the host gives it at +0x37 -- the
+ * `mov`'s immediate (`cr4_refused_bit`); then 0, PAE cleared in long mode;
  * then PAE and PGE through R9, read back through R13; then a bit above 31 --
  * reading CR4 after each -- and leaves its mark and halts. Assembled from
  * this source with clang, the offsets in the comments its listing's. */
@@ -3987,7 +4411,7 @@ const CR4_CODE: &[u8] = &[
     0x0F, 0x22, 0xE0,                                       // 28: mov cr4, rax
     0x0F, 0x20, 0xE0,                                       // 2b: mov rax, cr4
     0x48, 0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,         // 2e: mov qword [0x7010], rax
-    0xB8, 0x20, 0x00, 0x40, 0x00,                           // 36: mov eax, 0x400020 ; and PKE: #GP
+    0xB8, 0x20, 0x00, 0x40, 0x00,                           // 36: mov eax, 0x400020 ; and PKE or CET: #GP
     0x0F, 0x22, 0xE0,                                       // 3b: mov cr4, rax
     0x0F, 0x20, 0xE0,                                       // 3e: mov rax, cr4
     0x48, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,         // 41: mov qword [0x7018], rax
@@ -4038,19 +4462,19 @@ const CR4_READS: u64 = RESULTS + 0x8;
 const CR4_DONE: u64 = RESULTS + 0x38;
 const CR4_MARK: u32 = u32::from_le_bytes(*b"CR4!");
 /// How many CR4s it reads, how many times it writes it, and how many of the
-/// writes a CPU refuses: PKE, PAE cleared, bit 32.
+/// writes a CPU refuses: PKE or CET, PAE cleared, bit 32.
 const CR4_READ_COUNT: usize = 6;
 const CR4_WRITE_COUNT: u64 = 5;
 const CR4_REFUSED: u32 = 3;
 /// Of those, the ones no CR4 takes in long mode on any CPU -- PAE cleared,
 /// a bit above 31 -- which an AMD CPU may refuse itself, before its
 /// intercept: the AX41's Zen 2 does, under KVM, and QEMU's TCG leaves them
-/// to the host. PKE is refused only because the guest's CPUID does not
-/// offer it, and that is the host's to do wherever it runs.
+/// to the host. PKE or CET is refused only because the guest's CPUID does
+/// not offer it, and that is the host's to do wherever it runs.
 const CR4_CPU_REFUSABLE: u64 = 2;
 /// Under VT-x, which stops a guest at a write that changes a bit the host
 /// keeps and answers its reads from the read shadow: the writes that stop
-/// it -- MCE cleared, PKE, bit 32 -- and of those the ones refused. PAE
+/// it -- MCE cleared, PKE or CET, bit 32 -- and of those the ones refused. PAE
 /// cleared is the CPU's own #GP, and PGE set the CPU's own write.
 const CR4_VMX_EXITS: u64 = 3;
 const CR4_VMX_REFUSED: u64 = 2;
@@ -4061,6 +4485,19 @@ const CR4_BUDGET_MS: u64 = 10_000;
 const CR4_PAE: u64 = 1 << 5;
 const CR4_MCE: u64 = 1 << 6;
 const CR4_PGE: u64 = 1 << 7;
+/// Where the guest's code keeps the bit its CPUID does not offer -- with
+/// PAE, the immediate of its `mov` at 0x36 -- and the two it may be.
+const CR4_REFUSED_AT: u64 = ENTRY + 0x37;
+const CR4_PKE: u64 = 1 << 22;
+const CR4_CET: u64 = 1 << 23;
+
+/// The CR4 bit the cr4 guest writes that its CPUID does not offer: PKE where
+/// it is not offered PKU -- a Zen 2, which leaves a write of PKE to its
+/// intercept where it refuses CET's itself, before it, as it does bit 32 --
+/// and CET where it is, which no guest is offered.
+fn cr4_refused_bit() -> u64 {
+    if crate::policy::cr4_allowed() & CR4_PKE == 0 { CR4_PKE } else { CR4_CET }
+}
 
 /// Run the cr4 guest: one CPU, through the run loop a Linux guest's go
 /// through, where AMD-V stops it at every `mov` of CR4 and VT-x at every
@@ -4078,7 +4515,12 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
     let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
-    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, CR4_CODE) {
+    let refused = cr4_refused_bit();
+    /* PAE and the bit, in 32 bits: the immediate of a `mov eax`. */
+    let immediate = (CR4_PAE | refused) as u32;
+    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, CR4_CODE)
+        .and_then(|_| guest.memory().write_obj(CR4_REFUSED_AT, &immediate))
+    {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
     let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
@@ -4115,7 +4557,7 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = describe_stop(&stopped.stop, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_cr4(guest.memory(), &stopped, &counts, &held, vmx) {
+    match check_cr4(guest.memory(), &stopped, &counts, &held, vmx, refused) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
             let _ = writeln!(out, "hv: guest {} ok", CR4_NAME);
@@ -4153,7 +4595,7 @@ fn under_qemu_tcg() -> bool {
 }
 
 /// Under AMD-V: the guest read back what it wrote -- MCE cleared, then PGE
-/// set -- while the CPU's CR4 kept MCE; PKE, which its CPUID never
+/// set -- while the CPU's CR4 kept MCE; PKE or CET, which its CPUID does not
 /// offers, PAE cleared in long mode and bit 32 were each a #GP, with no
 /// error code, CR4 as it was; and every read and write was performed by the
 /// host, but for the two refusals a CPU may make itself before its
@@ -4163,11 +4605,12 @@ fn under_qemu_tcg() -> bool {
 /// are the host's all the same. Under
 /// VT-x the same CR4s read back -- the read shadow's, its reads stopped
 /// nowhere -- while the CPU's kept MCE: the three writes that changed a bit
-/// the host keeps stopped and performed by the host, PKE and bit 32
+/// the host keeps stopped and performed by the host, PKE or CET and bit 32
 /// refused, and PAE cleared in long mode the CPU's own #GP.
-fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, vmx: bool)
+fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, vmx: bool, refused: u64)
     -> core::result::Result<String, String>
 {
+    let refused = if refused == CR4_PKE { "PKE" } else { "CET" };
     let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
     if !matches!(stopped.stop, GuestStop::Halted { .. }) {
         return Err(String::from("it did not run to its halt"));
@@ -4202,9 +4645,10 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
             return Err(alloc::format!("the host performed {} of its CR4 writes and refused {}: wanted {} and {}",
                                       counts.cr4, counts.cr4_gp, CR4_VMX_EXITS, CR4_VMX_REFUSED));
         }
-        return Ok(String::from("it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- \
-                                while the CPU's CR4 kept MCE; the three writes of a bit the host keeps the host's, \
-                                PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was"));
+        return Ok(alloc::format!("it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- \
+                                  while the CPU's CR4 kept MCE; the three writes of a bit the host keeps the host's, \
+                                  {} and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+                                 refused));
     }
     if !held.reads_asked {
         return Err(String::from("its VMCB does not ask to stop it at a read of CR4"));
@@ -4240,7 +4684,8 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
                                    up to {} fewer of each, refused by the CPU itself",
                                   counts.cr4, counts.cr4_gp, performed, CR4_REFUSED, CR4_CPU_REFUSABLE));
     }
-    let writes = "while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was";
+    let writes = alloc::format!("while the CPU's CR4 kept MCE; {}, PAE cleared and bit 32 each a #GP, CR4 as it was",
+                                refused);
     let own = if by_cpu == 0 {
         String::new()
     } else {
