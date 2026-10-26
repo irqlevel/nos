@@ -1628,7 +1628,22 @@ breakpoint as it was entered -- which a guest then enables without an
 exit -- the first VM's breakpoint never fired, on both CPUs. Under VT-x,
 which stops a guest at every `mov` of a debug register, the same, with
 eighteen `mov`s the host's: DR7 armed, and in the handler DR6 read and
-cleared and DR7 turned off. After both rounds `hv` must count at least two
+cleared and DR7 turned off. And for `avx`, two CPUs of one guest whose tasks
+are both on the CPU the guests run on, taking turns by IPI: that each found
+YMM0-15 0 as it started, though the other's pattern was in the CPU's
+registers; that at every one of its 64 turns it found its YMM registers,
+MXCSR and x87 control word as it had left them -- its pattern one more in
+every word each turn -- the host having put its registers back each time
+the other had had the CPU, at least 64 times each; that its CPUID offered
+XSAVE and AVX, and OSXSAVE only once its CR4 had it; that its XCR0 was 1 out
+of reset and still after the five XSETBVs a CPU refuses, each a #GP, and 7
+after its own; that its XSETBV with OSXSAVE clear was a #UD -- the host's
+under QEMU's TCG, whose intercept comes before the CPU's checks, the CPU's
+own under VT-x and on a Zen 2, 6 and 5 refused by the host accordingly;
+and that leaf 0xD gave the x87, SSE and AVX, the area's sizes 576 and 832,
+no XSAVES, and AVX's component at 576. Its second CPU turns its local APIC
+on first: it comes out of INIT software-disabled, and a guest that waits
+for an IPI there before it does waits for good. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
 QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
@@ -1832,7 +1847,11 @@ reads AMD's NB_CFG and probes LS_CFG) and `--qemu-cpu
 Skylake-Client-v1,+svm,+npt,+nrip-save` (an Intel CPU given AMD-V, whose
 kernel reads MISC_ENABLE, the microcode revision and the platform ID) --
 TCG's `max` is an AMD family 6, which takes few of those paths. The MSRs
-the guest was refused, which it was ready for, are printed as a note.
+the guest was refused, which it was ready for, are printed as a note. And
+its kernel must have turned on the x87, SSE and AVX in XCR0, 832 bytes of
+them ("Enabled xstate features 0x7"): in XSAVE's standard format under TCG,
+compacted on a CPU with XSAVEC -- the AX41's Zen 2 -- which the policy
+passes on and Linux then saves with.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.
@@ -2131,7 +2150,9 @@ image, copied sparse, the guest's writable disk -- with systemd-firstboot
 given the root password, locale, keymap and timezone as credentials on the
 kernel command line; and checks that root logs in with that password, that
 `systemctl is-system-running` says running with no unit failed, that its
-root is `/dev/vda1`, ext4, read-write, that its clock is the host's; that
+root is `/dev/vda1`, ext4, read-write, that its clock is the host's, that
+glibc's own loader finds the CPU x86-64-v3 (`ld.so --help`: AVX and AVX2,
+FMA, F16C, BMI and the rest, what a distribution built for it needs); that
 systemd-networkd, given a `.network` for its ethernet as one more
 credential, takes its port's address, nos as its router and nos's DNS server
 from the switch's DHCP server, reaches nos, and fetches a page from the test

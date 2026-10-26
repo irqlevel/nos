@@ -536,6 +536,11 @@ def cloud(args, d):
                 x("curl -sI http://deb.debian.org/debian/dists/stable/Release | head -1", 120)
                 ] if args.internet else []
     kept_line = x("cat /root/nos.txt")
+    # The levels of x86-64 glibc's own loader finds the CPU it is shown to
+    # be: v3 is AVX, AVX2, BMI1 and BMI2, F16C, FMA, LZCNT, MOVBE and
+    # OSXSAVE, what a distribution built for it needs -- AVX's state
+    # switched for the guest (`hvarch::x86::fp`) and offered by its CPUID.
+    hwcaps_line = x("/lib64/ld-linux-x86-64.so.2 --help | grep x86-64-v")
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % d.password, "hv wait 0 secs=120 " + d.prompt]
@@ -552,7 +557,8 @@ def cloud(args, d):
              x("systemctl is-system-running --wait", 300),
              x("systemctl --failed --no-legend --no-pager | wc -l"),
              x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
-             x("date -u +%s")]
+             x("date -u +%s"),
+             hwcaps_line]
           + clock_lines(0, x)
           + [marker_line]
           # networkd, given its .network as a credential, asks the switch's
@@ -622,6 +628,8 @@ def cloud(args, d):
         m = re.search(r"^(\d{9,})\s*$", out(rc[base + 4]), re.M)
         pt.check("its clock is the host's", m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
                  out(rc[base + 4]))
+        pt.check("glibc finds the CPU x86-64-v3: AVX and AVX2, FMA, F16C, BMI and the rest of it",
+                 re.search(r"x86-64-v3 \(supported, searched\)", out(hwcaps_line)) is not None, out(hwcaps_line))
         rate = clock_rate(out, clock_lines(0, x))
         pt.check("idle, its clock keeps the host's time (no tick lost)",
                  rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)

@@ -372,7 +372,8 @@ pub unsafe fn enable(vmxon_phys: u64) -> Result<()> {
         unsafe { cpu::write_cr4(cpu::read_cr4() & !CR4_VMXE) };
         return Err(Error::EnableFailed);
     }
-    /* The host's x87/SSE control bits as every entry wants them, once; and
+    /* The host's x87, SSE and AVX control bits as every entry wants them,
+     * once, and IA32_XSS 0 (`super::fp`); and
      * what keeps a guest's speculation off the host's (`super::spec`). */
     unsafe { super::fp::on() };
     unsafe { super::spec::on(true) };
@@ -420,7 +421,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use kcore::consts::MAX_CPUS;
 
-use super::svm::{FxArea, GuestRegs, Kick, NotRun, Profile, VECTOR_AC, VECTOR_DB, VECTOR_MC};
+use super::fp::GuestFp;
+use super::svm::{GuestRegs, Kick, NotRun, Profile, VECTOR_AC, VECTOR_DB, VECTOR_MC};
 use super::svm::vmcb::{Save, Segment};
 
 /// How many guests' VMCSs are current on each CPU: what [`disable`] refuses
@@ -515,10 +517,6 @@ const CR0_PG: u64 = 1 << 31;
 /// has to match at every entry.
 const EFER_LMA: u64 = 1 << 10;
 
-/* XCR0 while a guest runs is the x87 alone, as under AMD-V -- and so is the
- * host's while VMX is on for the CPU (`super::fp`): `vmlaunch` does not
- * switch XCR0, and the guest is given no XSAVE, so nothing of another
- * guest's extended state is reachable. */
 /// CR4.LA57: five levels of paging (see [`NotRun::FiveLevelPaging`]).
 const CR4_LA57: u64 = 1 << 12;
 /// CR4.VMXE, which VMX forces set in the guest's CR0/CR4 fixed bits even
@@ -645,11 +643,12 @@ unsafe fn descriptor_base(gdt_base: u64, sel: u16) -> u64 {
 impl HostRegs {
     /// Read every host field off the CPU this runs on. CR4 among them is
     /// what the exit loads back, so it has to be the CR4 an entry runs under
-    /// -- with OSFXSR, which the FXSAVE after the exit needs to move the XMM
-    /// registers -- and it is: the bit is set for the CPU while VMX is on
-    /// for it (`super::fp`), not around each entry as it once was, when a
-    /// capture without it left FXSAVE implementation-defined and XSETBV an
-    /// undefined opcode after every exit.
+    /// -- with OSFXSR and OSXSAVE, which the save after the exit needs to
+    /// move the XMM and YMM registers at all -- and it is: both are set for
+    /// the CPU while VMX is on for it (`super::fp`), not around each entry
+    /// as OSFXSR once was, when a capture without it left FXSAVE
+    /// implementation-defined and XSETBV an undefined opcode after every
+    /// exit.
     fn capture() -> Self {
         let (cs, ss, ds, es, fs, gs, tr): (u16, u16, u16, u16, u16, u16, u16);
         unsafe {
@@ -720,8 +719,8 @@ impl HostRegs {
 
 /// A guest's CPU as VT-x keeps it: one VMCS, a shadow of the guest state
 /// that policy above reads and writes as though it were a VMCB's save area
-/// (`Save`), the registers the launch stub moves, and the x87/SSE state
-/// `vmlaunch` does not switch.
+/// (`Save`), the registers the launch stub moves, and the x87, SSE and AVX
+/// state and XCR0, which `vmlaunch` does not switch.
 /// The MSRs the CPU switches around a guest through the VM-entry and VM-exit
 /// load lists, because they are not VMCS fields and a guest that ran with the
 /// host's would be catastrophic: `SYSCALL` jumps to the host's `LSTAR`, and
@@ -839,11 +838,8 @@ pub struct Guest {
     /// and read back from it after.
     save: Save,
     regs: GuestRegs,
-    /// One element, on the heap: a `Vec` because it can be made fallibly.
-    fx: alloc::vec::Vec<FxArea>,
-    /// Which guest's registers a CPU holds, this one being this
-    /// (`super::fp`).
-    fp_id: u64,
+    /// Its x87, SSE and AVX registers and its XCR0 (`super::fp`).
+    fp: GuestFp,
 
     /* Control values, decided once from the CPU's capabilities. */
     basic: u64,
@@ -987,9 +983,7 @@ impl Guest {
     /// this says, a `mov` to CR4 that changes it exits, for the policy to
     /// answer ([`set_cr4`](Self::set_cr4)).
     pub fn new(caps: &Caps, exceptions: u32, cr4_own: u64, apicv: bool) -> Result<Self> {
-        let mut fx = alloc::vec::Vec::new();
-        fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
-        fx.push(FxArea::reset());
+        let fp = GuestFp::new()?;
         let vmcs = vmcs::VmcsPage::new(caps.revision())?;
         let mut msr_area = kcore::dma::DmaBuffer::new(1).ok_or(Error::NoMemory)?;
         msr_area.as_mut_slice().fill(0);
@@ -1028,8 +1022,7 @@ impl Guest {
             acked: None,
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
-            fx,
-            fp_id: super::fp::owner_id(),
+            fp,
             basic: caps.basic,
             pin: 0,
             proc1: 0,
@@ -1115,8 +1108,22 @@ impl Guest {
     pub fn save_and_regs_mut(&mut self) -> (&mut Save, &mut GuestRegs) {
         (&mut self.save, &mut self.regs)
     }
-    pub fn fx(&self) -> &FxArea {
-        &self.fx[0]
+    /// The guest's XCR0.
+    pub fn xcr0(&self) -> u64 {
+        self.fp.xcr0()
+    }
+
+    /// Make `value` the guest's XCR0, for its XSETBV the policy performs --
+    /// false, and nothing changed, for one a CPU refuses
+    /// ([`GuestFp::set_xcr0`]).
+    pub fn set_xcr0(&mut self, value: u64) -> bool {
+        self.fp.set_xcr0(value)
+    }
+
+    /// How many entries put its x87, SSE and AVX registers back into a CPU
+    /// that held another guest's.
+    pub fn fp_loads(&self) -> u64 {
+        self.fp.loads()
     }
 
     /// The policy has written the whole shadow -- every control register,
@@ -2086,6 +2093,12 @@ impl Guest {
             self.save.cr0 = self.exit_cr0;
             self.save.cr4 = self.exit_cr4;
         }
+        if basic == r::XSETBV && self.exit_reason & r::ENTRY_FAILURE == 0 {
+            /* The CPL, which an XSETBV is checked against: the CPU faults
+             * one above CPL 0 before it would exit, and a hypervisor under
+             * this one may not. */
+            self.save.cpl = unsafe { ((vmread(GUEST_SS_AR) >> 5) & 0x3) as u8 };
+        }
         /* An external interrupt the exit acknowledged: the host's, delivered
          * to nothing yet -- `run` hands it over once the CPU's entries are
          * let go of. */
@@ -2213,8 +2226,6 @@ impl Guest {
         kick: Option<&Kick>,
     ) -> core::result::Result<u32, NotRun> {
         let vmcs_phys = self.vmcs.phys();
-        let fx: *mut FxArea = &mut self.fx[0];
-        let fp_id = self.fp_id;
         let timed = self.profile.is_some();
         let stamp = |on: bool| if on { cpu::rdtsc() } else { 0 };
         let t0 = stamp(timed);
@@ -2224,6 +2235,9 @@ impl Guest {
         }
         if cpu::read_cr4() & CR4_LA57 != 0 {
             return Err(NotRun::FiveLevelPaging { cpu });
+        }
+        if !self.fp.fits(cpu) {
+            return Err(NotRun::Xstate { cpu, xcr0: self.fp.xcr0() });
         }
         if let Some(k) = kick {
             if !k.entering(cpu) {
@@ -2391,19 +2405,16 @@ impl Guest {
 
         let t2 = stamp(timed);
 
-        /* The x87/SSE state is the guest's from here to the FXSAVE after
-         * the exit, exactly as under AMD-V: `vmlaunch` does not switch
-         * it, and CR4.OSFXSR and an XCR0 of the x87 alone were set for
-         * the CPU when VMX was turned on for it (`super::fp`); and it is
-         * loaded only when the CPU's registers are not this guest's
-         * already from its last exit here, which the host, using none
-         * of them, leaves as they were. CR2 is the guest's likewise --
-         * VMX keeps no guest CR2 -- so save the host's and restore it
-         * after. */
-        if !super::fp::registers_are(cpu, fp_id) {
-            unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
-            super::fp::registers_loaded(cpu, fp_id);
-        }
+        /* The x87, SSE and AVX registers and XCR0 are the guest's from
+         * here to the save after the exit, exactly as under AMD-V:
+         * `vmlaunch` switches none of them, and CR4.OSFXSR and OSXSAVE
+         * were set for the CPU when VMX was turned on for it
+         * (`super::fp`) -- the CR4 the exit loads back (`HostRegs`) -- and
+         * the registers are loaded only when the CPU's are not this
+         * guest's already from its last exit here. `fits` held above,
+         * with interrupts off since. CR2 is the guest's likewise -- VMX
+         * keeps no guest CR2 -- so save the host's and restore it after. */
+        unsafe { self.fp.load(cpu) };
         let host_cr2 = cpu::read_cr2();
         unsafe { cpu::write_cr2(self.save.cr2) };
 
@@ -2431,7 +2442,8 @@ impl Guest {
 
         self.save.cr2 = cpu::read_cr2();
         unsafe { cpu::write_cr2(host_cr2) };
-        unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+        /* XCR0 still the guest's: its XSETBV always exits. */
+        unsafe { self.fp.save(cpu) };
         if let Some(k) = kick { k.left(); }
         let t5 = stamp(timed);
 

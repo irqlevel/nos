@@ -40,9 +40,13 @@ KVM it is whatever the host CPU has):
     translations; TCG flushes on every entry) -- and a guest of two CPUs,
     each on a host CPU of its own, the first starting the second with INIT
     and a start-up IPI into real mode, the second reaching long mode and
-    sending the first an IPI, and the first's APIC timer interrupting it.
-    Under TCG that last needs QEMU 9.2 or later, which puts a real-mode
-    guest through the nested page table; the test refuses an older one
+    sending the first an IPI, and the first's APIC timer interrupting it;
+    and a guest of two CPUs taking turns on the one host CPU by IPI, each
+    finding its YMM registers, MXCSR and x87 control word as it left them
+    at every turn, and YMM0-15 zero as it starts, its XSETBVs held to what
+    a CPU takes. Under TCG the guests of two CPUs need QEMU 9.2 or later,
+    which puts a real-mode guest through the nested page table; the test
+    refuses an older one
   - a second `insmod`, a CPU that does not exist, a word that is not a
     subcommand and a guest that does not exist are each refused
   - `rmmod` with the extension on for every CPU turns it off for every CPU
@@ -258,6 +262,19 @@ GUESTS = {
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
            r"\b14 and 14 movs of debug registers performed, 1 and 1 exceptions given back"],
+    # Two CPUs taking turns on the CPU the guests run on, by IPI: each has to
+    # find YMM0-15 0 as it starts, though the other's pattern was in the
+    # CPU's registers, and its YMM registers, MXCSR and x87 control word as
+    # it left them at every turn -- put back by the host each time the other
+    # had had the CPU (`hvarch::x86::fp`); its XSETBVs held to what a CPU
+    # takes, and leaf 0xD as a CPU gives it. The XSETBV with CR4.OSXSAVE
+    # clear is a #UD the CPU raises itself under VT-x, and the host's under
+    # QEMU's TCG, whose intercept comes first: 6 or 5 refused.
+    "avx": [r"XSAVE and AVX offered(?: \(AVX2 too\))?, OSXSAVE with CR4's, XCR0 1 to 7, the six XSETBVs a CPU "
+            r"refuses refused, leaf 0xD's sizes 576 and 832",
+            r"YMM0-15 0 at each CPU's start, and its YMM registers, MXCSR and control word its own at all 64 of "
+            r"its turns",
+            r"cpu 0: \d+ \(\d XSETBV, [56] refused;.*cpu 1: \d+ \(\d XSETBV, [56] refused;"],
 }
 
 # Five of the guests test a mechanism each vendor has its own way: AMD-V's
@@ -608,6 +625,9 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         if name in ("smp", "posted"):
             # Its first CPU there, its second on another CPU of its own.
             good = good and re.search(r"ran on\s+cpu %d and (?!%d,)\d+," % (cpu, cpu), report) is not None
+        elif name == "avx":
+            # Both its CPUs there.
+            good = good and re.search(r"ran on\s+cpu %d and cpu %d," % (cpu, cpu), report) is not None
         elif name != "refused":
             good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
@@ -627,6 +647,8 @@ def x86_checks(ran, script, digest, grown, raw):
              re.search(r"^hv: .* -- ready$", info, re.M) is not None, info)
     pt.check("with nested paging, which is what makes a guest's memory the CPU's",
              re.search(r"(nested paging|extended page tables)\s+yes", info) is not None, info)
+    pt.check("and AVX for a guest, its YMM registers and XCR0 switched with it",
+             re.search(r"AVX in a guest\s+yes", info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
