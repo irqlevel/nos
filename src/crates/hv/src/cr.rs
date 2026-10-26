@@ -7,8 +7,13 @@
 //! the guest's triple fault, and the host would never hear of it. The guest
 //! reads back the CR4 it wrote, MCE as it left it. And a bit its CPUID does
 //! not offer -- PKE, whose PKRU nothing switches between guests, SMEP,
-//! FSGSBASE, LA57, OSXSAVE, PCIDE -- is the #GP a CPU without the feature
-//! gives, not a feature the guest has behind its CPUID's back.
+//! FSGSBASE, LA57, OSXSAVE on a CPU without XSAVE, PCIDE -- is the #GP a CPU
+//! without the feature gives, not a feature the guest has behind its CPUID's
+//! back.
+//!
+//! And its XSETBV, which both stop it at -- XCR0 is the CPU's, and neither
+//! `vmrun` nor `vmlaunch` switches it -- performed as a CPU offering the
+//! XSAVE components `hvarch::x86::fp::offered` names does ([`xsetbv`]).
 //!
 //! Under AMD-V the exit names the register and which way, and on a CPU with
 //! decode assists the general-purpose register too. That last is not used:
@@ -49,6 +54,11 @@ const EFER_LMA: u64 = 1 << 10;
 const CR3_PCID: u64 = 0xFFF;
 /// The control register whose accesses this performs.
 const CR4: u8 = 4;
+/// CR4.OSXSAVE: XGETBV and XSETBV may be run.
+const CR4_OSXSAVE: u64 = 1 << 18;
+/// The extended control register XSETBV writes, of those ECX names: XCR0,
+/// the only one there is to write.
+const XCR0: u32 = 0;
 /// What 32-bit code reads and writes of a register.
 const LOW32: u64 = 0xFFFF_FFFF;
 
@@ -152,4 +162,39 @@ pub fn valid(old: u64, new: u64, save: &Save, allowed: u64) -> bool {
         return false;
     }
     true
+}
+
+/// What became of an XSETBV.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Xcr {
+    /// The value is the guest's XCR0 from now on.
+    Written,
+    /// A CPU refuses it: above CPL 0, of an XCR other than XCR0, or a value
+    /// XCR0 does not take -- a #GP, the instruction not run.
+    Refused,
+    /// CR4.OSXSAVE is clear: a #UD, the instruction not run.
+    Undefined,
+}
+
+/// Perform the XSETBV the guest stopped at -- ECX naming the register,
+/// EDX:EAX the value -- in the order a CPU checks it: a #UD without
+/// CR4.OSXSAVE, a #GP above CPL 0, for any register but XCR0, and for a
+/// value XCR0 does not take (`GuestFp::set_xcr0`: the x87 in it, AVX only
+/// with SSE, and nothing not offered). VT-x faults the first two before its
+/// exit, and AMD-V's intercept may come before either -- QEMU's TCG takes it
+/// first -- so they are checked here whichever it is. Taken, the value is
+/// the guest's XCR0 from its next entry, and the instruction stepped past.
+pub fn xsetbv(v: &mut Backend) -> Xcr {
+    if v.cr4() & CR4_OSXSAVE == 0 {
+        v.inject_ud();
+        return Xcr::Undefined;
+    }
+    let xcr = v.regs().rcx as u32;
+    let value = (v.regs().rdx & LOW32) << 32 | (v.save().rax & LOW32);
+    if v.save().cpl != 0 || xcr != XCR0 || !v.set_xcr0(value) {
+        v.inject_gp();
+        return Xcr::Refused;
+    }
+    v.skip_xsetbv();
+    Xcr::Written
 }

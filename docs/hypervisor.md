@@ -294,11 +294,11 @@ The differences that are not hidden by the shadow at all:
   VMCLEAR and VMXOFF that are the only things to change it), and an entry
   whose VMCS is current already skips the instruction. The CR4 the exit
   loads back from the host area has to be the one an entry runs under, with
-  OSFXSR: captured without it -- as it once was, the bit set around each
-  entry and captured before -- the FXSAVE after the exit could leave the XMM
-  registers out and the XSETBV after it was an undefined opcode. Now the
-  bit is the CPU's for as long as VMX is on for it (below), and the capture
-  is right by construction.
+  OSFXSR and OSXSAVE: captured without OSFXSR -- as it once was, the bit set
+  around each entry and captured before -- the FXSAVE after the exit could
+  leave the XMM registers out and the XSETBV after it was an undefined
+  opcode. Now both bits are the CPU's for as long as VMX is on for it
+  (below), and the capture is right by construction.
 - **The host's NMI is delivered by hand.** Under AMD-V an intercepted NMI
   stays pending until `stgi` and the host takes it then; under VT-x the exit
   *is* its delivery -- the NMI is consumed, and NMIs stay blocked until an
@@ -311,8 +311,10 @@ The differences that are not hidden by the shadow at all:
   that CPU.
 - **CR2 is nobody's on Intel.** `vmrun` keeps a guest CR2 in the VMCB; VMX
   keeps none, so `run` saves the host's and restores the guest's around the
-  world switch by hand. The x87/SSE and XCR0 switch is the same as AMD-V --
-  neither extension switches it, and the guest is given x87 alone.
+  world switch by hand. The switch of the x87, SSE and AVX registers and
+  XCR0 is the same as AMD-V's -- neither extension switches them -- but
+  that the CPU stops an XSETBV above CPL 0 or without CR4.OSXSAVE itself,
+  before its exit, which the run loop checks again anyway.
 - **CR8 is the host's on Intel.** In 64-bit mode CR8 is the local APIC's
   task priority register, and under VT-x a guest's `mov cr8` reaches the real
   one unless told not to: 15 there keeps every interrupt but an NMI off the
@@ -742,9 +744,9 @@ on on every entry, whatever the VMCB says:
   access's is, since a CPU without decode assists (QEMU's, a nested
   hypervisor's) does not name the register. A write of a bit the guest's
   CPUID does not offer is the #GP a CPU without the feature gives, so PKE,
-  LA57, OSXSAVE and CET stay off; one a CPU would not take
-  where the guest is -- PAE cleared in long mode, PCIDE with a PCID in CR3 --
-  is a #GP too; and a write that changes a bit a CPU translates by flushes
+  LA57 and CET stay off, and OSXSAVE on a CPU without XSAVE; one a CPU
+  would not take where the guest is -- PAE cleared in long mode, PCIDE with
+  a PCID in CR3 -- is a #GP too; and a write that changes a bit a CPU translates by flushes
   the guest's TLB, as the CPU would. QEMU's TCG never stops a guest at a
   read of CR4, whatever the VMCB asks: its decoder checks a read of any
   control register against CR0's read intercept, adding the register's
@@ -941,6 +943,7 @@ mode:
 | `posted` | on the machine of `smp`, asking for its interrupts to be the CPU's: the second CPU, started as `smp`'s is, sends the first a thousand fixed IPIs, one at a time, while the first spins with interrupts on and no HLT, counting them | where the CPU has posted interrupts each is posted and notified and taken by the first CPU in its guest, which leaves it a handful of times rather than once an IPI; elsewhere the host hands each over ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
+| `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
 | `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and PKE, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and PKE -- which its CPUID never offers -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
@@ -1016,24 +1019,54 @@ And while a guest runs:
   guests moved between CPUs, on a Zen 2 -- rather than on every entry, the
   host's entries included, as it was. `hv bench ... flush` still does that,
   for what it costs ([What an exit costs](#what-an-exit-costs)).
-- **The x87 and SSE state is the guest's, switched at the exit and, when
-  it has to be, at the entry.** FXSAVE after every exit into an area each
-  guest owns; FXRSTOR before an entry only when the CPU's registers are not
-  this guest's already -- each CPU remembers whose FXRSTOR was the last on
-  it (`fp::OWNER`, by a number no two guests ever share), and the host uses
+- **The x87, SSE and AVX state is the guest's, and XCR0 with it, switched
+  at the exit and, when it has to be, at the entry.** Neither `vmrun` nor
+  `vmlaunch` switches them (`hvarch::x86::fp`). After every exit, an XSAVE of
+  what the guest's XCR0 names into an area each guest owns -- XSAVE's
+  standard format, 832 bytes: the legacy region, the header, and AVX's
+  upper halves of the YMM registers -- or an FXSAVE where its XCR0 is the
+  x87 alone, the SSE registers being the guest's to use whatever XCR0 says.
+  Before an entry, an XRSTOR only when the CPU's registers are not this
+  guest's already -- each CPU remembers whose load was the last on it
+  (`fp::OWNER`, by a number no two guests ever share), and the host uses
   none of the registers (its C++ is built without SSE and x87, its Rust is
   soft-float), so between a guest's exit on a CPU and its next entry there
-  they hold what its FXSAVE saved unless another guest's entry came between.
-  CR4.OSFXSR, without which FXSAVE leaves the XMM registers out, is set for
-  a CPU when its extension is turned on and cleared when it is turned off
-  (`hvarch::x86::fp`), not around each entry as before: that was two
-  serializing writes of CR4 and an XGETBV an exit, and under a nested
-  hypervisor an exit to it for each. What is given up is that, while the
-  module is loaded, an SSE instruction in the kernel would run on those CPUs
-  instead of faulting -- a guard against a toolchain slip, not a guest. XCR0
-  is made the x87 alone at the same moment, if firmware left it with more,
-  and put back when the extension goes off; guests are given no XSAVE, so
-  AVX and above fault in a guest even if it turns OSXSAVE on itself.
+  they hold what its save saved unless another guest's entry came between.
+  That load is of all the CPU switches, under an XCR0 of all of it,
+  whatever the guest's says: the upper halves of the YMM registers, which a
+  guest whose XCR0 leaves out AVX cannot reach now but can the moment it
+  sets it, are its own or zero, never another guest's. Then XCR0 is made
+  the guest's -- an XSETBV only where it differs, since XSETBV serializes
+  and under a nested hypervisor is an exit to it: a Linux guest runs under
+  the very XCR0 the loads want, and its entries write none.
+  
+  The guest's own XSETBV always exits -- AMD-V's intercept, which `hvarch`
+  sets on every entry; VT-x's, unconditional -- and the run loop performs it
+  as a CPU does (`hv/src/cr.rs`, `xsetbv`): a #UD without CR4.OSXSAVE, a #GP
+  above CPL 0, for any register but XCR0, and for a value XCR0 does not
+  take -- the x87 left out, AVX without SSE, anything not offered.
+  `GuestFp::set_xcr0` holds a value to the same rules before it is ever
+  loaded, so no XSETBV of the host's can fault on what a guest asked. What
+  is switched, and so all that is offered (`fp::offered`), is the x87, SSE
+  and AVX as the CPU has them, AVX's component where every CPU with it puts
+  it, at 576 -- the area's bounds -- and nothing past it: AVX-512's, AMX's,
+  PKRU and CET's state are never in a guest's reach. AMD-V does not stop
+  XSAVES and XRSTORS, which no guest's CPUID offers, and they move the
+  supervisor components IA32_XSS names: it is made 0 while the extension
+  is on, so that they move nothing of the host's (VT-x faults them, its
+  control for them off).
+
+  CR4.OSFXSR and OSXSAVE, which the loads and saves need, are set for a CPU
+  when its extension is turned on and cleared when it is turned off, not
+  around each entry as OSFXSR once was: that was two serializing writes of
+  CR4 and an XGETBV an exit, and under a nested hypervisor an exit to it for
+  each. What is given up is that, while the module is loaded, an SSE or AVX
+  instruction in the kernel would run on those CPUs instead of faulting --
+  a guard against a toolchain slip, not a guest. Between a guest's exit and
+  the next entry XCR0 is whatever that guest had; the extension going off
+  puts back what it found, and IA32_XSS with it. The `avx` built-in guest
+  is the check: two CPUs taking turns on one host CPU, each finding its YMM
+  registers, MXCSR and control word as it left them at every turn.
 - **A halted guest costs its CPU nothing.** A HLT with interrupts on is
   stepped past, as a CPU an interrupt wakes resumes after it, and the vCPU
   is not entered again until the PIC has an interrupt for it; meanwhile its
@@ -1350,9 +1383,13 @@ here:
   CPUID is an allow-list: a leaf the policy does not name is all zeros, as
   is every leaf past the tops it reports -- 0x16 and 0x8000_0021, or the
   host's if lower -- and of the leaves it names a guest is told the host's
-  bits it lets through: no XSAVE and so no AVX -- the state switch around
-  `vmrun` moves only the FXSAVE registers, so a guest is given nothing it
-  could put in the part that is not switched -- no paravirtualisation, no
+  bits it lets through: XSAVE's state as far as the switch around `vmrun`
+  and `vmlaunch` moves it, the x87, SSE and AVX -- XSAVE, OSXSAVE as the
+  guest's own CR4 has it, AVX, FMA, F16C, AVX2, VAES and VPCLMULQDQ; leaf
+  0xD made up for those three components, its sizes for the guest's own
+  XCR0; XSAVEOPT, XSAVEC and XGETBV's ECX 1 as the host has them, never
+  XSAVES -- and no AVX-512, AMX or PKU, whose state nothing switches; no
+  paravirtualisation, no
   speculation control (none has its MSR behind it yet); of the structured
   leaf, 7, what runs as it is and owns no state of the host's -- SMEP, SMAP
   and UMIP for the guest's kernel, FSGSBASE over bases the VMCS and the VMCB
@@ -4207,10 +4244,13 @@ someone else's; then speed.
    affected", RFDS "Mitigation: Clear Register File", and every one of
    those in its flags. PCID it turns off itself there ("Incomplete global
    flushes", an Alder Lake and Raptor Lake erratum); on another CPU it is
-   used. Left: XSAVE, with XCR0 switched and leaf 0xD made up for it -- no
-   AVX, so a distribution built for x86-64-v3 (RHEL 10 and its rebuilds)
-   does not start -- and the speculation controls, SPEC_CTRL switched with
-   the guest: Spectre v2 retpolines in the guest, its store bypass open.
+   used. XSAVE is offered now, XCR0 switched with the guest and leaf 0xD
+   made up for what is switched, the x87, SSE and AVX
+   ([above](#what-the-extension-costs-while-it-is-on)) -- and with it AVX,
+   FMA, F16C, AVX2, VAES and VPCLMULQDQ: the whole of x86-64-v3's list, for
+   a distribution built for it (RHEL 10 and its rebuilds). Left: the
+   speculation controls, SPEC_CTRL switched with the guest: Spectre v2
+   retpolines in the guest, its store bypass open.
    (The hypervisor bit, clear until the policy became an allow-list -- the
    guest believing it was on bare metal -- is set now:
    [above](#before-other-peoples-guests), item 2.)

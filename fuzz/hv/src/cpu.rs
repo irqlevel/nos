@@ -178,7 +178,69 @@ pub mod x86 {
             if leaf == 1 {
                 r.edx |= AMD64_LEAF1_EDX;
             }
+            /* XSAVE's leaves as a CPU with it has them, now and then -- on
+             * half of the hosts with AVX as well: the components in leaf
+             * 0xD, and AVX's where every CPU with it puts it -- for `fp`'s
+             * `offered` to find, as hvarch's finds them on a CPU. */
+            let xsave = xsave_level();
+            if xsave >= XSAVE_SSE {
+                match (leaf, sub) {
+                    (1, _) => r.ecx |= ECX_XSAVE | if xsave >= XSAVE_AVX { ECX_AVX } else { 0 },
+                    (0xD, 0) => {
+                        r.eax |= 0b11 | if xsave >= XSAVE_AVX { 0b100 } else { 0 };
+                    }
+                    (0xD, 2) if xsave >= XSAVE_AVX => {
+                        r.eax = AVX_BYTES;
+                        r.ebx = AVX_OFFSET;
+                    }
+                    _ => {}
+                }
+            }
             Some(r)
+        }
+
+        /* Leaf 1 ECX's XSAVE and AVX, and AVX's component's size and offset
+         * in leaf 0xD. */
+        const ECX_XSAVE: u32 = 1 << 26;
+        const ECX_AVX: u32 = 1 << 28;
+        const AVX_BYTES: u32 = 256;
+        const AVX_OFFSET: u32 = 576;
+        /// What of XSAVE this input's host has for certain: nothing but what
+        /// its made-up leaves say, the x87 and SSE components, or AVX's too.
+        const XSAVE_SSE: u64 = 1;
+        const XSAVE_AVX: u64 = 2;
+        fn xsave_level() -> u64 {
+            (host() >> 40) & 3
+        }
+    }
+
+    /// hvarch's `fp`, as the policy and the run loop see it: the XCR0
+    /// components a guest is offered, found in this input's host's leaves
+    /// as hvarch's `supported` finds them in a CPU's -- XSAVE, the x87 and
+    /// SSE in leaf 0xD, and AVX where leaf 1 has it, leaf 0xD names it and
+    /// puts it at 576, 256 bytes long.
+    pub mod fp {
+        use super::cpu;
+
+        pub const XCR0_X87: u64 = 1 << 0;
+        pub const XCR0_SSE: u64 = 1 << 1;
+        pub const XCR0_AVX: u64 = 1 << 2;
+
+        pub fn offered() -> u64 {
+            const ECX_XSAVE: u32 = 1 << 26;
+            const ECX_AVX: u32 = 1 << 28;
+            let Some(features) = cpu::cpuid_count(1, 0) else { return 0 };
+            if features.ecx & ECX_XSAVE == 0 {
+                return 0;
+            }
+            let Some(components) = cpu::cpuid_count(0xD, 0) else { return 0 };
+            let has = u64::from(components.eax) | u64::from(components.edx) << 32;
+            if has & (XCR0_X87 | XCR0_SSE) != XCR0_X87 | XCR0_SSE {
+                return 0;
+            }
+            let fits = cpu::cpuid_count(0xD, 2).map_or(false, |c| c.eax == 256 && c.ebx == 576);
+            let avx = features.ecx & ECX_AVX != 0 && has & XCR0_AVX != 0 && fits;
+            XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 }
         }
     }
 
@@ -385,6 +447,7 @@ pub mod vm {
         Flush(u32),
         NotItsMemory,
         Controls { cpu: u32, field: &'static str, missing: u32 },
+        Xstate { cpu: u32, xcr0: u64 },
     }
 
     /// An event on its way into the guest.
@@ -432,6 +495,9 @@ pub mod vm {
         cr4: u64,
         /// The guest's DR0-DR3, as svm.rs keeps them apart from the CPU's.
         debug_addrs: [u64; 4],
+        /// The guest's XCR0, as hvarch's `GuestFp` keeps it: the x87 alone
+        /// out of reset, and whatever XSETBV the run loop performed made it.
+        xcr0: u64,
         /// VT-x's virtual APIC, as the machine is said to have one: CR8 its
         /// VTPR, never an exit, and while the run loop has virtual-interrupt
         /// delivery on (`apicv`), this model is the CPU that delivers VIRR's
@@ -488,6 +554,7 @@ pub mod vm {
                 exit_len: 0,
                 cr4: 0,
                 debug_addrs: [0; 4],
+                xcr0: crate::x86::fp::XCR0_X87,
                 vapic: false,
                 apicv: false,
                 virr: [0; 8],
@@ -690,6 +757,27 @@ pub mod vm {
         }
         pub fn skip_wbinvd(&mut self) {
             self.step(2);
+        }
+        pub fn skip_xsetbv(&mut self) {
+            self.step(3);
+        }
+        pub fn xcr0(&self) -> u64 {
+            self.xcr0
+        }
+        /// As hvarch's `GuestFp::set_xcr0`: the x87 in it, AVX only with
+        /// SSE, and nothing `fp::offered` does not offer -- false and
+        /// nothing changed otherwise.
+        pub fn set_xcr0(&mut self, value: u64) -> bool {
+            use crate::x86::fp::{offered, XCR0_AVX, XCR0_SSE, XCR0_X87};
+            let valid = value & XCR0_X87 != 0 && value & !offered() == 0
+                && (value & XCR0_AVX == 0 || value & XCR0_SSE != 0);
+            if valid {
+                self.xcr0 = value;
+            }
+            valid
+        }
+        pub fn fp_loads(&self) -> u64 {
+            0
         }
         /// As VT-x's: CR8 to or from a register, and stepped past.
         pub fn cr8_access(&mut self, write: bool, gpr: u8) {
