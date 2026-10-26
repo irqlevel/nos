@@ -1,23 +1,23 @@
 #include "stack_probe.h"
 
-namespace Kernel
+namespace kernel
 {
 
-namespace StackProbe
+namespace stack_probe
 {
 
-void Poison(void* base, ulong size)
+void poison(void* base, ulong size)
 {
-    Stdlib::MemSet(base, PatternByte, size);
+    stdlib::mem_set(base, PATTERN_BYTE, size);
 }
 
-ulong Untouched(const void* base, ulong size)
+ulong untouched(const void* base, ulong size)
 {
     const ulong* word = (const ulong*)base;
     ulong count = size / sizeof(ulong);
 
     ulong i = 0;
-    while (i < count && word[i] == Pattern)
+    while (i < count && word[i] == PATTERN)
         i++;
 
     return i * sizeof(ulong);

@@ -20,55 +20,55 @@
    (Cpu::IPI) EOIs itself before it may Schedule() away, exactly like the
    x86 flow. */
 
-namespace Kernel
+namespace kernel
 {
 
-extern "C" void IPInterrupt(Context* ctx); /* kernel/cpu.cpp */
+extern "C" void ip_interrupt(Context* ctx); /* kernel/cpu.cpp */
 
 namespace
 {
 
-const ulong MaxIntIds = 256;
-const ulong MaxSharedPerIntId = 8;
+const ulong MAX_INT_IDS = 256;
+const ulong MAX_SHARED_PER_INT_ID = 8;
 
 struct IntIdEntry
 {
-    u8 HandlerCount;
-    bool Level;
-    InterruptHandler* Handlers[MaxSharedPerIntId];
+    u8 handler_count;
+    bool level;
+    InterruptHandler* handlers[MAX_SHARED_PER_INT_ID];
 };
 
-IntIdEntry IntIds[MaxIntIds];
+IntIdEntry int_ids[MAX_INT_IDS];
 
-ulong ReadMpidr()
+ulong read_mpidr()
 {
     ulong mpidr;
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
     return mpidr;
 }
 
-void RegisterCommon(InterruptHandler& handler, u8 intId, bool edge, bool level)
+void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level)
 {
-    auto& gic = Gic::GetInstance();
-    BugOn(!gic.IsReady());
+    auto& gic = Gic::get_instance();
+    BUG_ON(!gic.is_ready());
 
-    auto& ve = IntIds[intId];
-    if (BugOn(ve.HandlerCount >= MaxSharedPerIntId))
+    auto& ve = int_ids[int_id];
+    if (BUG_ON(ve.handler_count >= MAX_SHARED_PER_INT_ID))
         return;
-    if (BugOn(ve.HandlerCount != 0 && !ve.Level))
+    if (BUG_ON(ve.handler_count != 0 && !ve.level))
         return;
-    ve.Level = level;
-    ve.Handlers[ve.HandlerCount] = &handler;
+    ve.level = level;
+    ve.handlers[ve.handler_count] = &handler;
     /* The handler written before the count that lets an interrupt on another
        CPU reach it -- a level line shared is enabled already. Release: the
        compiler and the CPU both keep the order, which plain stores at -O2
        promise neither. */
-    __atomic_store_n(&ve.HandlerCount, static_cast<u8>(ve.HandlerCount + 1), __ATOMIC_RELEASE);
+    __atomic_store_n(&ve.handler_count, static_cast<u8>(ve.handler_count + 1), __ATOMIC_RELEASE);
 
-    gic.EnableIrq(intId, ReadMpidr(), edge);
-    handler.OnInterruptRegister(intId, intId);
+    gic.enable_irq(int_id, read_mpidr(), edge);
+    handler.on_interrupt_register(int_id, int_id);
 
-    Trace(0, "Interrupt: intid %lu registered %s", (ulong)intId,
+    trace(0, "Interrupt: intid %lu registered %s", (ulong)int_id,
         level ? "level" : "edge");
 }
 
@@ -78,30 +78,30 @@ void RegisterCommon(InterruptHandler& handler, u8 intId, bool edge, bool level)
    "vector" argument is advisory and ignored (callers like the Rust FFI
    pass an x86 vector-space value). OnInterruptRegister reports the
    INTID back as the effective vector. */
-void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
+void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
 {
     (void)vector;
-    RegisterCommon(handler, irq, true, false);
+    register_common(handler, irq, true, false);
 }
 
-void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
+void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
 {
     (void)vector;
-    RegisterCommon(handler, irq, false, true);
+    register_common(handler, irq, false, true);
 }
 
-void Interrupt::SharedDispatch(Context* ctx)
+void Interrupt::shared_dispatch(Context* ctx)
 {
     (void)ctx; /* dispatch happens in ArmIrqEntry */
 }
 
-extern "C" void ArmIrqEntry(Context* ctx)
+extern "C" void arm_irq_entry(Context* ctx)
 {
     bool handled = false;
 
     for (;;)
     {
-        u32 intId = Gic::ReadIar();
+        u32 int_id = Gic::read_iar();
         /* The special INTIDs 1020..1023 mean "no (further) interrupt to
            acknowledge" — 1023 is the normal drain-loop terminator. Bound the
            check to that range: LPIs (>= LpiIntIdBase, i.e. 8192) are numerically
@@ -109,62 +109,62 @@ extern "C" void ArmIrqEntry(Context* ctx)
            they are acknowledged (IAR read raises the running priority) but
            never EOI'd, wedging the CPU interface against every lower/equal
            priority interrupt. */
-        if (intId >= Gic::SpuriousIntId && intId < Its::LpiIntIdBase)
+        if (int_id >= Gic::SPURIOUS_INT_ID && int_id < Its::LPI_INT_ID_BASE)
         {
             /* An empty first read is a real spurious interrupt; an empty
                re-read is just the dispatch loop draining */
             if (!handled)
-                InterruptStats::Inc(IrqSpurious);
+                InterruptStats::inc(IrqSpurious);
             return;
         }
         handled = true;
 
-        if (intId == CpuTable::IPIVector)
+        if (int_id == CpuTable::IPI_VECTOR)
         {
             /* EOIs itself (Hal::IrqEoi in Cpu::IPI) before Schedule */
-            IPInterrupt(ctx);
+            ip_interrupt(ctx);
             continue;
         }
 
-        if (intId >= Its::LpiIntIdBase)
+        if (int_id >= Its::LPI_INT_ID_BASE)
         {
-            Its::GetInstance().HandleLpi(intId);
-            Gic::WriteEoir(intId);
+            Its::get_instance().handle_lpi(int_id);
+            Gic::write_eoir(int_id);
             continue;
         }
 
-        if (intId == GenericTimer::GetInstance().IntId())
+        if (int_id == GenericTimer::get_instance().int_id())
         {
             /* Per-CPU scheduler tick: LocalTick EOIs before it may
                Schedule() away, so it is not part of the generic path. */
-            GenericTimer::GetInstance().LocalTick(ctx);
+            GenericTimer::get_instance().local_tick(ctx);
             continue;
         }
 
         /* Registration is bounded to u8 INTIDs, but the GIC can report up
            to 1019 — never index IntIds with an unregistered-range id */
-        if (intId >= MaxIntIds)
+        if (int_id >= MAX_INT_IDS)
         {
-            InterruptStats::Inc(IrqDummy);
-            Gic::WriteEoir(intId);
+            InterruptStats::inc(IrqDummy);
+            Gic::write_eoir(int_id);
             continue;
         }
 
-        auto& ve = IntIds[intId];
+        auto& ve = int_ids[int_id];
         /* Acquire, the other half of RegisterCommon's release: every handler
            counted is one whose pointer is there to call */
-        const u8 count = __atomic_load_n(&ve.HandlerCount, __ATOMIC_ACQUIRE);
+        const u8 count = __atomic_load_n(&ve.handler_count, __ATOMIC_ACQUIRE);
         if (count == 0)
         {
-            InterruptStats::Inc(IrqDummy);
+            InterruptStats::inc(IrqDummy);
         }
         else
         {
             for (u8 i = 0; i < count; i++)
-                ve.Handlers[i]->OnInterrupt(ctx);
+                ve.handlers[i]->on_interrupt(ctx);
         }
 
-        Gic::WriteEoir(intId);
+        Gic::write_eoir(int_id);
     }
 }
 

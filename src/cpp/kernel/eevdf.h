@@ -3,7 +3,7 @@
 #include <lib/stdlib.h>
 #include <lib/list_entry.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* What the scheduler knows of a task, and the rules it decides by:
@@ -35,67 +35,67 @@ struct SchedEntity
 
     /* Its share, from its nice: 1024 at nice 0, each step 1.25 times the
        next (Linux's sched_prio_to_weight) */
-    ulong Weight;
+    ulong weight;
 
     /* Virtual nanoseconds per nanosecond on the CPU, times 2^32:
        (1024 << 32) / Weight */
-    ulong VMult;
+    ulong vmult;
 
-    long Nice;
+    long nice;
 
     /* How long it asks to run at a time: its deadline is a slice past its
        VRuntime when it is placed or its slice is done */
-    ulong SliceNs;
+    ulong slice_ns;
 
     /* The virtual time it has had, and the virtual time its request is due
        by. Compared as differences, so that they may wrap. */
-    u64 VRuntime;
-    u64 Deadline;
+    u64 vruntime;
+    u64 deadline;
 
     /* What it was owed (positive) or owed (negative) as it left its queue --
        asleep, or moved to another CPU -- clamped to LagLimit: where it is
        placed when it comes back */
-    s64 VLag;
+    s64 vlag;
 
     /* Placed once: a new task is placed with no lag and half a slice, to
        run soon but not to take the CPU for a whole slice ahead of everybody */
-    bool Placed;
+    bool placed;
 
     /* The lag it was last placed with, as it brought it: for `sched probe` */
-    s64 PlacedLag;
+    s64 placed_lag;
 
     /* When it was last charged for the CPU: when it started running, or
        when it was last charged since */
-    u64 ExecStart;
+    u64 exec_start;
 
     /* On its queue's run list */
-    Stdlib::ListEntry Entry;
+    stdlib::ListEntry entry;
 
     /* constexpr, so inline: Stdlib::Min takes them by reference */
-    static constexpr long NiceMin = -20;
-    static constexpr long NiceMax = 19;
-    static constexpr ulong Nice0Weight = 1024;
-    static constexpr ulong DefaultSliceNs = 3 * Const::NanoSecsInMs;
-    static constexpr ulong MinSliceNs = 100 * Const::NanoSecsInUsec;
-    static constexpr ulong MaxSliceNs = 100 * Const::NanoSecsInMs;
+    static constexpr long NICE_MIN = -20;
+    static constexpr long NICE_MAX = 19;
+    static constexpr ulong NICE0_WEIGHT = 1024;
+    static constexpr ulong DEFAULT_SLICE_NS = 3 * consts::NANO_SECS_IN_MS;
+    static constexpr ulong MIN_SLICE_NS = 100 * consts::NANO_SECS_IN_USEC;
+    static constexpr ulong MAX_SLICE_NS = 100 * consts::NANO_SECS_IN_MS;
 
     /* Its weight and VMult for nice, clamped to [NiceMin, NiceMax] */
-    void SetNice(long nice);
+    void set_nice(long value);
 
     /* Clamped to [MinSliceNs, MaxSliceNs] */
-    void SetSlice(ulong sliceNs);
+    void set_slice(ulong value);
 
     /* Virtual nanoseconds that ns on the CPU are worth to it, and the
        nanoseconds on the CPU v virtual ones take it */
-    u64 VirtualOf(ulong ns) const;
-    ulong RealOf(u64 v) const;
+    u64 virtual_of(ulong ns) const;
+    ulong real_of(u64 v) const;
 
     /* Its slice in virtual time */
-    u64 VSlice() const;
+    u64 vslice() const;
 
     /* The most lag it keeps, either way: two slices or a tick, the longer,
        in its virtual time (Linux's limit in update_entity_lag) */
-    s64 LagLimit() const;
+    s64 lag_limit() const;
 
 private:
     SchedEntity(const SchedEntity& other) = delete;
@@ -126,10 +126,10 @@ public:
     EevdfQueue();
 
     /* Nothing waits on the list */
-    bool IsEmpty();
+    bool is_empty();
 
     /* The entity on the CPU, nullptr for none */
-    SchedEntity* Current();
+    SchedEntity* current();
 
     /* se joins the list -- new, woken, or moved here: its VRuntime at V less
        the lag it brings, and its deadline a slice past that -- half a slice
@@ -137,62 +137,62 @@ public:
        and so takes that much of its lag away; the lag is made larger by
        (W + w) / W first, so that once it is in, V less its VRuntime is the
        lag it left with (Linux's place_entity has the derivation). */
-    void Join(SchedEntity* se);
+    void join(SchedEntity* se);
 
     /* se joins as Join places it, onto the CPU: the idle task starting to
        run something. Nothing is current. */
-    void JoinCurrent(SchedEntity* se);
+    void join_current(SchedEntity* se);
 
     /* se leaves -- current, going to sleep or exited or the idle task
        idling again; or on the list, moving to another CPU: the lag it takes
        with it, from a V that counts it */
-    void Leave(SchedEntity* se);
+    void leave(SchedEntity* se);
 
     /* The current one back on the list, displaced and able to run: it keeps
        where it is */
-    void PutBack();
+    void put_back();
 
     /* se, on the list, takes the CPU. Nothing is current: the last one has
        left or gone back, and whatever it took was reckoned with se counted. */
-    void Take(SchedEntity* se);
+    void take(SchedEntity* se);
 
     /* The current one has run until now: its VRuntime advanced by what that
        is worth to it, and its deadline renewed if it has been reached. True
        when it was: its slice is done, and another may be due the CPU. */
-    bool Charge(u64 now);
+    bool charge(u64 now);
 
     /* The eligible entity whose deadline is soonest, the current one among
        them when withCurrent; the one whose deadline is soonest if none is
        eligible, which is only possible with the current one left out.
        nullptr for nothing to choose. */
-    SchedEntity* Pick(bool withCurrent);
+    SchedEntity* pick(bool with_current);
 
     /* The current one asks to let the others go first: its deadline at
        least a slice past V. Bounded, so that a task yielding without end
        does not push its deadline without end. */
-    void Yield();
+    void yield();
 
     /* Nanoseconds on the CPU until the current one's deadline, 0 if it is
        past */
-    ulong RealUntilDeadline();
+    ulong real_until_deadline();
 
     /* The queue's average VRuntime, the current one's included; where an
        entity joining an empty queue starts (the last V there was) if there
        is none */
-    u64 V();
+    u64 v();
 
     /* Whether se, current or on the list, is at or before V */
-    bool IsEligible(const SchedEntity* se);
+    bool is_eligible(const SchedEntity* se);
 
     /* How many entities are on the list */
-    ulong GetCount();
+    ulong get_count();
 
     /* The list itself, for its owner to look through (SchedEntity::Entry) --
        and not to change but by the calls above */
-    Stdlib::ListEntry& Entries() { return List; }
+    stdlib::ListEntry& entries() { return list_; }
 
     /* Everything off the queue: the list unlinked, and nothing current */
-    void Clear();
+    void clear();
 
 private:
     EevdfQueue(const EevdfQueue& other) = delete;
@@ -201,31 +201,31 @@ private:
     EevdfQueue& operator=(EevdfQueue&& other) = delete;
 
     /* se at V less the lag it brings (Join) */
-    void Place(SchedEntity* se);
+    void place(SchedEntity* se);
 
     /* V's parts, over the list and the current one: the smallest VRuntime,
        the sum of weight times VRuntime past it, and the sum of the weights */
     struct Sums
     {
-        u64 Base;
-        u64 Weighted;
-        u64 Load;
+        u64 base;
+        u64 weighted;
+        u64 load;
     };
-    void Sum(Sums& sums);
-    static u64 Average(const Sums& sums);
-    static bool Eligible(const SchedEntity* se, const Sums& sums);
+    void sum(Sums& sums);
+    static u64 average(const Sums& sums);
+    static bool eligible(const SchedEntity* se, const Sums& sums);
 
     /* A VRuntime this far past the base is taken as this far in the sums,
        and counted: a sum that would overflow is a schedule gone wrong, and
        it is not made worse by wrapping */
-    static constexpr u64 MaxSpan = 1UL << 40;
+    static constexpr u64 MAX_SPAN = 1UL << 40;
 
-    Stdlib::ListEntry List;
-    ulong Count;
-    SchedEntity* Curr;
+    stdlib::ListEntry list_;
+    ulong count_;
+    SchedEntity* curr_;
 
     /* V when the queue last had something counted */
-    u64 LastV;
+    u64 last_v_;
 };
 
 }

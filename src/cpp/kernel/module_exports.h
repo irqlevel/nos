@@ -8,8 +8,8 @@
    pass1_tables.cpp stands in for it in pass 1. */
 struct ModuleExport
 {
-    const char* Name;
-    ulong Addr;
+    const char* name;
+    ulong addr;
 };
 
 extern "C" const ModuleExport nos_module_exports[];

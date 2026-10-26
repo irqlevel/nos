@@ -1,6 +1,6 @@
 #pragma once
 
-namespace Stdlib
+namespace stdlib
 {
 
 template<typename T1, typename T2>
@@ -8,14 +8,14 @@ class Pair
 {
 public:
     Pair()
-        : First()
-        , Second()
+        : first_()
+        , second_()
     {
     }
 
     Pair(const T1& first, const T2& second)
-        : First(first)
-        , Second(second)
+        : first_(first)
+        , second_(second)
     {
     }
 
@@ -25,38 +25,38 @@ public:
 
     Pair(const Pair& other)
     {
-        First = other.First;
-        Second = other.Second;
+        first_ = other.first_;
+        second_ = other.second_;
     }
 
     Pair& operator=(const Pair& other)
     {
         if (this != &other)
         {
-            First = other.First;
-            Second = other.Second;
+            first_ = other.first_;
+            second_ = other.second_;
         }
         return *this;
     }
 
     Pair(Pair&& other)
     {
-        First = Move(other.First);
-        Second = Move(other.Second);
+        first_ = move(other.first_);
+        second_ = move(other.second_);
     }
 
     Pair& operator=(Pair&& other)
     {
         if (this != &other)
         {
-            First = Move(other.First);
-            Second = Move(other.Second);
+            first_ = move(other.first_);
+            second_ = move(other.second_);
         }
         return *this;
     }
 
-    T1 First;
-    T2 Second;
+    T1 first_;
+    T2 second_;
 
 private:
 };

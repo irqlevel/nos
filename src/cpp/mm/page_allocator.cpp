@@ -7,194 +7,194 @@
 #include <kernel/cpu.h>
 #include <lib/list_entry.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 FixedPageAllocator::FixedPageAllocator()
-    : PageCount(0)
+    : page_count_(0)
 {
 }
 
 FixedPageAllocator::~FixedPageAllocator()
 {
-    Trace(0, "0x%p dtor", this);
+    trace(0, "0x%p dtor", this);
 }
 
-bool FixedPageAllocator::Setup(ulong vaStart, ulong vaEnd, ulong pageCount)
+bool FixedPageAllocator::setup(ulong start, ulong end, ulong page_count)
 {
-    PageCount = pageCount;
-    ulong blockSize = pageCount * Const::PageSize;
+    page_count_ = page_count;
+    ulong block_size = page_count * consts::PAGE_SIZE;
 
-    Trace(0, "0x%p start 0x%lX end 0x%lX pages %lu", this, vaStart, vaEnd, PageCount);
-    return VaAlloc.Setup(vaStart, vaEnd, blockSize);
+    trace(0, "0x%p start 0x%lX end 0x%lX pages %lu", this, start, end, page_count_);
+    return va_alloc_.setup(start, end, block_size);
 }
 
-void* FixedPageAllocator::Alloc()
+void* FixedPageAllocator::alloc()
 {
-    auto& pt = PageTable::GetInstance();
-    BugOn(PageCount > MaxPageCount);
-    Page* pages[MaxPageCount];
+    auto& pt = PageTable::get_instance();
+    BUG_ON(page_count_ > MAX_PAGE_COUNT);
+    Page* pages[MAX_PAGE_COUNT];
 
-    for (size_t i = 0; i < PageCount; i++)
+    for (size_t i = 0; i < page_count_; i++)
     {
-        pages[i] = pt.AllocPage();
+        pages[i] = pt.alloc_page();
         if (pages[i] == 0)
         {
             for (size_t j = 0; j < i; j++)
-                pt.FreePage(pages[j]);
+                pt.free_page(pages[j]);
             return nullptr;
         }
     }
 
-    ulong va = VaAlloc.Alloc();
+    ulong va = va_alloc_.alloc();
     if (va == 0)
     {
-        for (size_t i = 0; i < PageCount; i++)
-            pt.FreePage(pages[i]);
+        for (size_t i = 0; i < page_count_; i++)
+            pt.free_page(pages[i]);
         return nullptr;
     }
 
-    if (!pt.MapPages(va, pages, PageCount))
+    if (!pt.map_pages(va, pages, page_count_))
     {
-        for (size_t i = 0; i < PageCount; i++)
-            pt.FreePage(pages[i]);
+        for (size_t i = 0; i < page_count_; i++)
+            pt.free_page(pages[i]);
         /* Remote CPUs may have cached translations from the prefix MapPages
            rolled back (it only invalidates locally); flush everywhere before
            the VA block and the pages become reusable. */
-        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, PageCount);
-        VaAlloc.Free(va);
+        kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+        va_alloc_.free(va);
         return nullptr;
     }
 
     return (void*)va;
 }
 
-void* FixedPageAllocator::Map(Page* pages)
+void* FixedPageAllocator::map(Page* pages)
 {
-    ulong va = VaAlloc.Alloc();
+    ulong va = va_alloc_.alloc();
     if (va == 0)
     {
         return nullptr;
     }
 
-    auto& pt = PageTable::GetInstance();
-    if (!pt.MapContiguousPages(va, pages, PageCount))
+    auto& pt = PageTable::get_instance();
+    if (!pt.map_contiguous_pages(va, pages, page_count_))
     {
         /* See Alloc: shoot down remote TLBs before reusing the VA. */
-        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, PageCount);
-        VaAlloc.Free(va);
+        kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
+        va_alloc_.free(va);
         return nullptr;
     }
 
     return (void*)va;
 }
 
-void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
+void* FixedPageAllocator::map_phys(ulong* phys_addrs, size_t count)
 {
-    BugOn(count == 0 || count > PageCount);
+    BUG_ON(count == 0 || count > page_count_);
 
-    ulong va = VaAlloc.Alloc();
+    ulong va = va_alloc_.alloc();
     if (va == 0)
     {
         return nullptr;
     }
 
-    auto& pt = PageTable::GetInstance();
-    if (!pt.MapPhysPages(va, physAddrs, count))
+    auto& pt = PageTable::get_instance();
+    if (!pt.map_phys_pages(va, phys_addrs, count))
     {
         /* See Alloc: shoot down remote TLBs before reusing the VA. */
-        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, count);
-        VaAlloc.Free(va);
+        kernel::CpuTable::get_instance().invalidate_tlb_range(va, count);
+        va_alloc_.free(va);
         return nullptr;
     }
 
     return (void*)va;
 }
 
-bool FixedPageAllocator::Unmap(void* addr, size_t count)
+bool FixedPageAllocator::unmap(void* addr, size_t count)
 {
-    if (!VaAlloc.Contains((ulong)addr))
+    if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    BugOn(count == 0 || count > PageCount);
+    BUG_ON(count == 0 || count > page_count_);
 
-    PageTable::GetInstance().UnmapPages((ulong)addr, count, false);
+    PageTable::get_instance().unmap_pages((ulong)addr, count, false);
 
-    Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, count);
-    VaAlloc.Free((ulong)addr);
+    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, count);
+    va_alloc_.free((ulong)addr);
     return true;
 }
 
-bool FixedPageAllocator::Free(void* addr)
+bool FixedPageAllocator::free(void* addr)
 {
-    if (!VaAlloc.Contains((ulong)addr))
+    if (!va_alloc_.contains((ulong)addr))
         return false;
 
-    PageTable::GetInstance().UnmapPages((ulong)addr, PageCount, true);
+    PageTable::get_instance().unmap_pages((ulong)addr, page_count_, true);
 
-    Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, PageCount);
-    VaAlloc.Free((ulong)addr);
+    kernel::CpuTable::get_instance().invalidate_tlb_range((ulong)addr, page_count_);
+    va_alloc_.free((ulong)addr);
     return true;
 }
 
-bool FixedPageAllocator::Contains(void* addr)
+bool FixedPageAllocator::contains(void* addr)
 {
-    return VaAlloc.Contains((ulong)addr);
+    return va_alloc_.contains((ulong)addr);
 }
 
 PageAllocatorImpl::PageAllocatorImpl()
 {
 }
 
-bool PageAllocatorImpl::Setup()
+bool PageAllocatorImpl::setup()
 {
-    auto& pt = PageTable::GetInstance();
-    ulong freePagesCount = pt.GetFreePagesCount();
-    if (freePagesCount == 0)
+    auto& pt = PageTable::get_instance();
+    ulong free_pages_count = pt.get_free_pages_count();
+    if (free_pages_count == 0)
         return false;
 
-    ulong startAddress = pt.GetVaEnd();
-    ulong endAddress = startAddress + ((7 * freePagesCount) / 10) * Const::PageSize;
+    ulong start_address = pt.get_va_end();
+    ulong end_address = start_address + ((7 * free_pages_count) / 10) * consts::PAGE_SIZE;
 
-    Trace(0, "setup 0x%p start 0x%lX end 0x%lX free pages %lu", this, startAddress, endAddress, freePagesCount);
+    trace(0, "setup 0x%p start 0x%lX end 0x%lX free pages %lu", this, start_address, end_address, free_pages_count);
 
-    size_t sizePerBalloc = (endAddress - startAddress) / Stdlib::ArraySize(FixedPgAlloc);
-    for (size_t i = 0; i < Stdlib::ArraySize(FixedPgAlloc); i++)
+    size_t size_per_balloc = (end_address - start_address) / stdlib::array_size(fixed_pg_alloc_);
+    for (size_t i = 0; i < stdlib::array_size(fixed_pg_alloc_); i++)
     {
-        ulong start = startAddress + i * sizePerBalloc;
-        ulong blockSize = (1UL << i) * Const::PageSize;
-        if (!FixedPgAlloc[i].Setup(Stdlib::RoundUp(start, blockSize), start + sizePerBalloc, blockSize / Const::PageSize))
+        ulong start = start_address + i * size_per_balloc;
+        ulong block_size = (1UL << i) * consts::PAGE_SIZE;
+        if (!fixed_pg_alloc_[i].setup(stdlib::round_up(start, block_size), start + size_per_balloc, block_size / consts::PAGE_SIZE))
         {
             return false;
         }
     }
 
     /* The large runs get a window of their own, past the blocks' */
-    const ulong largeBlock = PageTable::MaxLargeMapPages * Const::PageSize;
-    const ulong largeStart = Stdlib::RoundUp(endAddress, largeBlock);
-    if (!LargePgAlloc.Setup(largeStart, largeStart + LargeBlockCount * largeBlock,
-            PageTable::MaxLargeMapPages))
+    const ulong large_block = PageTable::MAX_LARGE_MAP_PAGES * consts::PAGE_SIZE;
+    const ulong large_start = stdlib::round_up(end_address, large_block);
+    if (!large_pg_alloc_.setup(large_start, large_start + LARGE_BLOCK_COUNT * large_block,
+            PageTable::MAX_LARGE_MAP_PAGES))
     {
         return false;
     }
 
-    ulong keptPages = Stdlib::Min<ulong>(KeptPagesMax, freePagesCount / KeptRamShare);
-    for (size_t i = 0; i < Stdlib::ArraySize(KeptBlocks); i++)
+    ulong kept_pages = stdlib::min<ulong>(KEPT_PAGES_MAX, free_pages_count / KEPT_RAM_SHARE);
+    for (size_t i = 0; i < stdlib::array_size(kept_blocks_); i++)
     {
-        Stdlib::AutoLock lock(KeptBlocks[i].Lock);
-        KeptBlocks[i].Limit = keptPages >> i;
+        stdlib::AutoLock lock(kept_blocks_[i].lock);
+        kept_blocks_[i].limit = kept_pages >> i;
     }
 
     /* A CPU keeps no more of a size than KeptBlocks may: on a machine too
        small to keep any, none */
-    for (auto& cpu : CpuKeptBlocks)
+    for (auto& cpu : cpu_kept_blocks_)
     {
-        Stdlib::AutoLock lock(cpu.Lock);
-        for (size_t i = 0; i < CpuKeptLogs; i++)
-            cpu.Sizes[i].Limit = Stdlib::Min<ulong>(CpuKeptPages >> i, KeptBlocks[i].Limit);
+        stdlib::AutoLock lock(cpu.lock);
+        for (size_t i = 0; i < CPU_KEPT_LOGS; i++)
+            cpu.sizes[i].limit = stdlib::min<ulong>(CPU_KEPT_PAGES >> i, kept_blocks_[i].limit);
     }
 
     return true;
@@ -202,50 +202,50 @@ bool PageAllocatorImpl::Setup()
 
 PageAllocatorImpl::~PageAllocatorImpl()
 {
-    Trace(0, "0x%p dtor", this);
+    trace(0, "0x%p dtor", this);
 }
 
-void* PageAllocatorImpl::Alloc(size_t numPages, bool zero)
+void* PageAllocatorImpl::alloc(size_t num_pages, bool zero)
 {
-    BugOn(numPages == 0);
+    BUG_ON(num_pages == 0);
 
-    size_t log = Stdlib::Log2(numPages);
-    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+    size_t log = stdlib::log2(num_pages);
+    if (log >= stdlib::array_size(fixed_pg_alloc_))
         return nullptr;
 
     /* Zeroed when asked, as a block of fresh pages always is: whoever had
        it last wrote into it, and a caller of Mm::Alloc may count on what
        the page allocator has always handed out */
-    void* kept = TakeKept(log);
+    void* kept = take_kept(log);
     if (kept != nullptr)
     {
         if (zero)
-            Stdlib::MemSet(kept, 0, (1UL << log) * Const::PageSize);
+            stdlib::mem_set(kept, 0, (1UL << log) * consts::PAGE_SIZE);
         return kept;
     }
 
-    void* block = FixedPgAlloc[log].Alloc();
+    void* block = fixed_pg_alloc_[log].alloc();
     /* No page, or no VA of this size: what the caches hold may be both */
-    if (block == nullptr && Trim())
-        block = FixedPgAlloc[log].Alloc();
+    if (block == nullptr && trim())
+        block = fixed_pg_alloc_[log].alloc();
     return block;
 }
 
-void PageAllocatorImpl::Free(void* addr)
+void PageAllocatorImpl::free(void* addr)
 {
     size_t log;
-    if (!ClassOf(addr, log))
-        Panic("Can't free addr 0x%p", addr);
+    if (!class_of(addr, log))
+        PANIC("Can't free addr 0x%p", addr);
 
-    if (!Keep(log, addr))
-        Release(addr);
+    if (!keep(log, addr))
+        release(addr);
 }
 
-bool PageAllocatorImpl::ClassOf(void* addr, size_t& log)
+bool PageAllocatorImpl::class_of(void* addr, size_t& log)
 {
-    for (size_t i = 0; i < Stdlib::ArraySize(FixedPgAlloc); i++)
+    for (size_t i = 0; i < stdlib::array_size(fixed_pg_alloc_); i++)
     {
-        if (FixedPgAlloc[i].Contains(addr))
+        if (fixed_pg_alloc_[i].contains(addr))
         {
             log = i;
             return true;
@@ -254,85 +254,85 @@ bool PageAllocatorImpl::ClassOf(void* addr, size_t& log)
     return false;
 }
 
-void PageAllocatorImpl::Release(void* addr)
+void PageAllocatorImpl::release(void* addr)
 {
     size_t log;
-    if (!ClassOf(addr, log) || !FixedPgAlloc[log].Free(addr))
-        Panic("Can't free addr 0x%p", addr);
+    if (!class_of(addr, log) || !fixed_pg_alloc_[log].free(addr))
+        PANIC("Can't free addr 0x%p", addr);
 }
 
-PageAllocatorImpl::CpuKept* PageAllocatorImpl::ThisCpuKept(size_t log)
+PageAllocatorImpl::CpuKept* PageAllocatorImpl::this_cpu_kept(size_t log)
 {
     ulong cpu;
-    if (log >= CpuKeptLogs || !CacheCpu(cpu))
+    if (log >= CPU_KEPT_LOGS || !cache_cpu(cpu))
         return nullptr;
-    return &CpuKeptBlocks[cpu];
+    return &cpu_kept_blocks_[cpu];
 }
 
-bool PageAllocatorImpl::Keep(size_t log, void* ptr)
+bool PageAllocatorImpl::keep(size_t log, void* ptr)
 {
-    BugOn(log >= Stdlib::ArraySize(KeptBlocks));
+    BUG_ON(log >= stdlib::array_size(kept_blocks_));
     Kept* block = static_cast<Kept*>(ptr);
 
     /* A kept block carries the mark, and TakeKept clears it on the way
        out: one that has it now is kept already -- a second free -- or its
        owner wrote those very words, so the mark only says where to look */
-    if (block->Mark == KeptMark && IsKept(log, block))
-        Panic("Double free of 0x%p", ptr);
+    if (block->mark == KEPT_MARK && is_kept(log, block))
+        PANIC("Double free of 0x%p", ptr);
 
-    CpuKept* cpu = ThisCpuKept(log);
+    CpuKept* cpu = this_cpu_kept(log);
     if (cpu == nullptr)
-        return KeepShared(log, block);
+        return keep_shared(log, block);
 
-    Kept* spill[CpuKeptPages];
+    Kept* spill[CPU_KEPT_PAGES];
     ulong spilled = 0;
     bool cached = false;
     {
-        Stdlib::AutoLock lock(cpu->Lock);
-        CpuKeptSize& size = cpu->Sizes[log];
-        if (size.Limit != 0)
+        stdlib::AutoLock lock(cpu->lock);
+        CpuKeptSize& size = cpu->sizes[log];
+        if (size.limit != 0)
         {
-            if (size.Count >= size.Limit)
+            if (size.count >= size.limit)
             {
                 /* The older half: the newer is likelier still in this
                    CPU's data cache */
-                spilled = (size.Limit + 1) / 2;
+                spilled = (size.limit + 1) / 2;
                 for (ulong i = 0; i < spilled; i++)
-                    spill[i] = size.Blocks[i];
-                for (ulong i = spilled; i < size.Count; i++)
-                    size.Blocks[i - spilled] = size.Blocks[i];
-                size.Count -= spilled;
+                    spill[i] = size.blocks[i];
+                for (ulong i = spilled; i < size.count; i++)
+                    size.blocks[i - spilled] = size.blocks[i];
+                size.count -= spilled;
             }
-            block->Mark = KeptMark;
-            size.Blocks[size.Count++] = block;
+            block->mark = KEPT_MARK;
+            size.blocks[size.count++] = block;
             cached = true;
         }
     }
     if (!cached)
-        return KeepShared(log, block);
+        return keep_shared(log, block);
 
     /* With this CPU's lock let go of: what KeptBlocks has no room for is
        unmapped, and the shootdown waits on every other CPU */
     for (ulong i = 0; i < spilled; i++)
     {
-        if (!KeepShared(log, spill[i]) && !FixedPgAlloc[log].Free(spill[i]))
-            Panic("Can't free kept block 0x%p", spill[i]);
+        if (!keep_shared(log, spill[i]) && !fixed_pg_alloc_[log].free(spill[i]))
+            PANIC("Can't free kept block 0x%p", spill[i]);
     }
     return true;
 }
 
-bool PageAllocatorImpl::KeepShared(size_t log, Kept* block)
+bool PageAllocatorImpl::keep_shared(size_t log, Kept* block)
 {
-    auto& list = KeptBlocks[log];
+    auto& list = kept_blocks_[log];
 
-    Stdlib::AutoLock lock(list.Lock);
-    if (list.Count >= list.Limit)
+    stdlib::AutoLock lock(list.lock);
+    if (list.count >= list.limit)
         return false;
 
-    block->Next = list.Head;
-    block->Mark = KeptMark;
-    list.Head = block;
-    list.Count++;
+    block->next = list.head;
+    block->mark = KEPT_MARK;
+    list.head = block;
+    list.count++;
     return true;
 }
 
@@ -340,102 +340,102 @@ bool PageAllocatorImpl::KeepShared(size_t log, Kept* block)
    once. Only for a block that carries the mark, which a block handed out
    does not, so a free reaches here for a double free or a block whose
    owner happened to write the mark's very words. */
-bool PageAllocatorImpl::IsKept(size_t log, Kept* block)
+bool PageAllocatorImpl::is_kept(size_t log, Kept* block)
 {
-    if (log < CpuKeptLogs)
+    if (log < CPU_KEPT_LOGS)
     {
-        for (auto& cpu : CpuKeptBlocks)
+        for (auto& cpu : cpu_kept_blocks_)
         {
-            Stdlib::AutoLock lock(cpu.Lock);
-            const CpuKeptSize& size = cpu.Sizes[log];
-            for (ulong i = 0; i < size.Count; i++)
-                if (size.Blocks[i] == block)
+            stdlib::AutoLock lock(cpu.lock);
+            const CpuKeptSize& size = cpu.sizes[log];
+            for (ulong i = 0; i < size.count; i++)
+                if (size.blocks[i] == block)
                     return true;
         }
     }
 
-    auto& list = KeptBlocks[log];
-    Stdlib::AutoLock lock(list.Lock);
-    for (Kept* kept = list.Head; kept != nullptr; kept = kept->Next)
+    auto& list = kept_blocks_[log];
+    stdlib::AutoLock lock(list.lock);
+    for (Kept* kept = list.head; kept != nullptr; kept = kept->next)
         if (kept == block)
             return true;
     return false;
 }
 
-void* PageAllocatorImpl::TakeKept(size_t log)
+void* PageAllocatorImpl::take_kept(size_t log)
 {
-    BugOn(log >= Stdlib::ArraySize(KeptBlocks));
+    BUG_ON(log >= stdlib::array_size(kept_blocks_));
     Kept* block = nullptr;
 
-    CpuKept* cpu = ThisCpuKept(log);
+    CpuKept* cpu = this_cpu_kept(log);
     if (cpu != nullptr)
     {
-        Stdlib::AutoLock lock(cpu->Lock);
-        CpuKeptSize& size = cpu->Sizes[log];
-        if (size.Count > 0)
-            block = size.Blocks[--size.Count];
+        stdlib::AutoLock lock(cpu->lock);
+        CpuKeptSize& size = cpu->sizes[log];
+        if (size.count > 0)
+            block = size.blocks[--size.count];
     }
 
     if (block == nullptr)
     {
-        auto& list = KeptBlocks[log];
-        Stdlib::AutoLock lock(list.Lock);
-        block = list.Head;
+        auto& list = kept_blocks_[log];
+        stdlib::AutoLock lock(list.lock);
+        block = list.head;
         if (block == nullptr)
             return nullptr;
-        list.Head = block->Next;
-        list.Count--;
+        list.head = block->next;
+        list.count--;
     }
 
     /* The caller's now: unmarked, so that its free does not go looking */
-    block->Mark = 0;
+    block->mark = 0;
     return block;
 }
 
 /* Each list is taken whole under its lock and released with the lock let
    go of: a release unmaps, and the shootdown waits on every other CPU */
-bool PageAllocatorImpl::Trim()
+bool PageAllocatorImpl::trim()
 {
     bool trimmed = false;
-    for (auto& cpu : CpuKeptBlocks)
+    for (auto& cpu : cpu_kept_blocks_)
     {
-        for (size_t log = 0; log < CpuKeptLogs; log++)
+        for (size_t log = 0; log < CPU_KEPT_LOGS; log++)
         {
-            Kept* blocks[CpuKeptPages];
+            Kept* blocks[CPU_KEPT_PAGES];
             ulong count;
             {
-                Stdlib::AutoLock lock(cpu.Lock);
-                CpuKeptSize& size = cpu.Sizes[log];
-                count = size.Count;
+                stdlib::AutoLock lock(cpu.lock);
+                CpuKeptSize& size = cpu.sizes[log];
+                count = size.count;
                 for (ulong i = 0; i < count; i++)
-                    blocks[i] = size.Blocks[i];
-                size.Count = 0;
+                    blocks[i] = size.blocks[i];
+                size.count = 0;
             }
 
             for (ulong i = 0; i < count; i++)
             {
-                if (!FixedPgAlloc[log].Free(blocks[i]))
-                    Panic("Can't free kept block 0x%p", blocks[i]);
+                if (!fixed_pg_alloc_[log].free(blocks[i]))
+                    PANIC("Can't free kept block 0x%p", blocks[i]);
                 trimmed = true;
             }
         }
     }
 
-    for (size_t log = 0; log < Stdlib::ArraySize(KeptBlocks); log++)
+    for (size_t log = 0; log < stdlib::array_size(kept_blocks_); log++)
     {
         Kept* head;
         {
-            Stdlib::AutoLock lock(KeptBlocks[log].Lock);
-            head = KeptBlocks[log].Head;
-            KeptBlocks[log].Head = nullptr;
-            KeptBlocks[log].Count = 0;
+            stdlib::AutoLock lock(kept_blocks_[log].lock);
+            head = kept_blocks_[log].head;
+            kept_blocks_[log].head = nullptr;
+            kept_blocks_[log].count = 0;
         }
 
         while (head != nullptr)
         {
-            Kept* next = head->Next;
-            if (!FixedPgAlloc[log].Free(head))
-                Panic("Can't free kept block 0x%p", head);
+            Kept* next = head->next;
+            if (!fixed_pg_alloc_[log].free(head))
+                PANIC("Can't free kept block 0x%p", head);
             head = next;
             trimmed = true;
         }
@@ -443,90 +443,90 @@ bool PageAllocatorImpl::Trim()
     return trimmed;
 }
 
-void* PageAllocatorImpl::AllocMapPages(size_t numPages, ulong* physAddr)
+void* PageAllocatorImpl::alloc_map_pages(size_t num_pages, ulong* phys_addr)
 {
-    BugOn(numPages == 0);
+    BUG_ON(num_pages == 0);
 
-    size_t log = Stdlib::Log2(numPages);
-    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+    size_t log = stdlib::log2(num_pages);
+    if (log >= stdlib::array_size(fixed_pg_alloc_))
         return nullptr;
 
     /* Kept blocks hold pages and this size's VA both: once more without
        them before refusing */
-    void* result = TryAllocMapPages(log, physAddr);
-    if (result == nullptr && Trim())
-        result = TryAllocMapPages(log, physAddr);
+    void* result = try_alloc_map_pages(log, phys_addr);
+    if (result == nullptr && trim())
+        result = try_alloc_map_pages(log, phys_addr);
     return result;
 }
 
-void* PageAllocatorImpl::TryAllocMapPages(size_t log, ulong* physAddr)
+void* PageAllocatorImpl::try_alloc_map_pages(size_t log, ulong* phys_addr)
 {
-    size_t roundedPages = 1UL << log;
-    auto& pt = PageTable::GetInstance();
-    Page* pages = pt.AllocContiguousPages(roundedPages);
+    size_t rounded_pages = 1UL << log;
+    auto& pt = PageTable::get_instance();
+    Page* pages = pt.alloc_contiguous_pages(rounded_pages);
     if (!pages)
         return nullptr;
 
-    void* result = FixedPgAlloc[log].Map(pages);
+    void* result = fixed_pg_alloc_[log].map(pages);
     if (!result)
     {
-        for (size_t i = 0; i < roundedPages; i++)
-            pt.FreePage(&pages[i]);
+        for (size_t i = 0; i < rounded_pages; i++)
+            pt.free_page(&pages[i]);
         return nullptr;
     }
-    *physAddr = pages->GetPhyAddress();
+    *phys_addr = pages->get_phy_address();
     return result;
 }
 
 /* Not kept: a DMA buffer's pages go back to the page allocator as they
    always have */
-void PageAllocatorImpl::UnmapFreePages(void* ptr)
+void PageAllocatorImpl::unmap_free_pages(void* ptr)
 {
-    Release(ptr);
+    release(ptr);
 }
 
-void* PageAllocatorImpl::MapPages(size_t numPages, ulong* physAddrs)
+void* PageAllocatorImpl::map_pages(size_t num_pages, ulong* phys_addrs)
 {
-    BugOn(numPages == 0);
+    BUG_ON(num_pages == 0);
 
-    size_t log = Stdlib::Log2(numPages);
-    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+    size_t log = stdlib::log2(num_pages);
+    if (log >= stdlib::array_size(fixed_pg_alloc_))
         return nullptr;
 
-    return FixedPgAlloc[log].MapPhys(physAddrs, numPages);
+    return fixed_pg_alloc_[log].map_phys(phys_addrs, num_pages);
 }
 
-void PageAllocatorImpl::UnmapPages(void* ptr, size_t numPages)
+void PageAllocatorImpl::unmap_pages(void* ptr, size_t num_pages)
 {
-    BugOn(numPages == 0);
+    BUG_ON(num_pages == 0);
 
-    size_t log = Stdlib::Log2(numPages);
-    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+    size_t log = stdlib::log2(num_pages);
+    if (log >= stdlib::array_size(fixed_pg_alloc_))
     {
-        Panic("Can't unmap addr 0x%p numPages %lu", ptr, numPages);
+        PANIC("Can't unmap addr 0x%p numPages %lu", ptr, num_pages);
         return;
     }
 
-    if (!FixedPgAlloc[log].Unmap(ptr, numPages))
-        Panic("Can't unmap addr 0x%p numPages %lu", ptr, numPages);
+    if (!fixed_pg_alloc_[log].unmap(ptr, num_pages))
+        PANIC("Can't unmap addr 0x%p numPages %lu", ptr, num_pages);
 }
 
-void* PageAllocatorImpl::MapLargePages(size_t numPages, ulong* physAddrs)
+void* PageAllocatorImpl::map_large_pages(size_t num_pages, ulong* phys_addrs)
 {
-    BugOn(numPages == 0);
+    BUG_ON(num_pages == 0);
 
-    if (numPages > PageTable::MaxLargeMapPages)
+    if (num_pages > PageTable::MAX_LARGE_MAP_PAGES)
         return nullptr;
 
-    return LargePgAlloc.MapPhys(physAddrs, numPages);
+    return large_pg_alloc_.map_phys(phys_addrs, num_pages);
 }
 
-void PageAllocatorImpl::UnmapLargePages(void* ptr, size_t numPages)
+void PageAllocatorImpl::unmap_large_pages(void* ptr, size_t num_pages)
 {
-    BugOn(numPages == 0 || numPages > PageTable::MaxLargeMapPages);
+    BUG_ON(num_pages == 0 || num_pages > PageTable::MAX_LARGE_MAP_PAGES);
 
-    if (!LargePgAlloc.Unmap(ptr, numPages))
-        Panic("Can't unmap large run 0x%p numPages %lu", ptr, numPages);
+    if (!large_pg_alloc_.unmap(ptr, num_pages))
+        PANIC("Can't unmap large run 0x%p numPages %lu", ptr, num_pages);
 }
 
 }

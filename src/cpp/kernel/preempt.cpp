@@ -6,60 +6,60 @@
 #include "debug.h"
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
-Atomic PreemptActive;
+Atomic preempt_active;
 
-void PreemptOn()
+void preempt_on()
 {
-    PreemptActive.Inc();
-    BugOn(PreemptActive.Get() > 1);
+    preempt_active.inc();
+    BUG_ON(preempt_active.get() > 1);
 }
 
-void PreemptOnWait()
+void preempt_on_wait()
 {
     /* Block until the BSP has globally enabled preemption: PreemptActive
        starts at zero and PreemptOn() sets it to 1. (Atomic's constructors
        are constexpr, so a static one is initialised by the compiler; the
        kernel runs no .init_array, and the link refuses one.) */
-    while (PreemptActive.Get() == 0)
+    while (preempt_active.get() == 0)
     {
-        Pause();
+        cpu_relax();
     }
 }
 
-void PreemptOff()
+void preempt_off()
 {
-    PreemptActive.Dec();
-    BugOn(PreemptActive.Get() != 0);
+    preempt_active.dec();
+    BUG_ON(preempt_active.get() != 0);
 }
 
-bool PreemptIsOn()
+bool preempt_is_on()
 {
-    return (PreemptActive.Get() != 0) ? true : false;
+    return (preempt_active.get() != 0) ? true : false;
 }
 
-Task* PreemptCurrentTask()
+Task* preempt_current_task()
 {
-    Task* task = Task::TryGetCurrentTask();
+    Task* task = Task::try_get_current_task();
     if (likely(task != nullptr))
         return task;
 
-    if (Panicker::GetInstance().IsActive())
+    if (Panicker::get_instance().is_active())
         return nullptr;
 
     /* What is wrong with this stack, said by the BugOn that finds it */
-    return Task::GetCurrentTask();
+    return Task::get_current_task();
 }
 
-void PreemptDisable()
+void preempt_disable()
 {
-    if (likely(PreemptIsOn()))
+    if (likely(preempt_is_on()))
     {
-        Task* task = PreemptCurrentTask();
+        Task* task = preempt_current_task();
         if (task != nullptr)
-            task->PreemptDisableCounter.Inc();
+            task->preempt_disable_counter_.inc();
     }
 }
 
@@ -70,88 +70,88 @@ void PreemptDisable()
    that is running: a lock can be released on another's behalf, as
    SwitchComplete releases the ones Schedule() took in the task it switched
    away from. And not once a panic has begun, which no tick preempts either. */
-static void PreemptRunPending(Task* task)
+static void preempt_run_pending(Task* task)
 {
-    if (likely(task->PreemptPending.Get() == 0))
+    if (likely(task->preempt_pending_.get() == 0))
         return;
 
-    if (!Hal::IsInterruptEnabled() || task != Task::TryGetCurrentTask() ||
-        Panicker::GetInstance().IsActive())
+    if (!hal::is_interrupt_enabled() || task != Task::try_get_current_task() ||
+        Panicker::get_instance().is_active())
         return;
 
-    Preempt();
+    preempt();
 }
 
-void PreemptEnable()
+void preempt_enable()
 {
-    if (likely(PreemptIsOn()))
+    if (likely(preempt_is_on()))
     {
-        Task* task = PreemptCurrentTask();
+        Task* task = preempt_current_task();
         if (task == nullptr)
             return;
-        BugOn(!task->PreemptDisableCounter.Get());
-        if (task->PreemptDisableCounter.DecAndTest())
-            PreemptRunPending(task);
+        BUG_ON(!task->preempt_disable_counter_.get());
+        if (task->preempt_disable_counter_.dec_and_test())
+            preempt_run_pending(task);
     }
 }
 
-Task* PreemptDisableTask()
+Task* preempt_disable_task()
 {
-    if (!PreemptIsOn())
+    if (!preempt_is_on())
         return nullptr;
 
     /* Not GetCurrentTask(), whose BugOn is for callers that know they run on
        a task: a lock is taken from stacks that are not one. */
-    Task* task = Task::TryGetCurrentTask();
+    Task* task = Task::try_get_current_task();
     if (task != nullptr)
-        task->PreemptDisableCounter.Inc();
+        task->preempt_disable_counter_.inc();
 
     return task;
 }
 
-void PreemptEnableTask(Task* task)
+void preempt_enable_task(Task* task)
 {
     if (task == nullptr)
         return;
 
-    BugOn(task->PreemptDisableCounter.Get() == 0);
-    if (task->PreemptDisableCounter.DecAndTest())
-        PreemptRunPending(task);
+    BUG_ON(task->preempt_disable_counter_.get() == 0);
+    if (task->preempt_disable_counter_.dec_and_test())
+        preempt_run_pending(task);
 }
 
-bool PreemptCanBlock()
+bool preempt_can_block()
 {
-    if (!Hal::IsInterruptEnabled())
+    if (!hal::is_interrupt_enabled())
         return false;
 
     /* Before the scheduler runs nothing is ever switched away, so a wait
        spins through to its end: interrupts are the whole question. */
-    if (!PreemptIsOn())
+    if (!preempt_is_on())
         return true;
 
-    Task* task = Task::TryGetCurrentTask();
-    return task != nullptr && task->PreemptDisableCounter.Get() == 0;
+    Task* task = Task::try_get_current_task();
+    return task != nullptr && task->preempt_disable_counter_.get() == 0;
 }
 
-static constexpr ulong PreemptWasOnBit = (1UL << 63);
+static constexpr ulong PREEMPT_WAS_ON_BIT = (1UL << 63);
 
-ulong PreemptIrqSave()
+ulong preempt_irq_save()
 {
-    bool preemptOn = PreemptIsOn();
-    if (preemptOn)
-        PreemptDisable();
-    ulong flags = Hal::IrqSave();
-    if (preemptOn)
-        flags |= PreemptWasOnBit;
+    bool preempt_on = preempt_is_on();
+    if (preempt_on)
+        preempt_disable();
+    ulong flags = hal::irq_save();
+    if (preempt_on)
+        flags |= PREEMPT_WAS_ON_BIT;
     return flags;
 }
 
-void PreemptIrqRestore(ulong flags)
+void preempt_irq_restore(ulong flags)
 {
-    bool preemptWasOn = (flags & PreemptWasOnBit) != 0;
-    Hal::IrqRestore(flags & ~PreemptWasOnBit);
-    if (preemptWasOn)
-        PreemptEnable();
+    bool preempt_was_on = (flags & PREEMPT_WAS_ON_BIT) != 0;
+    hal::irq_restore(flags & ~PREEMPT_WAS_ON_BIT);
+    if (preempt_was_on)
+        preempt_enable();
 }
 
 }

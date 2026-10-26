@@ -13,49 +13,49 @@ extern "C" {
 
 int __cxa_guard_acquire (__guard *g) 
 {
-    Kernel::PreemptDisable();
-    bool iflag = Hal::IsInterruptEnabled();
+    kernel::preempt_disable();
+    bool iflag = hal::is_interrupt_enabled();
     if (iflag)
-        InterruptDisable();
+        interrupt_disable();
 
-    while (true == g->SetBit(__GUARD_LOCK_BIT))
+    while (true == g->set_bit(__GUARD_LOCK_BIT))
     {
-        Pause();
+        cpu_relax();
     }
 
-    if (!g->TestBit(__GUARD_INIT_BIT))
+    if (!g->test_bit(__GUARD_INIT_BIT))
     {
         if (iflag)
-            g->SetBit(__GUARD_IF_BIT);
+            g->set_bit(__GUARD_IF_BIT);
         else
-            g->ClearBit(__GUARD_IF_BIT);
+            g->clear_bit(__GUARD_IF_BIT);
         return 1;
     }
 
-    g->ClearBit(__GUARD_LOCK_BIT);
+    g->clear_bit(__GUARD_LOCK_BIT);
     if (iflag)
-        InterruptEnable();
-    Kernel::PreemptEnable();
+        interrupt_enable();
+    kernel::preempt_enable();
     return 0;
 }
 
 void __cxa_guard_release(__guard *g)
 {
-    BugOn(g->TestBit(__GUARD_INIT_BIT));
-    BugOn(!g->TestBit(__GUARD_LOCK_BIT));
+    BUG_ON(g->test_bit(__GUARD_INIT_BIT));
+    BUG_ON(!g->test_bit(__GUARD_LOCK_BIT));
 
-    bool iflag = (g->TestBit(__GUARD_IF_BIT)) ? true : false;
+    bool iflag = (g->test_bit(__GUARD_IF_BIT)) ? true : false;
 
-    g->SetBit(__GUARD_INIT_BIT);
-    g->ClearBit(__GUARD_LOCK_BIT);
+    g->set_bit(__GUARD_INIT_BIT);
+    g->clear_bit(__GUARD_LOCK_BIT);
     if (iflag)
-        InterruptEnable();
-    Kernel::PreemptEnable();
+        interrupt_enable();
+    kernel::preempt_enable();
 }
 
 void __cxa_guard_abort(__guard *)
 {
-	Panic("Guard abort");
+	PANIC("Guard abort");
 }
 
 atexit_func_entry_t __atexit_funcs[ATEXIT_MAX_FUNCS];
@@ -154,7 +154,7 @@ void __cxa_finalize(void *f)
 
 void __cxa_pure_virtual(void)
 {
-    Panic("Pure virtual");
+    PANIC("Pure virtual");
 }
 
 #ifdef __cplusplus

@@ -10,18 +10,18 @@
 #include <lib/stdlib.h>
 #include <include/const.h>
 
-namespace Kernel
+namespace kernel
 {
 
 SoftIrq::SoftIrq()
-    : Running(0)
-    , Ready(0)
+    : running_(0)
+    , ready_(0)
 {
-    Stdlib::MemSet(Handlers, 0, sizeof(Handlers));
-    for (ulong i = 0; i < MaxCpus; i++)
+    stdlib::mem_set(handlers_, 0, sizeof(handlers_));
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        CpuStates[i].Pending.Set(0);
-        CpuStates[i].TaskPtr = nullptr;
+        cpu_states_[i].pending.set(0);
+        cpu_states_[i].task_ptr = nullptr;
     }
 }
 
@@ -29,94 +29,94 @@ SoftIrq::~SoftIrq()
 {
 }
 
-bool SoftIrq::Init()
+bool SoftIrq::init()
 {
-    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
+    ulong cpu_mask = CpuTable::get_instance().get_running_cpus();
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (!(cpuMask & (1UL << i)))
+        if (!(cpu_mask & (1UL << i)))
             continue;
 
-        char name[TaskNameLen];
-        Stdlib::SnPrintf(name, sizeof(name), "softirq/%lu", i);
-        Task* task = Mm::TAlloc<Task, Tag>(name);
+        char name[TASK_NAME_LEN];
+        stdlib::sn_printf(name, sizeof(name), "softirq/%lu", i);
+        Task* task = mm::talloc<Task, TAG>(name);
         if (!task)
         {
-            Stop();
+            stop();
             return false;
         }
 
-        task->SetCpuAffinity(1UL << i);
-        if (!task->Start(&SoftIrq::TaskFunc, &CpuStates[i]))
+        task->set_cpu_affinity(1UL << i);
+        if (!task->start(&SoftIrq::task_func, &cpu_states_[i]))
         {
-            task->Put();
-            Stop();
+            task->put();
+            stop();
             return false;
         }
 
-        CpuStates[i].TaskPtr = task;
+        cpu_states_[i].task_ptr = task;
     }
 
-    Ready.Set(1);
+    ready_.set(1);
 
-    Trace(0, "SoftIrq: initialized");
+    trace(0, "SoftIrq: initialized");
     return true;
 }
 
-void SoftIrq::Stop()
+void SoftIrq::stop()
 {
-    Ready.Set(0);
+    ready_.set(0);
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        Task* task = CpuStates[i].TaskPtr;
+        Task* task = cpu_states_[i].task_ptr;
         if (task)
         {
-            task->SetStopping();
+            task->set_stopping();
 
             /* Publish-then-wake, as everywhere else here: a blocked task is
                out of the scheduler's walk and would never reach the top of
                its loop to notice the flag, and the Wait() below would then
                spin for good. */
-            task->Unblock();
+            task->unblock();
 
-            task->Wait();
+            task->wait();
 
             /* Unpublished before the reference goes: Raise() and TickKick()
                both dereference this pointer without a lock, and Put() may be
                the last one. */
-            CpuStates[i].TaskPtr = nullptr;
-            task->Put();
+            cpu_states_[i].task_ptr = nullptr;
+            task->put();
         }
     }
 }
 
-bool SoftIrq::IsPending(ulong type)
+bool SoftIrq::is_pending(ulong type)
 {
-    if (type >= MaxTypes)
+    if (type >= MAX_TYPES)
         return false;
 
-    ulong cpu = CpuTable::GetInstance().GetCurrentCpuId();
-    if (cpu >= MaxCpus)
+    ulong cpu = CpuTable::get_instance().get_current_cpu_id();
+    if (cpu >= MAX_CPUS)
         return false;
 
-    return CpuStates[cpu].Pending.TestBit(type);
+    return cpu_states_[cpu].pending.test_bit(type);
 }
 
-void SoftIrq::Raise(ulong type)
+void SoftIrq::raise(ulong type)
 {
-    if (type >= MaxTypes)
+    if (type >= MAX_TYPES)
         return;
 
-    ulong cpu = CpuTable::GetInstance().GetCurrentCpuId();
-    if (BugOn(cpu >= MaxCpus))
+    ulong cpu = CpuTable::get_instance().get_current_cpu_id();
+    if (BUG_ON(cpu >= MAX_CPUS))
         return;
 
-    if (CpuStates[cpu].Pending.SetBit(type))
+    if (cpu_states_[cpu].pending.set_bit(type))
         return; /* was already pending */
 
-    if (!Ready.Get())
+    if (!ready_.get())
         return;
 
     /* The pending bit is up; now make sure the task will be looked at. This
@@ -125,10 +125,10 @@ void SoftIrq::Raise(ulong type)
        of the scheduler's walk while still being the current task, so a raise
        landing in that window would take the early return below and leave the
        work to sit until the tick repaired it. */
-    Task* target = CpuStates[cpu].TaskPtr;
-    bool wasBlocked = (target != nullptr) && target->IsBlocked();
+    Task* target = cpu_states_[cpu].task_ptr;
+    bool was_blocked = (target != nullptr) && target->is_blocked();
     if (target != nullptr)
-        target->Unblock();
+        target->unblock();
 
     /* The softirq task raising work for its own CPU needs no kick -- unless
        it was blocked, which is the one case where "it is running" is true and
@@ -149,104 +149,104 @@ void SoftIrq::Raise(ulong type)
        pass, which is how the receive poll yields on its budget, was getting
        exactly one pass per tick: 64 frames at 100 Hz, a ceiling of 6600
        packets a second no matter how many arrived. */
-    if (!wasBlocked && Task::TryGetCurrentTask() == target)
+    if (!was_blocked && Task::try_get_current_task() == target)
         return;
 
     /* Otherwise the kick is what gets the task scheduled: without it an idle
        CPU would not run its softirq task until the next timer tick. Sent
        directly -- CpuTable::SendIPI takes spinlocks that are not safe in
        hard IRQ context. */
-    Hal::SendIpi(cpu, CpuTable::IPIVector);
+    hal::send_ipi(cpu, CpuTable::IPI_VECTOR);
 }
 
-void SoftIrq::Register(ulong type, void (*handler)(void* ctx), void* ctx)
+void SoftIrq::register_handler(ulong type, void (*handler)(void* ctx), void* ctx)
 {
-    if (type >= MaxTypes)
+    if (type >= MAX_TYPES)
         return;
 
-    Handlers[type].Func = handler;
-    Handlers[type].Ctx = ctx;
+    handlers_[type].func = handler;
+    handlers_[type].ctx = ctx;
 }
 
-void SoftIrq::TaskFunc(void* ctx)
+void SoftIrq::task_func(void* ctx)
 {
-    SoftIrq::GetInstance().Run(*static_cast<CpuState*>(ctx));
+    SoftIrq::get_instance().run(*static_cast<CpuState*>(ctx));
 }
 
-void SoftIrq::TickKick(ulong cpu)
+void SoftIrq::tick_kick(ulong cpu)
 {
-    if (cpu >= MaxCpus)
+    if (cpu >= MAX_CPUS)
         return;
 
     /* Only when there is something to wake for: a CPU with nothing pending
        should stay in the idle task's Hlt, which is the whole point of the
        task blocking rather than spinning. */
-    if (CpuStates[cpu].Pending.Get() == 0)
+    if (cpu_states_[cpu].pending.get() == 0)
         return;
 
-    Task* target = CpuStates[cpu].TaskPtr;
+    Task* target = cpu_states_[cpu].task_ptr;
     if (target != nullptr)
-        target->Unblock();
+        target->unblock();
 }
 
-bool SoftIrq::HasRunnableWork(CpuState& state)
+bool SoftIrq::has_runnable_work(CpuState& state)
 {
-    for (ulong i = 0; i < MaxTypes; i++)
+    for (ulong i = 0; i < MAX_TYPES; i++)
     {
-        if (state.Pending.TestBit(i) && !Running.TestBit(i))
+        if (state.pending.test_bit(i) && !running_.test_bit(i))
             return true;
     }
 
     return false;
 }
 
-void SoftIrq::Run(CpuState& state)
+void SoftIrq::run(CpuState& state)
 {
-    auto* task = Task::GetCurrentTask();
-    ulong self = (ulong)(&state - &CpuStates[0]);
+    auto* task = Task::get_current_task();
+    ulong self = (ulong)(&state - &cpu_states_[0]);
 
-    while (!task->IsStopping())
+    while (!task->is_stopping())
     {
         bool handled = false;
 
-        for (ulong i = 0; i < MaxTypes; i++)
+        for (ulong i = 0; i < MAX_TYPES; i++)
         {
-            if (!state.Pending.TestBit(i))
+            if (!state.pending.test_bit(i))
                 continue;
 
-            if (Running.SetBit(i))
+            if (running_.set_bit(i))
             {
                 /* Type is being handled on another CPU: keep the
                    pending bit set and retry on the next pass. */
                 continue;
             }
 
-            state.Pending.ClearBit(i);
+            state.pending.clear_bit(i);
 
-            if (Handlers[i].Func)
+            if (handlers_[i].func)
             {
-                Handlers[i].Func(Handlers[i].Ctx);
+                handlers_[i].func(handlers_[i].ctx);
                 handled = true;
             }
 
-            Running.ClearBit(i);
+            running_.clear_bit(i);
 
             /* Kick CPUs which lost the Running race while we held it,
                so their pending work is not delayed until the next
                timer tick. */
-            for (ulong c = 0; c < MaxCpus; c++)
+            for (ulong c = 0; c < MAX_CPUS; c++)
             {
-                if (c == self || !CpuStates[c].Pending.TestBit(i))
+                if (c == self || !cpu_states_[c].pending.test_bit(i))
                     continue;
 
                 /* Clear the block before the kick, in the same order Raise
                    uses: that CPU's task may be sitting out of the scheduler's
                    walk, and an IPI alone would not put it back in -- the work
                    would then wait for the tick to repair it. */
-                if (CpuStates[c].TaskPtr != nullptr)
-                    CpuStates[c].TaskPtr->Unblock();
+                if (cpu_states_[c].task_ptr != nullptr)
+                    cpu_states_[c].task_ptr->unblock();
 
-                Hal::SendIpi(c, CpuTable::IPIVector);
+                hal::send_ipi(c, CpuTable::IPI_VECTOR);
             }
         }
 
@@ -259,7 +259,7 @@ void SoftIrq::Run(CpuState& state)
                it runs in task context with interrupts on, which is what
                freeing a stack requires: it triggers a TLB shootdown that
                waits for every other CPU to answer. */
-            CpuTable::GetInstance().GetCurrentCpu().GetTaskQueue().ReapExited();
+            CpuTable::get_instance().get_current_cpu().get_task_queue().reap_exited();
 
             /* Nothing pending: ask the scheduler to pass over this task
                until someone has work for it. This used to be Sleep(1ms),
@@ -295,20 +295,20 @@ void SoftIrq::Run(CpuState& state)
                of a receive path going nowhere, a few times in a thousand
                round trips. Schedule() keeps interrupts per task, so the task
                comes back with them still off. */
-            ulong flags = Hal::IrqSave();
-            task->Block();
+            ulong flags = hal::irq_save();
+            task->block();
 
-            if (!HasRunnableWork(state))
-                Schedule();
+            if (!has_runnable_work(state))
+                schedule();
 
             /* Running again, so the flag has no business still being up. The
                waker normally cleared it; this covers the re-check above
                finding work, and the case where Schedule() had no one else to
                run and returned to us still blocked. Cleared before interrupts
                come back on: a tick held off until then would find it up. */
-            task->Unblock();
+            task->unblock();
 
-            Hal::IrqRestore(flags);
+            hal::irq_restore(flags);
         }
     }
 }

@@ -6,138 +6,138 @@
 #include <mm/mmio.h>
 #include <lib/lock.h>
 
-namespace Kernel
+namespace kernel
 {
 
 IoApic::IoApic()
-    : BaseAddress(nullptr)
+    : base_address_(nullptr)
 {
-    BaseAddress = Acpi::GetInstance().GetIoApicAddress();
+    base_address_ = Acpi::get_instance().get_io_apic_address();
 
-    Trace(IoApicLL, "IO Apic addr 0x%p", BaseAddress);
+    trace(IO_APIC_LL, "IO Apic addr 0x%p", base_address_);
 }
 
 IoApic::~IoApic()
 {
 }
 
-u32 IoApic::ReadRegister(u8 reg)
+u32 IoApic::read_register(u8 reg)
 {
-    Stdlib::AutoLock lock(OpLock);
+    stdlib::AutoLock lock(op_lock_);
 
-    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
+    mm::MmIo::write32(stdlib::mem_add(base_address_, REG_SEL), reg);
 
-    Hal::DmaWmb();
+    hal::dma_wmb();
 
-    return Mm::MmIo::Read32(Stdlib::MemAdd(BaseAddress, RegWin));
+    return mm::MmIo::read32(stdlib::mem_add(base_address_, REG_WIN));
 }
 
-void IoApic::WriteRegister(u8 reg, u32 value)
+void IoApic::write_register(u8 reg, u32 value)
 {
-    Stdlib::AutoLock lock(OpLock);
+    stdlib::AutoLock lock(op_lock_);
 
-    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
+    mm::MmIo::write32(stdlib::mem_add(base_address_, REG_SEL), reg);
 
-    Hal::DmaWmb();
+    hal::dma_wmb();
 
-    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegWin), value);
+    mm::MmIo::write32(stdlib::mem_add(base_address_, REG_WIN), value);
 
-    Hal::DmaWmb();
+    hal::dma_wmb();
 }
 
-void IoApic::Enable()
+void IoApic::enable()
 {
-    WriteRegister(ApicId, 0x0);
+    write_register(APIC_ID, 0x0);
 
-    u32 ver = ReadRegister(ApicVer);
+    u32 ver = read_register(APIC_VER);
     size_t pins = ((ver >> 16) & 0xFF) + 1;
 
     // Disable all entries
     for (size_t i = 0; i < pins; i++)
     {
-        SetEntry(i, 1 << MaskedShift);
+        set_entry(i, 1 << MASKED_SHIFT);
     }
 
-    Trace(IoApicLL, "IO Apic ver 0x%X pins %lu", ver, pins);
+    trace(IO_APIC_LL, "IO Apic ver 0x%X pins %lu", ver, pins);
 }
 
-void IoApic::SetEntry(u8 index, u64 data)
+void IoApic::set_entry(u8 index, u64 data)
 {
     /* High (destination) first: writing the low half first can briefly
        unmask the entry with a stale destination */
-    WriteRegister(RedTbl + 2 * index + 1, (u32)(data >> 32));
-    WriteRegister(RedTbl + 2 * index, (u32)data);
+    write_register(RED_TBL + 2 * index + 1, (u32)(data >> 32));
+    write_register(RED_TBL + 2 * index, (u32)data);
 }
 
-u64 IoApic::CheckDest(u8 irq, u64 apicId)
+u64 IoApic::check_dest(u8 irq, u64 apic_id)
 {
-    if (CanTarget(apicId))
-        return apicId;
+    if (can_target(apic_id))
+        return apic_id;
 
     /* Never silently alias onto whatever apic id the low four bits happen to
        name -- that is how an interrupt goes missing for good. Fall back to
        the boot CPU, which is always addressable, and say so. */
-    Trace(0, "IoApic: irq 0x%lX apicId %lu exceeds physical destination range %lu, using 0",
-        (ulong)irq, (ulong)apicId, (ulong)MaxPhysicalDest);
+    trace(0, "IoApic: irq 0x%lX apicId %lu exceeds physical destination range %lu, using 0",
+        (ulong)irq, (ulong)apic_id, (ulong)MAX_PHYSICAL_DEST);
 
     return 0;
 }
 
-void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
+void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
 {
     u64 data = 0;
 
-    apicId = CheckDest(irq, apicId);
+    apic_id = check_dest(irq, apic_id);
 
     data |= vector; // interrupt vector
-    data |= DmFixed << DelivModeShift; // delivery mode: fixed
-    data |= 0 << DestModeShift; // destination: physical
-    data |= 0 << DelivStatusShift; // delivery status : relaxed
-    data |= 0 << PolarityShift; // pin polarity: active high
-    data |= TriggerEdge << TriggerModeShift; // trigger mode: edge
-    data |= 0 << MaskedShift; // disable: no
-    data |= apicId << DestShift; //destination id
+    data |= DM_FIXED << DELIV_MODE_SHIFT; // delivery mode: fixed
+    data |= 0 << DEST_MODE_SHIFT; // destination: physical
+    data |= 0 << DELIV_STATUS_SHIFT; // delivery status : relaxed
+    data |= 0 << POLARITY_SHIFT; // pin polarity: active high
+    data |= TRIGGER_EDGE << TRIGGER_MODE_SHIFT; // trigger mode: edge
+    data |= 0 << MASKED_SHIFT; // disable: no
+    data |= apic_id << DEST_SHIFT; //destination id
 
-    Trace(IoApicLL, "SetIrq irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX",
-        (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data);
+    trace(IO_APIC_LL, "SetIrq irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX",
+        (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data);
 
-    SetEntry(irq, data);
+    set_entry(irq, data);
 }
 
-void IoApic::SetIrqDestination(u8 irq, u64 apicId)
+void IoApic::set_irq_destination(u8 irq, u64 apic_id)
 {
-    apicId = CheckDest(irq, apicId);
+    apic_id = check_dest(irq, apic_id);
 
     /* The destination id occupies bits 56-63 of the redirection entry,
        i.e. bits 24-31 of the high register. A single 32-bit write
        switches the destination without touching mask/trigger/vector. */
-    u32 high = ReadRegister(RedTbl + 2 * irq + 1);
-    high = (high & 0x00FFFFFFU) | ((u32)apicId << 24);
-    WriteRegister(RedTbl + 2 * irq + 1, high);
+    u32 high = read_register(RED_TBL + 2 * irq + 1);
+    high = (high & 0x00FFFFFFU) | ((u32)apic_id << 24);
+    write_register(RED_TBL + 2 * irq + 1, high);
 
-    Trace(IoApicLL, "SetIrqDestination irq 0x%lX apicId 0x%lX",
-        (ulong)irq, (ulong)apicId);
+    trace(IO_APIC_LL, "SetIrqDestination irq 0x%lX apicId 0x%lX",
+        (ulong)irq, (ulong)apic_id);
 }
 
-void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh)
+void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
 {
     u64 data = 0;
 
-    apicId = CheckDest(irq, apicId);
+    apic_id = check_dest(irq, apic_id);
 
     data |= vector; // interrupt vector
-    data |= DmFixed << DelivModeShift; // delivery mode: fixed
-    data |= 0 << DestModeShift; // destination: physical
-    data |= 0 << DelivStatusShift; // delivery status : relaxed
-    data |= (activeHigh ? 0UL : 1UL) << PolarityShift; // pin polarity
-    data |= TriggerLevel << TriggerModeShift; // trigger mode: level
-    data |= 0 << MaskedShift; // disable: no
-    data |= apicId << DestShift; //destination id
+    data |= DM_FIXED << DELIV_MODE_SHIFT; // delivery mode: fixed
+    data |= 0 << DEST_MODE_SHIFT; // destination: physical
+    data |= 0 << DELIV_STATUS_SHIFT; // delivery status : relaxed
+    data |= (active_high ? 0UL : 1UL) << POLARITY_SHIFT; // pin polarity
+    data |= TRIGGER_LEVEL << TRIGGER_MODE_SHIFT; // trigger mode: level
+    data |= 0 << MASKED_SHIFT; // disable: no
+    data |= apic_id << DEST_SHIFT; //destination id
 
-    Trace(IoApicLL, "SetIrqLevel irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX activeHigh %lu",
-        (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data, (ulong)activeHigh);
+    trace(IO_APIC_LL, "SetIrqLevel irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX activeHigh %lu",
+        (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)active_high);
 
-    SetEntry(irq, data);
+    set_entry(irq, data);
 }
 
 }

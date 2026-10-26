@@ -3,18 +3,18 @@
 #include <lib/stdlib.h>
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 struct Pte final
 {
-    ulong Value;
+    ulong value;
 
     Pte()
-        : Value(0)
+        : value(0)
     {
     }
 
@@ -22,145 +22,145 @@ struct Pte final
     {
     }
 
-    ulong Address()
+    ulong address()
     {
         /* Bits 12-51 only: NX is bit 63, so an entry that maps a page
            non-executable would otherwise hand back an address with the top
            bit set -- and GetPage() a BUG -- the moment it is unmapped */
-        return Value & AddrMask;
+        return value & ADDR_MASK;
     }
 
-    bool Present()
+    bool present()
     {
-        return (Value & (1UL << PresentBit)) ? true : false;
+        return (value & (1UL << PRESENT_BIT)) ? true : false;
     }
 
-    bool Huge()
+    bool huge()
     {
-        return (Value & (1UL << HugeBit)) ? true : false;
+        return (value & (1UL << HUGE_BIT)) ? true : false;
     }
 
-    void SetAddress(ulong address)
+    void set_address(ulong address)
     {
-        BugOn(address & BitMask);
-        Value |= address;
+        BUG_ON(address & BIT_MASK);
+        value |= address;
     }
 
-    void SetPresent()
+    void set_present()
     {
-        Value |= (1UL << PresentBit);
+        value |= (1UL << PRESENT_BIT);
     }
 
-    void SetCacheDisabled()
+    void set_cache_disabled()
     {
-        Value |= (1UL << CacheDisabledBit);
+        value |= (1UL << CACHE_DISABLED_BIT);
     }
 
     /* Write-combining: PAT=1, PCD=0, PWT=0 selects IA32_PAT entry 4, which
        Hal::SetupMemoryTypes() programs to WC. Only valid on a 4KiB leaf
        entry -- at L2/L3 the same bit 7 means "huge page" (HugeBit), and
        those levels carry the PAT bit at bit 12 instead. */
-    void SetWriteCombining()
+    void set_write_combining()
     {
-        Value &= ~((1UL << CacheDisabledBit) | (1UL << WriteThrough));
-        Value |= (1UL << PatBit);
+        value &= ~((1UL << CACHE_DISABLED_BIT) | (1UL << WRITE_THROUGH));
+        value |= (1UL << PAT_BIT);
     }
 
-    void SetHuge()
+    void set_huge()
     {
-        Value |= (1UL << HugeBit);
+        value |= (1UL << HUGE_BIT);
     }
 
-    void SetWritable()
+    void set_writable()
     {
-        Value |= (1UL << WritableBit);
+        value |= (1UL << WRITABLE_BIT);
     }
 
-    void SetReadOnly()
+    void set_read_only()
     {
-        Value &= ~(1UL << WritableBit);
+        value &= ~(1UL << WRITABLE_BIT);
     }
 
-    void SetNoExecute()
+    void set_no_execute()
     {
-        Value |= NxBit; /* requires EFER.NXE; unused until x86 W^X lands */
+        value |= NX_BIT; /* requires EFER.NXE; unused until x86 W^X lands */
     }
 
-    void ClearNoExecute()
+    void clear_no_execute()
     {
-        Value &= ~NxBit;
+        value &= ~NX_BIT;
     }
 
-    void ClearPresent()
+    void clear_present()
     {
-        Value &= ~(1UL << PresentBit);
+        value &= ~(1UL << PRESENT_BIT);
     }
 
-    void Clear()
+    void clear()
     {
-        Value = 0;
+        value = 0;
     }
 
     /* One index per translation level, top (L4) to leaf (L1).
        x86-64 4KiB paging: 9 bits per level, page offset 12 bits. */
-    static ulong L4Index(ulong virtAddr)
+    static ulong l4_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 3 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L3Index(ulong virtAddr)
+    static ulong l3_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 2 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L2Index(ulong virtAddr)
+    static ulong l2_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 1 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L1Index(ulong virtAddr)
+    static ulong l1_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 0 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong HugeOffset(ulong virtAddr)
+    static ulong huge_offset(ulong virt_addr)
     {
-        return virtAddr & (HugePageSize - 1);
+        return virt_addr & (HUGE_PAGE_SIZE - 1);
     }
 
-    static const ulong PresentBit = 0;
-    static const ulong WritableBit = 1;
-    static const ulong UserBit = 2;
-    static const ulong WriteThrough = 3;
-    static const ulong CacheDisabledBit = 4;
-    static const ulong AccessedBit = 5;
-    static const ulong DirtyBit = 6;
-    static const ulong HugeBit = 7;
+    static const ulong PRESENT_BIT = 0;
+    static const ulong WRITABLE_BIT = 1;
+    static const ulong USER_BIT = 2;
+    static const ulong WRITE_THROUGH = 3;
+    static const ulong CACHE_DISABLED_BIT = 4;
+    static const ulong ACCESSED_BIT = 5;
+    static const ulong DIRTY_BIT = 6;
+    static const ulong HUGE_BIT = 7;
     /* Same bit as HugeBit: it is the PAT selector on 4KiB leaf entries and
        the page-size bit on L2/L3 entries. */
-    static const ulong PatBit = 7;
-    static const ulong MaxBit = 12;
-    static const ulong BitMask = (1UL << MaxBit) - 1;
+    static const ulong PAT_BIT = 7;
+    static const ulong MAX_BIT = 12;
+    static const ulong BIT_MASK = (1UL << MAX_BIT) - 1;
 
-    static const ulong NxBit = 1UL << 63;
+    static const ulong NX_BIT = 1UL << 63;
 
     /* The frame address: bits 12 up to 51, the architectural limit on
        MAXPHYADDR. Above it sit bits the CPU ignores, the protection keys and
        NX, none of them part of the address. */
-    static const ulong AddrMask = 0x000FFFFFFFFFF000UL;
+    static const ulong ADDR_MASK = 0x000FFFFFFFFFF000UL;
 
-    static const ulong HugePageShift = 21;
-    static const ulong HugePageSize = 1UL << HugePageShift;
+    static const ulong HUGE_PAGE_SHIFT = 21;
+    static const ulong HUGE_PAGE_SIZE = 1UL << HUGE_PAGE_SHIFT;
 };
 
 static_assert(sizeof(Pte) == 8, "Invalid size");
 
 struct PtePage final
 {
-    struct Pte Entry[512];
+    struct Pte entry[512];
 };
 
-static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
+static_assert(sizeof(PtePage) == consts::PAGE_SIZE, "Invalid size");
 
 }
 }

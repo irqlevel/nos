@@ -560,9 +560,9 @@ $(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_export
 # The symbol table stack traces name frames by (kernel/symtab.cpp): every
 # function of an ELF's text, in address order. $(call symtab,elf,cpp)
 define symtab
-@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $(2)
+@printf '#include "kernel/symtab.h"\nnamespace kernel {\nconst SymEntry SymbolTable::SYMBOLS[] = {\n' > $(2)
 @$(NM) -Cn $(1) | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $(2)
-@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $(2)
+@printf '};\nconst size_t SymbolTable::SYMBOL_COUNT = sizeof(SYMBOLS)/sizeof(SYMBOLS[0]);\n}\n' >> $(2)
 endef
 
 $(OUT)/symtab_data.cpp: $(OUT)/pass2.elf

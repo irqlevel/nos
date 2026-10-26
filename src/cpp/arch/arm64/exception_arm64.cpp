@@ -8,13 +8,13 @@
 /* EL1 exception entries called from vectors.S. The x86 twin is the
    ExceptionTable/IDT machinery in arch/x86_64. */
 
-namespace Kernel
+namespace kernel
 {
 
 namespace
 {
 
-const char* EcName(ulong ec)
+const char* ec_name(ulong ec)
 {
     switch (ec)
     {
@@ -35,32 +35,32 @@ const char* EcName(ulong ec)
 
 }
 
-extern "C" void ArmSyncEntry(Context* ctx)
+extern "C" void arm_sync_entry(Context* ctx)
 {
     /* A read the panic report was not sure of: back into the report (see
        Panicker::RecoverFault), and this one is not reported */
-    Panicker::GetInstance().RecoverFault();
+    Panicker::get_instance().recover_fault();
 
-    ulong ec = (ctx->Esr >> 26) & 0x3F;
-    ulong iss = ctx->Esr & 0x1FFFFFF;
+    ulong ec = (ctx->esr >> 26) & 0x3F;
+    ulong iss = ctx->esr & 0x1FFFFFF;
 
-    PanicCtx(ctx, false,
+    PANIC_CTX(ctx, false,
         "sync exception: %s (esr 0x%lX ec 0x%lX iss 0x%lX) far 0x%lX elr 0x%lX",
-        EcName(ec), ctx->Esr, ec, iss, ctx->Far, ctx->Elr);
+        ec_name(ec), ctx->esr, ec, iss, ctx->far, ctx->elr);
 }
 
-extern "C" void ArmUnexpectedEntry(Context* ctx, ulong index)
+extern "C" void arm_unexpected_entry(Context* ctx, ulong index)
 {
-    PanicCtx(ctx, false,
+    PANIC_CTX(ctx, false,
         "unexpected exception vector %lu (esr 0x%lX far 0x%lX elr 0x%lX)",
-        index, ctx->Esr, ctx->Far, ctx->Elr);
+        index, ctx->esr, ctx->far, ctx->elr);
 }
 
-extern "C" char Arm64Vectors[];
+extern "C" char arm64_vectors[];
 
-void SetupVectors()
+void setup_vectors()
 {
-    asm volatile("msr vbar_el1, %0; isb" :: "r"(&Arm64Vectors[0]));
+    asm volatile("msr vbar_el1, %0; isb" :: "r"(&arm64_vectors[0]));
 }
 
 }

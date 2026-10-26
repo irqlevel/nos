@@ -2,20 +2,20 @@
 
 #include "stdlib.h"
 
-namespace Kernel
+namespace kernel
 {
 
-void PreemptOn();
+void preempt_on();
 
-void PreemptOnWait();
+void preempt_on_wait();
 
-void PreemptOff();
+void preempt_off();
 
-bool PreemptIsOn();
+bool preempt_is_on();
 
-void PreemptDisable();
+void preempt_disable();
 
-void PreemptEnable();
+void preempt_enable();
 
 class Task;
 
@@ -26,8 +26,8 @@ class Task;
    because the count belongs to the task that took it -- a lock may be
    released by another task (the scheduler's are, across a context switch),
    and a nullptr from before PreemptOn() stays a no-op after it. */
-Task* PreemptDisableTask();
-void PreemptEnableTask(Task* task);
+Task* preempt_disable_task();
+void preempt_enable_task(Task* task);
 
 /* The task running, as the lock path counts and records it -- PreemptDisable,
    PreemptEnable, a SpinLock's owner: Task::GetCurrentTask(), whose BugOn is
@@ -39,13 +39,13 @@ void PreemptEnableTask(Task* task);
    stopped at its first lock, before the other CPUs' stacks, the netconsole
    and the reset. A panic switches to no task again, so there is nothing to
    count. */
-Task* PreemptCurrentTask();
+Task* preempt_current_task();
 
 /* May the caller block -- wait for a completion, or Schedule() away? Not
    with interrupts off; and once preemption is on, not off a task stack, and
    not with preemption disabled -- which every spinlock (RawSpinLock,
    SpinLock, RawRwSpinLock) keeps it for as long as it is held. */
-bool PreemptCanBlock();
+bool preempt_can_block();
 
 /*
  * Save rflags, conditionally disable preemption, disable interrupts.
@@ -53,7 +53,7 @@ bool PreemptCanBlock();
  * actually called, so PreemptIrqRestore() can balance it correctly
  * even if PreemptIsOn() changes between the two calls.
  */
-ulong PreemptIrqSave();
-void PreemptIrqRestore(ulong flags);
+ulong preempt_irq_save();
+void preempt_irq_restore(ulong flags);
 
 }

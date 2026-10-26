@@ -6,7 +6,7 @@
 #include <kernel/interrupt.h>
 #include <kernel/spin_lock.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class MsixTable
@@ -18,22 +18,22 @@ public:
     /* Probe PCI config for MSI-X capability (cap ID 0x11). Map MSI-X table.
        Returns false if the device has no MSI-X. Does not enable MSI-X in HW.
        If mappedBars is non-null, reuses already-mapped BAR VAs (0 = unmapped). */
-    bool Setup(Pci::DeviceInfo* dev, const ulong* mappedBars = nullptr);
+    bool setup(Pci::DeviceInfo* dev, const ulong* mapped_bars = nullptr);
 
     /* Program table entry `index`, install IDT handler, return CPU vector 0 on failure. */
-    u8 EnableVector(u16 index, InterruptHandler& handler);
+    u8 enable_vector(u16 index, InterruptHandler& handler);
 
-    void Mask(u16 index);
-    void Unmask(u16 index);
+    void mask(u16 index);
+    void unmask(u16 index);
 
     /* Redirect an enabled entry to another CPU (used by IrqBalance) */
-    void Retarget(u16 index, u32 apicId);
+    void retarget(u16 index, u32 apic_id);
 
-    u16 GetTableSize() const { return Count; }
-    bool IsReady() const { return Table != nullptr && Count > 0; }
+    u16 get_table_size() const { return count_; }
+    bool is_ready() const { return table_ != nullptr && count_ > 0; }
 
-    static const u8 MsixVectorBase = 0x40;
-    static const u8 MsixVectorLimit = 0xEF;
+    static const u8 MSIX_VECTOR_BASE = 0x40;
+    static const u8 MSIX_VECTOR_LIMIT = 0xEF;
 
 private:
     MsixTable(const MsixTable& other) = delete;
@@ -41,27 +41,27 @@ private:
     MsixTable& operator=(const MsixTable& other) = delete;
     MsixTable& operator=(MsixTable&& other) = delete;
 
-    bool MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar, ulong tableBytes);
-    u8 AllocVector();
-    static void DisableLegacyIntx(Pci::DeviceInfo* dev);
+    bool map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar, ulong table_bytes);
+    u8 alloc_vector();
+    static void disable_legacy_intx(Pci::DeviceInfo* dev);
 
-    volatile u8* Table;
-    u16 Count;
-    u8 CapOffset;
-    Pci::DeviceInfo* Dev;
-    bool PciMsixEnabled;
+    volatile u8* table_;
+    u16 count_;
+    u8 cap_offset_;
+    Pci::DeviceInfo* dev_;
+    bool pci_msix_enabled_;
 
     /* Per-table-entry assigned CPU vector; 0 = none. */
-    u8* EntryVector;
+    u8* entry_vector_;
 
     /* Serializes table entry updates (EnableVector/Mask/Unmask/Retarget)
        so a concurrent Mask cannot be clobbered by Retarget restoring a
        stale control value. Not taken from IRQ context. */
-    SpinLock EntryLock;
+    SpinLock entry_lock_;
 
     /* Count of vectors handed out (vector = MsixVectorBase + offset);
        atomic so concurrent device init can't double-allocate */
-    static Atomic NextVectorOffset;
+    static Atomic next_vector_offset_;
 };
 
 }

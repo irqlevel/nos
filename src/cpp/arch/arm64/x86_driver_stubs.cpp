@@ -12,34 +12,34 @@
    drivers; the bus is Rust now (src/rust/virtio), and compiled for x86
    only. */
 
-namespace Kernel
+namespace kernel
 {
 
 /* arm64 boots from a device tree, so drivers/acpi.cpp is not built here;
    these keep the rust_ffi ACPI query linkable. */
 Acpi::Acpi()
-    : Root(nullptr)
-    , RootIsXsdt(false)
-    , LapicAddress(nullptr)
-    , IoApicAddress(nullptr)
-    , IrqToGsiSize(0)
-    , Pm1aCntPort(0)
-    , ResetRegValid(false)
-    , ResetRegPort(0)
-    , ResetVal(0)
-    , CenturyRegister(0)
-    , HpetBasePhys(0)
-    , HpetMinTick(0)
-    , FirmwareWatchdog(false)
+    : root_(nullptr)
+    , root_is_xsdt_(false)
+    , lapic_address_(nullptr)
+    , io_apic_address_(nullptr)
+    , irq_to_gsi_size_(0)
+    , pm1a_cnt_port_(0)
+    , reset_reg_valid_(false)
+    , reset_reg_port_(0)
+    , reset_val_(0)
+    , century_register_(0)
+    , hpet_base_phys_(0)
+    , hpet_min_tick_(0)
+    , firmware_watchdog_(false)
 {
-    OemId[0] = '\0';
+    oem_id_[0] = '\0';
 }
 
 Acpi::~Acpi()
 {
 }
 
-bool Acpi::HasFirmwareWatchdog()
+bool Acpi::has_firmware_watchdog()
 {
     return false;
 }
@@ -52,25 +52,25 @@ Hpet::~Hpet()
 {
 }
 
-bool Hpet::IsAvailable()
+bool Hpet::is_available()
 {
     return false;
 }
 
-void Hpet::OnInterruptRegister(u8 irq, u8 vector)
+void Hpet::on_interrupt_register(u8 irq, u8 vector)
 {
     (void)irq;
     (void)vector;
 }
 
-InterruptHandlerFn Hpet::GetHandlerFn()
+InterruptHandlerFn Hpet::get_handler_fn()
 {
     return nullptr;
 }
 
-Stdlib::Time Hpet::GetTime()
+stdlib::Time Hpet::get_time()
 {
-    return Stdlib::Time();
+    return stdlib::Time();
 }
 
 }
@@ -79,55 +79,55 @@ Stdlib::Time Hpet::GetTime()
    values are ignored by the arm64 dispatch */
 extern "C"
 {
-void IO8042InterruptStub() {}
-void SerialInterruptStub() {}
-void PitInterruptStub() {}
-void HpetInterruptStub() {}
-void IPInterruptStub() {}
-void LapicTimerInterruptStub() {}
-void PostedInterruptStub() {}
-void VirtioNetInterruptStub() {}
-void VirtioScsiInterruptStub() {}
-void SharedInterruptStub() {}
-void SpuriousInterruptStub() {}
-void RustInterruptStub0() {}
-void RustInterruptStub1() {}
-void RustInterruptStub2() {}
-void RustInterruptStub3() {}
-void RustInterruptStub4() {}
-void RustInterruptStub5() {}
-void RustInterruptStub6() {}
-void RustInterruptStub7() {}
-void RustMsixStub0() {}
-void RustMsixStub1() {}
-void RustMsixStub2() {}
-void RustMsixStub3() {}
-void RustMsixStub4() {}
-void RustMsixStub5() {}
-void RustMsixStub6() {}
-void RustMsixStub7() {}
-void RustMsixStub8() {}
-void RustMsixStub9() {}
-void RustMsixStub10() {}
-void RustMsixStub11() {}
-void RustMsixStub12() {}
-void RustMsixStub13() {}
-void RustMsixStub14() {}
-void RustMsixStub15() {}
-void RustMsixStub16() {}
-void RustMsixStub17() {}
-void RustMsixStub18() {}
-void RustMsixStub19() {}
-void RustMsixStub20() {}
-void RustMsixStub21() {}
-void RustMsixStub22() {}
-void RustMsixStub23() {}
-void RustMsixStub24() {}
-void RustMsixStub25() {}
-void RustMsixStub26() {}
-void RustMsixStub27() {}
-void RustMsixStub28() {}
-void RustMsixStub29() {}
-void RustMsixStub30() {}
-void RustMsixStub31() {}
+void io8042_interrupt_stub() {}
+void serial_interrupt_stub() {}
+void pit_interrupt_stub() {}
+void hpet_interrupt_stub() {}
+void ip_interrupt_stub() {}
+void lapic_timer_interrupt_stub() {}
+void posted_interrupt_stub() {}
+void virtio_net_interrupt_stub() {}
+void virtio_scsi_interrupt_stub() {}
+void shared_interrupt_stub() {}
+void spurious_interrupt_stub() {}
+void rust_interrupt_stub0() {}
+void rust_interrupt_stub1() {}
+void rust_interrupt_stub2() {}
+void rust_interrupt_stub3() {}
+void rust_interrupt_stub4() {}
+void rust_interrupt_stub5() {}
+void rust_interrupt_stub6() {}
+void rust_interrupt_stub7() {}
+void rust_msix_stub0() {}
+void rust_msix_stub1() {}
+void rust_msix_stub2() {}
+void rust_msix_stub3() {}
+void rust_msix_stub4() {}
+void rust_msix_stub5() {}
+void rust_msix_stub6() {}
+void rust_msix_stub7() {}
+void rust_msix_stub8() {}
+void rust_msix_stub9() {}
+void rust_msix_stub10() {}
+void rust_msix_stub11() {}
+void rust_msix_stub12() {}
+void rust_msix_stub13() {}
+void rust_msix_stub14() {}
+void rust_msix_stub15() {}
+void rust_msix_stub16() {}
+void rust_msix_stub17() {}
+void rust_msix_stub18() {}
+void rust_msix_stub19() {}
+void rust_msix_stub20() {}
+void rust_msix_stub21() {}
+void rust_msix_stub22() {}
+void rust_msix_stub23() {}
+void rust_msix_stub24() {}
+void rust_msix_stub25() {}
+void rust_msix_stub26() {}
+void rust_msix_stub27() {}
+void rust_msix_stub28() {}
+void rust_msix_stub29() {}
+void rust_msix_stub30() {}
+void rust_msix_stub31() {}
 }

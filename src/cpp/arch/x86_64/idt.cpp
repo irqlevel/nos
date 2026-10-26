@@ -9,17 +9,17 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* One stub per vector, generated in asm.asm; each passes its own index to
    DummyInterruptDispatch */
-extern "C" InterruptHandlerFn DummyInterruptStubTable[256];
+extern "C" InterruptHandlerFn dummy_interrupt_stub_table[256];
 
 /* Vectors whose exception frame carries a CPU-pushed error code (SDM
    vol.3, "Exception- and Interrupt-Vector Reference"). The dummy stub
    does not pop it, so the panic dump has to know it is there. */
-static bool VectorHasErrorCode(u8 vector)
+static bool vector_has_error_code(u8 vector)
 {
     switch (vector)
     {
@@ -38,17 +38,17 @@ static bool VectorHasErrorCode(u8 vector)
 }
 
 Idt::Idt()
-    : Base(0)
-    , Limit(0)
+    : base_(0)
+    , limit_(0)
 {
-    Trace(0, "Idt 0x%p", this);
+    trace(0, "Idt 0x%p", this);
 
-    static_assert(sizeof(Entry) / sizeof(Entry[0]) == 256,
+    static_assert(sizeof(entry_) / sizeof(entry_[0]) == 256,
         "DummyInterruptStubTable holds one stub per idt entry");
 
-    for (size_t i = 0; i < Stdlib::ArraySize(Entry); i++)
+    for (size_t i = 0; i < stdlib::array_size(entry_); i++)
     {
-        Entry[i] = IdtDescriptor::Encode(DummyInterruptStubTable[i]);
+        entry_[i] = IdtDescriptor::encode(dummy_interrupt_stub_table[i]);
     }
 }
 
@@ -56,56 +56,56 @@ Idt::~Idt()
 {
 }
 
-void Idt::Save()
+void Idt::save()
 {
     TableDesc desc = {
-        .Limit = sizeof(Entry),
-        .Base = reinterpret_cast<u64>(&Entry[0]),
+        .limit = sizeof(entry_),
+        .base = reinterpret_cast<u64>(&entry_[0]),
     };
 
-    LoadIdt(&desc);
+    load_idt(&desc);
 
-    Base = desc.Base;
-    Limit = desc.Limit;
+    base_ = desc.base;
+    limit_ = desc.limit;
 }
 
-u32 Idt::GetBase()
+u32 Idt::get_base()
 {
-    return Base;
+    return base_;
 }
 
-u16 Idt::GetLimit()
+u16 Idt::get_limit()
 {
-    return Limit;
+    return limit_;
 }
 
-IdtDescriptor Idt::GetDescriptor(u16 index)
+IdtDescriptor Idt::get_descriptor(u16 index)
 {
-    if (index >= Stdlib::ArraySize(Entry))
+    if (index >= stdlib::array_size(entry_))
 	    return IdtDescriptor();
 
-    return Entry[index];
+    return entry_[index];
 }
 
-void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
+void Idt::set_descriptor(u16 index, const IdtDescriptor& desc)
 {
-    if (index >= Stdlib::ArraySize(Entry))
+    if (index >= stdlib::array_size(entry_))
 	    return;
 
-    Entry[index] = desc;
+    entry_[index] = desc;
 }
 
-void Idt::DummyInterrupt(Context* ctx, u8 vector)
+void Idt::dummy_interrupt(Context* ctx, u8 vector)
 {
-    DummyInterruptCounter.Inc();
+    dummy_interrupt_counter_.inc();
 
     /* Below FirstDeviceVector this is a CPU exception on a slot
        ExceptionTable never claimed -- a fault before it ran, or one of the
        reserved vectors. That is a kernel bug, and the stub cannot step
        over the error code some of them push, so there is no returning. */
-    if (vector < FirstDeviceVector)
+    if (vector < FIRST_DEVICE_VECTOR)
     {
-        PanicCtx(ctx, VectorHasErrorCode(vector), "Unknown exception, vector 0x%lX",
+        PANIC_CTX(ctx, vector_has_error_code(vector), "Unknown exception, vector 0x%lX",
             (ulong)vector);
         return;
     }
@@ -116,35 +116,35 @@ void Idt::DummyInterrupt(Context* ctx, u8 vector)
        with its spurious vector. Name it and keep going -- a panic here
        makes a machine unbootable over something Linux logs one line
        about. */
-    long count = DummyInterruptCounter.Get();
-    if (count <= MaxDummyReports)
+    long count = dummy_interrupt_counter_.get();
+    if (count <= MAX_DUMMY_REPORTS)
     {
-        Trace(0, "Unknown interrupt, vector 0x%lX rip 0x%lX count %lu",
-            (ulong)vector, ctx->GetRetRip(), (ulong)count);
+        trace(0, "Unknown interrupt, vector 0x%lX rip 0x%lX count %lu",
+            (ulong)vector, ctx->get_ret_rip(), (ulong)count);
 
         /* The screen is the only channel on a machine with no serial port */
-        Screen::Printf("Unknown interrupt, vector 0x%lX\n", (ulong)vector);
+        screen::printf("Unknown interrupt, vector 0x%lX\n", (ulong)vector);
     }
 
     /* EOI only what the LAPIC actually has in service: a vector delivered
        through LINT0 in ExtINT mode never set an ISR bit, and the EOI would
        then dismiss an unrelated interrupt. */
-    if (Hal::IrqIsInService(vector))
-        Hal::IrqEoi(vector);
+    if (hal::irq_is_in_service(vector))
+        hal::irq_eoi(vector);
 }
 
-extern "C" void DummyInterruptDispatch(Context* ctx, u32 vector)
+extern "C" void dummy_interrupt_dispatch(Context* ctx, u32 vector)
 {
-    InterruptStats::Inc(IrqDummy);
-    Idt::GetInstance().DummyInterrupt(ctx, (u8)vector);
+    InterruptStats::inc(IrqDummy);
+    Idt::get_instance().dummy_interrupt(ctx, (u8)vector);
 }
 
-extern "C" void SpuriousInterrupt()
+extern "C" void spurious_interrupt()
 {
     /* LAPIC spurious-interrupt vector (Lapic::SpuriousVector). Per the SDM a
        spurious interrupt must NOT be acknowledged with an EOI -- just count
        it and return, rather than falling through to DummyInterrupt's panic. */
-    InterruptStats::Inc(IrqSpurious);
+    InterruptStats::inc(IrqSpurious);
 }
 
 }

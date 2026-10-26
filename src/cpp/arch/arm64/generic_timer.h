@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <kernel/interrupt.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* ARM generic (virtual) timer scheduler tick. Each CPU runs its own timer:
@@ -16,33 +16,33 @@ namespace Kernel
 class GenericTimer final : public InterruptHandler
 {
 public:
-    static GenericTimer& GetInstance()
+    static GenericTimer& get_instance()
     {
-        static GenericTimer Instance;
-        return Instance;
+        static GenericTimer instance;
+        return instance;
     }
 
     /* BSP: register the PPI, then start this CPU's timer. */
-    bool Setup();
+    bool setup();
 
     /* Each CPU (incl. APs): enable the timer PPI in its own redistributor
        and start its CNTV. */
-    void ArmSelf();
+    void arm_self();
 
     /* Fire this CPU's CNTV once, deltaNs from now: its compare value
        written, which also takes the level line down for one in the past
        (Hal::LocalTimerArm). */
-    static void ArmIn(ulong deltaNs);
+    static void arm_in(ulong delta_ns);
 
-    u32 IntId() const { return TimerIntId; }
+    u32 int_id() const { return timer_int_id_; }
 
     /* Local per-CPU tick: re-arm, run the scheduler (and global timers on
        the BSP), EOI the PPI before Schedule() may switch away. */
-    void LocalTick(Context* ctx);
+    void local_tick(Context* ctx);
 
-    void OnInterruptRegister(u8 irq, u8 vector) override;
-    InterruptHandlerFn GetHandlerFn() override;
-    void OnInterrupt(Context* ctx) override;
+    void on_interrupt_register(u8 irq, u8 vector) override;
+    InterruptHandlerFn get_handler_fn() override;
+    void on_interrupt(Context* ctx) override;
 
 private:
     GenericTimer();
@@ -52,9 +52,9 @@ private:
     GenericTimer& operator=(const GenericTimer& other) = delete;
     GenericTimer& operator=(GenericTimer&& other) = delete;
 
-    u32 TimerIntId;
+    u32 timer_int_id_;
 
-    static constexpr ulong MaxArmNs = Const::NanoSecsInSec;
+    static constexpr ulong MAX_ARM_NS = consts::NANO_SECS_IN_SEC;
 };
 
 }

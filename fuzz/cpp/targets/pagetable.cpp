@@ -47,92 +47,92 @@
 
 #include <sanitizer/asan_interface.h>
 
-using namespace Kernel;
-using Kernel::Mm::MemoryMap;
-using Kernel::Mm::Page;
-using Kernel::Mm::PageTable;
-using Kernel::Mm::Pte;
-using Kernel::Mm::PtePage;
+using namespace kernel;
+using kernel::mm::MemoryMap;
+using kernel::mm::Page;
+using kernel::mm::PageTable;
+using kernel::mm::Pte;
+using kernel::mm::PtePage;
 
 namespace
 {
 
-const ulong PageBytes = Const::PageSize;
-const ulong WindowSlots = PageTable::TmpMapPageCount;
+const ulong PAGE_BYTES = consts::PAGE_SIZE;
+const ulong WINDOW_SLOTS = PageTable::TMP_MAP_PAGE_COUNT;
 
 /* ---- the machine ---- */
 
 struct Machine
 {
-    uint8_t* Phys = nullptr;
-    ulong Pages = 0;
+    uint8_t* phys = nullptr;
+    ulong pages = 0;
     /* The TmpMap window and the L1 table whose entries map it */
-    uint8_t* Window = nullptr;
-    PtePage* WindowL1 = nullptr;
+    uint8_t* window = nullptr;
+    PtePage* window_l1 = nullptr;
     /* What each slot holds: the physical address loaded into it, or none */
-    long SlotPhys[WindowSlots];
-    Page* PageArray = nullptr;
+    long slot_phys[WINDOW_SLOTS];
+    Page* page_array = nullptr;
 };
 
-Machine M;
+Machine machine;
 
-const long NoPhys = -1;
+const long NO_PHYS = -1;
 
-bool InRam(ulong phys)
+bool in_ram(ulong phys)
 {
-    return phys / PageBytes < M.Pages;
+    return phys / PAGE_BYTES < machine.pages;
 }
 
-void WriteBack(size_t slot)
+void write_back(size_t slot)
 {
-    if (M.SlotPhys[slot] == NoPhys)
+    if (machine.slot_phys[slot] == NO_PHYS)
         return;
-    ulong phys = static_cast<ulong>(M.SlotPhys[slot]);
-    if (InRam(phys))
-        memcpy(M.Phys + phys, M.Window + slot * PageBytes, PageBytes);
+    ulong phys = static_cast<ulong>(machine.slot_phys[slot]);
+    if (in_ram(phys))
+        memcpy(machine.phys + phys, machine.window + slot * PAGE_BYTES, PAGE_BYTES);
 }
 
-void WriteBackAll()
+void write_back_all()
 {
-    for (size_t i = 0; i < WindowSlots; i++)
-        WriteBack(i);
+    for (size_t i = 0; i < WINDOW_SLOTS; i++)
+        write_back(i);
 }
 
 /* Slot i as its entry says now: what it held written back, what it maps
    loaded. */
-void Sync(size_t i)
+void sync(size_t i)
 {
-    uint8_t* slot = M.Window + i * PageBytes;
-    WriteBack(i);
-    Pte pte = M.WindowL1->Entry[i];
-    if (!pte.Present())
+    uint8_t* slot = machine.window + i * PAGE_BYTES;
+    write_back(i);
+    Pte pte = machine.window_l1->entry[i];
+    if (!pte.present())
     {
-        M.SlotPhys[i] = NoPhys;
-        ASAN_POISON_MEMORY_REGION(slot, PageBytes);
+        machine.slot_phys[i] = NO_PHYS;
+        ASAN_POISON_MEMORY_REGION(slot, PAGE_BYTES);
         return;
     }
-    ulong phys = pte.Address();
-    for (size_t j = 0; j < WindowSlots; j++)
+    ulong phys = pte.address();
+    for (size_t j = 0; j < WINDOW_SLOTS; j++)
     {
-        INVARIANT(j == i || M.SlotPhys[j] != static_cast<long>(phys),
+        INVARIANT(j == i || machine.slot_phys[j] != static_cast<long>(phys),
             "physical page 0x%lx mapped in TmpMap slots %zu and %zu at once", phys, j, i);
     }
-    ASAN_UNPOISON_MEMORY_REGION(slot, PageBytes);
-    if (InRam(phys))
-        memcpy(slot, M.Phys + phys, PageBytes);
+    ASAN_UNPOISON_MEMORY_REGION(slot, PAGE_BYTES);
+    if (in_ram(phys))
+        memcpy(slot, machine.phys + phys, PAGE_BYTES);
     else
-        memset(slot, 0, PageBytes); /* a device's page: nothing to model */
-    M.SlotPhys[i] = static_cast<long>(phys);
+        memset(slot, 0, PAGE_BYTES); /* a device's page: nothing to model */
+    machine.slot_phys[i] = static_cast<long>(phys);
 }
 
-void SyncChanged()
+void sync_changed()
 {
-    for (size_t i = 0; i < WindowSlots; i++)
+    for (size_t i = 0; i < WINDOW_SLOTS; i++)
     {
-        Pte pte = M.WindowL1->Entry[i];
-        long now = pte.Present() ? static_cast<long>(pte.Address()) : NoPhys;
-        if (now != M.SlotPhys[i])
-            Sync(i);
+        Pte pte = machine.window_l1->entry[i];
+        long now = pte.present() ? static_cast<long>(pte.address()) : NO_PHYS;
+        if (now != machine.slot_phys[i])
+            sync(i);
     }
 }
 
@@ -140,64 +140,64 @@ void SyncChanged()
 
 /* ---- the MMU, where the kernel tells it something ---- */
 
-namespace Fuzz
+namespace fuzz
 {
 
-void HostTlbFlushPage(ulong virtAddr)
+void host_tlb_flush_page(ulong virt_addr)
 {
-    if (M.Window == nullptr)
+    if (machine.window == nullptr)
         return;
-    ulong start = reinterpret_cast<ulong>(M.Window);
-    if (virtAddr >= start && virtAddr < start + WindowSlots * PageBytes)
-        Sync((virtAddr - start) / PageBytes);
+    ulong start = reinterpret_cast<ulong>(machine.window);
+    if (virt_addr >= start && virt_addr < start + WINDOW_SLOTS * PAGE_BYTES)
+        sync((virt_addr - start) / PAGE_BYTES);
 }
 
-void HostTlbFlushAll()
+void host_tlb_flush_all()
 {
-    if (M.Window != nullptr)
-        SyncChanged();
+    if (machine.window != nullptr)
+        sync_changed();
 }
 
-void HostPteMadeValid()
+void host_pte_made_valid()
 {
-    if (M.Window != nullptr)
-        SyncChanged();
+    if (machine.window != nullptr)
+        sync_changed();
 }
 
 }
 
 /* ---- the rest of the kernel page_table.cpp calls ---- */
 
-namespace Kernel
+namespace kernel
 {
 
-Task* PreemptDisableTask()
+Task* preempt_disable_task()
 {
     return nullptr;
 }
 
-void PreemptEnableTask(Task* task)
+void preempt_enable_task(Task* task)
 {
     (void)task;
 }
 
 }
 
-namespace Hal
+namespace hal
 {
 
-ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
+ulong mmio_premapped_va(ulong phys_addr, ulong size_bytes)
 {
-    (void)physAddr;
-    (void)sizeBytes;
+    (void)phys_addr;
+    (void)size_bytes;
     return 0;
 }
 
-bool WriteCombining;
+bool write_combining;
 
-bool IsWriteCombiningAvailable()
+bool is_write_combining_available()
 {
-    return WriteCombining;
+    return write_combining;
 }
 
 }
@@ -218,420 +218,420 @@ struct PageState
         Pool,    /* in a block of the huge pool, free there */
         Huge,    /* in a block of the huge pool the sequence holds */
     };
-    Kind State;
-    long Ref;
-    bool Frame;
+    Kind state;
+    long ref;
+    bool frame;
 };
 
-std::vector<PageState> Pages;
+std::vector<PageState> pages;
 /* va -> phys of the sequence's mappings, and of MMIO */
-std::map<ulong, ulong> Maps;
-std::map<ulong, ulong> Mmio;
+std::map<ulong, ulong> maps;
+std::map<ulong, ulong> mmio;
 /* The sequence's temp mappings: va -> (phys, what it wrote there) */
 struct Tmp
 {
-    ulong Phys;
-    ulong Pages;
-    uint8_t Mark;
+    ulong phys;
+    ulong pages;
+    uint8_t mark;
 };
-std::map<ulong, Tmp> Tmps;
-size_t TmpSlots;
+std::map<ulong, Tmp> tmps;
+size_t tmp_slots;
 /* Leaves whose protection the sequence set: va -> (writable, executable) */
-std::map<ulong, std::pair<bool, bool>> Prot;
+std::map<ulong, std::pair<bool, bool>> prot;
 /* The pool's blocks, by their first page's address: whether the sequence
    holds each */
-std::map<ulong, bool> PoolBlocks;
+std::map<ulong, bool> pool_blocks;
 
-const ulong ReservedPages = 8;
-const ulong HugePages = PageTable::HugeFramePages;
-const ulong HugeBytes = PageTable::HugeFrameSize;
+const ulong RESERVED_PAGES = 8;
+const ulong HUGE_PAGES = PageTable::HUGE_FRAME_PAGES;
+const ulong HUGE_BYTES = PageTable::HUGE_FRAME_SIZE;
 
-PageTable& Pt()
+PageTable& tested_pt()
 {
-    return PageTable::GetInstance();
+    return PageTable::get_instance();
 }
 
-ulong Index(ulong phys)
+ulong index(ulong phys)
 {
-    return phys / PageBytes;
+    return phys / PAGE_BYTES;
 }
 
-Page* PageOf(ulong phys)
+Page* page_of(ulong phys)
 {
-    return &M.PageArray[Index(phys)];
+    return &machine.page_array[index(phys)];
 }
 
 /* The kernel's own tables, found the way the MMU finds them: from the root,
    through physical memory. */
-void Tables(std::set<ulong>& tables)
+void collect_tables(std::set<ulong>& tables)
 {
-    WriteBackAll();
+    write_back_all();
     tables.clear();
-    std::vector<std::pair<ulong, int>> todo = {{Pt().Root, 4}};
+    std::vector<std::pair<ulong, int>> todo = {{tested_pt().root_, 4}};
     while (!todo.empty())
     {
         auto [phys, level] = todo.back();
         todo.pop_back();
-        INVARIANT(InRam(phys), "a table at 0x%lx, past memory", phys);
+        INVARIANT(in_ram(phys), "a table at 0x%lx, past memory", phys);
         INVARIANT(tables.insert(phys).second, "table 0x%lx reached twice", phys);
         if (level == 1)
             continue;
-        const PtePage* t = reinterpret_cast<const PtePage*>(M.Phys + phys);
+        const PtePage* t = reinterpret_cast<const PtePage*>(machine.phys + phys);
         for (size_t i = 0; i < 512; i++)
         {
-            Pte e = t->Entry[i];
-            if (e.Present() && !e.Huge())
-                todo.push_back({e.Address(), level - 1});
+            Pte e = t->entry[i];
+            if (e.present() && !e.huge())
+                todo.push_back({e.address(), level - 1});
         }
     }
 }
 
 /* An entry's permissions, in either arch's encoding: what making it
    read-only or never-executable would change */
-bool Writable(Pte p)
+bool writable(Pte p)
 {
     Pte c = p;
-    c.SetReadOnly();
-    return c.Value != p.Value;
+    c.set_read_only();
+    return c.value != p.value;
 }
 
-bool Executable(Pte p)
+bool executable(Pte p)
 {
     Pte c = p;
-    c.SetNoExecute();
-    return c.Value != p.Value;
+    c.set_no_execute();
+    return c.value != p.value;
 }
 
 /* The leaf entry that maps va, read the way the MMU reads it; Value 0 if
    none. */
-Pte Leaf(ulong va)
+Pte leaf_of(ulong va)
 {
-    WriteBackAll();
+    write_back_all();
     Pte none;
-    none.Value = 0;
-    ulong phys = Pt().Root;
-    const ulong idx[] = {Pte::L4Index(va), Pte::L3Index(va), Pte::L2Index(va), Pte::L1Index(va)};
+    none.value = 0;
+    ulong phys = tested_pt().root_;
+    const ulong idx[] = {Pte::l4_index(va), Pte::l3_index(va), Pte::l2_index(va), Pte::l1_index(va)};
     for (int level = 0; level < 4; level++)
     {
-        const PtePage* t = reinterpret_cast<const PtePage*>(M.Phys + phys);
-        Pte e = t->Entry[idx[level]];
-        if (!e.Present())
+        const PtePage* t = reinterpret_cast<const PtePage*>(machine.phys + phys);
+        Pte e = t->entry[idx[level]];
+        if (!e.present())
             return none;
         if (level == 3)
             return e;
-        phys = e.Address();
+        phys = e.address();
     }
     return none;
 }
 
 /* Everything the model says, against the machine. */
-void Check(const char* after)
+void check(const char* after)
 {
     /* Every page on the free list is a free one, once, and the count is
        the list's length */
-    ulong onList = 0;
+    ulong on_list = 0;
     std::set<ulong> free;
-    for (Stdlib::ListEntry* e = Pt().FreePagesList.Flink; e != &Pt().FreePagesList; e = e->Flink)
+    for (stdlib::ListEntry* e = tested_pt().free_pages_list_.flink; e != &tested_pt().free_pages_list_; e = e->flink)
     {
-        Page* p = CONTAINING_RECORD(e, Page, ListEntry);
-        ulong i = static_cast<ulong>(p - M.PageArray);
-        INVARIANT(i < M.Pages, "the free list holds a page that is no page, after %s", after);
+        Page* p = CONTAINING_RECORD(e, Page, list_entry);
+        ulong i = static_cast<ulong>(p - machine.page_array);
+        INVARIANT(i < machine.pages, "the free list holds a page that is no page, after %s", after);
         INVARIANT(free.insert(i).second, "page %lu twice on the free list, after %s", i, after);
-        onList++;
-        INVARIANT(onList <= M.Pages, "the free list loops, after %s", after);
+        on_list++;
+        INVARIANT(on_list <= machine.pages, "the free list loops, after %s", after);
     }
-    INVARIANT(Pt().FreePagesCount == onList, "FreePagesCount %lu with %lu on the list, after %s",
-        Pt().FreePagesCount, onList, after);
+    INVARIANT(tested_pt().free_pages_count_ == on_list, "FreePagesCount %lu with %lu on the list, after %s",
+        tested_pt().free_pages_count_, on_list, after);
 
     /* The pool as the model has it, in its counts and its bitmaps */
-    ulong poolFree = 0;
-    for (const auto& b : PoolBlocks)
+    ulong pool_free = 0;
+    for (const auto& b : pool_blocks)
     {
-        const ulong block = b.first / HugeBytes;
-        INVARIANT(Pt().HugePoolTest(Pt().HugePoolIn, block), "block 0x%lx not in the pool's bitmap, after %s", b.first,
+        const ulong block = b.first / HUGE_BYTES;
+        INVARIANT(tested_pt().huge_pool_test(tested_pt().huge_pool_in_, block), "block 0x%lx not in the pool's bitmap, after %s", b.first,
             after);
-        INVARIANT(Pt().HugePoolTest(Pt().HugePoolFreeBits, block) == !b.second, "block 0x%lx %s by the bitmap, after %s",
+        INVARIANT(tested_pt().huge_pool_test(tested_pt().huge_pool_free_bits_, block) == !b.second, "block 0x%lx %s by the bitmap, after %s",
             b.first, b.second ? "free" : "held", after);
-        poolFree += !b.second;
+        pool_free += !b.second;
     }
-    INVARIANT(Pt().GetHugePoolBlocks() == PoolBlocks.size() && Pt().GetHugePoolFree() == poolFree,
-        "the pool says %lu blocks, %lu free, where it has %zu, %lu free, after %s", Pt().GetHugePoolBlocks(),
-        Pt().GetHugePoolFree(), PoolBlocks.size(), poolFree, after);
+    INVARIANT(tested_pt().get_huge_pool_blocks() == pool_blocks.size() && tested_pt().get_huge_pool_free() == pool_free,
+        "the pool says %lu blocks, %lu free, where it has %zu, %lu free, after %s", tested_pt().get_huge_pool_blocks(),
+        tested_pt().get_huge_pool_free(), pool_blocks.size(), pool_free, after);
 
     /* Tables the walk from the root finds are pages that left the free list
        for the kernel itself: the model learns of them here */
     std::set<ulong> tables;
-    Tables(tables);
+    collect_tables(tables);
     for (ulong phys : tables)
     {
-        PageState& s = Pages[Index(phys)];
-        if (s.State == PageState::Free)
+        PageState& s = pages[index(phys)];
+        if (s.state == PageState::Free)
         {
-            s.State = PageState::Table;
-            Fuzz::Reached("a table allocated on the way down");
+            s.state = PageState::Table;
+            fuzz::reached("a table allocated on the way down");
         }
-        INVARIANT(s.State == PageState::Table, "page 0x%lx is a table, and %s's too (state %d), after %s", phys,
-            "the sequence", s.State, after);
+        INVARIANT(s.state == PageState::Table, "page 0x%lx is a table, and %s's too (state %d), after %s", phys,
+            "the sequence", s.state, after);
     }
 
-    for (ulong i = 0; i < M.Pages; i++)
+    for (ulong i = 0; i < machine.pages; i++)
     {
-        const PageState& s = Pages[i];
-        Page& p = M.PageArray[i];
-        INVARIANT(p.GetPhyAddress() == i * PageBytes, "page %lu's descriptor says 0x%lx", i, p.GetPhyAddress());
-        if (s.State == PageState::Free)
+        const PageState& s = pages[i];
+        Page& p = machine.page_array[i];
+        INVARIANT(p.get_phy_address() == i * PAGE_BYTES, "page %lu's descriptor says 0x%lx", i, p.get_phy_address());
+        if (s.state == PageState::Free)
             INVARIANT(free.count(i), "page %lu is free and not on the free list, after %s", i, after);
         else
-            INVARIANT(!free.count(i), "page %lu (state %d) is on the free list, after %s", i, s.State, after);
-        if (s.State == PageState::Table)
-            INVARIANT(tables.count(i * PageBytes), "table page %lu is in no table, after %s", i, after);
-        INVARIANT(p.RefCount.Get() == s.Ref, "page %lu's reference count is %ld where the rules make it %ld, "
-            "after %s", i, p.RefCount.Get(), s.Ref, after);
+            INVARIANT(!free.count(i), "page %lu (state %d) is on the free list, after %s", i, s.state, after);
+        if (s.state == PageState::Table)
+            INVARIANT(tables.count(i * PAGE_BYTES), "table page %lu is in no table, after %s", i, after);
+        INVARIANT(p.ref_count.get() == s.ref, "page %lu's reference count is %ld where the rules make it %ld, "
+            "after %s", i, p.ref_count.get(), s.ref, after);
     }
 
     /* No TmpMap slot kept by anything but the sequence */
     size_t used = 0;
-    for (size_t i = 0; i < PageTable::TmpMapSharedCount; i++)
-        used += Pt().TmpMapPageArray[i] != nullptr;
-    INVARIANT(used == TmpSlots, "%zu TmpMap slots in use where the sequence holds %zu, after %s", used, TmpSlots,
+    for (size_t i = 0; i < PageTable::TMP_MAP_SHARED_COUNT; i++)
+        used += tested_pt().tmp_map_page_array_[i] != nullptr;
+    INVARIANT(used == tmp_slots, "%zu TmpMap slots in use where the sequence holds %zu, after %s", used, tmp_slots,
         after);
-    for (size_t i = PageTable::TmpMapSharedCount; i < WindowSlots; i++)
-        INVARIANT(!M.WindowL1->Entry[i].Present(), "frame slot %zu left mapped, after %s",
-            i - PageTable::TmpMapSharedCount, after);
-    Fuzz::CheckNoLocksHeld(after);
+    for (size_t i = PageTable::TMP_MAP_SHARED_COUNT; i < WINDOW_SLOTS; i++)
+        INVARIANT(!machine.window_l1->entry[i].present(), "frame slot %zu left mapped, after %s",
+            i - PageTable::TMP_MAP_SHARED_COUNT, after);
+    fuzz::check_no_locks_held(after);
 }
 
 /* The translations the model holds, as VirtToPhys and the leaves say. */
-void CheckMaps(Fuzz::Input& in, const char* after)
+void check_maps(fuzz::Input& in, const char* after)
 {
     int n = 0;
-    for (const auto& m : Maps)
+    for (const auto& m : maps)
     {
-        if (n++ > 16 && !in.Chance(8))
+        if (n++ > 16 && !in.chance(8))
             continue;
-        ulong got = Pt().VirtToPhys(m.first + 8);
+        ulong got = tested_pt().virt_to_phys(m.first + 8);
         INVARIANT(got == m.second + 8, "VirtToPhys(0x%lx) = 0x%lx where 0x%lx is mapped, after %s", m.first + 8,
             got, m.second, after);
-        Pte leaf = Leaf(m.first);
-        auto prot = Prot.find(m.first);
-        bool w = (prot == Prot.end()) ? true : prot->second.first;
-        bool x = (prot == Prot.end()) ? false : prot->second.second;
-        INVARIANT(leaf.Present() && Writable(leaf) == w && Executable(leaf) == x,
-            "the leaf of 0x%lx is %s%s, not %s%s, after %s", m.first, Writable(leaf) ? "w" : "",
-            Executable(leaf) ? "x" : "", w ? "w" : "", x ? "x" : "", after);
+        Pte leaf = leaf_of(m.first);
+        auto found = prot.find(m.first);
+        bool w = (found == prot.end()) ? true : found->second.first;
+        bool x = (found == prot.end()) ? false : found->second.second;
+        INVARIANT(leaf.present() && writable(leaf) == w && executable(leaf) == x,
+            "the leaf of 0x%lx is %s%s, not %s%s, after %s", m.first, writable(leaf) ? "w" : "",
+            executable(leaf) ? "x" : "", w ? "w" : "", x ? "x" : "", after);
     }
-    for (const auto& m : Mmio)
-        INVARIANT(Pt().VirtToPhys(m.first) == m.second, "the MMIO mapping of 0x%lx lost, after %s", m.second, after);
+    for (const auto& m : mmio)
+        INVARIANT(tested_pt().virt_to_phys(m.first) == m.second, "the MMIO mapping of 0x%lx lost, after %s", m.second, after);
 }
 
 /* ---- the sequence's choices ---- */
 
-std::vector<ulong> HeldPages()
+std::vector<ulong> held_pages()
 {
     std::vector<ulong> v;
-    for (ulong i = 0; i < M.Pages; i++)
+    for (ulong i = 0; i < machine.pages; i++)
     {
-        if (Pages[i].State == PageState::Held)
-            v.push_back(i * PageBytes);
+        if (pages[i].state == PageState::Held)
+            v.push_back(i * PAGE_BYTES);
     }
     return v;
 }
 
 /* A page the sequence holds and has not mapped, or 0 */
-ulong Unmapped(Fuzz::Input& in)
+ulong unmapped(fuzz::Input& in)
 {
     std::vector<ulong> v;
-    for (ulong phys : HeldPages())
+    for (ulong phys : held_pages())
     {
-        if (Pages[Index(phys)].Ref == 1 && !Pages[Index(phys)].Frame)
+        if (pages[index(phys)].ref == 1 && !pages[index(phys)].frame)
             v.push_back(phys);
     }
-    return v.empty() ? 0 : v[in.Below(v.size())];
+    return v.empty() ? 0 : v[in.below(v.size())];
 }
 
 /* A kernel VA: runs in a few regions, so tables are shared, and runs that
    cross an L1 table's end and an L2's. */
-ulong Va(Fuzz::Input& in)
+ulong pick_va(fuzz::Input& in)
 {
-    static const ulong Regions[] = {0xFFFF900000000000UL, 0xFFFF9000001FF000UL, 0xFFFF90003FFFE000UL,
+    static const ulong REGIONS[] = {0xFFFF900000000000UL, 0xFFFF9000001FF000UL, 0xFFFF90003FFFE000UL,
                                     0xFFFFA00000000000UL, 0x0000100000000000UL};
-    return in.Pick(Regions) + in.Below(64) * PageBytes;
+    return in.pick(REGIONS) + in.below(64) * PAGE_BYTES;
 }
 
-bool RangeFree(ulong va, ulong count)
+bool range_free(ulong va, ulong count)
 {
     for (ulong i = 0; i < count; i++)
     {
-        if (Maps.count(va + i * PageBytes) || Mmio.count(va + i * PageBytes))
+        if (maps.count(va + i * PAGE_BYTES) || mmio.count(va + i * PAGE_BYTES))
             return false;
     }
     return true;
 }
 
-bool RangeMapped(ulong va, ulong count)
+bool range_mapped(ulong va, ulong count)
 {
     for (ulong i = 0; i < count; i++)
     {
-        if (!Maps.count(va + i * PageBytes))
+        if (!maps.count(va + i * PAGE_BYTES))
             return false;
     }
     return true;
 }
 
 /* A page handed out: it reads as zeros. */
-void CheckZeroed(ulong phys, const char* by)
+void check_zeroed(ulong phys, const char* by)
 {
-    WriteBackAll();
-    for (ulong b = 0; b < PageBytes; b++)
-        INVARIANT(M.Phys[phys + b] == 0, "page 0x%lx handed out by %s is not zeroed at +%lu", phys, by, b);
+    write_back_all();
+    for (ulong b = 0; b < PAGE_BYTES; b++)
+        INVARIANT(machine.phys[phys + b] == 0, "page 0x%lx handed out by %s is not zeroed at +%lu", phys, by, b);
 }
 
-void Alloc(Fuzz::Input& in)
+void alloc(fuzz::Input& in)
 {
     (void)in;
-    Page* p = Pt().AllocPage();
+    Page* p = tested_pt().alloc_page();
     if (p == nullptr)
     {
-        INVARIANT(Pt().FreePagesCount == 0, "AllocPage failed with %lu pages free", Pt().FreePagesCount);
-        Fuzz::Reached("memory exhausted");
+        INVARIANT(tested_pt().free_pages_count_ == 0, "AllocPage failed with %lu pages free", tested_pt().free_pages_count_);
+        fuzz::reached("memory exhausted");
         return;
     }
-    ulong phys = p->GetPhyAddress();
-    PageState& s = Pages[Index(phys)];
-    INVARIANT(s.State == PageState::Free, "AllocPage handed out page 0x%lx, which is not free (state %d)", phys,
-        s.State);
-    s.State = PageState::Held;
-    CheckZeroed(phys, "AllocPage");
+    ulong phys = p->get_phy_address();
+    PageState& s = pages[index(phys)];
+    INVARIANT(s.state == PageState::Free, "AllocPage handed out page 0x%lx, which is not free (state %d)", phys,
+        s.state);
+    s.state = PageState::Held;
+    check_zeroed(phys, "AllocPage");
 }
 
-void AllocRun(Fuzz::Input& in)
+void alloc_run(fuzz::Input& in)
 {
-    ulong count = in.Chance(16) ? in.Range(129, 200) : 1 + in.Below(12);
-    Page* first = Pt().AllocContiguousPages(count);
+    ulong count = in.chance(16) ? in.range(129, 200) : 1 + in.below(12);
+    Page* first = tested_pt().alloc_contiguous_pages(count);
     if (first == nullptr)
     {
-        Fuzz::Reached("no contiguous run");
+        fuzz::reached("no contiguous run");
         return;
     }
-    INVARIANT(count <= PageTable::MaxContiguousPages, "a run of %lu pages, past the most", count);
-    ulong base = first->GetPhyAddress();
+    INVARIANT(count <= PageTable::MAX_CONTIGUOUS_PAGES, "a run of %lu pages, past the most", count);
+    ulong base = first->get_phy_address();
     for (ulong i = 0; i < count; i++)
     {
-        ulong phys = base + i * PageBytes;
-        INVARIANT(InRam(phys) && &first[i] == PageOf(phys), "run page %lu is no page", i);
-        PageState& s = Pages[Index(phys)];
-        INVARIANT(s.State == PageState::Free, "AllocContiguousPages handed out page 0x%lx, not free", phys);
-        s.State = PageState::Held;
-        CheckZeroed(phys, "AllocContiguousPages");
+        ulong phys = base + i * PAGE_BYTES;
+        INVARIANT(in_ram(phys) && &first[i] == page_of(phys), "run page %lu is no page", i);
+        PageState& s = pages[index(phys)];
+        INVARIANT(s.state == PageState::Free, "AllocContiguousPages handed out page 0x%lx, not free", phys);
+        s.state = PageState::Held;
+        check_zeroed(phys, "AllocContiguousPages");
     }
-    Fuzz::Reached("a contiguous run");
+    fuzz::reached("a contiguous run");
 }
 
 /* Memory taken down to its last few pages: what makes a table allocation
    fail half way down a walk. */
-void Exhaust(Fuzz::Input& in)
+void exhaust(fuzz::Input& in)
 {
-    ulong leave = in.Below(4);
-    while (Pt().FreePagesCount > leave)
+    ulong leave = in.below(4);
+    while (tested_pt().free_pages_count_ > leave)
     {
-        Page* p = Pt().AllocPage();
-        INVARIANT(p != nullptr, "AllocPage failed with %lu pages free", Pt().FreePagesCount);
-        Pages[Index(p->GetPhyAddress())].State = PageState::Held;
+        Page* p = tested_pt().alloc_page();
+        INVARIANT(p != nullptr, "AllocPage failed with %lu pages free", tested_pt().free_pages_count_);
+        pages[index(p->get_phy_address())].state = PageState::Held;
     }
-    Fuzz::Reached("memory taken to its last pages");
+    fuzz::reached("memory taken to its last pages");
 }
 
-void Free(Fuzz::Input& in)
+void free_one(fuzz::Input& in)
 {
-    ulong phys = Unmapped(in);
+    ulong phys = unmapped(in);
     if (phys == 0)
         return;
-    PageState& s = Pages[Index(phys)];
-    if (in.Bool())
+    PageState& s = pages[index(phys)];
+    if (in.boolean())
     {
-        INVARIANT(Pt().IsFrameAddress(phys), "IsFrameAddress(0x%lx) says no", phys);
-        Pt().FreeFrame(phys);
+        INVARIANT(tested_pt().is_frame_address(phys), "IsFrameAddress(0x%lx) says no", phys);
+        tested_pt().free_frame(phys);
     }
     else
     {
-        Pt().FreePage(PageOf(phys));
+        tested_pt().free_page(page_of(phys));
     }
-    s.State = PageState::Free;
+    s.state = PageState::Free;
 }
 
-void Map(Fuzz::Input& in)
+void map(fuzz::Input& in)
 {
-    std::vector<ulong> held = HeldPages();
+    std::vector<ulong> held = held_pages();
     if (held.empty())
         return;
-    ulong count = 1 + in.Below(in.Chance(32) ? 40 : 4);
-    ulong va = Va(in);
-    int form = in.U8() % 4;
-    std::vector<Page*> pages;
+    ulong count = 1 + in.below(in.chance(32) ? 40 : 4);
+    ulong va = pick_va(in);
+    int form = in.u8() % 4;
+    std::vector<Page*> page_ptrs;
     std::vector<ulong> phys;
     if (form == 2)
     {
         /* A contiguous run of the sequence's, as its descriptors */
-        ulong start = held[in.Below(held.size())];
-        for (ulong i = 0; i < count && InRam(start + i * PageBytes) &&
-             Pages[Index(start + i * PageBytes)].State == PageState::Held; i++)
-            phys.push_back(start + i * PageBytes);
+        ulong start = held[in.below(held.size())];
+        for (ulong i = 0; i < count && in_ram(start + i * PAGE_BYTES) &&
+             pages[index(start + i * PAGE_BYTES)].state == PageState::Held; i++)
+            phys.push_back(start + i * PAGE_BYTES);
         count = phys.size();
         for (ulong p : phys)
-            pages.push_back(PageOf(p));
+            page_ptrs.push_back(page_of(p));
     }
     else
     {
         for (ulong i = 0; i < count; i++)
         {
-            phys.push_back(held[in.Below(held.size())]);
-            pages.push_back(PageOf(phys.back()));
+            phys.push_back(held[in.below(held.size())]);
+            page_ptrs.push_back(page_of(phys.back()));
         }
     }
     if (form == 0)
         count = 1;
-    bool fits = RangeFree(va, count);
+    bool fits = range_free(va, count);
 
     bool ok;
     switch (form)
     {
     case 0:
-        ok = Pt().MapPage(va, pages[0]);
+        ok = tested_pt().map_page(va, page_ptrs[0]);
         break;
     case 1:
-        ok = Pt().MapPages(va, pages.data(), count);
+        ok = tested_pt().map_pages(va, page_ptrs.data(), count);
         break;
     case 2:
-        ok = Pt().MapContiguousPages(va, pages[0], count);
+        ok = tested_pt().map_contiguous_pages(va, page_ptrs[0], count);
         break;
     default:
-        ok = Pt().MapPhysPages(va, phys.data(), count);
+        ok = tested_pt().map_phys_pages(va, phys.data(), count);
         break;
     }
-    Fuzz::Say("map %lu pages at 0x%lx (form %d): %d", count, va, form, ok);
+    fuzz::say("map %lu pages at 0x%lx (form %d): %d", count, va, form, ok);
     if (!fits)
         INVARIANT(!ok, "a map over 0x%lx, where something is mapped already, said yes", va);
     if (ok)
     {
         for (ulong i = 0; i < count; i++)
         {
-            Maps[va + i * PageBytes] = phys[i];
-            Pages[Index(phys[i])].Ref++;
-            Prot.erase(va + i * PageBytes);
+            maps[va + i * PAGE_BYTES] = phys[i];
+            pages[index(phys[i])].ref++;
+            prot.erase(va + i * PAGE_BYTES);
         }
-        Fuzz::Reached("a map");
+        fuzz::reached("a map");
     }
     else if (fits)
     {
-        Fuzz::Reached("a map that failed on the way");
+        fuzz::reached("a map that failed on the way");
     }
     /* Whatever happened, the translations are the model's: a map that
        failed left none of its own */
     for (ulong i = 0; i < count; i++)
     {
-        ulong a = va + i * PageBytes;
-        if (!Maps.count(a) && !Mmio.count(a))
-            INVARIANT(Pt().VirtToPhys(a) == 0, "0x%lx is mapped after a map of it said %s", a, ok ? "yes" : "no");
+        ulong a = va + i * PAGE_BYTES;
+        if (!maps.count(a) && !mmio.count(a))
+            INVARIANT(tested_pt().virt_to_phys(a) == 0, "0x%lx is mapped after a map of it said %s", a, ok ? "yes" : "no");
     }
 }
 
@@ -641,474 +641,474 @@ void Map(Fuzz::Input& in)
    table on the way takes the second; with fewer the kernel says so and
    stops (ZeroPage's panic), which is what the window being full of leaked
    slots should do. With two, every map must go as it would with all. */
-void Crowd(Fuzz::Input& in)
+void crowd(fuzz::Input& in)
 {
-    std::vector<ulong> held = HeldPages();
+    std::vector<ulong> held = held_pages();
     if (held.size() < 4)
         return;
-    ulong keep = 2 + in.Below(4);
-    ulong crowd = PageTable::TmpMapSharedCount - TmpSlots - keep;
-    ulong device = (M.Pages + 4096) * PageBytes;
-    ulong va = Pt().TmpMapRange(device, crowd * PageBytes);
+    ulong keep = 2 + in.below(4);
+    ulong crowd = PageTable::TMP_MAP_SHARED_COUNT - tmp_slots - keep;
+    ulong device = (machine.pages + 4096) * PAGE_BYTES;
+    ulong va = tested_pt().tmp_map_range(device, crowd * PAGE_BYTES);
     if (va == 0)
         return;
-    TmpSlots += crowd;
-    Fuzz::Reached("the TmpMap window crowded");
+    tmp_slots += crowd;
+    fuzz::reached("the TmpMap window crowded");
 
     /* Across the end of an L1 table, into a region no table maps yet */
-    ulong count = 2 + in.Below(6);
-    ulong at = 0xFFFFB00000000000UL + (512 - in.Below(count)) * PageBytes + in.Below(8) * (1UL << 30);
-    std::vector<Page*> pages;
+    ulong count = 2 + in.below(6);
+    ulong at = 0xFFFFB00000000000UL + (512 - in.below(count)) * PAGE_BYTES + in.below(8) * (1UL << 30);
+    std::vector<Page*> page_ptrs;
     std::vector<ulong> phys;
     for (ulong i = 0; i < count; i++)
     {
-        phys.push_back(held[in.Below(held.size())]);
-        pages.push_back(PageOf(phys.back()));
+        phys.push_back(held[in.below(held.size())]);
+        page_ptrs.push_back(page_of(phys.back()));
     }
-    bool fits = RangeFree(at, count);
-    bool ok = Pt().MapPages(at, pages.data(), count);
+    bool fits = range_free(at, count);
+    bool ok = tested_pt().map_pages(at, page_ptrs.data(), count);
     for (ulong p = 0; p < crowd; p++)
-        Pt().TmpUnmapPage(va + p * PageBytes);
-    TmpSlots -= crowd;
+        tested_pt().tmp_unmap_page(va + p * PAGE_BYTES);
+    tmp_slots -= crowd;
     if (ok)
     {
         INVARIANT(fits, "a map over 0x%lx, where something is mapped already, said yes", at);
         for (ulong i = 0; i < count; i++)
         {
-            Maps[at + i * PageBytes] = phys[i];
-            Pages[Index(phys[i])].Ref++;
-            Prot.erase(at + i * PageBytes);
+            maps[at + i * PAGE_BYTES] = phys[i];
+            pages[index(phys[i])].ref++;
+            prot.erase(at + i * PAGE_BYTES);
         }
-        Fuzz::Reached("a map in a crowded window");
+        fuzz::reached("a map in a crowded window");
         return;
     }
-    Fuzz::Reached("a map a crowded window refused");
-    if (fits && Pt().FreePagesCount >= 3)
-        Fuzz::Reached("a map a crowded window refused, memory free");
+    fuzz::reached("a map a crowded window refused");
+    if (fits && tested_pt().free_pages_count_ >= 3)
+        fuzz::reached("a map a crowded window refused, memory free");
     for (ulong i = 0; i < count; i++)
     {
-        ulong a = at + i * PageBytes;
-        if (!Maps.count(a) && !Mmio.count(a))
-            INVARIANT(Pt().VirtToPhys(a) == 0, "0x%lx is mapped after a map of it in a crowded TmpMap window said no",
+        ulong a = at + i * PAGE_BYTES;
+        if (!maps.count(a) && !mmio.count(a))
+            INVARIANT(tested_pt().virt_to_phys(a) == 0, "0x%lx is mapped after a map of it in a crowded TmpMap window said no",
                 a);
     }
 }
 
-void Unmap(Fuzz::Input& in)
+void unmap(fuzz::Input& in)
 {
-    if (Maps.empty())
+    if (maps.empty())
         return;
-    auto it = Maps.begin();
-    std::advance(it, in.Below(Maps.size()));
+    auto it = maps.begin();
+    std::advance(it, in.below(maps.size()));
     ulong va = it->first;
     ulong count = 1;
-    while (count < 8 && in.Bool() && Maps.count(va + count * PageBytes))
+    while (count < 8 && in.boolean() && maps.count(va + count * PAGE_BYTES))
         count++;
-    if (in.Chance(96) && count == 1)
+    if (in.chance(96) && count == 1)
     {
         /* The single-page form, and the caller's own Put after it */
-        Page* p = Pt().UnmapPage(va);
-        INVARIANT(p != nullptr && p->GetPhyAddress() == Maps[va], "UnmapPage(0x%lx) returned another page", va);
-        p->Put();
-        Pages[Index(Maps[va])].Ref--;
-        Maps.erase(va);
-        Prot.erase(va);
-        Fuzz::Reached("UnmapPage");
+        Page* p = tested_pt().unmap_page(va);
+        INVARIANT(p != nullptr && p->get_phy_address() == maps[va], "UnmapPage(0x%lx) returned another page", va);
+        p->put();
+        pages[index(maps[va])].ref--;
+        maps.erase(va);
+        prot.erase(va);
+        fuzz::reached("UnmapPage");
         return;
     }
     /* Freeing through the unmap only pages mapped once, and there once */
-    bool free = in.Bool();
+    bool free = in.boolean();
     std::map<ulong, int> uses;
     for (ulong i = 0; i < count; i++)
-        uses[Maps[va + i * PageBytes]]++;
+        uses[maps[va + i * PAGE_BYTES]]++;
     for (auto& u : uses)
     {
-        if (u.second != 1 || Pages[Index(u.first)].Ref != 2 || Pages[Index(u.first)].Frame)
+        if (u.second != 1 || pages[index(u.first)].ref != 2 || pages[index(u.first)].frame)
             free = false;
     }
-    Pt().UnmapPages(va, count, free);
+    tested_pt().unmap_pages(va, count, free);
     for (ulong i = 0; i < count; i++)
     {
-        ulong phys = Maps[va + i * PageBytes];
-        Pages[Index(phys)].Ref--;
+        ulong phys = maps[va + i * PAGE_BYTES];
+        pages[index(phys)].ref--;
         if (free)
-            Pages[Index(phys)].State = PageState::Free;
-        Maps.erase(va + i * PageBytes);
-        Prot.erase(va + i * PageBytes);
-        INVARIANT(Pt().VirtToPhys(va + i * PageBytes) == 0, "0x%lx still mapped after its unmap", va + i * PageBytes);
+            pages[index(phys)].state = PageState::Free;
+        maps.erase(va + i * PAGE_BYTES);
+        prot.erase(va + i * PAGE_BYTES);
+        INVARIANT(tested_pt().virt_to_phys(va + i * PAGE_BYTES) == 0, "0x%lx still mapped after its unmap", va + i * PAGE_BYTES);
     }
-    Fuzz::Reached(free ? "an unmap that frees" : "an unmap");
+    fuzz::reached(free ? "an unmap that frees" : "an unmap");
 }
 
-void Protect(Fuzz::Input& in)
+void protect(fuzz::Input& in)
 {
-    if (Maps.empty())
+    if (maps.empty())
         return;
-    auto it = Maps.begin();
-    std::advance(it, in.Below(Maps.size()));
+    auto it = maps.begin();
+    std::advance(it, in.below(maps.size()));
     ulong va = it->first;
-    ulong count = 1 + in.Below(4);
-    bool w = in.Bool(), x = in.Bool() && !w, exact = in.Bool();
-    bool ok = exact ? Pt().SetRangeProtection(va, count * PageBytes, w, x)
-                    : Pt().ProtectRange(va, count * PageBytes, w, x);
+    ulong count = 1 + in.below(4);
+    bool w = in.boolean(), x = in.boolean() && !w, exact = in.boolean();
+    bool ok = exact ? tested_pt().set_range_protection(va, count * PAGE_BYTES, w, x)
+                    : tested_pt().protect_range(va, count * PAGE_BYTES, w, x);
     /* Page by page up to the first that is not mapped, which says no */
     ulong i = 0;
-    for (; i < count && Maps.count(va + i * PageBytes); i++)
+    for (; i < count && maps.count(va + i * PAGE_BYTES); i++)
     {
-        auto cur = Prot.count(va + i * PageBytes) ? Prot[va + i * PageBytes] : std::make_pair(true, false);
+        auto cur = prot.count(va + i * PAGE_BYTES) ? prot[va + i * PAGE_BYTES] : std::make_pair(true, false);
         if (exact)
-            Prot[va + i * PageBytes] = {w, x};
+            prot[va + i * PAGE_BYTES] = {w, x};
         else
-            Prot[va + i * PageBytes] = {cur.first && w, cur.second && x};
+            prot[va + i * PAGE_BYTES] = {cur.first && w, cur.second && x};
     }
-    if (i < count && !RangeMapped(va + i * PageBytes, 1) && Pt().VirtToPhys(va + i * PageBytes) == 0)
-        INVARIANT(!ok, "a protection change over 0x%lx, which is not mapped, said yes", va + i * PageBytes);
-    Fuzz::Reached(ok ? "a protection change" : "a protection change that stopped");
+    if (i < count && !range_mapped(va + i * PAGE_BYTES, 1) && tested_pt().virt_to_phys(va + i * PAGE_BYTES) == 0)
+        INVARIANT(!ok, "a protection change over 0x%lx, which is not mapped, said yes", va + i * PAGE_BYTES);
+    fuzz::reached(ok ? "a protection change" : "a protection change that stopped");
 }
 
-void TmpMap(Fuzz::Input& in)
+void tmp_map(fuzz::Input& in)
 {
-    if (!Tmps.empty() && (in.Bool() || Tmps.size() > 12))
+    if (!tmps.empty() && (in.boolean() || tmps.size() > 12))
     {
         /* One of the sequence's, unmapped: what it wrote is in the page */
-        auto it = Tmps.begin();
-        std::advance(it, in.Below(Tmps.size()));
-        ulong va = it->first & ~(PageBytes - 1);
+        auto it = tmps.begin();
+        std::advance(it, in.below(tmps.size()));
+        ulong va = it->first & ~(PAGE_BYTES - 1);
         Tmp t = it->second;
-        for (ulong p = 0; p < t.Pages; p++)
+        for (ulong p = 0; p < t.pages; p++)
         {
-            ulong phys = Pt().TmpUnmapPage(va + p * PageBytes);
-            INVARIANT(phys == t.Phys + p * PageBytes, "TmpUnmapPage gave back 0x%lx, not 0x%lx", phys,
-                t.Phys + p * PageBytes);
-            Pages[Index(phys)].Ref--;
+            ulong phys = tested_pt().tmp_unmap_page(va + p * PAGE_BYTES);
+            INVARIANT(phys == t.phys + p * PAGE_BYTES, "TmpUnmapPage gave back 0x%lx, not 0x%lx", phys,
+                t.phys + p * PAGE_BYTES);
+            pages[index(phys)].ref--;
         }
-        TmpSlots -= t.Pages;
-        Tmps.erase(it);
-        WriteBackAll();
-        for (ulong b = 0; b < t.Pages * PageBytes; b += 509)
-            INVARIANT(M.Phys[t.Phys + b] == t.Mark, "a write through the TmpMap window to 0x%lx is not in the page",
-                t.Phys + b);
+        tmp_slots -= t.pages;
+        tmps.erase(it);
+        write_back_all();
+        for (ulong b = 0; b < t.pages * PAGE_BYTES; b += 509)
+            INVARIANT(machine.phys[t.phys + b] == t.mark, "a write through the TmpMap window to 0x%lx is not in the page",
+                t.phys + b);
         return;
     }
-    ulong phys = Unmapped(in);
+    ulong phys = unmapped(in);
     if (phys == 0)
         return;
     /* The pages after it, while they are the sequence's and mapped nowhere
        either -- a page in two slots at once is nothing the kernel does */
-    ulong pages = 1;
-    while (pages < 3 && InRam(phys + pages * PageBytes) && in.Bool())
+    ulong npages = 1;
+    while (npages < 3 && in_ram(phys + npages * PAGE_BYTES) && in.boolean())
     {
-        const PageState& next = Pages[Index(phys + pages * PageBytes)];
-        if (next.State != PageState::Held || next.Ref != 1 || next.Frame)
+        const PageState& next = pages[index(phys + npages * PAGE_BYTES)];
+        if (next.state != PageState::Held || next.ref != 1 || next.frame)
             break;
-        pages++;
+        npages++;
     }
-    ulong offset = in.Below(PageBytes);
-    ulong len = (pages - 1) * PageBytes + 1 + in.Below(PageBytes - offset);
-    ulong va = (pages == 1 && in.Bool()) ? Pt().TmpMapAddress(phys + offset) : Pt().TmpMapRange(phys + offset, len);
+    ulong offset = in.below(PAGE_BYTES);
+    ulong len = (npages - 1) * PAGE_BYTES + 1 + in.below(PAGE_BYTES - offset);
+    ulong va = (npages == 1 && in.boolean()) ? tested_pt().tmp_map_address(phys + offset) : tested_pt().tmp_map_range(phys + offset, len);
     if (va == 0)
     {
-        INVARIANT(TmpSlots + pages > PageTable::TmpMapSharedCount - 16,
-            "no TmpMap slot for %lu pages with %zu of the window's in use", pages, TmpSlots);
+        INVARIANT(tmp_slots + npages > PageTable::TMP_MAP_SHARED_COUNT - 16,
+            "no TmpMap slot for %lu pages with %zu of the window's in use", npages, tmp_slots);
         return;
     }
-    INVARIANT((va & (PageBytes - 1)) == offset, "a TmpMap of 0x%lx at 0x%lx: the offset is lost", phys + offset, va);
-    ulong span = (offset + len + PageBytes - 1) / PageBytes;
-    uint8_t mark = static_cast<uint8_t>(1 + in.Below(255));
-    memset(reinterpret_cast<void*>(va - offset), mark, span * PageBytes);
+    INVARIANT((va & (PAGE_BYTES - 1)) == offset, "a TmpMap of 0x%lx at 0x%lx: the offset is lost", phys + offset, va);
+    ulong span = (offset + len + PAGE_BYTES - 1) / PAGE_BYTES;
+    uint8_t mark = static_cast<uint8_t>(1 + in.below(255));
+    memset(reinterpret_cast<void*>(va - offset), mark, span * PAGE_BYTES);
     for (ulong p = 0; p < span; p++)
-        Pages[Index(phys + p * PageBytes)].Ref++;
-    TmpSlots += span;
-    Tmps[va] = {phys, span, mark};
-    Fuzz::Reached(span > 1 ? "a TmpMap of a range" : "a TmpMap");
+        pages[index(phys + p * PAGE_BYTES)].ref++;
+    tmp_slots += span;
+    tmps[va] = {phys, span, mark};
+    fuzz::reached(span > 1 ? "a TmpMap of a range" : "a TmpMap");
 }
 
-void Frame(Fuzz::Input& in)
+void frame(fuzz::Input& in)
 {
-    ulong phys = Unmapped(in);
+    ulong phys = unmapped(in);
     if (phys == 0)
         return;
-    Pages[Index(phys)].Frame = true;
-    Fuzz::CurrentCpu = in.Below(64);
-    ulong flags = Hal::IrqSave();
-    ulong va = Pt().MapFrameSlot(phys);
-    uint8_t mark = in.U8();
-    memset(reinterpret_cast<void*>(va), mark, PageBytes);
-    Pt().UnmapFrameSlot(va);
-    Hal::IrqRestore(flags);
-    WriteBackAll();
-    for (ulong b = 0; b < PageBytes; b += 509)
-        INVARIANT(M.Phys[phys + b] == mark, "a copy through frame slot %lu is not in frame 0x%lx", Fuzz::CurrentCpu,
+    pages[index(phys)].frame = true;
+    fuzz::current_cpu = in.below(64);
+    ulong flags = hal::irq_save();
+    ulong va = tested_pt().map_frame_slot(phys);
+    uint8_t mark = in.u8();
+    memset(reinterpret_cast<void*>(va), mark, PAGE_BYTES);
+    tested_pt().unmap_frame_slot(va);
+    hal::irq_restore(flags);
+    write_back_all();
+    for (ulong b = 0; b < PAGE_BYTES; b += 509)
+        INVARIANT(machine.phys[phys + b] == mark, "a copy through frame slot %lu is not in frame 0x%lx", fuzz::current_cpu,
             phys);
-    Pages[Index(phys)].Frame = false;
-    Fuzz::Reached("a frame copied");
+    pages[index(phys)].frame = false;
+    fuzz::reached("a frame copied");
 }
 
-void MapMmio(Fuzz::Input& in)
+void map_mmio(fuzz::Input& in)
 {
-    ulong pa = (M.Pages + in.Below(64)) * PageBytes;
-    ulong va = pa + MemoryMap::KernelSpaceBase;
-    if (Mmio.count(va) || Maps.count(va))
+    ulong pa = (machine.pages + in.below(64)) * PAGE_BYTES;
+    ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
+    if (mmio.count(va) || maps.count(va))
         return;
-    Hal::WriteCombining = in.Bool();
-    ulong got = Pt().MapMmioRegion(pa, 1 + in.Below(PageBytes), in.Bool() ? PageTable::MmioWriteCombining
+    hal::write_combining = in.boolean();
+    ulong got = tested_pt().map_mmio_region(pa, 1 + in.below(PAGE_BYTES), in.boolean() ? PageTable::MmioWriteCombining
                                                                           : PageTable::MmioUncached);
     if (got == 0)
     {
-        Fuzz::Reached("an MMIO map that failed on the way");
+        fuzz::reached("an MMIO map that failed on the way");
         return;
     }
     INVARIANT(got == va, "MMIO at 0x%lx mapped at 0x%lx", pa, got);
-    Mmio[va] = pa;
-    Pte leaf = Leaf(va);
-    INVARIANT(leaf.Present() && !Executable(leaf), "an MMIO mapping that can be executed");
-    Fuzz::Reached("an MMIO map");
+    mmio[va] = pa;
+    Pte leaf = leaf_of(va);
+    INVARIANT(leaf.present() && !executable(leaf), "an MMIO mapping that can be executed");
+    fuzz::reached("an MMIO map");
 }
 
 /* The huge pool, reserved as the boot reserves it: whole free blocks, the
    highest first, leaving keep pages free. */
-void ReservePool(Fuzz::Input& in)
+void reserve_pool(fuzz::Input& in)
 {
-    const ulong keep = in.Below(M.Pages);
-    const ulong want = in.Chance(8) ? in.Value32() : in.Below(4) + in.Chance(192);
-    const ulong before = Pt().FreePagesCount;
-    const ulong got = Pt().ReserveHugePoolKeeping(want * HugeBytes, keep);
+    const ulong keep = in.below(machine.pages);
+    const ulong want = in.chance(8) ? in.value32() : in.below(4) + in.chance(192);
+    const ulong before = tested_pt().free_pages_count_;
+    const ulong got = tested_pt().reserve_huge_pool_keeping(want * HUGE_BYTES, keep);
     INVARIANT(got <= want, "%lu blocks reserved of %lu asked", got, want);
-    INVARIANT(got == 0 || Pt().FreePagesCount >= keep, "the pool left %lu pages free, under the %lu kept",
-        Pt().FreePagesCount, keep);
-    INVARIANT(before - Pt().FreePagesCount == got * HugePages, "%lu pages left the free list for %lu blocks",
-        before - Pt().FreePagesCount, got);
-    for (ulong block = 0; block < M.Pages / HugePages; block++)
+    INVARIANT(got == 0 || tested_pt().free_pages_count_ >= keep, "the pool left %lu pages free, under the %lu kept",
+        tested_pt().free_pages_count_, keep);
+    INVARIANT(before - tested_pt().free_pages_count_ == got * HUGE_PAGES, "%lu pages left the free list for %lu blocks",
+        before - tested_pt().free_pages_count_, got);
+    for (ulong block = 0; block < machine.pages / HUGE_PAGES; block++)
     {
-        if (!Pt().HugePoolTest(Pt().HugePoolIn, block))
+        if (!tested_pt().huge_pool_test(tested_pt().huge_pool_in_, block))
             continue;
-        for (ulong i = block * HugePages; i < (block + 1) * HugePages; i++)
+        for (ulong i = block * HUGE_PAGES; i < (block + 1) * HUGE_PAGES; i++)
         {
-            INVARIANT(Pages[i].State == PageState::Free, "page %lu reserved for the pool, and not free (state %d)", i,
-                Pages[i].State);
-            Pages[i].State = PageState::Pool;
+            INVARIANT(pages[i].state == PageState::Free, "page %lu reserved for the pool, and not free (state %d)", i,
+                pages[i].state);
+            pages[i].state = PageState::Pool;
         }
-        PoolBlocks[block * HugeBytes] = false;
+        pool_blocks[block * HUGE_BYTES] = false;
     }
-    INVARIANT(PoolBlocks.size() == got, "%zu blocks in the bitmap, %lu said reserved", PoolBlocks.size(), got);
+    INVARIANT(pool_blocks.size() == got, "%zu blocks in the bitmap, %lu said reserved", pool_blocks.size(), got);
     /* Highest first: a block still free is below every block the pool
        took, and is left only when the pool had all it asked or the pages
        kept stopped it */
-    const bool limited = Pt().FreePagesCount < keep + HugePages;
-    for (ulong block = 0; block < M.Pages / HugePages; block++)
+    const bool limited = tested_pt().free_pages_count_ < keep + HUGE_PAGES;
+    for (ulong block = 0; block < machine.pages / HUGE_PAGES; block++)
     {
         bool free = true;
-        for (ulong i = block * HugePages; i < (block + 1) * HugePages && free; i++)
-            free = Pages[i].State == PageState::Free;
+        for (ulong i = block * HUGE_PAGES; i < (block + 1) * HUGE_PAGES && free; i++)
+            free = pages[i].state == PageState::Free;
         if (!free)
             continue;
         INVARIANT(got == want || limited, "block %lu left free with %lu of %lu reserved and room for more", block, got,
             want);
-        INVARIANT(PoolBlocks.empty() || block * HugeBytes < PoolBlocks.begin()->first,
-            "block %lu left free above block 0x%lx of the pool", block, PoolBlocks.begin()->first);
+        INVARIANT(pool_blocks.empty() || block * HUGE_BYTES < pool_blocks.begin()->first,
+            "block %lu left free above block 0x%lx of the pool", block, pool_blocks.begin()->first);
     }
     if (got != 0 && got < want)
-        Fuzz::Reached("a pool cut short");
+        fuzz::reached("a pool cut short");
     if (got != 0)
-        Fuzz::Reached("a huge pool");
+        fuzz::reached("a huge pool");
 }
 
-void AllocHuge(Fuzz::Input& in)
+void alloc_huge(fuzz::Input& in)
 {
     (void)in;
-    ulong poolFree = 0;
-    for (const auto& b : PoolBlocks)
-        poolFree += !b.second;
-    const ulong phys = Pt().AllocHugeFrame();
+    ulong pool_free = 0;
+    for (const auto& b : pool_blocks)
+        pool_free += !b.second;
+    const ulong phys = tested_pt().alloc_huge_frame();
     if (phys == 0)
     {
-        INVARIANT(poolFree == 0, "AllocHugeFrame failed with %lu blocks free", poolFree);
+        INVARIANT(pool_free == 0, "AllocHugeFrame failed with %lu blocks free", pool_free);
         return;
     }
-    auto it = PoolBlocks.find(phys);
-    INVARIANT(it != PoolBlocks.end() && !it->second, "AllocHugeFrame handed out 0x%lx, no free block of the pool",
+    auto it = pool_blocks.find(phys);
+    INVARIANT(it != pool_blocks.end() && !it->second, "AllocHugeFrame handed out 0x%lx, no free block of the pool",
         phys);
     it->second = true;
-    for (ulong i = 0; i < HugePages; i++)
+    for (ulong i = 0; i < HUGE_PAGES; i++)
     {
-        PageState& st = Pages[Index(phys) + i];
-        INVARIANT(st.State == PageState::Pool, "page %lu of a block handed out is not the pool's (state %d)",
-            Index(phys) + i, st.State);
-        st.State = PageState::Huge;
-        CheckZeroed(phys + i * PageBytes, "AllocHugeFrame");
+        PageState& st = pages[index(phys) + i];
+        INVARIANT(st.state == PageState::Pool, "page %lu of a block handed out is not the pool's (state %d)",
+            index(phys) + i, st.state);
+        st.state = PageState::Huge;
+        check_zeroed(phys + i * PAGE_BYTES, "AllocHugeFrame");
     }
     /* What a guest would write there: the next one handed it must find
        zeros again */
-    memset(M.Phys + phys, in.U8() | 1, HugeBytes);
-    Fuzz::Reached("a huge frame");
+    memset(machine.phys + phys, in.u8() | 1, HUGE_BYTES);
+    fuzz::reached("a huge frame");
 }
 
-void FreeHuge(Fuzz::Input& in)
+void free_huge(fuzz::Input& in)
 {
     std::vector<ulong> held;
-    for (const auto& b : PoolBlocks)
+    for (const auto& b : pool_blocks)
     {
         if (b.second)
             held.push_back(b.first);
     }
     if (held.empty())
         return;
-    const ulong phys = held[in.Below(held.size())];
-    Pt().FreeHugeFrame(phys);
-    PoolBlocks[phys] = false;
-    for (ulong i = 0; i < HugePages; i++)
-        Pages[Index(phys) + i].State = PageState::Pool;
-    Fuzz::Reached("a huge frame back");
+    const ulong phys = held[in.below(held.size())];
+    tested_pt().free_huge_frame(phys);
+    pool_blocks[phys] = false;
+    for (ulong i = 0; i < HUGE_PAGES; i++)
+        pages[index(phys) + i].state = PageState::Pool;
+    fuzz::reached("a huge frame back");
 }
 
 /* ---- a machine as Setup leaves one ---- */
 
-void Boot(Fuzz::Input& in)
+void boot(fuzz::Input& in)
 {
     /* Small, and now and then past 4 MiB: room for a block of the huge
        pool, the first 2MiB being the machine's own */
-    M.Pages = in.Chance(24) ? 1024 + in.Below(1536) : 48 + in.Below(in.Chance(32) ? 960 : 160);
+    machine.pages = in.chance(24) ? 1024 + in.below(1536) : 48 + in.below(in.chance(32) ? 960 : 160);
     void* mem = nullptr;
-    INVARIANT(posix_memalign(&mem, PageBytes, M.Pages * PageBytes) == 0, "no host memory");
-    M.Phys = static_cast<uint8_t*>(mem);
+    INVARIANT(posix_memalign(&mem, PAGE_BYTES, machine.pages * PAGE_BYTES) == 0, "no host memory");
+    machine.phys = static_cast<uint8_t*>(mem);
     /* What a page held before: not zeros */
-    std::vector<uint8_t> noise = Fuzz::Noise(in.U32(), PageBytes);
-    for (ulong i = 0; i < M.Pages; i++)
-        memcpy(M.Phys + i * PageBytes, noise.data(), PageBytes);
-    INVARIANT(posix_memalign(&mem, PageTable::HugePageSize, WindowSlots * PageBytes) == 0, "no host memory");
-    M.Window = static_cast<uint8_t*>(mem);
-    ASAN_POISON_MEMORY_REGION(M.Window, WindowSlots * PageBytes);
-    INVARIANT(posix_memalign(&mem, PageBytes, PageBytes) == 0, "no host memory");
-    M.WindowL1 = static_cast<PtePage*>(mem);
-    memset(M.WindowL1, 0, PageBytes);
-    for (size_t i = 0; i < WindowSlots; i++)
-        M.SlotPhys[i] = NoPhys;
-    M.PageArray = new Page[M.Pages];
+    std::vector<uint8_t> noise = fuzz::noise(in.u32(), PAGE_BYTES);
+    for (ulong i = 0; i < machine.pages; i++)
+        memcpy(machine.phys + i * PAGE_BYTES, noise.data(), PAGE_BYTES);
+    INVARIANT(posix_memalign(&mem, PageTable::HUGE_PAGE_SIZE, WINDOW_SLOTS * PAGE_BYTES) == 0, "no host memory");
+    machine.window = static_cast<uint8_t*>(mem);
+    ASAN_POISON_MEMORY_REGION(machine.window, WINDOW_SLOTS * PAGE_BYTES);
+    INVARIANT(posix_memalign(&mem, PAGE_BYTES, PAGE_BYTES) == 0, "no host memory");
+    machine.window_l1 = static_cast<PtePage*>(mem);
+    memset(machine.window_l1, 0, PAGE_BYTES);
+    for (size_t i = 0; i < WINDOW_SLOTS; i++)
+        machine.slot_phys[i] = NO_PHYS;
+    machine.page_array = new Page[machine.pages];
 
-    MemoryMap::GetInstance().AddRegion(0, M.Pages * PageBytes, MemoryMap::UsableRamType);
+    MemoryMap::get_instance().add_region(0, machine.pages * PAGE_BYTES, MemoryMap::USABLE_RAM_TYPE);
 
-    PageTable& pt = Pt();
-    pt.PageArray = M.PageArray;
-    pt.PageArrayCount = M.Pages;
-    pt.HighestPhyAddr = M.Pages * PageBytes;
-    pt.TotalPagesCount = M.Pages;
-    pt.TmpMapStart = reinterpret_cast<ulong>(M.Window);
-    pt.TmpMapL1Page = M.WindowL1;
-    Pages.assign(M.Pages, {PageState::Machine, 1, false});
+    PageTable& pt = tested_pt();
+    pt.page_array_ = machine.page_array;
+    pt.page_array_count_ = machine.pages;
+    pt.highest_phy_addr_ = machine.pages * PAGE_BYTES;
+    pt.total_pages_count_ = machine.pages;
+    pt.tmp_map_start_ = reinterpret_cast<ulong>(machine.window);
+    pt.tmp_map_l1_page_ = machine.window_l1;
+    pages.assign(machine.pages, {PageState::Machine, 1, false});
     /* What DrainEarlyFreeList leaves: every usable page on the list, at
        reference count 1 */
-    for (ulong i = M.Pages; i-- > ReservedPages;)
+    for (ulong i = machine.pages; i-- > RESERVED_PAGES;)
     {
-        M.PageArray[i].Init(i * PageBytes);
-        pt.FreePagesList.InsertHead(&M.PageArray[i].ListEntry);
-        pt.FreePagesCount++;
-        Pages[i].State = PageState::Free;
+        machine.page_array[i].init(i * PAGE_BYTES);
+        pt.free_pages_list_.insert_head(&machine.page_array[i].list_entry);
+        pt.free_pages_count_++;
+        pages[i].state = PageState::Free;
     }
-    for (ulong i = 0; i < ReservedPages; i++)
-        M.PageArray[i].Init(i * PageBytes);
+    for (ulong i = 0; i < RESERVED_PAGES; i++)
+        machine.page_array[i].init(i * PAGE_BYTES);
 
     /* The root, as Setup allocates it */
-    Page* root = pt.AllocPage();
+    Page* root = pt.alloc_page();
     INVARIANT(root != nullptr, "no page for the root");
-    pt.Root = root->GetPhyAddress();
-    Pages[Index(pt.Root)].State = PageState::Table;
+    pt.root_ = root->get_phy_address();
+    pages[index(pt.root_)].state = PageState::Table;
 
     /* The pool, right after the free list as the boot reserves it */
-    if (M.Pages >= 2 * HugePages && in.Chance(192))
-        ReservePool(in);
+    if (machine.pages >= 2 * HUGE_PAGES && in.chance(192))
+        reserve_pool(in);
 }
 
-void Run(Fuzz::Input& in)
+void run(fuzz::Input& in)
 {
-    Boot(in);
-    Check("the boot");
-    for (int ops = 0; ops < 64 && in.More(); ops++)
+    boot(in);
+    check("the boot");
+    for (int ops = 0; ops < 64 && in.more(); ops++)
     {
-        switch (in.U8() % 16)
+        switch (in.u8() % 16)
         {
         case 0:
         case 1:
         case 2:
-            Alloc(in);
+            alloc(in);
             break;
         case 3:
-            AllocRun(in);
+            alloc_run(in);
             break;
         case 4:
-            Free(in);
+            free_one(in);
             break;
         case 5:
-            if (in.Chance(48))
-                Exhaust(in);
+            if (in.chance(48))
+                exhaust(in);
             else
-                Free(in);
+                free_one(in);
             break;
         case 6:
         case 7:
         case 8:
-            Map(in);
+            map(in);
             break;
         case 9:
         case 10:
-            Unmap(in);
+            unmap(in);
             break;
         case 11:
-            Protect(in);
+            protect(in);
             break;
         case 12:
         case 13:
-            TmpMap(in);
+            tmp_map(in);
             break;
         case 14:
-            if (in.Chance(64))
-                Crowd(in);
-            else if (!PoolBlocks.empty() && in.Chance(192))
+            if (in.chance(64))
+                crowd(in);
+            else if (!pool_blocks.empty() && in.chance(192))
             {
-                if (in.Bool())
-                    AllocHuge(in);
+                if (in.boolean())
+                    alloc_huge(in);
                 else
-                    FreeHuge(in);
+                    free_huge(in);
             }
             else
-                Frame(in);
+                frame(in);
             break;
         default:
-            MapMmio(in);
+            map_mmio(in);
             break;
         }
-        Check("an operation");
-        if (in.Chance(64))
-            CheckMaps(in, "an operation");
+        check("an operation");
+        if (in.chance(64))
+            check_maps(in, "an operation");
     }
-    CheckMaps(in, "the sequence");
+    check_maps(in, "the sequence");
 }
 
-void Reset()
+void reset()
 {
-    Tmps.clear();
-    TmpSlots = 0;
-    Maps.clear();
-    Mmio.clear();
-    Prot.clear();
-    PoolBlocks.clear();
-    Pages.clear();
-    if (M.Window != nullptr)
+    tmps.clear();
+    tmp_slots = 0;
+    maps.clear();
+    mmio.clear();
+    prot.clear();
+    pool_blocks.clear();
+    pages.clear();
+    if (machine.window != nullptr)
     {
-        ASAN_UNPOISON_MEMORY_REGION(M.Window, WindowSlots * PageBytes);
-        free(M.Window);
-        free(M.WindowL1);
-        free(M.Phys);
-        delete[] M.PageArray;
+        ASAN_UNPOISON_MEMORY_REGION(machine.window, WINDOW_SLOTS * PAGE_BYTES);
+        free(machine.window);
+        free(machine.window_l1);
+        free(machine.phys);
+        delete[] machine.page_array;
     }
-    M = Machine();
-    PageTable& pt = Pt();
+    machine = Machine();
+    PageTable& pt = tested_pt();
     pt.~PageTable();
     new (&pt) PageTable();
-    MemoryMap& mmap = MemoryMap::GetInstance();
+    MemoryMap& mmap = MemoryMap::get_instance();
     mmap.~MemoryMap();
     new (&mmap) MemoryMap();
 }
 
 }
 
-const Fuzz::Target Fuzz::TheTarget = {"pagetable", Reset, Run, 1024, 20000};
+const fuzz::Target fuzz::THE_TARGET = {"pagetable", reset, run, 1024, 20000};

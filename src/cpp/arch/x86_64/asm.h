@@ -16,83 +16,83 @@ extern "C"
 {
 #endif
 
-ulong GetCr0(void);
-ulong GetCr1(void);
-ulong GetCr2(void);
-ulong GetCr3(void);
-ulong GetCr4(void);
+ulong get_cr0(void);
+ulong get_cr1(void);
+ulong get_cr2(void);
+ulong get_cr3(void);
+ulong get_cr4(void);
 
-void SetCr3(ulong addr);
+void set_cr3(ulong addr);
 
-ulong GetRsp(void);
-ulong GetRbp(void);
-ulong GetRip(void);
+ulong get_rsp(void);
+ulong get_rbp(void);
+ulong get_rip(void);
 
-ulong GetRflags(void);
-void SetRflags(ulong rflags);
+ulong get_rflags(void);
+void set_rflags(ulong rflags);
 
-ulong GetCs(void);
-ulong GetDs(void);
-ulong GetSs(void);
-ulong GetEs(void);
-ulong GetFs(void);
-ulong GetGs(void);
+ulong get_cs(void);
+ulong get_ds(void);
+ulong get_ss(void);
+ulong get_es(void);
+ulong get_fs(void);
+ulong get_gs(void);
 
-void StoreIdt(void *dest);
-void LoadIdt(void *src);
+void store_idt(void *dest);
+void load_idt(void *src);
 
-void StoreGdt(void *dest);
-void LoadGdt(void *src);
+void store_gdt(void *dest);
+void load_gdt(void *src);
 
-void LoadTr(u16 selector);
+void load_tr(u16 selector);
 
-void Outb(u16 port, u8 data);
-u8 Inb(u16 port);
+void outb(u16 port, u8 data);
+u8 inb(u16 port);
 
-void Outw(u16 port, u16 data);
-u16 Inw(u16 port);
+void outw(u16 port, u16 data);
+u16 inw(u16 port);
 
-void Out(u16 port, u32 data);
-u32 In(u16 port);
+void outl(u16 port, u32 data);
+u32 inl(u16 port);
 
-u64 ReadMsr(u32 msr);
-void WriteMsr(u32 msr, u64 value);
+u64 read_msr(u32 msr);
+void write_msr(u32 msr, u64 value);
 
-void SetRsp(ulong newValue);
-void SetRbp(ulong newValue);
+void set_rsp(ulong new_value);
+void set_rbp(ulong new_value);
 
-u64 ReadTsc();
+u64 read_tsc();
 
-u64 ReadTscp(u64 *cpuIndex);
+u64 read_tscp(u64 *cpu_index);
 
-void ExcDivideByZeroStub();
-void ExcDebuggerStub();
-void ExcNMIStub();
-void ExcBreakpointStub();
-void ExcOverflowStub();
-void ExcBoundsStub();
-void ExcInvalidOpcodeStub();
-void ExcCoprocessorNotAvailableStub();
-void ExcDoubleFaultStub();
-void ExcCoprocessorSegmentOverrunStub();
-void ExcInvalidTaskStateSegmentStub();
-void ExcSegmentNotPresentStub();
-void ExcStackFaultStub();
-void ExcGeneralProtectionFaultStub();
-void ExcPageFaultStub();
-void ExcReservedStub();
-void ExcMathFaultStub();
-void ExcAlignmentCheckStub();
-void ExcMachineCheckStub();
-void ExcSIMDFpExceptionStub();
-void ExcVirtExceptionStub();
-void ExcControlProtectionStub();
+void exc_divide_by_zero_stub();
+void exc_debugger_stub();
+void exc_nmi_stub();
+void exc_breakpoint_stub();
+void exc_overflow_stub();
+void exc_bounds_stub();
+void exc_invalid_opcode_stub();
+void exc_coprocessor_not_available_stub();
+void exc_double_fault_stub();
+void exc_coprocessor_segment_overrun_stub();
+void exc_invalid_task_state_segment_stub();
+void exc_segment_not_present_stub();
+void exc_stack_fault_stub();
+void exc_general_protection_fault_stub();
+void exc_page_fault_stub();
+void exc_reserved_stub();
+void exc_math_fault_stub();
+void exc_alignment_check_stub();
+void exc_machine_check_stub();
+void exc_simd_fp_exception_stub();
+void exc_virt_exception_stub();
+void exc_control_protection_stub();
 
 #ifdef __cplusplus
 }
 #endif
 
-static inline void Invlpg(unsigned long addr)
+static inline void invlpg(unsigned long addr)
 {
         asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
 }

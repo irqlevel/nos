@@ -8,30 +8,30 @@
 #include <hal/irq_stubs.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Pit final : public InterruptHandler
 {
 public:
-    static Pit& GetInstance()
+    static Pit& get_instance()
     {
-        static Pit Instance;
+        static Pit instance;
 
-        return Instance;
+        return instance;
     }
 
-    virtual void OnInterruptRegister(u8 irq, u8 vector) override;
-    virtual InterruptHandlerFn GetHandlerFn() override;
+    virtual void on_interrupt_register(u8 irq, u8 vector) override;
+    virtual InterruptHandlerFn get_handler_fn() override;
 
-    void Interrupt(Context* ctx);
+    void interrupt(Context* ctx);
 
-    void Setup();
+    void setup();
 
-    Stdlib::Time GetTime();
+    stdlib::Time get_time();
 
-    void Wait(const Stdlib::Time& timeout);
-    void Wait(ulong nanoSecs);
+    void wait(const stdlib::Time& timeout);
+    void wait(ulong nano_secs);
 
 private:
     Pit();
@@ -42,30 +42,30 @@ private:
     Pit& operator=(const Pit& other) = delete;
     Pit& operator=(Pit&& other) = delete;
 
-    int IntVector;
+    int int_vector_;
 
     /* I/O ports */
-    static const u16 Channel0Port = 0x40;
-    static const u16 Channel2Port = 0x42;
-    static const u16 ModePort     = 0x43;
+    static const u16 CHANNEL0_PORT = 0x40;
+    static const u16 CHANNEL2_PORT = 0x42;
+    static const u16 MODE_PORT     = 0x43;
 
     /* Base oscillator frequency in Hz */
-    static const u32 BaseFrequency = 1193182;
+    static const u32 BASE_FREQUENCY = 1193182;
 
     /* Desired tick rate and derived reload value */
-    static const u32 DesiredHz = 100;
-    static const u16 DesiredReload = (BaseFrequency + DesiredHz / 2) / DesiredHz;
+    static const u32 DESIRED_HZ = 100;
+    static const u16 DESIRED_RELOAD = (BASE_FREQUENCY + DESIRED_HZ / 2) / DESIRED_HZ;
 
     /* Mode command: channel 0, lobyte/hibyte access, mode 2 (rate generator), binary */
-    static const u8 ModeCh0RateGen = 0x34;
+    static const u8 MODE_CH0_RATE_GEN = 0x34;
 
-    ulong TimeMs;
-    ulong TimeMsNs;
-    ulong TickMs;
-    ulong TickMsNs;
-    u16 ReloadValue;
+    ulong time_ms_;
+    ulong time_ms_ns_;
+    ulong tick_ms_;
+    ulong tick_ms_ns_;
+    u16 reload_value_;
 
-    SeqLock TimeLock;
+    SeqLock time_lock_;
 };
 
 }

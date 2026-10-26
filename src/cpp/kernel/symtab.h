@@ -2,34 +2,34 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 struct SymEntry
 {
-    ulong Addr;
-    const char* Name;
+    ulong addr;
+    const char* name;
 };
 
 class SymbolTable
 {
 public:
-    static SymbolTable& GetInstance()
+    static SymbolTable& get_instance()
     {
-        static SymbolTable Instance;
+        static SymbolTable instance;
 
-        return Instance;
+        return instance;
     }
 
     /* The kernel's own function addr is in, and addr's offset into it; addr
        has to be in the kernel's text */
-    bool Resolve(ulong addr, const char*& name, ulong& offset);
+    bool resolve(ulong addr, const char*& name, ulong& offset);
 
     /* addr as "name+0xoff" into buf: in a function of the kernel's, or of a
        loaded module's -- "name+0xoff [module]", copied, since the module
        may go the moment this returns. False, buf untouched, if addr is in
        neither. Never waits, so a panic may call it as well as bt. */
-    bool Describe(ulong addr, char* buf, ulong size);
+    bool describe(ulong addr, char* buf, ulong size);
 
     /* Describe, for a return address -- what a backtrace's frames are: the
        function is the one holding ret - 1, the call's own last byte. A call
@@ -38,10 +38,10 @@ public:
        itself put every frame of a panic under the function that happened
        to follow it in the image, at +0x0. The offset printed is ret's, just
        past the call, as before. */
-    bool DescribeReturn(ulong ret, char* buf, ulong size);
+    bool describe_return(ulong ret, char* buf, ulong size);
 
     /* Room for what Describe writes before it truncates */
-    static const ulong DescribeMax = 160;
+    static const ulong DESCRIBE_MAX = 160;
 
 private:
     SymbolTable();
@@ -51,8 +51,8 @@ private:
     SymbolTable& operator=(const SymbolTable& other) = delete;
     SymbolTable& operator=(SymbolTable&& other) = delete;
 
-    static const SymEntry Symbols[];
-    static const size_t SymbolCount;
+    static const SymEntry SYMBOLS[];
+    static const size_t SYMBOL_COUNT;
 };
 
 }

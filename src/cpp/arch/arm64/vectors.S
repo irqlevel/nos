@@ -66,13 +66,13 @@
 vec_sync:
     SAVE_CONTEXT
     mov     x0, sp
-    bl      ArmSyncEntry
+    bl      arm_sync_entry
     RESTORE_CONTEXT_ERET
 
 vec_irq:
     SAVE_CONTEXT
     mov     x0, sp
-    bl      ArmIrqEntry
+    bl      arm_irq_entry
     RESTORE_CONTEXT_ERET
 
 .macro UNEXPECTED_BODY name, index
@@ -80,7 +80,7 @@ vec_unexpected_\name:
     SAVE_CONTEXT
     mov     x0, sp
     mov     x1, #\index
-    bl      ArmUnexpectedEntry
+    bl      arm_unexpected_entry
     RESTORE_CONTEXT_ERET
 .endm
 
@@ -99,9 +99,9 @@ UNEXPECTED_BODY low32_irq, 13
 UNEXPECTED_BODY low32_fiq, 14
 UNEXPECTED_BODY low32_serror, 15
 
-    .globl Arm64Vectors
+    .globl arm64_vectors
     .align 11
-Arm64Vectors:
+arm64_vectors:
     /* Current EL with SP0 */
     b       vec_unexpected_sp0_sync
     .align 7

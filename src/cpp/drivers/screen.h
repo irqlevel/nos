@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* The video console, whatever the firmware left us with: a pixel
@@ -15,20 +15,20 @@ namespace Kernel
    Setup() picks the backend from what the bootloader reported; every
    other entry point is a no-op until then, and stays a no-op if no
    usable screen exists (serial still works). */
-namespace Screen
+namespace screen
 {
 
-bool Setup();
+bool setup();
 
-bool IsReady();
+bool is_ready();
 
-void PrintString(const char *s);
-PRINTF_FORMAT(1, 2) void Printf(const char *fmt, ...);
-void Backspace();
-void Cls();
+void print_string(const char *s);
+PRINTF_FORMAT(1, 2) void printf(const char *fmt, ...);
+void backspace();
+void cls();
 
 /* Panic context: no locks, polled output only. */
-void PanicPrintString(const char *s);
+void panic_print_string(const char *s);
 
 }
 

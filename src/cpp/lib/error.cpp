@@ -1,56 +1,56 @@
 #include "error.h"
 
-namespace Stdlib
+namespace stdlib
 {
 
 Error::Error()
-    : Func("unknown")
-    , File("unknown")
-    , Line(0)
-    , Code(Success)
+    : func_("unknown")
+    , file_("unknown")
+    , line_(0)
+    , code_(SUCCESS)
 {
 }
 
 Error::Error(int code)
     : Error()
 {
-    Code = code;
+    code_ = code;
 }
 
 Error::Error(int code, const char *func, const char *file, int line)
     : Error()
 {
-    Code = code;
-    Func = func;
-    File = file;
-    Line = line;
+    code_ = code;
+    func_ = func;
+    file_ = file;
+    line_ = line;
 }
 
 Error::~Error()
 {
 }
 
-int Error::GetCode() const
+int Error::get_code() const
 {
-    return Code;
+    return code_;
 }
 
-void Error::SetCode(int code)
+void Error::set_code(int code)
 {
-    Code = code;
+    code_ = code;
 }
 
-const char* Error::GetDescription() const
+const char* Error::get_description() const
 {
-    switch (Code)
+    switch (code_)
     {
-    case Success:
+    case SUCCESS:
         return "Success";
-    case InvalidValue:
+    case INVALID_VALUE:
         return "Invalid value";
-    case NoMemory:
+    case NO_MEMORY:
         return "No memory";
-    case Cancelled:
+    case CANCELLED:
         return "Cancelled";
     default:
         return "Unknown";
@@ -59,65 +59,65 @@ const char* Error::GetDescription() const
 
 bool Error::operator!= (const Error& other) const
 {
-    return GetCode() != other.GetCode();
+    return get_code() != other.get_code();
 }
 
 bool Error::operator== (const Error& other) const
 {
-    return GetCode() == other.GetCode();
+    return get_code() == other.get_code();
 }
 
-void Error::Reset()
+void Error::reset()
 {
-    Code = Success;
+    code_ = SUCCESS;
 }
 
-bool Error::Ok() const
+bool Error::ok() const
 {
-    return (Code == Success) ? true : false;
+    return (code_ == SUCCESS) ? true : false;
 }
 
-int Error::GetLine() const
+int Error::get_line() const
 {
-    return Line;
+    return line_;
 }
 
-const char* Error::GetFile() const
+const char* Error::get_file() const
 {
-    return File;
+    return file_;
 }
 
-const char* Error::GetFunc() const
+const char* Error::get_func() const
 {
-    return Func;
+    return func_;
 }
 
 Error::Error(const Error& other)
     : Error()
 {
-    Code = other.Code;
-    Func = other.Func;
-    File = other.File;
-    Line = other.Line;
+    code_ = other.code_;
+    func_ = other.func_;
+    file_ = other.file_;
+    line_ = other.line_;
 }
 
 Error::Error(Error&& other)
 {
-    Code = other.Code;
-    Func = other.Func;
-    File = other.File;
-    Line = other.Line;
-    other.Reset();
+    code_ = other.code_;
+    func_ = other.func_;
+    file_ = other.file_;
+    line_ = other.line_;
+    other.reset();
 }
 
 Error& Error::operator=(const Error& other)
 {
     if (this != &other)
     {
-        Code = other.Code;
-        Func = other.Func;
-        File = other.File;
-        Line = other.Line;
+        code_ = other.code_;
+        func_ = other.func_;
+        file_ = other.file_;
+        line_ = other.line_;
     }
     return *this;
 }
@@ -126,11 +126,11 @@ Error& Error::operator=(Error&& other)
 {
     if (this != &other)
     {
-        Code = other.Code;
-        Func = other.Func;
-        File = other.File;
-        Line = other.Line;
-        other.Reset();
+        code_ = other.code_;
+        func_ = other.func_;
+        file_ = other.file_;
+        line_ = other.line_;
+        other.reset();
     }
     return *this;
 }

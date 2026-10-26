@@ -8,20 +8,20 @@
 #include <hal/pmu.h>
 #include <mm/new.h>
 
-namespace Kernel
+namespace kernel
 {
 
 Profiler::Profiler()
-    : Active(false)
-    , UsePmu(false)
-    , Allocated(false)
+    : active_(false)
+    , use_pmu_(false)
+    , allocated_(false)
 {
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        Cpu_[i].Records = nullptr;
-        Cpu_[i].Count = 0;
-        Cpu_[i].Dropped = 0;
-        Cpu_[i].PmuArmed = false;
+        cpu_[i].records = nullptr;
+        cpu_[i].count = 0;
+        cpu_[i].dropped = 0;
+        cpu_[i].pmu_armed = false;
     }
 }
 
@@ -29,25 +29,25 @@ Profiler::~Profiler()
 {
 }
 
-bool Profiler::Allocate()
+bool Profiler::allocate()
 {
-    if (Allocated)
+    if (allocated_)
         return true;
 
     /* Only the CPUs that are up: a buffer for every slot MaxCpus allows
        would be megabytes held for the life of the kernel to serve cores this
        machine does not have. */
-    ulong running = CpuTable::GetInstance().GetRunningCpus();
+    ulong running = CpuTable::get_instance().get_running_cpus();
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if (!(running & (1UL << i)))
             continue;
 
-        Cpu_[i].Records = (Record*)Mm::Alloc(SamplesPerCpu * sizeof(Record), Tag);
-        if (Cpu_[i].Records == nullptr)
+        cpu_[i].records = (Record*)mm::alloc(SAMPLES_PER_CPU * sizeof(Record), TAG);
+        if (cpu_[i].records == nullptr)
         {
-            Trace(0, "Profiler: no memory for cpu %lu buffer", i);
+            trace(0, "Profiler: no memory for cpu %lu buffer", i);
             return false;
         }
     }
@@ -56,36 +56,36 @@ bool Profiler::Allocate()
        be inside Sample() having already passed the Active check when another
        CPU stops the run, and freeing underneath it would be a use-after-free
        for the sake of reclaiming a megabyte. */
-    Allocated = true;
+    allocated_ = true;
     return true;
 }
 
-bool Profiler::Start()
+bool Profiler::start()
 {
-    if (Active)
+    if (active_)
         return false;
 
-    if (!Allocate())
+    if (!allocate())
         return false;
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        Cpu_[i].Count = 0;
-        Cpu_[i].Dropped = 0;
+        cpu_[i].count = 0;
+        cpu_[i].dropped = 0;
     }
 
     /* Asked once, on the CPU running the shell: the answer is a property of
        the part, and the cycle counter is the one thing the two core types of
        a hybrid CPU do agree about. */
-    UsePmu = Hal::PmuAvailable();
+    use_pmu_ = hal::pmu_available();
 
-    Active = true;
+    active_ = true;
     return true;
 }
 
-void Profiler::Stop()
+void Profiler::stop()
 {
-    Active = false;
+    active_ = false;
 
     /* Each CPU disarms its own counter on its next tick -- the control
        registers are per CPU and cannot be written from here. Until then it
@@ -93,85 +93,85 @@ void Profiler::Stop()
        already false. */
 }
 
-void Profiler::Tick(Context* ctx)
+void Profiler::tick(Context* ctx)
 {
-    ulong index = Hal::GetCurrentCpuHwId();
-    if (index >= MaxCpus)
+    ulong index = hal::get_current_cpu_hw_id();
+    if (index >= MAX_CPUS)
         return;
 
-    PerCpu& cpu = Cpu_[index];
+    PerCpu& cpu = cpu_[index];
 
-    if (!Active)
+    if (!active_)
     {
-        if (cpu.PmuArmed)
+        if (cpu.pmu_armed)
         {
-            Hal::PmuStop();
-            cpu.PmuArmed = false;
+            hal::pmu_stop();
+            cpu.pmu_armed = false;
         }
         return;
     }
 
-    if (UsePmu)
+    if (use_pmu_)
     {
-        if (!cpu.PmuArmed)
-            cpu.PmuArmed = Hal::PmuStart();
+        if (!cpu.pmu_armed)
+            cpu.pmu_armed = hal::pmu_start();
 
         /* Armed: the samples arrive as counter overflows, and taking one here
            as well would count this tick twice. */
-        if (cpu.PmuArmed)
+        if (cpu.pmu_armed)
             return;
     }
 
-    Sample(ctx);
+    sample(ctx);
 }
 
-void Profiler::Sample(Context* ctx)
+void Profiler::sample(Context* ctx)
 {
-    if (!Active)
+    if (!active_)
         return;
 
-    ulong index = Hal::GetCurrentCpuHwId();
-    if (index >= MaxCpus)
+    ulong index = hal::get_current_cpu_hw_id();
+    if (index >= MAX_CPUS)
         return;
 
-    PerCpu& cpu = Cpu_[index];
-    if (cpu.Records == nullptr)
+    PerCpu& cpu = cpu_[index];
+    if (cpu.records == nullptr)
         return;
 
-    if (cpu.Count >= SamplesPerCpu)
+    if (cpu.count >= SAMPLES_PER_CPU)
     {
-        cpu.Dropped++;
+        cpu.dropped++;
         return;
     }
 
-    Record& record = cpu.Records[cpu.Count];
+    Record& record = cpu.records[cpu.count];
 
-    Task* task = Task::TryGetCurrentTask();
-    record.Pid = (task != nullptr) ? task->Pid : 0;
+    Task* task = Task::try_get_current_task();
+    record.pid = (task != nullptr) ? task->pid_ : 0;
 
     /* The interrupted instruction, exactly, from the frame the tick pushed --
        not a walk from in here, which would have to guess how many of its own
        frames to skip. */
-    record.Frame[0] = ctx->GetRetRip();
-    record.Depth = 1 + StackTrace::CaptureFromSp(ctx->GetFramePointer(),
-        ctx->GetOrigRsp(), &record.Frame[1], MaxDepth - 1);
+    record.frame[0] = ctx->get_ret_rip();
+    record.depth = 1 + StackTrace::capture_from_sp(ctx->get_frame_pointer(),
+        ctx->get_orig_rsp(), &record.frame[1], MAX_DEPTH - 1);
 
-    cpu.Count++;
+    cpu.count++;
 }
 
-static const char* SymbolName(const char* name)
+static const char* symbol_name(const char* name)
 {
     return (name != nullptr) ? name : "(unknown)";
 }
 
-void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimit)
+void Profiler::report(stdlib::Printer& printer, ulong pid_filter, ulong chain_limit)
 {
     /* Whole chains, not leaves. Every sample already carries MaxDepth frames;
        counting them by leaf alone threw away all but the first two. */
     struct Chain
     {
-        ulong Depth;
-        ulong Count;
+        ulong depth;
+        ulong count;
 
         /* The leaf folds by symbol, the callers by exact address.
  
@@ -185,26 +185,26 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
            so folding the callers by address does not shatter anything -- it
            separates paths that really are different, and keeps the offset
            that names which call in the function this came through. */
-        const char* LeafName;
-        ulong LeafLow;
-        ulong LeafHigh;
+        const char* leaf_name;
+        ulong leaf_low;
+        ulong leaf_high;
 
-        ulong Frame[MaxDepth];
+        ulong frame[MAX_DEPTH];
     };
 
     /* On the heap rather than on the stack: Report runs in task context,
        where allocating is fine, and a table this size is a third of the
        headroom `stacks` measures on a task stack. */
-    Chain* chains = (Chain*)Mm::Alloc(MaxChains * sizeof(Chain), Tag);
+    Chain* chains = (Chain*)mm::alloc(MAX_CHAINS * sizeof(Chain), TAG);
     if (chains == nullptr)
     {
-        printer.Printf("profile: no memory for the chain table\n");
+        printer.printf("profile: no memory for the chain table\n");
         return;
     }
 
-    auto& symtab = SymbolTable::GetInstance();
+    auto& symtab = SymbolTable::get_instance();
 
-    ulong chainCount = 0;
+    ulong chain_count = 0;
     ulong total = 0;
     ulong dropped = 0;
     ulong cpus = 0;
@@ -212,62 +212,62 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
 
     /* One pass over every sample. The old report walked them all again for
        each hot symbol it wanted callers for; this costs one walk in total. */
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        PerCpu& cpu = Cpu_[i];
-        if (cpu.Records == nullptr)
+        PerCpu& cpu = cpu_[i];
+        if (cpu.records == nullptr)
             continue;
 
-        if (cpu.Count != 0)
+        if (cpu.count != 0)
             cpus++;
 
-        dropped += cpu.Dropped;
+        dropped += cpu.dropped;
 
-        for (ulong s = 0; s < cpu.Count; s++)
+        for (ulong s = 0; s < cpu.count; s++)
         {
-            Record& record = cpu.Records[s];
-            if (pidFilter != NoPidFilter && record.Pid != pidFilter)
+            Record& record = cpu.records[s];
+            if (pid_filter != NO_PID_FILTER && record.pid != pid_filter)
                 continue;
 
             total++;
 
-            ulong depth = record.Depth;
-            if (depth > MaxDepth)
-                depth = MaxDepth;
+            ulong depth = record.depth;
+            if (depth > MAX_DEPTH)
+                depth = MAX_DEPTH;
 
             /* Resolved here rather than at sample time: a symbol lookup has
                no place in an interrupt handler, and the addresses keep just
                as well. Only the leaf is resolved during the walk -- the
                callers fold as raw addresses and are named at print time,
                for the few chains that actually get printed. */
-            const char* leafName;
-            ulong leafOffset;
-            if (!symtab.Resolve(record.Frame[0], leafName, leafOffset))
+            const char* leaf_name;
+            ulong leaf_offset;
+            if (!symtab.resolve(record.frame[0], leaf_name, leaf_offset))
             {
-                leafName = nullptr;
-                leafOffset = 0;
+                leaf_name = nullptr;
+                leaf_offset = 0;
             }
 
             ulong c = 0;
-            for (; c < chainCount; c++)
+            for (; c < chain_count; c++)
             {
-                if (chains[c].Depth != depth)
+                if (chains[c].depth != depth)
                     continue;
 
                 /* Resolve hands back a pointer into the static table, so the
                    same symbol is the same pointer. */
-                if (chains[c].LeafName != leafName)
+                if (chains[c].leaf_name != leaf_name)
                     continue;
 
                 /* No name to fold by -- a loadable module's code, or nobody's
                    -- and the address is all there is */
-                if (leafName == nullptr && chains[c].Frame[0] != record.Frame[0])
+                if (leaf_name == nullptr && chains[c].frame[0] != record.frame[0])
                     continue;
 
                 ulong f = 1;
                 for (; f < depth; f++)
                 {
-                    if (chains[c].Frame[f] != record.Frame[f])
+                    if (chains[c].frame[f] != record.frame[f])
                         break;
                 }
 
@@ -275,68 +275,68 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
                     break;
             }
 
-            if (c == chainCount)
+            if (c == chain_count)
             {
-                if (chainCount == MaxChains)
+                if (chain_count == MAX_CHAINS)
                 {
                     unfolded++;
                     continue;
                 }
 
-                chains[c].Depth = depth;
-                chains[c].LeafName = leafName;
+                chains[c].depth = depth;
+                chains[c].leaf_name = leaf_name;
                 for (ulong f = 0; f < depth; f++)
-                    chains[c].Frame[f] = record.Frame[f];
-                chains[c].Count = 0;
-                chains[c].LeafLow = leafOffset;
-                chains[c].LeafHigh = leafOffset;
-                chainCount++;
+                    chains[c].frame[f] = record.frame[f];
+                chains[c].count = 0;
+                chains[c].leaf_low = leaf_offset;
+                chains[c].leaf_high = leaf_offset;
+                chain_count++;
             }
 
-            if (leafOffset < chains[c].LeafLow)
-                chains[c].LeafLow = leafOffset;
-            if (leafOffset > chains[c].LeafHigh)
-                chains[c].LeafHigh = leafOffset;
+            if (leaf_offset < chains[c].leaf_low)
+                chains[c].leaf_low = leaf_offset;
+            if (leaf_offset > chains[c].leaf_high)
+                chains[c].leaf_high = leaf_offset;
 
-            chains[c].Count++;
+            chains[c].count++;
         }
     }
 
     /* Which clock these came off matters for reading them: at 100 Hz a
        function has to be very hot to appear at all, and nothing that runs
        with interrupts off appears ever. */
-    printer.Printf("%lu samples on %lu cpus, %lu dropped, source %s\n",
-        total, cpus, dropped, UsePmu ? Hal::PmuName() : "tick");
+    printer.printf("%lu samples on %lu cpus, %lu dropped, source %s\n",
+        total, cpus, dropped, use_pmu_ ? hal::pmu_name() : "tick");
 
     if (total == 0)
     {
-        if (pidFilter != NoPidFilter)
-            printer.Printf("(no sample landed in pid %lu -- it may have been "
+        if (pid_filter != NO_PID_FILTER)
+            printer.printf("(no sample landed in pid %lu -- it may have been "
                 "asleep the whole window, which is what a task that is not "
-                "running looks like)\n", pidFilter);
-        else if (UsePmu)
+                "running looks like)\n", pid_filter);
+        else if (use_pmu_)
             /* The counter counts unhalted cycles, so a machine that spent the
                window in `hlt` produces nothing at all -- where the tick would
                have shown a stack full of idle. */
-            printer.Printf("(nothing sampled -- every cpu was halted for the "
+            printer.printf("(nothing sampled -- every cpu was halted for the "
                 "whole window, or the window was too short)\n");
         else
-            printer.Printf("(nothing sampled -- was the window too short?)\n");
+            printer.printf("(nothing sampled -- was the window too short?)\n");
 
-        Mm::Free(chains);
+        mm::free(chains);
         return;
     }
 
     if (unfolded != 0)
-        printer.Printf("%lu samples past the %lu chains this report holds\n",
-            unfolded, (ulong)MaxChains);
+        printer.printf("%lu samples past the %lu chains this report holds\n",
+            unfolded, (ulong)MAX_CHAINS);
 
-    for (ulong i = 0; i < chainCount && i < chainLimit; i++)
+    for (ulong i = 0; i < chain_count && i < chain_limit; i++)
     {
         ulong best = i;
-        for (ulong j = i + 1; j < chainCount; j++)
+        for (ulong j = i + 1; j < chain_count; j++)
         {
-            if (chains[j].Count > chains[best].Count)
+            if (chains[j].count > chains[best].count)
                 best = j;
         }
 
@@ -347,41 +347,41 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
             chains[best] = tmp;
         }
 
-        ulong permille = (chains[i].Count * 1000) / total;
+        ulong permille = (chains[i].count * 1000) / total;
 
-        if (chains[i].LeafName == nullptr)
+        if (chains[i].leaf_name == nullptr)
         {
             /* Not the kernel's: named now, if a module still has it */
-            char where[SymbolTable::DescribeMax];
-            if (!symtab.Describe(chains[i].Frame[0], where, sizeof(where)))
-                Stdlib::SnPrintf(where, sizeof(where), "0x%lX", chains[i].Frame[0]);
-            printer.Printf("%lu.%lu%% %lu %s\n", permille / 10, permille % 10,
-                chains[i].Count, where);
+            char where[SymbolTable::DESCRIBE_MAX];
+            if (!symtab.describe(chains[i].frame[0], where, sizeof(where)))
+                stdlib::sn_printf(where, sizeof(where), "0x%lX", chains[i].frame[0]);
+            printer.printf("%lu.%lu%% %lu %s\n", permille / 10, permille % 10,
+                chains[i].count, where);
         }
-        else if (chains[i].LeafLow == chains[i].LeafHigh)
-            printer.Printf("%lu.%lu%% %lu %s+0x%lX\n", permille / 10, permille % 10,
-                chains[i].Count, SymbolName(chains[i].LeafName),
-                chains[i].LeafLow);
+        else if (chains[i].leaf_low == chains[i].leaf_high)
+            printer.printf("%lu.%lu%% %lu %s+0x%lX\n", permille / 10, permille % 10,
+                chains[i].count, symbol_name(chains[i].leaf_name),
+                chains[i].leaf_low);
         else
-            printer.Printf("%lu.%lu%% %lu %s+0x%lX..0x%lX\n",
-                permille / 10, permille % 10, chains[i].Count,
-                SymbolName(chains[i].LeafName),
-                chains[i].LeafLow, chains[i].LeafHigh);
+            printer.printf("%lu.%lu%% %lu %s+0x%lX..0x%lX\n",
+                permille / 10, permille % 10, chains[i].count,
+                symbol_name(chains[i].leaf_name),
+                chains[i].leaf_low, chains[i].leaf_high);
 
         /* The offset is into the caller and points just past the call that
            led here -- these are return addresses, the same ones the panic
            backtrace prints, so the two read alike. */
-        for (ulong f = 1; f < chains[i].Depth; f++)
+        for (ulong f = 1; f < chains[i].depth; f++)
         {
-            char where[SymbolTable::DescribeMax];
-            if (symtab.DescribeReturn(chains[i].Frame[f], where, sizeof(where)))
-                printer.Printf("        <- %s\n", where);
+            char where[SymbolTable::DESCRIBE_MAX];
+            if (symtab.describe_return(chains[i].frame[f], where, sizeof(where)))
+                printer.printf("        <- %s\n", where);
             else
-                printer.Printf("        <- 0x%lX\n", chains[i].Frame[f]);
+                printer.printf("        <- 0x%lX\n", chains[i].frame[f]);
         }
     }
 
-    Mm::Free(chains);
+    mm::free(chains);
 }
 
 }

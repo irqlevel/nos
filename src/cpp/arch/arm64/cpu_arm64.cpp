@@ -5,48 +5,48 @@
    (seq_cst), which lower to inline LDXR/STXR loops with
    -mno-outline-atomics. SwitchContext/SetJmp/LongJmp live in asm.S. */
 
-extern "C" void Arm64TaskEntryThunk();
-extern "C" void __attribute__((noreturn)) Arm64RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx);
+extern "C" void arm64_task_entry_thunk();
+extern "C" void __attribute__((noreturn)) arm64_run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx);
 
-namespace Hal
+namespace hal
 {
 
 /* SwitchContext's frame in asm.S, in words, and the one x29 is saved in */
-static const ulong SwitchFrameWords = 14;
-static const ulong SwitchFrameFp = 12;
+static const ulong SWITCH_FRAME_WORDS = 14;
+static const ulong SWITCH_FRAME_FP = 12;
 
 /* Frame layout must match SwitchContext in asm.S:
    [DAIF, pad][x19,x20][x21,x22][x23,x24][x25,x26][x27,x28][x29,x30] */
-ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
+ulong build_task_frame(ulong stack_top, ulong entry, ulong arg)
 {
-    ulong* sp = (ulong*)(stackTop & ~0xFUL);
-    sp -= SwitchFrameWords;
-    for (ulong i = 0; i < SwitchFrameWords; i++)
+    ulong* sp = (ulong*)(stack_top & ~0xFUL);
+    sp -= SWITCH_FRAME_WORDS;
+    for (ulong i = 0; i < SWITCH_FRAME_WORDS; i++)
         sp[i] = 0;
     /* DAIF: IRQs enabled, D/A/F stay masked — the PSTATE every other
        context runs with (boot masks all four, InterruptEnable clears only
        I), so SError delivery does not depend on which task is current */
-    const ulong DaifDAF = (1UL << 9) | (1UL << 8) | (1UL << 6);
-    sp[0] = DaifDAF;
+    const ulong daif_daf = (1UL << 9) | (1UL << 8) | (1UL << 6);
+    sp[0] = daif_daf;
     sp[2] = arg;                        /* x19 */
     sp[3] = entry;                      /* x20 */
-    sp[13] = (ulong)&Arm64TaskEntryThunk; /* x30 */
+    sp[13] = (ulong)&arm64_task_entry_thunk; /* x30 */
     return (ulong)sp;
 }
 
-ulong TaskSavedFramePointer(ulong savedSp, ulong stackBase, ulong stackLimit)
+ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_limit)
 {
-    if (savedSp % sizeof(ulong) != 0 || savedSp < stackBase || savedSp > stackLimit ||
-        stackLimit - savedSp < SwitchFrameWords * sizeof(ulong))
+    if (saved_sp % sizeof(ulong) != 0 || saved_sp < stack_base || saved_sp > stack_limit ||
+        stack_limit - saved_sp < SWITCH_FRAME_WORDS * sizeof(ulong))
         return 0;
 
     /* SwitchContext frame slot 12 = x29 (see asm.S layout comment) */
-    return ((ulong*)savedSp)[SwitchFrameFp];
+    return ((ulong*)saved_sp)[SWITCH_FRAME_FP];
 }
 
-void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)
+void run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx)
 {
-    Arm64RunOnStack(stackTop, fn, ctx);
+    arm64_run_on_stack(stack_top, fn, ctx);
 }
 
 }
@@ -54,27 +54,27 @@ void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)
 extern "C"
 {
 
-void Pause(void)
+void cpu_relax(void)
 {
     asm volatile("yield");
 }
 
-void Hlt(void)
+void cpu_halt(void)
 {
     asm volatile("wfi");
 }
 
-void InterruptEnable(void)
+void interrupt_enable(void)
 {
     asm volatile("msr daifclr, #2" ::: "memory");
 }
 
-void InterruptDisable(void)
+void interrupt_disable(void)
 {
     asm volatile("msr daifset, #2" ::: "memory");
 }
 
-void SpinLockLock(ulong *lock)
+void spin_lock_lock(ulong *lock)
 {
     for (;;)
     {
@@ -87,47 +87,47 @@ void SpinLockLock(ulong *lock)
     }
 }
 
-void SpinLockUnlock(ulong *lock)
+void spin_lock_unlock(ulong *lock)
 {
     __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
 }
 
-void AtomicInc(volatile long *pvalue)
+void atomic_inc(volatile long *pvalue)
 {
     __atomic_add_fetch(pvalue, 1, __ATOMIC_SEQ_CST);
 }
 
-void AtomicDec(volatile long *pvalue)
+void atomic_dec(volatile long *pvalue)
 {
     __atomic_sub_fetch(pvalue, 1, __ATOMIC_SEQ_CST);
 }
 
-void AtomicAdd(volatile long *pvalue, long delta)
+void atomic_add(volatile long *pvalue, long delta)
 {
     __atomic_add_fetch(pvalue, delta, __ATOMIC_SEQ_CST);
 }
 
-long AtomicRead(volatile long *pvalue)
+long atomic_read(volatile long *pvalue)
 {
     return __atomic_load_n(pvalue, __ATOMIC_SEQ_CST);
 }
 
-void AtomicWrite(volatile long *pvalue, long newValue)
+void atomic_write(volatile long *pvalue, long new_value)
 {
-    __atomic_store_n(pvalue, newValue, __ATOMIC_SEQ_CST);
+    __atomic_store_n(pvalue, new_value, __ATOMIC_SEQ_CST);
 }
 
-long AtomicReadAndDec(volatile long *pvalue)
+long atomic_read_and_dec(volatile long *pvalue)
 {
     return __atomic_fetch_sub(pvalue, 1, __ATOMIC_SEQ_CST);
 }
 
-long AtomicReadAndInc(volatile long *pvalue)
+long atomic_read_and_inc(volatile long *pvalue)
 {
     return __atomic_fetch_add(pvalue, 1, __ATOMIC_SEQ_CST);
 }
 
-long AtomicCmpxchg(volatile long *pvalue, long exchange, long comparand)
+long atomic_cmpxchg(volatile long *pvalue, long exchange, long comparand)
 {
     long expected = comparand;
     __atomic_compare_exchange_n(pvalue, &expected, exchange, false,
@@ -135,21 +135,21 @@ long AtomicCmpxchg(volatile long *pvalue, long exchange, long comparand)
     return expected; /* original value: comparand on success */
 }
 
-long AtomicTestAndSetBit(volatile long *pvalue, ulong bit)
+long atomic_test_and_set_bit(volatile long *pvalue, ulong bit)
 {
     long mask = 1L << bit;
     long old = __atomic_fetch_or(pvalue, mask, __ATOMIC_SEQ_CST);
     return (old & mask) ? 1 : 0;
 }
 
-long AtomicTestAndClearBit(volatile long *pvalue, ulong bit)
+long atomic_test_and_clear_bit(volatile long *pvalue, ulong bit)
 {
     long mask = 1L << bit;
     long old = __atomic_fetch_and(pvalue, ~mask, __ATOMIC_SEQ_CST);
     return (old & mask) ? 1 : 0;
 }
 
-long AtomicTestBit(volatile long *pvalue, ulong bit)
+long atomic_test_bit(volatile long *pvalue, ulong bit)
 {
     long mask = 1L << bit;
     return (__atomic_load_n(pvalue, __ATOMIC_SEQ_CST) & mask) ? 1 : 0;

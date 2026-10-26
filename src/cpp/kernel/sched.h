@@ -6,7 +6,7 @@
 #include <lib/stdlib.h>
 #include <lib/list_entry.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* What one CPU's scheduler did, counted as it does it: how long a task that
@@ -22,45 +22,45 @@ public:
     /* Log2 buckets of microseconds: bucket 0 is under 1 us, bucket k is
        [2^(k-1), 2^k) us, and the last holds everything from 2^(Buckets-2) us
        up -- about 4 s */
-    static const ulong Buckets = 24;
+    static const ulong BUCKETS = 24;
 
     struct Snapshot
     {
         /* Woken: unblocked by someone, or asleep until a deadline that
            came -- from then until it ran */
-        ulong Wake[Buckets];
-        ulong WakeMaxNs;
+        ulong wake[BUCKETS];
+        ulong wake_max_ns;
         /* Displaced while it could still run, until it ran again */
-        ulong Delay[Buckets];
-        ulong Decisions;
-        ulong DecisionCycles;
-        ulong DecisionMaxCycles;
+        ulong delay[BUCKETS];
+        ulong decisions;
+        ulong decision_cycles;
+        ulong decision_max_cycles;
         /* Tasks a decision touched -- itself, and each it put on the run
            list -- summed over the decisions */
-        ulong Touched;
-        ulong TouchedMax;
+        ulong touched;
+        ulong touched_max;
         /* Looks at the queue the timer made, the tasks they found able to
            run -- the one on the CPU included, the idle task not -- summed,
            the most, and how many found two or more */
-        ulong Looks;
-        ulong Runnable;
-        ulong RunnableMax;
-        ulong Crowded;
+        ulong looks;
+        ulong runnable;
+        ulong runnable_max;
+        ulong crowded;
     };
 
     constexpr SchedStats() = default;
     ~SchedStats() = default;
 
-    void Wake(ulong ns);
-    void Delay(ulong ns);
-    void Decision(ulong cycles, ulong touched);
-    void Look(ulong runnable);
+    void wake(ulong ns);
+    void delay(ulong ns);
+    void decision(ulong cycles, ulong touched);
+    void look(ulong runnable);
 
-    void Read(Snapshot& out);
+    void read(Snapshot& out);
 
-    static ulong Bucket(ulong ns);
+    static ulong bucket(ulong ns);
     /* What bucket's entries are under, in microseconds */
-    static ulong BucketLimitUs(ulong bucket);
+    static ulong bucket_limit_us(ulong bucket);
 
 private:
     SchedStats(const SchedStats& other) = delete;
@@ -72,22 +72,22 @@ private:
        instruction -- Atomic's Set is a lock xchg on x86, five of them a
        decision: a reader on another CPU sees the value before or the value
        after, never a torn one */
-    static void Bump(ulong& counter, ulong by);
-    static void Raise(ulong& max, ulong value);
-    static ulong Load(const ulong& counter);
+    static void bump(ulong& counter, ulong by);
+    static void raise(ulong& max, ulong value);
+    static ulong load(const ulong& counter);
 
-    ulong WakeHist[Buckets] = {};
-    ulong WakeMax = 0;
-    ulong DelayHist[Buckets] = {};
-    ulong Decisions = 0;
-    ulong DecisionCycles = 0;
-    ulong DecisionMax = 0;
-    ulong Touched = 0;
-    ulong TouchedMax = 0;
-    ulong Looks = 0;
-    ulong RunnableSum = 0;
-    ulong RunnableMax = 0;
-    ulong Crowded = 0;
+    ulong wake_hist_[BUCKETS] = {};
+    ulong wake_max_ = 0;
+    ulong delay_hist_[BUCKETS] = {};
+    ulong decisions_ = 0;
+    ulong decision_cycles_ = 0;
+    ulong decision_max_ = 0;
+    ulong touched_ = 0;
+    ulong touched_max_ = 0;
+    ulong looks_ = 0;
+    ulong runnable_sum_ = 0;
+    ulong runnable_max_ = 0;
+    ulong crowded_ = 0;
 };
 
 /* Why a decision is made: a voluntary Schedule() -- curr blocking, exiting,
@@ -108,54 +108,54 @@ public:
     TaskQueue();
     ~TaskQueue();
 
-    void Insert(Task* task);
-    void Remove(Task* task);
+    void insert(Task* task);
+    void remove(Task* task);
 
-    void Schedule(Task* curr, ScheduleReason why);
+    void schedule(Task* curr, ScheduleReason why);
 
     /* A task's nice and slice (SchedEntity), set under this queue's lock --
        false when the task is not this queue's, and the caller looks again
        (SetTaskNice, SetTaskSlice) */
-    bool SetNice(Task* task, long nice);
-    bool SetSlice(Task* task, ulong sliceNs);
+    bool set_nice(Task* task, long nice);
+    bool set_slice(Task* task, ulong slice_ns);
 
     /* What EEVDF has of one task on this queue: `sched queue` */
     struct EntityView
     {
-        char Name[TaskNameLen];
-        ulong Pid;
-        long Nice;
-        ulong SliceNs;
+        char name[TASK_NAME_LEN];
+        ulong pid;
+        long nice;
+        ulong slice_ns;
         /* V less its VRuntime, and its deadline less V: virtual ns */
-        s64 Lag;
-        s64 Deadline;
-        bool Eligible;
-        bool OnCpu;
+        s64 lag;
+        s64 deadline;
+        bool eligible;
+        bool on_cpu;
     };
 
     /* The queue as it is, copied under its lock into out -- the one on the
        CPU first, if it is counted -- for printing after: at most max, the
        count returned */
-    ulong View(EntityView* out, ulong max);
+    ulong view(EntityView* out, ulong max);
 
-    void Clear();
+    void clear();
 
-    long GetSwitchContextCounter();
+    long get_switch_context_counter();
 
     /* How many tasks this queue is home to -- runnable, running, asleep, the
        idle task -- maintained by every change of home */
-    long GetTaskCount();
+    long get_task_count();
 
     /* How many of them could run now: the one on the CPU included, the idle
        task not. What the load balancer weighs (Task::SelectNextTaskQueue). */
-    long GetRunnableCount();
+    long get_runnable_count();
 
     /* Free tasks that exited on this queue's CPU. Must be called with
        interrupts enabled (it frees stacks, which triggers a blocking TLB
        shootdown) -- see SwitchComplete. */
-    void ReapExited();
+    void reap_exited();
 
-    void ReadStats(SchedStats::Snapshot& out);
+    void read_stats(SchedStats::Snapshot& out);
 
     /* A task this queue is home to, found asleep by an Unblock() that has
        just made it Task::RunWaking: handed back from any CPU and any
@@ -163,7 +163,7 @@ public:
        a stack this queue's CPU takes whole at its next Schedule() and puts
        on the run list (DrainWakes). That Schedule() is the waker's to bring
        about, as it always was: Event::Signal and SoftIrq::Raise send the IPI. */
-    void PushWake(Task* task);
+    void push_wake(Task* task);
 
 private:
     TaskQueue(const TaskQueue &other) = delete;
@@ -175,81 +175,81 @@ private:
 
     /* The tasks woken since the last look (PushWake), onto the run list in
        the order they were woken; touched counts them, for SchedStats */
-    void DrainWakes(ulong& touched);
+    void drain_wakes(ulong& touched);
 
     /* The sleepers whose deadline is not after now, onto the run list */
-    void WakeDue(ulong now, ulong& touched);
+    void wake_due(ulong now, ulong& touched);
 
     /* A task that could not run and now can -- new, woken, moved here:
        placed by its lag (EevdfQueue::Join), onto the run list, and counted */
-    void Enqueue(Task* task);
+    void enqueue(Task* task);
 
     /* curr, current and displaced while it can still run: back on the run
        list where its virtual runtime and deadline say */
-    void Requeue(Task* task);
+    void requeue(Task* task);
 
     /* A task has gone on the run list now: what CheckStalls times */
-    void NoteQueued(Task* task);
+    void note_queued(Task* task);
 
     /* curr, gone to sleep: its lag kept, no longer counted, and on the
        sleep list if it is asleep until a deadline */
-    void Asleep(Task* task);
+    void asleep(Task* task);
 
     /* curr as a decision finds it: charged for what it has run at its
        weight if it is current, gone from the queue if it has exited, and
        the idle task in the count or out of it (CountIdle) */
-    void Account(Task* curr, ulong now, bool exited);
+    void account(Task* curr, ulong now, bool exited);
 
     /* The idle task joins the count when it stops idling -- placed as a
        task waking, from the lag it left with -- and leaves it, its lag kept,
        when it idles again: idling, it is not one of the tasks that share the
        CPU, only what runs when none of them can */
-    void CountIdle(Task* curr, ulong now);
+    void count_idle(Task* curr, ulong now);
 
-    static Task* TaskOf(SchedEntity* se);
+    static Task* task_of(SchedEntity* se);
 
     /* The slice the current one is given, when another waits for the CPU:
        this CPU's timer brought forward to when its deadline comes, so that
        its slice ends then and not at the next tick. No sooner than MinArmNs
        from now. */
-    void ArmSlice(ulong now);
+    void arm_slice(ulong now);
 
-    static const ulong MinArmNs = 50 * Const::NanoSecsInUsec;
+    static const ulong MIN_ARM_NS = 50 * consts::NANO_SECS_IN_USEC;
 
     /* The idle task made an ordinary one (Task::ClearIdle, at a shutdown):
        out of its place as the last resort, and into its turn */
-    void ReleaseIdle(Task* curr);
+    void release_idle(Task* curr);
 
     /* A runnable task that has waited StallReportNs for this CPU is a
        report, once a wait: a scheduler that can starve one says so. Noted
        under the lock, and said by ReportStall once this CPU holds none of
        the scheduler's locks -- the keep path's end, or SwitchComplete. */
-    void CheckStalls(ulong now);
-    void ReportStall();
+    void check_stalls(ulong now);
+    void report_stall();
 
-    static const ulong StallReportNs = 5 * Const::NanoSecsInSec;
+    static const ulong STALL_REPORT_NS = 5 * consts::NANO_SECS_IN_SEC;
 
     /* The stall noted and not yet said: this CPU's alone */
-    bool StallPending;
-    char StallName[TaskNameLen];
-    ulong StallPid;
-    ulong StallWaitedMs;
-    long StallRunnable;
+    bool stall_pending_;
+    char stall_name_[TASK_NAME_LEN];
+    ulong stall_pid_;
+    ulong stall_waited_ms_;
+    long stall_runnable_;
 
     /* Spins allowed in Schedule while an exited task waits for a
        runnable candidate before declaring the queue broken */
-    static const ulong MaxExitedRetries = 100000000;
+    static const ulong MAX_EXITED_RETRIES = 100000000;
 
-    void Switch(Task* next, Task* curr);
+    void switch_to(Task* next, Task* curr);
 
-    void SwitchComplete(Task* curr);
+    void switch_complete(Task* curr);
 
-    static void SwitchComplete(void* ctx);
+    static void switch_complete(void* ctx);
 
-    using ListEntry = Stdlib::ListEntry;
+    using ListEntry = stdlib::ListEntry;
 
     /* Every task this queue is home to (Task::ListEntry) */
-    ListEntry TaskList;
+    ListEntry task_list_;
 
     /* The runnable ones (Task::Sched.Entry), the one on the CPU among them
        as the queue's current, and the rules a decision over them is made
@@ -257,41 +257,41 @@ private:
        runs something other than its idling. Only runnable tasks: one blocked
        is off it until woken, so a decision never passes over a task that
        cannot run. */
-    EevdfQueue Eevdf;
+    EevdfQueue eevdf_;
 
     /* The idle task is counted -- it runs something other than its idling,
        or waits for its turn to (CountIdle) */
-    bool IdleCounted;
+    bool idle_counted_;
 
     /* The tasks asleep until a deadline -- Sleep(), Event::WaitFor() --
        soonest first (Task::SleepEntry): what this CPU's timer is armed for,
        and what WakeDue looks at the head of */
-    ListEntry SleepList;
+    ListEntry sleep_list_;
 
     /* The CPU's idle task, kept apart from the run list: the last resort,
        taken only when nothing else can run */
-    Task* IdleTask;
+    Task* idle_task_;
 
     /* PushWake's stack, a Task* and 0 for none, linked by Task::WakeNext */
-    Atomic WakeHead;
+    Atomic wake_head_;
 
-    SpinLock Lock;
+    SpinLock lock_;
 
     /* Tasks that exited on this CPU, pending a stack free with interrupts
        enabled (ReapExited), rather than in the IRQs-off switch path. */
-    ListEntry ExitedList;
-    SpinLock ExitedLock;
+    ListEntry exited_list_;
+    SpinLock exited_lock_;
 
-    Atomic ScheduleCounter;
-    Atomic SwitchContextCounter;
-    Atomic TaskCount;
-    Atomic RunnableCount;
+    Atomic schedule_counter_;
+    Atomic switch_context_counter_;
+    Atomic task_count_;
+    Atomic runnable_count_;
 
     /* The waits next has just ended, as it is switched in at now: woken,
        or displaced while runnable (SchedStats). Under Lock. */
-    void NoteRun(Task* next, ulong now);
+    void note_run(Task* next, ulong now);
 
-    SchedStats Stats;
+    SchedStats stats_;
 };
 
 
@@ -308,7 +308,7 @@ private:
    the CPU to any other runnable task but never to the idle one. Every wait
    primitive here does -- WaitGroup, Mutex, RwMutex -- and the one time each
    of them did not, it cost a tick per wait (see WaitGroup::Wait). */
-void Schedule();
+void schedule();
 
 /* The reschedule an interrupt asks for -- the tick's and every IPI's: the CPU
    goes to another task runnable on it, if there is one, and otherwise stays
@@ -320,7 +320,7 @@ void Schedule();
    a quarter of the CPU, and a p99 of 10 ms. A task with preemption off keeps
    the CPU, and the reschedule is made when its PreemptEnable() brings the
    count back to zero -- deferred, not dropped (see ScheduleCurrent). */
-void Preempt();
+void preempt();
 
 /* Gives the CPU to another task runnable on it, if there is one, and returns
    at once if there is not: never to the idle task, as Schedule() would, which
@@ -328,27 +328,27 @@ void Preempt();
    work another CPU's interrupt will bring, without keeping whatever else is
    runnable here -- a softirq task the tick preempted mid-handler among them
    -- off the CPU the way a plain spin does. */
-void YieldToRunnable();
+void yield_to_runnable();
 
-void Sleep(ulong nanoSecs);
+void sleep(ulong nano_secs);
 
 /* Tasks moved between CPU queues since boot. */
-long GetTaskMigrationCount();
+long get_task_migration_count();
 
 /* Reschedules since boot that found preemption off on the task they landed
    on, and how many of those landed on an idle task (see ScheduleCurrent). */
-long GetPreemptDeferredCount();
-long GetPreemptDeferredIdleCount();
+long get_preempt_deferred_count();
+long get_preempt_deferred_idle_count();
 
 /* Runnable tasks reported since boot for having waited too long for their
    CPU (TaskQueue::CheckStalls) */
-long GetStallReportCount();
+long get_stall_report_count();
 
 /* A task's nice (its share of its CPU, SchedEntity::SetNice) and slice (how
    soon after it can it runs, and for how long at a time), wherever it is:
    under its queue's lock, the queue looked up again if it moved meanwhile.
    From task context. */
-void SetTaskNice(Task* task, long nice);
-void SetTaskSlice(Task* task, ulong sliceNs);
+void set_task_nice(Task* task, long nice);
+void set_task_slice(Task* task, ulong slice_ns);
 
 }

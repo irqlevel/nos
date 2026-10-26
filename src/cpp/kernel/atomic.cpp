@@ -3,74 +3,74 @@
 
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace kernel
 {
 
-void Atomic::Inc()
+void Atomic::inc()
 {
-    AtomicInc(&Value);
+    atomic_inc(&value_);
 }
 
-void Atomic::Dec()
+void Atomic::dec()
 {
-    AtomicDec(&Value);
+    atomic_dec(&value_);
 }
 
-void Atomic::Add(long delta)
+void Atomic::add(long delta)
 {
-    AtomicAdd(&Value, delta);
+    atomic_add(&value_, delta);
 }
 
-bool Atomic::DecAndTest()
+bool Atomic::dec_and_test()
 {
-    long oldValue = AtomicReadAndDec(&Value);
-    return (oldValue == 1) ? true : false;
+    long old_value = atomic_read_and_dec(&value_);
+    return (old_value == 1) ? true : false;
 }
 
-void Atomic::Set(long value)
+void Atomic::set(long value)
 {
-    AtomicWrite(&Value, value);
+    atomic_write(&value_, value);
 }
 
-long Atomic::Get()
+long Atomic::get()
 {
-    return AtomicRead(&Value);
+    return atomic_read(&value_);
 }
 
-bool Atomic::SetBit(ulong bit)
+bool Atomic::set_bit(ulong bit)
 {
-    BugOn(bit >= Stdlib::SizeOfInBits<long>());
+    BUG_ON(bit >= stdlib::size_of_in_bits<long>());
 
-    return (AtomicTestAndSetBit(&Value, bit)) ? true : false;
+    return (atomic_test_and_set_bit(&value_, bit)) ? true : false;
 }
 
-bool Atomic::ClearBit(ulong bit)
+bool Atomic::clear_bit(ulong bit)
 {
-    BugOn(bit >= Stdlib::SizeOfInBits<long>());
+    BUG_ON(bit >= stdlib::size_of_in_bits<long>());
 
-    return (AtomicTestAndClearBit(&Value, bit)) ? true : false;
+    return (atomic_test_and_clear_bit(&value_, bit)) ? true : false;
 }
 
-bool Atomic::TestBit(ulong bit)
+bool Atomic::test_bit(ulong bit)
 {
-    BugOn(bit >= Stdlib::SizeOfInBits<long>());
+    BUG_ON(bit >= stdlib::size_of_in_bits<long>());
 
-    return (AtomicTestBit(&Value, bit)) ? true : false;
+    return (atomic_test_bit(&value_, bit)) ? true : false;
 }
 
-long Atomic::Cmpxchg(long exchange, long comparand)
+long Atomic::cmpxchg(long exchange, long comparand)
 {
-    return AtomicCmpxchg(&Value, exchange, comparand);
+    return atomic_cmpxchg(&value_, exchange, comparand);
 }
 
 Atomic::Atomic(Atomic&& other)
 {
-    Set(other.Get());
+    set(other.get());
 }
 
 Atomic& Atomic::operator=(Atomic&& other)
 {
-    Set(other.Get());
+    set(other.get());
     return *this;
 }
 

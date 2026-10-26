@@ -9,17 +9,17 @@
 #include <drivers/hpet.h>
 #include <arch/x86_64/lapic.h>
 
-namespace Kernel
+namespace kernel
 {
 
 Tsc::Tsc()
-    : FreqHz(0)
-    , BaseTsc(0)
-    , Invariant(false)
-    , Calibrated(false)
-    , KvmClockAvail(false)
-    , PvClock(nullptr)
-    , PvClockPhys(0)
+    : freq_hz_(0)
+    , base_tsc_(0)
+    , invariant_(false)
+    , calibrated_(false)
+    , kvm_clock_avail_(false)
+    , pv_clock_(nullptr)
+    , pv_clock_phys_(0)
 {
 }
 
@@ -27,98 +27,98 @@ Tsc::~Tsc()
 {
 }
 
-ulong Tsc::CalibratePitCh2()
+ulong Tsc::calibrate_pit_ch2()
 {
     /* Program PIT channel 2 in one-shot mode */
-    u8 gate = Inb(PitGatePort);
-    gate = (gate & GateMask) | GateOn; /* gate on, speaker off */
-    Outb(PitGatePort, gate);
+    u8 gate = inb(PIT_GATE_PORT);
+    gate = (gate & GATE_MASK) | GATE_ON; /* gate on, speaker off */
+    outb(PIT_GATE_PORT, gate);
 
-    Outb(PitModePort, PitCh2OneShotCmd);
+    outb(PIT_MODE_PORT, PIT_CH2_ONE_SHOT_CMD);
 
     /* Write reload value (lobyte then hibyte) */
-    u16 reload = (u16)CalibrationReload;
-    Outb(PitChannel2Port, (u8)(reload & 0xFF));
-    Outb(PitChannel2Port, (u8)((reload >> 8) & 0xFF));
+    u16 reload = (u16)CALIBRATION_RELOAD;
+    outb(PIT_CHANNEL2_PORT, (u8)(reload & 0xFF));
+    outb(PIT_CHANNEL2_PORT, (u8)((reload >> 8) & 0xFF));
 
     /* Reset the gate to restart the countdown */
-    gate = Inb(PitGatePort);
-    Outb(PitGatePort, gate & GateOff);  /* gate low */
-    Outb(PitGatePort, gate | GateOn);   /* gate high -- starts countdown */
+    gate = inb(PIT_GATE_PORT);
+    outb(PIT_GATE_PORT, gate & GATE_OFF);  /* gate low */
+    outb(PIT_GATE_PORT, gate | GATE_ON);   /* gate high -- starts countdown */
 
-    u64 tscStart = ReadTsc();
+    u64 tsc_start = read_tsc();
 
     /* Poll OUT pin until it goes high */
-    while (!(Inb(PitGatePort) & OutPin))
+    while (!(inb(PIT_GATE_PORT) & OUT_PIN))
         ;
 
-    u64 tscEnd = ReadTsc();
+    u64 tsc_end = read_tsc();
 
-    return (ulong)(tscEnd - tscStart);
+    return (ulong)(tsc_end - tsc_start);
 }
 
-ulong Tsc::CalibrateHpet()
+ulong Tsc::calibrate_hpet()
 {
-    auto& hpet = Hpet::GetInstance();
-    if (!hpet.IsAvailable())
+    auto& hpet = Hpet::get_instance();
+    if (!hpet.is_available())
         return 0;
 
-    Stdlib::Time tStart = hpet.GetTime();
-    Stdlib::Time tEnd = tStart + Stdlib::Time(CalibrationMs * Const::NanoSecsInMs);
+    stdlib::Time t_start = hpet.get_time();
+    stdlib::Time t_end = t_start + stdlib::Time(CALIBRATION_MS * consts::NANO_SECS_IN_MS);
 
-    u64 tscStart = ReadTsc();
-    while (hpet.GetTime() < tEnd)
+    u64 tsc_start = read_tsc();
+    while (hpet.get_time() < t_end)
     {
-        Pause();
+        cpu_relax();
     }
-    u64 tscEnd = ReadTsc();
+    u64 tsc_end = read_tsc();
 
-    return (ulong)(tscEnd - tscStart);
+    return (ulong)(tsc_end - tsc_start);
 }
 
-bool Tsc::Calibrate()
+bool Tsc::calibrate()
 {
     /* Check TSC presence */
-    auto leaf1 = Cpuid(CpuidLeafFeatures);
-    if (!(leaf1.Edx & CpuidBitTsc))
+    auto leaf1 = cpuid(CPUID_LEAF_FEATURES);
+    if (!(leaf1.edx & CPUID_BIT_TSC))
     {
-        Trace(0, "TSC: not present");
+        trace(0, "TSC: not present");
         return false;
     }
 
     /* Check invariant TSC (only if extended CPUID supports this leaf) */
-    auto maxExt = Cpuid(CpuidLeafMaxExt);
-    if (maxExt.Eax >= CpuidLeafExtAdv)
+    auto max_ext = cpuid(CPUID_LEAF_MAX_EXT);
+    if (max_ext.eax >= CPUID_LEAF_EXT_ADV)
     {
-        auto leaf8007 = Cpuid(CpuidLeafExtAdv);
-        Invariant = (leaf8007.Edx & CpuidBitInvariantTsc) != 0;
+        auto leaf8007 = cpuid(CPUID_LEAF_EXT_ADV);
+        invariant_ = (leaf8007.edx & CPUID_BIT_INVARIANT_TSC) != 0;
     }
 
-    Trace(0, "TSC: invariant=%lu", (ulong)Invariant);
+    trace(0, "TSC: invariant=%lu", (ulong)invariant_);
 
-    ulong samples[CalibrationRounds];
+    ulong samples[CALIBRATION_ROUNDS];
 
     /* Prefer HPET calibration over PIT channel 2 */
-    if (Hpet::GetInstance().IsAvailable())
+    if (Hpet::get_instance().is_available())
     {
-        Trace(0, "TSC: calibrating via HPET");
-        for (ulong i = 0; i < CalibrationRounds; i++)
-            samples[i] = CalibrateHpet();
+        trace(0, "TSC: calibrating via HPET");
+        for (ulong i = 0; i < CALIBRATION_ROUNDS; i++)
+            samples[i] = calibrate_hpet();
     }
     else
     {
         /* Calibrate using PIT channel 2 */
-        u8 savedGate = Inb(PitGatePort);
-        for (ulong i = 0; i < CalibrationRounds; i++)
-            samples[i] = CalibratePitCh2();
+        u8 saved_gate = inb(PIT_GATE_PORT);
+        for (ulong i = 0; i < CALIBRATION_ROUNDS; i++)
+            samples[i] = calibrate_pit_ch2();
         /* Restore port 0x61 to pre-calibration state (gate off, original bits) */
-        Outb(PitGatePort, savedGate & GateOff);
+        outb(PIT_GATE_PORT, saved_gate & GATE_OFF);
     }
 
     /* Sort and take median */
-    for (ulong i = 0; i < CalibrationRounds - 1; i++)
+    for (ulong i = 0; i < CALIBRATION_ROUNDS - 1; i++)
     {
-        for (ulong j = i + 1; j < CalibrationRounds; j++)
+        for (ulong j = i + 1; j < CALIBRATION_ROUNDS; j++)
         {
             if (samples[j] < samples[i])
             {
@@ -129,88 +129,88 @@ bool Tsc::Calibrate()
         }
     }
 
-    ulong medianTicks = samples[CalibrationRounds / 2];
+    ulong median_ticks = samples[CALIBRATION_ROUNDS / 2];
 
-    if (medianTicks == 0)
+    if (median_ticks == 0)
     {
-        Trace(0, "TSC: calibration failed, zero ticks");
+        trace(0, "TSC: calibration failed, zero ticks");
         return false;
     }
 
     /* FreqHz = medianTicks / (CalibrationMs / 1000)
      *        = medianTicks * 1000 / CalibrationMs */
-    FreqHz = medianTicks * MsPerSec / CalibrationMs;
-    BaseTsc = ReadTsc();
-    Calibrated = true;
+    freq_hz_ = median_ticks * MS_PER_SEC / CALIBRATION_MS;
+    base_tsc_ = read_tsc();
+    calibrated_ = true;
 
-    Trace(0, "TSC: frequency %lu Hz (%lu MHz)", FreqHz, FreqHz / HzPerMHz);
+    trace(0, "TSC: frequency %lu Hz (%lu MHz)", freq_hz_, freq_hz_ / HZ_PER_MHZ);
 
     return true;
 }
 
-bool Tsc::SetupKvmClock()
+bool Tsc::setup_kvm_clock()
 {
     /* Check KVM signature: CPUID 0x40000000 -> "KVMKVMKVM\0\0\0" */
-    auto sig = Cpuid(KvmCpuidSignature);
-    u32 kvm[3] = { sig.Ebx, sig.Ecx, sig.Edx };
-    const char* kvmStr = "KVMKVMKVM\0\0\0";
-    if (Stdlib::MemCmp(kvm, kvmStr, KvmSignatureLen) != 0)
+    auto sig = cpuid(KVM_CPUID_SIGNATURE);
+    u32 kvm[3] = { sig.ebx, sig.ecx, sig.edx };
+    const char* kvm_str = "KVMKVMKVM\0\0\0";
+    if (stdlib::mem_cmp(kvm, kvm_str, KVM_SIGNATURE_LEN) != 0)
     {
-        Trace(0, "TSC: not running under KVM");
+        trace(0, "TSC: not running under KVM");
         return false;
     }
 
     /* Check KVM_FEATURE_CLOCKSOURCE2 */
-    auto feat = Cpuid(KvmCpuidFeatures);
-    if (!(feat.Eax & KvmFeatureClockSource2))
+    auto feat = cpuid(KVM_CPUID_FEATURES);
+    if (!(feat.eax & KVM_FEATURE_CLOCK_SOURCE2))
     {
-        Trace(0, "TSC: KVM detected but no clocksource2 feature");
+        trace(0, "TSC: KVM detected but no clocksource2 feature");
         return false;
     }
 
     /* Allocate a page of pvclock entries (one per APIC id) */
-    PvClock = static_cast<PvClockVcpuTimeInfo*>(
-        Mm::AllocMapPages(1, &PvClockPhys));
-    if (!PvClock)
+    pv_clock_ = static_cast<PvClockVcpuTimeInfo*>(
+        mm::alloc_map_pages(1, &pv_clock_phys_));
+    if (!pv_clock_)
     {
-        Trace(0, "TSC: failed to allocate pvclock page");
+        trace(0, "TSC: failed to allocate pvclock page");
         return false;
     }
 
-    Stdlib::MemSet(PvClock, 0, Const::PageSize);
+    stdlib::mem_set(pv_clock_, 0, consts::PAGE_SIZE);
 
     /* Enable kvmclock for the BSP; each AP arms its own entry in ApMain2 */
-    if (!EnableKvmClockSelf())
+    if (!enable_kvm_clock_self())
         return false;
 
-    KvmClockAvail = true;
+    kvm_clock_avail_ = true;
 
-    Trace(0, "TSC: kvmclock enabled, pvclock at phys 0x%lX virt 0x%lX",
-        PvClockPhys, (ulong)PvClock);
+    trace(0, "TSC: kvmclock enabled, pvclock at phys 0x%lX virt 0x%lX",
+        pv_clock_phys_, (ulong)pv_clock_);
 
     return true;
 }
 
-bool Tsc::EnableKvmClockSelf()
+bool Tsc::enable_kvm_clock_self()
 {
-    if (PvClock == nullptr)
+    if (pv_clock_ == nullptr)
         return false;
 
-    ulong idx = Lapic::GetApicId();
-    if (idx >= PvClockEntryCount)
+    ulong idx = Lapic::get_apic_id();
+    if (idx >= PV_CLOCK_ENTRY_COUNT)
     {
-        Trace(0, "TSC: apic id %lu exceeds pvclock entries", idx);
+        trace(0, "TSC: apic id %lu exceeds pvclock entries", idx);
         return false;
     }
 
     /* Write this entry's physical address | 1 (enable bit) to the MSR. KVM
        updates the entry only for the vcpu that wrote it. */
-    WriteMsr(KvmMsrSystemTime,
-             (PvClockPhys + idx * sizeof(PvClockVcpuTimeInfo)) | KvmMsrEnable);
+    write_msr(KVM_MSR_SYSTEM_TIME,
+             (pv_clock_phys_ + idx * sizeof(PvClockVcpuTimeInfo)) | KVM_MSR_ENABLE);
     return true;
 }
 
-Stdlib::Time Tsc::KvmClockTime()
+stdlib::Time Tsc::kvm_clock_time()
 {
     u32 version;
     u64 ns;
@@ -225,120 +225,120 @@ Stdlib::Time Tsc::KvmClockTime()
        interrupts enabled the task could be migrated between selecting the
        entry and executing rdtsc, mixing CPU A's parameters with CPU B's
        TSC. */
-    ulong irq = PreemptIrqSave();
+    ulong irq = preempt_irq_save();
 
-    PvClockVcpuTimeInfo* pv = &PvClock[Lapic::GetApicId() % PvClockEntryCount];
+    PvClockVcpuTimeInfo* pv = &pv_clock_[Lapic::get_apic_id() % PV_CLOCK_ENTRY_COUNT];
 
     do {
-        version = pv->Version;
-        Hal::SmpRmb();
+        version = pv->version;
+        hal::smp_rmb();
 
         /* Same-vcpu rdtsc cannot precede the entry's timestamp; if the host
            republishes the entry mid-read the version loop retries, so only
            avoid the transient huge unsigned delta. */
-        u64 now = ReadTsc();
-        u64 delta = (now >= pv->TscTimestamp) ? now - pv->TscTimestamp : 0;
-        if (pv->TscShift >= 0)
-            delta <<= pv->TscShift;
+        u64 now = read_tsc();
+        u64 delta = (now >= pv->tsc_timestamp) ? now - pv->tsc_timestamp : 0;
+        if (pv->tsc_shift >= 0)
+            delta <<= pv->tsc_shift;
         else
-            delta >>= (u8)(-pv->TscShift);
+            delta >>= (u8)(-pv->tsc_shift);
 
-        ns = pv->SystemTime +
-             (u64)(((__uint128_t)delta * pv->TscToSystemMul) >> 32);
+        ns = pv->system_time +
+             (u64)(((__uint128_t)delta * pv->tsc_to_system_mul) >> 32);
 
-        flags = pv->Flags;
-        Hal::SmpRmb();
-    } while ((pv->Version & 1) || pv->Version != version);
+        flags = pv->flags;
+        hal::smp_rmb();
+    } while ((pv->version & 1) || pv->version != version);
 
-    PreemptIrqRestore(irq);
+    preempt_irq_restore(irq);
 
     /* Without the stable bit (host left masterclock mode: live migration,
        host suspend, unstable host TSC) per-vcpu readings are not cross-CPU
        monotonic. Latch a global maximum so time never goes backwards --
        callers latch "now + timeout" deadlines, and a transient forward jump
        followed by correct readings would hang them forever. */
-    if ((flags & PvClockTscStableBit) == 0)
+    if ((flags & PV_CLOCK_TSC_STABLE_BIT) == 0)
     {
-        long seen = LastNs.Get();
+        long seen = last_ns_.get();
         while ((long)ns > seen)
         {
-            long old = LastNs.Cmpxchg((long)ns, seen);
+            long old = last_ns_.cmpxchg((long)ns, seen);
             if (old == seen)
-                return Stdlib::Time(ns);
+                return stdlib::Time(ns);
             seen = old;
         }
-        return Stdlib::Time((u64)seen);
+        return stdlib::Time((u64)seen);
     }
 
-    return Stdlib::Time(ns);
+    return stdlib::Time(ns);
 }
 
-Stdlib::Time Tsc::GetTime()
+stdlib::Time Tsc::get_time()
 {
-    if (KvmClockAvail)
-        return KvmClockTime();
+    if (kvm_clock_avail_)
+        return kvm_clock_time();
 
-    if (Calibrated)
-        return TscTime();
+    if (calibrated_)
+        return tsc_time();
 
-    return Stdlib::Time(0);
+    return stdlib::Time(0);
 }
 
-Stdlib::Time Tsc::TscTime()
+stdlib::Time Tsc::tsc_time()
 {
-    if (!Calibrated)
-        return Stdlib::Time(0);
+    if (!calibrated_)
+        return stdlib::Time(0);
 
-    u64 delta = ReadTsc() - BaseTsc;
+    u64 delta = read_tsc() - base_tsc_;
     /* ns = delta * 1000000000 / FreqHz
      * To avoid overflow: split into seconds + remainder */
-    u64 secs = delta / FreqHz;
-    u64 rem = delta % FreqHz;
-    u64 ns = secs * Const::NanoSecsInSec + rem * Const::NanoSecsInSec / FreqHz;
-    return Stdlib::Time(ns);
+    u64 secs = delta / freq_hz_;
+    u64 rem = delta % freq_hz_;
+    u64 ns = secs * consts::NANO_SECS_IN_SEC + rem * consts::NANO_SECS_IN_SEC / freq_hz_;
+    return stdlib::Time(ns);
 }
 
-u64 Tsc::ReadTscNow()
+u64 Tsc::read_tsc_now()
 {
-    return ReadTsc();
+    return read_tsc();
 }
 
-ulong Tsc::TscToNs(u64 deltaTsc)
+ulong Tsc::tsc_to_ns(u64 delta_tsc)
 {
-    if (!Calibrated || FreqHz == 0)
+    if (!calibrated_ || freq_hz_ == 0)
         return 0;
 
-    u64 secs = deltaTsc / FreqHz;
-    u64 rem = deltaTsc % FreqHz;
-    return (ulong)(secs * Const::NanoSecsInSec + rem * Const::NanoSecsInSec / FreqHz);
+    u64 secs = delta_tsc / freq_hz_;
+    u64 rem = delta_tsc % freq_hz_;
+    return (ulong)(secs * consts::NANO_SECS_IN_SEC + rem * consts::NANO_SECS_IN_SEC / freq_hz_);
 }
 
-ulong Tsc::ElapsedNs(u64 startTsc, u64 endTsc)
+ulong Tsc::elapsed_ns(u64 start_tsc, u64 end_tsc)
 {
-    if (endTsc <= startTsc)
+    if (end_tsc <= start_tsc)
         return 0;
 
-    return TscToNs(endTsc - startTsc);
+    return tsc_to_ns(end_tsc - start_tsc);
 }
 
-ulong Tsc::GetFreqHz()
+ulong Tsc::get_freq_hz()
 {
-    return FreqHz;
+    return freq_hz_;
 }
 
-bool Tsc::IsCalibrated()
+bool Tsc::is_calibrated()
 {
-    return Calibrated;
+    return calibrated_;
 }
 
-bool Tsc::IsInvariant()
+bool Tsc::is_invariant()
 {
-    return Invariant;
+    return invariant_;
 }
 
-bool Tsc::IsKvmClockAvailable()
+bool Tsc::is_kvm_clock_available()
 {
-    return KvmClockAvail;
+    return kvm_clock_avail_;
 }
 
 }

@@ -12,7 +12,7 @@
 #include <lib/ring_buffer.h>
 #include <lib/printer.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Cmd final
@@ -20,26 +20,26 @@ class Cmd final
     , public SerialObserver
 {
 public:
-    static Cmd& GetInstance()
+    static Cmd& get_instance()
     {
-        static Cmd Instance;
-        return Instance;
+        static Cmd instance;
+        return instance;
     }
 
-    virtual void OnChar(char c, u8 code) override;
+    virtual void on_char(char c, u8 code) override;
 
-    bool ShouldShutdown();
-    bool ShouldReboot();
+    bool should_shutdown();
+    bool should_reboot();
 
-    void RequestShutdown();
-    void RequestReboot();
+    void request_shutdown();
+    void request_reboot();
 
-    bool Start();
+    bool start();
 
-    void Stop();
-    void StopDhcp();
+    void stop();
+    void stop_dhcp();
 
-    static void Dispatch(const char *cmd, Stdlib::Printer& out);
+    static void dispatch(const char *cmd, stdlib::Printer& out);
 
     typedef void (*ScriptStep)(void* ctx);
 
@@ -49,36 +49,36 @@ public:
        is run so at boot (RunBootScript). False if the file cannot be read,
        or a script is running already: a script that ran itself would never
        end. */
-    bool RunScript(const char* path, Stdlib::Printer& out, ScriptStep step = nullptr,
-        void* stepCtx = nullptr);
+    bool run_script(const char* path, stdlib::Printer& out, ScriptStep step = nullptr,
+        void* step_ctx = nullptr);
 
     /* Held while /etc/rc is rewritten, one edit at a time */
-    Mutex& GetRcLock() { return RcLock; }
+    Mutex& get_rc_lock() { return rc_lock_; }
 
     /* Shell commands added at run time, by a loadable module through
        kernel_cmd_register. A call hands the handler its ctx, the rest of the
        command line after the name, and the Stdlib::Printer to answer on --
        opaque to the module, which writes to it with kernel_printer_write. */
-    typedef void (*DynamicHandler)(void* ctx, const char* args, ulong argsLen, void* out);
+    typedef void (*DynamicHandler)(void* ctx, const char* args, ulong args_len, void* out);
 
     /* A handle for UnregisterDynamic, or 0: the name is empty, too long or
        not one printable word, it is taken -- by a built-in command or by
        another module's -- or the table is full. The name and help are
        copied. */
-    ulong RegisterDynamic(const char* name, ulong nameLen, const char* help, ulong helpLen,
+    ulong register_dynamic(const char* name, ulong name_len, const char* help, ulong help_len,
         DynamicHandler handler, void* ctx);
 
     /* Returns once no call to the command is running and none can start:
        from then on its handler and ctx are the caller's to free. Sleeps while
        a call runs, so task context only -- and never from that command's own
        handler, which would wait for itself. */
-    void UnregisterDynamic(ulong handle);
+    void unregister_dynamic(ulong handle);
 
     /* The help lines of the commands added at run time */
-    void DynamicHelp(Stdlib::Printer& out);
+    void dynamic_help(stdlib::Printer& out);
 
 private:
-    bool DispatchDynamic(const char* cmd, Stdlib::Printer& out);
+    bool dispatch_dynamic(const char* cmd, stdlib::Printer& out);
 
     Cmd();
     ~Cmd();
@@ -87,54 +87,54 @@ private:
     Cmd& operator=(const Cmd& other) = delete;
     Cmd& operator=(Cmd&& other) = delete;
 
-    void ShowBanner(Stdlib::Printer& out);
+    void show_banner(stdlib::Printer& out);
 
     /* /etc/rc, run once the network is set up, what it prints going to the
        kernel log; rc=off skips it */
-    void RunBootScript();
+    void run_boot_script();
 
-    void Run();
-    static void RunFunc(void *ctx);
+    void run();
+    static void run_func(void *ctx);
 
     /* What is typed, a terminal's bytes, until the shell's task takes it */
-    Stdlib::RingBuffer<char, Const::PageSize> Buf;
-    LineEditor Editor;
-    SpinLock Lock;
-    Task *TaskPtr;
-    bool Shutdown;
-    bool Reboot;
-    bool Active;
-    bool ScriptRunning;     /* under Lock */
-    Mutex RcLock;
+    stdlib::RingBuffer<char, consts::PAGE_SIZE> buf_;
+    LineEditor editor_;
+    SpinLock lock_;
+    Task *task_ptr_;
+    bool shutdown_;
+    bool reboot_;
+    bool active_;
+    bool script_running_;     /* under Lock */
+    Mutex rc_lock_;
 
     /* Room for every command the kernel's own layers register -- the block,
        filesystem and network layers are Rust and put their own commands in
        front of whoever runs one -- and for a module's on top of those. */
-    static const ulong DynamicMax = 128;
-    static const ulong DynamicNameMax = 31;
-    static const ulong DynamicHelpMax = 95;
+    static const ulong DYNAMIC_MAX = 128;
+    static const ulong DYNAMIC_NAME_MAX = 31;
+    static const ulong DYNAMIC_HELP_MAX = 95;
     /* A handle is the slot index + 1 in its low bits, and a registration
        count above them, so a stale handle never names the slot's next user */
-    static const ulong DynamicSlotBits = 8;
-    static_assert(DynamicMax < (1UL << DynamicSlotBits), "slot must fit a handle");
-    static const ulong DynamicPollNs = Const::NanoSecsInMs;
+    static const ulong DYNAMIC_SLOT_BITS = 8;
+    static_assert(DYNAMIC_MAX < (1UL << DYNAMIC_SLOT_BITS), "slot must fit a handle");
+    static const ulong DYNAMIC_POLL_NS = consts::NANO_SECS_IN_MS;
 
     struct DynamicCmd
     {
-        ulong Handle;       /* 0: the slot is free */
-        char Name[DynamicNameMax + 1];
-        char Help[DynamicHelpMax + 1];
-        DynamicHandler Handler;
-        void* Ctx;
-        ulong Running;      /* calls in progress */
-        bool Removing;      /* no call may start */
+        ulong handle;       /* 0: the slot is free */
+        char name[DYNAMIC_NAME_MAX + 1];
+        char help[DYNAMIC_HELP_MAX + 1];
+        DynamicHandler handler;
+        void* ctx;
+        ulong running;      /* calls in progress */
+        bool removing;      /* no call may start */
     };
 
-    DynamicCmd Dynamic[DynamicMax];
-    ulong DynamicGeneration;
-    SpinLock DynamicLock;
+    DynamicCmd dynamic_[DYNAMIC_MAX];
+    ulong dynamic_generation_;
+    SpinLock dynamic_lock_;
 
-    static const ulong Tag = 'Cmd ';
+    static const ulong TAG = 'Cmd ';
 };
 
 }
