@@ -820,6 +820,16 @@ impl Vcpu {
         self.guest.fp_loads()
     }
 
+    /// The guest's MSRs the extension does not switch: its TSC_AUX and
+    /// IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &hvarch::x86::msrs::GuestMsrs {
+        self.guest.msrs()
+    }
+
+    pub fn msrs_mut(&mut self) -> &mut hvarch::x86::msrs::GuestMsrs {
+        self.guest.msrs_mut()
+    }
+
     /// Whether an event is queued for injection on the next entry.
     pub fn event_queued(&self) -> bool {
         self.guest.inject_valid()

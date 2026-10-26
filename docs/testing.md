@@ -1586,10 +1586,13 @@ user process's `stepi` once stopped its whole VM. Under VT-x the same --
 its DR6 the one the exit said, VT-x writing none at a #DB that exits, and
 its handler's `mov`s of DR6 answered by the host. And for
 `cr4`, through the same loop, that the guest read back each CR4 it wrote --
-MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that PKE, which
-its CPUID never offers, PAE cleared in long mode and bit 32 were each a
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that a bit its
+CPUID does not offer -- PKE where it is not offered PKU, CET where it is,
+which no guest is -- PAE cleared in long mode and bit 32 were each a
 #GP with no error code, CR4 as it was; and that the host performed all
-eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
+eleven of its accesses. The bit is PKE on a Zen 2 because the Zen 2
+refuses a write of CET itself, before its intercept, as it does bit 32:
+with CET, none of the three refusals reached the host there. On QEMU's TCG -- known by its hypervisor leaf's
 signature -- which checks a read of any control register against CR0's
 intercept and so stops no read of CR4, it holds the reads to the register
 instead, MCE in it, and the host to its five writes; its VMCB must ask for
@@ -1599,15 +1602,15 @@ read lost MCE at the first write. Under VT-x, which stops a guest at a
 write of CR4 only where it changes a bit the host keeps, and answers its
 reads from the read shadow, it holds the reads to the same CR4s, the CPU's
 to MCE kept and VMXE, and the host to three writes performed -- MCE
-cleared, PKE, bit 32 -- and two refused: PAE cleared in long mode is the
+cleared, PKE or CET, bit 32 -- and two refused: PAE cleared in long mode is the
 CPU's own #GP, and PGE set its own write. And for `msr`, through the same loop,
-that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
-which the policy names for no CPU, and MTRRs turned on, which nothing
-keeps, were each a #GP its own handler took -- in that order, with no
-error code, and in the host's count of five reads, three writes and four
-refusals; that MCG_CAP, MCG_STATUS and the PAT were answered; and that
-CPUID told it of no speculation control and no PMU, of no basic leaf past
-0x16, and of a hypervisor. Every MSR but the three segment bases comes to
+that AMD's VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer,
+AMD's LS_CFG, which the policy names for no CPU, and MTRRs turned on,
+which nothing keeps, were each a #GP its own handler took -- in that
+order, with no error code, and in the host's count of five reads, three
+writes and four refusals; that MCG_CAP, MCG_STATUS and the PAT were
+answered; and that CPUID told it of no VIRT_SSBD, no INVLPGB and no PMU,
+of no basic leaf past 0x16, and of a hypervisor. Every MSR but the three segment bases comes to
 the same policy on either backend, so it says the same under VT-x. A
 control build whose policy did not name MCG_STATUS failed it, a fifth #GP
 on both CPUs it ran on. And for `dr`, two VMs of one CPU each, one after
@@ -1643,15 +1646,53 @@ own under VT-x and on a Zen 2, 6 and 5 refused by the host accordingly;
 and that leaf 0xD gave the x87, SSE and AVX, the area's sizes 576 and 832,
 no XSAVES, and AVX's component at 576. Its second CPU turns its local APIC
 on first: it comes out of INIT software-disabled, and a guest that waits
-for an IPI there before it does waits for good. After both rounds `hv` must count at least two
+for an IPI there before it does waits for good. And for `tscaux`, two VMs
+of one CPU each, one after the other on the CPU the guests run on: that
+each was told RDTSCP, RDPID and INVPCID exactly as `hv info` says they run
+in a guest, RDTSCP everywhere; that the second read TSC_AUX as 0 by RDTSCP,
+RDPID and RDMSR as it started, where the first had left its own; that each
+read back the value it wrote every way it has, RDTSCP's TSC between two
+RDTSCs, and had a write of bit 32 refused, its value kept; that INVPCID's
+four types ran and a fifth was a #GP where it is offered -- the EX44's
+silicon -- and every one a #UD where not, QEMU's TCG and a Zen 2; and that
+the run loop saw its three RDMSRs and two WRMSRs and stopped it at no
+RDTSCP. And for `spec`, two VMs of one CPU each, one after the other on the
+CPU the guests run on: that each was offered exactly the speculation
+controls the host switches, as `hv info` says a guest has them -- none
+under QEMU's TCG, where every access to SPEC_CTRL and PRED_CMD has to be a
+#GP; that where SPEC_CTRL is offered the second read it as 0 as it
+started, where the first had left its own, each read back the bits it
+wrote, had bit 62 refused with its value kept, and ran under its bits over
+the host's, the CPU's the host's alone after its run; that where IBPB is
+offered each of the three it asked for was answered by a barrier before
+its next entry; and that PRED_CMD's read and bit 1 were each a #GP. On the
+AX41's Zen 2, under KVM, three control builds failed it: one that left
+the guest's bits out of the CPU's (it ran under the host's 0x2, not 0x6),
+one whose IBPB between two guest CPUs looked at the guest CPU alone and
+not at the IBPBs it asked for (three asked, none answered), and one that
+left the guest's bits in the host's after the exit. And for `pkru`, two CPUs
+of one guest whose tasks are both on the CPU the guests run on, taking
+turns by IPI as `avx`'s do: that each found RDPKRU a #UD with CR4.PKE
+clear; and where PKU is offered -- `hv info` says so, and QEMU's TCG and
+the EX44 have it, a Zen 2 not -- that each was told OSPKE only once its
+CR4.PKE was set, that its XCR0 was its own, PKRU in the first's and not in
+the second's, that leaf 0xD gave PKRU's component as the host has it and
+the area's sizes for each XCR0, that PKRU was 0 as it started though the
+other's was in the CPU's register, and that at every one of its 64 turns
+it found its own as it left it, put back each time the other had had the
+CPU -- whatever its XCR0 says of PKRU. A control build that never loaded a
+guest's PKRU failed it under QEMU's TCG: the second CPU found the first's
+as it started. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
 QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
 otherwise steer the host's branches or returns on -- the AX41's Zen 2,
 under KVM -- that is the IBPB after every exit, issued at least once a
-switch. And where `hv on` set IA32_SPEC_CTRL -- under VT-x, its IBRS; under
-AMD-V, STIBP, for which the machine's cores have two threads each -- every
-CPU's register, read back, must still have it. Every guest ran through the run stub's clearing of the
+switch -- between two guest CPUs, two CPUs of one guest that share a CPU
+among them, as `avx`'s do. And where the CPU has IA32_SPEC_CTRL every CPU's
+register, read back, must be what the host runs with there: what `hv on`
+set -- under VT-x, its IBRS; under AMD-V, STIBP, for which the machine's
+cores have two threads each -- and none of a guest's bits left over it. Every guest ran through the run stub's clearing of the
 registers and refill of the return stack after each exit. The unload that
 follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.

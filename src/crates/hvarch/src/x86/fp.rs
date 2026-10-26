@@ -20,9 +20,18 @@
 //! but can as soon as it sets it, are never another guest's. They are saved
 //! as the guest's XCR0 has them: what XCR0 leaves out the guest cannot have
 //! changed -- an AVX instruction faults without it, an SSE one leaves the
-//! upper halves alone -- and the area still holds it. Nothing above AVX is
-//! switched or offered -- AVX-512, AMX, PKRU, CET -- so none of that state
-//! is ever in a guest's reach.
+//! upper halves alone -- and the area still holds it. Of what is above AVX, PKRU
+//! alone is switched (below); AVX-512, AMX and CET are neither switched nor
+//! offered, so none of that state is ever in a guest's reach.
+//!
+//! PKRU, the protection keys' rights, is switched by RDPKRU after every
+//! exit and WRPKRU where the CPU holds another guest's -- not through the
+//! area: a guest changes it by WRPKRU whatever its XCR0 says, and an XSAVE
+//! under an XCR0 without it would leave it out. Both need CR4.PKE, which is
+//! set beside OSXSAVE while the extension is on, where the CPU has PKU; it
+//! changes nothing this kernel does, whose pages are supervisor pages all,
+//! to which protection keys do not apply. PKRU is in XCR0's components a
+//! guest is offered ([`offered`]), and its own XCR0 may have it or not.
 //!
 //! This kernel boots with CR4.OSFXSR and CR4.OSXSAVE clear and never sets
 //! them: its C++ is built without SSE and its Rust is soft-float, so an SSE
@@ -98,16 +107,28 @@ fn registers_loaded(cpu: u32, id: u64) {
 }
 
 /// XCR0's components, as far as a guest is given them: the x87; SSE's XMM
-/// registers and MXCSR; AVX's upper halves of the YMM registers.
+/// registers and MXCSR; AVX's upper halves of the YMM registers; PKRU.
 pub const XCR0_X87: u64 = 1 << 0;
 pub const XCR0_SSE: u64 = 1 << 1;
 pub const XCR0_AVX: u64 = 1 << 2;
+pub const XCR0_PKRU: u64 = 1 << 9;
+/// What of those the area holds: PKRU it never does, switched by RDPKRU and
+/// WRPKRU instead.
+const AREA_COMPONENTS: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
 
-/// CPUID's leaf of XSAVE's components, and its subleaf of AVX's.
+/// CPUID's leaf of XSAVE's components, and its subleaves of AVX's and
+/// PKRU's; PKRU's size.
 const LEAF_XSAVE: u32 = 0xD;
 const SUBLEAF_AVX: u32 = 2;
+const SUBLEAF_PKRU: u32 = 9;
+const PKRU_BYTES: u32 = 8;
 /// Leaf 1 ECX: AVX.
 const ECX_AVX: u32 = 1 << 28;
+/// Leaf 7 ECX: PKU, RDPKRU and WRPKRU and protection keys.
+const LEAF_STRUCTURED: u32 = 7;
+const ECX7_PKU: u32 = 1 << 3;
+/// CR4.PKE: protection keys on, RDPKRU and WRPKRU with them.
+const CR4_PKE: u64 = 1 << 22;
 /// Leaf 0xD, subleaf 1, EAX: XSAVES, and IA32_XSS with it.
 const EAX_XSAVES: u32 = 1 << 3;
 /// IA32_XSS: the supervisor components XSAVES and XRSTORS move.
@@ -168,8 +189,9 @@ impl Area {
 /// The XCR0 components the CPU this runs on can keep a guest's registers
 /// in: the x87 and SSE where it has XSAVE -- every CPU with XSAVE has both --
 /// and AVX with them where it has that too, laid out where the area has
-/// room for it. 0 where it has no XSAVE: its guests have FXSAVE's registers
-/// alone.
+/// room for it; and PKRU where it has PKU and XCR0 takes it, switched apart
+/// from the area. 0 where it has no XSAVE: its guests have FXSAVE's
+/// registers alone.
 fn supported() -> u64 {
     const LEAF_FEATURES: u32 = 1;
     let Some(features) = cpu::cpuid(LEAF_FEATURES) else { return 0 };
@@ -184,7 +206,15 @@ fn supported() -> u64 {
     let avx_fits = cpu::cpuid_count(LEAF_XSAVE, SUBLEAF_AVX)
         .map_or(false, |c| c.ebx as usize == AVX_OFFSET && c.eax as usize == AVX_BYTES);
     let avx = features.ecx & ECX_AVX != 0 && has & XCR0_AVX != 0 && avx_fits;
-    XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 }
+    /* PKRU where the CPU has PKU and XCR0 takes it -- and its component is
+     * as every CPU with it has it, 8 bytes past AVX's, what the guest is told
+     * of it in leaf 0xD being the host's. */
+    let pkru_fits = cpu::cpuid_count(LEAF_XSAVE, SUBLEAF_PKRU)
+        .map_or(false, |c| c.eax == PKRU_BYTES && c.ebx as usize >= AREA_BYTES);
+    let pkru = has & XCR0_PKRU != 0
+        && pkru_fits
+        && cpu::cpuid_count(LEAF_STRUCTURED, 0).map_or(false, |c| c.ecx & ECX7_PKU != 0);
+    XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 } | if pkru { XCR0_PKRU } else { 0 }
 }
 
 /// Whether the CPU this runs on has XSAVES, and so IA32_XSS.
@@ -213,9 +243,10 @@ pub fn offered() -> u64 {
 }
 
 /// Per CPU: the XCR0 its guests' registers are put back under -- what it
-/// keeps of them, [`supported`] there -- or 0 where it has no XSAVE, or the
-/// extension is off. Written by `on` and `off` on that CPU with interrupts
-/// off, and read by its entries, with interrupts off.
+/// keeps of them, [`supported`] there, PKRU among them where it switches
+/// that -- or 0 where it has no XSAVE, or the extension is off. Written by
+/// `on` and `off` on that CPU with interrupts off, and read by its entries,
+/// with interrupts off.
 static MASK: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 fn mask(cpu: u32) -> u64 {
@@ -239,7 +270,8 @@ static SAVED_STATE: [Saved; MAX_CPUS] = [const {
 }; MAX_CPUS];
 
 /// Set `CR4.OSFXSR`, and `CR4.OSXSAVE` where there is XSAVE, on the CPU this
-/// runs on; make its XCR0 what its guests' registers are put back under, and
+/// runs on, and `CR4.PKE` where it switches PKRU, for RDPKRU and WRPKRU;
+/// make its XCR0 what its guests' registers are put back under, and
 /// its IA32_XSS 0 -- a guest's XSAVES and XRSTORS, which AMD-V does not stop
 /// and no CPUID of a guest's offers, would move the supervisor components it
 /// names, the host's, and on Intel's processor trace load its MSRs -- all
@@ -252,20 +284,22 @@ pub unsafe fn on() {
     let cpu = kcore::cpu::id() as usize;
     let (Some(saved), Some(slot)) = (SAVED_STATE.get(cpu), MASK.get(cpu)) else { return };
     let xsave = cpu::has_xsave();
+    let mask = if xsave { supported() } else { 0 };
     let cr4 = cpu::read_cr4();
-    let wanted = cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
+    let wanted = cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 }
+        | if mask & XCR0_PKRU != 0 { CR4_PKE } else { 0 };
     unsafe { cpu::write_cr4(cr4 | wanted) };
     saved.cr4_added.store(wanted & !cr4, Ordering::Relaxed);
     if !xsave {
         slot.store(0, Ordering::Relaxed);
         return;
     }
-    let mask = supported();
     /* With no switch of the SSE component -- no CPU with XSAVE lacks it --
-     * guests keep to FXSAVE's registers, and XCR0 to the x87 alone. */
+     * guests keep to FXSAVE's registers, and XCR0 to the x87 alone. The
+     * XCR0 of the area's components, PKRU not among them. */
     let xcr0 = unsafe { cpu::xgetbv0() };
     saved.xcr0.store(xcr0 | SAVED, Ordering::Relaxed);
-    unsafe { set_xcr0(if mask != 0 { mask } else { XCR0_X87 }) };
+    unsafe { set_xcr0(if mask != 0 { mask & AREA_COMPONENTS } else { XCR0_X87 }) };
     if has_xsaves() {
         let xss = unsafe { cpu::rdmsr(MSR_XSS) };
         if xss != 0 {
@@ -315,12 +349,15 @@ unsafe fn set_xcr0(value: u64) {
     }
 }
 
-/// A guest CPU's x87, SSE and AVX registers and its XCR0: what an entry
-/// puts into the CPU ([`GuestFp::load`]) and its exit takes back out
+/// A guest CPU's x87, SSE and AVX registers, its PKRU and its XCR0: what an
+/// entry puts into the CPU ([`GuestFp::load`]) and its exit takes back out
 /// ([`GuestFp::save`]).
 pub struct GuestFp {
     /// One element, on the heap: a `Vec` because it can be made fallibly.
     area: Vec<Area>,
+    /// Its PKRU, 0 out of reset -- INIT leaves it -- where the CPU switches
+    /// it.
+    pkru: u32,
     /// The guest's XCR0: the x87 alone out of reset, and what its XSETBVs
     /// were let make it since ([`GuestFp::set_xcr0`]). INIT leaves it.
     xcr0: u64,
@@ -335,7 +372,7 @@ impl GuestFp {
         let mut area = Vec::new();
         area.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
         area.push(Area::reset());
-        Ok(Self { area, xcr0: XCR0_X87, id: owner_id(), loads: 0 })
+        Ok(Self { area, pkru: 0, xcr0: XCR0_X87, id: owner_id(), loads: 0 })
     }
 
     pub fn xcr0(&self) -> u64 {
@@ -344,9 +381,10 @@ impl GuestFp {
 
     /// Make `value` the guest's XCR0, for an XSETBV of it the run loop
     /// performs -- if it is one a CPU offering [`offered`] takes: the x87 in
-    /// it, AVX only with SSE, and nothing else. False otherwise, the XCR0 as
-    /// it was: the #GP a CPU raises. What an entry makes XCR0 is never
-    /// anything this did not take, so no XSETBV of the host's faults.
+    /// it, AVX only with SSE, PKRU with anything, and nothing else. False
+    /// otherwise, the XCR0 as it was: the #GP a CPU raises. What an entry
+    /// makes XCR0 is never anything this did not take, so no XSETBV of the
+    /// host's faults.
     pub fn set_xcr0(&mut self, value: u64) -> bool {
         let valid = value & XCR0_X87 != 0
             && value & !offered() == 0
@@ -367,6 +405,10 @@ impl GuestFp {
     /// switches every component of -- the x87 alone on a CPU without XSAVE.
     /// Asked with interrupts off on `cpu`, before anything of the entry is
     /// done.
+    ///
+    /// A guest on a CPU that switches PKRU has its own whatever its XCR0
+    /// says; on one that does not, its CPUID offers no PKU, its CR4.PKE is
+    /// refused, and it has no WRPKRU.
     pub fn fits(&self, cpu: u32) -> bool {
         match mask(cpu) {
             0 => self.xcr0 == XCR0_X87,
@@ -387,18 +429,24 @@ impl GuestFp {
                 let area: *const Area = &self.area[0];
                 unsafe { asm!("fxrstor64 [{}]", in(reg) area, options(nostack, preserves_flags)) };
             } else {
-                /* Under XCR0 the whole of what this CPU switches, the guest's
-                 * own state or the initial one in every register of it. A
-                 * component the area says it holds that this CPU does not
-                 * switch would be a #GP: no save on this CPU sets one, and
-                 * it is none the guest can reach here. */
-                unsafe { set_xcr0(mask) };
+                /* Under XCR0 the whole of what this CPU switches through the
+                 * area, the guest's own state or the initial one in every
+                 * register of it. A component the area says it holds that
+                 * this CPU does not switch would be a #GP: no save on this
+                 * CPU sets one, and it is none the guest can reach here. */
+                let area_mask = mask & AREA_COMPONENTS;
+                unsafe { set_xcr0(area_mask) };
                 let bv = self.area[0].xstate_bv();
-                self.area[0].set_xstate_bv(bv & mask);
+                self.area[0].set_xstate_bv(bv & area_mask);
                 let area: *const Area = &self.area[0];
                 unsafe {
-                    asm!("xrstor64 [{}]", in(reg) area, in("eax") mask as u32, in("edx") (mask >> 32) as u32,
-                         options(nostack, preserves_flags));
+                    asm!("xrstor64 [{}]", in(reg) area, in("eax") area_mask as u32,
+                         in("edx") (area_mask >> 32) as u32, options(nostack, preserves_flags));
+                }
+                if mask & XCR0_PKRU != 0 {
+                    /* CR4.PKE is set for this CPU (`on`), and ECX and EDX 0
+                     * are what WRPKRU wants of them. */
+                    unsafe { asm!("wrpkru", in("eax") self.pkru, in("ecx") 0, in("edx") 0, options(nostack, nomem)) };
                 }
             }
             registers_loaded(cpu, self.id);
@@ -410,19 +458,25 @@ impl GuestFp {
     }
 
     /// Take the guest's registers back out of CPU `cpu` after its exit: what
-    /// its XCR0 names, which is all it can have changed -- by FXSAVE where
-    /// that is the x87 alone, since the SSE registers are the guest's to use
-    /// whatever its XCR0 says, and an XSAVE under it would leave them out.
+    /// its XCR0 names of the area's, which is all of those it can have
+    /// changed -- by FXSAVE where that is the x87 alone, since the SSE
+    /// registers are the guest's to use whatever its XCR0 says, and an XSAVE
+    /// under it would leave them out -- and its PKRU, where the CPU switches
+    /// it, which its WRPKRU changes whatever its XCR0 says.
     ///
     /// # Safety
     /// On `cpu`, interrupts off since the [`GuestFp::load`] before the entry,
     /// and nothing since then has written XCR0.
     pub unsafe fn save(&mut self, cpu: u32) {
-        let xsave = mask(cpu) != 0;
+        let mask = mask(cpu);
+        let xsave = mask != 0;
         let area: *mut Area = &mut self.area[0];
         if xsave && self.xcr0 & XCR0_SSE != 0 {
+            /* What its XCR0 names of the area's: not PKRU, which XSAVE would
+             * write past the area, at its own offset. */
+            let rfbm = self.xcr0 & AREA_COMPONENTS;
             unsafe {
-                asm!("xsave64 [{}]", in(reg) area, in("eax") self.xcr0 as u32, in("edx") (self.xcr0 >> 32) as u32,
+                asm!("xsave64 [{}]", in(reg) area, in("eax") rfbm as u32, in("edx") (rfbm >> 32) as u32,
                      options(nostack, preserves_flags));
             }
         } else {
@@ -432,6 +486,13 @@ impl GuestFp {
                 let bv = self.area[0].xstate_bv();
                 self.area[0].set_xstate_bv(bv | XCR0_X87 | XCR0_SSE);
             }
+        }
+        if mask & XCR0_PKRU != 0 {
+            /* CR4.PKE is set for this CPU (`on`), and ECX 0 is what RDPKRU
+             * wants of it. */
+            let pkru: u32;
+            unsafe { asm!("rdpkru", out("eax") pkru, in("ecx") 0, out("edx") _, options(nostack, nomem)) };
+            self.pkru = pkru;
         }
     }
 }

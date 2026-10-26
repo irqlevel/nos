@@ -17,6 +17,7 @@ use kcore::percpu::ConstInit;
 
 use super::cpu;
 use super::fp::GuestFp;
+use super::msrs::GuestMsrs;
 use crate::{Error, Result};
 
 pub mod vmcb;
@@ -44,6 +45,10 @@ pub const PAUSE_THRESHOLD: u32 = 1 << 12;
 pub const AVIC: u32 = 1 << 13;
 pub const VMSAVE_VIRT: u32 = 1 << 15;
 pub const VGIF: u32 = 1 << 16;
+/// `vmrun` loads the guest's IA32_SPEC_CTRL from the VMCB (`Save::spec_ctrl`)
+/// and the `#vmexit` puts the host's back: there is no turning it off, and a
+/// CPU that has it runs a guest under the VMCB's value whatever the MSR held.
+pub const V_SPEC_CTRL: u32 = 1 << 20;
 pub const VNMI: u32 = 1 << 24;
 
 /// The features worth a line in a report, and why each matters here. The
@@ -163,9 +168,12 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
         return Err(Error::EnableFailed);
     }
     /* The host's x87, SSE and AVX control bits as every entry wants them,
-     * once, and IA32_XSS out of a guest's XSAVES's reach (`super::fp`); and
-     * what keeps a guest's speculation off the host's (`super::spec`). */
+     * once, and IA32_XSS out of a guest's XSAVES's reach (`super::fp`);
+     * what the CPU holds in TSC_AUX, for the entries to load over
+     * (`super::msrs`); and what keeps a guest's speculation off the host's
+     * (`super::spec`). */
     unsafe { super::fp::on() };
+    unsafe { super::msrs::on() };
     unsafe { super::spec::on(false) };
     Ok(())
 }
@@ -179,6 +187,7 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
 pub unsafe fn disable() {
     /* What `enable` set for the entries: nothing, on a CPU it never ran on. */
     unsafe { super::spec::off() };
+    unsafe { super::msrs::off() };
     unsafe { super::fp::off() };
     /* KVM's order: the address, then the enable bit. Either order has a
      * window -- SVM on with no save area, or SVM off still naming the page
@@ -705,8 +714,8 @@ pub struct Profile {
 
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
-/// wait in while the guest runs, the x87, SSE and AVX state and XCR0, and
-/// the breakpoint addresses.
+/// wait in while the guest runs, the x87, SSE and AVX state and XCR0,
+/// TSC_AUX, and the breakpoint addresses.
 pub struct Guest {
     vmcb: VmcbPage,
     host: VmcbPage,
@@ -717,6 +726,8 @@ pub struct Guest {
     debug_addrs: [u64; 4],
     /// Its x87, SSE and AVX registers and its XCR0 (`super::fp`).
     fp: GuestFp,
+    /// Its TSC_AUX (`super::msrs`).
+    msrs: GuestMsrs,
     /// The ASID it last entered under, and where that came from; None until
     /// its first entry.
     asid: Option<AsidTag>,
@@ -734,6 +745,7 @@ impl Guest {
             regs: GuestRegs::default(),
             debug_addrs: [0; 4],
             fp: GuestFp::new()?,
+            msrs: GuestMsrs::new(),
             asid: None,
             flush_always: false,
             profile: None,
@@ -785,6 +797,16 @@ impl Guest {
     /// that held another guest's.
     pub fn fp_loads(&self) -> u64 {
         self.fp.loads()
+    }
+
+    /// The guest's MSRs the extension does not switch (`super::msrs`): its
+    /// TSC_AUX and IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &GuestMsrs {
+        &self.msrs
+    }
+
+    pub fn msrs_mut(&mut self) -> &mut GuestMsrs {
+        &mut self.msrs
     }
 
     pub fn vmcb(&self) -> &Vmcb {
@@ -888,6 +910,7 @@ impl Guest {
         let host = self.host.phys();
         let regs: *mut GuestRegs = &mut self.regs;
         let fp = &mut self.fp;
+        let msrs = &mut self.msrs;
         let debug_addrs = self.debug_addrs;
         let flush_always = self.flush_always;
         let tag = &mut self.asid;
@@ -947,16 +970,35 @@ impl Guest {
              * held above, with interrupts off since. */
             let t1 = stamp(timed);
             unsafe { fp.load(cpu) };
+            /* TSC_AUX the guest's likewise, for its RDTSCP and RDPID: put
+             * there where the CPU holds another's, and left after the exit,
+             * which no read of the host's needs. */
+            unsafe { msrs.load(cpu) };
             /* The breakpoint addresses are the guest's from here on, armed
              * by its own DR7 once `vmrun` loads it. The host's DR7 enables
              * none: nothing in this kernel writes it, and the `#vmexit` of
              * any earlier entry here left it with all four off. */
             unsafe { entries.debug_addrs.load(&debug_addrs) };
-            /* Another guest than the last on this CPU: the predictors it
-             * trained are not to steer this one (`super::spec`). */
-            entries.spec.entering(nested.id);
+            /* Another guest CPU than the last on this CPU, or this one
+             * after an IBPB it asked for: the predictors trained before are
+             * not to steer it (`super::spec`). */
+            if entries.spec.entering(msrs.id(), msrs.ibpbs()) {
+                msrs.barrier();
+            }
             let speculation = entries.spec.svm_entry();
             let flags = if speculation.ibpb_exit() { RUN_IBPB } else { 0 };
+            /* Its IA32_SPEC_CTRL over the host's: through the VMCB on a CPU
+             * with virtual SPEC_CTRL, whose `vmrun` loads it from there and
+             * whose exit puts the host's back; in the MSR otherwise, put
+             * back after the exit (`super::spec`). */
+            let spec_ctrl = match entries.spec.vmcb_spec_ctrl(msrs.spec_ctrl()) {
+                Some(value) => {
+                    vmcb.get_mut().save.spec_ctrl = value;
+                    Some(value)
+                }
+                None => entries.spec.load_guest(msrs.spec_ctrl()),
+            };
+            msrs.ran(spec_ctrl);
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, the checks above are the rest of what the stub needs,
@@ -967,6 +1009,7 @@ impl Guest {
             if flags & RUN_IBPB != 0 {
                 speculation.count_exit_barrier(cpu);
             }
+            entries.spec.exited(false);
             if let Some(k) = kick {
                 k.left();
             }
