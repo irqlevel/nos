@@ -2,14 +2,14 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class IdtDescriptor final
 {
 public:
     IdtDescriptor();
-    IdtDescriptor(u64 lowPart, u64 highPart);
+    IdtDescriptor(u64 low_part, u64 high_part);
 
     ~IdtDescriptor();
 
@@ -20,23 +20,23 @@ public:
     IdtDescriptor& operator=(const IdtDescriptor& other);
 
     /* ist 1..7 selects a TSS IST stack for the gate; 0 = no stack switch */
-    static IdtDescriptor Encode(u64 offset, u16 selector, u8 type, u8 ist = 0);
-    static IdtDescriptor Encode(void (*handlerFn)(), u8 ist = 0);
+    static IdtDescriptor encode(u64 offset, u16 selector, u8 type, u8 ist = 0);
+    static IdtDescriptor encode(void (*handler_fn)(), u8 ist = 0);
 
 private:
-    u64 LowPart;
-    u64 HighPart;
+    u64 low_part_;
+    u64 high_part_;
 
-    static const u8 FlagPresent = (1 << 7);
-    static const u8 FlagDPL0 = 0;
-    static const u8 FlagDPL1 = (1 << 5);
-    static const u8 FlagDPL2 = (1 << 6);
-    static const u8 FlagDPL3 = (1 << 5) | (1 << 6);
-    static const u8 FlagGateTask80386_32 = 0x5;
-    static const u8 FlagGateInterrupt80286_16 = 0x6;
-    static const u8 FlagGateTrap80286_16 = 0x7;
-    static const u8 FlagGateInterrupt80386_32 = 0xE;
-    static const u8 FlagGateTrap80386_32 = 0xF;
+    static const u8 FLAG_PRESENT = (1 << 7);
+    static const u8 FLAG_DPL0 = 0;
+    static const u8 FLAG_DPL1 = (1 << 5);
+    static const u8 FLAG_DPL2 = (1 << 6);
+    static const u8 FLAG_DPL3 = (1 << 5) | (1 << 6);
+    static const u8 FLAG_GATE_TASK80386_32 = 0x5;
+    static const u8 FLAG_GATE_INTERRUPT80286_16 = 0x6;
+    static const u8 FLAG_GATE_TRAP80286_16 = 0x7;
+    static const u8 FLAG_GATE_INTERRUPT80386_32 = 0xE;
+    static const u8 FLAG_GATE_TRAP80386_32 = 0xF;
 };
 
 }

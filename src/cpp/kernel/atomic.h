@@ -2,7 +2,7 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Atomic final
@@ -14,25 +14,25 @@ public:
        Plain initialisation, not Set(): nothing can see the object before
        its constructor returns. */
     constexpr Atomic()
-        : Value(0)
+        : value_(0)
     {
     }
 
     constexpr Atomic(long value)
-        : Value(value)
+        : value_(value)
     {
     }
-    void Inc();
-    void Dec();
-    void Add(long delta);
-    bool DecAndTest();
-    long Get();
-    void Set(long value);
-    bool SetBit(ulong bit);
-    bool ClearBit(ulong bit);
-    bool TestBit(ulong bit);
+    void inc();
+    void dec();
+    void add(long delta);
+    bool dec_and_test();
+    long get();
+    void set(long value);
+    bool set_bit(ulong bit);
+    bool clear_bit(ulong bit);
+    bool test_bit(ulong bit);
 
-    long Cmpxchg(long exchange, long comparand);
+    long cmpxchg(long exchange, long comparand);
 
     ~Atomic() = default;
 
@@ -43,7 +43,7 @@ private:
     Atomic(const Atomic& other) = delete;
     Atomic& operator=(const Atomic& other) = delete;
 
-    volatile long Value;
+    volatile long value_;
 };
 
 static_assert(sizeof(Atomic) == sizeof(long), "Invalid size");

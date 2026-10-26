@@ -25,11 +25,11 @@ void rust_netconsole_panic_flush();
 void rust_disklog_panic_flush();
 }
 
-namespace Kernel
+namespace kernel
 {
 
 Panicker::Panicker()
-    : ProbeCpu(-1)
+    : probe_cpu_(-1)
 {
 }
 
@@ -37,9 +37,9 @@ Panicker::~Panicker()
 {
 }
 
-bool Panicker::IsActive()
+bool Panicker::is_active()
 {
-    return (Active.Get() != 0) ? true : false;
+    return (active_.get() != 0) ? true : false;
 }
 
 /* After the report: on the screen, the serial port and -- flushed by the
@@ -47,34 +47,34 @@ bool Panicker::IsActive()
    which takes no lock and wants no interrupt; before the counter is
    calibrated, at once. Only the CPU whose report it is: the others are
    halted. */
-void Panicker::ResetIfAsked()
+void Panicker::reset_if_asked()
 {
-    ulong secs = Parameters::GetInstance().GetPanicResetSecs();
+    ulong secs = Parameters::get_instance().get_panic_reset_secs();
     if (secs == 0)
         return;
 
     char buf[96];
-    Stdlib::SnPrintf(buf, sizeof(buf), "panic: resetting the machine in %lu s (panic=%lu)\n", secs, secs);
-    PrintOutput(buf);
+    stdlib::sn_printf(buf, sizeof(buf), "panic: resetting the machine in %lu s (panic=%lu)\n", secs, secs);
+    print_output(buf);
 
-    ulong hz = Hal::CycleCounterHz();
+    ulong hz = hal::cycle_counter_hz();
     if (hz != 0)
     {
-        u64 start = Hal::ReadCycleCounter();
+        u64 start = hal::read_cycle_counter();
         u64 wait = (u64)secs * hz;
-        while (Hal::ReadCycleCounter() - start < wait)
-            Pause();
+        while (hal::read_cycle_counter() - start < wait)
+            cpu_relax();
     }
-    Hal::ResetNow();
+    hal::reset_now();
 }
 
-void Panicker::PrintOutput(const char* str)
+void Panicker::print_output(const char* str)
 {
-    Hal::ConsolePanicWrite(str);
+    hal::console_panic_write(str);
 
     /* Also into the netconsole ring; PanicFlush() below pushes it out while
        the machine still can. */
-    rust_netconsole_log(str, Stdlib::StrLen(str));
+    rust_netconsole_log(str, stdlib::str_len(str));
 
     /* And into the disk log's, for its PanicFlush(): on a machine with no
        serial port and no network yet the disk is the only place the report
@@ -82,121 +82,121 @@ void Panicker::PrintOutput(const char* str)
     rust_disklog_log(str);
 }
 
-void Panicker::DumpContext()
+void Panicker::dump_context()
 {
     char buf[128];
 
     /* CPU ID — safe if LAPIC is mapped */
-    if (Hal::IrqChipReady())
+    if (hal::irq_chip_ready())
     {
-        ulong cpuId = CpuTable::GetInstance().GetCurrentCpuId();
-        Stdlib::SnPrintf(buf, sizeof(buf), "CPU: %lu\n", cpuId);
-        PrintOutput(buf);
+        ulong cpu_id = CpuTable::get_instance().get_current_cpu_id();
+        stdlib::sn_printf(buf, sizeof(buf), "CPU: %lu\n", cpu_id);
+        print_output(buf);
     }
 
     /* Task — use TryGetCurrentTask to avoid BugOn/recursive panic */
-    Task* task = Task::TryGetCurrentTask();
+    Task* task = Task::try_get_current_task();
     if (task != nullptr)
     {
-        Stdlib::SnPrintf(buf, sizeof(buf), "Task: pid %lu name %s\n",
-            task->Pid, task->GetName());
-        PrintOutput(buf);
+        stdlib::sn_printf(buf, sizeof(buf), "Task: pid %lu name %s\n",
+            task->pid_, task->get_name());
+        print_output(buf);
     }
 }
 
-void Panicker::DumpBacktrace(ulong* frames, size_t count)
+void Panicker::dump_backtrace(ulong* frames, size_t count)
 {
-    char where[SymbolTable::DescribeMax];
-    char buf[SymbolTable::DescribeMax + 32];
-    auto& symtab = SymbolTable::GetInstance();
+    char where[SymbolTable::DESCRIBE_MAX];
+    char buf[SymbolTable::DESCRIBE_MAX + 32];
+    auto& symtab = SymbolTable::get_instance();
 
-    PrintOutput("Backtrace:\n");
+    print_output("Backtrace:\n");
     for (size_t i = 0; i < count; i++)
     {
-        if (symtab.DescribeReturn(frames[i], where, sizeof(where)))
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n",
+        if (symtab.describe_return(frames[i], where, sizeof(where)))
+            stdlib::sn_printf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n",
                 (ulong)i, frames[i], where);
         else
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX\n",
+            stdlib::sn_printf(buf, sizeof(buf), "  [%lu] 0x%lX\n",
                 (ulong)i, frames[i]);
-        PrintOutput(buf);
+        print_output(buf);
     }
 }
 
 /* Where each loaded module sits, so a frame nothing could name -- or one read
    off a log later -- can still be placed */
-void Panicker::DumpModules()
+void Panicker::dump_modules()
 {
-    static const ulong LineMax = 256;
-    char list[LineMax];
-    char buf[LineMax + 16];
+    static const ulong LINE_LEN_MAX = 256;
+    char list[LINE_LEN_MAX];
+    char buf[LINE_LEN_MAX + 16];
 
-    if (!ModuleTable::GetInstance().DescribeAll(list, sizeof(list)))
+    if (!ModuleTable::get_instance().describe_all(list, sizeof(list)))
         return;
 
-    Stdlib::SnPrintf(buf, sizeof(buf), "Modules: %s\n", list);
-    PrintOutput(buf);
+    stdlib::sn_printf(buf, sizeof(buf), "Modules: %s\n", list);
+    print_output(buf);
 }
 
-bool Panicker::CollectRemoteStack()
+bool Panicker::collect_remote_stack()
 {
-    if (Collecting.Get() == 0)
+    if (collecting_.get() == 0)
         return false;
 
-    ulong index = Hal::GetCurrentCpuHwId();
-    if (index >= RemoteCpuCount)
+    ulong index = hal::get_current_cpu_hw_id();
+    if (index >= REMOTE_CPU_COUNT)
         return false;
 
-    if (RemoteDone[index].Cmpxchg(1, 0) != 0)
+    if (remote_done_[index].cmpxchg(1, 0) != 0)
         return true; /* already recorded; still not our NMI to panic about */
 
     /* Walked from here: the frame pointer chain crosses the interrupt entry
        (the kernel is built with -fno-omit-frame-pointer), so this stack ends
        in whatever the CPU was doing when the NMI arrived -- which is the
        whole point of asking. */
-    size_t count = StackTrace::Capture(RemoteFrame[index], RemoteFrameCount);
-    RemoteCount[index] = (u8)count;
+    size_t count = StackTrace::capture(remote_frame_[index], REMOTE_FRAME_COUNT);
+    remote_count_[index] = (u8)count;
 
-    Hal::SmpWmb();
-    RemoteDone[index].Set(2);
+    hal::smp_wmb();
+    remote_done_[index].set(2);
     return true;
 }
 
-void Panicker::RecoverFault()
+void Panicker::recover_fault()
 {
-    long probe = ProbeCpu.Get();
-    if (probe < 0 || Active.Get() == 0)
+    long probe = probe_cpu_.get();
+    if (probe < 0 || active_.get() == 0)
         return;
 
     /* Which CPU this is, only once it can be asked: before the interrupt
        controller is up the boot CPU is the only one, and on x86 the asking
        is a read of the local APIC, not mapped yet -- a fault of its own */
-    if (Hal::IrqChipReady() && probe != (long)Hal::GetCurrentCpuHwId())
+    if (hal::irq_chip_ready() && probe != (long)hal::get_current_cpu_hw_id())
         return;
 
-    ProbeCpu.Set(-1);
-    LongJmp(&ProbeJump, 1);
+    probe_cpu_.set(-1);
+    long_jmp(&probe_jump_, 1);
 }
 
-void Panicker::CollectRemoteStacks()
+void Panicker::collect_remote_stacks()
 {
-    static_assert(RemoteCpuCount == MaxCpus, "RemoteCpuCount is out of step");
+    static_assert(REMOTE_CPU_COUNT == MAX_CPUS, "RemoteCpuCount is out of step");
 
-    if (!Hal::IrqChipReady() || !Hal::NmiIpiSupported())
+    if (!hal::irq_chip_ready() || !hal::nmi_ipi_supported())
         return;
 
-    auto& table = CpuTable::GetInstance();
-    ulong self = table.GetCurrentCpu().GetIndex();
-    ulong mask = table.GetRunningCpus();
+    auto& table = CpuTable::get_instance();
+    ulong self = table.get_current_cpu().get_index();
+    ulong mask = table.get_running_cpus();
 
-    for (ulong i = 0; i < RemoteCpuCount; i++)
-        RemoteDone[i].Set(0);
+    for (ulong i = 0; i < REMOTE_CPU_COUNT; i++)
+        remote_done_[i].set(0);
 
-    Collecting.Set(1);
+    collecting_.set(1);
 
     ulong asked = 0;
     ulong parked = 0;
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if (!(mask & (1UL << i)) || i == self)
             continue;
@@ -204,66 +204,66 @@ void Panicker::CollectRemoteStacks()
         /* Stopped for good in the halt path (Cpu::Park): it has nothing to
            tell -- what it runs is the halt, on a stack of its own -- and the
            report says so in a line. */
-        if (table.GetCpu(i).IsParked())
+        if (table.get_cpu(i).is_parked())
         {
             parked |= (1UL << i);
             continue;
         }
 
         asked |= (1UL << i);
-        Hal::SendNmiIpi(i);
+        hal::send_nmi_ipi(i);
     }
 
     /* Bounded by iterations, not by the clock: a panic must not depend on a
        clock source that may be part of what broke. */
-    static const ulong SpinBudget = 20000000;
-    for (ulong spin = 0; spin < SpinBudget; spin++)
+    static const ulong SPIN_BUDGET = 20000000;
+    for (ulong spin = 0; spin < SPIN_BUDGET; spin++)
     {
         ulong done = 0;
-        for (ulong i = 0; i < MaxCpus; i++)
+        for (ulong i = 0; i < MAX_CPUS; i++)
         {
-            if ((asked & (1UL << i)) && RemoteDone[i].Get() == 2)
+            if ((asked & (1UL << i)) && remote_done_[i].get() == 2)
                 done |= (1UL << i);
         }
 
         if (done == asked)
             break;
 
-        Pause();
+        cpu_relax();
     }
 
-    Collecting.Set(0);
+    collecting_.set(0);
 
     char buf[64];
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if (parked & (1UL << i))
         {
-            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu parked\n", i);
-            PrintOutput(buf);
+            stdlib::sn_printf(buf, sizeof(buf), "Cpu %lu parked\n", i);
+            print_output(buf);
             continue;
         }
 
         if (!(asked & (1UL << i)))
             continue;
 
-        if (RemoteDone[i].Get() != 2)
+        if (remote_done_[i].get() != 2)
         {
-            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu did not answer the NMI\n", i);
-            PrintOutput(buf);
+            stdlib::sn_printf(buf, sizeof(buf), "Cpu %lu did not answer the NMI\n", i);
+            print_output(buf);
             continue;
         }
 
-        Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu backtrace:\n", i);
-        PrintOutput(buf);
-        DumpBacktrace(RemoteFrame[i], RemoteCount[i]);
+        stdlib::sn_printf(buf, sizeof(buf), "Cpu %lu backtrace:\n", i);
+        print_output(buf);
+        dump_backtrace(remote_frame_[i], remote_count_[i]);
     }
 }
 
-void Panicker::DoPanic(const char *fmt, ...)
+void Panicker::do_panic(const char *fmt, ...)
 {
-    InterruptDisable();
-    if (Active.Cmpxchg(1, 0) == 0)
+    interrupt_disable();
+    if (active_.cmpxchg(1, 0) == 0)
     {
         /* Before the first PrintOutput: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
@@ -273,25 +273,25 @@ void Panicker::DoPanic(const char *fmt, ...)
         va_list args;
 
         va_start(args, fmt);
-        Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
+        stdlib::vsn_printf(message_, sizeof(message_), fmt, args);
         va_end(args);
 
-        PrintOutput(Message);
-        DumpContext();
+        print_output(message_);
+        dump_context();
 
         ulong frames[16];
-        size_t count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
-        DumpBacktrace(frames, count);
-        DumpModules();
+        size_t count = StackTrace::capture(frames, stdlib::array_size(frames));
+        dump_backtrace(frames, count);
+        dump_modules();
 
         /* Before the halting IPI: the CPU worth asking has interrupts off and
            would never take that one. */
-        CollectRemoteStacks();
+        collect_remote_stacks();
 
-        if (Hal::IrqChipReady())
+        if (hal::irq_chip_ready())
         {
-            Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
-            CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+            Cpu& cpu = CpuTable::get_instance().get_current_cpu();
+            CpuTable::get_instance().send_ipi_all_exclude(cpu.get_index());
         }
 
         /* Last thing done, and best-effort by construction: the console
@@ -300,19 +300,19 @@ void Panicker::DoPanic(const char *fmt, ...)
         rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
 
-        ResetIfAsked();
+        reset_if_asked();
     }
 
     for (;;)
     {
-        Pause();
+        cpu_relax();
     }
 }
 
-void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
+void Panicker::do_panic_ctx(Context* ctx, bool has_error_code, const char *fmt, ...)
 {
-    InterruptDisable();
-    if (Active.Cmpxchg(1, 0) == 0)
+    interrupt_disable();
+    if (active_.cmpxchg(1, 0) == 0)
     {
         /* Before the first PrintOutput: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
@@ -322,11 +322,11 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         va_list args;
 
         va_start(args, fmt);
-        Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
+        stdlib::vsn_printf(message_, sizeof(message_), fmt, args);
         va_end(args);
 
-        PrintOutput(Message);
-        DumpContext();
+        print_output(message_);
+        dump_context();
 
         /* Walk from the faulting code's RBP, over the stack its own RSP
            names: #DF arrives on a separate IST stack, and the report wanted
@@ -337,36 +337,36 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
            the report goes on without it. It used to fault itself, a panic
            inside the panic, and stop: no other CPU's stack, no netconsole,
            no reset. */
-        if (SetJmp(&ProbeJump) == 0)
+        if (set_jmp(&probe_jump_) == 0)
         {
-            ProbeCpu.Set(Hal::IrqChipReady() ? (long)Hal::GetCurrentCpuHwId() : 0);
+            probe_cpu_.set(hal::irq_chip_ready() ? (long)hal::get_current_cpu_hw_id() : 0);
             ulong frames[16];
-            size_t count = StackTrace::CaptureFromSp(ctx->GetFramePointer(),
-                ctx->GetOrigRsp(hasErrorCode), frames, Stdlib::ArraySize(frames));
-            ProbeCpu.Set(-1);
-            DumpBacktrace(frames, count);
+            size_t count = StackTrace::capture_from_sp(ctx->get_frame_pointer(),
+                ctx->get_orig_rsp(has_error_code), frames, stdlib::array_size(frames));
+            probe_cpu_.set(-1);
+            dump_backtrace(frames, count);
         }
         else
         {
             /* Then at least where it was, which needs no stack */
-            char where[SymbolTable::DescribeMax];
-            char buf[SymbolTable::DescribeMax + 64];
-            if (SymbolTable::GetInstance().Describe(ctx->GetRetRip(hasErrorCode), where, sizeof(where)))
-                Stdlib::SnPrintf(buf, sizeof(buf),
+            char where[SymbolTable::DESCRIBE_MAX];
+            char buf[SymbolTable::DESCRIBE_MAX + 64];
+            if (SymbolTable::get_instance().describe(ctx->get_ret_rip(has_error_code), where, sizeof(where)))
+                stdlib::sn_printf(buf, sizeof(buf),
                     "Backtrace: none, the stack it came from cannot be read; at %s\n", where);
             else
-                Stdlib::SnPrintf(buf, sizeof(buf),
+                stdlib::sn_printf(buf, sizeof(buf),
                     "Backtrace: none, the stack it came from cannot be read\n");
-            PrintOutput(buf);
+            print_output(buf);
         }
-        DumpModules();
+        dump_modules();
 
-        CollectRemoteStacks();
+        collect_remote_stacks();
 
-        if (Hal::IrqChipReady())
+        if (hal::irq_chip_ready())
         {
-            Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
-            CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+            Cpu& cpu = CpuTable::get_instance().get_current_cpu();
+            CpuTable::get_instance().send_ipi_all_exclude(cpu.get_index());
         }
 
         /* Last thing done, and best-effort by construction: the console
@@ -375,12 +375,12 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
 
-        ResetIfAsked();
+        reset_if_asked();
     }
 
     for (;;)
     {
-        Pause();
+        cpu_relax();
     }
 }
 

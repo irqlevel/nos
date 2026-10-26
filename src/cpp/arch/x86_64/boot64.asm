@@ -1,8 +1,8 @@
-extern Main
-extern ApMain
+extern main_x86_64
+extern ap_main
 
 global Start32
-global ApStart16
+global ap_start16
 
 ; Must equal Kernel::MaxCpus (kernel/cpu.h). Each CPU gets one CPU_STACK_SIZE
 ; page of .trampolinedata to run on between the SIPI and the switch to its
@@ -62,7 +62,7 @@ gdt32:
 
 BITS 16
 section .trampoline
-ApStart16:
+ap_start16:
     lgdt [gdt32.desc]
     mov eax, cr0
     or al, 0x01
@@ -383,7 +383,7 @@ long_mode_start:
     mov gs, ax
 start64:
     mov rdi, [mbinfo]
-    mov rax, Main
+    mov rax, main_x86_64
     call rax
 
 long_mode_ap_start:
@@ -395,5 +395,5 @@ long_mode_ap_start:
     mov fs, ax
     mov gs, ax
 ap_start64:
-    mov rax, ApMain
+    mov rax, ap_main
     call rax

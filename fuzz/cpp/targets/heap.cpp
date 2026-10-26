@@ -38,85 +38,85 @@
 #include <sanitizer/asan_interface.h>
 #include <sys/mman.h>
 
-using namespace Kernel;
-using Kernel::Mm::AllocatorImpl;
-using Kernel::Mm::Page;
-using Kernel::Mm::PageAllocatorImpl;
-using Kernel::Mm::PageTable;
+using namespace kernel;
+using kernel::mm::AllocatorImpl;
+using kernel::mm::Page;
+using kernel::mm::PageAllocatorImpl;
+using kernel::mm::PageTable;
 
 namespace
 {
 
-const ulong PageBytes = Const::PageSize;
+const ulong PAGE_BYTES = consts::PAGE_SIZE;
 
 /* The host VA the heap's VA allocators are given: reserved once, used a
    few megabytes of per input, and the large runs' window past them. */
-const ulong RegionBytes = 2UL << 30;
-uint8_t* Region;
+const ulong REGION_BYTES = 2UL << 30;
+uint8_t* region;
 
 /* The pages: names, a Page each, as PageArray has them */
 struct PageSet
 {
-    Page* Array = nullptr;
-    ulong Count = 0;
+    Page* array = nullptr;
+    ulong count = 0;
 
-    Page* data() { return Array; }
-    ulong size() const { return Count; }
-    Page& operator[](ulong i) { return Array[i]; }
+    Page* data() { return array; }
+    ulong size() const { return count; }
+    Page& operator[](ulong i) { return array[i]; }
 };
 
 struct Pages
 {
-    PageSet All;
-    std::vector<bool> Free;
+    PageSet all;
+    std::vector<bool> free;
     /* Free pages, most recently freed on top; some may have been taken by
        AllocContiguousPages since, and are passed over */
-    std::vector<ulong> Stack;
+    std::vector<ulong> stack;
     /* How many VAs each page is mapped at */
-    std::vector<ulong> MapCount;
-    ulong FreeCount = 0;
-    long FailAfter = -1;
-    long MapFailAfter = -1;
+    std::vector<ulong> map_count;
+    ulong free_count = 0;
+    long fail_after = -1;
+    long map_fail_after = -1;
     /* va -> page index, for every page mapped */
-    std::map<ulong, ulong> Mapped;
-} P;
+    std::map<ulong, ulong> mapped;
+} page_model;
 
-bool Take(long& failAfter)
+bool take(long& fail_after)
 {
-    if (failAfter == 0)
+    if (fail_after == 0)
         return false;
-    if (failAfter > 0)
-        failAfter--;
+    if (fail_after > 0)
+        fail_after--;
     return true;
 }
 
-ulong IndexOf(Page* page)
+ulong index_of(Page* page)
 {
-    ulong i = static_cast<ulong>(page - P.All.data());
-    INVARIANT(i < P.All.size(), "a page that is no page: %p", page);
+    ulong i = static_cast<ulong>(page - page_model.all.data());
+    INVARIANT(i < page_model.all.size(), "a page that is no page: %p", page);
     return i;
 }
 
-void MapOne(ulong va, ulong index)
+void map_one(ulong va, ulong index)
 {
-    INVARIANT(va % PageBytes == 0, "a map at 0x%lx, not a page's start", va);
-    INVARIANT(va >= reinterpret_cast<ulong>(Region) && va + PageBytes <= reinterpret_cast<ulong>(Region) + RegionBytes,
+    INVARIANT(va % PAGE_BYTES == 0, "a map at 0x%lx, not a page's start", va);
+    INVARIANT(va >= reinterpret_cast<ulong>(region) && va + PAGE_BYTES <= reinterpret_cast<ulong>(region) + REGION_BYTES,
         "a map at 0x%lx, outside the VA the heap was given", va);
-    INVARIANT(!P.Free[index], "free page %lu mapped at 0x%lx", index, va);
-    INVARIANT(P.Mapped.insert({va, index}).second, "0x%lx mapped twice", va);
-    P.MapCount[index]++;
-    ASAN_UNPOISON_MEMORY_REGION(reinterpret_cast<void*>(va), PageBytes);
-    memset(reinterpret_cast<void*>(va), 0, PageBytes);
+    INVARIANT(!page_model.free[index], "free page %lu mapped at 0x%lx", index, va);
+    INVARIANT(page_model.mapped.insert({va, index}).second, "0x%lx mapped twice", va);
+    page_model.map_count[index]++;
+    ASAN_UNPOISON_MEMORY_REGION(reinterpret_cast<void*>(va), PAGE_BYTES);
+    memset(reinterpret_cast<void*>(va), 0, PAGE_BYTES);
 }
 
-ulong UnmapOne(ulong va)
+ulong unmap_one(ulong va)
 {
-    auto it = P.Mapped.find(va);
-    INVARIANT(it != P.Mapped.end(), "an unmap of 0x%lx, which is not mapped", va);
+    auto it = page_model.mapped.find(va);
+    INVARIANT(it != page_model.mapped.end(), "an unmap of 0x%lx, which is not mapped", va);
     ulong index = it->second;
-    P.Mapped.erase(it);
-    P.MapCount[index]--;
-    ASAN_POISON_MEMORY_REGION(reinterpret_cast<void*>(va), PageBytes);
+    page_model.mapped.erase(it);
+    page_model.map_count[index]--;
+    ASAN_POISON_MEMORY_REGION(reinterpret_cast<void*>(va), PAGE_BYTES);
     return index;
 }
 
@@ -124,9 +124,9 @@ ulong UnmapOne(ulong va)
 
 /* ---- the page table, as the heap uses it ---- */
 
-namespace Kernel
+namespace kernel
 {
-namespace Mm
+namespace mm
 {
 
 PageTable::PageTable()
@@ -137,124 +137,124 @@ PageTable::~PageTable()
 {
 }
 
-Page* PageTable::AllocPage()
+Page* PageTable::alloc_page()
 {
-    INVARIANT(Fuzz::HeldSpinLocks() == 0, "a page allocated with a spin lock held");
-    if (!Take(P.FailAfter) || P.FreeCount == 0)
+    INVARIANT(fuzz::held_spin_locks() == 0, "a page allocated with a spin lock held");
+    if (!take(page_model.fail_after) || page_model.free_count == 0)
         return nullptr;
-    while (!P.Stack.empty())
+    while (!page_model.stack.empty())
     {
-        ulong i = P.Stack.back();
-        P.Stack.pop_back();
-        if (P.Free[i])
+        ulong i = page_model.stack.back();
+        page_model.stack.pop_back();
+        if (page_model.free[i])
         {
-            P.Free[i] = false;
-            P.FreeCount--;
-            return &P.All[i];
+            page_model.free[i] = false;
+            page_model.free_count--;
+            return &page_model.all[i];
         }
     }
-    INVARIANT(false, "%lu pages free and none on the stack", P.FreeCount);
+    INVARIANT(false, "%lu pages free and none on the stack", page_model.free_count);
     return nullptr;
 }
 
-Page* PageTable::AllocContiguousPages(ulong count)
+Page* PageTable::alloc_contiguous_pages(ulong count)
 {
-    if (!Take(P.FailAfter) || count == 0 || count > MaxContiguousPages)
+    if (!take(page_model.fail_after) || count == 0 || count > MAX_CONTIGUOUS_PAGES)
         return nullptr;
-    for (ulong i = 0; i + count <= P.All.size(); i++)
+    for (ulong i = 0; i + count <= page_model.all.size(); i++)
     {
         ulong n = 0;
-        while (n < count && P.Free[i + n])
+        while (n < count && page_model.free[i + n])
             n++;
         if (n == count)
         {
             for (ulong j = 0; j < count; j++)
-                P.Free[i + j] = false;
-            P.FreeCount -= count;
-            return &P.All[i];
+                page_model.free[i + j] = false;
+            page_model.free_count -= count;
+            return &page_model.all[i];
         }
         i += n;
     }
     return nullptr;
 }
 
-void PageTable::FreePage(Page* page)
+void PageTable::free_page(Page* page)
 {
-    ulong i = IndexOf(page);
-    INVARIANT(!P.Free[i], "page %lu freed twice", i);
-    INVARIANT(P.MapCount[i] == 0, "page %lu freed while mapped", i);
-    P.Free[i] = true;
-    P.FreeCount++;
-    P.Stack.push_back(i);
+    ulong i = index_of(page);
+    INVARIANT(!page_model.free[i], "page %lu freed twice", i);
+    INVARIANT(page_model.map_count[i] == 0, "page %lu freed while mapped", i);
+    page_model.free[i] = true;
+    page_model.free_count++;
+    page_model.stack.push_back(i);
 }
 
-ulong PageTable::GetFreePagesCount()
+ulong PageTable::get_free_pages_count()
 {
-    return P.FreeCount;
+    return page_model.free_count;
 }
 
-ulong PageTable::GetVaEnd()
+ulong PageTable::get_va_end()
 {
-    return reinterpret_cast<ulong>(Region);
+    return reinterpret_cast<ulong>(region);
 }
 
-bool PageTable::MapPage(ulong virtAddr, Page* page)
+bool PageTable::map_page(ulong virt_addr, Page* page)
 {
-    return MapPages(virtAddr, &page, 1);
+    return map_pages(virt_addr, &page, 1);
 }
 
-bool PageTable::MapPages(ulong virtAddr, Page* const* pages, size_t count)
+bool PageTable::map_pages(ulong virt_addr, Page* const* pages, size_t count)
 {
-    INVARIANT(Fuzz::HeldSpinLocks() == 0, "pages mapped with a spin lock held");
-    if (!Take(P.MapFailAfter))
+    INVARIANT(fuzz::held_spin_locks() == 0, "pages mapped with a spin lock held");
+    if (!take(page_model.map_fail_after))
         return false;
     for (size_t i = 0; i < count; i++)
-        MapOne(virtAddr + i * PageBytes, IndexOf(pages[i]));
+        map_one(virt_addr + i * PAGE_BYTES, index_of(pages[i]));
     return true;
 }
 
-bool PageTable::MapContiguousPages(ulong virtAddr, Page* pages, size_t count)
+bool PageTable::map_contiguous_pages(ulong virt_addr, Page* pages, size_t count)
 {
-    if (!Take(P.MapFailAfter))
+    if (!take(page_model.map_fail_after))
         return false;
     for (size_t i = 0; i < count; i++)
-        MapOne(virtAddr + i * PageBytes, IndexOf(&pages[i]));
+        map_one(virt_addr + i * PAGE_BYTES, index_of(&pages[i]));
     return true;
 }
 
-bool PageTable::MapPhysPages(ulong virtAddr, const ulong* phyAddrs, size_t count)
+bool PageTable::map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count)
 {
-    if (!Take(P.MapFailAfter))
+    if (!take(page_model.map_fail_after))
         return false;
     for (size_t i = 0; i < count; i++)
     {
-        INVARIANT(phyAddrs[i] % PageBytes == 0 && phyAddrs[i] / PageBytes < P.All.size(),
-            "a map of physical 0x%lx, which is no page", phyAddrs[i]);
-        MapOne(virtAddr + i * PageBytes, phyAddrs[i] / PageBytes);
+        INVARIANT(phy_addrs[i] % PAGE_BYTES == 0 && phy_addrs[i] / PAGE_BYTES < page_model.all.size(),
+            "a map of physical 0x%lx, which is no page", phy_addrs[i]);
+        map_one(virt_addr + i * PAGE_BYTES, phy_addrs[i] / PAGE_BYTES);
     }
     return true;
 }
 
-void PageTable::UnmapPages(ulong virtAddr, size_t count, bool freePages)
+void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
 {
     for (size_t i = 0; i < count; i++)
     {
-        ulong index = UnmapOne(virtAddr + i * PageBytes);
-        if (freePages)
-            FreePage(&P.All[index]);
+        ulong index = unmap_one(virt_addr + i * PAGE_BYTES);
+        if (free_pages)
+            free_page(&page_model.all[index]);
     }
 }
 
-Page* PageTable::UnmapPage(ulong virtAddr)
+Page* PageTable::unmap_page(ulong virt_addr)
 {
-    return &P.All[UnmapOne(virtAddr)];
+    return &page_model.all[unmap_one(virt_addr)];
 }
 
 }
 
-void CpuTable::InvalidateTlbRange(ulong virtAddr, ulong count)
+void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
 {
-    (void)virtAddr;
+    (void)virt_addr;
     (void)count;
 }
 
@@ -267,141 +267,141 @@ namespace
 
 struct Block
 {
-    ulong Size;
-    uint8_t Mark;
+    ulong size;
+    uint8_t mark;
     enum Kind
     {
         Heap,
         Run,    /* AllocMapPages */
         Driver, /* MapPages of the sequence's own pages */
         Large,  /* MapLargePages */
-    } How;
-    std::vector<ulong> Pages;
+    } how;
+    std::vector<ulong> pages;
 };
 
-std::map<ulong, Block> Live;
-ulong Baseline;
+std::map<ulong, Block> live;
+ulong baseline;
 
-AllocatorImpl& Heap()
+AllocatorImpl& tested_heap()
 {
-    return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance());
+    return AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance());
 }
 
-bool IsMapped(ulong va, ulong size)
+bool is_mapped(ulong va, ulong size)
 {
-    for (ulong p = va & ~(PageBytes - 1); p < va + size; p += PageBytes)
+    for (ulong p = va & ~(PAGE_BYTES - 1); p < va + size; p += PAGE_BYTES)
     {
-        if (!P.Mapped.count(p))
+        if (!page_model.mapped.count(p))
             return false;
     }
     return true;
 }
 
-void Fill(ulong va, const Block& b)
+void fill(ulong va, const Block& b)
 {
-    memset(reinterpret_cast<void*>(va), b.Mark, b.Size);
+    memset(reinterpret_cast<void*>(va), b.mark, b.size);
 }
 
-void CheckFill(ulong va, const Block& b, const char* when)
+void check_fill(ulong va, const Block& b, const char* when)
 {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(va);
-    for (ulong i = 0; i < b.Size; i++)
-        INVARIANT(p[i] == b.Mark, "the block at 0x%lx of %lu bytes changed at +%lu %s", va, b.Size, i, when);
+    for (ulong i = 0; i < b.size; i++)
+        INVARIANT(p[i] == b.mark, "the block at 0x%lx of %lu bytes changed at +%lu %s", va, b.size, i, when);
 }
 
-void Place(ulong va, Block b, const char* by)
+void place(ulong va, Block b, const char* by)
 {
-    INVARIANT(IsMapped(va, b.Size), "%s gave 0x%lx for %lu bytes, which is not all mapped", by, va, b.Size);
-    auto next = Live.lower_bound(va);
-    if (next != Live.end())
-        INVARIANT(va + b.Size <= next->first, "%s gave [0x%lx, +%lu), which runs into the block at 0x%lx", by, va,
-            b.Size, next->first);
-    if (next != Live.begin())
+    INVARIANT(is_mapped(va, b.size), "%s gave 0x%lx for %lu bytes, which is not all mapped", by, va, b.size);
+    auto next = live.lower_bound(va);
+    if (next != live.end())
+        INVARIANT(va + b.size <= next->first, "%s gave [0x%lx, +%lu), which runs into the block at 0x%lx", by, va,
+            b.size, next->first);
+    if (next != live.begin())
     {
         auto prev = std::prev(next);
-        INVARIANT(prev->first + prev->second.Size <= va, "%s gave 0x%lx, inside the block at 0x%lx", by, va,
+        INVARIANT(prev->first + prev->second.size <= va, "%s gave 0x%lx, inside the block at 0x%lx", by, va,
             prev->first);
     }
-    Fill(va, b);
-    Live[va] = b;
+    fill(va, b);
+    live[va] = b;
 }
 
-ulong Size(Fuzz::Input& in)
+ulong pick_size(fuzz::Input& in)
 {
-    switch (in.U8() % 10)
+    switch (in.u8() % 10)
     {
     case 0:
-        return 1 + in.Below(16);
+        return 1 + in.below(16);
     case 1:
     case 2:
-        return 1 + in.Below(256);
+        return 1 + in.below(256);
     case 3:
-        return 1 + in.Below(2048);
+        return 1 + in.below(2048);
     case 4:
         /* The edge between the pools and whole pages */
-        return 2032 + in.Below(32);
+        return 2032 + in.below(32);
     case 5:
-        return PageBytes * (1 + in.Below(4)) - 8 + in.Below(16);
+        return PAGE_BYTES * (1 + in.below(4)) - 8 + in.below(16);
     case 6:
-        return 1 + in.Below(PageBytes * PageTable::MaxContiguousPages + PageBytes);
+        return 1 + in.below(PAGE_BYTES * PageTable::MAX_CONTIGUOUS_PAGES + PAGE_BYTES);
     default:
-        return 1 + in.Below(512);
+        return 1 + in.below(512);
     }
 }
 
 /* Blocks of a fixed page allocator's VA nobody holds: its bitmap's zeros */
-ulong VaFree(ulong log)
+ulong va_free(ulong log)
 {
-    auto& va = PageAllocatorImpl::GetInstance().FixedPgAlloc[log].VaAlloc;
+    auto& va = PageAllocatorImpl::get_instance().fixed_pg_alloc_[log].va_alloc_;
     ulong free = 0;
-    for (ulong i = 0; i < va.BlockCount; i++)
-        free += ((va.BitmapPtr[i / 8] >> (i % 8)) & 1) == 0;
+    for (ulong i = 0; i < va.block_count_; i++)
+        free += ((va.bitmap_ptr_[i / 8] >> (i % 8)) & 1) == 0;
     return free;
 }
 
 /* Blocks every CPU's cache holds */
-ulong CachedCount()
+ulong cached_count()
 {
     ulong n = 0;
-    for (auto& cache : Heap().Caches)
-        for (auto& size : cache.Sizes)
-            n += size.Count;
+    for (auto& cache : tested_heap().caches_)
+        for (auto& size : cache.sizes)
+            n += size.count;
     return n;
 }
 
 /* Blocks the page allocator keeps, of every size */
-ulong KeptCount()
+ulong kept_count()
 {
-    auto& pa = PageAllocatorImpl::GetInstance();
+    auto& pa = PageAllocatorImpl::get_instance();
     ulong n = 0;
-    for (auto& list : pa.KeptBlocks)
-        n += list.Count;
-    for (auto& cpu : pa.CpuKeptBlocks)
-        for (auto& size : cpu.Sizes)
-            n += size.Count;
+    for (auto& list : pa.kept_blocks_)
+        n += list.count;
+    for (auto& cpu : pa.cpu_kept_blocks_)
+        for (auto& size : cpu.sizes)
+            n += size.count;
     return n;
 }
 
 /* Blocks every CPU's cache of kept blocks holds */
-ulong CpuKeptCount()
+ulong cpu_kept_count()
 {
     ulong n = 0;
-    for (auto& cpu : PageAllocatorImpl::GetInstance().CpuKeptBlocks)
-        for (auto& size : cpu.Sizes)
-            n += size.Count;
+    for (auto& cpu : PageAllocatorImpl::get_instance().cpu_kept_blocks_)
+        for (auto& size : cpu.sizes)
+            n += size.count;
     return n;
 }
 
 /* A kept block as it must be, wherever it is kept: of its size's VA, all
    mapped, marked, and nobody's in use; and kept once */
-void CheckKeptBlock(PageAllocatorImpl& pa, ulong log, ulong va, std::set<ulong>& seen)
+void check_kept_block(PageAllocatorImpl& pa, ulong log, ulong va, std::set<ulong>& seen)
 {
     auto* kept = reinterpret_cast<PageAllocatorImpl::Kept*>(va);
-    INVARIANT(pa.FixedPgAlloc[log].Contains(kept), "a kept block 0x%lx not of its size's VA", va);
-    INVARIANT(IsMapped(va, (1UL << log) * PageBytes), "a kept block 0x%lx not all mapped", va);
-    INVARIANT(kept->Mark == PageAllocatorImpl::KeptMark, "a kept block 0x%lx without its mark", va);
-    auto live = Live.upper_bound(va + (1UL << log) * PageBytes - 1);
-    INVARIANT(live == Live.begin() || std::prev(live)->first + std::prev(live)->second.Size <= va,
+    INVARIANT(pa.fixed_pg_alloc_[log].contains(kept), "a kept block 0x%lx not of its size's VA", va);
+    INVARIANT(is_mapped(va, (1UL << log) * PAGE_BYTES), "a kept block 0x%lx not all mapped", va);
+    INVARIANT(kept->mark == PageAllocatorImpl::KEPT_MARK, "a kept block 0x%lx without its mark", va);
+    auto after = live.upper_bound(va + (1UL << log) * PAGE_BYTES - 1);
+    INVARIANT(after == live.begin() || std::prev(after)->first + std::prev(after)->second.size <= va,
         "a kept block 0x%lx that a block in use overlaps", va);
     INVARIANT(seen.insert(va).second, "the block 0x%lx kept twice", va);
 }
@@ -409,163 +409,163 @@ void CheckKeptBlock(PageAllocatorImpl& pa, ulong log, ulong va, std::set<ulong>&
 /* What the heap keeps for its next allocations, between two operations:
    no more than its bounds, each kept block whole -- mapped, marked, its own
    and nobody's in use -- and each pool's kept pages empty */
-void CheckKept()
+void check_kept()
 {
-    auto& pa = PageAllocatorImpl::GetInstance();
+    auto& pa = PageAllocatorImpl::get_instance();
     std::set<ulong> kept;
-    for (ulong log = 0; log < Stdlib::ArraySize(pa.KeptBlocks); log++)
+    for (ulong log = 0; log < stdlib::array_size(pa.kept_blocks_); log++)
     {
-        auto& list = pa.KeptBlocks[log];
-        INVARIANT(list.Count <= list.Limit, "%lu blocks of %lu pages kept, past the bound of %lu", list.Count,
-            1UL << log, list.Limit);
+        auto& list = pa.kept_blocks_[log];
+        INVARIANT(list.count <= list.limit, "%lu blocks of %lu pages kept, past the bound of %lu", list.count,
+            1UL << log, list.limit);
         ulong n = 0;
-        for (auto* block = list.Head; block != nullptr; block = block->Next)
+        for (auto* block = list.head; block != nullptr; block = block->next)
         {
-            INVARIANT(++n <= list.Count, "the list of kept %lu-page blocks is longer than its count %lu",
-                1UL << log, list.Count);
-            CheckKeptBlock(pa, log, reinterpret_cast<ulong>(block), kept);
+            INVARIANT(++n <= list.count, "the list of kept %lu-page blocks is longer than its count %lu",
+                1UL << log, list.count);
+            check_kept_block(pa, log, reinterpret_cast<ulong>(block), kept);
         }
-        INVARIANT(n == list.Count, "%lu kept %lu-page blocks on a list that counts %lu", n, 1UL << log,
-            list.Count);
+        INVARIANT(n == list.count, "%lu kept %lu-page blocks on a list that counts %lu", n, 1UL << log,
+            list.count);
     }
 
     /* Each CPU's: within its bound, which is within KeptBlocks' */
-    for (ulong cpu = 0; cpu < Stdlib::ArraySize(pa.CpuKeptBlocks); cpu++)
+    for (ulong cpu = 0; cpu < stdlib::array_size(pa.cpu_kept_blocks_); cpu++)
     {
-        for (ulong log = 0; log < PageAllocatorImpl::CpuKeptLogs; log++)
+        for (ulong log = 0; log < PageAllocatorImpl::CPU_KEPT_LOGS; log++)
         {
-            auto& size = pa.CpuKeptBlocks[cpu].Sizes[log];
-            INVARIANT(size.Count <= size.Limit && size.Limit <= pa.KeptBlocks[log].Limit,
-                "CPU %lu keeps %lu blocks of %lu pages, its bound %lu and the shared one %lu", cpu, size.Count,
-                1UL << log, size.Limit, pa.KeptBlocks[log].Limit);
-            for (ulong i = 0; i < size.Count; i++)
-                CheckKeptBlock(pa, log, reinterpret_cast<ulong>(size.Blocks[i]), kept);
+            auto& size = pa.cpu_kept_blocks_[cpu].sizes[log];
+            INVARIANT(size.count <= size.limit && size.limit <= pa.kept_blocks_[log].limit,
+                "CPU %lu keeps %lu blocks of %lu pages, its bound %lu and the shared one %lu", cpu, size.count,
+                1UL << log, size.limit, pa.kept_blocks_[log].limit);
+            for (ulong i = 0; i < size.count; i++)
+                check_kept_block(pa, log, reinterpret_cast<ulong>(size.blocks[i]), kept);
         }
     }
 
-    auto& heap = Heap();
-    for (auto& pool : heap.Pool)
-        INVARIANT(pool.EmptyPages <= Kernel::Mm::Pool::EmptyPagesKept, "a pool of %lu-byte blocks keeps %lu empty "
-            "pages", pool.BlockSize, pool.EmptyPages);
+    auto& heap = tested_heap();
+    for (auto& pool : heap.pool_)
+        INVARIANT(pool.empty_pages_ <= kernel::mm::Pool::EMPTY_PAGES_KEPT, "a pool of %lu-byte blocks keeps %lu empty "
+            "pages", pool.block_size_, pool.empty_pages_);
 
     /* Every CPU's cache: within its bound, each block in it free -- its tag
        the pool's FreedTag -- in no other cache and nobody's in use (whose
        address is the block's past the heap's header) */
     std::set<ulong> cached;
-    for (ulong cpu = 0; cpu < Stdlib::ArraySize(heap.Caches); cpu++)
+    for (ulong cpu = 0; cpu < stdlib::array_size(heap.caches_); cpu++)
     {
-        for (ulong p = 0; p < AllocatorImpl::PoolCount; p++)
+        for (ulong p = 0; p < AllocatorImpl::POOL_COUNT; p++)
         {
-            auto& size = heap.Caches[cpu].Sizes[p];
-            INVARIANT(size.Count <= size.Limit, "CPU %lu caches %lu blocks of pool %lu, past its bound of %lu", cpu,
-                size.Count, p, size.Limit);
-            for (ulong i = 0; i < size.Count; i++)
+            auto& size = heap.caches_[cpu].sizes[p];
+            INVARIANT(size.count <= size.limit, "CPU %lu caches %lu blocks of pool %lu, past its bound of %lu", cpu,
+                size.count, p, size.limit);
+            for (ulong i = 0; i < size.count; i++)
             {
-                ulong block = reinterpret_cast<ulong>(size.Blocks[i]);
-                auto* header = reinterpret_cast<Kernel::Mm::Pool::Block*>(block) - 1;
-                INVARIANT(static_cast<ulong>(header->Tag.Get()) == Kernel::Mm::Pool::FreedTag,
+                ulong block = reinterpret_cast<ulong>(size.blocks[i]);
+                auto* header = reinterpret_cast<kernel::mm::Pool::Block*>(block) - 1;
+                INVARIANT(static_cast<ulong>(header->tag.get()) == kernel::mm::Pool::FREED_TAG,
                     "CPU %lu caches 0x%lx, whose tag 0x%lx is not a free block's", cpu, block,
-                    static_cast<ulong>(header->Tag.Get()));
+                    static_cast<ulong>(header->tag.get()));
                 INVARIANT(cached.insert(block).second, "0x%lx cached twice", block);
-                INVARIANT(!Live.count(block + sizeof(AllocatorImpl::Header)), "CPU %lu caches 0x%lx, which is in use",
+                INVARIANT(!live.count(block + sizeof(AllocatorImpl::Header)), "CPU %lu caches 0x%lx, which is in use",
                     cpu, block);
             }
         }
     }
 }
 
-void Alloc(Fuzz::Input& in)
+void alloc(fuzz::Input& in)
 {
-    ulong size = Size(in);
+    ulong size = pick_size(in);
     /* Rust's allocations, which ask for no contents in particular */
-    const bool uninit = in.Bool();
-    ulong keptBefore = KeptCount();
-    ulong cachedBefore = CachedCount();
-    ulong cpuKeptBefore = CpuKeptCount();
-    void* p = uninit ? Heap().AllocUninit(size, 0x54657374) : Heap().Alloc(size, 0x54657374);
-    if (CpuKeptCount() < cpuKeptBefore)
-        Fuzz::Reached("a kept block from a CPU's own");
-    if (KeptCount() < keptBefore)
-        Fuzz::Reached(uninit ? "a kept block handed out as it was" : "a kept block handed out zeroed");
-    if (CachedCount() < cachedBefore)
-        Fuzz::Reached("a block from a CPU's cache");
+    const bool uninit = in.boolean();
+    ulong kept_before = kept_count();
+    ulong cached_before = cached_count();
+    ulong cpu_kept_before = cpu_kept_count();
+    void* p = uninit ? tested_heap().alloc_uninit(size, 0x54657374) : tested_heap().alloc(size, 0x54657374);
+    if (cpu_kept_count() < cpu_kept_before)
+        fuzz::reached("a kept block from a CPU's own");
+    if (kept_count() < kept_before)
+        fuzz::reached(uninit ? "a kept block handed out as it was" : "a kept block handed out zeroed");
+    if (cached_count() < cached_before)
+        fuzz::reached("a block from a CPU's cache");
     if (p == nullptr)
     {
         /* Past the largest run, no page or no VA for one -- a pool's block
            may need a page of its own -- or a failure on the input's word */
-        ulong pages = (size + 8 >= PageBytes / 2) ? (size + PageBytes - 1) / PageBytes : 1;
-        ulong log = Stdlib::Log2(pages);
-        INVARIANT(pages > PageTable::MaxContiguousPages || P.FreeCount < (1UL << log) || VaFree(log) == 0 ||
-            P.FailAfter >= 0 || P.MapFailAfter >= 0, "Alloc(%lu) refused with %lu pages and %lu blocks of VA free",
-            size, P.FreeCount, VaFree(log));
-        Fuzz::Reached("an allocation refused");
+        ulong pages = (size + 8 >= PAGE_BYTES / 2) ? (size + PAGE_BYTES - 1) / PAGE_BYTES : 1;
+        ulong log = stdlib::log2(pages);
+        INVARIANT(pages > PageTable::MAX_CONTIGUOUS_PAGES || page_model.free_count < (1UL << log) || va_free(log) == 0 ||
+            page_model.fail_after >= 0 || page_model.map_fail_after >= 0, "Alloc(%lu) refused with %lu pages and %lu blocks of VA free",
+            size, page_model.free_count, va_free(log));
+        fuzz::reached("an allocation refused");
         return;
     }
     ulong va = reinterpret_cast<ulong>(p);
     INVARIANT(va % 8 == 0, "Alloc(%lu) gave 0x%lx, not 8-aligned", size, va);
-    const bool pages = size + 8 >= PageBytes / 2;
+    const bool pages = size + 8 >= PAGE_BYTES / 2;
     if (pages && !uninit)
     {
         /* Zeroed, as fresh pages are -- a block the page allocator kept
            from a free included, whatever was written into it before */
-        INVARIANT(IsMapped(va, size), "Alloc gave 0x%lx for %lu bytes, which is not all mapped", va, size);
+        INVARIANT(is_mapped(va, size), "Alloc gave 0x%lx for %lu bytes, which is not all mapped", va, size);
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(va);
         for (ulong i = 0; i < size; i++)
             INVARIANT(bytes[i] == 0, "Alloc(%lu) gave 0x%lx with a byte not zero at +%lu", size, va, i);
     }
-    Place(va, {size, static_cast<uint8_t>(1 + in.Below(255)), Block::Heap, {}}, "Alloc");
-    Fuzz::Reached(pages ? "a page allocation" : "a pool allocation");
+    place(va, {size, static_cast<uint8_t>(1 + in.below(255)), Block::Heap, {}}, "Alloc");
+    fuzz::reached(pages ? "a page allocation" : "a pool allocation");
 }
 
-void Free(Fuzz::Input& in)
+void free_one(fuzz::Input& in)
 {
-    if (Live.empty())
+    if (live.empty())
         return;
-    auto it = Live.begin();
-    std::advance(it, in.Below(Live.size()));
+    auto it = live.begin();
+    std::advance(it, in.below(live.size()));
     ulong va = it->first;
     Block b = it->second;
-    CheckFill(va, b, "before its free");
-    Live.erase(it);
-    auto& pa = PageAllocatorImpl::GetInstance();
-    switch (b.How)
+    check_fill(va, b, "before its free");
+    live.erase(it);
+    auto& pa = PageAllocatorImpl::get_instance();
+    switch (b.how)
     {
     case Block::Heap:
     {
-        ulong cachedBefore = CachedCount();
-        Heap().Free(reinterpret_cast<void*>(va));
-        if (CachedCount() < cachedBefore)
-            Fuzz::Reached("a CPU's cache spilled to its pool");
+        ulong cached_before = cached_count();
+        tested_heap().free(reinterpret_cast<void*>(va));
+        if (cached_count() < cached_before)
+            fuzz::reached("a CPU's cache spilled to its pool");
         break;
     }
     case Block::Run:
-        pa.UnmapFreePages(reinterpret_cast<void*>(va));
+        pa.unmap_free_pages(reinterpret_cast<void*>(va));
         break;
     case Block::Driver:
-        pa.UnmapPages(reinterpret_cast<void*>(va), b.Pages.size());
-        for (ulong i : b.Pages)
-            PageTable::GetInstance().FreePage(&P.All[i]);
+        pa.unmap_pages(reinterpret_cast<void*>(va), b.pages.size());
+        for (ulong i : b.pages)
+            PageTable::get_instance().free_page(&page_model.all[i]);
         break;
     case Block::Large:
-        pa.UnmapLargePages(reinterpret_cast<void*>(va), b.Pages.size());
-        for (ulong i : b.Pages)
-            PageTable::GetInstance().FreePage(&P.All[i]);
+        pa.unmap_large_pages(reinterpret_cast<void*>(va), b.pages.size());
+        for (ulong i : b.pages)
+            PageTable::get_instance().free_page(&page_model.all[i]);
         break;
     }
 }
 
-void PageRun(Fuzz::Input& in)
+void page_run(fuzz::Input& in)
 {
-    ulong count = 1 + in.Below(in.Chance(32) ? 200 : 12);
+    ulong count = 1 + in.below(in.chance(32) ? 200 : 12);
     ulong phys = 0;
-    void* p = PageAllocatorImpl::GetInstance().AllocMapPages(count, &phys);
+    void* p = PageAllocatorImpl::get_instance().alloc_map_pages(count, &phys);
     if (p == nullptr)
     {
-        Fuzz::Reached("a page run refused");
+        fuzz::reached("a page run refused");
         return;
     }
     ulong va = reinterpret_cast<ulong>(p);
-    INVARIANT(va % PageBytes == 0, "AllocMapPages gave 0x%lx", va);
+    INVARIANT(va % PAGE_BYTES == 0, "AllocMapPages gave 0x%lx", va);
     /* The run is contiguous, from phys on, and all of it mapped in order */
     ulong rounded = 1;
     while (rounded < count)
@@ -573,156 +573,156 @@ void PageRun(Fuzz::Input& in)
     std::vector<ulong> pages;
     for (ulong i = 0; i < rounded; i++)
     {
-        auto m = P.Mapped.find(va + i * PageBytes);
-        INVARIANT(m != P.Mapped.end() && m->second == phys / PageBytes + i,
-            "page %lu of the run at 0x%lx is not physical 0x%lx", i, va, phys + i * PageBytes);
+        auto m = page_model.mapped.find(va + i * PAGE_BYTES);
+        INVARIANT(m != page_model.mapped.end() && m->second == phys / PAGE_BYTES + i,
+            "page %lu of the run at 0x%lx is not physical 0x%lx", i, va, phys + i * PAGE_BYTES);
         pages.push_back(m->second);
     }
-    Place(va, {rounded * PageBytes, static_cast<uint8_t>(1 + in.Below(255)), Block::Run, pages}, "AllocMapPages");
-    Fuzz::Reached("a page run");
+    place(va, {rounded * PAGE_BYTES, static_cast<uint8_t>(1 + in.below(255)), Block::Run, pages}, "AllocMapPages");
+    fuzz::reached("a page run");
 }
 
-void Driver(Fuzz::Input& in)
+void driver(fuzz::Input& in)
 {
-    const bool large = in.Chance(32);
-    ulong count = large ? 1 + in.Below(300) : 1 + in.Below(8);
+    const bool large = in.chance(32);
+    ulong count = large ? 1 + in.below(300) : 1 + in.below(8);
     std::vector<ulong> pages;
     std::vector<ulong> phys;
     for (ulong i = 0; i < count; i++)
     {
-        Page* page = PageTable::GetInstance().AllocPage();
+        Page* page = PageTable::get_instance().alloc_page();
         if (page == nullptr)
             break;
-        pages.push_back(IndexOf(page));
-        phys.push_back(IndexOf(page) * PageBytes);
+        pages.push_back(index_of(page));
+        phys.push_back(index_of(page) * PAGE_BYTES);
     }
     void* p = nullptr;
     if (!pages.empty())
     {
-        auto& pa = PageAllocatorImpl::GetInstance();
-        p = large ? pa.MapLargePages(pages.size(), phys.data()) : pa.MapPages(pages.size(), phys.data());
+        auto& pa = PageAllocatorImpl::get_instance();
+        p = large ? pa.map_large_pages(pages.size(), phys.data()) : pa.map_pages(pages.size(), phys.data());
     }
     if (p == nullptr)
     {
         for (ulong i : pages)
-            PageTable::GetInstance().FreePage(&P.All[i]);
-        Fuzz::Reached("a driver's map refused");
+            PageTable::get_instance().free_page(&page_model.all[i]);
+        fuzz::reached("a driver's map refused");
         return;
     }
     ulong va = reinterpret_cast<ulong>(p);
     for (ulong i = 0; i < pages.size(); i++)
     {
-        auto m = P.Mapped.find(va + i * PageBytes);
-        INVARIANT(m != P.Mapped.end() && m->second == pages[i], "a driver's page %lu mapped elsewhere", i);
+        auto m = page_model.mapped.find(va + i * PAGE_BYTES);
+        INVARIANT(m != page_model.mapped.end() && m->second == pages[i], "a driver's page %lu mapped elsewhere", i);
     }
-    Place(va, {pages.size() * PageBytes, static_cast<uint8_t>(1 + in.Below(255)), large ? Block::Large : Block::Driver,
+    place(va, {pages.size() * PAGE_BYTES, static_cast<uint8_t>(1 + in.below(255)), large ? Block::Large : Block::Driver,
                pages}, large ? "MapLargePages" : "MapPages");
-    Fuzz::Reached(large ? "a large driver's map" : "a driver's map");
+    fuzz::reached(large ? "a large driver's map" : "a driver's map");
 }
 
-void Boot(Fuzz::Input& in)
+void boot(fuzz::Input& in)
 {
     /* 32 MiB and up: a smaller machine gives the largest runs' allocator no
        VA to set up over, and the kernel would not boot on it */
-    ulong pages = 8192 + in.Below(8192);
-    P.All.Array = new Page[pages];
-    P.All.Count = pages;
+    ulong pages = 8192 + in.below(8192);
+    page_model.all.array = new Page[pages];
+    page_model.all.count = pages;
     for (ulong i = 0; i < pages; i++)
-        P.All[i].Init(i * PageBytes);
-    P.Free.assign(pages, true);
-    P.MapCount.assign(pages, 0);
-    P.FreeCount = pages;
+        page_model.all[i].init(i * PAGE_BYTES);
+    page_model.free.assign(pages, true);
+    page_model.map_count.assign(pages, 0);
+    page_model.free_count = pages;
     for (ulong i = pages; i-- > 0;)
-        P.Stack.push_back(i);
+        page_model.stack.push_back(i);
     /* The fixed allocators' ranges and the first of the large runs' window:
        poisoned until mapped */
-    ASAN_POISON_MEMORY_REGION(Region, 64UL << 20);
-    INVARIANT(PageAllocatorImpl::GetInstance().Setup(), "the page allocator would not set up over %lu pages", pages);
-    Heap();
-    Baseline = pages - P.FreeCount;
+    ASAN_POISON_MEMORY_REGION(region, 64UL << 20);
+    INVARIANT(PageAllocatorImpl::get_instance().setup(), "the page allocator would not set up over %lu pages", pages);
+    tested_heap();
+    baseline = pages - page_model.free_count;
 }
 
-void Run(Fuzz::Input& in)
+void run(fuzz::Input& in)
 {
-    Boot(in);
-    for (int ops = 0; ops < 200 && in.More(); ops++)
+    boot(in);
+    for (int ops = 0; ops < 200 && in.more(); ops++)
     {
         /* Which CPU the operation runs on: a block freed on another than
            the one it was taken on moves between their caches; past the
            caches' CPUs there is none, and the pools are reached directly */
-        if (in.Chance(32))
-            Fuzz::CurrentCpu = in.Chance(16) ? Kernel::Mm::CacheCpus + in.Below(4) : in.Below(4);
-        switch (in.U8() % 13)
+        if (in.chance(32))
+            fuzz::current_cpu = in.chance(16) ? kernel::mm::CACHE_CPUS + in.below(4) : in.below(4);
+        switch (in.u8() % 13)
         {
         case 12:
             /* What the heap keeps for its next allocations given back,
                with blocks still out */
-            if (Heap().Trim())
-                Fuzz::Reached("a trim that gave something back");
+            if (tested_heap().trim())
+                fuzz::reached("a trim that gave something back");
             break;
         case 0:
         case 1:
         case 2:
         case 3:
         case 4:
-            Alloc(in);
+            alloc(in);
             break;
         case 5:
         case 6:
         case 7:
-            Free(in);
+            free_one(in);
             break;
         case 8:
-            PageRun(in);
+            page_run(in);
             break;
         case 9:
-            Driver(in);
+            driver(in);
             break;
         case 10:
             /* Pages and maps that fail, from a few calls on */
-            if (!in.Chance(48))
+            if (!in.chance(48))
                 break;
-            if (in.Bool())
-                P.FailAfter = in.Below(4);
+            if (in.boolean())
+                page_model.fail_after = in.below(4);
             else
-                P.MapFailAfter = in.Below(3);
-            Fuzz::Reached("failures armed");
+                page_model.map_fail_after = in.below(3);
+            fuzz::reached("failures armed");
             break;
         default:
-            P.FailAfter = -1;
-            P.MapFailAfter = -1;
+            page_model.fail_after = -1;
+            page_model.map_fail_after = -1;
             break;
         }
-        Fuzz::CheckNoLocksHeld("an operation");
-        CheckKept();
+        fuzz::check_no_locks_held("an operation");
+        check_kept();
     }
 
     /* Everything freed and the heap trimmed: every block as it was written,
        and every page back but the VA allocators' bitmaps -- none left in
        a pool's kept page or among the page allocator's kept blocks */
-    P.FailAfter = -1;
-    P.MapFailAfter = -1;
-    for (auto& l : Live)
-        CheckFill(l.first, l.second, "at the end");
-    while (!Live.empty())
-        Free(in);
-    Heap().Trim();
-    INVARIANT(P.All.size() - P.FreeCount == Baseline, "%lu pages still out once everything is freed, where the "
-        "bitmaps hold %lu", P.All.size() - P.FreeCount, Baseline);
-    INVARIANT(!Heap().Trim(), "a second trim found something the first left");
+    page_model.fail_after = -1;
+    page_model.map_fail_after = -1;
+    for (auto& l : live)
+        check_fill(l.first, l.second, "at the end");
+    while (!live.empty())
+        free_one(in);
+    tested_heap().trim();
+    INVARIANT(page_model.all.size() - page_model.free_count == baseline, "%lu pages still out once everything is freed, where the "
+        "bitmaps hold %lu", page_model.all.size() - page_model.free_count, baseline);
+    INVARIANT(!tested_heap().trim(), "a second trim found something the first left");
 }
 
-void Reset()
+void reset()
 {
-    for (auto& m : P.Mapped)
-        ASAN_POISON_MEMORY_REGION(reinterpret_cast<void*>(m.first), PageBytes);
-    delete[] P.All.Array;
-    P = Pages();
-    Live.clear();
-    auto& heap = AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance());
+    for (auto& m : page_model.mapped)
+        ASAN_POISON_MEMORY_REGION(reinterpret_cast<void*>(m.first), PAGE_BYTES);
+    delete[] page_model.all.array;
+    page_model = Pages();
+    live.clear();
+    auto& heap = AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance());
     heap.~AllocatorImpl();
-    new (&heap) AllocatorImpl(&PageAllocatorImpl::GetInstance());
-    auto& pa = PageAllocatorImpl::GetInstance();
+    new (&heap) AllocatorImpl(&PageAllocatorImpl::get_instance());
+    auto& pa = PageAllocatorImpl::get_instance();
     pa.~PageAllocatorImpl();
     new (&pa) PageAllocatorImpl();
 }
@@ -732,12 +732,12 @@ struct RegionInit
 {
     RegionInit()
     {
-        void* m = mmap(nullptr, RegionBytes + (16UL << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        void* m = mmap(nullptr, REGION_BYTES + (16UL << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         INVARIANT(m != MAP_FAILED, "no host VA for the heap");
-        Region = reinterpret_cast<uint8_t*>((reinterpret_cast<ulong>(m) + (16UL << 20) - 1) & ~((16UL << 20) - 1));
+        region = reinterpret_cast<uint8_t*>((reinterpret_cast<ulong>(m) + (16UL << 20) - 1) & ~((16UL << 20) - 1));
     }
-} TheRegion;
+} the_region;
 
 }
 
-const Fuzz::Target Fuzz::TheTarget = {"heap", Reset, Run, 2048, 5000};
+const fuzz::Target fuzz::THE_TARGET = {"heap", reset, run, 2048, 5000};

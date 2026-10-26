@@ -1,8 +1,8 @@
 #pragma once
 
-namespace Kernel
+namespace kernel
 {
 
-void DebugWait();
+void debug_wait();
 
 }

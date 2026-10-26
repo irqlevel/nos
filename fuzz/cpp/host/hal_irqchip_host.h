@@ -6,59 +6,59 @@
 
 #include <include/types.h>
 
-namespace Fuzz
+namespace fuzz
 {
-extern ulong CurrentCpu;
-[[noreturn]] void HostHalUnreachable(const char* what);
+extern ulong current_cpu;
+[[noreturn]] void host_hal_unreachable(const char* what);
 }
 
-namespace Hal
+namespace hal
 {
 
 /* IPI vector: IDT slot on x86, SGI INTID on arm64; on the host, the x86's */
-constexpr u8 IpiVector = 0xFE;
+constexpr u8 IPI_VECTOR = 0xFE;
 
-static inline bool IrqChipReady()
+static inline bool irq_chip_ready()
 {
     return true;
 }
 
-static inline ulong GetCurrentCpuHwId()
+static inline ulong get_current_cpu_hw_id()
 {
-    return Fuzz::CurrentCpu;
+    return fuzz::current_cpu;
 }
 
-static inline void IrqEoi()
+static inline void irq_eoi()
 {
 }
 
-static inline void IrqEoi(u8 vector)
+static inline void irq_eoi(u8 vector)
 {
     (void)vector;
 }
 
-static inline bool IrqIsInService(u8 vector)
+static inline bool irq_is_in_service(u8 vector)
 {
     (void)vector;
     return false;
 }
 
-static inline void SendIpi(ulong hwId, u8 vector)
+static inline void send_ipi(ulong hw_id, u8 vector)
 {
-    (void)hwId;
+    (void)hw_id;
     (void)vector;
-    Fuzz::HostHalUnreachable("Hal::SendIpi");
+    fuzz::host_hal_unreachable("Hal::SendIpi");
 }
 
-static inline bool NmiIpiSupported()
+static inline bool nmi_ipi_supported()
 {
     return false;
 }
 
-static inline void SendNmiIpi(ulong hwId)
+static inline void send_nmi_ipi(ulong hw_id)
 {
-    (void)hwId;
-    Fuzz::HostHalUnreachable("Hal::SendNmiIpi");
+    (void)hw_id;
+    fuzz::host_hal_unreachable("Hal::SendNmiIpi");
 }
 
 }

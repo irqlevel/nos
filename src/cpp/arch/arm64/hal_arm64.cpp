@@ -20,18 +20,18 @@ namespace
 {
 
 /* PSCI 0.2 function IDs */
-const u32 PsciSystemOff = 0x84000008;
-const u32 PsciSystemReset = 0x84000009;
+const u32 PSCI_SYSTEM_OFF = 0x84000008;
+const u32 PSCI_SYSTEM_RESET = 0x84000009;
 
 /* SMCCC: the callee may clobber x1-x17 */
 #define SMCCC_CLOBBERS \
     "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", \
     "x12", "x13", "x14", "x15", "x16", "x17", "memory"
 
-void PsciCall(u32 fn)
+void psci_call(u32 fn)
 {
     register ulong x0 asm("x0") = fn;
-    if (Kernel::Board::GetInstance().PsciUseHvc)
+    if (kernel::Board::get_instance().psci_use_hvc_)
         asm volatile("hvc #0" : "+r"(x0) :: SMCCC_CLOBBERS);
     else
         asm volatile("smc #0" : "+r"(x0) :: SMCCC_CLOBBERS);
@@ -39,23 +39,23 @@ void PsciCall(u32 fn)
 
 }
 
-namespace Hal
+namespace hal
 {
 
-bool SetupSerializingLfence()
+bool setup_serializing_lfence()
 {
     /* Nothing to set: an ISB orders what follows it on every arm64 CPU. */
     return false;
 }
 
-bool SetupCpuPerformance(CpuPerformance* out)
+bool setup_cpu_performance(CpuPerformance* out)
 {
     /* The clock is firmware's to set here, through PSCI and SCMI. */
     *out = CpuPerformance{};
     return false;
 }
 
-ulong CycleCounterHz()
+ulong cycle_counter_hz()
 {
     /* The generic timer's rate, which firmware sets and nothing changes:
        what ReadCycleCounter's CNTVCT_EL0 counts at. */
@@ -66,26 +66,26 @@ ulong CycleCounterHz()
 
 /* PMUv3 exists on the hardware but is not wired up here, and Apple's
    hypervisor does not hand the guest one to test against. */
-bool PmuAvailable()
+bool pmu_available()
 {
     return false;
 }
 
-bool PmuStart()
+bool pmu_start()
 {
     return false;
 }
 
-void PmuStop()
+void pmu_stop()
 {
 }
 
-const char* PmuName()
+const char* pmu_name()
 {
     return "none";
 }
 
-void PrintCpuInfo(Stdlib::Printer& con)
+void print_cpu_info(stdlib::Printer& con)
 {
     ulong midr, ctr, mmfr0;
     asm volatile("mrs %0, midr_el1" : "=r"(midr));
@@ -107,47 +107,47 @@ void PrintCpuInfo(Stdlib::Printer& con)
     default: break;
     }
 
-    con.Printf("implementer 0x%lX (%s)\n", implementer, name);
-    con.Printf("part 0x%lX variant %lu revision %lu, midr 0x%lX\n",
+    con.printf("implementer 0x%lX (%s)\n", implementer, name);
+    con.printf("part 0x%lX variant %lu revision %lu, midr 0x%lX\n",
         (midr >> 4) & 0xFFF, (midr >> 20) & 0xF, midr & 0xF, midr);
 
     /* Log2 of the words in the smallest cache line, per CTR_EL0. */
-    con.Printf("cache line: i %lu bytes, d %lu bytes\n",
+    con.printf("cache line: i %lu bytes, d %lu bytes\n",
         4UL << (ctr & 0xF), 4UL << ((ctr >> 16) & 0xF));
 
     /* PARange, the physical address width this core can address. */
-    static const u8 ParangeBits[] = { 32, 36, 40, 42, 44, 48, 52, 56 };
+    static const u8 PARANGE_BITS[] = { 32, 36, 40, 42, 44, 48, 52, 56 };
     ulong parange = mmfr0 & 0xF;
-    con.Printf("physical address bits %lu\n",
-        (parange < Stdlib::ArraySize(ParangeBits))
-            ? (ulong)ParangeBits[parange] : 0UL);
+    con.printf("physical address bits %lu\n",
+        (parange < stdlib::array_size(PARANGE_BITS))
+            ? (ulong)PARANGE_BITS[parange] : 0UL);
 }
 
-void PrintCpuState(Stdlib::Printer& con)
+void print_cpu_state(stdlib::Printer& con)
 {
     ulong v;
     asm volatile("mrs %0, CurrentEL" : "=r"(v));
-    con.Printf("el %lu sp 0x%lX", v >> 2, Hal::GetSp());
+    con.printf("el %lu sp 0x%lX", v >> 2, hal::get_sp());
     asm volatile("mrs %0, sctlr_el1" : "=r"(v));
-    con.Printf(" sctlr 0x%lX", v);
+    con.printf(" sctlr 0x%lX", v);
     asm volatile("mrs %0, tcr_el1" : "=r"(v));
-    con.Printf(" tcr 0x%lX\n", v);
+    con.printf(" tcr 0x%lX\n", v);
     asm volatile("mrs %0, ttbr1_el1" : "=r"(v));
-    con.Printf("ttbr1 0x%lX", v);
+    con.printf("ttbr1 0x%lX", v);
     asm volatile("mrs %0, mair_el1" : "=r"(v));
-    con.Printf(" mair 0x%lX", v);
+    con.printf(" mair 0x%lX", v);
     asm volatile("mrs %0, daif" : "=r"(v));
-    con.Printf(" daif 0x%lX", v);
+    con.printf(" daif 0x%lX", v);
     asm volatile("mrs %0, vbar_el1" : "=r"(v));
-    con.Printf(" vbar 0x%lX mpidr %lu\n", v, Hal::GetCurrentCpuHwId());
+    con.printf(" vbar 0x%lX mpidr %lu\n", v, hal::get_current_cpu_hw_id());
 }
 
-void EnableWxSupport()
+void enable_wx_support()
 {
     /* PXN/UXN are always active on arm64 — nothing to enable. */
 }
 
-void SyncInstructionCache(ulong va, ulong size)
+void sync_instruction_cache(ulong va, ulong size)
 {
     if (size == 0)
         return;
@@ -175,90 +175,90 @@ void SyncInstructionCache(ulong va, ulong size)
     asm volatile("isb" ::: "memory");
 }
 
-u16 ModuleElfMachine()
+u16 module_elf_machine()
 {
-    return Kernel::Elf::MachineAarch64;
+    return kernel::elf::MACHINE_AARCH64;
 }
 
-ModuleReloc ClassifyModuleReloc(u32 type)
+ModuleReloc classify_module_reloc(u32 type)
 {
     /* AArch64 ELF ABI numbering */
-    static const u32 RelNone = 0;
-    static const u32 RelAbs64 = 257;     /* R_AARCH64_ABS64: a pointer in data */
-    static const u32 RelGlobDat = 1025;  /* R_AARCH64_GLOB_DAT: a GOT slot */
-    static const u32 RelJumpSlot = 1026; /* R_AARCH64_JUMP_SLOT: a PLT's slot */
-    static const u32 RelRelative = 1027; /* R_AARCH64_RELATIVE */
+    static const u32 REL_NONE = 0;
+    static const u32 REL_ABS64 = 257;     /* R_AARCH64_ABS64: a pointer in data */
+    static const u32 REL_GLOB_DAT = 1025;  /* R_AARCH64_GLOB_DAT: a GOT slot */
+    static const u32 REL_JUMP_SLOT = 1026; /* R_AARCH64_JUMP_SLOT: a PLT's slot */
+    static const u32 REL_RELATIVE = 1027; /* R_AARCH64_RELATIVE */
 
     switch (type)
     {
-    case RelNone:
+    case REL_NONE:
         return ModuleReloc::None;
-    case RelRelative:
+    case REL_RELATIVE:
         return ModuleReloc::Relative;
-    case RelAbs64:
-    case RelGlobDat:
-    case RelJumpSlot:
+    case REL_ABS64:
+    case REL_GLOB_DAT:
+    case REL_JUMP_SLOT:
         return ModuleReloc::Symbol;
     default:
         return ModuleReloc::Unsupported;
     }
 }
 
-void SetupMemoryTypes()
+void setup_memory_types()
 {
     /* boot.S loads the same MAIR_EL1 on the boot CPU and on every
        secondary, and idx2 is already Normal non-cacheable — the arm64
        equivalent of write-combining. Nothing to do per CPU. */
 }
 
-bool IsWriteCombiningAvailable()
+bool is_write_combining_available()
 {
     return true;
 }
 
-void ConsoleOut(const char *s)
+void console_out(const char *s)
 {
-    Kernel::Pl011::PrintString(s);
+    kernel::Pl011::print_string(s);
 }
 
-void ConsoleOutBackspace()
+void console_out_backspace()
 {
-    Kernel::Pl011::PrintString("\b \b");
+    kernel::Pl011::print_string("\b \b");
 }
 
-void ConsoleOutClear()
+void console_out_clear()
 {
     /* ANSI escape: clear screen and move cursor home */
-    Kernel::Pl011::PrintString("\033[2J\033[H");
+    kernel::Pl011::print_string("\033[2J\033[H");
 }
 
-void ConsoleWrite(const char *msg)
+void console_write(const char *msg)
 {
-    Kernel::Pl011::PrintString(msg);
+    kernel::Pl011::print_string(msg);
 }
 
-void ConsolePanicWrite(const char *msg)
+void console_panic_write(const char *msg)
 {
-    Kernel::Pl011::PanicPrintString(msg);
+    kernel::Pl011::panic_print_string(msg);
 }
 
-void PowerOff()
+void power_off()
 {
-    PsciCall(PsciSystemOff);
+    psci_call(PSCI_SYSTEM_OFF);
     for (;;)
     {
         asm volatile("wfi");
     }
 }
 
-void Reset()
+void reset()
 {
-    ResetNow();
+    reset_now();
 }
 
-void ResetNow()
+void reset_now()
 {
-    PsciCall(PsciSystemReset);
+    psci_call(PSCI_SYSTEM_RESET);
     for (;;)
     {
         asm volatile("wfi");

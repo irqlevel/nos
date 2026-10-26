@@ -1,35 +1,35 @@
 #include "grub_env.h"
 #include "stdlib.h"
 
-namespace Stdlib
+namespace stdlib
 {
 
-static const char GrubEnvSignature[] = "# GRUB Environment Block\n";
-static_assert(sizeof(GrubEnvSignature) - 1 == GrubEnvBlock::SignatureLen,
+static const char GRUB_ENV_SIGNATURE[] = "# GRUB Environment Block\n";
+static_assert(sizeof(GRUB_ENV_SIGNATURE) - 1 == GrubEnvBlock::SIGNATURE_LEN,
     "GRUB environment block signature length");
 
 GrubEnvBlock::GrubEnvBlock(char* buf, ulong size)
-    : Buf(buf)
-    , Size(size)
+    : buf_(buf)
+    , size_(size)
 {
 }
 
-bool GrubEnvBlock::IsValid()
+bool GrubEnvBlock::is_valid()
 {
-    return Buf != nullptr && Size >= MinSize &&
-        MemCmp(Buf, GrubEnvSignature, SignatureLen) == 0;
+    return buf_ != nullptr && size_ >= MIN_SIZE &&
+        mem_cmp(buf_, GRUB_ENV_SIGNATURE, SIGNATURE_LEN) == 0;
 }
 
-void GrubEnvBlock::Format(char* buf, ulong size)
+void GrubEnvBlock::format(char* buf, ulong size)
 {
-    if (buf == nullptr || size < MinSize)
+    if (buf == nullptr || size < MIN_SIZE)
         return;
 
-    MemSet(buf, '#', size);
-    MemCpy(buf, GrubEnvSignature, SignatureLen);
+    mem_set(buf, '#', size);
+    mem_cpy(buf, GRUB_ENV_SIGNATURE, SIGNATURE_LEN);
 }
 
-bool GrubEnvBlock::ValidName(const char* name)
+bool GrubEnvBlock::valid_name(const char* name)
 {
     if (name == nullptr || name[0] == '\0')
         return false;
@@ -40,13 +40,13 @@ bool GrubEnvBlock::ValidName(const char* name)
         char c = *p;
         bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                   (c >= '0' && c <= '9') || c == '_';
-        if (!ok || len >= MaxNameLen)
+        if (!ok || len >= MAX_NAME_LEN)
             return false;
     }
     return true;
 }
 
-ulong GrubEnvBlock::EscapedLen(const char* value)
+ulong GrubEnvBlock::escaped_len(const char* value)
 {
     ulong len = 0;
     for (const char* p = value; *p != '\0'; p++)
@@ -54,76 +54,76 @@ ulong GrubEnvBlock::EscapedLen(const char* value)
     return len;
 }
 
-ulong GrubEnvBlock::NextLine(ulong pos)
+ulong GrubEnvBlock::next_line(ulong pos)
 {
-    while (pos < Size)
+    while (pos < size_)
     {
-        if (Buf[pos] == '\\')
+        if (buf_[pos] == '\\')
             pos += 2;
-        else if (Buf[pos] == '\n')
+        else if (buf_[pos] == '\n')
             return pos + 1;
         else
             pos++;
     }
-    return Size;
+    return size_;
 }
 
-ulong GrubEnvBlock::ValueLen(ulong pos)
+ulong GrubEnvBlock::value_len(ulong pos)
 {
     ulong len = 0;
-    while (pos + len < Size && Buf[pos + len] != '\n')
-        len += (Buf[pos + len] == '\\') ? 2 : 1;
+    while (pos + len < size_ && buf_[pos + len] != '\n')
+        len += (buf_[pos + len] == '\\') ? 2 : 1;
 
-    if (pos + len >= Size)
-        return NoNewline;
+    if (pos + len >= size_)
+        return NO_NEWLINE;
     return len;
 }
 
-long GrubEnvBlock::FindLine(const char* name, ulong nameLen, ulong limit)
+long GrubEnvBlock::find_line(const char* name, ulong name_len, ulong limit)
 {
-    ulong pos = SignatureLen;
-    while (pos + nameLen + 1 < limit)
+    ulong pos = SIGNATURE_LEN;
+    while (pos + name_len + 1 < limit)
     {
-        if (MemCmp(Buf + pos, name, nameLen) == 0 && Buf[pos + nameLen] == '=')
+        if (mem_cmp(buf_ + pos, name, name_len) == 0 && buf_[pos + name_len] == '=')
             return (long)pos;
-        pos = NextLine(pos);
+        pos = next_line(pos);
     }
     return -1;
 }
 
-bool GrubEnvBlock::FreeSpace(ulong& space)
+bool GrubEnvBlock::free_space(ulong& space)
 {
-    ulong pos = Size;
-    while (pos > SignatureLen && Buf[pos - 1] == '#')
+    ulong pos = size_;
+    while (pos > SIGNATURE_LEN && buf_[pos - 1] == '#')
         pos--;
 
-    if (Buf[pos - 1] != '\n')
+    if (buf_[pos - 1] != '\n')
         return false;
 
     space = pos;
     return true;
 }
 
-bool GrubEnvBlock::ParseLine(ulong pos, ulong limit, ulong& nameEnd, ulong& next)
+bool GrubEnvBlock::parse_line(ulong pos, ulong limit, ulong& name_end, ulong& next)
 {
     /* A backslash would make NextLine and FindLine step over what follows it,
        and a NUL cut the name ForEach hands out short of the one FindLine
        compares */
     ulong p = pos;
-    while (p < limit && Buf[p] != '=')
+    while (p < limit && buf_[p] != '=')
     {
-        char c = Buf[p];
-        if (c == '\n' || c == '\\' || c == '\0' || p - pos >= MaxNameLen)
+        char c = buf_[p];
+        if (c == '\n' || c == '\\' || c == '\0' || p - pos >= MAX_NAME_LEN)
             return false;
         p++;
     }
     if (p >= limit)
         return false;
-    nameEnd = p;
+    name_end = p;
 
     p++;
-    while (p < limit && Buf[p] != '\n')
-        p += (Buf[p] == '\\') ? 2 : 1;
+    while (p < limit && buf_[p] != '\n')
+        p += (buf_[p] == '\\') ? 2 : 1;
     if (p >= limit)
         return false;
 
@@ -131,25 +131,25 @@ bool GrubEnvBlock::ParseLine(ulong pos, ulong limit, ulong& nameEnd, ulong& next
     return true;
 }
 
-bool GrubEnvBlock::WellFormed(ulong limit)
+bool GrubEnvBlock::well_formed(ulong limit)
 {
-    ulong pos = SignatureLen;
+    ulong pos = SIGNATURE_LEN;
     while (pos < limit)
     {
-        char c = Buf[pos];
+        char c = buf_[pos];
         ulong next;
         if (c == '#' || c == '\n' || c == '\r')
         {
             /* A comment whose last newline is escaped runs on into whatever
                comes after it */
-            next = NextLine(pos);
+            next = next_line(pos);
             if (next > limit)
                 return false;
         }
         else
         {
-            ulong nameEnd;
-            if (!ParseLine(pos, limit, nameEnd, next))
+            ulong name_end;
+            if (!parse_line(pos, limit, name_end, next))
                 return false;
         }
         pos = next;
@@ -157,126 +157,126 @@ bool GrubEnvBlock::WellFormed(ulong limit)
     return true;
 }
 
-bool GrubEnvBlock::Set(const char* name, const char* value)
+bool GrubEnvBlock::set(const char* name, const char* value)
 {
-    if (!IsValid() || !ValidName(name) || value == nullptr)
+    if (!is_valid() || !valid_name(name) || value == nullptr)
         return false;
 
-    ulong nameLen = StrLen(name);
-    ulong newLen = EscapedLen(value);
+    ulong name_len = str_len(name);
+    ulong new_len = escaped_len(value);
 
     ulong space;
-    if (!FreeSpace(space) || !WellFormed(space))
+    if (!free_space(space) || !well_formed(space))
         return false;
-    ulong room = Size - space;
+    ulong room = size_ - space;
 
-    ulong valuePos;
-    long line = FindLine(name, nameLen, space);
+    ulong value_pos;
+    long line = find_line(name, name_len, space);
     if (line >= 0)
     {
-        valuePos = (ulong)line + nameLen + 1;
-        ulong oldLen = ValueLen(valuePos);
-        if (oldLen == NoNewline)
+        value_pos = (ulong)line + name_len + 1;
+        ulong old_len = value_len(value_pos);
+        if (old_len == NO_NEWLINE)
             return false;
 
         /* The lines after this one and the padding move as one; growing
            eats the tail of the padding, which the room check says is
            there, shrinking leaves stale bytes at the very end to cover. */
-        if (newLen > oldLen)
+        if (new_len > old_len)
         {
-            ulong grow = newLen - oldLen;
+            ulong grow = new_len - old_len;
             if (room < grow)
                 return false;
-            MemMove(Buf + valuePos + newLen, Buf + valuePos + oldLen, Size - (valuePos + newLen));
+            mem_move(buf_ + value_pos + new_len, buf_ + value_pos + old_len, size_ - (value_pos + new_len));
         }
-        else if (newLen < oldLen)
+        else if (new_len < old_len)
         {
-            ulong shrink = oldLen - newLen;
-            MemMove(Buf + valuePos + newLen, Buf + valuePos + oldLen, Size - (valuePos + oldLen));
-            MemSet(Buf + Size - shrink, '#', shrink);
+            ulong shrink = old_len - new_len;
+            mem_move(buf_ + value_pos + new_len, buf_ + value_pos + old_len, size_ - (value_pos + old_len));
+            mem_set(buf_ + size_ - shrink, '#', shrink);
         }
     }
     else
     {
-        if (room < nameLen + 1 + newLen + 1)
+        if (room < name_len + 1 + new_len + 1)
             return false;
-        MemCpy(Buf + space, name, nameLen);
-        Buf[space + nameLen] = '=';
-        valuePos = space + nameLen + 1;
+        mem_cpy(buf_ + space, name, name_len);
+        buf_[space + name_len] = '=';
+        value_pos = space + name_len + 1;
     }
 
-    ulong pos = valuePos;
+    ulong pos = value_pos;
     for (const char* p = value; *p != '\0'; p++)
     {
         if (*p == '\\' || *p == '\n')
-            Buf[pos++] = '\\';
-        Buf[pos++] = *p;
+            buf_[pos++] = '\\';
+        buf_[pos++] = *p;
     }
-    Buf[pos] = '\n';
+    buf_[pos] = '\n';
     return true;
 }
 
-bool GrubEnvBlock::Unset(const char* name)
+bool GrubEnvBlock::unset(const char* name)
 {
-    if (!IsValid() || !ValidName(name))
+    if (!is_valid() || !valid_name(name))
         return false;
 
     ulong space;
-    if (!FreeSpace(space) || !WellFormed(space))
+    if (!free_space(space) || !well_formed(space))
         return false;
 
-    ulong nameLen = StrLen(name);
-    long line = FindLine(name, nameLen, space);
+    ulong name_len = str_len(name);
+    long line = find_line(name, name_len, space);
     if (line < 0)
         return false;
 
-    ulong valueLen = ValueLen((ulong)line + nameLen + 1);
-    if (valueLen == NoNewline)
+    ulong vlen = value_len((ulong)line + name_len + 1);
+    if (vlen == NO_NEWLINE)
         return false;
 
-    ulong lineLen = nameLen + 1 + valueLen + 1;
-    MemMove(Buf + line, Buf + line + lineLen, Size - ((ulong)line + lineLen));
-    MemSet(Buf + Size - lineLen, '#', lineLen);
+    ulong line_len = name_len + 1 + vlen + 1;
+    mem_move(buf_ + line, buf_ + line + line_len, size_ - ((ulong)line + line_len));
+    mem_set(buf_ + size_ - line_len, '#', line_len);
     return true;
 }
 
-bool GrubEnvBlock::ForEach(Visitor visitor, void* ctx)
+bool GrubEnvBlock::for_each(Visitor visitor, void* ctx)
 {
-    if (!IsValid() || visitor == nullptr)
+    if (!is_valid() || visitor == nullptr)
         return false;
 
-    ulong pos = SignatureLen;
-    while (pos < Size)
+    ulong pos = SIGNATURE_LEN;
+    while (pos < size_)
     {
-        char c = Buf[pos];
+        char c = buf_[pos];
         if (c == '#' || c == '\n' || c == '\r')
         {
-            pos = NextLine(pos);
+            pos = next_line(pos);
             continue;
         }
 
-        ulong nameEnd, next;
-        if (!ParseLine(pos, Size, nameEnd, next))
+        ulong name_end, next;
+        if (!parse_line(pos, size_, name_end, next))
             return false;
 
         /* ParseLine bounds the name by MaxNameLen */
-        char name[MaxNameLen + 1];
-        ulong nameLen = nameEnd - pos;
-        MemCpy(name, Buf + pos, nameLen);
-        name[nameLen] = '\0';
+        char name[MAX_NAME_LEN + 1];
+        ulong name_len = name_end - pos;
+        mem_cpy(name, buf_ + pos, name_len);
+        name[name_len] = '\0';
 
         /* ParseLine stopped on this line's newline and stepped over escapes
            the same way, so the walk cannot run past it */
-        char value[MaxValueLen + 1];
-        ulong valueLen = 0;
-        for (ulong i = nameEnd + 1; Buf[i] != '\n'; i++)
+        char value[MAX_VALUE_LEN + 1];
+        ulong value_len = 0;
+        for (ulong i = name_end + 1; buf_[i] != '\n'; i++)
         {
-            if (Buf[i] == '\\')
+            if (buf_[i] == '\\')
                 i++;
-            if (valueLen < MaxValueLen)
-                value[valueLen++] = Buf[i];
+            if (value_len < MAX_VALUE_LEN)
+                value[value_len++] = buf_[i];
         }
-        value[valueLen] = '\0';
+        value[value_len] = '\0';
 
         if (!visitor(name, value, ctx))
             return true;
@@ -289,35 +289,35 @@ bool GrubEnvBlock::ForEach(Visitor visitor, void* ctx)
 
 struct GrubEnvGetCtx
 {
-    const char* Name;
-    char* Value;
-    ulong ValueSize;
-    bool Found;
+    const char* name;
+    char* value;
+    ulong value_size;
+    bool found;
 };
 
-bool GrubEnvBlock::GetVisitor(const char* name, const char* value, void* ctx)
+bool GrubEnvBlock::get_visitor(const char* name, const char* value, void* ctx)
 {
     auto* get = static_cast<GrubEnvGetCtx*>(ctx);
-    if (StrCmp(name, get->Name) != 0)
+    if (str_cmp(name, get->name) != 0)
         return true;
 
-    StrnCpy(get->Value, value, get->ValueSize);
-    get->Found = true;
+    strn_cpy(get->value, value, get->value_size);
+    get->found = true;
     return false;
 }
 
-bool GrubEnvBlock::Get(const char* name, char* value, ulong valueSize)
+bool GrubEnvBlock::get(const char* name, char* value, ulong value_size)
 {
-    if (!ValidName(name) || value == nullptr || valueSize == 0)
+    if (!valid_name(name) || value == nullptr || value_size == 0)
         return false;
 
     GrubEnvGetCtx ctx;
-    ctx.Name = name;
-    ctx.Value = value;
-    ctx.ValueSize = valueSize;
-    ctx.Found = false;
-    ForEach(GetVisitor, &ctx);
-    return ctx.Found;
+    ctx.name = name;
+    ctx.value = value;
+    ctx.value_size = value_size;
+    ctx.found = false;
+    for_each(get_visitor, &ctx);
+    return ctx.found;
 }
 
 }

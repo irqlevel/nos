@@ -210,24 +210,24 @@ high_entry:
     mrs     x0, mpidr_el1
     and     x0, x0, #0xFF
     msr     tpidr_el1, x0
-    adrp    x1, BootStackTop
-    add     x1, x1, :lo12:BootStackTop
+    adrp    x1, boot_stack_top
+    add     x1, x1, :lo12:boot_stack_top
     mov     sp, x1
 
     ldr     x1, =0xFFFF800000000000
     add     x0, x27, x1
-    bl      MainArm64
+    bl      main_arm64
 
 3:  wfi
     b       3b
 
     /* PSCI CPU_ON secondary entry: x0 = cpu index (context id). MMU off
-       at the physical address; the BSP filled Arm64ApTtbr1 with the real
-       kernel table root and Arm64ApStackTop[index] with virtual stack
+       at the physical address; the BSP filled arm64_ap_ttbr1 with the real
+       kernel table root and arm64_ap_stack_top[index] with virtual stack
        tops before the CPU_ON call. TTBR0 reuses the boot identity table
        for the switch, exactly like the BSP path. */
-    .globl SecondaryEntry
-SecondaryEntry:
+    .globl secondary_entry
+secondary_entry:
     mov     x27, x0                 /* cpu index */
 
     mrs     x1, CurrentEL
@@ -265,8 +265,8 @@ ap_el1:
 
     adrp    x1, BootPgTblIdL0
     msr     ttbr0_el1, x1
-    adrp    x1, Arm64ApTtbr1
-    add     x1, x1, :lo12:Arm64ApTtbr1
+    adrp    x1, arm64_ap_ttbr1
+    add     x1, x1, :lo12:arm64_ap_ttbr1
     ldr     x1, [x1]
     msr     ttbr1_el1, x1
 
@@ -301,12 +301,12 @@ ap_high_entry:
     isb
 
     msr     tpidr_el1, x27      /* cache this CPU's index */
-    adrp    x1, Arm64ApStackTop
-    add     x1, x1, :lo12:Arm64ApStackTop
+    adrp    x1, arm64_ap_stack_top
+    add     x1, x1, :lo12:arm64_ap_stack_top
     ldr     x1, [x1, x27, lsl #3]
     mov     sp, x1
     mov     x0, x27
-    bl      ApMainArm64
+    bl      ap_main_arm64
 4:  wfi
     b       4b
 
@@ -324,29 +324,29 @@ BootPgTblIdL0:
 BootPgTblIdL1:
     .space 4096
     /* A page of nothing between the boot stack and the identity tables above
-       -- which each AP walks the moment it turns its MMU on. MainArm64 fills
+       -- which each AP walks the moment it turns its MMU on. main_arm64 fills
        it with the stack probe's pattern and CpuTable::StartAll checks it
        before starting any AP, so a boot stack that runs off its end is a
        panic, not an identity table zeroed under an AP that then dies with no
        vector to fault to. That is how it showed first: a UBSan build's
        deeper frames overran the 16 KiB this stack had, and every AP was
        "still not running" (docs/build.md). */
-    .globl BootStackGuard
-BootStackGuard:
+    .globl boot_stack_guard
+boot_stack_guard:
     .space 4096
     /* 32 KiB, as x86's boot stacks: the boot path takes ~16 KiB on both, and
        it had 248 bytes to spare here. */
-    .globl BootStack
-BootStack:
+    .globl boot_stack
+boot_stack:
     .space 32768
-    .globl BootStackTop
-BootStackTop:
-    .globl Arm64ApTtbr1
-Arm64ApTtbr1:
+    .globl boot_stack_top
+boot_stack_top:
+    .globl arm64_ap_ttbr1
+arm64_ap_ttbr1:
     .space 8
     /* One stack-top pointer per CPU, indexed by the CPU index PSCI CPU_ON
        passes back in x0. Must hold Kernel::MaxCpus entries; a static_assert
        in cpu_start_arm64.cpp checks the two agree. */
-    .globl Arm64ApStackTop
-Arm64ApStackTop:
+    .globl arm64_ap_stack_top
+arm64_ap_stack_top:
     .space (64 * 8)

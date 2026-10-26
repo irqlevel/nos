@@ -34,7 +34,7 @@
 
 extern "C" void rust_disklog_log(const char* line);
 
-namespace Kernel
+namespace kernel
 {
 
 namespace
@@ -44,110 +44,110 @@ namespace
    ubsan_handlers.h, clang's side of the ABI. */
 struct SourceLocation
 {
-    const char* File;
-    u32 Line;
-    u32 Column;
+    const char* file;
+    u32 line;
+    u32 column;
 };
 
 /* Followed in memory by the type's name, NUL-terminated. */
 struct TypeDescriptor
 {
-    u16 Kind;
-    u16 Info;
+    u16 kind;
+    u16 info;
 };
 
 struct TypeMismatchData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* Type;
-    u8 LogAlignment;
-    u8 CheckKind;
+    SourceLocation loc;
+    const TypeDescriptor* type;
+    u8 log_alignment;
+    u8 check_kind;
 };
 
 struct AlignmentAssumptionData
 {
-    SourceLocation Loc;
-    SourceLocation AssumptionLoc;
-    const TypeDescriptor* Type;
+    SourceLocation loc;
+    SourceLocation assumption_loc;
+    const TypeDescriptor* type;
 };
 
 struct OverflowData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* Type;
+    SourceLocation loc;
+    const TypeDescriptor* type;
 };
 
 struct ShiftOutOfBoundsData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* LhsType;
-    const TypeDescriptor* RhsType;
+    SourceLocation loc;
+    const TypeDescriptor* lhs_type;
+    const TypeDescriptor* rhs_type;
 };
 
 struct OutOfBoundsData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* ArrayType;
-    const TypeDescriptor* IndexType;
+    SourceLocation loc;
+    const TypeDescriptor* array_type;
+    const TypeDescriptor* index_type;
 };
 
 struct UnreachableData
 {
-    SourceLocation Loc;
+    SourceLocation loc;
 };
 
 struct VlaBoundData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* Type;
+    SourceLocation loc;
+    const TypeDescriptor* type;
 };
 
 struct InvalidValueData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* Type;
+    SourceLocation loc;
+    const TypeDescriptor* type;
 };
 
 struct InvalidBuiltinData
 {
-    SourceLocation Loc;
-    u8 Kind;
+    SourceLocation loc;
+    u8 kind;
 };
 
 struct NonNullReturnData
 {
-    SourceLocation AttrLoc;
+    SourceLocation attr_loc;
 };
 
 struct NonNullArgData
 {
-    SourceLocation Loc;
-    SourceLocation AttrLoc;
-    int ArgIndex;
+    SourceLocation loc;
+    SourceLocation attr_loc;
+    int arg_index;
 };
 
 struct PointerOverflowData
 {
-    SourceLocation Loc;
+    SourceLocation loc;
 };
 
 struct FloatCastOverflowData
 {
-    SourceLocation Loc;
-    const TypeDescriptor* FromType;
-    const TypeDescriptor* ToType;
+    SourceLocation loc;
+    const TypeDescriptor* from_type;
+    const TypeDescriptor* to_type;
 };
 
-const u16 TypeKindInteger = 0;
-const u16 TypeInfoSigned = 1;
-const u32 ReportedBit = 0x80000000;
-const unsigned MaxInlineBits = 64;
-const size_t LineMax = 256;
-const size_t ValueMax = 32;
-const size_t BacktraceFrames = 16;
+const u16 TYPE_KIND_INTEGER = 0;
+const u16 TYPE_INFO_SIGNED = 1;
+const u32 REPORTED_BIT = 0x80000000;
+const unsigned MAX_INLINE_BITS = 64;
+const size_t LINE_LEN_MAX = 256;
+const size_t VALUE_MAX = 32;
+const size_t BACKTRACE_FRAMES = 16;
 
 /* TypeMismatchData::CheckKind, in clang's order. */
-const char* const CheckKindNames[] = {
+const char* const CHECK_KIND_NAMES[] = {
     "load of", "store to", "reference binding to", "member access within",
     "member call on", "constructor call on", "downcast of", "downcast of",
     "upcast of", "cast to virtual base of", "_Nonnull binding to",
@@ -155,100 +155,100 @@ const char* const CheckKindNames[] = {
 };
 
 /* InvalidBuiltinData::Kind */
-const u8 BuiltinCtz = 0;
-const u8 BuiltinClz = 1;
+const u8 BUILTIN_CTZ = 0;
+const u8 BUILTIN_CLZ = 1;
 
 /* Constant-initialised, so nothing here needs a constructor to have run. */
-int Busy;
-bool WarnOnly;
-unsigned long ReportCount;
-unsigned long UnprintedCount;
+int busy;
+bool warn_only;
+unsigned long report_count;
+unsigned long unprinted_count;
 
-const char* TypeName(const TypeDescriptor* type)
+const char* type_name(const TypeDescriptor* type)
 {
     return reinterpret_cast<const char*>(type) + sizeof(TypeDescriptor);
 }
 
-bool IsInteger(const TypeDescriptor* type)
+bool is_integer(const TypeDescriptor* type)
 {
-    return type->Kind == TypeKindInteger;
+    return type->kind == TYPE_KIND_INTEGER;
 }
 
-bool IsSigned(const TypeDescriptor* type)
+bool is_signed(const TypeDescriptor* type)
 {
-    return (type->Info & TypeInfoSigned) != 0;
+    return (type->info & TYPE_INFO_SIGNED) != 0;
 }
 
-unsigned BitWidth(const TypeDescriptor* type)
+unsigned bit_width(const TypeDescriptor* type)
 {
-    return 1u << (type->Info >> 1);
+    return 1u << (type->info >> 1);
 }
 
 /* An integer of up to 64 bits arrives in the handle itself; a wider one as a
    pointer to it, which is only ever printed as a width. */
-bool IsInline(const TypeDescriptor* type)
+bool is_inline(const TypeDescriptor* type)
 {
-    return IsInteger(type) && BitWidth(type) <= MaxInlineBits;
+    return is_integer(type) && bit_width(type) <= MAX_INLINE_BITS;
 }
 
-long SignedValue(const TypeDescriptor* type, ulong value)
+long signed_value(const TypeDescriptor* type, ulong value)
 {
-    unsigned width = BitWidth(type);
-    if (width >= MaxInlineBits)
+    unsigned width = bit_width(type);
+    if (width >= MAX_INLINE_BITS)
         return (long)value;
 
-    unsigned shift = MaxInlineBits - width;
+    unsigned shift = MAX_INLINE_BITS - width;
     return (long)(value << shift) >> shift;
 }
 
-bool IsNegative(const TypeDescriptor* type, ulong value)
+bool is_negative(const TypeDescriptor* type, ulong value)
 {
-    return IsInline(type) && IsSigned(type) && SignedValue(type, value) < 0;
+    return is_inline(type) && is_signed(type) && signed_value(type, value) < 0;
 }
 
-void FormatValue(char* buf, size_t size, const TypeDescriptor* type, ulong value)
+void format_value(char* buf, size_t size, const TypeDescriptor* type, ulong value)
 {
-    if (!IsInteger(type))
+    if (!is_integer(type))
     {
-        Stdlib::SnPrintf(buf, size, "<a value of type %s>", TypeName(type));
+        stdlib::sn_printf(buf, size, "<a value of type %s>", type_name(type));
         return;
     }
-    if (!IsInline(type))
+    if (!is_inline(type))
     {
-        Stdlib::SnPrintf(buf, size, "<a %lu-bit value>", (ulong)BitWidth(type));
+        stdlib::sn_printf(buf, size, "<a %lu-bit value>", (ulong)bit_width(type));
         return;
     }
-    if (IsSigned(type))
+    if (is_signed(type))
     {
-        Stdlib::SnPrintf(buf, size, "%ld", SignedValue(type, value));
+        stdlib::sn_printf(buf, size, "%ld", signed_value(type, value));
         return;
     }
 
-    unsigned width = BitWidth(type);
-    ulong masked = (width >= MaxInlineBits) ? value : (value & ((1UL << width) - 1));
-    Stdlib::SnPrintf(buf, size, "%lu", masked);
+    unsigned width = bit_width(type);
+    ulong masked = (width >= MAX_INLINE_BITS) ? value : (value & ((1UL << width) - 1));
+    stdlib::sn_printf(buf, size, "%lu", masked);
 }
 
-void Emit(const char* text)
+void emit(const char* text)
 {
-    Hal::ConsolePanicWrite(text);
+    hal::console_panic_write(text);
     rust_disklog_log(text);
 }
 
 /* Whether this failure is to be printed: nobody else is reporting, and its
    site has not reported yet. On true the caller holds Busy. */
-bool Begin(SourceLocation* loc)
+bool begin(SourceLocation* loc)
 {
-    if (__atomic_exchange_n(&Busy, 1, __ATOMIC_ACQUIRE) != 0)
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE) != 0)
     {
-        __atomic_add_fetch(&UnprintedCount, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&unprinted_count, 1, __ATOMIC_RELAXED);
         return false;
     }
 
-    u32 before = __atomic_fetch_or(&loc->Column, ReportedBit, __ATOMIC_RELAXED);
-    if (before & ReportedBit)
+    u32 before = __atomic_fetch_or(&loc->column, REPORTED_BIT, __ATOMIC_RELAXED);
+    if (before & REPORTED_BIT)
     {
-        __atomic_store_n(&Busy, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
         return false;
     }
     return true;
@@ -256,76 +256,76 @@ bool Begin(SourceLocation* loc)
 
 /* Print the report and, unless ubsan=warn, panic with it. Called holding
    Busy, which a warning gives back. */
-void Report(const SourceLocation* loc, const char* what)
+void report(const SourceLocation* loc, const char* what)
 {
-    char line[LineMax];
-    ulong count = __atomic_add_fetch(&ReportCount, 1, __ATOMIC_RELAXED);
-    Stdlib::SnPrintf(line, sizeof(line), "UBSAN: %s at %s:%lu:%lu",
-        what, loc->File, (ulong)loc->Line, (ulong)(loc->Column & ~ReportedBit));
+    char line[LINE_LEN_MAX];
+    ulong count = __atomic_add_fetch(&report_count, 1, __ATOMIC_RELAXED);
+    stdlib::sn_printf(line, sizeof(line), "UBSAN: %s at %s:%lu:%lu",
+        what, loc->file, (ulong)loc->line, (ulong)(loc->column & ~REPORTED_BIT));
 
-    if (!__atomic_load_n(&WarnOnly, __ATOMIC_RELAXED))
-        Panic("%s", line);
+    if (!__atomic_load_n(&warn_only, __ATOMIC_RELAXED))
+        PANIC("%s", line);
 
-    ulong flags = Hal::IrqSave();
+    ulong flags = hal::irq_save();
 
-    Emit(line);
-    Emit("\n");
+    emit(line);
+    emit("\n");
 
-    ulong frames[BacktraceFrames];
-    size_t frameCount = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
-    char where[SymbolTable::DescribeMax];
-    char buf[SymbolTable::DescribeMax + ValueMax];
-    for (size_t i = 0; i < frameCount; i++)
+    ulong frames[BACKTRACE_FRAMES];
+    size_t frame_count = StackTrace::capture(frames, stdlib::array_size(frames));
+    char where[SymbolTable::DESCRIBE_MAX];
+    char buf[SymbolTable::DESCRIBE_MAX + VALUE_MAX];
+    for (size_t i = 0; i < frame_count; i++)
     {
-        if (SymbolTable::GetInstance().DescribeReturn(frames[i], where, sizeof(where)))
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
+        if (SymbolTable::get_instance().describe_return(frames[i], where, sizeof(where)))
+            stdlib::sn_printf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
         else
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX\n", (ulong)i, frames[i]);
-        Emit(buf);
+            stdlib::sn_printf(buf, sizeof(buf), "  [%lu] 0x%lX\n", (ulong)i, frames[i]);
+        emit(buf);
     }
 
-    Stdlib::SnPrintf(buf, sizeof(buf), "UBSAN: %lu report(s) so far\n", count);
-    Emit(buf);
+    stdlib::sn_printf(buf, sizeof(buf), "UBSAN: %lu report(s) so far\n", count);
+    emit(buf);
 
-    Hal::IrqRestore(flags);
-    __atomic_store_n(&Busy, 0, __ATOMIC_RELEASE);
+    hal::irq_restore(flags);
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }
 
 /* The two checks there is no going on from. */
-[[noreturn]] void Fatal(SourceLocation* loc, const char* what)
+[[noreturn]] void fatal(SourceLocation* loc, const char* what)
 {
-    if (Begin(loc))
-        Report(loc, what);
+    if (begin(loc))
+        report(loc, what);
 
-    Panic("UBSAN: %s at %s:%lu", what, loc->File, (ulong)loc->Line);
+    PANIC("UBSAN: %s at %s:%lu", what, loc->file, (ulong)loc->line);
     __builtin_unreachable();
 }
 
-void Overflow(void* data, ulong lhs, ulong rhs, char op)
+void overflow(void* data, ulong lhs, ulong rhs, char op)
 {
     auto* d = static_cast<OverflowData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char left[ValueMax], right[ValueMax], what[LineMax];
-    FormatValue(left, sizeof(left), d->Type, lhs);
-    FormatValue(right, sizeof(right), d->Type, rhs);
-    Stdlib::SnPrintf(what, sizeof(what), "%s integer overflow: %s %c %s cannot be represented in type %s",
-        IsSigned(d->Type) ? "signed" : "unsigned", left, op, right, TypeName(d->Type));
-    Report(&d->Loc, what);
+    char left[VALUE_MAX], right[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(left, sizeof(left), d->type, lhs);
+    format_value(right, sizeof(right), d->type, rhs);
+    stdlib::sn_printf(what, sizeof(what), "%s integer overflow: %s %c %s cannot be represented in type %s",
+        is_signed(d->type) ? "signed" : "unsigned", left, op, right, type_name(d->type));
+    report(&d->loc, what);
 }
 
 }
 
-namespace Ubsan
+namespace ubsan
 {
 
-void SetWarnOnly(bool warnOnly)
+void set_warn_only(bool on)
 {
-    __atomic_store_n(&WarnOnly, warnOnly, __ATOMIC_RELAXED);
+    __atomic_store_n(&warn_only, on, __ATOMIC_RELAXED);
 }
 
-bool Enabled()
+bool enabled()
 {
 #ifdef NOS_UBSAN
     return true;
@@ -334,31 +334,31 @@ bool Enabled()
 #endif
 }
 
-void Announce()
+void announce()
 {
-    if (!Enabled())
+    if (!enabled())
         return;
 
-    Trace(0, "UBSan: on -- %s", __atomic_load_n(&WarnOnly, __ATOMIC_RELAXED)
+    trace(0, "UBSan: on -- %s", __atomic_load_n(&warn_only, __ATOMIC_RELAXED)
         ? "ubsan=warn: each site reports once, to the serial port and the disk log, and the kernel goes on"
         : "the first report is a panic");
 }
 
-unsigned long Reports()
+unsigned long reports()
 {
-    return __atomic_load_n(&ReportCount, __ATOMIC_RELAXED);
+    return __atomic_load_n(&report_count, __ATOMIC_RELAXED);
 }
 
-unsigned long Unprinted()
+unsigned long unprinted()
 {
-    return __atomic_load_n(&UnprintedCount, __ATOMIC_RELAXED);
+    return __atomic_load_n(&unprinted_count, __ATOMIC_RELAXED);
 }
 
 }
 
 }
 
-using namespace Kernel;
+using namespace kernel;
 
 /* The handlers clang calls. Recoverable ones only: the build never asks for
    -fno-sanitize-recover, so no _abort variant is referenced, and a build
@@ -369,215 +369,215 @@ extern "C"
 void __ubsan_handle_type_mismatch_v1(void* data, ulong pointer)
 {
     auto* d = static_cast<TypeMismatchData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    const char* check = (d->CheckKind < Stdlib::ArraySize(CheckKindNames))
-        ? CheckKindNames[d->CheckKind] : "access to";
-    ulong alignment = 1UL << d->LogAlignment;
-    char what[LineMax];
+    const char* check = (d->check_kind < stdlib::array_size(CHECK_KIND_NAMES))
+        ? CHECK_KIND_NAMES[d->check_kind] : "access to";
+    ulong alignment = 1UL << d->log_alignment;
+    char what[LINE_LEN_MAX];
 
     if (pointer == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "%s null pointer of type %s", check, TypeName(d->Type));
+        stdlib::sn_printf(what, sizeof(what), "%s null pointer of type %s", check, type_name(d->type));
     else if (pointer & (alignment - 1))
-        Stdlib::SnPrintf(what, sizeof(what), "%s misaligned address 0x%lX for type %s, which requires %lu byte alignment",
-            check, pointer, TypeName(d->Type), alignment);
+        stdlib::sn_printf(what, sizeof(what), "%s misaligned address 0x%lX for type %s, which requires %lu byte alignment",
+            check, pointer, type_name(d->type), alignment);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "%s address 0x%lX with insufficient space for an object of type %s",
-            check, pointer, TypeName(d->Type));
-    Report(&d->Loc, what);
+        stdlib::sn_printf(what, sizeof(what), "%s address 0x%lX with insufficient space for an object of type %s",
+            check, pointer, type_name(d->type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_alignment_assumption(void* data, ulong pointer, ulong alignment, ulong offset)
 {
     auto* d = static_cast<AlignmentAssumptionData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char what[LineMax];
-    Stdlib::SnPrintf(what, sizeof(what), "assumption of %lu byte alignment (offset %lu) for pointer 0x%lX of type %s failed",
-        alignment, offset, pointer, TypeName(d->Type));
-    Report(&d->Loc, what);
+    char what[LINE_LEN_MAX];
+    stdlib::sn_printf(what, sizeof(what), "assumption of %lu byte alignment (offset %lu) for pointer 0x%lX of type %s failed",
+        alignment, offset, pointer, type_name(d->type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_add_overflow(void* data, ulong lhs, ulong rhs)
 {
-    Overflow(data, lhs, rhs, '+');
+    overflow(data, lhs, rhs, '+');
 }
 
 void __ubsan_handle_sub_overflow(void* data, ulong lhs, ulong rhs)
 {
-    Overflow(data, lhs, rhs, '-');
+    overflow(data, lhs, rhs, '-');
 }
 
 void __ubsan_handle_mul_overflow(void* data, ulong lhs, ulong rhs)
 {
-    Overflow(data, lhs, rhs, '*');
+    overflow(data, lhs, rhs, '*');
 }
 
 void __ubsan_handle_negate_overflow(void* data, ulong old)
 {
     auto* d = static_cast<OverflowData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char value[ValueMax], what[LineMax];
-    FormatValue(value, sizeof(value), d->Type, old);
-    Stdlib::SnPrintf(what, sizeof(what), "negation of %s cannot be represented in type %s", value, TypeName(d->Type));
-    Report(&d->Loc, what);
+    char value[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(value, sizeof(value), d->type, old);
+    stdlib::sn_printf(what, sizeof(what), "negation of %s cannot be represented in type %s", value, type_name(d->type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_divrem_overflow(void* data, ulong lhs, ulong rhs)
 {
     auto* d = static_cast<OverflowData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char left[ValueMax], what[LineMax];
-    FormatValue(left, sizeof(left), d->Type, lhs);
-    if (IsInline(d->Type) && (IsSigned(d->Type) ? SignedValue(d->Type, rhs) == 0 : rhs == 0))
-        Stdlib::SnPrintf(what, sizeof(what), "division of %s by zero", left);
+    char left[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(left, sizeof(left), d->type, lhs);
+    if (is_inline(d->type) && (is_signed(d->type) ? signed_value(d->type, rhs) == 0 : rhs == 0))
+        stdlib::sn_printf(what, sizeof(what), "division of %s by zero", left);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "division of %s by -1 cannot be represented in type %s",
-            left, TypeName(d->Type));
-    Report(&d->Loc, what);
+        stdlib::sn_printf(what, sizeof(what), "division of %s by -1 cannot be represented in type %s",
+            left, type_name(d->type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_shift_out_of_bounds(void* data, ulong lhs, ulong rhs)
 {
     auto* d = static_cast<ShiftOutOfBoundsData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char left[ValueMax], right[ValueMax], what[LineMax];
-    FormatValue(left, sizeof(left), d->LhsType, lhs);
-    FormatValue(right, sizeof(right), d->RhsType, rhs);
+    char left[VALUE_MAX], right[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(left, sizeof(left), d->lhs_type, lhs);
+    format_value(right, sizeof(right), d->rhs_type, rhs);
 
-    if (IsNegative(d->RhsType, rhs))
-        Stdlib::SnPrintf(what, sizeof(what), "shift exponent %s is negative", right);
-    else if (IsInline(d->RhsType) && rhs >= BitWidth(d->LhsType))
-        Stdlib::SnPrintf(what, sizeof(what), "shift exponent %s is too large for %lu-bit type %s",
-            right, (ulong)BitWidth(d->LhsType), TypeName(d->LhsType));
-    else if (IsNegative(d->LhsType, lhs))
-        Stdlib::SnPrintf(what, sizeof(what), "left shift of negative value %s", left);
+    if (is_negative(d->rhs_type, rhs))
+        stdlib::sn_printf(what, sizeof(what), "shift exponent %s is negative", right);
+    else if (is_inline(d->rhs_type) && rhs >= bit_width(d->lhs_type))
+        stdlib::sn_printf(what, sizeof(what), "shift exponent %s is too large for %lu-bit type %s",
+            right, (ulong)bit_width(d->lhs_type), type_name(d->lhs_type));
+    else if (is_negative(d->lhs_type, lhs))
+        stdlib::sn_printf(what, sizeof(what), "left shift of negative value %s", left);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "left shift of %s by %s places cannot be represented in type %s",
-            left, right, TypeName(d->LhsType));
-    Report(&d->Loc, what);
+        stdlib::sn_printf(what, sizeof(what), "left shift of %s by %s places cannot be represented in type %s",
+            left, right, type_name(d->lhs_type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_out_of_bounds(void* data, ulong index)
 {
     auto* d = static_cast<OutOfBoundsData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char value[ValueMax], what[LineMax];
-    FormatValue(value, sizeof(value), d->IndexType, index);
-    Stdlib::SnPrintf(what, sizeof(what), "index %s out of bounds for type %s", value, TypeName(d->ArrayType));
-    Report(&d->Loc, what);
+    char value[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(value, sizeof(value), d->index_type, index);
+    stdlib::sn_printf(what, sizeof(what), "index %s out of bounds for type %s", value, type_name(d->array_type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_builtin_unreachable(void* data)
 {
-    Fatal(&static_cast<UnreachableData*>(data)->Loc, "execution reached an unreachable program point");
+    fatal(&static_cast<UnreachableData*>(data)->loc, "execution reached an unreachable program point");
 }
 
 void __ubsan_handle_missing_return(void* data)
 {
-    Fatal(&static_cast<UnreachableData*>(data)->Loc,
+    fatal(&static_cast<UnreachableData*>(data)->loc,
         "execution reached the end of a value-returning function without returning a value");
 }
 
 void __ubsan_handle_vla_bound_not_positive(void* data, ulong bound)
 {
     auto* d = static_cast<VlaBoundData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char value[ValueMax], what[LineMax];
-    FormatValue(value, sizeof(value), d->Type, bound);
-    Stdlib::SnPrintf(what, sizeof(what), "variable length array bound evaluates to non-positive value %s", value);
-    Report(&d->Loc, what);
+    char value[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(value, sizeof(value), d->type, bound);
+    stdlib::sn_printf(what, sizeof(what), "variable length array bound evaluates to non-positive value %s", value);
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_float_cast_overflow(void* data, ulong)
 {
     auto* d = static_cast<FloatCastOverflowData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char what[LineMax];
-    Stdlib::SnPrintf(what, sizeof(what), "a value of type %s is outside the range of type %s",
-        TypeName(d->FromType), TypeName(d->ToType));
-    Report(&d->Loc, what);
+    char what[LINE_LEN_MAX];
+    stdlib::sn_printf(what, sizeof(what), "a value of type %s is outside the range of type %s",
+        type_name(d->from_type), type_name(d->to_type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_load_invalid_value(void* data, ulong value)
 {
     auto* d = static_cast<InvalidValueData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char text[ValueMax], what[LineMax];
-    FormatValue(text, sizeof(text), d->Type, value);
-    Stdlib::SnPrintf(what, sizeof(what), "load of value %s, which is not a valid value for type %s",
-        text, TypeName(d->Type));
-    Report(&d->Loc, what);
+    char text[VALUE_MAX], what[LINE_LEN_MAX];
+    format_value(text, sizeof(text), d->type, value);
+    stdlib::sn_printf(what, sizeof(what), "load of value %s, which is not a valid value for type %s",
+        text, type_name(d->type));
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_invalid_builtin(void* data)
 {
     auto* d = static_cast<InvalidBuiltinData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char what[LineMax];
-    if (d->Kind == BuiltinCtz || d->Kind == BuiltinClz)
-        Stdlib::SnPrintf(what, sizeof(what), "passing zero to %s(), which is not a valid argument",
-            d->Kind == BuiltinCtz ? "ctz" : "clz");
+    char what[LINE_LEN_MAX];
+    if (d->kind == BUILTIN_CTZ || d->kind == BUILTIN_CLZ)
+        stdlib::sn_printf(what, sizeof(what), "passing zero to %s(), which is not a valid argument",
+            d->kind == BUILTIN_CTZ ? "ctz" : "clz");
     else
-        Stdlib::SnPrintf(what, sizeof(what), "an assumption the code made does not hold");
-    Report(&d->Loc, what);
+        stdlib::sn_printf(what, sizeof(what), "an assumption the code made does not hold");
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_nonnull_return_v1(void*, void* location)
 {
     auto* loc = static_cast<SourceLocation*>(location);
-    if (!Begin(loc))
+    if (!begin(loc))
         return;
 
-    Report(loc, "null pointer returned from a function declared never to return null");
+    report(loc, "null pointer returned from a function declared never to return null");
 }
 
 void __ubsan_handle_nonnull_arg(void* data)
 {
     auto* d = static_cast<NonNullArgData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char what[LineMax];
-    Stdlib::SnPrintf(what, sizeof(what), "null pointer passed as argument %ld, which is declared never to be null",
-        (long)d->ArgIndex);
-    Report(&d->Loc, what);
+    char what[LINE_LEN_MAX];
+    stdlib::sn_printf(what, sizeof(what), "null pointer passed as argument %ld, which is declared never to be null",
+        (long)d->arg_index);
+    report(&d->loc, what);
 }
 
 void __ubsan_handle_pointer_overflow(void* data, ulong base, ulong result)
 {
     auto* d = static_cast<PointerOverflowData*>(data);
-    if (!Begin(&d->Loc))
+    if (!begin(&d->loc))
         return;
 
-    char what[LineMax];
+    char what[LINE_LEN_MAX];
     if (base == 0 && result == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "applying zero offset to null pointer");
+        stdlib::sn_printf(what, sizeof(what), "applying zero offset to null pointer");
     else if (base == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset 0x%lX to null pointer", result);
+        stdlib::sn_printf(what, sizeof(what), "applying non-zero offset 0x%lX to null pointer", result);
     else if (result == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset to non-null pointer 0x%lX produced null pointer", base);
+        stdlib::sn_printf(what, sizeof(what), "applying non-zero offset to non-null pointer 0x%lX produced null pointer", base);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "pointer arithmetic on 0x%lX overflowed to 0x%lX", base, result);
-    Report(&d->Loc, what);
+        stdlib::sn_printf(what, sizeof(what), "pointer arithmetic on 0x%lX overflowed to 0x%lX", base, result);
+    report(&d->loc, what);
 }
 
 }

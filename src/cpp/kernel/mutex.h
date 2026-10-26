@@ -3,22 +3,22 @@
 #include "atomic.h"
 #include <lib/lock.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Mutex final
-	: public Stdlib::LockInterface
+	: public stdlib::LockInterface
 {
 public:
 	Mutex();
 
-	void Lock();
+	void lock();
 
-	void Unlock();
+	void unlock();
 
-	virtual void Lock(ulong& flags) override;
+	virtual void lock(ulong& flags) override;
 
-	virtual void Unlock(ulong flags) override;
+	virtual void unlock(ulong flags) override;
 
 	virtual ~Mutex();
 
@@ -28,7 +28,7 @@ private:
 	Mutex& operator=(const Mutex& other) = delete;
 	Mutex& operator=(Mutex&& other) = delete;
 
-	Atomic Value; // 0 = unlocked, 1 = locked
+	Atomic value_; // 0 = unlocked, 1 = locked
 };
 
 }

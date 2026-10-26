@@ -4,7 +4,7 @@
 #include <include/types.h>
 #include <kernel/panic.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 template <typename T>
@@ -16,30 +16,30 @@ public:
     {
     public:
         Iterator()
-            : CurrListEntry(nullptr)
-            , EndList(nullptr)
+            : curr_list_entry_(nullptr)
+            , end_list_(nullptr)
         {
         }
 
         Iterator(const Iterator& other)
         {
-            CurrListEntry = other.CurrListEntry;
-            EndList = other.EndList;
+            curr_list_entry_ = other.curr_list_entry_;
+            end_list_ = other.end_list_;
         }
 
-        Iterator(LinkedList& List)
+        Iterator(LinkedList& list)
             : Iterator()
         {
-            CurrListEntry = List.ListHead.Flink;
-            EndList = &List.ListHead;
+            curr_list_entry_ = list.list_head_.flink;
+            end_list_ = &list.list_head_;
         }
 
         Iterator& operator=(const Iterator& other)
         {
             if (this != &other)
             {
-                CurrListEntry = other.CurrListEntry;
-                EndList = other.EndList;
+                curr_list_entry_ = other.curr_list_entry_;
+                end_list_ = other.end_list_;
             }
             return *this;
         }
@@ -48,28 +48,28 @@ public:
         {
             if (this != &other)
             {
-                CurrListEntry = other.CurrListEntry;
-                EndList = other.EndList;
-                other.CurrListEntry = nullptr;
-                other.EndList = nullptr; 
+                curr_list_entry_ = other.curr_list_entry_;
+                end_list_ = other.end_list_;
+                other.curr_list_entry_ = nullptr;
+                other.end_list_ = nullptr; 
             }
             return *this;
         }
 
-        T& Get()
+        T& get()
         {
-            BugOn(CurrListEntry == EndList);
-            LinkedListNode* node = CONTAINING_RECORD(CurrListEntry,
+            BUG_ON(curr_list_entry_ == end_list_);
+            LinkedListNode* node = CONTAINING_RECORD(curr_list_entry_,
                                                      LinkedListNode,
-                                                     ListLink);
-            return node->Value;
+                                                     list_link_);
+            return node->value_;
         }
 
-        bool IsValid()
+        bool is_valid()
         {
-            if (CurrListEntry != nullptr && EndList != nullptr)
+            if (curr_list_entry_ != nullptr && end_list_ != nullptr)
             {
-                return (CurrListEntry != EndList) ? true : false;
+                return (curr_list_entry_ != end_list_) ? true : false;
             }
             else
             {
@@ -77,26 +77,26 @@ public:
             }
         }
 
-        void Next()
+        void next()
         {
-            if (IsValid())
+            if (is_valid())
             {
-                CurrListEntry = CurrListEntry->Flink;
+                curr_list_entry_ = curr_list_entry_->flink;
             }
         }
 
-        void Erase()
+        void erase()
         {
-            BugOn(!IsValid());
+            BUG_ON(!is_valid());
 
-            ListEntry* next = CurrListEntry->Flink;
+            ListEntry* next = curr_list_entry_->flink;
 
-            LinkedListNode* node = CONTAINING_RECORD(CurrListEntry,
+            LinkedListNode* node = CONTAINING_RECORD(curr_list_entry_,
                                                      LinkedListNode,
-                                                     ListLink);
-            node->ListLink.RemoveInit();
+                                                     list_link_);
+            node->list_link_.remove_init();
             delete node;
-            CurrListEntry = next;
+            curr_list_entry_ = next;
         }
 
         ~Iterator()
@@ -104,163 +104,163 @@ public:
 
         }
     private:
-        ListEntry* CurrListEntry;
-        ListEntry* EndList;
+        ListEntry* curr_list_entry_;
+        ListEntry* end_list_;
     };
 
     LinkedList()
     {
-        ListHead.Init();
+        list_head_.init();
     }
 
-    bool AddHead(const T& value)
+    bool add_head(const T& value)
     {
-        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(value);
+        LinkedListNode* node = kernel::mm::talloc<LinkedListNode, 0>(value);
 
         if (!node)
         {
             return false;
         }
-        ListHead.InsertHead(&node->ListLink);
+        list_head_.insert_head(&node->list_link_);
         return true;
     }
 
-    bool AddTail(const T& value)
+    bool add_tail(const T& value)
     {
-        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(value);
+        LinkedListNode* node = kernel::mm::talloc<LinkedListNode, 0>(value);
 
         if (!node)
         {
             return false;
         }
-        ListHead.InsertTail(&node->ListLink);
+        list_head_.insert_tail(&node->list_link_);
         return true;
     }
 
-    bool AddTail(T&& value)
+    bool add_tail(T&& value)
     {
-        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(Stdlib::Move(value));
+        LinkedListNode* node = kernel::mm::talloc<LinkedListNode, 0>(stdlib::move(value));
         if (!node)
         {
             return false;
         }
-        ListHead.InsertTail(&node->ListLink);
+        list_head_.insert_tail(&node->list_link_);
         return true;
     }
 
-    void AddTail(LinkedList&& other)
+    void add_tail(LinkedList&& other)
     {
-        if (other.ListHead.IsEmpty())
+        if (other.list_head_.is_empty())
             return;
 
-        ListEntry* entry = other.ListHead.Flink;
-        other.ListHead.RemoveInit();
-        ListHead.AppendTail(entry);
+        ListEntry* entry = other.list_head_.flink;
+        other.list_head_.remove_init();
+        list_head_.append_tail(entry);
         return;
     }
 
-    T& Head()
+    T& head()
     {
         LinkedListNode* node;
 
-        BugOn(ListHead.IsEmpty());
+        BUG_ON(list_head_.is_empty());
 
-        node = CONTAINING_RECORD(ListHead.Flink, LinkedListNode, ListLink);
-        return node->Value;
+        node = CONTAINING_RECORD(list_head_.flink, LinkedListNode, list_link_);
+        return node->value_;
     }
 
-    T& Tail()
+    T& tail()
     {
         LinkedListNode* node;
 
-        BugOn(ListHead.IsEmpty());
+        BUG_ON(list_head_.is_empty());
 
-        node = CONTAINING_RECORD(ListHead.Blink, LinkedListNode, ListLink);
-        return node->Value;
+        node = CONTAINING_RECORD(list_head_.blink, LinkedListNode, list_link_);
+        return node->value_;
     }
 
-    void PopHead()
+    void pop_head()
     {
         LinkedListNode* node;
 
-        BugOn(ListHead.IsEmpty());
+        BUG_ON(list_head_.is_empty());
 
-        node = CONTAINING_RECORD(ListHead.RemoveHead(),
-                                 LinkedListNode, ListLink);
+        node = CONTAINING_RECORD(list_head_.remove_head(),
+                                 LinkedListNode, list_link_);
         delete node;
     }
 
-    void PopTail()
+    void pop_tail()
     {
         LinkedListNode* node;
 
-        BugOn(ListHead.IsEmpty());
+        BUG_ON(list_head_.is_empty());
 
-        node = CONTAINING_RECORD(ListHead.RemoveTail(),
-                                 LinkedListNode, ListLink);
+        node = CONTAINING_RECORD(list_head_.remove_tail(),
+                                 LinkedListNode, list_link_);
         delete node;
     }
 
-    bool IsEmpty()
+    bool is_empty()
     {
-        return ListHead.IsEmpty();
+        return list_head_.is_empty();
     }
 
     ~LinkedList()
     {
-        Release();
+        release();
     }
 
     LinkedList(LinkedList&& other)
     {
-        ListHead.Init();
-        AddTail(Stdlib::Move(other));
+        list_head_.init();
+        add_tail(stdlib::move(other));
     }
 
     LinkedList& operator=(LinkedList&& other)
     {
         if (this != &other)
         {
-            Release();
+            release();
 
-            ListHead.Init();
-            AddTail(Stdlib::Move(other));
+            list_head_.init();
+            add_tail(stdlib::move(other));
         }
         return *this;
     }
 
-    Iterator GetIterator()
+    Iterator get_iterator()
     {
         return Iterator(*this);
     }
 
-    size_t Count()
+    size_t count()
     {
         size_t count = 0;
-        auto it = GetIterator();
-        for (; it.IsValid();it.Next())
+        auto it = get_iterator();
+        for (; it.is_valid();it.next())
         {
             count++;
         }
         return count;
     }
 
-    void Clear()
+    void clear()
     {
-        Release();
+        release();
     }
 
 private:
     LinkedList(const LinkedList& other) = delete;
     LinkedList& operator=(const LinkedList& other) = delete;
 
-    void Release()
+    void release()
     {
         LinkedListNode* node;
-        while (!ListHead.IsEmpty())
+        while (!list_head_.is_empty())
         {
-            node = CONTAINING_RECORD(ListHead.RemoveHead(),
-                                     LinkedListNode, ListLink);
+            node = CONTAINING_RECORD(list_head_.remove_head(),
+                                     LinkedListNode, list_link_);
             delete node;
         }
     }
@@ -270,23 +270,23 @@ private:
     public:
         LinkedListNode(const T& value)
         {
-            ListLink.Init();
-            Value = value;
+            list_link_.init();
+            value_ = value;
         }
         LinkedListNode(T&& value)
         {
-            ListLink.Init();
-            Value = Stdlib::Move(value);
+            list_link_.init();
+            value_ = stdlib::move(value);
         }
-        ListEntry ListLink;
-        T Value;
+        ListEntry list_link_;
+        T value_;
     private:
         LinkedListNode() = delete;
         LinkedListNode(const LinkedListNode& other) = delete;
         LinkedListNode& operator=(const LinkedListNode& other) = delete;
         LinkedListNode& operator=(LinkedListNode&& other) = delete;
     };
-    ListEntry ListHead;
+    ListEntry list_head_;
 };
 
 }

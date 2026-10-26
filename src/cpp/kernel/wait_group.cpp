@@ -2,38 +2,38 @@
 #include "panic.h"
 #include "sched.h"
 
-namespace Kernel
+namespace kernel
 {
 
 WaitGroup::WaitGroup()
-    : Counter(0)
+    : counter_(0)
 {
 }
 
 WaitGroup::WaitGroup(long count)
-    : Counter(count)
+    : counter_(count)
 {
-    BugOn(count < 0);
+    BUG_ON(count < 0);
 }
 
 WaitGroup::~WaitGroup()
 {
-    BugOn(Counter.Get() != 0);
+    BUG_ON(counter_.get() != 0);
 }
 
-void WaitGroup::Add(long delta)
+void WaitGroup::add(long delta)
 {
-    BugOn(delta <= 0);
-    Counter.Add(delta);
+    BUG_ON(delta <= 0);
+    counter_.add(delta);
 }
 
-void WaitGroup::Done()
+void WaitGroup::done()
 {
-    BugOn(Counter.Get() <= 0);
-    Counter.Dec();
+    BUG_ON(counter_.get() <= 0);
+    counter_.dec();
 }
 
-void WaitGroup::Wait()
+void WaitGroup::wait()
 {
     /* YieldToRunnable, not Schedule: the counter is brought down by whoever
        the waiter waits for -- an interrupt handler, for every user this has
@@ -51,15 +51,15 @@ void WaitGroup::Wait()
        and the ~5.7 of 8 that did not still showed as p99.9 10.2 ms. The same
        qd=1 run with the machine kept busy: 49k IOPS, p50 16.8 us -- 498x, for
        nothing but having something else to run. */
-    while (Counter.Get() != 0)
+    while (counter_.get() != 0)
     {
-        YieldToRunnable();
+        yield_to_runnable();
     }
 }
 
-long WaitGroup::GetCounter()
+long WaitGroup::get_counter()
 {
-    return Counter.Get();
+    return counter_.get();
 }
 
 }

@@ -2,23 +2,23 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Pic final
 {
 public:
-    static Pic& GetInstance()
+    static Pic& get_instance()
     {
-        static Pic Instance;
-        return Instance;
+        static Pic instance;
+        return instance;
     }
 
-    void Remap(int offset1 = 0x20, int offset2 = 0x28);
+    void remap(int offset1 = 0x20, int offset2 = 0x28);
 
-    void Disable();
+    void disable();
 
-    void EOI(int irq);
+    void eoi(int irq);
 
 private:
     Pic();
@@ -28,7 +28,7 @@ private:
     Pic& operator=(const Pic& other) = delete;
     Pic& operator=(Pic&& other) = delete;    
 
-    void IoWait();
+    void io_wait();
 
     static const u8 PIC1 = 0x20;	/* IO base address for master PIC */
     static const u8 PIC2 = 0xA0;	/* IO base address for slave PIC */

@@ -12,7 +12,7 @@ extern "C" {
 /* guard variables */
 
 /* The ABI requires a 64-bit type.  */
-typedef Kernel::Atomic __guard;
+typedef kernel::Atomic __guard;
 
 static_assert(sizeof(__guard) == sizeof(u64), "invalid size");
 

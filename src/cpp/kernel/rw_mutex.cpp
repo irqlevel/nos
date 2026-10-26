@@ -1,7 +1,7 @@
 #include "rw_mutex.h"
 #include "sched.h"
 
-namespace Kernel
+namespace kernel
 {
 
 RwMutex::RwMutex()
@@ -12,55 +12,55 @@ RwMutex::~RwMutex()
 {
 }
 
-void RwMutex::ReadLock()
+void RwMutex::read_lock()
 {
     for (;;)
     {
-        if (WriterWaiting.Get() != 0)
+        if (writer_waiting_.get() != 0)
         {
-            YieldToRunnable();
+            yield_to_runnable();
             continue;
         }
 
-        long v = Value.Get();
-        if (v >= 0 && Value.Cmpxchg(v + 1, v) == v)
+        long v = value_.get();
+        if (v >= 0 && value_.cmpxchg(v + 1, v) == v)
         {
             /* A writer may have started waiting between the check above
                and the cmpxchg; back out so it isn't starved */
-            if (WriterWaiting.Get() != 0)
+            if (writer_waiting_.get() != 0)
             {
-                Value.Dec();
-                YieldToRunnable();
+                value_.dec();
+                yield_to_runnable();
                 continue;
             }
             break;
         }
 
-        YieldToRunnable();
+        yield_to_runnable();
     }
 }
 
-void RwMutex::ReadUnlock()
+void RwMutex::read_unlock()
 {
-    Value.Dec();
+    value_.dec();
 }
 
-void RwMutex::WriteLock()
+void RwMutex::write_lock()
 {
-    WriterWaiting.Inc();
+    writer_waiting_.inc();
     for (;;)
     {
-        if (Value.Cmpxchg(-1, 0) == 0)
+        if (value_.cmpxchg(-1, 0) == 0)
             break;
 
-        YieldToRunnable();
+        yield_to_runnable();
     }
 }
 
-void RwMutex::WriteUnlock()
+void RwMutex::write_unlock()
 {
-    Value.Set(0);
-    WriterWaiting.Dec();
+    value_.set(0);
+    writer_waiting_.dec();
 }
 
 }

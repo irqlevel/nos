@@ -4,7 +4,7 @@
 
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 using InterruptHandlerFn = void (*)();
@@ -14,12 +14,12 @@ struct Context;
 class InterruptHandler
 {
 public:
-    virtual void OnInterruptRegister(u8 irq, u8 vector) = 0;
-    virtual InterruptHandlerFn GetHandlerFn() = 0;
+    virtual void on_interrupt_register(u8 irq, u8 vector) = 0;
+    virtual InterruptHandlerFn get_handler_fn() = 0;
 
     /* Called by shared interrupt dispatch. Override to handle the interrupt.
        Must NOT signal EOI -- the shared dispatcher does that. */
-    virtual void OnInterrupt(Context* ctx) { (void)ctx; }
+    virtual void on_interrupt(Context* ctx) { (void)ctx; }
 };
 
 enum InterruptSource : u8
@@ -42,16 +42,16 @@ enum InterruptSource : u8
 class InterruptStats
 {
 public:
-    static void Inc(InterruptSource src);
-    static long Get(InterruptSource src);
-    static const char* GetName(InterruptSource src);
-    static constexpr ulong Count = IrqMax;
+    static void inc(InterruptSource src);
+    static long get(InterruptSource src);
+    static const char* get_name(InterruptSource src);
+    static constexpr ulong COUNT = IrqMax;
 
 private:
     InterruptStats() = delete;
     ~InterruptStats() = delete;
 
-    static Atomic Counters[IrqMax];
+    static Atomic counters_[IrqMax];
 };
 
 class Interrupt
@@ -60,15 +60,15 @@ public:
     /* Edge-triggered system IRQs (PIT/HPET/8042/serial). These stay
        pinned to the registering CPU (the BSP): timekeeping and the
        scheduling tick depend on it. Not balanced by IrqBalance. */
-    static void Register(InterruptHandler& handler, u8 irq, u8 vector);
+    static void register_handler(InterruptHandler& handler, u8 irq, u8 vector);
 
     /* Level-triggered device IRQs (PCI INTx). The destination CPU is
        chosen by IrqBalance and spread across CPUs after SMP bringup.
        MSI-X vectors are likewise balanced via MsixTable::EnableVector. */
-    static void RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector);
+    static void register_level(InterruptHandler& handler, u8 irq, u8 vector);
 
     /* Shared interrupt dispatch (called from SharedInterruptStub) */
-    static void SharedDispatch(Context* ctx);
+    static void shared_dispatch(Context* ctx);
 
 private:
     Interrupt() = delete;
@@ -79,20 +79,20 @@ private:
     Interrupt& operator=(Interrupt&& other) = delete;
 
     /* Shared handler table: multiple handlers can share a vector */
-    static const ulong MaxSharedHandlers = 8;
+    static const ulong MAX_SHARED_HANDLERS = 8;
 
-    static const ulong MaxVectors = 256;
+    static const ulong MAX_VECTORS = 256;
     struct VectorEntry
     {
-        u8 Gsi;
-        u8 HandlerCount;
+        u8 gsi;
+        u8 handler_count;
         /* True for RegisterLevel (PCI INTx) entries; only those may chain.
            Edge entries (Register) own their GSI + vector exclusively. */
-        bool Level;
-        InterruptHandler* Handlers[MaxSharedHandlers];
+        bool level;
+        InterruptHandler* handlers[MAX_SHARED_HANDLERS];
     };
 
-    static VectorEntry Vectors[MaxVectors];
+    static VectorEntry vectors_[MAX_VECTORS];
 };
 
 }

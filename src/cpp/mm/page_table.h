@@ -6,68 +6,68 @@
 #include <kernel/panic.h>
 #include <hal/pte.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 struct Page final
 {
-    void Init(ulong phyAddr)
+    void init(ulong addr)
     {
-        ListEntry.Init();
-        RefCount.Set(1);
-        PhyAddr = phyAddr;
+        list_entry.init();
+        ref_count.set(1);
+        phy_addr = addr;
     }
 
-    void Get()
+    void get()
     {
-        RefCount.Inc();
+        ref_count.inc();
     }
 
-    void Put()
+    void put()
     {
-        BugOn(RefCount.Get() == 0);
-        RefCount.Dec();
+        BUG_ON(ref_count.get() == 0);
+        ref_count.dec();
     }
 
-    ulong GetPhyAddress()
+    ulong get_phy_address()
     {
-        return PhyAddr;
+        return phy_addr;
     }
 
-    Stdlib::ListEntry ListEntry;
-    Kernel::Atomic RefCount;
-    ulong PhyAddr;
+    stdlib::ListEntry list_entry;
+    kernel::Atomic ref_count;
+    ulong phy_addr;
 };
 
 static_assert(sizeof(Page) == 0x20, "Invalid size");
-static_assert((Const::PageSize % sizeof(Page)) == 0, "Invalid size");
+static_assert((consts::PAGE_SIZE % sizeof(Page)) == 0, "Invalid size");
 
 class BuiltinPageTable final
 {
 public:
-    static BuiltinPageTable& GetInstance()
+    static BuiltinPageTable& get_instance()
     {
-        static BuiltinPageTable Instance;
-        return Instance;
+        static BuiltinPageTable instance;
+        return instance;
     }
 
-    bool Setup();
+    bool setup();
 
-    ulong VirtToPhys(ulong virtAddr);
+    ulong virt_to_phys(ulong virt_addr);
 
-    ulong PhysToVirt(ulong phyAddr);
+    ulong phys_to_virt(ulong phy_addr);
 
-    ulong GetRoot();
+    ulong get_root();
 
     /* One past the highest physical address the bootstrap linear map
        reaches. Setup() sets it; it is the hard ceiling on what
        PageTable::GetFreePages can put on the free list, because building
        that list threads a next-pointer through the free pages themselves,
        which means writing to every one of them through this map. */
-    ulong GetMappedLimit();
+    ulong get_mapped_limit();
 
     /* Extend the map over usable RAM above what Setup() could reach, and
        raise MappedLimit to match. Best effort: on hardware that cannot do
@@ -76,7 +76,7 @@ public:
        outcome either way. Must be called once the memory map is populated,
        which on x86 is after the Multiboot tags are parsed and therefore
        after Setup(). */
-    void MapHighRam();
+    void map_high_ram();
 
 private:
     BuiltinPageTable(const BuiltinPageTable& other) = delete;
@@ -86,50 +86,50 @@ private:
     BuiltinPageTable();
     ~BuiltinPageTable();
 
-    PtePage P4Page __attribute__((aligned(Const::PageSize)));
-    PtePage P3KernelPage __attribute__((aligned(Const::PageSize)));
-    PtePage P3UserPage __attribute__((aligned(Const::PageSize)));
-    PtePage P2KernelPage[4] __attribute__((aligned(Const::PageSize)));
-    PtePage P2UserPage[4] __attribute__((aligned(Const::PageSize)));
+    PtePage p4_page_ __attribute__((aligned(consts::PAGE_SIZE)));
+    PtePage p3_kernel_page_ __attribute__((aligned(consts::PAGE_SIZE)));
+    PtePage p3_user_page_ __attribute__((aligned(consts::PAGE_SIZE)));
+    PtePage p2_kernel_page_[4] __attribute__((aligned(consts::PAGE_SIZE)));
+    PtePage p2_user_page_[4] __attribute__((aligned(consts::PAGE_SIZE)));
 
-    ulong MappedLimit;
+    ulong mapped_limit_;
 };
 
 class PageTable final
 {
 public:
-    static PageTable& GetInstance()
+    static PageTable& get_instance()
     {
-        static PageTable Instance;
-        return Instance;
+        static PageTable instance;
+        return instance;
     }
 
-    bool Setup();
-    bool SetupFreePagesList();
+    bool setup();
+    bool setup_free_pages_list();
 
-    ulong GetRoot();
+    ulong get_root();
 
-    static void InvalidateLocalTlb();
-    static void InvalidateLocalTlbAddress(ulong virtAddr);
-    static void InvalidateLocalTlbRange(ulong virtAddr, ulong count);
+    static void invalidate_local_tlb();
+    static void invalidate_local_tlb_address(ulong virt_addr);
+    static void invalidate_local_tlb_range(ulong virt_addr, ulong count);
 
-    ulong TmpMapPage(ulong phyAddr);
-    ulong TmpUnmapPage(ulong virtAddr);
-    ulong TmpMapAddress(ulong phyAddr);
-    ulong TmpMapRange(ulong phyAddr, size_t len);
+    ulong tmp_map_page(ulong phy_addr);
+    ulong tmp_unmap_page(ulong virt_addr);
+    ulong tmp_map_address(ulong phy_addr);
+    ulong tmp_map_range(ulong phy_addr, size_t len);
 
-    ulong VirtToPhys(ulong virtAddr);
-    ulong VirtToPhysLocked(ulong virtAddr);
+    ulong virt_to_phys(ulong virt_addr);
+    ulong virt_to_phys_locked(ulong virt_addr);
 
-    ulong GetFreePagesCount();
-    ulong GetTotalPagesCount();
+    ulong get_free_pages_count();
+    ulong get_total_pages_count();
 
-    ulong GetVaEnd();
+    ulong get_va_end();
 
-    Page* GetPage(ulong phyAddr);
+    Page* get_page(ulong phy_addr);
 
-    bool MapPage(ulong virtAddr, Page* page);
-    Page* UnmapPage(ulong virtAddr);
+    bool map_page(ulong virt_addr, Page* page);
+    Page* unmap_page(ulong virt_addr);
 
     /* Range forms of MapPage/UnmapPage. A run of consecutive VAs shares
        one walk down L4/L3/L2 and one temp mapping of the L1 table, so an
@@ -142,13 +142,13 @@ public:
        exist (it takes the mapping reference itself, like the others).
        All three are all-or-nothing: on failure nothing is left mapped and
        no mapping reference is left outstanding. */
-    bool MapPages(ulong virtAddr, Page* const* pages, size_t count);
-    bool MapContiguousPages(ulong virtAddr, Page* pages, size_t count);
-    bool MapPhysPages(ulong virtAddr, const ulong* phyAddrs, size_t count);
+    bool map_pages(ulong virt_addr, Page* const* pages, size_t count);
+    bool map_contiguous_pages(ulong virt_addr, Page* pages, size_t count);
+    bool map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count);
 
     /* Drop the mapping reference on count pages; with freePages set they
        also go back to the free list (the AllocPage/MapPages pairing). */
-    void UnmapPages(ulong virtAddr, size_t count, bool freePages);
+    void unmap_pages(ulong virt_addr, size_t count, bool free_pages);
 
     /* Cache policy for MapMmioRegion.
 
@@ -180,14 +180,14 @@ public:
        (never unmapped), and only the local TLB is invalidated. Callers
        must therefore run on the BSP before the APs are started
        (currently: HPET and driver init in Main2/BpStartup). */
-    ulong MapMmioRegion(ulong physAddr, ulong sizeBytes,
+    ulong map_mmio_region(ulong phys_addr, ulong size_bytes,
         MmioCachePolicy policy = MmioUncached);
 
     /* Tighten permissions on an existing kernel-image mapping to enforce
        W^X: writable=false makes the range read-only, executable=false makes
        it non-executable (NX/PXN). Walks the 4KiB leaf PTEs in [virtAddr,
        virtAddr+sizeBytes) and invalidates the local TLB. */
-    bool ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
+    bool protect_range(ulong virt_addr, ulong size_bytes, bool writable, bool executable);
 
     /* Set exactly these permissions on [virtAddr, virtAddr+sizeBytes),
        loosening as well as tightening, which ProtectRange never does. For
@@ -196,7 +196,7 @@ public:
        before they are freed. Same walk and same 4KiB-leaf requirement, and
        likewise only the local TLB is invalidated -- the caller shoots down
        the rest (CpuTable::InvalidateTlbRange). */
-    bool SetRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
+    bool set_range_protection(ulong virt_addr, ulong size_bytes, bool writable, bool executable);
 
     /* Walk every page descriptor and report any page that is on the free
        list but must not be: inside a reserved region, inside the kernel
@@ -206,22 +206,22 @@ public:
        runs without the lock -- it is a diagnostic, and holding this lock
        across sixteen million pages would stall the machine harder than any
        fault it could find. */
-    void CheckFreeList(Stdlib::Printer& printer);
+    void check_free_list(stdlib::Printer& printer);
 
-    Page* AllocPage();
+    Page* alloc_page();
     /* A page, zeroed, as AllocPage gives one -- or none while the free list
        holds `keep` pages or fewer: what an allocation that must leave the
        rest of the kernel its memory takes (kernel_frame_alloc, a guest's
        RAM). The count is looked at under the lock the page is taken under. */
-    Page* AllocPageKeeping(ulong keep);
-    static const ulong MaxContiguousPages = 128;
+    Page* alloc_page_keeping(ulong keep);
+    static const ulong MAX_CONTIGUOUS_PAGES = 128;
 
     /* The most pages Mm::MapLargePages maps at one run of VA: 16 MiB, for
        what outgrows the largest block MapPages serves -- a loadable
        module's image, the .ko file it is read from */
-    static const ulong MaxLargeMapPages = 4096;
-    Page* AllocContiguousPages(ulong count);
-    void FreePage(Page* page);
+    static const ulong MAX_LARGE_MAP_PAGES = 4096;
+    Page* alloc_contiguous_pages(ulong count);
+    void free_page(Page* page);
 
     /* Frames: pages handed out by address and mapped nowhere -- not into
        the kernel's space, nor into any table but whatever their owner puts
@@ -246,10 +246,10 @@ public:
        the slot search and the reference TmpMapPage takes: the frame is the
        caller's for the length of the call. RAM, so write-back; data, so
        no-execute. */
-    bool IsFrameAddress(ulong phyAddr);
-    void FreeFrame(ulong phyAddr);
-    ulong MapFrameSlot(ulong phyAddr);
-    void UnmapFrameSlot(ulong virtAddr);
+    bool is_frame_address(ulong phy_addr);
+    void free_frame(ulong phy_addr);
+    ulong map_frame_slot(ulong phy_addr);
+    void unmap_frame_slot(ulong virt_addr);
 
     /* The pages no allocation for a guest may take: what the kernel goes on
        needing once guests have the rest -- its heap, the pages their nested
@@ -260,9 +260,9 @@ public:
        panicked the host under every other guest. kernel_frame_alloc keeps
        it free; ReserveHugePool keeps twice it, the kernel's own boot being
        still to come out of what it leaves. */
-    static const ulong KernelReserveMinBytes = 64 * Const::MB;
-    static const ulong KernelReserveFraction = 16;
-    ulong GetKernelReservePages();
+    static const ulong KERNEL_RESERVE_MIN_BYTES = 64 * consts::MB;
+    static const ulong KERNEL_RESERVE_FRACTION = 16;
+    ulong get_kernel_reserve_pages();
 
     /* The huge pool (hugepages=): 2MiB blocks -- physically contiguous runs
        of HugeFramePages pages, aligned to their size -- reserved at boot for
@@ -297,14 +297,14 @@ public:
 
        GetHugePoolBlocks, GetHugePoolFree: how many blocks the pool has, and
        how many of them are free. */
-    static const ulong HugeFramePages = 512;
-    static const ulong HugeFrameSize = HugeFramePages * Const::PageSize;
-    ulong ReserveHugePool(ulong bytes);
-    ulong ReserveHugePoolKeeping(ulong bytes, ulong keepPages);
-    ulong AllocHugeFrame();
-    void FreeHugeFrame(ulong phyAddr);
-    ulong GetHugePoolBlocks();
-    ulong GetHugePoolFree();
+    static const ulong HUGE_FRAME_PAGES = 512;
+    static const ulong HUGE_FRAME_SIZE = HUGE_FRAME_PAGES * consts::PAGE_SIZE;
+    ulong reserve_huge_pool(ulong bytes);
+    ulong reserve_huge_pool_keeping(ulong bytes, ulong keep_pages);
+    ulong alloc_huge_frame();
+    void free_huge_frame(ulong phy_addr);
+    ulong get_huge_pool_blocks();
+    ulong get_huge_pool_free();
 
 private:
     PageTable(const PageTable& other) = delete;
@@ -314,122 +314,122 @@ private:
     PageTable();
     ~PageTable();
 
-    ulong GetFreePage();
+    ulong get_free_page();
 
     /* Move every page on the early physical free list onto FreePagesList. */
-    void DrainEarlyFreeList();
+    void drain_early_free_list();
 
     /* One 4KiB leaf in the table Setup() is building, before it is live.
        executable is for the kernel image alone -- the kernel runs out of
        that mapping from the root switch until ProtectRange refines it;
        every other page Setup() maps is data and gets NX. */
-    bool SetupPage(ulong virtAddr, ulong phyAddr, bool executable);
+    bool setup_page(ulong virt_addr, ulong phy_addr, bool executable);
 
     /* SetupPage stopping one level short: a 2MiB leaf at L2 instead of a
        4KiB one at L1. Only PageArray uses it, and only because it is the one
        runtime mapping large enough for the page size to matter. */
-    bool SetupHugePage(ulong virtAddr, ulong phyAddr);
+    bool setup_huge_page(ulong virt_addr, ulong phy_addr);
 
     /* Find a physically contiguous, huge-page-aligned home for PageArray at
        or above lowerBound, clear of the kernel image and of every reserved
        region. Returns 0 if the machine's map has no window that fits. */
-    ulong ReservePageArray(ulong bytes, ulong lowerBound);
+    ulong reserve_page_array(ulong bytes, ulong lower_bound);
 
     /* Build the early physical free list from the memory map. Pages below
        excludeLimit go on the side list instead (see the comment there). */
-    bool GetFreePages(ulong excludeLimit);
+    bool get_free_pages(ulong exclude_limit);
 
-    Page* AllocPageNoLock();
-    void FreePageNoLock(Page* page);
+    Page* alloc_page_no_lock();
+    void free_page_no_lock(Page* page);
     /* The halves of an allocation: a page off the free list, with Lock
        held; and its zeroing, which needs no lock -- the page is the
        caller's alone once it is off the list. */
-    Page* TakeFreePageNoLock();
-    void ZeroPage(Page* page);
+    Page* take_free_page_no_lock();
+    void zero_page(Page* page);
 
     /* Where a range map takes its frames from: exactly one member is set.
        A tagged source keeps one range walk serving all three public forms
        -- this kernel has no lambdas to parameterize it with. */
     struct MapSource
     {
-        Page* const* Ptrs;
-        Page* Array;
-        const ulong* PhyAddrs;
+        Page* const* ptrs;
+        Page* array;
+        const ulong* phy_addrs;
     };
 
-    Page* SourcePage(const MapSource& src, size_t index);
+    Page* source_page(const MapSource& src, size_t index);
 
-    PtePage* WalkToL1Locked(ulong virtAddr, bool create);
-    bool MapRangeLocked(ulong virtAddr, size_t count, const MapSource& src);
+    PtePage* walk_to_l1_locked(ulong virt_addr, bool create);
+    bool map_range_locked(ulong virt_addr, size_t count, const MapSource& src);
 
-    bool ChangeRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable,
+    bool change_range_protection(ulong virt_addr, ulong size_bytes, bool writable,
         bool executable, bool exact);
-    void UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages);
+    void unmap_range_locked(ulong virt_addr, size_t count, bool free_pages);
 
-    ulong TmpMapStart;
-    Kernel::SpinLock TmpMapLock;
-    PtePage *TmpMapL1Page;
+    ulong tmp_map_start_;
+    kernel::SpinLock tmp_map_lock_;
+    PtePage *tmp_map_l1_page_;
 
     /* The TmpMap window, TmpMapPageCount slots in one L1 table: first the
        ones any CPU takes under TmpMapLock (TmpMapPage, TmpMapRange), then a
        slot for each CPU, for copying a frame (MapFrameSlot). */
-    static const size_t TmpMapPageCount = 512;
-    static const size_t FrameSlotCount = 64;
-    static const size_t TmpMapSharedCount = TmpMapPageCount - FrameSlotCount;
-    Page *TmpMapPageArray[TmpMapSharedCount];
+    static const size_t TMP_MAP_PAGE_COUNT = 512;
+    static const size_t FRAME_SLOT_COUNT = 64;
+    static const size_t TMP_MAP_SHARED_COUNT = TMP_MAP_PAGE_COUNT - FRAME_SLOT_COUNT;
+    Page *tmp_map_page_array_[TMP_MAP_SHARED_COUNT];
 
-    ulong FrameSlotAddress(ulong cpu);
+    ulong frame_slot_address(ulong cpu);
 
-    ulong GetL1Page(ulong virtAddr);
+    ulong get_l1_page(ulong virt_addr);
 
-    ulong Root;
+    ulong root_;
 
-    SpinLock Lock;
-    SpinLock FreePagesLock;
-    ulong FreePages;
+    SpinLock lock_;
+    SpinLock free_pages_lock_;
+    ulong free_pages_;
     /* Usable RAM below the PageArray limit, parked by ExcludeFreePages so
        Setup never allocates it; reclaimed in SetupFreePagesList. */
-    ulong ExcludedPages;
+    ulong excluded_pages_;
 
     /* PageArray is one Page per 4KiB frame of physical memory, so on a big
        machine it is hundreds of megabytes and every free-list walk touches
        it at random. It gets a physically contiguous home of its own, mapped
        with 2MiB pages: 512 times fewer leaf entries, and a TLB that can
        actually cover it. */
-    static const ulong HugePageSize = 512 * Const::PageSize;
+    static const ulong HUGE_PAGE_SIZE = 512 * consts::PAGE_SIZE;
 
-    Page* PageArray;
-    ulong PageArrayPhys;
-    ulong PageArrayCount;
-    ulong HighestPhyAddr;
-    Stdlib::ListEntry FreePagesList;
-    ulong FreePagesCount;
-    ulong TotalPagesCount;
+    Page* page_array_;
+    ulong page_array_phys_;
+    ulong page_array_count_;
+    ulong highest_phy_addr_;
+    stdlib::ListEntry free_pages_list_;
+    ulong free_pages_count_;
+    ulong total_pages_count_;
 
     /* The huge pool's two bitmaps, a bit a 2MiB block of physical memory:
        in the pool, written only by ReserveHugePool before there is another
        CPU, and free in it, under Lock. Sized for the most RAM the bootstrap
        map can reach on either arch, one PDPT of 1GiB blocks: 512 GiB, 32
        KiB a bitmap. */
-    static const ulong HugePoolMaxBytes = 512 * Const::GB;
-    static const ulong HugePoolMaxBlocks = HugePoolMaxBytes / HugeFrameSize;
-    static const ulong HugePoolWordBits = 8 * sizeof(ulong);
-    static const ulong HugePoolWords = HugePoolMaxBlocks / HugePoolWordBits;
-    ulong HugePoolIn[HugePoolWords];
-    ulong HugePoolFreeBits[HugePoolWords];
-    ulong HugePoolCount;
-    ulong HugePoolFreeCount;
+    static const ulong HUGE_POOL_MAX_BYTES = 512 * consts::GB;
+    static const ulong HUGE_POOL_MAX_BLOCKS = HUGE_POOL_MAX_BYTES / HUGE_FRAME_SIZE;
+    static const ulong HUGE_POOL_WORD_BITS = 8 * sizeof(ulong);
+    static const ulong HUGE_POOL_WORDS = HUGE_POOL_MAX_BLOCKS / HUGE_POOL_WORD_BITS;
+    ulong huge_pool_in_[HUGE_POOL_WORDS];
+    ulong huge_pool_free_bits_[HUGE_POOL_WORDS];
+    ulong huge_pool_count_;
+    ulong huge_pool_free_count_;
     /* The word AllocHugeFrame looks in first: where the last block came
        from, so that a guest taking thousands of blocks does not scan past
        the ones it took already for each. */
-    ulong HugePoolHint;
+    ulong huge_pool_hint_;
 
     /* The block phyAddr is in, when it is one the pool has: false for an
        address past the bitmaps or in no block of the pool. */
-    bool HugePoolBlockOf(ulong phyAddr, ulong& block);
-    static bool HugePoolTest(const ulong* bits, ulong block);
-    static void HugePoolSet(ulong* bits, ulong block, bool value);
-    bool HugeBlockFree(ulong block);
+    bool huge_pool_block_of(ulong phy_addr, ulong& block);
+    static bool huge_pool_test(const ulong* bits, ulong block);
+    static void huge_pool_set(ulong* bits, ulong block, bool value);
+    bool huge_block_free(ulong block);
 };
 
 }

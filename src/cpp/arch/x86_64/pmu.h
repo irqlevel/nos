@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* Performance monitoring, used for one thing: overflowing a cycle counter
@@ -38,43 +38,43 @@ public:
        where the counters are real. Both answers are cached: this is asked on
        the CPU that starts a profiling run, and the CPUs that then arm their
        own counters must not each repeat the probe. */
-    static bool Available();
+    static bool available();
 
     /* Arm this CPU's counter to raise an NMI every `period` core cycles.
        The period is clamped from below: a period small enough to overflow
        faster than the handler returns is a machine that never leaves the
        NMI. */
-    static bool Start(ulong period);
+    static bool start(ulong period);
 
     /* Disarm this CPU's counter. */
-    static void Stop();
+    static void stop();
 
     /* Called from the NMI handler. True when the interrupt was a counter
        overflow -- in which case the counter has been rearmed and the local
        APIC's perf entry unmasked, and the caller should treat it as a
        sample rather than as a fault. */
-    static bool AckOverflow();
+    static bool ack_overflow();
 
     /* Called from the NMI handler once AckOverflow() has said no. True when
        this NMI is an AMD part's habit of delivering a performance-counter
        interrupt just after the overflow that caused it was handled: not a
        sample, but not a fault to panic over either. */
-    static bool AbsorbSpuriousNmi();
+    static bool absorb_spurious_nmi();
 
     /* Which counter the samples come off, for the profile report and for
        `lscpu`. */
-    static const char* Name();
+    static const char* name();
 
     /* How many late NMIs AbsorbSpuriousNmi() has swallowed. Counted rather
        than traced: the count is read from the shell, where printing it is
        safe, and an NMI handler is no place to take the dmesg lock. */
-    static ulong SpuriousNmiCount();
+    static ulong spurious_nmi_count();
 
     /* Cycles between samples: about 1 kHz on a 3 GHz part, ten times the
        tick and enough to see inside a function without drowning the machine
        in interrupts. */
-    static const ulong DefaultPeriod = 3000000;
-    static const ulong MinPeriod = 100000;
+    static const ulong DEFAULT_PERIOD = 3000000;
+    static const ulong MIN_PERIOD = 100000;
 };
 
 }

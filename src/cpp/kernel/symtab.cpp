@@ -4,9 +4,9 @@
 /* The kernel's text, from the linker script: only an address in it is one of
    Symbols[]' -- past the last function, a loadable module's code say, is not
    that function, however near the offset would come out */
-extern "C" char KernelStart[], KernelText[];
+extern "C" char kernel_start[], kernel_text[];
 
-namespace Kernel
+namespace kernel
 {
 
 
@@ -18,22 +18,22 @@ SymbolTable::~SymbolTable()
 {
 }
 
-bool SymbolTable::Resolve(ulong addr, const char*& name, ulong& offset)
+bool SymbolTable::resolve(ulong addr, const char*& name, ulong& offset)
 {
-    if (SymbolCount == 0)
+    if (SYMBOL_COUNT == 0)
         return false;
 
-    if (addr < reinterpret_cast<ulong>(KernelStart) || addr >= reinterpret_cast<ulong>(KernelText))
+    if (addr < reinterpret_cast<ulong>(kernel_start) || addr >= reinterpret_cast<ulong>(kernel_text))
         return false;
 
     /* Binary search for the largest Symbols[i].Addr <= addr */
     size_t lo = 0;
-    size_t hi = SymbolCount;
+    size_t hi = SYMBOL_COUNT;
 
     while (lo < hi)
     {
         size_t mid = lo + (hi - lo) / 2;
-        if (Symbols[mid].Addr <= addr)
+        if (SYMBOLS[mid].addr <= addr)
             lo = mid + 1;
         else
             hi = mid;
@@ -43,38 +43,38 @@ bool SymbolTable::Resolve(ulong addr, const char*& name, ulong& offset)
         return false;
 
     lo--;
-    name = Symbols[lo].Name;
-    offset = addr - Symbols[lo].Addr;
+    name = SYMBOLS[lo].name;
+    offset = addr - SYMBOLS[lo].addr;
     return true;
 }
 
-bool SymbolTable::Describe(ulong addr, char* buf, ulong size)
+bool SymbolTable::describe(ulong addr, char* buf, ulong size)
 {
     const char* name;
     ulong offset;
-    if (Resolve(addr, name, offset))
+    if (resolve(addr, name, offset))
     {
-        Stdlib::SnPrintf(buf, size, "%s+0x%lX", name, offset);
+        stdlib::sn_printf(buf, size, "%s+0x%lX", name, offset);
         return true;
     }
 
-    return ModuleTable::GetInstance().Describe(addr, false, buf, size);
+    return ModuleTable::get_instance().describe(addr, false, buf, size);
 }
 
-bool SymbolTable::DescribeReturn(ulong ret, char* buf, ulong size)
+bool SymbolTable::describe_return(ulong ret, char* buf, ulong size)
 {
     if (ret == 0)
         return false;
 
     const char* name;
     ulong offset;
-    if (Resolve(ret - 1, name, offset))
+    if (resolve(ret - 1, name, offset))
     {
-        Stdlib::SnPrintf(buf, size, "%s+0x%lX", name, offset + 1);
+        stdlib::sn_printf(buf, size, "%s+0x%lX", name, offset + 1);
         return true;
     }
 
-    return ModuleTable::GetInstance().Describe(ret, true, buf, size);
+    return ModuleTable::get_instance().describe(ret, true, buf, size);
 }
 
 }

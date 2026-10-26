@@ -6,7 +6,7 @@
 
 #include "cpu.h"
 
-namespace Kernel
+namespace kernel
 {
 
 /* Sampling profiler: where the kernel actually spends its time, asked of a
@@ -39,36 +39,36 @@ namespace Kernel
 class Profiler final
 {
 public:
-    static Profiler& GetInstance()
+    static Profiler& get_instance()
     {
-        static Profiler Instance;
-        return Instance;
+        static Profiler instance;
+        return instance;
     }
 
-    static const ulong MaxDepth = 8;
+    static const ulong MAX_DEPTH = 8;
 
     /* Cheap enough to call from every tick: one read of a flag. */
-    bool IsActive() { return Active; }
+    bool is_active() { return active_; }
 
     /* Called from the per-CPU tick, interrupts already off. Arms and disarms
        this CPU's performance counter, and takes the sample itself when there
        is no counter to do it. */
-    void Tick(Context* ctx);
+    void tick(Context* ctx);
 
     /* Called from the NMI handler once the counter overflow has been
        acknowledged as this profiler's. */
-    void Sample(Context* ctx);
+    void sample(Context* ctx);
 
-    bool Start();
-    void Stop();
+    bool start();
+    void stop();
 
     /* Report every task, rather than one. */
-    static const ulong NoPidFilter = (ulong)-1;
+    static const ulong NO_PID_FILTER = (ulong)-1;
 
     /* `chains` caps how many are printed. The default is TopChains; a
        smaller number is what makes the report readable on a console with no
        scrollback, where the hottest chain is the one that scrolls away. */
-    void Report(Stdlib::Printer& printer, ulong pidFilter, ulong chains = TopChains);
+    void report(stdlib::Printer& printer, ulong pid_filter, ulong chains = TOP_CHAINS);
 
 private:
     Profiler();
@@ -79,45 +79,45 @@ private:
     /* One second per CPU at the counter rate, ten at the tick rate. Buffers
        are allocated for the CPUs that are actually running, so the cost is
        the machine's real width rather than MaxCpus. */
-    static const ulong SamplesPerCpu = 1024;
+    static const ulong SAMPLES_PER_CPU = 1024;
 
     /* How many distinct call chains a report can hold, and how many it
        prints. A chain that does not fit is counted, not silently lost. */
-    static const ulong MaxChains = 128;
+    static const ulong MAX_CHAINS = 128;
 
 public:
-    static const ulong TopChains = 8;
+    static const ulong TOP_CHAINS = 8;
 private:
 
     struct Record
     {
-        ulong Pid;
-        ulong Depth;
-        ulong Frame[MaxDepth];
+        ulong pid;
+        ulong depth;
+        ulong frame[MAX_DEPTH];
     };
 
     struct PerCpu
     {
-        Record* Records;
-        ulong Count;
-        ulong Dropped;
+        Record* records;
+        ulong count;
+        ulong dropped;
 
         /* Written only by its own CPU, from its own tick. */
-        bool PmuArmed;
+        bool pmu_armed;
     };
 
-    bool Allocate();
+    bool allocate();
 
-    volatile bool Active;
+    volatile bool active_;
 
     /* Set at Start from CPUID; read by every tick. */
-    volatile bool UsePmu;
+    volatile bool use_pmu_;
 
-    bool Allocated;
+    bool allocated_;
 
-    PerCpu Cpu_[MaxCpus];
+    PerCpu cpu_[MAX_CPUS];
 
-    static const ulong Tag = 'Prof';
+    static const ulong TAG = 'Prof';
 };
 
 }

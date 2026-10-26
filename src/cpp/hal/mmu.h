@@ -2,13 +2,13 @@
 
 #include <include/types.h>
 
-namespace Hal
+namespace hal
 {
 /* Enable hardware support required for W^X. x86: set EFER.NXE so the NX
    PTE bit is honored (must run before any PTE has bit 63 set, i.e. before
    loading a CR3 whose table carries NX bits). arm64: no-op (PXN/UXN are
    always active). Defined per arch. */
-void EnableWxSupport();
+void enable_wx_support();
 
 /* Program this CPU's memory-type table so write-combining MMIO mappings
    work. x86: IA32_PAT entry 4 (the entry a 4K PTE selects with the PAT
@@ -18,24 +18,24 @@ void EnableWxSupport();
    and on each AP before it loads the kernel page table. arm64: no-op, the
    MAIR (idx2 = Normal non-cacheable) is set up in boot.S for every CPU.
    Defined per arch. */
-void SetupMemoryTypes();
+void setup_memory_types();
 
 /* True once SetupMemoryTypes() has made write-combining usable (x86: the
    CPU has PAT). MapMmioRegion falls back to uncached when it is false. */
-bool IsWriteCombiningAvailable();
+bool is_write_combining_available();
 
 /* Nonzero if the arch guarantees [physAddr, physAddr+size) is permanently
    mapped (arm64: the boot device-GiB block covering all QEMU-virt MMIO);
    MapMmioRegion returns it directly instead of building 4K mappings.
    x86 returns 0. Defined per arch. */
-ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes);
+ulong mmio_premapped_va(ulong phys_addr, ulong size_bytes);
 
 /* Make code just stored to [va, va+size) safe to execute: the stores reach
    the point of unification, and no stale instruction stays cached for the
    range. arm64 does both by hand (DC CVAU, IC IVAU); x86 keeps instruction
    fetch coherent with stores and needs nothing. The module loader calls it
    before a module's first instruction runs. Defined per arch. */
-void SyncInstructionCache(ulong va, ulong size);
+void sync_instruction_cache(ulong va, ulong size);
 }
 
 // MMU control: TLB invalidation and the translation-root register.

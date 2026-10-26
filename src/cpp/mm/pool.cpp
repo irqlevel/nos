@@ -8,44 +8,44 @@
 #include <lib/stdlib.h>
 #include <mm/new.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 Pool::Pool()
-    : BlockSize(0)
-    , PgAlloc(nullptr)
-    , BlockCount(0)
-    , PeekBlockCount(0)
-    , EmptyPages(0)
+    : block_size_(0)
+    , pg_alloc_(nullptr)
+    , block_count_(0)
+    , peek_block_count_(0)
+    , empty_pages_(0)
 {
 }
 
 Pool::~Pool()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    Trace(0, "0x%p blockSize %lu peekBlockCount %lu", this, BlockSize, PeekBlockCount);
+    trace(0, "0x%p blockSize %lu peekBlockCount %lu", this, block_size_, peek_block_count_);
 
-    if (BlockCount != 0)
-        Trace(0, "0x%p blockSize %lu blockCount %lu", this, BlockSize, BlockCount);
+    if (block_count_ != 0)
+        trace(0, "0x%p blockSize %lu blockCount %lu", this, block_size_, block_count_);
 
     /* The blocks nobody freed, page by page: the pool keeps no list of the
        blocks out, which every allocation would have to take Lock to join */
-    ListEntry* lists[] = { &PageList, &FreePageList };
+    ListEntry* lists[] = { &page_list_, &free_page_list_ };
     for (ListEntry* list : lists)
     {
-        for (auto link = list->Flink; link != list; link = link->Flink)
+        for (auto link = list->flink; link != list; link = link->flink)
         {
-            auto page = CONTAINING_RECORD(link, Page, Link);
-            for (ulong i = 0; i < page->MaxBlockCount; i++)
+            auto page = CONTAINING_RECORD(link, Page, link);
+            for (ulong i = 0; i < page->max_block_count; i++)
             {
-                Block* block = BlockAt(page, i);
-                ulong tag = static_cast<ulong>(block->Tag.Get());
-                if (tag != FreedTag)
-                    Trace(0, "0x%p block 0x%p tag 0x%lX", this, block, tag);
+                Block* block = block_at(page, i);
+                ulong tag = static_cast<ulong>(block->tag.get());
+                if (tag != FREED_TAG)
+                    trace(0, "0x%p block 0x%p tag 0x%lX", this, block, tag);
             }
         }
     }
@@ -64,47 +64,47 @@ Pool::~Pool()
        above; their memory is not worth anything at halt. */
 }
 
-void Pool::Init(size_t blockSize, class PageAllocator* pgAlloc)
+void Pool::init(size_t block_size, class PageAllocator* pg_alloc)
 {
-    BugOn(BlockCount);
-    BugOn(BlockSize);
-    BugOn(PgAlloc != nullptr);
-    BugOn(!PageList.IsEmpty());
-    BugOn(!FreePageList.IsEmpty());
-    BugOn(PeekBlockCount);
+    BUG_ON(block_count_);
+    BUG_ON(block_size_);
+    BUG_ON(pg_alloc_ != nullptr);
+    BUG_ON(!page_list_.is_empty());
+    BUG_ON(!free_page_list_.is_empty());
+    BUG_ON(peek_block_count_);
 
-    BlockSize = blockSize;
-    PgAlloc = pgAlloc;
+    block_size_ = block_size;
+    pg_alloc_ = pg_alloc;
 }
 
-Pool::Page* Pool::NewPage()
+Pool::Page* Pool::new_page()
 {
-    Page* page = static_cast<Page*>(PgAlloc->Alloc(1, true));
+    Page* page = static_cast<Page*>(pg_alloc_->alloc(1, true));
     if (page == nullptr)
         return nullptr;
 
-    page->Link.Init();
-    page->BlockCount = 0;
-    page->BlockList.Init();
+    page->link.init();
+    page->block_count = 0;
+    page->block_list.init();
 
-    Block* block = BlockAt(page, 0);
-    while (Stdlib::MemAdd(block, sizeof(*block) + BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
+    Block* block = block_at(page, 0);
+    while (stdlib::mem_add(block, sizeof(*block) + block_size_) <= stdlib::mem_add(page, consts::PAGE_SIZE))
     {
         /* Made here, the page being raw memory: Tag is an Atomic, whose
            lifetime a constructor begins */
         block = new (block) Block;
-        block->Tag.Set(static_cast<long>(FreedTag));
-        page->BlockList.InsertTail(&block->Link);
-        page->BlockCount++;
-        block = BlockAt(page, page->BlockCount);
+        block->tag.set(static_cast<long>(FREED_TAG));
+        page->block_list.insert_tail(&block->link);
+        page->block_count++;
+        block = block_at(page, page->block_count);
     }
-    page->MaxBlockCount = page->BlockCount;
+    page->max_block_count = page->block_count;
     return page;
 }
 
-Pool::Block* Pool::BlockAt(Page* page, ulong index)
+Pool::Block* Pool::block_at(Page* page, ulong index)
 {
-    return static_cast<Block*>(Stdlib::MemAdd(&page->Data[0], index * (sizeof(Block) + BlockSize)));
+    return static_cast<Block*>(stdlib::mem_add(&page->data[0], index * (sizeof(Block) + block_size_)));
 }
 
 /* A page for the pool is allocated with the lock let go of, as Free gives
@@ -112,190 +112,190 @@ Pool::Block* Pool::BlockAt(Page* page, ulong index)
    them all, and a CPU spinning on this lock with its interrupts off would
    never answer. The new page is this call's alone until it is on the list;
    if another CPU put one there meanwhile, it goes back. */
-void *Pool::Alloc(ulong tag)
+void *Pool::alloc(ulong tag)
 {
     Block* block = nullptr;
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (!FreePageList.IsEmpty())
-            block = TakeLocked();
+        if (!free_page_list_.is_empty())
+            block = take_locked();
     }
 
     if (block == nullptr)
     {
-        Page* page = NewPage();
+        Page* page = new_page();
         if (page == nullptr)
             return nullptr;
 
         Page* spare = nullptr;
         {
-            Stdlib::AutoLock lock(Lock);
+            stdlib::AutoLock lock(lock_);
 
-            if (FreePageList.IsEmpty())
+            if (free_page_list_.is_empty())
             {
-                FreePageList.InsertHead(&page->Link);
-                EmptyPages++;
+                free_page_list_.insert_head(&page->link);
+                empty_pages_++;
             }
             else
                 spare = page;
-            block = TakeLocked();
+            block = take_locked();
         }
 
         if (spare != nullptr)
-            PgAlloc->Free(spare);
+            pg_alloc_->free(spare);
     }
 
-    Claim(block + 1, tag);
+    claim(block + 1, tag);
     return block + 1;
 }
 
-Pool::Block* Pool::TakeLocked()
+Pool::Block* Pool::take_locked()
 {
-    Page* page = CONTAINING_RECORD(FreePageList.Flink, Page, Link);
-    BugOn(page->BlockList.IsEmpty());
-    if (page->BlockCount == page->MaxBlockCount)
+    Page* page = CONTAINING_RECORD(free_page_list_.flink, Page, link);
+    BUG_ON(page->block_list.is_empty());
+    if (page->block_count == page->max_block_count)
     {
-        BugOn(EmptyPages == 0);
-        EmptyPages--;
+        BUG_ON(empty_pages_ == 0);
+        empty_pages_--;
     }
-    Block* block = CONTAINING_RECORD(page->BlockList.RemoveHead(), Block, Link);
-    block->Link.Init();
-    page->BlockCount--;
-    if (page->BlockList.IsEmpty())
+    Block* block = CONTAINING_RECORD(page->block_list.remove_head(), Block, link);
+    block->link.init();
+    page->block_count--;
+    if (page->block_list.is_empty())
     {
-        BugOn(page->BlockCount);
-        page->Link.RemoveInit();
-        PageList.InsertTail(&page->Link);
+        BUG_ON(page->block_count);
+        page->link.remove_init();
+        page_list_.insert_tail(&page->link);
     }
 
-    BlockCount++;
-    if (BlockCount > PeekBlockCount)
-        PeekBlockCount = BlockCount;
+    block_count_++;
+    if (block_count_ > peek_block_count_)
+        peek_block_count_ = block_count_;
 
     /* Free since its page was made or its owner let it go: a tag of
        anything else is a write into a block nobody owned */
-    BugOn(static_cast<ulong>(block->Tag.Get()) != FreedTag);
+    BUG_ON(static_cast<ulong>(block->tag.get()) != FREED_TAG);
     return block;
 }
 
-Pool::Page* Pool::PutLocked(Block* block)
+Pool::Page* Pool::put_locked(Block* block)
 {
-    BugOn(static_cast<ulong>(block->Tag.Get()) != FreedTag);
-    Page* page = reinterpret_cast<Page*>(reinterpret_cast<ulong>(block) & ~(Const::PageSize - 1));
-    BugOn(page->BlockCount >= page->MaxBlockCount);
+    BUG_ON(static_cast<ulong>(block->tag.get()) != FREED_TAG);
+    Page* page = reinterpret_cast<Page*>(reinterpret_cast<ulong>(block) & ~(consts::PAGE_SIZE - 1));
+    BUG_ON(page->block_count >= page->max_block_count);
 
-    BlockCount--;
-    page->BlockList.InsertTail(&block->Link);
-    page->BlockCount++;
-    page->Link.RemoveInit();
-    if (page->BlockCount == page->MaxBlockCount && EmptyPages >= EmptyPagesKept)
+    block_count_--;
+    page->block_list.insert_tail(&block->link);
+    page->block_count++;
+    page->link.remove_init();
+    if (page->block_count == page->max_block_count && empty_pages_ >= EMPTY_PAGES_KEPT)
         return page;
 
     /* At the tail: the pages before it, with blocks in use, are the ones to
        fill first */
-    if (page->BlockCount == page->MaxBlockCount)
-        EmptyPages++;
-    FreePageList.InsertTail(&page->Link);
+    if (page->block_count == page->max_block_count)
+        empty_pages_++;
+    free_page_list_.insert_tail(&page->link);
     return nullptr;
 }
 
-void Pool::Free(void* ptr)
+void Pool::free(void* ptr)
 {
-    BugOn(!ptr);
-    MarkFreed(ptr);
+    BUG_ON(!ptr);
+    mark_freed(ptr);
 
-    Page* freePage;
+    Page* free_page;
     {
-        Stdlib::AutoLock lock(Lock);
-        freePage = PutLocked(static_cast<Block*>(ptr) - 1);
+        stdlib::AutoLock lock(lock_);
+        free_page = put_locked(static_cast<Block*>(ptr) - 1);
     }
 
-    if (freePage)
-        PgAlloc->Free(freePage);
+    if (free_page)
+        pg_alloc_->free(free_page);
 }
 
-size_t Pool::TakeFree(void** blocks, size_t count)
+size_t Pool::take_free(void** blocks, size_t count)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     size_t taken = 0;
-    while (taken < count && !FreePageList.IsEmpty())
-        blocks[taken++] = TakeLocked() + 1;
+    while (taken < count && !free_page_list_.is_empty())
+        blocks[taken++] = take_locked() + 1;
     return taken;
 }
 
-void Pool::PutFree(void* const* blocks, size_t count)
+void Pool::put_free(void* const* blocks, size_t count)
 {
-    BugOn(count > PutFreeMax);
+    BUG_ON(count > PUT_FREE_MAX);
 
     /* At most one page a block: a page another block of the batch would go
        back to cannot also be empty */
-    Page* release[PutFreeMax];
+    Page* release[PUT_FREE_MAX];
     size_t released = 0;
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
         for (size_t i = 0; i < count; i++)
         {
-            Page* page = PutLocked(static_cast<Block*>(blocks[i]) - 1);
+            Page* page = put_locked(static_cast<Block*>(blocks[i]) - 1);
             if (page != nullptr)
                 release[released++] = page;
         }
     }
 
     for (size_t i = 0; i < released; i++)
-        PgAlloc->Free(release[i]);
+        pg_alloc_->free(release[i]);
 }
 
-void Pool::Claim(void* ptr, ulong tag)
+void Pool::claim(void* ptr, ulong tag)
 {
     Block* block = static_cast<Block*>(ptr) - 1;
-    long was = block->Tag.Cmpxchg(static_cast<long>(tag), static_cast<long>(FreedTag));
+    long was = block->tag.cmpxchg(static_cast<long>(tag), static_cast<long>(FREED_TAG));
     /* Not free: handed out twice, or written into while free */
-    BugOn(static_cast<ulong>(was) != FreedTag);
+    BUG_ON(static_cast<ulong>(was) != FREED_TAG);
 }
 
-void Pool::MarkFreed(void* ptr)
+void Pool::mark_freed(void* ptr)
 {
     Block* block = static_cast<Block*>(ptr) - 1;
     for (;;)
     {
-        long was = block->Tag.Get();
+        long was = block->tag.get();
         /* Freed already: a double free */
-        BugOn(static_cast<ulong>(was) == FreedTag);
-        if (block->Tag.Cmpxchg(static_cast<long>(FreedTag), was) == was)
+        BUG_ON(static_cast<ulong>(was) == FREED_TAG);
+        if (block->tag.cmpxchg(static_cast<long>(FREED_TAG), was) == was)
             return;
     }
 }
 
-bool Pool::Trim()
+bool Pool::trim()
 {
     ListEntry empty;
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        ListEntry* link = FreePageList.Flink;
-        while (link != &FreePageList)
+        ListEntry* link = free_page_list_.flink;
+        while (link != &free_page_list_)
         {
-            ListEntry* next = link->Flink;
-            Page* page = CONTAINING_RECORD(link, Page, Link);
-            if (page->BlockCount == page->MaxBlockCount)
+            ListEntry* next = link->flink;
+            Page* page = CONTAINING_RECORD(link, Page, link);
+            if (page->block_count == page->max_block_count)
             {
-                page->Link.RemoveInit();
-                empty.InsertTail(&page->Link);
-                BugOn(EmptyPages == 0);
-                EmptyPages--;
+                page->link.remove_init();
+                empty.insert_tail(&page->link);
+                BUG_ON(empty_pages_ == 0);
+                empty_pages_--;
             }
             link = next;
         }
-        BugOn(EmptyPages != 0);
+        BUG_ON(empty_pages_ != 0);
     }
 
     bool trimmed = false;
-    while (!empty.IsEmpty())
+    while (!empty.is_empty())
     {
-        PgAlloc->Free(CONTAINING_RECORD(empty.RemoveHead(), Page, Link));
+        pg_alloc_->free(CONTAINING_RECORD(empty.remove_head(), Page, link));
         trimmed = true;
     }
     return trimmed;

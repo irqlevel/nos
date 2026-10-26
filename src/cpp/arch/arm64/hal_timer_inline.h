@@ -6,12 +6,12 @@
 // arm64 body for Hal::LocalTimerArm (see hal/timer.h): the generic timer's
 // CNTV, by its compare value.
 
-namespace Hal
+namespace hal
 {
 
-static inline __attribute__((always_inline)) void LocalTimerArm(ulong deltaNs)
+static inline __attribute__((always_inline)) void local_timer_arm(ulong delta_ns)
 {
-    Kernel::GenericTimer::ArmIn(deltaNs);
+    kernel::GenericTimer::arm_in(delta_ns);
 }
 
 }

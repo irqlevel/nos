@@ -3,25 +3,25 @@
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 class MmIo
 {
 public:
-    static u32 Read32(void *addr)
+    static u32 read32(void *addr)
     {
         u32 result = *reinterpret_cast<volatile u32 *>(addr);
-        Trace(MmIoLL, "MmIo read 0x%p result 0x%lX", addr, (ulong)result);
+        trace(MM_IO_LL, "MmIo read 0x%p result 0x%lX", addr, (ulong)result);
         return result;
     }
 
-    static void Write32(void *addr, u32 value)
+    static void write32(void *addr, u32 value)
     {
-        Trace(MmIoLL, "MmIo write 0x%p value 0x%lX", addr, (ulong)value);
+        trace(MM_IO_LL, "MmIo write 0x%p value 0x%lX", addr, (ulong)value);
         *reinterpret_cast<volatile u32 *>(addr) = value;
     }
 };

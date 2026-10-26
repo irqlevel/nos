@@ -1,7 +1,7 @@
 #pragma once
 
 
-namespace Kernel
+namespace kernel
 {
 
 class TaskQueue;

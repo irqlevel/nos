@@ -2,7 +2,7 @@
 
 #include "stdlib.h"
 
-namespace Stdlib
+namespace stdlib
 {
 
 class Error final
@@ -16,71 +16,71 @@ public:
 
     ~Error();
 
-    int GetCode() const;
+    int get_code() const;
 
-    void SetCode(int code);
+    void set_code(int code);
 
-    const char* GetDescription() const;
+    const char* get_description() const;
 
-    static const int Success = 0;
+    static const int SUCCESS = 0;
 
-    static const int Again = 11;
+    static const int AGAIN = 11;
 
-    static const int InvalidValue = 22;
+    static const int INVALID_VALUE = 22;
 
-    static const int NoMemory = 12;
+    static const int NO_MEMORY = 12;
 
-    static const int ConnReset = 104;
+    static const int CONN_RESET = 104;
 
-    static const int Cancelled = 125;
+    static const int CANCELLED = 125;
 
-    static const int NotExecuted = 500;
+    static const int NOT_EXECUTED = 500;
 
-    static const int InvalidState = 501;
+    static const int INVALID_STATE = 501;
 
-    static const int Unsuccessful = 502;
+    static const int UNSUCCESSFUL = 502;
 
-    static const int NotImplemented = 503;
+    static const int NOT_IMPLEMENTED = 503;
 
-    static const int UnknownCode = 504;
+    static const int UNKNOWN_CODE = 504;
 
-    static const int NotFound = 505;
+    static const int NOT_FOUND = 505;
 
     static const int EOF = 506;
 
-    static const int BufTooBig = 507;
+    static const int BUF_TOO_BIG = 507;
 
     static const int IO = 508;
 
-    static const int BadMagic = 509;
+    static const int BAD_MAGIC = 509;
 
-    static const int HeaderCorrupt = 510;
+    static const int HEADER_CORRUPT = 510;
 
-    static const int DataCorrupt = 511;
+    static const int DATA_CORRUPT = 511;
 
-    static const int BadSize = 512;
+    static const int BAD_SIZE = 512;
 
-    static const int AlreadyExists = 513;
+    static const int ALREADY_EXISTS = 513;
 
-    static const int UnexpectedEOF = 514;
+    static const int UNEXPECTED_EOF = 514;
 
-    static const int Overflow = 515;
+    static const int OVERFLOWED = 515;
 
-    static const int Overlap = 516;
+    static const int OVERLAP = 516;
 
     bool operator!= (const Error& other) const;
 
     bool operator== (const Error& other) const;
 
-    bool Ok() const;
+    bool ok() const;
 
-    void Reset();
+    void reset();
 
-    const char* GetFile() const;
+    const char* get_file() const;
 
-    const char* GetFunc() const;
+    const char* get_func() const;
 
-    int GetLine() const;
+    int get_line() const;
 
     Error(const Error& other);
 
@@ -91,16 +91,16 @@ public:
     Error& operator=(Error&& other);
 
 private:
-    const char* Func;
-    const char* File;
-    int Line;
-    int Code;
+    const char* func_;
+    const char* file_;
+    int line_;
+    int code_;
 };
 
 }
 
-#define MakeError(code) \
-    Stdlib::Error(code, __FUNCTION__, Stdlib::TruncateFileName(__FILE__), __LINE__)
+#define make_error(code) \
+    stdlib::Error(code, __FUNCTION__, stdlib::truncate_file_name(__FILE__), __LINE__)
 
-#define MakeSuccess() \
-    Stdlib::Error(Stdlib::Error::Success, __FUNCTION__, Stdlib::TruncateFileName(__FILE__), __LINE__)
+#define make_success() \
+    stdlib::Error(stdlib::Error::SUCCESS, __FUNCTION__, stdlib::truncate_file_name(__FILE__), __LINE__)

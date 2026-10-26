@@ -11,16 +11,16 @@
 #include <mm/page_table.h>
 #include <include/const.h>
 
-namespace Kernel
+namespace kernel
 {
 
 Hpet::Hpet()
-    : Mmio(nullptr)
-    , PeriodFs(0)
-    , FreqHz_(0)
-    , TickPeriodNs(0)
-    , IntVector(-1)
-    , TimeNs(0)
+    : mmio_(nullptr)
+    , period_fs_(0)
+    , freq_hz_(0)
+    , tick_period_ns_(0)
+    , int_vector_(-1)
+    , time_ns_(0)
 {
 }
 
@@ -28,78 +28,78 @@ Hpet::~Hpet()
 {
 }
 
-u64 Hpet::ReadReg(ulong offset) volatile
+u64 Hpet::read_reg(ulong offset) volatile
 {
-    return *reinterpret_cast<volatile u64*>(reinterpret_cast<ulong>(Mmio) + offset);
+    return *reinterpret_cast<volatile u64*>(reinterpret_cast<ulong>(mmio_) + offset);
 }
 
-void Hpet::WriteReg(ulong offset, u64 value) volatile
+void Hpet::write_reg(ulong offset, u64 value) volatile
 {
-    *reinterpret_cast<volatile u64*>(reinterpret_cast<ulong>(Mmio) + offset) = value;
+    *reinterpret_cast<volatile u64*>(reinterpret_cast<ulong>(mmio_) + offset) = value;
 }
 
-bool Hpet::Setup()
+bool Hpet::setup()
 {
-    ulong basePhys = Acpi::GetInstance().GetHpetBasePhys();
-    if (basePhys == 0)
+    ulong base_phys = Acpi::get_instance().get_hpet_base_phys();
+    if (base_phys == 0)
     {
-        Trace(0, "HPET: no HPET ACPI table, using PIT");
+        trace(0, "HPET: no HPET ACPI table, using PIT");
         return false;
     }
 
     /* Map one page of HPET MMIO */
-    ulong va = Mm::PageTable::GetInstance().MapMmioRegion(basePhys, Const::PageSize);
+    ulong va = mm::PageTable::get_instance().map_mmio_region(base_phys, consts::PAGE_SIZE);
     if (va == 0)
     {
-        Trace(0, "HPET: MapMmioRegion failed for phys 0x%lX", basePhys);
+        trace(0, "HPET: MapMmioRegion failed for phys 0x%lX", base_phys);
         return false;
     }
 
-    Mmio = reinterpret_cast<volatile u64*>(va);
+    mmio_ = reinterpret_cast<volatile u64*>(va);
 
     /* Read capabilities: period in femtoseconds is in bits 63:32 */
-    u64 gcap = ReadReg(RegGcapId);
-    PeriodFs = gcap >> GcapPeriodShift;
-    ulong numTimers = (ulong)((gcap & GcapNumTimMask) >> GcapNumTimShift) + 1;
+    u64 gcap = read_reg(REG_GCAP_ID);
+    period_fs_ = gcap >> GCAP_PERIOD_SHIFT;
+    ulong num_timers = (ulong)((gcap & GCAP_NUM_TIM_MASK) >> GCAP_NUM_TIM_SHIFT) + 1;
 
     /* GetTime assumes a full-width 64-bit main counter. A 32-bit counter
        (COUNT_SIZE_CAP == 0) wraps ~every 43s and breaks TSC calibration and
        the GetBootTime fallback. QEMU's HPET is 64-bit; warn on anything else. */
-    if (!(gcap & GcapCountSizeCap))
-        Trace(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
+    if (!(gcap & GCAP_COUNT_SIZE_CAP))
+        trace(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
 
-    if (PeriodFs == 0 || PeriodFs > 0x05F5E100ULL /* 100 ns max per spec */)
+    if (period_fs_ == 0 || period_fs_ > 0x05F5E100ULL /* 100 ns max per spec */)
     {
-        Trace(0, "HPET: invalid period %lu fs", (ulong)PeriodFs);
-        Mmio = nullptr;
+        trace(0, "HPET: invalid period %lu fs", (ulong)period_fs_);
+        mmio_ = nullptr;
         return false;
     }
 
     /* Frequency = 1e15 / period_fs */
-    FreqHz_ = (ulong)(1000000000000000ULL / PeriodFs);
+    freq_hz_ = (ulong)(1000000000000000ULL / period_fs_);
 
     /* Nanoseconds per tick at DesiredHz */
-    TickPeriodNs = Const::NanoSecsInSec / DesiredHz;
+    tick_period_ns_ = consts::NANO_SECS_IN_SEC / DESIRED_HZ;
 
-    Trace(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
-        basePhys, va, (ulong)PeriodFs, FreqHz_, numTimers);
+    trace(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
+        base_phys, va, (ulong)period_fs_, freq_hz_, num_timers);
 
     /* Timer 0 must support periodic mode: the TYPE_CNF bit is ignored
        otherwise, the timer fires once and the system tick stops */
-    if (!(ReadReg(RegTimer0Cfg) & TimerPerIntCap))
+    if (!(read_reg(REG_TIMER0_CFG) & TIMER_PER_INT_CAP))
     {
-        Trace(0, "HPET: timer 0 has no periodic mode, using PIT");
-        Mmio = nullptr;
+        trace(0, "HPET: timer 0 has no periodic mode, using PIT");
+        mmio_ = nullptr;
         return false;
     }
 
     /* Disable counter while we configure */
-    u64 conf = ReadReg(RegGenConf);
-    conf &= ~ConfEnableCnf;
-    WriteReg(RegGenConf, conf);
+    u64 conf = read_reg(REG_GEN_CONF);
+    conf &= ~CONF_ENABLE_CNF;
+    write_reg(REG_GEN_CONF, conf);
 
     /* Reset main counter to 0 */
-    WriteReg(RegMainCnt, 0);
+    write_reg(REG_MAIN_CNT, 0);
 
     /*
      * Configure timer 0 for periodic mode at DesiredHz.
@@ -109,90 +109,90 @@ bool Hpet::Setup()
      *      first write sets the initial compare value;
      *      second write (with VAL_SET_CNF still set) sets the accumulator.
      */
-    u64 ticksPerInterrupt = FreqHz_ / DesiredHz;
-    u64 timerCfg = TimerIntEnb | TimerTypePer | TimerValSet;
-    WriteReg(RegTimer0Cfg, timerCfg);
-    WriteReg(RegTimer0Cmp, ticksPerInterrupt); /* initial comparator */
-    WriteReg(RegTimer0Cmp, ticksPerInterrupt); /* periodic accumulator */
+    u64 ticks_per_interrupt = freq_hz_ / DESIRED_HZ;
+    u64 timer_cfg = TIMER_INT_ENB | TIMER_TYPE_PER | TIMER_VAL_SET;
+    write_reg(REG_TIMER0_CFG, timer_cfg);
+    write_reg(REG_TIMER0_CMP, ticks_per_interrupt); /* initial comparator */
+    write_reg(REG_TIMER0_CMP, ticks_per_interrupt); /* periodic accumulator */
 
     /* Enable legacy replacement mode: timer 0 → IRQ 0 (replaces PIT),
        timer 1 → IRQ 8 (replaces RTC). This lets us register with the
        same GSI as the PIT, no explicit INT_ROUTE_CNF needed. */
-    conf = ReadReg(RegGenConf);
-    conf |= ConfEnableCnf | ConfLegRtCnf;
-    WriteReg(RegGenConf, conf);
+    conf = read_reg(REG_GEN_CONF);
+    conf |= CONF_ENABLE_CNF | CONF_LEG_RT_CNF;
+    write_reg(REG_GEN_CONF, conf);
 
-    Trace(0, "HPET: configured, ticksPerInt %lu (100 Hz)", (ulong)ticksPerInterrupt);
+    trace(0, "HPET: configured, ticksPerInt %lu (100 Hz)", (ulong)ticks_per_interrupt);
     return true;
 }
 
-bool Hpet::IsAvailable()
+bool Hpet::is_available()
 {
-    return Mmio != nullptr;
+    return mmio_ != nullptr;
 }
 
-ulong Hpet::GetFreqHz()
+ulong Hpet::get_freq_hz()
 {
-    return FreqHz_;
+    return freq_hz_;
 }
 
-Stdlib::Time Hpet::GetTime()
+stdlib::Time Hpet::get_time()
 {
-    if (Mmio == nullptr)
-        return Stdlib::Time(0);
+    if (mmio_ == nullptr)
+        return stdlib::Time(0);
 
-    u64 cnt = ReadReg(RegMainCnt);
+    u64 cnt = read_reg(REG_MAIN_CNT);
     /* ns = cnt * PeriodFs / 1e6; use 128-bit intermediate to avoid overflow */
-    u64 ns = (u64)((__uint128_t)cnt * PeriodFs / FemtoSecsPerNanoSec);
-    return Stdlib::Time(ns);
+    u64 ns = (u64)((__uint128_t)cnt * period_fs_ / FEMTO_SECS_PER_NANO_SEC);
+    return stdlib::Time(ns);
 }
 
-void Hpet::Wait(ulong nanoSecs)
+void Hpet::wait(ulong nano_secs)
 {
-    Stdlib::Time expired = GetTime() + Stdlib::Time(nanoSecs);
-    while (GetTime() < expired)
+    stdlib::Time expired = get_time() + stdlib::Time(nano_secs);
+    while (get_time() < expired)
     {
-        Pause();
+        cpu_relax();
     }
 }
 
-void Hpet::OnInterruptRegister(u8 irq, u8 vector)
+void Hpet::on_interrupt_register(u8 irq, u8 vector)
 {
     (void)irq;
-    IntVector = vector;
+    int_vector_ = vector;
 }
 
-InterruptHandlerFn Hpet::GetHandlerFn()
+InterruptHandlerFn Hpet::get_handler_fn()
 {
-    return HpetInterruptStub;
+    return hpet_interrupt_stub;
 }
 
-void Hpet::Interrupt(Context* ctx)
+void Hpet::interrupt(Context* ctx)
 {
     (void)ctx;
 
     /* Clear the interrupt status for timer 0 */
-    WriteReg(RegGenIntSts, 1ULL);
+    write_reg(REG_GEN_INT_STS, 1ULL);
 
     {
-        TimeLock.WriteBegin();
-        TimeNs = TimeNs + TickPeriodNs;
-        TimeLock.WriteEnd();
+        time_lock_.write_begin();
+        time_ns_ = time_ns_ + tick_period_ns_;
+        time_lock_.write_end();
     }
 
     /* Timekeeping above is the job that stays here. The fan-out below is
        only the tick, and once every CPU runs its own local timer there is
        nobody left to wake. */
-    if (!CpuTable::GetInstance().HasPerCpuTimer())
-        CpuTable::GetInstance().SendIPIAll();
+    if (!CpuTable::get_instance().has_per_cpu_timer())
+        CpuTable::get_instance().send_ipi_all();
 
-    Hal::IrqEoi(IntVector);
+    hal::irq_eoi(int_vector_);
 }
 
-extern "C" void HpetInterrupt(Context* ctx)
+extern "C" void hpet_interrupt(Context* ctx)
 {
-    InterruptStats::Inc(IrqHpet);
-    Hpet::GetInstance().Interrupt(ctx);
+    InterruptStats::inc(IrqHpet);
+    Hpet::get_instance().interrupt(ctx);
 }
 
 }

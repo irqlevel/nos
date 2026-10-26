@@ -17,31 +17,31 @@
 // classifying a site never changes x86 codegen. On arm64 these become dmb
 // instructions, which is why call sites must pick the semantic variant.
 
-namespace Hal
+namespace hal
 {
 
-static inline __attribute__((always_inline)) void CompilerBarrier()
+static inline __attribute__((always_inline)) void compiler_barrier()
 {
     __asm__ __volatile__("" : : : "memory");
 }
 
 #if defined(__x86_64__)
 
-static inline __attribute__((always_inline)) void SmpWmb() { CompilerBarrier(); }
-static inline __attribute__((always_inline)) void SmpRmb() { CompilerBarrier(); }
-static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__("mfence" : : : "memory"); }
-static inline __attribute__((always_inline)) void DmaWmb() { CompilerBarrier(); }
-static inline __attribute__((always_inline)) void DmaRmb() { CompilerBarrier(); }
-static inline __attribute__((always_inline)) void WcFlush() { __asm__ __volatile__("sfence" : : : "memory"); }
+static inline __attribute__((always_inline)) void smp_wmb() { compiler_barrier(); }
+static inline __attribute__((always_inline)) void smp_rmb() { compiler_barrier(); }
+static inline __attribute__((always_inline)) void smp_mb() { __asm__ __volatile__("mfence" : : : "memory"); }
+static inline __attribute__((always_inline)) void dma_wmb() { compiler_barrier(); }
+static inline __attribute__((always_inline)) void dma_rmb() { compiler_barrier(); }
+static inline __attribute__((always_inline)) void wc_flush() { __asm__ __volatile__("sfence" : : : "memory"); }
 
 #elif defined(__aarch64__)
 
-static inline __attribute__((always_inline)) void SmpWmb() { __asm__ __volatile__("dmb ishst" : : : "memory"); }
-static inline __attribute__((always_inline)) void SmpRmb() { __asm__ __volatile__("dmb ishld" : : : "memory"); }
-static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__("dmb ish" : : : "memory"); }
-static inline __attribute__((always_inline)) void DmaWmb() { __asm__ __volatile__("dmb oshst" : : : "memory"); }
-static inline __attribute__((always_inline)) void DmaRmb() { __asm__ __volatile__("dmb oshld" : : : "memory"); }
-static inline __attribute__((always_inline)) void WcFlush() { __asm__ __volatile__("dsb oshst" : : : "memory"); }
+static inline __attribute__((always_inline)) void smp_wmb() { __asm__ __volatile__("dmb ishst" : : : "memory"); }
+static inline __attribute__((always_inline)) void smp_rmb() { __asm__ __volatile__("dmb ishld" : : : "memory"); }
+static inline __attribute__((always_inline)) void smp_mb() { __asm__ __volatile__("dmb ish" : : : "memory"); }
+static inline __attribute__((always_inline)) void dma_wmb() { __asm__ __volatile__("dmb oshst" : : : "memory"); }
+static inline __attribute__((always_inline)) void dma_rmb() { __asm__ __volatile__("dmb oshld" : : : "memory"); }
+static inline __attribute__((always_inline)) void wc_flush() { __asm__ __volatile__("dsb oshst" : : : "memory"); }
 
 #else
 #error "unsupported architecture"

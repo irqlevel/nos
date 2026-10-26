@@ -4,48 +4,48 @@
 #include <lib/stdlib.h>
 #include <hal/console.h>
 
-namespace Kernel
+namespace kernel
 {
 
-class Console : public Stdlib::Printer
+class Console : public stdlib::Printer
 {
 public:
-    static Console& GetInstance()
+    static Console& get_instance()
     {
-        static Console Instance;
-        return Instance;
+        static Console instance;
+        return instance;
     }
 
-    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
-        VPrintf(fmt, args);
+        v_printf(fmt, args);
         va_end(args);
     }
 
-    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void v_printf(const char *fmt, va_list args) override
     {
         char str[256];
-        if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
+        if (stdlib::vsn_printf(str, sizeof(str), fmt, args) < 0)
             return;
 
-        Hal::ConsoleOut(str);
+        hal::console_out(str);
     }
 
-    virtual void PrintString(const char *s) override
+    virtual void print_string(const char *s) override
     {
-        Hal::ConsoleOut(s);
+        hal::console_out(s);
     }
 
-    virtual void Backspace() override
+    virtual void backspace() override
     {
-        Hal::ConsoleOutBackspace();
+        hal::console_out_backspace();
     }
 
-    void Cls()
+    void cls()
     {
-        Hal::ConsoleOutClear();
+        hal::console_out_clear();
     }
 
 private:

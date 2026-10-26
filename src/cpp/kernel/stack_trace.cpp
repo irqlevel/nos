@@ -3,46 +3,46 @@
 #include "trace.h"
 #include "task.h"
 
-namespace Kernel
+namespace kernel
 {
-    size_t StackTrace::CaptureFrom(ulong rbp, ulong stackBase, ulong stackLimit, ulong *frames, size_t maxFrames)
+    size_t StackTrace::capture_from(ulong rbp, ulong stack_base, ulong stack_limit, ulong *frames, size_t max_frames)
     {
-        ulong currRbp = rbp;
+        ulong curr_rbp = rbp;
         size_t i = 0;
 
-        while (i < maxFrames)
+        while (i < max_frames)
         {
             /* RBP must be 8-byte aligned */
-            if (currRbp % sizeof(ulong) != 0)
+            if (curr_rbp % sizeof(ulong) != 0)
                 break;
 
             /* Both saved-RBP and return-address slots must be in range */
-            if (!Stdlib::IsValueInRange(currRbp, stackBase, stackLimit))
+            if (!stdlib::is_value_in_range(curr_rbp, stack_base, stack_limit))
                 break;
-            if (!Stdlib::IsValueInRange(currRbp + sizeof(ulong), stackBase, stackLimit))
+            if (!stdlib::is_value_in_range(curr_rbp + sizeof(ulong), stack_base, stack_limit))
                 break;
 
-            ulong prevRbp = *(ulong *)(currRbp);
-            ulong retAddress = *(ulong *)(currRbp + sizeof(ulong));
+            ulong prev_rbp = *(ulong *)(curr_rbp);
+            ulong ret_address = *(ulong *)(curr_rbp + sizeof(ulong));
 
             /* The outermost frame of a task's: nothing called its entry
                function (Hal::BuildTaskFrame) */
-            if (retAddress == 0)
+            if (ret_address == 0)
                 break;
 
-            frames[i++] = retAddress;
+            frames[i++] = ret_address;
 
             /* Stack grows downward: caller's RBP must be strictly higher */
-            if (prevRbp <= currRbp)
+            if (prev_rbp <= curr_rbp)
                 break;
 
-            currRbp = prevRbp;
+            curr_rbp = prev_rbp;
         }
 
         return i;
     }
 
-    static size_t DetectBoundsAndCapture(ulong rbp, ulong sp, ulong *frames, size_t maxFrames)
+    static size_t detect_bounds_and_capture(ulong rbp, ulong sp, ulong *frames, size_t max_frames)
     {
         /* The window comes from the stack pointer, never from the frame
            pointer.
@@ -68,42 +68,42 @@ namespace Kernel
            always this function's own: #DF is delivered on its own IST stack,
            and its report is about the stack it came from. Callers holding a
            Context pass GetOrigRsp(); the rest pass their own. */
-        ulong base = sp & (~(Task::StackSize - 1));
-        Task::Stack* stackPtr = reinterpret_cast<Task::Stack*>(base);
-        if (stackPtr->Magic1 == Task::StackMagic1 &&
-            stackPtr->Magic2 == Task::StackMagic2)
+        ulong base = sp & (~(Task::STACK_SIZE - 1));
+        Task::Stack* stack_ptr = reinterpret_cast<Task::Stack*>(base);
+        if (stack_ptr->magic1 == Task::STACK_MAGIC1 &&
+            stack_ptr->magic2 == Task::STACK_MAGIC2)
         {
             /* Up to StackTop, not to the end of the struct: the last word is
                Magic2, and a walk allowed to read it reports the guard value
                as a return address -- 0xCBDECBDE appearing as this task's
                outermost caller, which is not a caller at all. */
-            return StackTrace::CaptureFrom(rbp, base,
-                (ulong)&stackPtr->StackTop[0], frames, maxFrames);
+            return StackTrace::capture_from(rbp, base,
+                (ulong)&stack_ptr->stack_top[0], frames, max_frames);
         }
 
         /* Not a task stack -- a per-CPU static stack, or the boot stack.
            Still bounded by the stack pointer, so still a mapped page. */
-        base = sp & (~(Const::PageSize - 1));
-        return StackTrace::CaptureFrom(rbp, base, base + Const::PageSize, frames, maxFrames);
+        base = sp & (~(consts::PAGE_SIZE - 1));
+        return StackTrace::capture_from(rbp, base, base + consts::PAGE_SIZE, frames, max_frames);
     }
 
-    size_t StackTrace::CaptureFrom(ulong rbp, ulong *frames, size_t maxFrames)
+    size_t StackTrace::capture_from(ulong rbp, ulong *frames, size_t max_frames)
     {
-        return DetectBoundsAndCapture(rbp, Hal::GetSp(), frames, maxFrames);
+        return detect_bounds_and_capture(rbp, hal::get_sp(), frames, max_frames);
     }
 
-    size_t StackTrace::CaptureFromSp(ulong rbp, ulong sp, ulong *frames, size_t maxFrames)
+    size_t StackTrace::capture_from_sp(ulong rbp, ulong sp, ulong *frames, size_t max_frames)
     {
-        return DetectBoundsAndCapture(rbp, sp, frames, maxFrames);
+        return detect_bounds_and_capture(rbp, sp, frames, max_frames);
     }
 
-    size_t StackTrace::Capture(ulong stackBase, ulong stackLimit, ulong *frames, size_t maxFrames)
+    size_t StackTrace::capture(ulong stack_base, ulong stack_limit, ulong *frames, size_t max_frames)
     {
-        return CaptureFrom(Hal::GetFp(), stackBase, stackLimit, frames, maxFrames);
+        return capture_from(hal::get_fp(), stack_base, stack_limit, frames, max_frames);
     }
 
-    size_t StackTrace::Capture(ulong *frames, size_t maxFrames)
+    size_t StackTrace::capture(ulong *frames, size_t max_frames)
     {
-        return DetectBoundsAndCapture(Hal::GetFp(), Hal::GetSp(), frames, maxFrames);
+        return detect_bounds_and_capture(hal::get_fp(), hal::get_sp(), frames, max_frames);
     }
 }

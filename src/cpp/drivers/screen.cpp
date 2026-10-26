@@ -5,111 +5,111 @@
 #include <kernel/trace.h>
 #include <arch/x86_64/grub.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Screen
+namespace screen
 {
 
 /* Which backend Setup() selected; false means VgaTerm (or nothing). */
-static bool FbActive;
+static bool fb_active;
 
-bool Setup()
+bool setup()
 {
-    const Grub::FramebufferInfo *fb = Grub::GetFramebufferInfo();
+    const grub::FramebufferInfo *fb = grub::get_framebuffer_info();
 
-    if (fb != nullptr && fb->Type == Grub::MultiBootFramebufferTypeRgb)
+    if (fb != nullptr && fb->type == grub::MULTI_BOOT_FRAMEBUFFER_TYPE_RGB)
     {
         FbInfo info;
 
-        info.PhyAddr = (ulong)fb->Addr;
-        info.Pitch = fb->Pitch;
-        info.Width = fb->Width;
-        info.Height = fb->Height;
-        info.Bpp = fb->Bpp;
-        info.RedPos = fb->RedPos;
-        info.RedSize = fb->RedSize;
-        info.GreenPos = fb->GreenPos;
-        info.GreenSize = fb->GreenSize;
-        info.BluePos = fb->BluePos;
-        info.BlueSize = fb->BlueSize;
+        info.phy_addr = (ulong)fb->addr;
+        info.pitch = fb->pitch;
+        info.width = fb->width;
+        info.height = fb->height;
+        info.bpp = fb->bpp;
+        info.red_pos = fb->red_pos;
+        info.red_size = fb->red_size;
+        info.green_pos = fb->green_pos;
+        info.green_size = fb->green_size;
+        info.blue_pos = fb->blue_pos;
+        info.blue_size = fb->blue_size;
 
-        if (FbTerm::GetInstance().Setup(info))
+        if (FbTerm::get_instance().setup(info))
         {
-            FbActive = true;
+            fb_active = true;
             return true;
         }
 
-        Trace(0, "Screen: framebuffer console setup failed");
+        trace(0, "Screen: framebuffer console setup failed");
         return false;
     }
 
-    if (fb != nullptr && fb->Type != Grub::MultiBootFramebufferTypeEgaText)
+    if (fb != nullptr && fb->type != grub::MULTI_BOOT_FRAMEBUFFER_TYPE_EGA_TEXT)
     {
         /* Indexed-color (palette) modes are not supported: there is no
            text mode to fall back to either, so the screen stays dark. */
-        Trace(0, "Screen: unsupported framebuffer type %lu, no video console",
-            (ulong)fb->Type);
+        trace(0, "Screen: unsupported framebuffer type %lu, no video console",
+            (ulong)fb->type);
         return false;
     }
 
     /* EGA text, or a bootloader that reported no framebuffer at all --
        VgaTerm decides for itself whether 0xB8000 is real hardware. */
-    VgaTerm::GetInstance();
+    VgaTerm::get_instance();
 
-    if (!VgaTerm::IsReady())
-        Trace(0, "Screen: no video console (serial only)");
+    if (!VgaTerm::is_ready())
+        trace(0, "Screen: no video console (serial only)");
 
-    return VgaTerm::IsReady();
+    return VgaTerm::is_ready();
 }
 
-bool IsReady()
+bool is_ready()
 {
-    return FbActive ? FbTerm::IsReady() : VgaTerm::IsReady();
+    return fb_active ? FbTerm::is_ready() : VgaTerm::is_ready();
 }
 
-void PrintString(const char *s)
+void print_string(const char *s)
 {
-    if (FbActive)
-        FbTerm::GetInstance().PrintString(s);
+    if (fb_active)
+        FbTerm::get_instance().print_string(s);
     else
-        VgaTerm::GetInstance().PrintString(s);
+        VgaTerm::get_instance().print_string(s);
 }
 
-void Printf(const char *fmt, ...)
+void printf(const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    if (FbActive)
-        FbTerm::GetInstance().VPrintf(fmt, args);
+    if (fb_active)
+        FbTerm::get_instance().v_printf(fmt, args);
     else
-        VgaTerm::GetInstance().VPrintf(fmt, args);
+        VgaTerm::get_instance().v_printf(fmt, args);
     va_end(args);
 }
 
-void Backspace()
+void backspace()
 {
-    if (FbActive)
-        FbTerm::GetInstance().Backspace();
+    if (fb_active)
+        FbTerm::get_instance().backspace();
     else
-        VgaTerm::GetInstance().Backspace();
+        VgaTerm::get_instance().backspace();
 }
 
-void Cls()
+void cls()
 {
-    if (FbActive)
-        FbTerm::GetInstance().Cls();
+    if (fb_active)
+        FbTerm::get_instance().cls();
     else
-        VgaTerm::GetInstance().Cls();
+        VgaTerm::get_instance().cls();
 }
 
-void PanicPrintString(const char *s)
+void panic_print_string(const char *s)
 {
-    if (FbActive)
-        FbTerm::GetInstance().PanicPrintString(s);
+    if (fb_active)
+        FbTerm::get_instance().panic_print_string(s);
     else
-        VgaTerm::GetInstance().PanicPrintString(s);
+        VgaTerm::get_instance().panic_print_string(s);
 }
 
 }

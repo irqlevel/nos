@@ -3,15 +3,15 @@
 #include <kernel/trace.h>
 #include <hal/cpu.h>
 
-namespace Kernel
+namespace kernel
 {
 
-ulong Pl011::Base;
+ulong Pl011::base_;
 /* A function-local static, not a static member: its constructor registers it
    with the watchdog, as the x86 serial port's lock is, and a global's
    constructor is one this kernel never runs -- as a member it went unwatched
    from the day it was written. Built on the first line printed. */
-static RawSpinLock& OutLock()
+static RawSpinLock& out_lock()
 {
     static RawSpinLock lock;
     return lock;
@@ -20,100 +20,100 @@ static RawSpinLock& OutLock()
 namespace
 {
 
-inline void MmioWrite32(ulong addr, u32 value)
+inline void mmio_write32(ulong addr, u32 value)
 {
     *reinterpret_cast<volatile u32*>(addr) = value;
 }
 
-inline u32 MmioRead32(ulong addr)
+inline u32 mmio_read32(ulong addr)
 {
     return *reinterpret_cast<volatile u32*>(addr);
 }
 
 }
 
-void Pl011::EarlyInit(ulong virtBase)
+void Pl011::early_init(ulong virt_base)
 {
-    Base = virtBase;
+    base_ = virt_base;
 
-    MmioWrite32(Base + Cr, 0);
+    mmio_write32(base_ + CR, 0);
     /* QEMU ignores the baud divisor; program 115200 @ 24MHz anyway */
-    MmioWrite32(Base + Ibrd, 13);
-    MmioWrite32(Base + Fbrd, 1);
-    MmioWrite32(Base + LcrH, LcrHFen | LcrHWlen8);
-    MmioWrite32(Base + Cr, CrUarten | CrTxe | CrRxe);
+    mmio_write32(base_ + IBRD, 13);
+    mmio_write32(base_ + FBRD, 1);
+    mmio_write32(base_ + LCR_H, LCR_H_FEN | LCR_H_WLEN8);
+    mmio_write32(base_ + CR, CR_UARTEN | CR_TXE | CR_RXE);
 }
 
-void Pl011::PutChar(char c)
+void Pl011::put_char(char c)
 {
-    while (MmioRead32(Base + Fr) & FrTxff)
+    while (mmio_read32(base_ + FR) & FR_TXFF)
     {
     }
-    MmioWrite32(Base + Dr, (u32)(u8)c);
+    mmio_write32(base_ + DR, (u32)(u8)c);
 }
 
-void Pl011::PanicPrintString(const char* s)
+void Pl011::panic_print_string(const char* s)
 {
     while (*s != '\0')
     {
         if (*s == '\n')
-            PutChar('\r');
-        PutChar(*s);
+            put_char('\r');
+        put_char(*s);
         s++;
     }
 }
 
-void Pl011::PrintString(const char* s)
+void Pl011::print_string(const char* s)
 {
-    ulong flags = Hal::IrqSave();
-    OutLock().Lock();
-    PanicPrintString(s);
-    OutLock().Unlock();
-    Hal::IrqRestore(flags);
+    ulong flags = hal::irq_save();
+    out_lock().lock();
+    panic_print_string(s);
+    out_lock().unlock();
+    hal::irq_restore(flags);
 }
 
-bool Pl011::Setup(u32 intId)
+bool Pl011::setup(u32 int_id)
 {
     /* PL011 interrupts are level-triggered */
-    Interrupt::RegisterLevel(*this, intId, intId);
-    MmioWrite32(Base + Imsc, IntRx | IntRt);
+    Interrupt::register_level(*this, int_id, int_id);
+    mmio_write32(base_ + IMSC, INT_RX | INT_RT);
     return true;
 }
 
-bool Pl011::RegisterObserver(SerialObserver& observer)
+bool Pl011::register_observer(SerialObserver& observer)
 {
-    if (ObserverCount >= MaxObservers)
+    if (observer_count_ >= MAX_OBSERVERS)
         return false;
-    Observers[ObserverCount] = &observer;
-    ObserverCount = ObserverCount + 1;
+    observers_[observer_count_] = &observer;
+    observer_count_ = observer_count_ + 1;
     return true;
 }
 
-void Pl011::OnInterruptRegister(u8 irq, u8 vector)
+void Pl011::on_interrupt_register(u8 irq, u8 vector)
 {
     (void)irq;
-    IntVector = vector;
+    int_vector_ = vector;
 }
 
-InterruptHandlerFn Pl011::GetHandlerFn()
+InterruptHandlerFn Pl011::get_handler_fn()
 {
     return nullptr; /* dispatch is object-based on arm64 */
 }
 
-void Pl011::OnInterrupt(Context* ctx)
+void Pl011::on_interrupt(Context* ctx)
 {
     (void)ctx;
 
-    while (!(MmioRead32(Base + Fr) & FrRxfe))
+    while (!(mmio_read32(base_ + FR) & FR_RXFE))
     {
-        char c = (char)(MmioRead32(Base + Dr) & 0xFF);
+        char c = (char)(mmio_read32(base_ + DR) & 0xFF);
         if (c == '\r')
             c = '\n';
-        for (ulong i = 0; i < ObserverCount; i++)
-            Observers[i]->OnChar(c, (u8)c);
+        for (ulong i = 0; i < observer_count_; i++)
+            observers_[i]->on_char(c, (u8)c);
     }
 
-    MmioWrite32(Base + Icr, IntRx | IntRt);
+    mmio_write32(base_ + ICR, INT_RX | INT_RT);
 }
 
 }

@@ -3,7 +3,7 @@
 #include <lib/stdlib.h>
 #include "spin_lock.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class MsixTable;
@@ -25,7 +25,7 @@ class MsixTable;
 class IrqBalance
 {
 public:
-    static IrqBalance& GetInstance()
+    static IrqBalance& get_instance()
     {
         static IrqBalance instance;
         return instance;
@@ -33,17 +33,17 @@ public:
 
     /* Record a level-triggered IOAPIC device IRQ. Returns the
        destination CPU to program into the redirection entry. */
-    ulong AssignIoApicIrq(u8 gsi);
+    ulong assign_io_apic_irq(u8 gsi);
 
     /* Record an MSI-X vector. Returns the destination CPU to program
        into the table entry. */
-    ulong AssignMsix(MsixTable* table, u16 index);
+    ulong assign_msix(MsixTable* table, u16 index);
 
     /* Forget the MSI-X vectors of a table being destroyed. */
-    void RemoveMsix(MsixTable* table);
+    void remove_msix(MsixTable* table);
 
     /* Called once after SMP bringup: spread recorded IRQs across CPUs. */
-    void Balance();
+    void balance();
 
 private:
     IrqBalance();
@@ -53,30 +53,30 @@ private:
     IrqBalance& operator=(const IrqBalance& other) = delete;
     IrqBalance& operator=(IrqBalance&& other) = delete;
 
-    static const u8 KindIoApic = 0;
-    static const u8 KindMsix = 1;
+    static const u8 KIND_IO_APIC = 0;
+    static const u8 KIND_MSIX = 1;
 
     struct Entry
     {
-        u8 Kind;
-        u8 Gsi;
-        u16 Index;
-        MsixTable* Table;
-        ulong Cpu;
+        u8 kind;
+        u8 gsi;
+        u16 index;
+        MsixTable* table;
+        ulong cpu;
     };
 
-    ulong Assign(Entry entry);
-    ulong NextCpuLockHeld(bool ioApic);
-    void ApplyLockHeld(Entry& entry);
+    ulong assign(Entry entry);
+    ulong next_cpu_lock_held(bool io_apic);
+    void apply_lock_held(Entry& entry);
 
-    static const ulong MaxEntries = 64;
+    static const ulong MAX_ENTRIES = 64;
 
-    Entry Entries[MaxEntries];
-    ulong EntryCount;
-    ulong NextCpu;       /* round-robin cursor for MSI-X vectors */
-    ulong NextIoApicCpu; /* and for IOAPIC lines, over a smaller CPU set */
-    bool Balanced;
-    SpinLock Lock;
+    Entry entries_[MAX_ENTRIES];
+    ulong entry_count_;
+    ulong next_cpu_;       /* round-robin cursor for MSI-X vectors */
+    ulong next_io_apic_cpu_; /* and for IOAPIC lines, over a smaller CPU set */
+    bool balanced_;
+    SpinLock lock_;
 };
 
 }

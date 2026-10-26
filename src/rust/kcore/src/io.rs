@@ -12,33 +12,33 @@ pub trait PortWidth: Copy {
 #[cfg(target_arch = "x86_64")]
 impl PortWidth for u8 {
     fn read_port(port: u16) -> Self {
-        unsafe { io::Inb(port) }
+        unsafe { io::inb(port) }
     }
 
     fn write_port(port: u16, val: Self) {
-        unsafe { io::Outb(port, val) }
+        unsafe { io::outb(port, val) }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl PortWidth for u16 {
     fn read_port(port: u16) -> Self {
-        unsafe { io::Inw(port) }
+        unsafe { io::inw(port) }
     }
 
     fn write_port(port: u16, val: Self) {
-        unsafe { io::Outw(port, val) }
+        unsafe { io::outw(port, val) }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl PortWidth for u32 {
     fn read_port(port: u16) -> Self {
-        unsafe { io::In(port) }
+        unsafe { io::inl(port) }
     }
 
     fn write_port(port: u16, val: Self) {
-        unsafe { io::Out(port, val) }
+        unsafe { io::outl(port, val) }
     }
 }
 

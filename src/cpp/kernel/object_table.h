@@ -3,14 +3,14 @@
 #include <lib/stdlib.h>
 #include "spin_lock.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class Object
 {
 public:
-    virtual void Get() = 0;
-    virtual void Put() = 0;
+    virtual void get() = 0;
+    virtual void put() = 0;
 };
 
 template<typename T>
@@ -18,35 +18,35 @@ class ObjectPtr final
 {
 public:
     ObjectPtr()
-        : Ptr(nullptr)
+        : ptr_(nullptr)
     {
     }
 
     explicit ObjectPtr(T* ptr)
-        : Ptr(ptr)
+        : ptr_(ptr)
     {
     }
 
     ~ObjectPtr()
     {
-        if (Ptr != nullptr)
-            Ptr->Put();
+        if (ptr_ != nullptr)
+            ptr_->put();
     }
 
     ObjectPtr(ObjectPtr&& other)
-        : Ptr(other.Ptr)
+        : ptr_(other.ptr_)
     {
-        other.Ptr = nullptr;
+        other.ptr_ = nullptr;
     }
 
     ObjectPtr& operator=(ObjectPtr&& other)
     {
         if (this != &other)
         {
-            if (Ptr != nullptr)
-                Ptr->Put();
-            Ptr = other.Ptr;
-            other.Ptr = nullptr;
+            if (ptr_ != nullptr)
+                ptr_->put();
+            ptr_ = other.ptr_;
+            other.ptr_ = nullptr;
         }
         return *this;
     }
@@ -54,26 +54,26 @@ public:
     ObjectPtr(const ObjectPtr& other) = delete;
     ObjectPtr& operator=(const ObjectPtr& other) = delete;
 
-    T* Get() const { return Ptr; }
-    T* operator->() const { return Ptr; }
-    T& operator*() const { return *Ptr; }
+    T* get() const { return ptr_; }
+    T* operator->() const { return ptr_; }
+    T& operator*() const { return *ptr_; }
 
-    explicit operator bool() const { return Ptr != nullptr; }
+    explicit operator bool() const { return ptr_ != nullptr; }
 
-    T* Release()
+    T* release()
     {
-        T* p = Ptr;
-        Ptr = nullptr;
+        T* p = ptr_;
+        ptr_ = nullptr;
         return p;
     }
 
 private:
-    T* Ptr;
+    T* ptr_;
 };
 
 using ObjectId = ulong;
 
-const ObjectId InvalidObjectId = ~((ObjectId)0);
+const ObjectId INVALID_OBJECT_ID = ~((ObjectId)0);
 
 class ObjectTable final
 {
@@ -81,11 +81,11 @@ public:
     ObjectTable();
     ~ObjectTable();
 
-    ulong Insert(Object *object);
+    ulong insert(Object *object);
 
-    void Remove(ulong objectId);
+    void remove(ulong object_id);
 
-    Object* Lookup(ulong objectId);
+    Object* lookup(ulong object_id);
 
 private:
     ObjectTable(const ObjectTable& other) = delete;
@@ -93,11 +93,11 @@ private:
     ObjectTable& operator=(const ObjectTable& other) = delete;
     ObjectTable& operator=(ObjectTable&& other) = delete;
 
-    static const ulong MaxObjectId = 256;
+    static const ulong MAX_OBJECT_ID = 256;
 
-    Object* ObjectArray[MaxObjectId];
+    Object* object_array_[MAX_OBJECT_ID];
 
-    SpinLock Lock;
+    SpinLock lock_;
 };
 
 }

@@ -2,72 +2,72 @@
 #include "stdlib.h"
 #include <kernel/panic.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
-Bitmap::Bitmap(void* addr, ulong bitCount)
-    : Addr(addr)
-    , BitCount(bitCount)
+Bitmap::Bitmap(void* addr, ulong bit_count)
+    : addr_(addr)
+    , bit_count_(bit_count)
 {
-    BugOn((ulong)addr % sizeof(ulong));
+    BUG_ON((ulong)addr % sizeof(ulong));
 }
 
 Bitmap::~Bitmap()
 {
 }
 
-void Bitmap::SetBit(ulong bitNum)
+void Bitmap::set_bit(ulong bit_num)
 {
-    BugOn(bitNum >= BitCount);
+    BUG_ON(bit_num >= bit_count_);
 
-    ulong offset = bitNum / (8 * sizeof(ulong));
-    ulong shift = bitNum % (8 * sizeof(ulong));
+    ulong offset = bit_num / (8 * sizeof(ulong));
+    ulong shift = bit_num % (8 * sizeof(ulong));
 
-    *((ulong *)Addr + offset) |= (1UL << shift);
+    *((ulong *)addr_ + offset) |= (1UL << shift);
 }
 
-void Bitmap::ClearBit(ulong bitNum)
+void Bitmap::clear_bit(ulong bit_num)
 {
-    BugOn(bitNum >= BitCount);
+    BUG_ON(bit_num >= bit_count_);
 
-    ulong offset = bitNum / (8 * sizeof(ulong));
-    ulong shift = bitNum % (8 * sizeof(ulong));
+    ulong offset = bit_num / (8 * sizeof(ulong));
+    ulong shift = bit_num % (8 * sizeof(ulong));
 
-    *((ulong *)Addr + offset) &= ~(1UL << shift);    
+    *((ulong *)addr_ + offset) &= ~(1UL << shift);    
 }
 
-bool Bitmap::TestBit(ulong bitNum)
+bool Bitmap::test_bit(ulong bit_num)
 {
-    BugOn(bitNum >= BitCount);
+    BUG_ON(bit_num >= bit_count_);
 
-    ulong offset = bitNum / (8 * sizeof(ulong));
-    ulong shift = bitNum % (8 * sizeof(ulong));
+    ulong offset = bit_num / (8 * sizeof(ulong));
+    ulong shift = bit_num % (8 * sizeof(ulong));
 
-    return (*((ulong *)Addr + offset) & (1UL << shift)) ? true : false;
+    return (*((ulong *)addr_ + offset) & (1UL << shift)) ? true : false;
 }
 
-long Bitmap::FindSetZeroBit()
+long Bitmap::find_set_zero_bit()
 {
-    ulong* curr = (ulong*)Addr;
-    long restBitCount = BitCount;
+    ulong* curr = (ulong*)addr_;
+    long rest_bit_count = bit_count_;
 
-    while (restBitCount > 0)
+    while (rest_bit_count > 0)
     {
         ulong value = *curr;
         if (value != ~0UL)
         {
-            for (ulong shift = 0; shift < Min<ulong>(8 * sizeof(ulong), restBitCount); shift++)
+            for (ulong shift = 0; shift < min<ulong>(8 * sizeof(ulong), rest_bit_count); shift++)
             {
                 if (!(value & (1UL << shift)))
                 {
                     *curr |= (1UL << shift);
-                    long bitNum = 8 * ((ulong)curr - (ulong)Addr) + shift;
-                    BugOn((ulong)bitNum >= BitCount);
-                    return bitNum;
+                    long bit_num = 8 * ((ulong)curr - (ulong)addr_) + shift;
+                    BUG_ON((ulong)bit_num >= bit_count_);
+                    return bit_num;
                 }
             }
         }
-        restBitCount -= 8 * sizeof(ulong);
+        rest_bit_count -= 8 * sizeof(ulong);
         curr++;
     }
     return -1;

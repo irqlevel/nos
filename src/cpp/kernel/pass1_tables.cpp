@@ -13,10 +13,10 @@
 __attribute__((weak)) const ModuleExport nos_module_exports[] = {};
 __attribute__((weak)) const ulong nos_module_export_count = 0;
 
-namespace Kernel
+namespace kernel
 {
 
-__attribute__((weak)) const SymEntry SymbolTable::Symbols[] = {};
-__attribute__((weak)) const size_t SymbolTable::SymbolCount = 0;
+__attribute__((weak)) const SymEntry SymbolTable::SYMBOLS[] = {};
+__attribute__((weak)) const size_t SymbolTable::SYMBOL_COUNT = 0;
 
 }

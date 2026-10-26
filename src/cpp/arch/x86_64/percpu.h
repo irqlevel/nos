@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* Per-CPU data reachable through the GS base, so asking "which CPU am I on"
@@ -25,15 +25,15 @@ namespace Kernel
    "APIC ID 0", which is a real CPU. */
 struct PerCpuData
 {
-    ulong ApicIdPlusOne;
+    ulong apic_id_plus_one;
 };
 
 /* Point GS at a shared slot that reads as "not set up". Must run before
    anything on this CPU can ask for its ID, because a GS base left as
    whatever firmware had would make that question a wild read. */
-void PerCpuSetupBoot();
+void per_cpu_setup_boot();
 
 /* Give this CPU its own slot, once its APIC ID is known. */
-void PerCpuPublish(ulong apicId);
+void per_cpu_publish(ulong apic_id);
 
 }

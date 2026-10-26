@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include "spin_lock.h"
 
-namespace Kernel
+namespace kernel
 {
 
 /* Source-agnostic keyboard sink. The legacy 8042 driver and the USB HID
@@ -17,25 +17,25 @@ namespace Kernel
 class KeyboardObserver
 {
 public:
-    virtual void OnChar(char c, u8 code) = 0;
+    virtual void on_char(char c, u8 code) = 0;
 };
 
 class KeyboardInput final
 {
 public:
-    static KeyboardInput& GetInstance()
+    static KeyboardInput& get_instance()
     {
-        static KeyboardInput Instance;
+        static KeyboardInput instance;
 
-        return Instance;
+        return instance;
     }
 
-    bool RegisterObserver(KeyboardObserver& observer);
-    void UnregisterObserver(KeyboardObserver& observer);
+    bool register_observer(KeyboardObserver& observer);
+    void unregister_observer(KeyboardObserver& observer);
 
     /* Deliver one decoded character to every registered observer. Safe from
        task context (USB poll task) and from timer context (8042 tick). */
-    void Emit(char c, u8 code);
+    void emit(char c, u8 code);
 
 private:
     KeyboardInput();
@@ -46,10 +46,10 @@ private:
     KeyboardInput& operator=(const KeyboardInput& other) = delete;
     KeyboardInput& operator=(KeyboardInput&& other) = delete;
 
-    static const size_t MaxObserver = 16;
+    static const size_t MAX_OBSERVER = 16;
 
-    SpinLock Lock;
-    KeyboardObserver* Observer[MaxObserver];
+    SpinLock lock_;
+    KeyboardObserver* observer_[MAX_OBSERVER];
 };
 
 }

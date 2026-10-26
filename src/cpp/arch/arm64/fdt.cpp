@@ -2,7 +2,7 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 namespace
@@ -10,66 +10,66 @@ namespace
 
 struct FdtHeader
 {
-    u32 Magic;
-    u32 TotalSize;
-    u32 OffDtStruct;
-    u32 OffDtStrings;
-    u32 OffMemRsvmap;
-    u32 Version;
-    u32 LastCompVersion;
-    u32 BootCpuidPhys;
-    u32 SizeDtStrings;
-    u32 SizeDtStruct;
+    u32 magic;
+    u32 total_size;
+    u32 off_dt_struct;
+    u32 off_dt_strings;
+    u32 off_mem_rsvmap;
+    u32 version;
+    u32 last_comp_version;
+    u32 boot_cpuid_phys;
+    u32 size_dt_strings;
+    u32 size_dt_struct;
 };
 
-const int MaxDepth = 16;
+const int MAX_DEPTH = 16;
 
 /* Cell counts inherited while walking; single-threaded early boot only. */
-u32 AddressCellsStack[MaxDepth];
-u32 SizeCellsStack[MaxDepth];
+u32 address_cells_stack[MAX_DEPTH];
+u32 size_cells_stack[MAX_DEPTH];
 
-ulong AlignUp4(ulong v)
+ulong align_up4(ulong v)
 {
     return (v + 3) & ~3UL;
 }
 
 }
 
-u32 Fdt::Be32(const void* p)
+u32 Fdt::be32(const void* p)
 {
     const u8* b = static_cast<const u8*>(p);
     return ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | (u32)b[3];
 }
 
-u32 Fdt::TokenAt(ulong off) const
+u32 Fdt::token_at(ulong off) const
 {
-    return Be32(Base + off);
+    return be32(base_ + off);
 }
 
-const char* Fdt::String(u32 off) const
+const char* Fdt::string(u32 off) const
 {
-    return reinterpret_cast<const char*>(Base + StringsOff + off);
+    return reinterpret_cast<const char*>(base_ + strings_off_ + off);
 }
 
-ulong Fdt::BoundedNameLen(ulong off) const
+ulong Fdt::bounded_name_len(ulong off) const
 {
-    ulong limit = StructOff + StructSize;
+    ulong limit = struct_off_ + struct_size_;
     for (ulong i = off; i < limit; i++)
     {
-        if (Base[i] == '\0')
+        if (base_[i] == '\0')
             return i - off;
     }
     return (ulong)-1;
 }
 
-bool Fdt::StringMatches(u32 nameOff, const char* name) const
+bool Fdt::string_matches(u32 name_off, const char* name) const
 {
-    if (nameOff >= StringsSize)
+    if (name_off >= strings_size_)
         return false;
 
-    const char* s = String(nameOff);
-    ulong maxLen = StringsSize - nameOff;
-    for (ulong i = 0; i < maxLen; i++)
+    const char* s = string(name_off);
+    ulong max_len = strings_size_ - name_off;
+    for (ulong i = 0; i < max_len; i++)
     {
         if (s[i] != name[i])
             return false;
@@ -79,107 +79,107 @@ bool Fdt::StringMatches(u32 nameOff, const char* name) const
     return false; /* unterminated within the strings block */
 }
 
-bool Fdt::Setup(const void* dtb)
+bool Fdt::setup(const void* dtb)
 {
     if (dtb == nullptr)
         return false;
 
     const u8* base = static_cast<const u8*>(dtb);
     FdtHeader hdr;
-    Stdlib::MemCpy(&hdr, base, sizeof(hdr));
+    stdlib::mem_cpy(&hdr, base, sizeof(hdr));
 
-    if (Be32(&hdr.Magic) != Magic)
+    if (be32(&hdr.magic) != MAGIC)
         return false;
 
-    Base = base;
-    TotalSize = Be32(&hdr.TotalSize);
-    StructOff = Be32(&hdr.OffDtStruct);
-    StructSize = Be32(&hdr.SizeDtStruct);
-    StringsOff = Be32(&hdr.OffDtStrings);
-    StringsSize = Be32(&hdr.SizeDtStrings);
+    base_ = base;
+    total_size_ = be32(&hdr.total_size);
+    struct_off_ = be32(&hdr.off_dt_struct);
+    struct_size_ = be32(&hdr.size_dt_struct);
+    strings_off_ = be32(&hdr.off_dt_strings);
+    strings_size_ = be32(&hdr.size_dt_strings);
 
     /* The blob's own size is the one thing nothing else can check, so it
        is held to what the boot protocol allows: the walkers read no byte
        past it, and the memory map reserves exactly that much */
-    if (TotalSize < sizeof(FdtHeader) || TotalSize > MaxSize)
+    if (total_size_ < sizeof(FdtHeader) || total_size_ > MAX_SIZE)
         return false;
 
     /* A truncated/corrupt header must not steer the walkers out of the
        blob; every later bound derives from these */
-    if (StructOff > TotalSize || StructSize > TotalSize - StructOff ||
-        StringsOff > TotalSize || StringsSize > TotalSize - StringsOff)
+    if (struct_off_ > total_size_ || struct_size_ > total_size_ - struct_off_ ||
+        strings_off_ > total_size_ || strings_size_ > total_size_ - strings_off_)
         return false;
 
-    Valid = true;
+    valid_ = true;
     return true;
 }
 
-bool Fdt::NextNode(Node& node)
+bool Fdt::next_node(Node& node)
 {
-    if (!Valid)
+    if (!valid_)
         return false;
 
     ulong off;
     int depth;
 
-    if (node.Name == nullptr)
+    if (node.name == nullptr)
     {
         /* Start of walk */
-        off = StructOff;
+        off = struct_off_;
         depth = -1;
-        AddressCellsStack[0] = 2;
-        SizeCellsStack[0] = 1;
+        address_cells_stack[0] = 2;
+        size_cells_stack[0] = 1;
     }
     else
     {
         /* Resume after the previously returned node: skip its BEGIN_NODE
            token + name, then continue scanning. */
-        ulong nameLen = BoundedNameLen(node.Offset + 4);
-        if (nameLen == (ulong)-1)
+        ulong name_len = bounded_name_len(node.offset + 4);
+        if (name_len == (ulong)-1)
             return false;
-        off = node.Offset + 4 + AlignUp4(nameLen + 1);
-        depth = node.Depth;
+        off = node.offset + 4 + align_up4(name_len + 1);
+        depth = node.depth;
     }
 
-    ulong limit = StructOff + StructSize;
+    ulong limit = struct_off_ + struct_size_;
     while (off + 4 <= limit)
     {
-        u32 tok = TokenAt(off);
+        u32 tok = token_at(off);
 
-        if (tok == TokBeginNode)
+        if (tok == TOK_BEGIN_NODE)
         {
-            if (BoundedNameLen(off + 4) == (ulong)-1)
+            if (bounded_name_len(off + 4) == (ulong)-1)
                 return false; /* unterminated name: corrupt blob */
-            const char* name = reinterpret_cast<const char*>(Base + off + 4);
-            if (depth + 1 >= MaxDepth)
+            const char* name = reinterpret_cast<const char*>(base_ + off + 4);
+            if (depth + 1 >= MAX_DEPTH)
                 return false;
             depth++;
             /* Children inherit the parent's cells until overridden. depth is
                the root's 0 at least: an END_NODE with none open is refused */
-            if (depth + 1 < MaxDepth)
+            if (depth + 1 < MAX_DEPTH)
             {
-                AddressCellsStack[depth + 1] = AddressCellsStack[depth];
-                SizeCellsStack[depth + 1] = SizeCellsStack[depth];
+                address_cells_stack[depth + 1] = address_cells_stack[depth];
+                size_cells_stack[depth + 1] = size_cells_stack[depth];
             }
 
-            node.Name = name;
-            node.Offset = off;
-            node.Depth = depth;
-            node.AddressCells = AddressCellsStack[depth];
-            node.SizeCells = SizeCellsStack[depth];
+            node.name = name;
+            node.offset = off;
+            node.depth = depth;
+            node.address_cells = address_cells_stack[depth];
+            node.size_cells = size_cells_stack[depth];
 
             /* Peek this node's #address-cells/#size-cells for its children */
             u32 cells;
-            Prop prop = GetProp(node, "#address-cells");
-            if (prop.Length() == 4 && prop.Cell(0, cells) && depth + 1 < MaxDepth)
-                AddressCellsStack[depth + 1] = cells;
-            prop = GetProp(node, "#size-cells");
-            if (prop.Length() == 4 && prop.Cell(0, cells) && depth + 1 < MaxDepth)
-                SizeCellsStack[depth + 1] = cells;
+            Prop prop = get_prop(node, "#address-cells");
+            if (prop.length() == 4 && prop.cell(0, cells) && depth + 1 < MAX_DEPTH)
+                address_cells_stack[depth + 1] = cells;
+            prop = get_prop(node, "#size-cells");
+            if (prop.length() == 4 && prop.cell(0, cells) && depth + 1 < MAX_DEPTH)
+                size_cells_stack[depth + 1] = cells;
 
             return true;
         }
-        else if (tok == TokEndNode)
+        else if (tok == TOK_END_NODE)
         {
             /* One more end than there were beginnings: no node is open to
                end, and the cell stacks have no entry below the root's */
@@ -188,16 +188,16 @@ bool Fdt::NextNode(Node& node)
             depth--;
             off += 4;
         }
-        else if (tok == TokProp)
+        else if (tok == TOK_PROP)
         {
             if (off + 12 > limit)
                 return false;
-            u32 len = Be32(Base + off + 4);
+            u32 len = be32(base_ + off + 4);
             if (len > limit - off - 12)
                 return false;
-            off += 12 + AlignUp4(len);
+            off += 12 + align_up4(len);
         }
-        else if (tok == TokNop)
+        else if (tok == TOK_NOP)
         {
             off += 4;
         }
@@ -210,34 +210,34 @@ bool Fdt::NextNode(Node& node)
     return false;
 }
 
-Fdt::Prop Fdt::GetProp(const Node& node, const char* name)
+Fdt::Prop Fdt::get_prop(const Node& node, const char* name)
 {
-    if (!Valid)
+    if (!valid_)
         return Prop();
 
     /* Properties come right after BEGIN_NODE + name, before any subnode */
-    ulong nameLen = BoundedNameLen(node.Offset + 4);
-    if (nameLen == (ulong)-1)
+    ulong name_len = bounded_name_len(node.offset + 4);
+    if (name_len == (ulong)-1)
         return Prop();
-    ulong off = node.Offset + 4 + AlignUp4(nameLen + 1);
-    ulong limit = StructOff + StructSize;
+    ulong off = node.offset + 4 + align_up4(name_len + 1);
+    ulong limit = struct_off_ + struct_size_;
 
     while (off + 4 <= limit)
     {
-        u32 tok = TokenAt(off);
-        if (tok == TokProp)
+        u32 tok = token_at(off);
+        if (tok == TOK_PROP)
         {
             if (off + 12 > limit)
                 return Prop();
-            u32 len = Be32(Base + off + 4);
-            u32 nameOff = Be32(Base + off + 8);
+            u32 len = be32(base_ + off + 4);
+            u32 name_off = be32(base_ + off + 8);
             if (len > limit - off - 12)
                 return Prop(); /* value would run past the struct block */
-            if (StringMatches(nameOff, name))
-                return Prop(Base + off + 12, len);
-            off += 12 + AlignUp4(len);
+            if (string_matches(name_off, name))
+                return Prop(base_ + off + 12, len);
+            off += 12 + align_up4(len);
         }
-        else if (tok == TokNop)
+        else if (tok == TOK_NOP)
         {
             off += 4;
         }
@@ -250,53 +250,53 @@ Fdt::Prop Fdt::GetProp(const Node& node, const char* name)
     return Prop();
 }
 
-bool Fdt::Prop::Cell(ulong index, u32& value) const
+bool Fdt::Prop::cell(ulong index, u32& value) const
 {
-    if (Data == nullptr || index >= Len / 4)
+    if (data_ == nullptr || index >= len_ / 4)
         return false;
 
-    value = Be32(Data + index * 4);
+    value = be32(data_ + index * 4);
     return true;
 }
 
-bool Fdt::Prop::Cells(ulong index, u32 count, u64& value) const
+bool Fdt::Prop::cells(ulong index, u32 count, u64& value) const
 {
     /* Two cells are a u64; a third would be shifted out without a word */
-    static const u32 MaxCells = 2;
+    static const u32 MAX_CELLS = 2;
 
-    if (Data == nullptr || count > MaxCells || index > Len / 4 || count > Len / 4 - index)
+    if (data_ == nullptr || count > MAX_CELLS || index > len_ / 4 || count > len_ / 4 - index)
         return false;
 
     value = 0;
     for (u32 i = 0; i < count; i++)
-        value = (value << 32) | Be32(Data + (index + i) * 4);
+        value = (value << 32) | be32(data_ + (index + i) * 4);
     return true;
 }
 
-const char* Fdt::Prop::String() const
+const char* Fdt::Prop::string() const
 {
-    if (Data == nullptr || Len == 0 || Data[Len - 1] != '\0')
+    if (data_ == nullptr || len_ == 0 || data_[len_ - 1] != '\0')
         return nullptr;
 
-    return reinterpret_cast<const char*>(Data);
+    return reinterpret_cast<const char*>(data_);
 }
 
-bool Fdt::IsCompatible(const Node& node, const char* compat)
+bool Fdt::is_compatible(const Node& node, const char* compat)
 {
-    Prop prop = GetProp(node, "compatible");
+    Prop prop = get_prop(node, "compatible");
 
     /* A compatible list is NUL-terminated by definition */
-    const char* s = prop.String();
+    const char* s = prop.string();
     if (s == nullptr)
         return false;
-    const ulong len = prop.Length();
+    const ulong len = prop.length();
 
     ulong pos = 0;
     while (pos < len)
     {
-        if (Stdlib::StrCmp(s + pos, compat) == 0)
+        if (stdlib::str_cmp(s + pos, compat) == 0)
             return true;
-        pos += Stdlib::StrLen(s + pos) + 1;
+        pos += stdlib::str_len(s + pos) + 1;
     }
     return false;
 }

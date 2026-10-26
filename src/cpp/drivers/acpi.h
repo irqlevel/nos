@@ -3,47 +3,47 @@
 #include <lib/stdlib.h>
 #include <lib/error.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Acpi final
 {
 public:
-    static Acpi& GetInstance()
+    static Acpi& get_instance()
     {
-        static Acpi Instance;
-        return Instance;
+        static Acpi instance;
+        return instance;
     }
 
-    Stdlib::Error Parse();
+    stdlib::Error parse();
 
-    void* GetLapicAddress();
+    void* get_lapic_address();
 
-    void* GetIoApicAddress();
+    void* get_io_apic_address();
 
-    u32 GetGsiByIrq(u8 irq);
-    u16 GetIrqFlags(u8 irq);
+    u32 get_gsi_by_irq(u8 irq);
+    u16 get_irq_flags(u8 irq);
 
     /* FADT: PM1a control port for ACPI S5 shutdown (0 if not found) */
-    ulong GetPm1aCntPort();
+    ulong get_pm1a_cnt_port();
 
     /* FADT: ACPI reset register (I/O port) and value (0/false if not available) */
-    bool HasResetReg();
-    ulong GetResetRegPort();
-    u8 GetResetValue();
+    bool has_reset_reg();
+    ulong get_reset_reg_port();
+    u8 get_reset_value();
 
     /* FADT: RTC century CMOS register selector (0 if the platform has none) */
-    u8 GetCenturyRegister();
+    u8 get_century_register();
 
     /* HPET: physical base address (0 if no HPET ACPI table) */
-    ulong GetHpetBasePhys();
-    u16 GetHpetMinTick();
+    ulong get_hpet_base_phys();
+    u16 get_hpet_min_tick();
 
     /* WDAT: true when the firmware describes a watchdog for the OS to drive
        through the ACPI instruction set.  Native watchdog drivers (the Rust
        tco_wdt) must then leave the hardware alone -- the same rule Linux
        applies in acpi_has_watchdog(). */
-    bool HasFirmwareWatchdog();
+    bool has_firmware_watchdog();
 
 private:
     Acpi();
@@ -55,107 +55,107 @@ private:
 
     struct RSDPDescriptor
     {
-        u64 Signature;
-        u8 Checksum;
-        char OEMID[6];
-        u8 Revision;
-        u32 RsdtAddress;
+        u64 signature;
+        u8 checksum;
+        char oemid[6];
+        u8 revision;
+        u32 rsdt_address;
     } __attribute__((packed));
 
     struct RSDPDescriptor20
     {
-        RSDPDescriptor FirstPart;
-        u32 Length;
-        u64 XsdtAddress;
-        u8 ExtendedChecksum;
-        u8 Reserved[3];
+        RSDPDescriptor first_part;
+        u32 length;
+        u64 xsdt_address;
+        u8 extended_checksum;
+        u8 reserved[3];
     } __attribute__((packed));
 
     struct ACPISDTHeader
     {
-        char Signature[4];
-        u32 Length;
-        u8 Revision;
-        u8 Checksum;
-        char OEMID[6];
-        char OEMTableID[8];
-        u32 OEMRevision;
-        u32 CreatorID;
-        u32 CreatorRevision;
-        u32 Entry[0];
+        char signature[4];
+        u32 length;
+        u8 revision;
+        u8 checksum;
+        char oemid[6];
+        char oem_table_id[8];
+        u32 oem_revision;
+        u32 creator_id;
+        u32 creator_revision;
+        u32 entry[0];
     } __attribute__((packed));
 
     static_assert(sizeof(ACPISDTHeader) == 36, "Invalid size");
 
     struct MadtEntry
     {
-        u8 Type;
-        u8 Length;
+        u8 type;
+        u8 length;
     } __attribute__((packed));
 
-    static const u8 MadtEntryTypeLapic = 0;
-    static const u8 MadtEntryTypeIoApic = 1;
-    static const u8 MadtEntryTypeIntSrcOverride = 2;
+    static const u8 MADT_ENTRY_TYPE_LAPIC = 0;
+    static const u8 MADT_ENTRY_TYPE_IO_APIC = 1;
+    static const u8 MADT_ENTRY_TYPE_INT_SRC_OVERRIDE = 2;
 
     struct MadtHeader
     {
-        u32 LocalIntCtrlAddress;
-        u32 Flags;
-        MadtEntry Entry[0];
+        u32 local_int_ctrl_address;
+        u32 flags;
+        MadtEntry entry[0];
     } __attribute__((packed));
 
     struct MadtLapicEntry
     {
-        u8 AcpiProcessId;
-        u8 ApicId;
-        u32 Flags;
+        u8 acpi_process_id;
+        u8 apic_id;
+        u32 flags;
     } __attribute__((packed));
 
     struct MadtIoApicEntry
     {
-        u8 IoApicId;
-        u8 Reserved;
-        u32 IoApicAddress;
-        u32 GlobalSystemInterruptBase;
+        u8 io_apic_id;
+        u8 reserved;
+        u32 io_apic_address;
+        u32 global_system_interrupt_base;
     } __attribute__((packed));
 
     struct MadtIntSrcOverrideEntry
     {
-        u8 BusSource;
-        u8 IrqSource;
-        u32 GlobalSystemInterrupt;
-        u16 Flags;
+        u8 bus_source;
+        u8 irq_source;
+        u32 global_system_interrupt;
+        u16 flags;
     } __attribute__((packed));
 
-    int ComputeSum(void* table, size_t len);
+    int compute_sum(void* table, size_t len);
 
     /* All three yield the physical address of the root table and which of
        the two kinds it is. See ParseRsdp for why there are two. */
-    bool ParseRsdp(RSDPDescriptor20* rsdp, ulong& rootPhysAddr, bool& isXsdt);
-    bool FindRootTable(ulong& rootPhysAddr, bool& isXsdt);
-    bool ScanRsdpRange(ulong phyStart, ulong phyEnd, ulong& rootPhysAddr,
-        bool& isXsdt);
-    Stdlib::Error ParseRootTable(ACPISDTHeader* root);
+    bool parse_rsdp(RSDPDescriptor20* rsdp, ulong& root_phys_addr, bool& is_xsdt);
+    bool find_root_table(ulong& root_phys_addr, bool& is_xsdt);
+    bool scan_rsdp_range(ulong phy_start, ulong phy_end, ulong& root_phys_addr,
+        bool& is_xsdt);
+    stdlib::Error parse_root_table(ACPISDTHeader* root);
 
     /* Root entry index -> physical address of that table. The entries are
        32-bit in an RSDT and 64-bit in an XSDT, and in an XSDT they are not
        naturally aligned (the header is 36 bytes), so they are copied out
        rather than dereferenced. */
-    ulong RootEntry(size_t index);
+    ulong root_entry(size_t index);
 
     /* Parse's work: what it maps is left for Parse to let go of */
-    Stdlib::Error ParseTables();
-    Stdlib::Error ParseTablePointers();
-    Stdlib::Error ParseMADT();
+    stdlib::Error parse_tables();
+    stdlib::Error parse_table_pointers();
+    stdlib::Error parse_madt();
 
     /* The table of that signature Parse is reading, and its length */
-    ACPISDTHeader* LookupTable(const char *name, u32& length);
+    ACPISDTHeader* lookup_table(const char *name, u32& length);
 
-    char OemId[7];
+    char oem_id_[7];
 
-    ACPISDTHeader* Root;
-    u32 RootLength;
-    bool RootIsXsdt;
+    ACPISDTHeader* root_;
+    u32 root_length_;
+    bool root_is_xsdt_;
 
     /* The tables this kernel reads, one of each kind, mapped through the
        TmpMap window while Parse reads them: Table[i] is WantedTables[i]'s,
@@ -168,62 +168,62 @@ private:
        eleven of them SSDTs, and the count moves with every BIOS revision --
        and a slot of the window held is one every page allocation after it
        goes without. */
-    static const size_t MaxTables = 4;
-    ACPISDTHeader* Table[MaxTables];
-    u32 TableLength[MaxTables];
+    static const size_t MAX_TABLES = 4;
+    ACPISDTHeader* table_[MAX_TABLES];
+    u32 table_length_[MAX_TABLES];
 
     /* The longest table mapped, the root or one of those read -- a MADT of
        a thousand CPUs, each with its x2APIC and NMI entries, is 42 KiB. A
        longer one is refused, so that what Parse holds of the window at once
        is bounded: the root and a table of each kind, at most 17 pages
        each. */
-    static const u32 MaxTableLength = 64 * 1024;
+    static const u32 MAX_TABLE_LENGTH = 64 * 1024;
 
     /* WantedTables' index of signature, or -1 */
-    static long WantedIndex(const char* signature);
+    static long wanted_index(const char* signature);
 
     /* The header of the SDT at phys, mapped -- SDTs are only 4-byte
        aligned, so it may straddle two pages -- or nullptr, which is said:
        past the physical address space, or no room in the window */
-    ACPISDTHeader* MapHeader(ulong phys);
+    ACPISDTHeader* map_header(ulong phys);
 
     /* The SDT at phys, whose header MapHeader mapped, mapped whole, its
        length read once into length; the header's mapping is let go of.
        nullptr, which is said, for a table not to be mapped -- shorter than
        its header, longer than MaxTableLength, reaching past the physical
        address space -- or no room in the window */
-    ACPISDTHeader* MapWhole(ACPISDTHeader* header, ulong phys, u32& length);
+    ACPISDTHeader* map_whole(ACPISDTHeader* header, ulong phys, u32& length);
 
     /* Let go of the root and the tables */
-    void ReleaseTables();
+    void release_tables();
 
     /* Let go of the TmpMap pages a mapping of len bytes at va holds */
-    static void UnmapTableRange(void* va, ulong len);
+    static void unmap_table_range(void* va, ulong len);
 
-    static const bool checkRsdtChecksum = false;
-    static const u64 RSDPSignature = 0x2052545020445352ULL; //'RSD PTR '
+    static const bool CHECK_RSDT_CHECKSUM = false;
+    static const u64 RSDP_SIGNATURE = 0x2052545020445352ULL; //'RSD PTR '
 
-    void* LapicAddress;
-    void* IoApicAddress;
+    void* lapic_address_;
+    void* io_apic_address_;
 
     struct IrqToGsiEntry
     {
-        u8 Irq;
-        u32 Gsi;
-        u16 Flags;
+        u8 irq;
+        u32 gsi;
+        u16 flags;
     };
 
-    IrqToGsiEntry IrqToGsi[64];
-    size_t IrqToGsiSize;
+    IrqToGsiEntry irq_to_gsi_[64];
+    size_t irq_to_gsi_size_;
 
     /* An Interrupt Source Override: the first for an IRQ is the one taken,
        and one naming a GSI past what the interrupt layer takes (an u8) or
        past the table's room is left out, which is said -- none of them is
        reason enough to lose ACPI, and the boot with it. */
-    void RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags);
+    void register_irq_to_gsi(u8 irq, u32 gsi, u16 flags);
 
     /* The GSI base of the IO-APIC IoApicAddress maps, ~0U while none */
-    u32 IoApicGsiBase;
+    u32 io_apic_gsi_base_;
 
     /* What of an APIC's page its registers take, from the address the MADT
        gives. The local APIC's are the page, which the architecture puts at
@@ -232,20 +232,20 @@ private:
        An address whose registers would run past its page is refused: the
        drivers' accesses would land in the TmpMap window's next slot, and
        in whatever page that maps. */
-    static const ulong LapicRegisterBytes = Const::PageSize;
-    static const ulong IoApicRegisterBytes = 0x44;
+    static const ulong LAPIC_REGISTER_BYTES = consts::PAGE_SIZE;
+    static const ulong IO_APIC_REGISTER_BYTES = 0x44;
 
     /* Whether registers of that many bytes at phys stay in its page */
-    static bool RegistersInPage(ulong phys, ulong bytes);
+    static bool registers_in_page(ulong phys, ulong bytes);
 
     /* Generic Address Structure (ACPI spec 5.2.3.2) */
     struct GenericAddressStructure
     {
-        u8  AddressSpaceId;  /* 0 = system memory, 1 = I/O, 2 = PCI config */
-        u8  RegisterBitWidth;
-        u8  RegisterBitOffset;
-        u8  AccessSize;
-        u64 Address;
+        u8  address_space_id;  /* 0 = system memory, 1 = I/O, 2 = PCI config */
+        u8  register_bit_width;
+        u8  register_bit_offset;
+        u8  access_size;
+        u64 address;
     } __attribute__((packed));
 
     static_assert(sizeof(GenericAddressStructure) == 12, "Invalid GAS size");
@@ -254,86 +254,86 @@ private:
     struct FadtFields
     {
         /* offset  0 (from after SDT header = absolute offset 36): FirmwareCtrl */
-        u32 FirmwareCtrl;       /* +0  */
-        u32 Dsdt;               /* +4  */
-        u8  Reserved0;          /* +8  */
-        u8  PreferredPmProfile; /* +9  */
-        u16 SciInt;             /* +10 */
-        u32 SmiCmd;             /* +12 */
-        u8  AcpiEnable;         /* +16 */
-        u8  AcpiDisable;        /* +17 */
-        u8  S4BiosReq;          /* +18 */
-        u8  PStateCtrl;         /* +19 */
-        u32 Pm1aEvtBlk;         /* +20 */
-        u32 Pm1bEvtBlk;         /* +24 */
-        u32 Pm1aCntBlk;         /* +28 */
-        u32 Pm1bCntBlk;         /* +32 */
-        u32 Pm2CntBlk;          /* +36 */
-        u32 PmTmrBlk;           /* +40 */
-        u32 Gpe0Blk;            /* +44 */
-        u32 Gpe1Blk;            /* +48 */
-        u8  Pm1EvtLen;          /* +52 */
-        u8  Pm1CntLen;          /* +53 */
-        u8  Pm2CntLen;          /* +54 */
-        u8  PmTmrLen;           /* +55 */
-        u8  Gpe0BlkLen;         /* +56 */
-        u8  Gpe1BlkLen;         /* +57 */
-        u8  Gpe1Base;           /* +58 */
-        u8  CstCnt;             /* +59 */
-        u16 PLvl2Lat;           /* +60 */
-        u16 PLvl3Lat;           /* +62 */
-        u16 FlushSize;          /* +64 */
-        u16 FlushStride;        /* +66 */
-        u8  DutyOffset;         /* +68 */
-        u8  DutyWidth;          /* +69 */
-        u8  DayAlarm;           /* +70 */
-        u8  MonAlarm;           /* +71 */
-        u8  Century;            /* +72 */
-        u16 IaPcBootArch;       /* +73 */
-        u8  Reserved1;          /* +75 */
-        u32 Flags;              /* +76 */
-        GenericAddressStructure ResetReg;   /* +80 */
-        u8  ResetValue;         /* +92 */
+        u32 firmware_ctrl;       /* +0  */
+        u32 dsdt;               /* +4  */
+        u8  reserved0;          /* +8  */
+        u8  preferred_pm_profile; /* +9  */
+        u16 sci_int;             /* +10 */
+        u32 smi_cmd;             /* +12 */
+        u8  acpi_enable;         /* +16 */
+        u8  acpi_disable;        /* +17 */
+        u8  s4_bios_req;          /* +18 */
+        u8  pstate_ctrl;         /* +19 */
+        u32 pm1a_evt_blk;         /* +20 */
+        u32 pm1b_evt_blk;         /* +24 */
+        u32 pm1a_cnt_blk;         /* +28 */
+        u32 pm1b_cnt_blk;         /* +32 */
+        u32 pm2_cnt_blk;          /* +36 */
+        u32 pm_tmr_blk;           /* +40 */
+        u32 gpe0_blk;            /* +44 */
+        u32 gpe1_blk;            /* +48 */
+        u8  pm1_evt_len;          /* +52 */
+        u8  pm1_cnt_len;          /* +53 */
+        u8  pm2_cnt_len;          /* +54 */
+        u8  pm_tmr_len;           /* +55 */
+        u8  gpe0_blk_len;         /* +56 */
+        u8  gpe1_blk_len;         /* +57 */
+        u8  gpe1_base;           /* +58 */
+        u8  cst_cnt;             /* +59 */
+        u16 p_lvl2_lat;           /* +60 */
+        u16 p_lvl3_lat;           /* +62 */
+        u16 flush_size;          /* +64 */
+        u16 flush_stride;        /* +66 */
+        u8  duty_offset;         /* +68 */
+        u8  duty_width;          /* +69 */
+        u8  day_alarm;           /* +70 */
+        u8  mon_alarm;           /* +71 */
+        u8  century;            /* +72 */
+        u16 ia_pc_boot_arch;       /* +73 */
+        u8  reserved1;          /* +75 */
+        u32 flags;              /* +76 */
+        GenericAddressStructure reset_reg;   /* +80 */
+        u8  reset_value;         /* +92 */
     } __attribute__((packed));
 
     /* HPET ACPI table body (beyond SDT header) */
     struct HpetTableBody
     {
-        u32 EventTimerBlockId;          /* +0  */
-        GenericAddressStructure BaseAddress; /* +4  */
-        u8  HpetNumber;                 /* +16 */
-        u16 MinimumClockTick;           /* +17 */
-        u8  PageProtection;             /* +19 */
+        u32 event_timer_block_id;          /* +0  */
+        GenericAddressStructure base_address; /* +4  */
+        u8  hpet_number;                 /* +16 */
+        u16 minimum_clock_tick;           /* +17 */
+        u8  page_protection;             /* +19 */
     } __attribute__((packed));
 
     /* WDAT ACPI table body (beyond the SDT header), followed by Entries
        WdatEntry records */
     struct WdatTableBody
     {
-        u32 HeaderLength;       /* +0  */
-        u16 PciSegment;         /* +4  */
-        u8  PciBus;             /* +6  */
-        u8  PciDevice;          /* +7  */
-        u8  PciFunction;        /* +8  */
-        u8  Reserved[3];        /* +9  */
-        u32 TimerPeriod;        /* +12, milliseconds per count */
-        u32 MaxCount;           /* +16 */
-        u32 MinCount;           /* +20 */
-        u8  Flags;              /* +24 */
-        u8  Reserved2[3];       /* +25 */
-        u32 Entries;            /* +28 */
+        u32 header_length;       /* +0  */
+        u16 pci_segment;         /* +4  */
+        u8  pci_bus;             /* +6  */
+        u8  pci_device;          /* +7  */
+        u8  pci_function;        /* +8  */
+        u8  reserved[3];        /* +9  */
+        u32 timer_period;        /* +12, milliseconds per count */
+        u32 max_count;           /* +16 */
+        u32 min_count;           /* +20 */
+        u8  flags;              /* +24 */
+        u8  reserved2[3];       /* +25 */
+        u32 entries;            /* +28 */
     } __attribute__((packed));
 
     static_assert(sizeof(WdatTableBody) == 32, "Invalid WDAT body size");
 
     struct WdatEntry
     {
-        u8  Action;             /* +0  */
-        u8  Instruction;        /* +1  */
-        u16 Reserved;           /* +2  */
-        GenericAddressStructure RegisterRegion; /* +4  */
-        u32 Value;              /* +16 */
-        u32 Mask;               /* +20 */
+        u8  action;             /* +0  */
+        u8  instruction;        /* +1  */
+        u16 reserved;           /* +2  */
+        GenericAddressStructure register_region; /* +4  */
+        u32 value;              /* +16 */
+        u32 mask;               /* +20 */
     } __attribute__((packed));
 
     static_assert(sizeof(WdatEntry) == 24, "Invalid WDAT entry size");
@@ -341,26 +341,26 @@ private:
     /* A WDAT whose instructions poke the RTC is ignored: the CMOS ports are
        not the watchdog's alone (Linux does the same in
        acpi_watchdog_uses_rtc). */
-    static const u8 GasSpaceSystemIo = 1;
-    static const u64 RtcPortBase = 0x70;
+    static const u8 GAS_SPACE_SYSTEM_IO = 1;
+    static const u64 RTC_PORT_BASE = 0x70;
 
-    void ParseFADT();
-    void ParseHPET();
-    void ParseWDAT();
+    void parse_fadt();
+    void parse_hpet();
+    void parse_wdat();
 
     /* FADT-derived values */
-    ulong Pm1aCntPort;
-    bool ResetRegValid;
-    ulong ResetRegPort;
-    u8 ResetVal;
-    u8 CenturyRegister;
+    ulong pm1a_cnt_port_;
+    bool reset_reg_valid_;
+    ulong reset_reg_port_;
+    u8 reset_val_;
+    u8 century_register_;
 
     /* HPET-derived values */
-    ulong HpetBasePhys;
-    u16 HpetMinTick;
+    ulong hpet_base_phys_;
+    u16 hpet_min_tick_;
 
     /* WDAT-derived value */
-    bool FirmwareWatchdog;
+    bool firmware_watchdog_;
 
 };
 

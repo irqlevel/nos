@@ -2,36 +2,36 @@
 
 #include <include/types.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 class LockInterface
 {
 public:
-    virtual void Lock(ulong& flags) = 0;
-    virtual void Unlock(ulong flags) = 0;
+    virtual void lock(ulong& flags) = 0;
+    virtual void unlock(ulong flags) = 0;
 };
 
 class SharedLockInterface
 {
 public:
-    virtual void SharedLock(ulong& flags) = 0;
-    virtual void SharedUnlock(ulong flags) = 0;
+    virtual void shared_lock(ulong& flags) = 0;
+    virtual void shared_unlock(ulong flags) = 0;
 };
 
 class AutoLock
 {
 public:
     AutoLock(LockInterface& lock)
-        : Lock(lock)
-        , Flags(0)
+        : lock_(lock)
+        , flags_(0)
     {
-        Lock.Lock(Flags);
+        lock_.lock(flags_);
     }
 
     virtual ~AutoLock()
     {
-        Lock.Unlock(Flags);
+        lock_.unlock(flags_);
     }
 private:
     AutoLock() = delete;
@@ -40,23 +40,23 @@ private:
     AutoLock& operator=(const AutoLock& other) = delete;
     AutoLock& operator=(AutoLock&& other) = delete;
 
-    LockInterface& Lock;
-    ulong Flags;
+    LockInterface& lock_;
+    ulong flags_;
 };
 
 class SharedAutoLock
 {
 public:
     SharedAutoLock(SharedLockInterface& lock)
-        : Lock(lock)
-        , Flags(0)
+        : lock_(lock)
+        , flags_(0)
     {
-        Lock.SharedLock(Flags);
+        lock_.shared_lock(flags_);
     }
 
     virtual ~SharedAutoLock()
     {
-        Lock.SharedUnlock(Flags);
+        lock_.shared_unlock(flags_);
     }
 private:
     SharedAutoLock() = delete;
@@ -65,35 +65,35 @@ private:
     SharedAutoLock& operator=(const SharedAutoLock& other) = delete;
     SharedAutoLock& operator=(SharedAutoLock&& other) = delete;
 
-    SharedLockInterface& Lock;
-    ulong Flags;
+    SharedLockInterface& lock_;
+    ulong flags_;
 };
 
 class NopLock
-	: public Stdlib::LockInterface
-	, public Stdlib::SharedLockInterface
+	: public stdlib::LockInterface
+	, public stdlib::SharedLockInterface
 {
 public:
 	NopLock()
 	{
 	}
 
-	virtual void Lock(ulong& flags) override
+	virtual void lock(ulong& flags) override
 	{
         flags = 0;
 	}
 
-	virtual void Unlock(ulong flags) override
+	virtual void unlock(ulong flags) override
 	{
         (void)flags;
 	}
 
-	virtual void SharedLock(ulong& flags) override
+	virtual void shared_lock(ulong& flags) override
 	{
         flags = 0;
 	}
 
-	virtual void SharedUnlock(ulong flags) override
+	virtual void shared_unlock(ulong flags) override
 	{
         (void)flags;
 	}

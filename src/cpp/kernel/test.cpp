@@ -25,30 +25,30 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Test
+namespace test
 {
 
-static const ulong Tag = 'Test';
+static const ulong TAG = 'Test';
 
-Stdlib::Error TestAllocator()
+stdlib::Error test_allocator()
 {
-    Trace(0, "TestAllocator: started");
+    trace(0, "TestAllocator: started");
 
-    for (size_t size = 1; size <= 8 * Const::PageSize; size++)
+    for (size_t size = 1; size <= 8 * consts::PAGE_SIZE; size++)
     {
         if (size % 500 == 0)
         {
-            Trace(0, "TestAllocator: alloc size %lu", size);
+            trace(0, "TestAllocator: alloc size %lu", size);
         }
 
-        u8 *block = new (Mm::NoThrow) u8[size];
+        u8 *block = new (mm::NO_THROW) u8[size];
         if (block == nullptr)
         {
-            Trace(0, "TestAllocator: alloc failed at size %lu", size);
-            return Stdlib::Error::NoMemory;
+            trace(0, "TestAllocator: alloc failed at size %lu", size);
+            return stdlib::Error::NO_MEMORY;
         }
 
         block[0] = 1;
@@ -57,137 +57,137 @@ Stdlib::Error TestAllocator()
         delete [] block;
     }
 
-    Trace(0, "TestAllocator: complete");
-    return MakeError(Stdlib::Error::Success);
+    trace(0, "TestAllocator: complete");
+    return make_error(stdlib::Error::SUCCESS);
 }
 
-Stdlib::Error TestRingBuffer()
+stdlib::Error test_ring_buffer()
 {
-    Trace(0, "TestRingBuffer: started");
+    trace(0, "TestRingBuffer: started");
 
-    Stdlib::RingBuffer<u8, 3> rb;
+    stdlib::RingBuffer<u8, 3> rb;
 
-    if (!rb.Put(0x1))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!rb.put(0x1))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!rb.Put(0x2))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!rb.put(0x2))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!rb.Put(0x3))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!rb.put(0x3))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (rb.Put(0x4))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (rb.put(0x4))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!rb.IsFull())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!rb.is_full())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (rb.IsEmpty())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (rb.is_empty())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (rb.Get() != 0x1)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (rb.get() != 0x1)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (rb.Get() != 0x2)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (rb.get() != 0x2)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (rb.Get() != 0x3)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (rb.get() != 0x3)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!rb.IsEmpty())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!rb.is_empty())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
    
-    return MakeError(Stdlib::Error::Success);
+    return make_error(stdlib::Error::SUCCESS);
 }
 
 /* noinline helpers to create a known call-depth difference */
-static __attribute__((noinline)) size_t CaptureAtDepth0()
+static __attribute__((noinline)) size_t capture_at_depth0()
 {
     ulong frames[20];
-    return StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+    return StackTrace::capture(frames, stdlib::array_size(frames));
 }
 
-static __attribute__((noinline)) size_t CaptureAtDepth1()
+static __attribute__((noinline)) size_t capture_at_depth1()
 {
-    return CaptureAtDepth0();
+    return capture_at_depth0();
 }
 
-static __attribute__((noinline)) size_t CaptureAtDepth2()
+static __attribute__((noinline)) size_t capture_at_depth2()
 {
-    return CaptureAtDepth1();
+    return capture_at_depth1();
 }
 
-static __attribute__((noinline)) size_t CaptureAtDepth3()
+static __attribute__((noinline)) size_t capture_at_depth3()
 {
-    return CaptureAtDepth2();
+    return capture_at_depth2();
 }
 
-Stdlib::Error TestStackTrace()
+stdlib::Error test_stack_trace()
 {
-    Trace(0, "TestStackTrace: started");
+    trace(0, "TestStackTrace: started");
 
     ulong frames[20];
     size_t count;
 
     /* Auto-detect: must capture at least 1 frame */
-    count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+    count = StackTrace::capture(frames, stdlib::array_size(frames));
     if (count == 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* All return addresses must be in kernel space */
     for (size_t i = 0; i < count; i++)
     {
         if (frames[i] < 0xFFFF800001000000UL)
-            return MakeError(Stdlib::Error::Unsuccessful);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* maxFrames = 0 must return 0 */
-    count = StackTrace::Capture(frames, 0);
+    count = StackTrace::capture(frames, 0);
     if (count != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* maxFrames = 1 must return exactly 1 */
-    count = StackTrace::Capture(frames, 1);
+    count = StackTrace::capture(frames, 1);
     if (count != 1)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Explicit bounds: empty range (base == limit) must return 0 */
-    count = StackTrace::Capture(0, 0, frames, Stdlib::ArraySize(frames));
+    count = StackTrace::capture(0, 0, frames, stdlib::array_size(frames));
     if (count != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Explicit bounds: range not containing our stack must return 0 */
-    count = StackTrace::Capture(0x1000, 0x2000, frames, Stdlib::ArraySize(frames));
+    count = StackTrace::capture(0x1000, 0x2000, frames, stdlib::array_size(frames));
     if (count != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Explicit bounds with correct task stack range */
-    ulong rsp = Hal::GetSp();
-    ulong base = rsp & (~(Task::StackSize - 1));
-    Task::Stack* stackPtr = reinterpret_cast<Task::Stack*>(base);
-    if (stackPtr->Magic1 == Task::StackMagic1 &&
-        stackPtr->Magic2 == Task::StackMagic2)
+    ulong rsp = hal::get_sp();
+    ulong base = rsp & (~(Task::STACK_SIZE - 1));
+    Task::Stack* stack_ptr = reinterpret_cast<Task::Stack*>(base);
+    if (stack_ptr->magic1 == Task::STACK_MAGIC1 &&
+        stack_ptr->magic2 == Task::STACK_MAGIC2)
     {
-        count = StackTrace::Capture(base, base + Task::StackSize,
-                                    frames, Stdlib::ArraySize(frames));
+        count = StackTrace::capture(base, base + Task::STACK_SIZE,
+                                    frames, stdlib::array_size(frames));
         if (count == 0)
-            return MakeError(Stdlib::Error::Unsuccessful);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Deeper nesting must capture more frames:
        CaptureAtDepth0 adds 1 extra function on the chain,
        CaptureAtDepth3 adds 4.  Difference must be exactly 3. */
-    size_t shallow = CaptureAtDepth0();
-    size_t deep = CaptureAtDepth3();
+    size_t shallow = capture_at_depth0();
+    size_t deep = capture_at_depth3();
     if (deep < shallow + 3)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Consecutive captures at the same depth must match */
-    size_t count1 = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+    size_t count1 = StackTrace::capture(frames, stdlib::array_size(frames));
     ulong frames2[20];
-    size_t count2 = StackTrace::Capture(frames2, Stdlib::ArraySize(frames2));
+    size_t count2 = StackTrace::capture(frames2, stdlib::array_size(frames2));
     if (count1 != count2)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Return addresses from consecutive captures must be identical
        (same call chain, same function, same callers above) */
@@ -198,50 +198,50 @@ Stdlib::Error TestStackTrace()
         if (i == 0)
             continue;
         if (frames[i] != frames2[i])
-            return MakeError(Stdlib::Error::Unsuccessful);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestStackTrace: complete");
-    return MakeSuccess();
+    trace(0, "TestStackTrace: complete");
+    return make_success();
 }
 
-Stdlib::Error TestParseUlong()
+stdlib::Error test_parse_ulong()
 {
-    Trace(0, "TestParseUlong: started");
+    trace(0, "TestParseUlong: started");
 
     ulong val;
 
     /* Basic numbers */
-    if (!Stdlib::ParseUlong("0", val) || val != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::parse_ulong("0", val) || val != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!Stdlib::ParseUlong("1", val) || val != 1)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::parse_ulong("1", val) || val != 1)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!Stdlib::ParseUlong("12345", val) || val != 12345)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::parse_ulong("12345", val) || val != 12345)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (!Stdlib::ParseUlong("999999", val) || val != 999999)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::parse_ulong("999999", val) || val != 999999)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Invalid inputs must fail */
-    if (Stdlib::ParseUlong("", val))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::parse_ulong("", val))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (Stdlib::ParseUlong(nullptr, val))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::parse_ulong(nullptr, val))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (Stdlib::ParseUlong("abc", val))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::parse_ulong("abc", val))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (Stdlib::ParseUlong("12x4", val))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::parse_ulong("12x4", val))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    if (Stdlib::ParseUlong(" 5", val))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::parse_ulong(" 5", val))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestParseUlong: complete");
-    return MakeSuccess();
+    trace(0, "TestParseUlong: complete");
+    return make_success();
 }
 
 /* Nothing on the command line stops the boot: it is read before the
@@ -250,29 +250,29 @@ Stdlib::Error TestParseUlong()
    cannot be parsed is skipped and the rest still read, and a line too long
    for the buffer is read up to its last whole parameter. Each case parses
    into its own instance, never the one the kernel booted with. */
-Stdlib::Error TestParameters()
+stdlib::Error test_parameters()
 {
-    Trace(0, "TestParameters: started");
+    trace(0, "TestParameters: started");
 
     Parameters label;
-    label.Parse("dhcp=auto root=LABEL=nosenv");
-    if (label.GetRoot().Mode != Parameters::RootLabel ||
-        Stdlib::StrCmp(label.GetRoot().Value, "nosenv") != 0 ||
-        !label.IsDhcpAuto())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    label.parse("dhcp=auto root=LABEL=nosenv");
+    if (label.get_root().mode != Parameters::RootLabel ||
+        stdlib::str_cmp(label.get_root().value, "nosenv") != 0 ||
+        !label.is_dhcp_auto())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     Parameters uuid;
-    uuid.Parse("root=UUID=f8740651-e0b5-4ae3-84f1-a55d1ab00139 ro");
-    if (uuid.GetRoot().Mode != Parameters::RootUuid ||
-        uuid.GetRoot().Uuid[0] != 0xf8 || uuid.GetRoot().Uuid[15] != 0x39 ||
-        !uuid.IsRootReadOnly())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    uuid.parse("root=UUID=f8740651-e0b5-4ae3-84f1-a55d1ab00139 ro");
+    if (uuid.get_root().mode != Parameters::RootUuid ||
+        uuid.get_root().uuid[0] != 0xf8 || uuid.get_root().uuid[15] != 0x39 ||
+        !uuid.is_root_read_only())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     Parameters device;
-    device.Parse("root=nvme11");
-    if (device.GetRoot().Mode != Parameters::RootDevice ||
-        Stdlib::StrCmp(device.GetRoot().Value, "nvme11") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    device.parse("root=nvme11");
+    if (device.get_root().mode != Parameters::RootDevice ||
+        stdlib::str_cmp(device.get_root().value, "nvme11") != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Skipped: no key, no value, a bare word other than ro, one character,
        and a parameter longer than any taken */
@@ -283,212 +283,212 @@ Stdlib::Error TestParameters()
         "x",
         "root=LABEL=a-label-longer-than-any-parameter-taken",
     };
-    for (ulong i = 0; i < Stdlib::ArraySize(skipped); i++)
+    for (ulong i = 0; i < stdlib::array_size(skipped); i++)
     {
         Parameters one;
-        one.Parse(skipped[i]);
-        if (one.GetRoot().Mode != Parameters::RootNone || one.IsRootReadOnly())
-            return MakeError(Stdlib::Error::Unsuccessful);
+        one.parse(skipped[i]);
+        if (one.get_root().mode != Parameters::RootNone || one.is_root_read_only())
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* ... and the rest of the line still read around them */
     Parameters rest;
-    rest.Parse("quiet root=nvme11 =nosenv dhcp=auto x");
-    if (rest.GetRoot().Mode != Parameters::RootDevice ||
-        Stdlib::StrCmp(rest.GetRoot().Value, "nvme11") != 0 ||
-        !rest.IsDhcpAuto())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    rest.parse("quiet root=nvme11 =nosenv dhcp=auto x");
+    if (rest.get_root().mode != Parameters::RootDevice ||
+        stdlib::str_cmp(rest.get_root().value, "nvme11") != 0 ||
+        !rest.is_dhcp_auto())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Too long for the buffer, padded so the root parameter starts inside it
        and ends past it: that one is dropped rather than read as a shorter
        one (a root=LABEL=nos), and everything before it is taken */
     const char* filler = " dns=on";
     const char* straddler = " root=LABEL=nosenv";
-    char line[Parameters::CmdlineLen * 2];
-    Stdlib::StrnCpy(line, "dhcp=auto", sizeof(line));
-    ulong lineLen = Stdlib::StrLen(line);
-    while (lineLen < Parameters::CmdlineLen - Stdlib::StrLen(straddler))
+    char line[Parameters::CMDLINE_LEN * 2];
+    stdlib::strn_cpy(line, "dhcp=auto", sizeof(line));
+    ulong line_len = stdlib::str_len(line);
+    while (line_len < Parameters::CMDLINE_LEN - stdlib::str_len(straddler))
     {
-        Stdlib::StrnCpy(line + lineLen, filler, sizeof(line) - lineLen);
-        lineLen += Stdlib::StrLen(filler);
+        stdlib::strn_cpy(line + line_len, filler, sizeof(line) - line_len);
+        line_len += stdlib::str_len(filler);
     }
-    Stdlib::StrnCpy(line + lineLen, straddler, sizeof(line) - lineLen);
+    stdlib::strn_cpy(line + line_len, straddler, sizeof(line) - line_len);
 
-    Parameters longLine;
-    longLine.Parse(line);
-    if (longLine.GetRoot().Mode != Parameters::RootNone ||
-        !longLine.IsDhcpAuto() || !longLine.IsDnsEnabled())
-        return MakeError(Stdlib::Error::Unsuccessful);
+    Parameters long_line;
+    long_line.parse(line);
+    if (long_line.get_root().mode != Parameters::RootNone ||
+        !long_line.is_dhcp_auto() || !long_line.is_dns_enabled())
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestParameters: complete");
-    return MakeSuccess();
+    trace(0, "TestParameters: complete");
+    return make_success();
 }
 
-Stdlib::Error TestHexCharToNibble()
+stdlib::Error test_hex_char_to_nibble()
 {
-    Trace(0, "TestHexCharToNibble: started");
+    trace(0, "TestHexCharToNibble: started");
 
     /* Decimal digits */
     for (char c = '0'; c <= '9'; c++)
     {
-        if (Stdlib::HexCharToNibble(c) != (u8)(c - '0'))
-            return MakeError(Stdlib::Error::Unsuccessful);
+        if (stdlib::hex_char_to_nibble(c) != (u8)(c - '0'))
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Lowercase hex */
     for (char c = 'a'; c <= 'f'; c++)
     {
-        if (Stdlib::HexCharToNibble(c) != (u8)(c - 'a' + 10))
-            return MakeError(Stdlib::Error::Unsuccessful);
+        if (stdlib::hex_char_to_nibble(c) != (u8)(c - 'a' + 10))
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Uppercase hex */
     for (char c = 'A'; c <= 'F'; c++)
     {
-        if (Stdlib::HexCharToNibble(c) != (u8)(c - 'A' + 10))
-            return MakeError(Stdlib::Error::Unsuccessful);
+        if (stdlib::hex_char_to_nibble(c) != (u8)(c - 'A' + 10))
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Invalid chars */
-    if (Stdlib::HexCharToNibble('g') != 0xFF)
-        return MakeError(Stdlib::Error::Unsuccessful);
-    if (Stdlib::HexCharToNibble(' ') != 0xFF)
-        return MakeError(Stdlib::Error::Unsuccessful);
-    if (Stdlib::HexCharToNibble('\0') != 0xFF)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::hex_char_to_nibble('g') != 0xFF)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    if (stdlib::hex_char_to_nibble(' ') != 0xFF)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    if (stdlib::hex_char_to_nibble('\0') != 0xFF)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestHexCharToNibble: complete");
-    return MakeSuccess();
+    trace(0, "TestHexCharToNibble: complete");
+    return make_success();
 }
 
-Stdlib::Error TestHexDecode()
+stdlib::Error test_hex_decode()
 {
-    Trace(0, "TestHexDecode: started");
+    trace(0, "TestHexDecode: started");
 
     u8 out[16];
     ulong written;
 
     /* Simple decode */
-    if (!Stdlib::HexDecode("48656C6C6F", 10, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("48656C6C6F", 10, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 5)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (out[0] != 0x48 || out[1] != 0x65 || out[2] != 0x6C ||
         out[3] != 0x6C || out[4] != 0x6F)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* All zeros */
-    if (!Stdlib::HexDecode("0000", 4, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("0000", 4, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 2 || out[0] != 0 || out[1] != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* All FF */
-    if (!Stdlib::HexDecode("FFFF", 4, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("FFFF", 4, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 2 || out[0] != 0xFF || out[1] != 0xFF)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Lowercase */
-    if (!Stdlib::HexDecode("deadbeef", 8, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("deadbeef", 8, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 4 || out[0] != 0xDE || out[1] != 0xAD ||
         out[2] != 0xBE || out[3] != 0xEF)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Invalid hex must fail */
-    if (Stdlib::HexDecode("ZZZZ", 4, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (stdlib::hex_decode("ZZZZ", 4, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Empty string */
-    if (!Stdlib::HexDecode("", 0, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("", 0, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Odd length: only complete pairs decoded */
-    if (!Stdlib::HexDecode("ABC", 3, out, sizeof(out), written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("ABC", 3, out, sizeof(out), written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 1 || out[0] != 0xAB)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Output buffer limit */
-    if (!Stdlib::HexDecode("0102030405", 10, out, 2, written))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!stdlib::hex_decode("0102030405", 10, out, 2, written))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     if (written != 2)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestHexDecode: complete");
-    return MakeSuccess();
+    trace(0, "TestHexDecode: complete");
+    return make_success();
 }
 
-Stdlib::Error TestNextToken()
+stdlib::Error test_next_token()
 {
-    Trace(0, "TestNextToken: started");
+    trace(0, "TestNextToken: started");
 
     const char* end;
     const char* tok;
 
     /* Single token */
-    tok = Stdlib::NextToken("hello", end);
-    if (!tok || Stdlib::StrnCmp(tok, "hello", 5) != 0 || (end - tok) != 5)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    tok = stdlib::next_token("hello", end);
+    if (!tok || stdlib::strn_cmp(tok, "hello", 5) != 0 || (end - tok) != 5)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Leading spaces */
-    tok = Stdlib::NextToken("   abc", end);
-    if (!tok || Stdlib::StrnCmp(tok, "abc", 3) != 0 || (end - tok) != 3)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    tok = stdlib::next_token("   abc", end);
+    if (!tok || stdlib::strn_cmp(tok, "abc", 3) != 0 || (end - tok) != 3)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Two tokens */
-    tok = Stdlib::NextToken("one two", end);
-    if (!tok || Stdlib::StrnCmp(tok, "one", 3) != 0 || (end - tok) != 3)
-        return MakeError(Stdlib::Error::Unsuccessful);
-    tok = Stdlib::NextToken(end, end);
-    if (!tok || Stdlib::StrnCmp(tok, "two", 3) != 0 || (end - tok) != 3)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    tok = stdlib::next_token("one two", end);
+    if (!tok || stdlib::strn_cmp(tok, "one", 3) != 0 || (end - tok) != 3)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    tok = stdlib::next_token(end, end);
+    if (!tok || stdlib::strn_cmp(tok, "two", 3) != 0 || (end - tok) != 3)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* No more tokens */
-    tok = Stdlib::NextToken(end, end);
+    tok = stdlib::next_token(end, end);
     if (tok != nullptr)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Empty string */
-    tok = Stdlib::NextToken("", end);
+    tok = stdlib::next_token("", end);
     if (tok != nullptr)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Only spaces */
-    tok = Stdlib::NextToken("   ", end);
+    tok = stdlib::next_token("   ", end);
     if (tok != nullptr)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* TokenCopy */
     const char* input = "diskread vda 42";
-    tok = Stdlib::NextToken(input, end);
+    tok = stdlib::next_token(input, end);
     char buf[16];
-    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-    if (Stdlib::StrCmp(buf, "diskread") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    stdlib::token_copy(tok, end, buf, sizeof(buf));
+    if (stdlib::str_cmp(buf, "diskread") != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    tok = Stdlib::NextToken(end, end);
-    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-    if (Stdlib::StrCmp(buf, "vda") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    tok = stdlib::next_token(end, end);
+    stdlib::token_copy(tok, end, buf, sizeof(buf));
+    if (stdlib::str_cmp(buf, "vda") != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    tok = Stdlib::NextToken(end, end);
-    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-    if (Stdlib::StrCmp(buf, "42") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    tok = stdlib::next_token(end, end);
+    stdlib::token_copy(tok, end, buf, sizeof(buf));
+    if (stdlib::str_cmp(buf, "42") != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* TokenCopy truncation */
     char tiny[4];
-    const char* longTok = "longtoken";
-    Stdlib::TokenCopy(longTok, longTok + 9, tiny, sizeof(tiny));
-    if (Stdlib::StrCmp(tiny, "lon") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    const char* long_tok = "longtoken";
+    stdlib::token_copy(long_tok, long_tok + 9, tiny, sizeof(tiny));
+    if (stdlib::str_cmp(tiny, "lon") != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestNextToken: complete");
-    return MakeSuccess();
+    trace(0, "TestNextToken: complete");
+    return make_success();
 }
 
 /* The block layer's table (src/rust/block/src/selftest.rs). The devices are
@@ -497,348 +497,348 @@ Stdlib::Error TestNextToken()
    to its own name with the handle the walk gave. */
 extern "C" int rust_block_selftest();
 
-static Stdlib::Error TestBlockDeviceTable()
+static stdlib::Error test_block_device_table()
 {
-    Trace(0, "TestBlockDeviceTable: started");
+    trace(0, "TestBlockDeviceTable: started");
 
     if (rust_block_selftest() != 0)
     {
-        Trace(0, "TestBlockDeviceTable: failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestBlockDeviceTable: failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestBlockDeviceTable: complete");
-    return MakeSuccess();
+    trace(0, "TestBlockDeviceTable: complete");
+    return make_success();
 }
 
-Stdlib::Error TestContiguousPages()
+stdlib::Error test_contiguous_pages()
 {
-    auto& pt = Mm::PageTable::GetInstance();
+    auto& pt = mm::PageTable::get_instance();
 
-    Trace(0, "TestContiguousPages: started");
+    trace(0, "TestContiguousPages: started");
 
     /* count=0 must fail */
-    if (pt.AllocContiguousPages(0) != nullptr)
+    if (pt.alloc_contiguous_pages(0) != nullptr)
     {
-        Trace(0, "TestContiguousPages: count=0 should fail");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: count=0 should fail");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Alloc 1 page */
-    ulong freeBefore = pt.GetFreePagesCount();
-    Trace(0, "TestContiguousPages: free pages before %lu", freeBefore);
+    ulong free_before = pt.get_free_pages_count();
+    trace(0, "TestContiguousPages: free pages before %lu", free_before);
 
-    Mm::Page* p1 = pt.AllocContiguousPages(1);
+    mm::Page* p1 = pt.alloc_contiguous_pages(1);
     if (!p1)
     {
-        Trace(0, "TestContiguousPages: alloc 1 page failed");
-        return MakeError(Stdlib::Error::NoMemory);
+        trace(0, "TestContiguousPages: alloc 1 page failed");
+        return make_error(stdlib::Error::NO_MEMORY);
     }
 
-    if (pt.GetFreePagesCount() != freeBefore - 1)
+    if (pt.get_free_pages_count() != free_before - 1)
     {
-        Trace(0, "TestContiguousPages: free count mismatch after alloc 1");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: free count mismatch after alloc 1");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Write and read back via TmpMap (pages are not identity-mapped) */
-    ulong va1 = pt.TmpMapPage(p1->GetPhyAddress());
+    ulong va1 = pt.tmp_map_page(p1->get_phy_address());
     if (!va1)
     {
-        Trace(0, "TestContiguousPages: TmpMapPage failed");
-        pt.FreePage(p1);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: TmpMapPage failed");
+        pt.free_page(p1);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
-    Stdlib::MemSet((void*)va1, 0xAB, Const::PageSize);
+    stdlib::mem_set((void*)va1, 0xAB, consts::PAGE_SIZE);
     u8* ptr1 = (u8*)va1;
-    for (ulong i = 0; i < Const::PageSize; i++)
+    for (ulong i = 0; i < consts::PAGE_SIZE; i++)
     {
         if (ptr1[i] != 0xAB)
         {
-            Trace(0, "TestContiguousPages: pattern mismatch at %lu", i);
-            pt.TmpUnmapPage(va1);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestContiguousPages: pattern mismatch at %lu", i);
+            pt.tmp_unmap_page(va1);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
-    pt.TmpUnmapPage(va1);
+    pt.tmp_unmap_page(va1);
 
-    pt.FreePage(p1);
-    if (pt.GetFreePagesCount() != freeBefore)
+    pt.free_page(p1);
+    if (pt.get_free_pages_count() != free_before)
     {
-        Trace(0, "TestContiguousPages: free count mismatch after free 1");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: free count mismatch after free 1");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Alloc 4 contiguous pages */
-    ulong freeBefore4 = pt.GetFreePagesCount();
-    Mm::Page* p4 = pt.AllocContiguousPages(4);
+    ulong free_before4 = pt.get_free_pages_count();
+    mm::Page* p4 = pt.alloc_contiguous_pages(4);
     if (!p4)
     {
-        Trace(0, "TestContiguousPages: alloc 4 pages failed");
-        return MakeError(Stdlib::Error::NoMemory);
+        trace(0, "TestContiguousPages: alloc 4 pages failed");
+        return make_error(stdlib::Error::NO_MEMORY);
     }
 
-    if (pt.GetFreePagesCount() != freeBefore4 - 4)
+    if (pt.get_free_pages_count() != free_before4 - 4)
     {
-        Trace(0, "TestContiguousPages: free count mismatch after alloc 4");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: free count mismatch after alloc 4");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Verify physical contiguity */
-    ulong basePhys = p4->GetPhyAddress();
-    Trace(0, "TestContiguousPages: 4 pages at phys 0x%lX", basePhys);
-    Mm::Page* pageArray = p4;
+    ulong base_phys = p4->get_phy_address();
+    trace(0, "TestContiguousPages: 4 pages at phys 0x%lX", base_phys);
+    mm::Page* page_array = p4;
     for (ulong j = 0; j < 4; j++)
     {
-        if (pageArray[j].GetPhyAddress() != basePhys + j * Const::PageSize)
+        if (page_array[j].get_phy_address() != base_phys + j * consts::PAGE_SIZE)
         {
-            Trace(0, "TestContiguousPages: page %lu phys 0x%lX expected 0x%lX",
-                j, pageArray[j].GetPhyAddress(), basePhys + j * Const::PageSize);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestContiguousPages: page %lu phys 0x%lX expected 0x%lX",
+                j, page_array[j].get_phy_address(), base_phys + j * consts::PAGE_SIZE);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Write unique patterns to each page and verify via TmpMap */
     for (ulong j = 0; j < 4; j++)
     {
-        ulong va = pt.TmpMapPage(pageArray[j].GetPhyAddress());
-        BugOn(!va);
-        Stdlib::MemSet((void*)va, (u8)(0xC0 + j), Const::PageSize);
-        pt.TmpUnmapPage(va);
+        ulong va = pt.tmp_map_page(page_array[j].get_phy_address());
+        BUG_ON(!va);
+        stdlib::mem_set((void*)va, (u8)(0xC0 + j), consts::PAGE_SIZE);
+        pt.tmp_unmap_page(va);
     }
 
     for (ulong j = 0; j < 4; j++)
     {
-        ulong va = pt.TmpMapPage(pageArray[j].GetPhyAddress());
-        BugOn(!va);
+        ulong va = pt.tmp_map_page(page_array[j].get_phy_address());
+        BUG_ON(!va);
         u8* ptr = (u8*)va;
         u8 expected = (u8)(0xC0 + j);
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (ptr[i] != expected)
             {
-                Trace(0, "TestContiguousPages: page %lu byte %lu: 0x%lX expected 0x%lX",
+                trace(0, "TestContiguousPages: page %lu byte %lu: 0x%lX expected 0x%lX",
                     j, i, (ulong)ptr[i], (ulong)expected);
-                pt.TmpUnmapPage(va);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                pt.tmp_unmap_page(va);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
-        pt.TmpUnmapPage(va);
+        pt.tmp_unmap_page(va);
     }
 
     /* Free all 4 pages */
     for (ulong j = 0; j < 4; j++)
     {
-        pt.FreePage(&pageArray[j]);
+        pt.free_page(&page_array[j]);
     }
 
-    if (pt.GetFreePagesCount() != freeBefore4)
+    if (pt.get_free_pages_count() != free_before4)
     {
-        Trace(0, "TestContiguousPages: free count mismatch after free 4: %lu expected %lu",
-            pt.GetFreePagesCount(), freeBefore4);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestContiguousPages: free count mismatch after free 4: %lu expected %lu",
+            pt.get_free_pages_count(), free_before4);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Alloc and free repeatedly to check stability */
     for (ulong round = 0; round < 3; round++)
     {
-        ulong freeNow = pt.GetFreePagesCount();
-        Mm::Page* pages = pt.AllocContiguousPages(2);
+        ulong free_now = pt.get_free_pages_count();
+        mm::Page* pages = pt.alloc_contiguous_pages(2);
         if (!pages)
         {
-            Trace(0, "TestContiguousPages: round %lu alloc failed", round);
-            return MakeError(Stdlib::Error::NoMemory);
+            trace(0, "TestContiguousPages: round %lu alloc failed", round);
+            return make_error(stdlib::Error::NO_MEMORY);
         }
 
-        if (pages[1].GetPhyAddress() != pages[0].GetPhyAddress() + Const::PageSize)
+        if (pages[1].get_phy_address() != pages[0].get_phy_address() + consts::PAGE_SIZE)
         {
-            Trace(0, "TestContiguousPages: round %lu not contiguous", round);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestContiguousPages: round %lu not contiguous", round);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
-        pt.FreePage(&pages[0]);
-        pt.FreePage(&pages[1]);
+        pt.free_page(&pages[0]);
+        pt.free_page(&pages[1]);
 
-        if (pt.GetFreePagesCount() != freeNow)
+        if (pt.get_free_pages_count() != free_now)
         {
-            Trace(0, "TestContiguousPages: round %lu free count mismatch", round);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestContiguousPages: round %lu free count mismatch", round);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Trace(0, "TestContiguousPages: complete");
-    return MakeSuccess();
+    trace(0, "TestContiguousPages: complete");
+    return make_success();
 }
 
-Stdlib::Error TestPageAllocator()
+stdlib::Error test_page_allocator()
 {
-    Trace(0, "TestPageAllocator: started");
+    trace(0, "TestPageAllocator: started");
 
-    auto& pt = Mm::PageTable::GetInstance();
+    auto& pt = mm::PageTable::get_instance();
 
     /* Test AllocMapPages / UnmapFreePages with 1 page */
     {
-        ulong physAddr = 0;
-        void* ptr = Mm::AllocMapPages(1, &physAddr);
+        ulong phys_addr = 0;
+        void* ptr = mm::alloc_map_pages(1, &phys_addr);
         if (!ptr)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(1) failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(1) failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
-        if (physAddr == 0)
+        if (phys_addr == 0)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(1) physAddr is 0");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(1) physAddr is 0");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
-        Stdlib::MemSet(ptr, 0xAA, Const::PageSize);
+        stdlib::mem_set(ptr, 0xAA, consts::PAGE_SIZE);
         u8* p = (u8*)ptr;
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (p[i] != 0xAA)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(1) mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: AllocMapPages(1) mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
 
-        Mm::UnmapFreePages(ptr);
+        mm::unmap_free_pages(ptr);
     }
 
     /* Test AllocMapPages / UnmapFreePages with 2 pages */
     {
-        ulong physAddr = 0;
-        void* ptr = Mm::AllocMapPages(2, &physAddr);
+        ulong phys_addr = 0;
+        void* ptr = mm::alloc_map_pages(2, &phys_addr);
         if (!ptr)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(2) failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(2) failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
-        if (physAddr == 0)
+        if (phys_addr == 0)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(2) physAddr is 0");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(2) physAddr is 0");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
         u8* p = (u8*)ptr;
-        Stdlib::MemSet(p, 0xBB, Const::PageSize);
-        Stdlib::MemSet(p + Const::PageSize, 0xCC, Const::PageSize);
+        stdlib::mem_set(p, 0xBB, consts::PAGE_SIZE);
+        stdlib::mem_set(p + consts::PAGE_SIZE, 0xCC, consts::PAGE_SIZE);
 
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (p[i] != 0xBB)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(2) page0 mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: AllocMapPages(2) page0 mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
-            if (p[Const::PageSize + i] != 0xCC)
+            if (p[consts::PAGE_SIZE + i] != 0xCC)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(2) page1 mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: AllocMapPages(2) page1 mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
 
-        Mm::UnmapFreePages(ptr);
+        mm::unmap_free_pages(ptr);
     }
 
     /* Test MapPages / UnmapPages with pre-allocated physical pages */
     {
-        ulong freePagesBefore = pt.GetFreePagesCount();
+        ulong free_pages_before = pt.get_free_pages_count();
 
-        Mm::Page* pages = pt.AllocContiguousPages(2);
+        mm::Page* pages = pt.alloc_contiguous_pages(2);
         if (!pages)
         {
-            Trace(0, "TestPageAllocator: AllocContiguousPages(2) failed");
-            return MakeError(Stdlib::Error::NoMemory);
+            trace(0, "TestPageAllocator: AllocContiguousPages(2) failed");
+            return make_error(stdlib::Error::NO_MEMORY);
         }
 
-        ulong physAddrs[2];
-        physAddrs[0] = pages[0].GetPhyAddress();
-        physAddrs[1] = pages[1].GetPhyAddress();
+        ulong phys_addrs[2];
+        phys_addrs[0] = pages[0].get_phy_address();
+        phys_addrs[1] = pages[1].get_phy_address();
 
-        void* ptr = Mm::MapPages(2, physAddrs);
+        void* ptr = mm::map_pages(2, phys_addrs);
         if (!ptr)
         {
-            Trace(0, "TestPageAllocator: MapPages(2) failed");
-            pt.FreePage(&pages[0]);
-            pt.FreePage(&pages[1]);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: MapPages(2) failed");
+            pt.free_page(&pages[0]);
+            pt.free_page(&pages[1]);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
         /* Write via mapped VA */
         u8* p = (u8*)ptr;
-        Stdlib::MemSet(p, 0xDD, Const::PageSize);
-        Stdlib::MemSet(p + Const::PageSize, 0xEE, Const::PageSize);
+        stdlib::mem_set(p, 0xDD, consts::PAGE_SIZE);
+        stdlib::mem_set(p + consts::PAGE_SIZE, 0xEE, consts::PAGE_SIZE);
 
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (p[i] != 0xDD)
             {
-                Trace(0, "TestPageAllocator: MapPages page0 mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: MapPages page0 mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
-            if (p[Const::PageSize + i] != 0xEE)
+            if (p[consts::PAGE_SIZE + i] != 0xEE)
             {
-                Trace(0, "TestPageAllocator: MapPages page1 mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: MapPages page1 mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
 
         /* UnmapPages - releases VA but does NOT free physical pages */
-        Mm::UnmapPages(ptr, 2);
+        mm::unmap_pages(ptr, 2);
 
         /* Verify physical pages still contain written data via TmpMap */
-        ulong va0 = pt.TmpMapPage(physAddrs[0]);
+        ulong va0 = pt.tmp_map_page(phys_addrs[0]);
         if (!va0)
         {
-            Trace(0, "TestPageAllocator: TmpMapPage page0 after UnmapPages failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: TmpMapPage page0 after UnmapPages failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         u8* t0 = (u8*)va0;
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (t0[i] != 0xDD)
             {
-                Trace(0, "TestPageAllocator: post-unmap page0 mismatch at %lu", i);
-                pt.TmpUnmapPage(va0);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: post-unmap page0 mismatch at %lu", i);
+                pt.tmp_unmap_page(va0);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
-        pt.TmpUnmapPage(va0);
+        pt.tmp_unmap_page(va0);
 
-        ulong va1 = pt.TmpMapPage(physAddrs[1]);
+        ulong va1 = pt.tmp_map_page(phys_addrs[1]);
         if (!va1)
         {
-            Trace(0, "TestPageAllocator: TmpMapPage page1 after UnmapPages failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: TmpMapPage page1 after UnmapPages failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         u8* t1 = (u8*)va1;
-        for (ulong i = 0; i < Const::PageSize; i++)
+        for (ulong i = 0; i < consts::PAGE_SIZE; i++)
         {
             if (t1[i] != 0xEE)
             {
-                Trace(0, "TestPageAllocator: post-unmap page1 mismatch at %lu", i);
-                pt.TmpUnmapPage(va1);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: post-unmap page1 mismatch at %lu", i);
+                pt.tmp_unmap_page(va1);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
-        pt.TmpUnmapPage(va1);
+        pt.tmp_unmap_page(va1);
 
         /* Now free the physical pages */
-        pt.FreePage(&pages[0]);
-        pt.FreePage(&pages[1]);
+        pt.free_page(&pages[0]);
+        pt.free_page(&pages[1]);
 
-        if (pt.GetFreePagesCount() != freePagesBefore)
+        if (pt.get_free_pages_count() != free_pages_before)
         {
-            Trace(0, "TestPageAllocator: free count mismatch: %lu expected %lu",
-                pt.GetFreePagesCount(), freePagesBefore);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: free count mismatch: %lu expected %lu",
+                pt.get_free_pages_count(), free_pages_before);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -846,23 +846,23 @@ Stdlib::Error TestPageAllocator()
     {
         for (ulong round = 0; round < 5; round++)
         {
-            ulong physAddr = 0;
-            void* ptr = Mm::AllocMapPages(1, &physAddr);
+            ulong phys_addr = 0;
+            void* ptr = mm::alloc_map_pages(1, &phys_addr);
             if (!ptr)
             {
-                Trace(0, "TestPageAllocator: round %lu AllocMapPages failed", round);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: round %lu AllocMapPages failed", round);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
             u8* p = (u8*)ptr;
-            Stdlib::MemSet(p, (u8)(0x10 + round), Const::PageSize);
+            stdlib::mem_set(p, (u8)(0x10 + round), consts::PAGE_SIZE);
             if (p[0] != (u8)(0x10 + round))
             {
-                Trace(0, "TestPageAllocator: round %lu pattern mismatch", round);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: round %lu pattern mismatch", round);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
-            Mm::UnmapFreePages(ptr);
+            mm::unmap_free_pages(ptr);
         }
     }
 
@@ -870,32 +870,32 @@ Stdlib::Error TestPageAllocator()
     {
         for (ulong round = 0; round < 5; round++)
         {
-            Mm::Page* page = pt.AllocContiguousPages(1);
+            mm::Page* page = pt.alloc_contiguous_pages(1);
             if (!page)
             {
-                Trace(0, "TestPageAllocator: MapPages round %lu alloc failed", round);
-                return MakeError(Stdlib::Error::NoMemory);
+                trace(0, "TestPageAllocator: MapPages round %lu alloc failed", round);
+                return make_error(stdlib::Error::NO_MEMORY);
             }
 
-            ulong pa = page->GetPhyAddress();
-            void* ptr = Mm::MapPages(1, &pa);
+            ulong pa = page->get_phy_address();
+            void* ptr = mm::map_pages(1, &pa);
             if (!ptr)
             {
-                Trace(0, "TestPageAllocator: MapPages round %lu map failed", round);
-                pt.FreePage(page);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: MapPages round %lu map failed", round);
+                pt.free_page(page);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
             u8* p = (u8*)ptr;
-            Stdlib::MemSet(p, (u8)(0x50 + round), Const::PageSize);
+            stdlib::mem_set(p, (u8)(0x50 + round), consts::PAGE_SIZE);
             if (p[0] != (u8)(0x50 + round))
             {
-                Trace(0, "TestPageAllocator: MapPages round %lu pattern mismatch", round);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: MapPages round %lu pattern mismatch", round);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
-            Mm::UnmapPages(ptr, 1);
-            pt.FreePage(page);
+            mm::unmap_pages(ptr, 1);
+            pt.free_page(page);
         }
     }
 
@@ -909,49 +909,49 @@ Stdlib::Error TestPageAllocator()
            to touch a fresh L1 -- which is what a UEFI boot does, the
            framebuffer mapping having moved the VA cursor along. */
         {
-            ulong warmPhys = 0;
-            void* warmPtr = Mm::AllocMapPages(32, &warmPhys);
-            if (warmPtr)
-                Mm::UnmapFreePages(warmPtr);
+            ulong warm_phys = 0;
+            void* warm_ptr = mm::alloc_map_pages(32, &warm_phys);
+            if (warm_ptr)
+                mm::unmap_free_pages(warm_ptr);
         }
 
-        ulong freePagesBefore = pt.GetFreePagesCount();
-        ulong physAddr = 0;
-        void* ptr = Mm::AllocMapPages(32, &physAddr);
+        ulong free_pages_before = pt.get_free_pages_count();
+        ulong phys_addr = 0;
+        void* ptr = mm::alloc_map_pages(32, &phys_addr);
         if (!ptr)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(32) failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(32) failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
-        if (physAddr == 0)
+        if (phys_addr == 0)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(32) physAddr is 0");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(32) physAddr is 0");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
         u8* p = (u8*)ptr;
         for (ulong pg = 0; pg < 32; pg++)
         {
-            Stdlib::MemSet(p + pg * Const::PageSize, (u8)(0xA0 + pg), Const::PageSize);
+            stdlib::mem_set(p + pg * consts::PAGE_SIZE, (u8)(0xA0 + pg), consts::PAGE_SIZE);
         }
         for (ulong pg = 0; pg < 32; pg++)
         {
             u8 expected = (u8)(0xA0 + pg);
-            u8* base = p + pg * Const::PageSize;
-            if (base[0] != expected || base[Const::PageSize - 1] != expected)
+            u8* base = p + pg * consts::PAGE_SIZE;
+            if (base[0] != expected || base[consts::PAGE_SIZE - 1] != expected)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(32) page %lu mismatch", pg);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: AllocMapPages(32) page %lu mismatch", pg);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
 
-        Mm::UnmapFreePages(ptr);
+        mm::unmap_free_pages(ptr);
 
-        if (pt.GetFreePagesCount() != freePagesBefore)
+        if (pt.get_free_pages_count() != free_pages_before)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %lu expected %lu",
-                pt.GetFreePagesCount(), freePagesBefore);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %lu expected %lu",
+                pt.get_free_pages_count(), free_pages_before);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -962,70 +962,70 @@ Stdlib::Error TestPageAllocator()
            reclaimed on unmap.  Do a throwaway cycle so that the page
            table structure is already in place before we snapshot. */
         {
-            ulong warmPhys = 0;
-            void* warmPtr = Mm::AllocMapPages(128, &warmPhys);
-            if (warmPtr)
-                Mm::UnmapFreePages(warmPtr);
+            ulong warm_phys = 0;
+            void* warm_ptr = mm::alloc_map_pages(128, &warm_phys);
+            if (warm_ptr)
+                mm::unmap_free_pages(warm_ptr);
         }
 
-        ulong freePagesBefore = pt.GetFreePagesCount();
-        ulong physAddr = 0;
-        void* ptr = Mm::AllocMapPages(128, &physAddr);
+        ulong free_pages_before = pt.get_free_pages_count();
+        ulong phys_addr = 0;
+        void* ptr = mm::alloc_map_pages(128, &phys_addr);
         if (!ptr)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(128) failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(128) failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
-        if (physAddr == 0)
+        if (phys_addr == 0)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(128) physAddr is 0");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(128) physAddr is 0");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
         u8* p = (u8*)ptr;
         for (ulong pg = 0; pg < 128; pg++)
         {
-            Stdlib::MemSet(p + pg * Const::PageSize, (u8)(pg & 0xFF), Const::PageSize);
+            stdlib::mem_set(p + pg * consts::PAGE_SIZE, (u8)(pg & 0xFF), consts::PAGE_SIZE);
         }
         for (ulong pg = 0; pg < 128; pg++)
         {
             u8 expected = (u8)(pg & 0xFF);
-            u8* base = p + pg * Const::PageSize;
-            if (base[0] != expected || base[Const::PageSize - 1] != expected)
+            u8* base = p + pg * consts::PAGE_SIZE;
+            if (base[0] != expected || base[consts::PAGE_SIZE - 1] != expected)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(128) page %lu mismatch", pg);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestPageAllocator: AllocMapPages(128) page %lu mismatch", pg);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
 
-        Mm::UnmapFreePages(ptr);
+        mm::unmap_free_pages(ptr);
 
-        if (pt.GetFreePagesCount() != freePagesBefore)
+        if (pt.get_free_pages_count() != free_pages_before)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(128) free count mismatch: %lu expected %lu",
-                pt.GetFreePagesCount(), freePagesBefore);
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestPageAllocator: AllocMapPages(128) free count mismatch: %lu expected %lu",
+                pt.get_free_pages_count(), free_pages_before);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Trace(0, "TestPageAllocator: complete");
-    return MakeSuccess();
+    trace(0, "TestPageAllocator: complete");
+    return make_success();
 }
 
-Stdlib::Error TestMemSet()
+stdlib::Error test_mem_set()
 {
-    Trace(0, "TestMemSet: started");
+    trace(0, "TestMemSet: started");
 
     /* Basic fill */
     {
         u8 buf[128];
-        Stdlib::MemSet(buf, 0xAA, sizeof(buf));
+        stdlib::mem_set(buf, 0xAA, sizeof(buf));
         for (ulong i = 0; i < sizeof(buf); i++)
         {
             if (buf[i] != 0xAA)
             {
-                Trace(0, "TestMemSet: basic fill mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestMemSet: basic fill mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1033,14 +1033,14 @@ Stdlib::Error TestMemSet()
     /* Zero fill */
     {
         u8 buf[64];
-        Stdlib::MemSet(buf, 0xFF, sizeof(buf));
-        Stdlib::MemSet(buf, 0, sizeof(buf));
+        stdlib::mem_set(buf, 0xFF, sizeof(buf));
+        stdlib::mem_set(buf, 0, sizeof(buf));
         for (ulong i = 0; i < sizeof(buf); i++)
         {
             if (buf[i] != 0)
             {
-                Trace(0, "TestMemSet: zero fill mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestMemSet: zero fill mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1050,14 +1050,14 @@ Stdlib::Error TestMemSet()
         for (ulong sz = 0; sz <= 17; sz++)
         {
             u8 buf[32];
-            Stdlib::MemSet(buf, 0, sizeof(buf));
-            Stdlib::MemSet(buf, 0xCD, sz);
+            stdlib::mem_set(buf, 0, sizeof(buf));
+            stdlib::mem_set(buf, 0xCD, sz);
             for (ulong i = 0; i < sz; i++)
             {
                 if (buf[i] != 0xCD)
                 {
-                    Trace(0, "TestMemSet: odd size %lu mismatch at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemSet: odd size %lu mismatch at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
             /* Bytes beyond sz must be untouched */
@@ -1065,34 +1065,34 @@ Stdlib::Error TestMemSet()
             {
                 if (buf[i] != 0)
                 {
-                    Trace(0, "TestMemSet: odd size %lu overflow at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemSet: odd size %lu overflow at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
     }
 
-    Trace(0, "TestMemSet: complete");
-    return MakeSuccess();
+    trace(0, "TestMemSet: complete");
+    return make_success();
 }
 
-Stdlib::Error TestMemCpy()
+stdlib::Error test_mem_cpy()
 {
-    Trace(0, "TestMemCpy: started");
+    trace(0, "TestMemCpy: started");
 
     /* Basic copy */
     {
         u8 src[128], dst[128];
         for (ulong i = 0; i < sizeof(src); i++)
             src[i] = (u8)(i & 0xFF);
-        Stdlib::MemSet(dst, 0, sizeof(dst));
-        Stdlib::MemCpy(dst, src, sizeof(src));
+        stdlib::mem_set(dst, 0, sizeof(dst));
+        stdlib::mem_cpy(dst, src, sizeof(src));
         for (ulong i = 0; i < sizeof(src); i++)
         {
             if (dst[i] != src[i])
             {
-                Trace(0, "TestMemCpy: basic copy mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestMemCpy: basic copy mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1104,14 +1104,14 @@ Stdlib::Error TestMemCpy()
             u8 src[32], dst[32];
             for (ulong i = 0; i < sizeof(src); i++)
                 src[i] = (u8)((i + 0x30) & 0xFF);
-            Stdlib::MemSet(dst, 0, sizeof(dst));
-            Stdlib::MemCpy(dst, src, sz);
+            stdlib::mem_set(dst, 0, sizeof(dst));
+            stdlib::mem_cpy(dst, src, sz);
             for (ulong i = 0; i < sz; i++)
             {
                 if (dst[i] != src[i])
                 {
-                    Trace(0, "TestMemCpy: odd size %lu mismatch at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemCpy: odd size %lu mismatch at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
             /* Bytes beyond sz must be untouched */
@@ -1119,34 +1119,34 @@ Stdlib::Error TestMemCpy()
             {
                 if (dst[i] != 0)
                 {
-                    Trace(0, "TestMemCpy: odd size %lu overflow at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemCpy: odd size %lu overflow at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
     }
 
-    Trace(0, "TestMemCpy: complete");
-    return MakeSuccess();
+    trace(0, "TestMemCpy: complete");
+    return make_success();
 }
 
-Stdlib::Error TestMemMove()
+stdlib::Error test_mem_move()
 {
-    Trace(0, "TestMemMove: started");
+    trace(0, "TestMemMove: started");
 
     /* Non-overlapping forward */
     {
         u8 src[128], dst[128];
         for (ulong i = 0; i < sizeof(src); i++)
             src[i] = (u8)(i & 0xFF);
-        Stdlib::MemSet(dst, 0, sizeof(dst));
-        Stdlib::MemMove(dst, src, sizeof(src));
+        stdlib::mem_set(dst, 0, sizeof(dst));
+        stdlib::mem_move(dst, src, sizeof(src));
         for (ulong i = 0; i < sizeof(src); i++)
         {
             if (dst[i] != src[i])
             {
-                Trace(0, "TestMemMove: non-overlap mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestMemMove: non-overlap mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1156,14 +1156,14 @@ Stdlib::Error TestMemMove()
         u8 buf[64];
         for (ulong i = 0; i < sizeof(buf); i++)
             buf[i] = (u8)(i & 0xFF);
-        Stdlib::MemMove(buf + 8, buf, 32);
+        stdlib::mem_move(buf + 8, buf, 32);
         for (ulong i = 0; i < 32; i++)
         {
             if (buf[8 + i] != (u8)(i & 0xFF))
             {
-                Trace(0, "TestMemMove: overlap fwd mismatch at %lu: 0x%lX expected 0x%lX",
+                trace(0, "TestMemMove: overlap fwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[8 + i], (ulong)(u8)(i & 0xFF));
-                return MakeError(Stdlib::Error::Unsuccessful);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1173,14 +1173,14 @@ Stdlib::Error TestMemMove()
         u8 buf[64];
         for (ulong i = 0; i < sizeof(buf); i++)
             buf[i] = (u8)(i & 0xFF);
-        Stdlib::MemMove(buf, buf + 8, 32);
+        stdlib::mem_move(buf, buf + 8, 32);
         for (ulong i = 0; i < 32; i++)
         {
             if (buf[i] != (u8)((i + 8) & 0xFF))
             {
-                Trace(0, "TestMemMove: overlap bwd mismatch at %lu: 0x%lX expected 0x%lX",
+                trace(0, "TestMemMove: overlap bwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[i], (ulong)(u8)((i + 8) & 0xFF));
-                return MakeError(Stdlib::Error::Unsuccessful);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1190,13 +1190,13 @@ Stdlib::Error TestMemMove()
         u8 buf[32];
         for (ulong i = 0; i < sizeof(buf); i++)
             buf[i] = (u8)(i & 0xFF);
-        Stdlib::MemMove(buf, buf, sizeof(buf));
+        stdlib::mem_move(buf, buf, sizeof(buf));
         for (ulong i = 0; i < sizeof(buf); i++)
         {
             if (buf[i] != (u8)(i & 0xFF))
             {
-                Trace(0, "TestMemMove: same ptr mismatch at %lu", i);
-                return MakeError(Stdlib::Error::Unsuccessful);
+                trace(0, "TestMemMove: same ptr mismatch at %lu", i);
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
     }
@@ -1204,12 +1204,12 @@ Stdlib::Error TestMemMove()
     /* Zero size */
     {
         u8 buf[16];
-        Stdlib::MemSet(buf, 0xAA, sizeof(buf));
-        Stdlib::MemMove(buf + 4, buf, 0);
+        stdlib::mem_set(buf, 0xAA, sizeof(buf));
+        stdlib::mem_move(buf + 4, buf, 0);
         if (buf[4] != 0xAA)
         {
-            Trace(0, "TestMemMove: zero size modified data");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemMove: zero size modified data");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1224,13 +1224,13 @@ Stdlib::Error TestMemMove()
             for (ulong i = 0; i < sizeof(expected); i++)
                 expected[i] = (u8)(i & 0xFF);
 
-            Stdlib::MemMove(buf + 3, buf, sz);
+            stdlib::mem_move(buf + 3, buf, sz);
             for (ulong i = 0; i < sz; i++)
             {
                 if (buf[3 + i] != expected[i])
                 {
-                    Trace(0, "TestMemMove: odd sz %lu overlap fwd mismatch at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemMove: odd sz %lu overlap fwd mismatch at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
@@ -1244,13 +1244,13 @@ Stdlib::Error TestMemMove()
             for (ulong i = 0; i < sizeof(buf); i++)
                 buf[i] = (u8)(i & 0xFF);
 
-            Stdlib::MemMove(buf, buf + 3, sz);
+            stdlib::mem_move(buf, buf + 3, sz);
             for (ulong i = 0; i < sz; i++)
             {
                 if (buf[i] != (u8)((i + 3) & 0xFF))
                 {
-                    Trace(0, "TestMemMove: odd sz %lu overlap bwd mismatch at %lu", sz, i);
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                    trace(0, "TestMemMove: odd sz %lu overlap bwd mismatch at %lu", sz, i);
+                    return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
@@ -1259,31 +1259,31 @@ Stdlib::Error TestMemMove()
     /* Single byte */
     {
         u8 a = 0x42, b = 0;
-        Stdlib::MemMove(&b, &a, 1);
+        stdlib::mem_move(&b, &a, 1);
         if (b != 0x42)
         {
-            Trace(0, "TestMemMove: single byte failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemMove: single byte failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Trace(0, "TestMemMove: complete");
-    return MakeSuccess();
+    trace(0, "TestMemMove: complete");
+    return make_success();
 }
 
-Stdlib::Error TestMemCmp()
+stdlib::Error test_mem_cmp()
 {
-    Trace(0, "TestMemCmp: started");
+    trace(0, "TestMemCmp: started");
 
     /* Equal buffers */
     {
         u8 a[64], b[64];
-        Stdlib::MemSet(a, 0xAB, sizeof(a));
-        Stdlib::MemSet(b, 0xAB, sizeof(b));
-        if (Stdlib::MemCmp(a, b, sizeof(a)) != 0)
+        stdlib::mem_set(a, 0xAB, sizeof(a));
+        stdlib::mem_set(b, 0xAB, sizeof(b));
+        if (stdlib::mem_cmp(a, b, sizeof(a)) != 0)
         {
-            Trace(0, "TestMemCmp: equal buffers returned non-zero");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: equal buffers returned non-zero");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1291,10 +1291,10 @@ Stdlib::Error TestMemCmp()
     {
         u8 a[] = {1, 2, 3};
         u8 b[] = {1, 2, 4};
-        if (Stdlib::MemCmp(a, b, 3) >= 0)
+        if (stdlib::mem_cmp(a, b, 3) >= 0)
         {
-            Trace(0, "TestMemCmp: a < b not detected");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: a < b not detected");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1302,10 +1302,10 @@ Stdlib::Error TestMemCmp()
     {
         u8 a[] = {1, 2, 5};
         u8 b[] = {1, 2, 4};
-        if (Stdlib::MemCmp(a, b, 3) <= 0)
+        if (stdlib::mem_cmp(a, b, 3) <= 0)
         {
-            Trace(0, "TestMemCmp: a > b not detected");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: a > b not detected");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1313,10 +1313,10 @@ Stdlib::Error TestMemCmp()
     {
         u8 a[] = {0x00, 0xFF};
         u8 b[] = {0xFF, 0x00};
-        if (Stdlib::MemCmp(a, b, 2) >= 0)
+        if (stdlib::mem_cmp(a, b, 2) >= 0)
         {
-            Trace(0, "TestMemCmp: first byte a < b not detected");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: first byte a < b not detected");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1324,10 +1324,10 @@ Stdlib::Error TestMemCmp()
     {
         u8 a[] = {1};
         u8 b[] = {2};
-        if (Stdlib::MemCmp(a, b, 0) != 0)
+        if (stdlib::mem_cmp(a, b, 0) != 0)
         {
-            Trace(0, "TestMemCmp: zero length not equal");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: zero length not equal");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
@@ -1339,259 +1339,259 @@ Stdlib::Error TestMemCmp()
             a[i] = (u8)i;
             b[i] = (u8)i;
         }
-        if (Stdlib::MemCmp(a, b, sizeof(a)) != 0)
+        if (stdlib::mem_cmp(a, b, sizeof(a)) != 0)
         {
-            Trace(0, "TestMemCmp: odd size equal mismatch");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: odd size equal mismatch");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         b[16] = 0xFF;
-        if (Stdlib::MemCmp(a, b, sizeof(a)) >= 0)
+        if (stdlib::mem_cmp(a, b, sizeof(a)) >= 0)
         {
-            Trace(0, "TestMemCmp: odd size diff at end not detected");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestMemCmp: odd size diff at end not detected");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Trace(0, "TestMemCmp: complete");
-    return MakeSuccess();
+    trace(0, "TestMemCmp: complete");
+    return make_success();
 }
 
-Stdlib::Error TestStrLen()
+stdlib::Error test_str_len()
 {
-    Trace(0, "TestStrLen: started");
+    trace(0, "TestStrLen: started");
 
     /* Empty string */
-    if (Stdlib::StrLen("") != 0)
+    if (stdlib::str_len("") != 0)
     {
-        Trace(0, "TestStrLen: empty string failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrLen: empty string failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Single char */
-    if (Stdlib::StrLen("A") != 1)
+    if (stdlib::str_len("A") != 1)
     {
-        Trace(0, "TestStrLen: single char failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrLen: single char failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Known string */
-    if (Stdlib::StrLen("hello") != 5)
+    if (stdlib::str_len("hello") != 5)
     {
-        Trace(0, "TestStrLen: 'hello' failed, got %lu", Stdlib::StrLen("hello"));
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrLen: 'hello' failed, got %lu", stdlib::str_len("hello"));
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* String with embedded high bytes */
     {
         char buf[10] = {'\xFF', '\xFE', '\x01', '\0', 'X', '\0'};
-        if (Stdlib::StrLen(buf) != 3)
+        if (stdlib::str_len(buf) != 3)
         {
-            Trace(0, "TestStrLen: high bytes failed, got %lu", Stdlib::StrLen(buf));
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrLen: high bytes failed, got %lu", stdlib::str_len(buf));
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Longer string (> 8 bytes, tests qword boundary) */
-    if (Stdlib::StrLen("abcdefghijklmnop") != 16)
+    if (stdlib::str_len("abcdefghijklmnop") != 16)
     {
-        Trace(0, "TestStrLen: 16-char string failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrLen: 16-char string failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestStrLen: complete");
-    return MakeSuccess();
+    trace(0, "TestStrLen: complete");
+    return make_success();
 }
 
-Stdlib::Error TestStrCmp()
+stdlib::Error test_str_cmp()
 {
-    Trace(0, "TestStrCmp: started");
+    trace(0, "TestStrCmp: started");
 
     /* Equal strings */
-    if (Stdlib::StrCmp("abc", "abc") != 0)
+    if (stdlib::str_cmp("abc", "abc") != 0)
     {
-        Trace(0, "TestStrCmp: equal strings failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: equal strings failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Empty strings */
-    if (Stdlib::StrCmp("", "") != 0)
+    if (stdlib::str_cmp("", "") != 0)
     {
-        Trace(0, "TestStrCmp: empty strings failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: empty strings failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* First < second */
-    if (Stdlib::StrCmp("abc", "abd") >= 0)
+    if (stdlib::str_cmp("abc", "abd") >= 0)
     {
-        Trace(0, "TestStrCmp: abc < abd failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: abc < abd failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* First > second */
-    if (Stdlib::StrCmp("abd", "abc") <= 0)
+    if (stdlib::str_cmp("abd", "abc") <= 0)
     {
-        Trace(0, "TestStrCmp: abd > abc failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: abd > abc failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Prefix: shorter < longer */
-    if (Stdlib::StrCmp("ab", "abc") >= 0)
+    if (stdlib::str_cmp("ab", "abc") >= 0)
     {
-        Trace(0, "TestStrCmp: ab < abc failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: ab < abc failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Prefix: longer > shorter */
-    if (Stdlib::StrCmp("abc", "ab") <= 0)
+    if (stdlib::str_cmp("abc", "ab") <= 0)
     {
-        Trace(0, "TestStrCmp: abc > ab failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: abc > ab failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Single char difference */
-    if (Stdlib::StrCmp("a", "b") >= 0)
+    if (stdlib::str_cmp("a", "b") >= 0)
     {
-        Trace(0, "TestStrCmp: a < b failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: a < b failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Empty vs non-empty */
-    if (Stdlib::StrCmp("", "a") >= 0)
+    if (stdlib::str_cmp("", "a") >= 0)
     {
-        Trace(0, "TestStrCmp: '' < 'a' failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: '' < 'a' failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
-    if (Stdlib::StrCmp("a", "") <= 0)
+    if (stdlib::str_cmp("a", "") <= 0)
     {
-        Trace(0, "TestStrCmp: 'a' > '' failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: 'a' > '' failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Longer strings (cross qword boundary) */
-    if (Stdlib::StrCmp("abcdefghij", "abcdefghij") != 0)
+    if (stdlib::str_cmp("abcdefghij", "abcdefghij") != 0)
     {
-        Trace(0, "TestStrCmp: long equal failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: long equal failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
-    if (Stdlib::StrCmp("abcdefghij", "abcdefghik") >= 0)
+    if (stdlib::str_cmp("abcdefghij", "abcdefghik") >= 0)
     {
-        Trace(0, "TestStrCmp: long diff at end failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestStrCmp: long diff at end failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestStrCmp: complete");
-    return MakeSuccess();
+    trace(0, "TestStrCmp: complete");
+    return make_success();
 }
 
-Stdlib::Error TestStrStr()
+stdlib::Error test_str_str()
 {
-    Trace(0, "TestStrStr: started");
+    trace(0, "TestStrStr: started");
 
     /* Empty needle always matches at start */
     {
         const char* h = "hello";
-        if (Stdlib::StrStr(h, "") != h)
+        if (stdlib::str_str(h, "") != h)
         {
-            Trace(0, "TestStrStr: empty needle failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: empty needle failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Match at beginning */
     {
         const char* h = "abcdef";
-        const char* r = Stdlib::StrStr(h, "abc");
+        const char* r = stdlib::str_str(h, "abc");
         if (r != h)
         {
-            Trace(0, "TestStrStr: match at start failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: match at start failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Match in middle */
     {
         const char* h = "hello world";
-        const char* r = Stdlib::StrStr(h, "world");
+        const char* r = stdlib::str_str(h, "world");
         if (r != h + 6)
         {
-            Trace(0, "TestStrStr: match in middle failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: match in middle failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Match at end */
     {
         const char* h = "abcxyz";
-        const char* r = Stdlib::StrStr(h, "xyz");
+        const char* r = stdlib::str_str(h, "xyz");
         if (r != h + 3)
         {
-            Trace(0, "TestStrStr: match at end failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: match at end failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* No match */
     {
-        if (Stdlib::StrStr("abcdef", "xyz") != nullptr)
+        if (stdlib::str_str("abcdef", "xyz") != nullptr)
         {
-            Trace(0, "TestStrStr: no match returned non-null");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: no match returned non-null");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Partial match then fail */
     {
         const char* h = "abcabd";
-        const char* r = Stdlib::StrStr(h, "abd");
+        const char* r = stdlib::str_str(h, "abd");
         if (r != h + 3)
         {
-            Trace(0, "TestStrStr: partial match failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: partial match failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Needle longer than haystack */
     {
-        if (Stdlib::StrStr("ab", "abcdef") != nullptr)
+        if (stdlib::str_str("ab", "abcdef") != nullptr)
         {
-            Trace(0, "TestStrStr: needle longer returned non-null");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: needle longer returned non-null");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Both empty */
     {
         const char* h = "";
-        if (Stdlib::StrStr(h, "") != h)
+        if (stdlib::str_str(h, "") != h)
         {
-            Trace(0, "TestStrStr: both empty failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: both empty failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Single char match */
     {
         const char* h = "abcdef";
-        const char* r = Stdlib::StrStr(h, "d");
+        const char* r = stdlib::str_str(h, "d");
         if (r != h + 3)
         {
-            Trace(0, "TestStrStr: single char match failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: single char match failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* Exact match */
     {
         const char* h = "exact";
-        if (Stdlib::StrStr(h, "exact") != h)
+        if (stdlib::str_str(h, "exact") != h)
         {
-            Trace(0, "TestStrStr: exact match failed");
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestStrStr: exact match failed");
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Trace(0, "TestStrStr: complete");
-    return MakeSuccess();
+    trace(0, "TestStrStr: complete");
+    return make_success();
 }
 
 /* MemSet, MemCpy and MemMove held to a byte at a time -- on arm64 the
@@ -1604,38 +1604,38 @@ Stdlib::Error TestStrStr()
 namespace
 {
 
-const u8 MemGuardByte = 0xA5;
-const u8 MemSetByte = 0x5C;
-const ulong MemGuard = 16;
-const ulong MemSmallMax = 130;
-const ulong MemEdges[] = { 191, 192, 193, 255, 256, 257 };
-const ulong MemSrcOffsets[] = { 0, 3, 8, 13 };
-const ulong MemAlign = 16;
-const ulong MemLarge = 2 * Const::PageSize + 77;
-const ulong MemBufSize = MemLarge + 2 * MemAlign + 2 * MemGuard;
-const ulong MemTag = 'memt';
+const u8 MEM_GUARD_BYTE = 0xA5;
+const u8 MEM_SET_BYTE = 0x5C;
+const ulong MEM_GUARD = 16;
+const ulong MEM_SMALL_MAX = 130;
+const ulong MEM_EDGES[] = { 191, 192, 193, 255, 256, 257 };
+const ulong MEM_SRC_OFFSETS[] = { 0, 3, 8, 13 };
+const ulong MEM_ALIGN = 16;
+const ulong MEM_LARGE = 2 * consts::PAGE_SIZE + 77;
+const ulong MEM_BUF_SIZE = MEM_LARGE + 2 * MEM_ALIGN + 2 * MEM_GUARD;
+const ulong MEM_TAG = 'memt';
 /* Copies, and sets, of MemLarge bytes the throughput check times: half a
    megabyte, a quarter of a millisecond at a byte a cycle */
-const ulong MemRateRounds = 64;
-const ulong NsPerUs = 1000;
+const ulong MEM_RATE_ROUNDS = 64;
+const ulong NS_PER_US = 1000;
 
-u8 MemPattern(ulong i)
+u8 mem_pattern(ulong i)
 {
     return static_cast<u8>(i * 7 + 13);
 }
 
 /* What dst holds after [at, at + n) was set from expected(i - at), the rest
    still guard bytes; false, said, otherwise */
-bool MemCheck(const char* what, const u8* dst, ulong cap, ulong at, ulong n, const u8* from, bool set)
+bool mem_check(const char* what, const u8* dst, ulong cap, ulong at, ulong n, const u8* from, bool set)
 {
     for (ulong i = 0; i < cap; i++)
     {
-        u8 expected = MemGuardByte;
+        u8 expected = MEM_GUARD_BYTE;
         if (i >= at && i < at + n)
-            expected = set ? MemSetByte : from[i - at];
+            expected = set ? MEM_SET_BYTE : from[i - at];
         if (dst[i] != expected)
         {
-            Trace(0, "TestMemRoutines: %s of %lu at +%lu: byte %lu is 0x%x, not 0x%x", what, n, at, i,
+            trace(0, "TestMemRoutines: %s of %lu at +%lu: byte %lu is 0x%x, not 0x%x", what, n, at, i,
                 static_cast<unsigned int>(dst[i]), static_cast<unsigned int>(expected));
             return false;
         }
@@ -1643,47 +1643,47 @@ bool MemCheck(const char* what, const u8* dst, ulong cap, ulong at, ulong n, con
     return true;
 }
 
-bool MemCase(u8* src, u8* dst, ulong n, ulong srcOff, ulong dstOff)
+bool mem_case(u8* src, u8* dst, ulong n, ulong src_off, ulong dst_off)
 {
-    const ulong cap = dstOff + n + MemGuard;
-    for (ulong i = 0; i < srcOff + n; i++)
-        src[i] = MemPattern(i);
+    const ulong cap = dst_off + n + MEM_GUARD;
+    for (ulong i = 0; i < src_off + n; i++)
+        src[i] = mem_pattern(i);
 
-    Stdlib::MemSet(dst, MemGuardByte, cap);
-    Stdlib::MemCpy(dst + dstOff, src + srcOff, n);
-    if (!MemCheck("MemCpy", dst, cap, dstOff, n, src + srcOff, false))
+    stdlib::mem_set(dst, MEM_GUARD_BYTE, cap);
+    stdlib::mem_cpy(dst + dst_off, src + src_off, n);
+    if (!mem_check("MemCpy", dst, cap, dst_off, n, src + src_off, false))
         return false;
 
     /* MemMove without an overlap is a copy */
-    Stdlib::MemSet(dst, MemGuardByte, cap);
-    Stdlib::MemMove(dst + dstOff, src + srcOff, n);
-    if (!MemCheck("MemMove", dst, cap, dstOff, n, src + srcOff, false))
+    stdlib::mem_set(dst, MEM_GUARD_BYTE, cap);
+    stdlib::mem_move(dst + dst_off, src + src_off, n);
+    if (!mem_check("MemMove", dst, cap, dst_off, n, src + src_off, false))
         return false;
 
     /* The guard bytes set a byte at a time, so MemSet is held to the loop and
        not to itself */
     for (ulong i = 0; i < cap; i++)
-        dst[i] = MemGuardByte;
-    Stdlib::MemSet(dst + dstOff, MemSetByte, n);
-    return MemCheck("MemSet", dst, cap, dstOff, n, nullptr, true);
+        dst[i] = MEM_GUARD_BYTE;
+    stdlib::mem_set(dst + dst_off, MEM_SET_BYTE, n);
+    return mem_check("MemSet", dst, cap, dst_off, n, nullptr, true);
 }
 
 /* MemMove of n bytes within buf, from+src to from+dst, against a copy made a
    byte at a time through ref */
-bool MemOverlap(u8* buf, u8* ref, ulong cap, ulong src, ulong dst, ulong n)
+bool mem_overlap(u8* buf, u8* ref, ulong cap, ulong src, ulong dst, ulong n)
 {
     for (ulong i = 0; i < cap; i++)
-        buf[i] = MemPattern(i);
+        buf[i] = mem_pattern(i);
     for (ulong i = 0; i < n; i++)
         ref[i] = buf[src + i];
 
-    Stdlib::MemMove(buf + dst, buf + src, n);
+    stdlib::mem_move(buf + dst, buf + src, n);
     for (ulong i = 0; i < cap; i++)
     {
-        u8 expected = (i >= dst && i < dst + n) ? ref[i - dst] : MemPattern(i);
+        u8 expected = (i >= dst && i < dst + n) ? ref[i - dst] : mem_pattern(i);
         if (buf[i] != expected)
         {
-            Trace(0, "TestMemRoutines: MemMove of %lu from +%lu to +%lu: byte %lu is 0x%x, not 0x%x", n, src, dst,
+            trace(0, "TestMemRoutines: MemMove of %lu from +%lu to +%lu: byte %lu is 0x%x, not 0x%x", n, src, dst,
                 i, static_cast<unsigned int>(buf[i]), static_cast<unsigned int>(expected));
             return false;
         }
@@ -1691,16 +1691,16 @@ bool MemOverlap(u8* buf, u8* ref, ulong cap, ulong src, ulong dst, ulong n)
     return true;
 }
 
-bool MemRoutines(u8* src, u8* dst, u8* ref)
+bool mem_routines(u8* src, u8* dst, u8* ref)
 {
-    for (ulong n = 0; n <= MemSmallMax + Stdlib::ArraySize(MemEdges); n++)
+    for (ulong n = 0; n <= MEM_SMALL_MAX + stdlib::array_size(MEM_EDGES); n++)
     {
-        ulong size = (n <= MemSmallMax) ? n : MemEdges[n - MemSmallMax - 1];
-        for (ulong dstOff = 0; dstOff < MemAlign; dstOff++)
+        ulong size = (n <= MEM_SMALL_MAX) ? n : MEM_EDGES[n - MEM_SMALL_MAX - 1];
+        for (ulong dst_off = 0; dst_off < MEM_ALIGN; dst_off++)
         {
-            for (ulong srcOff : MemSrcOffsets)
+            for (ulong src_off : MEM_SRC_OFFSETS)
             {
-                if (!MemCase(src, dst, size, srcOff, dstOff))
+                if (!mem_case(src, dst, size, src_off, dst_off))
                     return false;
             }
         }
@@ -1708,293 +1708,293 @@ bool MemRoutines(u8* src, u8* dst, u8* ref)
 
     /* Overlaps: every shift of up to 20 either way, at a base off any
        boundary */
-    const ulong base = MemGuard + 2 * MemAlign + 3;
-    const long shiftMax = 20;
-    for (ulong n = 0; n <= MemSmallMax + Stdlib::ArraySize(MemEdges); n++)
+    const ulong base = MEM_GUARD + 2 * MEM_ALIGN + 3;
+    const long shift_max = 20;
+    for (ulong n = 0; n <= MEM_SMALL_MAX + stdlib::array_size(MEM_EDGES); n++)
     {
-        ulong size = (n <= MemSmallMax) ? n : MemEdges[n - MemSmallMax - 1];
-        for (long shift = -shiftMax; shift <= shiftMax; shift++)
+        ulong size = (n <= MEM_SMALL_MAX) ? n : MEM_EDGES[n - MEM_SMALL_MAX - 1];
+        for (long shift = -shift_max; shift <= shift_max; shift++)
         {
             ulong to = static_cast<ulong>(static_cast<long>(base) + shift);
-            if (!MemOverlap(dst, ref, base + size + shiftMax + MemGuard, base, to, size))
+            if (!mem_overlap(dst, ref, base + size + shift_max + MEM_GUARD, base, to, size))
                 return false;
         }
     }
 
     /* Past two pages, unaligned both ways, and moved onto itself by a block
        and a byte, up and down */
-    if (!MemCase(src, dst, MemLarge, 5, 3))
+    if (!mem_case(src, dst, MEM_LARGE, 5, 3))
         return false;
-    const ulong largeCap = MemLarge + 2 * MemAlign + MemGuard;
-    if (!MemOverlap(dst, ref, largeCap, MemAlign, MemAlign + 65, MemLarge - 65) ||
-        !MemOverlap(dst, ref, largeCap, MemAlign + 65, MemAlign, MemLarge - 65) ||
-        !MemOverlap(dst, ref, largeCap, MemAlign, MemAlign + 1, MemLarge - 1) ||
-        !MemOverlap(dst, ref, largeCap, MemAlign + 1, MemAlign, MemLarge - 1))
+    const ulong large_cap = MEM_LARGE + 2 * MEM_ALIGN + MEM_GUARD;
+    if (!mem_overlap(dst, ref, large_cap, MEM_ALIGN, MEM_ALIGN + 65, MEM_LARGE - 65) ||
+        !mem_overlap(dst, ref, large_cap, MEM_ALIGN + 65, MEM_ALIGN, MEM_LARGE - 65) ||
+        !mem_overlap(dst, ref, large_cap, MEM_ALIGN, MEM_ALIGN + 1, MEM_LARGE - 1) ||
+        !mem_overlap(dst, ref, large_cap, MEM_ALIGN + 1, MEM_ALIGN, MEM_LARGE - 1))
         return false;
     return true;
 }
 
 /* What MemCpy and MemSet cost, said every boot: MB/s, a byte a microsecond */
-void MemRate(u8* src, u8* dst)
+void mem_rate(u8* src, u8* dst)
 {
-    const ulong start = GetBootTime().GetValue();
-    for (ulong r = 0; r < MemRateRounds; r++)
-        Stdlib::MemCpy(dst, src, MemLarge);
-    const ulong copied = GetBootTime().GetValue();
-    for (ulong r = 0; r < MemRateRounds; r++)
-        Stdlib::MemSet(dst, static_cast<u8>(r), MemLarge);
-    const ulong set = GetBootTime().GetValue();
+    const ulong start = get_boot_time().get_value();
+    for (ulong r = 0; r < MEM_RATE_ROUNDS; r++)
+        stdlib::mem_cpy(dst, src, MEM_LARGE);
+    const ulong copied = get_boot_time().get_value();
+    for (ulong r = 0; r < MEM_RATE_ROUNDS; r++)
+        stdlib::mem_set(dst, static_cast<u8>(r), MEM_LARGE);
+    const ulong set = get_boot_time().get_value();
 
-    const ulong bytes = MemRateRounds * MemLarge;
-    const ulong copyNs = (copied > start) ? copied - start : 1;
-    const ulong setNs = (set > copied) ? set - copied : 1;
-    Trace(0, "TestMemRoutines: MemCpy %lu MB/s, MemSet %lu MB/s", bytes * NsPerUs / copyNs,
-        bytes * NsPerUs / setNs);
+    const ulong bytes = MEM_RATE_ROUNDS * MEM_LARGE;
+    const ulong copy_ns = (copied > start) ? copied - start : 1;
+    const ulong set_ns = (set > copied) ? set - copied : 1;
+    trace(0, "TestMemRoutines: MemCpy %lu MB/s, MemSet %lu MB/s", bytes * NS_PER_US / copy_ns,
+        bytes * NS_PER_US / set_ns);
 }
 
 }
 
-Stdlib::Error TestMemRoutines()
+stdlib::Error test_mem_routines()
 {
-    Trace(0, "TestMemRoutines: started");
+    trace(0, "TestMemRoutines: started");
 
-    u8* bufs = static_cast<u8*>(Mm::Alloc(3 * MemBufSize, MemTag));
+    u8* bufs = static_cast<u8*>(mm::alloc(3 * MEM_BUF_SIZE, MEM_TAG));
     if (bufs == nullptr)
-        return MakeError(Stdlib::Error::NoMemory);
+        return make_error(stdlib::Error::NO_MEMORY);
 
-    bool ok = MemRoutines(bufs, bufs + MemBufSize, bufs + 2 * MemBufSize);
+    bool ok = mem_routines(bufs, bufs + MEM_BUF_SIZE, bufs + 2 * MEM_BUF_SIZE);
     if (ok)
-        MemRate(bufs, bufs + MemBufSize);
-    Mm::Free(bufs);
+        mem_rate(bufs, bufs + MEM_BUF_SIZE);
+    mm::free(bufs);
     if (!ok)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestMemRoutines: complete");
-    return MakeSuccess();
+    trace(0, "TestMemRoutines: complete");
+    return make_success();
 }
 
 /* CRC-32 against the check value every implementation of it is held to, and
    the streaming form fed in pieces against the whole */
-Stdlib::Error TestCrc32()
+stdlib::Error test_crc32()
 {
-    static const char Check[] = "123456789";
-    static const u32 CheckCrc = 0xCBF43926;
-    const ulong len = sizeof(Check) - 1;
+    static const char CHECK[] = "123456789";
+    static const u32 CHECK_CRC = 0xCBF43926;
+    const ulong len = sizeof(CHECK) - 1;
 
-    u32 whole = Stdlib::Crc32(Check, len);
+    u32 whole = stdlib::crc32(CHECK, len);
     u32 pieces = 0;
     for (ulong at = 0; at < len; at += 2)
-        pieces = Stdlib::Crc32Update(pieces, Check + at, (len - at < 2) ? len - at : 2);
-    if (whole != CheckCrc || pieces != CheckCrc || Stdlib::Crc32(Check, 0) != 0)
+        pieces = stdlib::crc32_update(pieces, CHECK + at, (len - at < 2) ? len - at : 2);
+    if (whole != CHECK_CRC || pieces != CHECK_CRC || stdlib::crc32(CHECK, 0) != 0)
     {
-        Trace(0, "TestCrc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CheckCrc);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestCrc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CHECK_CRC);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
-    return MakeSuccess();
+    return make_success();
 }
 
-Stdlib::Error TestSnPrintf()
+stdlib::Error test_sn_printf()
 {
-    Trace(0, "TestSnPrintf: started");
+    trace(0, "TestSnPrintf: started");
 
     char buf[128];
     int rc;
 
     /* Existing specifiers still work */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "hello %s", "world");
-    if (rc < 0 || Stdlib::StrCmp(buf, "hello world") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "hello %s", "world");
+    if (rc < 0 || stdlib::str_cmp(buf, "hello world") != 0)
     {
-        Trace(0, "TestSnPrintf: %%s failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%s failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lu", (ulong)42);
-    if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lu", (ulong)42);
+    if (rc < 0 || stdlib::str_cmp(buf, "42") != 0)
     {
-        Trace(0, "TestSnPrintf: %%u failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%u failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%c", (int)'A');
-    if (rc < 0 || Stdlib::StrCmp(buf, "A") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%c", (int)'A');
+    if (rc < 0 || stdlib::str_cmp(buf, "A") != 0)
     {
-        Trace(0, "TestSnPrintf: %%c failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%c failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lu", (ulong)0);
-    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lu", (ulong)0);
+    if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        Trace(0, "TestSnPrintf: %%u zero failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%u zero failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* %% literal percent */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "100%%");
-    if (rc < 0 || Stdlib::StrCmp(buf, "100%") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "100%%");
+    if (rc < 0 || stdlib::str_cmp(buf, "100%") != 0)
     {
-        Trace(0, "TestSnPrintf: %%%% failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%%% failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%%start");
-    if (rc < 0 || Stdlib::StrCmp(buf, "%start") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%%start");
+    if (rc < 0 || stdlib::str_cmp(buf, "%start") != 0)
     {
-        Trace(0, "TestSnPrintf: %%%% at start failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%%% at start failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* %d signed decimal */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)42);
-    if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)42);
+    if (rc < 0 || stdlib::str_cmp(buf, "42") != 0)
     {
-        Trace(0, "TestSnPrintf: %%d positive failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%d positive failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)-1);
-    if (rc < 0 || Stdlib::StrCmp(buf, "-1") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)-1);
+    if (rc < 0 || stdlib::str_cmp(buf, "-1") != 0)
     {
-        Trace(0, "TestSnPrintf: %%d -1 failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%d -1 failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)-12345);
-    if (rc < 0 || Stdlib::StrCmp(buf, "-12345") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)-12345);
+    if (rc < 0 || stdlib::str_cmp(buf, "-12345") != 0)
     {
-        Trace(0, "TestSnPrintf: %%d negative failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%d negative failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)0);
-    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)0);
+    if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        Trace(0, "TestSnPrintf: %%d zero failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%d zero failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* %x lowercase hex */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)0);
-    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)0);
+    if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        Trace(0, "TestSnPrintf: %%x zero failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%x zero failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)0xDEAD);
-    if (rc < 0 || Stdlib::StrCmp(buf, "dead") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)0xDEAD);
+    if (rc < 0 || stdlib::str_cmp(buf, "dead") != 0)
     {
-        Trace(0, "TestSnPrintf: %%x deadbeef failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%x deadbeef failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)255);
-    if (rc < 0 || Stdlib::StrCmp(buf, "ff") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)255);
+    if (rc < 0 || stdlib::str_cmp(buf, "ff") != 0)
     {
-        Trace(0, "TestSnPrintf: %%x 255 failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%x 255 failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* %X uppercase hex */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lX", (ulong)0xDEAD);
-    if (rc < 0 || Stdlib::StrCmp(buf, "DEAD") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lX", (ulong)0xDEAD);
+    if (rc < 0 || stdlib::str_cmp(buf, "DEAD") != 0)
     {
-        Trace(0, "TestSnPrintf: %%X failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%X failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lX", (ulong)255);
-    if (rc < 0 || Stdlib::StrCmp(buf, "FF") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%lX", (ulong)255);
+    if (rc < 0 || stdlib::str_cmp(buf, "FF") != 0)
     {
-        Trace(0, "TestSnPrintf: %%X 255 failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%X 255 failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Zero-padded width: %08x */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%08lx", (ulong)0xFF);
-    if (rc < 0 || Stdlib::StrCmp(buf, "000000ff") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%08lx", (ulong)0xFF);
+    if (rc < 0 || stdlib::str_cmp(buf, "000000ff") != 0)
     {
-        Trace(0, "TestSnPrintf: %%08x failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%08x failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%016lX", (ulong)0xABCD1234);
-    if (rc < 0 || Stdlib::StrCmp(buf, "00000000ABCD1234") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%016lX", (ulong)0xABCD1234);
+    if (rc < 0 || stdlib::str_cmp(buf, "00000000ABCD1234") != 0)
     {
-        Trace(0, "TestSnPrintf: %%016X failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%016X failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Zero-padded decimal: %05u */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05lu", (ulong)42);
-    if (rc < 0 || Stdlib::StrCmp(buf, "00042") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%05lu", (ulong)42);
+    if (rc < 0 || stdlib::str_cmp(buf, "00042") != 0)
     {
-        Trace(0, "TestSnPrintf: %%05u failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%05u failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Zero-padded signed: %05d with negative */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05ld", (long)-42);
-    if (rc < 0 || Stdlib::StrCmp(buf, "-0042") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%05ld", (long)-42);
+    if (rc < 0 || stdlib::str_cmp(buf, "-0042") != 0)
     {
-        Trace(0, "TestSnPrintf: %%05d negative failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%05d negative failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Zero-padded signed: value fills width */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%03ld", (long)12345);
-    if (rc < 0 || Stdlib::StrCmp(buf, "12345") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%03ld", (long)12345);
+    if (rc < 0 || stdlib::str_cmp(buf, "12345") != 0)
     {
-        Trace(0, "TestSnPrintf: %%03d overflow failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%03d overflow failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Width with no zero-pad (space padding) */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%5lu", (ulong)42);
-    if (rc < 0 || Stdlib::StrCmp(buf, "   42") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%5lu", (ulong)42);
+    if (rc < 0 || stdlib::str_cmp(buf, "   42") != 0)
     {
-        Trace(0, "TestSnPrintf: %%5u space pad failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%5u space pad failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%8lx", (ulong)0xFF);
-    if (rc < 0 || Stdlib::StrCmp(buf, "      ff") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%8lx", (ulong)0xFF);
+    if (rc < 0 || stdlib::str_cmp(buf, "      ff") != 0)
     {
-        Trace(0, "TestSnPrintf: %%8x space pad failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%8x space pad failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* String with width */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%10s", "hi");
-    if (rc < 0 || Stdlib::StrCmp(buf, "        hi") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%10s", "hi");
+    if (rc < 0 || stdlib::str_cmp(buf, "        hi") != 0)
     {
-        Trace(0, "TestSnPrintf: %%10s failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%10s failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Mixed specifiers in one format string */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld %lu %lx %lX %s %%",
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%ld %lu %lx %lX %s %%",
                           (long)-7, (ulong)100, (ulong)0xAB, (ulong)0xCD, "ok");
-    if (rc < 0 || Stdlib::StrCmp(buf, "-7 100 ab CD ok %") != 0)
+    if (rc < 0 || stdlib::str_cmp(buf, "-7 100 ab CD ok %") != 0)
     {
-        Trace(0, "TestSnPrintf: mixed failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: mixed failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Null string */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%s", (const char*)nullptr);
-    if (rc < 0 || Stdlib::StrCmp(buf, "(null)") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%s", (const char*)nullptr);
+    if (rc < 0 || stdlib::str_cmp(buf, "(null)") != 0)
     {
-        Trace(0, "TestSnPrintf: null string failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: null string failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* %p still works (uppercase hex) */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%p", (void*)(ulong)0xABCDEF);
-    if (rc < 0 || Stdlib::StrCmp(buf, "ABCDEF") != 0)
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%p", (void*)(ulong)0xABCDEF);
+    if (rc < 0 || stdlib::str_cmp(buf, "ABCDEF") != 0)
     {
-        Trace(0, "TestSnPrintf: %%p failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: %%p failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* More than the buffer holds is truncated and marked, never dropped: a
@@ -2002,33 +2002,33 @@ Stdlib::Error TestSnPrintf()
        threw away every line that reported the overflow -- which is how a
        Rust panic reached the console as "RUST PANIC: " and nothing else. */
     char small[8];
-    rc = Stdlib::SnPrintf(small, sizeof(small), "ab%s", "cdefghij");
-    if (rc != 7 || Stdlib::StrCmp(small, "abcd...") != 0)
+    rc = stdlib::sn_printf(small, sizeof(small), "ab%s", "cdefghij");
+    if (rc != 7 || stdlib::str_cmp(small, "abcd...") != 0)
     {
-        Trace(0, "TestSnPrintf: long %%s not truncated: '%s' (%d)", small, rc);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: long %%s not truncated: '%s' (%d)", small, rc);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(small, sizeof(small), "abcdefghij");
-    if (rc != 7 || Stdlib::StrCmp(small, "abcd...") != 0)
+    rc = stdlib::sn_printf(small, sizeof(small), "abcdefghij");
+    if (rc != 7 || stdlib::str_cmp(small, "abcd...") != 0)
     {
-        Trace(0, "TestSnPrintf: long text not truncated: '%s' (%d)", small, rc);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: long text not truncated: '%s' (%d)", small, rc);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    rc = Stdlib::SnPrintf(small, sizeof(small), "%lu", (ulong)123456789);
-    if (rc != 7 || Stdlib::StrCmp(small, "1234...") != 0)
+    rc = stdlib::sn_printf(small, sizeof(small), "%lu", (ulong)123456789);
+    if (rc != 7 || stdlib::str_cmp(small, "1234...") != 0)
     {
-        Trace(0, "TestSnPrintf: long %%u not truncated: '%s' (%d)", small, rc);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: long %%u not truncated: '%s' (%d)", small, rc);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Exactly the buffer, terminator included: no mark, nothing lost. */
-    rc = Stdlib::SnPrintf(small, sizeof(small), "abcdefg");
-    if (rc != 7 || Stdlib::StrCmp(small, "abcdefg") != 0)
+    rc = stdlib::sn_printf(small, sizeof(small), "abcdefg");
+    if (rc != 7 || stdlib::str_cmp(small, "abcdefg") != 0)
     {
-        Trace(0, "TestSnPrintf: exact fit failed: '%s' (%d)", small, rc);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: exact fit failed: '%s' (%d)", small, rc);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Each argument read as the type it was passed as, which the length
@@ -2037,71 +2037,71 @@ Stdlib::Error TestSnPrintf()
        x86-64 and past the fifth on arm64 (buf, size and fmt take three of
        the six and eight registers), where an int read as a long brings the
        other half of its slot with it. */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u %lu %d %ld %x %lx %u %lu %d %ld %X %lX",
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%u %lu %d %ld %x %lx %u %lu %d %ld %X %lX",
         (u32)0xFFFFFFFF, (ulong)1 << 40, (int)-5, (long)-6, (u32)0xAB, (ulong)0xCD00000000UL,
         (u32)7, (ulong)8, (int)-9, (long)-10, (u32)0xEF, (ulong)0x1200000000UL);
-    if (rc < 0 || Stdlib::StrCmp(buf,
+    if (rc < 0 || stdlib::str_cmp(buf,
         "4294967295 1099511627776 -5 -6 ab cd00000000 7 8 -9 -10 EF 1200000000") != 0)
     {
-        Trace(0, "TestSnPrintf: widths failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: widths failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* hh and h: a char or a short, passed as an int */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%hhu %hhd %hu %hd",
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%hhu %hhd %hu %hd",
         (u8)200, (s8)-3, (u16)60000, (s16)-30000);
-    if (rc < 0 || Stdlib::StrCmp(buf, "200 -3 60000 -30000") != 0)
+    if (rc < 0 || stdlib::str_cmp(buf, "200 -3 60000 -30000") != 0)
     {
-        Trace(0, "TestSnPrintf: hh/h failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: hh/h failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* z a size_t, ll a long long, their extremes included */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%zu %lld %llu %llx",
+    rc = stdlib::sn_printf(buf, sizeof(buf), "%zu %lld %llu %llx",
         (size_t)123, (long long)-9223372036854775807LL - 1, 18446744073709551615ULL, 0xABCULL);
-    if (rc < 0 || Stdlib::StrCmp(buf, "123 -9223372036854775808 18446744073709551615 abc") != 0)
+    if (rc < 0 || stdlib::str_cmp(buf, "123 -9223372036854775808 18446744073709551615 abc") != 0)
     {
-        Trace(0, "TestSnPrintf: z/ll failed: '%s'", buf);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestSnPrintf: z/ll failed: '%s'", buf);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestSnPrintf: complete");
-    return MakeSuccess();
+    trace(0, "TestSnPrintf: complete");
+    return make_success();
 }
 
 /* The filesystem self-test (src/rust/fs/src/selftest.rs) on a ramfs mounted
    on / for the duration and taken down after: the whole file API, over a
    filesystem that needs no disk. */
-extern "C" int kernel_fs_selftest(const char* dir, unsigned long dirLen, unsigned long size);
-extern "C" int rust_ramfs_mount(const char* path, unsigned long pathLen, int readOnly);
-extern "C" int kernel_vfs_unmount(const char* path, unsigned long pathLen);
+extern "C" int kernel_fs_selftest(const char* dir, unsigned long dir_len, unsigned long size);
+extern "C" int rust_ramfs_mount(const char* path, unsigned long path_len, int read_only);
+extern "C" int kernel_vfs_unmount(const char* path, unsigned long path_len);
 
-Stdlib::Error TestVfs()
+stdlib::Error test_vfs()
 {
-    static const ulong BigSize = 100 * 1024;
+    static const ulong BIG_SIZE = 100 * 1024;
 
     if (rust_ramfs_mount("/", 1, 0) != 0)
     {
-        Trace(0, "TestVfs: mount failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestVfs: mount failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    bool ok = kernel_fs_selftest("/", 1, BigSize) == 0;
+    bool ok = kernel_fs_selftest("/", 1, BIG_SIZE) == 0;
 
     if (kernel_vfs_unmount("/", 1) != 0)
     {
-        Trace(0, "TestVfs: unmount failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestVfs: unmount failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     if (!ok)
     {
-        Trace(0, "TestVfs: self-test failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestVfs: self-test failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestVfs: complete");
-    return MakeSuccess();
+    trace(0, "TestVfs: complete");
+    return make_success();
 }
 
 /* The network layer's packet formats (src/rust/net/src/selftest.rs). A ping
@@ -2111,21 +2111,21 @@ Stdlib::Error TestVfs()
    checked here instead, against packets written out by hand. */
 extern "C" int rust_net_selftest();
 
-Stdlib::Error TestNetWire()
+stdlib::Error test_net_wire()
 {
-    Trace(0, "TestNetWire: started");
+    trace(0, "TestNetWire: started");
 
     if (rust_net_selftest() != 0)
     {
-        Trace(0, "TestNetWire: failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestNetWire: failed");
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    Trace(0, "TestNetWire: complete");
-    return MakeSuccess();
+    trace(0, "TestNetWire: complete");
+    return make_success();
 }
 
-static bool CountGrubEnvVar(const char* name, const char* value, void* ctx)
+static bool count_grub_env_var(const char* name, const char* value, void* ctx)
 {
     (void)name;
     (void)value;
@@ -2135,55 +2135,55 @@ static bool CountGrubEnvVar(const char* name, const char* value, void* ctx)
 }
 
 /* Does the block hold exactly this value for name? */
-static bool GrubEnvHas(Stdlib::GrubEnvBlock& env, const char* name, const char* expected)
+static bool grub_env_has(stdlib::GrubEnvBlock& env, const char* name, const char* expected)
 {
-    char value[Stdlib::GrubEnvBlock::MaxValueLen + 1];
-    return env.Get(name, value, sizeof(value)) && Stdlib::StrCmp(value, expected) == 0;
+    char value[stdlib::GrubEnvBlock::MAX_VALUE_LEN + 1];
+    return env.get(name, value, sizeof(value)) && stdlib::str_cmp(value, expected) == 0;
 }
 
-Stdlib::Error TestGrubEnv()
+stdlib::Error test_grub_env()
 {
-    Trace(0, "TestGrubEnv: started");
+    trace(0, "TestGrubEnv: started");
 
-    using Stdlib::GrubEnvBlock;
+    using stdlib::GrubEnvBlock;
 
-    char block[GrubEnvBlock::DefaultSize];
-    GrubEnvBlock::Format(block, sizeof(block));
+    char block[GrubEnvBlock::DEFAULT_SIZE];
+    GrubEnvBlock::format(block, sizeof(block));
     GrubEnvBlock env(block, sizeof(block));
-    char value[GrubEnvBlock::MaxValueLen + 1];
+    char value[GrubEnvBlock::MAX_VALUE_LEN + 1];
 
-    if (!env.IsValid() || env.Get("nos_next", value, sizeof(value)))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.is_valid() || env.get("nos_next", value, sizeof(value)))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Set, read back, and a second variable behind the first */
-    if (!env.Set("nos_next", "nos-next") || !env.Set("other", "x") ||
-        !GrubEnvHas(env, "nos_next", "nos-next") || !GrubEnvHas(env, "other", "x"))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.set("nos_next", "nos-next") || !env.set("other", "x") ||
+        !grub_env_has(env, "nos_next", "nos-next") || !grub_env_has(env, "other", "x"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* A longer value shifts the line behind it, intact; so does a shorter one */
-    if (!env.Set("nos_next", "nos-multiboot2") ||
-        !GrubEnvHas(env, "nos_next", "nos-multiboot2") || !GrubEnvHas(env, "other", "x"))
-        return MakeError(Stdlib::Error::Unsuccessful);
-    if (!env.Set("nos_next", "n") ||
-        !GrubEnvHas(env, "nos_next", "n") || !GrubEnvHas(env, "other", "x"))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.set("nos_next", "nos-multiboot2") ||
+        !grub_env_has(env, "nos_next", "nos-multiboot2") || !grub_env_has(env, "other", "x"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    if (!env.set("nos_next", "n") ||
+        !grub_env_has(env, "nos_next", "n") || !grub_env_has(env, "other", "x"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* What GRUB leaves behind when it clears a flag: the name, nothing after '=' */
-    if (!env.Set("nos_next", "") || !GrubEnvHas(env, "nos_next", ""))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.set("nos_next", "") || !grub_env_has(env, "nos_next", ""))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Escapes go on and come off */
-    if (!env.Set("esc", "a\\b") || !GrubEnvHas(env, "esc", "a\\b"))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.set("esc", "a\\b") || !grub_env_has(env, "esc", "a\\b"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     ulong count = 0;
-    if (!env.ForEach(CountGrubEnvVar, &count) || count != 3)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.for_each(count_grub_env_var, &count) || count != 3)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* Unset closes the gap; a second unset finds nothing */
-    if (!env.Unset("nos_next") || env.Get("nos_next", value, sizeof(value)) ||
-        env.Unset("nos_next") || !GrubEnvHas(env, "other", "x") || !GrubEnvHas(env, "esc", "a\\b"))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.unset("nos_next") || env.get("nos_next", value, sizeof(value)) ||
+        env.unset("nos_next") || !grub_env_has(env, "other", "x") || !grub_env_has(env, "esc", "a\\b"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* The layout GRUB's own writer insists on: lines, a newline, '#' to the end */
     {
@@ -2191,70 +2191,70 @@ Stdlib::Error TestGrubEnv()
         while (pos > 0 && block[pos - 1] == '#')
             pos--;
         if (pos == sizeof(block) || block[pos - 1] != '\n')
-            return MakeError(Stdlib::Error::Unsuccessful);
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* A name GRUB would not take, and a value there is no room for, leave
        the block as it was */
     char copy[sizeof(block)];
-    Stdlib::MemCpy(copy, block, sizeof(block));
-    if (env.Set("bad name", "x") || env.Set("", "x") || env.Set("a=b", "x") ||
-        Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
+    stdlib::mem_cpy(copy, block, sizeof(block));
+    if (env.set("bad name", "x") || env.set("", "x") || env.set("a=b", "x") ||
+        stdlib::mem_cmp(copy, block, sizeof(block)) != 0)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    char big[GrubEnvBlock::MaxValueLen + 1];
-    Stdlib::MemSet(big, 'v', sizeof(big) - 1);
+    char big[GrubEnvBlock::MAX_VALUE_LEN + 1];
+    stdlib::mem_set(big, 'v', sizeof(big) - 1);
     big[sizeof(big) - 1] = '\0';
     bool full = false;
     for (ulong i = 0; i < 8 && !full; i++)
     {
         char name[8];
-        Stdlib::SnPrintf(name, sizeof(name), "big%lu", i);
-        Stdlib::MemCpy(copy, block, sizeof(block));
-        if (!env.Set(name, big))
+        stdlib::sn_printf(name, sizeof(name), "big%lu", i);
+        stdlib::mem_cpy(copy, block, sizeof(block));
+        if (!env.set(name, big))
         {
-            if (Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
-                return MakeError(Stdlib::Error::Unsuccessful);
+            if (stdlib::mem_cmp(copy, block, sizeof(block)) != 0)
+                return make_error(stdlib::Error::UNSUCCESSFUL);
             full = true;
         }
     }
-    if (!full || !GrubEnvHas(env, "other", "x"))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!full || !grub_env_has(env, "other", "x"))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
     /* A comment line, as grub-editenv writes one, is passed over */
     {
-        static const char comment[] = "# WARNING: Do not edit this file by hand\n";
-        static const char line[] = "a=1\n";
-        GrubEnvBlock::Format(block, sizeof(block));
-        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen, comment, sizeof(comment) - 1);
-        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen + sizeof(comment) - 1, line, sizeof(line) - 1);
-        if (!GrubEnvHas(env, "a", "1") || !env.Set("b", "2") ||
-            !GrubEnvHas(env, "a", "1") || !GrubEnvHas(env, "b", "2") ||
-            Stdlib::MemCmp(block + GrubEnvBlock::SignatureLen, comment, sizeof(comment) - 1) != 0)
-            return MakeError(Stdlib::Error::Unsuccessful);
+        static const char COMMENT[] = "# WARNING: Do not edit this file by hand\n";
+        static const char LINE[] = "a=1\n";
+        GrubEnvBlock::format(block, sizeof(block));
+        stdlib::mem_cpy(block + GrubEnvBlock::SIGNATURE_LEN, COMMENT, sizeof(COMMENT) - 1);
+        stdlib::mem_cpy(block + GrubEnvBlock::SIGNATURE_LEN + sizeof(COMMENT) - 1, LINE, sizeof(LINE) - 1);
+        if (!grub_env_has(env, "a", "1") || !env.set("b", "2") ||
+            !grub_env_has(env, "a", "1") || !grub_env_has(env, "b", "2") ||
+            stdlib::mem_cmp(block + GrubEnvBlock::SIGNATURE_LEN, COMMENT, sizeof(COMMENT) - 1) != 0)
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* A line with no '=' would lend its text to the next line's name as
        ForEach -- and GRUB -- read it, while Set would find "a" on a line of
        its own: the block is malformed, and Set and Unset leave it as it was */
     {
-        static const char lines[] = "b\na=1\n";
-        GrubEnvBlock::Format(block, sizeof(block));
-        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen, lines, sizeof(lines) - 1);
-        Stdlib::MemCpy(copy, block, sizeof(block));
+        static const char LINES[] = "b\na=1\n";
+        GrubEnvBlock::format(block, sizeof(block));
+        stdlib::mem_cpy(block + GrubEnvBlock::SIGNATURE_LEN, LINES, sizeof(LINES) - 1);
+        stdlib::mem_cpy(copy, block, sizeof(block));
         count = 0;
-        if (env.ForEach(CountGrubEnvVar, &count) || env.Set("a", "2") || env.Unset("a") ||
-            Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
-            return MakeError(Stdlib::Error::Unsuccessful);
+        if (env.for_each(count_grub_env_var, &count) || env.set("a", "2") || env.unset("a") ||
+            stdlib::mem_cmp(copy, block, sizeof(block)) != 0)
+            return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Not a block at all */
     block[0] = 'x';
-    if (env.IsValid() || env.Set("nos_next", "nos-next") || env.Get("a", value, sizeof(value)))
-        return MakeError(Stdlib::Error::Unsuccessful);
+    if (env.is_valid() || env.set("nos_next", "nos-next") || env.get("a", value, sizeof(value)))
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestGrubEnv: complete");
-    return MakeSuccess();
+    trace(0, "TestGrubEnv: complete");
+    return make_success();
 }
 
 /* modtest.ko -- src/rust/modules/modtest as the Makefile builds it --
@@ -2266,45 +2266,45 @@ extern "C" const ulong nos_modtest_ko_size;
    has to name it back, out of the function table the build put in the .ko --
    and the kernel's own functions still by the kernel's table, with an
    address in neither left unnamed. */
-static Stdlib::Error CheckSymbolizer(const char* output)
+static stdlib::Error check_symbolizer(const char* output)
 {
-    static const char Marker[] = "double at ";
-    static const ulong DigitsMax = 24;
+    static const char MARKER[] = "double at ";
+    static const ulong DIGITS_MAX = 24;
 
-    const char* at = Stdlib::StrStr(output, Marker);
+    const char* at = stdlib::str_str(output, MARKER);
     if (at == nullptr)
     {
-        Trace(0, "TestModules: no address in: %s", output);
-        return MakeError(Stdlib::Error::NotFound);
+        trace(0, "TestModules: no address in: %s", output);
+        return make_error(stdlib::Error::NOT_FOUND);
     }
 
-    char digits[DigitsMax];
+    char digits[DIGITS_MAX];
     ulong n = 0;
-    at += sizeof(Marker) - 1;
+    at += sizeof(MARKER) - 1;
     for (; n < sizeof(digits) - 1 && at[n] >= '0' && at[n] <= '9'; n++)
         digits[n] = at[n];
     digits[n] = '\0';
 
-    auto& symtab = SymbolTable::GetInstance();
-    char where[SymbolTable::DescribeMax];
+    auto& symtab = SymbolTable::get_instance();
+    char where[SymbolTable::DESCRIBE_MAX];
     where[0] = '\0';
     ulong addr = 0;
-    if (!Stdlib::ParseUlong(digits, addr) ||
-        !symtab.Describe(addr, where, sizeof(where)) ||
-        Stdlib::StrStr(where, "mod_modtest::double+0x") == nullptr ||
-        Stdlib::StrStr(where, "[modtest]") == nullptr)
+    if (!stdlib::parse_ulong(digits, addr) ||
+        !symtab.describe(addr, where, sizeof(where)) ||
+        stdlib::str_str(where, "mod_modtest::double+0x") == nullptr ||
+        stdlib::str_str(where, "[modtest]") == nullptr)
     {
-        Trace(0, "TestModules: modtest's double() at 0x%lX named '%s'", addr, where);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: modtest's double() at 0x%lX named '%s'", addr, where);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     where[0] = '\0';
-    if (!symtab.Describe(reinterpret_cast<ulong>(&CheckSymbolizer), where, sizeof(where)) ||
-        Stdlib::StrStr(where, "CheckSymbolizer") == nullptr ||
-        symtab.Describe(0, where, sizeof(where)))
+    if (!symtab.describe(reinterpret_cast<ulong>(&check_symbolizer), where, sizeof(where)) ||
+        stdlib::str_str(where, "CheckSymbolizer") == nullptr ||
+        symtab.describe(0, where, sizeof(where)))
     {
-        Trace(0, "TestModules: the kernel's own named '%s'", where);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: the kernel's own named '%s'", where);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* A backtrace's frames are return addresses, named by the call before
@@ -2312,54 +2312,54 @@ static Stdlib::Error CheckSymbolizer(const char* output)
        kernel and in a module alike -- and one at a function's first byte is
        the end of whatever precedes it, which is what a call that does not
        return leaves on the stack, never the function at +0x0 */
-    const ulong self = reinterpret_cast<ulong>(&CheckSymbolizer);
+    const ulong self = reinterpret_cast<ulong>(&check_symbolizer);
     where[0] = '\0';
-    if (!symtab.DescribeReturn(self + 1, where, sizeof(where)) ||
-        Stdlib::StrStr(where, "CheckSymbolizer+0x1") == nullptr)
+    if (!symtab.describe_return(self + 1, where, sizeof(where)) ||
+        stdlib::str_str(where, "CheckSymbolizer+0x1") == nullptr)
     {
-        Trace(0, "TestModules: a return address a byte into CheckSymbolizer named '%s'", where);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: a return address a byte into CheckSymbolizer named '%s'", where);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     where[0] = '\0';
-    if (symtab.DescribeReturn(self, where, sizeof(where)) &&
-        Stdlib::StrStr(where, "CheckSymbolizer+0x0") != nullptr)
+    if (symtab.describe_return(self, where, sizeof(where)) &&
+        stdlib::str_str(where, "CheckSymbolizer+0x0") != nullptr)
     {
-        Trace(0, "TestModules: a return address at CheckSymbolizer's start named '%s'", where);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: a return address at CheckSymbolizer's start named '%s'", where);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     where[0] = '\0';
-    if (!symtab.DescribeReturn(addr + 1, where, sizeof(where)) ||
-        Stdlib::StrStr(where, "mod_modtest::double+0x1 [modtest]") == nullptr ||
-        symtab.DescribeReturn(0, where, sizeof(where)))
+    if (!symtab.describe_return(addr + 1, where, sizeof(where)) ||
+        stdlib::str_str(where, "mod_modtest::double+0x1 [modtest]") == nullptr ||
+        symtab.describe_return(0, where, sizeof(where)))
     {
-        Trace(0, "TestModules: a return address a byte into modtest's double() named '%s'", where);
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: a return address a byte into modtest's double() named '%s'", where);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    return MakeSuccess();
+    return make_success();
 }
 
 /* Overwrite every occurrence of from with to, a string as long */
-static void PatchAll(u8* buf, ulong size, const char* from, const char* to)
+static void patch_all(u8* buf, ulong size, const char* from, const char* to)
 {
-    const ulong len = Stdlib::StrLen(from);
-    if (Stdlib::StrLen(to) != len)
+    const ulong len = stdlib::str_len(from);
+    if (stdlib::str_len(to) != len)
         return;
 
     for (ulong i = 0; i + len <= size; i++)
     {
-        if (Stdlib::MemCmp(buf + i, from, len) == 0)
-            Stdlib::MemCpy(buf + i, to, len);
+        if (stdlib::mem_cmp(buf + i, from, len) == 0)
+            stdlib::mem_cpy(buf + i, to, len);
     }
 }
 
 /* Flip a bit of the byte offset bytes past the first occurrence of marker */
-static void FlipAfter(u8* buf, ulong size, const char* marker, ulong offset)
+static void flip_after(u8* buf, ulong size, const char* marker, ulong offset)
 {
-    const ulong len = Stdlib::StrLen(marker);
+    const ulong len = stdlib::str_len(marker);
     for (ulong i = 0; i + len <= size; i++)
     {
-        if (Stdlib::MemCmp(buf + i, marker, len) == 0)
+        if (stdlib::mem_cmp(buf + i, marker, len) == 0)
         {
             if (i + offset < size)
                 buf[i + offset] ^= 1;
@@ -2372,216 +2372,216 @@ static void FlipAfter(u8* buf, ulong size, const char* marker, ulong offset)
    and Backspace alone, and this is the row they make. Backspace on an empty
    row would have erased the line above it, and a row past what the editor
    ever shows is a redraw that forgot what was there: either breaks it. */
-class EditorScreen final : public Stdlib::Printer
+class EditorScreen final : public stdlib::Printer
 {
 public:
     EditorScreen()
-        : Len(0)
-        , Broken(false)
+        : len_(0)
+        , broken_(false)
     {
-        Row[0] = '\0';
+        row_[0] = '\0';
     }
 
-    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
-        VPrintf(fmt, args);
+        v_printf(fmt, args);
         va_end(args);
     }
 
-    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void v_printf(const char *fmt, va_list args) override
     {
-        char text[RowMax + 1];
-        if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
+        char text[ROW_MAX + 1];
+        if (stdlib::vsn_printf(text, sizeof(text), fmt, args) < 0)
             return;
-        PrintString(text);
+        print_string(text);
     }
 
-    virtual void PrintString(const char *s) override
+    virtual void print_string(const char *s) override
     {
         for (; *s != '\0'; s++)
         {
             if (*s == '\n')
-                Len = 0;
-            else if (Len < RowMax)
-                Row[Len++] = *s;
+                len_ = 0;
+            else if (len_ < ROW_MAX)
+                row_[len_++] = *s;
             else
-                Broken = true;
-            Row[Len] = '\0';
+                broken_ = true;
+            row_[len_] = '\0';
         }
     }
 
-    virtual void Backspace() override
+    virtual void backspace() override
     {
-        if (Len == 0)
-            Broken = true;
+        if (len_ == 0)
+            broken_ = true;
         else
-            Row[--Len] = '\0';
+            row_[--len_] = '\0';
     }
 
     /* The row is want, and nothing broke on the way */
-    bool Shows(const char* want, ulong step) const
+    bool shows(const char* want, ulong step) const
     {
-        if (!Broken && Stdlib::StrCmp(Row, want) == 0)
+        if (!broken_ && stdlib::str_cmp(row_, want) == 0)
             return true;
-        Trace(0, "TestLineEditor: step %lu shows '%s'%s, not '%s'", step, Row,
-            Broken ? " (broken)" : "", want);
+        trace(0, "TestLineEditor: step %lu shows '%s'%s, not '%s'", step, row_,
+            broken_ ? " (broken)" : "", want);
         return false;
     }
 
 private:
-    static const ulong RowMax = 256;
+    static const ulong ROW_MAX = 256;
 
-    char Row[RowMax + 1];
-    ulong Len;
-    bool Broken;
+    char row_[ROW_MAX + 1];
+    ulong len_;
+    bool broken_;
 };
 
 /* Types keys at the editor as the shell does: a line it ends is counted and
    kept in line, and the next prompt shown */
-static void TypeAt(LineEditor& ed, EditorScreen& screen, const char* keys, ulong& lines, const char*& line)
+static void type_at(LineEditor& ed, EditorScreen& screen, const char* keys, ulong& lines, const char*& line)
 {
     for (; *keys != '\0'; keys++)
     {
-        if (ed.Key(*keys, screen))
+        if (ed.key(*keys, screen))
         {
             lines++;
-            line = ed.GetLine();
-            ed.Prompt(screen);
+            line = ed.get_line();
+            ed.prompt(screen);
         }
     }
 }
 
-static bool TestLineEditorOn(LineEditor& ed)
+static bool test_line_editor_on(LineEditor& ed)
 {
     EditorScreen screen;
     ulong lines = 0;
     const char* line = "";
 
-    ed.Prompt(screen);
-    if (!screen.Shows("$", 1))
+    ed.prompt(screen);
+    if (!screen.shows("$", 1))
         return false;
 
     /* Three lines run, a blank one not kept, the same line twice kept once */
-    TypeAt(ed, screen, "echo one\necho two\n   \nls\nls\n", lines, line);
-    if (lines != 5 || Stdlib::StrCmp(line, "ls") != 0 || !screen.Shows("$", 2))
+    type_at(ed, screen, "echo one\necho two\n   \nls\nls\n", lines, line);
+    if (lines != 5 || stdlib::str_cmp(line, "ls") != 0 || !screen.shows("$", 2))
         return false;
 
     /* Up goes back to the oldest and no further, Down forward to what was
        being typed; ^P and ^N are the same; an edited line runs as edited */
-    TypeAt(ed, screen, "dr\x1b[A", lines, line);
-    if (!screen.Shows("$ls", 3))
+    type_at(ed, screen, "dr\x1b[A", lines, line);
+    if (!screen.shows("$ls", 3))
         return false;
-    TypeAt(ed, screen, "\x1b[A\x1bOA\x1b[A", lines, line);
-    if (!screen.Shows("$echo one", 4))
+    type_at(ed, screen, "\x1b[A\x1bOA\x1b[A", lines, line);
+    if (!screen.shows("$echo one", 4))
         return false;
-    TypeAt(ed, screen, "\x0e\x0e", lines, line);
-    if (!screen.Shows("$ls", 5))
+    type_at(ed, screen, "\x0e\x0e", lines, line);
+    if (!screen.shows("$ls", 5))
         return false;
-    TypeAt(ed, screen, "\x1b[B", lines, line);
-    if (!screen.Shows("$dr", 6))
+    type_at(ed, screen, "\x1b[B", lines, line);
+    if (!screen.shows("$dr", 6))
         return false;
-    TypeAt(ed, screen, "\x1b[B\x10\x7f\x08ls -l\n", lines, line);
-    if (lines != 6 || Stdlib::StrCmp(line, "ls -l") != 0 || !screen.Shows("$", 7))
+    type_at(ed, screen, "\x1b[B\x10\x7f\x08ls -l\n", lines, line);
+    if (lines != 6 || stdlib::str_cmp(line, "ls -l") != 0 || !screen.shows("$", 7))
         return false;
 
     /* ^R finds the newest line holding the query, ^R again an older one, and
        Enter runs it; history: echo one, echo two, ls, ls -l */
-    TypeAt(ed, screen, "\x12" "ech", lines, line);
-    if (!screen.Shows("(reverse-i-search)'ech': echo two", 8))
+    type_at(ed, screen, "\x12" "ech", lines, line);
+    if (!screen.shows("(reverse-i-search)'ech': echo two", 8))
         return false;
-    TypeAt(ed, screen, "\x12", lines, line);
-    if (!screen.Shows("(reverse-i-search)'ech': echo one", 9))
+    type_at(ed, screen, "\x12", lines, line);
+    if (!screen.shows("(reverse-i-search)'ech': echo one", 9))
         return false;
-    TypeAt(ed, screen, "\x12", lines, line);
-    if (!screen.Shows("(failed reverse-i-search)'ech': echo one", 10))
+    type_at(ed, screen, "\x12", lines, line);
+    if (!screen.shows("(failed reverse-i-search)'ech': echo one", 10))
         return false;
-    TypeAt(ed, screen, "\n", lines, line);
-    if (lines != 7 || Stdlib::StrCmp(line, "echo one") != 0 || !screen.Shows("$", 11))
+    type_at(ed, screen, "\n", lines, line);
+    if (lines != 7 || stdlib::str_cmp(line, "echo one") != 0 || !screen.shows("$", 11))
         return false;
 
     /* A query that fails, made shorter, finds again from the newest line;
        ^G puts back the line from before the search */
-    TypeAt(ed, screen, "x\x12lz", lines, line);
-    if (!screen.Shows("(failed reverse-i-search)'lz': ls -l", 12))
+    type_at(ed, screen, "x\x12lz", lines, line);
+    if (!screen.shows("(failed reverse-i-search)'lz': ls -l", 12))
         return false;
-    TypeAt(ed, screen, "\x08", lines, line);
-    if (!screen.Shows("(reverse-i-search)'l': ls -l", 13))
+    type_at(ed, screen, "\x08", lines, line);
+    if (!screen.shows("(reverse-i-search)'l': ls -l", 13))
         return false;
-    TypeAt(ed, screen, "\x7f", lines, line);
-    if (!screen.Shows("(reverse-i-search)'': x", 14))
+    type_at(ed, screen, "\x7f", lines, line);
+    if (!screen.shows("(reverse-i-search)'': x", 14))
         return false;
-    TypeAt(ed, screen, "two\x07", lines, line);
-    if (!screen.Shows("$x", 15))
+    type_at(ed, screen, "two\x07", lines, line);
+    if (!screen.shows("$x", 15))
         return false;
 
     /* Any other key keeps what was found, to be edited, and Up and Down go
        on from it; Down past the newest gives back the line from before */
-    TypeAt(ed, screen, "\x12two\x1b[D", lines, line);
-    if (!screen.Shows("$echo two", 16))
+    type_at(ed, screen, "\x12two\x1b[D", lines, line);
+    if (!screen.shows("$echo two", 16))
         return false;
-    TypeAt(ed, screen, "\x1b[A", lines, line);
-    if (!screen.Shows("$echo one", 17))
+    type_at(ed, screen, "\x1b[A", lines, line);
+    if (!screen.shows("$echo one", 17))
         return false;
-    TypeAt(ed, screen, "\x1b[B\x1b[B\x1b[B\x1b[B", lines, line);
-    if (!screen.Shows("$echo one", 18))
+    type_at(ed, screen, "\x1b[B\x1b[B\x1b[B\x1b[B", lines, line);
+    if (!screen.shows("$echo one", 18))
         return false;
-    TypeAt(ed, screen, "\x1b[B", lines, line);
-    if (!screen.Shows("$x", 19))
+    type_at(ed, screen, "\x1b[B", lines, line);
+    if (!screen.shows("$x", 19))
         return false;
 
     /* ^C drops the line and ^U clears it; a sequence a control key cuts
        short leaves the key to be itself */
-    TypeAt(ed, screen, "\x03", lines, line);
-    if (lines != 7 || !screen.Shows("$", 20))
+    type_at(ed, screen, "\x03", lines, line);
+    if (lines != 7 || !screen.shows("$", 20))
         return false;
-    TypeAt(ed, screen, "abc\x15" "def\x1b[\n", lines, line);
-    if (lines != 8 || Stdlib::StrCmp(line, "def") != 0 || !screen.Shows("$", 21))
+    type_at(ed, screen, "abc\x15" "def\x1b[\n", lines, line);
+    if (lines != 8 || stdlib::str_cmp(line, "def") != 0 || !screen.shows("$", 21))
         return false;
 
     /* A line stops at LineMax */
-    for (ulong i = 0; i < LineEditor::LineMax + 10; i++)
-        TypeAt(ed, screen, "a", lines, line);
-    TypeAt(ed, screen, "\n", lines, line);
-    if (lines != 9 || Stdlib::StrLen(line) != LineEditor::LineMax)
+    for (ulong i = 0; i < LineEditor::LINE_LEN_MAX + 10; i++)
+        type_at(ed, screen, "a", lines, line);
+    type_at(ed, screen, "\n", lines, line);
+    if (lines != 9 || stdlib::str_len(line) != LineEditor::LINE_LEN_MAX)
         return false;
 
     /* Of more lines than it keeps, the oldest go */
-    for (ulong i = 0; i < LineEditor::HistoryMax + 8; i++)
+    for (ulong i = 0; i < LineEditor::HISTORY_MAX + 8; i++)
     {
         char cmd[16];
-        Stdlib::SnPrintf(cmd, sizeof(cmd), "c%lu\n", i);
-        TypeAt(ed, screen, cmd, lines, line);
+        stdlib::sn_printf(cmd, sizeof(cmd), "c%lu\n", i);
+        type_at(ed, screen, cmd, lines, line);
     }
-    for (ulong i = 0; i < LineEditor::HistoryMax + 4; i++)
-        TypeAt(ed, screen, "\x10", lines, line);
-    if (!screen.Shows("$c8", 22))
+    for (ulong i = 0; i < LineEditor::HISTORY_MAX + 4; i++)
+        type_at(ed, screen, "\x10", lines, line);
+    if (!screen.shows("$c8", 22))
         return false;
-    TypeAt(ed, screen, "\x15", lines, line);
+    type_at(ed, screen, "\x15", lines, line);
 
-    return screen.Shows("$", 23);
+    return screen.shows("$", 23);
 }
 
 /* The console's line editor (kernel/line_editor.h): history, Up and Down,
    ^R's search, all on a screen of text and Backspace. cpp-fuzz.py's
    lineedit target holds it to a model over random keys. */
-Stdlib::Error TestLineEditor()
+stdlib::Error test_line_editor()
 {
-    Trace(0, "TestLineEditor: started");
+    trace(0, "TestLineEditor: started");
 
-    LineEditor* ed = new (Mm::NoThrow) LineEditor();
+    LineEditor* ed = new (mm::NO_THROW) LineEditor();
     if (ed == nullptr)
-        return MakeError(Stdlib::Error::NoMemory);
+        return make_error(stdlib::Error::NO_MEMORY);
 
-    bool ok = TestLineEditorOn(*ed);
+    bool ok = test_line_editor_on(*ed);
     delete ed;
 
     if (!ok)
-        return MakeError(Stdlib::Error::Unsuccessful);
+        return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    Trace(0, "TestLineEditor: complete");
-    return MakeSuccess();
+    trace(0, "TestLineEditor: complete");
+    return make_success();
 }
 
 /* The loader end to end, on modtest.ko. Loaded, the module runs its own
@@ -2593,102 +2593,102 @@ Stdlib::Error TestLineEditor()
    takes, refused; then damaged copies, which the loader must turn away --
    the last three only after mapping and relocating them, so the cleanup of
    a load that fails halfway runs too. */
-Stdlib::Error TestModules()
+stdlib::Error test_modules()
 {
     /* kmod::ModuleInfo: the magic "NOSM", the version, then the digest of the
        kernel interface the module was built against */
-    static const ulong HeaderAbiOffset = 8;
-    static const ulong DamageCount = 6;
-    static const ulong OutputSize = 1024;
+    static const ulong HEADER_ABI_OFFSET = 8;
+    static const ulong DAMAGE_COUNT = 6;
+    static const ulong OUTPUT_SIZE = 1024;
     /* What each round hands modtest's init, and what its command answers:
        42 + 10, what its checks computed, unless answer= says otherwise */
-    static const char* const RoundParams[] = { "", "answer=7" };
-    static const char* const RoundAnswers[] = {
+    static const char* const ROUND_PARAMS[] = { "", "answer=7" };
+    static const char* const ROUND_ANSWERS[] = {
         "modtest: answer 52 args '1 2'",
         "modtest: answer 7 args '1 2'",
     };
 
-    auto& modules = ModuleTable::GetInstance();
-    char output[OutputSize];
-    Stdlib::BufferPrinter out(output, sizeof(output));
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
 
     for (ulong round = 0; round < 2; round++)
     {
-        out.Reset();
-        Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, RoundParams[round], out);
-        if (!err.Ok())
+        out.reset();
+        stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, ROUND_PARAMS[round], out);
+        if (!err.ok())
         {
-            Trace(0, "TestModules: load failed: %s", out.Get());
+            trace(0, "TestModules: load failed: %s", out.get());
             return err;
         }
 
-        out.Reset();
-        Cmd::Dispatch("modtest 1 2", out);
-        if (Stdlib::StrStr(out.Get(), RoundAnswers[round]) == nullptr)
+        out.reset();
+        Cmd::dispatch("modtest 1 2", out);
+        if (stdlib::str_str(out.get(), ROUND_ANSWERS[round]) == nullptr)
         {
-            Trace(0, "TestModules: the module's command answered: %s", out.Get());
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestModules: the module's command answered: %s", out.get());
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
-        err = CheckSymbolizer(out.Get());
-        if (!err.Ok())
+        err = check_symbolizer(out.get());
+        if (!err.ok())
             return err;
 
-        out.Reset();
-        err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, "", out);
-        if (err.GetCode() != Stdlib::Error::AlreadyExists || !modules.IsLoaded("modtest"))
+        out.reset();
+        err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+        if (err.get_code() != stdlib::Error::ALREADY_EXISTS || !modules.is_loaded("modtest"))
         {
-            Trace(0, "TestModules: a second copy was not refused: %s", out.Get());
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestModules: a second copy was not refused: %s", out.get());
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
-        out.Reset();
-        err = modules.Unload("modtest", out);
-        if (!err.Ok() || modules.IsLoaded("modtest"))
+        out.reset();
+        err = modules.unload("modtest", out);
+        if (!err.ok() || modules.is_loaded("modtest"))
         {
-            Trace(0, "TestModules: unload failed: %s", out.Get());
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestModules: unload failed: %s", out.get());
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
-        out.Reset();
-        Cmd::Dispatch("modtest", out);
-        if (Stdlib::StrStr(out.Get(), "not found") == nullptr)
+        out.reset();
+        Cmd::dispatch("modtest", out);
+        if (stdlib::str_str(out.get(), "not found") == nullptr)
         {
-            Trace(0, "TestModules: the command outlived its module: %s", out.Get());
-            return MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestModules: the command outlived its module: %s", out.get());
+            return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
     /* A parameter it has not got: its init says so, and refuses the load */
-    out.Reset();
-    Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, "answr=7", out);
-    if (err.GetCode() != Stdlib::Error::Unsuccessful || modules.IsLoaded("modtest") ||
-        Stdlib::StrStr(out.Get(), "\"answr\" is not a parameter") == nullptr)
+    out.reset();
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "answr=7", out);
+    if (err.get_code() != stdlib::Error::UNSUCCESSFUL || modules.is_loaded("modtest") ||
+        stdlib::str_str(out.get(), "\"answr\" is not a parameter") == nullptr)
     {
-        Trace(0, "TestModules: an unknown parameter: error %lu: %s", (ulong)err.GetCode(), out.Get());
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: an unknown parameter: error %lu: %s", (ulong)err.get_code(), out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Longer than insmod hands on: refused before the module is looked at */
-    char longParams[ModuleTable::ParamsMax + 2];
-    Stdlib::MemSet(longParams, 'a', sizeof(longParams) - 1);
-    longParams[sizeof(longParams) - 1] = '\0';
-    out.Reset();
-    err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, longParams, out);
-    if (err.GetCode() != Stdlib::Error::InvalidValue || modules.IsLoaded("modtest"))
+    char long_params[ModuleTable::PARAMS_MAX + 2];
+    stdlib::mem_set(long_params, 'a', sizeof(long_params) - 1);
+    long_params[sizeof(long_params) - 1] = '\0';
+    out.reset();
+    err = modules.load(nos_modtest_ko, nos_modtest_ko_size, long_params, out);
+    if (err.get_code() != stdlib::Error::INVALID_VALUE || modules.is_loaded("modtest"))
     {
-        Trace(0, "TestModules: parameters too long: error %lu: %s", (ulong)err.GetCode(), out.Get());
-        return MakeError(Stdlib::Error::Unsuccessful);
+        trace(0, "TestModules: parameters too long: error %lu: %s", (ulong)err.get_code(), out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    u8* copy = static_cast<u8*>(Mm::Alloc(nos_modtest_ko_size, Tag));
+    u8* copy = static_cast<u8*>(mm::alloc(nos_modtest_ko_size, TAG));
     if (copy == nullptr)
-        return MakeError(Stdlib::Error::NoMemory);
+        return make_error(stdlib::Error::NO_MEMORY);
 
-    Stdlib::Error result = MakeSuccess();
-    for (ulong i = 0; i < DamageCount && result.Ok(); i++)
+    stdlib::Error result = make_success();
+    for (ulong i = 0; i < DAMAGE_COUNT && result.ok(); i++)
     {
-        Stdlib::MemCpy(copy, nos_modtest_ko, nos_modtest_ko_size);
+        stdlib::mem_cpy(copy, nos_modtest_ko, nos_modtest_ko_size);
         ulong size = nos_modtest_ko_size;
         const char* what;
         int expected;
@@ -2697,162 +2697,162 @@ Stdlib::Error TestModules()
         {
         case 0:
             what = "a truncated header";
-            size = sizeof(Elf::Ehdr) - 1;
-            expected = Stdlib::Error::BadMagic;
+            size = sizeof(elf::Ehdr) - 1;
+            expected = stdlib::Error::BAD_MAGIC;
             break;
         case 1:
             what = "another machine's";
-            reinterpret_cast<Elf::Ehdr*>(copy)->Machine = 0;
-            expected = Stdlib::Error::InvalidValue;
+            reinterpret_cast<elf::Ehdr*>(copy)->machine = 0;
+            expected = stdlib::Error::INVALID_VALUE;
             break;
         case 2:
             what = "an import the kernel lacks";
-            PatchAll(copy, size, "kernel_trace", "kernel_trac3");
-            expected = Stdlib::Error::NotFound;
+            patch_all(copy, size, "kernel_trace", "kernel_trac3");
+            expected = stdlib::Error::NOT_FOUND;
             break;
         case 3:
             what = "no module header";
-            PatchAll(copy, size, "nos_module_info", "nos_module_inf0");
-            expected = Stdlib::Error::NotFound;
+            patch_all(copy, size, "nos_module_info", "nos_module_inf0");
+            expected = stdlib::Error::NOT_FOUND;
             break;
         case 4:
             what = "a bad header magic";
-            PatchAll(copy, size, "NOSM", "NOSX");
-            expected = Stdlib::Error::BadMagic;
+            patch_all(copy, size, "NOSM", "NOSX");
+            expected = stdlib::Error::BAD_MAGIC;
             break;
         default:
             what = "another kernel interface";
-            FlipAfter(copy, size, "NOSM", HeaderAbiOffset);
-            expected = Stdlib::Error::InvalidValue;
+            flip_after(copy, size, "NOSM", HEADER_ABI_OFFSET);
+            expected = stdlib::Error::INVALID_VALUE;
             break;
         }
 
-        out.Reset();
-        err = modules.Load(copy, size, "", out);
-        if (err.GetCode() != expected || modules.IsLoaded("modtest"))
+        out.reset();
+        err = modules.load(copy, size, "", out);
+        if (err.get_code() != expected || modules.is_loaded("modtest"))
         {
-            Trace(0, "TestModules: %s: error %lu, expected %lu: %s", what,
-                (ulong)err.GetCode(), (ulong)expected, out.Get());
-            result = MakeError(Stdlib::Error::Unsuccessful);
+            trace(0, "TestModules: %s: error %lu, expected %lu: %s", what,
+                (ulong)err.get_code(), (ulong)expected, out.get());
+            result = make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    Mm::Free(copy);
-    if (!result.Ok())
+    mm::free(copy);
+    if (!result.ok())
         return result;
 
-    Trace(0, "TestModules: complete");
-    return MakeSuccess();
+    trace(0, "TestModules: complete");
+    return make_success();
 }
 
-Stdlib::Error Test()
+stdlib::Error test()
 {
-    Stdlib::Error err;
+    stdlib::Error err;
 
-    Trace(0, "Self-test in progress, please wait...");
+    trace(0, "Self-test in progress, please wait...");
 
-    err = TestAllocator();
-    if (!err.Ok())
+    err = test_allocator();
+    if (!err.ok())
         return err;
 
-    err = TestMemRoutines();
-    if (!err.Ok())
+    err = test_mem_routines();
+    if (!err.ok())
         return err;
 
-    err = TestCrc32();
-    if (!err.Ok())
+    err = test_crc32();
+    if (!err.ok())
         return err;
 
-    err = TestRingBuffer();
-    if (!err.Ok())
+    err = test_ring_buffer();
+    if (!err.ok())
         return err;
 
-    err = TestStackTrace();
-    if (!err.Ok())
+    err = test_stack_trace();
+    if (!err.ok())
         return err;
 
-    err = TestParseUlong();
-    if (!err.Ok())
+    err = test_parse_ulong();
+    if (!err.ok())
         return err;
 
-    err = TestParameters();
-    if (!err.Ok())
+    err = test_parameters();
+    if (!err.ok())
         return err;
 
-    err = TestHexCharToNibble();
-    if (!err.Ok())
+    err = test_hex_char_to_nibble();
+    if (!err.ok())
         return err;
 
-    err = TestHexDecode();
-    if (!err.Ok())
+    err = test_hex_decode();
+    if (!err.ok())
         return err;
 
-    err = TestNextToken();
-    if (!err.Ok())
+    err = test_next_token();
+    if (!err.ok())
         return err;
 
-    err = TestBlockDeviceTable();
-    if (!err.Ok())
+    err = test_block_device_table();
+    if (!err.ok())
         return err;
 
-    err = TestContiguousPages();
-    if (!err.Ok())
+    err = test_contiguous_pages();
+    if (!err.ok())
         return err;
 
-    err = TestPageAllocator();
-    if (!err.Ok())
+    err = test_page_allocator();
+    if (!err.ok())
         return err;
 
-    err = TestMemSet();
-    if (!err.Ok())
+    err = test_mem_set();
+    if (!err.ok())
         return err;
 
-    err = TestMemCpy();
-    if (!err.Ok())
+    err = test_mem_cpy();
+    if (!err.ok())
         return err;
 
-    err = TestMemMove();
-    if (!err.Ok())
+    err = test_mem_move();
+    if (!err.ok())
         return err;
 
-    err = TestMemCmp();
-    if (!err.Ok())
+    err = test_mem_cmp();
+    if (!err.ok())
         return err;
 
-    err = TestStrLen();
-    if (!err.Ok())
+    err = test_str_len();
+    if (!err.ok())
         return err;
 
-    err = TestStrCmp();
-    if (!err.Ok())
+    err = test_str_cmp();
+    if (!err.ok())
         return err;
 
-    err = TestStrStr();
-    if (!err.Ok())
+    err = test_str_str();
+    if (!err.ok())
         return err;
 
-    err = TestSnPrintf();
-    if (!err.Ok())
+    err = test_sn_printf();
+    if (!err.ok())
         return err;
 
-    err = TestNetWire();
-    if (!err.Ok())
+    err = test_net_wire();
+    if (!err.ok())
         return err;
 
-    err = TestGrubEnv();
-    if (!err.Ok())
+    err = test_grub_env();
+    if (!err.ok())
         return err;
 
-    err = TestLineEditor();
-    if (!err.Ok())
+    err = test_line_editor();
+    if (!err.ok())
         return err;
 
-    err = TestVfs();
-    if (!err.Ok())
+    err = test_vfs();
+    if (!err.ok())
         return err;
 
-    err = TestModules();
-    if (!err.Ok())
+    err = test_modules();
+    if (!err.ok())
         return err;
 
     return err;
@@ -2864,78 +2864,78 @@ Stdlib::Error Test()
    succeeds, through the IRQ-saving SpinLock, and through both sides of a
    RawRwSpinLock. Run first thing in TestMultiTasking, which every CPU calls
    in task context with interrupts and preemption on. */
-static bool TestSpinLockPreempt()
+static bool test_spin_lock_preempt()
 {
-    if (!PreemptCanBlock())
+    if (!preempt_can_block())
     {
-        Trace(0, "TestSpinLockPreempt: cannot block before any lock is taken");
+        trace(0, "TestSpinLockPreempt: cannot block before any lock is taken");
         return false;
     }
 
     RawSpinLock outer;
     RawSpinLock inner;
 
-    outer.Lock();
-    bool underOuter = !PreemptCanBlock();
-    bool innerTaken = inner.TryLock();
-    bool outerTakenTwice = outer.TryLock();
-    outer.Unlock();
-    bool underInner = !PreemptCanBlock();
-    if (innerTaken)
-        inner.Unlock();
-    bool released = PreemptCanBlock();
+    outer.lock();
+    bool under_outer = !preempt_can_block();
+    bool inner_taken = inner.try_lock();
+    bool outer_taken_twice = outer.try_lock();
+    outer.unlock();
+    bool under_inner = !preempt_can_block();
+    if (inner_taken)
+        inner.unlock();
+    bool released = preempt_can_block();
 
     SpinLock spin;
-    bool underSpin;
+    bool under_spin;
     {
-        Stdlib::AutoLock lock(spin);
-        underSpin = !PreemptCanBlock();
+        stdlib::AutoLock lock(spin);
+        under_spin = !preempt_can_block();
     }
-    bool releasedSpin = PreemptCanBlock();
+    bool released_spin = preempt_can_block();
 
     /* The reader-writer lock, both sides: two readers nested on it, their
        counts coming back through ReadUnlock(), then a writer alone. */
     RawRwSpinLock rw;
-    Task* reader = rw.ReadLock();
-    Task* nested = rw.ReadLock();
-    bool underReads = !PreemptCanBlock();
-    rw.ReadUnlock(nested);
-    bool underRead = !PreemptCanBlock();
-    rw.ReadUnlock(reader);
-    bool releasedRead = PreemptCanBlock();
-    rw.WriteLock();
-    bool underWrite = !PreemptCanBlock();
-    rw.WriteUnlock();
-    bool releasedWrite = PreemptCanBlock();
+    Task* reader = rw.read_lock();
+    Task* nested = rw.read_lock();
+    bool under_reads = !preempt_can_block();
+    rw.read_unlock(nested);
+    bool under_read = !preempt_can_block();
+    rw.read_unlock(reader);
+    bool released_read = preempt_can_block();
+    rw.write_lock();
+    bool under_write = !preempt_can_block();
+    rw.write_unlock();
+    bool released_write = preempt_can_block();
 
-    if (!underOuter || !innerTaken || outerTakenTwice || !underInner ||
-        !released || !underSpin || !releasedSpin || !underReads ||
-        !underRead || !releasedRead || !underWrite || !releasedWrite)
+    if (!under_outer || !inner_taken || outer_taken_twice || !under_inner ||
+        !released || !under_spin || !released_spin || !under_reads ||
+        !under_read || !released_read || !under_write || !released_write)
     {
-        Trace(0, "TestSpinLockPreempt: outer %lu inner %lu twice %lu "
+        trace(0, "TestSpinLockPreempt: outer %lu inner %lu twice %lu "
             "under inner %lu released %lu spin %lu released spin %lu",
-            (ulong)underOuter, (ulong)innerTaken, (ulong)outerTakenTwice,
-            (ulong)underInner, (ulong)released, (ulong)underSpin,
-            (ulong)releasedSpin);
-        Trace(0, "TestSpinLockPreempt: rw reads %lu read %lu released %lu "
-            "write %lu released %lu", (ulong)underReads, (ulong)underRead,
-            (ulong)releasedRead, (ulong)underWrite, (ulong)releasedWrite);
+            (ulong)under_outer, (ulong)inner_taken, (ulong)outer_taken_twice,
+            (ulong)under_inner, (ulong)released, (ulong)under_spin,
+            (ulong)released_spin);
+        trace(0, "TestSpinLockPreempt: rw reads %lu read %lu released %lu "
+            "write %lu released %lu", (ulong)under_reads, (ulong)under_read,
+            (ulong)released_read, (ulong)under_write, (ulong)released_write);
         return false;
     }
 
     return true;
 }
 
-void TestMultiTaskingTaskFunc(void *ctx)
+void test_multi_tasking_task_func(void *ctx)
 {
     (void)ctx;
 
     for (size_t i = 0; i < 2; i++)
     {
-        auto& cpu = GetCpu();
-        auto task = Task::GetCurrentTask();
-        Trace(TestLL, "Hello from task 0x%p pid %lu cpu %lu", task, task->Pid, cpu.GetIndex());
-        Sleep(100 * Const::NanoSecsInMs);
+        auto& cpu = get_cpu();
+        auto task = Task::get_current_task();
+        trace(TEST_LL, "Hello from task 0x%p pid %lu cpu %lu", task, task->pid_, cpu.get_index());
+        sleep(100 * consts::NANO_SECS_IN_MS);
     }
 }
 
@@ -2948,57 +2948,57 @@ void TestMultiTaskingTaskFunc(void *ctx)
    spins, interrupts off, until the TLB shootdown watchdog panics. */
 struct EventPingPong
 {
-    Event Ping;
-    Event Pong;
-    Atomic Rounds;
-    Atomic Failed;
-    Atomic Abort;   /* the pinger never started: the ponger goes home */
+    Event ping;
+    Event pong;
+    Atomic rounds;
+    Atomic failed;
+    Atomic abort;   /* the pinger never started: the ponger goes home */
 };
 
-static const ulong EventTestRounds = 64;
+static const ulong EVENT_TEST_ROUNDS = 64;
 
-static void EventTestPinger(void* ctx)
+static void event_test_pinger(void* ctx)
 {
     auto* pp = static_cast<EventPingPong*>(ctx);
-    for (ulong i = 0; i < EventTestRounds; i++)
+    for (ulong i = 0; i < EVENT_TEST_ROUNDS; i++)
     {
-        pp->Ping.Signal();
-        pp->Pong.Wait();
-        if (pp->Rounds.Get() != (long)(i + 1))
-            pp->Failed.Set(1);
+        pp->ping.signal();
+        pp->pong.wait();
+        if (pp->rounds.get() != (long)(i + 1))
+            pp->failed.set(1);
     }
 }
 
-static void EventTestPonger(void* ctx)
+static void event_test_ponger(void* ctx)
 {
     auto* pp = static_cast<EventPingPong*>(ctx);
-    for (ulong i = 0; i < EventTestRounds; i++)
+    for (ulong i = 0; i < EVENT_TEST_ROUNDS; i++)
     {
-        pp->Ping.Wait();
-        if (pp->Abort.Get() != 0)
+        pp->ping.wait();
+        if (pp->abort.get() != 0)
             return;
-        pp->Rounds.Inc();
-        pp->Pong.Signal();
+        pp->rounds.inc();
+        pp->pong.signal();
     }
 }
 
-static bool TestEvent()
+static bool test_event()
 {
     /* A signal before the wait is kept, and the wait takes it without
        blocking -- so this much is safe on the idle task; two are one. */
     {
         Event early;
-        early.Signal();
-        early.Signal();
-        early.Wait();
+        early.signal();
+        early.signal();
+        early.wait();
     }
 
-    auto* pp = Mm::TAlloc<EventPingPong, Tag>();
+    auto* pp = mm::talloc<EventPingPong, TAG>();
     if (pp == nullptr)
         return false;
 
-    Task* ponger = Mm::TAlloc<Task, Tag>("evpong");
-    Task* pinger = Mm::TAlloc<Task, Tag>("evping");
+    Task* ponger = mm::talloc<Task, TAG>("evpong");
+    Task* pinger = mm::talloc<Task, TAG>("evping");
     bool ok = ponger != nullptr && pinger != nullptr;
 
     /* Both on this CPU: a waiter moved elsewhere as it blocks is woken at its
@@ -3006,41 +3006,41 @@ static bool TestEvent()
        of a second of boot */
     if (ok)
     {
-        ulong self = 1UL << CpuTable::GetInstance().GetCurrentCpuId();
-        ponger->SetCpuAffinity(self);
-        pinger->SetCpuAffinity(self);
+        ulong self = 1UL << CpuTable::get_instance().get_current_cpu_id();
+        ponger->set_cpu_affinity(self);
+        pinger->set_cpu_affinity(self);
     }
 
-    if (ok && ponger->Start(EventTestPonger, pp))
+    if (ok && ponger->start(event_test_ponger, pp))
     {
-        if (!pinger->Start(EventTestPinger, pp))
+        if (!pinger->start(event_test_pinger, pp))
         {
             ok = false;
-            pp->Abort.Set(1);
-            pp->Ping.Signal();
+            pp->abort.set(1);
+            pp->ping.signal();
         }
         else
         {
-            pinger->Wait();
+            pinger->wait();
         }
-        ponger->Wait();
+        ponger->wait();
     }
     else
     {
         ok = false;
     }
 
-    ok = ok && pp->Failed.Get() == 0 && pp->Rounds.Get() == (long)EventTestRounds;
+    ok = ok && pp->failed.get() == 0 && pp->rounds.get() == (long)EVENT_TEST_ROUNDS;
 
     if (pinger != nullptr)
-        pinger->Put();
+        pinger->put();
     if (ponger != nullptr)
-        ponger->Put();
+        ponger->put();
     pp->~EventPingPong();
-    Mm::Free(pp);
+    mm::free(pp);
 
     if (!ok)
-        Trace(0, "TestEvent: the ping-pong lost count");
+        trace(0, "TestEvent: the ping-pong lost count");
     return ok;
 }
 
@@ -3050,43 +3050,43 @@ static bool TestEvent()
    what lets the signal come only after the first wait has returned. */
 struct WaitForProbe
 {
-    Event Ev;
-    Atomic Phase;       /* 1 once the first wait has returned */
-    Atomic TimedOut;    /* it returned false, having waited its time */
-    Atomic Signalled;   /* the second came back true */
+    Event ev;
+    Atomic phase;       /* 1 once the first wait has returned */
+    Atomic timed_out;    /* it returned false, having waited its time */
+    Atomic signalled;   /* the second came back true */
 };
 
-static const ulong WaitForTestNs = 20 * Const::NanoSecsInMs;
-static const ulong WaitForLongNs = 10 * Const::NanoSecsInSec;
+static const ulong WAIT_FOR_TEST_NS = 20 * consts::NANO_SECS_IN_MS;
+static const ulong WAIT_FOR_LONG_NS = 10 * consts::NANO_SECS_IN_SEC;
 
-static void WaitForTask(void* ctx)
+static void wait_for_task(void* ctx)
 {
     auto* p = static_cast<WaitForProbe*>(ctx);
-    ulong start = GetBootTime().GetValue();
-    bool got = p->Ev.WaitFor(WaitForTestNs);
-    ulong waited = GetBootTime().GetValue() - start;
-    p->TimedOut.Set((!got && waited >= WaitForTestNs) ? 1 : 0);
-    p->Phase.Set(1);
-    p->Signalled.Set(p->Ev.WaitFor(WaitForLongNs) ? 1 : 0);
+    ulong start = get_boot_time().get_value();
+    bool got = p->ev.wait_for(WAIT_FOR_TEST_NS);
+    ulong waited = get_boot_time().get_value() - start;
+    p->timed_out.set((!got && waited >= WAIT_FOR_TEST_NS) ? 1 : 0);
+    p->phase.set(1);
+    p->signalled.set(p->ev.wait_for(WAIT_FOR_LONG_NS) ? 1 : 0);
 }
 
-static bool TestEventWaitFor()
+static bool test_event_wait_for()
 {
-    auto* p = Mm::TAlloc<WaitForProbe, Tag>();
-    Task* task = Mm::TAlloc<Task, Tag>("waitfor");
+    auto* p = mm::talloc<WaitForProbe, TAG>();
+    Task* task = mm::talloc<Task, TAG>("waitfor");
     bool ok = (p != nullptr && task != nullptr);
     if (ok)
-        task->SetCpuAffinity(1UL << CpuTable::GetInstance().GetCurrentCpuId());
-    if (ok && task->Start(WaitForTask, p))
+        task->set_cpu_affinity(1UL << CpuTable::get_instance().get_current_cpu_id());
+    if (ok && task->start(wait_for_task, p))
     {
-        while (p->Phase.Get() == 0)
-            Sleep(Const::NanoSecsInMs);
-        p->Ev.Signal();
-        task->Wait();
-        ok = (p->TimedOut.Get() == 1 && p->Signalled.Get() == 1);
+        while (p->phase.get() == 0)
+            sleep(consts::NANO_SECS_IN_MS);
+        p->ev.signal();
+        task->wait();
+        ok = (p->timed_out.get() == 1 && p->signalled.get() == 1);
         if (!ok)
-            Trace(0, "TestEventWaitFor: timed out %lu, signalled %lu",
-                (ulong)p->TimedOut.Get(), (ulong)p->Signalled.Get());
+            trace(0, "TestEventWaitFor: timed out %lu, signalled %lu",
+                (ulong)p->timed_out.get(), (ulong)p->signalled.get());
     }
     else
     {
@@ -3094,11 +3094,11 @@ static bool TestEventWaitFor()
     }
 
     if (task != nullptr)
-        task->Put();
+        task->put();
     if (p != nullptr)
     {
         p->~WaitForProbe();
-        Mm::Free(p);
+        mm::free(p);
     }
     return ok;
 }
@@ -3112,67 +3112,67 @@ static bool TestEventWaitFor()
    come. Both on this CPU, each asleep SleepTestRounds times; what the two
    ran between them must be a small part of what they slept -- well under a
    poller's half, far over a blocked one's microseconds. */
-static const ulong SleepTestRounds = 5;
-static const ulong SleepTestNs = 20 * Const::NanoSecsInMs;
-static const ulong SleepTestMaxRunPercent = 10;
-static const ulong SleepTestPercent = 100;
+static const ulong SLEEP_TEST_ROUNDS = 5;
+static const ulong SLEEP_TEST_NS = 20 * consts::NANO_SECS_IN_MS;
+static const ulong SLEEP_TEST_MAX_RUN_PERCENT = 10;
+static const ulong SLEEP_TEST_PERCENT = 100;
 
-static void SleepTestTask(void* ctx)
+static void sleep_test_task(void* ctx)
 {
     (void)ctx;
-    for (ulong i = 0; i < SleepTestRounds; i++)
-        Sleep(SleepTestNs);
+    for (ulong i = 0; i < SLEEP_TEST_ROUNDS; i++)
+        sleep(SLEEP_TEST_NS);
 }
 
-static bool TestSleepBlocks()
+static bool test_sleep_blocks()
 {
-    Task* task[2] = { Mm::TAlloc<Task, Tag>("sleep0"), Mm::TAlloc<Task, Tag>("sleep1") };
+    Task* task[2] = { mm::talloc<Task, TAG>("sleep0"), mm::talloc<Task, TAG>("sleep1") };
     bool ok = (task[0] != nullptr && task[1] != nullptr);
 
     if (ok)
     {
-        ulong self = 1UL << CpuTable::GetInstance().GetCurrentCpuId();
-        task[0]->SetCpuAffinity(self);
-        task[1]->SetCpuAffinity(self);
+        ulong self = 1UL << CpuTable::get_instance().get_current_cpu_id();
+        task[0]->set_cpu_affinity(self);
+        task[1]->set_cpu_affinity(self);
     }
 
     bool started[2] = { false, false };
-    for (ulong i = 0; ok && i < Stdlib::ArraySize(task); i++)
+    for (ulong i = 0; ok && i < stdlib::array_size(task); i++)
     {
-        started[i] = task[i]->Start(SleepTestTask, nullptr);
+        started[i] = task[i]->start(sleep_test_task, nullptr);
         ok = started[i];
     }
 
-    ulong runNs = 0;
-    for (ulong i = 0; i < Stdlib::ArraySize(task); i++)
+    ulong run_ns = 0;
+    for (ulong i = 0; i < stdlib::array_size(task); i++)
     {
         if (!started[i])
             continue;
 
-        task[i]->Wait();
+        task[i]->wait();
         /* Under the task's lock, which every UpdateRuntime() is made under:
            the exited task may still be in its last switch on its CPU. */
-        Stdlib::AutoLock lock(task[i]->Lock);
-        runNs += task[i]->Runtime.GetValue();
+        stdlib::AutoLock lock(task[i]->lock_);
+        run_ns += task[i]->runtime_.get_value();
     }
 
-    for (ulong i = 0; i < Stdlib::ArraySize(task); i++)
+    for (ulong i = 0; i < stdlib::array_size(task); i++)
     {
         if (task[i] != nullptr)
-            task[i]->Put();
+            task[i]->put();
     }
 
     if (!ok)
     {
-        Trace(0, "TestSleepBlocks: no tasks for the test");
+        trace(0, "TestSleepBlocks: no tasks for the test");
         return false;
     }
 
-    ulong sleptNs = Stdlib::ArraySize(task) * SleepTestRounds * SleepTestNs;
-    if (runNs * SleepTestPercent > sleptNs * SleepTestMaxRunPercent)
+    ulong slept_ns = stdlib::array_size(task) * SLEEP_TEST_ROUNDS * SLEEP_TEST_NS;
+    if (run_ns * SLEEP_TEST_PERCENT > slept_ns * SLEEP_TEST_MAX_RUN_PERCENT)
     {
-        Trace(0, "TestSleepBlocks: two sleepers on one CPU ran %lu us of the %lu us they slept",
-            runNs / Const::NanoSecsInUsec, sleptNs / Const::NanoSecsInUsec);
+        trace(0, "TestSleepBlocks: two sleepers on one CPU ran %lu us of the %lu us they slept",
+            run_ns / consts::NANO_SECS_IN_USEC, slept_ns / consts::NANO_SECS_IN_USEC);
         return false;
     }
 
@@ -3191,66 +3191,66 @@ static bool TestSleepBlocks()
    well under a tick: a TCG host that stalls a vCPU for tens of
    milliseconds now and then puts a sleep or two that far out, and not half
    of them. */
-static const ulong SleepPromptRounds = 21;
-static const ulong SleepPromptNs = Const::NanoSecsInMs;
-static const ulong SleepPromptMaxMedianNs = 5 * Const::NanoSecsInMs;
+static const ulong SLEEP_PROMPT_ROUNDS = 21;
+static const ulong SLEEP_PROMPT_NS = consts::NANO_SECS_IN_MS;
+static const ulong SLEEP_PROMPT_MAX_MEDIAN_NS = 5 * consts::NANO_SECS_IN_MS;
 
 struct SleepPromptProbe
 {
-    Atomic Done;
-    ulong Took[SleepPromptRounds];
+    Atomic done;
+    ulong took[SLEEP_PROMPT_ROUNDS];
 };
 
-static void SleepPromptTask(void* ctx)
+static void sleep_prompt_task(void* ctx)
 {
     auto* p = static_cast<SleepPromptProbe*>(ctx);
-    for (ulong i = 0; i < SleepPromptRounds; i++)
+    for (ulong i = 0; i < SLEEP_PROMPT_ROUNDS; i++)
     {
-        ulong start = GetBootTime().GetValue();
-        Sleep(SleepPromptNs);
-        p->Took[i] = GetBootTime().GetValue() - start;
+        ulong start = get_boot_time().get_value();
+        sleep(SLEEP_PROMPT_NS);
+        p->took[i] = get_boot_time().get_value() - start;
     }
-    p->Done.Set(1);
+    p->done.set(1);
 }
 
-static bool TestSleepPrompt()
+static bool test_sleep_prompt()
 {
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    auto& cpu = CpuTable::get_instance().get_current_cpu();
 
     /* A timer that could not be calibrated leaves the broadcast tick in
        charge (x86), and every sleep on its grid */
-    if (!cpu.LocalTimerOneShot())
+    if (!cpu.local_timer_one_shot())
         return true;
 
-    auto* p = Mm::TAlloc<SleepPromptProbe, Tag>();
-    Task* task = Mm::TAlloc<Task, Tag>("sleepprompt");
+    auto* p = mm::talloc<SleepPromptProbe, TAG>();
+    Task* task = mm::talloc<Task, TAG>("sleepprompt");
     bool ok = (p != nullptr && task != nullptr);
 
     if (ok)
-        task->SetCpuAffinity(1UL << cpu.GetIndex());
-    if (ok && task->Start(SleepPromptTask, p))
+        task->set_cpu_affinity(1UL << cpu.get_index());
+    if (ok && task->start(sleep_prompt_task, p))
     {
-        while (p->Done.Get() == 0)
-            cpu.Idle();
-        task->Wait();
+        while (p->done.get() == 0)
+            cpu.idle();
+        task->wait();
 
         /* Sorted in place, an insertion at a time: the middle one is the
            median of an odd count */
-        for (ulong i = 1; i < SleepPromptRounds; i++)
+        for (ulong i = 1; i < SLEEP_PROMPT_ROUNDS; i++)
         {
-            ulong v = p->Took[i];
+            ulong v = p->took[i];
             ulong j = i;
-            for (; j > 0 && p->Took[j - 1] > v; j--)
-                p->Took[j] = p->Took[j - 1];
-            p->Took[j] = v;
+            for (; j > 0 && p->took[j - 1] > v; j--)
+                p->took[j] = p->took[j - 1];
+            p->took[j] = v;
         }
 
-        ulong median = p->Took[SleepPromptRounds / 2];
-        ok = (median <= SleepPromptMaxMedianNs);
+        ulong median = p->took[SLEEP_PROMPT_ROUNDS / 2];
+        ok = (median <= SLEEP_PROMPT_MAX_MEDIAN_NS);
         if (!ok)
-            Trace(0, "TestSleepPrompt: sleeps of %lu us took %lu us at the median, %lu to %lu",
-                SleepPromptNs / Const::NanoSecsInUsec, median / Const::NanoSecsInUsec,
-                p->Took[0] / Const::NanoSecsInUsec, p->Took[SleepPromptRounds - 1] / Const::NanoSecsInUsec);
+            trace(0, "TestSleepPrompt: sleeps of %lu us took %lu us at the median, %lu to %lu",
+                SLEEP_PROMPT_NS / consts::NANO_SECS_IN_USEC, median / consts::NANO_SECS_IN_USEC,
+                p->took[0] / consts::NANO_SECS_IN_USEC, p->took[SLEEP_PROMPT_ROUNDS - 1] / consts::NANO_SECS_IN_USEC);
     }
     else
     {
@@ -3258,11 +3258,11 @@ static bool TestSleepPrompt()
     }
 
     if (task != nullptr)
-        task->Put();
+        task->put();
     if (p != nullptr)
     {
         p->~SleepPromptProbe();
-        Mm::Free(p);
+        mm::free(p);
     }
     return ok;
 }
@@ -3274,25 +3274,25 @@ static bool TestSleepPrompt()
    flag whether or not another task was there to take the CPU. After
    TestSpinLockPreempt, in the same task context with interrupts and
    preemption on. */
-static bool TestPreemptDeferred()
+static bool test_preempt_deferred()
 {
-    Task* task = Task::GetCurrentTask();
-    long deferred = GetPreemptDeferredCount();
+    Task* task = Task::get_current_task();
+    long deferred = get_preempt_deferred_count();
 
     SpinLock lock;
-    bool pendingUnder;
+    bool pending_under;
     {
-        Stdlib::AutoLock guard(lock);
-        Preempt();
-        pendingUnder = (task->PreemptPending.Get() != 0);
+        stdlib::AutoLock guard(lock);
+        preempt();
+        pending_under = (task->preempt_pending_.get() != 0);
     }
-    bool pendingAfter = (task->PreemptPending.Get() != 0);
-    bool counted = (GetPreemptDeferredCount() > deferred);
+    bool pending_after = (task->preempt_pending_.get() != 0);
+    bool counted = (get_preempt_deferred_count() > deferred);
 
-    if (!pendingUnder || pendingAfter || !counted)
+    if (!pending_under || pending_after || !counted)
     {
-        Trace(0, "TestPreemptDeferred: pending under the lock %lu, after the unlock %lu, counted %lu",
-            (ulong)pendingUnder, (ulong)pendingAfter, (ulong)counted);
+        trace(0, "TestPreemptDeferred: pending under the lock %lu, after the unlock %lu, counted %lu",
+            (ulong)pending_under, (ulong)pending_after, (ulong)counted);
         return false;
     }
 
@@ -3308,249 +3308,249 @@ static bool TestPreemptDeferred()
    told from a quiet one only by these. */
 struct LocateProbe
 {
-    Event Ev;
-    Atomic Started;
-    Atomic Stop;
-    Atomic Done;
+    Event ev;
+    Atomic started;
+    Atomic stop;
+    Atomic done;
     /* The silent task gave up waiting for Stop, interrupts off */
-    Atomic GaveUp;
+    Atomic gave_up;
 };
 
-static const ulong LocateTestTries = 200;
-static const ulong LocateTestAnswerNs = 100 * Const::NanoSecsInMs;
+static const ulong LOCATE_TEST_TRIES = 200;
+static const ulong LOCATE_TEST_ANSWER_NS = 100 * consts::NANO_SECS_IN_MS;
 /* The longest the silent task keeps its CPU deaf, should the test never
    tell it to stop: a failure, and not a wedge */
-static const ulong LocateTestSilentMaxNs = 2 * Const::NanoSecsInSec;
-static const ulong JoinTestReportNs = 20 * Const::NanoSecsInMs;
-static const ulong JoinTestNapNs = 50 * Const::NanoSecsInMs;
+static const ulong LOCATE_TEST_SILENT_MAX_NS = 2 * consts::NANO_SECS_IN_SEC;
+static const ulong JOIN_TEST_REPORT_NS = 20 * consts::NANO_SECS_IN_MS;
+static const ulong JOIN_TEST_NAP_NS = 50 * consts::NANO_SECS_IN_MS;
 
-static void LocateParkTask(void* ctx)
+static void locate_park_task(void* ctx)
 {
     auto* p = static_cast<LocateProbe*>(ctx);
-    p->Started.Set(1);
-    p->Ev.Wait();
-    p->Done.Set(1);
+    p->started.set(1);
+    p->ev.wait();
+    p->done.set(1);
 }
 
 /* Out of line, so that the frame named is its caller's, whichever
    instruction of the loop the IPI lands on: one landing in the loop of a
    function that has the loop itself is named by Pc alone */
-static __attribute__((noinline)) void LocateSpinning(LocateProbe* p)
+static __attribute__((noinline)) void locate_spinning(LocateProbe* p)
 {
-    while (p->Stop.Get() == 0)
-        Pause();
+    while (p->stop.get() == 0)
+        cpu_relax();
 }
 
-static void LocateSpinTask(void* ctx)
+static void locate_spin_task(void* ctx)
 {
     auto* p = static_cast<LocateProbe*>(ctx);
-    p->Started.Set(1);
-    LocateSpinning(p);
-    p->Done.Set(1);
+    p->started.set(1);
+    locate_spinning(p);
+    p->done.set(1);
 }
 
-static void LocateSilentTask(void* ctx)
+static void locate_silent_task(void* ctx)
 {
     auto* p = static_cast<LocateProbe*>(ctx);
-    ulong until = GetBootTime().GetValue() + LocateTestSilentMaxNs;
-    ulong flags = Hal::IrqSave();
-    p->Started.Set(1);
-    while (p->Stop.Get() == 0)
+    ulong until = get_boot_time().get_value() + LOCATE_TEST_SILENT_MAX_NS;
+    ulong flags = hal::irq_save();
+    p->started.set(1);
+    while (p->stop.get() == 0)
     {
-        if (GetBootTime().GetValue() >= until)
+        if (get_boot_time().get_value() >= until)
         {
-            p->GaveUp.Set(1);
+            p->gave_up.set(1);
             break;
         }
-        Pause();
+        cpu_relax();
     }
-    Hal::IrqRestore(flags);
-    p->Done.Set(1);
+    hal::irq_restore(flags);
+    p->done.set(1);
 }
 
-static void JoinNapTask(void* ctx)
+static void join_nap_task(void* ctx)
 {
     (void)ctx;
-    Sleep(JoinTestNapNs);
+    sleep(JOIN_TEST_NAP_NS);
 }
 
 /* Whether where's frames name fn */
-static bool LocateNames(Task::Where& where, const char* fn)
+static bool locate_names(Task::Where& where, const char* fn)
 {
-    auto& symtab = SymbolTable::GetInstance();
-    char name[SymbolTable::DescribeMax];
-    for (size_t i = 0; i < where.Count; i++)
+    auto& symtab = SymbolTable::get_instance();
+    char name[SymbolTable::DESCRIBE_MAX];
+    for (size_t i = 0; i < where.count; i++)
     {
-        if (symtab.DescribeReturn(where.Frames[i], name, sizeof(name)) &&
-            Stdlib::StrStr(name, fn) != nullptr)
+        if (symtab.describe_return(where.frames[i], name, sizeof(name)) &&
+            stdlib::str_str(name, fn) != nullptr)
             return true;
     }
     return false;
 }
 
-static void LocateTrace(const char* test, Task::Where& where)
+static void locate_trace(const char* test, Task::Where& where)
 {
-    char what[2 * SymbolTable::DescribeMax];
-    where.Describe(what, sizeof(what));
-    Trace(0, "%s: found %s, %lu frames", test, what, (ulong)where.Count);
+    char what[2 * SymbolTable::DESCRIBE_MAX];
+    where.describe(what, sizeof(what));
+    trace(0, "%s: found %s, %lu frames", test, what, (ulong)where.count);
 }
 
 /* A task made, started with p and on cpu (~0UL: any), or nullptr */
-static Task* LocateStart(const char* name, Task::Func func, LocateProbe* p, ulong cpu)
+static Task* locate_start(const char* name, Task::Func func, LocateProbe* p, ulong cpu)
 {
-    Task* task = Mm::TAlloc<Task, Tag>(name);
+    Task* task = mm::talloc<Task, TAG>(name);
     if (task == nullptr)
         return nullptr;
 
     if (cpu != ~0UL)
-        task->SetCpuAffinity(1UL << cpu);
-    if (!task->Start(func, p))
+        task->set_cpu_affinity(1UL << cpu);
+    if (!task->start(func, p))
     {
-        task->Put();
+        task->put();
         return nullptr;
     }
 
-    while (p->Started.Get() == 0)
-        Sleep(Const::NanoSecsInMs);
+    while (p->started.get() == 0)
+        sleep(consts::NANO_SECS_IN_MS);
     return task;
 }
 
-static bool TestLocateBlocked()
+static bool test_locate_blocked()
 {
-    auto* p = Mm::TAlloc<LocateProbe, Tag>();
+    auto* p = mm::talloc<LocateProbe, TAG>();
     if (p == nullptr)
         return false;
 
     bool ok = false;
-    Task* task = LocateStart("locate-park", LocateParkTask, p, ~0UL);
+    Task* task = locate_start("locate-park", locate_park_task, p, ~0UL);
     if (task != nullptr)
     {
         Task::Where where;
-        for (ulong i = 0; i < LocateTestTries && !ok; i++)
+        for (ulong i = 0; i < LOCATE_TEST_TRIES && !ok; i++)
         {
-            task->Locate(where);
-            ok = (where.What == Task::Where::Switched && where.Blocked &&
-                  !where.Asleep && LocateNames(where, "LocateParkTask"));
+            task->locate(where);
+            ok = (where.what == Task::Where::Switched && where.blocked &&
+                  !where.asleep && locate_names(where, "LocateParkTask"));
             if (!ok)
-                Sleep(Const::NanoSecsInMs);
+                sleep(consts::NANO_SECS_IN_MS);
         }
         if (!ok)
-            LocateTrace("TestLocateBlocked", where);
+            locate_trace("TestLocateBlocked", where);
 
-        p->Ev.Signal();
-        task->Wait();
-        task->Put();
+        p->ev.signal();
+        task->wait();
+        task->put();
     }
 
     p->~LocateProbe();
-    Mm::Free(p);
+    mm::free(p);
     return ok;
 }
 
 /* The silent CPU first, then the spinning task on it: the probe left
    unanswered there is the one the second has to find answered and reuse */
-static bool TestLocateOnCpu(ulong cpu)
+static bool test_locate_on_cpu(ulong cpu)
 {
-    auto* p = Mm::TAlloc<LocateProbe, Tag>();
+    auto* p = mm::talloc<LocateProbe, TAG>();
     if (p == nullptr)
         return false;
 
     bool ok = false;
-    Task* task = LocateStart("locate-silent", LocateSilentTask, p, cpu);
+    Task* task = locate_start("locate-silent", locate_silent_task, p, cpu);
     if (task != nullptr)
     {
         Task::Where where;
-        task->Locate(where, LocateTestAnswerNs);
-        ok = (where.What == Task::Where::Silent && (where.SilentCpus & (1UL << cpu)));
+        task->locate(where, LOCATE_TEST_ANSWER_NS);
+        ok = (where.what == Task::Where::Silent && (where.silent_cpus & (1UL << cpu)));
         if (!ok)
-            LocateTrace("TestLocateOnCpu silent", where);
+            locate_trace("TestLocateOnCpu silent", where);
 
-        p->Stop.Set(1);
-        task->Wait();
-        task->Put();
-        if (p->GaveUp.Get() != 0)
+        p->stop.set(1);
+        task->wait();
+        task->put();
+        if (p->gave_up.get() != 0)
         {
-            Trace(0, "TestLocateOnCpu: the silent task was never told to stop");
+            trace(0, "TestLocateOnCpu: the silent task was never told to stop");
             ok = false;
         }
     }
 
     p->~LocateProbe();
-    Mm::Free(p);
+    mm::free(p);
     if (!ok)
         return false;
 
-    p = Mm::TAlloc<LocateProbe, Tag>();
+    p = mm::talloc<LocateProbe, TAG>();
     if (p == nullptr)
         return false;
 
     ok = false;
-    task = LocateStart("locate-spin", LocateSpinTask, p, cpu);
+    task = locate_start("locate-spin", locate_spin_task, p, cpu);
     if (task != nullptr)
     {
         Task::Where where;
-        for (ulong i = 0; i < LocateTestTries && !ok; i++)
+        for (ulong i = 0; i < LOCATE_TEST_TRIES && !ok; i++)
         {
-            task->Locate(where);
-            ok = (where.What == Task::Where::Running && where.Cpu == cpu &&
-                  where.Pc != 0 && LocateNames(where, "LocateSpinTask"));
+            task->locate(where);
+            ok = (where.what == Task::Where::Running && where.cpu == cpu &&
+                  where.pc != 0 && locate_names(where, "LocateSpinTask"));
             if (!ok)
-                Sleep(Const::NanoSecsInMs);
+                sleep(consts::NANO_SECS_IN_MS);
         }
         if (!ok)
-            LocateTrace("TestLocateOnCpu running", where);
+            locate_trace("TestLocateOnCpu running", where);
 
-        p->Stop.Set(1);
-        task->Wait();
-        task->Put();
+        p->stop.set(1);
+        task->wait();
+        task->put();
     }
 
     p->~LocateProbe();
-    Mm::Free(p);
+    mm::free(p);
     return ok;
 }
 
-static bool TestJoinReport()
+static bool test_join_report()
 {
-    Task* task = Mm::TAlloc<Task, Tag>("join-nap");
+    Task* task = mm::talloc<Task, TAG>("join-nap");
     if (task == nullptr)
         return false;
 
-    long before = Task::GetJoinReportCount();
-    bool ok = task->Start(JoinNapTask, nullptr);
+    long before = Task::get_join_report_count();
+    bool ok = task->start(join_nap_task, nullptr);
     if (ok)
     {
-        task->Wait(JoinTestReportNs);
-        ok = (Task::GetJoinReportCount() > before);
+        task->wait(JOIN_TEST_REPORT_NS);
+        ok = (Task::get_join_report_count() > before);
         if (!ok)
-            Trace(0, "TestJoinReport: a wait of %lu ms went unreported",
-                JoinTestNapNs / Const::NanoSecsInMs);
+            trace(0, "TestJoinReport: a wait of %lu ms went unreported",
+                JOIN_TEST_NAP_NS / consts::NANO_SECS_IN_MS);
     }
-    task->Put();
+    task->put();
     return ok;
 }
 
-bool TestTaskLocate()
+bool test_task_locate()
 {
-    if (!TestLocateBlocked())
+    if (!test_locate_blocked())
         return false;
 
     /* Another CPU, should there be one: the highest, the one least likely
        to be the BSP's */
-    auto& cpus = CpuTable::GetInstance();
-    ulong self = cpus.GetCurrentCpuId();
-    ulong mask = cpus.GetRunningCpus();
+    auto& cpus = CpuTable::get_instance();
+    ulong self = cpus.get_current_cpu_id();
+    ulong mask = cpus.get_running_cpus();
     ulong other = ~0UL;
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if ((mask & (1UL << i)) && i != self)
             other = i;
     }
 
-    if (other != ~0UL && !TestLocateOnCpu(other))
+    if (other != ~0UL && !test_locate_on_cpu(other))
         return false;
 
-    return TestJoinReport();
+    return test_join_report();
 }
 
 /* The boot runs in its CPU's idle task, and the idle task is the last resort
@@ -3562,47 +3562,47 @@ bool TestTaskLocate()
    producer, started on the boot CPU, kept the boot from starting its
    consumer for the thirty seconds it waited for one, one boot in a few
    hundred under HVF. */
-static const ulong TurnSpinMaxNs = 2 * Const::NanoSecsInSec;
-static const ulong TurnSleepNs = Const::NanoSecsInMs;
-static const ulong TurnMaxNs = 200 * Const::NanoSecsInMs;
+static const ulong TURN_SPIN_MAX_NS = 2 * consts::NANO_SECS_IN_SEC;
+static const ulong TURN_SLEEP_NS = consts::NANO_SECS_IN_MS;
+static const ulong TURN_MAX_NS = 200 * consts::NANO_SECS_IN_MS;
 
 struct TurnProbe
 {
-    Atomic Stop;
+    Atomic stop;
 };
 
-static void TurnSpinTask(void* ctx)
+static void turn_spin_task(void* ctx)
 {
     auto* p = static_cast<TurnProbe*>(ctx);
-    ulong until = GetBootTime().GetValue() + TurnSpinMaxNs;
-    while (p->Stop.Get() == 0 && GetBootTime().GetValue() < until)
-        YieldToRunnable();
+    ulong until = get_boot_time().get_value() + TURN_SPIN_MAX_NS;
+    while (p->stop.get() == 0 && get_boot_time().get_value() < until)
+        yield_to_runnable();
 }
 
-bool TestIdleTakesTurns()
+bool test_idle_takes_turns()
 {
-    Task* self = Task::GetCurrentTask();
-    if (!self->IsIdle())
+    Task* self = Task::get_current_task();
+    if (!self->is_idle())
         return true;
 
-    auto* p = Mm::TAlloc<TurnProbe, Tag>();
-    Task* task = Mm::TAlloc<Task, Tag>("turn-spin");
+    auto* p = mm::talloc<TurnProbe, TAG>();
+    Task* task = mm::talloc<Task, TAG>("turn-spin");
     bool ok = (p != nullptr && task != nullptr);
     if (ok)
-        task->SetCpuAffinity(1UL << CpuTable::GetInstance().GetCurrentCpuId());
-    if (ok && task->Start(TurnSpinTask, p))
+        task->set_cpu_affinity(1UL << CpuTable::get_instance().get_current_cpu_id());
+    if (ok && task->start(turn_spin_task, p))
     {
-        ulong start = GetBootTime().GetValue();
-        Sleep(TurnSleepNs);
-        ulong took = GetBootTime().GetValue() - start;
+        ulong start = get_boot_time().get_value();
+        sleep(TURN_SLEEP_NS);
+        ulong took = get_boot_time().get_value() - start;
 
-        p->Stop.Set(1);
-        task->Wait();
+        p->stop.set(1);
+        task->wait();
 
-        ok = (took <= TurnMaxNs);
+        ok = (took <= TURN_MAX_NS);
         if (!ok)
-            Trace(0, "TestIdleTakesTurns: a sleep of %lu us in the idle task took %lu us beside a task that yields",
-                TurnSleepNs / Const::NanoSecsInUsec, took / Const::NanoSecsInUsec);
+            trace(0, "TestIdleTakesTurns: a sleep of %lu us in the idle task took %lu us beside a task that yields",
+                TURN_SLEEP_NS / consts::NANO_SECS_IN_USEC, took / consts::NANO_SECS_IN_USEC);
     }
     else
     {
@@ -3610,11 +3610,11 @@ bool TestIdleTakesTurns()
     }
 
     if (task != nullptr)
-        task->Put();
+        task->put();
     if (p != nullptr)
     {
         p->~TurnProbe();
-        Mm::Free(p);
+        mm::free(p);
     }
     return ok;
 }
@@ -3635,187 +3635,187 @@ bool TestIdleTakesTurns()
    where at random points it waits half a slice. Measured: under HVF a
    wakeup waits <16us at the median, under TCG <64us; the shares are 3.0
    for 3.06. */
-static const ulong EevdfSamples = 101;
-static const ulong EevdfOneMedianNs = 500 * Const::NanoSecsInUsec;
-static const ulong EevdfTwoMedianNs = Const::NanoSecsInMs;
-static const ulong EevdfAnswerNs = Const::NanoSecsInSec;
+static const ulong EEVDF_SAMPLES = 101;
+static const ulong EEVDF_ONE_MEDIAN_NS = 500 * consts::NANO_SECS_IN_USEC;
+static const ulong EEVDF_TWO_MEDIAN_NS = consts::NANO_SECS_IN_MS;
+static const ulong EEVDF_ANSWER_NS = consts::NANO_SECS_IN_SEC;
 /* Between signals: EevdfGapNs, and up to a default slice more drawn from a
    fixed seed */
-static const ulong EevdfGapNs = Const::NanoSecsInMs;
-static const u64 EevdfSeed = 0x9E3779B97F4A7C15UL;
-static const ulong EevdfShareNs = 400 * Const::NanoSecsInMs;
-static const long EevdfLightNice = 5;
+static const ulong EEVDF_GAP_NS = consts::NANO_SECS_IN_MS;
+static const u64 EEVDF_SEED = 0x9E3779B97F4A7C15UL;
+static const ulong EEVDF_SHARE_NS = 400 * consts::NANO_SECS_IN_MS;
+static const long EEVDF_LIGHT_NICE = 5;
 /* nice 0 against nice 5 is 1024 against 335: 3.06, held to [2.4, 3.9] in
    tenths */
-static const ulong EevdfShareMinTenths = 24;
-static const ulong EevdfShareMaxTenths = 39;
+static const ulong EEVDF_SHARE_MIN_TENTHS = 24;
+static const ulong EEVDF_SHARE_MAX_TENTHS = 39;
 
 struct EevdfProbe
 {
-    Event Ev;
-    Atomic Stop;
-    Atomic SentAt;
-    Atomic Answered;
+    Event ev;
+    Atomic stop;
+    Atomic sent_at;
+    Atomic answered;
     /* The waiter's, read after it has exited */
-    ulong Took[EevdfSamples];
-    ulong Count;
+    ulong took[EEVDF_SAMPLES];
+    ulong count;
 };
 
-static void EevdfSpin(void* ctx)
+static void eevdf_spin(void* ctx)
 {
     auto* p = static_cast<EevdfProbe*>(ctx);
-    while (p->Stop.Get() == 0)
-        Pause();
+    while (p->stop.get() == 0)
+        cpu_relax();
 }
 
-static void EevdfWaiter(void* ctx)
+static void eevdf_waiter(void* ctx)
 {
     auto* p = static_cast<EevdfProbe*>(ctx);
-    while (p->Stop.Get() == 0)
+    while (p->stop.get() == 0)
     {
-        if (!p->Ev.WaitFor(100 * Const::NanoSecsInMs))
+        if (!p->ev.wait_for(100 * consts::NANO_SECS_IN_MS))
             continue;
 
-        ulong now = GetBootTime().GetValue();
-        ulong sent = (ulong)p->SentAt.Get();
-        if (sent != 0 && now >= sent && p->Count < EevdfSamples)
-            p->Took[p->Count++] = now - sent;
-        p->SentAt.Set(0);
-        p->Answered.Set(1);
+        ulong now = get_boot_time().get_value();
+        ulong sent = (ulong)p->sent_at.get();
+        if (sent != 0 && now >= sent && p->count < EEVDF_SAMPLES)
+            p->took[p->count++] = now - sent;
+        p->sent_at.set(0);
+        p->answered.set(1);
     }
 }
 
-static Task* EevdfStart(const char* name, ulong cpu, Task::Func func, void* ctx, long nice)
+static Task* eevdf_start(const char* name, ulong cpu, Task::Func func, void* ctx, long nice)
 {
-    Task* task = Mm::TAlloc<Task, Tag>(name);
+    Task* task = mm::talloc<Task, TAG>(name);
     if (task == nullptr)
         return nullptr;
 
-    task->SetCpuAffinity(1UL << cpu);
-    SetTaskNice(task, nice);
-    if (!task->Start(func, ctx))
+    task->set_cpu_affinity(1UL << cpu);
+    set_task_nice(task, nice);
+    if (!task->start(func, ctx))
     {
-        task->Put();
+        task->put();
         return nullptr;
     }
     return task;
 }
 
-static ulong EevdfRuntime(Task* task)
+static ulong eevdf_runtime(Task* task)
 {
-    Stdlib::AutoLock lock(task->Lock);
-    return task->Runtime.GetValue();
+    stdlib::AutoLock lock(task->lock_);
+    return task->runtime_.get_value();
 }
 
 /* The median wait of a waiter woken beside spinners on cpu, or ~0UL */
-static ulong EevdfMedianWait(ulong cpu, ulong spinners)
+static ulong eevdf_median_wait(ulong cpu, ulong spinners)
 {
-    auto* p = Mm::TAlloc<EevdfProbe, Tag>();
+    auto* p = mm::talloc<EevdfProbe, TAG>();
     if (p == nullptr)
         return ~0UL;
-    p->Count = 0;
+    p->count = 0;
 
     Task* tasks[3] = {};
-    bool ok = (spinners + 1 <= Stdlib::ArraySize(tasks));
+    bool ok = (spinners + 1 <= stdlib::array_size(tasks));
     for (ulong i = 0; ok && i <= spinners; i++)
     {
-        tasks[i] = EevdfStart((i == 0) ? "eevdf-wait" : "eevdf-spin", cpu,
-            (i == 0) ? EevdfWaiter : EevdfSpin, p, 0);
+        tasks[i] = eevdf_start((i == 0) ? "eevdf-wait" : "eevdf-spin", cpu,
+            (i == 0) ? eevdf_waiter : eevdf_spin, p, 0);
         ok = (tasks[i] != nullptr);
     }
 
-    u64 x = EevdfSeed;
-    for (ulong sample = 0; ok && sample < EevdfSamples; sample++)
+    u64 x = EEVDF_SEED;
+    for (ulong sample = 0; ok && sample < EEVDF_SAMPLES; sample++)
     {
-        p->Answered.Set(0);
-        p->SentAt.Set((long)GetBootTime().GetValue());
-        p->Ev.Signal();
+        p->answered.set(0);
+        p->sent_at.set((long)get_boot_time().get_value());
+        p->ev.signal();
 
-        ulong giveUp = GetBootTime().GetValue() + EevdfAnswerNs;
-        while (p->Answered.Get() == 0 && GetBootTime().GetValue() < giveUp)
-            Sleep(Const::NanoSecsInMs);
+        ulong give_up = get_boot_time().get_value() + EEVDF_ANSWER_NS;
+        while (p->answered.get() == 0 && get_boot_time().get_value() < give_up)
+            sleep(consts::NANO_SECS_IN_MS);
 
         /* xorshift64 */
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        Sleep(EevdfGapNs + (ulong)(x % SchedEntity::DefaultSliceNs));
+        sleep(EEVDF_GAP_NS + (ulong)(x % SchedEntity::DEFAULT_SLICE_NS));
     }
 
-    p->Stop.Set(1);
-    p->Ev.Signal();
-    for (ulong i = 0; i <= spinners && i < Stdlib::ArraySize(tasks); i++)
+    p->stop.set(1);
+    p->ev.signal();
+    for (ulong i = 0; i <= spinners && i < stdlib::array_size(tasks); i++)
     {
         if (tasks[i] == nullptr)
             continue;
-        tasks[i]->Wait();
-        tasks[i]->Put();
+        tasks[i]->wait();
+        tasks[i]->put();
     }
 
     ulong median = ~0UL;
-    if (ok && p->Count == EevdfSamples)
+    if (ok && p->count == EEVDF_SAMPLES)
     {
-        for (ulong i = 1; i < p->Count; i++)
+        for (ulong i = 1; i < p->count; i++)
         {
-            ulong v = p->Took[i];
+            ulong v = p->took[i];
             ulong j = i;
-            for (; j > 0 && p->Took[j - 1] > v; j--)
-                p->Took[j] = p->Took[j - 1];
-            p->Took[j] = v;
+            for (; j > 0 && p->took[j - 1] > v; j--)
+                p->took[j] = p->took[j - 1];
+            p->took[j] = v;
         }
-        median = p->Took[p->Count / 2];
+        median = p->took[p->count / 2];
     }
 
     p->~EevdfProbe();
-    Mm::Free(p);
+    mm::free(p);
     return median;
 }
 
 /* What two spinners of nice 0 and EevdfLightNice ran on cpu over a window:
    the heavy's runtime over the light's, in tenths, or ~0UL */
-static ulong EevdfShareTenths(ulong cpu)
+static ulong eevdf_share_tenths(ulong cpu)
 {
-    auto* p = Mm::TAlloc<EevdfProbe, Tag>();
+    auto* p = mm::talloc<EevdfProbe, TAG>();
     if (p == nullptr)
         return ~0UL;
 
-    Task* heavy = EevdfStart("eevdf-heavy", cpu, EevdfSpin, p, 0);
-    Task* light = EevdfStart("eevdf-light", cpu, EevdfSpin, p, EevdfLightNice);
+    Task* heavy = eevdf_start("eevdf-heavy", cpu, eevdf_spin, p, 0);
+    Task* light = eevdf_start("eevdf-light", cpu, eevdf_spin, p, EEVDF_LIGHT_NICE);
     ulong tenths = ~0UL;
     if (heavy != nullptr && light != nullptr)
     {
         /* Both running before the window opens */
-        Sleep(20 * Const::NanoSecsInMs);
-        ulong h0 = EevdfRuntime(heavy), l0 = EevdfRuntime(light);
-        Sleep(EevdfShareNs);
-        ulong h1 = EevdfRuntime(heavy), l1 = EevdfRuntime(light);
-        ulong lightRan = l1 - l0;
-        if (lightRan != 0)
-            tenths = ((h1 - h0) * 10) / lightRan;
+        sleep(20 * consts::NANO_SECS_IN_MS);
+        ulong h0 = eevdf_runtime(heavy), l0 = eevdf_runtime(light);
+        sleep(EEVDF_SHARE_NS);
+        ulong h1 = eevdf_runtime(heavy), l1 = eevdf_runtime(light);
+        ulong light_ran = l1 - l0;
+        if (light_ran != 0)
+            tenths = ((h1 - h0) * 10) / light_ran;
     }
 
-    p->Stop.Set(1);
+    p->stop.set(1);
     Task* both[2] = { heavy, light };
     for (auto* task : both)
     {
         if (task == nullptr)
             continue;
-        task->Wait();
-        task->Put();
+        task->wait();
+        task->put();
     }
     p->~EevdfProbe();
-    Mm::Free(p);
+    mm::free(p);
     return tenths;
 }
 
-bool TestEevdf()
+bool test_eevdf()
 {
     /* The highest CPU that is not this one: the boot's own runs this */
-    auto& cpus = CpuTable::GetInstance();
-    ulong self = cpus.GetCurrentCpuId();
-    ulong mask = cpus.GetRunningCpus();
+    auto& cpus = CpuTable::get_instance();
+    ulong self = cpus.get_current_cpu_id();
+    ulong mask = cpus.get_running_cpus();
     ulong cpu = ~0UL;
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if ((mask & (1UL << i)) && i != self)
             cpu = i;
@@ -3823,16 +3823,16 @@ bool TestEevdf()
     if (cpu == ~0UL)
         return true;
 
-    ulong one = EevdfMedianWait(cpu, 1);
-    ulong two = EevdfMedianWait(cpu, 2);
-    ulong share = EevdfShareTenths(cpu);
+    ulong one = eevdf_median_wait(cpu, 1);
+    ulong two = eevdf_median_wait(cpu, 2);
+    ulong share = eevdf_share_tenths(cpu);
 
-    bool ok = (one <= EevdfOneMedianNs && two <= EevdfTwoMedianNs &&
-               share >= EevdfShareMinTenths && share <= EevdfShareMaxTenths);
-    Trace(0, "TestEevdf: on cpu %lu a wakeup waits %lu us beside one spinner, %lu us beside two, "
+    bool ok = (one <= EEVDF_ONE_MEDIAN_NS && two <= EEVDF_TWO_MEDIAN_NS &&
+               share >= EEVDF_SHARE_MIN_TENTHS && share <= EEVDF_SHARE_MAX_TENTHS);
+    trace(0, "TestEevdf: on cpu %lu a wakeup waits %lu us beside one spinner, %lu us beside two, "
         "at the median; nice 0 has %lu.%lu times nice %ld's CPU",
-        cpu, (one == ~0UL) ? 0 : one / Const::NanoSecsInUsec, (two == ~0UL) ? 0 : two / Const::NanoSecsInUsec,
-        (share == ~0UL) ? 0 : share / 10, (share == ~0UL) ? 0 : share % 10, EevdfLightNice);
+        cpu, (one == ~0UL) ? 0 : one / consts::NANO_SECS_IN_USEC, (two == ~0UL) ? 0 : two / consts::NANO_SECS_IN_USEC,
+        (share == ~0UL) ? 0 : share / 10, (share == ~0UL) ? 0 : share % 10, EEVDF_LIGHT_NICE);
     return ok;
 }
 
@@ -3848,241 +3848,241 @@ bool TestEevdf()
    a pass, naming the task the token was sent to and where it is. It does
    not clean up then: a task that cannot be woken cannot be joined, and the
    boot panics on the failure. */
-static const ulong StormMaxTasks = 32;
-static const ulong StormHops = 3000;
-static const ulong StormNapEvery = 64;
-static const ulong StormNapNs = Const::NanoSecsInMs;
-static const ulong StormWaitNs = 50 * Const::NanoSecsInMs;
-static const ulong StormStallNs = 2 * Const::NanoSecsInSec;
-static const ulong StormMaxNs = 60 * Const::NanoSecsInSec;
+static const ulong STORM_MAX_TASKS = 32;
+static const ulong STORM_HOPS = 3000;
+static const ulong STORM_NAP_EVERY = 64;
+static const ulong STORM_NAP_NS = consts::NANO_SECS_IN_MS;
+static const ulong STORM_WAIT_NS = 50 * consts::NANO_SECS_IN_MS;
+static const ulong STORM_STALL_NS = 2 * consts::NANO_SECS_IN_SEC;
+static const ulong STORM_MAX_NS = 60 * consts::NANO_SECS_IN_SEC;
 /* How long a yielder spins between its yields */
-static const ulong StormYieldSpins = 200;
+static const ulong STORM_YIELD_SPINS = 200;
 
 struct StormProbe;
 
 struct StormSlot
 {
-    Event Ev;
-    StormProbe* Probe;
-    ulong Index;
-    Task* Worker;
+    Event ev;
+    StormProbe* probe;
+    ulong index;
+    Task* worker;
 };
 
 struct StormProbe
 {
-    StormSlot Slots[StormMaxTasks];
-    Task* Yielders[MaxCpus];
-    ulong Count;
-    Atomic Hops;
+    StormSlot slots[STORM_MAX_TASKS];
+    Task* yielders[MAX_CPUS];
+    ulong count;
+    Atomic hops;
     /* The slot the token was sent to last */
-    Atomic Holder;
-    Atomic Stop;
+    Atomic holder;
+    Atomic stop;
 };
 
-static void StormTaskFunc(void* ctx)
+static void storm_task_func(void* ctx)
 {
     auto* slot = static_cast<StormSlot*>(ctx);
-    StormProbe* p = slot->Probe;
-    bool timed = (slot->Index % 2) == 0;
+    StormProbe* p = slot->probe;
+    bool timed = (slot->index % 2) == 0;
 
-    while (p->Stop.Get() == 0)
+    while (p->stop.get() == 0)
     {
         if (timed)
         {
-            if (!slot->Ev.WaitFor(StormWaitNs))
+            if (!slot->ev.wait_for(STORM_WAIT_NS))
                 continue;
         }
         else
         {
-            slot->Ev.Wait();
+            slot->ev.wait();
         }
 
-        if (p->Stop.Get() != 0)
+        if (p->stop.get() != 0)
             break;
 
         /* The token is this task's alone until it signals the next */
-        long hop = p->Hops.Get() + 1;
-        p->Hops.Set(hop);
-        if ((ulong)hop % StormNapEvery == 0)
-            Sleep(StormNapNs);
+        long hop = p->hops.get() + 1;
+        p->hops.set(hop);
+        if ((ulong)hop % STORM_NAP_EVERY == 0)
+            sleep(STORM_NAP_NS);
 
-        ulong next = (slot->Index + 1) % p->Count;
-        p->Holder.Set((long)next);
-        p->Slots[next].Ev.Signal();
+        ulong next = (slot->index + 1) % p->count;
+        p->holder.set((long)next);
+        p->slots[next].ev.signal();
     }
 }
 
-static void StormYieldFunc(void* ctx)
+static void storm_yield_func(void* ctx)
 {
     auto* p = static_cast<StormProbe*>(ctx);
-    while (p->Stop.Get() == 0)
+    while (p->stop.get() == 0)
     {
-        for (ulong i = 0; i < StormYieldSpins; i++)
-            Pause();
-        YieldToRunnable();
+        for (ulong i = 0; i < STORM_YIELD_SPINS; i++)
+            cpu_relax();
+        yield_to_runnable();
     }
 }
 
-static Task* StormStart(const char* name, ulong cpu, Task::Func func, void* ctx)
+static Task* storm_start(const char* name, ulong cpu, Task::Func func, void* ctx)
 {
-    Task* task = Mm::TAlloc<Task, Tag>(name);
+    Task* task = mm::talloc<Task, TAG>(name);
     if (task == nullptr)
         return nullptr;
 
-    task->SetCpuAffinity(1UL << cpu);
-    if (!task->Start(func, ctx))
+    task->set_cpu_affinity(1UL << cpu);
+    if (!task->start(func, ctx))
     {
-        task->Put();
+        task->put();
         return nullptr;
     }
     return task;
 }
 
-bool TestWakeStorm()
+bool test_wake_storm()
 {
-    auto& cpus = CpuTable::GetInstance();
-    ulong mask = cpus.GetRunningCpus();
-    ulong cpuList[MaxCpus];
-    ulong cpuCount = 0;
-    for (ulong i = 0; i < MaxCpus; i++)
+    auto& cpus = CpuTable::get_instance();
+    ulong mask = cpus.get_running_cpus();
+    ulong cpu_list[MAX_CPUS];
+    ulong cpu_count = 0;
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if (mask & (1UL << i))
-            cpuList[cpuCount++] = i;
+            cpu_list[cpu_count++] = i;
     }
-    if (cpuCount == 0)
+    if (cpu_count == 0)
         return false;
 
-    auto* p = Mm::TAlloc<StormProbe, Tag>();
+    auto* p = mm::talloc<StormProbe, TAG>();
     if (p == nullptr)
     {
-        Trace(0, "TestWakeStorm: no memory");
+        trace(0, "TestWakeStorm: no memory");
         return false;
     }
 
-    p->Count = Stdlib::Min(2 * cpuCount, StormMaxTasks);
-    for (ulong i = 0; i < MaxCpus; i++)
-        p->Yielders[i] = nullptr;
+    p->count = stdlib::min(2 * cpu_count, STORM_MAX_TASKS);
+    for (ulong i = 0; i < MAX_CPUS; i++)
+        p->yielders[i] = nullptr;
 
     bool ok = true;
-    for (ulong i = 0; i < p->Count; i++)
+    for (ulong i = 0; i < p->count; i++)
     {
-        StormSlot& slot = p->Slots[i];
-        slot.Probe = p;
-        slot.Index = i;
-        char name[TaskNameLen];
-        Stdlib::SnPrintf(name, sizeof(name), "storm%lu", i);
-        slot.Worker = ok ? StormStart(name, cpuList[i % cpuCount], StormTaskFunc, &slot) : nullptr;
-        ok = ok && (slot.Worker != nullptr);
+        StormSlot& slot = p->slots[i];
+        slot.probe = p;
+        slot.index = i;
+        char name[TASK_NAME_LEN];
+        stdlib::sn_printf(name, sizeof(name), "storm%lu", i);
+        slot.worker = ok ? storm_start(name, cpu_list[i % cpu_count], storm_task_func, &slot) : nullptr;
+        ok = ok && (slot.worker != nullptr);
     }
     /* Not on this CPU: this runs in its idle task, the last resort, which a
        task that can always run would keep off it for as long as it ran */
-    ulong self = cpus.GetCurrentCpuId();
-    for (ulong i = 0; ok && i < cpuCount; i++)
+    ulong self = cpus.get_current_cpu_id();
+    for (ulong i = 0; ok && i < cpu_count; i++)
     {
-        if (cpuList[i] == self)
+        if (cpu_list[i] == self)
             continue;
 
-        char name[TaskNameLen];
-        Stdlib::SnPrintf(name, sizeof(name), "storm-yield%lu", cpuList[i]);
-        p->Yielders[i] = StormStart(name, cpuList[i], StormYieldFunc, p);
-        ok = (p->Yielders[i] != nullptr);
+        char name[TASK_NAME_LEN];
+        stdlib::sn_printf(name, sizeof(name), "storm-yield%lu", cpu_list[i]);
+        p->yielders[i] = storm_start(name, cpu_list[i], storm_yield_func, p);
+        ok = (p->yielders[i] != nullptr);
     }
 
     if (ok)
     {
-        ulong start = GetBootTime().GetValue();
-        ulong lastHops = 0;
-        ulong lastAt = start;
+        ulong start = get_boot_time().get_value();
+        ulong last_hops = 0;
+        ulong last_at = start;
 
-        p->Holder.Set(0);
-        p->Slots[0].Ev.Signal();
+        p->holder.set(0);
+        p->slots[0].ev.signal();
 
-        while ((ulong)p->Hops.Get() < StormHops)
+        while ((ulong)p->hops.get() < STORM_HOPS)
         {
-            Sleep(Const::NanoSecsInMs);
-            ulong now = GetBootTime().GetValue();
-            ulong hops = (ulong)p->Hops.Get();
-            if (hops != lastHops)
+            sleep(consts::NANO_SECS_IN_MS);
+            ulong now = get_boot_time().get_value();
+            ulong hops = (ulong)p->hops.get();
+            if (hops != last_hops)
             {
-                lastHops = hops;
-                lastAt = now;
+                last_hops = hops;
+                last_at = now;
                 continue;
             }
 
-            if (now - lastAt < StormStallNs && now - start < StormMaxNs)
+            if (now - last_at < STORM_STALL_NS && now - start < STORM_MAX_NS)
                 continue;
 
-            ulong holder = (ulong)p->Holder.Get();
+            ulong holder = (ulong)p->holder.get();
             Task::Where where;
-            p->Slots[holder].Worker->Locate(where);
-            char what[2 * SymbolTable::DescribeMax];
-            where.Describe(what, sizeof(what));
-            Trace(0, "TestWakeStorm: the token stopped after %lu of %lu passes, %lu ms without one: sent to %s, which is %s",
-                hops, StormHops, (now - lastAt) / Const::NanoSecsInMs,
-                p->Slots[holder].Worker->GetName(), what);
+            p->slots[holder].worker->locate(where);
+            char what[2 * SymbolTable::DESCRIBE_MAX];
+            where.describe(what, sizeof(what));
+            trace(0, "TestWakeStorm: the token stopped after %lu of %lu passes, %lu ms without one: sent to %s, which is %s",
+                hops, STORM_HOPS, (now - last_at) / consts::NANO_SECS_IN_MS,
+                p->slots[holder].worker->get_name(), what);
             return false;
         }
 
-        Trace(0, "TestWakeStorm: %lu passes among %lu tasks on %lu cpus in %lu ms",
-            (ulong)p->Hops.Get(), p->Count, cpuCount,
-            (GetBootTime().GetValue() - start) / Const::NanoSecsInMs);
+        trace(0, "TestWakeStorm: %lu passes among %lu tasks on %lu cpus in %lu ms",
+            (ulong)p->hops.get(), p->count, cpu_count,
+            (get_boot_time().get_value() - start) / consts::NANO_SECS_IN_MS);
     }
     else
     {
-        Trace(0, "TestWakeStorm: could not start its tasks");
+        trace(0, "TestWakeStorm: could not start its tasks");
     }
 
-    p->Stop.Set(1);
-    for (ulong i = 0; i < p->Count; i++)
+    p->stop.set(1);
+    for (ulong i = 0; i < p->count; i++)
     {
-        if (p->Slots[i].Worker == nullptr)
+        if (p->slots[i].worker == nullptr)
             continue;
-        p->Slots[i].Ev.Signal();
-        p->Slots[i].Worker->Wait();
-        p->Slots[i].Worker->Put();
+        p->slots[i].ev.signal();
+        p->slots[i].worker->wait();
+        p->slots[i].worker->put();
     }
-    for (ulong i = 0; i < cpuCount; i++)
+    for (ulong i = 0; i < cpu_count; i++)
     {
-        if (p->Yielders[i] == nullptr)
+        if (p->yielders[i] == nullptr)
             continue;
-        p->Yielders[i]->Wait();
-        p->Yielders[i]->Put();
+        p->yielders[i]->wait();
+        p->yielders[i]->put();
     }
 
     p->~StormProbe();
-    Mm::Free(p);
+    mm::free(p);
     return ok;
 }
 
-bool TestMultiTasking()
+bool test_multi_tasking()
 {
-    if (!TestSpinLockPreempt())
+    if (!test_spin_lock_preempt())
         return false;
 
-    if (!TestPreemptDeferred())
+    if (!test_preempt_deferred())
         return false;
 
-    if (!TestEvent())
+    if (!test_event())
         return false;
 
-    if (!TestSleepBlocks())
+    if (!test_sleep_blocks())
         return false;
 
-    if (!TestSleepPrompt())
+    if (!test_sleep_prompt())
         return false;
 
-    if (!TestEventWaitFor())
+    if (!test_event_wait_for())
         return false;
 
     Task *task[2] = {0};
-    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
+    for (size_t i = 0; i < stdlib::array_size(task); i++)
     {
-        task[i] = Kernel::Mm::TAlloc<Task, Tag>();
+        task[i] = kernel::mm::talloc<Task, TAG>();
         if (task[i] == nullptr)
         {
             for (size_t j = 0; j < i; j++)
             {
-                task[j]->Put();
+                task[j]->put();
             }
             return false;
         }
@@ -4090,30 +4090,30 @@ bool TestMultiTasking()
 
     bool result;
 
-    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
+    for (size_t i = 0; i < stdlib::array_size(task); i++)
     {
-        if (!task[i]->Start(TestMultiTaskingTaskFunc, nullptr))
+        if (!task[i]->start(test_multi_tasking_task_func, nullptr))
         {
             for (size_t j = 0; j < i; j++)
             {
-                task[j]->Wait();
+                task[j]->wait();
             }
             result = false;
             goto delTasks;
         }
     }
 
-    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
+    for (size_t i = 0; i < stdlib::array_size(task); i++)
     {
-        task[i]->Wait();
+        task[i]->wait();
     }
 
     result = true;
 
 delTasks:
-    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
+    for (size_t i = 0; i < stdlib::array_size(task); i++)
     {
-        task[i]->Put();
+        task[i]->put();
     }
 
     return result;

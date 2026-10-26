@@ -4,290 +4,290 @@
 #include "trace.h"
 #include "ubsan.h"
 
-namespace Kernel
+namespace kernel
 {
 
 /* Bounds on netframes=N. The floor keeps a typo from starving the datapath;
    the ceiling keeps one from reserving a quarter of a gigabyte at boot, since
    the pool is built once and never grows. */
-static const ulong NetFrameCountMin = 64;
-static const ulong NetFrameCountMax = 65536;
+static const ulong NET_FRAME_COUNT_MIN = 64;
+static const ulong NET_FRAME_COUNT_MAX = 65536;
 
 /* Upper bound on nctail=N. The netconsole ring is smaller than this, and it
    treats a cap at or above its own size as no cap at all -- this only keeps
    a typo from being taken for a number. */
-static const ulong NetconsoleTailKbMax = 1024;
+static const ulong NETCONSOLE_TAIL_KB_MAX = 1024;
 
 /* hugepages=: a share in percent is at most the whole machine; a size is
    in MiB or GiB, and at most what the most RAM this kernel addresses is --
    past that it is a typo, not a machine. Either is cut down at boot to what
    the machine can spare (PageTable::ReserveHugePool). */
-static const ulong HugePoolPercentMax = 100;
-static const ulong HugePoolMaxGiB = 512;
-static const ulong PercentWhole = 100;
+static const ulong HUGE_POOL_PERCENT_MAX = 100;
+static const ulong HUGE_POOL_MAX_GIB = 512;
+static const ulong PERCENT_WHOLE = 100;
 /* "1024G" and a NUL: the longest value worth reading. */
-static const size_t HugePoolValueMax = 16;
+static const size_t HUGE_POOL_VALUE_MAX = 16;
 
 Parameters::Parameters()
-    : TraceVga(false)
-    , PanicVga(false)
-    , PanicResetSecs(0)
-    , SmpOff(false)
-    , MaxCpusLimit(0)
-    , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
-    , HwRngOff(false)
-    , HwpOff(false)
-    , UcodeOff(false)
-    , WxProbeMd(WxProbeOff)
-    , UsbOff(false)
-    , RcOff(false)
-    , ConMode(ConsoleBoth)
-    , DhcpMd(DhcpOn)
-    , UdpShellPort(0)
-    , NetconsoleIp(0)
-    , NetconsolePort(0)
-    , NetconsoleTailKb(0)
-    , NetFrameCount(0)
-    , HugePoolPercent(0)
-    , HugePoolBytes(0)
-    , RxPoll(false)
-    , LogLevel(DefaultLogLevel)
-    , DnsEnabled(false)
-    , RootReadOnly(false)
-    , FsTest(false)
-    , DiskLogOn(false)
-    , Parsed(false)
+    : trace_vga_(false)
+    , panic_vga_(false)
+    , panic_reset_secs_(0)
+    , smp_off_(false)
+    , max_cpus_limit_(0)
+    , its_enabled_(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
+    , hw_rng_off_(false)
+    , hwp_off_(false)
+    , ucode_off_(false)
+    , wx_probe_md_(WxProbeOff)
+    , usb_off_(false)
+    , rc_off_(false)
+    , con_mode_(ConsoleBoth)
+    , dhcp_md_(DhcpOn)
+    , udp_shell_port_(0)
+    , netconsole_ip_(0)
+    , netconsole_port_(0)
+    , netconsole_tail_kb_(0)
+    , net_frame_count_(0)
+    , huge_pool_percent_(0)
+    , huge_pool_bytes_(0)
+    , rx_poll_(false)
+    , log_level_(DEFAULT_LOG_LEVEL)
+    , dns_enabled_(false)
+    , root_read_only_(false)
+    , fs_test_(false)
+    , disk_log_on_(false)
+    , parsed_(false)
 {
-    Cmdline[0] = '\0';
-    Stdlib::MemSet(&Root, 0, sizeof(Root));
-    Root.Mode = RootNone;
+    cmdline_[0] = '\0';
+    stdlib::mem_set(&root_, 0, sizeof(root_));
+    root_.mode = RootNone;
 }
 
 Parameters::~Parameters()
 {
 }
 
-bool Parameters::IsTraceVga()
+bool Parameters::is_trace_vga()
 {
-    return TraceVga;
+    return trace_vga_;
 }
 
-bool Parameters::IsPanicVga()
+bool Parameters::is_panic_vga()
 {
-    return PanicVga;
+    return panic_vga_;
 }
 
-ulong Parameters::GetPanicResetSecs()
+ulong Parameters::get_panic_reset_secs()
 {
-    return PanicResetSecs;
+    return panic_reset_secs_;
 }
 
-bool Parameters::IsSmpOff()
+bool Parameters::is_smp_off()
 {
-    return SmpOff;
+    return smp_off_;
 }
 
-ulong Parameters::GetMaxCpus()
+ulong Parameters::get_max_cpus()
 {
-    return MaxCpusLimit;
+    return max_cpus_limit_;
 }
 
-bool Parameters::IsHwRngOff()
+bool Parameters::is_hw_rng_off()
 {
-    return HwRngOff;
+    return hw_rng_off_;
 }
 
-bool Parameters::IsHwpOff()
+bool Parameters::is_hwp_off()
 {
-    return HwpOff;
+    return hwp_off_;
 }
 
-bool Parameters::IsUcodeOff()
+bool Parameters::is_ucode_off()
 {
-    return UcodeOff;
+    return ucode_off_;
 }
 
-bool Parameters::IsItsEnabled()
+bool Parameters::is_its_enabled()
 {
-    return ItsEnabled;
+    return its_enabled_;
 }
 
-bool Parameters::IsWxProbeText()
+bool Parameters::is_wx_probe_text()
 {
-    return WxProbeMd == WxProbeText;
+    return wx_probe_md_ == WxProbeText;
 }
 
-bool Parameters::IsWxProbeHeap()
+bool Parameters::is_wx_probe_heap()
 {
-    return WxProbeMd == WxProbeHeap;
+    return wx_probe_md_ == WxProbeHeap;
 }
 
-bool Parameters::IsUsbOff()
+bool Parameters::is_usb_off()
 {
-    return UsbOff;
+    return usb_off_;
 }
 
-bool Parameters::IsRcOff()
+bool Parameters::is_rc_off()
 {
-    return RcOff;
+    return rc_off_;
 }
 
-bool Parameters::IsConsoleSerial()
+bool Parameters::is_console_serial()
 {
-    return ConMode == ConsoleSerialOnly;
+    return con_mode_ == ConsoleSerialOnly;
 }
 
-bool Parameters::IsConsoleVga()
+bool Parameters::is_console_vga()
 {
-    return ConMode == ConsoleVgaOnly;
+    return con_mode_ == ConsoleVgaOnly;
 }
 
-bool Parameters::IsConsoleBoth()
+bool Parameters::is_console_both()
 {
-    return ConMode == ConsoleBoth;
+    return con_mode_ == ConsoleBoth;
 }
 
-bool Parameters::IsDhcpAuto()
+bool Parameters::is_dhcp_auto()
 {
-    return DhcpMd == DhcpAuto;
+    return dhcp_md_ == DhcpAuto;
 }
 
-bool Parameters::IsDhcpOff()
+bool Parameters::is_dhcp_off()
 {
-    return DhcpMd == DhcpOff;
+    return dhcp_md_ == DhcpOff;
 }
 
-u16 Parameters::GetUdpShellPort()
+u16 Parameters::get_udp_shell_port()
 {
-    return UdpShellPort;
+    return udp_shell_port_;
 }
 
-bool Parameters::IsNetconsoleEnabled()
+bool Parameters::is_netconsole_enabled()
 {
-    return NetconsolePort != 0;
+    return netconsole_port_ != 0;
 }
 
-u32 Parameters::GetNetconsoleIp()
+u32 Parameters::get_netconsole_ip()
 {
-    return NetconsoleIp;
+    return netconsole_ip_;
 }
 
-u16 Parameters::GetNetconsolePort()
+u16 Parameters::get_netconsole_port()
 {
-    return NetconsolePort;
+    return netconsole_port_;
 }
 
-ulong Parameters::GetNetconsoleTailKb()
+ulong Parameters::get_netconsole_tail_kb()
 {
-    return NetconsoleTailKb;
+    return netconsole_tail_kb_;
 }
 
-ulong Parameters::GetNetFrameCount()
+ulong Parameters::get_net_frame_count()
 {
-    return NetFrameCount;
+    return net_frame_count_;
 }
 
-ulong Parameters::GetHugePoolBytes(ulong totalBytes)
+ulong Parameters::get_huge_pool_bytes(ulong total_bytes)
 {
-    if (HugePoolPercent != 0)
+    if (huge_pool_percent_ != 0)
     {
         /* Both bounded -- the percent by HugePoolPercentMax, the machine by
            what one PDPT maps -- so the product cannot wrap. */
-        return totalBytes / PercentWhole * HugePoolPercent;
+        return total_bytes / PERCENT_WHOLE * huge_pool_percent_;
     }
-    return HugePoolBytes;
+    return huge_pool_bytes_;
 }
 
 /* "50%", "32G", "512M": a share of RAM or a size, into HugePoolPercent or
    HugePoolBytes. False, and neither set, for anything else. */
-bool Parameters::ParseHugePool(const char* value)
+bool Parameters::parse_huge_pool(const char* value)
 {
-    const size_t len = Stdlib::StrLen(value);
-    if (len < 2 || len >= HugePoolValueMax)
+    const size_t len = stdlib::str_len(value);
+    if (len < 2 || len >= HUGE_POOL_VALUE_MAX)
         return false;
     /* Everything but the last character, which says what the number is. */
-    char digits[HugePoolValueMax];
-    Stdlib::StrnCpy(digits, value, len);
+    char digits[HUGE_POOL_VALUE_MAX];
+    stdlib::strn_cpy(digits, value, len);
     ulong n = 0;
-    if (!Stdlib::ParseUlong(digits, n) || n == 0)
+    if (!stdlib::parse_ulong(digits, n) || n == 0)
         return false;
 
     switch (value[len - 1])
     {
     case '%':
-        if (n > HugePoolPercentMax)
+        if (n > HUGE_POOL_PERCENT_MAX)
             return false;
-        HugePoolPercent = n;
-        HugePoolBytes = 0;
+        huge_pool_percent_ = n;
+        huge_pool_bytes_ = 0;
         return true;
     case 'G':
     case 'g':
-        if (n > HugePoolMaxGiB)
+        if (n > HUGE_POOL_MAX_GIB)
             return false;
-        HugePoolBytes = n * Const::GB;
-        HugePoolPercent = 0;
+        huge_pool_bytes_ = n * consts::GB;
+        huge_pool_percent_ = 0;
         return true;
     case 'M':
     case 'm':
-        if (n > HugePoolMaxGiB * Const::GB / Const::MB)
+        if (n > HUGE_POOL_MAX_GIB * consts::GB / consts::MB)
             return false;
-        HugePoolBytes = n * Const::MB;
-        HugePoolPercent = 0;
+        huge_pool_bytes_ = n * consts::MB;
+        huge_pool_percent_ = 0;
         return true;
     default:
         return false;
     }
 }
 
-bool Parameters::IsRxPollEnabled()
+bool Parameters::is_rx_poll_enabled()
 {
-    return RxPoll;
+    return rx_poll_;
 }
 
-int Parameters::GetLogLevel()
+int Parameters::get_log_level()
 {
-    return LogLevel;
+    return log_level_;
 }
 
-bool Parameters::IsDnsEnabled()
+bool Parameters::is_dns_enabled()
 {
-    return DnsEnabled;
+    return dns_enabled_;
 }
 
-const Parameters::RootSpec& Parameters::GetRoot()
+const Parameters::RootSpec& Parameters::get_root()
 {
-    return Root;
+    return root_;
 }
 
-bool Parameters::IsRootReadOnly()
+bool Parameters::is_root_read_only()
 {
-    return RootReadOnly;
+    return root_read_only_;
 }
 
-bool Parameters::IsFsTest()
+bool Parameters::is_fs_test()
 {
-    return FsTest;
+    return fs_test_;
 }
 
-bool Parameters::IsDiskLogOn()
+bool Parameters::is_disk_log_on()
 {
-    return DiskLogOn;
+    return disk_log_on_;
 }
 
-bool Parameters::IsParsed()
+bool Parameters::is_parsed()
 {
-    return Parsed;
+    return parsed_;
 }
 
 /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, as blkid prints it */
-bool Parameters::ParseUuid(const char* text, u8* out)
+bool Parameters::parse_uuid(const char* text, u8* out)
 {
-    if (Stdlib::StrLen(text) != UuidTextLen)
+    if (stdlib::str_len(text) != UUID_TEXT_LEN)
         return false;
 
-    char hex[UuidBytes * 2 + 1];
+    char hex[UUID_BYTES * 2 + 1];
     ulong n = 0;
-    for (ulong i = 0; i < UuidTextLen; i++)
+    for (ulong i = 0; i < UUID_TEXT_LEN; i++)
     {
         if (i == 8 || i == 13 || i == 18 || i == 23)
         {
@@ -300,18 +300,18 @@ bool Parameters::ParseUuid(const char* text, u8* out)
     hex[n] = '\0';
 
     ulong bytes = 0;
-    return Stdlib::HexDecode(hex, n, out, UuidBytes, bytes) && bytes == UuidBytes;
+    return stdlib::hex_decode(hex, n, out, UUID_BYTES, bytes) && bytes == UUID_BYTES;
 }
 
-const char* Parameters::GetCmdline()
+const char* Parameters::get_cmdline()
 {
-    return Cmdline;
+    return cmdline_;
 }
 
 /* A dotted quad into host byte order. The only thing the command line has
    ever needed of an address, and the reason this file used to include the
    whole network layer's header. */
-static bool ParseIpV4(const char* text, u32& out)
+static bool parse_ip_v4(const char* text, u32& out)
 {
     u32 addr = 0;
     for (ulong octet = 0; octet < 4; octet++)
@@ -344,32 +344,32 @@ static bool ParseIpV4(const char* text, u32& out)
     return true;
 }
 
-bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
+bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
 {
-    if (BugOn(start >= end))
+    if (BUG_ON(start >= end))
         return false;
 
-    char param[MaxParamLen + 1];
+    char param[MAX_PARAM_LEN + 1];
     size_t len = end - start;
-    if (len > MaxParamLen)
+    if (len > MAX_PARAM_LEN)
         return false;
 
     /* The shortest token taken is the bare word ro */
     if (len < 2)
         return false;
 
-    Stdlib::StrnCpy(param, &cmdline[start], len + 1);
+    stdlib::strn_cpy(param, &cmdline[start], len + 1);
 
     /* The key ends at the first '=': the value may hold one of its own, as
        root=LABEL=<label> and root=UUID=<uuid> do */
-    const char* sep = Stdlib::StrChr(param, '=');
+    const char* sep = stdlib::str_chr(param, '=');
     if (sep == nullptr)
     {
         /* The one bare word taken, as on Linux: ro */
-        if (Stdlib::StrCmp(param, "ro") == 0)
+        if (stdlib::str_cmp(param, "ro") == 0)
         {
-            Trace(0, "Key %s", param);
-            RootReadOnly = true;
+            trace(0, "Key %s", param);
+            root_read_only_ = true;
             return true;
         }
         return false;
@@ -378,324 +378,324 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if ((sep == param) || (sep == &param[len - 1]))
         return false;
 
-    size_t keyLen = sep - param;
+    size_t key_len = sep - param;
     const char *key = &param[0];
-    param[keyLen] = '\0';
-    const char *value = &param[keyLen + 1];
+    param[key_len] = '\0';
+    const char *value = &param[key_len + 1];
 
-    Trace(0, "Key %s value %s", key, value);
+    trace(0, "Key %s value %s", key, value);
 
-    if (Stdlib::StrCmp(key, "trace") == 0)
+    if (stdlib::str_cmp(key, "trace") == 0)
     {
-        if (Stdlib::StrCmp(value, "vga") == 0)
+        if (stdlib::str_cmp(value, "vga") == 0)
         {
-            TraceVga = true;
+            trace_vga_ = true;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "panic") == 0)
+    else if (stdlib::str_cmp(key, "panic") == 0)
     {
         ulong secs = 0;
-        if (Stdlib::StrCmp(value, "vga") == 0)
+        if (stdlib::str_cmp(value, "vga") == 0)
         {
-            PanicVga = true;
+            panic_vga_ = true;
         }
-        else if (Stdlib::ParseUlong(value, secs) && secs <= PanicResetSecsMax)
+        else if (stdlib::parse_ulong(value, secs) && secs <= PANIC_RESET_SECS_MAX)
         {
-            PanicResetSecs = secs;
-        }
-        else
-        {
-            Trace(0, "Unknown value %s, key %s", value, key);
-        }
-    }
-    else if (Stdlib::StrCmp(key, "its") == 0)
-    {
-        ItsEnabled = (Stdlib::StrCmp(value, "off") != 0);
-    }
-    else if (Stdlib::StrCmp(key, "usb") == 0)
-    {
-        UsbOff = (Stdlib::StrCmp(value, "off") == 0);
-    }
-    else if (Stdlib::StrCmp(key, "rc") == 0)
-    {
-        RcOff = (Stdlib::StrCmp(value, "off") == 0);
-    }
-    else if (Stdlib::StrCmp(key, "hwrng") == 0)
-    {
-        HwRngOff = (Stdlib::StrCmp(value, "off") == 0);
-    }
-    else if (Stdlib::StrCmp(key, "hwp") == 0)
-    {
-        HwpOff = (Stdlib::StrCmp(value, "off") == 0);
-    }
-    else if (Stdlib::StrCmp(key, "ucode") == 0)
-    {
-        UcodeOff = (Stdlib::StrCmp(value, "off") == 0);
-    }
-    else if (Stdlib::StrCmp(key, "wxprobe") == 0)
-    {
-        if (Stdlib::StrCmp(value, "on") == 0 || Stdlib::StrCmp(value, "text") == 0)
-            WxProbeMd = WxProbeText;
-        else if (Stdlib::StrCmp(value, "heap") == 0)
-            WxProbeMd = WxProbeHeap;
-        else
-            Trace(0, "Unknown value %s, key %s", value, key);
-    }
-    else if (Stdlib::StrCmp(key, "smp") == 0)
-    {
-        if (Stdlib::StrCmp(value, "off") == 0)
-        {
-            SmpOff = true;
+            panic_reset_secs_ = secs;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "maxcpus") == 0)
+    else if (stdlib::str_cmp(key, "its") == 0)
+    {
+        its_enabled_ = (stdlib::str_cmp(value, "off") != 0);
+    }
+    else if (stdlib::str_cmp(key, "usb") == 0)
+    {
+        usb_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "rc") == 0)
+    {
+        rc_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "hwrng") == 0)
+    {
+        hw_rng_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "hwp") == 0)
+    {
+        hwp_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "ucode") == 0)
+    {
+        ucode_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "wxprobe") == 0)
+    {
+        if (stdlib::str_cmp(value, "on") == 0 || stdlib::str_cmp(value, "text") == 0)
+            wx_probe_md_ = WxProbeText;
+        else if (stdlib::str_cmp(value, "heap") == 0)
+            wx_probe_md_ = WxProbeHeap;
+        else
+            trace(0, "Unknown value %s, key %s", value, key);
+    }
+    else if (stdlib::str_cmp(key, "smp") == 0)
+    {
+        if (stdlib::str_cmp(value, "off") == 0)
+        {
+            smp_off_ = true;
+        }
+        else
+        {
+            trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (stdlib::str_cmp(key, "maxcpus") == 0)
     {
         ulong count = 0;
-        if (Stdlib::ParseUlong(value, count) && count > 0 && count <= MaxCpus)
+        if (stdlib::parse_ulong(value, count) && count > 0 && count <= MAX_CPUS)
         {
-            MaxCpusLimit = count;
+            max_cpus_limit_ = count;
         }
         else
         {
-            Trace(0, "Invalid maxcpus %s", value);
+            trace(0, "Invalid maxcpus %s", value);
         }
     }
-    else if (Stdlib::StrCmp(key, "console") == 0)
+    else if (stdlib::str_cmp(key, "console") == 0)
     {
-        if (Stdlib::StrCmp(value, "serial") == 0)
+        if (stdlib::str_cmp(value, "serial") == 0)
         {
-            ConMode = ConsoleSerialOnly;
+            con_mode_ = ConsoleSerialOnly;
         }
-        else if (Stdlib::StrCmp(value, "vga") == 0)
+        else if (stdlib::str_cmp(value, "vga") == 0)
         {
-            ConMode = ConsoleVgaOnly;
+            con_mode_ = ConsoleVgaOnly;
         }
-        else if (Stdlib::StrCmp(value, "both") == 0)
+        else if (stdlib::str_cmp(value, "both") == 0)
         {
-            ConMode = ConsoleBoth;
+            con_mode_ = ConsoleBoth;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "dhcp") == 0)
+    else if (stdlib::str_cmp(key, "dhcp") == 0)
     {
-        if (Stdlib::StrCmp(value, "auto") == 0)
+        if (stdlib::str_cmp(value, "auto") == 0)
         {
-            DhcpMd = DhcpAuto;
+            dhcp_md_ = DhcpAuto;
         }
-        else if (Stdlib::StrCmp(value, "on") == 0)
+        else if (stdlib::str_cmp(value, "on") == 0)
         {
-            DhcpMd = DhcpOn;
+            dhcp_md_ = DhcpOn;
         }
-        else if (Stdlib::StrCmp(value, "off") == 0)
+        else if (stdlib::str_cmp(value, "off") == 0)
         {
-            DhcpMd = DhcpOff;
+            dhcp_md_ = DhcpOff;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "udpshell") == 0)
+    else if (stdlib::str_cmp(key, "udpshell") == 0)
     {
         ulong port = 0;
-        if (Stdlib::ParseUlong(value, port) && port > 0 && port <= 65535)
+        if (stdlib::parse_ulong(value, port) && port > 0 && port <= 65535)
         {
-            UdpShellPort = (u16)port;
+            udp_shell_port_ = (u16)port;
         }
         else
         {
-            Trace(0, "Invalid udpshell port %s", value);
+            trace(0, "Invalid udpshell port %s", value);
         }
     }
-    else if (Stdlib::StrCmp(key, "netconsole") == 0)
+    else if (stdlib::str_cmp(key, "netconsole") == 0)
     {
         /* netconsole=ip:port */
-        const char* colon = Stdlib::StrChrOnce(value, ':');
+        const char* colon = stdlib::str_chr_once(value, ':');
         if (colon == nullptr || colon == value || *(colon + 1) == '\0')
         {
-            Trace(0, "Invalid netconsole value %s, expected ip:port", value);
+            trace(0, "Invalid netconsole value %s, expected ip:port", value);
         }
         else
         {
-            char ipBuf[16];
-            size_t ipLen = colon - value;
+            char ip_buf[16];
+            size_t ip_len = colon - value;
             ulong port = 0;
 
             u32 ip = 0;
-            if (ipLen >= sizeof(ipBuf))
+            if (ip_len >= sizeof(ip_buf))
             {
-                Trace(0, "Invalid netconsole ip in %s", value);
+                trace(0, "Invalid netconsole ip in %s", value);
             }
             else
             {
-                Stdlib::StrnCpy(ipBuf, value, ipLen + 1);
-                if (!ParseIpV4(ipBuf, ip))
+                stdlib::strn_cpy(ip_buf, value, ip_len + 1);
+                if (!parse_ip_v4(ip_buf, ip))
                 {
-                    Trace(0, "Invalid netconsole ip %s", ipBuf);
+                    trace(0, "Invalid netconsole ip %s", ip_buf);
                 }
-                else if (!Stdlib::ParseUlong(colon + 1, port) || port == 0 || port > 65535)
+                else if (!stdlib::parse_ulong(colon + 1, port) || port == 0 || port > 65535)
                 {
-                    Trace(0, "Invalid netconsole port %s", colon + 1);
+                    trace(0, "Invalid netconsole port %s", colon + 1);
                 }
                 else
                 {
-                    NetconsoleIp = ip;
-                    NetconsolePort = (u16)port;
+                    netconsole_ip_ = ip;
+                    netconsole_port_ = (u16)port;
                 }
             }
         }
     }
-    else if (Stdlib::StrCmp(key, "rxpoll") == 0)
+    else if (stdlib::str_cmp(key, "rxpoll") == 0)
     {
-        RxPoll = (Stdlib::StrCmp(value, "on") == 0);
+        rx_poll_ = (stdlib::str_cmp(value, "on") == 0);
     }
-    else if (Stdlib::StrCmp(key, "ubsan") == 0)
+    else if (stdlib::str_cmp(key, "ubsan") == 0)
     {
         /* Meaningful in a UBSAN=1 build only, and harmless in any other. */
-        Ubsan::SetWarnOnly(Stdlib::StrCmp(value, "warn") == 0);
+        ubsan::set_warn_only(stdlib::str_cmp(value, "warn") == 0);
     }
-    else if (Stdlib::StrCmp(key, "netframes") == 0)
+    else if (stdlib::str_cmp(key, "netframes") == 0)
     {
         ulong count = 0;
-        if (Stdlib::ParseUlong(value, count) &&
-            count >= NetFrameCountMin && count <= NetFrameCountMax)
+        if (stdlib::parse_ulong(value, count) &&
+            count >= NET_FRAME_COUNT_MIN && count <= NET_FRAME_COUNT_MAX)
         {
-            NetFrameCount = count;
+            net_frame_count_ = count;
         }
         else
         {
-            Trace(0, "Invalid netframes %s", value);
+            trace(0, "Invalid netframes %s", value);
         }
     }
-    else if (Stdlib::StrCmp(key, "hugepages") == 0)
+    else if (stdlib::str_cmp(key, "hugepages") == 0)
     {
-        if (!ParseHugePool(value))
-            Trace(0, "Invalid hugepages %s: a share of RAM (50%%) or a size (32G, 512M)", value);
+        if (!parse_huge_pool(value))
+            trace(0, "Invalid hugepages %s: a share of RAM (50%%) or a size (32G, 512M)", value);
     }
-    else if (Stdlib::StrCmp(key, "nctail") == 0)
+    else if (stdlib::str_cmp(key, "nctail") == 0)
     {
         ulong kb = 0;
-        if (Stdlib::ParseUlong(value, kb) && kb > 0 && kb <= NetconsoleTailKbMax)
+        if (stdlib::parse_ulong(value, kb) && kb > 0 && kb <= NETCONSOLE_TAIL_KB_MAX)
         {
-            NetconsoleTailKb = kb;
+            netconsole_tail_kb_ = kb;
         }
         else
         {
-            Trace(0, "Invalid nctail %s", value);
+            trace(0, "Invalid nctail %s", value);
         }
     }
-    else if (Stdlib::StrCmp(key, "loglevel") == 0)
+    else if (stdlib::str_cmp(key, "loglevel") == 0)
     {
         /* The runtime `loglevel` shell command cannot help with a boot that
            has already happened, and the chattier levels are exactly the ones
            worth having during bring-up on a machine you cannot log into. */
         ulong level = 0;
-        if (Stdlib::ParseUlong(value, level) && level <= (ulong)MaxTraceLevel)
+        if (stdlib::parse_ulong(value, level) && level <= (ulong)MAX_TRACE_LEVEL)
         {
-            LogLevel = (int)level;
+            log_level_ = (int)level;
         }
         else
         {
-            Trace(0, "Invalid loglevel %s", value);
+            trace(0, "Invalid loglevel %s", value);
         }
     }
-    else if (Stdlib::StrCmp(key, "root") == 0)
+    else if (stdlib::str_cmp(key, "root") == 0)
     {
-        const char* labelPrefix = "LABEL=";
-        const char* uuidPrefix = "UUID=";
-        ulong labelPrefixLen = Stdlib::StrLen(labelPrefix);
-        ulong uuidPrefixLen = Stdlib::StrLen(uuidPrefix);
+        const char* label_prefix = "LABEL=";
+        const char* uuid_prefix = "UUID=";
+        ulong label_prefix_len = stdlib::str_len(label_prefix);
+        ulong uuid_prefix_len = stdlib::str_len(uuid_prefix);
 
-        Stdlib::MemSet(&Root, 0, sizeof(Root));
-        if (Stdlib::StrCmp(value, "auto") == 0)
+        stdlib::mem_set(&root_, 0, sizeof(root_));
+        if (stdlib::str_cmp(value, "auto") == 0)
         {
-            Root.Mode = RootAuto;
+            root_.mode = RootAuto;
         }
-        else if (Stdlib::StrnCmp(value, labelPrefix, labelPrefixLen) == 0 &&
-                 value[labelPrefixLen] != '\0')
+        else if (stdlib::strn_cmp(value, label_prefix, label_prefix_len) == 0 &&
+                 value[label_prefix_len] != '\0')
         {
-            Root.Mode = RootLabel;
-            Stdlib::StrnCpy(Root.Value, value + labelPrefixLen, sizeof(Root.Value));
+            root_.mode = RootLabel;
+            stdlib::strn_cpy(root_.value, value + label_prefix_len, sizeof(root_.value));
         }
-        else if (Stdlib::StrnCmp(value, uuidPrefix, uuidPrefixLen) == 0)
+        else if (stdlib::strn_cmp(value, uuid_prefix, uuid_prefix_len) == 0)
         {
-            if (ParseUuid(value + uuidPrefixLen, Root.Uuid))
+            if (parse_uuid(value + uuid_prefix_len, root_.uuid))
             {
-                Root.Mode = RootUuid;
-                Stdlib::StrnCpy(Root.Value, value + uuidPrefixLen, sizeof(Root.Value));
+                root_.mode = RootUuid;
+                stdlib::strn_cpy(root_.value, value + uuid_prefix_len, sizeof(root_.value));
             }
             else
             {
-                Trace(0, "Invalid UUID %s, key %s", value, key);
+                trace(0, "Invalid UUID %s, key %s", value, key);
             }
         }
         else
         {
-            Root.Mode = RootDevice;
-            Stdlib::StrnCpy(Root.Value, value, sizeof(Root.Value));
+            root_.mode = RootDevice;
+            stdlib::strn_cpy(root_.value, value, sizeof(root_.value));
         }
     }
-    else if (Stdlib::StrCmp(key, "fstest") == 0)
+    else if (stdlib::str_cmp(key, "fstest") == 0)
     {
-        if (Stdlib::StrCmp(value, "on") == 0)
+        if (stdlib::str_cmp(value, "on") == 0)
         {
-            FsTest = true;
+            fs_test_ = true;
         }
-        else if (Stdlib::StrCmp(value, "off") == 0)
+        else if (stdlib::str_cmp(value, "off") == 0)
         {
-            FsTest = false;
+            fs_test_ = false;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "disklog") == 0)
+    else if (stdlib::str_cmp(key, "disklog") == 0)
     {
-        if (Stdlib::StrCmp(value, "on") == 0)
+        if (stdlib::str_cmp(value, "on") == 0)
         {
-            DiskLogOn = true;
+            disk_log_on_ = true;
         }
-        else if (Stdlib::StrCmp(value, "off") == 0)
+        else if (stdlib::str_cmp(value, "off") == 0)
         {
-            DiskLogOn = false;
+            disk_log_on_ = false;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    else if (Stdlib::StrCmp(key, "dns") == 0)
+    else if (stdlib::str_cmp(key, "dns") == 0)
     {
-        if (Stdlib::StrCmp(value, "on") == 0)
+        if (stdlib::str_cmp(value, "on") == 0)
         {
-            DnsEnabled = true;
+            dns_enabled_ = true;
         }
         else
         {
-            Trace(0, "Unknown value %s, key %s", value, key);
+            trace(0, "Unknown value %s, key %s", value, key);
         }
     }
     else
     {
-        Trace(0, "Unknown key %s, skipping", key);
+        trace(0, "Unknown key %s, skipping", key);
     }
 
     return true;
 }
 
-void Parameters::Parse(const char *cmdline)
+void Parameters::parse(const char *cmdline)
 {
     /* Not set until the whole line has been read, at the end. Parsing traces
        a line per parameter, and the disk log keeps a line only while nothing
@@ -708,14 +708,14 @@ void Parameters::Parse(const char *cmdline)
 
     if (cmdline == nullptr)
     {
-        Parsed = true;
+        parsed_ = true;
         return;
     }
 
     /* StrnCpy, not SnPrintf: past the end of the buffer SnPrintf keeps
        nothing, and what is wanted there is as much as fits */
-    Stdlib::StrnCpy(Cmdline, cmdline, sizeof(Cmdline));
-    ulong kept = Stdlib::StrLen(Cmdline);
+    stdlib::strn_cpy(cmdline_, cmdline, sizeof(cmdline_));
+    ulong kept = stdlib::str_len(cmdline_);
     if (cmdline[kept] != '\0')
     {
         /* Longer than the buffer. The parameter the end cuts through goes
@@ -723,48 +723,48 @@ void Parameters::Parse(const char *cmdline)
            cut short is root=LABEL=nos. */
         if (cmdline[kept] != ' ')
         {
-            while (kept > 0 && Cmdline[kept - 1] != ' ')
+            while (kept > 0 && cmdline_[kept - 1] != ' ')
                 kept--;
-            Cmdline[kept] = '\0';
+            cmdline_[kept] = '\0';
         }
 
         const char* rest = &cmdline[kept];
         while (*rest == ' ')
             rest++;
 
-        char shown[MaxParamLen + 1];
-        Stdlib::StrnCpy(shown, rest, sizeof(shown));
-        Trace(0, "Cmdline: longer than %lu characters, ignoring from '%s'",
-            (ulong)(CmdlineLen - 1), shown);
+        char shown[MAX_PARAM_LEN + 1];
+        stdlib::strn_cpy(shown, rest, sizeof(shown));
+        trace(0, "Cmdline: longer than %lu characters, ignoring from '%s'",
+            (ulong)(CMDLINE_LEN - 1), shown);
     }
 
-    ulong len = Stdlib::StrLen(Cmdline);
+    ulong len = stdlib::str_len(cmdline_);
     ulong start = 0;
     for (ulong i = 0; i <= len; i++)
     {
-        if (i < len && Cmdline[i] != ' ')
+        if (i < len && cmdline_[i] != ' ')
             continue;
 
-        if (start < i && !ParseParameter(Cmdline, start, i))
+        if (start < i && !parse_parameter(cmdline_, start, i))
         {
             /* Named, so that a typo, or a Linux habit such as quiet, is a
                line in the log rather than a boot that stops */
-            ulong shownLen = i - start;
-            if (shownLen > MaxParamLen)
-                shownLen = MaxParamLen;
+            ulong shown_len = i - start;
+            if (shown_len > MAX_PARAM_LEN)
+                shown_len = MAX_PARAM_LEN;
 
-            char shown[MaxParamLen + 1];
-            Stdlib::StrnCpy(shown, &Cmdline[start], shownLen + 1);
-            if (i - start > MaxParamLen)
-                Trace(0, "Cmdline: ignoring '%s...', longer than the %lu characters "
-                    "a parameter can have", shown, (ulong)MaxParamLen);
+            char shown[MAX_PARAM_LEN + 1];
+            stdlib::strn_cpy(shown, &cmdline_[start], shown_len + 1);
+            if (i - start > MAX_PARAM_LEN)
+                trace(0, "Cmdline: ignoring '%s...', longer than the %lu characters "
+                    "a parameter can have", shown, (ulong)MAX_PARAM_LEN);
             else
-                Trace(0, "Cmdline: ignoring '%s'", shown);
+                trace(0, "Cmdline: ignoring '%s'", shown);
         }
         start = i + 1;
     }
 
-    Parsed = true;
+    parsed_ = true;
 }
 
 }
