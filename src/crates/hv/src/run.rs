@@ -322,6 +322,11 @@ pub struct Counts {
     /// a #DB with DR7's general detect on.
     pub dr: u64,
     pub dr_refused: u64,
+    /// XSETBVs the guest stopped at (`crate::cr::xsetbv`), and of those the
+    /// ones refused: a #UD without CR4.OSXSAVE, a #GP for an XCR0 a CPU
+    /// does not take.
+    pub xsetbv: u64,
+    pub xsetbv_refused: u64,
     pub exits: u64,
 }
 
@@ -368,6 +373,8 @@ impl Counts {
         self.cr4_gp += o.cr4_gp;
         self.dr += o.dr;
         self.dr_refused += o.dr_refused;
+        self.xsetbv += o.xsetbv;
+        self.xsetbv_refused += o.xsetbv_refused;
         self.exits += o.exits;
     }
 }
@@ -1331,12 +1338,12 @@ impl LinuxGuest {
                 Exit::Io(io) => self.io(gc, &io, host),
                 Exit::Cpuid => {
                     gc.counts.cpuid += 1;
-                    let id = gc.lapic.id();
                     let apic = self.has_apic();
                     let v = gc.cpu.backend_mut();
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
-                    let answer = crate::policy::cpuid(leaf, sub, id, apic);
+                    let asker = crate::policy::Asker { apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0() };
+                    let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
                     crate::policy::apply_cpuid(save, regs, &answer);
                     v.skip_cpuid();
@@ -1443,9 +1450,16 @@ impl LinuxGuest {
                 /* The guest can take an interrupt, or an NMI, now; the next
                  * entry injects it. Nothing to do here. */
                 Exit::IrqWindow | Exit::NmiWindow => None,
+                Exit::Other(vmcb::exit::XSETBV) => {
+                    gc.counts.xsetbv += 1;
+                    if cr::xsetbv(gc.cpu.backend_mut()) != cr::Xcr::Written {
+                        gc.counts.xsetbv_refused += 1;
+                    }
+                    None
+                }
                 Exit::Other(code) if matches!(code,
                     vmcb::exit::MONITOR | vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED
-                    | vmcb::exit::RDTSCP | vmcb::exit::RDPRU | vmcb::exit::XSETBV) =>
+                    | vmcb::exit::RDTSCP | vmcb::exit::RDPRU) =>
                 {
                     /* Intercepted, and not offered by CPUID: the guest gets
                      * what a CPU without them gives it. */

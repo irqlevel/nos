@@ -472,7 +472,7 @@ pub(crate) fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: 
         return Err(Error::BadAddress);
     }
     let ioapic_id = cpus as u8;
-    let signature = crate::policy::cpuid(1, 0, 0, true);
+    let signature = crate::policy::cpuid(1, 0, &crate::policy::Asker::RESET);
 
     /* Built in a buffer on the stack -- every entry the most CPUs need
      * fits in far less than the KiB the table has -- then copied in. */

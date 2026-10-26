@@ -74,6 +74,13 @@ REQUIRED = [
 # setup; not required, but reported when it appears.
 NICE = r"Kernel command line:"
 
+# XSAVE's state, switched for the guest as far as AVX's (`hvarch::x86::fp`):
+# its kernel turns the x87, SSE and AVX on in XCR0 -- 832 bytes of them in
+# either of XSAVE's formats: standard, or compacted where the CPU has XSAVEC
+# for the policy to pass on (a Zen 2 has; QEMU's TCG has not), which Linux
+# then saves with, AVX's component wanting no alignment of its own there.
+XSTATE = r"x86/fpu: Enabled xstate features 0x7, context size is 832 bytes, using '(?:standard|compacted)' format\."
+
 # With an initramfs, the fourth demo: the guest runs its init and reaches an
 # interactive shell over the emulated UART. These are checked only when an
 # initrd is given (the init here is a busybox that prints and execs a shell).
@@ -630,6 +637,9 @@ def check_boot(args, txt):
     block = txt[txt.find("--- ttyS0 ---"):txt.find("--- end ttyS0 ---")] if "--- ttyS0 ---" in txt else ""
     for m in REQUIRED:
         pt.check("the guest printed: %s" % m, re.search(m, block) is not None, block[-1500:])
+    xstate = re.search(r"(?m)^.*x86/fpu: Enabled xstate.*$", block)
+    pt.check("the guest's kernel turned on the x87, SSE and AVX in XCR0", re.search(XSTATE, block) is not None,
+             xstate.group(0) if xstate else block[-1500:])
     if re.search(NICE, block):
         print("note: the guest reached %r" % NICE)
     if args.initrd:
