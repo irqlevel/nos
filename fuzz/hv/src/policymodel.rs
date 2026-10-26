@@ -79,18 +79,27 @@ const EXT21_EAX: u32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 29) | (
 const EXT21_ECX: u32 = (1 << 1) | (1 << 2);
 
 /* Leaf 7, subleaf 0: FSGSBASE, BMI1, the x87 FDP and CS/DS facts, SMEP,
- * BMI2, ERMS, RDSEED, ADX, SMAP, CLFLUSHOPT, CLWB and SHA in EBX; UMIP in
- * ECX; FSRM, MD_CLEAR, SERIALIZE and ARCH_CAPABILITIES in EDX -- what runs
- * as it is, on no state the host would switch, and facts of the CPU. No
- * other subleaf. */
+ * BMI2, ERMS, RDSEED, ADX, SMAP, CLFLUSHOPT, CLWB and SHA in EBX; UMIP and
+ * GFNI in ECX; FSRM, MD_CLEAR, SERIALIZE and ARCH_CAPABILITIES in EDX --
+ * what runs as it is, on no state the host would switch, and facts of the
+ * CPU. */
 const LEAF7_EBX: u32 = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 13) | (1 << 18)
     | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 24) | (1 << 29);
-const LEAF7_ECX: u32 = 1 << 2;
+const LEAF7_ECX: u32 = (1 << 2) | (1 << 8);
 const LEAF7_EDX: u32 = (1 << 4) | (1 << 10) | (1 << 14) | (1 << 29);
 /* And where AVX's state is offered, its line: AVX2 in EBX, VAES and
  * VPCLMULQDQ in ECX. */
 const LEAF7_EBX_AVX: u32 = 1 << 5;
 const LEAF7_ECX_AVX: u32 = (1 << 9) | (1 << 10);
+/* Subleaf 1, the last answered (subleaf 0's EAX no more than 1): in EAX the
+ * fast string facts -- zero-length MOVSB, short STOSB, short CMPSB and SCASB
+ * -- and where AVX's state is offered the VEX-coded SHA512, SM3, SM4,
+ * AVX-VNNI and AVX-IFMA; in EDX AVX-VNNI-INT8, AVX-NE-CONVERT and
+ * AVX-VNNI-INT16; nothing in EBX or ECX. */
+const LEAF7_LAST: u32 = 1;
+const LEAF7_1_EAX: u32 = (1 << 10) | (1 << 11) | (1 << 12);
+const LEAF7_1_EAX_AVX: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 23);
+const LEAF7_1_EDX_AVX: u32 = (1 << 4) | (1 << 5) | (1 << 10);
 
 /* Leaf 0xD (SDM vol. 1, 13.2; APM vol. 2, 11.5.2): XSAVE's standard area
  * is the legacy region and the header, 576 bytes, then each component at
@@ -201,10 +210,16 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         6 => want(g == [arat, 0, 0, 0], "ARAT for a guest with APICs, and nothing else"),
         7 if sub == 0 => {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
-            want(g[0] == 0, "EAX: no subleaf past 0");
+            want(g[0] == h[0].min(LEAF7_LAST), "EAX: the host's last subleaf, no further than 1");
             want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx, 0) == 0, "EBX within the model's");
             want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx, 0) == 0, "ECX within the model's");
             want(leaked(g[3], h[3], LEAF7_EDX, 0) == 0, "EDX within the model's");
+        }
+        7 if sub == 1 && host(7, 0).map_or(0, |h0| h0[0]) >= 1 => {
+            let (avx_eax, avx_edx) = if avx { (LEAF7_1_EAX_AVX, LEAF7_1_EDX_AVX) } else { (0, 0) };
+            want(leaked(g[0], h[0], LEAF7_1_EAX | avx_eax, 0) == 0, "EAX within the model's");
+            want(g[1] == 0 && g[2] == 0, "EBX and ECX: nothing");
+            want(leaked(g[3], h[3], avx_edx, 0) == 0, "EDX within the model's");
         }
         0xD if offered == 0 => want(g == [0; 4], "nothing: no XSAVE state offered"),
         0xD => {
