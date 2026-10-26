@@ -1385,16 +1385,18 @@ here:
   host's if lower -- and of the leaves it names a guest is told the host's
   bits it lets through: XSAVE's state as far as the switch around `vmrun`
   and `vmlaunch` moves it, the x87, SSE and AVX -- XSAVE, OSXSAVE as the
-  guest's own CR4 has it, AVX, FMA, F16C, AVX2, VAES and VPCLMULQDQ; leaf
-  0xD made up for those three components, its sizes for the guest's own
-  XCR0; XSAVEOPT, XSAVEC and XGETBV's ECX 1 as the host has them, never
-  XSAVES -- and no AVX-512, AMX or PKU, whose state nothing switches; no
-  paravirtualisation, no
+  guest's own CR4 has it, AVX, FMA, F16C, AVX2, VAES and VPCLMULQDQ, and of
+  leaf 7's subleaf 1 the VEX-coded AVX-VNNI, AVX-IFMA, AVX-VNNI-INT8 and
+  -INT16, AVX-NE-CONVERT, SHA512, SM3 and SM4; leaf 0xD made up for those
+  three components, its sizes for the guest's own XCR0; XSAVEOPT, XSAVEC
+  and XGETBV's ECX 1 as the host has them, never XSAVES -- and no AVX-512,
+  AMX or PKU, whose state nothing switches; no paravirtualisation, no
   speculation control (none has its MSR behind it yet); of the structured
   leaf, 7, what runs as it is and owns no state of the host's -- SMEP, SMAP
   and UMIP for the guest's kernel, FSGSBASE over bases the VMCS and the VMCB
-  keep, BMI, ADX, ERMS and FSRM, RDSEED, SHA, CLFLUSHOPT and CLWB,
-  SERIALIZE -- with MD_CLEAR, VERW clearing the CPU's buffers in a guest as
+  keep, BMI, ADX, ERMS and FSRM (and of subleaf 1 the fast zero-length and
+  short string facts, FZRM, FSRS and FSRC), RDSEED, SHA, GFNI, CLFLUSHOPT
+  and CLWB, SERIALIZE -- with MD_CLEAR, VERW clearing the CPU's buffers in a guest as
   anywhere, and ARCH_CAPABILITIES, whose MSR reads as the host's but for
   the bits that are not facts of the CPU (IBRS_ALL, whose SPEC_CTRL is not
   the guest's, and those naming an MSR nothing answers); PCID, but not

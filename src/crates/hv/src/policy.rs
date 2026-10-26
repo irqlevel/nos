@@ -171,13 +171,15 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
 /* Leaf 7, subleaf 0, the structured features: what runs on the CPU as it
  * is, with nothing of the host's behind it to switch, and what CR4 bits the
  * guest owns turn on -- SMEP, SMAP and UMIP for its kernel, FSGSBASE over
- * bases the VMCS and the VMCB keep -- and facts of the silicon; and where
- * AVX's state is switched, the AVX line (`LEAF7_EBX_AVX`). Its EAX, the last
- * subleaf, is 0: the others are not offered. Among what is cleared: AVX-512
- * and AMX (state past AVX's, which nothing switches), HLE and RTM, MPX, PT,
- * SGX, PKU (a PKRU nothing switches), CET, WAITPKG, TSC_ADJUST, INVPCID,
- * RDPID, LA57, the hybrid flag, and the speculation controls -- IBRS and
- * IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not the guest's to write. */
+ * bases the VMCS and the VMCB keep -- and facts of the silicon; GFNI, whose
+ * SSE forms are on the XMM registers and VEX forms on the YMM; and where
+ * AVX's state is switched, the AVX line (`LEAF7_EBX_AVX`). Its EAX is the
+ * last subleaf answered, the host's or 1 (`LEAF7_LAST_SUBLEAF`). Among what
+ * is cleared: AVX-512 and AMX (state past AVX's, which nothing switches),
+ * HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
+ * TSC_ADJUST, INVPCID, RDPID, LA57, the hybrid flag, and the speculation
+ * controls -- IBRS and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not
+ * the guest's to write. */
 const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 3)   // BMI1
     | (1 << 6)   // the x87 data pointer kept at exceptions only
@@ -191,13 +193,37 @@ const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 23)  // CLFLUSHOPT
     | (1 << 24)  // CLWB
     | (1 << 29); // SHA
-const LEAF7_ECX_KEEP: u32 = 1 << 2; // UMIP
+const LEAF7_ECX_KEEP: u32 = (1 << 2)   // UMIP
+    | (1 << 8);  // GFNI
 /* Leaf 7, subleaf 0: the AVX line, where AVX's state is switched and the
  * host has each -- AVX2 in EBX, and in ECX VAES and VPCLMULQDQ, whose VEX
  * forms are on the YMM registers (their EVEX forms are AVX-512's). */
 const LEAF7_EBX_AVX: u32 = 1 << 5; // AVX2
 const LEAF7_ECX_AVX: u32 = (1 << 9)   // VAES
     | (1 << 10); // VPCLMULQDQ
+/// The last subleaf of leaf 7 answered: 1, or the host's where that is 0.
+const LEAF7_LAST_SUBLEAF: u32 = SUBLEAF_7_1;
+const SUBLEAF_7_1: u32 = 1;
+/* Leaf 7, subleaf 1: in EAX, facts of the silicon -- REP MOVSB fast at no
+ * bytes, REP STOSB, CMPSB and SCASB fast at a few -- and where AVX's state is
+ * switched, the instructions VEX codes on the YMM registers: SHA512, SM3 and
+ * SM4, AVX-VNNI and AVX-IFMA; in EDX the same of AVX-VNNI-INT8,
+ * AVX-NE-CONVERT and AVX-VNNI-INT16 -- each where the host has it. Among
+ * what is cleared: AVX512_BF16 and AMX-FP16 (state past AVX's), LASS and
+ * LAM (CR4's and CR3's), FRED and LKGS, WRMSRNS and MSRLIST, HRESET,
+ * CMPCCXADD and RAO-INT, PPIN, the performance monitor's extensions, and
+ * every bit of EBX and ECX. */
+const LEAF7_1_EAX_KEEP: u32 = (1 << 10)  // FZRM
+    | (1 << 11)  // FSRS
+    | (1 << 12); // FSRC
+const LEAF7_1_EAX_AVX: u32 = (1 << 0)   // SHA512
+    | (1 << 1)   // SM3
+    | (1 << 2)   // SM4
+    | (1 << 4)   // AVX-VNNI
+    | (1 << 23); // AVX-IFMA
+const LEAF7_1_EDX_AVX: u32 = (1 << 4)   // AVX-VNNI-INT8
+    | (1 << 5)   // AVX-NE-CONVERT
+    | (1 << 10); // AVX-VNNI-INT16
 
 /* Leaf 0xD, where anything of XSAVE's state is offered: subleaf 1's EAX,
  * the XSAVE line as the host has it -- XSAVEOPT, XSAVEC, XGETBV with ECX 1,
@@ -360,11 +386,17 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_STRUCTURED if sub == 0 => {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
             Cpuid {
-                eax: 0,
+                eax: eax.min(LEAF7_LAST_SUBLEAF),
                 ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx),
                 ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx),
                 edx: edx & LEAF7_EDX_KEEP,
             }
+        }
+        /* Where the host has the subleaf: past its last, its answer is no
+         * CPU's. */
+        LEAF_STRUCTURED if sub == SUBLEAF_7_1 && structured_last() >= SUBLEAF_7_1 => {
+            let (avx_eax, avx_edx) = if avx { (LEAF7_1_EAX_AVX, LEAF7_1_EDX_AVX) } else { (0, 0) };
+            Cpuid { eax: eax & (LEAF7_1_EAX_KEEP | avx_eax), ebx: 0, ecx: 0, edx: edx & avx_edx }
         }
         LEAF_XSAVE => xsave_leaf(sub, eax, asker.xcr0),
         LEAF_TSC if apic => {
@@ -387,6 +419,11 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_EXT_FEATURES2 => Cpuid { eax: eax & EXT21_EAX_KEEP, ebx: 0, ecx: ecx & EXT21_ECX_KEEP, edx: 0 },
         _ => NONE,
     }
+}
+
+/// The host's last subleaf of leaf 7, which subleaf 0's EAX gives.
+fn structured_last() -> u32 {
+    cpu::cpuid_count(LEAF_STRUCTURED, 0).map_or(0, |c| c.eax)
 }
 
 /// Leaf 1 ECX's XSAVE line for a guest whose CR4 is `cr4`, of the host's
