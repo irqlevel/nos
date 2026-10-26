@@ -724,6 +724,7 @@ const SEVERAL: &[SeveralSpec] = &[
     },
 ];
 
+#[inline(never)]
 fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let s = (spec.run)(machine);
@@ -763,6 +764,12 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// guest of more than one CPU, its others on tasks of their own, on other
 /// CPUs the extension is on for -- and say what it did. `None` when there is
 /// no such guest; otherwise whether it did what it was told.
+///
+/// Each guest's runner is a frame of its own (`#[inline(never)]`), there
+/// only while that guest runs. Inlined here, the runners' frames came to
+/// 17.6 KiB under every guest, and with the `asid` guest's -- its VMs made
+/// beneath them -- to 57 KiB of the task's 64: one more runner's frame took
+/// the task off the end of its stack.
 pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
     if name == SMP_NAME {
         return Some(run_smp(machine, &SMP_GUEST, out));
@@ -795,6 +802,7 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     Some(run_spec(machine, spec, out))
 }
 
+#[inline(never)]
 fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let mut vm = match Vm::new(machine, spec.exceptions).and_then(|mut vm| (spec.build)(&mut vm).map(|_| vm)) {
@@ -1118,6 +1126,7 @@ const SMP_GUEST: SmpGuest =
 /// Run a guest of the smp guest's machine: its first CPU on this task, its
 /// second on a task of its own on another CPU the extension is on for --
 /// this one, when it is on for no other.
+#[inline(never)]
 fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -1597,6 +1606,7 @@ const IOAPIC_GUEST: IoGuest =
 /// Run a guest of the IO-APIC's machine: its first CPU on this task, its
 /// second -- which only waits -- on a task of its own, so that it is found
 /// asleep when the first stops.
+#[inline(never)]
 fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2097,6 +2107,7 @@ fn one_cpu_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()>
 
 /// Run the debug guest: one CPU, through the run loop a Linux guest's go
 /// through, where a #DB of the guest's own is given back.
+#[inline(never)]
 fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", DEBUG_NAME, DEBUG_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2369,6 +2380,7 @@ fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Res
 
 /// Run the dr guest: two VMs of one CPU each, one after the other on the
 /// CPU this runs on, through the run loop a Linux guest's go through.
+#[inline(never)]
 fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", DR_NAME, DR_ABOUT);
     let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
@@ -2586,6 +2598,7 @@ const CR4_PGE: u64 = 1 << 7;
 /// Run the cr4 guest: one CPU, through the run loop a Linux guest's go
 /// through, where AMD-V stops it at every `mov` of CR4 and VT-x at every
 /// write that changes a bit the host keeps.
+#[inline(never)]
 fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", CR4_NAME, CR4_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2901,6 +2914,7 @@ const MSR_BUDGET_MS: u64 = 10_000;
 
 /// Run the msr guest: one CPU, through the run loop a Linux guest's go
 /// through, where every MSR but the three segment bases stops it.
+#[inline(never)]
 fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", MSR_NAME, MSR_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
