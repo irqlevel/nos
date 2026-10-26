@@ -335,7 +335,11 @@ impl Vcpu {
         if filter {
             c.pause_filter_count = PAUSE_FILTER_COUNT;
         }
-        c.intercept_misc2 = misc2::VMMCALL | misc2::RDTSCP | misc2::ICEBP | misc2::WBINVD
+        /* RDTSCP where the guest is not offered it, for the #UD a CPU
+         * without it gives (`hvarch::x86::offers`): where it is, it runs in
+         * the guest, reading the guest's own TSC_AUX. */
+        let rdtscp = if hvarch::x86::offers().rdtscp { 0 } else { misc2::RDTSCP };
+        c.intercept_misc2 = misc2::VMMCALL | rdtscp | misc2::ICEBP | misc2::WBINVD
             | misc2::MONITOR | misc2::MWAIT | misc2::MWAIT_ARMED | misc2::XSETBV | misc2::RDPRU;
         c.intercept_exceptions = exceptions;
         /* CR4: its writes, which `hvarch` intercepts whatever this asks, and
@@ -773,6 +777,17 @@ impl Vcpu {
     /// a CPU that held another's.
     pub fn fp_loads(&self) -> u64 {
         self.guest.fp_loads()
+    }
+
+    /// The guest's TSC_AUX, which its RDTSCP and RDPID read.
+    pub fn tsc_aux(&self) -> u64 {
+        self.guest.tsc_aux()
+    }
+
+    /// Make `value` the guest's TSC_AUX, for a WRMSR of it the policy
+    /// performed: false, and nothing changed, for one the MSR cannot hold.
+    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
+        self.guest.set_tsc_aux(value)
     }
 
     /// Give the guest an exception of its own the host intercepted -- #DB,

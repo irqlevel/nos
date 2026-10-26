@@ -63,8 +63,6 @@ void set_rbp(ulong new_value);
 
 u64 read_tsc();
 
-u64 read_tscp(u64 *cpu_index);
-
 void exc_divide_by_zero_stub();
 void exc_debugger_stub();
 void exc_nmi_stub();

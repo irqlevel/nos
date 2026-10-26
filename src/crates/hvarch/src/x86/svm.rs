@@ -17,6 +17,7 @@ use kcore::percpu::ConstInit;
 
 use super::cpu;
 use super::fp::GuestFp;
+use super::msrs::GuestMsrs;
 use crate::{Error, Result};
 
 pub mod vmcb;
@@ -163,9 +164,12 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
         return Err(Error::EnableFailed);
     }
     /* The host's x87, SSE and AVX control bits as every entry wants them,
-     * once, and IA32_XSS out of a guest's XSAVES's reach (`super::fp`); and
-     * what keeps a guest's speculation off the host's (`super::spec`). */
+     * once, and IA32_XSS out of a guest's XSAVES's reach (`super::fp`);
+     * what the CPU holds in TSC_AUX, for the entries to load over
+     * (`super::msrs`); and what keeps a guest's speculation off the host's
+     * (`super::spec`). */
     unsafe { super::fp::on() };
+    unsafe { super::msrs::on() };
     unsafe { super::spec::on(false) };
     Ok(())
 }
@@ -179,6 +183,7 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
 pub unsafe fn disable() {
     /* What `enable` set for the entries: nothing, on a CPU it never ran on. */
     unsafe { super::spec::off() };
+    unsafe { super::msrs::off() };
     unsafe { super::fp::off() };
     /* KVM's order: the address, then the enable bit. Either order has a
      * window -- SVM on with no save area, or SVM off still naming the page
@@ -705,8 +710,8 @@ pub struct Profile {
 
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
-/// wait in while the guest runs, the x87, SSE and AVX state and XCR0, and
-/// the breakpoint addresses.
+/// wait in while the guest runs, the x87, SSE and AVX state and XCR0,
+/// TSC_AUX, and the breakpoint addresses.
 pub struct Guest {
     vmcb: VmcbPage,
     host: VmcbPage,
@@ -717,6 +722,8 @@ pub struct Guest {
     debug_addrs: [u64; 4],
     /// Its x87, SSE and AVX registers and its XCR0 (`super::fp`).
     fp: GuestFp,
+    /// Its TSC_AUX (`super::msrs`).
+    msrs: GuestMsrs,
     /// The ASID it last entered under, and where that came from; None until
     /// its first entry.
     asid: Option<AsidTag>,
@@ -734,6 +741,7 @@ impl Guest {
             regs: GuestRegs::default(),
             debug_addrs: [0; 4],
             fp: GuestFp::new()?,
+            msrs: GuestMsrs::new(),
             asid: None,
             flush_always: false,
             profile: None,
@@ -785,6 +793,18 @@ impl Guest {
     /// that held another guest's.
     pub fn fp_loads(&self) -> u64 {
         self.fp.loads()
+    }
+
+    /// The guest's TSC_AUX.
+    pub fn tsc_aux(&self) -> u64 {
+        self.msrs.tsc_aux()
+    }
+
+    /// Make `value` the guest's TSC_AUX, for its WRMSR the policy performs
+    /// -- false, and nothing changed, for one with a bit above the low 32
+    /// ([`GuestMsrs::set_tsc_aux`]).
+    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
+        self.msrs.set_tsc_aux(value)
     }
 
     pub fn vmcb(&self) -> &Vmcb {
@@ -888,6 +908,7 @@ impl Guest {
         let host = self.host.phys();
         let regs: *mut GuestRegs = &mut self.regs;
         let fp = &mut self.fp;
+        let msrs = &self.msrs;
         let debug_addrs = self.debug_addrs;
         let flush_always = self.flush_always;
         let tag = &mut self.asid;
@@ -947,6 +968,10 @@ impl Guest {
              * held above, with interrupts off since. */
             let t1 = stamp(timed);
             unsafe { fp.load(cpu) };
+            /* TSC_AUX the guest's likewise, for its RDTSCP and RDPID: put
+             * there where the CPU holds another's, and left after the exit,
+             * which no read of the host's needs. */
+            unsafe { msrs.load(cpu) };
             /* The breakpoint addresses are the guest's from here on, armed
              * by its own DR7 once `vmrun` loads it. The host's DR7 enables
              * none: nothing in this kernel writes it, and the `#vmexit` of
