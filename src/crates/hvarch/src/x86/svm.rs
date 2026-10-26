@@ -45,6 +45,10 @@ pub const PAUSE_THRESHOLD: u32 = 1 << 12;
 pub const AVIC: u32 = 1 << 13;
 pub const VMSAVE_VIRT: u32 = 1 << 15;
 pub const VGIF: u32 = 1 << 16;
+/// `vmrun` loads the guest's IA32_SPEC_CTRL from the VMCB (`Save::spec_ctrl`)
+/// and the `#vmexit` puts the host's back: there is no turning it off, and a
+/// CPU that has it runs a guest under the VMCB's value whatever the MSR held.
+pub const V_SPEC_CTRL: u32 = 1 << 20;
 pub const VNMI: u32 = 1 << 24;
 
 /// The features worth a line in a report, and why each matters here. The
@@ -795,16 +799,14 @@ impl Guest {
         self.fp.loads()
     }
 
-    /// The guest's TSC_AUX.
-    pub fn tsc_aux(&self) -> u64 {
-        self.msrs.tsc_aux()
+    /// The guest's MSRs the extension does not switch (`super::msrs`): its
+    /// TSC_AUX and IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &GuestMsrs {
+        &self.msrs
     }
 
-    /// Make `value` the guest's TSC_AUX, for its WRMSR the policy performs
-    /// -- false, and nothing changed, for one with a bit above the low 32
-    /// ([`GuestMsrs::set_tsc_aux`]).
-    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
-        self.msrs.set_tsc_aux(value)
+    pub fn msrs_mut(&mut self) -> &mut GuestMsrs {
+        &mut self.msrs
     }
 
     pub fn vmcb(&self) -> &Vmcb {
@@ -908,7 +910,7 @@ impl Guest {
         let host = self.host.phys();
         let regs: *mut GuestRegs = &mut self.regs;
         let fp = &mut self.fp;
-        let msrs = &self.msrs;
+        let msrs = &mut self.msrs;
         let debug_addrs = self.debug_addrs;
         let flush_always = self.flush_always;
         let tag = &mut self.asid;
@@ -977,11 +979,26 @@ impl Guest {
              * none: nothing in this kernel writes it, and the `#vmexit` of
              * any earlier entry here left it with all four off. */
             unsafe { entries.debug_addrs.load(&debug_addrs) };
-            /* Another guest than the last on this CPU: the predictors it
-             * trained are not to steer this one (`super::spec`). */
-            entries.spec.entering(nested.id);
+            /* Another guest CPU than the last on this CPU, or this one
+             * after an IBPB it asked for: the predictors trained before are
+             * not to steer it (`super::spec`). */
+            if entries.spec.entering(msrs.id(), msrs.ibpbs()) {
+                msrs.barrier();
+            }
             let speculation = entries.spec.svm_entry();
             let flags = if speculation.ibpb_exit() { RUN_IBPB } else { 0 };
+            /* Its IA32_SPEC_CTRL over the host's: through the VMCB on a CPU
+             * with virtual SPEC_CTRL, whose `vmrun` loads it from there and
+             * whose exit puts the host's back; in the MSR otherwise, put
+             * back after the exit (`super::spec`). */
+            let spec_ctrl = match entries.spec.vmcb_spec_ctrl(msrs.spec_ctrl()) {
+                Some(value) => {
+                    vmcb.get_mut().save.spec_ctrl = value;
+                    Some(value)
+                }
+                None => entries.spec.load_guest(msrs.spec_ctrl()),
+            };
+            msrs.ran(spec_ctrl);
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, the checks above are the rest of what the stub needs,
@@ -992,6 +1009,7 @@ impl Guest {
             if flags & RUN_IBPB != 0 {
                 speculation.count_exit_barrier(cpu);
             }
+            entries.spec.exited(false);
             if let Some(k) = kick {
                 k.left();
             }

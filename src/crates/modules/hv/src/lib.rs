@@ -442,9 +442,10 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
 
 /// What keeps one guest's speculation off the host and the next guest
 /// (`hv::spec`), and how often it was needed -- for VT-x, as the CPU this
-/// runs on has it; and a warning for every CPU of `hardware`, those the
-/// extension is on for, whose IA32_SPEC_CTRL no longer has what `hv on`
-/// set there, asked of each CPU's register.
+/// runs on has it; what of it a guest has of its own; and a warning for
+/// every CPU of `hardware`, those the extension is on for, whose
+/// IA32_SPEC_CTRL is not what the host runs with there -- what `hv on` set
+/// undone, or a guest's left over it -- asked of each CPU's register.
 #[cfg(target_arch = "x86_64")]
 fn speculation(out: &mut Output, hardware: u64) {
     use hv::spec::Ibrs;
@@ -462,7 +463,8 @@ fn speculation(out: &mut Output, hardware: u64) {
     if undone != 0 {
         let _ = write!(out, "hv: WARNING -- IA32_SPEC_CTRL on cpu ");
         write_mask(out, undone);
-        let _ = writeln!(out, " no longer has what hv on set there: something wrote it behind this module's back");
+        let _ = writeln!(out, " is not what the host runs with there: what hv on set undone, or a guest's bits \
+                               left over it");
     }
     let r = hv::spec::report();
     let a = r.amd;
@@ -475,6 +477,20 @@ fn speculation(out: &mut Output, hardware: u64) {
     } else {
         let _ = writeln!(out, "hv: guests switched on a CPU {} times; the CPU has no IBPB to put between them",
                          r.switches);
+    }
+    if r.asked != 0 {
+        if a.ibpb_exit {
+            let _ = writeln!(out, "hv: guests ran on {} times after an IBPB they asked for, the one after every exit \
+                                   between", r.asked);
+        } else {
+            let _ = writeln!(out, "hv: guests ran on {} times after an IBPB they asked for, each issued before ({} \
+                                   issued)", r.asked, r.asked_barriers);
+        }
+    }
+    let c = r.controls;
+    if c.spec_ctrl != 0 || c.pred_cmd != 0 {
+        let _ = writeln!(out, "hv: a guest's own speculation controls -- IA32_SPEC_CTRL {:#x} over the host's for its \
+                               run, IA32_PRED_CMD {:#x}", c.spec_ctrl, c.pred_cmd);
     }
     if r.auto_ibrs {
         let _ = writeln!(out, "hv: automatic IBRS on -- the host's indirect branches are not a guest's to steer");

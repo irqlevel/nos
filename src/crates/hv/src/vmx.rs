@@ -820,15 +820,14 @@ impl Vcpu {
         self.guest.fp_loads()
     }
 
-    /// The guest's TSC_AUX, which its RDTSCP and RDPID read.
-    pub fn tsc_aux(&self) -> u64 {
-        self.guest.tsc_aux()
+    /// The guest's MSRs the extension does not switch: its TSC_AUX and
+    /// IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &hvarch::x86::msrs::GuestMsrs {
+        self.guest.msrs()
     }
 
-    /// Make `value` the guest's TSC_AUX, for a WRMSR of it the policy
-    /// performed: false, and nothing changed, for one the MSR cannot hold.
-    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
-        self.guest.set_tsc_aux(value)
+    pub fn msrs_mut(&mut self) -> &mut hvarch::x86::msrs::GuestMsrs {
+        self.guest.msrs_mut()
     }
 
     /// Whether an event is queued for injection on the next entry.

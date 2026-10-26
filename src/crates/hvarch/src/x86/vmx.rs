@@ -1135,16 +1135,14 @@ impl Guest {
         self.fp.loads()
     }
 
-    /// The guest's TSC_AUX.
-    pub fn tsc_aux(&self) -> u64 {
-        self.msrs.tsc_aux()
+    /// The guest's MSRs the extension does not switch (`super::msrs`): its
+    /// TSC_AUX and IA32_SPEC_CTRL, and the IBPBs it asked for.
+    pub fn msrs(&self) -> &GuestMsrs {
+        &self.msrs
     }
 
-    /// Make `value` the guest's TSC_AUX, for its WRMSR the policy performs
-    /// -- false, and nothing changed, for one with a bit above the low 32
-    /// ([`GuestMsrs::set_tsc_aux`]).
-    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
-        self.msrs.set_tsc_aux(value)
+    pub fn msrs_mut(&mut self) -> &mut GuestMsrs {
+        &mut self.msrs
     }
 
     /// The policy has written the whole shadow -- every control register,
@@ -2371,10 +2369,13 @@ impl Guest {
          * by its own DR7 once the entry loads it: the host's enables
          * none, nothing in this kernel writing it and every VM exit
          * leaving it with all four off (`svm::LoadedDebugAddrs`). And
-         * another guest than the last on this CPU: the predictors it
-         * trained are not to steer this one (`super::spec`). */
+         * another guest CPU than the last on this CPU, or this one after
+         * an IBPB it asked for: the predictors trained before are not to
+         * steer it (`super::spec`). */
         unsafe { entries.debug_addrs.load(&self.debug_addrs) };
-        entries.spec.entering(nested.id);
+        if entries.spec.entering(self.msrs.id(), self.msrs.ibpbs()) {
+            self.msrs.barrier();
+        }
         let speculation = entries.spec.vmx_entry();
         let t1 = stamp(timed);
         unsafe { self.write_guest_state() };
@@ -2471,8 +2472,13 @@ impl Guest {
             | if speculation.verw() { RUN_VERW } else { 0 }
             | if spec_ctrl.is_some() { RUN_SPEC_CTRL } else { 0 };
         let t3 = stamp(timed);
+        /* Its IA32_SPEC_CTRL over the host's, put back after the exit --
+         * by the stub itself for legacy IBRS (`super::spec`). */
+        let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
+        self.msrs.ran(ran_with);
         speculation.flush_l1d();
         let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
+        entries.spec.exited(spec_ctrl.is_some());
         let t4 = stamp(timed);
 
         self.save.cr2 = cpu::read_cr2();
