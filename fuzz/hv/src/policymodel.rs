@@ -15,10 +15,16 @@
 //! The model is written from the manuals, not from the policy: a bit or an
 //! MSR the policy comes to offer is a finding here until the model is told
 //! of it too, on purpose.
+//!
+//! XSAVE's state is offered as far as the host switches it (`fp::offered`,
+//! made up with the host): leaf 1's XSAVE line and leaf 0xD answered for
+//! what is offered, and for the asking CPU's own CR4 and XCR0, which the
+//! input makes up too.
 
-use crate::policy::{self, Cpuid};
+use crate::policy::{self, Asker, Cpuid};
 use crate::targets::Input;
 use crate::x86::cpu;
+use crate::x86::fp;
 use crate::x86::svm::vmcb::Save;
 
 /* The tops of the two ranges a guest may be told: the highest leaf the
@@ -35,6 +41,14 @@ const LEAF1_ECX: u32 = (1 << 0) | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 17) | 
     | (1 << 23) | (1 << 25) | (1 << 30);
 const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+/* Leaf 1 ECX's XSAVE line: XSAVE where any of its state is offered, and
+ * OSXSAVE as the asking CPU's CR4 has it; AVX where AVX's is, and FMA and
+ * F16C with it as the host has them -- VEX-coded on the YMM registers. */
+const LEAF1_ECX_XSAVE: u32 = 1 << 26;
+const LEAF1_ECX_OSXSAVE: u32 = 1 << 27;
+const LEAF1_ECX_AVX: u32 = 1 << 28;
+const LEAF1_ECX_AVX_LINE: u32 = (1 << 12) | (1 << 29);
+const CR4_OSXSAVE: u64 = 1 << 18;
 /* Leaf 1 EDX: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, SEP, MTRR, PGE,
  * MCA, CMOV, PAT, PSE-36, CLFLUSH, MMX, FXSR, SSE, SSE2. The APIC is the
  * policy's own, for a guest with APICs. */
@@ -73,6 +87,21 @@ const LEAF7_EBX: u32 = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1
     | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 24) | (1 << 29);
 const LEAF7_ECX: u32 = 1 << 2;
 const LEAF7_EDX: u32 = (1 << 4) | (1 << 10) | (1 << 14) | (1 << 29);
+/* And where AVX's state is offered, its line: AVX2 in EBX, VAES and
+ * VPCLMULQDQ in ECX. */
+const LEAF7_EBX_AVX: u32 = 1 << 5;
+const LEAF7_ECX_AVX: u32 = (1 << 9) | (1 << 10);
+
+/* Leaf 0xD (SDM vol. 1, 13.2; APM vol. 2, 11.5.2): XSAVE's standard area
+ * is the legacy region and the header, 576 bytes, then each component at
+ * its offset -- AVX's at 576, 256 bytes long, unaligned in the compacted
+ * one too. Subleaf 1 EAX: XSAVEOPT, XSAVEC and XGETBV's ECX 1 may be the
+ * host's; XSAVES, whose supervisor state nothing switches, and XFD not. */
+const XSAVE_LEGACY: u32 = 576;
+const XSAVE_AVX_OFFSET: u32 = 576;
+const XSAVE_AVX_SIZE: u32 = 256;
+const LEAF_D1_EAX: u32 = 0b111;
+const LEAF_D1_EAX_XSAVEC: u32 = 1 << 1;
 
 /* IA32_ARCH_CAPABILITIES as a guest may read it: of the host's, the bits
  * that say what the CPU is not open to and what VERW clears -- RDCL_NO,
@@ -95,14 +124,20 @@ fn host(leaf: u32, sub: u32) -> Option<[u32; 4]> {
     cpu::cpuid_count(leaf, sub).map(|h| [h.eax, h.ebx, h.ecx, h.edx])
 }
 
+/// The XSAVE area's size for `components`: the legacy region and the
+/// header, and AVX's past them.
+fn xsave_size(components: u64) -> u32 {
+    if components & fp::XCR0_AVX != 0 { XSAVE_AVX_OFFSET + XSAVE_AVX_SIZE } else { XSAVE_LEGACY }
+}
+
 /// What the guest is told of the tops of the two ranges: no higher than
 /// the model's or the host's, and the vendor as the host says it.
-fn tops(apic_id: u32, apic: bool) -> (u32, u32) {
-    let basic = words(&policy::cpuid(0, 0, apic_id, apic));
+fn tops(asker: &Asker) -> (u32, u32) {
+    let basic = words(&policy::cpuid(0, 0, asker));
     let h = host(0, 0).unwrap_or([0; 4]);
     invariant!(basic[0] == h[0].min(BASIC_TOP) && basic[1..] == h[1..],
                "leaf 0 answered {:x?}, the host's {:x?}: wanted the top no higher than {:#x}", basic, h, BASIC_TOP);
-    let ext = words(&policy::cpuid(0x8000_0000, 0, apic_id, apic));
+    let ext = words(&policy::cpuid(0x8000_0000, 0, asker));
     match host(0x8000_0000, 0) {
         Some(h) => invariant!(ext[0] == h[0].min(EXT_TOP) && ext[1..] == h[1..],
                               "leaf 0x8000_0000 answered {:x?}, the host's {:x?}: wanted the top no higher than {:#x}",
@@ -112,9 +147,11 @@ fn tops(apic_id: u32, apic: bool) -> (u32, u32) {
     (basic[0], ext[0])
 }
 
-/// Leaf `leaf`, subleaf `sub`, as the guest is told it, held to the model.
-fn check_leaf(leaf: u32, sub: u32, apic_id: u32, apic: bool, (basic_top, ext_top): (u32, u32)) {
-    let g = words(&policy::cpuid(leaf, sub, apic_id, apic));
+/// Leaf `leaf`, subleaf `sub`, as the guest's CPU `asker` is told it, held
+/// to the model.
+fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u32)) {
+    let (apic_id, apic) = (asker.apic_id, asker.apic);
+    let g = words(&policy::cpuid(leaf, sub, asker));
     let top = if leaf >= 0x8000_0000 { ext_top } else { basic_top };
     let Some(h) = host(leaf, sub).filter(|_| leaf <= top && (leaf < 0x4000_0000 || leaf >= 0x8000_0000)) else {
         invariant!(g == [0; 4], "leaf {:#x}.{}, past the top the guest is told ({:#x}) or the host's, answered {:x?}",
@@ -130,13 +167,28 @@ fn check_leaf(leaf: u32, sub: u32, apic_id: u32, apic: bool, (basic_top, ext_top
         }
     };
     let (x2apic, apic_bit, arat) = if apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC, LEAF6_EAX_ARAT) } else { (0, 0, 0) };
+    let offered = fp::offered();
+    let avx = offered & fp::XCR0_AVX != 0;
+    /* Leaf 1's XSAVE line, exactly; and the AVX line's other bits, which
+     * are the host's to have. */
+    let xsave_bits = if offered == 0 {
+        0
+    } else {
+        LEAF1_ECX_XSAVE
+            | if asker.cr4 & CR4_OSXSAVE != 0 { LEAF1_ECX_OSXSAVE } else { 0 }
+            | if avx { LEAF1_ECX_AVX } else { 0 }
+    };
+    let avx_line = if avx { LEAF1_ECX_AVX_LINE } else { 0 };
     match leaf {
         0 | 0x8000_0000 => {}
         1 => {
             want(g[0] == h[0], "the signature, the host's");
             want(g[1] & 0xFFFF == h[1] & 0xFFFF && (g[1] >> 16) & 0xFF == 1 && g[1] >> 24 == apic_id & 0xFF,
                  "EBX: the host's low half, one logical CPU, its own APIC ID");
-            want(leaked(g[2], h[2], LEAF1_ECX, x2apic | LEAF1_ECX_HYPERVISOR) == 0, "ECX within the model's");
+            want(leaked(g[2], h[2], LEAF1_ECX | avx_line, x2apic | LEAF1_ECX_HYPERVISOR | xsave_bits) == 0,
+                 "ECX within the model's");
+            want(g[2] & (LEAF1_ECX_XSAVE | LEAF1_ECX_OSXSAVE | LEAF1_ECX_AVX) == xsave_bits,
+                 "XSAVE where its state is offered, OSXSAVE as CR4 has it, AVX where its state is");
             want(g[2] & LEAF1_ECX_X2APIC == x2apic, "x2APIC exactly when the guest has APICs");
             want(g[2] & LEAF1_ECX_HYPERVISOR != 0, "the hypervisor bit");
             want(leaked(g[3], h[3], LEAF1_EDX, apic_bit) == 0, "EDX within the model's");
@@ -148,10 +200,27 @@ fn check_leaf(leaf: u32, sub: u32, apic_id: u32, apic: bool, (basic_top, ext_top
         }
         6 => want(g == [arat, 0, 0, 0], "ARAT for a guest with APICs, and nothing else"),
         7 if sub == 0 => {
+            let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
             want(g[0] == 0, "EAX: no subleaf past 0");
-            want(leaked(g[1], h[1], LEAF7_EBX, 0) == 0, "EBX within the model's");
-            want(leaked(g[2], h[2], LEAF7_ECX, 0) == 0, "ECX within the model's");
+            want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx, 0) == 0, "EBX within the model's");
+            want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx, 0) == 0, "ECX within the model's");
             want(leaked(g[3], h[3], LEAF7_EDX, 0) == 0, "EDX within the model's");
+        }
+        0xD if offered == 0 => want(g == [0; 4], "nothing: no XSAVE state offered"),
+        0xD => {
+            let on = asker.xcr0 & offered;
+            match sub {
+                0 => want(g == [offered as u32, xsave_size(on), xsave_size(offered), (offered >> 32) as u32],
+                          "the components offered, the area's size for those XCR0 has on and for all"),
+                1 => {
+                    let compacted = if g[0] & LEAF_D1_EAX_XSAVEC != 0 { xsave_size(on) } else { 0 };
+                    want(g[0] == h[0] & LEAF_D1_EAX && g[1] == compacted && g[2] == 0 && g[3] == 0,
+                         "XSAVEOPT, XSAVEC, XGETBV's ECX 1 as the host has them, with XSAVEC the compacted size, \
+                          and no supervisor state");
+                }
+                2 if avx => want(g == [XSAVE_AVX_SIZE, XSAVE_AVX_OFFSET, 0, 0], "AVX's component, at 576"),
+                _ => want(g == [0; 4], "nothing: no component past AVX's"),
+            }
         }
         0x15 if apic => want(g == [0; 4] || (g[0] == 1_000_000 && g[1] != 0 && g[2] == 1_000_000_000 && g[3] == 0),
                              "the TSC over the emulated APIC's 1 GHz, or nothing"),
@@ -176,8 +245,8 @@ fn check_leaf(leaf: u32, sub: u32, apic_id: u32, apic: bool, (basic_top, ext_top
         _ => want(g == [0; 4], "nothing: a leaf the model does not name"),
     }
     if let Some(what) = bad {
-        panic!("invariant: leaf {:#x}.{} answered {:x?} from the host's {:x?} (apic {}): wanted {}",
-               leaf, sub, g, h, apic, what);
+        panic!("invariant: leaf {:#x}.{} answered {:x?} from the host's {:x?} (apic {}, CR4 {:#x}, XCR0 {:#x}, \
+                offered {:#x}): wanted {}", leaf, sub, g, h, apic, asker.cr4, asker.xcr0, offered, what);
     }
 }
 
@@ -265,9 +334,9 @@ fn blank_save() -> Save {
 }
 
 /// Every feature the guest is told of backed by what it promises.
-fn check_implied(apic_id: u32, apic: bool) {
+fn check_implied(asker: &Asker) {
     for &(leaf, sub, reg, bit, needs, name) in IMPLIED {
-        let g = words(&policy::cpuid(leaf, sub, apic_id, apic));
+        let g = words(&policy::cpuid(leaf, sub, asker));
         if g[reg] & (1 << bit) == 0 {
             continue;
         }
@@ -467,13 +536,19 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
 /// in long mode with paging on, or before it.
 pub fn policy_target(r: &mut Input) {
     cpu::set_host(r.u64());
-    let apic = r.bool();
-    let apic_id = r.below(16) as u32;
-    let told = tops(apic_id, apic);
+    /* The asking CPU's CR4 -- OSXSAVE on or off, among anything -- and its
+     * XCR0: one an XSETBV could have made it, of the components offered,
+     * or out of reset. */
+    let xcr0 = fp::XCR0_X87 | (r.pick(&[0, fp::XCR0_SSE, fp::XCR0_SSE | fp::XCR0_AVX]) & fp::offered());
+    let asker = Asker { apic_id: r.below(16) as u32, apic: r.bool(), cr4: r.value64(), xcr0 };
+    let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {
-        check_leaf(leaf, r.below(4) as u32, apic_id, apic, told);
+        check_leaf(leaf, r.below(4) as u32, &asker, told);
     }
-    check_implied(apic_id, apic);
+    for sub in 0..4 {
+        check_leaf(0xD, sub, &asker, told);
+    }
+    check_implied(&asker);
 
     let mut save = blank_save();
     if r.bool() {
@@ -486,7 +561,7 @@ pub fn policy_target(r: &mut Input) {
     while let Some(op) = r.op(4) {
         let msr = match op {
             0 => {
-                check_leaf(r.u32(), r.u32(), apic_id, apic, told);
+                check_leaf(r.u32(), r.u32(), &asker, told);
                 continue;
             }
             1 => r.pick(MSRS).0,
