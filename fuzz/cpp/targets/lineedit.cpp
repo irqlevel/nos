@@ -318,8 +318,8 @@ void run(fuzz::Input& in)
 
     while (in.more())
     {
-        /* Now and then a run of one key: a line past LineMax, a history
-           past HistoryMax, Up past its oldest line */
+        /* Now and then a run of one key: a line past LINE_LEN_MAX, a history
+           past HISTORY_MAX, Up past its oldest line */
         size_t times = in.chance(16) ? in.range(1, 2 * LineEditor::LINE_LEN_MAX) : 1;
         char c = next_key(in);
         if (times > 1)
@@ -353,7 +353,7 @@ void run(fuzz::Input& in)
             if (!m.searching && m.browse < m.count())
                 fuzz::reached("a line from the history");
             if (m.line.size() == LineEditor::LINE_LEN_MAX)
-                fuzz::reached("a line at LineMax");
+                fuzz::reached("a line at LINE_LEN_MAX");
         }
     }
     delete ed;

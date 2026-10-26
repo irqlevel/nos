@@ -31,7 +31,7 @@ FbTerm::FbTerm()
 
 FbTerm::~FbTerm()
 {
-    /* The framebuffer mapping is permanent (MapMmioRegion), so there is
+    /* The framebuffer mapping is permanent (map_mmio_region), so there is
        nothing to release; the console lives for the whole boot. */
 }
 
@@ -72,7 +72,7 @@ void FbTerm::put_pixel(u32 x, u32 y, u32 color)
 }
 
 /* Framebuffer memory is uncached, so drawing cost is bus transactions, not
-   bytes: a 24bpp pixel written as three MmioWrite8 costs three of them.
+   bytes: a 24bpp pixel written as three mmio_write8 costs three of them.
    One font cell is 8 pixels wide, i.e. 16, 24 or 32 bytes -- always a
    multiple of 8 -- so a whole glyph row is staged in a register-aligned
    buffer and pushed out as 64-bit stores instead. */
@@ -315,7 +315,7 @@ bool FbTerm::setup(const FbInfo& info)
     /* Framebuffer memory has no read side effects, so it is mapped
        write-combining: stores get buffered and merged instead of going out
        one bus transaction at a time. Everything that draws ends with
-       Hal::WcFlush() so the pixels actually appear. */
+       hal::wc_flush() so the pixels actually appear. */
     ulong size_bytes = (ulong)info.pitch * info.height;
     ulong va = mm::PageTable::get_instance().map_mmio_region(info.phy_addr, size_bytes,
         mm::PageTable::MmioWriteCombining);

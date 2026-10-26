@@ -26,7 +26,7 @@ struct Pte final
     {
         /* Bits 12-51 only: NX is bit 63, so an entry that maps a page
            non-executable would otherwise hand back an address with the top
-           bit set -- and GetPage() a BUG -- the moment it is unmapped */
+           bit set -- and get_page() a BUG -- the moment it is unmapped */
         return value & ADDR_MASK;
     }
 
@@ -57,8 +57,8 @@ struct Pte final
     }
 
     /* Write-combining: PAT=1, PCD=0, PWT=0 selects IA32_PAT entry 4, which
-       Hal::SetupMemoryTypes() programs to WC. Only valid on a 4KiB leaf
-       entry -- at L2/L3 the same bit 7 means "huge page" (HugeBit), and
+       hal::setup_memory_types() programs to WC. Only valid on a 4KiB leaf
+       entry -- at L2/L3 the same bit 7 means "huge page" (HUGE_BIT), and
        those levels carry the PAT bit at bit 12 instead. */
     void set_write_combining()
     {
@@ -136,7 +136,7 @@ struct Pte final
     static const ulong ACCESSED_BIT = 5;
     static const ulong DIRTY_BIT = 6;
     static const ulong HUGE_BIT = 7;
-    /* Same bit as HugeBit: it is the PAT selector on 4KiB leaf entries and
+    /* Same bit as HUGE_BIT: it is the PAT selector on 4KiB leaf entries and
        the page-size bit on L2/L3 entries. */
     static const ulong PAT_BIT = 7;
     static const ulong MAX_BIT = 12;

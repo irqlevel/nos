@@ -12,7 +12,7 @@ generator does with them, and what is and is not being claimed.
 
 The pool is Rust, in the image: a `static` with nothing to construct, behind a
 lock that allocates nothing (`IrqSpinLock`), because the boot seeds it from
-`Main2`, long before `rust_init`. What reaches it, and how:
+`main2`, long before `rust_init`. What reaches it, and how:
 
 - **the layers and the modules** -- `net`, `tls`, `fs`, the sshd module --
   through `kcore::random` (`fill_random`, `random_u64`), which is the C ABI's
@@ -24,8 +24,8 @@ lock that allocates nothing (`IrqSpinLock`), because the boot seeds it from
 - **a hardware generator's driver** registers as a trait object,
   `random::register_source(name, &'static dyn random::Source)` --
   `drivers/virtio_rng`.
-- **the boot**, C++: `Hal::ProbeHwRandom()` and then `rust_random_setup()` in
-  `Main2` / `MainArm64`, `rust_random_reseed()` once the devices are up.
+- **the boot**, C++: `hal::probe_hw_random()` and then `rust_random_setup()` in
+  `main2` / `main_arm64`, `rust_random_reseed()` once the devices are up.
 - **the CPU's instruction** is the one piece left in C++, behind
   `hal/random.h`, because it is an instruction and the HAL is where those
   are: the pool asks for it through calls that take values and give values
@@ -64,7 +64,7 @@ what a generator is for — sources contribute, the generator answers.
 | `jitter` | `src/rust/random/src/jitter.rs` | timing jitter, the fallback (below) |
 
 `hal/random.h` is the seam for the CPU instruction, so common code never asks
-which architecture it is on. `Hal::ProbeHwRandom()` runs once on the BSP and is
+which architecture it is on. `hal::probe_hw_random()` runs once on the BSP and is
 what decides whether the instruction exists: reading RNDR on a core without
 FEAT_RNG is an undefined-instruction trap, and CPUID has to be checked before
 RDRAND for the same reason. It also honours `hwrng=off`.
@@ -136,8 +136,8 @@ the pool worse.**
 
 | when | what |
 |---|---|
-| `Main2` / `MainArm64`, before anything can ask for bytes | `Hal::ProbeHwRandom()`, then `rust_random_setup()` — register the sources that need no device, seed from them. No heap, no device |
-| `BpStartup` / `BpStartupArm`, after the virtio probe | `rust_random_reseed()` — fold in every registered source, virtio-rng now included |
+| `main2` / `main_arm64`, before anything can ask for bytes | `hal::probe_hw_random()`, then `rust_random_setup()` — register the sources that need no device, seed from them. No heap, no device |
+| `bp_startup` / `bp_startup_arm`, after the virtio probe | `rust_random_reseed()` — fold in every registered source, virtio-rng now included |
 | `rust_test` | `random::selftest` — the block function against RFC 8439, then the pool's output |
 | `entropy reseed` | the reseed, by hand |
 

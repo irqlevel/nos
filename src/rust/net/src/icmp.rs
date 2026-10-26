@@ -22,7 +22,7 @@ const PAYLOAD_LEN: usize = 32;
 /// The biggest frame this builds, headers included: an Ethernet MTU.
 const MAX_FRAME: usize = 1514;
 
-/// Per-subsystem trace level (kernel/trace.h: IcmpLL)
+/// Per-subsystem trace level (kernel/trace.h: ICMP_LL)
 const ICMP_LL: u32 = 5;
 
 #[derive(Clone, Copy)]

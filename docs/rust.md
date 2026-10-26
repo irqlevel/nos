@@ -123,7 +123,7 @@ wrapper, so no call site has a `forget` to remember.
 
 **`rust_ffi.cpp`** is the C++ side, and all of it lives in that one file.
 Register/create functions heap-allocate their adapters with
-`Mm::TAlloc<T, RustAllocTag>()`, never a static array of non-trivial
+`mm::talloc<T, RUST_ALLOC_TAG>()`, never a static array of non-trivial
 objects. The slot pools for IRQ, timer and MSI-X callbacks are under a
 `RawRwSpinLock`: read-locked in the handlers, write-locked with interrupts
 saved to register or unregister. Handles are raw pointers cast to

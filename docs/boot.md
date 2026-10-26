@@ -40,7 +40,7 @@ all — without the tag GRUB reports no framebuffer and everything written to
 4. `setup_low_page_tables` / `setup_high_page_tables` build the bootstrap
    map: P4[0] and P4[256] each point at a PDPT of four page directories of
    512 2 MiB pages — the first 4 GiB identity-mapped, and the same 4 GiB
-   again at `KernelSpaceBase` (`0xFFFF800000000000`). Everything is mapped
+   again at `KERNEL_SPACE_BASE` (`0xFFFF800000000000`). Everything is mapped
    write-back on purpose: the MTRRs keep the MMIO holes uncached on real
    hardware, and setting PCD here would run the entire kernel uncached on
    bare metal.
@@ -53,47 +53,47 @@ all — without the tag GRUB reports no framebuffer and everything written to
    which the platform turns into a reset indistinguishable from a
    spontaneous reboot.
 6. `lgdt gdt64` and a far jump to `long_mode_start`, which zeroes the data
-   segment registers and calls `Main(mbinfo)`.
+   segment registers and calls `main_x86_64(mbinfo)`.
 
-`Main` (`kernel/main.cpp`) points GS at a per-CPU slot that reads as "not
-set up yet" (`PerCpuSetupBoot` — a GS base left as whatever firmware had
+`main_x86_64` (`kernel/main.cpp`) points GS at a per-CPU slot that reads as "not
+set up yet" (`per_cpu_setup_boot` — a GS base left as whatever firmware had
 would make "which CPU am I on" a wild read), switches from the 4 KiB
-trampoline stack to this CPU's 32 KiB static stack out of `Stack[MaxCpus][]`,
-and calls `Main2`.
+trampoline stack to this CPU's 32 KiB static stack out of `Stack[MAX_CPUS][]`,
+and calls `main2`.
 
-## x86-64: `Main2`, on the BSP
+## x86-64: `main2`, on the BSP
 
 The order below is load-bearing; the notes say why.
 
 | Step | Why here |
 |---|---|
 | `Panicker` / `Watchdog` singletons | Instantiated before anything can need them — static constructors do not run in this kernel |
-| Poison the static stacks | `StackProbe::Poison` fills them with a pattern; what survives is what a stack never reached, which is what `stacks` reports later. The stack this code is running on is filled only up to a margin below the current SP |
-| `BuiltinPageTable::Setup()` + `SetCr3` | The kernel's own copy of the 4 GiB linear map replaces GRUB's tables, which are about to be overwritten |
+| Poison the static stacks | `stack_probe::poison` fills them with a pattern; what survives is what a stack never reached, which is what `stacks` reports later. The stack this code is running on is filled only up to a margin below the current SP |
+| `BuiltinPageTable::setup()` + `set_cr3` | The kernel's own copy of the 4 GiB linear map replaces GRUB's tables, which are about to be overwritten |
 | GDT, exception handlers, IDT | From here a fault is a panic report instead of a triple fault |
 | PIC remap + disable | The 8259s are moved out of the exception vectors and then masked; interrupts come from the IOAPIC |
-| `Dmesg::Setup()` | The ring buffer, so every trace from here is recoverable after the fact |
-| `Grub::ParseMultiBootInfo` | The firmware memory map, the framebuffer, the kernel image bounds, and the command line — which is what `Parameters::Parse` reads. Until this point the trace level is necessarily the default |
-| `Microcode::LoadOnBsp` | Intel's microcode, from the module GRUB loaded beside the kernel as `ucode`, read through the bootstrap map -- a module is below 4 GiB -- before the page allocator can hand its pages out; the update for this CPU copied into the image for the APs (see below) |
-| `Netconsole::Setup()` | Armed as soon as the command line is known, so the log is buffered from the beginning and can be shipped once the link comes up |
-| `BuiltinPageTable::MapHighRam()` | Extends the bootstrap map over RAM above 4 GiB in 1 GiB blocks. It could not run in `Setup()` — there was no memory map yet |
-| `PageTable::Setup()` + `SetCr3` + `SetupFreePagesList()` | The real 4-level page table, the page-descriptor array, and the free list. See [Paging](paging.md) |
-| W^X | `EnableWxSupport` (EFER.NXE), `SetupMemoryTypes` (PAT entry 4 = write-combining), `SetupSerializingLfence` (AMD: DE_CFG bit 1, traced when the firmware left it clear), `SetupCpuPerformance` (Intel: HWP on, the CPU asked for its whole range of clocks, turbo included, and left to pick in it -- see below), then `ProtectRange` three times: text RX, rodata RO+NX, data RW+NX. The first two must precede the first `MapMmioRegion` — an NX bit without NXE faults as reserved, and a write-combining PTE needs the PAT entry to exist. The third makes `lfence; rdtsc` ordered on an AMD CPU, as Linux makes it: without it a guest's TSC read runs ahead of the load before it, and a guest across two CCXs measured its CPUs' TSCs 2052 cycles apart and gave the TSC up |
-| `Screen::Setup()` | Picks EGA text (BIOS) or the pixel framebuffer (UEFI). Needs `MapMmioRegion`, so it cannot be earlier; must be on the BSP before the APs start, so it cannot be later |
-| `Acpi::Parse()` | RSDP, the RSDT or XSDT, and of the tables it lists the four this kernel reads -- the MADT, the FADT, the HPET table, the WDAT: the LAPIC address, the IOAPIC (the one whose pins start at GSI 0), the IRQ→GSI overrides, and one `CpuTable::InsertCpu` per LAPIC entry — which is how the kernel learns how many CPUs it has. The tables are read once, through the TmpMap window, and let go of: what is kept is the values, and the two APICs' pages. A table past the physical address space or longer than 64 KiB is skipped and said; a MADT that is missing, malformed or names no IO-APIC is the one failure, and a panic here |
-| `PageAllocatorImpl::Setup()` + `AllocatorImpl` | The heap. Nothing may allocate before this line |
-| `Hpet::Setup()` | Needs the heap for its MMIO mapping |
-| `HaltTcoWatchdog()` | The BIOS may leave the PCH's TCO timer running with a short timeout; left alone it resets the machine during the self-tests |
-| `Test::Test()` | The boot self-tests (`kernel/test.cpp`). `After test` is printed immediately after |
-| `Pci::Scan()` | Enumerate the bus |
+| `Dmesg::setup()` | The ring buffer, so every trace from here is recoverable after the fact |
+| `grub::parse_multi_boot_info` | The firmware memory map, the framebuffer, the kernel image bounds, and the command line — which is what `Parameters::parse` reads. Until this point the trace level is necessarily the default |
+| `microcode::load_on_bsp` | Intel's microcode, from the module GRUB loaded beside the kernel as `ucode`, read through the bootstrap map -- a module is below 4 GiB -- before the page allocator can hand its pages out; the update for this CPU copied into the image for the APs (see below) |
+| `Netconsole::setup()` | Armed as soon as the command line is known, so the log is buffered from the beginning and can be shipped once the link comes up |
+| `BuiltinPageTable::map_high_ram()` | Extends the bootstrap map over RAM above 4 GiB in 1 GiB blocks. It could not run in `setup()` — there was no memory map yet |
+| `PageTable::setup()` + `set_cr3` + `setup_free_pages_list()` | The real 4-level page table, the page-descriptor array, and the free list. See [Paging](paging.md) |
+| W^X | `enable_wx_support` (EFER.NXE), `setup_memory_types` (PAT entry 4 = write-combining), `setup_serializing_lfence` (AMD: DE_CFG bit 1, traced when the firmware left it clear), `setup_cpu_performance` (Intel: HWP on, the CPU asked for its whole range of clocks, turbo included, and left to pick in it -- see below), then `protect_range` three times: text RX, rodata RO+NX, data RW+NX. The first two must precede the first `map_mmio_region` — an NX bit without NXE faults as reserved, and a write-combining PTE needs the PAT entry to exist. The third makes `lfence; rdtsc` ordered on an AMD CPU, as Linux makes it: without it a guest's TSC read runs ahead of the load before it, and a guest across two CCXs measured its CPUs' TSCs 2052 cycles apart and gave the TSC up |
+| `Screen::setup()` | Picks EGA text (BIOS) or the pixel framebuffer (UEFI). Needs `map_mmio_region`, so it cannot be earlier; must be on the BSP before the APs start, so it cannot be later |
+| `Acpi::parse()` | RSDP, the RSDT or XSDT, and of the tables it lists the four this kernel reads -- the MADT, the FADT, the HPET table, the WDAT: the LAPIC address, the IOAPIC (the one whose pins start at GSI 0), the IRQ→GSI overrides, and one `CpuTable::insert_cpu` per LAPIC entry — which is how the kernel learns how many CPUs it has. The tables are read once, through the tmp_map window, and let go of: what is kept is the values, and the two APICs' pages. A table past the physical address space or longer than 64 KiB is skipped and said; a MADT that is missing, malformed or names no IO-APIC is the one failure, and a panic here |
+| `PageAllocatorImpl::setup()` + `AllocatorImpl` | The heap. Nothing may allocate before this line |
+| `Hpet::setup()` | Needs the heap for its MMIO mapping |
+| `halt_tco_watchdog()` | The BIOS may leave the PCH's TCO timer running with a short timeout; left alone it resets the machine during the self-tests |
+| `test::test()` | The boot self-tests (`kernel/test.cpp`). `After test` is printed immediately after |
+| `Pci::scan()` | Enumerate the bus |
 | Console observers | `console=` decides whether the shell listens on the keyboard, the serial line, or both |
-| `Lapic::Enable()`, `SetBspIndex` | This CPU's local APIC and its identity |
-| `cpu.Run(BpStartup)` | The BSP turns itself into its own idle task and never returns from here |
+| `Lapic::enable()`, `set_bsp_index` | This CPU's local APIC and its identity |
+| `cpu.Run(bp_startup)` | The BSP turns itself into its own idle task and never returns from here |
 
 (The GDT, the exception table and the IDT are re-saved once more after the
-page-table switch, between `SetupFreePagesList` and `Screen::Setup`.)
+page-table switch, between `setup_free_pages_list` and `Screen::setup`.)
 
-## x86-64: `BpStartup`, the BSP idle task
+## x86-64: `bp_startup`, the BSP idle task
 
 Everything below runs in task context, which is what lets it allocate, block
 and take mutexes.
@@ -104,7 +104,7 @@ and take mutexes.
   that ACPI maps ISA IRQ 0 to. The 8042 keyboard takes vector 0x21, the
   serial port 0x24.
 - virtio-blk and virtio-scsi come up and their partitions are probed.
-- `NetFramePool::Setup()` (sized by `netframes=`). The pool is built before
+- `NetFramePool::setup()` (sized by `netframes=`). The pool is built before
   any driver can want a frame — the Rust NIC drivers too, which fill their
   receive rings as they come up; built after them, those rings started out
   as heap frames that each cost a TLB shootdown to free.
@@ -112,26 +112,26 @@ and take mutexes.
 - virtio-net and virtio-rng.
 - The IPI vector (0xFE), the LAPIC timer vector (0xFD) and the LAPIC
   spurious vector (0xFF) get their IDT entries, and interrupts are enabled.
-- `TimeInit()` calibrates the TSC against PIT channel 2 and picks a clock
+- `time_init()` calibrates the TSC against PIT channel 2 and picks a clock
   source (kvmclock → calibrated TSC → PIT).
-- `Lapic::CalibrateTimer()` and `StartTimer` — this CPU's own tick: its
+- `Lapic::calibrate_timer()` and `start_timer` — this CPU's own tick: its
   local APIC's timer, one-shot, armed for each tick and for each deadline a
-  task on the CPU sleeps to (`Cpu::LocalTimerStart`, [the
-  scheduler](scheduler.md#the-local-timer)). It has to precede `StartAll` so
+  task on the CPU sleeps to (`Cpu::local_timer_start`, [the
+  scheduler](scheduler.md#the-local-timer)). It has to precede `start_all` so
   an AP can start its own timer as it comes up.
-- `CpuTable::StartAll()` unless `smp=off`; `maxcpus=N` caps how many.
-- `IrqBalance::Balance()` spreads the device IRQs recorded so far across the
+- `CpuTable::start_all()` unless `smp=off`; `maxcpus=N` caps how many.
+- `IrqBalance::balance()` spreads the device IRQs recorded so far across the
   CPUs that are now running. See [Interrupts](interrupts.md).
-- `PreemptOn()` → **`Preempt is now on`**. Until this line `Schedule()` is a
-  no-op, and the APs are spinning in `PreemptOnWait()`.
-- An IPI round trip to every other CPU, `Test::TestMultiTasking()`,
+- `preempt_on()` → **`Preempt is now on`**. Until this line `schedule()` is a
+  no-op, and the APs are spinning in `preempt_on_wait()`.
+- An IPI round trip to every other CPU, `test::test_multi_tasking()`,
   `rust_test()`.
-- `SoftIrq::Init()` creates one softirq task per running CPU. Block I/O
+- `SoftIrq::init()` creates one softirq task per running CPU. Block I/O
   completions and the receive path run there, so several things below this
   line would silently do nothing above it: `PartitionDevice::ProbeNew()`
   (the disks that appeared during `rust_init`), `MountRootFs()` (the root
   filesystem `root=` names, which may well be on one of those disks — see
-  [Filesystems](filesystems.md)) and `DiskLog::Setup()` are here for exactly
+  [Filesystems](filesystems.md)) and `disk_log::setup()` are here for exactly
   that reason.
 - `Tcp::Init()`, then xHCI (unless `usb=off`) — on a laptop with no PS/2
   controller the USB keyboard is the only way in, so enumeration happens
@@ -143,9 +143,9 @@ and take mutexes.
 
 ## x86-64: the application processors
 
-`CpuTable::StartAll` (`arch/x86_64/cpu_start.cpp`) walks the CPUs ACPI
+`CpuTable::start_all` (`arch/x86_64/cpu_start.cpp`) walks the CPUs ACPI
 reported and brings them up **one at a time**: INIT, 10 ms, then up to two
-SIPIs 200 µs apart pointing at `ApStart16 >> 12`, then poll for up to a
+SIPIs 200 µs apart pointing at `ap_start16 >> 12`, then poll for up to a
 second. One at a time costs the 10 ms INIT delay per CPU and buys two
 things — the trace line names the CPU being poked, so a machine that dies
 during bring-up says which one it choked on, and the APs no longer race each
@@ -153,23 +153,23 @@ other through the dmesg lock and the heap on their way up.
 
 The AP path is the BSP's, minus the parts that only happen once:
 
-`ApStart16` (16-bit real mode, page-aligned below 1 MiB — the SIPI vector is
+`ap_start16` (16-bit real mode, page-aligned below 1 MiB — the SIPI vector is
 a page number) → `gdt32` → protected mode → `ap_start32`, which **reloads
 SS/DS/ES before touching the stack**: the far jump reloaded only CS, and the
 post-INIT descriptor caches would truncate ESP mod 64K and write straight
 into the boot page tables → `AllocStack` → `enable_paging` on the same
-bootstrap tables → `gdt64` → `ApMain`.
+bootstrap tables → `gdt64` → `ap_main`.
 
-`ApMain2` is where the ordering matters again. Until it loads CR3 this CPU
+`ap_main2` is where the ordering matters again. Until it loads CR3 this CPU
 is still on the boot table, which maps exactly two 4 GiB windows — and the
 console may not be in either of them (a Raptor Lake iGPU aperture sits at
 `0x40_0000_0000`). An AP has no IDT yet, so a page fault there is a triple
-fault: the machine resets during `StartAll` with nothing on the screen and
+fault: the machine resets during `start_all` with nothing on the screen and
 nothing in any log. Hence: NXE, then the kernel page table, then GDT and
 IDT, then the microcode the BSP kept, then the PAT and serializing LFENCE,
 as the BSP has them, and only then anything that can print -- what the
 microcode did among the first. After that the LAPIC, kvmclock for this
-vcpu, its clock (HWP), its TSS, and `cpu.Run(ApStartup)`.
+vcpu, its clock (HWP), its TSS, and `cpu.Run(ap_startup)`.
 
 **The clock.** An Intel CPU runs at the ratio firmware last asked for until
 something asks for another, and firmware asks for the base clock: on the
@@ -221,11 +221,11 @@ is the host's, on a CPU that is not Intel's, or with `ucode=off`; arm64 has
 none to load. `cpp-fuzz.py`'s `ucode` target holds the file's reading to
 the SDM.
 
-`ApStartup` arms this CPU's LAPIC timer, enables interrupts, publishes
-itself as running, waits for `PreemptOn` on the BSP, runs the multitasking
+`ap_startup` arms this CPU's LAPIC timer, enables interrupts, publishes
+itself as running, waits for `preempt_on` on the BSP, runs the multitasking
 self-test and enters the idle loop.
 
-`ApStartedFlag` is incremented at five points along that path; if `StartAll`
+`ap_started_flag` is incremented at five points along that path; if `start_all`
 gives up, its value says how far the AP got.
 
 ## arm64: from the Image header to EL1
@@ -243,7 +243,7 @@ in `x0`, MMU off, at the load address.
   implementation's reset value, and SA/A/WXN/EE vary by part.
 - Zero BSS — the bootstrap tables live in it.
 - Build the bootstrap translation, mirroring x86's: **TTBR1** L0[256] → L1
-  with four 1 GiB blocks at `KernelSpaceBase + phys`, block 0
+  with four 1 GiB blocks at `KERNEL_SPACE_BASE + phys`, block 0
   Device-nGnRE (so the PL011, the GIC and the virtio-mmio slots are visible
   immediately) and blocks 1–3 Normal write-back; **TTBR0** an identity 1 GiB
   block over the kernel, live only for the instant the MMU turns on.
@@ -256,14 +256,14 @@ in `x0`, MMU off, at the load address.
   disable TTBR0 walks for good. A live identity alias would keep kernel RAM
   writable *and* executable at its physical address, straight past W^X, and
   would let wild low-half pointers hit RAM instead of faulting.
-- Cache the CPU index in `TPIDR_EL1`, set SP to `BootStackTop`, and call
-  `MainArm64` with the DTB as a linear-map VA.
+- Cache the CPU index in `TPIDR_EL1`, set SP to `boot_stack_top`, and call
+  `main_arm64` with the DTB as a linear-map VA.
 
-## arm64: `MainArm64` and `BpStartupArm`
+## arm64: `main_arm64` and `bp_startup_arm`
 
-`MainArm64` (`arch/arm64/main_arm64.cpp`) is the `Main2` twin. It installs
+`main_arm64` (`arch/arm64/main_arm64.cpp`) is the `main2` twin. It installs
 the EL1 vectors, poisons the boot stack, and parses the device tree
-(`Board::Setup`) for memory regions, the CPU list, the PL011, the GIC
+(`Board::setup`) for memory regions, the CPU list, the PL011, the GIC
 distributor/redistributors, the ITS, the virtio-mmio slots, the PCIe ECAM
 window and the kernel command line. It takes of the tree only what the
 kernel can act on -- register windows the linear map reaches, interrupts
@@ -276,28 +276,28 @@ MPIDR.Aff0, which is right on QEMU virt and wrong on clustered-affinity
 hardware.
 
 From there it follows the x86 sequence: early PL011, dmesg, parameters,
-netconsole, bootstrap map + `MapHighRam`, the real page table, W^X, the page
-allocator, `TimeInit`, `Test::Test()`, then the GICv3, the ITS (unless
+netconsole, bootstrap map + `map_high_ram`, the real page table, W^X, the page
+allocator, `time_init`, `test::test()`, then the GICv3, the ITS (unless
 `its=off`), PCIe over ECAM, the CPU table from the DTB, and
-`cpu.Run(BpStartupArm)`.
+`cpu.Run(bp_startup_arm)`.
 
-One arm64-only step: `InstallEarlyDeviceBlock` copies the device GiB into
+One arm64-only step: `install_early_device_block` copies the device GiB into
 the real table *before* the translation root is switched, so the UART does
 not disappear mid-boot.
 
-`BpStartupArm` sets up the generic timer (per-CPU by construction, so
-`SetPerCpuTimer` is unconditional), the PL011 interrupt, the virtio-mmio
-devices discovered from the DTB slots, then `StartAll`, `PreemptOn`, the
+`bp_startup_arm` sets up the generic timer (per-CPU by construction, so
+`set_per_cpu_timer` is unconditional), the PL011 interrupt, the virtio-mmio
+devices discovered from the DTB slots, then `start_all`, `preempt_on`, the
 self-tests, `rust_init`/`rust_test`, softirqs, TCP, the shell, netconsole
 and the UDP shell — and prints `boot: complete`.
 
 APs come up through PSCI `CPU_ON`, with the CPU index passed as the context
-argument, landing at `SecondaryEntry`. The BSP publishes the kernel
-translation root in `Arm64ApTtbr1` and a stack top per CPU in
-`Arm64ApStackTop[]`, and cleans both to the point of coherency — the
-secondary reads them with the MMU and caches off. `ApMainArm64` then
-installs the vectors, runs `Gic::CpuInit` for its own redistributor, and
-enters `ApStartupArm`, which arms its own generic timer and idles.
+argument, landing at `secondary_entry`. The BSP publishes the kernel
+translation root in `arm64_ap_ttbr1` and a stack top per CPU in
+`arm64_ap_stack_top[]`, and cleans both to the point of coherency — the
+secondary reads them with the MMU and caches off. `ap_main_arm64` then
+installs the vectors, runs `Gic::cpu_init` for its own redistributor, and
+enters `ap_startup_arm`, which arms its own generic timer and idles.
 
 ## What to do when it does not boot
 

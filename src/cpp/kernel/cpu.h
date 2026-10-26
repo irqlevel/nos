@@ -14,15 +14,15 @@ namespace kernel
 {
 
 /* Upper bound on the CPUs the kernel tracks.  64 is a ceiling rather than a
-   tuning knob: CPU sets travel as a ulong bitmask (GetRunningCpus,
-   Task::CpuAffinity, SoftIrq), so index 63 is the last one that fits.
+   tuning knob: CPU sets travel as a ulong bitmask (get_running_cpus,
+   Task::cpu_affinity_, SoftIrq), so index 63 is the last one that fits.
 
    On x86 the index *is* the LAPIC ID, not a dense counter, so this bound has
    to clear the largest APIC ID the firmware reports rather than the CPU
    count: a 14-core Raptor Lake numbers its 20 threads 0,1,8,9,...,62, and at
-   MaxCpus = 8 everything above the first two threads was dropped.  Anything
+   MAX_CPUS = 8 everything above the first two threads was dropped.  Anything
    sized by this constant is per-CPU static storage (kernel/main.cpp Stack[],
-   gdt.h DfStack[], arm64 ApBootStack[]), so raising it further costs BSS in
+   gdt.h df_stack_[], arm64 ap_boot_stack[]), so raising it further costs BSS in
    proportion. */
 const ulong MAX_CPUS = 64;
 
@@ -61,12 +61,12 @@ public:
 
     ulong get_state();
 
-    /* True once Park() has stopped this CPU for good -- the last thing it
+    /* True once park() has stopped this CPU for good -- the last thing it
        does, from a stack of its own -- after which the CPU that asked it to
        exit may free everything it ran on: the task it interrupted, that
        task's stack, at last the heap. Written once by the parking CPU and
        read without the lock: by the halt waiting for it
-       (CpuTable::ExitAllExceptSelf), by whatever would send it work, and by
+       (CpuTable::exit_all_except_self), by whatever would send it work, and by
        whichever CPU panics. */
     bool is_parked();
 
@@ -74,20 +74,20 @@ public:
     void timer_tick(Context* ctx);
 
     /* This CPU's local timer, one-shot: armed for the earlier of its next
-       tick, on a TickHz grid, and the soonest deadline of a task asleep on
-       it -- so a Sleep() or an Event::WaitFor() ends at its deadline, and
+       tick, on a TICK_HZ grid, and the soonest deadline of a task asleep on
+       it -- so a sleep() or an Event::wait_for() ends at its deadline, and
        not at the next tick after it. Each is called on this CPU only, with
        interrupts off.
 
-       LocalTimerStart: the hardware set up one-shot by the arch, the grid
-       begins and the first tick is armed. LocalTimerFired: from the
+       local_timer_start: the hardware set up one-shot by the arch, the grid
+       begins and the first tick is armed. local_timer_fired: from the
        timer's interrupt, whether the tick is due -- the grid moved on if so
        -- with the timer armed again for the next one; the soonest deadline,
        if it is sooner, is the scheduler's to bring forward
-       (LocalTimerTakeWalk, TaskQueue::Schedule). LocalTimerWake: the timer
+       (local_timer_take_walk, TaskQueue::schedule). local_timer_wake: the timer
        brought forward to a deadline sooner than the one it has; nothing for
        0, for a later one, or where the timer is not one-shot.
-       LocalTimerTick: the next tick armed and nothing else, for a CPU whose
+       local_timer_tick: the next tick armed and nothing else, for a CPU whose
        queue may not be looked at -- a panic's. */
     void local_timer_start();
     bool local_timer_one_shot() const { return timer_one_shot_; }
@@ -102,7 +102,7 @@ public:
 
     bool run(Task::Func func, void *ctx);
 
-    /* The task Run() made for this CPU: the BSP's runs BpStartup and then
+    /* The task Run() made for this CPU: the BSP's runs bp_startup and then
        the shutdown watch, an AP's its idle loop */
     Task* get_idle_task() { return idle_task_ptr_; }
 
@@ -138,7 +138,7 @@ private:
     stdlib::ListEntry ipi_task_list_;
     bool ipi_tasks_closed_; /* set on exit: queuers self-complete instead of waiting */
 
-    /* Set by Park(), last; see IsParked */
+    /* Set by park(), last; see is_parked */
     Atomic parked_;
 
     void local_timer_arm(ulong when, ulong now);
@@ -205,8 +205,8 @@ public:
        it from every CPU's tick, and taking the table lock there would be both
        the contention the reader exists to remove and a spinlock acquired
        from an interrupt with interrupts off -- the shape that wedges
-       machines. Published by NoteCpuRunning as each CPU comes up, and
-       refreshed by every locked call above. Nothing clears StateRunning
+       machines. Published by note_cpu_running as each CPU comes up, and
+       refreshed by every locked call above. Nothing clears STATE_RUNNING
        today, so nothing takes a bit back out. */
     ulong get_running_cpus_no_lock();
 
@@ -240,7 +240,7 @@ private:
     Cpu cpu_array_[MAX_CPUS];
 
     ulong bsp_index_;
-    /* Mirror of BspIndex readable without taking Lock */
+    /* Mirror of bsp_index_ readable without taking Lock */
     Atomic bsp_index_cached_;
 
     /* Mirror of the running-CPU set, read on the tick path */

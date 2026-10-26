@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <arch/arm64/generic_timer.h>
 
-// arm64 body for Hal::LocalTimerArm (see hal/timer.h): the generic timer's
+// arm64 body for hal::local_timer_arm (see hal/timer.h): the generic timer's
 // CNTV, by its compare value.
 
 namespace hal

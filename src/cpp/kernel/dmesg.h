@@ -41,8 +41,8 @@ public:
     PRINTF_FORMAT(2, 3) void printf(const char *fmt, ...);
     void print_string(const char *s);
 
-    /* Print the log. lastLines == 0 is the whole of it; otherwise only the
-       newest lastLines messages, found by walking back from the tail. filter,
+    /* Print the log. last_lines == 0 is the whole of it; otherwise only the
+       newest last_lines messages, found by walking back from the tail. filter,
        when set, prints only the messages that contain it.
 
        The tail is what a remote shell wants: its reply buffer holds a few
@@ -85,7 +85,7 @@ private:
     Dmesg& operator=(const Dmesg& other) = delete;
     Dmesg& operator=(Dmesg&& other) = delete;
 
-    /* The message a lastLines dump starts printing at, pinned, or nullptr
+    /* The message a last_lines dump starts printing at, pinned, or nullptr
        when the log is empty. */
     DmesgMsg* tail_start(ulong last_lines);
 

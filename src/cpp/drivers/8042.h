@@ -43,11 +43,11 @@ private:
     static const ulong DATA_PORT = 0x60;
     static const ulong STATUS_PORT = 0x64;
 
-    /* Bound on the ReadData drain loop (stuck status bit) */
+    /* Bound on the read_data drain loop (stuck status bit) */
     static const size_t MAX_DRAIN_ITERATIONS = 4096;
 
     /* Set-1 scan codes: a key's make code, its break code the same with
-       CodeBreak set; behind CodeExtended, the right Ctrl and the arrows */
+       CODE_BREAK set; behind CODE_EXTENDED, the right Ctrl and the arrows */
     static const u8 CODE_BREAK = 0x80;
     static const u8 CODE_EXTENDED = 0xE0;
     static const u8 CODE_CTRL = 0x1D;

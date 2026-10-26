@@ -2,12 +2,12 @@
 
 #include <include/types.h>
 
-// arm64 bodies for the Hal:: MMU wrappers (see hal/mmu.h). The kernel
+// arm64 bodies for the hal:: MMU wrappers (see hal/mmu.h). The kernel
 // address space lives in TTBR1_EL1; TTBR0 walks are disabled (TCR.EPD0,
 // set by boot.S once the bootstrap identity map has served the MMU-on
 // transition). TLB flushes use the inner-shareable variants so the hardware
 // broadcasts them to every CPU — no IPI shootdown needed
-// (Hal::TlbShootdownNeedsIpi() returns false).
+// (hal::tlb_shootdown_needs_ipi() returns false).
 
 namespace hal
 {

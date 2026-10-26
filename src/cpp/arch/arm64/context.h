@@ -5,7 +5,7 @@
 namespace kernel
 {
 
-/* SetJmp/LongJmp buffer: x19-x28, x29, x30, sp (+pad to 16-byte multiple) */
+/* set_jmp/long_jmp buffer: x19-x28, x29, x30, sp (+pad to 16-byte multiple) */
 struct JmpContext final
 {
     ulong x19;
@@ -25,7 +25,7 @@ struct JmpContext final
 };
 
 /* Exception/interrupt register frame, built by vectors.S. The accessor
-   names (GetRetRip/GetErrorCode/GetOrigRsp/GetFramePointer) are the
+   names (get_ret_rip/get_error_code/get_orig_rsp/get_frame_pointer) are the
    cross-arch contract with common code. */
 struct Context final
 {

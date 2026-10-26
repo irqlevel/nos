@@ -6,22 +6,22 @@ namespace kernel
 {
 
 /* One task waiting for others to have something for it: an auto-reset
-   event. Signal() comes from anywhere, a hard IRQ handler included; the one
-   task that calls Wait() comes back once for every run of signals since it
+   event. signal() comes from anywhere, a hard IRQ handler included; the one
+   task that calls wait() comes back once for every run of signals since it
    last did.
 
-   Wait() takes the task out of the scheduler's walk (Task::Block) rather
-   than spinning on Schedule() the way WaitGroup does, so a waiter costs its
-   CPU nothing while there is nothing to do; and a Signal() that finds it
+   wait() takes the task out of the scheduler's walk (Task::block) rather
+   than spinning on schedule() the way WaitGroup does, so a waiter costs its
+   CPU nothing while there is nothing to do; and a signal() that finds it
    blocked sends that CPU an IPI, so it runs now rather than at the next tick.
-   The handshake is SoftIrq::Run's: the waiter publishes itself and raises its
-   blocked flag before it looks at Signaled one last time, and Signal() sets
+   The handshake is SoftIrq::run's: the waiter publishes itself and raises its
+   blocked flag before it looks at Signaled one last time, and signal() sets
    Signaled before it looks for a waiter -- every step a sequentially
    consistent atomic, so a signal landing anywhere in the waiter's window is
-   either seen by the re-check or clears the flag before Schedule() can act
-   on it. Unlike SoftIrq::Run, the window runs with interrupts off: a tick or
+   either seen by the re-check or clears the flag before schedule() can act
+   on it. Unlike SoftIrq::run, the window runs with interrupts off: a tick or
    an IPI in it would switch the blocked task out before its re-check, and an
-   event has no TickKick to come back for it.
+   event has no tick_kick to come back for it.
 
    The IPI goes to the CPU the waiter blocked on. A waiter free to move may
    be moved as it blocks, and is then woken at its new CPU's next scheduling
@@ -38,19 +38,19 @@ public:
        nothing to switch to. */
     void wait();
 
-    /* Wait() for at most timeoutNs: true when signalled, false when the
-       time ran out first. The deadline is Sleep()'s -- the scheduler wakes a
-       sleeping task whose SleepUntil has passed at its CPU's next scheduling
+    /* wait() for at most timeout_ns: true when signalled, false when the
+       time ran out first. The deadline is sleep()'s -- the scheduler wakes a
+       sleeping task whose sleep_until_ has passed at its CPU's next scheduling
        point, which that CPU's timer, armed for the deadline as the task goes
-       to sleep, makes then (TaskQueue::WakeDue) -- so a waiter costs its CPU
+       to sleep, makes then (TaskQueue::wake_due) -- so a waiter costs its CPU
        nothing either way, ends at its deadline and not at the next tick
-       after it, and a Signal() still wakes it at once: of the two, exactly
-       one does (Task::RunState). */
+       after it, and a signal() still wakes it at once: of the two, exactly
+       one does (Task::run_state_). */
     bool wait_for(unsigned long long timeout_ns);
 
-    /* Any context. A signaller is done with the event only when Signal()
+    /* Any context. A signaller is done with the event only when signal()
        returns -- the waiter having taken the signal says nothing about that
-       -- so the event, and the waiting task, must outlive every Signal()
+       -- so the event, and the waiting task, must outlive every signal()
        that may still be running: whoever frees them has to know that no
        signaller is left, not merely that the waiter woke. */
     void signal();
@@ -62,7 +62,7 @@ private:
     Event& operator=(Event&& other) = delete;
 
     Atomic signaled_;
-    Atomic waiter_;      /* the Task in Wait(), 0 when none is */
+    Atomic waiter_;      /* the Task in wait(), 0 when none is */
     Atomic waiter_cpu_;
 };
 

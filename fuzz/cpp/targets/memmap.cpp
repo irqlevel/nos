@@ -5,7 +5,7 @@
 // that overlap, that are empty, that run past the top of the address space.
 // Every answer is held to the same question answered naively, page by page,
 // in arithmetic that cannot wrap, over the regions as memory_map.h says it
-// keeps them; and the free-page scan PageTable::GetFreePages runs is run
+// keeps them; and the free-page scan PageTable::get_free_pages runs is run
 // over the map, which must never list a page a reserved region covers, and
 // must always move forward.
 #include "host.h"
@@ -91,7 +91,7 @@ void run(fuzz::Input& in)
 
     /* The map: what the firmware said, and sometimes more than it holds.
        What memory_map.h says is kept of a region: nothing of an empty one
-       or one past MaxPhysAddr, and of the rest what is below it. */
+       or one past MAX_PHYS_ADDR, and of the rest what is below it. */
     const u128 top = MemoryMap::MAX_PHYS_ADDR;
     bool many = in.chance(8);
     ulong count = many ? MemoryMap::MAX_REGIONS + 6 : in.below(14);
@@ -104,16 +104,16 @@ void run(fuzz::Input& in)
         bool added = mmap.add_region(addr, len, type);
         if (len == 0 || addr >= top)
         {
-            INVARIANT(added, "AddRegion(0x%lx, 0x%lx) refused a region it keeps nothing of", addr, len);
+            INVARIANT(added, "add_region(0x%lx, 0x%lx) refused a region it keeps nothing of", addr, len);
             fuzz::reached("a region kept nothing of");
             continue;
         }
         if (map.size() >= MemoryMap::MAX_REGIONS)
         {
-            INVARIANT(!added, "AddRegion took region %lu into a full map", i);
+            INVARIANT(!added, "add_region took region %lu into a full map", i);
             continue;
         }
-        INVARIANT(added, "AddRegion refused region %lu of a map with room", i);
+        INVARIANT(added, "add_region refused region %lu of a map with room", i);
         u128 end = static_cast<u128>(addr) + len;
         if (end > top)
         {
@@ -135,7 +135,7 @@ void run(fuzz::Input& in)
     }
 
     /* The free-page scan of page_table.cpp over [start, end): skip what
-       GetReservedEnd says is reserved, list up to GetNextReservedStart. */
+       get_reserved_end says is reserved, list up to get_next_reserved_start. */
     ulong start = in.chance(32) ? ((1UL << 52) - (in.u8() % 8) * PAGE) : (in.u8() % 64) * PAGE;
     ulong end = start + (1 + in.u8() % 64) * PAGE;
     ulong address = start;
@@ -145,23 +145,23 @@ void run(fuzz::Input& in)
         ulong reserved_end = mmap.get_reserved_end(address);
         if (reserved_end != 0)
         {
-            INVARIANT(reserved(map, address), "GetReservedEnd(0x%lx) says reserved to 0x%lx: nothing reserves it",
+            INVARIANT(reserved(map, address), "get_reserved_end(0x%lx) says reserved to 0x%lx: nothing reserves it",
                 address, reserved_end);
-            INVARIANT(reserved_end > address, "GetReservedEnd(0x%lx) = 0x%lx: the scan goes nowhere", address,
+            INVARIANT(reserved_end > address, "get_reserved_end(0x%lx) = 0x%lx: the scan goes nowhere", address,
                 reserved_end);
             if (reserved_end > end)
                 reserved_end = end;
             for (ulong a = address; a < reserved_end; a += PAGE)
-                INVARIANT(reserved(map, a), "GetReservedEnd(0x%lx) skips page 0x%lx, which nothing reserves",
+                INVARIANT(reserved(map, a), "get_reserved_end(0x%lx) skips page 0x%lx, which nothing reserves",
                     address, a);
             fuzz::reached("a reserved run skipped");
             address = reserved_end;
             continue;
         }
-        INVARIANT(!reserved(map, address), "GetReservedEnd(0x%lx) = 0 for a reserved page", address);
+        INVARIANT(!reserved(map, address), "get_reserved_end(0x%lx) = 0 for a reserved page", address);
         ulong run_end = mmap.get_next_reserved_start(address, end);
-        INVARIANT(run_end > address, "GetNextReservedStart(0x%lx) = 0x%lx: the scan goes nowhere", address, run_end);
-        INVARIANT(run_end <= end, "GetNextReservedStart(0x%lx, 0x%lx) = 0x%lx: past its limit", address, end, run_end);
+        INVARIANT(run_end > address, "get_next_reserved_start(0x%lx) = 0x%lx: the scan goes nowhere", address, run_end);
+        INVARIANT(run_end <= end, "get_next_reserved_start(0x%lx, 0x%lx) = 0x%lx: past its limit", address, end, run_end);
         for (; address < run_end; address += PAGE)
             INVARIANT(!reserved(map, address), "the free-page scan lists page 0x%lx, which is reserved", address);
         fuzz::reached("a free run listed");
@@ -181,7 +181,7 @@ void run(fuzz::Input& in)
                 if (r.usable && a >= r.addr && a < r.end)
                     usable = true;
             }
-            INVARIANT(mmap.is_usable_ram(a) == usable, "IsUsableRam(0x%lx) says %d", a, !usable);
+            INVARIANT(mmap.is_usable_ram(a) == usable, "is_usable_ram(0x%lx) says %d", a, !usable);
             break;
         }
         case 1:
@@ -191,7 +191,7 @@ void run(fuzz::Input& in)
             if (static_cast<u128>(a) + len > (static_cast<u128>(1) << 64))
                 break;
             bool reserved = overlaps(map, false, a, static_cast<u128>(a) + len);
-            INVARIANT(mmap.is_reserved(a, len) == reserved, "IsReserved(0x%lx, 0x%lx) says %d", a, len, !reserved);
+            INVARIANT(mmap.is_reserved(a, len) == reserved, "is_reserved(0x%lx, 0x%lx) says %d", a, len, !reserved);
             break;
         }
         case 2:
@@ -200,7 +200,7 @@ void run(fuzz::Input& in)
             if (e < a)
                 break;
             bool usable = overlaps(map, true, a, e);
-            INVARIANT(mmap.has_usable_ram_in(a, e) == usable, "HasUsableRamIn(0x%lx, 0x%lx) says %d", a, e, !usable);
+            INVARIANT(mmap.has_usable_ram_in(a, e) == usable, "has_usable_ram_in(0x%lx, 0x%lx) says %d", a, e, !usable);
             break;
         }
         default:
@@ -212,7 +212,7 @@ void run(fuzz::Input& in)
                     above += r.end - ((r.addr > a) ? r.addr : static_cast<u128>(a));
             }
             INVARIANT(mmap.get_usable_ram_bytes_above(a) == static_cast<ulong>(above),
-                "GetUsableRamBytesAbove(0x%lx) = 0x%lx, not 0x%lx", a, mmap.get_usable_ram_bytes_above(a),
+                "get_usable_ram_bytes_above(0x%lx) = 0x%lx, not 0x%lx", a, mmap.get_usable_ram_bytes_above(a),
                 static_cast<ulong>(above));
             break;
         }
@@ -229,9 +229,9 @@ void run(fuzz::Input& in)
         if (r.end > highest)
             highest = r.end;
     }
-    INVARIANT(mmap.get_usable_ram_bytes() == static_cast<ulong>(total), "GetUsableRamBytes() = 0x%lx, not 0x%lx",
+    INVARIANT(mmap.get_usable_ram_bytes() == static_cast<ulong>(total), "get_usable_ram_bytes() = 0x%lx, not 0x%lx",
         mmap.get_usable_ram_bytes(), static_cast<ulong>(total));
-    INVARIANT(mmap.get_usable_ram_end() == static_cast<ulong>(highest), "GetUsableRamEnd() = 0x%lx, not 0x%lx",
+    INVARIANT(mmap.get_usable_ram_end() == static_cast<ulong>(highest), "get_usable_ram_end() = 0x%lx, not 0x%lx",
         mmap.get_usable_ram_end(), static_cast<ulong>(highest));
 }
 

@@ -118,12 +118,12 @@ static HaltAction halt_action_fn;
 
 /* Runs on the static boot stack: releases the idle task, runs static
    destructors and Rust teardown, then powers off/resets. Never returns
-   (the x86 twin: FinalizeOnStaticStack in kernel/main.cpp). */
+   (the x86 twin: finalize_on_static_stack in kernel/main.cpp). */
 static void finalize_on_boot_stack(void* ctx)
 {
     (void)ctx;
 
-    trace(0, "FinalizeOnBootStack");
+    trace(0, "finalize_on_boot_stack");
 
     halt_task->put();
 
@@ -139,7 +139,7 @@ static void finalize_on_boot_stack(void* ctx)
 static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action)
 {
     /* Extra ref so the idle task is not freed while we still run on its
-       stack (released in FinalizeOnBootStack after the stack switch) */
+       stack (released in finalize_on_boot_stack after the stack switch) */
     auto task = Task::get_current_task();
     task->get();
 
@@ -163,7 +163,7 @@ static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action)
     hal::run_on_stack((ulong)&boot_stack_top[0], finalize_on_boot_stack, nullptr);
 }
 
-/* AP idle-task body (the x86 twin: ApStartup in kernel/main.cpp) */
+/* AP idle-task body (the x86 twin: ap_startup in kernel/main.cpp) */
 static void ap_startup_arm(void* ctx)
 {
     (void)ctx;
@@ -196,7 +196,7 @@ static void ap_startup_arm(void* ctx)
     }
 }
 
-/* The BpStartup twin (kernel/main.cpp): runs as the BSP idle task */
+/* The bp_startup twin (kernel/main.cpp): runs as the BSP idle task */
 static void bp_startup_arm(void* ctx)
 {
     (void)ctx;
@@ -211,7 +211,7 @@ static void bp_startup_arm(void* ctx)
     }
 
     /* The generic timer is per core by construction, and every CPU arms its
-       own in ApStartupArm -- so the tick work on the IPI path is a duplicate
+       own in ap_startup_arm -- so the tick work on the IPI path is a duplicate
        here, and has been since the port. */
     CpuTable::get_instance().set_per_cpu_timer();
 
@@ -226,7 +226,7 @@ static void bp_startup_arm(void* ctx)
     /* Hand the virtio-mmio windows the device tree described to the drivers
        (all inside the premapped device GiB). What is in each one is theirs
        to read; this only says where they are. Must run on the BSP before the
-       APs start (MapMmioRegion boot-ordering constraint). */
+       APs start (map_mmio_region boot-ordering constraint). */
     {
         static VirtioMmioSlot slots[Board::MAX_VIRTIO_MMIO];
         ulong count = 0;
@@ -263,7 +263,7 @@ static void bp_startup_arm(void* ctx)
     preempt_on();
     trace(0, "Preempt is now on");
 
-    /* IPI round-trip test (mirrors kernel/main.cpp BpStartup) */
+    /* IPI round-trip test (mirrors kernel/main.cpp bp_startup) */
     ulong cpu_mask = cpus.get_running_cpus();
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
@@ -371,7 +371,7 @@ static void bp_startup_arm(void* ctx)
             kernel_vfs_unmount_all();
 
             /* The disk log last of all: its writer finishes what is queued
-               and the log switches off -- after SoftIrq::Stop() a write
+               and the log switches off -- after SoftIrq::stop() a write
                through a virtio disk would wait for ever. */
             rust_disklog_stop();
 
@@ -413,7 +413,7 @@ static void wx_probe_heap()
     trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
-/* PSCI CPU_ON lands here (via boot.S SecondaryEntry) on the AP boot stack */
+/* PSCI CPU_ON lands here (via boot.S secondary_entry) on the AP boot stack */
 extern "C" void ap_main_arm64(ulong index)
 {
     using namespace kernel;
@@ -451,7 +451,7 @@ extern "C" void main_arm64(void* dtb)
             stack_probe::poison(&boot_stack[0],
                 (sp - base - poison_margin) & ~(sizeof(ulong) - 1));
 
-        /* And the guard page below it, whole: CpuTable::StartAll wants it
+        /* And the guard page below it, whole: CpuTable::start_all wants it
            untouched (boot.S). */
         stack_probe::poison(&boot_stack_guard[0], base - (ulong)&boot_stack_guard[0]);
     }
@@ -557,7 +557,7 @@ extern "C" void main_arm64(void* dtb)
     /* W^X: kernel text is RX, everything else in the image is RW+NX.
        Runs after the free-pages list so the walk sees the final image
        mapping. The image is the only executable mapping the page table was
-       built with -- every other one is NX from birth (MapRangeLocked). */
+       built with -- every other one is NX from birth (map_range_locked). */
     {
         ulong text_start = (ulong)kernel_start;
         ulong text_end = (ulong)kernel_text;

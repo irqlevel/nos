@@ -125,7 +125,7 @@ bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_
     ulong va = pt.map_mmio_region(phys_addr, bar_size);
     if (va == 0)
     {
-        trace(0, "MsixTable: MapMmioRegion failed");
+        trace(0, "MsixTable: map_mmio_region failed");
         return false;
     }
 
@@ -232,9 +232,9 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
         return 0;
     }
 
-    /* AssignMsix takes the IrqBalance lock; it must complete before
-       EntryLock is taken because Balance() nests them the other way
-       around (IrqBalance lock -> Retarget -> EntryLock). */
+    /* assign_msix takes the IrqBalance lock; it must complete before
+       entry_lock_ is taken because balance() nests them the other way
+       around (IrqBalance lock -> Retarget -> entry_lock_). */
     u32 apic_id = (u32)IrqBalance::get_instance().assign_msix(this, index);
     u32 addr_low = MSIX_ADDR_BASE | (apic_id << 12);
 

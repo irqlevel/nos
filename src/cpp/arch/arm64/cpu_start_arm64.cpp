@@ -44,7 +44,7 @@ long psci_call(u32 fn, ulong a1, ulong a2, ulong a3)
     return (long)x0;
 }
 
-/* Static boot stacks the APs run on until Cpu::Run switches them to
+/* Static boot stacks the APs run on until Cpu::run switches them to
    their idle-task stacks (the x86 twin: Stack[] in kernel/main.cpp). */
 const ulong AP_BOOT_STACK_SIZE = 4 * consts::PAGE_SIZE;
 char ap_boot_stack[MAX_CPUS][4 * consts::PAGE_SIZE]
@@ -62,10 +62,10 @@ void clean_dcache_line(const void* p)
 extern "C" char secondary_entry[];
 extern "C" ulong arm64_ap_ttbr1;
 extern "C" ulong arm64_ap_stack_top[64];
-/* sizeof arithmetic rather than Stdlib::ArraySize: that helper is not
+/* sizeof arithmetic rather than stdlib::array_size: that helper is not
    constexpr, so it cannot be used in a static_assert. */
 static_assert(sizeof(arm64_ap_stack_top) / sizeof(arm64_ap_stack_top[0]) == MAX_CPUS,
-    "Arm64ApStackTop (boot.S) must hold one entry per CPU");
+    "arm64_ap_stack_top (boot.S) must hold one entry per CPU");
 static_assert(Board::MAX_BOARD_CPUS <= MAX_CPUS,
     "the FDT CPU table must not outgrow the kernel's CPU cap");
 
@@ -76,8 +76,8 @@ extern "C" char boot_stack_top[];
 
 void report_cpu_stacks(stdlib::Printer& printer, ulong& worst_free)
 {
-    /* The BSP's boot stack carries all of MainArm64 -- the deepest code on
-       this arch -- and the AP stacks carry bring-up until Cpu::Run moves each
+    /* The BSP's boot stack carries all of main_arm64 -- the deepest code on
+       this arch -- and the AP stacks carry bring-up until Cpu::run moves each
        one onto an idle-task stack. None of them has the magic word or the
        one-page tripwire a task stack gets. */
     struct { const char* name; char* base; ulong size; ulong id; } stacks[MAX_CPUS + 1];

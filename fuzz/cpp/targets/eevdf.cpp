@@ -2,7 +2,7 @@
 // queue, a handful of entities of random weights and slices, some always able
 // to run and some that sleep and wake or move away and come back, and time
 // going by a quantum at a time -- a tick, a slice's end, a wakeup -- with
-// every decision made in the order the kernel's TaskQueue::Schedule makes it:
+// every decision made in the order the kernel's TaskQueue::schedule makes it:
 // the next picked while the last is still current, the last gone or back on
 // the list, the next taken. Each decision is checked against a model that
 // computes it from scratch in 128 bits: the one picked is eligible -- at or
@@ -250,7 +250,7 @@ void leave(Model& m)
     fuzz::reached(current ? "a leave from the CPU" : "a leave from the list");
 }
 
-/* A decision, as TaskQueue::Schedule makes it */
+/* A decision, as TaskQueue::schedule makes it */
 enum class Why
 {
     /* An interrupt's: the current one kept when it is best */

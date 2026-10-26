@@ -1,6 +1,6 @@
-// The Hal:: interrupt-controller wrappers of hal/irqchip.h, for a process on
+// The hal:: interrupt-controller wrappers of hal/irqchip.h, for a process on
 // the host: no controller, and the CPU the fuzzed code runs on is whichever
-// the target says (Fuzz::CurrentCpu). An interrupt or an IPI sent is a
+// the target says (fuzz::current_cpu). An interrupt or an IPI sent is a
 // finding: nothing the fuzzed code does may need one.
 #pragma once
 
@@ -47,7 +47,7 @@ static inline void send_ipi(ulong hw_id, u8 vector)
 {
     (void)hw_id;
     (void)vector;
-    fuzz::host_hal_unreachable("Hal::SendIpi");
+    fuzz::host_hal_unreachable("hal::send_ipi");
 }
 
 static inline bool nmi_ipi_supported()
@@ -58,7 +58,7 @@ static inline bool nmi_ipi_supported()
 static inline void send_nmi_ipi(ulong hw_id)
 {
     (void)hw_id;
-    fuzz::host_hal_unreachable("Hal::SendNmiIpi");
+    fuzz::host_hal_unreachable("hal::send_nmi_ipi");
 }
 
 }

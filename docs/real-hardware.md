@@ -28,7 +28,7 @@ ever demanded:
   firmware owns it, so it cannot reset the box mid-boot.
 - **Diagnostics** — with no UART the screen is the only channel, so boot-path
   failures print through the screen console and the panic handler rather than
-  `Trace` alone.
+  `trace` alone.
 
 ## Hetzner EX44 dedicated server
 
@@ -40,7 +40,7 @@ tasks, and the load balancer spreads the multitasking self-test across them.
 The hybrid topology is what makes it worth recording. The APIC IDs are sparse
 and non-contiguous — `0, 1, 8, 9 … 40, 41` for the SMT pairs on the P-cores,
 then `48, 50 … 62`, even-numbered, for the E-cores — so the largest apic id is
-62 on a 20-CPU machine. That is why `MaxCpus` is 64 rather than a number near
+62 on a 20-CPU machine. That is why `MAX_CPUS` is 64 rather than a number near
 the CPU count, and why IOAPIC redirection entries are only aimed at apic ids a
 physical-mode entry can actually name: that field is four bits wide, ids 0..15,
 so round-robining an IOAPIC line onto an E-core silently aliased it onto an id
@@ -141,7 +141,7 @@ measurements and that, none of them the 82576 model could show:
   to five thousand packets, and the echo a quarter less CPU per packet.
 - The first burst after every boot lost frames — 755 k in two seconds —
   until the receive ring had turned over once: the rings were filled from
-  `Mm::Alloc` before the frame pool existed, and each of those frames cost
+  `mm::alloc` before the frame pool existed, and each of those frames cost
   a TLB shootdown to free. The pool now comes up first.
 
 `SRRCTL.Drop_En` stays set: a queue out of descriptors drops at the queue,

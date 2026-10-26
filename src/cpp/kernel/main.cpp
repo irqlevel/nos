@@ -101,7 +101,7 @@ void trace_cpu_state(ulong cpu)
  *   4. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
  *
  * This runs before the PCI subsystem exists, hence the raw CF8/CFC access,
- * but after Acpi::Parse(), so the WDAT verdict is already available.
+ * but after Acpi::parse(), so the WDAT verdict is already available.
  */
 static void halt_tco_watchdog()
 {
@@ -124,7 +124,7 @@ static void halt_tco_watchdog()
     static const u16 TMR_HLT      = 1 << 11;
     static const u16 INTEL_VENDOR = 0x8086;
 
-    trace(0, "HaltTcoWatchdog: started");
+    trace(0, "halt_tco_watchdog: started");
 
     /* An ACPI WDAT table means the firmware owns the watchdog and the Rust
        tco_wdt driver stands down.  The halt below still runs: WDAT normally
@@ -190,7 +190,7 @@ static void halt_tco_watchdog()
     outw(tco_base + TCO1_STS, 1 << 3);
     outw(tco_base + TCO2_STS, 1 << 1);
 
-    trace(0, "TCO watchdog halted (tcoBase 0x%lX via %s%s)", (ulong)tco_base, source,
+    trace(0, "TCO watchdog halted (tco_base 0x%lX via %s%s)", (ulong)tco_base, source,
         firmware_watchdog ? ", ACPI WDAT owns it" : "");
 }
 
@@ -212,7 +212,7 @@ void ap_startup(void *ctx)
 
     /* Before interrupts: this CPU's own tick, so it never depends on another
        CPU still answering one -- one-shot, armed for each tick and for each
-       deadline a task here sleeps to (Cpu::LocalTimerStart). */
+       deadline a task here sleeps to (Cpu::local_timer_start). */
     if (lapic_timer_ok)
     {
         Lapic::start_timer(CpuTable::TIMER_VECTOR);
@@ -245,16 +245,16 @@ void ap_startup(void *ctx)
    map. A call starts a frame of its own on the new stack. */
 __attribute__((noinline)) void ap_main2()
 {
-    atomic_read_and_inc(&ap_started_flag); /* 2: entered ApMain2 */
+    atomic_read_and_inc(&ap_started_flag); /* 2: entered ap_main2 */
 
     /* Until the CR3 below, this CPU is still on the boot page table from
        boot64.asm, which maps exactly two windows: the low 4GiB identity and
-       the same 4GiB at KernelSpaceBase. Nothing here may touch a virtual
-       address outside them -- and the console is one. MapMmioRegion places a
-       device at physAddr + KernelSpaceBase, so a framebuffer above 4GiB (the
+       the same 4GiB at KERNEL_SPACE_BASE. Nothing here may touch a virtual
+       address outside them -- and the console is one. map_mmio_region places a
+       device at phys_addr + KERNEL_SPACE_BASE, so a framebuffer above 4GiB (the
        Raptor Lake iGPU aperture sits at 0x40_0000_0000) lands at a VA the
        boot table has no L3 entry for. An AP has no IDT yet either, so that
-       page fault is a triple fault: the machine resets during StartAll with
+       page fault is a triple fault: the machine resets during start_all with
        nothing on the screen and nothing in any log.
 
        Hence the order: NXE first (the W^X page table sets NX bits, which
@@ -330,7 +330,7 @@ extern "C" void ap_main()
 {
     /* Before anything can ask which CPU this is: the GS base firmware left
        behind is not a slot of ours, and reading through it would be a wild
-       load. Until Lapic::Enable() publishes the real one, this reads as
+       load. Until Lapic::enable() publishes the real one, this reads as
        "not set up" and the answer comes from the APIC as it always did. */
     per_cpu_setup_boot();
 
@@ -349,7 +349,7 @@ extern "C" void rust_fini();
 static void __attribute__((noinline, noreturn))
 finalize_on_static_stack(Task* task, HaltAction action)
 {
-    trace(0, "FinalizeOnStaticStack");
+    trace(0, "finalize_on_static_stack");
 
     task->put();
 
@@ -366,7 +366,7 @@ finalize_on_static_stack(Task* task, HaltAction action)
 
 static void prepare_halt(HaltAction action)
 {
-    /* Hold an extra reference so CpuTable::Reset()'s Put()
+    /* Hold an extra reference so CpuTable::reset()'s put()
     only drops refcount 2→1 instead of freeing the task
     while we are still running on its stack. */
     auto task = Task::get_current_task();
@@ -388,17 +388,17 @@ static void prepare_halt(HaltAction action)
     interrupt_disable();
 
     /* Switch back to CPU 0's static stack so we can release
-       the idle task.  FinalizeOnStaticStack gets its own
-       stack frame on the static stack, calls task->Put()
+       the idle task.  finalize_on_static_stack gets its own
+       stack frame on the static stack, calls task->put()
        (refcount 1→0, frees the idle task and its dynamic
        stack), runs static destructors, and then performs the
-       halt action.  It never returns, so PrepareHalt's stale
+       halt action.  It never returns, so prepare_halt's stale
        RBP is harmless.
 
-       WARNING: SetRsp abandons the caller's stack without
+       WARNING: set_rsp abandons the caller's stack without
        unwinding.  Any C++ objects still alive on that stack
        (the idle task's stack) will NOT have their destructors
-       called.  Callers of Shutdown()/Reboot() must ensure all
+       called.  Callers of shutdown()/reboot() must ensure all
        stack-local objects with non-trivial destructors (e.g.
        SpinLock, or anything containing one) are destroyed
        before reaching this point. */
@@ -431,8 +431,8 @@ void some_task_routine(void *ctx)
         sleep(100 * consts::NANO_SECS_IN_MS);
 }
 
-/* Shutdown()/Reboot() end up in PrepareHalt which abandons this
-   stack via SetRsp without unwinding (see the WARNING there).
+/* shutdown()/reboot() end up in prepare_halt which abandons this
+   stack via set_rsp without unwinding (see the WARNING there).
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
@@ -537,7 +537,7 @@ void bp_startup(void* ctx)
            freeing a frame would otherwise cost. That means before rust_init,
            whose NIC drivers fill their receive rings as they come up. Set up
            after it, as it was, a ring started out as a thousand frames from
-           Mm::Alloc, and the first burst after boot paid a shootdown for each
+           mm::alloc, and the first burst after boot paid a shootdown for each
            in the receive softirq until the ring had turned over: on the AX41
            two seconds at 256 frames a second, the NIC dropping the rest.
            arm64 has always had this order. */
@@ -561,7 +561,7 @@ void bp_startup(void* ctx)
         idt.set_descriptor(hal::POSTED_VECTOR, IdtDescriptor::encode(posted_interrupt_stub));
 
         /* Install a benign handler for the LAPIC spurious-interrupt vector so a
-           spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */
+           spurious IRQ counts a stat instead of hitting dummy_interrupt's panic. */
         idt.set_descriptor(Lapic::SPURIOUS_VECTOR, IdtDescriptor::encode(spurious_interrupt_stub));
 
         trace(0, "IPI registred");
@@ -584,8 +584,8 @@ void bp_startup(void* ctx)
 
         /*
          * TSC calibration uses PIT channel 2 with busy-polling (~150ms).
-         * Done after InterruptEnable so PIT channel 0 interrupts flow
-         * normally, and before cpus.StartAll so the clock source is ready
+         * Done after interrupt_enable so PIT channel 0 interrupts flow
+         * normally, and before cpus.start_all so the clock source is ready
          * for per-CPU time queries.
          */
         time_init();
@@ -598,8 +598,8 @@ void bp_startup(void* ctx)
            nothing preempted and no watchdog ran to notice. Now a wedged CPU
            stops only its own tick and the others go on watching it.
 
-           Calibration needs a clock, which is why this sits after TimeInit,
-           and it must precede StartAll so an AP can arm its timer as it comes
+           Calibration needs a clock, which is why this sits after time_init,
+           and it must precede start_all so an AP can arm its timer as it comes
            up. arm64 has worked this way from the start (GenericTimer). */
         lapic_timer_ok = Lapic::calibrate_timer();
         if (lapic_timer_ok)
@@ -620,8 +620,8 @@ void bp_startup(void* ctx)
         {
             if (!cpus.start_all())
             {
-                /* Diagnostic: did the AP reach ApMain()? */
-                trace(0, "AP diag: ApStartedFlag=%lu",
+                /* Diagnostic: did the AP reach ap_main()? */
+                trace(0, "AP diag: ap_started_flag=%lu",
                       (ulong)ap_started_flag);
                 PANIC("Can't start all cpus");
                 return;
@@ -768,7 +768,7 @@ void bp_startup(void* ctx)
         kernel_vfs_unmount_all();
 
         /* The disk log last of all: its writer finishes what is queued and
-           the log switches off -- after SoftIrq::Stop() a write through a
+           the log switches off -- after SoftIrq::stop() a write through a
            virtio disk would wait for ever. */
         rust_disklog_stop();
 
@@ -805,7 +805,7 @@ static void wx_probe_heap()
     trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
-/* Never inlined, as ApMain2 is not: see there */
+/* Never inlined, as ap_main2 is not: see there */
 __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 {
     do {
@@ -849,7 +849,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     /* Before any page table is built: every mapping the kernel makes at
        runtime carries NX, and with EFER.NXE off bit 63 is a reserved bit --
        the first touch of such a page would fault instead of reading. The APs
-       do the same before they load this table (ApMain2). */
+       do the same before they load this table (ap_main2). */
     hal::enable_wx_support();
 
     auto& bpt = mm::BuiltinPageTable::get_instance();
@@ -881,7 +881,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
        so the earliest traces are always at the default level. */
     Tracer::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
 
-    //Screen::Printf("Hello!\n");
+    //Screen::printf("Hello!\n");
 
     grub::parse_multi_boot_info((grub::MultiBootInfoHeader *)bpt.phys_to_virt((ulong)mb_info));
 
@@ -889,7 +889,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 
     /* Microcode, as early as it can be: this CPU's update from the module
        GRUB loaded, while the bootstrap map still reaches it -- below 4 GiB,
-       as a module's range is -- kept for the APs (ApMain2). */
+       as a module's range is -- kept for the APs (ap_main2). */
     {
         ulong ucode_phys = 0, ucode_len = 0;
         if (grub::get_ucode_module(ucode_phys, ucode_len))
@@ -922,7 +922,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     }
 
     /* Now that the firmware map is known, grow the bootstrap map over the
-       RAM above 4GiB -- Setup() ran before the Multiboot tags were parsed
+       RAM above 4GiB -- setup() ran before the Multiboot tags were parsed
        and could not know there was any. */
     bpt.map_high_ram();
 
@@ -951,15 +951,15 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
        .text RX, .rodata RO+NX, .data/.bss RW+NX */
     {
         extern char kernel_start[], kernel_text[], kernel_rodata[], kernel_end[];
-        /* Before the first MapMmioRegion: a write-combining mapping needs
+        /* Before the first map_mmio_region: a write-combining mapping needs
            the PAT entry to exist. */
         hal::setup_memory_types();
         /* The firmware's choice, said once: the APs make the same one
-           (ApMain2). */
+           (ap_main2). */
         if (hal::setup_serializing_lfence())
             trace(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
         /* The clock the CPU's own to pick, up to its turbo, rather than
-           firmware's base: the APs do the same (ApMain2). */
+           firmware's base: the APs do the same (ap_main2). */
         hal::CpuPerformance perf;
         if (hal::setup_cpu_performance(&perf))
             trace(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
@@ -1001,7 +1001,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     /* Pick the video console now that MMIO can be mapped: under UEFI the
        only screen is the pixel framebuffer GRUB hands over, and mapping it
        needs the page table (but not yet the heap). Must happen on the BSP
-       before the APs start -- see MapMmioRegion. */
+       before the APs start -- see map_mmio_region. */
     screen::setup();
 
     screen::printf("Hello!\n");
@@ -1029,7 +1029,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         wx_probe_heap();
 
     /* Setup HPET after page allocator is ready (MMIO mapping requires it).
-       HPET may not be available on all hardware; Setup() returns false silently. */
+       HPET may not be available on all hardware; setup() returns false silently. */
     Hpet::get_instance().setup();
 
     halt_tco_watchdog();
@@ -1037,7 +1037,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     /* Before anything can ask the pool for bytes: seeding needs no heap and
        no device, only the cycle counter and whatever instruction the cpu
        has, which the probe finds first. The devices that can do better are
-       folded in by the rust_random_reseed() in BpStartup. */
+       folded in by the rust_random_reseed() in bp_startup. */
     hal::probe_hw_random();
     if (!rust_random_setup())
         trace(0, "Random: unseeded at boot, https will fail until a source turns up");
@@ -1123,7 +1123,7 @@ void report_cpu_stacks(stdlib::Printer& printer, ulong& worst_free)
     /* These carry the deepest code in the kernel -- all of Main2 and the
        bring-up path run here, before the first task stack exists -- and
        unlike a task stack they have neither a magic word nor the one-page
-       tripwire GetCurrentTask checks. */
+       tripwire get_current_task checks. */
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
         ulong free = stack_probe::untouched(&stack[i][0], CPU_STACK_SIZE);

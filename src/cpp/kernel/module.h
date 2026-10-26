@@ -34,7 +34,7 @@ struct LoadedModule;
    held only to look a module up or move it on to its next phase, never
    across an init or an exit: a load or unload that takes its time holds up
    nothing but itself, and lsmod never waits. The shell runs each insmod and
-   rmmod in a task of its own (StartLoad, StartUnload). */
+   rmmod in a task of its own (start_load, start_unload). */
 class ModuleTable final
 {
 public:
@@ -62,8 +62,8 @@ public:
        still loading or unloading is left to it. */
     void unload_all();
 
-    /* insmod and rmmod: LoadFile or Unload in a task of its own, waited for
-       for at most ShellWaitMs. What it says is printed on out if it is done
+    /* insmod and rmmod: load_file or Unload in a task of its own, waited for
+       for at most SHELL_WAIT_MS. What it says is printed on out if it is done
        by then; if not, it carries on in the background -- lsmod shows the
        module loading or unloading meanwhile -- and the kernel log says how
        it ended. insmod's args are the path, its first word, and the
@@ -79,8 +79,8 @@ public:
     /* addr as "function+0xoff [module]" into buf when it is inside a loaded
        module -- copied, since the module may go the moment this returns.
        Never waits, so a panic may call it: false if the table is busy.
-       returnAddress: addr is a return address, named by the call before it
-       (SymbolTable::DescribeReturn); the offset is still addr's. */
+       return_address: addr is a return address, named by the call before it
+       (SymbolTable::describe_return); the offset is still addr's. */
     bool describe(ulong addr, bool return_address, char* buf, ulong size);
 
     /* The loaded modules, "name base+size" each, into buf for the panic

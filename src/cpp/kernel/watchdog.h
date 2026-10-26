@@ -26,7 +26,7 @@ public:
 
     void dump(stdlib::Printer& printer);
 
-    /* Checked against MaxCpus in the .cpp; kept here so this header does not
+    /* Checked against MAX_CPUS in the .cpp; kept here so this header does not
        have to pull in cpu.h. */
     static const ulong SLICE_CPUS = 64;
 

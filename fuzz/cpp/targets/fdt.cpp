@@ -3,7 +3,7 @@
 // a fault is a boot that dies without a word, and whatever the firmware or
 // the bootloader put there -- a tree of QEMU virt's shape, and that damaged.
 // Every tree is built node by node from the input, serialized as a DTB, and
-// handed to Board::Setup as the boot hands it. A tree serialized as it was
+// handed to Board::setup as the boot hands it. A tree serialized as it was
 // built is one the model reads too: the board is held to what board.h says
 // it takes of each node -- the parent's cells, the node's own property
 // lengths, windows the linear map reaches, interrupts the kernel takes, the

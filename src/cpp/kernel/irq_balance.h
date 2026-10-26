@@ -11,14 +11,14 @@ class MsixTable;
 /*
  * Simple irqbalance: device IRQs (level-triggered IOAPIC lines and MSI-X
  * vectors) are recorded at registration time and spread round-robin
- * across running CPUs once SMP bringup completes (Balance()).
- * Devices which register after Balance() get the next CPU immediately.
+ * across running CPUs once SMP bringup completes (balance()).
+ * Devices which register after balance() get the next CPU immediately.
  * System IRQs (PIT/HPET/8042/serial) are not recorded and stay on the BSP.
  *
  * The two kinds do not share a cursor, because they cannot address the same
  * set of CPUs: an MSI-X entry carries a full 8-bit destination, while an
  * IOAPIC redirection entry in physical mode has four bits and reaches apic
- * ids 0..15 only (IoApic::CanTarget). Handing an IOAPIC line a higher id
+ * ids 0..15 only (IoApic::can_target). Handing an IOAPIC line a higher id
  * does not spread it, it aliases it -- onto another CPU, or on a hybrid part
  * onto an id no CPU has, which loses the interrupt for good.
  */

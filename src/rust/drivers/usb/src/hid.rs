@@ -13,7 +13,7 @@
 
 use kcore::trace;
 
-/// The per-subsystem trace level, as `kernel/trace.h` has it for KbdLL.
+/// The per-subsystem trace level, as `kernel/trace.h` has it for KBD_LL.
 const KBD_LL: u32 = 3;
 
 pub const REPORT_SIZE: usize = 8;

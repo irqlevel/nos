@@ -385,7 +385,7 @@ pub fn register_all() {
 /// prints goes to the console the shell is about to take.
 ///
 /// # Safety
-/// `printer` is a `Stdlib::Printer*` that outlives the call.
+/// `printer` is a `stdlib::Printer*` that outlives the call.
 #[no_mangle]
 pub unsafe extern "C" fn rust_net_dhcp_auto(printer: *mut core::ffi::c_void) {
     let mut out = unsafe { Output::from_raw(printer) };

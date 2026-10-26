@@ -51,7 +51,7 @@ bool Hpet::setup()
     ulong va = mm::PageTable::get_instance().map_mmio_region(base_phys, consts::PAGE_SIZE);
     if (va == 0)
     {
-        trace(0, "HPET: MapMmioRegion failed for phys 0x%lX", base_phys);
+        trace(0, "HPET: map_mmio_region failed for phys 0x%lX", base_phys);
         return false;
     }
 
@@ -62,9 +62,9 @@ bool Hpet::setup()
     period_fs_ = gcap >> GCAP_PERIOD_SHIFT;
     ulong num_timers = (ulong)((gcap & GCAP_NUM_TIM_MASK) >> GCAP_NUM_TIM_SHIFT) + 1;
 
-    /* GetTime assumes a full-width 64-bit main counter. A 32-bit counter
+    /* get_time assumes a full-width 64-bit main counter. A 32-bit counter
        (COUNT_SIZE_CAP == 0) wraps ~every 43s and breaks TSC calibration and
-       the GetBootTime fallback. QEMU's HPET is 64-bit; warn on anything else. */
+       the get_boot_time fallback. QEMU's HPET is 64-bit; warn on anything else. */
     if (!(gcap & GCAP_COUNT_SIZE_CAP))
         trace(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
 
@@ -78,7 +78,7 @@ bool Hpet::setup()
     /* Frequency = 1e15 / period_fs */
     freq_hz_ = (ulong)(1000000000000000ULL / period_fs_);
 
-    /* Nanoseconds per tick at DesiredHz */
+    /* Nanoseconds per tick at DESIRED_HZ */
     tick_period_ns_ = consts::NANO_SECS_IN_SEC / DESIRED_HZ;
 
     trace(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
@@ -102,7 +102,7 @@ bool Hpet::setup()
     write_reg(REG_MAIN_CNT, 0);
 
     /*
-     * Configure timer 0 for periodic mode at DesiredHz.
+     * Configure timer 0 for periodic mode at DESIRED_HZ.
      * Steps per HPET spec:
      *   1. Set INT_ENB_CNF, TYPE_CNF (periodic), VAL_SET_CNF
      *   2. Write the period (in counter ticks) to the comparator twice:
@@ -142,7 +142,7 @@ stdlib::Time Hpet::get_time()
         return stdlib::Time(0);
 
     u64 cnt = read_reg(REG_MAIN_CNT);
-    /* ns = cnt * PeriodFs / 1e6; use 128-bit intermediate to avoid overflow */
+    /* ns = cnt * period_fs_ / 1e6; use 128-bit intermediate to avoid overflow */
     u64 ns = (u64)((__uint128_t)cnt * period_fs_ / FEMTO_SECS_PER_NANO_SEC);
     return stdlib::Time(ns);
 }

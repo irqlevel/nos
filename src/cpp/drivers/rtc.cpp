@@ -93,7 +93,7 @@ bool Rtc::read_time(RtcTime& t)
     t.month  = mon1;
 
     /* Only trust the century CMOS register if the FADT advertises one;
-       on a board without a century register, RegCentury (0x32) holds
+       on a board without a century register, REG_CENTURY (0x32) holds
        unrelated data and would yield a wildly wrong year. */
     u8 century_reg = Acpi::get_instance().get_century_register();
     if (century_reg != 0 && cen1 != 0)

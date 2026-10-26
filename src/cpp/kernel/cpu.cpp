@@ -68,7 +68,7 @@ void Cpu::idle()
 
     /* The last resort from here until it wakes: an interrupt that finds
        something else to run switches to it and leaves this task in its
-       place, rather than in the turns (Task::SetIdling). Not before the
+       place, rather than in the turns (Task::set_idling). Not before the
        reap, whose frees may wait for other CPUs. */
     Task* self = Task::try_get_current_task();
     if (self != nullptr)
@@ -273,18 +273,18 @@ void Cpu::on_panic()
     }
 }
 
-/* What a parked CPU stands on (Cpu::Park): a stack of its own, static, which
+/* What a parked CPU stands on (Cpu::park): a stack of its own, static, which
    nothing frees -- so that whatever a parked CPU still runs, it touches
    nothing the halt takes down. That is its last two calls and the halt; on
    x86 also an NMI or a machine check, which end HLT with interrupts off,
    push their frames onto the stack the CPU is on, and may panic there. A
-   panic is what the size is for: one made to run on this stack (StackProbe,
+   panic is what the size is for: one made to run on this stack (stack_probe,
    on a build for the purpose) went 1800 bytes deep on arm64 and 1880 on
    x86, and 5176 on arm64 with the netconsole sending its report. */
 static const ulong PARK_STACK_SIZE = 4 * consts::PAGE_SIZE;
 static char park_stack[MAX_CPUS][PARK_STACK_SIZE] __attribute__((aligned(16)));
 
-/* Where an exiting CPU ends, for good. Once it is parked (IsParked) the CPU
+/* Where an exiting CPU ends, for good. Once it is parked (is_parked) the CPU
    that asked goes on to free the tasks, their stacks and at last the heap --
    the stack this one was interrupted on among them -- so from that moment
    this CPU must touch none of it, for as long as the machine runs.
@@ -293,7 +293,7 @@ static char park_stack[MAX_CPUS][PARK_STACK_SIZE] __attribute__((aligned(16)));
    stay put: arm64's WFI may complete at any moment -- a pending interrupt
    ends it even while masked, and under HVF every AP was out of it within
    milliseconds -- and x86's HLT ends at an NMI, whose frame goes onto the
-   stack the CPU is on. The halt was a loop around Hlt(), a call, whose frame
+   stack the CPU is on. The halt was a loop around cpu_halt(), a call, whose frame
    record went onto that stack at every wakeup: the data abort a parked AP
    printed now and then on arm64, in the middle of the boot CPU's static
    destructors. And the word that it had exited was written under this CPU's
@@ -392,12 +392,12 @@ void CpuTable::send_tlb_ipi(ulong cpu_mask, IPITask tasks[MAX_CPUS])
                 break;
             }
 
-            /* YieldToRunnable, not Schedule: the ack comes from the remote
+            /* yield_to_runnable, not Schedule: the ack comes from the remote
                CPU's IPI handler, which has no reason to interrupt this one.
                Handing this CPU to the idle task therefore halts it until its
                own next tick, and a shootdown that the other CPUs answered in
-               microseconds took a whole one -- on the path every Mm::Free
-               with a mapping to drop goes down (see WaitGroup::Wait). */
+               microseconds took a whole one -- on the path every mm::free
+               with a mapping to drop goes down (see WaitGroup::wait). */
             yield_to_runnable();
         }
     }
@@ -517,7 +517,7 @@ void Cpu::ipi(Context* ctx)
         park();
     }
 
-    /* The periodic work moved to this CPU's own timer (Cpu::TimerTick).
+    /* The periodic work moved to this CPU's own timer (Cpu::timer_tick).
        While that timer is running the IPI carries only queued work; on a
        machine where it could not be calibrated, the tick still arrives here
        as a broadcast from whichever CPU owns the HPET. */
@@ -532,13 +532,13 @@ void Cpu::ipi(Context* ctx)
 
     hal::irq_eoi(CpuTable::IPI_VECTOR);
 
-    /* Not Schedule(): a task this lands on while it can still run keeps the
+    /* Not schedule(): a task this lands on while it can still run keeps the
        CPU -- see Preempt */
     preempt();
 }
 
 /* The local timer, one-shot. It used to tick periodically and nothing else,
-   and a task asleep until a deadline -- Sleep(), Event::WaitFor() -- ran at
+   and a task asleep until a deadline -- sleep(), Event::wait_for() -- ran at
    the first tick after it: a halted guest's vCPU waits for its guest's next
    timer edge that way, and a guest's `usleep 1000` took 10 ms on the EX44.
    Now the timer fires at the earlier of the next tick and the soonest such
@@ -587,7 +587,7 @@ bool Cpu::local_timer_fired(ulong now)
 
     /* The tick, for now: a sleeper's deadline sooner than it is brought
        forward by the walk the reschedule after this makes, under the queue
-       lock it takes anyway (TaskQueue::Schedule) -- not from here, with
+       lock it takes anyway (TaskQueue::schedule) -- not from here, with
        interrupts off and whatever this CPU was doing interrupted. */
     local_timer_arm(tick_due_, now);
     timer_walk_ = true;
@@ -627,7 +627,7 @@ void Cpu::local_timer_tick()
    machine's entire sense of time depend on one CPU still answering
    interrupts. A CPU that wedges now stops only its own tick, and the others
    go on ticking and notice. One-shot, and also for a sleeper's deadline
-   (LocalTimerStart): such an interrupt only reschedules. */
+   (local_timer_start): such an interrupt only reschedules. */
 void Cpu::timer_tick(Context* ctx)
 {
     if (Panicker::get_instance().is_active())
@@ -667,7 +667,7 @@ void Cpu::timer_tick(Context* ctx)
     }
 
     /* Repairs a wakeup that went missing, and nothing else -- see
-       SoftIrq::TickKick. Before the reschedule below, so the kick has an
+       SoftIrq::tick_kick. Before the reschedule below, so the kick has an
        effect on this very tick. */
     SoftIrq::get_instance().tick_kick(index_);
 
@@ -728,7 +728,7 @@ void Cpu::drain_and_close_ipi_tasks(Context* ctx)
     local_list.init();
 
     /* Close the queue and take everything still on it under the same lock, so
-       a concurrent QueueIPITaskAsync either lands here (and is completed below)
+       a concurrent queue_ipi_task_async either lands here (and is completed below)
        or observes the closed flag and self-completes -- never both, never
        neither. */
     ulong flags = ipi_task_lock_.lock_irq_save();
@@ -758,7 +758,7 @@ extern "C" void ip_interrupt(Context* ctx)
 }
 
 /* A posted interrupt's notification that found its vCPU out of its guest
-   (Hal::PostedVector): the vCPU folds what was posted for it into its APIC
+   (hal::POSTED_VECTOR): the vCPU folds what was posted for it into its APIC
    before it next enters, so there is nothing to do but end the interrupt. */
 extern "C" void posted_interrupt(Context* ctx)
 {
@@ -848,7 +848,7 @@ ulong CpuTable::get_running_cpus()
 void CpuTable::reset()
 {
     /* An exited task's last reference is dropped by its CPU's idle loop
-       (TaskQueue::ReapExited), and once the halt has begun no CPU idles
+       (TaskQueue::reap_exited), and once the halt has begun no CPU idles
        again: the others are parked and this one is on its way out. Dropped
        here instead, or everything that exited since each CPU last idled
        leaks -- the soft IRQ tasks among them, stopped moments before the

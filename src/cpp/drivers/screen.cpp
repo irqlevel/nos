@@ -11,7 +11,7 @@ namespace kernel
 namespace screen
 {
 
-/* Which backend Setup() selected; false means VgaTerm (or nothing). */
+/* Which backend setup() selected; false means VgaTerm (or nothing). */
 static bool fb_active;
 
 bool setup()

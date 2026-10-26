@@ -21,7 +21,7 @@ void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
     trace(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
         (ulong)irq, (ulong)vector, handler.get_handler_fn());
 
-    /* `irq` is a GSI (callers pass acpi.GetGsiByIrq()). Claiming a GSI or
+    /* `irq` is a GSI (callers pass acpi.get_gsi_by_irq()). Claiming a GSI or
        vector that is already owned would silently reprogram the IOAPIC pin
        or overwrite the IDT entry, and the loser's interrupts would be
        EOI'd unhandled by the winner's stub -- refuse loudly instead. */
@@ -45,7 +45,7 @@ void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
     IoApic::get_instance().set_irq(irq, CpuTable::get_instance().get_current_cpu_id(), vector);
     Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
 
-    /* Record the claim so RegisterLevel cannot land a PCI device on the
+    /* Record the claim so register_level cannot land a PCI device on the
        same GSI/vector behind this handler's back */
     VectorEntry& ve = vectors_[vector];
     ve.gsi = irq;
@@ -115,7 +115,7 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
         return;
     }
 
-    trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p activeHigh %lu",
+    trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p active_high %lu",
         (ulong)irq, (ulong)gsi, (ulong)vector, handler.get_handler_fn(), (ulong)active_high);
 
     ulong cpu = IrqBalance::get_instance().assign_io_apic_irq(gsi);

@@ -58,7 +58,7 @@ bool setup_cpu_performance(CpuPerformance* out)
 ulong cycle_counter_hz()
 {
     /* The generic timer's rate, which firmware sets and nothing changes:
-       what ReadCycleCounter's CNTVCT_EL0 counts at. */
+       what read_cycle_counter's CNTVCT_EL0 counts at. */
     u64 freq;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     return freq;

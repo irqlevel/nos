@@ -45,7 +45,7 @@ void enable_wx_support()
 namespace
 {
 
-/* Set once SetupMemoryTypes() has programmed the PAT; every CPU writes the
+/* Set once setup_memory_types() has programmed the PAT; every CPU writes the
    same value, so the racy stores are benign. */
 bool write_combining_ready;
 
@@ -267,14 +267,14 @@ static const ulong ABI_STACK_ALIGN = 16;
 
 ulong build_task_frame(ulong stack_top, ulong entry, ulong arg)
 {
-    /* The entry function is reached by SwitchContext's `ret`, as though it
+    /* The entry function is reached by switch_context's `ret`, as though it
        had been called from a boundary -- so the address `ret` pops sits on
        one. Worked out from the top rounded down, not from where Task::Stack
-       happens to put StackTop. */
+       happens to put stack_top. */
     ulong* rsp = (ulong *)((stack_top & ~(ABI_STACK_ALIGN - 1)) - ABI_STACK_ALIGN);
-    rsp[0] = entry; /* return address SwitchContext's ret pops */
+    rsp[0] = entry; /* return address switch_context's ret pops */
     /* and the entry function's own, which it has none of: 0 ends a
-       backtrace there (StackTrace::CaptureFrom), where the stack's poison
+       backtrace there (StackTrace::capture_from), where the stack's poison
        read as one more frame of every task's */
     rsp[1] = 0;
     kernel::Context* regs = (kernel::Context*)((ulong)rsp - sizeof(*regs));
@@ -451,7 +451,7 @@ void print_cpu_state(stdlib::Printer& con)
 
 ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_limit)
 {
-    /* SwitchContext's PushAll is a Context, all of it */
+    /* switch_context's PushAll is a Context, all of it */
     if (saved_sp % sizeof(ulong) != 0 || saved_sp < stack_base || saved_sp > stack_limit ||
         stack_limit - saved_sp < sizeof(kernel::Context))
         return 0;
@@ -461,8 +461,8 @@ ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_lim
 
 void run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx)
 {
-    /* Rounded down before the call, as Arm64RunOnStack does. Task::Stack's
-       StackTop sits 8 below a boundary, and a call from there entered every
+    /* Rounded down before the call, as arm64_run_on_stack does. Task::Stack's
+       stack_top sits 8 below a boundary, and a call from there entered every
        function on the boot and idle stacks 8 off the ABI -- which nothing
        noticed, the kernel using no SSE, until a UBSan build (docs/build.md)
        found a 16-aligned local 8 off. */
@@ -472,7 +472,7 @@ void run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx)
         "callq *%0\n\t"
         :: "a"(fn), "r"(top), "D"(ctx)
         : "memory");
-    trace(0, "RunOnStack: fn returned");
+    trace(0, "run_on_stack: fn returned");
     while (1)
         cpu_halt();
 }

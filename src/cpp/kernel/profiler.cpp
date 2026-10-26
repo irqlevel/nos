@@ -34,7 +34,7 @@ bool Profiler::allocate()
     if (allocated_)
         return true;
 
-    /* Only the CPUs that are up: a buffer for every slot MaxCpus allows
+    /* Only the CPUs that are up: a buffer for every slot MAX_CPUS allows
        would be megabytes held for the life of the kernel to serve cores this
        machine does not have. */
     ulong running = CpuTable::get_instance().get_running_cpus();
@@ -53,7 +53,7 @@ bool Profiler::allocate()
     }
 
     /* Kept for the life of the kernel rather than freed on Stop. A CPU can
-       be inside Sample() having already passed the Active check when another
+       be inside sample() having already passed the Active check when another
        CPU stops the run, and freeing underneath it would be a use-after-free
        for the sake of reclaiming a megabyte. */
     allocated_ = true;
@@ -89,7 +89,7 @@ void Profiler::stop()
 
     /* Each CPU disarms its own counter on its next tick -- the control
        registers are per CPU and cannot be written from here. Until then it
-       keeps overflowing, and Sample() drops what arrives because Active is
+       keeps overflowing, and sample() drops what arrives because Active is
        already false. */
 }
 
@@ -166,7 +166,7 @@ static const char* symbol_name(const char* name)
 
 void Profiler::report(stdlib::Printer& printer, ulong pid_filter, ulong chain_limit)
 {
-    /* Whole chains, not leaves. Every sample already carries MaxDepth frames;
+    /* Whole chains, not leaves. Every sample already carries MAX_DEPTH frames;
        counting them by leaf alone threw away all but the first two. */
     struct Chain
     {

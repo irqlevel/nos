@@ -8,7 +8,7 @@ namespace kernel
 {
 
 static_assert(Board::LINEAR_MAP_REACH == 0 - mm::MemoryMap::KERNEL_SPACE_BASE,
-    "the linear map reaches from KernelSpaceBase to the top of the address space");
+    "the linear map reaches from KERNEL_SPACE_BASE to the top of the address space");
 
 namespace
 {

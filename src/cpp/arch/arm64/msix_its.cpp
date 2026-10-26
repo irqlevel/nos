@@ -12,9 +12,9 @@
 /* arm64 MsixTable: same class ABI as drivers/msix.cpp (x86), but MSI is
    routed through the GICv3 ITS instead of a LAPIC-addressed message. The
    MSI-X table setup / BAR mapping is identical; only the message
-   composition (address = GITS_TRANSLATER, data = ITS eventId) and the
+   composition (address = GITS_TRANSLATER, data = ITS event_id) and the
    interrupt install (an LPI handler, not an IDT vector) differ. This is a
-   per-arch TU of the shared class, like CpuTable::StartAll. */
+   per-arch TU of the shared class, like CpuTable::start_all. */
 
 namespace kernel
 {
@@ -125,7 +125,7 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     for (u16 i = 0; i < count_; i++)
         mask(i);
 
-    /* Map the device with the ITS up front (RID = deviceId on QEMU virt) */
+    /* Map the device with the ITS up front (RID = device_id on QEMU virt) */
     u32 device_id = ((u32)dev->bus << 8) | ((u32)dev->slot << 3) | dev->func;
     Its::get_instance().map_device(device_id, count_);
 
@@ -161,7 +161,7 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
     u32 msi_data = Its::get_instance().map_event(device_id, index, handler, msi_addr);
     if (msi_addr == 0)
     {
-        trace(0, "MsixTable(its): MapEvent failed");
+        trace(0, "MsixTable(its): map_event failed");
         return 0;
     }
 

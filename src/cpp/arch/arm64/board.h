@@ -13,8 +13,8 @@ namespace kernel
    not depend on parser completeness.
 
    What the tree says is taken only as far as the kernel can act on it: a
-   device's registers where the linear map reaches them (LinearMapReach), an
-   interrupt the kernel can take (an INTID IsTakenIntId passes), bus numbers
+   device's registers where the linear map reaches them (LINEAR_MAP_REACH), an
+   interrupt the kernel can take (an INTID is_taken_int_id passes), bus numbers
    that are bus numbers. What fails that is refused -- left as if the tree
    had not said it, the fallback's to fill -- and counted in Refused, which
    the boot traces once there is a console to say it on. */
@@ -44,7 +44,7 @@ public:
 
     static const ulong MAX_MEM_REGIONS = 8;
     static const ulong MAX_VIRTIO_MMIO = 32;
-    /* CPUs taken from the device tree. Kept at Kernel::MaxCpus so the FDT
+    /* CPUs taken from the device tree. Kept at kernel::MAX_CPUS so the FDT
        parser is not the thing that silently caps SMP. */
     static const ulong MAX_BOARD_CPUS = 64;
 
@@ -93,7 +93,7 @@ public:
     ulong refused_ = 0;
 
     /* How far above physical 0 the kernel's linear map reaches: the most a
-       physical address can be for KernelSpaceBase + it to be an address. */
+       physical address can be for KERNEL_SPACE_BASE + it to be an address. */
     static const ulong LINEAR_MAP_REACH = 1UL << 47;
 
     /* The INTIDs the kernel can take: the GIC's PPIs and the SPIs below the
@@ -111,7 +111,7 @@ private:
 
     void apply_fallbacks();
 
-    /* [base, base + size) inside LinearMapReach; counts a refusal if not */
+    /* [base, base + size) inside LINEAR_MAP_REACH; counts a refusal if not */
     bool reachable(u64 base, u64 size);
 
     /* A reg-like property's <address size> pair from cell index on, in the

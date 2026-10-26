@@ -25,8 +25,8 @@ struct Choice
 };
 
 /* The parts of an update's date, each of which printed in hex reads as the
-   decimal it is: (Date & DateYearMask), (Date >> DateMonthShift) and
-   ((Date >> DateDayShift) & DateDayMask) */
+   decimal it is: (Date & DATE_YEAR_MASK), (Date >> DATE_MONTH_SHIFT) and
+   ((Date >> DATE_DAY_SHIFT) & DATE_DAY_MASK) */
 const u32 DATE_YEAR_MASK = 0xFFFF;
 const u32 DATE_MONTH_SHIFT = 24;
 const u32 DATE_DAY_SHIFT = 16;

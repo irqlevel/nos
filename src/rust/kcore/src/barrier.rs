@@ -1,4 +1,4 @@
-//! DMA memory barriers, the Rust half of the C++ `Hal::DmaWmb`/`Hal::DmaRmb`
+//! DMA memory barriers, the Rust half of the C++ `hal::dma_wmb`/`hal::dma_rmb`
 //! contract (src/cpp/hal/barrier.h): compiler-only on x86 (TSO + coherent
 //! DMA), `dmb oshst`/`dmb oshld` on arm64. `core::sync::atomic::fence`
 //! is NOT a substitute there — it lowers to `dmb ish`, whose inner-shareable

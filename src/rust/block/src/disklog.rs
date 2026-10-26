@@ -105,7 +105,7 @@ impl Header {
 
 /* ---- sizes ---- */
 
-/// A line as the tracer makes it: `Tracer::Output` formats into 256 bytes,
+/// A line as the tracer makes it: `Tracer::output` formats into 256 bytes,
 /// and anything longer is cut to fit.
 const MSG_SIZE: usize = 256;
 
@@ -697,7 +697,7 @@ fn read_header(w: &mut Writer, dev: &Disk) -> Option<Header> {
 }
 
 /// On the way down, before the soft IRQs stop: the writer finishes what is
-/// queued and exits, and the log switches off -- after `SoftIrq::Stop` a
+/// queued and exits, and the log switches off -- after `SoftIrq::stop` a
 /// write through a virtio disk, which completes by soft IRQ, would wait for
 /// ever.
 pub fn stop() {

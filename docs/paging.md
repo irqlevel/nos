@@ -12,21 +12,21 @@ deadlocking. The code lives in `src/cpp/mm/`, with the PTE encoding in
 | Range | Contents |
 |---|---|
 | `0x0000000000000000` – `0x00007FFFFFFFFFFF` | User half. Mapped only by the x86 bootstrap table, and only until the real table takes over; on arm64 TTBR0 walks are disabled outright after boot |
-| `0xFFFF800000000000` + phys | `KernelSpaceBase`. The bootstrap linear map, and the permanent home of every MMIO mapping |
+| `0xFFFF800000000000` + phys | `KERNEL_SPACE_BASE`. The bootstrap linear map, and the permanent home of every MMIO mapping |
 | `0xFFFF800001000000` | Kernel image (x86-64; arm64 links at `…40200000`, matching the QEMU virt load address). Split into text RX / rodata RO+NX / data RW+NX late in boot |
-| just above the image | The `TmpMap` window: 512 slots, one L1 table, the only way the kernel touches an arbitrary physical page -- 448 shared under a lock, and one for each CPU for copying a frame |
-| next huge-page boundary | `PageArray`, one 32-byte descriptor per 4 KiB frame, mapped in 2 MiB pages |
-| after `PageArray` | The `VaAllocator` arena the page allocator hands out |
+| just above the image | The `tmp_map` window: 512 slots, one L1 table, the only way the kernel touches an arbitrary physical page -- 448 shared under a lock, and one for each CPU for copying a frame |
+| next huge-page boundary | `page_array_`, one 32-byte descriptor per 4 KiB frame, mapped in 2 MiB pages |
+| after `page_array_` | The `VaAllocator` arena the page allocator hands out |
 
 ## Two page tables
 
 **`BuiltinPageTable`** is the bootstrap linear map: `phys` ↔
-`phys + KernelSpaceBase`, arithmetic rather than a walk. On x86 it is the C++
+`phys + KERNEL_SPACE_BASE`, arithmetic rather than a walk. On x86 it is the C++
 copy of what `boot64.asm` built — four 1 GiB PDPT entries of 2 MiB pages,
-covering the low 4 GiB — installed in `Main2` before GRUB's tables are
+covering the low 4 GiB — installed in `main2` before GRUB's tables are
 overwritten. On arm64 the equivalent is built in `arch/arm64/builtin_pt.cpp`.
 
-`MapHighRam()` extends it once the firmware memory map is known: one 1 GiB
+`map_high_ram()` extends it once the firmware memory map is known: one 1 GiB
 block per GiB of RAM above 4 GiB, skipping blocks with no usable RAM in
 them. On x86 that needs CPUID PDPE1GB (everything since Nehalem and
 Barcelona has it; QEMU's default CPU model does not advertise it, so the
@@ -43,81 +43,81 @@ would make a whole GiB of RAM uncached.
 Why this matters: **the bootstrap map's extent is the hard ceiling on the
 RAM the kernel can use**. Building the free list threads a next-pointer
 through the free pages themselves, which means writing to every one of them
-through this map. RAM above `GetMappedLimit()` is real, reported by the
-firmware, and unusable — so `GetFreePages` prints both numbers, and
+through this map. RAM above `get_mapped_limit()` is real, reported by the
+firmware, and unusable — so `get_free_pages` prints both numbers, and
 `meminfo` shows them, rather than letting the difference be silent.
 
 **`PageTable`** is the real thing: a 4-level table built page by page, with
-`Root` loaded into CR3 (x86) or TTBR1 (arm64) partway through `Main2`. From
+`Root` loaded into CR3 (x86) or TTBR1 (arm64) partway through `main2`. From
 that point the linear map is gone and every access to an arbitrary physical
-page goes through `TmpMap`.
+page goes through `tmp_map`.
 
-## `TmpMap`: the window onto physical memory
+## `tmp_map`: the window onto physical memory
 
 512 consecutive VAs sharing one L1 table. The first 448 are shared, guarded
-by `TmpMapLock`: `TmpMapPage(phys)` finds a free slot, writes the leaf PTE,
+by `tmp_map_lock_`: `tmp_map_page(phys)` finds a free slot, writes the leaf PTE,
 invalidates the local TLB, takes a reference on the page and returns the
-VA; `TmpUnmapPage` reverses it. `TmpMapRange` takes a run of adjacent slots
+VA; `tmp_unmap_page` reverses it. `tmp_map_range` takes a run of adjacent slots
 for a structure that crosses a page boundary (ACPI tables, mostly).
 
 The last 64 are a slot for each CPU, and serve one thing: a copy into or
 out of a frame -- a page handed out by address and mapped nowhere, what a
 guest's memory is made of (`kcore::frame`) -- which is every read and write
 of a guest's memory but its devices' rings, which are mapped through
-`Mm::MapPages` while a queue is up (`kcore::frame::Mapped`). `MapFrameSlot(phys)` maps this CPU's slot and
-`UnmapFrameSlot` clears it, with interrupts off from one to the other,
+`mm::map_pages` while a queue is up (`kcore::frame::Mapped`). `map_frame_slot(phys)` maps this CPU's slot and
+`unmap_frame_slot` clears it, with interrupts off from one to the other,
 which makes the slot the copy's alone: no lock, no slot to search for, no
 reference (the frame is the caller's for the call), no memory-map lookup
 (a frame is RAM), and one TLB invalidation instead of two -- the slot was
 not present, and no TLB keeps anything of an entry that was not
-(`Hal::PteMadeValid` is x86's compiler barrier and arm64's `dsb ishst;
+(`hal::pte_made_valid` is x86's compiler barrier and arm64's `dsb ishst;
 isb`). The frame is mapped only for the length of its copy, and nowhere
 the moment it is done. Through the shared slots, their lock and their two
 flushes had cost a busy guest's vCPU as much as the copy itself.
 
 Two details that are easy to get wrong:
 
-- RAM is mapped write-back, everything else uncached — `TmpMap` serves both
-  free pages and MMIO, and `MemoryMap::IsUsableRam` is what tells them apart.
+- RAM is mapped write-back, everything else uncached — `tmp_map` serves both
+  free pages and MMIO, and `MemoryMap::is_usable_ram` is what tells them apart.
 - The slots are shared, and unmapping invalidates only the *local* TLB. So
-  `VirtToPhys` — a four-deep walk, each level mapped and unmapped in turn —
+  `virt_to_phys` — a four-deep walk, each level mapped and unmapped in turn —
   disables preemption for the whole walk: a migration mid-walk would leave a
   stale mapping on the original CPU that a later slot reuse would
   mistranslate.
 
 ## From firmware map to free list
 
-`PageTable::Setup()` runs in this order, and each step depends on the one
+`PageTable::setup()` runs in this order, and each step depends on the one
 before:
 
-1. `HighestPhyAddr` is the top of usable RAM, clamped to the bootstrap map.
-2. `PageArray` is sized (one `Page` per frame — 512 MiB on a 64 GiB box) and
+1. `highest_phy_addr_` is the top of usable RAM, clamped to the bootstrap map.
+2. `page_array_` is sized (one `Page` per frame — 512 MiB on a 64 GiB box) and
    given a physically contiguous, huge-page-aligned home by
-   `ReservePageArray`, clear of the kernel image and of every reserved
+   `reserve_page_array`, clear of the kernel image and of every reserved
    region. That home is then **added to the memory map as reserved**, which
    is the entire mechanism that keeps the free list off it.
-3. `GetFreePages()` walks the usable regions and threads a singly linked
+3. `get_free_pages()` walks the usable regions and threads a singly linked
    list through the pages themselves. It skips reserved runs boundary to
    boundary rather than testing each page (a real server has twenty-odd
    reserved regions and sixteen million pages), skips the kernel image, and
    sorts pages whose identity address is shadowed by the kernel's own VA
-   window onto a *second* list — `ExcludedPages` — because `Setup` still
+   window onto a *second* list — `excluded_pages_` — because `setup` still
    reaches its allocations through the bootstrap map.
-4. The kernel image, the `TmpMap` slots and its L1 table get real 4 KiB
-   mappings; `PageArray` gets 2 MiB ones (512 times fewer leaf entries, and
+4. The kernel image, the `tmp_map` slots and its L1 table get real 4 KiB
+   mappings; `page_array_` gets 2 MiB ones (512 times fewer leaf entries, and
    a TLB that can actually cover it).
 5. Every descriptor is initialised through the bootstrap map, with its list
    links pointed at the address the descriptor will answer to once
-   `PageArray` is live — "self-pointing means not on the free list" is the
-   test `AllocContiguousPages` uses.
+   `page_array_` is live — "self-pointing means not on the free list" is the
+   test `alloc_contiguous_pages` uses.
 
-`SetupFreePagesList()` then runs `DrainEarlyFreeList` twice: once for the
+`setup_free_pages_list()` then runs `drain_early_free_list` twice: once for the
 main list, once for the excluded one, which is safe by then because all page
-access goes through `TmpMap`. The drain holds a single `TmpMap` slot across
+access goes through `tmp_map`. The drain holds a single `tmp_map` slot across
 the whole walk instead of using the general pair — one TLB invalidation and
 one lock round trip per page instead of two of each.
 
-Nothing is zeroed on the way to the list: `AllocPageNoLock` zeroes every page
+Nothing is zeroed on the way to the list: `alloc_page_no_lock` zeroes every page
 it hands out, so a page sitting on the free list is not expected to be clean.
 Even so, building the list touches every page twice, about 0.6 µs each, so a
 64 GiB machine spends roughly ten seconds of its boot here — hence the
@@ -131,16 +131,16 @@ The refcounting is explicit and the easiest thing here to get wrong:
 
 | Call | Effect on the refcount |
 |---|---|
-| `MapPage(va, page)` | `+1` |
-| `GetPage(phys)` | `+1` — the caller must `Put()` |
-| `UnmapPage(va)` | net 0 (it does a `GetPage` and a `Put` internally), returns the `Page*` |
-| `FreePage(page)` | back onto the free list; does not touch the refcount |
+| `map_page(va, page)` | `+1` |
+| `get_page(phys)` | `+1` — the caller must `put()` |
+| `unmap_page(va)` | net 0 (it does a `get_page` and a `put` internally), returns the `Page*` |
+| `free_page(page)` | back onto the free list; does not touch the refcount |
 
-To undo a `MapPage`: `UnmapPage` + `Put`. To free a mapped page:
-`UnmapPage` + `FreePage` + `Put`.
+To undo a `map_page`: `unmap_page` + `put`. To free a mapped page:
+`unmap_page` + `free_page` + `put`.
 
-The range forms — `MapPages` (array of `Page*`), `MapContiguousPages` (a run
-of descriptors), `MapPhysPages` (physical addresses of pages that already
+The range forms — `map_pages` (array of `Page*`), `map_contiguous_pages` (a run
+of descriptors), `map_phys_pages` (physical addresses of pages that already
 exist) — share one walk down L4/L3/L2 and one temp mapping of the L1 table,
 so an n-page block costs 4 temp mappings instead of 4n. All three are
 all-or-nothing, and all of them invalidate only the local TLB: the caller
@@ -150,9 +150,9 @@ shoots down the other CPUs once for the whole range.
 
 Three layers, each built on the one below.
 
-**`PageTable::AllocPage` / `AllocContiguousPages(n ≤ 128)`** — frames off
+**`PageTable::alloc_page` / `alloc_contiguous_pages(n ≤ 128)`** — frames off
 the free list. A contiguous run is found by walking the free list and, for
-each candidate, checking that the next n-1 descriptors in `PageArray` are
+each candidate, checking that the next n-1 descriptors in `page_array_` are
 physically consecutive and still free — a self-pointing list entry is what
 marks a descriptor as allocated. The walk is deliberately unbounded (a cap
 would turn a slow allocation into a spurious OOM, and plain `new` panics on
@@ -160,17 +160,17 @@ that) but says so in the log once it has examined more than a thousand
 entries, because it runs with the page-table lock held.
 
 **`PageAllocatorImpl`** — eight `FixedPageAllocator` buckets, for 1, 2, 4 …
-128 pages. The VA arena starts where `PageArray` ends and spans 70% of the
+128 pages. The VA arena starts where `page_array_` ends and spans 70% of the
 free page count; each bucket gets an eighth of it and tracks it with a
 `VaAllocator` bitmap (`mm/va_allocator.h`), whose blocks are aligned to their
 own size. The
-`Mm::` surface on top of it (`mm/new.h`):
+`mm::` surface on top of it (`mm/new.h`):
 
 | API | Allocates frames? | Tracked VA? | Frees frames on release? |
 |---|---|---|---|
-| `Mm::Alloc` / `Mm::Free` | yes | yes (via the pools) | yes |
-| `Mm::AllocMapPages` / `UnmapFreePages` | yes, contiguous, returns the physical address too | yes | yes |
-| `Mm::MapPages` / `UnmapPages` | no — the caller supplies the physical addresses | yes | no |
+| `mm::alloc` / `mm::free` | yes | yes (via the pools) | yes |
+| `mm::alloc_map_pages` / `unmap_free_pages` | yes, contiguous, returns the physical address too | yes | yes |
+| `mm::map_pages` / `unmap_pages` | no — the caller supplies the physical addresses | yes | no |
 
 **`AllocatorImpl` + `Pool`** — power-of-two size classes for small
 allocations, one `Pool` per class, each carving 4 KiB pages into blocks with
@@ -190,29 +190,29 @@ costs what the first one did (`heapbench`, below, measures each):
 - **A cache per CPU in front of the pools.** A few free blocks of each size,
   under a lock only that CPU takes, traded with the pool half a cache at a
   time — so allocations of one size on several CPUs do not all queue on the
-  pool's lock. Used once the CPU can say which it is (`Hal::IrqChipReady`).
+  pool's lock. Used once the CPU can say which it is (`hal::irq_chip_ready`).
 - **An empty page per pool.** The largest class's block has a page to
   itself, so without it every allocation and free of 1 to 2 KiB was a page
   mapped and unmapped.
 - **Freed blocks of the page allocator, still mapped** — a bounded list per
   size, a thousandth of RAM at most and never more than 512 KiB a size. A
   block that comes back costs no map and, on x86, no TLB shootdown of every
-  other CPU. `Mm::Alloc` zeroes a kept block, as fresh pages always are;
-  `Mm::AllocUninit`, what Rust's global allocator calls, does not —
+  other CPU. `mm::alloc` zeroes a kept block, as fresh pages always are;
+  `mm::alloc_uninit`, what Rust's global allocator calls, does not —
   `GlobalAlloc::alloc` promises no contents, and `alloc_zeroed` zeroes on the
-  Rust side. DMA buffers (`UnmapFreePages`) are never kept.
+  Rust side. DMA buffers (`unmap_free_pages`) are never kept.
 
-`AllocatorImpl::Trim` gives all of it back; an allocation that finds no page
+`AllocatorImpl::trim` gives all of it back; an allocation that finds no page
 or no VA trims the page allocator's lists and tries once more before refusing.
 
-`operator new` sits on top of `Mm::Alloc`, and its contract is unusual:
+`operator new` sits on top of `mm::alloc`, and its contract is unusual:
 **plain `new T(...)` panics on OOM and never returns nullptr**. The
 replaceable plain form is implicitly potentially-throwing, so the compiler
 runs the constructor on the result unchecked and may delete a caller's null
 test — a null check after plain `new` is dead code. An allocation that wants
-to observe OOM must use `new (Mm::NoThrow) T(...)` or
-`Mm::TAlloc<T, Tag>()`, both of which are checked; from `Stdlib::` code the
-tag is spelled in full, `new (Kernel::Mm::NoThrow) T[...]`, as in
+to observe OOM must use `new (mm::NO_THROW) T(...)` or
+`mm::talloc<T, Tag>()`, both of which are checked; from `stdlib::` code the
+tag is spelled in full, `new (kernel::mm::NO_THROW) T[...]`, as in
 `lib/vector.h`. The reasoning is in `mm/new.h`. There is no way to make the
 plain form nullable instead: a `noexcept` redeclaration of it does not
 compile, and the toolchain's clang parses `-fcheck-new` without implementing
@@ -220,13 +220,13 @@ it.
 
 ## MMIO, cacheability and W^X
 
-`MapMmioRegion(phys, size, policy)` builds 4 KiB leaf entries at
-`phys + KernelSpaceBase`, allocating table pages as it goes. Two policies:
+`map_mmio_region(phys, size, policy)` builds 4 KiB leaf entries at
+`phys + KERNEL_SPACE_BASE`, allocating table pages as it goes. Two policies:
 `MmioUncached` for device registers (every load and store reaches the
 device, in program order) and `MmioWriteCombining` for memory-like device
 RAM with no read side effects — a framebuffer — where stores may be
 buffered, merged and reordered, which is what makes drawing affordable. The
-write-combining writer must call `Hal::WcFlush()` when the pixels have to be
+write-combining writer must call `hal::wc_flush()` when the pixels have to be
 visible, and must never use it for registers; on a CPU without PAT the
 policy silently degrades to uncached.
 
@@ -235,26 +235,26 @@ and on real hardware a speculative fetch from device memory can trigger read
 side effects.
 
 These mappings live outside the `VaAllocator`, are permanent, and invalidate
-only the local TLB — so **`MapMmioRegion` callers must run on the BSP before
+only the local TLB — so **`map_mmio_region` callers must run on the BSP before
 the APs start**. On arm64 a request that falls inside the boot device GiB is
-answered from the premapped window instead (`Hal::MmioPremappedVa`).
+answered from the premapped window instead (`hal::mmio_premapped_va`).
 
-Never map DMA or device memory at `phys + KernelSpaceBase` by hand: go
-through `Mm::MapPages` / `Mm::AllocMapPages` so the VA is tracked.
+Never map DMA or device memory at `phys + KERNEL_SPACE_BASE` by hand: go
+through `mm::map_pages` / `mm::alloc_map_pages` so the VA is tracked.
 
 **W^X** has two halves. Every mapping the kernel makes at runtime is
-non-executable from birth: `MapRangeLocked` sets NX on each leaf it writes,
-so the heap, task stacks, DMA buffers, the temp-map window and `PageArray`
-are RW+NX, and so is MMIO (`MapMmioRegion`). Nothing walks that back except
+non-executable from birth: `map_range_locked` sets NX on each leaf it writes,
+so the heap, task stacks, DMA buffers, the temp-map window and `page_array_`
+are RW+NX, and so is MMIO (`map_mmio_region`). Nothing walks that back except
 the module loader, which asks for each segment's permissions by name once
-the segment is written (`SetRangeProtection`), so a module's text is RX and
+the segment is written (`set_range_protection`), so a module's text is RX and
 nothing is ever writable and executable at once. The tables above the leaves
 stay permissive: on both architectures an NX bit on an L4/L3/L2 entry takes
 execute permission away from the whole subtree and no leaf can give it back.
 
 The other half is the kernel image, which is the one executable mapping the
 page table is built with — the kernel runs out of it from the root switch
-onwards. Late in boot `ProtectRange` walks its 4 KiB leaves and splits it
+onwards. Late in boot `protect_range` walks its 4 KiB leaves and splits it
 into text RX, rodata RO+NX, data RW+NX on both architectures.
 
 So self-modifying code, executing from a heap buffer, or writing through a
@@ -265,20 +265,20 @@ page the allocator just handed out, to prove both halves are on;
 
 On x86-64 the NX bit means nothing until `EFER.NXE` is set, and bit 63 is a
 *reserved* bit until it is — a PTE carrying it faults on the first touch. So
-`Hal::EnableWxSupport()` runs before any page table is built on the BSP, and
-on each AP before it loads the kernel's (`ApMain2`). arm64 needs no enable:
+`hal::enable_wx_support()` runs before any page table is built on the BSP, and
+on each AP before it loads the kernel's (`ap_main2`). arm64 needs no enable:
 PXN/UXN are always honored.
 
 ## TLB shootdown, and the deadlock it can cause
 
 Every mapping change invalidates only the issuing CPU's TLB.
-`CpuTable::InvalidateTlbAll/Address/Range` fan the invalidation out to the
+`CpuTable::invalidate_tlb_all/Address/Range` fan the invalidation out to the
 others as an IPI task and wait for every one to acknowledge — except on
-arm64, where `TLBI` broadcasts in hardware and `Hal::TlbShootdownNeedsIpi()`
+arm64, where `TLBI` broadcasts in hardware and `hal::tlb_shootdown_needs_ipi()`
 answers false.
 
 This is the origin of the single most important rule in the codebase:
-**never allocate or free with a spinlock held.** `Mm::Free`/`Mm::Alloc` can
+**never allocate or free with a spinlock held.** `mm::free`/`mm::alloc` can
 reach the page allocator, which shoots down every other CPU and waits for
 all of them to answer. A CPU spinning on the lock you hold has interrupts
 off and can never answer, so the two wait for each other forever and the
@@ -287,7 +287,7 @@ releasing into a local list under the lock, unlock, then release. Better
 still, do not allocate on a datapath at all — network frames come from a
 pool built once at boot for exactly this reason.
 
-`SendTlbIPI` gives up after ten seconds and panics naming the CPUs that never
+`send_tlb_ipi` gives up after ten seconds and panics naming the CPUs that never
 answered, so a new instance of this bug is a report rather than a dead
 machine.
 
@@ -303,8 +303,8 @@ machine.
   hypervisor](hypervisor.md#how-much-of-it-and-where)).
 - `heapbench` (a module, `insmod /heapbench.ko`; [Modules](modules.md)) —
   what an allocation and a free cost, size by size, on one CPU and on all.
-- `memcheck` — `CheckFreeList` walks every descriptor and reports any page
+- `memcheck` — `check_free_list` walks every descriptor and reports any page
   that is on the free list but must not be: inside a reserved region, inside
   the kernel image, or outside usable RAM. That invariant is what the whole
   carve-out scheme rests on, and its violation is silent until something
-  overwrites `PageArray` or an ACPI table.
+  overwrites `page_array_` or an ACPI table.

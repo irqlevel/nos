@@ -4,7 +4,7 @@ extern ap_main
 global Start32
 global ap_start16
 
-; Must equal Kernel::MaxCpus (kernel/cpu.h). Each CPU gets one CPU_STACK_SIZE
+; Must equal kernel::MAX_CPUS (kernel/cpu.h). Each CPU gets one CPU_STACK_SIZE
 ; page of .trampolinedata to run on between the SIPI and the switch to its
 ; real stack in kernel/main.cpp, so this directly sizes a low-memory
 ; reservation: 64 CPUs put the end of .trampolinedata at 0x55000. The linker

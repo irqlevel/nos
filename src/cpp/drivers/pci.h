@@ -44,8 +44,8 @@ public:
     void write_word(u16 bus, u16 slot, u16 func, u16 offset, u16 value);
 
     /* Walk PCI capability list. Returns config-space offset of capability
-       with matching capId, or 0 if not found. Pass previous cap's next
-       pointer as startOffset to find subsequent caps of the same type. */
+       with matching cap_id, or 0 if not found. Pass previous cap's next
+       pointer as start_offset to find subsequent caps of the same type. */
     u8 find_capability(u16 bus, u16 slot, u16 func, u8 cap_id, u8 start_offset = 0);
 
     u32 get_bar(u16 bus, u16 slot, u16 func, u8 bar);

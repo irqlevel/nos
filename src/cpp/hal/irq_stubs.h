@@ -3,7 +3,7 @@
 // Portable interrupt entry-point contract. Every arch defines these symbols
 // (x86_64: macro-generated stubs in arch/x86_64/asm.asm that push a Context
 // frame and call the C++ handler; arm64 later: C veneers dispatched from the
-// GIC IRQ path). Drivers hand them to Interrupt::Register via GetHandlerFn.
+// GIC IRQ path). Drivers hand them to Interrupt::register_handler via get_handler_fn.
 // The CPU-exception stubs (Exc*Stub) are arch-private and not part of this
 // contract.
 

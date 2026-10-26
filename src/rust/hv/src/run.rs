@@ -105,7 +105,7 @@ const NIC_IRQ: u8 = 10;
 /// the page read of an absent device finds.
 const MSIX_PAGES: u32 = 0xFE00_0000;
 /// The most RAM a guest has: the most this kernel can take of a machine,
-/// one PDPT of 1 GiB blocks (`BuiltinPageTable::MapHighRam`) -- no guest is
+/// one PDPT of 1 GiB blocks (`BuiltinPageTable::map_high_ram`) -- no guest is
 /// bigger than its host. Laid out as `linux::Ram` says: up to the devices'
 /// pages from 0, the rest from 4 GiB, and all of it below what the guest is
 /// told a physical address is (`policy::phys_bits`).
@@ -166,7 +166,7 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// The longest a halted vCPU's task sleeps before it looks again, when no
 /// timer edge is due sooner: a guest whose PIT is stopped, or in a one-shot
 /// mode this does not raise IRQ0 in, still has its time budget checked. One
-/// host tick -- `task::sleep` wakes at one anyway (`Kernel::Sleep` blocks
+/// host tick -- `task::sleep` wakes at one anyway (`kernel::sleep` blocks
 /// until the deadline, and is woken at its CPU's next scheduling point, the
 /// tick at the latest).
 const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;

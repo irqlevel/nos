@@ -106,11 +106,11 @@ struct Rela
     long addend;
 };
 
-static_assert(sizeof(Ehdr) == 64, "Elf::Ehdr layout");
-static_assert(sizeof(Phdr) == 56, "Elf::Phdr layout");
-static_assert(sizeof(Shdr) == 64, "Elf::Shdr layout");
-static_assert(sizeof(Sym) == 24, "Elf::Sym layout");
-static_assert(sizeof(Rela) == 24, "Elf::Rela layout");
+static_assert(sizeof(Ehdr) == 64, "elf::Ehdr layout");
+static_assert(sizeof(Phdr) == 56, "elf::Phdr layout");
+static_assert(sizeof(Shdr) == 64, "elf::Shdr layout");
+static_assert(sizeof(Sym) == 24, "elf::Sym layout");
+static_assert(sizeof(Rela) == 24, "elf::Rela layout");
 
 inline u32 rela_sym(u64 info)
 {

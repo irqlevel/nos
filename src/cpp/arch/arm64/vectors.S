@@ -1,7 +1,7 @@
 /*
  * EL1 exception vector table. Each 128-byte slot only branches to a
  * shared body (SAVE_CONTEXT alone is bigger than a slot); the bodies
- * build a full Kernel::Context (arch/arm64/context.h: x0-x30, sp, elr,
+ * build a full kernel::Context (arch/arm64/context.h: x0-x30, sp, elr,
  * spsr, esr, far = 36 slots) on the interrupted stack and call the C++
  * handler with it in x0.
  *

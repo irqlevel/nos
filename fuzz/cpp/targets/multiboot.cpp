@@ -238,7 +238,7 @@ struct Expected
     u32 ucode_start = 0, ucode_end = 0;
 };
 
-/* AddRegion, as memory_map.h says it keeps a region */
+/* add_region, as memory_map.h says it keeps a region */
 void add(Expected& e, u64 addr, u64 len, u64 type)
 {
     const u64 top = MemoryMap::MAX_PHYS_ADDR;
@@ -402,7 +402,7 @@ void run(fuzz::Input& in)
             memcpy(&entry_size, t.body.data(), 4);
             if (entry_size < 24)
                 break;
-            /* The entries that fit whole, entrySize apart */
+            /* The entries that fit whole, entry_size apart */
             std::vector<MmapEntry> fit;
             for (size_t k = 0; 8 + 8 + (k + 1) * entry_size <= 8 + t.body.size() && k < entries.size(); k++)
                 fit.push_back(entries[k]);

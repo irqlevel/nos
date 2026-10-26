@@ -44,12 +44,12 @@ public:
        points at a dedicated per-CPU stack used by the double-fault gate, so
        #DF is delivered on a known-good stack even when RSP is corrupt --
        without it the CPU pushes the #DF frame onto the bad stack and
-       triple-faults, losing all panic diagnostics. Requires Save() to have
+       triple-faults, losing all panic diagnostics. Requires save() to have
        run on this CPU. Safe to call again after a GDT reload: the
        descriptor is rewritten first, which clears the busy bit ltr sets. */
     void setup_tss_self(ulong cpu_index);
 
-    /* Must equal MaxCpus (static_assert in gdt.cpp); gdt.h cannot include
+    /* Must equal MAX_CPUS (static_assert in gdt.cpp); gdt.h cannot include
        cpu.h without an include cycle. */
     static const ulong TSS_MAX_CPUS = 64;
 
@@ -64,7 +64,7 @@ private:
 
     static const ulong TSS_ENTRY_BASE = 2; /* null, code, then TSS pairs */
     /* What a double fault's report runs on, all of it: one, the netconsole
-       sending it, went 5688 bytes deep here (StackProbe, on a build for the
+       sending it, went 5688 bytes deep here (stack_probe, on a build for the
        purpose) -- past the page this was, into the next CPU's. */
     static const ulong DF_STACK_SIZE = 4 * consts::PAGE_SIZE;
 

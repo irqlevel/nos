@@ -72,7 +72,7 @@ public:
        TAlloc, and a format handed on through a template reaches the
        constructor as a variable no compiler can check against its
        arguments -- "idle%u" was given a ulong that way, which nothing
-       saw. A name to be formatted is made with SnPrintf first, where the
+       saw. A name to be formatted is made with sn_printf first, where the
        check is. */
     explicit Task(const char* name);
 
@@ -88,9 +88,9 @@ public:
     bool start(Func func, void* ctx);
 
     /* Waits for the task to exit, and says so when that takes long: once
-       reportNs have passed -- who waits, for which task, for how long, and
+       report_ns have passed -- who waits, for which task, for how long, and
        where that task is (Locate) -- and again each time the wait has
-       doubled, or JoinReportMaxNs on, whichever is sooner. It never gives
+       doubled, or JOIN_REPORT_MAX_NS on, whichever is sooner. It never gives
        up: a task that has not exited is still using whatever its waiter is
        about to free. A join that never ends is a stop, an unload or a
        shutdown that never ends, and one that says nothing is the worst
@@ -120,8 +120,8 @@ public:
             /* On Cpu, where the interrupt that asked it landed: at Pc,
                Frames from there. The asker's own task too, Pc 0. */
             Running,
-            /* Not off its CPU, and SilentCpus took no interrupt in
-               AnswerNs to say whether it is on theirs: interrupts off
+            /* Not off its CPU, and silent_cpus took no interrupt in
+               answer_ns to say whether it is on theirs: interrupts off
                there, which is where such a task usually is. */
             Silent,
         };
@@ -129,7 +129,7 @@ public:
         Kind what;
         bool blocked;
         bool asleep;
-        /* Woken (RunWaking), and not yet put back on its queue's run list:
+        /* Woken (RUN_WAKING), and not yet put back on its queue's run list:
            a moment's state, and a task found in it for long is a wakeup
            its CPU has not taken */
         bool waking;
@@ -149,7 +149,7 @@ public:
        for a task on a CPU which one and where it was. A task off its CPU is
        read off its stack, and held to not having run while it was read; one
        on a CPU is asked, by an IPI to every other CPU, whose answers are
-       waited for up to LocateAnswerNs -- a CPU with interrupts off takes no
+       waited for up to LOCATE_ANSWER_NS -- a CPU with interrupts off takes no
        IPI, and is named instead. From task context, since it waits; one at
        a time across the machine. */
     void locate(Where& where, ulong answer_ns = LOCATE_ANSWER_NS);
@@ -179,12 +179,12 @@ public:
        allows, or nullptr to say it is already on the right one. */
     void set_idle();
     /* Back to an ordinary task: scheduled in its turn, not only when
-       nothing else on its queue can run (see TaskQueue::ReleaseIdle) */
+       nothing else on its queue can run (see TaskQueue::release_idle) */
     void clear_idle();
     bool is_idle();
 
     /* The idle task is the last resort only while it idles -- inside
-       Cpu::Idle, about to halt or halted. Running anything else -- the
+       Cpu::idle, about to halt or halted. Running anything else -- the
        boot, its self-tests, the shutdown -- it is a task like any other and
        takes its turn: it used to be the last resort whatever it ran, and a
        task the boot started on the boot CPU that never blocked kept the
@@ -194,24 +194,24 @@ public:
     bool is_idling();
 
     /* A task that has asked not to be scheduled until someone wakes it.
-       Block() is called by the task itself, immediately before the Schedule()
-       that switches it out; Unblock() may be called from any CPU and from
-       hard IRQ context. Both are locked operations on one word, RunState,
-       and take no lock: an Unblock() that finds the task already off its
+       Block() is called by the task itself, immediately before the schedule()
+       that switches it out; unblock() may be called from any CPU and from
+       hard IRQ context. Both are locked operations on one word, run_state_,
+       and take no lock: an unblock() that finds the task already off its
        CPU puts it back on its queue's run list by way of that queue's wake
-       stack (TaskQueue::PushWake), which takes none either. */
+       stack (TaskQueue::push_wake), which takes none either. */
     void block();
     void unblock();
     bool is_blocked();
 
-    /* Where a task is with its queue -- RunState's values. Queued: it can
+    /* Where a task is with its queue -- run_state_'s values. Queued: it can
        run, and is on its queue's run list or on the CPU. Blocking: it has
-       called Block() and is still on its CPU -- its Schedule() has not taken
-       it off. Sleeping: that Schedule() has, and it is on no list but the
-       sleep list, if it is asleep until a deadline. Waking: an Unblock()
-       found it Sleeping and is handing it back (TaskQueue::PushWake). Each
-       move is a compare-and-swap, so of an Unblock() and the Schedule() that
-       takes the task off, or of a deadline and an Unblock(), exactly one
+       called Block() and is still on its CPU -- its schedule() has not taken
+       it off. Sleeping: that schedule() has, and it is on no list but the
+       sleep list, if it is asleep until a deadline. Waking: an unblock()
+       found it Sleeping and is handing it back (TaskQueue::push_wake). Each
+       move is a compare-and-swap, so of an unblock() and the schedule() that
+       takes the task off, or of a deadline and an unblock(), exactly one
        wins: Blocking -> Queued is the waker's, Blocking -> Sleeping its
        CPU's, Sleeping -> Waking a waker's, Sleeping -> Queued the deadline's,
        Waking -> Queued its CPU's, as it puts it on the run list. */
@@ -232,11 +232,11 @@ public:
        resort it is, rather than as one more task to take a turn. */
     static const long FLAG_IDLE_BIT = 2;
 
-    /* The idle task inside Cpu::Idle (SetIdling) */
+    /* The idle task inside Cpu::idle (set_idling) */
     static const long FLAG_IDLING_BIT = 4;
 
     /* Shown in ps's flags while the task is blocked, as it always was; what
-       says so is RunState */
+       says so is run_state_ */
     static const long FLAG_BLOCKED_BIT = 3;
 
 public:
@@ -248,43 +248,43 @@ public:
        runtime, deadline and lag -- and its place on the queue's run list
        (Sched.Entry) while it can run and is off the CPU; and its place on
        the sleep list while asleep until a deadline. All under the queue's
-       lock; set from elsewhere through SetTaskNice and SetTaskSlice. */
+       lock; set from elsewhere through set_task_nice and set_task_slice. */
     SchedEntity sched_;
     stdlib::ListEntry sleep_entry_;
 
-    /* RunQueued, RunBlocking, RunSleeping or RunWaking (above) */
+    /* RUN_QUEUED, RUN_BLOCKING, RUN_SLEEPING or RUN_WAKING (above) */
     Atomic run_state_;
 
-    /* The next on the wake stack it is on (TaskQueue::PushWake): the
+    /* The next on the wake stack it is on (TaskQueue::push_wake): the
        waker's to write before the push publishes it, its queue's CPU's to
        read once it has taken the stack */
     Task* wake_next_;
 
     /* When it went on the run list, and whether a wait that long has been
-       reported (TaskQueue::CheckStalls): under the queue's lock */
+       reported (TaskQueue::check_stalls): under the queue's lock */
     ulong queued_at_;
     bool stall_reported_;
 
     TaskQueue* task_queue_;
     SpinLock lock_;
     Atomic preempt_disable_counter_;
-    /* A reschedule that came while PreemptDisableCounter was up: the tick's,
+    /* A reschedule that came while preempt_disable_counter_ was up: the tick's,
        or the one an IPI asks for on behalf of a task just woken. The task
        keeps the CPU, as it must, and the reschedule is made the moment the
-       count is back to zero (PreemptEnable), where it used to be dropped. */
+       count is back to zero (preempt_enable), where it used to be dropped. */
     Atomic preempt_pending_;
     Atomic context_switches_;
     ulong rsp_;
 
     Atomic state_;
     Atomic flags_;
-    /* The boot time, in nanoseconds, at which a task blocked in Sleep() is
+    /* The boot time, in nanoseconds, at which a task blocked in sleep() is
        to run again: the scheduler's walk on its CPU notices that the time
        has come (TaskQueue::SelectNext) -- the tick's walk at the latest --
        and runs it, and the task unblocks itself. 0 while it is not asleep. */
     Atomic sleep_until_;
 
-    /* When an Unblock() last took the flag down: the start of the wait for
+    /* When an unblock() last took the flag down: the start of the wait for
        the CPU that SchedStats measures at the switch in. Written by the
        waker, from any CPU and any context. */
     Atomic wake_time_;
@@ -317,7 +317,7 @@ private:
 
     bool prepare_start(Func func, void* ctx);
 
-    /* Wait's report, after waitedNs */
+    /* Wait's report, after waited_ns */
     void report_join(ulong waited_ns);
 
     /* Locate, under its lock; and its case of a task off its CPU, false if
@@ -355,7 +355,7 @@ public:
 
     void ps(stdlib::Printer& printer);
 
-    /* High-water marks of every task stack, worst free tracked in worstFree. */
+    /* High-water marks of every task stack, worst free tracked in worst_free. */
     void stacks(stdlib::Printer& printer, ulong& worst_free);
 
     /* One task's accumulated CPU time, copied out under the bucket lock so

@@ -15,7 +15,7 @@ pub fn panic_handler(info: &core::panic::PanicInfo) -> ! {
 /// The heap handed back null to an allocation that cannot fail -- a
 /// `Box::new`, a `format!`, a `push` past capacity. The request's size and
 /// alignment are what tell its refusals apart: a request past the heap's
-/// largest block (`PageTable::MaxContiguousPages` pages) is refused however
+/// largest block (`PageTable::MAX_CONTIGUOUS_PAGES` pages) is refused however
 /// much memory is free, one whose size class has used up its share of the
 /// address space is refused with memory to spare, and neither reads like a
 /// machine that has really run out. Formatted on the stack, as the panic

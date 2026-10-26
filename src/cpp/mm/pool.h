@@ -29,10 +29,10 @@ public:
 
     /* For the per-CPU caches in front of the pools (AllocatorImpl): up to
        count free blocks off their pages, and free blocks back onto them,
-       each under one hold of Lock. TakeFree takes no new page -- none free
-       is 0 -- and PutFree gives back any page that empties past the one the
+       each under one hold of Lock. take_free takes no new page -- none free
+       is 0 -- and put_free gives back any page that empties past the one the
        pool keeps, after letting go of Lock. A block between the two is
-       nobody's and still carries FreedTag. */
+       nobody's and still carries FREED_TAG. */
     size_t take_free(void** blocks, size_t count);
     void put_free(void* const* blocks, size_t count);
     static constexpr size_t PUT_FREE_MAX = 16;
@@ -58,8 +58,8 @@ private:
 
     static_assert(sizeof(Page) == consts::PAGE_SIZE, "invalid size");
 
-    /* Link threads a free block on its page's BlockList and is unused while
-       the block is out. Tag is FreedTag from the page's making until an
+    /* Link threads a free block on its page's block_list and is unused while
+       the block is out. Tag is FREED_TAG from the page's making until an
        owner has the block, and the owner's tag until it is freed: what the
        report of blocks nobody freed reads, page by page. */
     struct Block {
@@ -70,7 +70,7 @@ private:
     /* Tag stamped on freed blocks to detect double-free */
     static const ulong FREED_TAG = 0xF7EEF7EEF7EEF7EEUL;
 
-    /* How many pages with every block free the pool keeps on FreePageList
+    /* How many pages with every block free the pool keeps on free_page_list_
        rather than give back. One is what stops an allocation and its free
        from costing a page each when they are all the pool has -- every one
        of the largest size's, whose page holds a single block. */
@@ -83,8 +83,8 @@ private:
     /* The index-th block of a page */
     Block* block_at(Page* page, ulong index);
 
-    /* A block off the first page on FreePageList, which is not empty, its
-       tag still FreedTag. Lock must be held. */
+    /* A block off the first page on free_page_list_, which is not empty, its
+       tag still FREED_TAG. Lock must be held. */
     Block* take_locked();
 
     /* A free block back onto its page. Returns the page if that left it one
@@ -101,7 +101,7 @@ private:
        hold */
     ulong block_count_;
     ulong peek_block_count_;
-    /* Pages on FreePageList with every block free */
+    /* Pages on free_page_list_ with every block free */
     ulong empty_pages_;
 };
 

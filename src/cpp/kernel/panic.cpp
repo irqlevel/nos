@@ -94,7 +94,7 @@ void Panicker::dump_context()
         print_output(buf);
     }
 
-    /* Task — use TryGetCurrentTask to avoid BugOn/recursive panic */
+    /* Task — use try_get_current_task to avoid BUG_ON/recursive panic */
     Task* task = Task::try_get_current_task();
     if (task != nullptr)
     {
@@ -180,7 +180,7 @@ void Panicker::recover_fault()
 
 void Panicker::collect_remote_stacks()
 {
-    static_assert(REMOTE_CPU_COUNT == MAX_CPUS, "RemoteCpuCount is out of step");
+    static_assert(REMOTE_CPU_COUNT == MAX_CPUS, "REMOTE_CPU_COUNT is out of step");
 
     if (!hal::irq_chip_ready() || !hal::nmi_ipi_supported())
         return;
@@ -201,7 +201,7 @@ void Panicker::collect_remote_stacks()
         if (!(mask & (1UL << i)) || i == self)
             continue;
 
-        /* Stopped for good in the halt path (Cpu::Park): it has nothing to
+        /* Stopped for good in the halt path (Cpu::park): it has nothing to
            tell -- what it runs is the halt, on a stack of its own -- and the
            report says so in a line. */
         if (table.get_cpu(i).is_parked())
@@ -265,7 +265,7 @@ void Panicker::do_panic(const char *fmt, ...)
     interrupt_disable();
     if (active_.cmpxchg(1, 0) == 0)
     {
-        /* Before the first PrintOutput: the report is appended behind whatever
+        /* Before the first print_output: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
            needs to know how much of it to skip. */
         rust_netconsole_panic_mark();
@@ -314,7 +314,7 @@ void Panicker::do_panic_ctx(Context* ctx, bool has_error_code, const char *fmt, 
     interrupt_disable();
     if (active_.cmpxchg(1, 0) == 0)
     {
-        /* Before the first PrintOutput: the report is appended behind whatever
+        /* Before the first print_output: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
            needs to know how much of it to skip. */
         rust_netconsole_panic_mark();
@@ -333,7 +333,7 @@ void Panicker::do_panic_ctx(Context* ctx, bool has_error_code, const char *fmt, 
            is about the stack it came from. Which is the likeliest thing
            there to be broken -- a double fault is a fault the CPU could not
            push onto that stack -- so the walk reads it as memory that may
-           not be there: a fault in it comes back here (RecoverFault), and
+           not be there: a fault in it comes back here (recover_fault), and
            the report goes on without it. It used to fault itself, a panic
            inside the panic, and stop: no other CPU's stack, no netconsole,
            no reset. */

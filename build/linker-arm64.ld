@@ -2,7 +2,7 @@ ENTRY(Start64)
 
 /* QEMU virt: RAM at 0x40000000. The Linux Image header requests
    text_offset 0x200000, so the kernel is loaded at phys 0x40200000.
-   Virtual layout keeps the linear-map invariant VA = phys + KernelSpaceBase
+   Virtual layout keeps the linear-map invariant VA = phys + KERNEL_SPACE_BASE
    (0xFFFF800000000000), mirroring the x86 script. */
 
 SECTIONS
