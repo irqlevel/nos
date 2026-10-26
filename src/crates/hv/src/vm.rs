@@ -36,6 +36,9 @@ pub enum Refusal {
     /// control the host needs to keep a guest off what is the host's:
     /// `missing`, of the `field` controls.
     Controls { cpu: u32, field: &'static str, missing: u32 },
+    /// This CPU does not switch every component of the x87, SSE and AVX
+    /// state the guest's XCR0 names: `xcr0`, taken on a CPU that does.
+    Xstate { cpu: u32, xcr0: u64 },
 }
 
 /// One guest's CPU, of whichever kind the machine runs. Every method the run
@@ -119,6 +122,25 @@ impl Backend {
     }
     pub fn skip_wbinvd(&mut self) {
         match self { Backend::Svm(v) => v.skip_wbinvd(), Backend::Vmx(v) => v.skip_wbinvd() }
+    }
+    pub fn skip_xsetbv(&mut self) {
+        match self { Backend::Svm(v) => v.skip_xsetbv(), Backend::Vmx(v) => v.skip_xsetbv() }
+    }
+    /// The guest's XCR0, which its entries make the CPU's: the x87 alone
+    /// out of reset, and what its XSETBVs made it since.
+    pub fn xcr0(&self) -> u64 {
+        match self { Backend::Svm(v) => v.xcr0(), Backend::Vmx(v) => v.xcr0() }
+    }
+    /// Make `value` the guest's XCR0, for an XSETBV of it `crate::cr`
+    /// performed: false, and nothing changed, for a value a CPU offering
+    /// what `hvarch::x86::fp::offered` names refuses.
+    pub fn set_xcr0(&mut self, value: u64) -> bool {
+        match self { Backend::Svm(v) => v.set_xcr0(value), Backend::Vmx(v) => v.set_xcr0(value) }
+    }
+    /// How many entries put the guest's x87, SSE and AVX registers back into
+    /// a CPU that held another guest's.
+    pub fn fp_loads(&self) -> u64 {
+        match self { Backend::Svm(v) => v.fp_loads(), Backend::Vmx(v) => v.fp_loads() }
     }
     /// Answer the guest's `mov` to or from CR8 ([`Exit::Cr8`]) from the
     /// shadow task-priority register and step past it. AMD-V keeps that
