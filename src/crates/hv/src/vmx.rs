@@ -820,6 +820,17 @@ impl Vcpu {
         self.guest.fp_loads()
     }
 
+    /// The guest's TSC_AUX, which its RDTSCP and RDPID read.
+    pub fn tsc_aux(&self) -> u64 {
+        self.guest.tsc_aux()
+    }
+
+    /// Make `value` the guest's TSC_AUX, for a WRMSR of it the policy
+    /// performed: false, and nothing changed, for one the MSR cannot hold.
+    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
+        self.guest.set_tsc_aux(value)
+    }
+
     /// Whether an event is queued for injection on the next entry.
     pub fn event_queued(&self) -> bool {
         self.guest.inject_valid()

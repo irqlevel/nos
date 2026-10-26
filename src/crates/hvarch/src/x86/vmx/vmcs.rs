@@ -245,6 +245,10 @@ pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 /* Secondary processor-based controls. */
 pub const PROC2_ENABLE_EPT: u32 = 1 << 1;
+/// RDTSCP and RDPID run in the guest -- a #UD each without it -- reading
+/// the CPU's TSC_AUX, which nothing but `super::super::msrs` switches.
+/// Neither exits: RDTSC exiting is off.
+pub const PROC2_ENABLE_RDTSCP: u32 = 1 << 3;
 /// RDMSR and WRMSR of 800H-8FFH that the MSR bitmap lets through are of the
 /// virtual APIC, not the CPU's -- a read of anything but TPR, without
 /// APIC-register virtualization, being of the CPU's: which is why the bitmap
@@ -260,6 +264,9 @@ pub const PROC2_UNRESTRICTED_GUEST: u32 = 1 << 7;
 /// `PLE_WINDOW`, each PAUSE within `PLE_GAP` of the last, rather than at
 /// every PAUSE (`PROC_PAUSE_EXITING`, which must then be off).
 pub const PROC2_PAUSE_LOOP_EXITING: u32 = 1 << 10;
+/// INVPCID runs in the guest -- a #UD without it -- on the translations
+/// its own VPID tags; it would exit only with INVLPG exiting, which is off.
+pub const PROC2_ENABLE_INVPCID: u32 = 1 << 12;
 /// The CPU delivers the virtual APIC's interrupts itself -- the highest in
 /// VIRR, when the guest can take it and it is above VPPR -- and performs its
 /// EOIs, writes of its task priority and its self-IPIs, all without an exit.

@@ -77,7 +77,6 @@ global cpu_halt
 global set_rsp
 global set_rbp
 global read_tsc
-global read_tscp
 global cpuid_call
 
 global switch_context
@@ -378,15 +377,6 @@ set_rbp:
 
 read_tsc:
 	rdtsc; result in edx:eax
-	shl rdx, 32
-	or rdx, rax
-	mov rax, rdx
-	ret
-
-read_tscp:
-	; rdi - &cpu_index
-	rdtscp; result in edx:eax, cpu_index in ecx
-	mov qword [rdi], rcx
 	shl rdx, 32
 	or rdx, rax
 	mov rax, rdx

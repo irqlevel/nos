@@ -2,11 +2,13 @@
 
 pub mod cpu;
 pub mod fp;
+pub mod msrs;
 pub mod spec;
 pub mod svm;
 pub mod vmx;
 
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use kcore::percpu::{ConstInit, CpuLocal};
 
@@ -54,6 +56,68 @@ const ECX_X2APIC: u32 = 1 << 21;
 const ECX_HYPERVISOR: u32 = 1 << 31;
 /// CPUID.8000_0001:EDX.
 const EDX_GB_PAGES: u32 = 1 << 26;
+const EDX_RDTSCP: u32 = 1 << 27;
+/// CPUID.7.0:EBX and ECX.
+const EBX_INVPCID: u32 = 1 << 10;
+const ECX_RDPID: u32 = 1 << 22;
+
+/// The instructions a guest runs as the CPU has them that its CPUID offers
+/// only where they run: RDTSCP and RDPID, which read the guest's own
+/// TSC_AUX ([`msrs`]), and INVPCID, which drops the guest's own
+/// translations -- those of the ASID or VPID it runs under. AMD-V runs all
+/// three in a guest unasked, RDTSCP once its intercept is off; VT-x only
+/// where its secondary controls are there to turn them on (`enable RDTSCP`,
+/// which RDPID needs too, and `enable INVPCID`) -- without, each is a #UD.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Offers {
+    pub rdtscp: bool,
+    pub rdpid: bool,
+    pub invpcid: bool,
+}
+
+/// What [`offers`] answers, a bit an instruction, with `OFFERS_KNOWN` set
+/// once it has been asked.
+static OFFERS: AtomicU8 = AtomicU8::new(0);
+const OFFERS_KNOWN: u8 = 1 << 7;
+const OFFERS_RDTSCP: u8 = 1 << 0;
+const OFFERS_RDPID: u8 = 1 << 1;
+const OFFERS_INVPCID: u8 = 1 << 2;
+
+/// What of RDTSCP, RDPID and INVPCID a guest is given: what the CPU first
+/// asked has and its extension runs in a guest, and that from then on, as a
+/// guest's CPUID has to stay. VT-x's controls are asked again of each CPU a
+/// guest is configured on, and one without them refuses it
+/// ([`vmx::Guest`]'s `NotRun::Controls`) -- none this kernel runs on.
+pub fn offers() -> Offers {
+    let mut bits = OFFERS.load(Ordering::Relaxed);
+    if bits & OFFERS_KNOWN == 0 {
+        let found = OFFERS_KNOWN | find_offers();
+        bits = match OFFERS.compare_exchange(0, found, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => found,
+            Err(first) => first,
+        };
+    }
+    Offers {
+        rdtscp: bits & OFFERS_RDTSCP != 0,
+        rdpid: bits & OFFERS_RDPID != 0,
+        invpcid: bits & OFFERS_INVPCID != 0,
+    }
+}
+
+fn find_offers() -> u8 {
+    let has = |yes: bool, bit: u8| if yes { bit } else { 0 };
+    let leaf7 = cpu::cpuid_count(7, 0);
+    let cpu = has(cpu::cpuid(0x8000_0001).is_some_and(|r| r.edx & EDX_RDTSCP != 0), OFFERS_RDTSCP)
+        | has(leaf7.is_some_and(|r| r.ecx & ECX_RDPID != 0), OFFERS_RDPID)
+        | has(leaf7.is_some_and(|r| r.ebx & EBX_INVPCID != 0), OFFERS_INVPCID);
+    let runs = match Caps::probe().detail {
+        Detail::Svm(_) => OFFERS_RDTSCP | OFFERS_RDPID | OFFERS_INVPCID,
+        Detail::Vmx(caps) => has(caps.has(vmx::SEC_ENABLE_RDTSCP), OFFERS_RDTSCP | OFFERS_RDPID)
+            | has(caps.has(vmx::SEC_ENABLE_INVPCID), OFFERS_INVPCID),
+        Detail::None => 0,
+    };
+    cpu & runs
+}
 
 /// Whichever extension this CPU has, in that vendor's own words.
 pub enum Detail {
@@ -243,6 +307,12 @@ impl Caps {
             (false, false) => (false, "no XSAVE: FXSAVE's x87 and SSE alone"),
         };
         feature(out, "AVX in a guest", avx, note)?;
+        /* What of RDTSCP, RDPID and INVPCID it runs as the CPU has them
+         * (`offers`). */
+        let runs = offers();
+        feature(out, "RDTSCP in a guest", runs.rdtscp, "the TSC and its own TSC_AUX, switched with it")?;
+        feature(out, "RDPID in a guest", runs.rdpid, "its own TSC_AUX")?;
+        feature(out, "INVPCID in a guest", runs.invpcid, "the translations of its own ASID or VPID")?;
         Ok(())
     }
 }

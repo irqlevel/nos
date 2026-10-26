@@ -19,12 +19,13 @@
 //! XSAVE's state is offered as far as the host switches it (`fp::offered`,
 //! made up with the host): leaf 1's XSAVE line and leaf 0xD answered for
 //! what is offered, and for the asking CPU's own CR4 and XCR0, which the
-//! input makes up too.
+//! input makes up too. RDTSCP, RDPID and INVPCID as far as they run in a
+//! guest (`x86::offers`, made up with the host too), and TSC_AUX with the
+//! first two.
 
-use crate::policy::{self, Asker, Cpuid};
+use crate::policy::{self, Asker, Cpuid, Own};
 use crate::targets::Input;
-use crate::x86::cpu;
-use crate::x86::fp;
+use crate::x86::{self, cpu, fp};
 use crate::x86::svm::vmcb::Save;
 
 /* The tops of the two ranges a guest may be told: the highest leaf the
@@ -61,9 +62,11 @@ const LEAF6_EAX_ARAT: u32 = 1 << 2;
  * PREFETCHW. */
 const EXT1_ECX: u32 = (1 << 0) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8);
 /* 0x8000_0001 EDX: leaf 1's mirrors (FPU to CX8, MTRR to PSE-36, MMX,
- * FXSR), SYSCALL, NX, the MMX extensions, 1 GiB pages, long mode. */
+ * FXSR), SYSCALL, NX, the MMX extensions, 1 GiB pages, long mode; and
+ * RDTSCP where it runs in a guest. */
 const EXT1_EDX: u32 = 0x1FF | (1 << 11) | (0x3F << 12) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 24) | (1 << 26)
     | (1 << 29);
+const EXT1_EDX_RDTSCP: u32 = 1 << 27;
 /* 0x8000_0007 EDX: the invariant TSC. */
 const EXT7_EDX: u32 = 1 << 8;
 /* 0x8000_0008 EAX: the physical and linear address widths. EBX: CLZERO,
@@ -88,9 +91,12 @@ const LEAF7_EBX: u32 = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1
 const LEAF7_ECX: u32 = (1 << 2) | (1 << 8);
 const LEAF7_EDX: u32 = (1 << 4) | (1 << 10) | (1 << 14) | (1 << 29);
 /* And where AVX's state is offered, its line: AVX2 in EBX, VAES and
- * VPCLMULQDQ in ECX. */
+ * VPCLMULQDQ in ECX. Where each runs in a guest, INVPCID in EBX and RDPID
+ * in ECX. */
 const LEAF7_EBX_AVX: u32 = 1 << 5;
 const LEAF7_ECX_AVX: u32 = (1 << 9) | (1 << 10);
+const LEAF7_EBX_INVPCID: u32 = 1 << 10;
+const LEAF7_ECX_RDPID: u32 = 1 << 22;
 /* Subleaf 1, the last answered (subleaf 0's EAX no more than 1): in EAX the
  * fast string facts -- zero-length MOVSB, short STOSB, short CMPSB and SCASB
  * -- and where AVX's state is offered the VEX-coded SHA512, SM3, SM4,
@@ -188,6 +194,8 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
             | if avx { LEAF1_ECX_AVX } else { 0 }
     };
     let avx_line = if avx { LEAF1_ECX_AVX_LINE } else { 0 };
+    let runs = x86::offers();
+    let bit = |yes: bool, b: u32| if yes { b } else { 0 };
     match leaf {
         0 | 0x8000_0000 => {}
         1 => {
@@ -211,8 +219,10 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         7 if sub == 0 => {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
             want(g[0] == h[0].min(LEAF7_LAST), "EAX: the host's last subleaf, no further than 1");
-            want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx, 0) == 0, "EBX within the model's");
-            want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx, 0) == 0, "ECX within the model's");
+            want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx | bit(runs.invpcid, LEAF7_EBX_INVPCID), 0) == 0,
+                 "EBX within the model's");
+            want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx | bit(runs.rdpid, LEAF7_ECX_RDPID), 0) == 0,
+                 "ECX within the model's");
             want(leaked(g[3], h[3], LEAF7_EDX, 0) == 0, "EDX within the model's");
         }
         7 if sub == 1 && host(7, 0).map_or(0, |h0| h0[0]) >= 1 => {
@@ -244,7 +254,8 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         0x8000_0001 => {
             want(g[0] == h[0] && g[1] == h[1], "EAX and EBX: the host's");
             want(leaked(g[2], h[2], EXT1_ECX, 0) == 0, "ECX within the model's");
-            want(leaked(g[3], h[3], EXT1_EDX, apic_bit) == 0, "EDX within the model's");
+            want(leaked(g[3], h[3], EXT1_EDX | bit(runs.rdtscp, EXT1_EDX_RDTSCP), apic_bit) == 0,
+                 "EDX within the model's");
         }
         0x8000_0007 => want(g == [0, 0, 0, h[3] & EXT7_EDX], "the invariant TSC alone"),
         0x8000_0008 => {
@@ -305,6 +316,8 @@ const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (6, 0, ECX, 0, Needs::Read(0xE8), "APERF/MPERF"),
     (6, 0, ECX, 3, Needs::Read(0x1B0), "energy/performance bias"),
     (7, 0, EBX, 1, Needs::Read(0x3B), "TSC_ADJUST"),
+    (7, 0, ECX, 22, Needs::Read(0xC000_0103), "RDPID"),
+    (7, 0, ECX, 22, Needs::Write(0xC000_0103, 0xFFFF_FFFF), "RDPID"),
     (7, 0, ECX, 5, Needs::Read(0xE1), "WAITPKG"),
     (7, 0, ECX, 7, Needs::Read(0x6A2), "CET shadow stacks"),
     (7, 0, EDX, 20, Needs::Read(0x6A2), "CET indirect branch tracking"),
@@ -324,6 +337,7 @@ const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (0x8000_0001, 0, EDX, 11, Needs::Read(0xC000_0081), "SYSCALL"),
     (0x8000_0001, 0, EDX, 20, Needs::Efer(1 << 11), "NX"),
     (0x8000_0001, 0, EDX, 27, Needs::Read(0xC000_0103), "RDTSCP"),
+    (0x8000_0001, 0, EDX, 27, Needs::Write(0xC000_0103, 0xFFFF_FFFF), "RDTSCP"),
     (0x8000_0001, 0, EDX, 29, Needs::Efer(1 << 8), "long mode"),
     (0x8000_0007, 0, EDX, 7, Needs::Read(0xC001_0061), "hardware P-states"),
     (0x8000_0008, 0, EBX, 1, Needs::Read(0xC000_00E9), "IRPERF"),
@@ -356,10 +370,11 @@ fn check_implied(asker: &Asker) {
             continue;
         }
         let mut save = blank_save();
+        let mut own = Own::default();
         let backed = match needs {
-            Needs::Read(msr) => policy::rdmsr(&save, msr).is_some(),
-            Needs::Write(msr, value) => policy::wrmsr(&mut save, msr, value),
-            Needs::Efer(b) => policy::wrmsr(&mut save, MSR_EFER, b),
+            Needs::Read(msr) => policy::rdmsr(&save, &own, msr).is_some(),
+            Needs::Write(msr, value) => policy::wrmsr(&mut save, &mut own, msr, value),
+            Needs::Efer(b) => policy::wrmsr(&mut save, &mut own, MSR_EFER, b),
         };
         invariant!(backed, "the guest is told of {} (leaf {:#x}.{} register {} bit {}), and {:x?} is refused",
                    name, leaf, sub, reg, bit, needs);
@@ -387,6 +402,9 @@ enum Kind {
     /// IA32_ARCH_CAPABILITIES: read-only, the host's masked to `ARCH_CAP`,
     /// where the host has it; a #GP where it has not.
     ArchCapabilities,
+    /// IA32_TSC_AUX: the guest's own, beside its save area, any value of
+    /// its low 32 bits.
+    TscAux,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -402,6 +420,8 @@ enum Of {
     Every,
     Amd,
     Intel,
+    /// One whose guest RDTSCP or RDPID runs in (`x86::offers`).
+    Rdtscp,
 }
 
 /// The MSRs a guest is answered, from the manuals: its own state, the TSC,
@@ -433,6 +453,7 @@ const MSRS: &[(u32, Of, Kind)] = &[
     (0xC001_0015, Of::Amd, Kind::Fixed(1 << 24)),        // HWCR: TscFreqSel
     (0xC001_001F, Of::Amd, Kind::Fixed(1 << 46)),        // NB_CFG: CF8's extended configuration
     (0xC001_1029, Of::Amd, Kind::Fixed(1 << 1)),         // DE_CFG: LFENCE serializing
+    (0xC000_0103, Of::Rdtscp, Kind::TscAux),
 ];
 
 /* EFER's bits as the model has them. */
@@ -447,9 +468,14 @@ const CR0_PG: u64 = 1 << 31;
 /// one it does not name.
 fn kind(msr: u32) -> Option<Kind> {
     let intel = cpu::host_is_intel();
-    MSRS.iter()
-        .find(|&&(m, of, _)| m == msr && (of == Of::Every || (of == Of::Intel) == intel))
-        .map(|&(_, _, k)| k)
+    let runs = x86::offers();
+    let has = |of: Of| match of {
+        Of::Every => true,
+        Of::Amd => !intel,
+        Of::Intel => intel,
+        Of::Rdtscp => runs.rdtscp || runs.rdpid,
+    };
+    MSRS.iter().find(|&&(m, of, _)| m == msr && has(of)).map(|&(_, _, k)| k)
 }
 
 /// Intel's MISC_ENABLE: fast strings as the host has them, branch tracing
@@ -474,6 +500,7 @@ fn takes(k: Kind, value: u64, save: &Save) -> bool {
         Kind::Tsc | Kind::ReadOnly(_) | Kind::ArchCapabilities => false,
         Kind::Fixed(v) => value == v,
         Kind::MiscEnable => value == misc_enable(),
+        Kind::TscAux => value >> 32 == 0,
     }
 }
 
@@ -484,37 +511,47 @@ fn bytes(save: &Save) -> Vec<u8> {
 }
 
 /// A read of MSR `msr`, held to the model.
-fn check_rdmsr(save: &Save, msr: u32) {
-    let got = policy::rdmsr(save, msr);
+fn check_rdmsr(save: &Save, own: &Own, msr: u32) {
+    let got = policy::rdmsr(save, own, msr);
     let ok = match kind(msr) {
         None => got.is_none(),
         Some(Kind::Own(_)) | Some(Kind::Efer) | Some(Kind::Tsc) => got.is_some(),
         Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => got == Some(v),
         Some(Kind::MiscEnable) => got == Some(misc_enable()),
         Some(Kind::ArchCapabilities) => got == cpu::arch_capabilities().map(|v| v & ARCH_CAP),
+        Some(Kind::TscAux) => got == Some(own.tsc_aux),
     };
     invariant!(ok, "rdmsr {:#x} answered {:#x?}, where the model has it {:?} (intel {})", msr, got, kind(msr),
                cpu::host_is_intel());
 }
 
 /// A write of `value` to MSR `msr`, held to the model: taken or refused as
-/// it says, a refusal leaving the guest's state as it was, and what was
-/// taken of the guest's own read back.
-fn check_wrmsr(save: &mut Save, msr: u32, value: u64) {
+/// it says, a refusal leaving the guest's state as it was, a write to one
+/// MSR changing no other of its own, and what was taken of the guest's own
+/// read back.
+fn check_wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) {
     let k = kind(msr);
     let before = *save;
+    let own_before = *own;
     let efer_before = before.efer;
     let want = k.map_or(false, |k| takes(k, value, &before));
-    let took = policy::wrmsr(save, msr, value);
+    let took = policy::wrmsr(save, own, msr, value);
     invariant!(took == want, "wrmsr {:#x} <- {:#x} {}, where the model has it {:?} (intel {}, CR0 {:#x}, EFER {:#x})",
                msr, value, if took { "taken" } else { "refused" }, k, cpu::host_is_intel(), before.cr0, before.efer);
     if !took {
-        invariant!(bytes(save) == bytes(&before), "wrmsr {:#x} <- {:#x}, refused, changed the guest's state", msr, value);
+        invariant!(bytes(save) == bytes(&before) && *own == own_before,
+                   "wrmsr {:#x} <- {:#x}, refused, changed the guest's state", msr, value);
         return;
     }
-    let read = policy::rdmsr(save, msr);
+    let others = match k {
+        Some(Kind::TscAux) => bytes(save) == bytes(&before),
+        _ => *own == own_before,
+    };
+    invariant!(others, "wrmsr {:#x} <- {:#x} changed another of the guest's MSRs ({:x?} from {:x?})", msr, value,
+               own, own_before);
+    let read = policy::rdmsr(save, own, msr);
     let back = match k {
-        Some(Kind::Own(_)) => Some(value),
+        Some(Kind::Own(_)) | Some(Kind::TscAux) => Some(value),
         Some(Kind::Efer) => Some((value & !EFER_LMA) | (efer_before & EFER_LMA)),
         _ => read,
     };
@@ -530,6 +567,7 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
             Some(Kind::MiscEnable) => misc_enable(),
             Some(Kind::ArchCapabilities) => cpu::arch_capabilities().unwrap_or(0),
             Some(Kind::Efer) => r.pick(&[EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE, EFER_LME, EFER_SCE | EFER_NXE]),
+            Some(Kind::TscAux) => u64::from(r.u32()),
             _ => r.value64(),
         },
         1 => if r.bool() { 0x0007_0406_0007_0406 } else { r.u64() & 0x0707_0707_0707_0707 },
@@ -570,8 +608,9 @@ pub fn policy_target(r: &mut Input) {
         save.cr0 = CR0_PG | 1;
         save.efer = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME;
     }
+    let mut own = Own::default();
     for &(msr, _, _) in MSRS {
-        check_rdmsr(&save, msr);
+        check_rdmsr(&save, &own, msr);
     }
     while let Some(op) = r.op(4) {
         let msr = match op {
@@ -585,10 +624,10 @@ pub fn policy_target(r: &mut Input) {
             _ => r.u32(),
         };
         if r.bool() {
-            check_rdmsr(&save, msr);
+            check_rdmsr(&save, &own, msr);
         } else {
             let value = msr_value(r, kind(msr));
-            check_wrmsr(&mut save, msr, value);
+            check_wrmsr(&mut save, &mut own, msr, value);
         }
     }
 }

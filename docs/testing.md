@@ -1643,7 +1643,17 @@ own under VT-x and on a Zen 2, 6 and 5 refused by the host accordingly;
 and that leaf 0xD gave the x87, SSE and AVX, the area's sizes 576 and 832,
 no XSAVES, and AVX's component at 576. Its second CPU turns its local APIC
 on first: it comes out of INIT software-disabled, and a guest that waits
-for an IPI there before it does waits for good. After both rounds `hv` must count at least two
+for an IPI there before it does waits for good. And for `tscaux`, two VMs
+of one CPU each, one after the other on the CPU the guests run on: that
+each was told RDTSCP, RDPID and INVPCID exactly as `hv info` says they run
+in a guest, RDTSCP everywhere; that the second read TSC_AUX as 0 by RDTSCP,
+RDPID and RDMSR as it started, where the first had left its own; that each
+read back the value it wrote every way it has, RDTSCP's TSC between two
+RDTSCs, and had a write of bit 32 refused, its value kept; that INVPCID's
+four types ran and a fifth was a #GP where it is offered -- the EX44's
+silicon -- and every one a #UD where not, QEMU's TCG and a Zen 2; and that
+the run loop saw its three RDMSRs and two WRMSRs and stopped it at no
+RDTSCP. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
 QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
