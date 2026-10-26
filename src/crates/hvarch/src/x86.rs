@@ -313,6 +313,11 @@ impl Caps {
         feature(out, "RDTSCP in a guest", runs.rdtscp, "the TSC and its own TSC_AUX, switched with it")?;
         feature(out, "RDPID in a guest", runs.rdpid, "its own TSC_AUX")?;
         feature(out, "INVPCID in a guest", runs.invpcid, "the translations of its own ASID or VPID")?;
+        /* What of the speculation controls is a guest's own (`spec`). */
+        let controls = spec::guest_controls();
+        feature(out, "SPEC_CTRL in a guest", controls.spec_ctrl != 0,
+                "its own, the CPU's over the host's for its run")?;
+        feature(out, "IBPB in a guest", controls.pred_cmd != 0, "done before its next entry on any CPU it trained")?;
         Ok(())
     }
 }

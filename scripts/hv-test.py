@@ -251,9 +251,23 @@ GUESTS = {
             r"2 of them the CPU's own, before its intercept)"],
     # Every MSR comes to the policy on both backends, so this one says the
     # same under either.
-    "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
-            r"CPUID offers no speculation control and no PMU, and says a hypervisor is there",
+    "msr": [r"VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
+            r"CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, and says a hypervisor is there",
             r"\b5 rdmsr, 3 wrmsr, 4 refused"],
+    # Two VMs, one after the other on the CPU the guests run on: offered
+    # exactly the speculation controls the host switches -- none under
+    # QEMU's TCG, which has none, every access a #GP -- and where it has
+    # them, SPEC_CTRL its own: the second reads 0 where the first left its
+    # own, each runs under its bits over the host's and the CPU's is the
+    # host's alone after; three IBPBs asked each, all answered before the
+    # next entry. Which the CPU has is `hv info`'s to say, and checked
+    # against it below (`check_controls`).
+    "spec": [r"(?:no speculation control offered, as the CPU has none: every access to SPEC_CTRL and PRED_CMD a #GP"
+             r"|SPEC_CTRL 0x[0-9a-f]+ and PRED_CMD 0x[0-9a-f]+ offered, as the host switches them; vm B read "
+             r"SPEC_CTRL as 0 where vm A had left 0x[0-9a-f]+, each read back its own and ran under it over the "
+             r"host's, bit 62 refused, the CPU's the host's alone after; [03] IBPBs asked each, all answered before "
+             r"the next entry; PRED_CMD's read and bit 1 a #GP)",
+             r"\b4 and 4 rdmsr, 6 and 6 wrmsr"],
     # Two VMs, one after the other on the CPU the guests run on: the second
     # must read 0 where the first left its own, and each one's breakpoint,
     # on an instruction of its own, fire -- DR0-DR3 made its own before each
@@ -656,6 +670,21 @@ def check_offers(info, text, cpu):
              m is not None and list(m.groups()) == said, report or text)
 
 
+def check_controls(info, text, cpu):
+    """The spec guest was offered speculation controls exactly where `hv
+    info` says a guest has them of its own -- on a CPU that has them, which
+    QEMU's TCG does not -- and asked for its IBPBs where it has IBPB."""
+    spec_ctrl = re.search(r"SPEC_CTRL in a guest\s+yes", info) is not None
+    ibpb = re.search(r"IBPB in a guest\s+yes", info) is not None
+    report = guest_report(text, "spec")
+    m = re.search(r"SPEC_CTRL (0x[0-9a-f]+) and PRED_CMD (0x[0-9a-f]+) offered", report)
+    offered = (m is not None and int(m.group(1), 16) != 0, m is not None and int(m.group(2), 16) != 0)
+    asked = re.search(r"\b([03]) IBPBs asked each", report)
+    good = offered == (spec_ctrl, ibpb) and (asked is None or (asked.group(1) == "3") == ibpb)
+    pt.check("  spec on cpu %d offered SPEC_CTRL %s and IBPB %s, as hv info says a guest has them"
+             % (cpu, "yes" if spec_ctrl else "no", "yes" if ibpb else "no"), good, report or text)
+
+
 def x86_checks(ran, script, digest, grown, raw):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
@@ -703,6 +732,8 @@ def x86_checks(ran, script, digest, grown, raw):
     check_all_guests(out[13], CPUS - 1, backend, apicv, posted)
     check_offers(info, out[12], 0)
     check_offers(info, out[13], CPUS - 1)
+    check_controls(info, out[12], 0)
+    check_controls(info, out[13], CPUS - 1)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
@@ -722,8 +753,8 @@ def x86_checks(ran, script, digest, grown, raw):
                                 or m.group(4) is not None and int(m.group(4)) >= switches), out[14])
     # Read back from every CPU's register, where `hv on` set one: what it
     # set is still there after the guests.
-    pt.check("and every CPU's IA32_SPEC_CTRL still has what hv on set there",
-             "IA32_SPEC_CTRL" not in out[14], out[14])
+    pt.check("and every CPU's IA32_SPEC_CTRL is what the host runs with there: what hv on set kept, no guest's "
+             "bits left over it", "IA32_SPEC_CTRL on cpu" not in out[14], out[14])
 
     pt.check("a second insmod is refused", "loaded at" not in out[15], out[15])
     pt.check("a CPU that does not exist is refused", "is not a CPU" in out[16], out[16])

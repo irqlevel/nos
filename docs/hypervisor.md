@@ -488,16 +488,18 @@ since VT-x's controls are not AMD-V's intercepts:
   for each CPU as the extension is turned on there, with KVM's as the
   reference: after every exit the guest's values cleared out of every
   register the stub returns with and the return stack refilled before its
-  first `ret`, as AMD-V's stub does; an IBPB between two guests on a CPU;
-  IBRS in IA32_SPEC_CTRL while the extension is on -- enhanced, set once, on
+  first `ret`, as AMD-V's stub does; an IBPB between two guest CPUs on a
+  CPU; IBRS in IA32_SPEC_CTRL while the extension is on -- enhanced, set once, on
   the EX44, and legacy, a barrier only when written, written again after
   every exit on a CPU without it (Skylake) -- with BHI_DIS_S beside it where
   the CPU has the control; VERW, the CPU's buffers cleared, the last thing
   before every entry where MDS, TAA or RFDS apply (the EX44's E-cores have
   RFDS); and the L1 data cache flushed before every entry where L1TF lets a
-  guest read it (Skylake). `hv` says which of them the CPU it runs on has,
-  and reads every CPU's IA32_SPEC_CTRL back, warning where it no longer
-  has what `hv on` set there. What each costs an exit on the EX44 is in
+  guest read it (Skylake). A guest's own SPEC_CTRL goes over the host's
+  for its run, and the host's alone is written back after the exit -- by
+  the stub, for legacy IBRS. `hv` says which of them the CPU it runs on has,
+  and reads every CPU's IA32_SPEC_CTRL back, warning where it is not what
+  the host runs with there. What each costs an exit on the EX44 is in
   [What an exit costs](#what-an-exit-costs).
 
 What the VMX backend does not do yet, and says so rather than pretends:
@@ -763,9 +765,10 @@ on on every entry, whatever the VMCB says:
   guest's values cleared out of every register the run stub returns with,
   and the return stack refilled before the host's first `ret` -- a guest's
   return addresses left there would have the host's returns predicted to
-  them; before the entry, an IBPB where the guest is another than the last
-  on the CPU, told apart by its nested table's id, where the CPU has IBPB;
-  and automatic IBRS turned on with the extension, where the CPU has it;
+  them; before the entry, an IBPB where the guest CPU is another than the
+  last on the CPU -- two CPUs of one guest included -- or this one after an
+  IBPB it asked for itself, where the CPU has IBPB; and automatic IBRS
+  turned on with the extension, where the CPU has it;
 - the intercept of every read and write of DR0-DR3, and the CPU's four made
   the guest's own before each entry. The breakpoint addresses are the
   CPU's, not the VMCB's -- `vmrun` switches DR6 and DR7, not them -- so
@@ -949,6 +952,7 @@ mode:
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
 | `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
+| `spec` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers of the speculation controls, reads IA32_SPEC_CTRL, writes every control offered into it and reads it back, writes it with bit 62 set and reads it again, asks for three IBPBs by IA32_PRED_CMD, reads PRED_CMD and writes its bit 1 | offered exactly the controls the host switches (`spec::guest_controls`) -- none under QEMU's TCG, every access a #GP; SPEC_CTRL 0 as each VM starts, the second where the first had left its own; the bits it wrote read back, bit 62 a #GP and the value kept; its last entry run under its bits over the host's, and the CPU's the host's alone after; every IBPB it asked for answered by a barrier before its next entry; PRED_CMD's read and bit 1 a #GP; every RDMSR and WRMSR seen by the run loop |
 | `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and PKE, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and PKE -- which its CPUID never offers -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
 ```
@@ -1085,6 +1089,37 @@ And while a guest runs:
   going off puts back what it found. The `tscaux` built-in guest is the
   check: two VMs one after the other on one CPU, the second reading 0 where
   the first left its own.
+- **A guest's speculation controls are its own** (`hvarch::x86::spec`,
+  `hvarch::x86::msrs`): every control of IA32_SPEC_CTRL the CPU has --
+  IBRS, STIBP, SSBD, and Intel's PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and
+  BHI_DIS_S, AMD's PSFD -- and IA32_PRED_CMD's IBPB, with AMD's SBPB, which
+  neither extension switches. A guest CPU's SPEC_CTRL is kept beside it, 0
+  out of reset, written through the policy and held to the bits the CPU
+  takes, and made the CPU's for its run over the host's own: the host's
+  protection -- IBRS and BHI_DIS_S under VT-x, STIBP under AMD-V where a
+  core has two threads -- is never off while a guest runs, and each of
+  these bits only takes from what speculation may do, so a guest's left
+  in the host's until the write after its exit costs speed and nothing
+  else. The MSR is written before an entry and after an exit only where it
+  holds otherwise -- a Linux guest under an enhanced-IBRS host sets the
+  very bits the host has, and costs no write at all -- by the stub's own
+  write after the exit for legacy IBRS, and on an AMD CPU with virtual
+  SPEC_CTRL through the VMCB, which `vmrun` loads it from whatever the MSR
+  holds: there the guest had run under 0, without the host's STIBP. Its
+  reads and writes always exit. A write of PRED_CMD asks for an IBPB, and
+  each guest CPU counts those it asked for: the IBPB between two guest
+  CPUs on a CPU is keyed by both, so one goes in before its next entry on
+  any CPU it ran on before it asked -- its kernel's barrier between two of
+  its processes, which a CPU it ran the first on and runs the second on
+  later would otherwise not have -- and none goes in twice. That key is
+  the guest CPU now, not the guest: two CPUs of one guest that share a CPU
+  get an IBPB between them, as KVM gives them, since their kernel takes
+  them for CPUs that share no predictors. Where the CPU has an IBPB after
+  every exit already (a Zen 2), that is the one. Not L1D_FLUSH: a guest's
+  flush would have to run on the CPU its data was in, before its task
+  could move. `hv` counts the IBPBs guests asked for, and reads every
+  CPU's IA32_SPEC_CTRL back, warning where it is not the host's exactly.
+  The `spec` built-in guest is the check.
 - **A halted guest costs its CPU nothing.** A HLT with interrupts on is
   stepped past, as a CPU an interrupt wakes resumes after it, and the vCPU
   is not entered again until the PIC has an interrupt for it; meanwhile its
@@ -1408,16 +1443,22 @@ here:
   -INT16, AVX-NE-CONVERT, SHA512, SM3 and SM4; leaf 0xD made up for those
   three components, its sizes for the guest's own XCR0; XSAVEOPT, XSAVEC
   and XGETBV's ECX 1 as the host has them, never XSAVES -- and no AVX-512,
-  AMX or PKU, whose state nothing switches; no paravirtualisation, no
-  speculation control (none has its MSR behind it yet); of the structured
+  AMX or PKU, whose state nothing switches; no paravirtualisation; the
+  speculation controls the host has -- IBRS and IBPB, STIBP, SSBD, and
+  Intel's PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and BHI_DIS_S, AMD's PSFD and
+  SBPB -- with IA32_SPEC_CTRL and IA32_PRED_CMD the guest's own ([What the
+  extension costs](#what-the-extension-costs-while-it-is-on)), but not
+  L1D_FLUSH, whose flush would have to run on the CPU the guest's data was
+  in before its task could move; of the structured
   leaf, 7, what runs as it is and owns no state of the host's -- SMEP, SMAP
   and UMIP for the guest's kernel, FSGSBASE over bases the VMCS and the VMCB
   keep, BMI, ADX, ERMS and FSRM (and of subleaf 1 the fast zero-length and
   short string facts, FZRM, FSRS and FSRC), RDSEED, SHA, GFNI, CLFLUSHOPT
   and CLWB, SERIALIZE -- with MD_CLEAR, VERW clearing the CPU's buffers in a guest as
   anywhere, and ARCH_CAPABILITIES, whose MSR reads as the host's but for
-  the bits that are not facts of the CPU (IBRS_ALL, whose SPEC_CTRL is not
-  the guest's, and those naming an MSR nothing answers); PCID, and INVPCID
+  the bits that are not facts of the CPU (those naming an MSR nothing
+  answers) -- IBRS_ALL among the facts, the guest's SPEC_CTRL its own;
+  PCID, and INVPCID
   -- a global flush without two writes of CR4 -- RDTSCP and RDPID where they
   run in a guest: always under AMD-V, where the CPU has them, and under
   VT-x where it has the controls that turn them on, the last two reading
@@ -4056,8 +4097,10 @@ someone else's; then speed.
    and the modules; a Zen 3 or 4 whose microcode has IBPB_BRTYPE but whose
    CPUID does not say so, which Linux finds by a write to PRED_CMD and this
    takes for open to SRSO; Zen 5's cheaper control of SRSO and TSA's VERW
-   (Zen 3 and 4); and a guest's own speculation control (IBRS, STIBP, SSBD,
-   IBPB), offered to none until its MSR is switched with it. Done under VT-x
+   (Zen 3 and 4). A guest's own speculation controls -- IBRS, STIBP, SSBD,
+   IBPB -- are offered now, its IA32_SPEC_CTRL switched with it and its
+   IBPBs performed ([What the extension
+   costs](#what-the-extension-costs-while-it-is-on)). Done under VT-x
    ([The VMX backend](#the-vmx-backend-and-where-it-differs-from-amd-v)),
    decided for each CPU from what CPUID and IA32_ARCH_CAPABILITIES say of
    it, with KVM's as the reference: the registers cleared and the return
@@ -4102,7 +4145,9 @@ someone else's; then speed.
    written from the manuals, with a table of what each CPUID bit promises:
    nine mutants, the old swallowing and IBPB offered among them, each failed
    within 1,600 inputs. `hv-test.py`'s `msr` guest has the run loop refuse
-   SPEC_CTRL, PRED_CMD, an MSR nobody names and MTRRs turned on, and answer
+   VIRT_SPEC_CTRL, FLUSH_CMD -- once SPEC_CTRL and PRED_CMD, which are a
+   guest's own now, and the `spec` guest's -- an MSR nobody names and MTRRs
+   turned on, and answer
    the machine-check registers and the PAT; a build that refused
    MCG_STATUS failed it. `hv-linux-test.py` holds every boot's console to
    no "unchecked MSR access error" and no "MCA architectural violation",
@@ -4272,9 +4317,10 @@ someone else's; then speed.
    made up for what is switched, the x87, SSE and AVX
    ([above](#what-the-extension-costs-while-it-is-on)) -- and with it AVX,
    FMA, F16C, AVX2, VAES and VPCLMULQDQ: the whole of x86-64-v3's list, for
-   a distribution built for it (RHEL 10 and its rebuilds). Left: the
-   speculation controls, SPEC_CTRL switched with the guest: Spectre v2
-   retpolines in the guest, its store bypass open.
+   a distribution built for it (RHEL 10 and its rebuilds). And the
+   speculation controls, the guest's IA32_SPEC_CTRL its own and its IBPBs
+   performed: Spectre v2 by enhanced IBRS in a guest whose host has it, its
+   store bypass its own to close.
    (The hypervisor bit, clear until the policy became an allow-list -- the
    guest believing it was on bare metal -- is set now:
    [above](#before-other-peoples-guests), item 2.)

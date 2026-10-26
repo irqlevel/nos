@@ -21,7 +21,9 @@
 //! what is offered, and for the asking CPU's own CR4 and XCR0, which the
 //! input makes up too. RDTSCP, RDPID and INVPCID as far as they run in a
 //! guest (`x86::offers`, made up with the host too), and TSC_AUX with the
-//! first two.
+//! first two. The speculation controls as far as the host has them, and
+//! IA32_SPEC_CTRL and IA32_PRED_CMD as what the guest's CPUID promises of
+//! them: the bits its answers name, and nothing else.
 
 use crate::policy::{self, Asker, Cpuid, Own};
 use crate::targets::Input;
@@ -79,6 +81,16 @@ const EXT8_EBX: u32 = (1 << 0) | (1 << 2) | (1 << 26) | (1 << 29);
  * affected by SRSO, at all or across user and kernel. ECX: not affected
  * by TSA-SQ or TSA-L1. */
 const EXT21_EAX: u32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 29) | (1 << 30);
+/* The speculation controls, as far as the host has them: leaf 7's EDX --
+ * IBRS and IBPB, STIBP, SSBD; its subleaf 2's -- PSFD, IPRED_CTRL,
+ * RRSBA_CTRL, DDPD_U, BHI_CTRL, and MCDT_NO, a fact; 0x8000_0008's EBX --
+ * IBPB, IBRS, STIBP, SSBD, PSFD, and IBPB_RET, a fact of that IBPB; and
+ * 0x8000_0021's EAX -- SBPB, and IBPB_BRTYPE, a fact of IBPB. What each
+ * promises of IA32_SPEC_CTRL and IA32_PRED_CMD is `promised`'s. */
+const LEAF7_EDX_SPEC: u32 = (1 << 26) | (1 << 27) | (1 << 31);
+const LEAF7_2_EDX: u32 = 0x3F;
+const EXT8_EBX_SPEC: u32 = (1 << 12) | (1 << 14) | (1 << 15) | (1 << 24) | (1 << 28) | (1 << 30);
+const EXT21_EAX_SPEC: u32 = (1 << 27) | (1 << 28);
 const EXT21_ECX: u32 = (1 << 1) | (1 << 2);
 
 /* Leaf 7, subleaf 0: FSGSBASE, BMI1, the x87 FDP and CS/DS facts, SMEP,
@@ -102,7 +114,7 @@ const LEAF7_ECX_RDPID: u32 = 1 << 22;
  * -- and where AVX's state is offered the VEX-coded SHA512, SM3, SM4,
  * AVX-VNNI and AVX-IFMA; in EDX AVX-VNNI-INT8, AVX-NE-CONVERT and
  * AVX-VNNI-INT16; nothing in EBX or ECX. */
-const LEAF7_LAST: u32 = 1;
+const LEAF7_LAST: u32 = 2;
 const LEAF7_1_EAX: u32 = (1 << 10) | (1 << 11) | (1 << 12);
 const LEAF7_1_EAX_AVX: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 23);
 const LEAF7_1_EDX_AVX: u32 = (1 << 4) | (1 << 5) | (1 << 10);
@@ -120,10 +132,10 @@ const LEAF_D1_EAX_XSAVEC: u32 = 1 << 1;
 
 /* IA32_ARCH_CAPABILITIES as a guest may read it: of the host's, the bits
  * that say what the CPU is not open to and what VERW clears -- RDCL_NO,
- * RSBA, SSB_NO, MDS_NO, PSCHANGE_MC_NO, TAA_NO, the three MMIO stale data
+ * IBRS_ALL (SPEC_CTRL being the guest's), RSBA, SSB_NO, MDS_NO, PSCHANGE_MC_NO, TAA_NO, the three MMIO stale data
  * NOs, FB_CLEAR, RRSBA, BHI_NO, PBRSB_NO, GDS_NO, RFDS_NO, RFDS_CLEAR and
  * ITS_NO -- and none that names an MSR or a control the guest would use. */
-const ARCH_CAP: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 13) | (1 << 14)
+const ARCH_CAP: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 13) | (1 << 14)
     | (1 << 15) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 62);
 
 /// Leaves a guest is given as the host has them: descriptions of caches,
@@ -218,12 +230,16 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         6 => want(g == [arat, 0, 0, 0], "ARAT for a guest with APICs, and nothing else"),
         7 if sub == 0 => {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
-            want(g[0] == h[0].min(LEAF7_LAST), "EAX: the host's last subleaf, no further than 1");
+            want(g[0] == h[0].min(LEAF7_LAST), "EAX: the host's last subleaf, no further than 2");
             want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx | bit(runs.invpcid, LEAF7_EBX_INVPCID), 0) == 0,
                  "EBX within the model's");
             want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx | bit(runs.rdpid, LEAF7_ECX_RDPID), 0) == 0,
                  "ECX within the model's");
-            want(leaked(g[3], h[3], LEAF7_EDX, 0) == 0, "EDX within the model's");
+            want(leaked(g[3], h[3], LEAF7_EDX | LEAF7_EDX_SPEC, 0) == 0, "EDX within the model's");
+        }
+        7 if sub == 2 && host(7, 0).map_or(0, |h0| h0[0]) >= 2 => {
+            want(g[..3] == [0; 3], "EAX to ECX: nothing");
+            want(leaked(g[3], h[3], LEAF7_2_EDX, 0) == 0, "EDX within the model's");
         }
         7 if sub == 1 && host(7, 0).map_or(0, |h0| h0[0]) >= 1 => {
             let (avx_eax, avx_edx) = if avx { (LEAF7_1_EAX_AVX, LEAF7_1_EDX_AVX) } else { (0, 0) };
@@ -260,11 +276,11 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         0x8000_0007 => want(g == [0, 0, 0, h[3] & EXT7_EDX], "the invariant TSC alone"),
         0x8000_0008 => {
             want(g[0] == h[0] & EXT8_EAX, "EAX: the address widths, the host's");
-            want(leaked(g[1], h[1], EXT8_EBX, 0) == 0, "EBX within the model's");
+            want(leaked(g[1], h[1], EXT8_EBX | EXT8_EBX_SPEC, 0) == 0, "EBX within the model's");
             want(g[2] == 0 && g[3] == 0, "ECX and EDX: nothing -- one core");
         }
         0x8000_0021 => {
-            want(leaked(g[0], h[0], EXT21_EAX, 0) == 0, "EAX within the model's");
+            want(leaked(g[0], h[0], EXT21_EAX | EXT21_EAX_SPEC, 0) == 0, "EAX within the model's");
             want(leaked(g[2], h[2], EXT21_ECX, 0) == 0, "ECX within the model's");
             want(g[1] == 0 && g[3] == 0, "EBX and EDX: nothing");
         }
@@ -322,12 +338,20 @@ const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (7, 0, ECX, 7, Needs::Read(0x6A2), "CET shadow stacks"),
     (7, 0, EDX, 20, Needs::Read(0x6A2), "CET indirect branch tracking"),
     (7, 0, EDX, 26, Needs::Read(0x48), "IBRS and IBPB"),
+    (7, 0, EDX, 26, Needs::Write(0x48, 1), "IBRS and IBPB"),
     (7, 0, EDX, 26, Needs::Write(0x49, 1), "IBRS and IBPB"),
     (7, 0, EDX, 27, Needs::Read(0x48), "STIBP"),
+    (7, 0, EDX, 27, Needs::Write(0x48, 1 << 1), "STIBP"),
     (7, 0, EDX, 28, Needs::Write(0x10B, 1), "L1D_FLUSH"),
     (7, 0, EDX, 29, Needs::Read(0x10A), "ARCH_CAPABILITIES"),
     (7, 0, EDX, 30, Needs::Read(0xCF), "CORE_CAPABILITIES"),
     (7, 0, EDX, 31, Needs::Read(0x48), "SSBD"),
+    (7, 0, EDX, 31, Needs::Write(0x48, 1 << 2), "SSBD"),
+    (7, 2, EDX, 0, Needs::Write(0x48, 1 << 7), "PSFD"),
+    (7, 2, EDX, 1, Needs::Write(0x48, 3 << 3), "IPRED_CTRL"),
+    (7, 2, EDX, 2, Needs::Write(0x48, 3 << 5), "RRSBA_CTRL"),
+    (7, 2, EDX, 3, Needs::Write(0x48, 1 << 8), "DDPD_U"),
+    (7, 2, EDX, 4, Needs::Write(0x48, 1 << 10), "BHI_CTRL"),
     (0xD, 1, EAX, 3, Needs::Read(0xDA0), "XSAVES"),
     (0x8000_0001, 0, ECX, 2, Needs::Read(0xC001_0114), "SVM"),
     (0x8000_0001, 0, ECX, 9, Needs::Read(0xC001_0140), "OSVW"),
@@ -343,14 +367,20 @@ const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (0x8000_0008, 0, EBX, 1, Needs::Read(0xC000_00E9), "IRPERF"),
     (0x8000_0008, 0, EBX, 12, Needs::Write(0x49, 1), "IBPB"),
     (0x8000_0008, 0, EBX, 14, Needs::Read(0x48), "IBRS"),
+    (0x8000_0008, 0, EBX, 14, Needs::Write(0x48, 1), "IBRS"),
     (0x8000_0008, 0, EBX, 15, Needs::Read(0x48), "STIBP"),
+    (0x8000_0008, 0, EBX, 15, Needs::Write(0x48, 1 << 1), "STIBP"),
     (0x8000_0008, 0, EBX, 23, Needs::Read(0xC001_02F0), "PPIN"),
     (0x8000_0008, 0, EBX, 24, Needs::Read(0x48), "SSBD"),
+    (0x8000_0008, 0, EBX, 24, Needs::Write(0x48, 1 << 2), "SSBD"),
     (0x8000_0008, 0, EBX, 25, Needs::Read(0xC001_011F), "VIRT_SSBD"),
     (0x8000_0008, 0, EBX, 27, Needs::Read(0xC001_02B0), "CPPC"),
     (0x8000_0008, 0, EBX, 28, Needs::Read(0x48), "PSFD"),
+    (0x8000_0008, 0, EBX, 28, Needs::Write(0x48, 1 << 7), "PSFD"),
+    (0x8000_0008, 0, EBX, 30, Needs::Write(0x49, 1), "IBPB_RET"),
     (0x8000_0021, 0, EAX, 8, Needs::Efer(1 << 21), "AutoIBRS"),
     (0x8000_0021, 0, EAX, 27, Needs::Write(0x49, 1 << 7), "SBPB"),
+    (0x8000_0021, 0, EAX, 28, Needs::Write(0x49, 1), "IBPB_BRTYPE"),
     (0x8000_0022, 0, EAX, 0, Needs::Read(0xC000_0300), "PerfMonV2"),
 ];
 
@@ -405,6 +435,12 @@ enum Kind {
     /// IA32_TSC_AUX: the guest's own, beside its save area, any value of
     /// its low 32 bits.
     TscAux,
+    /// IA32_SPEC_CTRL: the guest's own, beside its save area, any of the
+    /// bits its CPUID promises (`promised`).
+    SpecCtrl,
+    /// IA32_PRED_CMD: written alone -- a read is a #GP -- with any of the
+    /// bits its CPUID promises; each write of one an IBPB asked for.
+    PredCmd,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -422,6 +458,10 @@ enum Of {
     Intel,
     /// One whose guest RDTSCP or RDPID runs in (`x86::offers`).
     Rdtscp,
+    /// One whose guest's CPUID promises a control of IA32_SPEC_CTRL, or of
+    /// IA32_PRED_CMD (`promised`).
+    SpecCtrl,
+    PredCmd,
 }
 
 /// The MSRs a guest is answered, from the manuals: its own state, the TSC,
@@ -454,7 +494,32 @@ const MSRS: &[(u32, Of, Kind)] = &[
     (0xC001_001F, Of::Amd, Kind::Fixed(1 << 46)),        // NB_CFG: CF8's extended configuration
     (0xC001_1029, Of::Amd, Kind::Fixed(1 << 1)),         // DE_CFG: LFENCE serializing
     (0xC000_0103, Of::Rdtscp, Kind::TscAux),
+    (0x48, Of::SpecCtrl, Kind::SpecCtrl),
+    (0x49, Of::PredCmd, Kind::PredCmd),
 ];
+
+/// What the guest's CPUID promises of IA32_SPEC_CTRL and IA32_PRED_CMD,
+/// from the manuals: each control's bits, Intel's leaves and AMD's.
+fn promised() -> (u64, u64) {
+    let a = Asker::RESET;
+    let l7 = words(&policy::cpuid(7, 0, &a))[EDX];
+    let l72 = words(&policy::cpuid(7, 2, &a))[EDX];
+    let e8 = words(&policy::cpuid(0x8000_0008, 0, &a))[EBX];
+    let e21 = words(&policy::cpuid(0x8000_0021, 0, &a))[EAX];
+    let bit = |word: u32, b: u32| word & (1 << b) != 0;
+    let has = |yes: bool, v: u64| if yes { v } else { 0 };
+    let spec_ctrl = has(bit(l7, 26) || bit(e8, 14), 1 << 0)   // IBRS
+        | has(bit(l7, 27) || bit(e8, 15), 1 << 1)              // STIBP
+        | has(bit(l7, 31) || bit(e8, 24), 1 << 2)              // SSBD
+        | has(bit(l72, 0) || bit(e8, 28), 1 << 7)              // PSFD
+        | has(bit(l72, 1), 3 << 3)                             // IPRED_DIS_U and _S
+        | has(bit(l72, 2), 3 << 5)                             // RRSBA_DIS_U and _S
+        | has(bit(l72, 3), 1 << 8)                             // DDPD_U
+        | has(bit(l72, 4), 1 << 10);                           // BHI_DIS_S
+    let pred_cmd = has(bit(l7, 26) || bit(e8, 12), 1 << 0)    // IBPB
+        | has(bit(e21, 27), 1 << 7);                           // SBPB
+    (spec_ctrl, pred_cmd)
+}
 
 /* EFER's bits as the model has them. */
 const EFER_SCE: u64 = 1 << 0;
@@ -474,6 +539,8 @@ fn kind(msr: u32) -> Option<Kind> {
         Of::Amd => !intel,
         Of::Intel => intel,
         Of::Rdtscp => runs.rdtscp || runs.rdpid,
+        Of::SpecCtrl => promised().0 != 0,
+        Of::PredCmd => promised().1 != 0,
     };
     MSRS.iter().find(|&&(m, of, _)| m == msr && has(of)).map(|&(_, _, k)| k)
 }
@@ -501,6 +568,8 @@ fn takes(k: Kind, value: u64, save: &Save) -> bool {
         Kind::Fixed(v) => value == v,
         Kind::MiscEnable => value == misc_enable(),
         Kind::TscAux => value >> 32 == 0,
+        Kind::SpecCtrl => value & !promised().0 == 0,
+        Kind::PredCmd => value & !promised().1 == 0,
     }
 }
 
@@ -520,6 +589,8 @@ fn check_rdmsr(save: &Save, own: &Own, msr: u32) {
         Some(Kind::MiscEnable) => got == Some(misc_enable()),
         Some(Kind::ArchCapabilities) => got == cpu::arch_capabilities().map(|v| v & ARCH_CAP),
         Some(Kind::TscAux) => got == Some(own.tsc_aux),
+        Some(Kind::SpecCtrl) => got == Some(own.spec_ctrl),
+        Some(Kind::PredCmd) => got.is_none(),
     };
     invariant!(ok, "rdmsr {:#x} answered {:#x?}, where the model has it {:?} (intel {})", msr, got, kind(msr),
                cpu::host_is_intel());
@@ -543,15 +614,22 @@ fn check_wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) {
                    "wrmsr {:#x} <- {:#x}, refused, changed the guest's state", msr, value);
         return;
     }
-    let others = match k {
-        Some(Kind::TscAux) => bytes(save) == bytes(&before),
-        _ => *own == own_before,
+    /* What of the guest's own beside its save area the write made: the one
+     * MSR's value, or an IBPB more asked for -- and nothing else. */
+    let own_want = match k {
+        Some(Kind::TscAux) => Own { tsc_aux: value, ..own_before },
+        Some(Kind::SpecCtrl) => Own { spec_ctrl: value, ..own_before },
+        Some(Kind::PredCmd) => Own { ibpbs: own_before.ibpbs.wrapping_add(u64::from(value != 0)), ..own_before },
+        _ => own_before,
     };
-    invariant!(others, "wrmsr {:#x} <- {:#x} changed another of the guest's MSRs ({:x?} from {:x?})", msr, value,
-               own, own_before);
+    let beside = matches!(k, Some(Kind::TscAux) | Some(Kind::SpecCtrl) | Some(Kind::PredCmd));
+    invariant!(*own == own_want && (!beside || bytes(save) == bytes(&before)),
+               "wrmsr {:#x} <- {:#x} made the guest's own {:x?} from {:x?}, not {:x?}, or changed its save area", msr,
+               value, own, own_before, own_want);
     let read = policy::rdmsr(save, own, msr);
     let back = match k {
-        Some(Kind::Own(_)) | Some(Kind::TscAux) => Some(value),
+        Some(Kind::Own(_)) | Some(Kind::TscAux) | Some(Kind::SpecCtrl) => Some(value),
+        Some(Kind::PredCmd) => None,
         Some(Kind::Efer) => Some((value & !EFER_LMA) | (efer_before & EFER_LMA)),
         _ => read,
     };
@@ -568,6 +646,8 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
             Some(Kind::ArchCapabilities) => cpu::arch_capabilities().unwrap_or(0),
             Some(Kind::Efer) => r.pick(&[EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE, EFER_LME, EFER_SCE | EFER_NXE]),
             Some(Kind::TscAux) => u64::from(r.u32()),
+            Some(Kind::SpecCtrl) => promised().0 & r.u64(),
+            Some(Kind::PredCmd) => r.pick(&[1, 0, 1 << 7, 0x81]),
             _ => r.value64(),
         },
         1 => if r.bool() { 0x0007_0406_0007_0406 } else { r.u64() & 0x0707_0707_0707_0707 },

@@ -758,7 +758,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
         .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME,
-                TSCAUX_NAME]
+                TSCAUX_NAME, SPEC_NAME]
             .into_iter())
 }
 
@@ -802,6 +802,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == TSCAUX_NAME {
         return Some(run_tscaux(machine, out));
+    }
+    if name == SPEC_NAME {
+        return Some(run_spec_guest(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -3535,6 +3538,431 @@ fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, St
                       if runs.invpcid { "ran types 0 to 3, 4 a #GP" } else { "was a #UD" }))
 }
 
+/* ---- spec: a guest's speculation controls its own ---- */
+
+const SPEC_NAME: &str = "spec";
+const SPEC_ABOUT: &str = "two VMs on one CPU, one after the other: each reads what its CPUID offers of the speculation \
+                          controls, reads IA32_SPEC_CTRL as it starts, writes every control offered into it and reads \
+                          it back, has bit 62 refused, asks for three IBPBs by IA32_PRED_CMD, and has a read of that \
+                          and its bit 1 refused -- SPEC_CTRL its own, made the CPU's over the host's for its run and \
+                          the host's alone again after, and each IBPB done before its next entry";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #UD
+ * and #GP handlers note the vector and go on past the step that faulted --
+ * the address each step leaves at +0xF0, as the tscaux guest's do. It reads
+ * leaf 7's last subleaf and EDX, subleaf 2's EDX, 0x8000_0008's EBX and
+ * 0x8000_0021's EAX; then IA32_SPEC_CTRL; writes the host's word at +0x100
+ * into it -- every control its CPUID offers -- and reads it back; writes it
+ * with bit 62 set as well and reads it again; writes IA32_PRED_CMD's IBPB
+ * three times, reads PRED_CMD, and writes its bit 1; leaves its mark and
+ * halts. Each step's value, and the vector it faulted with or 0, a quadword
+ * each from `RESULTS` on. Assembled from this source with clang, the
+ * offsets in the comments its listing's. */
+const SPEC_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xDC, 0x01, 0x00, 0x00,               // 00: start: lea rax, [rip + ud] ; gate 6, #UD
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA060
+    0xE8, 0xFE, 0x01, 0x00, 0x00,                           // 0c: call gate
+    0x48, 0x8D, 0x05, 0xD8, 0x01, 0x00, 0x00,               // 11: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 18: mov edi, 0xA0D0
+    0xE8, 0xED, 0x01, 0x00, 0x00,                           // 1d: call gate
+    0x0F, 0x01, 0x1D, 0x0C, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
+    0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 29: mov r13d, 0x7000 ; its results
+    0x4D, 0x8B, 0xA5, 0x00, 0x01, 0x00, 0x00,               // 2f: mov r12, qword [r13 + 0x100] ; its SPEC_CTRL
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 36: mov eax, 7 ; what its CPUID offers
+    0x31, 0xC9,                                             // 3b: xor ecx, ecx
+    0x0F, 0xA2,                                             // 3d: cpuid
+    0x41, 0x89, 0x85, 0xC8, 0x00, 0x00, 0x00,               // 3f: mov dword [r13 + 0xC8], eax ; leaf 7's last subleaf
+    0x41, 0x89, 0x95, 0xCC, 0x00, 0x00, 0x00,               // 46: mov dword [r13 + 0xCC], edx ; IBRS and IBPB, STIBP, SSBD
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 4d: mov eax, 7
+    0xB9, 0x02, 0x00, 0x00, 0x00,                           // 52: mov ecx, 2
+    0x0F, 0xA2,                                             // 57: cpuid
+    0x41, 0x89, 0x95, 0xD0, 0x00, 0x00, 0x00,               // 59: mov dword [r13 + 0xD0], edx ; PSFD, IPRED, RRSBA, DDPD_U, BHI
+    0xB8, 0x08, 0x00, 0x00, 0x80,                           // 60: mov eax, 0x80000008
+    0x31, 0xC9,                                             // 65: xor ecx, ecx
+    0x0F, 0xA2,                                             // 67: cpuid
+    0x41, 0x89, 0x9D, 0xD4, 0x00, 0x00, 0x00,               // 69: mov dword [r13 + 0xD4], ebx ; AMD's IBPB, IBRS, STIBP, SSBD, PSFD
+    0xB8, 0x21, 0x00, 0x00, 0x80,                           // 70: mov eax, 0x80000021
+    0x31, 0xC9,                                             // 75: xor ecx, ecx
+    0x0F, 0xA2,                                             // 77: cpuid
+    0x41, 0x89, 0x85, 0xD8, 0x00, 0x00, 0x00,               // 79: mov dword [r13 + 0xD8], eax ; SBPB
+    0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00,               // 80: lea rax, [rip + .L1] ; 1: SPEC_CTRL as it starts
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 87: mov qword [r13 + 0xF0], rax
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // 8e: mov ecx, 0x48
+    0x0F, 0x32,                                             // 93: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // 95: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 99: or rax, rdx
+    0x49, 0x89, 0x45, 0x00,                                 // 9c: mov qword [r13 + 0x00], rax
+    0x49, 0x8D, 0x7D, 0x08,                                 // a0: .1: lea rdi, [r13 + 0x08]
+    0xE8, 0x24, 0x01, 0x00, 0x00,                           // a4: call took
+    0x48, 0x8D, 0x05, 0x18, 0x00, 0x00, 0x00,               // a9: lea rax, [rip + .L2] ; 2: its own into it
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // b0: mov qword [r13 + 0xF0], rax
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // b7: mov ecx, 0x48
+    0x44, 0x89, 0xE0,                                       // bc: mov eax, r12d
+    0x4C, 0x89, 0xE2,                                       // bf: mov rdx, r12
+    0x48, 0xC1, 0xEA, 0x20,                                 // c2: shr rdx, 32
+    0x0F, 0x30,                                             // c6: wrmsr
+    0x49, 0x8D, 0x7D, 0x10,                                 // c8: .2: lea rdi, [r13 + 0x10]
+    0xE8, 0xFC, 0x00, 0x00, 0x00,                           // cc: call took
+    0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00,               // d1: lea rax, [rip + .L3] ; 3: and back
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // d8: mov qword [r13 + 0xF0], rax
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // df: mov ecx, 0x48
+    0x0F, 0x32,                                             // e4: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // e6: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // ea: or rax, rdx
+    0x49, 0x89, 0x45, 0x18,                                 // ed: mov qword [r13 + 0x18], rax
+    0x49, 0x8D, 0x7D, 0x20,                                 // f1: .3: lea rdi, [r13 + 0x20]
+    0xE8, 0xD3, 0x00, 0x00, 0x00,                           // f5: call took
+    0x48, 0x8D, 0x05, 0x16, 0x00, 0x00, 0x00,               // fa: lea rax, [rip + .L4] ; 4: bit 62 too: a #GP
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 101: mov qword [r13 + 0xF0], rax
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // 108: mov ecx, 0x48
+    0x44, 0x89, 0xE0,                                       // 10d: mov eax, r12d
+    0xBA, 0x00, 0x00, 0x00, 0x40,                           // 110: mov edx, 0x40000000
+    0x0F, 0x30,                                             // 115: wrmsr
+    0x49, 0x8D, 0x7D, 0x28,                                 // 117: .4: lea rdi, [r13 + 0x28]
+    0xE8, 0xAD, 0x00, 0x00, 0x00,                           // 11b: call took
+    0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00,               // 120: lea rax, [rip + .L5] ; 5: as it was
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 127: mov qword [r13 + 0xF0], rax
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // 12e: mov ecx, 0x48
+    0x0F, 0x32,                                             // 133: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // 135: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 139: or rax, rdx
+    0x49, 0x89, 0x45, 0x30,                                 // 13c: mov qword [r13 + 0x30], rax
+    0x49, 0x8D, 0x7D, 0x38,                                 // 140: .5: lea rdi, [r13 + 0x38]
+    0xE8, 0x84, 0x00, 0x00, 0x00,                           // 144: call took
+    0x31, 0xDB,                                             // 149: xor ebx, ebx ; 6: three IBPBs
+    0x49, 0x8D, 0x7D, 0x40,                                 // 14b: lea rdi, [r13 + 0x40]
+    0x48, 0x8D, 0x05, 0x15, 0x00, 0x00, 0x00,               // 14f: .ibpb: lea rax, [rip + .Lasked]
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 156: mov qword [r13 + 0xF0], rax
+    0xB9, 0x49, 0x00, 0x00, 0x00,                           // 15d: mov ecx, 0x49
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // 162: mov eax, 1
+    0x31, 0xD2,                                             // 167: xor edx, edx
+    0x0F, 0x30,                                             // 169: wrmsr
+    0xE8, 0x5D, 0x00, 0x00, 0x00,                           // 16b: .asked: call took
+    0x48, 0x83, 0xC7, 0x08,                                 // 170: add rdi, 8
+    0xFF, 0xC3,                                             // 174: inc ebx
+    0x83, 0xFB, 0x03,                                       // 176: cmp ebx, 3
+    0x72, 0xD4,                                             // 179: jb .Libpb
+    0x48, 0x8D, 0x05, 0x0E, 0x00, 0x00, 0x00,               // 17b: lea rax, [rip + .L7] ; 7: PRED_CMD read: a #GP
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 182: mov qword [r13 + 0xF0], rax
+    0xB9, 0x49, 0x00, 0x00, 0x00,                           // 189: mov ecx, 0x49
+    0x0F, 0x32,                                             // 18e: rdmsr
+    0x49, 0x8D, 0x7D, 0x58,                                 // 190: .7: lea rdi, [r13 + 0x58]
+    0xE8, 0x34, 0x00, 0x00, 0x00,                           // 194: call took
+    0x48, 0x8D, 0x05, 0x15, 0x00, 0x00, 0x00,               // 199: lea rax, [rip + .L8] ; 8: its bit 1: a #GP
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 1a0: mov qword [r13 + 0xF0], rax
+    0xB9, 0x49, 0x00, 0x00, 0x00,                           // 1a7: mov ecx, 0x49
+    0xB8, 0x02, 0x00, 0x00, 0x00,                           // 1ac: mov eax, 2
+    0x31, 0xD2,                                             // 1b1: xor edx, edx
+    0x0F, 0x30,                                             // 1b3: wrmsr
+    0x49, 0x8D, 0x7D, 0x60,                                 // 1b5: .8: lea rdi, [r13 + 0x60]
+    0xE8, 0x0F, 0x00, 0x00, 0x00,                           // 1b9: call took
+    0x41, 0xC7, 0x85, 0xC0, 0x00, 0x00, 0x00, 0x53,         // 1be: mov dword [r13 + 0xC0], 0x43455053 ; 'SPEC'
+    0x50, 0x45, 0x43,
+    0xFA,                                                   // 1c9: cli
+    0xF4,                                                   // 1ca: .dead: hlt
+    0xEB, 0xFD,                                             // 1cb: jmp .Ldead
+    0x49, 0x8B, 0x85, 0xF8, 0x00, 0x00, 0x00,               // 1cd: took: mov rax, qword [r13 + 0xF8] ; the step's fault, or 0
+    0x48, 0x89, 0x07,                                       // 1d4: mov qword [rdi], rax
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x00,         // 1d7: mov qword [r13 + 0xF8], 0
+    0x00, 0x00, 0x00,
+    0xC3,                                                   // 1e2: ret
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x06,         // 1e3: ud: mov qword [r13 + 0xF8], 6 ; a #UD: the step's fault,
+    0x00, 0x00, 0x00,
+    0xEB, 0x0F,                                             // 1ee: jmp recover
+    0x48, 0x83, 0xC4, 0x08,                                 // 1f0: gp: add rsp, 8 ; a #GP, its error code dropped
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x0D,         // 1f4: mov qword [r13 + 0xF8], 13
+    0x00, 0x00, 0x00,
+    0x50,                                                   // 1ff: recover: push rax
+    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 200: mov rax, qword [r13 + 0xF0] ; and on past the step
+    0x48, 0x89, 0x44, 0x24, 0x08,                           // 207: mov qword [rsp + 8], rax
+    0x58,                                                   // 20c: pop rax
+    0x48, 0xCF,                                             // 20d: iretq
+    0x66, 0x89, 0x07,                                       // 20f: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 212: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 218: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 21e: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 222: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 226: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 22a: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 22d: mov dword [rdi + 12], 0
+    0xC3,                                                   // 234: ret
+    0xDF, 0x00,                                             // 235: idtr: dw 0xDF ; gates to 13
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 237: dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`, a quadword a slot: each step's value
+ * and the vector it faulted with, 0 for none (`SG_*`); its mark at +0xC0;
+ * what its CPUID offered at +0xC8 on; and what the host gives it, at +0x100. */
+const SG_SLOTS: usize = 13;
+/// SPEC_CTRL as it starts, with its fault; the fault of its write; SPEC_CTRL
+/// read back, with its fault; the fault of the write with bit 62; SPEC_CTRL
+/// read again, with its fault.
+const SG_FIRST: usize = 0;
+const SG_WRITE: usize = 2;
+const SG_BACK: usize = 3;
+const SG_BAD_WRITE: usize = 5;
+const SG_AFTER_BAD: usize = 6;
+/// The faults of its three IBPBs, of its read of PRED_CMD, and of PRED_CMD's
+/// bit 1.
+const SG_IBPBS: usize = 8;
+const SG_IBPBS_ASKED: u64 = 3;
+const SG_PRED_READ: usize = 11;
+const SG_PRED_BAD: usize = 12;
+const SG_DONE: u64 = RESULTS + 0xC0;
+const SG_MARK: u32 = u32::from_le_bytes(*b"SPEC");
+const SG_LEAF7_EAX: u64 = RESULTS + 0xC8;
+const SG_LEAF7_EDX: u64 = RESULTS + 0xCC;
+const SG_LEAF7_2_EDX: u64 = RESULTS + 0xD0;
+const SG_EXT8_EBX: u64 = RESULTS + 0xD4;
+const SG_EXT21_EAX: u64 = RESULTS + 0xD8;
+const SG_WORD: u64 = RESULTS + 0x100;
+/// What it writes where no control of IA32_SPEC_CTRL is offered: IBRS, a #GP
+/// there.
+const SG_NONE_OFFERED: u64 = 1;
+/// IA32_PRED_CMD's IBPB, what its three writes ask for.
+const SG_PRED_IBPB: u64 = 1;
+/// Its MSR exits: SPEC_CTRL read three times and written twice, PRED_CMD
+/// written four times and read once.
+const SG_RDMSRS: u64 = 4;
+const SG_WRMSRS: u64 = 6;
+/// Its accesses of SPEC_CTRL, and those of PRED_CMD always refused: its
+/// read and its bit 1.
+const SG_SPEC_ACCESSES: u64 = 5;
+const SG_PRED_REFUSED: u64 = 2;
+const SPEC_BUDGET_MS: u64 = 10_000;
+
+/// What the guest's CPUID promised it of IA32_SPEC_CTRL and IA32_PRED_CMD,
+/// from the manuals: each control's bits, Intel's leaves and AMD's.
+fn sg_promised(l7_edx: u32, l72_edx: u32, e8_ebx: u32, e21_eax: u32) -> hvarch::x86::spec::Controls {
+    let bit = |word: u32, b: u32| word & (1 << b) != 0;
+    let has = |yes: bool, v: u64| if yes { v } else { 0 };
+    hvarch::x86::spec::Controls {
+        spec_ctrl: has(bit(l7_edx, 26) || bit(e8_ebx, 14), 1 << 0)   // IBRS
+            | has(bit(l7_edx, 27) || bit(e8_ebx, 15), 1 << 1)          // STIBP
+            | has(bit(l7_edx, 31) || bit(e8_ebx, 24), 1 << 2)          // SSBD
+            | has(bit(l72_edx, 0) || bit(e8_ebx, 28), 1 << 7)          // PSFD
+            | has(bit(l72_edx, 1), 3 << 3)                             // IPRED_DIS
+            | has(bit(l72_edx, 2), 3 << 5)                             // RRSBA_DIS
+            | has(bit(l72_edx, 3), 1 << 8)                             // DDPD_U
+            | has(bit(l72_edx, 4), 1 << 10),                           // BHI_DIS_S
+        pred_cmd: has(bit(l7_edx, 26) || bit(e8_ebx, 12), 1 << 0)    // IBPB
+            | has(bit(e21_eax, 27), 1 << 7),                           // SBPB
+    }
+}
+
+/// What one VM of the spec guest did: where it ran, what the run loop
+/// counted, how it stopped, what it left, and what its backend kept.
+struct SpecRun {
+    cpu: Option<u32>,
+    us: u64,
+    counts: Counts,
+    stopped: Stopped,
+    slots: [u64; SG_SLOTS],
+    told: hvarch::x86::spec::Controls,
+    done: u32,
+    /// The IBPBs it asked for and those answered; the IA32_SPEC_CTRL its
+    /// last entry ran under; and, after its run, the CPU's -- whether it is
+    /// the host's (`spec::held`).
+    asked: u64,
+    answered: u64,
+    ran_with: Option<u64>,
+    held: Option<bool>,
+}
+
+/// Run one VM of the spec guest, `word` what it writes into IA32_SPEC_CTRL,
+/// on the CPU this runs on.
+fn run_spec_vm(machine: &Arc<Machine>, word: u64) -> core::result::Result<SpecRun, String> {
+    let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
+    let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
+    let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
+    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let m = guest.memory();
+    one_cpu_board(m, &mut bsp, SPEC_CODE).and_then(|_| m.write_obj(SG_WORD, &word)).map_err(made)?;
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(SPEC_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    /* Asked here, on the CPU it ran on, after its last exit. */
+    let held = hvarch::x86::spec::held();
+    let (asked, answered, ran_with) = match &*bsp.backend_mut() {
+        Backend::Svm(v) => (v.msrs().ibpbs(), v.msrs().answered(), v.msrs().ran_with()),
+        Backend::Vmx(v) => (v.msrs().ibpbs(), v.msrs().answered(), v.msrs().ran_with()),
+    };
+    drop(bsp);
+    let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    let cpu = guest.cpu_states().first().and_then(|&(_, h)| h);
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    let mut slots = [0u64; SG_SLOTS];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = m.read_obj::<u64>(RESULTS + i as u64 * 8).map_err(unread)?;
+    }
+    let dword = |at: u64| m.read_obj::<u32>(at).map_err(unread);
+    let told = sg_promised(dword(SG_LEAF7_EDX)?, dword(SG_LEAF7_2_EDX)?, dword(SG_EXT8_EBX)?, dword(SG_EXT21_EAX)?);
+    let _ = dword(SG_LEAF7_EAX)?;
+    Ok(SpecRun { cpu, us, counts, stopped, slots, told, done: dword(SG_DONE)?, asked, answered, ran_with, held })
+}
+
+/// Run the spec guest: two VMs of one CPU each, one after the other on the
+/// CPU this runs on, through the run loop a Linux guest's go through.
+#[inline(never)]
+fn run_spec_guest(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", SPEC_NAME, SPEC_ABOUT);
+    let controls = hvarch::x86::spec::guest_controls();
+    let word = if controls.spec_ctrl != 0 { controls.spec_ctrl } else { SG_NONE_OFFERED };
+    let mut runs = alloc::vec::Vec::new();
+    for _ in 0..2 {
+        match run_spec_vm(machine, word) {
+            Ok(run) => {
+                if let GuestStop::Refused(Refusal::NotOn(cpu)) = run.stopped.stop {
+                    let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first",
+                                     SPEC_NAME, cpu);
+                    return false;
+                }
+                runs.push(run);
+            }
+            Err(why) => {
+                let _ = writeln!(out, "hv: guest {} FAILED -- {}", SPEC_NAME, why);
+                return false;
+            }
+        }
+    }
+    let [a, b] = runs.as_slice() else {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {} VMs run, not two", SPEC_NAME, runs.len());
+        return false;
+    };
+    let on = |c: Option<u32>| c.map_or(String::from("no cpu"), |c| alloc::format!("cpu {}", c));
+    let _ = writeln!(out, "  ran on     {}, {} us -- vm A; vm B on {}, {} us", on(a.cpu), a.us, on(b.cpu), b.us);
+    let _ = writeln!(out, "  exits      {} and {}: {} and {} rdmsr, {} and {} wrmsr, {} and {} refused",
+                     a.counts.exits, b.counts.exits, a.counts.msr_read, b.counts.msr_read, a.counts.msr_write,
+                     b.counts.msr_write, a.counts.msr_gp, b.counts.msr_gp);
+    let _ = writeln!(out, "  controls   SPEC_CTRL {:#x}, PRED_CMD {:#x}; IBPBs asked {} and {}, answered {} and {}",
+                     controls.spec_ctrl, controls.pred_cmd, a.asked, b.asked, a.answered, b.answered);
+    let (mut says_a, mut says_b) = (String::new(), String::new());
+    let _ = describe_stop(&a.stopped.stop, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
+
+    match check_spec(a, b, controls, word) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", SPEC_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", SPEC_NAME, why);
+            for (name, run) in [("A", a), ("B", b)] {
+                let _ = writeln!(out, "  vm {}'s results {:x?}, ran with {:x?}", name, run.slots, run.ran_with);
+                let _ = writeln!(out, "  vm {}'s cpu {} as it stopped:", name, run.stopped.cpu);
+                let _ = out.write_str(&run.stopped.dump);
+            }
+            false
+        }
+    }
+}
+
+/// Both VMs ran on one CPU to their halt; each was told exactly the
+/// controls the host switches (`spec::guest_controls`); where SPEC_CTRL is
+/// offered, each read it as 0 as it started -- the second where the first
+/// had left its own -- read back every control it wrote, had bit 62
+/// refused with its value kept, and ran under its bits over the host's,
+/// and after its run the CPU's was the host's alone; where IBPB is offered,
+/// each asked for three, and every one was answered by a barrier before
+/// its next entry; a read of PRED_CMD and its bit 1 a #GP each, and where
+/// neither MSR is offered every access to it a #GP; and the run loop saw
+/// every RDMSR and WRMSR.
+fn check_spec(a: &SpecRun, b: &SpecRun, controls: hvarch::x86::spec::Controls, word: u64)
+    -> core::result::Result<String, String>
+{
+    let spec_ctrl = controls.spec_ctrl != 0;
+    let ibpb = controls.pred_cmd & SG_PRED_IBPB != 0;
+    let fault = |has: bool| if has { NO_FAULT } else { VECTOR_GP };
+    if a.cpu.is_none() || a.cpu != b.cpu {
+        return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU", a.cpu, b.cpu));
+    }
+    let vms = [("A", a), ("B", b)];
+    for (name, run) in vms {
+        if !matches!(run.stopped.stop, GuestStop::Halted { .. }) || run.done != SG_MARK {
+            return Err(alloc::format!("vm {} did not run to its halt: its mark is {:#x}", name, run.done));
+        }
+    }
+    for (name, run) in vms {
+        if run.told != controls {
+            return Err(alloc::format!("vm {}'s CPUID promised SPEC_CTRL {:#x} and PRED_CMD {:#x}: wanted {:#x} and \
+                                       {:#x}, what the host switches", name, run.told.spec_ctrl,
+                                      run.told.pred_cmd, controls.spec_ctrl, controls.pred_cmd));
+        }
+    }
+    /* What each was to see first -- 0 where the other had left its own --
+     * before the rest. */
+    for (name, run) in vms {
+        let s = &run.slots;
+        if s[SG_FIRST + 1] != fault(spec_ctrl) || (spec_ctrl && s[SG_FIRST] != 0) {
+            return Err(alloc::format!("vm {}'s SPEC_CTRL as it started read {:#x} with fault {}: wanted 0, fault {}",
+                                      name, s[SG_FIRST], s[SG_FIRST + 1], fault(spec_ctrl)));
+        }
+    }
+    for (name, run) in vms {
+        let s = &run.slots;
+        /* A read that does not fault reads its value back; one that faults
+         * has none to read. */
+        let read_ok = |at: usize, want: u64| {
+            s[at + 1] == fault(spec_ctrl) && (!spec_ctrl || s[at] == want)
+        };
+        if s[SG_WRITE] != fault(spec_ctrl) || !read_ok(SG_BACK, word) || s[SG_BAD_WRITE] != VECTOR_GP
+            || !read_ok(SG_AFTER_BAD, word)
+        {
+            return Err(alloc::format!("vm {}'s SPEC_CTRL: its write of {:#x} faulted with {}, read back {:#x} ({}), \
+                                       the write with bit 62 faulted with {}, read again {:#x} ({})", name, word,
+                                      s[SG_WRITE], s[SG_BACK], s[SG_BACK + 1], s[SG_BAD_WRITE], s[SG_AFTER_BAD],
+                                      s[SG_AFTER_BAD + 1]));
+        }
+    }
+    for (name, run) in vms {
+        let host = hvarch::x86::spec::host_spec_ctrl();
+        let want = host.map(|h| h | if spec_ctrl { word } else { 0 });
+        if run.ran_with != want || run.held != host.map(|_| true) {
+            return Err(alloc::format!("vm {}'s last entry ran under SPEC_CTRL {:x?} and the CPU's after it was the \
+                                       host's: {:x?} -- wanted {:x?}, the host's {:x?} with its own over it, and \
+                                       the host's alone after", name, run.ran_with, run.held, want, host));
+        }
+    }
+    for (name, run) in vms {
+        let s = &run.slots;
+        let ibpbs = &s[SG_IBPBS..SG_IBPBS + SG_IBPBS_ASKED as usize];
+        let asked = if ibpb { SG_IBPBS_ASKED } else { 0 };
+        if ibpbs.iter().any(|&f| f != fault(ibpb)) || run.asked != asked || run.answered != asked
+            || s[SG_PRED_READ] != VECTOR_GP || s[SG_PRED_BAD] != VECTOR_GP
+        {
+            return Err(alloc::format!("vm {}'s IBPBs faulted with {:?}, {} asked and {} answered, its read of \
+                                       PRED_CMD with {} and its bit 1 with {}: wanted {} each, {} asked and answered, \
+                                       and a #GP for both", name, ibpbs, run.asked, run.answered, s[SG_PRED_READ],
+                                      s[SG_PRED_BAD], fault(ibpb), asked));
+        }
+    }
+    for (name, run) in vms {
+        let c = &run.counts;
+        /* SPEC_CTRL's write with bit 62 -- or where it is not offered all
+         * five of its accesses -- PRED_CMD's read and bit 1, and its IBPBs
+         * where IBPB is not offered. */
+        let refused = if spec_ctrl { 1 } else { SG_SPEC_ACCESSES } + SG_PRED_REFUSED
+            + if ibpb { 0 } else { SG_IBPBS_ASKED };
+        if c.msr_read != SG_RDMSRS || c.msr_write != SG_WRMSRS || c.msr_gp != refused {
+            return Err(alloc::format!("vm {}'s run loop saw {} RDMSRs and {} WRMSRs and refused {}: wanted {}, {} and \
+                                       {}", name, c.msr_read, c.msr_write, c.msr_gp, SG_RDMSRS, SG_WRMSRS, refused));
+        }
+    }
+    Ok(match (spec_ctrl, ibpb) {
+        (false, false) => String::from("no speculation control offered, as the CPU has none: every access to \
+                                        SPEC_CTRL and PRED_CMD a #GP"),
+        _ => alloc::format!("SPEC_CTRL {:#x} and PRED_CMD {:#x} offered, as the host switches them; vm B read \
+                             SPEC_CTRL as 0 where vm A had left {:#x}, each read back its own and ran under it over \
+                             the host's, bit 62 refused, the CPU's the host's alone after; {} IBPBs asked each, all \
+                             answered before the next entry; PRED_CMD's read and bit 1 a #GP",
+                            controls.spec_ctrl, controls.pred_cmd, word, if ibpb { SG_IBPBS_ASKED } else { 0 }),
+    })
+}
+
 /* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */
 
 const CR4_NAME: &str = "cr4";
@@ -3829,15 +4257,17 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
 /* ---- msr: the MSRs a guest is answered, a #GP for every other ---- */
 
 const MSR_NAME: &str = "msr";
-const MSR_ABOUT: &str = "a guest's MSRs: SPEC_CTRL and PRED_CMD, which its CPUID does not offer, an MSR nobody \
-                         names and MTRRs turned on, which nothing keeps, each a #GP; the machine-check registers \
-                         and the PAT answered; and CPUID with no speculation control and no PMU in it";
+const MSR_ABOUT: &str = "a guest's MSRs: VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer, an MSR \
+                         nobody names and MTRRs turned on, which nothing keeps, each a #GP; the machine-check \
+                         registers and the PAT answered; and CPUID with no VIRT_SSBD, no INVLPGB and no PMU in it";
 
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
  * handler counts each, keeps the MSR it was refused (ECX, eight at most)
  * and its error code, and steps over the 2-byte `rdmsr` or `wrmsr` that
- * raised it. It reads SPEC_CTRL and writes an IBPB to PRED_CMD; reads AMD's
- * LS_CFG, which this policy names for no CPU; turns its MTRRs on,
+ * raised it. It reads AMD's VIRT_SPEC_CTRL and writes an L1D flush to
+ * FLUSH_CMD -- neither offered, where SPEC_CTRL and PRED_CMD may be (the
+ * `spec` guest's); reads AMD's LS_CFG, which this policy names for no CPU;
+ * turns its MTRRs on,
  * write-back; reads MCG_CAP, MCG_STATUS and the PAT; turns the MTRRs off --
  * which they are; then asks CPUID for 0x8000_0008, 0xA, 0 and 1 -- and
  * leaves its mark and halts. Assembled from this source with clang, the
@@ -3847,9 +4277,9 @@ const MSR_CODE: &[u8] = &[
     0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
     0xE8, 0xC3, 0x00, 0x00, 0x00,                           // 0c: call gate
     0x0F, 0x01, 0x1D, 0x13, 0x01, 0x00, 0x00,               // 11: lidt [rip + idtr]
-    0xB9, 0x48, 0x00, 0x00, 0x00,                           // 18: mov ecx, 0x48 ; SPEC_CTRL: #GP
+    0xB9, 0x1F, 0x01, 0x01, 0xC0,                           // 18: mov ecx, 0xC001011F ; VIRT_SPEC_CTRL: #GP
     0x0F, 0x32,                                             // 1d: rdmsr
-    0xB9, 0x49, 0x00, 0x00, 0x00,                           // 1f: mov ecx, 0x49 ; PRED_CMD, IBPB: #GP
+    0xB9, 0x0B, 0x01, 0x00, 0x00,                           // 1f: mov ecx, 0x10B ; FLUSH_CMD, L1D: #GP
     0xB8, 0x01, 0x00, 0x00, 0x00,                           // 24: mov eax, 1
     0x31, 0xD2,                                             // 29: xor edx, edx
     0x0F, 0x30,                                             // 2b: wrmsr
@@ -3935,16 +4365,15 @@ const MSR_LEAF1_ECX: u64 = RESULTS + 0x34;
 const MSR_DONE: u64 = RESULTS + 0x38;
 const MSR_REFUSALS: u64 = RESULTS + 0x40;
 const MSR_MARK: u32 = u32::from_le_bytes(*b"MSR!");
-/// The MSRs it is refused, in turn: SPEC_CTRL, PRED_CMD, LS_CFG and the
-/// MTRRs' default type, written with them on.
-const MSR_REFUSED: [u32; 4] = [0x48, 0x49, 0xC001_1020, 0x2FF];
+/// The MSRs it is refused, in turn: VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and
+/// the MTRRs' default type, written with them on.
+const MSR_REFUSED: [u32; 4] = [0xC001_011F, 0x10B, 0xC001_1020, 0x2FF];
 /// What it reads of MSRs, and writes: five and three.
 const MSR_READS: u64 = 5;
 const MSR_WRITES: u64 = 3;
-/// What a guest is not told of in 0x8000_0008's EBX: INVLPGB, IBPB, IBRS,
-/// STIBP, SSBD, VIRT_SSBD and PSFD -- each the host's to back, and none
-/// backed.
-const MSR_SPECULATION: u32 = (1 << 3) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 28);
+/// What a guest is not told of in 0x8000_0008's EBX: INVLPGB, which the
+/// VMCB does not enable, and VIRT_SSBD, whose MSR nothing answers.
+const MSR_NOT_OFFERED: u32 = (1 << 3) | (1 << 25);
 /// The highest basic leaf a guest may be told of, and leaf 1's hypervisor
 /// bit.
 const MSR_BASIC_TOP: u32 = 0x16;
@@ -4048,14 +4477,14 @@ fn check_msr(m: &GuestMemory, stopped: &Stopped, counts: &Counts, faults: &[(u32
     let pmu = m.read_obj::<u32>(MSR_PMU_EAX).map_err(unread)?;
     let top = m.read_obj::<u32>(MSR_TOP).map_err(unread)?;
     let leaf1_ecx = m.read_obj::<u32>(MSR_LEAF1_ECX).map_err(unread)?;
-    if ext8_ebx & MSR_SPECULATION != 0 || pmu != 0 || top > MSR_BASIC_TOP || leaf1_ecx & MSR_HYPERVISOR == 0 {
+    if ext8_ebx & MSR_NOT_OFFERED != 0 || pmu != 0 || top > MSR_BASIC_TOP || leaf1_ecx & MSR_HYPERVISOR == 0 {
         return Err(alloc::format!("CPUID told it 0x8000_0008 EBX {:#x}, 0xA EAX {:#x}, a top of {:#x} and leaf 1 ECX \
                                    {:#x}: wanted none of {:#x}, no PMU, no higher than {:#x} and the hypervisor bit",
-                                  ext8_ebx, pmu, top, leaf1_ecx, MSR_SPECULATION, MSR_BASIC_TOP));
+                                  ext8_ebx, pmu, top, leaf1_ecx, MSR_NOT_OFFERED, MSR_BASIC_TOP));
     }
-    Ok(String::from("SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took; MCG_CAP, \
-                     MCG_STATUS and the PAT answered; CPUID offers no speculation control and no PMU, and says a \
-                     hypervisor is there"))
+    Ok(String::from("VIRT_SPEC_CTRL, FLUSH_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took; \
+                     MCG_CAP, MCG_STATUS and the PAT answered; CPUID offers no VIRT_SSBD, no INVLPGB and no PMU, \
+                     and says a hypervisor is there"))
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table

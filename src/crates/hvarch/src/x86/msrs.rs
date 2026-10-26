@@ -14,12 +14,19 @@
 //!
 //! What a CPU held when the extension went on for it is put back when it
 //! goes off: a CPU the extension goes off for is as it booted.
+//!
+//! And what a guest CPU set of its speculation controls -- its
+//! IA32_SPEC_CTRL, which `super::spec` makes the CPU's over the host's for
+//! its run, and the IBPBs it asked for by IA32_PRED_CMD, which `super::spec`
+//! performs before its next entry on any CPU it may have trained -- by a
+//! number of its own, no other guest CPU's ever ([`GuestMsrs::id`]).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use kcore::consts::MAX_CPUS;
 
 use super::cpu;
+use super::spec;
 
 pub const MSR_TSC_AUX: u32 = 0xC000_0103;
 /// TSC_AUX's bits, the low 32: a write of any other is a #GP.
@@ -80,31 +87,101 @@ pub unsafe fn off() {
     }
 }
 
-/// A guest CPU's MSRs that the extension does not switch: its TSC_AUX, 0
-/// out of reset -- INIT leaves it.
+/// The number the next guest CPU made is given.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A guest CPU's MSRs that the extension does not switch: its TSC_AUX and
+/// its IA32_SPEC_CTRL, 0 out of reset -- INIT leaves both -- and the IBPBs
+/// it asked for.
 pub struct GuestMsrs {
     tsc_aux: u64,
+    spec_ctrl: u64,
+    /// How many IBPBs it asked for, and how many of those an IBPB was
+    /// between before an entry of its -- the last entry's count, there.
+    ibpbs: u64,
+    answered: u64,
+    /// The IA32_SPEC_CTRL its last entry ran under -- its bits over the
+    /// host's -- or None where the CPU has none, or before its first.
+    ran_with: Option<u64>,
+    id: u64,
 }
 
 impl GuestMsrs {
-    pub const fn new() -> Self {
-        Self { tsc_aux: 0 }
+    pub fn new() -> Self {
+        Self {
+            tsc_aux: 0,
+            spec_ctrl: 0,
+            ibpbs: 0,
+            answered: 0,
+            ran_with: None,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// A number no other guest CPU has had: which one a CPU last entered,
+    /// for the IBPB between two (`super::spec::State::entering`). One never
+    /// given twice, so a guest CPU dropped and another made in its memory
+    /// cannot be taken for it.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn tsc_aux(&self) -> u64 {
         self.tsc_aux
     }
 
-    /// Make `value` the guest's TSC_AUX, for a WRMSR of it the policy
-    /// performs: false, and nothing changed, for one with a bit above the
-    /// low 32, the #GP a CPU gives -- and a value an entry's write of the MSR
+    /// The guest's IA32_SPEC_CTRL: the bits it set.
+    pub fn spec_ctrl(&self) -> u64 {
+        self.spec_ctrl
+    }
+
+    /// How many IBPBs it asked for.
+    pub fn ibpbs(&self) -> u64 {
+        self.ibpbs
+    }
+
+    /// How many of those an IBPB was between before an entry of its, on the
+    /// CPU it entered: all of them, once it has run again.
+    pub fn answered(&self) -> u64 {
+        self.answered
+    }
+
+    /// Make `tsc_aux` and `spec_ctrl` the guest's TSC_AUX and IA32_SPEC_CTRL,
+    /// and where `ibpb`, ask for an IBPB -- done before its next entry on any
+    /// CPU it may have trained (`spec::State::entering`) -- for a WRMSR the
+    /// policy performed. False, and nothing changed, where any of it is what
+    /// a CPU refuses: TSC_AUX with a bit above its 32, SPEC_CTRL with a bit
+    /// the CPU has no control of (`spec::guest_controls`), an IBPB where it
+    /// has none -- the #GP a CPU gives, and each a value an entry's write
     /// would fault on in the host.
-    pub fn set_tsc_aux(&mut self, value: u64) -> bool {
-        if value & !TSC_AUX_BITS != 0 {
+    pub fn set(&mut self, tsc_aux: u64, spec_ctrl: u64, ibpb: bool) -> bool {
+        let controls = spec::guest_controls();
+        if tsc_aux & !TSC_AUX_BITS != 0 || spec_ctrl & !controls.spec_ctrl != 0 || (ibpb && controls.pred_cmd == 0) {
             return false;
         }
-        self.tsc_aux = value;
+        self.tsc_aux = tsc_aux;
+        self.spec_ctrl = spec_ctrl;
+        if ibpb {
+            self.ibpbs = self.ibpbs.wrapping_add(1);
+        }
         true
+    }
+
+    /// An entry of its had a barrier before it (`spec::State::entering`):
+    /// every IBPB it asked for so far is answered.
+    pub(super) fn barrier(&mut self) {
+        self.answered = self.ibpbs;
+    }
+
+    /// The IA32_SPEC_CTRL its last entry ran under: for a check, which
+    /// cannot ask the CPU while the guest runs.
+    pub fn ran_with(&self) -> Option<u64> {
+        self.ran_with
+    }
+
+    /// Its entry ran under `value` (`spec::State::load_guest`, or its VMCB's).
+    pub(super) fn ran(&mut self, value: Option<u64>) {
+        self.ran_with = value;
     }
 
     /// Put the guest's TSC_AUX into CPU `cpu` before its entry, unless the
@@ -117,8 +194,8 @@ impl GuestMsrs {
         let Some(loaded) = LOADED.get(cpu as usize) else { return };
         let now = loaded.load(Ordering::Relaxed);
         if now != ABSENT && now != self.tsc_aux {
-            /* The MSR is there (`on` read it), and `set_tsc_aux` took only
-             * values of its bits. */
+            /* The MSR is there (`on` read it), and `set` took only values of
+             * its bits. */
             unsafe { cpu::wrmsr(MSR_TSC_AUX, self.tsc_aux) };
             loaded.store(self.tsc_aux, Ordering::Relaxed);
         }
