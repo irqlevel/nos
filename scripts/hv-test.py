@@ -242,10 +242,11 @@ GUESTS = {
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
     # The host performs every access, 11 of them, or on QEMU's TCG -- which
-    # stops no read of CR4 -- the 5 writes; and refuses PKE, PAE cleared and
+    # stops no read of CR4 -- the 5 writes; and refuses a bit its CPUID does
+    # not offer -- PKE where it has no PKU, CET where it has -- PAE cleared and
     # bit 32. A CPU may refuse the last two itself, before its intercept, as
     # the AX41's Zen 2 does under KVM: then 9 and 1, and the guest says so.
-    "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
+    "cr4": [r"while the CPU's CR4 kept MCE; (?:PKE|CET), PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:(?:11|5) of CR4 performed, 3 refused|9 of CR4 performed, 1 refused\b.*\n(?:.*\n)*.*"
             r"2 of them the CPU's own, before its intercept)"],
@@ -295,6 +296,13 @@ GUESTS = {
     # RDPID and RDMSR, each where its CPUID offers it and a #UD where not.
     # Which are offered is `hv info`'s to say, and checked against it below
     # (`check_offers`); INVPCID is on neither QEMU's TCG nor a Zen 2.
+    # Two CPUs taking turns on the CPU the guests run on, by IPI, as avx's
+    # do: where PKU is offered -- as `hv info` says, checked below
+    # (`check_pkru`) -- each has to find PKRU 0 as it starts and its own at
+    # every turn, whatever its XCR0 says of PKRU; RDPKRU a #UD before PKE.
+    "pkru": [r"(?:PKU offered, OSPKE with CR4.PKE, XCR0 0x203 and 1, PKRU's component of 8 bytes at \d+; PKRU 0 "
+             r"at each CPU's start, and its own at all 64 of its turns, put back \d+ and \d+ times"
+             r"|no PKU offered, as this CPU switches no PKRU: RDPKRU a #UD; all 64 turns each taken)"],
     "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said; vm B read TSC_AUX as 0 where "
                r"vm A had left its own, each read back the value it wrote -- bit 32 refused -- and INVPCID "
                r"(?:ran types 0 to 3, 4 a #GP|was a #UD)",
@@ -320,7 +328,7 @@ GUESTS_VMX = {
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
     "cr4": [r"it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- while the CPU's CR4 "
             r"kept MCE",
-            r"PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+            r"(?:PKE|CET) and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
             r"\b3 of CR4 performed, 2 refused"],
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
@@ -649,7 +657,7 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         if name in ("smp", "posted"):
             # Its first CPU there, its second on another CPU of its own.
             good = good and re.search(r"ran on\s+cpu %d and (?!%d,)\d+," % (cpu, cpu), report) is not None
-        elif name == "avx":
+        elif name in ("avx", "pkru"):
             # Both its CPUs there.
             good = good and re.search(r"ran on\s+cpu %d and cpu %d," % (cpu, cpu), report) is not None
         elif name != "refused":
@@ -668,6 +676,16 @@ def check_offers(info, text, cpu):
     pt.check("  tscaux on cpu %d offered RDTSCP, RDPID and INVPCID as hv info says they run (%s)"
              % (cpu, ", ".join(str(s) for s in said)),
              m is not None and list(m.groups()) == said, report or text)
+
+
+def check_pkru(info, text, cpu):
+    """The pkru guest was offered PKU exactly where `hv info` says a guest's
+    PKRU is switched."""
+    pku = re.search(r"PKU in a guest\s+yes", info) is not None
+    report = guest_report(text, "pkru")
+    offered = "PKU offered, OSPKE" in report
+    pt.check("  pkru on cpu %d offered PKU %s, as hv info says" % (cpu, "yes" if pku else "no"),
+             offered == pku and ("no PKU offered" in report) != pku, report or text)
 
 
 def check_controls(info, text, cpu):
@@ -734,6 +752,8 @@ def x86_checks(ran, script, digest, grown, raw):
     check_offers(info, out[13], CPUS - 1)
     check_controls(info, out[12], 0)
     check_controls(info, out[13], CPUS - 1)
+    check_pkru(info, out[12], 0)
+    check_pkru(info, out[13], CPUS - 1)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after

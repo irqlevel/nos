@@ -109,6 +109,11 @@ const LEAF7_EBX_AVX: u32 = 1 << 5;
 const LEAF7_ECX_AVX: u32 = (1 << 9) | (1 << 10);
 const LEAF7_EBX_INVPCID: u32 = 1 << 10;
 const LEAF7_ECX_RDPID: u32 = 1 << 22;
+/* And where PKRU is switched, PKU, and OSPKE as the asking CPU's CR4.PKE
+ * has it. */
+const LEAF7_ECX_PKU: u32 = 1 << 3;
+const LEAF7_ECX_OSPKE: u32 = 1 << 4;
+const CR4_PKE: u64 = 1 << 22;
 /* Subleaf 1, the last answered (subleaf 0's EAX no more than 1): in EAX the
  * fast string facts -- zero-length MOVSB, short STOSB, short CMPSB and SCASB
  * -- and where AVX's state is offered the VEX-coded SHA512, SM3, SM4,
@@ -154,7 +159,34 @@ fn host(leaf: u32, sub: u32) -> Option<[u32; 4]> {
 /// The XSAVE area's size for `components`: the legacy region and the
 /// header, and AVX's past them.
 fn xsave_size(components: u64) -> u32 {
-    if components & fp::XCR0_AVX != 0 { XSAVE_AVX_OFFSET + XSAVE_AVX_SIZE } else { XSAVE_LEGACY }
+    let avx = if components & fp::XCR0_AVX != 0 { XSAVE_AVX_OFFSET + XSAVE_AVX_SIZE } else { XSAVE_LEGACY };
+    match pkru() {
+        /* The standard format: PKRU's component at its own offset. */
+        Some((size, offset, _)) if components & fp::XCR0_PKRU != 0 => avx.max(offset + size),
+        _ => avx,
+    }
+}
+
+/// The compacted area's size for `components`: each after the last, PKRU's
+/// at a multiple of 64 where its subleaf's ECX bit 1 says so.
+fn xsave_compacted_size(components: u64) -> u32 {
+    let avx = if components & fp::XCR0_AVX != 0 { XSAVE_AVX_OFFSET + XSAVE_AVX_SIZE } else { XSAVE_LEGACY };
+    match pkru() {
+        Some((size, _, aligned)) if components & fp::XCR0_PKRU != 0 => {
+            (if aligned { avx.next_multiple_of(64) } else { avx }) + size
+        }
+        _ => avx,
+    }
+}
+
+/// PKRU's component as the host's leaf 0xD subleaf 9 gives it, where it is
+/// offered: its size, its offset, and its alignment in the compacted format.
+fn pkru() -> Option<(u32, u32, bool)> {
+    if fp::offered() & fp::XCR0_PKRU == 0 {
+        return None;
+    }
+    let h = host(0xD, 9)?;
+    Some((h[EAX], h[EBX], h[ECX] & 0b10 != 0))
 }
 
 /// What the guest is told of the tops of the two ranges: no higher than
@@ -233,8 +265,12 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
             want(g[0] == h[0].min(LEAF7_LAST), "EAX: the host's last subleaf, no further than 2");
             want(leaked(g[1], h[1], LEAF7_EBX | avx_ebx | bit(runs.invpcid, LEAF7_EBX_INVPCID), 0) == 0,
                  "EBX within the model's");
-            want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx | bit(runs.rdpid, LEAF7_ECX_RDPID), 0) == 0,
+            let pku = bit(offered & fp::XCR0_PKRU != 0, LEAF7_ECX_PKU);
+            let ospke = bit(pku != 0 && asker.cr4 & CR4_PKE != 0, LEAF7_ECX_OSPKE);
+            want(leaked(g[2], h[2], LEAF7_ECX | avx_ecx | bit(runs.rdpid, LEAF7_ECX_RDPID), pku | ospke) == 0,
                  "ECX within the model's");
+            want(g[2] & (LEAF7_ECX_PKU | LEAF7_ECX_OSPKE) == pku | ospke,
+                 "PKU where PKRU is switched, and OSPKE with it as the asking CPU's CR4.PKE has it");
             want(leaked(g[3], h[3], LEAF7_EDX | LEAF7_EDX_SPEC, 0) == 0, "EDX within the model's");
         }
         7 if sub == 2 && host(7, 0).map_or(0, |h0| h0[0]) >= 2 => {
@@ -254,13 +290,18 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
                 0 => want(g == [offered as u32, xsave_size(on), xsave_size(offered), (offered >> 32) as u32],
                           "the components offered, the area's size for those XCR0 has on and for all"),
                 1 => {
-                    let compacted = if g[0] & LEAF_D1_EAX_XSAVEC != 0 { xsave_size(on) } else { 0 };
+                    let compacted = if g[0] & LEAF_D1_EAX_XSAVEC != 0 { xsave_compacted_size(on) } else { 0 };
                     want(g[0] == h[0] & LEAF_D1_EAX && g[1] == compacted && g[2] == 0 && g[3] == 0,
                          "XSAVEOPT, XSAVEC, XGETBV's ECX 1 as the host has them, with XSAVEC the compacted size, \
                           and no supervisor state");
                 }
                 2 if avx => want(g == [XSAVE_AVX_SIZE, XSAVE_AVX_OFFSET, 0, 0], "AVX's component, at 576"),
-                _ => want(g == [0; 4], "nothing: no component past AVX's"),
+                9 if pkru().is_some() => {
+                    let (size, offset, aligned) = pkru().unwrap_or((0, 0, false));
+                    want(g == [size, offset, if aligned { 0b10 } else { 0 }, 0] && size == 8 && offset >= 832,
+                         "PKRU's component, as the host has it: 8 bytes, past AVX's");
+                }
+                _ => want(g == [0; 4], "nothing: no component past AVX's but PKRU's"),
             }
         }
         0x15 if apic => want(g == [0; 4] || (g[0] == 1_000_000 && g[1] != 0 && g[2] == 1_000_000_000 && g[3] == 0),
@@ -672,7 +713,9 @@ pub fn policy_target(r: &mut Input) {
     /* The asking CPU's CR4 -- OSXSAVE on or off, among anything -- and its
      * XCR0: one an XSETBV could have made it, of the components offered,
      * or out of reset. */
-    let xcr0 = fp::XCR0_X87 | (r.pick(&[0, fp::XCR0_SSE, fp::XCR0_SSE | fp::XCR0_AVX]) & fp::offered());
+    let xcr0 = fp::XCR0_X87
+        | (r.pick(&[0, fp::XCR0_SSE, fp::XCR0_SSE | fp::XCR0_AVX, fp::XCR0_PKRU,
+                    fp::XCR0_SSE | fp::XCR0_AVX | fp::XCR0_PKRU]) & fp::offered());
     let asker = Asker { apic_id: r.below(16) as u32, apic: r.bool(), cr4: r.value64(), xcr0 };
     let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {

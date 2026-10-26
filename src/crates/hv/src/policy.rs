@@ -173,14 +173,14 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
  * bases the VMCS and the VMCB keep -- and facts of the silicon; GFNI, whose
  * SSE forms are on the XMM registers and VEX forms on the YMM; where AVX's
  * state is switched, the AVX line (`LEAF7_EBX_AVX`); where they run in a
- * guest, INVPCID and RDPID (`hvarch::x86::offers`); and the speculation
- * controls, whose MSRs are the guest's own (`LEAF7_EDX_SPEC`). Its EAX is
- * the last subleaf answered, the host's or 2 (`LEAF7_LAST_SUBLEAF`). Among
- * what is cleared: AVX-512 and AMX (state past AVX's, which nothing
- * switches), HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET,
- * WAITPKG, TSC_ADJUST, LA57, the hybrid flag, and L1D_FLUSH, whose flush
- * would have to run on the CPU the guest's data was in, before its task
- * could move. */
+ * guest, INVPCID and RDPID (`hvarch::x86::offers`); where PKRU is switched,
+ * PKU and OSPKE (`LEAF7_ECX_PKU`); and the speculation controls, whose MSRs
+ * are the guest's own (`LEAF7_EDX_SPEC`). Its EAX is the last subleaf
+ * answered, the host's or 2 (`LEAF7_LAST_SUBLEAF`). Among what is cleared:
+ * AVX-512 and AMX (state past AVX's, which nothing switches), HLE and RTM,
+ * MPX, PT, SGX, CET, WAITPKG, TSC_ADJUST, LA57, the hybrid flag, and
+ * L1D_FLUSH, whose flush would have to run on the CPU the guest's data was
+ * in, before its task could move. */
 const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 3)   // BMI1
     | (1 << 6)   // the x87 data pointer kept at exceptions only
@@ -207,6 +207,13 @@ const LEAF7_ECX_AVX: u32 = (1 << 9)   // VAES
  * where it runs in a guest. */
 const LEAF7_EBX_INVPCID: u32 = 1 << 10;
 const LEAF7_ECX_RDPID: u32 = 1 << 22;
+/* Leaf 7, subleaf 0, ECX: PKU where PKRU is switched for a guest
+ * (`fp::offered`), and OSPKE with it as the guest's own CR4.PKE has it, as
+ * a CPU's mirrors its CR4 -- not as the host's, which has PKE set while the
+ * extension is on. */
+const LEAF7_ECX_PKU: u32 = 1 << 3;
+const LEAF7_ECX_OSPKE: u32 = 1 << 4;
+const CR4_PKE: u64 = 1 << 22;
 /// The last subleaf of leaf 7 answered: 2, or the host's where that is less.
 const LEAF7_LAST_SUBLEAF: u32 = SUBLEAF_7_2;
 const SUBLEAF_7_1: u32 = 1;
@@ -246,6 +253,11 @@ const LEAF_D1_EAX_XSAVEC: u32 = 1 << 1;
 const XSAVE_LEGACY_BYTES: u32 = 576;
 const XSAVE_AVX_BYTES: u32 = 256;
 const SUBLEAF_AVX: u32 = 2;
+/// PKRU's subleaf; a component's ECX bit 1, its compacted offset a multiple
+/// of 64.
+const SUBLEAF_PKRU: u32 = 9;
+const LEAF_D_ECX_ALIGNED: u32 = 1 << 1;
+const XSAVE_ALIGNMENT: u32 = 64;
 /* In EDX: fast short REP MOVSB; MD_CLEAR -- VERW clears the CPU's buffers,
  * which it does in a guest as anywhere, and which a guest's kernel needs to
  * know to use it; SERIALIZE; and ARCH_CAPABILITIES, which the guest reads
@@ -457,10 +469,12 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
             let invpcid = if runs.invpcid { LEAF7_EBX_INVPCID } else { 0 };
             let rdpid = if runs.rdpid { LEAF7_ECX_RDPID } else { 0 };
+            let pku = if fp::offered() & fp::XCR0_PKRU != 0 { LEAF7_ECX_PKU } else { 0 };
+            let ospke = if pku != 0 && asker.cr4 & CR4_PKE != 0 { LEAF7_ECX_OSPKE } else { 0 };
             Cpuid {
                 eax: eax.min(LEAF7_LAST_SUBLEAF),
                 ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx | invpcid),
-                ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx | rdpid),
+                ecx: (ecx & (LEAF7_ECX_KEEP | avx_ecx | rdpid | pku)) | ospke,
                 edx: edx & (LEAF7_EDX_KEEP | speculation(LEAF7_EDX_SPEC)),
             }
         }
@@ -532,10 +546,43 @@ fn leaf1_xsave(host_ecx: u32, cr4: u64) -> u32 {
     LEAF1_ECX_XSAVE | osxsave | avx
 }
 
-/// The size of XSAVE's area for `components`, of those offered, in either
-/// format: the legacy region and the header, and AVX's after them.
+/// PKRU's component as the host's CPUID gives it, where it is offered: its
+/// size, its offset in the standard format -- past AVX's, as `fp` holds it
+/// to -- and whether the compacted format puts it at a multiple of 64.
+fn pkru_component() -> Option<(u32, u32, bool)> {
+    if fp::offered() & fp::XCR0_PKRU == 0 {
+        return None;
+    }
+    let c = cpu::cpuid_count(LEAF_XSAVE, SUBLEAF_PKRU)?;
+    Some((c.eax, c.ebx, c.ecx & LEAF_D_ECX_ALIGNED != 0))
+}
+
+/// The size of XSAVE's standard area for `components`, of those offered:
+/// the end of the last of them -- the legacy region and the header, AVX's
+/// after them, PKRU's at its own offset.
 fn xsave_bytes(components: u64) -> u32 {
-    XSAVE_LEGACY_BYTES + if components & fp::XCR0_AVX != 0 { XSAVE_AVX_BYTES } else { 0 }
+    let mut end = XSAVE_LEGACY_BYTES + if components & fp::XCR0_AVX != 0 { XSAVE_AVX_BYTES } else { 0 };
+    if components & fp::XCR0_PKRU != 0 {
+        if let Some((size, offset, _)) = pkru_component() {
+            end = end.max(offset.saturating_add(size));
+        }
+    }
+    end
+}
+
+/// The size of XSAVE's compacted area for `components`: each after the
+/// last, in order -- AVX's wanting no alignment, PKRU's where CPUID says.
+fn xsave_compacted_bytes(components: u64) -> u32 {
+    let mut end = XSAVE_LEGACY_BYTES + if components & fp::XCR0_AVX != 0 { XSAVE_AVX_BYTES } else { 0 };
+    if components & fp::XCR0_PKRU != 0 {
+        if let Some((size, _, aligned)) = pkru_component() {
+            if aligned {
+                end = end.next_multiple_of(XSAVE_ALIGNMENT);
+            }
+            end = end.saturating_add(size);
+        }
+    }
+    end
 }
 
 /// Leaf 0xD, subleaf `sub`, for a guest whose XCR0 is `xcr0`, the host's
@@ -544,8 +591,9 @@ fn xsave_bytes(components: u64) -> u32 {
 /// XCR0 has on and for all of them. Subleaf 1: the XSAVE line kept of the
 /// host's, and -- with XSAVEC -- the compacted area's size for its XCR0, as
 /// a CPU gives it (with no supervisor components, IA32_XSS being none of
-/// the guest's). Subleaf 2: AVX's component, its size and its offset. Every
-/// other subleaf is blank: no component past AVX's is offered.
+/// the guest's). Subleaf 2: AVX's component, its size and its offset;
+/// subleaf 9 PKRU's, as the host's CPUID has it. Every other subleaf is
+/// blank: no other component is offered.
 fn xsave_leaf(sub: u32, host_eax: u32, xcr0: u64) -> Cpuid {
     let offered = fp::offered();
     if offered == 0 {
@@ -561,12 +609,18 @@ fn xsave_leaf(sub: u32, host_eax: u32, xcr0: u64) -> Cpuid {
         },
         1 => {
             let eax = host_eax & LEAF_D1_EAX_KEEP;
-            let ebx = if eax & LEAF_D1_EAX_XSAVEC != 0 { xsave_bytes(on) } else { 0 };
+            let ebx = if eax & LEAF_D1_EAX_XSAVEC != 0 { xsave_compacted_bytes(on) } else { 0 };
             Cpuid { eax, ebx, ecx: 0, edx: 0 }
         }
         SUBLEAF_AVX if offered & fp::XCR0_AVX != 0 => {
             Cpuid { eax: XSAVE_AVX_BYTES, ebx: XSAVE_LEGACY_BYTES, ecx: 0, edx: 0 }
         }
+        SUBLEAF_PKRU => match pkru_component() {
+            Some((size, offset, aligned)) => {
+                Cpuid { eax: size, ebx: offset, ecx: if aligned { LEAF_D_ECX_ALIGNED } else { 0 }, edx: 0 }
+            }
+            None => NONE,
+        },
         _ => NONE,
     }
 }
@@ -631,12 +685,12 @@ const CR4_PCE: u64 = 1 << 8;
 /// The CR4 bits a guest may set: those whose feature the CPUID it is told
 /// offers (`cpuid`), and PCE. Any other is the #GP a CPU without the
 /// feature gives (`crate::cr`), so no feature reaches a guest behind its
-/// CPUID's back -- PKE above all, whose PKRU nothing switches between
-/// guests. Today that is VME and PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
+/// CPUID's back -- PKE above all, where a guest's PKRU is not switched
+/// between guests. Today that is VME and PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
 /// OSFXSR and OSXMMEXCPT, UMIP, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP,
-/// each where the host has its feature -- OSXSAVE where XSAVE's state is
-/// switched for a guest; never PKE, LA57 or CET, whose features are not
-/// offered.
+/// and PKE, each where the host has its feature -- OSXSAVE where XSAVE's
+/// state is switched for a guest, PKE where its PKRU is; never LA57 or CET,
+/// whose features are not offered.
 pub fn cr4_allowed() -> u64 {
     let features = cpuid(LEAF_FEATURES, 0, &Asker::RESET);
     let structured = cpuid(LEAF_STRUCTURED, 0, &Asker::RESET);

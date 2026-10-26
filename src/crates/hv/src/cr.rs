@@ -6,10 +6,10 @@
 //! machine check while the guest ran would be a shutdown that looks like
 //! the guest's triple fault, and the host would never hear of it. The guest
 //! reads back the CR4 it wrote, MCE as it left it. And a bit its CPUID does
-//! not offer -- PKE, whose PKRU nothing switches between guests, SMEP,
-//! FSGSBASE, LA57, OSXSAVE on a CPU without XSAVE, PCIDE -- is the #GP a CPU
-//! without the feature gives, not a feature the guest has behind its CPUID's
-//! back.
+//! not offer -- PKE where its PKRU is not switched between guests, SMEP,
+//! FSGSBASE, LA57, CET, OSXSAVE on a CPU without XSAVE, PCIDE -- is the #GP a
+//! CPU without the feature gives, not a feature the guest has behind its
+//! CPUID's back.
 //!
 //! And its XSETBV, which both stop it at -- XCR0 is the CPU's, and neither
 //! `vmrun` nor `vmlaunch` switches it -- performed as a CPU offering the

@@ -448,8 +448,8 @@ since VT-x's controls are not AMD-V's intercepts:
   the guest reads the read shadow's. A `mov` to CR4 that changes a bit of
   the mask exits, naming its register and length, and `crate::cr` performs
   it from there -- a bit its CPUID does not offer the #GP a CPU without the
-  feature gives, so PKE, and with it PKRU, stays the guest's to have only
-  where it is offered -- and writes the register and the shadow at the next
+  feature gives, so PKE stays the guest's to have only where PKU is offered,
+  its PKRU switched with it -- and writes the register and the shadow at the next
   entry. A read never exits, the shadow answering it, and a write of the
   guest's own bits never does either: Linux's global TLB flush turns PGE
   over twice, with no exit, where AMD-V stops every `mov` of CR4. PAE
@@ -748,8 +748,9 @@ on on every entry, whatever the VMCB says:
   instruction fetched by the guest's paging and decoded, as an MMIO
   access's is, since a CPU without decode assists (QEMU's, a nested
   hypervisor's) does not name the register. A write of a bit the guest's
-  CPUID does not offer is the #GP a CPU without the feature gives, so PKE,
-  LA57 and CET stay off, and OSXSAVE on a CPU without XSAVE; one a CPU
+  CPUID does not offer is the #GP a CPU without the feature gives, so LA57
+  and CET stay off, PKE where its PKRU is not switched, and OSXSAVE on a
+  CPU without XSAVE; one a CPU
   would not take where the guest is -- PAE cleared in long mode, PCIDE with
   a PCID in CR3 -- is a #GP too; and a write that changes a bit a CPU translates by flushes
   the guest's TLB, as the CPU would. QEMU's TCG never stops a guest at a
@@ -950,10 +951,11 @@ mode:
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
+| `pkru` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, the second started by `avx`'s code: each turns its local APIC on, runs an RDPKRU with CR4.PKE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, and where its CPUID offers PKU sets PKE, makes XCR0 its own -- PKRU in the first's, the x87 alone the second's -- reads leaf 7, leaf 0xD's subleaves 0 and 9 and PKRU, and loads its own into PKRU; then 64 turns each, a turn its peer's IPI, every one checking PKRU against what it left and loading it one key more | the RDPKRU a #UD; where PKU is offered -- QEMU's TCG, the EX44, not a Zen 2 -- OSPKE only once its CR4.PKE has it, leaf 0xD's components and sizes for its XCR0, PKRU's subleaf the host's; PKRU 0 as each CPU starts, though the other's was in the CPU's register, and its own at every turn, put back by the host each time the other had had the CPU -- 64 times each at least, whatever its XCR0 says of PKRU |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
 | `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
 | `spec` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers of the speculation controls, reads IA32_SPEC_CTRL, writes every control offered into it and reads it back, writes it with bit 62 set and reads it again, asks for three IBPBs by IA32_PRED_CMD, reads PRED_CMD and writes its bit 1 | offered exactly the controls the host switches (`spec::guest_controls`) -- none under QEMU's TCG, every access a #GP; SPEC_CTRL 0 as each VM starts, the second where the first had left its own; the bits it wrote read back, bit 62 a #GP and the value kept; its last entry run under its bits over the host's, and the CPU's the host's alone after; every IBPB it asked for answered by a barrier before its next entry; PRED_CMD's read and bit 1 a #GP; every RDMSR and WRMSR seen by the run loop |
-| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and PKE, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and PKE -- which its CPUID never offers -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
+| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and a bit its CPUID does not offer -- PKE, or CET where it is offered PKU -- 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and that bit PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
 ```
 $ hv run all 3
@@ -1057,8 +1059,20 @@ And while a guest runs:
   loaded, so no XSETBV of the host's can fault on what a guest asked. What
   is switched, and so all that is offered (`fp::offered`), is the x87, SSE
   and AVX as the CPU has them, AVX's component where every CPU with it puts
-  it, at 576 -- the area's bounds -- and nothing past it: AVX-512's, AMX's,
-  PKRU and CET's state are never in a guest's reach. AMD-V does not stop
+  it, at 576 -- the area's bounds -- and PKRU where the CPU has PKU, its 8
+  bytes past AVX's: AVX-512's, AMX's and CET's state are never in a guest's
+  reach. PKRU is not kept in the area but switched by RDPKRU after every
+  exit and WRPKRU where the CPU held another guest's, beside the XRSTOR: a
+  guest changes it by WRPKRU whatever its XCR0 says, and an XSAVE under an
+  XCR0 without it would leave it out. Both instructions need CR4.PKE, which
+  is set beside OSXSAVE while the extension is on where the CPU has PKU; it
+  changes nothing this kernel does, whose pages are supervisor pages all,
+  to which protection keys do not apply. The guest's own XCR0 may have PKRU
+  or not, leaf 0xD's sizes following it -- its subleaf 9 the host's, the
+  standard area ending past it, the compacted one 8 bytes past AVX's -- and
+  CPUID says OSPKE as the guest's own CR4.PKE has it. The `pkru` built-in
+  guest is the check: two CPUs taking turns on one host CPU, one with PKRU
+  in its XCR0 and one without, each finding its own at every turn. AMD-V does not stop
   XSAVES and XRSTORS, which no guest's CPUID offers, and they move the
   supervisor components IA32_XSS names: it is made 0 while the extension
   is on, so that they move nothing of the host's (VT-x faults them, its
@@ -1443,7 +1457,9 @@ here:
   -INT16, AVX-NE-CONVERT, SHA512, SM3 and SM4; leaf 0xD made up for those
   three components, its sizes for the guest's own XCR0; XSAVEOPT, XSAVEC
   and XGETBV's ECX 1 as the host has them, never XSAVES -- and no AVX-512,
-  AMX or PKU, whose state nothing switches; no paravirtualisation; the
+  AMX, whose state nothing switches; PKU where the CPU has it, the guest's
+  PKRU switched with it, and OSPKE as its CR4.PKE has it; no
+  paravirtualisation; the
   speculation controls the host has -- IBRS and IBPB, STIBP, SSBD, and
   Intel's PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and BHI_DIS_S, AMD's PSFD and
   SBPB -- with IA32_SPEC_CTRL and IA32_PRED_CMD the guest's own ([What the
@@ -3969,8 +3985,9 @@ someone else's; then speed.
    too, keeps the CR4 the guest wrote and answers from it (`hv/src/cr.rs`:
    the instruction fetched and decoded, `insn::decode_mov_cr`, since QEMU's
    and a nested hypervisor's CPUs give no decode assists), refuses with #GP
-   a bit the guest's CPUID does not offer -- PKE among them, which closes the
-   PKRU half of item 7 below under AMD-V -- and a write no CPU takes in long
+   a bit the guest's CPUID does not offer -- PKE where its PKRU is not
+   switched, which closed the PKRU half of item 7 below under AMD-V -- and a
+   write no CPU takes in long
    mode, and flushes the guest's TLB where the CPU would. The `cr4` built-in
    guest, hv-fuzz's platform target (every read and write held to what it
    should have done, at the CPU's next entry) and insn-test's control
@@ -4272,9 +4289,11 @@ someone else's; then speed.
    platform target holds DR4-DR7 to its model as well -- three mutants of
    `dr.rs` (DR6 written whole, the #UD of DR4 and DR5 checked after the CPL,
    no #GP for a bit above 31) each failed at once. And PKRU: a guest's write
-   of CR4.PKE is a #GP under both now (item 5), its CPUID not offering PKU,
-   and WRPKRU is then the #UD it is without PKE -- under VT-x it was the
-   guest's to set, and nothing switched the register.
+   of CR4.PKE was a #GP under both (item 5), its CPUID not offering PKU, and
+   WRPKRU then the #UD it is without PKE -- under VT-x it had been the
+   guest's to set, and nothing switched the register. Now PKU is offered
+   where the CPU has it, and PKRU switched with the guest
+   ([What the extension costs](#what-the-extension-costs-while-it-is-on)).
 8. ~~**VT-x's controls are taken on trust.**~~ Done: a control the host
    needs that `adjust` dropped -- the exits for interrupts and NMIs, ports,
    CR8, MONITOR, MWAIT, RDPMC, every `mov` of a debug register and WBINVD,

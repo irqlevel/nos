@@ -1586,10 +1586,13 @@ user process's `stepi` once stopped its whole VM. Under VT-x the same --
 its DR6 the one the exit said, VT-x writing none at a #DB that exits, and
 its handler's `mov`s of DR6 answered by the host. And for
 `cr4`, through the same loop, that the guest read back each CR4 it wrote --
-MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that PKE, which
-its CPUID never offers, PAE cleared in long mode and bit 32 were each a
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that a bit its
+CPUID does not offer -- PKE where it is not offered PKU, CET where it is,
+which no guest is -- PAE cleared in long mode and bit 32 were each a
 #GP with no error code, CR4 as it was; and that the host performed all
-eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
+eleven of its accesses. The bit is PKE on a Zen 2 because the Zen 2
+refuses a write of CET itself, before its intercept, as it does bit 32:
+with CET, none of the three refusals reached the host there. On QEMU's TCG -- known by its hypervisor leaf's
 signature -- which checks a read of any control register against CR0's
 intercept and so stops no read of CR4, it holds the reads to the register
 instead, MCE in it, and the host to its five writes; its VMCB must ask for
@@ -1599,7 +1602,7 @@ read lost MCE at the first write. Under VT-x, which stops a guest at a
 write of CR4 only where it changes a bit the host keeps, and answers its
 reads from the read shadow, it holds the reads to the same CR4s, the CPU's
 to MCE kept and VMXE, and the host to three writes performed -- MCE
-cleared, PKE, bit 32 -- and two refused: PAE cleared in long mode is the
+cleared, PKE or CET, bit 32 -- and two refused: PAE cleared in long mode is the
 CPU's own #GP, and PGE set its own write. And for `msr`, through the same loop,
 that AMD's VIRT_SPEC_CTRL and FLUSH_CMD, which its CPUID does not offer,
 AMD's LS_CFG, which the policy names for no CPU, and MTRRs turned on,
@@ -1667,7 +1670,19 @@ AX41's Zen 2, under KVM, three control builds failed it: one that left
 the guest's bits out of the CPU's (it ran under the host's 0x2, not 0x6),
 one whose IBPB between two guest CPUs looked at the guest CPU alone and
 not at the IBPBs it asked for (three asked, none answered), and one that
-left the guest's bits in the host's after the exit. After both rounds `hv` must count at least two
+left the guest's bits in the host's after the exit. And for `pkru`, two CPUs
+of one guest whose tasks are both on the CPU the guests run on, taking
+turns by IPI as `avx`'s do: that each found RDPKRU a #UD with CR4.PKE
+clear; and where PKU is offered -- `hv info` says so, and QEMU's TCG and
+the EX44 have it, a Zen 2 not -- that each was told OSPKE only once its
+CR4.PKE was set, that its XCR0 was its own, PKRU in the first's and not in
+the second's, that leaf 0xD gave PKRU's component as the host has it and
+the area's sizes for each XCR0, that PKRU was 0 as it started though the
+other's was in the CPU's register, and that at every one of its 64 turns
+it found its own as it left it, put back each time the other had had the
+CPU -- whatever its XCR0 says of PKRU. A control build that never loaded a
+guest's PKRU failed it under QEMU's TCG: the second CPU found the first's
+as it started. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
 QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
