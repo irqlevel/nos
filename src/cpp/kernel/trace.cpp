@@ -53,7 +53,7 @@ void Tracer::output(const char *fmt, ...)
     va_end(args);
 
     /* A line longer than the buffer comes out truncated, with "..." where it
-       was cut (VsnPrintf), and is printed: dropping it lost exactly the
+       was cut (vsn_printf), and is printed: dropping it lost exactly the
        reports worth reading, a Rust panic's message among them. Only a
        format string this code got wrong still returns -1, and even then
        whatever was formatted before it is printed if there is any. */

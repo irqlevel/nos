@@ -1,4 +1,4 @@
-// The Hal:: CPU wrappers of hal/cpu.h, for a process on the host: the
+// The hal:: CPU wrappers of hal/cpu.h, for a process on the host: the
 // interrupt flag is a word the stand-ins keep (kernel.cpp), the stack and
 // frame pointers are the host's, and the cycle counter counts.
 #pragma once
@@ -43,7 +43,7 @@ static inline ulong get_sp()
 static inline void set_sp(ulong new_value)
 {
     (void)new_value;
-    fuzz::host_hal_unreachable("Hal::SetSp");
+    fuzz::host_hal_unreachable("hal::set_sp");
 }
 
 static inline ulong get_fp()

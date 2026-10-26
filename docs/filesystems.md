@@ -248,7 +248,7 @@ mount makes of a reachable inode or block marked free. `format` and `mount`
 refuse a device smaller than the layout (69 MB) before touching it.
 
 ramfs (`src/rust/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
-layout puts on `/`, and what `TestVfs` exercises at every boot: a file is
+layout puts on `/`, and what `test_vfs` exercises at every boot: a file is
 one buffer that doubles as it grows. procfs (`procfs.rs`) is a ramfs whose
 `/proc/interrupts` is regenerated on each lookup -- the VFS looks a file up
 before it reads it or reports its size, so refreshing there keeps the two
@@ -306,5 +306,5 @@ both architectures. `crc32 <path>` checks a file against its copy on the
 host, and `truncate <path> <size>` cuts a file, or grows it with a hole -- a
 guest's blank disk image of any size the filesystem holds.
 
-`TestVfs` in `kernel/test.cpp` runs the same test on a ramfs at every boot,
+`test_vfs` in `kernel/test.cpp` runs the same test on a ramfs at every boot,
 before any disk is up.

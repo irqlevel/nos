@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-// x86_64 bodies for the Hal:: CPU wrappers (see hal/cpu.h).
+// x86_64 bodies for the hal:: CPU wrappers (see hal/cpu.h).
 // Included only via hal/cpu.h.
 
 #ifdef __cplusplus
@@ -60,7 +60,7 @@ static inline __attribute__((always_inline)) ulong get_fp()
 }
 
 // Monotonic per-CPU cycle counter for cheap timestamps/IDs/entropy,
-// not a calibrated clock (use GetBootTime for time).
+// not a calibrated clock (use get_boot_time for time).
 static inline __attribute__((always_inline)) u64 read_cycle_counter()
 {
     return read_tsc();
@@ -70,7 +70,7 @@ static inline __attribute__((always_inline)) u64 read_cycle_counter()
 // loop of two instructions, so that a wakeup only halts it again. HLT ends,
 // even with interrupts off, at an NMI or a machine check, whose handlers
 // return here. For a CPU whose stack and everything else may be freed
-// under it (Cpu::Park).
+// under it (Cpu::park).
 static inline __attribute__((always_inline, noreturn)) void halt_forever()
 {
     asm volatile("1: hlt\n\t"

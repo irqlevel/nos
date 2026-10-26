@@ -1,4 +1,4 @@
-// The Hal:: MMU wrappers of hal/mmu.h, for a process on the host. Nothing
+// The hal:: MMU wrappers of hal/mmu.h, for a process on the host. Nothing
 // here translates by itself: what the kernel does to its page tables is made
 // real by whatever target models the MMU (fuzz/cpp/targets/mm.cpp), at the
 // points where the hardware would see it -- a TLB flush, an entry made

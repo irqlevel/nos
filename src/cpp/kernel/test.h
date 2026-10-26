@@ -11,7 +11,7 @@ stdlib::Error test();
 
 bool test_multi_tasking();
 
-/* Task::Locate and Wait's report: once, from the BSP, with every CPU up */
+/* Task::locate and Wait's report: once, from the BSP, with every CPU up */
 bool test_task_locate();
 
 /* Wakeups across every CPU, into every window of a task's run state, and

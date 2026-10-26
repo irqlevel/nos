@@ -31,7 +31,7 @@ public:
     /* Called first by the handlers of the faults a read can raise -- x86's
        page fault, general protection fault and stack fault, arm64's sync
        exception. When the fault is the panicking CPU's own, in a read its
-       report could not be sure of (ProbeCpu, see DoPanicCtx), it does not
+       report could not be sure of (probe_cpu_, see do_panic_ctx), it does not
        return: it resumes the report past that read. Otherwise it returns,
        and the fault is reported as any other. */
     void recover_fault();
@@ -51,7 +51,7 @@ private:
 
     static const size_t REMOTE_FRAME_COUNT = 12;
 
-    /* Kept in step with Kernel::MaxCpus by a static_assert in panic.cpp;
+    /* Kept in step with kernel::MAX_CPUS by a static_assert in panic.cpp;
        including cpu.h here would be circular. */
     static const size_t REMOTE_CPU_COUNT = 64;
 
@@ -74,8 +74,8 @@ private:
     Atomic active_;
 
     /* A read of memory that may not be there, by the CPU making the report:
-       that CPU's index in ProbeCpu while it lasts, -1 otherwise, and in
-       ProbeJump where a fault in it resumes. */
+       that CPU's index in probe_cpu_ while it lasts, -1 otherwise, and in
+       probe_jump_ where a fault in it resumes. */
     JmpContext probe_jump_;
     Atomic probe_cpu_;
 

@@ -3,7 +3,7 @@
 // (fuzz/cpp/Makefile): the kernel sources it tests, compiled for the host as
 // they are, the stand-ins for the kernel around them (kernel.cpp, heap.cpp,
 // the host HAL in fuzz/cpp/host), and the target's own file, which defines
-// Fuzz::TheTarget. The runner (runner.cpp) feeds it random bytes from a seed,
+// fuzz::THE_TARGET. The runner (runner.cpp) feeds it random bytes from a seed,
 // each input in a process of its own forked from one that has run nothing.
 //
 // A file of the fuzzers includes host.h before anything else (host.h says
@@ -16,7 +16,7 @@ namespace fuzz
 {
 
 /* The input, read as a stream of choices: past its end every read is 0,
-   which is always the ordinary choice, and More() says there is no more.
+   which is always the ordinary choice, and more() says there is no more.
    The same reader as fuzz/common/input.rs. */
 class Input
 {

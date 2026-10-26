@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-// arm64 bodies for the Hal:: CPU wrappers (see hal/cpu.h).
+// arm64 bodies for the hal:: CPU wrappers (see hal/cpu.h).
 // Included only via hal/cpu.h.
 
 namespace hal
@@ -51,7 +51,7 @@ static inline __attribute__((always_inline)) ulong get_fp()
 }
 
 // Monotonic per-CPU cycle counter for cheap timestamps/IDs/entropy,
-// not a calibrated clock (use GetBootTime for time).
+// not a calibrated clock (use get_boot_time for time).
 static inline __attribute__((always_inline)) u64 read_cycle_counter()
 {
     u64 cnt;
@@ -62,7 +62,7 @@ static inline __attribute__((always_inline)) u64 read_cycle_counter()
 // Halts this CPU for good, touching no memory -- no stack, no data: one
 // loop of two instructions, so that a wakeup only halts it again. WFI ends
 // at any pending interrupt, even a masked one. For a CPU whose stack and
-// everything else may be freed under it (Cpu::Park).
+// everything else may be freed under it (Cpu::park).
 static inline __attribute__((always_inline, noreturn)) void halt_forever()
 {
     asm volatile("1: wfi\n\t"

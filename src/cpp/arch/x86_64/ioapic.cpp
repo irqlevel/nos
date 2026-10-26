@@ -77,7 +77,7 @@ u64 IoApic::check_dest(u8 irq, u64 apic_id)
     /* Never silently alias onto whatever apic id the low four bits happen to
        name -- that is how an interrupt goes missing for good. Fall back to
        the boot CPU, which is always addressable, and say so. */
-    trace(0, "IoApic: irq 0x%lX apicId %lu exceeds physical destination range %lu, using 0",
+    trace(0, "IoApic: irq 0x%lX apic_id %lu exceeds physical destination range %lu, using 0",
         (ulong)irq, (ulong)apic_id, (ulong)MAX_PHYSICAL_DEST);
 
     return 0;
@@ -98,7 +98,7 @@ void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
     data |= 0 << MASKED_SHIFT; // disable: no
     data |= apic_id << DEST_SHIFT; //destination id
 
-    trace(IO_APIC_LL, "SetIrq irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX",
+    trace(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX",
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data);
 
     set_entry(irq, data);
@@ -115,7 +115,7 @@ void IoApic::set_irq_destination(u8 irq, u64 apic_id)
     high = (high & 0x00FFFFFFU) | ((u32)apic_id << 24);
     write_register(RED_TBL + 2 * irq + 1, high);
 
-    trace(IO_APIC_LL, "SetIrqDestination irq 0x%lX apicId 0x%lX",
+    trace(IO_APIC_LL, "set_irq_destination irq 0x%lX apic_id 0x%lX",
         (ulong)irq, (ulong)apic_id);
 }
 
@@ -134,7 +134,7 @@ void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
     data |= 0 << MASKED_SHIFT; // disable: no
     data |= apic_id << DEST_SHIFT; //destination id
 
-    trace(IO_APIC_LL, "SetIrqLevel irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX activeHigh %lu",
+    trace(IO_APIC_LL, "set_irq_level irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX active_high %lu",
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)active_high);
 
     set_entry(irq, data);

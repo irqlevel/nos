@@ -40,8 +40,8 @@ public:
 
     /* Arm kvmclock for the calling CPU. KVM updates a pvclock entry only for
        the vcpu that wrote the MSR, so every CPU needs its own entry + MSR
-       write. The BSP arms itself in SetupKvmClock; APs call this from
-       ApMain2. */
+       write. The BSP arms itself in setup_kvm_clock; APs call this from
+       ap_main2. */
     bool enable_kvm_clock_self();
 
     ulong get_freq_hz();
@@ -80,7 +80,7 @@ private:
     static const u8  PIT_CH2_ONE_SHOT_CMD = 0xB0; /* channel 2, lobyte/hibyte, mode 0 */
     static const u8  GATE_MASK  = 0xFC; /* mask off gate + speaker bits */
     static const u8  GATE_ON    = 0x01; /* bit 0: gate enable */
-    static const u8  GATE_OFF   = 0xFE; /* ~GateOn */
+    static const u8  GATE_OFF   = 0xFE; /* ~GATE_ON */
     static const u8  OUT_PIN    = 0x20; /* bit 5: channel 2 OUT pin */
     static const u32 CALIBRATION_MS = 50;
     static const ulong CALIBRATION_RELOAD = (PIT_FREQUENCY * CALIBRATION_MS + 500) / 1000;
@@ -116,7 +116,7 @@ private:
     ulong pv_clock_phys_;
 
     /* Highest ns ever returned; enforces monotonicity when the host does
-       not report PVCLOCK_TSC_STABLE_BIT (see KvmClockTime). */
+       not report PVCLOCK_TSC_STABLE_BIT (see kvm_clock_time). */
     Atomic last_ns_;
 };
 

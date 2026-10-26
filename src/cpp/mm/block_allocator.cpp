@@ -61,7 +61,7 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
 
     if (usage_ != 0)
     {
-        trace(0, "0x%p usage %lu blockSize %lu", this, usage_, block_size_);
+        trace(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
         for (ListEntry* le = active_block_list_.flink; le != &active_block_list_; le = le->flink)
         {
             BlockEntry* b = CONTAINING_RECORD(le, BlockEntry, list_link);
@@ -70,7 +70,7 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
             for (size_t i = 0; i < b->num_frames; i++)
                 trace(0, "leak entry 0x%p stack[%lu]=0x%lX", b, i, b->frames[i]);
         }
-        trace(0, "0x%p usage %lu blockSize %lu", this, usage_, block_size_);
+        trace(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
     }
 
     BUG_ON(usage_ != 0);

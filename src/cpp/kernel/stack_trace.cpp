@@ -26,7 +26,7 @@ namespace kernel
             ulong ret_address = *(ulong *)(curr_rbp + sizeof(ulong));
 
             /* The outermost frame of a task's: nothing called its entry
-               function (Hal::BuildTaskFrame) */
+               function (hal::build_task_frame) */
             if (ret_address == 0)
                 break;
 
@@ -52,28 +52,28 @@ namespace kernel
            here -- so the stack pointer is always a real address. The frame
            pointer is not: it is whatever the interrupted code had in RBP, and
            hand-written assembly uses that register for its own purposes
-           (asm.asm's RunOnStack loads it from an argument, SetJmp and LongJmp
+           (asm.asm's run_on_stack loads it from an argument, set_jmp and long_jmp
            save and restore it). A profiler sampling on a performance counter
            lands in exactly that code, because the leaves of a hot path are
-           AtomicRead, SetRflags, ReadTsc and Pause.
+           atomic_read, set_rflags, read_tsc and Pause.
 
            Deriving the window from a garbage RBP and then reading the magic
            word out of it dereferences an address that need not be mapped, or
            even canonical, inside an NMI handler -- a fault with nothing left
            to report it. Bounded by the stack pointer instead, a garbage frame
-           pointer simply fails CaptureFrom's range check and the walk returns
+           pointer simply fails capture_from's range check and the walk returns
            no frames, which is the honest answer.
 
            `sp` is the stack pointer of the code being described, which is not
            always this function's own: #DF is delivered on its own IST stack,
            and its report is about the stack it came from. Callers holding a
-           Context pass GetOrigRsp(); the rest pass their own. */
+           Context pass get_orig_rsp(); the rest pass their own. */
         ulong base = sp & (~(Task::STACK_SIZE - 1));
         Task::Stack* stack_ptr = reinterpret_cast<Task::Stack*>(base);
         if (stack_ptr->magic1 == Task::STACK_MAGIC1 &&
             stack_ptr->magic2 == Task::STACK_MAGIC2)
         {
-            /* Up to StackTop, not to the end of the struct: the last word is
+            /* Up to stack_top, not to the end of the struct: the last word is
                Magic2, and a walk allowed to read it reports the guard value
                as a return address -- 0xCBDECBDE appearing as this task's
                outermost caller, which is not a caller at all. */

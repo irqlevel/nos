@@ -1,14 +1,14 @@
 // The page tables and the physical page allocator (mm/page_table.cpp), past
 // Setup: what every mapping, every page and every frame of the running
 // kernel goes through, and the error paths nothing else takes -- a table
-// that cannot be allocated half way down a walk, a TmpMap window with no slot
+// that cannot be allocated half way down a walk, a tmp_map window with no slot
 // left, a machine with no free page.
 //
-// The machine is a small one: physical memory is a host buffer, PageArray a
-// host array, and the state PageTable::Setup leaves -- the root, the free
-// list, the TmpMap window and the L1 table that maps it -- is set up here as
+// The machine is a small one: physical memory is a host buffer, page_array a
+// host array, and the state PageTable::setup leaves -- the root, the free
+// list, the tmp_map window and the L1 table that maps it -- is set up here as
 // Setup documents it, since Setup itself runs on the bootstrap linear map. The
-// MMU is emulated where the code reaches memory through it, the TmpMap
+// MMU is emulated where the code reaches memory through it, the tmp_map
 // window: when the kernel changes a slot's entry and tells the hardware (a
 // TLB flush, an entry made valid), the slot is loaded with the page it now
 // maps, and the one it mapped before gets the slot's contents back; an unmapped
@@ -21,7 +21,7 @@
 // held to a model: every page's reference count as mm/page_table.h's rules
 // have it, every mapping's translation, every page either free, the
 // sequence's, a table, or the machine's own, and never two; a page handed out
-// zeroed; a map that fails leaving nothing mapped; no TmpMap slot left behind
+// zeroed; a map that fails leaving nothing mapped; no tmp_map slot left behind
 // by any path. A machine of more than 4 MiB may have a huge pool reserved
 // (hugepages=), its 2MiB blocks handed out and given back: a block of it
 // never on the free list, never another's, zeroed when handed out, and the
@@ -66,7 +66,7 @@ struct Machine
 {
     uint8_t* phys = nullptr;
     ulong pages = 0;
-    /* The TmpMap window and the L1 table whose entries map it */
+    /* The tmp_map window and the L1 table whose entries map it */
     uint8_t* window = nullptr;
     PtePage* window_l1 = nullptr;
     /* What each slot holds: the physical address loaded into it, or none */
@@ -115,7 +115,7 @@ void sync(size_t i)
     for (size_t j = 0; j < WINDOW_SLOTS; j++)
     {
         INVARIANT(j == i || machine.slot_phys[j] != static_cast<long>(phys),
-            "physical page 0x%lx mapped in TmpMap slots %zu and %zu at once", phys, j, i);
+            "physical page 0x%lx mapped in tmp_map slots %zu and %zu at once", phys, j, i);
     }
     ASAN_UNPOISON_MEMORY_REGION(slot, PAGE_BYTES);
     if (in_ram(phys))
@@ -340,7 +340,7 @@ void check(const char* after)
         on_list++;
         INVARIANT(on_list <= machine.pages, "the free list loops, after %s", after);
     }
-    INVARIANT(tested_pt().free_pages_count_ == on_list, "FreePagesCount %lu with %lu on the list, after %s",
+    INVARIANT(tested_pt().free_pages_count_ == on_list, "free_pages_count_ %lu with %lu on the list, after %s",
         tested_pt().free_pages_count_, on_list, after);
 
     /* The pool as the model has it, in its counts and its bitmaps */
@@ -389,11 +389,11 @@ void check(const char* after)
             "after %s", i, p.ref_count.get(), s.ref, after);
     }
 
-    /* No TmpMap slot kept by anything but the sequence */
+    /* No tmp_map slot kept by anything but the sequence */
     size_t used = 0;
     for (size_t i = 0; i < PageTable::TMP_MAP_SHARED_COUNT; i++)
         used += tested_pt().tmp_map_page_array_[i] != nullptr;
-    INVARIANT(used == tmp_slots, "%zu TmpMap slots in use where the sequence holds %zu, after %s", used, tmp_slots,
+    INVARIANT(used == tmp_slots, "%zu tmp_map slots in use where the sequence holds %zu, after %s", used, tmp_slots,
         after);
     for (size_t i = PageTable::TMP_MAP_SHARED_COUNT; i < WINDOW_SLOTS; i++)
         INVARIANT(!machine.window_l1->entry[i].present(), "frame slot %zu left mapped, after %s",
@@ -401,7 +401,7 @@ void check(const char* after)
     fuzz::check_no_locks_held(after);
 }
 
-/* The translations the model holds, as VirtToPhys and the leaves say. */
+/* The translations the model holds, as virt_to_phys and the leaves say. */
 void check_maps(fuzz::Input& in, const char* after)
 {
     int n = 0;
@@ -410,7 +410,7 @@ void check_maps(fuzz::Input& in, const char* after)
         if (n++ > 16 && !in.chance(8))
             continue;
         ulong got = tested_pt().virt_to_phys(m.first + 8);
-        INVARIANT(got == m.second + 8, "VirtToPhys(0x%lx) = 0x%lx where 0x%lx is mapped, after %s", m.first + 8,
+        INVARIANT(got == m.second + 8, "virt_to_phys(0x%lx) = 0x%lx where 0x%lx is mapped, after %s", m.first + 8,
             got, m.second, after);
         Pte leaf = leaf_of(m.first);
         auto found = prot.find(m.first);
@@ -492,16 +492,16 @@ void alloc(fuzz::Input& in)
     Page* p = tested_pt().alloc_page();
     if (p == nullptr)
     {
-        INVARIANT(tested_pt().free_pages_count_ == 0, "AllocPage failed with %lu pages free", tested_pt().free_pages_count_);
+        INVARIANT(tested_pt().free_pages_count_ == 0, "alloc_page failed with %lu pages free", tested_pt().free_pages_count_);
         fuzz::reached("memory exhausted");
         return;
     }
     ulong phys = p->get_phy_address();
     PageState& s = pages[index(phys)];
-    INVARIANT(s.state == PageState::Free, "AllocPage handed out page 0x%lx, which is not free (state %d)", phys,
+    INVARIANT(s.state == PageState::Free, "alloc_page handed out page 0x%lx, which is not free (state %d)", phys,
         s.state);
     s.state = PageState::Held;
-    check_zeroed(phys, "AllocPage");
+    check_zeroed(phys, "alloc_page");
 }
 
 void alloc_run(fuzz::Input& in)
@@ -520,9 +520,9 @@ void alloc_run(fuzz::Input& in)
         ulong phys = base + i * PAGE_BYTES;
         INVARIANT(in_ram(phys) && &first[i] == page_of(phys), "run page %lu is no page", i);
         PageState& s = pages[index(phys)];
-        INVARIANT(s.state == PageState::Free, "AllocContiguousPages handed out page 0x%lx, not free", phys);
+        INVARIANT(s.state == PageState::Free, "alloc_contiguous_pages handed out page 0x%lx, not free", phys);
         s.state = PageState::Held;
-        check_zeroed(phys, "AllocContiguousPages");
+        check_zeroed(phys, "alloc_contiguous_pages");
     }
     fuzz::reached("a contiguous run");
 }
@@ -535,7 +535,7 @@ void exhaust(fuzz::Input& in)
     while (tested_pt().free_pages_count_ > leave)
     {
         Page* p = tested_pt().alloc_page();
-        INVARIANT(p != nullptr, "AllocPage failed with %lu pages free", tested_pt().free_pages_count_);
+        INVARIANT(p != nullptr, "alloc_page failed with %lu pages free", tested_pt().free_pages_count_);
         pages[index(p->get_phy_address())].state = PageState::Held;
     }
     fuzz::reached("memory taken to its last pages");
@@ -549,7 +549,7 @@ void free_one(fuzz::Input& in)
     PageState& s = pages[index(phys)];
     if (in.boolean())
     {
-        INVARIANT(tested_pt().is_frame_address(phys), "IsFrameAddress(0x%lx) says no", phys);
+        INVARIANT(tested_pt().is_frame_address(phys), "is_frame_address(0x%lx) says no", phys);
         tested_pt().free_frame(phys);
     }
     else
@@ -635,11 +635,11 @@ void map(fuzz::Input& in)
     }
 }
 
-/* The TmpMap window all but full -- device pages, which take no page's
+/* The tmp_map window all but full -- device pages, which take no page's
    reference -- and a map across an L1 table's end made in what is left.
    A walk holds two slots at most, a table and the next, and allocating a
    table on the way takes the second; with fewer the kernel says so and
-   stops (ZeroPage's panic), which is what the window being full of leaked
+   stops (zero_page's panic), which is what the window being full of leaked
    slots should do. With two, every map must go as it would with all. */
 void crowd(fuzz::Input& in)
 {
@@ -653,7 +653,7 @@ void crowd(fuzz::Input& in)
     if (va == 0)
         return;
     tmp_slots += crowd;
-    fuzz::reached("the TmpMap window crowded");
+    fuzz::reached("the tmp_map window crowded");
 
     /* Across the end of an L1 table, into a region no table maps yet */
     ulong count = 2 + in.below(6);
@@ -689,7 +689,7 @@ void crowd(fuzz::Input& in)
     {
         ulong a = at + i * PAGE_BYTES;
         if (!maps.count(a) && !mmio.count(a))
-            INVARIANT(tested_pt().virt_to_phys(a) == 0, "0x%lx is mapped after a map of it in a crowded TmpMap window said no",
+            INVARIANT(tested_pt().virt_to_phys(a) == 0, "0x%lx is mapped after a map of it in a crowded tmp_map window said no",
                 a);
     }
 }
@@ -708,12 +708,12 @@ void unmap(fuzz::Input& in)
     {
         /* The single-page form, and the caller's own Put after it */
         Page* p = tested_pt().unmap_page(va);
-        INVARIANT(p != nullptr && p->get_phy_address() == maps[va], "UnmapPage(0x%lx) returned another page", va);
+        INVARIANT(p != nullptr && p->get_phy_address() == maps[va], "unmap_page(0x%lx) returned another page", va);
         p->put();
         pages[index(maps[va])].ref--;
         maps.erase(va);
         prot.erase(va);
-        fuzz::reached("UnmapPage");
+        fuzz::reached("unmap_page");
         return;
     }
     /* Freeing through the unmap only pages mapped once, and there once */
@@ -778,7 +778,7 @@ void tmp_map(fuzz::Input& in)
         for (ulong p = 0; p < t.pages; p++)
         {
             ulong phys = tested_pt().tmp_unmap_page(va + p * PAGE_BYTES);
-            INVARIANT(phys == t.phys + p * PAGE_BYTES, "TmpUnmapPage gave back 0x%lx, not 0x%lx", phys,
+            INVARIANT(phys == t.phys + p * PAGE_BYTES, "tmp_unmap_page gave back 0x%lx, not 0x%lx", phys,
                 t.phys + p * PAGE_BYTES);
             pages[index(phys)].ref--;
         }
@@ -786,7 +786,7 @@ void tmp_map(fuzz::Input& in)
         tmps.erase(it);
         write_back_all();
         for (ulong b = 0; b < t.pages * PAGE_BYTES; b += 509)
-            INVARIANT(machine.phys[t.phys + b] == t.mark, "a write through the TmpMap window to 0x%lx is not in the page",
+            INVARIANT(machine.phys[t.phys + b] == t.mark, "a write through the tmp_map window to 0x%lx is not in the page",
                 t.phys + b);
         return;
     }
@@ -809,10 +809,10 @@ void tmp_map(fuzz::Input& in)
     if (va == 0)
     {
         INVARIANT(tmp_slots + npages > PageTable::TMP_MAP_SHARED_COUNT - 16,
-            "no TmpMap slot for %lu pages with %zu of the window's in use", npages, tmp_slots);
+            "no tmp_map slot for %lu pages with %zu of the window's in use", npages, tmp_slots);
         return;
     }
-    INVARIANT((va & (PAGE_BYTES - 1)) == offset, "a TmpMap of 0x%lx at 0x%lx: the offset is lost", phys + offset, va);
+    INVARIANT((va & (PAGE_BYTES - 1)) == offset, "a tmp_map of 0x%lx at 0x%lx: the offset is lost", phys + offset, va);
     ulong span = (offset + len + PAGE_BYTES - 1) / PAGE_BYTES;
     uint8_t mark = static_cast<uint8_t>(1 + in.below(255));
     memset(reinterpret_cast<void*>(va - offset), mark, span * PAGE_BYTES);
@@ -820,7 +820,7 @@ void tmp_map(fuzz::Input& in)
         pages[index(phys + p * PAGE_BYTES)].ref++;
     tmp_slots += span;
     tmps[va] = {phys, span, mark};
-    fuzz::reached(span > 1 ? "a TmpMap of a range" : "a TmpMap");
+    fuzz::reached(span > 1 ? "a tmp_map of a range" : "a tmp_map");
 }
 
 void frame(fuzz::Input& in)
@@ -922,11 +922,11 @@ void alloc_huge(fuzz::Input& in)
     const ulong phys = tested_pt().alloc_huge_frame();
     if (phys == 0)
     {
-        INVARIANT(pool_free == 0, "AllocHugeFrame failed with %lu blocks free", pool_free);
+        INVARIANT(pool_free == 0, "alloc_huge_frame failed with %lu blocks free", pool_free);
         return;
     }
     auto it = pool_blocks.find(phys);
-    INVARIANT(it != pool_blocks.end() && !it->second, "AllocHugeFrame handed out 0x%lx, no free block of the pool",
+    INVARIANT(it != pool_blocks.end() && !it->second, "alloc_huge_frame handed out 0x%lx, no free block of the pool",
         phys);
     it->second = true;
     for (ulong i = 0; i < HUGE_PAGES; i++)
@@ -935,7 +935,7 @@ void alloc_huge(fuzz::Input& in)
         INVARIANT(st.state == PageState::Pool, "page %lu of a block handed out is not the pool's (state %d)",
             index(phys) + i, st.state);
         st.state = PageState::Huge;
-        check_zeroed(phys + i * PAGE_BYTES, "AllocHugeFrame");
+        check_zeroed(phys + i * PAGE_BYTES, "alloc_huge_frame");
     }
     /* What a guest would write there: the next one handed it must find
        zeros again */
@@ -995,7 +995,7 @@ void boot(fuzz::Input& in)
     pt.tmp_map_start_ = reinterpret_cast<ulong>(machine.window);
     pt.tmp_map_l1_page_ = machine.window_l1;
     pages.assign(machine.pages, {PageState::Machine, 1, false});
-    /* What DrainEarlyFreeList leaves: every usable page on the list, at
+    /* What drain_early_free_list leaves: every usable page on the list, at
        reference count 1 */
     for (ulong i = machine.pages; i-- > RESERVED_PAGES;)
     {

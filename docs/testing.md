@@ -15,10 +15,10 @@ each gate does, and the failure it is there for.
 ## Self-tests at boot
 
 Self-tests live in `src/cpp/kernel/test.cpp`; each is a
-`Stdlib::Error TestXxx()` function. They run early in boot, from
-`Test::Test()` (called in `main.cpp:Main2`, and from `main_arm64.cpp`) and
-`Test::TestMultiTasking()`, and a failing one returns a non-success
-`Stdlib::Error`. The Rust side's run from the same place, through
+`stdlib::Error TestXxx()` function. They run early in boot, from
+`test::test()` (called in `main.cpp:main2`, and from `main_arm64.cpp`) and
+`test::test_multi_tasking()`, and a failing one returns a non-success
+`stdlib::Error`. The Rust side's run from the same place, through
 `rust_test` (`src/rust/kernel/src/lib.rs`) -- among them the frame test
 (`kernel/src/frames.rs`): a page mapped nowhere, written a piece at a time at
 every alignment and read back on every running CPU, each through its own
@@ -36,19 +36,19 @@ is what catches it: a ring whose sequences were relaxed failed eight boots
 of eight under HVF, while TCG on an x86 host may never show it. Its line
 says what a push and a pop cost on one CPU and how long each run took
 (`ring selftest: passed ...`): a number every boot prints is noticed when it
-moves. And on every CPU `TestSleepPrompt` has a task of its own sleep a
+moves. And on every CPU `test_sleep_prompt` has a task of its own sleep a
 millisecond twenty-one times while the CPU halts between interrupts: the
 median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
 CPU's timer is not armed for a sleeper's deadline and the tick wakes it
 ([the local timer](scheduler.md#the-local-timer)).
-Once, from the boot CPU with the others up, `TestTaskLocate` finds tasks
+Once, from the boot CPU with the others up, `test_task_locate` finds tasks
 where they are ([waiting for one to end](scheduler.md#waiting-for-one-to-end)):
 one blocked on an event, read off its stack; one on another CPU with
 interrupts off, which must be named as that CPU's after the tenth of a
 second the test waits for it; one spinning on that CPU, caught there by the
 IPI -- through the slot the deaf CPU answered late, which has to be
 reusable -- each held to frames naming the function it is in; and a join
-of 50 ms reported at a report interval of 20. After it `TestWakeStorm`
+of 50 ms reported at a report interval of 20. After it `test_wake_storm`
 passes a token round a ring of tasks, two a CPU, each pinned to its own and
 each pass a wakeup on another CPU -- half the waits with a deadline, a sleep
 now and then racing the signal that comes for it, a task yielding on every
@@ -57,11 +57,11 @@ the task it was sent to and where that task is: a wakeup lost is a task
 asleep for good, which nothing else would report
 ([blocking and waking](scheduler.md#blocking-and-waking)). Its line says how
 many passes in how long; a control run that dropped one wakeup in 1500
-failed the boot at the 1633rd. `TestIdleTakesTurns` has the boot, which runs
+failed the boot at the 1633rd. `test_idle_takes_turns` has the boot, which runs
 in the boot CPU's idle task, sleep a millisecond beside a task pinned to that
 CPU that only yields, and fails it if the sleep takes 200 ms: the idle task is
 the last resort only while it idles ([the idle task](scheduler.md#the-idle-task)).
-And `TestEevdf`, on a CPU other than the boot's, holds EEVDF's two promises
+And `test_eevdf`, on a CPU other than the boot's, holds EEVDF's two promises
 ([who runs next](scheduler.md#who-runs-next-eevdf)): a task woken beside one
 task that never blocks, and beside two, runs within half a millisecond and a
 millisecond at the median -- signalled at random points of the spinners'
@@ -69,7 +69,7 @@ slices, since at a fixed rhythm a lag reckoned wrong slipped under the bound
 -- and a spinner of nice 0 has 2.4 to 3.9 times the CPU of one of nice 5,
 for 3.06. Its line gives both medians and the share; a control run with the
 lag reckoned wrong waited 1256 us beside one spinner and failed the boot.
-`TestLineEditor` types at the console's line editor
+`test_line_editor` types at the console's line editor
 ([line editing](shell-commands.md#line-editing)) on a screen of text and
 Backspace, as the console is: lines run and kept, Up and Down through them
 to the line being typed, ^R's search -- found, found again, failed, made
@@ -83,7 +83,7 @@ keys.
 - To run a single test, edit `Test()` to call only that function, rebuild,
   boot, and watch `nos.log`.
 
-Two more run at boot when there is something to run them on: `TestModules`
+Two more run at boot when there is something to run them on: `test_modules`
 loads the `modtest` module embedded in the image, with a parameter and
 without, and then feeds the loader damaged copies of it (see [Loadable modules](modules.md#testing)), and
 `fstest=on` runs the filesystem self-test on `/` once it is mounted
@@ -165,7 +165,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -202,7 +202,7 @@ of their own, a panic run on a static one (`panic offstack`). The report has
 to reach the collector -- the x86 one with the other CPU's stack in it, and
 saying the stack it came from could not be read -- and `panic=1` has to
 reset the machine. Until the lock path stopped asking which task held a lock
-once a panic had begun (`PreemptCurrentTask`), such a report stopped at its
+once a panic had begun (`preempt_current_task`), such a report stopped at its
 first lock, a panic inside the panic that only spins -- with the netconsole
 on, before it had printed a line -- and nothing reset the machine; a double
 fault's would have stopped again at the walk of the stack it came from, and
@@ -253,7 +253,7 @@ looked, they found it faulting still, in two runs of three: a parked CPU's
 halt was a call, whose frame record every wakeup from WFI wrote onto the
 stack the CPU had been interrupted on -- one the boot CPU frees. A parked CPU
 stands on a stack of its own now, and halts in a loop that touches no memory
-(`Cpu::Park`).
+(`Cpu::park`).
 
 ### `nanofs-test.py` -- nanofs
 
@@ -467,7 +467,7 @@ Asserts the read comes back in well under a tick.
 
 It is here because of what the wait primitives used to do. A task waiting for
 another CPU's interrupt -- a synchronous block read, a mutex, the TLB
-shootdown's acks -- polls, and polling with `Schedule()` lets the scheduler
+shootdown's acks -- polls, and polling with `schedule()` lets the scheduler
 hand the CPU to the idle task, which halts it. What such a task waits for is a
 counter or a store in an interrupt handler: no waiter to unblock, no IPI to
 send, so nothing brings the CPU back before its own next tick. The work was
@@ -476,7 +476,7 @@ done microseconds in and the wait cost 10 ms, every time.
 Every other gate is blind to it, which is the point of having this one. The
 precondition is a CPU with *nothing else runnable*, and a smoke boot has more
 polling tasks -- shell, udpsh, dhcp, netconsole, usb -- than CPUs, so
-`Schedule()` never reaches the idle task and every latency looks right. The
+`schedule()` never reaches the idle task and every latency looks right. The
 same unfixed kernel reads at 45k IOPS at `-smp 4` and at 98 IOPS at `-smp 16`.
 It was found on a 12-CPU Hetzner AX41 and nowhere else, after two earlier
 sightings of the same shape (`a171a86`, `ce3087c`) left the primitives
@@ -1198,23 +1198,23 @@ what its header says it does:
   with cell counts, property lengths, strings, interrupts and windows of
   every kind, and damaged: nesting that ends more nodes than it began,
   lengths and name offsets that lie, a header that does, a blob cut short.
-  A sound one's board -- what `Board::Setup` took of each node, the
+  A sound one's board -- what `Board::setup` took of each node, the
   refusals counted, the fallbacks for the rest -- is held to a reader of the
   tree written from `board.h`; any board to what the kernel acts on:
   windows the linear map reaches, interrupts it can take, bus numbers that
   are bus numbers;
 - `memmap`: firmware maps with regions that overlap, are empty, or run past
   the physical address space, and the questions the page allocator asks of
-  them -- the free-page scan, `IsReserved`, `IsUsableRam`, the RAM totals --
+  them -- the free-page scan, `is_reserved`, `is_usable_ram`, the RAM totals --
   answered naively, page by page, in 128-bit arithmetic that cannot wrap;
 - `grubenv`: blocks grub-editenv could have written, damaged, and bytes;
-  `Set`, `Unset`, `Get` and `ForEach` held to the model's variables, room
-  counted to the byte -- and on any block, a `Set` that says yes is what `Get`
+  `set`, `unset`, `get` and `for_each` held to the model's variables, room
+  counted to the byte -- and on any block, a `set` that says yes is what `get`
   gives back and one that says no changes nothing;
 - `module`: `.ko` files as the build makes them, for x86-64 and for arm64 --
   segments, dynamic symbols and relocations, the function table, the kmod
   header -- made to say what the loader must refuse, and damaged, handed to
-  the loader's own `Stage` (all of `Load` up to the module's init, which a
+  the loader's own `stage` (all of `load` up to the module's init, which a
   fuzzer does not run). A sound one's image is held to the segments and the
   relocations, byte for byte; its pages' permissions, its imports, its
   function table and the lookups a backtrace makes through it to the file.
@@ -1223,10 +1223,10 @@ what its header says it does:
   refused, or failed to allocate, leaves every page, mapping and heap block
   as it found them;
 - `pagetable`: the page tables and the physical page allocator past
-  `Setup`, whose state is set up as `Setup` leaves it (it runs on the
+  `setup`, whose state is set up as `setup` leaves it (it runs on the
   bootstrap linear map, which a host process has not got) over a physical
   memory of the host's and an MMU emulated where the kernel reaches memory
-  through it, the TmpMap window: a slot is loaded with the page its entry
+  through it, the tmp_map window: a slot is loaded with the page its entry
   maps when the kernel flushes it or makes the entry valid, the page gets the
   slot's contents back when it is unmapped, and an unmapped slot is poisoned
   for ASan. Pages allocated one at a time and in runs, mapped in every form,
@@ -1235,13 +1235,13 @@ what its header says it does:
   and in a window with two slots left -- are held to `page_table.h`'s
   rules: every page's reference count, every translation, every page free,
   held, a table or the machine's and never two, pages handed out zeroed, a
-  map that fails leaving nothing of its own, no TmpMap slot left behind.
+  map that fails leaving nothing of its own, no tmp_map slot left behind.
   A machine of more than 4 MiB may reserve a huge pool (`hugepages=`) right
   after its free list, as the boot does, and hand its 2 MiB blocks out and
   back: the highest free blocks taken and the pages kept left free, a block
   of the pool never on the free list nor anyone else's, zeroed each time it
   is handed out, and the pool's counts its bitmaps';
-- `heap`: `Mm::Alloc` and `Mm::Free`, the pools, the page runs and the three
+- `heap`: `mm::alloc` and `mm::free`, the pools, the page runs and the three
   ways a driver maps pages, over a page table as `page_table.h` promises it
   and a VA region of the host's -- mapped VA is memory, the rest poisoned --
   with pages and maps failing on the input's word: every block the size
@@ -1259,7 +1259,7 @@ what its header says it does:
   RSDP tags; the framebuffer; modules, `ucode` among other names and names
   the tag cuts short, of ranges empty or not; the tags this kernel skips --
   and damaged: sizes that lie, a tag past the info's end, no end tag. What
-  `ParseMultiBootInfo` leaves -- the memory map region by region, the
+  `parse_multi_boot_info` leaves -- the memory map region by region, the
   command line, the RSDP's copy, the framebuffer, the microcode module's
   range -- is held to the tags read in order, the map's reserved regions
   before its usable RAM;
@@ -1271,7 +1271,7 @@ what its header says it does:
   CPU the input makes up or for another, of revisions above and below the
   one it runs; then one update made unsound in a way the SDM rules out, bytes
   after the last, or bytes of anything written over it. Over a file the
-  generator made, `Choose` is held to a model written from the SDM (Vol. 3A,
+  generator made, `choose` is held to a model written from the SDM (Vol. 3A,
   10.11.1): the newest update for the CPU above its revision, of those before
   the first unsound one; over any file, a choice is an update inside the
   file, sound by the model's reading of one, for the CPU and newer than what
@@ -1282,7 +1282,7 @@ what its header says it does:
   above 4 GiB, across page ends and over each other -- a MADT of every entry
   kind, FADTs, HPET tables and WDATs of every length and each side of the
   fields the kernel reads, the SSDTs and the rest a firmware lists, seconds
-  of the kinds read among them --, now and then damaged anywhere. The TmpMap
+  of the kinds read among them --, now and then damaged anywhere. The tmp_map
   window is emulated to the slot: a mapping is a copy of the pages it maps
   between poisoned ones, a table's mapping is poisoned outside the table,
   so that a read past a table's length is a report and not a read of its
@@ -1295,7 +1295,7 @@ what its header says it does:
   longer than a table may be, no more of the window held at once than
   `acpi.h` bounds, and when the parse is done nothing held but the two
   APICs' pages -- and not those if it failed;
-- `format`: `Stdlib::VsnPrintf`, which every traced line, panic and
+- `format`: `stdlib::vsn_printf`, which every traced line, panic and
   command's output goes through, against the host's own `vsnprintf` --
   what `PRINTF_FORMAT`'s check rests on. Random formats of what it
   implements (`d u x X c s`, `%%`, the flags `0` and `-`, widths, the length
@@ -1305,14 +1305,14 @@ what its header says it does:
   its place, and each int made by cutting a long at the call, so that a
   reader taking an int as a long reads the other half of its slot: what
   fits must be the host's output byte for byte and its length, and what
-  does not, the host's output cut where `VsnPrintf` cuts it and marked with
+  does not, the host's output cut where `vsn_printf` cuts it and marked with
   `...`;
 - `eevdf`: the scheduler's rules (`kernel/eevdf.cpp`): one CPU's queue and
   a handful of tasks of random weights and slices, some that never sleep and
   some that sleep, wake, yield and move away and back -- and one that joins
   on the CPU, as the idle task does when it starts to run something -- with
   time going by a tick, a slice's end or a random quantum at a time, and
-  every decision made in `TaskQueue::Schedule`'s order: the next picked while
+  every decision made in `TaskQueue::schedule`'s order: the next picked while
   the last is still current, the last gone or back on the list, the next
   taken. Every step is held to a model of EEVDF computed from scratch in 128
   bits: the one picked is eligible and no eligible one's deadline is sooner;
@@ -1322,7 +1322,7 @@ what its header says it does:
   its weight says; every task on the queue is on its list or current, never
   both or neither, and the list's count is the model's. A third of the
   inputs are tasks that never sleep, run long enough for slices and quanta to
-  even out: each must have had the CPU in proportion to its weight. A `Leave`
+  even out: each must have had the CPU in proportion to its weight. A `leave`
   that reckoned V without the leaver in it failed the first input;
 - `lineedit`: the console shell's line editor (`kernel/line_editor.cpp`),
   what a terminal on the serial port types at it: any byte, weighted to the
@@ -1357,7 +1357,7 @@ What it found on its first day, each fixed:
 - the device tree reader let an `END_NODE` with no node open take the depth
   below the root, and the next node wrote its cell counts at index -1 of the
   walker's stacks: a write into `.bss` outside them, from the first thing
-  the arm64 boot reads. And `Board::Setup` read every `reg` and `interrupts`
+  the arm64 boot reads. And `Board::setup` read every `reg` and `interrupts`
   by the tree's own cell counts and not the property's length -- a count of
   3 or 2^32, or a property shorter than it said, read past the blob -- and
   took `bootargs` without its NUL. Properties are read through `Fdt::Prop`
@@ -1374,24 +1374,24 @@ What it found on its first day, each fixed:
   question about it wrapped: a reserved region hidden from the free-page
   scan, its pages handed out. A region is cut at 2^52, the physical address
   space of both arches, when it is added, empty ones dropped -- one of those
-  counted as overlapping by `IsReserved` and not by the scan;
-- the GRUB environment block's `ForEach` read a line with no `=` into the
-  next line's name, where `Set` found that line by itself: `Set` said yes
-  and `Get` -- and GRUB -- read something else. `Set` and `Unset` also wrote
-  blocks `ForEach` then called malformed, and `Unset` one with no newline
+  counted as overlapping by `is_reserved` and not by the scan;
+- the GRUB environment block's `for_each` read a line with no `=` into the
+  next line's name, where `set` found that line by itself: `set` said yes
+  and `get` -- and GRUB -- read something else. `set` and `unset` also wrote
+  blocks `for_each` then called malformed, and `unset` one with no newline
   before the padding. The two ways of reading the block share one parser
-  now, and `Set` and `Unset` refuse a block it rejects, as `grub_env.h`
+  now, and `set` and `unset` refuse a block it rejects, as `grub_env.h`
   said they did;
 - the heap's pools allocated a page with their spin lock held, interrupts
   off: when mapping it failed, the page allocator shot down every CPU's TLB
   and waited for them, and a CPU spinning on that pool's lock never answers.
-  The page is allocated with the lock let go of now, as `Pool::Free` already
+  The page is allocated with the lock let go of now, as `Pool::free` already
   gave one back.
 
-And two loud ends made plainer: with no TmpMap slot free, `ZeroPage` and an
-unmap's walk -- `MapRangeLocked`'s undo among them, which would otherwise
+And two loud ends made plainer: with no tmp_map slot free, `zero_page` and an
+unmap's walk -- `map_range_locked`'s undo among them, which would otherwise
 leave pages mapped behind a map that said no -- panic saying so, where one
-was a bare `BugOn` and the other returned without a word. No walk needs more
+was a bare `BUG_ON` and the other returned without a word. No walk needs more
 than two slots, which `pagetable` checks.
 
 And when the x86 boot's own readers were added, each fixed:
@@ -1403,7 +1403,7 @@ And when the x86 boot's own readers were added, each fixed:
   boot protocol passes, and a map longer than that is not a boot that stops
   -- its reserved regions go in first, and the usable RAM past what leaves
   room for the kernel's own regions is left out, and said;
-- ACPI: every table the root listed stayed mapped in the TmpMap window for
+- ACPI: every table the root listed stayed mapped in the tmp_map window for
   good -- the EX44's 25, of a window of 448 slots every page allocation needs
   one of -- where four are read. The four are mapped while `Parse` reads them
   and let go of after, and so is the root, whichever way it ends; what is
@@ -1430,12 +1430,12 @@ And when the x86 boot's own readers were added, each fixed:
 - the command line: `Parameters`'s constructor left two members unset --
   zeros in the kernel only because the object's storage is static.
 
-And when the formatter was put under the compiler's check: `VsnPrintf`
+And when the formatter was put under the compiler's check: `vsn_printf`
 read every integer conversion as a 64-bit slot, whatever the argument was,
 and nothing checked a call -- the convention was to cast each argument to
 `ulong`. The ones that were not were read with whatever the other half of
-their register or stack slot held: the trace level in every `Trace` (an
-int under `%u`), and a few `%d`s and `%u`s of ints. `VsnPrintf` reads C's
+their register or stack slot held: the trace level in every `trace` (an
+int under `%u`), and a few `%d`s and `%u`s of ints. `vsn_printf` reads C's
 printf now, the length modifiers included; every printf-like function
 carries `PRINTF_FORMAT`, the build has `-Wformat=2`, and 924 conversions
 were rewritten to say what they print -- `%lu`, and `%lX` for the addresses
@@ -1443,14 +1443,14 @@ passed as `ulong` under `%p`, which prints what `%p` printed. Two formats
 no check could see, and which the new reading would have misread, were
 found by `-Wformat-nonliteral` and the template it cannot look through:
 `profile`'s usage, a variable, and the idle and softirq tasks' names,
-handed through `TAlloc<Task>` -- `"idle%u"` over a `ulong`. The first is a
+handed through `talloc<Task>` -- `"idle%u"` over a `ulong`. The first is a
 constant the check reads, and a `Task` takes a name rather than a
 format. The boot log is
 the same line for line on both arches, digits aside. And `MemoryMap`'s
 region hint, which `memcheck` read and wrote with no lock while other CPUs
 mapped, is an `Atomic`.
 
-What it does not reach yet: `PageTable::Setup` and the free list's build,
+What it does not reach yet: `PageTable::setup` and the free list's build,
 which run on the bootstrap linear map; anything that needs a second CPU;
 and the block allocator under the dmesg ring (`mm/block_allocator.cpp`),
 which every traced line takes a message from -- though not, as this page
@@ -1685,7 +1685,7 @@ fail, the second load's among them, and the module's own warnings name the
 CPUs left on. With the run stub storing R8 into R9's slot, the hypercall
 guest fails on both CPUs, naming R8 as 0. And with the stub's `vmload` of
 the host's state taken out, the kernel panics at the first exit -- a page
-fault at 0 in `Hal::GetCurrentCpuHwId()`, the guest's GS base -- and the
+fault at 0 in `hal::get_current_cpu_hw_id()`, the guest's GS base -- and the
 gate says so. And `smp` fails two ways more: with the start-up IPI ignored,
 the second CPU never enters, and the report shows the first halted where it
 waits for the second's IPI; with the APIC timer never running out, the

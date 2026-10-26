@@ -384,8 +384,8 @@ read_tsc:
 	ret
 
 read_tscp:
-	; rdi - &cpuIndex
-	rdtscp; result in edx:eax, cpuIndex in ecx
+	; rdi - &cpu_index
+	rdtscp; result in edx:eax, cpu_index in ecx
 	mov qword [rdi], rcx
 	shl rdx, 32
 	or rdx, rax
@@ -480,13 +480,13 @@ atomic_add:
 ; A sequentially consistent load on x86-64 is a plain aligned MOV. This used
 ; `lock xadd` with zero, which reads by way of a read-modify-write: it takes
 ; the cache line for exclusive ownership and dirties it, so every "read"
-; invalidates that line in every other CPU's cache. Task::SelectNextTaskQueue
+; invalidates that line in every other CPU's cache. Task::select_next_task_queue
 ; reads all 64 queue counters on every context switch, and at line rate that
 ; was the top of the profile -- 64 cache lines stolen from their owners per
 ; switch, to look at numbers nobody was changing.
 ;
 ; Nothing is weakened. The C++ mapping for x86-64 is SC-load = MOV, SC-store =
-; XCHG, and AtomicWrite below is already `lock xchg`; the pair is what makes
+; XCHG, and atomic_write below is already `lock xchg`; the pair is what makes
 ; the ordering, not the load.
 atomic_read:
 	mov rax, qword [rdi]

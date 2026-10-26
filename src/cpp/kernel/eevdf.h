@@ -53,7 +53,7 @@ struct SchedEntity
     u64 deadline;
 
     /* What it was owed (positive) or owed (negative) as it left its queue --
-       asleep, or moved to another CPU -- clamped to LagLimit: where it is
+       asleep, or moved to another CPU -- clamped to lag_limit: where it is
        placed when it comes back */
     s64 vlag;
 
@@ -71,7 +71,7 @@ struct SchedEntity
     /* On its queue's run list */
     stdlib::ListEntry entry;
 
-    /* constexpr, so inline: Stdlib::Min takes them by reference */
+    /* constexpr, so inline: stdlib::min takes them by reference */
     static constexpr long NICE_MIN = -20;
     static constexpr long NICE_MAX = 19;
     static constexpr ulong NICE0_WEIGHT = 1024;
@@ -79,10 +79,10 @@ struct SchedEntity
     static constexpr ulong MIN_SLICE_NS = 100 * consts::NANO_SECS_IN_USEC;
     static constexpr ulong MAX_SLICE_NS = 100 * consts::NANO_SECS_IN_MS;
 
-    /* Its weight and VMult for nice, clamped to [NiceMin, NiceMax] */
+    /* Its weight and VMult for nice, clamped to [NICE_MIN, NICE_MAX] */
     void set_nice(long value);
 
-    /* Clamped to [MinSliceNs, MaxSliceNs] */
+    /* Clamped to [MIN_SLICE_NS, MAX_SLICE_NS] */
     void set_slice(ulong value);
 
     /* Virtual nanoseconds that ns on the CPU are worth to it, and the
@@ -116,7 +116,7 @@ private:
    the list before the last left the CPU, the lag the last went to sleep with
    was reckoned from a V without the next in it, and a waiter beside one
    spinner went with none, ever, to wait out what was left of a slice at
-   every wakeup (TestEevdf). Every decision is made over the queue as it is,
+   every wakeup (test_eevdf). Every decision is made over the queue as it is,
    from scratch: V and every eligibility are recomputed, so nothing kept can
    drift. That makes a decision O(n) in the tasks that can run on the CPU,
    which are few. */
@@ -162,7 +162,7 @@ public:
     bool charge(u64 now);
 
     /* The eligible entity whose deadline is soonest, the current one among
-       them when withCurrent; the one whose deadline is soonest if none is
+       them when with_current; the one whose deadline is soonest if none is
        eligible, which is only possible with the current one left out.
        nullptr for nothing to choose. */
     SchedEntity* pick(bool with_current);
@@ -187,7 +187,7 @@ public:
     /* How many entities are on the list */
     ulong get_count();
 
-    /* The list itself, for its owner to look through (SchedEntity::Entry) --
+    /* The list itself, for its owner to look through (SchedEntity::entry) --
        and not to change but by the calls above */
     stdlib::ListEntry& entries() { return list_; }
 

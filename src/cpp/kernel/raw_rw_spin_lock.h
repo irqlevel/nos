@@ -16,13 +16,13 @@ class Task;
  *  >0   = N concurrent readers hold the lock
  *  -1   = one writer holds the lock
  *
- * WriterWaiting: when non-zero, new readers back off and let existing
+ * writer_waiting_: when non-zero, new readers back off and let existing
  * readers drain so the writer can acquire without starvation.
  *
- * Holding either side disables preemption, as RawSpinLock::Lock() does. The
+ * Holding either side disables preemption, as RawSpinLock::lock() does. The
  * writer is one, and the lock keeps whose count it raised. Readers are many
- * at once, so that cannot live in the lock: ReadLock() hands it back and
- * ReadUnlock() takes it, the way WriteLockIrqSave() hands back its flags.
+ * at once, so that cannot live in the lock: read_lock() hands it back and
+ * read_unlock() takes it, the way write_lock_irq_save() hands back its flags.
  */
 class RawRwSpinLock final
 {
@@ -36,9 +36,9 @@ public:
 
     ~RawRwSpinLock() = default;
 
-    /* The returned task goes back to ReadUnlock(). It is nullptr when there
+    /* The returned task goes back to read_unlock(). It is nullptr when there
        was nothing to disable -- preemption not on yet, or no task on this
-       stack -- and ReadUnlock(nullptr) then leaves the count alone, whatever
+       stack -- and read_unlock(nullptr) then leaves the count alone, whatever
        the global gate did in between. */
     Task* read_lock();
     void read_unlock(Task* preempt_task);
@@ -63,9 +63,9 @@ private:
     Atomic value_;
     Atomic writer_waiting_;
 
-    /* Whose preemption WriteLock() disabled, for WriteUnlock() to enable
+    /* Whose preemption write_lock() disabled, for write_unlock() to enable
        again. nullptr when it had nothing to disable, and whenever the lock is
-       not held through WriteLock() -- WriteLockIrqSave's flags carry that
+       not held through write_lock() -- write_lock_irq_save's flags carry that
        instead. */
     Task* writer_preempt_task_;
 };

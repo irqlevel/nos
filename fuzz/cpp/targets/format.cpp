@@ -1,7 +1,7 @@
 // The kernel's printf (lib/format.cpp): every line anything traces, every
-// panic's report and every command's output goes through Stdlib::VsnPrintf,
+// panic's report and every command's output goes through stdlib::vsn_printf,
 // and PRINTF_FORMAT has the compiler hold each call to C's printf rules --
-// which is sound only while VsnPrintf reads each argument as C's printf
+// which is sound only while vsn_printf reads each argument as C's printf
 // does. So it is held to the host's own vsnprintf, format for format:
 // random formats of what it implements -- d u x X c s and %%, the flags 0
 // and -, widths, and the length modifiers hh h l ll z -- among literal
@@ -10,7 +10,7 @@
 // each conversion matching the type at its place, so that some are read
 // from registers and some from the stack. What fits must be the host's
 // output byte for byte and its length; what does not, the host's output cut
-// where VsnPrintf cuts and marked with "..." as it marks it.
+// where vsn_printf cuts and marked with "..." as it marks it.
 #include "host.h"
 
 #include <lib/stdlib.h>
@@ -76,8 +76,8 @@ int host_call(int shape, char* buf, size_t size, const char* fmt, const Args& a)
 }
 
 /* A conversion for what is at the place: its flags, width and length
-   modifier among what VsnPrintf implements, and nothing C leaves undefined
-   (0 with s or c, a width on c, which VsnPrintf does not pad) */
+   modifier among what vsn_printf implements, and nothing C leaves undefined
+   (0 with s or c, a width on c, which vsn_printf does not pad) */
 std::string conversion(fuzz::Input& in, Slot slot)
 {
     std::string c = "%";
@@ -132,7 +132,7 @@ std::string show(const std::string& b)
     return out;
 }
 
-/* What VsnPrintf makes of output that does not fit size bytes: what fits
+/* What vsn_printf makes of output that does not fit size bytes: what fits
    before the mark, the mark as much as fits, NUL-terminated */
 std::string cut(const std::string& full, size_t size)
 {
@@ -189,11 +189,11 @@ void run(fuzz::Input& in)
 
     std::vector<char> buf(size + 1, '\x7F');
     const int len = kernel_call(shape, buf.data(), size, fmt.c_str(), a);
-    INVARIANT(buf[size] == '\x7F', "VsnPrintf wrote past the %zu bytes it was given, on '%s'", size, fmt.c_str());
+    INVARIANT(buf[size] == '\x7F', "vsn_printf wrote past the %zu bytes it was given, on '%s'", size, fmt.c_str());
 
     if (size == 0)
     {
-        INVARIANT(len == 0, "VsnPrintf said %d for a buffer of nothing, on '%s'", len, fmt.c_str());
+        INVARIANT(len == 0, "vsn_printf said %d for a buffer of nothing, on '%s'", len, fmt.c_str());
         fuzz::reached("a buffer of nothing");
         return;
     }
@@ -201,7 +201,7 @@ void run(fuzz::Input& in)
     /* Bytes, not strings: a %c of a value whose low byte is 0 puts a NUL in
        the middle of both */
     INVARIANT(len >= 0 && static_cast<size_t>(len) < size && buf[len] == '\0',
-              "VsnPrintf said %d into %zu bytes and did not end there, on '%s'", len, size, fmt.c_str());
+              "vsn_printf said %d into %zu bytes and did not end there, on '%s'", len, size, fmt.c_str());
     const std::string got(buf.data(), len);
     const std::string full(host, host_len);
     if (static_cast<size_t>(host_len) < size)

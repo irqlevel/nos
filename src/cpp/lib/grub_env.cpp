@@ -106,8 +106,8 @@ bool GrubEnvBlock::free_space(ulong& space)
 
 bool GrubEnvBlock::parse_line(ulong pos, ulong limit, ulong& name_end, ulong& next)
 {
-    /* A backslash would make NextLine and FindLine step over what follows it,
-       and a NUL cut the name ForEach hands out short of the one FindLine
+    /* A backslash would make next_line and find_line step over what follows it,
+       and a NUL cut the name for_each hands out short of the one find_line
        compares */
     ulong p = pos;
     while (p < limit && buf_[p] != '=')
@@ -259,13 +259,13 @@ bool GrubEnvBlock::for_each(Visitor visitor, void* ctx)
         if (!parse_line(pos, size_, name_end, next))
             return false;
 
-        /* ParseLine bounds the name by MaxNameLen */
+        /* parse_line bounds the name by MAX_NAME_LEN */
         char name[MAX_NAME_LEN + 1];
         ulong name_len = name_end - pos;
         mem_cpy(name, buf_ + pos, name_len);
         name[name_len] = '\0';
 
-        /* ParseLine stopped on this line's newline and stepped over escapes
+        /* parse_line stopped on this line's newline and stepped over escapes
            the same way, so the walk cannot run past it */
         char value[MAX_VALUE_LEN + 1];
         ulong value_len = 0;

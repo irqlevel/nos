@@ -13,9 +13,9 @@ namespace kernel
    running machine over the shell.
  
    The expensive parts of a profiler are already in this kernel and are
-   reused rather than rebuilt: SymbolTable::Resolve turns an address into a
+   reused rather than rebuilt: SymbolTable::resolve turns an address into a
    name from the table the two-pass link bakes into the image, and
-   StackTrace::CaptureFrom walks the frame-pointer chain, which is intact
+   StackTrace::capture_from walks the frame-pointer chain, which is intact
    because the whole kernel is built with -fno-omit-frame-pointer. What is
    left is to take a sample on each tick and count them up.
  
@@ -26,7 +26,7 @@ namespace kernel
    an NMI -- it also samples code running with interrupts disabled, which a
    tick by construction never catches. Everywhere else the tick itself takes
    the sample, at 100 Hz per CPU: enough to find a hot function, not enough
-   to show its shape. Report() names the counter the numbers came off.
+   to show its shape. report() names the counter the numbers came off.
 
    The two differ in one way worth knowing before reading a report: the
    counter counts unhalted cycles, so an idle CPU contributes nothing at all,
@@ -65,7 +65,7 @@ public:
     /* Report every task, rather than one. */
     static const ulong NO_PID_FILTER = (ulong)-1;
 
-    /* `chains` caps how many are printed. The default is TopChains; a
+    /* `chains` caps how many are printed. The default is TOP_CHAINS; a
        smaller number is what makes the report readable on a console with no
        scrollback, where the hottest chain is the one that scrolls away. */
     void report(stdlib::Printer& printer, ulong pid_filter, ulong chains = TOP_CHAINS);
@@ -78,7 +78,7 @@ private:
 
     /* One second per CPU at the counter rate, ten at the tick rate. Buffers
        are allocated for the CPUs that are actually running, so the cost is
-       the machine's real width rather than MaxCpus. */
+       the machine's real width rather than MAX_CPUS. */
     static const ulong SAMPLES_PER_CPU = 1024;
 
     /* How many distinct call chains a report can hold, and how many it

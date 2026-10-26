@@ -19,8 +19,8 @@ void preempt_on()
 
 void preempt_on_wait()
 {
-    /* Block until the BSP has globally enabled preemption: PreemptActive
-       starts at zero and PreemptOn() sets it to 1. (Atomic's constructors
+    /* Block until the BSP has globally enabled preemption: preempt_active
+       starts at zero and preempt_on() sets it to 1. (Atomic's constructors
        are constexpr, so a static one is initialised by the compiler; the
        kernel runs no .init_array, and the link refuses one.) */
     while (preempt_active.get() == 0)
@@ -49,7 +49,7 @@ Task* preempt_current_task()
     if (Panicker::get_instance().is_active())
         return nullptr;
 
-    /* What is wrong with this stack, said by the BugOn that finds it */
+    /* What is wrong with this stack, said by the BUG_ON that finds it */
     return Task::get_current_task();
 }
 
@@ -66,9 +66,9 @@ void preempt_disable()
 /* The count has just dropped to zero: a reschedule that came while it was up
    is made now. Only with interrupts on -- off, this is an interrupt handler
    or a section its caller keeps closed, and the reschedule waits for the next
-   PreemptEnable, the handler's own Preempt() or the tick. Only for the task
+   preempt_enable, the handler's own Preempt() or the tick. Only for the task
    that is running: a lock can be released on another's behalf, as
-   SwitchComplete releases the ones Schedule() took in the task it switched
+   switch_complete releases the ones schedule() took in the task it switched
    away from. And not once a panic has begun, which no tick preempts either. */
 static void preempt_run_pending(Task* task)
 {
@@ -100,7 +100,7 @@ Task* preempt_disable_task()
     if (!preempt_is_on())
         return nullptr;
 
-    /* Not GetCurrentTask(), whose BugOn is for callers that know they run on
+    /* Not get_current_task(), whose BUG_ON is for callers that know they run on
        a task: a lock is taken from stacks that are not one. */
     Task* task = Task::try_get_current_task();
     if (task != nullptr)

@@ -10,7 +10,7 @@
    CPU's own model-specific registers, so each core arms and disarms its own.
 
    x86-64 implements it on Intel parts with architectural perfmon version 2
-   or later, and on AMD family 10h and later; everywhere else PmuAvailable()
+   or later, and on AMD family 10h and later; everywhere else pmu_available()
    answers false and the profiler keeps sampling on the tick. */
 namespace hal
 {

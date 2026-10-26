@@ -155,7 +155,7 @@ ulong MemoryMap::get_reserved_end(ulong phy_addr)
 {
     ulong end = 0;
 
-    /* Nothing is there to reserve (AddRegion) */
+    /* Nothing is there to reserve (add_region) */
     if (phy_addr >= MAX_PHYS_ADDR)
         return 0;
 
@@ -165,7 +165,7 @@ ulong MemoryMap::get_reserved_end(ulong phy_addr)
         if (region.type == USABLE_RAM_TYPE)
             continue;
 
-        /* The overlap test IsReserved does, for the page at phyAddr. */
+        /* The overlap test is_reserved does, for the page at phy_addr. */
         if (phy_addr < (region.addr + region.len) &&
             region.addr < (phy_addr + consts::PAGE_SIZE))
         {
@@ -192,7 +192,7 @@ ulong MemoryMap::get_next_reserved_start(ulong phy_addr, ulong limit)
             continue;
 
         /* Rounded down: a region starting mid-page makes that whole page
-           reserved, exactly as IsReserved would have said. */
+           reserved, exactly as is_reserved would have said. */
         ulong start = stdlib::round_down(region.addr, consts::PAGE_SIZE);
         if (start > phy_addr && start < next)
             next = start;

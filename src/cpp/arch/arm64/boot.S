@@ -8,7 +8,7 @@
  * addresses because link-time code<->symbol offsets are preserved.
  *
  * Bootstrap translation (mirrors the x86 4x1GiB linear map):
- *   TTBR1: L0[256] -> L1 with 4x1GiB blocks at KernelSpaceBase + phys
+ *   TTBR1: L0[256] -> L1 with 4x1GiB blocks at KERNEL_SPACE_BASE + phys
  *          block 0 = Device-nGnRE (PL011/GIC/virtio visible immediately),
  *          blocks 1-3 = Normal WB (RAM; kernel image is in block 1).
  *   TTBR0: L0[0] -> L1[1] identity 1GiB Normal block covering the kernel,
@@ -206,7 +206,7 @@ high_entry:
     dsb     nsh
     isb
 
-    /* Cache this CPU's index in TPIDR_EL1 (Hal::GetCurrentCpuHwId reads it) */
+    /* Cache this CPU's index in TPIDR_EL1 (hal::get_current_cpu_hw_id reads it) */
     mrs     x0, mpidr_el1
     and     x0, x0, #0xFF
     msr     tpidr_el1, x0
@@ -325,7 +325,7 @@ BootPgTblIdL1:
     .space 4096
     /* A page of nothing between the boot stack and the identity tables above
        -- which each AP walks the moment it turns its MMU on. main_arm64 fills
-       it with the stack probe's pattern and CpuTable::StartAll checks it
+       it with the stack probe's pattern and CpuTable::start_all checks it
        before starting any AP, so a boot stack that runs off its end is a
        panic, not an identity table zeroed under an AP that then dies with no
        vector to fault to. That is how it showed first: a UBSan build's
@@ -345,7 +345,7 @@ boot_stack_top:
 arm64_ap_ttbr1:
     .space 8
     /* One stack-top pointer per CPU, indexed by the CPU index PSCI CPU_ON
-       passes back in x0. Must hold Kernel::MaxCpus entries; a static_assert
+       passes back in x0. Must hold kernel::MAX_CPUS entries; a static_assert
        in cpu_start_arm64.cpp checks the two agree. */
     .globl arm64_ap_stack_top
 arm64_ap_stack_top:

@@ -52,7 +52,7 @@ private:
     void set_entry(u8 index, u64 data);
 
     /* Backstop for a destination the entry cannot encode; the caller is
-       supposed to have filtered it out with CanTarget() already. */
+       supposed to have filtered it out with can_target() already. */
     u64 check_dest(u8 irq, u64 apic_id);
 
     static const ulong REG_SEL = 0x0;

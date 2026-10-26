@@ -13,7 +13,7 @@ namespace mm
 {
 
 /* The x86 bootstrap linear map: defined in an arch TU so other
-   architectures supply their own BuiltinPageTable::Setup (see
+   architectures supply their own BuiltinPageTable::setup (see
    arch/arm64/builtin_pt.cpp). */
 
 namespace
@@ -46,7 +46,7 @@ bool BuiltinPageTable::setup()
 
     /* Four PDPT entries, each a page directory of 512 2MiB pages: 4GiB.
        That is the whole extent of the bootstrap map, and therefore the
-       ceiling on the RAM the page allocator can take (see GetMappedLimit). */
+       ceiling on the RAM the page allocator can take (see get_mapped_limit). */
     static const ulong KERNEL_MAP_SIZE = 4 * consts::GB;
 
     //Map first 4GB of kernel address space
@@ -123,7 +123,7 @@ bool BuiltinPageTable::setup()
 
 void BuiltinPageTable::map_high_ram()
 {
-    /* The low 4GiB stays exactly as Setup() built it, at 2MiB granularity.
+    /* The low 4GiB stays exactly as setup() built it, at 2MiB granularity.
        Below that line the MTRRs describe MMIO holes with memory types other
        than write-back, and a large page spanning two MTRR types is left to
        the implementation (SDM 11.11.9) -- in practice the most conservative
@@ -164,8 +164,8 @@ void BuiltinPageTable::map_high_ram()
     {
         /* Skip a GiB with no RAM in it: mapping it write-back would license
            speculative reads of unbacked bus space for nothing. Everything
-           usable below MappedLimit still ends up mapped, which is the
-           property GetFreePages relies on. */
+           usable below mapped_limit_ still ends up mapped, which is the
+           property get_free_pages relies on. */
         if (!mmap.has_usable_ram_in(block, block + BLOCK_BYTES))
             continue;
 

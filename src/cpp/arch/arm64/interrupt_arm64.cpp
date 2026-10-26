@@ -10,14 +10,14 @@
 #include <hal/context.h>
 #include <hal/irqchip.h>
 
-/* arm64 backend for the Kernel::Interrupt registration API (the x86 twin
+/* arm64 backend for the kernel::Interrupt registration API (the x86 twin
    is kernel/interrupt.cpp over IDT+IOAPIC). "irq" and "vector" are both
    the GIC INTID here; all INTIDs this kernel uses fit the u8 API
    (SGI 1, PPI 27, UART 33, RTC 34, virtio-mmio 48..79).
 
-   IAR/EOIR convention: ArmIrqEntry owns the pairing — it EOIs after the
+   IAR/EOIR convention: arm_irq_entry owns the pairing — it EOIs after the
    handlers return. The one exception is the IPI, whose handler chain
-   (Cpu::IPI) EOIs itself before it may Schedule() away, exactly like the
+   (Cpu::ipi) EOIs itself before it may schedule() away, exactly like the
    x86 flow. */
 
 namespace kernel
@@ -76,7 +76,7 @@ void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level
 
 /* "irq" is the GIC INTID and is the identity here; the x86-style
    "vector" argument is advisory and ignored (callers like the Rust FFI
-   pass an x86 vector-space value). OnInterruptRegister reports the
+   pass an x86 vector-space value). on_interrupt_register reports the
    INTID back as the effective vector. */
 void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
 {
@@ -92,7 +92,7 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
 
 void Interrupt::shared_dispatch(Context* ctx)
 {
-    (void)ctx; /* dispatch happens in ArmIrqEntry */
+    (void)ctx; /* dispatch happens in arm_irq_entry */
 }
 
 extern "C" void arm_irq_entry(Context* ctx)
@@ -104,7 +104,7 @@ extern "C" void arm_irq_entry(Context* ctx)
         u32 int_id = Gic::read_iar();
         /* The special INTIDs 1020..1023 mean "no (further) interrupt to
            acknowledge" — 1023 is the normal drain-loop terminator. Bound the
-           check to that range: LPIs (>= LpiIntIdBase, i.e. 8192) are numerically
+           check to that range: LPIs (>= LPI_INT_ID_BASE, i.e. 8192) are numerically
            above it and MUST fall through to the LPI dispatch below, otherwise
            they are acknowledged (IAR read raises the running priority) but
            never EOI'd, wedging the CPU interface against every lower/equal
@@ -121,7 +121,7 @@ extern "C" void arm_irq_entry(Context* ctx)
 
         if (int_id == CpuTable::IPI_VECTOR)
         {
-            /* EOIs itself (Hal::IrqEoi in Cpu::IPI) before Schedule */
+            /* EOIs itself (hal::irq_eoi in Cpu::ipi) before Schedule */
             ip_interrupt(ctx);
             continue;
         }
@@ -135,14 +135,14 @@ extern "C" void arm_irq_entry(Context* ctx)
 
         if (int_id == GenericTimer::get_instance().int_id())
         {
-            /* Per-CPU scheduler tick: LocalTick EOIs before it may
-               Schedule() away, so it is not part of the generic path. */
+            /* Per-CPU scheduler tick: local_tick EOIs before it may
+               schedule() away, so it is not part of the generic path. */
             GenericTimer::get_instance().local_tick(ctx);
             continue;
         }
 
         /* Registration is bounded to u8 INTIDs, but the GIC can report up
-           to 1019 — never index IntIds with an unregistered-range id */
+           to 1019 — never index int_ids with an unregistered-range id */
         if (int_id >= MAX_INT_IDS)
         {
             InterruptStats::inc(IrqDummy);
@@ -151,7 +151,7 @@ extern "C" void arm_irq_entry(Context* ctx)
         }
 
         auto& ve = int_ids[int_id];
-        /* Acquire, the other half of RegisterCommon's release: every handler
+        /* Acquire, the other half of register_common's release: every handler
            counted is one whose pointer is there to call */
         const u8 count = __atomic_load_n(&ve.handler_count, __ATOMIC_ACQUIRE);
         if (count == 0)

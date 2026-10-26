@@ -27,7 +27,7 @@ impl Output {
     /// console.
     ///
     /// # Safety
-    /// `printer` is a `Stdlib::Printer*` that outlives the Output.
+    /// `printer` is a `stdlib::Printer*` that outlives the Output.
     pub unsafe fn from_raw(printer: *mut c_void) -> Self {
         Self { printer }
     }
@@ -85,7 +85,7 @@ pub struct Terminal {
 type Handler = dyn Fn(&str, &mut Output) + Send + Sync;
 
 /// How much of a command's help `help` shows: the kernel keeps this many
-/// characters of it (Cmd::DynamicHelpMax) and drops the rest.
+/// characters of it (Cmd::DYNAMIC_HELP_MAX) and drops the rest.
 pub const HELP_MAX: usize = 95;
 
 /// A registered command. Dropping it takes the command away, after any call

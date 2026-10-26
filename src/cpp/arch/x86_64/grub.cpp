@@ -19,10 +19,10 @@ static size_t acpi_rsdp_size;
 static bool acpi_rsdp_is_new;
 
 /* Regions the kernel adds to the memory map itself once the firmware's are
-   in: PageArray's, with room to spare */
+   in: page_array_'s, with room to spare */
 static const ulong KERNEL_CARVE_OUTS = 4;
 
-/* The `ucode` module's physical range; UcodeEnd 0 for none */
+/* The `ucode` module's physical range; ucode_end 0 for none */
 static const char UCODE_MODULE_NAME[] = "ucode";
 static ulong ucode_start;
 static ulong ucode_end;
@@ -82,7 +82,7 @@ static void save_acpi_rsdp(MultiBootTag* tag, bool is_new)
 
 void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
 {
-    trace(0, "MbInfo %p", mb_info);
+    trace(0, "mb_info %p", mb_info);
 
     const void* mb_info_end = stdlib::mem_add(mb_info, mb_info->total_size);
     MultiBootTag * tag;
@@ -129,7 +129,7 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
                console a headless machine has: a firmware's map too long for
                it must not stop the boot without a word. So reserved regions
                go in first and usable RAM after, leaving room for the
-               kernel's own carve-outs (PageArray's): a reserved region left
+               kernel's own carve-outs (page_array_'s): a reserved region left
                out would be pages handed out that are not RAM, a usable one
                only RAM not used, which is said. Only reserved regions too
                many for the table by themselves stop the boot. */

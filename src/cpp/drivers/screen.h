@@ -12,7 +12,7 @@ namespace kernel
    is no text mode at all, so the framebuffer path is the only one that
    produces visible output.
 
-   Setup() picks the backend from what the bootloader reported; every
+   setup() picks the backend from what the bootloader reported; every
    other entry point is a no-op until then, and stays a no-op if no
    usable screen exists (serial still works). */
 namespace screen

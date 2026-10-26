@@ -142,7 +142,7 @@ void Task::block()
 /* The waker's half: whatever it finds, a locked operation -- a failed
    compare-and-swap included -- so that the work it published before is
    ordered before the look, which a plain read would not be on arm64.
-   Blocking: the task never left its CPU, and the Schedule() that would take
+   Blocking: the task never left its CPU, and the schedule() that would take
    it off finds it Queued and keeps it runnable. Sleeping: it left, and this
    call, having won it from any other waker and from its deadline, hands it
    back to its queue. Queued or Waking: someone was first, and nothing is
@@ -186,7 +186,7 @@ void Task::exec_callback()
     if (this != curr)
     {
         diagnose_get_current_task();
-        trace(0, "ExecCallback: this 0x%lX GetCurrentTask 0x%lX rsp 0x%lX",
+        trace(0, "exec_callback: this 0x%lX get_current_task 0x%lX rsp 0x%lX",
             (ulong)this, (ulong)curr, hal::get_sp());
         BUG_ON(true);
     }
@@ -200,7 +200,7 @@ void Task::exec(void *task)
     static_cast<Task *>(task)->exec_callback();
 }
 
-/* Waits that Wait has reported (GetJoinReportCount) */
+/* Waits that Wait has reported (get_join_report_count) */
 static Atomic join_reports;
 
 void Task::wait(ulong report_ns)
@@ -243,7 +243,7 @@ static void task_probe_ipi(void* ctx, Context* ipi_ctx);
    so the IPI queued there -- and the answer its handler writes -- has to
    outlive the call that queued it. On the asker's stack, a CPU that took
    it late would write into whatever that stack had become by then. Under
-   LocateLock, but for the answer, which the handler writes before it brings
+   locate_lock, but for the answer, which the handler writes before it brings
    the IPI's Completion back to 0. */
 struct TaskProbe final
 {
@@ -291,7 +291,7 @@ static void task_probe_ipi(void* ctx, Context* ipi_ctx)
 }
 
 /* Asks every other CPU running whether it is running task, and waits up to
-   answerNs for the answers. True when one was -- where says which,
+   answer_ns for the answers. True when one was -- where says which,
    and where it was -- and when none was but some CPU did not answer: the
    task is on one of those, as far as anything can tell. False when every
    CPU answered no: it has left its CPU since it was seen on one. */
@@ -593,11 +593,11 @@ bool Task::run(class TaskQueue& task_queue, Func func, void* ctx)
 
 Task* Task::get_current_task()
 {
-    /* Derive the task from RSP by rounding down to StackSize boundary.
-       Returns nullptr if the stack doesn't look valid (e.g. during SwitchComplete
+    /* Derive the task from RSP by rounding down to STACK_SIZE boundary.
+       Returns nullptr if the stack doesn't look valid (e.g. during switch_complete
        before the new stack is fully set up, or on a non-task stack).
-       NOTE: no Trace() calls here — Trace takes a lock which calls
-       PreemptDisable -> GetCurrentTask, causing infinite recursion. */
+       NOTE: no trace() calls here — Trace takes a lock which calls
+       preempt_disable -> get_current_task, causing infinite recursion. */
     ulong rsp = hal::get_sp();
     struct Stack* stack_ptr = reinterpret_cast<struct Stack *>(rsp & (~(STACK_SIZE - 1)));
     if (BUG_ON(stack_ptr->magic1 != STACK_MAGIC1))
@@ -622,7 +622,7 @@ Task* Task::get_current_task()
 Task* Task::try_get_current_task()
 {
     /*
-     * Same as GetCurrentTask but without BugOn — returns nullptr
+     * Same as get_current_task but without BUG_ON — returns nullptr
      * on any invalid state. Safe to call from panic context.
      */
     ulong rsp = hal::get_sp();
@@ -646,21 +646,21 @@ Task* Task::try_get_current_task()
 void Task::diagnose_get_current_task()
 {
     /* Safe to call from contexts where Trace is allowed (e.g. Schedule).
-       Re-checks the same conditions as GetCurrentTask but logs the failure. */
+       Re-checks the same conditions as get_current_task but logs the failure. */
     ulong rsp = hal::get_sp();
     struct Stack* stack_ptr = reinterpret_cast<struct Stack *>(rsp & (~(STACK_SIZE - 1)));
 
     trace(0, "DiagTask: rsp 0x%lX base 0x%lX", rsp, (ulong)stack_ptr);
     trace(0, "DiagTask: Magic1 0x%lX expect 0x%lX", stack_ptr->magic1, STACK_MAGIC1);
     trace(0, "DiagTask: Magic2 0x%lX expect 0x%lX", stack_ptr->magic2, STACK_MAGIC2);
-    trace(0, "DiagTask: StackBottom+page 0x%lX StackTop 0x%lX",
+    trace(0, "DiagTask: stack_bottom+page 0x%lX stack_top 0x%lX",
         (ulong)&stack_ptr->stack_bottom[0] + consts::PAGE_SIZE,
         (ulong)&stack_ptr->stack_top[0]);
 
     if (stack_ptr->magic1 == STACK_MAGIC1 && stack_ptr->magic2 == STACK_MAGIC2)
     {
         Task* task = stack_ptr->task;
-        trace(0, "DiagTask: Task 0x%lX TaskMagic 0x%lX expect 0x%lX",
+        trace(0, "DiagTask: Task 0x%lX TASK_MAGIC 0x%lX expect 0x%lX",
             (ulong)task, task->magic_, TASK_MAGIC);
     }
 }
@@ -702,14 +702,14 @@ ulong Task::get_cpu_affinity()
 TaskQueue* Task::select_next_task_queue()
 {
     /* The mirror, not the locked walk: this runs on every context switch,
-       and GetRunningCpus takes the table lock and then each of the 64 CPUs'
-       own locks to read one flag apiece. Nothing ever clears StateRunning,
+       and get_running_cpus takes the table lock and then each of the 64 CPUs'
+       own locks to read one flag apiece. Nothing ever clears STATE_RUNNING,
        so the two answers agree once a CPU has published itself. */
     ulong cpu_mask = CpuTable::get_instance().get_running_cpus_no_lock() & cpu_affinity_;
     if (cpu_mask == 0)
         return nullptr;
 
-    /* Read once: Remove() clears it, and the caller may be about to. */
+    /* Read once: remove() clears it, and the caller may be about to. */
     class TaskQueue* current = task_queue_;
 
     class TaskQueue* best = nullptr;
@@ -842,7 +842,7 @@ size_t TaskTable::sample_cpu(CpuSample* out, size_t max)
         {
             if (++walked > MAX_TASKS_PER_LIST)
             {
-                trace(0, "SampleCpu: task list %lu does not end after %lu entries",
+                trace(0, "sample_cpu: task list %lu does not end after %lu entries",
                     (ulong)i, (ulong)MAX_TASKS_PER_LIST);
                 break;
             }

@@ -11,7 +11,7 @@ public:
     /* constexpr, and the destructor trivial: an Atomic with static storage
        is then initialised by the compiler rather than by a constructor the
        kernel would never run (no .init_array here; the link refuses one).
-       Plain initialisation, not Set(): nothing can see the object before
+       Plain initialisation, not set(): nothing can see the object before
        its constructor returns. */
     constexpr Atomic()
         : value_(0)

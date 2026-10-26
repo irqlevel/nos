@@ -146,7 +146,7 @@ const size_t LINE_LEN_MAX = 256;
 const size_t VALUE_MAX = 32;
 const size_t BACKTRACE_FRAMES = 16;
 
-/* TypeMismatchData::CheckKind, in clang's order. */
+/* TypeMismatchData::check_kind, in clang's order. */
 const char* const CHECK_KIND_NAMES[] = {
     "load of", "store to", "reference binding to", "member access within",
     "member call on", "constructor call on", "downcast of", "downcast of",
@@ -154,7 +154,7 @@ const char* const CHECK_KIND_NAMES[] = {
     "dynamic operation on",
 };
 
-/* InvalidBuiltinData::Kind */
+/* InvalidBuiltinData::kind */
 const u8 BUILTIN_CTZ = 0;
 const u8 BUILTIN_CLZ = 1;
 

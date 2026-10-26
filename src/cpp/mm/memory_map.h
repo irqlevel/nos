@@ -23,9 +23,9 @@ public:
     /* A region as the firmware reported it, or one the kernel carves out;
        false only when the map has no room left. A firmware's map is
        whatever it says, so the region is kept as the map can answer for
-       it: an empty one is dropped, and one reaching past MaxPhysAddr is
+       it: an empty one is dropped, and one reaching past MAX_PHYS_ADDR is
        cut there -- or dropped, if it starts past it -- which leaves every
-       Addr + Len in the map at most MaxPhysAddr, and no query's arithmetic
+       Addr + Len in the map at most MAX_PHYS_ADDR, and no query's arithmetic
        able to wrap. */
     bool add_region(ulong addr, ulong len, ulong type);
 
@@ -58,15 +58,15 @@ public:
        mapped cacheable over unbacked bus space. */
     bool has_usable_ram_in(ulong start, ulong end);
 
-    /* The two queries a page scan wants instead of IsReserved per page. A
+    /* The two queries a page scan wants instead of is_reserved per page. A
        real server's map has twenty-odd reserved regions and sixteen million
        pages, and asking "is this one reserved" about each of them is thirty
        million interval tests for a handful of boundaries.
 
-       GetReservedEnd: if the page at phyAddr overlaps a reserved region, the
+       get_reserved_end: if the page at phy_addr overlaps a reserved region, the
        page-aligned end of the reserved run it is in; 0 if it does not.
-       GetNextReservedStart: the page-aligned start of the next reserved
-       region above phyAddr, or limit if none is below limit. Between the two
+       get_next_reserved_start: the page-aligned start of the next reserved
+       region above phy_addr, or limit if none is below limit. Between the two
        a scan moves boundary to boundary. */
     ulong get_reserved_end(ulong phy_addr);
     ulong get_next_reserved_start(ulong phy_addr, ulong limit);
@@ -74,21 +74,21 @@ public:
     /* Name of a firmware region type, for the shell. */
     static const char* get_region_type_name(ulong type);
 
-    /* True if the physical page containing phyAddr lies in a usable RAM
+    /* True if the physical page containing phy_addr lies in a usable RAM
        (e820 type 1) region. Used to pick cacheability for mappings:
        usable RAM is mapped write-back, everything else (MMIO, reserved,
        ACPI) is mapped uncached. */
     bool is_usable_ram(ulong phy_addr);
 
-    /* True if [phyAddr, phyAddr+len) overlaps any reserved (non-type-1)
+    /* True if [phy_addr, phy_addr+len) overlaps any reserved (non-type-1)
        region — e.g. the DTB carve-out on arm64. The free-page scan must
        skip such pages even when a usable-RAM region covers them. */
     bool is_reserved(ulong phy_addr, ulong len);
 
     /* e820/EFI region types. Ordinary usable RAM is 1; everything else is
        MMIO, firmware-reserved or ACPI, and the page allocator stays out of
-       it. The kernel adds regions of its own (the arm64 DTB, PageArray's
-       backing) as reserved, which is what keeps GetFreePages off them. */
+       it. The kernel adds regions of its own (the arm64 DTB, page_array_'s
+       backing) as reserved, which is what keeps get_free_pages off them. */
     static const ulong USABLE_RAM_TYPE = 1;
     static const ulong RESERVED_TYPE = 2;
 
@@ -115,8 +115,8 @@ private:
     MemoryRegion region_[MAX_REGIONS];
     size_t size_;
 
-    /* Index of the region that last answered IsUsableRam. A hint only, and
-       shared: temp mappings ask under TmpMapLock, and memcheck asks with no
+    /* Index of the region that last answered is_usable_ram. A hint only, and
+       shared: temp mappings ask under tmp_map_lock_, and memcheck asks with no
        lock at all, from any CPU. So it is an Atomic -- a plain word would
        be a data race, however harmless its value -- and every read of it
        is bounds-checked: a stale value costs a full scan, never a wrong

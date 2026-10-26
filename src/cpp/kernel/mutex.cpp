@@ -15,9 +15,9 @@ Mutex::~Mutex()
 
 void Mutex::lock()
 {
-    /* YieldToRunnable, not Schedule: Unlock() is a store and nothing else,
+    /* yield_to_runnable, not Schedule: unlock() is a store and nothing else,
        so a waiter the idle task displaced is woken by no one before the next
-       tick -- see WaitGroup::Wait for what that costs. Keeping the CPU costs
+       tick -- see WaitGroup::wait for what that costs. Keeping the CPU costs
        nothing that was going to be used: the walk hands it to any other
        runnable task first, and only a CPU with none at all spins. */
     while (value_.cmpxchg(1, 0) != 0)

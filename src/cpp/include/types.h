@@ -26,7 +26,7 @@ typedef uint64_t u64;
 /* A function that takes a format string and the arguments it names, checked
    at every call as printf's are: fmtIndex is the format's parameter -- from
    1, and the implicit this is the first of a member function -- and
-   firstArg the first argument's, or 0 for a va_list. Stdlib::VsnPrintf
+   firstArg the first argument's, or 0 for a va_list. stdlib::vsn_printf
    reads each argument as C's printf does, the length modifiers included,
    so what -Wformat accepts is what gets printed; and -Werror makes the rest
    -- a ulong under %u, a string under %d, an argument too few -- a build

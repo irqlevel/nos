@@ -33,7 +33,7 @@ long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
 namespace kernel
 {
 
-/* Pages of its own at one run of VA -- up to PageTable::MaxLargeMapPages of
+/* Pages of its own at one run of VA -- up to PageTable::MAX_LARGE_MAP_PAGES of
    them, physically scattered, mapped writable: a module's image, or the .ko
    file it is read from */
 struct ModulePageRun
@@ -79,7 +79,7 @@ struct LoadedModule
 
     stdlib::ListEntry list_entry;
     char name[ModuleTable::NAME_LEN_MAX + 1];
-    ModulePhase phase;            /* changed only under ModuleTable::Lock */
+    ModulePhase phase;            /* changed only under ModuleTable::lock_ */
     ModulePageRun image;          /* the segments, then the symbol table */
     ulong image_size;              /* the segments' extent */
     ulong text_end;                /* where the last executable segment ends */
@@ -112,7 +112,7 @@ struct ModuleInfo
     u32 version;
     char abi[INFO_ABI_LEN];
     char name[INFO_NAME_LEN];
-    /* params: what insmod's line had after the path, paramsLen bytes of
+    /* params: what insmod's line had after the path, params_len bytes of
        it, NUL-terminated; it and out are valid while the init runs */
     void* (*init)(const char* params, ulong params_len, stdlib::Printer* out);
     void (*exit)(void* instance);
@@ -128,7 +128,7 @@ static_assert(sizeof(KERNEL_ABI) - 1 <= INFO_ABI_LEN, "NOS_MODULE_ABI is too lon
 const ulong ABI_SHOWN = 12;
 
 /* A module's image -- its segments and its symbol table -- and the .ko file
-   it comes from are at most the longest run MapLargePages maps: 16 MiB */
+   it comes from are at most the longest run map_large_pages maps: 16 MiB */
 const ulong MAX_IMAGE_SIZE = mm::PageTable::MAX_LARGE_MAP_PAGES * consts::PAGE_SIZE;
 
 /* A linked .ko has half a dozen program headers; the segment checks compare
@@ -190,7 +190,7 @@ const char* phase_text(ModulePhase phase)
     }
 }
 
-/* Undo AllocPageRun, whatever part of it happened. Unmapping takes the page
+/* Undo alloc_page_run, whatever part of it happened. Unmapping takes the page
    permissions with the PTEs and shoots down every CPU's TLB. */
 void free_page_run(ModulePageRun& run)
 {
@@ -297,7 +297,7 @@ struct LoadCtx
     ulong run_size;           /* all the image's pages, symbol table included */
     ulong text_end;
     ulong imports;
-    const char* permanent_by; /* the first of PermanentImports it imports */
+    const char* permanent_by; /* the first of PERMANENT_IMPORTS it imports */
     const char* func_text;    /* .nos_syms, if it has one */
     ulong func_text_size;
     ulong func_lines;
@@ -475,7 +475,7 @@ stdlib::Error find_symbols(LoadCtx& ctx, stdlib::Printer& out)
     return make_success();
 }
 
-/* The .nos_syms section, measured: BuildFunctions copies and indexes it once
+/* The .nos_syms section, measured: build_functions copies and indexes it once
    the image is mapped. A .ko without one -- linked outside the Makefile --
    loads all the same, and its frames go unnamed. */
 void find_functions(LoadCtx& ctx)
@@ -521,7 +521,7 @@ void find_functions(LoadCtx& ctx)
     }
 }
 
-/* NUL-terminated within the table: FindSymbols checked its last byte */
+/* NUL-terminated within the table: find_symbols checked its last byte */
 const char* sym_name(const LoadCtx& ctx, const elf::Sym& sym)
 {
     return (sym.name < ctx.str_size) ? ctx.strs + sym.name : nullptr;
@@ -546,7 +546,7 @@ ulong lookup_kernel(const char* name)
 /* Every function the module imports, looked up before anything is mapped: a
    module this kernel cannot satisfy is refused with the list of everything it
    lacks. A weak import may go unresolved; it binds to 0. Importing one of
-   PermanentImports makes the module permanent. */
+   PERMANENT_IMPORTS makes the module permanent. */
 stdlib::Error check_imports(LoadCtx& ctx, stdlib::Printer& out)
 {
     ulong missing = 0;
@@ -637,7 +637,7 @@ stdlib::Error apply_reloc(const LoadCtx& ctx, const elf::Rela& rela, stdlib::Pri
         }
         else
         {
-            /* CheckImports vouched for the name, and for a miss being weak:
+            /* check_imports vouched for the name, and for a miss being weak:
                an unresolved weak import is 0, plus the addend like any other */
             value = lookup_kernel(sym_name(ctx, sym)) + rela.addend;
         }
@@ -912,7 +912,7 @@ stdlib::Error protect(const LoadCtx& ctx, stdlib::Printer& out)
             stdlib::round_up(ph.memsz, consts::PAGE_SIZE), writable, executable);
     }
 
-    /* SetRangeProtection flushes only this CPU's TLB */
+    /* set_range_protection flushes only this CPU's TLB */
     CpuTable::get_instance().invalidate_tlb_range(ctx.base, ctx.run_size / consts::PAGE_SIZE);
 
     if (!ok)
@@ -1023,14 +1023,14 @@ struct ModuleJob
         , unload(unload)
         , result(stdlib::Error::SUCCESS)
     {
-        /* StartJob has seen to it that both fit */
+        /* start_job has seen to it that both fit */
         stdlib::mem_cpy(arg, arg_text, stdlib::str_len(arg_text) + 1);
         stdlib::mem_cpy(params, params_text, stdlib::str_len(params_text) + 1);
         output[0] = '\0';
     }
 
     Atomic refs;
-    Atomic state;   /* JobRunning, then JobDone or JobAbandoned */
+    Atomic state;   /* JOB_RUNNING, then JOB_DONE or JOB_ABANDONED */
     bool unload;
     int result;
     char arg[ModuleTable::PATH_LEN_MAX + 1];

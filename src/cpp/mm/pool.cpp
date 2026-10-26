@@ -27,10 +27,10 @@ Pool::~Pool()
 {
     stdlib::AutoLock lock(lock_);
 
-    trace(0, "0x%p blockSize %lu peekBlockCount %lu", this, block_size_, peek_block_count_);
+    trace(0, "0x%p block_size %lu peekBlockCount %lu", this, block_size_, peek_block_count_);
 
     if (block_count_ != 0)
-        trace(0, "0x%p blockSize %lu blockCount %lu", this, block_size_, block_count_);
+        trace(0, "0x%p block_size %lu blockCount %lu", this, block_size_, block_count_);
 
     /* The blocks nobody freed, page by page: the pool keeps no list of the
        blocks out, which every allocation would have to take Lock to join */
@@ -59,7 +59,7 @@ Pool::~Pool()
        watchdog. The watchdog's buckets are where that bit: a leaked
        object's lock shares a bucket with a static's lock, and unregistering
        the static one writes into the leaked one's links -- a page fault in
-       Watchdog::UnregisterSpinLock under Cpu::~Cpu, Serial::~Serial or
+       Watchdog::unregister_spin_lock under Cpu::~Cpu, Serial::~Serial or
        whichever static drew the neighbouring slot. The leaks are reported
        above; their memory is not worth anything at halt. */
 }

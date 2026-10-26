@@ -30,7 +30,7 @@ public:
        route is ignored, the enable lands in this CPU's redistributor. */
     void enable_irq(u32 int_id, ulong mpidr, bool edge);
 
-    /* targetCpu is the kernel's linear CPU index; the MPIDR affinity is
+    /* target_cpu is the kernel's linear CPU index; the MPIDR affinity is
        looked up in the Board CPU list (DTB order == linear index). */
     void send_sgi(ulong target_cpu, u32 int_id);
 
@@ -39,7 +39,7 @@ public:
 
     static const u32 SPURIOUS_INT_ID = 1020;
 
-    /* Must match Hal::IpiVector (hal_irqchip_inline.h) */
+    /* Must match hal::IPI_VECTOR (hal_irqchip_inline.h) */
     static const u32 IPI_SGI = 1;
 
 private:

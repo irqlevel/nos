@@ -63,7 +63,7 @@ private:
 
 	size_t log2(size_t size);
 	bool log_by_size(size_t size, size_t& log);
-	/* zeroPages: whether a block past the pools comes back zeroed */
+	/* zero_pages: whether a block past the pools comes back zeroed */
 	void* alloc_block(size_t size, ulong tag, bool zero_pages);
 
 	struct Header {
@@ -81,10 +81,10 @@ private:
 	   it does on one (heapbench). A CPU's cache keeps a few free blocks of
 	   each size under a lock of its own, which only that CPU takes -- and
 	   Trim -- and trades them with the pools half a cache at a time, the
-	   pool's lock once a batch. A block in a cache is free: FreedTag, and
+	   pool's lock once a batch. A block in a cache is free: FREED_TAG, and
 	   nobody's. */
 	static constexpr size_t CACHE_BLOCKS_MAX = 16;
-	/* The most a CPU's cache of one size holds: CacheBlocksMax blocks, and
+	/* The most a CPU's cache of one size holds: CACHE_BLOCKS_MAX blocks, and
 	   no more bytes than a page -- two of the largest blocks, each of which
 	   has a page to itself */
 	static constexpr size_t CACHE_BYTES = consts::PAGE_SIZE;

@@ -21,20 +21,20 @@ public:
     }
 
     /* BSP once: map registers, provision tables + command queue, enable
-       LPIs on this CPU's redistributor and the ITS. gicrBase/gicrSize come
+       LPIs on this CPU's redistributor and the ITS. gicr_base/gicr_size come
        from the GIC driver (redistributor region for LPI enable). */
     bool setup(ulong its_phys, ulong gicr_base, ulong gicr_size);
 
     bool is_ready() const { return ready_; }
 
-    /* Map a device (PCI RID) with room for `numEvents` events. Idempotent
-       per deviceId. Returns false on failure. */
+    /* Map a device (PCI RID) with room for `num_events` events. Idempotent
+       per device_id. Returns false on failure. */
     bool map_device(u32 device_id, u32 num_events);
 
-    /* Allocate an LPI and map (deviceId, eventId) -> LPI to the boot
+    /* Allocate an LPI and map (device_id, event_id) -> LPI to the boot
        collection; registers `handler` for that LPI. Returns the MSI data
-       value (the eventId) and fills msiAddr with GITS_TRANSLATER; returns
-       0 on failure. Caller writes {msiAddr, eventId} into the MSI-X entry. */
+       value (the event_id) and fills msi_addr with GITS_TRANSLATER; returns
+       0 on failure. Caller writes {msi_addr, event_id} into the MSI-X entry. */
     u32 map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
         u64& msi_addr);
 

@@ -20,15 +20,15 @@ enum ClockSource
 static ClockSource active_source = ClockPit;
 static ulong rtc_epoch_secs = 0;
 
-/* Added to the active source's reading so GetBootTime() stays one
-   continuous timeline across a source switch (see SetClockSource).
+/* Added to the active source's reading so get_boot_time() stays one
+   continuous timeline across a source switch (see set_clock_source).
    The HPET/PIT fallback below defines that timeline and takes no
    offset. */
 static long clock_offset_ns = 0;
 
-/* The timeline GetBootTime() reports: the HPET the kernel reset in
-   Hpet::Setup(), or the PIT when there is no HPET. It runs from before
-   the first GetBootTime() call to the last, so it is the one clock every
+/* The timeline get_boot_time() reports: the HPET the kernel reset in
+   Hpet::setup(), or the PIT when there is no HPET. It runs from before
+   the first get_boot_time() call to the last, so it is the one clock every
    other source is aligned onto and it never takes an offset. */
 static stdlib::Time read_base_clock()
 {
@@ -51,8 +51,8 @@ static stdlib::Time read_clock_source(bool* primary)
     case ClockTsc:
     {
         /* Ask for the source this offset was computed against, not for
-           Tsc::GetTime()'s "best" one: that one silently becomes kvmclock
-           the moment SetupKvmClock() arms it, which would move a ClockTsc
+           Tsc::get_time()'s "best" one: that one silently becomes kvmclock
+           the moment setup_kvm_clock() arms it, which would move a ClockTsc
            reading onto a raw clock with a different zero. */
         stdlib::Time t = (active_source == ClockKvmClock)
             ? Tsc::get_instance().get_time()
@@ -71,10 +71,10 @@ static stdlib::Time read_clock_source(bool* primary)
     return read_base_clock();
 }
 
-/* Point GetBootTime() at another source without moving the clock.
+/* Point get_boot_time() at another source without moving the clock.
 
    Every source has its own zero: the HPET main counter is reset in
-   Hpet::Setup(), the TSC baseline is taken here in TimeInit(), and
+   Hpet::setup(), the TSC baseline is taken here in time_init(), and
    kvmclock counts from VM start. Switching to one raw therefore steps
    the reported time -- back by everything the kernel did between the
    two zeros (the self test alone runs tens of seconds), or forward
@@ -82,21 +82,21 @@ static stdlib::Time read_clock_source(bool* primary)
 
    Whatever holds an absolute deadline across the step then waits it
    out. The 8042 timer that decodes scancodes is armed from
-   Interrupt::Register, before TimeInit, at now + 10ms: step the clock
+   Interrupt::register_handler, before time_init, at now + 10ms: step the clock
    back and nothing decodes a keystroke until the new clock passes that
    mark, so keys pile up in the driver's ring buffer and all land at
    once, half a minute later. Stepping forward instead makes every lock
    the watchdog is timing look held for the size of the step.
 
    The two readings are taken from the new source and from the base
-   clock, never from GetBootTime(): enabling a source can change what the
-   *current* source reads before ActiveSource moves -- SetupKvmClock()
-   flips Tsc::GetTime() over to kvmclock -- so a "before" taken through
-   GetBootTime() would already be on the new raw clock carrying the old
+   clock, never from get_boot_time(): enabling a source can change what the
+   *current* source reads before active_source moves -- setup_kvm_clock()
+   flips Tsc::get_time() over to kvmclock -- so a "before" taken through
+   get_boot_time() would already be on the new raw clock carrying the old
    offset. That measures a zero step, keeps the stale offset and doubles
    the reported boot time.
 
-   IRQs are off because ProcessTimers reads the clock from the tick IPI
+   IRQs are off because process_timers reads the clock from the tick IPI
    on this CPU; the APs are not started yet, so there is no other
    reader. */
 static void set_clock_source(ClockSource source)
@@ -129,7 +129,7 @@ void time_init()
         trace(0, "Time: TSC calibration failed");
     }
 
-    /* Try kvmclock (takes priority over TSC for GetBootTime) */
+    /* Try kvmclock (takes priority over TSC for get_boot_time) */
     if (tsc.setup_kvm_clock())
     {
         set_clock_source(ClockKvmClock);
@@ -145,8 +145,8 @@ void time_init()
     }
 
     /* Read RTC wall clock. Store the epoch of boot time zero, not of
-       now: GetBootTime() already counts the stretch before TimeInit, and
-       GetWallTimeSecs adds the two. */
+       now: get_boot_time() already counts the stretch before time_init, and
+       get_wall_time_secs adds the two. */
     RtcTime rtc;
     if (Rtc::get_instance().read_time(rtc))
     {
@@ -180,8 +180,8 @@ stdlib::Time get_boot_time()
 
 ulong cycle_counter_delta_to_ns(u64 delta)
 {
-    /* Hal::ReadCycleCounter is the TSC here; TscToNs returns 0 until
-       Calibrate() has run. */
+    /* hal::read_cycle_counter is the TSC here; tsc_to_ns returns 0 until
+       calibrate() has run. */
     return Tsc::get_instance().tsc_to_ns(delta);
 }
 

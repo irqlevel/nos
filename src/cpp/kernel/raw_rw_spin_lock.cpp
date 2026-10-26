@@ -7,7 +7,7 @@ namespace kernel
 
 Task* RawRwSpinLock::read_lock()
 {
-    /* Before the acquire, as in RawSpinLock::Lock(): a tick landing between
+    /* Before the acquire, as in RawSpinLock::lock(): a tick landing between
        the two would switch a reader away with the lock held. */
     Task* task = preempt_disable_task();
 

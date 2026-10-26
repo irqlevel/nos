@@ -70,7 +70,7 @@ pub struct ModuleInfo {
     pub abi: [u8; ABI_LEN],
     pub name: [u8; NAME_LEN],
     /// `params`: what `insmod`'s line had after the path, `len` bytes of
-    /// it; `out`: the `Stdlib::Printer` its output goes to. Both valid while
+    /// it; `out`: the `stdlib::Printer` its output goes to. Both valid while
     /// the init runs (`ModuleInfo` in kernel/module.cpp).
     pub init: unsafe extern "C" fn(params: *const u8, len: usize, out: *mut c_void) -> *mut c_void,
     pub exit: unsafe extern "C" fn(state: *mut c_void),
@@ -157,7 +157,7 @@ pub fn __no_params(name: &str, params: &Params, out: &mut Output,
 /// the loader keeps it.
 ///
 /// # Safety
-/// `params` is readable for `len` bytes, and `out` is a `Stdlib::Printer*`,
+/// `params` is readable for `len` bytes, and `out` is a `stdlib::Printer*`,
 /// for as long as the call runs: what the loader hands an init.
 #[doc(hidden)]
 pub unsafe fn __init(name: &str, params: *const u8, len: usize, out: *mut c_void,

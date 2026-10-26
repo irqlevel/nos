@@ -21,7 +21,7 @@ Serial::Serial()
        whatever is written to register 7, an undecoded port reads back 0xFF
        (or 0x00 when something else answers). Laptops that expose no UART
        fail this, and every serial write below is then skipped -- otherwise
-       Wait() burns its full ~1M pause budget per character on a port whose
+       wait() burns its full ~1M pause budget per character on a port whose
        transmitter never reports empty. */
     outb(PORT + 7, 0xAE);
     present_ = (inb(PORT + 7) == 0xAE);

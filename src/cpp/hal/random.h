@@ -12,7 +12,7 @@
 // source the bare-metal machines this kernel boots on all share, which is why
 // it gets a HAL seam of its own.
 //
-// Two functions because the hardware makes the distinction: Seed() asks for
+// Two functions because the hardware makes the distinction: seed() asks for
 // raw conditioned entropy (RDSEED, RNDRRS) and is the right thing to key a
 // pool from, Random() asks the CPU's own whitening DRBG (RDRAND, RNDR) and is
 // the cheap one. Both can legitimately fail -- the entropy behind them is

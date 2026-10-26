@@ -43,11 +43,11 @@ public:
     bool is_valid();
 
     /* Make buf an empty block: the signature, then '#' to the end. size is
-       at least MinSize. */
+       at least MIN_SIZE. */
     static void format(char* buf, ulong size);
 
     /* Look up a variable, false if it is not set. The value comes back
-       unescaped, cut to valueSize - 1. */
+       unescaped, cut to value_size - 1. */
     bool get(const char* name, char* value, ulong value_size);
 
     /* Set a variable, replacing its value if it has one. False when the name
@@ -62,7 +62,7 @@ public:
     /* Visit every variable in order; the visitor returns false to stop.
        Returns false when the block is malformed and stops there: a line
        that is not a comment and has no '=' before its end, a name longer
-       than MaxNameLen or holding a backslash or a NUL, a value without a
+       than MAX_NAME_LEN or holding a backslash or a NUL, a value without a
        newline before the end of the block. A block is malformed by the same
        rules for Set and Unset, which find a variable's line on their own:
        over those lines the two ways of reading the block could not agree on
@@ -81,16 +81,16 @@ private:
     ulong next_line(ulong pos);
 
     /* Bytes of the value starting at pos, escapes included, up to its
-       newline; NoNewline when the block ends first */
+       newline; NO_NEWLINE when the block ends first */
     ulong value_len(ulong pos);
 
     /* Where the '#' padding at the end begins; false when what precedes it
        is not a newline, which is a block GRUB will not write to either */
     bool free_space(ulong& space);
 
-    /* The variable line at pos, as ForEach reads it: where its name ends
+    /* The variable line at pos, as for_each reads it: where its name ends
        and where the line after it begins, before limit; false when it is not
-       one (ForEach says what that is) */
+       one (for_each says what that is) */
     bool parse_line(ulong pos, ulong limit, ulong& name_end, ulong& next);
 
     /* Every line before limit a comment, a blank or a variable line, the

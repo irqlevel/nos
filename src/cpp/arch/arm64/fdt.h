@@ -8,7 +8,7 @@ namespace kernel
 
 /* Minimal flattened-device-tree (DTB) reader: structure-block walk with
    #address-cells/#size-cells tracking. Read-only, no allocation; parsed
-   once at early boot by Board::Setup(). Not a general-purpose parser --
+   once at early boot by Board::setup(). Not a general-purpose parser --
    just enough for QEMU virt (memory, chosen, psci, gic, pl011, pl031,
    virtio_mmio, timer, cpus).
 
@@ -113,8 +113,8 @@ private:
     /* Length of the NUL-terminated string at structure offset `off`,
        bounded by the structure block; (ulong)-1 if unterminated. */
     ulong bounded_name_len(ulong off) const;
-    /* StrCmp(String(nameOff), name), refusing to run past the strings
-       block on a corrupt nameOff / unterminated string. */
+    /* str_cmp(string(name_off), name), refusing to run past the strings
+       block on a corrupt name_off / unterminated string. */
     bool string_matches(u32 name_off, const char* name) const;
 };
 

@@ -137,8 +137,8 @@ bool Tsc::calibrate()
         return false;
     }
 
-    /* FreqHz = medianTicks / (CalibrationMs / 1000)
-     *        = medianTicks * 1000 / CalibrationMs */
+    /* freq_hz_ = median_ticks / (CALIBRATION_MS / 1000)
+     *        = median_ticks * 1000 / CALIBRATION_MS */
     freq_hz_ = median_ticks * MS_PER_SEC / CALIBRATION_MS;
     base_tsc_ = read_tsc();
     calibrated_ = true;
@@ -179,7 +179,7 @@ bool Tsc::setup_kvm_clock()
 
     stdlib::mem_set(pv_clock_, 0, consts::PAGE_SIZE);
 
-    /* Enable kvmclock for the BSP; each AP arms its own entry in ApMain2 */
+    /* Enable kvmclock for the BSP; each AP arms its own entry in ap_main2 */
     if (!enable_kvm_clock_self())
         return false;
 
@@ -219,7 +219,7 @@ stdlib::Time Tsc::kvm_clock_time()
     /* Read this CPU's own entry: an AP reading the BSP's entry would compute
        AP_tsc - BSP_timestamp, which is wrong unless TSCs are perfectly
        synchronized. A never-armed entry is all-zero (mul = 0) and yields 0,
-       which GetBootTime treats as "fall back to HPET/PIT".
+       which get_boot_time treats as "fall back to HPET/PIT".
 
        The entry and the TSC must be sampled on the same vcpu: with
        interrupts enabled the task could be migrated between selecting the
@@ -290,7 +290,7 @@ stdlib::Time Tsc::tsc_time()
         return stdlib::Time(0);
 
     u64 delta = read_tsc() - base_tsc_;
-    /* ns = delta * 1000000000 / FreqHz
+    /* ns = delta * 1000000000 / freq_hz_
      * To avoid overflow: split into seconds + remainder */
     u64 secs = delta / freq_hz_;
     u64 rem = delta % freq_hz_;

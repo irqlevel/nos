@@ -20,13 +20,13 @@ void enable_wx_support();
    Defined per arch. */
 void setup_memory_types();
 
-/* True once SetupMemoryTypes() has made write-combining usable (x86: the
-   CPU has PAT). MapMmioRegion falls back to uncached when it is false. */
+/* True once setup_memory_types() has made write-combining usable (x86: the
+   CPU has PAT). map_mmio_region falls back to uncached when it is false. */
 bool is_write_combining_available();
 
-/* Nonzero if the arch guarantees [physAddr, physAddr+size) is permanently
+/* Nonzero if the arch guarantees [phys_addr, phys_addr+size) is permanently
    mapped (arm64: the boot device-GiB block covering all QEMU-virt MMIO);
-   MapMmioRegion returns it directly instead of building 4K mappings.
+   map_mmio_region returns it directly instead of building 4K mappings.
    x86 returns 0. Defined per arch. */
 ulong mmio_premapped_va(ulong phys_addr, ulong size_bytes);
 
@@ -39,8 +39,8 @@ void sync_instruction_cache(ulong va, ulong size);
 }
 
 // MMU control: TLB invalidation and the translation-root register.
-// Provides namespace Hal { TlbFlushPage, TlbFlushAll, PteMadeValid,
-// GetTranslationRoot, SetTranslationRoot }. Local-CPU semantics only;
+// Provides namespace Hal { tlb_flush_page, tlb_flush_all, pte_made_valid,
+// get_translation_root, set_translation_root }. Local-CPU semantics only;
 // cross-CPU shootdown is built on top via IPIs (kernel/cpu.h InvalidateTlb*).
 #if defined(__x86_64__)
 #include <arch/x86_64/hal_mmu_inline.h>

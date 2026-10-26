@@ -109,7 +109,7 @@ bool ExceptionTable::set_handler(size_t index, ExcHandler handler)
 
 void ExceptionTable::register_exception_handlers()
 {
-    /* #DF is delivered on its own per-CPU IST stack (Gdt::SetupTssSelf):
+    /* #DF is delivered on its own per-CPU IST stack (Gdt::setup_tss_self):
        it fires exactly when the current stack is unusable, and pushing the
        exception frame onto that bad stack would triple-fault instead of
        reaching the panic handler. */
@@ -251,7 +251,7 @@ void ExceptionTable::exc_stack_fault(Context* ctx)
     exc_stack_fault_counter_.inc();
 
     /* A read the panic report was not sure of: back into the report (see
-       Panicker::RecoverFault), and this one is not reported. The same in
+       Panicker::recover_fault), and this one is not reported. The same in
        the next two. */
     Panicker::get_instance().recover_fault();
 

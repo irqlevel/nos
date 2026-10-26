@@ -13,15 +13,15 @@ namespace mm
    arch/x86_64/pte.h — the accessor/helper names are the cross-arch
    contract used by mm/page_table.cpp):
 
-   - SetPresent() marks a valid TABLE entry (levels 0-2) or PAGE entry
+   - set_present() marks a valid TABLE entry (levels 0-2) or PAGE entry
      (level 3): both need bit1 set. It also sets AF|SH(inner) — those bits
      are ignored on table descriptors, required on leaves.
-   - SetHuge() converts the entry to a BLOCK descriptor (bit1 cleared),
+   - set_huge() converts the entry to a BLOCK descriptor (bit1 cleared),
      used for 2MiB mappings at the L2 level — same geometry as x86.
-   - SetWritable() clears AP[2]: 0 (the default) is EL1-RW, so it matters
-     only to undo SetReadOnly(), which PageTable::SetRangeProtection does
+   - set_writable() clears AP[2]: 0 (the default) is EL1-RW, so it matters
+     only to undo set_read_only(), which PageTable::set_range_protection does
      (x86 always sets W too).
-   - SetCacheDisabled() selects MAIR AttrIndx 1 = Device-nGnRE, clears SH
+   - set_cache_disabled() selects MAIR AttrIndx 1 = Device-nGnRE, clears SH
      (ignored for device memory) and sets PXN|UXN. Default AttrIndx 0 =
      Normal WB.
    - No hardware AF management: a valid entry without AF faults, so AF is
@@ -60,7 +60,7 @@ struct Pte final
         value |= address;
     }
 
-    /* Call-order independent w.r.t. SetHuge: the software "huge" marker
+    /* Call-order independent w.r.t. set_huge: the software "huge" marker
        (bit 55, ignored by the MMU) decides whether the descriptor is a
        table/page (bit1 set) or a block (bit1 clear). */
     void set_present()
@@ -96,7 +96,7 @@ struct Pte final
     void set_writable()
     {
         /* AP[2]=0 is EL1 read-write: what a fresh entry already is, and what
-           undoes SetReadOnly() */
+           undoes set_read_only() */
         value &= ~AP_READ_ONLY;
     }
 

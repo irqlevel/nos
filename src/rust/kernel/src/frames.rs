@@ -1,8 +1,8 @@
 //! The boot's check of frames -- pages mapped nowhere, which a guest's memory
 //! is made of -- written and read back through the kernel's temporary window:
-//! what every copy of a guest's memory goes through (`FrameCopy` in
+//! what every copy of a guest's memory goes through (`frame_copy` in
 //! kernel/rust_ffi.cpp), and each CPU with a slot of the window of its own for
-//! it (`PageTable::MapFrameSlot`). So every CPU reads the frame back through
+//! it (`PageTable::map_frame_slot`). So every CPU reads the frame back through
 //! its own slot. A failure panics, as the boot's other self-tests do.
 
 use core::sync::atomic::{AtomicU64, Ordering};

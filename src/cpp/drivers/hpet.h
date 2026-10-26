@@ -17,7 +17,7 @@ namespace kernel
  * Comparator 0 is programmed for 100 Hz periodic mode; the interrupt
  * broadcasts an IPI to all CPUs exactly like PIT::Interrupt.
  *
- * GetTime() reads the MAIN_CNT register directly for sub-microsecond
+ * get_time() reads the MAIN_CNT register directly for sub-microsecond
  * precision without depending on the interrupt counter.
  *
  * Legacy replacement mode (LEG_RT_CNF) is used: timer 0 replaces
@@ -39,11 +39,11 @@ public:
     }
 
     /* Map MMIO from ACPI, read GCAP, configure comparator 0.
-       Must be called after Acpi::Parse() and after page allocator is up.
+       Must be called after Acpi::parse() and after page allocator is up.
        Returns false if no HPET ACPI table or mapping fails. */
     bool setup();
 
-    /* true once Setup() succeeds */
+    /* true once setup() succeeds */
     bool is_available();
 
     /* Monotonic time read directly from MAIN_CNT (high precision) */
@@ -103,7 +103,7 @@ private:
     volatile u64* mmio_;  /* mapped HPET MMIO base (null = not available) */
     u64 period_fs_;        /* counter period in femtoseconds */
     ulong freq_hz_;       /* derived counter frequency */
-    ulong tick_period_ns_;  /* nanoseconds per tick at DesiredHz */
+    ulong tick_period_ns_;  /* nanoseconds per tick at DESIRED_HZ */
     int int_vector_;
 
     /* Interrupt-driven coarse counter (kept in sync for callers that use it) */

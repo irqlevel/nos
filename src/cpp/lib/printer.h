@@ -24,7 +24,7 @@ public:
     virtual void backspace() = 0;
 
     /* What the person at the other end types, for a command that reads it
-       while it runs: up to len bytes, waiting up to timeoutNs for some.
+       while it runs: up to len bytes, waiting up to timeout_ns for some.
        0 when the time passed with nothing, -1 when no one can type here --
        the console, the UDP shell, /etc/rc -- or no more will come. Only an
        SSH session's printer has anyone to ask (kernel_cmd_dispatch_io). */

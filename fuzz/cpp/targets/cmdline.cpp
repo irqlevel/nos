@@ -5,9 +5,9 @@
 // bring up. A line is built from the input of the parameters
 // docs/kernel-parameters.md names, with values right and wrong, of words
 // nobody named, of tokens past the longest one taken and of lines past the
-// longest one kept, and handed to Parameters::Parse; every getter is held to
+// longest one kept, and handed to Parameters::parse; every getter is held to
 // a reader of the line written from parameters.h: tokens split on spaces, a
-// parameter longer than MaxParamLen skipped, a line past CmdlineLen - 1 read
+// parameter longer than MAX_PARAM_LEN skipped, a line past CMDLINE_LEN - 1 read
 // up to its last whole parameter, each key's value taken as its branch says,
 // the last word on a key the one that counts.
 #include "host.h"
@@ -325,7 +325,7 @@ void take(Expected& e, const std::string& token)
 Expected read(const std::string& line)
 {
     Expected e;
-    /* What is kept of the line: CmdlineLen - 1 characters, and if that cuts
+    /* What is kept of the line: CMDLINE_LEN - 1 characters, and if that cuts
        through a parameter, only up to the one before it */
     const size_t keep = Parameters::CMDLINE_LEN - 1;
     std::string kept = line.substr(0, keep);

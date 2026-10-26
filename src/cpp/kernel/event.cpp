@@ -28,7 +28,7 @@ void Event::wait()
     Task* self = Task::get_current_task();
 
     /* One waiter at a time, claimed for the whole wait: a second would take
-       over the slot, and each Signal() would then wake one of the two. */
+       over the slot, and each signal() would then wake one of the two. */
     BUG_ON(waiter_.cmpxchg((long)self, 0) != 0);
 
     for (;;)
@@ -39,13 +39,13 @@ void Event::wait()
             break;
 
         /* Interrupts off from the moment the flag goes up until it is down
-           again. The tick and every IPI end in a Schedule() of their own, and
+           again. The tick and every IPI end in a schedule() of their own, and
            one landing while the flag is up switches the task out as a
            blocked one: asleep on a signal it never looked at, or had just
            seen, which nothing may ever send again. That is not a theory -- it
            is how the block server's worker went to sleep for good with fifty
-           requests queued. The task comes back from its own Schedule(), when
-           it is woken, with interrupts still off: Schedule() saves and
+           requests queued. The task comes back from its own schedule(), when
+           it is woken, with interrupts still off: schedule() saves and
            restores them per task. */
         ulong flags = hal::irq_save();
 
@@ -56,8 +56,8 @@ void Event::wait()
             schedule();
 
         /* Running again: the signaller cleared the flag, the re-check found
-           the signal, or Schedule() had nobody else to run. Down before
-           interrupts come back on -- a tick held off until the IrqRestore
+           the signal, or schedule() had nobody else to run. Down before
+           interrupts come back on -- a tick held off until the irq_restore
            would find it still up. */
         self->unblock();
 
@@ -71,7 +71,7 @@ bool Event::wait_for(unsigned long long timeout_ns)
 {
     Task* self = Task::get_current_task();
 
-    /* One waiter at a time, as in Wait() */
+    /* One waiter at a time, as in wait() */
     BUG_ON(waiter_.cmpxchg((long)self, 0) != 0);
 
     ulong start = get_boot_time().get_value();
@@ -88,9 +88,9 @@ bool Event::wait_for(unsigned long long timeout_ns)
         if (get_boot_time().get_value() >= until)
             break;
 
-        /* Wait()'s window, interrupts off from the flag going up until it is
+        /* wait()'s window, interrupts off from the flag going up until it is
            down again, with the deadline beside it for the scheduler: a
-           Signal() unblocks the task, and so does its time coming. */
+           signal() unblocks the task, and so does its time coming. */
         ulong flags = hal::irq_save();
 
         waiter_cpu_.set((long)CpuTable::get_instance().get_current_cpu_id());
@@ -128,8 +128,8 @@ void Event::signal()
     waiter->unblock();
 
     /* Unblocked is not running: an idle CPU would not look at its queue again
-       until the next tick. The IPI ends in Schedule(), which finds the task
-       runnable -- the same kick SoftIrq::Raise gives its tasks. */
+       until the next tick. The IPI ends in schedule(), which finds the task
+       runnable -- the same kick SoftIrq::raise gives its tasks. */
     hal::send_ipi((ulong)waiter_cpu_.get(), CpuTable::IPI_VECTOR);
 }
 
