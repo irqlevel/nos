@@ -188,7 +188,13 @@ pub struct Save {
     pub br_to: u64,
     pub last_excp_from: u64,
     pub last_excp_to: u64, // 0x690
-    _reserved_698: [u8; 0x1000 - 0x698],
+    _reserved_698: [u8; 0x6E0 - 0x698],
+    /// The guest's IA32_SPEC_CTRL, on a CPU with virtual SPEC_CTRL
+    /// (`super::V_SPEC_CTRL`): `vmrun` loads it, and the `#vmexit` saves
+    /// it here and puts the host's back. A CPU without the feature never
+    /// reads it.
+    pub spec_ctrl: u64, // 0x6E0
+    _reserved_6e8: [u8; 0x1000 - 0x6E8],
 }
 
 /// The whole of it: one page, page-aligned.
@@ -270,6 +276,7 @@ const _: () = {
     assert!(S + offset_of!(Save, g_pat) == 0x668);
     assert!(S + offset_of!(Save, dbgctl) == 0x670);
     assert!(S + offset_of!(Save, last_excp_to) == 0x690);
+    assert!(S + offset_of!(Save, spec_ctrl) == 0x6E0);
 };
 
 /// A VMCB in a page of its own: what a guest runs from, or -- with only its

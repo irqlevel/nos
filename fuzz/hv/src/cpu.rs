@@ -131,6 +131,12 @@ pub mod x86 {
             host_is_intel() && host() & 2 != 0
         }
 
+        /// An Intel host's VMX secondary controls `enable RDTSCP` and
+        /// `enable INVPCID`: there or not, made up with the rest of it.
+        pub fn vmx_rdtscp_invpcid() -> (bool, bool) {
+            (host() & (1 << 46) != 0, host() & (1 << 47) != 0)
+        }
+
         /// The host's IA32_ARCH_CAPABILITIES, where its CPUID offers it (leaf
         /// 7, EDX bit 29): every bit made up with the rest of the host.
         pub fn arch_capabilities() -> Option<u64> {
@@ -196,8 +202,36 @@ pub mod x86 {
                     _ => {}
                 }
             }
+            /* PKU and PKRU's component as a CPU with them has them, now and
+             * then -- Intel's offset or AMD's, and once in a while a size no
+             * CPU gives it -- for `fp`'s `offered` to take or leave. */
+            if host() & HOST_PKU != 0 {
+                match (leaf, sub) {
+                    (7, 0) => r.ecx |= ECX7_PKU,
+                    (0xD, 0) => r.eax |= XCR0_PKRU_BIT,
+                    (0xD, 9) => {
+                        r.eax = if host() & HOST_PKRU_ODD != 0 { r.eax } else { PKRU_BYTES };
+                        r.ebx = if host() & HOST_PKRU_AMD != 0 { PKRU_OFFSET_AMD } else { PKRU_OFFSET_INTEL };
+                        r.ecx &= 0b10;
+                        r.edx = 0;
+                    }
+                    _ => {}
+                }
+            }
             Some(r)
         }
+
+        /* PKU: leaf 7 ECX's, XCR0's bit, PKRU's size and its offsets on an
+         * Intel CPU and an AMD one; and which host has it, where, and with a
+         * size no CPU gives it. */
+        const ECX7_PKU: u32 = 1 << 3;
+        const XCR0_PKRU_BIT: u32 = 1 << 9;
+        const PKRU_BYTES: u32 = 8;
+        const PKRU_OFFSET_INTEL: u32 = 2688;
+        const PKRU_OFFSET_AMD: u32 = 2432;
+        const HOST_PKU: u64 = 1 << 44;
+        const HOST_PKRU_AMD: u64 = 1 << 45;
+        const HOST_PKRU_ODD: u64 = 1 << 48;
 
         /* Leaf 1 ECX's XSAVE and AVX, and AVX's component's size and offset
          * in leaf 0xD. */
@@ -214,6 +248,67 @@ pub mod x86 {
         }
     }
 
+    /// hvarch's: what of RDTSCP, RDPID and INVPCID runs in a guest --
+    /// what this input's host's leaves have, and on an Intel host, whose
+    /// guests VT-x runs, what its secondary controls let run, made up with
+    /// the rest of it; on an AMD host all of what the leaves have, as AMD-V
+    /// runs them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Offers {
+        pub rdtscp: bool,
+        pub rdpid: bool,
+        pub invpcid: bool,
+    }
+
+    pub fn offers() -> Offers {
+        let ext1 = cpu::cpuid_count(0x8000_0001, 0);
+        let leaf7 = cpu::cpuid_count(7, 0);
+        let (rdtscp, invpcid) = if cpu::host_is_intel() { cpu::vmx_rdtscp_invpcid() } else { (true, true) };
+        Offers {
+            rdtscp: rdtscp && ext1.is_some_and(|r| r.edx & (1 << 27) != 0),
+            rdpid: rdtscp && leaf7.is_some_and(|r| r.ecx & (1 << 22) != 0),
+            invpcid: invpcid && leaf7.is_some_and(|r| r.ebx & (1 << 10) != 0),
+        }
+    }
+
+    /// hvarch's `spec`, as the policy sees it: what of IA32_SPEC_CTRL and
+    /// IA32_PRED_CMD a guest may write -- every control this input's host's
+    /// leaves name, Intel's and AMD's both, as hvarch's `cpu_controls` finds
+    /// them in a CPU's.
+    pub mod spec {
+        use super::cpu;
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Controls {
+            pub spec_ctrl: u64,
+            pub pred_cmd: u64,
+        }
+
+        pub fn guest_controls() -> Controls {
+            let has = |yes: bool, bits: u64| if yes { bits } else { 0 };
+            let structured = cpu::cpuid_count(7, 0);
+            let edx = structured.map_or(0, |r| r.edx);
+            let edx2 = match structured {
+                Some(r) if r.eax >= 2 => cpu::cpuid_count(7, 2).map_or(0, |r| r.edx),
+                _ => 0,
+            };
+            let sizes = cpu::cpuid_count(0x8000_0008, 0).map_or(0, |r| r.ebx);
+            let features2 = cpu::cpuid_count(0x8000_0021, 0).map_or(0, |r| r.eax);
+            let bit = |word: u32, b: u32| word & (1 << b) != 0;
+            Controls {
+                spec_ctrl: has(bit(edx, 26) || bit(sizes, 14), 1 << 0)
+                    | has(bit(edx, 27) || bit(sizes, 15), 1 << 1)
+                    | has(bit(edx, 31) || bit(sizes, 24), 1 << 2)
+                    | has(bit(edx2, 0) || bit(sizes, 28), 1 << 7)
+                    | has(bit(edx2, 1), (1 << 3) | (1 << 4))
+                    | has(bit(edx2, 2), (1 << 5) | (1 << 6))
+                    | has(bit(edx2, 3), 1 << 8)
+                    | has(bit(edx2, 4), 1 << 10),
+                pred_cmd: has(bit(edx, 26) || bit(sizes, 12), 1 << 0) | has(bit(features2, 27), 1 << 7),
+            }
+        }
+    }
+
     /// hvarch's `fp`, as the policy and the run loop see it: the XCR0
     /// components a guest is offered, found in this input's host's leaves
     /// as hvarch's `supported` finds them in a CPU's -- XSAVE, the x87 and
@@ -225,6 +320,7 @@ pub mod x86 {
         pub const XCR0_X87: u64 = 1 << 0;
         pub const XCR0_SSE: u64 = 1 << 1;
         pub const XCR0_AVX: u64 = 1 << 2;
+        pub const XCR0_PKRU: u64 = 1 << 9;
 
         pub fn offered() -> u64 {
             const ECX_XSAVE: u32 = 1 << 26;
@@ -240,7 +336,10 @@ pub mod x86 {
             }
             let fits = cpu::cpuid_count(0xD, 2).map_or(false, |c| c.eax == 256 && c.ebx == 576);
             let avx = features.ecx & ECX_AVX != 0 && has & XCR0_AVX != 0 && fits;
-            XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 }
+            let pkru_fits = cpu::cpuid_count(0xD, 9).map_or(false, |c| c.eax == 8 && c.ebx >= 832);
+            let pkru = has & XCR0_PKRU != 0 && pkru_fits
+                && cpu::cpuid_count(7, 0).map_or(false, |c| c.ecx & (1 << 3) != 0);
+            XCR0_X87 | XCR0_SSE | if avx { XCR0_AVX } else { 0 } | if pkru { XCR0_PKRU } else { 0 }
         }
     }
 
@@ -498,6 +597,12 @@ pub mod vm {
         /// The guest's XCR0, as hvarch's `GuestFp` keeps it: the x87 alone
         /// out of reset, and whatever XSETBV the run loop performed made it.
         xcr0: u64,
+        /// The guest's TSC_AUX and IA32_SPEC_CTRL, as hvarch's `GuestMsrs`
+        /// keeps them: 0 out of reset, and whatever WRMSR the run loop
+        /// performed made them; and the IBPBs it asked for.
+        tsc_aux: u64,
+        spec_ctrl: u64,
+        ibpbs: u64,
         /// VT-x's virtual APIC, as the machine is said to have one: CR8 its
         /// VTPR, never an exit, and while the run loop has virtual-interrupt
         /// delivery on (`apicv`), this model is the CPU that delivers VIRR's
@@ -555,6 +660,9 @@ pub mod vm {
                 cr4: 0,
                 debug_addrs: [0; 4],
                 xcr0: crate::x86::fp::XCR0_X87,
+                tsc_aux: 0,
+                spec_ctrl: 0,
+                ibpbs: 0,
                 vapic: false,
                 apicv: false,
                 virr: [0; 8],
@@ -778,6 +886,31 @@ pub mod vm {
         }
         pub fn fp_loads(&self) -> u64 {
             0
+        }
+        /// As vm.rs's: the guest's MSRs its save area does not hold.
+        pub fn own_msrs(&self) -> crate::policy::Own {
+            crate::policy::Own { tsc_aux: self.tsc_aux, spec_ctrl: self.spec_ctrl, ibpbs: self.ibpbs }
+        }
+        /// As vm.rs's, over hvarch's `GuestMsrs::set`: held to what the MSRs
+        /// can hold -- a value the policy took that an entry's WRMSR of it
+        /// would fault on in the host is a finding, not a #GP -- and an IBPB
+        /// asked for one at a time, where the CPU has one.
+        pub fn set_own_msrs(&mut self, own: &crate::policy::Own) -> bool {
+            invariant!(own.tsc_aux >> 32 == 0, "TSC_AUX made {:#x}, which the MSR cannot hold", own.tsc_aux);
+            let runs = crate::x86::offers();
+            invariant!(runs.rdtscp || runs.rdpid || own.tsc_aux == self.tsc_aux,
+                       "TSC_AUX made {:#x} in a guest offered neither RDTSCP nor RDPID", own.tsc_aux);
+            let controls = crate::x86::spec::guest_controls();
+            invariant!(own.spec_ctrl & !controls.spec_ctrl == 0,
+                       "IA32_SPEC_CTRL made {:#x}, bits {:#x} of it no control the CPU has", own.spec_ctrl,
+                       own.spec_ctrl & !controls.spec_ctrl);
+            invariant!(own.ibpbs == self.ibpbs || (own.ibpbs == self.ibpbs.wrapping_add(1) && controls.pred_cmd != 0),
+                       "the IBPBs asked for went from {} to {} (the CPU's PRED_CMD {:#x})", self.ibpbs, own.ibpbs,
+                       controls.pred_cmd);
+            self.tsc_aux = own.tsc_aux;
+            self.spec_ctrl = own.spec_ctrl;
+            self.ibpbs = own.ibpbs;
+            true
         }
         /// As VT-x's: CR8 to or from a register, and stepped past.
         pub fn cr8_access(&mut self, write: bool, gpr: u8) {
