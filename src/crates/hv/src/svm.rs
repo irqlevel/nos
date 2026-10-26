@@ -59,6 +59,8 @@ const LEN_MSR: u64 = 2;
 const LEN_VMMCALL: u64 = 3;
 const LEN_WBINVD: u64 = 2;
 const LEN_ICEBP: u64 = 1;
+/// XSETBV is `0F 01 D1`.
+const LEN_XSETBV: u64 = 3;
 /// PAUSE is `F3 90`, REP NOP.
 const LEN_PAUSE: u64 = 2;
 /// With the pause filter, how many PAUSEs in a row a guest runs before its
@@ -256,7 +258,7 @@ pub fn protected_mode(s: &mut vmcb::Save, p: &ProtectedMode, efer: u64) {
 /// the processor's signature -- family, model and stepping, CPUID leaf 1's
 /// EAX -- as the guest's CPUID gives it.
 pub fn reset_regs() -> GuestRegs {
-    GuestRegs { rdx: u64::from(crate::policy::cpuid(1, 0, 0, true).eax), ..GuestRegs::default() }
+    GuestRegs { rdx: u64::from(crate::policy::cpuid(1, 0, &crate::policy::Asker::RESET).eax), ..GuestRegs::default() }
 }
 
 /// Exceptions that push an error code, which an intercept of them leaves
@@ -366,6 +368,7 @@ impl Vcpu {
             Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
             Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
             Err(NotRun::Controls { cpu, field, missing }) => return Err(Refusal::Controls { cpu, field, missing }),
+            Err(NotRun::Xstate { cpu, xcr0 }) => return Err(Refusal::Xstate { cpu, xcr0 }),
         };
         self.requeue_event();
         /* The NMI handler's IRET, stopped at on the way in, has run once the
@@ -750,6 +753,28 @@ impl Vcpu {
         self.skip(LEN_ICEBP);
     }
 
+    /// Step past an XSETBV performed for the guest (`crate::cr::xsetbv`).
+    pub fn skip_xsetbv(&mut self) {
+        self.skip(LEN_XSETBV);
+    }
+
+    /// The guest's XCR0, which its entries make the CPU's.
+    pub fn xcr0(&self) -> u64 {
+        self.guest.xcr0()
+    }
+
+    /// Make `value` the guest's XCR0, for an XSETBV of it performed for the
+    /// guest: false, and nothing changed, for one a CPU refuses.
+    pub fn set_xcr0(&mut self, value: u64) -> bool {
+        self.guest.set_xcr0(value)
+    }
+
+    /// How many entries put the guest's x87, SSE and AVX registers back into
+    /// a CPU that held another's.
+    pub fn fp_loads(&self) -> u64 {
+        self.guest.fp_loads()
+    }
+
     /// Give the guest an exception of its own the host intercepted -- #DB,
     /// #AC, intercepted always for the delivery loops a guest could make of
     /// them -- as the CPU would have delivered it: the hardware exception,
@@ -815,8 +840,9 @@ impl Vcpu {
 
     /// Inject an invalid-opcode fault on the next entry: what a CPU raises for
     /// an instruction it does not have, and so the answer to one the guest
-    /// was told by CPUID is not there -- MONITOR, MWAIT, RDTSCP, RDPRU,
-    /// XSETBV -- and runs anyway. The guest's RIP stays on the instruction.
+    /// was told by CPUID is not there -- MONITOR, MWAIT, RDTSCP, RDPRU --
+    /// and runs anyway, or an XSETBV with CR4.OSXSAVE clear. The guest's RIP
+    /// stays on the instruction.
     pub fn inject_ud(&mut self) {
         use vmcb::event;
         const VECTOR_UD: u64 = 6;

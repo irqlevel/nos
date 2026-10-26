@@ -724,6 +724,7 @@ const SEVERAL: &[SeveralSpec] = &[
     },
 ];
 
+#[inline(never)]
 fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let s = (spec.run)(machine);
@@ -756,13 +757,20 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME]
+            .into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
 /// guest of more than one CPU, its others on tasks of their own, on other
 /// CPUs the extension is on for -- and say what it did. `None` when there is
 /// no such guest; otherwise whether it did what it was told.
+///
+/// Each guest's runner is a frame of its own (`#[inline(never)]`), there
+/// only while that guest runs. Inlined here, the runners' frames came to
+/// 17.6 KiB under every guest, and with the `asid` guest's -- its VMs made
+/// beneath them -- to 57 KiB of the task's 64: one more runner's frame took
+/// the task off the end of its stack.
 pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
     if name == SMP_NAME {
         return Some(run_smp(machine, &SMP_GUEST, out));
@@ -788,6 +796,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     if name == DR_NAME {
         return Some(run_dr(machine, out));
     }
+    if name == AVX_NAME {
+        return Some(run_avx(machine, out));
+    }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
     }
@@ -795,6 +806,7 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     Some(run_spec(machine, spec, out))
 }
 
+#[inline(never)]
 fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let mut vm = match Vm::new(machine, spec.exceptions).and_then(|mut vm| (spec.build)(&mut vm).map(|_| vm)) {
@@ -846,6 +858,8 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
         Stop::Refused(Refusal::Controls { cpu, field, missing }) => writeln!(
             out, "not entered -- cpu {} will not take the {} controls {:#x}, which the host needs", cpu, field,
             missing),
+        Stop::Refused(Refusal::Xstate { cpu, xcr0 }) => writeln!(
+            out, "not entered -- cpu {} does not switch every component of the guest's XCR0, {:#x}", cpu, xcr0),
         Stop::Invalid => writeln!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Unexpected { exit, rip } => writeln!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
     };
@@ -1118,6 +1132,7 @@ const SMP_GUEST: SmpGuest =
 /// Run a guest of the smp guest's machine: its first CPU on this task, its
 /// second on a task of its own on another CPU the extension is on for --
 /// this one, when it is on for no other.
+#[inline(never)]
 fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -1597,6 +1612,7 @@ const IOAPIC_GUEST: IoGuest =
 /// Run a guest of the IO-APIC's machine: its first CPU on this task, its
 /// second -- which only waits -- on a task of its own, so that it is found
 /// asleep when the first stops.
+#[inline(never)]
 fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2097,6 +2113,7 @@ fn one_cpu_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()>
 
 /// Run the debug guest: one CPU, through the run loop a Linux guest's go
 /// through, where a #DB of the guest's own is given back.
+#[inline(never)]
 fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", DEBUG_NAME, DEBUG_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2369,6 +2386,7 @@ fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Res
 
 /// Run the dr guest: two VMs of one CPU each, one after the other on the
 /// CPU this runs on, through the run loop a Linux guest's go through.
+#[inline(never)]
 fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", DR_NAME, DR_ABOUT);
     let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
@@ -2484,6 +2502,601 @@ fn dr_four(r: &[u64; 4]) -> String {
     alloc::format!("{:#x} {:#x} {:#x} {:#x}", r[0], r[1], r[2], r[3])
 }
 
+/* ---- avx: a guest's x87, SSE and AVX registers its own, XCR0 too ---- */
+
+const AVX_NAME: &str = "avx";
+const AVX_ABOUT: &str = "two CPUs taking turns on one host CPU, by IPI: each turns on CR4.OSXSAVE and AVX in XCR0 -- \
+                         its XSETBVs refused where a CPU refuses them -- reads the XSAVE leaves of its CPUID, finds \
+                         YMM0-15 its own as it starts, and at every one of 64 turns finds its YMM registers, MXCSR \
+                         and x87 control word as it left them";
+
+/* A Linux guest's machine of two CPUs (`smp_board`), both of whose tasks
+ * run on the one host CPU the guest is run on -- so that each entry of one
+ * finds the other's registers in the CPU, and has its own put back. The
+ * first gives itself an IDT -- #UD, #GP and the other CPU's IPI -- and each
+ * CPU, the first and then the second, once the first has started it by
+ * INIT and start-up IPIs (`AVX_AP_CODE` climbs to long mode as the smp
+ * guest's does, and joins the first's code at its second way in): turns
+ * its local APIC on -- the second's comes out of INIT software-disabled,
+ * and would drop the first's IPIs -- reads leaf 1's ECX, runs an XSETBV
+ * with CR4.OSXSAVE clear -- a #UD -- sets OSFXSR, OSXMMEXCPT and OSXSAVE,
+ * reads leaf 1's ECX and XCR0 again and leaf 0xD, runs five XSETBVs a CPU
+ * refuses -- no x87, AVX without SSE, PKRU, bit 32, XCR1: a #GP each, its
+ * handler counting and stepping past -- and its own, of the x87, SSE and
+ * AVX; then reads XCR0, leaf 0xD's first three subleaves and leaf 7, stores
+ * YMM0-15 as it started, and loads its own x87 control word, MXCSR and a
+ * pattern of its own into YMM0-15. Then 64 turns each, a turn the other's
+ * IPI: all of YMM0-15, MXCSR and the control word checked against what it
+ * left -- a turn that finds otherwise counted -- its pattern one more in
+ * every word and loaded, and the other's turn sent. Each ends with its mark
+ * and halts. Assembled from this source with clang, the offsets in the
+ * comments its listing's. */
+const AVX_CODE: &[u8] = &[
+    0xEB, 0x15,                                             // 00: start: jmp bsp ; the first CPU's way in
+    0x41, 0xBD, 0x00, 0x78, 0x00, 0x00,                     // 02: ap: mov r13d, 0x7800 ; the second's: its results
+    0x45, 0x31, 0xF6,                                       // 08: xor r14d, r14d ; its peer: APIC ID 0
+    0xE8, 0x9C, 0x00, 0x00, 0x00,                           // 0b: call setup
+    0xE8, 0x2E, 0x03, 0x00, 0x00,                           // 10: call send ; up: the first CPU's turn
+    0xEB, 0x65,                                             // 15: jmp rounds
+    0x48, 0x8D, 0x05, 0x48, 0x03, 0x00, 0x00,               // 17: bsp: lea rax, [rip + ud] ; gate 6, #UD
+    0xBF, 0x60, 0x60, 0x00, 0x00,                           // 1e: mov edi, 0x6060
+    0xE8, 0x73, 0x03, 0x00, 0x00,                           // 23: call gate
+    0x48, 0x8D, 0x05, 0x42, 0x03, 0x00, 0x00,               // 28: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0x60, 0x00, 0x00,                           // 2f: mov edi, 0x60D0
+    0xE8, 0x62, 0x03, 0x00, 0x00,                           // 34: call gate
+    0x48, 0x8D, 0x05, 0x40, 0x03, 0x00, 0x00,               // 39: lea rax, [rip + ipi] ; gate 0x40, its peer's IPI
+    0xBF, 0x00, 0x64, 0x00, 0x00,                           // 40: mov edi, 0x6400
+    0xE8, 0x51, 0x03, 0x00, 0x00,                           // 45: call gate
+    0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 4a: mov r13d, 0x7000 ; its results
+    0x41, 0xBE, 0x01, 0x00, 0x00, 0x00,                     // 50: mov r14d, 1 ; its peer: APIC ID 1
+    0xE8, 0x51, 0x00, 0x00, 0x00,                           // 56: call setup
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // 5b: mov ecx, 0x830 ; ICR, to APIC ID 1
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // 60: mov edx, 1
+    0xB8, 0x00, 0x45, 0x00, 0x00,                           // 65: mov eax, 0x4500 ; INIT, asserted
+    0x0F, 0x30,                                             // 6a: wrmsr
+    0xB8, 0x00, 0x85, 0x00, 0x00,                           // 6c: mov eax, 0x8500 ; INIT, de-asserted
+    0x0F, 0x30,                                             // 71: wrmsr
+    0xB8, 0x09, 0x06, 0x00, 0x00,                           // 73: mov eax, 0x0609 ; start-up at 0x9000
+    0x0F, 0x30,                                             // 78: wrmsr
+    0x0F, 0x30,                                             // 7a: wrmsr ; and again, as the MP protocol has it
+    0x45, 0x31, 0xFF,                                       // 7c: rounds: xor r15d, r15d ; a turn: from its peer's IPI
+    0xE8, 0xCF, 0x02, 0x00, 0x00,                           // 7f: .round: call wait
+    0xE8, 0x64, 0x01, 0x00, 0x00,                           // 84: call verify
+    0xE8, 0xBA, 0x01, 0x00, 0x00,                           // 89: call bump
+    0xE8, 0xB0, 0x02, 0x00, 0x00,                           // 8e: call send
+    0x41, 0xFF, 0xC7,                                       // 93: inc r15d
+    0x45, 0x89, 0x7D, 0x70,                                 // 96: mov dword [r13 + 0x70], r15d
+    0x41, 0x83, 0xFF, 0x40,                                 // 9a: cmp r15d, 64
+    0x72, 0xDF,                                             // 9e: jb .Lround
+    0x41, 0xC7, 0x45, 0x7C, 0x41, 0x56, 0x58, 0x21,         // a0: mov dword [r13 + 0x7C], 0x21585641 ; 'AVX!'
+    0xFA,                                                   // a8: cli
+    0xF4,                                                   // a9: .dead: hlt
+    0xEB, 0xFD,                                             // aa: jmp .Ldead
+    0x0F, 0x01, 0x1D, 0x0E, 0x03, 0x00, 0x00,               // ac: setup: lidt [rip + idtr]
+    0xB9, 0x0F, 0x08, 0x00, 0x00,                           // b3: mov ecx, 0x80F ; SVR: its APIC on, or IPIs drop
+    0xB8, 0xFF, 0x01, 0x00, 0x00,                           // b8: mov eax, 0x1FF
+    0x31, 0xD2,                                             // bd: xor edx, edx
+    0x0F, 0x30,                                             // bf: wrmsr
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // c1: mov eax, 1
+    0x0F, 0xA2,                                             // c6: cpuid
+    0x41, 0x89, 0x4D, 0x00,                                 // c8: mov dword [r13 + 0x00], ecx ; leaf 1 ECX
+    0x31, 0xC9,                                             // cc: xor ecx, ecx
+    0x31, 0xD2,                                             // ce: xor edx, edx
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // d0: mov eax, 7
+    0x0F, 0x01, 0xD1,                                       // d5: xsetbv ; CR4.OSXSAVE clear: a #UD
+    0x0F, 0x20, 0xE0,                                       // d8: mov rax, cr4
+    0x48, 0x0D, 0x00, 0x06, 0x04, 0x00,                     // db: or rax, 0x40600 ; OSFXSR, OSXMMEXCPT and OSXSAVE
+    0x0F, 0x22, 0xE0,                                       // e1: mov cr4, rax
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // e4: mov eax, 1
+    0x0F, 0xA2,                                             // e9: cpuid
+    0x41, 0x89, 0x4D, 0x04,                                 // eb: mov dword [r13 + 0x04], ecx ; leaf 1 ECX
+    0x31, 0xC9,                                             // ef: xor ecx, ecx
+    0x0F, 0x01, 0xD0,                                       // f1: xgetbv
+    0x41, 0x89, 0x45, 0x10,                                 // f4: mov dword [r13 + 0x10], eax ; XCR0 as it starts
+    0x41, 0x89, 0x55, 0x14,                                 // f8: mov dword [r13 + 0x14], edx
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // fc: mov eax, 0xD
+    0x31, 0xC9,                                             // 101: xor ecx, ecx
+    0x0F, 0xA2,                                             // 103: cpuid
+    0x41, 0x89, 0x45, 0x28,                                 // 105: mov dword [r13 + 0x28], eax ; leaf 0xD
+    0x41, 0x89, 0x5D, 0x2C,                                 // 109: mov dword [r13 + 0x2C], ebx
+    0x41, 0x89, 0x4D, 0x30,                                 // 10d: mov dword [r13 + 0x30], ecx
+    0x41, 0x89, 0x55, 0x34,                                 // 111: mov dword [r13 + 0x34], edx
+    0x31, 0xC9,                                             // 115: xor ecx, ecx ; five a CPU refuses, each a #GP:
+    0x31, 0xD2,                                             // 117: xor edx, edx
+    0x31, 0xC0,                                             // 119: xor eax, eax ; no x87
+    0x0F, 0x01, 0xD1,                                       // 11b: xsetbv
+    0xB8, 0x05, 0x00, 0x00, 0x00,                           // 11e: mov eax, 5 ; AVX without SSE
+    0x0F, 0x01, 0xD1,                                       // 123: xsetbv
+    0xB8, 0x07, 0x02, 0x00, 0x00,                           // 126: mov eax, 0x207 ; PKRU, not offered
+    0x0F, 0x01, 0xD1,                                       // 12b: xsetbv
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 12e: mov eax, 7
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // 133: mov edx, 1 ; bit 32
+    0x0F, 0x01, 0xD1,                                       // 138: xsetbv
+    0x31, 0xD2,                                             // 13b: xor edx, edx
+    0xB9, 0x01, 0x00, 0x00, 0x00,                           // 13d: mov ecx, 1 ; XCR1
+    0x0F, 0x01, 0xD1,                                       // 142: xsetbv
+    0x31, 0xC9,                                             // 145: xor ecx, ecx
+    0x0F, 0x01, 0xD0,                                       // 147: xgetbv
+    0x41, 0x89, 0x45, 0x18,                                 // 14a: mov dword [r13 + 0x18], eax ; XCR0 after them
+    0x41, 0x89, 0x55, 0x1C,                                 // 14e: mov dword [r13 + 0x1C], edx
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 152: mov eax, 7 ; x87, SSE and AVX
+    0x31, 0xD2,                                             // 157: xor edx, edx
+    0x0F, 0x01, 0xD1,                                       // 159: xsetbv
+    0x0F, 0x01, 0xD0,                                       // 15c: xgetbv
+    0x41, 0x89, 0x45, 0x20,                                 // 15f: mov dword [r13 + 0x20], eax ; XCR0 now
+    0x41, 0x89, 0x55, 0x24,                                 // 163: mov dword [r13 + 0x24], edx
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // 167: mov eax, 0xD
+    0x31, 0xC9,                                             // 16c: xor ecx, ecx
+    0x0F, 0xA2,                                             // 16e: cpuid
+    0x41, 0x89, 0x45, 0x38,                                 // 170: mov dword [r13 + 0x38], eax ; leaf 0xD
+    0x41, 0x89, 0x5D, 0x3C,                                 // 174: mov dword [r13 + 0x3C], ebx
+    0x41, 0x89, 0x4D, 0x40,                                 // 178: mov dword [r13 + 0x40], ecx
+    0x41, 0x89, 0x55, 0x44,                                 // 17c: mov dword [r13 + 0x44], edx
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // 180: mov eax, 0xD
+    0xB9, 0x01, 0x00, 0x00, 0x00,                           // 185: mov ecx, 1
+    0x0F, 0xA2,                                             // 18a: cpuid
+    0x41, 0x89, 0x45, 0x48,                                 // 18c: mov dword [r13 + 0x48], eax ; subleaf 1
+    0x41, 0x89, 0x5D, 0x4C,                                 // 190: mov dword [r13 + 0x4C], ebx
+    0x41, 0x89, 0x4D, 0x50,                                 // 194: mov dword [r13 + 0x50], ecx
+    0x41, 0x89, 0x55, 0x54,                                 // 198: mov dword [r13 + 0x54], edx
+    0xB8, 0x0D, 0x00, 0x00, 0x00,                           // 19c: mov eax, 0xD
+    0xB9, 0x02, 0x00, 0x00, 0x00,                           // 1a1: mov ecx, 2
+    0x0F, 0xA2,                                             // 1a6: cpuid
+    0x41, 0x89, 0x45, 0x58,                                 // 1a8: mov dword [r13 + 0x58], eax ; subleaf 2, AVX's
+    0x41, 0x89, 0x5D, 0x5C,                                 // 1ac: mov dword [r13 + 0x5C], ebx
+    0x41, 0x89, 0x4D, 0x60,                                 // 1b0: mov dword [r13 + 0x60], ecx
+    0x41, 0x89, 0x55, 0x64,                                 // 1b4: mov dword [r13 + 0x64], edx
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 1b8: mov eax, 7
+    0x31, 0xC9,                                             // 1bd: xor ecx, ecx
+    0x0F, 0xA2,                                             // 1bf: cpuid
+    0x41, 0x89, 0x5D, 0x68,                                 // 1c1: mov dword [r13 + 0x68], ebx ; leaf 7
+    0x41, 0x89, 0x4D, 0x6C,                                 // 1c5: mov dword [r13 + 0x6C], ecx
+    0x49, 0x8D, 0xBD, 0x00, 0x01, 0x00, 0x00,               // 1c9: lea rdi, [r13 + 0x100] ; YMM0-15 as it starts
+    0xE8, 0xFA, 0x00, 0x00, 0x00,                           // 1d0: call store
+    0x41, 0xD9, 0xAD, 0x8C, 0x00, 0x00, 0x00,               // 1d5: fldcw word [r13 + 0x8C] ; its own FCW and MXCSR
+    0x41, 0x0F, 0xAE, 0x95, 0x88, 0x00, 0x00, 0x00,         // 1dc: ldmxcsr dword [r13 + 0x88]
+    0x49, 0x8D, 0xB5, 0x00, 0x05, 0x00, 0x00,               // 1e4: lea rsi, [r13 + 0x500] ; and its pattern
+    0xEB, 0x6E,                                             // 1eb: jmp load
+    0x49, 0x8D, 0xBD, 0x00, 0x03, 0x00, 0x00,               // 1ed: verify: lea rdi, [r13 + 0x300] ; all as it left them?
+    0xE8, 0xD6, 0x00, 0x00, 0x00,                           // 1f4: call store
+    0x49, 0x8D, 0xB5, 0x00, 0x05, 0x00, 0x00,               // 1f9: lea rsi, [r13 + 0x500]
+    0x49, 0x8D, 0xBD, 0x00, 0x03, 0x00, 0x00,               // 200: lea rdi, [r13 + 0x300]
+    0xB9, 0x40, 0x00, 0x00, 0x00,                           // 207: mov ecx, 64
+    0xF3, 0x48, 0xA7,                                       // 20c: repe cmpsq
+    0x75, 0x32,                                             // 20f: jne .Lbad
+    0x41, 0x0F, 0xAE, 0x9D, 0x80, 0x00, 0x00, 0x00,         // 211: stmxcsr dword [r13 + 0x80]
+    0x41, 0x8B, 0x85, 0x80, 0x00, 0x00, 0x00,               // 219: mov eax, dword [r13 + 0x80]
+    0x41, 0x3B, 0x85, 0x88, 0x00, 0x00, 0x00,               // 220: cmp eax, dword [r13 + 0x88]
+    0x75, 0x1A,                                             // 227: jne .Lbad
+    0x41, 0xD9, 0xBD, 0x84, 0x00, 0x00, 0x00,               // 229: fnstcw word [r13 + 0x84]
+    0x66, 0x41, 0x8B, 0x85, 0x84, 0x00, 0x00, 0x00,         // 230: mov ax, word [r13 + 0x84]
+    0x66, 0x41, 0x3B, 0x85, 0x8C, 0x00, 0x00, 0x00,         // 238: cmp ax, word [r13 + 0x8C]
+    0x75, 0x01,                                             // 240: jne .Lbad
+    0xC3,                                                   // 242: ret
+    0x41, 0xFF, 0x45, 0x74,                                 // 243: .bad: inc dword [r13 + 0x74]
+    0xC3,                                                   // 247: ret
+    0x49, 0x8D, 0xB5, 0x00, 0x05, 0x00, 0x00,               // 248: bump: lea rsi, [r13 + 0x500] ; its pattern, one more
+    0xB9, 0x40, 0x00, 0x00, 0x00,                           // 24f: mov ecx, 64
+    0x48, 0xFF, 0x44, 0xCE, 0xF8,                           // 254: .next: inc qword [rsi + 8*rcx - 8]
+    0xE2, 0xF9,                                             // 259: loop .Lnext
+    0xC5, 0xFE, 0x6F, 0x06,                                 // 25b: load: vmovdqu ymm0, [rsi + 0x0]
+    0xC5, 0xFE, 0x6F, 0x4E, 0x20,                           // 25f: vmovdqu ymm1, [rsi + 0x20]
+    0xC5, 0xFE, 0x6F, 0x56, 0x40,                           // 264: vmovdqu ymm2, [rsi + 0x40]
+    0xC5, 0xFE, 0x6F, 0x5E, 0x60,                           // 269: vmovdqu ymm3, [rsi + 0x60]
+    0xC5, 0xFE, 0x6F, 0xA6, 0x80, 0x00, 0x00, 0x00,         // 26e: vmovdqu ymm4, [rsi + 0x80]
+    0xC5, 0xFE, 0x6F, 0xAE, 0xA0, 0x00, 0x00, 0x00,         // 276: vmovdqu ymm5, [rsi + 0xa0]
+    0xC5, 0xFE, 0x6F, 0xB6, 0xC0, 0x00, 0x00, 0x00,         // 27e: vmovdqu ymm6, [rsi + 0xc0]
+    0xC5, 0xFE, 0x6F, 0xBE, 0xE0, 0x00, 0x00, 0x00,         // 286: vmovdqu ymm7, [rsi + 0xe0]
+    0xC5, 0x7E, 0x6F, 0x86, 0x00, 0x01, 0x00, 0x00,         // 28e: vmovdqu ymm8, [rsi + 0x100]
+    0xC5, 0x7E, 0x6F, 0x8E, 0x20, 0x01, 0x00, 0x00,         // 296: vmovdqu ymm9, [rsi + 0x120]
+    0xC5, 0x7E, 0x6F, 0x96, 0x40, 0x01, 0x00, 0x00,         // 29e: vmovdqu ymm10, [rsi + 0x140]
+    0xC5, 0x7E, 0x6F, 0x9E, 0x60, 0x01, 0x00, 0x00,         // 2a6: vmovdqu ymm11, [rsi + 0x160]
+    0xC5, 0x7E, 0x6F, 0xA6, 0x80, 0x01, 0x00, 0x00,         // 2ae: vmovdqu ymm12, [rsi + 0x180]
+    0xC5, 0x7E, 0x6F, 0xAE, 0xA0, 0x01, 0x00, 0x00,         // 2b6: vmovdqu ymm13, [rsi + 0x1a0]
+    0xC5, 0x7E, 0x6F, 0xB6, 0xC0, 0x01, 0x00, 0x00,         // 2be: vmovdqu ymm14, [rsi + 0x1c0]
+    0xC5, 0x7E, 0x6F, 0xBE, 0xE0, 0x01, 0x00, 0x00,         // 2c6: vmovdqu ymm15, [rsi + 0x1e0]
+    0xC3,                                                   // 2ce: ret
+    0xC5, 0xFE, 0x7F, 0x07,                                 // 2cf: store: vmovdqu [rdi + 0x0], ymm0
+    0xC5, 0xFE, 0x7F, 0x4F, 0x20,                           // 2d3: vmovdqu [rdi + 0x20], ymm1
+    0xC5, 0xFE, 0x7F, 0x57, 0x40,                           // 2d8: vmovdqu [rdi + 0x40], ymm2
+    0xC5, 0xFE, 0x7F, 0x5F, 0x60,                           // 2dd: vmovdqu [rdi + 0x60], ymm3
+    0xC5, 0xFE, 0x7F, 0xA7, 0x80, 0x00, 0x00, 0x00,         // 2e2: vmovdqu [rdi + 0x80], ymm4
+    0xC5, 0xFE, 0x7F, 0xAF, 0xA0, 0x00, 0x00, 0x00,         // 2ea: vmovdqu [rdi + 0xa0], ymm5
+    0xC5, 0xFE, 0x7F, 0xB7, 0xC0, 0x00, 0x00, 0x00,         // 2f2: vmovdqu [rdi + 0xc0], ymm6
+    0xC5, 0xFE, 0x7F, 0xBF, 0xE0, 0x00, 0x00, 0x00,         // 2fa: vmovdqu [rdi + 0xe0], ymm7
+    0xC5, 0x7E, 0x7F, 0x87, 0x00, 0x01, 0x00, 0x00,         // 302: vmovdqu [rdi + 0x100], ymm8
+    0xC5, 0x7E, 0x7F, 0x8F, 0x20, 0x01, 0x00, 0x00,         // 30a: vmovdqu [rdi + 0x120], ymm9
+    0xC5, 0x7E, 0x7F, 0x97, 0x40, 0x01, 0x00, 0x00,         // 312: vmovdqu [rdi + 0x140], ymm10
+    0xC5, 0x7E, 0x7F, 0x9F, 0x60, 0x01, 0x00, 0x00,         // 31a: vmovdqu [rdi + 0x160], ymm11
+    0xC5, 0x7E, 0x7F, 0xA7, 0x80, 0x01, 0x00, 0x00,         // 322: vmovdqu [rdi + 0x180], ymm12
+    0xC5, 0x7E, 0x7F, 0xAF, 0xA0, 0x01, 0x00, 0x00,         // 32a: vmovdqu [rdi + 0x1a0], ymm13
+    0xC5, 0x7E, 0x7F, 0xB7, 0xC0, 0x01, 0x00, 0x00,         // 332: vmovdqu [rdi + 0x1c0], ymm14
+    0xC5, 0x7E, 0x7F, 0xBF, 0xE0, 0x01, 0x00, 0x00,         // 33a: vmovdqu [rdi + 0x1e0], ymm15
+    0xC3,                                                   // 342: ret
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // 343: send: mov ecx, 0x830 ; to its peer, vector 0x40
+    0x44, 0x89, 0xF2,                                       // 348: mov edx, r14d
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // 34b: mov eax, 0x40
+    0x0F, 0x30,                                             // 350: wrmsr
+    0xC3,                                                   // 352: ret
+    0xFB,                                                   // 353: wait: sti ; until its peer's IPI
+    0xF4,                                                   // 354: hlt
+    0xFA,                                                   // 355: cli
+    0x41, 0x83, 0x7D, 0x78, 0x00,                           // 356: cmp dword [r13 + 0x78], 0
+    0x74, 0xF6,                                             // 35b: je wait
+    0x41, 0xC7, 0x45, 0x78, 0x00, 0x00, 0x00, 0x00,         // 35d: mov dword [r13 + 0x78], 0
+    0xC3,                                                   // 365: ret
+    0x41, 0xFF, 0x45, 0x08,                                 // 366: ud: inc dword [r13 + 0x08] ; counted, and past it
+    0x48, 0x83, 0x04, 0x24, 0x03,                           // 36a: add qword [rsp], 3
+    0x48, 0xCF,                                             // 36f: iretq
+    0x41, 0xFF, 0x45, 0x0C,                                 // 371: gp: inc dword [r13 + 0x0C] ; counted, and past it
+    0x48, 0x83, 0xC4, 0x08,                                 // 375: add rsp, 8
+    0x48, 0x83, 0x04, 0x24, 0x03,                           // 379: add qword [rsp], 3
+    0x48, 0xCF,                                             // 37e: iretq
+    0x41, 0xC7, 0x45, 0x78, 0x01, 0x00, 0x00, 0x00,         // 380: ipi: mov dword [r13 + 0x78], 1 ; its peer is done
+    0x50,                                                   // 388: push rax
+    0x51,                                                   // 389: push rcx
+    0x52,                                                   // 38a: push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // 38b: mov ecx, 0x80B ; EOI
+    0x31, 0xC0,                                             // 390: xor eax, eax
+    0x31, 0xD2,                                             // 392: xor edx, edx
+    0x0F, 0x30,                                             // 394: wrmsr
+    0x5A,                                                   // 396: pop rdx
+    0x59,                                                   // 397: pop rcx
+    0x58,                                                   // 398: pop rax
+    0x48, 0xCF,                                             // 399: iretq
+    0x66, 0x89, 0x07,                                       // 39b: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 39e: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 3a4: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 3aa: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 3ae: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 3b2: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 3b6: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 3b9: mov dword [rdi + 12], 0
+    0xC3,                                                   // 3c0: ret
+    0x0F, 0x04,                                             // 3c1: idtr: dw 0x41 * 16 - 1 ; gates to 0x40
+    0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 3c3: dq 0x6000
+];
+
+/// The second CPU's start, at `SMP_AP_AT`: the smp guest's way to long
+/// mode, and into `AVX_CODE` at its second way in.
+const AVX_AP_CODE: &[u8] = &[
+    0xFA,                                                   // 00: ap16: cli ; real mode, at 0x9000
+    0x31, 0xC0,                                             // 01: xor ax, ax
+    0x8E, 0xD8,                                             // 03: mov ds, ax
+    0x66, 0x0F, 0x01, 0x16, 0x62, 0x90,                     // 05: o32 lgdt [gdtr]
+    0x0F, 0x20, 0xC0,                                       // 0b: mov eax, cr0
+    0x0C, 0x01,                                             // 0e: or al, 1 ; PE
+    0x0F, 0x22, 0xC0,                                       // 10: mov cr0, eax
+    0x66, 0xEA, 0x1B, 0x90, 0x00, 0x00, 0x28, 0x00,         // 13: jmp dword 0x28:ap32
+    0x66, 0xB8, 0x10, 0x00,                                 // 1b: ap32: mov ax, 0x10
+    0x8E, 0xD8,                                             // 1f: mov ds, eax
+    0x8E, 0xC0,                                             // 21: mov es, eax
+    0x8E, 0xD0,                                             // 23: mov ss, eax
+    0x0F, 0x20, 0xE0,                                       // 25: mov eax, cr4
+    0x83, 0xC8, 0x20,                                       // 28: or eax, 0x20 ; PAE
+    0x0F, 0x22, 0xE0,                                       // 2b: mov cr4, eax
+    0xB8, 0x00, 0x20, 0x00, 0x00,                           // 2e: mov eax, 0x2000 ; the first CPU's PML4
+    0x0F, 0x22, 0xD8,                                       // 33: mov cr3, eax
+    0xB9, 0x80, 0x00, 0x00, 0xC0,                           // 36: mov ecx, 0xC0000080 ; EFER.LME
+    0x0F, 0x32,                                             // 3b: rdmsr
+    0x0D, 0x00, 0x01, 0x00, 0x00,                           // 3d: or eax, 0x100
+    0x0F, 0x30,                                             // 42: wrmsr
+    0x0F, 0x20, 0xC0,                                       // 44: mov eax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x80,                           // 47: or eax, 0x80000000 ; PG: long mode
+    0x0F, 0x22, 0xC0,                                       // 4c: mov cr0, eax
+    0xEA, 0x56, 0x90, 0x00, 0x00, 0x08, 0x00,               // 4f: jmp 0x08:ap64
+    0xBC, 0x00, 0xE0, 0x00, 0x00,                           // 56: ap64: mov esp, 0xE000
+    0xB8, 0x02, 0x80, 0x00, 0x00,                           // 5b: mov eax, 0x8002 ; the second's way in
+    0xFF, 0xE0,                                             // 60: jmp rax
+    0x2F, 0x00,                                             // 62: gdtr: dw 6 * 8 - 1 ; six entries
+    0x00, 0x10, 0x00, 0x00,                                 // 64: dd 0x1000
+];
+
+
+/* What each CPU leaves at its results -- the first's at `RESULTS`, the
+ * second's 0x800 bytes on: leaf 1's ECX before OSXSAVE and with it at +0
+ * and +4; its #UDs and #GPs at +8 and +0xC; XCR0 as it started, after the
+ * five refused and after its own at +0x10, +0x18 and +0x20; leaf 0xD's
+ * subleaf 0 under the first and the last at +0x28 and +0x38, subleaves 1
+ * and 2 at +0x48 and +0x58; leaf 7's EBX and ECX at +0x68; its turns and
+ * those that found anything it had not left at +0x70 and +0x74; 'AVX!' at
+ * +0x7C once done; and YMM0-15 as it started at +0x100. What the host
+ * gives it: its MXCSR and control word at +0x88 and +0x8C, and its first
+ * pattern at +0x500. */
+const AVX_RESULTS: [u64; 2] = [RESULTS, RESULTS + 0x800];
+const AVX_LEAF1: u64 = 0x00;
+const AVX_UD: u64 = 0x08;
+const AVX_GP: u64 = 0x0C;
+const AVX_XCR0: u64 = 0x10;
+const AVX_LEAF_D0: u64 = 0x28;
+const AVX_LEAF_D1: u64 = 0x48;
+const AVX_LEAF_D2: u64 = 0x58;
+const AVX_LEAF7: u64 = 0x68;
+const AVX_TURNS: u64 = 0x70;
+const AVX_WRONG: u64 = 0x74;
+const AVX_DONE: u64 = 0x7C;
+const AVX_MXCSR: u64 = 0x88;
+const AVX_FCW: u64 = 0x8C;
+const AVX_FIRST: u64 = 0x100;
+const AVX_PATTERN: u64 = 0x500;
+const AVX_MARK: u32 = u32::from_le_bytes(*b"AVX!");
+/// YMM0-15: sixteen registers of 32 bytes, 64 words.
+const AVX_WORDS: u64 = 64;
+const AVX_TURNS_EACH: u32 = 64;
+/// Each CPU's own: its first pattern's first word -- a word each counts up
+/// from -- its MXCSR, rounding down and up, and its x87 control word,
+/// double and single precision.
+const AVX_CPUS: [(u64, u32, u16); 2] =
+    [(0x1111_1111_0000_0000, 0x3F80, 0x027F), (0x2222_2222_0000_0000, 0x5F80, 0x007F)];
+/// The XSETBVs each CPU runs that a CPU refuses: one with OSXSAVE clear, a
+/// #UD, and five a #GP.
+const AVX_REFUSED: u64 = 6;
+/// Leaf 1 ECX: XSAVE, OSXSAVE and AVX; leaf 0xD subleaf 1 EAX: XSAVEC, and
+/// what is not offered -- XSAVES and XFD.
+const LEAF1_XSAVE: u32 = 1 << 26;
+const LEAF1_OSXSAVE: u32 = 1 << 27;
+const LEAF1_AVX: u32 = 1 << 28;
+const LEAF_D1_XSAVEC: u32 = 1 << 1;
+const LEAF_D1_NOT_OFFERED: u32 = (1 << 3) | (1 << 4);
+/// XCR0 out of reset, and as each CPU makes it: the x87, SSE and AVX.
+const XCR0_RESET: u64 = 1;
+const XCR0_AVX: u64 = 7;
+/// XSAVE's area for the x87 and SSE alone, and with AVX's after them.
+const XSAVE_LEGACY: u32 = 576;
+const XSAVE_WITH_AVX: u32 = 832;
+const AVX_BUDGET_MS: u64 = 10_000;
+
+/// One CPU of the avx guest, on a task of its own: what it ran on, what its
+/// run loop counted, and how many of its entries put its registers back
+/// into a CPU that held the other's.
+struct AvxCpu {
+    guest: Arc<LinuxGuest>,
+    cpu: GuestCpu,
+    machine: Arc<Machine>,
+    deadline: u64,
+    ran: Arc<kcore::sync::Mutex<(Counts, u64)>>,
+}
+
+fn avx_cpu(run: AvxCpu) {
+    let AvxCpu { guest, mut cpu, machine, deadline, ran } = run;
+    let counts = guest.run(&mut cpu, &machine, deadline, &Quiet);
+    *ran.lock() = (counts, cpu.backend_mut().fp_loads());
+    /* Its CPU goes in this task, before the guest: under VT-x the VMCS is
+     * cleared off its host CPU from task context. */
+    drop(cpu);
+}
+
+/// What one CPU of the avx guest left, read out of its results.
+struct AvxSeen {
+    leaf1: [u32; 2],
+    ud: u32,
+    gp: u32,
+    xcr0: [u64; 3],
+    leaf_d0: [[u32; 4]; 2],
+    leaf_d1: [u32; 4],
+    leaf_d2: [u32; 4],
+    leaf7: [u32; 2],
+    turns: u32,
+    wrong: u32,
+    done: u32,
+    /// The words of YMM0-15 as it started that were not 0.
+    first_set: u64,
+}
+
+fn avx_seen(m: &GuestMemory, at: u64) -> Result<AvxSeen> {
+    let four = |a: u64| -> Result<[u32; 4]> {
+        Ok([m.read_obj(a)?, m.read_obj(a + 4)?, m.read_obj(a + 8)?, m.read_obj(a + 12)?])
+    };
+    let mut first_set = 0;
+    for w in 0..AVX_WORDS {
+        if m.read_obj::<u64>(at + AVX_FIRST + w * 8)? != 0 {
+            first_set += 1;
+        }
+    }
+    Ok(AvxSeen {
+        leaf1: [m.read_obj(at + AVX_LEAF1)?, m.read_obj(at + AVX_LEAF1 + 4)?],
+        ud: m.read_obj(at + AVX_UD)?,
+        gp: m.read_obj(at + AVX_GP)?,
+        xcr0: [m.read_obj(at + AVX_XCR0)?, m.read_obj(at + AVX_XCR0 + 8)?, m.read_obj(at + AVX_XCR0 + 16)?],
+        leaf_d0: [four(at + AVX_LEAF_D0)?, four(at + AVX_LEAF_D0 + 16)?],
+        leaf_d1: four(at + AVX_LEAF_D1)?,
+        leaf_d2: four(at + AVX_LEAF_D2)?,
+        leaf7: [m.read_obj(at + AVX_LEAF7)?, m.read_obj(at + AVX_LEAF7 + 4)?],
+        turns: m.read_obj(at + AVX_TURNS)?,
+        wrong: m.read_obj(at + AVX_WRONG)?,
+        done: m.read_obj(at + AVX_DONE)?,
+        first_set,
+    })
+}
+
+/// Run the avx guest: its two CPUs each on a task of its own, both on the
+/// CPU this runs on.
+#[inline(never)]
+fn run_avx(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", AVX_NAME, AVX_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", AVX_NAME, why);
+        false
+    };
+    if hvarch::x86::fp::offered() & hvarch::x86::fp::XCR0_AVX == 0 {
+        return fail(out, "this CPU has no AVX state to switch for a guest");
+    }
+    let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, false, 2, Arc::new(doorbells), true, false) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    let m = guest.memory();
+    let board = smp_board(m, &mut bsp, AVX_CODE, AVX_AP_CODE).and_then(|_| {
+        for (&at, &(first, mxcsr, fcw)) in AVX_RESULTS.iter().zip(AVX_CPUS.iter()) {
+            for w in 0..AVX_WORDS {
+                m.write_obj(at + AVX_PATTERN + w * 8, &(first + w))?;
+            }
+            m.write_obj(at + AVX_MXCSR, &mxcsr)?;
+            m.write_obj(at + AVX_FCW, &fcw)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = board {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let guest = Arc::new(guest);
+    let (Some(ran0), Some(ran1)) =
+        (kcore::sync::Mutex::new((Counts::default(), 0)), kcore::sync::Mutex::new((Counts::default(), 0)))
+    else {
+        return fail(out, "out of memory");
+    };
+    let ran = [Arc::new(ran0), Arc::new(ran1)];
+
+    /* Both on this CPU: the second first, waiting for its start-up IPI, so
+     * that the first never starts a CPU that has no task. */
+    let here = 1u64 << kcore::cpu::id();
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(AVX_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let second = AvxCpu { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, ran: ran[1].clone() };
+    let Some(second) = kcore::task::spawn_on_with("hv/avx/cpu1", here, second, avx_cpu) else {
+        return fail(out, "no task for its second CPU");
+    };
+    let first = AvxCpu { guest: guest.clone(), cpu: bsp, machine: machine.clone(), deadline, ran: ran[0].clone() };
+    let first = kcore::task::spawn_on_with("hv/avx/cpu0", here, first, avx_cpu);
+    if first.is_none() {
+        guest.stop(GuestStop::Requested);
+    }
+    /* Dropping each handle waits for its task. */
+    drop(second);
+    let Some(first) = first else { return fail(out, "no task for its first CPU") };
+    drop(first);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let (counts, loads): ([Counts; 2], [u64; 2]) = {
+        let (a, b) = (*ran[0].lock(), *ran[1].lock());
+        ([a.0, b.0], [a.1, b.1])
+    };
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", AVX_NAME, cpu);
+        return false;
+    }
+    let hosts: alloc::vec::Vec<Option<u32>> = guest.cpu_states().iter().map(|&(_, h)| h).collect();
+    let on = |c: Option<&Option<u32>>| match c {
+        Some(Some(h)) => alloc::format!("cpu {}", h),
+        _ => String::from("no cpu"),
+    };
+    let _ = writeln!(out, "  ran on     {} and {}, {} us", on(hosts.first()), on(hosts.get(1)),
+                     ns / kcore::consts::NS_PER_US);
+    let _ = writeln!(out, "  exits      cpu 0: {} ({} XSETBV, {} refused; {} IPIs sent, {} hlt); cpu 1: {} ({} XSETBV, \
+                           {} refused; {} IPIs sent, {} hlt)",
+                     counts[0].exits, counts[0].xsetbv, counts[0].xsetbv_refused, counts[0].ipi_sent, counts[0].hlt,
+                     counts[1].exits, counts[1].xsetbv, counts[1].xsetbv_refused, counts[1].ipi_sent, counts[1].hlt);
+    let _ = writeln!(out, "  registers  put back into the CPU {} times for cpu 0, {} for cpu 1", loads[0], loads[1]);
+    let mut says = String::new();
+    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_avx(guest.memory(), &stopped, &counts, loads, &hosts) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", AVX_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", AVX_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// Both CPUs ran on one host CPU to their halt; each was told XSAVE and
+/// AVX, and OSXSAVE once its CR4 had it; its XSETBV with OSXSAVE clear was
+/// a #UD, the five a CPU refuses a #GP each, its XCR0 out of reset 1 and
+/// still after them, and 7 after its own; leaf 0xD gave the x87, SSE and
+/// AVX, the area's size for its XCR0 and for all -- 576 and 832 -- no
+/// XSAVES, and AVX's component at 576, 256 bytes long; YMM0-15 were 0 as it
+/// started, though the other CPU's pattern had been in the CPU's registers;
+/// and at every one of its turns it found its registers as it had left
+/// them, put back by the host each time the other had had the CPU.
+fn check_avx(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], loads: [u64; 2], hosts: &[Option<u32>])
+    -> core::result::Result<String, String>
+{
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    let seen = [avx_seen(m, AVX_RESULTS[0]).map_err(unread)?, avx_seen(m, AVX_RESULTS[1]).map_err(unread)?];
+    let host = hosts.first().copied().flatten();
+    if host.is_none() || hosts.get(1).copied().flatten() != host {
+        return Err(alloc::format!("its CPUs ran on {:?}: not one host CPU, where each would find the other's \
+                                   registers in it", hosts));
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if !matches!(stopped.stop, GuestStop::Halted { .. }) || s.done != AVX_MARK {
+            return Err(alloc::format!("cpu {} did not run to its halt: its mark is {:#x}, {} turns", i, s.done,
+                                      s.turns));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        let told = s.leaf1[0] & (LEAF1_XSAVE | LEAF1_OSXSAVE | LEAF1_AVX);
+        let with = s.leaf1[1] & (LEAF1_XSAVE | LEAF1_OSXSAVE | LEAF1_AVX);
+        if told != LEAF1_XSAVE | LEAF1_AVX || with != LEAF1_XSAVE | LEAF1_OSXSAVE | LEAF1_AVX {
+            return Err(alloc::format!("cpu {}'s leaf 1 ECX was {:#x} before CR4.OSXSAVE and {:#x} with it: wanted \
+                                       XSAVE and AVX, and OSXSAVE only with CR4's", i, s.leaf1[0], s.leaf1[1]));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if s.ud != 1 || s.gp != 5 {
+            return Err(alloc::format!("cpu {}'s XSETBVs took {} #UDs and {} #GPs: wanted one, with CR4.OSXSAVE \
+                                       clear, and five", i, s.ud, s.gp));
+        }
+        if s.xcr0 != [XCR0_RESET, XCR0_RESET, XCR0_AVX] {
+            return Err(alloc::format!("cpu {}'s XCR0 was {:#x} as it started, {:#x} after the refused XSETBVs and \
+                                       {:#x} after its own: wanted 1, 1 and 7", i, s.xcr0[0], s.xcr0[1], s.xcr0[2]));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        let want = [[7, XSAVE_LEGACY, XSAVE_WITH_AVX, 0], [7, XSAVE_WITH_AVX, XSAVE_WITH_AVX, 0]];
+        let compacted = if s.leaf_d1[0] & LEAF_D1_XSAVEC != 0 { XSAVE_WITH_AVX } else { 0 };
+        if s.leaf_d0 != want || s.leaf_d1[0] & LEAF_D1_NOT_OFFERED != 0 || s.leaf_d1[1..] != [compacted, 0, 0]
+            || s.leaf_d2 != [256, XSAVE_LEGACY, 0, 0]
+        {
+            return Err(alloc::format!("cpu {}'s leaf 0xD: subleaf 0 {:x?} under XCR0 1 and {:x?} under 7, subleaf 1 \
+                                       {:x?}, subleaf 2 {:x?}", i, s.leaf_d0[0], s.leaf_d0[1], s.leaf_d1,
+                                      s.leaf_d2));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if s.first_set != 0 {
+            return Err(alloc::format!("cpu {} found {} words of YMM0-15 not 0 as it started: another's registers", i,
+                                      s.first_set));
+        }
+    }
+    for (i, s) in seen.iter().enumerate() {
+        if s.turns != AVX_TURNS_EACH || s.wrong != 0 {
+            return Err(alloc::format!("cpu {} found its YMM registers, MXCSR or control word other than it left them \
+                                       at {} of its {} turns", i, s.wrong, s.turns));
+        }
+    }
+    for (i, c) in counts.iter().enumerate() {
+        let taken = c.xsetbv.saturating_sub(c.xsetbv_refused);
+        if taken != 1 || c.xsetbv_refused + 1 < AVX_REFUSED || c.xsetbv_refused > AVX_REFUSED {
+            return Err(alloc::format!("cpu {}'s run loop performed {} XSETBVs and refused {}: wanted its own taken, \
+                                       and the five a CPU refuses -- and the one with OSXSAVE clear, where the CPU \
+                                       did not fault it first", i, c.xsetbv, c.xsetbv_refused));
+        }
+    }
+    for (i, &n) in loads.iter().enumerate() {
+        if n < u64::from(AVX_TURNS_EACH) {
+            return Err(alloc::format!("cpu {}'s registers were put back into the CPU {} times, fewer than its {} \
+                                       turns: the CPUs did not take turns on it", i, n, AVX_TURNS_EACH));
+        }
+    }
+    let avx2 = seen[0].leaf7[0] & (1 << 5) != 0;
+    Ok(alloc::format!("XSAVE and AVX offered{}, OSXSAVE with CR4's, XCR0 1 to 7, the six XSETBVs a CPU refuses \
+                       refused, leaf 0xD's sizes 576 and 832; YMM0-15 0 at each CPU's start, and its YMM registers, \
+                       MXCSR and control word its own at all {} of its turns, put back {} and {} times",
+                      if avx2 { " (AVX2 too)" } else { "" }, AVX_TURNS_EACH, loads[0], loads[1]))
+}
+
 /* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */
 
 const CR4_NAME: &str = "cr4";
@@ -2586,6 +3199,7 @@ const CR4_PGE: u64 = 1 << 7;
 /// Run the cr4 guest: one CPU, through the run loop a Linux guest's go
 /// through, where AMD-V stops it at every `mov` of CR4 and VT-x at every
 /// write that changes a bit the host keeps.
+#[inline(never)]
 fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", CR4_NAME, CR4_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2901,6 +3515,7 @@ const MSR_BUDGET_MS: u64 = 10_000;
 
 /// Run the msr guest: one CPU, through the run loop a Linux guest's go
 /// through, where every MSR but the three segment bases stops it.
+#[inline(never)]
 fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", MSR_NAME, MSR_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {

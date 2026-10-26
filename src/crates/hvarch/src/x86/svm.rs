@@ -16,6 +16,7 @@ use kcore::dma::DmaBuffer;
 use kcore::percpu::ConstInit;
 
 use super::cpu;
+use super::fp::GuestFp;
 use crate::{Error, Result};
 
 pub mod vmcb;
@@ -161,7 +162,8 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
         unsafe { cpu::wrmsr(MSR_VM_HSAVE_PA, 0) };
         return Err(Error::EnableFailed);
     }
-    /* The host's x87/SSE control bits as every entry wants them, once; and
+    /* The host's x87, SSE and AVX control bits as every entry wants them,
+     * once, and IA32_XSS out of a guest's XSAVES's reach (`super::fp`); and
      * what keeps a guest's speculation off the host's (`super::spec`). */
     unsafe { super::fp::on() };
     unsafe { super::spec::on(false) };
@@ -387,6 +389,12 @@ pub enum NotRun {
     /// WBINVD, or the switch of EFER, the PAT and DR7. `field` names the
     /// control field and `missing` the bits it lacks; nothing was entered.
     Controls { cpu: u32, field: &'static str, missing: u32 },
+    /// The guest's XCR0 names a component of the x87, SSE and AVX state this
+    /// CPU does not switch (`super::fp`): taken on a CPU that does, of a
+    /// host whose CPUs are not alike. Loaded here it would be a #GP in the
+    /// host, or a register of another guest's in this one's reach; nothing
+    /// was entered.
+    Xstate { cpu: u32, xcr0: u64 },
 }
 
 /// What another CPU does to have a guest that is running leave it -- the
@@ -675,46 +683,11 @@ impl LoadedDebugAddrs {
     }
 }
 
-/// The guest's x87, MMX and SSE registers, in FXSAVE's format: what
-/// `vmrun` does not switch, and so what [`Guest::run`] does, on every entry
-/// and exit. The host uses none of these registers -- its C++ is built
-/// without SSE and x87, its Rust is soft-float -- but other guests do, and a
-/// guest's CPU is a task that may be on another CPU each time it enters.
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-pub struct FxArea(pub [u8; FX_AREA_BYTES]);
-
-pub const FX_AREA_BYTES: usize = 512;
-/// Where FXSAVE keeps the x87 control word and MXCSR.
-const FX_FCW: usize = 0;
-const FX_MXCSR: usize = 24;
-/// Their values out of reset.
-const FCW_RESET: u16 = 0x0040;
-const MXCSR_RESET: u32 = 0x1F80;
-
-impl FxArea {
-    /// The registers as a CPU comes out of reset: everything zero but the
-    /// control word and MXCSR.
-    pub fn reset() -> Self {
-        let mut a = [0u8; FX_AREA_BYTES];
-        a[FX_FCW..FX_FCW + 2].copy_from_slice(&FCW_RESET.to_le_bytes());
-        a[FX_MXCSR..FX_MXCSR + 4].copy_from_slice(&MXCSR_RESET.to_le_bytes());
-        Self(a)
-    }
-}
-
-/* XCR0 while a guest runs is the x87 alone, and so is the host's for as long
- * as its extension is on (`super::fp`): `vmrun` does not switch XCR0, and a
- * guest is given no XSAVE (the CPUID policy in `hv` hides it), so what it
- * may use of the extended state is nothing -- AVX and above fault in it
- * even should it turn CR4.OSXSAVE on itself, and no register the host does
- * not switch holds anything of another guest's. */
-
 /// Where an entry's time goes, in time-stamp counter ticks summed over the
 /// entries made while it was asked for: the checks and the ASID, before
-/// anything is switched; the guest's x87 and SSE registers put in; `vmrun`
-/// to `#vmexit`, the stub's VMSAVE and VMLOAD on either side and whatever
-/// the guest ran included; and the registers taken back out. For a
+/// anything is switched; the guest's x87, SSE and AVX registers put in;
+/// `vmrun` to `#vmexit`, the stub's VMSAVE and VMLOAD on either side and
+/// whatever the guest ran included; and the registers taken back out. For a
 /// benchmark, which turns it on for one guest.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Profile {
@@ -732,8 +705,8 @@ pub struct Profile {
 
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
-/// wait in while the guest runs, the x87 and SSE state, and the breakpoint
-/// addresses.
+/// wait in while the guest runs, the x87, SSE and AVX state and XCR0, and
+/// the breakpoint addresses.
 pub struct Guest {
     vmcb: VmcbPage,
     host: VmcbPage,
@@ -742,11 +715,8 @@ pub struct Guest {
     /// `HOST_DR` -- read and write, and what the CPU's are made before each
     /// entry. 0 out of reset.
     debug_addrs: [u64; 4],
-    /// One element, on the heap: a `Vec` because it can be made fallibly.
-    fx: alloc::vec::Vec<FxArea>,
-    /// Which guest's registers a CPU holds, this one being this
-    /// (`super::fp`).
-    fp_id: u64,
+    /// Its x87, SSE and AVX registers and its XCR0 (`super::fp`).
+    fp: GuestFp,
     /// The ASID it last entered under, and where that came from; None until
     /// its first entry.
     asid: Option<AsidTag>,
@@ -758,16 +728,12 @@ pub struct Guest {
 
 impl Guest {
     pub fn new() -> Result<Self> {
-        let mut fx = alloc::vec::Vec::new();
-        fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
-        fx.push(FxArea::reset());
         Ok(Self {
             vmcb: VmcbPage::new()?,
             host: VmcbPage::new()?,
             regs: GuestRegs::default(),
             debug_addrs: [0; 4],
-            fx,
-            fp_id: super::fp::owner_id(),
+            fp: GuestFp::new()?,
             asid: None,
             flush_always: false,
             profile: None,
@@ -803,8 +769,22 @@ impl Guest {
         self.flush_always = on;
     }
 
-    pub fn fx(&self) -> &FxArea {
-        &self.fx[0]
+    /// The guest's XCR0.
+    pub fn xcr0(&self) -> u64 {
+        self.fp.xcr0()
+    }
+
+    /// Make `value` the guest's XCR0, for its XSETBV the policy performs --
+    /// false, and nothing changed, for one a CPU refuses
+    /// ([`GuestFp::set_xcr0`]).
+    pub fn set_xcr0(&mut self, value: u64) -> bool {
+        self.fp.set_xcr0(value)
+    }
+
+    /// How many entries put its x87, SSE and AVX registers back into a CPU
+    /// that held another guest's.
+    pub fn fp_loads(&self) -> u64 {
+        self.fp.loads()
     }
 
     pub fn vmcb(&self) -> &Vmcb {
@@ -907,8 +887,7 @@ impl Guest {
         let guest = self.vmcb.phys();
         let host = self.host.phys();
         let regs: *mut GuestRegs = &mut self.regs;
-        let fx: *mut FxArea = &mut self.fx[0];
-        let fp_id = self.fp_id;
+        let fp = &mut self.fp;
         let debug_addrs = self.debug_addrs;
         let flush_always = self.flush_always;
         let tag = &mut self.asid;
@@ -934,6 +913,9 @@ impl Guest {
             if cr4 & CR4_LA57 != 0 {
                 return Err(NotRun::FiveLevelPaging { cpu });
             }
+            if !fp.fits(cpu) {
+                return Err(NotRun::Xstate { cpu, xcr0: fp.xcr0() });
+            }
             /* With interrupts off: a kick from here on is an interrupt held
              * pending on this CPU, which ends the guest's turn as soon as it
              * begins; one before this is refused here. */
@@ -954,21 +936,17 @@ impl Guest {
                 c.guest_asid = asid;
                 c.tlb_control = control;
             }
-            /* The x87 and SSE registers are the guest's from here to the
-             * FXSAVE after the exit. CR4.OSFXSR, for FXSAVE and FXRSTOR to
-             * move the XMM registers at all (AMD leaves them out without
-             * it), and an XCR0 of the x87 alone were set for this CPU when
-             * SVM was turned on for it (`super::fp`), and stay until it is
-             * turned off: setting them around each entry cost two serializing
-             * writes of CR4 and an XGETBV an exit. `fx` is this guest's own
-             * area, aligned to 16 -- and loaded only when the CPU's registers
-             * are not this guest's already from its last exit here, which
-             * the host, using none of them, leaves as they were. */
+            /* The x87, SSE and AVX registers and XCR0 are the guest's from
+             * here to the save after the exit -- loaded only when the CPU's
+             * registers are not this guest's already from its last exit
+             * here, which the host, using none of them, leaves as they were.
+             * CR4.OSFXSR and OSXSAVE, which the loads and saves need, were
+             * set for this CPU when SVM was turned on for it (`super::fp`),
+             * and stay until it is turned off: setting them around each
+             * entry cost two serializing writes of CR4 an exit. `fits`
+             * held above, with interrupts off since. */
             let t1 = stamp(timed);
-            if !super::fp::registers_are(cpu, fp_id) {
-                unsafe { asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
-                super::fp::registers_loaded(cpu, fp_id);
-            }
+            unsafe { fp.load(cpu) };
             /* The breakpoint addresses are the guest's from here on, armed
              * by its own DR7 once `vmrun` loads it. The host's DR7 enables
              * none: nothing in this kernel writes it, and the `#vmexit` of
@@ -993,7 +971,9 @@ impl Guest {
                 k.left();
             }
 
-            unsafe { asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+            /* Interrupts still off since the load, and XCR0 the guest's:
+             * its XSETBV exits (`HOST_MISC2`). */
+            unsafe { fp.save(cpu) };
             if let Some(p) = profile.as_mut() {
                 let t4 = stamp(timed);
                 p.entries += 1;

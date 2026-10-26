@@ -234,6 +234,15 @@ impl Caps {
         feature(out, "x2APIC", self.x2apic, "the host's; a guest's is MSR exits either way")?;
         feature(out, "2 MiB nested pages", self.nested_2m(), "a guest's memory from the huge pool a block an entry")?;
         feature(out, "1 GiB pages", self.gb_pages, "guest memory in one nested entry a gigabyte")?;
+        /* What of the x87, SSE and AVX state a guest is given (`fp`): all
+         * three where XSAVE switches AVX's, and what it has otherwise. */
+        let offered = fp::offered();
+        let (avx, note) = match (offered & fp::XCR0_AVX != 0, offered != 0) {
+            (true, _) => (true, "its YMM registers and XCR0 switched with its x87 and SSE"),
+            (false, true) => (false, "XSAVE with no AVX: the x87 and SSE alone"),
+            (false, false) => (false, "no XSAVE: FXSAVE's x87 and SSE alone"),
+        };
+        feature(out, "AVX in a guest", avx, note)?;
         Ok(())
     }
 }

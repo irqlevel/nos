@@ -8,14 +8,16 @@
 //! name is a #GP, read or written -- nothing of the host's reaches a guest
 //! that has not been looked at here, and nothing a guest writes goes
 //! nowhere while it believes it went in. So a guest sees a CPU cut down to
-//! what is emulated here: no XSAVE and so no AVX (the state switch around
-//! `vmrun` moves only the FXSAVE registers), no paravirtualisation, no
-//! virtualization extension of its own, no speculation control it would
-//! write into nothing -- and a local APIC only in a guest of more than one
-//! CPU, where it is an x2APIC (`lapic`) with no TSC-deadline timer. What is
-//! left is enough to decompress and start a 64-bit kernel, and its other
-//! CPUs: long mode, NX, SYSCALL, the SSE line, the PAT, the APIC and the
-//! plain arithmetic features -- and the hypervisor bit, since there is one.
+//! what is emulated here: XSAVE's state no further than AVX's (what the
+//! switch around `vmrun` and `vmlaunch` moves, `hvarch::x86::fp`), so no
+//! AVX-512, AMX or PKU; no paravirtualisation, no virtualization extension
+//! of its own, no speculation control it would write into nothing -- and a
+//! local APIC only in a guest of more than one CPU, where it is an x2APIC
+//! (`lapic`) with no TSC-deadline timer. What is left is enough to
+//! decompress and start a 64-bit kernel, and its other CPUs, and to run
+//! what is built for x86-64-v3: long mode, NX, SYSCALL, the SSE and AVX
+//! lines, the PAT, the APIC and the plain arithmetic features -- and the
+//! hypervisor bit, since there is one.
 //!
 //! Each of a guest's CPUs is a package of its own, one core and one thread,
 //! its APIC ID its number: leaf 1 says so, and the leaves that would say
@@ -38,6 +40,7 @@
 //! log (Linux's "unchecked MSR access error"), and in the VM's report.
 
 use hvarch::x86::cpu;
+use hvarch::x86::fp;
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::GuestRegs;
 
@@ -46,20 +49,17 @@ use hvarch::x86::svm::GuestRegs;
  * highest of them, or the host's top if that is lower. Every other leaf is
  * all zeros, as a CPU answers one it has nothing in: no leaf of the host's
  * reaches a guest that this policy has not read. Among those left zero:
- * the structured features (7) -- SMEP, SMAP, FSGSBASE, AVX2 and the rest,
- * either the guest's own CR4 business or state XSAVE would switch, which
- * is off -- and with them every speculation control Intel enumerates
- * there; the topology leaves (0xB, 0x1F), where the host's x2APIC IDs are;
- * XSAVE's (0xD); the PMU's (0xA), with no counters to back it; the
- * hypervisor range (no paravirtualisation is offered); and of AMD's, the
- * SVM leaf, the extended APIC ID, memory encryption and the extended
- * performance monitor. */
+ * the topology leaves (0xB, 0x1F), where the host's x2APIC IDs are; the
+ * PMU's (0xA), with no counters to back it; the hypervisor range (no
+ * paravirtualisation is offered); and of AMD's, the SVM leaf, the extended
+ * APIC ID, memory encryption and the extended performance monitor. */
 const LEAF_BASIC: u32 = 0;
 const LEAF_FEATURES: u32 = 1;
 const LEAF_CACHE_DESCRIPTORS: u32 = 2;
 const LEAF_CACHE: u32 = 4;
 const LEAF_POWER: u32 = 6;
 const LEAF_STRUCTURED: u32 = 7;
+const LEAF_XSAVE: u32 = 0xD;
 const LEAF_TSC: u32 = 0x15;
 const LEAF_FREQUENCY: u32 = 0x16;
 const LEAF_BASIC_TOP: u32 = LEAF_FREQUENCY;
@@ -111,9 +111,10 @@ const LEAF15_CRYSTAL_HZ: u32 = 1_000_000_000;
 const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
- * among them MONITOR, VMX, PDCM, the TSC deadline timer, XSAVE, OSXSAVE and
- * AVX. x2APIC is set on top (`LEAF1_ECX_X2APIC`) for a guest of more than
- * one CPU, and the hypervisor bit for every guest. PCID is the guest's own:
+ * among them MONITOR, VMX, PDCM and the TSC deadline timer -- but for the
+ * XSAVE line (`leaf1_xsave`), and x2APIC, set on top (`LEAF1_ECX_X2APIC`)
+ * for a guest of more than one CPU, and the hypervisor bit for every
+ * guest. PCID is the guest's own:
  * its TLB entries tagged under its VPID or ASID as the CPU tags them, CR4's
  * bit turned on under `crate::cr`'s rules; INVPCID, which VT-x would need a
  * control for, is not offered with it. */
@@ -128,6 +129,19 @@ const LEAF1_ECX_KEEP: u32 = (1 << 0)   // SSE3
     | (1 << 23)  // POPCNT
     | (1 << 25)  // AES-NI
     | (1 << 30); // RDRAND
+
+/* Leaf 1, ECX: the XSAVE line. XSAVE where the host switches any of its
+ * state for a guest (`fp::offered`), OSXSAVE with it as the guest's own
+ * CR4.OSXSAVE has it, as a CPU's mirrors its CR4; and where AVX's state is
+ * switched, AVX, and FMA and F16C where the host has them -- VEX-coded on
+ * the YMM registers, as AVX is. */
+const LEAF1_ECX_FMA: u32 = 1 << 12;
+const LEAF1_ECX_XSAVE: u32 = 1 << 26;
+const LEAF1_ECX_OSXSAVE: u32 = 1 << 27;
+const LEAF1_ECX_AVX: u32 = 1 << 28;
+const LEAF1_ECX_F16C: u32 = 1 << 29;
+/// CR4.OSXSAVE, which leaf 1's OSXSAVE mirrors.
+const CR4_OSXSAVE: u64 = 1 << 18;
 
 /* Leaf 1, EDX: the features kept. APIC (bit 9) is set on top of them
  * (`LEAF1_EDX_APIC`) for a guest of more than one CPU, whatever the host
@@ -157,13 +171,13 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
 /* Leaf 7, subleaf 0, the structured features: what runs on the CPU as it
  * is, with nothing of the host's behind it to switch, and what CR4 bits the
  * guest owns turn on -- SMEP, SMAP and UMIP for its kernel, FSGSBASE over
- * bases the VMCS and the VMCB keep -- and facts of the silicon. Its EAX, the
- * last subleaf, is 0: the others are not offered. Among what is cleared:
- * AVX2 and AVX-512, AMX (state XSAVE would switch, and XSAVE is not offered),
- * HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
- * TSC_ADJUST, INVPCID, RDPID, LA57, the hybrid flag, and the speculation
- * controls -- IBRS and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not
- * the guest's to write. */
+ * bases the VMCS and the VMCB keep -- and facts of the silicon; and where
+ * AVX's state is switched, the AVX line (`LEAF7_EBX_AVX`). Its EAX, the last
+ * subleaf, is 0: the others are not offered. Among what is cleared: AVX-512
+ * and AMX (state past AVX's, which nothing switches), HLE and RTM, MPX, PT,
+ * SGX, PKU (a PKRU nothing switches), CET, WAITPKG, TSC_ADJUST, INVPCID,
+ * RDPID, LA57, the hybrid flag, and the speculation controls -- IBRS and
+ * IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not the guest's to write. */
 const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 3)   // BMI1
     | (1 << 6)   // the x87 data pointer kept at exceptions only
@@ -178,6 +192,27 @@ const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 24)  // CLWB
     | (1 << 29); // SHA
 const LEAF7_ECX_KEEP: u32 = 1 << 2; // UMIP
+/* Leaf 7, subleaf 0: the AVX line, where AVX's state is switched and the
+ * host has each -- AVX2 in EBX, and in ECX VAES and VPCLMULQDQ, whose VEX
+ * forms are on the YMM registers (their EVEX forms are AVX-512's). */
+const LEAF7_EBX_AVX: u32 = 1 << 5; // AVX2
+const LEAF7_ECX_AVX: u32 = (1 << 9)   // VAES
+    | (1 << 10); // VPCLMULQDQ
+
+/* Leaf 0xD, where anything of XSAVE's state is offered: subleaf 1's EAX,
+ * the XSAVE line as the host has it -- XSAVEOPT, XSAVEC, XGETBV with ECX 1,
+ * each on the components the guest's XCR0 names -- but not XSAVES, whose
+ * supervisor state is not switched, nor XFD. The sizes the leaf gives are
+ * those of the components offered: the legacy region and the header, 576
+ * bytes, and AVX's 256 after them -- in either of XSAVE's formats, AVX's
+ * component wanting no alignment of its own in the compacted one. */
+const LEAF_D1_EAX_KEEP: u32 = (1 << 0)   // XSAVEOPT
+    | (1 << 1)   // XSAVEC
+    | (1 << 2);  // XGETBV with ECX 1
+const LEAF_D1_EAX_XSAVEC: u32 = 1 << 1;
+const XSAVE_LEGACY_BYTES: u32 = 576;
+const XSAVE_AVX_BYTES: u32 = 256;
+const SUBLEAF_AVX: u32 = 2;
 /* In EDX: fast short REP MOVSB; MD_CLEAR -- VERW clears the CPU's buffers,
  * which it does in a guest as anywhere, and which a guest's kernel needs to
  * know to use it; SERIALIZE; and ARCH_CAPABILITIES, which the guest reads
@@ -192,9 +227,9 @@ const LEAF7_EDX_KEEP: u32 = (1 << 4)   // FSRM
  * but SVM", and on a real Zen 2 the guest found MWAITX there (bit 29), used
  * MONITORX for its udelay, and stopped at an intercept nothing answers: TCG's
  * `-cpu max` never offered it. Among what is cleared: SVM, the extended APIC
- * space, OSVW, IBS, XOP and FMA4 and TBM (VEX-coded, and so on state XSAVE
- * would switch), SKINIT, the watchdog, LWP, the topology and performance
- * counter extensions, MWAITX. */
+ * space, OSVW, IBS, XOP and FMA4 and TBM (Bulldozer's own, which Zen
+ * dropped), SKINIT, the watchdog, LWP, the topology and performance counter
+ * extensions, MWAITX. */
 const EXT1_ECX_KEEP: u32 = (1 << 0)   // LAHF/SAHF in 64-bit mode
     | (1 << 5)   // ABM: LZCNT
     | (1 << 6)   // SSE4A
@@ -267,12 +302,30 @@ pub struct Cpuid {
     pub edx: u32,
 }
 
-/// What the guest's CPU whose APIC ID is `apic_id` is told for CPUID leaf
-/// `leaf`, subleaf `sub` (ECX on the way in, for the leaves that take one);
-/// `apic` says whether the guest has local APICs -- one of more than one
-/// CPU -- which leaf 1 then says, the x2APIC with it.
-pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
-    const NONE: Cpuid = Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 };
+const NONE: Cpuid = Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 };
+
+/// Who asks a CPUID, as far as the answer is theirs: the guest's CPU's APIC
+/// ID; whether the guest has local APICs -- one of more than one CPU --
+/// which leaf 1 then says, the x2APIC with it; and the CPU's CR4 and XCR0,
+/// whose OSXSAVE leaf 1 mirrors and whose components leaf 0xD gives the
+/// XSAVE area's size for.
+#[derive(Clone, Copy, Debug)]
+pub struct Asker {
+    pub apic_id: u32,
+    pub apic: bool,
+    pub cr4: u64,
+    pub xcr0: u64,
+}
+
+impl Asker {
+    /// A guest's first CPU out of reset, where nothing asked for depends on
+    /// more: its signature, its features, its address widths.
+    pub const RESET: Asker = Asker { apic_id: 0, apic: true, cr4: 0, xcr0: fp::XCR0_X87 };
+}
+
+/// What the guest's CPU `asker` is told for CPUID leaf `leaf`, subleaf
+/// `sub` (ECX on the way in, for the leaves that take one).
+pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
     /* Above a range's top the guest is told there is nothing, and is
      * answered so: a leaf of the host's past it would be the host's no
      * matter what this policy says of it. */
@@ -282,14 +335,16 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     }
     let Some(host) = cpu::cpuid_count(leaf, sub) else { return NONE };
     let (eax, ebx, ecx, edx) = (host.eax, host.ebx, host.ecx, host.edx);
-    let (apic_ecx, apic_edx) = if apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC) } else { (0, 0) };
+    let (apic_ecx, apic_edx) = if asker.apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC) } else { (0, 0) };
+    let apic = asker.apic;
+    let avx = fp::offered() & fp::XCR0_AVX != 0;
 
     match leaf {
         LEAF_BASIC => Cpuid { eax: eax.min(LEAF_BASIC_TOP), ebx, ecx, edx },
         LEAF_FEATURES => Cpuid {
             eax,
-            ebx: (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU | ((apic_id & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT),
-            ecx: (ecx & LEAF1_ECX_KEEP) | apic_ecx | LEAF1_ECX_HYPERVISOR,
+            ebx: (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU | ((asker.apic_id & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT),
+            ecx: (ecx & LEAF1_ECX_KEEP) | leaf1_xsave(ecx, asker.cr4) | apic_ecx | LEAF1_ECX_HYPERVISOR,
             edx: (edx & LEAF1_EDX_KEEP) | apic_edx,
         },
         /* What the caches, TLBs and the brand are, and how fast the CPU is
@@ -303,8 +358,15 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
          * -- each names MSRs this hypervisor does not answer. */
         LEAF_POWER => Cpuid { eax: if apic { LEAF6_EAX_ARAT } else { 0 }, ebx: 0, ecx: 0, edx: 0 },
         LEAF_STRUCTURED if sub == 0 => {
-            Cpuid { eax: 0, ebx: ebx & LEAF7_EBX_KEEP, ecx: ecx & LEAF7_ECX_KEEP, edx: edx & LEAF7_EDX_KEEP }
+            let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
+            Cpuid {
+                eax: 0,
+                ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx),
+                ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx),
+                edx: edx & LEAF7_EDX_KEEP,
+            }
         }
+        LEAF_XSAVE => xsave_leaf(sub, eax, asker.xcr0),
         LEAF_TSC if apic => {
             /* The host's TSC, from the host's own leaf: crystal times
              * ratio. Blank when the host does not say -- the guest then
@@ -327,6 +389,63 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     }
 }
 
+/// Leaf 1 ECX's XSAVE line for a guest whose CR4 is `cr4`, of the host's
+/// `host_ecx`: XSAVE where anything of its state is switched for a guest
+/// (`fp::offered`), with OSXSAVE as the guest's CR4 has it; and where AVX's
+/// is, AVX, and FMA and F16C as the host has them.
+fn leaf1_xsave(host_ecx: u32, cr4: u64) -> u32 {
+    let offered = fp::offered();
+    if offered == 0 {
+        return 0;
+    }
+    let osxsave = if cr4 & CR4_OSXSAVE != 0 { LEAF1_ECX_OSXSAVE } else { 0 };
+    let avx = if offered & fp::XCR0_AVX != 0 {
+        LEAF1_ECX_AVX | (host_ecx & (LEAF1_ECX_FMA | LEAF1_ECX_F16C))
+    } else {
+        0
+    };
+    LEAF1_ECX_XSAVE | osxsave | avx
+}
+
+/// The size of XSAVE's area for `components`, of those offered, in either
+/// format: the legacy region and the header, and AVX's after them.
+fn xsave_bytes(components: u64) -> u32 {
+    XSAVE_LEGACY_BYTES + if components & fp::XCR0_AVX != 0 { XSAVE_AVX_BYTES } else { 0 }
+}
+
+/// Leaf 0xD, subleaf `sub`, for a guest whose XCR0 is `xcr0`, the host's
+/// subleaf EAX being `host_eax`: nothing where nothing is offered. Subleaf
+/// 0: the components it may turn on, and the area's size for those its
+/// XCR0 has on and for all of them. Subleaf 1: the XSAVE line kept of the
+/// host's, and -- with XSAVEC -- the compacted area's size for its XCR0, as
+/// a CPU gives it (with no supervisor components, IA32_XSS being none of
+/// the guest's). Subleaf 2: AVX's component, its size and its offset. Every
+/// other subleaf is blank: no component past AVX's is offered.
+fn xsave_leaf(sub: u32, host_eax: u32, xcr0: u64) -> Cpuid {
+    let offered = fp::offered();
+    if offered == 0 {
+        return NONE;
+    }
+    let on = xcr0 & offered;
+    match sub {
+        0 => Cpuid {
+            eax: offered as u32,
+            ebx: xsave_bytes(on),
+            ecx: xsave_bytes(offered),
+            edx: (offered >> 32) as u32,
+        },
+        1 => {
+            let eax = host_eax & LEAF_D1_EAX_KEEP;
+            let ebx = if eax & LEAF_D1_EAX_XSAVEC != 0 { xsave_bytes(on) } else { 0 };
+            Cpuid { eax, ebx, ecx: 0, edx: 0 }
+        }
+        SUBLEAF_AVX if offered & fp::XCR0_AVX != 0 => {
+            Cpuid { eax: XSAVE_AVX_BYTES, ebx: XSAVE_LEGACY_BYTES, ecx: 0, edx: 0 }
+        }
+        _ => NONE,
+    }
+}
+
 /// The width of a physical address the guest is told -- leaf 0x80000008's
 /// EAX bits 7:0, the host's -- below `1 << which` its RAM must end, or it
 /// cannot reach it: an entry of its own page table with an address bit past
@@ -335,7 +454,7 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
 /// architecture has at most, whatever a CPU -- or a hypervisor under this
 /// one -- says (hv-fuzz found the shift by a width of 64 or more).
 pub fn phys_bits() -> u32 {
-    match cpuid(LEAF_EXT_ADDRESS, 0, 0, false).eax & EXT8_EAX_PHYS_BITS {
+    match cpuid(LEAF_EXT_ADDRESS, 0, &Asker::RESET).eax & EXT8_EAX_PHYS_BITS {
         0 => DEFAULT_PHYS_BITS,
         bits => bits.min(MAX_PHYS_BITS),
     }
@@ -389,12 +508,13 @@ const CR4_PCE: u64 = 1 << 8;
 /// feature gives (`crate::cr`), so no feature reaches a guest behind its
 /// CPUID's back -- PKE above all, whose PKRU nothing switches between
 /// guests. Today that is VME and PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
-/// OSFXSR and OSXMMEXCPT, UMIP, FSGSBASE, PCIDE, SMEP and SMAP, each where
-/// the host has its feature; never OSXSAVE, PKE, LA57 or CET, whose
-/// features are not offered.
+/// OSFXSR and OSXMMEXCPT, UMIP, FSGSBASE, PCIDE, OSXSAVE, SMEP and SMAP,
+/// each where the host has its feature -- OSXSAVE where XSAVE's state is
+/// switched for a guest; never PKE, LA57 or CET, whose features are not
+/// offered.
 pub fn cr4_allowed() -> u64 {
-    let features = cpuid(LEAF_FEATURES, 0, 0, false);
-    let structured = cpuid(LEAF_STRUCTURED, 0, 0, false);
+    let features = cpuid(LEAF_FEATURES, 0, &Asker::RESET);
+    let structured = cpuid(LEAF_STRUCTURED, 0, &Asker::RESET);
     let mut allowed = CR4_PCE;
     for &(bit, leaf, word, feature) in CR4_FEATURES {
         let answer = if leaf == LEAF_FEATURES { &features } else { &structured };

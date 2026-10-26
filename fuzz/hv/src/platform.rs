@@ -118,6 +118,8 @@ struct CpuPlan {
     /// Its DR0-DR3 by the script's own reckoning: what its writes that a
     /// CPU takes made them, 0 out of reset and INIT.
     dr_model: [u64; 4],
+    /// What its last XSETBV should have come to, for its next entry to see.
+    xcr: Option<XcrExpect>,
 }
 
 /// What a `mov` to or from CR4 the script put at a CPU's RIP should have
@@ -133,6 +135,18 @@ enum Cr4Expect {
     /// `value` refused, as a CPU without a bit's feature refuses it: a #GP
     /// on its way in, CR4 still `old`, RIP still on the instruction.
     Refused { value: u64, old: u64, rip: u64 },
+}
+
+/// What an XSETBV the script put at a CPU's RIP should have done by that
+/// CPU's next entry -- by the script's own reckoning, not `cr.rs`'s.
+#[derive(Clone, Copy, Debug)]
+enum XcrExpect {
+    /// Taken: XCR0 `value` from now on, RIP past the instruction at `rip`.
+    Written { value: u64, rip: u64 },
+    /// Refused as a CPU refuses it -- `vector`, a #UD with CR4.OSXSAVE
+    /// clear and a #GP for the rest, on its way in -- XCR0 still `old`,
+    /// RIP still on the instruction.
+    Refused { vector: u8, old: u64, rip: u64 },
 }
 
 /// What a `mov` to or from DR0-DR3 the script put at a CPU's RIP should have
@@ -194,6 +208,7 @@ fn gpr_slot(v: &mut Backend, n: u8) -> &mut u64 {
 const CR4_PAE: u64 = 1 << 5;
 const CR4_MCE: u64 = 1 << 6;
 const CR4_DE: u64 = 1 << 3;
+const CR4_OSXSAVE: u64 = 1 << 18;
 /// The CR4 bits a guest under VT-x writes without an exit, where its CPUID
 /// offers them -- vmx.rs's choice, which the fuzzer does not compile, as
 /// the model has it: VME, PVI, TSD, DE, PSE, PAE, PGE, PCE, OSFXSR and
@@ -350,6 +365,9 @@ impl Script {
             .collect();
         let denied: Vec<u64> = (0..64).map(|b| 1u64 << b).filter(|b| allowed & b == 0).collect();
         let value = match r.u8() % 8 {
+            /* OSXSAVE turned on, as a kernel turns it on at its start and
+             * keeps it: for its XSETBVs to get past the #UD. */
+            3 if allowed & CR4_OSXSAVE != 0 && old & CR4_OSXSAVE == 0 => old | CR4_OSXSAVE,
             0..=2 if allowed & PGE != 0 => old ^ PGE,
             0..=5 if !offered.is_empty() => old ^ offered[r.below(offered.len() as u64) as usize],
             6 if long => old & !CR4_PAE,
@@ -400,6 +418,47 @@ impl Script {
             });
         }
         Exit::Cr4 { write, gpr: None }
+    }
+
+    /// An XSETBV at the guest's RIP, as a kernel runs one: of XCR0, the x87
+    /// with what of SSE and AVX is offered -- or now and then a value a CPU
+    /// refuses: the x87 left out, AVX without SSE, a component past AVX or
+    /// a high bit; another XCR; at CPL 3; with EAX's and EDX's high halves
+    /// anything, which XSETBV does not read; and under whatever CR4.OSXSAVE
+    /// the guest's writes of CR4 left. What it should come to, for the CPU's
+    /// next entry to see (`XcrExpect`), by the manual's rules.
+    fn xsetbv_insn(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Exit {
+        use crate::x86::fp::{offered, XCR0_AVX, XCR0_SSE, XCR0_X87};
+        const XSETBV: [u8; 3] = [0x0F, 0x01, 0xD1];
+        let offered = offered();
+        let value = match r.u8() % 8 {
+            0..=4 => XCR0_X87 | (r.pick(&[0, XCR0_SSE, XCR0_SSE | XCR0_AVX]) & offered),
+            5 => r.pick(&[0, XCR0_AVX, XCR0_X87 | XCR0_AVX, XCR0_SSE | XCR0_AVX, 0x207, 0x27, 1 << 32 | 7]),
+            _ => r.value64(),
+        };
+        let xcr = if r.u8() < 16 { r.u32() } else { 0 };
+        let cpl = if r.u8() < 16 { 3 } else { 0 };
+        let undefined = v.cr4() & CR4_OSXSAVE == 0;
+        let takes = value & XCR0_X87 != 0 && value & !offered == 0 && (value & XCR0_AVX == 0 || value & XCR0_SSE != 0);
+
+        self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
+        let rip = self.code;
+        let _ = mem.write(rip, &XSETBV);
+        let high = |r: &mut Input| if r.u8() < 32 { r.u64() << 32 } else { 0 };
+        v.save_mut().rip = rip;
+        v.save_mut().cpl = cpl;
+        v.save_mut().rax = (value & 0xFFFF_FFFF) | high(r);
+        v.regs_mut().rdx = (value >> 32) | high(r);
+        v.regs_mut().rcx = u64::from(xcr) | high(r);
+        let old = v.xcr0();
+        self.cpus[self.me].xcr = Some(if undefined {
+            XcrExpect::Refused { vector: 6, old, rip }
+        } else if cpl != 0 || xcr != 0 || !takes {
+            XcrExpect::Refused { vector: 13, old, rip }
+        } else {
+            XcrExpect::Written { value, rip }
+        });
+        Exit::Other(code::XSETBV)
     }
 
     /// A `mov` to or from DR0-DR3 at the guest's RIP, as a kernel makes one:
@@ -500,6 +559,9 @@ impl Script {
             .collect();
         let denied: Vec<u64> = (0..64).map(|b| 1u64 << b).filter(|b| allowed & b == 0).collect();
         let value = match r.u8() % 8 {
+            /* OSXSAVE turned on, as a kernel turns it on at its start and
+             * keeps it: for its XSETBVs to get past the #UD. */
+            3 if allowed & CR4_OSXSAVE != 0 && old & CR4_OSXSAVE == 0 => old | CR4_OSXSAVE,
             0..=2 if allowed & PGE != 0 => old ^ PGE,
             0..=5 if !offered.is_empty() => old ^ offered[r.below(offered.len() as u64) as usize],
             6 if long => old & !CR4_PAE,
@@ -970,6 +1032,31 @@ fn check_dr(v: &mut Backend, e: DrExpect, model: [u64; 4]) {
     v.save_mut().cpl = 0;
 }
 
+/// Hold the run loop to what an XSETBV the script made should have done
+/// (`XcrExpect`), at the next entry of the CPU that made it. Back at CPL 0
+/// after, which only the XSETBV may have been made away from.
+fn check_xcr(v: &mut Backend, e: XcrExpect) {
+    const LEN: u64 = 3;
+    let rip = v.save().rip;
+    match e {
+        XcrExpect::Written { value, rip: at } => {
+            invariant!(v.xcr0() == value && rip == at.wrapping_add(LEN),
+                       "an XSETBV of {:#x} at {:#x} left XCR0 {:#x} and RIP at {:#x}: wanted it, and {:#x}",
+                       value, at, v.xcr0(), rip, at.wrapping_add(LEN));
+            mov_checked(if value & crate::x86::fp::XCR0_AVX != 0 { "platform: XSETBV taken, AVX on" }
+                        else { "platform: XSETBV taken" });
+        }
+        XcrExpect::Refused { vector, old, rip: at } => {
+            invariant!(v.event == Some(vm::Event::Exception(vector)) && v.xcr0() == old && rip == at,
+                       "an XSETBV at {:#x}, which a CPU refuses with vector {}, left event {:#x?}, XCR0 {:#x} \
+                        (was {:#x}) and RIP at {:#x}", at, vector, v.event, v.xcr0(), old, rip);
+            mov_checked(if vector == 6 { "platform: XSETBV without CR4.OSXSAVE, a #UD" }
+                        else { "platform: XSETBV refused, a #GP" });
+        }
+    }
+    v.save_mut().cpl = 0;
+}
+
 fn io_exit(v: &mut Backend, port: u16, size: u8, input: bool) -> Exit {
     let rip = v.save().rip;
     Exit::Io(Io { port, size, input, string: false, rep: false, next_rip: rip.wrapping_add(2) })
@@ -989,6 +1076,7 @@ impl vm::Guest for Script {
             self.cpus[cpu].cr4 = None;
             self.cpus[cpu].dr = None;
             self.cpus[cpu].dr_model = [0; 4];
+            self.cpus[cpu].xcr = None;
             self.cpus[cpu].protected32 = false;
         }
         let data = core::mem::take(&mut self.data);
@@ -1014,6 +1102,9 @@ impl Script {
         if let Some(e) = self.cpus[self.me].dr.take() {
             check_dr(v, e, self.cpus[self.me].dr_model);
         }
+        if let Some(e) = self.cpus[self.me].xcr.take() {
+            check_xcr(v, e);
+        }
         loop {
             if let Some(s) = self.plan().pop_front() {
                 v.take_event();
@@ -1022,7 +1113,13 @@ impl Script {
                     None => continue,
                 }
             }
-            let op = r.op(37)?;
+            let op = r.op(38)?;
+            if op == 37 {
+                /* An XSETBV, which both stop the guest at. */
+                v.take_event();
+                let exit = self.xsetbv_insn(v, mem, r);
+                return Some(vm::Next::Exit(exit));
+            }
             if op == 36 {
                 /* A `mov` of a debug register: of DR0-DR3, which AMD-V stops
                  * the guest at, or of any, which VT-x does. */
@@ -1280,8 +1377,8 @@ impl Script {
                  * SVM one, GETSEC -- answered #UD. */
                 28 if r.u8() < 48 => Exit::Undefined,
                 28 => Exit::Other(if r.rare() { code::INVD } else {
-                    r.pick(&[code::MONITOR, code::MWAIT, code::RDTSCP, code::XSETBV, code::WBINVD, code::RDPRU,
-                             code::RDPMC, code::ICEBP])
+                    r.pick(&[code::MONITOR, code::MWAIT, code::RDTSCP, code::WBINVD, code::RDPRU, code::RDPMC,
+                             code::ICEBP])
                 }),
                 29 => Exit::Hypercall,
                 30 => Exit::Host,
@@ -1543,7 +1640,8 @@ pub fn platform(r: &mut Input) {
         apic: cpus > 1,
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
-                                       protected32: false, cr4: None, dr: None, dr_model: [0; 4] }).collect(),
+                                       protected32: false, cr4: None, dr: None, dr_model: [0; 4],
+                                       xcr: None }).collect(),
         me: 0,
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,

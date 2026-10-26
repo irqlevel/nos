@@ -239,6 +239,7 @@ impl Vcpu {
             Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
             Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
             Err(NotRun::Controls { cpu, field, missing }) => return Err(Refusal::Controls { cpu, field, missing }),
+            Err(NotRun::Xstate { cpu, xcr0 }) => return Err(Refusal::Xstate { cpu, xcr0 }),
         };
         if self.guest.entry_failed() {
             /* VMLAUNCH itself failed: the guest never started, and the
@@ -797,6 +798,26 @@ impl Vcpu {
     }
     pub fn skip_wbinvd(&mut self) {
         self.skip();
+    }
+    pub fn skip_xsetbv(&mut self) {
+        self.skip();
+    }
+
+    /// The guest's XCR0, which its entries make the CPU's.
+    pub fn xcr0(&self) -> u64 {
+        self.guest.xcr0()
+    }
+
+    /// Make `value` the guest's XCR0, for an XSETBV of it performed for the
+    /// guest: false, and nothing changed, for one a CPU refuses.
+    pub fn set_xcr0(&mut self, value: u64) -> bool {
+        self.guest.set_xcr0(value)
+    }
+
+    /// How many entries put the guest's x87, SSE and AVX registers back into
+    /// a CPU that held another's.
+    pub fn fp_loads(&self) -> u64 {
+        self.guest.fp_loads()
     }
 
     /// Whether an event is queued for injection on the next entry.
