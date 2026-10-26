@@ -243,6 +243,44 @@ pub mod x86 {
         }
     }
 
+    /// hvarch's `spec`, as the policy sees it: what of IA32_SPEC_CTRL and
+    /// IA32_PRED_CMD a guest may write -- every control this input's host's
+    /// leaves name, Intel's and AMD's both, as hvarch's `cpu_controls` finds
+    /// them in a CPU's.
+    pub mod spec {
+        use super::cpu;
+
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct Controls {
+            pub spec_ctrl: u64,
+            pub pred_cmd: u64,
+        }
+
+        pub fn guest_controls() -> Controls {
+            let has = |yes: bool, bits: u64| if yes { bits } else { 0 };
+            let structured = cpu::cpuid_count(7, 0);
+            let edx = structured.map_or(0, |r| r.edx);
+            let edx2 = match structured {
+                Some(r) if r.eax >= 2 => cpu::cpuid_count(7, 2).map_or(0, |r| r.edx),
+                _ => 0,
+            };
+            let sizes = cpu::cpuid_count(0x8000_0008, 0).map_or(0, |r| r.ebx);
+            let features2 = cpu::cpuid_count(0x8000_0021, 0).map_or(0, |r| r.eax);
+            let bit = |word: u32, b: u32| word & (1 << b) != 0;
+            Controls {
+                spec_ctrl: has(bit(edx, 26) || bit(sizes, 14), 1 << 0)
+                    | has(bit(edx, 27) || bit(sizes, 15), 1 << 1)
+                    | has(bit(edx, 31) || bit(sizes, 24), 1 << 2)
+                    | has(bit(edx2, 0) || bit(sizes, 28), 1 << 7)
+                    | has(bit(edx2, 1), (1 << 3) | (1 << 4))
+                    | has(bit(edx2, 2), (1 << 5) | (1 << 6))
+                    | has(bit(edx2, 3), 1 << 8)
+                    | has(bit(edx2, 4), 1 << 10),
+                pred_cmd: has(bit(edx, 26) || bit(sizes, 12), 1 << 0) | has(bit(features2, 27), 1 << 7),
+            }
+        }
+    }
+
     /// hvarch's `fp`, as the policy and the run loop see it: the XCR0
     /// components a guest is offered, found in this input's host's leaves
     /// as hvarch's `supported` finds them in a CPU's -- XSAVE, the x87 and
@@ -527,9 +565,12 @@ pub mod vm {
         /// The guest's XCR0, as hvarch's `GuestFp` keeps it: the x87 alone
         /// out of reset, and whatever XSETBV the run loop performed made it.
         xcr0: u64,
-        /// The guest's TSC_AUX, as hvarch's `GuestMsrs` keeps it: 0 out of
-        /// reset, and whatever WRMSR the run loop performed made it.
+        /// The guest's TSC_AUX and IA32_SPEC_CTRL, as hvarch's `GuestMsrs`
+        /// keeps them: 0 out of reset, and whatever WRMSR the run loop
+        /// performed made them; and the IBPBs it asked for.
         tsc_aux: u64,
+        spec_ctrl: u64,
+        ibpbs: u64,
         /// VT-x's virtual APIC, as the machine is said to have one: CR8 its
         /// VTPR, never an exit, and while the run loop has virtual-interrupt
         /// delivery on (`apicv`), this model is the CPU that delivers VIRR's
@@ -588,6 +629,8 @@ pub mod vm {
                 debug_addrs: [0; 4],
                 xcr0: crate::x86::fp::XCR0_X87,
                 tsc_aux: 0,
+                spec_ctrl: 0,
+                ibpbs: 0,
                 vapic: false,
                 apicv: false,
                 virr: [0; 8],
@@ -814,17 +857,27 @@ pub mod vm {
         }
         /// As vm.rs's: the guest's MSRs its save area does not hold.
         pub fn own_msrs(&self) -> crate::policy::Own {
-            crate::policy::Own { tsc_aux: self.tsc_aux }
+            crate::policy::Own { tsc_aux: self.tsc_aux, spec_ctrl: self.spec_ctrl, ibpbs: self.ibpbs }
         }
-        /// As vm.rs's, over hvarch's `GuestMsrs::set_tsc_aux`: held to what
-        /// the MSR can hold -- a value the policy took that an entry's WRMSR
-        /// of it would fault on in the host is a finding, not a #GP.
+        /// As vm.rs's, over hvarch's `GuestMsrs::set`: held to what the MSRs
+        /// can hold -- a value the policy took that an entry's WRMSR of it
+        /// would fault on in the host is a finding, not a #GP -- and an IBPB
+        /// asked for one at a time, where the CPU has one.
         pub fn set_own_msrs(&mut self, own: &crate::policy::Own) -> bool {
             invariant!(own.tsc_aux >> 32 == 0, "TSC_AUX made {:#x}, which the MSR cannot hold", own.tsc_aux);
             let runs = crate::x86::offers();
             invariant!(runs.rdtscp || runs.rdpid || own.tsc_aux == self.tsc_aux,
                        "TSC_AUX made {:#x} in a guest offered neither RDTSCP nor RDPID", own.tsc_aux);
+            let controls = crate::x86::spec::guest_controls();
+            invariant!(own.spec_ctrl & !controls.spec_ctrl == 0,
+                       "IA32_SPEC_CTRL made {:#x}, bits {:#x} of it no control the CPU has", own.spec_ctrl,
+                       own.spec_ctrl & !controls.spec_ctrl);
+            invariant!(own.ibpbs == self.ibpbs || (own.ibpbs == self.ibpbs.wrapping_add(1) && controls.pred_cmd != 0),
+                       "the IBPBs asked for went from {} to {} (the CPU's PRED_CMD {:#x})", self.ibpbs, own.ibpbs,
+                       controls.pred_cmd);
             self.tsc_aux = own.tsc_aux;
+            self.spec_ctrl = own.spec_ctrl;
+            self.ibpbs = own.ibpbs;
             true
         }
         /// As VT-x's: CR8 to or from a register, and stepped past.

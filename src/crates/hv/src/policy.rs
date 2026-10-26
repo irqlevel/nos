@@ -39,7 +39,7 @@
 //! are ready for; a refusal the guest was not ready for is a line in its
 //! log (Linux's "unchecked MSR access error"), and in the VM's report.
 
-use hvarch::x86::{self, cpu, fp};
+use hvarch::x86::{self, cpu, fp, spec};
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::GuestRegs;
 
@@ -172,14 +172,15 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
  * guest owns turn on -- SMEP, SMAP and UMIP for its kernel, FSGSBASE over
  * bases the VMCS and the VMCB keep -- and facts of the silicon; GFNI, whose
  * SSE forms are on the XMM registers and VEX forms on the YMM; where AVX's
- * state is switched, the AVX line (`LEAF7_EBX_AVX`); and where they run in
- * a guest, INVPCID and RDPID (`hvarch::x86::offers`). Its EAX is the last
- * subleaf answered, the host's or 1 (`LEAF7_LAST_SUBLEAF`). Among what is
- * cleared: AVX-512 and AMX (state past AVX's, which nothing switches), HLE
- * and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
- * TSC_ADJUST, LA57, the hybrid flag, and the speculation controls -- IBRS
- * and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not the guest's to
- * write. */
+ * state is switched, the AVX line (`LEAF7_EBX_AVX`); where they run in a
+ * guest, INVPCID and RDPID (`hvarch::x86::offers`); and the speculation
+ * controls, whose MSRs are the guest's own (`LEAF7_EDX_SPEC`). Its EAX is
+ * the last subleaf answered, the host's or 2 (`LEAF7_LAST_SUBLEAF`). Among
+ * what is cleared: AVX-512 and AMX (state past AVX's, which nothing
+ * switches), HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET,
+ * WAITPKG, TSC_ADJUST, LA57, the hybrid flag, and L1D_FLUSH, whose flush
+ * would have to run on the CPU the guest's data was in, before its task
+ * could move. */
 const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 3)   // BMI1
     | (1 << 6)   // the x87 data pointer kept at exceptions only
@@ -206,9 +207,10 @@ const LEAF7_ECX_AVX: u32 = (1 << 9)   // VAES
  * where it runs in a guest. */
 const LEAF7_EBX_INVPCID: u32 = 1 << 10;
 const LEAF7_ECX_RDPID: u32 = 1 << 22;
-/// The last subleaf of leaf 7 answered: 1, or the host's where that is 0.
-const LEAF7_LAST_SUBLEAF: u32 = SUBLEAF_7_1;
+/// The last subleaf of leaf 7 answered: 2, or the host's where that is less.
+const LEAF7_LAST_SUBLEAF: u32 = SUBLEAF_7_2;
 const SUBLEAF_7_1: u32 = 1;
+const SUBLEAF_7_2: u32 = 2;
 /* Leaf 7, subleaf 1: in EAX, facts of the silicon -- REP MOVSB fast at no
  * bytes, REP STOSB, CMPSB and SCASB fast at a few -- and where AVX's state is
  * switched, the instructions VEX codes on the YMM registers: SHA512, SM3 and
@@ -253,6 +255,63 @@ const LEAF7_EDX_KEEP: u32 = (1 << 4)   // FSRM
     | (1 << 14)  // SERIALIZE
     | (1 << 29); // ARCH_CAPABILITIES
 
+/* The speculation controls, Intel's in leaf 7 and AMD's in 0x8000_0008 and
+ * 0x8000_0021, each where the host has it and the bits of IA32_SPEC_CTRL or
+ * IA32_PRED_CMD it names are the guest's to write (`spec::guest_controls`,
+ * `Own`): the guest's SPEC_CTRL is its own, made the CPU's over the host's
+ * for its run, and an IBPB it asks for is performed before its next entry on
+ * any CPU it may have trained. Leaf 7, subleaf 0, EDX: IBRS and IBPB, STIBP,
+ * SSBD. Subleaf 2, EDX: PSFD, IPRED_DIS, RRSBA_DIS, DDPD_U and BHI_DIS_S,
+ * and MCDT_NO, a fact of the silicon. 0x8000_0008 EBX: IBPB -- with it
+ * IBPB_RET, a fact of that IBPB -- IBRS, STIBP, SSBD and PSFD. 0x8000_0021
+ * EAX: SBPB, and with IBPB IBPB_BRTYPE, a fact of it. Each bit with the
+ * controls it names: (leaf, register's bit, SPEC_CTRL's, PRED_CMD's). */
+const LEAF7_EDX_SPEC: &[(u32, u64, u64)] = &[
+    (1 << 26, SPEC_CTRL_IBRS, PRED_CMD_IBPB), // IBRS and IBPB
+    (1 << 27, SPEC_CTRL_STIBP, 0),            // STIBP
+    (1 << 31, SPEC_CTRL_SSBD, 0),             // SSBD
+];
+const LEAF7_2_EDX_KEEP: u32 = 1 << 5; // MCDT_NO
+const LEAF7_2_EDX_SPEC: &[(u32, u64, u64)] = &[
+    (1 << 0, SPEC_CTRL_PSFD, 0),      // PSFD
+    (1 << 1, SPEC_CTRL_IPRED_DIS, 0), // IPRED_CTRL
+    (1 << 2, SPEC_CTRL_RRSBA_DIS, 0), // RRSBA_CTRL
+    (1 << 3, SPEC_CTRL_DDPD_U, 0),    // DDPD_U
+    (1 << 4, SPEC_CTRL_BHI_DIS_S, 0), // BHI_CTRL
+];
+const EXT8_EBX_SPEC: &[(u32, u64, u64)] = &[
+    (1 << 12, 0, PRED_CMD_IBPB),  // IBPB
+    (1 << 30, 0, PRED_CMD_IBPB),  // IBPB_RET: that IBPB clears the return predictions too
+    (1 << 14, SPEC_CTRL_IBRS, 0), // IBRS
+    (1 << 15, SPEC_CTRL_STIBP, 0), // STIBP
+    (1 << 24, SPEC_CTRL_SSBD, 0), // SSBD
+    (1 << 28, SPEC_CTRL_PSFD, 0), // PSFD
+];
+const EXT21_EAX_SPEC: &[(u32, u64, u64)] = &[
+    (1 << 27, 0, PRED_CMD_SBPB), // SBPB
+    (1 << 28, 0, PRED_CMD_IBPB), // IBPB_BRTYPE: that IBPB flushes the branch types too
+];
+/* IA32_SPEC_CTRL's bits and IA32_PRED_CMD's, as those CPUID bits name them. */
+const SPEC_CTRL_IBRS: u64 = 1 << 0;
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
+const SPEC_CTRL_SSBD: u64 = 1 << 2;
+const SPEC_CTRL_IPRED_DIS: u64 = (1 << 3) | (1 << 4);
+const SPEC_CTRL_RRSBA_DIS: u64 = (1 << 5) | (1 << 6);
+const SPEC_CTRL_PSFD: u64 = 1 << 7;
+const SPEC_CTRL_DDPD_U: u64 = 1 << 8;
+const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
+const PRED_CMD_IBPB: u64 = 1 << 0;
+const PRED_CMD_SBPB: u64 = 1 << 7;
+
+/// The bits of `table` -- (register's bit, SPEC_CTRL's, PRED_CMD's) -- whose
+/// controls are all the guest's.
+fn speculation(table: &[(u32, u64, u64)]) -> u32 {
+    let c = spec::guest_controls();
+    table.iter()
+        .filter(|&&(_, ctrl, pred)| c.spec_ctrl & ctrl == ctrl && c.pred_cmd & pred == pred)
+        .fold(0, |bits, &(bit, _, _)| bits | bit)
+}
+
 /* Extended leaf 0x80000001, ECX: the features kept, on the same terms as
  * leaf 1's -- anything not named is cleared. That list was once "all of it
  * but SVM", and on a real Zen 2 the guest found MWAITX there (bit 29), used
@@ -289,11 +348,12 @@ const EXT1_EDX_RDTSCP: u32 = 1 << 27;
  * the width of a nested guest's. In EBX, what the CPU does as it is: CLZERO,
  * an instruction with nothing to intercept; the FP error pointers FXSAVE
  * always keeps; and two attacks it is not open to, speculative store bypass
- * and branch type confusion -- facts of the silicon, true of a guest on it.
- * A speculation control is offered only beside the MSR that makes it true,
- * and there is none here yet: IBPB was offered while a write to PRED_CMD
- * went nowhere, and IBRS, STIBP and SSBD while SPEC_CTRL kept nothing, so a
- * guest on AMD reported itself mitigated and was not. Among the rest:
+ * and branch type confusion -- facts of the silicon, true of a guest on it;
+ * and the speculation controls (`EXT8_EBX_SPEC`), each only beside the MSR
+ * that makes it true: IBPB was offered once while a write to PRED_CMD went
+ * nowhere, and IBRS, STIBP and SSBD while SPEC_CTRL kept nothing, so a
+ * guest on AMD reported itself mitigated and was not. Not VIRT_SSBD, whose
+ * MSR nothing answers. Among the rest:
  * INVLPGB, which the VMCB does not enable (Linux 6.15 on Zen 3 would flush
  * its TLBs with it and take a #UD, by its source), RDPRU and WBNOINVD,
  * whose exits have no answer here, PPIN and CPPC, MSRs nobody answers. */
@@ -307,10 +367,11 @@ const EXT8_EBX_KEEP: u32 = (1 << 0)   // CLZERO
  * what is true of the CPU a guest runs on and asks nothing of the host -- no
  * nested data breakpoints, LFENCE serializing, VERW clearing what TSA would
  * leave, a null selector clearing the base, and not affected by SRSO, at
- * all or across user and kernel; in ECX, not affected by TSA-SQ or TSA-L1.
+ * all or across user and kernel; in ECX, not affected by TSA-SQ or TSA-L1;
+ * and SBPB and IBPB_BRTYPE where PRED_CMD is the guest's (`EXT21_EAX_SPEC`).
  * Not AutoIBRS, whose EFER bit a guest may not set (offered with its
  * write refused, Linux on Zen 4 runs with neither it nor retpolines, by its
- * source), SBPB and IBPB_BRTYPE, PRED_CMD's, nor CPUID faulting, HWCR's. */
+ * source), nor CPUID faulting, HWCR's. */
 const EXT21_EAX_KEEP: u32 = (1 << 0)   // no nested data breakpoints
     | (1 << 2)   // LFENCE always serializing
     | (1 << 5)   // VERW clears what TSA would leave
@@ -400,7 +461,7 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
                 eax: eax.min(LEAF7_LAST_SUBLEAF),
                 ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx | invpcid),
                 ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx | rdpid),
-                edx: edx & LEAF7_EDX_KEEP,
+                edx: edx & (LEAF7_EDX_KEEP | speculation(LEAF7_EDX_SPEC)),
             }
         }
         /* Where the host has the subleaf: past its last, its answer is no
@@ -408,6 +469,9 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_STRUCTURED if sub == SUBLEAF_7_1 && structured_last() >= SUBLEAF_7_1 => {
             let (avx_eax, avx_edx) = if avx { (LEAF7_1_EAX_AVX, LEAF7_1_EDX_AVX) } else { (0, 0) };
             Cpuid { eax: eax & (LEAF7_1_EAX_KEEP | avx_eax), ebx: 0, ecx: 0, edx: edx & avx_edx }
+        }
+        LEAF_STRUCTURED if sub == SUBLEAF_7_2 && structured_last() >= SUBLEAF_7_2 => {
+            Cpuid { eax: 0, ebx: 0, ecx: 0, edx: edx & (LEAF7_2_EDX_KEEP | speculation(LEAF7_2_EDX_SPEC)) }
         }
         LEAF_XSAVE => xsave_leaf(sub, eax, asker.xcr0),
         LEAF_TSC if apic => {
@@ -429,8 +493,18 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
             Cpuid { eax, ebx, ecx: ecx & EXT1_ECX_KEEP, edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | apic_edx }
         }
         LEAF_EXT_POWER => Cpuid { eax: 0, ebx: 0, ecx: 0, edx: edx & EXT7_EDX_INVARIANT_TSC },
-        LEAF_EXT_ADDRESS => Cpuid { eax: eax & EXT8_EAX_KEEP, ebx: ebx & EXT8_EBX_KEEP, ecx: 0, edx: 0 },
-        LEAF_EXT_FEATURES2 => Cpuid { eax: eax & EXT21_EAX_KEEP, ebx: 0, ecx: ecx & EXT21_ECX_KEEP, edx: 0 },
+        LEAF_EXT_ADDRESS => Cpuid {
+            eax: eax & EXT8_EAX_KEEP,
+            ebx: ebx & (EXT8_EBX_KEEP | speculation(EXT8_EBX_SPEC)),
+            ecx: 0,
+            edx: 0,
+        },
+        LEAF_EXT_FEATURES2 => Cpuid {
+            eax: eax & (EXT21_EAX_KEEP | speculation(EXT21_EAX_SPEC)),
+            ebx: 0,
+            ecx: ecx & EXT21_ECX_KEEP,
+            edx: 0,
+        },
         _ => NONE,
     }
 }
@@ -616,19 +690,46 @@ const MSR_TSC_AUX: u32 = 0xC000_0103;
 const TSC_AUX_BITS: u64 = 0xFFFF_FFFF;
 
 /// A guest CPU's MSRs that its save area does not hold, which the backend
-/// keeps and its entries make the CPU's (`hvarch::x86::msrs`): read here,
-/// and written back through what checks them again (`Backend::set_own_msrs`).
+/// keeps and its entries make the CPU's, and the IBPBs it asked for
+/// (`hvarch::x86::msrs`): read here, and written back through what checks
+/// them again (`Backend::set_own_msrs`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Own {
     /// IA32_TSC_AUX.
     pub tsc_aux: u64,
+    /// IA32_SPEC_CTRL: the bits the guest set.
+    pub spec_ctrl: u64,
+    /// How many IBPBs it asked for by IA32_PRED_CMD: one more for each write
+    /// of it that asks for one.
+    pub ibpbs: u64,
 }
+
+/* IA32_SPEC_CTRL and IA32_PRED_CMD, where the guest's CPUID offers a control
+ * of them (`spec::guest_controls`): SPEC_CTRL holds any of the bits offered
+ * and reads back what it was given; PRED_CMD is written alone -- a read is a
+ * #GP, as a CPU's -- and takes IBPB, SBPB where it is offered, which an IBPB
+ * more than does, and 0; each barrier one asked of the backend. */
+const MSR_SPEC_CTRL: u32 = 0x48;
+const MSR_PRED_CMD: u32 = 0x49;
 
 /// Whether the guest's CPU has IA32_TSC_AUX: where its CPUID offers RDTSCP
 /// or RDPID, which read it.
 fn has_tsc_aux() -> bool {
     let runs = x86::offers();
     runs.rdtscp || runs.rdpid
+}
+
+/// Whether IA32_SPEC_CTRL takes `value`: the MSR is there -- a control of it
+/// offered -- and no bit of it is one not offered.
+fn spec_ctrl_takes(value: u64) -> bool {
+    let offered = spec::guest_controls().spec_ctrl;
+    offered != 0 && value & !offered == 0
+}
+
+/// Whether IA32_PRED_CMD takes `value`: the same.
+fn pred_cmd_takes(value: u64) -> bool {
+    let offered = spec::guest_controls().pred_cmd;
+    offered != 0 && value & !offered == 0
 }
 
 /* MSRs that a feature the guest's CPUID offers says its CPU has, or that a
@@ -664,12 +765,15 @@ const MSR_PLATFORM_ID: u32 = 0x17;
 /// takes the CPU for one open to everything its model was ever open to: on
 /// the EX44 it isolated its page tables for Meltdown (with no PCID, a whole
 /// TLB flush at every system call) and reported MDS and RFDS unmitigated.
-/// Not IBRS_ALL, whose SPEC_CTRL is not the guest's; not SKIP_L1DFL_VMENTRY,
-/// a hypervisor's, and the guest runs none; nor any bit that names an MSR
+/// IBRS_ALL with them, the guest's SPEC_CTRL its own: an IBRS it sets once
+/// is set for every one of its runs, as on the host's CPU -- which keeps its
+/// own set under it anyway. Not SKIP_L1DFL_VMENTRY, a hypervisor's, and the
+/// guest runs none; nor any bit that names an MSR
 /// this policy does not answer -- TSX_CTRL, FB_CLEAR_CTRL, GDS_CTRL,
 /// DOITM, the energy filter's -- which a kernel told of one writes.
 const MSR_ARCH_CAPABILITIES: u32 = 0x10A;
 const ARCH_CAP_GUEST: u64 = (1 << 0)   // RDCL_NO: not open to Meltdown
+    | (1 << 1)   // IBRS_ALL: enhanced IBRS, SPEC_CTRL's IBRS the guest's
     | (1 << 2)   // RSBA: a RET may be predicted from elsewhere than the RSB
     | (1 << 4)   // SSB_NO
     | (1 << 5)   // MDS_NO
@@ -810,6 +914,7 @@ pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
         MSR_SYSENTER_EIP => save.sysenter_eip,
         MSR_TSC => cpu::rdtsc(),
         MSR_TSC_AUX if has_tsc_aux() => own.tsc_aux,
+        MSR_SPEC_CTRL if spec::guest_controls().spec_ctrl != 0 => own.spec_ctrl,
         _ => match constant(msr)? {
             Constant::ReadOnly(v) | Constant::Fixed(v) => v,
         },
@@ -858,6 +963,12 @@ pub fn wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) -> bool {
         MSR_SYSENTER_EIP => save.sysenter_eip = value,
         /* Its low 32 bits: a write of another is the CPU's #GP. */
         MSR_TSC_AUX if has_tsc_aux() && value & !TSC_AUX_BITS == 0 => own.tsc_aux = value,
+        MSR_SPEC_CTRL if spec_ctrl_takes(value) => own.spec_ctrl = value,
+        MSR_PRED_CMD if pred_cmd_takes(value) => {
+            if value != 0 {
+                own.ibpbs = own.ibpbs.wrapping_add(1);
+            }
+        }
         _ => return matches!(constant(msr), Some(Constant::Fixed(v)) if v == value),
     }
     true
