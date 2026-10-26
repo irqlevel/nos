@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <lib/printer.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* The console shell's line editor: what is typed at the screen's keyboard or
@@ -29,26 +29,26 @@ class LineEditor final
 {
 public:
     /* The longest line taken: what is typed past it is dropped */
-    static const ulong LineMax = 80;
+    static const ulong LINE_LEN_MAX = 80;
     /* Lines Up, Down and ^R go back through */
-    static const ulong HistoryMax = 32;
+    static const ulong HISTORY_MAX = 32;
 
-    static constexpr char PromptText[] = "$";
-    static constexpr char SearchText[] = "(reverse-i-search)'";
-    static constexpr char FailedText[] = "(failed reverse-i-search)'";
-    static constexpr char QueryEndText[] = "': ";
+    static constexpr char PROMPT_TEXT[] = "$";
+    static constexpr char SEARCH_TEXT[] = "(reverse-i-search)'";
+    static constexpr char FAILED_TEXT[] = "(failed reverse-i-search)'";
+    static constexpr char QUERY_END_TEXT[] = "': ";
 
     LineEditor();
 
     /* A line begins: the prompt, and the line so far -- empty once a line
        has ended -- on out, at the start of a line of its own */
-    void Prompt(Stdlib::Printer& out);
+    void prompt(stdlib::Printer& out);
 
     /* One byte typed, what it changes shown on out. True when it ended a
        line, which GetLine() then is until the next call. */
-    bool Key(char c, Stdlib::Printer& out);
+    bool key(char c, stdlib::Printer& out);
 
-    const char* GetLine() const { return Done; }
+    const char* get_line() const { return done_; }
 
 private:
     LineEditor(const LineEditor& other) = delete;
@@ -57,28 +57,28 @@ private:
     LineEditor& operator=(LineEditor&& other) = delete;
 
     /* The keys the editor has a use for, as a terminal sends them */
-    static const char KeyCtrlC = 0x03;
-    static const char KeyCtrlG = 0x07;
-    static const char KeyBackspace = 0x08;
-    static const char KeyLf = 0x0A;
-    static const char KeyCr = 0x0D;
-    static const char KeyCtrlN = 0x0E;
-    static const char KeyCtrlP = 0x10;
-    static const char KeyCtrlR = 0x12;
-    static const char KeyCtrlU = 0x15;
-    static const char KeyEsc = 0x1B;
-    static const char KeyDel = 0x7F;
+    static const char KEY_CTRL_C = 0x03;
+    static const char KEY_CTRL_G = 0x07;
+    static const char KEY_BACKSPACE = 0x08;
+    static const char KEY_LF = 0x0A;
+    static const char KEY_CR = 0x0D;
+    static const char KEY_CTRL_N = 0x0E;
+    static const char KEY_CTRL_P = 0x10;
+    static const char KEY_CTRL_R = 0x12;
+    static const char KEY_CTRL_U = 0x15;
+    static const char KEY_ESC = 0x1B;
+    static const char KEY_DEL = 0x7F;
 
     /* ECMA-48's control sequence: ESC [, parameter and intermediate bytes,
        and a final byte that says which key -- A up, B down */
-    static const char CsiMiddleFirst = 0x20;
-    static const char CsiMiddleLast = 0x3F;
-    static const char CsiFinalFirst = 0x40;
-    static const char CsiFinalLast = 0x7E;
+    static const char CSI_MIDDLE_FIRST = 0x20;
+    static const char CSI_MIDDLE_LAST = 0x3F;
+    static const char CSI_FINAL_FIRST = 0x40;
+    static const char CSI_FINAL_LAST = 0x7E;
 
     /* The most the editor ever shows: a failed search's prompt, what is
        searched for, and the line */
-    static const ulong ShownMax = (sizeof(FailedText) - 1) + LineMax + (sizeof(QueryEndText) - 1) + LineMax;
+    static const ulong SHOWN_MAX = (sizeof(FAILED_TEXT) - 1) + LINE_LEN_MAX + (sizeof(QUERY_END_TEXT) - 1) + LINE_LEN_MAX;
 
     enum EscState
     {
@@ -87,59 +87,59 @@ private:
         EscSequence,    /* ESC [ or ESC O, until the final byte */
     };
 
-    static bool IsPrintable(char c) { return c >= ' ' && c <= '~'; }
+    static bool is_printable(char c) { return c >= ' ' && c <= '~'; }
 
-    bool Enter(Stdlib::Printer& out);
-    void Cancel(Stdlib::Printer& out);
-    void Remember();
-    void Older();
-    void Newer();
+    bool enter(stdlib::Printer& out);
+    void cancel(stdlib::Printer& out);
+    void remember();
+    void older();
+    void newer();
 
     /* ^R: the search begins, from the newest line */
-    void StartSearch();
+    void start_search();
     /* The newest line older than below that holds the query: Line and
        Match are it, or Failed says there is none and they stay */
-    void Find(ulong below);
-    void AcceptSearch();
+    void find(ulong below);
+    void accept_search();
 
-    const char* HistoryAt(ulong i) const;
-    bool Holds(ulong i) const;
+    const char* history_at(ulong i) const;
+    bool holds(ulong i) const;
 
     /* Makes the screen show the editor's state, from where the two differ */
-    void Show(Stdlib::Printer& out);
+    void show(stdlib::Printer& out);
 
-    char Line[LineMax + 1];
-    ulong Len;
+    char line_[LINE_LEN_MAX + 1];
+    ulong len_;
 
     /* A ring of the lines run, Count of them from First, oldest first */
-    char History[HistoryMax][LineMax + 1];
-    ulong First;
-    ulong Count;
+    char history_[HISTORY_MAX][LINE_LEN_MAX + 1];
+    ulong first_;
+    ulong count_;
 
     /* Where Up and Down have got to in the history: Count when not in it */
-    ulong Browse;
+    ulong browse_;
     /* The line being typed when Up took it away, for Down to give back */
-    char Draft[LineMax + 1];
-    ulong DraftLen;
+    char draft_[LINE_LEN_MAX + 1];
+    ulong draft_len_;
 
-    EscState Esc;
+    EscState esc_;
 
-    bool Searching;
+    bool searching_;
     /* Nothing older holds the query: the line is the last that did */
-    bool Failed;
-    char Query[LineMax + 1];
-    ulong QueryLen;
+    bool failed_;
+    char query_[LINE_LEN_MAX + 1];
+    ulong query_len_;
     /* The history line the search found, Count before it found one */
-    ulong Match;
+    ulong match_;
     /* The line from before the search, for ^G */
-    char Saved[LineMax + 1];
-    ulong SavedLen;
+    char saved_[LINE_LEN_MAX + 1];
+    ulong saved_len_;
 
     /* What the screen shows since the prompt began */
-    char Shown[ShownMax + 1];
-    ulong ShownLen;
+    char shown_[SHOWN_MAX + 1];
+    ulong shown_len_;
 
-    char Done[LineMax + 1];
+    char done_[LINE_LEN_MAX + 1];
 };
 
 }

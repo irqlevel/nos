@@ -32,7 +32,7 @@ typedef uint64_t u64;
    -- a ulong under %u, a string under %d, an argument too few -- a build
    that fails, where it was a value read from half a register or past the
    last one passed. */
-#define PRINTF_FORMAT(fmtIndex, firstArg) __attribute__((format(printf, fmtIndex, firstArg)))
+#define PRINTF_FORMAT(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))
 
 /* __builtin_offsetof, what offsetof is: the old &((type*)0)->field made a
    member access through a null pointer, which is undefined behaviour -- the

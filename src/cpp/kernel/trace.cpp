@@ -10,46 +10,46 @@ void rust_netconsole_log(const char* line, unsigned long len);
 void rust_disklog_log(const char* line);
 }
 
-namespace Kernel
+namespace kernel
 {
 
 Tracer::Tracer()
-    : Level(0)
-    , ConsoleSuppressed(false)
+    : level_(0)
+    , console_suppressed_(false)
 {
 }
 
-void Tracer::SetLevel(int level)
+void Tracer::set_level(int level)
 {
-    Level = level;
+    level_ = level;
 }
 
-int Tracer::GetLevel()
+int Tracer::get_level()
 {
-    return Level;
+    return level_;
 }
 
-void Tracer::SetConsoleSuppressed(bool suppressed)
+void Tracer::set_console_suppressed(bool suppressed)
 {
-    ConsoleSuppressed = suppressed;
+    console_suppressed_ = suppressed;
 }
 
-bool Tracer::IsConsoleSuppressed()
+bool Tracer::is_console_suppressed()
 {
-    return ConsoleSuppressed;
+    return console_suppressed_;
 }
 
 Tracer::~Tracer()
 {
 }
 
-void Tracer::Output(const char *fmt, ...)
+void Tracer::output(const char *fmt, ...)
 {
     char msg[256];
 
     va_list args;
     va_start(args, fmt);
-    int size = Stdlib::VsnPrintf(msg, sizeof(msg), fmt, args);
+    int size = stdlib::vsn_printf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
     /* A line longer than the buffer comes out truncated, with "..." where it
@@ -60,20 +60,20 @@ void Tracer::Output(const char *fmt, ...)
     if (size < 0 && msg[0] == '\0')
         return;
 
-    Dmesg::GetInstance().PrintString(msg);
+    Dmesg::get_instance().print_string(msg);
 
     /* Capture is a memcpy into a ring buffer -- the send happens later, on the
        netconsole task, so this stays safe in IRQ context. */
-    rust_netconsole_log(msg, Stdlib::StrLen(msg));
+    rust_netconsole_log(msg, stdlib::str_len(msg));
 
     /* And to the disk area, if one was prepared. Unlike the netconsole this
        writes now, synchronously: it exists for the boot that stops before
        there is a task to drain anything. */
     rust_disklog_log(msg);
 
-    if (!ConsoleSuppressed)
+    if (!console_suppressed_)
     {
-        Hal::ConsoleWrite(msg);
+        hal::console_write(msg);
     }
 }
 

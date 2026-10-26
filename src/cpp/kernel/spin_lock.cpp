@@ -4,11 +4,11 @@
 #include "preempt.h"
 #include "watchdog.h"
 
-namespace Kernel
+namespace kernel
 {
 
 SpinLock::SpinLock()
-    : Owner(nullptr)
+    : owner_(nullptr)
 {
 }
 
@@ -16,46 +16,46 @@ SpinLock::~SpinLock()
 {
 }
 
-void SpinLock::Unwatch()
+void SpinLock::unwatch()
 {
-    Watchdog::GetInstance().UnregisterSpinLock(RawLock);
+    Watchdog::get_instance().unregister_spin_lock(raw_lock_);
 }
 
-void SpinLock::Lock()
+void SpinLock::lock()
 {
-    RawLock.Lock();
-    Owner = (PreemptIsOn()) ? PreemptCurrentTask() : nullptr;
+    raw_lock_.lock();
+    owner_ = (preempt_is_on()) ? preempt_current_task() : nullptr;
 }
 
-void SpinLock::Unlock()
+void SpinLock::unlock()
 {
-    Owner = nullptr;
-    RawLock.Unlock();
+    owner_ = nullptr;
+    raw_lock_.unlock();
 }
 
 /* Through the raw lock's IRQ-saving form: preemption goes off with
    interrupts and the flags carry it, instead of Lock() counting it a second
    time. */
-void SpinLock::Lock(ulong& flags)
+void SpinLock::lock(ulong& flags)
 {
-    flags = RawLock.LockIrqSave();
-    Owner = (PreemptIsOn()) ? PreemptCurrentTask() : nullptr;
+    flags = raw_lock_.lock_irq_save();
+    owner_ = (preempt_is_on()) ? preempt_current_task() : nullptr;
 }
 
-void SpinLock::Unlock(ulong flags)
+void SpinLock::unlock(ulong flags)
 {
-    Owner = nullptr;
-    RawLock.UnlockIrqRestore(flags);
+    owner_ = nullptr;
+    raw_lock_.unlock_irq_restore(flags);
 }
 
-void SpinLock::SharedLock(ulong& flags)
+void SpinLock::shared_lock(ulong& flags)
 {
-    Lock(flags);
+    lock(flags);
 }
 
-void SpinLock::SharedUnlock(ulong flags)
+void SpinLock::shared_unlock(ulong flags)
 {
-    Unlock(flags);
+    unlock(flags);
 }
 
 }

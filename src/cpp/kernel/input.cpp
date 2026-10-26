@@ -2,28 +2,28 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 KeyboardInput::KeyboardInput()
 {
-    for (size_t i = 0; i < Stdlib::ArraySize(Observer); i++)
-        Observer[i] = nullptr;
+    for (size_t i = 0; i < stdlib::array_size(observer_); i++)
+        observer_[i] = nullptr;
 }
 
 KeyboardInput::~KeyboardInput()
 {
 }
 
-bool KeyboardInput::RegisterObserver(KeyboardObserver& observer)
+bool KeyboardInput::register_observer(KeyboardObserver& observer)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    for (size_t i = 0; i < MaxObserver; i++)
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
     {
-        if (Observer[i] == nullptr)
+        if (observer_[i] == nullptr)
         {
-            Observer[i] = &observer;
+            observer_[i] = &observer;
             return true;
         }
     }
@@ -31,25 +31,25 @@ bool KeyboardInput::RegisterObserver(KeyboardObserver& observer)
     return false;
 }
 
-void KeyboardInput::UnregisterObserver(KeyboardObserver& observer)
+void KeyboardInput::unregister_observer(KeyboardObserver& observer)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    for (size_t i = 0; i < MaxObserver; i++)
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
     {
-        if (Observer[i] == &observer)
-            Observer[i] = nullptr;
+        if (observer_[i] == &observer)
+            observer_[i] = nullptr;
     }
 }
 
-void KeyboardInput::Emit(char c, u8 code)
+void KeyboardInput::emit(char c, u8 code)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    for (size_t i = 0; i < MaxObserver; i++)
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
     {
-        if (Observer[i] != nullptr)
-            Observer[i]->OnChar(c, code);
+        if (observer_[i] != nullptr)
+            observer_[i]->on_char(c, code);
     }
 }
 

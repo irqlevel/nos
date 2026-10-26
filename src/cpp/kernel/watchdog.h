@@ -7,28 +7,28 @@
 #include "raw_spin_lock.h"
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class Watchdog final
 {
 public:
-    static Watchdog& GetInstance()
+    static Watchdog& get_instance()
     {
-        static Watchdog Instance;
-        return Instance;
+        static Watchdog instance;
+        return instance;
     }
 
-    void RegisterSpinLock(RawSpinLock& lock);
-    void UnregisterSpinLock(RawSpinLock& lock);
+    void register_spin_lock(RawSpinLock& lock);
+    void unregister_spin_lock(RawSpinLock& lock);
 
-    void Check();
+    void check();
 
-    void Dump(Stdlib::Printer& printer);
+    void dump(stdlib::Printer& printer);
 
     /* Checked against MaxCpus in the .cpp; kept here so this header does not
        have to pull in cpu.h. */
-    static const ulong SliceCpus = 64;
+    static const ulong SLICE_CPUS = 64;
 
 private:
     Watchdog(const Watchdog& other) = delete;
@@ -37,7 +37,7 @@ private:
     Watchdog& operator=(Watchdog&& other) = delete;
 
 
-    static const size_t SpinLockHashSize = 512;
+    static const size_t SPIN_LOCK_HASH_SIZE = 512;
 
     /* The watchdog's own locks cannot be RawSpinLocks: a RawSpinLock
        registers itself with the watchdog when it is constructed, and these
@@ -46,27 +46,27 @@ private:
     class ListLock final
     {
     public:
-        ulong LockIrqSave();
-        void UnlockIrqRestore(ulong flags);
+        ulong lock_irq_save();
+        void unlock_irq_restore(ulong flags);
 
     private:
-        Atomic Value;
+        Atomic value_;
     };
 
-    Stdlib::ListEntry SpinLockList[SpinLockHashSize];
-    ListLock SpinLockListLock[SpinLockHashSize];
+    stdlib::ListEntry spin_lock_list_[SPIN_LOCK_HASH_SIZE];
+    ListLock spin_lock_list_lock_[SPIN_LOCK_HASH_SIZE];
 
     /* The slice of the bucket table each CPU walks, for Dump. */
     struct Slice
     {
-        ulong First;
-        ulong Stride;
+        ulong first;
+        ulong stride;
     };
 
-    Slice CpuSlice[SliceCpus];
+    Slice cpu_slice_[SLICE_CPUS];
 
-    Atomic CheckCounter;
-    Atomic SpinLockCounter;
+    Atomic check_counter_;
+    Atomic spin_lock_counter_;
 
     Watchdog();
     ~Watchdog();

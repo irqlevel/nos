@@ -44,32 +44,32 @@ extern "C" const char* __ubsan_default_options()
     return "print_stacktrace=1";
 }
 
-namespace Fuzz
+namespace fuzz
 {
 
 namespace
 {
 
-bool Counting = false;
-bool Trace = false;
-std::set<std::string> ReachedStates;
+bool counting = false;
+bool trace_on = false;
+std::set<std::string> reached_states;
 
 /* What a batch's process sends up at its end: how many of its inputs
    reached each state. */
-const char StatsMark[] = "\x01stats";
+const char STATS_MARK[] = "\x01stats";
 
 /* How long one input may run before it is a hang. */
-const int HangSeconds = 20;
+const int HANG_SECONDS = 20;
 
 /* SplitMix64: the seed's stream of random words. */
 struct Rng
 {
-    uint64_t State;
+    uint64_t state;
 
-    uint64_t Next()
+    uint64_t next()
     {
-        State += 0x9E3779B97F4A7C15ULL;
-        uint64_t z = State;
+        state += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = state;
         z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
         z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
         return z ^ (z >> 31);
@@ -79,30 +79,30 @@ struct Rng
 /* The input of iteration iter under seed: its length and bytes from a
    stream of their own, so any one iteration can be made again without the
    ones before it. */
-std::vector<uint8_t> MakeInput(const char* target, uint64_t seed, uint64_t iter, size_t maxLen)
+std::vector<uint8_t> make_input(const char* target, uint64_t seed, uint64_t iter, size_t max_len)
 {
     uint64_t h = seed ^ 0xCBF29CE484222325ULL;
     for (const char* p = target; *p != '\0'; p++)
         h = (h ^ static_cast<uint8_t>(*p)) * 0x100000001B3ULL;
     Rng rng{h ^ (iter * 0x9E3779B97F4A7C15ULL)};
     size_t len;
-    switch (rng.Next() % 4)
+    switch (rng.next() % 4)
     {
     case 0:
-        len = rng.Next() % std::max<uint64_t>(maxLen / 32, 64);
+        len = rng.next() % std::max<uint64_t>(max_len / 32, 64);
         break;
     case 1:
-        len = rng.Next() % std::max<uint64_t>(maxLen / 4, 512);
+        len = rng.next() % std::max<uint64_t>(max_len / 4, 512);
         break;
     default:
-        len = rng.Next() % maxLen;
+        len = rng.next() % max_len;
         break;
     }
     std::vector<uint8_t> v;
     v.reserve(len + 8);
     while (v.size() < len)
     {
-        uint64_t w = rng.Next();
+        uint64_t w = rng.next();
         for (int i = 0; i < 8; i++)
             v.push_back(static_cast<uint8_t>(w >> (8 * i)));
     }
@@ -110,7 +110,7 @@ std::vector<uint8_t> MakeInput(const char* target, uint64_t seed, uint64_t iter,
     return v;
 }
 
-void WriteAll(int fd, const char* s, size_t n)
+void write_all(int fd, const char* s, size_t n)
 {
     while (n > 0)
     {
@@ -126,19 +126,19 @@ void WriteAll(int fd, const char* s, size_t n)
     }
 }
 
-std::string Hex(const std::vector<uint8_t>& data)
+std::string hex(const std::vector<uint8_t>& data)
 {
-    static const char Digits[] = "0123456789abcdef";
+    static const char DIGITS[] = "0123456789abcdef";
     std::string s;
     for (uint8_t b : data)
     {
-        s += Digits[b >> 4];
-        s += Digits[b & 0xF];
+        s += DIGITS[b >> 4];
+        s += DIGITS[b & 0xF];
     }
     return s;
 }
 
-bool Unhex(const std::string& text, std::vector<uint8_t>& out)
+bool unhex(const std::string& text, std::vector<uint8_t>& out)
 {
     std::string s;
     for (char c : text)
@@ -160,10 +160,10 @@ bool Unhex(const std::string& text, std::vector<uint8_t>& out)
     return true;
 }
 
-void RunInput(const std::vector<uint8_t>& data)
+void run_input(const std::vector<uint8_t>& data)
 {
     Input input(data.data(), data.size());
-    TheTarget.Run(input);
+    THE_TARGET.run(input);
 }
 
 /* What became of an input. */
@@ -175,7 +175,7 @@ enum class Outcome
     Hang,
 };
 
-double Now()
+double now()
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -186,30 +186,30 @@ double Now()
    on, since when, and how far it got. */
 struct Shared
 {
-    volatile uint64_t Current;
-    volatile uint64_t Done;
-    volatile double Started;
+    volatile uint64_t current;
+    volatile uint64_t done;
+    volatile double started;
 };
 
-Shared* Progress;
+Shared* progress;
 
 /* The parameters of a run, which a batch's process inherits. */
 struct Run
 {
-    uint64_t Seed;
-    uint64_t Gate;
-    long Seconds;
-    double Start;
+    uint64_t seed;
+    uint64_t gate;
+    long seconds;
+    double start;
 
-    bool Over(uint64_t iter) const
+    bool over(uint64_t iter) const
     {
-        return (Seconds >= 0) ? (Now() - Start >= Seconds) : (iter >= Gate);
+        return (seconds >= 0) ? (now() - start >= seconds) : (iter >= gate);
     }
 };
 
 /* A process of its own for data, or for the batch from first on; its
    stderr, where the sanitizers report, is the pipe its parent reads. */
-Outcome Supervise(pid_t pid, int fd, std::string& message, int& signal)
+Outcome supervise(pid_t pid, int fd, std::string& message, int& signal)
 {
     bool hung = false;
     message.clear();
@@ -231,7 +231,7 @@ Outcome Supervise(pid_t pid, int fd, std::string& message, int& signal)
                 message.erase(0, message.size() - (1 << 19));
             continue;
         }
-        if (Now() - Progress->Started > HangSeconds)
+        if (now() - progress->started > HANG_SECONDS)
         {
             hung = true;
             kill(pid, SIGKILL);
@@ -253,7 +253,7 @@ Outcome Supervise(pid_t pid, int fd, std::string& message, int& signal)
     return (WEXITSTATUS(status) != 0) ? Outcome::Finding : Outcome::Pass;
 }
 
-pid_t Spawn(int& fd)
+pid_t spawn(int& fd)
 {
     int fds[2];
     if (pipe(fds) != 0)
@@ -283,61 +283,61 @@ pid_t Spawn(int& fd)
 }
 
 /* The one input, alone in a fresh process: a finding's report. */
-Outcome RunAlone(const std::vector<uint8_t>& data, std::string& message, int& signal)
+Outcome run_alone(const std::vector<uint8_t>& data, std::string& message, int& signal)
 {
     int fd;
-    Progress->Started = Now();
-    pid_t pid = Spawn(fd);
+    progress->started = now();
+    pid_t pid = spawn(fd);
     if (pid == 0)
     {
-        RunInput(data);
+        run_input(data);
         _exit(0);
     }
-    return Supervise(pid, fd, message, signal);
+    return supervise(pid, fd, message, signal);
 }
 
 /* Inputs from first on, one after another, until the run is over or one of
    them ends the process; what each reached is counted into reached. */
-Outcome RunBatch(const Run& run, uint64_t first, std::string& message, int& signal,
+Outcome run_batch(const Run& run, uint64_t first, std::string& message, int& signal,
     std::map<std::string, uint64_t>& reached)
 {
     int fd;
-    Progress->Current = first;
-    Progress->Done = first;
-    Progress->Started = Now();
-    pid_t pid = Spawn(fd);
+    progress->current = first;
+    progress->done = first;
+    progress->started = now();
+    pid_t pid = spawn(fd);
     if (pid == 0)
     {
         std::map<std::string, uint64_t> counts;
-        for (uint64_t i = first; !run.Over(i); i++)
+        for (uint64_t i = first; !run.over(i); i++)
         {
-            std::vector<uint8_t> data = MakeInput(TheTarget.Name, run.Seed, i, TheTarget.MaxLen);
-            Progress->Current = i;
-            Progress->Started = Now();
+            std::vector<uint8_t> data = make_input(THE_TARGET.name, run.seed, i, THE_TARGET.max_len);
+            progress->current = i;
+            progress->started = now();
             if (i != first)
             {
-                ResetKernel();
-                TheTarget.Reset();
+                reset_kernel();
+                THE_TARGET.reset();
             }
-            RunInput(data);
-            for (const std::string& st : ReachedStates)
+            run_input(data);
+            for (const std::string& st : reached_states)
                 counts[st]++;
-            ReachedStates.clear();
-            Progress->Done = i + 1;
+            reached_states.clear();
+            progress->done = i + 1;
         }
-        std::string up = StatsMark;
+        std::string up = STATS_MARK;
         for (const auto& c : counts)
             up += "\n" + std::to_string(c.second) + "\t" + c.first;
-        WriteAll(STDERR_FILENO, up.data(), up.size());
+        write_all(STDERR_FILENO, up.data(), up.size());
         _exit(0);
     }
-    Outcome outcome = Supervise(pid, fd, message, signal);
+    Outcome outcome = supervise(pid, fd, message, signal);
     if (outcome == Outcome::Pass)
     {
-        size_t at = message.find(StatsMark);
+        size_t at = message.find(STATS_MARK);
         if (at != std::string::npos)
         {
-            std::string rest = message.substr(at + sizeof(StatsMark) - 1);
+            std::string rest = message.substr(at + sizeof(STATS_MARK) - 1);
             size_t pos = 0;
             while (pos < rest.size())
             {
@@ -356,7 +356,7 @@ Outcome RunBatch(const Run& run, uint64_t first, std::string& message, int& sign
     return outcome;
 }
 
-std::string Trim(const std::string& s)
+std::string trim(const std::string& s)
 {
     size_t b = s.find_first_not_of(" \t\r\n");
     size_t e = s.find_last_not_of(" \t\r\n");
@@ -364,7 +364,7 @@ std::string Trim(const std::string& s)
 }
 
 /* The line that says what happened, of a report that may have many. */
-std::string Headline(const std::string& report)
+std::string headline(const std::string& report)
 {
     size_t at = 0;
     while (at < report.size())
@@ -373,18 +373,18 @@ std::string Headline(const std::string& report)
         std::string line = report.substr(at, (nl == std::string::npos) ? std::string::npos : nl - at);
         if (line.find("FINDING: ") != std::string::npos || line.find("runtime error:") != std::string::npos ||
             line.find("SUMMARY: ") != std::string::npos)
-            return Trim(line);
+            return trim(line);
         if (nl == std::string::npos)
             break;
         at = nl + 1;
     }
     std::string first = report.substr(0, report.find('\n'));
-    return Trim(first);
+    return trim(first);
 }
 
 /* Where a finding is: the same check failing again is the same bug,
    whatever the names and numbers it says this time. */
-std::string Place(const std::string& headline)
+std::string place_of(const std::string& headline)
 {
     size_t p = headline.find("FINDING: ");
     if (p != std::string::npos)
@@ -416,49 +416,49 @@ std::string Place(const std::string& headline)
     return s;
 }
 
-[[noreturn]] void Usage()
+[[noreturn]] void usage()
 {
-    fprintf(stderr, "usage: %s [--seed N] [--iterations N | --seconds S] [--keep-going]\n", TheTarget.Name);
+    fprintf(stderr, "usage: %s [--seed N] [--iterations N | --seconds S] [--keep-going]\n", THE_TARGET.name);
     fprintf(stderr, "       (with neither, the target's own number of inputs: the gate)\n");
-    fprintf(stderr, "       %s --replay HEXFILE [--trace]\n", TheTarget.Name);
+    fprintf(stderr, "       %s --replay HEXFILE [--trace]\n", THE_TARGET.name);
     exit(2);
 }
 
 }
 
-uint32_t Input::Value32()
+uint32_t Input::value32()
 {
-    static const uint32_t Edges[] = {0, 1, 2, 3, 0x7F, 0x80, 0xFF, 0x100, 0xFFFF, 0x10000, 0x7FFFFFFF,
+    static const uint32_t EDGES[] = {0, 1, 2, 3, 0x7F, 0x80, 0xFF, 0x100, 0xFFFF, 0x10000, 0x7FFFFFFF,
                                      0x80000000, 0xFFFFFFFE, 0xFFFFFFFF};
-    switch (U8() % 4)
+    switch (u8() % 4)
     {
     case 0:
-        return Pick(Edges);
+        return pick(EDGES);
     case 1:
-        return 1u << (U8() % 32);
+        return 1u << (u8() % 32);
     default:
-        return U32();
+        return u32();
     }
 }
 
-uint64_t Input::Value64()
+uint64_t Input::value64()
 {
-    static const uint64_t Edges[] = {0, 1, 2, 0xFFFFFFFF, 0x100000000ULL, 0x7FFFFFFFFFFFFFFFULL,
+    static const uint64_t EDGES[] = {0, 1, 2, 0xFFFFFFFF, 0x100000000ULL, 0x7FFFFFFFFFFFFFFFULL,
                                      0x8000000000000000ULL, 0xFFFFFFFFFFFFF000ULL, 0xFFFFFFFFFFFFFFFFULL};
-    switch (U8() % 4)
+    switch (u8() % 4)
     {
     case 0:
-        return Pick(Edges);
+        return pick(EDGES);
     case 1:
-        return 1ULL << (U8() % 64);
+        return 1ULL << (u8() % 64);
     case 2:
-        return Value32();
+        return value32();
     default:
-        return U64();
+        return u64();
     }
 }
 
-std::vector<uint8_t> Noise(uint32_t seed, size_t n)
+std::vector<uint8_t> noise(uint32_t seed, size_t n)
 {
     uint64_t x = seed | (1ULL << 40);
     std::vector<uint8_t> v;
@@ -475,20 +475,20 @@ std::vector<uint8_t> Noise(uint32_t seed, size_t n)
     return v;
 }
 
-void Reached(const char* what)
+void reached(const char* what)
 {
-    if (Counting)
-        ReachedStates.insert(what);
+    if (counting)
+        reached_states.insert(what);
 }
 
-bool Tracing()
+bool tracing()
 {
-    return Trace;
+    return trace_on;
 }
 
-void Say(const char* fmt, ...)
+void say(const char* fmt, ...)
 {
-    if (!Trace)
+    if (!trace_on)
         return;
     va_list args;
     va_start(args, fmt);
@@ -497,7 +497,7 @@ void Say(const char* fmt, ...)
     fputc('\n', stderr);
 }
 
-void Finding(const char* file, int line, const char* fmt, ...)
+void finding(const char* file, int line, const char* fmt, ...)
 {
     char what[2048];
     va_list args;
@@ -511,7 +511,7 @@ void Finding(const char* file, int line, const char* fmt, ...)
         n = 0;
     if (static_cast<size_t>(n) >= sizeof(report))
         n = sizeof(report) - 1;
-    WriteAll(STDERR_FILENO, report, static_cast<size_t>(n));
+    write_all(STDERR_FILENO, report, static_cast<size_t>(n));
     _exit(1);
 }
 
@@ -519,20 +519,20 @@ void Finding(const char* file, int line, const char* fmt, ...)
 
 int main(int argc, char** argv)
 {
-    using namespace Fuzz;
+    using namespace fuzz;
 
     uint64_t seed = 1;
     uint64_t iterations = 0;
-    bool haveIterations = false;
+    bool have_iterations = false;
     long seconds = -1;
-    bool keepGoing = false;
+    bool keep_going = false;
     const char* replay = nullptr;
     for (int i = 1; i < argc; i++)
     {
         std::string a = argv[i];
         auto value = [&]() -> const char* {
             if (i + 1 >= argc)
-                Usage();
+                usage();
             return argv[++i];
         };
         if (a == "--seed")
@@ -540,20 +540,20 @@ int main(int argc, char** argv)
         else if (a == "--iterations")
         {
             iterations = strtoull(value(), nullptr, 0);
-            haveIterations = true;
+            have_iterations = true;
         }
         else if (a == "--seconds")
             seconds = strtol(value(), nullptr, 0);
         else if (a == "--keep-going")
-            keepGoing = true;
+            keep_going = true;
         else if (a == "--trace")
-            Trace = true;
+            trace_on = true;
         else if (a == "--replay")
             replay = value();
         else
-            Usage();
+            usage();
     }
-    Counting = getenv("CPP_FUZZ_STATS") != nullptr;
+    counting = getenv("CPP_FUZZ_STATS") != nullptr;
     /* Nothing buffered twice: a forked child would print the parent's. */
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -573,103 +573,103 @@ int main(int argc, char** argv)
             text.append(buf, n);
         fclose(f);
         std::vector<uint8_t> data;
-        if (!Unhex(text, data))
+        if (!unhex(text, data))
         {
             fprintf(stderr, "%s: not a hex file\n", replay);
             return 2;
         }
-        RunInput(data);
-        printf("%s: ran to its end\n", TheTarget.Name);
+        run_input(data);
+        printf("%s: ran to its end\n", THE_TARGET.name);
         return 0;
     }
 
-    Progress = static_cast<Shared*>(mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
+    progress = static_cast<Shared*>(mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
         MAP_SHARED | MAP_ANONYMOUS, -1, 0));
-    if (Progress == MAP_FAILED)
+    if (progress == MAP_FAILED)
     {
         perror("mmap");
         return 2;
     }
 
-    Run run = {seed, haveIterations ? iterations : TheTarget.Gate, seconds, Now()};
+    Run run = {seed, have_iterations ? iterations : THE_TARGET.gate, seconds, now()};
     uint64_t iter = 0;
     uint64_t failed = 0;
     bool hung = false;
     std::map<std::string, uint64_t> reached;
     std::set<std::string> places;
-    while (!run.Over(iter))
+    while (!run.over(iter))
     {
         std::string message;
         int signal = 0;
-        Outcome outcome = RunBatch(run, iter, message, signal, reached);
+        Outcome outcome = run_batch(run, iter, message, signal, reached);
         if (outcome == Outcome::Pass)
         {
-            iter = Progress->Done;
+            iter = progress->done;
             break;
         }
 
         /* An input ended its batch: again, alone, for its own report. */
-        uint64_t bad = Progress->Current;
-        uint64_t batchStart = iter;
-        std::vector<uint8_t> data = MakeInput(TheTarget.Name, seed, bad, TheTarget.MaxLen);
+        uint64_t bad = progress->current;
+        uint64_t batch_start = iter;
+        std::vector<uint8_t> data = make_input(THE_TARGET.name, seed, bad, THE_TARGET.max_len);
         std::string alone;
-        int aloneSignal = 0;
-        Outcome again = RunAlone(data, alone, aloneSignal);
+        int alone_signal = 0;
+        Outcome again = run_alone(data, alone, alone_signal);
         if (again != Outcome::Pass)
         {
             outcome = again;
             message = alone;
-            signal = aloneSignal;
+            signal = alone_signal;
         }
 
         std::string what;
         if (outcome == Outcome::Hang)
         {
             hung = true;
-            what = "a hang: no end in " + std::to_string(HangSeconds) + " s";
+            what = "a hang: no end in " + std::to_string(HANG_SECONDS) + " s";
         }
         else if (outcome == Outcome::Crash)
         {
-            std::string head = Headline(message);
+            std::string head = headline(message);
             what = "killed by signal " + std::to_string(signal) + (head.empty() ? "" : ": " + head);
         }
         else
         {
-            what = Headline(message);
+            what = headline(message);
             if (what.empty())
                 what = "exit with a failure, and no report";
         }
         if (again == Outcome::Pass)
-            what = "only after the inputs before it in its batch, from iteration " + std::to_string(batchStart) +
+            what = "only after the inputs before it in its batch, from iteration " + std::to_string(batch_start) +
                    " -- the target's Reset leaves something behind: " + what;
         failed++;
-        std::string place = (outcome == Outcome::Hang) ? "hang" : Place(what);
+        std::string place = (outcome == Outcome::Hang) ? "hang" : place_of(what);
         if (places.insert(place).second)
         {
             char file[256];
-            snprintf(file, sizeof(file), "cpp-fuzz-%s-%llu-%llu.hex", TheTarget.Name,
+            snprintf(file, sizeof(file), "cpp-fuzz-%s-%llu-%llu.hex", THE_TARGET.name,
                 static_cast<unsigned long long>(seed), static_cast<unsigned long long>(bad));
             FILE* f = fopen(file, "w");
             if (f != nullptr)
             {
-                std::string h = Hex(data);
+                std::string h = hex(data);
                 fwrite(h.data(), 1, h.size(), f);
                 fputc('\n', f);
                 fclose(f);
             }
-            printf("FAIL %s: seed %llu iteration %llu: %s\n", TheTarget.Name,
+            printf("FAIL %s: seed %llu iteration %llu: %s\n", THE_TARGET.name,
                 static_cast<unsigned long long>(seed), static_cast<unsigned long long>(bad), what.c_str());
-            printf("     input in %s -- %s --replay %s\n", file, TheTarget.Name, file);
+            printf("     input in %s -- %s --replay %s\n", file, THE_TARGET.name, file);
         }
-        if (!keepGoing)
+        if (!keep_going)
             return hung ? 3 : 1;
         iter = bad + 1;
     }
-    printf("%-10s %8llu inputs, %6.1f s", TheTarget.Name, static_cast<unsigned long long>(iter), Now() - run.Start);
+    printf("%-10s %8llu inputs, %6.1f s", THE_TARGET.name, static_cast<unsigned long long>(iter), now() - run.start);
     if (failed != 0)
         printf(", %llu failed", static_cast<unsigned long long>(failed));
     printf("\n");
-    if (Counting)
+    if (counting)
     {
         for (const auto& r : reached)
             printf("           %6.2f%%  %s\n", 100.0 * r.second / (iter ? iter : 1), r.first.c_str());

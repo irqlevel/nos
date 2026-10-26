@@ -11,7 +11,7 @@
 
 #include "fuzz.h"
 
-namespace Kernel
+namespace kernel
 {
 
 Cpu::Cpu()
@@ -42,43 +42,43 @@ TaskQueue::~TaskQueue()
 Task::Task(const char* name)
 {
     (void)name;
-    Fuzz::HostHalUnreachable("Task::Task");
+    fuzz::host_hal_unreachable("Task::Task");
 }
 
-bool Task::Start(Func func, void* ctx)
+bool Task::start(Func func, void* ctx)
 {
     (void)func;
     (void)ctx;
-    Fuzz::HostHalUnreachable("Task::Start");
+    fuzz::host_hal_unreachable("Task::Start");
 }
 
-void Task::Get()
+void Task::get()
 {
-    Fuzz::HostHalUnreachable("Task::Get");
+    fuzz::host_hal_unreachable("Task::Get");
 }
 
-void Task::Put()
+void Task::put()
 {
-    Fuzz::HostHalUnreachable("Task::Put");
+    fuzz::host_hal_unreachable("Task::Put");
 }
 
-void Sleep(ulong nanoSecs)
+void sleep(ulong nano_secs)
 {
-    (void)nanoSecs;
-    Fuzz::HostHalUnreachable("Sleep");
+    (void)nano_secs;
+    fuzz::host_hal_unreachable("Sleep");
 }
 
 /* Interrupts off and back, as the kernel's: what a caller that needs them
    off for its CPU's frame slot (PageTable::MapFrameSlot) is checked for.
    One task at a time, so there is no preemption to hold off. */
-ulong PreemptIrqSave()
+ulong preempt_irq_save()
 {
-    return Hal::IrqSave();
+    return hal::irq_save();
 }
 
-void PreemptIrqRestore(ulong flags)
+void preempt_irq_restore(ulong flags)
 {
-    Hal::IrqRestore(flags);
+    hal::irq_restore(flags);
 }
 
 }

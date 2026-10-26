@@ -25,23 +25,23 @@ namespace
 {
 
 /* CPUID.01H:ECX[30] = RDRAND, CPUID.(EAX=07H,ECX=0):EBX[18] = RDSEED */
-const u32 CpuidLeafFeatures = 1;
-const u32 CpuidBitRdRand = 1U << 30;
-const u32 CpuidLeafStructuredExt = 7;
-const u32 CpuidBitRdSeed = 1U << 18;
+const u32 CPUID_LEAF_FEATURES = 1;
+const u32 CPUID_BIT_RDRAND = 1U << 30;
+const u32 CPUID_LEAF_STRUCTURED_EXT = 7;
+const u32 CPUID_BIT_RDSEED = 1U << 18;
 
 /* Intel's own guidance for RDRAND is that ten attempts are enough to tell a
    broken DRBG from a busy one. RDSEED draws straight on the noise source and
    is expected to come up empty under contention, so it gets more patience: the
    kernel asks it for a seed a handful of times per boot, and waiting there is
    cheaper than reporting a working source as a missing one. */
-const ulong RdRandAttempts = 10;
-const ulong RdSeedAttempts = 128;
+const ulong RDRAND_ATTEMPTS = 10;
+const ulong RDSEED_ATTEMPTS = 128;
 
-bool HaveRdRand;
-bool HaveRdSeed;
+bool have_rdrand;
+bool have_rdseed;
 
-bool RdRandStep(u64& out)
+bool rdrand_step(u64& out)
 {
     u64 value = 0;
     u8 ok = 0;
@@ -54,7 +54,7 @@ bool RdRandStep(u64& out)
     return ok != 0;
 }
 
-bool RdSeedStep(u64& out)
+bool rdseed_step(u64& out)
 {
     u64 value = 0;
     u8 ok = 0;
@@ -65,25 +65,25 @@ bool RdSeedStep(u64& out)
     return ok != 0;
 }
 
-bool RdRandRetry(u64& out)
+bool rdrand_retry(u64& out)
 {
-    for (ulong i = 0; i < RdRandAttempts; i++)
+    for (ulong i = 0; i < RDRAND_ATTEMPTS; i++)
     {
-        if (RdRandStep(out))
+        if (rdrand_step(out))
             return true;
-        Pause();
+        cpu_relax();
     }
 
     return false;
 }
 
-bool RdSeedRetry(u64& out)
+bool rdseed_retry(u64& out)
 {
-    for (ulong i = 0; i < RdSeedAttempts; i++)
+    for (ulong i = 0; i < RDSEED_ATTEMPTS; i++)
     {
-        if (RdSeedStep(out))
+        if (rdseed_step(out))
             return true;
-        Pause();
+        cpu_relax();
     }
 
     return false;
@@ -91,15 +91,15 @@ bool RdSeedRetry(u64& out)
 
 }
 
-namespace Hal
+namespace hal
 {
 
-void ProbeHwRandom()
+void probe_hw_random()
 {
-    CpuidResult features = Cpuid(CpuidLeafFeatures);
-    if (!(features.Ecx & CpuidBitRdRand))
+    CpuidResult features = cpuid(CPUID_LEAF_FEATURES);
+    if (!(features.ecx & CPUID_BIT_RDRAND))
     {
-        Trace(0, "HwRandom: this cpu has no RDRAND");
+        trace(0, "HwRandom: this cpu has no RDRAND");
         return;
     }
 
@@ -107,57 +107,57 @@ void ProbeHwRandom()
        a leaf above the maximum with the highest leaf's data, not with zeroes,
        so an unguarded read here invents an RDSEED bit out of unrelated
        feature words. */
-    CpuidResult leaf0 = Cpuid(0);
+    CpuidResult leaf0 = cpuid(0);
     bool rdseed = false;
-    if (leaf0.Eax >= CpuidLeafStructuredExt)
+    if (leaf0.eax >= CPUID_LEAF_STRUCTURED_EXT)
     {
-        CpuidResult ext = Cpuid(CpuidLeafStructuredExt, 0);
-        rdseed = (ext.Ebx & CpuidBitRdSeed) != 0;
+        CpuidResult ext = cpuid(CPUID_LEAF_STRUCTURED_EXT, 0);
+        rdseed = (ext.ebx & CPUID_BIT_RDSEED) != 0;
     }
 
-    if (Kernel::Parameters::GetInstance().IsHwRngOff())
+    if (kernel::Parameters::get_instance().is_hw_rng_off())
     {
         /* Not a diagnostic for its own sake: it is how the timing-jitter path
            gets exercised on a machine that does have RDRAND. */
-        Trace(0, "HwRandom: rdrand present (rdseed %s), disabled by hwrng=off",
+        trace(0, "HwRandom: rdrand present (rdseed %s), disabled by hwrng=off",
             rdseed ? "yes" : "no");
         return;
     }
 
-    HaveRdRand = true;
-    HaveRdSeed = rdseed;
+    have_rdrand = true;
+    have_rdseed = rdseed;
 
-    Trace(0, "HwRandom: rdrand yes, rdseed %s", HaveRdSeed ? "yes" : "no");
+    trace(0, "HwRandom: rdrand yes, rdseed %s", have_rdseed ? "yes" : "no");
 }
 
-HwRandomKind GetHwRandomKind()
+HwRandomKind get_hw_random_kind()
 {
-    if (!HaveRdRand)
+    if (!have_rdrand)
         return HwRandomKind::None;
 
-    return HaveRdSeed ? HwRandomKind::RdSeed : HwRandomKind::RdRand;
+    return have_rdseed ? HwRandomKind::RdSeed : HwRandomKind::RdRand;
 }
 
-bool HwRandom(u64& out)
+bool hw_random(u64& out)
 {
-    if (!HaveRdRand)
+    if (!have_rdrand)
         return false;
 
-    return RdRandRetry(out);
+    return rdrand_retry(out);
 }
 
-bool HwRandomSeed(u64& out)
+bool hw_random_seed(u64& out)
 {
-    if (!HaveRdRand)
+    if (!have_rdrand)
         return false;
 
-    if (HaveRdSeed && RdSeedRetry(out))
+    if (have_rdseed && rdseed_retry(out))
         return true;
 
     /* The noise source is drained, or there is no RDSEED here. RDRAND is
        reseeded from that same noise source, so it remains the best answer
        available -- refusing would leave the pool with nothing. */
-    return RdRandRetry(out);
+    return rdrand_retry(out);
 }
 
 }

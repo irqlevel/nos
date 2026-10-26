@@ -4,7 +4,7 @@
 #include <lib/list_entry.h>
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class Task;
@@ -27,20 +27,20 @@ public:
        slice -- and a caller that asks whether it may block
        (PreemptCanBlock) is told no. Interrupts stay on: LockIrqSave is for a
        lock an interrupt handler takes too. */
-    void Lock();
-    void Unlock();
+    void lock();
+    void unlock();
 
     /* One attempt, no spin. For paths that must not block on a lock whose
        holder may never release it -- the panic path, above all. Preemption
        stays disabled only if the lock was taken. */
-    bool TryLock();
+    bool try_lock();
 
-	ulong LockIrqSave();
-	void UnlockIrqRestore(ulong flags);
+	ulong lock_irq_save();
+	void unlock_irq_restore(ulong flags);
 
 	/* Disables interrupts either way; acquired says whether the lock was
 	   actually taken, and the caller must decide what to do if it was not. */
-	ulong TryLockIrqSave(bool& acquired);
+	ulong try_lock_irq_save(bool& acquired);
 
 private:
     RawSpinLock(const RawSpinLock& other) = delete;
@@ -48,31 +48,31 @@ private:
     RawSpinLock& operator=(const RawSpinLock& other) = delete;
     RawSpinLock& operator=(RawSpinLock&& other) = delete;
 
-    void Acquire();
-    bool TryAcquire();
-    void Release();
-    void Stamp();
+    void acquire();
+    bool try_acquire();
+    void release();
+    void stamp();
 
-    Atomic Value;
-    bool Watched;
+    Atomic value_;
+    bool watched_;
 
     /* Whose preemption Lock() disabled, for Unlock() to enable again -- not
        necessarily the task calling Unlock(): the scheduler takes its locks
        in one task and releases them in the next, across the context switch.
        nullptr when Lock() had nothing to disable, and whenever the lock is
        free or held through LockIrqSave, whose flags carry that instead. */
-    Task* PreemptTask;
+    Task* preempt_task_;
 
 public:
     /* Set once the watchdog has complained about this lock, cleared on
        release: one line per stuck episode instead of one per check pass,
        and the watchdog checks over a thousand times a second per CPU. */
-    Atomic WatchdogReported;
+    Atomic watchdog_reported_;
 
 private:
 
 public:
-    Stdlib::ListEntry WatchdogListEntry;
-    Atomic WatchdogLockTime;
+    stdlib::ListEntry watchdog_list_entry_;
+    Atomic watchdog_lock_time_;
 };
 }

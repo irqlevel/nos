@@ -13,306 +13,306 @@
 #include <mm/new.h>
 #include <mm/page_table.h>
 
-namespace Kernel
+namespace kernel
 {
 
-static const u8 PciCapIdMsix = 0x11;
+static const u8 PCI_CAP_ID_MSIX = 0x11;
 
-static const u16 PciCommandIntxDisable = (u16)(1 << 10);
+static const u16 PCI_COMMAND_INTX_DISABLE = (u16)(1 << 10);
 
-static const u16 MsixControlEnable = (u16)(1 << 15);
-static const u16 MsixControlFuncMask = (u16)(1 << 14);
+static const u16 MSIX_CONTROL_ENABLE = (u16)(1 << 15);
+static const u16 MSIX_CONTROL_FUNC_MASK = (u16)(1 << 14);
 
-static const u32 MsixAddrBase = 0xFEE00000U;
+static const u32 MSIX_ADDR_BASE = 0xFEE00000U;
 
-Atomic MsixTable::NextVectorOffset;
+Atomic MsixTable::next_vector_offset_;
 
 MsixTable::MsixTable()
-    : Table(nullptr)
-    , Count(0)
-    , CapOffset(0)
-    , Dev(nullptr)
-    , PciMsixEnabled(false)
-    , EntryVector(nullptr)
+    : table_(nullptr)
+    , count_(0)
+    , cap_offset_(0)
+    , dev_(nullptr)
+    , pci_msix_enabled_(false)
+    , entry_vector_(nullptr)
 {
 }
 
 MsixTable::~MsixTable()
 {
-    IrqBalance::GetInstance().RemoveMsix(this);
+    IrqBalance::get_instance().remove_msix(this);
 
-    if (Dev && CapOffset != 0 && PciMsixEnabled)
+    if (dev_ && cap_offset_ != 0 && pci_msix_enabled_)
     {
-        auto& pci = Pci::GetInstance();
-        u16 mc = pci.ReadWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2));
-        mc = (u16)(mc & ~MsixControlEnable);
-        pci.WriteWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2), mc);
+        auto& pci = Pci::get_instance();
+        u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
+        mc = (u16)(mc & ~MSIX_CONTROL_ENABLE);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
 
-        u16 cmd = pci.ReadWord(Dev->Bus, Dev->Slot, Dev->Func, 0x04);
-        cmd = (u16)(cmd & ~PciCommandIntxDisable);
-        pci.WriteWord(Dev->Bus, Dev->Slot, Dev->Func, 0x04, cmd);
+        u16 cmd = pci.read_word(dev_->bus, dev_->slot, dev_->func, 0x04);
+        cmd = (u16)(cmd & ~PCI_COMMAND_INTX_DISABLE);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, 0x04, cmd);
     }
 
-    if (EntryVector)
+    if (entry_vector_)
     {
-        Mm::Free(EntryVector);
-        EntryVector = nullptr;
+        mm::free(entry_vector_);
+        entry_vector_ = nullptr;
     }
 
-    Table = nullptr;
-    Count = 0;
-    Dev = nullptr;
-    CapOffset = 0;
-    PciMsixEnabled = false;
+    table_ = nullptr;
+    count_ = 0;
+    dev_ = nullptr;
+    cap_offset_ = 0;
+    pci_msix_enabled_ = false;
 }
 
-bool MsixTable::MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar,
-    ulong tableBytes)
+bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar,
+    ulong table_bytes)
 {
     if (bar >= 6)
         return false;
 
-    auto& pci = Pci::GetInstance();
-    u32 barVal = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
+    auto& pci = Pci::get_instance();
+    u32 bar_val = pci.get_bar(dev->bus, dev->slot, dev->func, bar);
 
-    if (barVal & 1)
+    if (bar_val & 1)
     {
-        Trace(0, "MsixTable: BAR%lu is I/O, not MMIO", (ulong)bar);
+        trace(0, "MsixTable: BAR%lu is I/O, not MMIO", (ulong)bar);
         return false;
     }
 
-    ulong physAddr = barVal & ~0xFUL;
+    ulong phys_addr = bar_val & ~0xFUL;
 
-    bool is64 = ((barVal & 0x6) == 0x4) && (bar + 1 < 6);
-    u32 barHigh = 0;
+    bool is64 = ((bar_val & 0x6) == 0x4) && (bar + 1 < 6);
+    u32 bar_high = 0;
     if (is64)
     {
-        barHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1));
-        physAddr |= ((ulong)barHigh << 32);
+        bar_high = pci.get_bar(dev->bus, dev->slot, dev->func, (u8)(bar + 1));
+        phys_addr |= ((ulong)bar_high << 32);
     }
 
-    if (physAddr == 0)
+    if (phys_addr == 0)
         return false;
 
     /* Size-probe both halves of a 64-bit BAR; probing only the low half
        computes a bogus size for BARs >= 4 GB */
-    pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + bar * 4), 0xFFFFFFFF);
-    u32 sizeMaskLow = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
-    u32 sizeMaskHigh = 0xFFFFFFFF;
+    pci.write_dword(dev->bus, dev->slot, dev->func, (u16)(0x10 + bar * 4), 0xFFFFFFFF);
+    u32 size_mask_low = pci.get_bar(dev->bus, dev->slot, dev->func, bar);
+    u32 size_mask_high = 0xFFFFFFFF;
     if (is64)
     {
-        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + (bar + 1) * 4), 0xFFFFFFFF);
-        sizeMaskHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1));
-        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + (bar + 1) * 4), barHigh);
+        pci.write_dword(dev->bus, dev->slot, dev->func, (u16)(0x10 + (bar + 1) * 4), 0xFFFFFFFF);
+        size_mask_high = pci.get_bar(dev->bus, dev->slot, dev->func, (u8)(bar + 1));
+        pci.write_dword(dev->bus, dev->slot, dev->func, (u16)(0x10 + (bar + 1) * 4), bar_high);
     }
-    pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + bar * 4), barVal);
+    pci.write_dword(dev->bus, dev->slot, dev->func, (u16)(0x10 + bar * 4), bar_val);
 
-    ulong sizeMask = ((ulong)sizeMaskHigh << 32) | (ulong)(sizeMaskLow & ~0xFU);
-    ulong barSize = ~sizeMask + 1;
-    if (barSize == 0)
-        barSize = Const::PageSize;
+    ulong size_mask = ((ulong)size_mask_high << 32) | (ulong)(size_mask_low & ~0xFU);
+    ulong bar_size = ~size_mask + 1;
+    if (bar_size == 0)
+        bar_size = consts::PAGE_SIZE;
 
-    if (offsetInBar + tableBytes > barSize)
+    if (offset_in_bar + table_bytes > bar_size)
     {
-        Trace(0, "MsixTable: table past BAR end");
+        trace(0, "MsixTable: table past BAR end");
         return false;
     }
 
-    Trace(0, "MsixTable: BAR%lu phys 0x%lX size 0x%lX table off 0x%lX",
-        (ulong)bar, physAddr, barSize, offsetInBar);
+    trace(0, "MsixTable: BAR%lu phys 0x%lX size 0x%lX table off 0x%lX",
+        (ulong)bar, phys_addr, bar_size, offset_in_bar);
 
-    auto& pt = Mm::PageTable::GetInstance();
-    ulong va = pt.MapMmioRegion(physAddr, barSize);
+    auto& pt = mm::PageTable::get_instance();
+    ulong va = pt.map_mmio_region(phys_addr, bar_size);
     if (va == 0)
     {
-        Trace(0, "MsixTable: MapMmioRegion failed");
+        trace(0, "MsixTable: MapMmioRegion failed");
         return false;
     }
 
-    Table = (volatile u8*)(va + offsetInBar);
+    table_ = (volatile u8*)(va + offset_in_bar);
     return true;
 }
 
-bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
+bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
 {
-    if (!dev || !dev->Valid)
+    if (!dev || !dev->valid)
         return false;
 
-    Dev = dev;
+    dev_ = dev;
 
-    auto& pci = Pci::GetInstance();
-    u8 cap = pci.FindCapability(dev->Bus, dev->Slot, dev->Func, PciCapIdMsix);
+    auto& pci = Pci::get_instance();
+    u8 cap = pci.find_capability(dev->bus, dev->slot, dev->func, PCI_CAP_ID_MSIX);
     if (cap == 0)
     {
-        Trace(0, "MsixTable: no MSI-X capability");
-        Table = nullptr;
-        Count = 0;
-        CapOffset = 0;
+        trace(0, "MsixTable: no MSI-X capability");
+        table_ = nullptr;
+        count_ = 0;
+        cap_offset_ = 0;
         return false;
     }
 
-    CapOffset = cap;
+    cap_offset_ = cap;
 
-    u32 capDw0 = pci.ReadDword(dev->Bus, dev->Slot, dev->Func, cap);
-    u16 msgCtrl = (u16)((capDw0 >> 16) & 0xFFFF);
-    Count = (u16)((msgCtrl & 0x7FFu) + 1);
+    u32 cap_dw0 = pci.read_dword(dev->bus, dev->slot, dev->func, cap);
+    u16 msg_ctrl = (u16)((cap_dw0 >> 16) & 0xFFFF);
+    count_ = (u16)((msg_ctrl & 0x7FFu) + 1);
 
-    if (Count == 0)
+    if (count_ == 0)
         return false;
 
-    u32 tblInfo = pci.ReadDword(dev->Bus, dev->Slot, dev->Func, (u16)(cap + 4));
-    u8 bir = (u8)(tblInfo & 7);
-    ulong offInBar = tblInfo & ~7UL;
+    u32 tbl_info = pci.read_dword(dev->bus, dev->slot, dev->func, (u16)(cap + 4));
+    u8 bir = (u8)(tbl_info & 7);
+    ulong off_in_bar = tbl_info & ~7UL;
 
-    ulong tableBytes = (ulong)Count * 16;
+    ulong table_bytes = (ulong)count_ * 16;
 
-    EntryVector = (u8*)Mm::Alloc((size_t)Count, 0);
-    if (!EntryVector)
+    entry_vector_ = (u8*)mm::alloc((size_t)count_, 0);
+    if (!entry_vector_)
         return false;
-    Stdlib::MemSet(EntryVector, 0, (size_t)Count);
+    stdlib::mem_set(entry_vector_, 0, (size_t)count_);
 
     bool mapped = false;
-    if (mappedBars && bir < 6 && mappedBars[bir] != 0)
+    if (mapped_bars && bir < 6 && mapped_bars[bir] != 0)
     {
-        Table = (volatile u8*)(mappedBars[bir] + offInBar);
+        table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
         mapped = true;
-        Trace(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
-            (ulong)bir, mappedBars[bir], offInBar);
+        trace(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
+            (ulong)bir, mapped_bars[bir], off_in_bar);
     }
 
-    if (!mapped && !MapBarForTable(dev, bir, offInBar, tableBytes))
+    if (!mapped && !map_bar_for_table(dev, bir, off_in_bar, table_bytes))
     {
-        Mm::Free(EntryVector);
-        EntryVector = nullptr;
-        Table = nullptr;
-        Count = 0;
+        mm::free(entry_vector_);
+        entry_vector_ = nullptr;
+        table_ = nullptr;
+        count_ = 0;
         return false;
     }
 
-    for (u16 i = 0; i < Count; i++)
-        Mask(i);
+    for (u16 i = 0; i < count_; i++)
+        mask(i);
 
-    Trace(0, "MsixTable: %lu entries cap 0x%lX", (ulong)Count, (ulong)cap);
+    trace(0, "MsixTable: %lu entries cap 0x%lX", (ulong)count_, (ulong)cap);
     return true;
 }
 
-u8 MsixTable::AllocVector()
+u8 MsixTable::alloc_vector()
 {
     for (;;)
     {
-        long curr = NextVectorOffset.Get();
-        ulong vector = MsixVectorBase + (ulong)curr;
-        if (vector > MsixVectorLimit)
+        long curr = next_vector_offset_.get();
+        ulong vector = MSIX_VECTOR_BASE + (ulong)curr;
+        if (vector > MSIX_VECTOR_LIMIT)
             return 0;
-        if (NextVectorOffset.Cmpxchg(curr + 1, curr) == curr)
+        if (next_vector_offset_.cmpxchg(curr + 1, curr) == curr)
             return (u8)vector;
     }
 }
 
-void MsixTable::DisableLegacyIntx(Pci::DeviceInfo* dev)
+void MsixTable::disable_legacy_intx(Pci::DeviceInfo* dev)
 {
-    auto& pci = Pci::GetInstance();
-    u16 cmd = pci.ReadWord(dev->Bus, dev->Slot, dev->Func, 0x04);
-    cmd = (u16)(cmd | PciCommandIntxDisable);
-    pci.WriteWord(dev->Bus, dev->Slot, dev->Func, 0x04, cmd);
+    auto& pci = Pci::get_instance();
+    u16 cmd = pci.read_word(dev->bus, dev->slot, dev->func, 0x04);
+    cmd = (u16)(cmd | PCI_COMMAND_INTX_DISABLE);
+    pci.write_word(dev->bus, dev->slot, dev->func, 0x04, cmd);
 }
 
-u8 MsixTable::EnableVector(u16 index, InterruptHandler& handler)
+u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 {
-    if (!Table || !Dev || index >= Count || CapOffset == 0)
+    if (!table_ || !dev_ || index >= count_ || cap_offset_ == 0)
         return 0;
 
-    if (EntryVector[index] != 0)
-        return EntryVector[index];
+    if (entry_vector_[index] != 0)
+        return entry_vector_[index];
 
-    u8 vector = AllocVector();
+    u8 vector = alloc_vector();
     if (vector == 0)
     {
-        Trace(0, "MsixTable: out of vectors");
+        trace(0, "MsixTable: out of vectors");
         return 0;
     }
 
     /* AssignMsix takes the IrqBalance lock; it must complete before
        EntryLock is taken because Balance() nests them the other way
        around (IrqBalance lock -> Retarget -> EntryLock). */
-    u32 apicId = (u32)IrqBalance::GetInstance().AssignMsix(this, index);
-    u32 addrLow = MsixAddrBase | (apicId << 12);
+    u32 apic_id = (u32)IrqBalance::get_instance().assign_msix(this, index);
+    u32 addr_low = MSIX_ADDR_BASE | (apic_id << 12);
 
-    volatile u8* entry = Table + (ulong)index * 16;
+    volatile u8* entry = table_ + (ulong)index * 16;
 
     {
-        Stdlib::AutoLock lock(EntryLock);
+        stdlib::AutoLock lock(entry_lock_);
 
-        MmioWrite32(entry + 0, addrLow);
-        MmioWrite32(entry + 4, 0);
-        MmioWrite32(entry + 8, (u32)vector);
-        MmioWrite32(entry + 12, 1);
+        mmio_write32(entry + 0, addr_low);
+        mmio_write32(entry + 4, 0);
+        mmio_write32(entry + 8, (u32)vector);
+        mmio_write32(entry + 12, 1);
     }
 
-    Idt::GetInstance().SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
-    handler.OnInterruptRegister(0, vector);
+    Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
+    handler.on_interrupt_register(0, vector);
 
     {
-        Stdlib::AutoLock lock(EntryLock);
-        MmioWrite32(entry + 12, 0);
+        stdlib::AutoLock lock(entry_lock_);
+        mmio_write32(entry + 12, 0);
     }
 
-    if (!PciMsixEnabled)
+    if (!pci_msix_enabled_)
     {
-        DisableLegacyIntx(Dev);
-        auto& pci = Pci::GetInstance();
-        u16 mc = pci.ReadWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2));
+        disable_legacy_intx(dev_);
+        auto& pci = Pci::get_instance();
+        u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
         /* Clear Function Mask too: firmware may have left it set, which
            would keep every vector masked after enable */
-        mc = (u16)((mc | MsixControlEnable) & ~MsixControlFuncMask);
-        pci.WriteWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2), mc);
-        PciMsixEnabled = true;
+        mc = (u16)((mc | MSIX_CONTROL_ENABLE) & ~MSIX_CONTROL_FUNC_MASK);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
+        pci_msix_enabled_ = true;
     }
 
-    EntryVector[index] = vector;
+    entry_vector_[index] = vector;
     return vector;
 }
 
-void MsixTable::Mask(u16 index)
+void MsixTable::mask(u16 index)
 {
-    if (!Table || index >= Count)
+    if (!table_ || index >= count_)
         return;
 
-    Stdlib::AutoLock lock(EntryLock);
+    stdlib::AutoLock lock(entry_lock_);
 
-    volatile u8* entry = Table + (ulong)index * 16;
-    u32 ctrl = MmioRead32(entry + 12);
-    MmioWrite32(entry + 12, ctrl | 1);
+    volatile u8* entry = table_ + (ulong)index * 16;
+    u32 ctrl = mmio_read32(entry + 12);
+    mmio_write32(entry + 12, ctrl | 1);
 }
 
-void MsixTable::Unmask(u16 index)
+void MsixTable::unmask(u16 index)
 {
-    if (!Table || index >= Count)
+    if (!table_ || index >= count_)
         return;
 
-    Stdlib::AutoLock lock(EntryLock);
+    stdlib::AutoLock lock(entry_lock_);
 
-    volatile u8* entry = Table + (ulong)index * 16;
-    u32 ctrl = MmioRead32(entry + 12);
-    MmioWrite32(entry + 12, ctrl & ~1u);
+    volatile u8* entry = table_ + (ulong)index * 16;
+    u32 ctrl = mmio_read32(entry + 12);
+    mmio_write32(entry + 12, ctrl & ~1u);
 }
 
-void MsixTable::Retarget(u16 index, u32 apicId)
+void MsixTable::retarget(u16 index, u32 apic_id)
 {
-    if (!Table || index >= Count || EntryVector[index] == 0)
+    if (!table_ || index >= count_ || entry_vector_[index] == 0)
         return;
 
-    Stdlib::AutoLock lock(EntryLock);
+    stdlib::AutoLock lock(entry_lock_);
 
-    volatile u8* entry = Table + (ulong)index * 16;
+    volatile u8* entry = table_ + (ulong)index * 16;
 
     /* The address must not change while the entry is unmasked */
-    u32 ctrl = MmioRead32(entry + 12);
-    MmioWrite32(entry + 12, ctrl | 1);
+    u32 ctrl = mmio_read32(entry + 12);
+    mmio_write32(entry + 12, ctrl | 1);
 
-    MmioWrite32(entry + 0, MsixAddrBase | (apicId << 12));
+    mmio_write32(entry + 0, MSIX_ADDR_BASE | (apic_id << 12));
 
-    MmioWrite32(entry + 12, ctrl);
+    mmio_write32(entry + 12, ctrl);
 }
 
 }

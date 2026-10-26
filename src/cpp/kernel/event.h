@@ -2,7 +2,7 @@
 
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 /* One task waiting for others to have something for it: an auto-reset
@@ -36,7 +36,7 @@ public:
        CPU's idle task, which is the scheduler's last resort and must stay
        runnable: a task exiting on a CPU whose idle task is blocked has
        nothing to switch to. */
-    void Wait();
+    void wait();
 
     /* Wait() for at most timeoutNs: true when signalled, false when the
        time ran out first. The deadline is Sleep()'s -- the scheduler wakes a
@@ -46,14 +46,14 @@ public:
        nothing either way, ends at its deadline and not at the next tick
        after it, and a Signal() still wakes it at once: of the two, exactly
        one does (Task::RunState). */
-    bool WaitFor(unsigned long long timeoutNs);
+    bool wait_for(unsigned long long timeout_ns);
 
     /* Any context. A signaller is done with the event only when Signal()
        returns -- the waiter having taken the signal says nothing about that
        -- so the event, and the waiting task, must outlive every Signal()
        that may still be running: whoever frees them has to know that no
        signaller is left, not merely that the waiter woke. */
-    void Signal();
+    void signal();
 
 private:
     Event(const Event& other) = delete;
@@ -61,9 +61,9 @@ private:
     Event& operator=(const Event& other) = delete;
     Event& operator=(Event&& other) = delete;
 
-    Atomic Signaled;
-    Atomic Waiter;      /* the Task in Wait(), 0 when none is */
-    Atomic WaiterCpu;
+    Atomic signaled_;
+    Atomic waiter_;      /* the Task in Wait(), 0 when none is */
+    Atomic waiter_cpu_;
 };
 
 }

@@ -1,64 +1,64 @@
 #include "object_table.h"
 
-namespace Kernel
+namespace kernel
 {
 
 ObjectTable::ObjectTable()
 {
-    for (ObjectId objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
+    for (ObjectId object_id = 0; object_id < stdlib::array_size(object_array_); object_id++)
     {
-        ObjectArray[objectId] = nullptr;
+        object_array_[object_id] = nullptr;
     }
 }
 
-ulong ObjectTable::Insert(Object *object)
+ulong ObjectTable::insert(Object *object)
 {
-    object->Get();
+    object->get();
     {
-        Stdlib::AutoLock lock(Lock);
-        for (ObjectId objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
+        stdlib::AutoLock lock(lock_);
+        for (ObjectId object_id = 0; object_id < stdlib::array_size(object_array_); object_id++)
         {
-            if (ObjectArray[objectId] == nullptr)
+            if (object_array_[object_id] == nullptr)
             {
-                ObjectArray[objectId] = object;
-                return objectId;
+                object_array_[object_id] = object;
+                return object_id;
             }
         }
     }
-    object->Put();
-    return InvalidObjectId;
+    object->put();
+    return INVALID_OBJECT_ID;
 }
 
-void ObjectTable::Remove(ulong objectId)
+void ObjectTable::remove(ulong object_id)
 {
-    if (objectId >= Stdlib::ArraySize(ObjectArray))
+    if (object_id >= stdlib::array_size(object_array_))
         return;
 
     Object* object = nullptr;
     {
-        Stdlib::AutoLock lock(Lock);
-        object = ObjectArray[objectId];
-        ObjectArray[objectId] = nullptr;
+        stdlib::AutoLock lock(lock_);
+        object = object_array_[object_id];
+        object_array_[object_id] = nullptr;
     }
 
     if (object != nullptr)
     {
-        object->Put();
+        object->put();
     }
 }
 
-Object* ObjectTable::Lookup(ulong objectId)
+Object* ObjectTable::lookup(ulong object_id)
 {
-    if (objectId >= Stdlib::ArraySize(ObjectArray))
+    if (object_id >= stdlib::array_size(object_array_))
         return nullptr;
 
     Object* object = nullptr;
     {
-        Stdlib::AutoLock lock(Lock);
-        object = ObjectArray[objectId];
+        stdlib::AutoLock lock(lock_);
+        object = object_array_[object_id];
         if (object != nullptr)
         {
-            object->Get();
+            object->get();
             return object;
         }
     }
@@ -68,13 +68,13 @@ Object* ObjectTable::Lookup(ulong objectId)
 
 ObjectTable::~ObjectTable()
 {
-    for (size_t objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
+    for (size_t object_id = 0; object_id < stdlib::array_size(object_array_); object_id++)
     {
-        Object* object = ObjectArray[objectId];
-        ObjectArray[objectId] = nullptr;
+        Object* object = object_array_[object_id];
+        object_array_[object_id] = nullptr;
         if (object != nullptr)
         {
-            object->Put();
+            object->put();
         }
     }
 }

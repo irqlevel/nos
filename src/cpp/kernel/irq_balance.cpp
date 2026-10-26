@@ -5,56 +5,56 @@
 #include <arch/x86_64/ioapic.h>
 #include <drivers/msix.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* Running-CPU bits an IOAPIC redirection entry can name, for the diagnostic
    below: everything from apic id 0 up to IoApic::MaxPhysicalDest. */
-static const ulong IoApicTargetMask =
-    (IoApic::MaxPhysicalDest >= MaxCpus - 1)
+static const ulong IO_APIC_TARGET_MASK =
+    (IoApic::MAX_PHYSICAL_DEST >= MAX_CPUS - 1)
         ? ~0UL
-        : ((1UL << (IoApic::MaxPhysicalDest + 1)) - 1);
+        : ((1UL << (IoApic::MAX_PHYSICAL_DEST + 1)) - 1);
 
 IrqBalance::IrqBalance()
-    : EntryCount(0)
-    , NextCpu(0)
-    , NextIoApicCpu(0)
-    , Balanced(false)
+    : entry_count_(0)
+    , next_cpu_(0)
+    , next_io_apic_cpu_(0)
+    , balanced_(false)
 {
-    Stdlib::MemSet(Entries, 0, sizeof(Entries));
+    stdlib::mem_set(entries_, 0, sizeof(entries_));
 }
 
 IrqBalance::~IrqBalance()
 {
 }
 
-ulong IrqBalance::NextCpuLockHeld(bool ioApic)
+ulong IrqBalance::next_cpu_lock_held(bool io_apic)
 {
-    auto& cpus = CpuTable::GetInstance();
+    auto& cpus = CpuTable::get_instance();
 
     /* An IOAPIC line that cannot be delivered is worse than one that is not
        balanced, so its fallback is the BSP rather than whichever CPU happens
        to be running this. */
-    ulong fallback = ioApic ? cpus.GetBspIndex() : cpus.GetCurrentCpuId();
+    ulong fallback = io_apic ? cpus.get_bsp_index() : cpus.get_current_cpu_id();
 
-    ulong cpuMask = cpus.GetRunningCpus();
-    if (cpuMask == 0)
+    ulong cpu_mask = cpus.get_running_cpus();
+    if (cpu_mask == 0)
         return fallback;
 
-    ulong& cursor = ioApic ? NextIoApicCpu : NextCpu;
+    ulong& cursor = io_apic ? next_io_apic_cpu_ : next_cpu_;
 
     /* Cycle through running CPUs starting after the last assigned one */
-    for (ulong i = 1; i <= MaxCpus; i++)
+    for (ulong i = 1; i <= MAX_CPUS; i++)
     {
-        ulong cpu = (cursor + i) % MaxCpus;
+        ulong cpu = (cursor + i) % MAX_CPUS;
 
-        if (!(cpuMask & (1UL << cpu)))
+        if (!(cpu_mask & (1UL << cpu)))
             continue;
 
         /* On x86 the CPU index is the apic id, and an IOAPIC entry in
            physical mode can only name the low ones -- see IoApic::CanTarget.
            MSI-X has the full 8-bit field and takes any of them. */
-        if (ioApic && !IoApic::CanTarget(cpu))
+        if (io_apic && !IoApic::can_target(cpu))
             continue;
 
         cursor = cpu;
@@ -64,102 +64,102 @@ ulong IrqBalance::NextCpuLockHeld(bool ioApic)
     return fallback;
 }
 
-void IrqBalance::ApplyLockHeld(Entry& entry)
+void IrqBalance::apply_lock_held(Entry& entry)
 {
-    if (entry.Kind == KindIoApic)
+    if (entry.kind == KIND_IO_APIC)
     {
-        IoApic::GetInstance().SetIrqDestination(entry.Gsi, entry.Cpu);
-        Trace(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.Gsi, entry.Cpu);
+        IoApic::get_instance().set_irq_destination(entry.gsi, entry.cpu);
+        trace(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.gsi, entry.cpu);
     }
     else
     {
-        entry.Table->Retarget(entry.Index, (u32)entry.Cpu);
-        Trace(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
-            (ulong)entry.Table, (ulong)entry.Index, entry.Cpu);
+        entry.table->retarget(entry.index, (u32)entry.cpu);
+        trace(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
+            (ulong)entry.table, (ulong)entry.index, entry.cpu);
     }
 }
 
-ulong IrqBalance::Assign(Entry entry)
+ulong IrqBalance::assign(Entry entry)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     /* Before Balance() all IRQs stay on the registering CPU (the BSP)
        and get spread once SMP bringup completes; afterwards new IRQs
        join the round-robin immediately. */
-    entry.Cpu = Balanced ? NextCpuLockHeld(entry.Kind == KindIoApic)
-                         : CpuTable::GetInstance().GetCurrentCpuId();
+    entry.cpu = balanced_ ? next_cpu_lock_held(entry.kind == KIND_IO_APIC)
+                         : CpuTable::get_instance().get_current_cpu_id();
 
-    if (EntryCount < MaxEntries)
-        Entries[EntryCount++] = entry;
+    if (entry_count_ < MAX_ENTRIES)
+        entries_[entry_count_++] = entry;
     else
-        Trace(0, "IrqBalance: entry table full, irq not balanced");
+        trace(0, "IrqBalance: entry table full, irq not balanced");
 
-    return entry.Cpu;
+    return entry.cpu;
 }
 
-ulong IrqBalance::AssignIoApicIrq(u8 gsi)
+ulong IrqBalance::assign_io_apic_irq(u8 gsi)
 {
     Entry entry;
-    entry.Kind = KindIoApic;
-    entry.Gsi = gsi;
-    entry.Table = nullptr;
-    entry.Index = 0;
-    entry.Cpu = 0;
-    return Assign(entry);
+    entry.kind = KIND_IO_APIC;
+    entry.gsi = gsi;
+    entry.table = nullptr;
+    entry.index = 0;
+    entry.cpu = 0;
+    return assign(entry);
 }
 
-ulong IrqBalance::AssignMsix(MsixTable* table, u16 index)
+ulong IrqBalance::assign_msix(MsixTable* table, u16 index)
 {
     Entry entry;
-    entry.Kind = KindMsix;
-    entry.Gsi = 0;
-    entry.Table = table;
-    entry.Index = index;
-    entry.Cpu = 0;
-    return Assign(entry);
+    entry.kind = KIND_MSIX;
+    entry.gsi = 0;
+    entry.table = table;
+    entry.index = index;
+    entry.cpu = 0;
+    return assign(entry);
 }
 
-void IrqBalance::RemoveMsix(MsixTable* table)
+void IrqBalance::remove_msix(MsixTable* table)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     ulong dst = 0;
-    for (ulong src = 0; src < EntryCount; src++)
+    for (ulong src = 0; src < entry_count_; src++)
     {
-        if (Entries[src].Kind == KindMsix && Entries[src].Table == table)
+        if (entries_[src].kind == KIND_MSIX && entries_[src].table == table)
             continue;
 
         if (dst != src)
-            Entries[dst] = Entries[src];
+            entries_[dst] = entries_[src];
         dst++;
     }
-    EntryCount = dst;
+    entry_count_ = dst;
 }
 
-void IrqBalance::Balance()
+void IrqBalance::balance()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Balanced)
+    if (balanced_)
         return;
-    Balanced = true;
+    balanced_ = true;
 
     /* Start the round-robin after the BSP so device IRQs prefer
        the other CPUs (the BSP keeps the system IRQs) */
-    NextCpu = CpuTable::GetInstance().GetBspIndex();
-    NextIoApicCpu = NextCpu;
+    next_cpu_ = CpuTable::get_instance().get_bsp_index();
+    next_io_apic_cpu_ = next_cpu_;
 
-    for (ulong i = 0; i < EntryCount; i++)
+    for (ulong i = 0; i < entry_count_; i++)
     {
-        Entries[i].Cpu = NextCpuLockHeld(Entries[i].Kind == KindIoApic);
-        ApplyLockHeld(Entries[i]);
+        entries_[i].cpu = next_cpu_lock_held(entries_[i].kind == KIND_IO_APIC);
+        apply_lock_held(entries_[i]);
     }
 
-    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
-    ulong ioApicMask = cpuMask & IoApicTargetMask;
+    ulong cpu_mask = CpuTable::get_instance().get_running_cpus();
+    ulong io_apic_mask = cpu_mask & IO_APIC_TARGET_MASK;
 
-    Trace(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
-        EntryCount, cpuMask, ioApicMask);
+    trace(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
+        entry_count_, cpu_mask, io_apic_mask);
 }
 
 }

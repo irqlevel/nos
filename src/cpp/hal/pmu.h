@@ -12,17 +12,17 @@
    x86-64 implements it on Intel parts with architectural perfmon version 2
    or later, and on AMD family 10h and later; everywhere else PmuAvailable()
    answers false and the profiler keeps sampling on the tick. */
-namespace Hal
+namespace hal
 {
 
-bool PmuAvailable();
-bool PmuStart();
-void PmuStop();
+bool pmu_available();
+bool pmu_start();
+void pmu_stop();
 
 /* What the samples are being counted with, for the profile report: the two
    vendors reach the same cycle count through different counters, and a
    report that says which one is what tells a PMU the hypervisor declined to
    virtualise apart from a machine that was simply idle. */
-const char* PmuName();
+const char* pmu_name();
 
 }

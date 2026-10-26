@@ -5,54 +5,54 @@
 #include <include/const.h>
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace kernel
 {
-namespace Mm
+namespace mm
 {
 
-void* Alloc(size_t size, ulong tag)
+void* alloc(size_t size, ulong tag)
 {
-	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Alloc(size, tag);
+	return AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance()).alloc(size, tag);
 }
 
-void* AllocUninit(size_t size, ulong tag)
+void* alloc_uninit(size_t size, ulong tag)
 {
-	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).AllocUninit(size, tag);
+	return AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance()).alloc_uninit(size, tag);
 }
 
-void Free(void* ptr)
+void free(void* ptr)
 {
-	AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Free(ptr);
+	AllocatorImpl::get_instance(&PageAllocatorImpl::get_instance()).free(ptr);
 }
 
-void* AllocMapPages(size_t numPages, ulong* physAddr)
+void* alloc_map_pages(size_t num_pages, ulong* phys_addr)
 {
-	return PageAllocatorImpl::GetInstance().AllocMapPages(numPages, physAddr);
+	return PageAllocatorImpl::get_instance().alloc_map_pages(num_pages, phys_addr);
 }
 
-void UnmapFreePages(void* ptr)
+void unmap_free_pages(void* ptr)
 {
-	PageAllocatorImpl::GetInstance().UnmapFreePages(ptr);
+	PageAllocatorImpl::get_instance().unmap_free_pages(ptr);
 }
 
-void* MapPages(size_t numPages, ulong* physAddrs)
+void* map_pages(size_t num_pages, ulong* phys_addrs)
 {
-	return PageAllocatorImpl::GetInstance().MapPages(numPages, physAddrs);
+	return PageAllocatorImpl::get_instance().map_pages(num_pages, phys_addrs);
 }
 
-void UnmapPages(void* ptr, size_t numPages)
+void unmap_pages(void* ptr, size_t num_pages)
 {
-	PageAllocatorImpl::GetInstance().UnmapPages(ptr, numPages);
+	PageAllocatorImpl::get_instance().unmap_pages(ptr, num_pages);
 }
 
-void* MapLargePages(size_t numPages, ulong* physAddrs)
+void* map_large_pages(size_t num_pages, ulong* phys_addrs)
 {
-	return PageAllocatorImpl::GetInstance().MapLargePages(numPages, physAddrs);
+	return PageAllocatorImpl::get_instance().map_large_pages(num_pages, phys_addrs);
 }
 
-void UnmapLargePages(void* ptr, size_t numPages)
+void unmap_large_pages(void* ptr, size_t num_pages)
 {
-	PageAllocatorImpl::GetInstance().UnmapLargePages(ptr, numPages);
+	PageAllocatorImpl::get_instance().unmap_large_pages(ptr, num_pages);
 }
 
 }
@@ -63,17 +63,17 @@ void UnmapLargePages(void* ptr, size_t numPages)
    here would mean a write to VA 0 instead of a diagnosable panic. */
 void* operator new(size_t size)
 {
-    void* ptr = Kernel::Mm::Alloc(size, 0);
+    void* ptr = kernel::mm::alloc(size, 0);
     if (ptr == nullptr)
-        Panic("operator new: out of memory (size %lu)", (ulong)size);
+        PANIC("operator new: out of memory (size %lu)", (ulong)size);
     return ptr;
 }
 
 void* operator new[](size_t size)
 {
-    void* ptr = Kernel::Mm::Alloc(size, 0);
+    void* ptr = kernel::mm::alloc(size, 0);
     if (ptr == nullptr)
-        Panic("operator new[]: out of memory (size %lu)", (ulong)size);
+        PANIC("operator new[]: out of memory (size %lu)", (ulong)size);
     return ptr;
 }
 
@@ -89,32 +89,32 @@ void* operator new[](size_t size, void *ptr) noexcept
     return ptr;
 }
 
-void* operator new(size_t size, const Kernel::Mm::NoThrowT&) noexcept
+void* operator new(size_t size, const kernel::mm::NoThrowT&) noexcept
 {
-    return Kernel::Mm::Alloc(size, 0);
+    return kernel::mm::alloc(size, 0);
 }
 
-void* operator new[](size_t size, const Kernel::Mm::NoThrowT&) noexcept
+void* operator new[](size_t size, const kernel::mm::NoThrowT&) noexcept
 {
-    return Kernel::Mm::Alloc(size, 0);
+    return kernel::mm::alloc(size, 0);
 }
 
-void operator delete(void* ptr, const Kernel::Mm::NoThrowT&) noexcept
+void operator delete(void* ptr, const kernel::mm::NoThrowT&) noexcept
 {
-    Kernel::Mm::Free(ptr);
+    kernel::mm::free(ptr);
 }
 
-void operator delete[](void* ptr, const Kernel::Mm::NoThrowT&) noexcept
+void operator delete[](void* ptr, const kernel::mm::NoThrowT&) noexcept
 {
-    Kernel::Mm::Free(ptr);
+    kernel::mm::free(ptr);
 }
 
 void operator delete(void* ptr)
 {
-	Kernel::Mm::Free(ptr);
+	kernel::mm::free(ptr);
 }
 
 void operator delete[](void* ptr)
 {
-	Kernel::Mm::Free(ptr);
+	kernel::mm::free(ptr);
 }

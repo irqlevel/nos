@@ -7,7 +7,7 @@
 #include <drivers/hpet.h>
 #include <drivers/rtc.h>
 
-namespace Kernel
+namespace kernel
 {
 
 enum ClockSource
@@ -17,35 +17,35 @@ enum ClockSource
     ClockKvmClock,
 };
 
-static ClockSource ActiveSource = ClockPit;
-static ulong RtcEpochSecs = 0;
+static ClockSource active_source = ClockPit;
+static ulong rtc_epoch_secs = 0;
 
 /* Added to the active source's reading so GetBootTime() stays one
    continuous timeline across a source switch (see SetClockSource).
    The HPET/PIT fallback below defines that timeline and takes no
    offset. */
-static long ClockOffsetNs = 0;
+static long clock_offset_ns = 0;
 
 /* The timeline GetBootTime() reports: the HPET the kernel reset in
    Hpet::Setup(), or the PIT when there is no HPET. It runs from before
    the first GetBootTime() call to the last, so it is the one clock every
    other source is aligned onto and it never takes an offset. */
-static Stdlib::Time ReadBaseClock()
+static stdlib::Time read_base_clock()
 {
-    if (Hpet::GetInstance().IsAvailable())
-        return Hpet::GetInstance().GetTime();
+    if (Hpet::get_instance().is_available())
+        return Hpet::get_instance().get_time();
 
-    return Pit::GetInstance().GetTime();
+    return Pit::get_instance().get_time();
 }
 
 /* Reads the active source, or the base clock when that source has
    nothing to say. *primary reports which one answered, because only the
    active source needs the offset. */
-static Stdlib::Time ReadClockSource(bool* primary)
+static stdlib::Time read_clock_source(bool* primary)
 {
     *primary = true;
 
-    switch (ActiveSource)
+    switch (active_source)
     {
     case ClockKvmClock:
     case ClockTsc:
@@ -54,10 +54,10 @@ static Stdlib::Time ReadClockSource(bool* primary)
            Tsc::GetTime()'s "best" one: that one silently becomes kvmclock
            the moment SetupKvmClock() arms it, which would move a ClockTsc
            reading onto a raw clock with a different zero. */
-        Stdlib::Time t = (ActiveSource == ClockKvmClock)
-            ? Tsc::GetInstance().GetTime()
-            : Tsc::GetInstance().TscTime();
-        if (t.GetValue() != 0)
+        stdlib::Time t = (active_source == ClockKvmClock)
+            ? Tsc::get_instance().get_time()
+            : Tsc::get_instance().tsc_time();
+        if (t.get_value() != 0)
             return t;
         /* Fallthrough to the base clock if TSC returns 0 (shouldn't happen) */
         break;
@@ -68,7 +68,7 @@ static Stdlib::Time ReadClockSource(bool* primary)
 
     *primary = false;
 
-    return ReadBaseClock();
+    return read_base_clock();
 }
 
 /* Point GetBootTime() at another source without moving the clock.
@@ -99,104 +99,104 @@ static Stdlib::Time ReadClockSource(bool* primary)
    IRQs are off because ProcessTimers reads the clock from the tick IPI
    on this CPU; the APs are not started yet, so there is no other
    reader. */
-static void SetClockSource(ClockSource source)
+static void set_clock_source(ClockSource source)
 {
-    ulong flags = Hal::IrqSave();
+    ulong flags = hal::irq_save();
 
-    ActiveSource = source;
-    ClockOffsetNs = 0;
+    active_source = source;
+    clock_offset_ns = 0;
 
     bool primary = false;
-    ulong raw = ReadClockSource(&primary).GetValue();
+    ulong raw = read_clock_source(&primary).get_value();
     if (primary)
-        ClockOffsetNs = (long)ReadBaseClock().GetValue() - (long)raw;
+        clock_offset_ns = (long)read_base_clock().get_value() - (long)raw;
 
-    Hal::IrqRestore(flags);
+    hal::irq_restore(flags);
 }
 
-void TimeInit()
+void time_init()
 {
-    auto& tsc = Tsc::GetInstance();
+    auto& tsc = Tsc::get_instance();
 
     /* Always calibrate TSC if possible */
-    if (tsc.Calibrate())
+    if (tsc.calibrate())
     {
-        if (tsc.IsInvariant())
-            SetClockSource(ClockTsc);
+        if (tsc.is_invariant())
+            set_clock_source(ClockTsc);
     }
     else
     {
-        Trace(0, "Time: TSC calibration failed");
+        trace(0, "Time: TSC calibration failed");
     }
 
     /* Try kvmclock (takes priority over TSC for GetBootTime) */
-    if (tsc.SetupKvmClock())
+    if (tsc.setup_kvm_clock())
     {
-        SetClockSource(ClockKvmClock);
-        Trace(0, "Time: using kvmclock");
+        set_clock_source(ClockKvmClock);
+        trace(0, "Time: using kvmclock");
     }
-    else if (ActiveSource == ClockTsc)
+    else if (active_source == ClockTsc)
     {
-        Trace(0, "Time: using calibrated TSC");
+        trace(0, "Time: using calibrated TSC");
     }
     else
     {
-        Trace(0, "Time: using PIT fallback");
+        trace(0, "Time: using PIT fallback");
     }
 
     /* Read RTC wall clock. Store the epoch of boot time zero, not of
        now: GetBootTime() already counts the stretch before TimeInit, and
        GetWallTimeSecs adds the two. */
     RtcTime rtc;
-    if (Rtc::GetInstance().ReadTime(rtc))
+    if (Rtc::get_instance().read_time(rtc))
     {
-        RtcEpochSecs = Rtc::ToUnixEpoch(rtc) - GetBootTime().GetSecs();
-        Trace(0, "Time: RTC epoch %lu", RtcEpochSecs);
+        rtc_epoch_secs = Rtc::to_unix_epoch(rtc) - get_boot_time().get_secs();
+        trace(0, "Time: RTC epoch %lu", rtc_epoch_secs);
     }
 
     /* Counts from the kernel's own start, not from this line: the
        restart-at-zero this replaces hid how long the self test and the
        device probe really take. */
-    Trace(0, "Time: boot time %lu ns", GetBootTime().GetValue());
+    trace(0, "Time: boot time %lu ns", get_boot_time().get_value());
 }
 
-Stdlib::Time GetBootTime()
+stdlib::Time get_boot_time()
 {
     bool primary = false;
-    ulong raw = ReadClockSource(&primary).GetValue();
+    ulong raw = read_clock_source(&primary).get_value();
 
     if (!primary)
-        return Stdlib::Time(raw);
+        return stdlib::Time(raw);
 
-    long offset = ClockOffsetNs;
+    long offset = clock_offset_ns;
 
     if (offset >= 0)
-        return Stdlib::Time(raw + (ulong)offset);
+        return stdlib::Time(raw + (ulong)offset);
 
     ulong back = (ulong)(-offset);
 
-    return Stdlib::Time((raw > back) ? (raw - back) : 0);
+    return stdlib::Time((raw > back) ? (raw - back) : 0);
 }
 
-ulong CycleCounterDeltaToNs(u64 delta)
+ulong cycle_counter_delta_to_ns(u64 delta)
 {
     /* Hal::ReadCycleCounter is the TSC here; TscToNs returns 0 until
        Calibrate() has run. */
-    return Tsc::GetInstance().TscToNs(delta);
+    return Tsc::get_instance().tsc_to_ns(delta);
 }
 
-void BusyWait(ulong nanoSecs)
+void busy_wait(ulong nano_secs)
 {
-    Stdlib::Time expired = GetBootTime() + Stdlib::Time(nanoSecs);
-    while (GetBootTime() < expired)
+    stdlib::Time expired = get_boot_time() + stdlib::Time(nano_secs);
+    while (get_boot_time() < expired)
     {
-        Pause();
+        cpu_relax();
     }
 }
 
-ulong GetWallTimeSecs()
+ulong get_wall_time_secs()
 {
-    return RtcEpochSecs + GetBootTime().GetSecs();
+    return rtc_epoch_secs + get_boot_time().get_secs();
 }
 
 }

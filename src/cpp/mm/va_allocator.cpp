@@ -6,108 +6,108 @@
 #include <kernel/trace.h>
 #include <lib/bitmap.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 VaAllocator::VaAllocator()
-    : BitmapPtr(nullptr)
-    , BitmapSize(0)
-    , VaStart(0)
-    , VaEnd(0)
-    , BlockSize(0)
-    , BlockCount(0)
+    : bitmap_ptr_(nullptr)
+    , bitmap_size_(0)
+    , va_start_(0)
+    , va_end_(0)
+    , block_size_(0)
+    , block_count_(0)
 {
 }
 
 VaAllocator::~VaAllocator()
 {
-    Trace(0, "0x%p dtor", this);
+    trace(0, "0x%p dtor", this);
 }
 
-bool VaAllocator::Setup(ulong vaStart, ulong vaEnd, ulong blockSize)
+bool VaAllocator::setup(ulong start, ulong end, ulong block_size)
 {
-    BlockCount = (vaEnd - vaStart) / blockSize;
-    if (!BlockCount)
+    block_count_ = (end - start) / block_size;
+    if (!block_count_)
         return false;
 
-    VaStart = vaStart;
-    VaEnd = vaEnd;
-    BlockSize = blockSize;
-    BitmapSize = (BlockCount + 7) / 8;
+    va_start_ = start;
+    va_end_ = end;
+    block_size_ = block_size;
+    bitmap_size_ = (block_count_ + 7) / 8;
 
-    ulong bitmapPages = Stdlib::RoundUp(BitmapSize, Const::PageSize) / Const::PageSize;
+    ulong bitmap_pages = stdlib::round_up(bitmap_size_, consts::PAGE_SIZE) / consts::PAGE_SIZE;
 
-    auto& pt = PageTable::GetInstance();
-    for (ulong i = 0; i < bitmapPages; i++)
+    auto& pt = PageTable::get_instance();
+    for (ulong i = 0; i < bitmap_pages; i++)
     {
-        Page* page = pt.AllocPage();
+        Page* page = pt.alloc_page();
         if (!page)
         {
             for (ulong j = 0; j < i; j++)
             {
-                Page* p = pt.UnmapPage(vaStart + j * Const::PageSize);
-                pt.FreePage(p);
-                p->Put();
+                Page* p = pt.unmap_page(start + j * consts::PAGE_SIZE);
+                pt.free_page(p);
+                p->put();
             }
             return false;
         }
-        if (!pt.MapPage(vaStart + i * Const::PageSize, page))
+        if (!pt.map_page(start + i * consts::PAGE_SIZE, page))
         {
-            pt.FreePage(page);
+            pt.free_page(page);
             for (ulong j = 0; j < i; j++)
             {
-                Page* p = pt.UnmapPage(vaStart + j * Const::PageSize);
-                pt.FreePage(p);
-                p->Put();
+                Page* p = pt.unmap_page(start + j * consts::PAGE_SIZE);
+                pt.free_page(p);
+                p->put();
             }
             return false;
         }
     }
 
-    BitmapPtr = (u8*)vaStart;
-    Stdlib::MemSet(BitmapPtr, 0, bitmapPages * Const::PageSize);
+    bitmap_ptr_ = (u8*)start;
+    stdlib::mem_set(bitmap_ptr_, 0, bitmap_pages * consts::PAGE_SIZE);
 
     /* Reserve the blocks occupied by the bitmap itself */
-    ulong bitmapBlocks = Stdlib::RoundUp(bitmapPages * Const::PageSize, blockSize) / blockSize;
-    for (ulong i = 0; i < bitmapBlocks; i++)
-        Stdlib::Bitmap(BitmapPtr, BlockCount).SetBit(i);
+    ulong bitmap_blocks = stdlib::round_up(bitmap_pages * consts::PAGE_SIZE, block_size) / block_size;
+    for (ulong i = 0; i < bitmap_blocks; i++)
+        stdlib::Bitmap(bitmap_ptr_, block_count_).set_bit(i);
 
-    Trace(0, "0x%p start 0x%lX end 0x%lX bsize 0x%lX bcount %lu bmpages %lu",
-        this, VaStart, VaEnd, BlockSize, BlockCount, bitmapPages);
+    trace(0, "0x%p start 0x%lX end 0x%lX bsize 0x%lX bcount %lu bmpages %lu",
+        this, va_start_, va_end_, block_size_, block_count_, bitmap_pages);
     return true;
 }
 
-ulong VaAllocator::Alloc()
+ulong VaAllocator::alloc()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    long blockIndex = Stdlib::Bitmap(BitmapPtr, BlockCount).FindSetZeroBit();
-    if (blockIndex < 0)
+    long block_index = stdlib::Bitmap(bitmap_ptr_, block_count_).find_set_zero_bit();
+    if (block_index < 0)
         return 0;
 
-    return VaStart + blockIndex * BlockSize;
+    return va_start_ + block_index * block_size_;
 }
 
-void VaAllocator::Free(ulong va)
+void VaAllocator::free(ulong va)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    BugOn(va < VaStart || va >= VaEnd);
-    BugOn((va - VaStart) % BlockSize != 0);
+    BUG_ON(va < va_start_ || va >= va_end_);
+    BUG_ON((va - va_start_) % block_size_ != 0);
 
-    ulong blockIndex = (va - VaStart) / BlockSize;
-    Stdlib::Bitmap bitmap(BitmapPtr, BlockCount);
+    ulong block_index = (va - va_start_) / block_size_;
+    stdlib::Bitmap bitmap(bitmap_ptr_, block_count_);
     /* Double-free: the same VA would be handed out to two callers */
-    BugOn(!bitmap.TestBit(blockIndex));
-    bitmap.ClearBit(blockIndex);
+    BUG_ON(!bitmap.test_bit(block_index));
+    bitmap.clear_bit(block_index);
 }
 
-bool VaAllocator::Contains(ulong va)
+bool VaAllocator::contains(ulong va)
 {
-    return va >= VaStart && va < VaEnd && ((va - VaStart) % BlockSize) == 0;
+    return va >= va_start_ && va < va_end_ && ((va - va_start_) % block_size_) == 0;
 }
 
 }

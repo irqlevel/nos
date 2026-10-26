@@ -11,49 +11,49 @@ int asm_strcmp(const char* s1, const char* s2);
 const char* asm_strstr(const char* haystack, const char* needle);
 }
 
-namespace Stdlib
+namespace stdlib
 {
 
-void *MemAdd(void *ptr, unsigned long len)
+void *mem_add(void *ptr, unsigned long len)
 {
     return reinterpret_cast<void *>(reinterpret_cast<unsigned long>(ptr) + len);
 }
 
-const void *MemAdd(const void *ptr, unsigned long len)
+const void *mem_add(const void *ptr, unsigned long len)
 {
     return reinterpret_cast<const void *>(reinterpret_cast<unsigned long>(ptr) + len);
 }
 
-void MemSet(void* ptr, unsigned char c, size_t size)
+void mem_set(void* ptr, unsigned char c, size_t size)
 {
     asm_memset(ptr, c, size);
 }
 
-int MemCmp(const void* ptr1, const void* ptr2, size_t size)
+int mem_cmp(const void* ptr1, const void* ptr2, size_t size)
 {
     return asm_memcmp(ptr1, ptr2, size);
 }
 
-void MemCpy(void* dst, const void* src, size_t size)
+void mem_cpy(void* dst, const void* src, size_t size)
 {
     asm_memcpy(dst, src, size);
 }
 
-void MemMove(void* dst, const void* src, size_t size)
+void mem_move(void* dst, const void* src, size_t size)
 {
     asm_memmove(dst, src, size);
 }
 
-size_t StrLen(const char* s)
+size_t str_len(const char* s)
 {
     return asm_strlen(s);
 }
 
-const char *TruncateFileName(const char *fileName)
+const char *truncate_file_name(const char *file_name)
 {
-    const char *base, *lastSep = nullptr;
+    const char *base, *last_sep = nullptr;
 
-    base = fileName;
+    base = file_name;
     for (;;)
     {
         if (*base == '\0')
@@ -61,39 +61,39 @@ const char *TruncateFileName(const char *fileName)
 
         if (*base == '/')
         {
-            lastSep = base;
+            last_sep = base;
         }
         base++;
     }
 
-    if (lastSep)
-        return lastSep + 1;
+    if (last_sep)
+        return last_sep + 1;
     else
-        return fileName;
+        return file_name;
 }
 
-void ByteSwap(u8 *b1, u8 *b2)
+void byte_swap(u8 *b1, u8 *b2)
 {
     u8 tmp = *b1;
     *b1 = *b2;
     *b2 = tmp;
 }
 
-void MemReverse(void *mem, size_t size)
+void mem_reverse(void *mem, size_t size)
 {
     u8 *p_mem = (u8 *)mem;
     size_t i;
 
     for (i = 0; i < size/2; i++)
-        ByteSwap(&p_mem[i], &p_mem[size - i - 1]);
+        byte_swap(&p_mem[i], &p_mem[size - i - 1]);
 }
 
-int StrCmp(const char *s1, const char *s2)
+int str_cmp(const char *s1, const char *s2)
 {
     return asm_strcmp(s1, s2);
 }
 
-int StrnCmp(const char *s1, const char *s2, size_t size)
+int strn_cmp(const char *s1, const char *s2, size_t size)
 {
     size_t i;
 
@@ -116,7 +116,7 @@ int StrnCmp(const char *s1, const char *s2, size_t size)
     return 0;
 }
 
-void StrnCpy(char *dst, const char *src, size_t size)
+void strn_cpy(char *dst, const char *src, size_t size)
 {
     if (size == 0)
         return;
@@ -133,24 +133,24 @@ void StrnCpy(char *dst, const char *src, size_t size)
 }
 
 // find n : 2^n >= size
-size_t Log2(size_t size)
+size_t log2(size_t size)
 {
     if (size < 2) {
         return 0;
     }
 
 	size_t log = 0;
-    size_t restSize = size;
-    while (restSize != 0)
+    size_t rest_size = size;
+    while (rest_size != 0)
     {
-        restSize >>= 1;
+        rest_size >>= 1;
         log++;
     }
 
     return (size & (size - 1)) ? log : (log - 1);
 }
 
-size_t HashPtr(void *ptr)
+size_t hash_ptr(void *ptr)
 {
     ulong val = (ulong)ptr;
     size_t hash, i, c;
@@ -166,7 +166,7 @@ size_t HashPtr(void *ptr)
     return hash;
 }
 
-const char* StrChr(const char* s, char c)
+const char* str_chr(const char* s, char c)
 {
     for (const char* curr = s; *curr != '\0'; curr++)
     {
@@ -176,7 +176,7 @@ const char* StrChr(const char* s, char c)
     return nullptr;
 }
 
-const char* StrChrOnce(const char* s, char sep)
+const char* str_chr_once(const char* s, char sep)
 {
     const char* curr = s;
     const char* res = nullptr;
@@ -203,7 +203,7 @@ const char* StrChrOnce(const char* s, char sep)
     }
 }
 
-bool IsValueInRange(ulong value, ulong base, ulong limit)
+bool is_value_in_range(ulong value, ulong base, ulong limit)
 {
     if (value >= base && value < limit)
         return true;
@@ -211,19 +211,19 @@ bool IsValueInRange(ulong value, ulong base, ulong limit)
     return false;
 }
 
-bool ParseUlong(const char* s, ulong& result)
+bool parse_ulong(const char* s, ulong& result)
 {
     result = 0;
     if (!s || *s == '\0')
         return false;
 
-    const ulong maxValue = (ulong)-1;
+    const ulong max_value = (ulong)-1;
     while (*s)
     {
         if (*s < '0' || *s > '9')
             return false;
         ulong digit = (ulong)(*s - '0');
-        if (result > (maxValue - digit) / 10)
+        if (result > (max_value - digit) / 10)
             return false;
         result = result * 10 + digit;
         s++;
@@ -231,7 +231,7 @@ bool ParseUlong(const char* s, ulong& result)
     return true;
 }
 
-u8 HexCharToNibble(char c)
+u8 hex_char_to_nibble(char c)
 {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -239,21 +239,21 @@ u8 HexCharToNibble(char c)
     return 0xFF;
 }
 
-bool HexDecode(const char* hex, ulong hexLen, u8* out, ulong outSize, ulong& bytesWritten)
+bool hex_decode(const char* hex, ulong hex_len, u8* out, ulong out_size, ulong& bytes_written)
 {
-    bytesWritten = 0;
-    for (ulong i = 0; i + 1 < hexLen && bytesWritten < outSize; i += 2)
+    bytes_written = 0;
+    for (ulong i = 0; i + 1 < hex_len && bytes_written < out_size; i += 2)
     {
-        u8 hi = HexCharToNibble(hex[i]);
-        u8 lo = HexCharToNibble(hex[i + 1]);
+        u8 hi = hex_char_to_nibble(hex[i]);
+        u8 lo = hex_char_to_nibble(hex[i + 1]);
         if (hi == 0xFF || lo == 0xFF)
             return false;
-        out[bytesWritten++] = (hi << 4) | lo;
+        out[bytes_written++] = (hi << 4) | lo;
     }
     return true;
 }
 
-const char* NextToken(const char* s, const char*& end)
+const char* next_token(const char* s, const char*& end)
 {
     while (*s == ' ') s++;
     if (*s == '\0') { end = s; return nullptr; }
@@ -263,20 +263,20 @@ const char* NextToken(const char* s, const char*& end)
     return start;
 }
 
-ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize)
+ulong token_copy(const char* start, const char* end, char* dst, ulong dst_size)
 {
-    if (dstSize == 0)
+    if (dst_size == 0)
         return 0;
 
     ulong len = (ulong)(end - start);
-    if (len >= dstSize)
-        len = dstSize - 1;
-    MemCpy(dst, start, len);
+    if (len >= dst_size)
+        len = dst_size - 1;
+    mem_cpy(dst, start, len);
     dst[len] = '\0';
     return len;
 }
 
-const char* StrStr(const char* haystack, const char* needle)
+const char* str_str(const char* haystack, const char* needle)
 {
     return asm_strstr(haystack, needle);
 }
@@ -288,24 +288,24 @@ extern "C"
 
 void *memcpy(void *dst, const void *src, size_t size)
 {
-    Stdlib::MemCpy(dst, src, size);
+    stdlib::mem_cpy(dst, src, size);
     return dst;
 }
 
 void *memset(void *ptr, int c, size_t size)
 {
-    Stdlib::MemSet(ptr, static_cast<unsigned char>(c), size);
+    stdlib::mem_set(ptr, static_cast<unsigned char>(c), size);
     return ptr;
 }
 
 int memcmp(const void *s1, const void *s2, size_t n)
 {
-    return Stdlib::MemCmp(s1, s2, n);
+    return stdlib::mem_cmp(s1, s2, n);
 }
 
 void *memmove(void *dst, const void *src, size_t size)
 {
-    Stdlib::MemMove(dst, src, size);
+    stdlib::mem_move(dst, src, size);
     return dst;
 }
 

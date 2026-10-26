@@ -2,7 +2,7 @@
 
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class WaitGroup final
@@ -12,11 +12,11 @@ public:
     WaitGroup(long count);
     ~WaitGroup();
 
-    void Add(long delta);
-    void Done();
-    void Wait();
+    void add(long delta);
+    void done();
+    void wait();
 
-    long GetCounter();
+    long get_counter();
 
 private:
     WaitGroup(const WaitGroup& other) = delete;
@@ -24,7 +24,7 @@ private:
     WaitGroup& operator=(const WaitGroup& other) = delete;
     WaitGroup& operator=(WaitGroup&& other) = delete;
 
-    Atomic Counter;
+    Atomic counter_;
 };
 
 }

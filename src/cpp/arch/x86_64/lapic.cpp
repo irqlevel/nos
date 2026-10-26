@@ -7,85 +7,85 @@
 #include "asm.h"
 #include <mm/mmio.h>
 
-namespace Kernel
+namespace kernel
 {
 
-ulong Lapic::TimerTicksPerSec = 0;
+ulong Lapic::timer_ticks_per_sec_ = 0;
 
-void* Lapic::GetRegBase(ulong index)
+void* Lapic::get_reg_base(ulong index)
 {
-    return Stdlib::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
+    return stdlib::mem_add(Acpi::get_instance().get_lapic_address(), index * 0x10);
 }
 
-u32 Lapic::ReadReg(ulong index)
+u32 Lapic::read_reg(ulong index)
 {
-    Hal::DmaRmb();
-    return Mm::MmIo::Read32(GetRegBase(index));
+    hal::dma_rmb();
+    return mm::MmIo::read32(get_reg_base(index));
 }
 
-void Lapic::WriteReg(ulong index, u32 value)
+void Lapic::write_reg(ulong index, u32 value)
 {
-    Mm::MmIo::Write32(GetRegBase(index), value);
-    Hal::DmaWmb();
+    mm::MmIo::write32(get_reg_base(index), value);
+    hal::dma_wmb();
 }
 
-void Lapic::Enable()
+void Lapic::enable()
 {
-    ulong msr = ReadMsr(BaseMsr);
+    ulong msr = read_msr(BASE_MSR);
 
-    Trace(LapicLL, "Lapic: msr 0x%lX base 0x%p", msr, Acpi::GetInstance().GetLapicAddress());
+    trace(LAPIC_LL, "Lapic: msr 0x%lX base 0x%p", msr, Acpi::get_instance().get_lapic_address());
 
     /* Firmware may hand off with the APIC in x2APIC mode, where the
        MMIO window is dead. The SDM forbids switching x2APIC->xAPIC
        directly: go through the globally-disabled state first. */
-    if (msr & BaseMsrX2ApicEnable)
+    if (msr & BASE_MSR_X2_APIC_ENABLE)
     {
-        Trace(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
-        WriteMsr(BaseMsr, msr & ~(BaseMsrX2ApicEnable | BaseMsrGlobalEnable));
-        msr = msr & ~(BaseMsrX2ApicEnable | BaseMsrGlobalEnable);
+        trace(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
+        write_msr(BASE_MSR, msr & ~(BASE_MSR_X2_APIC_ENABLE | BASE_MSR_GLOBAL_ENABLE));
+        msr = msr & ~(BASE_MSR_X2_APIC_ENABLE | BASE_MSR_GLOBAL_ENABLE);
     }
 
     /* Make sure the APIC is globally enabled (xAPIC MMIO mode) */
-    if (!(msr & BaseMsrGlobalEnable))
+    if (!(msr & BASE_MSR_GLOBAL_ENABLE))
     {
-        msr = msr | BaseMsrGlobalEnable;
-        WriteMsr(BaseMsr, msr);
+        msr = msr | BASE_MSR_GLOBAL_ENABLE;
+        write_msr(BASE_MSR, msr);
     }
 
-    WriteReg(DfrIndex, 0xffffffff);// Flat mode
-    WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1
-    WriteReg(TprIndex, 0xFF);// Disable all interrupts
-    WriteReg(SpIvIndex, 0x100 | SpuriousVector);// bit 8 = APIC software enable
+    write_reg(DFR_INDEX, 0xffffffff);// Flat mode
+    write_reg(LDR_INDEX, 0x01000000);// All cpus use logical id 1
+    write_reg(TPR_INDEX, 0xFF);// Disable all interrupts
+    write_reg(SP_IV_INDEX, 0x100 | SPURIOUS_VECTOR);// bit 8 = APIC software enable
 
-    Trace(LapicLL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
-        (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
+    trace(LAPIC_LL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
+        (ulong)read_reg(TPR_INDEX), (ulong)read_reg(DFR_INDEX), (ulong)read_reg(LDR_INDEX), (ulong)read_reg(SP_IV_INDEX));
 
-    Trace(LapicLL, "Lapic: apicId 0x%lX", (ulong)GetApicId());
+    trace(LAPIC_LL, "Lapic: apicId 0x%lX", (ulong)get_apic_id());
 
     /* The ID is known and the MMIO window is live: give this CPU its GS slot
        so nothing has to come back here to ask again. */
-    PerCpuPublish(GetApicId());
+    per_cpu_publish(get_apic_id());
 
-    MaskAllLvt();
+    mask_all_lvt();
 
-    WriteReg(EoiIndex, 0x0); // Acknowledge any outstanding interrupts
+    write_reg(EOI_INDEX, 0x0); // Acknowledge any outstanding interrupts
 
-    WriteReg(TprIndex, 0x0);// Clear task priority to enable all interrupts
+    write_reg(TPR_INDEX, 0x0);// Clear task priority to enable all interrupts
 }
 
-void Lapic::MaskLvt(ulong index, const char* name)
+void Lapic::mask_lvt(ulong index, const char* name)
 {
-    u32 value = ReadReg(index);
+    u32 value = read_reg(index);
 
-    if (value & LvtMasked)
+    if (value & LVT_MASKED)
         return;
 
-    Trace(0, "Lapic: masking lvt %s 0x%lX", name, (ulong)value);
+    trace(0, "Lapic: masking lvt %s 0x%lX", name, (ulong)value);
 
-    WriteReg(index, value | LvtMasked);
+    write_reg(index, value | LVT_MASKED);
 }
 
-void Lapic::MaskAllLvt()
+void Lapic::mask_all_lvt()
 {
     /* Firmware hands the APIC over configured for itself: virtual wire
        mode (LINT0 = ExtINT, so the 8259's INTR line reaches the CPU
@@ -99,136 +99,136 @@ void Lapic::MaskAllLvt()
 
        "Max LVT Entry" (version register bits 23:16) is the entry count
        minus one; reading the entries past it is undefined. */
-    u32 maxLvt = (ReadReg(VersionIndex) >> 16) & 0xFF;
+    u32 max_lvt = (read_reg(VERSION_INDEX) >> 16) & 0xFF;
 
-    MaskLvt(LvtTimerIndex, "timer");
-    MaskLvt(LvtLint0Index, "lint0");
-    MaskLvt(LvtLint1Index, "lint1");
+    mask_lvt(LVT_TIMER_INDEX, "timer");
+    mask_lvt(LVT_LINT0_INDEX, "lint0");
+    mask_lvt(LVT_LINT1_INDEX, "lint1");
 
-    if (maxLvt >= 3)
-        MaskLvt(LvtErrorIndex, "error");
+    if (max_lvt >= 3)
+        mask_lvt(LVT_ERROR_INDEX, "error");
 
-    if (maxLvt >= 4)
-        MaskLvt(LvtPerfCntIndex, "perfcnt");
+    if (max_lvt >= 4)
+        mask_lvt(LVT_PERF_CNT_INDEX, "perfcnt");
 
-    if (maxLvt >= 5)
-        MaskLvt(LvtThermalIndex, "thermal");
+    if (max_lvt >= 5)
+        mask_lvt(LVT_THERMAL_INDEX, "thermal");
 
-    if (maxLvt >= 6)
-        MaskLvt(LvtCmciIndex, "cmci");
+    if (max_lvt >= 6)
+        mask_lvt(LVT_CMCI_INDEX, "cmci");
 }
 
-bool Lapic::CheckIsr(u8 vector)
+bool Lapic::check_isr(u8 vector)
 {
-    ulong isrRegNumber = vector / 32;
-    u8 regOffset = vector % 32;
+    ulong isr_reg_number = vector / 32;
+    u8 reg_offset = vector % 32;
 
-    return (ReadReg(IsrBaseIndex + isrRegNumber) & (1 << regOffset)) ? true : false;
+    return (read_reg(ISR_BASE_INDEX + isr_reg_number) & (1 << reg_offset)) ? true : false;
 }
 
-void Lapic::EOI()
+void Lapic::eoi()
 {
-    WriteReg(EoiIndex, 0x0);
+    write_reg(EOI_INDEX, 0x0);
 }
 
-void Lapic::EOI(u8 vector)
+void Lapic::eoi(u8 vector)
 {
-    if (vector != SpuriousVector)
-        WriteReg(EoiIndex, 0x0);
+    if (vector != SPURIOUS_VECTOR)
+        write_reg(EOI_INDEX, 0x0);
 }
 
-u8 Lapic::GetApicId()
+u8 Lapic::get_apic_id()
 {
-    return ReadReg(ApicIdIndex) >> 24;
+    return read_reg(APIC_ID_INDEX) >> 24;
 }
 
-void Lapic::SendInit(u32 apicId)
-{
-    /* Same ICR interleaving hazard as SendIPI below */
-    ulong flags = GetRflags();
-    InterruptDisable();
-
-    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
-    WriteReg(IcrLowIndex, IcrInit | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
-
-    while (ReadReg(IcrLowIndex) & IcrSendPending)
-    {
-        Pause();
-    }
-
-    SetRflags(flags);
-}
-
-void Lapic::SendStartup(u32 apicId, u32 vector)
+void Lapic::send_init(u32 apic_id)
 {
     /* Same ICR interleaving hazard as SendIPI below */
-    ulong flags = GetRflags();
-    InterruptDisable();
+    ulong flags = get_rflags();
+    interrupt_disable();
 
-    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
-    WriteReg(IcrLowIndex, vector | IcrStartup | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+    write_reg(ICR_HIGH_INDEX, apic_id << ICR_DESTINATION_SHIFT);
+    write_reg(ICR_LOW_INDEX, ICR_INIT | ICR_PHYSICAL | ICR_ASSERT | ICR_EDGE | ICR_NO_SHORTHAND);
 
-    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    while (read_reg(ICR_LOW_INDEX) & ICR_SEND_PENDING)
     {
-        Pause();
+        cpu_relax();
     }
 
-    SetRflags(flags);
+    set_rflags(flags);
+}
+
+void Lapic::send_startup(u32 apic_id, u32 vector)
+{
+    /* Same ICR interleaving hazard as SendIPI below */
+    ulong flags = get_rflags();
+    interrupt_disable();
+
+    write_reg(ICR_HIGH_INDEX, apic_id << ICR_DESTINATION_SHIFT);
+    write_reg(ICR_LOW_INDEX, vector | ICR_STARTUP | ICR_PHYSICAL | ICR_ASSERT | ICR_EDGE | ICR_NO_SHORTHAND);
+
+    while (read_reg(ICR_LOW_INDEX) & ICR_SEND_PENDING)
+    {
+        cpu_relax();
+    }
+
+    set_rflags(flags);
 }
 
 /* Delivery mode NMI: reaches a CPU with interrupts disabled, which an
    ordinary IPI cannot. No vector -- NMI is always vector 2. */
-void Lapic::SendNmi(u32 apicId)
+void Lapic::send_nmi(u32 apic_id)
 {
-    ulong flags = GetRflags();
-    InterruptDisable();
+    ulong flags = get_rflags();
+    interrupt_disable();
 
-    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
-    WriteReg(IcrLowIndex, IcrNmi | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+    write_reg(ICR_HIGH_INDEX, apic_id << ICR_DESTINATION_SHIFT);
+    write_reg(ICR_LOW_INDEX, ICR_NMI | ICR_PHYSICAL | ICR_ASSERT | ICR_EDGE | ICR_NO_SHORTHAND);
 
-    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    while (read_reg(ICR_LOW_INDEX) & ICR_SEND_PENDING)
     {
-        Pause();
+        cpu_relax();
     }
 
-    SetRflags(flags);
+    set_rflags(flags);
 }
 
-void Lapic::WriteLvtPerfCounterNmi()
+void Lapic::write_lvt_perf_counter_nmi()
 {
-    WriteReg(LvtPerfCntIndex, IcrNmi);
+    write_reg(LVT_PERF_CNT_INDEX, ICR_NMI);
 }
 
-void Lapic::MaskLvtPerfCounter()
+void Lapic::mask_lvt_perf_counter()
 {
-    WriteReg(LvtPerfCntIndex, LvtMasked);
+    write_reg(LVT_PERF_CNT_INDEX, LVT_MASKED);
 }
 
-bool Lapic::CalibrateTimer()
+bool Lapic::calibrate_timer()
 {
-    static const ulong SampleNs = 50 * Const::NanoSecsInMs;
+    static const ulong SAMPLE_NS = 50 * consts::NANO_SECS_IN_MS;
 
     /* Free-running and masked: nothing is delivered, the counter just
        counts down so we can see how fast it goes. */
-    WriteReg(TimerDivideIndex, TimerDivideBy16);
-    WriteReg(LvtTimerIndex, LvtMasked);
-    WriteReg(TimerInitialCountIndex, 0xFFFFFFFF);
+    write_reg(TIMER_DIVIDE_INDEX, TIMER_DIVIDE_BY16);
+    write_reg(LVT_TIMER_INDEX, LVT_MASKED);
+    write_reg(TIMER_INITIAL_COUNT_INDEX, 0xFFFFFFFF);
 
-    Stdlib::Time start = GetBootTime();
-    Stdlib::Time deadline = start + Stdlib::Time(SampleNs);
-    while (GetBootTime() < deadline)
-        Pause();
+    stdlib::Time start = get_boot_time();
+    stdlib::Time deadline = start + stdlib::Time(SAMPLE_NS);
+    while (get_boot_time() < deadline)
+        cpu_relax();
 
-    u32 remaining = ReadReg(TimerCurrentCountIndex);
-    ulong elapsed = (GetBootTime() - start).GetValue();
+    u32 remaining = read_reg(TIMER_CURRENT_COUNT_INDEX);
+    ulong elapsed = (get_boot_time() - start).get_value();
 
-    WriteReg(TimerInitialCountIndex, 0);
+    write_reg(TIMER_INITIAL_COUNT_INDEX, 0);
 
     if (remaining == 0 || elapsed == 0)
     {
         /* Ran the counter to zero, or the clock did not move: either way
            the measurement is not one to build a tick on. */
-        Trace(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
+        trace(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
             (ulong)remaining, elapsed);
         return false;
     }
@@ -236,75 +236,75 @@ bool Lapic::CalibrateTimer()
     /* Under 2^32 counts in a sample of 50 ms: the product stays far below
        2^64 */
     ulong ticks = 0xFFFFFFFFUL - remaining;
-    ulong ticksPerSec = (ticks * Const::NanoSecsInSec) / elapsed;
+    ulong ticks_per_sec = (ticks * consts::NANO_SECS_IN_SEC) / elapsed;
 
     /* Under 2^32 a second -- a bus of 68 GHz at the divide of 16 -- or the
        measurement is not of a local APIC; and ArmTimer's arithmetic stays
        in a u64 below that. */
-    if (ticksPerSec == 0 || ticksPerSec > 0xFFFFFFFFUL)
+    if (ticks_per_sec == 0 || ticks_per_sec > 0xFFFFFFFFUL)
     {
-        Trace(0, "Lapic: timer rate %lu out of range", ticksPerSec);
+        trace(0, "Lapic: timer rate %lu out of range", ticks_per_sec);
         return false;
     }
 
-    TimerTicksPerSec = ticksPerSec;
-    Trace(0, "Lapic: timer %lu ticks/s", ticksPerSec);
+    timer_ticks_per_sec_ = ticks_per_sec;
+    trace(0, "Lapic: timer %lu ticks/s", ticks_per_sec);
 
     return true;
 }
 
-void Lapic::StartTimer(u8 vector)
+void Lapic::start_timer(u8 vector)
 {
-    WriteReg(TimerDivideIndex, TimerDivideBy16);
-    WriteReg(LvtTimerIndex, (u32)vector | LvtTimerOneShot);
-    WriteReg(TimerInitialCountIndex, 0);
+    write_reg(TIMER_DIVIDE_INDEX, TIMER_DIVIDE_BY16);
+    write_reg(LVT_TIMER_INDEX, (u32)vector | LVT_TIMER_ONE_SHOT);
+    write_reg(TIMER_INITIAL_COUNT_INDEX, 0);
 }
 
-void Lapic::ArmTimer(ulong deltaNs)
+void Lapic::arm_timer(ulong delta_ns)
 {
-    ulong perSec = TimerTicksPerSec;
-    if (perSec == 0)
+    ulong per_sec = timer_ticks_per_sec_;
+    if (per_sec == 0)
         return;
 
-    ulong late = deltaNs / TimerLateParts;
-    ulong ns = (deltaNs > ~0UL - late) ? ~0UL : deltaNs + late;
+    ulong late = delta_ns / TIMER_LATE_PARTS;
+    ulong ns = (delta_ns > ~0UL - late) ? ~0UL : delta_ns + late;
 
     /* Whole seconds and the rest apart, the rest rounded up: a remainder
        under 2^30 times a rate under 2^32 (CalibrateTimer) stays in a u64,
        and whole seconds past what the 32-bit count holds are its most */
-    ulong secs = ns / Const::NanoSecsInSec;
-    ulong rest = ns % Const::NanoSecsInSec;
-    ulong ticks = MaxTimerCount;
-    if (secs <= MaxTimerCount / perSec)
+    ulong secs = ns / consts::NANO_SECS_IN_SEC;
+    ulong rest = ns % consts::NANO_SECS_IN_SEC;
+    ulong ticks = MAX_TIMER_COUNT;
+    if (secs <= MAX_TIMER_COUNT / per_sec)
     {
-        ticks = secs * perSec +
-            (rest * perSec + Const::NanoSecsInSec - 1) / Const::NanoSecsInSec;
+        ticks = secs * per_sec +
+            (rest * per_sec + consts::NANO_SECS_IN_SEC - 1) / consts::NANO_SECS_IN_SEC;
     }
 
     /* A count of 0 stops the timer instead of firing it */
-    ticks = Stdlib::Max(ticks, 1UL);
-    ticks = Stdlib::Min(ticks, MaxTimerCount);
+    ticks = stdlib::max(ticks, 1UL);
+    ticks = stdlib::min(ticks, MAX_TIMER_COUNT);
 
-    WriteReg(TimerInitialCountIndex, (u32)ticks);
+    write_reg(TIMER_INITIAL_COUNT_INDEX, (u32)ticks);
 }
 
-void Lapic::SendIPI(u32 apicId, u32 vector)
+void Lapic::send_ipi(u32 apic_id, u32 vector)
 {
     /* The two ICR writes must not be interleaved with another SendIPI
        on this CPU (e.g. from an interrupt handler): the second sender
        would clobber IcrHigh and redirect the first IPI. */
-    ulong flags = GetRflags();
-    InterruptDisable();
+    ulong flags = get_rflags();
+    interrupt_disable();
 
-    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
-    WriteReg(IcrLowIndex, vector | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+    write_reg(ICR_HIGH_INDEX, apic_id << ICR_DESTINATION_SHIFT);
+    write_reg(ICR_LOW_INDEX, vector | ICR_PHYSICAL | ICR_ASSERT | ICR_EDGE | ICR_NO_SHORTHAND);
 
-    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    while (read_reg(ICR_LOW_INDEX) & ICR_SEND_PENDING)
     {
-        Pause();
+        cpu_relax();
     }
 
-    SetRflags(flags);
+    set_rflags(flags);
 }
 
 }

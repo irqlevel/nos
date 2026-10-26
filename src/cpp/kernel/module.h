@@ -7,7 +7,7 @@
 #include <lib/list_entry.h>
 #include <lib/printer.h>
 
-namespace Kernel
+namespace kernel
 {
 
 struct LoadedModule;
@@ -38,29 +38,29 @@ struct LoadedModule;
 class ModuleTable final
 {
 public:
-    static ModuleTable& GetInstance()
+    static ModuleTable& get_instance()
     {
-        static ModuleTable Instance;
-        return Instance;
+        static ModuleTable instance;
+        return instance;
     }
 
     /* Load the module in the file at path, its init handed params -- what
        insmod's line had after the path, "" for none: the module's to take
        or refuse. What goes wrong is said on out. */
-    Stdlib::Error LoadFile(const char* path, const char* params, Stdlib::Printer& out);
+    stdlib::Error load_file(const char* path, const char* params, stdlib::Printer& out);
 
     /* Load a module from an image in memory, 8-byte aligned, its init
        handed params. The image is only read, and not needed once this
        returns. */
-    Stdlib::Error Load(const void* image, ulong size, const char* params, Stdlib::Printer& out);
+    stdlib::Error load(const void* image, ulong size, const char* params, stdlib::Printer& out);
 
-    Stdlib::Error Unload(const char* name, Stdlib::Printer& out);
+    stdlib::Error unload(const char* name, stdlib::Printer& out);
 
     /* Unload every module that can be, newest first. For the shutdown path,
        while the services a module's exit may use -- files, block I/O, the
        soft IRQs it completes through -- still run. A module another task is
        still loading or unloading is left to it. */
-    void UnloadAll();
+    void unload_all();
 
     /* insmod and rmmod: LoadFile or Unload in a task of its own, waited for
        for at most ShellWaitMs. What it says is printed on out if it is done
@@ -68,34 +68,34 @@ public:
        module loading or unloading meanwhile -- and the kernel log says how
        it ended. insmod's args are the path, its first word, and the
        module's parameters, the rest of the line. */
-    void StartLoad(const char* args, Stdlib::Printer& out);
-    void StartUnload(const char* name, Stdlib::Printer& out);
+    void start_load(const char* args, stdlib::Printer& out);
+    void start_unload(const char* name, stdlib::Printer& out);
 
-    bool IsLoaded(const char* name);
+    bool is_loaded(const char* name);
 
     /* lsmod: a line per module */
-    void Dump(Stdlib::Printer& out);
+    void dump(stdlib::Printer& out);
 
     /* addr as "function+0xoff [module]" into buf when it is inside a loaded
        module -- copied, since the module may go the moment this returns.
        Never waits, so a panic may call it: false if the table is busy.
        returnAddress: addr is a return address, named by the call before it
        (SymbolTable::DescribeReturn); the offset is still addr's. */
-    bool Describe(ulong addr, bool returnAddress, char* buf, ulong size);
+    bool describe(ulong addr, bool return_address, char* buf, ulong size);
 
     /* The loaded modules, "name base+size" each, into buf for the panic
        report. Never waits either; false if there are none, or no telling. */
-    bool DescribeAll(char* buf, ulong size);
+    bool describe_all(char* buf, ulong size);
 
     /* The longest module name: kmod's NAME_LEN, less the NUL */
-    static const ulong NameMax = 31;
-    static const ulong PathMax = 255;
+    static const ulong NAME_LEN_MAX = 31;
+    static const ulong PATH_LEN_MAX = 255;
     /* The longest a module's parameters may be, as insmod gives them */
-    static const ulong ParamsMax = 255;
+    static const ulong PARAMS_MAX = 255;
 
     /* How long insmod and rmmod wait for their task before they leave it to
        finish on its own */
-    static const ulong ShellWaitMs = 5000;
+    static const ulong SHELL_WAIT_MS = 5000;
 
 private:
     ModuleTable();
@@ -105,15 +105,15 @@ private:
     ModuleTable& operator=(const ModuleTable& other) = delete;
     ModuleTable& operator=(ModuleTable&& other) = delete;
 
-    void StartJob(bool unload, const char* arg, const char* params, Stdlib::Printer& out);
-    LoadedModule* FindLocked(const char* name);
-    void Remove(LoadedModule* module);
+    void start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out);
+    LoadedModule* find_locked(const char* name);
+    void remove(LoadedModule* module);
 
     /* Guards List and each module's phase. Held only for a lookup or a
        change of phase: never across a module's init or exit, an allocation,
        or printing. Not watched: a panic may be the first to want it. */
-    RawSpinLock Lock;
-    Stdlib::ListEntry List;
+    RawSpinLock lock_;
+    stdlib::ListEntry list_;
 };
 
 }

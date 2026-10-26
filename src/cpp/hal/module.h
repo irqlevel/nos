@@ -6,10 +6,10 @@
    CPU: which ELF machine it is, and what each of its dynamic relocation types
    asks for. A module is a shared object whose static relocations the linker
    has already resolved, so there are few of them. Defined per arch. */
-namespace Hal
+namespace hal
 {
 
-u16 ModuleElfMachine();
+u16 module_elf_machine();
 
 enum class ModuleReloc
 {
@@ -19,6 +19,6 @@ enum class ModuleReloc
     Unsupported,
 };
 
-ModuleReloc ClassifyModuleReloc(u32 type);
+ModuleReloc classify_module_reloc(u32 type);
 
 }

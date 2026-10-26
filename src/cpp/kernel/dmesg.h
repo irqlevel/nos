@@ -7,19 +7,19 @@
 #include <lib/printer.h>
 #include <mm/block_allocator.h>
 
-namespace Kernel
+namespace kernel
 {
 
 struct DmesgMsg final
 {
-    char Str[256 - sizeof(Stdlib::ListEntry) - sizeof(Atomic)];
-    Stdlib::ListEntry ListEntry;
-    Atomic Usage;
+    char str[256 - sizeof(stdlib::ListEntry) - sizeof(Atomic)];
+    stdlib::ListEntry list_entry;
+    Atomic usage;
 
-    void Init()
+    void init()
     {
-        ListEntry.Init();
-        Usage.Set(0);
+        list_entry.init();
+        usage.set(0);
     }
 };
 
@@ -29,17 +29,17 @@ class Dmesg final
 {
 public:
 
-    static Dmesg& GetInstance()
+    static Dmesg& get_instance()
     {
-        static Dmesg Instance;
-        return Instance;
+        static Dmesg instance;
+        return instance;
     }
 
-    bool Setup();
+    bool setup();
 
-    PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args);
-    PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...);
-    void PrintString(const char *s);
+    PRINTF_FORMAT(2, 0) void v_printf(const char *fmt, va_list args);
+    PRINTF_FORMAT(2, 3) void printf(const char *fmt, ...);
+    void print_string(const char *s);
 
     /* Print the log. lastLines == 0 is the whole of it; otherwise only the
        newest lastLines messages, found by walking back from the tail. filter,
@@ -49,32 +49,32 @@ public:
        kilobytes and drops everything past that, so a dump from the head of a
        log that has been growing for an hour returns the first minute of boot
        and nothing else. */
-    void Dump(Stdlib::Printer& printer, ulong lastLines = 0,
+    void dump(stdlib::Printer& printer, ulong last_lines = 0,
               const char* filter = nullptr);
 
     /* Step a walk one message towards the tail (Next) or the head (Prev).
        nullptr starts at the head resp. the tail; the returned message is
        pinned so VPrintf cannot recycle it under the walk, and the step
        releases the message it came from. */
-    DmesgMsg* Next(DmesgMsg* current);
-    DmesgMsg* Prev(DmesgMsg* current);
+    DmesgMsg* next(DmesgMsg* current);
+    DmesgMsg* prev(DmesgMsg* current);
 
     /* Release the message a walk is standing on. A walk that stops before it
        runs off the end must call this: a pinned message is skipped by the
        recycler forever, so an abandoned pin permanently costs the log a slot. */
-    void Release(DmesgMsg* msg);
+    void release(DmesgMsg* msg);
 
     /* Messages the log no longer has: recycled to make room, or dropped. */
-    ulong GetLost();
+    ulong get_lost();
 
-    void Reset();
+    void reset();
 
     /* The list cannot hold more messages than the buffer has slots, so a walk
        that visits more than this is not walking a log any more -- it is
        following a tail another CPU keeps extending, and it is not obliged to
        ever end. Every walk is capped here. */
-    static const ulong BufSize = 128 * Const::PageSize;
-    static const ulong MaxMsgs = BufSize / sizeof(DmesgMsg);
+    static const ulong BUF_SIZE = 128 * consts::PAGE_SIZE;
+    static const ulong MAX_MSGS = BUF_SIZE / sizeof(DmesgMsg);
 
 private:
     Dmesg();
@@ -87,26 +87,26 @@ private:
 
     /* The message a lastLines dump starts printing at, pinned, or nullptr
        when the log is empty. */
-    DmesgMsg* TailStart(ulong lastLines);
+    DmesgMsg* tail_start(ulong last_lines);
 
     /* How many times VPrintf retries when the buffer is full and every listed
        message is pinned by a reader. Retrying is a bet that a reader steps on
        within the next few instructions; past that it is an unbounded spin in
        the trace path, which costs a CPU to save one line of log. */
-    static const ulong MaxRecycleRetries = 16;
+    static const ulong MAX_RECYCLE_RETRIES = 16;
 
-    char Buf[BufSize]  __attribute__((aligned(sizeof(DmesgMsg))));
+    char buf_[BUF_SIZE]  __attribute__((aligned(sizeof(DmesgMsg))));
 
-    Mm::BlockAllocatorImpl MsgBuf;
+    mm::BlockAllocatorImpl msg_buf_;
 
-    Stdlib::ListEntry MsgList;
+    stdlib::ListEntry msg_list_;
 
-    SpinLock Lock;
+    SpinLock lock_;
 
-    volatile bool Active;
+    volatile bool active_;
 
     /* Guarded by Lock. */
-    ulong Lost;
+    ulong lost_;
 };
 
 }

@@ -34,10 +34,10 @@
 #include "version_gen.h"
 #include "dmesg.h"
 
-static const ulong RustAllocTag = 'rust';
+static const ulong RUST_ALLOC_TAG = 'rust';
 
 /* kernel_printer_write hands a Printer at most this much at a time */
-static const unsigned long PrinterChunkSize = 128;
+static const unsigned long PRINTER_CHUNK_SIZE = 128;
 
 /* Longer than any net device's name: VirtioNet's are at most 7 */
 
@@ -48,11 +48,11 @@ static const unsigned long PrinterChunkSize = 128;
    line is copied through a buffer this long on the stack of the task that
    dispatches it -- an SSH session's or the UDP shell's, 64 KiB each. The UDP
    shell's own datagrams stay at its CMD_MAX. */
-static const unsigned long DispatchLineMax = 1023;
+static const unsigned long DISPATCH_LINE_MAX = 1023;
 
 /* kernel_cmd_dispatch: how much of a command's output waits in memory for a
    moment it may be sent */
-static const unsigned long SinkBufferSize = 64 * 1024;
+static const unsigned long SINK_BUFFER_SIZE = 64 * 1024;
 
 /* What a command prints, for Rust -- an SSH session's channel -- instead of
    a console. A command may print holding a spinlock with interrupts off
@@ -64,50 +64,50 @@ static const unsigned long SinkBufferSize = 64 * 1024;
    seen as it prints while one printing everything at once goes out after it
    returns, its locks let go; and whatever is left when it has. What does
    not fit while nothing may be sent is dropped, and said so at the end. */
-class SinkPrinter final : public Stdlib::Printer
+class SinkPrinter final : public stdlib::Printer
 {
 public:
     typedef void (*SinkFn)(void* ctx, const unsigned char* buf, unsigned long len);
     typedef long (*SourceFn)(void* ctx, unsigned char* buf, unsigned long len,
-        unsigned long long timeoutNs);
-    typedef bool (*TerminalFn)(void* ctx, Stdlib::TerminalInfo* info);
+        unsigned long long timeout_ns);
+    typedef bool (*TerminalFn)(void* ctx, stdlib::TerminalInfo* info);
 
     SinkPrinter(SinkFn fn, SourceFn src, TerminalFn term, void* ctx, unsigned char* buf, unsigned long size)
-        : Fn(fn)
-        , Src(src)
-        , Term(term)
-        , Ctx(ctx)
-        , Buf(buf)
-        , Size(size)
-        , Len(0)
-        , Oldest(0)
-        , Dropped(0)
+        : fn_(fn)
+        , src_(src)
+        , term_(term)
+        , ctx_(ctx)
+        , buf_(buf)
+        , size_(size)
+        , len_(0)
+        , oldest_(0)
+        , dropped_(0)
     {
     }
 
-    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
-        VPrintf(fmt, args);
+        v_printf(fmt, args);
         va_end(args);
     }
 
-    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void v_printf(const char *fmt, va_list args) override
     {
-        char text[FormatMax];
-        if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
+        char text[FORMAT_MAX];
+        if (stdlib::vsn_printf(text, sizeof(text), fmt, args) < 0)
             return;
-        Put(text);
+        put(text);
     }
 
-    virtual void PrintString(const char *s) override
+    virtual void print_string(const char *s) override
     {
         if (s != nullptr)
-            Put(s);
+            put(s);
     }
 
-    virtual void Backspace() override
+    virtual void backspace() override
     {
     }
 
@@ -116,93 +116,93 @@ public:
        line end to send it on its way, and a command reading its answer must
        not leave the question waiting in Buf. Not where the caller may not
        block: the source waits for the network. */
-    virtual long ReadInput(unsigned char* buf, unsigned long len, unsigned long long timeoutNs) override
+    virtual long read_input(unsigned char* buf, unsigned long len, unsigned long long timeout_ns) override
     {
-        if (Src == nullptr || buf == nullptr || len == 0 || !Kernel::PreemptCanBlock())
+        if (src_ == nullptr || buf == nullptr || len == 0 || !kernel::preempt_can_block())
             return -1;
 
-        Flush();
-        return Src(Ctx, buf, len, timeoutNs);
+        flush();
+        return src_(ctx_, buf, len, timeout_ns);
     }
 
     /* From the session's own, for a command that asks: the session keeps
        it under a lock that sleeps, so not where the caller may not */
-    virtual bool Terminal(Stdlib::TerminalInfo& info) override
+    virtual bool terminal(stdlib::TerminalInfo& info) override
     {
-        if (Term == nullptr || !Kernel::PreemptCanBlock())
+        if (term_ == nullptr || !kernel::preempt_can_block())
             return false;
 
-        return Term(Ctx, &info);
+        return term_(ctx_, &info);
     }
 
     /* The command has returned: what is left goes, and what was lost is
        said */
-    void Finish()
+    void finish()
     {
-        Flush();
-        if (Dropped == 0)
+        flush();
+        if (dropped_ == 0)
             return;
 
         char note[128];
-        Stdlib::BufferPrinter bp(note, sizeof(note));
-        bp.Printf("\n[%lu bytes of output dropped: printed with a lock held, past the %lu that can wait]\n",
-            Dropped, Size);
-        Fn(Ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
-        Dropped = 0;
+        stdlib::BufferPrinter bp(note, sizeof(note));
+        bp.printf("\n[%lu bytes of output dropped: printed with a lock held, past the %lu that can wait]\n",
+            dropped_, size_);
+        fn_(ctx_, reinterpret_cast<const unsigned char*>(note), stdlib::str_len(note));
+        dropped_ = 0;
     }
 
 private:
     SinkPrinter(const SinkPrinter& other) = delete;
     SinkPrinter& operator=(const SinkPrinter& other) = delete;
 
-    void Put(const char* s)
+    void put(const char* s)
     {
-        bool lineEnd = false;
+        bool line_end = false;
         for (; *s != '\0'; s++)
         {
-            if (Len == Size)
+            if (len_ == size_)
             {
-                if (!Kernel::PreemptCanBlock())
+                if (!kernel::preempt_can_block())
                 {
-                    Dropped++;
+                    dropped_++;
                     continue;
                 }
-                Flush();
+                flush();
             }
-            if (Len == 0)
-                Oldest = Kernel::GetBootTime().GetValue();
-            Buf[Len++] = (unsigned char)*s;
+            if (len_ == 0)
+                oldest_ = kernel::get_boot_time().get_value();
+            buf_[len_++] = (unsigned char)*s;
             if (*s == '\n' || *s == '\r')
-                lineEnd = true;
+                line_end = true;
         }
 
-        if (lineEnd && Len != 0 &&
-            Kernel::GetBootTime().GetValue() - Oldest >= FlushDelayNs &&
-            Kernel::PreemptCanBlock())
-            Flush();
+        if (line_end && len_ != 0 &&
+            kernel::get_boot_time().get_value() - oldest_ >= FLUSH_DELAY_NS &&
+            kernel::preempt_can_block())
+            flush();
     }
 
-    void Flush()
+    void flush()
     {
-        if (Len != 0)
+        if (len_ != 0)
         {
-            Fn(Ctx, Buf, Len);
-            Len = 0;
+            fn_(ctx_, buf_, len_);
+            len_ = 0;
         }
     }
 
-    static const unsigned long FormatMax = 512;
-    static const unsigned long long FlushDelayNs = 50ULL * 1000 * 1000;
+    static const unsigned long FORMAT_MAX = 512;
+    static const unsigned long long FLUSH_DELAY_NS = 50ULL * 1000 * 1000;
 
-    SinkFn Fn;
-    SourceFn Src;
-    TerminalFn Term;
-    void* Ctx;
-    unsigned char* Buf;
-    unsigned long Size;
-    unsigned long Len;
-    unsigned long long Oldest;
-    unsigned long Dropped;
+    SinkFn fn_;
+    SourceFn src_;
+    TerminalFn term_;
+    void* ctx_;
+    unsigned char* buf_;
+    unsigned long size_;
+    unsigned long len_;
+    unsigned long long oldest_;
+    unsigned long dropped_;
 };
 
 extern "C" {
@@ -213,38 +213,38 @@ void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long le
        every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
        forty thousand times in a few seconds of netblk load, each one
        formatted and logged from the handler. */
-    if (level > (unsigned int)Kernel::Tracer::GetInstance().GetLevel())
+    if (level > (unsigned int)kernel::Tracer::get_instance().get_level())
         return;
 
     char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
-    Stdlib::MemCpy(buf, msg, n);
+    stdlib::mem_cpy(buf, msg, n);
     buf[n] = '\0';
-    auto time = Kernel::GetBootTime();
-    Kernel::Tracer::GetInstance().Output("%u:%lu.%06lu:%s\n",
-        level, time.GetSecs(), time.GetUsecs(), buf);
+    auto time = kernel::get_boot_time();
+    kernel::Tracer::get_instance().output("%u:%lu.%06lu:%s\n",
+        level, time.get_secs(), time.get_usecs(), buf);
 }
 
 void* kernel_alloc(unsigned long size, unsigned long align)
 {
     if (align == 0 || (align & (align - 1)) != 0)
-        Panic("kernel_alloc: bad align %lu", align);
+        PANIC("kernel_alloc: bad align %lu", align);
 
     /* Mm::Alloc guarantees 8-byte alignment. AllocUninit: GlobalAlloc::alloc
        promises nothing about the contents, and alloc_zeroed zeroes them on
        the Rust side. */
     if (align <= 8)
-        return Kernel::Mm::AllocUninit(size, RustAllocTag);
+        return kernel::mm::alloc_uninit(size, RUST_ALLOC_TAG);
 
     /* Over-aligned (#[repr(align)] / SIMD types): over-allocate and stash
        the original pointer just below the aligned address for kernel_free */
     if (size > (unsigned long)-1 - align - sizeof(void*))
         return nullptr;
-    void* raw = Kernel::Mm::AllocUninit(size + align + sizeof(void*), RustAllocTag);
+    void* raw = kernel::mm::alloc_uninit(size + align + sizeof(void*), RUST_ALLOC_TAG);
     if (raw == nullptr)
         return nullptr;
     unsigned long aligned =
-        Stdlib::RoundUp((unsigned long)raw + sizeof(void*), align);
+        stdlib::round_up((unsigned long)raw + sizeof(void*), align);
     ((void**)aligned)[-1] = raw;
     return (void*)aligned;
 }
@@ -256,7 +256,7 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
         return;
     if (align > 8)
         ptr = ((void**)ptr)[-1];
-    Kernel::Mm::Free(ptr);
+    kernel::mm::free(ptr);
 }
 
 [[noreturn]] void kernel_panic(const unsigned char* msg, unsigned long len)
@@ -266,50 +266,50 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
        VsnPrintf below. */
     char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
-    Stdlib::MemCpy(buf, msg, n);
+    stdlib::mem_cpy(buf, msg, n);
     buf[n] = '\0';
-    Kernel::Panicker::GetInstance().DoPanic("RUST PANIC: %s\n", buf);
+    kernel::Panicker::get_instance().do_panic("RUST PANIC: %s\n", buf);
     /* Not an empty loop: one with no side effect is one the compiler may
        assume ends, and take out -- and this function would fall through
        into whatever follows it */
     for (;;)
-        Pause();
+        cpu_relax();
 }
 
 void kernel_get_boot_time(unsigned long* secs, unsigned long* usecs)
 {
     if (!secs || !usecs)
         return;
-    auto t = Kernel::GetBootTime();
-    *secs = t.GetSecs();
-    *usecs = t.GetUsecs();
+    auto t = kernel::get_boot_time();
+    *secs = t.get_secs();
+    *usecs = t.get_usecs();
 }
 
 unsigned long long kernel_get_boot_time_ns()
 {
-    return Kernel::GetBootTime().GetValue();
+    return kernel::get_boot_time().get_value();
 }
 
 unsigned long long kernel_cycle_counter_hz()
 {
-    return Hal::CycleCounterHz();
+    return hal::cycle_counter_hz();
 }
 
 /* The cycle counter as it stands: the TSC on x86-64, the generic timer's
    virtual count on arm64 */
 unsigned long long kernel_read_cycle_counter()
 {
-    return Hal::ReadCycleCounter();
+    return hal::read_cycle_counter();
 }
 
 unsigned long kernel_get_wall_time_secs()
 {
-    return Kernel::GetWallTimeSecs();
+    return kernel::get_wall_time_secs();
 }
 
 unsigned long kernel_mutex_create()
 {
-    Kernel::Mutex* m = Kernel::Mm::TAlloc<Kernel::Mutex, RustAllocTag>();
+    kernel::Mutex* m = kernel::mm::talloc<kernel::Mutex, RUST_ALLOC_TAG>();
     return (unsigned long)m;
 }
 
@@ -317,24 +317,24 @@ void kernel_mutex_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
-    Kernel::Mutex* m = reinterpret_cast<Kernel::Mutex*>(handle);
+    kernel::Mutex* m = reinterpret_cast<kernel::Mutex*>(handle);
     m->~Mutex();
-    Kernel::Mm::Free(m);
+    kernel::mm::free(m);
 }
 
 void kernel_mutex_lock(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Mutex*>(handle)->Lock();
+    reinterpret_cast<kernel::Mutex*>(handle)->lock();
 }
 
 void kernel_mutex_unlock(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Mutex*>(handle)->Unlock();
+    reinterpret_cast<kernel::Mutex*>(handle)->unlock();
 }
 
 unsigned long kernel_spinlock_create()
 {
-    Kernel::SpinLock* s = Kernel::Mm::TAlloc<Kernel::SpinLock, RustAllocTag>();
+    kernel::SpinLock* s = kernel::mm::talloc<kernel::SpinLock, RUST_ALLOC_TAG>();
     return (unsigned long)s;
 }
 
@@ -342,26 +342,26 @@ void kernel_spinlock_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
-    Kernel::SpinLock* s = reinterpret_cast<Kernel::SpinLock*>(handle);
+    kernel::SpinLock* s = reinterpret_cast<kernel::SpinLock*>(handle);
     s->~SpinLock();
-    Kernel::Mm::Free(s);
+    kernel::mm::free(s);
 }
 
 unsigned long long kernel_spinlock_lock(unsigned long handle)
 {
     unsigned long flags = 0;
-    reinterpret_cast<Kernel::SpinLock*>(handle)->Lock(flags);
+    reinterpret_cast<kernel::SpinLock*>(handle)->lock(flags);
     return (unsigned long long)flags;
 }
 
 void kernel_spinlock_unlock(unsigned long handle, unsigned long long flags)
 {
-    reinterpret_cast<Kernel::SpinLock*>(handle)->Unlock((unsigned long)flags);
+    reinterpret_cast<kernel::SpinLock*>(handle)->unlock((unsigned long)flags);
 }
 
 unsigned long kernel_waitgroup_create()
 {
-    Kernel::WaitGroup* wg = Kernel::Mm::TAlloc<Kernel::WaitGroup, RustAllocTag>();
+    kernel::WaitGroup* wg = kernel::mm::talloc<kernel::WaitGroup, RUST_ALLOC_TAG>();
     return (unsigned long)wg;
 }
 
@@ -369,29 +369,29 @@ void kernel_waitgroup_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
-    Kernel::WaitGroup* wg = reinterpret_cast<Kernel::WaitGroup*>(handle);
+    kernel::WaitGroup* wg = reinterpret_cast<kernel::WaitGroup*>(handle);
     wg->~WaitGroup();
-    Kernel::Mm::Free(wg);
+    kernel::mm::free(wg);
 }
 
 void kernel_waitgroup_add(unsigned long handle, long delta)
 {
-    reinterpret_cast<Kernel::WaitGroup*>(handle)->Add(delta);
+    reinterpret_cast<kernel::WaitGroup*>(handle)->add(delta);
 }
 
 void kernel_waitgroup_done(unsigned long handle)
 {
-    reinterpret_cast<Kernel::WaitGroup*>(handle)->Done();
+    reinterpret_cast<kernel::WaitGroup*>(handle)->done();
 }
 
 void kernel_waitgroup_wait(unsigned long handle)
 {
-    reinterpret_cast<Kernel::WaitGroup*>(handle)->Wait();
+    reinterpret_cast<kernel::WaitGroup*>(handle)->wait();
 }
 
 unsigned long kernel_event_create()
 {
-    Kernel::Event* e = Kernel::Mm::TAlloc<Kernel::Event, RustAllocTag>();
+    kernel::Event* e = kernel::mm::talloc<kernel::Event, RUST_ALLOC_TAG>();
     return (unsigned long)e;
 }
 
@@ -399,64 +399,64 @@ void kernel_event_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
-    Kernel::Event* e = reinterpret_cast<Kernel::Event*>(handle);
+    kernel::Event* e = reinterpret_cast<kernel::Event*>(handle);
     e->~Event();
-    Kernel::Mm::Free(e);
+    kernel::mm::free(e);
 }
 
 void kernel_event_wait(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Event*>(handle)->Wait();
+    reinterpret_cast<kernel::Event*>(handle)->wait();
 }
 
-int kernel_event_wait_for(unsigned long handle, unsigned long long timeoutNs)
+int kernel_event_wait_for(unsigned long handle, unsigned long long timeout_ns)
 {
-    return reinterpret_cast<Kernel::Event*>(handle)->WaitFor(timeoutNs) ? 1 : 0;
+    return reinterpret_cast<kernel::Event*>(handle)->wait_for(timeout_ns) ? 1 : 0;
 }
 
 void kernel_event_signal(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Event*>(handle)->Signal();
+    reinterpret_cast<kernel::Event*>(handle)->signal();
 }
 
 /* The name ps and top show for a task Rust starts: the caller's, a Rust
    string with no terminator, cut to the room a task has for one */
-static Kernel::Task* NewRustTask(const unsigned char* name, unsigned long nameLen)
+static kernel::Task* new_rust_task(const unsigned char* name, unsigned long name_len)
 {
-    char buf[Kernel::TaskNameLen];
-    const unsigned long len = Stdlib::Min(nameLen, (unsigned long)sizeof(buf) - 1);
+    char buf[kernel::TASK_NAME_LEN];
+    const unsigned long len = stdlib::min(name_len, (unsigned long)sizeof(buf) - 1);
 
-    Stdlib::MemCpy(buf, name, len);
+    stdlib::mem_cpy(buf, name, len);
     buf[len] = '\0';
     /* A name, not a format: a '%' in it is the caller's */
-    return Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>(buf);
+    return kernel::mm::talloc<kernel::Task, RUST_ALLOC_TAG>(buf);
 }
 
-unsigned long kernel_task_spawn(const unsigned char* name, unsigned long nameLen,
+unsigned long kernel_task_spawn(const unsigned char* name, unsigned long name_len,
     void (*func)(void*), void* ctx)
 {
-    Kernel::Task* t = NewRustTask(name, nameLen);
+    kernel::Task* t = new_rust_task(name, name_len);
     if (!t)
         return 0;
-    if (!t->Start(func, ctx))
+    if (!t->start(func, ctx))
     {
-        t->Put();
+        t->put();
         return 0;
     }
     return (unsigned long)t;
 }
 
-unsigned long kernel_task_spawn_on(const unsigned char* name, unsigned long nameLen,
+unsigned long kernel_task_spawn_on(const unsigned char* name, unsigned long name_len,
     void (*func)(void*), void* ctx,
     unsigned long affinity_mask)
 {
-    Kernel::Task* t = NewRustTask(name, nameLen);
+    kernel::Task* t = new_rust_task(name, name_len);
     if (!t)
         return 0;
-    t->SetCpuAffinity(affinity_mask);
-    if (!t->Start(func, ctx))
+    t->set_cpu_affinity(affinity_mask);
+    if (!t->start(func, ctx))
     {
-        t->Put();
+        t->put();
         return 0;
     }
     return (unsigned long)t;
@@ -464,42 +464,42 @@ unsigned long kernel_task_spawn_on(const unsigned char* name, unsigned long name
 
 void kernel_task_wait(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Task*>(handle)->Wait();
+    reinterpret_cast<kernel::Task*>(handle)->wait();
 }
 
 void kernel_task_set_stopping(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Task*>(handle)->SetStopping();
+    reinterpret_cast<kernel::Task*>(handle)->set_stopping();
 }
 
 /* Whether the calling task has been asked to stop: what a loop that runs
    for the life of the kernel checks each time round. */
 int kernel_task_stopping()
 {
-    Kernel::Task* task = Kernel::Task::GetCurrentTask();
-    return (task != nullptr && task->IsStopping()) ? 1 : 0;
+    kernel::Task* task = kernel::Task::get_current_task();
+    return (task != nullptr && task->is_stopping()) ? 1 : 0;
 }
 
 void kernel_task_put(unsigned long handle)
 {
-    reinterpret_cast<Kernel::Task*>(handle)->Put();
+    reinterpret_cast<kernel::Task*>(handle)->put();
 }
 
 void kernel_sleep_ns(unsigned long long ns)
 {
-    Kernel::Sleep((ulong)ns);
+    kernel::sleep((ulong)ns);
 }
 
 void kernel_task_yield_to_runnable()
 {
-    Kernel::YieldToRunnable();
+    kernel::yield_to_runnable();
 }
 
 /* The calling task -- a handle to compare with a TaskHandle's, never to
    wait on or put */
 unsigned long kernel_task_current()
 {
-    return (unsigned long)Kernel::Task::GetCurrentTask();
+    return (unsigned long)kernel::Task::get_current_task();
 }
 
 /* The same, but 0 rather than a complaint when the stack is not a task's.
@@ -507,17 +507,17 @@ unsigned long kernel_task_current()
    disk log above all, where the complaint would itself trace and recurse. */
 unsigned long kernel_task_current_or_none()
 {
-    return (unsigned long)Kernel::Task::TryGetCurrentTask();
+    return (unsigned long)kernel::Task::try_get_current_task();
 }
 
 unsigned int kernel_get_cpu_id()
 {
-    return (unsigned int)Kernel::GetCpu().GetIndex();
+    return (unsigned int)kernel::get_cpu().get_index();
 }
 
 unsigned int kernel_cpu_count()
 {
-    ulong mask = Kernel::CpuTable::GetInstance().GetRunningCpus();
+    ulong mask = kernel::CpuTable::get_instance().get_running_cpus();
     unsigned int count = 0;
     while (mask) { count += mask & 1; mask >>= 1; }
     return count;
@@ -525,21 +525,21 @@ unsigned int kernel_cpu_count()
 
 unsigned long kernel_cpu_online_mask()
 {
-    return Kernel::CpuTable::GetInstance().GetRunningCpus();
+    return kernel::CpuTable::get_instance().get_running_cpus();
 }
 
 } /* extern "C" */
 
 struct RustIPIAdapter
 {
-    void (*Handler)(void*);
-    void* Ctx;
+    void (*handler)(void*);
+    void* ctx;
 };
 
-static void RustIPITrampoline(void* actx, Kernel::Context*)
+static void rust_ipi_trampoline(void* actx, kernel::Context*)
 {
     auto* a = static_cast<RustIPIAdapter*>(actx);
-    a->Handler(a->Ctx);
+    a->handler(a->ctx);
 }
 
 extern "C" {
@@ -547,25 +547,25 @@ extern "C" {
 void kernel_cpu_run_on(unsigned int cpu,
     void (*handler)(void*), void* ctx)
 {
-    if (!handler || cpu >= (unsigned int)Kernel::MaxCpus)
+    if (!handler || cpu >= (unsigned int)kernel::MAX_CPUS)
         return;
 
     /* A CPU that never started or already exited will not drain its IPI task
        list; queueing would block Completion.Wait() forever (SendIPISelf
        silently refuses to send in those states). */
-    auto& target = Kernel::CpuTable::GetInstance().GetCpu(cpu);
-    ulong state = target.GetState();
-    if (!(state & Kernel::Cpu::StateRunning) ||
-        (state & Kernel::Cpu::StateExiting) || target.IsParked())
+    auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
+    ulong state = target.get_state();
+    if (!(state & kernel::Cpu::STATE_RUNNING) ||
+        (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
     {
-        Trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
+        trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
         return;
     }
 
     RustIPIAdapter a{handler, ctx};
-    Kernel::IPITask task(RustIPITrampoline, &a);
-    target.QueueIPITask(task);
+    kernel::IPITask task(rust_ipi_trampoline, &a);
+    target.queue_ipi_task(task);
 }
 
 /* An interrupt to `cpu`, now, and nothing waited for: what makes a vCPU that
@@ -576,10 +576,10 @@ void kernel_cpu_run_on(unsigned int cpu,
    too. A CPU that is not running holds it pending, or never sees it. */
 void kernel_cpu_kick(unsigned int cpu)
 {
-    if (cpu >= (unsigned int)Kernel::MaxCpus)
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
         return;
 
-    Hal::SendIpi(cpu, Kernel::CpuTable::IPIVector);
+    hal::send_ipi(cpu, kernel::CpuTable::IPI_VECTOR);
 }
 
 /* The notification of an interrupt posted for the vCPU running on `cpu`
@@ -588,17 +588,17 @@ void kernel_cpu_kick(unsigned int cpu)
    from any context. */
 void kernel_cpu_notify(unsigned int cpu)
 {
-    if (cpu >= (unsigned int)Kernel::MaxCpus)
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
         return;
 
-    Hal::SendIpi(cpu, Hal::PostedVector);
+    hal::send_ipi(cpu, hal::POSTED_VECTOR);
 }
 
 /* The vector kernel_cpu_notify sends: what a VMCS names as its
    posted-interrupt notification vector. */
 unsigned char kernel_posted_interrupt_vector(void)
 {
-    return Hal::PostedVector;
+    return hal::POSTED_VECTOR;
 }
 
 /* The CPU this runs on to take an interrupt from its own timer by
@@ -608,12 +608,12 @@ unsigned char kernel_posted_interrupt_vector(void)
    guest that computes without one. Nothing for a deadline that has passed:
    armed for one, the timer would fire at once, and again at every entry
    while the guest cannot take what is due. From any context. */
-void kernel_cpu_timer_at(unsigned long long deadlineNs)
+void kernel_cpu_timer_at(unsigned long long deadline_ns)
 {
-    ulong flags = Hal::IrqSave();
-    if ((ulong)deadlineNs > Kernel::GetBootTime().GetValue())
-        Kernel::CpuTable::GetInstance().GetCurrentCpu().LocalTimerWake((ulong)deadlineNs);
-    Hal::IrqRestore(flags);
+    ulong flags = hal::irq_save();
+    if ((ulong)deadline_ns > kernel::get_boot_time().get_value())
+        kernel::CpuTable::get_instance().get_current_cpu().local_timer_wake((ulong)deadline_ns);
+    hal::irq_restore(flags);
 }
 
 void* kernel_alloc_dma_pages(unsigned long count,
@@ -623,7 +623,7 @@ void* kernel_alloc_dma_pages(unsigned long count,
         return nullptr;
 
     unsigned long phys = 0;
-    void* p = Kernel::Mm::AllocMapPages((size_t)count, &phys);
+    void* p = kernel::mm::alloc_map_pages((size_t)count, &phys);
     if (!p)
     {
         *phys_out = 0;
@@ -632,14 +632,14 @@ void* kernel_alloc_dma_pages(unsigned long count,
     }
 
     *phys_out = phys;
-    *actual_pages_out = (unsigned long)(1UL << Stdlib::Log2((size_t)count));
+    *actual_pages_out = (unsigned long)(1UL << stdlib::log2((size_t)count));
     return p;
 }
 
 void kernel_free_dma_pages(void* ptr)
 {
     if (ptr)
-        Kernel::Mm::UnmapFreePages(ptr);
+        kernel::mm::unmap_free_pages(ptr);
 }
 
 void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
@@ -647,8 +647,8 @@ void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
     if (num_pages == 0)
         return nullptr;
 
-    ulong size = num_pages * Const::PageSize;
-    ulong va = Kernel::Mm::PageTable::GetInstance().MapMmioRegion(phys_base, size);
+    ulong size = num_pages * consts::PAGE_SIZE;
+    ulong va = kernel::mm::PageTable::get_instance().map_mmio_region(phys_base, size);
     if (va == 0)
         return nullptr;
     return (void*)va;
@@ -667,48 +667,48 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 {
     if (!virt_addr)
         return 0;
-    return Kernel::Mm::PageTable::GetInstance().VirtToPhys((ulong)virt_addr);
+    return kernel::mm::PageTable::get_instance().virt_to_phys((ulong)virt_addr);
 }
 
 /* ---- Frames: pages of RAM mapped nowhere (kcore::frame) ---- */
 
 unsigned long kernel_frame_alloc()
 {
-    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    auto& pt = kernel::mm::PageTable::get_instance();
     /* AllocPageKeeping zeroes what it hands out, through the temp map, as
        AllocPage does; it leaves the kernel its reserve (GetKernelReservePages). */
-    Kernel::Mm::Page* page = pt.AllocPageKeeping(pt.GetKernelReservePages());
-    return page ? page->GetPhyAddress() : 0;
+    kernel::mm::Page* page = pt.alloc_page_keeping(pt.get_kernel_reserve_pages());
+    return page ? page->get_phy_address() : 0;
 }
 
 /* A block of the huge pool, zeroed: its address, or 0 when the pool has
    none free -- or is not there, hugepages= not given. */
 unsigned long kernel_frame_alloc_huge()
 {
-    return Kernel::Mm::PageTable::GetInstance().AllocHugeFrame();
+    return kernel::mm::PageTable::get_instance().alloc_huge_frame();
 }
 
 /* Back into the pool: a panic for an address that is no block of it, or
    one back already. */
 void kernel_frame_free_huge(unsigned long phys)
 {
-    Kernel::Mm::PageTable::GetInstance().FreeHugeFrame(phys);
+    kernel::mm::PageTable::get_instance().free_huge_frame(phys);
 }
 
 /* The pool's blocks, and how many of them are free. */
 unsigned long kernel_frame_huge_blocks()
 {
-    return Kernel::Mm::PageTable::GetInstance().GetHugePoolBlocks();
+    return kernel::mm::PageTable::get_instance().get_huge_pool_blocks();
 }
 
 unsigned long kernel_frame_huge_free()
 {
-    return Kernel::Mm::PageTable::GetInstance().GetHugePoolFree();
+    return kernel::mm::PageTable::get_instance().get_huge_pool_free();
 }
 
 void kernel_frame_free(unsigned long phys)
 {
-    Kernel::Mm::PageTable::GetInstance().FreeFrame(phys);
+    kernel::mm::PageTable::get_instance().free_frame(phys);
 }
 
 /* Copy between a frame and the caller's memory through this CPU's frame
@@ -730,47 +730,47 @@ void kernel_frame_free(unsigned long phys)
    through a volatile pointer, with a MemCpy call for each word on the
    caller's side: 512 calls a page, and two thirds of a busy guest's vCPU
    while it wrote to its disk.) */
-static int FrameCopy(unsigned long phys, unsigned long offset,
+static int frame_copy(unsigned long phys, unsigned long offset,
     unsigned char* buf, const unsigned char* data, unsigned long len)
 {
     if (len == 0)
         return 0;
     if ((buf == nullptr) == (data == nullptr))
         return -1;
-    if (offset >= Const::PageSize || len > Const::PageSize - offset)
+    if (offset >= consts::PAGE_SIZE || len > consts::PAGE_SIZE - offset)
         return -1;
 
-    auto& pt = Kernel::Mm::PageTable::GetInstance();
-    if (!pt.IsFrameAddress(phys))
+    auto& pt = kernel::mm::PageTable::get_instance();
+    if (!pt.is_frame_address(phys))
         return -1;
 
     /* Through this CPU's own slot of the window, which interrupts off makes
        the copy's alone: no lock, no slot to search for, no reference. */
-    ulong flags = Kernel::PreemptIrqSave();
-    ulong va = pt.MapFrameSlot(phys);
+    ulong flags = kernel::preempt_irq_save();
+    ulong va = pt.map_frame_slot(phys);
 
     /* Inside the page mapped at va: offset and len were checked above. */
     void* frame = reinterpret_cast<void*>(va + offset);
     if (data != nullptr)
-        Stdlib::MemCpy(frame, data, len);
+        stdlib::mem_cpy(frame, data, len);
     else
-        Stdlib::MemCpy(buf, frame, len);
+        stdlib::mem_cpy(buf, frame, len);
 
-    pt.UnmapFrameSlot(va);
-    Kernel::PreemptIrqRestore(flags);
+    pt.unmap_frame_slot(va);
+    kernel::preempt_irq_restore(flags);
     return 0;
 }
 
 int kernel_frame_read(unsigned long phys, unsigned long offset,
     unsigned char* buf, unsigned long len)
 {
-    return FrameCopy(phys, offset, buf, nullptr, len);
+    return frame_copy(phys, offset, buf, nullptr, len);
 }
 
 int kernel_frame_write(unsigned long phys, unsigned long offset,
     const unsigned char* data, unsigned long len)
 {
-    return FrameCopy(phys, offset, nullptr, data, len);
+    return frame_copy(phys, offset, nullptr, data, len);
 }
 
 /* One 16-bit word of a frame, loaded or stored whole: a single access,
@@ -784,38 +784,38 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
    says so. The same slot of the window as FrameCopy's, with preemption and
    interrupts off for the same reason. -1, and nothing done, for a word
    that is not an aligned one inside a page of RAM. */
-static bool FrameWordInside(unsigned long phys, unsigned long offset)
+static bool frame_word_inside(unsigned long phys, unsigned long offset)
 {
-    return offset < Const::PageSize && offset % sizeof(unsigned short) == 0
-        && Kernel::Mm::PageTable::GetInstance().IsFrameAddress(phys);
+    return offset < consts::PAGE_SIZE && offset % sizeof(unsigned short) == 0
+        && kernel::mm::PageTable::get_instance().is_frame_address(phys);
 }
 
 int kernel_frame_load16(unsigned long phys, unsigned long offset, unsigned short* value)
 {
-    if (value == nullptr || !FrameWordInside(phys, offset))
+    if (value == nullptr || !frame_word_inside(phys, offset))
         return -1;
 
-    auto& pt = Kernel::Mm::PageTable::GetInstance();
-    ulong flags = Kernel::PreemptIrqSave();
-    ulong va = pt.MapFrameSlot(phys);
+    auto& pt = kernel::mm::PageTable::get_instance();
+    ulong flags = kernel::preempt_irq_save();
+    ulong va = pt.map_frame_slot(phys);
     /* Aligned, inside the page mapped at va: checked above. */
     *value = __atomic_load_n(reinterpret_cast<unsigned short*>(va + offset), __ATOMIC_ACQUIRE);
-    pt.UnmapFrameSlot(va);
-    Kernel::PreemptIrqRestore(flags);
+    pt.unmap_frame_slot(va);
+    kernel::preempt_irq_restore(flags);
     return 0;
 }
 
 int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned short value)
 {
-    if (!FrameWordInside(phys, offset))
+    if (!frame_word_inside(phys, offset))
         return -1;
 
-    auto& pt = Kernel::Mm::PageTable::GetInstance();
-    ulong flags = Kernel::PreemptIrqSave();
-    ulong va = pt.MapFrameSlot(phys);
+    auto& pt = kernel::mm::PageTable::get_instance();
+    ulong flags = kernel::preempt_irq_save();
+    ulong va = pt.map_frame_slot(phys);
     __atomic_store_n(reinterpret_cast<unsigned short*>(va + offset), value, __ATOMIC_RELEASE);
-    pt.UnmapFrameSlot(va);
-    Kernel::PreemptIrqRestore(flags);
+    pt.unmap_frame_slot(va);
+    kernel::preempt_irq_restore(flags);
     return 0;
 }
 
@@ -828,22 +828,22 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
    allocated until kernel_frames_unmap has run: the mapping holds them by
    their address and nothing else. 0 when there are none or more than
    FramesMapMax, one is no frame, or no address is left. */
-static const unsigned long FramesMapMax = 4;
+static const unsigned long FRAMES_MAP_MAX = 4;
 
 unsigned long kernel_frames_map(const unsigned long* phys, unsigned long count)
 {
-    if (phys == nullptr || count == 0 || count > FramesMapMax)
+    if (phys == nullptr || count == 0 || count > FRAMES_MAP_MAX)
         return 0;
 
-    auto& pt = Kernel::Mm::PageTable::GetInstance();
-    ulong frames[FramesMapMax];
+    auto& pt = kernel::mm::PageTable::get_instance();
+    ulong frames[FRAMES_MAP_MAX];
     for (unsigned long i = 0; i < count; i++)
     {
-        if (!pt.IsFrameAddress(phys[i]))
+        if (!pt.is_frame_address(phys[i]))
             return 0;
         frames[i] = phys[i];
     }
-    return reinterpret_cast<unsigned long>(Kernel::Mm::MapPages(count, frames));
+    return reinterpret_cast<unsigned long>(kernel::mm::map_pages(count, frames));
 }
 
 /* A kernel_frames_map undone: `va` and `count` as it returned and was
@@ -851,27 +851,27 @@ unsigned long kernel_frames_map(const unsigned long* phys, unsigned long count)
    to answer, so it is never called with a spin lock held. */
 void kernel_frames_unmap(unsigned long va, unsigned long count)
 {
-    Kernel::Mm::UnmapPages(reinterpret_cast<void*>(va), count);
+    kernel::mm::unmap_pages(reinterpret_cast<void*>(va), count);
 }
 
 /* ---- Soft IRQ ---- */
 
 void kernel_softirq_raise(unsigned long type)
 {
-    Kernel::SoftIrq::GetInstance().Raise(type);
+    kernel::SoftIrq::get_instance().raise(type);
 }
 
 /* Whether that soft IRQ is already asked for. What lets a poll tell a pass
    it caused from one an interrupt caused. */
 int kernel_softirq_pending(unsigned long type)
 {
-    return Kernel::SoftIrq::GetInstance().IsPending(type) ? 1 : 0;
+    return kernel::SoftIrq::get_instance().is_pending(type) ? 1 : 0;
 }
 
 void kernel_softirq_register(unsigned long type,
     void (*handler)(void*), void* ctx)
 {
-    Kernel::SoftIrq::GetInstance().Register(type, handler, ctx);
+    kernel::SoftIrq::get_instance().register_handler(type, handler, ctx);
 }
 
 /* ---- PCI ---- */
@@ -891,19 +891,19 @@ struct RustPciDeviceInfo
     unsigned char irq_pin;
 };
 
-static void FillRustPciInfo(RustPciDeviceInfo* out, const Pci::DeviceInfo* dev)
+static void fill_rust_pci_info(RustPciDeviceInfo* out, const Pci::DeviceInfo* dev)
 {
-    out->bus = dev->Bus;
-    out->slot = dev->Slot;
-    out->func = dev->Func;
-    out->vendor = dev->Vendor;
-    out->device = dev->Device;
-    out->cls = dev->Class;
-    out->subclass = dev->SubClass;
-    out->prog_if = dev->ProgIF;
-    out->revision = dev->RevisionID;
-    out->irq_line = dev->InterruptLine;
-    out->irq_pin = dev->InterruptPin;
+    out->bus = dev->bus;
+    out->slot = dev->slot;
+    out->func = dev->func;
+    out->vendor = dev->vendor;
+    out->device = dev->device;
+    out->cls = dev->base_class;
+    out->subclass = dev->sub_class;
+    out->prog_if = dev->prog_if;
+    out->revision = dev->revision_id;
+    out->irq_line = dev->interrupt_line;
+    out->irq_pin = dev->interrupt_pin;
 }
 
 long kernel_pci_find_device(unsigned short vendor, unsigned short device,
@@ -911,13 +911,13 @@ long kernel_pci_find_device(unsigned short vendor, unsigned short device,
 {
     if (!out)
         return -1;
-    auto& pci = Pci::GetInstance();
-    for (unsigned long i = start_index; i < pci.GetDeviceCount(); i++)
+    auto& pci = Pci::get_instance();
+    for (unsigned long i = start_index; i < pci.get_device_count(); i++)
     {
-        auto* dev = pci.GetDevice(i);
-        if (dev && dev->Valid && dev->Vendor == vendor && dev->Device == device)
+        auto* dev = pci.get_device(i);
+        if (dev && dev->valid && dev->vendor == vendor && dev->device == device)
         {
-            FillRustPciInfo(out, dev);
+            fill_rust_pci_info(out, dev);
             return (long)i;
         }
     }
@@ -926,84 +926,84 @@ long kernel_pci_find_device(unsigned short vendor, unsigned short device,
 
 unsigned long kernel_pci_device_count()
 {
-    return Pci::GetInstance().GetDeviceCount();
+    return Pci::get_instance().get_device_count();
 }
 
 int kernel_pci_get_device(unsigned long index, RustPciDeviceInfo* out)
 {
     if (!out)
         return 0;
-    auto* dev = Pci::GetInstance().GetDevice(index);
-    if (!dev || !dev->Valid)
+    auto* dev = Pci::get_instance().get_device(index);
+    if (!dev || !dev->valid)
         return 0;
-    FillRustPciInfo(out, dev);
+    fill_rust_pci_info(out, dev);
     return 1;
 }
 
 unsigned int kernel_pci_get_bar(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned char bar)
 {
-    return Pci::GetInstance().GetBAR(bus, slot, func, bar);
+    return Pci::get_instance().get_bar(bus, slot, func, bar);
 }
 
 void kernel_pci_enable_bus_mastering(unsigned short bus, unsigned short slot,
     unsigned short func)
 {
-    Pci::GetInstance().EnableBusMastering(bus, slot, func);
+    Pci::get_instance().enable_bus_mastering(bus, slot, func);
 }
 
 unsigned char kernel_pci_find_capability(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned char cap_id, unsigned char start_offset)
 {
-    return Pci::GetInstance().FindCapability(bus, slot, func, cap_id, start_offset);
+    return Pci::get_instance().find_capability(bus, slot, func, cap_id, start_offset);
 }
 
 unsigned char kernel_pci_read_config8(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset)
 {
-    return Pci::GetInstance().ReadByte(bus, slot, func, offset);
+    return Pci::get_instance().read_byte(bus, slot, func, offset);
 }
 
 unsigned short kernel_pci_read_config16(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset)
 {
-    return Pci::GetInstance().ReadWord(bus, slot, func, offset);
+    return Pci::get_instance().read_word(bus, slot, func, offset);
 }
 
 unsigned int kernel_pci_read_config32(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset)
 {
-    return Pci::GetInstance().ReadDword(bus, slot, func, offset);
+    return Pci::get_instance().read_dword(bus, slot, func, offset);
 }
 
 void kernel_pci_write_config8(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset, unsigned char val)
 {
-    Pci::GetInstance().WriteByte(bus, slot, func, offset, val);
+    Pci::get_instance().write_byte(bus, slot, func, offset, val);
 }
 
 void kernel_pci_write_config16(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset, unsigned short val)
 {
-    Pci::GetInstance().WriteWord(bus, slot, func, offset, val);
+    Pci::get_instance().write_word(bus, slot, func, offset, val);
 }
 
 void kernel_pci_write_config32(unsigned short bus, unsigned short slot,
     unsigned short func, unsigned short offset, unsigned int val)
 {
-    Pci::GetInstance().WriteDword(bus, slot, func, offset, val);
+    Pci::get_instance().write_dword(bus, slot, func, offset, val);
 }
 
 /* ---- MSI-X ---- */
 
-static Pci::DeviceInfo* FindPciDevByBdf(unsigned short bus, unsigned short slot,
+static Pci::DeviceInfo* find_pci_dev_by_bdf(unsigned short bus, unsigned short slot,
     unsigned short func)
 {
-    auto& pci = Pci::GetInstance();
-    for (ulong i = 0; i < pci.GetDeviceCount(); i++)
+    auto& pci = Pci::get_instance();
+    for (ulong i = 0; i < pci.get_device_count(); i++)
     {
-        auto* d = pci.GetDevice(i);
-        if (d && d->Valid && d->Bus == bus && d->Slot == slot && d->Func == func)
+        auto* d = pci.get_device(i);
+        if (d && d->valid && d->bus == bus && d->slot == slot && d->func == func)
             return d;
     }
     return nullptr;
@@ -1012,18 +1012,18 @@ static Pci::DeviceInfo* FindPciDevByBdf(unsigned short bus, unsigned short slot,
 unsigned long kernel_msix_create(unsigned short bus, unsigned short slot,
     unsigned short func, const unsigned long* mapped_bars)
 {
-    auto* dev = FindPciDevByBdf(bus, slot, func);
+    auto* dev = find_pci_dev_by_bdf(bus, slot, func);
     if (!dev)
         return 0;
 
-    auto* t = Kernel::Mm::TAlloc<Kernel::MsixTable, RustAllocTag>();
+    auto* t = kernel::mm::talloc<kernel::MsixTable, RUST_ALLOC_TAG>();
     if (!t)
         return 0;
 
-    if (!t->Setup(dev, mapped_bars))
+    if (!t->setup(dev, mapped_bars))
     {
         t->~MsixTable();
-        Kernel::Mm::Free(t);
+        kernel::mm::free(t);
         return 0;
     }
     return (unsigned long)t;
@@ -1033,149 +1033,149 @@ void kernel_msix_destroy(unsigned long handle)
 {
     if (handle == 0)
         return;
-    auto* t = reinterpret_cast<Kernel::MsixTable*>(handle);
+    auto* t = reinterpret_cast<kernel::MsixTable*>(handle);
     t->~MsixTable();
-    Kernel::Mm::Free(t);
+    kernel::mm::free(t);
 }
 
 void kernel_msix_mask(unsigned long handle, unsigned short index)
 {
     if (handle == 0)
         return;
-    reinterpret_cast<Kernel::MsixTable*>(handle)->Mask(index);
+    reinterpret_cast<kernel::MsixTable*>(handle)->mask(index);
 }
 
 void kernel_msix_unmask(unsigned long handle, unsigned short index)
 {
     if (handle == 0)
         return;
-    reinterpret_cast<Kernel::MsixTable*>(handle)->Unmask(index);
+    reinterpret_cast<kernel::MsixTable*>(handle)->unmask(index);
 }
 
 unsigned short kernel_msix_table_size(unsigned long handle)
 {
     if (handle == 0)
         return 0;
-    return reinterpret_cast<Kernel::MsixTable*>(handle)->GetTableSize();
+    return reinterpret_cast<kernel::MsixTable*>(handle)->get_table_size();
 }
 
 int kernel_msix_is_ready(unsigned long handle)
 {
     if (handle == 0)
         return 0;
-    return reinterpret_cast<Kernel::MsixTable*>(handle)->IsReady() ? 1 : 0;
+    return reinterpret_cast<kernel::MsixTable*>(handle)->is_ready() ? 1 : 0;
 }
 
 } /* extern "C" */
 
 /* ---- Legacy (INTx) interrupts ---- */
 
-static const ulong RustIrqSlotCount = 8;
-static const u8 RustIrqVectorBase = 0x38;
+static const ulong RUST_IRQ_SLOT_COUNT = 8;
+static const u8 RUST_IRQ_VECTOR_BASE = 0x38;
 
 /* Every member initialised, so that the static table is too: a default
    constructor that left one indeterminate is not a constant expression, and
    the compiler then made a runtime constructor this kernel never runs. */
 struct RustIrqSlot
 {
-    void (*Handler)(void*) = nullptr;
-    void* Ctx = nullptr;
-    u8 Vector = 0;
-    bool Used = false;
-    Kernel::Atomic InFlight; /* ISRs currently executing Handler */
+    void (*handler)(void*) = nullptr;
+    void* ctx = nullptr;
+    u8 vector = 0;
+    bool used = false;
+    kernel::Atomic in_flight; /* ISRs currently executing Handler */
 };
 
-static RustIrqSlot RustIrqSlots[RustIrqSlotCount];
-static Kernel::RawRwSpinLock RustIrqLock;
+static RustIrqSlot rust_irq_slots[RUST_IRQ_SLOT_COUNT];
+static kernel::RawRwSpinLock rust_irq_lock;
 
-static Kernel::InterruptHandlerFn RustStubTable[RustIrqSlotCount] = {
-    RustInterruptStub0,
-    RustInterruptStub1,
-    RustInterruptStub2,
-    RustInterruptStub3,
-    RustInterruptStub4,
-    RustInterruptStub5,
-    RustInterruptStub6,
-    RustInterruptStub7,
+static kernel::InterruptHandlerFn rust_stub_table[RUST_IRQ_SLOT_COUNT] = {
+    rust_interrupt_stub0,
+    rust_interrupt_stub1,
+    rust_interrupt_stub2,
+    rust_interrupt_stub3,
+    rust_interrupt_stub4,
+    rust_interrupt_stub5,
+    rust_interrupt_stub6,
+    rust_interrupt_stub7,
 };
 
-class RustLegacyHandler : public Kernel::InterruptHandler
+class RustLegacyHandler : public kernel::InterruptHandler
 {
 public:
-    ulong SlotIndex;
+    ulong slot_index_;
 
-    void OnInterruptRegister(u8 irq, u8 vector) override
+    void on_interrupt_register(u8 irq, u8 vector) override
     {
         (void)irq;
-        RustIrqSlots[SlotIndex].Vector = vector;
+        rust_irq_slots[slot_index_].vector = vector;
     }
 
-    Kernel::InterruptHandlerFn GetHandlerFn() override
+    kernel::InterruptHandlerFn get_handler_fn() override
     {
-        return RustStubTable[SlotIndex];
+        return rust_stub_table[slot_index_];
     }
 
-    void OnInterrupt(Kernel::Context* ctx) override
+    void on_interrupt(kernel::Context* ctx) override
     {
         (void)ctx;
-        Kernel::Task* preempt = RustIrqLock.ReadLock();
-        auto handler = RustIrqSlots[SlotIndex].Handler;
-        auto uctx = RustIrqSlots[SlotIndex].Ctx;
+        kernel::Task* preempt = rust_irq_lock.read_lock();
+        auto handler = rust_irq_slots[slot_index_].handler;
+        auto uctx = rust_irq_slots[slot_index_].ctx;
         if (handler)
-            RustIrqSlots[SlotIndex].InFlight.Inc();
-        RustIrqLock.ReadUnlock(preempt);
+            rust_irq_slots[slot_index_].in_flight.inc();
+        rust_irq_lock.read_unlock(preempt);
         if (handler)
         {
             handler(uctx);
-            RustIrqSlots[SlotIndex].InFlight.Dec();
+            rust_irq_slots[slot_index_].in_flight.dec();
         }
     }
 };
 
-static char RustLegacyHandlersBuf[RustIrqSlotCount][sizeof(RustLegacyHandler)];
-static bool RustLegacyHandlersInit[RustIrqSlotCount];
+static char rust_legacy_handlers_buf[RUST_IRQ_SLOT_COUNT][sizeof(RustLegacyHandler)];
+static bool rust_legacy_handlers_init[RUST_IRQ_SLOT_COUNT];
 
-static RustLegacyHandler& GetLegacyHandler(ulong i)
+static RustLegacyHandler& get_legacy_handler(ulong i)
 {
-    if (!RustLegacyHandlersInit[i])
+    if (!rust_legacy_handlers_init[i])
     {
-        new (&RustLegacyHandlersBuf[i]) RustLegacyHandler();
-        RustLegacyHandlersInit[i] = true;
+        new (&rust_legacy_handlers_buf[i]) RustLegacyHandler();
+        rust_legacy_handlers_init[i] = true;
     }
-    return *reinterpret_cast<RustLegacyHandler*>(&RustLegacyHandlersBuf[i]);
+    return *reinterpret_cast<RustLegacyHandler*>(&rust_legacy_handlers_buf[i]);
 }
 
 extern "C" {
 
-void RustInterruptDispatch(Kernel::Context* ctx, int slot)
+void dispatch_rust_interrupt(kernel::Context* ctx, int slot)
 {
     (void)ctx;
 
     /* The legacy line, counted for the same reason as the MSI-X path below:
        the driver falls back to INTx when MSI-X is unavailable, and which of
        the two a card ended up on was not visible from the running machine. */
-    Kernel::InterruptStats::Inc(Kernel::IrqShared);
+    kernel::InterruptStats::inc(kernel::IrqShared);
 
-    if (slot < 0 || (ulong)slot >= RustIrqSlotCount)
+    if (slot < 0 || (ulong)slot >= RUST_IRQ_SLOT_COUNT)
     {
-        Hal::IrqEoi();
+        hal::irq_eoi();
         return;
     }
     /* InFlight is raised inside the read-locked section so unregister (which
        nulls Handler under the write lock) can wait out a mid-call ISR before
        its caller frees ctx. */
-    Kernel::Task* preempt = RustIrqLock.ReadLock();
-    auto handler = RustIrqSlots[slot].Handler;
-    auto uctx = RustIrqSlots[slot].Ctx;
+    kernel::Task* preempt = rust_irq_lock.read_lock();
+    auto handler = rust_irq_slots[slot].handler;
+    auto uctx = rust_irq_slots[slot].ctx;
     if (handler)
-        RustIrqSlots[slot].InFlight.Inc();
-    RustIrqLock.ReadUnlock(preempt);
+        rust_irq_slots[slot].in_flight.inc();
+    rust_irq_lock.read_unlock(preempt);
     if (handler)
     {
         handler(uctx);
-        RustIrqSlots[slot].InFlight.Dec();
+        rust_irq_slots[slot].in_flight.dec();
     }
-    Hal::IrqEoi();
+    hal::irq_eoi();
 }
 
 unsigned long kernel_interrupt_register_level(
@@ -1186,21 +1186,21 @@ unsigned long kernel_interrupt_register_level(
     if (!handler || !out_vector)
         return 0;
 
-    ulong flags = RustIrqLock.WriteLockIrqSave();
-    for (ulong i = 0; i < RustIrqSlotCount; i++)
+    ulong flags = rust_irq_lock.write_lock_irq_save();
+    for (ulong i = 0; i < RUST_IRQ_SLOT_COUNT; i++)
     {
-        if (!RustIrqSlots[i].Used)
+        if (!rust_irq_slots[i].used)
         {
-            RustIrqSlots[i].Handler = handler;
-            RustIrqSlots[i].Ctx = ctx;
-            RustIrqSlots[i].Used = true;
-            RustIrqSlots[i].Vector = 0;
+            rust_irq_slots[i].handler = handler;
+            rust_irq_slots[i].ctx = ctx;
+            rust_irq_slots[i].used = true;
+            rust_irq_slots[i].vector = 0;
 
-            auto& lh = GetLegacyHandler(i);
-            lh.SlotIndex = i;
+            auto& lh = get_legacy_handler(i);
+            lh.slot_index_ = i;
 
-            u8 vector = (u8)(RustIrqVectorBase + i);
-            Kernel::Interrupt::RegisterLevel(lh, irq_line, vector);
+            u8 vector = (u8)(RUST_IRQ_VECTOR_BASE + i);
+            kernel::Interrupt::register_level(lh, irq_line, vector);
 
             /* RegisterLevel is void and refuses silently (GSI owned by an
                edge handler, vector already claimed, shared list full). Its
@@ -1208,91 +1208,91 @@ unsigned long kernel_interrupt_register_level(
                means no IOAPIC pin was programmed -- roll the slot back
                instead of handing the driver a dead handle it would trust
                (NIC enabled, no interrupts ever delivered). */
-            if (RustIrqSlots[i].Vector == 0)
+            if (rust_irq_slots[i].vector == 0)
             {
-                RustIrqSlots[i].Handler = nullptr;
-                RustIrqSlots[i].Ctx = nullptr;
-                RustIrqSlots[i].Used = false;
-                RustIrqLock.WriteUnlockIrqRestore(flags);
-                Trace(0, "kernel_interrupt_register_level: irq %lu refused",
+                rust_irq_slots[i].handler = nullptr;
+                rust_irq_slots[i].ctx = nullptr;
+                rust_irq_slots[i].used = false;
+                rust_irq_lock.write_unlock_irq_restore(flags);
+                trace(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
                 return 0;
             }
 
-            *out_vector = RustIrqSlots[i].Vector;
-            RustIrqLock.WriteUnlockIrqRestore(flags);
+            *out_vector = rust_irq_slots[i].vector;
+            rust_irq_lock.write_unlock_irq_restore(flags);
             return i + 1;
         }
     }
-    RustIrqLock.WriteUnlockIrqRestore(flags);
+    rust_irq_lock.write_unlock_irq_restore(flags);
 
-    Trace(0, "kernel_interrupt_register_level: no free slots");
+    trace(0, "kernel_interrupt_register_level: no free slots");
     return 0;
 }
 
 void kernel_interrupt_unregister(unsigned long handle)
 {
-    if (handle == 0 || handle > RustIrqSlotCount)
+    if (handle == 0 || handle > RUST_IRQ_SLOT_COUNT)
         return;
     ulong i = handle - 1;
-    ulong flags = RustIrqLock.WriteLockIrqSave();
-    RustIrqSlots[i].Handler = nullptr;
-    RustIrqSlots[i].Ctx = nullptr;
-    RustIrqSlots[i].Used = false;
-    RustIrqSlots[i].Vector = 0;
-    RustIrqLock.WriteUnlockIrqRestore(flags);
+    ulong flags = rust_irq_lock.write_lock_irq_save();
+    rust_irq_slots[i].handler = nullptr;
+    rust_irq_slots[i].ctx = nullptr;
+    rust_irq_slots[i].used = false;
+    rust_irq_slots[i].vector = 0;
+    rust_irq_lock.write_unlock_irq_restore(flags);
 
     /* Wait out an ISR mid-call on another CPU: the caller may free ctx the
        moment we return. An ISR on this CPU cannot be mid-call here --
        interrupts run to completion. */
-    while (RustIrqSlots[i].InFlight.Get() != 0)
-        Pause();
+    while (rust_irq_slots[i].in_flight.get() != 0)
+        cpu_relax();
 }
 
 } /* extern "C" */
 
 /* ---- Periodic timers ---- */
 
-static const ulong RustTimerSlotCount = 8;
+static const ulong RUST_TIMER_SLOT_COUNT = 8;
 
 struct RustTimerSlot
 {
-    void (*Handler)(void*);
-    void* Ctx;
-    bool Active;
+    void (*handler)(void*);
+    void* ctx;
+    bool active;
 };
 
-static RustTimerSlot RustTimerSlots[RustTimerSlotCount];
-static Kernel::RawRwSpinLock RustTimerLock;
+static RustTimerSlot rust_timer_slots[RUST_TIMER_SLOT_COUNT];
+static kernel::RawRwSpinLock rust_timer_lock;
 
-class RustTimerAdapter : public Kernel::TimerCallback
+class RustTimerAdapter : public kernel::TimerCallback
 {
 public:
-    ulong SlotIndex;
+    ulong slot_index_;
 
-    void OnTick(Kernel::TimerCallback& callback) override
+    void on_tick(kernel::TimerCallback& callback) override
     {
         (void)callback;
-        Kernel::Task* preempt = RustTimerLock.ReadLock();
-        auto handler = RustTimerSlots[SlotIndex].Handler;
-        auto ctx = RustTimerSlots[SlotIndex].Ctx;
-        RustTimerLock.ReadUnlock(preempt);
+        kernel::Task* preempt = rust_timer_lock.read_lock();
+        auto handler = rust_timer_slots[slot_index_].handler;
+        auto ctx = rust_timer_slots[slot_index_].ctx;
+        rust_timer_lock.read_unlock(preempt);
         if (handler)
             handler(ctx);
     }
 };
 
-static char RustTimerAdaptersBuf[RustTimerSlotCount][sizeof(RustTimerAdapter)];
-static bool RustTimerAdaptersInit[RustTimerSlotCount];
+static char rust_timer_adapters_buf[RUST_TIMER_SLOT_COUNT][sizeof(RustTimerAdapter)];
+static bool rust_timer_adapters_init[RUST_TIMER_SLOT_COUNT];
 
-static RustTimerAdapter& GetTimerAdapter(ulong i)
+static RustTimerAdapter& get_timer_adapter(ulong i)
 {
-    if (!RustTimerAdaptersInit[i])
+    if (!rust_timer_adapters_init[i])
     {
-        new (&RustTimerAdaptersBuf[i]) RustTimerAdapter();
-        RustTimerAdaptersInit[i] = true;
+        new (&rust_timer_adapters_buf[i]) RustTimerAdapter();
+        rust_timer_adapters_init[i] = true;
     }
-    return *reinterpret_cast<RustTimerAdapter*>(&RustTimerAdaptersBuf[i]);
+    return *reinterpret_cast<RustTimerAdapter*>(&rust_timer_adapters_buf[i]);
 }
 
 extern "C" {
@@ -1304,39 +1304,39 @@ unsigned long kernel_timer_start(
     if (!handler || period_ns == 0)
         return 0;
 
-    ulong flags = RustTimerLock.WriteLockIrqSave();
-    for (ulong i = 0; i < RustTimerSlotCount; i++)
+    ulong flags = rust_timer_lock.write_lock_irq_save();
+    for (ulong i = 0; i < RUST_TIMER_SLOT_COUNT; i++)
     {
-        if (!RustTimerSlots[i].Active)
+        if (!rust_timer_slots[i].active)
         {
-            RustTimerSlots[i].Handler = handler;
-            RustTimerSlots[i].Ctx = ctx;
-            RustTimerSlots[i].Active = true;
+            rust_timer_slots[i].handler = handler;
+            rust_timer_slots[i].ctx = ctx;
+            rust_timer_slots[i].active = true;
 
-            auto& ta = GetTimerAdapter(i);
-            ta.SlotIndex = i;
+            auto& ta = get_timer_adapter(i);
+            ta.slot_index_ = i;
 
-            Stdlib::Time period(period_ns);
-            if (!Kernel::TimerTable::GetInstance().StartTimer(
+            stdlib::Time period(period_ns);
+            if (!kernel::TimerTable::get_instance().start_timer(
                     ta, period))
             {
-                RustTimerSlots[i].Active = false;
-                RustTimerSlots[i].Handler = nullptr;
-                RustTimerSlots[i].Ctx = nullptr;
-                RustTimerLock.WriteUnlockIrqRestore(flags);
+                rust_timer_slots[i].active = false;
+                rust_timer_slots[i].handler = nullptr;
+                rust_timer_slots[i].ctx = nullptr;
+                rust_timer_lock.write_unlock_irq_restore(flags);
                 return 0;
             }
-            RustTimerLock.WriteUnlockIrqRestore(flags);
+            rust_timer_lock.write_unlock_irq_restore(flags);
             return i + 1;
         }
     }
-    RustTimerLock.WriteUnlockIrqRestore(flags);
+    rust_timer_lock.write_unlock_irq_restore(flags);
     return 0;
 }
 
 void kernel_timer_stop(unsigned long handle)
 {
-    if (handle == 0 || handle > RustTimerSlotCount)
+    if (handle == 0 || handle > RUST_TIMER_SLOT_COUNT)
         return;
     ulong i = handle - 1;
 
@@ -1345,111 +1345,111 @@ void kernel_timer_stop(unsigned long handle)
        needs RustTimerLock in read mode; holding the write lock across that wait
        would deadlock (AB/BA). Clearing Handler first makes a racing OnTick a
        no-op once it acquires the read lock. */
-    ulong flags = RustTimerLock.WriteLockIrqSave();
-    RustTimerSlots[i].Handler = nullptr;
-    RustTimerSlots[i].Ctx = nullptr;
-    RustTimerSlots[i].Active = false;
-    RustTimerLock.WriteUnlockIrqRestore(flags);
+    ulong flags = rust_timer_lock.write_lock_irq_save();
+    rust_timer_slots[i].handler = nullptr;
+    rust_timer_slots[i].ctx = nullptr;
+    rust_timer_slots[i].active = false;
+    rust_timer_lock.write_unlock_irq_restore(flags);
 
-    Kernel::TimerTable::GetInstance().StopTimer(GetTimerAdapter(i));
+    kernel::TimerTable::get_instance().stop_timer(get_timer_adapter(i));
 }
 
 } /* extern "C" */
 
 /* ---- MSI-X callback slots ---- */
 
-static const ulong RustMsixSlotCount = 32;
+static const ulong RUST_MSIX_SLOT_COUNT = 32;
 
 /* Every member initialised, as RustIrqSlot's are. */
 struct RustMsixSlot
 {
-    void (*Handler)(void*) = nullptr;
-    void* Ctx = nullptr;
-    bool Used = false;
-    Kernel::Atomic InFlight; /* ISRs currently executing Handler */
+    void (*handler)(void*) = nullptr;
+    void* ctx = nullptr;
+    bool used = false;
+    kernel::Atomic in_flight; /* ISRs currently executing Handler */
 };
 
-static RustMsixSlot RustMsixSlots[RustMsixSlotCount];
-static Kernel::RawRwSpinLock RustMsixLock;
+static RustMsixSlot rust_msix_slots[RUST_MSIX_SLOT_COUNT];
+static kernel::RawRwSpinLock rust_msix_lock;
 
-static Kernel::InterruptHandlerFn RustMsixStubTable[RustMsixSlotCount] = {
-    RustMsixStub0,
-    RustMsixStub1,
-    RustMsixStub2,
-    RustMsixStub3,
-    RustMsixStub4,
-    RustMsixStub5,
-    RustMsixStub6,
-    RustMsixStub7,
-    RustMsixStub8,
-    RustMsixStub9,
-    RustMsixStub10,
-    RustMsixStub11,
-    RustMsixStub12,
-    RustMsixStub13,
-    RustMsixStub14,
-    RustMsixStub15,
-    RustMsixStub16,
-    RustMsixStub17,
-    RustMsixStub18,
-    RustMsixStub19,
-    RustMsixStub20,
-    RustMsixStub21,
-    RustMsixStub22,
-    RustMsixStub23,
-    RustMsixStub24,
-    RustMsixStub25,
-    RustMsixStub26,
-    RustMsixStub27,
-    RustMsixStub28,
-    RustMsixStub29,
-    RustMsixStub30,
-    RustMsixStub31,
+static kernel::InterruptHandlerFn rust_msix_stub_table[RUST_MSIX_SLOT_COUNT] = {
+    rust_msix_stub0,
+    rust_msix_stub1,
+    rust_msix_stub2,
+    rust_msix_stub3,
+    rust_msix_stub4,
+    rust_msix_stub5,
+    rust_msix_stub6,
+    rust_msix_stub7,
+    rust_msix_stub8,
+    rust_msix_stub9,
+    rust_msix_stub10,
+    rust_msix_stub11,
+    rust_msix_stub12,
+    rust_msix_stub13,
+    rust_msix_stub14,
+    rust_msix_stub15,
+    rust_msix_stub16,
+    rust_msix_stub17,
+    rust_msix_stub18,
+    rust_msix_stub19,
+    rust_msix_stub20,
+    rust_msix_stub21,
+    rust_msix_stub22,
+    rust_msix_stub23,
+    rust_msix_stub24,
+    rust_msix_stub25,
+    rust_msix_stub26,
+    rust_msix_stub27,
+    rust_msix_stub28,
+    rust_msix_stub29,
+    rust_msix_stub30,
+    rust_msix_stub31,
 };
 
-extern "C" void RustMsixDispatch(Kernel::Context* ctx, int slot);
+extern "C" void dispatch_rust_msix(kernel::Context* ctx, int slot);
 
-class RustMsixSlotHandler : public Kernel::InterruptHandler
+class RustMsixSlotHandler : public kernel::InterruptHandler
 {
 public:
-    ulong SlotIndex;
+    ulong slot_index_;
 
-    void OnInterruptRegister(u8 irq, u8 vector) override
+    void on_interrupt_register(u8 irq, u8 vector) override
     {
         (void)irq;
         (void)vector;
     }
 
-    Kernel::InterruptHandlerFn GetHandlerFn() override
+    kernel::InterruptHandlerFn get_handler_fn() override
     {
-        return RustMsixStubTable[SlotIndex];
+        return rust_msix_stub_table[slot_index_];
     }
 
     /* Object-based dispatch path (arm64 GIC/ITS LPIs). On x86 MSI-X goes
        through the IDT stub -> RustMsixDispatch instead, so this override is
        unused there. */
-    void OnInterrupt(Kernel::Context* ctx) override
+    void on_interrupt(kernel::Context* ctx) override
     {
-        RustMsixDispatch(ctx, (int)SlotIndex);
+        dispatch_rust_msix(ctx, (int)slot_index_);
     }
 };
 
-static char RustMsixSlotHandlersBuf[RustMsixSlotCount][sizeof(RustMsixSlotHandler)];
-static bool RustMsixSlotHandlersInit[RustMsixSlotCount];
+static char rust_msix_slot_handlers_buf[RUST_MSIX_SLOT_COUNT][sizeof(RustMsixSlotHandler)];
+static bool rust_msix_slot_handlers_init[RUST_MSIX_SLOT_COUNT];
 
-static RustMsixSlotHandler& GetMsixSlotHandler(ulong i)
+static RustMsixSlotHandler& get_msix_slot_handler(ulong i)
 {
-    if (!RustMsixSlotHandlersInit[i])
+    if (!rust_msix_slot_handlers_init[i])
     {
-        new (&RustMsixSlotHandlersBuf[i]) RustMsixSlotHandler();
-        RustMsixSlotHandlersInit[i] = true;
+        new (&rust_msix_slot_handlers_buf[i]) RustMsixSlotHandler();
+        rust_msix_slot_handlers_init[i] = true;
     }
-    return *reinterpret_cast<RustMsixSlotHandler*>(&RustMsixSlotHandlersBuf[i]);
+    return *reinterpret_cast<RustMsixSlotHandler*>(&rust_msix_slot_handlers_buf[i]);
 }
 
 extern "C" {
 
-void RustMsixDispatch(Kernel::Context* ctx, int slot)
+void dispatch_rust_msix(kernel::Context* ctx, int slot)
 {
     (void)ctx;
 
@@ -1459,26 +1459,26 @@ void RustMsixDispatch(Kernel::Context* ctx, int slot)
        thousand packets. Asking whether the card's interrupts had stopped was
        therefore unanswerable, which is most of why its receive stall took so
        long to corner. */
-    Kernel::InterruptStats::Inc(Kernel::IrqMsix);
+    kernel::InterruptStats::inc(kernel::IrqMsix);
 
-    if (slot < 0 || (ulong)slot >= RustMsixSlotCount)
+    if (slot < 0 || (ulong)slot >= RUST_MSIX_SLOT_COUNT)
     {
-        Hal::IrqEoi();
+        hal::irq_eoi();
         return;
     }
     /* Same in-flight discipline as RustInterruptDispatch */
-    Kernel::Task* preempt = RustMsixLock.ReadLock();
-    auto handler = RustMsixSlots[slot].Handler;
-    auto uctx = RustMsixSlots[slot].Ctx;
+    kernel::Task* preempt = rust_msix_lock.read_lock();
+    auto handler = rust_msix_slots[slot].handler;
+    auto uctx = rust_msix_slots[slot].ctx;
     if (handler)
-        RustMsixSlots[slot].InFlight.Inc();
-    RustMsixLock.ReadUnlock(preempt);
+        rust_msix_slots[slot].in_flight.inc();
+    rust_msix_lock.read_unlock(preempt);
     if (handler)
     {
         handler(uctx);
-        RustMsixSlots[slot].InFlight.Dec();
+        rust_msix_slots[slot].in_flight.dec();
     }
-    Hal::IrqEoi();
+    hal::irq_eoi();
 }
 
 unsigned long kernel_msix_register_handler(
@@ -1489,52 +1489,52 @@ unsigned long kernel_msix_register_handler(
     if (!handler || !out_vector || msix_handle == 0)
         return 0;
 
-    ulong flags = RustMsixLock.WriteLockIrqSave();
-    for (ulong i = 0; i < RustMsixSlotCount; i++)
+    ulong flags = rust_msix_lock.write_lock_irq_save();
+    for (ulong i = 0; i < RUST_MSIX_SLOT_COUNT; i++)
     {
-        if (!RustMsixSlots[i].Used)
+        if (!rust_msix_slots[i].used)
         {
-            RustMsixSlots[i].Handler = handler;
-            RustMsixSlots[i].Ctx = ctx;
-            RustMsixSlots[i].Used = true;
+            rust_msix_slots[i].handler = handler;
+            rust_msix_slots[i].ctx = ctx;
+            rust_msix_slots[i].used = true;
 
-            auto& mh = GetMsixSlotHandler(i);
-            mh.SlotIndex = i;
+            auto& mh = get_msix_slot_handler(i);
+            mh.slot_index_ = i;
 
-            auto* t = reinterpret_cast<Kernel::MsixTable*>(msix_handle);
-            u8 vector = t->EnableVector(msix_index, mh);
+            auto* t = reinterpret_cast<kernel::MsixTable*>(msix_handle);
+            u8 vector = t->enable_vector(msix_index, mh);
             if (vector == 0)
             {
-                RustMsixSlots[i].Handler = nullptr;
-                RustMsixSlots[i].Ctx = nullptr;
-                RustMsixSlots[i].Used = false;
-                RustMsixLock.WriteUnlockIrqRestore(flags);
+                rust_msix_slots[i].handler = nullptr;
+                rust_msix_slots[i].ctx = nullptr;
+                rust_msix_slots[i].used = false;
+                rust_msix_lock.write_unlock_irq_restore(flags);
                 return 0;
             }
             *out_vector = vector;
-            RustMsixLock.WriteUnlockIrqRestore(flags);
+            rust_msix_lock.write_unlock_irq_restore(flags);
             return i + 1;
         }
     }
-    RustMsixLock.WriteUnlockIrqRestore(flags);
-    Trace(0, "kernel_msix_register_handler: no free slots");
+    rust_msix_lock.write_unlock_irq_restore(flags);
+    trace(0, "kernel_msix_register_handler: no free slots");
     return 0;
 }
 
 void kernel_msix_unregister_handler(unsigned long handle)
 {
-    if (handle == 0 || handle > RustMsixSlotCount)
+    if (handle == 0 || handle > RUST_MSIX_SLOT_COUNT)
         return;
     ulong i = handle - 1;
-    ulong flags = RustMsixLock.WriteLockIrqSave();
-    RustMsixSlots[i].Handler = nullptr;
-    RustMsixSlots[i].Ctx = nullptr;
-    RustMsixSlots[i].Used = false;
-    RustMsixLock.WriteUnlockIrqRestore(flags);
+    ulong flags = rust_msix_lock.write_lock_irq_save();
+    rust_msix_slots[i].handler = nullptr;
+    rust_msix_slots[i].ctx = nullptr;
+    rust_msix_slots[i].used = false;
+    rust_msix_lock.write_unlock_irq_restore(flags);
 
     /* Wait out an ISR mid-call on another CPU (see kernel_interrupt_unregister) */
-    while (RustMsixSlots[i].InFlight.Get() != 0)
-        Pause();
+    while (rust_msix_slots[i].in_flight.get() != 0)
+        cpu_relax();
 }
 
 } /* extern "C" */
@@ -1548,15 +1548,15 @@ void kernel_msix_unregister_handler(unsigned long handle)
    faulting. */
 struct HwRandomDraw
 {
-    unsigned long long Value;
-    unsigned long long Ok;      /* 1 when Value is a draw */
+    unsigned long long value;
+    unsigned long long ok;      /* 1 when Value is a draw */
 };
 
 extern "C" {
 
 unsigned int kernel_hw_random_kind()
 {
-    return (unsigned int)Hal::GetHwRandomKind();
+    return (unsigned int)hal::get_hw_random_kind();
 }
 
 /* The CPU's whitened output: RDRAND, RNDR */
@@ -1564,10 +1564,10 @@ HwRandomDraw kernel_hw_random()
 {
     HwRandomDraw draw = { 0, 0 };
     u64 value = 0;
-    if (Hal::HwRandom(value))
+    if (hal::hw_random(value))
     {
-        draw.Value = value;
-        draw.Ok = 1;
+        draw.value = value;
+        draw.ok = 1;
     }
     return draw;
 }
@@ -1578,10 +1578,10 @@ HwRandomDraw kernel_hw_random_seed()
 {
     HwRandomDraw draw = { 0, 0 };
     u64 value = 0;
-    if (Hal::HwRandomSeed(value))
+    if (hal::hw_random_seed(value))
     {
-        draw.Value = value;
-        draw.Ok = 1;
+        draw.value = value;
+        draw.ok = 1;
     }
     return draw;
 }
@@ -1599,35 +1599,35 @@ extern "C" {
 
 unsigned long long kernel_hpet_read_ns()
 {
-    auto& hpet = Kernel::Hpet::GetInstance();
-    if (!hpet.IsAvailable()) return 0;
-    return hpet.GetTime().GetValue();
+    auto& hpet = kernel::Hpet::get_instance();
+    if (!hpet.is_available()) return 0;
+    return hpet.get_time().get_value();
 }
 
 bool kernel_hpet_is_available()
 {
-    return Kernel::Hpet::GetInstance().IsAvailable();
+    return kernel::Hpet::get_instance().is_available();
 }
 
 bool kernel_acpi_has_firmware_watchdog()
 {
-    return Kernel::Acpi::GetInstance().HasFirmwareWatchdog();
+    return kernel::Acpi::get_instance().has_firmware_watchdog();
 }
 
 /* Shell commands from Rust, a loadable module's in particular (kcore::cmd).
    Rust's handler takes the arguments as *const u8, which is the same thing
    to the ABI as the const char* DynamicHandler is declared with. */
-unsigned long kernel_cmd_register(const unsigned char* name, unsigned long nameLen,
-    const unsigned char* help, unsigned long helpLen,
-    Kernel::Cmd::DynamicHandler handler, void* ctx)
+unsigned long kernel_cmd_register(const unsigned char* name, unsigned long name_len,
+    const unsigned char* help, unsigned long help_len,
+    kernel::Cmd::DynamicHandler handler, void* ctx)
 {
-    return Kernel::Cmd::GetInstance().RegisterDynamic(reinterpret_cast<const char*>(name),
-        nameLen, reinterpret_cast<const char*>(help), helpLen, handler, ctx);
+    return kernel::Cmd::get_instance().register_dynamic(reinterpret_cast<const char*>(name),
+        name_len, reinterpret_cast<const char*>(help), help_len, handler, ctx);
 }
 
 void kernel_cmd_unregister(unsigned long handle)
 {
-    Kernel::Cmd::GetInstance().UnregisterDynamic(handle);
+    kernel::Cmd::get_instance().unregister_dynamic(handle);
 }
 
 /* out is the Stdlib::Printer a command handler was given */
@@ -1636,14 +1636,14 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
     if (out == nullptr || buf == nullptr)
         return;
 
-    auto* printer = static_cast<Stdlib::Printer*>(out);
-    char chunk[PrinterChunkSize];
+    auto* printer = static_cast<stdlib::Printer*>(out);
+    char chunk[PRINTER_CHUNK_SIZE];
     while (len != 0)
     {
         unsigned long n = (len < sizeof(chunk) - 1) ? len : sizeof(chunk) - 1;
-        Stdlib::MemCpy(chunk, buf, n);
+        stdlib::mem_cpy(chunk, buf, n);
         chunk[n] = '\0';
-        printer->PrintString(chunk);
+        printer->print_string(chunk);
         buf += n;
         len -= n;
     }
@@ -1655,38 +1655,38 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
    runs read from source(ctx, ...), and the terminal it is typed at from
    term(ctx, ...). Sleeps as long as the command runs: task context only,
    with no lock held. */
-static void DispatchTo(const unsigned char* line, unsigned long len,
+static void dispatch_to(const unsigned char* line, unsigned long len,
     SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, SinkPrinter::TerminalFn term, void* ctx)
 {
     if (line == nullptr || sink == nullptr)
         return;
 
-    if (len > DispatchLineMax)
+    if (len > DISPATCH_LINE_MAX)
     {
         char note[96];
-        Stdlib::BufferPrinter bp(note, sizeof(note));
-        bp.Printf("command too long: %lu characters, the most is %lu\n", len, DispatchLineMax);
-        sink(ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
+        stdlib::BufferPrinter bp(note, sizeof(note));
+        bp.printf("command too long: %lu characters, the most is %lu\n", len, DISPATCH_LINE_MAX);
+        sink(ctx, reinterpret_cast<const unsigned char*>(note), stdlib::str_len(note));
         return;
     }
 
     /* Before the command runs: the one moment sure to be allowed to */
-    auto* buf = static_cast<unsigned char*>(Kernel::Mm::Alloc(SinkBufferSize, RustAllocTag));
+    auto* buf = static_cast<unsigned char*>(kernel::mm::alloc(SINK_BUFFER_SIZE, RUST_ALLOC_TAG));
     if (buf == nullptr)
     {
-        static const char NoMemory[] = "no memory for the command's output\n";
-        sink(ctx, reinterpret_cast<const unsigned char*>(NoMemory), sizeof(NoMemory) - 1);
+        static const char NO_MEMORY[] = "no memory for the command's output\n";
+        sink(ctx, reinterpret_cast<const unsigned char*>(NO_MEMORY), sizeof(NO_MEMORY) - 1);
         return;
     }
 
-    char cmd[DispatchLineMax + 1];
-    Stdlib::MemCpy(cmd, line, len);
+    char cmd[DISPATCH_LINE_MAX + 1];
+    stdlib::mem_cpy(cmd, line, len);
     cmd[len] = '\0';
 
-    SinkPrinter out(sink, source, term, ctx, buf, SinkBufferSize);
-    Kernel::Cmd::Dispatch(cmd, out);
-    out.Finish();
-    Kernel::Mm::Free(buf);
+    SinkPrinter out(sink, source, term, ctx, buf, SINK_BUFFER_SIZE);
+    kernel::Cmd::dispatch(cmd, out);
+    out.finish();
+    kernel::mm::free(buf);
 }
 
 /* A shell command line run for Rust -- an SSH session's -- with nobody to
@@ -1694,7 +1694,7 @@ static void DispatchTo(const unsigned char* line, unsigned long len,
 void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
     SinkPrinter::SinkFn sink, void* ctx)
 {
-    DispatchTo(line, len, sink, nullptr, nullptr, ctx);
+    dispatch_to(line, len, sink, nullptr, nullptr, ctx);
 }
 
 /* The same with someone to type: an SSH session's command can read what the
@@ -1703,27 +1703,27 @@ void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
 void kernel_cmd_dispatch_io(const unsigned char* line, unsigned long len,
     SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, SinkPrinter::TerminalFn term, void* ctx)
 {
-    DispatchTo(line, len, sink, source, term, ctx);
+    dispatch_to(line, len, sink, source, term, ctx);
 }
 
 /* What is typed at a command, for one that asks: see Printer::ReadInput */
 long kernel_printer_read(void* out, unsigned char* buf, unsigned long len,
-    unsigned long long timeoutNs)
+    unsigned long long timeout_ns)
 {
     if (out == nullptr || buf == nullptr || len == 0)
         return -1;
 
-    return static_cast<Stdlib::Printer*>(out)->ReadInput(buf, len, timeoutNs);
+    return static_cast<stdlib::Printer*>(out)->read_input(buf, len, timeout_ns);
 }
 
 /* The terminal a command is typed at, for one that draws on it: see
    Printer::Terminal. info is untouched when there is none */
-bool kernel_printer_terminal(void* out, Stdlib::TerminalInfo* info)
+bool kernel_printer_terminal(void* out, stdlib::TerminalInfo* info)
 {
     if (out == nullptr || info == nullptr)
         return false;
 
-    return static_cast<Stdlib::Printer*>(out)->Terminal(*info);
+    return static_cast<stdlib::Printer*>(out)->terminal(*info);
 }
 
 /* What procfs puts in its files: the kernel's version, the command line it
@@ -1734,7 +1734,7 @@ unsigned long kernel_version_string(char* buf, unsigned long len)
     if (buf == nullptr || len == 0)
         return 0;
 
-    int n = Stdlib::SnPrintf(buf, len, "nos %s (%s)", KERNEL_VERSION, KERNEL_GIT_REV);
+    int n = stdlib::sn_printf(buf, len, "nos %s (%s)", KERNEL_VERSION, KERNEL_GIT_REV);
     return (n > 0) ? (unsigned long)n : 0;
 }
 
@@ -1743,8 +1743,8 @@ unsigned long kernel_cmdline_string(char* buf, unsigned long len)
     if (buf == nullptr || len == 0)
         return 0;
 
-    const char* cmdline = Kernel::Parameters::GetInstance().GetCmdline();
-    int n = Stdlib::SnPrintf(buf, len, "%s", cmdline);
+    const char* cmdline = kernel::Parameters::get_instance().get_cmdline();
+    int n = stdlib::sn_printf(buf, len, "%s", cmdline);
     return (n > 0) ? (unsigned long)n : 0;
 }
 
@@ -1752,36 +1752,36 @@ unsigned long kernel_cmdline_string(char* buf, unsigned long len)
    called and has counted. -1 past the end. */
 unsigned long kernel_interrupt_source_count()
 {
-    return Kernel::InterruptStats::Count;
+    return kernel::InterruptStats::COUNT;
 }
 
-long kernel_interrupt_source(unsigned long index, char* name, unsigned long nameLen)
+long kernel_interrupt_source(unsigned long index, char* name, unsigned long name_len)
 {
-    if (index >= Kernel::InterruptStats::Count)
+    if (index >= kernel::InterruptStats::COUNT)
         return -1;
 
-    Kernel::InterruptSource src = static_cast<Kernel::InterruptSource>(index);
-    if (name != nullptr && nameLen != 0)
-        Stdlib::SnPrintf(name, nameLen, "%s", Kernel::InterruptStats::GetName(src));
-    return Kernel::InterruptStats::Get(src);
+    kernel::InterruptSource src = static_cast<kernel::InterruptSource>(index);
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", kernel::InterruptStats::get_name(src));
+    return kernel::InterruptStats::get(src);
 }
 
 /* What netconsole= asked for: the collector's address into ip, its port into
    port, and the nctail= cap in KiB into tailKb. 1 when it was asked for at
    all, 0 when it was not. */
 int kernel_netconsole_params(unsigned int* ip, unsigned short* port,
-    unsigned long* tailKb)
+    unsigned long* tail_kb)
 {
-    auto& params = Kernel::Parameters::GetInstance();
-    if (!params.IsNetconsoleEnabled())
+    auto& params = kernel::Parameters::get_instance();
+    if (!params.is_netconsole_enabled())
         return 0;
 
     if (ip != nullptr)
-        *ip = params.GetNetconsoleIp();
+        *ip = params.get_netconsole_ip();
     if (port != nullptr)
-        *port = params.GetNetconsolePort();
-    if (tailKb != nullptr)
-        *tailKb = params.GetNetconsoleTailKb();
+        *port = params.get_netconsole_port();
+    if (tail_kb != nullptr)
+        *tail_kb = params.get_netconsole_tail_kb();
     return 1;
 }
 
@@ -1794,22 +1794,22 @@ void kernel_dmesg_replay(void (*line)(void* ctx, const unsigned char* s,
     if (line == nullptr)
         return;
 
-    Kernel::DmesgMsg* msg = Kernel::Dmesg::GetInstance().Next(nullptr);
+    kernel::DmesgMsg* msg = kernel::Dmesg::get_instance().next(nullptr);
     for (ulong replayed = 0; msg != nullptr; replayed++)
     {
-        ulong len = Stdlib::StrLen(msg->Str);
+        ulong len = stdlib::str_len(msg->str);
         if (len != 0)
-            line(ctx, reinterpret_cast<const unsigned char*>(msg->Str), len);
+            line(ctx, reinterpret_cast<const unsigned char*>(msg->str), len);
 
         /* Never outlast the log itself: a walk past its capacity is chasing
            a tail someone else is still extending. */
-        if (replayed + 1 == Kernel::Dmesg::MaxMsgs)
+        if (replayed + 1 == kernel::Dmesg::MAX_MSGS)
         {
-            Kernel::Dmesg::GetInstance().Release(msg);
+            kernel::Dmesg::get_instance().release(msg);
             break;
         }
 
-        msg = Kernel::Dmesg::GetInstance().Next(msg);
+        msg = kernel::Dmesg::get_instance().next(msg);
     }
 }
 
@@ -1819,12 +1819,12 @@ void kernel_dmesg_replay(void (*line)(void* ctx, const unsigned char* s,
    first and disabling after leaves a window to be preempted onto another. */
 unsigned long kernel_irq_save()
 {
-    return Kernel::PreemptIrqSave();
+    return kernel::preempt_irq_save();
 }
 
 void kernel_irq_restore(unsigned long flags)
 {
-    Kernel::PreemptIrqRestore(flags);
+    kernel::preempt_irq_restore(flags);
 }
 
 /* Preemption off, and back on: what a spin lock of the kernel's own kind
@@ -1834,12 +1834,12 @@ void kernel_irq_restore(unsigned long flags)
    slice. */
 void kernel_preempt_disable()
 {
-    Kernel::PreemptDisable();
+    kernel::preempt_disable();
 }
 
 void kernel_preempt_enable()
 {
-    Kernel::PreemptEnable();
+    kernel::preempt_enable();
 }
 
 /* The same, for code that runs on stacks that are not a task's -- the
@@ -1849,19 +1849,19 @@ void kernel_preempt_enable()
    took it. */
 unsigned long kernel_preempt_disable_task()
 {
-    return (unsigned long)Kernel::PreemptDisableTask();
+    return (unsigned long)kernel::preempt_disable_task();
 }
 
 void kernel_preempt_enable_task(unsigned long task)
 {
-    Kernel::PreemptEnableTask(reinterpret_cast<Kernel::Task*>(task));
+    kernel::preempt_enable_task(reinterpret_cast<kernel::Task*>(task));
 }
 
 /* Whether preemption is on at all yet: before it is, no task will ever be
    scheduled and a caller with work to hand off has to do it itself. */
 int kernel_preempt_is_on()
 {
-    return Kernel::PreemptIsOn() ? 1 : 0;
+    return kernel::preempt_is_on() ? 1 : 0;
 }
 
 /* May the caller wait -- for a completion, or to be scheduled away? Not with
@@ -1869,7 +1869,7 @@ int kernel_preempt_is_on()
    which every spinlock holds for as long as it is held. */
 int kernel_preempt_can_block()
 {
-    return Kernel::PreemptCanBlock() ? 1 : 0;
+    return kernel::preempt_can_block() ? 1 : 0;
 }
 
 /* Whether interrupts are on for this CPU. What tells a caller it may
@@ -1877,14 +1877,14 @@ int kernel_preempt_can_block()
    interrupts off it could not answer one itself. */
 int kernel_interrupts_enabled()
 {
-    return Hal::IsInterruptEnabled() ? 1 : 0;
+    return hal::is_interrupt_enabled() ? 1 : 0;
 }
 
 /* Whether a panic has started: what tells code to write without taking a
    lock, because another CPU may hold it and is on its way to a halt. */
 int kernel_panic_active()
 {
-    return Kernel::Panicker::GetInstance().IsActive() ? 1 : 0;
+    return kernel::Panicker::get_instance().is_active() ? 1 : 0;
 }
 
 /* One decoded byte of a keystroke from a driver in Rust -- the USB
@@ -1892,26 +1892,26 @@ int kernel_panic_active()
    What it is is KeyboardObserver's (kernel/input.h). */
 void kernel_input_key(char c, unsigned char code)
 {
-    Kernel::KeyboardInput::GetInstance().Emit(c, code);
+    kernel::KeyboardInput::get_instance().emit(c, code);
 }
 
 /* dhcp=off: the shell's `dhcp` says so rather than running one. */
 int kernel_param_dhcp_off()
 {
-    return Kernel::Parameters::GetInstance().IsDhcpOff() ? 1 : 0;
+    return kernel::Parameters::get_instance().is_dhcp_off() ? 1 : 0;
 }
 
 /* dns=on: a lease's DNS server is worth starting a resolver on. */
 int kernel_param_dns_on()
 {
-    return Kernel::Parameters::GetInstance().IsDnsEnabled() ? 1 : 0;
+    return kernel::Parameters::get_instance().is_dns_enabled() ? 1 : 0;
 }
 
 /* rxpoll=on: the tick's receive poll, which the network layer's
    DeviceTable::poll_rx asks about on every call. */
 int kernel_param_rxpoll_on()
 {
-    return Kernel::Parameters::GetInstance().IsRxPollEnabled() ? 1 : 0;
+    return kernel::Parameters::get_instance().is_rx_poll_enabled() ? 1 : 0;
 }
 
 /* Whether the kernel log is to be written to a prepared disk area: 1 for
@@ -1920,38 +1920,38 @@ int kernel_param_rxpoll_on()
    lines are part of the boot the area is meant to hold. */
 int kernel_disklog_wanted()
 {
-    auto& params = Kernel::Parameters::GetInstance();
-    if (!params.IsParsed())
+    auto& params = kernel::Parameters::get_instance();
+    if (!params.is_parsed())
         return -1;
-    return params.IsDiskLogOn() ? 1 : 0;
+    return params.is_disk_log_on() ? 1 : 0;
 }
 
 /* What the root filesystem is to be, off the kernel command line: the mode
    (Parameters::RootMode), the device name or label into `value`, and the
    parsed UUID into `uuid`. See rust_mount_root_fs. */
-int kernel_root_spec(char* value, unsigned long valueLen, unsigned char* uuid,
-    unsigned long uuidLen)
+int kernel_root_spec(char* value, unsigned long value_len, unsigned char* uuid,
+    unsigned long uuid_len)
 {
-    const Kernel::Parameters::RootSpec& spec = Kernel::Parameters::GetInstance().GetRoot();
+    const kernel::Parameters::RootSpec& spec = kernel::Parameters::get_instance().get_root();
 
-    if (value != nullptr && valueLen != 0)
-        Stdlib::SnPrintf(value, valueLen, "%s", spec.Value);
-    if (uuid != nullptr && uuidLen >= sizeof(spec.Uuid))
-        Stdlib::MemCpy(uuid, spec.Uuid, sizeof(spec.Uuid));
+    if (value != nullptr && value_len != 0)
+        stdlib::sn_printf(value, value_len, "%s", spec.value);
+    if (uuid != nullptr && uuid_len >= sizeof(spec.uuid))
+        stdlib::mem_cpy(uuid, spec.uuid, sizeof(spec.uuid));
 
-    return (int)spec.Mode;
+    return (int)spec.mode;
 }
 
 /* ro: the root is to be mounted read-only */
 int kernel_root_read_only()
 {
-    return Kernel::Parameters::GetInstance().IsRootReadOnly() ? 1 : 0;
+    return kernel::Parameters::get_instance().is_root_read_only() ? 1 : 0;
 }
 
 /* fstest=on: run the filesystem self-test on / once it is mounted */
 int kernel_root_fstest()
 {
-    return Kernel::Parameters::GetInstance().IsFsTest() ? 1 : 0;
+    return kernel::Parameters::get_instance().is_fs_test() ? 1 : 0;
 }
 
 /* Net devices from Rust, both sides of them -- the driver's and the

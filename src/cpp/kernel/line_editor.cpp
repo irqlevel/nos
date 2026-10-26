@@ -3,80 +3,80 @@
 #include <kernel/panic.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 namespace
 {
 
 /* Appends n bytes of s to buf at len, which the caller has made room for */
-void Put(char* buf, ulong size, ulong& len, const char* s, ulong n)
+void put(char* buf, ulong size, ulong& len, const char* s, ulong n)
 {
-    BugOn(n > size - len);
-    Stdlib::MemCpy(buf + len, s, n);
+    BUG_ON(n > size - len);
+    stdlib::mem_cpy(buf + len, s, n);
     len += n;
 }
 
 }
 
 LineEditor::LineEditor()
-    : Len(0)
-    , First(0)
-    , Count(0)
-    , Browse(0)
-    , DraftLen(0)
-    , Esc(EscNone)
-    , Searching(false)
-    , Failed(false)
-    , QueryLen(0)
-    , Match(0)
-    , SavedLen(0)
-    , ShownLen(0)
+    : len_(0)
+    , first_(0)
+    , count_(0)
+    , browse_(0)
+    , draft_len_(0)
+    , esc_(EscNone)
+    , searching_(false)
+    , failed_(false)
+    , query_len_(0)
+    , match_(0)
+    , saved_len_(0)
+    , shown_len_(0)
 {
-    Stdlib::MemSet(Line, 0, sizeof(Line));
-    Stdlib::MemSet(History, 0, sizeof(History));
-    Stdlib::MemSet(Draft, 0, sizeof(Draft));
-    Stdlib::MemSet(Query, 0, sizeof(Query));
-    Stdlib::MemSet(Saved, 0, sizeof(Saved));
-    Stdlib::MemSet(Shown, 0, sizeof(Shown));
-    Stdlib::MemSet(Done, 0, sizeof(Done));
+    stdlib::mem_set(line_, 0, sizeof(line_));
+    stdlib::mem_set(history_, 0, sizeof(history_));
+    stdlib::mem_set(draft_, 0, sizeof(draft_));
+    stdlib::mem_set(query_, 0, sizeof(query_));
+    stdlib::mem_set(saved_, 0, sizeof(saved_));
+    stdlib::mem_set(shown_, 0, sizeof(shown_));
+    stdlib::mem_set(done_, 0, sizeof(done_));
 }
 
-void LineEditor::Prompt(Stdlib::Printer& out)
+void LineEditor::prompt(stdlib::Printer& out)
 {
-    ShownLen = 0;
-    Show(out);
+    shown_len_ = 0;
+    show(out);
 }
 
-bool LineEditor::Key(char c, Stdlib::Printer& out)
+bool LineEditor::key(char c, stdlib::Printer& out)
 {
     /* An escape sequence is the terminal's name for a key, and only its
        final byte says which */
-    switch (Esc)
+    switch (esc_)
     {
     case EscStart:
-        Esc = EscNone;
+        esc_ = EscNone;
         if (c == '[' || c == 'O')
         {
-            Esc = EscSequence;
+            esc_ = EscSequence;
             return false;
         }
         /* ESC and a character is Alt and it, which nothing here has a use
            for; a control key is itself */
-        if (IsPrintable(c))
+        if (is_printable(c))
             return false;
         break;
     case EscSequence:
-        if (c >= CsiMiddleFirst && c <= CsiMiddleLast)
+        if (c >= CSI_MIDDLE_FIRST && c <= CSI_MIDDLE_LAST)
             return false;
-        Esc = EscNone;
-        if (c >= CsiFinalFirst && c <= CsiFinalLast)
+        esc_ = EscNone;
+        if (c >= CSI_FINAL_FIRST && c <= CSI_FINAL_LAST)
         {
             if (c == 'A')
-                Older();
+                older();
             else if (c == 'B')
-                Newer();
-            Show(out);
+                newer();
+            show(out);
             return false;
         }
         /* A control key cut the sequence short: it is a key of its own */
@@ -85,133 +85,133 @@ bool LineEditor::Key(char c, Stdlib::Printer& out)
         break;
     }
 
-    if (Searching)
+    if (searching_)
     {
-        if (IsPrintable(c))
+        if (is_printable(c))
         {
-            if (QueryLen < LineMax)
+            if (query_len_ < LINE_LEN_MAX)
             {
-                Query[QueryLen++] = c;
+                query_[query_len_++] = c;
                 /* The line found so far may hold the longer query too */
-                Find((Match < Count) ? Match + 1 : Count);
+                find((match_ < count_) ? match_ + 1 : count_);
             }
-            Show(out);
+            show(out);
             return false;
         }
 
         switch (c)
         {
-        case KeyCtrlR:
-            Find(Match);
-            Show(out);
+        case KEY_CTRL_R:
+            find(match_);
+            show(out);
             return false;
-        case KeyBackspace:
-        case KeyDel:
+        case KEY_BACKSPACE:
+        case KEY_DEL:
             /* A shorter query is searched for again from the newest line */
-            if (QueryLen > 0)
+            if (query_len_ > 0)
             {
-                QueryLen--;
-                Stdlib::MemCpy(Line, Saved, SavedLen);
-                Len = SavedLen;
-                Match = Count;
-                Failed = false;
-                if (QueryLen > 0)
-                    Find(Count);
+                query_len_--;
+                stdlib::mem_cpy(line_, saved_, saved_len_);
+                len_ = saved_len_;
+                match_ = count_;
+                failed_ = false;
+                if (query_len_ > 0)
+                    find(count_);
             }
-            Show(out);
+            show(out);
             return false;
-        case KeyCtrlG:
-            Stdlib::MemCpy(Line, Saved, SavedLen);
-            Len = SavedLen;
-            Searching = false;
-            Show(out);
+        case KEY_CTRL_G:
+            stdlib::mem_cpy(line_, saved_, saved_len_);
+            len_ = saved_len_;
+            searching_ = false;
+            show(out);
             return false;
-        case KeyCtrlC:
-            Cancel(out);
+        case KEY_CTRL_C:
+            cancel(out);
             return false;
         default:
             /* Any other key keeps what was found, and is a key of the line's */
-            AcceptSearch();
+            accept_search();
             break;
         }
     }
 
     switch (c)
     {
-    case KeyCr:
-    case KeyLf:
-        return Enter(out);
-    case KeyBackspace:
-    case KeyDel:
-        if (Len > 0)
-            Len--;
+    case KEY_CR:
+    case KEY_LF:
+        return enter(out);
+    case KEY_BACKSPACE:
+    case KEY_DEL:
+        if (len_ > 0)
+            len_--;
         break;
-    case KeyCtrlC:
-        Cancel(out);
+    case KEY_CTRL_C:
+        cancel(out);
         return false;
-    case KeyCtrlU:
-        Len = 0;
+    case KEY_CTRL_U:
+        len_ = 0;
         break;
-    case KeyCtrlR:
-        StartSearch();
+    case KEY_CTRL_R:
+        start_search();
         break;
-    case KeyCtrlP:
-        Older();
+    case KEY_CTRL_P:
+        older();
         break;
-    case KeyCtrlN:
-        Newer();
+    case KEY_CTRL_N:
+        newer();
         break;
-    case KeyEsc:
-        Esc = EscStart;
+    case KEY_ESC:
+        esc_ = EscStart;
         break;
     default:
         /* Tab, the other control keys and whatever is past ASCII: no
            command has a use for them */
-        if (IsPrintable(c) && Len < LineMax)
-            Line[Len++] = c;
+        if (is_printable(c) && len_ < LINE_LEN_MAX)
+            line_[len_++] = c;
         break;
     }
 
-    Show(out);
+    show(out);
     return false;
 }
 
-bool LineEditor::Enter(Stdlib::Printer& out)
+bool LineEditor::enter(stdlib::Printer& out)
 {
     /* What runs is shown after the prompt: a search's find too */
-    Show(out);
-    out.PrintString("\n");
-    ShownLen = 0;
+    show(out);
+    out.print_string("\n");
+    shown_len_ = 0;
 
-    Stdlib::MemCpy(Done, Line, Len);
-    Done[Len] = '\0';
-    Remember();
+    stdlib::mem_cpy(done_, line_, len_);
+    done_[len_] = '\0';
+    remember();
 
-    Len = 0;
-    DraftLen = 0;
-    Browse = Count;
+    len_ = 0;
+    draft_len_ = 0;
+    browse_ = count_;
     return true;
 }
 
-void LineEditor::Cancel(Stdlib::Printer& out)
+void LineEditor::cancel(stdlib::Printer& out)
 {
-    out.PrintString("^C\n");
-    ShownLen = 0;
+    out.print_string("^C\n");
+    shown_len_ = 0;
 
-    Searching = false;
-    Len = 0;
-    DraftLen = 0;
-    Browse = Count;
-    Show(out);
+    searching_ = false;
+    len_ = 0;
+    draft_len_ = 0;
+    browse_ = count_;
+    show(out);
 }
 
-void LineEditor::Remember()
+void LineEditor::remember()
 {
-    ulong len = Stdlib::StrLen(Done);
+    ulong len = stdlib::str_len(done_);
     bool blank = true;
     for (ulong i = 0; i < len; i++)
     {
-        if (Done[i] != ' ')
+        if (done_[i] != ' ')
         {
             blank = false;
             break;
@@ -221,161 +221,161 @@ void LineEditor::Remember()
         return;
 
     /* The same line twice running is kept once */
-    if (Count != 0 && Stdlib::StrCmp(HistoryAt(Count - 1), Done) == 0)
+    if (count_ != 0 && stdlib::str_cmp(history_at(count_ - 1), done_) == 0)
         return;
 
     ulong slot;
-    if (Count < HistoryMax)
+    if (count_ < HISTORY_MAX)
     {
-        slot = (First + Count) % HistoryMax;
-        Count++;
+        slot = (first_ + count_) % HISTORY_MAX;
+        count_++;
     }
     else
     {
-        slot = First;
-        First = (First + 1) % HistoryMax;
+        slot = first_;
+        first_ = (first_ + 1) % HISTORY_MAX;
     }
-    Stdlib::MemCpy(History[slot], Done, len + 1);
+    stdlib::mem_cpy(history_[slot], done_, len + 1);
 }
 
-const char* LineEditor::HistoryAt(ulong i) const
+const char* LineEditor::history_at(ulong i) const
 {
-    BugOn(i >= Count);
-    return History[(First + i) % HistoryMax];
+    BUG_ON(i >= count_);
+    return history_[(first_ + i) % HISTORY_MAX];
 }
 
-void LineEditor::Older()
+void LineEditor::older()
 {
-    if (Browse == 0)
+    if (browse_ == 0)
         return;
 
-    if (Browse == Count)
+    if (browse_ == count_)
     {
-        Stdlib::MemCpy(Draft, Line, Len);
-        DraftLen = Len;
+        stdlib::mem_cpy(draft_, line_, len_);
+        draft_len_ = len_;
     }
-    Browse--;
+    browse_--;
 
-    const char* line = HistoryAt(Browse);
-    Len = Stdlib::StrLen(line);
-    Stdlib::MemCpy(Line, line, Len);
+    const char* line = history_at(browse_);
+    len_ = stdlib::str_len(line);
+    stdlib::mem_cpy(line_, line, len_);
 }
 
-void LineEditor::Newer()
+void LineEditor::newer()
 {
-    if (Browse >= Count)
+    if (browse_ >= count_)
         return;
 
-    Browse++;
-    if (Browse == Count)
+    browse_++;
+    if (browse_ == count_)
     {
-        Stdlib::MemCpy(Line, Draft, DraftLen);
-        Len = DraftLen;
+        stdlib::mem_cpy(line_, draft_, draft_len_);
+        len_ = draft_len_;
     }
     else
     {
-        const char* line = HistoryAt(Browse);
-        Len = Stdlib::StrLen(line);
-        Stdlib::MemCpy(Line, line, Len);
+        const char* line = history_at(browse_);
+        len_ = stdlib::str_len(line);
+        stdlib::mem_cpy(line_, line, len_);
     }
 }
 
-void LineEditor::StartSearch()
+void LineEditor::start_search()
 {
-    Searching = true;
-    Failed = false;
-    QueryLen = 0;
-    Match = Count;
-    Stdlib::MemCpy(Saved, Line, Len);
-    SavedLen = Len;
+    searching_ = true;
+    failed_ = false;
+    query_len_ = 0;
+    match_ = count_;
+    stdlib::mem_cpy(saved_, line_, len_);
+    saved_len_ = len_;
 }
 
-bool LineEditor::Holds(ulong i) const
+bool LineEditor::holds(ulong i) const
 {
-    const char* line = HistoryAt(i);
-    ulong len = Stdlib::StrLen(line);
-    if (QueryLen > len)
+    const char* line = history_at(i);
+    ulong len = stdlib::str_len(line);
+    if (query_len_ > len)
         return false;
 
-    for (ulong at = 0; at + QueryLen <= len; at++)
+    for (ulong at = 0; at + query_len_ <= len; at++)
     {
-        if (Stdlib::MemCmp(line + at, Query, QueryLen) == 0)
+        if (stdlib::mem_cmp(line + at, query_, query_len_) == 0)
             return true;
     }
     return false;
 }
 
-void LineEditor::Find(ulong below)
+void LineEditor::find(ulong below)
 {
-    BugOn(below > Count);
+    BUG_ON(below > count_);
 
     for (ulong i = below; i > 0; i--)
     {
-        if (Holds(i - 1))
+        if (holds(i - 1))
         {
-            Match = i - 1;
-            Failed = false;
-            const char* line = HistoryAt(Match);
-            Len = Stdlib::StrLen(line);
-            Stdlib::MemCpy(Line, line, Len);
+            match_ = i - 1;
+            failed_ = false;
+            const char* line = history_at(match_);
+            len_ = stdlib::str_len(line);
+            stdlib::mem_cpy(line_, line, len_);
             return;
         }
     }
-    Failed = true;
+    failed_ = true;
 }
 
-void LineEditor::AcceptSearch()
+void LineEditor::accept_search()
 {
-    Searching = false;
-    if (Match < Count)
+    searching_ = false;
+    if (match_ < count_)
     {
         /* Up and Down go on from what was found, and Down past the newest
            line still gives back the one being typed before it all */
-        if (Browse == Count)
+        if (browse_ == count_)
         {
-            Stdlib::MemCpy(Draft, Saved, SavedLen);
-            DraftLen = SavedLen;
+            stdlib::mem_cpy(draft_, saved_, saved_len_);
+            draft_len_ = saved_len_;
         }
-        Browse = Match;
+        browse_ = match_;
     }
 }
 
-void LineEditor::Show(Stdlib::Printer& out)
+void LineEditor::show(stdlib::Printer& out)
 {
-    char text[ShownMax];
+    char text[SHOWN_MAX];
     ulong len = 0;
-    if (Searching)
+    if (searching_)
     {
-        if (Failed)
-            Put(text, sizeof(text), len, FailedText, sizeof(FailedText) - 1);
+        if (failed_)
+            put(text, sizeof(text), len, FAILED_TEXT, sizeof(FAILED_TEXT) - 1);
         else
-            Put(text, sizeof(text), len, SearchText, sizeof(SearchText) - 1);
-        Put(text, sizeof(text), len, Query, QueryLen);
-        Put(text, sizeof(text), len, QueryEndText, sizeof(QueryEndText) - 1);
+            put(text, sizeof(text), len, SEARCH_TEXT, sizeof(SEARCH_TEXT) - 1);
+        put(text, sizeof(text), len, query_, query_len_);
+        put(text, sizeof(text), len, QUERY_END_TEXT, sizeof(QUERY_END_TEXT) - 1);
     }
     else
     {
-        Put(text, sizeof(text), len, PromptText, sizeof(PromptText) - 1);
+        put(text, sizeof(text), len, PROMPT_TEXT, sizeof(PROMPT_TEXT) - 1);
     }
-    Put(text, sizeof(text), len, Line, Len);
+    put(text, sizeof(text), len, line_, len_);
 
     ulong same = 0;
-    while (same < ShownLen && same < len && Shown[same] == text[same])
+    while (same < shown_len_ && same < len && shown_[same] == text[same])
         same++;
 
-    for (ulong i = same; i < ShownLen; i++)
-        out.Backspace();
+    for (ulong i = same; i < shown_len_; i++)
+        out.backspace();
 
     if (same < len)
     {
-        char tail[ShownMax + 1];
-        Stdlib::MemCpy(tail, text + same, len - same);
+        char tail[SHOWN_MAX + 1];
+        stdlib::mem_cpy(tail, text + same, len - same);
         tail[len - same] = '\0';
-        out.PrintString(tail);
+        out.print_string(tail);
     }
 
-    Stdlib::MemCpy(Shown, text, len);
-    ShownLen = len;
+    stdlib::mem_cpy(shown_, text, len);
+    shown_len_ = len;
 }
 
 }

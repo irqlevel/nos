@@ -10,485 +10,485 @@
 #include <kernel/cpu.h>
 #include <kernel/debug.h>
 
-namespace Kernel
+namespace kernel
 {
 
 ExceptionTable::ExceptionTable()
 {
-    Trace(0, "ExcTable 0x%p", this);
+    trace(0, "ExcTable 0x%p", this);
 
-    for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
+    for (size_t i = 0; i < stdlib::array_size(handler_); i++)
     {
-        Handler[i] = nullptr;
+        handler_[i] = nullptr;
     }
 
-    if (!SetHandler(0x0, ExcDivideByZeroStub))
+    if (!set_handler(0x0, exc_divide_by_zero_stub))
         goto error;
 
-    if (!SetHandler(0x1, ExcDebuggerStub))
+    if (!set_handler(0x1, exc_debugger_stub))
         goto error;
 
-    if (!SetHandler(0x2, ExcNMIStub))
+    if (!set_handler(0x2, exc_nmi_stub))
         goto error;
 
-    if (!SetHandler(0x3, ExcBreakpointStub))
+    if (!set_handler(0x3, exc_breakpoint_stub))
         goto error;
 
-    if (!SetHandler(0x4, ExcOverflowStub))
+    if (!set_handler(0x4, exc_overflow_stub))
         goto error;
 
-    if (!SetHandler(0x5, ExcBoundsStub))
+    if (!set_handler(0x5, exc_bounds_stub))
         goto error;
 
-    if (!SetHandler(0x6, ExcInvalidOpcodeStub))
+    if (!set_handler(0x6, exc_invalid_opcode_stub))
         goto error;
 
-    if (!SetHandler(0x7, ExcCoprocessorNotAvailableStub))
+    if (!set_handler(0x7, exc_coprocessor_not_available_stub))
         goto error;
 
-    if (!SetHandler(0x8, ExcDoubleFaultStub))
+    if (!set_handler(0x8, exc_double_fault_stub))
         goto error;
 
-    if (!SetHandler(0x9, ExcCoprocessorSegmentOverrunStub))
+    if (!set_handler(0x9, exc_coprocessor_segment_overrun_stub))
         goto error;
 
-    if (!SetHandler(0xA, ExcInvalidTaskStateSegmentStub))
+    if (!set_handler(0xA, exc_invalid_task_state_segment_stub))
         goto error;
 
-    if (!SetHandler(0xB, ExcSegmentNotPresentStub))
+    if (!set_handler(0xB, exc_segment_not_present_stub))
         goto error;
 
-    if (!SetHandler(0xC, ExcStackFaultStub))
+    if (!set_handler(0xC, exc_stack_fault_stub))
         goto error;
 
-    if (!SetHandler(0xD, ExcGeneralProtectionFaultStub))
+    if (!set_handler(0xD, exc_general_protection_fault_stub))
         goto error;
 
-    if (!SetHandler(0xE, ExcPageFaultStub))
+    if (!set_handler(0xE, exc_page_fault_stub))
         goto error;
 
-    if (!SetHandler(0xF, ExcReservedStub))
+    if (!set_handler(0xF, exc_reserved_stub))
         goto error;
 
-    if (!SetHandler(0x10, ExcMathFaultStub))
+    if (!set_handler(0x10, exc_math_fault_stub))
         goto error;
 
-    if (!SetHandler(0x11, ExcAlignmentCheckStub))
+    if (!set_handler(0x11, exc_alignment_check_stub))
         goto error;
 
-    if (!SetHandler(0x12, ExcMachineCheckStub))
+    if (!set_handler(0x12, exc_machine_check_stub))
         goto error;
 
-    if (!SetHandler(0x13, ExcSIMDFpExceptionStub))
+    if (!set_handler(0x13, exc_simd_fp_exception_stub))
         goto error;
 
-    if (!SetHandler(0x14, ExcVirtExceptionStub))
+    if (!set_handler(0x14, exc_virt_exception_stub))
         goto error;
 
-    if (!SetHandler(0x15, ExcControlProtectionStub))
+    if (!set_handler(0x15, exc_control_protection_stub))
         goto error;
 
     return;
 
 error:
-    Panic("EXC: Can't setup exception handler");
+    PANIC("EXC: Can't setup exception handler");
 }
 
 ExceptionTable::~ExceptionTable()
 {
 }
 
-bool ExceptionTable::SetHandler(size_t index, ExcHandler handler)
+bool ExceptionTable::set_handler(size_t index, ExcHandler handler)
 {
-    if (index >= Stdlib::ArraySize(Handler))
+    if (index >= stdlib::array_size(handler_))
         return false;
-    Trace(0, "Set handler[%lu]=0x%p", index, handler);
-    Handler[index] = handler;
+    trace(0, "Set handler[%lu]=0x%p", index, handler);
+    handler_[index] = handler;
     return true;
 }
 
-void ExceptionTable::RegisterExceptionHandlers()
+void ExceptionTable::register_exception_handlers()
 {
     /* #DF is delivered on its own per-CPU IST stack (Gdt::SetupTssSelf):
        it fires exactly when the current stack is unusable, and pushing the
        exception frame onto that bad stack would triple-fault instead of
        reaching the panic handler. */
-    static const size_t DoubleFaultVector = 0x8;
-    static const u8 DoubleFaultIst = 1;
+    static const size_t DOUBLE_FAULT_VECTOR = 0x8;
+    static const u8 DOUBLE_FAULT_IST = 1;
 
-    auto& idt = Idt::GetInstance();
+    auto& idt = Idt::get_instance();
 
-    for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
+    for (size_t i = 0; i < stdlib::array_size(handler_); i++)
     {
-        u8 ist = (i == DoubleFaultVector) ? DoubleFaultIst : 0;
-        idt.SetDescriptor(i, IdtDescriptor::Encode(Handler[i], ist));
+        u8 ist = (i == DOUBLE_FAULT_VECTOR) ? DOUBLE_FAULT_IST : 0;
+        idt.set_descriptor(i, IdtDescriptor::encode(handler_[i], ist));
     }
 }
 
-void ExceptionTable::ExcDivideByZero(Context* ctx)
+void ExceptionTable::exc_divide_by_zero(Context* ctx)
 {
-    ExcDivideByZeroCounter.Inc();
+    exc_divide_by_zero_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: DivideByZero rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: DivideByZero rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcDebugger(Context* ctx)
+void ExceptionTable::exc_debugger(Context* ctx)
 {
-    ExcDebuggerCounter.Inc();
+    exc_debugger_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: Debugger rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: Debugger rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcNMI(Context* ctx)
+void ExceptionTable::exc_nmi(Context* ctx)
 {
-    ExcNMICounter.Inc();
+    exc_nmi_counter_.inc();
 
     /* A panic on another CPU asking for this one's stack. It gets recorded
        and this CPU stops here: the panic is halting everything anyway, and
        panicking about the NMI itself would bury the report that sent it. */
-    if (Panicker::GetInstance().CollectRemoteStack())
+    if (Panicker::get_instance().collect_remote_stack())
     {
         for (;;)
-            Hlt();
+            cpu_halt();
     }
 
     /* A performance counter overflowing: a profiler sample, not a fault.
        Asked after the panic case and before the panic itself -- an NMI this
        kernel raised on purpose is the one kind it must return from. */
-    if (Pmu::AckOverflow())
+    if (Pmu::ack_overflow())
     {
-        Profiler::GetInstance().Sample(ctx);
+        Profiler::get_instance().sample(ctx);
         return;
     }
 
     /* An AMD part delivering the tail of an overflow this CPU has already
        handled. Not a sample -- there is nothing new to record -- but not a
        fault to bring the machine down over either. */
-    if (Pmu::AbsorbSpuriousNmi())
+    if (Pmu::absorb_spurious_nmi())
         return;
 
-    PanicCtx(ctx, false, "EXC: NMI rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: NMI rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcBreakpoint(Context* ctx)
+void ExceptionTable::exc_breakpoint(Context* ctx)
 {
-    ExcBreakpointCounter.Inc();
+    exc_breakpoint_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: Breakpoint rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: Breakpoint rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcOverflow(Context* ctx)
+void ExceptionTable::exc_overflow(Context* ctx)
 {
-    ExcOverflowCounter.Inc();
+    exc_overflow_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: Overflow rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: Overflow rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcBounds(Context* ctx)
+void ExceptionTable::exc_bounds(Context* ctx)
 {
-    ExcBoundsCounter.Inc();
+    exc_bounds_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: Bounds rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: Bounds rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcInvalidOpcode(Context* ctx)
+void ExceptionTable::exc_invalid_opcode(Context* ctx)
 {
-    ExcInvalidOpcodeCounter.Inc();
+    exc_invalid_opcode_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: InvalidOpcode cpu %lu rip 0x%lX rsp 0x%lX",
-        CpuTable::GetInstance().GetCurrentCpuId(),
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: InvalidOpcode cpu %lu rip 0x%lX rsp 0x%lX",
+        CpuTable::get_instance().get_current_cpu_id(),
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
+void ExceptionTable::exc_coprocessor_not_available(Context* ctx)
 {
-    ExcCoprocessorNotAvailableCounter.Inc();
+    exc_coprocessor_not_available_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: CoprocessorNotAvailable rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: CoprocessorNotAvailable rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcDoubleFault(Context* ctx)
+void ExceptionTable::exc_double_fault(Context* ctx)
 {
-    ExcDoubleFaultCounter.Inc();
+    exc_double_fault_counter_.inc();
 
-    PanicCtx(ctx, true, "EXC: DoubleFault rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: DoubleFault rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
+void ExceptionTable::exc_coprocessor_segment_overrun(Context* ctx)
 {
-    ExcCoprocessorSegmentOverrunCounter.Inc();
+    exc_coprocessor_segment_overrun_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: CoprocessorSegmentOverrun rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: CoprocessorSegmentOverrun rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcInvalidTaskStateSegment(Context* ctx)
+void ExceptionTable::exc_invalid_task_state_segment(Context* ctx)
 {
-    ExcInvalidTaskStateSegmentCounter.Inc();
+    exc_invalid_task_state_segment_counter_.inc();
 
-    PanicCtx(ctx, true, "EXC: InvalidTSS rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: InvalidTSS rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcSegmentNotPresent(Context* ctx)
+void ExceptionTable::exc_segment_not_present(Context* ctx)
 {
-    ExcSegmentNotPresentCounter.Inc();
+    exc_segment_not_present_counter_.inc();
 
-    PanicCtx(ctx, true, "EXC: SegmentNotPresent rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: SegmentNotPresent rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcStackFault(Context* ctx)
+void ExceptionTable::exc_stack_fault(Context* ctx)
 {
-    ExcStackFaultCounter.Inc();
+    exc_stack_fault_counter_.inc();
 
     /* A read the panic report was not sure of: back into the report (see
        Panicker::RecoverFault), and this one is not reported. The same in
        the next two. */
-    Panicker::GetInstance().RecoverFault();
+    Panicker::get_instance().recover_fault();
 
-    PanicCtx(ctx, true, "EXC: StackFault rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: StackFault rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
+void ExceptionTable::exc_general_protection_fault(Context* ctx)
 {
-    ExcGeneralProtectionFaultCounter.Inc();
+    exc_general_protection_fault_counter_.inc();
 
-    Panicker::GetInstance().RecoverFault();
+    Panicker::get_instance().recover_fault();
 
-    PanicCtx(ctx, true, "EXC: GP cpu %lu rip 0x%lX rsp 0x%lX err 0x%lX",
-        CpuTable::GetInstance().GetCurrentCpuId(),
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: GP cpu %lu rip 0x%lX rsp 0x%lX err 0x%lX",
+        CpuTable::get_instance().get_current_cpu_id(),
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcPageFault(Context* ctx)
+void ExceptionTable::exc_page_fault(Context* ctx)
 {
-    ExcPageFaultCounter.Inc();
+    exc_page_fault_counter_.inc();
 
-    Panicker::GetInstance().RecoverFault();
+    Panicker::get_instance().recover_fault();
 
-    PanicCtx(ctx, true, "EXC: PageFault cr2 0x%lX rip 0x%lX rsp 0x%lX err 0x%lX cr3 0x%lX",
-        GetCr2(), ctx->GetRetRip(true), ctx->GetOrigRsp(true),
-        ctx->GetErrorCode(), GetCr3());
+    PANIC_CTX(ctx, true, "EXC: PageFault cr2 0x%lX rip 0x%lX rsp 0x%lX err 0x%lX cr3 0x%lX",
+        get_cr2(), ctx->get_ret_rip(true), ctx->get_orig_rsp(true),
+        ctx->get_error_code(), get_cr3());
 }
 
-void ExceptionTable::ExcReserved(Context* ctx)
+void ExceptionTable::exc_reserved(Context* ctx)
 {
-    ExcReservedCounter.Inc();
+    exc_reserved_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: Reserved rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: Reserved rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcMathFault(Context* ctx)
+void ExceptionTable::exc_math_fault(Context* ctx)
 {
-    ExcMathFaultCounter.Inc();
+    exc_math_fault_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: MathFault rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: MathFault rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcAlignmentCheck(Context* ctx)
+void ExceptionTable::exc_alignment_check(Context* ctx)
 {
-    ExcAlignmentCheckCounter.Inc();
+    exc_alignment_check_counter_.inc();
 
-    PanicCtx(ctx, true, "EXC: AlignmentCheck rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: AlignmentCheck rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-void ExceptionTable::ExcMachineCheck(Context* ctx)
+void ExceptionTable::exc_machine_check(Context* ctx)
 {
-    ExcMachineCheckCounter.Inc();
+    exc_machine_check_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: MachineCheck rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: MachineCheck rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcSIMDFpException(Context* ctx)
+void ExceptionTable::exc_simd_fp_exception(Context* ctx)
 {
-    ExcSIMDFpExceptionCounter.Inc();
+    exc_simd_fp_exception_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: SIMDFpException rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: SIMDFpException rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcVirtException(Context* ctx)
+void ExceptionTable::exc_virt_exception(Context* ctx)
 {
-    ExcVirtExceptionCounter.Inc();
+    exc_virt_exception_counter_.inc();
 
-    PanicCtx(ctx, false, "EXC: VirtException rip 0x%lX rsp 0x%lX",
-        ctx->GetRetRip(), ctx->GetOrigRsp());
+    PANIC_CTX(ctx, false, "EXC: VirtException rip 0x%lX rsp 0x%lX",
+        ctx->get_ret_rip(), ctx->get_orig_rsp());
 }
 
-void ExceptionTable::ExcControlProtection(Context* ctx)
+void ExceptionTable::exc_control_protection(Context* ctx)
 {
-    ExcControlProtectionCounter.Inc();
+    exc_control_protection_counter_.inc();
 
-    PanicCtx(ctx, true, "EXC: ControlProtection rip 0x%lX rsp 0x%lX err 0x%lX",
-        ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
+    PANIC_CTX(ctx, true, "EXC: ControlProtection rip 0x%lX rsp 0x%lX err 0x%lX",
+        ctx->get_ret_rip(true), ctx->get_orig_rsp(true), ctx->get_error_code());
 }
 
-extern "C" void ExcDivideByZero(Context* ctx)
+extern "C" void exc_divide_by_zero(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcDivideByZero(ctx);
+    exc_table.exc_divide_by_zero(ctx);
 }
 
-extern "C" void ExcDebugger(Context* ctx)
+extern "C" void exc_debugger(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcDebugger(ctx);
+    exc_table.exc_debugger(ctx);
 }
 
-extern "C" void ExcNMI(Context* ctx)
+extern "C" void exc_nmi(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcNMI(ctx);
+    exc_table.exc_nmi(ctx);
 }
 
-extern "C" void ExcBreakpoint(Context* ctx)
+extern "C" void exc_breakpoint(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcBreakpoint(ctx);
+    exc_table.exc_breakpoint(ctx);
 }
 
-extern "C" void ExcOverflow(Context* ctx)
+extern "C" void exc_overflow(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcOverflow(ctx);
+    exc_table.exc_overflow(ctx);
 }
 
-extern "C" void ExcBounds(Context* ctx)
+extern "C" void exc_bounds(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcBounds(ctx);
+    exc_table.exc_bounds(ctx);
 }
 
-extern "C" void ExcInvalidOpcode(Context* ctx)
+extern "C" void exc_invalid_opcode(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcInvalidOpcode(ctx);
+    exc_table.exc_invalid_opcode(ctx);
 }
 
-extern "C" void ExcCoprocessorNotAvailable(Context* ctx)
+extern "C" void exc_coprocessor_not_available(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcCoprocessorNotAvailable(ctx);
+    exc_table.exc_coprocessor_not_available(ctx);
 }
 
-extern "C" void ExcDoubleFault(Context* ctx)
+extern "C" void exc_double_fault(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcDoubleFault(ctx);
+    exc_table.exc_double_fault(ctx);
 }
 
-extern "C" void ExcCoprocessorSegmentOverrun(Context* ctx)
+extern "C" void exc_coprocessor_segment_overrun(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcCoprocessorSegmentOverrun(ctx);
+    exc_table.exc_coprocessor_segment_overrun(ctx);
 }
 
-extern "C" void ExcInvalidTaskStateSegment(Context* ctx)
+extern "C" void exc_invalid_task_state_segment(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcInvalidTaskStateSegment(ctx);
+    exc_table.exc_invalid_task_state_segment(ctx);
 }
 
-extern "C" void ExcSegmentNotPresent(Context* ctx)
+extern "C" void exc_segment_not_present(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcSegmentNotPresent(ctx);
+    exc_table.exc_segment_not_present(ctx);
 }
 
-extern "C" void ExcStackFault(Context* ctx)
+extern "C" void exc_stack_fault(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcStackFault(ctx);
+    exc_table.exc_stack_fault(ctx);
 }
 
-extern "C" void ExcGeneralProtectionFault(Context* ctx)
+extern "C" void exc_general_protection_fault(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcGeneralProtectionFault(ctx);
+    exc_table.exc_general_protection_fault(ctx);
 }
 
-extern "C" void ExcPageFault(Context* ctx)
+extern "C" void exc_page_fault(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcPageFault(ctx);
+    exc_table.exc_page_fault(ctx);
 }
 
-extern "C" void ExcReserved(Context* ctx)
+extern "C" void exc_reserved(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcReserved(ctx);
+    exc_table.exc_reserved(ctx);
 }
 
-extern "C" void ExcMathFault(Context* ctx)
+extern "C" void exc_math_fault(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcMathFault(ctx);
+    exc_table.exc_math_fault(ctx);
 }
 
-extern "C" void ExcAlignmentCheck(Context* ctx)
+extern "C" void exc_alignment_check(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcAlignmentCheck(ctx);
+    exc_table.exc_alignment_check(ctx);
 }
 
-extern "C" void ExcMachineCheck(Context* ctx)
+extern "C" void exc_machine_check(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcMachineCheck(ctx);
+    exc_table.exc_machine_check(ctx);
 }
 
-extern "C" void ExcSIMDFpException(Context* ctx)
+extern "C" void exc_simd_fp_exception(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcSIMDFpException(ctx);
+    exc_table.exc_simd_fp_exception(ctx);
 }
 
-extern "C" void ExcVirtException(Context* ctx)
+extern "C" void exc_virt_exception(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcVirtException(ctx);
+    exc_table.exc_virt_exception(ctx);
 }
 
-extern "C" void ExcControlProtection(Context* ctx)
+extern "C" void exc_control_protection(Context* ctx)
 {
-    auto& excTable = ExceptionTable::GetInstance();
+    auto& exc_table = ExceptionTable::get_instance();
 
-    excTable.ExcControlProtection(ctx);
+    exc_table.exc_control_protection(ctx);
 }
 
 }

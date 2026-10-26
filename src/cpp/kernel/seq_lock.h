@@ -3,47 +3,47 @@
 #include "atomic.h"
 #include <hal/barrier.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class SeqLock final
 {
 public:
     SeqLock()
-        : Seq(0)
+        : seq_(0)
     {
     }
 
     ~SeqLock() {}
 
     /* Writer: call from single writer context (e.g. IRQ handler) */
-    void WriteBegin()
+    void write_begin()
     {
-        Seq.Inc();
-        Hal::SmpWmb();
+        seq_.inc();
+        hal::smp_wmb();
     }
 
-    void WriteEnd()
+    void write_end()
     {
-        Hal::SmpWmb();
-        Seq.Inc();
+        hal::smp_wmb();
+        seq_.inc();
     }
 
     /* Reader: retry loop */
-    long ReadBegin()
+    long read_begin()
     {
         long s;
         do {
-            s = Seq.Get();
+            s = seq_.get();
         } while (s & 1); /* spin while writer is active (odd) */
-        Hal::SmpRmb();
+        hal::smp_rmb();
         return s;
     }
 
-    bool ReadRetry(long start)
+    bool read_retry(long start)
     {
-        Hal::SmpRmb();
-        return Seq.Get() != start;
+        hal::smp_rmb();
+        return seq_.get() != start;
     }
 
 private:
@@ -52,7 +52,7 @@ private:
     SeqLock& operator=(const SeqLock& other) = delete;
     SeqLock& operator=(SeqLock&& other) = delete;
 
-    Atomic Seq;
+    Atomic seq_;
 };
 
 }

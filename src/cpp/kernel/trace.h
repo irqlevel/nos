@@ -6,21 +6,21 @@
 #include <lib/error.h>
 #include <lib/ring_buffer.h>
 
-namespace Kernel
+namespace kernel
 {
 
-const int ExcLL = 0;
-const int AcpiLL = 0;
-const int CmdLL = 0;
-const int KbdLL = 3;
-const int UsbLL = 3;
-const int PageAllocatorLL = 4;
-const int AllocatorLL = 4;
-const int PoolLL = 4;
-const int LapicLL = 0;
-const int IoApicLL = 0;
-const int MmIoLL = 4;
-const int TestLL = 3;
+const int EXC_LL = 0;
+const int ACPI_LL = 0;
+const int CMD_LL = 0;
+const int KBD_LL = 3;
+const int USB_LL = 3;
+const int PAGE_ALLOCATOR_LL = 4;
+const int ALLOCATOR_LL = 4;
+const int POOL_LL = 4;
+const int LAPIC_LL = 0;
+const int IO_APIC_LL = 0;
+const int MM_IO_LL = 4;
+const int TEST_LL = 3;
 
 /* One line per entropy source per reseed, and a reseed is a rare event -- but
    a source that quietly stops answering is worth being able to see. */
@@ -30,44 +30,44 @@ const int TestLL = 3;
    in the dmesg ring and in the netconsole stream. The counters behind
    `icmpstat` already say how many arrived and how many were answered;
    `loglevel 3` brings the per-packet detail back. */
-const int IcmpLL = 3;
+const int ICMP_LL = 3;
 
 /* Task create/start/free/destroy. Six lines per task, and the multitasking
    self-test makes one task per CPU twice over: on a 20-CPU box that is a
    third of everything printed before the network exists, all of it competing
    for room in the netconsole ring with the lines someone actually needs.
    `loglevel 3` brings it back on a running kernel. */
-const int TaskLL = 3;
+const int TASK_LL = 3;
 
 /* Loadable modules: what each import bound to and the permissions each
    segment got, a few lines per insmod. The load and unload themselves are
    always traced. */
-const int ModuleLL = 3;
+const int MODULE_LL = 3;
 
 /* The highest level any call site above uses, and the bound the shell's
    loglevel command accepts. Raise it together with a noisier call site. */
-const int MaxTraceLevel = 5;
+const int MAX_TRACE_LEVEL = 5;
 
 class Tracer
 {
 public:
-    static Tracer& GetInstance()
+    static Tracer& get_instance()
     {
-        static Tracer Instance;
+        static Tracer instance;
 
-        return Instance;
+        return instance;
     }
 
-    PRINTF_FORMAT(2, 3) void Output(const char *fmt, ...);
+    PRINTF_FORMAT(2, 3) void output(const char *fmt, ...);
 
-    PRINTF_FORMAT(3, 4) void Output(Stdlib::Error& err, const char *fmt, ...);
+    PRINTF_FORMAT(3, 4) void output(stdlib::Error& err, const char *fmt, ...);
 
-    void SetLevel(int level);
+    void set_level(int level);
 
-    int GetLevel();
+    int get_level();
 
-    void SetConsoleSuppressed(bool suppressed);
-    bool IsConsoleSuppressed();
+    void set_console_suppressed(bool suppressed);
+    bool is_console_suppressed();
 
 private:
     Tracer();
@@ -79,35 +79,35 @@ private:
 
     /* Written from the shell on one CPU while every other CPU reads it in
        Trace(); a stale read costs at most one line. */
-    volatile int Level;
-    bool ConsoleSuppressed;
+    volatile int level_;
+    bool console_suppressed_;
 };
 
 }
 
-#define Trace(level, fmt, ...)                                      \
+#define trace(level, fmt, ...)                                      \
 do {                                                                \
-    auto& tracer = Kernel::Tracer::GetInstance();                   \
-    if (unlikely((level) <= tracer.GetLevel()))                     \
+    auto& macro_tracer = kernel::Tracer::get_instance();             \
+    if (unlikely((level) <= macro_tracer.get_level()))               \
     {                                                               \
-        auto time = Kernel::GetBootTime();                          \
-        tracer.Output("%lu:%lu.%06lu:%s(),%s,%lu: " fmt "\n",        \
-            (ulong)(level), time.GetSecs(), time.GetUsecs(),        \
-            __func__, Stdlib::TruncateFileName(__FILE__),           \
+        auto macro_time = kernel::get_boot_time();                    \
+        macro_tracer.output("%lu:%lu.%06lu:%s(),%s,%lu: " fmt "\n",  \
+            (ulong)(level), macro_time.get_secs(), macro_time.get_usecs(), \
+            __func__, stdlib::truncate_file_name(__FILE__),           \
             (ulong)__LINE__, ##__VA_ARGS__);                        \
     }                                                               \
 } while (false)
 
-#define TraceError(err, fmt, ...)                                   \
+#define trace_error(err, fmt, ...)                                   \
 do {                                                                \
-    auto& tracer = Kernel::Tracer::GetInstance();                   \
-    if (unlikely(0 <= tracer.GetLevel()))                           \
+    auto& macro_tracer = kernel::Tracer::get_instance();             \
+    if (unlikely(0 <= macro_tracer.get_level()))                     \
     {                                                               \
-        auto time = Kernel::GetBootTime();                          \
-        tracer.Output("%lu:%lu.%06lu:%s(),%s,%lu: Error %lu at %s(),%s,%lu: " fmt "\n",   \
-            0UL, time.GetSecs(), time.GetUsecs(),                   \
-            __func__, Stdlib::TruncateFileName(__FILE__),           \
-            (ulong)__LINE__, (ulong)err.GetCode(), err.GetFunc(), Stdlib::TruncateFileName(err.GetFile()),  \
-            (ulong)err.GetLine(), ##__VA_ARGS__);                                  \
+        auto macro_time = kernel::get_boot_time();                    \
+        macro_tracer.output("%lu:%lu.%06lu:%s(),%s,%lu: Error %lu at %s(),%s,%lu: " fmt "\n", \
+            0UL, macro_time.get_secs(), macro_time.get_usecs(),       \
+            __func__, stdlib::truncate_file_name(__FILE__),           \
+            (ulong)__LINE__, (ulong)err.get_code(), err.get_func(), stdlib::truncate_file_name(err.get_file()),  \
+            (ulong)err.get_line(), ##__VA_ARGS__);                                  \
     }                                                               \
 } while (false)

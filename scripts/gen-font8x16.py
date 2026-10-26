@@ -65,8 +65,8 @@ def main():
               "   Glyphs rasterized from DejaVu Sans Mono (Bitstream Vera\n"
               "   derived, permissive license) into 8x16 monochrome cells. */\n\n"
               '#include "font8x16.h"\n\n'
-              "namespace Kernel\n{\n\n"
-              "const u8 Font8x16[Font8x16GlyphCount][Font8x16Height] = {\n")
+              "namespace kernel\n{\n\n"
+              "const u8 FONT8X16[FONT8X16_GLYPH_COUNT][FONT8X16_HEIGHT] = {\n")
     for code in range(FIRST, LAST + 1):
         rows = tall[code][origin:origin + HEIGHT]
         name = chr(code) if code not in (0x27, 0x5C) else "\\" + chr(code)

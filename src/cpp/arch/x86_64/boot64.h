@@ -7,7 +7,7 @@ extern "C"
 {
 #endif
 
-void ApStart16(void);
+void ap_start16(void);
 
 #ifdef __cplusplus
 }

@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <include/const.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* Minimal flattened-device-tree (DTB) reader: structure-block walk with
@@ -24,11 +24,11 @@ public:
        walker exposes a cursor over nodes with their parent cell counts. */
     struct Node
     {
-        const char* Name;       /* node name (with unit address) */
-        ulong Offset;           /* structure-block offset of this node */
-        int Depth;
-        u32 AddressCells;       /* #address-cells inherited from parent */
-        u32 SizeCells;          /* #size-cells inherited from parent */
+        const char* name;       /* node name (with unit address) */
+        ulong offset;           /* structure-block offset of this node */
+        int depth;
+        u32 address_cells;       /* #address-cells inherited from parent */
+        u32 size_cells;          /* #size-cells inherited from parent */
     };
 
     /* A property's value: its bytes, and how many there are. Every read is
@@ -38,84 +38,84 @@ public:
     {
     public:
         Prop()
-            : Data(nullptr)
-            , Len(0)
+            : data_(nullptr)
+            , len_(0)
         {
         }
 
         Prop(const u8* data, u32 len)
-            : Data(data)
-            , Len(len)
+            : data_(data)
+            , len_(len)
         {
         }
 
-        bool Present() const { return Data != nullptr; }
-        u32 Length() const { return Len; }
+        bool present() const { return data_ != nullptr; }
+        u32 length() const { return len_; }
 
         /* The big-endian u32 cell at index; false past the value's end. */
-        bool Cell(ulong index, u32& value) const;
+        bool cell(ulong index, u32& value) const;
 
         /* count cells from cell index on, read as one big-endian number:
            no cells are 0, and more than two do not fit a u64 and are
            refused, as is a run past the value's end. */
-        bool Cells(ulong index, u32 count, u64& value) const;
+        bool cells(ulong index, u32 count, u64& value) const;
 
         /* The value as a string: only if it is NUL-terminated within its
            length, nullptr otherwise. */
-        const char* String() const;
+        const char* string() const;
 
     private:
-        const u8* Data;
-        u32 Len;
+        const u8* data_;
+        u32 len_;
     };
 
-    bool Setup(const void* dtb);
+    bool setup(const void* dtb);
 
-    bool IsValid() const { return Valid; }
+    bool is_valid() const { return valid_; }
 
     /* Iterate nodes in structure order. Pass zeroed Node to start; returns
        false when the tree is exhausted, or found corrupt. */
-    bool NextNode(Node& node);
+    bool next_node(Node& node);
 
     /* The property of the node the cursor points at; absent if the node has
        none of that name. */
-    Prop GetProp(const Node& node, const char* name);
+    Prop get_prop(const Node& node, const char* name);
 
     /* True if the node's compatible list contains the given string. */
-    bool IsCompatible(const Node& node, const char* compat);
+    bool is_compatible(const Node& node, const char* compat);
 
-    ulong GetTotalSize() const { return TotalSize; }
+    ulong get_total_size() const { return total_size_; }
 
-    static u32 Be32(const void* p);
+    static u32 be32(const void* p);
 
     /* The largest blob the arm64 boot protocol allows (Linux's
        Documentation/arch/arm64/booting.rst): nothing past it is the DTB's. */
-    static const ulong MaxSize = 2 * Const::MB;
+    static const ulong MAX_SIZE = 2 * consts::MB;
 
 private:
-    const u8* Base = nullptr;
-    ulong TotalSize = 0;
-    ulong StructOff = 0;
-    ulong StructSize = 0;
-    ulong StringsOff = 0;
-    ulong StringsSize = 0;
-    bool Valid = false;
+    const u8* base_ = nullptr;
+    ulong total_size_ = 0;
+    ulong struct_off_ = 0;
+    ulong struct_size_ = 0;
+    ulong strings_off_ = 0;
+    ulong strings_size_ = 0;
+    bool valid_ = false;
 
-    static const u32 Magic = 0xD00DFEED;
-    static const u32 TokBeginNode = 1;
-    static const u32 TokEndNode = 2;
-    static const u32 TokProp = 3;
-    static const u32 TokNop = 4;
-    static const u32 TokEnd = 9;
+    static const u32 MAGIC = 0xD00DFEED;
+    static const u32 TOK_BEGIN_NODE = 1;
+    static const u32 TOK_END_NODE = 2;
+    static const u32 TOK_PROP = 3;
+    static const u32 TOK_NOP = 4;
+    static const u32 TOK_END = 9;
 
-    u32 TokenAt(ulong off) const;
-    const char* String(u32 off) const;
+    u32 token_at(ulong off) const;
+    const char* string(u32 off) const;
     /* Length of the NUL-terminated string at structure offset `off`,
        bounded by the structure block; (ulong)-1 if unterminated. */
-    ulong BoundedNameLen(ulong off) const;
+    ulong bounded_name_len(ulong off) const;
     /* StrCmp(String(nameOff), name), refusing to run past the strings
        block on a corrupt nameOff / unterminated string. */
-    bool StringMatches(u32 nameOff, const char* name) const;
+    bool string_matches(u32 name_off, const char* name) const;
 };
 
 }

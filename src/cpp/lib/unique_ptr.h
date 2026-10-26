@@ -6,7 +6,7 @@
 #include <kernel/panic.h>
 #include <mm/new.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 template<typename T, typename Deleter = DefaultDeleter<T>>
@@ -16,86 +16,86 @@ public:
     UniquePtr(UniquePtr&& other)
         : UniquePtr()
     {
-        Reset(other.Release());
+        reset(other.release());
     }
 
     UniquePtr& operator=(UniquePtr&& other)
     {
         if (this != &other)
         {
-            Reset(other.Release());
+            reset(other.release());
         }
         return *this;
     }
 
     UniquePtr()
-        : Object(nullptr)
+        : object_(nullptr)
     {
     }
 
     UniquePtr(T* object)
         : UniquePtr()
     {
-        Reset(object);
+        reset(object);
     }
 
     UniquePtr(const UniquePtr& other) = delete;
 
     UniquePtr& operator=(const UniquePtr& other) = delete;
 
-    void Reset(T* object)
+    void reset(T* object)
     {
-        BugOn(Object != nullptr && Object == object);
+        BUG_ON(object_ != nullptr && object_ == object);
 
-        if (Object != nullptr)
+        if (object_ != nullptr)
         {
-            Deleter()(Object);
-            Object = nullptr;
+            Deleter()(object_);
+            object_ = nullptr;
         }
 
-        Object = object;
+        object_ = object;
     }
 
-    void Reset()
+    void reset()
     {
-        Reset(nullptr);
+        reset(nullptr);
     }
 
-    T* Release()
+    T* release()
     {
-        T* object = Object;
-        Object = nullptr;
+        T* object = object_;
+        object_ = nullptr;
         return object;
     }
 
     ~UniquePtr()
     {
-        Reset(nullptr);
+        reset(nullptr);
     }
 
-    T* Get() const
+    T* get() const
     {
-        return Object;
+        return object_;
     }
 
     T& operator*() const
     {
-        return *Get();
+        return *get();
     }
 
     T* operator->() const
     {
-        return Get();
+        return get();
     }
 
 private:
-    T* Object;
+    T* object_;
 };
 
 template<typename T, class... Args>
-UniquePtr<T> MakeUnique(Args&&... args)
+UniquePtr<T> make_unique(Args&&... args)
 {
-    return UniquePtr<T>(Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...));
+    return UniquePtr<T>(kernel::mm::talloc<T, 0>(stdlib::forward<Args>(args)...));
 }
 
 }

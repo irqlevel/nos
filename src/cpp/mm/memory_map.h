@@ -3,20 +3,20 @@
 #include <include/types.h>
 #include <kernel/atomic.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 class MemoryMap final
 {
 public:
-    static MemoryMap& GetInstance()
+    static MemoryMap& get_instance()
     {
-        static MemoryMap Instance;
+        static MemoryMap instance;
 
-        return Instance;
+        return instance;
     }
     ~MemoryMap();
 
@@ -27,36 +27,36 @@ public:
        cut there -- or dropped, if it starts past it -- which leaves every
        Addr + Len in the map at most MaxPhysAddr, and no query's arithmetic
        able to wrap. */
-    bool AddRegion(ulong addr, ulong len, ulong type);
+    bool add_region(ulong addr, ulong len, ulong type);
 
     /* No CPU either arch runs on has a physical address past 52 bits
        (x86's MAXPHYADDR, arm64 with LPA), so no RAM or device is there. */
-    static const ulong MaxPhysAddr = 1UL << 52;
+    static const ulong MAX_PHYS_ADDR = 1UL << 52;
 
     /* How many regions the map holds: what Linux's boot protocol passes
        (E820_MAX_ENTRIES_ZEROPAGE) */
-    static const size_t MaxRegions = 128;
+    static const size_t MAX_REGIONS = 128;
 
-    ulong GetKernelStart();
+    ulong get_kernel_start();
 
-    ulong GetKernelEnd();
+    ulong get_kernel_end();
 
-    size_t GetRegionCount();
+    size_t get_region_count();
 
-    bool GetRegion(size_t index, ulong& addr, ulong& len, ulong& type);
+    bool get_region(size_t index, ulong& addr, ulong& len, ulong& type);
 
     /* Usable (type 1) RAM the firmware reported: all of it, the end of the
        highest such region, and how much of it lies at or above limit. The
        kernel can only free-list what the bootstrap linear map reaches, so
        the last one is the RAM the machine has and does not use. */
-    ulong GetUsableRamBytes();
-    ulong GetUsableRamEnd();
-    ulong GetUsableRamBytesAbove(ulong limit);
+    ulong get_usable_ram_bytes();
+    ulong get_usable_ram_end();
+    ulong get_usable_ram_bytes_above(ulong limit);
 
     /* True if any usable RAM falls in [start, end). The bootstrap map grows
        in 1GiB blocks; a block with no RAM in it is left unmapped rather than
        mapped cacheable over unbacked bus space. */
-    bool HasUsableRamIn(ulong start, ulong end);
+    bool has_usable_ram_in(ulong start, ulong end);
 
     /* The two queries a page scan wants instead of IsReserved per page. A
        real server's map has twenty-odd reserved regions and sixteen million
@@ -68,33 +68,33 @@ public:
        GetNextReservedStart: the page-aligned start of the next reserved
        region above phyAddr, or limit if none is below limit. Between the two
        a scan moves boundary to boundary. */
-    ulong GetReservedEnd(ulong phyAddr);
-    ulong GetNextReservedStart(ulong phyAddr, ulong limit);
+    ulong get_reserved_end(ulong phy_addr);
+    ulong get_next_reserved_start(ulong phy_addr, ulong limit);
 
     /* Name of a firmware region type, for the shell. */
-    static const char* GetRegionTypeName(ulong type);
+    static const char* get_region_type_name(ulong type);
 
     /* True if the physical page containing phyAddr lies in a usable RAM
        (e820 type 1) region. Used to pick cacheability for mappings:
        usable RAM is mapped write-back, everything else (MMIO, reserved,
        ACPI) is mapped uncached. */
-    bool IsUsableRam(ulong phyAddr);
+    bool is_usable_ram(ulong phy_addr);
 
     /* True if [phyAddr, phyAddr+len) overlaps any reserved (non-type-1)
        region — e.g. the DTB carve-out on arm64. The free-page scan must
        skip such pages even when a usable-RAM region covers them. */
-    bool IsReserved(ulong phyAddr, ulong len);
+    bool is_reserved(ulong phy_addr, ulong len);
 
     /* e820/EFI region types. Ordinary usable RAM is 1; everything else is
        MMIO, firmware-reserved or ACPI, and the page allocator stays out of
        it. The kernel adds regions of its own (the arm64 DTB, PageArray's
        backing) as reserved, which is what keeps GetFreePages off them. */
-    static const ulong UsableRamType = 1;
-    static const ulong ReservedType = 2;
+    static const ulong USABLE_RAM_TYPE = 1;
+    static const ulong RESERVED_TYPE = 2;
 
-    static const ulong KernelSpaceBase = 0xFFFF800000000000;
+    static const ulong KERNEL_SPACE_BASE = 0xFFFF800000000000;
 
-    static const ulong UserSpaceMax = 0x00007FFFFFFFFFFF;
+    static const ulong USER_SPACE_MAX = 0x00007FFFFFFFFFFF;
 
 private:
     MemoryMap(const MemoryMap& other) = delete;
@@ -107,13 +107,13 @@ private:
 
     struct MemoryRegion
     {
-        ulong Addr;
-        ulong Len;
-        ulong Type;
+        ulong addr;
+        ulong len;
+        ulong type;
     };
 
-    MemoryRegion Region[MaxRegions];
-    size_t Size;
+    MemoryRegion region_[MAX_REGIONS];
+    size_t size_;
 
     /* Index of the region that last answered IsUsableRam. A hint only, and
        shared: temp mappings ask under TmpMapLock, and memcheck asks with no
@@ -121,7 +121,7 @@ private:
        be a data race, however harmless its value -- and every read of it
        is bounds-checked: a stale value costs a full scan, never a wrong
        answer. */
-    Atomic LastUsableRegion;
+    Atomic last_usable_region_;
 };
 
 }

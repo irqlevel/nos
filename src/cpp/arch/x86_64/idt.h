@@ -5,7 +5,7 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 struct Context;
@@ -14,23 +14,23 @@ class Idt final
 {
 public:
 
-    static Idt& GetInstance()
+    static Idt& get_instance()
     {
-        static Idt Instance;
-        return Instance;
+        static Idt instance;
+        return instance;
     }
 
-    void Save();
+    void save();
 
-    IdtDescriptor GetDescriptor(u16 index);
+    IdtDescriptor get_descriptor(u16 index);
 
-    void SetDescriptor(u16 index, const IdtDescriptor& desc);
+    void set_descriptor(u16 index, const IdtDescriptor& desc);
 
-    u32 GetBase();
+    u32 get_base();
 
-    u16 GetLimit();
+    u16 get_limit();
 
-    void DummyInterrupt(Context* ctx, u8 vector);
+    void dummy_interrupt(Context* ctx, u8 vector);
 
 private:
     Idt();
@@ -44,22 +44,22 @@ private:
 
     /* Slots below this are CPU exceptions (Intel reserved); device
        interrupts start at 0x20 */
-    static const u8 FirstDeviceVector = 0x20;
+    static const u8 FIRST_DEVICE_VECTOR = 0x20;
 
     /* Report a stray interrupt this many times, then only count it: a
        level-triggered source nobody can acknowledge repeats forever */
-    static const long MaxDummyReports = 8;
+    static const long MAX_DUMMY_REPORTS = 8;
 
     struct TableDesc {
-	    u16 Limit;
-	    u64 Base;
+	    u16 limit;
+	    u64 base;
     } __attribute((packed));
 
-    u64 Base;
-    u16 Limit;
+    u64 base_;
+    u16 limit_;
 
-    IdtDescriptor Entry[256];
-    Atomic DummyInterruptCounter;
+    IdtDescriptor entry_[256];
+    Atomic dummy_interrupt_counter_;
 };
 
 }

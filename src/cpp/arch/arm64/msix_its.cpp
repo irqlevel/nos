@@ -16,205 +16,205 @@
    interrupt install (an LPI handler, not an IDT vector) differ. This is a
    per-arch TU of the shared class, like CpuTable::StartAll. */
 
-namespace Kernel
+namespace kernel
 {
 
-static const u8 PciCapIdMsix = 0x11;
-static const u16 PciCommandIntxDisable = (u16)(1 << 10);
-static const u16 MsixControlEnable = (u16)(1 << 15);
-static const u16 MsixControlFuncMask = (u16)(1 << 14);
+static const u8 PCI_CAP_ID_MSIX = 0x11;
+static const u16 PCI_COMMAND_INTX_DISABLE = (u16)(1 << 10);
+static const u16 MSIX_CONTROL_ENABLE = (u16)(1 << 15);
+static const u16 MSIX_CONTROL_FUNC_MASK = (u16)(1 << 14);
 
-Atomic MsixTable::NextVectorOffset;
+Atomic MsixTable::next_vector_offset_;
 
 MsixTable::MsixTable()
-    : Table(nullptr)
-    , Count(0)
-    , CapOffset(0)
-    , Dev(nullptr)
-    , PciMsixEnabled(false)
-    , EntryVector(nullptr)
+    : table_(nullptr)
+    , count_(0)
+    , cap_offset_(0)
+    , dev_(nullptr)
+    , pci_msix_enabled_(false)
+    , entry_vector_(nullptr)
 {
 }
 
 MsixTable::~MsixTable()
 {
-    if (EntryVector)
+    if (entry_vector_)
     {
-        Mm::Free(EntryVector);
-        EntryVector = nullptr;
+        mm::free(entry_vector_);
+        entry_vector_ = nullptr;
     }
-    Table = nullptr;
-    Count = 0;
-    Dev = nullptr;
+    table_ = nullptr;
+    count_ = 0;
+    dev_ = nullptr;
 }
 
-bool MsixTable::MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar,
-    ulong tableBytes)
+bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_bar,
+    ulong table_bytes)
 {
     if (bar >= 6)
         return false;
 
-    auto& pci = Pci::GetInstance();
-    u32 barVal = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
-    if (barVal & 1)
+    auto& pci = Pci::get_instance();
+    u32 bar_val = pci.get_bar(dev->bus, dev->slot, dev->func, bar);
+    if (bar_val & 1)
         return false;
 
-    ulong physAddr = barVal & ~0xFUL;
-    bool is64 = ((barVal & 0x6) == 0x4) && (bar + 1 < 6);
+    ulong phys_addr = bar_val & ~0xFUL;
+    bool is64 = ((bar_val & 0x6) == 0x4) && (bar + 1 < 6);
     if (is64)
-        physAddr |= ((ulong)pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1)) << 32);
-    if (physAddr == 0)
+        phys_addr |= ((ulong)pci.get_bar(dev->bus, dev->slot, dev->func, (u8)(bar + 1)) << 32);
+    if (phys_addr == 0)
         return false;
 
-    ulong mapBytes = offsetInBar + tableBytes;
-    mapBytes = (mapBytes + Const::PageSize - 1) & ~(Const::PageSize - 1);
+    ulong map_bytes = offset_in_bar + table_bytes;
+    map_bytes = (map_bytes + consts::PAGE_SIZE - 1) & ~(consts::PAGE_SIZE - 1);
 
-    ulong va = Mm::PageTable::GetInstance().MapMmioRegion(physAddr, mapBytes);
+    ulong va = mm::PageTable::get_instance().map_mmio_region(phys_addr, map_bytes);
     if (va == 0)
         return false;
 
-    Table = (volatile u8*)(va + offsetInBar);
+    table_ = (volatile u8*)(va + offset_in_bar);
     return true;
 }
 
-bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
+bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
 {
-    if (!dev || !dev->Valid)
+    if (!dev || !dev->valid)
         return false;
 
-    Dev = dev;
+    dev_ = dev;
 
-    auto& pci = Pci::GetInstance();
-    u8 cap = pci.FindCapability(dev->Bus, dev->Slot, dev->Func, PciCapIdMsix);
+    auto& pci = Pci::get_instance();
+    u8 cap = pci.find_capability(dev->bus, dev->slot, dev->func, PCI_CAP_ID_MSIX);
     if (cap == 0)
         return false;
 
-    CapOffset = cap;
+    cap_offset_ = cap;
 
-    u32 capDw0 = pci.ReadDword(dev->Bus, dev->Slot, dev->Func, cap);
-    u16 msgCtrl = (u16)((capDw0 >> 16) & 0xFFFF);
-    Count = (u16)((msgCtrl & 0x7FFu) + 1);
-    if (Count == 0)
+    u32 cap_dw0 = pci.read_dword(dev->bus, dev->slot, dev->func, cap);
+    u16 msg_ctrl = (u16)((cap_dw0 >> 16) & 0xFFFF);
+    count_ = (u16)((msg_ctrl & 0x7FFu) + 1);
+    if (count_ == 0)
         return false;
 
-    u32 tblInfo = pci.ReadDword(dev->Bus, dev->Slot, dev->Func, (u16)(cap + 4));
-    u8 bir = (u8)(tblInfo & 7);
-    ulong offInBar = tblInfo & ~7UL;
-    ulong tableBytes = (ulong)Count * 16;
+    u32 tbl_info = pci.read_dword(dev->bus, dev->slot, dev->func, (u16)(cap + 4));
+    u8 bir = (u8)(tbl_info & 7);
+    ulong off_in_bar = tbl_info & ~7UL;
+    ulong table_bytes = (ulong)count_ * 16;
 
-    EntryVector = (u8*)Mm::Alloc((size_t)Count, 0);
-    if (!EntryVector)
+    entry_vector_ = (u8*)mm::alloc((size_t)count_, 0);
+    if (!entry_vector_)
         return false;
-    Stdlib::MemSet(EntryVector, 0, (size_t)Count);
+    stdlib::mem_set(entry_vector_, 0, (size_t)count_);
 
     bool mapped = false;
-    if (mappedBars && bir < 6 && mappedBars[bir] != 0)
+    if (mapped_bars && bir < 6 && mapped_bars[bir] != 0)
     {
-        Table = (volatile u8*)(mappedBars[bir] + offInBar);
+        table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
         mapped = true;
     }
-    if (!mapped && !MapBarForTable(dev, bir, offInBar, tableBytes))
+    if (!mapped && !map_bar_for_table(dev, bir, off_in_bar, table_bytes))
     {
-        Mm::Free(EntryVector);
-        EntryVector = nullptr;
-        Table = nullptr;
-        Count = 0;
+        mm::free(entry_vector_);
+        entry_vector_ = nullptr;
+        table_ = nullptr;
+        count_ = 0;
         return false;
     }
 
-    for (u16 i = 0; i < Count; i++)
-        Mask(i);
+    for (u16 i = 0; i < count_; i++)
+        mask(i);
 
     /* Map the device with the ITS up front (RID = deviceId on QEMU virt) */
-    u32 deviceId = ((u32)dev->Bus << 8) | ((u32)dev->Slot << 3) | dev->Func;
-    Its::GetInstance().MapDevice(deviceId, Count);
+    u32 device_id = ((u32)dev->bus << 8) | ((u32)dev->slot << 3) | dev->func;
+    Its::get_instance().map_device(device_id, count_);
 
-    Trace(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
-        (ulong)Count, (ulong)cap, (ulong)deviceId);
+    trace(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
+        (ulong)count_, (ulong)cap, (ulong)device_id);
     return true;
 }
 
-u8 MsixTable::AllocVector()
+u8 MsixTable::alloc_vector()
 {
     /* Unused on arm64 (LPIs are allocated by the ITS); kept for ABI. */
     return 0;
 }
 
-void MsixTable::DisableLegacyIntx(Pci::DeviceInfo* dev)
+void MsixTable::disable_legacy_intx(Pci::DeviceInfo* dev)
 {
-    auto& pci = Pci::GetInstance();
-    u16 cmd = pci.ReadWord(dev->Bus, dev->Slot, dev->Func, 0x04);
-    cmd = (u16)(cmd | PciCommandIntxDisable);
-    pci.WriteWord(dev->Bus, dev->Slot, dev->Func, 0x04, cmd);
+    auto& pci = Pci::get_instance();
+    u16 cmd = pci.read_word(dev->bus, dev->slot, dev->func, 0x04);
+    cmd = (u16)(cmd | PCI_COMMAND_INTX_DISABLE);
+    pci.write_word(dev->bus, dev->slot, dev->func, 0x04, cmd);
 }
 
-u8 MsixTable::EnableVector(u16 index, InterruptHandler& handler)
+u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
 {
-    if (!Table || !Dev || index >= Count || CapOffset == 0)
+    if (!table_ || !dev_ || index >= count_ || cap_offset_ == 0)
         return 0;
-    if (EntryVector[index] != 0)
-        return EntryVector[index];
+    if (entry_vector_[index] != 0)
+        return entry_vector_[index];
 
-    u32 deviceId = ((u32)Dev->Bus << 8) | ((u32)Dev->Slot << 3) | Dev->Func;
+    u32 device_id = ((u32)dev_->bus << 8) | ((u32)dev_->slot << 3) | dev_->func;
 
-    u64 msiAddr = 0;
-    u32 msiData = Its::GetInstance().MapEvent(deviceId, index, handler, msiAddr);
-    if (msiAddr == 0)
+    u64 msi_addr = 0;
+    u32 msi_data = Its::get_instance().map_event(device_id, index, handler, msi_addr);
+    if (msi_addr == 0)
     {
-        Trace(0, "MsixTable(its): MapEvent failed");
+        trace(0, "MsixTable(its): MapEvent failed");
         return 0;
     }
 
-    volatile u8* entry = Table + (ulong)index * 16;
+    volatile u8* entry = table_ + (ulong)index * 16;
     {
-        Stdlib::AutoLock lock(EntryLock);
-        MmioWrite32(entry + 0, (u32)(msiAddr & 0xFFFFFFFF));
-        MmioWrite32(entry + 4, (u32)(msiAddr >> 32));
-        MmioWrite32(entry + 8, msiData);
-        MmioWrite32(entry + 12, 0); /* unmasked */
+        stdlib::AutoLock lock(entry_lock_);
+        mmio_write32(entry + 0, (u32)(msi_addr & 0xFFFFFFFF));
+        mmio_write32(entry + 4, (u32)(msi_addr >> 32));
+        mmio_write32(entry + 8, msi_data);
+        mmio_write32(entry + 12, 0); /* unmasked */
     }
 
-    if (!PciMsixEnabled)
+    if (!pci_msix_enabled_)
     {
-        DisableLegacyIntx(Dev);
-        auto& pci = Pci::GetInstance();
-        u16 mc = pci.ReadWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2));
-        mc = (u16)((mc | MsixControlEnable) & ~MsixControlFuncMask);
-        pci.WriteWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2), mc);
-        PciMsixEnabled = true;
+        disable_legacy_intx(dev_);
+        auto& pci = Pci::get_instance();
+        u16 mc = pci.read_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2));
+        mc = (u16)((mc | MSIX_CONTROL_ENABLE) & ~MSIX_CONTROL_FUNC_MASK);
+        pci.write_word(dev_->bus, dev_->slot, dev_->func, (u16)(cap_offset_ + 2), mc);
+        pci_msix_enabled_ = true;
     }
 
     /* Non-zero token so re-enable is idempotent; the actual routing token
        is the ITS LPI, not a CPU vector. */
-    EntryVector[index] = (u8)(index + 1);
-    return EntryVector[index];
+    entry_vector_[index] = (u8)(index + 1);
+    return entry_vector_[index];
 }
 
-void MsixTable::Mask(u16 index)
+void MsixTable::mask(u16 index)
 {
-    if (!Table || index >= Count)
+    if (!table_ || index >= count_)
         return;
-    Stdlib::AutoLock lock(EntryLock);
-    volatile u8* entry = Table + (ulong)index * 16;
-    u32 ctrl = MmioRead32(entry + 12);
-    MmioWrite32(entry + 12, ctrl | 1);
+    stdlib::AutoLock lock(entry_lock_);
+    volatile u8* entry = table_ + (ulong)index * 16;
+    u32 ctrl = mmio_read32(entry + 12);
+    mmio_write32(entry + 12, ctrl | 1);
 }
 
-void MsixTable::Unmask(u16 index)
+void MsixTable::unmask(u16 index)
 {
-    if (!Table || index >= Count)
+    if (!table_ || index >= count_)
         return;
-    Stdlib::AutoLock lock(EntryLock);
-    volatile u8* entry = Table + (ulong)index * 16;
-    u32 ctrl = MmioRead32(entry + 12);
-    MmioWrite32(entry + 12, ctrl & ~1u);
+    stdlib::AutoLock lock(entry_lock_);
+    volatile u8* entry = table_ + (ulong)index * 16;
+    u32 ctrl = mmio_read32(entry + 12);
+    mmio_write32(entry + 12, ctrl & ~1u);
 }
 
-void MsixTable::Retarget(u16 index, u32 apicId)
+void MsixTable::retarget(u16 index, u32 apic_id)
 {
     /* No MSI balancing on arm64 yet (all LPIs on the boot collection) */
     (void)index;
-    (void)apicId;
+    (void)apic_id;
 }
 
 }

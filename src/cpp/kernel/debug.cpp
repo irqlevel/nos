@@ -1,17 +1,17 @@
 #include "debug.h"
 #include <hal/cpu.h>
 
-namespace Kernel
+namespace kernel
 {
 
-volatile bool DebugWaitActive = false;
+volatile bool debug_wait_active = false;
 
-void DebugWait()
+void debug_wait()
 {
-    DebugWaitActive = true;
-    while (DebugWaitActive)
+    debug_wait_active = true;
+    while (debug_wait_active)
     {
-        Pause();
+        cpu_relax();
     }	
 }
 

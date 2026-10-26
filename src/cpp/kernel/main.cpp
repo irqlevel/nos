@@ -53,34 +53,34 @@
 #include <kernel/module.h>
 #include <arch/x86_64/percpu.h>
 
-using namespace Kernel;
-using namespace Stdlib;
-using namespace Const;
+using namespace kernel;
+using namespace stdlib;
+using namespace consts;
 
-const size_t CpuStackSize = 8 * Const::PageSize;
-static char Stack[MaxCpus][8 * Const::PageSize] __attribute__((aligned(Const::PageSize)));
-static long StackIndex;
-static volatile long ApStartedFlag;
+const size_t CPU_STACK_SIZE = 8 * consts::PAGE_SIZE;
+static char stack[MAX_CPUS][8 * consts::PAGE_SIZE] __attribute__((aligned(consts::PAGE_SIZE)));
+static long stack_index;
+static volatile long ap_started_flag;
 
 #define ALLOC_CPU_STACK()                               \
 do {                                                    \
-    auto index = AtomicReadAndInc(&StackIndex);         \
-    if (index >= (long)MaxCpus)                         \
-        Panic("Can't allocate stack for cpu");          \
-    SetRsp((long)&Stack[index][CpuStackSize-128]);      \
+    auto index = atomic_read_and_inc(&stack_index);         \
+    if (index >= (long)MAX_CPUS)                         \
+        PANIC("Can't allocate stack for cpu");          \
+    set_rsp((long)&stack[index][CPU_STACK_SIZE-128]);      \
 } while (false)
 
-void TraceCpuState(ulong cpu)
+void trace_cpu_state(ulong cpu)
 {
-    Trace(0, "Cpu %lu cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
-        cpu, GetCr0(), GetCr2(), GetCr3(), GetCr4());
+    trace(0, "Cpu %lu cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
+        cpu, get_cr0(), get_cr2(), get_cr3(), get_cr4());
 
-    Trace(0, "Cpu %lu rflags 0x%lX rsp 0x%lX rip 0x%lX",
-        cpu, GetRflags(), GetRsp(), GetRip());
+    trace(0, "Cpu %lu rflags 0x%lX rsp 0x%lX rip 0x%lX",
+        cpu, get_rflags(), get_rsp(), get_rip());
 
-    Trace(0, "Cpu %lu ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
-        cpu, (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
-        (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
+    trace(0, "Cpu %lu ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
+        cpu, (ulong)get_ss(), (ulong)get_cs(), (ulong)get_ds(),
+        (ulong)get_gs(), (ulong)get_fs(), (ulong)get_es());
 }
 
 /*
@@ -103,138 +103,138 @@ void TraceCpuState(ulong cpu)
  * This runs before the PCI subsystem exists, hence the raw CF8/CFC access,
  * but after Acpi::Parse(), so the WDAT verdict is already available.
  */
-static void HaltTcoWatchdog()
+static void halt_tco_watchdog()
 {
-    static const u16 PciCfgAddr  = 0xCF8;
-    static const u16 PciCfgData  = 0xCFC;
-    static const u32 LpcBdf      = (0U << 16) | (0x1FU << 11) | (0U << 8);
-    static const u32 SmbusBdf    = (0U << 16) | (0x1FU << 11) | (4U << 8);
-    static const u16 VendorReg   = 0x00;
-    static const u16 ClassReg    = 0x08;
-    static const u16 TcoBaseReg  = 0x50;
-    static const u16 TcoCtlReg   = 0x54;
-    static const u32 TcoBaseEn   = 1U << 8;
-    static const u8  SerialBusCls = 0x0C;
-    static const u8  SmbusSubCls  = 0x05;
-    static const u16 AcpiBaseReg = 0x40;
-    static const u16 AcpiTcoOff  = 0x60;
-    static const u16 Tco1Sts     = 0x04;
-    static const u16 Tco2Sts     = 0x06;
-    static const u16 Tco1Cnt     = 0x08;
-    static const u16 TmrHlt      = 1 << 11;
-    static const u16 IntelVendor = 0x8086;
+    static const u16 PCI_CFG_ADDR  = 0xCF8;
+    static const u16 PCI_CFG_DATA  = 0xCFC;
+    static const u32 LPC_BDF      = (0U << 16) | (0x1FU << 11) | (0U << 8);
+    static const u32 SMBUS_BDF    = (0U << 16) | (0x1FU << 11) | (4U << 8);
+    static const u16 VENDOR_REG   = 0x00;
+    static const u16 CLASS_REG    = 0x08;
+    static const u16 TCO_BASE_REG  = 0x50;
+    static const u16 TCO_CTL_REG   = 0x54;
+    static const u32 TCO_BASE_EN   = 1U << 8;
+    static const u8  SERIAL_BUS_CLS = 0x0C;
+    static const u8  SMBUS_SUB_CLS  = 0x05;
+    static const u16 ACPI_BASE_REG = 0x40;
+    static const u16 ACPI_TCO_OFF  = 0x60;
+    static const u16 TCO1_STS     = 0x04;
+    static const u16 TCO2_STS     = 0x06;
+    static const u16 TCO1_CNT     = 0x08;
+    static const u16 TMR_HLT      = 1 << 11;
+    static const u16 INTEL_VENDOR = 0x8086;
 
-    Trace(0, "HaltTcoWatchdog: started");
+    trace(0, "HaltTcoWatchdog: started");
 
     /* An ACPI WDAT table means the firmware owns the watchdog and the Rust
        tco_wdt driver stands down.  The halt below still runs: WDAT normally
        describes this very TCO block, and a timer the firmware left running
        would reset the box in the middle of the boot-time self-tests with
        nothing left to kick it. */
-    const bool firmwareWatchdog = Acpi::GetInstance().HasFirmwareWatchdog();
+    const bool firmware_watchdog = Acpi::get_instance().has_firmware_watchdog();
 
-    u16 tcoBase = 0;
+    u16 tco_base = 0;
     const char* source = "SMBus 0:1F.4";
 
     /* 1. 100-series PCH and later.  0:1F.4 is not the SMBus controller on
        every chipset, so check the class code before trusting its 0x50. */
-    Out(PciCfgAddr, 0x80000000 | SmbusBdf | VendorReg);
-    if ((u16)In(PciCfgData) == IntelVendor)
+    outl(PCI_CFG_ADDR, 0x80000000 | SMBUS_BDF | VENDOR_REG);
+    if ((u16)inl(PCI_CFG_DATA) == INTEL_VENDOR)
     {
-        Out(PciCfgAddr, 0x80000000 | SmbusBdf | ClassReg);
-        u32 classCode = In(PciCfgData);
-        if ((u8)(classCode >> 24) == SerialBusCls && (u8)(classCode >> 16) == SmbusSubCls)
+        outl(PCI_CFG_ADDR, 0x80000000 | SMBUS_BDF | CLASS_REG);
+        u32 class_code = inl(PCI_CFG_DATA);
+        if ((u8)(class_code >> 24) == SERIAL_BUS_CLS && (u8)(class_code >> 16) == SMBUS_SUB_CLS)
         {
             /* Without TCO_BASE_EN the window is not decoded */
-            Out(PciCfgAddr, 0x80000000 | SmbusBdf | TcoCtlReg);
-            if ((In(PciCfgData) & TcoBaseEn) != 0)
+            outl(PCI_CFG_ADDR, 0x80000000 | SMBUS_BDF | TCO_CTL_REG);
+            if ((inl(PCI_CFG_DATA) & TCO_BASE_EN) != 0)
             {
-                Out(PciCfgAddr, 0x80000000 | SmbusBdf | TcoBaseReg);
-                tcoBase = (u16)In(PciCfgData) & 0xFFE0;
+                outl(PCI_CFG_ADDR, 0x80000000 | SMBUS_BDF | TCO_BASE_REG);
+                tco_base = (u16)inl(PCI_CFG_DATA) & 0xFFE0;
             }
         }
     }
 
     /* 2./3. ICH9-class chipsets, including QEMU's q35 */
-    if (tcoBase == 0)
+    if (tco_base == 0)
     {
         source = "LPC 0:1F.0";
 
         /* Only Intel PCH has a TCO watchdog */
-        Out(PciCfgAddr, 0x80000000 | LpcBdf | VendorReg);
-        u16 vendor = (u16)In(PciCfgData);
-        if (vendor != IntelVendor)
+        outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | VENDOR_REG);
+        u16 vendor = (u16)inl(PCI_CFG_DATA);
+        if (vendor != INTEL_VENDOR)
             return;
 
-        Out(PciCfgAddr, 0x80000000 | LpcBdf | TcoBaseReg);
-        u16 raw = (u16)In(PciCfgData);
+        outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | TCO_BASE_REG);
+        u16 raw = (u16)inl(PCI_CFG_DATA);
         if (raw != 0 && raw != 0xFFFF)
-            tcoBase = raw & 0xFFE0;
+            tco_base = raw & 0xFFE0;
 
-        if (tcoBase == 0) {
-            Out(PciCfgAddr, 0x80000000 | LpcBdf | AcpiBaseReg);
-            u16 pmBase = (u16)In(PciCfgData) & 0xFFFE;
-            if (pmBase != 0 && pmBase != 0xFFFE)
-                tcoBase = pmBase + AcpiTcoOff;
+        if (tco_base == 0) {
+            outl(PCI_CFG_ADDR, 0x80000000 | LPC_BDF | ACPI_BASE_REG);
+            u16 pm_base = (u16)inl(PCI_CFG_DATA) & 0xFFFE;
+            if (pm_base != 0 && pm_base != 0xFFFE)
+                tco_base = pm_base + ACPI_TCO_OFF;
         }
     }
 
-    if (tcoBase == 0)
+    if (tco_base == 0)
         return;
 
     /* Halt the timer */
-    u16 cnt = Inw(tcoBase + Tco1Cnt);
-    Outw(tcoBase + Tco1Cnt, cnt | TmrHlt);
+    u16 cnt = inw(tco_base + TCO1_CNT);
+    outw(tco_base + TCO1_CNT, cnt | TMR_HLT);
 
     /* Clear stale timeout status so the first-expiry latch is reset */
-    Outw(tcoBase + Tco1Sts, 1 << 3);
-    Outw(tcoBase + Tco2Sts, 1 << 1);
+    outw(tco_base + TCO1_STS, 1 << 3);
+    outw(tco_base + TCO2_STS, 1 << 1);
 
-    Trace(0, "TCO watchdog halted (tcoBase 0x%lX via %s%s)", (ulong)tcoBase, source,
-        firmwareWatchdog ? ", ACPI WDAT owns it" : "");
+    trace(0, "TCO watchdog halted (tcoBase 0x%lX via %s%s)", (ulong)tco_base, source,
+        firmware_watchdog ? ", ACPI WDAT owns it" : "");
 }
 
 /* Calibrated once on the BSP; every core's local timer runs off the same bus
    clock, so one measurement arms all of them. False means calibration failed
    and the old broadcast tick stays in charge. */
-static bool LapicTimerOk;
+static bool lapic_timer_ok;
 
-void ApStartup(void *ctx)
+void ap_startup(void *ctx)
 {
     (void)ctx;
 
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    auto& cpu = CpuTable::get_instance().get_current_cpu();
 
-    Trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
-        cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
+    trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
+        cpu.get_index(), get_rflags(), Task::get_current_task());
 
-    TraceCpuState(cpu.GetIndex());
+    trace_cpu_state(cpu.get_index());
 
     /* Before interrupts: this CPU's own tick, so it never depends on another
        CPU still answering one -- one-shot, armed for each tick and for each
        deadline a task here sleeps to (Cpu::LocalTimerStart). */
-    if (LapicTimerOk)
+    if (lapic_timer_ok)
     {
-        Lapic::StartTimer(CpuTable::TimerVector);
-        cpu.LocalTimerStart();
+        Lapic::start_timer(CpuTable::TIMER_VECTOR);
+        cpu.local_timer_start();
     }
 
-    BugOn(Hal::IsInterruptEnabled());
-    InterruptEnable();
+    BUG_ON(hal::is_interrupt_enabled());
+    interrupt_enable();
 
-    cpu.SetRunning();
+    cpu.set_running();
 
-    PreemptOnWait();
+    preempt_on_wait();
 
-    if (!Test::TestMultiTasking())
+    if (!test::test_multi_tasking())
     {
-        Panic("Multitasking test failed");
+        PANIC("Multitasking test failed");
         return;
     }
 
     for (;;)
     {
-        cpu.Idle();
+        cpu.idle();
     }
 }
 
@@ -243,9 +243,9 @@ void ApStartup(void *ctx)
    of the stack it left. Inlined, this function's locals would live in that
    frame -- on the trampoline's stack, which the real page tables do not
    map. A call starts a frame of its own on the new stack. */
-__attribute__((noinline)) void ApMain2()
+__attribute__((noinline)) void ap_main2()
 {
-    AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
+    atomic_read_and_inc(&ap_started_flag); /* 2: entered ApMain2 */
 
     /* Until the CR3 below, this CPU is still on the boot page table from
        boot64.asm, which maps exactly two windows: the low 4GiB identity and
@@ -261,82 +261,82 @@ __attribute__((noinline)) void ApMain2()
        fault as reserved without it), then the real page table, then the GDT
        and IDT so a fault from here on is a panic report rather than a reset,
        and only then anything that can print. */
-    Hal::EnableWxSupport();
-    SetCr3(Mm::PageTable::GetInstance().GetRoot());
-    AtomicReadAndInc(&ApStartedFlag); /* 3: page tables loaded */
+    hal::enable_wx_support();
+    set_cr3(mm::PageTable::get_instance().get_root());
+    atomic_read_and_inc(&ap_started_flag); /* 3: page tables loaded */
 
-    Gdt::GetInstance().Save();
-    Idt::GetInstance().Save();
-    AtomicReadAndInc(&ApStartedFlag); /* 4: GDT+IDT loaded */
+    Gdt::get_instance().save();
+    Idt::get_instance().save();
+    atomic_read_and_inc(&ap_started_flag); /* 4: GDT+IDT loaded */
 
     /* The update the BSP kept, as early as a fault here is a report: said
        below, once this CPU's index is known */
-    Microcode::Result ucode;
-    Microcode::LoadOnAp(&ucode);
+    microcode::Result ucode;
+    microcode::load_on_ap(&ucode);
 
     /* Same PAT as the BSP before this CPU can touch a write-combining
        mapping (the framebuffer console is already mapped by now). Its trace
        is the first console write an AP makes, which is why it has to come
        after the CR3 load; the only mapping the two disagree about in between
        is the framebuffer, and nothing above touches it. */
-    Hal::SetupMemoryTypes();
+    hal::setup_memory_types();
     /* As the BSP did: every CPU the same, or an lfence; rdtsc on this one
        would not be ordered as it is on the others. */
-    Hal::SetupSerializingLfence();
+    hal::setup_serializing_lfence();
 
-    if (Parameters::GetInstance().IsSmpOff())
-        Panic("AP cpu started while smp is off");
+    if (Parameters::get_instance().is_smp_off())
+        PANIC("AP cpu started while smp is off");
 
-    Lapic::Enable();
-    AtomicReadAndInc(&ApStartedFlag); /* 5: LAPIC enabled */
+    Lapic::enable();
+    atomic_read_and_inc(&ap_started_flag); /* 5: LAPIC enabled */
 
     /* KVM updates a pvclock entry only for the vcpu that armed it; without
        this the AP would read the BSP's entry with its own TSC. No-op when
        kvmclock is unavailable. */
-    Tsc::GetInstance().EnableKvmClockSelf();
+    Tsc::get_instance().enable_kvm_clock_self();
 
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    auto& cpu = CpuTable::get_instance().get_current_cpu();
 
-    if (Microcode::Kept())
+    if (microcode::kept())
     {
-        if (ucode.Skipped == nullptr)
-            Trace(0, "Cpu %lu: microcode revision 0x%x -> 0x%x", cpu.GetIndex(), ucode.Before, ucode.After);
-        else if (ucode.Asked)
-            Trace(0, "Cpu %lu: microcode %s (revision 0x%x)", cpu.GetIndex(), ucode.Skipped, ucode.Before);
+        if (ucode.skipped == nullptr)
+            trace(0, "Cpu %lu: microcode revision 0x%x -> 0x%x", cpu.get_index(), ucode.before, ucode.after);
+        else if (ucode.asked)
+            trace(0, "Cpu %lu: microcode %s (revision 0x%x)", cpu.get_index(), ucode.skipped, ucode.before);
         else
-            Trace(0, "Cpu %lu: microcode %s", cpu.GetIndex(), ucode.Skipped);
+            trace(0, "Cpu %lu: microcode %s", cpu.get_index(), ucode.skipped);
     }
 
     /* Its clock its own to raise, as the BSP's is: each CPU's range its own,
        the two kinds of core of a hybrid part giving different ones. */
-    Hal::CpuPerformance perf;
-    if (Hal::SetupCpuPerformance(&perf))
-        Trace(0, "Cpu %lu: HWP on, performance %u to %u, %u guaranteed",
-            cpu.GetIndex(), perf.Lowest, perf.Highest, perf.Guaranteed);
+    hal::CpuPerformance perf;
+    if (hal::setup_cpu_performance(&perf))
+        trace(0, "Cpu %lu: HWP on, performance %u to %u, %u guaranteed",
+            cpu.get_index(), perf.lowest, perf.highest, perf.guaranteed);
 
     /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
-    Gdt::GetInstance().SetupTssSelf(cpu.GetIndex());
+    Gdt::get_instance().setup_tss_self(cpu.get_index());
 
-    Trace(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.GetIndex(), GetRsp());
+    trace(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.get_index(), get_rsp());
 
-    if (!cpu.Run(ApStartup, nullptr))
+    if (!cpu.run(ap_startup, nullptr))
     {
-        Trace(0, "Can't run cpu %lu task", cpu.GetIndex());
+        trace(0, "Can't run cpu %lu task", cpu.get_index());
         return;
     }
 }
 
-extern "C" void ApMain()
+extern "C" void ap_main()
 {
     /* Before anything can ask which CPU this is: the GS base firmware left
        behind is not a slot of ours, and reading through it would be a wild
        load. Until Lapic::Enable() publishes the real one, this reads as
        "not set up" and the answer comes from the APIC as it always did. */
-    PerCpuSetupBoot();
+    per_cpu_setup_boot();
 
-    AtomicReadAndInc(&ApStartedFlag);
+    atomic_read_and_inc(&ap_started_flag);
     ALLOC_CPU_STACK();
-    ApMain2();
+    ap_main2();
 }
 
 typedef void (*HaltAction)();
@@ -347,45 +347,45 @@ extern "C" void rust_fini();
    Releases the idle task, runs static destructors, then
    performs the final halt/reboot action. Never returns. */
 static void __attribute__((noinline, noreturn))
-FinalizeOnStaticStack(Task* task, HaltAction action)
+finalize_on_static_stack(Task* task, HaltAction action)
 {
-    Trace(0, "FinalizeOnStaticStack");
+    trace(0, "FinalizeOnStaticStack");
 
-    task->Put();
+    task->put();
 
     rust_fini();
 
     __cxa_finalize(0);
 
-    Trace(0, "Finalized");
+    trace(0, "Finalized");
 
     action();
 
-    while (1) Hlt();
+    while (1) cpu_halt();
 }
 
-static void PrepareHalt(HaltAction action)
+static void prepare_halt(HaltAction action)
 {
     /* Hold an extra reference so CpuTable::Reset()'s Put()
     only drops refcount 2→1 instead of freeing the task
     while we are still running on its stack. */
-    auto task = Task::GetCurrentTask();
-    task->Get();
+    auto task = Task::get_current_task();
+    task->get();
 
-    PreemptDisable();
+    preempt_disable();
 
-    Trace(0, "Stopping cpu's");
+    trace(0, "Stopping cpu's");
 
-    CpuTable::GetInstance().ExitAllExceptSelf();
+    CpuTable::get_instance().exit_all_except_self();
 
-    Trace(0, "Cpu's stopped");
+    trace(0, "Cpu's stopped");
 
-    PreemptOff();
+    preempt_off();
 
-    CpuTable::GetInstance().Reset();
-    Dmesg::GetInstance().Reset();
+    CpuTable::get_instance().reset();
+    Dmesg::get_instance().reset();
 
-    InterruptDisable();
+    interrupt_disable();
 
     /* Switch back to CPU 0's static stack so we can release
        the idle task.  FinalizeOnStaticStack gets its own
@@ -402,33 +402,33 @@ static void PrepareHalt(HaltAction action)
        stack-local objects with non-trivial destructors (e.g.
        SpinLock, or anything containing one) are destroyed
        before reaching this point. */
-    SetRsp((long)&Stack[0][CpuStackSize - 128]);
-    FinalizeOnStaticStack(task, action);
+    set_rsp((long)&stack[0][CPU_STACK_SIZE - 128]);
+    finalize_on_static_stack(task, action);
 }
 
-void Shutdown()
+void shutdown()
 {
-    auto& con = Console::GetInstance();
-    con.Printf("Shutting down!\n");
+    auto& con = Console::get_instance();
+    con.printf("Shutting down!\n");
 
-    PrepareHalt(Hal::PowerOff);
+    prepare_halt(hal::power_off);
 }
 
-void Reboot()
+void reboot()
 {
-    auto& con = Console::GetInstance();
-    con.Printf("Rebooting!\n");
+    auto& con = Console::get_instance();
+    con.printf("Rebooting!\n");
 
-    PrepareHalt(Hal::Reset);
+    prepare_halt(hal::reset);
 }
 
-void SomeTaskRoutine(void *ctx)
+void some_task_routine(void *ctx)
 {
     (void)ctx;
 
-    auto task = Task::GetCurrentTask();
-    while (!task->IsStopping())
-        Sleep(100 * Const::NanoSecsInMs);
+    auto task = Task::get_current_task();
+    while (!task->is_stopping())
+        sleep(100 * consts::NANO_SECS_IN_MS);
 }
 
 /* Shutdown()/Reboot() end up in PrepareHalt which abandons this
@@ -442,7 +442,7 @@ extern "C" void rust_init();
 extern "C" int rust_netframe_pool_setup(unsigned long count);
 extern "C" int rust_netconsole_setup();
 extern "C" int rust_tcp_init();
-extern "C" void rust_net_start_services(unsigned short udpShellPort);
+extern "C" void rust_net_start_services(unsigned short udp_shell_port);
 extern "C" void rust_net_stop_services();
 /* USB is Rust (src/rust/drivers/usb): the xHCI controllers and the HID boot
    keyboard on them, which on a machine with no PS/2 is the only way in. */
@@ -480,53 +480,53 @@ extern "C" void rust_virtio_net_init();
 /* The virtio-scsi driver (src/rust/drivers/virtio_scsi) */
 extern "C" void rust_virtio_scsi_init();
 
-void BpStartup(void* ctx)
+void bp_startup(void* ctx)
 {
     (void)ctx;
 
-    bool doReboot = false;
+    bool do_reboot = false;
 
     {
-        auto& idt = Idt::GetInstance();
-        auto& pit = Pit::GetInstance();
-        auto& kbd = IO8042::GetInstance();
-        auto& serial = Serial::GetInstance();
-        auto& cmd = Cmd::GetInstance();
-        auto& ioApic = IoApic::GetInstance();
-        auto& cpus = CpuTable::GetInstance();
-        auto& cpu = cpus.GetCurrentCpu();
-        auto& acpi = Acpi::GetInstance();
+        auto& idt = Idt::get_instance();
+        auto& pit = Pit::get_instance();
+        auto& kbd = IO8042::get_instance();
+        auto& serial = Serial::get_instance();
+        auto& cmd = Cmd::get_instance();
+        auto& io_apic = IoApic::get_instance();
+        auto& cpus = CpuTable::get_instance();
+        auto& cpu = cpus.get_current_cpu();
+        auto& acpi = Acpi::get_instance();
 
-        Trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
-            cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
+        trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
+            cpu.get_index(), get_rflags(), Task::get_current_task());
 
-        TraceCpuState(cpu.GetIndex());
+        trace_cpu_state(cpu.get_index());
 
         /* GDT is loaded (Main2); give the BSP its TSS so #DF has an IST
            stack */
-        Gdt::GetInstance().SetupTssSelf(cpu.GetIndex());
+        Gdt::get_instance().setup_tss_self(cpu.get_index());
 
-        ioApic.Enable();
+        io_apic.enable();
 
         /* Choose tick source: HPET if available, otherwise PIT (ISA IRQ 0). */
-        auto& hpet = Hpet::GetInstance();
-        if (hpet.IsAvailable())
+        auto& hpet = Hpet::get_instance();
+        if (hpet.is_available())
         {
             /* HPET in legacy replacement mode: timer 0 replaces PIT on IRQ 0.
                Use the same GSI that PIT would use (MADT may remap IRQ 0 → GSI 2). */
-            Interrupt::Register(hpet, acpi.GetGsiByIrq(0x0), 0x20);
-            Trace(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
+            Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20);
+            trace(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
         }
         else
         {
             // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
-            Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
-            pit.Setup();
-            Trace(0, "Using PIT as tick source");
+            Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20);
+            pit.setup();
+            trace(0, "Using PIT as tick source");
         }
 
-        Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
-        Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
+        Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
+        Interrupt::register_handler(serial, acpi.get_gsi_by_irq(0x4), 0x24);
 
         rust_virtio_blk_init();
         rust_virtio_scsi_init();
@@ -542,7 +542,7 @@ void BpStartup(void* ctx)
            two seconds at 256 frames a second, the NIC dropping the rest.
            arm64 has always had this order. */
         /* 0 means the layer's own default. */
-        rust_netframe_pool_setup(Parameters::GetInstance().GetNetFrameCount());
+        rust_netframe_pool_setup(Parameters::get_instance().get_net_frame_count());
 
         rust_init();
 
@@ -553,34 +553,34 @@ void BpStartup(void* ctx)
            on what the boot itself could be measured for. */
         rust_random_reseed();
 
-        Trace(0, "Interrupts registered");
+        trace(0, "Interrupts registered");
 
-        idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
-        idt.SetDescriptor(CpuTable::TimerVector,
-            IdtDescriptor::Encode(LapicTimerInterruptStub));
-        idt.SetDescriptor(Hal::PostedVector, IdtDescriptor::Encode(PostedInterruptStub));
+        idt.set_descriptor(CpuTable::IPI_VECTOR, IdtDescriptor::encode(ip_interrupt_stub));
+        idt.set_descriptor(CpuTable::TIMER_VECTOR,
+            IdtDescriptor::encode(lapic_timer_interrupt_stub));
+        idt.set_descriptor(hal::POSTED_VECTOR, IdtDescriptor::encode(posted_interrupt_stub));
 
         /* Install a benign handler for the LAPIC spurious-interrupt vector so a
            spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */
-        idt.SetDescriptor(Lapic::SpuriousVector, IdtDescriptor::Encode(SpuriousInterruptStub));
+        idt.set_descriptor(Lapic::SPURIOUS_VECTOR, IdtDescriptor::encode(spurious_interrupt_stub));
 
-        Trace(0, "IPI registred");
+        trace(0, "IPI registred");
 
-        idt.Save();
+        idt.save();
 
-        Trace(0, "Idt saved");
+        trace(0, "Idt saved");
 
-        Trace(0, "Interrupts enabled %lu", (ulong)Hal::IsInterruptEnabled());
+        trace(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
 
-        BugOn(Hal::IsInterruptEnabled());
+        BUG_ON(hal::is_interrupt_enabled());
 
-        Trace(0, "Before interrupt enable");
+        trace(0, "Before interrupt enable");
 
-        InterruptEnable();
+        interrupt_enable();
 
         kernel_blockdev_set_interrupts_started();
 
-        Trace(0, "Interrupts enabled %lu", (ulong)Hal::IsInterruptEnabled());
+        trace(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
 
         /*
          * TSC calibration uses PIT channel 2 with busy-polling (~150ms).
@@ -588,7 +588,7 @@ void BpStartup(void* ctx)
          * normally, and before cpus.StartAll so the clock source is ready
          * for per-CPU time queries.
          */
-        TimeInit();
+        time_init();
 
         /* One local APIC timer per CPU in place of one HPET interrupt fanned
            out to everybody by IPI. The fan-out cost a write to the interrupt
@@ -601,93 +601,93 @@ void BpStartup(void* ctx)
            Calibration needs a clock, which is why this sits after TimeInit,
            and it must precede StartAll so an AP can arm its timer as it comes
            up. arm64 has worked this way from the start (GenericTimer). */
-        LapicTimerOk = Lapic::CalibrateTimer();
-        if (LapicTimerOk)
+        lapic_timer_ok = Lapic::calibrate_timer();
+        if (lapic_timer_ok)
         {
-            Lapic::StartTimer(CpuTable::TimerVector);
-            cpus.GetCurrentCpu().LocalTimerStart();
-            cpus.SetPerCpuTimer();
-            Trace(0, "Tick: per-cpu local apic timer, one-shot, at %lu Hz", TickHz);
+            Lapic::start_timer(CpuTable::TIMER_VECTOR);
+            cpus.get_current_cpu().local_timer_start();
+            cpus.set_per_cpu_timer();
+            trace(0, "Tick: per-cpu local apic timer, one-shot, at %lu Hz", TICK_HZ);
         }
         else
         {
-            Trace(0, "Tick: local apic timer unavailable, keeping the broadcast tick");
+            trace(0, "Tick: local apic timer unavailable, keeping the broadcast tick");
         }
 
-        Trace(0, "Before cpus start");
+        trace(0, "Before cpus start");
 
-        if (!Parameters::GetInstance().IsSmpOff())
+        if (!Parameters::get_instance().is_smp_off())
         {
-            if (!cpus.StartAll())
+            if (!cpus.start_all())
             {
                 /* Diagnostic: did the AP reach ApMain()? */
-                Trace(0, "AP diag: ApStartedFlag=%lu",
-                      (ulong)ApStartedFlag);
-                Panic("Can't start all cpus");
+                trace(0, "AP diag: ApStartedFlag=%lu",
+                      (ulong)ap_started_flag);
+                PANIC("Can't start all cpus");
                 return;
             }
         }
 
         /* All CPUs are running: spread device IRQs across them */
-        IrqBalance::GetInstance().Balance();
+        IrqBalance::get_instance().balance();
 
-        Trace(0, "Before preempt on");
+        trace(0, "Before preempt on");
 
-        PreemptOn();
+        preempt_on();
 
-        Trace(0, "Preempt is now on");
+        trace(0, "Preempt is now on");
 
-        Screen::Printf("IPI test...\n");
+        screen::printf("IPI test...\n");
 
-        ulong cpuMask = cpus.GetRunningCpus();
-        for (ulong i = 0; i < MaxCpus; i++)
+        ulong cpu_mask = cpus.get_running_cpus();
+        for (ulong i = 0; i < MAX_CPUS; i++)
         {
-            if (cpuMask & (1UL << i))
+            if (cpu_mask & (1UL << i))
             {
-                if (i != cpu.GetIndex())
+                if (i != cpu.get_index())
                 {
-                    cpus.SendIPI(i);
+                    cpus.send_ipi(i);
                 }
             }
         }
 
-        Screen::Printf("Task test...\n");
+        screen::printf("Task test...\n");
 
-        if (!Test::TestMultiTasking())
+        if (!test::test_multi_tasking())
         {
-            Panic("Multitasking test failed");
+            PANIC("Multitasking test failed");
             return;
         }
 
-        if (!Test::TestTaskLocate())
+        if (!test::test_task_locate())
         {
-            Panic("Task locate test failed");
+            PANIC("Task locate test failed");
             return;
         }
 
-        if (!Test::TestWakeStorm())
+        if (!test::test_wake_storm())
         {
-            Panic("Wake storm test failed");
+            PANIC("Wake storm test failed");
             return;
         }
 
-        if (!Test::TestIdleTakesTurns())
+        if (!test::test_idle_takes_turns())
         {
-            Panic("Idle task turn test failed");
+            PANIC("Idle task turn test failed");
             return;
         }
 
-        if (!Test::TestEevdf())
+        if (!test::test_eevdf())
         {
-            Panic("EEVDF test failed");
+            PANIC("EEVDF test failed");
             return;
         }
 
         rust_test();
 
-        if (!SoftIrq::GetInstance().Init())
+        if (!SoftIrq::get_instance().init())
         {
-            Panic("Can't init softirq");
+            PANIC("Can't init softirq");
             return;
         }
 
@@ -718,42 +718,42 @@ void BpStartup(void* ctx)
            only way in, so bring it up before the shell starts: enumeration
            happens here, synchronously, while trace output still reaches the
            console, and the polling task takes over afterwards. */
-        if (!Parameters::GetInstance().IsUsbOff())
+        if (!Parameters::get_instance().is_usb_off())
         {
             rust_usb_init();
 
             if (rust_usb_start() != 0)
-                Trace(0, "Usb: failed to start the poll task");
+                trace(0, "Usb: failed to start the poll task");
         }
 
-        Screen::Printf("Idle looping...\n");
+        screen::printf("Idle looping...\n");
 
-        if (!cmd.Start())
+        if (!cmd.start())
         {
-            Panic("Can't start cmd");
+            PANIC("Can't start cmd");
             return;
         }
 
         /* The netconsole, if the command line asked for one, and the shell over
            UDP: both on eth0, both the layer's to start. */
-        rust_net_start_services(Parameters::GetInstance().GetUdpShellPort());
+        rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
 
-        Trace(0, "boot: complete");
+        trace(0, "boot: complete");
 
         for (;;)
         {
-            cpu.Idle();
-            if (cmd.ShouldShutdown() || cmd.ShouldReboot())
+            cpu.idle();
+            if (cmd.should_shutdown() || cmd.should_reboot())
             {
-                doReboot = cmd.ShouldReboot();
-                if (doReboot)
-                    Trace(0, "Reboot requested");
+                do_reboot = cmd.should_reboot();
+                if (do_reboot)
+                    trace(0, "Reboot requested");
                 else
-                    Trace(0, "Shutdown requested");
+                    trace(0, "Shutdown requested");
                 rust_net_stop_services();
                 rust_usb_stop();
-                cmd.Stop();
-                cmd.StopDhcp();
+                cmd.stop();
+                cmd.stop_dhcp();
                 break;
             }
         }
@@ -761,7 +761,7 @@ void BpStartup(void* ctx)
         /* With the shells gone nothing calls into a module any more: its
            exit runs now, while the files, block I/O and soft IRQs it may
            still need are all there */
-        ModuleTable::GetInstance().UnloadAll();
+        ModuleTable::get_instance().unload_all();
 
         /* Before the soft IRQs stop: unmounting writes the superblock, and
            a block request completes through the BLK_IO soft IRQ */
@@ -772,13 +772,13 @@ void BpStartup(void* ctx)
            virtio disk would wait for ever. */
         rust_disklog_stop();
 
-        SoftIrq::GetInstance().Stop();
+        SoftIrq::get_instance().stop();
     } /* all locals destroyed before stack is abandoned */
 
-    if (doReboot)
-        Reboot();
+    if (do_reboot)
+        reboot();
     else
-        Shutdown();
+        shutdown();
 }
 
 /* wxprobe=heap: call into a page the allocator just handed out. Every
@@ -786,38 +786,38 @@ void BpStartup(void* ctx)
    line after it printing means W^X covers the kernel image and nothing else.
    Deliberately fatal, like the text probe -- it is asked for by name on the
    command line. */
-static void WxProbeHeap()
+static void wx_probe_heap()
 {
-    static const u8 RetOpcode = 0xC3;
+    static const u8 RET_OPCODE = 0xC3;
 
     ulong phys = 0;
-    void* va = Mm::AllocMapPages(1, &phys);
+    void* va = mm::alloc_map_pages(1, &phys);
     if (va == nullptr)
     {
-        Trace(0, "W^X probe: no page for the heap probe");
+        trace(0, "W^X probe: no page for the heap probe");
         return;
     }
 
-    *reinterpret_cast<volatile u8*>(va) = RetOpcode;
-    Hal::SyncInstructionCache((ulong)va, sizeof(RetOpcode));
-    Trace(0, "W^X probe: calling into a heap page 0x%lX (expect page fault)", (ulong)va);
+    *reinterpret_cast<volatile u8*>(va) = RET_OPCODE;
+    hal::sync_instruction_cache((ulong)va, sizeof(RET_OPCODE));
+    trace(0, "W^X probe: calling into a heap page 0x%lX (expect page fault)", (ulong)va);
     reinterpret_cast<void (*)()>(va)();
-    Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
+    trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
 /* Never inlined, as ApMain2 is not: see there */
-__attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
+__attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 {
     do {
 
-    Panicker::GetInstance();
-    Watchdog::GetInstance();
+    Panicker::get_instance();
+    Watchdog::get_instance();
 
-    Trace(0, "Cpu rsp 0x%lX rbp 0x%lX", GetRsp(), GetRbp());
-    for (ulong i = 0; i < MaxCpus; i++)
+    trace(0, "Cpu rsp 0x%lX rbp 0x%lX", get_rsp(), get_rbp());
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        Trace(0, "Static stack[%lu] base 0x%lX top 0x%lX",
-            i, (ulong)&Stack[i][0], (ulong)&Stack[i][CpuStackSize]);
+        trace(0, "Static stack[%lu] base 0x%lX top 0x%lX",
+            i, (ulong)&stack[i][0], (ulong)&stack[i][CPU_STACK_SIZE]);
     }
 
     /* Fill the per-CPU static stacks with the pattern whose survival tells us
@@ -826,23 +826,23 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
        from its base to a margin below the stack pointer, since the fill runs
        on it. */
     {
-        const ulong sp = GetRsp();
-        const ulong PoisonMargin = 2048;
+        const ulong sp = get_rsp();
+        const ulong poison_margin = 2048;
 
-        for (ulong i = 0; i < MaxCpus; i++)
+        for (ulong i = 0; i < MAX_CPUS; i++)
         {
-            ulong base = (ulong)&Stack[i][0];
-            ulong size = CpuStackSize;
+            ulong base = (ulong)&stack[i][0];
+            ulong size = CPU_STACK_SIZE;
 
-            if (sp > base && sp < base + CpuStackSize)
+            if (sp > base && sp < base + CPU_STACK_SIZE)
             {
-                if (sp - base <= PoisonMargin)
+                if (sp - base <= poison_margin)
                     continue;
 
-                size = (sp - base - PoisonMargin) & ~(sizeof(ulong) - 1);
+                size = (sp - base - poison_margin) & ~(sizeof(ulong) - 1);
             }
 
-            StackProbe::Poison((void*)base, size);
+            stack_probe::poison((void*)base, size);
         }
     }
 
@@ -850,60 +850,60 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
        runtime carries NX, and with EFER.NXE off bit 63 is a reserved bit --
        the first touch of such a page would fault instead of reading. The APs
        do the same before they load this table (ApMain2). */
-    Hal::EnableWxSupport();
+    hal::enable_wx_support();
 
-    auto& bpt = Mm::BuiltinPageTable::GetInstance();
-    if (!bpt.Setup())
+    auto& bpt = mm::BuiltinPageTable::get_instance();
+    if (!bpt.setup())
     {
-        Panic("Can't setup paging");
+        PANIC("Can't setup paging");
         break;
     }
 
-    Trace(0, "Paging root 0x%lX old cr3 0x%lX", bpt.GetRoot(), GetCr3());
-    SetCr3(bpt.GetRoot());
-    Trace(0, "Set new cr3 0x%lX", GetCr3());
+    trace(0, "Paging root 0x%lX old cr3 0x%lX", bpt.get_root(), get_cr3());
+    set_cr3(bpt.get_root());
+    trace(0, "Set new cr3 0x%lX", get_cr3());
 
-    Gdt::GetInstance().Save();
-    ExceptionTable::GetInstance().RegisterExceptionHandlers();
-    Idt::GetInstance().Save();
+    Gdt::get_instance().save();
+    ExceptionTable::get_instance().register_exception_handlers();
+    Idt::get_instance().save();
 
-    auto& pic = Pic::GetInstance();
-    pic.Remap();
-    pic.Disable();
+    auto& pic = Pic::get_instance();
+    pic.remap();
+    pic.disable();
 
-    if (!Dmesg::GetInstance().Setup())
+    if (!Dmesg::get_instance().setup())
     {
-        Panic("Can't setup dmesg");
+        PANIC("Can't setup dmesg");
         return;
     }
 
     /* Until the command line has been read there is nothing to read it from,
        so the earliest traces are always at the default level. */
-    Tracer::GetInstance().SetLevel(Parameters::DefaultLogLevel);
+    Tracer::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
 
     //Screen::Printf("Hello!\n");
 
-    Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
+    grub::parse_multi_boot_info((grub::MultiBootInfoHeader *)bpt.phys_to_virt((ulong)mb_info));
 
-    Tracer::GetInstance().SetLevel(Parameters::GetInstance().GetLogLevel());
+    Tracer::get_instance().set_level(Parameters::get_instance().get_log_level());
 
     /* Microcode, as early as it can be: this CPU's update from the module
        GRUB loaded, while the bootstrap map still reaches it -- below 4 GiB,
        as a module's range is -- kept for the APs (ApMain2). */
     {
-        ulong ucodePhys = 0, ucodeLen = 0;
-        if (Grub::GetUcodeModule(ucodePhys, ucodeLen))
+        ulong ucode_phys = 0, ucode_len = 0;
+        if (grub::get_ucode_module(ucode_phys, ucode_len))
         {
-            Microcode::Result ucode;
-            Microcode::LoadOnBsp((const u8*)bpt.PhysToVirt(ucodePhys), ucodeLen, &ucode);
-            if (ucode.Skipped == nullptr)
-                Trace(0, "microcode: revision 0x%x -> 0x%x, of %04x-%02x-%02x", ucode.Before, ucode.After,
-                    ucode.Date & Microcode::DateYearMask, ucode.Date >> Microcode::DateMonthShift,
-                    (ucode.Date >> Microcode::DateDayShift) & Microcode::DateDayMask);
-            else if (ucode.Asked)
-                Trace(0, "microcode: %s (revision 0x%x)", ucode.Skipped, ucode.Before);
+            microcode::Result ucode;
+            microcode::load_on_bsp((const u8*)bpt.phys_to_virt(ucode_phys), ucode_len, &ucode);
+            if (ucode.skipped == nullptr)
+                trace(0, "microcode: revision 0x%x -> 0x%x, of %04x-%02x-%02x", ucode.before, ucode.after,
+                    ucode.date & microcode::DATE_YEAR_MASK, ucode.date >> microcode::DATE_MONTH_SHIFT,
+                    (ucode.date >> microcode::DATE_DAY_SHIFT) & microcode::DATE_DAY_MASK);
+            else if (ucode.asked)
+                trace(0, "microcode: %s (revision 0x%x)", ucode.skipped, ucode.before);
             else
-                Trace(0, "microcode: %s", ucode.Skipped);
+                trace(0, "microcode: %s", ucode.skipped);
         }
     }
 
@@ -911,230 +911,230 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
        everything until the network can carry it away. */
     rust_netconsole_setup();
 
-    auto& mmap = Mm::MemoryMap::GetInstance();
-    Trace(0, "Enter kernel: start 0x%lX end 0x%lX",
-        mmap.GetKernelStart(), mmap.GetKernelEnd());
+    auto& mmap = mm::MemoryMap::get_instance();
+    trace(0, "Enter kernel: start 0x%lX end 0x%lX",
+        mmap.get_kernel_start(), mmap.get_kernel_end());
 
-    if (mmap.GetKernelEnd() <= bpt.PhysToVirt(MB))
+    if (mmap.get_kernel_end() <= bpt.phys_to_virt(MB))
     {
-        Panic("Kernel end is lower than kernel space base");
+        PANIC("Kernel end is lower than kernel space base");
         break;
     }
 
     /* Now that the firmware map is known, grow the bootstrap map over the
        RAM above 4GiB -- Setup() ran before the Multiboot tags were parsed
        and could not know there was any. */
-    bpt.MapHighRam();
+    bpt.map_high_ram();
 
-    auto& pt = Mm::PageTable::GetInstance();
-    if (!pt.Setup())
+    auto& pt = mm::PageTable::get_instance();
+    if (!pt.setup())
     {
-        Panic("Can't setup paging");
+        PANIC("Can't setup paging");
         break;
     }
 
-    Trace(0, "Paging root 0x%lX old cr3 0x%lX", pt.GetRoot(), GetCr3());
-    SetCr3(pt.GetRoot());
-    Trace(0, "Set new cr3 0x%lX", GetCr3());
-    if (!pt.SetupFreePagesList())
+    trace(0, "Paging root 0x%lX old cr3 0x%lX", pt.get_root(), get_cr3());
+    set_cr3(pt.get_root());
+    trace(0, "Set new cr3 0x%lX", get_cr3());
+    if (!pt.setup_free_pages_list())
     {
-        Panic("Can't setup paging");
+        PANIC("Can't setup paging");
         break;
     }
 
     /* The huge pool (hugepages=), now: the free list will never again be as
        whole as it is before the kernel's own allocations begin. */
-    pt.ReserveHugePool(Parameters::GetInstance().GetHugePoolBytes(pt.GetTotalPagesCount() * Const::PageSize));
+    pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
 
     /* W^X: the image mapping is the one executable thing the page table
        was built with (everything else is already NX), so split it here into
        .text RX, .rodata RO+NX, .data/.bss RW+NX */
     {
-        extern char KernelStart[], KernelText[], KernelRodata[], KernelEnd[];
+        extern char kernel_start[], kernel_text[], kernel_rodata[], kernel_end[];
         /* Before the first MapMmioRegion: a write-combining mapping needs
            the PAT entry to exist. */
-        Hal::SetupMemoryTypes();
+        hal::setup_memory_types();
         /* The firmware's choice, said once: the APs make the same one
            (ApMain2). */
-        if (Hal::SetupSerializingLfence())
-            Trace(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
+        if (hal::setup_serializing_lfence())
+            trace(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
         /* The clock the CPU's own to pick, up to its turbo, rather than
            firmware's base: the APs do the same (ApMain2). */
-        Hal::CpuPerformance perf;
-        if (Hal::SetupCpuPerformance(&perf))
-            Trace(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
-                perf.Lowest, perf.Highest, perf.Guaranteed);
-        ulong t0 = (ulong)KernelStart, t1 = (ulong)KernelText;
-        ulong r1 = (ulong)KernelRodata, e = (ulong)KernelEnd;
-        pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
-        pt.ProtectRange(t1, r1 - t1, false, false);  /* RO+NX */
-        pt.ProtectRange(r1, e - r1, true, false);    /* RW+NX */
-        Trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
+        hal::CpuPerformance perf;
+        if (hal::setup_cpu_performance(&perf))
+            trace(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
+                perf.lowest, perf.highest, perf.guaranteed);
+        ulong t0 = (ulong)kernel_start, t1 = (ulong)kernel_text;
+        ulong r1 = (ulong)kernel_rodata, e = (ulong)kernel_end;
+        pt.protect_range(t0, t1 - t0, false, true);   /* RX */
+        pt.protect_range(t1, r1 - t1, false, false);  /* RO+NX */
+        pt.protect_range(r1, e - r1, true, false);    /* RW+NX */
+        trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             t0, t1, t1, r1, r1, e);
-        if (Parameters::GetInstance().IsWxProbeText())
+        if (Parameters::get_instance().is_wx_probe_text())
         {
-            Trace(0, "W^X probe: writing to text 0x%lX (expect page fault)", t0);
+            trace(0, "W^X probe: writing to text 0x%lX (expect page fault)", t0);
             *reinterpret_cast<volatile u32*>(t0) = 0;
-            Trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
+            trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
         }
     }
 
-    Gdt::GetInstance().Save();
-    ExceptionTable::GetInstance().RegisterExceptionHandlers();
-    Idt::GetInstance().Save();
+    Gdt::get_instance().save();
+    ExceptionTable::get_instance().register_exception_handlers();
+    Idt::get_instance().save();
 
     //Test paging
     {
-        Trace(0, "Test paging");
-        auto page = pt.AllocPage();
+        trace(0, "Test paging");
+        auto page = pt.alloc_page();
         if (!page) {
-            Panic("Can't alloc page");
+            PANIC("Can't alloc page");
             break;
         }
-        auto va = pt.TmpMapPage(page->GetPhyAddress());
-        Trace(0, "va 0x%lX pha 0x%lX", va, page->GetPhyAddress());
-        Stdlib::MemSet((void *)va, 0, Const::PageSize);
-        pt.TmpUnmapPage(va);
-        pt.FreePage(page);
+        auto va = pt.tmp_map_page(page->get_phy_address());
+        trace(0, "va 0x%lX pha 0x%lX", va, page->get_phy_address());
+        stdlib::mem_set((void *)va, 0, consts::PAGE_SIZE);
+        pt.tmp_unmap_page(va);
+        pt.free_page(page);
     }
 
     /* Pick the video console now that MMIO can be mapped: under UEFI the
        only screen is the pixel framebuffer GRUB hands over, and mapping it
        needs the page table (but not yet the heap). Must happen on the BSP
        before the APs start -- see MapMmioRegion. */
-    Screen::Setup();
+    screen::setup();
 
-    Screen::Printf("Hello!\n");
+    screen::printf("Hello!\n");
 
-    Trace(0, "Parsing acpi...");
+    trace(0, "Parsing acpi...");
 
-    auto& acpi = Acpi::GetInstance();
-    auto err = acpi.Parse();
-    if (!err.Ok())
+    auto& acpi = Acpi::get_instance();
+    auto err = acpi.parse();
+    if (!err.ok())
     {
-        TraceError(err, "Can't parse ACPI");
-        Panic("Can't parse ACPI");
+        trace_error(err, "Can't parse ACPI");
+        PANIC("Can't parse ACPI");
         break;
     }
 
-    if (!Mm::PageAllocatorImpl::GetInstance().Setup())
+    if (!mm::PageAllocatorImpl::get_instance().setup())
     {
-        Panic("Can't setup page allocator");
+        PANIC("Can't setup page allocator");
         break;
     }
 
-    Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
+    mm::AllocatorImpl::get_instance(&mm::PageAllocatorImpl::get_instance());
 
-    if (Parameters::GetInstance().IsWxProbeHeap())
-        WxProbeHeap();
+    if (Parameters::get_instance().is_wx_probe_heap())
+        wx_probe_heap();
 
     /* Setup HPET after page allocator is ready (MMIO mapping requires it).
        HPET may not be available on all hardware; Setup() returns false silently. */
-    Hpet::GetInstance().Setup();
+    Hpet::get_instance().setup();
 
-    HaltTcoWatchdog();
+    halt_tco_watchdog();
 
     /* Before anything can ask the pool for bytes: seeding needs no heap and
        no device, only the cycle counter and whatever instruction the cpu
        has, which the probe finds first. The devices that can do better are
        folded in by the rust_random_reseed() in BpStartup. */
-    Hal::ProbeHwRandom();
+    hal::probe_hw_random();
     if (!rust_random_setup())
-        Trace(0, "Random: unseeded at boot, https will fail until a source turns up");
+        trace(0, "Random: unseeded at boot, https will fail until a source turns up");
 
-    Screen::Printf("Self test begin, please wait...\n");
+    screen::printf("Self test begin, please wait...\n");
 
-    Trace(0, "Before test");
+    trace(0, "Before test");
 
-    err = Test::Test();
-    if (!err.Ok())
+    err = test::test();
+    if (!err.ok())
     {
-        TraceError(err, "Test failed");
-        Panic("Self test failed");
+        trace_error(err, "Test failed");
+        PANIC("Self test failed");
         break;
     }
 
-    Trace(0, "After test");
-    Ubsan::Announce();
-    Screen::Printf("Self test complete, error %lu\n", (ulong)err.GetCode());
+    trace(0, "After test");
+    ubsan::announce();
+    screen::printf("Self test complete, error %lu\n", (ulong)err.get_code());
 
-    auto& pci = Pci::GetInstance();
-    pci.Scan();
+    auto& pci = Pci::get_instance();
+    pci.scan();
 
-    IO8042::GetInstance();
-    auto& serial = Serial::GetInstance();
-    auto& cmd = Cmd::GetInstance();
-    auto& cpus = CpuTable::GetInstance();
-    auto& params = Parameters::GetInstance();
-    if (!params.IsConsoleSerial())
+    IO8042::get_instance();
+    auto& serial = Serial::get_instance();
+    auto& cmd = Cmd::get_instance();
+    auto& cpus = CpuTable::get_instance();
+    auto& params = Parameters::get_instance();
+    if (!params.is_console_serial())
     {
         /* One sink for every keyboard: the 8042 and the USB HID driver both
            publish into KeyboardInput. */
-        if (!KeyboardInput::GetInstance().RegisterObserver(cmd))
+        if (!KeyboardInput::get_instance().register_observer(cmd))
         {
-            Panic("Can't register cmd in keyboard input");
+            PANIC("Can't register cmd in keyboard input");
             break;
         }
     }
-    if (!params.IsConsoleVga())
+    if (!params.is_console_vga())
     {
-        if (!serial.RegisterObserver(cmd))
+        if (!serial.register_observer(cmd))
         {
-            Panic("Can't register cmd in serial");
+            PANIC("Can't register cmd in serial");
             break;
         }
     }
 
-    Lapic::Enable();
+    Lapic::enable();
 
-    auto& cpu = cpus.GetCurrentCpu();
-    if (!cpus.SetBspIndex(cpu.GetIndex()))
+    auto& cpu = cpus.get_current_cpu();
+    if (!cpus.set_bsp_index(cpu.get_index()))
     {
-        Panic("Can't set boot processor index");
+        PANIC("Can't set boot processor index");
         break;
     }
 
-    Trace(0, "Before cpu run");
+    trace(0, "Before cpu run");
 
-    if (!cpu.Run(BpStartup, nullptr))
+    if (!cpu.run(bp_startup, nullptr))
     {
-        Panic("Can't run cpu %lu task", cpu.GetIndex());
+        PANIC("Can't run cpu %lu task", cpu.get_index());
         break;
     }
 
     } while (false);
 
-    Shutdown();
+    shutdown();
 }
 
-extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
+extern "C" void main_x86_64(grub::MultiBootInfoHeader *mb_info)
 {
-    PerCpuSetupBoot();
+    per_cpu_setup_boot();
 
     ALLOC_CPU_STACK();
-    Main2(MbInfo);
+    main2(mb_info);
 }
 
-namespace Kernel
+namespace kernel
 {
 
-void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree)
+void report_cpu_stacks(stdlib::Printer& printer, ulong& worst_free)
 {
     /* These carry the deepest code in the kernel -- all of Main2 and the
        bring-up path run here, before the first task stack exists -- and
        unlike a task stack they have neither a magic word nor the one-page
        tripwire GetCurrentTask checks. */
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        ulong free = StackProbe::Untouched(&Stack[i][0], CpuStackSize);
-        if (free == CpuStackSize)
+        ulong free = stack_probe::untouched(&stack[i][0], CPU_STACK_SIZE);
+        if (free == CPU_STACK_SIZE)
             continue;
 
-        printer.Printf("static %lu %lu %lu cpu-boot\n", i,
-            (ulong)CpuStackSize - free, (ulong)CpuStackSize);
+        printer.printf("static %lu %lu %lu cpu-boot\n", i,
+            (ulong)CPU_STACK_SIZE - free, (ulong)CPU_STACK_SIZE);
 
-        if (free < worstFree)
-            worstFree = free;
+        if (free < worst_free)
+            worst_free = free;
     }
 }
 

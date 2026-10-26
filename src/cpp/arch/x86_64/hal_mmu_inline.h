@@ -9,24 +9,24 @@ extern "C"
 {
 #endif
 
-ulong GetCr3(void);
-void SetCr3(ulong addr);
+ulong get_cr3(void);
+void set_cr3(ulong addr);
 
 #ifdef __cplusplus
 }
 #endif
 
-namespace Hal
+namespace hal
 {
 
-static inline __attribute__((always_inline)) void TlbFlushPage(ulong virtAddr)
+static inline __attribute__((always_inline)) void tlb_flush_page(ulong virt_addr)
 {
-    asm volatile("invlpg (%0)" ::"r" (virtAddr) : "memory");
+    asm volatile("invlpg (%0)" ::"r" (virt_addr) : "memory");
 }
 
-static inline __attribute__((always_inline)) void TlbFlushAll()
+static inline __attribute__((always_inline)) void tlb_flush_all()
 {
-    SetCr3(GetCr3());
+    set_cr3(get_cr3());
 }
 
 /* A leaf entry that was not present has just been made present, and this
@@ -34,24 +34,24 @@ static inline __attribute__((always_inline)) void TlbFlushAll()
    not-present entry, so there is nothing to invalidate, and its walk sees
    the CPU's own store as a load would: what is left is keeping the compiler
    from moving the store past the access. */
-static inline __attribute__((always_inline)) void PteMadeValid()
+static inline __attribute__((always_inline)) void pte_made_valid()
 {
     asm volatile("" ::: "memory");
 }
 
-static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
+static inline __attribute__((always_inline)) bool tlb_shootdown_needs_ipi()
 {
     return true; /* invlpg/CR3 are CPU-local; remote CPUs need an IPI */
 }
 
-static inline __attribute__((always_inline)) ulong GetTranslationRoot()
+static inline __attribute__((always_inline)) ulong get_translation_root()
 {
-    return GetCr3();
+    return get_cr3();
 }
 
-static inline __attribute__((always_inline)) void SetTranslationRoot(ulong phys)
+static inline __attribute__((always_inline)) void set_translation_root(ulong phys)
 {
-    SetCr3(phys);
+    set_cr3(phys);
 }
 
 }

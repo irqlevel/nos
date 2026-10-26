@@ -13,52 +13,52 @@ extern "C"
 {
 #endif
 
-void Pause(void);
-void Hlt(void);
+void cpu_relax(void);
+void cpu_halt(void);
 
-void InterruptEnable(void);
-void InterruptDisable(void);
+void interrupt_enable(void);
+void interrupt_disable(void);
 
-void SpinLockLock(ulong *lock);
-void SpinLockUnlock(ulong *lock);
+void spin_lock_lock(ulong *lock);
+void spin_lock_unlock(ulong *lock);
 
-void AtomicInc(volatile long *pvalue);
-void AtomicDec(volatile long *pvalue);
-void AtomicAdd(volatile long *pvalue, long delta);
-long AtomicRead(volatile long *pvalue);
-void AtomicWrite(volatile long *pvalue, long newValue);
-long AtomicReadAndDec(volatile long *pvalue);
-long AtomicReadAndInc(volatile long *pvalue);
+void atomic_inc(volatile long *pvalue);
+void atomic_dec(volatile long *pvalue);
+void atomic_add(volatile long *pvalue, long delta);
+long atomic_read(volatile long *pvalue);
+void atomic_write(volatile long *pvalue, long new_value);
+long atomic_read_and_dec(volatile long *pvalue);
+long atomic_read_and_inc(volatile long *pvalue);
 
-long AtomicCmpxchg(volatile long *pvalue, long exchange, long comparand);
+long atomic_cmpxchg(volatile long *pvalue, long exchange, long comparand);
 
-long AtomicTestAndSetBit(volatile long *pvalue, ulong bit);
-long AtomicTestAndClearBit(volatile long *pvalue, ulong bit);
-long AtomicTestBit(volatile long *pvalue, ulong bit);
+long atomic_test_and_set_bit(volatile long *pvalue, ulong bit);
+long atomic_test_and_clear_bit(volatile long *pvalue, ulong bit);
+long atomic_test_bit(volatile long *pvalue, ulong bit);
 
-void SwitchContext(ulong nextRsp, ulong* currRsp, void (*callback)(void* ctx), void* ctx);
+void switch_context(ulong next_rsp, ulong* curr_rsp, void (*callback)(void* ctx), void* ctx);
 
 /* returns_twice: the optimiser must not keep anything in a register across
    a SetJmp that a LongJmp back into it would find changed */
-long SetJmp(void *ctx) __attribute__((returns_twice));
-__attribute__((noreturn)) void LongJmp(void *ctx, long result);
+long set_jmp(void *ctx) __attribute__((returns_twice));
+__attribute__((noreturn)) void long_jmp(void *ctx, long result);
 
 #ifdef __cplusplus
 }
 #endif
 
-static inline void Pause(ulong count)
+static inline void cpu_relax(ulong count)
 {
     for (ulong i = 0; i < count; i++)
-        Pause();
+        cpu_relax();
 }
 
-namespace Hal
+namespace hal
 {
 /* Fabricate the initial stack frame that SwitchContext pops for a
    brand-new task; returns the initial stack pointer. Defined per arch
    (x86: arch/x86_64/hal_x86.cpp, arm64: arch/arm64/cpu_arm64.cpp). */
-ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg);
+ulong build_task_frame(ulong stack_top, ulong entry, ulong arg);
 
 /* Frame pointer recorded in a suspended task's SwitchContext frame
    (task->Rsp on x86 points at a Context; arm64 at the asm.S frame), or 0
@@ -67,17 +67,17 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg);
    by a report on a join that does not end (Task::Locate) -- so it may be
    one the task has since moved on from, and a frame read outside the
    stack would fault where a stale one inside it only names wrong frames. */
-ulong TaskSavedFramePointer(ulong savedSp, ulong stackBase, ulong stackLimit);
+ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_limit);
 
 /* Switch to a fresh stack and call fn(ctx) there, never returning.
    Switching SP mid-function is not expressible safely in C++ (the
    compiler may address temporaries SP-relative, arm64 does at -O0), so
    the switch+call is one indivisible per-arch primitive. Used for the
    never-returning idle/boot task bodies. */
-void __attribute__((noreturn)) RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx);
+void __attribute__((noreturn)) run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx);
 
 /* Execute a guaranteed-undefined instruction (crash/panic testing) */
-static inline __attribute__((always_inline)) void UndefInstr()
+static inline __attribute__((always_inline)) void undef_instr()
 {
 #if defined(__x86_64__)
     asm volatile("ud2");
@@ -92,12 +92,12 @@ static inline __attribute__((always_inline)) void UndefInstr()
    the IST gives it (x86-64; it does not return). arm64 delivers an
    exception onto whatever stack it is on and has no such fault: there it
    returns false, having done nothing. */
-static inline __attribute__((always_inline)) bool DoubleFault()
+static inline __attribute__((always_inline)) bool double_fault()
 {
 #if defined(__x86_64__)
-    static const ulong NonCanonical = 0x8000000000000000UL;
+    static const ulong NON_CANONICAL = 0x8000000000000000UL;
     asm volatile("movq %0, %%rsp\n\t"
-                 "pushq %%rax" :: "r"(NonCanonical) : "memory");
+                 "pushq %%rax" :: "r"(NON_CANONICAL) : "memory");
     __builtin_unreachable();
 #elif defined(__aarch64__)
     return false;
@@ -106,7 +106,7 @@ static inline __attribute__((always_inline)) bool DoubleFault()
 }
 
 #ifdef __cplusplus
-namespace Hal
+namespace hal
 {
 
 /* Make LFENCE dispatch-serializing on this CPU where it is not by default,
@@ -121,7 +121,7 @@ namespace Hal
    serializing by definition, or under a hypervisor, whose MSR that is.
    arm64: no-op. True when it had to be set: the firmware left it clear.
    Defined per arch. */
-bool SetupSerializingLfence();
+bool setup_serializing_lfence();
 
 /* What SetupCpuPerformance left a CPU asking for: on x86 with HWP, the
    range of performance levels it now picks its own clock from -- lowest to
@@ -130,9 +130,9 @@ bool SetupSerializingLfence();
    core. All zero where nothing was done. */
 struct CpuPerformance
 {
-    u32 Lowest;
-    u32 Guaranteed;
-    u32 Highest;
+    u32 lowest;
+    u32 guaranteed;
+    u32 highest;
 };
 
 /* Let this CPU run as fast as it can while it is busy, rather than at the
@@ -146,12 +146,12 @@ struct CpuPerformance
    hwp=off; arm64: nothing. Turning HWP on cannot be undone short of a
    reset. True when HWP was set up, with `out` filled; on the BSP and on
    each AP. Defined per arch. */
-bool SetupCpuPerformance(CpuPerformance* out);
+bool setup_cpu_performance(CpuPerformance* out);
 
 /* How fast ReadCycleCounter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.
    Defined per arch. */
-ulong CycleCounterHz();
+ulong cycle_counter_hz();
 
 }
 #endif

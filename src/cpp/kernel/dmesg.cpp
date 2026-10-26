@@ -1,66 +1,66 @@
 #include "dmesg.h"
 #include "panic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 Dmesg::Dmesg()
-    : Active(false)
-    , Lost(0)
+    : active_(false)
+    , lost_(0)
 {
 }
 
 Dmesg::~Dmesg()
 {
-    Reset();
+    reset();
 }
 
-bool Dmesg::Setup()
+bool Dmesg::setup()
 {
-    if (Active)
+    if (active_)
         return false;
 
-    Lost = 0;
-    Active = MsgBuf.Setup((ulong)&Buf[0], (ulong)&Buf[0] + sizeof(Buf), sizeof(DmesgMsg));
-    return Active;
+    lost_ = 0;
+    active_ = msg_buf_.setup((ulong)&buf_[0], (ulong)&buf_[0] + sizeof(buf_), sizeof(DmesgMsg));
+    return active_;
 }
 
-void Dmesg::Reset()
+void Dmesg::reset()
 {
-    Active = false;
-    Stdlib::AutoLock lock(Lock);
-    while (!MsgList.IsEmpty())
+    active_ = false;
+    stdlib::AutoLock lock(lock_);
+    while (!msg_list_.is_empty())
     {
-        DmesgMsg *msg = CONTAINING_RECORD(MsgList.RemoveHead(), DmesgMsg, ListEntry);
-        MsgBuf.Free(msg);
+        DmesgMsg *msg = CONTAINING_RECORD(msg_list_.remove_head(), DmesgMsg, list_entry);
+        msg_buf_.free(msg);
     }
 }
 
-void Dmesg::VPrintf(const char *fmt, va_list args)
+void Dmesg::v_printf(const char *fmt, va_list args)
 {
-    if (!Active)
+    if (!active_)
         return;
 
     ulong retries = 0;
 
 restart:
-    DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
+    DmesgMsg* msg = (DmesgMsg*)msg_buf_.alloc();
     if (msg == nullptr)
     {
-        Stdlib::AutoLock lock(Lock);
-        if (MsgList.IsEmpty())
+        stdlib::AutoLock lock(lock_);
+        if (msg_list_.is_empty())
         {
-            Lost++;
+            lost_++;
             return;
         }
 
-        for (auto listEntry = MsgList.Flink; listEntry != &MsgList; listEntry = listEntry->Flink)
+        for (auto list_entry = msg_list_.flink; list_entry != &msg_list_; list_entry = list_entry->flink)
         {
-            auto candMsg = CONTAINING_RECORD(listEntry, DmesgMsg, ListEntry);
-            if (candMsg->Usage.Get() == 0)
+            auto cand_msg = CONTAINING_RECORD(list_entry, DmesgMsg, list_entry);
+            if (cand_msg->usage.get() == 0)
             {
-                msg = candMsg;
-                msg->ListEntry.RemoveInit();
+                msg = cand_msg;
+                msg->list_entry.remove_init();
                 break;
             }
         }
@@ -71,166 +71,166 @@ restart:
                is pinned by a walk. Retrying bets on a walk stepping on within
                the next few instructions -- past that this is a spin in the
                trace path, and a CPU stuck printing is worse than a lost line. */
-            if (++retries < MaxRecycleRetries)
+            if (++retries < MAX_RECYCLE_RETRIES)
                 goto restart;
 
-            Lost++;
+            lost_++;
             return;
         }
 
-        Lost++;
+        lost_++;
     }
     else
     {
-        msg->Init();
+        msg->init();
     }
 
-	int size = Stdlib::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
+	int size = stdlib::vsn_printf(msg->str, sizeof(msg->str), fmt, args);
     if (size < 0)
     {
-        MsgBuf.Free(msg);
+        msg_buf_.free(msg);
 		return;
     }
 
-    Stdlib::AutoLock lock(Lock);
-    BugOn(msg->Usage.Get() != 0);
-    MsgList.InsertTail(&msg->ListEntry);
+    stdlib::AutoLock lock(lock_);
+    BUG_ON(msg->usage.get() != 0);
+    msg_list_.insert_tail(&msg->list_entry);
 }
 
-void Dmesg::Printf(const char *fmt, ...)
+void Dmesg::printf(const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    VPrintf(fmt, args);
+    v_printf(fmt, args);
     va_end(args);
 }
 
-void Dmesg::PrintString(const char *s)
+void Dmesg::print_string(const char *s)
 {
-    Printf("%s", s);
+    printf("%s", s);
 }
 
-DmesgMsg* Dmesg::Next(DmesgMsg* current)
+DmesgMsg* Dmesg::next(DmesgMsg* current)
 {
-    BugOn(current != nullptr && current->Usage.Get() == 0);
+    BUG_ON(current != nullptr && current->usage.get() == 0);
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    Stdlib::ListEntry* nextListEntry;
+    stdlib::ListEntry* next_list_entry;
     if (current == nullptr)
     {
-        nextListEntry = MsgList.Flink;
+        next_list_entry = msg_list_.flink;
     }
     else
     {
-        nextListEntry = current->ListEntry.Flink;
-        BugOn(current->Usage.Get() <= 0);
-        current->Usage.Dec();
+        next_list_entry = current->list_entry.flink;
+        BUG_ON(current->usage.get() <= 0);
+        current->usage.dec();
     }
 
-    if (nextListEntry == &MsgList)
+    if (next_list_entry == &msg_list_)
     {
         return nullptr;
     }
 
-    DmesgMsg* next = CONTAINING_RECORD(nextListEntry, DmesgMsg, ListEntry);
-    next->Usage.Inc();
+    DmesgMsg* next = CONTAINING_RECORD(next_list_entry, DmesgMsg, list_entry);
+    next->usage.inc();
     return next;
 }
 
-DmesgMsg* Dmesg::Prev(DmesgMsg* current)
+DmesgMsg* Dmesg::prev(DmesgMsg* current)
 {
-    BugOn(current != nullptr && current->Usage.Get() == 0);
+    BUG_ON(current != nullptr && current->usage.get() == 0);
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    Stdlib::ListEntry* prevListEntry;
+    stdlib::ListEntry* prev_list_entry;
     if (current == nullptr)
     {
-        prevListEntry = MsgList.Blink;
+        prev_list_entry = msg_list_.blink;
     }
     else
     {
-        prevListEntry = current->ListEntry.Blink;
-        BugOn(current->Usage.Get() <= 0);
-        current->Usage.Dec();
+        prev_list_entry = current->list_entry.blink;
+        BUG_ON(current->usage.get() <= 0);
+        current->usage.dec();
     }
 
-    if (prevListEntry == &MsgList)
+    if (prev_list_entry == &msg_list_)
     {
         return nullptr;
     }
 
-    DmesgMsg* prev = CONTAINING_RECORD(prevListEntry, DmesgMsg, ListEntry);
-    prev->Usage.Inc();
+    DmesgMsg* prev = CONTAINING_RECORD(prev_list_entry, DmesgMsg, list_entry);
+    prev->usage.inc();
     return prev;
 }
 
-void Dmesg::Release(DmesgMsg* msg)
+void Dmesg::release(DmesgMsg* msg)
 {
     if (msg == nullptr)
         return;
 
-    Stdlib::AutoLock lock(Lock);
-    BugOn(msg->Usage.Get() <= 0);
-    msg->Usage.Dec();
+    stdlib::AutoLock lock(lock_);
+    BUG_ON(msg->usage.get() <= 0);
+    msg->usage.dec();
 }
 
-ulong Dmesg::GetLost()
+ulong Dmesg::get_lost()
 {
-    Stdlib::AutoLock lock(Lock);
-    return Lost;
+    stdlib::AutoLock lock(lock_);
+    return lost_;
 }
 
-DmesgMsg* Dmesg::TailStart(ulong lastLines)
+DmesgMsg* Dmesg::tail_start(ulong last_lines)
 {
-    DmesgMsg* msg = Prev(nullptr);
+    DmesgMsg* msg = prev(nullptr);
 
-    for (ulong i = 1; msg != nullptr && i < lastLines; i++)
+    for (ulong i = 1; msg != nullptr && i < last_lines; i++)
     {
-        DmesgMsg* prev = Prev(msg);
-        if (prev == nullptr)
+        DmesgMsg* earlier = prev(msg);
+        if (earlier == nullptr)
         {
             /* The log is shorter than the walk asked for. Prev() released the
                pin on its way off the head, so start over from the head rather
                than try to resurrect it. */
-            return Next(nullptr);
+            return next(nullptr);
         }
 
-        msg = prev;
+        msg = earlier;
     }
 
     return msg;
 }
 
-void Dmesg::Dump(Stdlib::Printer& printer, ulong lastLines, const char* filter)
+void Dmesg::dump(stdlib::Printer& printer, ulong last_lines, const char* filter)
 {
-    if (lastLines > MaxMsgs)
-        lastLines = MaxMsgs;
+    if (last_lines > MAX_MSGS)
+        last_lines = MAX_MSGS;
 
     /* A walk longer than the list can be is following a tail another CPU keeps
        extending, so it would never return. Bound both flavours. */
-    const ulong limit = (lastLines != 0) ? lastLines : MaxMsgs;
+    const ulong limit = (last_lines != 0) ? last_lines : MAX_MSGS;
 
-    ulong lost = GetLost();
+    ulong lost = get_lost();
     if (lost != 0)
-        printer.Printf("dmesg: %lu earlier lines lost\n", lost);
+        printer.printf("dmesg: %lu earlier lines lost\n", lost);
 
-    DmesgMsg* msg = (lastLines != 0) ? TailStart(lastLines) : Next(nullptr);
+    DmesgMsg* msg = (last_lines != 0) ? tail_start(last_lines) : next(nullptr);
 
     for (ulong visited = 0; msg != nullptr; visited++)
     {
-        if (filter == nullptr || Stdlib::StrStr(msg->Str, filter) != nullptr)
-            printer.PrintString(msg->Str);
+        if (filter == nullptr || stdlib::str_str(msg->str, filter) != nullptr)
+            printer.print_string(msg->str);
 
         if (visited + 1 == limit)
         {
-            Release(msg);
+            release(msg);
             break;
         }
 
-        msg = Next(msg);
+        msg = next(msg);
     }
 }
 

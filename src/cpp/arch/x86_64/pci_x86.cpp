@@ -9,7 +9,7 @@
 namespace
 {
 
-u32 ConfigAddress(u16 bus, u16 slot, u16 func, u16 offset)
+u32 config_address(u16 bus, u16 slot, u16 func, u16 offset)
 {
     return (u32)(((u32)bus << 16) | ((u32)slot << 11) | ((u32)func << 8) |
                  (offset & 0xfc) | 0x80000000U);
@@ -17,22 +17,22 @@ u32 ConfigAddress(u16 bus, u16 slot, u16 func, u16 offset)
 
 }
 
-namespace Hal
+namespace hal
 {
 
-u32 PciConfigRead32(u16 bus, u16 slot, u16 func, u16 offset)
+u32 pci_config_read32(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
-    return In(0xCFC);
+    outl(0xCF8, config_address(bus, slot, func, offset));
+    return inl(0xCFC);
 }
 
-void PciConfigWrite32(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
+void pci_config_write32(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 {
-    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
-    Out(0xCFC, value);
+    outl(0xCF8, config_address(bus, slot, func, offset));
+    outl(0xCFC, value);
 }
 
-void PciAssignResources(void* devices, ulong count, ulong stride)
+void pci_assign_resources(void* devices, ulong count, ulong stride)
 {
     (void)devices;
     (void)count;

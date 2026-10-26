@@ -7,7 +7,7 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* The x86 MP startup protocol (INIT + 2x SIPI + poll) for CpuTable.
@@ -25,79 +25,79 @@ namespace
    no longer race each other through the dmesg lock, the heap and the shared
    GDT on their way up. The cost is the 10ms INIT delay per CPU -- the polling
    ends as soon as that one AP reports running. */
-bool StartCpu(Cpu& cpu, ulong index, ulong startupVector)
+bool start_cpu(Cpu& cpu, ulong index, ulong startup_vector)
 {
-    static const ulong InitDelayMs = 10;   /* 10ms after INIT */
-    static const ulong SipiRetries = 2;    /* the first SIPI can be lost */
-    static const ulong SipiDelayUs = 200;  /* Intel MP spec: 200us apart */
-    static const ulong ApTimeoutMs = 1000;
-    static const ulong ApPollIntervalMs = 1;
+    static const ulong INIT_DELAY_MS = 10;   /* 10ms after INIT */
+    static const ulong SIPI_RETRIES = 2;    /* the first SIPI can be lost */
+    static const ulong SIPI_DELAY_US = 200;  /* Intel MP spec: 200us apart */
+    static const ulong AP_TIMEOUT_MS = 1000;
+    static const ulong AP_POLL_INTERVAL_MS = 1;
 
-    Trace(0, "Cpu %lu: INIT+SIPI vector 0x%lX", index, startupVector);
+    trace(0, "Cpu %lu: INIT+SIPI vector 0x%lX", index, startup_vector);
 
-    Lapic::SendInit(index);
-    BusyWait(InitDelayMs * Const::NanoSecsInMs);
+    Lapic::send_init(index);
+    busy_wait(INIT_DELAY_MS * consts::NANO_SECS_IN_MS);
 
-    for (ulong sipi = 0; sipi < SipiRetries; sipi++)
+    for (ulong sipi = 0; sipi < SIPI_RETRIES; sipi++)
     {
-        if (cpu.GetState() & Cpu::StateRunning)
+        if (cpu.get_state() & Cpu::STATE_RUNNING)
             return true;
 
-        Lapic::SendStartup(index, startupVector);
-        BusyWait(SipiDelayUs * Const::NanoSecsInUsec);
+        Lapic::send_startup(index, startup_vector);
+        busy_wait(SIPI_DELAY_US * consts::NANO_SECS_IN_USEC);
     }
 
-    for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
+    for (ulong waited = 0; waited < AP_TIMEOUT_MS; waited += AP_POLL_INTERVAL_MS)
     {
-        if (cpu.GetState() & Cpu::StateRunning)
+        if (cpu.get_state() & Cpu::STATE_RUNNING)
             return true;
 
-        BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
+        busy_wait(AP_POLL_INTERVAL_MS * consts::NANO_SECS_IN_MS);
     }
 
-    Trace(0, "Cpu %lu still not running after %lu ms", index, ApTimeoutMs);
+    trace(0, "Cpu %lu still not running after %lu ms", index, AP_TIMEOUT_MS);
 
     return false;
 }
 
 }
 
-bool CpuTable::StartAll()
+bool CpuTable::start_all()
 {
-    ulong startupCode = (ulong)ApStart16;
+    ulong startup_code = (ulong)ap_start16;
 
-    Trace(0, "Starting cpus, startupCode 0x%lX", startupCode);
+    trace(0, "Starting cpus, startupCode 0x%lX", startup_code);
 
-    if (startupCode & (Const::PageSize - 1))
+    if (startup_code & (consts::PAGE_SIZE - 1))
         return false;
 
-    if (startupCode >= 0x100000)
+    if (startup_code >= 0x100000)
         return false;
 
-    const ulong bspIndex = GetBspIndex();
-    const ulong maxCpus = Parameters::GetInstance().GetMaxCpus();
+    const ulong bsp_index = get_bsp_index();
+    const ulong max_cpus = Parameters::get_instance().get_max_cpus();
     ulong running = 1; /* the BSP */
 
-    for (ulong index = 0; index < MaxCpus; index++)
+    for (ulong index = 0; index < MAX_CPUS; index++)
     {
-        auto& cpu = GetCpu(index);
+        auto& cpu = get_cpu(index);
 
-        if (index == bspIndex || !(cpu.GetState() & Cpu::StateInited))
+        if (index == bsp_index || !(cpu.get_state() & Cpu::STATE_INITED))
             continue;
 
-        if (maxCpus != 0 && running >= maxCpus)
+        if (max_cpus != 0 && running >= max_cpus)
         {
-            Trace(0, "Cpu %lu left parked, maxcpus is %lu", index, maxCpus);
+            trace(0, "Cpu %lu left parked, maxcpus is %lu", index, max_cpus);
             continue;
         }
 
-        if (!StartCpu(cpu, index, startupCode >> Const::PageShift))
+        if (!start_cpu(cpu, index, startup_code >> consts::PAGE_SHIFT))
             return false;
 
         running++;
     }
 
-    Trace(0, "Cpus started, %lu running", running);
+    trace(0, "Cpus started, %lu running", running);
 
     return true;
 }

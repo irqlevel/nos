@@ -3,7 +3,7 @@
 #include <lib/stdlib.h>
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class Task;
@@ -30,7 +30,7 @@ public:
     /* constexpr with a trivial destructor, for the same reason as Atomic's:
        the static instances (rust_ffi.cpp's) are initialised by the compiler. */
     constexpr RawRwSpinLock()
-        : WriterPreemptTask(nullptr)
+        : writer_preempt_task_(nullptr)
     {
     }
 
@@ -40,16 +40,16 @@ public:
        was nothing to disable -- preemption not on yet, or no task on this
        stack -- and ReadUnlock(nullptr) then leaves the count alone, whatever
        the global gate did in between. */
-    Task* ReadLock();
-    void ReadUnlock(Task* preemptTask);
+    Task* read_lock();
+    void read_unlock(Task* preempt_task);
 
-    void WriteLock();
-    void WriteUnlock();
+    void write_lock();
+    void write_unlock();
 
     /* IRQ-save variants for writers running in task/preemptible context.
        Preemption goes off with interrupts, and the flags carry it. */
-    ulong WriteLockIrqSave();
-    void WriteUnlockIrqRestore(ulong flags);
+    ulong write_lock_irq_save();
+    void write_unlock_irq_restore(ulong flags);
 
 private:
     RawRwSpinLock(const RawRwSpinLock& other) = delete;
@@ -57,17 +57,17 @@ private:
     RawRwSpinLock& operator=(const RawRwSpinLock& other) = delete;
     RawRwSpinLock& operator=(RawRwSpinLock&& other) = delete;
 
-    void AcquireWrite();
-    void ReleaseWrite();
+    void acquire_write();
+    void release_write();
 
-    Atomic Value;
-    Atomic WriterWaiting;
+    Atomic value_;
+    Atomic writer_waiting_;
 
     /* Whose preemption WriteLock() disabled, for WriteUnlock() to enable
        again. nullptr when it had nothing to disable, and whenever the lock is
        not held through WriteLock() -- WriteLockIrqSave's flags carry that
        instead. */
-    Task* WriterPreemptTask;
+    Task* writer_preempt_task_;
 };
 
 }

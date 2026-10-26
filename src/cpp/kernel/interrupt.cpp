@@ -11,155 +11,155 @@
 #include <arch/x86_64/ioapic.h>
 #include <hal/irqchip.h>
 
-namespace Kernel
+namespace kernel
 {
 
-Interrupt::VectorEntry Interrupt::Vectors[MaxVectors];
+Interrupt::VectorEntry Interrupt::vectors_[MAX_VECTORS];
 
-void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
+void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    Trace(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
-        (ulong)irq, (ulong)vector, handler.GetHandlerFn());
+    trace(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
+        (ulong)irq, (ulong)vector, handler.get_handler_fn());
 
     /* `irq` is a GSI (callers pass acpi.GetGsiByIrq()). Claiming a GSI or
        vector that is already owned would silently reprogram the IOAPIC pin
        or overwrite the IDT entry, and the loser's interrupts would be
        EOI'd unhandled by the winner's stub -- refuse loudly instead. */
-    for (ulong v = 0; v < MaxVectors; v++)
+    for (ulong v = 0; v < MAX_VECTORS; v++)
     {
-        VectorEntry& other = Vectors[v];
-        if (other.HandlerCount > 0 && other.Gsi == irq)
+        VectorEntry& other = vectors_[v];
+        if (other.handler_count > 0 && other.gsi == irq)
         {
-            Trace(0, "Register interrupt: gsi 0x%lX already owned by vector 0x%lX, refused",
+            trace(0, "Register interrupt: gsi 0x%lX already owned by vector 0x%lX, refused",
                 (ulong)irq, v);
             return;
         }
     }
-    if (Vectors[vector].HandlerCount > 0)
+    if (vectors_[vector].handler_count > 0)
     {
-        Trace(0, "Register interrupt: vector 0x%lX already in use, refused",
+        trace(0, "Register interrupt: vector 0x%lX already in use, refused",
             (ulong)vector);
         return;
     }
 
-    IoApic::GetInstance().SetIrq(irq, CpuTable::GetInstance().GetCurrentCpuId(), vector);
-    Idt::GetInstance().SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
+    IoApic::get_instance().set_irq(irq, CpuTable::get_instance().get_current_cpu_id(), vector);
+    Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
 
     /* Record the claim so RegisterLevel cannot land a PCI device on the
        same GSI/vector behind this handler's back */
-    VectorEntry& ve = Vectors[vector];
-    ve.Gsi = irq;
-    ve.Level = false;
-    ve.Handlers[0] = &handler;
-    ve.HandlerCount = 1;
+    VectorEntry& ve = vectors_[vector];
+    ve.gsi = irq;
+    ve.level = false;
+    ve.handlers[0] = &handler;
+    ve.handler_count = 1;
 
-    handler.OnInterruptRegister(irq, vector);
+    handler.on_interrupt_register(irq, vector);
 }
 
-void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
+void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    auto& acpi = Acpi::GetInstance();
-    u8 gsi = (u8)acpi.GetGsiByIrq(irq);
+    auto& acpi = Acpi::get_instance();
+    u8 gsi = (u8)acpi.get_gsi_by_irq(irq);
 
     /* Decode ACPI MADT polarity flags for this IRQ.
        Bits [1:0]: 00=bus default, 01=active high, 11=active low.
        PCI bus default is active low. */
-    u16 acpiFlags = acpi.GetIrqFlags(irq);
-    u8 polarity = acpiFlags & 3;
-    bool activeHigh = (polarity == 1);
+    u16 acpi_flags = acpi.get_irq_flags(irq);
+    u8 polarity = acpi_flags & 3;
+    bool active_high = (polarity == 1);
 
     /* Check if this GSI is already registered on another vector */
-    for (ulong v = 0; v < MaxVectors; v++)
+    for (ulong v = 0; v < MAX_VECTORS; v++)
     {
-        VectorEntry& ve = Vectors[v];
-        if (ve.HandlerCount > 0 && ve.Gsi == gsi)
+        VectorEntry& ve = vectors_[v];
+        if (ve.handler_count > 0 && ve.gsi == gsi)
         {
-            if (!ve.Level)
+            if (!ve.level)
             {
                 /* An edge-triggered system IRQ (PIT/HPET/8042/serial) owns
                    this GSI. Chaining a level PCI handler onto it would
                    re-program the pin and feed the edge handler phantom
                    interrupts -- refuse loudly instead. */
-                Trace(0, "Register level interrupt irq 0x%lX: gsi 0x%lX owned by edge vector 0x%lX, refused",
+                trace(0, "Register level interrupt irq 0x%lX: gsi 0x%lX owned by edge vector 0x%lX, refused",
                     (ulong)irq, (ulong)gsi, v);
                 return;
             }
 
             /* GSI already registered -- chain this handler onto the existing vector */
-            if (ve.HandlerCount >= MaxSharedHandlers)
+            if (ve.handler_count >= MAX_SHARED_HANDLERS)
             {
-                Trace(0, "Register level interrupt irq 0x%lX: too many shared handlers", (ulong)irq);
+                trace(0, "Register level interrupt irq 0x%lX: too many shared handlers", (ulong)irq);
                 return;
             }
 
-            ve.Handlers[ve.HandlerCount] = &handler;
-            ve.HandlerCount++;
+            ve.handlers[ve.handler_count] = &handler;
+            ve.handler_count++;
 
             /* Switch to shared dispatch stub */
-            Idt::GetInstance().SetDescriptor((u8)v, IdtDescriptor::Encode(SharedInterruptStub));
+            Idt::get_instance().set_descriptor((u8)v, IdtDescriptor::encode(shared_interrupt_stub));
 
-            Trace(0, "Register shared level interrupt irq 0x%lX vector 0x%lX handler %lu",
-                (ulong)irq, (ulong)v, (ulong)ve.HandlerCount);
+            trace(0, "Register shared level interrupt irq 0x%lX vector 0x%lX handler %lu",
+                (ulong)irq, (ulong)v, (ulong)ve.handler_count);
 
-            handler.OnInterruptRegister(irq, (u8)v);
+            handler.on_interrupt_register(irq, (u8)v);
             return;
         }
     }
 
     /* Fresh GSI: the requested vector must be free, or we would silently
        overwrite another device's IDT entry */
-    if (Vectors[vector].HandlerCount > 0)
+    if (vectors_[vector].handler_count > 0)
     {
-        Trace(0, "Register level interrupt irq 0x%lX: vector 0x%lX already in use, refused",
+        trace(0, "Register level interrupt irq 0x%lX: vector 0x%lX already in use, refused",
             (ulong)irq, (ulong)vector);
         return;
     }
 
-    Trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p activeHigh %lu",
-        (ulong)irq, (ulong)gsi, (ulong)vector, handler.GetHandlerFn(), (ulong)activeHigh);
+    trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p activeHigh %lu",
+        (ulong)irq, (ulong)gsi, (ulong)vector, handler.get_handler_fn(), (ulong)active_high);
 
-    ulong cpu = IrqBalance::GetInstance().AssignIoApicIrq(gsi);
-    IoApic::GetInstance().SetIrqLevel(gsi, cpu, vector, activeHigh);
+    ulong cpu = IrqBalance::get_instance().assign_io_apic_irq(gsi);
+    IoApic::get_instance().set_irq_level(gsi, cpu, vector, active_high);
 
     /* Record in the shared table */
-    VectorEntry& ve = Vectors[vector];
-    ve.Gsi = gsi;
-    ve.Level = true;
-    ve.Handlers[0] = &handler;
-    ve.HandlerCount = 1;
+    VectorEntry& ve = vectors_[vector];
+    ve.gsi = gsi;
+    ve.level = true;
+    ve.handlers[0] = &handler;
+    ve.handler_count = 1;
 
     /* First handler -- use device's own stub */
-    Idt::GetInstance().SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
+    Idt::get_instance().set_descriptor(vector, IdtDescriptor::encode(handler.get_handler_fn()));
 
-    handler.OnInterruptRegister(irq, vector);
+    handler.on_interrupt_register(irq, vector);
 }
 
-void Interrupt::SharedDispatch(Context* ctx)
+void Interrupt::shared_dispatch(Context* ctx)
 {
-    InterruptStats::Inc(IrqShared);
+    InterruptStats::inc(IrqShared);
 
-    for (ulong v = 0; v < MaxVectors; v++)
+    for (ulong v = 0; v < MAX_VECTORS; v++)
     {
-        VectorEntry& ve = Vectors[v];
+        VectorEntry& ve = vectors_[v];
         /* Only dispatch the vector that is actually in service; handlers
            of unrelated shared vectors must not see phantom interrupts */
-        if (ve.HandlerCount > 1 && Hal::IrqIsInService((u8)v))
+        if (ve.handler_count > 1 && hal::irq_is_in_service((u8)v))
         {
-            for (u8 i = 0; i < ve.HandlerCount; i++)
+            for (u8 i = 0; i < ve.handler_count; i++)
             {
-                InterruptHandler* h = ve.Handlers[i];
+                InterruptHandler* h = ve.handlers[i];
                 if (h)
-                    h->OnInterrupt(ctx);
+                    h->on_interrupt(ctx);
             }
         }
     }
 
-    Hal::IrqEoi();
+    hal::irq_eoi();
 }
 
 }
 
-extern "C" void SharedInterrupt(Kernel::Context* ctx)
+extern "C" void shared_interrupt(kernel::Context* ctx)
 {
-    Kernel::Interrupt::SharedDispatch(ctx);
+    kernel::Interrupt::shared_dispatch(ctx);
 }

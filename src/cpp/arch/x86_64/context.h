@@ -2,63 +2,63 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 struct JmpContext final
 {
-    ulong Rbx;
-    ulong Rsp;
-    ulong Rbp;
-    ulong R12;
-    ulong R13;
-    ulong R14;
-    ulong R15;
-    ulong RetAddr;
+    ulong rbx;
+    ulong rsp;
+    ulong rbp;
+    ulong r12;
+    ulong r13;
+    ulong r14;
+    ulong r15;
+    ulong ret_addr;
 };
 
 struct Context final
 {
-    ulong R15;
-    ulong R14;
-    ulong R13;
-    ulong R12;
-    ulong R11;
-    ulong R10;
-    ulong R9;
-    ulong R8;
-    ulong Rsi;
-    ulong Rdi;
-    ulong Rdx;
-    ulong Rcx;
-    ulong Rbx;
-    ulong Rax;
-    ulong Rbp;
-    ulong Rflags;
-    ulong Rsp;
+    ulong r15;
+    ulong r14;
+    ulong r13;
+    ulong r12;
+    ulong r11;
+    ulong r10;
+    ulong r9;
+    ulong r8;
+    ulong rsi;
+    ulong rdi;
+    ulong rdx;
+    ulong rcx;
+    ulong rbx;
+    ulong rax;
+    ulong rbp;
+    ulong rflags;
+    ulong rsp;
 
-    ulong GetRetRip(bool hasErrorCode = false)
+    ulong get_ret_rip(bool has_error_code = false)
     {
-        if (hasErrorCode)
-            return *((ulong *)(Rsp + sizeof(ulong)));
-        return *((ulong *)Rsp);
+        if (has_error_code)
+            return *((ulong *)(rsp + sizeof(ulong)));
+        return *((ulong *)rsp);
     }
 
-    ulong GetErrorCode()
+    ulong get_error_code()
     {
-        return *((ulong *)Rsp);
+        return *((ulong *)rsp);
     }
 
-    ulong GetFramePointer()
+    ulong get_frame_pointer()
     {
-        return Rbp;
+        return rbp;
     }
 
-    ulong GetOrigRsp(bool hasErrorCode = false)
+    ulong get_orig_rsp(bool has_error_code = false)
     {
-        if (hasErrorCode)
-            return *((ulong *)(Rsp + 4 * sizeof(ulong)));
-        return *((ulong *)(Rsp + 3 * sizeof(ulong)));
+        if (has_error_code)
+            return *((ulong *)(rsp + 4 * sizeof(ulong)));
+        return *((ulong *)(rsp + 3 * sizeof(ulong)));
     }
 private:
     Context(const Context& other) = delete;

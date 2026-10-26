@@ -4,10 +4,10 @@
 #include <lib/stdlib.h>
 #include <lib/list_entry.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 class BlockAllocatorImpl
@@ -16,13 +16,13 @@ public:
     BlockAllocatorImpl();
     ~BlockAllocatorImpl();
 
-    bool Setup(ulong startAddress, ulong endAddress, ulong blockSize);
+    bool setup(ulong start_address, ulong end_address, ulong block_size);
 
-    void* Alloc();
+    void* alloc();
 
-    bool IsOwner(void *block);
+    bool is_owner(void *block);
 
-    void Free(void *block);
+    void free(void *block);
 
 private:
     BlockAllocatorImpl(const BlockAllocatorImpl& other) = delete;
@@ -30,27 +30,27 @@ private:
     BlockAllocatorImpl& operator=(const BlockAllocatorImpl& other) = delete;
     BlockAllocatorImpl& operator=(BlockAllocatorImpl&& other) = delete;
 
-    using ListEntry = Stdlib::ListEntry;
+    using ListEntry = stdlib::ListEntry;
 
-    static const ulong Magic = 0xbeadbead;
+    static const ulong MAGIC = 0xbeadbead;
 
     struct BlockEntry
     {
-        ulong Magic;
-        ListEntry ListLink;
-        ulong Frames[10];
-        size_t NumFrames;
+        ulong magic;
+        ListEntry list_link;
+        ulong frames[10];
+        size_t num_frames;
     };
 
-    ListEntry FreeBlockList;
-    ListEntry ActiveBlockList;
+    ListEntry free_block_list_;
+    ListEntry active_block_list_;
 
-    ulong Usage;
-    ulong Total;
-    ulong StartAddress;
-    ulong EndAddress;
-    ulong BlockSize;
-    SpinLock Lock;
+    ulong usage_;
+    ulong total_;
+    ulong start_address_;
+    ulong end_address_;
+    ulong block_size_;
+    SpinLock lock_;
 };
 
 }

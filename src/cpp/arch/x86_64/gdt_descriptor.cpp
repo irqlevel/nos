@@ -1,15 +1,15 @@
 #include "gdt_descriptor.h"
 
-namespace Kernel
+namespace kernel
 {
 
 GdtDescriptor::GdtDescriptor()
-	: Value(0)
+	: value_(0)
 {
 }
 
 GdtDescriptor::GdtDescriptor(u64 value)
-    : Value(value)
+    : value_(value)
 {
 }
 
@@ -17,13 +17,13 @@ GdtDescriptor::~GdtDescriptor()
 {
 }
 
-u32 GdtDescriptor::GetBase()
+u32 GdtDescriptor::get_base()
 {
 	u32 high, low;
 	u32 base;
 
-	high = Stdlib::HighPart(Value);
-	low = Stdlib::LowPart(Value);
+	high = stdlib::high_part(value_);
+	low = stdlib::low_part(value_);
 	base = 0;
 	base |= (low & 0xFFFF0000) >> 16;
 	base |= (high & 0x000000FF) << 16;
@@ -32,46 +32,46 @@ u32 GdtDescriptor::GetBase()
 	return base;
 }
 
-u32 GdtDescriptor::GetLimit()
+u32 GdtDescriptor::get_limit()
 {
 	u32 high, low;
 	u32 limit;
 
-	high = Stdlib::HighPart(Value);
-	low = Stdlib::LowPart(Value);
+	high = stdlib::high_part(value_);
+	low = stdlib::low_part(value_);
 	limit = 0;
 	limit |= (low & 0x0000FFFF);
 	limit |= (high & 0x000F0000) << 16;
 	return limit;
 }
 
-u8 GdtDescriptor::GetFlag()
+u8 GdtDescriptor::get_flag()
 {
 	u32 high;
 
-	high = Stdlib::HighPart(Value);
+	high = stdlib::high_part(value_);
 	return (high & 0x00F00000) >> 20;
 }
 
-u8 GdtDescriptor::GetAccess()
+u8 GdtDescriptor::get_access()
 {
 	u32 high;
 
-	high = Stdlib::HighPart(Value);
+	high = stdlib::high_part(value_);
 	return (high & 0x0000FF00) >> 8;
 }
 
-u64 GdtDescriptor::GetValue()
+u64 GdtDescriptor::get_value()
 {
-    return Value;
+    return value_;
 }
 
-void GdtDescriptor::SetValue(u64 value)
+void GdtDescriptor::set_value(u64 value)
 {
-	Value = value;
+	value_ = value;
 }
 
-GdtDescriptor GdtDescriptor::Encode(u32 base, u32 limit, u8 flag, u8 access)
+GdtDescriptor GdtDescriptor::encode(u32 base, u32 limit, u8 flag, u8 access)
 {
 	u64 value = 0;
 
@@ -92,21 +92,21 @@ GdtDescriptor GdtDescriptor::Encode(u32 base, u32 limit, u8 flag, u8 access)
 
 GdtDescriptor::GdtDescriptor(GdtDescriptor&& other)
 {
-    Value = other.Value;
-    other.Value = 0;
+    value_ = other.value_;
+    other.value_ = 0;
 }
 
 GdtDescriptor::GdtDescriptor(const GdtDescriptor& other)
 {
-    Value = other.Value;
+    value_ = other.value_;
 }
 
 GdtDescriptor& GdtDescriptor::operator=(GdtDescriptor&& other)
 {
     if (this != &other)
     {
-        Value = other.Value;
-        other.Value = 0;
+        value_ = other.value_;
+        other.value_ = 0;
     }
     return *this;
 }
@@ -115,7 +115,7 @@ GdtDescriptor& GdtDescriptor::operator=(const GdtDescriptor& other)
 {
     if (this != &other)
     {
-        Value = other.Value;
+        value_ = other.value_;
     }
     return *this;
 }

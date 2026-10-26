@@ -2,49 +2,49 @@
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
 
-extern "C" char KernelEnd;
-extern "C" char KernelStart;
+extern "C" char kernel_end;
+extern "C" char kernel_start;
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 MemoryMap::MemoryMap()
-    : Size(0)
-    , LastUsableRegion(0)
+    : size_(0)
+    , last_usable_region_(0)
 {
 }
 
-bool MemoryMap::AddRegion(ulong addr, ulong len, ulong type)
+bool MemoryMap::add_region(ulong addr, ulong len, ulong type)
 {
     if (len == 0)
         return true;
 
-    if (addr >= MaxPhysAddr)
+    if (addr >= MAX_PHYS_ADDR)
     {
-        Trace(0, "mm: region 0x%lX len 0x%lX type %lu is past the physical address space, dropped",
+        trace(0, "mm: region 0x%lX len 0x%lX type %lu is past the physical address space, dropped",
             addr, len, type);
         return true;
     }
 
-    if (len > MaxPhysAddr - addr)
+    if (len > MAX_PHYS_ADDR - addr)
     {
-        Trace(0, "mm: region 0x%lX len 0x%lX type %lu reaches past the physical address space, cut at 0x%lX",
-            addr, len, type, MaxPhysAddr);
-        len = MaxPhysAddr - addr;
+        trace(0, "mm: region 0x%lX len 0x%lX type %lu reaches past the physical address space, cut at 0x%lX",
+            addr, len, type, MAX_PHYS_ADDR);
+        len = MAX_PHYS_ADDR - addr;
     }
 
-    if (Size >= Stdlib::ArraySize(Region))
+    if (size_ >= stdlib::array_size(region_))
         return false;
 
-    auto& region = Region[Size];
-    region.Addr = addr;
-    region.Len = len;
-    region.Type = type;
+    auto& region = region_[size_];
+    region.addr = addr;
+    region.len = len;
+    region.type = type;
 
-    Size++;
+    size_++;
 
     return true;
 }
@@ -53,60 +53,60 @@ MemoryMap::~MemoryMap()
 {
 }
 
-ulong MemoryMap::GetKernelStart()
+ulong MemoryMap::get_kernel_start()
 {
-    return Stdlib::RoundDown((ulong)&KernelStart, Const::PageSize);
+    return stdlib::round_down((ulong)&kernel_start, consts::PAGE_SIZE);
 }
 
-ulong MemoryMap::GetKernelEnd()
+ulong MemoryMap::get_kernel_end()
 {
-    return Stdlib::RoundUp((ulong)&KernelEnd, Const::PageSize);
+    return stdlib::round_up((ulong)&kernel_end, consts::PAGE_SIZE);
 }
 
 
-bool MemoryMap::IsReserved(ulong phyAddr, ulong len)
+bool MemoryMap::is_reserved(ulong phy_addr, ulong len)
 {
     /* Up to the top of the space, for a range the caller let run past it */
-    const ulong end = (len > ~0UL - phyAddr) ? ~0UL : phyAddr + len;
+    const ulong end = (len > ~0UL - phy_addr) ? ~0UL : phy_addr + len;
 
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        auto& region = Region[i];
-        if (region.Type == UsableRamType)
+        auto& region = region_[i];
+        if (region.type == USABLE_RAM_TYPE)
             continue;
 
-        if (phyAddr < (region.Addr + region.Len) &&
-            region.Addr < end)
+        if (phy_addr < (region.addr + region.len) &&
+            region.addr < end)
             return true;
     }
 
     return false;
 }
 
-bool MemoryMap::IsUsableRam(ulong phyAddr)
+bool MemoryMap::is_usable_ram(ulong phy_addr)
 {
     /* Every temp mapping asks this, and a temp mapping is on the path of
        every page allocation and every page-table walk; a real server's map
        has twenty-odd regions to walk past. The queries come in bursts inside
        one region, so try the region that answered last before scanning. */
-    long hint = LastUsableRegion.Get();
-    if (hint >= 0 && (size_t)hint < Size)
+    long hint = last_usable_region_.get();
+    if (hint >= 0 && (size_t)hint < size_)
     {
-        auto& region = Region[hint];
-        if (region.Type == UsableRamType &&
-            phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
+        auto& region = region_[hint];
+        if (region.type == USABLE_RAM_TYPE &&
+            phy_addr >= region.addr && phy_addr < (region.addr + region.len))
             return true;
     }
 
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        auto& region = Region[i];
-        if (region.Type != UsableRamType)
+        auto& region = region_[i];
+        if (region.type != USABLE_RAM_TYPE)
             continue;
 
-        if (phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
+        if (phy_addr >= region.addr && phy_addr < (region.addr + region.len))
         {
-            LastUsableRegion.Set((long)i);
+            last_usable_region_.set((long)i);
             return true;
         }
     }
@@ -114,65 +114,65 @@ bool MemoryMap::IsUsableRam(ulong phyAddr)
     return false;
 }
 
-size_t MemoryMap::GetRegionCount()
+size_t MemoryMap::get_region_count()
 {
-    return Size;
+    return size_;
 }
 
-bool MemoryMap::GetRegion(size_t index, ulong& addr, ulong& len, ulong& type)
+bool MemoryMap::get_region(size_t index, ulong& addr, ulong& len, ulong& type)
 {
-    if (index >= Size)
+    if (index >= size_)
         return false;
 
-    auto& region = Region[index];
-    addr = region.Addr;
-    len = region.Len;
-    type = region.Type;
+    auto& region = region_[index];
+    addr = region.addr;
+    len = region.len;
+    type = region.type;
     return true;
 }
 
-const char* MemoryMap::GetRegionTypeName(ulong type)
+const char* MemoryMap::get_region_type_name(ulong type)
 {
     /* e820 / EFI-derived types as Multiboot2 and the FDT parser hand them
        over; anything else is firmware being creative and is treated as
        reserved either way. */
-    static const ulong AcpiReclaimableType = 3;
-    static const ulong AcpiNvsType = 4;
-    static const ulong BadRamType = 5;
+    static const ulong ACPI_RECLAIMABLE_TYPE = 3;
+    static const ulong ACPI_NVS_TYPE = 4;
+    static const ulong BAD_RAM_TYPE = 5;
 
     switch (type)
     {
-    case UsableRamType:        return "usable";
-    case ReservedType:         return "reserved";
-    case AcpiReclaimableType:  return "acpi-reclaim";
-    case AcpiNvsType:          return "acpi-nvs";
-    case BadRamType:           return "bad";
+    case USABLE_RAM_TYPE:        return "usable";
+    case RESERVED_TYPE:         return "reserved";
+    case ACPI_RECLAIMABLE_TYPE:  return "acpi-reclaim";
+    case ACPI_NVS_TYPE:          return "acpi-nvs";
+    case BAD_RAM_TYPE:           return "bad";
     default:                   return "unknown";
     }
 }
 
-ulong MemoryMap::GetReservedEnd(ulong phyAddr)
+ulong MemoryMap::get_reserved_end(ulong phy_addr)
 {
     ulong end = 0;
 
     /* Nothing is there to reserve (AddRegion) */
-    if (phyAddr >= MaxPhysAddr)
+    if (phy_addr >= MAX_PHYS_ADDR)
         return 0;
 
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        auto& region = Region[i];
-        if (region.Type == UsableRamType)
+        auto& region = region_[i];
+        if (region.type == USABLE_RAM_TYPE)
             continue;
 
         /* The overlap test IsReserved does, for the page at phyAddr. */
-        if (phyAddr < (region.Addr + region.Len) &&
-            region.Addr < (phyAddr + Const::PageSize))
+        if (phy_addr < (region.addr + region.len) &&
+            region.addr < (phy_addr + consts::PAGE_SIZE))
         {
-            ulong regionEnd = Stdlib::RoundUp(region.Addr + region.Len,
-                Const::PageSize);
-            if (regionEnd > end)
-                end = regionEnd;
+            ulong region_end = stdlib::round_up(region.addr + region.len,
+                consts::PAGE_SIZE);
+            if (region_end > end)
+                end = region_end;
         }
     }
 
@@ -181,81 +181,81 @@ ulong MemoryMap::GetReservedEnd(ulong phyAddr)
     return end;
 }
 
-ulong MemoryMap::GetNextReservedStart(ulong phyAddr, ulong limit)
+ulong MemoryMap::get_next_reserved_start(ulong phy_addr, ulong limit)
 {
     ulong next = limit;
 
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        auto& region = Region[i];
-        if (region.Type == UsableRamType)
+        auto& region = region_[i];
+        if (region.type == USABLE_RAM_TYPE)
             continue;
 
         /* Rounded down: a region starting mid-page makes that whole page
            reserved, exactly as IsReserved would have said. */
-        ulong start = Stdlib::RoundDown(region.Addr, Const::PageSize);
-        if (start > phyAddr && start < next)
+        ulong start = stdlib::round_down(region.addr, consts::PAGE_SIZE);
+        if (start > phy_addr && start < next)
             next = start;
     }
 
     return next;
 }
 
-ulong MemoryMap::GetUsableRamBytes()
+ulong MemoryMap::get_usable_ram_bytes()
 {
     ulong total = 0;
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        if (Region[i].Type == UsableRamType)
-            total += Region[i].Len;
+        if (region_[i].type == USABLE_RAM_TYPE)
+            total += region_[i].len;
     }
 
     return total;
 }
 
-ulong MemoryMap::GetUsableRamEnd()
+ulong MemoryMap::get_usable_ram_end()
 {
     ulong end = 0;
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        if (Region[i].Type != UsableRamType)
+        if (region_[i].type != USABLE_RAM_TYPE)
             continue;
 
-        ulong regionEnd = Region[i].Addr + Region[i].Len;
-        if (regionEnd > end)
-            end = regionEnd;
+        ulong region_end = region_[i].addr + region_[i].len;
+        if (region_end > end)
+            end = region_end;
     }
 
     return end;
 }
 
-bool MemoryMap::HasUsableRamIn(ulong start, ulong end)
+bool MemoryMap::has_usable_ram_in(ulong start, ulong end)
 {
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        if (Region[i].Type != UsableRamType)
+        if (region_[i].type != USABLE_RAM_TYPE)
             continue;
 
-        if (Region[i].Addr < end && (Region[i].Addr + Region[i].Len) > start)
+        if (region_[i].addr < end && (region_[i].addr + region_[i].len) > start)
             return true;
     }
 
     return false;
 }
 
-ulong MemoryMap::GetUsableRamBytesAbove(ulong limit)
+ulong MemoryMap::get_usable_ram_bytes_above(ulong limit)
 {
     ulong total = 0;
-    for (size_t i = 0; i < Size; i++)
+    for (size_t i = 0; i < size_; i++)
     {
-        if (Region[i].Type != UsableRamType)
+        if (region_[i].type != USABLE_RAM_TYPE)
             continue;
 
-        ulong end = Region[i].Addr + Region[i].Len;
+        ulong end = region_[i].addr + region_[i].len;
         if (end <= limit)
             continue;
 
-        ulong start = (Region[i].Addr < limit) ? limit : Region[i].Addr;
+        ulong start = (region_[i].addr < limit) ? limit : region_[i].addr;
         total += end - start;
     }
 

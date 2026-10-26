@@ -4,29 +4,29 @@
 #include <lib/stdlib.h>
 #include "raw_spin_lock.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class TimerCallback
 {
 public:
-    virtual void OnTick(TimerCallback& callback) = 0;
+    virtual void on_tick(TimerCallback& callback) = 0;
 };
 
 class TimerTable final
 {
 public:
-    static TimerTable& GetInstance()
+    static TimerTable& get_instance()
     {
-        static TimerTable Instance;
+        static TimerTable instance;
 
-        return Instance;
+        return instance;
     }
 
-    bool StartTimer(TimerCallback& callback, Stdlib::Time period);
-    void StopTimer(TimerCallback& callback);
+    bool start_timer(TimerCallback& callback, stdlib::Time period);
+    void stop_timer(TimerCallback& callback);
 
-    void ProcessTimers();
+    void process_timers();
 
 private:
     TimerTable();
@@ -41,19 +41,19 @@ private:
     {
         Timer();
 
-        TimerCallback *Callback;
-        TimerCallback *Running;   /* callback mid-flight in ProcessTimers */
-        ulong RunningCpu;         /* CPU executing that callback */
-        Stdlib::Time Period;
-        Stdlib::Time Expired;
+        TimerCallback *callback;
+        TimerCallback *running;   /* callback mid-flight in ProcessTimers */
+        ulong running_cpu;         /* CPU executing that callback */
+        stdlib::Time period;
+        stdlib::Time expired;
     };
 
-    Timer Timer[16];
+    Timer timer_[16];
 
     /* Protects the timer array. StartTimer/StopTimer run in task context on
        any CPU while ProcessTimers runs in IPI context, so all access must be
        under the lock with IRQs disabled. */
-    RawSpinLock Lock;
+    RawSpinLock lock_;
 };
 
 }

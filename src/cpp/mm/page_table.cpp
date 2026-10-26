@@ -9,51 +9,51 @@
 #include <kernel/debug.h>
 #include <kernel/preempt.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 BuiltinPageTable::BuiltinPageTable()
-    : MappedLimit(0)
+    : mapped_limit_(0)
 {
-    Stdlib::MemSet(&P4Page, 0, sizeof(P4Page));
+    stdlib::mem_set(&p4_page_, 0, sizeof(p4_page_));
 
-    Stdlib::MemSet(&P3KernelPage, 0, sizeof(P3KernelPage));
-    Stdlib::MemSet(&P3UserPage, 0, sizeof(P3UserPage));
+    stdlib::mem_set(&p3_kernel_page_, 0, sizeof(p3_kernel_page_));
+    stdlib::mem_set(&p3_user_page_, 0, sizeof(p3_user_page_));
 
-    Stdlib::MemSet(&P2KernelPage[0], 0, sizeof(P2KernelPage));
-    Stdlib::MemSet(&P2UserPage[0], 0, sizeof(P2UserPage));
+    stdlib::mem_set(&p2_kernel_page_[0], 0, sizeof(p2_kernel_page_));
+    stdlib::mem_set(&p2_user_page_[0], 0, sizeof(p2_user_page_));
 
-    Trace(0, "PageTable 0x%p P4Page 0x%p", this, &P4Page);
+    trace(0, "PageTable 0x%p P4Page 0x%p", this, &p4_page_);
 }
 
-ulong BuiltinPageTable::VirtToPhys(ulong virtAddr)
+ulong BuiltinPageTable::virt_to_phys(ulong virt_addr)
 {
 
-    BugOn(virtAddr > MemoryMap::UserSpaceMax && virtAddr < MemoryMap::KernelSpaceBase);
+    BUG_ON(virt_addr > MemoryMap::USER_SPACE_MAX && virt_addr < MemoryMap::KERNEL_SPACE_BASE);
 
-    if (virtAddr <= MemoryMap::UserSpaceMax)
-        return virtAddr;
+    if (virt_addr <= MemoryMap::USER_SPACE_MAX)
+        return virt_addr;
 
-    return virtAddr - MemoryMap::KernelSpaceBase;
+    return virt_addr - MemoryMap::KERNEL_SPACE_BASE;
 }
 
-ulong BuiltinPageTable::PhysToVirt(ulong phyAddr)
+ulong BuiltinPageTable::phys_to_virt(ulong phy_addr)
 {
 
-    return phyAddr + MemoryMap::KernelSpaceBase;
+    return phy_addr + MemoryMap::KERNEL_SPACE_BASE;
 }
 
-ulong BuiltinPageTable::GetRoot()
+ulong BuiltinPageTable::get_root()
 {
-    return VirtToPhys((ulong)&P4Page);
+    return virt_to_phys((ulong)&p4_page_);
 }
 
-ulong BuiltinPageTable::GetMappedLimit()
+ulong BuiltinPageTable::get_mapped_limit()
 {
-    return MappedLimit;
+    return mapped_limit_;
 }
 
 BuiltinPageTable::~BuiltinPageTable()
@@ -61,28 +61,28 @@ BuiltinPageTable::~BuiltinPageTable()
 }
 
 PageTable::PageTable()
-    : Root(0)
-    , ExcludedPages(0)
-    , PageArray(nullptr)
-    , PageArrayPhys(0)
-    , PageArrayCount(0)
-    , HighestPhyAddr(0)
-    , FreePagesCount(0)
-    , TotalPagesCount(0)
-    , HugePoolCount(0)
-    , HugePoolFreeCount(0)
-    , HugePoolHint(0)
+    : root_(0)
+    , excluded_pages_(0)
+    , page_array_(nullptr)
+    , page_array_phys_(0)
+    , page_array_count_(0)
+    , highest_phy_addr_(0)
+    , free_pages_count_(0)
+    , total_pages_count_(0)
+    , huge_pool_count_(0)
+    , huge_pool_free_count_(0)
+    , huge_pool_hint_(0)
 {
-    Trace(0, "PageTable 0x%p", this);
-    for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
+    trace(0, "PageTable 0x%p", this);
+    for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
     {
-        TmpMapPageArray[i] = nullptr;
+        tmp_map_page_array_[i] = nullptr;
     }
-    TmpMapL1Page = nullptr;
-    for (ulong i = 0; i < HugePoolWords; i++)
+    tmp_map_l1_page_ = nullptr;
+    for (ulong i = 0; i < HUGE_POOL_WORDS; i++)
     {
-        HugePoolIn[i] = 0;
-        HugePoolFreeBits[i] = 0;
+        huge_pool_in_[i] = 0;
+        huge_pool_free_bits_[i] = 0;
     }
 }
 
@@ -90,87 +90,87 @@ PageTable::~PageTable()
 {
 }
 
-bool PageTable::GetFreePages(ulong excludeLimit)
+bool PageTable::get_free_pages(ulong exclude_limit)
 {
-    auto& mmap = MemoryMap::GetInstance();
+    auto& mmap = MemoryMap::get_instance();
 
     /* Free-listing a page means writing a next-pointer into it, so the list
        can only hold what the bootstrap linear map reaches. RAM above that
        is real, reported by the firmware, and unusable to us. */
-    const ulong BuiltinMapLimit = BuiltinPageTable::GetInstance().GetMappedLimit();
-    BugOn(BuiltinMapLimit == 0);
+    const ulong builtin_map_limit = BuiltinPageTable::get_instance().get_mapped_limit();
+    BUG_ON(builtin_map_limit == 0);
 
     /* A 64 GiB machine spends seconds in this loop and seconds more in the
        drain, and to a log read after the fact silence and a hang look the
        same. One line per 8 GiB is eight of them on the largest machine this
        kernel can address and none at all on a small one. */
-    const ulong ProgressPages = (8 * Const::GB) / Const::PageSize;
-    const ulong usableMiB = mmap.GetUsableRamBytes() / Const::MB;
-    ulong nextProgress = ProgressPages;
+    const ulong progress_pages = (8 * consts::GB) / consts::PAGE_SIZE;
+    const ulong usable_mib = mmap.get_usable_ram_bytes() / consts::MB;
+    ulong next_progress = progress_pages;
 
     /* Hoisted: the kernel image is one physical range, and comparing against
        it beat calling PhysToVirt twice per page. */
-    const ulong kernelPhysStart = BuiltinPageTable::GetInstance().VirtToPhys(mmap.GetKernelStart());
-    const ulong kernelPhysEnd = BuiltinPageTable::GetInstance().VirtToPhys(mmap.GetKernelEnd());
+    const ulong kernel_phys_start = BuiltinPageTable::get_instance().virt_to_phys(mmap.get_kernel_start());
+    const ulong kernel_phys_end = BuiltinPageTable::get_instance().virt_to_phys(mmap.get_kernel_end());
 
-    for (size_t i = 0; i < mmap.GetRegionCount(); i++)
+    for (size_t i = 0; i < mmap.get_region_count(); i++)
     {
         ulong addr, len, type;
 
-        if (!mmap.GetRegion(i, addr, len, type))
+        if (!mmap.get_region(i, addr, len, type))
             return false;
 
-        if (type != MemoryMap::UsableRamType)
+        if (type != MemoryMap::USABLE_RAM_TYPE)
             continue;
 
-        ulong memStart = Stdlib::RoundUp(addr, Const::PageSize);
-        ulong memEnd = ((addr + len) / Const::PageSize) * Const::PageSize;
+        ulong mem_start = stdlib::round_up(addr, consts::PAGE_SIZE);
+        ulong mem_end = ((addr + len) / consts::PAGE_SIZE) * consts::PAGE_SIZE;
 
-        if (memStart < Const::MB)
-            memStart = Stdlib::RoundUp(Const::MB, Const::PageSize);
+        if (mem_start < consts::MB)
+            mem_start = stdlib::round_up(consts::MB, consts::PAGE_SIZE);
 
-        if (memEnd > BuiltinMapLimit)
-            memEnd = BuiltinMapLimit;
+        if (mem_end > builtin_map_limit)
+            mem_end = builtin_map_limit;
 
-        Trace(PageAllocatorLL, "Phy memStart 0x%lX memEnd 0x%lX", memStart, memEnd);
+        trace(PAGE_ALLOCATOR_LL, "Phy memStart 0x%lX memEnd 0x%lX", mem_start, mem_end);
 
-        if (memStart >= memEnd)
+        if (mem_start >= mem_end)
             continue;
 
-        Trace(PageAllocatorLL, "GetFreePages: region 0x%lX-0x%lX", memStart, memEnd);
+        trace(PAGE_ALLOCATOR_LL, "GetFreePages: region 0x%lX-0x%lX", mem_start, mem_end);
 
-        ulong address = memStart;
-        while (address < memEnd)
+        ulong address = mem_start;
+        while (address < mem_end)
         {
             /* Reserved carve-outs (the arm64 DTB, PageArray's backing, the
                firmware's own) overlap usable-RAM regions; free-listing them
                would clobber their contents. Skipped a run at a time rather
                than a page at a time -- there are a handful of boundaries and
                millions of pages. */
-            ulong reservedEnd = mmap.GetReservedEnd(address);
-            if (reservedEnd != 0)
+            ulong reserved_end = mmap.get_reserved_end(address);
+            if (reserved_end != 0)
             {
-                if (reservedEnd > memEnd)
-                    reservedEnd = memEnd;
+                if (reserved_end > mem_end)
+                    reserved_end = mem_end;
 
-                TotalPagesCount += (reservedEnd - address) / Const::PageSize;
-                address = reservedEnd;
+                total_pages_count_ += (reserved_end - address) / consts::PAGE_SIZE;
+                address = reserved_end;
                 continue;
             }
 
-            ulong runEnd = mmap.GetNextReservedStart(address, memEnd);
-            for (; address < runEnd; address += Const::PageSize)
+            ulong run_end = mmap.get_next_reserved_start(address, mem_end);
+            for (; address < run_end; address += consts::PAGE_SIZE)
             {
-                TotalPagesCount++;
+                total_pages_count_++;
 
-                if (TotalPagesCount >= nextProgress)
+                if (total_pages_count_ >= next_progress)
                 {
-                    Trace(0, "mm: free list, %lu of %lu MiB",
-                        (TotalPagesCount * Const::PageSize) / Const::MB, usableMiB);
-                    nextProgress += ProgressPages;
+                    trace(0, "mm: free list, %lu of %lu MiB",
+                        (total_pages_count_ * consts::PAGE_SIZE) / consts::MB, usable_mib);
+                    next_progress += progress_pages;
                 }
 
-                if (address >= kernelPhysStart && address < kernelPhysEnd)
+                if (address >= kernel_phys_start && address < kernel_phys_end)
                     continue;
 
                 /* Pages whose identity address is shadowed by the kernel's
@@ -184,50 +184,50 @@ bool PageTable::GetFreePages(ulong excludeLimit)
                    them here costs one comparison; it used to be a second walk
                    of the whole list, and the whole list is as long as the
                    machine has memory. */
-                ulong* head = (address < excludeLimit) ? &ExcludedPages : &FreePages;
+                ulong* head = (address < exclude_limit) ? &excluded_pages_ : &free_pages_;
 
-                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = *head;
+                *(ulong *)BuiltinPageTable::get_instance().phys_to_virt(address) = *head;
                 *head = address;
             }
         }
-        Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %lu", TotalPagesCount);
+        trace(PAGE_ALLOCATOR_LL, "GetFreePages: inner loop done, total %lu", total_pages_count_);
     }
 
-    Trace(PageAllocatorLL, "GetFreePages done, HighestPhyAddr 0x%lX TotalPages %lu",
-        HighestPhyAddr, TotalPagesCount);
+    trace(PAGE_ALLOCATOR_LL, "GetFreePages done, HighestPhyAddr 0x%lX TotalPages %lu",
+        highest_phy_addr_, total_pages_count_);
 
     /* Say plainly how much of the machine's RAM the kernel actually took.
        The per-region traces above print the clamped end, so a box with more
        memory than the bootstrap map covers looked, in the log, exactly like
        a box with 4GiB in it. */
-    ulong usable = mmap.GetUsableRamBytes();
-    ulong unreachable = mmap.GetUsableRamBytesAbove(BuiltinMapLimit);
+    ulong usable = mmap.get_usable_ram_bytes();
+    ulong unreachable = mmap.get_usable_ram_bytes_above(builtin_map_limit);
 
-    Trace(0, "mm: %lu MiB usable RAM reported, %lu MiB reachable (%lu pages)",
-        usable / Const::MB, (TotalPagesCount * Const::PageSize) / Const::MB,
-        TotalPagesCount);
+    trace(0, "mm: %lu MiB usable RAM reported, %lu MiB reachable (%lu pages)",
+        usable / consts::MB, (total_pages_count_ * consts::PAGE_SIZE) / consts::MB,
+        total_pages_count_);
 
     if (unreachable != 0)
-        Trace(0, "mm: %lu MiB of it is above the bootstrap map at 0x%lX and is not used",
-            unreachable / Const::MB, BuiltinMapLimit);
+        trace(0, "mm: %lu MiB of it is above the bootstrap map at 0x%lX and is not used",
+            unreachable / consts::MB, builtin_map_limit);
 
     return true;
 }
 
-ulong PageTable::GetFreePage()
+ulong PageTable::get_free_page()
 {
-    if (FreePages == 0)
+    if (free_pages_ == 0)
         return 0;
 
-    ulong curr = FreePages;
-    ulong next = *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(curr);
-    FreePages = next;
+    ulong curr = free_pages_;
+    ulong next = *(ulong *)BuiltinPageTable::get_instance().phys_to_virt(curr);
+    free_pages_ = next;
 
-    Stdlib::MemSet((void *)BuiltinPageTable::GetInstance().PhysToVirt(curr), 0, Const::PageSize);
+    stdlib::mem_set((void *)BuiltinPageTable::get_instance().phys_to_virt(curr), 0, consts::PAGE_SIZE);
     return curr;
 }
 
-void PageTable::DrainEarlyFreeList()
+void PageTable::drain_early_free_list()
 {
     /* The early list is threaded through the free pages themselves, so every
        step has to read one, and there are as many of them as the machine has
@@ -235,27 +235,27 @@ void PageTable::DrainEarlyFreeList()
        TLB invalidations, two lock round trips and two PageArray lookups per
        page; one slot held across the whole walk costs one of each. Safe
        because this runs on the BSP before any AP is started. */
-    const ulong virtAddr = TmpMapStart;
-    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
+    const ulong virt_addr = tmp_map_start_;
+    Pte* l1_entry = &tmp_map_l1_page_->entry[Pte::l1_index(virt_addr)];
 
-    BugOn(l1Entry->Present());
+    BUG_ON(l1_entry->present());
 
     /* Same eight-lines-on-the-biggest-machine budget as the scan. */
-    const ulong ProgressPages = (8 * Const::GB) / Const::PageSize;
-    ulong nextProgress = ((FreePagesCount / ProgressPages) + 1) * ProgressPages;
+    const ulong progress_pages = (8 * consts::GB) / consts::PAGE_SIZE;
+    ulong next_progress = ((free_pages_count_ / progress_pages) + 1) * progress_pages;
 
-    while (FreePages != 0)
+    while (free_pages_ != 0)
     {
-        ulong phyAddr = FreePages;
+        ulong phy_addr = free_pages_;
 
-        l1Entry->Value = 0;
-        l1Entry->SetAddress(phyAddr);
-        l1Entry->SetWritable();
-        l1Entry->SetNoExecute(); /* a free page is data, like every TmpMap slot */
-        l1Entry->SetPresent();
-        Hal::TlbFlushPage(virtAddr);
+        l1_entry->value = 0;
+        l1_entry->set_address(phy_addr);
+        l1_entry->set_writable();
+        l1_entry->set_no_execute(); /* a free page is data, like every TmpMap slot */
+        l1_entry->set_present();
+        hal::tlb_flush_page(virt_addr);
 
-        FreePages = *(ulong *)virtAddr;
+        free_pages_ = *(ulong *)virt_addr;
 
         /* Nothing is zeroed on the way to the list. AllocPageNoLock zeroes
            every page it hands out and FreePageNoLock does not, so a page
@@ -263,297 +263,297 @@ void PageTable::DrainEarlyFreeList()
            Zeroing here was a write pass over every byte of RAM the machine
            has -- two thirds of the time this took, and all of it redone at
            the first allocation. */
-        Page* page = GetPage(phyAddr);
-        BugOn(!page);
+        Page* page = get_page(phy_addr);
+        BUG_ON(!page);
         /* GetPage's +1 was only for the lookup; a page on the free list must
            sit at refcount 1 */
-        page->Put();
-        FreePagesList.InsertHead(&page->ListEntry);
-        FreePagesCount++;
+        page->put();
+        free_pages_list_.insert_head(&page->list_entry);
+        free_pages_count_++;
 
-        if (FreePagesCount >= nextProgress)
+        if (free_pages_count_ >= next_progress)
         {
-            Trace(0, "mm: %lu MiB onto the free list",
-                (FreePagesCount * Const::PageSize) / Const::MB);
-            nextProgress += ProgressPages;
+            trace(0, "mm: %lu MiB onto the free list",
+                (free_pages_count_ * consts::PAGE_SIZE) / consts::MB);
+            next_progress += progress_pages;
         }
     }
 
-    l1Entry->Value = 0;
-    Hal::TlbFlushPage(virtAddr);
+    l1_entry->value = 0;
+    hal::tlb_flush_page(virt_addr);
 }
 
-ulong PageTable::GetL1Page(ulong virtAddr)
+ulong PageTable::get_l1_page(ulong virt_addr)
 {
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(!virtAddr);
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
+    BUG_ON(!virt_addr);
 
-    ulong l4Index = Pte::L4Index(virtAddr);
-    ulong l3Index = Pte::L3Index(virtAddr);
-    ulong l2Index = Pte::L2Index(virtAddr);
+    ulong l4_index = Pte::l4_index(virt_addr);
+    ulong l3_index = Pte::l3_index(virt_addr);
+    ulong l2_index = Pte::l2_index(virt_addr);
 
-    if (!Root)
+    if (!root_)
         return 0;
 
-    PtePage* l4Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(Root);
-    Pte *l4Entry = &l4Page->Entry[l4Index];
-    if (!l4Entry->Present())
+    PtePage* l4_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(root_);
+    Pte *l4_entry = &l4_page->entry[l4_index];
+    if (!l4_entry->present())
         return 0;
 
-    PtePage* l3Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l4Entry->Address());
-    Pte *l3Entry = &l3Page->Entry[l3Index];
-    if (!l3Entry->Present() || l3Entry->Huge())
+    PtePage* l3_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l4_entry->address());
+    Pte *l3_entry = &l3_page->entry[l3_index];
+    if (!l3_entry->present() || l3_entry->huge())
         return 0;
 
-    PtePage* l2Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l3Entry->Address());
-    Pte *l2Entry = &l2Page->Entry[l2Index];
-    if (!l2Entry->Present() || l2Entry->Huge())
+    PtePage* l2_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l3_entry->address());
+    Pte *l2_entry = &l2_page->entry[l2_index];
+    if (!l2_entry->present() || l2_entry->huge())
         return 0;
 
-    return l2Entry->Address();
+    return l2_entry->address();
 }
 
-ulong PageTable::VirtToPhys(ulong virtAddr)
+ulong PageTable::virt_to_phys(ulong virt_addr)
 {
     /* The walk below maps and unmaps shared TmpMap slots, and TmpUnmapPage
        only invalidates the local TLB. Disable preemption across the whole
        walk so a migration mid-walk cannot leave a stale mapping on the
        original CPU that a later slot reuse would mistranslate. */
-    ulong flags = PreemptIrqSave();
-    ulong phys = VirtToPhysLocked(virtAddr);
-    PreemptIrqRestore(flags);
+    ulong flags = preempt_irq_save();
+    ulong phys = virt_to_phys_locked(virt_addr);
+    preempt_irq_restore(flags);
     return phys;
 }
 
-ulong PageTable::VirtToPhysLocked(ulong virtAddr)
+ulong PageTable::virt_to_phys_locked(ulong virt_addr)
 {
-    if (!Root)
+    if (!root_)
         return 0;
 
-    ulong l4Index = Pte::L4Index(virtAddr);
-    ulong l3Index = Pte::L3Index(virtAddr);
-    ulong l2Index = Pte::L2Index(virtAddr);
-    ulong l1Index = Pte::L1Index(virtAddr);
-    ulong offset  = virtAddr & (Const::PageSize - 1);
+    ulong l4_index = Pte::l4_index(virt_addr);
+    ulong l3_index = Pte::l3_index(virt_addr);
+    ulong l2_index = Pte::l2_index(virt_addr);
+    ulong l1_index = Pte::l1_index(virt_addr);
+    ulong offset  = virt_addr & (consts::PAGE_SIZE - 1);
 
-    PtePage* l4Page = (PtePage*)TmpMapPage(Root);
-    if (!l4Page)
+    PtePage* l4_page = (PtePage*)tmp_map_page(root_);
+    if (!l4_page)
         return 0;
-    Pte l4Entry = l4Page->Entry[l4Index];
-    TmpUnmapPage((ulong)l4Page);
-    if (!l4Entry.Present())
+    Pte l4_entry = l4_page->entry[l4_index];
+    tmp_unmap_page((ulong)l4_page);
+    if (!l4_entry.present())
         return 0;
 
-    PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry.Address());
-    if (!l3Page)
+    PtePage* l3_page = (PtePage*)tmp_map_page(l4_entry.address());
+    if (!l3_page)
         return 0;
-    Pte l3Entry = l3Page->Entry[l3Index];
-    TmpUnmapPage((ulong)l3Page);
-    if (!l3Entry.Present())
+    Pte l3_entry = l3_page->entry[l3_index];
+    tmp_unmap_page((ulong)l3_page);
+    if (!l3_entry.present())
         return 0;
 
     /* 1GB block at the L3 level (the arm64 early device GiB); without this
        check the walk would treat the block's output address as an L2 table */
-    if (l3Entry.Huge())
-        return l3Entry.Address() + (virtAddr & (Const::GB - 1));
+    if (l3_entry.huge())
+        return l3_entry.address() + (virt_addr & (consts::GB - 1));
 
-    PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry.Address());
-    if (!l2Page)
+    PtePage* l2_page = (PtePage*)tmp_map_page(l3_entry.address());
+    if (!l2_page)
         return 0;
-    Pte l2Entry = l2Page->Entry[l2Index];
-    TmpUnmapPage((ulong)l2Page);
-    if (!l2Entry.Present())
+    Pte l2_entry = l2_page->entry[l2_index];
+    tmp_unmap_page((ulong)l2_page);
+    if (!l2_entry.present())
         return 0;
 
     /* 2MB huge page at L2 level */
-    if (l2Entry.Huge())
+    if (l2_entry.huge())
     {
-        ulong hugeOffset = Pte::HugeOffset(virtAddr);
-        return l2Entry.Address() + hugeOffset;
+        ulong huge_offset = Pte::huge_offset(virt_addr);
+        return l2_entry.address() + huge_offset;
     }
 
-    PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry.Address());
-    if (!l1Page)
+    PtePage* l1_page = (PtePage*)tmp_map_page(l2_entry.address());
+    if (!l1_page)
         return 0;
-    Pte l1Entry = l1Page->Entry[l1Index];
-    TmpUnmapPage((ulong)l1Page);
-    if (!l1Entry.Present())
+    Pte l1_entry = l1_page->entry[l1_index];
+    tmp_unmap_page((ulong)l1_page);
+    if (!l1_entry.present())
         return 0;
 
-    return l1Entry.Address() + offset;
+    return l1_entry.address() + offset;
 }
 
-bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr, bool executable)
+bool PageTable::setup_page(ulong virt_addr, ulong phy_addr, bool executable)
 {
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(phyAddr & (Const::PageSize - 1));
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
+    BUG_ON(phy_addr & (consts::PAGE_SIZE - 1));
 
-    ulong l4Index = Pte::L4Index(virtAddr);
-    ulong l3Index = Pte::L3Index(virtAddr);
-    ulong l2Index = Pte::L2Index(virtAddr);
-    ulong l1Index = Pte::L1Index(virtAddr);
+    ulong l4_index = Pte::l4_index(virt_addr);
+    ulong l3_index = Pte::l3_index(virt_addr);
+    ulong l2_index = Pte::l2_index(virt_addr);
+    ulong l1_index = Pte::l1_index(virt_addr);
 
-    if (Root == 0)
+    if (root_ == 0)
     {
-        Root = GetFreePage();
-        if (!Root)
+        root_ = get_free_page();
+        if (!root_)
             return false;
-        Trace(0, "Root 0x%lX", Root);
+        trace(0, "Root 0x%lX", root_);
     }
 
-    PtePage* l4Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(Root);
-    Pte *l4Entry = &l4Page->Entry[l4Index];
-    if (!l4Entry->Present()) {
-        ulong addr = GetFreePage();
+    PtePage* l4_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(root_);
+    Pte *l4_entry = &l4_page->entry[l4_index];
+    if (!l4_entry->present()) {
+        ulong addr = get_free_page();
         if (addr == 0)
             return false;
 
-        l4Entry->SetAddress(addr);
-        l4Entry->SetWritable();
-        l4Entry->SetPresent();
+        l4_entry->set_address(addr);
+        l4_entry->set_writable();
+        l4_entry->set_present();
     }
 
-    PtePage* l3Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l4Entry->Address());
-    Pte *l3Entry = &l3Page->Entry[l3Index];
-    if (!l3Entry->Present()) {
-        ulong addr = GetFreePage();
+    PtePage* l3_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l4_entry->address());
+    Pte *l3_entry = &l3_page->entry[l3_index];
+    if (!l3_entry->present()) {
+        ulong addr = get_free_page();
         if (addr == 0)
             return false;
 
-        l3Entry->SetAddress(addr);
-        l3Entry->SetWritable();
-        l3Entry->SetPresent();
+        l3_entry->set_address(addr);
+        l3_entry->set_writable();
+        l3_entry->set_present();
     }
 
-    PtePage* l2Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l3Entry->Address());
-    Pte *l2Entry = &l2Page->Entry[l2Index];
-    if (!l2Entry->Present()) {
-        ulong addr = GetFreePage();
+    PtePage* l2_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l3_entry->address());
+    Pte *l2_entry = &l2_page->entry[l2_index];
+    if (!l2_entry->present()) {
+        ulong addr = get_free_page();
         if (addr == 0)
             return false;
 
-        l2Entry->SetAddress(addr);
-        l2Entry->SetWritable();
-        l2Entry->SetPresent();
+        l2_entry->set_address(addr);
+        l2_entry->set_writable();
+        l2_entry->set_present();
     }
 
-    PtePage* l1Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l2Entry->Address());
-    Pte *l1Entry = &l1Page->Entry[l1Index];
+    PtePage* l1_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l2_entry->address());
+    Pte *l1_entry = &l1_page->entry[l1_index];
 
-    Trace(5, "va 0x%lX pha 0x%lX l4 %lu(0x%p) l3 %lu(0x%p) l2 %lu(0x%p) l1 %lu(0x%p)",
-        virtAddr, phyAddr, l4Index, l4Entry, l3Index, l3Entry, l2Index, l2Entry, l1Index, l1Entry);
+    trace(5, "va 0x%lX pha 0x%lX l4 %lu(0x%p) l3 %lu(0x%p) l2 %lu(0x%p) l1 %lu(0x%p)",
+        virt_addr, phy_addr, l4_index, l4_entry, l3_index, l3_entry, l2_index, l2_entry, l1_index, l1_entry);
 
-    if (l1Entry->Present())
+    if (l1_entry->present())
         return false;
 
-    if (phyAddr)
+    if (phy_addr)
     {
-        l1Entry->SetAddress(phyAddr);
-        l1Entry->SetWritable();
+        l1_entry->set_address(phy_addr);
+        l1_entry->set_writable();
         if (!executable)
-            l1Entry->SetNoExecute();
-        l1Entry->SetPresent();
+            l1_entry->set_no_execute();
+        l1_entry->set_present();
     } else {
-        l1Entry->Clear();
+        l1_entry->clear();
     }
-    Hal::TlbFlushPage(virtAddr);
+    hal::tlb_flush_page(virt_addr);
     return true;
 }
 
-bool PageTable::SetupHugePage(ulong virtAddr, ulong phyAddr)
+bool PageTable::setup_huge_page(ulong virt_addr, ulong phy_addr)
 {
-    BugOn(virtAddr & (HugePageSize - 1));
-    BugOn(phyAddr & (HugePageSize - 1));
-    BugOn(Root == 0);
+    BUG_ON(virt_addr & (HUGE_PAGE_SIZE - 1));
+    BUG_ON(phy_addr & (HUGE_PAGE_SIZE - 1));
+    BUG_ON(root_ == 0);
 
-    auto& bpt = BuiltinPageTable::GetInstance();
+    auto& bpt = BuiltinPageTable::get_instance();
 
-    PtePage* l4Page = (PtePage*)bpt.PhysToVirt(Root);
-    Pte* l4Entry = &l4Page->Entry[Pte::L4Index(virtAddr)];
-    if (!l4Entry->Present())
+    PtePage* l4_page = (PtePage*)bpt.phys_to_virt(root_);
+    Pte* l4_entry = &l4_page->entry[Pte::l4_index(virt_addr)];
+    if (!l4_entry->present())
     {
-        ulong addr = GetFreePage();
+        ulong addr = get_free_page();
         if (addr == 0)
             return false;
 
-        l4Entry->SetAddress(addr);
-        l4Entry->SetWritable();
-        l4Entry->SetPresent();
+        l4_entry->set_address(addr);
+        l4_entry->set_writable();
+        l4_entry->set_present();
     }
 
-    PtePage* l3Page = (PtePage*)bpt.PhysToVirt(l4Entry->Address());
-    Pte* l3Entry = &l3Page->Entry[Pte::L3Index(virtAddr)];
-    if (!l3Entry->Present())
+    PtePage* l3_page = (PtePage*)bpt.phys_to_virt(l4_entry->address());
+    Pte* l3_entry = &l3_page->entry[Pte::l3_index(virt_addr)];
+    if (!l3_entry->present())
     {
-        ulong addr = GetFreePage();
+        ulong addr = get_free_page();
         if (addr == 0)
             return false;
 
-        l3Entry->SetAddress(addr);
-        l3Entry->SetWritable();
-        l3Entry->SetPresent();
+        l3_entry->set_address(addr);
+        l3_entry->set_writable();
+        l3_entry->set_present();
     }
 
     /* A 1GiB block here instead of a table would swallow everything else
        living in this GiB of kernel VA. */
-    if (l3Entry->Huge())
+    if (l3_entry->huge())
         return false;
 
-    PtePage* l2Page = (PtePage*)bpt.PhysToVirt(l3Entry->Address());
-    Pte* l2Entry = &l2Page->Entry[Pte::L2Index(virtAddr)];
-    if (l2Entry->Present())
+    PtePage* l2_page = (PtePage*)bpt.phys_to_virt(l3_entry->address());
+    Pte* l2_entry = &l2_page->entry[Pte::l2_index(virt_addr)];
+    if (l2_entry->present())
         return false;
 
     /* The permissions SetupPage's 4KiB leaf gets for data, no more and no
        less: PageArray is written and read, never executed. */
-    l2Entry->SetAddress(phyAddr);
-    l2Entry->SetWritable();
-    l2Entry->SetNoExecute();
-    l2Entry->SetHuge();
-    l2Entry->SetPresent();
-    Hal::TlbFlushPage(virtAddr);
+    l2_entry->set_address(phy_addr);
+    l2_entry->set_writable();
+    l2_entry->set_no_execute();
+    l2_entry->set_huge();
+    l2_entry->set_present();
+    hal::tlb_flush_page(virt_addr);
     return true;
 }
 
-ulong PageTable::ReservePageArray(ulong bytes, ulong lowerBound)
+ulong PageTable::reserve_page_array(ulong bytes, ulong lower_bound)
 {
-    auto& mmap = MemoryMap::GetInstance();
-    auto& bpt = BuiltinPageTable::GetInstance();
+    auto& mmap = MemoryMap::get_instance();
+    auto& bpt = BuiltinPageTable::get_instance();
 
     /* It has to be writable through the bootstrap map: Setup fills PageArray
        in through PhysToVirt, while the real table is not live yet. */
-    const ulong mapLimit = bpt.GetMappedLimit();
+    const ulong map_limit = bpt.get_mapped_limit();
 
-    const ulong kernelStart = bpt.VirtToPhys(mmap.GetKernelStart());
-    const ulong kernelEnd = bpt.VirtToPhys(mmap.GetKernelEnd());
+    const ulong kernel_start = bpt.virt_to_phys(mmap.get_kernel_start());
+    const ulong kernel_end = bpt.virt_to_phys(mmap.get_kernel_end());
 
-    for (size_t i = 0; i < mmap.GetRegionCount(); i++)
+    for (size_t i = 0; i < mmap.get_region_count(); i++)
     {
         ulong addr, len, type;
-        if (!mmap.GetRegion(i, addr, len, type))
+        if (!mmap.get_region(i, addr, len, type))
             break;
 
-        if (type != MemoryMap::UsableRamType)
+        if (type != MemoryMap::USABLE_RAM_TYPE)
             continue;
 
-        ulong start = Stdlib::RoundUp((addr < lowerBound) ? lowerBound : addr,
-            HugePageSize);
+        ulong start = stdlib::round_up((addr < lower_bound) ? lower_bound : addr,
+            HUGE_PAGE_SIZE);
 
         ulong end = addr + len;
-        if (end > mapLimit)
-            end = mapLimit;
+        if (end > map_limit)
+            end = map_limit;
 
         if (start >= end || (end - start) < bytes)
             continue;
 
-        for (ulong cand = start; (cand + bytes) <= end; cand += HugePageSize)
+        for (ulong cand = start; (cand + bytes) <= end; cand += HUGE_PAGE_SIZE)
         {
             /* The kernel image is plain usable RAM as far as the firmware is
                concerned; nobody marks it reserved. */
-            if (cand < kernelEnd && (cand + bytes) > kernelStart)
+            if (cand < kernel_end && (cand + bytes) > kernel_start)
                 continue;
 
-            if (mmap.IsReserved(cand, bytes))
+            if (mmap.is_reserved(cand, bytes))
                 continue;
 
             return cand;
@@ -563,185 +563,185 @@ ulong PageTable::ReservePageArray(ulong bytes, ulong lowerBound)
     return 0;
 }
 
-bool PageTable::ChangeRangeProtection(ulong virtAddr, ulong sizeBytes,
+bool PageTable::change_range_protection(ulong virt_addr, ulong size_bytes,
     bool writable, bool executable, bool exact)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Root == 0)
+    if (root_ == 0)
         return false;
 
-    BugOn(virtAddr & (Const::PageSize - 1));
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
 
-    ulong end = virtAddr + Stdlib::RoundUp(sizeBytes, Const::PageSize);
+    ulong end = virt_addr + stdlib::round_up(size_bytes, consts::PAGE_SIZE);
 
     /* Runs after the real page table is active, so the page-table pages are
        reached through the TmpMap window (the builtin linear map is gone),
        exactly like MapPage/UnmapPage. */
-    for (ulong va = virtAddr; va < end; va += Const::PageSize)
+    for (ulong va = virt_addr; va < end; va += consts::PAGE_SIZE)
     {
-        PtePage* l4 = (PtePage*)TmpMapPage(Root);
-        Pte* l4e = &l4->Entry[Pte::L4Index(va)];
-        if (!l4e->Present()) { TmpUnmapPage((ulong)l4); return false; }
-        ulong l3phys = l4e->Address();
-        TmpUnmapPage((ulong)l4);
+        PtePage* l4 = (PtePage*)tmp_map_page(root_);
+        Pte* l4e = &l4->entry[Pte::l4_index(va)];
+        if (!l4e->present()) { tmp_unmap_page((ulong)l4); return false; }
+        ulong l3phys = l4e->address();
+        tmp_unmap_page((ulong)l4);
 
-        PtePage* l3 = (PtePage*)TmpMapPage(l3phys);
-        Pte* l3e = &l3->Entry[Pte::L3Index(va)];
-        if (!l3e->Present() || l3e->Huge())
+        PtePage* l3 = (PtePage*)tmp_map_page(l3phys);
+        Pte* l3e = &l3->entry[Pte::l3_index(va)];
+        if (!l3e->present() || l3e->huge())
         {
-            TmpUnmapPage((ulong)l3); /* kernel image is 4KiB-mapped */
+            tmp_unmap_page((ulong)l3); /* kernel image is 4KiB-mapped */
             return false;
         }
-        ulong l2phys = l3e->Address();
-        TmpUnmapPage((ulong)l3);
+        ulong l2phys = l3e->address();
+        tmp_unmap_page((ulong)l3);
 
-        PtePage* l2 = (PtePage*)TmpMapPage(l2phys);
-        Pte* l2e = &l2->Entry[Pte::L2Index(va)];
-        if (!l2e->Present() || l2e->Huge())
+        PtePage* l2 = (PtePage*)tmp_map_page(l2phys);
+        Pte* l2e = &l2->entry[Pte::l2_index(va)];
+        if (!l2e->present() || l2e->huge())
         {
-            TmpUnmapPage((ulong)l2); /* kernel image is 4KiB-mapped */
+            tmp_unmap_page((ulong)l2); /* kernel image is 4KiB-mapped */
             return false;
         }
-        ulong l1phys = l2e->Address();
-        TmpUnmapPage((ulong)l2);
+        ulong l1phys = l2e->address();
+        tmp_unmap_page((ulong)l2);
 
-        PtePage* l1 = (PtePage*)TmpMapPage(l1phys);
-        Pte* l1e = &l1->Entry[Pte::L1Index(va)];
-        if (!l1e->Present()) { TmpUnmapPage((ulong)l1); return false; }
+        PtePage* l1 = (PtePage*)tmp_map_page(l1phys);
+        Pte* l1e = &l1->entry[Pte::l1_index(va)];
+        if (!l1e->present()) { tmp_unmap_page((ulong)l1); return false; }
 
         if (!writable)
-            l1e->SetReadOnly();
+            l1e->set_read_only();
         else if (exact)
-            l1e->SetWritable();
+            l1e->set_writable();
         if (!executable)
-            l1e->SetNoExecute();
+            l1e->set_no_execute();
         else if (exact)
-            l1e->ClearNoExecute();
-        TmpUnmapPage((ulong)l1);
+            l1e->clear_no_execute();
+        tmp_unmap_page((ulong)l1);
 
-        InvalidateLocalTlbAddress(va);
+        invalidate_local_tlb_address(va);
     }
 
     return true;
 }
 
-bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
+bool PageTable::protect_range(ulong virt_addr, ulong size_bytes, bool writable,
     bool executable)
 {
-    return ChangeRangeProtection(virtAddr, sizeBytes, writable, executable, false);
+    return change_range_protection(virt_addr, size_bytes, writable, executable, false);
 }
 
-bool PageTable::SetRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable,
+bool PageTable::set_range_protection(ulong virt_addr, ulong size_bytes, bool writable,
     bool executable)
 {
-    return ChangeRangeProtection(virtAddr, sizeBytes, writable, executable, true);
+    return change_range_protection(virt_addr, size_bytes, writable, executable, true);
 }
 
-Page* PageTable::GetPage(ulong phyAddr)
+Page* PageTable::get_page(ulong phy_addr)
 {
-    BugOn(phyAddr & (Const::PageSize - 1));
-    ulong index = phyAddr / Const::PageSize;
+    BUG_ON(phy_addr & (consts::PAGE_SIZE - 1));
+    ulong index = phy_addr / consts::PAGE_SIZE;
 
-    BugOn(index >= PageArrayCount);
-    Page* page = &PageArray[index];
-    BugOn(page->GetPhyAddress() != phyAddr);
-    page->Get();
+    BUG_ON(index >= page_array_count_);
+    Page* page = &page_array_[index];
+    BUG_ON(page->get_phy_address() != phy_addr);
+    page->get();
     return page;
 }
 
-bool PageTable::Setup()
+bool PageTable::setup()
 {
-    Trace(0, "PageTable setup");
+    trace(0, "PageTable setup");
 
-    auto& mmap = MemoryMap::GetInstance();
-    auto& bpt = BuiltinPageTable::GetInstance();
+    auto& mmap = MemoryMap::get_instance();
+    auto& bpt = BuiltinPageTable::get_instance();
 
     /* PageArray has to be sized and placed before the free list is built --
        its home is carved out of the map so the list never sees those pages --
        so the top of usable memory is computed here rather than picked up
        from GetFreePages. Same clamp GetFreePages applies per region: the
        list can only hold what the bootstrap map reaches. */
-    HighestPhyAddr = Stdlib::RoundUp(mmap.GetUsableRamEnd(), Const::PageSize);
-    if (HighestPhyAddr > bpt.GetMappedLimit())
-        HighestPhyAddr = bpt.GetMappedLimit();
+    highest_phy_addr_ = stdlib::round_up(mmap.get_usable_ram_end(), consts::PAGE_SIZE);
+    if (highest_phy_addr_ > bpt.get_mapped_limit())
+        highest_phy_addr_ = bpt.get_mapped_limit();
 
-    TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
-    TmpMapStart = Stdlib::RoundUp(mmap.GetKernelEnd() + Const::PageSize, HugePageSize);
-    PageArray = (Page*)(TmpMapStart + TmpMapPageCount * Const::PageSize);
-    BugOn((ulong)PageArray & (HugePageSize - 1));
+    tmp_map_l1_page_ = (PtePage *)mmap.get_kernel_end();
+    tmp_map_start_ = stdlib::round_up(mmap.get_kernel_end() + consts::PAGE_SIZE, HUGE_PAGE_SIZE);
+    page_array_ = (Page*)(tmp_map_start_ + TMP_MAP_PAGE_COUNT * consts::PAGE_SIZE);
+    BUG_ON((ulong)page_array_ & (HUGE_PAGE_SIZE - 1));
 
-    ulong pageArrayCount = HighestPhyAddr / Const::PageSize + 1;
-    ulong pageArrayBytes = Stdlib::RoundUp(pageArrayCount * sizeof(Page), HugePageSize);
-    ulong pageArrayLimit = (ulong)PageArray + pageArrayBytes;
+    ulong page_array_count = highest_phy_addr_ / consts::PAGE_SIZE + 1;
+    ulong page_array_bytes = stdlib::round_up(page_array_count * sizeof(Page), HUGE_PAGE_SIZE);
+    ulong page_array_limit = (ulong)page_array_ + page_array_bytes;
 
     /* Above the VA window's own physical shadow, so the carve-out is nowhere
        near the pages ExcludeFreePages parks. */
-    PageArrayPhys = ReservePageArray(pageArrayBytes,
-        Stdlib::RoundUp(bpt.VirtToPhys(pageArrayLimit), HugePageSize));
-    if (PageArrayPhys == 0)
+    page_array_phys_ = reserve_page_array(page_array_bytes,
+        stdlib::round_up(bpt.virt_to_phys(page_array_limit), HUGE_PAGE_SIZE));
+    if (page_array_phys_ == 0)
     {
-        Trace(0, "mm: no %lu MiB contiguous window for PageArray",
-            pageArrayBytes / Const::MB);
+        trace(0, "mm: no %lu MiB contiguous window for PageArray",
+            page_array_bytes / consts::MB);
         return false;
     }
 
     /* Reserving it in the map is the whole mechanism: GetFreePages already
        skips any page a reserved region covers. */
-    if (!mmap.AddRegion(PageArrayPhys, pageArrayBytes, MemoryMap::ReservedType))
+    if (!mmap.add_region(page_array_phys_, page_array_bytes, MemoryMap::RESERVED_TYPE))
     {
-        Trace(0, "mm: no room in the memory map to reserve PageArray");
+        trace(0, "mm: no room in the memory map to reserve PageArray");
         return false;
     }
 
-    Trace(0, "mm: PageArray %lu MiB at phys 0x%lX, %lu huge pages",
-        pageArrayBytes / Const::MB, PageArrayPhys, pageArrayBytes / HugePageSize);
+    trace(0, "mm: PageArray %lu MiB at phys 0x%lX, %lu huge pages",
+        page_array_bytes / consts::MB, page_array_phys_, page_array_bytes / HUGE_PAGE_SIZE);
 
-    if (!GetFreePages(bpt.VirtToPhys(pageArrayLimit)))
+    if (!get_free_pages(bpt.virt_to_phys(page_array_limit)))
         return false;
 
-    for (ulong address = mmap.GetKernelStart(); address < mmap.GetKernelEnd(); address+= Const::PageSize)
+    for (ulong address = mmap.get_kernel_start(); address < mmap.get_kernel_end(); address+= consts::PAGE_SIZE)
     {
         /* The one executable mapping the table is built with: the kernel
            runs out of it from the root switch until ProtectRange splits
            it into text RX / rodata RO+NX / data RW+NX. */
-        if (!SetupPage(address, BuiltinPageTable::GetInstance().VirtToPhys(address), true))
+        if (!setup_page(address, BuiltinPageTable::get_instance().virt_to_phys(address), true))
         {
-            Trace(0, "can't setup page");
+            trace(0, "can't setup page");
             return false;
         }
     }
 
-    Trace(0, "TmpMapStart 0x%lX", TmpMapStart);
-    for (size_t i = 0; i < TmpMapPageCount; i++)
+    trace(0, "TmpMapStart 0x%lX", tmp_map_start_);
+    for (size_t i = 0; i < TMP_MAP_PAGE_COUNT; i++)
     {
-        if (!SetupPage(TmpMapStart + i * Const::PageSize, 0, false))
+        if (!setup_page(tmp_map_start_ + i * consts::PAGE_SIZE, 0, false))
             return false;
     }
-    for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
-        TmpMapPageArray[i] = nullptr;
+    for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
+        tmp_map_page_array_[i] = nullptr;
 
     /* One L1 table for the whole window, the CPUs' frame slots included:
        TmpMapL1Page is what every slot's entry is written through. */
-    auto tmpMapL1PagePhyAddr = GetL1Page(TmpMapStart);
-    for (size_t i = 0; i < TmpMapPageCount; i++)
-        BugOn(tmpMapL1PagePhyAddr != GetL1Page(TmpMapStart + i * Const::PageSize));
+    auto tmp_map_l1_page_phy_addr = get_l1_page(tmp_map_start_);
+    for (size_t i = 0; i < TMP_MAP_PAGE_COUNT; i++)
+        BUG_ON(tmp_map_l1_page_phy_addr != get_l1_page(tmp_map_start_ + i * consts::PAGE_SIZE));
 
-    if (!SetupPage((ulong)TmpMapL1Page, tmpMapL1PagePhyAddr, false))
+    if (!setup_page((ulong)tmp_map_l1_page_, tmp_map_l1_page_phy_addr, false))
         return false;
 
-    if (!SetupPage(0, 0, false))
+    if (!setup_page(0, 0, false))
         return false;
 
-    Trace(0, "PageArray setup, highestPhyAddr 0x%lX", HighestPhyAddr);
+    trace(0, "PageArray setup, highestPhyAddr 0x%lX", highest_phy_addr_);
 
-    Trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%lX", PageArray, pageArrayLimit);
+    trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%lX", page_array_, page_array_limit);
 
-    for (ulong offset = 0; offset < pageArrayBytes; offset += HugePageSize)
+    for (ulong offset = 0; offset < page_array_bytes; offset += HUGE_PAGE_SIZE)
     {
-        if (!SetupHugePage((ulong)PageArray + offset, PageArrayPhys + offset))
+        if (!setup_huge_page((ulong)page_array_ + offset, page_array_phys_ + offset))
         {
-            Trace(0, "mm: can't map PageArray at 0x%lX", (ulong)PageArray + offset);
+            trace(0, "mm: can't map PageArray at 0x%lX", (ulong)page_array_ + offset);
             return false;
         }
     }
@@ -749,10 +749,10 @@ bool PageTable::Setup()
     /* Filled through the bootstrap map rather than through PageArray's own
        virtual address: the real table is not live yet, and the backing is
        one contiguous physical run, so this is a straight linear write. */
-    Page* pages = (Page*)bpt.PhysToVirt(PageArrayPhys);
-    for (ulong i = 0; i < pageArrayCount; i++)
+    Page* pages = (Page*)bpt.phys_to_virt(page_array_phys_);
+    for (ulong i = 0; i < page_array_count; i++)
     {
-        pages[i].Init(i * Const::PageSize);
+        pages[i].init(i * consts::PAGE_SIZE);
 
         /* ListEntry::Init stores `this`, and `this` here is the descriptor's
            address in the bootstrap map, not the one PageArray gets in the
@@ -763,106 +763,106 @@ bool PageTable::Setup()
            whether it may take a page. It would read a reserved page, or a
            page below the start of RAM, as free, hand out the run and zero
            it. Point them at the address the descriptor will answer to. */
-        pages[i].ListEntry.Flink = &PageArray[i].ListEntry;
-        pages[i].ListEntry.Blink = &PageArray[i].ListEntry;
+        pages[i].list_entry.flink = &page_array_[i].list_entry;
+        pages[i].list_entry.blink = &page_array_[i].list_entry;
     }
 
-    PageArrayCount = pageArrayCount;
+    page_array_count_ = page_array_count;
 
-    Trace(0, "PageArray setup done, count %lu", PageArrayCount);
+    trace(0, "PageArray setup done, count %lu", page_array_count_);
     return true;
 }
 
-bool PageTable::SetupFreePagesList()
+bool PageTable::setup_free_pages_list()
 {
-    FreePagesCount = 0;
+    free_pages_count_ = 0;
 
     /* Pass 1 drains the early free list; pass 2 drains the pages Setup
        parked below the PageArray limit (plain usable RAM, safe now that all
        page access goes through TmpMap). */
     for (ulong pass = 0; pass < 2; pass++)
     {
-        DrainEarlyFreeList();
+        drain_early_free_list();
 
-        FreePages = ExcludedPages;
-        ExcludedPages = 0;
+        free_pages_ = excluded_pages_;
+        excluded_pages_ = 0;
     }
 
-    Trace(0, "FreePagesCount %lu", FreePagesCount);
+    trace(0, "FreePagesCount %lu", free_pages_count_);
     return true;
 }
 
-void PageTable::CheckFreeList(Stdlib::Printer& printer)
+void PageTable::check_free_list(stdlib::Printer& printer)
 {
-    auto& mmap = MemoryMap::GetInstance();
-    auto& bpt = BuiltinPageTable::GetInstance();
+    auto& mmap = MemoryMap::get_instance();
+    auto& bpt = BuiltinPageTable::get_instance();
 
-    const ulong kernelPhysStart = bpt.VirtToPhys(mmap.GetKernelStart());
-    const ulong kernelPhysEnd = bpt.VirtToPhys(mmap.GetKernelEnd());
+    const ulong kernel_phys_start = bpt.virt_to_phys(mmap.get_kernel_start());
+    const ulong kernel_phys_end = bpt.virt_to_phys(mmap.get_kernel_end());
 
-    ulong onList = 0;
-    ulong inReserved = 0;
-    ulong inKernel = 0;
-    ulong outsideRam = 0;
-    ulong wrongPhys = 0;
+    ulong on_list = 0;
+    ulong in_reserved = 0;
+    ulong in_kernel = 0;
+    ulong outside_ram = 0;
+    ulong wrong_phys = 0;
 
     /* Reserved-ness changes only at region boundaries, so carry a window
        forward instead of asking about every page. */
-    ulong windowEnd = 0;
-    bool windowReserved = false;
+    ulong window_end = 0;
+    bool window_reserved = false;
 
-    for (ulong pfn = 0; pfn < PageArrayCount; pfn++)
+    for (ulong pfn = 0; pfn < page_array_count_; pfn++)
     {
-        ulong phyAddr = pfn * Const::PageSize;
+        ulong phy_addr = pfn * consts::PAGE_SIZE;
 
-        if (phyAddr >= windowEnd)
+        if (phy_addr >= window_end)
         {
-            ulong reservedEnd = mmap.GetReservedEnd(phyAddr);
-            if (reservedEnd != 0)
+            ulong reserved_end = mmap.get_reserved_end(phy_addr);
+            if (reserved_end != 0)
             {
-                windowReserved = true;
-                windowEnd = reservedEnd;
+                window_reserved = true;
+                window_end = reserved_end;
             }
             else
             {
-                windowReserved = false;
-                windowEnd = mmap.GetNextReservedStart(phyAddr,
-                    PageArrayCount * Const::PageSize);
+                window_reserved = false;
+                window_end = mmap.get_next_reserved_start(phy_addr,
+                    page_array_count_ * consts::PAGE_SIZE);
             }
         }
 
-        Page* page = &PageArray[pfn];
-        if (page->GetPhyAddress() != phyAddr)
+        Page* page = &page_array_[pfn];
+        if (page->get_phy_address() != phy_addr)
         {
-            wrongPhys++;
+            wrong_phys++;
             continue;
         }
 
         /* A self-pointing ListEntry means the page is not on the free list,
            the same test AllocContiguousPages uses. */
-        if (page->ListEntry.Flink == &page->ListEntry)
+        if (page->list_entry.flink == &page->list_entry)
             continue;
 
-        onList++;
+        on_list++;
 
-        if (windowReserved)
-            inReserved++;
-        if (phyAddr >= kernelPhysStart && phyAddr < kernelPhysEnd)
-            inKernel++;
-        if (!mmap.IsUsableRam(phyAddr))
-            outsideRam++;
+        if (window_reserved)
+            in_reserved++;
+        if (phy_addr >= kernel_phys_start && phy_addr < kernel_phys_end)
+            in_kernel++;
+        if (!mmap.is_usable_ram(phy_addr))
+            outside_ram++;
     }
 
-    printer.Printf("pages: %lu descriptors, %lu on the free list (counter says %lu)\n",
-        PageArrayCount, onList, FreePagesCount);
-    printer.Printf("free pages inside a reserved region: %lu\n", inReserved);
-    printer.Printf("free pages inside the kernel image:  %lu\n", inKernel);
-    printer.Printf("free pages outside usable RAM:       %lu\n", outsideRam);
-    printer.Printf("descriptors with a wrong phys addr:  %lu\n", wrongPhys);
+    printer.printf("pages: %lu descriptors, %lu on the free list (counter says %lu)\n",
+        page_array_count_, on_list, free_pages_count_);
+    printer.printf("free pages inside a reserved region: %lu\n", in_reserved);
+    printer.printf("free pages inside the kernel image:  %lu\n", in_kernel);
+    printer.printf("free pages outside usable RAM:       %lu\n", outside_ram);
+    printer.printf("descriptors with a wrong phys addr:  %lu\n", wrong_phys);
 
-    bool ok = (inReserved == 0) && (inKernel == 0) && (outsideRam == 0) &&
-        (wrongPhys == 0);
-    printer.Printf("memcheck: %s (live snapshot, not locked)\n",
+    bool ok = (in_reserved == 0) && (in_kernel == 0) && (outside_ram == 0) &&
+        (wrong_phys == 0);
+    printer.printf("memcheck: %s (live snapshot, not locked)\n",
         ok ? "ok" : "FAILED");
 }
 
@@ -872,49 +872,49 @@ void PageTable::CheckFreeList(Stdlib::Printer& printer)
    QEMU throws its translations of a page away as the page is written, and
    rebuilding a guest that had run for half a minute held this lock for
    more than the watchdog's ten seconds, with every other CPU idle. */
-Page* PageTable::AllocPage()
+Page* PageTable::alloc_page()
 {
     Page* page;
     {
-        Stdlib::AutoLock lock(Lock);
-        page = TakeFreePageNoLock();
+        stdlib::AutoLock lock(lock_);
+        page = take_free_page_no_lock();
     }
     if (page)
-        ZeroPage(page);
+        zero_page(page);
     return page;
 }
 
-Page* PageTable::AllocPageKeeping(ulong keep)
+Page* PageTable::alloc_page_keeping(ulong keep)
 {
     Page* page = nullptr;
     {
-        Stdlib::AutoLock lock(Lock);
-        if (FreePagesCount > keep)
-            page = TakeFreePageNoLock();
+        stdlib::AutoLock lock(lock_);
+        if (free_pages_count_ > keep)
+            page = take_free_page_no_lock();
     }
     if (page)
-        ZeroPage(page);
+        zero_page(page);
     return page;
 }
 
-Page* PageTable::AllocPageNoLock()
+Page* PageTable::alloc_page_no_lock()
 {
-    Page* page = TakeFreePageNoLock();
+    Page* page = take_free_page_no_lock();
     if (page)
-        ZeroPage(page);
+        zero_page(page);
     return page;
 }
 
-Page* PageTable::TakeFreePageNoLock()
+Page* PageTable::take_free_page_no_lock()
 {
-    if (FreePagesList.IsEmpty())
+    if (free_pages_list_.is_empty())
     {
         return nullptr;
     }
 
-    Page* page = CONTAINING_RECORD(FreePagesList.RemoveHead(), Page, ListEntry);
-    page->ListEntry.Init(); /* Self-pointing = not on any list */
-    FreePagesCount--;
+    Page* page = CONTAINING_RECORD(free_pages_list_.remove_head(), Page, list_entry);
+    page->list_entry.init(); /* Self-pointing = not on any list */
+    free_pages_count_--;
     return page;
 }
 
@@ -923,23 +923,23 @@ Page* PageTable::TakeFreePageNoLock()
    moved to another CPU half way would leave the slot's translation stale
    behind it -- and the next page mapped at that slot there would be written
    through it. */
-void PageTable::ZeroPage(Page* page)
+void PageTable::zero_page(Page* page)
 {
-    Task* task = PreemptDisableTask();
-    ulong va = TmpMapPage(page->GetPhyAddress());
+    Task* task = preempt_disable_task();
+    ulong va = tmp_map_page(page->get_phy_address());
     if (va == 0)
-        Panic("ZeroPage: no TmpMap slot for page 0x%lX: the window's %lu shared slots are all held",
-            page->GetPhyAddress(), (ulong)TmpMapSharedCount);
-    Stdlib::MemSet((void*)va, 0, Const::PageSize);
-    TmpUnmapPage(va);
-    PreemptEnableTask(task);
+        PANIC("ZeroPage: no TmpMap slot for page 0x%lX: the window's %lu shared slots are all held",
+            page->get_phy_address(), (ulong)TMP_MAP_SHARED_COUNT);
+    stdlib::mem_set((void*)va, 0, consts::PAGE_SIZE);
+    tmp_unmap_page(va);
+    preempt_enable_task(task);
 }
 
-Page* PageTable::AllocContiguousPages(ulong count)
+Page* PageTable::alloc_contiguous_pages(ulong count)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (count == 0 || count > MaxContiguousPages || FreePagesList.IsEmpty())
+    if (count == 0 || count > MAX_CONTIGUOUS_PAGES || free_pages_list_.is_empty())
         return nullptr;
 
     /* Walk the free list and for each free page, check if the next
@@ -952,34 +952,34 @@ Page* PageTable::AllocContiguousPages(ulong count)
        panics on that. What it must not do is be invisible -- it runs with
        this lock held and interrupts off, so a long one is a stall every
        other CPU feels. Say so once it gets there. */
-    static const ulong LongSearchEntries = 1024;
+    static const ulong LONG_SEARCH_ENTRIES = 1024;
     ulong examined = 0;
 
-    auto* entry = FreePagesList.Flink;
-    while (entry != &FreePagesList)
+    auto* entry = free_pages_list_.flink;
+    while (entry != &free_pages_list_)
     {
         examined++;
-        Page* first = CONTAINING_RECORD(entry, Page, ListEntry);
-        ulong basePhyAddr = first->GetPhyAddress();
-        ulong baseIndex = (ulong)(first - PageArray);
+        Page* first = CONTAINING_RECORD(entry, Page, list_entry);
+        ulong base_phy_addr = first->get_phy_address();
+        ulong base_index = (ulong)(first - page_array_);
 
-        if (baseIndex + count > PageArrayCount)
+        if (base_index + count > page_array_count_)
         {
-            entry = entry->Flink;
+            entry = entry->flink;
             continue;
         }
 
         bool ok = true;
         for (ulong j = 0; j < count; j++)
         {
-            Page* p = &PageArray[baseIndex + j];
-            if (p->GetPhyAddress() != basePhyAddr + j * Const::PageSize)
+            Page* p = &page_array_[base_index + j];
+            if (p->get_phy_address() != base_phy_addr + j * consts::PAGE_SIZE)
             {
                 ok = false;
                 break;
             }
             /* Self-pointing ListEntry means the page is NOT on the free list. */
-            if (p->ListEntry.Flink == &p->ListEntry)
+            if (p->list_entry.flink == &p->list_entry)
             {
                 ok = false;
                 break;
@@ -988,7 +988,7 @@ Page* PageTable::AllocContiguousPages(ulong count)
 
         if (!ok)
         {
-            entry = entry->Flink;
+            entry = entry->flink;
             continue;
         }
 
@@ -996,350 +996,350 @@ Page* PageTable::AllocContiguousPages(ulong count)
            and zero them. */
         for (ulong j = 0; j < count; j++)
         {
-            Page* p = &PageArray[baseIndex + j];
-            p->ListEntry.RemoveInit();
-            FreePagesCount--;
-            ulong va = TmpMapPage(p->GetPhyAddress());
-            BugOn(!va);
-            Stdlib::MemSet((void*)va, 0, Const::PageSize);
-            TmpUnmapPage(va);
+            Page* p = &page_array_[base_index + j];
+            p->list_entry.remove_init();
+            free_pages_count_--;
+            ulong va = tmp_map_page(p->get_phy_address());
+            BUG_ON(!va);
+            stdlib::mem_set((void*)va, 0, consts::PAGE_SIZE);
+            tmp_unmap_page(va);
         }
 
-        if (examined > LongSearchEntries)
-            Trace(0, "AllocContiguousPages: %lu pages found after %lu entries",
+        if (examined > LONG_SEARCH_ENTRIES)
+            trace(0, "AllocContiguousPages: %lu pages found after %lu entries",
                 count, examined);
 
         return first;
     }
 
-    Trace(0, "AllocContiguousPages: no run of %lu pages in %lu entries",
+    trace(0, "AllocContiguousPages: no run of %lu pages in %lu entries",
         count, examined);
     return nullptr;
 }
 
-void PageTable::FreePageNoLock(Page* page)
+void PageTable::free_page_no_lock(Page* page)
 {
-    FreePagesCount++;
-    FreePagesList.InsertHead(&page->ListEntry);
+    free_pages_count_++;
+    free_pages_list_.insert_head(&page->list_entry);
 }
 
-void PageTable::FreePage(Page* page)
+void PageTable::free_page(Page* page)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    FreePageNoLock(page);
+    free_page_no_lock(page);
 }
 
-bool PageTable::IsFrameAddress(ulong phyAddr)
+bool PageTable::is_frame_address(ulong phy_addr)
 {
-    if (phyAddr & (Const::PageSize - 1))
+    if (phy_addr & (consts::PAGE_SIZE - 1))
         return false;
 
     /* PageArray and its count are set once in Setup() and never change. */
-    ulong index = phyAddr / Const::PageSize;
-    if (PageArray == nullptr || index >= PageArrayCount)
+    ulong index = phy_addr / consts::PAGE_SIZE;
+    if (page_array_ == nullptr || index >= page_array_count_)
         return false;
 
-    return PageArray[index].GetPhyAddress() == phyAddr;
+    return page_array_[index].get_phy_address() == phy_addr;
 }
 
-void PageTable::FreeFrame(ulong phyAddr)
+void PageTable::free_frame(ulong phy_addr)
 {
-    BugOn(!IsFrameAddress(phyAddr));
+    BUG_ON(!is_frame_address(phy_addr));
     /* A page of the huge pool goes back with its block, into the pool: on
        the free list too it would be handed out twice. */
     ulong block = 0;
-    if (HugePoolBlockOf(phyAddr, block))
-        Panic("FreeFrame: page 0x%lX is in block %lu of the huge pool", phyAddr, block);
+    if (huge_pool_block_of(phy_addr, block))
+        PANIC("FreeFrame: page 0x%lX is in block %lu of the huge pool", phy_addr, block);
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    Page* page = &PageArray[phyAddr / Const::PageSize];
+    Page* page = &page_array_[phy_addr / consts::PAGE_SIZE];
     /* A page handed out has a self-pointing entry (AllocPageNoLock); one on
        the free list points into it. Inserting the second kind again would
        make the list a loop. */
-    BugOn(page->ListEntry.Flink != &page->ListEntry);
-    FreePageNoLock(page);
+    BUG_ON(page->list_entry.flink != &page->list_entry);
+    free_page_no_lock(page);
 }
 
-ulong PageTable::GetKernelReservePages()
+ulong PageTable::get_kernel_reserve_pages()
 {
     /* TotalPagesCount is set once, by Setup. */
-    return Stdlib::Max(KernelReserveMinBytes / Const::PageSize,
-        TotalPagesCount / KernelReserveFraction);
+    return stdlib::max(KERNEL_RESERVE_MIN_BYTES / consts::PAGE_SIZE,
+        total_pages_count_ / KERNEL_RESERVE_FRACTION);
 }
 
-bool PageTable::HugePoolTest(const ulong* bits, ulong block)
+bool PageTable::huge_pool_test(const ulong* bits, ulong block)
 {
-    return ((bits[block / HugePoolWordBits] >> (block % HugePoolWordBits)) & 1) != 0;
+    return ((bits[block / HUGE_POOL_WORD_BITS] >> (block % HUGE_POOL_WORD_BITS)) & 1) != 0;
 }
 
-void PageTable::HugePoolSet(ulong* bits, ulong block, bool value)
+void PageTable::huge_pool_set(ulong* bits, ulong block, bool value)
 {
-    const ulong mask = 1UL << (block % HugePoolWordBits);
-    ulong& word = bits[block / HugePoolWordBits];
+    const ulong mask = 1UL << (block % HUGE_POOL_WORD_BITS);
+    ulong& word = bits[block / HUGE_POOL_WORD_BITS];
     word = value ? (word | mask) : (word & ~mask);
 }
 
-bool PageTable::HugePoolBlockOf(ulong phyAddr, ulong& block)
+bool PageTable::huge_pool_block_of(ulong phy_addr, ulong& block)
 {
-    if (phyAddr >= HugePoolMaxBytes)
+    if (phy_addr >= HUGE_POOL_MAX_BYTES)
         return false;
-    block = phyAddr / HugeFrameSize;
+    block = phy_addr / HUGE_FRAME_SIZE;
     /* Written only before there is another CPU: read without the lock. */
-    return HugePoolTest(HugePoolIn, block);
+    return huge_pool_test(huge_pool_in_, block);
 }
 
 /* Whether every page of the block is on the free list: a descriptor at its
    own address for each, and none self-pointing. Under Lock. */
-bool PageTable::HugeBlockFree(ulong block)
+bool PageTable::huge_block_free(ulong block)
 {
-    const ulong first = block * HugeFramePages;
-    if (first >= PageArrayCount || PageArrayCount - first < HugeFramePages)
+    const ulong first = block * HUGE_FRAME_PAGES;
+    if (first >= page_array_count_ || page_array_count_ - first < HUGE_FRAME_PAGES)
         return false;
-    for (ulong i = first; i < first + HugeFramePages; i++)
+    for (ulong i = first; i < first + HUGE_FRAME_PAGES; i++)
     {
-        Page* page = &PageArray[i];
-        if (page->GetPhyAddress() != i * Const::PageSize || page->ListEntry.Flink == &page->ListEntry)
+        Page* page = &page_array_[i];
+        if (page->get_phy_address() != i * consts::PAGE_SIZE || page->list_entry.flink == &page->list_entry)
             return false;
     }
     return true;
 }
 
-ulong PageTable::ReserveHugePool(ulong bytes)
+ulong PageTable::reserve_huge_pool(ulong bytes)
 {
-    return ReserveHugePoolKeeping(bytes, 2 * GetKernelReservePages());
+    return reserve_huge_pool_keeping(bytes, 2 * get_kernel_reserve_pages());
 }
 
-ulong PageTable::ReserveHugePoolKeeping(ulong bytes, ulong keepPages)
+ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
 {
-    const ulong want = bytes / HugeFrameSize;
+    const ulong want = bytes / HUGE_FRAME_SIZE;
     if (want == 0)
         return 0;
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     /* Once: a second call would find the bitmaps another CPU may be
        reading without the lock. */
-    BugOn(HugePoolCount != 0);
-    const ulong blocks = Stdlib::Min(PageArrayCount / HugeFramePages, HugePoolMaxBlocks);
-    for (ulong block = blocks; block-- > 0 && HugePoolCount < want;)
+    BUG_ON(huge_pool_count_ != 0);
+    const ulong blocks = stdlib::min(page_array_count_ / HUGE_FRAME_PAGES, HUGE_POOL_MAX_BLOCKS);
+    for (ulong block = blocks; block-- > 0 && huge_pool_count_ < want;)
     {
-        if (FreePagesCount < keepPages || FreePagesCount - keepPages < HugeFramePages)
+        if (free_pages_count_ < keep_pages || free_pages_count_ - keep_pages < HUGE_FRAME_PAGES)
             break;
-        if (!HugeBlockFree(block))
+        if (!huge_block_free(block))
             continue;
-        for (ulong i = 0; i < HugeFramePages; i++)
-            PageArray[block * HugeFramePages + i].ListEntry.RemoveInit();
-        FreePagesCount -= HugeFramePages;
-        HugePoolSet(HugePoolIn, block, true);
-        HugePoolSet(HugePoolFreeBits, block, true);
-        HugePoolCount++;
+        for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
+            page_array_[block * HUGE_FRAME_PAGES + i].list_entry.remove_init();
+        free_pages_count_ -= HUGE_FRAME_PAGES;
+        huge_pool_set(huge_pool_in_, block, true);
+        huge_pool_set(huge_pool_free_bits_, block, true);
+        huge_pool_count_++;
     }
-    HugePoolFreeCount = HugePoolCount;
+    huge_pool_free_count_ = huge_pool_count_;
     /* Said either way: a pool cut short is guests that will not start. */
-    Trace(0, "mm: hugepages: %lu 2MiB blocks reserved (%lu MiB) of %lu asked, %lu MiB left free",
-        HugePoolCount, HugePoolCount * HugeFrameSize / Const::MB, want,
-        FreePagesCount * Const::PageSize / Const::MB);
-    return HugePoolCount;
+    trace(0, "mm: hugepages: %lu 2MiB blocks reserved (%lu MiB) of %lu asked, %lu MiB left free",
+        huge_pool_count_, huge_pool_count_ * HUGE_FRAME_SIZE / consts::MB, want,
+        free_pages_count_ * consts::PAGE_SIZE / consts::MB);
+    return huge_pool_count_;
 }
 
-ulong PageTable::AllocHugeFrame()
+ulong PageTable::alloc_huge_frame()
 {
     ulong block = 0;
     {
-        Stdlib::AutoLock lock(Lock);
-        if (HugePoolFreeCount == 0)
+        stdlib::AutoLock lock(lock_);
+        if (huge_pool_free_count_ == 0)
             return 0;
         bool found = false;
-        for (ulong n = 0; n < HugePoolWords && !found; n++)
+        for (ulong n = 0; n < HUGE_POOL_WORDS && !found; n++)
         {
-            const ulong w = (HugePoolHint + n) % HugePoolWords;
-            const ulong bits = HugePoolFreeBits[w];
+            const ulong w = (huge_pool_hint_ + n) % HUGE_POOL_WORDS;
+            const ulong bits = huge_pool_free_bits_[w];
             if (bits == 0)
                 continue;
             /* bits is not 0: its lowest set bit is a free block. */
-            block = w * HugePoolWordBits + static_cast<ulong>(__builtin_ctzl(bits));
+            block = w * HUGE_POOL_WORD_BITS + static_cast<ulong>(__builtin_ctzl(bits));
             found = true;
         }
         /* The count said one was free and no bit says which: the two have
            come apart, and a block handed out of that is anyone's. */
         if (!found)
-            Panic("AllocHugeFrame: %lu blocks free by the count, none by the bitmap", HugePoolFreeCount);
-        BugOn(!HugePoolTest(HugePoolIn, block));
-        HugePoolSet(HugePoolFreeBits, block, false);
-        HugePoolFreeCount--;
-        HugePoolHint = block / HugePoolWordBits;
+            PANIC("AllocHugeFrame: %lu blocks free by the count, none by the bitmap", huge_pool_free_count_);
+        BUG_ON(!huge_pool_test(huge_pool_in_, block));
+        huge_pool_set(huge_pool_free_bits_, block, false);
+        huge_pool_free_count_--;
+        huge_pool_hint_ = block / HUGE_POOL_WORD_BITS;
     }
 
     /* Zeroed off the lock, a page at a time through this CPU's frame slot,
        as kernel_frame_read copies: interrupts off for one page's stores and
        no longer, and no TmpMapLock for each of the 512. */
-    const ulong phys = block * HugeFrameSize;
-    for (ulong i = 0; i < HugeFramePages; i++)
+    const ulong phys = block * HUGE_FRAME_SIZE;
+    for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
     {
-        ulong flags = PreemptIrqSave();
-        ulong va = MapFrameSlot(phys + i * Const::PageSize);
-        Stdlib::MemSet(reinterpret_cast<void*>(va), 0, Const::PageSize);
-        UnmapFrameSlot(va);
-        PreemptIrqRestore(flags);
+        ulong flags = preempt_irq_save();
+        ulong va = map_frame_slot(phys + i * consts::PAGE_SIZE);
+        stdlib::mem_set(reinterpret_cast<void*>(va), 0, consts::PAGE_SIZE);
+        unmap_frame_slot(va);
+        preempt_irq_restore(flags);
     }
     return phys;
 }
 
-void PageTable::FreeHugeFrame(ulong phyAddr)
+void PageTable::free_huge_frame(ulong phy_addr)
 {
     ulong block = 0;
-    if (phyAddr % HugeFrameSize != 0 || !HugePoolBlockOf(phyAddr, block))
-        Panic("FreeHugeFrame: 0x%lX is no block of the huge pool", phyAddr);
+    if (phy_addr % HUGE_FRAME_SIZE != 0 || !huge_pool_block_of(phy_addr, block))
+        PANIC("FreeHugeFrame: 0x%lX is no block of the huge pool", phy_addr);
 
-    Stdlib::AutoLock lock(Lock);
-    if (HugePoolTest(HugePoolFreeBits, block))
-        Panic("FreeHugeFrame: block 0x%lX freed twice", phyAddr);
-    BugOn(HugePoolFreeCount >= HugePoolCount);
-    HugePoolSet(HugePoolFreeBits, block, true);
-    HugePoolFreeCount++;
+    stdlib::AutoLock lock(lock_);
+    if (huge_pool_test(huge_pool_free_bits_, block))
+        PANIC("FreeHugeFrame: block 0x%lX freed twice", phy_addr);
+    BUG_ON(huge_pool_free_count_ >= huge_pool_count_);
+    huge_pool_set(huge_pool_free_bits_, block, true);
+    huge_pool_free_count_++;
 }
 
-ulong PageTable::GetHugePoolBlocks()
+ulong PageTable::get_huge_pool_blocks()
 {
     /* Set once, by ReserveHugePool, before there is another CPU. */
-    return HugePoolCount;
+    return huge_pool_count_;
 }
 
-ulong PageTable::GetHugePoolFree()
+ulong PageTable::get_huge_pool_free()
 {
-    Stdlib::AutoLock lock(Lock);
-    return HugePoolFreeCount;
+    stdlib::AutoLock lock(lock_);
+    return huge_pool_free_count_;
 }
 
 /* Sentinel for TmpMapPageArray when page was mapped without a Page struct (e.g. reserved ACPI region). */
-static Page* const TmpMapDirectSentinel = (Page*)1;
+static Page* const TMP_MAP_DIRECT_SENTINEL = (Page*)1;
 
-ulong PageTable::TmpMapPage(ulong phyAddr)
+ulong PageTable::tmp_map_page(ulong phy_addr)
 {
-    Stdlib::AutoLock lock(TmpMapLock);
+    stdlib::AutoLock lock(tmp_map_lock_);
 
-    BugOn(phyAddr & (Const::PageSize - 1));
+    BUG_ON(phy_addr & (consts::PAGE_SIZE - 1));
 
-    bool havePage = (phyAddr / Const::PageSize) < PageArrayCount;
+    bool have_page = (phy_addr / consts::PAGE_SIZE) < page_array_count_;
 
-    for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
+    for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
     {
-        if (!TmpMapPageArray[i]) {
-            ulong virtAddr = TmpMapStart + i * Const::PageSize;
-            ulong l1Index = Pte::L1Index(virtAddr);
-            Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
-            if (l1Entry->Present())
+        if (!tmp_map_page_array_[i]) {
+            ulong virt_addr = tmp_map_start_ + i * consts::PAGE_SIZE;
+            ulong l1_index = Pte::l1_index(virt_addr);
+            Pte *l1_entry = &tmp_map_l1_page_->entry[l1_index];
+            if (l1_entry->present())
                 return 0;
 
-            l1Entry->SetAddress(phyAddr);
+            l1_entry->set_address(phy_addr);
             /* TmpMap serves both RAM (free pages, ACPI tables) and MMIO
                (LAPIC, IOAPIC): only non-RAM gets mapped uncached. */
-            if (!MemoryMap::GetInstance().IsUsableRam(phyAddr))
-                l1Entry->SetCacheDisabled();
-            l1Entry->SetWritable();
+            if (!MemoryMap::get_instance().is_usable_ram(phy_addr))
+                l1_entry->set_cache_disabled();
+            l1_entry->set_writable();
             /* The window exists to read and write page tables, page contents
                and device registers; nothing is ever fetched from it. */
-            l1Entry->SetNoExecute();
-            l1Entry->SetPresent();
-            Hal::TlbFlushPage(virtAddr);
+            l1_entry->set_no_execute();
+            l1_entry->set_present();
+            hal::tlb_flush_page(virt_addr);
 
-            if (havePage) {
-                Page* page = GetPage(phyAddr);
-                BugOn(!page);
-                TmpMapPageArray[i] = page;
+            if (have_page) {
+                Page* page = get_page(phy_addr);
+                BUG_ON(!page);
+                tmp_map_page_array_[i] = page;
             } else {
                 /* Map reserved physical range (e.g. ACPI tables) without a Page struct. */
-                TmpMapPageArray[i] = TmpMapDirectSentinel;
+                tmp_map_page_array_[i] = TMP_MAP_DIRECT_SENTINEL;
             }
-            return virtAddr;
+            return virt_addr;
         }
     }
 
     return 0;
 }
 
-ulong PageTable::FrameSlotAddress(ulong cpu)
+ulong PageTable::frame_slot_address(ulong cpu)
 {
     /* Every CPU has a slot of its own: a CPU's index is the hardware ID the
        CPU table is indexed by, and below MaxCpus. */
-    static_assert(FrameSlotCount >= MaxCpus, "a frame slot for every CPU");
-    static_assert(TmpMapSharedCount != 0, "shared slots for TmpMapPage");
-    return TmpMapStart + (TmpMapSharedCount + cpu) * Const::PageSize;
+    static_assert(FRAME_SLOT_COUNT >= MAX_CPUS, "a frame slot for every CPU");
+    static_assert(TMP_MAP_SHARED_COUNT != 0, "shared slots for TmpMapPage");
+    return tmp_map_start_ + (TMP_MAP_SHARED_COUNT + cpu) * consts::PAGE_SIZE;
 }
 
-ulong PageTable::MapFrameSlot(ulong phyAddr)
+ulong PageTable::map_frame_slot(ulong phy_addr)
 {
     /* The slot is this CPU's alone only while nothing can interrupt the copy
        on it, nor move the copy to another CPU. */
-    BugOn(Hal::IsInterruptEnabled());
-    BugOn(!IsFrameAddress(phyAddr));
+    BUG_ON(hal::is_interrupt_enabled());
+    BUG_ON(!is_frame_address(phy_addr));
 
-    ulong cpu = Hal::GetCurrentCpuHwId();
-    BugOn(cpu >= FrameSlotCount);
-    ulong virtAddr = FrameSlotAddress(cpu);
-    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
+    ulong cpu = hal::get_current_cpu_hw_id();
+    BUG_ON(cpu >= FRAME_SLOT_COUNT);
+    ulong virt_addr = frame_slot_address(cpu);
+    Pte* l1_entry = &tmp_map_l1_page_->entry[Pte::l1_index(virt_addr)];
 
     /* Cleared and flushed by the last copy on this CPU: present, it is a copy
        that never unmapped, or two copies at once. */
-    BugOn(l1Entry->Present());
+    BUG_ON(l1_entry->present());
 
     /* Built aside and stored whole, so the walker never sees half of it. */
     Pte entry;
-    entry.SetAddress(phyAddr);
-    entry.SetWritable();
-    entry.SetNoExecute();
-    entry.SetPresent();
-    l1Entry->Value = entry.Value;
+    entry.set_address(phy_addr);
+    entry.set_writable();
+    entry.set_no_execute();
+    entry.set_present();
+    l1_entry->value = entry.value;
     /* It was not present, so no TLB holds anything of it: nothing to
        invalidate, only the store to make the walker's. */
-    Hal::PteMadeValid();
-    return virtAddr;
+    hal::pte_made_valid();
+    return virt_addr;
 }
 
-void PageTable::UnmapFrameSlot(ulong virtAddr)
+void PageTable::unmap_frame_slot(ulong virt_addr)
 {
-    BugOn(Hal::IsInterruptEnabled());
-    ulong cpu = Hal::GetCurrentCpuHwId();
-    BugOn(cpu >= FrameSlotCount || virtAddr != FrameSlotAddress(cpu));
+    BUG_ON(hal::is_interrupt_enabled());
+    ulong cpu = hal::get_current_cpu_hw_id();
+    BUG_ON(cpu >= FRAME_SLOT_COUNT || virt_addr != frame_slot_address(cpu));
 
-    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
-    BugOn(!l1Entry->Present());
-    l1Entry->Value = 0;
+    Pte* l1_entry = &tmp_map_l1_page_->entry[Pte::l1_index(virt_addr)];
+    BUG_ON(!l1_entry->present());
+    l1_entry->value = 0;
     /* The frame is mapped nowhere again once this returns, and the next copy
        on this CPU finds the slot with nothing of it cached. */
-    Hal::TlbFlushPage(virtAddr);
+    hal::tlb_flush_page(virt_addr);
 }
 
-ulong PageTable::TmpUnmapPage(ulong virtAddr)
+ulong PageTable::tmp_unmap_page(ulong virt_addr)
 {
-    Stdlib::AutoLock lock(TmpMapLock);
+    stdlib::AutoLock lock(tmp_map_lock_);
 
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(!virtAddr);
-    BugOn(virtAddr < TmpMapStart);
-    BugOn(virtAddr >= (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
-    size_t i = (virtAddr - TmpMapStart) / Const::PageSize;
-    Page* page = TmpMapPageArray[i];
-    BugOn(!page);
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
+    BUG_ON(!virt_addr);
+    BUG_ON(virt_addr < tmp_map_start_);
+    BUG_ON(virt_addr >= (tmp_map_start_ + stdlib::array_size(tmp_map_page_array_) * consts::PAGE_SIZE));
+    size_t i = (virt_addr - tmp_map_start_) / consts::PAGE_SIZE;
+    Page* page = tmp_map_page_array_[i];
+    BUG_ON(!page);
 
-    ulong l1Index = Pte::L1Index(virtAddr);
-    Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
-    BugOn(!l1Entry->Present());
-    auto phyAddr = l1Entry->Address();
-    l1Entry->Clear();
-    Hal::TlbFlushPage(virtAddr);
-    TmpMapPageArray[i] = nullptr;
-    if (page != TmpMapDirectSentinel) {
-        BugOn(page->GetPhyAddress() != phyAddr);
-        page->Put();
+    ulong l1_index = Pte::l1_index(virt_addr);
+    Pte *l1_entry = &tmp_map_l1_page_->entry[l1_index];
+    BUG_ON(!l1_entry->present());
+    auto phy_addr = l1_entry->address();
+    l1_entry->clear();
+    hal::tlb_flush_page(virt_addr);
+    tmp_map_page_array_[i] = nullptr;
+    if (page != TMP_MAP_DIRECT_SENTINEL) {
+        BUG_ON(page->get_phy_address() != phy_addr);
+        page->put();
     }
 
-    return phyAddr;
+    return phy_addr;
 }
 
-ulong PageTable::GetRoot()
+ulong PageTable::get_root()
 {
     /*
      * Root is set once in Setup() before any AP starts
@@ -1350,104 +1350,104 @@ ulong PageTable::GetRoot()
      * only resolves correctly under the kernel PageTable,
      * not the boot page tables the AP still uses.
      */
-    return Root;
+    return root_;
 }
 
-void PageTable::InvalidateLocalTlb()
+void PageTable::invalidate_local_tlb()
 {
-    Hal::TlbFlushAll();
+    hal::tlb_flush_all();
 }
 
-void PageTable::InvalidateLocalTlbAddress(ulong virtAddr)
+void PageTable::invalidate_local_tlb_address(ulong virt_addr)
 {
-    Hal::TlbFlushPage(virtAddr);
+    hal::tlb_flush_page(virt_addr);
 }
 
-void PageTable::InvalidateLocalTlbRange(ulong virtAddr, ulong count)
+void PageTable::invalidate_local_tlb_range(ulong virt_addr, ulong count)
 {
     for (ulong i = 0; i < count; i++)
-        Hal::TlbFlushPage(virtAddr + i * Const::PageSize);
+        hal::tlb_flush_page(virt_addr + i * consts::PAGE_SIZE);
 }
 
-ulong PageTable::TmpMapAddress(ulong phyAddr)
+ulong PageTable::tmp_map_address(ulong phy_addr)
 {
-    ulong phyPage = phyAddr & ~(Const::PageSize - 1);
-    ulong vaPage = TmpMapPage(phyPage);
-    if (!vaPage)
+    ulong phy_page = phy_addr & ~(consts::PAGE_SIZE - 1);
+    ulong va_page = tmp_map_page(phy_page);
+    if (!va_page)
         return 0;
 
-    return vaPage + (phyAddr - phyPage);
+    return va_page + (phy_addr - phy_page);
 }
 
-ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
+ulong PageTable::tmp_map_range(ulong phy_addr, size_t len)
 {
-    ulong phyBase = phyAddr & ~(Const::PageSize - 1);
-    ulong offset = phyAddr - phyBase;
-    size_t pageCount = (offset + len + Const::PageSize - 1) / Const::PageSize;
+    ulong phy_base = phy_addr & ~(consts::PAGE_SIZE - 1);
+    ulong offset = phy_addr - phy_base;
+    size_t page_count = (offset + len + consts::PAGE_SIZE - 1) / consts::PAGE_SIZE;
 
-    if (pageCount <= 1)
-        return TmpMapAddress(phyAddr);
+    if (page_count <= 1)
+        return tmp_map_address(phy_addr);
 
-    Stdlib::AutoLock lock(TmpMapLock);
+    stdlib::AutoLock lock(tmp_map_lock_);
 
-    for (size_t i = 0; i + pageCount <= Stdlib::ArraySize(TmpMapPageArray); i++)
+    for (size_t i = 0; i + page_count <= stdlib::array_size(tmp_map_page_array_); i++)
     {
-        bool allFree = true;
-        for (size_t j = 0; j < pageCount; j++)
+        bool all_free = true;
+        for (size_t j = 0; j < page_count; j++)
         {
-            if (TmpMapPageArray[i + j])
+            if (tmp_map_page_array_[i + j])
             {
-                allFree = false;
+                all_free = false;
                 i += j; /* skip to after the occupied slot */
                 break;
             }
         }
-        if (!allFree)
+        if (!all_free)
             continue;
 
-        for (size_t j = 0; j < pageCount; j++)
+        for (size_t j = 0; j < page_count; j++)
         {
-            ulong thisPhyPage = phyBase + j * Const::PageSize;
-            ulong virtAddr = TmpMapStart + (i + j) * Const::PageSize;
-            ulong l1Index = Pte::L1Index(virtAddr);
-            Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
-            if (l1Entry->Present())
+            ulong this_phy_page = phy_base + j * consts::PAGE_SIZE;
+            ulong virt_addr = tmp_map_start_ + (i + j) * consts::PAGE_SIZE;
+            ulong l1_index = Pte::l1_index(virt_addr);
+            Pte *l1_entry = &tmp_map_l1_page_->entry[l1_index];
+            if (l1_entry->present())
                 return 0;
 
-            l1Entry->SetAddress(thisPhyPage);
-            if (!MemoryMap::GetInstance().IsUsableRam(thisPhyPage))
-                l1Entry->SetCacheDisabled();
-            l1Entry->SetWritable();
-            l1Entry->SetNoExecute(); /* data, as in TmpMapPage */
-            l1Entry->SetPresent();
-            Hal::TlbFlushPage(virtAddr);
+            l1_entry->set_address(this_phy_page);
+            if (!MemoryMap::get_instance().is_usable_ram(this_phy_page))
+                l1_entry->set_cache_disabled();
+            l1_entry->set_writable();
+            l1_entry->set_no_execute(); /* data, as in TmpMapPage */
+            l1_entry->set_present();
+            hal::tlb_flush_page(virt_addr);
 
-            bool havePage = (thisPhyPage / Const::PageSize) < PageArrayCount;
-            if (havePage) {
-                Page* page = GetPage(thisPhyPage);
-                BugOn(!page);
-                TmpMapPageArray[i + j] = page;
+            bool have_page = (this_phy_page / consts::PAGE_SIZE) < page_array_count_;
+            if (have_page) {
+                Page* page = get_page(this_phy_page);
+                BUG_ON(!page);
+                tmp_map_page_array_[i + j] = page;
             } else {
-                TmpMapPageArray[i + j] = TmpMapDirectSentinel;
+                tmp_map_page_array_[i + j] = TMP_MAP_DIRECT_SENTINEL;
             }
         }
-        return TmpMapStart + i * Const::PageSize + offset;
+        return tmp_map_start_ + i * consts::PAGE_SIZE + offset;
     }
 
     return 0;
 }
 
-Page* PageTable::SourcePage(const MapSource& src, size_t index)
+Page* PageTable::source_page(const MapSource& src, size_t index)
 {
-    if (src.Ptrs != nullptr)
-        return src.Ptrs[index];
+    if (src.ptrs != nullptr)
+        return src.ptrs[index];
 
-    if (src.Array != nullptr)
-        return &src.Array[index];
+    if (src.array != nullptr)
+        return &src.array[index];
 
     /* GetPage's reference is only for the lookup; MapRangeLocked takes the
        mapping reference of its own and releases this one. */
-    return GetPage(src.PhyAddrs[index]);
+    return get_page(src.phy_addrs[index]);
 }
 
 /* Walk down to the L1 table that maps virtAddr and return it temp-mapped,
@@ -1455,14 +1455,14 @@ Page* PageTable::SourcePage(const MapSource& src, size_t index)
    a fresh table; without it a missing level means the caller asked about a
    VA that was never mapped, which is a bug in the caller. Lock must be
    held, and the caller TmpUnmapPage()s the result. */
-PtePage* PageTable::WalkToL1Locked(ulong virtAddr, bool create)
+PtePage* PageTable::walk_to_l1_locked(ulong virt_addr, bool create)
 {
     /* No BugOn: MapPage answered a missing Root with a plain failure, and
        a walk can also fail on a legitimately exhausted TmpMap. */
-    if (Root == 0)
+    if (root_ == 0)
         return nullptr;
 
-    PtePage* table = (PtePage*)TmpMapPage(Root);
+    PtePage* table = (PtePage*)tmp_map_page(root_);
     if (table == nullptr)
         return nullptr;
 
@@ -1470,38 +1470,38 @@ PtePage* PageTable::WalkToL1Locked(ulong virtAddr, bool create)
        leaves the next table temp-mapped in its place. */
     for (ulong level = 4; level > 1; level--)
     {
-        ulong index = (level == 4) ? Pte::L4Index(virtAddr)
-                    : (level == 3) ? Pte::L3Index(virtAddr)
-                                   : Pte::L2Index(virtAddr);
+        ulong index = (level == 4) ? Pte::l4_index(virt_addr)
+                    : (level == 3) ? Pte::l3_index(virt_addr)
+                                   : Pte::l2_index(virt_addr);
 
-        Pte* entry = &table->Entry[index];
-        if (!entry->Present())
+        Pte* entry = &table->entry[index];
+        if (!entry->present())
         {
             if (!create)
             {
-                BugOn(1);
-                TmpUnmapPage((ulong)table);
+                BUG_ON(1);
+                tmp_unmap_page((ulong)table);
                 return nullptr;
             }
 
-            Page* page = AllocPageNoLock();
+            Page* page = alloc_page_no_lock();
             if (page == nullptr)
             {
-                TmpUnmapPage((ulong)table);
+                tmp_unmap_page((ulong)table);
                 return nullptr;
             }
 
-            entry->SetAddress(page->GetPhyAddress());
-            entry->SetWritable();
+            entry->set_address(page->get_phy_address());
+            entry->set_writable();
             /* No NX on the way down: on both arches the bit on an L4/L3/L2
                entry takes away execute permission from the whole subtree,
                which no leaf can give back -- a module's text lives under
                these tables. Execute permission is a leaf decision. */
-            entry->SetPresent();
+            entry->set_present();
         }
 
-        PtePage* next = (PtePage*)TmpMapPage(entry->Address());
-        TmpUnmapPage((ulong)table);
+        PtePage* next = (PtePage*)tmp_map_page(entry->address());
+        tmp_unmap_page((ulong)table);
         if (next == nullptr)
             return nullptr;
 
@@ -1515,66 +1515,66 @@ PtePage* PageTable::WalkToL1Locked(ulong virtAddr, bool create)
    The walk is redone only when the run steps into the next L1 table, which
    for a naturally aligned block of at most MaxContiguousPages pages never
    happens. Lock must be held. */
-bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& src)
+bool PageTable::map_range_locked(ulong virt_addr, size_t count, const MapSource& src)
 {
-    BugOn(virtAddr & (Const::PageSize - 1));
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
 
-    PtePage* l1Page = nullptr;
+    PtePage* l1_page = nullptr;
     size_t mapped = 0;
 
     for (size_t i = 0; i < count; i++)
     {
-        ulong va = virtAddr + i * Const::PageSize;
-        ulong l1Index = Pte::L1Index(va);
+        ulong va = virt_addr + i * consts::PAGE_SIZE;
+        ulong l1_index = Pte::l1_index(va);
 
-        BugOn(va >= TmpMapStart && va < (TmpMapStart + TmpMapPageCount * Const::PageSize));
+        BUG_ON(va >= tmp_map_start_ && va < (tmp_map_start_ + TMP_MAP_PAGE_COUNT * consts::PAGE_SIZE));
 
-        if (l1Page == nullptr)
+        if (l1_page == nullptr)
         {
-            l1Page = WalkToL1Locked(va, true);
-            if (l1Page == nullptr)
+            l1_page = walk_to_l1_locked(va, true);
+            if (l1_page == nullptr)
                 break;
         }
 
-        Pte* l1Entry = &l1Page->Entry[l1Index];
-        if (l1Entry->Present())
+        Pte* l1_entry = &l1_page->entry[l1_index];
+        if (l1_entry->present())
             break;
 
-        Page* page = SourcePage(src, i);
+        Page* page = source_page(src, i);
         if (page != nullptr)
         {
-            page->Get();
-            l1Entry->SetAddress(page->GetPhyAddress());
-            l1Entry->SetWritable();
+            page->get();
+            l1_entry->set_address(page->get_phy_address());
+            l1_entry->set_writable();
             /* RW+NX is what every runtime mapping gets: the heap, stacks,
                DMA buffers and a module image before it is laid out. The one
                thing that runs from such a page is a module's text, and the
                loader asks for it by name (SetRangeProtection) once the
                segment is written -- so nothing is ever writable and
                executable at the same time. */
-            l1Entry->SetNoExecute();
-            l1Entry->SetPresent();
-            if (src.PhyAddrs != nullptr)
-                page->Put(); /* balance SourcePage's GetPage */
+            l1_entry->set_no_execute();
+            l1_entry->set_present();
+            if (src.phy_addrs != nullptr)
+                page->put(); /* balance SourcePage's GetPage */
         }
         else
         {
-            l1Entry->Clear();
+            l1_entry->clear();
         }
 
-        Hal::TlbFlushPage(va);
+        hal::tlb_flush_page(va);
         mapped++;
 
         /* Last entry of this table: the next VA starts a new walk. */
-        if (l1Index == (Stdlib::ArraySize(l1Page->Entry) - 1))
+        if (l1_index == (stdlib::array_size(l1_page->entry) - 1))
         {
-            TmpUnmapPage((ulong)l1Page);
-            l1Page = nullptr;
+            tmp_unmap_page((ulong)l1_page);
+            l1_page = nullptr;
         }
     }
 
-    if (l1Page != nullptr)
-        TmpUnmapPage((ulong)l1Page);
+    if (l1_page != nullptr)
+        tmp_unmap_page((ulong)l1_page);
 
     if (mapped == count)
         return true;
@@ -1582,7 +1582,7 @@ bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& sr
     /* All-or-nothing: undo the prefix that did get mapped, leaving the
        pages themselves to the caller. */
     if (mapped != 0)
-        UnmapRangeLocked(virtAddr, mapped, false);
+        unmap_range_locked(virt_addr, mapped, false);
 
     return false;
 }
@@ -1590,257 +1590,257 @@ bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& sr
 /* Range twin of MapRangeLocked. A missing entry is a caller bug (BugOn),
    but the walk carries on so the rest of the range is still torn down.
    Lock must be held. */
-void PageTable::UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages)
+void PageTable::unmap_range_locked(ulong virt_addr, size_t count, bool free_pages)
 {
-    BugOn(virtAddr & (Const::PageSize - 1));
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
 
-    PtePage* l1Page = nullptr;
+    PtePage* l1_page = nullptr;
 
     for (size_t i = 0; i < count; i++)
     {
-        ulong va = virtAddr + i * Const::PageSize;
-        ulong l1Index = Pte::L1Index(va);
+        ulong va = virt_addr + i * consts::PAGE_SIZE;
+        ulong l1_index = Pte::l1_index(va);
 
-        BugOn(va >= TmpMapStart && va < (TmpMapStart + TmpMapPageCount * Const::PageSize));
+        BUG_ON(va >= tmp_map_start_ && va < (tmp_map_start_ + TMP_MAP_PAGE_COUNT * consts::PAGE_SIZE));
 
-        if (l1Page == nullptr)
+        if (l1_page == nullptr)
         {
             /* A missing level is a BugOn in the walk, so this is a window
                with no slot for it: the pages from va on would stay mapped
                with their references while the caller -- MapRangeLocked's
                undo among them -- goes on as if they were not */
-            l1Page = WalkToL1Locked(va, false);
-            if (l1Page == nullptr)
-                Panic("UnmapRangeLocked: no TmpMap slot to walk to 0x%lX, %lu pages left mapped",
+            l1_page = walk_to_l1_locked(va, false);
+            if (l1_page == nullptr)
+                PANIC("UnmapRangeLocked: no TmpMap slot to walk to 0x%lX, %lu pages left mapped",
                     va, (ulong)(count - i));
         }
 
-        Pte* l1Entry = &l1Page->Entry[l1Index];
-        if (!l1Entry->Present())
+        Pte* l1_entry = &l1_page->entry[l1_index];
+        if (!l1_entry->present())
         {
-            BugOn(1);
+            BUG_ON(1);
         }
         else
         {
-            ulong phyAddr = l1Entry->Address();
-            l1Entry->Clear();
-            BugOn(!phyAddr);
-            Hal::TlbFlushPage(va);
+            ulong phy_addr = l1_entry->address();
+            l1_entry->clear();
+            BUG_ON(!phy_addr);
+            hal::tlb_flush_page(va);
 
-            Page* page = GetPage(phyAddr);
-            page->Put(); /* balance GetPage's lookup reference */
-            if (freePages)
-                FreePageNoLock(page);
-            page->Put(); /* the mapping reference MapRangeLocked took */
+            Page* page = get_page(phy_addr);
+            page->put(); /* balance GetPage's lookup reference */
+            if (free_pages)
+                free_page_no_lock(page);
+            page->put(); /* the mapping reference MapRangeLocked took */
         }
 
-        if (l1Index == (Stdlib::ArraySize(l1Page->Entry) - 1))
+        if (l1_index == (stdlib::array_size(l1_page->entry) - 1))
         {
-            TmpUnmapPage((ulong)l1Page);
-            l1Page = nullptr;
+            tmp_unmap_page((ulong)l1_page);
+            l1_page = nullptr;
         }
     }
 
-    if (l1Page != nullptr)
-        TmpUnmapPage((ulong)l1Page);
+    if (l1_page != nullptr)
+        tmp_unmap_page((ulong)l1_page);
 }
 
-bool PageTable::MapPage(ulong virtAddr, Page* page)
+bool PageTable::map_page(ulong virt_addr, Page* page)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     MapSource src = { &page, nullptr, nullptr };
 
-    return MapRangeLocked(virtAddr, 1, src);
+    return map_range_locked(virt_addr, 1, src);
 }
 
-bool PageTable::MapPages(ulong virtAddr, Page* const* pages, size_t count)
+bool PageTable::map_pages(ulong virt_addr, Page* const* pages, size_t count)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     MapSource src = { pages, nullptr, nullptr };
 
-    return MapRangeLocked(virtAddr, count, src);
+    return map_range_locked(virt_addr, count, src);
 }
 
-bool PageTable::MapContiguousPages(ulong virtAddr, Page* pages, size_t count)
+bool PageTable::map_contiguous_pages(ulong virt_addr, Page* pages, size_t count)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     MapSource src = { nullptr, pages, nullptr };
 
-    return MapRangeLocked(virtAddr, count, src);
+    return map_range_locked(virt_addr, count, src);
 }
 
-bool PageTable::MapPhysPages(ulong virtAddr, const ulong* phyAddrs, size_t count)
+bool PageTable::map_phys_pages(ulong virt_addr, const ulong* phy_addrs, size_t count)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    MapSource src = { nullptr, nullptr, phyAddrs };
+    MapSource src = { nullptr, nullptr, phy_addrs };
 
-    return MapRangeLocked(virtAddr, count, src);
+    return map_range_locked(virt_addr, count, src);
 }
 
-void PageTable::UnmapPages(ulong virtAddr, size_t count, bool freePages)
+void PageTable::unmap_pages(ulong virt_addr, size_t count, bool free_pages)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    UnmapRangeLocked(virtAddr, count, freePages);
+    unmap_range_locked(virt_addr, count, free_pages);
 }
 
-ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes, MmioCachePolicy policy)
+ulong PageTable::map_mmio_region(ulong phys_addr, ulong size_bytes, MmioCachePolicy policy)
 {
-    const bool writeCombining =
-        (policy == MmioWriteCombining) && Hal::IsWriteCombiningAvailable();
+    const bool write_combining =
+        (policy == MmioWriteCombining) && hal::is_write_combining_available();
 
     /* The arch's premapped window is device-typed, so it can only serve an
        uncached request; a write-combining one builds its own leaf PTEs. */
     if (policy == MmioUncached)
     {
-        ulong premapped = Hal::MmioPremappedVa(physAddr, sizeBytes);
+        ulong premapped = hal::mmio_premapped_va(phys_addr, size_bytes);
         if (premapped != 0)
             return premapped;
     }
 
-    if (physAddr & (Const::PageSize - 1))
+    if (phys_addr & (consts::PAGE_SIZE - 1))
         return 0;
 
-    ulong pages = (sizeBytes + Const::PageSize - 1) / Const::PageSize;
+    ulong pages = (size_bytes + consts::PAGE_SIZE - 1) / consts::PAGE_SIZE;
     if (pages == 0)
         pages = 1;
 
     for (ulong i = 0; i < pages; i++)
     {
-        ulong pa = physAddr + i * Const::PageSize;
-        ulong va = pa + MemoryMap::KernelSpaceBase;
+        ulong pa = phys_addr + i * consts::PAGE_SIZE;
+        ulong va = pa + MemoryMap::KERNEL_SPACE_BASE;
 
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        ulong l4Index = Pte::L4Index(va);
-        ulong l3Index = Pte::L3Index(va);
-        ulong l2Index = Pte::L2Index(va);
-        ulong l1Index = Pte::L1Index(va);
+        ulong l4_index = Pte::l4_index(va);
+        ulong l3_index = Pte::l3_index(va);
+        ulong l2_index = Pte::l2_index(va);
+        ulong l1_index = Pte::l1_index(va);
 
-        if (Root == 0)
+        if (root_ == 0)
             return 0;
 
-        PtePage* l4Page = (PtePage*)TmpMapPage(Root);
-        if (l4Page == nullptr)
+        PtePage* l4_page = (PtePage*)tmp_map_page(root_);
+        if (l4_page == nullptr)
             return 0;
 
-        Pte *l4Entry = &l4Page->Entry[l4Index];
-        if (!l4Entry->Present()) {
-            Page* p = AllocPageNoLock();
-            if (!p) { TmpUnmapPage((ulong)l4Page); return 0; }
-            l4Entry->SetAddress(p->GetPhyAddress());
-            l4Entry->SetWritable();
-            l4Entry->SetPresent();
+        Pte *l4_entry = &l4_page->entry[l4_index];
+        if (!l4_entry->present()) {
+            Page* p = alloc_page_no_lock();
+            if (!p) { tmp_unmap_page((ulong)l4_page); return 0; }
+            l4_entry->set_address(p->get_phy_address());
+            l4_entry->set_writable();
+            l4_entry->set_present();
         }
 
-        PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry->Address());
-        TmpUnmapPage((ulong)l4Page);
-        if (l3Page == nullptr)
+        PtePage* l3_page = (PtePage*)tmp_map_page(l4_entry->address());
+        tmp_unmap_page((ulong)l4_page);
+        if (l3_page == nullptr)
             return 0;
 
-        Pte *l3Entry = &l3Page->Entry[l3Index];
-        if (!l3Entry->Present()) {
-            Page* p = AllocPageNoLock();
-            if (!p) { TmpUnmapPage((ulong)l3Page); return 0; }
-            l3Entry->SetAddress(p->GetPhyAddress());
-            l3Entry->SetWritable();
-            l3Entry->SetPresent();
+        Pte *l3_entry = &l3_page->entry[l3_index];
+        if (!l3_entry->present()) {
+            Page* p = alloc_page_no_lock();
+            if (!p) { tmp_unmap_page((ulong)l3_page); return 0; }
+            l3_entry->set_address(p->get_phy_address());
+            l3_entry->set_writable();
+            l3_entry->set_present();
         }
 
-        PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry->Address());
-        TmpUnmapPage((ulong)l3Page);
-        if (l2Page == nullptr)
+        PtePage* l2_page = (PtePage*)tmp_map_page(l3_entry->address());
+        tmp_unmap_page((ulong)l3_page);
+        if (l2_page == nullptr)
             return 0;
 
-        Pte *l2Entry = &l2Page->Entry[l2Index];
-        if (!l2Entry->Present()) {
-            Page* p = AllocPageNoLock();
-            if (!p) { TmpUnmapPage((ulong)l2Page); return 0; }
-            l2Entry->SetAddress(p->GetPhyAddress());
-            l2Entry->SetWritable();
-            l2Entry->SetPresent();
+        Pte *l2_entry = &l2_page->entry[l2_index];
+        if (!l2_entry->present()) {
+            Page* p = alloc_page_no_lock();
+            if (!p) { tmp_unmap_page((ulong)l2_page); return 0; }
+            l2_entry->set_address(p->get_phy_address());
+            l2_entry->set_writable();
+            l2_entry->set_present();
         }
 
-        PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry->Address());
-        TmpUnmapPage((ulong)l2Page);
-        if (l1Page == nullptr)
+        PtePage* l1_page = (PtePage*)tmp_map_page(l2_entry->address());
+        tmp_unmap_page((ulong)l2_page);
+        if (l1_page == nullptr)
             return 0;
 
-        Pte *l1Entry = &l1Page->Entry[l1Index];
-        if (!l1Entry->Present())
+        Pte *l1_entry = &l1_page->entry[l1_index];
+        if (!l1_entry->present())
         {
-            l1Entry->SetAddress(pa);
-            if (writeCombining)
-                l1Entry->SetWriteCombining();
+            l1_entry->set_address(pa);
+            if (write_combining)
+                l1_entry->set_write_combining();
             else
-                l1Entry->SetCacheDisabled();   /* device memory: uncached */
+                l1_entry->set_cache_disabled();   /* device memory: uncached */
             /* Nothing is ever executed out of MMIO */
-            l1Entry->SetNoExecute();
-            l1Entry->SetWritable();
-            l1Entry->SetPresent();
+            l1_entry->set_no_execute();
+            l1_entry->set_writable();
+            l1_entry->set_present();
         }
-        TmpUnmapPage((ulong)l1Page);
-        Hal::TlbFlushPage(va);
+        tmp_unmap_page((ulong)l1_page);
+        hal::tlb_flush_page(va);
     }
 
-    return physAddr + MemoryMap::KernelSpaceBase;
+    return phys_addr + MemoryMap::KERNEL_SPACE_BASE;
 }
 
 /* Legacy single-page form: returns the page so the caller can pair its own
    FreePage/Put with it, the way it did before UnmapPages existed. */
-Page* PageTable::UnmapPage(ulong virtAddr)
+Page* PageTable::unmap_page(ulong virt_addr)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    PtePage* l1Page = WalkToL1Locked(virtAddr, false);
-    if (l1Page == nullptr)
+    PtePage* l1_page = walk_to_l1_locked(virt_addr, false);
+    if (l1_page == nullptr)
         return nullptr;
 
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + TmpMapPageCount * Const::PageSize));
+    BUG_ON(virt_addr & (consts::PAGE_SIZE - 1));
+    BUG_ON(virt_addr >= tmp_map_start_ && virt_addr < (tmp_map_start_ + TMP_MAP_PAGE_COUNT * consts::PAGE_SIZE));
 
-    Pte* l1Entry = &l1Page->Entry[Pte::L1Index(virtAddr)];
-    if (!l1Entry->Present())
+    Pte* l1_entry = &l1_page->entry[Pte::l1_index(virt_addr)];
+    if (!l1_entry->present())
     {
-        BugOn(1);
-        TmpUnmapPage((ulong)l1Page);
+        BUG_ON(1);
+        tmp_unmap_page((ulong)l1_page);
         return nullptr;
     }
 
-    ulong phyAddr = l1Entry->Address();
-    l1Entry->Clear();
-    TmpUnmapPage((ulong)l1Page);
-    BugOn(!phyAddr);
-    Hal::TlbFlushPage(virtAddr);
+    ulong phy_addr = l1_entry->address();
+    l1_entry->clear();
+    tmp_unmap_page((ulong)l1_page);
+    BUG_ON(!phy_addr);
+    hal::tlb_flush_page(virt_addr);
 
-    Page* page = GetPage(phyAddr);
-    page->Put();
+    Page* page = get_page(phy_addr);
+    page->put();
     return page;
 }
 
-ulong PageTable::GetFreePagesCount()
+ulong PageTable::get_free_pages_count()
 {
-    Stdlib::AutoLock lock(Lock);
-    return FreePagesCount;
+    stdlib::AutoLock lock(lock_);
+    return free_pages_count_;
 }
 
-ulong PageTable::GetTotalPagesCount()
+ulong PageTable::get_total_pages_count()
 {
-    Stdlib::AutoLock lock(Lock);
-    return TotalPagesCount;
+    stdlib::AutoLock lock(lock_);
+    return total_pages_count_;
 }
 
-ulong PageTable::GetVaEnd()
+ulong PageTable::get_va_end()
 {
     /* Rounded to the huge page, not to the 4KiB one: PageArray is mapped in
        2MiB blocks, and the VA allocator starts here. Handing it the tail of
        a block that is already mapped would have it build 4KiB mappings under
        an L2 entry that is a leaf. */
-    return Stdlib::RoundUp((ulong)&PageArray[PageArrayCount], HugePageSize);
+    return stdlib::round_up((ulong)&page_array_[page_array_count_], HUGE_PAGE_SIZE);
 }
 
 }

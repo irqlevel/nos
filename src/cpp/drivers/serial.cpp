@@ -7,15 +7,15 @@
 #include <kernel/interrupt.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 Serial::Serial()
-    : Present(false)
-    , IntVector(-1)
+    : present_(false)
+    , int_vector_(-1)
 {
-    for (size_t i = 0; i < MaxObserver; i++)
-        RxObserver[i] = nullptr;
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
+        rx_observer_[i] = nullptr;
 
     /* Scratch-register probe before anything is configured: a 16550 holds
        whatever is written to register 7, an undecoded port reads back 0xFF
@@ -23,96 +23,96 @@ Serial::Serial()
        fail this, and every serial write below is then skipped -- otherwise
        Wait() burns its full ~1M pause budget per character on a port whose
        transmitter never reports empty. */
-    Outb(Port + 7, 0xAE);
-    Present = (Inb(Port + 7) == 0xAE);
+    outb(PORT + 7, 0xAE);
+    present_ = (inb(PORT + 7) == 0xAE);
 
-    if (!Present)
+    if (!present_)
         return;
 
-    Outb(Port + 1, 0x00);    // Disable all interrupts
-    Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-    Outb(Port + 0, 0x01);    // Set divisor to 1 (lo byte) 115200 baud
-    Outb(Port + 1, 0x00);    //                  (hi byte)
-    Outb(Port + 3, 0x03);    // 8 bits, no parity, one stop bit
-    Outb(Port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-    Outb(Port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+    outb(PORT + 1, 0x00);    // Disable all interrupts
+    outb(PORT + 3, 0x80);    // Enable DLAB (set baud rate divisor)
+    outb(PORT + 0, 0x01);    // Set divisor to 1 (lo byte) 115200 baud
+    outb(PORT + 1, 0x00);    //                  (hi byte)
+    outb(PORT + 3, 0x03);    // 8 bits, no parity, one stop bit
+    outb(PORT + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
+    outb(PORT + 4, 0x0B);    // IRQs enabled, RTS/DSR set
 }
 
-bool Serial::IsPresent()
+bool Serial::is_present()
 {
-    return Present;
+    return present_;
 }
 
-void Serial::Send()
+void Serial::send()
 {
     ulong flags;
 
-    if (!Present)
+    if (!present_)
         return;
 
     for (;;)
     {
-        Lock.Lock(flags);
+        lock_.lock(flags);
 
-        if (!Buf.IsEmpty())
+        if (!buf_.is_empty())
         {
-            Lock.Unlock(flags);
-            Wait();
-            Lock.Lock(flags);
-            if (!Buf.IsEmpty())
-                Outb(Port, Buf.Get());
-            Lock.Unlock(flags);
+            lock_.unlock(flags);
+            wait();
+            lock_.lock(flags);
+            if (!buf_.is_empty())
+                outb(PORT, buf_.get());
+            lock_.unlock(flags);
         }
         else
         {
-            Lock.Unlock(flags);
+            lock_.unlock(flags);
             break;
         }
     }
 }
 
-void Serial::Flush()
+void Serial::flush()
 {
-    Send();
+    send();
 }
 
-void Serial::Wait()
+void Serial::wait()
 {
-    size_t pauseCount = 1;
+    size_t pause_count = 1;
 
     /* Bounded: a stuck transmitter must not hang the kernel; give up
        and let the caller drop the character (~1M pauses total) */
     for (size_t round = 0; round < 20; round++)
     {
-        if (IsTransmitEmpty())
+        if (is_transmit_empty())
             break;
 
-        for (size_t i = 0; i < pauseCount; i++)
-            Pause();
+        for (size_t i = 0; i < pause_count; i++)
+            cpu_relax();
 
-        pauseCount *= 2;
+        pause_count *= 2;
     }
 }
 
-bool Serial::IsTransmitEmpty()
+bool Serial::is_transmit_empty()
 {
-    return (Inb(Port + 5) & 0x20) ? true : false;
+    return (inb(PORT + 5) & 0x20) ? true : false;
 }
 
 Serial::~Serial()
 {
-    Send();
+    send();
 }
 
-void Serial::PrintString(const char *str)
+void Serial::print_string(const char *str)
 {
-    if (!Present)
+    if (!present_)
         return;
 
-    Send();
+    send();
 
     ulong flags;
-    Lock.Lock(flags);
+    lock_.lock(flags);
     for (;;)
     {
         char c = *str++;
@@ -123,35 +123,35 @@ void Serial::PrintString(const char *str)
 
         if (c == '\n')
         {
-            if (Buf.IsFull())
+            if (buf_.is_full())
             {
-                Lock.Unlock(flags);
-                Send();
-                Lock.Lock(flags);
+                lock_.unlock(flags);
+                send();
+                lock_.lock(flags);
             }
-            Buf.Put('\r');
+            buf_.put('\r');
         }
 
-        if (Buf.IsFull())
+        if (buf_.is_full())
         {
-            Lock.Unlock(flags);
-            Send();
-            Lock.Lock(flags);
+            lock_.unlock(flags);
+            send();
+            lock_.lock(flags);
         }
-        Buf.Put(c);
+        buf_.put(c);
     }
-    Lock.Unlock(flags);
+    lock_.unlock(flags);
 
-    Send();
+    send();
 }
 
-void Serial::PanicPrintString(const char *str)
+void Serial::panic_print_string(const char *str)
 {
     /*
      * Bypass lock and ring buffer — poll-write directly to UART.
      * Safe only in panic context with interrupts disabled.
      */
-    if (!Present)
+    if (!present_)
         return;
 
     while (*str)
@@ -159,99 +159,99 @@ void Serial::PanicPrintString(const char *str)
         char c = *str++;
         if (c == '\n')
         {
-            while (!IsTransmitEmpty())
-                Pause();
-            Outb(Port, '\r');
+            while (!is_transmit_empty())
+                cpu_relax();
+            outb(PORT, '\r');
         }
-        while (!IsTransmitEmpty())
-            Pause();
-        Outb(Port, c);
+        while (!is_transmit_empty())
+            cpu_relax();
+        outb(PORT, c);
     }
 }
 
-void Serial::VPrintf(const char *fmt, va_list args)
+void Serial::v_printf(const char *fmt, va_list args)
 {
 	char str[256];
 
-	if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
+	if (stdlib::vsn_printf(str, sizeof(str), fmt, args) < 0)
 		return;
 
-	PrintString(str);
+	print_string(str);
 }
 
-void Serial::Printf(const char *fmt, ...)
+void Serial::printf(const char *fmt, ...)
 {
 	va_list args;
 
 	va_start(args, fmt);
-	VPrintf(fmt, args);
+	v_printf(fmt, args);
 	va_end(args);
 }
 
-void Serial::Backspace()
+void Serial::backspace()
 {
     /* Send BS, space, BS to erase character on serial terminal */
-    PrintString("\b \b");
+    print_string("\b \b");
 }
 
-bool Serial::RegisterObserver(SerialObserver& observer)
+bool Serial::register_observer(SerialObserver& observer)
 {
     ulong flags;
-    Lock.Lock(flags);
+    lock_.lock(flags);
 
-    for (size_t i = 0; i < MaxObserver; i++)
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
     {
-        if (RxObserver[i] == nullptr)
+        if (rx_observer_[i] == nullptr)
         {
-            RxObserver[i] = &observer;
-            Lock.Unlock(flags);
+            rx_observer_[i] = &observer;
+            lock_.unlock(flags);
             return true;
         }
     }
 
-    Lock.Unlock(flags);
+    lock_.unlock(flags);
     return false;
 }
 
-void Serial::UnregisterObserver(SerialObserver& observer)
+void Serial::unregister_observer(SerialObserver& observer)
 {
     ulong flags;
-    Lock.Lock(flags);
+    lock_.lock(flags);
 
-    for (size_t i = 0; i < MaxObserver; i++)
+    for (size_t i = 0; i < MAX_OBSERVER; i++)
     {
-        if (RxObserver[i] == &observer)
+        if (rx_observer_[i] == &observer)
         {
-            RxObserver[i] = nullptr;
+            rx_observer_[i] = nullptr;
         }
     }
 
-    Lock.Unlock(flags);
+    lock_.unlock(flags);
 }
 
-void Serial::OnInterruptRegister(u8 irq, u8 vector)
+void Serial::on_interrupt_register(u8 irq, u8 vector)
 {
     (void)irq;
 
-    IntVector = vector;
+    int_vector_ = vector;
 
     /* Enable Received Data Available interrupt (IER bit 0) */
-    Outb(Port + 1, 0x01);
+    outb(PORT + 1, 0x01);
 }
 
-InterruptHandlerFn Serial::GetHandlerFn()
+InterruptHandlerFn Serial::get_handler_fn()
 {
-    return SerialInterruptStub;
+    return serial_interrupt_stub;
 }
 
-void Serial::Interrupt(Context* ctx)
+void Serial::interrupt(Context* ctx)
 {
     (void)ctx;
 
     /* Check for received data (LSR bit 0 = Data Ready) */
-    while (Inb(Port + 5) & 0x01)
+    while (inb(PORT + 5) & 0x01)
     {
-        u8 data = Inb(Port);
+        u8 data = inb(PORT);
         char c = (char)data;
         u8 code = 0;
 
@@ -265,22 +265,22 @@ void Serial::Interrupt(Context* ctx)
             code = 0x0E; /* PS/2 backspace scan code */
         }
 
-        for (size_t i = 0; i < MaxObserver; i++)
+        for (size_t i = 0; i < MAX_OBSERVER; i++)
         {
-            if (RxObserver[i] != nullptr)
-                RxObserver[i]->OnChar(c, code);
+            if (rx_observer_[i] != nullptr)
+                rx_observer_[i]->on_char(c, code);
         }
     }
 
-    Send();
+    send();
 
-    Hal::IrqEoi(IntVector);
+    hal::irq_eoi(int_vector_);
 }
 
-extern "C" void SerialInterrupt(Context* ctx)
+extern "C" void serial_interrupt(Context* ctx)
 {
-    InterruptStats::Inc(IrqSerial);
-    Serial::GetInstance().Interrupt(ctx);
+    InterruptStats::inc(IrqSerial);
+    Serial::get_instance().interrupt(ctx);
 }
 
 }

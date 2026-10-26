@@ -6,10 +6,10 @@
 
 #include "board.h"
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 /* arm64 bootstrap linear map, the C++ twin of the tables boot.S builds:
@@ -24,108 +24,108 @@ namespace Mm
 
 /* All QEMU-virt MMIO sits below the RAM base and is covered by the 1GiB
    Device-nGnRE L1 block InstallEarlyDeviceBlock puts into the real table. */
-ulong EarlyDeviceLimit;
+ulong early_device_limit;
 
-bool BuiltinPageTable::Setup()
+bool BuiltinPageTable::setup()
 {
-    auto& board = Board::GetInstance();
-    ulong ramBase = board.MemRegions[0].Addr;
-    ulong ramEnd = ramBase;
-    for (ulong i = 0; i < board.MemRegionCount; i++)
+    auto& board = Board::get_instance();
+    ulong ram_base = board.mem_regions_[0].addr;
+    ulong ram_end = ram_base;
+    for (ulong i = 0; i < board.mem_region_count_; i++)
     {
-        ulong end = board.MemRegions[i].Addr + board.MemRegions[i].Size;
-        if (end > ramEnd)
-            ramEnd = end;
+        ulong end = board.mem_regions_[i].addr + board.mem_regions_[i].size;
+        if (end > ram_end)
+            ram_end = end;
     }
 
-    auto& l0Entry = P4Page.Entry[256];
+    auto& l0_entry = p4_page_.entry[256];
 
-    l0Entry.SetAddress(VirtToPhys((ulong)&P3KernelPage));
-    l0Entry.SetWritable();
-    l0Entry.SetPresent();
+    l0_entry.set_address(virt_to_phys((ulong)&p3_kernel_page_));
+    l0_entry.set_writable();
+    l0_entry.set_present();
 
-    ulong addr = MemoryMap::KernelSpaceBase;
+    ulong addr = MemoryMap::KERNEL_SPACE_BASE;
     for (size_t i = 0; i < 4; i++)
     {
-        auto& l1Entry = P3KernelPage.Entry[i];
-        auto& l2Page = P2KernelPage[i];
+        auto& l1_entry = p3_kernel_page_.entry[i];
+        auto& l2_page = p2_kernel_page_[i];
 
-        l1Entry.SetAddress(VirtToPhys((ulong)&l2Page));
-        l1Entry.SetWritable();
-        l1Entry.SetPresent();
+        l1_entry.set_address(virt_to_phys((ulong)&l2_page));
+        l1_entry.set_writable();
+        l1_entry.set_present();
 
         for (size_t j = 0; j < 512; j++)
         {
-            auto& l2Entry = l2Page.Entry[j];
-            ulong phys = VirtToPhys(addr);
+            auto& l2_entry = l2_page.entry[j];
+            ulong phys = virt_to_phys(addr);
 
             /* Past the end of RAM there is nothing to map */
-            if (phys >= ramEnd && phys >= ramBase)
+            if (phys >= ram_end && phys >= ram_base)
             {
-                addr += (2 * Const::MB);
+                addr += (2 * consts::MB);
                 continue;
             }
 
-            l2Entry.SetAddress(phys);
-            l2Entry.SetWritable();
-            l2Entry.SetHuge();
-            l2Entry.SetPresent();
-            if (phys < ramBase)
-                l2Entry.SetCacheDisabled();
+            l2_entry.set_address(phys);
+            l2_entry.set_writable();
+            l2_entry.set_huge();
+            l2_entry.set_present();
+            if (phys < ram_base)
+                l2_entry.set_cache_disabled();
 
-            addr += (2 * Const::MB);
+            addr += (2 * consts::MB);
         }
     }
 
     /* Four L1 entries of 512 2MiB blocks: 4GiB of physical space, whatever
        part of it is RAM. The ceiling on what the page allocator can take
        (see GetMappedLimit). */
-    MappedLimit = 4 * Const::GB;
+    mapped_limit_ = 4 * consts::GB;
 
     return true;
 }
 
-void BuiltinPageTable::MapHighRam()
+void BuiltinPageTable::map_high_ram()
 {
     /* The first 4GiB is what Setup()'s four L2 tables cover. Past that one
        L1 block per GiB is enough, and with a 4KiB granule an L1 block
        descriptor is architectural -- no feature bit to test, unlike x86. */
-    static const ulong LowMapLimit = 4 * Const::GB;
-    static const ulong BlockSize = Const::GB;
+    static const ulong LOW_MAP_LIMIT = 4 * consts::GB;
+    static const ulong BLOCK_BYTES = consts::GB;
 
-    const ulong TopLimit = Stdlib::ArraySize(P3KernelPage.Entry) * BlockSize;
+    const ulong top_limit = stdlib::array_size(p3_kernel_page_.entry) * BLOCK_BYTES;
 
-    BugOn(MappedLimit != LowMapLimit);
+    BUG_ON(mapped_limit_ != LOW_MAP_LIMIT);
 
-    auto& mmap = MemoryMap::GetInstance();
-    ulong ramEnd = mmap.GetUsableRamEnd();
-    if (ramEnd <= LowMapLimit)
+    auto& mmap = MemoryMap::get_instance();
+    ulong ram_end = mmap.get_usable_ram_end();
+    if (ram_end <= LOW_MAP_LIMIT)
         return;
 
-    if (ramEnd > TopLimit)
+    if (ram_end > top_limit)
     {
-        Trace(0, "mm: usable RAM ends at 0x%lX, past what one L1 table covers",
-            ramEnd);
-        ramEnd = TopLimit;
+        trace(0, "mm: usable RAM ends at 0x%lX, past what one L1 table covers",
+            ram_end);
+        ram_end = top_limit;
     }
 
     ulong blocks = 0;
-    for (ulong block = LowMapLimit; block < ramEnd; block += BlockSize)
+    for (ulong block = LOW_MAP_LIMIT; block < ram_end; block += BLOCK_BYTES)
     {
         /* Normal-cacheable over a GiB with no RAM in it would license
            speculative reads of unbacked bus space -- the same reason Setup()
            leaves the space past ramEnd alone. */
-        if (!mmap.HasUsableRamIn(block, block + BlockSize))
+        if (!mmap.has_usable_ram_in(block, block + BLOCK_BYTES))
             continue;
 
-        auto& l1Entry = P3KernelPage.Entry[block / BlockSize];
-        BugOn(l1Entry.Present());
+        auto& l1_entry = p3_kernel_page_.entry[block / BLOCK_BYTES];
+        BUG_ON(l1_entry.present());
 
-        l1Entry.SetAddress(block);
-        l1Entry.SetWritable();
-        l1Entry.SetHuge();
-        l1Entry.SetPresent();
-        Hal::TlbFlushPage(PhysToVirt(block));
+        l1_entry.set_address(block);
+        l1_entry.set_writable();
+        l1_entry.set_huge();
+        l1_entry.set_present();
+        hal::tlb_flush_page(phys_to_virt(block));
 
         blocks++;
     }
@@ -133,9 +133,9 @@ void BuiltinPageTable::MapHighRam()
     if (blocks == 0)
         return;
 
-    MappedLimit = ramEnd;
-    Trace(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
-        MappedLimit, blocks);
+    mapped_limit_ = ram_end;
+    trace(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
+        mapped_limit_, blocks);
 }
 
 /* Install one 1GiB Device-nGnRE L1 block covering phys [0, ramBase-ish)
@@ -144,42 +144,42 @@ void BuiltinPageTable::MapHighRam()
    I/O and MMIO regions are mapped later via MapMmioRegion). Must run
    BEFORE the switch: the real table's pages are edited through the still-
    active builtin linear map. */
-bool InstallEarlyDeviceBlock(ulong realRoot)
+bool install_early_device_block(ulong real_root)
 {
-    auto& bpt = BuiltinPageTable::GetInstance();
+    auto& bpt = BuiltinPageTable::get_instance();
 
-    PtePage* l0 = (PtePage*)bpt.PhysToVirt(realRoot);
-    Pte* l0Entry = &l0->Entry[Pte::L4Index(MemoryMap::KernelSpaceBase)];
-    if (!l0Entry->Present())
+    PtePage* l0 = (PtePage*)bpt.phys_to_virt(real_root);
+    Pte* l0_entry = &l0->entry[Pte::l4_index(MemoryMap::KERNEL_SPACE_BASE)];
+    if (!l0_entry->present())
         return false;
 
-    PtePage* l1 = (PtePage*)bpt.PhysToVirt(l0Entry->Address());
-    Pte* l1Entry = &l1->Entry[0]; /* [KernelSpaceBase, +1GiB): all MMIO */
-    if (l1Entry->Present())
+    PtePage* l1 = (PtePage*)bpt.phys_to_virt(l0_entry->address());
+    Pte* l1_entry = &l1->entry[0]; /* [KernelSpaceBase, +1GiB): all MMIO */
+    if (l1_entry->present())
         return false;
 
-    l1Entry->SetAddress(0);
-    l1Entry->SetWritable();
-    l1Entry->SetHuge();
-    l1Entry->SetCacheDisabled();
-    l1Entry->SetPresent();
+    l1_entry->set_address(0);
+    l1_entry->set_writable();
+    l1_entry->set_huge();
+    l1_entry->set_cache_disabled();
+    l1_entry->set_present();
 
-    EarlyDeviceLimit = 1 * Const::GB;
+    early_device_limit = 1 * consts::GB;
     return true;
 }
 
 }
 }
 
-namespace Hal
+namespace hal
 {
 
-ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
+ulong mmio_premapped_va(ulong phys_addr, ulong size_bytes)
 {
-    using Kernel::Mm::MemoryMap;
-    if (Kernel::Mm::EarlyDeviceLimit != 0 &&
-        physAddr + sizeBytes <= Kernel::Mm::EarlyDeviceLimit)
-        return MemoryMap::KernelSpaceBase + physAddr;
+    using kernel::mm::MemoryMap;
+    if (kernel::mm::early_device_limit != 0 &&
+        phys_addr + size_bytes <= kernel::mm::early_device_limit)
+        return MemoryMap::KERNEL_SPACE_BASE + phys_addr;
     return 0;
 }
 

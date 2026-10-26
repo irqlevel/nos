@@ -3,7 +3,7 @@
 #include "error.h"
 #include "stdlib.h"
 
-namespace Stdlib
+namespace stdlib
 {
 
 template<typename T>
@@ -11,26 +11,26 @@ class Result
 {
 public:
     Result(const T& value)
-        : Value(value)
-        , Err(Error::Success)
+        : value_(value)
+        , err_(Error::SUCCESS)
     {
     }
 
     Result(T&& value)
-        : Value(Move(value))
-        , Err(Error::Success)
+        : value_(move(value))
+        , err_(Error::SUCCESS)
     {
     }
 
     Result(const Error& err)
-        : Value()
-        , Err(err)
+        : value_()
+        , err_(err)
     {
     }
 
     Result(Error&& err)
-        : Value()
-        , Err(Move(err))
+        : value_()
+        , err_(move(err))
     {
     }
 
@@ -39,8 +39,8 @@ public:
     }
 
     Result(const Result& other)
-        : Value(other.Value)
-        , Err(other.Err)
+        : value_(other.value_)
+        , err_(other.err_)
     {
     }
 
@@ -48,15 +48,15 @@ public:
     {
         if (this != &other)
         {
-            Value = other.Value;
-            Err = other.Err;
+            value_ = other.value_;
+            err_ = other.err_;
         }
         return *this;
     }
 
     Result(Result&& other)
-        : Value(Move(other.Value))
-        , Err(Move(other.Err))
+        : value_(move(other.value_))
+        , err_(move(other.err_))
     {
     }
 
@@ -64,40 +64,40 @@ public:
     {
         if (this != &other)
         {
-            Value = Move(other.Value);
-            Err = Move(other.Err);
+            value_ = move(other.value_);
+            err_ = move(other.err_);
         }
         return *this;
     }
 
-    bool Ok() const
+    bool ok() const
     {
-        return Err.Ok();
+        return err_.ok();
     }
 
-    const T& GetValue() const
+    const T& get_value() const
     {
-        return Value;
+        return value_;
     }
 
-    T& GetValue()
+    T& get_value()
     {
-        return Value;
+        return value_;
     }
 
-    const Error& GetError() const
+    const Error& get_error() const
     {
-        return Err;
+        return err_;
     }
 
-    Error& GetError()
+    Error& get_error()
     {
-        return Err;
+        return err_;
     }
 
 private:
-    T Value;
-    Error Err;
+    T value_;
+    Error err_;
 };
 
 }

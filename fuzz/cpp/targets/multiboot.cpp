@@ -26,17 +26,17 @@
 
 #include <new>
 
-using namespace Kernel;
-using Kernel::Mm::MemoryMap;
+using namespace kernel;
+using kernel::mm::MemoryMap;
 
-namespace Kernel
+namespace kernel
 {
-namespace Ubsan
+namespace ubsan
 {
 
-void SetWarnOnly(bool warnOnly)
+void set_warn_only(bool warn_only)
 {
-    (void)warnOnly;
+    (void)warn_only;
 }
 
 }
@@ -47,7 +47,7 @@ namespace
 
 /* ---- the info ---- */
 
-void Put(std::vector<uint8_t>& v, size_t at, uint64_t x, int bytes)
+void put(std::vector<uint8_t>& v, size_t at, uint64_t x, int bytes)
 {
     if (v.size() < at + bytes)
         v.resize(at + bytes, 0);
@@ -57,36 +57,36 @@ void Put(std::vector<uint8_t>& v, size_t at, uint64_t x, int bytes)
 
 struct MmapEntry
 {
-    u64 Addr;
-    u64 Len;
-    u32 Type;
+    u64 addr;
+    u64 len;
+    u32 type;
 };
 
 struct Fb
 {
-    u64 Addr;
-    u32 Pitch, Width, Height;
-    u8 Bpp, Type;
-    u8 Colors[6];
+    u64 addr;
+    u32 pitch, width, height;
+    u8 bpp, type;
+    u8 colors[6];
 };
 
 /* What a sound info holds, tag by tag, as the model reads it */
 struct Tag
 {
-    u32 Type;
-    std::vector<uint8_t> Body; /* after the 8-byte header */
+    u32 type;
+    std::vector<uint8_t> body; /* after the 8-byte header */
 };
 
-u64 Address(Fuzz::Input& in)
+u64 address(fuzz::Input& in)
 {
-    switch (in.U8() % 8)
+    switch (in.u8() % 8)
     {
     case 0:
-        return in.Value64();
+        return in.value64();
     case 1:
-        return (1ULL << 52) - in.U8() * Const::PageSize;
+        return (1ULL << 52) - in.u8() * consts::PAGE_SIZE;
     default:
-        return in.Below(1ULL << 36) & ~0xFFFULL;
+        return in.below(1ULL << 36) & ~0xFFFULL;
     }
 }
 
@@ -94,101 +94,101 @@ u64 Address(Fuzz::Input& in)
    info of one long map, which has more, and of them no more reserved ones
    than the map holds with the kernel's own: its usable RAM past that is
    left out, and a sound info never reaches the reserved regions' limit */
-const size_t EntryBudget = MemoryMap::MaxRegions - 8;
-const size_t LongBudget = MemoryMap::MaxRegions + 64;
-const size_t ReservedBudget = MemoryMap::MaxRegions - Grub::KernelCarveOuts;
+const size_t ENTRY_BUDGET = MemoryMap::MAX_REGIONS - 8;
+const size_t LONG_BUDGET = MemoryMap::MAX_REGIONS + 64;
+const size_t RESERVED_BUDGET = MemoryMap::MAX_REGIONS - grub::KERNEL_CARVE_OUTS;
 
-Tag MmapTag(Fuzz::Input& in, std::vector<MmapEntry>& entries, size_t& budget, size_t& reserved, bool longMap)
+Tag mmap_tag(fuzz::Input& in, std::vector<MmapEntry>& entries, size_t& budget, size_t& reserved, bool long_map)
 {
-    u32 entrySize = in.Chance(24) ? 24 + 8 * static_cast<u32>(in.Below(3)) : 24;
-    if (in.Chance(8))
-        entrySize = static_cast<u32>(in.Below(24));
+    u32 entry_size = in.chance(24) ? 24 + 8 * static_cast<u32>(in.below(3)) : 24;
+    if (in.chance(8))
+        entry_size = static_cast<u32>(in.below(24));
     Tag t{6, {}};
-    Put(t.Body, 0, entrySize, 4);
-    Put(t.Body, 4, 0, 4);
-    u64 want = longMap ? in.Range(MemoryMap::MaxRegions - 8, LongBudget) : in.Chance(16) ? in.Range(60, 140) : in.Below(24);
+    put(t.body, 0, entry_size, 4);
+    put(t.body, 4, 0, 4);
+    u64 want = long_map ? in.range(MemoryMap::MAX_REGIONS - 8, LONG_BUDGET) : in.chance(16) ? in.range(60, 140) : in.below(24);
     for (u64 n = std::min<u64>(budget, want); n > 0; n--, budget--)
     {
-        MmapEntry e{Address(in), in.Chance(16) ? in.Value64() : (1 + in.Below(4096)) * Const::PageSize,
-                    in.Chance(128) ? 1u : static_cast<u32>(in.Range(2, 6))};
-        if (e.Type != 1 && reserved-- == 0)
+        MmapEntry e{address(in), in.chance(16) ? in.value64() : (1 + in.below(4096)) * consts::PAGE_SIZE,
+                    in.chance(128) ? 1u : static_cast<u32>(in.range(2, 6))};
+        if (e.type != 1 && reserved-- == 0)
         {
             reserved = 0;
-            e.Type = 1;
+            e.type = 1;
         }
-        size_t at = t.Body.size();
-        Put(t.Body, at, e.Addr, 8);
-        Put(t.Body, at + 8, e.Len, 8);
-        Put(t.Body, at + 16, e.Type, 4);
-        Put(t.Body, at + 20, 0, 4);
-        if (entrySize > 24)
-            t.Body.resize(at + entrySize, 0);
+        size_t at = t.body.size();
+        put(t.body, at, e.addr, 8);
+        put(t.body, at + 8, e.len, 8);
+        put(t.body, at + 16, e.type, 4);
+        put(t.body, at + 20, 0, 4);
+        if (entry_size > 24)
+            t.body.resize(at + entry_size, 0);
         entries.push_back(e);
     }
     return t;
 }
 
-Tag CmdlineTag(Fuzz::Input& in)
+Tag cmdline_tag(fuzz::Input& in)
 {
     Tag t{1, {}};
-    static const char* const Lines[] = {"root=auto dhcp=auto", "console=serial loglevel=3", "ro root=vda1",
+    static const char* const LINES[] = {"root=auto dhcp=auto", "console=serial loglevel=3", "ro root=vda1",
                                         "netconsole=10.0.2.2:6666 nctail=64", ""};
-    std::string line = in.Pick(Lines);
-    for (int i = in.Below(8); i > 0; i--)
-        line += static_cast<char>(in.Chance(16) ? in.Range(1, 255) : 'a' + in.Below(26));
-    t.Body.assign(line.begin(), line.end());
-    if (!in.Chance(24))
-        t.Body.push_back(0);
+    std::string line = in.pick(LINES);
+    for (int i = in.below(8); i > 0; i--)
+        line += static_cast<char>(in.chance(16) ? in.range(1, 255) : 'a' + in.below(26));
+    t.body.assign(line.begin(), line.end());
+    if (!in.chance(24))
+        t.body.push_back(0);
     return t;
 }
 
-Tag RsdpTag(Fuzz::Input& in, bool isNew)
+Tag rsdp_tag(fuzz::Input& in, bool is_new)
 {
-    Tag t{isNew ? 15u : 14u, {}};
-    size_t len = in.Chance(32) ? in.Below(80) : (isNew ? 36 : 20);
-    t.Body = Fuzz::Noise(in.U32(), len);
+    Tag t{is_new ? 15u : 14u, {}};
+    size_t len = in.chance(32) ? in.below(80) : (is_new ? 36 : 20);
+    t.body = fuzz::noise(in.u32(), len);
     return t;
 }
 
 /* A module: its range, of any extent or none, and its command line --
    `ucode`, what the kernel takes, another name, or one cut short with no
    NUL inside the tag */
-Tag ModuleTag(Fuzz::Input& in)
+Tag module_tag(fuzz::Input& in)
 {
     Tag t{3, {}};
-    u32 start = in.Chance(8) ? in.U32() : static_cast<u32>(in.Below(1ULL << 32) & ~0xFFFULL);
-    u32 end = in.Chance(8) ? start - static_cast<u32>(in.Below(2)) : start + static_cast<u32>(in.Below(1 << 20));
-    Put(t.Body, 0, start, 4);
-    Put(t.Body, 4, end, 4);
-    static const char* const Names[] = {"ucode", "ucode", "ucode", "", "ucod", "ucode2", "initrd"};
-    std::string name = in.Pick(Names);
+    u32 start = in.chance(8) ? in.u32() : static_cast<u32>(in.below(1ULL << 32) & ~0xFFFULL);
+    u32 end = in.chance(8) ? start - static_cast<u32>(in.below(2)) : start + static_cast<u32>(in.below(1 << 20));
+    put(t.body, 0, start, 4);
+    put(t.body, 4, end, 4);
+    static const char* const NAMES[] = {"ucode", "ucode", "ucode", "", "ucod", "ucode2", "initrd"};
+    std::string name = in.pick(NAMES);
     for (char c : name)
-        t.Body.push_back(static_cast<uint8_t>(c));
-    if (!in.Chance(16))
-        t.Body.push_back(0);
+        t.body.push_back(static_cast<uint8_t>(c));
+    if (!in.chance(16))
+        t.body.push_back(0);
     return t;
 }
 
-Tag FbTag(Fuzz::Input& in)
+Tag fb_tag(fuzz::Input& in)
 {
     Tag t{8, {}};
-    Put(t.Body, 0, in.Chance(32) ? in.Value64() : 0xFD000000ULL, 8);
-    Put(t.Body, 8, in.Chance(32) ? in.Value32() : 4096, 4);
-    Put(t.Body, 12, in.Chance(32) ? in.Value32() : 1024, 4);
-    Put(t.Body, 16, in.Chance(32) ? in.Value32() : 768, 4);
-    Put(t.Body, 20, in.Chance(32) ? in.U8() : 32, 1);
-    Put(t.Body, 21, in.Below(4), 1);
-    Put(t.Body, 22, 0, 2);
+    put(t.body, 0, in.chance(32) ? in.value64() : 0xFD000000ULL, 8);
+    put(t.body, 8, in.chance(32) ? in.value32() : 4096, 4);
+    put(t.body, 12, in.chance(32) ? in.value32() : 1024, 4);
+    put(t.body, 16, in.chance(32) ? in.value32() : 768, 4);
+    put(t.body, 20, in.chance(32) ? in.u8() : 32, 1);
+    put(t.body, 21, in.below(4), 1);
+    put(t.body, 22, 0, 2);
     for (int i = 0; i < 6; i++)
-        Put(t.Body, 24 + i, in.U8(), 1);
+        put(t.body, 24 + i, in.u8(), 1);
     /* The common part only, the RGB fields, an indexed palette, or cut */
-    switch (in.U8() % 4)
+    switch (in.u8() % 4)
     {
     case 0:
-        t.Body.resize(24);
+        t.body.resize(24);
         break;
     case 1:
-        t.Body.resize(24 + in.Below(6));
+        t.body.resize(24 + in.below(6));
         break;
     default:
         break;
@@ -196,24 +196,24 @@ Tag FbTag(Fuzz::Input& in)
     return t;
 }
 
-std::vector<uint8_t> Serialize(const std::vector<Tag>& tags, bool end)
+std::vector<uint8_t> serialize(const std::vector<Tag>& tags, bool end)
 {
     std::vector<uint8_t> info(8, 0);
     for (const Tag& t : tags)
     {
         size_t at = info.size();
-        Put(info, at, t.Type, 4);
-        Put(info, at + 4, 8 + t.Body.size(), 4);
-        info.insert(info.end(), t.Body.begin(), t.Body.end());
+        put(info, at, t.type, 4);
+        put(info, at + 4, 8 + t.body.size(), 4);
+        info.insert(info.end(), t.body.begin(), t.body.end());
         while (info.size() % 8)
             info.push_back(0);
     }
     if (end)
     {
-        Put(info, info.size(), 0, 4);
-        Put(info, info.size(), 8, 4);
+        put(info, info.size(), 0, 4);
+        put(info, info.size(), 8, 4);
     }
-    Put(info, 0, info.size(), 4);
+    put(info, 0, info.size(), 4);
     return info;
 }
 
@@ -221,57 +221,57 @@ std::vector<uint8_t> Serialize(const std::vector<Tag>& tags, bool end)
 
 struct Region
 {
-    ulong Addr, Len, Type;
+    ulong addr, len, type;
 };
 
 struct Expected
 {
-    std::vector<Region> Map;
-    bool Line = false;
-    std::string Kept;
-    std::vector<uint8_t> Rsdp;
-    bool RsdpNew = false;
-    bool FbPresent = false;
-    Fb Framebuffer{};
-    bool FbColors = false;
-    bool Ucode = false;
-    u32 UcodeStart = 0, UcodeEnd = 0;
+    std::vector<Region> map;
+    bool line = false;
+    std::string kept;
+    std::vector<uint8_t> rsdp;
+    bool rsdp_new = false;
+    bool fb_present = false;
+    Fb framebuffer{};
+    bool fb_colors = false;
+    bool ucode = false;
+    u32 ucode_start = 0, ucode_end = 0;
 };
 
 /* AddRegion, as memory_map.h says it keeps a region */
-void Add(Expected& e, u64 addr, u64 len, u64 type)
+void add(Expected& e, u64 addr, u64 len, u64 type)
 {
-    const u64 top = MemoryMap::MaxPhysAddr;
+    const u64 top = MemoryMap::MAX_PHYS_ADDR;
     if (len == 0 || addr >= top)
         return;
     if (len > top - addr)
         len = top - addr;
-    INVARIANT(e.Map.size() < MemoryMap::MaxRegions, "the model's map overflows: the generator makes too many regions");
-    e.Map.push_back({addr, len, type});
+    INVARIANT(e.map.size() < MemoryMap::MAX_REGIONS, "the model's map overflows: the generator makes too many regions");
+    e.map.push_back({addr, len, type});
 }
 
-void ReadMmap(Expected& e, const std::vector<MmapEntry>& entries)
+void read_mmap(Expected& e, const std::vector<MmapEntry>& entries)
 {
     for (int pass = 0; pass < 2; pass++)
     {
         for (const MmapEntry& m : entries)
         {
-            bool usable = m.Type == 1;
+            bool usable = m.type == 1;
             if (usable != (pass == 1))
                 continue;
-            if (usable && e.Map.size() + Grub::KernelCarveOuts >= MemoryMap::MaxRegions)
+            if (usable && e.map.size() + grub::KERNEL_CARVE_OUTS >= MemoryMap::MAX_REGIONS)
             {
-                Fuzz::Reached("usable RAM past what the map holds");
+                fuzz::reached("usable RAM past what the map holds");
                 continue;
             }
-            Add(e, m.Addr, m.Len, m.Type);
+            add(e, m.addr, m.len, m.type);
         }
     }
 }
 
-std::string Kept(const std::string& line)
+std::string kept(const std::string& line)
 {
-    const size_t keep = Parameters::CmdlineLen - 1;
+    const size_t keep = Parameters::CMDLINE_LEN - 1;
     std::string kept = line.substr(0, keep);
     if (line.size() > keep && line[keep] != ' ')
     {
@@ -281,93 +281,93 @@ std::string Kept(const std::string& line)
     return kept;
 }
 
-void Run(Fuzz::Input& in)
+void run(fuzz::Input& in)
 {
     std::vector<Tag> tags;
     std::vector<std::vector<MmapEntry>> mmaps;
-    const bool longMap = in.Chance(16);
-    size_t budget = longMap ? LongBudget : EntryBudget;
-    size_t reserved = ReservedBudget;
+    const bool long_map = in.chance(16);
+    size_t budget = long_map ? LONG_BUDGET : ENTRY_BUDGET;
+    size_t reserved = RESERVED_BUDGET;
     Expected e;
-    for (int n = in.Below(10); n > 0; n--)
+    for (int n = in.below(10); n > 0; n--)
     {
-        switch (in.U8() % 9)
+        switch (in.u8() % 9)
         {
         case 0:
         case 1:
         {
             /* One long map to an info: a second's reserved regions could
                find the table full */
-            if (longMap && !mmaps.empty())
+            if (long_map && !mmaps.empty())
                 break;
             mmaps.emplace_back();
-            tags.push_back(MmapTag(in, mmaps.back(), budget, reserved, longMap));
+            tags.push_back(mmap_tag(in, mmaps.back(), budget, reserved, long_map));
             break;
         }
         case 2:
-            tags.push_back(CmdlineTag(in));
+            tags.push_back(cmdline_tag(in));
             break;
         case 3:
-            tags.push_back(RsdpTag(in, false));
+            tags.push_back(rsdp_tag(in, false));
             break;
         case 4:
-            tags.push_back(RsdpTag(in, true));
+            tags.push_back(rsdp_tag(in, true));
             break;
         case 5:
-            tags.push_back(FbTag(in));
+            tags.push_back(fb_tag(in));
             break;
         case 6:
         {
             Tag t{5, {}};
-            t.Body = Fuzz::Noise(in.U32(), in.Chance(32) ? in.Below(12) : 12);
+            t.body = fuzz::noise(in.u32(), in.chance(32) ? in.below(12) : 12);
             tags.push_back(t);
             break;
         }
         case 7:
-            tags.push_back(ModuleTag(in));
+            tags.push_back(module_tag(in));
             break;
         default:
         {
             /* A tag this kernel does not read: a name, ELF sections -- or a
                module whose body is anything */
-            static const u32 Others[] = {2, 3, 4, 9, 10, 21};
-            Tag t{static_cast<u32>(in.Chance(32) ? in.Range(16, 40) : in.Pick(Others)), {}};
-            t.Body = Fuzz::Noise(in.U32(), in.Below(64));
+            static const u32 OTHERS[] = {2, 3, 4, 9, 10, 21};
+            Tag t{static_cast<u32>(in.chance(32) ? in.range(16, 40) : in.pick(OTHERS)), {}};
+            t.body = fuzz::noise(in.u32(), in.below(64));
             tags.push_back(t);
             break;
         }
         }
     }
-    const bool end = !in.Chance(16);
-    std::vector<uint8_t> info = Serialize(tags, end);
+    const bool end = !in.chance(16);
+    std::vector<uint8_t> info = serialize(tags, end);
 
-    const bool damaged = in.Chance(64);
+    const bool damaged = in.chance(64);
     if (damaged)
     {
-        for (int n = 1 + in.Below(3); n > 0; n--)
+        for (int n = 1 + in.below(3); n > 0; n--)
         {
-            switch (in.U8() % 4)
+            switch (in.u8() % 4)
             {
             case 0:
                 /* The total size that lies */
-                Put(info, 0, in.Chance(32) ? in.Below(16) : in.Below(info.size() + 64), 4);
+                put(info, 0, in.chance(32) ? in.below(16) : in.below(info.size() + 64), 4);
                 break;
             case 1:
             {
                 /* A tag size that lies */
-                size_t at = 8 + 8 * in.Below((info.size() - 8) / 8);
-                Put(info, at + 4, in.Value32(), 4);
+                size_t at = 8 + 8 * in.below((info.size() - 8) / 8);
+                put(info, at + 4, in.value32(), 4);
                 break;
             }
             case 2:
-                info[in.Below(info.size())] = in.U8();
+                info[in.below(info.size())] = in.u8();
                 break;
             default:
-                info.resize(8 + in.Below(info.size() - 7));
+                info.resize(8 + in.below(info.size() - 7));
                 break;
             }
         }
-        Fuzz::Reached("a damaged info");
+        fuzz::reached("a damaged info");
     }
 
     /* The info as long as its header says, never less than a header: GRUB's
@@ -378,56 +378,56 @@ void Run(Fuzz::Input& in)
     std::vector<u64> buffer((size + 7) / 8, 0);
     memcpy(buffer.data(), info.data(), info.size());
 
-    Grub::ParseMultiBootInfo(reinterpret_cast<Grub::MultiBootInfoHeader*>(buffer.data()));
+    grub::parse_multi_boot_info(reinterpret_cast<grub::MultiBootInfoHeader*>(buffer.data()));
 
-    auto& mmap = MemoryMap::GetInstance();
-    INVARIANT(mmap.GetRegionCount() <= MemoryMap::MaxRegions, "a map of %zu regions", mmap.GetRegionCount());
-    size_t rsdpSize = 0;
-    const void* rsdp = Grub::GetAcpiRsdp(rsdpSize);
-    INVARIANT((rsdp == nullptr) == (rsdpSize == 0) && rsdpSize <= sizeof(Grub::AcpiRsdpCopy),
-        "an RSDP of %zu bytes", rsdpSize);
+    auto& mmap = MemoryMap::get_instance();
+    INVARIANT(mmap.get_region_count() <= MemoryMap::MAX_REGIONS, "a map of %zu regions", mmap.get_region_count());
+    size_t rsdp_size = 0;
+    const void* rsdp = grub::get_acpi_rsdp(rsdp_size);
+    INVARIANT((rsdp == nullptr) == (rsdp_size == 0) && rsdp_size <= sizeof(grub::acpi_rsdp_copy),
+        "an RSDP of %zu bytes", rsdp_size);
     if (damaged)
         return;
 
     /* The model: the tags in order, as the reader takes each */
-    size_t mmapIndex = 0;
+    size_t mmap_index = 0;
     for (const Tag& t : tags)
     {
-        switch (t.Type)
+        switch (t.type)
         {
         case 6:
         {
-            const std::vector<MmapEntry>& entries = mmaps[mmapIndex++];
-            u32 entrySize;
-            memcpy(&entrySize, t.Body.data(), 4);
-            if (entrySize < 24)
+            const std::vector<MmapEntry>& entries = mmaps[mmap_index++];
+            u32 entry_size;
+            memcpy(&entry_size, t.body.data(), 4);
+            if (entry_size < 24)
                 break;
             /* The entries that fit whole, entrySize apart */
             std::vector<MmapEntry> fit;
-            for (size_t k = 0; 8 + 8 + (k + 1) * entrySize <= 8 + t.Body.size() && k < entries.size(); k++)
+            for (size_t k = 0; 8 + 8 + (k + 1) * entry_size <= 8 + t.body.size() && k < entries.size(); k++)
                 fit.push_back(entries[k]);
-            ReadMmap(e, fit);
-            Fuzz::Reached(fit.size() > 60 ? "a long memory map" : "a memory map");
+            read_mmap(e, fit);
+            fuzz::reached(fit.size() > 60 ? "a long memory map" : "a memory map");
             break;
         }
         case 1:
         {
-            if (t.Body.empty() || memchr(t.Body.data(), 0, t.Body.size()) == nullptr)
+            if (t.body.empty() || memchr(t.body.data(), 0, t.body.size()) == nullptr)
                 break;
-            e.Line = true;
-            e.Kept = Kept(reinterpret_cast<const char*>(t.Body.data()));
+            e.line = true;
+            e.kept = kept(reinterpret_cast<const char*>(t.body.data()));
             break;
         }
         case 14:
         case 15:
         {
-            bool isNew = t.Type == 15;
-            if (!e.Rsdp.empty() && e.RsdpNew && !isNew)
+            bool is_new = t.type == 15;
+            if (!e.rsdp.empty() && e.rsdp_new && !is_new)
                 break;
-            if (t.Body.empty())
+            if (t.body.empty())
                 break;
-            e.Rsdp.assign(t.Body.begin(), t.Body.begin() + std::min<size_t>(t.Body.size(), 64));
-            e.RsdpNew = isNew;
+            e.rsdp.assign(t.body.begin(), t.body.begin() + std::min<size_t>(t.body.size(), 64));
+            e.rsdp_new = is_new;
             break;
         }
         case 3:
@@ -435,45 +435,45 @@ void Run(Fuzz::Input& in)
             /* The module's range, then its name, which must end inside the
                tag; `ucode` with a range that is not empty is kept, the last
                such over any before */
-            if (t.Body.size() <= 8)
+            if (t.body.size() <= 8)
                 break;
-            const uint8_t* name = t.Body.data() + 8;
-            size_t room = t.Body.size() - 8;
+            const uint8_t* name = t.body.data() + 8;
+            size_t room = t.body.size() - 8;
             const void* nul = memchr(name, 0, room);
             if (nul == nullptr)
                 break;
             if (strcmp(reinterpret_cast<const char*>(name), "ucode") != 0)
                 break;
             u32 start, end;
-            memcpy(&start, t.Body.data(), 4);
-            memcpy(&end, t.Body.data() + 4, 4);
+            memcpy(&start, t.body.data(), 4);
+            memcpy(&end, t.body.data() + 4, 4);
             if (end <= start)
                 break;
-            e.Ucode = true;
-            e.UcodeStart = start;
-            e.UcodeEnd = end;
-            Fuzz::Reached("a ucode module");
+            e.ucode = true;
+            e.ucode_start = start;
+            e.ucode_end = end;
+            fuzz::reached("a ucode module");
             break;
         }
         case 8:
         {
-            if (t.Body.size() < 24)
+            if (t.body.size() < 24)
                 break;
-            e.FbPresent = true;
-            memcpy(&e.Framebuffer.Addr, &t.Body[0], 8);
-            memcpy(&e.Framebuffer.Pitch, &t.Body[8], 4);
-            memcpy(&e.Framebuffer.Width, &t.Body[12], 4);
-            memcpy(&e.Framebuffer.Height, &t.Body[16], 4);
-            e.Framebuffer.Bpp = t.Body[20];
-            e.Framebuffer.Type = t.Body[21];
-            if (e.Framebuffer.Type == 1)
+            e.fb_present = true;
+            memcpy(&e.framebuffer.addr, &t.body[0], 8);
+            memcpy(&e.framebuffer.pitch, &t.body[8], 4);
+            memcpy(&e.framebuffer.width, &t.body[12], 4);
+            memcpy(&e.framebuffer.height, &t.body[16], 4);
+            e.framebuffer.bpp = t.body[20];
+            e.framebuffer.type = t.body[21];
+            if (e.framebuffer.type == 1)
             {
-                static const u8 Defaults[6] = {16, 8, 8, 8, 0, 8};
-                e.FbColors = true;
-                if (t.Body.size() >= 30)
-                    memcpy(e.Framebuffer.Colors, &t.Body[24], 6);
+                static const u8 DEFAULTS[6] = {16, 8, 8, 8, 0, 8};
+                e.fb_colors = true;
+                if (t.body.size() >= 30)
+                    memcpy(e.framebuffer.colors, &t.body[24], 6);
                 else
-                    memcpy(e.Framebuffer.Colors, Defaults, 6);
+                    memcpy(e.framebuffer.colors, DEFAULTS, 6);
             }
             break;
         }
@@ -482,61 +482,61 @@ void Run(Fuzz::Input& in)
         }
     }
 
-    INVARIANT(mmap.GetRegionCount() == e.Map.size(), "the map holds %zu regions, where the info says %zu",
-        mmap.GetRegionCount(), e.Map.size());
-    for (size_t i = 0; i < e.Map.size(); i++)
+    INVARIANT(mmap.get_region_count() == e.map.size(), "the map holds %zu regions, where the info says %zu",
+        mmap.get_region_count(), e.map.size());
+    for (size_t i = 0; i < e.map.size(); i++)
     {
         ulong addr, len, type;
-        mmap.GetRegion(i, addr, len, type);
-        INVARIANT(addr == e.Map[i].Addr && len == e.Map[i].Len && type == e.Map[i].Type,
-            "region %zu is 0x%lx+0x%lx type %lu, not 0x%lx+0x%lx type %lu", i, addr, len, type, e.Map[i].Addr,
-            e.Map[i].Len, e.Map[i].Type);
+        mmap.get_region(i, addr, len, type);
+        INVARIANT(addr == e.map[i].addr && len == e.map[i].len && type == e.map[i].type,
+            "region %zu is 0x%lx+0x%lx type %lu, not 0x%lx+0x%lx type %lu", i, addr, len, type, e.map[i].addr,
+            e.map[i].len, e.map[i].type);
     }
-    if (e.Line)
-        INVARIANT(e.Kept == Parameters::GetInstance().GetCmdline(), "the line kept is '%s', not '%s'",
-            Parameters::GetInstance().GetCmdline(), e.Kept.c_str());
-    INVARIANT(rsdpSize == e.Rsdp.size() && (rsdpSize == 0 || memcmp(rsdp, e.Rsdp.data(), rsdpSize) == 0),
-        "the RSDP kept is %zu bytes, not the %zu of the tag it should be", rsdpSize, e.Rsdp.size());
-    ulong ucodePhys = 0, ucodeLen = 0;
-    bool ucode = Grub::GetUcodeModule(ucodePhys, ucodeLen);
-    INVARIANT(ucode == e.Ucode && (!ucode || (ucodePhys == e.UcodeStart && ucodeLen == u64(e.UcodeEnd) - e.UcodeStart)),
-        "the ucode module kept is %s 0x%lx+0x%lx, where the info's is %s 0x%x-0x%x", ucode ? "" : "none,", ucodePhys,
-        ucodeLen, e.Ucode ? "" : "none,", e.UcodeStart, e.UcodeEnd);
-    INVARIANT(Grub::HasFramebufferInfo() == e.FbPresent, "a framebuffer %s", e.FbPresent ? "lost" : "from nowhere");
-    if (e.FbPresent)
+    if (e.line)
+        INVARIANT(e.kept == Parameters::get_instance().get_cmdline(), "the line kept is '%s', not '%s'",
+            Parameters::get_instance().get_cmdline(), e.kept.c_str());
+    INVARIANT(rsdp_size == e.rsdp.size() && (rsdp_size == 0 || memcmp(rsdp, e.rsdp.data(), rsdp_size) == 0),
+        "the RSDP kept is %zu bytes, not the %zu of the tag it should be", rsdp_size, e.rsdp.size());
+    ulong ucode_phys = 0, ucode_len = 0;
+    bool ucode = grub::get_ucode_module(ucode_phys, ucode_len);
+    INVARIANT(ucode == e.ucode && (!ucode || (ucode_phys == e.ucode_start && ucode_len == u64(e.ucode_end) - e.ucode_start)),
+        "the ucode module kept is %s 0x%lx+0x%lx, where the info's is %s 0x%x-0x%x", ucode ? "" : "none,", ucode_phys,
+        ucode_len, e.ucode ? "" : "none,", e.ucode_start, e.ucode_end);
+    INVARIANT(grub::has_framebuffer_info() == e.fb_present, "a framebuffer %s", e.fb_present ? "lost" : "from nowhere");
+    if (e.fb_present)
     {
-        const Grub::FramebufferInfo* fb = Grub::GetFramebufferInfo();
-        INVARIANT(fb->Addr == e.Framebuffer.Addr && fb->Pitch == e.Framebuffer.Pitch && fb->Width == e.Framebuffer.Width &&
-            fb->Height == e.Framebuffer.Height && fb->Bpp == e.Framebuffer.Bpp && fb->Type == e.Framebuffer.Type,
+        const grub::FramebufferInfo* fb = grub::get_framebuffer_info();
+        INVARIANT(fb->addr == e.framebuffer.addr && fb->pitch == e.framebuffer.pitch && fb->width == e.framebuffer.width &&
+            fb->height == e.framebuffer.height && fb->bpp == e.framebuffer.bpp && fb->type == e.framebuffer.type,
             "the framebuffer is not the tag's");
-        if (e.FbColors)
-            INVARIANT(fb->RedPos == e.Framebuffer.Colors[0] && fb->RedSize == e.Framebuffer.Colors[1] &&
-                fb->GreenPos == e.Framebuffer.Colors[2] && fb->GreenSize == e.Framebuffer.Colors[3] &&
-                fb->BluePos == e.Framebuffer.Colors[4] && fb->BlueSize == e.Framebuffer.Colors[5],
+        if (e.fb_colors)
+            INVARIANT(fb->red_pos == e.framebuffer.colors[0] && fb->red_size == e.framebuffer.colors[1] &&
+                fb->green_pos == e.framebuffer.colors[2] && fb->green_size == e.framebuffer.colors[3] &&
+                fb->blue_pos == e.framebuffer.colors[4] && fb->blue_size == e.framebuffer.colors[5],
                 "the framebuffer's colours are not the tag's");
-        Fuzz::Reached("a framebuffer");
+        fuzz::reached("a framebuffer");
     }
-    Fuzz::Reached(end ? "a sound info" : "a sound info with no end tag");
+    fuzz::reached(end ? "a sound info" : "a sound info with no end tag");
 }
 
-void Reset()
+void reset()
 {
-    MemoryMap& mmap = MemoryMap::GetInstance();
+    MemoryMap& mmap = MemoryMap::get_instance();
     mmap.~MemoryMap();
     new (&mmap) MemoryMap();
-    Parameters& p = Parameters::GetInstance();
+    Parameters& p = Parameters::get_instance();
     p.~Parameters();
     new (&p) Parameters();
-    memset(Grub::AcpiRsdpCopy, 0, sizeof(Grub::AcpiRsdpCopy));
-    Grub::AcpiRsdpSize = 0;
-    Grub::AcpiRsdpIsNew = false;
-    Grub::FramebufferPresent = false;
-    Grub::FramebufferType = 0;
-    Grub::Framebuffer = Grub::FramebufferInfo();
-    Grub::UcodeStart = 0;
-    Grub::UcodeEnd = 0;
+    memset(grub::acpi_rsdp_copy, 0, sizeof(grub::acpi_rsdp_copy));
+    grub::acpi_rsdp_size = 0;
+    grub::acpi_rsdp_is_new = false;
+    grub::framebuffer_present = false;
+    grub::framebuffer_type = 0;
+    grub::framebuffer = grub::FramebufferInfo();
+    grub::ucode_start = 0;
+    grub::ucode_end = 0;
 }
 
 }
 
-const Fuzz::Target Fuzz::TheTarget = {"multiboot", Reset, Run, 4096, 20000};
+const fuzz::Target fuzz::THE_TARGET = {"multiboot", reset, run, 4096, 20000};

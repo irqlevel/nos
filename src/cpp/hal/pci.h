@@ -6,14 +6,14 @@
 // CAM (0xCF8/0xCFC), BARs are firmware-programmed so assignment is a no-op.
 // arm64: ECAM (pci-host-ecam-generic), and the kernel must assign BARs from
 // the host bridge's MMIO window since bare -kernel boot has no firmware.
-namespace Hal
+namespace hal
 {
 
-u32 PciConfigRead32(u16 bus, u16 slot, u16 func, u16 offset);
-void PciConfigWrite32(u16 bus, u16 slot, u16 func, u16 offset, u32 value);
+u32 pci_config_read32(u16 bus, u16 slot, u16 func, u16 offset);
+void pci_config_write32(u16 bus, u16 slot, u16 func, u16 offset, u32 value);
 
 /* Called once after enumeration with the device array (opaque stride to
    avoid a Pci.h dependency here). x86: no-op. arm64: probe + assign BARs. */
-void PciAssignResources(void* devices, ulong count, ulong stride);
+void pci_assign_resources(void* devices, ulong count, ulong stride);
 
 }

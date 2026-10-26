@@ -20,17 +20,17 @@ namespace
 {
 
 /* ID_AA64ISAR0_EL1.RNDR, bits [63:60]: 1 means RNDR and RNDRRS exist. */
-const ulong IdIsar0RndrShift = 60;
-const ulong IdIsar0RndrMask = 0xFULL;
+const ulong ID_ISAR0_RNDR_SHIFT = 60;
+const ulong ID_ISAR0_RNDR_MASK = 0xFULL;
 
 /* Arm specifies no retry count. A read that cannot be answered "in a
    reasonable period of time" fails rather than blocking, so a retry rides out
    a reseed in progress -- it is not there to paper over a broken generator.
    RNDRRS forces that reseed and so fails more readily than RNDR. */
-const ulong RndrAttempts = 10;
-const ulong RndrrsAttempts = 128;
+const ulong RNDR_ATTEMPTS = 10;
+const ulong RNDRRS_ATTEMPTS = 128;
 
-bool HaveRndr;
+bool have_rndr;
 
 /* Both are read as system registers, and both set PSTATE.NZCV: on failure the
    register reads 0 and Z is set. The cset has to be in the same asm block as
@@ -39,7 +39,7 @@ bool HaveRndr;
    Spelled as raw encodings (S3_3_C2_C4_0 = RNDR, S3_3_C2_C4_1 = RNDRRS) so the
    build needs no +rand in its target features: this file compiles for a
    baseline armv8-a and decides at run time. */
-bool RndrStep(u64& out)
+bool rndr_step(u64& out)
 {
     u64 value = 0;
     ulong ok = 0;
@@ -51,7 +51,7 @@ bool RndrStep(u64& out)
     return ok != 0;
 }
 
-bool RndrrsStep(u64& out)
+bool rndrrs_step(u64& out)
 {
     u64 value = 0;
     ulong ok = 0;
@@ -63,25 +63,25 @@ bool RndrrsStep(u64& out)
     return ok != 0;
 }
 
-bool RndrRetry(u64& out)
+bool rndr_retry(u64& out)
 {
-    for (ulong i = 0; i < RndrAttempts; i++)
+    for (ulong i = 0; i < RNDR_ATTEMPTS; i++)
     {
-        if (RndrStep(out))
+        if (rndr_step(out))
             return true;
-        Pause();
+        cpu_relax();
     }
 
     return false;
 }
 
-bool RndrrsRetry(u64& out)
+bool rndrrs_retry(u64& out)
 {
-    for (ulong i = 0; i < RndrrsAttempts; i++)
+    for (ulong i = 0; i < RNDRRS_ATTEMPTS; i++)
     {
-        if (RndrrsStep(out))
+        if (rndrrs_step(out))
             return true;
-        Pause();
+        cpu_relax();
     }
 
     return false;
@@ -89,59 +89,59 @@ bool RndrrsRetry(u64& out)
 
 }
 
-namespace Hal
+namespace hal
 {
 
-void ProbeHwRandom()
+void probe_hw_random()
 {
     ulong isar0 = 0;
     asm volatile("mrs %0, id_aa64isar0_el1" : "=r"(isar0));
 
-    if (((isar0 >> IdIsar0RndrShift) & IdIsar0RndrMask) == 0)
+    if (((isar0 >> ID_ISAR0_RNDR_SHIFT) & ID_ISAR0_RNDR_MASK) == 0)
     {
         /* Reading RNDR on a core without FEAT_RNG is an undefined
            instruction, so this check is the whole reason the probe is a trace
            line and not a synchronous exception. */
-        Trace(0, "HwRandom: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%lX)",
+        trace(0, "HwRandom: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%lX)",
             isar0);
         return;
     }
 
-    if (Kernel::Parameters::GetInstance().IsHwRngOff())
+    if (kernel::Parameters::get_instance().is_hw_rng_off())
     {
-        Trace(0, "HwRandom: rndr present, disabled by hwrng=off");
+        trace(0, "HwRandom: rndr present, disabled by hwrng=off");
         return;
     }
 
-    HaveRndr = true;
+    have_rndr = true;
 
-    Trace(0, "HwRandom: rndr yes");
+    trace(0, "HwRandom: rndr yes");
 }
 
-HwRandomKind GetHwRandomKind()
+HwRandomKind get_hw_random_kind()
 {
-    return HaveRndr ? HwRandomKind::Rndr : HwRandomKind::None;
+    return have_rndr ? HwRandomKind::Rndr : HwRandomKind::None;
 }
 
-bool HwRandom(u64& out)
+bool hw_random(u64& out)
 {
-    if (!HaveRndr)
+    if (!have_rndr)
         return false;
 
-    return RndrRetry(out);
+    return rndr_retry(out);
 }
 
-bool HwRandomSeed(u64& out)
+bool hw_random_seed(u64& out)
 {
-    if (!HaveRndr)
+    if (!have_rndr)
         return false;
 
     /* RNDRRS reseeds the generator from the noise source before answering,
        which is what another generator wants for its own seed. */
-    if (RndrrsRetry(out))
+    if (rndrrs_retry(out))
         return true;
 
-    return RndrRetry(out);
+    return rndr_retry(out);
 }
 
 }

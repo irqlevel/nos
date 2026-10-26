@@ -19,257 +19,257 @@
    tick, which it takes only with rxpoll=on. */
 extern "C" void rust_net_poll_rx();
 
-namespace Kernel
+namespace kernel
 {
 
 IPITask::IPITask()
-    : Function(nullptr)
-    , Ctx(nullptr)
-    , Completion(1)
+    : function(nullptr)
+    , ctx(nullptr)
+    , completion(1)
 {
 }
 
 IPITask::IPITask(Func func, void* ctx)
-    : Function(func)
-    , Ctx(ctx)
-    , Completion(1)
+    : function(func)
+    , ctx(ctx)
+    , completion(1)
 {
 }
 
 Cpu::Cpu()
-    : Index(0)
-    , State(0)
-    , IdleTaskPtr(nullptr)
-    , IPITasksClosed(false)
-    , TimerOneShot(false)
-    , TickDue(0)
-    , TimerArmedAt(~0UL)
-    , TimerWalk(false)
+    : index_(0)
+    , state_(0)
+    , idle_task_ptr_(nullptr)
+    , ipi_tasks_closed_(false)
+    , timer_one_shot_(false)
+    , tick_due_(0)
+    , timer_armed_at_(~0UL)
+    , timer_walk_(false)
 {
-    IPITaskList.Init();
+    ipi_task_list_.init();
 }
 
-ulong Cpu::GetIndex()
+ulong Cpu::get_index()
 {
-    return Index;
+    return index_;
 }
 
-void Cpu::Idle()
+void Cpu::idle()
 {
-    if (BugOn(!(State & StateRunning)))
+    if (BUG_ON(!(state_ & STATE_RUNNING)))
         return;
 
-    if (BugOn(!Hal::IsInterruptEnabled()))
+    if (BUG_ON(!hal::is_interrupt_enabled()))
         return;
 
     /* Free tasks that exited on this CPU (deferred out of the IRQs-off switch
        path); safe here because interrupts are enabled. */
-    GetTaskQueue().ReapExited();
+    get_task_queue().reap_exited();
 
     /* The last resort from here until it wakes: an interrupt that finds
        something else to run switches to it and leaves this task in its
        place, rather than in the turns (Task::SetIdling). Not before the
        reap, whose frees may wait for other CPUs. */
-    Task* self = Task::TryGetCurrentTask();
+    Task* self = Task::try_get_current_task();
     if (self != nullptr)
-        self->SetIdling(true);
-    Hlt();
+        self->set_idling(true);
+    cpu_halt();
     if (self != nullptr)
-        self->SetIdling(false);
+        self->set_idling(false);
 }
 
-ulong Cpu::GetState()
+ulong Cpu::get_state()
 {
-    Stdlib::AutoLock lock(Lock);
-    return State;
+    stdlib::AutoLock lock(lock_);
+    return state_;
 }
 
-bool Cpu::IsParked()
+bool Cpu::is_parked()
 {
-    return (Parked.Get() != 0) ? true : false;
+    return (parked_.get() != 0) ? true : false;
 }
 
-void Cpu::SetRunning()
+void Cpu::set_running()
 {
     {
-        Stdlib::AutoLock lock(Lock);
-        if (BugOn(State & StateRunning))
+        stdlib::AutoLock lock(lock_);
+        if (BUG_ON(state_ & STATE_RUNNING))
             return;
 
-        State |= StateRunning;
+        state_ |= STATE_RUNNING;
     }
 
     /* Published outside this CPU's own lock and without the table's: the
        watchdog's tick path reads this mirror on every CPU. */
-    CpuTable::GetInstance().NoteCpuRunning(Index);
+    CpuTable::get_instance().note_cpu_running(index_);
 }
 
-void Cpu::SetExiting()
+void Cpu::set_exiting()
 {
-    Stdlib::AutoLock lock(Lock);
-    State |= StateExiting;
+    stdlib::AutoLock lock(lock_);
+    state_ |= STATE_EXITING;
 }
 
-void Cpu::Init(ulong index)
+void Cpu::init(ulong index)
 {
-    Stdlib::AutoLock lock(Lock);
-    if (BugOn(State & StateInited))
+    stdlib::AutoLock lock(lock_);
+    if (BUG_ON(state_ & STATE_INITED))
         return;
 
-    Index = index;
-    State |= StateInited;
+    index_ = index;
+    state_ |= STATE_INITED;
 
-    Trace(0, "Cpu 0x%p %lu inited", this, Index);
+    trace(0, "Cpu 0x%p %lu inited", this, index_);
 }
 
-void Cpu::Reset()
+void Cpu::reset()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    BugOn(State == StateRunning);
-    TaskQueue.Clear();
+    BUG_ON(state_ == STATE_RUNNING);
+    task_queue_.clear();
 
-    if (IdleTaskPtr != nullptr)
+    if (idle_task_ptr_ != nullptr)
     {
-        IdleTaskPtr->Put();
-        IdleTaskPtr = nullptr;
+        idle_task_ptr_->put();
+        idle_task_ptr_ = nullptr;
     }
 }
 
 Cpu::~Cpu()
 {
-    Reset();
+    reset();
 }
 
 CpuTable::CpuTable()
-    : BspIndex(0)
+    : bsp_index_(0)
 {
 }
 
 CpuTable::~CpuTable()
 {
-    Reset();
+    reset();
 }
 
-bool CpuTable::InsertCpu(ulong index)
+bool CpuTable::insert_cpu(ulong index)
 {
-    Stdlib::AutoLock lock(Lock);
-    if (index >= Stdlib::ArraySize(CpuArray))
+    stdlib::AutoLock lock(lock_);
+    if (index >= stdlib::array_size(cpu_array_))
         return false;
 
-    auto& cpu = CpuArray[index];
-    if (cpu.GetState() & Cpu::StateInited)
+    auto& cpu = cpu_array_[index];
+    if (cpu.get_state() & Cpu::STATE_INITED)
         return false;
 
-    cpu.Init(index);
+    cpu.init(index);
     return true;
 }
 
-Cpu& CpuTable::GetCpu(ulong index)
+Cpu& CpuTable::get_cpu(ulong index)
 {
-    BugOn(index >= Stdlib::ArraySize(CpuArray));
-    Cpu& cpu = CpuArray[index];
+    BUG_ON(index >= stdlib::array_size(cpu_array_));
+    Cpu& cpu = cpu_array_[index];
     return cpu;
 }
 
-ulong CpuTable::GetBspIndex()
+ulong CpuTable::get_bsp_index()
 {
-    Stdlib::AutoLock lock(Lock);
-    return GetBspIndexLockHeld();
+    stdlib::AutoLock lock(lock_);
+    return get_bsp_index_lock_held();
 }
 
-ulong CpuTable::GetBspIndexLockHeld()
+ulong CpuTable::get_bsp_index_lock_held()
 {
-    return BspIndex;
+    return bsp_index_;
 }
 
-ulong CpuTable::GetBspIndexNoLock()
+ulong CpuTable::get_bsp_index_no_lock()
 {
-    return (ulong)BspIndexCached.Get();
+    return (ulong)bsp_index_cached_.get();
 }
 
-bool CpuTable::SetBspIndex(ulong index)
+bool CpuTable::set_bsp_index(ulong index)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
+    if (BUG_ON(index >= stdlib::array_size(cpu_array_)))
         return false;
 
-    auto& cpu = CpuArray[index];
-    if (BugOn(!(cpu.GetState() & Cpu::StateInited)))
+    auto& cpu = cpu_array_[index];
+    if (BUG_ON(!(cpu.get_state() & Cpu::STATE_INITED)))
         return false;
 
-    cpu.SetRunning();
-    BspIndex = index;
-    BspIndexCached.Set((long)index);
+    cpu.set_running();
+    bsp_index_ = index;
+    bsp_index_cached_.set((long)index);
     return true;
 }
 
-ulong CpuTable::GetCurrentCpuId()
+ulong CpuTable::get_current_cpu_id()
 {
-    return Hal::GetCurrentCpuHwId();
+    return hal::get_current_cpu_hw_id();
 }
 
-Cpu& CpuTable::GetCurrentCpu()
+Cpu& CpuTable::get_current_cpu()
 {
-    return GetCpu(GetCurrentCpuId());
+    return get_cpu(get_current_cpu_id());
 }
 
-void CpuTable::ExitAllExceptSelf()
+void CpuTable::exit_all_except_self()
 {
-    auto& self = GetCurrentCpu();
+    auto& self = get_current_cpu();
 
-    ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < MaxCpus; i++)
+    ulong cpu_mask = get_running_cpus();
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpuMask & (1UL << i)) && (i != self.GetIndex()))
+        if ((cpu_mask & (1UL << i)) && (i != self.get_index()))
         {
-            auto& cpu = GetCpu(i);
-            cpu.SetExiting();
+            auto& cpu = get_cpu(i);
+            cpu.set_exiting();
 
-            while (!cpu.IsParked())
+            while (!cpu.is_parked())
             {
-                cpu.SendIPISelf();
-                Pause();
+                cpu.send_ipi_self();
+                cpu_relax();
             }
         }
     }
 }
 
-void CpuTable::SendIPIAllExclude(ulong excludeIndex)
+void CpuTable::send_ipi_all_exclude(ulong exclude_index)
 {
-    ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < MaxCpus; i++)
+    ulong cpu_mask = get_running_cpus();
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpuMask & (1UL << i)) && (i != excludeIndex))
+        if ((cpu_mask & (1UL << i)) && (i != exclude_index))
         {
-            auto& cpu = GetCpu(i);
+            auto& cpu = get_cpu(i);
 
-            cpu.SendIPISelf();
+            cpu.send_ipi_self();
         }
     }
 }
 
-void CpuTable::SendIPIAll()
+void CpuTable::send_ipi_all()
 {
-    ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < MaxCpus; i++)
+    ulong cpu_mask = get_running_cpus();
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpuMask & (1UL << i)))
+        if ((cpu_mask & (1UL << i)))
         {
-            auto& cpu = GetCpu(i);
+            auto& cpu = get_cpu(i);
 
-            cpu.SendIPISelf();
+            cpu.send_ipi_self();
         }
     }
 }
 
-void Cpu::OnPanic()
+void Cpu::on_panic()
 {
-    InterruptDisable();
+    interrupt_disable();
     for (;;)
     {
-        Pause();
+        cpu_relax();
     }
 }
 
@@ -281,8 +281,8 @@ void Cpu::OnPanic()
    panic is what the size is for: one made to run on this stack (StackProbe,
    on a build for the purpose) went 1800 bytes deep on arm64 and 1880 on
    x86, and 5176 on arm64 with the netconsole sending its report. */
-static const ulong ParkStackSize = 4 * Const::PageSize;
-static char ParkStack[MaxCpus][ParkStackSize] __attribute__((aligned(16)));
+static const ulong PARK_STACK_SIZE = 4 * consts::PAGE_SIZE;
+static char park_stack[MAX_CPUS][PARK_STACK_SIZE] __attribute__((aligned(16)));
 
 /* Where an exiting CPU ends, for good. Once it is parked (IsParked) the CPU
    that asked goes on to free the tasks, their stacks and at last the heap --
@@ -304,58 +304,58 @@ static char ParkStack[MaxCpus][ParkStackSize] __attribute__((aligned(16)));
    -- an atomic store and not this CPU's lock, which off a task's stack would
    look for the current task and panic -- and halts in a loop that touches no
    memory at all. */
-void Cpu::Park()
+void Cpu::park()
 {
-    InterruptDisable();
+    interrupt_disable();
 
-    Hal::RunOnStack((ulong)&ParkStack[Index][ParkStackSize], ParkOnOwnStack, this);
+    hal::run_on_stack((ulong)&park_stack[index_][PARK_STACK_SIZE], park_on_own_stack, this);
 }
 
-void Cpu::ParkOnOwnStack(void* ctx)
+void Cpu::park_on_own_stack(void* ctx)
 {
     auto cpu = static_cast<Cpu*>(ctx);
 
-    cpu->Parked.Set(1);
+    cpu->parked_.set(1);
 
-    Hal::HaltForever();
+    hal::halt_forever();
 }
 
-static void TlbFlushFunc(void* ctx, Context* ipiCtx)
+static void tlb_flush_func(void* ctx, Context* ipi_ctx)
 {
     (void)ctx;
-    (void)ipiCtx;
-    Mm::PageTable::InvalidateLocalTlb();
+    (void)ipi_ctx;
+    mm::PageTable::invalidate_local_tlb();
 }
 
 struct TlbRangeCtx
 {
-    ulong VirtAddr;
-    ulong Count;
+    ulong virt_addr;
+    ulong count;
 };
 
-static void TlbFlushRangeFunc(void* ctx, Context* ipiCtx)
+static void tlb_flush_range_func(void* ctx, Context* ipi_ctx)
 {
-    (void)ipiCtx;
+    (void)ipi_ctx;
     auto* rc = (TlbRangeCtx*)ctx;
-    Mm::PageTable::InvalidateLocalTlbRange(rc->VirtAddr, rc->Count);
+    mm::PageTable::invalidate_local_tlb_range(rc->virt_addr, rc->count);
 }
 
 /* Build a running-CPU mask excluding the local CPU and exited CPUs. */
-ulong CpuTable::GetRemoteCpuMask()
+ulong CpuTable::get_remote_cpu_mask()
 {
-    ulong localId = GetCurrentCpuId();
-    ulong cpuMask = GetRunningCpus() & ~(1UL << localId);
+    ulong local_id = get_current_cpu_id();
+    ulong cpu_mask = get_running_cpus() & ~(1UL << local_id);
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if ((cpuMask & (1UL << i)) && CpuArray[i].IsParked())
-            cpuMask &= ~(1UL << i);
+        if ((cpu_mask & (1UL << i)) && cpu_array_[i].is_parked())
+            cpu_mask &= ~(1UL << i);
     }
 
-    return cpuMask;
+    return cpu_mask;
 }
 
-void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
+void CpuTable::send_tlb_ipi(ulong cpu_mask, IPITask tasks[MAX_CPUS])
 {
     /* A shootdown that never completes means some CPU cannot take the IPI,
        and in this kernel that has exactly one cause: it is spinning on a
@@ -365,28 +365,28 @@ void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
        in the network path, no way to report it either. Ten seconds is far
        past any legitimate round of IPIs; name the CPUs that never answered
        and panic, which at least prints and can be read afterwards. */
-    static const ulong AckTimeoutNs = 10 * Const::NanoSecsInSec;
+    static const ulong ACK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (cpuMask & (1UL << i))
-            CpuArray[i].QueueIPITaskAsync(tasks[i]);
+        if (cpu_mask & (1UL << i))
+            cpu_array_[i].queue_ipi_task_async(tasks[i]);
     }
 
-    Stdlib::Time deadline = GetBootTime() + Stdlib::Time(AckTimeoutNs);
+    stdlib::Time deadline = get_boot_time() + stdlib::Time(ACK_TIMEOUT_NS);
     ulong silent = 0;
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (!(cpuMask & (1UL << i)))
+        if (!(cpu_mask & (1UL << i)))
         {
-            tasks[i].Completion.Done();
+            tasks[i].completion.done();
             continue;
         }
 
-        while (tasks[i].Completion.GetCounter() != 0)
+        while (tasks[i].completion.get_counter() != 0)
         {
-            if (GetBootTime() >= deadline)
+            if (get_boot_time() >= deadline)
             {
                 silent |= (1UL << i);
                 break;
@@ -398,143 +398,143 @@ void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
                own next tick, and a shootdown that the other CPUs answered in
                microseconds took a whole one -- on the path every Mm::Free
                with a mapping to drop goes down (see WaitGroup::Wait). */
-            YieldToRunnable();
+            yield_to_runnable();
         }
     }
 
     if (silent != 0)
-        Panic("TLB shootdown: cpus 0x%lX never acknowledged (asked 0x%lX)",
-            silent, cpuMask);
+        PANIC("TLB shootdown: cpus 0x%lX never acknowledged (asked 0x%lX)",
+            silent, cpu_mask);
 }
 
-void CpuTable::InvalidateTlbAll()
+void CpuTable::invalidate_tlb_all()
 {
-    Mm::PageTable::InvalidateLocalTlb();
+    mm::PageTable::invalidate_local_tlb();
 
-    if (!Hal::TlbShootdownNeedsIpi())
+    if (!hal::tlb_shootdown_needs_ipi())
         return; /* the local TLBI already broadcast to all CPUs */
 
-    ulong cpuMask = GetRemoteCpuMask();
-    if (cpuMask == 0)
+    ulong cpu_mask = get_remote_cpu_mask();
+    if (cpu_mask == 0)
         return;
 
-    IPITask tasks[MaxCpus];
+    IPITask tasks[MAX_CPUS];
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (cpuMask & (1UL << i))
-            tasks[i].Function = TlbFlushFunc;
+        if (cpu_mask & (1UL << i))
+            tasks[i].function = tlb_flush_func;
     }
 
-    SendTlbIPI(cpuMask, tasks);
+    send_tlb_ipi(cpu_mask, tasks);
 }
 
-void CpuTable::InvalidateTlbAddress(ulong virtAddr)
+void CpuTable::invalidate_tlb_address(ulong virt_addr)
 {
-    Mm::PageTable::InvalidateLocalTlbAddress(virtAddr);
+    mm::PageTable::invalidate_local_tlb_address(virt_addr);
 
-    if (!Hal::TlbShootdownNeedsIpi())
+    if (!hal::tlb_shootdown_needs_ipi())
         return;
 
-    ulong cpuMask = GetRemoteCpuMask();
-    if (cpuMask == 0)
+    ulong cpu_mask = get_remote_cpu_mask();
+    if (cpu_mask == 0)
         return;
 
     TlbRangeCtx rc;
-    rc.VirtAddr = virtAddr;
-    rc.Count = 1;
+    rc.virt_addr = virt_addr;
+    rc.count = 1;
 
-    IPITask tasks[MaxCpus];
+    IPITask tasks[MAX_CPUS];
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (cpuMask & (1UL << i))
+        if (cpu_mask & (1UL << i))
         {
-            tasks[i].Function = TlbFlushRangeFunc;
-            tasks[i].Ctx = &rc;
+            tasks[i].function = tlb_flush_range_func;
+            tasks[i].ctx = &rc;
         }
     }
 
-    SendTlbIPI(cpuMask, tasks);
+    send_tlb_ipi(cpu_mask, tasks);
 }
 
-void CpuTable::InvalidateTlbRange(ulong virtAddr, ulong count)
+void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
 {
-    Mm::PageTable::InvalidateLocalTlbRange(virtAddr, count);
+    mm::PageTable::invalidate_local_tlb_range(virt_addr, count);
 
-    if (!Hal::TlbShootdownNeedsIpi())
+    if (!hal::tlb_shootdown_needs_ipi())
         return;
 
-    ulong cpuMask = GetRemoteCpuMask();
-    if (cpuMask == 0)
+    ulong cpu_mask = get_remote_cpu_mask();
+    if (cpu_mask == 0)
         return;
 
     TlbRangeCtx rc;
-    rc.VirtAddr = virtAddr;
-    rc.Count = count;
+    rc.virt_addr = virt_addr;
+    rc.count = count;
 
-    IPITask tasks[MaxCpus];
+    IPITask tasks[MAX_CPUS];
 
-    for (ulong i = 0; i < MaxCpus; i++)
+    for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        if (cpuMask & (1UL << i))
+        if (cpu_mask & (1UL << i))
         {
-            tasks[i].Function = TlbFlushRangeFunc;
-            tasks[i].Ctx = &rc;
+            tasks[i].function = tlb_flush_range_func;
+            tasks[i].ctx = &rc;
         }
     }
 
-    SendTlbIPI(cpuMask, tasks);
+    send_tlb_ipi(cpu_mask, tasks);
 }
 
-void Cpu::IPI(Context* ctx)
+void Cpu::ipi(Context* ctx)
 {
-    IPIConter.Inc();
+    ipi_conter_.inc();
 
-    ProcessIPITasks(ctx);
+    process_ipi_tasks(ctx);
 
-    if (Panicker::GetInstance().IsActive())
+    if (Panicker::get_instance().is_active())
     {
-        OnPanic();
+        on_panic();
         return;
     }
 
     bool exit;
     {
-        Stdlib::AutoLock lock(Lock);
-        exit = (State & StateExiting) ? true : false;
+        stdlib::AutoLock lock(lock_);
+        exit = (state_ & STATE_EXITING) ? true : false;
     }
 
     if (exit)
     {
-        Trace(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
-            Index, State, IPIConter.Get());
+        trace(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
+            index_, state_, ipi_conter_.get());
 
         /* Complete any IPI tasks queued during the exit transition and refuse
            future ones, so a CPU that queued work to us never waits forever. */
-        DrainAndCloseIPITasks(ctx);
+        drain_and_close_ipi_tasks(ctx);
 
-        Park();
+        park();
     }
 
     /* The periodic work moved to this CPU's own timer (Cpu::TimerTick).
        While that timer is running the IPI carries only queued work; on a
        machine where it could not be calibrated, the tick still arrives here
        as a broadcast from whichever CPU owns the HPET. */
-    if (!CpuTable::GetInstance().HasPerCpuTimer())
+    if (!CpuTable::get_instance().has_per_cpu_timer())
     {
-        Watchdog::GetInstance().Check();
+        Watchdog::get_instance().check();
 
         /* Index is the LAPIC APIC ID; the BSP's is not necessarily 0 */
-        if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
-            TimerTable::GetInstance().ProcessTimers();
+        if (index_ == CpuTable::get_instance().get_bsp_index_no_lock())
+            TimerTable::get_instance().process_timers();
     }
 
-    Hal::IrqEoi(CpuTable::IPIVector);
+    hal::irq_eoi(CpuTable::IPI_VECTOR);
 
     /* Not Schedule(): a task this lands on while it can still run keeps the
        CPU -- see Preempt */
-    Preempt();
+    preempt();
 }
 
 /* The local timer, one-shot. It used to tick periodically and nothing else,
@@ -545,80 +545,80 @@ void Cpu::IPI(Context* ctx)
    deadline on this CPU, and the scheduler's walk that follows runs the
    sleeper. The tick keeps its grid and its work; a deadline's interrupt only
    reschedules. */
-void Cpu::LocalTimerStart()
+void Cpu::local_timer_start()
 {
-    ulong flags = Hal::IrqSave();
-    ulong now = GetBootTime().GetValue();
+    ulong flags = hal::irq_save();
+    ulong now = get_boot_time().get_value();
 
-    TimerOneShot = true;
-    TickDue = now + TickPeriodNs;
-    LocalTimerArm(TickDue, now);
+    timer_one_shot_ = true;
+    tick_due_ = now + TICK_PERIOD_NS;
+    local_timer_arm(tick_due_, now);
 
-    Hal::IrqRestore(flags);
+    hal::irq_restore(flags);
 }
 
-void Cpu::LocalTimerArm(ulong when, ulong now)
+void Cpu::local_timer_arm(ulong when, ulong now)
 {
     ulong delta = (when > now) ? when - now : 0;
 
     /* Never further than a tick and its slack, whatever `when` says: a
        clock that stepped back would otherwise leave the CPU without a tick. */
-    delta = Stdlib::Max(delta, TimerMinNs);
-    delta = Stdlib::Min(delta, TickPeriodNs + TickSlackNs);
+    delta = stdlib::max(delta, TIMER_MIN_NS);
+    delta = stdlib::min(delta, TICK_PERIOD_NS + TICK_SLACK_NS);
 
-    TimerArmedAt = now + delta;
-    Hal::LocalTimerArm(delta);
+    timer_armed_at_ = now + delta;
+    hal::local_timer_arm(delta);
 }
 
-bool Cpu::LocalTimerFired(ulong now)
+bool Cpu::local_timer_fired(ulong now)
 {
-    if (!TimerOneShot)
+    if (!timer_one_shot_)
         return true;
 
-    bool tick = (now + TickSlackNs >= TickDue);
+    bool tick = (now + TICK_SLACK_NS >= tick_due_);
     if (tick)
     {
         /* On the grid; a tick missed -- interrupts off a long while -- is
            not made up, the next one a period from now */
-        TickDue += TickPeriodNs;
-        if (TickDue <= now)
-            TickDue = now + TickPeriodNs;
+        tick_due_ += TICK_PERIOD_NS;
+        if (tick_due_ <= now)
+            tick_due_ = now + TICK_PERIOD_NS;
     }
 
     /* The tick, for now: a sleeper's deadline sooner than it is brought
        forward by the walk the reschedule after this makes, under the queue
        lock it takes anyway (TaskQueue::Schedule) -- not from here, with
        interrupts off and whatever this CPU was doing interrupted. */
-    LocalTimerArm(TickDue, now);
-    TimerWalk = true;
+    local_timer_arm(tick_due_, now);
+    timer_walk_ = true;
 
     return tick;
 }
 
-bool Cpu::LocalTimerTakeWalk()
+bool Cpu::local_timer_take_walk()
 {
-    bool walk = TimerWalk;
-    TimerWalk = false;
+    bool walk = timer_walk_;
+    timer_walk_ = false;
     return walk;
 }
 
-void Cpu::LocalTimerWake(ulong deadline)
+void Cpu::local_timer_wake(ulong deadline)
 {
-    if (!TimerOneShot || deadline == 0 || deadline >= TimerArmedAt)
+    if (!timer_one_shot_ || deadline == 0 || deadline >= timer_armed_at_)
         return;
 
-    LocalTimerArm(deadline, GetBootTime().GetValue());
+    local_timer_arm(deadline, get_boot_time().get_value());
 }
 
-void Cpu::LocalTimerTick()
+void Cpu::local_timer_tick()
 {
-    if (!TimerOneShot)
+    if (!timer_one_shot_)
         return;
 
-    ulong now = GetBootTime().GetValue();
-    if (TickDue <= now)
-        TickDue = now + TickPeriodNs;
-    LocalTimerArm(TickDue, now);
+    ulong now = get_boot_time().get_value();
+    if (tick_due_ <= now)
+        tick_due_ = now + TICK_PERIOD_NS;
+    local_timer_arm(tick_due_, now);
 }
 
 /* This CPU's own tick. One interrupt per CPU delivered by its own local
@@ -628,37 +628,37 @@ void Cpu::LocalTimerTick()
    interrupts. A CPU that wedges now stops only its own tick, and the others
    go on ticking and notice. One-shot, and also for a sleeper's deadline
    (LocalTimerStart): such an interrupt only reschedules. */
-void Cpu::TimerTick(Context* ctx)
+void Cpu::timer_tick(Context* ctx)
 {
-    if (Panicker::GetInstance().IsActive())
+    if (Panicker::get_instance().is_active())
     {
         /* Ticking on, as the periodic timer did, without the walk: the
            queue's lock may be the panicking CPU's */
-        LocalTimerTick();
-        Hal::IrqEoi(CpuTable::TimerVector);
+        local_timer_tick();
+        hal::irq_eoi(CpuTable::TIMER_VECTOR);
         return;
     }
 
-    if (!LocalTimerFired(GetBootTime().GetValue()))
+    if (!local_timer_fired(get_boot_time().get_value()))
     {
-        InterruptStats::Inc(IrqTimerWake);
-        Hal::IrqEoi(CpuTable::TimerVector);
-        Preempt();
+        InterruptStats::inc(IrqTimerWake);
+        hal::irq_eoi(CpuTable::TIMER_VECTOR);
+        preempt();
         return;
     }
 
-    InterruptStats::Inc(IrqLapicTimer);
+    InterruptStats::inc(IrqLapicTimer);
 
-    Watchdog::GetInstance().Check();
+    Watchdog::get_instance().check();
 
-    Profiler::GetInstance().Tick(ctx);
+    Profiler::get_instance().tick(ctx);
 
     /* Software timers stay on one CPU: they are a handful of periodic
        callbacks, not a per-CPU wheel, and running them everywhere would
        just fire each one N times. */
-    if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
+    if (index_ == CpuTable::get_instance().get_bsp_index_no_lock())
     {
-        TimerTable::GetInstance().ProcessTimers();
+        TimerTable::get_instance().process_timers();
 
         /* And offer the receive path a look, whether or not a NIC asked.
            The network layer takes it only with rxpoll=on -- the switch is
@@ -669,183 +669,183 @@ void Cpu::TimerTick(Context* ctx)
     /* Repairs a wakeup that went missing, and nothing else -- see
        SoftIrq::TickKick. Before the reschedule below, so the kick has an
        effect on this very tick. */
-    SoftIrq::GetInstance().TickKick(Index);
+    SoftIrq::get_instance().tick_kick(index_);
 
-    Hal::IrqEoi(CpuTable::TimerVector);
+    hal::irq_eoi(CpuTable::TIMER_VECTOR);
 
     /* Round-robin among the runnable, and never the idle task over a task
        that can still run -- see Preempt */
-    Preempt();
+    preempt();
 }
 
-void Cpu::QueueIPITaskAsync(IPITask& task)
+void Cpu::queue_ipi_task_async(IPITask& task)
 {
-    ulong flags = IPITaskLock.LockIrqSave();
-    bool closed = IPITasksClosed;
+    ulong flags = ipi_task_lock_.lock_irq_save();
+    bool closed = ipi_tasks_closed_;
     if (!closed)
-        IPITaskList.InsertTail(&task.ListEntry);
-    IPITaskLock.UnlockIrqRestore(flags);
+        ipi_task_list_.insert_tail(&task.list_entry);
+    ipi_task_lock_.unlock_irq_restore(flags);
 
     if (closed)
     {
         /* Target CPU has stopped processing IPI tasks (exiting/exited); the
            task will never run there, so complete it now to unblock the waiter
            instead of leaving it queued forever. */
-        task.Completion.Done();
+        task.completion.done();
         return;
     }
 
-    SendIPISelf();
+    send_ipi_self();
 }
 
-void Cpu::QueueIPITask(IPITask& task)
+void Cpu::queue_ipi_task(IPITask& task)
 {
-    QueueIPITaskAsync(task);
-    task.Completion.Wait();
+    queue_ipi_task_async(task);
+    task.completion.wait();
 }
 
-void Cpu::ProcessIPITasks(Context* ctx)
+void Cpu::process_ipi_tasks(Context* ctx)
 {
-    Stdlib::ListEntry localList;
-    localList.Init();
+    stdlib::ListEntry local_list;
+    local_list.init();
 
-    ulong flags = IPITaskLock.LockIrqSave();
-    localList.MoveTailList(&IPITaskList);
-    IPITaskLock.UnlockIrqRestore(flags);
+    ulong flags = ipi_task_lock_.lock_irq_save();
+    local_list.move_tail_list(&ipi_task_list_);
+    ipi_task_lock_.unlock_irq_restore(flags);
 
-    while (!localList.IsEmpty())
+    while (!local_list.is_empty())
     {
-        auto* entry = localList.RemoveHead();
-        IPITask* task = CONTAINING_RECORD(entry, IPITask, ListEntry);
-        task->Function(task->Ctx, ctx);
-        task->Completion.Done();
+        auto* entry = local_list.remove_head();
+        IPITask* task = CONTAINING_RECORD(entry, IPITask, list_entry);
+        task->function(task->ctx, ctx);
+        task->completion.done();
     }
 }
 
-void Cpu::DrainAndCloseIPITasks(Context* ctx)
+void Cpu::drain_and_close_ipi_tasks(Context* ctx)
 {
-    Stdlib::ListEntry localList;
-    localList.Init();
+    stdlib::ListEntry local_list;
+    local_list.init();
 
     /* Close the queue and take everything still on it under the same lock, so
        a concurrent QueueIPITaskAsync either lands here (and is completed below)
        or observes the closed flag and self-completes -- never both, never
        neither. */
-    ulong flags = IPITaskLock.LockIrqSave();
-    IPITasksClosed = true;
-    localList.MoveTailList(&IPITaskList);
-    IPITaskLock.UnlockIrqRestore(flags);
+    ulong flags = ipi_task_lock_.lock_irq_save();
+    ipi_tasks_closed_ = true;
+    local_list.move_tail_list(&ipi_task_list_);
+    ipi_task_lock_.unlock_irq_restore(flags);
 
-    while (!localList.IsEmpty())
+    while (!local_list.is_empty())
     {
-        auto* entry = localList.RemoveHead();
-        IPITask* task = CONTAINING_RECORD(entry, IPITask, ListEntry);
-        task->Function(task->Ctx, ctx);
-        task->Completion.Done();
+        auto* entry = local_list.remove_head();
+        IPITask* task = CONTAINING_RECORD(entry, IPITask, list_entry);
+        task->function(task->ctx, ctx);
+        task->completion.done();
     }
 }
 
-TaskQueue& Cpu::GetTaskQueue()
+TaskQueue& Cpu::get_task_queue()
 {
-    return TaskQueue;
+    return task_queue_;
 }
 
-extern "C" void IPInterrupt(Context* ctx)
+extern "C" void ip_interrupt(Context* ctx)
 {
-    InterruptStats::Inc(IrqIPI);
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.IPI(ctx);
+    InterruptStats::inc(IrqIPI);
+    auto& cpu = CpuTable::get_instance().get_current_cpu();
+    cpu.ipi(ctx);
 }
 
 /* A posted interrupt's notification that found its vCPU out of its guest
    (Hal::PostedVector): the vCPU folds what was posted for it into its APIC
    before it next enters, so there is nothing to do but end the interrupt. */
-extern "C" void PostedInterrupt(Context* ctx)
+extern "C" void posted_interrupt(Context* ctx)
 {
     (void)ctx;
-    InterruptStats::Inc(IrqPosted);
-    Hal::IrqEoi(Hal::PostedVector);
+    InterruptStats::inc(IrqPosted);
+    hal::irq_eoi(hal::POSTED_VECTOR);
 }
 
-extern "C" void LapicTimerInterrupt(Context* ctx)
+extern "C" void lapic_timer_interrupt(Context* ctx)
 {
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.TimerTick(ctx);
+    auto& cpu = CpuTable::get_instance().get_current_cpu();
+    cpu.timer_tick(ctx);
 }
 
-void Cpu::SendIPISelf()
+void Cpu::send_ipi_self()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (BugOn(!(State & Cpu::StateRunning)))
+    if (BUG_ON(!(state_ & Cpu::STATE_RUNNING)))
         return;
 
-    if (IsParked())
+    if (is_parked())
         return;
 
-    Hal::SendIpi(Index, CpuTable::IPIVector);
+    hal::send_ipi(index_, CpuTable::IPI_VECTOR);
 }
 
-void CpuTable::SendIPI(ulong index)
+void CpuTable::send_ipi(ulong index)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
+    if (BUG_ON(index >= stdlib::array_size(cpu_array_)))
         return;
 
-    auto& cpu = CpuArray[index];
-    cpu.SendIPISelf();
+    auto& cpu = cpu_array_[index];
+    cpu.send_ipi_self();
 }
 
-bool CpuTable::HasPerCpuTimer()
+bool CpuTable::has_per_cpu_timer()
 {
-    return PerCpuTimer;
+    return per_cpu_timer_;
 }
 
-void CpuTable::SetPerCpuTimer()
+void CpuTable::set_per_cpu_timer()
 {
-    PerCpuTimer = true;
+    per_cpu_timer_ = true;
 }
 
-ulong CpuTable::GetRunningCpusNoLock()
+ulong CpuTable::get_running_cpus_no_lock()
 {
-    return (ulong)RunningMaskCached.Get();
+    return (ulong)running_mask_cached_.get();
 }
 
-void CpuTable::NoteCpuRunning(ulong index)
+void CpuTable::note_cpu_running(ulong index)
 {
-    if (index >= MaxCpus)
+    if (index >= MAX_CPUS)
         return;
 
     ulong bit = 1UL << index;
     for (;;)
     {
-        ulong old = (ulong)RunningMaskCached.Get();
+        ulong old = (ulong)running_mask_cached_.get();
         if ((old & bit) != 0)
             return;
 
-        if ((ulong)RunningMaskCached.Cmpxchg((long)(old | bit), (long)old) == old)
+        if ((ulong)running_mask_cached_.cmpxchg((long)(old | bit), (long)old) == old)
             return;
     }
 }
 
-ulong CpuTable::GetRunningCpus()
+ulong CpuTable::get_running_cpus()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     ulong result = 0;
-    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
     {
-        auto& cpu = CpuArray[i];
-        if (cpu.GetState() & Cpu::StateRunning)
+        auto& cpu = cpu_array_[i];
+        if (cpu.get_state() & Cpu::STATE_RUNNING)
             result |= 1UL << i;
     }
 
-    RunningMaskCached.Set((long)result);
+    running_mask_cached_.set((long)result);
     return result;
 }
 
-void CpuTable::Reset()
+void CpuTable::reset()
 {
     /* An exited task's last reference is dropped by its CPU's idle loop
        (TaskQueue::ReapExited), and once the halt has begun no CPU idles
@@ -854,32 +854,32 @@ void CpuTable::Reset()
        leaks -- the soft IRQ tasks among them, stopped moments before the
        halt. Before the table lock: freeing a task frees its stack, and the
        TLB shootdown for that reads the running CPUs under this lock. */
-    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
-        CpuArray[i].GetTaskQueue().ReapExited();
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
+        cpu_array_[i].get_task_queue().reap_exited();
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
+    for (ulong i = 0; i < stdlib::array_size(cpu_array_); i++)
     {
-        auto& cpu = CpuArray[i];
-        cpu.Reset();
+        auto& cpu = cpu_array_[i];
+        cpu.reset();
     }
 }
 
-bool Cpu::Run(Task::Func func, void *ctx)
+bool Cpu::run(Task::Func func, void *ctx)
 {
-    char name[TaskNameLen];
-    Stdlib::SnPrintf(name, sizeof(name), "idle%lu", Index);
-    IdleTaskPtr = Mm::TAlloc<Task, Tag>(name);
-    if (IdleTaskPtr == nullptr)
+    char name[TASK_NAME_LEN];
+    stdlib::sn_printf(name, sizeof(name), "idle%lu", index_);
+    idle_task_ptr_ = mm::talloc<Task, TAG>(name);
+    if (idle_task_ptr_ == nullptr)
     {
         return false;
     }
 
-    IdleTaskPtr->SetCpuAffinity(1UL << Index);
-    IdleTaskPtr->SetIdle();
+    idle_task_ptr_->set_cpu_affinity(1UL << index_);
+    idle_task_ptr_->set_idle();
 
-    return IdleTaskPtr->Run(TaskQueue, func, ctx);
+    return idle_task_ptr_->run(task_queue_, func, ctx);
 }
 
 }

@@ -18,13 +18,13 @@
 // the cheap one. Both can legitimately fail -- the entropy behind them is
 // finite and shared with every other core -- so both report it.
 
-namespace Hal
+namespace hal
 {
 
 /* Once, on the BSP, before the calls below: reads the capability bits and
    honors hwrng=off. Reading a random instruction the CPU does not implement
    is an undefined-instruction trap, so nothing here may run before it. */
-void ProbeHwRandom();
+void probe_hw_random();
 
 /* Which instruction this CPU has, as the probe found it: what the pool names
    the source by. The values cross to Rust (kernel_hw_random_kind). */
@@ -36,13 +36,13 @@ enum class HwRandomKind : u32
     Rndr = 3,       /* arm64, RNDR and RNDRRS */
 };
 
-HwRandomKind GetHwRandomKind();
+HwRandomKind get_hw_random_kind();
 
 /* Whitened output; false if the CPU would not produce one. */
-bool HwRandom(u64& out);
+bool hw_random(u64& out);
 
 /* Raw conditioned entropy where the CPU has a separate instruction for it,
    otherwise the whitened output. */
-bool HwRandomSeed(u64& out);
+bool hw_random_seed(u64& out);
 
 }

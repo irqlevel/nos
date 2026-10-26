@@ -2,40 +2,40 @@
 
 #include <include/types.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 struct ListEntry final
 {
-    struct ListEntry *Flink;
-    struct ListEntry *Blink;
+    struct ListEntry *flink;
+    struct ListEntry *blink;
 
     ListEntry();
 
-    void Init();
+    void init();
 
-    bool IsEmpty();
+    bool is_empty();
 
-    bool Remove();
+    bool remove();
 
-    bool RemoveInit();
+    bool remove_init();
 
-    ListEntry* RemoveHead();
+    ListEntry* remove_head();
 
-    ListEntry* RemoveTail();
+    ListEntry* remove_tail();
 
-    void InsertTail(ListEntry* entry);
+    void insert_tail(ListEntry* entry);
 
-    void AppendTail(ListEntry* listToAppend);
+    void append_tail(ListEntry* list_to_append);
 
-    void InsertHead(ListEntry* Entry);
+    void insert_head(ListEntry* entry);
 
-    void MoveTailList(ListEntry* list);
+    void move_tail_list(ListEntry* list);
 
     ListEntry(ListEntry&& other);
     ListEntry& operator=(ListEntry&& other);
 
-    size_t CountEntries();
+    size_t count_entries();
 
 private:
     ListEntry(const ListEntry& other) = delete;

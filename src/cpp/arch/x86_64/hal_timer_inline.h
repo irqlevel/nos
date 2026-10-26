@@ -6,12 +6,12 @@
 // x86_64 body for Hal::LocalTimerArm (see hal/timer.h): the local APIC's
 // timer, one-shot.
 
-namespace Hal
+namespace hal
 {
 
-static inline __attribute__((always_inline)) void LocalTimerArm(ulong deltaNs)
+static inline __attribute__((always_inline)) void local_timer_arm(ulong delta_ns)
 {
-    Kernel::Lapic::ArmTimer(deltaNs);
+    kernel::Lapic::arm_timer(delta_ns);
 }
 
 }

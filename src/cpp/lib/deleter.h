@@ -1,6 +1,6 @@
 #pragma once
 
-namespace Stdlib
+namespace stdlib
 {
 
 template<typename T>

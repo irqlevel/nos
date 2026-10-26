@@ -1,17 +1,17 @@
 #include "interrupt.h"
 
-namespace Kernel
+namespace kernel
 {
 
-Atomic InterruptStats::Counters[IrqMax];
+Atomic InterruptStats::counters_[IrqMax];
 
-void InterruptStats::Inc(InterruptSource src)
+void InterruptStats::inc(InterruptSource src)
 {
     if (src < IrqMax)
-        Counters[src].Inc();
+        counters_[src].inc();
 }
 
-const char* InterruptStats::GetName(InterruptSource src)
+const char* InterruptStats::get_name(InterruptSource src)
 {
     switch (src)
     {
@@ -31,10 +31,10 @@ const char* InterruptStats::GetName(InterruptSource src)
     }
 }
 
-long InterruptStats::Get(InterruptSource src)
+long InterruptStats::get(InterruptSource src)
 {
     if (src < IrqMax)
-        return Counters[src].Get();
+        return counters_[src].get();
     return 0;
 }
 

@@ -2,277 +2,277 @@ BITS 64
 
 section .text
 
-extern DummyInterruptDispatch
-extern SpuriousInterrupt
-extern IO8042Interrupt
-extern SerialInterrupt
-extern PitInterrupt
-extern HpetInterrupt
-extern IPInterrupt
-extern LapicTimerInterrupt
-extern PostedInterrupt
-extern SharedInterrupt
-extern RustInterruptDispatch
-extern RustMsixDispatch
+extern dummy_interrupt_dispatch
+extern spurious_interrupt
+extern io8042_interrupt
+extern serial_interrupt
+extern pit_interrupt
+extern hpet_interrupt
+extern ip_interrupt
+extern lapic_timer_interrupt
+extern posted_interrupt
+extern shared_interrupt
+extern dispatch_rust_interrupt
+extern dispatch_rust_msix
 
-extern ExcDivideByZero
-extern ExcDebugger
-extern ExcNMI
-extern ExcBreakpoint
-extern ExcOverflow
-extern ExcBounds
-extern ExcInvalidOpcode
-extern ExcCoprocessorNotAvailable
-extern ExcDoubleFault
-extern ExcCoprocessorSegmentOverrun
-extern ExcInvalidTaskStateSegment
-extern ExcSegmentNotPresent
-extern ExcStackFault
-extern ExcGeneralProtectionFault
-extern ExcPageFault
-extern ExcReserved
-extern ExcMathFault
-extern ExcAlignmentCheck
-extern ExcMachineCheck
-extern ExcSIMDFpException
-extern ExcVirtException
-extern ExcControlProtection
+extern exc_divide_by_zero
+extern exc_debugger
+extern exc_nmi
+extern exc_breakpoint
+extern exc_overflow
+extern exc_bounds
+extern exc_invalid_opcode
+extern exc_coprocessor_not_available
+extern exc_double_fault
+extern exc_coprocessor_segment_overrun
+extern exc_invalid_task_state_segment
+extern exc_segment_not_present
+extern exc_stack_fault
+extern exc_general_protection_fault
+extern exc_page_fault
+extern exc_reserved
+extern exc_math_fault
+extern exc_alignment_check
+extern exc_machine_check
+extern exc_simd_fp_exception
+extern exc_virt_exception
+extern exc_control_protection
 
-global GetCr0
-global GetCr1
-global GetCr2
-global GetCr3
-global GetCr4
-global SetCr3
-global GetRsp
-global GetRbp
-global GetRip
-global GetRflags
-global SetRflags
-global Pause
-global GetCs
-global GetDs
-global GetSs
-global GetEs
-global GetFs
-global GetGs
-global LoadIdt
-global StoreIdt
-global LoadGdt
-global StoreGdt
-global LoadTr
-global SpinLockLock
-global SpinLockUnlock
-global Outb
-global Inb
-global Outw
-global Inw
-global Out
-global In
-global ReadMsr
-global WriteMsr
-global InterruptEnable
-global InterruptDisable
-global Hlt
-global SetRsp
-global SetRbp
-global ReadTsc
-global ReadTscp
-global CpuidCall
+global get_cr0
+global get_cr1
+global get_cr2
+global get_cr3
+global get_cr4
+global set_cr3
+global get_rsp
+global get_rbp
+global get_rip
+global get_rflags
+global set_rflags
+global cpu_relax
+global get_cs
+global get_ds
+global get_ss
+global get_es
+global get_fs
+global get_gs
+global load_idt
+global store_idt
+global load_gdt
+global store_gdt
+global load_tr
+global spin_lock_lock
+global spin_lock_unlock
+global outb
+global inb
+global outw
+global inw
+global outl
+global inl
+global read_msr
+global write_msr
+global interrupt_enable
+global interrupt_disable
+global cpu_halt
+global set_rsp
+global set_rbp
+global read_tsc
+global read_tscp
+global cpuid_call
 
-global SwitchContext
+global switch_context
 
-global AtomicInc
-global AtomicDec
-global AtomicAdd
-global AtomicRead
-global AtomicWrite
-global AtomicReadAndDec
-global AtomicReadAndInc
-global AtomicTestAndSetBit
-global AtomicTestAndClearBit
-global AtomicTestBit
-global AtomicCmpxchg
+global atomic_inc
+global atomic_dec
+global atomic_add
+global atomic_read
+global atomic_write
+global atomic_read_and_dec
+global atomic_read_and_inc
+global atomic_test_and_set_bit
+global atomic_test_and_clear_bit
+global atomic_test_bit
+global atomic_cmpxchg
 
-global DummyInterruptStubTable
-global SpuriousInterruptStub
-global IO8042InterruptStub
-global SerialInterruptStub
-global PitInterruptStub
-global HpetInterruptStub
-global IPInterruptStub
-global LapicTimerInterruptStub
-global PostedInterruptStub
-global SharedInterruptStub
-global RustInterruptStub0
-global RustInterruptStub1
-global RustInterruptStub2
-global RustInterruptStub3
-global RustInterruptStub4
-global RustInterruptStub5
-global RustInterruptStub6
-global RustInterruptStub7
-global RustMsixStub0
-global RustMsixStub1
-global RustMsixStub2
-global RustMsixStub3
-global RustMsixStub4
-global RustMsixStub5
-global RustMsixStub6
-global RustMsixStub7
-global RustMsixStub8
-global RustMsixStub9
-global RustMsixStub10
-global RustMsixStub11
-global RustMsixStub12
-global RustMsixStub13
-global RustMsixStub14
-global RustMsixStub15
-global RustMsixStub16
-global RustMsixStub17
-global RustMsixStub18
-global RustMsixStub19
-global RustMsixStub20
-global RustMsixStub21
-global RustMsixStub22
-global RustMsixStub23
-global RustMsixStub24
-global RustMsixStub25
-global RustMsixStub26
-global RustMsixStub27
-global RustMsixStub28
-global RustMsixStub29
-global RustMsixStub30
-global RustMsixStub31
+global dummy_interrupt_stub_table
+global spurious_interrupt_stub
+global io8042_interrupt_stub
+global serial_interrupt_stub
+global pit_interrupt_stub
+global hpet_interrupt_stub
+global ip_interrupt_stub
+global lapic_timer_interrupt_stub
+global posted_interrupt_stub
+global shared_interrupt_stub
+global rust_interrupt_stub0
+global rust_interrupt_stub1
+global rust_interrupt_stub2
+global rust_interrupt_stub3
+global rust_interrupt_stub4
+global rust_interrupt_stub5
+global rust_interrupt_stub6
+global rust_interrupt_stub7
+global rust_msix_stub0
+global rust_msix_stub1
+global rust_msix_stub2
+global rust_msix_stub3
+global rust_msix_stub4
+global rust_msix_stub5
+global rust_msix_stub6
+global rust_msix_stub7
+global rust_msix_stub8
+global rust_msix_stub9
+global rust_msix_stub10
+global rust_msix_stub11
+global rust_msix_stub12
+global rust_msix_stub13
+global rust_msix_stub14
+global rust_msix_stub15
+global rust_msix_stub16
+global rust_msix_stub17
+global rust_msix_stub18
+global rust_msix_stub19
+global rust_msix_stub20
+global rust_msix_stub21
+global rust_msix_stub22
+global rust_msix_stub23
+global rust_msix_stub24
+global rust_msix_stub25
+global rust_msix_stub26
+global rust_msix_stub27
+global rust_msix_stub28
+global rust_msix_stub29
+global rust_msix_stub30
+global rust_msix_stub31
 
-global ExcDivideByZeroStub
-global ExcDebuggerStub
-global ExcNMIStub
-global ExcBreakpointStub
-global ExcOverflowStub
-global ExcBoundsStub
-global ExcInvalidOpcodeStub
-global ExcCoprocessorNotAvailableStub
-global ExcDoubleFaultStub
-global ExcCoprocessorSegmentOverrunStub
-global ExcInvalidTaskStateSegmentStub
-global ExcSegmentNotPresentStub
-global ExcStackFaultStub
-global ExcGeneralProtectionFaultStub
-global ExcPageFaultStub
-global ExcReservedStub
-global ExcMathFaultStub
-global ExcAlignmentCheckStub
-global ExcMachineCheckStub
-global ExcSIMDFpExceptionStub
-global ExcVirtExceptionStub
-global ExcControlProtectionStub
-global SetJmp
-global LongJmp
+global exc_divide_by_zero_stub
+global exc_debugger_stub
+global exc_nmi_stub
+global exc_breakpoint_stub
+global exc_overflow_stub
+global exc_bounds_stub
+global exc_invalid_opcode_stub
+global exc_coprocessor_not_available_stub
+global exc_double_fault_stub
+global exc_coprocessor_segment_overrun_stub
+global exc_invalid_task_state_segment_stub
+global exc_segment_not_present_stub
+global exc_stack_fault_stub
+global exc_general_protection_fault_stub
+global exc_page_fault_stub
+global exc_reserved_stub
+global exc_math_fault_stub
+global exc_alignment_check_stub
+global exc_machine_check_stub
+global exc_simd_fp_exception_stub
+global exc_virt_exception_stub
+global exc_control_protection_stub
+global set_jmp
+global long_jmp
 
-GetCr0:
+get_cr0:
 	mov rax, cr0
 	ret
 
-GetCr1:
+get_cr1:
 	mov rax, cr1
 	ret
 
-GetCr2:
+get_cr2:
 	mov rax, cr2
 	ret
 
-GetCr3:
+get_cr3:
 	mov rax, cr3
 	ret
 
-SetCr3:
+set_cr3:
 	mov cr3, rdi
 	ret
 
-GetCr4:
+get_cr4:
 	mov rax, cr4
 	ret
 
-GetRbp:
+get_rbp:
     mov rax, rbp
     ret
 
-GetRsp:
+get_rsp:
 	mov rax, rsp
 	ret
 
-GetRip:
+get_rip:
 	call GetRipF
 GetRipF:
 	pop rax
 	ret
 
-GetRflags:
+get_rflags:
 	pushfq
 	pop rax
 	ret
 
-SetRflags:
+set_rflags:
 	push rdi
 	popfq
 	ret
 
-Pause:
+cpu_relax:
 	pause
 	ret
 
-GetCs:
+get_cs:
 	xor rax, rax
 	mov ax, cs
 	ret
 
-GetDs:
+get_ds:
 	xor rax, rax
 	mov ax, ds
 	ret
 
-GetSs:
+get_ss:
 	xor rax, rax
 	mov ax, ss
 	ret
 
-GetEs:
+get_es:
 	xor rax, rax
 	mov ax, es
 	ret
 
-GetFs:
+get_fs:
 	xor rax, rax
 	mov ax, fs
 	ret
 
-GetGs:
+get_gs:
 	xor rax, rax
 	mov ax, gs
 	ret
 
-StoreIdt:
+store_idt:
 	sidt [rdi]
 	ret
 
-LoadIdt:
+load_idt:
 	lidt [rdi]
 	ret
 
-StoreGdt:
+store_gdt:
 	sgdt [rdi]
 	ret
 
-LoadGdt:
+load_gdt:
 	lgdt [rdi]
 	ret
 
-LoadTr:
+load_tr:
 	ltr di
 	ret
 
-SpinLockLock:
+spin_lock_lock:
 	xor rsi, rsi
 	inc rsi
 .again:
@@ -284,12 +284,12 @@ SpinLockLock:
 .complete:
 	ret
 
-SpinLockUnlock:
+spin_lock_unlock:
 	xor rax, rax
 	lock and qword [rdi], rax
 	ret
 
-Outb:
+outb:
 	push rdx
 	mov rdx, rdi
 	mov rax, rsi
@@ -297,7 +297,7 @@ Outb:
 	pop rdx
 	ret
 
-Inb:
+inb:
 	push rdx
 	mov rdx, rdi
 	xor rax, rax
@@ -305,7 +305,7 @@ Inb:
 	pop rdx
 	ret
 
-Outw:
+outw:
 	push rdx
 	mov rdx, rdi
 	mov rax, rsi
@@ -313,7 +313,7 @@ Outw:
 	pop rdx
 	ret
 
-Inw:
+inw:
 	push rdx
 	mov rdx, rdi
 	xor rax, rax
@@ -321,7 +321,7 @@ Inw:
 	pop rdx
 	ret
 
-Out:
+outl:
 	push rdx
 	mov rdx, rdi
 	mov rax, rsi
@@ -329,7 +329,7 @@ Out:
 	pop rdx
 	ret
 
-In:
+inl:
 	push rdx
 	mov rdx, rdi
 	xor rax, rax
@@ -337,7 +337,7 @@ In:
 	pop rdx
 	ret
 
-ReadMsr: ;Read MSR specified by ECX into EDX:EAX.
+read_msr: ;Read MSR specified by ECX into EDX:EAX.
 	mov ecx, edi
 	rdmsr
 	shl rdx, 32
@@ -346,7 +346,7 @@ ReadMsr: ;Read MSR specified by ECX into EDX:EAX.
 	mov rax, rdx
 	ret
 
-WriteMsr: ;Write the value in EDX:EAX to MSR specified by ECX.
+write_msr: ;Write the value in EDX:EAX to MSR specified by ECX.
 	mov ecx, edi
 	mov rdx, rsi
 	mov eax, edx
@@ -354,36 +354,36 @@ WriteMsr: ;Write the value in EDX:EAX to MSR specified by ECX.
 	wrmsr
 	ret
 
-InterruptEnable:
+interrupt_enable:
 	sti
 	ret
 
-InterruptDisable:
+interrupt_disable:
 	cli
 	ret
 
-Hlt:
+cpu_halt:
 	hlt
 	ret
 
-SetRsp:
+set_rsp:
 	mov rax, [rsp] ; save return address
 	mov rsp, rdi
 	push rax
 	ret
 
-SetRbp:
+set_rbp:
     mov rbp, rdi
     ret
 
-ReadTsc:
+read_tsc:
 	rdtsc; result in edx:eax
 	shl rdx, 32
 	or rdx, rax
 	mov rax, rdx
 	ret
 
-ReadTscp:
+read_tscp:
 	; rdi - &cpuIndex
 	rdtscp; result in edx:eax, cpuIndex in ecx
 	mov qword [rdi], rcx
@@ -392,7 +392,7 @@ ReadTscp:
 	mov rax, rdx
 	ret
 
-CpuidCall:
+cpuid_call:
 	; rdi = leaf, rsi = subleaf, rdx = &CpuidResult
 	push rbx
 	mov eax, edi
@@ -450,7 +450,7 @@ CpuidCall:
 	add rsp, 8; simulate pop rsp(see push rsp in PushAll)
 %endmacro
 
-SwitchContext:
+switch_context:
 	;rdi = nextTask->Rsp
 	;rsi = &currTask->Rsp
 	;rdx = complete callback
@@ -464,15 +464,15 @@ SwitchContext:
 	PopAll
 	ret
 
-AtomicInc:
+atomic_inc:
 	lock inc qword [rdi]
 	ret
 
-AtomicDec:
+atomic_dec:
 	lock dec qword [rdi]
 	ret
 
-AtomicAdd:
+atomic_add:
 	; rdi = *pvalue, rsi = delta
 	lock xadd qword [rdi], rsi
 	ret
@@ -488,27 +488,27 @@ AtomicAdd:
 ; Nothing is weakened. The C++ mapping for x86-64 is SC-load = MOV, SC-store =
 ; XCHG, and AtomicWrite below is already `lock xchg`; the pair is what makes
 ; the ordering, not the load.
-AtomicRead:
+atomic_read:
 	mov rax, qword [rdi]
 	ret
 
-AtomicWrite:
+atomic_write:
 	lock xchg qword [rdi], rsi
 	ret
 
-AtomicReadAndDec:
+atomic_read_and_dec:
 	xor rax, rax
 	dec rax
 	lock xadd qword [rdi], rax
 	ret
 
-AtomicReadAndInc:
+atomic_read_and_inc:
 	xor rax, rax
 	inc rax
 	lock xadd qword [rdi], rax
 	ret
 
-AtomicTestAndSetBit:
+atomic_test_and_set_bit:
 	xor rax, rax
 	lock bts qword [rdi], rsi
 	jnc .return
@@ -516,7 +516,7 @@ AtomicTestAndSetBit:
 .return:
 	ret
 
-AtomicTestAndClearBit:
+atomic_test_and_clear_bit:
 	xor rax, rax
 	lock btr qword [rdi], rsi
 	jnc .return
@@ -524,7 +524,7 @@ AtomicTestAndClearBit:
 .return:
 	ret
 
-AtomicTestBit:
+atomic_test_bit:
 	xor rax, rax
 	bt qword [rdi], rsi
 	jnc .return
@@ -532,7 +532,7 @@ AtomicTestBit:
 .return:
 	ret
 
-AtomicCmpxchg:
+atomic_cmpxchg:
 	mov rax, rdx
 	lock cmpxchg qword [rdi], rsi
 	ret
@@ -555,17 +555,17 @@ AtomicCmpxchg:
 %endif
 
 %macro InterruptStub 1
-%1InterruptStub:
+%1_interrupt_stub:
 	PushAll
 	mov rdi, rsp
 	cld
-	call %1Interrupt
+	call %1_interrupt
 	PopAll
 	iretq
 %endmacro
 
 %macro ExceptionStub 1
-%1Stub:
+%1_stub:
 	PushAll
 	mov rdi, rsp
 	cld
@@ -575,7 +575,7 @@ AtomicCmpxchg:
 %endmacro
 
 %macro ExceptionStubErr 1
-%1Stub:
+%1_stub:
 	PushAll
 	mov rdi, rsp
 	cld
@@ -587,15 +587,15 @@ AtomicCmpxchg:
 	iretq
 %endmacro
 
-InterruptStub Spurious
-InterruptStub IO8042
-InterruptStub Serial
-InterruptStub Pit
-InterruptStub Hpet
-InterruptStub IP
-InterruptStub LapicTimer
-InterruptStub Posted
-InterruptStub Shared
+InterruptStub spurious
+InterruptStub io8042
+InterruptStub serial
+InterruptStub pit
+InterruptStub hpet
+InterruptStub ip
+InterruptStub lapic_timer
+InterruptStub posted
+InterruptStub shared
 
 ; One entry point per IDT vector. Every slot starts out pointing here
 ; (Idt::Idt), and the vector number is baked into the stub so a stray
@@ -604,12 +604,12 @@ InterruptStub Shared
 ; anonymous panic with nothing to chase.
 %assign DummyVector 0
 %rep 256
-DummyInterruptStub%+DummyVector:
+dummy_interrupt_stub%+DummyVector:
 	PushAll
 	mov rdi, rsp
 	mov esi, DummyVector
 	cld
-	call DummyInterruptDispatch
+	call dummy_interrupt_dispatch
 	PopAll
 	iretq
 %assign DummyVector DummyVector+1
@@ -617,22 +617,22 @@ DummyInterruptStub%+DummyVector:
 
 section .rodata
 align 8
-DummyInterruptStubTable:
+dummy_interrupt_stub_table:
 %assign DummyVector 0
 %rep 256
-	dq DummyInterruptStub%+DummyVector
+	dq dummy_interrupt_stub%+DummyVector
 %assign DummyVector DummyVector+1
 %endrep
 
 section .text
 
 %macro RustInterruptSlot 1
-RustInterruptStub%1:
+rust_interrupt_stub%1:
 	PushAll
 	mov rdi, rsp
 	mov esi, %1
 	cld
-	call RustInterruptDispatch
+	call dispatch_rust_interrupt
 	PopAll
 	iretq
 %endmacro
@@ -647,12 +647,12 @@ RustInterruptSlot 6
 RustInterruptSlot 7
 
 %macro RustMsixSlot 1
-RustMsixStub%1:
+rust_msix_stub%1:
 	PushAll
 	mov rdi, rsp
 	mov esi, %1
 	cld
-	call RustMsixDispatch
+	call dispatch_rust_msix
 	PopAll
 	iretq
 %endmacro
@@ -690,30 +690,30 @@ RustMsixSlot 29
 RustMsixSlot 30
 RustMsixSlot 31
 
-ExceptionStub ExcDivideByZero
-ExceptionStub ExcDebugger
-ExceptionStub ExcNMI
-ExceptionStub ExcBreakpoint
-ExceptionStub ExcOverflow
-ExceptionStub ExcBounds
-ExceptionStub ExcInvalidOpcode
-ExceptionStub ExcCoprocessorNotAvailable
-ExceptionStubErr ExcDoubleFault
-ExceptionStub ExcCoprocessorSegmentOverrun
-ExceptionStubErr ExcInvalidTaskStateSegment
-ExceptionStubErr ExcSegmentNotPresent
-ExceptionStubErr ExcStackFault
-ExceptionStubErr ExcGeneralProtectionFault
-ExceptionStubErr ExcPageFault
-ExceptionStub ExcReserved
-ExceptionStub ExcMathFault
-ExceptionStubErr ExcAlignmentCheck
-ExceptionStub ExcMachineCheck
-ExceptionStub ExcSIMDFpException
-ExceptionStub ExcVirtException
-ExceptionStubErr ExcControlProtection
+ExceptionStub exc_divide_by_zero
+ExceptionStub exc_debugger
+ExceptionStub exc_nmi
+ExceptionStub exc_breakpoint
+ExceptionStub exc_overflow
+ExceptionStub exc_bounds
+ExceptionStub exc_invalid_opcode
+ExceptionStub exc_coprocessor_not_available
+ExceptionStubErr exc_double_fault
+ExceptionStub exc_coprocessor_segment_overrun
+ExceptionStubErr exc_invalid_task_state_segment
+ExceptionStubErr exc_segment_not_present
+ExceptionStubErr exc_stack_fault
+ExceptionStubErr exc_general_protection_fault
+ExceptionStubErr exc_page_fault
+ExceptionStub exc_reserved
+ExceptionStub exc_math_fault
+ExceptionStubErr exc_alignment_check
+ExceptionStub exc_machine_check
+ExceptionStub exc_simd_fp_exception
+ExceptionStub exc_virt_exception
+ExceptionStubErr exc_control_protection
 
-SetJmp:
+set_jmp:
 	pop rsi
 	xor eax, eax
 	mov qword [rdi], rbx
@@ -727,7 +727,7 @@ SetJmp:
 	mov qword [rdi + 38h], rsi
 	ret
 
-LongJmp:
+long_jmp:
 	mov rax, rsi
 	mov rbx, qword [rdi]
 	mov rsp, qword [rdi + 8h]

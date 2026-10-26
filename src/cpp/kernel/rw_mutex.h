@@ -2,7 +2,7 @@
 
 #include "atomic.h"
 
-namespace Kernel
+namespace kernel
 {
 
 /*
@@ -30,11 +30,11 @@ public:
     RwMutex();
     ~RwMutex();
 
-    void ReadLock();
-    void ReadUnlock();
+    void read_lock();
+    void read_unlock();
 
-    void WriteLock();
-    void WriteUnlock();
+    void write_lock();
+    void write_unlock();
 
 private:
     RwMutex(const RwMutex& other) = delete;
@@ -42,8 +42,8 @@ private:
     RwMutex& operator=(const RwMutex& other) = delete;
     RwMutex& operator=(RwMutex&& other) = delete;
 
-    Atomic Value;
-    Atomic WriterWaiting;
+    Atomic value_;
+    Atomic writer_waiting_;
 };
 
 }

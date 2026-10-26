@@ -6,7 +6,7 @@
 #include <kernel/panic.h>
 #include <mm/new.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 template<class T>
@@ -14,198 +14,198 @@ class Vector
 {
 public:
     Vector()
-        : Arr(nullptr), Size(0), Capacity(0)
+        : arr_(nullptr), size_(0), capacity_(0)
     {
     }
 
-    size_t GetSize() const
+    size_t get_size() const
     {
-        return Size;
+        return size_;
     }
 
-    size_t GetCapacity() const
+    size_t get_capacity() const
     {
-        return Capacity;
+        return capacity_;
     }
 
     T& operator[](size_t index)
     {
-        BugOn(index >= Size);
-        return Arr[index];
+        BUG_ON(index >= size_);
+        return arr_[index];
     }
 
-    bool Reserve(size_t capacity)
+    bool reserve(size_t capacity)
     {
-        if (capacity <= Capacity)
+        if (capacity <= capacity_)
             return true;
 
-        T* newArr = new T[capacity];
-        if (!newArr)
+        T* new_arr = new T[capacity];
+        if (!new_arr)
             return false;
 
-        if (Arr)
+        if (arr_)
         {
-            for (size_t i = 0; i < Size; i++)
+            for (size_t i = 0; i < size_; i++)
             {
-                newArr[i] = Stdlib::Move(Arr[i]);
+                new_arr[i] = stdlib::move(arr_[i]);
             }
-            delete[] Arr;
+            delete[] arr_;
         }
-        Arr = newArr;
-        Capacity = capacity;
+        arr_ = new_arr;
+        capacity_ = capacity;
         return true;
     }
 
-    bool ReserveAndUse(size_t capacity)
+    bool reserve_and_use(size_t capacity)
     {
-        if (!Reserve(capacity))
+        if (!reserve(capacity))
             return false;
         /* Reserve() keeps a larger existing Capacity; using it here would
            expose stale elements at [capacity..Capacity). */
-        Size = capacity;
+        size_ = capacity;
         return true;
     }
 
-    bool Truncate(size_t size)
+    bool truncate(size_t size)
     {
-        if (size > Size)
+        if (size > size_)
             return false;
 
-        Size = size;
+        size_ = size;
         return true;
     }
 
-    bool PushBack(T&& e)
+    bool push_back(T&& e)
     {
-        if (Size == Capacity)
+        if (size_ == capacity_)
         {
-            if (!Reserve(2*Size + 1))
+            if (!reserve(2*size_ + 1))
                 return false;
         }
-        Arr[Size++] = Stdlib::Move(e);
+        arr_[size_++] = stdlib::move(e);
         return true;
     }
 
-    bool PushBack(const T& e)
+    bool push_back(const T& e)
     {
-        if (Size == Capacity)
+        if (size_ == capacity_)
         {
-            if (!Reserve(2*Size + 1))
+            if (!reserve(2*size_ + 1))
                 return false;
         }
-        Arr[Size++] = e;
+        arr_[size_++] = e;
         return true;
     }
 
-    const T* GetConstBuf() const
+    const T* get_const_buf() const
     {
-        return Arr;
+        return arr_;
     }
 
-    T* GetBuf()
+    T* get_buf()
     {
-        return Arr;
+        return arr_;
     }
 
     virtual ~Vector()
     {
-        Release();
+        release();
     }
 
-    void Clear()
+    void clear()
     {
-        Release();
+        release();
     }
 
     Vector(Vector&& other)
         : Vector()
     {
-        Arr = other.Arr;
-        Size = other.Size;
-        Capacity = other.Capacity;
-        other.Arr = nullptr;
-        other.Size = 0;
-        other.Capacity = 0;
+        arr_ = other.arr_;
+        size_ = other.size_;
+        capacity_ = other.capacity_;
+        other.arr_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
     }
 
     Vector& operator=(Vector&& other)
     {
-        Release();
-        Arr = other.Arr;
-        Size = other.Size;
-        Capacity = other.Capacity;
-        other.Arr = nullptr;
-        other.Size = 0;
-        other.Capacity = 0;
+        release();
+        arr_ = other.arr_;
+        size_ = other.size_;
+        capacity_ = other.capacity_;
+        other.arr_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
         return *this;
     }
 
-    Vector(const Vector& other, Stdlib::Error& err)
+    Vector(const Vector& other, stdlib::Error& err)
         : Vector()
     {
-        if (!err.Ok())
+        if (!err.ok())
             return;
 
-        Arr = new (Kernel::Mm::NoThrow) T[other.Capacity];
-        if (!Arr)
+        arr_ = new (kernel::mm::NO_THROW) T[other.capacity_];
+        if (!arr_)
         {
-            err = MakeError(Stdlib::Error::NoMemory);
+            err = make_error(stdlib::Error::NO_MEMORY);
             return;
         }
 
-        for (size_t i = 0; i < other.Size; i++)
+        for (size_t i = 0; i < other.size_; i++)
         {
-            Arr[i] = other.Arr[i];
+            arr_[i] = other.arr_[i];
         }
-        Size = other.Size;
-        Capacity = other.Capacity;
+        size_ = other.size_;
+        capacity_ = other.capacity_;
     }
 
-    void Shuffle()
+    void shuffle()
     {
-        Panic("Not implemented yet!");
+        PANIC("Not implemented yet!");
     }
 
-    Vector(const T* arr, size_t size, Stdlib::Error& err)
+    Vector(const T* arr, size_t size, stdlib::Error& err)
         : Vector()
     {
-        if (!err.Ok())
+        if (!err.ok())
             return;
 
-        Arr = new (Kernel::Mm::NoThrow) T[size];
-        if (!Arr)
+        arr_ = new (kernel::mm::NO_THROW) T[size];
+        if (!arr_)
         {
-            err = MakeError(Stdlib::Error::NoMemory);
+            err = make_error(stdlib::Error::NO_MEMORY);
             return;
         }
 
         for (size_t i = 0; i < size; i++)
         {
-            Arr[i] = arr[i];
+            arr_[i] = arr[i];
         }
 
-        Size = size;
-        Capacity = Size;
+        size_ = size;
+        capacity_ = size_;
     }
 
 private:
     Vector(const Vector& other) = delete;
     Vector& operator=(const Vector& other) = delete;
 
-    void Release()
+    void release()
     {
-        if (Arr)
+        if (arr_)
         {
-            delete[] Arr;
-            Arr = nullptr;
+            delete[] arr_;
+            arr_ = nullptr;
         }
-        Size = 0;
-        Capacity = 0;
+        size_ = 0;
+        capacity_ = 0;
     }
 
-    T* Arr;
-    size_t Size;
-    size_t Capacity;
+    T* arr_;
+    size_t size_;
+    size_t capacity_;
 };
 
 }

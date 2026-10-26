@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* Intel's microcode, loaded by the kernel from the file GRUB put in memory
@@ -12,25 +12,25 @@ namespace Kernel
    mitigation is only as good as the microcode under it. Loaded early, on
    the BSP and on each AP as it comes up, as Linux loads it from its
    initramfs. */
-namespace Microcode
+namespace microcode
 {
 
 /* An update for a CPU, as Choose found it in a file. */
 struct Choice
 {
-    ulong Offset;   /* where it starts in the file */
-    ulong Size;     /* all of it: header, data, any extended table */
-    u32 Revision;
-    u32 Date;       /* as the header has it: mmddyyyy, in BCD */
+    ulong offset;   /* where it starts in the file */
+    ulong size;     /* all of it: header, data, any extended table */
+    u32 revision;
+    u32 date;       /* as the header has it: mmddyyyy, in BCD */
 };
 
 /* The parts of an update's date, each of which printed in hex reads as the
    decimal it is: (Date & DateYearMask), (Date >> DateMonthShift) and
    ((Date >> DateDayShift) & DateDayMask) */
-const u32 DateYearMask = 0xFFFF;
-const u32 DateMonthShift = 24;
-const u32 DateDayShift = 16;
-const u32 DateDayMask = 0xFF;
+const u32 DATE_YEAR_MASK = 0xFFFF;
+const u32 DATE_MONTH_SHIFT = 24;
+const u32 DATE_DAY_SHIFT = 16;
+const u32 DATE_DAY_MASK = 0xFF;
 
 /* The newest update in `file` -- `len` bytes of Intel's updates one after
    another (SDM Vol. 3A, 10.11.1) -- for a CPU of signature `sig`
@@ -41,7 +41,7 @@ const u32 DateDayMask = 0xFF;
    table's -- and the walk ends at the first that is not sound, past which
    where the next one starts is unknown. False when none fits. Reads
    nothing outside [file, file + len). */
-bool Choose(const u8* file, ulong len, u32 sig, u32 pf, u32 current, Choice* out);
+bool choose(const u8* file, ulong len, u32 sig, u32 pf, u32 current, Choice* out);
 
 /* What loading did on a CPU: whether it was asked its revision -- not where
    the microcode is not the kernel's to load, as under a hypervisor -- the
@@ -49,24 +49,24 @@ bool Choose(const u8* file, ulong len, u32 sig, u32 pf, u32 current, Choice* out
    loaded: nullptr when an update was. */
 struct Result
 {
-    bool Asked;
-    u32 Before;
-    u32 After;
-    u32 Date;
-    const char* Skipped;
+    bool asked;
+    u32 before;
+    u32 after;
+    u32 date;
+    const char* skipped;
 };
 
 /* On the BSP, interrupts off, while the bootstrap map still reaches the
    module (`file`, `len`): choose this CPU's update, keep it for the APs and
    load it here. */
-void LoadOnBsp(const u8* file, ulong len, Result* out);
+void load_on_bsp(const u8* file, ulong len, Result* out);
 
 /* On an AP, interrupts off: the update the BSP kept, loaded where it is for
    this CPU and newer than what it runs. Nothing where the BSP kept none. */
-void LoadOnAp(Result* out);
+void load_on_ap(Result* out);
 
 /* Whether the BSP kept an update, for the APs to say what they did with it. */
-bool Kept();
+bool kept();
 
 }
 }

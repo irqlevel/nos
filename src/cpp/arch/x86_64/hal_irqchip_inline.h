@@ -7,41 +7,41 @@
 // x86_64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
 // "hwId" is the LAPIC id, which this kernel keeps equal to the cpu index.
 
-namespace Hal
+namespace hal
 {
 
 /* IPI vector: IDT slot on x86, SGI INTID on arm64 */
-constexpr u8 IpiVector = 0xFE;
+constexpr u8 IPI_VECTOR = 0xFE;
 
 /* The vector a vCPU running a guest is sent to hand it an interrupt posted
    for it (VT-x's posted interrupts, hvarch): taken by the CPU in its guest
    without an exit, and in the host -- the guest just left -- an EOI and
    nothing more (PostedInterrupt). Above every device's and below the
    timer's. */
-constexpr u8 PostedVector = 0xFC;
+constexpr u8 POSTED_VECTOR = 0xFC;
 
 /* True once the LAPIC MMIO is discovered: cpu-id reads and IPIs are safe */
-static inline __attribute__((always_inline)) bool IrqChipReady()
+static inline __attribute__((always_inline)) bool irq_chip_ready()
 {
-    return Kernel::Acpi::GetInstance().GetLapicAddress() != nullptr;
+    return kernel::Acpi::get_instance().get_lapic_address() != nullptr;
 }
 
-static inline __attribute__((always_inline)) void IrqEoi()
+static inline __attribute__((always_inline)) void irq_eoi()
 {
-    Kernel::Lapic::EOI();
+    kernel::Lapic::eoi();
 }
 
-static inline __attribute__((always_inline)) void IrqEoi(u8 vector)
+static inline __attribute__((always_inline)) void irq_eoi(u8 vector)
 {
-    Kernel::Lapic::EOI(vector);
+    kernel::Lapic::eoi(vector);
 }
 
-static inline __attribute__((always_inline)) bool IrqIsInService(u8 vector)
+static inline __attribute__((always_inline)) bool irq_is_in_service(u8 vector)
 {
-    return Kernel::Lapic::CheckIsr(vector);
+    return kernel::Lapic::check_isr(vector);
 }
 
-static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
+static inline __attribute__((always_inline)) ulong get_current_cpu_hw_id()
 {
     /* One load through GS instead of an uncached MMIO read of the APIC's ID
        register -- see arch/x86_64/percpu.h for why this is on a hot enough
@@ -56,25 +56,25 @@ static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
     if (biased != 0)
         return biased - 1;
 
-    return Kernel::Lapic::GetApicId();
+    return kernel::Lapic::get_apic_id();
 }
 
-static inline __attribute__((always_inline)) void SendIpi(ulong hwId, u8 vector)
+static inline __attribute__((always_inline)) void send_ipi(ulong hw_id, u8 vector)
 {
-    Kernel::Lapic::SendIPI(hwId, vector);
+    kernel::Lapic::send_ipi(hw_id, vector);
 }
 
 /* An NMI reaches a CPU that has interrupts disabled -- which is exactly the
    CPU worth asking about when the machine has wedged, and exactly the one an
    ordinary IPI cannot reach. */
-static inline __attribute__((always_inline)) bool NmiIpiSupported()
+static inline __attribute__((always_inline)) bool nmi_ipi_supported()
 {
     return true;
 }
 
-static inline __attribute__((always_inline)) void SendNmiIpi(ulong hwId)
+static inline __attribute__((always_inline)) void send_nmi_ipi(ulong hw_id)
 {
-    Kernel::Lapic::SendNmi(hwId);
+    kernel::Lapic::send_nmi(hw_id);
 }
 
 }

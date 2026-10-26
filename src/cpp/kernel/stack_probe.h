@@ -3,7 +3,7 @@
 #include <lib/stdlib.h>
 #include <lib/printer.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* How deep the stacks have actually gone.
@@ -25,24 +25,24 @@ namespace Kernel
    so the scan can report more free space than there really was. The same
    limitation applies to Linux's CONFIG_DEBUG_STACK_USAGE, which is the same
    trick. */
-namespace StackProbe
+namespace stack_probe
 {
 
 /* 0x5A repeated: a byte fill, so the fast MemSet writes it, and a word value
    that is neither a plausible pointer nor a plausible small integer. */
-static const u8 PatternByte = 0x5A;
-static const ulong Pattern = 0x5A5A5A5A5A5A5A5AUL;
+static const u8 PATTERN_BYTE = 0x5A;
+static const ulong PATTERN = 0x5A5A5A5A5A5A5A5AUL;
 
 /* Both take an 8-byte aligned base and a length that is a multiple of 8. */
-void Poison(void* base, ulong size);
+void poison(void* base, ulong size);
 
 /* Bytes of pattern still intact, counted from the base upward -- the part of
    the stack that was never touched. */
-ulong Untouched(const void* base, ulong size);
+ulong untouched(const void* base, ulong size);
 
 }
 
 /* Defined in main.cpp, where the per-CPU static stacks live. */
-void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree);
+void report_cpu_stacks(stdlib::Printer& printer, ulong& worst_free);
 
 }

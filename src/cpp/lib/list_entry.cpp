@@ -1,147 +1,147 @@
 #include "list_entry.h"
 #include <kernel/panic.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
 ListEntry::ListEntry()
 {
-    Init();
+    init();
 }
 
-void ListEntry::Init()
+void ListEntry::init()
 {
-    Flink = Blink = this;
+    flink = blink = this;
     return;
 }
 
-bool ListEntry::IsEmpty()
+bool ListEntry::is_empty()
 {
-    return (Flink == this) ? true : false;
+    return (flink == this) ? true : false;
 }
 
-bool ListEntry::Remove()
+bool ListEntry::remove()
 {
-    ListEntry* blink;
-    ListEntry* flink;
+    ListEntry* prev;
+    ListEntry* next;
 
-    flink = Flink;
-    blink = Blink;
-    blink->Flink = flink;
-    flink->Blink = blink;
-    return (flink == blink) ? true : false;
+    next = flink;
+    prev = blink;
+    prev->flink = next;
+    next->blink = prev;
+    return (next == prev) ? true : false;
 }
 
-bool ListEntry::RemoveInit()
+bool ListEntry::remove_init()
 {
-    bool result = Remove();
-    Init();
+    bool result = remove();
+    init();
     return result;
 }
 
-ListEntry* ListEntry::RemoveHead()
+ListEntry* ListEntry::remove_head()
 {
-    ListEntry* flink;
+    ListEntry* next;
     ListEntry* entry;
 
-    entry = Flink;
-    flink = entry->Flink;
-    Flink = flink;
-    flink->Blink = this;
+    entry = flink;
+    next = entry->flink;
+    flink = next;
+    next->blink = this;
     return entry;
 }
 
-ListEntry* ListEntry::RemoveTail()
+ListEntry* ListEntry::remove_tail()
 {
-    ListEntry* blink;
+    ListEntry* prev;
     ListEntry* entry;
 
-    entry = Blink;
-    blink = entry->Blink;
-    Blink = blink;
-    blink->Flink = this;
+    entry = blink;
+    prev = entry->blink;
+    blink = prev;
+    prev->flink = this;
     return entry;
 }
 
-void ListEntry::InsertTail(ListEntry* entry)
+void ListEntry::insert_tail(ListEntry* entry)
 {
-    ListEntry* blink;
+    ListEntry* prev;
 
-    blink = Blink;
-    BugOn(!blink);
-    entry->Flink = this;
-    entry->Blink = blink;
-    blink->Flink = entry;
-    Blink = entry;
+    prev = blink;
+    BUG_ON(!prev);
+    entry->flink = this;
+    entry->blink = prev;
+    prev->flink = entry;
+    blink = entry;
     return;
 }
 
-void ListEntry::AppendTail(ListEntry* listToAppend)
+void ListEntry::append_tail(ListEntry* list_to_append)
 {
-    ListEntry* listEnd = Blink;
+    ListEntry* list_end = blink;
 
-    Blink->Flink = listToAppend;
-    Blink = listToAppend->Blink;
-    listToAppend->Blink->Flink = this;
-    listToAppend->Blink = listEnd;
+    blink->flink = list_to_append;
+    blink = list_to_append->blink;
+    list_to_append->blink->flink = this;
+    list_to_append->blink = list_end;
 }
 
-void ListEntry::InsertHead(ListEntry* entry)
+void ListEntry::insert_head(ListEntry* entry)
 {
-    ListEntry* flink;
+    ListEntry* next;
 
-    flink = Flink;
-    entry->Flink = flink;
-    entry->Blink = this;
-    flink->Blink = entry;
-    Flink = entry;
+    next = flink;
+    entry->flink = next;
+    entry->blink = this;
+    next->blink = entry;
+    flink = entry;
     return;
 }
 
-void ListEntry::MoveTailList(ListEntry *list)
+void ListEntry::move_tail_list(ListEntry *list)
 {
-    if (list->IsEmpty())
+    if (list->is_empty())
         return;
 
-    ListEntry* entry = list->Flink;
-    list->RemoveInit();
-    AppendTail(entry);
+    ListEntry* entry = list->flink;
+    list->remove_init();
+    append_tail(entry);
 }
 
 ListEntry::ListEntry(ListEntry&& other)
 {
-    if (other.IsEmpty()) {
-        Init();
+    if (other.is_empty()) {
+        init();
         return;
     }
-    other.Flink->Blink = this;
-    other.Blink->Flink = this;
-    Flink = other.Flink;
-    Blink = other.Blink;
-    other.Init();
+    other.flink->blink = this;
+    other.blink->flink = this;
+    flink = other.flink;
+    blink = other.blink;
+    other.init();
 }
 
 ListEntry& ListEntry::operator=(ListEntry&& other)
 {
     if (this != &other) {
-        if (other.IsEmpty()) {
-            Init();
+        if (other.is_empty()) {
+            init();
             return *this;
         }
-        other.Flink->Blink = this;
-        other.Blink->Flink = this;
-        Flink = other.Flink;
-        Blink = other.Blink;
-        other.Init();
+        other.flink->blink = this;
+        other.blink->flink = this;
+        flink = other.flink;
+        blink = other.blink;
+        other.init();
     }
     return *this;
 }
 
-size_t ListEntry::CountEntries()
+size_t ListEntry::count_entries()
 {
     size_t count = 0;
 
-    for (ListEntry* e = Flink; e != this; e = e->Flink)
+    for (ListEntry* e = flink; e != this; e = e->flink)
     {
         count++;
     }

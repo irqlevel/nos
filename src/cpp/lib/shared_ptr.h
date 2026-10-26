@@ -7,74 +7,74 @@
 #include <kernel/panic.h>
 #include <mm/new.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
-const int SharedPtrLL = 5;
+const int SHARED_PTR_LL = 5;
 
 template<typename T, typename Deleter = DefaultDeleter<T>>
 class ObjectReference final
 {
 public:
     ObjectReference(T* object)
-        : Object(nullptr)
+        : object_(nullptr)
     {
-        Counter.Set(1);
-        Object = object;
+        counter_.set(1);
+        object_ = object;
 
-        Trace(SharedPtrLL, "objref 0x%p obj 0x%p ctor", this, Object);
+        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p ctor", this, object_);
     }
 
     ~ObjectReference()
     {
-        Trace(SharedPtrLL, "objref 0x%p dtor", this);
+        trace(SHARED_PTR_LL, "objref 0x%p dtor", this);
 
-        BugOn(Object != nullptr);
-        BugOn(Counter.Get() != 0);
+        BUG_ON(object_ != nullptr);
+        BUG_ON(counter_.get() != 0);
     }
 
-    void IncCounter()
+    void inc_counter()
     {
-        Counter.Inc();
-        Trace(SharedPtrLL, "objref 0x%p obj 0x%p inc counter %ld", this, Object, Counter.Get());
+        counter_.inc();
+        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p inc counter %ld", this, object_, counter_.get());
     }
 
-    int GetCounter()
+    int get_counter()
     {
-        return Counter.Get();
+        return counter_.get();
     }
 
-    void SetObject(T *object)
+    void set_object(T *object)
     {
-        if (BugOn(Object != nullptr))
+        if (BUG_ON(object_ != nullptr))
             return;
 
-        Object = object;
+        object_ = object;
     }
 
-    T* GetObject()
+    T* get_object()
     {
-        return Object;
+        return object_;
     }
 
-    bool DecCounter()
+    bool dec_counter()
     {
-        if (Counter.DecAndTest())
+        if (counter_.dec_and_test())
         {
-            Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %ld", this, Object, Counter.Get());
+            trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
 
-            Deleter()(Object);
-            Object = nullptr;
+            Deleter()(object_);
+            object_ = nullptr;
             return true;
         }
-        Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %ld", this, Object, Counter.Get());
+        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
 
         return false;
     }
 
 private:
-    Kernel::Atomic Counter;
-    T* Object;
+    kernel::Atomic counter_;
+    T* object_;
 
     ObjectReference() = delete;
     ObjectReference(const ObjectReference& other) = delete;
@@ -89,60 +89,60 @@ class SharedPtr final
 public:
     SharedPtr()
     {
-        ObjectRef = nullptr;
+        object_ref_ = nullptr;
 
-        Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
-    SharedPtr(ObjectReference<T, Deleter> *objectRef)
+    SharedPtr(ObjectReference<T, Deleter> *object_ref)
     {
-        ObjectRef = objectRef;
+        object_ref_ = object_ref;
 
-        Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(T *object)
         : SharedPtr()
     {
-        Reset(object);
+        reset(object);
 
-        Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(const SharedPtr& other)
         : SharedPtr()
     {
-        ObjectRef = other.ObjectRef;
-        if (ObjectRef != nullptr)
+        object_ref_ = other.object_ref_;
+        if (object_ref_ != nullptr)
         {
-            ObjectRef->IncCounter();
+            object_ref_->inc_counter();
         }
 
-        Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(SharedPtr&& other)
         : SharedPtr()
     {
-        ObjectRef = other.ObjectRef;
-        other.ObjectRef = nullptr;
+        object_ref_ = other.object_ref_;
+        other.object_ref_ = nullptr;
 
-        Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr& operator=(const SharedPtr& other)
     {
         if (this != &other)
         {
-            Reset(nullptr);
-            ObjectRef = other.ObjectRef;
-            if (ObjectRef != nullptr)
+            reset(nullptr);
+            object_ref_ = other.object_ref_;
+            if (object_ref_ != nullptr)
             {
-                ObjectRef->IncCounter();
+                object_ref_->inc_counter();
             }
         }
 
-        Trace(SharedPtrLL, "ptr 0x%p op= obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
 
         return *this;
     }
@@ -151,61 +151,61 @@ public:
     {
         if (this != &other)
         {
-            Reset(nullptr);
-            ObjectRef = other.ObjectRef;
-            other.ObjectRef = nullptr;
+            reset(nullptr);
+            object_ref_ = other.object_ref_;
+            other.object_ref_ = nullptr;
         }
 
-        Trace(SharedPtrLL, "ptr 0x%p op= obj 0x%p", this, Get());
+        trace(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
 
         return *this;
     }
 
-    T* Get() const
+    T* get() const
     {
-        return (ObjectRef != nullptr) ? ObjectRef->GetObject() : nullptr;
+        return (object_ref_ != nullptr) ? object_ref_->get_object() : nullptr;
     }
 
     T& operator*() const
     {
-        return *Get();
+        return *get();
     }
 
     T* operator->() const
     {
-        return Get();
+        return get();
     }
 
-    int GetCounter()
+    int get_counter()
     {
-        return (ObjectRef != nullptr) ? ObjectRef->GetCounter() : 0;
+        return (object_ref_ != nullptr) ? object_ref_->get_counter() : 0;
     }
 
     ~SharedPtr()
     {
-        Reset(nullptr);
+        reset(nullptr);
     }
 
-    void Reset(T* object)
+    void reset(T* object)
     {
-        Trace(SharedPtrLL, "ptr 0x%p reset obj 0x%p new 0x%p", this, Get(), object);
+        trace(SHARED_PTR_LL, "ptr 0x%p reset obj 0x%p new 0x%p", this, get(), object);
 
-        BugOn(Get() != nullptr && Get() == object);
+        BUG_ON(get() != nullptr && get() == object);
 
-        if (ObjectRef != nullptr)
+        if (object_ref_ != nullptr)
         {
-            if (ObjectRef->DecCounter())
+            if (object_ref_->dec_counter())
             {
-                delete ObjectRef;
+                delete object_ref_;
             }
         }
 
-        ObjectRef = nullptr;
+        object_ref_ = nullptr;
 
         if (object != nullptr)
         {
-            ObjectRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(object);
-            if (ObjectRef == nullptr)
+            object_ref_ = kernel::mm::talloc<ObjectReference<T, Deleter>, 0>(object);
+            if (object_ref_ == nullptr)
             {
                 Deleter()(object);
                 return;
@@ -213,53 +213,53 @@ public:
         }
     }
 
-    void Reset()
+    void reset()
     {
-        Reset(nullptr);
+        reset(nullptr);
     }
 
 private:
-    ObjectReference<T, Deleter>* ObjectRef;
+    ObjectReference<T, Deleter>* object_ref_;
 };
 
 template<typename T, class... Args>
-SharedPtr<T> MakeShared(Args&&... args)
+SharedPtr<T> make_shared(Args&&... args)
 {
-    T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
+    T* object = kernel::mm::talloc<T, 0>(stdlib::forward<Args>(args)...);
     if (object == nullptr)
         return SharedPtr<T>();
 
     /* Construct the ObjectReference around the live object so a failed
        allocation here never destroys a refcounted-but-armed control block
        (its dtor asserts Counter == 0). */
-    ObjectReference<T>* objRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(object);
-    if (objRef == nullptr)
+    ObjectReference<T>* obj_ref = kernel::mm::talloc<ObjectReference<T>, 0>(object);
+    if (obj_ref == nullptr)
     {
         delete object;
         return SharedPtr<T>();
     }
 
-    return SharedPtr<T>(objRef);
+    return SharedPtr<T>(obj_ref);
 }
 
 template<typename T, typename Deleter, class... Args>
-SharedPtr<T, Deleter> MakeSharedWith(Args&&... args)
+SharedPtr<T, Deleter> make_shared_with(Args&&... args)
 {
-    T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
+    T* object = kernel::mm::talloc<T, 0>(stdlib::forward<Args>(args)...);
     if (object == nullptr)
         return SharedPtr<T, Deleter>();
 
     /* Construct the ObjectReference around the live object so a failed
        allocation here never destroys a refcounted-but-armed control block
        (its dtor asserts Counter == 0). */
-    ObjectReference<T, Deleter>* objRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(object);
-    if (objRef == nullptr)
+    ObjectReference<T, Deleter>* obj_ref = kernel::mm::talloc<ObjectReference<T, Deleter>, 0>(object);
+    if (obj_ref == nullptr)
     {
         delete object;
         return SharedPtr<T, Deleter>();
     }
 
-    return SharedPtr<T, Deleter>(objRef);
+    return SharedPtr<T, Deleter>(obj_ref);
 }
 
 }

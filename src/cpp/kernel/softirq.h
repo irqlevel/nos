@@ -5,25 +5,25 @@
 #include "task.h"
 #include "cpu.h"
 
-namespace Kernel
+namespace kernel
 {
 
 class SoftIrq
 {
 public:
-    static SoftIrq& GetInstance()
+    static SoftIrq& get_instance()
     {
         static SoftIrq instance;
         return instance;
     }
 
     /* Called during boot: creates a soft IRQ task per running CPU */
-    bool Init();
-    void Stop();
+    bool init();
+    void stop();
 
     /* Called from hard IRQ handler to schedule deferred work.
        The work runs on the CPU which raised it. */
-    void Raise(ulong type);
+    void raise(ulong type);
 
     /* Safety net, called from this CPU's timer tick. Nothing here should be
        needed: every path that makes work available also wakes the task. But
@@ -31,21 +31,21 @@ public:
        good, on a machine whose only console is a UDP socket. One atomic read
        per tick turns that whole class of bug into at most a tick of latency,
        visible in a profile rather than as a dead box. */
-    void TickKick(ulong cpu);
+    void tick_kick(ulong cpu);
 
     /* Whether this CPU already has work of this type queued. A poll that
        wants to cover a lost interrupt must not raise on top of a wakeup that
        has already happened, or it cannot tell the two apart afterwards. */
-    bool IsPending(ulong type);
+    bool is_pending(ulong type);
 
     /* Register a handler for a soft IRQ type */
-    void Register(ulong type, void (*handler)(void* ctx), void* ctx);
+    void register_handler(ulong type, void (*handler)(void* ctx), void* ctx);
 
-    static const ulong TypeNetRx = 0;
-    static const ulong TypeBlkIo = 1;
-    static const ulong TypeNetTx = 2;
-    static const ulong TypeTcpTimer = 3;
-    static const ulong MaxTypes = 8;
+    static const ulong TYPE_NET_RX = 0;
+    static const ulong TYPE_BLK_IO = 1;
+    static const ulong TYPE_NET_TX = 2;
+    static const ulong TYPE_TCP_TIMER = 3;
+    static const ulong MAX_TYPES = 8;
 
 private:
     SoftIrq();
@@ -57,34 +57,34 @@ private:
 
     struct Handler
     {
-        void (*Func)(void* ctx);
-        void* Ctx;
+        void (*func)(void* ctx);
+        void* ctx;
     };
 
     struct CpuState
     {
-        Atomic Pending; /* bitmask of pending soft IRQ types */
-        Task* TaskPtr;
+        Atomic pending; /* bitmask of pending soft IRQ types */
+        Task* task_ptr;
     };
 
-    Handler Handlers[MaxTypes];
-    CpuState CpuStates[MaxCpus];
+    Handler handlers_[MAX_TYPES];
+    CpuState cpu_states_[MAX_CPUS];
 
     /* Handlers are not reentrant: a type runs on at most one CPU
        at a time. A CPU which loses the race keeps its pending bit
        set and retries. */
-    Atomic Running; /* bitmask of soft IRQ types being handled */
+    Atomic running_; /* bitmask of soft IRQ types being handled */
 
-    Atomic Ready; /* set once the per-CPU tasks are started */
+    Atomic ready_; /* set once the per-CPU tasks are started */
 
-    static void TaskFunc(void* ctx);
-    void Run(CpuState& state);
+    static void task_func(void* ctx);
+    void run(CpuState& state);
 
     /* Whether this CPU has a pending type that is not already running
        somewhere else -- the condition its task blocks on. */
-    bool HasRunnableWork(CpuState& state);
+    bool has_runnable_work(CpuState& state);
 
-    static const ulong Tag = 'SIrq';
+    static const ulong TAG = 'SIrq';
 };
 
 }

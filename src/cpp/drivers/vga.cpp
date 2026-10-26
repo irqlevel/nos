@@ -6,142 +6,142 @@
 #include <mm/page_table.h>
 #include <arch/x86_64/grub.h>
 
-namespace Kernel
+namespace kernel
 {
 
-bool VgaTerm::ReadyFlag = false;
+bool VgaTerm::ready_flag_ = false;
 
 VgaTerm::VgaTerm()
-    : Buf(nullptr)
-    , Row(0)
-    , Column(0)
-    , Width(MaxWidth)
-    , Height(MaxHeight)
-    , ColorCode(MakeColor(ColorWhite, ColorBlack))
+    : buf_(nullptr)
+    , row_(0)
+    , column_(0)
+    , width_(MAX_WIDTH)
+    , height_(MAX_HEIGHT)
+    , color_code_(make_color(ColorWhite, ColorBlack))
 {
-    Lock.Unwatch();
+    lock_.unwatch();
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
     /* On UEFI there is no EGA text mode: GRUB reports a pixel
        framebuffer instead. Writing to 0xB8000 would scribble over
        plain RAM, so leave the terminal disabled (ReadyFlag stays
        false, Buf stays null and all output methods are no-ops). */
-    if (Grub::HasFramebufferInfo() && !Grub::IsFramebufferEgaText())
+    if (grub::has_framebuffer_info() && !grub::is_framebuffer_ega_text())
     {
-        Trace(0, "Vga: no EGA text mode (pixel framebuffer), output disabled");
+        trace(0, "Vga: no EGA text mode (pixel framebuffer), output disabled");
         return;
     }
 
-    Buf = (u16*)Mm::PageTable::GetInstance().TmpMapPage(BufPhyAddr);
-    if (Buf == nullptr)
+    buf_ = (u16*)mm::PageTable::get_instance().tmp_map_page(buf_phy_addr_);
+    if (buf_ == nullptr)
     {
-        Panic("Can't map page");
+        PANIC("Can't map page");
     }
 
-    Trace(0, "Vga 0x%p buf 0x%lX mapped at 0x%p", this, BufPhyAddr, Buf);
+    trace(0, "Vga 0x%p buf 0x%lX mapped at 0x%p", this, buf_phy_addr_, buf_);
 
     /* Set cursor shape to underline (scan lines 13-15) */
-    Outb(VgaBase, 0x0A);
-    Outb(VgaBase + 1, 0x0D);
-    Outb(VgaBase, 0x0B);
-    Outb(VgaBase + 1, 0x0F);
+    outb(vga_base_, 0x0A);
+    outb(vga_base_ + 1, 0x0D);
+    outb(vga_base_, 0x0B);
+    outb(vga_base_ + 1, 0x0F);
 
-    ClsLockHeld();
-    Cursor();
+    cls_lock_held();
+    cursor();
 
-    ReadyFlag = true;
+    ready_flag_ = true;
 }
 
 VgaTerm::~VgaTerm()
 {
-    Trace(0, "Vga 0x%p dtor", this);
+    trace(0, "Vga 0x%p dtor", this);
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf != nullptr)
+    if (buf_ != nullptr)
     {
-        Mm::PageTable::GetInstance().TmpUnmapPage((ulong)Buf);
-        Buf = nullptr;
+        mm::PageTable::get_instance().tmp_unmap_page((ulong)buf_);
+        buf_ = nullptr;
     }
 }
 
-u8 VgaTerm::MakeColor(Color fg, Color bg)
+u8 VgaTerm::make_color(Color fg, Color bg)
 {
     return fg | bg << 4;
 }
 
-u16 VgaTerm::MakeEntry(char c, u8 color)
+u16 VgaTerm::make_entry(char c, u8 color)
 {
     return (u16)c | (u16)color << 8;
 }
 
-void VgaTerm::SetColor(Color fg, Color bg)
+void VgaTerm::set_color(Color fg, Color bg)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    ColorCode = MakeColor(fg, bg);
+    color_code_ = make_color(fg, bg);
 }
 
-size_t VgaTerm::GetIndex(u8 x, u8 y)
+size_t VgaTerm::get_index(u8 x, u8 y)
 {
-	return y * Width + x;
+	return y * width_ + x;
 }
 
-void VgaTerm::PutCharAt(char c, u8 color, u8 x, u8 y)
+void VgaTerm::put_char_at(char c, u8 color, u8 x, u8 y)
 {
-    BugOn(x >= Width);
-    BugOn(y >= Height);
+    BUG_ON(x >= width_);
+    BUG_ON(y >= height_);
 
-    Buf[GetIndex(x, y)] = MakeEntry(c, color);
+    buf_[get_index(x, y)] = make_entry(c, color);
 }
 
-void VgaTerm::Overflow()
+void VgaTerm::overflow()
 {
-    if (Column == Width)
+    if (column_ == width_)
     {
-        Column = 0;
-        Row++;
+        column_ = 0;
+        row_++;
     }
 
-    if (Row == Height)
+    if (row_ == height_)
     {
-        for (size_t row = 0; row < Height - 1; row++)
+        for (size_t row = 0; row < height_ - 1; row++)
         {
-            for (size_t column = 0; column < Width; column++)
+            for (size_t column = 0; column < width_; column++)
             {
-                Buf[GetIndex(column, row)] = Buf[GetIndex(column, row + 1)];
+                buf_[get_index(column, row)] = buf_[get_index(column, row + 1)];
             }
         }
 
-        for (size_t column = 0; column < Width; column++)
-            PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), column, Height - 1);
+        for (size_t column = 0; column < width_; column++)
+            put_char_at('\0', make_color(ColorBlack, ColorBlack), column, height_ - 1);
 
-        Row = Height - 1;
+        row_ = height_ - 1;
     }
 }
 
-void VgaTerm::PutChar(char c)
+void VgaTerm::put_char(char c)
 {
     if (c == '\n')
     {
-        while (Column < Width)
-            PutCharAt('\0', ColorCode, Column++, Row);
+        while (column_ < width_)
+            put_char_at('\0', color_code_, column_++, row_);
 
-        Column = 0;
-        Row++;
-        Overflow();
+        column_ = 0;
+        row_++;
+        overflow();
     }
     else
     {
-        PutCharAt(c, ColorCode, Column++, Row);
-        Overflow();
+        put_char_at(c, color_code_, column_++, row_);
+        overflow();
     }
 
-    Cursor();
+    cursor();
 }
 
-void VgaTerm::PutsLockHeld(const char *str)
+void VgaTerm::puts_lock_held(const char *str)
 {
     for (;;)
     {
@@ -149,117 +149,117 @@ void VgaTerm::PutsLockHeld(const char *str)
         if (c == '\0')
             break;
 
-        PutChar(c);
+        put_char(c);
     }
 }
 
-void VgaTerm::Puts(const char *str)
+void VgaTerm::puts(const char *str)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    PutsLockHeld(str);
+    puts_lock_held(str);
 }
 
-void VgaTerm::ClsLockHeld()
+void VgaTerm::cls_lock_held()
 {
-    for (u8 x = 0; x < Width; x++)
-        for (u8 y = 0; y < Height; y++)
-            PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), x, y);
+    for (u8 x = 0; x < width_; x++)
+        for (u8 y = 0; y < height_; y++)
+            put_char_at('\0', make_color(ColorBlack, ColorBlack), x, y);
 }
 
-void VgaTerm::Cls()
+void VgaTerm::cls()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    ClsLockHeld();
-    Row = 0;
-    Column = 0;
-    Cursor();
+    cls_lock_held();
+    row_ = 0;
+    column_ = 0;
+    cursor();
 }
 
-void VgaTerm::VPrintf(const char *fmt, va_list args)
+void VgaTerm::v_printf(const char *fmt, va_list args)
 {
     char str[256];
 
-    if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
+    if (stdlib::vsn_printf(str, sizeof(str), fmt, args) < 0)
         return;
 
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    PutsLockHeld(str);
+    puts_lock_held(str);
 }
 
-void VgaTerm::Printf(const char *fmt, ...)
+void VgaTerm::printf(const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    VPrintf(fmt, args);
+    v_printf(fmt, args);
     va_end(args);
 }
 
-void VgaTerm::PrintString(const char *s)
+void VgaTerm::print_string(const char *s)
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    PutsLockHeld(s);
+    puts_lock_held(s);
 }
 
-void VgaTerm::PanicPrintString(const char *s)
+void VgaTerm::panic_print_string(const char *s)
 {
     /*
      * Bypass lock — write directly to VGA buffer.
      * Safe only in panic context with interrupts disabled.
      */
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    PutsLockHeld(s);
+    puts_lock_held(s);
 }
 
-void VgaTerm::Cursor()
+void VgaTerm::cursor()
 {
-    u16 offset = ((Row % Height) * Width + (Column % Width)) % (Width * Height);
-    Outb(VgaBase, VgaIndex + 1);
-    Outb(VgaBase + 1, offset & 0xFF);
-    Outb(VgaBase, VgaIndex);
-    Outb(VgaBase + 1, offset >> 8);
+    u16 offset = ((row_ % height_) * width_ + (column_ % width_)) % (width_ * height_);
+    outb(vga_base_, vga_index_ + 1);
+    outb(vga_base_ + 1, offset & 0xFF);
+    outb(vga_base_, vga_index_);
+    outb(vga_base_ + 1, offset >> 8);
 }
 
-void VgaTerm::Backspace()
+void VgaTerm::backspace()
 {
-    Stdlib::AutoLock lock(Lock);
+    stdlib::AutoLock lock(lock_);
 
-    if (Buf == nullptr)
+    if (buf_ == nullptr)
         return;
 
-    if (Column > 0)
+    if (column_ > 0)
     {
-        PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), --Column, Row);
+        put_char_at('\0', make_color(ColorBlack, ColorBlack), --column_, row_);
     }
     else
     {
-        if (Row > 0)
+        if (row_ > 0)
         {
-            --Row;
-            Column = Width - 1;
-            PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), Column, Row);
+            --row_;
+            column_ = width_ - 1;
+            put_char_at('\0', make_color(ColorBlack, ColorBlack), column_, row_);
         }
     }
 
-    Cursor();
+    cursor();
 }
 
 }

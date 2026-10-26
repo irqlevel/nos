@@ -2,16 +2,16 @@
 
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class Parameters
 {
 public:
-    static Parameters& GetInstance()
+    static Parameters& get_instance()
     {
-        static Parameters Instance;
-        return Instance;
+        static Parameters instance;
+        return instance;
     }
 
     /* Take what can be taken and name what cannot. A parameter that cannot be
@@ -21,85 +21,85 @@ public:
        before the netconsole, the disk log or the NIC exist, so on a machine
        whose only console is the network a boot that stopped here would stop
        without a word. */
-    void Parse(const char *cmdline);
+    void parse(const char *cmdline);
 
     /* Whether Parse() has run. Before it every getter reports its default,
        and a caller that must not act on a default -- the disk log, keeping
        the first lines of the boot until it knows -- can tell. */
-    bool IsParsed();
+    bool is_parsed();
 
     /* The line, its terminator included, and the longest single parameter
        taken -- room for root=UUID=<uuid>, which is 46 */
-    static const ulong CmdlineLen = 256;
-    static const ulong MaxParamLen = 48;
+    static const ulong CMDLINE_LEN = 256;
+    static const ulong MAX_PARAM_LEN = 48;
 
-    bool IsTraceVga();
-    bool IsPanicVga();
+    bool is_trace_vga();
+    bool is_panic_vga();
 
     /* panic=N -- reset the machine N seconds after a panic's report, 1 to
        PanicResetSecsMax; 0, the default, keeps it stopped with the report
        on its screen. For a machine whose only console is the network,
        whose next boot is its own OS: back there with no hand on it. */
-    ulong GetPanicResetSecs();
-    static const ulong PanicResetSecsMax = 3600;
-    bool IsSmpOff();
+    ulong get_panic_reset_secs();
+    static const ulong PANIC_RESET_SECS_MAX = 3600;
+    bool is_smp_off();
 
     /* maxcpus=N -- bring up at most N CPUs, the BSP included. 0 = no cap. */
-    ulong GetMaxCpus();
+    ulong get_max_cpus();
 
-    bool IsItsEnabled();
+    bool is_its_enabled();
 
     /* wxprobe=text (or the older =on): write to .text once the image has
        been split, wxprobe=heap: call into a page the allocator just handed
        out. Both are meant to be fatal -- they are how W^X is shown to be
        doing its job (docs/paging.md). */
-    bool IsWxProbeText();
-    bool IsWxProbeHeap();
+    bool is_wx_probe_text();
+    bool is_wx_probe_heap();
 
-    bool IsUsbOff();
+    bool is_usb_off();
 
     /* rc=off -- do not run /etc/rc at boot: the way past a command in it
        that keeps the machine from coming up (see Cmd::RunBootScript) */
-    bool IsRcOff();
+    bool is_rc_off();
 
     /* hwrng=off -- ignore the cpu's random instruction (RDRAND/RDSEED,
        RNDR). For seeing what a machine without one does, on a machine that
        has one; the pool then falls back on virtio-rng and timing jitter. */
-    bool IsHwRngOff();
+    bool is_hw_rng_off();
 
     /* hwp=off -- x86: leave the CPUs' clock where firmware left it rather
        than turning on hardware P-states (Hal::SetupCpuPerformance) */
-    bool IsHwpOff();
+    bool is_hwp_off();
 
     /* ucode=off -- x86: load no microcode from the module GRUB put beside
        the kernel; the CPUs run firmware's (arch/x86_64/microcode.h) */
-    bool IsUcodeOff();
+    bool is_ucode_off();
 
-    bool IsConsoleSerial();
-    bool IsConsoleVga();
-    bool IsConsoleBoth();
+    bool is_console_serial();
+    bool is_console_vga();
+    bool is_console_both();
 
-    bool IsDhcpAuto();
-    bool IsDhcpOff();
+    bool is_dhcp_auto();
+    bool is_dhcp_off();
 
-    u16 GetUdpShellPort();
+    u16 get_udp_shell_port();
 
     /* netconsole=ip:port -- stream the kernel log to that collector */
-    bool IsNetconsoleEnabled();
+    bool is_netconsole_enabled();
     /* Host byte order; 0 when no netconsole was asked for. */
-    u32 GetNetconsoleIp();
-    u16 GetNetconsolePort();
+    u32 get_netconsole_ip();
+    u16 get_netconsole_port();
 
     /* nctail=N -- when the link comes up, ship only the newest N KiB of the
        buffered boot log. 0 (the default) ships all of it. */
-    ulong GetNetconsoleTailKb();
+    ulong get_netconsole_tail_kb();
 
     /* netframes=N -- how many frames the network pool is built with. 0 (the
        default) means the network layer's own default. Worth having as a knob
        rather than a rebuild: how many frames a driver keeps in flight is a
        property of that driver and that load, and the only way to find out is
        to raise it on the machine in question and watch `netpool` for misses. */
-    ulong GetNetFrameCount();
+    ulong get_net_frame_count();
 
     /* hugepages=N% | NG | NM -- the huge pool (mm/page_table.h,
        ReserveHugePool): that share of the machine's RAM, or that much of
@@ -109,7 +109,7 @@ public:
        pool, a guest's memory is the pool's or the guest does not start.
        What is asked past what the machine can spare is cut down to it, and
        the boot says so. The bytes for a machine of totalBytes of RAM. */
-    ulong GetHugePoolBytes(ulong totalBytes);
+    ulong get_huge_pool_bytes(ulong total_bytes);
 
     /* rxpoll=on -- have the tick look at the receive path as well as the
        NIC's own interrupt. Off by default: it is a hypothesis about a driver
@@ -118,14 +118,14 @@ public:
        so the two can be compared without a rebuild, which is the only way to
        tell on a box whose console is a UDP socket. The network layer's
        poll asks (kernel_param_rxpoll_on); the tick only offers. */
-    bool IsRxPollEnabled();
+    bool is_rx_poll_enabled();
 
     /* loglevel=N: the trace level to boot with. Defaults to what main sets
        today; the `loglevel` shell command moves it afterwards. */
-    int GetLogLevel();
-    static const int DefaultLogLevel = 1;
+    int get_log_level();
+    static const int DEFAULT_LOG_LEVEL = 1;
 
-    bool IsDnsEnabled();
+    bool is_dns_enabled();
 
     /* root=auto | <device> | LABEL=<label> | UUID=<uuid>: what to mount on /
        (see fs/rootfs.cpp). Value holds the device name or label; Uuid the
@@ -138,35 +138,35 @@ public:
         RootUuid,
     };
 
-    static const ulong RootValueLen = 40;
-    static const ulong UuidBytes = 16;
-    static const ulong UuidTextLen = 36;
+    static const ulong ROOT_VALUE_LEN = 40;
+    static const ulong UUID_BYTES = 16;
+    static const ulong UUID_TEXT_LEN = 36;
 
     struct RootSpec {
-        RootMode Mode;
-        char Value[RootValueLen];
-        u8 Uuid[UuidBytes];
+        RootMode mode;
+        char value[ROOT_VALUE_LEN];
+        u8 uuid[UUID_BYTES];
     };
 
-    const RootSpec& GetRoot();
+    const RootSpec& get_root();
 
     /* ro: mount the root filesystem read-only */
-    bool IsRootReadOnly();
+    bool is_root_read_only();
 
     /* fstest=on: run the filesystem self-test on / once it is mounted */
-    bool IsFsTest();
+    bool is_fs_test();
 
     /* disklog=on: write the kernel log to a disk area prepared with
        scripts/disklog.py (see kernel/disklog.h). Off by default: it costs
        a forced disk write per burst of lines. */
-    bool IsDiskLogOn();
+    bool is_disk_log_on();
 
-    const char* GetCmdline();
+    const char* get_cmdline();
 
     Parameters();
     ~Parameters();
 private:
-    bool ParseParameter(const char *cmdline, size_t start, size_t end);
+    bool parse_parameter(const char *cmdline, size_t start, size_t end);
 
     enum ConsoleMode {
         ConsoleBoth = 0,
@@ -186,39 +186,39 @@ private:
         DhcpOff,       /* disabled entirely */
     };
 
-    char Cmdline[CmdlineLen];
-    bool TraceVga;
-    bool PanicVga;
-    ulong PanicResetSecs;
-    bool SmpOff;
-    ulong MaxCpusLimit;
-    bool ItsEnabled;
-    bool HwRngOff;
-    bool HwpOff;
-    bool UcodeOff;
-    WxProbeMode WxProbeMd;
-    bool UsbOff;
-    bool RcOff;
-    ConsoleMode ConMode;
-    DhcpMode DhcpMd;
-    u16 UdpShellPort;
-    u32 NetconsoleIp;
-    u16 NetconsolePort;
-    ulong NetconsoleTailKb;
-    ulong NetFrameCount;
+    char cmdline_[CMDLINE_LEN];
+    bool trace_vga_;
+    bool panic_vga_;
+    ulong panic_reset_secs_;
+    bool smp_off_;
+    ulong max_cpus_limit_;
+    bool its_enabled_;
+    bool hw_rng_off_;
+    bool hwp_off_;
+    bool ucode_off_;
+    WxProbeMode wx_probe_md_;
+    bool usb_off_;
+    bool rc_off_;
+    ConsoleMode con_mode_;
+    DhcpMode dhcp_md_;
+    u16 udp_shell_port_;
+    u32 netconsole_ip_;
+    u16 netconsole_port_;
+    ulong netconsole_tail_kb_;
+    ulong net_frame_count_;
     /* hugepages=: a share of RAM in percent, or bytes -- one of the two. */
-    ulong HugePoolPercent;
-    ulong HugePoolBytes;
-    bool RxPoll;
-    int LogLevel;
-    bool DnsEnabled;
-    RootSpec Root;
-    bool RootReadOnly;
-    bool FsTest;
-    bool DiskLogOn;
-    bool Parsed;
+    ulong huge_pool_percent_;
+    ulong huge_pool_bytes_;
+    bool rx_poll_;
+    int log_level_;
+    bool dns_enabled_;
+    RootSpec root_;
+    bool root_read_only_;
+    bool fs_test_;
+    bool disk_log_on_;
+    bool parsed_;
 
-    static bool ParseUuid(const char* text, u8* out);
-    bool ParseHugePool(const char* value);
+    static bool parse_uuid(const char* text, u8* out);
+    bool parse_huge_pool(const char* value);
 };
 }

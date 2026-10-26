@@ -2,26 +2,26 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 /* SetJmp/LongJmp buffer: x19-x28, x29, x30, sp (+pad to 16-byte multiple) */
 struct JmpContext final
 {
-    ulong X19;
-    ulong X20;
-    ulong X21;
-    ulong X22;
-    ulong X23;
-    ulong X24;
-    ulong X25;
-    ulong X26;
-    ulong X27;
-    ulong X28;
-    ulong Fp;   /* x29 */
-    ulong Lr;   /* x30 */
-    ulong Sp;
-    ulong Pad;
+    ulong x19;
+    ulong x20;
+    ulong x21;
+    ulong x22;
+    ulong x23;
+    ulong x24;
+    ulong x25;
+    ulong x26;
+    ulong x27;
+    ulong x28;
+    ulong fp;   /* x29 */
+    ulong lr;   /* x30 */
+    ulong sp;
+    ulong pad;
 };
 
 /* Exception/interrupt register frame, built by vectors.S. The accessor
@@ -29,33 +29,33 @@ struct JmpContext final
    cross-arch contract with common code. */
 struct Context final
 {
-    ulong X[31];  /* x0..x30 */
-    ulong Sp;     /* SP at the exception point (SP_EL1, frame excluded) */
-    ulong Elr;    /* return address (ELR_EL1) */
-    ulong Spsr;   /* SPSR_EL1 */
-    ulong Esr;    /* exception syndrome (ESR_EL1) */
-    ulong Far;    /* fault address (FAR_EL1) */
+    ulong x[31];  /* x0..x30 */
+    ulong sp;     /* SP at the exception point (SP_EL1, frame excluded) */
+    ulong elr;    /* return address (ELR_EL1) */
+    ulong spsr;   /* SPSR_EL1 */
+    ulong esr;    /* exception syndrome (ESR_EL1) */
+    ulong far;    /* fault address (FAR_EL1) */
 
-    ulong GetRetRip(bool hasErrorCode = false)
+    ulong get_ret_rip(bool has_error_code = false)
     {
-        (void)hasErrorCode;
-        return Elr;
+        (void)has_error_code;
+        return elr;
     }
 
-    ulong GetErrorCode()
+    ulong get_error_code()
     {
-        return Esr;
+        return esr;
     }
 
-    ulong GetOrigRsp(bool hasErrorCode = false)
+    ulong get_orig_rsp(bool has_error_code = false)
     {
-        (void)hasErrorCode;
-        return Sp;
+        (void)has_error_code;
+        return sp;
     }
 
-    ulong GetFramePointer()
+    ulong get_frame_pointer()
     {
-        return X[29];
+        return x[29];
     }
 
 private:

@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-namespace Kernel
+namespace kernel
 {
 
 class InterruptHandler;
@@ -14,34 +14,34 @@ class InterruptHandler;
 class Its final
 {
 public:
-    static Its& GetInstance()
+    static Its& get_instance()
     {
-        static Its Instance;
-        return Instance;
+        static Its instance;
+        return instance;
     }
 
     /* BSP once: map registers, provision tables + command queue, enable
        LPIs on this CPU's redistributor and the ITS. gicrBase/gicrSize come
        from the GIC driver (redistributor region for LPI enable). */
-    bool Setup(ulong itsPhys, ulong gicrBase, ulong gicrSize);
+    bool setup(ulong its_phys, ulong gicr_base, ulong gicr_size);
 
-    bool IsReady() const { return Ready; }
+    bool is_ready() const { return ready_; }
 
     /* Map a device (PCI RID) with room for `numEvents` events. Idempotent
        per deviceId. Returns false on failure. */
-    bool MapDevice(u32 deviceId, u32 numEvents);
+    bool map_device(u32 device_id, u32 num_events);
 
     /* Allocate an LPI and map (deviceId, eventId) -> LPI to the boot
        collection; registers `handler` for that LPI. Returns the MSI data
        value (the eventId) and fills msiAddr with GITS_TRANSLATER; returns
        0 on failure. Caller writes {msiAddr, eventId} into the MSI-X entry. */
-    u32 MapEvent(u32 deviceId, u32 eventId, InterruptHandler& handler,
-        u64& msiAddr);
+    u32 map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
+        u64& msi_addr);
 
     /* Dispatch an incoming LPI (INTID >= 8192) to its handler. */
-    void HandleLpi(u32 intId);
+    void handle_lpi(u32 int_id);
 
-    static const u32 LpiIntIdBase = 8192;
+    static const u32 LPI_INT_ID_BASE = 8192;
 
 private:
     Its() = default;
@@ -51,58 +51,58 @@ private:
     Its& operator=(const Its& other) = delete;
     Its& operator=(Its&& other) = delete;
 
-    bool ProvisionTables();
-    bool SetupCommandQueue();
-    bool EnableLpisOnRedist(ulong gicrBase, ulong gicrSize);
+    bool provision_tables();
+    bool setup_command_queue();
+    bool enable_lpis_on_redist(ulong gicr_base, ulong gicr_size);
 
-    void CmdMapd(u32 deviceId, u64 ittPhys, u32 sizeBits, bool valid);
-    void CmdMapc(u16 icid, u64 rdBase, bool valid);
-    void CmdMapti(u32 deviceId, u32 eventId, u32 lpiIntId, u16 icid);
-    void CmdInv(u32 deviceId, u32 eventId);
-    void CmdSync(u64 rdBase);
-    void PostCommand(const u64 cmd[4]);
-    bool WaitCommands();
+    void cmd_mapd(u32 device_id, u64 itt_phys, u32 size_bits, bool valid);
+    void cmd_mapc(u16 icid, u64 rd_base, bool valid);
+    void cmd_mapti(u32 device_id, u32 event_id, u32 lpi_int_id, u16 icid);
+    void cmd_inv(u32 device_id, u32 event_id);
+    void cmd_sync(u64 rd_base);
+    void post_command(const u64 cmd[4]);
+    bool wait_commands();
 
-    u32 AllocLpi();
+    u32 alloc_lpi();
 
-    ulong ItsBase = 0;   /* mapped VA */
-    ulong ItsPhys = 0;   /* physical base (for the MSI translate address) */
-    bool Ready = false;
+    ulong its_base_ = 0;   /* mapped VA */
+    ulong its_phys_ = 0;   /* physical base (for the MSI translate address) */
+    bool ready_ = false;
 
     /* Command queue */
-    ulong CmdQueueVa = 0;
-    ulong CmdQueuePhys = 0;
-    ulong CmdQueueBytes = 0;
-    ulong CmdWriteOff = 0;
+    ulong cmd_queue_va_ = 0;
+    ulong cmd_queue_phys_ = 0;
+    ulong cmd_queue_bytes_ = 0;
+    ulong cmd_write_off_ = 0;
 
     /* Collection -> boot redistributor */
-    u16 BootIcid = 0;
-    u64 BootRdBase = 0; /* RDbase encoding (PTA-dependent) */
+    u16 boot_icid_ = 0;
+    u64 boot_rd_base_ = 0; /* RDbase encoding (PTA-dependent) */
 
-    u32 EventIdBits = 0;
-    u32 DeviceIdBits = 0;
-    u32  IttEntrySize = 0;
-    bool Pta = false;
+    u32 event_id_bits_ = 0;
+    u32 device_id_bits_ = 0;
+    u32  itt_entry_size_ = 0;
+    bool pta_ = false;
 
     /* LPI allocation + config table */
-    static const u32 MaxLpis = 64;
-    u32 NextLpi = 0;
-    ulong LpiConfigVa = 0;
+    static const u32 MAX_LPIS = 64;
+    u32 next_lpi_ = 0;
+    ulong lpi_config_va_ = 0;
 
     struct LpiHandler
     {
-        InterruptHandler* Handler;
+        InterruptHandler* handler;
     };
-    LpiHandler LpiHandlers[MaxLpis];
+    LpiHandler lpi_handlers_[MAX_LPIS];
 
     /* Per-device ITT tracking (small: only NVMe/r8168 here) */
-    static const u32 MaxDevices = 8;
+    static const u32 MAX_DEVICES = 8;
     struct DeviceEntry
     {
-        u32 DeviceId;
-        bool Used;
+        u32 device_id;
+        bool used;
     };
-    DeviceEntry Devices[MaxDevices];
+    DeviceEntry devices_[MAX_DEVICES];
 };
 
 }

@@ -9,10 +9,10 @@
 // broadcasts them to every CPU — no IPI shootdown needed
 // (Hal::TlbShootdownNeedsIpi() returns false).
 
-namespace Hal
+namespace hal
 {
 
-static inline __attribute__((always_inline)) void TlbFlushPage(ulong virtAddr)
+static inline __attribute__((always_inline)) void tlb_flush_page(ulong virt_addr)
 {
     /* TLBI VAAE1IS operand: VA[55:12] in bits [43:0]; bits [47:44] are the
        FEAT_TTL hint. Mask the shifted VA — a kernel address would otherwise
@@ -24,10 +24,10 @@ static inline __attribute__((always_inline)) void TlbFlushPage(ulong virtAddr)
         "tlbi vaae1is, %0\n"
         "dsb ish\n"
         "isb\n"
-        :: "r"((virtAddr >> 12) & ((1UL << 44) - 1)) : "memory");
+        :: "r"((virt_addr >> 12) & ((1UL << 44) - 1)) : "memory");
 }
 
-static inline __attribute__((always_inline)) void TlbFlushAll()
+static inline __attribute__((always_inline)) void tlb_flush_all()
 {
     asm volatile(
         "dsb ishst\n"
@@ -37,7 +37,7 @@ static inline __attribute__((always_inline)) void TlbFlushAll()
         ::: "memory");
 }
 
-static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
+static inline __attribute__((always_inline)) bool tlb_shootdown_needs_ipi()
 {
     return false; /* tlbi *is broadcasts in hardware */
 }
@@ -46,7 +46,7 @@ static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
    about to go through it. No TLB holds a translation from an invalid entry,
    so there is nothing to invalidate; the store has to reach the table
    walker, and later instructions have to see the new translation. */
-static inline __attribute__((always_inline)) void PteMadeValid()
+static inline __attribute__((always_inline)) void pte_made_valid()
 {
     asm volatile(
         "dsb ishst\n"
@@ -54,7 +54,7 @@ static inline __attribute__((always_inline)) void PteMadeValid()
         ::: "memory");
 }
 
-static inline __attribute__((always_inline)) ulong GetTranslationRoot()
+static inline __attribute__((always_inline)) ulong get_translation_root()
 {
     ulong root;
     asm volatile("mrs %0, ttbr1_el1" : "=r"(root));
@@ -62,7 +62,7 @@ static inline __attribute__((always_inline)) ulong GetTranslationRoot()
     return root & 0x0000FFFFFFFFF000UL;
 }
 
-static inline __attribute__((always_inline)) void SetTranslationRoot(ulong phys)
+static inline __attribute__((always_inline)) void set_translation_root(ulong phys)
 {
     asm volatile(
         "dsb ishst\n"      /* prior PTE stores visible to the walker */
@@ -75,7 +75,7 @@ static inline __attribute__((always_inline)) void SetTranslationRoot(ulong phys)
 }
 
 /* dsb ishst after PTE stores so table walkers observe them; no-op on x86 */
-static inline __attribute__((always_inline)) void PteWriteBarrier()
+static inline __attribute__((always_inline)) void pte_write_barrier()
 {
     asm volatile("dsb ishst" ::: "memory");
 }

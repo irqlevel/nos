@@ -9,105 +9,105 @@
    calibration needed (x86 twin: kernel/time.cpp + arch/x86_64/tsc.cpp).
    Wall clock arrives with the PL031 driver (milestone M3). */
 
-namespace Kernel
+namespace kernel
 {
 
 namespace
 {
 
-u64 BootCount;
-u64 FreqHz;
-ulong BootEpochSecs;
+u64 boot_count;
+u64 freq_hz;
+ulong boot_epoch_secs;
 
-u64 ReadCntvct()
+u64 read_cntvct()
 {
     u64 cnt;
     asm volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
     return cnt;
 }
 
-u64 ReadCntfrq()
+u64 read_cntfrq()
 {
     u64 freq;
     asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
     return freq;
 }
 
-u64 CountToNs(u64 count)
+u64 count_to_ns(u64 count)
 {
     /* Split to avoid 128-bit division (no compiler-rt in the kernel):
        remainder * 1e9 stays < 2^63 for any sane counter frequency. */
-    return (count / FreqHz) * Const::NanoSecsInSec +
-           ((count % FreqHz) * Const::NanoSecsInSec) / FreqHz;
+    return (count / freq_hz) * consts::NANO_SECS_IN_SEC +
+           ((count % freq_hz) * consts::NANO_SECS_IN_SEC) / freq_hz;
 }
 
 }
 
-void TimeInit()
+void time_init()
 {
-    if (FreqHz == 0)
+    if (freq_hz == 0)
     {
         /* Not yet self-armed by an early GetBootTime call */
-        FreqHz = ReadCntfrq();
-        BootCount = ReadCntvct();
+        freq_hz = read_cntfrq();
+        boot_count = read_cntvct();
     }
-    Trace(0, "TimeInit: generic timer freq %lu Hz", FreqHz);
+    trace(0, "TimeInit: generic timer freq %lu Hz", freq_hz);
 
     /* PL031 RTC: seconds since the Unix epoch (QEMU virt), through the
        premapped device GiB. The x86 twin reads the CMOS RTC. */
-    ulong pl031 = Board::GetInstance().Pl031Base;
+    ulong pl031 = Board::get_instance().pl031_base_;
     if (pl031 != 0)
     {
         u32 now = *reinterpret_cast<volatile u32*>(
-            Mm::MemoryMap::KernelSpaceBase + pl031);
-        ulong bootedSecs = CountToNs(ReadCntvct() - BootCount) /
-            Const::NanoSecsInSec;
-        BootEpochSecs = now - bootedSecs;
-        Trace(0, "TimeInit: rtc epoch %lu", (ulong)now);
+            mm::MemoryMap::KERNEL_SPACE_BASE + pl031);
+        ulong booted_secs = count_to_ns(read_cntvct() - boot_count) /
+            consts::NANO_SECS_IN_SEC;
+        boot_epoch_secs = now - booted_secs;
+        trace(0, "TimeInit: rtc epoch %lu", (ulong)now);
     }
 }
 
-Stdlib::Time GetBootTime()
+stdlib::Time get_boot_time()
 {
-    if (FreqHz == 0)
+    if (freq_hz == 0)
     {
         /* Callable before TimeInit (locks trace boot time); self-arm */
-        FreqHz = ReadCntfrq();
-        BootCount = ReadCntvct();
+        freq_hz = read_cntfrq();
+        boot_count = read_cntvct();
     }
 
-    Stdlib::Time time;
-    time.NanoSecs = CountToNs(ReadCntvct() - BootCount);
+    stdlib::Time time;
+    time.nano_secs = count_to_ns(read_cntvct() - boot_count);
     return time;
 }
 
-ulong CycleCounterDeltaToNs(u64 delta)
+ulong cycle_counter_delta_to_ns(u64 delta)
 {
     /* Hal::ReadCycleCounter is CNTVCT_EL0, the same counter GetBootTime
        reads, so FreqHz converts it directly. */
-    if (FreqHz == 0)
+    if (freq_hz == 0)
         return 0;
 
-    return CountToNs(delta);
+    return count_to_ns(delta);
 }
 
-void BusyWait(ulong nanoSecs)
+void busy_wait(ulong nano_secs)
 {
-    if (FreqHz == 0)
-        GetBootTime();
+    if (freq_hz == 0)
+        get_boot_time();
 
-    u64 target = ReadCntvct() +
-        (nanoSecs / Const::NanoSecsInSec) * FreqHz +
-        ((nanoSecs % Const::NanoSecsInSec) * FreqHz) / Const::NanoSecsInSec;
-    while (ReadCntvct() < target)
+    u64 target = read_cntvct() +
+        (nano_secs / consts::NANO_SECS_IN_SEC) * freq_hz +
+        ((nano_secs % consts::NANO_SECS_IN_SEC) * freq_hz) / consts::NANO_SECS_IN_SEC;
+    while (read_cntvct() < target)
     {
         asm volatile("yield");
     }
 }
 
-ulong GetWallTimeSecs()
+ulong get_wall_time_secs()
 {
-    return BootEpochSecs + GetBootTime().NanoSecs / Const::NanoSecsInSec;
+    return boot_epoch_secs + get_boot_time().nano_secs / consts::NANO_SECS_IN_SEC;
 }
 
 }

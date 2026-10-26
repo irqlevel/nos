@@ -7,140 +7,140 @@
 
 #include <kernel/panic.h>
 
-namespace Stdlib
+namespace stdlib
 {
 
-template <typename T, size_t Capacity = Const::PageSize, typename LockType = Stdlib::NopLock>
+template <typename T, size_t CAPACITY = consts::PAGE_SIZE, typename LockType = stdlib::NopLock>
 class RingBuffer final
 {
 public:
     class Dumper
     {
     public:
-        virtual void OnElement(const T& element) = 0;
+        virtual void on_element(const T& element) = 0;
     };
 
     RingBuffer()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        Size = 0;
-        StartIndex = 0;
-        EndIndex = 0;
+        size_ = 0;
+        start_index_ = 0;
+        end_index_ = 0;
     }
 
     ~RingBuffer()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
     }
 
-    bool Put(const T& value)
+    bool put(const T& value)
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (Size == Capacity)
+        if (size_ == CAPACITY)
         {
             return false;
         }
 
-        size_t position = EndIndex;
-        Buf[position] = value;
-        EndIndex = (EndIndex + 1) % Capacity;
-        Size++;
+        size_t position = end_index_;
+        buf_[position] = value;
+        end_index_ = (end_index_ + 1) % CAPACITY;
+        size_++;
         return true;
     }
 
-    bool Put(T&& value)
+    bool put(T&& value)
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (Size == Capacity)
+        if (size_ == CAPACITY)
         {
             return false;
         }
 
-        size_t position = EndIndex;
-        Buf[position] = Stdlib::Move(value);
-        EndIndex = (EndIndex + 1) % Capacity;
-        Size++;
+        size_t position = end_index_;
+        buf_[position] = stdlib::move(value);
+        end_index_ = (end_index_ + 1) % CAPACITY;
+        size_++;
         return true;
     }
 
-    bool IsEmpty()
+    bool is_empty()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        return (Size == 0) ? true : false;
+        return (size_ == 0) ? true : false;
     }
 
-    bool IsFull()
+    bool is_full()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        return (Size == Capacity) ? true : false;
+        return (size_ == CAPACITY) ? true : false;
     }
 
-    size_t GetSize()
+    size_t get_size()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        return Size;
+        return size_;
     }
 
-    size_t GetCapacity()
+    size_t get_capacity()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        return Capacity;
+        return CAPACITY;
     }
 
-    T Get()
+    T get()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (Size == 0)
+        if (size_ == 0)
         {
             return T();
         }
 
-        size_t position = StartIndex;
-        StartIndex = (StartIndex + 1) % Capacity;
-        Size--;
-        return Buf[position];
+        size_t position = start_index_;
+        start_index_ = (start_index_ + 1) % CAPACITY;
+        size_--;
+        return buf_[position];
     }
 
-    void PopHead()
+    void pop_head()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (Size == 0)
+        if (size_ == 0)
             return;
 
-        StartIndex = (StartIndex + 1) % Capacity;
-        Size--;
+        start_index_ = (start_index_ + 1) % CAPACITY;
+        size_--;
     }
 
-    void Clear()
+    void clear()
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        Size = 0;
-        StartIndex = 0;
-        EndIndex = 0;
+        size_ = 0;
+        start_index_ = 0;
+        end_index_ = 0;
     }
 
-    void Print(TypePrinter<T>& printer)
+    void print(TypePrinter<T>& printer)
     {
-        Stdlib::AutoLock lock(Lock);
+        stdlib::AutoLock lock(lock_);
 
-        if (Size == 0)
+        if (size_ == 0)
             return;
 
-        size_t index = StartIndex;
-        for (size_t i = 0; i < Size; i++)
+        size_t index = start_index_;
+        for (size_t i = 0; i < size_; i++)
         {
-            printer.PrintElement(Buf[index]);
-            index = (index + 1) % Capacity;
+            printer.print_element(buf_[index]);
+            index = (index + 1) % CAPACITY;
         }
     }
 
@@ -150,12 +150,12 @@ private:
     RingBuffer& operator=(const RingBuffer& other) = delete;
     RingBuffer& operator=(RingBuffer&& other) = delete;
 
-    size_t StartIndex;
-    size_t EndIndex;
-    size_t Size;
-    T Buf[Capacity];
+    size_t start_index_;
+    size_t end_index_;
+    size_t size_;
+    T buf_[CAPACITY];
 
-    LockType Lock;
+    LockType lock_;
 };
 
 }

@@ -2,95 +2,95 @@
 #include <hal/cpu.h>
 #include "preempt.h"
 
-namespace Kernel
+namespace kernel
 {
 
-Task* RawRwSpinLock::ReadLock()
+Task* RawRwSpinLock::read_lock()
 {
     /* Before the acquire, as in RawSpinLock::Lock(): a tick landing between
        the two would switch a reader away with the lock held. */
-    Task* task = PreemptDisableTask();
+    Task* task = preempt_disable_task();
 
     for (;;)
     {
-        if (WriterWaiting.Get() != 0)
+        if (writer_waiting_.get() != 0)
         {
-            Pause();
+            cpu_relax();
             continue;
         }
 
-        long v = Value.Get();
-        if (v >= 0 && Value.Cmpxchg(v + 1, v) == v)
+        long v = value_.get();
+        if (v >= 0 && value_.cmpxchg(v + 1, v) == v)
         {
             /* A writer may have started waiting between the check above
                and the cmpxchg; back out so it isn't starved */
-            if (WriterWaiting.Get() != 0)
+            if (writer_waiting_.get() != 0)
             {
-                Value.Dec();
-                Pause();
+                value_.dec();
+                cpu_relax();
                 continue;
             }
             break;
         }
 
-        Pause();
+        cpu_relax();
     }
 
     return task;
 }
 
-void RawRwSpinLock::ReadUnlock(Task* preemptTask)
+void RawRwSpinLock::read_unlock(Task* preempt_task)
 {
-    Value.Dec();
-    PreemptEnableTask(preemptTask);
+    value_.dec();
+    preempt_enable_task(preempt_task);
 }
 
-void RawRwSpinLock::AcquireWrite()
+void RawRwSpinLock::acquire_write()
 {
-    WriterWaiting.Inc();
+    writer_waiting_.inc();
     for (;;)
     {
-        if (Value.Cmpxchg(-1, 0) == 0)
+        if (value_.cmpxchg(-1, 0) == 0)
             break;
 
-        Pause();
+        cpu_relax();
     }
 }
 
-void RawRwSpinLock::ReleaseWrite()
+void RawRwSpinLock::release_write()
 {
-    Value.Set(0);
-    WriterWaiting.Dec();
+    value_.set(0);
+    writer_waiting_.dec();
 }
 
-void RawRwSpinLock::WriteLock()
+void RawRwSpinLock::write_lock()
 {
-    Task* task = PreemptDisableTask();
-    AcquireWrite();
-    WriterPreemptTask = task;
+    Task* task = preempt_disable_task();
+    acquire_write();
+    writer_preempt_task_ = task;
 }
 
-void RawRwSpinLock::WriteUnlock()
+void RawRwSpinLock::write_unlock()
 {
     /* Read and cleared while the lock is still ours: once it is released,
        the next writer records its own. */
-    Task* task = WriterPreemptTask;
-    WriterPreemptTask = nullptr;
-    ReleaseWrite();
-    PreemptEnableTask(task);
+    Task* task = writer_preempt_task_;
+    writer_preempt_task_ = nullptr;
+    release_write();
+    preempt_enable_task(task);
 }
 
-ulong RawRwSpinLock::WriteLockIrqSave()
+ulong RawRwSpinLock::write_lock_irq_save()
 {
-    ulong flags = PreemptIrqSave();
-    AcquireWrite();
+    ulong flags = preempt_irq_save();
+    acquire_write();
     return flags;
 }
 
-void RawRwSpinLock::WriteUnlockIrqRestore(ulong flags)
+void RawRwSpinLock::write_unlock_irq_restore(ulong flags)
 {
-    ReleaseWrite();
-    PreemptIrqRestore(flags);
+    release_write();
+    preempt_irq_restore(flags);
 }
 
 }

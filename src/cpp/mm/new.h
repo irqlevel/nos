@@ -3,48 +3,48 @@
 #include <include/types.h>
 #include <lib/stdlib.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
-void* Alloc(size_t size, ulong tag);
+void* alloc(size_t size, ulong tag);
 
 /* Alloc with no promise about what the block holds: for Rust's global
    allocator (AllocatorImpl::AllocUninit) */
-void* AllocUninit(size_t size, ulong tag);
+void* alloc_uninit(size_t size, ulong tag);
 
-void Free(void* ptr);
+void free(void* ptr);
 
-void* AllocMapPages(size_t numPages, ulong* physAddr);
+void* alloc_map_pages(size_t num_pages, ulong* phys_addr);
 
-void UnmapFreePages(void* ptr);
+void unmap_free_pages(void* ptr);
 
-void* MapPages(size_t numPages, ulong* physAddrs);
+void* map_pages(size_t num_pages, ulong* phys_addrs);
 
-void UnmapPages(void* ptr, size_t numPages);
+void unmap_pages(void* ptr, size_t num_pages);
 
 /* MapPages for more pages than its largest block holds, up to
    PageTable::MaxLargeMapPages: a loadable module's image, the .ko it is
    read from. The pages stay the caller's, as with MapPages. */
-void* MapLargePages(size_t numPages, ulong* physAddrs);
+void* map_large_pages(size_t num_pages, ulong* phys_addrs);
 
-void UnmapLargePages(void* ptr, size_t numPages);
+void unmap_large_pages(void* ptr, size_t num_pages);
 
-template<typename T, ulong tag, class... Args>
-T* TAlloc(Args&&... args)
+template<typename T, ulong TAG, class... Args>
+T* talloc(Args&&... args)
 {
-    void* p = Alloc(sizeof(T), tag);
+    void* p = alloc(sizeof(T), TAG);
     if (p == nullptr)
         return nullptr;
 
-    return new (p) T(Stdlib::Forward<Args>(args)...);
+    return new (p) T(stdlib::forward<Args>(args)...);
 }
 
 struct FreeDeleter
 {
-    void operator()(void* ptr) const { Free(ptr); }
+    void operator()(void* ptr) const { free(ptr); }
 };
 
 /* Tag for the non-throwing operator new forms. The replaceable plain forms
@@ -59,7 +59,7 @@ struct FreeDeleter
    for which the compiler is required to emit a null check before the
    constructor and to preserve callers' tests. */
 struct NoThrowT {};
-inline constexpr NoThrowT NoThrow{};
+inline constexpr NoThrowT NO_THROW{};
 
 }
 }
@@ -72,13 +72,13 @@ void* operator new(size_t size, void *ptr) noexcept;
 void* operator new[](size_t size, void *ptr) noexcept;
 
 /* Fallible forms: return nullptr on OOM. */
-void* operator new(size_t size, const Kernel::Mm::NoThrowT&) noexcept;
-void* operator new[](size_t size, const Kernel::Mm::NoThrowT&) noexcept;
+void* operator new(size_t size, const kernel::mm::NoThrowT&) noexcept;
+void* operator new[](size_t size, const kernel::mm::NoThrowT&) noexcept;
 
 /* Matching placement deletes: only reachable if a constructor throws,
    impossible with -fno-exceptions; declared for completeness. */
-void operator delete(void* ptr, const Kernel::Mm::NoThrowT&) noexcept;
-void operator delete[](void* ptr, const Kernel::Mm::NoThrowT&) noexcept;
+void operator delete(void* ptr, const kernel::mm::NoThrowT&) noexcept;
+void operator delete[](void* ptr, const kernel::mm::NoThrowT&) noexcept;
 
 void operator delete(void* ptr);
 void operator delete[](void* ptr);

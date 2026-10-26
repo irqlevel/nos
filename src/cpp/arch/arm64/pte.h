@@ -3,10 +3,10 @@
 #include <lib/stdlib.h>
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace kernel
 {
 
-namespace Mm
+namespace mm
 {
 
 /* arm64 4K-granule descriptor, API-compatible with the x86 Pte (see
@@ -28,10 +28,10 @@ namespace Mm
      always set together with the valid bit. */
 struct Pte final
 {
-    ulong Value;
+    ulong value;
 
     Pte()
-        : Value(0)
+        : value(0)
     {
     }
 
@@ -39,149 +39,149 @@ struct Pte final
     {
     }
 
-    ulong Address()
+    ulong address()
     {
-        return Value & AddrMask;
+        return value & ADDR_MASK;
     }
 
-    bool Present()
+    bool present()
     {
-        return (Value & (1UL << PresentBit)) ? true : false;
+        return (value & (1UL << PRESENT_BIT)) ? true : false;
     }
 
-    bool Huge()
+    bool huge()
     {
-        return (Value & HugeSwBit) ? true : false;
+        return (value & HUGE_SW_BIT) ? true : false;
     }
 
-    void SetAddress(ulong address)
+    void set_address(ulong address)
     {
-        BugOn(address & ~AddrMask);
-        Value |= address;
+        BUG_ON(address & ~ADDR_MASK);
+        value |= address;
     }
 
     /* Call-order independent w.r.t. SetHuge: the software "huge" marker
        (bit 55, ignored by the MMU) decides whether the descriptor is a
        table/page (bit1 set) or a block (bit1 clear). */
-    void SetPresent()
+    void set_present()
     {
-        Value |= (1UL << PresentBit) | AfBit | ShInner;
-        if (!(Value & HugeSwBit))
-            Value |= (1UL << TableBit);
+        value |= (1UL << PRESENT_BIT) | AF_BIT | SH_INNER;
+        if (!(value & HUGE_SW_BIT))
+            value |= (1UL << TABLE_BIT);
     }
 
-    void SetCacheDisabled()
+    void set_cache_disabled()
     {
-        Value &= ~(AttrIdxMask | ShInner);
+        value &= ~(ATTR_IDX_MASK | SH_INNER);
         /* Device memory is never executable: a speculative instruction
            fetch from MMIO can trigger read side effects on real hardware */
-        Value |= AttrIdxDevice | PxnBit | UxnBit;
+        value |= ATTR_IDX_DEVICE | PXN_BIT | UXN_BIT;
     }
 
     /* Write-combining equivalent: MAIR idx2 = Normal non-cacheable, so
        stores may be merged and reordered the way x86 WC does. Kept
        execute-never like device memory -- the only user is a framebuffer. */
-    void SetWriteCombining()
+    void set_write_combining()
     {
-        Value &= ~AttrIdxMask;
-        Value |= AttrIdxNonCacheable | ShInner | PxnBit | UxnBit;
+        value &= ~ATTR_IDX_MASK;
+        value |= ATTR_IDX_NON_CACHEABLE | SH_INNER | PXN_BIT | UXN_BIT;
     }
 
-    void SetHuge()
+    void set_huge()
     {
-        Value |= HugeSwBit;
-        Value &= ~(1UL << TableBit);
+        value |= HUGE_SW_BIT;
+        value &= ~(1UL << TABLE_BIT);
     }
 
-    void SetWritable()
+    void set_writable()
     {
         /* AP[2]=0 is EL1 read-write: what a fresh entry already is, and what
            undoes SetReadOnly() */
-        Value &= ~ApReadOnly;
+        value &= ~AP_READ_ONLY;
     }
 
-    void SetReadOnly()
+    void set_read_only()
     {
-        Value |= ApReadOnly; /* AP[2] (bit 7) -> read-only at EL1 */
+        value |= AP_READ_ONLY; /* AP[2] (bit 7) -> read-only at EL1 */
     }
 
-    void SetNoExecute()
+    void set_no_execute()
     {
-        Value |= PxnBit | UxnBit; /* never executable */
+        value |= PXN_BIT | UXN_BIT; /* never executable */
     }
 
-    void ClearNoExecute()
+    void clear_no_execute()
     {
         /* Executable at EL1 only: UXN stays, there is no EL0 to run it */
-        Value &= ~PxnBit;
-        Value |= UxnBit;
+        value &= ~PXN_BIT;
+        value |= UXN_BIT;
     }
 
-    void ClearPresent()
+    void clear_present()
     {
-        Value &= ~(1UL << PresentBit);
+        value &= ~(1UL << PRESENT_BIT);
     }
 
-    void Clear()
+    void clear()
     {
-        Value = 0;
+        value = 0;
     }
 
     /* One index per translation level, top (L0 here, "L4" in the shared
        naming) to leaf. arm64 4K/48-bit uses the same 9-9-9-9-12 split as
        x86-64. */
-    static ulong L4Index(ulong virtAddr)
+    static ulong l4_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 3 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L3Index(ulong virtAddr)
+    static ulong l3_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 2 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L2Index(ulong virtAddr)
+    static ulong l2_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 1 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong L1Index(ulong virtAddr)
+    static ulong l1_index(ulong virt_addr)
     {
-        return (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+        return (virt_addr >> (12 + 0 * 9)) & ((1 << 9) - 1);
     }
 
-    static ulong HugeOffset(ulong virtAddr)
+    static ulong huge_offset(ulong virt_addr)
     {
-        return virtAddr & (HugePageSize - 1);
+        return virt_addr & (HUGE_PAGE_SIZE - 1);
     }
 
-    static const ulong PresentBit = 0;
-    static const ulong TableBit = 1;
+    static const ulong PRESENT_BIT = 0;
+    static const ulong TABLE_BIT = 1;
 
-    static const ulong AttrIdxMask = 7UL << 2;
-    static const ulong AttrIdxDevice = 1UL << 2; /* MAIR idx1 = Device-nGnRE */
-    static const ulong AttrIdxNonCacheable = 2UL << 2; /* MAIR idx2 = Normal NC */
-    static const ulong ShInner = 3UL << 8;
-    static const ulong AfBit = 1UL << 10;
-    static const ulong ApReadOnly = 1UL << 7;    /* AP[2]: read-only */
-    static const ulong PxnBit = 1UL << 53;       /* privileged execute-never */
-    static const ulong UxnBit = 1UL << 54;       /* unprivileged execute-never */
-    static const ulong HugeSwBit = 1UL << 55;    /* software bit: block entry */
+    static const ulong ATTR_IDX_MASK = 7UL << 2;
+    static const ulong ATTR_IDX_DEVICE = 1UL << 2; /* MAIR idx1 = Device-nGnRE */
+    static const ulong ATTR_IDX_NON_CACHEABLE = 2UL << 2; /* MAIR idx2 = Normal NC */
+    static const ulong SH_INNER = 3UL << 8;
+    static const ulong AF_BIT = 1UL << 10;
+    static const ulong AP_READ_ONLY = 1UL << 7;    /* AP[2]: read-only */
+    static const ulong PXN_BIT = 1UL << 53;       /* privileged execute-never */
+    static const ulong UXN_BIT = 1UL << 54;       /* unprivileged execute-never */
+    static const ulong HUGE_SW_BIT = 1UL << 55;    /* software bit: block entry */
 
-    static const ulong AddrMask = 0x0000FFFFFFFFF000UL;
+    static const ulong ADDR_MASK = 0x0000FFFFFFFFF000UL;
 
-    static const ulong HugePageShift = 21;
-    static const ulong HugePageSize = 1UL << HugePageShift;
+    static const ulong HUGE_PAGE_SHIFT = 21;
+    static const ulong HUGE_PAGE_SIZE = 1UL << HUGE_PAGE_SHIFT;
 };
 
 static_assert(sizeof(Pte) == 8, "Invalid size");
 
 struct PtePage final
 {
-    struct Pte Entry[512];
+    struct Pte entry[512];
 };
 
-static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
+static_assert(sizeof(PtePage) == consts::PAGE_SIZE, "Invalid size");
 
 }
 }
