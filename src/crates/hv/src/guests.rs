@@ -757,7 +757,8 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME]
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME,
+                TSCAUX_NAME]
             .into_iter())
 }
 
@@ -798,6 +799,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == AVX_NAME {
         return Some(run_avx(machine, out));
+    }
+    if name == TSCAUX_NAME {
+        return Some(run_tscaux(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -3095,6 +3099,440 @@ fn check_avx(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], loads: [u
                        refused, leaf 0xD's sizes 576 and 832; YMM0-15 0 at each CPU's start, and its YMM registers, \
                        MXCSR and control word its own at all {} of its turns, put back {} and {} times",
                       if avx2 { " (AVX2 too)" } else { "" }, AVX_TURNS_EACH, loads[0], loads[1]))
+}
+
+/* ---- tscaux: a guest's TSC_AUX its own; RDTSCP, RDPID and INVPCID ---- */
+
+const TSCAUX_NAME: &str = "tscaux";
+const TSCAUX_ABOUT: &str = "two VMs on one CPU, one after the other: each reads its TSC_AUX by RDTSCP, RDPID and RDMSR \
+                            as it starts, writes a value of its own and reads it back each way, has a write of bit 32 \
+                            refused, and runs INVPCID of every type -- each where its CPUID offers it, a #UD where it \
+                            does not -- and neither reads the other's";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #UD
+ * and #GP handlers note the vector and go on past the step that faulted --
+ * the address each step leaves at +0xF0. It reads what its CPUID offers --
+ * 0x8000_0001's EDX, leaf 7's EBX and ECX -- then its TSC_AUX by RDTSCP, by
+ * RDPID and by RDMSR; writes the host's word at +0x100 into it; reads the
+ * TSC, then the TSC and TSC_AUX by RDTSCP, then the TSC; reads TSC_AUX by
+ * RDPID and by RDMSR again; writes it with bit 32 set as well -- a #GP -- and
+ * reads it by RDMSR once more; runs INVPCID of types 0 to 3 on a descriptor
+ * of PCID 0 and the host's address at +0x108, and of type 4, which is none;
+ * leaves its mark and halts. Each step's value, and the vector it faulted
+ * with or 0, a quadword each from `RESULTS` on. Assembled from this source
+ * with clang, the offsets in the comments its listing's. */
+const TSCAUX_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x31, 0x02, 0x00, 0x00,               // 00: start: lea rax, [rip + ud] ; gate 6, #UD
+    0xBF, 0x60, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA060
+    0xE8, 0x53, 0x02, 0x00, 0x00,                           // 0c: call gate
+    0x48, 0x8D, 0x05, 0x2D, 0x02, 0x00, 0x00,               // 11: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 18: mov edi, 0xA0D0
+    0xE8, 0x42, 0x02, 0x00, 0x00,                           // 1d: call gate
+    0x0F, 0x01, 0x1D, 0x61, 0x02, 0x00, 0x00,               // 22: lidt [rip + idtr]
+    0x41, 0xBD, 0x00, 0x70, 0x00, 0x00,                     // 29: mov r13d, 0x7000 ; its results
+    0x4D, 0x8B, 0xA5, 0x00, 0x01, 0x00, 0x00,               // 2f: mov r12, qword [r13 + 0x100] ; its pattern
+    0xB8, 0x01, 0x00, 0x00, 0x80,                           // 36: mov eax, 0x80000001 ; what its CPUID offers
+    0x0F, 0xA2,                                             // 3b: cpuid
+    0x41, 0x89, 0x95, 0xC8, 0x00, 0x00, 0x00,               // 3d: mov dword [r13 + 0xC8], edx ; RDTSCP
+    0xB8, 0x07, 0x00, 0x00, 0x00,                           // 44: mov eax, 7
+    0x31, 0xC9,                                             // 49: xor ecx, ecx
+    0x0F, 0xA2,                                             // 4b: cpuid
+    0x41, 0x89, 0x9D, 0xD0, 0x00, 0x00, 0x00,               // 4d: mov dword [r13 + 0xD0], ebx ; INVPCID
+    0x41, 0x89, 0x8D, 0xD8, 0x00, 0x00, 0x00,               // 54: mov dword [r13 + 0xD8], ecx ; RDPID
+    0x48, 0x8D, 0x05, 0x0E, 0x00, 0x00, 0x00,               // 5b: lea rax, [rip + .L1] ; 1: RDTSCP, as it starts
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 62: mov qword [r13 + 0xF0], rax
+    0x0F, 0x01, 0xF9,                                       // 69: rdtscp
+    0x49, 0x89, 0x4D, 0x00,                                 // 6c: mov qword [r13 + 0x00], rcx
+    0x49, 0x8D, 0x7D, 0x08,                                 // 70: .1: lea rdi, [r13 + 0x08]
+    0xE8, 0xA9, 0x01, 0x00, 0x00,                           // 74: call took
+    0x48, 0x8D, 0x05, 0x0F, 0x00, 0x00, 0x00,               // 79: lea rax, [rip + .L2] ; 2: RDPID
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 80: mov qword [r13 + 0xF0], rax
+    0xF3, 0x0F, 0xC7, 0xF8,                                 // 87: rdpid rax
+    0x49, 0x89, 0x45, 0x10,                                 // 8b: mov qword [r13 + 0x10], rax
+    0x49, 0x8D, 0x7D, 0x18,                                 // 8f: .2: lea rdi, [r13 + 0x18]
+    0xE8, 0x8A, 0x01, 0x00, 0x00,                           // 93: call took
+    0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00,               // 98: lea rax, [rip + .L3] ; 3: RDMSR of TSC_AUX
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 9f: mov qword [r13 + 0xF0], rax
+    0xB9, 0x03, 0x01, 0x00, 0xC0,                           // a6: mov ecx, 0xC0000103
+    0x0F, 0x32,                                             // ab: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // ad: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // b1: or rax, rdx
+    0x49, 0x89, 0x45, 0x20,                                 // b4: mov qword [r13 + 0x20], rax
+    0x49, 0x8D, 0x7D, 0x28,                                 // b8: .3: lea rdi, [r13 + 0x28]
+    0xE8, 0x61, 0x01, 0x00, 0x00,                           // bc: call took
+    0x48, 0x8D, 0x05, 0x13, 0x00, 0x00, 0x00,               // c1: lea rax, [rip + .L4] ; 4: its pattern into it
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // c8: mov qword [r13 + 0xF0], rax
+    0xB9, 0x03, 0x01, 0x00, 0xC0,                           // cf: mov ecx, 0xC0000103
+    0x44, 0x89, 0xE0,                                       // d4: mov eax, r12d
+    0x31, 0xD2,                                             // d7: xor edx, edx
+    0x0F, 0x30,                                             // d9: wrmsr
+    0x49, 0x8D, 0x7D, 0x30,                                 // db: .4: lea rdi, [r13 + 0x30]
+    0xE8, 0x3E, 0x01, 0x00, 0x00,                           // df: call took
+    0x48, 0x8D, 0x05, 0x33, 0x00, 0x00, 0x00,               // e4: lea rax, [rip + .L5] ; 5: RDTSC, RDTSCP, RDTSC
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // eb: mov qword [r13 + 0xF0], rax
+    0x0F, 0x31,                                             // f2: rdtsc
+    0x48, 0xC1, 0xE2, 0x20,                                 // f4: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // f8: or rax, rdx
+    0x49, 0x89, 0x45, 0x38,                                 // fb: mov qword [r13 + 0x38], rax
+    0x0F, 0x01, 0xF9,                                       // ff: rdtscp
+    0x48, 0xC1, 0xE2, 0x20,                                 // 102: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 106: or rax, rdx
+    0x49, 0x89, 0x45, 0x40,                                 // 109: mov qword [r13 + 0x40], rax
+    0x49, 0x89, 0x4D, 0x48,                                 // 10d: mov qword [r13 + 0x48], rcx
+    0x0F, 0x31,                                             // 111: rdtsc
+    0x48, 0xC1, 0xE2, 0x20,                                 // 113: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 117: or rax, rdx
+    0x49, 0x89, 0x45, 0x50,                                 // 11a: mov qword [r13 + 0x50], rax
+    0x49, 0x8D, 0x7D, 0x58,                                 // 11e: .5: lea rdi, [r13 + 0x58]
+    0xE8, 0xFB, 0x00, 0x00, 0x00,                           // 122: call took
+    0x48, 0x8D, 0x05, 0x0F, 0x00, 0x00, 0x00,               // 127: lea rax, [rip + .L6] ; 6: RDPID
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 12e: mov qword [r13 + 0xF0], rax
+    0xF3, 0x0F, 0xC7, 0xF8,                                 // 135: rdpid rax
+    0x49, 0x89, 0x45, 0x60,                                 // 139: mov qword [r13 + 0x60], rax
+    0x49, 0x8D, 0x7D, 0x68,                                 // 13d: .6: lea rdi, [r13 + 0x68]
+    0xE8, 0xDC, 0x00, 0x00, 0x00,                           // 141: call took
+    0x48, 0x8D, 0x05, 0x19, 0x00, 0x00, 0x00,               // 146: lea rax, [rip + .L7] ; 7: RDMSR
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 14d: mov qword [r13 + 0xF0], rax
+    0xB9, 0x03, 0x01, 0x00, 0xC0,                           // 154: mov ecx, 0xC0000103
+    0x0F, 0x32,                                             // 159: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // 15b: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 15f: or rax, rdx
+    0x49, 0x89, 0x45, 0x70,                                 // 162: mov qword [r13 + 0x70], rax
+    0x49, 0x8D, 0x7D, 0x78,                                 // 166: .7: lea rdi, [r13 + 0x78]
+    0xE8, 0xB3, 0x00, 0x00, 0x00,                           // 16a: call took
+    0x48, 0x8D, 0x05, 0x16, 0x00, 0x00, 0x00,               // 16f: lea rax, [rip + .L8] ; 8: bit 32 too: a #GP
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 176: mov qword [r13 + 0xF0], rax
+    0xB9, 0x03, 0x01, 0x00, 0xC0,                           // 17d: mov ecx, 0xC0000103
+    0x44, 0x89, 0xE0,                                       // 182: mov eax, r12d
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // 185: mov edx, 1
+    0x0F, 0x30,                                             // 18a: wrmsr
+    0x49, 0x8D, 0xBD, 0x80, 0x00, 0x00, 0x00,               // 18c: .8: lea rdi, [r13 + 0x80]
+    0xE8, 0x8A, 0x00, 0x00, 0x00,                           // 193: call took
+    0x48, 0x8D, 0x05, 0x1C, 0x00, 0x00, 0x00,               // 198: lea rax, [rip + .L9] ; 9: RDMSR: as it was
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 19f: mov qword [r13 + 0xF0], rax
+    0xB9, 0x03, 0x01, 0x00, 0xC0,                           // 1a6: mov ecx, 0xC0000103
+    0x0F, 0x32,                                             // 1ab: rdmsr
+    0x48, 0xC1, 0xE2, 0x20,                                 // 1ad: shl rdx, 32
+    0x48, 0x09, 0xD0,                                       // 1b1: or rax, rdx
+    0x49, 0x89, 0x85, 0x88, 0x00, 0x00, 0x00,               // 1b4: mov qword [r13 + 0x88], rax
+    0x49, 0x8D, 0xBD, 0x90, 0x00, 0x00, 0x00,               // 1bb: .9: lea rdi, [r13 + 0x90]
+    0xE8, 0x5B, 0x00, 0x00, 0x00,                           // 1c2: call took
+    0x49, 0xC7, 0x85, 0x80, 0x01, 0x00, 0x00, 0x00,         // 1c7: mov qword [r13 + 0x180], 0 ; 10: INVPCID: PCID 0,
+    0x00, 0x00, 0x00,
+    0x49, 0x8B, 0x85, 0x08, 0x01, 0x00, 0x00,               // 1d2: mov rax, qword [r13 + 0x108]
+    0x49, 0x89, 0x85, 0x88, 0x01, 0x00, 0x00,               // 1d9: mov qword [r13 + 0x188], rax ; an address of its own,
+    0x49, 0x8D, 0xB5, 0x80, 0x01, 0x00, 0x00,               // 1e0: lea rsi, [r13 + 0x180]
+    0x31, 0xDB,                                             // 1e7: xor ebx, ebx ; types 0 to 3, and 4, no type
+    0x49, 0x8D, 0xBD, 0x98, 0x00, 0x00, 0x00,               // 1e9: lea rdi, [r13 + 0x98]
+    0x48, 0x8D, 0x05, 0x0C, 0x00, 0x00, 0x00,               // 1f0: .invpcid: lea rax, [rip + .Lnext]
+    0x49, 0x89, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 1f7: mov qword [r13 + 0xF0], rax
+    0x66, 0x0F, 0x38, 0x82, 0x1E,                           // 1fe: invpcid rbx, xmmword [rsi]
+    0xE8, 0x1A, 0x00, 0x00, 0x00,                           // 203: .next: call took
+    0x48, 0x83, 0xC7, 0x08,                                 // 208: add rdi, 8
+    0xFF, 0xC3,                                             // 20c: inc ebx
+    0x83, 0xFB, 0x05,                                       // 20e: cmp ebx, 5
+    0x72, 0xDD,                                             // 211: jb .Linvpcid
+    0x41, 0xC7, 0x85, 0xC0, 0x00, 0x00, 0x00, 0x54,         // 213: mov dword [r13 + 0xC0], 0x58554154 ; 'TAUX'
+    0x41, 0x55, 0x58,
+    0xFA,                                                   // 21e: cli
+    0xF4,                                                   // 21f: .dead: hlt
+    0xEB, 0xFD,                                             // 220: jmp .Ldead
+    0x49, 0x8B, 0x85, 0xF8, 0x00, 0x00, 0x00,               // 222: took: mov rax, qword [r13 + 0xF8] ; the step's fault, or 0
+    0x48, 0x89, 0x07,                                       // 229: mov qword [rdi], rax
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x00,         // 22c: mov qword [r13 + 0xF8], 0
+    0x00, 0x00, 0x00,
+    0xC3,                                                   // 237: ret
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x06,         // 238: ud: mov qword [r13 + 0xF8], 6 ; a #UD: the step's fault,
+    0x00, 0x00, 0x00,
+    0xEB, 0x0F,                                             // 243: jmp recover
+    0x48, 0x83, 0xC4, 0x08,                                 // 245: gp: add rsp, 8 ; a #GP, its error code dropped
+    0x49, 0xC7, 0x85, 0xF8, 0x00, 0x00, 0x00, 0x0D,         // 249: mov qword [r13 + 0xF8], 13
+    0x00, 0x00, 0x00,
+    0x50,                                                   // 254: recover: push rax
+    0x49, 0x8B, 0x85, 0xF0, 0x00, 0x00, 0x00,               // 255: mov rax, qword [r13 + 0xF0] ; and on past the step
+    0x48, 0x89, 0x44, 0x24, 0x08,                           // 25c: mov qword [rsp + 8], rax
+    0x58,                                                   // 261: pop rax
+    0x48, 0xCF,                                             // 262: iretq
+    0x66, 0x89, 0x07,                                       // 264: gate: mov word [rdi], ax ; a gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 267: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 26d: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 273: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 277: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 27b: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 27f: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 282: mov dword [rdi + 12], 0
+    0xC3,                                                   // 289: ret
+    0xDF, 0x00,                                             // 28a: idtr: dw 0xDF ; gates to 13
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // 28c: dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`, a quadword a slot: each step's value
+ * and the vector it faulted with, 0 for none (`TA_*`); its mark at +0xC0;
+ * what its CPUID offered at +0xC8, +0xD0 and +0xD8; and what the host gives
+ * it at +0x100 and +0x108. */
+const TA_SLOTS: usize = 24;
+/// RDTSCP's TSC_AUX, RDPID's and RDMSR's as it starts, each with its fault.
+const TA_FIRST_RDTSCP: usize = 0;
+const TA_FIRST_RDPID: usize = 2;
+const TA_FIRST_RDMSR: usize = 4;
+/// Its write of its own value: the fault alone.
+const TA_WRITE: usize = 6;
+/// RDTSC, RDTSCP's TSC and its TSC_AUX, RDTSC, and the fault.
+const TA_TSC_BEFORE: usize = 7;
+const TA_RDTSCP_TSC: usize = 8;
+const TA_RDTSCP_AUX: usize = 9;
+const TA_TSC_AFTER: usize = 10;
+const TA_RDTSCP_FAULT: usize = 11;
+/// RDPID's and RDMSR's after it, each with its fault.
+const TA_RDPID: usize = 12;
+const TA_RDMSR: usize = 14;
+/// The write with bit 32 -- the fault alone -- and RDMSR's after it.
+const TA_BAD_WRITE: usize = 16;
+const TA_AFTER_BAD: usize = 17;
+/// INVPCID's five faults: types 0 to 3, and 4.
+const TA_INVPCID: usize = 19;
+const TA_INVPCID_TYPES: usize = 5;
+const TA_DONE: u64 = RESULTS + 0xC0;
+const TA_MARK: u32 = u32::from_le_bytes(*b"TAUX");
+const TA_EXT1_EDX: u64 = RESULTS + 0xC8;
+const TA_LEAF7_EBX: u64 = RESULTS + 0xD0;
+const TA_LEAF7_ECX: u64 = RESULTS + 0xD8;
+const TA_PATTERN: u64 = RESULTS + 0x100;
+const TA_ADDRESS: u64 = RESULTS + 0x108;
+/// What a step that did not fault leaves, and the two vectors one can.
+const NO_FAULT: u64 = 0;
+const VECTOR_UD: u64 = 6;
+const VECTOR_GP: u64 = 13;
+/// CPUID's RDTSCP (0x8000_0001 EDX), INVPCID (leaf 7 EBX) and RDPID (ECX).
+const EXT1_EDX_RDTSCP: u32 = 1 << 27;
+const LEAF7_EBX_INVPCID: u32 = 1 << 10;
+const LEAF7_ECX_RDPID: u32 = 1 << 22;
+/// Its MSR exits: three RDMSRs and two WRMSRs of TSC_AUX.
+const TA_RDMSRS: u64 = 3;
+const TA_WRMSRS: u64 = 2;
+/// The two VMs' values of TSC_AUX: 32 bits each, neither 0.
+const TA_VMS: [u32; 2] = [0x5A5A_1001, 0xA5A5_2002];
+const TSCAUX_BUDGET_MS: u64 = 10_000;
+
+/// What one VM of the tscaux guest did: where it ran, what the run loop
+/// counted, how it stopped, and what it left.
+struct TscAuxRun {
+    cpu: Option<u32>,
+    us: u64,
+    counts: Counts,
+    stopped: Stopped,
+    slots: [u64; TA_SLOTS],
+    ext1_edx: u32,
+    leaf7_ebx: u32,
+    leaf7_ecx: u32,
+    done: u32,
+}
+
+/// Run one VM of the tscaux guest, `pattern` its value of TSC_AUX, on the
+/// CPU this runs on.
+fn run_tscaux_vm(machine: &Arc<Machine>, pattern: u32) -> core::result::Result<TscAuxRun, String> {
+    let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
+    let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
+    let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, false, 1, Arc::new(doorbells), false, false).map_err(made)?;
+    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let m = guest.memory();
+    one_cpu_board(m, &mut bsp, TSCAUX_CODE)
+        .and_then(|_| m.write_obj(TA_PATTERN, &u64::from(pattern)))
+        .and_then(|_| m.write_obj(TA_ADDRESS, &ENTRY))
+        .map_err(made)?;
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(TSCAUX_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    drop(bsp);
+    let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    let cpu = guest.cpu_states().first().and_then(|&(_, h)| h);
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    let mut slots = [0u64; TA_SLOTS];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = m.read_obj::<u64>(RESULTS + i as u64 * 8).map_err(unread)?;
+    }
+    let dword = |at: u64| m.read_obj::<u32>(at).map_err(unread);
+    Ok(TscAuxRun {
+        cpu,
+        us,
+        counts,
+        stopped,
+        slots,
+        ext1_edx: dword(TA_EXT1_EDX)?,
+        leaf7_ebx: dword(TA_LEAF7_EBX)?,
+        leaf7_ecx: dword(TA_LEAF7_ECX)?,
+        done: dword(TA_DONE)?,
+    })
+}
+
+/// Run the tscaux guest: two VMs of one CPU each, one after the other on
+/// the CPU this runs on, through the run loop a Linux guest's go through.
+#[inline(never)]
+fn run_tscaux(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", TSCAUX_NAME, TSCAUX_ABOUT);
+    let mut runs = alloc::vec::Vec::new();
+    for &pattern in TA_VMS.iter() {
+        match run_tscaux_vm(machine, pattern) {
+            Ok(run) => {
+                if let GuestStop::Refused(Refusal::NotOn(cpu)) = run.stopped.stop {
+                    let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first",
+                                     TSCAUX_NAME, cpu);
+                    return false;
+                }
+                runs.push(run);
+            }
+            Err(why) => {
+                let _ = writeln!(out, "hv: guest {} FAILED -- {}", TSCAUX_NAME, why);
+                return false;
+            }
+        }
+    }
+    let [a, b] = runs.as_slice() else {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {} VMs run, not two", TSCAUX_NAME, runs.len());
+        return false;
+    };
+    let on = |c: Option<u32>| c.map_or(String::from("no cpu"), |c| alloc::format!("cpu {}", c));
+    let _ = writeln!(out, "  ran on     {}, {} us -- vm A; vm B on {}, {} us", on(a.cpu), a.us, on(b.cpu), b.us);
+    let _ = writeln!(out, "  exits      {} and {}: {} and {} rdmsr, {} and {} wrmsr, {} and {} refused, {} and {} #UDs \
+                           given",
+                     a.counts.exits, b.counts.exits, a.counts.msr_read, b.counts.msr_read, a.counts.msr_write,
+                     b.counts.msr_write, a.counts.msr_gp, b.counts.msr_gp, a.counts.ud, b.counts.ud);
+    let (mut says_a, mut says_b) = (String::new(), String::new());
+    let _ = describe_stop(&a.stopped.stop, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
+
+    match check_tscaux(a, b) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", TSCAUX_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", TSCAUX_NAME, why);
+            for (name, run) in [("A", a), ("B", b)] {
+                let _ = writeln!(out, "  vm {}'s results {:x?}", name, run.slots);
+                let _ = writeln!(out, "  vm {}'s cpu {} as it stopped:", name, run.stopped.cpu);
+                let _ = out.write_str(&run.stopped.dump);
+            }
+            false
+        }
+    }
+}
+
+/// A step's value and fault, held to what was wanted: the value where it
+/// was not to fault, the vector where it was.
+fn tscaux_step(run: &TscAuxRun, at: usize, fault: u64, want: u64, what: &str) -> core::result::Result<(), String> {
+    let (value, got) = (run.slots[at], run.slots[at + 1]);
+    if got != fault || (fault == NO_FAULT && value != want) {
+        return Err(if fault == NO_FAULT {
+            alloc::format!("{} read {:#x} with fault {}: wanted {:#x}", what, value, got, want)
+        } else {
+            alloc::format!("{} faulted with {}: wanted {}", what, got, fault)
+        });
+    }
+    Ok(())
+}
+
+/// Both VMs ran on one CPU -- where the first's TSC_AUX would be the
+/// second's to read, were the CPU's the guests' -- each to its halt; each
+/// was told RDTSCP, RDPID and INVPCID exactly where they run in a guest
+/// (`hvarch::x86::offers`), and found each instruction so: run where it was
+/// told, a #UD where not; each read TSC_AUX as 0 as it started, the second
+/// where the first had left its own, read back the value it wrote by each
+/// instruction it has and by RDMSR -- RDTSCP's TSC between two RDTSCs -- and
+/// had the write of bit 32 refused, its value still there; RDMSR and WRMSR
+/// of TSC_AUX a #GP where it has neither instruction; INVPCID's four types
+/// run and a fifth a #GP where it has it; and the run loop saw every RDMSR
+/// and WRMSR, and no RDTSCP where it is offered.
+fn check_tscaux(a: &TscAuxRun, b: &TscAuxRun) -> core::result::Result<String, String> {
+    let runs = hvarch::x86::offers();
+    let tsc_aux = runs.rdtscp || runs.rdpid;
+    let fault = |has: bool, otherwise: u64| if has { NO_FAULT } else { otherwise };
+    if a.cpu.is_none() || a.cpu != b.cpu {
+        return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU, where the first's TSC_AUX would be \
+                                   the second's", a.cpu, b.cpu));
+    }
+    let vms = [("A", a, TA_VMS[0]), ("B", b, TA_VMS[1])];
+    for (name, run, _) in vms {
+        if !matches!(run.stopped.stop, GuestStop::Halted { .. }) || run.done != TA_MARK {
+            return Err(alloc::format!("vm {} did not run to its halt: its mark is {:#x}", name, run.done));
+        }
+    }
+    for (name, run, _) in vms {
+        let told = [run.ext1_edx & EXT1_EDX_RDTSCP != 0, run.leaf7_ecx & LEAF7_ECX_RDPID != 0,
+                    run.leaf7_ebx & LEAF7_EBX_INVPCID != 0];
+        if told != [runs.rdtscp, runs.rdpid, runs.invpcid] {
+            return Err(alloc::format!("vm {}'s CPUID offered RDTSCP, RDPID and INVPCID {:?}: wanted {:?}, what runs \
+                                       in a guest here", name, told, [runs.rdtscp, runs.rdpid, runs.invpcid]));
+        }
+    }
+    /* What each was to see first -- 0 where the other had left its own --
+     * before the rest. */
+    for (name, run, _) in vms {
+        tscaux_step(run, TA_FIRST_RDTSCP, fault(runs.rdtscp, VECTOR_UD), 0,
+                    &alloc::format!("vm {}'s RDTSCP as it started", name))?;
+        tscaux_step(run, TA_FIRST_RDPID, fault(runs.rdpid, VECTOR_UD), 0,
+                    &alloc::format!("vm {}'s RDPID as it started", name))?;
+        tscaux_step(run, TA_FIRST_RDMSR, fault(tsc_aux, VECTOR_GP), 0,
+                    &alloc::format!("vm {}'s RDMSR of TSC_AUX as it started", name))?;
+    }
+    for (name, run, pattern) in vms {
+        let pattern = u64::from(pattern);
+        if run.slots[TA_WRITE] != fault(tsc_aux, VECTOR_GP) {
+            return Err(alloc::format!("vm {}'s write of TSC_AUX faulted with {}", name, run.slots[TA_WRITE]));
+        }
+        let want = fault(runs.rdtscp, VECTOR_UD);
+        let (before, at, after) = (run.slots[TA_TSC_BEFORE], run.slots[TA_RDTSCP_TSC], run.slots[TA_TSC_AFTER]);
+        if run.slots[TA_RDTSCP_FAULT] != want
+            || (want == NO_FAULT && (run.slots[TA_RDTSCP_AUX] != pattern || before > at || at > after))
+        {
+            return Err(alloc::format!("vm {}'s RDTSCP read TSC_AUX {:#x} and the TSC {:#x} between {:#x} and {:#x}, \
+                                       faulting with {}: wanted {:#x}, in order, and fault {}", name,
+                                      run.slots[TA_RDTSCP_AUX], at, before, after, run.slots[TA_RDTSCP_FAULT], pattern,
+                                      want));
+        }
+        tscaux_step(run, TA_RDPID, fault(runs.rdpid, VECTOR_UD), pattern,
+                    &alloc::format!("vm {}'s RDPID after its write", name))?;
+        tscaux_step(run, TA_RDMSR, fault(tsc_aux, VECTOR_GP), pattern,
+                    &alloc::format!("vm {}'s RDMSR after its write", name))?;
+        if run.slots[TA_BAD_WRITE] != VECTOR_GP {
+            return Err(alloc::format!("vm {}'s write of TSC_AUX with bit 32 faulted with {}: wanted a #GP", name,
+                                      run.slots[TA_BAD_WRITE]));
+        }
+        tscaux_step(run, TA_AFTER_BAD, fault(tsc_aux, VECTOR_GP), pattern,
+                    &alloc::format!("vm {}'s RDMSR after the write refused", name))?;
+    }
+    for (name, run, _) in vms {
+        let types = &run.slots[TA_INVPCID..TA_INVPCID + TA_INVPCID_TYPES];
+        let want = if runs.invpcid {
+            [NO_FAULT, NO_FAULT, NO_FAULT, NO_FAULT, VECTOR_GP]
+        } else {
+            [VECTOR_UD; TA_INVPCID_TYPES]
+        };
+        if types != want {
+            return Err(alloc::format!("vm {}'s INVPCID of types 0 to 4 faulted with {:?}: wanted {:?}", name, types,
+                                      want));
+        }
+    }
+    for (name, run, _) in vms {
+        let c = &run.counts;
+        let refused = if tsc_aux { 1 } else { TA_RDMSRS + TA_WRMSRS };
+        if c.msr_read != TA_RDMSRS || c.msr_write != TA_WRMSRS || c.msr_gp != refused
+            || (runs.rdtscp && c.ud != 0)
+        {
+            return Err(alloc::format!("vm {}'s run loop saw {} RDMSRs and {} WRMSRs, refused {} and gave {} #UDs: \
+                                       wanted {}, {}, {} and none for RDTSCP where it runs", name, c.msr_read,
+                                      c.msr_write, c.msr_gp, c.ud, TA_RDMSRS, TA_WRMSRS, refused));
+        }
+    }
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    Ok(alloc::format!("RDTSCP {}, RDPID {}, INVPCID {}, as its CPUID said; vm B read TSC_AUX as 0 where vm A had left \
+                       its own, each read back the value it wrote -- bit 32 refused -- and INVPCID {}",
+                      yes(runs.rdtscp), yes(runs.rdpid), yes(runs.invpcid),
+                      if runs.invpcid { "ran types 0 to 3, 4 a #GP" } else { "was a #UD" }))
 }
 
 /* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */

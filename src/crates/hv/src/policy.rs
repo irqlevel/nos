@@ -39,8 +39,7 @@
 //! are ready for; a refusal the guest was not ready for is a line in its
 //! log (Linux's "unchecked MSR access error"), and in the VM's report.
 
-use hvarch::x86::cpu;
-use hvarch::x86::fp;
+use hvarch::x86::{self, cpu, fp};
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::GuestRegs;
 
@@ -116,8 +115,8 @@ const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
  * for a guest of more than one CPU, and the hypervisor bit for every
  * guest. PCID is the guest's own:
  * its TLB entries tagged under its VPID or ASID as the CPU tags them, CR4's
- * bit turned on under `crate::cr`'s rules; INVPCID, which VT-x would need a
- * control for, is not offered with it. */
+ * bit turned on under `crate::cr`'s rules; and INVPCID with it where it
+ * runs in a guest (`LEAF7_EBX_INVPCID`). */
 const LEAF1_ECX_KEEP: u32 = (1 << 0)   // SSE3
     | (1 << 1)   // PCLMULQDQ
     | (1 << 9)   // SSSE3
@@ -172,14 +171,15 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
  * is, with nothing of the host's behind it to switch, and what CR4 bits the
  * guest owns turn on -- SMEP, SMAP and UMIP for its kernel, FSGSBASE over
  * bases the VMCS and the VMCB keep -- and facts of the silicon; GFNI, whose
- * SSE forms are on the XMM registers and VEX forms on the YMM; and where
- * AVX's state is switched, the AVX line (`LEAF7_EBX_AVX`). Its EAX is the
- * last subleaf answered, the host's or 1 (`LEAF7_LAST_SUBLEAF`). Among what
- * is cleared: AVX-512 and AMX (state past AVX's, which nothing switches),
- * HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
- * TSC_ADJUST, INVPCID, RDPID, LA57, the hybrid flag, and the speculation
- * controls -- IBRS and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not
- * the guest's to write. */
+ * SSE forms are on the XMM registers and VEX forms on the YMM; where AVX's
+ * state is switched, the AVX line (`LEAF7_EBX_AVX`); and where they run in
+ * a guest, INVPCID and RDPID (`hvarch::x86::offers`). Its EAX is the last
+ * subleaf answered, the host's or 1 (`LEAF7_LAST_SUBLEAF`). Among what is
+ * cleared: AVX-512 and AMX (state past AVX's, which nothing switches), HLE
+ * and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
+ * TSC_ADJUST, LA57, the hybrid flag, and the speculation controls -- IBRS
+ * and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not the guest's to
+ * write. */
 const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
     | (1 << 3)   // BMI1
     | (1 << 6)   // the x87 data pointer kept at exceptions only
@@ -201,6 +201,11 @@ const LEAF7_ECX_KEEP: u32 = (1 << 2)   // UMIP
 const LEAF7_EBX_AVX: u32 = 1 << 5; // AVX2
 const LEAF7_ECX_AVX: u32 = (1 << 9)   // VAES
     | (1 << 10); // VPCLMULQDQ
+/* Leaf 7, subleaf 0: INVPCID, which drops the translations of the guest's
+ * own VPID or ASID; and RDPID, which reads its own TSC_AUX (`Own`) -- each
+ * where it runs in a guest. */
+const LEAF7_EBX_INVPCID: u32 = 1 << 10;
+const LEAF7_ECX_RDPID: u32 = 1 << 22;
 /// The last subleaf of leaf 7 answered: 1, or the host's where that is 0.
 const LEAF7_LAST_SUBLEAF: u32 = SUBLEAF_7_1;
 const SUBLEAF_7_1: u32 = 1;
@@ -264,8 +269,8 @@ const EXT1_ECX_KEEP: u32 = (1 << 0)   // LAHF/SAHF in 64-bit mode
 
 /* Extended leaf 0x80000001, EDX: what leaf 1 keeps of the bits AMD mirrors
  * there, SYSCALL, NX, the MMX extensions, 1 GiB pages and long mode. The
- * APIC's mirror (bit 9) is set as leaf 1's is. RDTSCP (bit 27) is cleared
- * because its intercept has no answer here but #UD; FFXSR and 3DNow! go too. */
+ * APIC's mirror (bit 9) is set as leaf 1's is, and RDTSCP where it runs in a
+ * guest (`EXT1_EDX_RDTSCP`); FFXSR and 3DNow! are cleared. */
 const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
     | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)   // FPU..CX8, as leaf 1
     | (1 << 11)  // SYSCALL
@@ -275,6 +280,9 @@ const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
     | (1 << 23) | (1 << 24) // MMX, FXSR
     | (1 << 26)  // 1 GiB pages
     | (1 << 29); // long mode
+/// RDTSCP: the TSC and the guest's own TSC_AUX (`Own`), where it runs in a
+/// guest -- intercepted, under AMD-V, only where it does not.
+const EXT1_EDX_RDTSCP: u32 = 1 << 27;
 
 /* Extended leaf 0x80000008: in EAX the widths of a physical and a linear
  * address, the host's -- what a guest's page tables are held to -- and not
@@ -364,6 +372,7 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
     let (apic_ecx, apic_edx) = if asker.apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC) } else { (0, 0) };
     let apic = asker.apic;
     let avx = fp::offered() & fp::XCR0_AVX != 0;
+    let runs = x86::offers();
 
     match leaf {
         LEAF_BASIC => Cpuid { eax: eax.min(LEAF_BASIC_TOP), ebx, ecx, edx },
@@ -385,10 +394,12 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_POWER => Cpuid { eax: if apic { LEAF6_EAX_ARAT } else { 0 }, ebx: 0, ecx: 0, edx: 0 },
         LEAF_STRUCTURED if sub == 0 => {
             let (avx_ebx, avx_ecx) = if avx { (LEAF7_EBX_AVX, LEAF7_ECX_AVX) } else { (0, 0) };
+            let invpcid = if runs.invpcid { LEAF7_EBX_INVPCID } else { 0 };
+            let rdpid = if runs.rdpid { LEAF7_ECX_RDPID } else { 0 };
             Cpuid {
                 eax: eax.min(LEAF7_LAST_SUBLEAF),
-                ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx),
-                ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx),
+                ebx: ebx & (LEAF7_EBX_KEEP | avx_ebx | invpcid),
+                ecx: ecx & (LEAF7_ECX_KEEP | avx_ecx | rdpid),
                 edx: edx & LEAF7_EDX_KEEP,
             }
         }
@@ -413,7 +424,10 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
          * host's TSC and crystal, which are the guest's too. */
         LEAF_TSC => Cpuid { eax, ebx, ecx, edx },
         LEAF_EXT => Cpuid { eax: eax.min(LEAF_EXT_TOP), ebx, ecx, edx },
-        LEAF_EXT_FEATURES => Cpuid { eax, ebx, ecx: ecx & EXT1_ECX_KEEP, edx: (edx & EXT1_EDX_KEEP) | apic_edx },
+        LEAF_EXT_FEATURES => {
+            let rdtscp = if runs.rdtscp { EXT1_EDX_RDTSCP } else { 0 };
+            Cpuid { eax, ebx, ecx: ecx & EXT1_ECX_KEEP, edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | apic_edx }
+        }
         LEAF_EXT_POWER => Cpuid { eax: 0, ebx: 0, ecx: 0, edx: edx & EXT7_EDX_INVARIANT_TSC },
         LEAF_EXT_ADDRESS => Cpuid { eax: eax & EXT8_EAX_KEEP, ebx: ebx & EXT8_EBX_KEEP, ecx: 0, edx: 0 },
         LEAF_EXT_FEATURES2 => Cpuid { eax: eax & EXT21_EAX_KEEP, ebx: 0, ecx: ecx & EXT21_ECX_KEEP, edx: 0 },
@@ -595,6 +609,28 @@ const MSR_SYSENTER_EIP: u32 = 0x176;
  * guest's clock alone, and nothing offsets it. */
 const MSR_TSC: u32 = 0x10;
 
+/* IA32_TSC_AUX: what RDTSCP and RDPID read beside the TSC -- a kernel's CPU
+ * number, as Linux keeps it -- the guest's own, its low 32 bits, where its
+ * CPUID offers either instruction (`Own`). */
+const MSR_TSC_AUX: u32 = 0xC000_0103;
+const TSC_AUX_BITS: u64 = 0xFFFF_FFFF;
+
+/// A guest CPU's MSRs that its save area does not hold, which the backend
+/// keeps and its entries make the CPU's (`hvarch::x86::msrs`): read here,
+/// and written back through what checks them again (`Backend::set_own_msrs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Own {
+    /// IA32_TSC_AUX.
+    pub tsc_aux: u64,
+}
+
+/// Whether the guest's CPU has IA32_TSC_AUX: where its CPUID offers RDTSCP
+/// or RDPID, which read it.
+fn has_tsc_aux() -> bool {
+    let runs = x86::offers();
+    runs.rdtscp || runs.rdpid
+}
+
 /* MSRs that a feature the guest's CPUID offers says its CPU has, or that a
  * kernel reads of every CPU of its vendor without asking: each answers as a
  * CPU with nothing more behind it would, and keeps nothing of the guest's
@@ -754,11 +790,11 @@ const EFER_SVME: u64 = 1 << 12;
 const EFER_LME: u64 = 1 << 8;
 const CR0_PG: u64 = 1 << 31;
 
-/// What a guest read from MSR `msr`, and whether the read is allowed: `None`
-/// -- for every MSR not named here -- means inject a #GP, which is what a
-/// real CPU does for one it does not have and what a guest's `rdmsr_safe`
-/// is ready for.
-pub fn rdmsr(save: &Save, msr: u32) -> Option<u64> {
+/// What a guest whose state is `save` and `own` read from MSR `msr`, and
+/// whether the read is allowed: `None` -- for every MSR not named here --
+/// means inject a #GP, which is what a real CPU does for one it does not
+/// have and what a guest's `rdmsr_safe` is ready for.
+pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
     let value = match msr {
         MSR_EFER => save.efer & !EFER_SVME,
         MSR_STAR => save.star,
@@ -773,6 +809,7 @@ pub fn rdmsr(save: &Save, msr: u32) -> Option<u64> {
         MSR_SYSENTER_ESP => save.sysenter_esp,
         MSR_SYSENTER_EIP => save.sysenter_eip,
         MSR_TSC => cpu::rdtsc(),
+        MSR_TSC_AUX if has_tsc_aux() => own.tsc_aux,
         _ => match constant(msr)? {
             Constant::ReadOnly(v) | Constant::Fixed(v) => v,
         },
@@ -781,11 +818,11 @@ pub fn rdmsr(save: &Save, msr: u32) -> Option<u64> {
 }
 
 /// A guest wrote `value` to MSR `msr`. Returns whether it is allowed; `false`
-/// injects a #GP. The system MSRs land in the save area; a constant one
-/// takes a write that leaves it as it is (`Constant`); every other write --
-/// to the TSC, to an MSR not named here -- is refused, and nothing a guest
-/// writes goes nowhere.
-pub fn wrmsr(save: &mut Save, msr: u32, value: u64) -> bool {
+/// injects a #GP, with nothing changed. The system MSRs land in the save
+/// area, TSC_AUX in `own`; a constant one takes a write that leaves it as it
+/// is (`Constant`); every other write -- to the TSC, to an MSR not named
+/// here -- is refused, and nothing a guest writes goes nowhere.
+pub fn wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) -> bool {
     match msr {
         MSR_EFER => {
             if value & !EFER_GUEST_MASK != 0 {
@@ -819,6 +856,8 @@ pub fn wrmsr(save: &mut Save, msr: u32, value: u64) -> bool {
         MSR_SYSENTER_CS => save.sysenter_cs = value,
         MSR_SYSENTER_ESP => save.sysenter_esp = value,
         MSR_SYSENTER_EIP => save.sysenter_eip = value,
+        /* Its low 32 bits: a write of another is the CPU's #GP. */
+        MSR_TSC_AUX if has_tsc_aux() && value & !TSC_AUX_BITS == 0 => own.tsc_aux = value,
         _ => return matches!(constant(msr), Some(Constant::Fixed(v)) if v == value),
     }
     true

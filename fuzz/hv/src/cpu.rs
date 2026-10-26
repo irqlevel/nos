@@ -131,6 +131,12 @@ pub mod x86 {
             host_is_intel() && host() & 2 != 0
         }
 
+        /// An Intel host's VMX secondary controls `enable RDTSCP` and
+        /// `enable INVPCID`: there or not, made up with the rest of it.
+        pub fn vmx_rdtscp_invpcid() -> (bool, bool) {
+            (host() & (1 << 46) != 0, host() & (1 << 47) != 0)
+        }
+
         /// The host's IA32_ARCH_CAPABILITIES, where its CPUID offers it (leaf
         /// 7, EDX bit 29): every bit made up with the rest of the host.
         pub fn arch_capabilities() -> Option<u64> {
@@ -211,6 +217,29 @@ pub mod x86 {
         const XSAVE_AVX: u64 = 2;
         fn xsave_level() -> u64 {
             (host() >> 40) & 3
+        }
+    }
+
+    /// hvarch's: what of RDTSCP, RDPID and INVPCID runs in a guest --
+    /// what this input's host's leaves have, and on an Intel host, whose
+    /// guests VT-x runs, what its secondary controls let run, made up with
+    /// the rest of it; on an AMD host all of what the leaves have, as AMD-V
+    /// runs them.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Offers {
+        pub rdtscp: bool,
+        pub rdpid: bool,
+        pub invpcid: bool,
+    }
+
+    pub fn offers() -> Offers {
+        let ext1 = cpu::cpuid_count(0x8000_0001, 0);
+        let leaf7 = cpu::cpuid_count(7, 0);
+        let (rdtscp, invpcid) = if cpu::host_is_intel() { cpu::vmx_rdtscp_invpcid() } else { (true, true) };
+        Offers {
+            rdtscp: rdtscp && ext1.is_some_and(|r| r.edx & (1 << 27) != 0),
+            rdpid: rdtscp && leaf7.is_some_and(|r| r.ecx & (1 << 22) != 0),
+            invpcid: invpcid && leaf7.is_some_and(|r| r.ebx & (1 << 10) != 0),
         }
     }
 
@@ -498,6 +527,9 @@ pub mod vm {
         /// The guest's XCR0, as hvarch's `GuestFp` keeps it: the x87 alone
         /// out of reset, and whatever XSETBV the run loop performed made it.
         xcr0: u64,
+        /// The guest's TSC_AUX, as hvarch's `GuestMsrs` keeps it: 0 out of
+        /// reset, and whatever WRMSR the run loop performed made it.
+        tsc_aux: u64,
         /// VT-x's virtual APIC, as the machine is said to have one: CR8 its
         /// VTPR, never an exit, and while the run loop has virtual-interrupt
         /// delivery on (`apicv`), this model is the CPU that delivers VIRR's
@@ -555,6 +587,7 @@ pub mod vm {
                 cr4: 0,
                 debug_addrs: [0; 4],
                 xcr0: crate::x86::fp::XCR0_X87,
+                tsc_aux: 0,
                 vapic: false,
                 apicv: false,
                 virr: [0; 8],
@@ -778,6 +811,21 @@ pub mod vm {
         }
         pub fn fp_loads(&self) -> u64 {
             0
+        }
+        /// As vm.rs's: the guest's MSRs its save area does not hold.
+        pub fn own_msrs(&self) -> crate::policy::Own {
+            crate::policy::Own { tsc_aux: self.tsc_aux }
+        }
+        /// As vm.rs's, over hvarch's `GuestMsrs::set_tsc_aux`: held to what
+        /// the MSR can hold -- a value the policy took that an entry's WRMSR
+        /// of it would fault on in the host is a finding, not a #GP.
+        pub fn set_own_msrs(&mut self, own: &crate::policy::Own) -> bool {
+            invariant!(own.tsc_aux >> 32 == 0, "TSC_AUX made {:#x}, which the MSR cannot hold", own.tsc_aux);
+            let runs = crate::x86::offers();
+            invariant!(runs.rdtscp || runs.rdpid || own.tsc_aux == self.tsc_aux,
+                       "TSC_AUX made {:#x} in a guest offered neither RDTSCP nor RDPID", own.tsc_aux);
+            self.tsc_aux = own.tsc_aux;
+            true
         }
         /// As VT-x's: CR8 to or from a register, and stepped past.
         pub fn cr8_access(&mut self, write: bool, gpr: u8) {

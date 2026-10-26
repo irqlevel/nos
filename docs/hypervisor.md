@@ -380,9 +380,12 @@ The differences that are not hidden by the shadow at all:
   core stalled for milliseconds -- as often as the guest cares to; and
   PAUSE, so that a guest spinning comes out to be handed what is due to it
   ([Time](#time)); CPUID,
-  INVD, VMCALL, XSETBV and a triple fault exit unconditionally, and RDTSCP,
-  INVPCID and XSAVES are `#UD` in the guest because the secondary controls
-  that would enable them are off. Each control field is written through
+  INVD, VMCALL, XSETBV and a triple fault exit unconditionally, and XSAVES
+  is `#UD` in the guest because the secondary control that would enable it
+  is off. RDTSCP and RDPID, and INVPCID, run in the guest where its CPUID
+  offers them -- `enable RDTSCP` and `enable INVPCID` on, where the CPU has
+  them (`hvarch::x86::offers`) -- and are `#UD` there otherwise, as on a CPU
+  without them; none of them exits. Each control field is written through
   `adjust`, which forces on the bits `IA32_VMX_*_CTLS` says must be 1 and
   off the ones it forbids -- a value that ignored them fails entry with
   nothing named. Guest CR4.VMXE is forced set (the fixed MSRs demand it) and
@@ -945,6 +948,7 @@ mode:
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
+| `tscaux` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own whose #UD and #GP handlers note the vector and go on: each reads what its CPUID offers, reads its TSC_AUX by RDTSCP, RDPID and RDMSR, writes a value of its own into it, reads the TSC, RDTSCP and the TSC, reads TSC_AUX by RDPID and RDMSR again, writes it with bit 32 set and reads it once more, and runs INVPCID of types 0 to 4 | RDTSCP, RDPID and INVPCID offered exactly where they run in a guest, each run where offered and a #UD where not; TSC_AUX 0 as each VM starts, the second where the first had left its own -- its own put into the CPU before its entries (`hvarch::x86::msrs`); the value each wrote read back by every way it has, RDTSCP's TSC between the two RDTSCs; bit 32 a #GP, the value kept; RDMSR and WRMSR of it a #GP where neither instruction is offered; INVPCID's four types run and type 4 a #GP; every RDMSR and WRMSR seen by the run loop, and no RDTSCP where it runs |
 | `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and PKE, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and PKE -- which its CPUID never offers -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)) -- the last two, which no CR4 takes in long mode, the CPU's own #GPs before its intercept where it makes them so, as the AX41's Zen 2 does under KVM; on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
 ```
@@ -1067,6 +1071,20 @@ And while a guest runs:
   puts back what it found, and IA32_XSS with it. The `avx` built-in guest
   is the check: two CPUs taking turns on one host CPU, each finding its YMM
   registers, MXCSR and control word as it left them at every turn.
+- **TSC_AUX is the guest's**, the value RDTSCP and RDPID read beside the
+  TSC -- the CPU number, as Linux keeps it there -- which neither `vmrun`
+  nor `vmlaunch` switches either (`hvarch::x86::msrs`). Each guest CPU keeps
+  its own, 0 out of reset, written by its WRMSR through the policy, and it
+  is put into the CPU before an entry only where the CPU holds another
+  value: nothing in this kernel reads TSC_AUX or writes it, so between a
+  guest's exit and the next entry it holds what that guest had, and a CPU
+  running one guest makes no write at all. It is loaded on every CPU that
+  has the MSR, whether the guest is offered either instruction or not:
+  AMD-V cannot stop a guest at RDPID, and one running it behind its CPUID's
+  back reads its own 0, not the host's or another guest's. The extension
+  going off puts back what it found. The `tscaux` built-in guest is the
+  check: two VMs one after the other on one CPU, the second reading 0 where
+  the first left its own.
 - **A halted guest costs its CPU nothing.** A HLT with interrupts on is
   stepped past, as a CPU an interrupt wakes resumes after it, and the vCPU
   is not entered again until the PIC has an interrupt for it; meanwhile its
@@ -1399,8 +1417,12 @@ here:
   and CLWB, SERIALIZE -- with MD_CLEAR, VERW clearing the CPU's buffers in a guest as
   anywhere, and ARCH_CAPABILITIES, whose MSR reads as the host's but for
   the bits that are not facts of the CPU (IBRS_ALL, whose SPEC_CTRL is not
-  the guest's, and those naming an MSR nothing answers); PCID, but not
-  INVPCID, which VT-x would need a control for; of the power leaf ARAT
+  the guest's, and those naming an MSR nothing answers); PCID, and INVPCID
+  -- a global flush without two writes of CR4 -- RDTSCP and RDPID where they
+  run in a guest: always under AMD-V, where the CPU has them, and under
+  VT-x where it has the controls that turn them on, the last two reading
+  the guest's own TSC_AUX ([What the extension
+  costs](#what-the-extension-costs-while-it-is-on)); of the power leaf ARAT
   alone, and for a guest of one CPU no local APIC and no x2APIC (one of
   more has an emulated x2APIC: [More than one CPU](#more-than-one-cpu)); and
   the hypervisor bit, since there is one, which has Linux leave the

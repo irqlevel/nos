@@ -275,6 +275,16 @@ GUESTS = {
             r"YMM0-15 0 at each CPU's start, and its YMM registers, MXCSR and control word its own at all 64 of "
             r"its turns",
             r"cpu 0: \d+ \(\d XSETBV, [56] refused;.*cpu 1: \d+ \(\d XSETBV, [56] refused;"],
+    # Two VMs, one after the other on the CPU the guests run on: the second
+    # must read TSC_AUX as 0 where the first left its own -- each one's put
+    # into the CPU before its entries (`hvarch::x86::msrs`) -- by RDTSCP,
+    # RDPID and RDMSR, each where its CPUID offers it and a #UD where not.
+    # Which are offered is `hv info`'s to say, and checked against it below
+    # (`check_offers`); INVPCID is on neither QEMU's TCG nor a Zen 2.
+    "tscaux": [r"RDTSCP yes, RDPID (?:yes|no), INVPCID (?:yes|no), as its CPUID said; vm B read TSC_AUX as 0 where "
+               r"vm A had left its own, each read back the value it wrote -- bit 32 refused -- and INVPCID "
+               r"(?:ran types 0 to 3, 4 a #GP|was a #UD)",
+               r"\b3 and 3 rdmsr, 2 and 2 wrmsr, 1 and 1 refused"],
 }
 
 # Five of the guests test a mechanism each vendor has its own way: AMD-V's
@@ -633,6 +643,19 @@ def check_all_guests(text, cpu, backend, apicv, posted):
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
 
 
+def check_offers(info, text, cpu):
+    """The tscaux guest was offered RDTSCP, RDPID and INVPCID as `hv info`
+    says they run in a guest -- which its own check holds the instructions
+    to."""
+    said = [m.group(1) if m else None for m in
+            (re.search(r"%s in a guest\s+(yes|no)" % name, info) for name in ("RDTSCP", "RDPID", "INVPCID"))]
+    report = guest_report(text, "tscaux")
+    m = re.search(r"RDTSCP (yes|no), RDPID (yes|no), INVPCID (yes|no), as its CPUID said", report)
+    pt.check("  tscaux on cpu %d offered RDTSCP, RDPID and INVPCID as hv info says they run (%s)"
+             % (cpu, ", ".join(str(s) for s in said)),
+             m is not None and list(m.groups()) == said, report or text)
+
+
 def x86_checks(ran, script, digest, grown, raw):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == script,
                     "\n".join(c for c, _ in ran)):
@@ -649,6 +672,8 @@ def x86_checks(ran, script, digest, grown, raw):
              re.search(r"(nested paging|extended page tables)\s+yes", info) is not None, info)
     pt.check("and AVX for a guest, its YMM registers and XCR0 switched with it",
              re.search(r"AVX in a guest\s+yes", info) is not None, info)
+    pt.check("and RDTSCP, its TSC_AUX switched with it -- every CPU this runs on has it",
+             re.search(r"RDTSCP in a guest\s+yes", info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
@@ -676,6 +701,8 @@ def x86_checks(ran, script, digest, grown, raw):
     print("APIC virtualization: %s, posted interrupts: %s" % ("yes" if apicv else "no", "yes" if posted else "no"))
     check_all_guests(out[12], 0, backend, apicv, posted)
     check_all_guests(out[13], CPUS - 1, backend, apicv, posted)
+    check_offers(info, out[12], 0)
+    check_offers(info, out[13], CPUS - 1)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
