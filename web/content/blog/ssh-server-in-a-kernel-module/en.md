@@ -13,7 +13,7 @@ On 12 September 2026 nos got an SSH server ([57544cd](https://github.com/irqleve
 
 ## What it speaks
 
-The server speaks one algorithm of each kind, the ones every OpenSSH of the last ten years offers first or nearly. The whole list is a few constants in [transport.rs](https://github.com/irqlevel/nos/blob/master/src/rust/ssh/src/transport.rs):
+The server speaks one algorithm of each kind, the ones every OpenSSH of the last ten years offers first or nearly. The whole list is a few constants in [transport.rs](https://github.com/irqlevel/nos/blob/master/src/crates/ssh/src/transport.rs):
 
 ```rust
 /* What the server offers: one of each kind */
@@ -40,7 +40,7 @@ Everything else is refused: passwords, keys other than Ed25519, compression, `sf
 
 ## A protocol with no kernel in it
 
-The server is two crates. `src/rust/ssh` is the protocol: packets, key exchange, public key authentication, the session channel and a line editor with 32 lines of history. It knows nothing of the kernel and gets everything it needs from the machine through two traits ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/rust/ssh/src/lib.rs), doc comments left out):
+The server is two crates. `src/crates/ssh` is the protocol: packets, key exchange, public key authentication, the session channel and a line editor with 32 lines of history. It knows nothing of the kernel and gets everything it needs from the machine through two traits ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/crates/ssh/src/lib.rs), doc comments left out):
 
 ```rust
 pub trait Link {
@@ -58,7 +58,7 @@ pub trait Shell {
 }
 ```
 
-`src/rust/modules/sshd` implements them with a listener task, a task for each connection, the `sshd` command and the server's two files. The protocol crate has no `unsafe` at all. The module has four `unsafe` blocks, and each turns a task's context pointer back into its `Box`.
+`src/crates/modules/sshd` implements them with a listener task, a task for each connection, the `sshd` command and the server's two files. The protocol crate has no `unsafe` at all. The module has four `unsafe` blocks, and each turns a task's context pointer back into its `Box`.
 
 The cryptography comes from the RustCrypto and dalek crates the TLS client had already vendored, so the server added no dependency. One build detail needed care. A module is a separate cargo build that the kernel's features do not reach, so the `ssh` crate itself asks `sha2` for its software backend. Otherwise `sha2` picks the CPU's SHA instructions at run time, and the kernel keeps SIMD off. Free of the kernel, the crate also runs on the host, where the network fuzzer drives it with a full SSH client ([Fuzzing the kernel on the host](/blog/fuzzing-the-kernel-on-the-host)).
 
@@ -95,7 +95,7 @@ Before sshd, nothing in nos had accepted a TCP connection. The stack's passive s
 - A listener holds at most 16 connections nobody has accepted, and closing it resets them.
 - `Abort` ends a connection with a RST. The side that closes first keeps its slot through a minute of TIME-WAIT, and the kernel has only 64 slots.
 
-The server needs that last one, because a port 22 on the internet is knocked on all day. It serves 8 connections at once, at most 4 of them still logging in, and resets the rest ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/rust/modules/sshd/src/lib.rs)):
+The server needs that last one, because a port 22 on the internet is knocked on all day. It serves 8 connections at once, at most 4 of them still logging in, and resets the rest ([lib.rs](https://github.com/irqlevel/nos/blob/master/src/crates/modules/sshd/src/lib.rs)):
 
 ```rust
     if total >= MAX_SESSIONS || logging_in >= MAX_LOGGING_IN {

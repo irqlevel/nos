@@ -2,13 +2,13 @@ ENTRY(Start64)
 
 /* QEMU virt: RAM at 0x40000000. The Linux Image header requests
    text_offset 0x200000, so the kernel is loaded at phys 0x40200000.
-   Virtual layout keeps the linear-map invariant VA = phys + KernelSpaceBase
+   Virtual layout keeps the linear-map invariant VA = phys + KERNEL_SPACE_BASE
    (0xFFFF800000000000), mirroring the x86 script. */
 
 SECTIONS
 {
     . = 0xFFFF800040200000;
-    KernelStart = .;
+    kernel_start = .;
 
     .head.text : AT (ADDR(.head.text) - 0xFFFF800000000000)
     {
@@ -21,10 +21,10 @@ SECTIONS
         *(.text.*)
     }
 
-    /* W^X boundaries (page-aligned): [KernelStart, KernelText) = RX,
-       [KernelText, KernelRodata) = RO+NX, [KernelRodata, KernelEnd) = RW+NX. */
+    /* W^X boundaries (page-aligned): [kernel_start, kernel_text) = RX,
+       [kernel_text, kernel_rodata) = RO+NX, [kernel_rodata, kernel_end) = RW+NX. */
     . = ALIGN(4K);
-    KernelText = .;
+    kernel_text = .;
 
     .rodata : AT (ADDR(.rodata) - 0xFFFF800000000000)
     {
@@ -33,7 +33,7 @@ SECTIONS
     }
 
     . = ALIGN(4K);
-    KernelRodata = .;
+    kernel_rodata = .;
 
     .data : AT (ADDR(.data) - 0xFFFF800000000000)
     {
@@ -55,9 +55,9 @@ SECTIONS
     }
 
     . = ALIGN(4K);
-    KernelEnd = .;
+    kernel_end = .;
 
-    _image_size = KernelEnd - KernelStart;
+    _image_size = kernel_end - kernel_start;
 
     /* Static constructors and destructors, which this kernel never runs: a
        global whose initialisation needs code at startup is left as zeroes,

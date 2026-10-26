@@ -25,10 +25,10 @@ tags:
 ```toml
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/rust/ffi" }
-kcore = { path = "../../src/rust/kcore" }
-block = { path = "../../src/rust/block" }
-fs = { path = "../../src/rust/fs" }
+ffi = { path = "../../src/crates/ffi" }
+kcore = { path = "../../src/crates/kcore" }
+block = { path = "../../src/crates/block" }
+fs = { path = "../../src/crates/fs" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.
@@ -47,16 +47,16 @@ extern crate self as hv;
 extern crate self as hvarch;
 extern crate self as kcore;
 // ...
-#[path = "../../../src/rust/hv/src/acpi.rs"]
+#[path = "../../../src/crates/hv/src/acpi.rs"]
 pub mod acpi;
 // ...
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
-#[path = "../../../src/rust/modules/hv/src/dhcp.rs"]
+#[path = "../../../src/crates/modules/hv/src/dhcp.rs"]
 pub mod dhcp;
 ```
 
-C++ получает то же самое другим путём. [`fuzz/cpp/Makefile`](https://github.com/irqlevel/nos/blob/master/fuzz/cpp/Makefile) компилирует файлы ядра как есть, под ASan и UBSan (санитайзерами адресов и неопределённого поведения). Первым в пути поиска заголовков стоит хостовый HAL (слой абстракции оборудования), который подменяет inline-HAL каждой архитектуры. В нём нет привилегированных инструкций, а хуки MMU видны той цели фаззинга, которая моделирует MMU. Все четыре фаззера лежат в `fuzz/`, а не в `src/rust/`, потому что тамошний `.cargo/config.toml` превращает любую сборку cargo ниже по дереву в сборку ядра.
+C++ получает то же самое другим путём. [`fuzz/cpp/Makefile`](https://github.com/irqlevel/nos/blob/master/fuzz/cpp/Makefile) компилирует файлы ядра как есть, под ASan и UBSan (санитайзерами адресов и неопределённого поведения). Первым в пути поиска заголовков стоит хостовый HAL (слой абстракции оборудования), который подменяет inline-HAL каждой архитектуры. В нём нет привилегированных инструкций, а хуки MMU видны той цели фаззинга, которая моделирует MMU. Все четыре фаззера лежат в `fuzz/`, а не в `src/crates/`, потому что тамошний `.cargo/config.toml` превращает любую сборку cargo ниже по дереву в сборку ядра.
 
 ## Машина, на которой они работают
 
@@ -128,13 +128,13 @@ python3 scripts/hv-fuzz.py --replay platform out/hv-fuzz/findings/X.hex
 
 Цель `guestnet` соединяет коммутатор и NAT так же, как это делает модуль hv. На первом же входе она обнаружила, что гость может отправлять трафик от имени другого гостя. Коммутатор пропускал кадры с любым MAC и любым адресом. А NAT отправляет ответы потока на тот MAC, с которого пришёл последний пакет этого потока. Поэтому хватало одного пакета с адресом другого гостя и портами одного из его потоков, чтобы перехватить поток, и ответы внешнего мира уходили самозванцу.
 
-Исправление ([d1aeecf](https://github.com/irqlevel/nos/commit/d1aeecf09004bba80ed5301eea6b25d60f1dc1d6)) делает то же, что виртуальный коммутатор в облаке. [`ingress`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hv/src/net.rs) проверяет каждый кадр гостя прямо на входе. Пропускаются только IPv4 и ARP, и только с MAC и адресом своего порта. Единственное исключение — DHCP-клиент, у которого адреса ещё нет, и ему коммутатор отвечает сам. Всё остальное отбрасывается и записывается на счёт гостя в `hv list`.
+Исправление ([d1aeecf](https://github.com/irqlevel/nos/commit/d1aeecf09004bba80ed5301eea6b25d60f1dc1d6)) делает то же, что виртуальный коммутатор в облаке. [`ingress`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hv/src/net.rs) проверяет каждый кадр гостя прямо на входе. Пропускаются только IPv4 и ARP, и только с MAC и адресом своего порта. Единственное исключение — DHCP-клиент, у которого адреса ещё нет, и ему коммутатор отвечает сам. Всё остальное отбрасывается и записывается на счёт гостя в `hv list`.
 
 Однажды контрольный прогон с вырезанной проверкой показал, к чему это приводит: соединение через `hv forward` (эта команда пробрасывает порт nos в гостя) к веб-серверу одного гостя попало к другому. Теперь `hv-linux-test.py --net` заставляет настоящего Linux-гостя присвоить адрес соседа и проверяет, что обратно ничего не приходит.
 
 ### Адрес за верхней границей памяти
 
-Гость мог положить буфер virtio на самый верх своего адресного пространства. Тогда виртуальный диск, записывая статус запроса, вычислял адрес за пределами 2^64. При `RUSTUB=1` это была паника, а в обычном ядре адрес молча заворачивался на страницу 0. Исправили это типом, а не проверкой в каждом месте вызова. Адрес сегмента теперь приватный, а единственный метод, который его выдаёт, складывает с проверкой переполнения ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/devices/virtio.rs)):
+Гость мог положить буфер virtio на самый верх своего адресного пространства. Тогда виртуальный диск, записывая статус запроса, вычислял адрес за пределами 2^64. При `RUSTUB=1` это была паника, а в обычном ядре адрес молча заворачивался на страницу 0. Исправили это типом, а не проверкой в каждом месте вызова. Адрес сегмента теперь приватный, а единственный метод, который его выдаёт, складывает с проверкой переполнения ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/devices/virtio.rs)):
 
 ```rust
 pub struct Seg {

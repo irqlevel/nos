@@ -4,31 +4,31 @@
 
 #include <stddef.h>
 
-namespace Fuzz
+namespace fuzz
 {
 
 /* Back to the state a process of the runner's starts with: between two
    inputs of a batch, before the target's own Reset. */
-void ResetKernel();
+void reset_kernel();
 
 /* Spin locks held right now. */
-long HeldSpinLocks();
+long held_spin_locks();
 
 /* A finding if any spin lock is still held: when says at what point. */
-void CheckNoLocksHeld(const char* when);
+void check_no_locks_held(const char* when);
 
 /* The kernel heap (heap.cpp): what is allocated right now, in blocks and
    bytes. A target compares them before and after the work it hands the
    code, for what an error path forgot to give back. */
-size_t HeapBlocks();
-size_t HeapBytes();
+size_t heap_blocks();
+size_t heap_bytes();
 
 /* From now on, the next n kernel allocations succeed and the ones after
    fail (-1: none fails): for the error paths. */
-void HeapFailAfter(long n);
+void heap_fail_after(long n);
 
 /* No allocation set to fail. What an input left allocated stays so: a
    target counts what its own work leaves, as a difference. */
-void HeapReset();
+void heap_reset();
 
 }

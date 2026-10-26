@@ -3,7 +3,7 @@
 Space-separated `key=value` pairs. Set them on the GRUB command line on
 x86-64 (`build/grub.cfg`, the `multiboot2` line) or with QEMU `-append` on
 arm64 (`scripts/qemu-arm64.sh`). Parsing lives in
-`src/cpp/kernel/parameters.cpp`.
+`src/base/kernel/parameters.cpp`.
 
 Nothing on the command line stops the boot. An unknown key, a known key with
 a value it does not recognise, and a parameter that cannot be parsed at all
@@ -43,7 +43,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `loglevel=N` — trace level to boot with (0-5, default 1). The `loglevel` shell command moves it afterwards, but only a boot parameter can make the *boot* chatty; the task lifecycle and the multitasking self-test are at level 3
 - `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address, so pair it with `dhcp=auto`. See [Netconsole](netconsole.md)
 - `nctail=N` — ship only the newest N KiB of the log buffered before the link came up (e.g. `nctail=16`); the rest is dropped. For a machine that wedges shortly after the network appears, this spends the little airtime it has on the lines around the wedge instead of on the head of the boot log
-- `disklog=on` — write the kernel log, from its first line, to a disk area laid down with `scripts/disklog.py format`: for a machine with no serial port whose boot stops before its network is up. The boot so far is written when the area is found and every line after by a task of its own, so nothing that traces waits on the disk; a panic report goes down too. Off by default, since every burst of lines is a forced disk write. It takes both, the parameter and a prepared area: without the parameter no disk is so much as read, and with it but no area found the boot logs `DiskLog: disklog=on, but no prepared area on any disk` and carries on without. `disklog` in the shell says which. It works on both architectures; `scripts/disklog-test.py` is its test. While the log runs the area is its own: a mount of it, or of the disk it is on, and a `blkload` write test are refused. See [Real hardware](real-hardware.md)
+- `disklog=on` — write the kernel log, from its first line, to a disk area laid down with `scripts/disklog.py format`: for a machine with no serial port whose boot stops before its network is up. The boot so far is written when the area is found and every line after by a task of its own, so nothing that traces waits on the disk; a panic report goes down too. Off by default, since every burst of lines is a forced disk write. It takes both, the parameter and a prepared area: without the parameter no disk is so much as read, and with it but no area found the boot logs `disk_log: disklog=on, but no prepared area on any disk` and carries on without. `disklog` in the shell says which. It works on both architectures; `scripts/disklog-test.py` is its test. While the log runs the area is its own: a mount of it, or of the disk it is on, and a `blkload` write test are refused. See [Real hardware](real-hardware.md)
 - `panic=vga` — parsed and currently has no effect: the panic report already goes to the screen whenever one is ready, on both architectures
 - `panic=N` — reset the machine N seconds (1–3600) after a panic's report has gone out: to the screen and the serial port, and flushed to the netconsole and the disk log. Timed on the cycle counter; a panic before it is calibrated resets at once. 0, the default, keeps the machine stopped with the report on its screen. For a machine whose only console is the network: the system image's GRUB entries pass `panic=10`, so a server whose one-shot nos boot dies is back on its own OS by itself ([Install](install.md))
 
@@ -55,7 +55,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
-- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/rust/net/src/device.rs`)
+- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/net/src/device.rs`)
 
 ## Devices and filesystems
 

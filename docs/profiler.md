@@ -21,9 +21,9 @@ The code is `kernel/profiler.cpp`; the performance-counter backend is
 ## How a sample is taken
 
 Most of a profiler already existed in this kernel and is reused rather than
-rebuilt: `SymbolTable::Resolve` turns an address into a name using the table
+rebuilt: `SymbolTable::resolve` turns an address into a name using the table
 the [three-pass link](build.md) bakes into the image, and
-`StackTrace::CaptureFromSp` walks the frame-pointer chain, which is intact
+`StackTrace::capture_from_sp` walks the frame-pointer chain, which is intact
 because the whole kernel is built with `-fno-omit-frame-pointer`. What was
 left was to take a sample and count them up.
 
@@ -42,7 +42,7 @@ contend for. An NMI cannot be nested by another NMI on the same CPU, so that
 holds for the counter path too. Buffers hold 1024 samples per CPU (one
 second at the counter rate, ten at the tick rate) and are allocated only for
 the CPUs that are actually running. They are kept for the life of the kernel
-rather than freed on stop: a CPU can be inside `Sample()` having already
+rather than freed on stop: a CPU can be inside `sample()` having already
 passed the active check when another CPU stops the run, and freeing
 underneath it would be a use-after-free for the sake of reclaiming a
 megabyte.
@@ -108,14 +108,14 @@ claims, and which counter `profile` would actually use — or `tick only`.
 
 ## Arming, and stopping
 
-`Profiler::Start()` is called from the shell task; it allocates, zeroes the
+`Profiler::start()` is called from the shell task; it allocates, zeroes the
 counters, asks once whether there is a PMU, and sets the active flag. Each
 CPU then arms **its own** counter on its next tick — the control registers
 are per CPU and cannot be written from anywhere else. Once armed, that CPU's
 tick stops sampling, so nothing is counted twice.
 
 `Stop()` just clears the flag. Each CPU disarms its own counter on its next
-tick; until then it keeps overflowing and `Sample()` drops what arrives. An
+tick; until then it keeps overflowing and `sample()` drops what arrives. An
 overflow in flight when the counter is disarmed is still this profiler's, so
 the "armed" flag is set *before* the counter and cleared *after* it —
 load-bearing on AMD without PerfMonV2, where the overflow is recognised by
@@ -143,7 +143,7 @@ differ for a reason:
 > profile 2000 all 3
 profiled 2000 ms
 4102 samples on 4 cpus, 0 dropped, source pmu/nmi intel fixed-ctr1
-31.2% 1280 MemCpy+0x1a..0x3e
+31.2% 1280 mem_cpy+0x1a..0x3e
         <- NetFrame::Copy+0x44
         <- VirtioNet::Receive+0x1b2
 ...

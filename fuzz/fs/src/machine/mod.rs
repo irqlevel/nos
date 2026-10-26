@@ -100,7 +100,7 @@ pub fn set_params(p: Params) {
     *PARAMS.lock().unwrap_or_else(|e| e.into_inner()) = p;
 }
 
-/// `s` into the C buffer `buf` of `len` bytes as `SnPrintf("%s")` puts it:
+/// `s` into the C buffer `buf` of `len` bytes as `sn_printf("%s")` puts it:
 /// cut to fit, NUL-terminated; the bytes written, the NUL aside.
 ///
 /// # Safety

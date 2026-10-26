@@ -19,7 +19,7 @@ tags: [debugging, memory, arm64, x86-64]
 
 Первым был самый тихий сбой: `poweroff` просто ничего не делал. Команды `poweroff` и `reboot` в шелле только поднимают флаг. Проверяет его idle-задача BSP, то есть загрузочного процессора. Idle-задача получает процессор, когда он больше никому не нужен, и смотрит на флаг в промежутках между остановами. Такой задачей «на крайний случай» она стала совсем недавно: с 5 сентября планировщик выбирает idle-задачу, только если на её CPU больше нечего запускать ([021cbbf](https://github.com/irqlevel/nos/commit/021cbbf3a19f9327ee37584418e8ee4e6f4f66e7)).
 
-Но тогда `Sleep()` уступал процессор, а не блокировал задачу. На CPU, где жили шелл, DHCP-клиент и задача опроса USB, всегда было что запустить. Очередь до idle-задачи так и не доходила, и запрос лежал непрочитанным. На QEMU с двумя CPU так получалось каждый раз. Тот же коммит с ext2 от 9 сентября исправил и это: запрос теперь снимает с idle-задачи `FlagIdleBit`, и дальше она получает свою очередь наравне с остальными ([`cmd.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/cmd.cpp), [Планировщик](/docs/scheduler#the-idle-task)):
+Но тогда `Sleep()` уступал процессор, а не блокировал задачу. На CPU, где жили шелл, DHCP-клиент и задача опроса USB, всегда было что запустить. Очередь до idle-задачи так и не доходила, и запрос лежал непрочитанным. На QEMU с двумя CPU так получалось каждый раз. Тот же коммит с ext2 от 9 сентября исправил и это: запрос теперь снимает с idle-задачи `FlagIdleBit`, и дальше она получает свою очередь наравне с остальными ([`cmd.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/cmd.cpp), [Планировщик](/docs/scheduler#the-idle-task)):
 
 ```cpp
 static void WakeShutdownWatch()
@@ -33,7 +33,7 @@ static void WakeShutdownWatch()
 
 Пришлось поменять и порядок остановки. При размонтировании ext2 пишет суперблок, а блочный запрос завершается через soft IRQ BLK_IO, отложенную половину обработки прерываний. Поэтому размонтирование переехало раньше `SoftIrq::Stop()`. Через два дня та же беда обнаружилась у disk log, который копирует лог ядра на сырой раздел диска ([0d70452](https://github.com/irqlevel/nos/commit/0d704526d5d421c69576d2e79a1af453a4e666df)). С подготовленной областью под QEMU не завершилось ни одно выключение из трёх. Вывод в последовательный порт обрывался после того, как вторичные процессоры (AP) выходили из работы: ядро так и не дождалось записи в disk log. Теперь disk log останавливается после размонтирования и до soft IRQ.
 
-Вот порядок на x86 в его нынешнем виде, по [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/main.cpp):
+Вот порядок на x86 в его нынешнем виде, по [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/main.cpp):
 
 ```text
 BpStartup, once the request is seen
@@ -70,7 +70,7 @@ FinalizeOnStaticStack
 
 Одиночный `Hlt()` появился давно, в 2018 году, в коммите с названием «kernel: fix crash on shutdown» ([28ba855](https://github.com/irqlevel/nos/commit/28ba855c298d452d91abadd1362a6a47bd1fd42a)). Он заменил собой бесконечный цикл ожидания. На x86 останов с выключенными прерываниями длится до первого NMI (немаскируемого прерывания). Порт на arm64 выполняет тот же код, а WFI таких обещаний не даёт.
 
-Исправление ([7908bf6](https://github.com/irqlevel/nos/commit/7908bf6f5ddf8006aeda5cba5dfdbdb93259b526)) даёт выходящему процессору одно место, где он заканчивает работу: `Cpu::Park()`. Вот как функция выглядит сегодня, вместе с флагом `Parked` из исправления, о котором речь пойдёт ниже ([`cpu.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/cpu.cpp)):
+Исправление ([7908bf6](https://github.com/irqlevel/nos/commit/7908bf6f5ddf8006aeda5cba5dfdbdb93259b526)) даёт выходящему процессору одно место, где он заканчивает работу: `Cpu::Park()`. Вот как функция выглядит сегодня, вместе с флагом `Parked` из исправления, о котором речь пойдёт ниже ([`cpu.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/cpu.cpp)):
 
 ```cpp
 void Cpu::Park()
@@ -103,7 +103,7 @@ void Cpu::Park()
 
 Адрес сбоя показал ровно это. В пойманном случае утёкшими объектами были задачи soft IRQ, `softirq/N`, выделенные с тегом `'SIrq'` и забытые в списках завершившихся задач своих CPU. `Cpu::~Cpu` падал с cr2 (регистром, где лежит адрес сбоя), равным адресу задачи плюс 0x68. Это поле `Blink` в `Lock.RawLock.WatchdogListEntry` этой задачи. Какой статический объект упадёт, зависело от того, в какую корзину попал утёкший спинлок.
 
-Исправление ([a51290e](https://github.com/irqlevel/nos/commit/a51290e256fce4e488e59dda2c1c7bd963d95e16)) удаляет оба цикла и оставляет на их месте комментарий, который начинается словами «The pages stay mapped» ([`pool.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/mm/pool.cpp)):
+Исправление ([a51290e](https://github.com/irqlevel/nos/commit/a51290e256fce4e488e59dda2c1c7bd963d95e16)) удаляет оба цикла и оставляет на их месте комментарий, который начинается словами «The pages stay mapped» ([`pool.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/mm/pool.cpp)):
 
 ```diff
 -    while (!FreePageList.IsEmpty())

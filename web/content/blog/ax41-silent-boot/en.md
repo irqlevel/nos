@@ -18,7 +18,7 @@ On this machine that is survivable by design. The `nosboot` script arms exactly 
 
 ## What silence still tells you
 
-"Nothing" still tells you something about time. Each channel starts working at a known point of the boot, so silence on all of them limits how far the kernel can have got. Here is the boot order at the time, from [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/main.cpp):
+"Nothing" still tells you something about time. Each channel starts working at a known point of the boot, so silence on all of them limits how far the kernel can have got. Here is the boot order at the time, from [`kernel/main.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/main.cpp):
 
 ```text
 Main2
@@ -48,7 +48,7 @@ sudo ./scripts/disklog.py read /dev/nvme0n1p1      # read the last boot
 
 It had not moved. (At the time the log ran on every boot of a machine with a prepared area. Since [0d70452](https://github.com/irqlevel/nos/commit/0d704526d5d421c69576d2e79a1af453a4e666df) it needs `disklog=on`, and without it an unchanged number says nothing, so check the entry's command line first.)
 
-The second counter is ext2's own. When nos's ext2 driver (C++ then, Rust now) mounts a filesystem read-write, it does what Linux does ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/fs/src/ext2.rs)):
+The second counter is ext2's own. When nos's ext2 driver (C++ then, Rust now) mounts a filesystem read-write, it does what Linux does ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/fs/src/ext2.rs)):
 
 ```rust
             self.sb.state &= !STATE_VALID;
@@ -88,7 +88,7 @@ PANIC:ParseMultiBootInfo():grub.cpp,148: Can't parse command line
 
 ## Two equals signs
 
-`Parameters::ParseParameter` split each token into a key and a value with `StrChrOnce(param, '=')`. That helper returns `nullptr` when the separator occurs more than once, and `root=LABEL=nosenv` has two. With no separator found, the parser took the token for a bare word, a parameter with no value. The only bare word it accepts is `ro`, so the parse failed. On x86, a command line that failed to parse meant a panic ([`grub.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/x86_64/grub.cpp)):
+`Parameters::ParseParameter` split each token into a key and a value with `StrChrOnce(param, '=')`. That helper returns `nullptr` when the separator occurs more than once, and `root=LABEL=nosenv` has two. With no separator found, the parser took the token for a bare word, a parameter with no value. The only bare word it accepts is `ro`, so the parse failed. On x86, a command line that failed to parse meant a panic ([`grub.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/arch/x86_64/grub.cpp)):
 
 ```cpp
             Trace(0, "Cmdline %s", cmdLine->String);
