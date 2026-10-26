@@ -4,7 +4,7 @@ Four-level paging with 4 KiB pages, a higher-half kernel and no user space
 yet. This page covers the whole path: the bootstrap map the assembly entry
 builds, the real page table that replaces it, how physical memory becomes a
 free list, the allocators layered on top, and the rules that keep them from
-deadlocking. The code lives in `src/cpp/mm/`, with the PTE encoding in
+deadlocking. The code lives in `src/base/mm/`, with the PTE encoding in
 `arch/*/pte.h` behind `hal/pte.h`.
 
 ## The address space

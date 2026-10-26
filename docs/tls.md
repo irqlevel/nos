@@ -17,26 +17,26 @@ What the kernel supplies, and already had:
 
 | TLS needs | comes from |
 |---|---|
-| a byte transport | the TCP of `src/rust/net` (`tcp.rs`) |
-| randomness | the kernel's pool (`src/rust/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
+| a byte transport | the TCP of `src/crates/net` (`tcp.rs`) |
+| randomness | the kernel's pool (`src/crates/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
 | a wall clock, for certificate validity | `get_wall_time_secs()` |
 | a heap | the Rust global allocator over `mm::alloc` |
 
 ## The pieces
 
 ```
-  wget                           src/rust/net/src/wget.rs
+  wget                           src/crates/net/src/wget.rs
       |
-  http::get_with_location        src/rust/net/src/http.rs
+  http::get_with_location        src/crates/net/src/http.rs
       |   Transport: send / recv
       |         |
     Plain      Tls
       |         |
-      |     TlsStream<T>         src/rust/tls
+      |     TlsStream<T>         src/crates/tls
       |         |  rustls, rustls-rustcrypto, webpki-roots
       |     T: tls::Transport    implemented by http.rs for its connection
       |         |
-      +------  TCP               src/rust/net/src/tcp.rs
+      +------  TCP               src/crates/net/src/tcp.rs
 ```
 
 `Transport` is the seam: request framing, header parsing, chunked decoding,
@@ -59,7 +59,7 @@ There is no `std` in the kernel, so `read_tls`/`write_tls` — which take
 `std::io` traits — are not available. The `tls` crate drives rustls'
 unbuffered API instead: `process_tls_records` returns one state at a time
 (`EncodeTlsData`, `TransmitTlsData`, `BlockedHandshake`, `ReadTraffic`,
-`WriteTraffic`, `Closed`) and the loop in `src/rust/tls/src/lib.rs` does the
+`WriteTraffic`, `Closed`) and the loop in `src/crates/tls/src/lib.rs` does the
 reading, the writing and the buffering that `std::io` would have done.
 
 One rule matters more than the rest: **call `process_tls_records` once per
@@ -91,7 +91,7 @@ tls: InvalidCertificate(ExpiredContext { time: UnixTime(1788984857),
 
 **External crates.** These are the first dependencies in the tree that are not
 local paths: `rustls`, `rustls-rustcrypto`, `webpki-roots`, `getrandom` and
-what they pull in. Their sources are vendored in `src/rust/vendor` and the
+what they pull in. Their sources are vendored in `src/crates/vendor` and the
 build runs `cargo --offline`, so nothing is ever fetched during a build. After
 changing a dependency, run `scripts/vendor.sh` (which does need the network,
 once) and commit the result with `Cargo.lock`.
@@ -108,7 +108,7 @@ runtime and compile those paths unconditionally, which LLVM cannot legalize
 for a target with SSE off — it fails with `Do not know how to split the result
 of this operator`. The kernel keeps SSE off on purpose: it saves no XMM state
 on a context switch, so SSE in kernel code would corrupt userland-visible
-state the moment there is any. `src/rust/.cargo/config.toml` therefore sets
+state the moment there is any. `src/crates/.cargo/config.toml` therefore sets
 the crates' own switches to the portable backends:
 
 ```

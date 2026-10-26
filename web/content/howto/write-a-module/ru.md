@@ -5,7 +5,7 @@ order: 8
 updated: 2026-10-22
 ---
 
-К концу этого руководства у вас будет свой модуль. Это крейт в `src/rust/modules/`, который собирается в файл `.ko` и регистрирует команду шелла. Вы загрузите его в работающий nos командой `insmod` и выгрузите командой `rmmod`, не пересобирая и не перезагружая ядро.
+К концу этого руководства у вас будет свой модуль. Это крейт в `src/crates/modules/`, который собирается в файл `.ko` и регистрирует команду шелла. Вы загрузите его в работающий nos командой `insmod` и выгрузите командой `rmmod`, не пересобирая и не перезагружая ядро.
 
 Что понадобится:
 
@@ -23,7 +23,7 @@ updated: 2026-10-22
 
 ## Самый маленький настоящий модуль: `hello`
 
-В `src/rust/modules/hello/` два файла. Первый — `Cargo.toml`:
+В `src/crates/modules/hello/` два файла. Первый — `Cargo.toml`:
 
 ```toml
 [package]
@@ -40,7 +40,7 @@ kmod = { path = "../../kmod" }
 kcore = { path = "../../kcore" }
 ```
 
-Второй — [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hello/src/lib.rs), здесь он показан без doc-комментария:
+Второй — [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hello/src/lib.rs), здесь он показан без doc-комментария:
 
 ```rust
 #![no_std]
@@ -96,10 +96,10 @@ kmod::module!(name: "hello", init: init);
 Скопируйте `hello` и дайте копии своё имя. Пусть это будет `greet`:
 
 ```sh
-cp -r src/rust/modules/hello src/rust/modules/greet
+cp -r src/crates/modules/hello src/crates/modules/greet
 ```
 
-В `src/rust/modules/greet/Cargo.toml` переименуйте пакет в `mod-<name>`, а библиотеку в `mod_<name>`. Makefile рассчитывает именно на такие имена: он собирает пакет `mod-greet` и линкует `libmod_greet.a`.
+В `src/crates/modules/greet/Cargo.toml` переименуйте пакет в `mod-<name>`, а библиотеку в `mod_<name>`. Makefile рассчитывает именно на такие имена: он собирает пакет `mod-greet` и линкует `libmod_greet.a`.
 
 ```diff
  [package]
@@ -114,7 +114,7 @@ cp -r src/rust/modules/hello src/rust/modules/greet
  crate-type = ["staticlib"]
 ```
 
-Добавьте крейт в `members` рабочего пространства в `src/rust/Cargo.toml` (здесь строка сокращена). `default-members` не трогайте: по этому списку собирается само ядро.
+Добавьте крейт в `members` рабочего пространства в `src/crates/Cargo.toml` (здесь строка сокращена). `default-members` не трогайте: по этому списку собирается само ядро.
 
 ```diff
 -members = [..., "modules/hv", "modules/heapbench"]
@@ -128,7 +128,7 @@ cp -r src/rust/modules/hello src/rust/modules/greet
 +MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench greet
 ```
 
-Наконец, в `src/rust/modules/greet/src/lib.rs` поменяйте имя и текст справки команды, а имя модуля задайте в `kmod::module!(name: "greet", init: init)`.
+Наконец, в `src/crates/modules/greet/src/lib.rs` поменяйте имя и текст справки команды, а имя модуля задайте в `kmod::module!(name: "greet", init: init)`.
 
 ### Ядро доступно через `kcore`
 
@@ -158,7 +158,7 @@ let cmd = Command::register("hv", HELP, move |args, out| command(&for_cmd, args,
 - **Не выделяйте и не освобождайте память, держа спин-блокировку.** Аллокатор страниц сбрасывает TLB на всех остальных CPU и ждёт ответа от каждого. CPU, который крутится на вашей блокировке, работает с выключенными прерываниями и ответить не может. Они ждут друг друга, пока через десять секунд ядро не запаникует и не назовёт CPU, которые так и не ответили. Поэтому соберите под блокировкой то, что нужно освободить, отпустите её и только потом освобождайте.
 - **Осторожнее с объектами, которые ждут при уничтожении.** UDP-слушатель, `TaskHandle` или обработчик прерывания при drop дожидаются своих обратных вызовов. Держите каждый такой объект в собственном `Lock<Option<..>>`: забирайте его через `take()` под блокировкой, а уничтожайте уже после того, как её отпустили. Если уничтожить его под блокировкой, которая нужна его ожиданию, получится взаимоблокировка.
 - **Никогда не вызывайте `rmmod` из собственной команды модуля.** Выгрузка ждала бы эту команду, а команда ждала бы выгрузку.
-- **Модуль может вызывать только то, что объявлено в `ffi`.** Новый сервис ядра добавляется в три шага: функция на C++ в `src/cpp/kernel/rust_ffi.cpp`, её объявление в `src/rust/ffi` и безопасная обёртка в `src/rust/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). От этого меняется хеш интерфейса, поэтому ядро и все модули пересобираются вместе.
+- **Модуль может вызывать только то, что объявлено в `ffi`.** Новый сервис ядра добавляется в три шага: функция на C++ в `src/base/kernel/rust_ffi.cpp`, её объявление в `src/crates/ffi` и безопасная обёртка в `src/crates/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). От этого меняется хеш интерфейса, поэтому ядро и все модули пересобираются вместе.
 
 ## Сборка
 
@@ -173,7 +173,7 @@ make modules ARCH=aarch64
 docker run --platform linux/amd64 --rm -v "$PWD:/src" -w /src nos-builder make modules
 ```
 
-Каждый модуль компилируется отдельно, в `src/rust/target/modules`, со своей копией `core`, `alloc`, `kcore` и `kmod`. Модулю нужны флаги компилятора, которых нет у Rust-части ядра:
+Каждый модуль компилируется отдельно, в `src/crates/target/modules`, со своей копией `core`, `alloc`, `kcore` и `kmod`. Модулю нужны флаги компилятора, которых нет у Rust-части ядра:
 
 - **позиционно-независимый код**, потому что заранее неизвестно, куда модуль загрузят;
 - **малая модель кода на x86**, тогда как само ядро использует большую;
@@ -227,7 +227,7 @@ module: hello unloaded
 
 ## Что проверяет загрузчик
 
-`insmod` передаёт файл загрузчику из `src/cpp/kernel/module.cpp`. Загрузчик по порядку проходит следующие шаги и отвергает модуль при первой же неудаче:
+`insmod` передаёт файл загрузчику из `src/base/kernel/module.cpp`. Загрузчик по порядку проходит следующие шаги и отвергает модуль при первой же неудаче:
 
 1. **Файл.** Это должен быть разделяемый объект ELF64 для этого CPU, little-endian, с заголовками внутри файла и без сегментов thread-local и интерпретатора. Каждый загружаемый сегмент должен быть выровнен по странице, лежать внутри файла, не пересекаться с другими и **никогда не быть одновременно доступным на запись и на исполнение**.
 2. **Импорты, ещё до отображения в память.** Загрузчик ищет каждый неопределённый символ в таблице экспорта ядра. Если ядро не может дать модулю всё нужное, загрузчик отвергает модуль и перечисляет, чего не хватает.
@@ -274,5 +274,5 @@ module: hello unloaded
 
 - [Loadable kernel modules](/docs/modules) — справочник, где описаны и большие модули `blkload`, `netload`, `netblk`, `sshd`, `heapbench` и `hv`.
 - [Rust in the kernel](/docs/rust) — слои, место для `unsafe` и что есть в `kcore`.
-- Исходники настоящих модулей: [`src/rust/modules`](https://github.com/irqlevel/nos/blob/master/src/rust/modules).
+- Исходники настоящих модулей: [`src/crates/modules`](https://github.com/irqlevel/nos/blob/master/src/crates/modules).
 - [Linux-гость под гипервизором nos](/howto/linux-guest) — самый большой модуль из всех, гипервизор.

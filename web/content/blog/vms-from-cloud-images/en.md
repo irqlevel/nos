@@ -53,9 +53,9 @@ forward = ["2222:22"]
 restart = true
 ```
 
-The format is a strict subset of TOML, read by a parser with no kernel in it ([`config.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hv/src/config.rs)). Whatever it cannot read it refuses, naming the line. That includes a key it does not know and a key given twice, and the parser's comment gives the reason: `memroy = 4096` would otherwise boot a guest of the default size without a word. `port=` pins the guest to one port of the switch, so its address and MAC are the same at every start. `forward=` relays nos's ports to the guest while it runs. `restart` boots it again when it reboots itself.
+The format is a strict subset of TOML, read by a parser with no kernel in it ([`config.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hv/src/config.rs)). Whatever it cannot read it refuses, naming the line. That includes a key it does not know and a key given twice, and the parser's comment gives the reason: `memroy = 4096` would otherwise boot a guest of the default size without a word. `port=` pins the guest to one port of the switch, so its address and MAC are the same at every start. `forward=` relays nos's ports to the guest while it runs. `restart` boots it again when it reboots itself.
 
-The console log is written by a task of the VM's own, once a second, from the console's ring buffer ([`vmlog.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hv/src/vmlog.rs)). The guest's CPUs never write it, because then a VM exit would wait for the disk. hv's own lines go between the guest's, where they happened: `--- hv: <date> UTC vm 0 started on cpus 2,3 -- ... ---`, and then `booting again`, `stopped` or `off the list`. At 8 MiB the file moves to `console.log.1`. If a guest prints more than 64 KiB in a second, the ring loses what it can no longer hold, and the log says how much was lost.
+The console log is written by a task of the VM's own, once a second, from the console's ring buffer ([`vmlog.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hv/src/vmlog.rs)). The guest's CPUs never write it, because then a VM exit would wait for the disk. hv's own lines go between the guest's, where they happened: `--- hv: <date> UTC vm 0 started on cpus 2,3 -- ... ---`, and then `booting again`, `stopped` or `off the list`. At 8 MiB the file moves to `console.log.1`. If a guest prints more than 64 KiB in a second, the ring loses what it can no longer hold, and the log says how much was lost.
 
 Where the folders live is hv's one parameter, and modules had no parameters before this commit. Now `insmod /hv.ko vms=/data/vms` hands the rest of the line to the module's init. The module header went to version 2, and a module built for the old one is refused. A parameter hv does not have makes the load fail, the same way a misspelt key makes a `vm.toml` fail. nos's root is a disk, so a folder survives a reboot of nos, and `rc add hv start web` starts the VM at every boot.
 
@@ -79,7 +79,7 @@ Clouds ship their images in QEMU's qcow2 format, and hv's disks are raw files. U
 
 `hv convert` is a module command over the `diskimage` crate, which has no kernel in it, no dependency and `forbid(unsafe_code)` ([A disk from a cloud's image](/docs/hypervisor#a-disk-from-a-clouds-image)). It reads qcow2 versions 2 and 3, clusters from 512 bytes to 2 MiB, clusters that are stored, compressed, zero or absent, and extended L2 entries with their subclusters. Whatever it cannot convert faithfully it refuses, and it says why: a backing file, encryption, an external data file, zstd compression, an image QEMU has marked corrupt, a feature it does not know.
 
-The interesting part is the DEFLATE decoder. A compressed cluster is raw DEFLATE, and QEMU reads it through zlib. So a good stream is whatever zlib calls good, including streams that are odd at the edges, and the decoder's header says so ([`inflate.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/diskimage/src/inflate.rs)):
+The interesting part is the DEFLATE decoder. A compressed cluster is raw DEFLATE, and QEMU reads it through zlib. So a good stream is whatever zlib calls good, including streams that are odd at the edges, and the decoder's header says so ([`inflate.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/diskimage/src/inflate.rs)):
 
 ```rust
 //! Raw DEFLATE (RFC 1951) -- what a compressed qcow2 cluster holds --
@@ -105,7 +105,7 @@ The disk keeps its holes. It is a new file, grown to the image's size with a hol
 
 ## One command
 
-`hv create <name> <url>` puts the pieces together ([A VM of a cloud's image](/docs/hypervisor#a-vm-of-a-clouds-image), [`cloud.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/modules/hv/src/cloud.rs)):
+`hv create <name> <url>` puts the pieces together ([A VM of a cloud's image](/docs/hypervisor#a-vm-of-a-clouds-image), [`cloud.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hv/src/cloud.rs)):
 
 - **The download.** A module cannot link the network layer, and the TCP connection a module can open has a small receive window and no TLS. So the kernel now exports its own HTTP client to modules, `kernel_http_fetch`. It is the same code as the shell's `wget` ([HTTPS from inside the kernel](/blog/https-from-the-kernel)): TLS with the certificate checked, redirects followed, and a receive window big enough for a download of gigabytes. Only a 2xx answer counts as a body, a file that is already there is never written over, and a failed download leaves no file behind.
 - **The disk.** A qcow2 image is converted and the download removed. A raw image is taken as it is. Anything else is refused by name: an ISO, a gzip or xz stream, a VMDK or a VHD, each with a word on what to do with it. `size=` grows the disk with a hole, never below what the image holds, and on the first boot cloud-init's growpart grows the root into it.

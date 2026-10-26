@@ -61,7 +61,7 @@ Sixteen minutes later came a correction ([fc314e7](https://github.com/irqlevel/n
 
 We had said the other drivers were checked. The grep behind that claim looked for a function name that does not exist in this tree. It returned nothing, and we read that nothing as clean.
 
-So the release moved out of the drivers and into the layer that owns the lock, where a driver cannot get it wrong. Today the net layer is written in Rust. A driver's `flush_tx` borrows a `TxQueue` for the length of the call, and a finished frame has one documented way out ([device.rs](https://github.com/irqlevel/nos/blob/master/src/rust/net/src/device.rs)):
+So the release moved out of the drivers and into the layer that owns the lock, where a driver cannot get it wrong. Today the net layer is written in Rust. A driver's `flush_tx` borrows a `TxQueue` for the length of the call, and a finished frame has one documented way out ([device.rs](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/device.rs)):
 
 ```rust
 /// A transmitted frame, for release once the lock is down. Never dropped
@@ -88,11 +88,11 @@ pub fn release_tx_done(&self) {
 }
 ```
 
-`self.tx` is an `IrqSpinLock<Tx>`, a lock that owns what it guards ([sync.rs](https://github.com/irqlevel/nos/blob/master/src/rust/kcore/src/sync.rs)). The queue cannot be reached at all except through the lock's guard, and it is the type that enforces this, not a comment. The guard that `lock()` returns here is a temporary, dropped at the end of the `let` statement. So by the time `drop(frame)` runs, the lock is already released. `submit_tx` adds one more subtlety: it releases frames only with interrupts on. A caller with interrupts off could not answer a shootdown itself, so it raises the TX soft IRQ and leaves the release to it.
+`self.tx` is an `IrqSpinLock<Tx>`, a lock that owns what it guards ([sync.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/sync.rs)). The queue cannot be reached at all except through the lock's guard, and it is the type that enforces this, not a comment. The guard that `lock()` returns here is a temporary, dropped at the end of the `let` statement. So by the time `drop(frame)` runs, the lock is already released. `submit_tx` adds one more subtlety: it releases frames only with interrupts on. A caller with interrupts off could not answer a shootdown itself, so it raises the TX soft IRQ and leaves the release to it.
 
 ## Ten seconds, then a report
 
-A rule in a file stops the next instance only if someone reads it, and we had just shown how easy it is to miss one. So the same commit made the failure loud. The wait for acknowledgements used to be a loop that only an answer could end. Now `CpuTable::SendTlbIPI` gives up after ten seconds, far longer than any legitimate round of IPIs takes, and panics, naming the CPUs that never answered ([cpu.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/cpu.cpp)):
+A rule in a file stops the next instance only if someone reads it, and we had just shown how easy it is to miss one. So the same commit made the failure loud. The wait for acknowledgements used to be a loop that only an answer could end. Now `CpuTable::SendTlbIPI` gives up after ten seconds, far longer than any legitimate round of IPIs takes, and panics, naming the CPUs that never answered ([cpu.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/cpu.cpp)):
 
 ```cpp
     static const ulong AckTimeoutNs = 10 * Const::NanoSecsInSec;
@@ -132,7 +132,7 @@ Backtrace: DoPanic <- Watchdog::Check <- GenericTimer::LocalTick <- ArmIrqEntry
 
 Even better than releasing outside the lock is never releasing to the allocator at all. Also on September 4 ([c3e1d8d](https://github.com/irqlevel/nos/commit/c3e1d8d)), network frames moved into a pool built once at boot. The frames have a fixed size, and their physical addresses are resolved once. They are handed out from per-CPU caches, which are touched with interrupts off and need no atomics. Behind the caches sits one lockless ring, Vyukov's bounded MPMC (multi-producer, multi-consumer) queue. The caches refill from it and spill back to it in batches of 32.
 
-The commit put the priority plainly: a datapath that never calls the allocator cannot have that bug at all, and that is worth more than the speed. On a 4-CPU arm64 guest, 500 shell round trips took 506 frames from the pool with zero misses and touched the ring 31 times. The pool is in Rust now ([frame.rs](https://github.com/irqlevel/nos/blob/master/src/rust/net/src/frame.rs)). By default it holds 4096 frames. `netframes=` changes that, and `netpool` shows its state.
+The commit put the priority plainly: a datapath that never calls the allocator cannot have that bug at all, and that is worth more than the speed. On a 4-CPU arm64 guest, 500 shell round trips took 506 frames from the pool with zero misses and touched the ring 31 times. The pool is in Rust now ([frame.rs](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/frame.rs)). By default it holds 4096 frames. `netframes=` changes that, and `netpool` shows its state.
 
 The speed came anyway. On the AX41, the first flood after every boot used to lose frames at the NIC: 755,105 of 2.06 million, all in the first two seconds. The receive ring had been filled from `Mm::Alloc` before the pool was set up. Releasing each of those frames meant a TLB shootdown that waited on every other CPU, about 4 ms apiece on that machine ([e02dfe3](https://github.com/irqlevel/nos/commit/e02dfe3)). Now the pool comes up before any driver.
 
@@ -140,7 +140,7 @@ The speed came anyway. On the AX41, the first flood after every boot used to los
 
 The fuzzers ([Testing](/docs/testing)) enforce the rule mechanically. The allocator under the network and storage fuzzers checks every allocation and every free. One made with interrupts off is a finding, reported at the line that made it, with the seed and iteration that reproduce it. The panic says why: "a spin lock held: a free can wait on every other CPU, and one spinning on this lock never answers" ([heap.rs](https://github.com/irqlevel/nos/blob/master/fuzz/common/machine/heap.rs)). The C++ fuzzer's heap target asks the same of every page the allocator takes: `INVARIANT(Fuzz::HeldSpinLocks() == 0, "a page allocated with a spin lock held")`.
 
-On September 30 the C++ fuzzer found a violation in the last place we would have looked: the kernel heap itself ([00631ab](https://github.com/irqlevel/nos/commit/00631ab)). `Pool::Alloc`, which serves the heap's small allocations, took a new page from the page allocator while holding the pool's own spinlock. When mapping that page failed, the page allocator shot down every CPU's TLB and waited, and a CPU spinning on the pool's lock would never have answered. The fix has the same shape once more. Allocate after letting go of the lock. If another CPU put a page on the list in the meantime, give the spare back, also outside the lock ([pool.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/mm/pool.cpp)):
+On September 30 the C++ fuzzer found a violation in the last place we would have looked: the kernel heap itself ([00631ab](https://github.com/irqlevel/nos/commit/00631ab)). `Pool::Alloc`, which serves the heap's small allocations, took a new page from the page allocator while holding the pool's own spinlock. When mapping that page failed, the page allocator shot down every CPU's TLB and waited, and a CPU spinning on the pool's lock would never have answered. The fix has the same shape once more. Allocate after letting go of the lock. If another CPU put a page on the list in the meantime, give the spare back, also outside the lock ([pool.cpp](https://github.com/irqlevel/nos/blob/master/src/base/mm/pool.cpp)):
 
 ```cpp
     if (block == nullptr)

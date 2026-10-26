@@ -21,7 +21,7 @@ The other cases turned up by accident. On September 19 the C++ got a build with 
 
 ## Silently wrong
 
-Two of them were not. `Pci`'s config-space lock and `Pl011::OutLock`, the lock on the arm64 console's output, are both `RawSpinLock`s. A `RawSpinLock`'s constructor does real work: it registers the lock with the lock watchdog ([raw_spin_lock.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/raw_spin_lock.cpp)).
+Two of them were not. `Pci`'s config-space lock and `Pl011::OutLock`, the lock on the arm64 console's output, are both `RawSpinLock`s. A `RawSpinLock`'s constructor does real work: it registers the lock with the lock watchdog ([raw_spin_lock.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/raw_spin_lock.cpp)).
 
 ```cpp
 RawSpinLock::RawSpinLock(bool watched)
@@ -45,7 +45,7 @@ The worst part is how they went wrong. Both globals were harmless when they were
 
 The fix ([6f83be8](https://github.com/irqlevel/nos/commit/6f83be8)) moves every global into a form that needs no code at startup. There are three such forms.
 
-**A `constexpr` constructor and a trivial destructor.** This is for types whose construction only sets values. `Atomic` and `RawRwSpinLock` got both, and the compiler now initialises their static instances ([atomic.h](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/atomic.h)):
+**A `constexpr` constructor and a trivial destructor.** This is for types whose construction only sets values. `Atomic` and `RawRwSpinLock` got both, and the compiler now initialises their static instances ([atomic.h](https://github.com/irqlevel/nos/blob/master/src/base/kernel/atomic.h)):
 
 ```cpp
     constexpr Atomic()
@@ -74,7 +74,7 @@ struct RustIrqSlot
 };
 ```
 
-**A function-local static.** This is for an object whose constructor has real work to do. Both locks are now built the first time they are used ([pci.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/drivers/pci.cpp), [pl011.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/pl011.cpp)):
+**A function-local static.** This is for an object whose constructor has real work to do. Both locks are now built the first time they are used ([pci.cpp](https://github.com/irqlevel/nos/blob/master/src/base/drivers/pci.cpp), [pl011.cpp](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/pl011.cpp)):
 
 ```cpp
 Kernel::RawSpinLock& ConfigLock()
@@ -84,7 +84,7 @@ Kernel::RawSpinLock& ConfigLock()
 }
 ```
 
-The compiler guards that first use with `__cxa_guard_acquire`. nos implements it by disabling preemption and interrupts around an atomic bit ([icxxabi.cpp](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/icxxabi.cpp)). So if two CPUs race to the first PCI access, the lock is still built only once.
+The compiler guards that first use with `__cxa_guard_acquire`. nos implements it by disabling preemption and interrupts around an atomic bit ([icxxabi.cpp](https://github.com/irqlevel/nos/blob/master/src/base/kernel/icxxabi.cpp)). So if two CPUs race to the first PCI access, the lock is still built only once.
 
 We also reviewed the change for what the new form could break. Building the console lock prints nothing, because neither the watchdog's constructor nor `RegisterSpinLock` prints. So the first line printed cannot recurse into building its own lock. And `Panic` writes through a path that takes no lock at all. After the fix, the `watchdog` shell command on arm64 counted 816 watched locks, where before it had counted 814 at the same point of the same boot.
 
