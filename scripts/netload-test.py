@@ -678,7 +678,7 @@ def main():
 
         # The tick looks at the receive path only when rxpoll=on asks. The
         # switch once lived in the C++ function the tick called; that went
-        # with src/cpp/net, and from then on every tick polled. Nothing
+        # with src/base/net, and from then on every tick polled. Nothing
         # failed: under a flood the receive softirq just moved back and forth
         # between the BSP and the queue vector's CPU, an IPI each time, and
         # took two CPUs where it had taken one.

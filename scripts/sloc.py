@@ -5,10 +5,10 @@ Every file under src/ is lexed just far enough to tell a line of code from a
 comment from a blank one -- `//` and `/* */` (nested, in Rust), with string,
 char and raw string literals skipped over so that a "//" inside one is not
 taken for a comment -- and the counts are summed per component: a directory
-of src/cpp (arch/ split by architecture), a crate of src/rust (drivers/ and
+of src/base (arch/ split by architecture), a crate of src/crates (drivers/ and
 modules/ split by crate). A line holding both code and a comment is code.
 
-The vendored crates (src/rust/vendor) and cargo's output (target/) are not
+The vendored crates (src/crates/vendor) and cargo's output (target/) are not
 the kernel's own code and are not counted.
 
     ./scripts/sloc.py                  # the three tables: C++, Rust, asm
@@ -218,7 +218,7 @@ def component(rel):
     """src-relative path -> the component the file is counted under."""
     parts = rel.split(os.sep)
     top = parts[1] if len(parts) > 2 else "."
-    if top in ("arch", "drivers", "modules") and parts[0] == "rust" and len(parts) > 3:
+    if top in ("arch", "drivers", "modules") and parts[0] == "crates" and len(parts) > 3:
         return top + "/" + parts[2]
     if top == "arch" and len(parts) > 3:
         return top + "/" + parts[2]

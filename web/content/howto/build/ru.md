@@ -11,7 +11,7 @@ updated: 2026-10-22
 
 - клон репозитория;
 - Docker (так nos собирают на macOS, в том числе на Apple Silicon) или Linux с установленным тулчейном. Эталонная система — Ubuntu 22.04: на ней основан образ сборщика и на ней же работает CI;
-- место на диске: около 4,7 ГБ под образ сборщика и ещё пара гигабайт под результаты сборки обеих архитектур в `out/` и `src/rust/target/`;
+- место на диске: около 4,7 ГБ под образ сборщика и ещё пара гигабайт под результаты сборки обеих архитектур в `out/` и `src/crates/target/`;
 - доступ в сеть, чтобы установить тулчейн. Сама сборка в сеть не ходит.
 
 ```sh
@@ -86,12 +86,12 @@ sudo apt-get install -y build-essential clang lld llvm nasm \
     python3 curl
 ```
 
-Тулчейн Rust должен быть датированным nightly с компонентом `rust-src`. Выполните команду ниже из корня репозитория. Её же использует CI, и она ставит ровно тот nightly, что указан в [`src/rust/rust-toolchain.toml`](https://github.com/irqlevel/nos/blob/master/src/rust/rust-toolchain.toml):
+Тулчейн Rust должен быть датированным nightly с компонентом `rust-src`. Выполните команду ниже из корня репозитория. Её же использует CI, и она ставит ровно тот nightly, что указан в [`src/crates/rust-toolchain.toml`](https://github.com/irqlevel/nos/blob/master/src/crates/rust-toolchain.toml):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --component rust-src --default-toolchain \
-    "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src/rust/rust-toolchain.toml)"
+    "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src/crates/rust-toolchain.toml)"
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
@@ -105,7 +105,7 @@ make
 |---|---|
 | `make` | запускает `make check`, затем собирает `nos.iso` и модули |
 | `make nocheck` | то же без cppcheck |
-| `make check` | только cppcheck по `src/cpp`; любая находка — ошибка |
+| `make check` | только cppcheck по `src/base`; любая находка — ошибка |
 | `make rust` | только Rust-staticlib `libkernel.a` |
 | `make modules` | только модули |
 | `make nocheck ARCH=aarch64` | ядро arm64, его образ и модули |
@@ -133,9 +133,9 @@ make
 
 ## Как закреплён тулчейн и как устроен вендоринг зависимостей
 
-- `src/rust/rust-toolchain.toml` закрепляет датированный nightly (на момент написания — `nightly-2026-08-30`) с `rust-src`. Rust-коду ядра nightly нужен по двум причинам: ради `-Z build-std`, который пересобирает `core` и `alloc` с большой моделью кода, и ради фичи `alloc_error_handler`.
-- Исходники внешних крейтов хранятся прямо в репозитории, в `src/rust/vendor` (это и называют вендорингом), а Makefile запускает cargo с `--offline`. Среди них rustls и крейты RustCrypto, на которых построены TLS и SSH, а также крейты, от которых зависит сама std. Ни одна сборка не обращается к crates.io. Если сборка просит сеть, значит, какую-то зависимость забыли завендорить, и cargo завершится ошибкой, а не скачает её.
-- После того как вы добавили, удалили или обновили зависимость в `src/rust`, запустите `scripts/vendor.sh`. Это единственный шаг, которому нужна сеть. Закоммитьте обновлённый `src/rust/vendor` вместе с `Cargo.lock`. Если вы обновляете закреплённый nightly, перезапустите `scripts/vendor.sh` в том же коммите: в вендоренный набор входят зависимости самой std, а они меняются от одного nightly к другому.
+- `src/crates/rust-toolchain.toml` закрепляет датированный nightly (на момент написания — `nightly-2026-08-30`) с `rust-src`. Rust-коду ядра nightly нужен по двум причинам: ради `-Z build-std`, который пересобирает `core` и `alloc` с большой моделью кода, и ради фичи `alloc_error_handler`.
+- Исходники внешних крейтов хранятся прямо в репозитории, в `src/crates/vendor` (это и называют вендорингом), а Makefile запускает cargo с `--offline`. Среди них rustls и крейты RustCrypto, на которых построены TLS и SSH, а также крейты, от которых зависит сама std. Ни одна сборка не обращается к crates.io. Если сборка просит сеть, значит, какую-то зависимость забыли завендорить, и cargo завершится ошибкой, а не скачает её.
+- После того как вы добавили, удалили или обновили зависимость в `src/crates`, запустите `scripts/vendor.sh`. Это единственный шаг, которому нужна сеть. Закоммитьте обновлённый `src/crates/vendor` вместе с `Cargo.lock`. Если вы обновляете закреплённый nightly, перезапустите `scripts/vendor.sh` в том же коммите: в вендоренный набор входят зависимости самой std, а они меняются от одного nightly к другому.
 - Dockerfile и оба workflow CI берут версию из этого единственного файла, больше она нигде не записана.
 
 ## Сборка с проверками неопределённого поведения
@@ -149,7 +149,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 `UBSAN=1` собирает C++ с UB-санитайзером clang. `RUSTUB=1` включает в Rust два вида проверок: проверки предусловий unsafe-операций самого `core` и проверки арифметических переполнений. Флаги можно использовать по отдельности или вместе. Первая же сработавшая проверка вызывает панику и называет место:
 
 ```text
-PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/cpp/...
+PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/base/...
 ```
 
 Выходные файлы называются как обычно. Инструментированные объекты C++ попадают в `out/<arch>-ubsan/`. Файл-метка в `out/` заставляет сборку перелинковать образы при каждой смене варианта, так что обычная сборка никогда не выпустит инструментированное ядро. Команда `version` добавляет к выводу `+ubsan` или `+rustub`. Чтобы за одну загрузку собрать все отчёты C++, а не паниковать на первом, загрузите ядро с `ubsan=warn`. Подробнее — в разделах [UBSan](/docs/build#ubsan) и [Rust UB checks](/docs/build#rust-ub-checks).
@@ -160,7 +160,7 @@ PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit t
 
 Следить нужно за двумя вещами:
 
-- **Списки исходников явные.** Makefile перечисляет каждый файл C++ в `CXX_SRC_x86_64` и `CXX_SRC_aarch64`, а ассемблерные файлы — в `ASM_SRC_*` и `ASM_S_SRC_*`. Новый `.cpp`, которого нет в списке, молча не компилируется, поэтому переносимый код добавляйте в оба списка. Если общий код вызывает точку входа, которая есть только на x86, добавьте в [`x86_driver_stubs.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/arch/arm64/x86_driver_stubs.cpp) недостижимую заглушку для линковки, а не `#ifdef`.
+- **Списки исходников явные.** Makefile перечисляет каждый файл C++ в `CXX_SRC_x86_64` и `CXX_SRC_aarch64`, а ассемблерные файлы — в `ASM_SRC_*` и `ASM_S_SRC_*`. Новый `.cpp`, которого нет в списке, молча не компилируется, поэтому переносимый код добавляйте в оба списка. Если общий код вызывает точку входа, которая есть только на x86, добавьте в [`x86_driver_stubs.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/arch/arm64/x86_driver_stubs.cpp) недостижимую заглушку для линковки, а не `#ifdef`.
 - **Об успехе прогона судите по коду возврата.** Прежде чем отправить изменение, соберите и загрузите обе архитектуры:
 
 ```sh

@@ -74,7 +74,7 @@ At LLDB's prompt, connect with `gdb-remote 1234`.
 
 ## Read a panic
 
-A panic report goes to the serial port and the screen. When netconsole and the disk log are on, it goes to them too. The CPU that panicked stops the other CPUs. The machine then stays stopped with the report on its console, unless it was booted with `panic=N`. In that case it resets N seconds (1–3600) after the report has gone out. Here is the shape of the report, line by line, as [`kernel/panic.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/panic.cpp) prints it:
+A panic report goes to the serial port and the screen. When netconsole and the disk log are on, it goes to them too. The CPU that panicked stops the other CPUs. The machine then stays stopped with the report on its console, unless it was booted with `panic=N`. In that case it resets N seconds (1–3600) after the report has gone out. Here is the shape of the report, line by line, as [`kernel/panic.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/panic.cpp) prints it:
 
 ```text
 PANIC:<function>():<file>,<line>: <message>
@@ -119,7 +119,7 @@ A line is printed if its level is no higher than the current trace level. The tr
 - `loglevel=N` on the kernel command line. It's the only way to get more detail from the boot itself.
 - `loglevel N` in the shell, on a running kernel. Run `loglevel` alone to see the current level. The command works over the UDP shell and SSH too, which matters on a machine with no other console.
 
-The noisier subsystems trace at their own levels, which are constants at the top of [`src/cpp/kernel/trace.h`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/trace.h):
+The noisier subsystems trace at their own levels, which are constants at the top of [`src/base/kernel/trace.h`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/trace.h):
 
 | Level | Constants | What you see at that level |
 |---|---|---|
@@ -188,7 +188,7 @@ The first undefined operation in the C++ panics and names its site. In the Rust,
 
 ## Run the boot self-tests
 
-The self-tests run on every boot, from `Test()` in [`src/cpp/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp). A failing test panics with `Self test failed`. To run just one test, edit `Test()` so that it calls only that function, then rebuild, boot and watch `nos.log`.
+The self-tests run on every boot, from `Test()` in [`src/base/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/base/kernel/test.cpp). A failing test panics with `Self test failed`. To run just one test, edit `Test()` so that it calls only that function, then rebuild, boot and watch `nos.log`.
 
 ## Troubleshooting
 

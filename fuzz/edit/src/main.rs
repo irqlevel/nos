@@ -1,4 +1,4 @@
-//! The editor (src/rust/edit) on the host, run the way the edit module runs
+//! The editor (src/crates/edit) on the host, run the way the edit module runs
 //! it -- bytes through the key decoder, the editor's actions answered, its
 //! frames drawn on a terminal of the test's own (`vt`) -- and held to:
 //!
