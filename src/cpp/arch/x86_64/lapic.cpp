@@ -60,7 +60,7 @@ void Lapic::enable()
     trace(LAPIC_LL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
         (ulong)read_reg(TPR_INDEX), (ulong)read_reg(DFR_INDEX), (ulong)read_reg(LDR_INDEX), (ulong)read_reg(SP_IV_INDEX));
 
-    trace(LAPIC_LL, "Lapic: apicId 0x%lX", (ulong)get_apic_id());
+    trace(LAPIC_LL, "Lapic: apic_id 0x%lX", (ulong)get_apic_id());
 
     /* The ID is known and the MMIO window is live: give this CPU its GS slot
        so nothing has to come back here to ask again. */
@@ -144,7 +144,7 @@ u8 Lapic::get_apic_id()
 
 void Lapic::send_init(u32 apic_id)
 {
-    /* Same ICR interleaving hazard as SendIPI below */
+    /* Same ICR interleaving hazard as send_ipi below */
     ulong flags = get_rflags();
     interrupt_disable();
 
@@ -161,7 +161,7 @@ void Lapic::send_init(u32 apic_id)
 
 void Lapic::send_startup(u32 apic_id, u32 vector)
 {
-    /* Same ICR interleaving hazard as SendIPI below */
+    /* Same ICR interleaving hazard as send_ipi below */
     ulong flags = get_rflags();
     interrupt_disable();
 
@@ -239,7 +239,7 @@ bool Lapic::calibrate_timer()
     ulong ticks_per_sec = (ticks * consts::NANO_SECS_IN_SEC) / elapsed;
 
     /* Under 2^32 a second -- a bus of 68 GHz at the divide of 16 -- or the
-       measurement is not of a local APIC; and ArmTimer's arithmetic stays
+       measurement is not of a local APIC; and arm_timer's arithmetic stays
        in a u64 below that. */
     if (ticks_per_sec == 0 || ticks_per_sec > 0xFFFFFFFFUL)
     {
@@ -270,7 +270,7 @@ void Lapic::arm_timer(ulong delta_ns)
     ulong ns = (delta_ns > ~0UL - late) ? ~0UL : delta_ns + late;
 
     /* Whole seconds and the rest apart, the rest rounded up: a remainder
-       under 2^30 times a rate under 2^32 (CalibrateTimer) stays in a u64,
+       under 2^30 times a rate under 2^32 (calibrate_timer) stays in a u64,
        and whole seconds past what the 32-bit count holds are its most */
     ulong secs = ns / consts::NANO_SECS_IN_SEC;
     ulong rest = ns % consts::NANO_SECS_IN_SEC;
@@ -290,7 +290,7 @@ void Lapic::arm_timer(ulong delta_ns)
 
 void Lapic::send_ipi(u32 apic_id, u32 vector)
 {
-    /* The two ICR writes must not be interleaved with another SendIPI
+    /* The two ICR writes must not be interleaved with another send_ipi
        on this CPU (e.g. from an interrupt handler): the second sender
        would clobber IcrHigh and redirect the first IPI. */
     ulong flags = get_rflags();

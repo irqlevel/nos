@@ -3,7 +3,7 @@
 
 Why this exists. A task that waits for another CPU's interrupt -- a block
 driver's synchronous read, a mutex, the TLB shootdown's acks -- polls. If it
-polls with Schedule(), the scheduler is free to hand the CPU to the idle task,
+polls with schedule(), the scheduler is free to hand the CPU to the idle task,
 which halts it; the thing it waits for is a counter or a store in an interrupt
 handler, with no waiter to unblock and no IPI to send, so nothing brings the
 CPU back before its own next tick. The wait costs 10 ms, every time, and the
@@ -12,7 +12,7 @@ work was done microseconds in.
 Why no other gate sees it. The precondition is a CPU with *nothing else
 runnable*, and the smoke boots have more polling tasks (shell, udpsh, dhcp,
 netconsole, usb) than CPUs -- every CPU always has something to run, so
-Schedule() never reaches the idle task and every latency looks right. It takes
+schedule() never reaches the idle task and every latency looks right. It takes
 more CPUs than busy tasks to show at all: at -smp 4 the unfixed kernel reads
 at 45k IOPS, at -smp 16 the same kernel reads at 98. It was found on a 12-CPU
 Hetzner AX41 and nowhere else, three times over (a171a86, ce3087c, and the
@@ -42,7 +42,7 @@ _spec = importlib.util.spec_from_file_location("netblk_test", os.path.join(HERE,
 nb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(nb)
 
-# One tick is 10 ms on both architectures (Hpet::DesiredHz, Pit::DesiredHz).
+# One tick is 10 ms on both architectures (Hpet::DESIRED_HZ, Pit::DESIRED_HZ).
 # A wait that halted the CPU lands on it exactly; a wait that did not is three
 # orders of magnitude below. Anywhere near it is the bug.
 TICK_US = 10_000.0

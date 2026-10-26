@@ -4,8 +4,8 @@
 #include <arch/x86_64/lapic.h>
 #include <drivers/acpi.h>
 
-// x86_64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
-// "hwId" is the LAPIC id, which this kernel keeps equal to the cpu index.
+// x86_64 bodies for the hal:: irqchip wrappers (see hal/irqchip.h).
+// "hw_id" is the LAPIC id, which this kernel keeps equal to the cpu index.
 
 namespace hal
 {
@@ -16,7 +16,7 @@ constexpr u8 IPI_VECTOR = 0xFE;
 /* The vector a vCPU running a guest is sent to hand it an interrupt posted
    for it (VT-x's posted interrupts, hvarch): taken by the CPU in its guest
    without an exit, and in the host -- the guest just left -- an EOI and
-   nothing more (PostedInterrupt). Above every device's and below the
+   nothing more (posted_interrupt). Above every device's and below the
    timer's. */
 constexpr u8 POSTED_VECTOR = 0xFC;
 
@@ -48,7 +48,7 @@ static inline __attribute__((always_inline)) ulong get_current_cpu_hw_id()
        path to be worth a segment register.
 
        Zero means this CPU has not published its slot yet, which is the window
-       between entering C++ and Lapic::Enable(); the MMIO read is still
+       between entering C++ and Lapic::enable(); the MMIO read is still
        correct there, and is what the whole kernel used to do. */
     ulong biased;
     asm volatile("movq %%gs:0x0, %0" : "=r"(biased));

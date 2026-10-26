@@ -16,14 +16,14 @@ public:
 
     /* Take what can be taken and name what cannot. A parameter that cannot be
        parsed is logged and skipped and the rest of the line still read, as
-       Linux does, and a line longer than CmdlineLen - 1 characters is read
+       Linux does, and a line longer than CMDLINE_LEN - 1 characters is read
        up to its last whole parameter. Nothing here stops the boot: this runs
        before the netconsole, the disk log or the NIC exist, so on a machine
        whose only console is the network a boot that stopped here would stop
        without a word. */
     void parse(const char *cmdline);
 
-    /* Whether Parse() has run. Before it every getter reports its default,
+    /* Whether parse() has run. Before it every getter reports its default,
        and a caller that must not act on a default -- the disk log, keeping
        the first lines of the boot until it knows -- can tell. */
     bool is_parsed();
@@ -37,7 +37,7 @@ public:
     bool is_panic_vga();
 
     /* panic=N -- reset the machine N seconds after a panic's report, 1 to
-       PanicResetSecsMax; 0, the default, keeps it stopped with the report
+       PANIC_RESET_SECS_MAX; 0, the default, keeps it stopped with the report
        on its screen. For a machine whose only console is the network,
        whose next boot is its own OS: back there with no hand on it. */
     ulong get_panic_reset_secs();
@@ -59,7 +59,7 @@ public:
     bool is_usb_off();
 
     /* rc=off -- do not run /etc/rc at boot: the way past a command in it
-       that keeps the machine from coming up (see Cmd::RunBootScript) */
+       that keeps the machine from coming up (see Cmd::run_boot_script) */
     bool is_rc_off();
 
     /* hwrng=off -- ignore the cpu's random instruction (RDRAND/RDSEED,
@@ -68,7 +68,7 @@ public:
     bool is_hw_rng_off();
 
     /* hwp=off -- x86: leave the CPUs' clock where firmware left it rather
-       than turning on hardware P-states (Hal::SetupCpuPerformance) */
+       than turning on hardware P-states (hal::setup_cpu_performance) */
     bool is_hwp_off();
 
     /* ucode=off -- x86: load no microcode from the module GRUB put beside
@@ -102,13 +102,13 @@ public:
     ulong get_net_frame_count();
 
     /* hugepages=N% | NG | NM -- the huge pool (mm/page_table.h,
-       ReserveHugePool): that share of the machine's RAM, or that much of
+       reserve_huge_pool): that share of the machine's RAM, or that much of
        it, reserved at boot in 2MiB blocks for guests' memory, each block
        one entry of a guest's nested page table. 0, the default, reserves
        none, and a guest's memory is 4KiB frames as it always was; with a
        pool, a guest's memory is the pool's or the guest does not start.
        What is asked past what the machine can spare is cut down to it, and
-       the boot says so. The bytes for a machine of totalBytes of RAM. */
+       the boot says so. The bytes for a machine of total_bytes of RAM. */
     ulong get_huge_pool_bytes(ulong total_bytes);
 
     /* rxpoll=on -- have the tick look at the receive path as well as the

@@ -503,7 +503,7 @@ const MISC_ENABLE_BTS_UNAVAILABLE: u64 = 1 << 11;
 const MISC_ENABLE_PEBS_UNAVAILABLE: u64 = 1 << 12;
 /// AMD's, which Linux reads on every AMD CPU to learn what it does, and
 /// finds true: DE_CFG's LFENCE_SERIALIZE -- set on every AMD host CPU by the
-/// kernel (`Hal::SetupSerializingLfence`), as KVM reports it -- HWCR's
+/// kernel (`hal::setup_serializing_lfence`), as KVM reports it -- HWCR's
 /// TscFreqSel, read-only 1 on every AMD CPU since family 10h (read as zero,
 /// the guest logs "TSC doesn't count with P0 frequency" as a firmware bug),
 /// and NB_CFG's extended configuration through CF8, which Linux turns on for

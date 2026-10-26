@@ -9,7 +9,7 @@ namespace kernel
 {
 
 /* Running-CPU bits an IOAPIC redirection entry can name, for the diagnostic
-   below: everything from apic id 0 up to IoApic::MaxPhysicalDest. */
+   below: everything from apic id 0 up to IoApic::MAX_PHYSICAL_DEST. */
 static const ulong IO_APIC_TARGET_MASK =
     (IoApic::MAX_PHYSICAL_DEST >= MAX_CPUS - 1)
         ? ~0UL
@@ -52,7 +52,7 @@ ulong IrqBalance::next_cpu_lock_held(bool io_apic)
             continue;
 
         /* On x86 the CPU index is the apic id, and an IOAPIC entry in
-           physical mode can only name the low ones -- see IoApic::CanTarget.
+           physical mode can only name the low ones -- see IoApic::can_target.
            MSI-X has the full 8-bit field and takes any of them. */
         if (io_apic && !IoApic::can_target(cpu))
             continue;
@@ -83,7 +83,7 @@ ulong IrqBalance::assign(Entry entry)
 {
     stdlib::AutoLock lock(lock_);
 
-    /* Before Balance() all IRQs stay on the registering CPU (the BSP)
+    /* Before balance() all IRQs stay on the registering CPU (the BSP)
        and get spread once SMP bringup completes; afterwards new IRQs
        join the round-robin immediately. */
     entry.cpu = balanced_ ? next_cpu_lock_held(entry.kind == KIND_IO_APIC)

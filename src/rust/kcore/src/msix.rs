@@ -69,7 +69,7 @@ impl MsixInterrupt {
     /// locks that take interrupts off.
     ///
     /// Returns `None` if all 16 MSI-X callback slots are in use or
-    /// if `MsixTable::EnableVector` fails (no free CPU vectors).
+    /// if `MsixTable::enable_vector` fails (no free CPU vectors).
     pub fn register_for<T, F>(
         table: &MsixTable, msix_index: u16, target: &'static T, handler: F,
     ) -> Option<Self>

@@ -192,7 +192,7 @@ DmesgMsg* Dmesg::tail_start(ulong last_lines)
         DmesgMsg* earlier = prev(msg);
         if (earlier == nullptr)
         {
-            /* The log is shorter than the walk asked for. Prev() released the
+            /* The log is shorter than the walk asked for. prev() released the
                pin on its way off the head, so start over from the head rather
                than try to resurrect it. */
             return next(nullptr);

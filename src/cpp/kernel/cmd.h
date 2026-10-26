@@ -46,7 +46,7 @@ public:
     /* Runs the shell commands in the file at path a line at a time -- blank
        lines and #comments skipped -- with what they print on out, and step,
        if there is one, called after each (the boot script's logging). /etc/rc
-       is run so at boot (RunBootScript). False if the file cannot be read,
+       is run so at boot (run_boot_script). False if the file cannot be read,
        or a script is running already: a script that ran itself would never
        end. */
     bool run_script(const char* path, stdlib::Printer& out, ScriptStep step = nullptr,
@@ -57,11 +57,11 @@ public:
 
     /* Shell commands added at run time, by a loadable module through
        kernel_cmd_register. A call hands the handler its ctx, the rest of the
-       command line after the name, and the Stdlib::Printer to answer on --
+       command line after the name, and the stdlib::Printer to answer on --
        opaque to the module, which writes to it with kernel_printer_write. */
     typedef void (*DynamicHandler)(void* ctx, const char* args, ulong args_len, void* out);
 
-    /* A handle for UnregisterDynamic, or 0: the name is empty, too long or
+    /* A handle for unregister_dynamic, or 0: the name is empty, too long or
        not one printable word, it is taken -- by a built-in command or by
        another module's -- or the table is full. The name and help are
        copied. */

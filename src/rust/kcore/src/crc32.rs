@@ -1,6 +1,6 @@
 //! CRC-32 in its reflected 0xEDB88320 form -- what a GPT header carries over
 //! itself and what nanofs puts on every block, and the same function the C++
-//! side has as `Stdlib::Crc32`.
+//! side has as `stdlib::crc32`.
 //!
 //! Only the streaming form is here, because that is what those checksums
 //! need: each covers a block with its own checksum field zeroed, so it is

@@ -11,7 +11,7 @@ namespace kernel
  
    That question is asked on the packet datapath (NetFramePool, once when a
    frame is taken and once when it comes back), from the profiler's NMI, and
-   from every CpuTable::GetCurrentCpu -- which the watchdog, the scheduler and
+   from every CpuTable::get_current_cpu -- which the watchdog, the scheduler and
    the timer wheel each reach on every tick. arm64 has always answered it from
    TPIDR_EL1; this is the x86 twin. x2APIC, whose ID lives in an MSR, is not
    an option here: this kernel deliberately switches the APIC back to xAPIC

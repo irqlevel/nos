@@ -5,9 +5,9 @@
 // blank lines and name=value lines, then '#' to the end -- every call is held
 // to what grub_env.h says it does: Set and Unset change exactly the line the
 // model says, or say no and change nothing, room counted to the byte; Get
-// and ForEach give back what the model holds. Over any block, a Set that
+// and for_each give back what the model holds. Over any block, a Set that
 // says yes is what Get gives back, one that says no leaves every byte as it
-// was, and a block Set or Unset wrote is one ForEach reads to its end, with
+// was, and a block Set or Unset wrote is one for_each reads to its end, with
 // the newline and the '#' padding GRUB's own writer looks for.
 #include "host.h"
 
@@ -109,7 +109,7 @@ std::string cut(const std::string& v, size_t n)
     return v.substr(0, std::min(n, v.size()));
 }
 
-/* ForEach's visit, kept. */
+/* for_each's visit, kept. */
 struct Visits
 {
     std::vector<Var> seen;
@@ -134,13 +134,13 @@ bool tail(const char* b, size_t size)
 void check_reads_as_model(GrubEnvBlock& env, const std::vector<Var>& vars, const char* after)
 {
     Visits v{{}, ~0UL};
-    INVARIANT(env.for_each(visit, &v), "ForEach calls a block the model reads malformed, after %s", after);
-    INVARIANT(v.seen.size() == vars.size(), "ForEach visits %zu variables, not %zu, after %s", v.seen.size(),
+    INVARIANT(env.for_each(visit, &v), "for_each calls a block the model reads malformed, after %s", after);
+    INVARIANT(v.seen.size() == vars.size(), "for_each visits %zu variables, not %zu, after %s", v.seen.size(),
         vars.size(), after);
     for (size_t i = 0; i < vars.size(); i++)
     {
         INVARIANT(v.seen[i].name == vars[i].name && v.seen[i].value == cut(vars[i].value, GrubEnvBlock::MAX_VALUE_LEN),
-            "ForEach's variable %zu is '%s', not '%s', after %s", i, v.seen[i].name.c_str(), vars[i].name.c_str(),
+            "for_each's variable %zu is '%s', not '%s', after %s", i, v.seen[i].name.c_str(), vars[i].name.c_str(),
             after);
     }
 }
@@ -249,7 +249,7 @@ void run(fuzz::Input& in)
         {
             std::string value = pick_value(in);
             bool said = env.set(name.c_str(), value.c_str());
-            fuzz::say("Set('%s', '%s') = %d", name.c_str(), value.c_str(), said);
+            fuzz::say("set('%s', '%s') = %d", name.c_str(), value.c_str(), said);
             if (modelled)
             {
                 /* The model's answer, room counted to the byte. */
@@ -278,7 +278,7 @@ void run(fuzz::Input& in)
                         }
                     }
                 }
-                INVARIANT(said == want, "Set('%s') of %zu bytes said %d where the model says %d", name.c_str(),
+                INVARIANT(said == want, "set('%s') of %zu bytes said %d where the model says %d", name.c_str(),
                     value.size(), said, want);
                 if (said)
                     check_reads_as_model(env, vars, "a Set");
@@ -288,10 +288,10 @@ void run(fuzz::Input& in)
                 char got[GrubEnvBlock::MAX_VALUE_LEN + 1];
                 INVARIANT(env.get(name.c_str(), got, sizeof(got)), "a Set of '%s' that said yes is not there to Get",
                     name.c_str());
-                INVARIANT(cut(value, GrubEnvBlock::MAX_VALUE_LEN) == got, "Get('%s') gives back other than Set put",
+                INVARIANT(cut(value, GrubEnvBlock::MAX_VALUE_LEN) == got, "get('%s') gives back other than Set put",
                     name.c_str());
                 Visits v{{}, ~0UL};
-                INVARIANT(env.for_each(visit, &v), "a block Set wrote is one ForEach calls malformed");
+                INVARIANT(env.for_each(visit, &v), "a block Set wrote is one for_each calls malformed");
                 INVARIANT(tail(b, size), "a Set left no newline before the padding");
                 fuzz::reached("a Set");
             }
@@ -305,12 +305,12 @@ void run(fuzz::Input& in)
         case 1:
         {
             bool said = env.unset(name.c_str());
-            fuzz::say("Unset('%s') = %d", name.c_str(), said);
+            fuzz::say("unset('%s') = %d", name.c_str(), said);
             if (modelled)
             {
                 auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.name == name; });
                 bool want = valid_name(name) && it != vars.end();
-                INVARIANT(said == want, "Unset('%s') said %d where the model says %d", name.c_str(), said, want);
+                INVARIANT(said == want, "unset('%s') said %d where the model says %d", name.c_str(), said, want);
                 if (want)
                 {
                     used -= name.size() + 1 + escape(it->value).size() + 1;
@@ -321,7 +321,7 @@ void run(fuzz::Input& in)
             if (said)
             {
                 Visits v{{}, ~0UL};
-                INVARIANT(env.for_each(visit, &v), "a block Unset wrote is one ForEach calls malformed");
+                INVARIANT(env.for_each(visit, &v), "a block Unset wrote is one for_each calls malformed");
                 INVARIANT(tail(b, size), "an Unset left no newline before the padding");
                 fuzz::reached("an Unset");
             }
@@ -341,10 +341,10 @@ void run(fuzz::Input& in)
             {
                 auto it = std::find_if(vars.begin(), vars.end(), [&](const Var& v) { return v.name == name; });
                 bool want = valid_name(name) && it != vars.end();
-                INVARIANT(found == want, "Get('%s') found %d where the model says %d", name.c_str(), found, want);
+                INVARIANT(found == want, "get('%s') found %d where the model says %d", name.c_str(), found, want);
                 if (found)
                     INVARIANT(cut(cut(it->value, GrubEnvBlock::MAX_VALUE_LEN), cap - 1) == got.data(),
-                        "Get('%s') into %zu bytes gives back other than the model's value", name.c_str(), cap);
+                        "get('%s') into %zu bytes gives back other than the model's value", name.c_str(), cap);
             }
             if (found)
                 INVARIANT(strlen(got.data()) < cap, "Get wrote past what it was given");
@@ -356,9 +356,9 @@ void run(fuzz::Input& in)
             bool whole = env.for_each(visit, &v);
             if (modelled)
             {
-                INVARIANT(whole, "ForEach calls a block the model reads malformed");
+                INVARIANT(whole, "for_each calls a block the model reads malformed");
                 for (size_t i = 0; i < v.seen.size(); i++)
-                    INVARIANT(i < vars.size() && v.seen[i].name == vars[i].name, "ForEach visits past the model");
+                    INVARIANT(i < vars.size() && v.seen[i].name == vars[i].name, "for_each visits past the model");
             }
             break;
         }

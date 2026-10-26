@@ -64,10 +64,10 @@ public:
 
     /* Level-triggered device IRQs (PCI INTx). The destination CPU is
        chosen by IrqBalance and spread across CPUs after SMP bringup.
-       MSI-X vectors are likewise balanced via MsixTable::EnableVector. */
+       MSI-X vectors are likewise balanced via MsixTable::enable_vector. */
     static void register_level(InterruptHandler& handler, u8 irq, u8 vector);
 
-    /* Shared interrupt dispatch (called from SharedInterruptStub) */
+    /* Shared interrupt dispatch (called from shared_interrupt_stub) */
     static void shared_dispatch(Context* ctx);
 
 private:
@@ -86,7 +86,7 @@ private:
     {
         u8 gsi;
         u8 handler_count;
-        /* True for RegisterLevel (PCI INTx) entries; only those may chain.
+        /* True for register_level (PCI INTx) entries; only those may chain.
            Edge entries (Register) own their GSI + vector exclusively. */
         bool level;
         InterruptHandler* handlers[MAX_SHARED_HANDLERS];

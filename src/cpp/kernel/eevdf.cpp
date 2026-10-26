@@ -29,7 +29,7 @@ static_assert(sizeof(NICE_WEIGHTS) / sizeof(NICE_WEIGHTS[0]) ==
    should have been stopped */
 const ulong TICK_NS = 10 * consts::NANO_SECS_IN_MS;
 
-/* VMult's fixed point, and the weight's: Nice0Weight is 2^10 */
+/* VMult's fixed point, and the weight's: NICE0_WEIGHT is 2^10 */
 const ulong VMULT_SHIFT = 32;
 const ulong WEIGHT_SHIFT = 10;
 static_assert(SchedEntity::NICE0_WEIGHT == (1UL << WEIGHT_SHIFT), "nice 0's weight is 2^10");

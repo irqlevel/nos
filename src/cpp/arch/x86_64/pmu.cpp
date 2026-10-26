@@ -419,19 +419,19 @@ bool Pmu::available()
 {
     if (probed)
     {
-        /* Pairs with the publish below: Kind and everything Detect() left
+        /* Pairs with the publish below: Kind and everything detect() left
            behind it must be visible to a CPU that has seen Probed. */
         hal::smp_rmb();
         return kind != FlavorNone;
     }
 
-    /* Interrupts off for the whole probe, which is bounded at SelfTestCycles
+    /* Interrupts off for the whole probe, which is bounded at SELF_TEST_CYCLES
        -- about ten microseconds, once per boot.
 
        Something has to pin this to one CPU: it runs in task context, and
-       SelectNextTaskQueue() will move even a running task to a lighter
+       select_next_task_queue() will move even a running task to a lighter
        queue, so without pinning the two reads bracketing the spin can come
-       off two different CPUs' counters. Task::SetCpuAffinity() would pin it
+       off two different CPUs' counters. Task::set_cpu_affinity() would pin it
        too, but it would not stop a tick on this CPU from arming the counter
        underneath the probe -- and for ten microseconds the cheap answer is
        also the complete one. */
@@ -459,7 +459,7 @@ bool Pmu::available()
        hypervisor that does not virtualise the PMU the writes are accepted
        and the counter never moves, and a profiler that trusted CPUID would
        arm it on every CPU and report an empty profile with no hint as to
-       why. Bounded at SelfTestCycles, once. */
+       why. Bounded at SELF_TEST_CYCLES, once. */
     if (found == FlavorIntel && !intel::counts_for_real())
         found = FlavorNone;
     else if (found == FlavorAmd && !amd::counts_for_real())
@@ -467,7 +467,7 @@ bool Pmu::available()
 
     /* Published after the answer is complete, and after a barrier: the CPU
        running the shell gets here first, and the CPUs that go on to arm their
-       own counters read Kind, CounterWidth and V2 on the strength of having
+       own counters read Kind, counter_width and V2 on the strength of having
        seen Probed. */
     kind = found;
     hal::smp_wmb();
@@ -479,8 +479,8 @@ bool Pmu::available()
 
 bool Pmu::start(ulong period)
 {
-    /* Available(), not Probed, is what decides whether there is a counter --
-       but this runs from the tick, in an interrupt, and Available() spins for
+    /* available(), not Probed, is what decides whether there is a counter --
+       but this runs from the tick, in an interrupt, and available() spins for
        tens of microseconds the first time it is asked. The profiler calls it
        from the shell before it sets a single CPU sampling, so by the time any
        tick gets here the answer is already in. If it is not, this tick stays
@@ -493,7 +493,7 @@ bool Pmu::start(ulong period)
         return false;
 
     /* A CPU with no slot in the armed table would take overflows that
-       AckOverflow() then refuses to claim, and every one of them would reach
+       ack_overflow() then refuses to claim, and every one of them would reach
        the panic. Leave that CPU on the tick instead. */
     ulong index = hal::get_current_cpu_hw_id();
     if (index >= MAX_CPUS)
@@ -539,7 +539,7 @@ void Pmu::stop()
 
 bool Pmu::ack_overflow()
 {
-    /* SavedPeriod is 0 until some CPU has armed the counter. Rearming with it
+    /* saved_period is 0 until some CPU has armed the counter. Rearming with it
        would set the counter one cycle short of its wrap, and the machine
        would never leave the NMI. */
     if (kind == FlavorNone || saved_period == 0)

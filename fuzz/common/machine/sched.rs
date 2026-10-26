@@ -41,7 +41,7 @@ const TICK: u64 = 10_000_000;
 /// That many reads with no sleep, wait or yield between is a loop that
 /// neither gets anywhere nor lets anything else run.
 const SPIN_READS: u64 = 1_000_000;
-/// A task thread's stack: four times a kernel task's (`Task::StackSize`),
+/// A task thread's stack: four times a kernel task's (`Task::STACK_SIZE`),
 /// for what the host's code generation and the overflow checks add. A task
 /// that runs past it is a crash, and a finding.
 const STACK: usize = 256 * 1024;

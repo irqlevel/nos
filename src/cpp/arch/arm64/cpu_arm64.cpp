@@ -3,7 +3,7 @@
 /* arm64 implementations of the portable extern "C" CPU primitives that
    x86 provides in arch/x86_64/asm.asm. Atomics use the __atomic builtins
    (seq_cst), which lower to inline LDXR/STXR loops with
-   -mno-outline-atomics. SwitchContext/SetJmp/LongJmp live in asm.S. */
+   -mno-outline-atomics. switch_context/set_jmp/long_jmp live in asm.S. */
 
 extern "C" void arm64_task_entry_thunk();
 extern "C" void __attribute__((noreturn)) arm64_run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx);
@@ -11,11 +11,11 @@ extern "C" void __attribute__((noreturn)) arm64_run_on_stack(ulong stack_top, vo
 namespace hal
 {
 
-/* SwitchContext's frame in asm.S, in words, and the one x29 is saved in */
+/* switch_context's frame in asm.S, in words, and the one x29 is saved in */
 static const ulong SWITCH_FRAME_WORDS = 14;
 static const ulong SWITCH_FRAME_FP = 12;
 
-/* Frame layout must match SwitchContext in asm.S:
+/* Frame layout must match switch_context in asm.S:
    [DAIF, pad][x19,x20][x21,x22][x23,x24][x25,x26][x27,x28][x29,x30] */
 ulong build_task_frame(ulong stack_top, ulong entry, ulong arg)
 {
@@ -24,7 +24,7 @@ ulong build_task_frame(ulong stack_top, ulong entry, ulong arg)
     for (ulong i = 0; i < SWITCH_FRAME_WORDS; i++)
         sp[i] = 0;
     /* DAIF: IRQs enabled, D/A/F stay masked — the PSTATE every other
-       context runs with (boot masks all four, InterruptEnable clears only
+       context runs with (boot masks all four, interrupt_enable clears only
        I), so SError delivery does not depend on which task is current */
     const ulong daif_daf = (1UL << 9) | (1UL << 8) | (1UL << 6);
     sp[0] = daif_daf;
@@ -40,7 +40,7 @@ ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_lim
         stack_limit - saved_sp < SWITCH_FRAME_WORDS * sizeof(ulong))
         return 0;
 
-    /* SwitchContext frame slot 12 = x29 (see asm.S layout comment) */
+    /* switch_context frame slot 12 = x29 (see asm.S layout comment) */
     return ((ulong*)saved_sp)[SWITCH_FRAME_FP];
 }
 

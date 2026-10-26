@@ -18,12 +18,12 @@ input from random bytes -- a tree of QEMU virt's shape, a firmware map, a
 block grub-editenv could have written, and each of them damaged -- and holds
 what the code makes of it to a model of what its header says it does.
 
-The targets: fdt (the device tree reader and Board::Setup), memmap (the
+The targets: fdt (the device tree reader and Board::setup), memmap (the
 memory map and the free-page scan's questions of it), grubenv (the GRUB
 environment block), module (the module loader), pagetable (the page tables
 and the physical page allocator), heap (the kernel heap), cmdline (the
 command line), multiboot (Multiboot2's tags), acpi (the ACPI tables, over
-an emulated TmpMap window), format (the kernel's printf, against the
+an emulated tmp_map window), format (the kernel's printf, against the
 host's), eevdf (the scheduler's rules, against a model of EEVDF's) and
 lineedit (the console shell's line editor, what a terminal types at it).
 docs/testing.md says what each checks.

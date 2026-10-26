@@ -38,7 +38,7 @@ const char* ec_name(ulong ec)
 extern "C" void arm_sync_entry(Context* ctx)
 {
     /* A read the panic report was not sure of: back into the report (see
-       Panicker::RecoverFault), and this one is not reported */
+       Panicker::recover_fault), and this one is not reported */
     Panicker::get_instance().recover_fault();
 
     ulong ec = (ctx->esr >> 26) & 0x3F;

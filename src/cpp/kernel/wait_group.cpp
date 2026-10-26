@@ -35,10 +35,10 @@ void WaitGroup::done()
 
 void WaitGroup::wait()
 {
-    /* YieldToRunnable, not Schedule: the counter is brought down by whoever
+    /* yield_to_runnable, not Schedule: the counter is brought down by whoever
        the waiter waits for -- an interrupt handler, for every user this has
-       -- and Done() only decrements. It has no waiter to unblock and no IPI
-       to send, so a waiter that Schedule() handed to the idle task is woken
+       -- and done() only decrements. It has no waiter to unblock and no IPI
+       to send, so a waiter that schedule() handed to the idle task is woken
        by nothing before its CPU's own next tick.
 
        That is not a tail: it is every wait on a CPU with nothing else

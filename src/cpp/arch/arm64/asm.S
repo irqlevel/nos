@@ -4,7 +4,7 @@
  *
  * switch_context stack frame, low to high (7 x 16 bytes):
  *   [DAIF, pad][x19,x20][x21,x22][x23,x24][x25,x26][x27,x28][x29,x30]
- * Hal::BuildTaskFrame (cpu_arm64.cpp) fabricates this frame for a new
+ * hal::build_task_frame (cpu_arm64.cpp) fabricates this frame for a new
  * task with x30 = TaskEntryThunk, x19 = arg, x20 = entry.
  */
 
@@ -48,10 +48,10 @@ arm64_task_entry_thunk:
     mov     x0, x19
     br      x20
 
-    /* void arm64_run_on_stack(ulong stackTop, void (*fn)(void*), void* ctx) */
+    /* void arm64_run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx) */
     .globl arm64_run_on_stack
 arm64_run_on_stack:
-    /* Task::Stack::StackTop sits 8 below a 16-byte boundary; SP must stay
+    /* Task::Stack::stack_top sits 8 below a 16-byte boundary; SP must stay
        16-aligned (AAPCS64, and an SP-alignment fault wherever SCTLR.SA=1) */
     and     x9, x0, #0xFFFFFFFFFFFFFFF0
     mov     sp, x9
@@ -60,7 +60,7 @@ arm64_run_on_stack:
 1:  wfi
     b       1b
 
-    /* long set_jmp(void* ctx) — ctx is Kernel::JmpContext */
+    /* long set_jmp(void* ctx) — ctx is kernel::JmpContext */
     .globl set_jmp
 set_jmp:
     stp     x19, x20, [x0]

@@ -80,7 +80,7 @@ fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
 
 /* ---- the allocation bitmaps ----
  *
- * Bit i is bit (i % 8) of byte (i / 8), which is what Stdlib::Bitmap's
+ * Bit i is bit (i % 8) of byte (i / 8), which is what stdlib::Bitmap's
  * 64-bit words come to on a little-endian machine -- and what
  * scripts/mkfs_nanofs.py writes. */
 

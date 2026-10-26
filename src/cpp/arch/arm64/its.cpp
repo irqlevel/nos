@@ -58,7 +58,7 @@ u64 read64(ulong a) { return *reinterpret_cast<volatile u64*>(a); }
 void write64(ulong a, u64 v) { *reinterpret_cast<volatile u64*>(a) = v; }
 
 /* Allocate a zeroed, physically-contiguous region whose physical base is
-   aligned to `align` (>= 64KiB for PENDBASER/BASER). AllocMapPages maps
+   aligned to `align` (>= 64KiB for PENDBASER/BASER). alloc_map_pages maps
    the pages contiguously in VA too, so the aligned VA is base_va +
    (aligned_phys - base_phys). Never freed (leaks the alignment slack). */
 ulong alloc_aligned(ulong bytes, ulong align, ulong* phys)
@@ -104,17 +104,17 @@ bool Its::setup(ulong its_phys, ulong gicr_base, ulong gicr_size)
 
     /* Config table covers all LPIs from 8192 up; size it to what we use.
        IDbits in PROPBASER counts total interrupt-id bits (incl. SPIs), so
-       we cover LPI 8192 + MaxLpis; round the config table to a page. */
+       we cover LPI 8192 + MAX_LPIS; round the config table to a page. */
     ulong lpi_config_phys;
     lpi_config_va_ = alloc_zero_pages(LPI_INT_ID_BASE + MAX_LPIS, &lpi_config_phys);
     if (lpi_config_va_ == 0)
         return false;
-    /* Every used LPI: priority + not-enabled yet (enabled at MapEvent) */
+    /* Every used LPI: priority + not-enabled yet (enabled at map_event) */
     for (u32 i = 0; i < MAX_LPIS; i++)
         *reinterpret_cast<volatile u8*>(lpi_config_va_ + i) = LPI_PRIORITY;
     asm volatile("dsb sy" ::: "memory");
 
-    (void)lpi_config_phys; /* PROPBASER phys is re-derived in EnableLpisOnRedist */
+    (void)lpi_config_phys; /* PROPBASER phys is re-derived in enable_lpis_on_redist */
     if (!enable_lpis_on_redist(gicr_base, gicr_size))
         return false;
 
@@ -145,9 +145,9 @@ bool Its::enable_lpis_on_redist(ulong gicr_base, ulong gicr_size)
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
     ulong aff = mpidr & 0xFFFFFF;
 
-    /* gicrBase is physical; the redistributor lives in the premapped
+    /* gicr_base is physical; the redistributor lives in the premapped
        device GiB (phys < 1GiB on QEMU virt), so the device VA is
-       KernelSpaceBase + phys — the same mapping the GIC driver uses. */
+       KERNEL_SPACE_BASE + phys — the same mapping the GIC driver uses. */
     ulong gicr_va = mm::MemoryMap::KERNEL_SPACE_BASE + gicr_base;
 
     ulong rd = 0;
@@ -166,8 +166,8 @@ bool Its::enable_lpis_on_redist(ulong gicr_base, ulong gicr_size)
     if (rd == 0)
         return false;
 
-    /* LPI pending table: 1 bit per LPI id, covering 8192+MaxLpis; PENDBASER
-       requires 64KiB alignment (the AllocAligned default). */
+    /* LPI pending table: 1 bit per LPI id, covering 8192+MAX_LPIS; PENDBASER
+       requires 64KiB alignment (the alloc_aligned default). */
     ulong pend_bytes = 0x10000;
     ulong pend_phys;
     if (alloc_zero_pages(pend_bytes, &pend_phys) == 0)
@@ -193,7 +193,7 @@ bool Its::enable_lpis_on_redist(ulong gicr_base, ulong gicr_size)
     /* RDbase for MAPC/SYNC: PTA=1 -> RD_base phys >> 16; PTA=0 -> processor
        number (0 for the boot CPU on QEMU virt). The phys is derived
        arithmetically: rd lives in the premapped device GiB, which
-       VirtToPhys cannot walk (same reason ItsPhys is stored explicitly). */
+       virt_to_phys cannot walk (same reason its_phys_ is stored explicitly). */
     if (pta_)
     {
         ulong rd_phys = gicr_base + (rd - gicr_va);
@@ -226,7 +226,7 @@ bool Its::provision_tables()
         u64 page_size_sel = 2ULL << 8;
         ulong page_bytes = 0x10000;
 
-        /* Entries: the device table is indexed by the PCI RID (deviceId);
+        /* Entries: the device table is indexed by the PCI RID (device_id);
            for QEMU virt bus 0 that fits in ~256 entries. Cap it well under
            the page allocator's 128-contiguous-page limit (a 64KiB-page
            table of a few pages). */
@@ -360,7 +360,7 @@ bool Its::map_device(u32 device_id, u32 num_events)
     if (free == MAX_DEVICES)
         return false;
 
-    /* ITT: numEvents entries, IttEntrySize bytes each, 256-byte aligned */
+    /* ITT: num_events entries, itt_entry_size_ bytes each, 256-byte aligned */
     u32 event_bits = 1;
     while ((1u << event_bits) < num_events)
         event_bits++;
@@ -425,8 +425,8 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
         return 0;
     }
 
-    /* The device DMA-writes the eventId to the ITS translate register; hand
-       back its PHYSICAL address. (VirtToPhys can't resolve ItsBase: it lives
+    /* The device DMA-writes the event_id to the ITS translate register; hand
+       back its PHYSICAL address. (virt_to_phys can't resolve its_base_: it lives
        in the 1GiB device block, not 4K PTEs, so use the stored phys base.) */
     msi_addr = its_phys_ + GITS_TRANSLATER;
 
@@ -434,7 +434,7 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
 
     trace(0, "Its: event dev 0x%lX ev %lu -> lpi %lu addr 0x%lX",
         (ulong)device_id, (ulong)event_id, (ulong)lpi, msi_addr);
-    return event_id; /* MSI data = eventId */
+    return event_id; /* MSI data = event_id */
 }
 
 void Its::handle_lpi(u32 int_id)

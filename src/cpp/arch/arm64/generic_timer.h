@@ -9,10 +9,10 @@ namespace kernel
 /* ARM generic (virtual) timer scheduler tick. Each CPU runs its own timer:
    the PPI (INTID from the DTB, 27 on QEMU virt) is banked per-CPU, so every
    CPU arms its own CNTV and services the tick locally (no BSP broadcast).
-   The tick is dispatched specially by ArmIrqEntry -> LocalTick, which EOIs
-   before Schedule() may switch away (mirroring the IPI path). One-shot, by
+   The tick is dispatched specially by arm_irq_entry -> local_tick, which EOIs
+   before schedule() may switch away (mirroring the IPI path). One-shot, by
    its compare value: armed for each tick and for each deadline a task on
-   the CPU sleeps to (Cpu::LocalTimer*, Hal::LocalTimerArm). */
+   the CPU sleeps to (Cpu::LocalTimer*, hal::local_timer_arm). */
 class GenericTimer final : public InterruptHandler
 {
 public:
@@ -29,15 +29,15 @@ public:
        and start its CNTV. */
     void arm_self();
 
-    /* Fire this CPU's CNTV once, deltaNs from now: its compare value
+    /* Fire this CPU's CNTV once, delta_ns from now: its compare value
        written, which also takes the level line down for one in the past
-       (Hal::LocalTimerArm). */
+       (hal::local_timer_arm). */
     static void arm_in(ulong delta_ns);
 
     u32 int_id() const { return timer_int_id_; }
 
     /* Local per-CPU tick: re-arm, run the scheduler (and global timers on
-       the BSP), EOI the PPI before Schedule() may switch away. */
+       the BSP), EOI the PPI before schedule() may switch away. */
     void local_tick(Context* ctx);
 
     void on_interrupt_register(u8 irq, u8 vector) override;

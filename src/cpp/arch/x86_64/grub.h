@@ -150,7 +150,7 @@ struct MultiBootTagFramebuffer
     u8 bpp;
     u8 fb_type;
     u16 reserved;
-    /* Present only when FbType == Rgb (the indexed variant carries a
+    /* Present only when fb_type == Rgb (the indexed variant carries a
        palette here instead), so a tag may legitimately be shorter. */
     u8 red_field_position;
     u8 red_mask_size;
@@ -213,14 +213,14 @@ struct FramebufferInfo
 /* The physical range of the module GRUB loaded with the command line
    `ucode` -- this CPU's microcode, `module2 /boot/ucode ucode` -- for the
    BSP to choose an update from while the bootstrap map still reaches it
-   (Microcode::LoadOnBsp). False when there is none. */
+   (microcode::load_on_bsp). False when there is none. */
 bool get_ucode_module(ulong& phys, ulong& len);
 
 /* True if GRUB provided a framebuffer tag. */
 bool has_framebuffer_info();
 
 /* True if the framebuffer is legacy EGA text mode at 0xB8000.
-   Only meaningful when HasFramebufferInfo() is true. */
+   Only meaningful when has_framebuffer_info() is true. */
 bool is_framebuffer_ega_text();
 
 /* The saved framebuffer tag, or nullptr if GRUB provided none. */

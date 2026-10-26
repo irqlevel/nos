@@ -60,7 +60,7 @@ public:
     {
         if (!reserve(capacity))
             return false;
-        /* Reserve() keeps a larger existing Capacity; using it here would
+        /* reserve() keeps a larger existing Capacity; using it here would
            expose stale elements at [capacity..Capacity). */
         size_ = capacity;
         return true;

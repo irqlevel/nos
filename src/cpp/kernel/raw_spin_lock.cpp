@@ -22,7 +22,7 @@ RawSpinLock::~RawSpinLock()
         Watchdog::get_instance().unregister_spin_lock(*this);
 }
 
-/* Raw cycle counter, not GetBootTime(): this runs on every lock in the
+/* Raw cycle counter, not get_boot_time(): this runs on every lock in the
    kernel. 0 is the "not held" marker the watchdog reads, so a counter that
    happens to read exactly 0 is nudged rather than losing the timestamp. */
 void RawSpinLock::stamp()
@@ -77,7 +77,7 @@ void RawSpinLock::lock()
 
 void RawSpinLock::unlock()
 {
-    /* Read and cleared while the lock is still ours: once Release() runs,
+    /* Read and cleared while the lock is still ours: once release() runs,
        the next holder writes its own. */
     Task* task = preempt_task_;
     preempt_task_ = nullptr;
@@ -98,7 +98,7 @@ bool RawSpinLock::try_lock()
     return true;
 }
 
-/* The IRQ-saving forms leave PreemptTask alone: PreemptIrqSave disables
+/* The IRQ-saving forms leave preempt_task_ alone: preempt_irq_save disables
    preemption along with interrupts, and the flags carry it to the restore. */
 ulong RawSpinLock::lock_irq_save()
 {

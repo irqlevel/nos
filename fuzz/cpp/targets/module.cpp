@@ -21,7 +21,7 @@
 #include "host.h"
 
 /* The loader's own file, so that its internals -- Stage, LoadedModule,
-   FindFunction -- are this target's to call; and the table's list, which
+   find_function -- are this target's to call; and the table's list, which
    Load puts a module on, reachable to do the same. */
 #define private public
 #include <kernel/module.cpp>
@@ -72,7 +72,7 @@ struct Mapping
     ulong count;
     uint8_t* block;
     std::vector<ulong> phys;
-    /* Per page: what SetRangeProtection last gave it */
+    /* Per page: what set_range_protection last gave it */
     std::vector<uint8_t> perm;
 };
 
@@ -247,7 +247,7 @@ extern "C" const ModuleExport nos_module_exports[] = {
 };
 extern "C" const ulong nos_module_export_count = sizeof(nos_module_exports) / sizeof(nos_module_exports[0]);
 
-/* The file system's side of LoadFile, which this target does not use. */
+/* The file system's side of load_file, which this target does not use. */
 extern "C" long kernel_file_size(const char*, ulong)
 {
     fuzz::host_hal_unreachable("kernel_file_size");
@@ -417,7 +417,7 @@ Ko build(fuzz::Input& in)
     ko.relas.push_back({ko.info_vaddr + 112, rel_type('R'), 0, static_cast<long>(exit)});
 
     /* A slot in the data for a pointer, clear of the header, whose fields
-       CheckInfo reads */
+       check_info reads */
     auto slot = [&]() {
         for (;;)
         {
@@ -459,7 +459,7 @@ Ko build(fuzz::Input& in)
     if (in.chance(32))
         ko.relas.push_back({0, 0, 0, 0});
     /* The header's own slots last, whatever else points there: they are
-       what CheckInfo reads */
+       what check_info reads */
     std::rotate(ko.relas.begin(), ko.relas.begin() + 2, ko.relas.end());
     return ko;
 }
@@ -819,11 +819,11 @@ void lookups(fuzz::Input& in, LoadedModule& m)
         const ModuleSymbol* f = find_function(m, addr - m.image.base);
         if (f != nullptr)
             INVARIANT(f->offset <= addr - m.image.base && addr - m.image.base < m.text_end,
-                "FindFunction(+0x%lx) names a function at +0x%lx", addr - m.image.base, f->offset);
+                "find_function(+0x%lx) names a function at +0x%lx", addr - m.image.base, f->offset);
     }
     char all[256];
     table.describe_all(all, 1 + in.below(sizeof(all)));
-    INVARIANT(table.is_loaded(m.name), "IsLoaded does not know %s", m.name);
+    INVARIANT(table.is_loaded(m.name), "is_loaded does not know %s", m.name);
 }
 
 void run(fuzz::Input& in)
@@ -865,7 +865,7 @@ void run(fuzz::Input& in)
         }
     }
 
-    /* The file 8-byte aligned, as LoadFile's page run is, and alone */
+    /* The file 8-byte aligned, as load_file's page run is, and alone */
     std::vector<u64> aligned((file.size() + 7) / 8 + 1);
     memcpy(aligned.data(), file.data(), file.size());
 

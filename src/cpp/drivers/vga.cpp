@@ -25,7 +25,7 @@ VgaTerm::VgaTerm()
 
     /* On UEFI there is no EGA text mode: GRUB reports a pixel
        framebuffer instead. Writing to 0xB8000 would scribble over
-       plain RAM, so leave the terminal disabled (ReadyFlag stays
+       plain RAM, so leave the terminal disabled (ready_flag_ stays
        false, Buf stays null and all output methods are no-ops). */
     if (grub::has_framebuffer_info() && !grub::is_framebuffer_ega_text())
     {

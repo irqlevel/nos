@@ -78,7 +78,7 @@ private:
     Tracer& operator=(Tracer&& other) = delete;
 
     /* Written from the shell on one CPU while every other CPU reads it in
-       Trace(); a stale read costs at most one line. */
+       trace(); a stale read costs at most one line. */
     volatile int level_;
     bool console_suppressed_;
 };

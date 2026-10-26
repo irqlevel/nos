@@ -17,7 +17,7 @@ public:
 
     /* Probe PCI config for MSI-X capability (cap ID 0x11). Map MSI-X table.
        Returns false if the device has no MSI-X. Does not enable MSI-X in HW.
-       If mappedBars is non-null, reuses already-mapped BAR VAs (0 = unmapped). */
+       If mapped_bars is non-null, reuses already-mapped BAR VAs (0 = unmapped). */
     bool setup(Pci::DeviceInfo* dev, const ulong* mapped_bars = nullptr);
 
     /* Program table entry `index`, install IDT handler, return CPU vector 0 on failure. */
@@ -54,12 +54,12 @@ private:
     /* Per-table-entry assigned CPU vector; 0 = none. */
     u8* entry_vector_;
 
-    /* Serializes table entry updates (EnableVector/Mask/Unmask/Retarget)
+    /* Serializes table entry updates (enable_vector/Mask/Unmask/Retarget)
        so a concurrent Mask cannot be clobbered by Retarget restoring a
        stale control value. Not taken from IRQ context. */
     SpinLock entry_lock_;
 
-    /* Count of vectors handed out (vector = MsixVectorBase + offset);
+    /* Count of vectors handed out (vector = MSIX_VECTOR_BASE + offset);
        atomic so concurrent device init can't double-allocate */
     static Atomic next_vector_offset_;
 };

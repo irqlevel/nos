@@ -61,7 +61,7 @@ void* FixedPageAllocator::alloc()
     {
         for (size_t i = 0; i < page_count_; i++)
             pt.free_page(pages[i]);
-        /* Remote CPUs may have cached translations from the prefix MapPages
+        /* Remote CPUs may have cached translations from the prefix map_pages
            rolled back (it only invalidates locally); flush everywhere before
            the VA block and the pages become reusable. */
         kernel::CpuTable::get_instance().invalidate_tlb_range(va, page_count_);
@@ -188,7 +188,7 @@ bool PageAllocatorImpl::setup()
         kept_blocks_[i].limit = kept_pages >> i;
     }
 
-    /* A CPU keeps no more of a size than KeptBlocks may: on a machine too
+    /* A CPU keeps no more of a size than kept_blocks_ may: on a machine too
        small to keep any, none */
     for (auto& cpu : cpu_kept_blocks_)
     {
@@ -214,7 +214,7 @@ void* PageAllocatorImpl::alloc(size_t num_pages, bool zero)
         return nullptr;
 
     /* Zeroed when asked, as a block of fresh pages always is: whoever had
-       it last wrote into it, and a caller of Mm::Alloc may count on what
+       it last wrote into it, and a caller of mm::alloc may count on what
        the page allocator has always handed out */
     void* kept = take_kept(log);
     if (kept != nullptr)
@@ -274,7 +274,7 @@ bool PageAllocatorImpl::keep(size_t log, void* ptr)
     BUG_ON(log >= stdlib::array_size(kept_blocks_));
     Kept* block = static_cast<Kept*>(ptr);
 
-    /* A kept block carries the mark, and TakeKept clears it on the way
+    /* A kept block carries the mark, and take_kept clears it on the way
        out: one that has it now is kept already -- a second free -- or its
        owner wrote those very words, so the mark only says where to look */
     if (block->mark == KEPT_MARK && is_kept(log, block))
@@ -311,7 +311,7 @@ bool PageAllocatorImpl::keep(size_t log, void* ptr)
     if (!cached)
         return keep_shared(log, block);
 
-    /* With this CPU's lock let go of: what KeptBlocks has no room for is
+    /* With this CPU's lock let go of: what kept_blocks_ has no room for is
        unmapped, and the shootdown waits on every other CPU */
     for (ulong i = 0; i < spilled; i++)
     {
@@ -336,7 +336,7 @@ bool PageAllocatorImpl::keep_shared(size_t log, Kept* block)
     return true;
 }
 
-/* Every CPU's cache and KeptBlocks, each under its own lock -- never two at
+/* Every CPU's cache and kept_blocks_, each under its own lock -- never two at
    once. Only for a block that carries the mark, which a block handed out
    does not, so a free reaches here for a double free or a block whose
    owner happened to write the mark's very words. */
@@ -503,12 +503,12 @@ void PageAllocatorImpl::unmap_pages(void* ptr, size_t num_pages)
     size_t log = stdlib::log2(num_pages);
     if (log >= stdlib::array_size(fixed_pg_alloc_))
     {
-        PANIC("Can't unmap addr 0x%p numPages %lu", ptr, num_pages);
+        PANIC("Can't unmap addr 0x%p num_pages %lu", ptr, num_pages);
         return;
     }
 
     if (!fixed_pg_alloc_[log].unmap(ptr, num_pages))
-        PANIC("Can't unmap addr 0x%p numPages %lu", ptr, num_pages);
+        PANIC("Can't unmap addr 0x%p num_pages %lu", ptr, num_pages);
 }
 
 void* PageAllocatorImpl::map_large_pages(size_t num_pages, ulong* phys_addrs)
@@ -526,7 +526,7 @@ void PageAllocatorImpl::unmap_large_pages(void* ptr, size_t num_pages)
     BUG_ON(num_pages == 0 || num_pages > PageTable::MAX_LARGE_MAP_PAGES);
 
     if (!large_pg_alloc_.unmap(ptr, num_pages))
-        PANIC("Can't unmap large run 0x%p numPages %lu", ptr, num_pages);
+        PANIC("Can't unmap large run 0x%p num_pages %lu", ptr, num_pages);
 }
 
 }

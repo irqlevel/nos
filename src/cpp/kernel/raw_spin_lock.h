@@ -13,7 +13,7 @@ class RawSpinLock final
 {
 public:
     /* watched = false only for the watchdog's own locks: registering those
-       would recurse through Watchdog::GetInstance() while it is being built.
+       would recurse through Watchdog::get_instance() while it is being built.
        Everything else is watched, which is the point -- the locks that
        actually wedge a machine are the hot raw ones in the driver and net
        paths, and they used to be invisible because only SpinLock was
@@ -21,11 +21,11 @@ public:
     explicit RawSpinLock(bool watched = true);
     ~RawSpinLock();
 
-    /* Lock() disables preemption until Unlock(), as Linux's spin_lock does.
+    /* lock() disables preemption until unlock(), as Linux's spin_lock does.
        The holder cannot be switched away with the lock taken -- a timer tick
        would otherwise leave every other taker spinning for a whole time
        slice -- and a caller that asks whether it may block
-       (PreemptCanBlock) is told no. Interrupts stay on: LockIrqSave is for a
+       (preempt_can_block) is told no. Interrupts stay on: lock_irq_save is for a
        lock an interrupt handler takes too. */
     void lock();
     void unlock();
@@ -56,11 +56,11 @@ private:
     Atomic value_;
     bool watched_;
 
-    /* Whose preemption Lock() disabled, for Unlock() to enable again -- not
-       necessarily the task calling Unlock(): the scheduler takes its locks
+    /* Whose preemption lock() disabled, for unlock() to enable again -- not
+       necessarily the task calling unlock(): the scheduler takes its locks
        in one task and releases them in the next, across the context switch.
-       nullptr when Lock() had nothing to disable, and whenever the lock is
-       free or held through LockIrqSave, whose flags carry that instead. */
+       nullptr when lock() had nothing to disable, and whenever the lock is
+       free or held through lock_irq_save, whose flags carry that instead. */
     Task* preempt_task_;
 
 public:

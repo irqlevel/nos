@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <arch/x86_64/lapic.h>
 
-// x86_64 body for Hal::LocalTimerArm (see hal/timer.h): the local APIC's
+// x86_64 body for hal::local_timer_arm (see hal/timer.h): the local APIC's
 // timer, one-shot.
 
 namespace hal

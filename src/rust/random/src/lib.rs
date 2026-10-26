@@ -348,7 +348,7 @@ fn reseed() {
 
 /* ---- the C ABI ---- */
 
-/// Boot, on the BSP, once Hal::ProbeHwRandom has found what instruction the
+/// Boot, on the BSP, once hal::probe_hw_random has found what instruction the
 /// CPU has, and before anything can ask the pool for bytes. Whether anything
 /// seeded it.
 #[no_mangle]

@@ -400,7 +400,7 @@ static void cmd_top(const char* args, stdlib::Printer& con)
     con.printf("task migrations since boot: %lu\n", (ulong)get_task_migration_count());
     /* The window's count first: it is what the load being looked at did. The
        one since boot starts at one per CPU, on its idle task, that the boot
-       self-test makes on purpose (TestPreemptDeferred). */
+       self-test makes on purpose (test_preempt_deferred). */
     con.printf("preemptions deferred: %lu in the window, %lu of them on an idle task; "
         "%lu since boot, %lu on an idle task\n",
         (ulong)(deferred1 - deferred0), (ulong)(deferred_idle1 - deferred_idle0),
@@ -550,7 +550,7 @@ static void sched_diff(SchedStats::Snapshot& d, const SchedStats::Snapshot& a,
    never yield, so only the tick takes it from them; a waiter pinned beside
    them, asleep on an Event; and this command's task, on another CPU,
    signalling it a sample at a time and waiting to hear that it ran. Each
-   wait is from the Signal() to the waiter running: the waker's IPI, and
+   wait is from the signal() to the waiter running: the waker's IPI, and
    whatever the scheduler makes it wait behind. */
 struct SchedProbe
 {
@@ -618,7 +618,7 @@ static void sched_probe_waiter(void* ctx)
     }
 }
 
-/* Runtime of task so far, under its lock as every UpdateRuntime() is made */
+/* Runtime of task so far, under its lock as every update_runtime() is made */
 static ulong sched_probe_runtime(Task* task)
 {
     stdlib::AutoLock lock(task->lock_);
@@ -1129,7 +1129,7 @@ static void cmd_memusage(const char* args, stdlib::Printer& con)
     (void)args;
     auto& pt = mm::PageTable::get_instance();
 
-    con.printf("freePages: %lu\n", pt.get_free_pages_count());
+    con.printf("free_pages: %lu\n", pt.get_free_pages_count());
     con.printf("totalPages: %lu\n", pt.get_total_pages_count());
     con.printf("hugePages: %lu free of %lu\n", pt.get_huge_pool_free(), pt.get_huge_pool_blocks());
 }
@@ -1594,10 +1594,10 @@ static const ulong SCRIPT_SIZE_MAX = 16 * consts::KB;
 static const ulong SCRIPT_LINE_MAX = 1023;
 static const ulong SCRIPT_TAG = 'Rc  ';
 
-/* A script, NUL-terminated, in a buffer from Mm::Alloc the caller frees --
+/* A script, NUL-terminated, in a buffer from mm::alloc the caller frees --
    or nullptr, said on out, when it cannot be read. Read through the
    whole-file calls, which look for it where a cut-short write may have left
-   it as well as where it belongs. Past ScriptSizeMax only its whole lines
+   it as well as where it belongs. Past SCRIPT_SIZE_MAX only its whole lines
    are taken, whole comes back false, and it is said: a command cut at the
    limit would run as some other command. */
 static char* read_script(const char* path, ulong& size, bool& whole, stdlib::Printer& out)
@@ -1772,7 +1772,7 @@ private:
     ulong dropped_;
 };
 
-/* What a boot script command printed, into the log: RunScript's step */
+/* What a boot script command printed, into the log: run_script's step */
 static void commit_log(void* ctx)
 {
     static_cast<LogPrinter*>(ctx)->commit();
@@ -1817,7 +1817,7 @@ static void rc_show(stdlib::Printer& con)
 /* Writes a new /etc/rc: the lines of the old one but the one numbered skip
    (0: none), then add if there is one -- through kernel_file_write, since
    what it is for is the next boot, and a full disk must not leave it empty.
-   One edit at a time (RcLock): two at once would each write over the other
+   One edit at a time (rc_lock_): two at once would each write over the other
    one's line. */
 static bool rc_rewrite(ulong skip, const char* add, stdlib::Printer& con)
 {
@@ -1982,7 +1982,7 @@ static void cmd_rc(const char* args, stdlib::Printer& con)
     }
 }
 
-// Forward declaration - CmdHelp needs the Commands array defined below
+// Forward declaration - cmd_help needs the Commands array defined below
 static void cmd_help(const char* args, stdlib::Printer& con);
 
 static const CmdEntry COMMANDS[] = {
@@ -2114,7 +2114,7 @@ bool Cmd::dispatch_dynamic(const char* cmd, stdlib::Printer& out)
         return false;
 
     /* Without the lock: the handler is the module's code and may take as
-       long as it likes. Running keeps UnregisterDynamic -- and with it the
+       long as it likes. Running keeps unregister_dynamic -- and with it the
        module's unload -- waiting until it returns. */
     handler(ctx, args, stdlib::str_len(args), &out);
 

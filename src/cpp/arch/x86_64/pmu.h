@@ -26,7 +26,7 @@ namespace kernel
    its sign bit going clear. Zen 4 and later add PerfMonV2, whose global
    control and status work like Intel's and are used when present.
 
-   Available() answers false everywhere else, and the profiler keeps its
+   available() answers false everywhere else, and the profiler keeps its
    tick. */
 class Pmu final
 {
@@ -55,7 +55,7 @@ public:
        sample rather than as a fault. */
     static bool ack_overflow();
 
-    /* Called from the NMI handler once AckOverflow() has said no. True when
+    /* Called from the NMI handler once ack_overflow() has said no. True when
        this NMI is an AMD part's habit of delivering a performance-counter
        interrupt just after the overflow that caused it was handled: not a
        sample, but not a fault to panic over either. */
@@ -65,7 +65,7 @@ public:
        `lscpu`. */
     static const char* name();
 
-    /* How many late NMIs AbsorbSpuriousNmi() has swallowed. Counted rather
+    /* How many late NMIs absorb_spurious_nmi() has swallowed. Counted rather
        than traced: the count is read from the shell, where printing it is
        safe, and an NMI handler is no place to take the dmesg lock. */
     static ulong spurious_nmi_count();

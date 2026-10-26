@@ -68,10 +68,10 @@ asks of the code that -O0 never did:
   `Atomic`, an asm with a `"memory"` clobber, or a volatile access; a call
   the compiler cannot see into is enough only while it stays that way
 - a publish to another CPU is release/acquire (`__atomic_store_n`/
-  `__atomic_load_n`) or `Hal::SmpWmb`/`SmpRmb`: plain stores may be
+  `__atomic_load_n`) or `hal::smp_wmb`/`smp_rmb`: plain stores may be
   reordered by the compiler now, not only by an arm64 CPU
 - a function called after its caller moved the stack pointer is
-  `noinline` (`Main2`, `ApMain2`, after `ALLOC_CPU_STACK`)
+  `noinline` (`main2`, `ap_main2`, after `ALLOC_CPU_STACK`)
 - an endless loop has a side effect in it (`Pause()`): an empty one is one
   the compiler may assume ends, and take out
 
@@ -168,7 +168,7 @@ What its first boots found, all in code that had passed every gate:
 
 - `CONTAINING_RECORD` and `OFFSET_OF` were `&((type*)0)->field`, a member
   access through a null pointer. They are `__builtin_offsetof` now.
-- On x86 `Hal::RunOnStack` entered the boot and idle bodies with RSP 8 off the
+- On x86 `hal::run_on_stack` entered the boot and idle bodies with RSP 8 off the
   ABI's 16-byte boundary, and chasing that found the same in every exception
   stub under an error code, `#GP` and `#PF` among them. Nothing had faulted
   because the kernel uses no SSE. The stubs pad now, and NASM refuses to
@@ -179,7 +179,7 @@ What its first boots found, all in code that had passed every gate:
   it, which every AP walks as it turns its MMU on: each AP took a translation
   fault with no vector to go to, and was only ever "still not running". The
   plain build had 248 bytes of its 16 KiB to spare. It has 32 KiB now, as on
-  x86, and a guard page between it and the tables, which `CpuTable::StartAll`
+  x86, and a guard page between it and the tables, which `CpuTable::start_all`
   checks before it starts an AP.
 
 ## Rust UB checks

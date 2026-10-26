@@ -1,7 +1,7 @@
 #![no_std]
 
 //! The module the kernel loads at boot, out of its own image, to test the
-//! loader (TestModules in kernel/test.cpp). Its init does what a module does
+//! loader (test_modules in kernel/test.cpp). Its init does what a module does
 //! and checks every result: a check that fails fails the init, the load and
 //! the boot test. What it leaves behind is a shell command, which the test
 //! runs through the kernel's dispatcher and reads the answer of. It takes

@@ -17,7 +17,7 @@ AllocatorImpl::AllocatorImpl(class PageAllocator* pg_alloc)
 	: pg_alloc_(pg_alloc)
 {
 	static_assert(CACHE_CPUS == MAX_CPUS, "a CPU without a cache, or a cache without a CPU");
-	static_assert(CACHE_BLOCKS_MAX <= mm::Pool::PUT_FREE_MAX, "a cache's spill past what PutFree takes");
+	static_assert(CACHE_BLOCKS_MAX <= mm::Pool::PUT_FREE_MAX, "a cache's spill past what put_free takes");
 
 	for (size_t i = 0; i < stdlib::array_size(pool_); i++)
 	{

@@ -102,20 +102,20 @@ void probe_hw_random()
         /* Reading RNDR on a core without FEAT_RNG is an undefined
            instruction, so this check is the whole reason the probe is a trace
            line and not a synchronous exception. */
-        trace(0, "HwRandom: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%lX)",
+        trace(0, "hw_random: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%lX)",
             isar0);
         return;
     }
 
     if (kernel::Parameters::get_instance().is_hw_rng_off())
     {
-        trace(0, "HwRandom: rndr present, disabled by hwrng=off");
+        trace(0, "hw_random: rndr present, disabled by hwrng=off");
         return;
     }
 
     have_rndr = true;
 
-    trace(0, "HwRandom: rndr yes");
+    trace(0, "hw_random: rndr yes");
 }
 
 HwRandomKind get_hw_random_kind()

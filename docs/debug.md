@@ -21,7 +21,7 @@ Stack traces resolve symbols from a table baked into the kernel by a
 three-pass link (`out/$(ARCH)/pass2.elf` → `nm` → `symtab_data.cpp` → final
 ELF, checked against the final ELF; [Build](build.md)), so `bt <pid>` and the
 panic handler name functions without an external symbol file. A frame is a
-return address, named by the call before it (`SymbolTable::DescribeReturn`):
+return address, named by the call before it (`SymbolTable::describe_return`):
 after a call to a function that does not return -- every panic's -- the
 address is the next function's first byte, and naming it as it stood put the
 frame under that next function at `+0x0`.
@@ -38,25 +38,25 @@ over the network instead:
 - `loglevel=N` at boot or `loglevel N` in the shell raises the trace level
   without a rebuild; see [Kernel parameters](kernel-parameters.md).
 
-A log line is formatted into a 256-byte buffer (`Tracer::Output`), and a
-panic's message into 512 (`Panicker::Message`, reached from Rust through
+A log line is formatted into a 256-byte buffer (`Tracer::output`), and a
+panic's message into 512 (`Panicker::message_`, reached from Rust through
 `kernel_panic`). What does not fit is **truncated and marked with `...`**,
-never dropped: until `Stdlib::VsnPrintf` learned to truncate, a `%s` that
-did not fit wrote none of its argument and returned -1, and `Tracer::Output`
+never dropped: until `stdlib::vsn_printf` learned to truncate, a `%s` that
+did not fit wrote none of its argument and returned -1, and `Tracer::output`
 threw away every line that reported it -- so the longest reports, a Rust
 panic's message among them, reached the console as their prefix and nothing
-else (`RUST PANIC: ` followed by the backtrace). `TestSnPrintf` covers it.
+else (`RUST PANIC: ` followed by the backtrace). `test_sn_printf` covers it.
 
 Every format is C's printf, checked by the compiler: the functions that
 take one carry `PRINTF_FORMAT` (`include/types.h`), the build has
-`-Wformat=2 -Werror`, and `VsnPrintf` reads each argument as the length
+`-Wformat=2 -Werror`, and `vsn_printf` reads each argument as the length
 modifier names it -- an int under `%u`, a `ulong` under `%lu`. Until then
 every integer conversion read a 64-bit slot and the convention was to cast
 each argument to `ulong`; an argument that was not -- the trace level
-itself, in every `Trace` -- was read with whatever the other half of its
+itself, in every `trace` -- was read with whatever the other half of its
 register or stack slot held. A format that is not a literal at its call is
 a build error, so none can slip past the check through a variable or a
-template. `cpp-fuzz.py`'s `format` target holds `VsnPrintf` to the host's
+template. `cpp-fuzz.py`'s `format` target holds `vsn_printf` to the host's
 own `vsnprintf`.
 
 The boot sequence itself, and what each marker means, is in

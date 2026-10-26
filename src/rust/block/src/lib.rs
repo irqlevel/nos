@@ -33,7 +33,7 @@ use kcore::dma::DmaBuffer;
 use kcore::trace;
 
 /// Disks looked at, and partitions registered, at most. The kernel's device
-/// table holds 48 in all (BlockDeviceTable::MaxDevices), which these fit
+/// table holds 48 in all (BlockDeviceTable::MAX_DEVICES), which these fit
 /// inside with room for the disks themselves.
 const MAX_DISKS: usize = 8;
 /// GPT routinely declares 128 slots. Eight is what a disk here actually

@@ -79,8 +79,8 @@ public:
     virtual void* map_pages(size_t num_pages, ulong* phys_addrs) override;
     virtual void unmap_pages(void* ptr, size_t num_pages) override;
 
-    /* MapPages for runs past the largest block: up to
-       PageTable::MaxLargeMapPages pages, from a window of blocks that big */
+    /* map_pages for runs past the largest block: up to
+       PageTable::MAX_LARGE_MAP_PAGES pages, from a window of blocks that big */
     void* map_large_pages(size_t num_pages, ulong* phys_addrs);
     void unmap_large_pages(void* ptr, size_t num_pages);
 
@@ -100,7 +100,7 @@ private:
        through its own first words, and marked, so that a second free of it
        is caught rather than handing it out twice. Each size has a bound, in
        pages, that RAM sets at Setup; Trim, and an allocation that finds no
-       page, empty them. AllocMapPages's runs are not kept: a DMA buffer goes
+       page, empty them. alloc_map_pages's runs are not kept: a DMA buffer goes
        back as it always has. */
     struct Kept
     {
@@ -124,18 +124,18 @@ private:
     static constexpr ulong KEPT_PAGES_MAX = 128;
     static constexpr ulong KEPT_RAM_SHARE = 1024;
 
-    /* In front of KeptBlocks, for the three smallest sizes -- a page, two,
+    /* In front of kept_blocks_, for the three smallest sizes -- a page, two,
        four -- a few kept blocks a CPU, under a lock only that CPU takes
        (and Trim), as AllocatorImpl's caches are in front of its pools: four
-       CPUs allocating pages took KeptBlocks' lock in turn, and a pair of
+       CPUs allocating pages took kept_blocks_' lock in turn, and a pair of
        4 KiB blocks cost ten times on four what it did on one (heapbench).
        A free a full cache cannot take spills the older half of it to
-       KeptBlocks; an allocation an empty one cannot serve takes from
-       there. A block in a CPU's cache is kept as one in KeptBlocks is:
+       kept_blocks_; an allocation an empty one cannot serve takes from
+       there. A block in a CPU's cache is kept as one in kept_blocks_ is:
        mapped, marked, nobody's. */
     static constexpr size_t CPU_KEPT_LOGS = 3;
     /* Pages a CPU keeps of each of those sizes: four blocks of a page, two
-       of two, one of four -- and none past KeptBlocks' own bound */
+       of two, one of four -- and none past kept_blocks_' own bound */
     static constexpr ulong CPU_KEPT_PAGES = 4;
 
     struct CpuKeptSize
@@ -156,22 +156,22 @@ private:
        otherwise */
     CpuKept* this_cpu_kept(size_t log);
 
-    /* A freed block onto this CPU's cache, or KeptBlocks; false if neither
+    /* A freed block onto this CPU's cache, or kept_blocks_; false if neither
        took it */
     bool keep(size_t log, void* ptr);
-    /* A block onto KeptBlocks; false if it is full */
+    /* A block onto kept_blocks_; false if it is full */
     bool keep_shared(size_t log, Kept* block);
-    /* Whether a block is kept, in any CPU's cache or KeptBlocks: the
+    /* Whether a block is kept, in any CPU's cache or kept_blocks_: the
        double-free check, for a block that carries the mark */
     bool is_kept(size_t log, Kept* block);
-    /* A kept block, its mark cleared, from this CPU's cache or KeptBlocks;
+    /* A kept block, its mark cleared, from this CPU's cache or kept_blocks_;
        nullptr if there is none */
     void* take_kept(size_t log);
-    /* Which of FixedPgAlloc holds addr; false if none does */
+    /* Which of fixed_pg_alloc_ holds addr; false if none does */
     bool class_of(void* addr, size_t& log);
     /* Unmap and free a block: what Free did before blocks were kept */
     void release(void* addr);
-    /* One try at AllocMapPages, of 1 << log pages */
+    /* One try at alloc_map_pages, of 1 << log pages */
     void* try_alloc_map_pages(size_t log, ulong* phys_addr);
 
     PageAllocatorImpl(const PageAllocatorImpl& other) = delete;

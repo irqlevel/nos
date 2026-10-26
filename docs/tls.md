@@ -19,8 +19,8 @@ What the kernel supplies, and already had:
 |---|---|
 | a byte transport | the TCP of `src/rust/net` (`tcp.rs`) |
 | randomness | the kernel's pool (`src/rust/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
-| a wall clock, for certificate validity | `GetWallTimeSecs()` |
-| a heap | the Rust global allocator over `Mm::Alloc` |
+| a wall clock, for certificate validity | `get_wall_time_secs()` |
+| a heap | the Rust global allocator over `mm::alloc` |
 
 ## The pieces
 
@@ -136,7 +136,7 @@ pool -- `entropy` in the shell says which sources exist.
 - **Task stacks**: 64 KB, up from 32 KB. Verifying a chain walks candidate
   issuers recursively and goes deeper than anything else a task does — the
   shell task peaks at ~29 KB during a handshake, against ~4 KB before. A task
-  stack that overflows takes the machine down with a `GetCurrentTask` BUG, so
+  stack that overflows takes the machine down with a `get_current_task` BUG, so
   the headroom is not optional. `stacks` prints the high-water marks.
 - **Throughput**: software ChaCha20-Poly1305, several MB/s under QEMU —
   bounded by the 8 KB TCP receive window long before the cipher.

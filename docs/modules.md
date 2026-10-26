@@ -131,7 +131,7 @@ module: sshd: init failed
 insmod: /sshd.ko failed, error 502
 ```
 
-They are at most 255 bytes (`ModuleTable::ParamsMax`). Since its init takes
+They are at most 255 bytes (`ModuleTable::PARAMS_MAX`). Since its init takes
 them, the module's header is at layout version 2, and a module built before
 is refused with `header version 1, this kernel reads 2`: rebuild it.
 
@@ -213,13 +213,13 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
 3. **maps the image**: pages of its own, which need not be physically
    contiguous, mapped writable into one run of kernel virtual addresses --
    from a window of 16 MiB blocks set aside for runs the page allocator's own
-   blocks, 512 KiB at most, cannot hold (`Mm::MapLargePages`). The segments
+   blocks, 512 KiB at most, cannot hold (`mm::map_large_pages`). The segments
    are copied in; the zeroed tail of the last is `.bss`. The function names
    from `.nos_syms` go into the same pages, past the segments, indexed by
    offset.
 4. **relocates it**: every `RELA` section the loader is meant to see (`.rela.dyn`,
    `.rela.plt`). Three kinds of relocation reach it, and the architecture
-   says which is which (`Hal::ClassifyModuleReloc`):
+   says which is which (`hal::classify_module_reloc`):
 
    | Meaning | x86-64 | arm64 |
    |---|---|---|
@@ -237,7 +237,7 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
 6. **protects it**: each segment gets the permissions its program header
    asks for -- read-only, read-execute or read-write -- every CPU's TLB is
    shot down, and on arm64 the new code is cleaned from the data cache and
-   invalidated in every CPU's instruction cache (`Hal::SyncInstructionCache`),
+   invalidated in every CPU's instruction cache (`hal::sync_instruction_cache`),
    which x86 does not need.
 7. **runs its init**, lending it the parameters and `insmod`'s output
    ([Parameters](#parameters)). A second module by the same name is refused
@@ -260,7 +260,7 @@ while its init runs, so a second `insmod` of it is refused, as is an `rmmod`
 of one still loading or already unloading.
 
 `insmod` and `rmmod` each hand the work to a task of their own and wait for it
-at most five seconds (`ModuleTable::ShellWaitMs`). What the loader says is
+at most five seconds (`ModuleTable::SHELL_WAIT_MS`). What the loader says is
 printed when it is done by then. When it is not -- an unload waiting on a
 command, say -- the shell says so and gets its prompt back; `lsmod` shows the
 module as unloading meanwhile, and the kernel log says how it ended:
@@ -635,12 +635,12 @@ after it -- in the panic report, in `bt` and in the profiler's call chains:
 ```
 Backtrace:
   [0] 0xFFFF800012DA1C40 mod_hello::init::{closure#0}+0x3c [hello]
-  [1] 0xFFFF80000104A2F1 Kernel::Cmd::DispatchDynamic+0xd1
+  [1] 0xFFFF80000104A2F1 kernel::Cmd::dispatch_dynamic+0xd1
 ...
 Modules: hello 0xFFFF800012DA0000+0x5000
 ```
 
-`SymbolTable::Describe` asks the kernel's table first -- which now answers
+`SymbolTable::describe` asks the kernel's table first -- which now answers
 only for an address in the kernel's text, rather than naming whatever lies
 past its last function after that function -- and then the module table,
 whose names come from each module's `.nos_syms`. The name is copied out under
@@ -653,7 +653,7 @@ could not name.
 
 The boot self-test loads a module on both architectures. `modtest`
 (`src/rust/modules/modtest`) is built with the kernel and embedded in its
-image (`out/<arch>/modtest_blob.S`); `TestModules` in `kernel/test.cpp` loads
+image (`out/<arch>/modtest_blob.S`); `test_modules` in `kernel/test.cpp` loads
 it, and its init checks what a loader can get wrong -- initialised data,
 `.bss` (a megabyte of it, past the 512 KiB images were once held to), a
 table of function pointers, a trait object's vtable, allocations from the
@@ -676,7 +676,7 @@ shell's wait by hand or from a script.
 ## Limits
 
 - A module's image, function names included, is at most 16 MiB
-  (`PageTable::MaxLargeMapPages` pages), and so is the `.ko` file. The window
+  (`PageTable::MAX_LARGE_MAP_PAGES` pages), and so is the `.ko` file. The window
   they are mapped from holds 63 such runs at a time.
 - A module that registers a block device, a net device or a softirq handler
   cannot be unloaded (above).

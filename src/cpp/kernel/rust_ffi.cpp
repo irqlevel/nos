@@ -42,7 +42,7 @@ static const unsigned long PRINTER_CHUNK_SIZE = 128;
 /* Longer than any net device's name: VirtioNet's are at most 7 */
 
 /* kernel_cmd_dispatch: the longest command line it runs -- as long as a line
-   of /etc/rc (cmd.cpp's ScriptLineMax): a guest's `hv start` over SSH with a
+   of /etc/rc (cmd.cpp's SCRIPT_LINE_MAX): a guest's `hv start` over SSH with a
    distribution's kernel command line runs past two hundred characters before
    it says anything of its own, and was refused here at 255 on the AX41. The
    line is copied through a buffer this long on the stack of the task that
@@ -59,8 +59,8 @@ static const unsigned long SINK_BUFFER_SIZE = 64 * 1024;
    (ps, stacks, arp) or a mutex (ls holds the Vfs's), and passing text on
    means the network: allocating, and waiting for room as long as the client
    takes. So the text goes into Buf, and on to Fn only where the caller may
-   block (PreemptCanBlock): when Buf is full; at a line end once its oldest
-   byte has waited FlushDelayNs, so a command printing a line a second is
+   block (preempt_can_block): when Buf is full; at a line end once its oldest
+   byte has waited FLUSH_DELAY_NS, so a command printing a line a second is
    seen as it prints while one printing everything at once goes out after it
    returns, its locks let go; and whatever is left when it has. What does
    not fit while nothing may be sent is dropped, and said so at the end. */
@@ -209,7 +209,7 @@ extern "C" {
 
 void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
 {
-    /* The level, as Trace() has it. A trace!(3, ...) used to be printed at
+    /* The level, as trace() has it. A trace!(3, ...) used to be printed at
        every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
        forty thousand times in a few seconds of netblk load, each one
        formatted and logged from the handler. */
@@ -230,7 +230,7 @@ void* kernel_alloc(unsigned long size, unsigned long align)
     if (align == 0 || (align & (align - 1)) != 0)
         PANIC("kernel_alloc: bad align %lu", align);
 
-    /* Mm::Alloc guarantees 8-byte alignment. AllocUninit: GlobalAlloc::alloc
+    /* mm::alloc guarantees 8-byte alignment. alloc_uninit: GlobalAlloc::alloc
        promises nothing about the contents, and alloc_zeroed zeroes them on
        the Rust side. */
     if (align <= 8)
@@ -263,7 +263,7 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
 {
     /* Big enough for a panic from a UB check, whose message alone runs past
        200 characters; what does not fit is truncated here and marked by
-       VsnPrintf below. */
+       vsn_printf below. */
     char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     stdlib::mem_cpy(buf, msg, n);
@@ -551,7 +551,7 @@ void kernel_cpu_run_on(unsigned int cpu,
         return;
 
     /* A CPU that never started or already exited will not drain its IPI task
-       list; queueing would block Completion.Wait() forever (SendIPISelf
+       list; queueing would block Completion.wait() forever (send_ipi_self
        silently refuses to send in those states). */
     auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
     ulong state = target.get_state();
@@ -572,7 +572,7 @@ void kernel_cpu_run_on(unsigned int cpu,
    is running a guest there leave it -- a physical interrupt ends the guest's
    turn -- and costs any other CPU an interrupt with nothing to do. Sent the
    way SoftIrq's kick is, straight to the interrupt controller: the caller may
-   have interrupts off, and CpuTable::SendIPI takes locks its handler takes
+   have interrupts off, and CpuTable::send_ipi takes locks its handler takes
    too. A CPU that is not running holds it pending, or never sees it. */
 void kernel_cpu_kick(unsigned int cpu)
 {
@@ -583,7 +583,7 @@ void kernel_cpu_kick(unsigned int cpu)
 }
 
 /* The notification of an interrupt posted for the vCPU running on `cpu`
-   (Hal::PostedVector): the CPU takes it in the guest without an exit, and
+   (hal::POSTED_VECTOR): the CPU takes it in the guest without an exit, and
    out of one it is an interrupt that only ends itself. Sent as the kick is,
    from any context. */
 void kernel_cpu_notify(unsigned int cpu)
@@ -602,8 +602,8 @@ unsigned char kernel_posted_interrupt_vector(void)
 }
 
 /* The CPU this runs on to take an interrupt from its own timer by
-   deadlineNs on the boot clock, if it is not armed to fire sooner
-   (Cpu::LocalTimerWake): for a vCPU about to enter its guest, whose timer's
+   deadline_ns on the boot clock, if it is not armed to fire sooner
+   (Cpu::local_timer_wake): for a vCPU about to enter its guest, whose timer's
    next edge would otherwise wait for its next exit -- the host's tick, for a
    guest that computes without one. Nothing for a deadline that has passed:
    armed for one, the timer would fire at once, and again at every entry
@@ -656,7 +656,7 @@ void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
 
 void kernel_unmap_phys(void* virt_addr, unsigned long num_pages)
 {
-    /* MapMmioRegion maps at physAddr + KernelSpaceBase via direct PTEs;
+    /* map_mmio_region maps at phys_addr + KERNEL_SPACE_BASE via direct PTEs;
      * these mappings are permanent and cannot be unmapped in the current
      * page-table implementation. */
     (void)virt_addr;
@@ -675,8 +675,8 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 unsigned long kernel_frame_alloc()
 {
     auto& pt = kernel::mm::PageTable::get_instance();
-    /* AllocPageKeeping zeroes what it hands out, through the temp map, as
-       AllocPage does; it leaves the kernel its reserve (GetKernelReservePages). */
+    /* alloc_page_keeping zeroes what it hands out, through the temp map, as
+       alloc_page does; it leaves the kernel its reserve (get_kernel_reserve_pages). */
     kernel::mm::Page* page = pt.alloc_page_keeping(pt.get_kernel_reserve_pages());
     return page ? page->get_phy_address() : 0;
 }
@@ -712,7 +712,7 @@ void kernel_frame_free(unsigned long phys)
 }
 
 /* Copy between a frame and the caller's memory through this CPU's frame
-   slot of the temp-map window (PageTable::MapFrameSlot): out of the frame
+   slot of the temp-map window (PageTable::map_frame_slot): out of the frame
    into `buf`, or `data` into it -- exactly one of the two is given.
    Preemption and interrupts are off from the map to the unmap: that is what
    makes the slot this copy's alone, and the unmap invalidates only this
@@ -727,7 +727,7 @@ void kernel_frame_free(unsigned long phys)
    function of its own on arm64 -- which the compiler sees nothing of: each
    byte is read or written once, where the copy says, and a guest racing its
    own buffer gets what it raced for. (It used to go a word at a time
-   through a volatile pointer, with a MemCpy call for each word on the
+   through a volatile pointer, with a mem_cpy call for each word on the
    caller's side: 512 calls a page, and two thirds of a busy guest's vCPU
    while it wrote to its disk.) */
 static int frame_copy(unsigned long phys, unsigned long offset,
@@ -774,14 +774,14 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
 }
 
 /* One 16-bit word of a frame, loaded or stored whole: a single access,
-   which FrameCopy's MemCpy is not -- on x86 a `rep movsb`, a byte after a
+   which frame_copy's mem_cpy is not -- on x86 a `rep movsb`, a byte after a
    byte. A word a guest's other CPUs write while the host reads it -- a
    virtqueue's index -- has to be read whole: the high byte of 0x0100 with
    the low byte of the 0x00FF it replaced is 0x01FF, a ring that looks
    overrun. The load is an acquire and the store a release: what a driver
    published before its index is there to be read after the index is, and
    what this side wrote before its own index is there before the index
-   says so. The same slot of the window as FrameCopy's, with preemption and
+   says so. The same slot of the window as frame_copy's, with preemption and
    interrupts off for the same reason. -1, and nothing done, for a word
    that is not an aligned one inside a page of RAM. */
 static bool frame_word_inside(unsigned long phys, unsigned long offset)
@@ -822,12 +822,12 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
 /* A few frames mapped into the kernel's space together, in the order given,
    read-write and never executable, for as long as the Rust side keeps them
    so (kcore::frame::Mapped): a guest's pages the host reads and writes at
-   every frame it handles -- a virtqueue's rings -- which FrameCopy maps and
-   unmaps again at every access, a TLB flush each time. Through MapPages, so
+   every frame it handles -- a virtqueue's rings -- which frame_copy maps and
+   unmaps again at every access, a TLB flush each time. Through map_pages, so
    the VA is the allocator's to track. The frames stay the caller's, and
    allocated until kernel_frames_unmap has run: the mapping holds them by
    their address and nothing else. 0 when there are none or more than
-   FramesMapMax, one is no frame, or no address is left. */
+   FRAMES_MAP_MAX, one is no frame, or no address is left. */
 static const unsigned long FRAMES_MAP_MAX = 4;
 
 unsigned long kernel_frames_map(const unsigned long* phys, unsigned long count)
@@ -1161,7 +1161,7 @@ void dispatch_rust_interrupt(kernel::Context* ctx, int slot)
         hal::irq_eoi();
         return;
     }
-    /* InFlight is raised inside the read-locked section so unregister (which
+    /* in_flight is raised inside the read-locked section so unregister (which
        nulls Handler under the write lock) can wait out a mid-call ISR before
        its caller frees ctx. */
     kernel::Task* preempt = rust_irq_lock.read_lock();
@@ -1202,9 +1202,9 @@ unsigned long kernel_interrupt_register_level(
             u8 vector = (u8)(RUST_IRQ_VECTOR_BASE + i);
             kernel::Interrupt::register_level(lh, irq_line, vector);
 
-            /* RegisterLevel is void and refuses silently (GSI owned by an
+            /* register_level is void and refuses silently (GSI owned by an
                edge handler, vector already claimed, shared list full). Its
-               OnInterruptRegister callback sets the slot's Vector; still 0
+               on_interrupt_register callback sets the slot's Vector; still 0
                means no IOAPIC pin was programmed -- roll the slot back
                instead of handing the driver a dead handle it would trust
                (NIC enabled, no interrupts ever delivered). */
@@ -1340,10 +1340,10 @@ void kernel_timer_stop(unsigned long handle)
         return;
     ulong i = handle - 1;
 
-    /* Clear the slot under the lock, then release it BEFORE StopTimer. StopTimer
-       spin-waits for an in-flight OnTick on another CPU to finish, and OnTick
-       needs RustTimerLock in read mode; holding the write lock across that wait
-       would deadlock (AB/BA). Clearing Handler first makes a racing OnTick a
+    /* Clear the slot under the lock, then release it BEFORE stop_timer. stop_timer
+       spin-waits for an in-flight on_tick on another CPU to finish, and on_tick
+       needs rust_timer_lock in read mode; holding the write lock across that wait
+       would deadlock (AB/BA). Clearing Handler first makes a racing on_tick a
        no-op once it acquires the read lock. */
     ulong flags = rust_timer_lock.write_lock_irq_save();
     rust_timer_slots[i].handler = nullptr;
@@ -1426,7 +1426,7 @@ public:
     }
 
     /* Object-based dispatch path (arm64 GIC/ITS LPIs). On x86 MSI-X goes
-       through the IDT stub -> RustMsixDispatch instead, so this override is
+       through the IDT stub -> dispatch_rust_msix instead, so this override is
        unused there. */
     void on_interrupt(kernel::Context* ctx) override
     {
@@ -1466,7 +1466,7 @@ void dispatch_rust_msix(kernel::Context* ctx, int slot)
         hal::irq_eoi();
         return;
     }
-    /* Same in-flight discipline as RustInterruptDispatch */
+    /* Same in-flight discipline as dispatch_rust_interrupt */
     kernel::Task* preempt = rust_msix_lock.read_lock();
     auto handler = rust_msix_slots[slot].handler;
     auto uctx = rust_msix_slots[slot].ctx;
@@ -1543,7 +1543,7 @@ void kernel_msix_unregister_handler(unsigned long handle)
 
 /* hal/random.h for the pool, which is Rust (src/rust/random): which
    instruction the CPU has, and one draw from it. Values in and values out,
-   and safe at any time: a draw reads only the flags ProbeHwRandom sets, so on
+   and safe at any time: a draw reads only the flags probe_hw_random sets, so on
    a CPU with no instruction, or before the probe, it fails rather than
    faulting. */
 struct HwRandomDraw
@@ -1630,7 +1630,7 @@ void kernel_cmd_unregister(unsigned long handle)
     kernel::Cmd::get_instance().unregister_dynamic(handle);
 }
 
-/* out is the Stdlib::Printer a command handler was given */
+/* out is the stdlib::Printer a command handler was given */
 void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len)
 {
     if (out == nullptr || buf == nullptr)
@@ -1706,7 +1706,7 @@ void kernel_cmd_dispatch_io(const unsigned char* line, unsigned long len,
     dispatch_to(line, len, sink, source, term, ctx);
 }
 
-/* What is typed at a command, for one that asks: see Printer::ReadInput */
+/* What is typed at a command, for one that asks: see Printer::read_input */
 long kernel_printer_read(void* out, unsigned char* buf, unsigned long len,
     unsigned long long timeout_ns)
 {
@@ -1717,7 +1717,7 @@ long kernel_printer_read(void* out, unsigned char* buf, unsigned long len,
 }
 
 /* The terminal a command is typed at, for one that draws on it: see
-   Printer::Terminal. info is untouched when there is none */
+   Printer::terminal. info is untouched when there is none */
 bool kernel_printer_terminal(void* out, stdlib::TerminalInfo* info)
 {
     if (out == nullptr || info == nullptr)
@@ -1767,7 +1767,7 @@ long kernel_interrupt_source(unsigned long index, char* name, unsigned long name
 }
 
 /* What netconsole= asked for: the collector's address into ip, its port into
-   port, and the nctail= cap in KiB into tailKb. 1 when it was asked for at
+   port, and the nctail= cap in KiB into tail_kb. 1 when it was asked for at
    all, 0 when it was not. */
 int kernel_netconsole_params(unsigned int* ip, unsigned short* port,
     unsigned long* tail_kb)

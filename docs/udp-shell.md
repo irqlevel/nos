@@ -36,7 +36,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
   `dmesg 40` is the useful form. Same reasoning as `nctail=N` for the
   netconsole backlog -- what you want is the end.
 - `loglevel N` raises the trace level on the running kernel, which is the only
-  way to see a subsystem whose level constant is above the default 1 (`UsbLL`
-  and `KbdLL` are 3, the allocators and MMIO are 4) without a rebuild and a
+  way to see a subsystem whose level constant is above the default 1 (`USB_LL`
+  and `KBD_LL` are 3, the allocators and MMIO are 4) without a rebuild and a
   reflash. It is loud: level 4 traces every allocation.
 - **Warning:** the UDP shell has no authentication — anyone who can reach the port has full kernel shell access. Use only for testing or behind a firewall.

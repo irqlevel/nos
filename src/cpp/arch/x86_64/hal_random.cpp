@@ -99,7 +99,7 @@ void probe_hw_random()
     CpuidResult features = cpuid(CPUID_LEAF_FEATURES);
     if (!(features.ecx & CPUID_BIT_RDRAND))
     {
-        trace(0, "HwRandom: this cpu has no RDRAND");
+        trace(0, "hw_random: this cpu has no RDRAND");
         return;
     }
 
@@ -119,7 +119,7 @@ void probe_hw_random()
     {
         /* Not a diagnostic for its own sake: it is how the timing-jitter path
            gets exercised on a machine that does have RDRAND. */
-        trace(0, "HwRandom: rdrand present (rdseed %s), disabled by hwrng=off",
+        trace(0, "hw_random: rdrand present (rdseed %s), disabled by hwrng=off",
             rdseed ? "yes" : "no");
         return;
     }
@@ -127,7 +127,7 @@ void probe_hw_random()
     have_rdrand = true;
     have_rdseed = rdseed;
 
-    trace(0, "HwRandom: rdrand yes, rdseed %s", have_rdseed ? "yes" : "no");
+    trace(0, "hw_random: rdrand yes, rdseed %s", have_rdseed ? "yes" : "no");
 }
 
 HwRandomKind get_hw_random_kind()

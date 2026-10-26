@@ -38,7 +38,7 @@ pub enum HwKind {
     Rndr,
 }
 
-/// As the boot's probe (Hal::ProbeHwRandom) found it: None before then.
+/// As the boot's probe (hal::probe_hw_random) found it: None before then.
 pub fn hw_kind() -> HwKind {
     match random::kernel_hw_random_kind() {
         1 => HwKind::RdRand,

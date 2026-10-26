@@ -9,7 +9,7 @@
 namespace kernel
 {
 
-static_assert(Gdt::TSS_MAX_CPUS == MAX_CPUS, "TssMaxCpus must equal MaxCpus");
+static_assert(Gdt::TSS_MAX_CPUS == MAX_CPUS, "TSS_MAX_CPUS must equal MAX_CPUS");
 
 Gdt::Gdt()
 {

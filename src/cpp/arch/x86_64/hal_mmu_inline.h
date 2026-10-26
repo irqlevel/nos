@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-// x86_64 bodies for the Hal:: MMU wrappers (see hal/mmu.h).
+// x86_64 bodies for the hal:: MMU wrappers (see hal/mmu.h).
 
 #ifdef __cplusplus
 extern "C"

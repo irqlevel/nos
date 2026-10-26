@@ -5,7 +5,7 @@
 /* Link stubs for the x86-only paths still referenced from common code on
    arm64: ACPI and the HPET, which this architecture has neither of and does
    not build, and the x86 asm interrupt entry stubs a C++ driver's
-   GetHandlerFn returns (unused: arm64 dispatch is object-based). Every
+   get_handler_fn returns (unused: arm64 dispatch is object-based). Every
    function here is unreachable on arm64.
 
    The virtio bus stubs that used to be here are gone with the C++ virtio
@@ -75,7 +75,7 @@ stdlib::Time Hpet::get_time()
 
 }
 
-/* x86 asm interrupt entry points (hal/irq_stubs.h); GetHandlerFn return
+/* x86 asm interrupt entry points (hal/irq_stubs.h); get_handler_fn return
    values are ignored by the arm64 dispatch */
 extern "C"
 {

@@ -34,7 +34,7 @@ void SpinLock::unlock()
 }
 
 /* Through the raw lock's IRQ-saving form: preemption goes off with
-   interrupts and the flags carry it, instead of Lock() counting it a second
+   interrupts and the flags carry it, instead of lock() counting it a second
    time. */
 void SpinLock::lock(ulong& flags)
 {

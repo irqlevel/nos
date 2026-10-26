@@ -21,7 +21,7 @@ static const ulong NETCONSOLE_TAIL_KB_MAX = 1024;
 /* hugepages=: a share in percent is at most the whole machine; a size is
    in MiB or GiB, and at most what the most RAM this kernel addresses is --
    past that it is a typo, not a machine. Either is cut down at boot to what
-   the machine can spare (PageTable::ReserveHugePool). */
+   the machine can spare (PageTable::reserve_huge_pool). */
 static const ulong HUGE_POOL_PERCENT_MAX = 100;
 static const ulong HUGE_POOL_MAX_GIB = 512;
 static const ulong PERCENT_WHOLE = 100;
@@ -191,15 +191,15 @@ ulong Parameters::get_huge_pool_bytes(ulong total_bytes)
 {
     if (huge_pool_percent_ != 0)
     {
-        /* Both bounded -- the percent by HugePoolPercentMax, the machine by
+        /* Both bounded -- the percent by HUGE_POOL_PERCENT_MAX, the machine by
            what one PDPT maps -- so the product cannot wrap. */
         return total_bytes / PERCENT_WHOLE * huge_pool_percent_;
     }
     return huge_pool_bytes_;
 }
 
-/* "50%", "32G", "512M": a share of RAM or a size, into HugePoolPercent or
-   HugePoolBytes. False, and neither set, for anything else. */
+/* "50%", "32G", "512M": a share of RAM or a size, into huge_pool_percent_ or
+   huge_pool_bytes_. False, and neither set, for anything else. */
 bool Parameters::parse_huge_pool(const char* value)
 {
     const size_t len = stdlib::str_len(value);
@@ -712,7 +712,7 @@ void Parameters::parse(const char *cmdline)
         return;
     }
 
-    /* StrnCpy, not SnPrintf: past the end of the buffer SnPrintf keeps
+    /* strn_cpy, not sn_printf: past the end of the buffer sn_printf keeps
        nothing, and what is wanted there is as much as fits */
     stdlib::strn_cpy(cmdline_, cmdline, sizeof(cmdline_));
     ulong kept = stdlib::str_len(cmdline_);

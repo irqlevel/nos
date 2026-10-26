@@ -3,8 +3,8 @@
 #include <include/types.h>
 #include <arch/arm64/gicv3.h>
 
-// arm64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
-// "hwId" is the kernel's linear CPU index (cached in TPIDR_EL1); SendSgi
+// arm64 bodies for the hal:: irqchip wrappers (see hal/irqchip.h).
+// "hw_id" is the kernel's linear CPU index (cached in TPIDR_EL1); send_sgi
 // resolves it to the MPIDR affinity via the Board CPU list.
 
 namespace hal

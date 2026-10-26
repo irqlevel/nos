@@ -1,6 +1,6 @@
 /*
  * arm64 asm_memset, asm_memcpy and asm_memmove: the routines lib/stdlib.cpp
- * builds MemSet, MemCpy, MemMove -- and memset, memcpy, memmove -- on, so
+ * builds mem_set, mem_cpy, mem_move -- and memset, memcpy, memmove -- on, so
  * every copy the kernel's Rust makes as well, which links those C names
  * (src/rust/.cargo/config.toml builds core without compiler-builtins' own).
  * The x86 twins are rep stos/movs in arch/x86_64/stdlib_asm.asm.

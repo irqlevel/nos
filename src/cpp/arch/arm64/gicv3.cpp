@@ -76,7 +76,7 @@ bool Gic::setup(ulong gicd_phys, ulong gicr_phys, ulong gicr_size)
     {
     }
 
-    trace(0, "Gic: gicd 0x%lX gicr 0x%lX maxIntId %lu", gicd_base_, gicr_base_,
+    trace(0, "Gic: gicd 0x%lX gicr 0x%lX max_int_id %lu", gicd_base_, gicr_base_,
         (ulong)max_int_id);
 
     if (!cpu_init())
@@ -120,7 +120,7 @@ bool Gic::cpu_init()
     {
     }
 
-    /* SGIs + PPIs: Group1NS, default priority, all masked (EnableIrq
+    /* SGIs + PPIs: Group1NS, default priority, all masked (enable_irq
        unmasks what gets registered) */
     ulong sgi = rd + SGI_OFFSET;
     gic_write32(sgi + GICR_ICENABLER0, ~0U);
@@ -132,7 +132,7 @@ bool Gic::cpu_init()
             ((u32)DEFAULT_PRIORITY << 8) | DEFAULT_PRIORITY);
     }
 
-    /* The IPI SGI has no Interrupt::Register path (the dispatch loop
+    /* The IPI SGI has no Interrupt::register_handler path (the dispatch loop
        special-cases it, like the x86 IDT slot in main.cpp) — enable it
        here for every CPU */
     gic_write32(sgi + GICR_ISENABLER0, 1U << IPI_SGI);

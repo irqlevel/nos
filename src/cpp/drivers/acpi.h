@@ -130,7 +130,7 @@ private:
     int compute_sum(void* table, size_t len);
 
     /* All three yield the physical address of the root table and which of
-       the two kinds it is. See ParseRsdp for why there are two. */
+       the two kinds it is. See parse_rsdp for why there are two. */
     bool parse_rsdp(RSDPDescriptor20* rsdp, ulong& root_phys_addr, bool& is_xsdt);
     bool find_root_table(ulong& root_phys_addr, bool& is_xsdt);
     bool scan_rsdp_range(ulong phy_start, ulong phy_end, ulong& root_phys_addr,
@@ -158,8 +158,8 @@ private:
     bool root_is_xsdt_;
 
     /* The tables this kernel reads, one of each kind, mapped through the
-       TmpMap window while Parse reads them: Table[i] is WantedTables[i]'s,
-       TableLength[i] its length -- what of it is mapped, and all a parser
+       tmp_map window while Parse reads them: Table[i] is WANTED_TABLES[i]'s,
+       table_length_[i] its length -- what of it is mapped, and all a parser
        reads. Every other table the root lists is looked at and let go of at
        once, and these and the root when Parse is done, whichever way it
        ends: what the kernel keeps of ACPI is the values Parse takes out of
@@ -179,7 +179,7 @@ private:
        each. */
     static const u32 MAX_TABLE_LENGTH = 64 * 1024;
 
-    /* WantedTables' index of signature, or -1 */
+    /* WANTED_TABLES' index of signature, or -1 */
     static long wanted_index(const char* signature);
 
     /* The header of the SDT at phys, mapped -- SDTs are only 4-byte
@@ -187,17 +187,17 @@ private:
        past the physical address space, or no room in the window */
     ACPISDTHeader* map_header(ulong phys);
 
-    /* The SDT at phys, whose header MapHeader mapped, mapped whole, its
+    /* The SDT at phys, whose header map_header mapped, mapped whole, its
        length read once into length; the header's mapping is let go of.
        nullptr, which is said, for a table not to be mapped -- shorter than
-       its header, longer than MaxTableLength, reaching past the physical
+       its header, longer than MAX_TABLE_LENGTH, reaching past the physical
        address space -- or no room in the window */
     ACPISDTHeader* map_whole(ACPISDTHeader* header, ulong phys, u32& length);
 
     /* Let go of the root and the tables */
     void release_tables();
 
-    /* Let go of the TmpMap pages a mapping of len bytes at va holds */
+    /* Let go of the tmp_map pages a mapping of len bytes at va holds */
     static void unmap_table_range(void* va, ulong len);
 
     static const bool CHECK_RSDT_CHECKSUM = false;
@@ -222,7 +222,7 @@ private:
        reason enough to lose ACPI, and the boot with it. */
     void register_irq_to_gsi(u8 irq, u32 gsi, u16 flags);
 
-    /* The GSI base of the IO-APIC IoApicAddress maps, ~0U while none */
+    /* The GSI base of the IO-APIC io_apic_address_ maps, ~0U while none */
     u32 io_apic_gsi_base_;
 
     /* What of an APIC's page its registers take, from the address the MADT
@@ -230,7 +230,7 @@ private:
        a page's start (IA32_APIC_BASE holds a page frame); an IO-APIC's are
        words at 0x00 and 0x10, and at 0x40 the EOI register of a later one.
        An address whose registers would run past its page is refused: the
-       drivers' accesses would land in the TmpMap window's next slot, and
+       drivers' accesses would land in the tmp_map window's next slot, and
        in whatever page that maps. */
     static const ulong LAPIC_REGISTER_BYTES = consts::PAGE_SIZE;
     static const ulong IO_APIC_REGISTER_BYTES = 0x44;
@@ -253,7 +253,7 @@ private:
     /* FADT fields we care about (ACPI spec offsets beyond SDT header) */
     struct FadtFields
     {
-        /* offset  0 (from after SDT header = absolute offset 36): FirmwareCtrl */
+        /* offset  0 (from after SDT header = absolute offset 36): firmware_ctrl */
         u32 firmware_ctrl;       /* +0  */
         u32 dsdt;               /* +4  */
         u8  reserved0;          /* +8  */

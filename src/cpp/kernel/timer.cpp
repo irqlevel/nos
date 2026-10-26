@@ -57,9 +57,9 @@ void TimerTable::stop_timer(TimerCallback& callback)
     }
     lock_.unlock_irq_restore(flags);
 
-    /* Do not return while the callback is mid-flight in ProcessTimers on
+    /* Do not return while the callback is mid-flight in process_timers on
        another CPU: the caller is allowed to free the callback right after
-       StopTimer. If it is running on *this* CPU we are inside OnTick itself,
+       stop_timer. If it is running on *this* CPU we are inside on_tick itself,
        where waiting would self-deadlock and is unnecessary (the callback is
        still on our own stack). */
     for (size_t i = 0; i < stdlib::array_size(timer_); i++)
@@ -114,7 +114,7 @@ void TimerTable::process_timers()
         timer.running_cpu = CpuTable::get_instance().get_current_cpu_id();
         lock_.unlock_irq_restore(flags);
 
-        /* Invoke outside the lock: OnTick may call Start/StopTimer */
+        /* Invoke outside the lock: on_tick may call Start/stop_timer */
         callback->on_tick(*callback);
 
         flags = lock_.lock_irq_save();

@@ -14,8 +14,8 @@ namespace mm
 
 /* arm64 bootstrap linear map, the C++ twin of the tables boot.S builds:
    TTBR1 L0[256] -> L1[0..3] -> 512x2MiB L2 blocks covering the first 4GiB
-   at KernelSpaceBase. Same 9-9-9-9-12 geometry as x86, so the same class
-   layout (P4Page = L0, P3KernelPage = L1, P2KernelPage = L2) is reused.
+   at KERNEL_SPACE_BASE. Same 9-9-9-9-12 geometry as x86, so the same class
+   layout (p4_page_ = L0, p3_kernel_page_ = L1, p2_kernel_page_ = L2) is reused.
    Differences from x86: physical ranges below the RAM base are mapped
    Device-nGnRE (no MTRRs to fix cacheability), ranges past the end of RAM
    are left unmapped (a Normal-cacheable mapping would license speculative
@@ -23,7 +23,7 @@ namespace mm
    TTBR0 walks are disabled for good via TCR.EPD0 (boot.S). */
 
 /* All QEMU-virt MMIO sits below the RAM base and is covered by the 1GiB
-   Device-nGnRE L1 block InstallEarlyDeviceBlock puts into the real table. */
+   Device-nGnRE L1 block install_early_device_block puts into the real table. */
 ulong early_device_limit;
 
 bool BuiltinPageTable::setup()
@@ -79,7 +79,7 @@ bool BuiltinPageTable::setup()
 
     /* Four L1 entries of 512 2MiB blocks: 4GiB of physical space, whatever
        part of it is RAM. The ceiling on what the page allocator can take
-       (see GetMappedLimit). */
+       (see get_mapped_limit). */
     mapped_limit_ = 4 * consts::GB;
 
     return true;
@@ -87,7 +87,7 @@ bool BuiltinPageTable::setup()
 
 void BuiltinPageTable::map_high_ram()
 {
-    /* The first 4GiB is what Setup()'s four L2 tables cover. Past that one
+    /* The first 4GiB is what setup()'s four L2 tables cover. Past that one
        L1 block per GiB is enough, and with a 4KiB granule an L1 block
        descriptor is architectural -- no feature bit to test, unlike x86. */
     static const ulong LOW_MAP_LIMIT = 4 * consts::GB;
@@ -113,8 +113,8 @@ void BuiltinPageTable::map_high_ram()
     for (ulong block = LOW_MAP_LIMIT; block < ram_end; block += BLOCK_BYTES)
     {
         /* Normal-cacheable over a GiB with no RAM in it would license
-           speculative reads of unbacked bus space -- the same reason Setup()
-           leaves the space past ramEnd alone. */
+           speculative reads of unbacked bus space -- the same reason setup()
+           leaves the space past ram_end alone. */
         if (!mmap.has_usable_ram_in(block, block + BLOCK_BYTES))
             continue;
 
@@ -138,10 +138,10 @@ void BuiltinPageTable::map_high_ram()
         mapped_limit_, blocks);
 }
 
-/* Install one 1GiB Device-nGnRE L1 block covering phys [0, ramBase-ish)
+/* Install one 1GiB Device-nGnRE L1 block covering phys [0, ram_base-ish)
    into the freshly built real page table, so PL011/GIC/virtio survive the
    builtin->real root switch (x86 has no such need: its console is port
-   I/O and MMIO regions are mapped later via MapMmioRegion). Must run
+   I/O and MMIO regions are mapped later via map_mmio_region). Must run
    BEFORE the switch: the real table's pages are edited through the still-
    active builtin linear map. */
 bool install_early_device_block(ulong real_root)
@@ -154,7 +154,7 @@ bool install_early_device_block(ulong real_root)
         return false;
 
     PtePage* l1 = (PtePage*)bpt.phys_to_virt(l0_entry->address());
-    Pte* l1_entry = &l1->entry[0]; /* [KernelSpaceBase, +1GiB): all MMIO */
+    Pte* l1_entry = &l1->entry[0]; /* [KERNEL_SPACE_BASE, +1GiB): all MMIO */
     if (l1_entry->present())
         return false;
 

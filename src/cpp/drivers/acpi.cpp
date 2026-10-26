@@ -73,7 +73,7 @@ bool Acpi::parse_rsdp(RSDPDescriptor20 *rsdp, ulong& root_phys_addr, bool& is_xs
     oem_id_[sizeof(rsdp->first_part.oemid)] = '\0';
 
     /* ACPI 2.0 deprecated the RSDT: its entries are 32-bit, so it cannot
-       name a table above 4 GiB, and firmware is free to leave RsdtAddress
+       name a table above 4 GiB, and firmware is free to leave rsdt_address
        at zero once it supplies an XSDT. Prefer the XSDT whenever the RSDP
        is new enough to have one. The EX44's AMI firmware happens to supply
        both -- Linux uses the XSDT there and this kernel used to use the
@@ -89,7 +89,7 @@ bool Acpi::parse_rsdp(RSDPDescriptor20 *rsdp, ulong& root_phys_addr, bool& is_xs
         is_xsdt = false;
     }
 
-    trace(0, "Rsdp 0x%p revision %lu OemId %s %s 0x%lX",
+    trace(0, "Rsdp 0x%p revision %lu oem_id_ %s %s 0x%lX",
         rsdp, (ulong)rsdp->first_part.revision, oem_id_,
         is_xsdt ? "Xsdt" : "Rsdt", root_phys_addr);
 
@@ -124,9 +124,9 @@ bool Acpi::scan_rsdp_range(ulong phy_start, ulong phy_end, ulong& root_phys_addr
             if (rsdp->first_part.signature == RSDP_SIGNATURE)
             {
                 trace(0, "Checking rsdp va 0x%p pha 0x%lX", rsdp, curr + (va - page_va));
-                /* ParseRsdp reads the full 36-byte RSDPDescriptor20 when
+                /* parse_rsdp reads the full 36-byte RSDPDescriptor20 when
                    Revision >= 2; the loop bound only guarantees the 20-byte
-                   FirstPart, so skip a 2.0 RSDP whose extended fields would
+                   first_part, so skip a 2.0 RSDP whose extended fields would
                    read past this single mapped page. */
                 if (rsdp->first_part.revision >= 2 &&
                     va + sizeof(RSDPDescriptor20) > scan_end)
@@ -237,7 +237,7 @@ namespace
 {
 
 /* What this kernel reads of ACPI: the MADT, the FADT, the HPET table and
-   the WDAT (Acpi::Table has one slot for each) */
+   the WDAT (Acpi::table_ has one slot for each) */
 const char* const WANTED_TABLES[] = { "APIC", "FACP", "HPET", "WDAT" };
 
 }
@@ -451,14 +451,14 @@ stdlib::Error Acpi::parse_madt()
                 return make_error(stdlib::Error::INVALID_VALUE);
             MadtLapicEntry* lapic_entry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
 
-            trace(ACPI_LL, "Acpi: MADT lapic procId %lu apicId %lu flags 0x%lX",
+            trace(ACPI_LL, "Acpi: MADT lapic procId %lu apic_id %lu flags 0x%lX",
                 (ulong)lapic_entry->acpi_process_id, (ulong)lapic_entry->apic_id, (ulong)lapic_entry->flags);
 
             if (lapic_entry->flags & 0x1)
             {
                 if (!CpuTable::get_instance().insert_cpu(lapic_entry->apic_id))
                 {
-                    trace(ACPI_LL, "Acpi: MADT lapic apicId %lu ignored (max %lu)",
+                    trace(ACPI_LL, "Acpi: MADT lapic apic_id %lu ignored (max %lu)",
                         (ulong)lapic_entry->apic_id, (ulong)MAX_CPUS);
                 }
             }
@@ -545,7 +545,7 @@ void Acpi::parse_fadt()
     ulong body_len = length - sizeof(ACPISDTHeader);
     FadtFields* fadt = reinterpret_cast<FadtFields*>(sdt_header + 1);
 
-    /* Pm1aCntBlk sits at body offset +28; need at least 32 bytes of body */
+    /* pm1a_cnt_blk sits at body offset +28; need at least 32 bytes of body */
     static const ulong PM1A_CNT_BLK_END = OFFSET_OF(FadtFields, pm1a_cnt_blk) + sizeof(fadt->pm1a_cnt_blk);
     if (body_len >= PM1A_CNT_BLK_END)
     {
@@ -553,7 +553,7 @@ void Acpi::parse_fadt()
         trace(ACPI_LL, "Acpi: FADT PM1a_CNT port 0x%lX", pm1a_cnt_port_);
     }
 
-    /* Flags + ResetReg + ResetValue require at least 93 bytes of body (ACPI 2.0+) */
+    /* Flags + reset_reg + reset_value require at least 93 bytes of body (ACPI 2.0+) */
     static const ulong RESET_VALUE_END = OFFSET_OF(FadtFields, reset_value) + sizeof(fadt->reset_value);
     if (body_len >= RESET_VALUE_END)
     {
@@ -604,7 +604,7 @@ void Acpi::parse_hpet()
 
     HpetTableBody* hpet = reinterpret_cast<HpetTableBody*>(sdt_header + 1);
 
-    /* BaseAddress must be system memory (AddressSpaceId == 0) */
+    /* base_address must be system memory (address_space_id == 0) */
     if (hpet->base_address.address_space_id != 0)
     {
         trace(0, "Acpi: HPET base not in system memory (id %lu)", (ulong)hpet->base_address.address_space_id);
@@ -755,7 +755,7 @@ void* Acpi::get_io_apic_address()
 
 void Acpi::register_irq_to_gsi(u8 irq, u32 gsi, u16 flags)
 {
-    /* Interrupt::Register takes a GSI in an u8 */
+    /* Interrupt::register_handler takes a GSI in an u8 */
     static const u32 MAX_GSI = 0xFF;
 
     for (size_t i = 0; i < irq_to_gsi_size_; i++)

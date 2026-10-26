@@ -10,7 +10,7 @@ namespace mm
 {
 
 /* The CPUs the heap keeps a cache for -- AllocatorImpl's in front of the
-   pools, PageAllocatorImpl's in front of its kept blocks: Kernel::MaxCpus
+   pools, PageAllocatorImpl's in front of its kept blocks: kernel::MAX_CPUS
    (kernel/cpu.h), which mm's headers cannot include; allocator.cpp checks
    that the two agree. */
 static constexpr size_t CACHE_CPUS = 64;

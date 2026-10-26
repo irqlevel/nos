@@ -1,5 +1,5 @@
 // The kernel heap (mm/allocator.cpp, pool.cpp, page_allocator.cpp,
-// va_allocator.cpp): Mm::Alloc and Mm::Free, the pools of every size class
+// va_allocator.cpp): mm::alloc and mm::free, the pools of every size class
 // with their lists threaded through the blocks themselves, the page runs
 // behind them, the VA allocators' bitmaps, and the three ways a driver maps
 // pages -- everything every allocation of the kernel goes through, and the
@@ -54,7 +54,7 @@ const ulong PAGE_BYTES = consts::PAGE_SIZE;
 const ulong REGION_BYTES = 2UL << 30;
 uint8_t* region;
 
-/* The pages: names, a Page each, as PageArray has them */
+/* The pages: names, a Page each, as page_array has them */
 struct PageSet
 {
     Page* array = nullptr;
@@ -70,7 +70,7 @@ struct Pages
     PageSet all;
     std::vector<bool> free;
     /* Free pages, most recently freed on top; some may have been taken by
-       AllocContiguousPages since, and are passed over */
+       alloc_contiguous_pages since, and are passed over */
     std::vector<ulong> stack;
     /* How many VAs each page is mapped at */
     std::vector<ulong> map_count;
@@ -272,9 +272,9 @@ struct Block
     enum Kind
     {
         Heap,
-        Run,    /* AllocMapPages */
-        Driver, /* MapPages of the sequence's own pages */
-        Large,  /* MapLargePages */
+        Run,    /* alloc_map_pages */
+        Driver, /* map_pages of the sequence's own pages */
+        Large,  /* map_large_pages */
     } how;
     std::vector<ulong> pages;
 };
@@ -429,7 +429,7 @@ void check_kept()
             list.count);
     }
 
-    /* Each CPU's: within its bound, which is within KeptBlocks' */
+    /* Each CPU's: within its bound, which is within kept_blocks_' */
     for (ulong cpu = 0; cpu < stdlib::array_size(pa.cpu_kept_blocks_); cpu++)
     {
         for (ulong log = 0; log < PageAllocatorImpl::CPU_KEPT_LOGS; log++)
@@ -449,7 +449,7 @@ void check_kept()
             "pages", pool.block_size_, pool.empty_pages_);
 
     /* Every CPU's cache: within its bound, each block in it free -- its tag
-       the pool's FreedTag -- in no other cache and nobody's in use (whose
+       the pool's FREED_TAG -- in no other cache and nobody's in use (whose
        address is the block's past the heap's header) */
     std::set<ulong> cached;
     for (ulong cpu = 0; cpu < stdlib::array_size(heap.caches_); cpu++)
@@ -496,13 +496,13 @@ void alloc(fuzz::Input& in)
         ulong pages = (size + 8 >= PAGE_BYTES / 2) ? (size + PAGE_BYTES - 1) / PAGE_BYTES : 1;
         ulong log = stdlib::log2(pages);
         INVARIANT(pages > PageTable::MAX_CONTIGUOUS_PAGES || page_model.free_count < (1UL << log) || va_free(log) == 0 ||
-            page_model.fail_after >= 0 || page_model.map_fail_after >= 0, "Alloc(%lu) refused with %lu pages and %lu blocks of VA free",
+            page_model.fail_after >= 0 || page_model.map_fail_after >= 0, "alloc(%lu) refused with %lu pages and %lu blocks of VA free",
             size, page_model.free_count, va_free(log));
         fuzz::reached("an allocation refused");
         return;
     }
     ulong va = reinterpret_cast<ulong>(p);
-    INVARIANT(va % 8 == 0, "Alloc(%lu) gave 0x%lx, not 8-aligned", size, va);
+    INVARIANT(va % 8 == 0, "alloc(%lu) gave 0x%lx, not 8-aligned", size, va);
     const bool pages = size + 8 >= PAGE_BYTES / 2;
     if (pages && !uninit)
     {
@@ -511,7 +511,7 @@ void alloc(fuzz::Input& in)
         INVARIANT(is_mapped(va, size), "Alloc gave 0x%lx for %lu bytes, which is not all mapped", va, size);
         const uint8_t* bytes = reinterpret_cast<const uint8_t*>(va);
         for (ulong i = 0; i < size; i++)
-            INVARIANT(bytes[i] == 0, "Alloc(%lu) gave 0x%lx with a byte not zero at +%lu", size, va, i);
+            INVARIANT(bytes[i] == 0, "alloc(%lu) gave 0x%lx with a byte not zero at +%lu", size, va, i);
     }
     place(va, {size, static_cast<uint8_t>(1 + in.below(255)), Block::Heap, {}}, "Alloc");
     fuzz::reached(pages ? "a page allocation" : "a pool allocation");
@@ -565,7 +565,7 @@ void page_run(fuzz::Input& in)
         return;
     }
     ulong va = reinterpret_cast<ulong>(p);
-    INVARIANT(va % PAGE_BYTES == 0, "AllocMapPages gave 0x%lx", va);
+    INVARIANT(va % PAGE_BYTES == 0, "alloc_map_pages gave 0x%lx", va);
     /* The run is contiguous, from phys on, and all of it mapped in order */
     ulong rounded = 1;
     while (rounded < count)
@@ -578,7 +578,7 @@ void page_run(fuzz::Input& in)
             "page %lu of the run at 0x%lx is not physical 0x%lx", i, va, phys + i * PAGE_BYTES);
         pages.push_back(m->second);
     }
-    place(va, {rounded * PAGE_BYTES, static_cast<uint8_t>(1 + in.below(255)), Block::Run, pages}, "AllocMapPages");
+    place(va, {rounded * PAGE_BYTES, static_cast<uint8_t>(1 + in.below(255)), Block::Run, pages}, "alloc_map_pages");
     fuzz::reached("a page run");
 }
 
@@ -616,7 +616,7 @@ void driver(fuzz::Input& in)
         INVARIANT(m != page_model.mapped.end() && m->second == pages[i], "a driver's page %lu mapped elsewhere", i);
     }
     place(va, {pages.size() * PAGE_BYTES, static_cast<uint8_t>(1 + in.below(255)), large ? Block::Large : Block::Driver,
-               pages}, large ? "MapLargePages" : "MapPages");
+               pages}, large ? "map_large_pages" : "map_pages");
     fuzz::reached(large ? "a large driver's map" : "a driver's map");
 }
 

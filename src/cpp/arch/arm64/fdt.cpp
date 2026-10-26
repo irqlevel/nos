@@ -203,7 +203,7 @@ bool Fdt::next_node(Node& node)
         }
         else
         {
-            return false; /* TokEnd or corrupt */
+            return false; /* TOK_END or corrupt */
         }
     }
 

@@ -37,7 +37,7 @@ public:
     static void mask_lvt_perf_counter();
 
     /* Counts the local timer against the established clock: its rate,
-       kept for ArmTimer, and false if it could not be measured. Runs once,
+       kept for arm_timer, and false if it could not be measured. Runs once,
        on the BSP: the rate is a property of the bus clock, which every core
        shares. */
     static bool calibrate_timer();
@@ -45,8 +45,8 @@ public:
     /* This CPU's local timer, one-shot on the given vector, not armed. */
     static void start_timer(u8 vector);
 
-    /* Fire this CPU's local timer once, deltaNs from now: a write of the
-       initial count, which restarts it (Hal::LocalTimerArm). */
+    /* Fire this CPU's local timer once, delta_ns from now: a write of the
+       initial count, which restarts it (hal::local_timer_arm). */
     static void arm_timer(ulong delta_ns);
 
     /* Is `vector` currently in service on this CPU? Used by the shared
@@ -101,10 +101,10 @@ private:
     static const u32 LVT_TIMER_ONE_SHOT = 0;
 
     /* Counts of the local timer a second, at the divide above: measured
-       once by CalibrateTimer, 0 until then. */
+       once by calibrate_timer, 0 until then. */
     static ulong timer_ticks_per_sec_;
 
-    /* ArmTimer counts a part in this many over the delay it is asked for:
+    /* arm_timer counts a part in this many over the delay it is asked for:
        the rate is a measurement, and one a little fast would fire before a
        sleeper's deadline -- for one more interrupt to take it. Late by as
        much costs nothing. */

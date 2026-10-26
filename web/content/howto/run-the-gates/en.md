@@ -36,11 +36,11 @@ If you pipe a check's output, for example through `tail`, the pipeline's exit st
 
 ## 1. Self-tests at every boot
 
-Every boot runs the kernel's self-tests before going any further. They live in [`src/cpp/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp), and each one is a `Stdlib::Error TestXxx()` function:
+Every boot runs the kernel's self-tests before going any further. They live in [`src/cpp/kernel/test.cpp`](https://github.com/irqlevel/nos/blob/master/src/cpp/kernel/test.cpp), and each one is a `stdlib::Error TestXxx()` function:
 
-- **When they run.** `Test::Test()` runs early in boot, called from `Main2` in `main.cpp` and from `main_arm64.cpp`. `Test::TestMultiTasking()` runs later. A failing test returns a non-success `Stdlib::Error`.
+- **When they run.** `test::test()` runs early in boot, called from `main2` in `main.cpp` and from `main_arm64.cpp`. `test::test_multi_tasking()` runs later. A failing test returns a non-success `stdlib::Error`.
 - **The Rust side** runs from the same place, through `rust_test`. Its tests include the frame test, which writes a page through each CPU's slot in the temporary mapping window, and a test of the lock-free ring.
-- **`TestModules`** loads the `modtest` module embedded in the kernel image, then feeds the module loader damaged copies of it.
+- **`test_modules`** loads the `modtest` module embedded in the kernel image, then feeds the module loader damaged copies of it.
 - **`fstest=on`** on the kernel command line runs the filesystem self-test on `/` once it is mounted, and prints `fstest: passed` or `fstest: FAILED`.
 
 To add a test, write a `TestXxx()` and register it in the `Test()` dispatcher. To run a single test, edit `Test()` so that it calls only that function, then rebuild and boot. `./scripts/qemu.sh` writes the serial console to `nos.log`, so that is the file to watch.

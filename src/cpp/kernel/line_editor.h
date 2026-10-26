@@ -16,7 +16,7 @@ namespace kernel
 
    Enter ends the line; Backspace (BS or DEL) takes back a character; ^C drops
    the line, ^U clears it. Up and Down (^P and ^N) go back through the last
-   HistoryMax lines run, and forward again to the one being typed. ^R searches
+   HISTORY_MAX lines run, and forward again to the one being typed. ^R searches
    back through them for a line holding what is typed after it -- bash's
    reverse-i-search: ^R again finds the next older one, Backspace takes a
    character off what is searched for, Enter runs what was found, ^G puts the
@@ -45,7 +45,7 @@ public:
     void prompt(stdlib::Printer& out);
 
     /* One byte typed, what it changes shown on out. True when it ended a
-       line, which GetLine() then is until the next call. */
+       line, which get_line() then is until the next call. */
     bool key(char c, stdlib::Printer& out);
 
     const char* get_line() const { return done_; }

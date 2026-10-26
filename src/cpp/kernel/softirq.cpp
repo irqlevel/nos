@@ -77,14 +77,14 @@ void SoftIrq::stop()
 
             /* Publish-then-wake, as everywhere else here: a blocked task is
                out of the scheduler's walk and would never reach the top of
-               its loop to notice the flag, and the Wait() below would then
+               its loop to notice the flag, and the wait() below would then
                spin for good. */
             task->unblock();
 
             task->wait();
 
-            /* Unpublished before the reference goes: Raise() and TickKick()
-               both dereference this pointer without a lock, and Put() may be
+            /* Unpublished before the reference goes: raise() and tick_kick()
+               both dereference this pointer without a lock, and put() may be
                the last one. */
             cpu_states_[i].task_ptr = nullptr;
             task->put();
@@ -132,7 +132,7 @@ void SoftIrq::raise(ulong type)
 
     /* The softirq task raising work for its own CPU needs no kick -- unless
        it was blocked, which is the one case where "it is running" is true and
-       useless. In the few instructions between Block() and the Schedule()
+       useless. In the few instructions between Block() and the schedule()
        that follows it, the task is the current task and about to hand the CPU
        to idle; skipping the kick there would leave it runnable but
        unscheduled until the next tick, which at line rate is ten milliseconds
@@ -142,8 +142,8 @@ void SoftIrq::raise(ulong type)
        moment the handler returns.
 
        The IPI would be useless there: an interrupt, for a reschedule the task
-       does not need. It used to be worse than useless. Before Cpu::IPI ended
-       in Preempt() rather than Schedule(), it took the CPU away from the one
+       does not need. It used to be worse than useless. Before Cpu::ipi ended
+       in Preempt() rather than schedule(), it took the CPU away from the one
        task that had work to do and gave it to the idle task, and that task
        did not run again until the next tick. A handler that asks for another
        pass, which is how the receive poll yields on its budget, was getting
@@ -154,7 +154,7 @@ void SoftIrq::raise(ulong type)
 
     /* Otherwise the kick is what gets the task scheduled: without it an idle
        CPU would not run its softirq task until the next timer tick. Sent
-       directly -- CpuTable::SendIPI takes spinlocks that are not safe in
+       directly -- CpuTable::send_ipi takes spinlocks that are not safe in
        hard IRQ context. */
     hal::send_ipi(cpu, CpuTable::IPI_VECTOR);
 }
@@ -262,9 +262,9 @@ void SoftIrq::run(CpuState& state)
             CpuTable::get_instance().get_current_cpu().get_task_queue().reap_exited();
 
             /* Nothing pending: ask the scheduler to pass over this task
-               until someone has work for it. This used to be Sleep(1ms),
+               until someone has work for it. This used to be sleep(1ms),
                which despite the name never blocked -- it spun on
-               GetBootTime() and Schedule() for a whole millisecond without
+               get_boot_time() and schedule() for a whole millisecond without
                ever looking at Pending again, so a frame arriving just after
                it started waited out the rest, and the CPU never reached the
                idle task's Hlt.
@@ -272,11 +272,11 @@ void SoftIrq::run(CpuState& state)
                The order below is what makes it safe. The flag goes up
                first and the re-check reads only after; both CPUs that can
                wake this task do the mirror image, publishing the thing worth
-               waking for before clearing the flag. Raise() sets the pending
+               waking for before clearing the flag. raise() sets the pending
                bit, then unblocks. A CPU finishing a handler clears the
                Running bit, then unblocks every CPU still holding that type
                pending. Either way a wakeup landing anywhere in this window is
-               seen by the re-check or clears the flag before Schedule() can
+               seen by the re-check or clears the flag before schedule() can
                act on it. Both sides store sequentially consistent (lock bts
                on x86, stlr on arm64), which is what the pair needs -- relaxed
                ordering would hold on x86 and fail on arm64 only.
@@ -286,14 +286,14 @@ void SoftIrq::run(CpuState& state)
                empty: a type held by another CPU leaves the bit set here, and
                testing Pending alone would refuse to sleep and spin for the
                length of that handler. */
-            /* And interrupts off across it, as Event::Wait has them: the tick
-               and every IPI end in a Schedule() of their own, and one landing
+            /* And interrupts off across it, as Event::wait has them: the tick
+               and every IPI end in a schedule() of their own, and one landing
                between the flag going up and the re-check switches this task
                out blocked before it has looked -- while a raise that finds
                the bit already pending returns without a wakeup. Only
-               TickKick came back for it then, a tick later: ten milliseconds
+               tick_kick came back for it then, a tick later: ten milliseconds
                of a receive path going nowhere, a few times in a thousand
-               round trips. Schedule() keeps interrupts per task, so the task
+               round trips. schedule() keeps interrupts per task, so the task
                comes back with them still off. */
             ulong flags = hal::irq_save();
             task->block();
@@ -303,7 +303,7 @@ void SoftIrq::run(CpuState& state)
 
             /* Running again, so the flag has no business still being up. The
                waker normally cleared it; this covers the re-check above
-               finding work, and the case where Schedule() had no one else to
+               finding work, and the case where schedule() had no one else to
                run and returned to us still blocked. Cleared before interrupts
                come back on: a tick held off until then would find it up. */
             task->unblock();

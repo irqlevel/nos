@@ -51,12 +51,12 @@ void GenericTimer::arm_in(ulong delta_ns)
     u64 freq = read_cntfrq();
 
     /* A second ahead at most: the timer is armed for a tick at the latest
-       (Cpu::LocalTimerArm), and no further keeps the sum below in range */
+       (Cpu::local_timer_arm), and no further keeps the sum below in range */
     delta_ns = stdlib::min(delta_ns, MAX_ARM_NS);
 
     /* Counts, rounded up, whole seconds and the rest apart: a remainder
        under 2^30 times a frequency the architecture has as a 32-bit field
-       stays in a u64. The counter is what GetBootTime reads, so a deadline
+       stays in a u64. The counter is what get_boot_time reads, so a deadline
        in its counts is never early. */
     u64 secs = delta_ns / consts::NANO_SECS_IN_SEC;
     u64 rest = delta_ns % consts::NANO_SECS_IN_SEC;
@@ -84,10 +84,10 @@ bool GenericTimer::setup()
     timer_int_id_ = Board::get_instance().timer_int_id_;
 
     /* Register the handler object once (the INTID -> handler table is
-       global). ArmIrqEntry dispatches the timer PPI to LocalTick directly;
+       global). arm_irq_entry dispatches the timer PPI to local_tick directly;
        registration also enables the PPI in the BSP's redistributor and
        arms this CPU's CNTV. The architected timer output is a LEVEL
-       source (DT says so too); LocalTick deasserts it by re-arming CNTV
+       source (DT says so too); local_tick deasserts it by re-arming CNTV
        before the EOI. */
     Interrupt::register_level(*this, (u8)timer_int_id_, (u8)timer_int_id_);
 
@@ -170,7 +170,7 @@ InterruptHandlerFn GenericTimer::get_handler_fn()
 
 void GenericTimer::on_interrupt(Context* ctx)
 {
-    /* Unused: ArmIrqEntry routes the timer PPI to LocalTick directly so it
+    /* Unused: arm_irq_entry routes the timer PPI to local_tick directly so it
        can EOI before Schedule. Kept for the InterruptHandler contract. */
     local_tick(ctx);
 }

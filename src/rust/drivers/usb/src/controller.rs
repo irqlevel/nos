@@ -30,7 +30,7 @@ pub const MAX_PORTS: usize = 64;
 /// every downstream port number encodable.
 const MAX_TIER: u8 = 4;
 
-/// The per-subsystem trace level, as `kernel/trace.h` has it for UsbLL.
+/// The per-subsystem trace level, as `kernel/trace.h` has it for USB_LL.
 const USB_LL: u32 = 3;
 
 /* Timeouts. Real controllers answer commands in microseconds; these bounds

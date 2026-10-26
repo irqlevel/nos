@@ -7,7 +7,7 @@
 #
 # A kernel that keeps running prints "SUCCEEDED (W^X broken!)" instead, which
 # is what this test is here to catch: the heap probe is the one that fails if
-# MapRangeLocked ever stops setting NX on the leaves it writes.
+# map_range_locked ever stops setting NX on the leaves it writes.
 #
 # Usage: scripts/wx-test.sh [--skip-build] [--arch x86_64|aarch64]
 # Env:   WX_TIMEOUT  seconds to wait for each boot to fault (default 120)

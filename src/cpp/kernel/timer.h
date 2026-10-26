@@ -42,7 +42,7 @@ private:
         Timer();
 
         TimerCallback *callback;
-        TimerCallback *running;   /* callback mid-flight in ProcessTimers */
+        TimerCallback *running;   /* callback mid-flight in process_timers */
         ulong running_cpu;         /* CPU executing that callback */
         stdlib::Time period;
         stdlib::Time expired;
@@ -50,8 +50,8 @@ private:
 
     Timer timer_[16];
 
-    /* Protects the timer array. StartTimer/StopTimer run in task context on
-       any CPU while ProcessTimers runs in IPI context, so all access must be
+    /* Protects the timer array. start_timer/stop_timer run in task context on
+       any CPU while process_timers runs in IPI context, so all access must be
        under the lock with IRQs disabled. */
     RawSpinLock lock_;
 };

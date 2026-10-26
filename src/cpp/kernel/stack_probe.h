@@ -28,7 +28,7 @@ namespace kernel
 namespace stack_probe
 {
 
-/* 0x5A repeated: a byte fill, so the fast MemSet writes it, and a word value
+/* 0x5A repeated: a byte fill, so the fast mem_set writes it, and a word value
    that is neither a plausible pointer nor a plausible small integer. */
 static const u8 PATTERN_BYTE = 0x5A;
 static const ulong PATTERN = 0x5A5A5A5A5A5A5A5AUL;

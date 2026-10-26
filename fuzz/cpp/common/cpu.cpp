@@ -49,27 +49,27 @@ bool Task::start(Func func, void* ctx)
 {
     (void)func;
     (void)ctx;
-    fuzz::host_hal_unreachable("Task::Start");
+    fuzz::host_hal_unreachable("Task::start");
 }
 
 void Task::get()
 {
-    fuzz::host_hal_unreachable("Task::Get");
+    fuzz::host_hal_unreachable("Task::get");
 }
 
 void Task::put()
 {
-    fuzz::host_hal_unreachable("Task::Put");
+    fuzz::host_hal_unreachable("Task::put");
 }
 
 void sleep(ulong nano_secs)
 {
     (void)nano_secs;
-    fuzz::host_hal_unreachable("Sleep");
+    fuzz::host_hal_unreachable("sleep");
 }
 
 /* Interrupts off and back, as the kernel's: what a caller that needs them
-   off for its CPU's frame slot (PageTable::MapFrameSlot) is checked for.
+   off for its CPU's frame slot (PageTable::map_frame_slot) is checked for.
    One task at a time, so there is no preemption to hold off. */
 ulong preempt_irq_save()
 {

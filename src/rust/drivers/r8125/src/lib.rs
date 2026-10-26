@@ -433,7 +433,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8125Device) -> bool
             }
             None => {
                 trace!(0, "r8125: MSI-X entry 0 unavailable, falling back to INTx");
-                /* `table` is dropped here.  EnableVector never ran, so MSI-X
+                /* `table` is dropped here.  enable_vector never ran, so MSI-X
                  * was never enabled in config space and INTx is still live. */
             }
         }

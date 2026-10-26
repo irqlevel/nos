@@ -35,8 +35,8 @@ long get_preempt_deferred_idle_count()
     return preempts_deferred_idle.get();
 }
 
-/* Runnable tasks reported for having waited TaskQueue::StallReportNs for
-   their CPU (TaskQueue::CheckStalls) */
+/* Runnable tasks reported for having waited TaskQueue::STALL_REPORT_NS for
+   their CPU (TaskQueue::check_stalls) */
 static Atomic stall_reports;
 
 long get_stall_report_count()
@@ -161,9 +161,9 @@ void TaskQueue::reap_exited()
             stdlib::ListEntry* entry = exited_list_.remove_head();
             task = CONTAINING_RECORD(entry, Task, list_entry_);
         }
-        /* Put() here (interrupts enabled) may free the 32KB stack via a
+        /* put() here (interrupts enabled) may free the 32KB stack via a
            blocking cross-CPU TLB shootdown; that is safe now but was not in
-           the IRQs-off SwitchComplete path where the task was enqueued. */
+           the IRQs-off switch_complete path where the task was enqueued. */
         task->put();
     }
 }
@@ -183,18 +183,18 @@ void TaskQueue::switch_complete(Task* curr)
     {
         /* Only one that can still run -- displaced, not asleep -- is
            weighed for a lighter CPU. One asleep stays on the queue its
-           wakeups go to (Task::Unblock) and whose timer is armed for its
+           wakeups go to (Task::unblock) and whose timer is armed for its
            deadline; it moves, if it should, once it runs. Its state cannot
            change under this: a Queued task is moved from there only by
            itself, and it is not running. */
         bool runnable = prev->run_state_.get() == Task::RUN_QUEUED && !prev->is_idle();
         auto task_queue = runnable ? prev->select_next_task_queue() : nullptr;
 
-        /* Schedule()'s count should be the only one left: the locks
-           TaskQueue::Schedule took in prev were released above, in this
+        /* schedule()'s count should be the only one left: the locks
+           TaskQueue::schedule took in prev were released above, in this
            task, and handed their counts back to prev -- a RawSpinLock
            remembers whose preemption it disabled. Anything more would be a
-           lock prev still holds, which Schedule() never switches away from,
+           lock prev still holds, which schedule() never switches away from,
            or a count gone astray. Checked while that last count still keeps
            prev off every CPU. */
         BUG_ON(prev->preempt_disable_counter_.get() != 1);
@@ -221,12 +221,12 @@ void TaskQueue::switch_complete(Task* curr)
     } else {
 
         prev->preempt_disable_counter_.dec();
-        /* Defer the final Put() -- which frees the 32KB stack via a blocking
+        /* Defer the final put() -- which frees the 32KB stack via a blocking
            cross-CPU TLB shootdown -- out of this IRQs-disabled context. Two
            CPUs freeing exited stacks here concurrently could deadlock on each
-           other's shootdown IPI. Enqueue the task and let ReapExited() free it
+           other's shootdown IPI. Enqueue the task and let reap_exited() free it
            from the idle loop with interrupts enabled. prev->ListEntry was
-           RemoveInit'd in Schedule, so it is free to reuse. */
+           remove_init'd in Schedule, so it is free to reuse. */
         stdlib::AutoLock lock(exited_lock_);
         exited_list_.insert_tail(&prev->list_entry_);
     }
@@ -244,7 +244,7 @@ void TaskQueue::note_run(Task* next, ulong now)
     if (next->is_idle())
         return;
 
-    /* When it left the CPU, or started: UpdateRuntime stamped it then, and
+    /* When it left the CPU, or started: update_runtime stamped it then, and
        it has not run since */
     ulong out = next->run_start_time_.get_value();
 
@@ -255,7 +255,7 @@ void TaskQueue::note_run(Task* next, ulong now)
         return;
     }
 
-    /* Whoever woke it said when: an Unblock(), or its deadline (WakeDue) --
+    /* Whoever woke it said when: an unblock(), or its deadline (wake_due) --
        unless that was before it left the CPU, a wakeup for the wait before
        this one */
     ulong woke = (ulong)next->wake_time_.get();
@@ -291,9 +291,9 @@ void TaskQueue::switch_to(Task* next, Task* curr)
    popped: there is no ABA -- a task pushed again after the take is a new
    entry on what was an empty stack -- and the push is all a waker does, from
    whatever context it is in. The compare-and-swap that publishes the entry
-   is sequentially consistent, so the WakeNext written before it is seen by
+   is sequentially consistent, so the wake_next_ written before it is seen by
    the CPU that takes the stack. A task is on one stack at a time: only the
-   Unblock() that made it Waking pushes it, and only DrainWakes takes it off
+   unblock() that made it Waking pushes it, and only drain_wakes takes it off
    that state. */
 void TaskQueue::push_wake(Task* task)
 {
@@ -441,7 +441,7 @@ void TaskQueue::drain_wakes(ulong& touched)
         touched++;
 
         /* Off its CPU for good before it can be pushed: it was made
-           Sleeping by the Schedule() that switched it out on this CPU, whose
+           Sleeping by the schedule() that switched it out on this CPU, whose
            next one this is */
         BUG_ON(task->task_queue_ != this);
         BUG_ON(task->state_.get() == Task::STATE_RUNNING);
@@ -468,7 +468,7 @@ void TaskQueue::wake_due(ulong now, ulong& touched)
         task->sleep_entry_.remove_init();
         touched++;
 
-        /* Unless an Unblock() won it first: then it is Waking, on the wake
+        /* Unless an unblock() won it first: then it is Waking, on the wake
            stack, and the next drain puts it on the run list */
         if (task->run_state_.cmpxchg(Task::RUN_QUEUED, Task::RUN_SLEEPING) == Task::RUN_SLEEPING)
         {
@@ -524,7 +524,7 @@ void TaskQueue::check_stalls(ulong now)
     if (task == nullptr || now < task->queued_at_ + STALL_REPORT_NS)
         return;
 
-    /* Said once the locks are down (ReportStall): the trace path ends in the
+    /* Said once the locks are down (report_stall): the trace path ends in the
        console and, with disklog=on, in a disk write, and none of that is for
        under the queue's lock */
     task->stall_reported_ = true;
@@ -563,7 +563,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
     bool fired = cpu.local_timer_take_walk();
 
     /* Only the idle task to hand the CPU to: a task polling with
-       YieldToRunnable, or one an interrupt landed on, keeps it instead */
+       yield_to_runnable, or one an interrupt landed on, keeps it instead */
     bool keep_over_idle = (why != ScheduleReason::Voluntary);
 
     Task* next = nullptr;
@@ -640,7 +640,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
         {
             /* The idle task takes its turn only when there is no other turn
                to take, and not over a task an interrupt landed on, or one
-               polling with YieldToRunnable, that can still run itself. It
+               polling with yield_to_runnable, that can still run itself. It
                used to sit in the walk as an equal, so a reschedule -- and
                every raise of a softirq from an interrupt handler forces one,
                by way of the IPI -- could pick it over the task that had just
@@ -650,7 +650,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
         }
 
         /* Nothing to switch to: curr keeps the CPU -- runnable, or blocking
-           with no idle task to go to, when it comes back from Schedule()
+           with no idle task to go to, when it comes back from schedule()
            still Blocking, unblocks itself, and looks again */
         if (next != nullptr || !exited)
             break;
@@ -671,15 +671,15 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
 
         /* Nothing that could not run is ever on the run list, and no task
            with preemption disabled is ever on one when a decision is made
-           (SwitchComplete): what was passed over is now a report */
+           (switch_complete): what was passed over is now a report */
         BUG_ON(next->run_state_.get() != Task::RUN_QUEUED);
         BUG_ON(next->preempt_disable_counter_.get() != 0);
 
         /* curr leaves the CPU. Blocking, it goes to sleep -- unless an
-           Unblock() made it Queued since it looked, and then it has not.
+           unblock() made it Queued since it looked, and then it has not.
            Runnable, it goes back on the run list -- the idle task too, while
            it runs the boot or a test and is counted, and only while it idles
-           is its place its own (Task::SetIdling). Kept apart whatever it ran,
+           is its place its own (Task::set_idling). Kept apart whatever it ran,
            it used to be the last resort with the boot in it: a task the boot
            started on its own CPU that never blocked -- the ring selftest's
            producer -- took that CPU at the first tick and kept it, and the
@@ -736,7 +736,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
 
         /* The count down before interrupts come back on, not after: one
            waiting to be taken -- the IPI for a task woken meanwhile -- would
-           find it still up, and its reschedule would wait for a PreemptEnable
+           find it still up, and its reschedule would wait for a preempt_enable
            that a task which has just kept the CPU may be a long way from. */
         curr->preempt_disable_counter_.dec();
         hal::irq_restore(flags);
@@ -765,8 +765,8 @@ void TaskQueue::insert(Task* task)
     task_count_.inc();
 
     /* The idle task has a place of its own, apart from the run list. It is
-       made one before it is inserted (Cpu::Run), and is already running:
-       Task::Run inserts it from its own stack. */
+       made one before it is inserted (Cpu::run), and is already running:
+       Task::run inserts it from its own stack. */
     if (task->is_idle())
     {
         BUG_ON(idle_task_ != nullptr);
@@ -786,7 +786,7 @@ void TaskQueue::remove(Task* task)
         BUG_ON(task->task_queue_ != this);
         BUG_ON(task->list_entry_.is_empty());
 
-        /* Only a task that can run is moved (SwitchComplete): one asleep
+        /* Only a task that can run is moved (switch_complete): one asleep
            stays where its wakeups and its deadline go, and the idle task
            where it is */
         BUG_ON(task->run_state_.get() != Task::RUN_QUEUED);
@@ -795,7 +795,7 @@ void TaskQueue::remove(Task* task)
 
         /* It takes its lag with it, to be placed by on the queue it goes to.
            Not current: displaced, and back on the run list, where the
-           decision that switched it out put it (SwitchComplete moves it). */
+           decision that switched it out put it (switch_complete moves it). */
         BUG_ON(eevdf_.current() == &task->sched_);
         eevdf_.leave(&task->sched_);
         runnable_count_.dec();
@@ -887,10 +887,10 @@ static void schedule_current(ScheduleReason why)
     {
         /* Preemption is off -- a spinlock, most likely -- so not now; but
            remembered, and made the moment the count is back to zero (see
-           PreemptEnable). It used to be dropped, and with it whatever the
-           reschedule was for: the IPI SoftIrq::Raise sends to run a softirq
+           preempt_enable). It used to be dropped, and with it whatever the
+           reschedule was for: the IPI SoftIrq::raise sends to run a softirq
            task it has just woken, landing on an idle task inside the lock
-           ReapExited takes, left that idle task to halt with the softirq task
+           reap_exited takes, left that idle task to halt with the softirq task
            runnable -- and every raise after it found the bit already up and
            sent nothing. The CPU slept on its work until its next tick. */
         curr->preempt_pending_.set(1);
@@ -1051,16 +1051,16 @@ void set_task_slice(Task* task, ulong slice_ns)
    come, on the queue's sleep list, soonest first, and the scheduling point
    its CPU's timer makes at the deadline -- armed for it as the task goes to
    sleep -- or any sooner one that finds the time has come puts it back
-   (TaskQueue::WakeDue). That used to be the tick's, 100 times a second, at the
+   (TaskQueue::wake_due). That used to be the tick's, 100 times a second, at the
    latest, and a sleep of a millisecond took ten. It used to poll, too, a loop
-   around Schedule() that left it runnable: alone on its CPU it let the CPU
+   around schedule() that left it runnable: alone on its CPU it let the CPU
    halt until the tick, but two on one CPU handed it to each other without
    end and the idle task never ran. Two idle hypervisor guests, each vCPU
    asleep until its guest's next timer edge, kept a CPU of the AX41 busy that
    way between them, 46% each.
 
    Where a task cannot block -- before preemption is on, off a task's stack,
-   in a CPU's idle task (which must stay runnable, see Event::Wait), with
+   in a CPU's idle task (which must stay runnable, see Event::wait), with
    preemption disabled -- it polls as it always did. */
 void sleep(ulong nano_secs)
 {
@@ -1080,10 +1080,10 @@ void sleep(ulong nano_secs)
         }
 
         /* Interrupts off from the moment the task is marked until it is
-           unmarked, as in Event::Wait: a tick landing in between would
+           unmarked, as in Event::wait: a tick landing in between would
            switch it out as a sleeper -- harmless, it is one -- but then
-           return it here to go through the Schedule() below a second time.
-           The task comes back from Schedule() with interrupts still off,
+           return it here to go through the schedule() below a second time.
+           The task comes back from schedule() with interrupts still off,
            which the switch saves and restores per task. */
         ulong flags = hal::irq_save();
         self->sleep_until_.set((long)until);

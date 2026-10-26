@@ -179,7 +179,7 @@ impl TxRing {
             if let Some(frame) = self.frames[idx].take() {
                 /* Handed back, not dropped: this runs under the device's
                  * transmit lock with interrupts off, and dropping reaches
-                 * Mm::Free -> a TLB shootdown that waits for every other CPU.
+                 * mm::free -> a TLB shootdown that waits for every other CPU.
                  * A CPU spinning on that lock cannot answer it. */
                 stack.done(frame);
             }

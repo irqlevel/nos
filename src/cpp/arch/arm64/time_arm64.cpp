@@ -47,11 +47,11 @@ void time_init()
 {
     if (freq_hz == 0)
     {
-        /* Not yet self-armed by an early GetBootTime call */
+        /* Not yet self-armed by an early get_boot_time call */
         freq_hz = read_cntfrq();
         boot_count = read_cntvct();
     }
-    trace(0, "TimeInit: generic timer freq %lu Hz", freq_hz);
+    trace(0, "time_init: generic timer freq %lu Hz", freq_hz);
 
     /* PL031 RTC: seconds since the Unix epoch (QEMU virt), through the
        premapped device GiB. The x86 twin reads the CMOS RTC. */
@@ -63,7 +63,7 @@ void time_init()
         ulong booted_secs = count_to_ns(read_cntvct() - boot_count) /
             consts::NANO_SECS_IN_SEC;
         boot_epoch_secs = now - booted_secs;
-        trace(0, "TimeInit: rtc epoch %lu", (ulong)now);
+        trace(0, "time_init: rtc epoch %lu", (ulong)now);
     }
 }
 
@@ -71,7 +71,7 @@ stdlib::Time get_boot_time()
 {
     if (freq_hz == 0)
     {
-        /* Callable before TimeInit (locks trace boot time); self-arm */
+        /* Callable before time_init (locks trace boot time); self-arm */
         freq_hz = read_cntfrq();
         boot_count = read_cntvct();
     }
@@ -83,8 +83,8 @@ stdlib::Time get_boot_time()
 
 ulong cycle_counter_delta_to_ns(u64 delta)
 {
-    /* Hal::ReadCycleCounter is CNTVCT_EL0, the same counter GetBootTime
-       reads, so FreqHz converts it directly. */
+    /* hal::read_cycle_counter is CNTVCT_EL0, the same counter get_boot_time
+       reads, so freq_hz converts it directly. */
     if (freq_hz == 0)
         return 0;
 

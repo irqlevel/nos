@@ -7,7 +7,7 @@
 #include "cpu.h"
 
 static_assert(kernel::Watchdog::SLICE_CPUS == kernel::MAX_CPUS,
-    "SliceCpus must track MaxCpus");
+    "SLICE_CPUS must track MAX_CPUS");
 
 namespace kernel
 {
@@ -64,7 +64,7 @@ Watchdog::~Watchdog()
 
 void Watchdog::check()
 {
-    /* Same counter SpinLock::Lock stamps with. A lock taken on another CPU
+    /* Same counter SpinLock::lock stamps with. A lock taken on another CPU
        is timed against this CPU's counter: on a machine whose cycle
        counters do not run together that can over- or under-state the hold
        time, which only ever costs this trace a false or missed report. */

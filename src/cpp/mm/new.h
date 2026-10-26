@@ -12,7 +12,7 @@ namespace mm
 void* alloc(size_t size, ulong tag);
 
 /* Alloc with no promise about what the block holds: for Rust's global
-   allocator (AllocatorImpl::AllocUninit) */
+   allocator (AllocatorImpl::alloc_uninit) */
 void* alloc_uninit(size_t size, ulong tag);
 
 void free(void* ptr);
@@ -25,9 +25,9 @@ void* map_pages(size_t num_pages, ulong* phys_addrs);
 
 void unmap_pages(void* ptr, size_t num_pages);
 
-/* MapPages for more pages than its largest block holds, up to
-   PageTable::MaxLargeMapPages: a loadable module's image, the .ko it is
-   read from. The pages stay the caller's, as with MapPages. */
+/* map_pages for more pages than its largest block holds, up to
+   PageTable::MAX_LARGE_MAP_PAGES: a loadable module's image, the .ko it is
+   read from. The pages stay the caller's, as with map_pages. */
 void* map_large_pages(size_t num_pages, ulong* phys_addrs);
 
 void unmap_large_pages(void* ptr, size_t num_pages);
@@ -54,7 +54,7 @@ struct FreeDeleter
    tests may be optimized away. Plain new therefore panics on OOM; any
    allocation that wants to observe OOM must use
 
-       T* p = new (Mm::NoThrow) T(...);
+       T* p = new (mm::NO_THROW) T(...);
 
    for which the compiler is required to emit a null check before the
    constructor and to preserve callers' tests. */

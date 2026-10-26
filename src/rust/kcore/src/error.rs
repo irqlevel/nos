@@ -1,6 +1,6 @@
 /// Kernel error codes for Rust drivers.
 ///
-/// Matches the domain of `Stdlib::Error` codes on the C++ side.
+/// Matches the domain of `stdlib::Error` codes on the C++ side.
 /// Use `kcore::error::Result<T>` as the return type for fallible operations
 /// and the `?` operator to propagate errors up the call stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

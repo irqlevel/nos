@@ -1,7 +1,7 @@
 // The kernel heap, for a target that does not test the kernel's own: blocks
 // from the host's allocator, each counted, so a target can see what an error
 // path failed to give back, and each allocation able to fail on the target's
-// word, so the error paths are taken. Mm::Alloc of a size the kernel's heap
+// word, so the error paths are taken. mm::alloc of a size the kernel's heap
 // would refuse returns nullptr, as the kernel's does. Allocating or freeing
 // with a spin lock held is a finding: the kernel's allocator may shoot down
 // every CPU's TLB and wait for them, and a CPU spinning on that lock never

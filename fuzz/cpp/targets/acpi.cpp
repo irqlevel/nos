@@ -2,7 +2,7 @@
 // cloud's hypervisor -- says the machine is: its CPUs, its interrupt
 // controllers and how the legacy IRQs reach them, the HPET, the reset
 // register, a watchdog of the firmware's own. All of it is read once, at
-// boot, through the TmpMap window, before a headless machine has a console,
+// boot, through the tmp_map window, before a headless machine has a console,
 // and a failure there is a boot that stops. Physical memory is the input's
 // -- sparse, zeros where nothing was put -- with an RSDP in the Multiboot
 // tag's copy, the EBDA or the BIOS area among decoys, an RSDT or an XSDT,
@@ -51,7 +51,7 @@ const u64 MAX_TABLE_LENGTH = Acpi::MAX_TABLE_LENGTH;
 const size_t WINDOW_SLOTS = PageTable::TMP_MAP_SHARED_COUNT;
 
 /* What of the window the parse may hold at once (acpi.h): the root and a
-   table of each kind, each at most MaxTableLength long and so across at
+   table of each kind, each at most MAX_TABLE_LENGTH long and so across at
    most that many pages and one more; then a header looked at, across two,
    or the local APIC's page and two IO-APICs', the one kept and the one
    taking its place. */
@@ -109,7 +109,7 @@ bool is(u64 addr, const char* signature)
     return true;
 }
 
-/* ---- the TmpMap window ---- */
+/* ---- the tmp_map window ---- */
 
 struct Mapping
 {
@@ -159,10 +159,10 @@ u64 phys_of(const void* va)
     return it->second.phys_page + page * PAGE_BYTES + (v & (PAGE_BYTES - 1));
 }
 
-/* TmpMapPage, TmpMapAddress and TmpMapRange: len bytes at phys, in the
+/* tmp_map_page, tmp_map_address and tmp_map_range: len bytes at phys, in the
    window as the kernel's are, one slot a page. The pages are whole for the
    first two, whose callers read a page -- the RSDP's search, the BIOS data
-   area -- or hand it to a driver, and for TmpMapRange only the range: what
+   area -- or hand it to a driver, and for tmp_map_range only the range: what
    ACPI maps that way is a table, and all a parser may read of it. */
 ulong map(u64 pa, u64 len, bool exact)
 {
@@ -223,7 +223,7 @@ PageTable::~PageTable()
 
 ulong PageTable::tmp_map_page(ulong phy_addr)
 {
-    INVARIANT((phy_addr & (PAGE_BYTES - 1)) == 0, "TmpMapPage(0x%lx), not a page", phy_addr);
+    INVARIANT((phy_addr & (PAGE_BYTES - 1)) == 0, "tmp_map_page(0x%lx), not a page", phy_addr);
     return map(phy_addr, 1, false);
 }
 
@@ -242,7 +242,7 @@ ulong PageTable::tmp_unmap_page(ulong virt_addr)
     std::map<ulong, Mapping>::iterator it;
     size_t page = 0;
     INVARIANT((virt_addr & (PAGE_BYTES - 1)) == 0 && find(virt_addr, it, page) && it->second.held[page],
-        "TmpUnmapPage(0x%lx), which is no slot held", virt_addr);
+        "tmp_unmap_page(0x%lx), which is no slot held", virt_addr);
     it->second.held[page] = false;
     held--;
     u64 pa = it->second.phys_page + page * PAGE_BYTES;
@@ -342,7 +342,7 @@ std::vector<uint8_t> madt_body(fuzz::Input& in)
 {
     std::vector<std::vector<uint8_t>> entries;
 
-    /* The CPUs, some disabled, now and then with ids past MaxCpus or twice */
+    /* The CPUs, some disabled, now and then with ids past MAX_CPUS or twice */
     size_t cpus = in.chance(16) ? in.below(100) : in.range(1, 16);
     for (size_t i = 0; i < cpus; i++)
     {

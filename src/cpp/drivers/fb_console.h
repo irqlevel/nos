@@ -29,7 +29,7 @@ struct FbInfo
 /* Text console drawn into a pixel framebuffer with the 8x16 font. This is
    the only usable screen on UEFI, where there is no EGA text mode.
 
-   Framebuffer memory is uncached (MapMmioRegion), so reads from it are
+   Framebuffer memory is uncached (map_mmio_region), so reads from it are
    expensive: the console never reads back. A character grid in RAM
    mirrors the screen (Cells) plus what is currently painted (Shown), so
    scrolling repaints only the cells that actually changed. */
@@ -43,8 +43,8 @@ public:
     }
 
     /* Maps the framebuffer and clears the screen. Must run on the BSP
-       before the APs are started (MapMmioRegion constraint) and after
-       PageTable::SetupFreePagesList(). */
+       before the APs are started (map_mmio_region constraint) and after
+       PageTable::setup_free_pages_list(). */
     bool setup(const FbInfo& info);
 
     static bool is_ready() { return ready_flag_; }
@@ -95,7 +95,7 @@ private:
     u32 height_;
     u32 bytes_per_pixel_;
     /* Scanlines are 8-byte aligned, so glyph spans can go out as 64-bit
-       stores (see BlitSpan). */
+       stores (see blit_span). */
     bool fast_blit_;
 
     u32 fg_color_;

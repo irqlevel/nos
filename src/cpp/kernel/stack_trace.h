@@ -15,8 +15,8 @@ namespace kernel
 
         /* Walk from `rbp`, with the stack identified by `sp` -- the stack
            pointer of the code being described, which for an interrupt or an
-           exception is Context::GetOrigRsp(). The bounds must come from a
-           stack pointer: see DetectBoundsAndCapture. */
+           exception is Context::get_orig_rsp(). The bounds must come from a
+           stack pointer: see detect_bounds_and_capture. */
         static size_t capture_from_sp(ulong rbp, ulong sp, ulong *frames, size_t max_frames);
     };
 }

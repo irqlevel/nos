@@ -13,7 +13,7 @@ namespace kernel
 {
 
 /* One stub per vector, generated in asm.asm; each passes its own index to
-   DummyInterruptDispatch */
+   dummy_interrupt_dispatch */
 extern "C" InterruptHandlerFn dummy_interrupt_stub_table[256];
 
 /* Vectors whose exception frame carries a CPU-pushed error code (SDM
@@ -44,7 +44,7 @@ Idt::Idt()
     trace(0, "Idt 0x%p", this);
 
     static_assert(sizeof(entry_) / sizeof(entry_[0]) == 256,
-        "DummyInterruptStubTable holds one stub per idt entry");
+        "dummy_interrupt_stub_table holds one stub per idt entry");
 
     for (size_t i = 0; i < stdlib::array_size(entry_); i++)
     {
@@ -99,7 +99,7 @@ void Idt::dummy_interrupt(Context* ctx, u8 vector)
 {
     dummy_interrupt_counter_.inc();
 
-    /* Below FirstDeviceVector this is a CPU exception on a slot
+    /* Below FIRST_DEVICE_VECTOR this is a CPU exception on a slot
        ExceptionTable never claimed -- a fault before it ran, or one of the
        reserved vectors. That is a kernel bug, and the stub cannot step
        over the error code some of them push, so there is no returning. */
@@ -141,9 +141,9 @@ extern "C" void dummy_interrupt_dispatch(Context* ctx, u32 vector)
 
 extern "C" void spurious_interrupt()
 {
-    /* LAPIC spurious-interrupt vector (Lapic::SpuriousVector). Per the SDM a
+    /* LAPIC spurious-interrupt vector (Lapic::SPURIOUS_VECTOR). Per the SDM a
        spurious interrupt must NOT be acknowledged with an EOI -- just count
-       it and return, rather than falling through to DummyInterrupt's panic. */
+       it and return, rather than falling through to dummy_interrupt's panic. */
     InterruptStats::inc(IrqSpurious);
 }
 

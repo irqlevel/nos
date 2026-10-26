@@ -4,7 +4,7 @@
 
 // Portable CPU primitives. The extern "C" symbols below are the link-level
 // HAL contract: every arch defines them (x86_64: arch/x86_64/asm.asm).
-// The Hal:: inline functions wrap per-arch state whose native name or
+// The hal:: inline functions wrap per-arch state whose native name or
 // encoding differs between arches (stack pointer, IRQ flags, cycle counter);
 // their bodies live in arch/<arch>/hal_cpu_inline.h.
 
@@ -39,7 +39,7 @@ long atomic_test_bit(volatile long *pvalue, ulong bit);
 void switch_context(ulong next_rsp, ulong* curr_rsp, void (*callback)(void* ctx), void* ctx);
 
 /* returns_twice: the optimiser must not keep anything in a register across
-   a SetJmp that a LongJmp back into it would find changed */
+   a set_jmp that a long_jmp back into it would find changed */
 long set_jmp(void *ctx) __attribute__((returns_twice));
 __attribute__((noreturn)) void long_jmp(void *ctx, long result);
 
@@ -55,16 +55,16 @@ static inline void cpu_relax(ulong count)
 
 namespace hal
 {
-/* Fabricate the initial stack frame that SwitchContext pops for a
+/* Fabricate the initial stack frame that switch_context pops for a
    brand-new task; returns the initial stack pointer. Defined per arch
    (x86: arch/x86_64/hal_x86.cpp, arm64: arch/arm64/cpu_arm64.cpp). */
 ulong build_task_frame(ulong stack_top, ulong entry, ulong arg);
 
-/* Frame pointer recorded in a suspended task's SwitchContext frame
+/* Frame pointer recorded in a suspended task's switch_context frame
    (task->Rsp on x86 points at a Context; arm64 at the asm.S frame), or 0
-   when that frame is not all inside [stackBase, stackLimit). The saved
+   when that frame is not all inside [stack_base, stack_limit). The saved
    stack pointer is read without anything holding the task still -- by bt,
-   by a report on a join that does not end (Task::Locate) -- so it may be
+   by a report on a join that does not end (Task::locate) -- so it may be
    one the task has since moved on from, and a frame read outside the
    stack would fault where a stale one inside it only names wrong frames. */
 ulong task_saved_frame_pointer(ulong saved_sp, ulong stack_base, ulong stack_limit);
@@ -123,7 +123,7 @@ namespace hal
    Defined per arch. */
 bool setup_serializing_lfence();
 
-/* What SetupCpuPerformance left a CPU asking for: on x86 with HWP, the
+/* What setup_cpu_performance left a CPU asking for: on x86 with HWP, the
    range of performance levels it now picks its own clock from -- lowest to
    highest, turbo included -- and the level it guarantees, all in the CPU's
    own units, which on a hybrid part are not the same for its two kinds of
@@ -148,7 +148,7 @@ struct CpuPerformance
    each AP. Defined per arch. */
 bool setup_cpu_performance(CpuPerformance* out);
 
-/* How fast ReadCycleCounter() counts, in Hz: the TSC's rate as the kernel
+/* How fast read_cycle_counter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.
    Defined per arch. */
 ulong cycle_counter_hz();
@@ -156,8 +156,8 @@ ulong cycle_counter_hz();
 }
 #endif
 
-// Provides namespace Hal { IsInterruptEnabled, IrqSave, IrqRestore,
-// GetSp, SetSp, GetFp, ReadCycleCounter }.
+// Provides namespace Hal { is_interrupt_enabled, irq_save, irq_restore,
+// get_sp, set_sp, get_fp, read_cycle_counter }.
 #if defined(__x86_64__)
 #include <arch/x86_64/hal_cpu_inline.h>
 #elif defined(__aarch64__)

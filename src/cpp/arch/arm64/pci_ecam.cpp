@@ -11,14 +11,14 @@
 /* arm64 PCI config backend: ECAM (pci-host-ecam-generic on QEMU virt).
    The ECAM window (256 MiB) sits above the premapped device GiB, so the
    buses we touch are mapped on demand. Bare -kernel boot has no firmware,
-   so PciAssignResources probes and assigns BARs from the host bridge's
+   so pci_assign_resources probes and assigns BARs from the host bridge's
    32-bit MMIO window (CPU addr == PCI addr on QEMU virt). */
 
 namespace
 {
 
 ulong ecam_va;          /* mapped base of the ECAM window (bus 0..N) */
-ulong ecam_buses_mapped; /* number of buses mapped from EcamVa */
+ulong ecam_buses_mapped; /* number of buses mapped from ecam_va */
 
 ulong mmio32_next, mmio32_end;   /* bump allocator: 32-bit non-prefetch window */
 ulong mmio64_next, mmio64_end;   /* bump allocator: 64-bit window */
@@ -143,7 +143,7 @@ void pci_assign_resources(void* devices, ulong count, ulong stride)
         /* Program the INTx routing (firmware's job; bare -kernel must do it).
            QEMU virt's interrupt-map swizzle: for INTx pin p (1..4) on device
            slot s, SPI = 3 + ((s + p - 1) % 4), i.e. GIC INTID 35..38. Write
-           it into the config-space InterruptLine so drivers register level
+           it into the config-space interrupt_line so drivers register level
            IRQs on the routed INTID unchanged. */
         u8 pin = pci.read_byte(d->bus, d->slot, d->func, 0x3D);
         if (pin >= 1 && pin <= 4)
@@ -169,7 +169,7 @@ namespace kernel
 
 /* Map the ECAM window (bus 0 is enough for QEMU virt's flat topology, but
    map a few buses to be safe) and record the MMIO window. Called from the
-   arm64 boot path before Pci::Scan. */
+   arm64 boot path before Pci::scan. */
 bool pci_ecam_setup()
 {
     auto& board = Board::get_instance();
@@ -184,13 +184,13 @@ bool pci_ecam_setup()
     ulong va = mm::PageTable::get_instance().map_mmio_region(board.ecam_base_, map_bytes);
     if (va == 0)
     {
-        trace(0, "PciEcamSetup: ECAM map failed");
+        trace(0, "pci_ecam_setup: ECAM map failed");
         return false;
     }
 
     ecam_va = va;
     ecam_buses_mapped = buses;
-    trace(0, "PciEcamSetup: ecam 0x%lX va 0x%lX buses %lu mmio32 0x%lX+0x%lX",
+    trace(0, "pci_ecam_setup: ecam 0x%lX va 0x%lX buses %lu mmio32 0x%lX+0x%lX",
         board.ecam_base_, va, buses, board.pci_mmio32_base_, board.pci_mmio32_size_);
     return true;
 }

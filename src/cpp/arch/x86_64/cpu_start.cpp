@@ -12,7 +12,7 @@ namespace kernel
 
 /* The x86 MP startup protocol (INIT + 2x SIPI + poll) for CpuTable.
    Defined in an arch TU so another architecture can supply its own
-   CpuTable::StartAll (e.g. PSCI CPU_ON) with full private access. */
+   CpuTable::start_all (e.g. PSCI CPU_ON) with full private access. */
 
 namespace
 {
@@ -66,7 +66,7 @@ bool CpuTable::start_all()
 {
     ulong startup_code = (ulong)ap_start16;
 
-    trace(0, "Starting cpus, startupCode 0x%lX", startup_code);
+    trace(0, "Starting cpus, startup_code 0x%lX", startup_code);
 
     if (startup_code & (consts::PAGE_SIZE - 1))
         return false;
