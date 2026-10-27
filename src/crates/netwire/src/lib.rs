@@ -23,6 +23,7 @@ pub const MAC_BROADCAST: Mac = [0xFF; 6];
 pub const ETH_HDR_LEN: usize = 14;
 pub const ETH_TYPE_IP: u16 = 0x0800;
 pub const ETH_TYPE_ARP: u16 = 0x0806;
+pub const ETH_TYPE_IPV6: u16 = 0x86DD;
 
 pub const ARP_LEN: usize = 28;
 pub const ARP_OP_REQUEST: u16 = 1;
@@ -36,6 +37,9 @@ pub const IP_PROTO_UDP: u8 = 17;
 
 pub const UDP_HDR_LEN: usize = 8;
 pub const ICMP_HDR_LEN: usize = 8;
+
+pub const IPV6_HDR_LEN: usize = 40;
+pub const IP_PROTO_ICMPV6: u8 = 58;
 
 /// An Ethernet frame, headers included, as this stack sends them: no jumbo
 /// frames and no VLAN tag.
@@ -706,6 +710,220 @@ pub mod tcp {
     #[inline]
     pub fn checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
         super::transport_checksum(IP_PROTO_TCP, src_ip, dst_ip, segment)
+    }
+}
+
+/* ---- IPv6 ---- */
+
+/// IPv6's header, and the chain of extension headers after it (RFC 8200).
+/// Nothing of nos's speaks it; the guests' switch reads it to tell whose a
+/// packet is, and answers one kind of it (`icmpv6`).
+pub mod ipv6 {
+    use super::{be16, IPV6_HDR_LEN};
+
+    /// An address, as the wire has it.
+    pub type Addr = [u8; 16];
+
+    pub const VERSION: u8 = 6;
+    pub const PAYLOAD_LEN: usize = 4;
+    pub const NEXT_HEADER: usize = 6;
+    pub const HOP_LIMIT: usize = 7;
+    pub const SRC: usize = 8;
+    pub const DST: usize = 24;
+
+    pub const UNSPECIFIED: Addr = [0; 16];
+
+    /* The extension headers a chain is walked through */
+    const HOP_BY_HOP: u8 = 0;
+    const ROUTING: u8 = 43;
+    const FRAGMENT: u8 = 44;
+    const AUTHENTICATION: u8 = 51;
+    const DESTINATION: u8 = 60;
+    /// Extension headers walked at most: past them, what the packet carries
+    /// is taken for hidden.
+    const CHAIN_MAX: usize = 8;
+
+    /// The version, from a packet at least `IPV6_HDR_LEN` long.
+    pub fn version(pkt: &[u8]) -> u8 {
+        pkt[0] >> 4
+    }
+
+    pub fn src(pkt: &[u8]) -> Addr {
+        addr(pkt, SRC)
+    }
+
+    pub fn dst(pkt: &[u8]) -> Addr {
+        addr(pkt, DST)
+    }
+
+    fn addr(pkt: &[u8], at: usize) -> Addr {
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&pkt[at..at + 16]);
+        a
+    }
+
+    pub fn is_multicast(a: &Addr) -> bool {
+        a[0] == 0xFF
+    }
+
+    pub fn is_link_local(a: &Addr) -> bool {
+        a[0] == 0xFE && a[1] & 0xC0 == 0x80
+    }
+
+    /// The modified EUI-64 interface identifier an Ethernet address makes
+    /// (RFC 4291, appendix A): FF:FE in its middle, its universal bit
+    /// flipped.
+    pub fn eui64(mac: &super::Mac) -> [u8; 8] {
+        [mac[0] ^ 0x02, mac[1], mac[2], 0xFF, 0xFE, mac[3], mac[4], mac[5]]
+    }
+
+    /// The address `prefix` -- its first eight bytes -- and `mac`'s EUI-64
+    /// make.
+    pub fn with_eui64(prefix: &[u8; 8], mac: &super::Mac) -> Addr {
+        let mut a = [0u8; 16];
+        a[..8].copy_from_slice(prefix);
+        a[8..].copy_from_slice(&eui64(mac));
+        a
+    }
+
+    /// What a packet carries, past its extension headers.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Upper {
+        /// This protocol's header, at this offset in the packet -- in its
+        /// first fragment, if a fragment header came before it.
+        Found { protocol: u8, at: usize, fragment: bool },
+        /// A fragment past the first: what it carries is the first's to say.
+        LaterFragment,
+        /// The chain runs past the packet, or past `CHAIN_MAX` headers, and
+        /// so hides what it carries -- which a packet that passes a check of
+        /// what it carries must not do (RFC 7112): one that does is dropped.
+        Hidden,
+    }
+
+    /// What `pkt` -- a packet from its IPv6 header on -- carries: the chain
+    /// of hop-by-hop, routing, destination options, fragment and
+    /// authentication headers walked to the first header that is none of
+    /// them, every one of them inside the packet.
+    pub fn upper(pkt: &[u8]) -> Upper {
+        if pkt.len() < IPV6_HDR_LEN {
+            return Upper::Hidden;
+        }
+        let mut next = pkt[NEXT_HEADER];
+        let mut at = IPV6_HDR_LEN;
+        let mut fragment = false;
+        for _ in 0..CHAIN_MAX {
+            let len = match next {
+                HOP_BY_HOP | ROUTING | DESTINATION => match pkt.get(at + 1) {
+                    Some(&units) => (usize::from(units) + 1) * 8,
+                    None => return Upper::Hidden,
+                },
+                AUTHENTICATION => match pkt.get(at + 1) {
+                    Some(&units) => (usize::from(units) + 2) * 4,
+                    None => return Upper::Hidden,
+                },
+                FRAGMENT => {
+                    if pkt.len() < at + 8 {
+                        return Upper::Hidden;
+                    }
+                    if be16(pkt, at + 2) & 0xFFF8 != 0 {
+                        return Upper::LaterFragment;
+                    }
+                    fragment = true;
+                    8
+                }
+                protocol => return Upper::Found { protocol, at, fragment },
+            };
+            if pkt.len() < at + len {
+                return Upper::Hidden;
+            }
+            next = pkt[at];
+            at += len;
+        }
+        Upper::Hidden
+    }
+
+    /// The checksum over IPv6's pseudo-header -- the addresses, the length
+    /// and the protocol -- and an upper-layer message (RFC 8200, 8.1):
+    /// answers 0 over a message whose own checksum is right.
+    pub fn checksum(protocol: u8, src: &Addr, dst: &Addr, msg: &[u8]) -> u16 {
+        let mut sum: u64 = 0;
+        for a in [src, dst] {
+            for pair in a.chunks_exact(2) {
+                sum += u64::from(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+        }
+        sum += msg.len() as u64;
+        sum += u64::from(protocol);
+        let mut at = 0;
+        while at + 1 < msg.len() {
+            sum += u64::from(u16::from_be_bytes([msg[at], msg[at + 1]]));
+            at += 2;
+        }
+        if at < msg.len() {
+            sum += u64::from(msg[at]) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// The 40-byte header, for a payload of `len` bytes.
+    pub fn write(pkt: &mut [u8], len: u16, next: u8, hop_limit: u8, src: &Addr, dst: &Addr) {
+        pkt[..4].copy_from_slice(&[VERSION << 4, 0, 0, 0]);
+        pkt[PAYLOAD_LEN..PAYLOAD_LEN + 2].copy_from_slice(&len.to_be_bytes());
+        pkt[NEXT_HEADER] = next;
+        pkt[HOP_LIMIT] = hop_limit;
+        pkt[SRC..SRC + 16].copy_from_slice(src);
+        pkt[DST..DST + 16].copy_from_slice(dst);
+    }
+}
+
+/// ICMPv6's messages of neighbour discovery and multicast listening (RFC
+/// 4861, RFC 3810), and the options neighbour discovery carries.
+pub mod icmpv6 {
+    pub const MLD_QUERY: u8 = 130;
+    pub const MLD_REPORT: u8 = 131;
+    pub const MLD_DONE: u8 = 132;
+    pub const MLD2_REPORT: u8 = 143;
+    pub const ROUTER_SOLICIT: u8 = 133;
+    pub const ROUTER_ADVERT: u8 = 134;
+    pub const NEIGHBOR_SOLICIT: u8 = 135;
+    pub const NEIGHBOR_ADVERT: u8 = 136;
+    pub const REDIRECT: u8 = 137;
+
+    /// Where each message's options begin: past its fixed part.
+    pub const RS_OPTIONS: usize = 8;
+    pub const RA_OPTIONS: usize = 16;
+    pub const NS_OPTIONS: usize = 24;
+    pub const NA_OPTIONS: usize = 24;
+    /// Where a solicitation's or an advertisement's target is.
+    pub const TARGET: usize = 8;
+
+    pub const OPT_SOURCE_LLA: u8 = 1;
+    pub const OPT_TARGET_LLA: u8 = 2;
+    pub const OPT_PREFIX: u8 = 3;
+    pub const OPT_MTU: u8 = 5;
+    /// An option's length is in units of this many bytes.
+    pub const OPT_UNIT: usize = 8;
+
+    /// Whether every link-layer address option of a message from `at` on --
+    /// a source's or a target's -- is `mac`, and the options are well
+    /// formed: none of length 0 (RFC 4861, 4.6), none past the message.
+    pub fn link_addresses_are(msg: &[u8], at: usize, mac: &super::Mac) -> bool {
+        let mut at = at;
+        while at < msg.len() {
+            let (Some(&kind), Some(&units)) = (msg.get(at), msg.get(at + 1)) else { return false };
+            let len = usize::from(units) * OPT_UNIT;
+            if len == 0 || msg.len() < at + len {
+                return false;
+            }
+            if (kind == OPT_SOURCE_LLA || kind == OPT_TARGET_LLA) && (len != OPT_UNIT || msg[at + 2..at + 8] != mac[..]) {
+                return false;
+            }
+            at += len;
+        }
+        true
     }
 }
 

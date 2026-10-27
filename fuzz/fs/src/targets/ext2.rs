@@ -340,8 +340,9 @@ pub fn ext2(r: &mut Input) {
                ro_asked, ro_features);
     reached(if read_only { "mounted read-only" } else { "mounted for writing" });
     let vfs = fs::vfs_instance().expect("the VFS");
-    let mut f = Fs { vfs, model: Model::new(want, read_only, Limits::fixed(max_file(bs), usize::MAX)),
-                     strict: !faults };
+    let mut f = Fs::new(vfs, Model::new(want, read_only, Limits::fixed(max_file(bs), usize::MAX)), !faults);
+    /* ext2 gives an image's discarded blocks back whole */
+    f.model.punch_block = bs;
 
     /* Now and then the filesystem filled to its last block first, through a
      * file of its own: the writes after it run out of room part way, which
@@ -356,9 +357,9 @@ pub fn ext2(r: &mut Input) {
         if r.chance(8) {
             /* Unmount and mount again: refused while a file is open, and
              * then everything as it was. */
-            let busy = !f.model.open.is_empty();
+            let busy = f.busy();
             let done = vfs.unmount(b"/");
-            invariant!(done != busy, "an unmount with {} files open {}", f.model.open.len(),
+            invariant!(done != busy, "an unmount with {} files and {} images open {}", f.model.open.len(), f.images.len(),
                        if done { "went through" } else { "was refused" });
             if done {
                 let again = fs::ext2::mount_at("/", dev.handle(), ro_asked);

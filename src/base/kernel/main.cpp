@@ -443,7 +443,8 @@ extern "C" int rust_netframe_pool_setup(unsigned long count);
 extern "C" int rust_netconsole_setup();
 extern "C" int rust_tcp_init();
 extern "C" void rust_net_start_services(unsigned short udp_shell_port);
-extern "C" void rust_net_stop_services();
+extern "C" void rust_net_stop_shell();
+extern "C" void rust_net_stop_netconsole();
 /* USB is Rust (src/crates/drivers/usb): the xHCI controllers and the HID boot
    keyboard on them, which on a machine with no PS/2 is the only way in. */
 extern "C" void rust_usb_init();
@@ -750,7 +751,7 @@ void bp_startup(void* ctx)
                     trace(0, "Reboot requested");
                 else
                     trace(0, "Shutdown requested");
-                rust_net_stop_services();
+                rust_net_stop_shell();
                 rust_usb_stop();
                 cmd.stop();
                 cmd.stop_dhcp();
@@ -771,6 +772,13 @@ void bp_startup(void* ctx)
            the log switches off -- after SoftIrq::stop() a write through a
            virtio disk would wait for ever. */
         rust_disklog_stop();
+
+        /* The netconsole after all of them: on a machine whose only console
+           is the network it carries the halt's own lines -- a module's exit
+           waiting for guests to turn themselves off, the unmount -- and its
+           drain sends what it still holds before it goes. Before the soft
+           IRQs stop: a send may still have to resolve the collector. */
+        rust_net_stop_netconsole();
 
         SoftIrq::get_instance().stop();
     } /* all locals destroyed before stack is abandoned */

@@ -8,7 +8,12 @@ boot log queued before the link came up arrives once it does, that the
 sequence numbers are contiguous so a gap can be told from a machine that
 stopped, that lines produced after link-up keep coming, and that a panic's
 report gets out -- which is the one time it matters most, and the one time
-the drain task is not running to send it.
+the drain task is not running to send it. Then a second boot is powered off,
+and the halt's own lines must arrive: the netconsole stops after the modules
+and the filesystems have gone -- a module's exit may wait minutes for
+guests to turn themselves off, which on such a machine nothing else would
+show -- and sends what it still holds as it stops, down to its own last
+line.
 
     scripts/netconsole-test.py [--tcg] [--keep]
 
@@ -105,18 +110,11 @@ def wait_until(predicate, timeout):
     return False
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tcg", action="store_true")
-    ap.add_argument("--keep", action="store_true", help="leave the log behind")
-    args = ap.parse_args()
-
-    tmp = tempfile.mkdtemp(prefix="nos-netcon-")
-    image = os.path.join(tmp, "root.img")
-    log = os.path.join(tmp, "serial.log")
+def boot(args, tmp, name):
+    """nos with its log streaming to the collector, and its serial log."""
+    image = os.path.join(tmp, name + ".img")
+    log = os.path.join(tmp, name + ".log")
     pt.mkrootfs(image)
-
-    collector = Collector(COLLECT_PORT)
 
     import platform
     hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not args.tcg
@@ -131,8 +129,59 @@ def main():
         "-device", "virtio-net-device,netdev=n0",
         "-netdev", "user,id=n0,hostfwd=udp::%d-:%d" % (SHELL_PORT, SHELL_PORT),
         "-serial", "file:" + log, "-display", "none"]
+    return subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), log
 
-    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def end(p):
+    if p.poll() is None:
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def halt(args, tmp):
+    """A boot powered off from the shell over UDP: the halt's own lines --
+    the unmount, after every module has gone, and the netconsole's last --
+    must reach the collector, with no gap in the numbers."""
+    collector = Collector(COLLECT_PORT)
+    p, log = boot(args, tmp, "halt")
+    try:
+        if not pt.check("boots again, to be powered off", pt.wait_log(log, "boot: complete", 300)):
+            return collector.text()
+        pt.check("its log arrives", wait_until(lambda: len(collector.lines) > 50, 60), "%d lines" % len(collector.lines))
+        sh = pt.Shell(timeout=5)
+        try:
+            sh.run("poweroff")
+        except Exception:
+            # The shell over UDP is the first thing the halt stops: its
+            # answer may never come.
+            pass
+        off = wait_until(lambda: p.poll() is not None, 120)
+        pt.check("the machine powers itself off", off and p.returncode == 0, "qemu %s" % p.poll())
+        tail = lambda: "\n".join(collector.lines[-30:])
+        pt.check("the halt's own lines reach the collector: the unmount, after the modules have gone",
+                 wait_until(lambda: "vfs: unmounting /" in collector.text(), 10), tail())
+        pt.check("down to the netconsole's own last line, sent as it stops",
+                 wait_until(lambda: "netconsole: stopping -- the last line sent" in collector.text(), 10), tail())
+        pt.check("with no gap in the numbers", collector.gaps() == [], str(collector.gaps()[:10]))
+    finally:
+        collector.stop()
+        end(p)
+    return collector.text()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tcg", action="store_true")
+    ap.add_argument("--keep", action="store_true", help="leave the log behind")
+    args = ap.parse_args()
+
+    tmp = tempfile.mkdtemp(prefix="nos-netcon-")
+
+    collector = Collector(COLLECT_PORT)
+    p, log = boot(args, tmp, "root")
     try:
         if not pt.check("reaches the shell", pt.wait_log(log, "boot: complete", 300)):
             return 1
@@ -176,17 +225,15 @@ def main():
                  collector.text()[-400:])
     finally:
         collector.stop()
-        if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
-            try:
-                p.wait(10)
-            except subprocess.TimeoutExpired:
-                p.kill()
+        end(p)
+
+    halted = halt(args, tmp)
 
     if args.keep:
         out = os.path.join(tmp, "netconsole.log")
         open(out, "w").write(collector.text())
-        print("collected log at " + out)
+        open(os.path.join(tmp, "netconsole-halt.log"), "w").write(halted)
+        print("collected logs at " + out + " and netconsole-halt.log beside it")
     else:
         subprocess.run(["rm", "-rf", tmp])
 

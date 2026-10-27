@@ -21,8 +21,11 @@
 //! with ACPI hears and a distribution's init answers by shutting down -- its
 //! services stopped, its disks unmounted -- and turning the machine off, and
 //! waits for that a while before it stops the guest where it is. A guest that
-//! does not listen to the button is stopped at once, and so is every guest
-//! when the module goes.
+//! does not listen to the button is stopped at once. So does the module's
+//! going -- `rmmod`, and nos's own poweroff and reboot, which unload every
+//! module: every guest's button pressed at once, and the guests given
+//! `stop_secs=` together (`UNLOAD_STOP_DEFAULT_S` unless `insmod` said) to
+//! turn themselves off before the rest are stopped where they are.
 //!
 //! A command never holds the table's lock while it waits: `stop` takes the
 //! VM off the table, and only then joins its task; `exec` and `wait` poll the
@@ -76,7 +79,7 @@ const CONSOLE_DEFAULT: usize = 2048;
 /// How long `hv exec` and `hv wait` wait by default, and at most.
 const EXEC_DEFAULT_S: u64 = 10;
 const WAIT_DEFAULT_S: u64 = 60;
-const WAIT_MAX_S: u64 = 600;
+pub(crate) const WAIT_MAX_S: u64 = 600;
 /// How often they look.
 const POLL_MS: u64 = 50;
 /// How long `hv restart` waits for the guest to be built again: as long as
@@ -96,6 +99,13 @@ const ATTACH_KEYS: usize = 256;
 /// button is pressed, unless told: long enough for a distribution's init to
 /// stop its services and unmount its disks.
 const STOP_DEFAULT_S: u64 = 30;
+/// How long the module's going gives the guests to turn themselves off once
+/// their power buttons are pressed, unless `insmod` said (`stop_secs=`):
+/// longer than `hv stop`'s, as nobody is at a prompt waiting for it and every
+/// guest shuts down at once, their disks all served by this one machine --
+/// and longer than the 90 s systemd gives a service that will not stop
+/// before it goes on to unmount the disks anyway.
+pub(crate) const UNLOAD_STOP_DEFAULT_S: u64 = 120;
 /* The power button, as `hv stop` presses it and the first CPU's loop takes
  * it: pressed, taken by the loop, and then whether the guest's OS heard it
  * -- had the button's event enabled -- or not. */
@@ -149,10 +159,11 @@ struct CpuStats {
 pub struct Shared {
     id: u32,
     stop: AtomicBool,
-    /// `hv stop` has it: the VM stays on the list -- its CPUs counted where
-    /// a new VM is placed, `hv off` and an unload seeing it -- while its
-    /// power button is given its time; a second stop and a restart are
-    /// refused meanwhile.
+    /// `hv stop` has it, or `hv stop all` or the unload: the VM stays on the
+    /// list -- its CPUs counted where a new VM is placed, `hv off` and an
+    /// unload seeing it -- while its power button is given its time; a
+    /// second stop and a restart are refused meanwhile, and a second press
+    /// is not made.
     stopping: AtomicBool,
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
@@ -1009,6 +1020,7 @@ impl Vms {
                 return;
             }
         };
+        spec.shape = place.shape;
         let placement = place.vcpus;
         let disk_cpu = place.disk;
         let cpu = placement[0];
@@ -1283,8 +1295,13 @@ impl Vms {
         if let Some(s) = self.switch.lock().as_ref() {
             let (to_host, refused, dhcp, foreign) = s.host_counts();
             let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers, \
-                                   {} neither IPv4 nor ARP (dropped)",
+                                   {} of nothing the switch carries (dropped)",
                              net::dotted(net::HOST_IP), to_host, refused, dhcp, foreign);
+            let (advertised, bound) = s.ipv6_counts();
+            let g = |i: usize| u16::from_be_bytes([net::PREFIX6[i], net::PREFIX6[i + 1]]);
+            let _ = writeln!(out, "IPv6 between the guests, in {:x}:{:x}:{:x}::/64: {} router advertisements, {} \
+                                   addresses bound -- none to nos, which speaks none",
+                             g(0), g(2), g(4), advertised, bound);
             match s.nat_address() {
                 Some(ip) => {
                     let _ = writeln!(out, "the guests go out through NAT, from {} (nos's nat command)", net::dotted(ip));
@@ -1707,8 +1724,10 @@ impl Vms {
             return;
         }
         if secs != 0 && shared.press() {
-            /* Not past an unload, which stops it at once itself. */
-            wait_shut_down(secs, || shared.shutting_down() && !self.table.lock().closing);
+            /* An unload meanwhile gives it its own time, and whichever of
+             * the two runs out first takes it off the list: this wait ends
+             * there too, the guest no longer running. */
+            wait_shut_down(secs, || shared.shutting_down());
         }
         let asked = shared.asked(secs);
         let vm = {
@@ -1735,17 +1754,24 @@ impl Vms {
     /// Stop every VM and take it off the list, saying how each ended -- to
     /// `out`, or, with no one to say it to, to the kernel log: every power
     /// button pressed at once and the guests given `secs` together to turn
-    /// themselves off, as `stop` gives one. Each one's forwards go with it,
-    /// when there are `forwards` still to take them from.
+    /// themselves off, as `stop` gives one. A VM an `hv stop` of its own is
+    /// giving its time already is not pressed again, only waited for. Each
+    /// one's forwards go with it, when there are `forwards` still to take
+    /// them from.
     pub fn stop_all(&self, mut out: Option<&mut Output>, secs: u64, forwards: Option<&Forwards>) {
+        let mut pressed = 0usize;
+        for vm in &self.table.lock().vms {
+            if !vm.shared.stopping.swap(true, Ordering::AcqRel) && secs != 0 && vm.shared.press() {
+                pressed += 1;
+            }
+        }
         if secs != 0 {
-            let mut pressed = false;
-            for vm in &self.table.lock().vms {
-                pressed |= vm.shared.press();
+            /* Said where it can be seen: on the way down, a pause of up to
+             * `secs` with nothing in the log would look like a wedge. */
+            if pressed != 0 && out.is_none() {
+                kcore::trace!(0, "hv: unloading -- {} vm(s) asked to turn themselves off, given {} s", pressed, secs);
             }
-            if pressed {
-                wait_shut_down(secs, || self.table.lock().vms.iter().any(|vm| vm.shared.shutting_down()));
-            }
+            wait_shut_down(secs, || self.table.lock().vms.iter().any(|vm| vm.shared.shutting_down()));
         }
         /* Then every stop flag, so that those left stop together rather than
          * one join at a time -- and what became of each press noted first: a
@@ -1790,14 +1816,17 @@ impl Vms {
     }
 
     /// The module is going: no VM starts from here on, and every one there is
-    /// stops -- and then the switch goes, `hv0`'s sink detached.
-    pub fn close(&self) {
+    /// stops as `hv stop all secs=<secs>` stops them -- asked first, its power
+    /// button pressed and the guests given `secs` together -- and then the
+    /// switch goes, `hv0`'s sink detached. This is how nos's own poweroff and
+    /// reboot end the guests too (they unload every module), and asking is
+    /// the difference between a guest that unmounted its disks and one whose
+    /// writes still in its page cache were lost: `rmmod` goes on in the
+    /// background after five seconds, the kernel log saying how each ended,
+    /// and the halt waits. The forwards went before this, every one of them.
+    pub fn close(&self, secs: u64) {
         self.table.lock().closing = true;
-        /* Where they are, without asking: an unload is no place to wait on
-         * guests -- rmmod gives a module's exit five seconds before it goes
-         * on in the background -- and `hv stop all` first is the way to shut
-         * them down. The forwards went before this, every one of them. */
-        self.stop_all(None, 0, None);
+        self.stop_all(None, secs, None);
         let switch = self.switch.lock().take();
         drop(switch);
     }

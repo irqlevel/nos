@@ -757,8 +757,8 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME, AVX_NAME,
-                TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, PVEOI_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME,
+                AVX_NAME, TSCAUX_NAME, SPEC_NAME, PKRU_NAME]
             .into_iter())
 }
 
@@ -784,6 +784,9 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == APICV_NAME {
         return Some(run_ioapic(machine, &APICV_GUEST, out));
+    }
+    if name == PVEOI_NAME {
+        return Some(run_ioapic(machine, &PVEOI_GUEST, out));
     }
     if name == DEBUG_NAME {
         return Some(run_debug(machine, out));
@@ -2019,6 +2022,240 @@ fn check_apicv(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapi
                       } else {
                           "the host injected all six"
                       }))
+}
+
+/* ---- pveoi: an EOI through a word in the guest's memory, KVM's PV EOI ---- */
+
+/* The pveoi guest: the ioapic guest's machine, its first CPU's local APIC
+ * taken to x2APIC mode, its interrupts injected by the run loop on either
+ * backend, and KVM's PV EOI turned on (MSR_KVM_PV_EOI_EN) with its word at
+ * 0x7100. Each handler ends its interrupt as Linux's does: the word's bit
+ * cleared if it was set -- the host set it before the entry, and does the
+ * EOI at the next exit -- and the EOI register written if not. A self-IPI
+ * 0x50 alone: the word set, and its EOI through it. A self-IPI 0x30, whose
+ * handler sends itself 0x70 and takes it nested: the word not set while 0x70
+ * waits, set for 0x70 once it is in -- and again after each of the two ISR
+ * reads in 0x70's handler, which exit -- and 0x70 ended through it; 0x30's
+ * own EOI, with no exit since, finds the word clear and writes the
+ * register, at whose exit 0x70's EOI is done first and 0x30's after. ISR
+ * read whole: nothing in service. PV EOI turned off, and 0x50 once more: the
+ * word never set, its EOI the register's. The output of `nasm -f bin`,
+ * `bits 64` and `org 0x8000`, its source's comments and labels. */
+const PVEOI_NAME: &str = "pveoi";
+const PVEOI_ABOUT: &str = "KVM's PV EOI -- an EOI through a word in the guest's memory, done by the host at the \
+                           next exit: alone, nested beneath an EOI by the register, and turned off";
+
+const PVEOI_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x5D, 0x01, 0x00, 0x00,               // start: lea rax, [rel h30] ; gate 0x30: takes 0x70 nested, then ends itself by the MSR
+    0xBF, 0x00, 0xA3, 0x00, 0x00,                           // mov edi, 0xA300
+    0xE8, 0xDA, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x3C, 0x01, 0x00, 0x00,               // lea rax, [rel h50] ; gate 0x50: a self-IPI alone
+    0xBF, 0x00, 0xA5, 0x00, 0x00,                           // mov edi, 0xA500
+    0xE8, 0xC9, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x68, 0x01, 0x00, 0x00,               // lea rax, [rel h70] ; gate 0x70: nested over 0x30
+    0xBF, 0x00, 0xA7, 0x00, 0x00,                           // mov edi, 0xA700
+    0xE8, 0xB8, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x87, 0x01, 0x00, 0x00,               // lidt [rel idtr]
+    0xB9, 0x1B, 0x00, 0x00, 0x00,                           // mov ecx, 0x1B ; IA32_APIC_BASE: firmware left xAPIC mode, the machine having an IO-APIC
+    0x0F, 0x32,                                             // rdmsr
+    0x0D, 0x00, 0x04, 0x00, 0x00,                           // or eax, 0x400 ; EXTD: x2APIC mode, its registers MSRs from here
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x0F, 0x08, 0x00, 0x00,                           // mov ecx, 0x80F ; SVR: on
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0xFF, 0x01, 0x00, 0x00,                           // mov eax, 0x1FF
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x04, 0x4D, 0x56, 0x4B,                           // mov ecx, 0x4B564D04 ; MSR_KVM_PV_EOI_EN: the word at 0x7100, on
+    0xB8, 0x01, 0x71, 0x00, 0x00,                           // mov eax, 0x7101
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI 0x50: alone -- its EOI the word's
+    0xB8, 0x50, 0x00, 0x00, 0x00,                           // mov eax, 0x50
+    0xFB,                                                   // sti
+    0x90,                                                   // nop
+    0x0F, 0x30,                                             // wrmsr
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI 0x30: whose handler takes 0x70 nested
+    0xB8, 0x30, 0x00, 0x00, 0x00,                           // mov eax, 0x30
+    0xFB,                                                   // sti
+    0x90,                                                   // nop
+    0x0F, 0x30,                                             // wrmsr
+    0x90,                                                   // nop
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0xE8, 0x4B, 0x00, 0x00, 0x00,                           // call isr_all
+    0x89, 0x1C, 0x25, 0x18, 0x70, 0x00, 0x00,               // mov dword [0x7018], ebx ; ISR after: nothing in service
+    0xB9, 0x04, 0x4D, 0x56, 0x4B,                           // mov ecx, 0x4B564D04 ; MSR_KVM_PV_EOI_EN: off
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI 0x50 again: the word never set, its EOI the MSR's
+    0xB8, 0x50, 0x00, 0x00, 0x00,                           // mov eax, 0x50
+    0xFB,                                                   // sti
+    0x90,                                                   // nop
+    0x0F, 0x30,                                             // wrmsr
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0x8B, 0x04, 0x25, 0x00, 0x71, 0x00, 0x00,               // mov eax, dword [0x7100]
+    0x89, 0x04, 0x25, 0x24, 0x70, 0x00, 0x00,               // mov dword [0x7024], eax ; the word after: clear
+    0xE8, 0x16, 0x00, 0x00, 0x00,                           // call isr_all
+    0x89, 0x1C, 0x25, 0x28, 0x70, 0x00, 0x00,               // mov dword [0x7028], ebx ; ISR at the end: nothing in service
+    0xC7, 0x04, 0x25, 0x2C, 0x70, 0x00, 0x00, 0x50, 0x56, 0x45, 0x4F, // mov dword [0x702C], 0x4F455650 ; 'PVEO'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x31, 0xDB,                                             // isr_all: xor ebx, ebx ; ISR, all eight words or'd into EBX
+    0xB9, 0x10, 0x08, 0x00, 0x00,                           // mov ecx, 0x810
+    0x0F, 0x32,                                             // .isr: rdmsr
+    0x09, 0xC3,                                             // or ebx, eax
+    0xFF, 0xC1,                                             // inc ecx
+    0x81, 0xF9, 0x18, 0x08, 0x00, 0x00,                     // cmp ecx, 0x818
+    0x72, 0xF2,                                             // jb .isr
+    0xC3,                                                   // ret
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0x53,                                                   // record: push rbx
+    0x8B, 0x1C, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov ebx, dword [0x7008]
+    0x88, 0x83, 0x00, 0x70, 0x00, 0x00,                     // mov byte [0x7000 + rbx], al
+    0xFF, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // inc dword [0x7008]
+    0x5B,                                                   // pop rbx
+    0xC3,                                                   // ret
+    0x0F, 0xBA, 0x34, 0x25, 0x00, 0x71, 0x00, 0x00, 0x00,   // eoi: btr dword [0x7100], 0 ; Linux's PV EOI: the word's bit taken, the EOI done by the host
+    0x73, 0x08,                                             // jnc .msr
+    0xFF, 0x04, 0x25, 0x1C, 0x70, 0x00, 0x00,               // inc dword [0x701C]
+    0xC3,                                                   // ret
+    0x50,                                                   // .msr: push rax ; or else the EOI register, an exit
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // mov ecx, 0x80B
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0xFF, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,               // inc dword [0x7020]
+    0xC3,                                                   // ret
+    0x50,                                                   // h50: push rax
+    0xB0, 0x50,                                             // mov al, 0x50
+    0xE8, 0xB5, 0xFF, 0xFF, 0xFF,                           // call record
+    0xE8, 0xC7, 0xFF, 0xFF, 0xFF,                           // call eoi
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // h30: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB0, 0x30,                                             // mov al, 0x30
+    0xE8, 0xA3, 0xFF, 0xFF, 0xFF,                           // call record
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI 0x70: class 7 over the class 3 in service
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0x70, 0x00, 0x00, 0x00,                           // mov eax, 0x70
+    0x0F, 0x30,                                             // wrmsr
+    0xFB,                                                   // sti ; taken here, the handler nested
+    0x90,                                                   // nop
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0xB0, 0x31,                                             // mov al, 0x31 ; back in 0x30's handler after 0x70's
+    0xE8, 0x8A, 0xFF, 0xFF, 0xFF,                           // call record
+    0xE8, 0x9C, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word clear: an exit, at which 0x70's EOI is done first
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // h70: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB0, 0x70,                                             // mov al, 0x70
+    0xE8, 0x76, 0xFF, 0xFF, 0xFF,                           // call record
+    0xB9, 0x11, 0x08, 0x00, 0x00,                           // mov ecx, 0x811 ; ISR, vectors 0x20-0x3F: 0x30 in service beneath
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [0x7010], eax
+    0xB9, 0x13, 0x08, 0x00, 0x00,                           // mov ecx, 0x813 ; ISR, vectors 0x60-0x7F: 0x70 itself
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00,               // mov dword [0x7014], eax
+    0xE8, 0x6C, 0xFF, 0xFF, 0xFF,                           // call eoi ; the word set again after each read: ended by it
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x0F, 0x07,                                             // idtr: dw 0x70F ; 0x71 gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+const PVEOI_ORDER: u64 = RESULTS;
+const PVEOI_TAKEN: u64 = RESULTS + 0x8;
+const PVEOI_ISR_30: u64 = RESULTS + 0x10;
+const PVEOI_ISR_70: u64 = RESULTS + 0x14;
+const PVEOI_ISR_MID: u64 = RESULTS + 0x18;
+const PVEOI_BY_WORD: u64 = RESULTS + 0x1C;
+const PVEOI_BY_REGISTER: u64 = RESULTS + 0x20;
+const PVEOI_WORD_AFTER: u64 = RESULTS + 0x24;
+const PVEOI_ISR_END: u64 = RESULTS + 0x28;
+const PVEOI_DONE: u64 = RESULTS + 0x2C;
+const PVEOI_MARK: u32 = u32::from_le_bytes(*b"PVEO");
+/// The order its handlers ran in.
+const PVEOI_ORDER_WANTED: [u8; 5] = [0x50, 0x30, 0x70, 0x31, 0x50];
+/// Bit 16 of a word of ISR: 0x30 and 0x70 each, in theirs.
+const PVEOI_BIT: u32 = 1 << 16;
+/// EOIs through the word -- 0x50's first, 0x70's -- and by the register --
+/// 0x30's, and 0x50's with PV EOI off.
+const PVEOI_BY_WORD_WANTED: u32 = 2;
+const PVEOI_BY_REGISTER_WANTED: u32 = 2;
+/// The interrupts it takes: four self-IPIs, each injected by the host.
+const PVEOI_INTERRUPTS: u64 = 4;
+
+const PVEOI_GUEST: IoGuest =
+    IoGuest { name: PVEOI_NAME, about: PVEOI_ABOUT, code: PVEOI_CODE, apicv: false, check: check_pveoi };
+
+fn check_pveoi(m: &GuestMemory, stopped: &Stopped, _stats: &crate::devices::ioapic::Stats, counts: &Counts,
+               _vapic: bool) -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(PVEOI_DONE)? != PVEOI_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let taken = word(PVEOI_TAKEN)?;
+    let order = m.read_obj::<u64>(PVEOI_ORDER).map_err(|e| alloc::format!("guest memory: {}", e))?.to_le_bytes();
+    if taken != PVEOI_ORDER_WANTED.len() as u32 || order[..PVEOI_ORDER_WANTED.len()] != PVEOI_ORDER_WANTED {
+        return Err(alloc::format!("its handlers ran {} times, in the order {:02x?}, not {:02x?}",
+                                  taken, &order[..PVEOI_ORDER_WANTED.len()], PVEOI_ORDER_WANTED));
+    }
+    let isr = [word(PVEOI_ISR_30)?, word(PVEOI_ISR_70)?];
+    if isr != [PVEOI_BIT; 2] {
+        return Err(alloc::format!("ISR read {:#x} and {:#x} in 0x70's handler, not {:#x} each: 0x30 and 0x70 in \
+                                   service", isr[0], isr[1], PVEOI_BIT));
+    }
+    let (mid, end) = (word(PVEOI_ISR_MID)?, word(PVEOI_ISR_END)?);
+    if mid != 0 || end != 0 {
+        return Err(alloc::format!("ISR read {:#x} after the nested pair and {:#x} at the end: an EOI lost", mid, end));
+    }
+    let (by_word, by_register) = (word(PVEOI_BY_WORD)?, word(PVEOI_BY_REGISTER)?);
+    if by_word != PVEOI_BY_WORD_WANTED || by_register != PVEOI_BY_REGISTER_WANTED {
+        return Err(alloc::format!("{} EOIs through the word and {} by the register, not {} and {}", by_word,
+                                  by_register, PVEOI_BY_WORD_WANTED, PVEOI_BY_REGISTER_WANTED));
+    }
+    if word(PVEOI_WORD_AFTER)? & 1 != 0 {
+        return Err(String::from("the word was set with PV EOI off"));
+    }
+    if counts.apic != PVEOI_INTERRUPTS || counts.pv_eoi != u64::from(PVEOI_BY_WORD_WANTED) || counts.vid != 0 {
+        return Err(alloc::format!("the host injected {} interrupts, did {} EOIs for the word and {} entries with \
+                                   virtual-interrupt delivery -- not {}, {} and none", counts.apic, counts.pv_eoi,
+                                  counts.vid, PVEOI_INTERRUPTS, PVEOI_BY_WORD_WANTED));
+    }
+    Ok(String::from("0x50 alone ended through the word, its EOI the host's at the next exit; 0x70, nested over \
+                     0x30, through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; \
+                     nothing left in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs \
+                     through the word, 2 by the register"))
 }
 
 /* ---- debug: a guest's own #DB given back to it ---- */

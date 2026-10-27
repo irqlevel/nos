@@ -49,10 +49,13 @@ const PORTS: [u16; 36] = [0x20, 0x21, 0xA0, 0xA1, 0x4D0, 0x4D1, 0x40, 0x41, 0x42
                           0x3F9, 0x3FA, 0x3FB, 0x3FC, 0x3FD, 0x3FE, 0x3FF, 0x600, 0x602, 0x604, 0x608, 0x60A, 0xCF8,
                           0xCFC, 0xCFD, 0xCFE, 0xCFF, 0x80, 0x64, 0x60, 0x2F8, 0x510];
 /// MSRs a kernel reads and writes.
-const MSRS: [u32; 29] = [0x10, 0x3A, 0x48, 0x49, 0x8B, 0x174, 0x175, 0x176, 0x179, 0x17A, 0x1A0, 0x277,
+const MSRS: [u32; 30] = [0x10, 0x3A, 0x48, 0x49, 0x8B, 0x174, 0x175, 0x176, 0x179, 0x17A, 0x1A0, 0x277,
                          0x2FF, 0x200, 0x201, 0x250, 0x6E0, 0xC000_0080, 0xC000_0081, 0xC000_0082, 0xC000_0084,
                          0xC000_0100, 0xC000_0101, 0xC000_0102, 0xC000_0103, 0xC001_0015, 0xC001_1029,
-                         0x4B56_4D00, 0x4000_0000];
+                         0x4B56_4D00, 0x4B56_4D04, 0x4000_0000];
+/// KVM's PV EOI: its MSR, and where the script's guest keeps its word.
+const MSR_KVM_PV_EOI_EN: u32 = 0x4B56_4D04;
+const PV_EOI_WORD: u64 = 0x0300_0000;
 const LEAVES: [u32; 20] = [0, 1, 2, 4, 6, 7, 0xA, 0xB, 0xD, 0xF, 0x10, 0x1F, 0x4000_0000, 0x4000_0001, 0x8000_0000,
                            0x8000_0001, 0x8000_0007, 0x8000_0008, 0x8000_001E, 0x8000_0021];
 /// Instructions the emulator must refuse, which stop the guest: a load of
@@ -96,6 +99,10 @@ enum Step {
     Wrmsr { msr: u32, value: u64 },
     Mmio { gpa: u64, store: bool, value: u64 },
     Poke { gpa: u64, bytes: Vec<u8> },
+    /// An EOI as Linux makes it with KVM's PV EOI on: its word's bit
+    /// cleared if the host set it -- no exit -- or the APIC's register
+    /// written if not.
+    PvEoi,
 }
 
 /// What the guest's code on one CPU knows: what it has planned to do, and
@@ -682,6 +689,21 @@ impl Script {
                 let _ = mem.write(gpa, &bytes);
                 None
             }
+            Step::PvEoi => {
+                let mut bits = [0u8];
+                if mem.read(PV_EOI_WORD, &mut bits).is_ok() && bits[0] & 1 != 0 {
+                    let _ = mem.write(PV_EOI_WORD, &[bits[0] & !1]);
+                    PV_EOI_BY_WORD.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                PV_EOI_BY_REGISTER.fetch_add(1, Ordering::Relaxed);
+                let eoi = if self.xapic() {
+                    Step::Mmio { gpa: XAPIC_BASE + (u64::from(APIC_EOI) << 4), store: true, value: 0 }
+                } else {
+                    Step::Wrmsr { msr: 0x800 + APIC_EOI, value: 0 }
+                };
+                self.step(v, mem, r, eoi)
+            }
         }
     }
 
@@ -759,11 +781,21 @@ impl Script {
                 self.plan().push_back(Step::Out { port: 0x40, size: 1, value: u32::from(count >> 8) });
             }
             2 => {
-                /* The APIC on, its timer and LINT0/1, the task priority. */
+                /* The APIC on, its timer and LINT0/1, the task priority --
+                 * and now and then KVM's PV EOI on, or off, or asked for at
+                 * a word no guest has or one not aligned. */
                 self.apic_write(0x0F, 0x1FF);
                 for reg in [0x32u32, 0x35, 0x36, 0x3E, 0x38, 0x08] {
                     let value = apic_value(r, reg);
                     self.apic_write(reg, value);
+                }
+                if self.apic && r.u8() < 128 {
+                    let value = if r.u8() < 224 {
+                        PV_EOI_WORD | 1
+                    } else {
+                        r.pick(&[0, PV_EOI_WORD | 3, (1 << 50) | 1])
+                    };
+                    self.plan().push_back(Step::Wrmsr { msr: MSR_KVM_PV_EOI_EN, value });
                 }
             }
                 3 if self.apic => {
@@ -1209,6 +1241,14 @@ impl Script {
                                 self.plan().push_back(Step::Out { port: 0x40, size: 1, value: 0x2E });
                                 self.plan().push_back(Step::Out { port: 0x21, size: 1, value: 0xFA });
                             }
+                            1 if self.apic => {
+                                /* The TSC-deadline timer, a deadline a
+                                 * moment from now in the TSC's count. */
+                                self.apic_write(0x0F, 0x1FF);
+                                self.apic_write(0x32, 0x4_0000 | 0xEC);
+                                let value = time::peek().saturating_add(r.pick(&[0, 10_000, 100_000, 1_000_000]));
+                                self.plan().push_back(Step::Wrmsr { msr: 0x6E0, value });
+                            }
                             _ if self.apic => {
                                 self.apic_write(0x0F, 0x1FF);
                                 self.apic_write(0x32, 0x20000 | 0xEC);
@@ -1262,7 +1302,11 @@ impl Script {
                     /* The guest took what it was given, and ends it: an EOI
                      * of its APIC and of the 8259s. */
                     if r.bool() {
-                        self.apic_write(APIC_EOI, 0);
+                        if r.bool() {
+                            self.plan().push_back(Step::PvEoi);
+                        } else {
+                            self.apic_write(APIC_EOI, 0);
+                        }
                     } else {
                         self.plan().push_back(Step::Out { port: 0x20, size: 1, value: 0x20 });
                         self.plan().push_back(Step::Out { port: 0xA0, size: 1, value: 0x20 });
@@ -1321,6 +1365,7 @@ impl Script {
                         let mut s = d.lock().unwrap();
                         s.ready += 1 + r.below(8) as usize;
                         s.fail = r.u8() < 16;
+                        s.order = if r.bool() { 0 } else { r.u64() };
                     }
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);
@@ -1433,6 +1478,10 @@ static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
 /// sent for them, for `HV_FUZZ_STATS`.
 static POSTED: AtomicU64 = AtomicU64::new(0);
 static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+/// EOIs the script's guest made through its PV EOI word -- found set by
+/// the host -- and those it made by the register, the word clear.
+static PV_EOI_BY_WORD: AtomicU64 = AtomicU64::new(0);
+static PV_EOI_BY_REGISTER: AtomicU64 = AtomicU64::new(0);
 
 fn mov_checked(what: &'static str) {
     *MOV_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
@@ -1451,6 +1500,8 @@ pub fn report() {
     }
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
+    println!("  platform: PV EOIs {} through the word, {} by the register", PV_EOI_BY_WORD.load(Ordering::Relaxed),
+             PV_EOI_BY_REGISTER.load(Ordering::Relaxed));
     for (what, n) in vm::APICV.lock().unwrap().iter() {
         println!("  platform: virtual APIC: {:>8} {}", n, what);
     }

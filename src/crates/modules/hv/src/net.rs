@@ -12,16 +12,33 @@
 //! port's.
 //!
 //! What a guest sends is checked where it comes in (`ingress`): it has to
-//! be IPv4 or ARP, sent as the guest on that port -- from the port's MAC,
-//! an IPv4 packet from the port's address, an ARP message with the port's
-//! MAC and address as its sender, or no address yet, as an ARP probe has.
-//! The one IPv4 packet with no address yet is a DHCP client's, which the
-//! switch answers and nothing past it sees. Anything else is dropped,
-//! counted. A guest sending as another could take that guest's flows through
-//! NAT, which answers a flow at the MAC its last packet came from, and tell
-//! `hv0` another's address was its own; and a protocol the switch carried
-//! without looking at it -- IPv6, which nothing of nos's speaks -- would be
-//! one where it could do both, the day something of nos's did.
+//! be IPv4, ARP or IPv6, sent as the guest on that port -- from the port's
+//! MAC, an IPv4 packet from the port's address, an ARP message with the
+//! port's MAC and address as its sender, or no address yet, as an ARP probe
+//! has. The one IPv4 packet with no address yet is a DHCP client's, which
+//! the switch answers and nothing past it sees. Anything else is dropped,
+//! counted. A guest sending as another could take that guest's flows
+//! through NAT, which answers a flow at the MAC its last packet came from,
+//! and tell `hv0` another's address was its own.
+//!
+//! IPv6 goes between the guests and no further: nothing of nos's speaks it,
+//! so `hv0` is given none, and there is no way out. Its addresses are the
+//! guests' own to choose -- link-local, and in the prefix the switch's
+//! router advertisement gives them (`PREFIX6`, unique-local, with no route)
+//! -- so they are not checked against the port as an IPv4 address is but
+//! bound to the port that first uses one (`Bindings`, RFC 6620's first come,
+//! first served): as its source, or as the target of its neighbour
+//! advertisement. From then on the address is that port's alone, until its
+//! VM goes; another sending from it, or advertising it, is spoofing -- and a
+//! guest looking for duplicates of an address it would have (DAD) is bound
+//! to it then, if it is nobody's. A guest is no router here and no DHCPv6
+//! server: its router advertisements, redirects and DHCPv6 replies go
+//! nowhere, and a neighbour discovery message of its must give its own MAC
+//! wherever it gives one, and come whole, not in fragments (RFC 6980). A
+//! packet whose chain of extension headers hides what it carries -- past
+//! its length, or a first fragment that stops short of it -- goes nowhere
+//! either: a router advertisement could be one (RFC 7112). The packet looked
+//! at is the one its receiver takes, to the length its header says.
 //!
 //! The switch is also the guests' way out: while it exists, NAT is on from
 //! `hv0` through the device nos's default route is on, so a guest reaches
@@ -64,6 +81,8 @@ use kcore::net::{Nat, NatError};
 use kcore::sync::{IrqSpinLock, Mutex};
 use kcore::vnic::{Attached, Vnic, VnicSink, BACKLOG};
 
+use netwire::{icmpv6, ipv6};
+
 use crate::dhcp;
 use crate::vms::Shared;
 
@@ -98,6 +117,35 @@ const MASK: u32 = 0xFFFF_FF00;
 /// byte.
 const PORT_MAC_PREFIX: [u8; 5] = [0x02, 0, 0, 0, 0x64];
 const PORT_BASE: usize = 2;
+
+/// The guests' IPv6 prefix, a /64 the switch's router advertisement gives
+/// them to make addresses in: unique-local (RFC 4193), its global ID "nos"
+/// and the subnet's third byte -- fd6e:6f73:64::/64. Advertised with no
+/// route: nos speaks no IPv6, and is no way out.
+pub const PREFIX6: [u8; 8] = [0xFD, 0x6E, 0x6F, 0x73, 0x00, 0x64, 0x00, 0x00];
+/// The IPv6 addresses one port has bound at once: its link-local one, the
+/// prefix's and temporary ones beside them. A new one past them takes the
+/// place of the port's least recently used.
+const ADDRS_PER_PORT: usize = 8;
+const BINDINGS: usize = MAX_PORTS * ADDRS_PER_PORT;
+/// DHCPv6's server's port, which a guest's packet is never from (RFC 8415).
+const DHCP6_SERVER_PORT: u16 = 547;
+/// The router advertisement the switch answers a solicitation with: its
+/// link-layer address, the MTU, and the prefix -- on the link, and to make
+/// addresses in -- for good; no route (router lifetime 0).
+const RA_BYTES: usize = netwire::ETH_HDR_LEN + netwire::IPV6_HDR_LEN + RA_MSG;
+const RA_MSG: usize = icmpv6::RA_OPTIONS + 8 + 8 + 32;
+const RA_HOP_LIMIT: u8 = 64;
+const ND_HOP_LIMIT: u8 = 255;
+const MTU: u32 = 1500;
+const PREFIX_LEN: u8 = 64;
+/// The prefix option's flags: on the link, and for making addresses in.
+const PREFIX_ON_LINK: u8 = 0x80;
+const PREFIX_AUTONOMOUS: u8 = 0x40;
+const FOREVER: u32 = u32::MAX;
+/// All the link's nodes: where an advertisement answering a solicitation
+/// from no address yet goes.
+const ALL_NODES: ipv6::Addr = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 pub fn port_ip(port: usize) -> u32 {
     SUBNET | (port + PORT_BASE) as u32
@@ -146,6 +194,75 @@ pub fn nat_why(why: NatError) -> &'static str {
         NatError::Device => "hv0 has no address",
         NatError::Busy => "NAT is on already, for something else",
         NatError::NoMemory => "out of memory for NAT's table",
+    }
+}
+
+/// IPv6 addresses, each bound to the port that first used one -- as the
+/// source of a packet of its, or as the target of its neighbour
+/// advertisement -- and that port's alone from then on, until its VM goes
+/// (RFC 6620's first come, first served). Fixed room, on the heap and
+/// taken when the switch is made: `ADDRS_PER_PORT` a port, a new one past
+/// them in the place of the port's least recently used. Read and changed
+/// with interrupts off: a guest's frames come in on its CPUs' paths.
+struct Bindings {
+    entries: Vec<Option<Binding>>,
+    /// Each use's stamp: what says which of a port's is least recently used.
+    clock: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    addr: ipv6::Addr,
+    port: u8,
+    used: u64,
+}
+
+impl Bindings {
+    fn new() -> Option<Bindings> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(BINDINGS).ok()?;
+        entries.resize(BINDINGS, None);
+        Some(Bindings { entries, clock: 0 })
+    }
+
+    /// Whether `addr` is `port`'s to send from or advertise: bound to it --
+    /// now, if it is nobody's -- and not, if it is another port's.
+    fn claim(&mut self, port: usize, addr: &ipv6::Addr) -> bool {
+        self.clock += 1;
+        if let Some(b) = self.entries.iter_mut().flatten().find(|b| b.addr == *addr) {
+            if usize::from(b.port) != port {
+                return false;
+            }
+            b.used = self.clock;
+            return true;
+        }
+        let mine = self.entries.iter().flatten().filter(|b| usize::from(b.port) == port).count();
+        let at = if mine < ADDRS_PER_PORT {
+            self.entries.iter().position(Option::is_none)
+        } else {
+            self.entries.iter().enumerate()
+                .filter_map(|(i, e)| e.filter(|b| usize::from(b.port) == port).map(|b| (i, b.used)))
+                .min_by_key(|&(_, used)| used)
+                .map(|(i, _)| i)
+        };
+        /* Room for every port's fill: a port under its own has a free
+         * entry, one at it has its least recently used. */
+        let Some(at) = at else { return false };
+        self.entries[at] = Some(Binding { addr: *addr, port: port as u8, used: self.clock });
+        true
+    }
+
+    /// Every address of `port`'s let go of: its VM has gone.
+    fn release(&mut self, port: usize) {
+        for e in self.entries.iter_mut() {
+            if e.is_some_and(|b| usize::from(b.port) == port) {
+                *e = None;
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.entries.iter().flatten().count()
     }
 }
 
@@ -277,28 +394,71 @@ pub struct Ports {
     dns: AtomicU32,
     /// DHCP messages answered.
     dhcp: AtomicU64,
-    /// Frames from the guests the switch does not carry: neither IPv4 nor
-    /// ARP, or too short to be.
+    /// Frames from the guests the switch does not carry: neither IPv4, ARP
+    /// nor IPv6, too short to be, IPv6 for nos -- which speaks none -- or
+    /// IPv6 hiding what it carries.
     foreign: AtomicU64,
+    /// The IPv6 addresses the guests have bound (`Bindings`).
+    bindings: IrqSpinLock<Bindings>,
+    /// Router solicitations answered.
+    advertised: AtomicU64,
 }
 
 /// What a frame a guest sent is, where it comes into the switch.
 enum Ingress {
     /// IPv4 or ARP, sent as the guest on its port: on its way.
     Own,
+    /// IPv6, sent as the guest on its port: on its way to the other guests,
+    /// and not to nos, which speaks none.
+    Own6,
+    /// A router solicitation, sent as the guest on its port: the switch's to
+    /// answer with its advertisement, and nobody else's to see.
+    Solicit,
     /// A DHCP client's request, from the port's address or none yet: the
     /// switch's to answer, and nobody else's to see.
     Dhcp,
-    /// Sent as another: another's MAC, or IPv4 or ARP from another's
-    /// address.
+    /// Sent as another: another's MAC, IPv4 or ARP from another's address,
+    /// IPv6 from or advertising an address bound to another port -- or as a
+    /// router, or a DHCPv6 server.
     Spoofed,
-    /// Neither IPv4 nor ARP, or too short to be either.
+    /// Neither IPv4, ARP nor IPv6, too short to be any, or IPv6 hiding what
+    /// it carries.
     Foreign,
 }
 
-/// What `frame`, from the guest on `port`, is. The ARP fields are read where
-/// the kernel's ARP table reads them, whatever the header says of their
-/// sizes.
+/// The router advertisement the switch sends to `mac`, at `to` (RFC 4861,
+/// 4.2), into `frame`: from `hv0`'s MAC and the link-local address it
+/// makes, with that MAC, the link's MTU and `PREFIX6` -- on the link, to
+/// make addresses in, for good -- and a router lifetime of 0: no route.
+fn router_advert(mac: &netwire::Mac, to: &ipv6::Addr, frame: &mut [u8; RA_BYTES]) {
+    use netwire::{ETH_HDR_LEN, ETH_TYPE_IPV6, IPV6_HDR_LEN, IP_PROTO_ICMPV6};
+    let from = ipv6::with_eui64(&[0xFE, 0x80, 0, 0, 0, 0, 0, 0], &HOST_MAC);
+    netwire::eth::write(frame, mac, &HOST_MAC, ETH_TYPE_IPV6);
+    let (head, msg) = frame[ETH_HDR_LEN..].split_at_mut(IPV6_HDR_LEN);
+    ipv6::write(head, RA_MSG as u16, IP_PROTO_ICMPV6, ND_HOP_LIMIT, &from, to);
+
+    msg[0] = icmpv6::ROUTER_ADVERT;
+    msg[4] = RA_HOP_LIMIT;
+    /* Flags, the router lifetime, reachable time and retransmit timer: 0 */
+    let mut at = icmpv6::RA_OPTIONS;
+    msg[at..at + 2].copy_from_slice(&[icmpv6::OPT_SOURCE_LLA, 1]);
+    msg[at + 2..at + 8].copy_from_slice(&HOST_MAC);
+    at += 8;
+    msg[at..at + 2].copy_from_slice(&[icmpv6::OPT_MTU, 1]);
+    msg[at + 4..at + 8].copy_from_slice(&MTU.to_be_bytes());
+    at += 8;
+    msg[at..at + 4].copy_from_slice(&[icmpv6::OPT_PREFIX, 4, PREFIX_LEN, PREFIX_ON_LINK | PREFIX_AUTONOMOUS]);
+    msg[at + 4..at + 8].copy_from_slice(&FOREVER.to_be_bytes());
+    msg[at + 8..at + 12].copy_from_slice(&FOREVER.to_be_bytes());
+    msg[at + 16..at + 24].copy_from_slice(&PREFIX6);
+
+    let sum = ipv6::checksum(IP_PROTO_ICMPV6, &from, to, msg);
+    msg[2..4].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// What `frame`, from the guest on `port`, is: IPv4 or ARP. The ARP fields
+/// are read where the kernel's ARP table reads them, whatever the header
+/// says of their sizes.
 fn ingress(port: usize, frame: &[u8]) -> Ingress {
     use netwire::{arp, eth, ip, ARP_LEN, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP, IP_HDR_LEN};
     let Some(body) = frame.get(ETH_HDR_LEN..) else { return Ingress::Foreign };
@@ -321,6 +481,108 @@ fn ingress(port: usize, frame: &[u8]) -> Ingress {
 }
 
 impl Ports {
+    /// What `frame`, from the guest on `port`, is (`ingress`, and for IPv6
+    /// `ingress6`).
+    fn ingress(&self, port: usize, frame: &[u8]) -> Ingress {
+        if frame.len() >= netwire::ETH_HDR_LEN && netwire::eth::ether_type(frame) == netwire::ETH_TYPE_IPV6 {
+            return self.ingress6(port, frame);
+        }
+        ingress(port, frame)
+    }
+
+    /// What an IPv6 frame from the guest on `port` is: its own -- from its
+    /// MAC, from no address yet only while it finds one, and otherwise from
+    /// an address that is its (`Bindings`), a neighbour advertisement's
+    /// target its too, and wherever a neighbour discovery message gives a
+    /// MAC its own -- or sent as another, or as a router or a DHCPv6
+    /// server, or hiding what it carries.
+    fn ingress6(&self, port: usize, frame: &[u8]) -> Ingress {
+        use netwire::{be16, ETH_HDR_LEN, IPV6_HDR_LEN, IP_PROTO_ICMPV6, IP_PROTO_UDP};
+        let pkt = &frame[ETH_HDR_LEN..];
+        if pkt.len() < IPV6_HDR_LEN || ipv6::version(pkt) != ipv6::VERSION {
+            return Ingress::Foreign;
+        }
+        /* The packet its receiver takes: to the length its header says,
+         * the frame's bytes past it none of it. */
+        let Some(pkt) = pkt.get(..IPV6_HDR_LEN + usize::from(be16(pkt, ipv6::PAYLOAD_LEN))) else {
+            return Ingress::Foreign;
+        };
+        let mac = port_mac(port);
+        if netwire::eth::src(frame) != mac {
+            return Ingress::Spoofed;
+        }
+        let (protocol, at, fragment) = match ipv6::upper(pkt) {
+            ipv6::Upper::Found { protocol, at, fragment } => (Some(protocol), at, fragment),
+            ipv6::Upper::LaterFragment => (None, 0, true),
+            ipv6::Upper::Hidden => return Ingress::Foreign,
+        };
+
+        /* What only a router, or a DHCPv6 server, sends; and the MACs and the
+         * target neighbour discovery gives -- whole, for every option of it
+         * to be looked at here (RFC 6980), and a target that is one
+         * address. */
+        let mut kind = None;
+        let mut target = None;
+        if protocol == Some(IP_PROTO_ICMPV6) {
+            let msg = &pkt[at..];
+            let Some(&k) = msg.first() else { return Ingress::Foreign };
+            kind = Some(k);
+            let options = match k {
+                icmpv6::ROUTER_ADVERT | icmpv6::REDIRECT => return Ingress::Spoofed,
+                icmpv6::ROUTER_SOLICIT => Some(icmpv6::RS_OPTIONS),
+                icmpv6::NEIGHBOR_SOLICIT => Some(icmpv6::NS_OPTIONS),
+                icmpv6::NEIGHBOR_ADVERT => Some(icmpv6::NA_OPTIONS),
+                _ => None,
+            };
+            if let Some(options) = options {
+                if fragment || msg.len() < options || !icmpv6::link_addresses_are(msg, options, &mac) {
+                    return Ingress::Spoofed;
+                }
+                if k != icmpv6::ROUTER_SOLICIT {
+                    let mut t = [0u8; 16];
+                    t.copy_from_slice(&msg[icmpv6::TARGET..icmpv6::TARGET + 16]);
+                    if ipv6::is_multicast(&t) {
+                        return Ingress::Spoofed;
+                    }
+                    target = Some(t);
+                }
+            }
+        }
+        if protocol == Some(IP_PROTO_UDP) && pkt.len() >= at + 2 && be16(pkt, at) == DHCP6_SERVER_PORT {
+            return Ingress::Spoofed;
+        }
+
+        /* The source: none yet only while finding one -- a solicitation of
+         * an address it would have, or a router's, a report of what it
+         * listens to -- and otherwise its own; a neighbour advertisement's
+         * target its own too. */
+        let src = ipv6::src(pkt);
+        if src == ipv6::UNSPECIFIED {
+            match kind {
+                /* Looking for a duplicate of an address it would have: the
+                 * address its, if it is nobody's (RFC 6620's tentative
+                 * binding), and the solicitation let through either way, for
+                 * an owner to answer. */
+                Some(icmpv6::NEIGHBOR_SOLICIT) => {
+                    if let Some(t) = target {
+                        let _ = self.bindings.lock().claim(port, &t);
+                    }
+                }
+                Some(icmpv6::ROUTER_SOLICIT | icmpv6::MLD_REPORT | icmpv6::MLD2_REPORT) => {}
+                _ => return Ingress::Spoofed,
+            }
+        } else if ipv6::is_multicast(&src) {
+            return Ingress::Spoofed;
+        } else {
+            let advertised = target.filter(|_| kind == Some(icmpv6::NEIGHBOR_ADVERT));
+            let mut bindings = self.bindings.lock();
+            if !bindings.claim(port, &src) || advertised.is_some_and(|t| !bindings.claim(port, &t)) {
+                return Ingress::Spoofed;
+            }
+        }
+        if kind == Some(icmpv6::ROUTER_SOLICIT) { Ingress::Solicit } else { Ingress::Own6 }
+    }
+
     /// A frame into a port's inbox, and its VM woken.
     fn deliver(&self, port: usize, frame: &[u8]) {
         self.deliver_rx(port, frame, None);
@@ -403,7 +665,9 @@ impl Ports {
     /// for anyone else -- `hv0` and NAT, everyone -- going on as a frame
     /// sent would.
     fn forward_partial(&self, from: usize, frame: &mut [u8], partial: Partial) {
-        if frame.len() >= netwire::ETH_HDR_LEN && matches!(ingress(from, frame), Ingress::Own) && frame[0] & 1 == 0 {
+        if frame.len() >= netwire::ETH_HDR_LEN && matches!(self.ingress(from, frame), Ingress::Own | Ingress::Own6)
+            && frame[0] & 1 == 0
+        {
             if let Some(q) = port_of(&frame[..6]) {
                 if q != from && self.ports.get(q).is_some_and(|p| p.takes_partial.load(Ordering::Acquire)) {
                     self.deliver_rx(q, frame, Some(partial));
@@ -424,7 +688,7 @@ impl Ports {
         if frame.len() < netwire::ETH_HDR_LEN {
             return;
         }
-        if !matches!(ingress(from, frame), Ingress::Own) {
+        if !matches!(self.ingress(from, frame), Ingress::Own) {
             /* Not its own, or not what it says: each frame cut from it would
              * be refused and counted the same, one by one. */
             let mut seg = [0u8; FRAME];
@@ -445,15 +709,20 @@ impl Ports {
 
     /// A frame to wherever its destination says, from port `from` -- or
     /// from `hv0`, which a frame from there never goes back to. What a guest
-    /// sends goes on only if it is its own; its DHCP message is answered
-    /// here, and goes nowhere.
+    /// sends goes on only if it is its own; its DHCP message and its router
+    /// solicitation are answered here, and go nowhere. IPv6 goes to the
+    /// guests and never to `hv0`: nos speaks none.
     fn forward(&self, from: Option<usize>, frame: &[u8]) {
         if frame.len() < netwire::ETH_HDR_LEN {
             return;
         }
         if let Some(port) = from {
-            match ingress(port, frame) {
-                Ingress::Own => {}
+            match self.ingress(port, frame) {
+                Ingress::Own | Ingress::Own6 => {}
+                Ingress::Solicit => {
+                    self.advertise(port, frame);
+                    return;
+                }
                 Ingress::Dhcp => {
                     self.answer_dhcp(port, frame);
                     return;
@@ -472,9 +741,14 @@ impl Ports {
         }
         let dst = &frame[..6];
         let broadcast = dst[0] & 1 != 0;
+        let v6 = netwire::eth::ether_type(frame) == netwire::ETH_TYPE_IPV6;
         if !broadcast {
             if dst == HOST_MAC {
-                self.to_host(from, frame);
+                if !v6 {
+                    self.to_host(from, frame);
+                } else if from.is_some() {
+                    self.foreign.fetch_add(1, Ordering::Relaxed);
+                }
                 return;
             }
             if let Some(p) = port_of(dst) {
@@ -498,7 +772,21 @@ impl Ports {
                 self.deliver(p, frame);
             }
         }
-        self.to_host(from, frame);
+        if !v6 {
+            self.to_host(from, frame);
+        }
+    }
+
+    /// The switch's router advertisement, to the guest on `port` that
+    /// solicited one with `solicit`: the prefix to make addresses in, and
+    /// no route.
+    fn advertise(&self, port: usize, solicit: &[u8]) {
+        let asked = ipv6::src(&solicit[netwire::ETH_HDR_LEN..]);
+        let to = if asked == ipv6::UNSPECIFIED { ALL_NODES } else { asked };
+        let mut frame = [0u8; RA_BYTES];
+        router_advert(&port_mac(port), &to, &mut frame);
+        self.advertised.fetch_add(1, Ordering::Relaxed);
+        self.deliver(port, &frame);
     }
 
     fn answer_dhcp(&self, port: usize, frame: &[u8]) {
@@ -656,6 +944,7 @@ impl Switch {
             .ok_or_else(|| String::from("no hv0: the kernel's virtual NICs are all taken, or one is being made"))?;
         let mut ports = Vec::new();
         ports.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
+        let bindings = Bindings::new().ok_or_else(|| String::from("out of memory for the switch"))?;
         for _ in 0..MAX_PORTS {
             ports.push(Port {
                 inbox: IrqSpinLock::new(Inbox {
@@ -680,6 +969,7 @@ impl Switch {
         let ports = Arc::new(Ports {
             ports, in_use: AtomicUsize::new(0), vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
             dns: AtomicU32::new(0), dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
+            bindings: IrqSpinLock::new(bindings), advertised: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
         let uplink = vnic.attach(Arc::new(Uplink(ports.clone())))
@@ -809,6 +1099,9 @@ impl Switch {
             self.ports.in_use.fetch_sub(1, Ordering::Relaxed);
         }
         drop(owner);
+        /* Its IPv6 addresses go with its VM: the next to claim the port, or
+         * any port, may have them. */
+        self.ports.bindings.lock().release(port);
         /* The port's address goes with it to the next VM to claim it: what
          * NAT has mapped for this one's flows goes now, or the next would be
          * answered for them -- a TCP connection's sequence numbers too. */
@@ -838,9 +1131,14 @@ impl Switch {
     }
 
     /// What went to the host, what the host would not take, the DHCP
-    /// messages answered, and the frames of no protocol the switch carries.
+    /// messages answered, and the frames the switch does not carry.
     pub fn host_counts(&self) -> (u64, u64, u64, u64) {
         (self.ports.to_host.load(Ordering::Relaxed), self.ports.refused.load(Ordering::Relaxed),
          self.ports.dhcp.load(Ordering::Relaxed), self.ports.foreign.load(Ordering::Relaxed))
+    }
+
+    /// The router solicitations answered, and the IPv6 addresses bound.
+    pub fn ipv6_counts(&self) -> (u64, usize) {
+        (self.ports.advertised.load(Ordering::Relaxed), self.ports.bindings.lock().count())
     }
 }

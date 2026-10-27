@@ -90,11 +90,90 @@ impl Taken {
 
 /// Where a guest goes: its vCPUs' CPUs, its first CPU's first, and the CPU
 /// the task that serves its disks runs on -- with no disks, its first
-/// vCPU's, which nothing runs on for them.
+/// vCPU's, which nothing runs on for them; and what its CPUID tells it of
+/// that ([`Shape`]).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Placement {
     pub vcpus: Vec<u32>,
     pub disk: u32,
+    pub shape: Shape,
+}
+
+/// What a guest is told of where its CPUs sit, by its CPUID
+/// (`crate::policy`): one package of cores of one thread or two -- a CPU's
+/// APIC ID its number, so a core's two threads are CPUs 2k and 2k+1 -- and
+/// the last-level cache the package's, or each core's own.
+///
+/// Told so where it is so. Two of its CPUs are threads of one core only
+/// where they are one host core's two threads, as `Cores::Own` gives them
+/// -- and its kernel then schedules as on such a core, spreading over cores
+/// first, and keeps its own processes apart there as on a core it shares:
+/// the side channels between two threads of a core are between two of its
+/// CPUs, which it can guard against only knowing. CPUs placed otherwise --
+/// a core's two threads to CPUs that are not 2k and 2k+1, where a core had
+/// one thread to give, or `Cores::Shared`'s CPUs on cores apart -- are each
+/// a core of their own. Its CPUs share a cache only where they share the
+/// host's last level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape {
+    cpus: u32,
+    smt: bool,
+    llc: bool,
+}
+
+impl Shape {
+    /// A guest of `cpus` CPUs, each a core of its own, sharing the cache:
+    /// what one is told whose CPUs' places are nobody's to say -- a guest of
+    /// one CPU, or one the module did not place.
+    pub const fn cores(cpus: u32) -> Shape {
+        let cpus = if cpus > MAX_CPUS as u32 { MAX_CPUS as u32 } else { cpus };
+        Shape { cpus, smt: false, llc: true }
+    }
+
+    /// What a guest whose CPUs run on the host's CPUs `vcpus`, in order, is
+    /// told: threads of one core in twos where its CPUs 2k and 2k+1 are each
+    /// on one host core and no other two of them are; the cache the
+    /// package's where every one shares the first's last level.
+    pub fn of(topo: &Topology, vcpus: &[u32]) -> Shape {
+        let vcpus = &vcpus[..vcpus.len().min(MAX_CPUS)];
+        let n = vcpus.len();
+        let core = |i: usize| topo.core(vcpus[i]);
+        let smt = n > 1 && (0..n).all(|i| (0..n).all(|j| i == j || (core(i) == core(j)) == (i / 2 == j / 2)));
+        let llc = vcpus.first().is_none_or(|&first| vcpus.iter().all(|&cpu| topo.llc(cpu) == topo.llc(first)));
+        Shape { cpus: n as u32, smt, llc }
+    }
+
+    /// Its CPUs.
+    #[inline]
+    pub fn cpus(&self) -> u32 {
+        self.cpus
+    }
+
+    /// An APIC ID's bits below its core's: 1 where a core is two threads.
+    #[inline]
+    pub fn smt_shift(&self) -> u32 {
+        u32::from(self.smt)
+    }
+
+    /// A core's threads.
+    #[inline]
+    pub fn threads(&self) -> u32 {
+        1 << self.smt_shift()
+    }
+
+    /// An APIC ID's bits below its package's: its threads' and its cores'.
+    #[inline]
+    pub fn package_shift(&self) -> u32 {
+        let cores = self.cpus.div_ceil(self.threads());
+        self.smt_shift() + cores.max(1).next_power_of_two().trailing_zeros()
+    }
+
+    /// Whether the last-level cache is the whole package's: every CPU on
+    /// one host cache. Each core's own otherwise.
+    #[inline]
+    pub fn llc_shared(&self) -> bool {
+        self.llc
+    }
 }
 
 /// Why a guest was given no place.
@@ -244,7 +323,7 @@ fn own(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option
     }
 
     let disk = if disks { own_disk(topo, online, held, chosen, &vcpus, home) } else { vcpus[0] };
-    Ok(Placement { vcpus, disk })
+    Ok(Placement { shape: Shape::of(topo, &vcpus), vcpus, disk })
 }
 
 /// The free core a guest takes next, of those with a CPU in `free` it has
@@ -378,5 +457,5 @@ fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Opt
         None if first != 0 => 0,
         None => first,
     };
-    Ok(Placement { vcpus, disk })
+    Ok(Placement { shape: Shape::of(topo, &vcpus), vcpus, disk })
 }

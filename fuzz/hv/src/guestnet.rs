@@ -26,6 +26,78 @@ const MASK: u32 = 0xFFFF_FF00;
 const PORT_MAC_PREFIX: [u8; 5] = [0x02, 0, 0, 0, 0x64];
 const SWITCH_PORT_BASE: usize = 2;
 const INBOX_FRAMES: usize = 256;
+/// The IPv6 addresses a port has bound at once, past which a new one takes
+/// the place of its least recently used.
+const ADDRS6_PER_PORT: usize = 8;
+/// The link-local prefix, and the switch's: a guest's addresses in them are
+/// its MAC's EUI-64 (RFC 4291).
+const LINK_LOCAL: [u8; 8] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0];
+const PREFIX6: [u8; 8] = [0xFD, 0x6E, 0x6F, 0x73, 0, 0x64, 0, 0];
+
+/// The address `prefix` and port `p`'s MAC make.
+fn eui64(prefix: &[u8; 8], p: usize) -> [u8; 16] {
+    let m = switch::port_mac(p);
+    let mut a = [0u8; 16];
+    a[..8].copy_from_slice(prefix);
+    a[8..].copy_from_slice(&[m[0] ^ 2, m[1], m[2], 0xFF, 0xFE, m[3], m[4], m[5]]);
+    a
+}
+
+/// The switch's router advertisement to port `p`'s guest at `to`, laid out
+/// as RFC 4861 lays one out (4.2, 4.6) -- the model's own bytes: from `hv0`'s
+/// MAC and link-local address, hop limit 255; a current hop limit of 64,
+/// no flags, a router lifetime of 0, no reachable time or retransmit timer;
+/// `hv0`'s MAC, an MTU of 1500, and the prefix -- a /64, on the link and to
+/// make addresses in, for good.
+fn router_advert(p: usize, to: &[u8; 16]) -> Vec<u8> {
+    let from = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFE, 0, 0x64, 0x01];
+    let mut msg = vec![134u8, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    msg.extend_from_slice(&[1, 1]);
+    msg.extend_from_slice(&HOST_MAC);
+    msg.extend_from_slice(&[5, 1, 0, 0]);
+    msg.extend_from_slice(&1500u32.to_be_bytes());
+    msg.extend_from_slice(&[3, 4, 64, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+    msg.extend_from_slice(&PREFIX6);
+    msg.extend_from_slice(&[0; 8]);
+    let mut sum: u64 = msg.len() as u64 + 58;
+    for w in from.chunks(2).chain(to.chunks(2)).chain(msg.chunks(2)) {
+        sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    msg[2..4].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    let mut f = switch::port_mac(p).to_vec();
+    f.extend_from_slice(&HOST_MAC);
+    f.extend_from_slice(&[0x86, 0xDD, 0x60, 0, 0, 0]);
+    f.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    f.extend_from_slice(&[58, 255]);
+    f.extend_from_slice(&from);
+    f.extend_from_slice(to);
+    f.extend_from_slice(&msg);
+    f
+}
+
+/// Whether the options of a neighbour discovery message, `opts` on, are
+/// well made -- none of length 0, none past the message -- and every
+/// link-layer address among them, a source's or a target's, `mac`.
+fn nd_options_are(opts: &[u8], mac: &[u8; 6]) -> bool {
+    let mut i = 0;
+    while i < opts.len() {
+        if i + 1 >= opts.len() {
+            return false;
+        }
+        let len = usize::from(opts[i + 1]) * 8;
+        if len == 0 || i + len > opts.len() {
+            return false;
+        }
+        if (opts[i] == 1 || opts[i] == 2) && (len != 8 || opts[i + 2..i + 8] != mac[..]) {
+            return false;
+        }
+        i += len;
+    }
+    true
+}
 
 /// `n` bytes of payload from `seed`: varied, and not the input's to spend --
 /// drawn from the input a byte at a time, a frame's payload took most of a
@@ -59,6 +131,10 @@ fn port_of(mac: &[u8]) -> Option<usize> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Admit {
     Own,
+    /// IPv6 of its own: to the other guests, never to `hv0`.
+    Own6,
+    /// A router solicitation of its own: answered, and seen by nobody.
+    Solicit,
     Dhcp,
     Spoofed,
     Foreign,
@@ -89,6 +165,10 @@ fn admit(p: usize, f: &[u8]) -> Admit {
 /// Sends of TCP the switch carried whole and cut, for `HV_FUZZ_STATS`.
 static WHOLE_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CUT_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// IPv6 frames from the guests by what the model made of each (`Admit`'s
+/// order), and addresses a port bound in the place of its oldest.
+static ADMIT6: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static EVICTED6: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What an inbox entry is, by the header it goes to its guest with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,8 +205,15 @@ struct Model {
     to_host: u64,
     refused: u64,
     dhcp: u64,
-    /// Guests' frames of neither IPv4 nor ARP.
+    /// Guests' frames of neither IPv4, ARP nor IPv6, IPv6 for `hv0`, and
+    /// IPv6 hiding what it carries.
     foreign: u64,
+    /// The IPv6 addresses bound, each to a port, with when it last used it
+    /// (RFC 6620's first come, first served), and the count of uses.
+    bound: BTreeMap<[u8; 16], (usize, u64)>,
+    uses: u64,
+    /// Router solicitations answered.
+    advertised: u64,
     /// What the stack must have been handed through `hv0`.
     stack: Vec<Vec<u8>>,
     dns: u32,
@@ -152,6 +239,9 @@ impl Model {
             refused: 0,
             dhcp: 0,
             foreign: 0,
+            bound: BTreeMap::new(),
+            uses: 0,
+            advertised: 0,
             stack: Vec::new(),
             dns: 0,
             refuse: false,
@@ -160,6 +250,157 @@ impl Model {
 
     fn deliver(&mut self, p: usize, frame: &[u8]) {
         self.deliver_kind(p, frame, Kind::Done);
+    }
+
+    /// Whether IPv6 address `a` is port `p`'s to use: bound to it, now if
+    /// it was nobody's -- in the place of its least recently used, if it
+    /// has as many as it may -- and not if it is another's.
+    fn claim6(&mut self, p: usize, a: [u8; 16]) -> bool {
+        self.uses += 1;
+        let now = self.uses;
+        match self.bound.get_mut(&a) {
+            Some(b) if b.0 != p => return false,
+            Some(b) => {
+                b.1 = now;
+                return true;
+            }
+            None => {}
+        }
+        let mine: Vec<([u8; 16], u64)> =
+            self.bound.iter().filter(|(_, b)| b.0 == p).map(|(a, b)| (*a, b.1)).collect();
+        if mine.len() == ADDRS6_PER_PORT {
+            let oldest = mine.iter().min_by_key(|m| m.1).map(|m| m.0).expect("a port's addresses");
+            self.bound.remove(&oldest);
+            EVICTED6.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.bound.insert(a, (p, now));
+        true
+    }
+
+    /// What the switch must make of a frame from port `p`: IPv6 by its
+    /// rules (`admit6`), the rest by `admit`'s.
+    fn admit(&mut self, p: usize, f: &[u8]) -> Admit {
+        if f.len() >= ETH_HDR_LEN && wire::be16(f, 12) == 0x86DD {
+            let a = self.admit6(p, f);
+            ADMIT6[a as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return a;
+        }
+        admit(p, f)
+    }
+
+    /// An IPv6 frame from port `p`, said from what a switch guarding its
+    /// guests' addresses is (RFC 6620, 7113, 6980): the packet taken to the
+    /// length its header says, past which the frame is none of it, or none
+    /// at all if that is past the frame; from the port's MAC; the chain of
+    /// extension headers walked to what the packet carries, or it is hidden
+    /// and goes nowhere. A router's advertisement or redirect is not a
+    /// guest's to send, nor is a DHCPv6 server's reply; neighbour discovery
+    /// comes whole and gives the port's MAC wherever it gives one, and a
+    /// target that is one address. The source is the port's, bound as it
+    /// is used, or none -- only while finding an address: a solicitation of
+    /// a router's or of a neighbour's, which binds what it looks for if it
+    /// is nobody's, or a listener's report. A neighbour advertisement's
+    /// target is the port's too.
+    fn admit6(&mut self, p: usize, f: &[u8]) -> Admit {
+        if f.len() < ETH_HDR_LEN + 40 || f[ETH_HDR_LEN] >> 4 != 6 {
+            return Admit::Foreign;
+        }
+        let end = ETH_HDR_LEN + 40 + usize::from(wire::be16(f, ETH_HDR_LEN + 4));
+        if end > f.len() {
+            return Admit::Foreign;
+        }
+        let pkt = &f[ETH_HDR_LEN..end];
+        let mac = switch::port_mac(p);
+        if f[6..12] != mac {
+            return Admit::Spoofed;
+        }
+        let (mut next, mut at, mut fragment) = (pkt[6], 40usize, false);
+        let mut carried = None;
+        let mut later = false;
+        for _ in 0..8 {
+            match next {
+                0 | 43 | 60 | 51 => {
+                    let Some(&units) = pkt.get(at + 1) else { return Admit::Foreign };
+                    let len = if next == 51 { (usize::from(units) + 2) * 4 } else { (usize::from(units) + 1) * 8 };
+                    if at + len > pkt.len() {
+                        return Admit::Foreign;
+                    }
+                    next = pkt[at];
+                    at += len;
+                }
+                44 => {
+                    if at + 8 > pkt.len() {
+                        return Admit::Foreign;
+                    }
+                    if wire::be16(pkt, at + 2) >> 3 != 0 {
+                        later = true;
+                        break;
+                    }
+                    fragment = true;
+                    next = pkt[at];
+                    at += 8;
+                }
+                proto => {
+                    carried = Some(proto);
+                    break;
+                }
+            }
+        }
+        if carried.is_none() && !later {
+            return Admit::Foreign;
+        }
+        let mut kind = None;
+        let mut target = None;
+        if carried == Some(58) {
+            let msg = &pkt[at..];
+            let Some(&k) = msg.first() else { return Admit::Foreign };
+            kind = Some(k);
+            if k == 134 || k == 137 {
+                return Admit::Spoofed;
+            }
+            let fixed = match k {
+                133 => Some(8),
+                135 | 136 => Some(24),
+                _ => None,
+            };
+            if let Some(fixed) = fixed {
+                if fragment || msg.len() < fixed || !nd_options_are(&msg[fixed..], &mac) {
+                    return Admit::Spoofed;
+                }
+                if k != 133 {
+                    let t: [u8; 16] = msg[8..24].try_into().expect("16 bytes");
+                    if t[0] == 0xFF {
+                        return Admit::Spoofed;
+                    }
+                    target = Some(t);
+                }
+            }
+        }
+        if carried == Some(17) && at + 2 <= pkt.len() && wire::be16(pkt, at) == 547 {
+            return Admit::Spoofed;
+        }
+        let src: [u8; 16] = pkt[8..24].try_into().expect("16 bytes");
+        if src == [0; 16] {
+            match kind {
+                Some(135) => {
+                    if let Some(t) = target {
+                        self.claim6(p, t);
+                    }
+                }
+                Some(133 | 131 | 143) => {}
+                _ => return Admit::Spoofed,
+            }
+        } else if src[0] == 0xFF {
+            return Admit::Spoofed;
+        } else {
+            if !self.claim6(p, src) {
+                return Admit::Spoofed;
+            }
+            if kind == Some(136) && !self.claim6(p, target.expect("an advertisement's target")) {
+                return Admit::Spoofed;
+            }
+        }
+        if kind == Some(133) { Admit::Solicit } else { Admit::Own6 }
     }
 
     fn deliver_kind(&mut self, p: usize, frame: &[u8], kind: Kind) {
@@ -205,7 +446,7 @@ impl Model {
         if frame.len() < ETH_HDR_LEN {
             return;
         }
-        if matches!(admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
+        if matches!(self.admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
             if let Some(q) = port_of(&frame[..6]) {
                 if q != from && self.deliver_whole(q, frame) {
                     return;
@@ -222,7 +463,9 @@ impl Model {
     /// offset`: so to the port it is for where that port takes it so,
     /// finished -- by the offload model's sum -- and forwarded otherwise.
     fn send_partial(&mut self, from: usize, frame: &[u8], start: usize, offset: usize) {
-        if frame.len() >= ETH_HDR_LEN && matches!(admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
+        if frame.len() >= ETH_HDR_LEN && matches!(self.admit(from, frame), Admit::Own | Admit::Own6)
+            && frame[0] & 1 == 0
+        {
             if let Some(q) = port_of(&frame[..6]) {
                 if q != from && self.takes_partial[q] {
                     self.deliver_kind(q, frame, Kind::Partial(start, offset));
@@ -291,8 +534,21 @@ impl Model {
             return;
         }
         if let Some(p) = from {
-            match admit(p, frame) {
-                Admit::Own => {}
+            match self.admit(p, frame) {
+                Admit::Own | Admit::Own6 => {}
+                Admit::Solicit => {
+                    /* Answered at the address it came from, or every node's
+                     * for none: the switch's advertisement, to it alone. */
+                    let asked: [u8; 16] = frame[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24].try_into().expect("16 bytes");
+                    let to = if asked == [0; 16] {
+                        [0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+                    } else {
+                        asked
+                    };
+                    self.advertised += 1;
+                    self.deliver(p, &router_advert(p, &to));
+                    return;
+                }
                 Admit::Dhcp => {
                     let net = dhcp::Network { server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK, dns: self.dns };
                     let mut reply = [0u8; dhcp::REPLY_MAX];
@@ -313,9 +569,15 @@ impl Model {
             }
         }
         let dst = &frame[..6];
+        /* IPv6 is the guests' alone: nos speaks none. */
+        let v6 = wire::be16(frame, 12) == 0x86DD;
         if dst[0] & 1 == 0 {
             if dst == HOST_MAC {
-                self.to_host(from, frame);
+                if !v6 {
+                    self.to_host(from, frame);
+                } else if from.is_some() {
+                    self.foreign += 1;
+                }
                 return;
             }
             if let Some(q) = port_of(dst) {
@@ -336,7 +598,9 @@ impl Model {
                 self.deliver(q, frame);
             }
         }
-        self.to_host(from, frame);
+        if !v6 {
+            self.to_host(from, frame);
+        }
     }
 }
 
@@ -363,9 +627,158 @@ fn guest_src_ip(r: &mut Input, p: usize) -> u32 {
     }
 }
 
-/// A frame a guest -- or the host -- might send: IPv4 or ARP, as the guest
-/// or as another, now and then another protocol; to a port, to `hv0`, to
-/// everyone, to nobody in particular; a DHCP request; of any length.
+/// An IPv6 address a guest on port `p` might send from or name: its own
+/// mostly, link-local or in the switch's prefix -- or another port's, one
+/// of a few more in the prefix than a port may have bound, none, a
+/// multicast one, anyone's.
+fn addr6(r: &mut Input, p: usize) -> [u8; 16] {
+    let q = if r.u8() < 208 { p } else { r.below(MAX_PORTS as u64) as usize };
+    match r.u8() % 16 {
+        0..=5 => eui64(&LINK_LOCAL, q),
+        6..=9 => eui64(&PREFIX6, q),
+        10..=12 => {
+            let mut a = [0u8; 16];
+            a[..8].copy_from_slice(&PREFIX6);
+            a[15] = 1 + r.below(12) as u8;
+            a
+        }
+        13 => [0; 16],
+        14 => [0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, r.pick(&[1u8, 2, 0x16])],
+        _ => core::array::from_fn(|_| r.u8()),
+    }
+}
+
+/// An IPv6 frame a guest on port `p` might send: neighbour discovery --
+/// solicitations of routers and of neighbours, advertisements, and a
+/// router's advertisement or redirect it has no business sending -- a
+/// multicast listener's report or query, an echo, UDP now and then from
+/// DHCPv6's server's port, TCP; behind extension headers, in fragments,
+/// past the chain the switch walks; its length in its header right mostly,
+/// past the frame or short of the message now and then, the frame running
+/// on past it; from its MAC and addresses, and with its MAC in its options,
+/// mostly.
+fn frame6(r: &mut Input, p: usize) -> Vec<u8> {
+    let src_mac = guest_src_mac(r, p);
+    let dst_mac: [u8; 6] = match r.u8() % 6 {
+        0 | 1 => [0x33, 0x33, 0, 0, 0, r.pick(&[1u8, 2, 0x16])],
+        2 => [0x33, 0x33, 0xFF, 0, 0x64, (SWITCH_PORT_BASE + r.below(MAX_PORTS as u64) as usize) as u8],
+        3 => HOST_MAC,
+        4 => MAC_BROADCAST,
+        _ => switch::port_mac(r.below(MAX_PORTS as u64) as usize),
+    };
+    let src = addr6(r, p);
+    let dst = addr6(r, p);
+    let lla = |r: &mut Input, kind: u8, m: &mut Vec<u8>| {
+        m.extend_from_slice(&[kind, 1]);
+        m.extend_from_slice(&guest_src_mac(r, p));
+    };
+    let (proto, mut l4): (u8, Vec<u8>) = match r.u8() % 12 {
+        0 | 1 => {
+            let mut m = vec![133, 0, 0, 0, 0, 0, 0, 0];
+            if r.bool() {
+                lla(r, 1, &mut m);
+            }
+            (58, m)
+        }
+        2 | 3 => {
+            let mut m = vec![135, 0, 0, 0, 0, 0, 0, 0];
+            m.extend_from_slice(&addr6(r, p));
+            if r.bool() {
+                lla(r, 1, &mut m);
+            }
+            (58, m)
+        }
+        4 | 5 => {
+            let mut m = vec![136, 0, 0, 0, r.pick(&[0x20u8, 0x60, 0xA0]), 0, 0, 0];
+            m.extend_from_slice(&addr6(r, p));
+            if r.bool() {
+                lla(r, 2, &mut m);
+            }
+            (58, m)
+        }
+        6 => {
+            let mut m = vec![r.pick(&[134u8, 137]), 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            m.extend_from_slice(&addr6(r, p));
+            m.extend_from_slice(&addr6(r, p));
+            (58, m)
+        }
+        7 => {
+            let mut m = vec![r.pick(&[143u8, 131, 130, 132]), 0, 0, 0, 0, 0, 0, 1];
+            m.extend_from_slice(&[0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0, 0x64, 2]);
+            (58, m)
+        }
+        8 => (58, noise(r.u32(), 8 + r.below(64) as usize).into_iter().enumerate()
+                  .map(|(i, b)| if i == 0 { r.pick(&[128u8, 129, 1, 3, 4]) } else { b }).collect()),
+        9 | 10 => {
+            let sport = r.pick(&[547u16, 546, 5353, 40000]);
+            let mut m = noise(r.u32(), 8 + r.below(64) as usize);
+            m[..2].copy_from_slice(&sport.to_be_bytes());
+            (17, m)
+        }
+        _ => (6, noise(r.u32(), 20 + r.below(64) as usize)),
+    };
+    /* An option made wrong now and then: of length 0, or running past the
+     * message. */
+    if proto == 58 && r.u8() < 16 {
+        l4.extend_from_slice(&[r.pick(&[1u8, 2, 3, 5]), r.pick(&[0u8, 2, 9])]);
+    }
+    let chain: Vec<u8> = match r.u8() % 16 {
+        0 => vec![0],
+        1 => vec![60],
+        2 => vec![44],
+        3 => vec![0, 44],
+        4 => vec![60; 9],
+        5 => vec![51],
+        6 => vec![43],
+        _ => vec![],
+    };
+    let later = r.u8() < 12;
+    let mut ext = Vec::new();
+    for (i, &h) in chain.iter().enumerate() {
+        let next = chain.get(i + 1).copied().unwrap_or(proto);
+        match h {
+            44 => ext.extend_from_slice(&[next, 0, 0, if later { 0x81 } else { 1 }, 0, 0, 0, 7]),
+            51 => ext.extend_from_slice(&[next, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            _ => ext.extend_from_slice(&[next, 0, 1, 4, 0, 0, 0, 0]),
+        }
+    }
+    let first = chain.first().copied().unwrap_or(proto);
+    let payload = ext.len() + l4.len();
+    let said = match r.u8() % 16 {
+        0 => payload + 1 + r.below(64) as usize,
+        1 => r.below(payload as u64 + 1) as usize,
+        _ => payload,
+    };
+    let mut f = dst_mac.to_vec();
+    f.extend_from_slice(&src_mac);
+    f.extend_from_slice(&[0x86, 0xDD, if r.u8() < 248 { 0x60 } else { 0x40 }, 0, 0, 0]);
+    f.extend_from_slice(&(said.min(0xFFFF) as u16).to_be_bytes());
+    f.extend_from_slice(&[first, 255]);
+    f.extend_from_slice(&src);
+    f.extend_from_slice(&dst);
+    f.extend_from_slice(&ext);
+    f.extend_from_slice(&l4);
+    if r.u8() < 16 {
+        f.extend_from_slice(&noise(r.u32(), 1 + r.below(32) as usize));
+    }
+    f
+}
+
+/// An echo request over IPv6 from port `p`'s guest, from `src`, to port
+/// `q`'s.
+fn echo6(p: usize, src: &[u8; 16], q: usize) -> Vec<u8> {
+    let mut f = switch::port_mac(q).to_vec();
+    f.extend_from_slice(&switch::port_mac(p));
+    f.extend_from_slice(&[0x86, 0xDD, 0x60, 0, 0, 0, 0, 16, 58, 64]);
+    f.extend_from_slice(src);
+    f.extend_from_slice(&eui64(&LINK_LOCAL, q));
+    f.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    f
+}
+
+/// A frame a guest -- or the host -- might send: IPv4, ARP or IPv6, as the
+/// guest or as another, now and then another protocol; to a port, to `hv0`,
+/// to everyone, to nobody in particular; a DHCP request; of any length.
 fn frame(r: &mut Input, from: Option<usize>) -> Vec<u8> {
     let src = match from {
         Some(p) => guest_src_mac(r, p),
@@ -374,6 +787,11 @@ fn frame(r: &mut Input, from: Option<usize>) -> Vec<u8> {
     if r.u8() < 24 {
         if let Some(p) = from {
             return dhcp_request(r, p);
+        }
+    }
+    if r.u8() < 40 {
+        if let Some(p) = from {
+            return frame6(r, p);
         }
     }
     let dst: [u8; 6] = match r.u8() % 10 {
@@ -468,7 +886,7 @@ pub fn switch_target(r: &mut Input) {
      * one more than there are ports. */
     let most = if r.u8() < 24 { MAX_PORTS + 1 } else { 1 + r.below(4) as usize };
 
-    while let Some(op) = r.op(15) {
+    while let Some(op) = r.op(16) {
         match op {
             0 | 10 => {
                 /* A VM on the switch, the first free port -- or, now and
@@ -515,6 +933,7 @@ pub fn switch_target(r: &mut Input) {
                 sw.release(p);
                 m.owned[p] = false;
                 m.inbox[p].clear();
+                m.bound.retain(|_, b| b.0 != p);
                 if let Some(vm) = vms[p].take() {
                     invariant!(vm.woken.load(std::sync::atomic::Ordering::Relaxed) == m.woken[p],
                                "port {}'s VM woken {} times for {} frames", p,
@@ -646,14 +1065,29 @@ pub fn switch_target(r: &mut Input) {
                     let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
                     let proto = r.pick(&[6u8, 17]);
                     let payload = r.below(1400) as usize;
-                    let mut f = crate::offloadmodel::build(r, proto, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+                    let offset = if proto == 17 { 6 } else { 16 };
+                    /* Over IPv4, or now and then over IPv6 -- from its own
+                     * address or another's, now and then made to sum to 0,
+                     * which UDP's goes as all ones. */
+                    let (mut f, start) = if r.u8() < 64 {
+                        let (mut f, l4) = crate::offloadmodel::build6(r, proto, &[], payload);
+                        let from = if r.u8() < 16 { eui64(&LINK_LOCAL, q) } else { eui64(&LINK_LOCAL, p) };
+                        f[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24].copy_from_slice(&from);
+                        f[ETH_HDR_LEN + 24..ETH_HDR_LEN + 40].copy_from_slice(&eui64(&PREFIX6, q));
+                        (f, l4)
+                    } else {
+                        let mut f = crate::offloadmodel::build(r, proto, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+                        f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
+                        f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
+                        (f, 34)
+                    };
                     f[..6].copy_from_slice(&dst_mac);
                     f[6..12].copy_from_slice(&switch::port_mac(p));
-                    f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
-                    f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
-                    let offset = if proto == 17 { 6 } else { 16 };
-                    if let Ok(partial) = offload::Partial::check(f.len(), 34, offset as u16) {
-                        m.send_partial(p, &f, 34, offset);
+                    if r.u8() < 32 {
+                        crate::offloadmodel::sum_to_zero(&mut f, start, start + offset);
+                    }
+                    if let Ok(partial) = offload::Partial::check(f.len(), start as u16, offset as u16) {
+                        m.send_partial(p, &f, start, offset);
                         if let Some(b) = backends[p].as_mut() {
                             b.send_partial(&mut f.clone(), partial);
                         }
@@ -677,6 +1111,27 @@ pub fn switch_target(r: &mut Input) {
                 let param = switch::ip_param(p, sw.dns());
                 invariant!(param.starts_with("ip=10.0.100."), "a port's ip= of {}", param);
                 let _ = (switch::nat_why(crate::net::NatError::Busy), sw.host_nic().map(|n| n.ip()));
+            }
+            15 => {
+                /* A guest with many addresses, as privacy extensions give
+                 * one: an echo from each of up to a dozen of the prefix's,
+                 * past what a port may have bound -- its oldest let go --
+                 * some of them now and then another port's. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if backends[p].is_some() {
+                    let (n, base, q) = (1 + r.below(12) as usize, r.u8() & 3, r.below(MAX_PORTS as u64) as usize);
+                    for i in 0..n {
+                        let mut a = [0u8; 16];
+                        a[..8].copy_from_slice(&PREFIX6);
+                        a[14] = base;
+                        a[15] = i as u8;
+                        let f = echo6(p, &a, q);
+                        m.forward(Some(p), &f);
+                        if let Some(b) = backends[p].as_mut() {
+                            b.send(&f);
+                        }
+                    }
+                }
             }
             9 => {
                 /* Time going by: a port's rate to every port earned back. */
@@ -706,6 +1161,9 @@ pub fn switch_target(r: &mut Input) {
         let counts = sw.host_counts();
         let want_counts = (m.to_host, m.refused, m.dhcp, m.foreign);
         invariant!(counts == want_counts, "host counts {:?}, the model {:?}", counts, want_counts);
+        let six = sw.ipv6_counts();
+        invariant!(six == (m.advertised, m.bound.len()), "{} router advertisements and {} addresses bound, the \
+                   model {} and {}", six.0, six.1, m.advertised, m.bound.len());
         let stack = network::take_stack();
         let hv0_in = network::take_hv0_in();
         /* A pass of the stack's over hv0's backlog: every port's share
@@ -1266,6 +1724,11 @@ pub static TAKEN_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  switch: {} sends of TCP carried whole, {} cut", WHOLE_SENDS.load(Relaxed), CUT_SENDS.load(Relaxed));
+    let six: Vec<u64> = ADMIT6.iter().map(|n| n.load(Relaxed)).collect();
+    println!("  switch: IPv6 frames {} carried, {} solicitations answered, {} spoofed, {} hiding what they carry \
+              or of no protocol; {} addresses bound in the place of a port's oldest", six[Admit::Own6 as usize],
+             six[Admit::Solicit as usize], six[Admit::Spoofed as usize], six[Admit::Foreign as usize],
+             EVICTED6.load(Relaxed));
     if OUT_CHECKED.load(Relaxed) + BACK_CHECKED.load(Relaxed) != 0 {
         println!("  nat: {} packets checked out, {} back ({} of them answers a live flow had to let in); {} answers \
                   tried; {} inputs with no NAT", OUT_CHECKED.load(Relaxed), BACK_CHECKED.load(Relaxed),
@@ -1822,6 +2285,12 @@ fn as_guest(q: usize, f: &[u8]) -> bool {
         ETH_TYPE_ARP if f.len() >= ETH_HDR_LEN + ARP_LEN => {
             let a = &f[ETH_HDR_LEN..];
             arp::sender_mac(a) == mac && (arp::sender_ip(a) == 0 || arp::sender_ip(a) == me)
+        }
+        /* IPv6 from none of another port's addresses: which of the rest
+         * are whose, the switch target's model says. */
+        0x86DD if f.len() >= ETH_HDR_LEN + 40 => {
+            let src = &f[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24];
+            !(0..MAX_PORTS).any(|o| o != q && (src == eui64(&LINK_LOCAL, o) || src == eui64(&PREFIX6, o)))
         }
         _ => false,
     }
