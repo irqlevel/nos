@@ -234,11 +234,6 @@ impl Queue {
         self.used_at() + 4 + USED_ELEM_SIZE * usize::from(self.size)
     }
 
-    /// Whether the driver took EVENT_IDX for this queue.
-    pub fn event_idx(&self) -> bool {
-        self.event_idx
-    }
-
     fn rings<'a>(&'a self, mem: &'a GuestMemory) -> Rings<'a> {
         Rings { mapped: self.mapped.as_ref(), mem, base: self.base() }
     }

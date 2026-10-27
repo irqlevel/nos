@@ -231,7 +231,10 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
             let _ = writeln!(out, "hv: net is hv start's");
             return;
         }
-        Ok(spec) if spec.secs.map_or(true, |s| (1..=MAX_SECS).contains(&s)) => spec,
+        Ok(mut spec) if spec.secs.map_or(true, |s| (1..=MAX_SECS).contains(&s)) => {
+            spec.name = String::from("boot");
+            spec
+        }
         Ok(_) => {
             let _ = writeln!(out, "hv: secs= must be 1..{}", MAX_SECS);
             return;

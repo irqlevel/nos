@@ -2401,7 +2401,9 @@ $ hv stop web
 `hv create <name> <words>` writes the file from the words `hv start` takes
 -- their paths the folder's unless they begin with `/` -- checked as a start
 would check them, and never over a `vm.toml` that is there; it says which of
-the files it names are not there yet. `hv start /some/where/web` boots a
+the files it names are not there yet. It gives the VM a UUID too
+(`uuid = "..."`), what its SMBIOS tells its OS the machine is
+([SMBIOS](#what-the-machine-is-smbios)). `hv start /some/where/web` boots a
 folder anywhere by its path, the folder's name the VM's. `hv vms` lists the
 folders under `/vms`, what each boots, and which run.
 
@@ -2762,6 +2764,45 @@ button and does nothing, stopped when its time is up. The tables themselves
 were checked with `iasl` as they were written. `scripts/hv-distro-test.py`
 boots Alpine and Debian on their ACPI, and has `hv stop` shut Debian down --
 or, with `--acpi-off`, boots them as before.
+
+### What the machine is: SMBIOS
+
+The other tables a PC's firmware leaves say what the machine is rather than
+how to drive it (DMTF's SMBIOS, `hv::smbios`): who made it, what product it
+is, its serial number and its UUID. Linux reads them into
+`/sys/class/dmi/id`, and what reads that knows the machine by it --
+systemd, cloud-init, `dmidecode`, software licensed to a machine -- the UUID
+above all, which is to stay the same from boot to boot.
+
+```
+[    0.000000] SMBIOS 3.2.0 present.
+[    0.000000] DMI: nos nos hv, BIOS dev (unknown) 10/27/2026
+```
+
+(The gate's guest, under nos built in a container with no git: its version
+is nos's, `dev` and the commit, which such a build does not know.)
+
+- **The tables** are SMBIOS 3's, the 64-bit entry point at 0xF0000 -- where
+  a kernel with no EFI scans for one, in the BIOS area the e820 map
+  reserves, after the ACPI tables -- and after it the BIOS (type 0, which
+  says the machine is a virtual one), the system (1: maker `nos`, product
+  `nos hv`, nos's version, the VM's name for its serial, and its UUID), its
+  chassis (3), the boot (32) and the end (127). Every string is the
+  operator's to have made -- a VM's name -- so each is cut to 64 bytes of
+  printable ASCII, anything else a `?`.
+- **The UUID is the VM's.** A VM's folder keeps it in its `vm.toml`
+  (`uuid = "..."`), which `hv create` writes; a VM whose file was written
+  before VMs had one is given one at its first start, added to the end of
+  the file -- the lines the operator wrote left as they were -- and the same
+  at every start after. One started from its kernel's path takes `uuid=`,
+  or a random one, kept across its restarts; its serial is its number.
+
+The gate is `scripts/hv-linux-test.py --smbios` with a kernel built with
+`DMI` and `DMIID`: what `/sys/class/dmi/id` says, a VM whose `vm.toml` had
+no UUID given one and written into the file, the same UUID at its next
+start, and a VM started with `uuid=` told it. The hv fuzzer's `smbios`
+target builds the tables from random names, versions and UUIDs and reads
+them back as Linux's `dmi_scan` does.
 
 ## A distribution
 

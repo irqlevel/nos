@@ -1051,6 +1051,25 @@ impl Vms {
         };
         core_hold.held_by(Holder::Vm(id));
 
+        /* What its SMBIOS calls it, and the UUID it gives it: its vm.toml's
+         * -- or, a VM from a folder at its first start since VMs had them,
+         * one made now and written into the file, every start after saying
+         * the same. One with no folder has a new one at each start; its
+         * restarts keep it. */
+        spec.name = match name {
+            Some(n) => String::from(n),
+            None => alloc::format!("vm{}", id),
+        };
+        if spec.uuid.is_none() {
+            let uuid = guest::random_uuid();
+            if let Some((folder, _)) = &stored {
+                if let Err(e) = store::add_uuid(folder, &uuid) {
+                    let _ = writeln!(out, "hv: its UUID is not kept -- {}: a new one at its next start", e);
+                }
+            }
+            spec.uuid = Some(uuid);
+        }
+
         let logged = stored.as_ref().is_some_and(|(_, log)| *log);
         let shared = match Shared::new(id, spec.log, &spec.input, spec.cpus, logged) {
             Some(shared) => Arc::new(shared),

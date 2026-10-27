@@ -77,6 +77,13 @@ fn made_up(r: &mut Input) -> Config {
         let (host, guest) = (r.u16().max(1), r.u16().max(1));
         o.forwards.push((host, guest));
     }
+    if r.bool() {
+        let mut u = [0u8; 16];
+        for b in u.iter_mut() {
+            *b = r.u8();
+        }
+        o.uuid = Some(u);
+    }
     Config { options: o, console_log: r.bool() }
 }
 
