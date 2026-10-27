@@ -29,6 +29,7 @@ pub static ALL: &[Target] = &[
     Target { name: "pit", run: pit, max_len: 2048 },
     Target { name: "rtc", run: rtc, max_len: 1024 },
     Target { name: "pm", run: pm, max_len: 2048 },
+    Target { name: "pvpanic", run: pvpanic_target, max_len: 512 },
     Target { name: "pci", run: pci_bus, max_len: 2048 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
@@ -37,11 +38,13 @@ pub static ALL: &[Target] = &[
     Target { name: "net", run: net_target, max_len: 8192 },
     Target { name: "offload", run: crate::offloadmodel::offload_target, max_len: 4096 },
     Target { name: "netrx", run: crate::netrx::netrx_target, max_len: 2048 },
+    Target { name: "virtq", run: crate::virtq::virtq_target, max_len: 4096 },
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
     Target { name: "pvh", run: pvh, max_len: 4096 },
     Target { name: "acpi", run: acpi, max_len: 512 },
+    Target { name: "smbios", run: crate::smbiosmodel::smbios_target, max_len: 512 },
     Target { name: "dhcp", run: dhcp, max_len: 1024 },
     Target { name: "switch", run: crate::guestnet::switch_target, max_len: 8192 },
     Target { name: "nat", run: crate::guestnet::nat_target, max_len: 8192 },
@@ -316,6 +319,35 @@ fn pm(r: &mut Input) {
                 p.press_power_button();
             }
         }
+    }
+}
+
+/// The panic device, held to what its port promises: a read says the events
+/// it takes, PANICKED and CRASH_LOADED; a write with PANICKED is the panic,
+/// whatever else it says; one with CRASH_LOADED alone is counted and let
+/// go; anything else is nothing.
+fn pvpanic_target(r: &mut Input) {
+    use crate::devices::pvpanic::{Event, PvPanic, CRASH_LOADED, PANICKED, PORT};
+    let mut dev = PvPanic::default();
+    let mut crash = 0u32;
+    invariant!(PvPanic::owns(PORT) && !PvPanic::owns(PORT + 1) && !PvPanic::owns(PORT - 1), "the port it owns");
+    while let Some(op) = r.op(2) {
+        if op == 0 {
+            invariant!(dev.read() == PANICKED | CRASH_LOADED, "a read of {:#x}", dev.read());
+            continue;
+        }
+        let v = r.u8();
+        let want = if v & PANICKED != 0 {
+            Some(Event::Panicked)
+        } else if v & CRASH_LOADED != 0 {
+            crash += 1;
+            Some(Event::CrashLoaded)
+        } else {
+            None
+        };
+        let got = dev.write(v);
+        invariant!(got == want, "{:#x} written, {:?} made of it, {:?} the model", v, got, want);
+        invariant!(dev.crash_loaded == crash, "{} crash kernels counted, {} the model", dev.crash_loaded, crash);
     }
 }
 
@@ -830,6 +862,11 @@ impl DiskState {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// Requests handed over and not yet taken back.
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
 }
 
 pub struct Disk(pub Arc<Mutex<DiskState>>);
@@ -1026,7 +1063,7 @@ fn blk_target(r: &mut Input) {
             }
         }
     }
-    mem.held_to_map_budget(since);
+    mem.held_to_map_budget(since, 1);
 }
 
 /// The guests' switch as a NIC's backend sees it: frames sent checked, and
@@ -1101,9 +1138,11 @@ fn net_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let since = time::boot_time_ns();
     let state = Arc::new(Mutex::new(NicState::default()));
-    let mut nic = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 2]).expect("a NIC");
+    /* One queue pair, or several and a control queue after them. */
+    let pairs = r.pick(&[1u16, 1, 2, 4, net::MAX_PAIRS]);
+    let mut nic = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 2], pairs).expect("a NIC");
     if r.bool() {
-        nic.offer_msix(3);
+        nic.offer_msix(net::vectors(pairs));
     }
     /* Receive interrupts moderated, on most inputs: what is owed comes by
      * the time the device said it would look again (`rx_due`). */
@@ -1120,9 +1159,13 @@ fn net_target(r: &mut Input) {
     if r.u8() < 48 {
         mem.refuse_maps(true);
     }
-    let mut queues = [DriverQueue::default(); 2];
-    while let Some(op) = r.op(14) {
-        let which = r.below(2) as usize;
+    let count = 2 * usize::from(pairs) + usize::from(pairs > 1);
+    let mut queues = vec![DriverQueue::default(); count];
+    while let Some(op) = r.op(16) {
+        let which = r.below(count as u64) as usize;
+        /* A pair's receive queue and its transmit queue. */
+        let rx = 2 * r.below(u64::from(pairs)) as usize;
+        let tx = 2 * r.below(u64::from(pairs)) as usize + 1;
         match op {
             0 => {
                 nic.io_read(r.below(u64::from(net::BAR_SIZE)) as u16, r.io_size());
@@ -1158,7 +1201,7 @@ fn net_target(r: &mut Input) {
                     let len = if r.bool() { 1526 } else { r.value32() };
                     segs.push((gpa(r), len, true));
                 }
-                chain(&mem, &mut queues[0], r, &segs);
+                chain(&mem, &mut queues[rx], r, &segs);
             }
             7 => {
                 /* A frame to send: the header, then the frame, in pieces. */
@@ -1167,7 +1210,7 @@ fn net_target(r: &mut Input) {
                     let len = if r.bool() { r.below(1600) as u32 } else { r.value32() };
                     segs.push((gpa(r), len, false));
                 }
-                chain(&mem, &mut queues[1], r, &segs);
+                chain(&mem, &mut queues[tx], r, &segs);
             }
             8 | 9 => {
                 let now = time::boot_time_ns();
@@ -1187,17 +1230,41 @@ fn net_target(r: &mut Input) {
                 nic.set_msix_enabled(r.bool());
                 nic.line();
                 nic.broken();
+                nic.queue_pairs();
+            }
+            14 => {
+                /* What the driver takes: everything offered, mostly --
+                 * multiqueue and its control queue among it. */
+                let features = if r.u8() < 200 { u32::MAX } else { r.value32() };
+                nic.io_write(GUEST_FEATURES, 4, features, &mem, time::boot_time_ns());
+            }
+            15 => {
+                /* A command on the control queue -- the last, where a driver
+                 * that took multiqueue has it, or 2, where one that did not
+                 * -- mostly how many pairs to use, then its notify. */
+                let at = if r.bool() { count - 1 } else { 2.min(count - 1) };
+                let (header, data, ack) = (gpa(r) & !1, gpa(r) & !1, gpa(r));
+                let class_cmd = if r.u8() < 200 { [4u8, 0] } else { [r.u8(), r.u8()] };
+                let _ = mem.write(header, &class_cmd);
+                let n = if r.u8() < 200 { r.below(u64::from(pairs) + 2) as u16 } else { r.u16() };
+                let _ = mem.write(data, &n.to_le_bytes());
+                let segs = [(header, if r.u8() < 230 { 2 } else { r.value32() }, false),
+                            (data, if r.u8() < 230 { 2 } else { r.value32() }, false),
+                            (ack, if r.u8() < 230 { 1 } else { r.value32() }, true)];
+                let n = 1 + r.below(3) as usize;
+                chain(&mem, &mut queues[at], r, &segs[..n]);
+                nic.io_write(QUEUE_NOTIFY, 2, at as u32, &mem, time::boot_time_ns());
             }
             _ => {
                 /* Another CPU keeping a ring topped up while the device takes
-                 * from it: the transmit ring through a notify, or the receive
+                 * from it: a transmit ring through a notify, or a receive
                  * ring through a round of the devices with frames enough to
                  * fill it twice over. Either pass has to end itself. */
-                if which == 1 {
+                if which % 2 == 1 {
                     let segs = [(gpa(r), 10, false), (gpa(r), 60, false)];
-                    chain(&mem, &mut queues[1], r, &segs);
-                    racing(&mem, &mut queues[1], || {
-                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem, time::boot_time_ns());
+                    chain(&mem, &mut queues[tx], r, &segs);
+                    racing(&mem, &mut queues[tx], || {
+                        nic.io_write(QUEUE_NOTIFY, 2, tx as u32, &mem, time::boot_time_ns());
                     });
                 } else {
                     {
@@ -1207,15 +1274,15 @@ fn net_target(r: &mut Input) {
                         }
                     }
                     let segs = [(gpa(r), 1526, true)];
-                    chain(&mem, &mut queues[0], r, &segs);
-                    racing(&mem, &mut queues[0], || {
+                    chain(&mem, &mut queues[rx], r, &segs);
+                    racing(&mem, &mut queues[rx], || {
                         nic.poll(&mem, time::boot_time_ns());
                     });
                 }
             }
         }
     }
-    mem.held_to_map_budget(since);
+    mem.held_to_map_budget(since, count);
 }
 
 /* ---- the MMIO path: the page walk and the decoder ---- */

@@ -1638,6 +1638,41 @@ streams across its readable and writable buffers, whatever the layout; its
 sector range is checked against the disk's size, and its size against what
 the driver was told a request may carry.
 
+**Each side asks for the other's notifications only when it wants them**
+(EVENT_IDX, `virtio::F_EVENT_IDX`, which the disks and the NICs offer).
+Without it every chain the driver makes available is a notify -- an exit --
+and every chain given back an interrupt, unless the driver's one flag says
+it wants none at all. With it each side says, in a word past its own ring,
+at which entry it wants to hear of the other's work: the driver at which
+used entry it wants an interrupt (`used_event`), the device at which
+available entry it wants a notify (`avail_event`). The device asks only
+when it stops for want of chains: a disk once it has taken every request
+there was -- with every one of its eight buffers out it asks for none, a
+request coming back has it look -- a NIC's transmit queue once it has sent
+every frame, its receive queue only when a frame waits for buffers, so the
+guest's refills of its receive ring cost no exit at all, the next frame
+taking what they posted. An ask is the index the device has seen, written;
+a full fence; and the index read again (`Queue::ask_kick`): a chain made
+available between the device's last look and its ask, by a driver on
+another CPU that saw no ask yet, has no notify coming for it and is taken
+then. A pass that ends at its bound (`more`) is the first CPU's round to go
+on with at once -- that CPU rung, if the pass ran on another's -- since a
+driver that notifies only when asked gives the device no other reason to
+come back. The interrupt is the driver's to place: the device raises one
+when the used index has passed the driver's word since it last decided
+(`wants_interrupt`), and Linux puts its word three quarters of the way
+through what it has out for its transmit queue, and leaves it behind while
+NAPI polls. Each device's notifies and interrupts are in the report (`hv
+stop`). Under TCG, Linux 6.18 through `hv-linux-test.py --net` -- the same
+build with EVENT_IDX not offered as the control -- refilled its receive ring
+with 1 notify where it had 35, and took 128 receive interrupts where it had
+216 (107 where 161, with two CPUs); its sends were a notify a frame either
+way, each finding the ring drained. Its disk (`--disk`) made 373 notifies
+where 398, and 367 where 408 -- that workload seldom has more than eight
+requests out, which is where the disk's are spared. The hv fuzzer's `virtq`
+target holds both sides to a Linux driver's every request served
+([Testing](testing.md)).
+
 **The disk works beside the guest.** A request used to be served before the
 notify that made it available returned, the vCPU waiting for its disk -- and
 on the AX41 a guest writing back what `apt-get update` had fetched stalled
@@ -1788,17 +1823,56 @@ architectures, and holds the disk to its SHA-256 ([Testing](testing.md)).
 `net`, on `hv start`, gives the guest a NIC on the guests' switch, and with
 it an address: 10.0.100.2 for the first port, .3 for the next, handed to its
 kernel on the command line (`ip=`). nos is 10.0.100.1 on the same subnet, so
-the guests reach it and each other, and it reaches them -- `ping 10.0.100.2`
-from nos's shell goes out of the device whose subnet the address is on:
+the guests reach it, and it reaches them -- `ping 10.0.100.2` from nos's
+shell goes out of the device whose subnet the address is on -- and guests
+on one network (`network=`) reach each other:
 
 ```
-$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
-$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
 $ hv exec 0 ping -c 3 10.0.100.1        # nos
-$ hv exec 0 ping -c 3 10.0.100.3        # the other guest
+$ hv exec 0 ping -c 3 10.0.100.3        # the other guest, on lab too
 $ ping 10.0.100.2                       # from nos
 $ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
 ```
+
+**A guest is alone on the switch unless its network says otherwise.** A
+port is on a network -- `network=<name>` on `hv start`, `network = "..."`
+in a VM's vm.toml -- or alone, and a guest reaches the other guests of its
+network as on one LAN and no other guest at all: one alone, as every VM is
+that names no network, reaches nos and, through NAT, the world, and that is
+all. A frame for another network's guest goes nowhere, counted against the
+guest that sent it in `hv list` (`N frames for another network's guests,
+dropped`); one for every port goes to its own network's and `hv0`; and
+IPv6's first-come bindings are each network's own. Nothing goes from one
+guest to another through nos either: NAT takes nothing for the guests' own
+subnet, and the stack forwards nothing. `hv list` says each port's network
+or `alone`, and so does `hv vms` of a folder's. A guest on a cloud's
+machines is in the same place -- its tenant's network, and nobody else's.
+
+The gate is `scripts/hv-linux-test.py --net`, whose two guests are on one
+network and ping each other, and whose VM from a folder, alone, pings nos
+and gets nothing from the other network's guest -- not by ARP, whose
+question that guest never hears, and not by a frame sent to its MAC, which
+the switch drops and counts. The hv fuzzer's `switch` target puts the ports
+on two networks and alone, and holds every delivery and every count to its
+model; eight mutants -- a frame to another network's guest let through, a
+broadcast to every port, a send whole or a checksum left to finish taken to
+another network, IPv6's bindings one table for all, every port alone, a
+port's network kept past its release, nothing counted -- each fail it.
+
+A port changes hands with frames for it on their way -- one VM gone,
+another taking its port -- and so what the switch looks at without a lock
+it asks again under the port's inbox lock, where the owner, its network
+and what its NIC takes change together: a frame meant for the VM going
+reaches the VM coming only if that one is of the sender's network, and a
+send whole or a checksum left to finish reaches only a NIC that says, by
+then, it takes it so. The `switch` target makes that moment: a hook in its
+spin locks hands a port over just before one of the locks a send takes,
+and every guest is held to what some order of the hand-over, the new NIC's
+word and the send gives -- the frame lost, at most, to the VM going or
+coming. Seven mutants of the checks under the lock each fail it; four of
+them nothing but that moment shows.
 
 **The guest's NIC is virtio-net, legacy, on the same transport as its
 disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
@@ -1807,6 +1881,30 @@ either way -- ten bytes, twelve once the driver takes mergeable buffers. A
 send is cut, or handed on whole, before the notify returns; what waits for
 the guest is put into the buffers it has posted each time round the run
 loop, one frame held by the device while it has posted too few.
+
+**A queue pair for each of the guest's CPUs** (`VIRTIO_NET_F_MQ`, with its
+control queue, `F_CTRL_VQ`): a guest of more than one CPU -- which has
+MSI-X -- is offered as many pairs as it has CPUs, up to eight, and a
+control queue after them, through which its driver says how many it uses;
+the device uses the first alone until it does, and refuses a count past
+those offered. Each queue has its vector, which Linux gives each CPU its own
+of: what a CPU sends it is told of on that CPU, and what comes for it is
+taken there, its NAPI poll on that CPU's softirq, where one ring and one
+interrupt had every CPU's traffic go through one. A frame for the guest
+goes to the pair the guest last sent its flow from -- virtio's automatic
+receive steering, a table of 256 slots by a hash of the flow's two ends,
+learned as it sends -- and a flow it has not sent to the pair its hash
+picks. The one frame the device holds for want of buffers is the device's
+and not a pair's: held for a ring that is empty, it holds up the frames
+behind it for the others until that ring's refill, which the device asked
+a notify for; and when the driver changes how many pairs it uses, the
+device delivers at once, steered anew -- a frame held for a pair the driver
+had just stopped using waited on a notify that would never come, and every
+frame behind it with it, which the hv fuzzer's `virtq` target found at its
+1,825th input. The report says how many pairs the driver uses (`hv stop`).
+Under TCG, Linux 6.18 on two CPUs through `hv-linux-test.py --net --cpus 2`
+took both pairs, and its receive interrupts each on its own CPU: 41 of the
+first pair's on its first CPU, 72 of the second's on its second.
 
 **Offloads, both ways.** The device completes a checksum the driver leaves
 to it (`VIRTIO_NET_F_CSUM`) -- a UDP datagram's that comes to 0 as all ones,
@@ -2342,7 +2440,11 @@ $ hv stop web
 `hv create <name> <words>` writes the file from the words `hv start` takes
 -- their paths the folder's unless they begin with `/` -- checked as a start
 would check them, and never over a `vm.toml` that is there; it says which of
-the files it names are not there yet. `hv start /some/where/web` boots a
+the files it names are not there yet. It gives the VM a UUID too
+(`uuid = "..."`), what its SMBIOS tells its OS the machine is
+([SMBIOS](#what-the-machine-is-smbios)); and `network=` on its words
+(`network = "..."`) puts it on a network of the switch's, with the VMs
+that name the same -- without, it is alone there ([A network](#a-network)). `hv start /some/where/web` boots a
 folder anywhere by its path, the folder's name the VM's. `hv vms` lists the
 folders under `/vms`, what each boots, and which run.
 
@@ -2703,6 +2805,68 @@ button and does nothing, stopped when its time is up. The tables themselves
 were checked with `iasl` as they were written. `scripts/hv-distro-test.py`
 boots Alpine and Debian on their ACPI, and has `hv stop` shut Debian down --
 or, with `--acpi-off`, boots them as before.
+
+### What the machine is: SMBIOS
+
+The other tables a PC's firmware leaves say what the machine is rather than
+how to drive it (DMTF's SMBIOS, `hv::smbios`): who made it, what product it
+is, its serial number and its UUID. Linux reads them into
+`/sys/class/dmi/id`, and what reads that knows the machine by it --
+systemd, cloud-init, `dmidecode`, software licensed to a machine -- the UUID
+above all, which is to stay the same from boot to boot.
+
+```
+[    0.000000] SMBIOS 3.2.0 present.
+[    0.000000] DMI: nos nos hv, BIOS dev (unknown) 10/27/2026
+```
+
+(The gate's guest, under nos built in a container with no git: its version
+is nos's, `dev` and the commit, which such a build does not know.)
+
+- **The tables** are SMBIOS 3's, the 64-bit entry point at 0xF0000 -- where
+  a kernel with no EFI scans for one, in the BIOS area the e820 map
+  reserves, after the ACPI tables -- and after it the BIOS (type 0, which
+  says the machine is a virtual one), the system (1: maker `nos`, product
+  `nos hv`, nos's version, the VM's name for its serial, and its UUID), its
+  chassis (3), the boot (32) and the end (127). Every string is the
+  operator's to have made -- a VM's name -- so each is cut to 64 bytes of
+  printable ASCII, anything else a `?`.
+- **The UUID is the VM's.** A VM's folder keeps it in its `vm.toml`
+  (`uuid = "..."`), which `hv create` writes; a VM whose file was written
+  before VMs had one is given one at its first start, added to the end of
+  the file -- the lines the operator wrote left as they were -- and the same
+  at every start after. One started from its kernel's path takes `uuid=`,
+  or a random one, kept across its restarts; its serial is its number.
+
+The gate is `scripts/hv-linux-test.py --smbios` with a kernel built with
+`DMI` and `DMIID`: what `/sys/class/dmi/id` says, a VM whose `vm.toml` had
+no UUID given one and written into the file, the same UUID at its next
+start, and a VM started with `uuid=` told it. The hv fuzzer's `smbios`
+target builds the tables from random names, versions and UUIDs and reads
+them back as Linux's `dmi_scan` does.
+
+### A guest that panics: pvpanic
+
+A kernel that panics comes to rest in `panic`: with `panic=N` it reboots N
+seconds later, and without, it spins there for good, a host CPU its own for
+nothing, and all a report could say of it is that it halted. QEMU's panic
+device lets it say so (`hv::devices::pvpanic`): one I/O port, 0x505, which
+the DSDT describes as `QEMU0001` -- what Linux's `pvpanic-mmio` binds to, as
+a distribution's kernel has it built -- and which the driver reads for the
+events the device takes, PANICKED and CRASH_LOADED, then writes as its
+panic notifier runs, the guest's other CPUs stopped already. PANICKED stops
+the VM where it is (`Stop::Panicked`), before its own `panic=` could reboot
+it: the report says the guest's kernel panicked, and a VM started with
+`restart` is booted again, as after a reset of its own, up to the same
+limit. CRASH_LOADED -- a crash kernel loaded, which the guest boots itself
+-- is counted, and the guest goes on.
+
+The gate is `scripts/hv-linux-test.py --pvpanic`, with a kernel built with
+ACPI and `PVPANIC_MMIO`: a guest with no init stopped by its panic, before
+`panic=1` reboots it; one with `restart` booted again at each until the loop
+is called one; a running guest's driver bound to `QEMU0001:00`, its init's
+exit a panic that stops it the same way; and its DSDT taken back out of the
+guest and through `iasl`, where the machine has it.
 
 ## A distribution
 
@@ -4589,9 +4753,12 @@ someone else's; then speed.
    wakeup is an IPI that nested under KVM is an exit. A disk with many
    requests in flight wants the block layer's asynchronous path from one
    task (`Disk::submit`), its command IDs budgeted, not more tasks.
-3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
-   work on legacy virtio; and a guest of one CPU has no local APIC, so no
-   MSI-X -- six exits an interrupt through the 8259.
+3. **Fewer exits a request.** EVENT_IDX done ([A disk](#a-disk)): the
+   receive ring's refills no longer notify, and a disk with every buffer
+   out takes no notify it cannot act on. Left: NO_NOTIFY, the flag's way of
+   the same for a driver without EVENT_IDX, which every Linux takes; and a
+   guest of one CPU has no local APIC, so no MSI-X -- six exits an
+   interrupt through the 8259.
 4. ~~**The EX44's E-cores first, with shared cores.**~~ Done: `hv::topology`
    asks each CPU of a hybrid part which kind of core it is (leaf 0x1A), and
    placement puts a guest's vCPUs on one kind where one has room for them
