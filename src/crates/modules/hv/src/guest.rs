@@ -796,11 +796,17 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
     }
-    for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole; \
-            notifies {} to send, {} to receive; interrupts {} for sends, {} for receives{}{}",
+    for (i, (s, (pairs, active), broken, copied)) in guest.nic_stats().into_iter().enumerate() {
+        let _ = write!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole; \
+            notifies {} to send, {} to receive; interrupts {} for sends, {} for receives",
             i, s.sent, s.received, s.dropped, s.large, s.whole, s.tx_notifies, s.rx_notifies, s.tx_interrupts,
-            s.rx_interrupts, if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+            s.rx_interrupts);
+        if pairs > 1 {
+            let _ = write!(out, "; {} of {} queue pairs in use, {} commands ({} refused)", active, pairs, s.commands,
+                s.refused);
+        }
+        let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
+            copied_note(copied));
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {

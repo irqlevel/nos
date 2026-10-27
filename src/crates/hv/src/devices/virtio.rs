@@ -517,24 +517,33 @@ pub enum Asked {
 /// at the price of an exit each. Past the budget a queue's rings are copied,
 /// as they were before rings were mapped, the guest's own device the slower
 /// for it. A driver sets its queues up once a boot; a reset takes none back.
+/// The burst is two boots' worth of a device's queues, eight at the least
+/// (`maps_burst`).
 struct Maps {
     left: u32,
+    burst: u32,
     at: u64,
 }
 
 const MAPS_BURST: u32 = 8;
 const MAPS_EVERY_NS: u64 = 1_000_000_000;
 
+/// The burst of mappings a device of `queues` queues has (`Maps`).
+pub fn maps_burst(queues: usize) -> u32 {
+    MAPS_BURST.max(2 * queues as u32)
+}
+
 impl Maps {
-    fn new() -> Maps {
-        Maps { left: MAPS_BURST, at: 0 }
+    fn new(queues: usize) -> Maps {
+        let burst = maps_burst(queues);
+        Maps { left: burst, burst, at: 0 }
     }
 
     /// Whether a queue set up at `now` may have its rings mapped.
     fn take(&mut self, now: u64) -> bool {
         let earned = now.saturating_sub(self.at) / MAPS_EVERY_NS;
         if earned != 0 {
-            self.left = earned.saturating_add(u64::from(self.left)).min(u64::from(MAPS_BURST)) as u32;
+            self.left = earned.saturating_add(u64::from(self.left)).min(u64::from(self.burst)) as u32;
             self.at = now;
         }
         if self.left == 0 {
@@ -561,7 +570,8 @@ impl Transport {
     /// A device offering `features`, with `queues` (the capacity already
     /// taken) of the sizes it wants.
     pub fn new(device_features: u32, queues: Vec<Queue>) -> Transport {
-        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None, maps: Maps::new() }
+        let maps = Maps::new(queues.len());
+        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None, maps }
     }
 
     /// The features offered, before a driver has read them: what the
@@ -627,6 +637,11 @@ impl Transport {
 
     pub fn queue(&mut self, index: u16) -> Option<&mut Queue> {
         self.queues.get_mut(usize::from(index))
+    }
+
+    /// Whether queue `index` is there and set up.
+    pub fn ready(&self, index: u16) -> bool {
+        self.queues.get(usize::from(index)).is_some_and(|q| q.ready())
     }
 
     fn selected(&self) -> Option<&Queue> {
