@@ -67,13 +67,19 @@ ulong IrqBalance::next_cpu_lock_held(bool io_apic)
 void IrqBalance::apply_lock_held(Entry& entry)
 {
     if (entry.kind == KIND_IO_APIC)
-    {
         IoApic::get_instance().set_irq_destination(entry.gsi, entry.cpu);
+    else
+        entry.table->retarget(entry.index, (u32)entry.cpu);
+}
+
+void IrqBalance::trace_entry(const Entry& entry)
+{
+    if (entry.kind == KIND_IO_APIC)
+    {
         trace(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.gsi, entry.cpu);
     }
     else
     {
-        entry.table->retarget(entry.index, (u32)entry.cpu);
         trace(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
             (ulong)entry.table, (ulong)entry.index, entry.cpu);
     }
@@ -81,17 +87,24 @@ void IrqBalance::apply_lock_held(Entry& entry)
 
 ulong IrqBalance::assign(Entry entry)
 {
-    stdlib::AutoLock lock(lock_);
+    bool recorded = false;
+    {
+        stdlib::AutoLock lock(lock_);
 
-    /* Before balance() all IRQs stay on the registering CPU (the BSP)
-       and get spread once SMP bringup completes; afterwards new IRQs
-       join the round-robin immediately. */
-    entry.cpu = balanced_ ? next_cpu_lock_held(entry.kind == KIND_IO_APIC)
-                         : CpuTable::get_instance().get_current_cpu_id();
+        /* Before balance() all IRQs stay on the registering CPU (the BSP)
+           and get spread once SMP bringup completes; afterwards new IRQs
+           join the round-robin immediately. */
+        entry.cpu = balanced_ ? next_cpu_lock_held(entry.kind == KIND_IO_APIC)
+                             : CpuTable::get_instance().get_current_cpu_id();
 
-    if (entry_count_ < MAX_ENTRIES)
-        entries_[entry_count_++] = entry;
-    else
+        if (entry_count_ < MAX_ENTRIES)
+        {
+            entries_[entry_count_++] = entry;
+            recorded = true;
+        }
+    }
+
+    if (!recorded)
         trace(0, "IrqBalance: entry table full, irq not balanced");
 
     return entry.cpu;
@@ -138,28 +151,40 @@ void IrqBalance::remove_msix(MsixTable* table)
 
 void IrqBalance::balance()
 {
-    stdlib::AutoLock lock(lock_);
-
-    if (balanced_)
-        return;
-    balanced_ = true;
-
-    /* Start the round-robin after the BSP so device IRQs prefer
-       the other CPUs (the BSP keeps the system IRQs) */
-    next_cpu_ = CpuTable::get_instance().get_bsp_index();
-    next_io_apic_cpu_ = next_cpu_;
-
-    for (ulong i = 0; i < entry_count_; i++)
+    /* What was done, said once the lock is down: the entries as they were
+       applied. A table's address is only printed, never followed, so one
+       removed meanwhile is no matter. */
+    Entry applied[MAX_ENTRIES];
+    ulong count = 0;
     {
-        entries_[i].cpu = next_cpu_lock_held(entries_[i].kind == KIND_IO_APIC);
-        apply_lock_held(entries_[i]);
+        stdlib::AutoLock lock(lock_);
+
+        if (balanced_)
+            return;
+        balanced_ = true;
+
+        /* Start the round-robin after the BSP so device IRQs prefer
+           the other CPUs (the BSP keeps the system IRQs) */
+        next_cpu_ = CpuTable::get_instance().get_bsp_index();
+        next_io_apic_cpu_ = next_cpu_;
+
+        for (ulong i = 0; i < entry_count_; i++)
+        {
+            entries_[i].cpu = next_cpu_lock_held(entries_[i].kind == KIND_IO_APIC);
+            apply_lock_held(entries_[i]);
+            applied[i] = entries_[i];
+        }
+        count = entry_count_;
     }
+
+    for (ulong i = 0; i < count; i++)
+        trace_entry(applied[i]);
 
     ulong cpu_mask = CpuTable::get_instance().get_running_cpus();
     ulong io_apic_mask = cpu_mask & IO_APIC_TARGET_MASK;
 
     trace(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
-        entry_count_, cpu_mask, io_apic_mask);
+        count, cpu_mask, io_apic_mask);
 }
 
 }
