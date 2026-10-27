@@ -737,6 +737,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",
             total.vid, total.eoi_exits);
     }
+    if total.pv_eoi != 0 {
+        let _ = writeln!(out, "  pv eoi     {} EOIs the guest made through its word (KVM's PV EOI), no exit of their own",
+            total.pv_eoi);
+    }
     if total.mmio_done != 0 {
         let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's",
             total.mmio_done);

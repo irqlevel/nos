@@ -10,8 +10,9 @@
 //! nowhere while it believes it went in. So a guest sees a CPU cut down to
 //! what is emulated here: XSAVE's state no further than AVX's (what the
 //! switch around `vmrun` and `vmlaunch` moves, `hvarch::x86::fp`), so no
-//! AVX-512, AMX or PKU; no paravirtualisation, no virtualization extension
-//! of its own, no speculation control it would write into nothing -- and a
+//! AVX-512, AMX or PKU; of paravirtualisation, KVM's interface as far as it
+//! is backed here (`hypervisor_leaf`); no virtualization extension of its
+//! own, no speculation control it would write into nothing -- and a
 //! local APIC only in a guest of more than one CPU, where it is an x2APIC
 //! (`lapic`) with its TSC-deadline timer. What is left is enough to
 //! decompress and start a 64-bit kernel, and its other CPUs, and to run
@@ -70,6 +71,8 @@ const LEAF_XSAVE: u32 = 0xD;
 const LEAF_TSC: u32 = 0x15;
 const LEAF_FREQUENCY: u32 = 0x16;
 const LEAF_BASIC_TOP: u32 = LEAF_FREQUENCY;
+const LEAF_HYPERVISOR: u32 = 0x4000_0000;
+const LEAF_KVM_FEATURES: u32 = 0x4000_0001;
 const LEAF_EXT: u32 = 0x8000_0000;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -136,8 +139,9 @@ const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 /// knows it leaves alone what is the host's business -- Linux loads no
 /// microcode (PATCH_LOADER, UCODE_WRITE), sets no chicken bits in AMD's
 /// configuration MSRs, and does not take the revision of 0 it reads for
-/// old microcode and taint itself. The hypervisor range is blank, so it
-/// finds no hypervisor it knows by name, and runs as on bare metal
+/// old microcode and taint itself. The hypervisor range names KVM
+/// (`hypervisor_leaf`), whose paravirtual interface a Linux built with
+/// KVM_GUEST then takes as far as it is offered, and runs as on bare metal
 /// otherwise.
 const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
 /// Leaf 6 EAX bit 2, ARAT: the APIC timer runs in every C-state. It does --
@@ -475,6 +479,26 @@ impl Asker {
     pub const RESET: Asker = Asker { apic_id: 0, apic: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1) };
 }
 
+/* The hypervisor's own range: KVM's signature, "KVMKVMKVM" in EBX, ECX and
+ * EDX of leaf 0x4000_0000 with the top of the range in EAX, and the
+ * features of its paravirtual interface in 0x4000_0001 -- what a Linux
+ * built with KVM_GUEST looks for, and takes no more of than the bits it is
+ * given. Of KVM's features, the two backed here: NOP_IO_DELAY, a fact --
+ * an `out` to port 0x80 delays nothing, and is an exit -- and for a guest
+ * with APICs, PV_EOI, an EOI made through a word in the guest's memory
+ * where it need not exit (`MSR_KVM_PV_EOI_EN`, `crate::run`). Not offered:
+ * kvmclock, the TSC being invariant and the host's; steal time, and what
+ * stands on it -- PV TLB flushes, PV sched yield -- a guest's CPUs having
+ * cores of their own; PV unhalt, for the same; and async page faults, a
+ * guest's memory never being paged out. No hypercall either: each is
+ * answered -KVM_ENOSYS, as KVM answers one it does not know. */
+const KVM_SIGNATURE: [u32; 3] = [0x4B4D_564B, 0x564B_4D56, 0x0000_004D];
+const KVM_FEATURE_NOP_IO_DELAY: u32 = 1 << 1;
+const KVM_FEATURE_PV_EOI: u32 = 1 << 6;
+/// MSR_KVM_PV_EOI_EN: where the guest's PV EOI word is, and whether it is
+/// on (bit 0) -- the run loop's, as the local APIC's MSRs are.
+pub const MSR_KVM_PV_EOI_EN: u32 = 0x4B56_4D04;
+
 /// Whether a guest with APICs is offered the TSC-deadline timer: where the
 /// TSC's rate is known, which a deadline is turned into host time by.
 pub fn tsc_deadline() -> bool {
@@ -484,6 +508,9 @@ pub fn tsc_deadline() -> bool {
 /// What the guest's CPU `asker` is told for CPUID leaf `leaf`, subleaf
 /// `sub` (ECX on the way in, for the leaves that take one).
 pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
+    if (LEAF_HYPERVISOR..LEAF_EXT).contains(&leaf) {
+        return hypervisor_leaf(leaf, asker);
+    }
     /* Above a range's top the guest is told there is nothing, and is
      * answered so: a leaf of the host's past it would be the host's no
      * matter what this policy says of it. */
@@ -597,6 +624,27 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
             eax: eax & (EXT21_EAX_KEEP | speculation(EXT21_EAX_SPEC)),
             ebx: 0,
             ecx: ecx & EXT21_ECX_KEEP,
+            edx: 0,
+        },
+        _ => NONE,
+    }
+}
+
+/// The hypervisor's range, as KVM answers it: its signature and the top of
+/// the range, and the features of its paravirtual interface backed here --
+/// PV EOI for a guest with APICs. Nothing else in the range.
+fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
+    match leaf {
+        LEAF_HYPERVISOR => Cpuid {
+            eax: LEAF_KVM_FEATURES,
+            ebx: KVM_SIGNATURE[0],
+            ecx: KVM_SIGNATURE[1],
+            edx: KVM_SIGNATURE[2],
+        },
+        LEAF_KVM_FEATURES => Cpuid {
+            eax: KVM_FEATURE_NOP_IO_DELAY | if asker.apic { KVM_FEATURE_PV_EOI } else { 0 },
+            ebx: 0,
+            ecx: 0,
             edx: 0,
         },
         _ => NONE,

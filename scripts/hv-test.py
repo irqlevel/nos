@@ -236,6 +236,13 @@ GUESTS = {
               r"handler, ISR showing each in service; three levels from the IO-APIC, sent again at each EOI while "
               r"the line stayed up; nothing left in service -- the host injected all six",
               r"the IO-APIC sent 3, 3 of them levels, 3 ended by EOI"],
+    # KVM's PV EOI, its interrupts the host's to inject on either backend:
+    # two EOIs through the guest's word, done by the host at the next exit,
+    # and two by the register.
+    "pveoi": [r"0x50 alone ended through the word, its EOI the host's at the next exit; 0x70, nested over 0x30, "
+              r"through it too, and 0x30's own EOI by the register after, whose exit did 0x70's first; nothing left "
+              r"in service; with PV EOI off, 0x50 by the register, the word never set -- 2 EOIs through the word, 2 "
+              r"by the register"],
     # Who hands the second CPU's IPIs over -- the host here -- is said after
     # the colon; that the first took them all is what has to be the same.
     "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, the host handing each over"],
