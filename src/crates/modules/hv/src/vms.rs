@@ -1020,6 +1020,7 @@ impl Vms {
                 return;
             }
         };
+        spec.shape = place.shape;
         let placement = place.vcpus;
         let disk_cpu = place.disk;
         let cpu = placement[0];

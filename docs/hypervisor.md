@@ -1485,11 +1485,14 @@ here:
   alone, and for a guest of one CPU no local APIC and no x2APIC (one of
   more has an emulated x2APIC: [More than one CPU](#more-than-one-cpu)); and
   the hypervisor bit, since there is one, which has Linux leave the
-  microcode loader and the bare-metal chicken bits alone. Each of its CPUs
-  is a package of one, whichever host CPU its vCPU runs on: leaf 1 says one
-  logical CPU, with that CPU's APIC ID -- 0 for a guest of one -- leaves 4
-  and 0x80000008 one core, and the topology leaves (0xB, 0x1F, 0x8000001E),
-  the SVM leaf and the memory-encryption leaf are blank. Every MSR is
+  microcode loader and the bare-metal chicken bits alone. Its CPUs are one
+  package, whichever host CPUs their vCPUs run on, each CPU's APIC ID its
+  number -- 0 for a guest of one -- of cores of one thread, or of two where
+  its CPUs are one host core's two threads ([Where its CPUs
+  sit](#where-its-cpus-sit)): leaf 1, the sharing counts of leaf 4 and AMD's
+  0x8000001D, the x2APIC topology leaf (0xB), and AMD's 0x80000008 and
+  0x8000001E say so, none of them the host's; 0x1F, past the top, the SVM
+  leaf and the memory-encryption leaf are blank. Every MSR is
   intercepted but the three segment bases, and every one is an allow-list's
   too: the system MSRs (EFER, the PAT, the segment bases, the SYSCALL and
   SYSENTER registers) are the guest's own state and are served from the
@@ -3125,7 +3128,9 @@ TSC's ratio to it, so a kernel need not measure either. Passed through, the
 leaf would name the host's crystal, tens of MHz, and a kernel that took the
 timer's rate from it would have its timer fire tens of times too soon;
 where the host has no frequency to give, the leaf is blank and the kernel
-measures. The topology leaves stay blank, as for one CPU. Of leaf
+measures. The topology leaves are the guest's own ([Where its CPUs
+sit](#where-its-cpus-sit)), and leaf 1 offers the timer's TSC-deadline mode
+([Time](#time)). Of leaf
 0x80000007 only the invariant TSC is left: its RAS bits (SUCCOR among them)
 sent Linux's machine-check code to set up AMD's deferred-error interrupt
 through the APIC's extended LVT -- MSR 0x852, a register this APIC has not
@@ -3145,6 +3150,40 @@ before its first line of SMP output. And `CONFIG_SMP`, `CONFIG_X86_X2APIC`
 `CONFIG_X86_MPPARSE`. A distribution's kernel has all of them: Alpine's
 `virt` 6.18 brings up two CPUs as it ships. An older kernel still boots on
 one CPU.
+
+### Where its CPUs sit
+
+A guest's CPUID tells it where its CPUs are (`hv::place::Shape`), and
+tells it what is so. They are one package, each CPU's APIC ID its number,
+of cores of one thread or two: two where its CPUs 2k and 2k+1 are each one
+host core's two threads and no other two of them share a core -- as
+`hv cores own`, the default, places them, a guest's vCPUs filling the
+threads of the cores it is given -- and one otherwise, `hv cores shared`'s
+CPUs on cores apart among them, and the odd guest whose CPUs the numbering
+cannot pair (a core with one thread to give before the others). Its
+last-level cache is the package's where all its CPUs are on one host cache,
+each core's own where not. The placement says so as it is made
+(`Placement::shape`), the guest's spec keeps it for every boot, and the
+leaves give it: leaf 1's count of the package's APIC IDs, with HTT where
+that is more than one; leaf 4's sharing and core counts, the last level's
+sharing the package's; the x2APIC topology leaf, 0xB, its SMT level and its
+core level, each with the CPU's x2APIC ID; and on AMD the package's CPUs and
+the APIC ID's width in 0x80000008, and -- where the host has TOPOEXT --
+0x8000001D's sharing and 0x8000001E's core and threads. Nothing of the
+host's topology reaches the guest: its APIC IDs and core counts were once
+another machine's, and a guest took the host CPU's APIC ID for its own.
+
+It matters twice. A guest's kernel schedules by it: its wakeups look for an
+idle CPU among those that share the waker's cache, which with each CPU a
+package of its own, as each was before, was no CPU but its own; and it
+spreads work over cores before it doubles up on a core's threads. And the
+side channels between a core's two threads -- MDS, L1TF, port contention --
+are between two of its own CPUs, which its kernel can guard its processes
+against only knowing (core scheduling, STIBP, `nosmt`): told each CPU was a
+package, it believed no two of its processes shared a core while two did.
+Linux 6.18 reads leaf 0xB on AMD as on Intel; an older kernel reads it on
+AMD only with TOPOEXT, and on an AMD host without TOPOEXT -- QEMU's `max`
+under TCG is one -- sees one package of cores, and no threads.
 
 ### Starting the others
 
@@ -3370,8 +3409,17 @@ Each local APIC has its timer: one-shot and periodic, counting down at a bus
 clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
 divide configuration a guest writes. A periodic timer that fell behind is
 owed its periods, handed over one at a time as the guest takes each, a
-second's worth at most, as the PIT's channel 0 is. There is no TSC-deadline
-mode, and CPUID says so.
+second's worth at most, as the PIT's channel 0 is. And TSC-deadline mode,
+which leaf 1 offers with the APIC wherever the host knows its TSC's rate: a
+write of IA32_TSC_DEADLINE (MSR 0x6E0) arms the timer to run out when the
+TSC reaches it -- the guest's TSC is the host's, so the deadline is turned
+into the host's time as it is written, at the rate the kernel measured --
+0 disarms it, it reads back until it runs out and 0 after, a count written
+meanwhile is ignored and the current count reads 0, and the mode's entry
+or exit disarms the timer, as the SDM has it (11.5.4.1); in the other modes
+the MSR reads 0 and takes nothing. Linux takes it over the one-shot count
+(`lapic-deadline`): a deadline is one write, and needs the timer's rate
+measured against nothing.
 
 A kernel measures the timer against the PIT before it trusts it
 (`calibrate_APIC_clock`), and while it measures it spins, `cpu_relax()` --
@@ -3475,8 +3523,8 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   IO-APIC; only the interrupts that follow go where the guest steers them
   -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
   Without one, those two reach the first CPU only.
-- **No TSC-deadline timer.** A kernel built with neither `X86_MPPARSE` nor
-  ACPI finds one CPU.
+- **Neither an MP table nor ACPI, one CPU.** A kernel built with neither
+  `X86_MPPARSE` nor ACPI finds one CPU.
 
 ### Gates
 
@@ -3493,7 +3541,11 @@ is the two CR0 writes the policy emulates.
   `smp: Brought up 1 node, N CPUs`, and the report's `N-1 started by the
   guest` -- then runs the VM phase with them: every CPU online, each taking
   its own local timer's interrupts, rescheduling IPIs between them, and
-  `hv list` naming the host CPU of each. `--disk`, `--disk --nvme-root`,
+  `hv list` naming the host CPU of each; the guest's timer the local APIC's
+  in TSC-deadline mode (`lapic-deadline`, with `tsc_deadline_timer` among
+  its CPU's flags), its CPUs one package -- and with `--cpus 2`, placed on
+  one core's two threads, that core of two threads sharing one last-level
+  cache, as its sysfs says. `--disk`, `--disk --nvme-root`,
   `--net` and `--attach` take `--cpus` too. The guest kernel needs what is
   above, plus POSIX timers for BusyBox's `ping`, which paces itself with
   `alarm()` (a tinyconfig leaves them out).

@@ -78,6 +78,7 @@ use crate::pvh;
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::mmio;
+use crate::place::Shape;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
 use crate::svm::Exit;
 use crate::vm::{Cpu, Refusal};
@@ -624,6 +625,8 @@ pub struct LinuxGuest {
     /// offloads (`set_offloads`).
     rx_moderation_ns: u64,
     offloads: bool,
+    /// Where its CPUs sit, as their CPUID tells them (`set_shape`).
+    shape: Shape,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -766,8 +769,20 @@ impl LinuxGuest {
             notified: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
+            shape: Shape::cores(cpus),
         };
         Ok((guest, vcpus))
+    }
+
+    /// What its CPUs' CPUID tells them of where they sit -- what their
+    /// placement made of them (`place::Placement::shape`) -- set before it
+    /// boots; each a core of its own, sharing the cache, unless told. A
+    /// shape of another number of CPUs is not this guest's, and changes
+    /// nothing.
+    pub fn set_shape(&mut self, shape: Shape) {
+        if shape.cpus() == self.cpus() {
+            self.shape = shape;
+        }
     }
 
     /// Its memory: for the kernel and the initrd to be streamed into.
@@ -1342,7 +1357,9 @@ impl LinuxGuest {
                     let v = gc.cpu.backend_mut();
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
-                    let asker = crate::policy::Asker { apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0() };
+                    let asker = crate::policy::Asker {
+                        apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0(), shape: self.shape,
+                    };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
                     crate::policy::apply_cpuid(save, regs, &answer);
@@ -2309,6 +2326,23 @@ impl LinuxGuest {
             gc.counts.msr_read += 1;
         }
 
+        /* The APIC timer's deadline, where the guest is offered the
+         * TSC-deadline timer: the TSC is the host's, and the deadline it
+         * names is turned into the host's time as it is written. */
+        if self.has_apic() && msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
+            if write {
+                gc.lapic.set_tsc_deadline(value, tsc_ns(value));
+                gc.cpu.backend_mut().skip_msr();
+            } else {
+                let deadline = gc.lapic.tsc_deadline();
+                let b = gc.cpu.backend_mut();
+                let (save, regs) = b.save_and_regs_mut();
+                set_msr_read(save, regs, deadline);
+                b.skip_msr();
+            }
+            return None;
+        }
+
         if self.has_apic() && lapic::owns(msr) {
             let now = time::boot_time_ns();
             if write {
@@ -2379,6 +2413,15 @@ impl LinuxGuest {
             p.msr_faults.push((msr, value, write));
         }
     }
+}
+
+/// When the TSC -- a guest's, which is the host's -- reaches `tsc`, in host
+/// nanoseconds: now, if it has already, or if the TSC's rate is not known.
+fn tsc_ns(tsc: u64) -> u64 {
+    let (now_tsc, now) = (time::cycle_counter(), time::boot_time_ns());
+    let Some(hz) = time::cycle_counter_hz() else { return now };
+    let ahead = u128::from(tsc.saturating_sub(now_tsc)) * u128::from(kcore::consts::NS_PER_SEC) / u128::from(hz);
+    now.saturating_add(u64::try_from(ahead).unwrap_or(u64::MAX))
 }
 
 /// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
