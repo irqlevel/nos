@@ -128,6 +128,16 @@ pub fn find(root: &str, word: &str) -> Result<Option<Folder>, String> {
     Ok(Some(Folder { name: String::from(name), path }))
 }
 
+/// A UUID given a VM at its first start -- one whose vm.toml was written
+/// before VMs had them -- added to the end of its vm.toml, the operator's
+/// lines left as they are, for every start after to give it the same.
+pub fn add_uuid(folder: &Folder, uuid: &[u8; 16]) -> Result<(), String> {
+    let file = join(&folder.path, CONFIG).ok_or_else(|| String::from("out of memory"))?;
+    let lines = alloc::format!("\n# Given at its first start: the machine its OS knows it as (SMBIOS)\nuuid = \"{}\"\n",
+                               config::uuid_text(uuid));
+    kcore::fs::append(&file, lines.as_bytes()).map_err(|e| alloc::format!("{}: {}", file, e))
+}
+
 /// The folder's configuration, read and parsed; what is wrong with it
 /// otherwise, said with its path.
 pub fn load(folder: &Folder) -> Result<Config, String> {
@@ -203,6 +213,9 @@ pub fn create(root: &str, args: &str, out: &mut Output) {
         return;
     };
     let folder = Folder { name: String::from(name), path };
+    /* Its UUID, made now: the machine its OS knows it as, at every start. */
+    let mut given = given;
+    given.uuid = given.uuid.or_else(|| Some(guest::random_uuid()));
     /* Checked as a start would check it -- the paths the folder's -- before
      * anything is written: a vm.toml that cannot boot is no use kept. */
     if let Err(e) = options_checked(&folder, &Config::new(given.clone())) {
@@ -312,6 +325,14 @@ fn summary(c: &Config, out: &mut Output) {
         if let Some(p) = o.port {
             if (p as usize) < net::MAX_PORTS {
                 let _ = write!(out, " port {} ({})", p, net::dotted(net::port_ip(p as usize)));
+            }
+        }
+        match &o.network {
+            Some(network) => {
+                let _ = write!(out, " on {}", network);
+            }
+            None => {
+                let _ = write!(out, " alone");
             }
         }
     }

@@ -55,9 +55,10 @@ use crate::place::Shape;
  * highest of them, or the host's top if that is lower. Every other leaf is
  * all zeros, as a CPU answers one it has nothing in: no leaf of the host's
  * reaches a guest that this policy has not read. Among those left zero:
- * the PMU's (0xA), with no counters to back it; the hypervisor range (no
- * paravirtualisation is offered); and of AMD's, the SVM leaf, memory
- * encryption and the extended performance monitor. The topology leaves
+ * the PMU's (0xA), with no counters to back it; the hypervisor range past
+ * its signature and KVM's features, the paravirtualisation offered being
+ * that little; and of AMD's, the SVM leaf, memory encryption and the
+ * extended performance monitor. The topology leaves
  * are the guest's own (`Shape`), the host's x2APIC IDs none of them; 0x1F,
  * past the top, is not asked. */
 const LEAF_BASIC: u32 = 0;

@@ -96,6 +96,9 @@ pub struct Spec {
     /// `port=`: the port of the switch to claim, rather than the first free
     /// one -- an address and a MAC the same at every start.
     pub port: Option<usize>,
+    /// `network=`: the network on the switch it is on, whose guests it
+    /// reaches -- alone, reaching none, without.
+    pub network: Option<String>,
     /// `forward=`: nos's ports relayed to the guest's, once it runs.
     pub forwards: Vec<(u16, u16)>,
     pub nic: Option<NicSpec>,
@@ -103,6 +106,12 @@ pub struct Spec {
     /// made of them (`hv::place::Placement::shape`), once it has one --
     /// each a core of its own until then. Every boot of it is told the same.
     pub shape: Shape,
+    /// `uuid=`, or its vm.toml's: the UUID its SMBIOS gives it -- a random
+    /// one at each start when it has none (`identity`).
+    pub uuid: Option<[u8; 16]>,
+    /// What its SMBIOS calls it, its serial number: its folder's name, or
+    /// its number for a VM with none; set as it starts.
+    pub name: String,
 }
 
 /// A guest's NIC: its port on the switch.
@@ -163,6 +172,12 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
         } else if let Some(v) = word.strip_prefix("forward=") {
             o.forwards.push(crate::config::forward(v)
                 .ok_or_else(|| String::from("forward= wants <nos's port>:<the guest's>, each 1..65535"))?);
+        } else if let Some(v) = word.strip_prefix("network=") {
+            if !crate::config::valid_network(v) {
+                return Err(alloc::format!("network= wants a name -- a letter or a digit, then letters, digits, . _ \
+                                           and -, at most {}", crate::config::NETWORK_NAME_MAX));
+            }
+            o.network = Some(String::from(v));
         } else if let Some(v) = word.strip_prefix("port=") {
             o.port = Some(v.parse().map_err(|_| String::from("port= wants the number of a port of the switch"))?);
         } else if let Some(v) = word.strip_prefix("secs=") {
@@ -187,6 +202,8 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
             o.apicv = Some(false);
         } else if word == "nooffload" {
             o.nooffload = true;
+        } else if let Some(v) = word.strip_prefix("uuid=") {
+            o.uuid = Some(crate::config::uuid(v).ok_or_else(|| String::from("uuid= wants 8-4-4-4-12 hex digits"))?);
         } else if let Some(v) = word.strip_prefix("rxmod=") {
             o.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
@@ -234,6 +251,9 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if !o.forwards.is_empty() && !o.net {
         return Err(String::from("forward= is a net guest's -- net too"));
     }
+    if o.network.is_some() && !o.net {
+        return Err(String::from("network= is a net guest's -- net too"));
+    }
     if o.forwards.len() > crate::forward::MAX_FORWARDS {
         return Err(alloc::format!("at most {} forwards", crate::forward::MAX_FORWARDS));
     }
@@ -262,10 +282,41 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         restart: o.restart,
         net: o.net,
         port,
+        network: o.network,
         forwards: o.forwards,
         nic: None,
         shape: Shape::cores(cpus),
+        uuid: o.uuid,
+        name: String::new(),
     })
+}
+
+/// A UUID of version 4 -- random -- from the kernel's pool; one made of the
+/// clock, should the pool have nothing yet, which it has once nos is up.
+pub fn random_uuid() -> [u8; 16] {
+    let mut u = [0u8; 16];
+    if !kcore::random::fill_random(&mut u) {
+        let t = kcore::time::boot_time_ns();
+        u[..8].copy_from_slice(&t.to_le_bytes());
+        u[8..].copy_from_slice(&t.rotate_left(29).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    }
+    u[6] = (u[6] & 0x0F) | 0x40;
+    u[8] = (u[8] & 0x3F) | 0x80;
+    u
+}
+
+/// What a guest's SMBIOS says it is: its UUID -- `spec`'s, or a random one
+/// -- its name, and nos's version, as nos says it, its leading "nos " left
+/// off.
+fn identity(spec: &Spec) -> hv::run::Identity {
+    let mut buf = [0u8; 96];
+    let n = kcore::procinfo::version(&mut buf);
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    hv::run::Identity {
+        uuid: spec.uuid.unwrap_or_else(random_uuid),
+        serial: spec.name.clone(),
+        version: String::from(text.strip_prefix("nos ").unwrap_or(text)),
+    }
 }
 
 /// The command line the guest's kernel is given: `cmdline`; for a guest of
@@ -454,6 +505,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     if let Some(us) = spec.rxmod_us {
         guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
     }
+    guest.set_identity(identity(spec));
     if spec.nooffload {
         guest.set_offloads(false);
     }
@@ -638,6 +690,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             value, port, hv::run::reset_source(port), rip),
         Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
         Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI PM1 control register, at {:#x}", rip),
+        Stop::Panicked { rip } => write!(out, "the guest's kernel panicked, and said so to its panic device, at {:#x}", rip),
         Stop::MmioInsn { gpa, rip, error, bytes } => {
             write!(out, "an access of guest physical {:#x} at rip {:#x} not performed -- {}; its bytes",
                 gpa, rip, error.describe())?;
@@ -792,13 +845,21 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             let _ = write!(out, "; {} discards ({} KiB), {} writes of zeros ({} KiB)", s.discards,
                 s.discarded_bytes / 1024, s.zeroings, s.zeroed_bytes / 1024);
         }
+        let _ = write!(out, "; {} notifies, {} interrupts", s.notifies, s.interrupts);
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
     }
-    for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",
-            i, s.sent, s.received, s.dropped, s.large, s.whole,
-            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+    for (i, (s, (pairs, active), broken, copied)) in guest.nic_stats().into_iter().enumerate() {
+        let _ = write!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole; \
+            notifies {} to send, {} to receive; interrupts {} for sends, {} for receives",
+            i, s.sent, s.received, s.dropped, s.large, s.whole, s.tx_notifies, s.rx_notifies, s.tx_interrupts,
+            s.rx_interrupts);
+        if pairs > 1 {
+            let _ = write!(out, "; {} of {} queue pairs in use, {} commands ({} refused)", active, pairs, s.commands,
+                s.refused);
+        }
+        let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
+            copied_note(copied));
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {
@@ -808,8 +869,12 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         }
         let _ = writeln!(out);
     }
+    let crash = guest.crash_kernels();
+    if crash != 0 {
+        let _ = writeln!(out, "  pvpanic    the guest's kernel panicked {} times with a crash kernel loaded, and booted it", crash);
+    }
     if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. } | Stop::Init { .. }
-        | Stop::PowerOff { .. })
+        | Stop::PowerOff { .. } | Stop::Panicked { .. })
     {
         if counts.len() > 1 {
             let _ = writeln!(out, "  stopped by cpu {}:", stopped.cpu);

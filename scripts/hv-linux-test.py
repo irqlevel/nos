@@ -46,6 +46,7 @@ Exit code 0 = every required marker appeared.
 """
 
 import argparse
+import base64
 import importlib.util
 import os
 import re
@@ -164,6 +165,16 @@ RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 RC_LOG = "dmesg hv:"
 # What the main phase's load gives the guests at its unload (`stop_secs=`).
 UNLOAD_SECS = 2
+
+
+# VIRTIO_RING_F_EVENT_IDX: its place in a virtio device's `features` in
+# sysfs, a character a bit from bit 0; and virtio-net's control queue and
+# multiqueue, which a NIC offers a guest of more than one CPU -- a queue
+# pair a CPU, up to its most.
+EVENT_IDX = 29
+CTRL_VQ = 17
+MQ = 22
+MAX_PAIRS = 8
 
 
 def interrupt_check(args, text, queue):
@@ -895,6 +906,7 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None, powers_off=False):
     if args.initrd:
         shutil.copy(args.initrd, os.path.join(rootdir, "initrd"))
     for name, src in (extra or {}).items():
+        os.makedirs(os.path.dirname(os.path.join(rootdir, name)), exist_ok=True)
         shutil.copy(src, os.path.join(rootdir, name))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# scripts/hv-linux-test.py\n" + "\n".join(rc) + "\n")
@@ -997,7 +1009,11 @@ def disk(args):
     trim = [x("mount /dev/vda /mnt"),
             x("rm -f /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 /mnt/big; sync", 120),
             x("fstrim -v /mnt", 300),
-            x("umount /mnt", 120)]
+            x("umount /mnt", 120),
+            # What its driver took of the device's features, a character a
+            # bit: EVENT_IDX (29) among them, each side asking for the
+            # other's notifications only when it wants them.
+            x("cat /sys/block/vda/device/features")]
     rc += trim
     handler = "/etc/acpi/PWRF/00000080"
     if args.acpi:
@@ -1043,6 +1059,9 @@ def disk(args):
         m = re.search(r"/mnt: (\d+) bytes trimmed", trimmed)
         pt.check("the guest's free space trimmed: discards the disk took", m is not None and int(m.group(1)) > 0,
                  trimmed[-600:])
+        took = output_of(secs, trim[4], 0) or ""
+        bits = re.search(r"(?m)^([01]{32,})\s*$", took)
+        pt.check("its driver took EVENT_IDX", bits is not None and bits.group(1)[EVENT_IDX] == "1", took[-300:])
         # The image -- held while the guest ran -- says as it is let go of
         # what it read and wrote off the VFS's lock, and what through it:
         # the guest's reads and its writes over blocks the image had, off
@@ -1121,6 +1140,162 @@ def disk(args):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def smbios(args):
+    """What a guest is told it is by its SMBIOS tables, as Linux reads them
+    into /sys/class/dmi/id: nos's hypervisor for its maker and product, nos's
+    version, its name for its serial, and a UUID that stays its own. A VM
+    whose vm.toml was written before VMs had UUIDs is given one at its first
+    start, written into the file -- added, the lines it had left as they
+    were -- and told the same at its next; one started from its kernel's
+    path is told the uuid= it is given, and its number for its serial."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvsmbios-")
+    toml = os.path.join(tmp, "vm.toml")
+    with open(toml, "w") as f:
+        f.write('# written by hand, before VMs had UUIDs\nkernel = "/bzImage"\ninitrd = "/initrd"\nmemory = %d\n'
+                % args.mem + ("cpus = %d\n" % args.cpus if args.cpus > 1 else "")
+                + 'cmdline = "%s"\n' % args.cmdline)
+    x = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
+    ids = ("cd /sys/class/dmi/id && for f in sys_vendor product_name product_version product_serial product_uuid "
+           "bios_vendor chassis_vendor; do echo $f=$(cat $f); done")
+    given = "4e4f5300-0000-4000-8000-00000000c0de"
+    rc = ["insmod /hv.ko", "hv on",
+          "hv start s0",
+          x("s0", "id", args.vm_secs),
+          x("s0", ids),
+          x("s0", "dmesg | grep -E 'SMBIOS|DMI:'"),
+          "cat /vms/s0/vm.toml",
+          "hv stop s0 secs=0",
+          "hv start s0",
+          x("s0", "id", args.vm_secs),
+          x("s0", ids),
+          "hv stop s0 secs=0",
+          "hv start /bzImage mem=%d%s initrd=/initrd uuid=%s cmdline=%s" % (args.mem, cpus_opt(args), given,
+                                                                           args.cmdline),
+          x(2, "id", args.vm_secs),
+          x(2, ids),
+          "hv stop 2 secs=0",
+          RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    p, log, image = boot_rc(args, tmp, rc, extra={"vms/s0/vm.toml": toml})
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        out = lambda line, n=0: output_of(secs, line, n) or ""
+        said = lambda text: dict(re.findall(r"(?m)^(\w+)=(.*?)\s*$", text))
+        first, second, third = said(out(rc[4])), said(out(rc[10], 1)), said(out(rc[14]))
+        pt.check("the guest reached its shell", "uid=0 gid=0" in out(rc[3]), out(rc[3])[-500:])
+        pt.check("its SMBIOS says nos's hypervisor made it", first.get("sys_vendor") == "nos"
+                 and first.get("product_name") == "nos hv" and first.get("bios_vendor") == "nos"
+                 and first.get("chassis_vendor") == "nos", out(rc[4])[-800:])
+        pt.check("and the version is nos's", re.match(r"\S+ \(\S+\)$", first.get("product_version", "")) is not None,
+                 out(rc[4])[-800:])
+        pt.check("its serial is its name", first.get("product_serial") == "s0", out(rc[4])[-800:])
+        uuid = first.get("product_uuid", "")
+        pt.check("it has a UUID, of version 4", re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-"
+                                                         r"[0-9a-f]{12}$", uuid) is not None, out(rc[4])[-800:])
+        pt.check("Linux found SMBIOS 3 where it scans for it", re.search(r"SMBIOS 3\.\d+\.\d+ present", out(rc[5]))
+                 is not None, out(rc[5])[-800:])
+        toml_now = out(rc[6])
+        pt.check("its vm.toml was given the UUID, its own lines kept",
+                 'uuid = "%s"' % uuid in toml_now and "written by hand, before VMs had UUIDs" in toml_now,
+                 toml_now[-800:])
+        pt.check("its next start tells it the same UUID", second.get("product_uuid") == uuid and uuid != "",
+                 out(rc[10], 1)[-800:])
+        pt.check("a VM started from its kernel's path is told the uuid= it is given, its number its serial",
+                 third.get("product_uuid") == given and third.get("product_serial") == "vm2", out(rc[14])[-800:])
+    finally:
+        pt.kill(p)
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def pvpanic(args):
+    """A guest's kernel that panics, and says so to its panic device -- which
+    it finds by its ACPI, `QEMU0001` on port 0x505 -- is stopped there, the
+    report saying why, before its own `panic=` would have rebooted it; one
+    started with `restart` is booted again at each, up to its limit, as one
+    that resets itself is; and a running guest's driver binds the device,
+    its init's exit a panic like any other. The DSDT the device is in comes
+    back out for `iasl`, where the machine has it."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvpanic-")
+    x = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
+    c = cpus_opt(args)
+    rc = ["insmod /hv.ko", "hv on",
+          # No initrd, so no init: a panic, which panic=1 would make a
+          # reboot a second later.
+          "hv start /bzImage mem=64%s cmdline=%s panic=1" % (c, args.cmdline),
+          "hv wait 0 secs=300 nos-never-printed",
+          "hv list",
+          "hv stop 0",
+          "hv start /bzImage mem=64%s restart cmdline=%s panic=1" % (c, args.cmdline),
+          "hv wait 1 secs=500 nos-never-printed-1",
+          "hv list",
+          "hv stop 1",
+          "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline),
+          x(2, "id", args.vm_secs),
+          x(2, "ls /sys/bus/platform/drivers/pvpanic-mmio/"),
+          x(2, "base64 -w 0 /sys/firmware/acpi/tables/DSDT; echo; echo dsdt-done"),
+          # Its init is its shell: an exit kills init, a panic.
+          r"hv send 2 exit\n",
+          "hv wait 2 secs=120 nos-never-printed-2",
+          "hv console 2 bytes=3000",
+          "hv list",
+          RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    p, log, image = boot_rc(args, tmp, rc)
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        txt = open(log, errors="replace").read()
+        secs = sections(txt)
+        out = lambda line, n=0: output_of(secs, line, n) or ""
+        panicked = "the guest's kernel panicked, and said so to its panic device"
+        first = out(rc[3])
+        pt.check("a guest whose kernel panics is stopped, its panic device telling why",
+                 re.search(r"hv: vm 0 stopped without printing .* -- %s" % re.escape(panicked), first) is not None,
+                 first[-800:])
+        pt.check("... before its panic=1 could reboot it", "Rebooting in" not in first, first[-800:])
+        pt.check("hv list keeps it, stopped, with its reason",
+                 re.search(r"vm 0  stopped .* -- %s" % re.escape(panicked), out(rc[4])) is not None, out(rc[4])[-600:])
+        loop = out(rc[7])
+        pt.check("one started with restart is booted again at each panic, until the loop is called one",
+                 re.search(r"hv: vm 1 stopped without printing .* -- %s.* -- reset 6 times in 60 s, left stopped"
+                           % re.escape(panicked), loop) is not None, loop[-800:])
+        pt.check("five restarts before it was left stopped", re.search(r"vm 1  stopped .* restarts 5 ", out(rc[8], 1))
+                 is not None, out(rc[8], 1)[-600:])
+        pt.check("a running guest reached its shell", "uid=0 gid=0" in out(rc[11]), out(rc[11])[-500:])
+        pt.check("its kernel's pvpanic-mmio bound the device, QEMU0001 by its ACPI",
+                 "QEMU0001:00" in out(rc[12]), out(rc[12])[-500:])
+        last, console = out(rc[15]), out(rc[16])
+        pt.check("its init's exit is a panic, and stops it the same way",
+                 re.search(r"hv: vm 2 stopped .* -- %s" % re.escape(panicked), last) is not None
+                 and "Attempted to kill init" in console, last[-800:] + console[-800:])
+        dsdt = re.search(r"(?m)^([A-Za-z0-9+/=]{40,})\s*$", out(rc[13]))
+        if dsdt and shutil.which("iasl"):
+            raw = os.path.join(tmp, "dsdt.dat")
+            with open(raw, "wb") as f:
+                f.write(base64.b64decode(dsdt.group(1)))
+            dis = subprocess.run(["iasl", "-d", raw], capture_output=True, cwd=tmp)
+            dsl = open(os.path.join(tmp, "dsdt.dsl"), errors="replace").read() if dis.returncode == 0 else ""
+            pt.check("iasl takes the DSDT, the panic device in it", dis.returncode == 0 and '"QEMU0001"' in dsl
+                     and "0x0505" in dsl, (dis.stdout + dis.stderr).decode(errors="replace")[-800:])
+        elif dsdt:
+            print("note: no iasl here -- the DSDT, base64, is in the log")
+    finally:
+        pt.kill(p)
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def web_server(root):
     """A web server on the test machine, serving `root` on 127.0.0.1 --
     which QEMU's user network puts at 10.0.2.2 for nos, and NAT for the
@@ -1163,7 +1338,10 @@ def network(args):
         f.write(big)
     server, web = web_server(www)
     x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
-    start = "hv start /bzImage mem=%d%s initrd=/initrd net cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline)
+    # The two guests on one network, which the switch's guests are not
+    # unless their network= puts them on one: the folder's VM below is not.
+    start = "hv start /bzImage mem=%d%s initrd=/initrd net network=lab cmdline=%s" % (args.mem, cpus_opt(args),
+                                                                                       args.cmdline)
     way_out = [x(0, "cat /proc/net/pnp"),
                x(0, "wget -q -O - http://10.0.2.2:%d/nat.txt" % web),
                x(0, "ping -c 3 10.0.2.2"),
@@ -1260,7 +1438,11 @@ def network(args):
            x(0, "ip -6 addr del %s/128 dev eth0; " % ula(1) + (sysctl6 % (1, 0)) + "; echo given-back"),
            echoes,
            x(1, "dmesg | grep 'advertised ou[r] address'; echo heard-done"),
-           "hv list"]
+           "hv list",
+           # What its driver took of the NIC's features: EVENT_IDX (29).
+           x(0, "cat /sys/class/net/eth0/device/features"),
+           # Its queues: a pair for each of its CPUs, with more than one.
+           x(0, "ls /sys/class/net/eth0/queues")]
     xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
     folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
               % (args.mem, cpus_opt(args), args.cmdline),
@@ -1269,7 +1451,13 @@ def network(args):
               xn("w0", "mkdir -p /www"),
               xn("w0", "echo nos-folder-hello > /www/index.html"),
               xn("w0", "httpd -p 80 -h /www"),
-              "hv forward"]
+              "hv forward",
+              # Alone on the switch: nos it reaches, the guests on lab not --
+              # not by ARP, whose question they never hear, and not by a
+              # frame for vm 1's MAC, which the switch drops and counts.
+              xn("w0", "ping -c 2 -W 5 10.0.100.1"),
+              xn("w0", "arp -s 10.0.100.3 02:00:00:00:64:03; ping -c 3 -W 2 10.0.100.3; echo alone-done", 60),
+              "hv list"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -1297,6 +1485,7 @@ def network(args):
         secs = sections(open(log, errors="replace").read())
         out = lambda i: output_of(secs, rc[i], 0) or ""
         ok_ping = lambda t: re.search(r"3 packets transmitted, 3 packets received", t) is not None
+        ok_ping2 = lambda t: re.search(r"2 packets transmitted, 2 packets received", t) is not None
         pt.check("both guests reach their shells", "uid=0 gid=0" in out(4) and "uid=0 gid=0" in out(5),
                  out(4)[-300:] + out(5)[-300:])
         pt.check("hv list gives each its address", "10.0.100.2" in out(6) and "10.0.100.3" in out(6), out(6))
@@ -1348,6 +1537,18 @@ def network(args):
                  six_out(6)[-200:] + six_out(7)[-400:] + six_out(8)[-600:] + six_out(10)[-200:])
         pt.check("and the other heard nothing of it advertising its address",
                  "heard-done" in six_out(11) and "advertised our address" not in six_out(11), six_out(11)[-600:])
+        took = six_out(13)
+        bits = re.search(r"(?m)^([01]{32,})\s*$", took)
+        pt.check("the guest's virtio-net driver took EVENT_IDX", bits is not None and bits.group(1)[EVENT_IDX] == "1",
+                 took[-300:])
+        pairs = min(args.cpus, MAX_PAIRS)
+        mq = "1" if pairs > 1 else "0"
+        pt.check("and multiqueue where it has more than one CPU" if pairs > 1 else "and no multiqueue, with one CPU",
+                 bits is not None and bits.group(1)[MQ] == mq and bits.group(1)[CTRL_VQ] == mq, took[-300:])
+        queues = six_out(14)
+        pt.check("it uses %d queue pair%s, one a CPU" % (pairs, "s" if pairs > 1 else ""),
+                 all("rx-%d" % i in queues and "tx-%d" % i in queues for i in range(pairs))
+                 and "rx-%d" % pairs not in queues, queues[-300:])
         listed = six_out(12)
         vm0 = re.search(r"(?m)^vm 0 .*$", listed)
         vm1 = re.search(r"(?m)^vm 1 .*$", listed)
@@ -1415,6 +1616,10 @@ def network(args):
                  len(guests) == 2 and not any("past its share" in g or "past their rate" in g for g in guests),
                  "\n".join(guests))
         pt.check(*interrupt_check(args, way(14), "input"))
+        if pairs > 1 and "pci=nomsi" not in args.cmdline.split():
+            pt.check("each queue pair's receive queue a vector of its own",
+                     all(re.search(r"PCI-MSIX\S*\s+\S+\s+virtio\d+-input\.%d\b" % i, way(14)) for i in range(pairs)),
+                     way(14)[-800:])
         claim = way(15)
         pt.check("a guest that claims another's address, ARP and IPv4, gets nothing back: nos heard none of it",
                  "claimed" in claim and re.search(r"Received 0 response", claim) is not None
@@ -1461,6 +1666,15 @@ def network(args):
                  "10.0.100.7" in fo(2) and re.search(r"(?i)02:00:00:00:64:07", fo(2)) is not None, fo(2)[-600:])
         pt.check("hv forward lists the forward its vm.toml asked for", re.search(r"port 8086 -> vm \d+", fo(6))
                  is not None, fo(6))
+        pt.check("alone on the switch, it reaches nos", ok_ping2(fo(7)), fo(7)[-600:])
+        pt.check("and not another network's guest, given its MAC",
+                 "alone-done" in fo(8) and "3 packets transmitted, 0 packets received" in fo(8), fo(8)[-600:])
+        listed = fo(9)
+        kept = re.search(r"(?m)^vm \d+ w0 .*10\.0\.100\.7 alone .*?\b(\d+) frames for another network's guests, "
+                         r"dropped", listed)
+        pt.check("hv list says who is on which network, and counts what the switch kept from the other",
+                 re.search(r"(?m)^vm 1 .*10\.0\.100\.3 on lab ", listed) is not None
+                 and kept is not None and int(kept.group(1)) >= 3, listed[-1200:])
         body = b""
         for attempt in range(10):
             try:
@@ -1567,6 +1781,12 @@ def main():
                     help="the guest's CPUs: with more than one, that it brings every one up, and that "
                          "each takes its timer's interrupts and IPIs (needs a guest kernel with SMP and "
                          "x2APIC; under TCG, QEMU 9.2 or later)")
+    ap.add_argument("--pvpanic", action="store_true",
+                    help="the guest kernel has ACPI and PVPANIC_MMIO: check that a panic stops it, saying so, "
+                         "and that a guest with restart is booted again after one")
+    ap.add_argument("--smbios", action="store_true",
+                    help="the guest kernel has DMI (DMI, DMIID): check what its SMBIOS tables say it is, and that "
+                         "a VM keeps its UUID from start to start")
     ap.add_argument("--acpi", action="store_true",
                     help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
                          "the machine's tables, reboots by the FADT's reset register, and shuts down when "
@@ -1642,10 +1862,16 @@ def main():
     if not os.path.exists(nos_iso(args)):
         sys.exit("build %s first (make%s)" % (nos_iso(args), " nos-test.iso" if args.nos_iso else ""))
 
-    if args.attach or args.disk or args.net:
+    if args.attach or args.disk or args.net or args.smbios or args.pvpanic:
         if not args.initrd:
-            sys.exit("--attach, --disk and --net need --initrd: the guest's shell is what is typed at")
-        attach(args) if args.attach else disk(args) if args.disk else network(args)
+            sys.exit("--attach, --disk, --net, --smbios and --pvpanic need --initrd: the guest's shell is what is "
+                     "typed at")
+        if args.smbios:
+            smbios(args)
+        elif args.pvpanic:
+            pvpanic(args)
+        else:
+            attach(args) if args.attach else disk(args) if args.disk else network(args)
     else:
         run(args)
 

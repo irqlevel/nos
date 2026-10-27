@@ -109,13 +109,16 @@ pub mod time {
 }
 
 pub mod sync {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     thread_local! {
         /// The kernel's locks this thread holds.
         static HELD: Cell<u32> = const { Cell::new(0) };
+        /// What a target has run just before a spin lock is taken
+        /// (`before_lock`), and how many such locks are to go by first.
+        static BEFORE_LOCK: RefCell<Option<(u32, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
     }
 
     /// How many of the kernel's locks this thread holds: none, where a vCPU
@@ -123,6 +126,42 @@ pub mod sync {
     /// would wait that long.
     pub fn held() -> u32 {
         HELD.with(|h| h.get())
+    }
+
+    /// `f` run once, just before the `n`th spin lock this thread takes from
+    /// now with none held (0 the next): where the code under test has looked
+    /// at something without the lock and is about to act on it with it --
+    /// the moment another CPU's change lands in, which one thread never
+    /// makes otherwise. `take_before_lock` hands it back if no such lock
+    /// came.
+    pub fn before_lock(n: u32, f: Box<dyn FnOnce()>) {
+        BEFORE_LOCK.with(|b| *b.borrow_mut() = Some((n, f)));
+    }
+
+    pub fn take_before_lock() -> Option<Box<dyn FnOnce()>> {
+        BEFORE_LOCK.with(|b| b.borrow_mut().take().map(|(_, f)| f))
+    }
+
+    /// A spin lock about to be taken: `before_lock`'s `f` run, if this is
+    /// its lock -- with nothing held, so that it may take any.
+    fn at_spin_lock() {
+        if held() != 0 {
+            return;
+        }
+        let due = BEFORE_LOCK.with(|b| {
+            let mut b = b.borrow_mut();
+            match b.as_mut() {
+                Some((0, _)) => b.take().map(|(_, f)| f),
+                Some((n, _)) => {
+                    *n -= 1;
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(f) = due {
+            f();
+        }
     }
 
     /// A lock that owns what it guards; `new` is fallible, as the kernel's is.
@@ -172,6 +211,7 @@ pub mod sync {
             Mutex::new(value).map(SpinLock)
         }
         pub fn lock(&self) -> MutexGuard<'_, T> {
+            at_spin_lock();
             self.0.lock()
         }
     }
@@ -183,6 +223,7 @@ pub mod sync {
             IrqSpinLock(Mutex(std::sync::Mutex::new(value)))
         }
         pub fn lock(&self) -> MutexGuard<'_, T> {
+            at_spin_lock();
             self.0.lock()
         }
     }

@@ -11,6 +11,18 @@
 //! not come from there -- for a broadcast, a multicast or a MAC that is no
 //! port's.
 //!
+//! A port is on a network, or alone (`claim`'s `network`): the guests on a
+//! network reach each other as on one LAN, and a guest alone -- what a VM is
+//! unless its `network=` says otherwise -- reaches no other guest at all,
+//! only `hv0` and, through NAT, the world. A frame for another network's
+//! guest goes nowhere, counted against the port that sent it (`isolated`);
+//! one for every port goes to the ports of its sender's network, and `hv0`;
+//! and IPv6's first-come bindings are each network's own, an address one
+//! network's guest took free for another's. `hv0` -- nos -- reaches every
+//! guest, and nothing goes from one guest to another through it: NAT takes
+//! nothing for the guests' own subnet (`net/src/nat.rs`), and the stack
+//! forwards nothing.
+//!
 //! What a guest sends is checked where it comes in (`ingress`): it has to
 //! be IPv4, ARP or IPv6, sent as the guest on that port -- from the port's
 //! MAC, an IPv4 packet from the port's address, an ARP message with the
@@ -88,6 +100,9 @@ use crate::vms::Shared;
 
 /// The most ports: a VM each.
 pub const MAX_PORTS: usize = 16;
+/// A port alone on the switch: its group (`Port::group`) is this and its
+/// number, apart from every network's, which are 1 to `MAX_PORTS`.
+const ALONE: u32 = 1 << 31;
 /// Frames an inbox holds: the guest's receive ring's worth (a virtio NIC's
 /// queue has 256 entries). At 64, a guest fetching over several connections
 /// at once lost frames on every burst, kicked or not.
@@ -214,6 +229,9 @@ struct Bindings {
 struct Binding {
     addr: ipv6::Addr,
     port: u8,
+    /// The group of the port it is bound to (`Port::group`): an address is
+    /// one port's within a network, and another network's to take too.
+    group: u32,
     used: u64,
 }
 
@@ -225,11 +243,12 @@ impl Bindings {
         Some(Bindings { entries, clock: 0 })
     }
 
-    /// Whether `addr` is `port`'s to send from or advertise: bound to it --
-    /// now, if it is nobody's -- and not, if it is another port's.
-    fn claim(&mut self, port: usize, addr: &ipv6::Addr) -> bool {
+    /// Whether `addr` is `port`'s to send from or advertise, `port` being of
+    /// `group`: bound to it -- now, if it is nobody's on its network -- and
+    /// not, if it is another port's there.
+    fn claim(&mut self, port: usize, group: u32, addr: &ipv6::Addr) -> bool {
         self.clock += 1;
-        if let Some(b) = self.entries.iter_mut().flatten().find(|b| b.addr == *addr) {
+        if let Some(b) = self.entries.iter_mut().flatten().find(|b| b.addr == *addr && b.group == group) {
             if usize::from(b.port) != port {
                 return false;
             }
@@ -248,7 +267,7 @@ impl Bindings {
         /* Room for every port's fill: a port under its own has a free
          * entry, one at it has its least recently used. */
         let Some(at) = at else { return false };
-        self.entries[at] = Some(Binding { addr: *addr, port: port as u8, used: self.clock });
+        self.entries[at] = Some(Binding { addr: *addr, port: port as u8, group, used: self.clock });
         true
     }
 
@@ -365,20 +384,31 @@ struct Port {
     /// a frame put in before it wakes nobody.
     quiet_until: AtomicU64,
     /// Whether its VM's NIC takes checksums left to finish, and sends of TCP
-    /// whole (`Backend::takes`).
+    /// whole (`Backend::takes`). Written under `inbox`'s lock, so that what
+    /// is put there is put as the NIC takes it then (`deliver_rx`,
+    /// `deliver_whole`); read without, they are what it took a moment ago.
     takes_partial: AtomicBool,
     takes_whole: AtomicBool,
+    /// Which guests it reaches, while a VM has it: a network's number -- the
+    /// ports on one share it -- or `ALONE` and its own; 0 while it is free.
+    /// Written under `inbox`'s lock with its `owner`, so that read there it
+    /// is the owner's (`deliver_rx`); read without, it was a moment ago.
+    group: AtomicU32,
+    /// Frames its guest sent to another network's guest, dropped.
+    isolated: AtomicU64,
 }
 
 /// What a port's guest lost, since it claimed the port: frames for it its
 /// inbox had no room for, frames it sent as another guest, frames for `hv0`
-/// past its share of the backlog, and sends to every port past their rate.
+/// past its share of the backlog, sends to every port past their rate, and
+/// frames for another network's guest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PortCounts {
     pub dropped: u64,
     pub spoofed: u64,
     pub over_share: u64,
     pub flooded: u64,
+    pub isolated: u64,
 }
 
 /// The ports, shared by the switch, every guest's NIC and `hv0`'s sink.
@@ -565,7 +595,8 @@ impl Ports {
                  * an owner to answer. */
                 Some(icmpv6::NEIGHBOR_SOLICIT) => {
                     if let Some(t) = target {
-                        let _ = self.bindings.lock().claim(port, &t);
+                        let group = self.group(port);
+                        let _ = self.bindings.lock().claim(port, group, &t);
                     }
                 }
                 Some(icmpv6::ROUTER_SOLICIT | icmpv6::MLD_REPORT | icmpv6::MLD2_REPORT) => {}
@@ -575,25 +606,53 @@ impl Ports {
             return Ingress::Spoofed;
         } else {
             let advertised = target.filter(|_| kind == Some(icmpv6::NEIGHBOR_ADVERT));
+            let group = self.group(port);
             let mut bindings = self.bindings.lock();
-            if !bindings.claim(port, &src) || advertised.is_some_and(|t| !bindings.claim(port, &t)) {
+            if !bindings.claim(port, group, &src) || advertised.is_some_and(|t| !bindings.claim(port, group, &t)) {
                 return Ingress::Spoofed;
             }
         }
         if kind == Some(icmpv6::ROUTER_SOLICIT) { Ingress::Solicit } else { Ingress::Own6 }
     }
 
-    /// A frame into a port's inbox, and its VM woken.
-    fn deliver(&self, port: usize, frame: &[u8]) {
-        self.deliver_rx(port, frame, None);
+    /// Port `port`'s group (`Port::group`): 0 for a free port, or none.
+    fn group(&self, port: usize) -> u32 {
+        self.ports.get(port).map_or(0, |p| p.group.load(Ordering::Acquire))
+    }
+
+    /// Whether a frame from port `from` goes on to port `to`'s guest: the
+    /// two on one network -- or `to` free, where nothing takes it -- and if
+    /// not, it is dropped, counted against `from`. The delivery asks again,
+    /// under the lock the port changes hands under.
+    fn may_reach(&self, from: usize, to: usize) -> bool {
+        let g = self.group(to);
+        if g == 0 || g == self.group(from) {
+            return true;
+        }
+        if let Some(p) = self.ports.get(from) {
+            p.isolated.fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+
+    /// A frame into a port's inbox, and its VM woken: from a guest of
+    /// `group`, or from `hv0` or the switch itself (None).
+    fn deliver(&self, port: usize, frame: &[u8], group: Option<u32>) {
+        self.deliver_rx(port, frame, None, group);
     }
 
     /// A frame into a port's inbox -- its checksum left to finish, for a NIC
-    /// that takes them so -- and its VM woken.
-    fn deliver_rx(&self, port: usize, frame: &[u8], partial: Option<Partial>) {
+    /// that takes them so -- and its VM woken: from a guest of `group`, for
+    /// the port's only if it is of that group, or from `hv0` or the switch
+    /// itself (None), for anyone's.
+    fn deliver_rx(&self, port: usize, frame: &[u8], partial: Option<Partial>, group: Option<u32>) {
         let Some(p) = self.ports.get(port) else { return };
         let mut inbox = p.inbox.lock();
-        if inbox.owner.is_none() {
+        /* Nobody's, or another network's: the group asked here, where it
+         * is the owner's -- the port may have changed hands since the
+         * switch looked, and what was for the guest on it then is for
+         * nobody now. */
+        if inbox.owner.is_none() || group.is_some_and(|g| p.group.load(Ordering::Relaxed) != g) {
             return;
         }
         if inbox.count == INBOX_FRAMES || frame.len() > FRAME {
@@ -602,6 +661,14 @@ impl Ports {
         }
         let slot = (inbox.head + inbox.count) % INBOX_FRAMES;
         inbox.frames[slot][..frame.len()].copy_from_slice(frame);
+        /* Its checksum left to finish only for a NIC that takes it so now:
+         * the NIC, or the VM on the port, may have changed since the switch
+         * looked. */
+        let mut partial = partial;
+        if let Some(left) = partial.filter(|_| !p.takes_partial.load(Ordering::Relaxed)) {
+            left.complete(&mut inbox.frames[slot][..frame.len()]);
+            partial = None;
+        }
         inbox.lens[slot] = frame.len() as u16;
         inbox.whole[slot] = NOT_WHOLE;
         inbox.partial[slot] = partial;
@@ -610,19 +677,24 @@ impl Ports {
         Self::wake(p, &inbox);
     }
 
-    /// A send of TCP up to 64 KiB into a port's inbox whole, for a VM whose
-    /// NIC takes it so, and its VM woken: false where it does not, or there
-    /// is no room for it whole -- the caller cuts it then.
-    fn deliver_whole(&self, port: usize, frame: &[u8], layout: Tcp4) -> bool {
+    /// A send of TCP up to 64 KiB from a guest of `group` into a port's
+    /// inbox whole, for a VM of that group whose NIC takes it so, and its VM
+    /// woken: false where it does not, or there is no room for it whole --
+    /// the caller cuts it then.
+    fn deliver_whole(&self, port: usize, frame: &[u8], layout: Tcp4, group: u32) -> bool {
         let Some(p) = self.ports.get(port) else { return true };
-        if !p.takes_whole.load(Ordering::Acquire) || frame.len() > SEND {
+        if frame.len() > SEND {
             return false;
         }
         let mut inbox = p.inbox.lock();
-        if inbox.owner.is_none() {
+        /* As `deliver_rx` asks, and whether its NIC takes the send whole --
+         * here, for the same reason. */
+        if inbox.owner.is_none() || p.group.load(Ordering::Relaxed) != group {
             return true;
         }
-        if inbox.count == INBOX_FRAMES || inbox.free_sends == 0 || inbox.sends.len() < WHOLE_SENDS {
+        if !p.takes_whole.load(Ordering::Relaxed) || inbox.count == INBOX_FRAMES || inbox.free_sends == 0
+            || inbox.sends.len() < WHOLE_SENDS
+        {
             return false;
         }
         let w = inbox.free_sends.trailing_zeros() as usize;
@@ -661,16 +733,17 @@ impl Ports {
     }
 
     /// A frame from port `from`'s guest whose checksum it left to finish: so
-    /// to the port it is for, if that port's NIC takes it so, and finished
-    /// for anyone else -- `hv0` and NAT, everyone -- going on as a frame
-    /// sent would.
+    /// to the guest on its network it is for, if that guest's NIC takes it
+    /// so (`deliver_rx`), and finished for anyone else -- `hv0` and NAT,
+    /// everyone -- going on as a frame sent would.
     fn forward_partial(&self, from: usize, frame: &mut [u8], partial: Partial) {
         if frame.len() >= netwire::ETH_HDR_LEN && matches!(self.ingress(from, frame), Ingress::Own | Ingress::Own6)
             && frame[0] & 1 == 0
         {
             if let Some(q) = port_of(&frame[..6]) {
-                if q != from && self.ports.get(q).is_some_and(|p| p.takes_partial.load(Ordering::Acquire)) {
-                    self.deliver_rx(q, frame, Some(partial));
+                let group = self.group(from);
+                if q != from && self.group(q) == group {
+                    self.deliver_rx(q, frame, Some(partial), Some(group));
                     return;
                 }
             }
@@ -698,7 +771,8 @@ impl Ports {
         let dst = &frame[..6];
         if dst[0] & 1 == 0 {
             if let Some(p) = port_of(dst) {
-                if p != from && self.deliver_whole(p, frame, layout) {
+                let group = self.group(from);
+                if p != from && self.group(p) == group && self.deliver_whole(p, frame, layout, group) {
                     return;
                 }
             }
@@ -752,8 +826,8 @@ impl Ports {
                 return;
             }
             if let Some(p) = port_of(dst) {
-                if Some(p) != from {
-                    self.deliver(p, frame);
+                if Some(p) != from && from.map_or(true, |f| self.may_reach(f, p)) {
+                    self.deliver(p, frame, from.map(|f| self.group(f)));
                 }
                 return;
             }
@@ -767,9 +841,12 @@ impl Ports {
                 return;
             }
         }
+        /* To its own network's ports -- which `deliver` picks out -- or,
+         * from `hv0`, every port. */
+        let group = from.map(|f| self.group(f));
         for p in 0..self.ports.len() {
             if Some(p) != from {
-                self.deliver(p, frame);
+                self.deliver(p, frame, group);
             }
         }
         if !v6 {
@@ -786,7 +863,7 @@ impl Ports {
         let mut frame = [0u8; RA_BYTES];
         router_advert(&port_mac(port), &to, &mut frame);
         self.advertised.fetch_add(1, Ordering::Relaxed);
-        self.deliver(port, &frame);
+        self.deliver(port, &frame, None);
     }
 
     fn answer_dhcp(&self, port: usize, frame: &[u8]) {
@@ -797,7 +874,7 @@ impl Ports {
         let mut reply = [0u8; dhcp::REPLY_MAX];
         if let Some(len) = dhcp::answer(frame, port_ip(port), &network, &mut reply) {
             self.dhcp.fetch_add(1, Ordering::Relaxed);
-            self.deliver(port, &reply[..len]);
+            self.deliver(port, &reply[..len], None);
         }
     }
 
@@ -912,6 +989,7 @@ impl hv::nic::Backend for PortBackend {
 
     fn takes(&mut self, takes: Takes) {
         if let Some(p) = self.ports.ports.get(self.port) {
+            let _inbox = p.inbox.lock();
             p.takes_partial.store(takes.partial, Ordering::Release);
             p.takes_whole.store(takes.whole, Ordering::Release);
         }
@@ -934,6 +1012,53 @@ pub struct Switch {
     /// the ports go.
     _uplink: Attached,
     ports: Arc<Ports>,
+    /// The networks the ports are on, a network's number less one its
+    /// place: its name and how many ports are on it -- one with none free
+    /// for the next name. A claim holds it throughout, so that a name has
+    /// one number for as long as a port is on it.
+    networks: Mutex<Vec<Network>>,
+}
+
+/// A network ports are on (`Switch::networks`).
+struct Network {
+    name: String,
+    ports: usize,
+}
+
+/// The place of network `name` in `networks` -- found, or given the first
+/// place no port is on, the name's from then on -- or None for no network,
+/// a port alone; why not, when every place has ports on it. A name is what
+/// `config::valid_network` let through.
+fn find_network(networks: &mut Vec<Network>, name: Option<&str>) -> Result<Option<usize>, &'static str> {
+    let Some(name) = name else { return Ok(None) };
+    if name.is_empty() {
+        return Err("a network has a name");
+    }
+    if let Some(at) = networks.iter().position(|n| n.name == name) {
+        return Ok(Some(at));
+    }
+    let mut owned = String::new();
+    owned.try_reserve_exact(name.len()).map_err(|_| "out of memory for the network's name")?;
+    owned.push_str(name);
+    if let Some(at) = networks.iter().position(|n| n.ports == 0) {
+        networks[at] = Network { name: owned, ports: 0 };
+        return Ok(Some(at));
+    }
+    if networks.len() >= MAX_PORTS {
+        return Err("as many networks as there are ports are in use");
+    }
+    networks.try_reserve(1).map_err(|_| "out of memory for the network's name")?;
+    networks.push(Network { name: owned, ports: 0 });
+    Ok(Some(networks.len() - 1))
+}
+
+/// The group of port `port` (`Port::group`): its network's number, the
+/// place `at` plus one -- or, alone, `ALONE` and its own number.
+fn group(at: Option<usize>, port: usize) -> u32 {
+    match at {
+        Some(at) => at as u32 + 1,
+        None => ALONE | port as u32,
+    }
 }
 
 impl Switch {
@@ -964,6 +1089,8 @@ impl Switch {
                 quiet_until: AtomicU64::new(0),
                 takes_partial: AtomicBool::new(false),
                 takes_whole: AtomicBool::new(false),
+                group: AtomicU32::new(0),
+                isolated: AtomicU64::new(0),
             });
         }
         let ports = Arc::new(Ports {
@@ -972,9 +1099,12 @@ impl Switch {
             bindings: IrqSpinLock::new(bindings), advertised: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
+        let mut table = Vec::new();
+        table.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
+        let networks = Mutex::new(table).ok_or_else(|| String::from("out of memory for the switch"))?;
         let uplink = vnic.attach(Arc::new(Uplink(ports.clone())))
             .ok_or_else(|| String::from("hv0 has a sink attached already -- another load of hv?"))?;
-        Ok(Switch { nat, _uplink: uplink, ports })
+        Ok(Switch { nat, _uplink: uplink, ports, networks })
     }
 
     /// The guests' way out: NAT on, if it is not yet, through the device
@@ -1006,34 +1136,54 @@ impl Switch {
         dns
     }
 
-    /// A free port for `vm`: its number, or why there is none. The first
-    /// VM on a port gives it its inbox's room, taken here with no lock held.
-    pub fn claim(&self, vm: &Arc<Shared>) -> Result<usize, &'static str> {
+    /// A free port for `vm`, on `network` or alone: its number, or why there
+    /// is none. The first VM on a port gives it its inbox's room, taken here
+    /// with no spin lock held.
+    pub fn claim(&self, vm: &Arc<Shared>, network: Option<&str>) -> Result<usize, &'static str> {
+        let mut networks = self.networks.lock();
+        let at = find_network(&mut networks, network)?;
         for i in 0..self.ports.ports.len() {
-            if self.take(i, vm)? {
+            if self.take(i, vm, group(at, i))? {
+                if let Some(n) = at.and_then(|n| networks.get_mut(n)) {
+                    n.ports += 1;
+                }
                 return Ok(i);
             }
         }
         Err("every port of the switch is taken")
     }
 
-    /// Port `port` for `vm`, and no other: what a VM with its own address
-    /// asks for (`port=`), the address and the MAC being the port's. Why
-    /// not, when it is taken or there is no such port.
-    pub fn claim_at(&self, port: usize, vm: &Arc<Shared>) -> Result<usize, &'static str> {
+    /// Port `port` for `vm`, and no other, on `network` or alone: what a VM
+    /// with its own address asks for (`port=`), the address and the MAC
+    /// being the port's. Why not, when it is taken or there is no such port.
+    pub fn claim_at(&self, port: usize, vm: &Arc<Shared>, network: Option<&str>) -> Result<usize, &'static str> {
         if port >= self.ports.ports.len() {
             return Err("there is no such port on the switch");
         }
-        if self.take(port, vm)? {
+        let mut networks = self.networks.lock();
+        let at = find_network(&mut networks, network)?;
+        if self.take(port, vm, group(at, port))? {
+            if let Some(n) = at.and_then(|n| networks.get_mut(n)) {
+                n.ports += 1;
+            }
             Ok(port)
         } else {
             Err("that port of the switch is another VM's")
         }
     }
 
-    /// Port `i` for `vm` if it is free: whether it was, or that its room
-    /// could not be had.
-    fn take(&self, i: usize, vm: &Arc<Shared>) -> Result<bool, &'static str> {
+    /// The network port `port` is on, by name: None for one alone, or free.
+    pub fn network_of(&self, port: usize) -> Option<String> {
+        let g = self.ports.group(port);
+        if g == 0 || g & ALONE != 0 {
+            return None;
+        }
+        self.networks.lock().get(g as usize - 1).map(|n| n.name.clone())
+    }
+
+    /// Port `i` for `vm`, of `group`, if it is free: whether it was, or that
+    /// its room could not be had.
+    fn take(&self, i: usize, vm: &Arc<Shared>, group: u32) -> Result<bool, &'static str> {
         let Some(p) = self.ports.ports.get(i) else { return Ok(false) };
         let roomless = {
             let inbox = p.inbox.lock();
@@ -1076,6 +1226,8 @@ impl Switch {
             p.quiet_until.store(0, Ordering::Release);
             p.takes_partial.store(false, Ordering::Release);
             p.takes_whole.store(false, Ordering::Release);
+            p.isolated.store(0, Ordering::Relaxed);
+            p.group.store(group, Ordering::Release);
             *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
             self.ports.in_use.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
@@ -1089,16 +1241,23 @@ impl Switch {
     /// The port given up, and its VM with it -- dropped here, the lock down.
     pub fn release(&self, port: usize) {
         let Some(p) = self.ports.ports.get(port) else { return };
-        let owner = {
+        let (owner, group) = {
             let mut inbox = p.inbox.lock();
             inbox.clear();
             p.waiting.store(0, Ordering::Release);
-            inbox.owner.take()
+            (inbox.owner.take(), p.group.swap(0, Ordering::AcqRel))
         };
         if owner.is_some() {
             self.ports.in_use.fetch_sub(1, Ordering::Relaxed);
         }
         drop(owner);
+        /* One port fewer on its network, whose name is the next's once it
+         * has none. */
+        if group != 0 && group & ALONE == 0 {
+            if let Some(n) = self.networks.lock().get_mut(group as usize - 1) {
+                n.ports = n.ports.saturating_sub(1);
+            }
+        }
         /* Its IPv6 addresses go with its VM: the next to claim the port, or
          * any port, may have them. */
         self.ports.bindings.lock().release(port);
@@ -1127,6 +1286,7 @@ impl Switch {
             spoofed: p.spoofed.load(Ordering::Relaxed),
             over_share: p.over_share.load(Ordering::Relaxed),
             flooded: p.flooded.load(Ordering::Relaxed),
+            isolated: p.isolated.load(Ordering::Relaxed),
         })
     }
 
