@@ -2518,8 +2518,9 @@ fn sync_msix(p: &mut Platform) {
 /// Hand the guest's receive register its next byte when it is free: first
 /// any answer it is waiting for to a terminal query (the cursor position a
 /// shell's line editor asks for before it reads), then a byte of what was
-/// typed -- held back until the guest has reached a prompt, so the boot
-/// does not swallow it. On every round of the first CPU's loop and not only
+/// typed -- held back until the guest is at a prompt, so the boot does not
+/// swallow it, and after each line until the next prompt, so a line is not
+/// typed ahead of the shell. On every round of the first CPU's loop and not only
 /// at an idle HLT: while a shell's line editor reads the answer to its
 /// cursor query it spins polling the port rather than halting, so a byte
 /// offered only at HLT would never arrive and the editor would time out.
@@ -2531,6 +2532,9 @@ fn feed_console(p: &mut Platform, host: &dyn Host) {
         p.uart.set_rx(byte);
     } else if let Some(byte) = host.input(p.uart.prompt_seen()) {
         p.uart.set_rx(byte);
+        if byte == b'\n' || byte == b'\r' {
+            p.uart.line_taken();
+        }
     }
 }
 
