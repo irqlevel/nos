@@ -302,6 +302,9 @@ fn serve(start: Serve) {
             Op::Read => image.read_at(offset, req.data_mut()).is_ok(),
             Op::Write => image.write_at(offset, req.data()).is_ok(),
             Op::Flush => image.sync().is_ok(),
+            /* Each range's whole blocks given back, as a discard asks */
+            Op::Discard => req.ranges().all(|r| image.discard(r.offset, r.len).is_ok()),
+            Op::WriteZeroes => req.ranges().all(|r| image.write_zeroes(r.offset, r.len, r.unmap).is_ok()),
         };
         req.done(ok);
 

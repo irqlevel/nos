@@ -397,6 +397,11 @@ const IMAGE_SIZE: usize = 96 * 1024;
 const IMAGE_WRITES: [(usize, usize, u8); 5] =
     [(8192 + 100, 3, 2), (30000, 6000, 3), (4000, 20000, 4), (8192, 8192, 5), (IMAGE_SIZE - 512, 512, 6)];
 
+/// Then zeros over it -- at, length, unmap -- across blocks and holes, given
+/// back and written; and a discard of whole blocks of every size ext2 has.
+const IMAGE_ZEROES: [(usize, usize, bool); 2] = [(10000, 20000, true), (40000, 1000, false)];
+const IMAGE_DISCARD: (usize, usize) = (32768, 4096);
+
 /// A disk's image (`image`): a file with holes held, and read and written
 /// as a guest's disk is -- off the VFS's lock where its filesystem keeps
 /// blocks on a device: holes reading as zeros, a write into one, a write
@@ -459,6 +464,31 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
         report.say(path, "the image took a write or a read past its end");
         return false;
     }
+
+    /* What a guest gives back: a write of zeros, its whole blocks given back
+     * or written; and a discard, whose whole blocks read as zeros after it
+     * where the filesystem gives blocks back, and as they were where it
+     * gives nothing back -- what it covers of a block in part as it was */
+    for (at, len, unmap) in IMAGE_ZEROES {
+        expect[at..at + len].fill(0);
+        if !image.write_zeroes(at as u64, len as u64, unmap) || !image.read_at(0, &mut got) || got != expect {
+            report.say(path, "a write of zeros to the image failed, or reads back wrong");
+            return false;
+        }
+    }
+    let (at, len) = IMAGE_DISCARD;
+    if image.gives_back() {
+        expect[at..at + len].fill(0);
+    }
+    if !image.discard(at as u64, len as u64) || !image.read_at(0, &mut got) || got != expect {
+        report.say(path, "a discard of the image failed, or reads back wrong");
+        return false;
+    }
+    if image.discard(IMAGE_SIZE as u64 - 512, 1024) || image.write_zeroes(IMAGE_SIZE as u64, 1, true) {
+        report.say(path, "the image took a discard or a write of zeros past its end");
+        return false;
+    }
+
     if !image.sync() {
         report.say(path, "the image's sync failed");
         return false;

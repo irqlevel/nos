@@ -949,6 +949,30 @@ def disk(args):
           x("umount /mnt", 120),
           x("grep virtio /proc/interrupts"),
           "hv list"]
+    # Several of the guest's requests at once, as a disk's tasks serve them
+    # (`modules/hv/src/disk.rs`): four files written side by side and their
+    # sums taken; then, the page cache gone with a remount, read back side
+    # by side off the device -- the image's reads in lanes of their own, its
+    # writes one at a time -- and the sums the same.
+    side = "for i in 1 2 3 4; do %s & done; wait"
+    parallel = [x("mount /dev/vda /mnt"),
+                x((side % "dd if=/dev/urandom of=/mnt/r$i bs=64k count=16 2>/dev/null") + "; sync", 300),
+                x("md5sum /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 | sort > /sums", 120),
+                x("umount /mnt", 120),
+                x("mount /dev/vda /mnt"),
+                x("(%s) | sort > /sums2" % (side % "md5sum /mnt/r$i"), 300),
+                x("cmp /sums /sums2 && wc -l < /sums2 && echo nos-same-$((6*7))"),
+                x("umount /mnt", 120)]
+    rc += parallel
+    # What the guest no longer needs given back: the files it wrote deleted
+    # and its free space trimmed -- discards, which nos's image turns into
+    # holes in its file (`fs::image`, `Vfs::punch`), its blocks the root's
+    # again; the image clean after, holding what the guest kept.
+    trim = [x("mount /dev/vda /mnt"),
+            x("rm -f /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 /mnt/big; sync", 120),
+            x("fstrim -v /mnt", 300),
+            x("umount /mnt", 120)]
+    rc += trim
     handler = "/etc/acpi/PWRF/00000080"
     if args.acpi:
         rc += [x("mount /dev/vda /mnt"),
@@ -986,16 +1010,28 @@ def disk(args):
                     r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
         pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
                  out(18)[-300:])
+        same = output_of(secs, parallel[6], 0) or ""
+        pt.check("four files written side by side read back side by side, every one the same",
+                 re.search(r"(?m)^4\s*$", same) is not None and "nos-same-42" in same, same[-600:])
+        trimmed = output_of(secs, trim[2], 0) or ""
+        m = re.search(r"/mnt: (\d+) bytes trimmed", trimmed)
+        pt.check("the guest's free space trimmed: discards the disk took", m is not None and int(m.group(1)) > 0,
+                 trimmed[-600:])
         # The image -- held while the guest ran -- says as it is let go of
         # what it read and wrote off the VFS's lock, and what through it:
         # the guest's reads and its writes over blocks the image had, off
         # it (`fs::image`); its writes into holes, through it.
-        held = r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock"
+        held = (r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock, "
+                r"\d+ written through it, (\d+) blocks given back")
         said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
         m = re.search(held, said)
+        line = (re.search(r"(?m)^.*image: /disk\.img.*$", said) or [said[-600:]])[0]
         pt.check("the guest's disk was read and written off the VFS's lock",
-                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0,
-                 (re.search(r"(?m)^.*image: /disk\.img.*$", said) or [said[-600:]])[0])
+                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
+        # 8 MiB written and deleted: at least half of it given back, in
+        # nos's root's blocks of 4 KiB.
+        pt.check("and what the guest trimmed given back to nos's root: 4 MiB at least",
+                 m is not None and int(m.group(3)) >= 1024, line)
         if args.acpi:
             # The halt's lines are on the serial console: the shell gave it
             # back as it stopped, before the modules went.
@@ -1016,6 +1052,8 @@ def disk(args):
             m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
             pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
                      and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
+            d = re.search(r"vda +.*; (\d+) discards \((\d+) KiB\)", stop)
+            pt.check("and the discards", d is not None and int(d.group(1)) > 0 and int(d.group(2)) > 0, stop[-800:])
     finally:
         pt.kill(p)
 

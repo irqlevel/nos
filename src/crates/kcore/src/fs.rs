@@ -183,6 +183,21 @@ impl Image {
         if rc == 0 { Ok(()) } else { Err(Error::IoError) }
     }
 
+    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// filesystem -- holes from here on, reading as zeros, the image's size
+    /// as it was: a guest's discard. What it covers of a block only in part
+    /// is left as it is.
+    pub fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        if fs::kernel_image_discard(self.handle, offset, len) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// `len` bytes from `offset` made zeros: with `unmap` the whole blocks
+    /// among them given back, the rest written over.
+    pub fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> Result<()> {
+        let rc = fs::kernel_image_write_zeroes(self.handle, offset, len, i32::from(unmap));
+        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
     /// Everything written to the image, on its disk's medium: a guest's
     /// flush.
     pub fn sync(&self) -> Result<()> {

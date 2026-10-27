@@ -28,6 +28,13 @@
 //! slot's lock across the C ABI), and the hold keeps everyone else off the
 //! file.
 //!
+//! A guest's discard gives whole blocks back to the filesystem (`discard`,
+//! `Vfs::punch`): holes from then on, as a write of zeros with its unmap
+//! flag does with the blocks it covers whole (`write_zeroes`). Blocks given
+//! back may be the next file's the moment the punch is done -- which is safe
+//! because, the image's calls coming one at a time, no read of its own is
+//! under way off the VFS's lock on a block it mapped before them.
+//!
 //! A loadable module reaches one through the C ABI at the bottom -- an image
 //! is a slot of this file's table and the generation of what is in it, looked
 //! up on every call (`kcore::fs::Image`).
@@ -46,6 +53,10 @@ use crate::vfs::{Handle, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
 
 /// The most blocks a batch moves: a page of the buffer each.
 const BATCH_PAGES: usize = 64;
+
+/// What zeros are written from, a piece at a time (`write_zeroes`).
+const ZERO_CHUNK: usize = 16 * 1024;
+static ZEROS: [u8; ZERO_CHUNK] = [0; ZERO_CHUNK];
 
 /// What an image reads and writes off the VFS's lock with: the device its
 /// file's blocks are on, and a page of the buffer for each block of a batch.
@@ -66,6 +77,8 @@ struct Direct {
     read_off: u64,
     written_off: u64,
     written_through: u64,
+    /// Blocks given back by discards.
+    punched: u64,
 }
 
 pub struct Image {
@@ -123,9 +136,19 @@ impl Image {
         self.identity
     }
 
+    /// Whether a discard gives blocks back -- its filesystem keeps blocks of
+    /// its own on a device -- or changes nothing.
+    pub fn gives_back(&self) -> bool {
+        self.direct.is_some()
+    }
+
     /// Whether `len` bytes from `offset` are all inside the image.
     fn inside(&self, offset: u64, len: usize) -> bool {
-        offset.checked_add(len as u64).is_some_and(|end| end <= self.size)
+        self.inside_len(offset, len as u64)
+    }
+
+    fn inside_len(&self, offset: u64, len: u64) -> bool {
+        offset.checked_add(len).is_some_and(|end| end <= self.size)
     }
 
     /// Fills `buf` from `offset`, all of it inside the image: false on an
@@ -258,6 +281,60 @@ impl Image {
         true
     }
 
+    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// filesystem -- holes from here on, reading as zeros, the image's size
+    /// as it was: a guest's discard. What the range covers of a block only
+    /// in part is left as it is, as a disk may leave it. False for a range
+    /// not inside the image, an image held for reading, or an I/O error. On
+    /// a filesystem with no blocks of its own there is nothing to give back,
+    /// and that is done. The filesystem has its metadata written before it
+    /// is done, so a sync after it is the device's alone.
+    pub fn discard(&mut self, offset: u64, len: u64) -> bool {
+        if !self.writable || !self.inside_len(offset, len) {
+            return false;
+        }
+        let (vfs, handle) = (self.vfs, self.handle);
+        let Some(direct) = self.direct.as_mut() else { return true };
+        match vfs.punch(handle, offset, len) {
+            Some(given) => {
+                direct.punched += given;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `len` bytes from `offset` made zeros, all of them inside the image:
+    /// with `unmap` the whole blocks among them given back -- holes read as
+    /// zeros -- and the rest written over with zeros. False for a range not
+    /// inside, an image held for reading, or an I/O error.
+    pub fn write_zeroes(&mut self, offset: u64, len: u64, unmap: bool) -> bool {
+        if !self.writable || !self.inside_len(offset, len) {
+            return false;
+        }
+        let end = offset + len;
+        if let Some(block) = self.direct.as_ref().map(|direct| direct.block as u64).filter(|_| unmap) {
+            let (from, to) = (offset.div_ceil(block) * block, end / block * block);
+            if from < to {
+                return self.discard(from, to - from) && self.zero(offset, from) && self.zero(to, end);
+            }
+        }
+        self.zero(offset, end)
+    }
+
+    /// Zeros written over `[from, to)`, a piece at a time.
+    fn zero(&mut self, from: u64, to: u64) -> bool {
+        let mut at = from;
+        while at < to {
+            let n = ((to - at) as usize).min(ZERO_CHUNK);
+            if !self.write_at(at, &ZEROS[..n]) {
+                return false;
+            }
+            at += n as u64;
+        }
+        true
+    }
+
     /// Everything written to the image so far on its disk's medium: the
     /// device's cache pushed out -- or, after a write the VFS took, the
     /// filesystem synced, which pushes it out after its own metadata.
@@ -281,7 +358,8 @@ impl Drop for Image {
         let path = core::str::from_utf8(&self.path).unwrap_or("(a path that is not UTF-8)");
         match &self.direct {
             Some(d) => trace!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} \
-                                  written through it", path, d.read_off, d.written_off, d.written_through),
+                                  written through it, {} blocks given back", path, d.read_off, d.written_off,
+                              d.written_through, d.punched),
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
         }
@@ -313,7 +391,7 @@ impl Direct {
         pieces.try_reserve_exact(batch.pages()).ok()?;
         sectors.resize(batch.pages(), 0);
         Some(Direct { disk, block, batch, sectors, pieces, through_vfs: false, read_off: 0, written_off: 0,
-                      written_through: 0 })
+                      written_through: 0, punched: 0 })
     }
 }
 
@@ -487,6 +565,26 @@ pub unsafe extern "C" fn kernel_image_write(image: usize, offset: u64, data: *co
     }
     let data = unsafe { core::slice::from_raw_parts(data, len) };
     match with(image, |image| image.write_at(offset, data)) {
+        Some(true) => 0,
+        _ => -1,
+    }
+}
+
+/// The whole blocks inside `len` bytes from `offset` given back -- holes,
+/// reading as zeros -- a guest's discard: 0, or -1.
+#[no_mangle]
+pub extern "C" fn kernel_image_discard(image: usize, offset: u64, len: u64) -> i32 {
+    match with(image, |image| image.discard(offset, len)) {
+        Some(true) => 0,
+        _ => -1,
+    }
+}
+
+/// `len` bytes from `offset` made zeros, the whole blocks among them given
+/// back with `unmap` not 0: 0, or -1.
+#[no_mangle]
+pub extern "C" fn kernel_image_write_zeroes(image: usize, offset: u64, len: u64, unmap: i32) -> i32 {
+    match with(image, |image| image.write_zeroes(offset, len, unmap != 0)) {
         Some(true) => 0,
         _ => -1,
     }

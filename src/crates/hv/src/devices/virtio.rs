@@ -41,7 +41,7 @@ pub const DEVICE_CONFIG: u16 = 0x14;
 /// and where the configuration begins then.
 const CONFIG_VECTOR: u16 = 0x14;
 const QUEUE_VECTOR: u16 = 0x16;
-const DEVICE_CONFIG_MSIX: u16 = 0x18;
+pub const DEVICE_CONFIG_MSIX: u16 = 0x18;
 /// A vector register's "none": no interrupt for it -- and what reads back
 /// from one a driver set to an entry the table has not got.
 pub const NO_VECTOR: u16 = 0xFFFF;
