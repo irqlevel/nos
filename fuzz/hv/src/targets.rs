@@ -29,6 +29,7 @@ pub static ALL: &[Target] = &[
     Target { name: "pit", run: pit, max_len: 2048 },
     Target { name: "rtc", run: rtc, max_len: 1024 },
     Target { name: "pm", run: pm, max_len: 2048 },
+    Target { name: "pvpanic", run: pvpanic_target, max_len: 512 },
     Target { name: "pci", run: pci_bus, max_len: 2048 },
     Target { name: "lapic", run: lapic_target, max_len: 4096 },
     Target { name: "ioapic", run: ioapic_target, max_len: 4096 },
@@ -318,6 +319,35 @@ fn pm(r: &mut Input) {
                 p.press_power_button();
             }
         }
+    }
+}
+
+/// The panic device, held to what its port promises: a read says the events
+/// it takes, PANICKED and CRASH_LOADED; a write with PANICKED is the panic,
+/// whatever else it says; one with CRASH_LOADED alone is counted and let
+/// go; anything else is nothing.
+fn pvpanic_target(r: &mut Input) {
+    use crate::devices::pvpanic::{Event, PvPanic, CRASH_LOADED, PANICKED, PORT};
+    let mut dev = PvPanic::default();
+    let mut crash = 0u32;
+    invariant!(PvPanic::owns(PORT) && !PvPanic::owns(PORT + 1) && !PvPanic::owns(PORT - 1), "the port it owns");
+    while let Some(op) = r.op(2) {
+        if op == 0 {
+            invariant!(dev.read() == PANICKED | CRASH_LOADED, "a read of {:#x}", dev.read());
+            continue;
+        }
+        let v = r.u8();
+        let want = if v & PANICKED != 0 {
+            Some(Event::Panicked)
+        } else if v & CRASH_LOADED != 0 {
+            crash += 1;
+            Some(Event::CrashLoaded)
+        } else {
+            None
+        };
+        let got = dev.write(v);
+        invariant!(got == want, "{:#x} written, {:?} made of it, {:?} the model", v, got, want);
+        invariant!(dev.crash_loaded == crash, "{} crash kernels counted, {} the model", dev.crash_loaded, crash);
     }
 }
 

@@ -8,7 +8,8 @@
 //! looks there: an XSDT naming the FADT and, for a guest whose CPUs have
 //! local APICs, the MADT; the FADT naming the FACS, the DSDT and the fixed
 //! hardware's registers (`devices::pm`); and the DSDT, the one table in AML,
-//! with the S5 sleep state and the PCI host bridge.
+//! with the S5 sleep state, the PCI host bridge and the panic device
+//! (`devices::pvpanic`), `QEMU0001` on its port, as QEMU's DSDT has it.
 //!
 //! The host bridge has to be there: a Linux with ACPI finds PCI through the
 //! namespace alone -- the root bridges the DSDT describes -- and never probes
@@ -33,7 +34,7 @@
 //! Everything is laid out into a buffer the caller copies into guest memory:
 //! plain data, with its checksums, holding nothing of the guest's.
 
-use crate::devices::{ioapic, pm, rtc};
+use crate::devices::{ioapic, pm, pvpanic, rtc};
 use crate::lapic;
 use crate::run::{RESET_CONTROL, RESET_VALUE};
 
@@ -165,6 +166,7 @@ const BYTE_PREFIX: u8 = 0x0A;
 const WORD_PREFIX: u8 = 0x0B;
 const DWORD_PREFIX: u8 = 0x0C;
 const QWORD_PREFIX: u8 = 0x0E;
+const STRING_PREFIX: u8 = 0x0D;
 const SCOPE_OP: u8 = 0x10;
 const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
@@ -216,6 +218,10 @@ const CONFIG_PORTS_LEN: u8 = 8;
 const BUSES: u16 = 0x100;
 /// The room a `_CRS` takes: every descriptor it may have.
 const CRS_MAX: usize = 96;
+/// The panic device's ID, which Linux's `pvpanic-mmio` binds to, and the
+/// bytes of its `_CRS`: its port, and the end.
+const PVPANIC_HID: &[u8; 8] = b"QEMU0001";
+const PVPANIC_CRS_BYTES: u64 = 10;
 
 /// A cursor over the bytes the tables are laid out in. A write past their
 /// end writes nothing and sets `overflow`, which is looked at once, at the
@@ -576,6 +582,10 @@ fn name(o: &mut Out, seg: &[u8; 4]) {
 ///         Name (_CRS, ResourceTemplate () { ... })
 ///         Name (_PRT, Package () { Package () { 0xSSSSFFFF, 0, 0, IRQ }, ... })
 ///     }
+///     Device (PEVT) {
+///         Name (_HID, "QEMU0001")
+///         Name (_CRS, ResourceTemplate () { IO (Decode16, 0x505, 0x505, 1, 1) })
+///     }
 /// }
 /// ```
 fn write_dsdt(o: &mut Out, m: &Machine) {
@@ -637,6 +647,28 @@ fn write_dsdt(o: &mut Out, m: &Machine) {
     }
 
     close(o, device);
+
+    o.u8(EXT_OP_PREFIX);
+    let panic = open(o, DEVICE_OP);
+    o.put(b"PEVT");
+    name(o, b"_HID");
+    o.u8(STRING_PREFIX);
+    o.put(PVPANIC_HID);
+    o.u8(0);
+    name(o, b"_CRS");
+    let buffer = open(o, BUFFER_OP);
+    int(o, PVPANIC_CRS_BYTES);
+    o.u8(IO_PORT_TAG);
+    o.u8(IO_DECODE_16);
+    o.u16(pvpanic::PORT);
+    o.u16(pvpanic::PORT);
+    o.u8(1); // alignment
+    o.u8(1); // length
+    o.u8(END_TAG);
+    o.u8(0);
+    close(o, buffer);
+    close(o, panic);
+
     close(o, scope);
     seal(o, start);
 }

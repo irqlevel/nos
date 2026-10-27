@@ -46,6 +46,7 @@ Exit code 0 = every required marker appeared.
 """
 
 import argparse
+import base64
 import importlib.util
 import os
 import re
@@ -1213,6 +1214,88 @@ def smbios(args):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def pvpanic(args):
+    """A guest's kernel that panics, and says so to its panic device -- which
+    it finds by its ACPI, `QEMU0001` on port 0x505 -- is stopped there, the
+    report saying why, before its own `panic=` would have rebooted it; one
+    started with `restart` is booted again at each, up to its limit, as one
+    that resets itself is; and a running guest's driver binds the device,
+    its init's exit a panic like any other. The DSDT the device is in comes
+    back out for `iasl`, where the machine has it."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvpanic-")
+    x = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
+    c = cpus_opt(args)
+    rc = ["insmod /hv.ko", "hv on",
+          # No initrd, so no init: a panic, which panic=1 would make a
+          # reboot a second later.
+          "hv start /bzImage mem=64%s cmdline=%s panic=1" % (c, args.cmdline),
+          "hv wait 0 secs=300 nos-never-printed",
+          "hv list",
+          "hv stop 0",
+          "hv start /bzImage mem=64%s restart cmdline=%s panic=1" % (c, args.cmdline),
+          "hv wait 1 secs=500 nos-never-printed-1",
+          "hv list",
+          "hv stop 1",
+          "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline),
+          x(2, "id", args.vm_secs),
+          x(2, "ls /sys/bus/platform/drivers/pvpanic-mmio/"),
+          x(2, "base64 -w 0 /sys/firmware/acpi/tables/DSDT; echo; echo dsdt-done"),
+          # Its init is its shell: an exit kills init, a panic.
+          r"hv send 2 exit\n",
+          "hv wait 2 secs=120 nos-never-printed-2",
+          "hv console 2 bytes=3000",
+          "hv list",
+          RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    p, log, image = boot_rc(args, tmp, rc)
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        txt = open(log, errors="replace").read()
+        secs = sections(txt)
+        out = lambda line, n=0: output_of(secs, line, n) or ""
+        panicked = "the guest's kernel panicked, and said so to its panic device"
+        first = out(rc[3])
+        pt.check("a guest whose kernel panics is stopped, its panic device telling why",
+                 re.search(r"hv: vm 0 stopped without printing .* -- %s" % re.escape(panicked), first) is not None,
+                 first[-800:])
+        pt.check("... before its panic=1 could reboot it", "Rebooting in" not in first, first[-800:])
+        pt.check("hv list keeps it, stopped, with its reason",
+                 re.search(r"vm 0  stopped .* -- %s" % re.escape(panicked), out(rc[4])) is not None, out(rc[4])[-600:])
+        loop = out(rc[7])
+        pt.check("one started with restart is booted again at each panic, until the loop is called one",
+                 re.search(r"hv: vm 1 stopped without printing .* -- %s.* -- reset 6 times in 60 s, left stopped"
+                           % re.escape(panicked), loop) is not None, loop[-800:])
+        pt.check("five restarts before it was left stopped", re.search(r"vm 1  stopped .* restarts 5 ", out(rc[8], 1))
+                 is not None, out(rc[8], 1)[-600:])
+        pt.check("a running guest reached its shell", "uid=0 gid=0" in out(rc[11]), out(rc[11])[-500:])
+        pt.check("its kernel's pvpanic-mmio bound the device, QEMU0001 by its ACPI",
+                 "QEMU0001:00" in out(rc[12]), out(rc[12])[-500:])
+        last, console = out(rc[15]), out(rc[16])
+        pt.check("its init's exit is a panic, and stops it the same way",
+                 re.search(r"hv: vm 2 stopped .* -- %s" % re.escape(panicked), last) is not None
+                 and "Attempted to kill init" in console, last[-800:] + console[-800:])
+        dsdt = re.search(r"(?m)^([A-Za-z0-9+/=]{40,})\s*$", out(rc[13]))
+        if dsdt and shutil.which("iasl"):
+            raw = os.path.join(tmp, "dsdt.dat")
+            with open(raw, "wb") as f:
+                f.write(base64.b64decode(dsdt.group(1)))
+            dis = subprocess.run(["iasl", "-d", raw], capture_output=True, cwd=tmp)
+            dsl = open(os.path.join(tmp, "dsdt.dsl"), errors="replace").read() if dis.returncode == 0 else ""
+            pt.check("iasl takes the DSDT, the panic device in it", dis.returncode == 0 and '"QEMU0001"' in dsl
+                     and "0x0505" in dsl, (dis.stdout + dis.stderr).decode(errors="replace")[-800:])
+        elif dsdt:
+            print("note: no iasl here -- the DSDT, base64, is in the log")
+    finally:
+        pt.kill(p)
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def web_server(root):
     """A web server on the test machine, serving `root` on 127.0.0.1 --
     which QEMU's user network puts at 10.0.2.2 for nos, and NAT for the
@@ -1679,6 +1762,9 @@ def main():
                     help="the guest's CPUs: with more than one, that it brings every one up, and that "
                          "each takes its timer's interrupts and IPIs (needs a guest kernel with SMP and "
                          "x2APIC; under TCG, QEMU 9.2 or later)")
+    ap.add_argument("--pvpanic", action="store_true",
+                    help="the guest kernel has ACPI and PVPANIC_MMIO: check that a panic stops it, saying so, "
+                         "and that a guest with restart is booted again after one")
     ap.add_argument("--smbios", action="store_true",
                     help="the guest kernel has DMI (DMI, DMIID): check what its SMBIOS tables say it is, and that "
                          "a VM keeps its UUID from start to start")
@@ -1757,11 +1843,14 @@ def main():
     if not os.path.exists(nos_iso(args)):
         sys.exit("build %s first (make%s)" % (nos_iso(args), " nos-test.iso" if args.nos_iso else ""))
 
-    if args.attach or args.disk or args.net or args.smbios:
+    if args.attach or args.disk or args.net or args.smbios or args.pvpanic:
         if not args.initrd:
-            sys.exit("--attach, --disk, --net and --smbios need --initrd: the guest's shell is what is typed at")
+            sys.exit("--attach, --disk, --net, --smbios and --pvpanic need --initrd: the guest's shell is what is "
+                     "typed at")
         if args.smbios:
             smbios(args)
+        elif args.pvpanic:
+            pvpanic(args)
         else:
             attach(args) if args.attach else disk(args) if args.disk else network(args)
     else:

@@ -2804,6 +2804,29 @@ start, and a VM started with `uuid=` told it. The hv fuzzer's `smbios`
 target builds the tables from random names, versions and UUIDs and reads
 them back as Linux's `dmi_scan` does.
 
+### A guest that panics: pvpanic
+
+A kernel that panics comes to rest in `panic`: with `panic=N` it reboots N
+seconds later, and without, it spins there for good, a host CPU its own for
+nothing, and all a report could say of it is that it halted. QEMU's panic
+device lets it say so (`hv::devices::pvpanic`): one I/O port, 0x505, which
+the DSDT describes as `QEMU0001` -- what Linux's `pvpanic-mmio` binds to, as
+a distribution's kernel has it built -- and which the driver reads for the
+events the device takes, PANICKED and CRASH_LOADED, then writes as its
+panic notifier runs, the guest's other CPUs stopped already. PANICKED stops
+the VM where it is (`Stop::Panicked`), before its own `panic=` could reboot
+it: the report says the guest's kernel panicked, and a VM started with
+`restart` is booted again, as after a reset of its own, up to the same
+limit. CRASH_LOADED -- a crash kernel loaded, which the guest boots itself
+-- is counted, and the guest goes on.
+
+The gate is `scripts/hv-linux-test.py --pvpanic`, with a kernel built with
+ACPI and `PVPANIC_MMIO`: a guest with no init stopped by its panic, before
+`panic=1` reboots it; one with `restart` booted again at each until the loop
+is called one; a running guest's driver bound to `QEMU0001:00`, its init's
+exit a panic that stops it the same way; and its DSDT taken back out of the
+guest and through `iasl`, where the machine has it.
+
 ## A distribution
 
 The guests above run a kernel built for the purpose, with a BusyBox

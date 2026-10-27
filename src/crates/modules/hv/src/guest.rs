@@ -677,6 +677,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             value, port, hv::run::reset_source(port), rip),
         Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
         Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI PM1 control register, at {:#x}", rip),
+        Stop::Panicked { rip } => write!(out, "the guest's kernel panicked, and said so to its panic device, at {:#x}", rip),
         Stop::MmioInsn { gpa, rip, error, bytes } => {
             write!(out, "an access of guest physical {:#x} at rip {:#x} not performed -- {}; its bytes",
                 gpa, rip, error.describe())?;
@@ -855,8 +856,12 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         }
         let _ = writeln!(out);
     }
+    let crash = guest.crash_kernels();
+    if crash != 0 {
+        let _ = writeln!(out, "  pvpanic    the guest's kernel panicked {} times with a crash kernel loaded, and booted it", crash);
+    }
     if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. } | Stop::Init { .. }
-        | Stop::PowerOff { .. })
+        | Stop::PowerOff { .. } | Stop::Panicked { .. })
     {
         if counts.len() > 1 {
             let _ = writeln!(out, "  stopped by cpu {}:", stopped.cpu);
