@@ -52,9 +52,11 @@ KVM it is whatever the host CPU has):
   - `rmmod` with the extension on for every CPU turns it off for every CPU
   - loading it again finds nothing left on -- the check the rest is for --
     and keeps the VMs' folders in /vms, given no `vms=`
-  - `insmod` given a parameter hv has not got, or a `vms=` that is no
-    absolute path, refuses the load and says why; given `vms=<folder>`,
-    `hv` and `hv vms` say that folder
+  - `insmod` given a parameter hv has not got, a `vms=` that is no absolute
+    path or a `stop_secs=` past 600, refuses the load and says why; given
+    `vms=<folder>`, `hv` and `hv vms` say that folder, and given
+    `stop_secs=N`, `hv` says an unload gives the guests N s to turn
+    themselves off -- 120 when insmod said nothing of it
   - `hv convert` makes qcow2 images qemu-img made of a disk made here --
     compressed, and version 2 -- the disk they were made of, as its SHA-256
     has it; refuses to write over a disk, an image cut short (leaving
@@ -181,26 +183,27 @@ SCRIPT = [
     "rmmod hv",             # 22
     "insmod /hv.ko vmz=/x", # 23
     "insmod /hv.ko vms=data",  # 24
-    "insmod /hv.ko vms=/data/vms/",  # 25
-    "hv",                   # 26
-    "hv vms",               # 27
-    "rmmod hv",             # 28
-    "lsmod",                # 29
-    "dmesg 400 hv:",        # 30
+    "insmod /hv.ko stop_secs=601",  # 25
+    "insmod /hv.ko vms=/data/vms/ stop_secs=7",  # 26
+    "hv",                   # 27
+    "hv vms",               # 28
+    "rmmod hv",             # 29
+    "lsmod",                # 30
+    "dmesg 400 hv:",        # 31
     # A PVH image (hv/src/pvh.rs): hvboot, started at its 32-bit entry with
     # paging off -- under VT-x, by unrestricted guest -- and given no disk.
-    "insmod /hv.ko",        # 31
-    "hv on",                # 32
-    "hv boot /hvboot mem=64 secs=120 cmdline=hvboot.verbose",  # 33
+    "insmod /hv.ko",        # 32
+    "hv on",                # 33
+    "hv boot /hvboot mem=64 secs=120 cmdline=hvboot.verbose",  # 34
     # And of two CPUs: the MP table written beside the start info, the
     # second CPU waiting for a start-up IPI that never comes.
-    "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 34
-    "rmmod hv",             # 35
+    "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 35
+    "rmmod hv",             # 36
 ] + [
     # `hv convert`, a cloud's qcow2 image made a raw disk (CONVERT, above),
     # and then `hv create` of a VM from a URL (create_script, below) --
     # whose lines need the port of the test's web server -- and an rmmod.
-    "insmod /hv.ko",        # 36
+    "insmod /hv.ko",        # 37
 ] + CONVERT
 
 # hvboot, as `make` builds it: the PVH image the script boots.
@@ -810,23 +813,32 @@ def x86_checks(ran, script, digest, grown, raw):
              "on for cpu none of %s" % ALL_CPUS in out[21], out[21])
     pt.check("with no vms= the vms are kept in /vms",
              re.search(r"^hv: vms kept in /vms$", out[21], re.M) is not None, out[21])
+    pt.check("and with no stop_secs= an unload gives the guests 120 s to turn themselves off",
+             re.search(r"^hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons "
+                       r"and gives them 120 s to turn themselves off$", out[21], re.M) is not None, out[21])
     pt.check("it unloads again", "hv unloaded" in out[22], out[22])
 
-    # Its one parameter, vms=: a word it has not got and a path that is no
-    # folder's refuse the load, each said; a folder is kept, its slash let go.
+    # Its parameters, vms= and stop_secs=: a word it has not got, a path
+    # that is no folder's and a time past the most refuse the load, each
+    # said; a folder is kept, its slash let go, and a time is said.
     pt.check("a parameter hv has not got refuses the load",
              '"vmz" is not a parameter of hv\'s' in out[23] and "loaded at" not in out[23], out[23])
     pt.check("and so does vms= with no absolute path",
              "vms=data is not an absolute path" in out[24] and "loaded at" not in out[24], out[24])
-    pt.check("vms=<folder> loads", "hv loaded at" in out[25], out[25])
-    pt.check("and hv says where the vms are kept", "vms kept in /data/vms, as insmod was told" in out[26], out[26])
-    pt.check("and hv vms looks there", "no /data/vms" in out[27], out[27])
-    pt.check("it unloads", "hv unloaded" in out[28], out[28])
-    pt.check("and leaves no module behind", "no modules loaded" in out[29], out[29])
+    pt.check("and so does stop_secs= past 600",
+             "stop_secs=601 is not a number of seconds 0..600" in out[25] and "loaded at" not in out[25], out[25])
+    pt.check("vms=<folder> and stop_secs=N load", "hv loaded at" in out[26], out[26])
+    pt.check("and hv says where the vms are kept", "vms kept in /data/vms, as insmod was told" in out[27], out[27])
+    pt.check("and what an unload gives the guests",
+             "presses the guests' power buttons and gives them 7 s to turn themselves off, as insmod was told"
+             in out[27], out[27])
+    pt.check("and hv vms looks there", "no /data/vms" in out[28], out[28])
+    pt.check("it unloads", "hv unloaded" in out[29], out[29])
+    pt.check("and leaves no module behind", "no modules loaded" in out[30], out[30])
 
     # What the module traced: not on the serial console, because the shell
     # suppresses trace output there once it starts, so the script asks dmesg.
-    logged = out[30]
+    logged = out[31]
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)
@@ -835,18 +847,18 @@ def x86_checks(ran, script, digest, grown, raw):
     # start info hv laid out -- its RAM and the command line, hv's TSC rate
     # after the VM's own words -- finds no disk, says so, and turns the
     # guest off through its ACPI, which is what ends the VM.
-    for i, what in ((33, "of one CPU"), (34, "of two CPUs")):
+    for i, what in ((34, "of one CPU"), (35, "of two CPUs")):
         pvh = out[i]
         pt.check("a PVH image boots, %s: hvboot, at its 32-bit entry, reads the start info hv laid out" % what,
                  re.search(r'hvboot: started by PVH: 6\d MiB of RAM, its command line "hvboot\.verbose', pvh)
                  is not None, pvh)
         pt.check("and, given no disk, says so and turns the guest off by its ACPI",
                  "hvboot: cannot boot: no virtio disk" in pvh and "the guest powered itself off" in pvh, pvh)
-    pt.check("and hv unloads after it", "hv unloaded" in out[35], out[35])
+    pt.check("and hv unloads after it", "hv unloaded" in out[36], out[36])
 
-    pt.check("hv loads for hv convert", "hv loaded at" in out[36], out[36])
-    convert_checks(out[37:37 + len(CONVERT)], digest)
-    at = 37 + len(CONVERT)
+    pt.check("hv loads for hv convert", "hv loaded at" in out[37], out[37])
+    convert_checks(out[38:38 + len(CONVERT)], digest)
+    at = 38 + len(CONVERT)
     # Of what is left: the creates, then `rmmod hv` and `RC_LAST`.
     created = len(script) - 2 - at
     create_checks(out[at:at + created], grown, raw)

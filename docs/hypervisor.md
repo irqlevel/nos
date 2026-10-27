@@ -544,7 +544,9 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all> [secs=N]   press its power button and give it secs (30)
                                 to turn itself off, then stop it; say how it
-                                ended, take it off the list
+                                ended, take it off the list -- as rmmod and
+                                nos's poweroff and reboot stop all of them,
+                                given insmod's stop_secs= (120)
     hv forward [add <port> <vm> <guest-port> | del <port>]
                                 a port of nos's relayed to a guest's
     hv help                     all of these, a line each
@@ -2213,10 +2215,11 @@ module gave that CPU, so a guest racing an `hv off` finds it off and stops,
 `not entered` -- on AMD-V; on Intel the CPU itself refuses to go off while a
 guest's VMCS is current on it ([above](#what-the-extension-costs-while-it-is-on)),
 so an `hv boot` or `hv run` the courtesy check does not see keeps its CPU
-too. `rmmod hv` stops every guest before it turns the extension off -- where
-it is, without pressing its power button; `hv stop all` before it shuts them
-down -- the guests first, an `hv boot` under way among them, so that an `hv exec`
-or `hv wait` waiting on one returns; then the command, whose unregistration
+too. `rmmod hv` stops every guest before it turns the extension off -- its
+power button pressed first and the guests given `stop_secs=`
+([above](#acpi)) -- the guests first, an `hv
+boot` under way among them (stopped at once: it is a diagnostic), so that an
+`hv exec` or `hv wait` waiting on one returns; then the command, whose unregistration
 waits out every call still running (an `hv start` still reading its files
 finds the module going when it comes to add its guest, and stops it itself);
 and only then the extension, on every CPU.
@@ -2224,8 +2227,8 @@ and only then the extension, on every CPU.
 The gate is `scripts/hv-linux-test.py` with `--initrd`: two VMs started side
 by side and one stopped mid-boot, a line typed at the other before its shell
 is up and another at its prompt, `send`, `wait`, `console`, the refused
-`hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
-the next load.
+`hv off`, and an `rmmod` that presses the guest's power button, stops it
+itself when its time is up and leaves nothing on for the next load.
 
 ## A VM in a folder
 
@@ -2337,7 +2340,7 @@ and for the same reason:
 
 ```
 $ insmod /hv.ko vmz=/data/vms
-hv: "vmz" is not a parameter of hv's -- vms=<folder> is
+hv: "vmz" is not a parameter of hv's -- vms=<folder> and stop_secs=N are
 module: hv: init failed
 insmod: /hv.ko failed, error 502
 $ insmod /hv.ko vms=/data/vms
@@ -2345,7 +2348,12 @@ module: hv loaded at 0xFFFF8000...
 $ hv
 hv: AMD-V on for cpu none of 0-3
 hv: vms kept in /data/vms, as insmod was told
+hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons and gives them 120 s to turn themselves off
 ```
+
+Its other parameter is `stop_secs=N`, 0 to 600: what the module's going
+gives the guests to turn themselves off
+([above](#acpi)), and `hv` says it.
 
 `rc add insmod /hv.ko vms=/data/vms` loads it so at every boot. `vms=` is
 at most 208 bytes: the VFS takes paths of 255, and under the folder go a
@@ -2436,8 +2444,9 @@ the folder above it -- boots it and types at it by its name, finds its
 network phase (`--net`), whose VM from its folder asks for
 port 5 and a forward -- its eth0 has the port's address and MAC, and its
 httpd answers from outside through the forward its `vm.toml` asked for;
-`hv-test.py`, whose last loads keep a `vms=` and say it, and refuse a
-parameter hv has not got and a `vms=` that is no absolute path;
+`hv-test.py`, whose last loads keep a `vms=` and a `stop_secs=` and say
+them, and refuse a parameter hv has not got, a `vms=` that is no absolute
+path and a `stop_secs=` past 600;
 `hv-fuzz.py`'s `config` target, which holds the parser to never
 panicking on any text and `render` and `parse` to giving each other back what
 they were given, and whose `switch` target claims a port asked for as well as
@@ -2568,9 +2577,32 @@ ACPI, `acpi=off`, not booted that far -- cannot hear it, and the first CPU's
 loop, which takes the press from the command, says so: it is stopped at
 once, `nothing in it listens to its power button`. `secs=0` stops a guest
 without asking, and `hv stop all` presses every button at once and waits for
-the guests together. `rmmod` does not ask: an unload is no place to wait on
-guests -- a module's exit has five seconds before `rmmod` goes on without
-it -- so `hv stop all` first is the way to shut guests down before one.
+the guests together.
+
+**So does the module's going** -- `rmmod hv`, and nos's own `poweroff` and
+`reboot`, which unload every module on the way down while the files, block
+I/O and soft IRQs a guest's shutdown writes through are all still there
+(`ModuleTable::unload_all`): every guest's power button pressed at once and
+the guests given `stop_secs=` of `insmod`'s together -- 120 s unless told,
+longer than the 90 s systemd gives a service that will not stop before it
+unmounts the disks anyway -- and those still running then stopped where
+they are. A guest that turns itself off ends `stopped for the unload -- the
+guest powered itself off`, in the kernel log; one whose OS never hears the
+button is stopped at once, as `hv stop` stops it. Without it a guest's disk
+was cut off under it: its last writes still in its page cache, its journal
+left to replay -- what `hv-linux-test.py --disk --acpi` now holds nos's own
+poweroff to, a guest's ext4 left mounted coming back clean. `rmmod` goes on
+in the background after five seconds, `lsmod` saying `unloading` and the
+kernel log how each guest ended; the halt waits, and says why in the log
+before it does (`hv: unloading -- 2 vm(s) asked to turn themselves off,
+given 120 s`). `stop_secs=0` is the old way, every guest stopped where it
+is. Meanwhile no guest starts, `hv list` shows each `stopping`, `hv stop` of
+one is refused as already being stopped and an `hv stop` already giving one
+its time goes on with it, the unload's time and its own both running: the
+first to end takes the guest off the list. On a machine whose only console
+is the network the netconsole stays up through all of it -- stopped after
+the modules and the filesystems, sending what it still holds as it goes
+(`rust_net_stop_netconsole`) -- so that the wait is seen.
 
 **A power-off is a write to a port**, as a reset is: SLP_EN with S5's sleep
 type in PM1a's control register. ACPICA writes the type first and the enable
@@ -4421,8 +4453,10 @@ someone else's; then speed.
 
 #### Lifecycle, and stages 4 and 5
 
-- A host `poweroff` or `reboot` stops every guest as `rmmod` does
-  (`stop_all` with no grace): no power button is pressed.
+- ~~A host `poweroff` or `reboot` stops every guest as `rmmod` does
+  (`stop_all` with no grace): no power button is pressed.~~ Done: the
+  unload presses every button and gives the guests `stop_secs=`
+  ([ACPI](#acpi)).
 - ~~`finish` and `FileDisk::drop` wait for their tasks with no deadline: a
   disk task stuck in a read hangs `hv stop`, `rmmod` and the host's
   shutdown with nothing said.~~ Done for every join in the kernel

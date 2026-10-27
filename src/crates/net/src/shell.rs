@@ -462,9 +462,18 @@ pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
     }
 }
 
-/// And what stops them, on the way down and before the soft IRQs go.
+/// And what stops them on the way down, apart: the shell over UDP with the
+/// other shells, before the modules go -- it calls into their commands --
+/// and the netconsole as late as it can be, after the modules and the
+/// filesystems and before the soft IRQs, so that on a machine whose only
+/// console is the network the halt's own lines reach the collector: a
+/// module's exit that waits for guests to turn themselves off among them.
 #[no_mangle]
-pub extern "C" fn rust_net_stop_services() {
+pub extern "C" fn rust_net_stop_shell() {
     abi::udp_shell_stop();
+}
+
+#[no_mangle]
+pub extern "C" fn rust_net_stop_netconsole() {
     NETCONSOLE.stop();
 }
