@@ -588,6 +588,8 @@ fn msi(r: &mut Input) {
 const MEM: u64 = 1 << 20;
 const PAGE: u64 = 4096;
 /* The legacy header's registers. */
+/// What the driver takes of the device's features, legacy virtio's way.
+const GUEST_FEATURES: u16 = 0x04;
 const QUEUE_PFN: u16 = 0x08;
 const QUEUE_SELECT: u16 = 0x0E;
 const QUEUE_NOTIFY: u16 = 0x10;
@@ -733,11 +735,14 @@ pub struct DiskState {
     /// Requests the fuzzer has said are served, to be taken.
     pub ready: usize,
     pub fail: bool,
+    /// Which of those it has said are served comes back next: a backend
+    /// serves several at once, and gives each back as it finishes.
+    pub order: u64,
 }
 
 impl DiskState {
     pub fn new(size: u64, read_only: bool) -> DiskState {
-        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false }
+        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
     }
 
     pub fn size(&self) -> u64 {
@@ -765,8 +770,21 @@ impl blk::Backend for Disk {
                            "a request of {} bytes at {} on a disk of {}", len, req.offset(), s.size);
             }
             blk::Op::Flush => {}
+            blk::Op::Discard | blk::Op::WriteZeroes => {
+                /* The device's copy, checked: what the backend acts on */
+                let ranges: Vec<blk::Range> = req.ranges().collect();
+                invariant!(!ranges.is_empty() && ranges.len() <= 8, "{} ranges handed over", ranges.len());
+                for r in &ranges {
+                    invariant!(r.offset % blk::SECTOR == 0 && r.len % blk::SECTOR == 0,
+                               "a range of {} bytes at {}, not whole sectors", r.len, r.offset);
+                    invariant!(r.offset.checked_add(r.len).is_some_and(|end| end <= s.size),
+                               "a range of {} bytes at {} on a disk of {}", r.len, r.offset, s.size);
+                    invariant!(!r.unmap || req.op() == blk::Op::WriteZeroes, "an unmap flag handed over on a discard");
+                }
+                RANGES_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        invariant!(!(s.read_only && req.op() == blk::Op::Write), "a write handed to a read-only disk");
+        invariant!(!(s.read_only && req.op().writes()), "a write, discard or write of zeros handed to a read-only disk");
         if req.op() == blk::Op::Read {
             req.data_mut().fill(0xA5);
         }
@@ -779,7 +797,15 @@ impl blk::Backend for Disk {
         }
         s.ready -= 1;
         let fail = s.fail;
-        let mut req = s.queue.pop_front()?;
+        if s.queue.is_empty() {
+            return None;
+        }
+        let at = (s.order % s.queue.len() as u64) as usize;
+        s.order = s.order.rotate_left(17).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        if at != 0 {
+            DISK_OUT_OF_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut req = s.queue.remove(at)?;
         req.done(!fail);
         Some(req)
     }
@@ -789,16 +815,35 @@ impl blk::Backend for Disk {
 /// data, and the status byte the device writes; in memory of `limit` bytes.
 pub fn blk_segments(mem: &dyn Memory, r: &mut Input, limit: u64) -> Vec<(u64, u32, bool)> {
     let header = gpa_in(r, limit) & !7;
-    let kind = r.pick(&[0u32, 1, 4, 8, 0xFFFF_FFFF]);
+    let kind = r.pick(&[0u32, 1, 4, 8, 11, 13, 0xFFFF_FFFF]);
     let sector = if r.bool() { r.below(1 << 20) } else { r.value64() };
     let mut h = [0u8; 16];
     h[..4].copy_from_slice(&kind.to_le_bytes());
     h[8..].copy_from_slice(&sector.to_le_bytes());
     mem.put(header, &h);
     let mut segs = vec![(header, if r.u8() < 240 { 16 } else { r.value32() }, false)];
-    for _ in 0..r.below(4) {
-        let len = if r.bool() { 512 * (1 + r.below(128)) as u32 } else { r.value32() };
-        segs.push((gpa_in(r, limit), len, kind != 1));
+    if (kind == 11 || kind == 13) && r.u8() < 200 {
+        /* A discard's or a write of zeros' ranges, as a driver lays them
+         * out: a sector, a count and flags each -- mostly plausible ones. */
+        let count = if r.u8() < 230 { 1 + r.below(8) } else { r.below(12) };
+        let at = gpa_in(r, limit) & !7;
+        for i in 0..count {
+            let mut range = [0u8; 16];
+            let first = if r.u8() < 220 { r.below(1 << 14) } else { r.value64() };
+            let sectors = if r.u8() < 220 { r.below(1 << 12) as u32 } else { r.value32() };
+            let flags = if r.u8() < 200 { (r.u8() & 1) as u32 } else { r.value32() };
+            range[..8].copy_from_slice(&first.to_le_bytes());
+            range[8..12].copy_from_slice(&sectors.to_le_bytes());
+            range[12..].copy_from_slice(&flags.to_le_bytes());
+            mem.put(at.wrapping_add(16 * i), &range);
+        }
+        let len = if r.u8() < 230 { 16 * count as u32 } else { r.value32() };
+        segs.push((at, len, false));
+    } else {
+        for _ in 0..r.below(4) {
+            let len = if r.bool() { 512 * (1 + r.below(128)) as u32 } else { r.value32() };
+            segs.push((gpa_in(r, limit), len, kind != 1));
+        }
     }
     segs.push((gpa_in(r, limit), if r.u8() < 240 { 1 } else { r.value32() }, true));
     segs
@@ -841,6 +886,12 @@ fn blk_target(r: &mut Input) {
                 setup_queue(r, &mut write, &mut q, index);
             }
             3 => {
+                if r.bool() {
+                    /* What the driver takes: everything offered, mostly --
+                     * discard and a write of zeros among it. */
+                    let features = if r.u8() < 200 { u32::MAX } else { r.value32() };
+                    disk.io_write(GUEST_FEATURES, 4, features, &mem, time::boot_time_ns());
+                }
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
                 disk.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
@@ -869,6 +920,7 @@ fn blk_target(r: &mut Input) {
                 let mut s = state.lock().unwrap();
                 s.ready += 1 + r.below(4) as usize;
                 s.fail = r.u8() % 8 == 0;
+                s.order = if r.bool() { 0 } else { r.u64() };
             }
             11 => {
                 disk.set_msix_enabled(r.bool());
@@ -1383,11 +1435,17 @@ fn elf_image(r: &mut Input) -> Vec<u8> {
 static PVH_PARSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PVH_PLANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PVH_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A disk's requests given back before one handed over earlier.
+static DISK_OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Discards and writes of zeros handed to the backend.
+static RANGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
              PVH_BUILT.load(Relaxed));
+    println!("  disks: {} requests given back before one handed over earlier, {} discards and writes of zeros \
+              handed over", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {

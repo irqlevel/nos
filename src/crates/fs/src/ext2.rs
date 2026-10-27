@@ -1971,6 +1971,145 @@ impl Ext2 {
 
         true
     }
+
+    /// Walk the data blocks of logical blocks `[*next, to)` upward, clearing
+    /// each one's pointer and collecting it in `batch` to be freed once the
+    /// pointers are on the disk, until the batch is full; `next` says where
+    /// to go on from. A missing indirect block is a run of holes, stepped
+    /// over whole. The indirect blocks stay, whatever is left in them: they
+    /// map what is past the range too, and one with nothing in it is a run
+    /// of holes as a missing one is. The ones changed are written before
+    /// this returns, so the inode the caller commits next leads to a
+    /// consistent tree (`release_tail`'s rule).
+    fn release_range(&mut self, inode: &mut Inode, to: u64, next: &mut u64, batch: &mut Vec<u32>) -> bool {
+        /* What an allocation left waiting goes down now, in its own order,
+         * and not mixed in with what this writes */
+        if !self.retire_pointers() {
+            return false;
+        }
+        let units = self.block_units();
+        let ppb = u64::from(self.ptrs_per_block);
+        let mut changed = [false; LEVELS];
+        let mut at = *next;
+
+        while at < to && batch.len() < FREE_BATCH {
+            let (top, rel) = match self.place(at) {
+                Some(Place::Direct(slot)) => {
+                    let p = inode.block[slot];
+                    if p != 0 {
+                        if !self.io.is_data_block(p) {
+                            trace!(0, "ext2: direct block {} points outside the filesystem", p);
+                            return false;
+                        }
+                        batch.push(p);
+                        inode.block[slot] = 0;
+                        inode.blocks = inode.blocks.saturating_sub(units);
+                    }
+                    at += 1;
+                    continue;
+                }
+                Some(Place::Tree { level, rel }) => (level, rel),
+                /* Past what the trees map there is nothing to release */
+                None => {
+                    at = to;
+                    continue;
+                }
+            };
+
+            let mut block = inode.block[INDIRECT_SLOT + top];
+            let mut first = self.tree_start(top);
+            if block == 0 {
+                at = first + self.span(top);
+                continue;
+            }
+            if !self.io.is_data_block(block) {
+                trace!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
+                return false;
+            }
+
+            /* Down the tree to the logical block: to its data block, or to
+             * the first level missing, which is where a run of holes is */
+            let mut level = top;
+            loop {
+                if !self.release_load(level, block, &mut changed) {
+                    return false;
+                }
+                let below = ppb.pow(level as u32);
+                let index = (rel / below % ppb) as u32;
+                let next_block = self.ptr(level, index);
+                if next_block != 0 && !self.io.is_data_block(next_block) {
+                    trace!(0, "ext2: block {} in {} block {} points outside the filesystem", next_block,
+                        LEVEL_NAMES[level], block);
+                    return false;
+                }
+
+                if level == 0 {
+                    if next_block != 0 {
+                        batch.push(next_block);
+                        self.clear_ptr(0, index);
+                        changed[0] = true;
+                        inode.blocks = inode.blocks.saturating_sub(units);
+                    }
+                    at += 1;
+                    break;
+                }
+
+                let child_first = first + u64::from(index) * below;
+                if next_block == 0 {
+                    /* A run of holes: all that the missing block would map */
+                    at = child_first + below;
+                    break;
+                }
+                block = next_block;
+                first = child_first;
+                level -= 1;
+            }
+        }
+
+        /* What this round changed in the blocks it keeps goes down ahead of
+         * the caller's flush, and the inode after it */
+        for level in 0..LEVELS {
+            if changed[level] && !self.write_ptrs(level) {
+                return false;
+            }
+        }
+        *next = at;
+        true
+    }
+
+    /// Give back the data blocks of logical blocks `[from, to)` of an inode:
+    /// a hole punched, the file's size as it was. In batches, as a truncate
+    /// cuts (`truncate_inode`): each batch's pointers cleared and on the
+    /// disk, the inode committed without the blocks, and only then are they
+    /// freed in the bitmap -- so a crash leaks at most one batch to e2fsck
+    /// and never leaves a block both in use and free. How many were given
+    /// back, or None.
+    fn punch_inode(&mut self, ino: u32, inode: &mut Inode, from: u64, to: u64) -> Option<u64> {
+        let mut batch: Vec<u32> = Vec::new();
+        if batch.try_reserve_exact(FREE_BATCH).is_err() {
+            trace!(0, "ext2: no memory for the batch of blocks to free");
+            return None;
+        }
+        let mut freed = 0;
+        let mut next = from;
+        while next < to {
+            batch.clear();
+            if !self.release_range(inode, to, &mut next, &mut batch) {
+                return None;
+            }
+            if batch.is_empty() {
+                continue;
+            }
+            if !self.io.flush() || !self.write_inode(ino, inode) {
+                return None;
+            }
+            for &block in &batch {
+                self.free_block(block);
+            }
+            freed += batch.len() as u64;
+        }
+        Some(freed)
+    }
 }
 
 /* ---- vnodes ---- */
@@ -2596,6 +2735,46 @@ impl Ext2 {
         ok
     }
 
+    /// Give back the data blocks of `count` blocks of `file` from block
+    /// `first` -- holes from here on, reading as zeros; the file's size as
+    /// it was -- of those inside the file: what a disk's image a guest
+    /// discards gives back (`image`). How many were given back, or None.
+    pub fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
+        let Some(ino) = self.file_ino(file) else {
+            trace!(0, "ext2: a punch of something that is not a file");
+            return None;
+        };
+        if self.read_only {
+            trace!(0, "ext2: read-only");
+            return None;
+        }
+        let mut inode = match self.read_inode(ino) {
+            Some(inode) => inode,
+            None => {
+                trace!(0, "ext2: read of inode {} failed", ino);
+                return None;
+            }
+        };
+        if inode.mode & MODE_TYPE_MASK != MODE_FILE {
+            trace!(0, "ext2: inode {} is not a regular file", ino);
+            return None;
+        }
+        let blocks = size_of(&inode).div_ceil(self.block_size() as u64);
+        let to = first.saturating_add(count).min(blocks);
+        if first >= to {
+            return Some(0);
+        }
+
+        inode.modify_time = wall_clock_secs() as u32;
+        let freed = self.punch_inode(ino, &mut inode, first, to);
+
+        if !self.io.flush() || !self.write_inode(ino, &inode) || !self.flush_bitmap() || !self.commit_meta() {
+            trace!(0, "ext2: commit of inode {} failed", ino);
+            return None;
+        }
+        freed
+    }
+
     /// Ready the filesystem for a regular file of `size` bytes. One of 2 GiB
     /// or more needs large_file, which Linux sets in the superblock when it
     /// makes the first such file, and e2fsck wants of a filesystem that has
@@ -3084,6 +3263,10 @@ impl FileSystem for Ext2 {
 
     fn map_blocks(&mut self, file: NodeId, first: u64, out: &mut [u64]) -> bool {
         Ext2::map_blocks(self, file, first, out)
+    }
+
+    fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
+        Ext2::punch(self, file, first, count)
     }
 }
 

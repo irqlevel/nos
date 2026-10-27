@@ -123,11 +123,26 @@ filesystem that keeps no blocks of its own on a device (`data_block_size`
 0: ramfs, and nanofs for now) has its images read and written through the
 VFS whole.
 
+A guest's discard gives whole blocks back (`Image::discard`, `Vfs::punch`):
+the filesystem's `punch` -- ext2's frees the data blocks of the range in
+truncate's batches, pointers cleared and on the disk and the inode
+committed before the bitmap frees them, and keeps the indirect blocks,
+which map what is past the range too -- leaves holes that read as zeros,
+the file's size as it was; what the range covers of a block only in part
+is left as it was. A write of zeros gives back the whole blocks it covers
+with its unmap flag and writes zeros over the rest. That the next file may
+have a block the moment the punch is done is safe because an image's calls
+come one at a time: none of its reads is under way off the lock on a block
+it mapped before. A filesystem with no blocks of its own gives nothing
+back, and its discard does nothing.
+
 `fstest` holds one at every smoke boot -- holes read as zeros, a write into
-one, into part of a block, across both, everything else refused while it is
-held, the file as the image left it once it lets go -- and `fs-fuzz`'s
-targets hold, read, write, sync and let go of images among every other
-call, each held to the model's rules.
+one, into part of a block, across both, a write of zeros given back and one
+written, a discard, everything else refused while it is held, the file as
+the image left it once it lets go -- and `fs-fuzz`'s targets hold, read,
+write, discard, zero, sync and let go of images among every other call,
+each held to the model's rules, ext2's images judged by its e2fsck after a
+clean unmount and after every power cut.
 
 ## What a filesystem is
 

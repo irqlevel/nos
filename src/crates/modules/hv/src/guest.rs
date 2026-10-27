@@ -774,10 +774,15 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.nmi, total.nmi_lost);
     }
     for (i, (sectors, s, broken, copied)) in guest.disk_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}{}",
+        let _ = write!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors",
             (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
-            s.writes, s.written_bytes / 1024, s.flushes, s.errors,
-            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+            s.writes, s.written_bytes / 1024, s.flushes, s.errors);
+        if s.discards != 0 || s.zeroings != 0 {
+            let _ = write!(out, "; {} discards ({} KiB), {} writes of zeros ({} KiB)", s.discards,
+                s.discarded_bytes / 1024, s.zeroings, s.zeroed_bytes / 1024);
+        }
+        let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
+            copied_note(copied));
     }
     for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
         let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",

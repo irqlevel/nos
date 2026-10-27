@@ -1321,6 +1321,7 @@ impl Script {
                         let mut s = d.lock().unwrap();
                         s.ready += 1 + r.below(8) as usize;
                         s.fail = r.u8() < 16;
+                        s.order = if r.bool() { 0 } else { r.u64() };
                     }
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);

@@ -88,6 +88,12 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, all of them inside the image, which
     /// never grows: 0, or -1. Not synced.
     pub fn kernel_image_write(image: usize, offset: u64, data: *const u8, len: usize) -> i32;
+    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// filesystem -- holes, reading as zeros: 0, or -1.
+    pub safe fn kernel_image_discard(image: usize, offset: u64, len: u64) -> i32;
+    /// `len` bytes from `offset` made zeros, the whole blocks among them
+    /// given back with `unmap` not 0: 0, or -1.
+    pub safe fn kernel_image_write_zeroes(image: usize, offset: u64, len: u64, unmap: i32) -> i32;
     /// Everything written to the image on its disk's medium: 0, or -1.
     pub safe fn kernel_image_sync(image: usize) -> i32;
 }
