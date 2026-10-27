@@ -170,7 +170,7 @@ const TERMINAL: [&[u8]; 9] = [b"\x1b[6n", b"\x1b[1;2H", b"\x1b[6", b"\x1b[", b"\
 
 fn uart(r: &mut Input) {
     let mut u = Uart::new();
-    while let Some(op) = r.op(9) {
+    while let Some(op) = r.op(10) {
         let offset = r.below(8) as u16;
         match op {
             8 => {
@@ -201,6 +201,20 @@ fn uart(r: &mut Input) {
             }
             6 => {
                 u.take_pulse();
+            }
+            9 => {
+                /* A line typed in whole: the next held back until the shell
+                 * asks where the cursor is again. */
+                u.line_taken();
+                invariant!(!u.prompt_seen(), "at a prompt still after a line went in");
+                /* The divisor latch closed, and loopback off: the query to
+                 * the line, not back to the receiver. */
+                u.write(3, 0x03);
+                u.write(4, 0x00);
+                for &b in b"\x1b[6n" {
+                    u.write(0, b);
+                }
+                invariant!(u.prompt_seen(), "not at a prompt after the shell asked where the cursor is");
             }
             _ => {
                 u.irq_line();

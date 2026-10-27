@@ -2203,7 +2203,13 @@ moment, and only what comes after it can end the wait. So a line typed at a
 guest that is still booting waits for its shell and comes back with its
 answer, not with the first prompt the shell printed before it read the line;
 and a line the guest never reads says so rather than timing out in silence.
-It prints everything the guest printed since the line was typed.
+It prints everything the guest printed since the line was typed. Each line
+goes in at a prompt of its own: after a newline the UART holds what is typed
+back until the shell asks where the cursor is again. Typed ahead -- a
+line queued behind another, a requeued `input=` after a reboot -- it went
+in while the shell still ran the one before, and that line's prompt ended
+the wait: `hv exec` came back with its answer cut after a character, which
+hv-linux-test caught once under load.
 
 **What reaches a terminal is made safe for one.** `hv console`, `hv exec` and
 the report print the guest's console with escape sequences taken out whole,
