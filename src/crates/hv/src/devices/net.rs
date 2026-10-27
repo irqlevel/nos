@@ -1,8 +1,18 @@
 //! A virtio network device, legacy PCI: a guest's `eth0`, over whatever
 //! carries its frames (`Backend`) -- the module's switch.
 //!
-//! Two queues, as legacy has them: 0 the driver fills with buffers for what
-//! the device receives, 1 with what it sends. Every frame either way comes
+//! Its queues come in pairs, as legacy has them: 0 the driver fills with
+//! buffers for what the device receives, 1 with what it sends. A guest of
+//! more than one CPU is offered a pair for each, up to `MAX_PAIRS`, and a
+//! control queue after them (`F_MQ`, `F_CTRL_VQ`), through which its driver
+//! says how many it uses -- the first alone until it does: each queue its
+//! own interrupt, which Linux gives each CPU its own of, so that what a CPU
+//! sends it is told of on that CPU, and what comes for it is taken there. A
+//! frame for the guest goes to the pair the guest last sent its flow from
+//! -- virtio's automatic receive steering (`steer`) -- and one of a flow it
+//! has not sent, by the flow's hash.
+//!
+//! Every frame either way comes
 //! after the header legacy puts in front of it -- ten bytes, or twelve once
 //! the driver takes mergeable buffers. What the guest sends may leave its
 //! checksum to the device, and TCP over IPv4 may come as one send of up to
@@ -12,7 +22,10 @@
 //! handed to the backend before the notify returns; what the backend has for the guest is put into
 //! its buffers each time round the run loop (`poll`) -- one frame held by the
 //! device when the driver has posted none, so nothing is lost for want of a
-//! buffer that is on its way.
+//! buffer that is on its way. The one frame is the device's, not a queue's:
+//! held for a pair whose ring is empty, it holds up the frames behind it for
+//! the others, until that ring's refill -- which the device asked a notify
+//! for -- or the driver's next say in how many pairs it uses.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -71,9 +84,26 @@ const CLASS: u32 = 0x02_00_00;
 /// The header and the configuration below, rounded up.
 pub const BAR_SIZE: u32 = 0x40;
 
-const RX_QUEUE: u16 = 0;
-const TX_QUEUE: u16 = 1;
 const QUEUE_SIZE: u16 = 256;
+/// The most queue pairs a NIC has: its MSI-X vectors -- the configuration's,
+/// one a queue, and one the control queue may be given (`vectors`) -- in the
+/// 32 a `Raise` carries, with room. A guest of more CPUs than that shares.
+pub const MAX_PAIRS: u16 = 8;
+
+/// A pair's receive queue and its transmit queue.
+fn rx_queue(pair: u16) -> u16 {
+    2 * pair
+}
+
+fn tx_queue(pair: u16) -> u16 {
+    2 * pair + 1
+}
+
+/// The MSI-X entries a NIC of `pairs` queue pairs offers: the
+/// configuration's, each queue's, and the control queue's.
+pub fn vectors(pairs: u16) -> u16 {
+    2 + 2 * pairs
+}
 /// The most chains taken off a queue in one pass: a queue's worth. A driver
 /// cannot have more than that available at once, so such a pass takes all
 /// that was there when it began; what is posted while it runs -- by the
@@ -97,15 +127,38 @@ const F_GUEST_TSO4: u32 = 1 << 7;
 const F_HOST_TSO4: u32 = 1 << 11;
 const F_MRG_RXBUF: u32 = 1 << 15;
 const F_STATUS: u32 = 1 << 16;
+/// A control queue, and queue pairs past the first: offered together, to a
+/// guest of more than one CPU.
+const F_CTRL_VQ: u32 = 1 << 17;
+const F_MQ: u32 = 1 << 22;
 /// What every NIC here offers, and the offloads on top (`set_offloads`).
-const BASE_FEATURES: u32 = F_MAC | F_STATUS;
+/// EVENT_IDX among the first: a kick asked for on the transmit queue when
+/// the device has sent every chain there was, and on the receive queue only
+/// when a frame waits for buffers -- the driver's refills otherwise cost no
+/// exit, the next frame taking what they posted.
+const BASE_FEATURES: u32 = F_MAC | F_STATUS | virtio::F_EVENT_IDX;
 const OFFLOADS: u32 = F_CSUM | F_GUEST_CSUM | F_GUEST_TSO4 | F_HOST_TSO4 | F_MRG_RXBUF;
 const LINK_UP: u16 = 1;
 
-/// The configuration: the MAC, then the status.
+/// The configuration: the MAC, the status, and the most queue pairs.
 const CFG_MAC: usize = 0;
 const CFG_STATUS: usize = 6;
-const CFG_BYTES: usize = 8;
+const CFG_MAX_PAIRS: usize = 8;
+const CFG_BYTES: usize = 10;
+
+/* The control queue's commands: a class and a command, what goes with it,
+ * and a byte the device answers in. Of them only multiqueue's -- how many
+ * pairs the driver uses -- is offered; anything else is answered an error. */
+const CTRL_HEADER: usize = 2;
+const CTRL_MQ: u8 = 4;
+const CTRL_MQ_VQ_PAIRS_SET: u8 = 0;
+const CTRL_OK: u8 = 0;
+const CTRL_ERR: u8 = 1;
+
+/// Receive steering's table: by a flow's hash, the pair the guest last sent
+/// the flow from, plus one -- 0 for none yet. Flows whose hashes meet share
+/// a slot, the last to send having it.
+const FLOWS: usize = 256;
 const _: () = assert!(virtio::DEVICE_CONFIG_MSIX as usize + CFG_BYTES <= BAR_SIZE as usize,
                       "the configuration fits the BAR, MSI-X's header and all");
 
@@ -136,6 +189,15 @@ pub struct Stats {
     /// Sent frames that were not frames: too short, or longer than was
     /// offered.
     pub dropped: u64,
+    /// The driver's notifies, to send and to receive -- each an exit -- and
+    /// the interrupts raised for each queue: what EVENT_IDX spares.
+    pub tx_notifies: u64,
+    pub rx_notifies: u64,
+    pub tx_interrupts: u64,
+    pub rx_interrupts: u64,
+    /// The control queue's commands, and those answered with an error.
+    pub commands: u64,
+    pub refused: u64,
 }
 
 pub struct Net {
@@ -154,26 +216,38 @@ pub struct Net {
     held: Option<(usize, Rx)>,
     /// What the backend was told the guest takes.
     told: Takes,
-    /// A transmit pass ended at its bound, with chains perhaps still on the
-    /// ring: the next round of the devices goes on with them.
-    tx_more: bool,
+    /// Its queue pairs: how many it has, and how many the driver uses --
+    /// the first alone until it says otherwise (`CTRL_MQ_VQ_PAIRS_SET`).
+    pairs: u16,
+    active: u16,
+    /// Receive steering (`FLOWS`).
+    flows: [u8; FLOWS],
+    /// Transmit passes that ended at their bound, with chains perhaps still
+    /// on the ring, a bit a pair: the next round of the devices goes on with
+    /// them.
+    tx_more: u32,
     /// Receive interrupts, moderated (`set_rx_moderation`): no closer than
     /// this after the last -- 0, each at once; the next allowed at
-    /// `rx_quiet_until`; and frames delivered since the last with none
-    /// raised for them yet, owed one then.
+    /// `rx_quiet_until`; and the pairs frames were delivered to since the
+    /// last with none raised for them yet, a bit each, owed one then.
     rx_quiet_ns: u64,
     rx_quiet_until: u64,
-    rx_owed: bool,
+    rx_owed: u32,
     broken: Option<Broken>,
     pub stats: Stats,
 }
 
 impl Net {
-    pub fn new(backend: Box<dyn Backend>, mac: [u8; 6]) -> Result<Net> {
+    /// A NIC of `pairs` queue pairs, 1 to `MAX_PAIRS` (clamped): past one,
+    /// with a control queue after them.
+    pub fn new(backend: Box<dyn Backend>, mac: [u8; 6], pairs: u16) -> Result<Net> {
+        let pairs = pairs.clamp(1, MAX_PAIRS);
+        let count = 2 * usize::from(pairs) + usize::from(pairs > 1);
         let mut queues = Vec::new();
-        queues.try_reserve_exact(2).map_err(|_| Error::NoMemory)?;
-        queues.push(Queue::new(QUEUE_SIZE));
-        queues.push(Queue::new(QUEUE_SIZE));
+        queues.try_reserve_exact(count).map_err(|_| Error::NoMemory)?;
+        for _ in 0..count {
+            queues.push(Queue::new(QUEUE_SIZE));
+        }
         let mut segs = Vec::new();
         segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
         let mut tx_buf = Vec::new();
@@ -183,7 +257,7 @@ impl Net {
         rx_buf.try_reserve_exact(HDR_MRG + offload::MAX_SEND).map_err(|_| Error::NoMemory)?;
         rx_buf.resize(HDR_MRG + offload::MAX_SEND, 0);
         Ok(Net {
-            transport: Transport::new(BASE_FEATURES | OFFLOADS, queues),
+            transport: Transport::new(BASE_FEATURES | multiqueue(pairs) | OFFLOADS, queues),
             backend,
             mac,
             segs,
@@ -191,13 +265,21 @@ impl Net {
             rx_buf,
             held: None,
             told: Takes::default(),
-            tx_more: false,
+            pairs,
+            active: 1,
+            flows: [0; FLOWS],
+            tx_more: 0,
             rx_quiet_ns: 0,
             rx_quiet_until: 0,
-            rx_owed: false,
+            rx_owed: 0,
             broken: None,
             stats: Stats::default(),
         })
+    }
+
+    /// Its queue pairs, and how many of them the driver uses.
+    pub fn queue_pairs(&self) -> (u16, u16) {
+        (self.pairs, self.active)
     }
 
     pub fn identity() -> Identity {
@@ -225,7 +307,8 @@ impl Net {
     /// before them, for a guest to be measured or run without. Before the
     /// driver reads the features: at the guest's next boot otherwise.
     pub fn set_offloads(&mut self, on: bool) {
-        self.transport.set_device_features(if on { BASE_FEATURES | OFFLOADS } else { BASE_FEATURES });
+        let base = BASE_FEATURES | multiqueue(self.pairs);
+        self.transport.set_device_features(if on { base | OFFLOADS } else { base });
     }
 
     /// Receive interrupts no closer than `ns` apart -- 0, as each frame
@@ -246,7 +329,7 @@ impl Net {
     /// interrupt owed for what it delivered, and frames that came meanwhile
     /// and woke nobody. None when nothing is promised past `now`.
     pub fn rx_due(&self, now: u64) -> Option<u64> {
-        (self.rx_quiet_until > now || self.rx_owed).then_some(self.rx_quiet_until)
+        (self.rx_quiet_until > now || self.rx_owed != 0).then_some(self.rx_quiet_until)
     }
 
     /// Until when its receive interrupts are held, as the last one raised
@@ -256,11 +339,31 @@ impl Net {
         self.rx_quiet_until
     }
 
+    /// Whether a transmit pass ended at its bound: the next round goes on
+    /// with it, and is due at once -- a driver that kicks only when asked
+    /// (EVENT_IDX) gives the device no other reason to come back.
+    pub fn more(&self) -> bool {
+        self.tx_more != 0
+    }
+
     fn config(&self) -> [u8; CFG_BYTES] {
         let mut c = [0u8; CFG_BYTES];
         c[CFG_MAC..CFG_MAC + 6].copy_from_slice(&self.mac);
         c[CFG_STATUS..CFG_STATUS + 2].copy_from_slice(&LINK_UP.to_le_bytes());
+        c[CFG_MAX_PAIRS..CFG_MAX_PAIRS + 2].copy_from_slice(&self.pairs.to_le_bytes());
         c
+    }
+
+    /// The pairs the driver may use, as it took the features: all of them
+    /// with multiqueue, the first without.
+    fn data_pairs(&self) -> u16 {
+        if self.transport.driver_features() & F_MQ != 0 { self.pairs } else { 1 }
+    }
+
+    /// The control queue, when the driver took it: right after the pairs it
+    /// may use.
+    fn ctrl_queue(&self) -> Option<u16> {
+        (self.transport.driver_features() & F_CTRL_VQ != 0).then(|| 2 * self.data_pairs())
     }
 
     /// Offer MSI-X, with a table of `entries`.
@@ -301,14 +404,23 @@ impl Net {
             return Raise::default();
         }
         match self.transport.write(offset, size, value, mem, now) {
-            Asked::Notify(TX_QUEUE) => self.send(mem),
+            Asked::Notify(queue) if Some(queue) == self.ctrl_queue() => self.control(mem, now),
+            Asked::Notify(queue) if queue < 2 * self.data_pairs() && queue % 2 == 1 => {
+                self.stats.tx_notifies += 1;
+                self.send(mem, queue / 2)
+            }
             /* Buffers posted for receiving: whatever is waiting can go. */
-            Asked::Notify(RX_QUEUE) => self.deliver(mem, now),
+            Asked::Notify(queue) if queue < 2 * self.data_pairs() => {
+                self.stats.rx_notifies += 1;
+                self.deliver(mem, now)
+            }
             Asked::Reset => {
                 self.broken = None;
                 self.held = None;
-                self.tx_more = false;
-                self.rx_owed = false;
+                self.active = 1;
+                self.flows = [0; FLOWS];
+                self.tx_more = 0;
+                self.rx_owed = 0;
                 self.tell(Takes::default());
                 Raise::default()
             }
@@ -316,9 +428,11 @@ impl Net {
         }
     }
 
-    /// What the driver has queued to send, to the backend: a pass's worth.
-    fn send(&mut self, mem: &GuestMemory) -> Raise {
-        self.tx_more = false;
+    /// What the driver has queued to send on `pair`, to the backend: a
+    /// pass's worth.
+    fn send(&mut self, mem: &GuestMemory, pair: u16) -> Raise {
+        let queue = tx_queue(pair);
+        self.tx_more &= !(1 << pair);
         if self.broken.is_some() {
             return Raise::default();
         }
@@ -326,23 +440,32 @@ impl Net {
         let mut left = PASS;
         loop {
             if left == 0 {
-                self.tx_more = true;
+                self.tx_more |= 1 << pair;
                 break;
             }
             left -= 1;
             let mut segs = core::mem::take(&mut self.segs);
-            let popped = match self.transport.queue(TX_QUEUE) {
+            let popped = match self.transport.queue(queue) {
                 Some(q) if q.ready() => q.pop(mem, &mut segs),
                 _ => Ok(None),
             };
             let result = match popped {
                 Ok(Some(head)) => {
-                    self.transmit(mem, &segs);
-                    self.transport.queue(TX_QUEUE).ok_or(Broken::Index).and_then(|q| q.push(mem, head, 0))
+                    self.transmit(mem, &segs, pair);
+                    self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, 0))
                 }
                 Ok(None) => {
                     self.segs = segs;
-                    break;
+                    /* Every chain there was sent: a kick asked for the
+                     * next, and what came before the ask sent now. */
+                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -355,14 +478,19 @@ impl Net {
                 }
             }
         }
-        let wants = sent && self.transport.queue(TX_QUEUE).map_or(false, |q| q.wants_interrupt(mem));
-        if wants { self.transport.interrupt(TX_QUEUE) } else { Raise::default() }
+        let wants = sent && self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem));
+        if !wants {
+            return Raise::default();
+        }
+        self.stats.tx_interrupts += 1;
+        self.transport.interrupt(queue)
     }
 
-    /// One chain the driver sent: the header, then the frame -- or a send
-    /// of TCP up to 64 KiB -- taken whole, and on to the backend as the
+    /// One chain the driver sent on `pair`: the header, then the frame -- or
+    /// a send of TCP up to 64 KiB -- taken whole, its flow's frames for the
+    /// guest steered to the pair from now on, and on to the backend as the
     /// header says (`offload::transmit`).
-    fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg]) {
+    fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg], pair: u16) {
         let features = self.transport.driver_features();
         let offloads = Offloads { csum: features & F_CSUM != 0, tso4: features & F_HOST_TSO4 != 0 };
         let hdr = if features & F_MRG_RXBUF != 0 { HDR_MRG } else { HDR };
@@ -383,6 +511,11 @@ impl Net {
                 return;
             }
             done += n;
+        }
+        if self.pairs > 1 {
+            if let Some(hash) = flow(&self.tx_buf[hdr..len]) {
+                self.flows[hash as usize % FLOWS] = (pair + 1) as u8;
+            }
         }
         let Net { tx_buf, backend, stats, .. } = self;
         let mut header = [0u8; HDR];
@@ -411,20 +544,25 @@ impl Net {
     /// the guest delivered -- and the interrupts that leaves the device
     /// with, a receive interrupt owed among them once its time is up.
     pub fn poll(&mut self, mem: &GuestMemory, now: u64) -> Raise {
-        let sent = if self.tx_more { self.send(mem) } else { Raise::default() };
-        sent.or(self.deliver(mem, now))
+        let mut raised = Raise::default();
+        for pair in 0..self.pairs {
+            if self.tx_more & (1 << pair) != 0 {
+                raised = raised.or(self.send(mem, pair));
+            }
+        }
+        raised.or(self.deliver(mem, now))
     }
 
     /// What the backend has for the guest, into the buffers the driver has
     /// posted -- a pass's worth -- and the interrupts that leaves the device
     /// with at `now`. What is left waits with the backend for the next round.
     fn deliver(&mut self, mem: &GuestMemory, now: u64) -> Raise {
-        if self.broken.is_some() || !self.transport.queue(RX_QUEUE).map_or(false, |q| q.ready()) {
+        if self.broken.is_some() || !self.transport.ready(rx_queue(0)) {
             /* A queue taken down, or a ring the device stopped following,
              * is owed nothing: kept owing, it would be due for good, and
              * the round that looks at it run without a pause (hv-fuzz
              * found it). Nor does it take sends whole. */
-            self.rx_owed = false;
+            self.rx_owed = 0;
             self.tell(Takes::default());
             return Raise::default();
         }
@@ -437,7 +575,6 @@ impl Net {
         self.tell(takes);
         let hdr = if merged { HDR_MRG } else { HDR };
         let start = HDR_MRG - hdr;
-        let mut delivered = false;
         for _ in 0..PASS {
             let (len, rx) = match self.held {
                 Some(h) => h,
@@ -469,26 +606,39 @@ impl Net {
             let header = rx.header();
             self.rx_buf[start..start + HDR].copy_from_slice(&header.bytes());
             let total = hdr + len;
+            let pair = self.steer(&self.rx_buf[HDR_MRG..HDR_MRG + len]);
+            let queue = rx_queue(pair);
             let mut segs = core::mem::take(&mut self.segs);
             let result = if merged {
-                self.merge(mem, total, start, &mut segs)
+                self.merge(mem, queue, total, start, &mut segs)
             } else {
-                self.one_chain(mem, total, start, &mut segs)
+                self.one_chain(mem, queue, total, start, &mut segs)
             };
             self.segs = segs;
             match result {
                 Ok(Taken::In) => {
                     self.held = None;
-                    delivered = true;
+                    self.rx_owed |= 1 << pair;
                     self.stats.received += 1;
                     if matches!(rx, Rx::Whole(_)) {
                         self.stats.whole += 1;
                     }
                 }
                 Ok(Taken::Wait) => {
-                    /* Not buffers enough yet: the frame waits here. */
+                    /* Not buffers enough yet: the frame waits here, a kick
+                     * asked for the driver's next -- and what it posted
+                     * before the ask looked at now, the pass's bound
+                     * bounding the looks. */
                     self.held = Some((len, rx));
-                    break;
+                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.held = None;
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
                 }
                 Ok(Taken::Dropped) => {
                     self.held = None;
@@ -501,18 +651,31 @@ impl Net {
                 }
             }
         }
-        if delivered {
-            self.rx_owed = true;
-        }
         self.rx_interrupt(mem, now)
+    }
+
+    /// The pair a frame for the guest goes to: the one the guest last sent
+    /// its flow from, if it still uses that one -- else the one the flow's
+    /// hash picks among those it uses; the first for what is no flow, and
+    /// for a pair whose receive queue the driver has not set up.
+    fn steer(&self, frame: &[u8]) -> u16 {
+        if self.active <= 1 {
+            return 0;
+        }
+        let Some(hash) = flow(frame) else { return 0 };
+        let learned = u16::from(self.flows[hash as usize % FLOWS]);
+        let pair = if learned != 0 && learned <= self.active { learned - 1 } else { (hash % u32::from(self.active)) as u16 };
+        if self.transport.ready(rx_queue(pair)) { pair } else { 0 }
     }
 
     /// The `total` bytes at `rx_buf[start..]`, header and frame, spread over
     /// as many of the driver's mergeable buffers as they take -- the count
     /// put in the header first -- or waiting for more, or dropped when as
     /// many as a frame may take would not hold it.
-    fn merge(&mut self, mem: &GuestMemory, total: usize, start: usize, segs: &mut Vec<Seg>) -> core::result::Result<Taken, Broken> {
-        let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+    fn merge(&mut self, mem: &GuestMemory, queue: u16, total: usize, start: usize, segs: &mut Vec<Seg>)
+        -> core::result::Result<Taken, Broken>
+    {
+        let q = self.transport.queue(queue).ok_or(Broken::Index)?;
         let chains = match q.room_ahead(mem, total as u64, MAX_MERGE, segs)? {
             Room::Enough(n) => n,
             Room::Wait => return Ok(Taken::Wait),
@@ -521,13 +684,13 @@ impl Net {
         self.rx_buf[start + HDR..start + HDR_MRG].copy_from_slice(&chains.to_le_bytes());
         let mut done = 0usize;
         for _ in 0..chains {
-            let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+            let q = self.transport.queue(queue).ok_or(Broken::Index)?;
             /* The chains looked at a moment ago: a driver that took them
              * back meanwhile, from another CPU, has a frame cut short. */
             let Some(head) = q.pop(mem, segs)? else { break };
             let written = write_chain(mem, segs, &self.rx_buf[start + done..start + total]);
             done += written;
-            self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+            self.transport.queue(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
         }
         Ok(if done == total { Taken::In } else { Taken::Dropped })
     }
@@ -535,12 +698,14 @@ impl Net {
     /// The `total` bytes at `rx_buf[start..]` into one chain of the
     /// driver's: waiting for one, or -- too short for them -- the frame
     /// dropped and the chain given back empty.
-    fn one_chain(&mut self, mem: &GuestMemory, total: usize, start: usize, segs: &mut Vec<Seg>) -> core::result::Result<Taken, Broken> {
-        let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+    fn one_chain(&mut self, mem: &GuestMemory, queue: u16, total: usize, start: usize, segs: &mut Vec<Seg>)
+        -> core::result::Result<Taken, Broken>
+    {
+        let q = self.transport.queue(queue).ok_or(Broken::Index)?;
         let Some(head) = q.pop(mem, segs)? else { return Ok(Taken::Wait) };
         let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
         let written = if room < total as u64 { 0 } else { write_chain(mem, segs, &self.rx_buf[start..start + total]) };
-        self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+        self.transport.queue(queue).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
         Ok(if written == total { Taken::In } else { Taken::Dropped })
     }
 
@@ -552,26 +717,158 @@ impl Net {
         }
     }
 
-    /// The receive interrupt owed for what was delivered, if its time is up
-    /// at `now` -- and the next not before `rx_quiet_ns` from now, frames
-    /// for the guest until then waking nobody (`Backend::quiet_until`): the
-    /// device's round comes for them by then (`rx_due`). One the driver has
-    /// said it does not want -- it is taking them already -- is not owed.
+    /// The receive interrupts owed for what was delivered, a pair's queue
+    /// each, if their time is up at `now` -- and the next not before
+    /// `rx_quiet_ns` from now, frames for the guest until then waking nobody
+    /// (`Backend::quiet_until`): the device's round comes for them by then
+    /// (`rx_due`). One the driver has said it does not want -- it is taking
+    /// them already -- is not owed.
     fn rx_interrupt(&mut self, mem: &GuestMemory, now: u64) -> Raise {
-        if !self.rx_owed || now < self.rx_quiet_until {
+        if self.rx_owed == 0 || now < self.rx_quiet_until {
             return Raise::default();
         }
-        self.rx_owed = false;
-        if !self.transport.queue(RX_QUEUE).map_or(false, |q| q.wants_interrupt(mem)) {
-            return Raise::default();
+        let owed = core::mem::take(&mut self.rx_owed);
+        let mut raised = Raise::default();
+        let mut wanted = false;
+        for pair in 0..self.pairs {
+            let queue = rx_queue(pair);
+            if owed & (1 << pair) == 0 || !self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem)) {
+                continue;
+            }
+            wanted = true;
+            self.stats.rx_interrupts += 1;
+            raised = raised.or(self.transport.interrupt(queue));
         }
-        if self.rx_quiet_ns != 0 {
+        if wanted && self.rx_quiet_ns != 0 {
             self.rx_quiet_until = now.saturating_add(self.rx_quiet_ns);
             self.backend.quiet_until(self.rx_quiet_until);
         }
-        self.transport.interrupt(RX_QUEUE)
+        raised
     }
 
+    /// The driver's commands on the control queue, each answered in its
+    /// writable byte: how many pairs it uses, within those offered, OK --
+    /// anything else, none of it offered, an error. A change in the pairs
+    /// it uses has what waits for the guest delivered at once, steered
+    /// anew: a frame held for a pair it no longer uses waited on a notify
+    /// from that pair's ring, which will never come -- and every frame
+    /// behind it with it (hv-fuzz's `virtq` found it).
+    fn control(&mut self, mem: &GuestMemory, now: u64) -> Raise {
+        let Some(queue) = self.ctrl_queue() else { return Raise::default() };
+        if self.broken.is_some() {
+            return Raise::default();
+        }
+        let before = self.active;
+        let mut answered = false;
+        for _ in 0..PASS {
+            let mut segs = core::mem::take(&mut self.segs);
+            let popped = match self.transport.queue(queue) {
+                Some(q) if q.ready() => q.pop(mem, &mut segs),
+                _ => Ok(None),
+            };
+            let result = match popped {
+                Ok(Some(head)) => {
+                    let ack = self.command(mem, &segs);
+                    let written = write_chain(mem, &segs, &[ack]);
+                    self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.push(mem, head, written as u32))
+                }
+                Ok(None) => {
+                    self.segs = segs;
+                    match self.transport.queue(queue).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            self.segs = segs;
+            match result {
+                Ok(()) => answered = true,
+                Err(e) => {
+                    self.broken = Some(e);
+                    break;
+                }
+            }
+        }
+        let wants = answered && self.transport.queue(queue).map_or(false, |q| q.wants_interrupt(mem));
+        let raised = if wants { self.transport.interrupt(queue) } else { Raise::default() };
+        if self.active == before {
+            return raised;
+        }
+        raised.or(self.deliver(mem, now))
+    }
+
+    /// One command, read from the chain's readable buffers: its answer.
+    fn command(&mut self, mem: &GuestMemory, segs: &[Seg]) -> u8 {
+        self.stats.commands += 1;
+        let mut c = [0u8; CTRL_HEADER + 2];
+        let whole = read_chain(mem, segs, &mut c) == c.len();
+        let mq = self.transport.driver_features() & F_MQ != 0;
+        if whole && mq && c[0] == CTRL_MQ && c[1] == CTRL_MQ_VQ_PAIRS_SET {
+            let pairs = u16::from_le_bytes([c[2], c[3]]);
+            if (1..=self.pairs).contains(&pairs) {
+                self.active = pairs;
+                return CTRL_OK;
+            }
+        }
+        self.stats.refused += 1;
+        CTRL_ERR
+    }
+}
+
+/// The features of `pairs` queue pairs: past one, a control queue and
+/// multiqueue.
+fn multiqueue(pairs: u16) -> u32 {
+    if pairs > 1 { F_CTRL_VQ | F_MQ } else { 0 }
+}
+
+/// A frame's flow, the same both ways: for TCP and UDP over IPv4 or IPv6, a
+/// hash of its protocol and its two ends -- address and port -- the lesser
+/// first, so that what the guest sends and what comes back for it meet;
+/// over IP with no ports to read -- another protocol, a fragment past the
+/// first -- of the addresses alone; None for what is not IP.
+fn flow(frame: &[u8]) -> Option<u32> {
+    const ETH_HEADER: usize = 14;
+    const ETHERTYPE_IPV4: u16 = 0x0800;
+    const ETHERTYPE_IPV6: u16 = 0x86DD;
+    const IPV4_HEADER: usize = 20;
+    const IPV4_FRAGMENT_OFFSET: u16 = 0x1FFF;
+    const IPV6_HEADER: usize = 40;
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    let ethertype = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
+    let ip = frame.get(ETH_HEADER..)?;
+    let (proto, a, b, l4) = match ethertype {
+        ETHERTYPE_IPV4 => {
+            let ihl = usize::from(*ip.first()? & 0x0F) * 4;
+            if ihl < IPV4_HEADER {
+                return None;
+            }
+            let fragment = u16::from_be_bytes([*ip.get(6)?, *ip.get(7)?]) & IPV4_FRAGMENT_OFFSET;
+            let l4 = if fragment == 0 { ip.get(ihl..) } else { None };
+            (*ip.get(9)?, ip.get(12..16)?, ip.get(16..20)?, l4)
+        }
+        ETHERTYPE_IPV6 => (*ip.get(6)?, ip.get(8..24)?, ip.get(24..IPV6_HEADER)?, ip.get(IPV6_HEADER..)),
+        _ => return None,
+    };
+    let ports = match (proto, l4) {
+        (TCP | UDP, Some(l4)) => (u16::from_be_bytes([*l4.first()?, *l4.get(1)?]),
+                                  u16::from_be_bytes([*l4.get(2)?, *l4.get(3)?])),
+        _ => (0, 0),
+    };
+    let (lo, hi) = if (a, ports.0) <= (b, ports.1) { ((a, ports.0), (b, ports.1)) } else { ((b, ports.1), (a, ports.0)) };
+    /* FNV-1a. */
+    let mut hash: u32 = 0x811C_9DC5;
+    for bytes in [&[proto][..], lo.0, &lo.1.to_be_bytes(), hi.0, &hi.1.to_be_bytes()] {
+        for &byte in bytes {
+            hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+        }
+    }
+    Some(hash)
 }
 
 /// What became of a frame offered to the driver's buffers.
@@ -579,6 +876,25 @@ enum Taken {
     In,
     Wait,
     Dropped,
+}
+
+/// The chain's readable buffers, from the first, into `buf`: how many bytes
+/// were read -- short of `buf` when they hold fewer, or one is not in
+/// memory.
+fn read_chain(mem: &GuestMemory, segs: &[Seg], buf: &mut [u8]) -> usize {
+    let mut done = 0usize;
+    for s in segs.iter().filter(|s| !s.write) {
+        if done == buf.len() {
+            break;
+        }
+        let n = (buf.len() - done).min(s.len as usize);
+        let Some(at) = s.at(0) else { continue };
+        if mem.read(at, &mut buf[done..done + n]).is_err() {
+            break;
+        }
+        done += n;
+    }
+    done
 }
 
 /// `data` into the chain's writable buffers, one copy a buffer -- `GuestMemory`

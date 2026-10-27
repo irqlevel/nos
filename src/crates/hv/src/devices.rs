@@ -29,6 +29,8 @@ pub mod pit;
 #[cfg(target_arch = "x86_64")]
 pub mod pm;
 #[cfg(target_arch = "x86_64")]
+pub mod pvpanic;
+#[cfg(target_arch = "x86_64")]
 pub mod rtc;
 pub mod uart;
 #[cfg(target_arch = "x86_64")]

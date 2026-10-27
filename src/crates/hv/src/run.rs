@@ -63,6 +63,7 @@ use kcore::sync::Mutex;
 use kcore::time;
 
 use crate::acpi;
+use crate::smbios;
 use crate::cr;
 use crate::dr;
 use crate::devices::blk::{self, Blk};
@@ -70,6 +71,7 @@ use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pm;
+use crate::devices::pvpanic::{self, PvPanic};
 use crate::devices::virtio::Raise;
 use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
@@ -120,7 +122,6 @@ const _: () = assert!(linux::LOW_RAM_END <= MSIX_PAGES as u64);
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
 const DISK_VECTORS: u16 = 2;
-const NIC_VECTORS: u16 = 3;
 /// The most disks, and NICs, a guest has.
 pub const MAX_DISKS: usize = 4;
 pub const MAX_NICS: usize = 2;
@@ -205,6 +206,10 @@ pub enum Stop {
     /// It turned itself off: S5's sleep type written to its PM1 control
     /// register with the sleep enable bit -- ACPI's soft off, a `poweroff`.
     PowerOff { rip: u64 },
+    /// Its kernel panicked, and said so to its panic device
+    /// (`devices::pvpanic`) at `rip`: stopped there rather than left to spin
+    /// in `panic` on a host CPU.
+    Panicked { rip: u64 },
     /// An MMIO access of a device's that could not be performed for it:
     /// the instruction at `rip` that reached `gpa`, as far as it was read
     /// (`bytes`), and why (`error`).
@@ -230,10 +235,11 @@ pub enum Stop {
 }
 
 impl Stop {
-    /// Whether the guest reset itself, one way or another: what a guest
-    /// that is to be booted again when it reboots is booted again after.
+    /// Whether the guest reset itself, one way or another -- or panicked,
+    /// which with `panic=` it would have rebooted after: what a guest that
+    /// is to be booted again when it reboots is booted again after.
     pub fn is_reset(&self) -> bool {
-        matches!(self, Stop::Reset { .. } | Stop::Shutdown { .. } | Stop::Init { .. })
+        matches!(self, Stop::Reset { .. } | Stop::Shutdown { .. } | Stop::Init { .. } | Stop::Panicked { .. })
     }
 }
 
@@ -579,6 +585,7 @@ struct Platform {
     rtc: Rtc,
     pic: Pic,
     pm: Pm,
+    pvpanic: PvPanic,
     /// The IO-APIC, for a guest given one.
     ioapic: Option<IoApic>,
     pci: PciBus,
@@ -646,6 +653,23 @@ pub struct LinuxGuest {
     offloads: bool,
     /// Where its CPUs sit, as their CPUID tells them (`set_shape`).
     shape: Shape,
+    /// What its SMBIOS says it is (`set_identity`).
+    identity: Identity,
+}
+
+/* The SMBIOS tables after the ACPI ones in the BIOS area, laid out in the
+ * same buffer. */
+const _: () = assert!(acpi::AREA + acpi::MAX_BYTES as u64 <= smbios::AREA
+                      && smbios::AREA + smbios::MAX_BYTES as u64 <= acpi::AREA_END
+                      && smbios::MAX_BYTES <= acpi::MAX_BYTES);
+
+/// What a guest's SMBIOS tables say of it (`smbios`): its UUID, as RFC 4122
+/// writes it -- all zeros, SMBIOS's "not set", until it is given one -- its
+/// serial number, and the hypervisor's version.
+pub struct Identity {
+    pub uuid: [u8; 16],
+    pub serial: String,
+    pub version: String,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -762,6 +786,7 @@ impl LinuxGuest {
             rtc: Rtc::new(),
             pic: Pic::new(),
             pm: Pm::new(time::boot_time_ns()),
+            pvpanic: PvPanic::default(),
             ioapic: ioapic.then(|| IoApic::new(cpus as u8)),
             pci: PciBus::new()?,
             pci_devs,
@@ -791,8 +816,16 @@ impl LinuxGuest {
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
+            identity: Identity { uuid: [0; 16], serial: String::new(), version: String::new() },
         };
         Ok((guest, vcpus))
+    }
+
+    /// What its SMBIOS tables say it is: set before it boots, and the same
+    /// at every boot -- a UUID, above all, that an OS takes for the
+    /// machine's own.
+    pub fn set_identity(&mut self, identity: Identity) {
+        self.identity = identity;
     }
 
     /// What its CPUs' CPUID tells them of where they sit -- what their
@@ -907,7 +940,9 @@ impl LinuxGuest {
     }
 
     /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
-    /// `eth1`, a virtio network device on the PCI bus.
+    /// `eth1`, a virtio network device on the PCI bus -- with a queue pair
+    /// for each of its CPUs, up to `net::MAX_PAIRS`, where it has MSI-X to
+    /// give each queue an interrupt of its own.
     pub fn add_nic(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
         if self.loaded {
             return Err(Error::BadAddress);
@@ -917,14 +952,17 @@ impl LinuxGuest {
         if p.nics >= MAX_NICS {
             return Err(Error::NoMemory);
         }
-        let mut nic = Net::new(backend, mac)?;
+        let page = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)?;
+        let pairs = if page.is_some() { u16::try_from(self.cpus()).unwrap_or(net::MAX_PAIRS) } else { 1 };
+        let mut nic = Net::new(backend, mac, pairs)?;
         nic.set_rx_moderation(self.rx_moderation_ns);
         nic.set_offloads(self.offloads);
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
         let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
-        if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {
-            nic.offer_msix(NIC_VECTORS).ok_or(Error::NoMemory)?;
-            f = f.with_msix(NIC_VECTORS, page);
+        if let Some(page) = page {
+            let vectors = net::vectors(nic.queue_pairs().0);
+            nic.offer_msix(vectors).ok_or(Error::NoMemory)?;
+            f = f.with_msix(vectors, page);
         }
         p.pci.add(f)?;
         p.pci_devs.push(PciDev::Nic(nic));
@@ -949,15 +987,16 @@ impl LinuxGuest {
         v
     }
 
-    /// What each NIC has done: (statistics, whether a ring stopped it,
-    /// whether its rings are copied rather than mapped).
-    pub fn nic_stats(&self) -> Vec<(net::Stats, bool, bool)> {
+    /// What each NIC has done: (statistics, its queue pairs and how many
+    /// its driver uses, whether a ring stopped it, whether its rings are
+    /// copied rather than mapped).
+    pub fn nic_stats(&self) -> Vec<(net::Stats, (u16, u16), bool, bool)> {
         let p = self.platform.lock();
         let mut v = Vec::new();
         if v.try_reserve_exact(p.nics).is_ok() {
             for d in &p.pci_devs {
                 if let PciDev::Nic(n) = d {
-                    v.push((n.stats, n.broken().is_some(), n.rings_copied()));
+                    v.push((n.stats, n.queue_pairs(), n.broken().is_some(), n.rings_copied()));
                 }
             }
         }
@@ -980,7 +1019,7 @@ impl LinuxGuest {
         let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
-        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
         linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         linux::set_entry(bsp.cpu.backend_mut(), &layout);
         self.loaded = true;
@@ -1004,7 +1043,7 @@ impl LinuxGuest {
         let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
-        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
         pvh::build(&self.memory, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         pvh::set_entry(bsp.cpu.backend_mut(), image);
         self.loaded = true;
@@ -1031,10 +1070,11 @@ impl LinuxGuest {
         Ok((n, msix))
     }
 
-    /// The ACPI tables, for the machine as it is now -- its CPUs, its
-    /// IO-APIC when `ioapic`, and each device on the bus, `routes` -- laid
-    /// out in the BIOS area.
-    fn write_acpi(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
+    /// The tables a PC's firmware leaves, laid out in the BIOS area: the
+    /// ACPI ones, for the machine as it is now -- its CPUs, its IO-APIC when
+    /// `ioapic`, and each device on the bus, `routes` -- and the SMBIOS ones,
+    /// what it is (`set_identity`).
+    fn write_firmware(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
         /* The window covers every slot's page, whichever have one. */
         let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
         let machine = acpi::Machine {
@@ -1050,7 +1090,22 @@ impl LinuxGuest {
         buf.resize(acpi::MAX_BYTES, 0);
         let len = acpi::build(&machine, &mut buf).ok_or(Error::NoMemory)?;
         self.memory.write(acpi::AREA, &buf[..len])?;
+
+        let machine = smbios::Machine {
+            uuid: self.identity.uuid,
+            serial: &self.identity.serial,
+            version: &self.identity.version,
+        };
+        buf.fill(0);
+        let len = smbios::build(&machine, &mut buf[..smbios::MAX_BYTES]).ok_or(Error::NoMemory)?;
+        self.memory.write(smbios::AREA, &buf[..len])?;
         Ok(linux::Firmware { rsdp: acpi::AREA, start: acpi::AREA, end: acpi::AREA_END })
+    }
+
+    /// How many times its kernel said it panicked with a crash kernel
+    /// loaded, which it then booted (`devices::pvpanic`).
+    pub fn crash_kernels(&self) -> u32 {
+        self.platform.lock().pvpanic.crash_loaded
     }
 
     /// What the guest's OS did with its ACPI.
@@ -1255,11 +1310,13 @@ impl LinuxGuest {
                 self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts, now);
                 /* When the devices' round has to come again on its own: a
                  * receive interrupt held, and frames that woke nobody while
-                 * it is (`Net::rx_due`) -- slept to, or armed before the
-                 * guest is entered, below. */
+                 * it is (`Net::rx_due`); a pass that ended at its bound, at
+                 * once (`more`) -- slept to, or armed before the guest is
+                 * entered, below. */
                 devices_due = p.pci_devs.iter().filter_map(|d| match d {
+                    PciDev::Nic(n) if n.more() => Some(now),
                     PciDev::Nic(n) => n.rx_due(now),
-                    PciDev::Disk(_) => None,
+                    PciDev::Disk(d) => d.more().then_some(now),
                 }).min();
                 pins |= sync_ioapic(&mut p, now);
                 self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
@@ -2201,6 +2258,17 @@ impl LinuxGuest {
                 }
                 gc.counts.port_out += 1;
             }
+        } else if PvPanic::owns(io.port) && io.size == 1 {
+            if io.input {
+                let value = p.pvpanic.read();
+                set_in(v.save_mut(), io.size, u32::from(value));
+                gc.counts.port_in += 1;
+            } else {
+                gc.counts.port_out += 1;
+                if p.pvpanic.write(v.save().rax as u8) == Some(pvpanic::Event::Panicked) {
+                    return Some(Stop::Panicked { rip: v.save().rip });
+                }
+            }
         } else if Pm::owns(io.port) {
             let now = time::boot_time_ns();
             if io.input {
@@ -2243,7 +2311,15 @@ impl LinuxGuest {
             } else {
                 let value = v.save().rax as u32;
                 let raised = match dev {
-                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
+                    Some(PciDev::Disk(d)) => {
+                        let raised = d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
+                        /* A pass that ended at its bound on another CPU's
+                         * notify is the first CPU's round to go on with,
+                         * which may be asleep or in its guest: rung, it
+                         * looks. */
+                        first |= me != 0 && d.more();
+                        raised
+                    }
                     Some(PciDev::Nic(n)) => {
                         let window = n.rx_window();
                         let raised = n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
@@ -2257,7 +2333,7 @@ impl LinuxGuest {
                          * waiting: rung, it looks again. Pings between two
                          * guests on the EX44 had a 10 ms answer every few
                          * hundred without this, and none in 2,400 with it. */
-                        first |= me != 0 && n.rx_window() != window;
+                        first |= me != 0 && (n.rx_window() != window || n.more());
                         raised
                     }
                     None => Raise::default(),

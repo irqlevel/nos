@@ -1051,6 +1051,25 @@ impl Vms {
         };
         core_hold.held_by(Holder::Vm(id));
 
+        /* What its SMBIOS calls it, and the UUID it gives it: its vm.toml's
+         * -- or, a VM from a folder at its first start since VMs had them,
+         * one made now and written into the file, every start after saying
+         * the same. One with no folder has a new one at each start; its
+         * restarts keep it. */
+        spec.name = match name {
+            Some(n) => String::from(n),
+            None => alloc::format!("vm{}", id),
+        };
+        if spec.uuid.is_none() {
+            let uuid = guest::random_uuid();
+            if let Some((folder, _)) = &stored {
+                if let Err(e) = store::add_uuid(folder, &uuid) {
+                    let _ = writeln!(out, "hv: its UUID is not kept -- {}: a new one at its next start", e);
+                }
+            }
+            spec.uuid = Some(uuid);
+        }
+
         let logged = stored.as_ref().is_some_and(|(_, log)| *log);
         let shared = match Shared::new(id, spec.log, &spec.input, spec.cpus, logged) {
             Some(shared) => Arc::new(shared),
@@ -1073,8 +1092,8 @@ impl Vms {
                 }
             };
             let claimed = match spec.port {
-                Some(p) => switch.claim_at(p, &shared),
-                None => switch.claim(&shared),
+                Some(p) => switch.claim_at(p, &shared, spec.network.as_deref()),
+                None => switch.claim(&shared, spec.network.as_deref()),
             };
             let port = match claimed {
                 Ok(port) => port,
@@ -1265,6 +1284,14 @@ impl Vms {
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
+                match self.switch.lock().as_ref().and_then(|s| s.network_of(port)) {
+                    Some(network) => {
+                        let _ = write!(out, " on {}", network);
+                    }
+                    None => {
+                        let _ = write!(out, " alone");
+                    }
+                }
             }
             let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
             if lost.dropped != 0 {
@@ -1278,6 +1305,9 @@ impl Vms {
             }
             if lost.flooded != 0 {
                 let _ = write!(out, "  {} frames for every port past their rate, dropped", lost.flooded);
+            }
+            if lost.isolated != 0 {
+                let _ = write!(out, "  {} frames for another network's guests, dropped", lost.isolated);
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {

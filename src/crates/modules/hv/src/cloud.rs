@@ -228,6 +228,7 @@ fn run(root: &str, name: &str, url: &str, words: &str, out: &mut Output) -> Resu
     o.mem_mib = o.mem_mib.or(Some(DEFAULT_MEM_MIB));
     o.net = true;
     o.restart = true;
+    o.uuid = o.uuid.or_else(|| Some(crate::guest::random_uuid()));
     let theirs = core::mem::take(&mut o.disks);
     o.disks.push((String::from(DISK), false));
     o.disks.push((String::from(SEED), true));
