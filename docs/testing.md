@@ -151,7 +151,7 @@ swallowing panic messages whole.
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
-| `netconsole-test.py` | arm64 | the trace path, a net device, netconsole |
+| `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
@@ -166,7 +166,7 @@ swallowing panic messages whole.
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
@@ -286,8 +286,14 @@ link came up arrives once it does, that the sequence numbers are contiguous
 -- so that a gap can be told from a machine that stopped -- that lines
 produced after link-up keep coming, and that a panic's report gets out with
 its backtrace, which is the one time it matters most and the one time the
-drain task is not running to send it. On the two Hetzner machines netconsole
-is the only console there is. See [Netconsole](netconsole.md).
+drain task is not running to send it. Then a second boot is powered off
+from the shell over UDP, and the halt's own lines must reach the collector
+with no gap in the numbers: the unmount, which comes after every module has
+gone -- a module's exit may wait minutes for guests to turn themselves off,
+which on a machine with no other console nothing else would show -- and the
+netconsole's own last line, traced as it stops and sent by the flush its
+drain does on the way out. On the two Hetzner machines netconsole is the
+only console there is. See [Netconsole](netconsole.md).
 
 ### `tcp-test.py` -- the connecting side of TCP
 
@@ -1892,7 +1898,9 @@ the guest was refused, which it was ready for, are printed as a note. And
 its kernel must have turned on the x87, SSE and AVX in XCR0, 832 bytes of
 them ("Enabled xstate features 0x7"): in XSAVE's standard format under TCG,
 compacted on a CPU with XSAVEC -- the AX41's Zen 2 -- which the policy
-passes on and Linux then saves with.
+passes on and Linux then saves with; and where the CPU has PKU -- TCG's
+`max`, the EX44's -- PKRU with them, 0x207: 2696 bytes in the standard
+format, 840 in the compacted one.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.
@@ -1950,8 +1958,11 @@ back whole (the cursor-position answer once made BusyBox wrap it); `hv send`,
 `hv wait`, `hv console`; a third guest with no init and `panic=1`, which
 panics, reboots, and must stop with its reset as the reason rather than spin
 on an 8042 that is not there; `hv off` refusing to turn the extension off
-under the running guest; and `rmmod hv` stopping that guest before it turns the
-extension off, which the next load confirms and `dmesg` shows in order. Once
+under the running guest; and `rmmod hv` pressing that guest's power button --
+the load having said `stop_secs=2` -- and stopping it when the time is up,
+before it turns the extension off, which the next load confirms and `dmesg`
+shows in order: `nothing in it listens to its power button` for a kernel
+without ACPI, `its power button went unanswered for 2 s` for one with. Once
 the shell has the console, the kernel's own lines go to the log and not to
 it -- so the gate ends on a command's output (`version`) rather than on
 `rc: /etc/rc done`, and reads what the vCPU tasks and the unload said with
@@ -2124,7 +2135,16 @@ when `secs=5` is up, `its power button went unanswered for 5 s`. Without
 button. In both, after the reload, two guests at their shells are stopped
 together by `hv stop all secs=3`, which must press both buttons at once and
 say of each what became of its press. `--acpi` goes with `--cpus`, `--disk`, `--net` and `--attach`, whose
-guests then find their devices through the DSDT's host bridge.
+guests then find their devices through the DSDT's host bridge. With
+`--disk`, the guest mounts its disk once more, writes a file to it and is
+left so, `acpid` given a handler that unmounts it and powers off -- and nos
+itself is powered off: its unload must press the button and say so, the
+guest unmount the disk and turn itself off, `stopped for the unload -- the
+guest powered itself off`, before nos unmounts its own root and goes; and
+the guest's ext4, taken out of nos's root, must be clean -- its state
+clean, no journal left to replay -- and hold the file written last. A guest
+stopped where it was, as every one was before the unload asked, leaves its
+journal to replay and that file in a page cache that is gone.
 
 `--xapic` has the guests' local APICs come out of reset in xAPIC mode (`hv
 start ... xapic`), and a kernel of more than one CPU then reaches them

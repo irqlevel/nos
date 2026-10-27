@@ -62,6 +62,9 @@ const NO_LINK_POLL_MS: u64 = 200;
 const TX_RETRY_MS: u64 = 20;
 /// Between two datagrams that both had something to send.
 const SEND_PACE_MS: u64 = 1;
+/// The most datagrams the drain sends once it is told to stop: a full ring
+/// is some 750 of them.
+const STOP_FLUSH_MAX: u32 = 1024;
 
 /// What the panic path will try to push out, so a wedged ring cannot turn a
 /// panic into an endless loop.
@@ -241,6 +244,16 @@ struct Log {
     nic: Option<Nic>,
 }
 
+/// What a turn of the drain did.
+enum Next {
+    /// The ring had nothing to send.
+    Empty,
+    /// The device took a datagram, and it is off the ring.
+    Sent,
+    /// The device did not take it: still in the ring.
+    Failed,
+}
+
 pub struct Netconsole {
     log: IrqSpinLock<Log>,
 
@@ -378,6 +391,10 @@ impl Netconsole {
     pub fn stop(&self) {
         let task = self.task.lock().take();
         if let Some(task) = task {
+            /* Said into the ring the drain flushes as it stops, so that the
+             * collector can tell a log that ended here from a machine that
+             * died: the last line it is sent. */
+            trace!(0, "netconsole: stopping -- the last line sent");
             task.request_stop();
             drop(task);
         }
@@ -440,6 +457,58 @@ impl Netconsole {
             &packet[..DGRAM_HDR + text_len])
     }
 
+    /// The next datagram of what the ring holds, sent and taken off it.
+    fn send_next(&self, nic: &Nic, packet: &mut [u8; DGRAM_MAX]) -> Next {
+        let (len, consumed, evicted, seq) = {
+            let log = self.log.lock();
+            let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
+            (len, consumed, log.ring.evicted, log.seq)
+        };
+
+        if len == 0 {
+            return Next::Empty;
+        }
+
+        if !self.send_batch(nic, packet, len, seq) {
+            /* The records are still in the ring. On a machine whose only
+             * console is this one, consuming them first turned any
+             * transmit hiccup into a silent blackout: the loop has no
+             * sleep while the ring is not empty, so it shredded the whole
+             * backlog at full speed, and every line traced afterwards
+             * with it. */
+            self.tx_failed.fetch_add(1, Ordering::Relaxed);
+            return Next::Failed;
+        }
+        self.sent.fetch_add(1, Ordering::Relaxed);
+
+        let mut log = self.log.lock();
+        log.seq = seq.wrapping_add(1);
+        /* An append may have evicted from the head while the lock was down:
+         * what was just sent is then partly or wholly gone already. */
+        log.ring.pop_sent(consumed, evicted);
+        Next::Sent
+    }
+
+    /// Told to stop -- on the way down, after the modules and the
+    /// filesystems have gone -- the drain sends what the ring still holds
+    /// first: the halt's own lines, the last a collector will have of this
+    /// boot, which a stop that left them in the ring lost every time. A
+    /// datagram at a time, as the loop sends them, up to `STOP_FLUSH_MAX`,
+    /// and not past one the device would not take: the halt waits for this.
+    fn flush_on_stop(&self, packet: &mut [u8; DGRAM_MAX]) {
+        let attached = self.log.lock().nic;
+        let nic = match attached {
+            Some(nic) if nic.ip() != 0 => nic,
+            _ => return,
+        };
+        for _ in 0..STOP_FLUSH_MAX {
+            match self.send_next(&nic, packet) {
+                Next::Sent => kcore::task::sleep_ms(SEND_PACE_MS),
+                Next::Empty | Next::Failed => return,
+            }
+        }
+    }
+
     fn run(&'static self) {
         /* The datagram being built is this task's own: filled under the lock
          * and sent with it down, since a send may wait on ARP. */
@@ -464,41 +533,14 @@ impl Netconsole {
 
             self.trim_backlog_once();
 
-            let (len, consumed, evicted, seq) = {
-                let log = self.log.lock();
-                let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
-                (len, consumed, log.ring.evicted, log.seq)
-            };
-
-            if len == 0 {
-                kcore::task::sleep_ms(IDLE_POLL_MS);
-                continue;
+            match self.send_next(&nic, &mut packet) {
+                Next::Empty => kcore::task::sleep_ms(IDLE_POLL_MS),
+                Next::Failed => kcore::task::sleep_ms(TX_RETRY_MS),
+                Next::Sent => kcore::task::sleep_ms(SEND_PACE_MS),
             }
-
-            if !self.send_batch(&nic, &mut packet, len, seq) {
-                /* The records are still in the ring. On a machine whose only
-                 * console is this one, consuming them first turned any
-                 * transmit hiccup into a silent blackout: the loop has no
-                 * sleep while the ring is not empty, so it shredded the whole
-                 * backlog at full speed, and every line traced afterwards
-                 * with it. */
-                self.tx_failed.fetch_add(1, Ordering::Relaxed);
-                kcore::task::sleep_ms(TX_RETRY_MS);
-                continue;
-            }
-            self.sent.fetch_add(1, Ordering::Relaxed);
-
-            {
-                let mut log = self.log.lock();
-                log.seq = seq.wrapping_add(1);
-                /* An append may have evicted from the head while the lock
-                 * was down: what was just sent is then partly or wholly gone
-                 * already. */
-                log.ring.pop_sent(consumed, evicted);
-            }
-
-            kcore::task::sleep_ms(SEND_PACE_MS);
         }
+
+        self.flush_on_stop(&mut packet);
     }
 
     /// The first moment there is anywhere to send to. With `nctail=N` the

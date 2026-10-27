@@ -27,8 +27,9 @@ With an initrd, then the long-lived VMs: two started side by side, one
 stopped while it boots; a line typed at the other before its shell is up,
 answered once it is (`hv exec`), and one typed at its prompt; `hv send` and
 `hv wait`; `hv console`; `hv off` refusing to pull the extension from under
-a running guest; and `rmmod` stopping that guest itself, with nothing left
-on for the next load to find.
+a running guest; and `rmmod` pressing that guest's power button and then
+stopping it itself (`insmod`'s `stop_secs=2`), with nothing left on for the
+next load to find.
 
 With --acpi -- a guest kernel with ACPI, the power button and evdev -- also
 that it takes the machine's ACPI tables: the boot finds the RSDP, the PM
@@ -36,7 +37,10 @@ timer, the PCI host bridge and the power button, and says nothing of a
 firmware bug; its reboots go through the FADT's reset register; its SCI is
 the 8259's IRQ 9; and `hv stop` presses its power button, which busybox's
 acpid answers with a poweroff -- S5 -- while `rmmod` waits out a guest that
-hears the button and does nothing.
+hears the button and does nothing. With --disk too, the guest's disk is
+left mounted and nos itself powered off: the unload presses the guest's
+button, acpid unmounts the disk and turns the guest off, and the guest's
+ext4 must come back out of nos's root clean, holding what it wrote last.
 
 Exit code 0 = every required marker appeared.
 """
@@ -79,7 +83,11 @@ NICE = r"Kernel command line:"
 # either of XSAVE's formats: standard, or compacted where the CPU has XSAVEC
 # for the policy to pass on (a Zen 2 has; QEMU's TCG has not), which Linux
 # then saves with, AVX's component wanting no alignment of its own there.
-XSTATE = r"x86/fpu: Enabled xstate features 0x7, context size is 832 bytes, using '(?:standard|compacted)' format\."
+# Where the CPU has PKU (TCG's `max`, the EX44's), PKRU too, 0x207: its 8
+# bytes at 2688 in the standard format, straight after AVX's in the
+# compacted one -- the PKRU switched for the guest by RDPKRU and WRPKRU.
+XSTATE = (r"x86/fpu: Enabled xstate features (?:0x7, context size is 832 bytes, using '(?:standard|compacted)'"
+          r"|0x207, context size is (?:2696 bytes, using 'standard'|840 bytes, using 'compacted')) format\.")
 
 # With an initramfs, the fourth demo: the guest runs its init and reaches an
 # interactive shell over the emulated UART. These are checked only when an
@@ -154,6 +162,8 @@ RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 # The module's own lines from the kernel log, printed to the console: what
 # the vCPU tasks and the unload say, which no command's output does.
 RC_LOG = "dmesg hv:"
+# What the main phase's load gives the guests at its unload (`stop_secs=`).
+UNLOAD_SECS = 2
 
 
 def interrupt_check(args, text, queue):
@@ -383,6 +393,10 @@ def vm_commands(args):
     stop_all = "hv stop all secs=3"
     all_note = (r"its power button went unanswered for 3 s" if args.acpi
                 else r"nothing in it listens to its power button")
+    # And the first load's `rmmod`, which presses vm 0's button as `hv stop
+    # all` does, given the time that load's `stop_secs=` says.
+    unload_note = (r"its power button went unanswered for %d s" % UNLOAD_SECS if args.acpi
+                   else r"nothing in it listens to its power button")
     lines = ["hv help", start0, start1, "hv list", start_full, "hv cores", stop1, exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
@@ -495,6 +509,9 @@ def vm_commands(args):
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
         ("hv", 0, "and keeps the vms where insmod's vms= says", r"hv: vms kept in %s, as insmod was told" % elsewhere,
          True),
+        ("hv", 0, "and gives the guests 120 s at its unload, insmod having said nothing of that",
+         r"(?m)^hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons and gives them "
+         r"120 s to turn themselves off\s*$", True),
         (create_elsewhere, 0, "hv create makes the vm's folder there, and the folder above it",
          r"hv: %s/t1/vm.toml written -- hv start t1 boots it" % elsewhere, True),
         ("hv start t0", 3, "hv start looks for a name there, not in /vms",
@@ -507,9 +524,11 @@ def vm_commands(args):
         (elsewhere_log, 0, "its console.log is in its folder there",
          r"vm %d started on [\s\S]*Linux version" % elsewhere_vm, True),
         (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
-        (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
-         r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
-        (RC_LOG, 0, "and without asking it first", r"(?m)hv: vm 0 stopped for the unload -- on request\s*$", True),
+        (RC_LOG, 0, "rmmod pressed vm 0's power button first, given the time insmod's stop_secs= said",
+         r"hv: unloading -- 1 vm\(s\) asked to turn themselves off, given %d s" % UNLOAD_SECS, True),
+        (RC_LOG, 0, "then stopped it itself, saying what became of the press, and only then turned the extension off",
+         r"hv: vm 0 stopped for the unload -- on request -- %s[\s\S]*hv: unloaded, extension off for cpu mask"
+         % unload_note, True),
         (RC_LOG, 0, "no unload left the extension on", r"hv: WARNING", False),
         (stop_all, 0, "hv stop all presses every button at once, and says what became of each press",
          r"hv: vm 0 stopped -- on request -- %s[\s\S]*hv: vm 1 stopped -- on request -- %s" % (all_note, all_note), True),
@@ -638,7 +657,8 @@ def check_boot(args, txt):
     for m in REQUIRED:
         pt.check("the guest printed: %s" % m, re.search(m, block) is not None, block[-1500:])
     xstate = re.search(r"(?m)^.*x86/fpu: Enabled xstate.*$", block)
-    pt.check("the guest's kernel turned on the x87, SSE and AVX in XCR0", re.search(XSTATE, block) is not None,
+    pt.check("the guest's kernel turned on the x87, SSE and AVX in XCR0, and PKRU where the CPU has PKU",
+             re.search(XSTATE, block) is not None,
              xstate.group(0) if xstate else block[-1500:])
     if re.search(NICE, block):
         print("note: the guest reached %r" % NICE)
@@ -836,10 +856,11 @@ def nos_mem(args):
     return getattr(args, "nos_mem", None) or "2G"
 
 
-def boot_rc(args, tmp, rc, extra=None, qemu=None):
+def boot_rc(args, tmp, rc, extra=None, qemu=None, powers_off=False):
     """nos with /etc/rc and the guest's files on its root, under TCG, run
-    until rc's last line has printed. The QEMU process and the serial log;
-    None for the process when rc did not get there."""
+    until rc's last line has printed -- or, `powers_off`, until nos has
+    turned the machine off, its rc's last line a `poweroff`. The QEMU process,
+    the serial log and nos's root image."""
     log = os.path.join(tmp, "serial.log")
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
@@ -872,10 +893,16 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
         if "PANIC:" in txt:
             pt.check("nos did not panic", False, txt[-3000:])
             return p, log, image
-        if RC_DONE.search(txt):
+        if not powers_off and RC_DONE.search(txt):
             return p, log, image
         time.sleep(3)
-    pt.check("/etc/rc ran to its end", False, txt[-2000:] or "qemu exited %s" % p.poll())
+    if powers_off and p.poll() is not None:
+        txt = open(log, errors="replace").read() if os.path.exists(log) else ""
+        if "PANIC:" in txt:
+            pt.check("nos did not panic", False, txt[-3000:])
+        return p, log, image
+    pt.check("nos powered itself off" if powers_off else "/etc/rc ran to its end", False,
+             txt[-2000:] or "qemu exited %s" % p.poll())
     return p, log, image
 
 
@@ -883,7 +910,14 @@ def disk(args):
     """A disk for the guest: an ext4 image on nos's root, `disk=` to the
     guest, which mounts it, reads what the host put there, writes, syncs and
     reads back -- and then nos's root is judged by e2fsck, and so is the
-    image, taken back out of it, which must hold what the guest wrote."""
+    image, taken back out of it, which must hold what the guest wrote.
+
+    With --acpi the guest mounts it once more and writes to it, gives
+    busybox's acpid a power-button handler that unmounts it and turns the
+    guest off, and leaves it so: nos itself is powered off, its unload
+    presses the button, and the image must come back clean -- unmounted --
+    holding the last file, where a guest stopped where it was would have
+    left its journal to replay and that file in its page cache."""
     tmp = tempfile.mkdtemp(prefix="nos-hvdisk-")
     content = os.path.join(tmp, "content")
     os.makedirs(content)
@@ -895,7 +929,10 @@ def disk(args):
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     rc = ["insmod /hv.ko", "hv on",
-          "hv start /bzImage mem=%d%s initrd=/initrd disk=/disk.img cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline),
+          # With --acpi its console to nos's log too (`log`): what its
+          # power-button handler says as nos goes down is read there.
+          "hv start /bzImage mem=%d%s initrd=/initrd disk=/disk.img%s cmdline=%s"
+          % (args.mem, cpus_opt(args), " log" if args.acpi else "", args.cmdline),
           x("id", args.vm_secs),
           x("mount -t devtmpfs devtmpfs /dev"),
           x("cat /sys/block/vda/size"),
@@ -911,11 +948,24 @@ def disk(args):
           x("ls -l /mnt/big"),
           x("umount /mnt", 120),
           x("grep virtio /proc/interrupts"),
-          "hv list",
-          "hv stop 0", RC_LAST]
-    p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
+          "hv list"]
+    handler = "/etc/acpi/PWRF/00000080"
+    if args.acpi:
+        rc += [x("mount /dev/vda /mnt"),
+               x("echo nos-wrote-this-last > /mnt/last.txt"),
+               x("mkdir -p /etc/acpi/PWRF"),
+               x("echo '#!/bin/sh' > %s" % handler),
+               x("echo 'umount /mnt && echo nos-guest-unmounted > /dev/console; poweroff -f' >> %s" % handler),
+               x("chmod +x %s" % handler),
+               x("acpid -l /acpid.log -p /acpid.pid"),
+               "poweroff"]
+    else:
+        rc += ["hv stop 0", RC_LAST]
+    p, log, image = boot_rc(args, tmp, rc, {"disk.img": img}, powers_off=args.acpi)
     try:
-        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+        if args.acpi and p.poll() is None:
+            return
+        if not args.acpi and (p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read())):
             return
         secs = sections(open(log, errors="replace").read())
         out = lambda i: output_of(secs, rc[i], 0) or ""
@@ -936,16 +986,33 @@ def disk(args):
                     r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
         pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
                  out(18)[-300:])
-        stop = output_of(secs, "hv stop 0", 0) or ""
-        m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
-        pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
-                 and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
+        if args.acpi:
+            # The halt's lines are on the serial console: the shell gave it
+            # back as it stopped, before the modules went.
+            txt = open(log, errors="replace").read()
+            halt = txt[txt.rfind("> poweroff"):]
+            pt.check("nos powered itself off", p.returncode == 0 and "ACPI shutdown" in halt, halt[-1500:])
+            pt.check("its unload pressed the guest's power button, giving it 120 s",
+                     "hv: unloading -- 1 vm(s) asked to turn themselves off, given 120 s" in halt, halt[-3000:])
+            pt.check("acpid's handler unmounted the disk", "nos-guest-unmounted" in halt, halt[-3000:])
+            pt.check("and the guest turned itself off, which ended it for the unload",
+                     "hv: vm 0 stopped for the unload -- the guest powered itself off, S5 by its ACPI PM1 control "
+                     "register" in halt, halt[-3000:])
+            pt.check("before nos unmounted its own root and went",
+                     re.search(r"hv: vm 0 stopped for the unload[\s\S]*module: hv unloaded[\s\S]*ACPI shutdown",
+                               halt) is not None, halt[-3000:])
+        else:
+            stop = output_of(secs, "hv stop 0", 0) or ""
+            m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
+            pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
+                     and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
     finally:
         pt.kill(p)
 
     # nos's own root, which every write of the guest's went through -- the
     # holes of the image filled, blocks of it written over -- as nos left it:
-    # stopped, not unmounted, which e2fsck is to find clean all the same.
+    # stopped, not unmounted, which e2fsck is to find clean all the same; or,
+    # with --acpi, unmounted by nos's own poweroff.
     fsck = subprocess.run(["e2fsck", "-fn", image], capture_output=True)
     pt.check("e2fsck finds nos's root clean after the guest's writes", fsck.returncode == 0,
              fsck.stdout.decode(errors="replace")[-800:])
@@ -962,6 +1029,18 @@ def disk(args):
         cat = subprocess.run(["debugfs", "-R", "cat /written.txt", back], capture_output=True)
         pt.check("and the file the guest wrote is in it", b"nos-wrote-this" in cat.stdout,
                  repr(cat.stdout[-200:]) + cat.stderr.decode(errors="replace")[-200:])
+        if args.acpi:
+            # Unmounted by the guest as nos went down: the state clean, and
+            # no journal left to replay -- which e2fsck -n does not replay,
+            # so it is the superblock that says how the guest left it.
+            head = subprocess.run(["dumpe2fs", "-h", back], capture_output=True).stdout.decode(errors="replace")
+            said = "\n".join(l for l in head.splitlines() if l.startswith(("Filesystem state", "Filesystem features")))
+            pt.check("the guest unmounted it as nos went down: clean, nothing in its journal to replay",
+                     re.search(r"(?m)^Filesystem state:\s+clean\s*$", head) is not None
+                     and "needs_recovery" not in head, said or head[-1500:])
+            last = subprocess.run(["debugfs", "-R", "cat /last.txt", back], capture_output=True)
+            pt.check("and the file it wrote last is in it", b"nos-wrote-this-last" in last.stdout,
+                     repr(last.stdout[-200:]) + last.stderr.decode(errors="replace")[-200:])
     if args.keep or pt.failures:
         print("log at " + log)
     else:
@@ -1265,7 +1344,10 @@ def run(args):
         # cmdline=, which takes the rest of the line.
         boot_cmd += " input=" + args.input
     boot_cmd += " cmdline=" + args.cmdline
-    rc = ["insmod /hv.ko", "hv on"]
+    # An unload's time for the guests short (`stop_secs=`): its `rmmod` presses
+    # vm 0's button and stops it when the time is up, within the five
+    # seconds rmmod waits for an unload before it goes on.
+    rc = ["insmod /hv.ko stop_secs=%d" % UNLOAD_SECS, "hv on"]
     if not args.skip_boot:
         rc.append(boot_cmd)
     vm_lines, vm_checks = vm_commands(args) if args.initrd and not args.skip_vms else ([], [])
