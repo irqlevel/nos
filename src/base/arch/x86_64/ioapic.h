@@ -20,8 +20,12 @@ public:
     void set_irq(u8 irq, u64 apic_id, u8 vector);
     void set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high);
 
-    /* Rewrite only the destination of an already programmed entry */
-    void set_irq_destination(u8 irq, u64 apic_id);
+    /* Rewrite only the destination of an already programmed entry, and
+       return the apic id written: check_dest's, should the one asked for be
+       beyond the field. It says nothing of its own -- IrqBalance, its one
+       caller, holds its spin lock across it and says where each line went
+       once the lock is down. */
+    u64 set_irq_destination(u8 irq, u64 apic_id);
 
     /* Physical destination mode names the target in bits 59:56 of the
        redirection entry -- four bits, so only apic ids 0..15 are
