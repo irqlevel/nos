@@ -68,6 +68,7 @@ private:
     ulong assign(Entry entry);
     ulong next_cpu_lock_held(bool io_apic);
     void apply_lock_held(Entry& entry);
+    static void trace_entry(const Entry& entry);
 
     static const ulong MAX_ENTRIES = 64;
 
@@ -76,6 +77,11 @@ private:
     ulong next_cpu_;       /* round-robin cursor for MSI-X vectors */
     ulong next_io_apic_cpu_; /* and for IOAPIC lines, over a smaller CPU set */
     bool balanced_;
+    /* Guards the above, and what a table is retargeted through: remove_msix
+       takes it before the table goes. Nothing is traced under it -- a line
+       goes to the console as it is written, about 10 ms of it on the EX44's
+       framebuffer, and balance()'s four lines under it held it there past
+       the watchdog's 25 ms. */
     SpinLock lock_;
 };
 
