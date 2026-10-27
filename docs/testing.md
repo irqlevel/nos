@@ -2014,12 +2014,18 @@ anything past 255, and a distribution's `hv start` is longer. It needs `ssh` and
 
 `--disk` is another: an ext4 image with a file in it, put on nos's root and
 given to the guest with `disk=`; the guest mounts it, reads the file, writes
-4 MiB and a file of its own, syncs, and reads both back after a remount; the
-report must count the disk's reads, writes and flushes and no error;
-nos's root, which every write of the guest's went through -- the image's
-holes filled, its blocks written over -- must pass `e2fsck` as nos left it,
-stopped rather than unmounted; and the image, taken back out of it with
-`debugfs`, must pass `e2fsck` too and hold what the guest wrote. It needs a
+4 MiB and a file of its own, syncs, and reads both back after a remount;
+writes four files side by side and, its page cache gone with a remount,
+reads them back side by side, every sum the same; then deletes what it
+wrote and trims its free space (`fstrim`), which must report bytes
+trimmed. The report must count the disk's reads, writes, flushes and
+discards and no error; the image, held while the guest ran, must say as it
+is let go of that it read and wrote off the VFS's lock and gave back 4 MiB
+of nos's root at least (`fs::image`); nos's root, which every write of the
+guest's went through -- the image's holes filled, its blocks written over,
+given back -- must pass `e2fsck` as nos left it, stopped rather than
+unmounted; and the image, taken back out of it with `debugfs`, must pass
+`e2fsck` too and hold what the guest wrote. It needs a
 guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 `--nvme-root` puts nos's root on an NVMe disk instead of virtio-blk: each
 driver takes ext2's batches of blocks its own way, and NVMe's is the one the

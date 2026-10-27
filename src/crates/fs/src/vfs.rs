@@ -121,6 +121,16 @@ pub trait FileSystem: Send {
     fn map_blocks(&mut self, _file: NodeId, _first: u64, _out: &mut [u64]) -> bool {
         false
     }
+
+    /// Give back the blocks of `count` blocks of `file` from block `first`,
+    /// of those inside it -- holes from here on, reading as zeros, the
+    /// file's size as it was -- in the filesystem's own order, so that no
+    /// crash leaves a block both in use and free. How many were given back,
+    /// or None: an I/O error, or a filesystem with no blocks of its own
+    /// (`data_block_size` 0), the default.
+    fn punch(&mut self, _file: NodeId, _first: u64, _count: u64) -> Option<u64> {
+        None
+    }
 }
 
 /// What `stat` answers.
@@ -1057,6 +1067,42 @@ impl Vfs {
             Some(end) if end <= size.div_ceil(block) => mount.fs.map_blocks(node, first, out),
             _ => false,
         }
+    }
+
+    /// The whole blocks inside `len` bytes from `offset` of the file `handle`
+    /// holds for writing given back to its filesystem (`FileSystem::punch`):
+    /// holes, reading as zeros, the file's size as it was -- a guest's
+    /// discard of its image. What the range covers of a block only in part
+    /// is left as it is. How many blocks were given back, or None. The caller
+    /// -- the image -- has no read of its own under way off this lock on
+    /// what it gives back: the next file may have those blocks.
+    pub fn punch(&self, handle: Handle, offset: u64, len: u64) -> Option<u64> {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node, flags) = {
+            let file = inner.file(handle)?;
+            (file.mount_id, file.node, file.flags)
+        };
+        if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
+            trace!(0, "vfs: only a file held for writing as a disk's image is punched");
+            return None;
+        }
+        let mount = inner.mount_by_id(mount_id)?;
+        if mount.read_only {
+            trace!(0, "vfs: that mount is read-only");
+            return None;
+        }
+        let block = mount.fs.data_block_size() as u64;
+        if block == 0 {
+            return None;
+        }
+        let first = offset.div_ceil(block);
+        let end = offset.checked_add(len)? / block;
+        if first >= end {
+            return Some(0);
+        }
+        mount.fs.punch(node, first, end - first)
     }
 
     /// The filesystem the file is on, synced: everything written to it on

@@ -1668,6 +1668,31 @@ report counts each disk's reads, writes, flushes and errors, and the image
 says as it is let go of how many of its batches went off the lock and how
 many through it.
 
+**What a guest no longer needs it gives back.** The disk offers discard
+and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the
+guest may only read offers neither): a guest's `fstrim`, ext4 mounted
+with `discard`, `blkdiscard`, `mkfs` of its own disk -- ranges of sectors,
+up to eight a request and 64 MiB a range, aligned best to 4 KiB. The device
+copies the ranges out of the guest's memory once, checks them in its own
+copy -- whole sectors inside the disk, no flag but a write of zeros'
+unmap -- and hands the backend that copy (`Request::ranges`): a guest that
+changes them after the check changes nothing it was checked on. The image
+gives the whole blocks of a discard back to nos's root (`Image::discard`,
+`Vfs::punch`, ext2's `punch`): holes in its file from then on, reading as
+zeros, its size as it was -- so an image no longer only grows. A write of
+zeros with unmap gives back the blocks it covers whole and writes zeros
+over the rest; without, it writes zeros, its blocks kept. ext2 gives the
+blocks back in batches in truncate's order -- each batch's pointers
+cleared and on the disk, the inode committed, and only then the blocks
+freed in the bitmap -- so a crash leaks at most a batch to e2fsck and
+never leaves a block both in use and free; the indirect blocks stay,
+whatever is left in them, since they map what is past the range too. That
+the next file may have a block the moment the punch is done is safe
+because an image's calls come one at a time: no read of its own is under
+way off the VFS's lock on a block it mapped before. The report counts the
+discards and writes of zeros, and the image says how many blocks it gave
+back.
+
 **What a guest's write costs nos's ext2** ([Filesystems](filesystems.md)):
 one into a hole of the image flushes nos's disk once and writes the pointers
 to what it filled after that, where it used to cost a flush and four FUA
@@ -4412,8 +4437,21 @@ someone else's; then speed.
    guest's disk no longer waits behind another's, nor behind nos's own
    files. What it was: `Vfs::read_at` and `write_within` held the VFS's one
    lock across the whole synchronous ext2 read or write, and a guest's
-   FLUSH was a sync of the whole filesystem under it. Left: each disk
-   still serves its requests one at a time, on its one task.
+   FLUSH was a sync of the whole filesystem under it. On the AX41, nested
+   under KVM, with two guests at once each reading 4 KiB four at a time
+   off its own image: 1.30 and 1.35 s each where it was 1.86 and 1.69,
+   reads of 64 KiB 0.74 where they were 1.02, writes of 4 KiB 1.55 and 1.61
+   where they were 1.84 and 1.69; one guest alone the same, within the
+   spread. Left: each disk serves its requests one at a time, on its one
+   task. Four tasks a disk -- the image's reads side by side in lanes of
+   their own, its writes one at a time -- were tried and measured, and left
+   out: slower wherever they differed, two guests' four writers of 64 KiB
+   8.5 s each where they were 1.2, since four lanes' batches of up to 16
+   pieces take every one of the NVMe driver's 64 command IDs and the one
+   left waiting sleeps 50 microseconds at a time, and each extra task's
+   wakeup is an IPI that nested under KVM is an exit. A disk with many
+   requests in flight wants the block layer's asynchronous path from one
+   task (`Disk::submit`), its command IDs budgeted, not more tasks.
 3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
    work on legacy virtio; and a guest of one CPU has no local APIC, so no
    MSI-X -- six exits an interrupt through the 8259.

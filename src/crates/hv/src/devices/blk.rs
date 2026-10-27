@@ -11,12 +11,21 @@
 //! The disk works beside the guest, as a disk of its own would. When the
 //! driver notifies, the vCPU takes what it made available off the ring --
 //! the data of a write copied out of guest memory then, into a buffer of the
-//! device's -- and hands each request to the backend, which serves them in
-//! order while the guest runs on; each time round the run loop (`poll`) what
-//! the backend has served is given back: a read's data copied into the
-//! guest, the status written, the chain on the used ring, and an interrupt.
+//! device's -- and hands each request to the backend, which serves them
+//! while the guest runs on: in whatever order it likes, several at once if
+//! it can -- virtio orders nothing between requests in flight; a driver
+//! that needs a write done before another waits for it, and before a
+//! flush. Each time round the run loop (`poll`) what the backend has served
+//! is given back: a read's data copied into the guest, the status written,
+//! the chain on the used ring, and an interrupt.
 //! The guest's memory is only ever touched here, on the vCPU's task: the
 //! backend sees buffers of the device's and nothing else.
+//!
+//! A discard and a write of zeros come as ranges -- sectors, a count, and
+//! for a write of zeros whether the blocks may be given back -- which the
+//! device copies out of the guest's memory once, checks there, and hands
+//! the backend that copy (`Request::ranges`): a guest that changes them
+//! after the check changes nothing it was checked on.
 //!
 //! At most `IN_FLIGHT` requests are with the backend at once, each in a
 //! buffer of `REQUEST_BYTES` taken when the device is made -- what the driver
@@ -34,8 +43,8 @@ use crate::memory::GuestMemory;
 use crate::{Error, Result};
 
 /// What stores a disk's bytes, and serves the requests the device hands it
-/// -- in the order it is handed them, beside the guest, from a task of its
-/// own or however it likes -- until `take` gives each back.
+/// -- beside the guest, from tasks of its own or however it likes, several
+/// at once and in any order -- until `take` gives each back.
 pub trait Backend: Send {
     /// The disk's size in bytes, a whole number of sectors: what the device
     /// keeps every request inside.
@@ -48,7 +57,8 @@ pub trait Backend: Send {
     /// Serve `req`. The device never has more than `IN_FLIGHT` handed over
     /// and not yet taken back, and a backend takes that many.
     fn submit(&mut self, req: Request);
-    /// A request served, if one is: in the order they were submitted.
+    /// A request served, if one is: in the order they were served, which
+    /// need not be the order they were submitted in.
     fn take(&mut self) -> Option<Request>;
 }
 
@@ -59,6 +69,28 @@ pub enum Op {
     Write,
     /// Everything written so far, on stable storage.
     Flush,
+    /// Its ranges (`Request::ranges`) no longer needed by the guest: what a
+    /// backend may give back, and need not.
+    Discard,
+    /// Its ranges made zeros -- given back too, where a range says it may be.
+    WriteZeroes,
+}
+
+impl Op {
+    /// Whether it changes what the disk holds.
+    pub fn writes(self) -> bool {
+        matches!(self, Op::Write | Op::Discard | Op::WriteZeroes)
+    }
+}
+
+/// One range of a discard or a write of zeros: `len` bytes from `offset`,
+/// whole sectors inside the disk, and whether -- for a write of zeros --
+/// the blocks under it may be given back rather than written.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Range {
+    pub offset: u64,
+    pub len: u64,
+    pub unmap: bool,
 }
 
 /// One request, on its way to the backend and back. Its buffer is the
@@ -99,14 +131,37 @@ impl Request {
     pub fn done(&mut self, ok: bool) {
         self.ok = ok;
     }
+
+    /// A discard's or a write of zeros' ranges, as the device checked them
+    /// in its own copy: every one whole sectors inside the disk. None for
+    /// any other request.
+    pub fn ranges(&self) -> impl Iterator<Item = Range> + '_ {
+        let ranges = if matches!(self.op, Op::Discard | Op::WriteZeroes) { &self.buf[..self.len] } else { &[] };
+        ranges.chunks_exact(RANGE_BYTES).map(|r| {
+            let sector = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
+            let count = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+            let flags = u32::from_le_bytes([r[12], r[13], r[14], r[15]]);
+            /* Checked to fit when the device took them (`ranges_request`) */
+            Range {
+                offset: sector.saturating_mul(SECTOR),
+                len: u64::from(count) * SECTOR,
+                unmap: flags & RANGE_UNMAP != 0,
+            }
+        })
+    }
 }
 
 /// Virtio's type for a block device.
 const VIRTIO_TYPE: u16 = 2;
 /// Mass storage, SCSI -- what a legacy virtio disk has always said it is.
 const CLASS: u32 = 0x01_00_00;
-/// Its I/O BAR: the header and the configuration below, rounded up.
-pub const BAR_SIZE: u32 = 0x40;
+/// Its I/O BAR: the header -- MSI-X's longer one -- and the configuration
+/// below, rounded up to a power of two. A configuration past the BAR's end
+/// is no device's to a guest: it reads all ones there, and a discard
+/// alignment of all ones once made every trim of a guest's trim nothing.
+pub const BAR_SIZE: u32 = 0x80;
+const _: () = assert!(virtio::DEVICE_CONFIG_MSIX as usize + CFG_BYTES <= BAR_SIZE as usize,
+                      "the configuration fits the BAR, MSI-X's header and all");
 
 pub const SECTOR: u64 = 512;
 /// The queue's size. A request takes a descriptor a segment plus two, so a
@@ -122,11 +177,24 @@ const QUEUE_SIZE: u16 = 256;
 const PASS: usize = QUEUE_SIZE as usize;
 
 /// Features: a limit on a segment's size and on the segments a request may
-/// have, flush, and a disk that is read-only.
+/// have, flush, a disk that is read-only, and -- one that is not -- discard
+/// and a write of zeros.
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
 const F_RO: u32 = 1 << 5;
 const F_FLUSH: u32 = 1 << 9;
+const F_DISCARD: u32 = 1 << 13;
+const F_WRITE_ZEROES: u32 = 1 << 14;
+/// A discard's or a write of zeros' ranges at most, and a range's sectors:
+/// what the driver is told. A range is a sector, a count and flags.
+const MAX_RANGES: usize = 8;
+const MAX_RANGE_SECTORS: u32 = 1 << 17;
+const RANGE_BYTES: usize = 16;
+/// A write of zeros' range may have its blocks given back.
+const RANGE_UNMAP: u32 = 1;
+/// The sectors a discard is best aligned to: 4 KiB, the block an image on
+/// nos's filesystem gives back whole.
+const DISCARD_ALIGNMENT: u32 = 8;
 /// What a request may carry, which the driver is told: data segments of at
 /// most a page, and this many of them.
 const SIZE_MAX: u32 = 4096;
@@ -142,6 +210,8 @@ const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 const T_GET_ID: u32 = 8;
+const T_DISCARD: u32 = 11;
+const T_WRITE_ZEROES: u32 = 13;
 const S_OK: u8 = 0;
 const S_IOERR: u8 = 1;
 const S_UNSUPP: u8 = 2;
@@ -153,7 +223,13 @@ const ID_BYTES: usize = 20;
 const CFG_CAPACITY: u16 = 0;
 const CFG_SIZE_MAX: u16 = 8;
 const CFG_SEG_MAX: u16 = 12;
-const CFG_BYTES: usize = 24;
+const CFG_MAX_DISCARD_SECTORS: u16 = 36;
+const CFG_MAX_DISCARD_SEG: u16 = 40;
+const CFG_DISCARD_ALIGNMENT: u16 = 44;
+const CFG_MAX_ZEROES_SECTORS: u16 = 48;
+const CFG_MAX_ZEROES_SEG: u16 = 52;
+const CFG_ZEROES_MAY_UNMAP: u16 = 56;
+const CFG_BYTES: usize = 60;
 
 /// What the device has done, for a report.
 #[derive(Clone, Copy, Default)]
@@ -164,6 +240,10 @@ pub struct Stats {
     pub read_bytes: u64,
     pub written_bytes: u64,
     pub errors: u64,
+    pub discards: u64,
+    pub discarded_bytes: u64,
+    pub zeroings: u64,
+    pub zeroed_bytes: u64,
 }
 
 /// A request with the backend, as the device keeps it: the chain it came in
@@ -184,6 +264,9 @@ struct Slot {
 enum Next {
     /// The backend's to serve: what, where, and how many bytes.
     Serve(Op, u64, usize),
+    /// A discard's or a write of zeros' ranges, the backend's to serve: how
+    /// many, in the device's own copy of them, checked.
+    Ranges(Op, usize, [u8; MAX_RANGES * RANGE_BYTES]),
     /// Answered here: the status, and how many data bytes were written into
     /// the chain.
     Answer(u8, u32),
@@ -226,7 +309,8 @@ impl Blk {
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
         name[..n].copy_from_slice(&id.as_bytes()[..n]);
-        let ro = if backend.read_only() { F_RO } else { 0 };
+        /* A disk that may only be read has nothing to give back. */
+        let ro = if backend.read_only() { F_RO } else { F_DISCARD | F_WRITE_ZEROES };
         Ok(Blk {
             transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | ro, queues),
             backend,
@@ -273,6 +357,13 @@ impl Blk {
         c[at..at + 4].copy_from_slice(&SIZE_MAX.to_le_bytes());
         let at = usize::from(CFG_SEG_MAX);
         c[at..at + 4].copy_from_slice(&SEG_MAX.to_le_bytes());
+        for (at, value) in [(CFG_MAX_DISCARD_SECTORS, MAX_RANGE_SECTORS), (CFG_MAX_DISCARD_SEG, MAX_RANGES as u32),
+                            (CFG_DISCARD_ALIGNMENT, DISCARD_ALIGNMENT), (CFG_MAX_ZEROES_SECTORS, MAX_RANGE_SECTORS),
+                            (CFG_MAX_ZEROES_SEG, MAX_RANGES as u32)] {
+            let at = usize::from(at);
+            c[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        c[usize::from(CFG_ZEROES_MAY_UNMAP)] = 1;
         c
     }
 
@@ -412,12 +503,13 @@ impl Blk {
     fn start(&mut self, mem: &GuestMemory, slot: usize, head: u16, segs: &[Seg])
         -> core::result::Result<bool, Broken>
     {
-        let (op, offset, len) = match self.classify(mem, segs) {
+        let (op, offset, len, ranges) = match self.classify(mem, segs) {
             Next::Answer(status, written) => {
                 self.finish(mem, segs, head, status, written)?;
                 return Ok(true);
             }
-            Next::Serve(op, offset, len) => (op, offset, len),
+            Next::Serve(op, offset, len) => (op, offset, len, None),
+            Next::Ranges(op, count, ranges) => (op, 0, count * RANGE_BYTES, Some(ranges)),
         };
         let Some(mut buf) = self.slots[slot].buf.take() else {
             /* `fill` chose the slot for having its buffer. */
@@ -425,6 +517,10 @@ impl Blk {
             self.finish(mem, segs, head, S_IOERR, 0)?;
             return Ok(true);
         };
+        if let Some(ranges) = ranges {
+            /* The copy the ranges were checked in, not the guest's memory again */
+            buf[..len].copy_from_slice(&ranges[..len]);
+        }
         if op == Op::Write && !copy_out(mem, segs, HEADER as u64, &mut buf[..len]) {
             self.slots[slot].buf = Some(buf);
             self.stats.errors += 1;
@@ -468,6 +564,14 @@ impl Blk {
                             self.stats.written_bytes += len as u64;
                         }
                         Op::Flush => self.stats.flushes += 1,
+                        Op::Discard => {
+                            self.stats.discards += 1;
+                            self.stats.discarded_bytes += ranged_bytes(&buf[..len]);
+                        }
+                        Op::WriteZeroes => {
+                            self.stats.zeroings += 1;
+                            self.stats.zeroed_bytes += ranged_bytes(&buf[..len]);
+                        }
                     }
                 } else {
                     self.stats.errors += 1;
@@ -542,8 +646,50 @@ impl Blk {
                     Next::Answer(S_IOERR, 0)
                 }
             }
+            T_DISCARD => self.ranges_request(mem, segs, Op::Discard, F_DISCARD, readable),
+            T_WRITE_ZEROES => self.ranges_request(mem, segs, Op::WriteZeroes, F_WRITE_ZEROES, readable),
             _ => Next::Answer(S_UNSUPP, 0),
         }
+    }
+
+    /// A discard or a write of zeros: its ranges copied out of the chain
+    /// once, into the device's own copy, and checked there -- a count of
+    /// them the driver was told it may send, each whole sectors inside the
+    /// disk, no flag but a write of zeros' unmap. Unsupported unless the
+    /// driver took the feature.
+    fn ranges_request(&mut self, mem: &GuestMemory, segs: &[Seg], op: Op, feature: u32, readable: u64) -> Next {
+        if self.transport.driver_features() & feature == 0 {
+            return Next::Answer(S_UNSUPP, 0);
+        }
+        if self.backend.read_only() {
+            self.stats.errors += 1;
+            return Next::Answer(S_IOERR, 0);
+        }
+        let bytes = readable.saturating_sub(HEADER as u64);
+        let count = (bytes / RANGE_BYTES as u64) as usize;
+        if bytes % RANGE_BYTES as u64 != 0 || count == 0 || count > MAX_RANGES {
+            self.stats.errors += 1;
+            return Next::Answer(S_IOERR, 0);
+        }
+        let mut ranges = [0u8; MAX_RANGES * RANGE_BYTES];
+        if !copy_out(mem, segs, HEADER as u64, &mut ranges[..count * RANGE_BYTES]) {
+            self.stats.errors += 1;
+            return Next::Answer(S_IOERR, 0);
+        }
+        let allowed = if op == Op::WriteZeroes { RANGE_UNMAP } else { 0 };
+        for r in ranges[..count * RANGE_BYTES].chunks_exact(RANGE_BYTES) {
+            let sector = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
+            let sectors = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
+            let flags = u32::from_le_bytes([r[12], r[13], r[14], r[15]]);
+            if flags & !allowed != 0 {
+                return Next::Answer(S_UNSUPP, 0);
+            }
+            if sectors > MAX_RANGE_SECTORS || self.range(sector, u64::from(sectors) * SECTOR).is_none() {
+                self.stats.errors += 1;
+                return Next::Answer(S_IOERR, 0);
+            }
+        }
+        Next::Ranges(op, count, ranges)
     }
 
     /// A read or a write of `len` bytes from `sector`.
@@ -570,6 +716,13 @@ impl Blk {
 /// A count of bytes, as the used ring's 32 bits hold it.
 fn clamp32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// The bytes ranges cover, for the stats.
+fn ranged_bytes(ranges: &[u8]) -> u64 {
+    ranges.chunks_exact(RANGE_BYTES)
+        .map(|r| u64::from(u32::from_le_bytes([r[8], r[9], r[10], r[11]])) * SECTOR)
+        .sum()
 }
 
 /// Copy `buf.len()` bytes of the chain's readable stream, from `skip` bytes

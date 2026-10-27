@@ -19,6 +19,10 @@ use crate::{reached, Input};
 /// A name is shorter than this, in the VFS and every filesystem under it.
 pub const NAME_MAX: usize = 64;
 
+/// Power cuts set going into a discard, a request apart: more than a punch
+/// of a few batches takes.
+const PUNCH_CUTS: u64 = 48;
+
 /// What the filesystem under the VFS holds at most.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -73,11 +77,15 @@ pub struct Model {
     /// The files held as images -- `Fs::images`, one for one -- and whether
     /// each is held for writing.
     pub holds: Vec<(Vec<Vec<u8>>, bool)>,
+    /// The blocks a discard of an image gives back whole -- holes, reading
+    /// as zeros -- or 0 where the filesystem gives nothing back and a
+    /// discard changes nothing.
+    pub punch_block: u64,
 }
 
 impl Model {
     pub fn new(tree: Node, read_only: bool, limits: Limits) -> Model {
-        Model { tree, read_only, limits, open: Vec::new(), holds: Vec::new() }
+        Model { tree, read_only, limits, open: Vec::new(), holds: Vec::new(), punch_block: 0 }
     }
 
     pub fn resolve(&self, path: &[u8]) -> Res {
@@ -677,6 +685,66 @@ impl Fs {
         }
     }
 
+    /// An image's discard (`zeroes` None) or write of zeros: a discard's
+    /// whole blocks become holes where the filesystem gives blocks back, and
+    /// what it covers of a block only in part is left; a write of zeros
+    /// makes the whole range zeros, its blocks given back or not.
+    pub fn image_discard(&mut self, i: usize, at: u64, len: u64, zeroes: Option<bool>, cut: bool) {
+        let Some((path, write)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_{} {} bytes of {} at {}", if zeroes.is_some() { "write_zeroes" } else { "discard" }, len,
+            show(&join(&path)), at));
+        if cut {
+            /* The power cut before each of its requests, one after another:
+             * every point of the order blocks are given back in -- pointers
+             * down, the inode committed, and only then the bitmap -- held to
+             * leaving the image at worst unclean, as the target judges every
+             * cut. */
+            crate::machine::disk::with(0, |d| {
+                let n = d.log.len() as u64;
+                d.crash_at.extend(n..n + PUNCH_CUTS);
+            });
+            reached("an image's blocks given back with the power cut at each request");
+        }
+        let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let got = match zeroes {
+            None => self.images[i].discard(at, len),
+            Some(unmap) => self.images[i].write_zeroes(at, len, unmap),
+        };
+        let size = self.model.size(&path);
+        let want = write && at.checked_add(len).is_some_and(|end| end <= size);
+        if zeroes.is_some() && self.refused_for_room(got, want, mark, &saved) {
+            /* Zeros written into a hole take blocks: the write stopped part
+             * way, as any other. */
+            let old = match self.model.node(&path) {
+                Some(Node::File(d)) => d.clone(),
+                _ => Data::new(),
+            };
+            self.resync_partial(&path, &old, at, &vec![0u8; len as usize]);
+            return;
+        }
+        self.check(got == want, format_args!("an image's {} of {} bytes of {} ({} bytes) at {} {}",
+                   if zeroes.is_some() { "write of zeros" } else { "discard" }, len, show(&join(&path)), size, at,
+                   if got { "succeeded" } else { "failed" }));
+        if !(got && want) {
+            return;
+        }
+        let zeroed = match zeroes {
+            Some(_) => Some((at, at + len)),
+            None if self.model.punch_block != 0 => {
+                let block = self.model.punch_block;
+                let (first, end) = (at.div_ceil(block) * block, (at + len) / block * block);
+                (first < end).then_some((first, end.min(size)))
+            }
+            None => None,
+        };
+        if let Some((from, to)) = zeroed {
+            if let Some(d) = self.model.file_mut(&path) {
+                d.write(from, &vec![0u8; (to - from) as usize]);
+            }
+            reached(if zeroes.is_some() { "an image's range made zeros" } else { "an image's blocks given back" });
+        }
+    }
+
     pub fn image_sync(&mut self, i: usize) {
         if let Some(image) = self.images.get_mut(i) {
             let ok = image.sync();
@@ -1131,9 +1199,20 @@ pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
         21 | 22 if held != 0 => {
             let i = pick_held(r);
             let size = f.model.holds.get(i).map_or(0, |(p, _)| f.model.size(p));
-            match r.u8() % 8 {
+            match r.u8() % 10 {
                 0 => f.image_sync(i),
                 1 => f.image_close(i),
+                8 | 9 => {
+                    /* A discard, or a write of zeros, over a few blocks */
+                    let at = offset(r, size, block, f.model.limits.span);
+                    let len = (length(r) as u64).saturating_mul(1 + r.below(4));
+                    let zeroes = if r.bool() { None } else { Some(r.bool()) };
+                    /* Where the filesystem gives blocks back -- ext2, on the
+                     * target's disk -- now and then with the power cut at
+                     * each of the discard's requests. */
+                    let cut = f.model.punch_block != 0 && r.chance(8);
+                    f.image_discard(i, at, len, zeroes, cut);
+                }
                 k => {
                     let at = offset(r, size, block, f.model.limits.span);
                     let n = length(r);

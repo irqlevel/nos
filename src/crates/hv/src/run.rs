@@ -93,10 +93,10 @@ const VECTOR_DB: u8 = 1;
 const VECTOR_AC: u8 = 17;
 
 /// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
-/// the disks' from 0xC000, the NICs' from 0xC100 -- and the IRQs they share:
-/// 11 and 10, free on a PC, on the slave PIC.
+/// the disks' from 0xC000, the NICs' past every disk's -- and the IRQs they
+/// share: 11 and 10, free on a PC, on the slave PIC.
 const DISK_IO_BASE: u16 = 0xC000;
-const NIC_IO_BASE: u16 = 0xC100;
+const NIC_IO_BASE: u16 = DISK_IO_BASE + (MAX_DISKS as u16) * (blk::BAR_SIZE as u16);
 const DISK_IRQ: u8 = 11;
 const NIC_IRQ: u8 = 10;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
