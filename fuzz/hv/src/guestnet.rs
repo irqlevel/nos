@@ -29,6 +29,8 @@ const INBOX_FRAMES: usize = 256;
 /// The IPv6 addresses a port has bound at once, past which a new one takes
 /// the place of its least recently used.
 const ADDRS6_PER_PORT: usize = 8;
+/// The networks the ports are put on: a port on none is alone.
+const NETS: [&str; 2] = ["lab", "dev"];
 /// The link-local prefix, and the switch's: a guest's addresses in them are
 /// its MAC's EUI-64 (RFC 4291).
 const LINK_LOCAL: [u8; 8] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0];
@@ -164,6 +166,10 @@ fn admit(p: usize, f: &[u8]) -> Admit {
 /// what the switch is for, and held against what it does.
 /// Sends of TCP the switch carried whole and cut, for `HV_FUZZ_STATS`.
 static WHOLE_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Ports changed hands as a guest sent, after the send and at one of its
+/// locks; and which of the model's ends each came to (`hand_over`).
+static HANDOVERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static HANDOVER_ENDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 static CUT_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// IPv6 frames from the guests by what the model made of each (`Admit`'s
 /// order), and addresses a port bound in the place of its oldest.
@@ -178,8 +184,14 @@ enum Kind {
     Whole,
 }
 
+#[derive(Clone)]
 struct Model {
     owned: [bool; MAX_PORTS],
+    /// The network each port is on -- a place in `NETS` -- or None, alone:
+    /// which guests it reaches.
+    net: [Option<usize>; MAX_PORTS],
+    /// Frames each port's guest sent to another network's guest.
+    isolated: [u64; MAX_PORTS],
     /// What waits for each port's NIC: frames, frames whose checksum is left
     /// to finish, and sends carried whole.
     inbox: Vec<VecDeque<(Vec<u8>, Kind)>>,
@@ -209,8 +221,9 @@ struct Model {
     /// IPv6 hiding what it carries.
     foreign: u64,
     /// The IPv6 addresses bound, each to a port, with when it last used it
-    /// (RFC 6620's first come, first served), and the count of uses.
-    bound: BTreeMap<[u8; 16], (usize, u64)>,
+    /// (RFC 6620's first come, first served) -- a network's own, by its
+    /// group (`group`) -- and the count of uses.
+    bound: BTreeMap<(u32, [u8; 16]), (usize, u64)>,
     uses: u64,
     /// Router solicitations answered.
     advertised: u64,
@@ -218,12 +231,18 @@ struct Model {
     stack: Vec<Vec<u8>>,
     dns: u32,
     refuse: bool,
+    /// A port the next frame for -- or kept from, as another network's --
+    /// is lost instead: what one sent as the port changes hands may come
+    /// to, for the VM going or the VM coming (`hand_over`).
+    lose: Option<usize>,
 }
 
 impl Model {
     fn new() -> Model {
         Model {
             owned: [false; MAX_PORTS],
+            net: [None; MAX_PORTS],
+            isolated: [0; MAX_PORTS],
             inbox: vec![VecDeque::new(); MAX_PORTS],
             dropped: [0; MAX_PORTS],
             spoofed: [0; MAX_PORTS],
@@ -245,11 +264,83 @@ impl Model {
             stack: Vec::new(),
             dns: 0,
             refuse: false,
+            lose: None,
         }
+    }
+
+    /// Port `p` given to a VM, on network `net` or alone: its counts and
+    /// what its NIC takes a new port's.
+    fn claim(&mut self, p: usize, net: Option<usize>) {
+        self.owned[p] = true;
+        self.net[p] = net;
+        self.isolated[p] = 0;
+        self.inbox[p].clear();
+        self.woken[p] = 0;
+        self.quiet[p] = false;
+        self.takes_partial[p] = false;
+        self.takes[p] = false;
+        self.dropped[p] = 0;
+        self.spoofed[p] = 0;
+        self.on_backlog[p] = 0;
+        self.over_share[p] = 0;
+        self.flooded[p] = 0;
+        self.flood[p] = (switch::FLOOD_BURST, time::peek());
+    }
+
+    /// Port `p` given up, with what waited for its VM and the IPv6 addresses
+    /// it had bound: how many times that VM was woken.
+    fn release(&mut self, p: usize) -> u64 {
+        self.owned[p] = false;
+        self.net[p] = None;
+        self.inbox[p].clear();
+        self.bound.retain(|_, b| b.0 != p);
+        self.woken[p]
+    }
+
+    /// Port `p` given up and given to another VM, on network `net` or
+    /// alone: how many times the VM that had it was woken.
+    fn hand_over(&mut self, p: usize, net: Option<usize>) -> u64 {
+        let woken = self.release(p);
+        self.claim(p, net);
+        woken
+    }
+
+    /// What port `p`'s guest lost, as the switch counts it.
+    fn counts(&self, p: usize) -> switch::PortCounts {
+        switch::PortCounts { dropped: self.dropped[p], spoofed: self.spoofed[p], over_share: self.over_share[p],
+                             flooded: self.flooded[p], isolated: self.isolated[p] }
+    }
+
+    /// Whether the frame at hand is lost for port `p` (`lose`): once.
+    fn lost(&mut self, p: usize) -> bool {
+        let lost = self.lose == Some(p);
+        if lost {
+            self.lose = None;
+        }
+        lost
     }
 
     fn deliver(&mut self, p: usize, frame: &[u8]) {
         self.deliver_kind(p, frame, Kind::Done);
+    }
+
+    /// Port `p`'s group, the switch's way of saying whom it reaches: a
+    /// network's, shared by its ports, or one of its own -- and 0 for a
+    /// port with no VM, which a NIC this target keeps past its port's
+    /// release still sends from.
+    fn group(&self, p: usize) -> u32 {
+        if !self.owned[p] {
+            return 0;
+        }
+        match self.net[p] {
+            Some(n) => 1 + n as u32,
+            None => 0x8000_0000 | p as u32,
+        }
+    }
+
+    /// Whether ports `p` and `q` are a VM's each, on one network.
+    fn same(&self, p: usize, q: usize) -> bool {
+        self.owned[p] && self.owned[q] && self.group(p) == self.group(q)
     }
 
     /// Whether IPv6 address `a` is port `p`'s to use: bound to it, now if
@@ -258,7 +349,8 @@ impl Model {
     fn claim6(&mut self, p: usize, a: [u8; 16]) -> bool {
         self.uses += 1;
         let now = self.uses;
-        match self.bound.get_mut(&a) {
+        let key = (self.group(p), a);
+        match self.bound.get_mut(&key) {
             Some(b) if b.0 != p => return false,
             Some(b) => {
                 b.1 = now;
@@ -266,14 +358,14 @@ impl Model {
             }
             None => {}
         }
-        let mine: Vec<([u8; 16], u64)> =
-            self.bound.iter().filter(|(_, b)| b.0 == p).map(|(a, b)| (*a, b.1)).collect();
+        let mine: Vec<((u32, [u8; 16]), u64)> =
+            self.bound.iter().filter(|(_, b)| b.0 == p).map(|(k, b)| (*k, b.1)).collect();
         if mine.len() == ADDRS6_PER_PORT {
             let oldest = mine.iter().min_by_key(|m| m.1).map(|m| m.0).expect("a port's addresses");
             self.bound.remove(&oldest);
             EVICTED6.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.bound.insert(a, (p, now));
+        self.bound.insert(key, (p, now));
         true
     }
 
@@ -404,7 +496,7 @@ impl Model {
     }
 
     fn deliver_kind(&mut self, p: usize, frame: &[u8], kind: Kind) {
-        if !self.owned[p] {
+        if !self.owned[p] || self.lost(p) {
             return;
         }
         if self.inbox[p].len() == INBOX_FRAMES || frame.len() > MAX_FRAME {
@@ -421,11 +513,14 @@ impl Model {
     /// a NIC that takes them, with room in the inbox and for one more of the
     /// eight it holds -- false otherwise, and the caller cuts it.
     fn deliver_whole(&mut self, p: usize, frame: &[u8]) -> bool {
-        if !self.takes[p] || frame.len() > offload::MAX_SEND {
+        if frame.len() > offload::MAX_SEND {
             return false;
         }
-        if !self.owned[p] {
+        if !self.owned[p] || self.lost(p) {
             return true;
+        }
+        if !self.takes[p] {
+            return false;
         }
         let whole = self.inbox[p].iter().filter(|e| e.1 == Kind::Whole).count();
         if self.inbox[p].len() == INBOX_FRAMES || whole == 8 {
@@ -448,7 +543,7 @@ impl Model {
         }
         if matches!(self.admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
             if let Some(q) = port_of(&frame[..6]) {
-                if q != from && self.deliver_whole(q, frame) {
+                if q != from && self.same(from, q) && self.deliver_whole(q, frame) {
                     return;
                 }
             }
@@ -460,22 +555,33 @@ impl Model {
     }
 
     /// A frame from port `from` whose checksum its guest left at `start +
-    /// offset`: so to the port it is for where that port takes it so,
-    /// finished -- by the offload model's sum -- and forwarded otherwise.
+    /// offset`: so to the guest on its network it is for where that guest's
+    /// NIC takes it so, and finished -- by the offload model's sum -- for
+    /// that guest otherwise, and forwarded for anyone else.
     fn send_partial(&mut self, from: usize, frame: &[u8], start: usize, offset: usize) {
+        let mut f = frame.to_vec();
+        crate::offloadmodel::finish(&mut f, start, offset);
         if frame.len() >= ETH_HDR_LEN && matches!(self.admit(from, frame), Admit::Own | Admit::Own6)
             && frame[0] & 1 == 0
         {
             if let Some(q) = port_of(&frame[..6]) {
-                if q != from && self.takes_partial[q] {
-                    self.deliver_kind(q, frame, Kind::Partial(start, offset));
+                if q != from && self.same(from, q) {
+                    if self.takes_partial[q] {
+                        self.deliver_kind(q, frame, Kind::Partial(start, offset));
+                    } else {
+                        self.deliver(q, &f);
+                    }
                     return;
                 }
             }
         }
-        let mut f = frame.to_vec();
-        crate::offloadmodel::finish(&mut f, start, offset);
         self.forward(Some(from), &f);
+    }
+
+    /// What port `p`'s NIC says it takes.
+    fn takes(&mut self, p: usize, takes: offload::Takes) {
+        self.takes_partial[p] = takes.partial;
+        self.takes[p] = takes.whole;
     }
 
     /// What port `p`'s NIC takes into a buffer of `room` bytes, as the switch
@@ -581,8 +687,13 @@ impl Model {
                 return;
             }
             if let Some(q) = port_of(dst) {
-                if Some(q) != from {
-                    self.deliver(q, frame);
+                if Some(q) != from && !self.lost(q) {
+                    /* Another network's guest is out of its reach; a free
+                     * port takes nothing anyway. */
+                    match from {
+                        Some(p) if self.owned[q] && !self.same(p, q) => self.isolated[p] += 1,
+                        _ => self.deliver(q, frame),
+                    }
                 }
                 return;
             }
@@ -593,8 +704,9 @@ impl Model {
                 return;
             }
         }
+        /* Every port of its network's, or -- from `hv0` -- every port. */
         for q in 0..MAX_PORTS {
-            if Some(q) != from {
+            if Some(q) != from && from.map_or(true, |p| self.same(p, q)) {
                 self.deliver(q, frame);
             }
         }
@@ -837,6 +949,225 @@ fn frame(r: &mut Input, from: Option<usize>) -> Vec<u8> {
     f
 }
 
+/// A send of TCP up to 64 KiB from port `p`'s guest, held up by its NIC: to
+/// port `q`'s, `hv0` or everyone -- as itself mostly. The send, the segment
+/// size it is cut by and how it held up, or None for one that did not.
+fn tcp4_send(r: &mut Input, p: usize, q: usize) -> Option<(Vec<u8>, usize, offload::Tcp4)> {
+    let (dst_mac, dst_ip) = match r.u8() % 4 {
+        0 => (HOST_MAC, HOST_IP),
+        1 => ([0xFF; 6], switch::port_ip(q)),
+        _ => (switch::port_mac(q), switch::port_ip(q)),
+    };
+    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
+    let payload = r.pick(&[0usize, 300, 1448, 4000, 20_000]);
+    let mss = r.pick(&[256usize, 536, 1448]);
+    let mut f = crate::offloadmodel::build(r, 6, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+    f[..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&switch::port_mac(p));
+    f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
+    f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
+    let layout = offload::check_tcp4(&f, mss).ok()?;
+    Some((f, mss, layout))
+}
+
+/// A frame from port `p`'s guest whose checksum it left to finish: to port
+/// `q`'s, `hv0` or everyone -- as itself mostly. The frame, where its
+/// checksum is summed from and put, and the place checked; None for a place
+/// that is not in it.
+fn partial_send(r: &mut Input, p: usize, q: usize) -> Option<(Vec<u8>, usize, usize, offload::Partial)> {
+    let (dst_mac, dst_ip) = match r.u8() % 4 {
+        0 => (HOST_MAC, HOST_IP),
+        1 => ([0xFF; 6], switch::port_ip(q)),
+        _ => (switch::port_mac(q), switch::port_ip(q)),
+    };
+    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
+    let proto = r.pick(&[6u8, 17]);
+    let payload = r.below(1400) as usize;
+    let offset = if proto == 17 { 6 } else { 16 };
+    /* Over IPv4, or now and then over IPv6 -- from its own address or
+     * another's, now and then made to sum to 0, which UDP's goes as all
+     * ones. */
+    let (mut f, start) = if r.u8() < 64 {
+        let (mut f, l4) = crate::offloadmodel::build6(r, proto, &[], payload);
+        let from = if r.u8() < 16 { eui64(&LINK_LOCAL, q) } else { eui64(&LINK_LOCAL, p) };
+        f[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24].copy_from_slice(&from);
+        f[ETH_HDR_LEN + 24..ETH_HDR_LEN + 40].copy_from_slice(&eui64(&PREFIX6, q));
+        (f, l4)
+    } else {
+        let mut f = crate::offloadmodel::build(r, proto, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+        f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
+        f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
+        (f, 34)
+    };
+    f[..6].copy_from_slice(&dst_mac);
+    f[6..12].copy_from_slice(&switch::port_mac(p));
+    if r.u8() < 32 {
+        crate::offloadmodel::sum_to_zero(&mut f, start, start + offset);
+    }
+    let partial = offload::Partial::check(f.len(), start as u16, offset as u16).ok()?;
+    Some((f, start, offset, partial))
+}
+
+/// What one guest sends, as `hand_over` has it sent.
+enum Sent {
+    Frame(Vec<u8>),
+    Partial(Vec<u8>, usize, usize, offload::Partial),
+    Tcp4(Vec<u8>, usize, offload::Tcp4),
+}
+
+/// Port `q` changing hands as the guest on port `s` sends -- a frame, to
+/// `q` mostly, one whose checksum it left to finish, a send of TCP: `q`'s
+/// VM gone and another on it, on a network or alone, its NIC saying what it
+/// takes now and then, just before one of the locks the switch takes for
+/// the send, or after it. What the switch looked at without a lock was the
+/// VM going's; where it puts the frame, under one, is the VM coming's.
+/// Every guest must have what it would have had if the port had changed
+/// hands before the send or after it -- the NIC saying what it takes before
+/// the send or after, the frame lost, now and then, to the VM going or the
+/// VM coming -- and none of them another network's frame.
+fn hand_over(r: &mut Input, sw: &Arc<Switch>, m: &mut Model, s: usize, q: usize,
+             vms: &mut [Option<Arc<Shared>>], backends: &mut [Option<switch::PortBackend>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let net = r.pick(&[None, Some(0usize), Some(1)]);
+    let takes = r.bool().then(|| offload::Takes { partial: r.bool(), whole: r.bool() });
+    let sent = match r.u8() % 4 {
+        0 | 1 => {
+            let mut f = frame(r, Some(s));
+            if f.len() >= ETH_HDR_LEN && r.u8() < 160 {
+                f[..6].copy_from_slice(&switch::port_mac(q));
+            }
+            Sent::Frame(f)
+        }
+        2 => match partial_send(r, s, q) {
+            Some((f, start, offset, partial)) => Sent::Partial(f, start, offset, partial),
+            None => return,
+        },
+        _ => match tcp4_send(r, s, q) {
+            Some((f, mss, layout)) => Sent::Tcp4(f, mss, layout),
+            None => return,
+        },
+    };
+    /* Before which of the switch's locks: the first, for a send of TCP --
+     * which may be cut, and a change between two of its frames would be one
+     * no order of the change and one send makes. */
+    let k = if matches!(sent, Sent::Tcp4(..)) { 0 } else { r.below(4) as u32 };
+    let send = |v: &mut Model| match &sent {
+        Sent::Frame(f) => v.forward(Some(s), f),
+        Sent::Partial(f, start, offset, _) => v.send_partial(s, f, *start, *offset),
+        Sent::Tcp4(f, mss, _) => v.send_tcp4(s, f, *mss),
+    };
+    /* The model's ends -- the change, what the new NIC takes and the send,
+     * in each order they may come in, the frame lost to the port's VM or
+     * not -- and how many times the VM going was woken. */
+    let mut ends: Vec<(&str, Model, u64)> = [
+        ("change, takes, send", 0, false), ("change, takes, send lost", 0, true),
+        ("change, send, takes", 1, false), ("change, send lost, takes", 1, true),
+        ("send, change, takes", 2, false), ("send lost, change, takes", 2, true),
+    ]
+    .iter()
+    .map(|&(name, order, lose)| {
+        let mut v = m.clone();
+        let mut left = 0;
+        if order < 2 {
+            left = v.hand_over(q, net);
+        }
+        if let (0, Some(t)) = (order, takes) {
+            v.takes(q, t);
+        }
+        v.lose = lose.then_some(q);
+        send(&mut v);
+        v.lose = None;
+        if order == 2 {
+            left = v.hand_over(q, net);
+        }
+        if let (1 | 2, Some(t)) = (order, takes) {
+            v.takes(q, t);
+        }
+        (name, v, left)
+    })
+    .collect();
+    /* The switch's: the change made at the lock, by what would make it --
+     * the port released, another VM's claim on it, its NIC saying what it
+     * takes. */
+    let name = net.map(|n| NETS[n]);
+    let changed: Arc<std::sync::Mutex<Option<(Result<usize, &'static str>, Arc<Shared>)>>> = Arc::default();
+    let change: Box<dyn FnOnce()> = {
+        let (sw, changed) = (sw.clone(), changed.clone());
+        Box::new(move || {
+            sw.release(q);
+            let vm = Arc::new(Shared::default());
+            let got = sw.claim_at(q, &vm, name);
+            if let Some(t) = takes {
+                sw.backend(q).takes(t);
+            }
+            *changed.lock().expect("the change's slot") = Some((got, vm));
+        })
+    };
+    crate::sync::before_lock(k, change);
+    if let Some(b) = backends[s].as_mut() {
+        match &sent {
+            Sent::Frame(f) => b.send(f),
+            Sent::Partial(f, _, _, partial) => b.send_partial(&mut f.clone(), *partial),
+            Sent::Tcp4(f, _, layout) => b.send_tcp4(f, *layout),
+        }
+    }
+    let at_lock = match crate::sync::take_before_lock() {
+        Some(change) => {
+            change();
+            false
+        }
+        None => true,
+    };
+    HANDOVERS[usize::from(at_lock)].fetch_add(1, Relaxed);
+    let (got, vm) = changed.lock().expect("the change's slot").take().expect("the port changed hands");
+    invariant!(got == Ok(q), "port {} given to a VM as it changed hands: {:?}", q, got);
+    invariant!(sw.network_of(q).as_deref() == name, "port {} on {:?} after it changed hands, put on {:?}", q,
+               sw.network_of(q), name);
+    let went = vms[q].replace(vm.clone());
+    let mut came = sw.backend(q);
+    let stack = network::take_stack();
+    let hv0_in = network::take_hv0_in();
+    let (went_woken, came_woken) = (went.as_ref().map(|v| v.woken.load(Relaxed)), vm.woken.load(Relaxed));
+    /* What waits for the VM coming, each as its NIC is handed it. */
+    let mut waiting = Vec::new();
+    let mut buf = vec![0u8; offload::MAX_SEND];
+    while let Some((n, rx)) = came.recv_with(&mut buf) {
+        let kind = match rx {
+            offload::Rx::Done => Kind::Done,
+            offload::Rx::Partial(p) => {
+                let h = p.header();
+                Kind::Partial(usize::from(h.csum_start), usize::from(h.csum_offset))
+            }
+            offload::Rx::Whole(_) => Kind::Whole,
+        };
+        waiting.push((buf[..n].to_vec(), kind));
+    }
+    backends[q] = Some(came);
+    let is = |v: &Model, left: u64| {
+        (0..MAX_PORTS).all(|p| sw.counts(p) == v.counts(p))
+            && sw.host_counts() == (v.to_host, v.refused, v.dhcp, v.foreign)
+            && sw.ipv6_counts() == (v.advertised, v.bound.len())
+            && stack == v.stack && hv0_in == v.stack
+            && went_woken.map_or(true, |w| w == left)
+            && came_woken == v.woken[q]
+            && v.inbox[q].iter().eq(waiting.iter())
+    };
+    let Some(at) = ends.iter().position(|(_, v, left)| is(v, *left)) else {
+        let said: Vec<String> = ends.iter().map(|(name, v, left)| {
+            format!("{}: {:?} and {:?}, {} to hv0, woken {} and {}, waiting {:?}", name, v.counts(s), v.counts(q),
+                    v.stack.len(), left, v.woken[q], v.inbox[q].iter().map(|e| (e.0.len(), e.1)).collect::<Vec<_>>())
+        }).collect();
+        panic!("invariant: port {} changed hands {} as port {} sent: {:?} and {:?}, {} to hv0, the VM going woken \
+                {:?} and the VM coming {}, waiting {:?} -- none of the model's ends ({})", q,
+               if at_lock { "at a lock" } else { "after" }, s, sw.counts(s), sw.counts(q), stack.len(), went_woken,
+               came_woken, waiting.iter().map(|e| (e.0.len(), e.1)).collect::<Vec<_>>(), said.join("; "));
+    };
+    HANDOVER_ENDS[at].fetch_add(1, Relaxed);
+    *m = ends.swap_remove(at).1;
+    m.stack.clear();
+    m.inbox[q].clear();
+}
+
 /// A DHCP client's DISCOVER or REQUEST from port `p`, as udhcpc sends one:
 /// from no address yet, or -- renewing -- its own; now and then as another.
 fn dhcp_request(r: &mut Input, p: usize) -> Vec<u8> {
@@ -876,7 +1207,7 @@ pub fn switch_target(r: &mut Input) {
     network::reset();
     let dns = r.pick(&[0u32, 0x0808_0808, 0x0A00_0203]);
     network::dns::UPSTREAM.store(dns, std::sync::atomic::Ordering::Relaxed);
-    let sw = Switch::new().expect("a switch");
+    let sw = Arc::new(Switch::new().expect("a switch"));
     let mut m = Model::new();
     let mut vms: Vec<Option<Arc<Shared>>> = vec![None; MAX_PORTS];
     let mut backends: Vec<Option<switch::PortBackend>> = (0..MAX_PORTS).map(|_| None).collect();
@@ -886,7 +1217,7 @@ pub fn switch_target(r: &mut Input) {
      * one more than there are ports. */
     let most = if r.u8() < 24 { MAX_PORTS + 1 } else { 1 + r.below(4) as usize };
 
-    while let Some(op) = r.op(16) {
+    while let Some(op) = r.op(17) {
         match op {
             0 | 10 => {
                 /* A VM on the switch, the first free port -- or, now and
@@ -896,30 +1227,24 @@ pub fn switch_target(r: &mut Input) {
                     break;
                 }
                 let vm = Arc::new(Shared::default());
+                /* On a network, or alone. */
+                let net = r.pick(&[None, None, Some(0usize), Some(1)]);
+                let name = net.map(|n| NETS[n]);
                 /* The first free port -- or, now and then, the port a VM
                  * asks for (`port=`): that one when it is free, and no other,
                  * one past the last among those asked for. */
                 let (got, want) = if r.u8() < 64 {
                     let q = r.below(MAX_PORTS as u64 + 1) as usize;
-                    (sw.claim_at(q, &vm), (q < MAX_PORTS && !m.owned[q]).then_some(q))
+                    (sw.claim_at(q, &vm, name), (q < MAX_PORTS && !m.owned[q]).then_some(q))
                 } else {
-                    (sw.claim(&vm), (0..MAX_PORTS).find(|&p| !m.owned[p]))
+                    (sw.claim(&vm, name), (0..MAX_PORTS).find(|&p| !m.owned[p]))
                 };
                 match (got, want) {
                     (Ok(p), Some(q)) => {
                         invariant!(p == q, "a VM given port {}, port {} being the one it should have", p, q);
-                        m.owned[p] = true;
-                        m.inbox[p].clear();
-                        m.woken[p] = 0;
-                        m.quiet[p] = false;
-                        m.takes_partial[p] = false;
-                        m.takes[p] = false;
-                        m.dropped[p] = 0;
-                        m.spoofed[p] = 0;
-                        m.on_backlog[p] = 0;
-                        m.over_share[p] = 0;
-                        m.flooded[p] = 0;
-                        m.flood[p] = (switch::FLOOD_BURST, time::peek());
+                        invariant!(sw.network_of(p).as_deref() == name, "port {} on {:?}, put on {:?}", p,
+                                   sw.network_of(p), name);
+                        m.claim(p, net);
                         vms[p] = Some(vm);
                         backends[p] = Some(sw.backend(p));
                     }
@@ -931,13 +1256,11 @@ pub fn switch_target(r: &mut Input) {
             1 => {
                 let p = r.below(MAX_PORTS as u64) as usize;
                 sw.release(p);
-                m.owned[p] = false;
-                m.inbox[p].clear();
-                m.bound.retain(|_, b| b.0 != p);
+                let woken = m.release(p);
                 if let Some(vm) = vms[p].take() {
-                    invariant!(vm.woken.load(std::sync::atomic::Ordering::Relaxed) == m.woken[p],
+                    invariant!(vm.woken.load(std::sync::atomic::Ordering::Relaxed) == woken,
                                "port {}'s VM woken {} times for {} frames", p,
-                               vm.woken.load(std::sync::atomic::Ordering::Relaxed), m.woken[p]);
+                               vm.woken.load(std::sync::atomic::Ordering::Relaxed), woken);
                 }
             }
             2..=4 => {
@@ -1019,20 +1342,7 @@ pub fn switch_target(r: &mut Input) {
                 let p = r.below(MAX_PORTS as u64) as usize;
                 if backends[p].is_some() {
                     let q = r.below(MAX_PORTS as u64) as usize;
-                    let (dst_mac, dst_ip) = match r.u8() % 4 {
-                        0 => (HOST_MAC, HOST_IP),
-                        1 => ([0xFF; 6], switch::port_ip(q)),
-                        _ => (switch::port_mac(q), switch::port_ip(q)),
-                    };
-                    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
-                    let payload = r.pick(&[0usize, 300, 1448, 4000, 20_000]);
-                    let mss = r.pick(&[256usize, 536, 1448]);
-                    let mut f = crate::offloadmodel::build(r, 6, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
-                    f[..6].copy_from_slice(&dst_mac);
-                    f[6..12].copy_from_slice(&switch::port_mac(p));
-                    f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
-                    f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
-                    if let Ok(layout) = offload::check_tcp4(&f, mss) {
+                    if let Some((f, mss, layout)) = tcp4_send(r, p, q) {
                         m.send_tcp4(p, &f, mss);
                         if let Some(b) = backends[p].as_mut() {
                             b.send_tcp4(&f, layout);
@@ -1057,36 +1367,7 @@ pub fn switch_target(r: &mut Input) {
                 let p = r.below(MAX_PORTS as u64) as usize;
                 if backends[p].is_some() {
                     let q = r.below(MAX_PORTS as u64) as usize;
-                    let (dst_mac, dst_ip) = match r.u8() % 4 {
-                        0 => (HOST_MAC, HOST_IP),
-                        1 => ([0xFF; 6], switch::port_ip(q)),
-                        _ => (switch::port_mac(q), switch::port_ip(q)),
-                    };
-                    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
-                    let proto = r.pick(&[6u8, 17]);
-                    let payload = r.below(1400) as usize;
-                    let offset = if proto == 17 { 6 } else { 16 };
-                    /* Over IPv4, or now and then over IPv6 -- from its own
-                     * address or another's, now and then made to sum to 0,
-                     * which UDP's goes as all ones. */
-                    let (mut f, start) = if r.u8() < 64 {
-                        let (mut f, l4) = crate::offloadmodel::build6(r, proto, &[], payload);
-                        let from = if r.u8() < 16 { eui64(&LINK_LOCAL, q) } else { eui64(&LINK_LOCAL, p) };
-                        f[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24].copy_from_slice(&from);
-                        f[ETH_HDR_LEN + 24..ETH_HDR_LEN + 40].copy_from_slice(&eui64(&PREFIX6, q));
-                        (f, l4)
-                    } else {
-                        let mut f = crate::offloadmodel::build(r, proto, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
-                        f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
-                        f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
-                        (f, 34)
-                    };
-                    f[..6].copy_from_slice(&dst_mac);
-                    f[6..12].copy_from_slice(&switch::port_mac(p));
-                    if r.u8() < 32 {
-                        crate::offloadmodel::sum_to_zero(&mut f, start, start + offset);
-                    }
-                    if let Ok(partial) = offload::Partial::check(f.len(), start as u16, offset as u16) {
+                    if let Some((f, start, offset, partial)) = partial_send(r, p, q) {
                         m.send_partial(p, &f, start, offset);
                         if let Some(b) = backends[p].as_mut() {
                             b.send_partial(&mut f.clone(), partial);
@@ -1133,6 +1414,17 @@ pub fn switch_target(r: &mut Input) {
                     }
                 }
             }
+            16 => {
+                /* A port changing hands as a guest on another sends: its VM
+                 * gone and another on it, on a network or alone -- one more
+                 * VM, where the port was free. */
+                let s = r.below(MAX_PORTS as u64) as usize;
+                let q = r.below(MAX_PORTS as u64) as usize;
+                let on = m.owned.iter().filter(|o| **o).count();
+                if m.owned[s] && backends[s].is_some() && q != s && (m.owned[q] || on < most) {
+                    hand_over(r, &sw, &mut m, s, q, &mut vms, &mut backends);
+                }
+            }
             9 => {
                 /* Time going by: a port's rate to every port earned back. */
                 time::advance(r.pick(&[NS_PER_SEC / 1000, NS_PER_SEC / 10, NS_PER_SEC, 10 * NS_PER_SEC]));
@@ -1154,9 +1446,8 @@ pub fn switch_target(r: &mut Input) {
         }
         /* The counts, and what the stack was handed, as the model has them. */
         for p in 0..MAX_PORTS {
-            let want = switch::PortCounts { dropped: m.dropped[p], spoofed: m.spoofed[p],
-                                            over_share: m.over_share[p], flooded: m.flooded[p] };
-            invariant!(sw.counts(p) == want, "port {} lost {:?}, the model {:?}", p, sw.counts(p), want);
+            invariant!(sw.counts(p) == m.counts(p), "port {} lost {:?}, the model {:?}", p, sw.counts(p),
+                       m.counts(p));
         }
         let counts = sw.host_counts();
         let want_counts = (m.to_host, m.refused, m.dhcp, m.foreign);
@@ -1724,6 +2015,11 @@ pub static TAKEN_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  switch: {} sends of TCP carried whole, {} cut", WHOLE_SENDS.load(Relaxed), CUT_SENDS.load(Relaxed));
+    let ends: Vec<u64> = HANDOVER_ENDS.iter().map(|n| n.load(Relaxed)).collect();
+    println!("  switch: ports changed hands at a lock of a send {} times, after it {}; ended as the change, what \
+              the NIC takes and the send {} ({} lost), the change, the send and what it takes {} ({} lost), the \
+              send, the change and what it takes {} ({} lost)", HANDOVERS[1].load(Relaxed),
+             HANDOVERS[0].load(Relaxed), ends[0], ends[1], ends[2], ends[3], ends[4], ends[5]);
     let six: Vec<u64> = ADMIT6.iter().map(|n| n.load(Relaxed)).collect();
     println!("  switch: IPv6 frames {} carried, {} solicitations answered, {} spoofed, {} hiding what they carry \
               or of no protocol; {} addresses bound in the place of a port's oldest", six[Admit::Own6 as usize],
@@ -2325,7 +2621,7 @@ pub fn guestnet_target(r: &mut Input) {
     let mut vms = Vec::new();
     for _ in 0..n {
         let vm = Arc::new(Shared::default());
-        let p = sw.claim(&vm).expect("a port");
+        let p = sw.claim(&vm, None).expect("a port");
         backends.push(sw.backend(p));
         vms.push(vm);
     }

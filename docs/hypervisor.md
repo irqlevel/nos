@@ -1823,17 +1823,56 @@ architectures, and holds the disk to its SHA-256 ([Testing](testing.md)).
 `net`, on `hv start`, gives the guest a NIC on the guests' switch, and with
 it an address: 10.0.100.2 for the first port, .3 for the next, handed to its
 kernel on the command line (`ip=`). nos is 10.0.100.1 on the same subnet, so
-the guests reach it and each other, and it reaches them -- `ping 10.0.100.2`
-from nos's shell goes out of the device whose subnet the address is on:
+the guests reach it, and it reaches them -- `ping 10.0.100.2` from nos's
+shell goes out of the device whose subnet the address is on -- and guests
+on one network (`network=`) reach each other:
 
 ```
-$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
-$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net network=lab cmdline=console=ttyS0 nolapic
 $ hv exec 0 ping -c 3 10.0.100.1        # nos
-$ hv exec 0 ping -c 3 10.0.100.3        # the other guest
+$ hv exec 0 ping -c 3 10.0.100.3        # the other guest, on lab too
 $ ping 10.0.100.2                       # from nos
 $ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
 ```
+
+**A guest is alone on the switch unless its network says otherwise.** A
+port is on a network -- `network=<name>` on `hv start`, `network = "..."`
+in a VM's vm.toml -- or alone, and a guest reaches the other guests of its
+network as on one LAN and no other guest at all: one alone, as every VM is
+that names no network, reaches nos and, through NAT, the world, and that is
+all. A frame for another network's guest goes nowhere, counted against the
+guest that sent it in `hv list` (`N frames for another network's guests,
+dropped`); one for every port goes to its own network's and `hv0`; and
+IPv6's first-come bindings are each network's own. Nothing goes from one
+guest to another through nos either: NAT takes nothing for the guests' own
+subnet, and the stack forwards nothing. `hv list` says each port's network
+or `alone`, and so does `hv vms` of a folder's. A guest on a cloud's
+machines is in the same place -- its tenant's network, and nobody else's.
+
+The gate is `scripts/hv-linux-test.py --net`, whose two guests are on one
+network and ping each other, and whose VM from a folder, alone, pings nos
+and gets nothing from the other network's guest -- not by ARP, whose
+question that guest never hears, and not by a frame sent to its MAC, which
+the switch drops and counts. The hv fuzzer's `switch` target puts the ports
+on two networks and alone, and holds every delivery and every count to its
+model; eight mutants -- a frame to another network's guest let through, a
+broadcast to every port, a send whole or a checksum left to finish taken to
+another network, IPv6's bindings one table for all, every port alone, a
+port's network kept past its release, nothing counted -- each fail it.
+
+A port changes hands with frames for it on their way -- one VM gone,
+another taking its port -- and so what the switch looks at without a lock
+it asks again under the port's inbox lock, where the owner, its network
+and what its NIC takes change together: a frame meant for the VM going
+reaches the VM coming only if that one is of the sender's network, and a
+send whole or a checksum left to finish reaches only a NIC that says, by
+then, it takes it so. The `switch` target makes that moment: a hook in its
+spin locks hands a port over just before one of the locks a send takes,
+and every guest is held to what some order of the hand-over, the new NIC's
+word and the send gives -- the frame lost, at most, to the VM going or
+coming. Seven mutants of the checks under the lock each fail it; four of
+them nothing but that moment shows.
 
 **The guest's NIC is virtio-net, legacy, on the same transport as its
 disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
@@ -2403,7 +2442,9 @@ $ hv stop web
 would check them, and never over a `vm.toml` that is there; it says which of
 the files it names are not there yet. It gives the VM a UUID too
 (`uuid = "..."`), what its SMBIOS tells its OS the machine is
-([SMBIOS](#what-the-machine-is-smbios)). `hv start /some/where/web` boots a
+([SMBIOS](#what-the-machine-is-smbios)); and `network=` on its words
+(`network = "..."`) puts it on a network of the switch's, with the VMs
+that name the same -- without, it is alone there ([A network](#a-network)). `hv start /some/where/web` boots a
 folder anywhere by its path, the folder's name the VM's. `hv vms` lists the
 folders under `/vms`, what each boots, and which run.
 
