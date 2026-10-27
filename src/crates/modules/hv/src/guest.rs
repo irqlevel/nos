@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use hv::linux::Header;
+use hv::place::Shape;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
 use hv::{Doorbells, Machine};
 use kcore::consts::{NS_PER_MS, NS_PER_SEC};
@@ -98,6 +99,10 @@ pub struct Spec {
     /// `forward=`: nos's ports relayed to the guest's, once it runs.
     pub forwards: Vec<(u16, u16)>,
     pub nic: Option<NicSpec>,
+    /// Where its CPUs sit, as their CPUID tells them: what its placement
+    /// made of them (`hv::place::Placement::shape`), once it has one --
+    /// each a core of its own until then. Every boot of it is told the same.
+    pub shape: Shape,
 }
 
 /// A guest's NIC: its port on the switch.
@@ -259,6 +264,7 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         port,
         forwards: o.forwards,
         nic: None,
+        shape: Shape::cores(cpus),
     })
 }
 
@@ -451,6 +457,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     if spec.nooffload {
         guest.set_offloads(false);
     }
+    guest.set_shape(spec.shape);
 
     /* The 64-bit kernel at its load address -- or each of a PVH image's
      * segments at its own, the zeroes past its file bytes being the fresh
@@ -730,6 +737,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",
             total.vid, total.eoi_exits);
     }
+    if total.pv_eoi != 0 {
+        let _ = writeln!(out, "  pv eoi     {} EOIs the guest made through its word (KVM's PV EOI), no exit of their own",
+            total.pv_eoi);
+    }
     if total.mmio_done != 0 {
         let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's",
             total.mmio_done);
@@ -774,10 +785,15 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.nmi, total.nmi_lost);
     }
     for (i, (sectors, s, broken, copied)) in guest.disk_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}{}",
+        let _ = write!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors",
             (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
-            s.writes, s.written_bytes / 1024, s.flushes, s.errors,
-            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+            s.writes, s.written_bytes / 1024, s.flushes, s.errors);
+        if s.discards != 0 || s.zeroings != 0 {
+            let _ = write!(out, "; {} discards ({} KiB), {} writes of zeros ({} KiB)", s.discards,
+                s.discarded_bytes / 1024, s.zeroings, s.zeroed_bytes / 1024);
+        }
+        let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
+            copied_note(copied));
     }
     for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
         let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",

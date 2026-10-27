@@ -151,7 +151,7 @@ swallowing panic messages whole.
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
-| `netconsole-test.py` | arm64 | the trace path, a net device, netconsole |
+| `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
@@ -166,7 +166,7 @@ swallowing panic messages whole.
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
@@ -286,8 +286,14 @@ link came up arrives once it does, that the sequence numbers are contiguous
 -- so that a gap can be told from a machine that stopped -- that lines
 produced after link-up keep coming, and that a panic's report gets out with
 its backtrace, which is the one time it matters most and the one time the
-drain task is not running to send it. On the two Hetzner machines netconsole
-is the only console there is. See [Netconsole](netconsole.md).
+drain task is not running to send it. Then a second boot is powered off
+from the shell over UDP, and the halt's own lines must reach the collector
+with no gap in the numbers: the unmount, which comes after every module has
+gone -- a module's exit may wait minutes for guests to turn themselves off,
+which on a machine with no other console nothing else would show -- and the
+netconsole's own last line, traced as it stops and sent by the flush its
+drain does on the way out. On the two Hetzner machines netconsole is the
+only console there is. See [Netconsole](netconsole.md).
 
 ### `tcp-test.py` -- the connecting side of TCP
 
@@ -597,7 +603,12 @@ is taken, and its disks' task on a spare thread of its own cores, then on a
 core no guest has, then beside a vCPU of its own. Five mutants of the rule
 -- later cores not checked, one vCPU a core, the disks' task on a held core,
 `cpu=`'s core not checked, the disks' task elsewhere before a spare thread
-of its own -- each failed within two inputs.
+of its own -- each failed within two inputs. And what the guest is told of
+where its CPUs sit (`Shape`): threads of a core in twos exactly where each
+host core it has holds its CPUs 2k and 2k+1, or its last alone; one cache
+exactly where all of them are on the first's -- the model groups them by
+core, where the code compares them two by two; a cache always shared, and
+pairs not checked both ways, each failed it.
 `policy` holds the CPUID and MSR policy to a model of its own
 (`fuzz/hv/src/policymodel.rs`), over a host CPU made up an input -- which
 vendor's, the tops of its two ranges of leaves, below the policy's and
@@ -609,7 +620,29 @@ it was, a taken one read back -- and every other refused both ways; and a
 table, from the manuals, of what each CPUID bit promises the guest that sees
 it, the MSR it will use or the bit of EFER it will set, which must then be
 answered. IBPB offered with PRED_CMD refused, or AutoIBRS with its EFER bit,
-is a finding at the first input. The model is written from the manuals and
+is a finding at the first input. The hypervisor's range is held to KVM's
+ABI: the signature, NOP_IO_DELAY and with APICs PV_EOI, nothing past
+0x40000001. The platform target's scripted guest turns PV EOI on now and
+then -- at its word, or at none it has, or unaligned -- and ends its
+interrupts as Linux does, through the word where the host set it and by the
+register where not. Where the guest's CPUs sit is made up too
+-- a host's threads, with SMT or not and its caches shared this widely,
+given to a guest of up to 64 CPUs, in order or anywhere -- and every
+topology leaf held to what a package of that shape answers: leaf 1's count
+of APIC IDs and HTT, the sharing and core counts of leaf 4 and of AMD's
+0x8000001D at each level, the last level the host's highest before the
+list's end, the x2APIC topology leaf level by level, and AMD's 0x80000008
+and 0x8000001E; and the TSC-deadline timer exactly with the APIC. Six
+mutants each failed it: the SMT level's shift the package's, the last level
+missed by one, 0x8000001E's threads and 0x80000008's CPUs each off by one,
+and HTT always on. `lapic` holds the TSC-deadline mode to the SDM, the mode
+read as the guest reads it, in the timer's entry: a deadline read back in
+that mode and 0 once it has run out, the MSR on the way into the mode 0,
+the current count 0 in it, and in any other mode the MSR reading 0 and its
+write moving nothing -- a deadline kept after it ran out and one armed in
+another mode each failed it. Two mutants pass, and are no change: the
+MSR's read and the count's each read 0 outside the mode by a check of
+their own, where nothing else ever lets them be anything else. The model is written from the manuals and
 not from the policy, so a leaf, a bit or an MSR the policy comes to offer is
 a finding until the model is told of it too; nine mutants of the policy --
 the old swallowing of every MSR, every leaf passed through, the tops not
@@ -626,7 +659,13 @@ to come back, and ports whose NIC holds its receive interrupts, a frame for
 which wakes nobody while the inbox is under half full -- and sends of TCP
 whole and frames with their checksum left to finish among them, each handed
 so to a port whose guest takes it so, and cut, or finished, for every other
-and for `hv0`; `nat`,
+and for `hv0` -- and IPv6 among them, neighbour discovery of every kind,
+multicast listeners' reports, echoes, UDP from DHCPv6's server's port,
+behind extension headers and in fragments, their lengths right and wrong, a
+guest now and then using more addresses than a port may have bound, held
+to a model of the switch's rules for it written from RFC 6620, 6105, 6980
+and 7112 -- whose addresses are bound to which port, the advertisement it
+answers a solicitation with laid out byte for byte from RFC 4861; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
@@ -750,7 +789,16 @@ as its sender; the one packet with no address yet is a DHCP client's,
 which the switch answers itself. The rest is dropped and counted -- `hv
 list` says how many a guest sent as another -- and the targets hold the
 switch to it both ways: `switch` to a model of the rule, `guestnet` to
-what the rule is for.
+what the rule is for. IPv6, which the switch then dropped, now goes
+between the guests under rules of its own ([A network](hypervisor.md#a-network)),
+held to a model by `switch` and, for what it is for, by `hv-linux-test.py
+--net`; ten mutants of them -- the packet not cut to its length, a guest's
+router advertisement let through, the newest address let go of in place of
+the oldest, a VM's addresses kept after it went, IPv6 handed to `hv0`, the
+advertisement's checksum without its pseudo-header, duplicate detection
+binding nothing, neighbour discovery in fragments, an advertisement's
+target taken unchecked, and UDP over IPv6's checksum of 0 left 0 -- each
+failed the gate.
 
 What it cannot see: the CPU is a stand-in, so nothing of hvarch -- its
 `unsafe`, the VMCB and VMCS, the entry and the exit -- is fuzzed, only what
@@ -1573,6 +1621,17 @@ delivering all six and taking their EOIs under VT-x, the guest stopped after
 the three level-triggered ones alone ([Interrupts the CPU delivers
 itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
 there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; for
+`pveoi`, on the same machine with its interrupts the host's to inject on
+either backend and KVM's PV EOI on, that each handler's EOI went through
+the guest's word where the host had set it and by the register where not
+-- 0x50 alone and 0x70 nested through the word, 0x30's own by the
+register, at whose exit 0x70's was done first, and 0x50 again by the
+register with PV EOI off -- that the word was never set while 0x70 waited
+in IRR, that nothing was left in service, and that the host did two EOIs
+for the word and injected four interrupts; a run loop that never did the
+EOI for the word, and one that did it while the guest still held the bit,
+each failed it ([KVM's paravirtual
+interface](hypervisor.md#kvms-paravirtual-interface-as-far-as-it-is-backed)); for
 `posted`, two CPUs both running, that the first counted all thousand of the
 fixed IPIs the second sent it while it spun -- and who handed them over:
 where the CPU has posted interrupts (`hv info`) each was posted and the
@@ -1892,7 +1951,9 @@ the guest was refused, which it was ready for, are printed as a note. And
 its kernel must have turned on the x87, SSE and AVX in XCR0, 832 bytes of
 them ("Enabled xstate features 0x7"): in XSAVE's standard format under TCG,
 compacted on a CPU with XSAVEC -- the AX41's Zen 2 -- which the policy
-passes on and Linux then saves with.
+passes on and Linux then saves with; and where the CPU has PKU -- TCG's
+`max`, the EX44's -- PKRU with them, 0x207: 2696 bytes in the standard
+format, 840 in the compacted one.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.
@@ -1950,8 +2011,11 @@ back whole (the cursor-position answer once made BusyBox wrap it); `hv send`,
 `hv wait`, `hv console`; a third guest with no init and `panic=1`, which
 panics, reboots, and must stop with its reset as the reason rather than spin
 on an 8042 that is not there; `hv off` refusing to turn the extension off
-under the running guest; and `rmmod hv` stopping that guest before it turns the
-extension off, which the next load confirms and `dmesg` shows in order. Once
+under the running guest; and `rmmod hv` pressing that guest's power button --
+the load having said `stop_secs=2` -- and stopping it when the time is up,
+before it turns the extension off, which the next load confirms and `dmesg`
+shows in order: `nothing in it listens to its power button` for a kernel
+without ACPI, `its power button went unanswered for 2 s` for one with. Once
 the shell has the console, the kernel's own lines go to the log and not to
 it -- so the gate ends on a command's output (`version`) rather than on
 `rc: /etc/rc done`, and reads what the vCPU tasks and the unload said with
@@ -2003,12 +2067,18 @@ anything past 255, and a distribution's `hv start` is longer. It needs `ssh` and
 
 `--disk` is another: an ext4 image with a file in it, put on nos's root and
 given to the guest with `disk=`; the guest mounts it, reads the file, writes
-4 MiB and a file of its own, syncs, and reads both back after a remount; the
-report must count the disk's reads, writes and flushes and no error;
-nos's root, which every write of the guest's went through -- the image's
-holes filled, its blocks written over -- must pass `e2fsck` as nos left it,
-stopped rather than unmounted; and the image, taken back out of it with
-`debugfs`, must pass `e2fsck` too and hold what the guest wrote. It needs a
+4 MiB and a file of its own, syncs, and reads both back after a remount;
+writes four files side by side and, its page cache gone with a remount,
+reads them back side by side, every sum the same; then deletes what it
+wrote and trims its free space (`fstrim`), which must report bytes
+trimmed. The report must count the disk's reads, writes, flushes and
+discards and no error; the image, held while the guest ran, must say as it
+is let go of that it read and wrote off the VFS's lock and gave back 4 MiB
+of nos's root at least (`fs::image`); nos's root, which every write of the
+guest's went through -- the image's holes filled, its blocks written over,
+given back -- must pass `e2fsck` as nos left it, stopped rather than
+unmounted; and the image, taken back out of it with `debugfs`, must pass
+`e2fsck` too and hold what the guest wrote. It needs a
 guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 `--nvme-root` puts nos's root on an NVMe disk instead of virtio-blk: each
 driver takes ext2's batches of blocks its own way, and NVMe's is the one the
@@ -2083,6 +2153,22 @@ the check taken out of the switch the claim reached it, and the other
 guest's own ARP put the entry right again -- once before the test could
 look, and once not, when the fetch through `hv forward`, which the test
 makes last, reached the claiming guest instead of the other's `httpd`.)
+IPv6 between the two, which nos does not speak: each must have its address
+in `fd6e:6f73:64::/64` -- the prefix of the switch's router advertisement,
+the address its MAC's EUI-64 -- no longer tentative; one pings the other at
+it and the other pings back at the link-local address; the advertisement
+must have put the prefix on the link and given no default route. One guest
+adds the other's address and must find it `dadfailed`: its duplicate
+detection's solicitation went through and the owner answered. It adds it
+again with its duplicate detection off (`accept_dad` 0: BusyBox's `ip` has
+no `nodad`) and `ndisc_notify` on, so that it tells the link the address is
+its, and pings the other's link-local address from it: nothing comes back,
+the other's count of echoes asked of it (`Icmp6InEchos`) is the same after
+as before, and its kernel never says another advertised its address -- the
+switch stopped every frame from the address, bound to the other's port. A
+control run with the bindings never refusing failed those checks. `hv list` must count
+them against the guest that sent them, none against the other, and say how
+many advertisements it sent and addresses it bound.
 Then one guest is stopped with a forward to it and its flows in NAT's table:
 its forward has to go with it, the other's stay, and `nat` show no mapping
 of its address -- the next VM on its port has its MAC and address, and was
@@ -2124,7 +2210,16 @@ when `secs=5` is up, `its power button went unanswered for 5 s`. Without
 button. In both, after the reload, two guests at their shells are stopped
 together by `hv stop all secs=3`, which must press both buttons at once and
 say of each what became of its press. `--acpi` goes with `--cpus`, `--disk`, `--net` and `--attach`, whose
-guests then find their devices through the DSDT's host bridge.
+guests then find their devices through the DSDT's host bridge. With
+`--disk`, the guest mounts its disk once more, writes a file to it and is
+left so, `acpid` given a handler that unmounts it and powers off -- and nos
+itself is powered off: its unload must press the button and say so, the
+guest unmount the disk and turn itself off, `stopped for the unload -- the
+guest powered itself off`, before nos unmounts its own root and goes; and
+the guest's ext4, taken out of nos's root, must be clean -- its state
+clean, no journal left to replay -- and hold the file written last. A guest
+stopped where it was, as every one was before the unload asked, leaves its
+journal to replay and that file in a page cache that is gone.
 
 `--xapic` has the guests' local APICs come out of reset in xAPIC mode (`hv
 start ... xapic`), and a kernel of more than one CPU then reaches them

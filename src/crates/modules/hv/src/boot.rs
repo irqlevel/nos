@@ -218,7 +218,7 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
         let _ = writeln!(out, "hv: no guest can run here -- {}", e);
         return;
     }
-    let spec = match guest::parse(args, USAGE) {
+    let mut spec = match guest::parse(args, USAGE) {
         Ok(spec) if spec.log => {
             let _ = writeln!(out, "hv: log is hv start's -- hv boot sends the console to the kernel log always");
             return;
@@ -248,6 +248,7 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
             return;
         }
     };
+    spec.shape = place.shape;
     let placement = place.vcpus;
     let cpu = placement[0];
 

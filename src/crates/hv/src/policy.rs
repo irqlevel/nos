@@ -10,19 +10,24 @@
 //! nowhere while it believes it went in. So a guest sees a CPU cut down to
 //! what is emulated here: XSAVE's state no further than AVX's (what the
 //! switch around `vmrun` and `vmlaunch` moves, `hvarch::x86::fp`), so no
-//! AVX-512, AMX or PKU; no paravirtualisation, no virtualization extension
-//! of its own, no speculation control it would write into nothing -- and a
+//! AVX-512, AMX or PKU; of paravirtualisation, KVM's interface as far as it
+//! is backed here (`hypervisor_leaf`); no virtualization extension of its
+//! own, no speculation control it would write into nothing -- and a
 //! local APIC only in a guest of more than one CPU, where it is an x2APIC
-//! (`lapic`) with no TSC-deadline timer. What is left is enough to
+//! (`lapic`) with its TSC-deadline timer. What is left is enough to
 //! decompress and start a 64-bit kernel, and its other CPUs, and to run
 //! what is built for x86-64-v3: long mode, NX, SYSCALL, the SSE and AVX
 //! lines, the PAT, the APIC and the plain arithmetic features -- and the
 //! hypervisor bit, since there is one.
 //!
-//! Each of a guest's CPUs is a package of its own, one core and one thread,
-//! its APIC ID its number: leaf 1 says so, and the leaves that would say
-//! otherwise -- the topology ones -- are blank. The CPUs are listed by the
-//! MP table the loader writes (`linux`), with the same IDs. A guest of one
+//! A guest's CPUs are one package, each CPU's APIC ID its number, of cores
+//! of one thread or two -- two where its CPUs 2k and 2k+1 are one host
+//! core's two threads -- sharing the last-level cache where they share the
+//! host's ([`Shape`], from where they were placed): leaf 1, the x2APIC
+//! topology leaf (0xB), the cache leaves' sharing counts (4, AMD's
+//! 0x8000_001D) and AMD's core counts (0x8000_0008, 0x8000_001E) all say
+//! so, and nothing of the host's topology reaches it. The CPUs are listed by
+//! the MP table the loader writes (`linux`), with the same IDs. A guest of one
 //! CPU is the PC it always was: no APIC, and no MP table -- which any kernel
 //! boots, where a firmware-enabled x2APIC listed by an MP table takes Linux
 //! 6.6 or later (an older one reads its APIC ID through the xAPIC's page
@@ -43,25 +48,31 @@ use hvarch::x86::{self, cpu, fp, spec};
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::GuestRegs;
 
+use crate::place::Shape;
+
 /* The CPUID leaves a guest is answered -- each named, each looked at --
  * and the top of each range, which leaf 0 and leaf 0x8000_0000 report: the
  * highest of them, or the host's top if that is lower. Every other leaf is
  * all zeros, as a CPU answers one it has nothing in: no leaf of the host's
  * reaches a guest that this policy has not read. Among those left zero:
- * the topology leaves (0xB, 0x1F), where the host's x2APIC IDs are; the
- * PMU's (0xA), with no counters to back it; the hypervisor range (no
- * paravirtualisation is offered); and of AMD's, the SVM leaf, the extended
- * APIC ID, memory encryption and the extended performance monitor. */
+ * the PMU's (0xA), with no counters to back it; the hypervisor range (no
+ * paravirtualisation is offered); and of AMD's, the SVM leaf, memory
+ * encryption and the extended performance monitor. The topology leaves
+ * are the guest's own (`Shape`), the host's x2APIC IDs none of them; 0x1F,
+ * past the top, is not asked. */
 const LEAF_BASIC: u32 = 0;
 const LEAF_FEATURES: u32 = 1;
 const LEAF_CACHE_DESCRIPTORS: u32 = 2;
 const LEAF_CACHE: u32 = 4;
 const LEAF_POWER: u32 = 6;
 const LEAF_STRUCTURED: u32 = 7;
+const LEAF_TOPOLOGY: u32 = 0xB;
 const LEAF_XSAVE: u32 = 0xD;
 const LEAF_TSC: u32 = 0x15;
 const LEAF_FREQUENCY: u32 = 0x16;
 const LEAF_BASIC_TOP: u32 = LEAF_FREQUENCY;
+const LEAF_HYPERVISOR: u32 = 0x4000_0000;
+const LEAF_KVM_FEATURES: u32 = 0x4000_0001;
 const LEAF_EXT: u32 = 0x8000_0000;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const LEAF_BRAND_FIRST: u32 = 0x8000_0002;
@@ -70,20 +81,56 @@ const LEAF_L1: u32 = 0x8000_0005;
 const LEAF_L2: u32 = 0x8000_0006;
 const LEAF_EXT_POWER: u32 = 0x8000_0007;
 const LEAF_EXT_ADDRESS: u32 = 0x8000_0008;
+const LEAF_EXT_CACHE: u32 = 0x8000_001D;
+const LEAF_EXT_APIC_ID: u32 = 0x8000_001E;
 const LEAF_EXT_FEATURES2: u32 = 0x8000_0021;
 const LEAF_EXT_TOP: u32 = LEAF_EXT_FEATURES2;
 
-/* Each of the guest's CPUs is a package of its own, with its own APIC ID,
- * whatever host CPU its vCPU runs on: leaf 1 EBX says so in its top two
- * bytes -- the initial APIC ID, and the logical processors in the package --
- * leaf 4 in its core and sharing counts, and leaf 0x80000008 ECX in the core
- * count and the APIC ID's width. The host's numbers there are another
+/* Where the guest's CPUs sit is the guest's own (`Shape`), whatever host
+ * CPU each runs on: leaf 1 EBX says so in its top two bytes -- the initial
+ * APIC ID, and the APIC IDs a package has room for -- with EDX's HTT where
+ * that is more than one; leaf 4 in its core and sharing counts, leaf 0xB
+ * level by level, and AMD's 0x8000_0008 ECX in the package's CPUs and the
+ * APIC ID's width, 0x8000_001D in its sharing counts and 0x8000_001E in
+ * the core and its threads. The host's numbers there are another
  * machine's: a Linux guest took CPU 3's APIC ID for its own ("APIC ID
  * mismatch"). */
 const LEAF1_EBX_KEEP: u32 = 0x0000_FFFF;
-const LEAF1_EBX_ONE_CPU: u32 = 1 << 16;
+const LEAF1_EBX_IDS_SHIFT: u32 = 16;
 const LEAF1_EBX_APIC_ID_SHIFT: u32 = 24;
+const LEAF1_EDX_HTT: u32 = 1 << 28;
+/// A deterministic cache leaf's EAX -- leaf 4's, AMD's 0x8000_001D -- of
+/// which the cache's own fields are kept: its type, its level, whether it
+/// initialises itself and is fully associative. The CPUs sharing it (bits
+/// 25:14, less one) and, in leaf 4, the package's cores (31:26, less one)
+/// are the guest's.
 const LEAF4_EAX_KEEP: u32 = 0x0000_3FFF;
+const CACHE_TYPE_MASK: u32 = 0x1F;
+const CACHE_LEVEL_SHIFT: u32 = 5;
+const CACHE_LEVEL_MASK: u32 = 0x7;
+const CACHE_SHARING_SHIFT: u32 = 14;
+const CACHE_CORES_SHIFT: u32 = 26;
+/// More subleaves than any CPU has caches.
+const CACHE_SUBLEAVES: u32 = 16;
+/// Leaf 0xB's levels, in ECX[15:8]: a core's threads, and the package's
+/// cores; 0 ends the list.
+const TOPOLOGY_SMT: u32 = 1;
+const TOPOLOGY_CORE: u32 = 2;
+const TOPOLOGY_LEVEL_SHIFT: u32 = 8;
+const TOPOLOGY_SUBLEAF_MASK: u32 = 0xFF;
+/// 0x8000_0001 ECX bit 22, TOPOEXT: AMD's topology leaves, 0x8000_001D and
+/// 0x8000_001E, are there -- answered with the guest's own, where the host
+/// has them.
+const EXT1_ECX_TOPOEXT: u32 = 1 << 22;
+/// 0x8000_0008 ECX: the package's CPUs less one (7:0), and the APIC ID's
+/// width below the package's (15:12).
+const EXT8_ECX_APIC_ID_SIZE_SHIFT: u32 = 12;
+/// 0x8000_001E EBX: the core's ID (7:0) and its threads less one (15:8).
+const EXT1E_EBX_THREADS_SHIFT: u32 = 8;
+/// Leaf 1 ECX bit 24: the APIC timer's TSC-deadline mode, emulated
+/// (`lapic`) for a guest with APICs where the TSC's rate is known -- what
+/// a deadline is turned into the host's time by.
+const LEAF1_ECX_TSC_DEADLINE: u32 = 1 << 24;
 /// Leaf 1: the APIC (EDX bit 9) and x2APIC mode (ECX bit 21), both
 /// emulated (`lapic`), set whatever the host has.
 const LEAF1_EDX_APIC: u32 = 1 << 9;
@@ -92,8 +139,9 @@ const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 /// knows it leaves alone what is the host's business -- Linux loads no
 /// microcode (PATCH_LOADER, UCODE_WRITE), sets no chicken bits in AMD's
 /// configuration MSRs, and does not take the revision of 0 it reads for
-/// old microcode and taint itself. The hypervisor range is blank, so it
-/// finds no hypervisor it knows by name, and runs as on bare metal
+/// old microcode and taint itself. The hypervisor range names KVM
+/// (`hypervisor_leaf`), whose paravirtual interface a Linux built with
+/// KVM_GUEST then takes as far as it is offered, and runs as on bare metal
 /// otherwise.
 const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
 /// Leaf 6 EAX bit 2, ARAT: the APIC timer runs in every C-state. It does --
@@ -110,10 +158,10 @@ const LEAF15_CRYSTAL_HZ: u32 = 1_000_000_000;
 const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
- * among them MONITOR, VMX, PDCM and the TSC deadline timer -- but for the
- * XSAVE line (`leaf1_xsave`), and x2APIC, set on top (`LEAF1_ECX_X2APIC`)
- * for a guest of more than one CPU, and the hypervisor bit for every
- * guest. PCID is the guest's own:
+ * among them MONITOR, VMX and PDCM -- but for the XSAVE line
+ * (`leaf1_xsave`), and x2APIC and the TSC-deadline timer, set on top
+ * (`LEAF1_ECX_X2APIC`, `LEAF1_ECX_TSC_DEADLINE`) for a guest of more than
+ * one CPU, and the hypervisor bit for every guest. PCID is the guest's own:
  * its TLB entries tagged under its VPID or ASID as the CPU tags them, CR4's
  * bit turned on under `crate::cr`'s rules; and INVPCID with it where it
  * runs in a guest (`LEAF7_EBX_INVPCID`). */
@@ -413,26 +461,56 @@ const NONE: Cpuid = Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 };
 
 /// Who asks a CPUID, as far as the answer is theirs: the guest's CPU's APIC
 /// ID; whether the guest has local APICs -- one of more than one CPU --
-/// which leaf 1 then says, the x2APIC with it; and the CPU's CR4 and XCR0,
-/// whose OSXSAVE leaf 1 mirrors and whose components leaf 0xD gives the
-/// XSAVE area's size for.
+/// which leaf 1 then says, the x2APIC and its TSC-deadline timer with it;
+/// the CPU's CR4 and XCR0, whose OSXSAVE leaf 1 mirrors and whose components
+/// leaf 0xD gives the XSAVE area's size for; and where the guest's CPUs sit.
 #[derive(Clone, Copy, Debug)]
 pub struct Asker {
     pub apic_id: u32,
     pub apic: bool,
     pub cr4: u64,
     pub xcr0: u64,
+    pub shape: Shape,
 }
 
 impl Asker {
     /// A guest's first CPU out of reset, where nothing asked for depends on
     /// more: its signature, its features, its address widths.
-    pub const RESET: Asker = Asker { apic_id: 0, apic: true, cr4: 0, xcr0: fp::XCR0_X87 };
+    pub const RESET: Asker = Asker { apic_id: 0, apic: true, cr4: 0, xcr0: fp::XCR0_X87, shape: Shape::cores(1) };
+}
+
+/* The hypervisor's own range: KVM's signature, "KVMKVMKVM" in EBX, ECX and
+ * EDX of leaf 0x4000_0000 with the top of the range in EAX, and the
+ * features of its paravirtual interface in 0x4000_0001 -- what a Linux
+ * built with KVM_GUEST looks for, and takes no more of than the bits it is
+ * given. Of KVM's features, the two backed here: NOP_IO_DELAY, a fact --
+ * an `out` to port 0x80 delays nothing, and is an exit -- and for a guest
+ * with APICs, PV_EOI, an EOI made through a word in the guest's memory
+ * where it need not exit (`MSR_KVM_PV_EOI_EN`, `crate::run`). Not offered:
+ * kvmclock, the TSC being invariant and the host's; steal time, and what
+ * stands on it -- PV TLB flushes, PV sched yield -- a guest's CPUs having
+ * cores of their own; PV unhalt, for the same; and async page faults, a
+ * guest's memory never being paged out. No hypercall either: each is
+ * answered -KVM_ENOSYS, as KVM answers one it does not know. */
+const KVM_SIGNATURE: [u32; 3] = [0x4B4D_564B, 0x564B_4D56, 0x0000_004D];
+const KVM_FEATURE_NOP_IO_DELAY: u32 = 1 << 1;
+const KVM_FEATURE_PV_EOI: u32 = 1 << 6;
+/// MSR_KVM_PV_EOI_EN: where the guest's PV EOI word is, and whether it is
+/// on (bit 0) -- the run loop's, as the local APIC's MSRs are.
+pub const MSR_KVM_PV_EOI_EN: u32 = 0x4B56_4D04;
+
+/// Whether a guest with APICs is offered the TSC-deadline timer: where the
+/// TSC's rate is known, which a deadline is turned into host time by.
+pub fn tsc_deadline() -> bool {
+    kcore::time::cycle_counter_hz().is_some()
 }
 
 /// What the guest's CPU `asker` is told for CPUID leaf `leaf`, subleaf
 /// `sub` (ECX on the way in, for the leaves that take one).
 pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
+    if (LEAF_HYPERVISOR..LEAF_EXT).contains(&leaf) {
+        return hypervisor_leaf(leaf, asker);
+    }
     /* Above a range's top the guest is told there is nothing, and is
      * answered so: a leaf of the host's past it would be the host's no
      * matter what this policy says of it. */
@@ -446,21 +524,29 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
     let apic = asker.apic;
     let avx = fp::offered() & fp::XCR0_AVX != 0;
     let runs = x86::offers();
+    let shape = &asker.shape;
+    let deadline = if apic && tsc_deadline() { LEAF1_ECX_TSC_DEADLINE } else { 0 };
+    /* The APIC IDs a package has room for, and HTT where that is more than
+     * one: the field is the guest's then, as a CPU's is. */
+    let ids = 1u32 << shape.package_shift();
+    let htt = if ids > 1 { LEAF1_EDX_HTT } else { 0 };
 
     match leaf {
         LEAF_BASIC => Cpuid { eax: eax.min(LEAF_BASIC_TOP), ebx, ecx, edx },
         LEAF_FEATURES => Cpuid {
             eax,
-            ebx: (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU | ((asker.apic_id & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT),
-            ecx: (ecx & LEAF1_ECX_KEEP) | leaf1_xsave(ecx, asker.cr4) | apic_ecx | LEAF1_ECX_HYPERVISOR,
-            edx: (edx & LEAF1_EDX_KEEP) | apic_edx,
+            ebx: (ebx & LEAF1_EBX_KEEP) | ((ids & 0xFF) << LEAF1_EBX_IDS_SHIFT)
+                | ((asker.apic_id & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT),
+            ecx: (ecx & LEAF1_ECX_KEEP) | leaf1_xsave(ecx, asker.cr4) | apic_ecx | deadline | LEAF1_ECX_HYPERVISOR,
+            edx: (edx & LEAF1_EDX_KEEP) | apic_edx | htt,
         },
         /* What the caches, TLBs and the brand are, and how fast the CPU is
          * clocked: descriptions, nothing a guest can turn on. */
         LEAF_CACHE_DESCRIPTORS | LEAF_FREQUENCY | LEAF_BRAND_FIRST..=LEAF_BRAND_LAST | LEAF_L1 | LEAF_L2 => {
             Cpuid { eax, ebx, ecx, edx }
         }
-        LEAF_CACHE => Cpuid { eax: eax & LEAF4_EAX_KEEP, ebx, ecx, edx },
+        LEAF_CACHE => Cpuid { eax: cache_eax(eax, shape, LEAF_CACHE, true), ebx, ecx, edx },
+        LEAF_TOPOLOGY => topology(sub, asker),
         /* Of the power leaf, ARAT alone, for a guest with an APIC timer:
          * the rest -- APERF/MPERF, HWP, the energy bias, the thermal sensor
          * -- each names MSRs this hypervisor does not answer. */
@@ -504,12 +590,33 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         LEAF_EXT => Cpuid { eax: eax.min(LEAF_EXT_TOP), ebx, ecx, edx },
         LEAF_EXT_FEATURES => {
             let rdtscp = if runs.rdtscp { EXT1_EDX_RDTSCP } else { 0 };
-            Cpuid { eax, ebx, ecx: ecx & EXT1_ECX_KEEP, edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | apic_edx }
+            Cpuid {
+                eax,
+                ebx,
+                ecx: ecx & (EXT1_ECX_KEEP | EXT1_ECX_TOPOEXT),
+                edx: (edx & (EXT1_EDX_KEEP | rdtscp)) | apic_edx,
+            }
         }
         LEAF_EXT_POWER => Cpuid { eax: 0, ebx: 0, ecx: 0, edx: edx & EXT7_EDX_INVARIANT_TSC },
         LEAF_EXT_ADDRESS => Cpuid {
             eax: eax & EXT8_EAX_KEEP,
             ebx: ebx & (EXT8_EBX_KEEP | speculation(EXT8_EBX_SPEC)),
+            /* AMD's: the package's CPUs, and the APIC ID's width below the
+             * package's. Intel's is reserved. */
+            ecx: if vendor() == Vendor::Amd {
+                (shape.cpus().saturating_sub(1) & 0xFF) | (shape.package_shift() << EXT8_ECX_APIC_ID_SIZE_SHIFT)
+            } else {
+                0
+            },
+            edx: 0,
+        },
+        /* AMD's topology leaves, where the host has them (TOPOEXT): its
+         * caches in leaf 4's format, with the guest's sharing counts, and
+         * the asking CPU's APIC ID, core and threads -- one node. */
+        LEAF_EXT_CACHE if topoext() => Cpuid { eax: cache_eax(eax, shape, LEAF_EXT_CACHE, false), ebx, ecx, edx },
+        LEAF_EXT_APIC_ID if topoext() => Cpuid {
+            eax: asker.apic_id,
+            ebx: ((asker.apic_id >> shape.smt_shift()) & 0xFF) | ((shape.threads() - 1) << EXT1E_EBX_THREADS_SHIFT),
             ecx: 0,
             edx: 0,
         },
@@ -521,6 +628,88 @@ pub fn cpuid(leaf: u32, sub: u32, asker: &Asker) -> Cpuid {
         },
         _ => NONE,
     }
+}
+
+/// The hypervisor's range, as KVM answers it: its signature and the top of
+/// the range, and the features of its paravirtual interface backed here --
+/// PV EOI for a guest with APICs. Nothing else in the range.
+fn hypervisor_leaf(leaf: u32, asker: &Asker) -> Cpuid {
+    match leaf {
+        LEAF_HYPERVISOR => Cpuid {
+            eax: LEAF_KVM_FEATURES,
+            ebx: KVM_SIGNATURE[0],
+            ecx: KVM_SIGNATURE[1],
+            edx: KVM_SIGNATURE[2],
+        },
+        LEAF_KVM_FEATURES => Cpuid {
+            eax: KVM_FEATURE_NOP_IO_DELAY | if asker.apic { KVM_FEATURE_PV_EOI } else { 0 },
+            ebx: 0,
+            ecx: 0,
+            edx: 0,
+        },
+        _ => NONE,
+    }
+}
+
+/// Leaf 0xB, the x2APIC topology, for the asking CPU: subleaf 0 its core's
+/// threads -- the APIC ID's bits below the core's, and how many -- subleaf
+/// 1 the package's cores -- the bits below the package's, and the
+/// package's CPUs -- and every other the end of the list; each with the
+/// CPU's APIC ID, which is its number.
+fn topology(sub: u32, asker: &Asker) -> Cpuid {
+    let shape = &asker.shape;
+    let (shift, count, level) = match sub {
+        0 => (shape.smt_shift(), shape.threads(), TOPOLOGY_SMT),
+        1 => (shape.package_shift(), shape.cpus(), TOPOLOGY_CORE),
+        _ => (0, 0, 0),
+    };
+    Cpuid {
+        eax: shift,
+        ebx: count,
+        ecx: (level << TOPOLOGY_LEVEL_SHIFT) | (sub & TOPOLOGY_SUBLEAF_MASK),
+        edx: asker.apic_id,
+    }
+}
+
+/// A deterministic cache leaf's EAX -- `leaf` 4's, or AMD's 0x8000_001D --
+/// with the guest's counts in place of the host's: the CPUs that share the
+/// cache -- a core's threads, and for the last level the whole package's
+/// where they share the host's -- and with `cores`, leaf 4's, the
+/// package's cores. A subleaf with no cache in it ends the list, as it is.
+fn cache_eax(eax: u32, shape: &Shape, leaf: u32, cores: bool) -> u32 {
+    let kept = eax & LEAF4_EAX_KEEP;
+    if eax & CACHE_TYPE_MASK == 0 {
+        return kept;
+    }
+    let level = (eax >> CACHE_LEVEL_SHIFT) & CACHE_LEVEL_MASK;
+    let sharing = if level >= last_level(leaf) && shape.llc_shared() {
+        1 << shape.package_shift()
+    } else {
+        shape.threads()
+    };
+    let core_ids = 1u32 << (shape.package_shift() - shape.smt_shift());
+    let cores = if cores { (core_ids - 1) << CACHE_CORES_SHIFT } else { 0 };
+    kept | ((sharing - 1) << CACHE_SHARING_SHIFT) | cores
+}
+
+/// The host's last level of cache, by its `leaf` -- 4, or 0x8000_001D: the
+/// highest a subleaf names before the one that ends the list.
+fn last_level(leaf: u32) -> u32 {
+    let mut last = 0;
+    for sub in 0..CACHE_SUBLEAVES {
+        let Some(c) = cpu::cpuid_count(leaf, sub) else { break };
+        if c.eax & CACHE_TYPE_MASK == 0 {
+            break;
+        }
+        last = last.max((c.eax >> CACHE_LEVEL_SHIFT) & CACHE_LEVEL_MASK);
+    }
+    last
+}
+
+/// Whether the host has AMD's topology leaves (TOPOEXT), which the guest's
+/// are then answered in.
+fn topoext() -> bool {
+    cpu::cpuid_count(LEAF_EXT_FEATURES, 0).is_some_and(|c| c.ecx & EXT1_ECX_TOPOEXT != 0)
 }
 
 /// The host's last subleaf of leaf 7, which subleaf 0's EAX gives.

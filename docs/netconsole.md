@@ -17,6 +17,14 @@ synchronously, best-effort and only if the collector MAC is already in the ARP
 cache, since a blocking ARP resolve could never complete with the other CPUs
 halted.
 
+So is the halt. On `poweroff` and `reboot` the netconsole is the last thing
+stopped before the soft IRQs -- after every module has been unloaded and
+every filesystem unmounted -- so a module's exit that waits, as `hv`'s does
+for its guests to turn themselves off for up to two minutes, is seen to
+wait; and its drain sends what the ring still holds before it goes, ending
+on its own `netconsole: stopping -- the last line sent`. A log that ends on
+that line ended in a halt; one that ends anywhere else did not.
+
 Each datagram carries an eight-byte header: `NOSC` and a little-endian
 sequence number, which the collector uses to report gaps. UDP drops datagrams
 without saying so, and a log that ends because the network ate the rest of a

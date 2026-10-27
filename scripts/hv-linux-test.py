@@ -27,8 +27,9 @@ With an initrd, then the long-lived VMs: two started side by side, one
 stopped while it boots; a line typed at the other before its shell is up,
 answered once it is (`hv exec`), and one typed at its prompt; `hv send` and
 `hv wait`; `hv console`; `hv off` refusing to pull the extension from under
-a running guest; and `rmmod` stopping that guest itself, with nothing left
-on for the next load to find.
+a running guest; and `rmmod` pressing that guest's power button and then
+stopping it itself (`insmod`'s `stop_secs=2`), with nothing left on for the
+next load to find.
 
 With --acpi -- a guest kernel with ACPI, the power button and evdev -- also
 that it takes the machine's ACPI tables: the boot finds the RSDP, the PM
@@ -36,7 +37,10 @@ timer, the PCI host bridge and the power button, and says nothing of a
 firmware bug; its reboots go through the FADT's reset register; its SCI is
 the 8259's IRQ 9; and `hv stop` presses its power button, which busybox's
 acpid answers with a poweroff -- S5 -- while `rmmod` waits out a guest that
-hears the button and does nothing.
+hears the button and does nothing. With --disk too, the guest's disk is
+left mounted and nos itself powered off: the unload presses the guest's
+button, acpid unmounts the disk and turns the guest off, and the guest's
+ext4 must come back out of nos's root clean, holding what it wrote last.
 
 Exit code 0 = every required marker appeared.
 """
@@ -79,7 +83,11 @@ NICE = r"Kernel command line:"
 # either of XSAVE's formats: standard, or compacted where the CPU has XSAVEC
 # for the policy to pass on (a Zen 2 has; QEMU's TCG has not), which Linux
 # then saves with, AVX's component wanting no alignment of its own there.
-XSTATE = r"x86/fpu: Enabled xstate features 0x7, context size is 832 bytes, using '(?:standard|compacted)' format\."
+# Where the CPU has PKU (TCG's `max`, the EX44's), PKRU too, 0x207: its 8
+# bytes at 2688 in the standard format, straight after AVX's in the
+# compacted one -- the PKRU switched for the guest by RDPKRU and WRPKRU.
+XSTATE = (r"x86/fpu: Enabled xstate features (?:0x7, context size is 832 bytes, using '(?:standard|compacted)'"
+          r"|0x207, context size is (?:2696 bytes, using 'standard'|840 bytes, using 'compacted')) format\.")
 
 # With an initramfs, the fourth demo: the guest runs its init and reaches an
 # interactive shell over the emulated UART. These are checked only when an
@@ -154,6 +162,8 @@ RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 # The module's own lines from the kernel log, printed to the console: what
 # the vCPU tasks and the unload say, which no command's output does.
 RC_LOG = "dmesg hv:"
+# What the main phase's load gives the guests at its unload (`stop_secs=`).
+UNLOAD_SECS = 2
 
 
 def interrupt_check(args, text, queue):
@@ -296,7 +306,14 @@ def vm_commands(args):
         on = r"cpus \d+(,\d+){%d}" % (args.cpus - 1)
         online = "hv exec 0 cat /sys/devices/system/cpu/online"
         irqs = "hv exec 0 grep -e LOC -e RES -e CAL /proc/interrupts"
-        smp_lines = [online, irqs]
+        # Where its CPUs sit, as it found from its CPUID -- one package, and
+        # with two CPUs on one core's two threads, that core -- and the
+        # timer it chose: the local APIC's in TSC-deadline mode.
+        shape = ("hv exec 0 (cd /sys/devices/system/cpu/cpu0; cat topology/package_cpus_list "
+                 "topology/thread_siblings_list cache/index3/shared_cpu_list "
+                 "../../clockevents/clockevent0/current_device); grep -m1 -o tsc_deadline_timer /proc/cpuinfo; "
+                 "echo shape-done")
+        smp_lines = [online, irqs, shape]
         smp_checks = [
             (online, 0, "every one of the guest's %d CPUs is online" % args.cpus,
              r"(?m)^0-%d$" % (args.cpus - 1), True),
@@ -306,12 +323,19 @@ def vm_commands(args):
              r"(?m)^\s*RES:(\s+\d+)*\s+[1-9]\d*", True),
             ("hv list", 0, "hv list says where each of its CPUs runs",
              r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
+            (shape, 0, "its CPUs are one package, and its timer the local APIC's in TSC-deadline mode",
+             r"(?m)^0-%d\s*$[\s\S]*^lapic-deadline\s*$\s*^tsc_deadline_timer\s*$\s*^shape-done"
+             % (args.cpus - 1), True),
         ]
         if args.cpus == 2:
             # Its cores its own, its CPUs filling their threads: one core's
             # two, a vCPU a thread, and the other core left to vm 1.
             smp_checks.append(("hv list", 0, "its two CPUs are one core's two threads, a core of its own",
                                r"vm 0  running  cpus (2,3|3,2|0,1|1,0)  ", True))
+            # And it knows: the core's two threads, sharing its last-level
+            # cache.
+            smp_checks.append((shape, 0, "and the guest sees them so: one core's two threads, one cache",
+                               r"(?m)^0-1\s*$\s*^0-1\s*$\s*^0-1\s*$\s*^lapic-deadline", True))
         if args.ioapic:
             # The PC's own lines through the IO-APIC: the timer's on pin 2,
             # which the boot counts its ticks by before the local APICs'
@@ -383,6 +407,10 @@ def vm_commands(args):
     stop_all = "hv stop all secs=3"
     all_note = (r"its power button went unanswered for 3 s" if args.acpi
                 else r"nothing in it listens to its power button")
+    # And the first load's `rmmod`, which presses vm 0's button as `hv stop
+    # all` does, given the time that load's `stop_secs=` says.
+    unload_note = (r"its power button went unanswered for %d s" % UNLOAD_SECS if args.acpi
+                   else r"nothing in it listens to its power button")
     lines = ["hv help", start0, start1, "hv list", start_full, "hv cores", stop1, exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
@@ -495,6 +523,9 @@ def vm_commands(args):
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
         ("hv", 0, "and keeps the vms where insmod's vms= says", r"hv: vms kept in %s, as insmod was told" % elsewhere,
          True),
+        ("hv", 0, "and gives the guests 120 s at its unload, insmod having said nothing of that",
+         r"(?m)^hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons and gives them "
+         r"120 s to turn themselves off\s*$", True),
         (create_elsewhere, 0, "hv create makes the vm's folder there, and the folder above it",
          r"hv: %s/t1/vm.toml written -- hv start t1 boots it" % elsewhere, True),
         ("hv start t0", 3, "hv start looks for a name there, not in /vms",
@@ -507,9 +538,11 @@ def vm_commands(args):
         (elsewhere_log, 0, "its console.log is in its folder there",
          r"vm %d started on [\s\S]*Linux version" % elsewhere_vm, True),
         (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
-        (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
-         r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
-        (RC_LOG, 0, "and without asking it first", r"(?m)hv: vm 0 stopped for the unload -- on request\s*$", True),
+        (RC_LOG, 0, "rmmod pressed vm 0's power button first, given the time insmod's stop_secs= said",
+         r"hv: unloading -- 1 vm\(s\) asked to turn themselves off, given %d s" % UNLOAD_SECS, True),
+        (RC_LOG, 0, "then stopped it itself, saying what became of the press, and only then turned the extension off",
+         r"hv: vm 0 stopped for the unload -- on request -- %s[\s\S]*hv: unloaded, extension off for cpu mask"
+         % unload_note, True),
         (RC_LOG, 0, "no unload left the extension on", r"hv: WARNING", False),
         (stop_all, 0, "hv stop all presses every button at once, and says what became of each press",
          r"hv: vm 0 stopped -- on request -- %s[\s\S]*hv: vm 1 stopped -- on request -- %s" % (all_note, all_note), True),
@@ -638,7 +671,8 @@ def check_boot(args, txt):
     for m in REQUIRED:
         pt.check("the guest printed: %s" % m, re.search(m, block) is not None, block[-1500:])
     xstate = re.search(r"(?m)^.*x86/fpu: Enabled xstate.*$", block)
-    pt.check("the guest's kernel turned on the x87, SSE and AVX in XCR0", re.search(XSTATE, block) is not None,
+    pt.check("the guest's kernel turned on the x87, SSE and AVX in XCR0, and PKRU where the CPU has PKU",
+             re.search(XSTATE, block) is not None,
              xstate.group(0) if xstate else block[-1500:])
     if re.search(NICE, block):
         print("note: the guest reached %r" % NICE)
@@ -696,6 +730,18 @@ def check_boot(args, txt):
         pt.check("and the report says the guest started them",
                  re.search(r"cpus\s+%d, %d started by the guest" % (args.cpus, args.cpus - 1), txt) is not None,
                  txt[-2500:])
+    if args.kvm:
+        # A guest kernel built with KVM_GUEST: it finds KVM by the
+        # signature, takes what of its paravirtual interface is offered --
+        # NOP_IO_DELAY, and with APICs PV EOI -- and, offered no PV unhalt,
+        # keeps its spinlocks native.
+        pt.check("the guest found KVM's paravirtual interface", "Hypervisor detected: KVM" in block, block[-1500:])
+        if args.cpus > 1:
+            pt.check("and made EOIs through its PV EOI word, done by the host at the next exit",
+                     re.search(r"(?m)^\s+pv eoi\s+[1-9]\d* EOIs the guest made through its word", txt) is not None,
+                     txt[-2500:])
+            pt.check("and kept its spinlocks native, offered no PV unhalt",
+                     "kvm-guest: PV spinlocks disabled, no host support" in block, block[-1500:])
     if args.apicv and args.cpus > 1 and not (args.xapic or args.ioapic) and accel_args(args)[1] == "host" \
             and hvt.host_has_vmx():
         # Asked for, under VT-x, in x2APIC mode: the CPU delivered its
@@ -836,10 +882,11 @@ def nos_mem(args):
     return getattr(args, "nos_mem", None) or "2G"
 
 
-def boot_rc(args, tmp, rc, extra=None, qemu=None):
+def boot_rc(args, tmp, rc, extra=None, qemu=None, powers_off=False):
     """nos with /etc/rc and the guest's files on its root, under TCG, run
-    until rc's last line has printed. The QEMU process and the serial log;
-    None for the process when rc did not get there."""
+    until rc's last line has printed -- or, `powers_off`, until nos has
+    turned the machine off, its rc's last line a `poweroff`. The QEMU process,
+    the serial log and nos's root image."""
     log = os.path.join(tmp, "serial.log")
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
@@ -872,10 +919,16 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
         if "PANIC:" in txt:
             pt.check("nos did not panic", False, txt[-3000:])
             return p, log, image
-        if RC_DONE.search(txt):
+        if not powers_off and RC_DONE.search(txt):
             return p, log, image
         time.sleep(3)
-    pt.check("/etc/rc ran to its end", False, txt[-2000:] or "qemu exited %s" % p.poll())
+    if powers_off and p.poll() is not None:
+        txt = open(log, errors="replace").read() if os.path.exists(log) else ""
+        if "PANIC:" in txt:
+            pt.check("nos did not panic", False, txt[-3000:])
+        return p, log, image
+    pt.check("nos powered itself off" if powers_off else "/etc/rc ran to its end", False,
+             txt[-2000:] or "qemu exited %s" % p.poll())
     return p, log, image
 
 
@@ -883,7 +936,14 @@ def disk(args):
     """A disk for the guest: an ext4 image on nos's root, `disk=` to the
     guest, which mounts it, reads what the host put there, writes, syncs and
     reads back -- and then nos's root is judged by e2fsck, and so is the
-    image, taken back out of it, which must hold what the guest wrote."""
+    image, taken back out of it, which must hold what the guest wrote.
+
+    With --acpi the guest mounts it once more and writes to it, gives
+    busybox's acpid a power-button handler that unmounts it and turns the
+    guest off, and leaves it so: nos itself is powered off, its unload
+    presses the button, and the image must come back clean -- unmounted --
+    holding the last file, where a guest stopped where it was would have
+    left its journal to replay and that file in its page cache."""
     tmp = tempfile.mkdtemp(prefix="nos-hvdisk-")
     content = os.path.join(tmp, "content")
     os.makedirs(content)
@@ -895,7 +955,10 @@ def disk(args):
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     rc = ["insmod /hv.ko", "hv on",
-          "hv start /bzImage mem=%d%s initrd=/initrd disk=/disk.img cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline),
+          # With --acpi its console to nos's log too (`log`): what its
+          # power-button handler says as nos goes down is read there.
+          "hv start /bzImage mem=%d%s initrd=/initrd disk=/disk.img%s cmdline=%s"
+          % (args.mem, cpus_opt(args), " log" if args.acpi else "", args.cmdline),
           x("id", args.vm_secs),
           x("mount -t devtmpfs devtmpfs /dev"),
           x("cat /sys/block/vda/size"),
@@ -911,11 +974,48 @@ def disk(args):
           x("ls -l /mnt/big"),
           x("umount /mnt", 120),
           x("grep virtio /proc/interrupts"),
-          "hv list",
-          "hv stop 0", RC_LAST]
-    p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
+          "hv list"]
+    # Several of the guest's requests at once, as a disk's tasks serve them
+    # (`modules/hv/src/disk.rs`): four files written side by side and their
+    # sums taken; then, the page cache gone with a remount, read back side
+    # by side off the device -- the image's reads in lanes of their own, its
+    # writes one at a time -- and the sums the same.
+    side = "for i in 1 2 3 4; do %s & done; wait"
+    parallel = [x("mount /dev/vda /mnt"),
+                x((side % "dd if=/dev/urandom of=/mnt/r$i bs=64k count=16 2>/dev/null") + "; sync", 300),
+                x("md5sum /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 | sort > /sums", 120),
+                x("umount /mnt", 120),
+                x("mount /dev/vda /mnt"),
+                x("(%s) | sort > /sums2" % (side % "md5sum /mnt/r$i"), 300),
+                x("cmp /sums /sums2 && wc -l < /sums2 && echo nos-same-$((6*7))"),
+                x("umount /mnt", 120)]
+    rc += parallel
+    # What the guest no longer needs given back: the files it wrote deleted
+    # and its free space trimmed -- discards, which nos's image turns into
+    # holes in its file (`fs::image`, `Vfs::punch`), its blocks the root's
+    # again; the image clean after, holding what the guest kept.
+    trim = [x("mount /dev/vda /mnt"),
+            x("rm -f /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 /mnt/big; sync", 120),
+            x("fstrim -v /mnt", 300),
+            x("umount /mnt", 120)]
+    rc += trim
+    handler = "/etc/acpi/PWRF/00000080"
+    if args.acpi:
+        rc += [x("mount /dev/vda /mnt"),
+               x("echo nos-wrote-this-last > /mnt/last.txt"),
+               x("mkdir -p /etc/acpi/PWRF"),
+               x("echo '#!/bin/sh' > %s" % handler),
+               x("echo 'umount /mnt && echo nos-guest-unmounted > /dev/console; poweroff -f' >> %s" % handler),
+               x("chmod +x %s" % handler),
+               x("acpid -l /acpid.log -p /acpid.pid"),
+               "poweroff"]
+    else:
+        rc += ["hv stop 0", "dmesg image:", RC_LAST]
+    p, log, image = boot_rc(args, tmp, rc, {"disk.img": img}, powers_off=args.acpi)
     try:
-        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+        if args.acpi and p.poll() is None:
+            return
+        if not args.acpi and (p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read())):
             return
         secs = sections(open(log, errors="replace").read())
         out = lambda i: output_of(secs, rc[i], 0) or ""
@@ -936,16 +1036,57 @@ def disk(args):
                     r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
         pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
                  out(18)[-300:])
-        stop = output_of(secs, "hv stop 0", 0) or ""
-        m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
-        pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
-                 and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
+        same = output_of(secs, parallel[6], 0) or ""
+        pt.check("four files written side by side read back side by side, every one the same",
+                 re.search(r"(?m)^4\s*$", same) is not None and "nos-same-42" in same, same[-600:])
+        trimmed = output_of(secs, trim[2], 0) or ""
+        m = re.search(r"/mnt: (\d+) bytes trimmed", trimmed)
+        pt.check("the guest's free space trimmed: discards the disk took", m is not None and int(m.group(1)) > 0,
+                 trimmed[-600:])
+        # The image -- held while the guest ran -- says as it is let go of
+        # what it read and wrote off the VFS's lock, and what through it:
+        # the guest's reads and its writes over blocks the image had, off
+        # it (`fs::image`); its writes into holes, through it.
+        held = (r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock, "
+                r"\d+ written through it, (\d+) blocks given back")
+        said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
+        m = re.search(held, said)
+        line = (re.search(r"(?m)^.*image: /disk\.img.*$", said) or [said[-600:]])[0]
+        pt.check("the guest's disk was read and written off the VFS's lock",
+                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
+        # 8 MiB written and deleted: at least half of it given back, in
+        # nos's root's blocks of 4 KiB.
+        pt.check("and what the guest trimmed given back to nos's root: 4 MiB at least",
+                 m is not None and int(m.group(3)) >= 1024, line)
+        if args.acpi:
+            # The halt's lines are on the serial console: the shell gave it
+            # back as it stopped, before the modules went.
+            txt = open(log, errors="replace").read()
+            halt = txt[txt.rfind("> poweroff"):]
+            pt.check("nos powered itself off", p.returncode == 0 and "ACPI shutdown" in halt, halt[-1500:])
+            pt.check("its unload pressed the guest's power button, giving it 120 s",
+                     "hv: unloading -- 1 vm(s) asked to turn themselves off, given 120 s" in halt, halt[-3000:])
+            pt.check("acpid's handler unmounted the disk", "nos-guest-unmounted" in halt, halt[-3000:])
+            pt.check("and the guest turned itself off, which ended it for the unload",
+                     "hv: vm 0 stopped for the unload -- the guest powered itself off, S5 by its ACPI PM1 control "
+                     "register" in halt, halt[-3000:])
+            pt.check("before nos unmounted its own root and went",
+                     re.search(r"hv: vm 0 stopped for the unload[\s\S]*module: hv unloaded[\s\S]*ACPI shutdown",
+                               halt) is not None, halt[-3000:])
+        else:
+            stop = output_of(secs, "hv stop 0", 0) or ""
+            m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
+            pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
+                     and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
+            d = re.search(r"vda +.*; (\d+) discards \((\d+) KiB\)", stop)
+            pt.check("and the discards", d is not None and int(d.group(1)) > 0 and int(d.group(2)) > 0, stop[-800:])
     finally:
         pt.kill(p)
 
     # nos's own root, which every write of the guest's went through -- the
     # holes of the image filled, blocks of it written over -- as nos left it:
-    # stopped, not unmounted, which e2fsck is to find clean all the same.
+    # stopped, not unmounted, which e2fsck is to find clean all the same; or,
+    # with --acpi, unmounted by nos's own poweroff.
     fsck = subprocess.run(["e2fsck", "-fn", image], capture_output=True)
     pt.check("e2fsck finds nos's root clean after the guest's writes", fsck.returncode == 0,
              fsck.stdout.decode(errors="replace")[-800:])
@@ -962,6 +1103,18 @@ def disk(args):
         cat = subprocess.run(["debugfs", "-R", "cat /written.txt", back], capture_output=True)
         pt.check("and the file the guest wrote is in it", b"nos-wrote-this" in cat.stdout,
                  repr(cat.stdout[-200:]) + cat.stderr.decode(errors="replace")[-200:])
+        if args.acpi:
+            # Unmounted by the guest as nos went down: the state clean, and
+            # no journal left to replay -- which e2fsck -n does not replay,
+            # so it is the superblock that says how the guest left it.
+            head = subprocess.run(["dumpe2fs", "-h", back], capture_output=True).stdout.decode(errors="replace")
+            said = "\n".join(l for l in head.splitlines() if l.startswith(("Filesystem state", "Filesystem features")))
+            pt.check("the guest unmounted it as nos went down: clean, nothing in its journal to replay",
+                     re.search(r"(?m)^Filesystem state:\s+clean\s*$", head) is not None
+                     and "needs_recovery" not in head, said or head[-1500:])
+            last = subprocess.run(["debugfs", "-R", "cat /last.txt", back], capture_output=True)
+            pt.check("and the file it wrote last is in it", b"nos-wrote-this-last" in last.stdout,
+                     repr(last.stdout[-200:]) + last.stderr.decode(errors="replace")[-200:])
     if args.keep or pt.failures:
         print("log at " + log)
     else:
@@ -988,12 +1141,16 @@ def web_server(root):
 def network(args):
     """The guests' network: two guests on the switch, each with its address
     from its port; each pings nos at 10.0.100.1 and the other guest, and
-    nos pings a guest back through hv0. Then their way out, NAT from nos's
-    own address: a page and a megabyte from a web server on the test
-    machine -- at 10.0.2.2, where QEMU's user network puts it -- and a ping
-    there; the DNS server nos was given, as ip= hands it to the guest; the
-    switch's DHCP server, asked by udhcpc; and with --internet, a name
-    looked up through that DNS server."""
+    nos pings a guest back through hv0. IPv6 between them: each has an
+    address in the prefix the switch's router advertisement gives, and its
+    link-local one, and reaches the other at both; one that asks for the
+    other's is told it is taken, and one that takes it anyway gets nothing
+    through. Then their way out, NAT from nos's own address: a page and a
+    megabyte from a web server on the test machine -- at 10.0.2.2, where
+    QEMU's user network puts it -- and a ping there; the DNS server nos was
+    given, as ip= hands it to the guest; the switch's DHCP server, asked by
+    udhcpc; and with --internet, a name looked up through that DNS
+    server."""
     import hashlib
     tmp = tempfile.mkdtemp(prefix="nos-hvnet-")
     www = os.path.join(tmp, "www")
@@ -1072,6 +1229,38 @@ def network(args):
     # nos's 8086 relayed to its httpd as its vm.toml says, with no hv
     # forward of the test's. After vm 0 has stopped, which leaves a core for
     # it.
+    # IPv6 between the guests, which nos does not speak: each has its
+    # link-local address and one in the switch's prefix, fd6e:6f73:64::/64,
+    # both its MAC's EUI-64 -- the prefix from the advertisement the switch
+    # answers a router solicitation with, which gives no route -- and reaches
+    # the other at both. A guest that asks for the other's address is told
+    # it is taken: its duplicate detection's solicitation goes through for
+    # the owner to answer. One that takes it anyway -- its duplicate
+    # detection off, which BusyBox's ip has no `nodad` for -- tells the link
+    # it is its (ndisc_notify's advertisement) and sends from it, and gets
+    # nothing through: the other hears no advertisement of its own address,
+    # its count of echoes asked of it is the same after as before, and the
+    # switch counts what it stopped against the guest that sent it.
+    ula = lambda vm: "fd6e:6f73:64::ff:fe00:64%02x" % (vm + 2)
+    lla = lambda vm: "fe80::ff:fe00:64%02x" % (vm + 2)
+    ready6 = lambda vm: x(vm, "for i in $(seq 90); do ip -6 addr show dev eth0 | grep '%s/64' | grep -qv tentative "
+                              "&& break; sleep 1; done; ip -6 addr show dev eth0; echo ready6" % ula(vm), 180)
+    echoes = x(1, "grep Icmp6InEchos /proc/net/snmp6")
+    sysctl6 = "for f in all/accept_dad eth0/accept_dad; do echo %d > /proc/sys/net/ipv6/conf/$f; done; " \
+              "echo %d > /proc/sys/net/ipv6/conf/eth0/ndisc_notify"
+    six = [ready6(0), ready6(1),
+           x(0, "ping -c 3 -W 5 %s" % ula(1), 60),
+           x(1, "ping -c 3 -W 5 %s%%eth0" % lla(0), 60),
+           x(0, "ip -6 route; echo routes6"),
+           x(0, "ip -6 addr add %s/64 dev eth0; sleep 5; ip -6 addr show dev eth0 | grep '%s'; "
+                "ip -6 addr del %s/64 dev eth0; echo dad-done" % (ula(1), ula(1), ula(1)), 60),
+           echoes,
+           x(0, (sysctl6 % (0, 1)) + "; ip -6 addr add %s/128 dev eth0; echo taken" % ula(1)),
+           x(0, "ping -c 3 -W 2 -I %s %s%%eth0; echo spoof-done" % (ula(1), lla(1)), 60),
+           x(0, "ip -6 addr del %s/128 dev eth0; " % ula(1) + (sysctl6 % (1, 0)) + "; echo given-back"),
+           echoes,
+           x(1, "dmesg | grep 'advertised ou[r] address'; echo heard-done"),
+           "hv list"]
     xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
     folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
               % (args.mem, cpus_opt(args), args.cmdline),
@@ -1093,7 +1282,7 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + folder + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + six + kept + way_out + folder + [RC_LAST]
     port = free_port()
     ssh_port = free_port()
     folder_port = free_port()
@@ -1131,6 +1320,44 @@ def network(args):
                 time.sleep(3)
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
+
+        # IPv6, each line by its own occurrence: "hv list" is run before
+        # them, and the count of echoes twice.
+        at6 = rc.index(six[0])
+        six_out = lambda i: output_of(secs, six[i], rc[:at6 + i].count(six[i])) or ""
+        line6 = lambda i: re.search(r"inet6 %s/64 scope global[^\n]*" % re.escape(ula(i)), six_out(i))
+        pt.check("each guest has its address in the switch's prefix, made from its MAC, from the switch's "
+                 "router advertisement",
+                 all("ready6" in six_out(i) and line6(i) is not None and "tentative" not in line6(i).group(0)
+                     for i in (0, 1)), six_out(0)[-600:] + six_out(1)[-600:])
+        pt.check("a guest pings the other over IPv6, at its address in the prefix", ok_ping(six_out(2)),
+                 six_out(2)[-600:])
+        pt.check("and the other pings it back at its link-local address", ok_ping(six_out(3)), six_out(3)[-600:])
+        routes = six_out(4)
+        pt.check("the advertisement puts the prefix on the link and gives no route",
+                 "routes6" in routes and re.search(r"fd6e:6f73:64::/64 dev eth0", routes) is not None
+                 and "default" not in routes, routes[-600:])
+        pt.check("a guest that asks for the other's address is told it is taken",
+                 "dad-done" in six_out(5) and "dadfailed" in six_out(5), six_out(5)[-600:])
+        before = re.search(r"Icmp6InEchos\s+(\d+)", six_out(6))
+        after = re.search(r"Icmp6InEchos\s+(\d+)", six_out(10))
+        pt.check("one that takes it anyway gets nothing through: the other was asked for no echo",
+                 "taken" in six_out(7) and "spoof-done" in six_out(8) and "given-back" in six_out(9)
+                 and "3 packets transmitted, 0 packets received" in six_out(8)
+                 and before is not None and after is not None and before.group(1) == after.group(1),
+                 six_out(6)[-200:] + six_out(7)[-400:] + six_out(8)[-600:] + six_out(10)[-200:])
+        pt.check("and the other heard nothing of it advertising its address",
+                 "heard-done" in six_out(11) and "advertised our address" not in six_out(11), six_out(11)[-600:])
+        listed = six_out(12)
+        vm0 = re.search(r"(?m)^vm 0 .*$", listed)
+        vm1 = re.search(r"(?m)^vm 1 .*$", listed)
+        spoofed = re.search(r"(\d+) frames it sent as another guest", vm0.group(0) if vm0 else "")
+        pt.check("hv list counts what it sent as the other against it, and nothing against the other; "
+                 "the advertisements and the addresses bound",
+                 spoofed is not None and int(spoofed.group(1)) >= 3
+                 and vm1 is not None and "as another" not in vm1.group(0)
+                 and re.search(r"IPv6 between the guests, in fd6e:6f73:64::/64: [1-9]\d* router advertisements, "
+                               r"[1-9]\d* addresses bound", listed) is not None, listed[-1200:])
 
         # Kept from the test machine and the metadata server, until let
         # through.
@@ -1265,7 +1492,10 @@ def run(args):
         # cmdline=, which takes the rest of the line.
         boot_cmd += " input=" + args.input
     boot_cmd += " cmdline=" + args.cmdline
-    rc = ["insmod /hv.ko", "hv on"]
+    # An unload's time for the guests short (`stop_secs=`): its `rmmod` presses
+    # vm 0's button and stops it when the time is up, within the five
+    # seconds rmmod waits for an unload before it goes on.
+    rc = ["insmod /hv.ko stop_secs=%d" % UNLOAD_SECS, "hv on"]
     if not args.skip_boot:
         rc.append(boot_cmd)
     vm_lines, vm_checks = vm_commands(args) if args.initrd and not args.skip_vms else ([], [])
@@ -1341,6 +1571,10 @@ def main():
                     help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
                          "the machine's tables, reboots by the FADT's reset register, and shuts down when "
                          "hv stop presses its power button")
+    ap.add_argument("--kvm", action="store_true",
+                    help="the guest kernel has KVM_GUEST (and PARAVIRT_SPINLOCKS): check that it finds KVM's "
+                         "paravirtual interface, and with --cpus 2 or more makes EOIs through its PV EOI word "
+                         "and keeps its spinlocks native")
     ap.add_argument("--xapic", action="store_true",
                     help="the guest's local APICs out of reset in xAPIC mode (hv's `xapic`): every access of "
                          "theirs through the page, each instruction decoded and performed by the hypervisor")

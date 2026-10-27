@@ -38,7 +38,8 @@ extern "C" int rust_netframe_pool_setup(unsigned long count);
 extern "C" int rust_netconsole_setup();
 extern "C" int rust_tcp_init();
 extern "C" void rust_net_start_services(unsigned short udp_shell_port);
-extern "C" void rust_net_stop_services();
+extern "C" void rust_net_stop_shell();
+extern "C" void rust_net_stop_netconsole();
 /* The filesystem layer is Rust (src/crates/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
@@ -357,7 +358,7 @@ static void bp_startup_arm(void* ctx)
             else
                 trace(0, "Shutdown requested");
 
-            rust_net_stop_services();
+            rust_net_stop_shell();
             cmd.stop();
             cmd.stop_dhcp();
 
@@ -374,6 +375,10 @@ static void bp_startup_arm(void* ctx)
                and the log switches off -- after SoftIrq::stop() a write
                through a virtio disk would wait for ever. */
             rust_disklog_stop();
+
+            /* The netconsole after all of them, with the halt's own lines
+               (as in kernel/main.cpp), before the soft IRQs stop. */
+            rust_net_stop_netconsole();
 
             /* Then the soft IRQ tasks themselves, as on x86. Left running
                into the halt they were never released -- SoftIrq's own

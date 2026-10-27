@@ -544,7 +544,9 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all> [secs=N]   press its power button and give it secs (30)
                                 to turn itself off, then stop it; say how it
-                                ended, take it off the list
+                                ended, take it off the list -- as rmmod and
+                                nos's poweroff and reboot stop all of them,
+                                given insmod's stop_secs= (120)
     hv forward [add <port> <vm> <guest-port> | del <port>]
                                 a port of nos's relayed to a guest's
     hv help                     all of these, a line each
@@ -949,6 +951,7 @@ mode:
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
 | `posted` | on the machine of `smp`, asking for its interrupts to be the CPU's: the second CPU, started as `smp`'s is, sends the first a thousand fixed IPIs, one at a time, while the first spins with interrupts on and no HLT, counting them | where the CPU has posted interrupts each is posted and notified and taken by the first CPU in its guest, which leaves it a handful of times rather than once an IPI; elsewhere the host hands each over ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
+| `pveoi` | on the machine of `apicv`, its interrupts the host's to inject on either backend, KVM's PV EOI turned on with its word at 0x7100, each handler ending its interrupt as Linux's does -- the word's bit cleared if set, the EOI register written if not: a self-IPI 0x50 alone; 0x30, whose handler takes 0x70 nested and reads ISR in it; ISR read whole; PV EOI turned off and 0x50 once more | 0x50 and 0x70 ended through the word, each EOI the host's at the next exit -- 0x70's at the exit of 0x30's own EOI by the register, done before it -- the word not set while 0x70 waited in IRR nor after PV EOI went off, nothing left in service: two EOIs through the word, two by the register ([KVM's paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `pkru` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, the second started by `avx`'s code: each turns its local APIC on, runs an RDPKRU with CR4.PKE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, and where its CPUID offers PKU sets PKE, makes XCR0 its own -- PKRU in the first's, the x87 alone the second's -- reads leaf 7, leaf 0xD's subleaves 0 and 9 and PKRU, and loads its own into PKRU; then 64 turns each, a turn its peer's IPI, every one checking PKRU against what it left and loading it one key more | the RDPKRU a #UD; where PKU is offered -- QEMU's TCG, the EX44, not a Zen 2 -- OSPKE only once its CR4.PKE has it, leaf 0xD's components and sizes for its XCR0, PKRU's subleaf the host's; PKRU 0 as each CPU starts, though the other's was in the CPU's register, and its own at every turn, put back by the host each time the other had had the CPU -- 64 times each at least, whatever its XCR0 says of PKRU |
@@ -1483,11 +1486,14 @@ here:
   alone, and for a guest of one CPU no local APIC and no x2APIC (one of
   more has an emulated x2APIC: [More than one CPU](#more-than-one-cpu)); and
   the hypervisor bit, since there is one, which has Linux leave the
-  microcode loader and the bare-metal chicken bits alone. Each of its CPUs
-  is a package of one, whichever host CPU its vCPU runs on: leaf 1 says one
-  logical CPU, with that CPU's APIC ID -- 0 for a guest of one -- leaves 4
-  and 0x80000008 one core, and the topology leaves (0xB, 0x1F, 0x8000001E),
-  the SVM leaf and the memory-encryption leaf are blank. Every MSR is
+  microcode loader and the bare-metal chicken bits alone. Its CPUs are one
+  package, whichever host CPUs their vCPUs run on, each CPU's APIC ID its
+  number -- 0 for a guest of one -- of cores of one thread, or of two where
+  its CPUs are one host core's two threads ([Where its CPUs
+  sit](#where-its-cpus-sit)): leaf 1, the sharing counts of leaf 4 and AMD's
+  0x8000001D, the x2APIC topology leaf (0xB), and AMD's 0x80000008 and
+  0x8000001E say so, none of them the host's; 0x1F, past the top, the SVM
+  leaf and the memory-encryption leaf are blank. Every MSR is
   intercepted but the three segment bases, and every one is an allow-list's
   too: the system MSRs (EFER, the PAT, the segment bases, the SYSCALL and
   SYSENTER registers) are the guest's own state and are served from the
@@ -1652,12 +1658,44 @@ ring full waits for its disk rather than growing anything of nos's.
 
 **The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
 request and gives it back served): the module's `FileDisk` holds the image
-open (`kcore::fs::File`, whose handle the kernel looks up on every call; the
-file cannot be removed, nor its filesystem unmounted, while the disk has
-it), reads and writes it where the guest asks -- within the file's size,
-never growing it -- and for a guest's flush, offered and taken by ext4,
-syncs the filesystem it is on. The report counts each disk's reads, writes,
-flushes and errors.
+(`kcore::fs::Image`, whose word the kernel looks up on every call; nothing
+else may write the file, cut it, grow it, rename it or remove it while the
+disk has it, nor its filesystem be unmounted -- [A disk's
+image](filesystems.md#a-disks-image)), reads and writes it where the guest
+asks -- within the file's size, never growing it -- off the VFS's lock,
+the image mapping the blocks under it and moving them itself, and for a
+guest's flush, offered and taken by ext4, flushes the device: the
+filesystem's sync only after a write into a hole, which goes through the
+VFS. Which file it is comes first, so that a second guest's disk on it is
+refused saying whose it is (`Claims`), and only then is it held. The
+report counts each disk's reads, writes, flushes and errors, and the image
+says as it is let go of how many of its batches went off the lock and how
+many through it.
+
+**What a guest no longer needs it gives back.** The disk offers discard
+and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the
+guest may only read offers neither): a guest's `fstrim`, ext4 mounted
+with `discard`, `blkdiscard`, `mkfs` of its own disk -- ranges of sectors,
+up to eight a request and 64 MiB a range, aligned best to 4 KiB. The device
+copies the ranges out of the guest's memory once, checks them in its own
+copy -- whole sectors inside the disk, no flag but a write of zeros'
+unmap -- and hands the backend that copy (`Request::ranges`): a guest that
+changes them after the check changes nothing it was checked on. The image
+gives the whole blocks of a discard back to nos's root (`Image::discard`,
+`Vfs::punch`, ext2's `punch`): holes in its file from then on, reading as
+zeros, its size as it was -- so an image no longer only grows. A write of
+zeros with unmap gives back the blocks it covers whole and writes zeros
+over the rest; without, it writes zeros, its blocks kept. ext2 gives the
+blocks back in batches in truncate's order -- each batch's pointers
+cleared and on the disk, the inode committed, and only then the blocks
+freed in the bitmap -- so a crash leaks at most a batch to e2fsck and
+never leaves a block both in use and free; the indirect blocks stay,
+whatever is left in them, since they map what is past the range too. That
+the next file may have a block the moment the punch is done is safe
+because an image's calls come one at a time: no read of its own is under
+way off the VFS's lock on a block it mapped before. The report counts the
+discards and writes of zeros, and the image says how many blocks it gave
+back.
 
 **What a guest's write costs nos's ext2** ([Filesystems](filesystems.md)):
 one into a hole of the image flushes nos's disk once and writes the pointers
@@ -1771,7 +1809,9 @@ the guest is put into the buffers it has posted each time round the run
 loop, one frame held by the device while it has posted too few.
 
 **Offloads, both ways.** The device completes a checksum the driver leaves
-to it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as
+to it (`VIRTIO_NET_F_CSUM`) -- a UDP datagram's that comes to 0 as all ones,
+over IPv4 or over IPv6 past its extension headers, since 0 there is no
+checksum at all and IPv6 refuses it -- and cuts TCP over IPv4 the driver hands it as
 one send of up to 64 KiB into frames (`HOST_TSO4`; `hv::devices::offload`):
 the headers of the send in front of each, its IP length, ID and checksum,
 its sequence number and its TCP checksum its own, FIN and PSH the last
@@ -1861,20 +1901,59 @@ and 256 a second after, a token bucket a port. What either keeps out is
 dropped and counted against the guest in `hv list`.
 
 **What a guest sends has to be its own.** A frame is checked where it comes
-in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4 or ARP
--- nothing of nos's speaks anything else, and nothing the switch cannot
-check goes through it -- from the port's MAC; an IPv4 packet from the
-port's address; an ARP message with the port's MAC as its sender's, and
-the port's address as its sender's or none yet, as a probe has. The one
-IPv4 packet with no address yet is a DHCP client's, which the switch
-answers itself. The rest is dropped: a frame sent as another guest counted
-against the guest that sent it in `hv list`, one of another protocol --
-IPv6, which every Linux sends at boot -- on `hv0`'s line. Without it a guest
+in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4, ARP
+or IPv6 -- nothing the switch cannot check goes through it -- from the
+port's MAC; an IPv4 packet from the port's address; an ARP message with the
+port's MAC as its sender's, and the port's address as its sender's or none
+yet, as a probe has; IPv6 by rules of its own (below). The one IPv4 packet
+with no address yet is a DHCP client's, which the switch answers itself.
+The rest is dropped: a frame sent as another guest counted against the
+guest that sent it in `hv list`, one of another protocol on `hv0`'s line.
+Without it a guest
 could take another's flows through NAT, which answers a flow at the MAC its
 last packet came from -- one packet with the other's address and the flow's
 ports was enough -- and tell `hv0`'s ARP table another's address was its
 own. `hv-fuzz`'s `guestnet` target found that
 ([testing](testing.md#hv-fuzzpy----everything-a-guest-reaches-fuzzed)).
+
+**IPv6 goes between the guests, and no further.** Nothing of nos's speaks
+it, so `hv0` is handed none -- a guest's IPv6 for nos's MAC is dropped on
+`hv0`'s line -- and there is no way out: no NAT, no route. Each guest makes
+its own addresses: its link-local one, and one in the prefix the switch
+gives it, `fd6e:6f73:64::/64` -- unique-local (RFC 4193), its global ID
+"nos" and 100, the third byte of the guests' IPv4 subnet -- which the switch's
+router advertisement carries, answering a guest's solicitation: from
+`hv0`'s MAC and the link-local address it makes, the prefix on the link
+and to make addresses in, for good, the MTU 1500, and a router lifetime of
+0, so no default route and a connect anywhere else refused at once. Since
+the addresses are the guests' to choose, they are not checked against the
+port as an IPv4 address is, but bound to the port that first uses one
+(RFC 6620's first come, first served): as the source of a packet of its,
+as the target of its neighbour advertisement, or as the address its
+duplicate detection asks after, if it is nobody's yet. From then on it is
+that port's alone until its VM goes -- eight a port, a ninth taking the
+place of its least recently used, so privacy addresses come and go -- and
+another sending from it, or advertising it, is spoofing, counted against it.
+A guest's duplicate detection of another's address goes through, for the
+owner to answer, so a guest asking for a taken address is told so. A guest
+is no router here and no DHCPv6 server: its router advertisements,
+redirects and DHCPv6 replies go nowhere (RFC 6105's guard); its neighbour
+discovery must give its own MAC wherever it gives one, a target that is one
+address, and come whole, not in fragments (RFC 6980); its source is none
+only while it finds an address -- a solicitation, a listener's report --
+and never a multicast group. A packet whose extension headers hide what it
+carries -- running past its length, more than eight of them, a first
+fragment that stops short of the header after them -- goes nowhere, since a
+router advertisement could be one (RFC 7112); and the packet the switch
+looks at is the one its receiver takes, to the length its header says, so
+the two cannot read different messages out of one frame. `hv list` counts
+the advertisements and the addresses bound. hv-fuzz's `switch` target holds
+the switch to a model of these rules of its own, frame by frame, with
+neighbour discovery of every kind among its frames, and `hv-linux-test.py
+--net` two Linux guests: each makes its address from the advertisement,
+they ping each other at it and at their link-local ones, one asking for
+the other's address is told it is taken, and one that takes it anyway gets
+nothing through to the other.
 
 **A guest that is running is kicked out of it.** Its turn ends when its
 CPU takes an interrupt, and the device model hands frames over only between
@@ -2125,7 +2204,13 @@ moment, and only what comes after it can end the wait. So a line typed at a
 guest that is still booting waits for its shell and comes back with its
 answer, not with the first prompt the shell printed before it read the line;
 and a line the guest never reads says so rather than timing out in silence.
-It prints everything the guest printed since the line was typed.
+It prints everything the guest printed since the line was typed. Each line
+goes in at a prompt of its own: after a newline the UART holds what is typed
+back until the shell asks where the cursor is again. Typed ahead -- a
+line queued behind another, a requeued `input=` after a reboot -- it went
+in while the shell still ran the one before, and that line's prompt ended
+the wait: `hv exec` came back with its answer cut after a character, which
+hv-linux-test caught once under load.
 
 **What reaches a terminal is made safe for one.** `hv console`, `hv exec` and
 the report print the guest's console with escape sequences taken out whole,
@@ -2213,10 +2298,11 @@ module gave that CPU, so a guest racing an `hv off` finds it off and stops,
 `not entered` -- on AMD-V; on Intel the CPU itself refuses to go off while a
 guest's VMCS is current on it ([above](#what-the-extension-costs-while-it-is-on)),
 so an `hv boot` or `hv run` the courtesy check does not see keeps its CPU
-too. `rmmod hv` stops every guest before it turns the extension off -- where
-it is, without pressing its power button; `hv stop all` before it shuts them
-down -- the guests first, an `hv boot` under way among them, so that an `hv exec`
-or `hv wait` waiting on one returns; then the command, whose unregistration
+too. `rmmod hv` stops every guest before it turns the extension off -- its
+power button pressed first and the guests given `stop_secs=`
+([above](#acpi)) -- the guests first, an `hv
+boot` under way among them (stopped at once: it is a diagnostic), so that an
+`hv exec` or `hv wait` waiting on one returns; then the command, whose unregistration
 waits out every call still running (an `hv start` still reading its files
 finds the module going when it comes to add its guest, and stops it itself);
 and only then the extension, on every CPU.
@@ -2224,8 +2310,8 @@ and only then the extension, on every CPU.
 The gate is `scripts/hv-linux-test.py` with `--initrd`: two VMs started side
 by side and one stopped mid-boot, a line typed at the other before its shell
 is up and another at its prompt, `send`, `wait`, `console`, the refused
-`hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
-the next load.
+`hv off`, and an `rmmod` that presses the guest's power button, stops it
+itself when its time is up and leaves nothing on for the next load.
 
 ## A VM in a folder
 
@@ -2337,7 +2423,7 @@ and for the same reason:
 
 ```
 $ insmod /hv.ko vmz=/data/vms
-hv: "vmz" is not a parameter of hv's -- vms=<folder> is
+hv: "vmz" is not a parameter of hv's -- vms=<folder> and stop_secs=N are
 module: hv: init failed
 insmod: /hv.ko failed, error 502
 $ insmod /hv.ko vms=/data/vms
@@ -2345,7 +2431,12 @@ module: hv loaded at 0xFFFF8000...
 $ hv
 hv: AMD-V on for cpu none of 0-3
 hv: vms kept in /data/vms, as insmod was told
+hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons and gives them 120 s to turn themselves off
 ```
+
+Its other parameter is `stop_secs=N`, 0 to 600: what the module's going
+gives the guests to turn themselves off
+([above](#acpi)), and `hv` says it.
 
 `rc add insmod /hv.ko vms=/data/vms` loads it so at every boot. `vms=` is
 at most 208 bytes: the VFS takes paths of 255, and under the folder go a
@@ -2436,8 +2527,9 @@ the folder above it -- boots it and types at it by its name, finds its
 network phase (`--net`), whose VM from its folder asks for
 port 5 and a forward -- its eth0 has the port's address and MAC, and its
 httpd answers from outside through the forward its `vm.toml` asked for;
-`hv-test.py`, whose last loads keep a `vms=` and say it, and refuse a
-parameter hv has not got and a `vms=` that is no absolute path;
+`hv-test.py`, whose last loads keep a `vms=` and a `stop_secs=` and say
+them, and refuse a parameter hv has not got, a `vms=` that is no absolute
+path and a `stop_secs=` past 600;
 `hv-fuzz.py`'s `config` target, which holds the parser to never
 panicking on any text and `render` and `parse` to giving each other back what
 they were given, and whose `switch` target claims a port asked for as well as
@@ -2568,9 +2660,32 @@ ACPI, `acpi=off`, not booted that far -- cannot hear it, and the first CPU's
 loop, which takes the press from the command, says so: it is stopped at
 once, `nothing in it listens to its power button`. `secs=0` stops a guest
 without asking, and `hv stop all` presses every button at once and waits for
-the guests together. `rmmod` does not ask: an unload is no place to wait on
-guests -- a module's exit has five seconds before `rmmod` goes on without
-it -- so `hv stop all` first is the way to shut guests down before one.
+the guests together.
+
+**So does the module's going** -- `rmmod hv`, and nos's own `poweroff` and
+`reboot`, which unload every module on the way down while the files, block
+I/O and soft IRQs a guest's shutdown writes through are all still there
+(`ModuleTable::unload_all`): every guest's power button pressed at once and
+the guests given `stop_secs=` of `insmod`'s together -- 120 s unless told,
+longer than the 90 s systemd gives a service that will not stop before it
+unmounts the disks anyway -- and those still running then stopped where
+they are. A guest that turns itself off ends `stopped for the unload -- the
+guest powered itself off`, in the kernel log; one whose OS never hears the
+button is stopped at once, as `hv stop` stops it. Without it a guest's disk
+was cut off under it: its last writes still in its page cache, its journal
+left to replay -- what `hv-linux-test.py --disk --acpi` now holds nos's own
+poweroff to, a guest's ext4 left mounted coming back clean. `rmmod` goes on
+in the background after five seconds, `lsmod` saying `unloading` and the
+kernel log how each guest ended; the halt waits, and says why in the log
+before it does (`hv: unloading -- 2 vm(s) asked to turn themselves off,
+given 120 s`). `stop_secs=0` is the old way, every guest stopped where it
+is. Meanwhile no guest starts, `hv list` shows each `stopping`, `hv stop` of
+one is refused as already being stopped and an `hv stop` already giving one
+its time goes on with it, the unload's time and its own both running: the
+first to end takes the guest off the list. On a machine whose only console
+is the network the netconsole stays up through all of it -- stopped after
+the modules and the filesystems, sending what it still holds as it goes
+(`rust_net_stop_netconsole`) -- so that the wait is seen.
 
 **A power-off is a write to a port**, as a reset is: SLP_EN with S5's sleep
 type in PM1a's control register. ACPICA writes the type first and the enable
@@ -3020,7 +3135,9 @@ TSC's ratio to it, so a kernel need not measure either. Passed through, the
 leaf would name the host's crystal, tens of MHz, and a kernel that took the
 timer's rate from it would have its timer fire tens of times too soon;
 where the host has no frequency to give, the leaf is blank and the kernel
-measures. The topology leaves stay blank, as for one CPU. Of leaf
+measures. The topology leaves are the guest's own ([Where its CPUs
+sit](#where-its-cpus-sit)), and leaf 1 offers the timer's TSC-deadline mode
+([Time](#time)). Of leaf
 0x80000007 only the invariant TSC is left: its RAS bits (SUCCOR among them)
 sent Linux's machine-check code to set up AMD's deferred-error interrupt
 through the APIC's extended LVT -- MSR 0x852, a register this APIC has not
@@ -3040,6 +3157,77 @@ before its first line of SMP output. And `CONFIG_SMP`, `CONFIG_X86_X2APIC`
 `CONFIG_X86_MPPARSE`. A distribution's kernel has all of them: Alpine's
 `virt` 6.18 brings up two CPUs as it ships. An older kernel still boots on
 one CPU.
+
+### Where its CPUs sit
+
+A guest's CPUID tells it where its CPUs are (`hv::place::Shape`), and
+tells it what is so. They are one package, each CPU's APIC ID its number,
+of cores of one thread or two: two where its CPUs 2k and 2k+1 are each one
+host core's two threads and no other two of them share a core -- as
+`hv cores own`, the default, places them, a guest's vCPUs filling the
+threads of the cores it is given -- and one otherwise, `hv cores shared`'s
+CPUs on cores apart among them, and the odd guest whose CPUs the numbering
+cannot pair (a core with one thread to give before the others). Its
+last-level cache is the package's where all its CPUs are on one host cache,
+each core's own where not. The placement says so as it is made
+(`Placement::shape`), the guest's spec keeps it for every boot, and the
+leaves give it: leaf 1's count of the package's APIC IDs, with HTT where
+that is more than one; leaf 4's sharing and core counts, the last level's
+sharing the package's; the x2APIC topology leaf, 0xB, its SMT level and its
+core level, each with the CPU's x2APIC ID; and on AMD the package's CPUs and
+the APIC ID's width in 0x80000008, and -- where the host has TOPOEXT --
+0x8000001D's sharing and 0x8000001E's core and threads. Nothing of the
+host's topology reaches the guest: its APIC IDs and core counts were once
+another machine's, and a guest took the host CPU's APIC ID for its own.
+
+It matters twice. A guest's kernel schedules by it: its wakeups look for an
+idle CPU among those that share the waker's cache, which with each CPU a
+package of its own, as each was before, was no CPU but its own; and it
+spreads work over cores before it doubles up on a core's threads. And the
+side channels between a core's two threads -- MDS, L1TF, port contention --
+are between two of its own CPUs, which its kernel can guard its processes
+against only knowing (core scheduling, STIBP, `nosmt`): told each CPU was a
+package, it believed no two of its processes shared a core while two did.
+Linux 6.18 reads leaf 0xB on AMD as on Intel; an older kernel reads it on
+AMD only with TOPOEXT, and on an AMD host without TOPOEXT -- QEMU's `max`
+under TCG is one -- sees one package of cores, and no threads.
+
+### KVM's paravirtual interface, as far as it is backed
+
+The hypervisor's CPUID range answers as KVM's does: its signature,
+`KVMKVMKVM`, in leaf 0x40000000, and in 0x40000001 the features of its
+paravirtual interface -- what a Linux built with `KVM_GUEST` looks for, and
+takes no more of than the bits it is given. Two are offered. NOP_IO_DELAY,
+a fact: an `out` to port 0x80 delays nothing here and is an exit, and a
+kernel told so stops making them. And for a guest with APICs, PV EOI: the
+guest names a word in its memory (`MSR_KVM_PV_EOI_EN`, aligned to 4 bytes,
+or a #GP), and where the end of the interrupt in service need not exit --
+the highest in service edge-triggered, since a level's end the IO-APIC has
+to hear of, and nothing requested, which an EOI that does not exit would
+leave waiting unseen -- the run loop sets the word's bit before the entry
+(`pv_eoi_arm`). The guest's EOI then clears the bit and goes on, no exit;
+at the next exit, before anything else is looked at, the run loop finds the
+bit clear and does the EOI itself -- or finds it still set, and clears it,
+so that an EOI the guest makes from there exits as usual (`pv_eoi_sync`).
+An EOI written to the register at that exit, of the vector beneath, comes
+after the one done for the word, as it came after in the guest. Under VT-x
+with APIC virtualization the CPU takes the EOIs itself and the word is
+never set. Elsewhere each EOI was an exit of its own, beside the one that
+brought the interrupt and, in TSC-deadline mode, the next deadline's write;
+`hv boot`'s report counts the ones saved (`pv eoi`). INIT turns PV EOI
+off, as KVM's reset does.
+
+Not offered, and why: kvmclock, the TSC being invariant and the host's
+(`tsc_khz=` tells the guest its rate); steal time, and what stands on it --
+PV TLB flushes and PV sched yield -- a guest's CPUs having cores of their
+own (`hv cores own`); PV unhalt, for the same reason, so a guest's
+spinlocks stay native (`PV spinlocks disabled, no host support`); and async
+page faults, a guest's memory never being paged out. No hypercall is
+offered either, and each is answered -KVM_ENOSYS in RAX, as KVM answers one
+it does not know: a driver that probes, as `ptp_kvm` does for its clock
+pairing, takes that for not there -- where the old answer, RAX left as it
+was, read as a positive error. A kernel without `KVM_GUEST` finds a
+signature it does not know, and runs as before.
 
 ### Starting the others
 
@@ -3265,8 +3453,17 @@ Each local APIC has its timer: one-shot and periodic, counting down at a bus
 clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
 divide configuration a guest writes. A periodic timer that fell behind is
 owed its periods, handed over one at a time as the guest takes each, a
-second's worth at most, as the PIT's channel 0 is. There is no TSC-deadline
-mode, and CPUID says so.
+second's worth at most, as the PIT's channel 0 is. And TSC-deadline mode,
+which leaf 1 offers with the APIC wherever the host knows its TSC's rate: a
+write of IA32_TSC_DEADLINE (MSR 0x6E0) arms the timer to run out when the
+TSC reaches it -- the guest's TSC is the host's, so the deadline is turned
+into the host's time as it is written, at the rate the kernel measured --
+0 disarms it, it reads back until it runs out and 0 after, a count written
+meanwhile is ignored and the current count reads 0, and the mode's entry
+or exit disarms the timer, as the SDM has it (11.5.4.1); in the other modes
+the MSR reads 0 and takes nothing. Linux takes it over the one-shot count
+(`lapic-deadline`): a deadline is one write, and needs the timer's rate
+measured against nothing.
 
 A kernel measures the timer against the PIT before it trusts it
 (`calibrate_APIC_clock`), and while it measures it spins, `cpu_relax()` --
@@ -3370,8 +3567,8 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   IO-APIC; only the interrupts that follow go where the guest steers them
   -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
   Without one, those two reach the first CPU only.
-- **No TSC-deadline timer.** A kernel built with neither `X86_MPPARSE` nor
-  ACPI finds one CPU.
+- **Neither an MP table nor ACPI, one CPU.** A kernel built with neither
+  `X86_MPPARSE` nor ACPI finds one CPU.
 
 ### Gates
 
@@ -3388,7 +3585,11 @@ is the two CR0 writes the policy emulates.
   `smp: Brought up 1 node, N CPUs`, and the report's `N-1 started by the
   guest` -- then runs the VM phase with them: every CPU online, each taking
   its own local timer's interrupts, rescheduling IPIs between them, and
-  `hv list` naming the host CPU of each. `--disk`, `--disk --nvme-root`,
+  `hv list` naming the host CPU of each; the guest's timer the local APIC's
+  in TSC-deadline mode (`lapic-deadline`, with `tsc_deadline_timer` among
+  its CPU's flags), its CPUs one package -- and with `--cpus 2`, placed on
+  one core's two threads, that core of two threads sharing one last-level
+  cache, as its sysfs says. `--disk`, `--disk --nvme-root`,
   `--net` and `--attach` take `--cpus` too. The guest kernel needs what is
   above, plus POSIX timers for BusyBox's `ping`, which paces itself with
   `alarm()` (a tinyconfig leaves them out).
@@ -4366,12 +4567,28 @@ someone else's; then speed.
 #### Speed
 
 1. **The CPU a guest is shown**, above, is the largest lever on Intel.
-2. **The disk is one request at a time, machine-wide.** `Vfs::read_at` and
-   `write_within` hold the VFS's one lock across the whole synchronous ext2
-   read or write, and a guest's FLUSH is a sync of the whole filesystem
-   under it: every guest's disks and nos's own files go in single file.
-   Fix: the image's block map resolved under the lock, the I/O through the
-   block layer's asynchronous path, more than `IN_FLIGHT` (8) in flight.
+2. ~~**The disk is one request at a time, machine-wide.**~~ A guest's
+   image is held and read and written off the VFS's lock (`fs::image`):
+   its block map resolved under it, the blocks moved without it, a flush
+   the device's unless a write into a hole went through the VFS -- so one
+   guest's disk no longer waits behind another's, nor behind nos's own
+   files. What it was: `Vfs::read_at` and `write_within` held the VFS's one
+   lock across the whole synchronous ext2 read or write, and a guest's
+   FLUSH was a sync of the whole filesystem under it. On the AX41, nested
+   under KVM, with two guests at once each reading 4 KiB four at a time
+   off its own image: 1.30 and 1.35 s each where it was 1.86 and 1.69,
+   reads of 64 KiB 0.74 where they were 1.02, writes of 4 KiB 1.55 and 1.61
+   where they were 1.84 and 1.69; one guest alone the same, within the
+   spread. Left: each disk serves its requests one at a time, on its one
+   task. Four tasks a disk -- the image's reads side by side in lanes of
+   their own, its writes one at a time -- were tried and measured, and left
+   out: slower wherever they differed, two guests' four writers of 64 KiB
+   8.5 s each where they were 1.2, since four lanes' batches of up to 16
+   pieces take every one of the NVMe driver's 64 command IDs and the one
+   left waiting sleeps 50 microseconds at a time, and each extra task's
+   wakeup is an IPI that nested under KVM is an exit. A disk with many
+   requests in flight wants the block layer's asynchronous path from one
+   task (`Disk::submit`), its command IDs budgeted, not more tasks.
 3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
    work on legacy virtio; and a guest of one CPU has no local APIC, so no
    MSI-X -- six exits an interrupt through the 8259.
@@ -4421,8 +4638,10 @@ someone else's; then speed.
 
 #### Lifecycle, and stages 4 and 5
 
-- A host `poweroff` or `reboot` stops every guest as `rmmod` does
-  (`stop_all` with no grace): no power button is pressed.
+- ~~A host `poweroff` or `reboot` stops every guest as `rmmod` does
+  (`stop_all` with no grace): no power button is pressed.~~ Done: the
+  unload presses every button and gives the guests `stop_secs=`
+  ([ACPI](#acpi)).
 - ~~`finish` and `FileDisk::drop` wait for their tasks with no deadline: a
   disk task stuck in a read hangs `hv stop`, `rmmod` and the host's
   shutdown with nothing said.~~ Done for every join in the kernel

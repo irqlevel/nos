@@ -5,7 +5,8 @@
 //! [`vfs`] is the mount table, path resolution and the open files; under it
 //! [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and [`procfs`], each
 //! a [`vfs::FileSystem`] seeing one call at a time under the VFS lock, and
-//! each keeping what it holds in a [`vnode::Tree`]. [`rootfs`] is what the
+//! each keeping what it holds in a [`vnode::Tree`]. [`image`] is a file held
+//! as a guest's disk, read and written off that lock. [`rootfs`] is what the
 //! kernel command line asks to be mounted at boot. C++ and the modules come
 //! in through the C ABI at the bottom of this file and of [`files`], and
 //! never see a vnode: an open file is a handle to them, and a handle is
@@ -18,6 +19,7 @@ extern crate alloc;
 pub mod ext2;
 pub mod files;
 pub mod find;
+pub mod image;
 pub mod nanofs;
 pub mod paths;
 pub mod procfs;

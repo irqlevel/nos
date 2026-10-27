@@ -146,9 +146,12 @@ pub struct Uart {
     esc: Esc,
     col: u16,
     reply: Reply,
-    /// Set once the guest has sent its first cursor-position query, which a
-    /// shell does when it is at a prompt ready to read: until then, typed
-    /// input would be swallowed by the boot, so it is held back.
+    /// Set when the guest sends a cursor-position query, which a shell's
+    /// line editor does at each prompt, ready to read; cleared as a line of
+    /// typed input goes in whole (`line_taken`). Typed input is held back
+    /// while it is clear: before the first prompt the boot would swallow
+    /// it, and after a line, the next goes in at a prompt of its own rather
+    /// than typed ahead of the shell.
     prompt_seen: bool,
     /// The transmitter's interrupt is pending: the holding register is
     /// empty, and neither a read of IIR that reported it nor a byte written
@@ -311,10 +314,21 @@ impl Uart {
         self.reply.pos < self.reply.len
     }
 
-    /// Whether the guest has reached a shell prompt (asked where the cursor
-    /// is): only then is typed input handed over, so the boot does not eat it.
+    /// Whether the guest is at a shell prompt (asked where the cursor is,
+    /// since the last line went in): only then is typed input handed over,
+    /// so the boot does not eat it and a line is not typed ahead of the one
+    /// before it.
     pub fn prompt_seen(&self) -> bool {
         self.prompt_seen
+    }
+
+    /// A line of typed input gone in whole: the next waits for the prompt
+    /// the shell prints after it. Typed ahead, it went in while the shell
+    /// still ran the line before -- and `hv exec`, which waits for a prompt
+    /// printed after its line went in, took that line's prompt for its own
+    /// and came back with its answer cut short.
+    pub fn line_taken(&mut self) {
+        self.prompt_seen = false;
     }
 
     /// Follow what the guest writes as a terminal would: the column the

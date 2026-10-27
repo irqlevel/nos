@@ -84,6 +84,16 @@ pub mod time {
         NOW.store(later(NOW.load(Ordering::Relaxed), ns), Ordering::Relaxed);
     }
 
+    /// The cycle counter -- the TSC, a guest's as well -- as the fuzzer has
+    /// it: a GHz from the clock's start, so a count is nanoseconds; read
+    /// without the read costing time or counting as one.
+    pub fn cycle_counter() -> u64 {
+        NOW.load(Ordering::Relaxed)
+    }
+    pub fn cycle_counter_hz() -> Option<u64> {
+        Some(crate::consts::NS_PER_SEC)
+    }
+
 
     #[derive(Clone, Copy, Debug)]
     pub struct Duration(u64);
