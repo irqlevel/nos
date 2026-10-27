@@ -1115,12 +1115,16 @@ def web_server(root):
 def network(args):
     """The guests' network: two guests on the switch, each with its address
     from its port; each pings nos at 10.0.100.1 and the other guest, and
-    nos pings a guest back through hv0. Then their way out, NAT from nos's
-    own address: a page and a megabyte from a web server on the test
-    machine -- at 10.0.2.2, where QEMU's user network puts it -- and a ping
-    there; the DNS server nos was given, as ip= hands it to the guest; the
-    switch's DHCP server, asked by udhcpc; and with --internet, a name
-    looked up through that DNS server."""
+    nos pings a guest back through hv0. IPv6 between them: each has an
+    address in the prefix the switch's router advertisement gives, and its
+    link-local one, and reaches the other at both; one that asks for the
+    other's is told it is taken, and one that takes it anyway gets nothing
+    through. Then their way out, NAT from nos's own address: a page and a
+    megabyte from a web server on the test machine -- at 10.0.2.2, where
+    QEMU's user network puts it -- and a ping there; the DNS server nos was
+    given, as ip= hands it to the guest; the switch's DHCP server, asked by
+    udhcpc; and with --internet, a name looked up through that DNS
+    server."""
     import hashlib
     tmp = tempfile.mkdtemp(prefix="nos-hvnet-")
     www = os.path.join(tmp, "www")
@@ -1199,6 +1203,38 @@ def network(args):
     # nos's 8086 relayed to its httpd as its vm.toml says, with no hv
     # forward of the test's. After vm 0 has stopped, which leaves a core for
     # it.
+    # IPv6 between the guests, which nos does not speak: each has its
+    # link-local address and one in the switch's prefix, fd6e:6f73:64::/64,
+    # both its MAC's EUI-64 -- the prefix from the advertisement the switch
+    # answers a router solicitation with, which gives no route -- and reaches
+    # the other at both. A guest that asks for the other's address is told
+    # it is taken: its duplicate detection's solicitation goes through for
+    # the owner to answer. One that takes it anyway -- its duplicate
+    # detection off, which BusyBox's ip has no `nodad` for -- tells the link
+    # it is its (ndisc_notify's advertisement) and sends from it, and gets
+    # nothing through: the other hears no advertisement of its own address,
+    # its count of echoes asked of it is the same after as before, and the
+    # switch counts what it stopped against the guest that sent it.
+    ula = lambda vm: "fd6e:6f73:64::ff:fe00:64%02x" % (vm + 2)
+    lla = lambda vm: "fe80::ff:fe00:64%02x" % (vm + 2)
+    ready6 = lambda vm: x(vm, "for i in $(seq 90); do ip -6 addr show dev eth0 | grep '%s/64' | grep -qv tentative "
+                              "&& break; sleep 1; done; ip -6 addr show dev eth0; echo ready6" % ula(vm), 180)
+    echoes = x(1, "grep Icmp6InEchos /proc/net/snmp6")
+    sysctl6 = "for f in all/accept_dad eth0/accept_dad; do echo %d > /proc/sys/net/ipv6/conf/$f; done; " \
+              "echo %d > /proc/sys/net/ipv6/conf/eth0/ndisc_notify"
+    six = [ready6(0), ready6(1),
+           x(0, "ping -c 3 -W 5 %s" % ula(1), 60),
+           x(1, "ping -c 3 -W 5 %s%%eth0" % lla(0), 60),
+           x(0, "ip -6 route; echo routes6"),
+           x(0, "ip -6 addr add %s/64 dev eth0; sleep 5; ip -6 addr show dev eth0 | grep '%s'; "
+                "ip -6 addr del %s/64 dev eth0; echo dad-done" % (ula(1), ula(1), ula(1)), 60),
+           echoes,
+           x(0, (sysctl6 % (0, 1)) + "; ip -6 addr add %s/128 dev eth0; echo taken" % ula(1)),
+           x(0, "ping -c 3 -W 2 -I %s %s%%eth0; echo spoof-done" % (ula(1), lla(1)), 60),
+           x(0, "ip -6 addr del %s/128 dev eth0; " % ula(1) + (sysctl6 % (1, 0)) + "; echo given-back"),
+           echoes,
+           x(1, "dmesg | grep 'advertised ou[r] address'; echo heard-done"),
+           "hv list"]
     xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
     folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
               % (args.mem, cpus_opt(args), args.cmdline),
@@ -1220,7 +1256,7 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + folder + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + six + kept + way_out + folder + [RC_LAST]
     port = free_port()
     ssh_port = free_port()
     folder_port = free_port()
@@ -1258,6 +1294,44 @@ def network(args):
                 time.sleep(3)
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
+
+        # IPv6, each line by its own occurrence: "hv list" is run before
+        # them, and the count of echoes twice.
+        at6 = rc.index(six[0])
+        six_out = lambda i: output_of(secs, six[i], rc[:at6 + i].count(six[i])) or ""
+        line6 = lambda i: re.search(r"inet6 %s/64 scope global[^\n]*" % re.escape(ula(i)), six_out(i))
+        pt.check("each guest has its address in the switch's prefix, made from its MAC, from the switch's "
+                 "router advertisement",
+                 all("ready6" in six_out(i) and line6(i) is not None and "tentative" not in line6(i).group(0)
+                     for i in (0, 1)), six_out(0)[-600:] + six_out(1)[-600:])
+        pt.check("a guest pings the other over IPv6, at its address in the prefix", ok_ping(six_out(2)),
+                 six_out(2)[-600:])
+        pt.check("and the other pings it back at its link-local address", ok_ping(six_out(3)), six_out(3)[-600:])
+        routes = six_out(4)
+        pt.check("the advertisement puts the prefix on the link and gives no route",
+                 "routes6" in routes and re.search(r"fd6e:6f73:64::/64 dev eth0", routes) is not None
+                 and "default" not in routes, routes[-600:])
+        pt.check("a guest that asks for the other's address is told it is taken",
+                 "dad-done" in six_out(5) and "dadfailed" in six_out(5), six_out(5)[-600:])
+        before = re.search(r"Icmp6InEchos\s+(\d+)", six_out(6))
+        after = re.search(r"Icmp6InEchos\s+(\d+)", six_out(10))
+        pt.check("one that takes it anyway gets nothing through: the other was asked for no echo",
+                 "taken" in six_out(7) and "spoof-done" in six_out(8) and "given-back" in six_out(9)
+                 and "3 packets transmitted, 0 packets received" in six_out(8)
+                 and before is not None and after is not None and before.group(1) == after.group(1),
+                 six_out(6)[-200:] + six_out(7)[-400:] + six_out(8)[-600:] + six_out(10)[-200:])
+        pt.check("and the other heard nothing of it advertising its address",
+                 "heard-done" in six_out(11) and "advertised our address" not in six_out(11), six_out(11)[-600:])
+        listed = six_out(12)
+        vm0 = re.search(r"(?m)^vm 0 .*$", listed)
+        vm1 = re.search(r"(?m)^vm 1 .*$", listed)
+        spoofed = re.search(r"(\d+) frames it sent as another guest", vm0.group(0) if vm0 else "")
+        pt.check("hv list counts what it sent as the other against it, and nothing against the other; "
+                 "the advertisements and the addresses bound",
+                 spoofed is not None and int(spoofed.group(1)) >= 3
+                 and vm1 is not None and "as another" not in vm1.group(0)
+                 and re.search(r"IPv6 between the guests, in fd6e:6f73:64::/64: [1-9]\d* router advertisements, "
+                               r"[1-9]\d* addresses bound", listed) is not None, listed[-1200:])
 
         # Kept from the test machine and the metadata server, until let
         # through.

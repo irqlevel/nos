@@ -1294,8 +1294,13 @@ impl Vms {
         if let Some(s) = self.switch.lock().as_ref() {
             let (to_host, refused, dhcp, foreign) = s.host_counts();
             let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers, \
-                                   {} neither IPv4 nor ARP (dropped)",
+                                   {} of nothing the switch carries (dropped)",
                              net::dotted(net::HOST_IP), to_host, refused, dhcp, foreign);
+            let (advertised, bound) = s.ipv6_counts();
+            let g = |i: usize| u16::from_be_bytes([net::PREFIX6[i], net::PREFIX6[i + 1]]);
+            let _ = writeln!(out, "IPv6 between the guests, in {:x}:{:x}:{:x}::/64: {} router advertisements, {} \
+                                   addresses bound -- none to nos, which speaks none",
+                             g(0), g(2), g(4), advertised, bound);
             match s.nat_address() {
                 Some(ip) => {
                     let _ = writeln!(out, "the guests go out through NAT, from {} (nos's nat command)", net::dotted(ip));

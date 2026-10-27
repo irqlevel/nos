@@ -68,6 +68,40 @@ fn pseudo(src: &[u8], dst: &[u8], proto: u8, len: usize) -> u64 {
         + u64::from(proto) + len as u64
 }
 
+/// Where the checksum of the UDP datagram `f` carries is, if it carries
+/// one: over IPv4 past its header, or over IPv6 past its extension headers
+/// -- the model's own walk of them (RFC 8200, 4): hop-by-hop, routing and
+/// destination options eight bytes and eight more a unit, authentication
+/// eight and four more a unit, a first fragment's eight; eight of them at
+/// most.
+fn udp_sum_place(f: &[u8]) -> Option<usize> {
+    if f.len() < ETH {
+        return None;
+    }
+    match be16(f, 12) {
+        0x0800 if f.len() >= ETH + 20 => (f[ETH + 9] == 17).then(|| ETH + usize::from(f[ETH] & 0xF) * 4 + 6),
+        0x86DD if f.len() >= ETH + 40 => {
+            let (mut next, mut at) = (f[ETH + 6], ETH + 40);
+            for _ in 0..8 {
+                let len = match next {
+                    17 => return Some(at + 6),
+                    0 | 43 | 60 => 8 * (1 + usize::from(*f.get(at + 1)?)),
+                    51 => 4 * (2 + usize::from(*f.get(at + 1)?)),
+                    44 if f.len() >= at + 8 && be16(f, at + 2) >> 3 == 0 => 8,
+                    _ => return None,
+                };
+                if at + len > f.len() {
+                    return None;
+                }
+                next = f[at];
+                at += len;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// A checksum left at `start + offset` finished as the model has it: the
 /// sum from `start` on, folded and complemented, all ones for UDP's 0.
 pub fn finish(f: &mut [u8], start: usize, offset: usize) {
@@ -76,12 +110,21 @@ pub fn finish(f: &mut [u8], start: usize, offset: usize) {
         return;
     }
     let mut sum = !fold_sum(&f[start..], 0);
-    let udp = f.len() >= ETH + 20 && be16(f, 12) == 0x0800 && f[ETH + 9] == 17
-        && at == ETH + usize::from(f[ETH] & 0xF) * 4 + 6;
-    if sum == 0 && udp {
+    if sum == 0 && udp_sum_place(f) == Some(at) {
         sum = 0xFFFF;
     }
     put16(f, at, sum);
+}
+
+/// The checksum field at `at` set so that the sum from `start` comes to all
+/// ones, and the checksum finished to 0 -- which UDP's goes as all ones.
+pub fn sum_to_zero(f: &mut [u8], start: usize, at: usize) {
+    if start > at || at + 2 > f.len() || (at - start) % 2 != 0 {
+        return;
+    }
+    put16(f, at, 0);
+    let rest = fold_sum(&f[start..], 0);
+    put16(f, at, 0xFFFF - rest);
 }
 
 /// What the model says a send comes to: the frames that go out, or why none.
@@ -102,10 +145,8 @@ fn model(hdr: &TxHeader, frame: &[u8], offloads: Offloads) -> Result<Vec<Vec<u8>
                     return Err(Dropped::ChecksumPlace);
                 }
                 let mut sum = !fold_sum(&f[start..], 0);
-                /* UDP over IPv4, the place its checksum's: 0 goes as 0xFFFF. */
-                let udp = f.len() >= ETH + 20 && be16(&f, 12) == 0x0800 && f[ETH + 9] == 17
-                    && at == ETH + usize::from(f[ETH] & 0xF) * 4 + 6;
-                if sum == 0 && udp {
+                /* UDP, the place its checksum's: 0 goes as 0xFFFF. */
+                if sum == 0 && udp_sum_place(&f) == Some(at) {
                     sum = 0xFFFF;
                 }
                 put16(&mut f, at, sum);
@@ -174,6 +215,47 @@ pub fn cut(frame: &[u8], mss: usize) -> Result<Vec<Vec<u8>>, Dropped> {
         out.push(f);
     }
     Ok(out)
+}
+
+/// A TCP or UDP frame over IPv6 as a driver builds one: the extension
+/// headers `chain` names between its header and the transport's --
+/// hop-by-hop, routing and destination options of eight bytes, a first
+/// fragment's eight, authentication's twelve -- and `payload` bytes after
+/// it; and where the transport's header is.
+pub fn build6(r: &mut Input, proto: u8, chain: &[u8], payload: usize) -> (Vec<u8>, usize) {
+    let l4 = if proto == 17 { 8 } else { 20 };
+    let ext: usize = chain.iter().map(|&h| if h == 51 { 12 } else { 8 }).sum();
+    let mut f = vec![0u8; ETH + 40 + ext + l4 + payload];
+    let mut x = u64::from(r.u32()) | 1;
+    for b in f.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+    put16(&mut f, 12, 0x86DD);
+    f[ETH..ETH + 4].copy_from_slice(&[0x60, 0, 0, 0]);
+    put16(&mut f, ETH + 4, (ext + l4 + payload).min(0xFFFF) as u16);
+    f[ETH + 6] = chain.first().copied().unwrap_or(proto);
+    f[ETH + 7] = 64;
+    let mut at = ETH + 40;
+    for (i, &h) in chain.iter().enumerate() {
+        f[at] = chain.get(i + 1).copied().unwrap_or(proto);
+        f[at + 1] = u8::from(h == 51);
+        if h == 44 {
+            /* The first fragment, more to come */
+            f[at + 1] = 0;
+            put16(&mut f, at + 2, 1);
+        }
+        at += if h == 51 { 12 } else { 8 };
+    }
+    if proto == 17 {
+        put16(&mut f, at + 4, (l4 + payload).min(0xFFFF) as u16);
+    } else {
+        f[at + 12] = 0x50;
+        f[at + 13] = 0x18;
+    }
+    (f, at)
 }
 
 /// A TCP or UDP frame over IPv4 as a driver builds one: headers of the
@@ -270,17 +352,27 @@ fn one(r: &mut Input, offloads: Offloads, seg: &mut [u8; offload::MAX_FRAME]) {
                              csum_start: (ETH + ihl) as u16, csum_offset: 16 };
         (hdr, frame)
     } else if kind < 220 {
-        /* A frame whose checksum is left to the device: TCP or UDP, its
-         * place given right, mostly. */
+        /* A frame whose checksum is left to the device: TCP or UDP, over
+         * IPv4 or over IPv6 and its extension headers, its place given
+         * right, mostly -- and now and then its sum made to come to 0,
+         * which UDP's goes as all ones. */
         let proto = r.pick(&[6u8, 17]);
-        let ihl = if r.u8() < 230 { 20 } else { 24 };
         let payload = if r.u8() < 240 { r.below(1460) as usize } else { 1460 + r.below(200) as usize };
-        let frame = build(r, proto, ihl, 20, payload, 0x0800, 0x4000, 0x18, true);
+        let (mut frame, l4) = if r.u8() < 64 {
+            let chain: &[u8] = r.pick(&[&[][..], &[0], &[60], &[44], &[0, 44], &[51], &[43, 60]]);
+            build6(r, proto, chain, payload)
+        } else {
+            let ihl = if r.u8() < 230 { 20 } else { 24 };
+            (build(r, proto, ihl, 20, payload, 0x0800, 0x4000, 0x18, true), ETH + ihl)
+        };
         let (start, offset) = if r.u8() < 230 {
-            ((ETH + ihl) as u16, if proto == 17 { 6 } else { 16 })
+            (l4 as u16, if proto == 17 { 6 } else { 16 })
         } else {
             (r.u16(), r.u16())
         };
+        if r.u8() < 32 {
+            sum_to_zero(&mut frame, usize::from(start), usize::from(start) + usize::from(offset));
+        }
         let hdr = TxHeader { flags: if r.u8() < 240 { 1 } else { 0 }, gso_type: 0, hdr_len: 0, gso_size: 0,
                              csum_start: start, csum_offset: offset };
         (hdr, frame)
