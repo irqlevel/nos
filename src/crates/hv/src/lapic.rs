@@ -25,7 +25,9 @@
 //! register, the local vector table, the interrupt command register -- which
 //! hands the IPI it sends back to the caller, who alone can reach the other
 //! CPUs (`Ipi`) -- and the timer, counting down at a bus clock of 1 GHz off
-//! the host's clock. Delivery into the guest is the run loop's: it asks for
+//! the host's clock, or in TSC-deadline mode waiting for the TSC to reach
+//! what the guest wrote to IA32_TSC_DEADLINE, turned into the host's time by
+//! the caller. Delivery into the guest is the run loop's: it asks for
 //! the highest interrupt the priorities let through (`pending`), injects it,
 //! and says so (`acknowledge`).
 //!
@@ -34,6 +36,9 @@
 
 /// IA32_APIC_BASE.
 pub const MSR_APIC_BASE: u32 = 0x1B;
+/// IA32_TSC_DEADLINE: the timer's deadline in TSC-deadline mode -- an MSR
+/// of its own, outside the x2APIC's range and there in xAPIC mode too.
+pub const MSR_TSC_DEADLINE: u32 = 0x6E0;
 /// The x2APIC's registers: MSR 0x800 plus the xAPIC offset over 16.
 pub const MSR_X2APIC_FIRST: u32 = 0x800;
 pub const MSR_X2APIC_LAST: u32 = 0x8FF;
@@ -98,17 +103,29 @@ const LVT_DELIVERY_SHIFT: u32 = 8;
 const LVT_DELIVERY_MASK: u32 = 0x7 << LVT_DELIVERY_SHIFT;
 const DELIVERY_NMI: u32 = 0x4 << LVT_DELIVERY_SHIFT;
 const DELIVERY_EXTINT: u32 = 0x7 << LVT_DELIVERY_SHIFT;
-/// The timer's mode, bits 18:17: one-shot (0) or periodic (1). The third,
-/// TSC-deadline, is not offered (CPUID says so), and the bit is not
-/// writable -- as on a CPU without it.
-const TIMER_PERIODIC: u32 = 1 << 17;
+/// The timer's mode, bits 18:17: one-shot (0), periodic (1) or
+/// TSC-deadline (2); the fourth is reserved, and runs as one-shot, as KVM
+/// has it.
+const TIMER_MODE_SHIFT: u32 = 17;
+const TIMER_MODE_MASK: u32 = 0b11 << TIMER_MODE_SHIFT;
+const TIMER_PERIODIC: u32 = 0b01 << TIMER_MODE_SHIFT;
+const TIMER_DEADLINE: u32 = 0b10 << TIMER_MODE_SHIFT;
 
-/// What of each entry a write sets, by entry -- KVM's masks, less the
-/// TSC-deadline mode: the vector, the delivery mode where there is one, the
-/// LINT pins' polarity and trigger mode, the mask, the timer's mode. The
-/// delivery-status and remote-IRR bits are the APIC's to report.
+/// What the timer counts in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimerMode {
+    OneShot,
+    Periodic,
+    /// The TSC, to the deadline written to IA32_TSC_DEADLINE.
+    Deadline,
+}
+
+/// What of each entry a write sets, by entry -- KVM's masks: the vector,
+/// the delivery mode where there is one, the LINT pins' polarity and
+/// trigger mode, the mask, the timer's mode. The delivery-status and
+/// remote-IRR bits are the APIC's to report.
 const LVT_WRITABLE: [u32; LVT_ENTRIES] = [
-    LVT_VECTOR | LVT_MASKED | TIMER_PERIODIC,
+    LVT_VECTOR | LVT_MASKED | TIMER_MODE_MASK,
     LVT_VECTOR | LVT_DELIVERY_MASK | LVT_MASKED,
     LVT_VECTOR | LVT_DELIVERY_MASK | LVT_MASKED,
     LVT_VECTOR | LVT_DELIVERY_MASK | (1 << 13) | (1 << 15) | LVT_MASKED,
@@ -462,6 +479,9 @@ pub struct Lapic {
     icr: u64,
     lvt: [u32; LVT_ENTRIES],
     timer: Timer,
+    /// IA32_TSC_DEADLINE as written, in TSC-deadline mode: the deadline
+    /// armed, 0 when there is none -- run out, or never written.
+    tsc_deadline: u64,
     /// xAPIC mode's logical ID (bits 31:24) and destination format, as
     /// written; x2APIC mode's logical ID is its ID's, and it has no format.
     ldr: u32,
@@ -490,6 +510,7 @@ impl Lapic {
             icr: 0,
             lvt: [LVT_MASKED; LVT_ENTRIES],
             timer: Timer { initial: 0, divide: 0, loaded_ns: 0, deadline: None },
+            tsc_deadline: 0,
             ldr: 0,
             dfr: DFR_RESET,
         };
@@ -704,12 +725,41 @@ impl Lapic {
         }
     }
 
+    /// The timer's mode, as its entry says.
+    fn timer_mode(&self) -> TimerMode {
+        match self.lvt[LVT_TIMER] & TIMER_MODE_MASK {
+            TIMER_PERIODIC => TimerMode::Periodic,
+            TIMER_DEADLINE => TimerMode::Deadline,
+            _ => TimerMode::OneShot,
+        }
+    }
+
+    /// IA32_TSC_DEADLINE as the guest reads it: the deadline armed in
+    /// TSC-deadline mode, 0 once it has run out -- and 0 in the other modes,
+    /// as on a CPU.
+    pub fn tsc_deadline(&self) -> u64 {
+        if self.timer_mode() == TimerMode::Deadline { self.tsc_deadline } else { 0 }
+    }
+
+    /// A write of IA32_TSC_DEADLINE: in TSC-deadline mode the timer armed
+    /// to run out at `at_ns`, host nanoseconds -- when the TSC reaches
+    /// `value`, as the caller reckons it -- or with 0 disarmed; in the other
+    /// modes nothing, as on a CPU.
+    pub fn set_tsc_deadline(&mut self, value: u64, at_ns: u64) {
+        if self.timer_mode() != TimerMode::Deadline {
+            return;
+        }
+        self.tsc_deadline = value;
+        self.timer.deadline = (value != 0).then_some(at_ns);
+    }
+
     /// Whether the timer has run out by `now`: its interrupt into the
     /// request register, unless its entry is masked, and in periodic mode
-    /// the next period begun. A periodic timer that fell behind is owed its
-    /// periods, handed over one at a time and each only once the last is no
-    /// longer waiting in the request register -- a second's worth at most.
-    /// True when an interrupt was requested.
+    /// the next period begun -- in TSC-deadline mode, the deadline gone,
+    /// IA32_TSC_DEADLINE reading 0. A periodic timer that fell behind is
+    /// owed its periods, handed over one at a time and each only once the
+    /// last is no longer waiting in the request register -- a second's worth
+    /// at most. True when an interrupt was requested.
     pub fn timer(&mut self, now: u64) -> bool {
         let Some(deadline) = self.timer.deadline else { return false };
         if now < deadline {
@@ -717,7 +767,7 @@ impl Lapic {
         }
         let lvt = self.lvt[LVT_TIMER];
         let vector = lvt as u8;
-        let periodic = lvt & TIMER_PERIODIC != 0;
+        let periodic = self.timer_mode() == TimerMode::Periodic;
         if periodic && test_bit(&self.irr, vector) {
             /* Still waiting to be taken: the next period is owed, and
              * delivered once it has been. */
@@ -735,6 +785,9 @@ impl Lapic {
         } else {
             None
         };
+        if self.timer_mode() == TimerMode::Deadline {
+            self.tsc_deadline = 0;
+        }
         if lvt & LVT_MASKED != 0 {
             return false;
         }
@@ -752,22 +805,25 @@ impl Lapic {
     /// time, for as long as the guest stayed so (hv-fuzz found it).
     pub fn next_timer_ns(&self) -> Option<u64> {
         let lvt = self.lvt[LVT_TIMER];
-        if lvt & LVT_MASKED != 0 || (lvt & TIMER_PERIODIC != 0 && test_bit(&self.irr, lvt as u8)) {
+        if lvt & LVT_MASKED != 0
+            || (self.timer_mode() == TimerMode::Periodic && test_bit(&self.irr, lvt as u8))
+        {
             return None;
         }
         self.timer.deadline
     }
 
     /// The count as it reads now: counting down from the last one written,
-    /// 0 once a one-shot has run out, and round again for a periodic one.
+    /// 0 once a one-shot has run out, and round again for a periodic one --
+    /// and 0 in TSC-deadline mode, which counts none.
     fn current_count(&self, now: u64) -> u32 {
         let t = &self.timer;
-        if t.initial == 0 {
+        if t.initial == 0 || self.timer_mode() == TimerMode::Deadline {
             return 0;
         }
         let ticks = now.saturating_sub(t.loaded_ns) / t.ns_per_tick();
         let initial = u64::from(t.initial);
-        if self.lvt[LVT_TIMER] & TIMER_PERIODIC != 0 {
+        if self.timer_mode() == TimerMode::Periodic {
             (initial - ticks % initial) as u32
         } else if ticks >= initial {
             0
@@ -937,13 +993,23 @@ impl Lapic {
                 if !self.software_enabled() {
                     entry |= LVT_MASKED;
                 }
+                let was_deadline = self.timer_mode() == TimerMode::Deadline;
                 self.lvt[i] = entry;
+                /* Into TSC-deadline mode or out of it, the timer is
+                 * disarmed: no count, no deadline (SDM 11.5.4.1). */
+                if i == LVT_TIMER && was_deadline != (self.timer_mode() == TimerMode::Deadline) {
+                    self.timer.initial = 0;
+                    self.timer.deadline = None;
+                    self.tsc_deadline = 0;
+                }
             }
+            /* In TSC-deadline mode a count written is ignored. */
+            REG_TIMER_INITIAL if self.timer_mode() == TimerMode::Deadline => {}
             REG_TIMER_INITIAL => {
                 self.timer.initial = v;
                 self.timer.loaded_ns = now;
                 self.timer.deadline = (v != 0).then(|| {
-                    let span = if self.lvt[LVT_TIMER] & TIMER_PERIODIC != 0 {
+                    let span = if self.timer_mode() == TimerMode::Periodic {
                         self.timer.span_ns().max(MIN_PERIOD_NS)
                     } else {
                         self.timer.span_ns()

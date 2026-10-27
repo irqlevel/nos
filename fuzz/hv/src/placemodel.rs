@@ -139,6 +139,27 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
     };
 
     let mine = p.vcpus.iter().fold(0u64, |m, &c| m | bit(c));
+    /* What the guest is told of where its CPUs sit: threads of a core in
+     * twos exactly where each host core it has holds the pair 2k and 2k+1
+     * of its CPUs, or its last alone; one cache exactly where all of them
+     * are on the first's. */
+    let mut by_core: Vec<(u32, Vec<usize>)> = Vec::new();
+    for (i, &cpu) in p.vcpus.iter().enumerate() {
+        match by_core.iter_mut().find(|(core, _)| *core == topo.core(cpu)) {
+            Some((_, ixs)) => ixs.push(i),
+            None => by_core.push((topo.core(cpu), vec![i])),
+        }
+    }
+    let count = p.vcpus.len();
+    let twos = count > 1 && by_core.iter().all(|(_, ixs)| match ixs.as_slice() {
+        [a, b] => a % 2 == 0 && *b == a + 1,
+        [a] => count % 2 == 1 && *a == count - 1,
+        _ => false,
+    });
+    let one_cache = p.vcpus.iter().all(|&cpu| topo.llc(cpu) == topo.llc(p.vcpus[0]));
+    invariant!(p.shape.cpus() as usize == count && (p.shape.smt_shift() == 1) == twos
+                   && p.shape.threads() == 1 << p.shape.smt_shift() && p.shape.llc_shared() == one_cache,
+               "vCPUs {:?} told {:?}: threads in twos {}, one cache {}", p.vcpus, p.shape, twos, one_cache);
     invariant!(p.vcpus.len() as u32 == n && mine.count_ones() == n,
                "{} cpus asked for and given {:?}: not that many, each its own", n, p.vcpus);
     invariant!(mine & !enabled == 0, "vCPUs {:?} on CPUs the extension is not on for ({:#x})", p.vcpus, enabled);

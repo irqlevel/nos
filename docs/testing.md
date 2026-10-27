@@ -603,7 +603,12 @@ is taken, and its disks' task on a spare thread of its own cores, then on a
 core no guest has, then beside a vCPU of its own. Five mutants of the rule
 -- later cores not checked, one vCPU a core, the disks' task on a held core,
 `cpu=`'s core not checked, the disks' task elsewhere before a spare thread
-of its own -- each failed within two inputs.
+of its own -- each failed within two inputs. And what the guest is told of
+where its CPUs sit (`Shape`): threads of a core in twos exactly where each
+host core it has holds its CPUs 2k and 2k+1, or its last alone; one cache
+exactly where all of them are on the first's -- the model groups them by
+core, where the code compares them two by two; a cache always shared, and
+pairs not checked both ways, each failed it.
 `policy` holds the CPUID and MSR policy to a model of its own
 (`fuzz/hv/src/policymodel.rs`), over a host CPU made up an input -- which
 vendor's, the tops of its two ranges of leaves, below the policy's and
@@ -615,7 +620,24 @@ it was, a taken one read back -- and every other refused both ways; and a
 table, from the manuals, of what each CPUID bit promises the guest that sees
 it, the MSR it will use or the bit of EFER it will set, which must then be
 answered. IBPB offered with PRED_CMD refused, or AutoIBRS with its EFER bit,
-is a finding at the first input. The model is written from the manuals and
+is a finding at the first input. Where the guest's CPUs sit is made up too
+-- a host's threads, with SMT or not and its caches shared this widely,
+given to a guest of up to 64 CPUs, in order or anywhere -- and every
+topology leaf held to what a package of that shape answers: leaf 1's count
+of APIC IDs and HTT, the sharing and core counts of leaf 4 and of AMD's
+0x8000001D at each level, the last level the host's highest before the
+list's end, the x2APIC topology leaf level by level, and AMD's 0x80000008
+and 0x8000001E; and the TSC-deadline timer exactly with the APIC. Six
+mutants each failed it: the SMT level's shift the package's, the last level
+missed by one, 0x8000001E's threads and 0x80000008's CPUs each off by one,
+and HTT always on. `lapic` holds the TSC-deadline mode to the SDM, the mode
+read as the guest reads it, in the timer's entry: a deadline read back in
+that mode and 0 once it has run out, the MSR on the way into the mode 0,
+the current count 0 in it, and in any other mode the MSR reading 0 and its
+write moving nothing -- a deadline kept after it ran out and one armed in
+another mode each failed it. Two mutants pass, and are no change: the
+MSR's read and the count's each read 0 outside the mode by a check of
+their own, where nothing else ever lets them be anything else. The model is written from the manuals and
 not from the policy, so a leaf, a bit or an MSR the policy comes to offer is
 a finding until the model is told of it too; nine mutants of the policy --
 the old swallowing of every MSR, every leaf passed through, the tops not

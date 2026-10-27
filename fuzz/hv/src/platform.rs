@@ -1209,6 +1209,14 @@ impl Script {
                                 self.plan().push_back(Step::Out { port: 0x40, size: 1, value: 0x2E });
                                 self.plan().push_back(Step::Out { port: 0x21, size: 1, value: 0xFA });
                             }
+                            1 if self.apic => {
+                                /* The TSC-deadline timer, a deadline a
+                                 * moment from now in the TSC's count. */
+                                self.apic_write(0x0F, 0x1FF);
+                                self.apic_write(0x32, 0x4_0000 | 0xEC);
+                                let value = time::peek().saturating_add(r.pick(&[0, 10_000, 100_000, 1_000_000]));
+                                self.plan().push_back(Step::Wrmsr { msr: 0x6E0, value });
+                            }
                             _ if self.apic => {
                                 self.apic_write(0x0F, 0x1FF);
                                 self.apic_write(0x32, 0x20000 | 0xEC);
