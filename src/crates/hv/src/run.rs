@@ -71,6 +71,7 @@ use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pm;
+use crate::devices::pvpanic::{self, PvPanic};
 use crate::devices::virtio::Raise;
 use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
@@ -205,6 +206,10 @@ pub enum Stop {
     /// It turned itself off: S5's sleep type written to its PM1 control
     /// register with the sleep enable bit -- ACPI's soft off, a `poweroff`.
     PowerOff { rip: u64 },
+    /// Its kernel panicked, and said so to its panic device
+    /// (`devices::pvpanic`) at `rip`: stopped there rather than left to spin
+    /// in `panic` on a host CPU.
+    Panicked { rip: u64 },
     /// An MMIO access of a device's that could not be performed for it:
     /// the instruction at `rip` that reached `gpa`, as far as it was read
     /// (`bytes`), and why (`error`).
@@ -230,10 +235,11 @@ pub enum Stop {
 }
 
 impl Stop {
-    /// Whether the guest reset itself, one way or another: what a guest
-    /// that is to be booted again when it reboots is booted again after.
+    /// Whether the guest reset itself, one way or another -- or panicked,
+    /// which with `panic=` it would have rebooted after: what a guest that
+    /// is to be booted again when it reboots is booted again after.
     pub fn is_reset(&self) -> bool {
-        matches!(self, Stop::Reset { .. } | Stop::Shutdown { .. } | Stop::Init { .. })
+        matches!(self, Stop::Reset { .. } | Stop::Shutdown { .. } | Stop::Init { .. } | Stop::Panicked { .. })
     }
 }
 
@@ -579,6 +585,7 @@ struct Platform {
     rtc: Rtc,
     pic: Pic,
     pm: Pm,
+    pvpanic: PvPanic,
     /// The IO-APIC, for a guest given one.
     ioapic: Option<IoApic>,
     pci: PciBus,
@@ -779,6 +786,7 @@ impl LinuxGuest {
             rtc: Rtc::new(),
             pic: Pic::new(),
             pm: Pm::new(time::boot_time_ns()),
+            pvpanic: PvPanic::default(),
             ioapic: ioapic.then(|| IoApic::new(cpus as u8)),
             pci: PciBus::new()?,
             pci_devs,
@@ -1092,6 +1100,12 @@ impl LinuxGuest {
         let len = smbios::build(&machine, &mut buf[..smbios::MAX_BYTES]).ok_or(Error::NoMemory)?;
         self.memory.write(smbios::AREA, &buf[..len])?;
         Ok(linux::Firmware { rsdp: acpi::AREA, start: acpi::AREA, end: acpi::AREA_END })
+    }
+
+    /// How many times its kernel said it panicked with a crash kernel
+    /// loaded, which it then booted (`devices::pvpanic`).
+    pub fn crash_kernels(&self) -> u32 {
+        self.platform.lock().pvpanic.crash_loaded
     }
 
     /// What the guest's OS did with its ACPI.
@@ -2243,6 +2257,17 @@ impl LinuxGuest {
                     p.pic.write(io.port, byte);
                 }
                 gc.counts.port_out += 1;
+            }
+        } else if PvPanic::owns(io.port) && io.size == 1 {
+            if io.input {
+                let value = p.pvpanic.read();
+                set_in(v.save_mut(), io.size, u32::from(value));
+                gc.counts.port_in += 1;
+            } else {
+                gc.counts.port_out += 1;
+                if p.pvpanic.write(v.save().rax as u8) == Some(pvpanic::Event::Panicked) {
+                    return Some(Stop::Panicked { rip: v.save().rip });
+                }
             }
         } else if Pm::owns(io.port) {
             let now = time::boot_time_ns();

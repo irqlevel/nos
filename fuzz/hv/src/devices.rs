@@ -17,6 +17,8 @@ pub mod pic;
 pub mod pit;
 #[path = "../../../src/crates/hv/src/devices/pm.rs"]
 pub mod pm;
+#[path = "../../../src/crates/hv/src/devices/pvpanic.rs"]
+pub mod pvpanic;
 #[path = "../../../src/crates/hv/src/devices/rtc.rs"]
 pub mod rtc;
 #[path = "../../../src/crates/hv/src/devices/uart.rs"]
