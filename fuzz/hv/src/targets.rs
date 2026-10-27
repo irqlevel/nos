@@ -37,6 +37,7 @@ pub static ALL: &[Target] = &[
     Target { name: "net", run: net_target, max_len: 8192 },
     Target { name: "offload", run: crate::offloadmodel::offload_target, max_len: 4096 },
     Target { name: "netrx", run: crate::netrx::netrx_target, max_len: 2048 },
+    Target { name: "virtq", run: crate::virtq::virtq_target, max_len: 4096 },
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
@@ -829,6 +830,11 @@ impl DiskState {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Requests handed over and not yet taken back.
+    pub fn queued(&self) -> usize {
+        self.queue.len()
     }
 }
 

@@ -1638,6 +1638,41 @@ streams across its readable and writable buffers, whatever the layout; its
 sector range is checked against the disk's size, and its size against what
 the driver was told a request may carry.
 
+**Each side asks for the other's notifications only when it wants them**
+(EVENT_IDX, `virtio::F_EVENT_IDX`, which the disks and the NICs offer).
+Without it every chain the driver makes available is a notify -- an exit --
+and every chain given back an interrupt, unless the driver's one flag says
+it wants none at all. With it each side says, in a word past its own ring,
+at which entry it wants to hear of the other's work: the driver at which
+used entry it wants an interrupt (`used_event`), the device at which
+available entry it wants a notify (`avail_event`). The device asks only
+when it stops for want of chains: a disk once it has taken every request
+there was -- with every one of its eight buffers out it asks for none, a
+request coming back has it look -- a NIC's transmit queue once it has sent
+every frame, its receive queue only when a frame waits for buffers, so the
+guest's refills of its receive ring cost no exit at all, the next frame
+taking what they posted. An ask is the index the device has seen, written;
+a full fence; and the index read again (`Queue::ask_kick`): a chain made
+available between the device's last look and its ask, by a driver on
+another CPU that saw no ask yet, has no notify coming for it and is taken
+then. A pass that ends at its bound (`more`) is the first CPU's round to go
+on with at once -- that CPU rung, if the pass ran on another's -- since a
+driver that notifies only when asked gives the device no other reason to
+come back. The interrupt is the driver's to place: the device raises one
+when the used index has passed the driver's word since it last decided
+(`wants_interrupt`), and Linux puts its word three quarters of the way
+through what it has out for its transmit queue, and leaves it behind while
+NAPI polls. Each device's notifies and interrupts are in the report (`hv
+stop`). Under TCG, Linux 6.18 through `hv-linux-test.py --net` -- the same
+build with EVENT_IDX not offered as the control -- refilled its receive ring
+with 1 notify where it had 35, and took 128 receive interrupts where it had
+216 (107 where 161, with two CPUs); its sends were a notify a frame either
+way, each finding the ring drained. Its disk (`--disk`) made 373 notifies
+where 398, and 367 where 408 -- that workload seldom has more than eight
+requests out, which is where the disk's are spared. The hv fuzzer's `virtq`
+target holds both sides to a Linux driver's every request served
+([Testing](testing.md)).
+
 **The disk works beside the guest.** A request used to be served before the
 notify that made it available returned, the vCPU waiting for its disk -- and
 on the AX41 a guest writing back what `apt-get update` had fetched stalled
@@ -4589,9 +4624,12 @@ someone else's; then speed.
    wakeup is an IPI that nested under KVM is an exit. A disk with many
    requests in flight wants the block layer's asynchronous path from one
    task (`Disk::submit`), its command IDs budgeted, not more tasks.
-3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
-   work on legacy virtio; and a guest of one CPU has no local APIC, so no
-   MSI-X -- six exits an interrupt through the 8259.
+3. **Fewer exits a request.** EVENT_IDX done ([A disk](#a-disk)): the
+   receive ring's refills no longer notify, and a disk with every buffer
+   out takes no notify it cannot act on. Left: NO_NOTIFY, the flag's way of
+   the same for a driver without EVENT_IDX, which every Linux takes; and a
+   guest of one CPU has no local APIC, so no MSI-X -- six exits an
+   interrupt through the 8259.
 4. ~~**The EX44's E-cores first, with shared cores.**~~ Done: `hv::topology`
    asks each CPU of a hybrid part which kind of core it is (leaf 0x1A), and
    placement puts a guest's vCPUs on one kind where one has room for them

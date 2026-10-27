@@ -98,7 +98,11 @@ const F_HOST_TSO4: u32 = 1 << 11;
 const F_MRG_RXBUF: u32 = 1 << 15;
 const F_STATUS: u32 = 1 << 16;
 /// What every NIC here offers, and the offloads on top (`set_offloads`).
-const BASE_FEATURES: u32 = F_MAC | F_STATUS;
+/// EVENT_IDX among the first: a kick asked for on the transmit queue when
+/// the device has sent every chain there was, and on the receive queue only
+/// when a frame waits for buffers -- the driver's refills otherwise cost no
+/// exit, the next frame taking what they posted.
+const BASE_FEATURES: u32 = F_MAC | F_STATUS | virtio::F_EVENT_IDX;
 const OFFLOADS: u32 = F_CSUM | F_GUEST_CSUM | F_GUEST_TSO4 | F_HOST_TSO4 | F_MRG_RXBUF;
 const LINK_UP: u16 = 1;
 
@@ -136,6 +140,12 @@ pub struct Stats {
     /// Sent frames that were not frames: too short, or longer than was
     /// offered.
     pub dropped: u64,
+    /// The driver's notifies, to send and to receive -- each an exit -- and
+    /// the interrupts raised for each queue: what EVENT_IDX spares.
+    pub tx_notifies: u64,
+    pub rx_notifies: u64,
+    pub tx_interrupts: u64,
+    pub rx_interrupts: u64,
 }
 
 pub struct Net {
@@ -256,6 +266,13 @@ impl Net {
         self.rx_quiet_until
     }
 
+    /// Whether a transmit pass ended at its bound: the next round goes on
+    /// with it, and is due at once -- a driver that kicks only when asked
+    /// (EVENT_IDX) gives the device no other reason to come back.
+    pub fn more(&self) -> bool {
+        self.tx_more
+    }
+
     fn config(&self) -> [u8; CFG_BYTES] {
         let mut c = [0u8; CFG_BYTES];
         c[CFG_MAC..CFG_MAC + 6].copy_from_slice(&self.mac);
@@ -301,9 +318,15 @@ impl Net {
             return Raise::default();
         }
         match self.transport.write(offset, size, value, mem, now) {
-            Asked::Notify(TX_QUEUE) => self.send(mem),
+            Asked::Notify(TX_QUEUE) => {
+                self.stats.tx_notifies += 1;
+                self.send(mem)
+            }
             /* Buffers posted for receiving: whatever is waiting can go. */
-            Asked::Notify(RX_QUEUE) => self.deliver(mem, now),
+            Asked::Notify(RX_QUEUE) => {
+                self.stats.rx_notifies += 1;
+                self.deliver(mem, now)
+            }
             Asked::Reset => {
                 self.broken = None;
                 self.held = None;
@@ -342,7 +365,16 @@ impl Net {
                 }
                 Ok(None) => {
                     self.segs = segs;
-                    break;
+                    /* Every chain there was sent: a kick asked for the
+                     * next, and what came before the ask sent now. */
+                    match self.transport.queue(TX_QUEUE).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -356,7 +388,11 @@ impl Net {
             }
         }
         let wants = sent && self.transport.queue(TX_QUEUE).map_or(false, |q| q.wants_interrupt(mem));
-        if wants { self.transport.interrupt(TX_QUEUE) } else { Raise::default() }
+        if !wants {
+            return Raise::default();
+        }
+        self.stats.tx_interrupts += 1;
+        self.transport.interrupt(TX_QUEUE)
     }
 
     /// One chain the driver sent: the header, then the frame -- or a send
@@ -486,9 +522,20 @@ impl Net {
                     }
                 }
                 Ok(Taken::Wait) => {
-                    /* Not buffers enough yet: the frame waits here. */
+                    /* Not buffers enough yet: the frame waits here, a kick
+                     * asked for the driver's next -- and what it posted
+                     * before the ask looked at now, the pass's bound
+                     * bounding the looks. */
                     self.held = Some((len, rx));
-                    break;
+                    match self.transport.queue(RX_QUEUE).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.held = None;
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
                 }
                 Ok(Taken::Dropped) => {
                     self.held = None;
@@ -569,6 +616,7 @@ impl Net {
             self.rx_quiet_until = now.saturating_add(self.rx_quiet_ns);
             self.backend.quiet_until(self.rx_quiet_until);
         }
+        self.stats.rx_interrupts += 1;
         self.transport.interrupt(RX_QUEUE)
     }
 

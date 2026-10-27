@@ -122,6 +122,7 @@ mod platform;
 mod policymodel;
 mod recycle;
 mod targets;
+mod virtq;
 
 #[global_allocator]
 static ALLOCATOR: recycle::Recycling = recycle::Recycling;
@@ -328,6 +329,7 @@ fn main() {
         placemodel::report();
         offloadmodel::report();
         netrx::report();
+        virtq::report();
         targets::report();
     }
     if findings.is_empty() {

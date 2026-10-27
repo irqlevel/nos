@@ -166,6 +166,11 @@ RC_LOG = "dmesg hv:"
 UNLOAD_SECS = 2
 
 
+# VIRTIO_RING_F_EVENT_IDX: its place in a virtio device's `features` in
+# sysfs, a character a bit from bit 0.
+EVENT_IDX = 29
+
+
 def interrupt_check(args, text, queue):
     """How a guest's virtio device interrupts it, from its /proc/interrupts:
     with a local APIC -- more than one CPU -- by MSI-X, a vector a queue,
@@ -997,7 +1002,11 @@ def disk(args):
     trim = [x("mount /dev/vda /mnt"),
             x("rm -f /mnt/r1 /mnt/r2 /mnt/r3 /mnt/r4 /mnt/big; sync", 120),
             x("fstrim -v /mnt", 300),
-            x("umount /mnt", 120)]
+            x("umount /mnt", 120),
+            # What its driver took of the device's features, a character a
+            # bit: EVENT_IDX (29) among them, each side asking for the
+            # other's notifications only when it wants them.
+            x("cat /sys/block/vda/device/features")]
     rc += trim
     handler = "/etc/acpi/PWRF/00000080"
     if args.acpi:
@@ -1043,6 +1052,9 @@ def disk(args):
         m = re.search(r"/mnt: (\d+) bytes trimmed", trimmed)
         pt.check("the guest's free space trimmed: discards the disk took", m is not None and int(m.group(1)) > 0,
                  trimmed[-600:])
+        took = output_of(secs, trim[4], 0) or ""
+        bits = re.search(r"(?m)^([01]{32,})\s*$", took)
+        pt.check("its driver took EVENT_IDX", bits is not None and bits.group(1)[EVENT_IDX] == "1", took[-300:])
         # The image -- held while the guest ran -- says as it is let go of
         # what it read and wrote off the VFS's lock, and what through it:
         # the guest's reads and its writes over blocks the image had, off
@@ -1260,7 +1272,9 @@ def network(args):
            x(0, "ip -6 addr del %s/128 dev eth0; " % ula(1) + (sysctl6 % (1, 0)) + "; echo given-back"),
            echoes,
            x(1, "dmesg | grep 'advertised ou[r] address'; echo heard-done"),
-           "hv list"]
+           "hv list",
+           # What its driver took of the NIC's features: EVENT_IDX (29).
+           x(0, "cat /sys/class/net/eth0/device/features")]
     xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
     folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
               % (args.mem, cpus_opt(args), args.cmdline),
@@ -1348,6 +1362,10 @@ def network(args):
                  six_out(6)[-200:] + six_out(7)[-400:] + six_out(8)[-600:] + six_out(10)[-200:])
         pt.check("and the other heard nothing of it advertising its address",
                  "heard-done" in six_out(11) and "advertised our address" not in six_out(11), six_out(11)[-600:])
+        took = six_out(13)
+        bits = re.search(r"(?m)^([01]{32,})\s*$", took)
+        pt.check("the guest's virtio-net driver took EVENT_IDX", bits is not None and bits.group(1)[EVENT_IDX] == "1",
+                 took[-300:])
         listed = six_out(12)
         vm0 = re.search(r"(?m)^vm 0 .*$", listed)
         vm1 = re.search(r"(?m)^vm 1 .*$", listed)
