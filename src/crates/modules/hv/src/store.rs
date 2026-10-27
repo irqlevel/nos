@@ -327,6 +327,14 @@ fn summary(c: &Config, out: &mut Output) {
                 let _ = write!(out, " port {} ({})", p, net::dotted(net::port_ip(p as usize)));
             }
         }
+        match &o.network {
+            Some(network) => {
+                let _ = write!(out, " on {}", network);
+            }
+            None => {
+                let _ = write!(out, " alone");
+            }
+        }
     }
     for (host, guest) in &o.forwards {
         let _ = write!(out, "  forward {}:{}", host, guest);

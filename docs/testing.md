@@ -682,8 +682,12 @@ MSR on Intel, and IBPB and AutoIBRS offered with the model told -- each
 failed within its first 1,600 inputs.
 The guests' network has three: `switch`, guests on its ports and `hv0`
 sending each other frames of every kind -- as themselves and as each other
--- held to a model of where each must go and what each must count, a
-guest's bursts among them, past its share of `hv0`'s backlog (the backlog
+-- held to a model of where each must go and what each must count, the
+ports on two networks and alone, and now and then one handed to another VM
+just before one of the locks a guest's send takes (a hook in the stand-in
+spin locks, `sync::before_lock`: the moment another CPU's change lands in,
+which one thread never makes otherwise), every guest then held to what
+some order of the hand-over and the send gives; a guest's bursts among them, past its share of `hv0`'s backlog (the backlog
 over the ports in use, counted afresh at each of the stack's passes) and
 past its rate to every port, the clock moved on now and then for the rate
 to come back, and ports whose NIC holds its receive interrupts, a frame for

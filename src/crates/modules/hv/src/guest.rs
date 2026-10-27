@@ -96,6 +96,9 @@ pub struct Spec {
     /// `port=`: the port of the switch to claim, rather than the first free
     /// one -- an address and a MAC the same at every start.
     pub port: Option<usize>,
+    /// `network=`: the network on the switch it is on, whose guests it
+    /// reaches -- alone, reaching none, without.
+    pub network: Option<String>,
     /// `forward=`: nos's ports relayed to the guest's, once it runs.
     pub forwards: Vec<(u16, u16)>,
     pub nic: Option<NicSpec>,
@@ -169,6 +172,12 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
         } else if let Some(v) = word.strip_prefix("forward=") {
             o.forwards.push(crate::config::forward(v)
                 .ok_or_else(|| String::from("forward= wants <nos's port>:<the guest's>, each 1..65535"))?);
+        } else if let Some(v) = word.strip_prefix("network=") {
+            if !crate::config::valid_network(v) {
+                return Err(alloc::format!("network= wants a name -- a letter or a digit, then letters, digits, . _ \
+                                           and -, at most {}", crate::config::NETWORK_NAME_MAX));
+            }
+            o.network = Some(String::from(v));
         } else if let Some(v) = word.strip_prefix("port=") {
             o.port = Some(v.parse().map_err(|_| String::from("port= wants the number of a port of the switch"))?);
         } else if let Some(v) = word.strip_prefix("secs=") {
@@ -242,6 +251,9 @@ pub fn spec(o: Options) -> Result<Spec, String> {
     if !o.forwards.is_empty() && !o.net {
         return Err(String::from("forward= is a net guest's -- net too"));
     }
+    if o.network.is_some() && !o.net {
+        return Err(String::from("network= is a net guest's -- net too"));
+    }
     if o.forwards.len() > crate::forward::MAX_FORWARDS {
         return Err(alloc::format!("at most {} forwards", crate::forward::MAX_FORWARDS));
     }
@@ -270,6 +282,7 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         restart: o.restart,
         net: o.net,
         port,
+        network: o.network,
         forwards: o.forwards,
         nic: None,
         shape: Shape::cores(cpus),

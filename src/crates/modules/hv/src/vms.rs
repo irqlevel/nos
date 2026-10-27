@@ -1092,8 +1092,8 @@ impl Vms {
                 }
             };
             let claimed = match spec.port {
-                Some(p) => switch.claim_at(p, &shared),
-                None => switch.claim(&shared),
+                Some(p) => switch.claim_at(p, &shared, spec.network.as_deref()),
+                None => switch.claim(&shared, spec.network.as_deref()),
             };
             let port = match claimed {
                 Ok(port) => port,
@@ -1284,6 +1284,14 @@ impl Vms {
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
+                match self.switch.lock().as_ref().and_then(|s| s.network_of(port)) {
+                    Some(network) => {
+                        let _ = write!(out, " on {}", network);
+                    }
+                    None => {
+                        let _ = write!(out, " alone");
+                    }
+                }
             }
             let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
             if lost.dropped != 0 {
@@ -1297,6 +1305,9 @@ impl Vms {
             }
             if lost.flooded != 0 {
                 let _ = write!(out, "  {} frames for every port past their rate, dropped", lost.flooded);
+            }
+            if lost.isolated != 0 {
+                let _ = write!(out, "  {} frames for another network's guests, dropped", lost.isolated);
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {
