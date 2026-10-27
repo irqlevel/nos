@@ -951,6 +951,7 @@ mode:
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
 | `posted` | on the machine of `smp`, asking for its interrupts to be the CPU's: the second CPU, started as `smp`'s is, sends the first a thousand fixed IPIs, one at a time, while the first spins with interrupts on and no HLT, counting them | where the CPU has posted interrupts each is posted and notified and taken by the first CPU in its guest, which leaves it a handful of times rather than once an IPI; elsewhere the host hands each over ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
+| `pveoi` | on the machine of `apicv`, its interrupts the host's to inject on either backend, KVM's PV EOI turned on with its word at 0x7100, each handler ending its interrupt as Linux's does -- the word's bit cleared if set, the EOI register written if not: a self-IPI 0x50 alone; 0x30, whose handler takes 0x70 nested and reads ISR in it; ISR read whole; PV EOI turned off and 0x50 once more | 0x50 and 0x70 ended through the word, each EOI the host's at the next exit -- 0x70's at the exit of 0x30's own EOI by the register, done before it -- the word not set while 0x70 waited in IRR nor after PV EOI went off, nothing left in service: two EOIs through the word, two by the register ([KVM's paravirtual interface](#kvms-paravirtual-interface-as-far-as-it-is-backed)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `avx` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI: each turns its local APIC on, runs an XSETBV with CR4.OSXSAVE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, runs five XSETBVs a CPU refuses and its own, of the x87, SSE and AVX, reads leaf 1, leaf 0xD's first three subleaves and leaf 7, stores YMM0-15, and loads an x87 control word, an MXCSR and a pattern of its own into YMM0-15; then 64 turns each, a turn its peer's IPI, every one checking all of them against what it left and loading the pattern one more | YMM0-15 zero as each CPU starts, though the other's pattern was in the CPU's registers; its YMM registers, MXCSR and control word as it left them at every turn, put back by the host each time the other had had the CPU -- 64 times each at least; XSAVE and AVX offered, OSXSAVE as CR4 has it, XCR0 1 out of reset and 7 after its own; the XSETBV with OSXSAVE clear a #UD -- the CPU's own under VT-x, the host's under QEMU's TCG, whose intercept comes first -- and the five a #GP each; leaf 0xD's sizes 576 and 832, AVX's component at 576, no XSAVES |
 | `pkru` | on the machine of `smp`, both CPUs on the one host CPU the guests run on, taking turns by IPI, the second started by `avx`'s code: each turns its local APIC on, runs an RDPKRU with CR4.PKE clear, sets OSFXSR, OSXMMEXCPT and OSXSAVE, and where its CPUID offers PKU sets PKE, makes XCR0 its own -- PKRU in the first's, the x87 alone the second's -- reads leaf 7, leaf 0xD's subleaves 0 and 9 and PKRU, and loads its own into PKRU; then 64 turns each, a turn its peer's IPI, every one checking PKRU against what it left and loading it one key more | the RDPKRU a #UD; where PKU is offered -- QEMU's TCG, the EX44, not a Zen 2 -- OSPKE only once its CR4.PKE has it, leaf 0xD's components and sizes for its XCR0, PKRU's subleaf the host's; PKRU 0 as each CPU starts, though the other's was in the CPU's register, and its own at every turn, put back by the host each time the other had had the CPU -- 64 times each at least, whatever its XCR0 says of PKRU |
@@ -3190,6 +3191,43 @@ package, it believed no two of its processes shared a core while two did.
 Linux 6.18 reads leaf 0xB on AMD as on Intel; an older kernel reads it on
 AMD only with TOPOEXT, and on an AMD host without TOPOEXT -- QEMU's `max`
 under TCG is one -- sees one package of cores, and no threads.
+
+### KVM's paravirtual interface, as far as it is backed
+
+The hypervisor's CPUID range answers as KVM's does: its signature,
+`KVMKVMKVM`, in leaf 0x40000000, and in 0x40000001 the features of its
+paravirtual interface -- what a Linux built with `KVM_GUEST` looks for, and
+takes no more of than the bits it is given. Two are offered. NOP_IO_DELAY,
+a fact: an `out` to port 0x80 delays nothing here and is an exit, and a
+kernel told so stops making them. And for a guest with APICs, PV EOI: the
+guest names a word in its memory (`MSR_KVM_PV_EOI_EN`, aligned to 4 bytes,
+or a #GP), and where the end of the interrupt in service need not exit --
+the highest in service edge-triggered, since a level's end the IO-APIC has
+to hear of, and nothing requested, which an EOI that does not exit would
+leave waiting unseen -- the run loop sets the word's bit before the entry
+(`pv_eoi_arm`). The guest's EOI then clears the bit and goes on, no exit;
+at the next exit, before anything else is looked at, the run loop finds the
+bit clear and does the EOI itself -- or finds it still set, and clears it,
+so that an EOI the guest makes from there exits as usual (`pv_eoi_sync`).
+An EOI written to the register at that exit, of the vector beneath, comes
+after the one done for the word, as it came after in the guest. Under VT-x
+with APIC virtualization the CPU takes the EOIs itself and the word is
+never set. Elsewhere each EOI was an exit of its own, beside the one that
+brought the interrupt and, in TSC-deadline mode, the next deadline's write;
+`hv boot`'s report counts the ones saved (`pv eoi`). INIT turns PV EOI
+off, as KVM's reset does.
+
+Not offered, and why: kvmclock, the TSC being invariant and the host's
+(`tsc_khz=` tells the guest its rate); steal time, and what stands on it --
+PV TLB flushes and PV sched yield -- a guest's CPUs having cores of their
+own (`hv cores own`); PV unhalt, for the same reason, so a guest's
+spinlocks stay native (`PV spinlocks disabled, no host support`); and async
+page faults, a guest's memory never being paged out. No hypercall is
+offered either, and each is answered -KVM_ENOSYS in RAX, as KVM answers one
+it does not know: a driver that probes, as `ptp_kvm` does for its clock
+pairing, takes that for not there -- where the old answer, RAX left as it
+was, read as a positive error. A kernel without `KVM_GUEST` finds a
+signature it does not know, and runs as before.
 
 ### Starting the others
 

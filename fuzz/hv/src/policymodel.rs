@@ -31,6 +31,11 @@
 //! leaf, AMD's 0x8000_0008 and 0x8000_001E -- held to what the manuals say
 //! a package of that shape answers: one package, APIC IDs the CPUs'
 //! numbers, a core's threads in its low bit where it has two.
+//!
+//! The hypervisor's range is KVM's, as its ABI has it
+//! (Documentation/virt/kvm/x86/cpuid.rst): the signature, and of the
+//! features NOP_IO_DELAY and, with APICs, PV_EOI -- nothing else, and
+//! nothing past 0x4000_0001.
 
 use crate::place::{Shape, Topology};
 use crate::policy::{self, Asker, Cpuid, Own};
@@ -258,6 +263,18 @@ fn tops(asker: &Asker) -> (u32, u32) {
 fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u32)) {
     let (apic_id, apic) = (asker.apic_id, asker.apic);
     let g = words(&policy::cpuid(leaf, sub, asker));
+    if (0x4000_0000..0x8000_0000).contains(&leaf) {
+        let kvm = [0x4000_0001, u32::from_le_bytes(*b"KVMK"), u32::from_le_bytes(*b"VMKV"),
+                   u32::from_le_bytes(*b"M\0\0\0")];
+        let want = match leaf {
+            0x4000_0000 => kvm,
+            0x4000_0001 => [1 << 1 | if apic { 1 << 6 } else { 0 }, 0, 0, 0],
+            _ => [0; 4],
+        };
+        invariant!(g == want, "leaf {:#x}.{} answered {:x?}: wanted {:x?} -- KVM's signature, its NOP_IO_DELAY and \
+                   with APICs PV_EOI, and nothing past", leaf, sub, g, want);
+        return;
+    }
     let top = if leaf >= 0x8000_0000 { ext_top } else { basic_top };
     let Some(h) = host(leaf, sub).filter(|_| leaf <= top && (leaf < 0x4000_0000 || leaf >= 0x8000_0000)) else {
         invariant!(g == [0; 4], "leaf {:#x}.{}, past the top the guest is told ({:#x}) or the host's, answered {:x?}",
@@ -431,8 +448,8 @@ const MSR_EFER: u32 = 0xC000_0080;
 /// Each CPUID bit and what it promises, from the manuals: the leaf, the
 /// subleaf, the register and the bit, and the MSR or the EFER bit a guest
 /// that sees it will use. The local APIC's MSRs are not here, nor the
-/// TSC-deadline timer's, IA32_TSC_DEADLINE: the run loop gives them to the
-/// APIC before the policy is asked.
+/// TSC-deadline timer's, IA32_TSC_DEADLINE, nor KVM's PV EOI MSR: the run
+/// loop answers them before the policy is asked.
 const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (1, 0, EDX, 4, Needs::Read(0x10), "TSC"),
     (1, 0, EDX, 11, Needs::Read(0x174), "SEP"),

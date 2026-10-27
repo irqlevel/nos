@@ -725,6 +725,22 @@ impl Lapic {
         }
     }
 
+    /// Whether the end of the interrupt in service may be left to the
+    /// guest's word (KVM's PV EOI, `crate::run`): the highest in service
+    /// edge-triggered -- a level's end the IO-APIC has to hear of -- and
+    /// nothing requested, which an EOI that does not exit would leave
+    /// waiting unseen until the guest's next exit.
+    pub fn eoi_may_be_quiet(&self) -> bool {
+        highest(&self.irr).is_none() && highest(&self.isr).is_some_and(|v| !test_bit(&self.tmr, v))
+    }
+
+    /// The EOI the guest made through its word: the highest vector in
+    /// service ended, as a write of the EOI register ends it -- a level's
+    /// handed back for the IO-APIC, though none is armed so.
+    pub fn quiet_eoi(&mut self) -> Option<u8> {
+        self.eoi()
+    }
+
     /// The timer's mode, as its entry says.
     fn timer_mode(&self) -> TimerMode {
         match self.lvt[LVT_TIMER] & TIMER_MODE_MASK {

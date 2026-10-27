@@ -620,7 +620,12 @@ it was, a taken one read back -- and every other refused both ways; and a
 table, from the manuals, of what each CPUID bit promises the guest that sees
 it, the MSR it will use or the bit of EFER it will set, which must then be
 answered. IBPB offered with PRED_CMD refused, or AutoIBRS with its EFER bit,
-is a finding at the first input. Where the guest's CPUs sit is made up too
+is a finding at the first input. The hypervisor's range is held to KVM's
+ABI: the signature, NOP_IO_DELAY and with APICs PV_EOI, nothing past
+0x40000001. The platform target's scripted guest turns PV EOI on now and
+then -- at its word, or at none it has, or unaligned -- and ends its
+interrupts as Linux does, through the word where the host set it and by the
+register where not. Where the guest's CPUs sit is made up too
 -- a host's threads, with SMT or not and its caches shared this widely,
 given to a guest of up to 64 CPUs, in order or anywhere -- and every
 topology leaf held to what a package of that shape answers: leaf 1's count
@@ -1616,6 +1621,17 @@ delivering all six and taking their EOIs under VT-x, the guest stopped after
 the three level-triggered ones alone ([Interrupts the CPU delivers
 itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
 there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; for
+`pveoi`, on the same machine with its interrupts the host's to inject on
+either backend and KVM's PV EOI on, that each handler's EOI went through
+the guest's word where the host had set it and by the register where not
+-- 0x50 alone and 0x70 nested through the word, 0x30's own by the
+register, at whose exit 0x70's was done first, and 0x50 again by the
+register with PV EOI off -- that the word was never set while 0x70 waited
+in IRR, that nothing was left in service, and that the host did two EOIs
+for the word and injected four interrupts; a run loop that never did the
+EOI for the word, and one that did it while the guest still held the bit,
+each failed it ([KVM's paravirtual
+interface](hypervisor.md#kvms-paravirtual-interface-as-far-as-it-is-backed)); for
 `posted`, two CPUs both running, that the first counted all thousand of the
 fixed IPIs the second sent it while it spun -- and who handed them over:
 where the CPU has posted interrupts (`hv info`) each was posted and the
