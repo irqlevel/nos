@@ -33,6 +33,13 @@ pub const OPEN_WRITE: usize = 2;
 pub const OPEN_CREATE: usize = 4;
 pub const OPEN_TRUNCATE: usize = 8;
 pub const OPEN_APPEND: usize = 16;
+/// A disk's image (`image`): the file held while the handle is open --
+/// nobody else may write it, cut it or grow it (nor, open, rename or remove
+/// it), so that its blocks stay where `map` said they are while the image
+/// reads and writes them off the lock. With `OPEN_WRITE` the holder writes
+/// it, and has it alone; without, any number may hold it to read. Refused
+/// while anyone else has the file open for writing.
+pub const OPEN_HOLD: usize = 32;
 
 /// What a filesystem is to the VFS: the tree of what it holds, and the calls
 /// that change it.
@@ -94,6 +101,25 @@ pub trait FileSystem: Send {
     /// or in blocks of its own.
     fn sparse_max(&self) -> usize {
         0
+    }
+
+    /// How big the blocks are that a file's data is kept in on the device
+    /// (`device`) -- what a disk's image reads and writes off the VFS's
+    /// lock, a block where `map_blocks` says it is -- or 0 for a filesystem
+    /// that keeps no blocks of its own on a device, whose images go
+    /// through it a call at a time. Never more than a page.
+    fn data_block_size(&self) -> usize {
+        0
+    }
+
+    /// The device sector each of the `out.len()` blocks of `file` from
+    /// block `first` begins at -- 0 for a hole, which is nothing on the
+    /// device and reads as zeros -- every one of them inside the file.
+    /// Nothing is allocated or changed. false on an I/O error, or a pointer
+    /// that leads outside the filesystem -- and for a filesystem with no
+    /// blocks of its own (`data_block_size` 0).
+    fn map_blocks(&mut self, _file: NodeId, _first: u64, _out: &mut [u64]) -> bool {
+        false
     }
 }
 
@@ -730,7 +756,19 @@ impl Vfs {
         };
 
         let size = match mount.fs.tree().get(node) {
-            Some(found) if found.is_file() => found.size,
+            Some(found) if found.is_file() => {
+                /* A disk's image is its holder's alone to write -- and only
+                 * what nobody else writes is held. */
+                if found.holds != 0 && writes {
+                    trace!(0, "vfs: that file is a disk's image, held while it is open");
+                    return None;
+                }
+                if flags & OPEN_HOLD != 0 && found.writers != 0 {
+                    trace!(0, "vfs: that file is open for writing, and cannot be held as a disk's image");
+                    return None;
+                }
+                found.size
+            }
             _ => {
                 trace!(0, "vfs: that path is not a file");
                 return None;
@@ -753,14 +791,42 @@ impl Vfs {
         let mount = inner.mounts[resolved.mount].as_mut()?;
         if let Some(found) = mount.fs.tree_mut().get_mut(node) {
             found.open_count += 1;
+            if flags & OPEN_WRITE != 0 {
+                found.writers += 1;
+            }
+            if flags & OPEN_HOLD != 0 {
+                found.holds += 1;
+            }
         }
         mount.open_files += 1;
         Some(handle)
     }
 
     pub fn close(&self, handle: Handle) {
+        self.close_as(handle, false);
+    }
+
+    /// Lets go of a file held as a disk's image: what its image does as it
+    /// goes, and nothing else may (`close`).
+    pub(crate) fn release(&self, handle: Handle) {
+        self.close_as(handle, true);
+    }
+
+    fn close_as(&self, handle: Handle, image: bool) {
         let mut inner = self.inner.lock();
 
+        /* A held file is let go of by its image alone: a word that names its
+         * handle -- guessed, or one a caller of the file ABI got wrong --
+         * must not take the hold away from under the reads and writes the
+         * image goes on making off this lock. */
+        match inner.file(handle) {
+            Some(file) if file.flags & OPEN_HOLD != 0 && !image => {
+                trace!(0, "vfs: a disk's image is let go of by its image, not closed");
+                return;
+            }
+            Some(_) => {}
+            None => return,
+        }
         let file = match inner.take_file(handle) {
             Some(file) => file,
             None => return,
@@ -769,6 +835,12 @@ impl Vfs {
         if let Some(mount) = inner.mount_by_id(file.mount_id) {
             if let Some(node) = mount.fs.tree_mut().get_mut(file.node) {
                 node.open_count = node.open_count.saturating_sub(1);
+                if file.flags & OPEN_WRITE != 0 {
+                    node.writers = node.writers.saturating_sub(1);
+                }
+                if file.flags & OPEN_HOLD != 0 {
+                    node.holds = node.holds.saturating_sub(1);
+                }
             }
             mount.open_files = mount.open_files.saturating_sub(1);
         }
@@ -817,6 +889,11 @@ impl Vfs {
         };
         if flags & OPEN_WRITE == 0 {
             trace!(0, "vfs: that handle is not open for writing");
+            return None;
+        }
+        /* A held file never grows: its holder writes within it. */
+        if flags & OPEN_HOLD != 0 {
+            trace!(0, "vfs: a disk's image is written within its size");
             return None;
         }
         if data.is_empty() {
@@ -909,13 +986,76 @@ impl Vfs {
         }
         match inner.mount_by_id(mount_id) {
             Some(mount) if !mount.read_only => {
-                mount.fs.tree().get(node).is_some_and(|found| found.is_file()) && mount.fs.truncate(node, size)
+                match mount.fs.tree().get(node) {
+                    Some(found) if found.is_file() && found.holds == 0 => {}
+                    Some(found) if found.is_file() => {
+                        trace!(0, "vfs: that file is a disk's image, its size held while it is open");
+                        return false;
+                    }
+                    _ => return false,
+                }
+                mount.fs.truncate(node, size)
             }
             Some(_) => {
                 trace!(0, "vfs: that mount is read-only");
                 false
             }
             None => false,
+        }
+    }
+
+    /// The device the blocks of the file `handle` holds (`OPEN_HOLD`) are on,
+    /// and how big one is: what its image reads and writes off the lock --
+    /// or None where its filesystem keeps no blocks of its own on a device,
+    /// or the handle holds nothing.
+    pub fn geometry(&self, handle: Handle) -> Option<(usize, usize)> {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, flags) = {
+            let file = inner.file(handle)?;
+            (file.mount_id, file.flags)
+        };
+        if flags & OPEN_HOLD == 0 {
+            return None;
+        }
+        let fs = &inner.mount_by_id(mount_id)?.fs;
+        match (fs.device(), fs.data_block_size()) {
+            (0, _) | (_, 0) => None,
+            (device, size) => Some((device, size)),
+        }
+    }
+
+    /// Where `out.len()` blocks of the file `handle` holds, from block
+    /// `first`, are on its device: each one's first sector, 0 for a hole
+    /// (`FileSystem::map_blocks`). Only a held file is mapped, and only
+    /// blocks inside it: what the caller then reads and writes there, off
+    /// this lock, stays the file's -- and nobody else's to write -- for as
+    /// long as the hold does.
+    pub fn map(&self, handle: Handle, first: u64, out: &mut [u64]) -> bool {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node, flags) = match inner.file(handle) {
+            Some(file) => (file.mount_id, file.node, file.flags),
+            None => return false,
+        };
+        if flags & OPEN_HOLD == 0 {
+            trace!(0, "vfs: only a file held as a disk's image is mapped");
+            return false;
+        }
+        let Some(mount) = inner.mount_by_id(mount_id) else { return false };
+        let size = match mount.fs.tree().get(node) {
+            Some(found) => found.size as u64,
+            None => return false,
+        };
+        let block = mount.fs.data_block_size() as u64;
+        if block == 0 {
+            return false;
+        }
+        match first.checked_add(out.len() as u64) {
+            Some(end) if end <= size.div_ceil(block) => mount.fs.map_blocks(node, first, out),
+            _ => false,
         }
     }
 
@@ -1062,7 +1202,15 @@ impl Vfs {
         let node = resolved.node?;
         let fs = &mut Self::writable(inner, &resolved)?.fs;
 
-        if !fs.tree().get(node)?.is_file() {
+        let found = fs.tree().get(node)?;
+        if !found.is_file() {
+            return None;
+        }
+        /* Cut under a disk's image, the blocks its map named would go back
+         * to the filesystem -- and to the next file -- while the image still
+         * wrote them. */
+        if found.holds != 0 {
+            trace!(0, "vfs: that file is a disk's image, held while it is open");
             return None;
         }
         fs.truncate(node, size).then_some(())
@@ -1149,6 +1297,13 @@ impl Vfs {
         };
 
         let size = match fs.tree().get(node) {
+            /* A disk's image is its holder's alone to write (`OPEN_HOLD`):
+             * cut to nothing under it, its blocks would go to the next file
+             * while the image still wrote them. */
+            Some(found) if found.is_file() && found.holds != 0 => {
+                trace!(0, "vfs: that file is a disk's image, held while it is open");
+                return None;
+            }
             Some(found) if found.is_file() => found.size,
             _ => return None,
         };

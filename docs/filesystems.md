@@ -89,6 +89,46 @@ One mutex serialises every VFS call, so a multi-megabyte read holds up an
 `ls` from the UDP shell for its duration. Everything it guards is inside it:
 the mounts, each owning its filesystem, and the open files.
 
+### A disk's image
+
+A guest's disk that is a file of nos's (`hv start ... disk=/vms/a/disk.img`)
+is read and written for as long as the guest runs, a request at a time,
+and through that one mutex it would wait behind every other guest's disk and
+behind nos's own files. So it is opened as an image (`fs::image::Image`,
+`kcore::fs::Image` for a module): the file is **held** (`OPEN_HOLD`), and an
+image takes only what it must under the lock -- where the blocks of the
+range it is asked for are on the device (`Vfs::map`, the filesystem's
+`map_blocks`: ext2 walks the file's pointers, through its caches, and
+allocates nothing) -- and reads and writes those blocks itself with the lock
+let go, through a buffer of its own, in batches the driver has in flight
+together (`Disk::read_pieces`, `write_pieces`).
+
+The hold is what makes that safe: while it lasts nothing else may write the
+file -- open it for writing, appending or truncating, cut it by its path,
+`write_file` it, grow it through a handle -- and, open, it cannot be
+renamed or removed, nor its filesystem unmounted; so the blocks a map named
+stay the file's, and nobody else writes them, until the image lets go. A
+file someone else has open for writing cannot be held, and one held for
+writing cannot be held again; any number may hold one to read while nobody
+writes it. Only its image lets go of it: the VFS handle under it is closed
+by the image's going, and refused to the file ABI's close, which a word
+guessed or kept too long could otherwise reach. What only the filesystem
+can do is left to it: a batch with a hole in it -- blocks to allocate and
+point at, in order -- is written through the VFS, and the next flush is then
+the filesystem's sync (its metadata, then the device); otherwise a flush is
+the device's alone. A part of a block -- a guest's sector in a block of 4
+KiB -- is read, changed and written back whole, which an image may do
+because its calls come one at a time and nobody else writes the file. A
+filesystem that keeps no blocks of its own on a device (`data_block_size`
+0: ramfs, and nanofs for now) has its images read and written through the
+VFS whole.
+
+`fstest` holds one at every smoke boot -- holes read as zeros, a write into
+one, into part of a block, across both, everything else refused while it is
+held, the file as the image left it once it lets go -- and `fs-fuzz`'s
+targets hold, read, write, sync and let go of images among every other
+call, each held to the model's rules.
+
 ## What a filesystem is
 
 A filesystem is a type that implements `vfs::FileSystem`, mounted as a
