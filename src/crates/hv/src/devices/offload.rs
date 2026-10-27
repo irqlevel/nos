@@ -12,7 +12,7 @@
 //! every offset and length in it is checked against the frame before it is
 //! used, and a send that does not hold up goes nowhere, counted.
 
-use netwire::{self as wire, ETH_HDR_LEN, ETH_TYPE_IP, IP_PROTO_TCP, IP_PROTO_UDP};
+use netwire::{self as wire, ETH_HDR_LEN, ETH_TYPE_IP, ETH_TYPE_IPV6, IP_PROTO_TCP, IP_PROTO_UDP};
 
 /// The longest frame on the wire: Ethernet's, less the FCS.
 pub const MAX_FRAME: usize = 1514;
@@ -237,7 +237,7 @@ impl Partial {
             return;
         }
         let mut c = checksum(sum(&frame[start..], 0));
-        if c == 0 && udp4_checksum_at(frame, at) {
+        if c == 0 && udp_checksum_at(frame, at) {
             c = 0xFFFF;
         }
         wire::set_be16(frame, at, c);
@@ -319,14 +319,24 @@ pub fn transmit<'a>(hdr: &TxHeader, frame: &'a mut [u8], offloads: Offloads) -> 
     }
 }
 
-/// Whether `at` is the checksum of the UDP datagram an IPv4 frame carries.
-fn udp4_checksum_at(frame: &[u8], at: usize) -> bool {
-    if frame.len() < ETH_HDR_LEN + IP_MIN || wire::be16(frame, 12) != ETH_TYPE_IP {
+/// Whether `at` is the checksum of the UDP datagram a frame carries -- over
+/// IPv4, or over IPv6 past its extension headers -- whose 0 goes as all ones
+/// (RFC 768; RFC 8200, 8.1, where 0 is none and refused).
+fn udp_checksum_at(frame: &[u8], at: usize) -> bool {
+    if frame.len() < ETH_HDR_LEN {
         return false;
     }
-    let ip = &frame[ETH_HDR_LEN..];
-    let ihl = usize::from(ip[0] & 0xF) * 4;
-    ip[IP_PROTO] == IP_PROTO_UDP && at == ETH_HDR_LEN + ihl + UDP_CHECKSUM
+    match wire::be16(frame, 12) {
+        ETH_TYPE_IP if frame.len() >= ETH_HDR_LEN + IP_MIN => {
+            let ip = &frame[ETH_HDR_LEN..];
+            let ihl = usize::from(ip[0] & 0xF) * 4;
+            ip[IP_PROTO] == IP_PROTO_UDP && at == ETH_HDR_LEN + ihl + UDP_CHECKSUM
+        }
+        ETH_TYPE_IPV6 => matches!(wire::ipv6::upper(&frame[ETH_HDR_LEN..]),
+                                  wire::ipv6::Upper::Found { protocol: IP_PROTO_UDP, at: udp, .. }
+                                      if at == ETH_HDR_LEN + udp + UDP_CHECKSUM),
+        _ => false,
+    }
 }
 
 /// Whether `frame` is TCP over IPv4 that can be cut by `mss`: its headers,

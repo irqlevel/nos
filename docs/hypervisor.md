@@ -1805,7 +1805,9 @@ the guest is put into the buffers it has posted each time round the run
 loop, one frame held by the device while it has posted too few.
 
 **Offloads, both ways.** The device completes a checksum the driver leaves
-to it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as
+to it (`VIRTIO_NET_F_CSUM`) -- a UDP datagram's that comes to 0 as all ones,
+over IPv4 or over IPv6 past its extension headers, since 0 there is no
+checksum at all and IPv6 refuses it -- and cuts TCP over IPv4 the driver hands it as
 one send of up to 64 KiB into frames (`HOST_TSO4`; `hv::devices::offload`):
 the headers of the send in front of each, its IP length, ID and checksum,
 its sequence number and its TCP checksum its own, FIN and PSH the last
@@ -1895,20 +1897,59 @@ and 256 a second after, a token bucket a port. What either keeps out is
 dropped and counted against the guest in `hv list`.
 
 **What a guest sends has to be its own.** A frame is checked where it comes
-in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4 or ARP
--- nothing of nos's speaks anything else, and nothing the switch cannot
-check goes through it -- from the port's MAC; an IPv4 packet from the
-port's address; an ARP message with the port's MAC as its sender's, and
-the port's address as its sender's or none yet, as a probe has. The one
-IPv4 packet with no address yet is a DHCP client's, which the switch
-answers itself. The rest is dropped: a frame sent as another guest counted
-against the guest that sent it in `hv list`, one of another protocol --
-IPv6, which every Linux sends at boot -- on `hv0`'s line. Without it a guest
+in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4, ARP
+or IPv6 -- nothing the switch cannot check goes through it -- from the
+port's MAC; an IPv4 packet from the port's address; an ARP message with the
+port's MAC as its sender's, and the port's address as its sender's or none
+yet, as a probe has; IPv6 by rules of its own (below). The one IPv4 packet
+with no address yet is a DHCP client's, which the switch answers itself.
+The rest is dropped: a frame sent as another guest counted against the
+guest that sent it in `hv list`, one of another protocol on `hv0`'s line.
+Without it a guest
 could take another's flows through NAT, which answers a flow at the MAC its
 last packet came from -- one packet with the other's address and the flow's
 ports was enough -- and tell `hv0`'s ARP table another's address was its
 own. `hv-fuzz`'s `guestnet` target found that
 ([testing](testing.md#hv-fuzzpy----everything-a-guest-reaches-fuzzed)).
+
+**IPv6 goes between the guests, and no further.** Nothing of nos's speaks
+it, so `hv0` is handed none -- a guest's IPv6 for nos's MAC is dropped on
+`hv0`'s line -- and there is no way out: no NAT, no route. Each guest makes
+its own addresses: its link-local one, and one in the prefix the switch
+gives it, `fd6e:6f73:64::/64` -- unique-local (RFC 4193), its global ID
+"nos" and 100, the third byte of the guests' IPv4 subnet -- which the switch's
+router advertisement carries, answering a guest's solicitation: from
+`hv0`'s MAC and the link-local address it makes, the prefix on the link
+and to make addresses in, for good, the MTU 1500, and a router lifetime of
+0, so no default route and a connect anywhere else refused at once. Since
+the addresses are the guests' to choose, they are not checked against the
+port as an IPv4 address is, but bound to the port that first uses one
+(RFC 6620's first come, first served): as the source of a packet of its,
+as the target of its neighbour advertisement, or as the address its
+duplicate detection asks after, if it is nobody's yet. From then on it is
+that port's alone until its VM goes -- eight a port, a ninth taking the
+place of its least recently used, so privacy addresses come and go -- and
+another sending from it, or advertising it, is spoofing, counted against it.
+A guest's duplicate detection of another's address goes through, for the
+owner to answer, so a guest asking for a taken address is told so. A guest
+is no router here and no DHCPv6 server: its router advertisements,
+redirects and DHCPv6 replies go nowhere (RFC 6105's guard); its neighbour
+discovery must give its own MAC wherever it gives one, a target that is one
+address, and come whole, not in fragments (RFC 6980); its source is none
+only while it finds an address -- a solicitation, a listener's report --
+and never a multicast group. A packet whose extension headers hide what it
+carries -- running past its length, more than eight of them, a first
+fragment that stops short of the header after them -- goes nowhere, since a
+router advertisement could be one (RFC 7112); and the packet the switch
+looks at is the one its receiver takes, to the length its header says, so
+the two cannot read different messages out of one frame. `hv list` counts
+the advertisements and the addresses bound. hv-fuzz's `switch` target holds
+the switch to a model of these rules of its own, frame by frame, with
+neighbour discovery of every kind among its frames, and `hv-linux-test.py
+--net` two Linux guests: each makes its address from the advertisement,
+they ping each other at it and at their link-local ones, one asking for
+the other's address is told it is taken, and one that takes it anyway gets
+nothing through to the other.
 
 **A guest that is running is kicked out of it.** Its turn ends when its
 CPU takes an interrupt, and the device model hands frames over only between

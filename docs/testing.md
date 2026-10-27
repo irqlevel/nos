@@ -632,7 +632,13 @@ to come back, and ports whose NIC holds its receive interrupts, a frame for
 which wakes nobody while the inbox is under half full -- and sends of TCP
 whole and frames with their checksum left to finish among them, each handed
 so to a port whose guest takes it so, and cut, or finished, for every other
-and for `hv0`; `nat`,
+and for `hv0` -- and IPv6 among them, neighbour discovery of every kind,
+multicast listeners' reports, echoes, UDP from DHCPv6's server's port,
+behind extension headers and in fragments, their lengths right and wrong, a
+guest now and then using more addresses than a port may have bound, held
+to a model of the switch's rules for it written from RFC 6620, 6105, 6980
+and 7112 -- whose addresses are bound to which port, the advertisement it
+answers a solicitation with laid out byte for byte from RFC 4861; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
@@ -756,7 +762,16 @@ as its sender; the one packet with no address yet is a DHCP client's,
 which the switch answers itself. The rest is dropped and counted -- `hv
 list` says how many a guest sent as another -- and the targets hold the
 switch to it both ways: `switch` to a model of the rule, `guestnet` to
-what the rule is for.
+what the rule is for. IPv6, which the switch then dropped, now goes
+between the guests under rules of its own ([A network](hypervisor.md#a-network)),
+held to a model by `switch` and, for what it is for, by `hv-linux-test.py
+--net`; ten mutants of them -- the packet not cut to its length, a guest's
+router advertisement let through, the newest address let go of in place of
+the oldest, a VM's addresses kept after it went, IPv6 handed to `hv0`, the
+advertisement's checksum without its pseudo-header, duplicate detection
+binding nothing, neighbour discovery in fragments, an advertisement's
+target taken unchecked, and UDP over IPv6's checksum of 0 left 0 -- each
+failed the gate.
 
 What it cannot see: the CPU is a stand-in, so nothing of hvarch -- its
 `unsafe`, the VMCB and VMCS, the entry and the exit -- is fuzzed, only what
@@ -2100,6 +2115,22 @@ the check taken out of the switch the claim reached it, and the other
 guest's own ARP put the entry right again -- once before the test could
 look, and once not, when the fetch through `hv forward`, which the test
 makes last, reached the claiming guest instead of the other's `httpd`.)
+IPv6 between the two, which nos does not speak: each must have its address
+in `fd6e:6f73:64::/64` -- the prefix of the switch's router advertisement,
+the address its MAC's EUI-64 -- no longer tentative; one pings the other at
+it and the other pings back at the link-local address; the advertisement
+must have put the prefix on the link and given no default route. One guest
+adds the other's address and must find it `dadfailed`: its duplicate
+detection's solicitation went through and the owner answered. It adds it
+again with its duplicate detection off (`accept_dad` 0: BusyBox's `ip` has
+no `nodad`) and `ndisc_notify` on, so that it tells the link the address is
+its, and pings the other's link-local address from it: nothing comes back,
+the other's count of echoes asked of it (`Icmp6InEchos`) is the same after
+as before, and its kernel never says another advertised its address -- the
+switch stopped every frame from the address, bound to the other's port. A
+control run with the bindings never refusing failed those checks. `hv list` must count
+them against the guest that sent them, none against the other, and say how
+many advertisements it sent and addresses it bound.
 Then one guest is stopped with a forward to it and its flows in NAT's table:
 its forward has to go with it, the other's stay, and `nat` show no mapping
 of its address -- the next VM on its port has its MAC and address, and was
