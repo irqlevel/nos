@@ -1338,7 +1338,10 @@ def network(args):
         f.write(big)
     server, web = web_server(www)
     x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
-    start = "hv start /bzImage mem=%d%s initrd=/initrd net cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline)
+    # The two guests on one network, which the switch's guests are not
+    # unless their network= puts them on one: the folder's VM below is not.
+    start = "hv start /bzImage mem=%d%s initrd=/initrd net network=lab cmdline=%s" % (args.mem, cpus_opt(args),
+                                                                                       args.cmdline)
     way_out = [x(0, "cat /proc/net/pnp"),
                x(0, "wget -q -O - http://10.0.2.2:%d/nat.txt" % web),
                x(0, "ping -c 3 10.0.2.2"),
@@ -1448,7 +1451,13 @@ def network(args):
               xn("w0", "mkdir -p /www"),
               xn("w0", "echo nos-folder-hello > /www/index.html"),
               xn("w0", "httpd -p 80 -h /www"),
-              "hv forward"]
+              "hv forward",
+              # Alone on the switch: nos it reaches, the guests on lab not --
+              # not by ARP, whose question they never hear, and not by a
+              # frame for vm 1's MAC, which the switch drops and counts.
+              xn("w0", "ping -c 2 -W 5 10.0.100.1"),
+              xn("w0", "arp -s 10.0.100.3 02:00:00:00:64:03; ping -c 3 -W 2 10.0.100.3; echo alone-done", 60),
+              "hv list"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -1476,6 +1485,7 @@ def network(args):
         secs = sections(open(log, errors="replace").read())
         out = lambda i: output_of(secs, rc[i], 0) or ""
         ok_ping = lambda t: re.search(r"3 packets transmitted, 3 packets received", t) is not None
+        ok_ping2 = lambda t: re.search(r"2 packets transmitted, 2 packets received", t) is not None
         pt.check("both guests reach their shells", "uid=0 gid=0" in out(4) and "uid=0 gid=0" in out(5),
                  out(4)[-300:] + out(5)[-300:])
         pt.check("hv list gives each its address", "10.0.100.2" in out(6) and "10.0.100.3" in out(6), out(6))
@@ -1656,6 +1666,15 @@ def network(args):
                  "10.0.100.7" in fo(2) and re.search(r"(?i)02:00:00:00:64:07", fo(2)) is not None, fo(2)[-600:])
         pt.check("hv forward lists the forward its vm.toml asked for", re.search(r"port 8086 -> vm \d+", fo(6))
                  is not None, fo(6))
+        pt.check("alone on the switch, it reaches nos", ok_ping2(fo(7)), fo(7)[-600:])
+        pt.check("and not another network's guest, given its MAC",
+                 "alone-done" in fo(8) and "3 packets transmitted, 0 packets received" in fo(8), fo(8)[-600:])
+        listed = fo(9)
+        kept = re.search(r"(?m)^vm \d+ w0 .*10\.0\.100\.7 alone .*?\b(\d+) frames for another network's guests, "
+                         r"dropped", listed)
+        pt.check("hv list says who is on which network, and counts what the switch kept from the other",
+                 re.search(r"(?m)^vm 1 .*10\.0\.100\.3 on lab ", listed) is not None
+                 and kept is not None and int(kept.group(1)) >= 3, listed[-1200:])
         body = b""
         for attempt in range(10):
             try:

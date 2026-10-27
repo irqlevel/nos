@@ -73,6 +73,15 @@ fn made_up(r: &mut Input) -> Config {
     if r.bool() {
         o.port = Some(r.value32());
     }
+    if r.bool() {
+        /* A network's name, as a name may be. */
+        let n = 1 + r.below(crate::vmconfig::NETWORK_NAME_MAX as u64) as usize;
+        let name: String = (0..n).map(|i| {
+            let c = r.pick(&['a', 'z', '0', '9', '.', '_', '-', 'Q']);
+            if i == 0 && matches!(c, '.' | '_' | '-') { 'n' } else { c }
+        }).collect();
+        o.network = Some(name);
+    }
     for _ in 0..r.below(4) {
         let (host, guest) = (r.u16().max(1), r.u16().max(1));
         o.forwards.push((host, guest));

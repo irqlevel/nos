@@ -57,6 +57,9 @@ pub struct Options {
     pub port: Option<u32>,
     /// nos's ports relayed to its own once it runs: (nos's, the guest's).
     pub forwards: Vec<(u16, u16)>,
+    /// The network on the guests' switch it is on, whose other guests it
+    /// reaches; alone, reaching none, when not said.
+    pub network: Option<String>,
     /// The UUID its SMBIOS gives it, as RFC 4122 writes one: what its OS
     /// knows the machine by, the same at every start. A VM with a folder is
     /// given one at its first start, written into its vm.toml.
@@ -100,9 +103,10 @@ enum Key {
     Rxmod,
     Offload,
     Uuid,
+    Network,
 }
 
-const KEYS: [(&str, Key); 20] = [
+const KEYS: [(&str, Key); 21] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
@@ -123,7 +127,20 @@ const KEYS: [(&str, Key); 20] = [
     ("rxmod", Key::Rxmod),
     ("offload", Key::Offload),
     ("uuid", Key::Uuid),
+    ("network", Key::Network),
 ];
+
+/// The longest a network's name is.
+pub const NETWORK_NAME_MAX: usize = 31;
+
+/// Whether `name` may be a network's on the guests' switch: a letter or a
+/// digit, then letters, digits, `.`, `_` and `-`, at most
+/// `NETWORK_NAME_MAX` in all -- as a VM's name is.
+pub fn valid_network(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= NETWORK_NAME_MAX && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
 
 /// A value as the file writes it.
 enum Value {
@@ -193,6 +210,13 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
         (Key::Initrd, Value::Str(s)) if !s.is_empty() => o.initrd = Some(s),
         (Key::Kernel | Key::Initrd, Value::Str(_)) => return Err(error(line, &alloc::format!("{} is an empty path", name))),
         (Key::Cmdline, Value::Str(s)) => o.cmdline = Some(s),
+        (Key::Network, Value::Str(s)) => {
+            if !valid_network(&s) {
+                return Err(error(line, &alloc::format!("\"{}\" is not a network's name -- a letter or a digit, then \
+                                                        letters, digits, . _ and -, at most {}", s, NETWORK_NAME_MAX)));
+            }
+            o.network = Some(s);
+        }
         (Key::Uuid, Value::Str(s)) => {
             o.uuid = Some(uuid(&s).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a UUID -- \
                                                                               8-4-4-4-12 hex digits", s)))?);
@@ -232,7 +256,9 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
                 o.forwards.push(pair);
             }
         }
-        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input | Key::Uuid, v) => return Err(wrong("a string", &v)),
+        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input | Key::Uuid | Key::Network, v) => {
+            return Err(wrong("a string", &v));
+        }
         (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Port, v) => return Err(wrong("a number", &v)),
         (Key::Disks | Key::Forward, v) => return Err(wrong("a list of strings", &v)),
         (_, v) => return Err(wrong("true or false", &v)),
@@ -585,6 +611,9 @@ pub fn render(c: &Config) -> Option<String> {
     }
     if o.net {
         s.push_str("net = true\n");
+    }
+    if let Some(v) = &o.network {
+        put(&mut s, "network", v);
     }
     if let Some(v) = o.port {
         let _ = writeln!(s, "port = {}", v);
