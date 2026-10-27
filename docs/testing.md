@@ -564,7 +564,8 @@ moves, the locks, a vCPU's wait), for its network layer (the net devices,
 their frames, ARP, `hv0`'s end of the switch) and for the CPU, with
 overflow checks on as a `RUSTUB=1` kernel has them. Each target turns random bytes into what a guest does to
 one device: the serial port, the 8259, the PIT, the RTC, ACPI's fixed
-hardware, PCI configuration space, the local APIC through its MSRs and its
+hardware, the panic device (`pvpanic`: every write held to the event it is),
+PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
 made and not -- and raced: another of the guest's CPUs topping a ring up
 by plain writes while the device takes from it, as nothing on the host can
