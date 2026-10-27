@@ -24,7 +24,15 @@
 //! first two. The speculation controls as far as the host has them, and
 //! IA32_SPEC_CTRL and IA32_PRED_CMD as what the guest's CPUID promises of
 //! them: the bits its answers name, and nothing else.
+//!
+//! Where the guest's CPUs sit is a made-up host's threads given to a
+//! made-up guest (`place::Shape`), and every topology leaf -- leaf 1's
+//! counts, leaf 4's and AMD's 0x8000_001D's sharing, the x2APIC topology
+//! leaf, AMD's 0x8000_0008 and 0x8000_001E -- held to what the manuals say
+//! a package of that shape answers: one package, APIC IDs the CPUs'
+//! numbers, a core's threads in its low bit where it has two.
 
+use crate::place::{Shape, Topology};
 use crate::policy::{self, Asker, Cpuid, Own};
 use crate::targets::Input;
 use crate::x86::{self, cpu, fp};
@@ -44,6 +52,13 @@ const LEAF1_ECX: u32 = (1 << 0) | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 17) | 
     | (1 << 23) | (1 << 25) | (1 << 30);
 const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+/* Leaf 1 ECX: the APIC timer's TSC-deadline mode, for a guest with APICs
+ * (the stand-in's TSC rate is known). EDX: HTT, where a package has room
+ * for more than one APIC ID. */
+const LEAF1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+const LEAF1_EDX_HTT: u32 = 1 << 28;
+/* 0x8000_0001 ECX: TOPOEXT, AMD's topology leaves, as the host has it. */
+const EXT1_ECX_TOPOEXT: u32 = 1 << 22;
 /* Leaf 1 ECX's XSAVE line: XSAVE where any of its state is offered, and
  * OSXSAVE as the asking CPU's CR4 has it; AVX where AVX's is, and FMA and
  * F16C with it as the host has them -- VEX-coded on the YMM registers. */
@@ -189,6 +204,38 @@ fn pkru() -> Option<(u32, u32, bool)> {
     Some((h[EAX], h[EBX], h[ECX] & 0b10 != 0))
 }
 
+/// The APIC ID's bits below the package's, for a guest of `shape`: a core's
+/// threads', and enough for its cores -- its CPUs over its threads, rounded
+/// up (SDM vol. 3, 10.12.8; APM vol. 3, CPUID 0x8000_0008).
+fn package_shift(shape: &Shape) -> u32 {
+    let cores = shape.cpus().div_ceil(shape.threads()).max(1);
+    let mut bits = 0;
+    while (1u32 << bits) < cores {
+        bits += 1;
+    }
+    shape.smt_shift() + bits
+}
+
+/// A deterministic cache leaf's EAX as the guest is told it (SDM vol. 2,
+/// CPUID leaf 4; APM vol. 3, 0x8000_001D): the host's own fields of the
+/// cache -- type, level, self-initialising, fully associative -- and the
+/// guest's counts: the CPUs that share it -- a core's threads, and at the
+/// host's last level the package's where its CPUs share one cache -- and,
+/// in leaf 4, the package's cores. A subleaf of no cache, type 0, ends the
+/// list and has no counts; the last level is the highest before it.
+fn cache_eax(host_eax: u32, leaf: u32, shape: &Shape, cores: bool) -> u32 {
+    let own = host_eax & 0x3FFF;
+    if host_eax & 0x1F == 0 {
+        return own;
+    }
+    let last = (0..16u32).map_while(|s| host(leaf, s).filter(|h| h[EAX] & 0x1F != 0)).map(|h| (h[EAX] >> 5) & 7)
+        .max().unwrap_or(0);
+    let package = package_shift(shape);
+    let sharing = if (host_eax >> 5) & 7 >= last && shape.llc_shared() { 1 << package } else { shape.threads() };
+    let core_ids = if cores { ((1u32 << (package - shape.smt_shift())) - 1) << 26 } else { 0 };
+    own | ((sharing - 1) << 14) | core_ids
+}
+
 /// What the guest is told of the tops of the two ranges: no higher than
 /// the model's or the host's, and the vendor as the host says it.
 fn tops(asker: &Asker) -> (u32, u32) {
@@ -240,24 +287,42 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
     let avx_line = if avx { LEAF1_ECX_AVX_LINE } else { 0 };
     let runs = x86::offers();
     let bit = |yes: bool, b: u32| if yes { b } else { 0 };
+    let shape = &asker.shape;
+    let ids = 1u32 << package_shift(shape);
+    let deadline = bit(apic, LEAF1_ECX_TSC_DEADLINE);
+    let htt = bit(ids > 1, LEAF1_EDX_HTT);
+    let topoext = host(0x8000_0001, 0).is_some_and(|e| e[ECX] & EXT1_ECX_TOPOEXT != 0);
     match leaf {
         0 | 0x8000_0000 => {}
         1 => {
             want(g[0] == h[0], "the signature, the host's");
-            want(g[1] & 0xFFFF == h[1] & 0xFFFF && (g[1] >> 16) & 0xFF == 1 && g[1] >> 24 == apic_id & 0xFF,
-                 "EBX: the host's low half, one logical CPU, its own APIC ID");
-            want(leaked(g[2], h[2], LEAF1_ECX | avx_line, x2apic | LEAF1_ECX_HYPERVISOR | xsave_bits) == 0,
+            want(g[1] & 0xFFFF == h[1] & 0xFFFF && (g[1] >> 16) & 0xFF == ids & 0xFF && g[1] >> 24 == apic_id & 0xFF,
+                 "EBX: the host's low half, the APIC IDs the package has room for, its own APIC ID");
+            want(leaked(g[2], h[2], LEAF1_ECX | avx_line, x2apic | deadline | LEAF1_ECX_HYPERVISOR | xsave_bits) == 0,
                  "ECX within the model's");
             want(g[2] & (LEAF1_ECX_XSAVE | LEAF1_ECX_OSXSAVE | LEAF1_ECX_AVX) == xsave_bits,
                  "XSAVE where its state is offered, OSXSAVE as CR4 has it, AVX where its state is");
             want(g[2] & LEAF1_ECX_X2APIC == x2apic, "x2APIC exactly when the guest has APICs");
+            want(g[2] & LEAF1_ECX_TSC_DEADLINE == deadline, "the TSC-deadline timer exactly when the guest has APICs");
             want(g[2] & LEAF1_ECX_HYPERVISOR != 0, "the hypervisor bit");
-            want(leaked(g[3], h[3], LEAF1_EDX, apic_bit) == 0, "EDX within the model's");
+            want(leaked(g[3], h[3], LEAF1_EDX, apic_bit | htt) == 0, "EDX within the model's");
             want(g[3] & LEAF1_EDX_APIC == apic_bit, "the APIC exactly when the guest has APICs");
+            want(g[3] & LEAF1_EDX_HTT == htt, "HTT exactly when a package has room for more than one APIC ID");
         }
         4 => {
-            want(leaked(g[0], h[0], 0x3FFF, 0) == 0, "EAX: the cache's own fields, no core or sharing counts");
+            want(g[0] == cache_eax(h[0], 4, shape, true), "EAX: the cache's own fields, the guest's counts");
             want(g[1..] == h[1..], "EBX to EDX: the host's");
+        }
+        /* The x2APIC topology (SDM vol. 2, CPUID leaf 0xB): the SMT level,
+         * then the core level, then the end -- each with the CPU's own
+         * x2APIC ID. */
+        0xB => {
+            let level = match sub {
+                0 => [shape.smt_shift(), shape.threads(), 1 << 8, apic_id],
+                1 => [package_shift(shape), shape.cpus(), 2 << 8 | 1, apic_id],
+                _ => [0, 0, sub & 0xFF, apic_id],
+            };
+            want(g == level, "a core's threads, then the package's CPUs, then the end, with its APIC ID");
         }
         6 => want(g == [arat, 0, 0, 0], "ARAT for a guest with APICs, and nothing else"),
         7 if sub == 0 => {
@@ -310,7 +375,7 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         l if WHOLE.contains(&l) => want(g == h, "the host's, whole"),
         0x8000_0001 => {
             want(g[0] == h[0] && g[1] == h[1], "EAX and EBX: the host's");
-            want(leaked(g[2], h[2], EXT1_ECX, 0) == 0, "ECX within the model's");
+            want(leaked(g[2], h[2], EXT1_ECX | EXT1_ECX_TOPOEXT, 0) == 0, "ECX within the model's");
             want(leaked(g[3], h[3], EXT1_EDX | bit(runs.rdtscp, EXT1_EDX_RDTSCP), apic_bit) == 0,
                  "EDX within the model's");
         }
@@ -318,7 +383,19 @@ fn check_leaf(leaf: u32, sub: u32, asker: &Asker, (basic_top, ext_top): (u32, u3
         0x8000_0008 => {
             want(g[0] == h[0] & EXT8_EAX, "EAX: the address widths, the host's");
             want(leaked(g[1], h[1], EXT8_EBX | EXT8_EBX_SPEC, 0) == 0, "EBX within the model's");
-            want(g[2] == 0 && g[3] == 0, "ECX and EDX: nothing -- one core");
+            let ecx = if cpu::host_is_intel() { 0 } else { ((shape.cpus() - 1) & 0xFF) | package_shift(shape) << 12 };
+            want(g[2] == ecx && g[3] == 0, "ECX: AMD's, the package's CPUs and its APIC IDs' width; EDX nothing");
+        }
+        /* AMD's topology leaves, where the host has them: its caches with
+         * the guest's sharing, and the CPU's APIC ID, core and threads, in
+         * one node (APM vol. 3, CPUID 0x8000_001D, 0x8000_001E). */
+        0x8000_001D if topoext => {
+            want(g[0] == cache_eax(h[0], 0x8000_001D, shape, false) && g[1..] == h[1..],
+                 "the host's cache, the guest's sharing count");
+        }
+        0x8000_001E if topoext => {
+            want(g == [apic_id, ((apic_id >> shape.smt_shift()) & 0xFF) | (shape.threads() - 1) << 8, 0, 0],
+                 "its APIC ID, its core and the core's threads, one node");
         }
         0x8000_0021 => {
             want(leaked(g[0], h[0], EXT21_EAX | EXT21_EAX_SPEC, 0) == 0, "EAX within the model's");
@@ -353,8 +430,9 @@ const MSR_EFER: u32 = 0xC000_0080;
 
 /// Each CPUID bit and what it promises, from the manuals: the leaf, the
 /// subleaf, the register and the bit, and the MSR or the EFER bit a guest
-/// that sees it will use. The local APIC's MSRs are not here: the run loop
-/// gives them to the APIC before the policy is asked.
+/// that sees it will use. The local APIC's MSRs are not here, nor the
+/// TSC-deadline timer's, IA32_TSC_DEADLINE: the run loop gives them to the
+/// APIC before the policy is asked.
 const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (1, 0, EDX, 4, Needs::Read(0x10), "TSC"),
     (1, 0, EDX, 11, Needs::Read(0x174), "SEP"),
@@ -366,7 +444,6 @@ const IMPLIED: &[(u32, u32, usize, u32, Needs, &str)] = &[
     (1, 0, EDX, 21, Needs::Read(0x600), "DS"),
     (1, 0, ECX, 5, Needs::Read(0x480), "VMX"),
     (1, 0, ECX, 15, Needs::Read(0x345), "PDCM"),
-    (1, 0, ECX, 24, Needs::Read(0x6E0), "TSC deadline"),
     (6, 0, EAX, 0, Needs::Read(0x19C), "digital thermal sensor"),
     (6, 0, EAX, 7, Needs::Read(0x770), "HWP"),
     (6, 0, ECX, 0, Needs::Read(0xE7), "APERF/MPERF"),
@@ -716,7 +793,15 @@ pub fn policy_target(r: &mut Input) {
     let xcr0 = fp::XCR0_X87
         | (r.pick(&[0, fp::XCR0_SSE, fp::XCR0_SSE | fp::XCR0_AVX, fp::XCR0_PKRU,
                     fp::XCR0_SSE | fp::XCR0_AVX | fp::XCR0_PKRU]) & fp::offered());
-    let asker = Asker { apic_id: r.below(16) as u32, apic: r.bool(), cr4: r.value64(), xcr0 };
+    /* Where the guest's CPUs sit: a made-up host's threads, with SMT or
+     * not and its caches shared this widely, given to a made-up guest --
+     * its CPUs on them in order, now and then anywhere -- or none said. */
+    let topo = Topology::of(r.below(2) as u32, r.below(6) as u32);
+    let n = 1 + r.below(64) as u32;
+    let vcpus: Vec<u32> = (0..n).map(|i| if r.u8() < 232 { i } else { r.below(64) as u32 }).collect();
+    let shape = if r.u8() < 32 { Shape::cores(n) } else { Shape::of(&topo, &vcpus) };
+    let apic_id = r.below(u64::from(shape.cpus())) as u32;
+    let asker = Asker { apic_id, apic: r.bool(), cr4: r.value64(), xcr0, shape };
     let told = tops(&asker);
     for leaf in (0..=0x30u32).chain(0x4000_0000..=0x4000_0010).chain(0x8000_0000..=0x8000_0030) {
         check_leaf(leaf, r.below(4) as u32, &asker, told);

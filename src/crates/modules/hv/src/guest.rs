@@ -12,6 +12,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use hv::linux::Header;
+use hv::place::Shape;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
 use hv::{Doorbells, Machine};
 use kcore::consts::{NS_PER_MS, NS_PER_SEC};
@@ -98,6 +99,10 @@ pub struct Spec {
     /// `forward=`: nos's ports relayed to the guest's, once it runs.
     pub forwards: Vec<(u16, u16)>,
     pub nic: Option<NicSpec>,
+    /// Where its CPUs sit, as their CPUID tells them: what its placement
+    /// made of them (`hv::place::Placement::shape`), once it has one --
+    /// each a core of its own until then. Every boot of it is told the same.
+    pub shape: Shape,
 }
 
 /// A guest's NIC: its port on the switch.
@@ -259,6 +264,7 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         port,
         forwards: o.forwards,
         nic: None,
+        shape: Shape::cores(cpus),
     })
 }
 
@@ -451,6 +457,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     if spec.nooffload {
         guest.set_offloads(false);
     }
+    guest.set_shape(spec.shape);
 
     /* The 64-bit kernel at its load address -- or each of a PVH image's
      * segments at its own, the zeroes past its file bytes being the fresh

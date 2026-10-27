@@ -388,6 +388,7 @@ const APIC_ICR: u32 = 0x30;
 const APIC_ICR_HIGH: u32 = 0x31;
 const APIC_LVT_TIMER: u32 = 0x32;
 const APIC_TIMER_INITIAL: u32 = 0x38;
+const APIC_TIMER_CURRENT: u32 = 0x39;
 const APIC_TIMER_DIVIDE: u32 = 0x3E;
 const APIC_SELF_IPI: u32 = 0x3F;
 
@@ -410,8 +411,11 @@ pub fn apic_value(r: &mut Input, reg: u32) -> u64 {
     match reg {
         APIC_SVR => 0x100 | vector | u64::from(r.u8() & 0x10) << 8,
         APIC_LVT_TIMER | 0x33..=0x37 => {
-            vector | (r.below(8) << 8) | u64::from(r.bool()) << 16 | u64::from(r.bool()) << 17
-                | u64::from(r.bool()) << 13 | u64::from(r.bool()) << 15
+            /* The timer's TSC-deadline mode now and then: bit 18 with 17,
+             * the reserved mode, rarely. */
+            let deadline = reg == APIC_LVT_TIMER && r.u8() < 64;
+            vector | (r.below(8) << 8) | u64::from(r.bool()) << 16 | u64::from(r.bool() && (!deadline || r.rare())) << 17
+                | u64::from(deadline) << 18 | u64::from(r.bool()) << 13 | u64::from(r.bool()) << 15
         }
         APIC_TIMER_INITIAL => r.pick(&[1u64, 2, 100, 10_000, 1_000_000, 0xFFFF_FFFF]),
         APIC_TIMER_DIVIDE => r.below(16),
@@ -455,11 +459,33 @@ fn apic_write(a: &mut Lapic, r: &mut Input, reg: u32, value: u64, now: u64) {
     }
 }
 
+/// The timer's mode, LVT bits 18:17, as the guest reads its entry -- through
+/// the MSR in x2APIC mode, the page in xAPIC mode; None with the APIC off.
+fn timer_mode(a: &Lapic, now: u64) -> Option<u32> {
+    apic_read(a, APIC_LVT_TIMER, now).map(|lvt| (lvt >> 17) & 0b11)
+}
+
+/// TSC-deadline mode's code in those bits.
+const TIMER_DEADLINE: u32 = 0b10;
+
+/// Register `reg` as the guest reads it, in the APIC's mode; None with the
+/// APIC off.
+fn apic_read(a: &Lapic, reg: u32, now: u64) -> Option<u32> {
+    if !a.enabled() {
+        return None;
+    }
+    if a.xapic() {
+        Some(a.mmio_read(reg << 4, 4, now))
+    } else {
+        a.rdmsr(lapic::MSR_X2APIC_FIRST + reg, now).ok().map(|v| v as u32)
+    }
+}
+
 fn lapic_target(r: &mut Input) {
     let (id, bsp, x2apic) = (r.below(16) as u32, r.bool(), r.bool());
     let mut a = Lapic::new(id, bsp, x2apic);
     let mut now = time::boot_time_ns();
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         match op {
             0 => {
                 let reg = apic_reg(r);
@@ -515,6 +541,48 @@ fn lapic_target(r: &mut Input) {
             10 => a.init(),
             11 => {
                 apic_write(&mut a, r, APIC_SVR, 0x1FF, now);
+            }
+            13 => {
+                /* IA32_TSC_DEADLINE, in whatever mode the timer is: in
+                 * TSC-deadline mode a deadline armed and read back, gone
+                 * once the timer has run out; in any other, nothing taken
+                 * and 0 read (SDM 11.5.4.1). */
+                let before = timer_mode(&a, now);
+                if r.u8() < 128 {
+                    let entry = 0x4_0000 | (16 + r.below(240));
+                    apic_write(&mut a, r, APIC_LVT_TIMER, entry, now);
+                }
+                /* The mode as the guest reads it in the timer's entry. */
+                let mode = timer_mode(&a, now);
+                if mode == Some(TIMER_DEADLINE) {
+                    invariant!(before == mode || a.tsc_deadline() == 0,
+                               "IA32_TSC_DEADLINE {:#x} on the way into TSC-deadline mode", a.tsc_deadline());
+                    invariant!(apic_read(&a, APIC_TIMER_CURRENT, now) == Some(0),
+                               "the current count read {:?} in TSC-deadline mode", apic_read(&a, APIC_TIMER_CURRENT, now));
+                }
+                let value = if r.u8() < 32 { 0 } else { r.value64() };
+                let at = time::later(now, r.time_step());
+                let next = a.next_timer_ns();
+                a.set_tsc_deadline(value, at);
+                let read = a.tsc_deadline();
+                match mode {
+                    Some(TIMER_DEADLINE) => {
+                        invariant!(read == value, "IA32_TSC_DEADLINE read {:#x} after {:#x} was written", read, value);
+                        if value != 0 {
+                            let later = time::later(at, r.time_step());
+                            a.timer(later);
+                            invariant!(a.tsc_deadline() == 0, "IA32_TSC_DEADLINE {:#x} once the timer ran out",
+                                       a.tsc_deadline());
+                            now = later;
+                        }
+                    }
+                    Some(other) => {
+                        invariant!(read == 0, "IA32_TSC_DEADLINE read {:#x} in timer mode {}", read, other);
+                        invariant!(a.next_timer_ns() == next, "IA32_TSC_DEADLINE written in timer mode {} moved the \
+                                   timer from {:?} to {:?}", other, next, a.next_timer_ns());
+                    }
+                    None => {}
+                }
             }
             _ => {
                 a.sync_cr8(r.u8() & 0xF);

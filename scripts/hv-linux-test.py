@@ -306,7 +306,14 @@ def vm_commands(args):
         on = r"cpus \d+(,\d+){%d}" % (args.cpus - 1)
         online = "hv exec 0 cat /sys/devices/system/cpu/online"
         irqs = "hv exec 0 grep -e LOC -e RES -e CAL /proc/interrupts"
-        smp_lines = [online, irqs]
+        # Where its CPUs sit, as it found from its CPUID -- one package, and
+        # with two CPUs on one core's two threads, that core -- and the
+        # timer it chose: the local APIC's in TSC-deadline mode.
+        shape = ("hv exec 0 (cd /sys/devices/system/cpu/cpu0; cat topology/package_cpus_list "
+                 "topology/thread_siblings_list cache/index3/shared_cpu_list "
+                 "../../clockevents/clockevent0/current_device); grep -m1 -o tsc_deadline_timer /proc/cpuinfo; "
+                 "echo shape-done")
+        smp_lines = [online, irqs, shape]
         smp_checks = [
             (online, 0, "every one of the guest's %d CPUs is online" % args.cpus,
              r"(?m)^0-%d$" % (args.cpus - 1), True),
@@ -316,12 +323,19 @@ def vm_commands(args):
              r"(?m)^\s*RES:(\s+\d+)*\s+[1-9]\d*", True),
             ("hv list", 0, "hv list says where each of its CPUs runs",
              r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
+            (shape, 0, "its CPUs are one package, and its timer the local APIC's in TSC-deadline mode",
+             r"(?m)^0-%d\s*$[\s\S]*^lapic-deadline\s*$\s*^tsc_deadline_timer\s*$\s*^shape-done"
+             % (args.cpus - 1), True),
         ]
         if args.cpus == 2:
             # Its cores its own, its CPUs filling their threads: one core's
             # two, a vCPU a thread, and the other core left to vm 1.
             smp_checks.append(("hv list", 0, "its two CPUs are one core's two threads, a core of its own",
                                r"vm 0  running  cpus (2,3|3,2|0,1|1,0)  ", True))
+            # And it knows: the core's two threads, sharing its last-level
+            # cache.
+            smp_checks.append((shape, 0, "and the guest sees them so: one core's two threads, one cache",
+                               r"(?m)^0-1\s*$\s*^0-1\s*$\s*^0-1\s*$\s*^lapic-deadline", True))
         if args.ioapic:
             # The PC's own lines through the IO-APIC: the timer's on pin 2,
             # which the boot counts its ticks by before the local APICs'
