@@ -77,12 +77,30 @@ struct Racer {
     left: usize,
 }
 
-/// What the memory and every mapping of it share: the pages, and the racer
-/// that watches reads of them. Its reads and writes are inside the memory's
+/// Another CPU of the guest's making one chain available while the device
+/// works -- after the device's `after`th read of the available index from
+/// when it is armed -- and reading the device's `avail_event` right after,
+/// as a driver does to decide whether to kick: the moment EVENT_IDX's ask
+/// has to survive, a chain published between the device's last look at the
+/// ring and its ask for a kick, by a driver that saw no ask yet.
+struct LatePost {
+    idx: u64,
+    ring: u64,
+    avail_event: u64,
+    size: u16,
+    head: u16,
+    after: usize,
+    /// Once posted: the `avail_event` the driver read.
+    seen: Option<u16>,
+}
+
+/// What the memory and every mapping of it share: the pages, and the racers
+/// that watch reads of them. Their reads and writes are inside the memory's
 /// regions, which whoever calls them has checked.
 struct Shared {
     pages: Mutex<Pages>,
     racer: Mutex<Option<Racer>>,
+    late: Mutex<Option<LatePost>>,
 }
 
 pub struct GuestMemory {
@@ -100,7 +118,7 @@ impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
         Ok(GuestMemory {
             regions: Vec::new(),
-            shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None) }),
+            shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None), late: Mutex::new(None) }),
             absent: Mutex::new(Vec::new()),
             refuse_maps: AtomicBool::new(false),
             maps: AtomicUsize::new(0),
@@ -117,6 +135,29 @@ impl GuestMemory {
     /// The race over: how many chains the racer posted.
     pub fn stop_race(&self) -> usize {
         self.shared.racer.lock().unwrap().take().map_or(0, |r| r.posts)
+    }
+
+    /// Have another CPU make the chain at `head` available on the ring
+    /// whose index is at `idx` and entries from `ring`, after the device's
+    /// `after`th read of the index from now (`LatePost`), and read the
+    /// device's word at `avail_event` right after.
+    pub fn post_late(&self, idx: u64, ring: u64, avail_event: u64, size: u16, head: u16, after: usize) {
+        *self.shared.late.lock().unwrap() = Some(LatePost { idx, ring, avail_event, size, head, after, seen: None });
+    }
+
+    /// The late post, once made: the `avail_event` its driver read, the
+    /// post over. None while it waits for its read.
+    pub fn late_posted(&self) -> Option<u16> {
+        let mut late = self.shared.late.lock().unwrap();
+        let seen = late.as_ref()?.seen?;
+        *late = None;
+        Some(seen)
+    }
+
+    /// The late post called off before it was made: whether it was still
+    /// waiting.
+    pub fn cancel_late(&self) -> bool {
+        self.shared.late.lock().unwrap().take().is_some_and(|l| l.seen.is_none())
     }
 
     /// From now on `map` refuses, or maps again: what a device does with its
@@ -242,6 +283,7 @@ impl Shared {
     /// index has it publish the next chain, when the ring has room for one.
     /// The racer's ring is one a target laid out inside the memory.
     fn race_after_read(&self, gpa: u64, len: usize) {
+        self.post_after_read(gpa, len);
         let mut racer = self.racer.lock().unwrap();
         let Some(r) = racer.as_mut() else { return };
         if !(gpa < r.idx.saturating_add(2) && r.idx < gpa.saturating_add(len as u64)) {
@@ -262,6 +304,27 @@ impl Shared {
         let slot = u64::from(idx % r.size);
         self.write(r.ring + 2 * slot, &r.head.to_le_bytes());
         self.write(r.idx, &idx.wrapping_add(1).to_le_bytes());
+    }
+
+    /// A read the device made, as the late poster sees it: its chain made
+    /// available after the read it waits for, and the device's ask read.
+    fn post_after_read(&self, gpa: u64, len: usize) {
+        let mut late = self.late.lock().unwrap();
+        let Some(l) = late.as_mut() else { return };
+        if l.seen.is_some() || !(gpa < l.idx.saturating_add(2) && l.idx < gpa.saturating_add(len as u64)) {
+            return;
+        }
+        if l.after != 0 {
+            l.after -= 1;
+            return;
+        }
+        let mut b = [0u8; 2];
+        self.read_unraced(l.idx, &mut b);
+        let idx = u16::from_le_bytes(b);
+        self.write(l.ring + 2 * u64::from(idx % l.size), &l.head.to_le_bytes());
+        self.write(l.idx, &idx.wrapping_add(1).to_le_bytes());
+        self.read_unraced(l.avail_event, &mut b);
+        l.seen = Some(u16::from_le_bytes(b));
     }
 }
 

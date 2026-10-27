@@ -792,13 +792,15 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             let _ = write!(out, "; {} discards ({} KiB), {} writes of zeros ({} KiB)", s.discards,
                 s.discarded_bytes / 1024, s.zeroings, s.zeroed_bytes / 1024);
         }
+        let _ = write!(out, "; {} notifies, {} interrupts", s.notifies, s.interrupts);
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
     }
     for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",
-            i, s.sent, s.received, s.dropped, s.large, s.whole,
-            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole; \
+            notifies {} to send, {} to receive; interrupts {} for sends, {} for receives{}{}",
+            i, s.sent, s.received, s.dropped, s.large, s.whole, s.tx_notifies, s.rx_notifies, s.tx_interrupts,
+            s.rx_interrupts, if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {

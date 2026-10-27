@@ -21,6 +21,21 @@
 //! size, a chain longer than the queue (a loop), a buffer outside guest
 //! memory make the ring `Broken`, and a device that finds one stops using the
 //! queue until the driver resets it -- rather than the host trusting it.
+//!
+//! Each side tells the other when it wants to hear of the other's work. A
+//! driver that takes EVENT_IDX (`F_EVENT_IDX`) says at which used entry it
+//! wants an interrupt (`used_event`, past its available ring's entries), and
+//! the device at which available entry it wants a kick (`avail_event`, past
+//! the used ring's elements): an interrupt or a kick for every entry is an
+//! exit for every request and every frame, which under load was most of what
+//! a guest's I/O cost. Without it the driver's one flag says whether it wants
+//! interrupts at all, and every chain it makes available is a kick. A device
+//! that stops taking chains for want of them asks for a kick at the next
+//! (`ask_kick`), and looks once more: what the driver made available before
+//! it saw the ask has no kick coming for it. One that stops for any other
+//! reason -- every buffer of its own in use, a frame that has its buffers
+//! already, a pass at its bound -- asks for none, and comes back by itself:
+//! the driver's chains meanwhile cost the guest no exit.
 
 use alloc::vec::Vec;
 
@@ -65,8 +80,22 @@ const DESC_INDIRECT: u16 = 4;
 /// A descriptor's size in the table, and a used element's.
 const DESC_SIZE: usize = 16;
 const USED_ELEM_SIZE: usize = 8;
-/// The available ring's flag: the driver wants no interrupt.
+/// The available ring's flag: the driver wants no interrupt. Not looked at
+/// with EVENT_IDX, whose `used_event` says when.
 const AVAIL_NO_INTERRUPT: u16 = 1;
+/// VIRTIO_RING_F_EVENT_IDX: each side says at which entry it wants to hear
+/// of the other's work -- a feature of the ring, which a device offers when
+/// it asks for its kicks (`Queue::ask_kick`).
+pub const F_EVENT_IDX: u32 = 1 << 29;
+
+/// Whether moving an index from `old` to `new` passed `event` -- the entry
+/// the other side asked to hear of -- as the virtio spec has it
+/// (`vring_need_event`): in wrapping 16-bit arithmetic, `event` in
+/// `old..new`.
+#[inline]
+pub fn need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
+}
 
 /// A driver's buffer, from a descriptor: where it is, how long, and whether
 /// the device writes it (or reads it). Where it is is the guest's to say --
@@ -123,6 +152,9 @@ pub struct Queue {
     /// The next available entry to take, and the next used one to fill.
     next_avail: u16,
     next_used: u16,
+    /// The driver's available index as the device last read it: what it
+    /// has looked at, up to there, and asks a kick past (`ask_kick`).
+    seen: u16,
     /// Its rings mapped into the host's space, from when the driver gives
     /// their page frame number until it takes the queue down
     /// (`GuestMemory::map`): read and written at every chain, where a copy
@@ -130,18 +162,26 @@ pub struct Queue {
     /// each time. None while the queue is down, and when no mapping was to
     /// be had (`Maps`): the rings are copied as they always were then.
     mapped: Option<Mapping>,
+    /// The driver took EVENT_IDX: interrupts by its `used_event`, kicks by
+    /// the device's `avail_event`.
+    event_idx: bool,
+    /// The used index the last interrupt decision was made at, once one was:
+    /// what `used_event` is held against, entries given back since.
+    signalled_used: Option<u16>,
 }
 
 impl Queue {
     pub fn new(size: u16) -> Queue {
-        Queue { size, pfn: 0, next_avail: 0, next_used: 0, mapped: None }
+        Queue { size, pfn: 0, next_avail: 0, next_used: 0, seen: 0, mapped: None, event_idx: false, signalled_used: None }
     }
 
     fn reset(&mut self) {
         self.pfn = 0;
         self.next_avail = 0;
         self.next_used = 0;
+        self.seen = 0;
         self.mapped = None;
+        self.signalled_used = None;
     }
 
     /// Set up by the driver at `pfn`: its rings mapped from there when `map`
@@ -150,6 +190,8 @@ impl Queue {
         self.pfn = pfn;
         self.next_avail = 0;
         self.next_used = 0;
+        self.seen = 0;
+        self.signalled_used = None;
         /* The old rings' mapping undone before a new one is made. */
         self.mapped = None;
         if map {
@@ -182,6 +224,21 @@ impl Queue {
         self.used_at() + 6 + USED_ELEM_SIZE * usize::from(self.size)
     }
 
+    /// The driver's `used_event`: after the available ring's entries.
+    fn used_event_at(&self) -> usize {
+        self.avail_at() + 4 + 2 * usize::from(self.size)
+    }
+
+    /// The device's `avail_event`: after the used ring's elements.
+    fn avail_event_at(&self) -> usize {
+        self.used_at() + 4 + USED_ELEM_SIZE * usize::from(self.size)
+    }
+
+    /// Whether the driver took EVENT_IDX for this queue.
+    pub fn event_idx(&self) -> bool {
+        self.event_idx
+    }
+
     fn rings<'a>(&'a self, mem: &'a GuestMemory) -> Rings<'a> {
         Rings { mapped: self.mapped.as_ref(), mem, base: self.base() }
     }
@@ -200,13 +257,15 @@ impl Queue {
     }
 
     /// How many chains the driver has made available and the device not
-    /// taken: never more than the queue holds.
-    fn waiting(&self, mem: &GuestMemory) -> Result<u16, Broken> {
+    /// taken: never more than the queue holds. What it read is what the
+    /// device has seen.
+    fn waiting(&mut self, mem: &GuestMemory) -> Result<u16, Broken> {
         let avail_idx = self.rings(mem).word(self.avail_at() + 2)?;
         let waiting = avail_idx.wrapping_sub(self.next_avail);
         if waiting > self.size {
             return Err(Broken::Overrun);
         }
+        self.seen = avail_idx;
         Ok(waiting)
     }
 
@@ -217,7 +276,7 @@ impl Queue {
     /// of them falling short -- never goes. `most` bounds the walk too, which
     /// a guest's chains of no room would otherwise make the whole ring's at
     /// every look. `segs` is scratch.
-    pub fn room_ahead(&self, mem: &GuestMemory, need: u64, most: u16, segs: &mut Vec<Seg>) -> Result<Room, Broken> {
+    pub fn room_ahead(&mut self, mem: &GuestMemory, need: u64, most: u16, segs: &mut Vec<Seg>) -> Result<Room, Broken> {
         let waiting = self.waiting(mem)?;
         let mut room = 0u64;
         for k in 0..waiting.min(most) {
@@ -279,17 +338,51 @@ impl Queue {
         published
     }
 
-    /// Whether the driver wants an interrupt for what was given back -- read
-    /// after a full fence. The driver turns interrupts back on and then
-    /// looks for what came meanwhile; without the fence, the device's load
-    /// of its flag can pass its own store of the used index, still in the
-    /// CPU's store buffer, and each sees the other's old value: the driver
-    /// waits for an interrupt the device decided not to send. A copy through
-    /// the kernel's window fenced it by accident -- the unmap's INVLPG is a
-    /// serializing instruction -- which the mapped rings do not.
-    pub fn wants_interrupt(&self, mem: &GuestMemory) -> bool {
+    /// Whether the driver wants an interrupt for what was given back since
+    /// the last time this was asked -- read after a full fence. The driver
+    /// turns interrupts back on and then looks for what came meanwhile;
+    /// without the fence, the device's load of its flag can pass its own
+    /// store of the used index, still in the CPU's store buffer, and each
+    /// sees the other's old value: the driver waits for an interrupt the
+    /// device decided not to send. A copy through the kernel's window fenced
+    /// it by accident -- the unmap's INVLPG is a serializing instruction --
+    /// which the mapped rings do not. With EVENT_IDX, when the used index has
+    /// passed the driver's `used_event` since the last time -- or this is the
+    /// first, or the word is not to be read: an interrupt too many is the
+    /// driver's to ignore, one too few a guest that waits for good.
+    pub fn wants_interrupt(&mut self, mem: &GuestMemory) -> bool {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.rings(mem).word(self.avail_at()).map_or(true, |flags| flags & AVAIL_NO_INTERRUPT == 0)
+        if !self.event_idx {
+            return self.rings(mem).word(self.avail_at()).map_or(true, |flags| flags & AVAIL_NO_INTERRUPT == 0);
+        }
+        let Some(old) = self.signalled_used.replace(self.next_used) else { return true };
+        match self.rings(mem).word(self.used_event_at()) {
+            Ok(event) => need_event(event, self.next_used, old),
+            Err(_) => true,
+        }
+    }
+
+    /// With EVENT_IDX, ask for a kick at the driver's next chain past what
+    /// the device has seen of the ring -- which it has taken, or looked at
+    /// and found short (`room_ahead`) -- and say whether the driver has made
+    /// another available since: one made before the driver could see the
+    /// ask, which no kick comes for, so the device looks again now rather
+    /// than wait. The index is read after a full fence, for the reason
+    /// `wants_interrupt` gives the other way: the driver stores its index
+    /// and then loads `avail_event`, and without the fence each could miss
+    /// the other's store -- the chain made, and no kick asked for it. The
+    /// ask is the index seen, not the next to take: past chains the device
+    /// has looked at already, a kick that waited for the next one to take
+    /// would never come. Without EVENT_IDX every chain is a kick, and there
+    /// is nothing to ask.
+    pub fn ask_kick(&mut self, mem: &GuestMemory) -> Result<bool, Broken> {
+        if !self.event_idx {
+            return Ok(false);
+        }
+        let rings = self.rings(mem);
+        rings.put_word(self.avail_event_at(), self.seen)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(rings.word(self.avail_at() + 2)? != self.seen)
     }
 }
 
@@ -475,7 +568,15 @@ impl Transport {
     /// device is, for a guest's next boot.
     pub fn set_device_features(&mut self, features: u32) {
         self.device_features = features;
-        self.driver_features &= features;
+        self.set_driver_features(self.driver_features & features);
+    }
+
+    /// What the driver takes, and what that makes of its queues.
+    fn set_driver_features(&mut self, features: u32) {
+        self.driver_features = features;
+        for q in &mut self.queues {
+            q.event_idx = features & F_EVENT_IDX != 0;
+        }
     }
 
     /// Offer MSI-X, with a table of `entries`: every source's vector starts
@@ -533,7 +634,7 @@ impl Transport {
     }
 
     fn reset(&mut self) {
-        self.driver_features = 0;
+        self.set_driver_features(0);
         self.status = 0;
         self.isr = 0;
         self.select = 0;
@@ -602,7 +703,7 @@ impl Transport {
         let mut asked = Asked::Nothing;
         if touches(DRIVER_FEATURES, 4) {
             /* Only what was offered can be taken. */
-            self.driver_features = get32(&h, DRIVER_FEATURES) & self.device_features;
+            self.set_driver_features(get32(&h, DRIVER_FEATURES) & self.device_features);
         }
         if touches(QUEUE_SELECT, 2) {
             self.select = get16(&h, QUEUE_SELECT);
