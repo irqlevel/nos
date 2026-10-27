@@ -730,6 +730,18 @@ def check_boot(args, txt):
         pt.check("and the report says the guest started them",
                  re.search(r"cpus\s+%d, %d started by the guest" % (args.cpus, args.cpus - 1), txt) is not None,
                  txt[-2500:])
+    if args.kvm:
+        # A guest kernel built with KVM_GUEST: it finds KVM by the
+        # signature, takes what of its paravirtual interface is offered --
+        # NOP_IO_DELAY, and with APICs PV EOI -- and, offered no PV unhalt,
+        # keeps its spinlocks native.
+        pt.check("the guest found KVM's paravirtual interface", "Hypervisor detected: KVM" in block, block[-1500:])
+        if args.cpus > 1:
+            pt.check("and made EOIs through its PV EOI word, done by the host at the next exit",
+                     re.search(r"(?m)^\s+pv eoi\s+[1-9]\d* EOIs the guest made through its word", txt) is not None,
+                     txt[-2500:])
+            pt.check("and kept its spinlocks native, offered no PV unhalt",
+                     "kvm-guest: PV spinlocks disabled, no host support" in block, block[-1500:])
     if args.apicv and args.cpus > 1 and not (args.xapic or args.ioapic) and accel_args(args)[1] == "host" \
             and hvt.host_has_vmx():
         # Asked for, under VT-x, in x2APIC mode: the CPU delivered its
@@ -1559,6 +1571,10 @@ def main():
                     help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
                          "the machine's tables, reboots by the FADT's reset register, and shuts down when "
                          "hv stop presses its power button")
+    ap.add_argument("--kvm", action="store_true",
+                    help="the guest kernel has KVM_GUEST (and PARAVIRT_SPINLOCKS): check that it finds KVM's "
+                         "paravirtual interface, and with --cpus 2 or more makes EOIs through its PV EOI word "
+                         "and keeps its spinlocks native")
     ap.add_argument("--xapic", action="store_true",
                     help="the guest's local APICs out of reset in xAPIC mode (hv's `xapic`): every access of "
                          "theirs through the page, each instruction decoded and performed by the hypervisor")
