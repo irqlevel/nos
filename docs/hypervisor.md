@@ -1654,12 +1654,19 @@ ring full waits for its disk rather than growing anything of nos's.
 
 **The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
 request and gives it back served): the module's `FileDisk` holds the image
-open (`kcore::fs::File`, whose handle the kernel looks up on every call; the
-file cannot be removed, nor its filesystem unmounted, while the disk has
-it), reads and writes it where the guest asks -- within the file's size,
-never growing it -- and for a guest's flush, offered and taken by ext4,
-syncs the filesystem it is on. The report counts each disk's reads, writes,
-flushes and errors.
+(`kcore::fs::Image`, whose word the kernel looks up on every call; nothing
+else may write the file, cut it, grow it, rename it or remove it while the
+disk has it, nor its filesystem be unmounted -- [A disk's
+image](filesystems.md#a-disks-image)), reads and writes it where the guest
+asks -- within the file's size, never growing it -- off the VFS's lock,
+the image mapping the blocks under it and moving them itself, and for a
+guest's flush, offered and taken by ext4, flushes the device: the
+filesystem's sync only after a write into a hole, which goes through the
+VFS. Which file it is comes first, so that a second guest's disk on it is
+refused saying whose it is (`Claims`), and only then is it held. The
+report counts each disk's reads, writes, flushes and errors, and the image
+says as it is let go of how many of its batches went off the lock and how
+many through it.
 
 **What a guest's write costs nos's ext2** ([Filesystems](filesystems.md)):
 one into a hole of the image flushes nos's disk once and writes the pointers
@@ -4398,12 +4405,15 @@ someone else's; then speed.
 #### Speed
 
 1. **The CPU a guest is shown**, above, is the largest lever on Intel.
-2. **The disk is one request at a time, machine-wide.** `Vfs::read_at` and
-   `write_within` hold the VFS's one lock across the whole synchronous ext2
-   read or write, and a guest's FLUSH is a sync of the whole filesystem
-   under it: every guest's disks and nos's own files go in single file.
-   Fix: the image's block map resolved under the lock, the I/O through the
-   block layer's asynchronous path, more than `IN_FLIGHT` (8) in flight.
+2. ~~**The disk is one request at a time, machine-wide.**~~ A guest's
+   image is held and read and written off the VFS's lock (`fs::image`):
+   its block map resolved under it, the blocks moved without it, a flush
+   the device's unless a write into a hole went through the VFS -- so one
+   guest's disk no longer waits behind another's, nor behind nos's own
+   files. What it was: `Vfs::read_at` and `write_within` held the VFS's one
+   lock across the whole synchronous ext2 read or write, and a guest's
+   FLUSH was a sync of the whole filesystem under it. Left: each disk
+   still serves its requests one at a time, on its one task.
 3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
    work on legacy virtio; and a guest of one CPU has no local APIC, so no
    MSI-X -- six exits an interrupt through the 8259.

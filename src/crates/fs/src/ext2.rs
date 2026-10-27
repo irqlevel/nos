@@ -2428,6 +2428,35 @@ impl Ext2 {
         self.read_inode_data(&inode, buf, offset)
     }
 
+    /// The device sector each of `out.len()` blocks of `file` from block
+    /// `first` begins at, 0 for a hole: what a disk's image reads and
+    /// writes off the VFS's lock (`image`). A walk of the file's tree as a
+    /// read's is -- through the indirect blocks cached and the pointers a
+    /// write has set and not yet put down -- with nothing allocated.
+    pub fn map_blocks(&mut self, file: NodeId, first: u64, out: &mut [u64]) -> bool {
+        let Some(ino) = self.file_ino(file) else { return false };
+        let Some(inode) = self.read_inode(ino) else {
+            trace!(0, "ext2: read of inode {} failed", ino);
+            return false;
+        };
+        /* A walk maps but never allocates, so the inode is not modified */
+        let mut scratch = inode;
+        let sectors = (self.io.block_size / self.io.sector_size) as u64;
+        for (k, slot) in out.iter_mut().enumerate() {
+            let Some(logical) = first.checked_add(k as u64).and_then(|l| u32::try_from(l).ok()) else {
+                return false;
+            };
+            *slot = match self.map_block(&mut scratch, 0, logical, false) {
+                Some((block, _)) => u64::from(block) * sectors,
+                None => {
+                    trace!(0, "ext2: logical block {} is unmappable", logical);
+                    return false;
+                }
+            };
+        }
+        true
+    }
+
     pub fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
         let ino = match self.file_ino(file) {
             Some(ino) => ino,
@@ -3045,6 +3074,16 @@ impl FileSystem for Ext2 {
     /// let it be.
     fn sparse_max(&self) -> usize {
         if self.mounted { self.max_size() as usize } else { 0 }
+    }
+
+    /// A file's data is in blocks of the filesystem's on its device: 1, 2
+    /// or 4 KiB (`MAX_LOG_BLOCK_SIZE`), never more than a page.
+    fn data_block_size(&self) -> usize {
+        if self.mounted { self.block_size() } else { 0 }
+    }
+
+    fn map_blocks(&mut self, file: NodeId, first: u64, out: &mut [u64]) -> bool {
+        Ext2::map_blocks(self, file, first, out)
     }
 }
 

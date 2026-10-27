@@ -4,7 +4,12 @@
 //! the VFS and the filesystem under it document. Every call's answer is
 //! held to the model's, and so is the whole tree, read back through the
 //! VFS, whenever a target asks.
+//!
+//! Among the files open, disks' images (`fs::image`): a file held, read and
+//! written off the VFS's lock where its filesystem keeps blocks on a device
+//! -- and while it is held, everything else that would write it refused.
 
+use fs::image::Image;
 use fs::vfs::{FileStat, Handle, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
 use fs::vnode::Kind;
 
@@ -65,11 +70,14 @@ pub struct Model {
     pub limits: Limits,
     /// The kernel's handles, and the model's view of each.
     pub open: Vec<(Handle, Opened)>,
+    /// The files held as images -- `Fs::images`, one for one -- and whether
+    /// each is held for writing.
+    pub holds: Vec<(Vec<Vec<u8>>, bool)>,
 }
 
 impl Model {
     pub fn new(tree: Node, read_only: bool, limits: Limits) -> Model {
-        Model { tree, read_only, limits, open: Vec::new() }
+        Model { tree, read_only, limits, open: Vec::new(), holds: Vec::new() }
     }
 
     pub fn resolve(&self, path: &[u8]) -> Res {
@@ -114,9 +122,31 @@ impl Model {
         }
     }
 
-    /// Whether anything at or under `p` is open.
+    /// Whether anything at or under `p` is open -- an image among them.
     pub fn busy(&self, p: &[Vec<u8>]) -> bool {
-        self.open.iter().any(|(_, o)| o.path.starts_with(p))
+        self.open.iter().any(|(_, o)| o.path.starts_with(p)) || self.holds.iter().any(|(h, _)| h.starts_with(p))
+    }
+
+    /// Whether the file at `p` is held as an image: nothing but the image
+    /// may write it.
+    pub fn held(&self, p: &[Vec<u8>]) -> bool {
+        self.holds.iter().any(|(h, _)| h == p)
+    }
+
+    /// What `Image::open` should do, done to the model: the file it holds.
+    /// Only a file nobody else writes is held -- for writing, by nobody else
+    /// at all -- and never on a read-only mount for writing.
+    pub fn hold(&self, p: &[u8], write: bool) -> Option<Vec<Vec<u8>>> {
+        let Res::Node(path) = self.resolve(p) else { return None };
+        if !matches!(self.node(&path), Some(Node::File(_))) || (write && self.read_only) {
+            return None;
+        }
+        let written = self.open.iter().any(|(_, o)| o.path == path && o.flags & OPEN_WRITE != 0)
+            || self.holds.iter().any(|(h, w)| *h == path && *w);
+        if written || (write && self.held(&path)) {
+            return None;
+        }
+        Some(path)
     }
 
     /// A node made in directory `dir`: whether the filesystem has room for
@@ -162,6 +192,10 @@ impl Model {
             Some(Node::File(d)) => d.len(),
             _ => return None,
         };
+        /* A disk's image is its holder's alone to write. */
+        if writes && m.held(&path) {
+            return None;
+        }
         if flags & OPEN_TRUNCATE != 0 && size != 0 {
             m.file_mut(&path).expect("a file").truncate(0);
         }
@@ -201,6 +235,11 @@ impl Model {
         let res = m.resolve(p);
         if res == Res::Invalid || m.read_only {
             return false;
+        }
+        if let Res::Node(n) = &res {
+            if m.held(n) {
+                return false;
+            }
         }
         let path = match res {
             Res::Node(n) => n,
@@ -281,6 +320,14 @@ pub struct Fs {
     pub model: Model,
     /// Every answer held to the model's.
     pub strict: bool,
+    /// The images held: `model.holds`, one for one.
+    pub images: Vec<Image>,
+}
+
+impl Fs {
+    pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
+        Fs { vfs, model, strict, images: Vec::new() }
+    }
 }
 
 /* ---- what the input chooses ---- */
@@ -545,6 +592,96 @@ impl Fs {
         while !self.model.open.is_empty() {
             self.close(0);
         }
+        while !self.images.is_empty() {
+            self.image_close(0);
+        }
+    }
+
+    /// Whether anything is open -- a file, or an image: what refuses an
+    /// unmount.
+    pub fn busy(&self) -> bool {
+        !self.model.open.is_empty() || !self.images.is_empty()
+    }
+
+    /* ---- images ---- */
+
+    pub fn image_open(&mut self, p: &[u8], write: bool) {
+        say(format_args!("image_open {} write {}", show(p), write));
+        let got = Image::open(self.vfs, p, write);
+        let want = self.model.hold(p, write);
+        self.check(got.is_some() == want.is_some(), format_args!("an image of {} for {} {}, where the model {}",
+                   show(p), if write { "writing" } else { "reading" }, if got.is_some() { "was held" } else { "was refused" },
+                   if want.is_some() { "holds it" } else { "does not" }));
+        if let (Some(image), Some(path)) = (got, want) {
+            reached(if write { "a file held as an image to write" } else { "a file held as an image to read" });
+            if self.images.iter().any(|i| i.identity() == image.identity()) {
+                reached("a file held as two images at once");
+            }
+            self.images.push(image);
+            self.model.holds.push((path, write));
+        }
+    }
+
+    pub fn image_close(&mut self, i: usize) {
+        if i < self.images.len() {
+            say(format_args!("image_close {}", i));
+            drop(self.images.remove(i));
+            self.model.holds.remove(i);
+        }
+    }
+
+    pub fn image_read(&mut self, i: usize, at: u64, n: usize) {
+        let Some((path, _)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_read {} bytes of {} at {}", n, show(&join(&path)), at));
+        let mut buf = vec![0u8; n];
+        let got = self.images[i].read_at(at, &mut buf);
+        let size = self.model.size(&path);
+        let want = at.checked_add(n as u64).is_some_and(|end| end <= size);
+        self.check(got == want, format_args!("an image's read of {} bytes of {} ({} bytes) at {} {}", n,
+                   show(&join(&path)), size, at, if got { "succeeded" } else { "failed" }));
+        if got && want {
+            let d = match self.model.node(&path) {
+                Some(Node::File(d)) => d.read(at, n as u64),
+                _ => Vec::new(),
+            };
+            self.check(buf == d, format_args!("an image's read of {} at {} gave other bytes than were written",
+                                              show(&join(&path)), at));
+            if n != 0 {
+                reached("an image read");
+            }
+        }
+    }
+
+    pub fn image_write(&mut self, i: usize, at: u64, data: &[u8]) {
+        let Some((path, write)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_write {} bytes to {} at {}", data.len(), show(&join(&path)), at));
+        let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let got = self.images[i].write_at(at, data);
+        let size = self.model.size(&path);
+        let want = write && at.checked_add(data.len() as u64).is_some_and(|end| end <= size);
+        if self.refused_for_room(got, want, mark, &saved) {
+            let old = match self.model.node(&path) {
+                Some(Node::File(d)) => d.clone(),
+                _ => Data::new(),
+            };
+            self.resync_partial(&path, &old, at, data);
+            return;
+        }
+        self.check(got == want, format_args!("an image's write of {} bytes to {} ({} bytes) at {} {}", data.len(),
+                   show(&join(&path)), size, at, if got { "succeeded" } else { "failed" }));
+        if got && want && !data.is_empty() {
+            if let Some(d) = self.model.file_mut(&path) {
+                d.write(at, data);
+            }
+            reached("an image written");
+        }
+    }
+
+    pub fn image_sync(&mut self, i: usize) {
+        if let Some(image) = self.images.get_mut(i) {
+            let ok = image.sync();
+            self.check(ok, format_args!("an image's sync failed"));
+        }
     }
 
     pub fn read(&mut self, i: usize, n: usize) {
@@ -708,7 +845,7 @@ impl Fs {
         let got = self.vfs.truncate(p, s);
         let limit = self.model.limits.max_file;
         let want = match self.model.resolve(p) {
-            Res::Node(n) if !self.model.read_only && size <= limit => match self.model.file_mut(&n) {
+            Res::Node(n) if !self.model.read_only && size <= limit && !self.model.held(&n) => match self.model.file_mut(&n) {
                 Some(d) => {
                     if d.len() > u32::MAX as u64 && size < d.len() && got {
                         reached("a file past 4 GiB cut down");
@@ -979,7 +1116,36 @@ pub fn say(what: std::fmt::Arguments) {
 pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
     let open = f.model.open.len() as u64;
     let pick_open = |r: &mut Input| r.below(open.max(1)) as usize;
-    match r.u8() % 20 {
+    let held = f.images.len() as u64;
+    let pick_held = |r: &mut Input| r.below(held.max(1)) as usize;
+    match r.u8() % 23 {
+        /* A disk's image: held, read and written, synced and let go of --
+         * and everything above tried on it meanwhile. */
+        20 => {
+            let p = path(r, &f.model);
+            if f.images.len() < 4 {
+                let write = !r.chance(4);
+                f.image_open(&p, write);
+            }
+        }
+        21 | 22 if held != 0 => {
+            let i = pick_held(r);
+            let size = f.model.holds.get(i).map_or(0, |(p, _)| f.model.size(p));
+            match r.u8() % 8 {
+                0 => f.image_sync(i),
+                1 => f.image_close(i),
+                k => {
+                    let at = offset(r, size, block, f.model.limits.span);
+                    let n = length(r);
+                    if k % 2 == 0 {
+                        f.image_read(i, at, n);
+                    } else {
+                        let data = crate::input::noise(r.u32(), n);
+                        f.image_write(i, at, &data);
+                    }
+                }
+            }
+        }
         0 => {
             let p = path(r, &f.model);
             f.stat(&p);

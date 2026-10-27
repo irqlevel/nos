@@ -202,8 +202,7 @@ pub fn ext2bad(r: &mut Input) {
     }
     reached("a damaged image mounted");
     let vfs = fs::vfs_instance().expect("the VFS");
-    let mut f = Fs { vfs, model: Model::new(tree, mounted == 1, Limits::fixed(max_file(bs), usize::MAX)),
-                     strict: false };
+    let mut f = Fs::new(vfs, Model::new(tree, mounted == 1, Limits::fixed(max_file(bs), usize::MAX)), false);
 
     /* Everything that can be listed, listed twice, and looked up; and
      * again, and again: work that changes nothing leaves nothing behind. */

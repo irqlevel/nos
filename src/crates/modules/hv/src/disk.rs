@@ -1,10 +1,15 @@
 //! A guest's disk that is a file of nos's -- an image, whose size is the
-//! disk's, whole sectors of it -- held open while the guest runs, and read,
+//! disk's, whole sectors of it -- held while the guest runs, and read,
 //! written and synced where the guest asks by a task of the disk's own, so
 //! that the guest runs on while its disk works.
 //!
+//! The image is held (`kcore::fs::Image`): nothing else may write the file,
+//! cut it or move it while the disk is open, and so its reads and writes go
+//! to the device off the VFS's lock -- one guest's disk does not wait
+//! behind another's, nor behind nos's own files.
+//!
 //! The device hands a request over (`Backend::submit`) and the task serves
-//! it through `kcore::fs::File`, one at a time in the order they came; what
+//! it through the image, one at a time in the order they came; what
 //! it has served goes back the other way, and each one back wakes the vCPU
 //! (`Wake`) -- a halted one's task out of its wait, a running one out of its
 //! guest -- to give it to the guest. Both ways are queues under one lock,
@@ -28,7 +33,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hv::disk::{self as blk, Op, Request};
-use kcore::fs::{File, FileId};
+use kcore::fs::{File, FileId, Image};
 use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 
@@ -175,11 +180,11 @@ struct Pipe {
     wake: Arc<dyn Wake>,
 }
 
-/// What the disk's task starts from: the pipe, and the file, which is the
-/// task's alone and closed when it ends.
+/// What the disk's task starts from: the pipe, and the image, which is the
+/// task's alone and let go of when it ends.
 struct Serve {
     pipe: Arc<Pipe>,
-    file: File,
+    image: Image,
 }
 
 pub struct FileDisk {
@@ -189,7 +194,7 @@ pub struct FileDisk {
     /// The disk's task: told to stop, and waited for, when the disk goes.
     task: Option<TaskHandle>,
     /// Its claim on its image (`Claims`): a field, and so given back only
-    /// after `drop` has waited for the task, the file's last user.
+    /// after `drop` has waited for the task, the image's last user.
     _claim: Claim,
 }
 
@@ -198,15 +203,24 @@ impl FileDisk {
     /// served for `runner`'s guest by a task called after it and the disk's
     /// `letter`.
     pub fn open(path: &str, read_only: bool, runner: &Runner, letter: char) -> Result<FileDisk, String> {
-        let file = File::open(path, !read_only).map_err(|e| alloc::format!("{}: {}", path, e))?;
-        let size = file.size().map_err(|e| alloc::format!("{}: {}", path, e))?;
+        /* Which file it is, first: the claim says whose guest's disk has
+         * it, where the hold below would only refuse. */
+        let id = File::open(path, false).map_err(|e| alloc::format!("{}: {}", path, e))?
+            .identity().ok_or_else(|| alloc::format!("{}: the kernel does not know it", path))?;
+        let claim = runner.claims.claim(id, !read_only, runner.holder)
+            .map_err(|why| alloc::format!("{}: {}", path, why))?;
+        let image = Image::open(path, !read_only).map_err(|_| {
+            alloc::format!("{}: cannot be held as a disk -- nos has it open for writing, or cannot write it here", path)
+        })?;
+        /* The file the claim is on, still: not one put in its place between. */
+        if image.identity() != Some(id) {
+            return Err(alloc::format!("{}: replaced while it was being opened", path));
+        }
+        let size = image.size().map_err(|e| alloc::format!("{}: {}", path, e))?;
         let size = size - size % blk::SECTOR;
         if size == 0 {
             return Err(alloc::format!("{}: not a sector long", path));
         }
-        let id = file.identity().ok_or_else(|| alloc::format!("{}: the kernel does not know it", path))?;
-        let claim = runner.claims.claim(id, !read_only, runner.holder)
-            .map_err(|why| alloc::format!("{}: {}", path, why))?;
 
         let mut todo = VecDeque::new();
         let mut done = VecDeque::new();
@@ -222,7 +236,7 @@ impl FileDisk {
         let pipe = Arc::new(Pipe { requests, done: AtomicUsize::new(0), work, wake: runner.wake.clone() });
 
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
-        let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu, Serve { pipe: pipe.clone(), file }, serve)
+        let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu, Serve { pipe: pipe.clone(), image }, serve)
             .ok_or_else(|| alloc::format!("{}: no task to serve it", path))?;
         Ok(FileDisk { pipe, size, read_only, task: Some(task), _claim: claim })
     }
@@ -265,10 +279,9 @@ impl Drop for FileDisk {
 }
 
 /// The disk's task: every request in the order it came, until the disk goes.
-/// A read that comes back short, or any call that fails, is an error the
-/// guest is told of.
+/// Any call that fails is an error the guest is told of.
 fn serve(start: Serve) {
-    let Serve { pipe, file } = start;
+    let Serve { pipe, image } = start;
     loop {
         let next = {
             let mut requests = pipe.requests.lock();
@@ -286,12 +299,9 @@ fn serve(start: Serve) {
 
         let offset = req.offset();
         let ok = match req.op() {
-            Op::Read => {
-                let buf = req.data_mut();
-                matches!(file.read_at(offset, buf), Ok(n) if n == buf.len())
-            }
-            Op::Write => file.write_at(offset, req.data()).is_ok(),
-            Op::Flush => file.sync().is_ok(),
+            Op::Read => image.read_at(offset, req.data_mut()).is_ok(),
+            Op::Write => image.write_at(offset, req.data()).is_ok(),
+            Op::Flush => image.sync().is_ok(),
         };
         req.done(ok);
 

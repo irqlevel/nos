@@ -12,6 +12,7 @@ use kcore::cmd::Output;
 use kcore::trace;
 
 use crate::files::buffer;
+use crate::image::Image;
 use crate::paths::Path;
 use crate::vfs::{FileStat, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
                  OPEN_WRITE};
@@ -383,6 +384,111 @@ fn far_file(vfs: &Vfs, path: &str, report: &mut Reporter) -> bool {
     true
 }
 
+/* ---- a disk's image ---- */
+
+/// The image's size: whole blocks of every size ext2 has, more than a
+/// batch's worth of 1 KiB ones.
+const IMAGE_SIZE: usize = 96 * 1024;
+
+/// What a held image is written, in order, each read back whole after it:
+/// part of a block that is there, a hole, a stretch across a hole and
+/// blocks that are there, whole blocks that are there, and the last sector
+/// -- at, length, salt.
+const IMAGE_WRITES: [(usize, usize, u8); 5] =
+    [(8192 + 100, 3, 2), (30000, 6000, 3), (4000, 20000, 4), (8192, 8192, 5), (IMAGE_SIZE - 512, 512, 6)];
+
+/// A disk's image (`image`): a file with holes held, and read and written
+/// as a guest's disk is -- off the VFS's lock where its filesystem keeps
+/// blocks on a device: holes reading as zeros, a write into one, a write
+/// over part of a block and the rest of it kept, a write across blocks that
+/// are there and a hole. While it is held everything else that would write
+/// the file is refused; let go of, the file reads as the image left it; and
+/// held to read, two at once may, while nothing writes it.
+fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
+    let (Some(mut expect), Some(mut got)) = (buffer(IMAGE_SIZE), buffer(IMAGE_SIZE)) else {
+        report.say(path, "no memory for the image's buffers");
+        return false;
+    };
+
+    /* A file of holes, with blocks in the middle written the usual way */
+    if !vfs.write_file(path.as_bytes(), b"") || !vfs.truncate(path.as_bytes(), IMAGE_SIZE) {
+        report.say(path, "the image's file could not be made");
+        return false;
+    }
+    fill(&mut expect[8192..], 4096, 8192, 1);
+    match open(vfs, path, OPEN_WRITE) {
+        Some(file) if file.seek(8192) && file.write(&expect[8192..12288]) => {}
+        _ => {
+            report.say(path, "the image's middle could not be written");
+            return false;
+        }
+    }
+
+    let Some(mut image) = Image::open(vfs, path.as_bytes(), true) else {
+        report.say(path, "the file could not be held as an image");
+        return false;
+    };
+
+    let refused = open(vfs, path, OPEN_WRITE).is_none()
+        && open(vfs, path, OPEN_APPEND).is_none()
+        && open(vfs, path, OPEN_READ | OPEN_TRUNCATE).is_none()
+        && !vfs.truncate(path.as_bytes(), 0)
+        && !vfs.remove(path.as_bytes())
+        && Image::open(vfs, path.as_bytes(), false).is_none();
+    if !refused || open(vfs, path, OPEN_READ).is_none() {
+        report.say(path, "a held image was written, cut, removed or held again -- or could not be read");
+        return false;
+    }
+
+    if !image.read_at(0, &mut got) || got != expect {
+        report.say(path, "a held image does not read as the file was written");
+        return false;
+    }
+    for (at, len, salt) in IMAGE_WRITES {
+        fill(&mut expect[at..], len, at, salt);
+        if !image.write_at(at as u64, &expect[at..at + len]) {
+            report.say(path, "a write to the image failed");
+            return false;
+        }
+        if !image.read_at(0, &mut got) || got != expect {
+            report.say(path, "the image reads back wrong after a write");
+            return false;
+        }
+    }
+    if image.write_at(IMAGE_SIZE as u64 - 1, &[0, 0]) || image.read_at(IMAGE_SIZE as u64, &mut got[..1]) {
+        report.say(path, "the image took a write or a read past its end");
+        return false;
+    }
+    if !image.sync() {
+        report.say(path, "the image's sync failed");
+        return false;
+    }
+    drop(image);
+
+    /* Let go of: the file as the image left it, through the VFS */
+    got.fill(0xAA);
+    if read_whole(vfs, path, &mut got) != Some(IMAGE_SIZE) || got != expect {
+        report.say(path, "the file does not read as its image left it");
+        return false;
+    }
+
+    let (Some(mut first), Some(_second)) =
+        (Image::open(vfs, path.as_bytes(), false), Image::open(vfs, path.as_bytes(), false))
+    else {
+        report.say(path, "two could not hold the file to read");
+        return false;
+    };
+    if open(vfs, path, OPEN_WRITE).is_some() || first.write_at(0, &[1]) {
+        report.say(path, "a file held to read was written");
+        return false;
+    }
+    if !first.read_at(0, &mut got) || got != expect {
+        report.say(path, "an image held to read reads wrong");
+        return false;
+    }
+    true
+}
+
 /* ---- the whole test ---- */
 
 pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
@@ -413,9 +519,10 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
         Path::join(base.as_str(), "sub"),
         Path::join(base.as_str(), "big.bin"),
         Path::join(base.as_str(), "far.bin"),
+        Path::join(base.as_str(), "image.bin"),
     ];
-    let (a, b, sub, big, far) = match &paths {
-        [Some(a), Some(b), Some(sub), Some(big), Some(far)] => (a, b, sub, big, far),
+    let (a, b, sub, big, far, image) = match &paths {
+        [Some(a), Some(b), Some(sub), Some(big), Some(far), Some(image)] => (a, b, sub, big, far, image),
         _ => { report.say(dir, "path too long"); return false; }
     };
     let c = match Path::join(sub.as_str(), "c.txt") { Some(p) => p, None => {
@@ -432,7 +539,7 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
         return false;
     }
 
-    let ok = body(vfs, &base, a, b, sub, &c, big, far, big_size, &mut report);
+    let ok = body(vfs, &base, a, b, sub, &c, big, far, image, big_size, &mut report);
     if !ok {
         vfs.remove(base.as_bytes());
     }
@@ -440,8 +547,8 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &Path, far: &Path,
-        big_size: usize, report: &mut Reporter) -> bool {
+fn body(vfs: &'static Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &Path, far: &Path,
+        image: &Path, big_size: usize, report: &mut Reporter) -> bool {
     if !vfs.write_file(a.as_bytes(), b"hello world")
         || !check_content(vfs, a.as_str(), b"hello world", report)
     {
@@ -524,6 +631,10 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
     }
 
     if !far_file(vfs, far.as_str(), report) {
+        return false;
+    }
+
+    if !image_file(vfs, image.as_str(), report) {
         return false;
     }
 

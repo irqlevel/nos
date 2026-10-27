@@ -355,7 +355,9 @@ fn classify(w: &mut World, word: usize) -> Word {
         return Word::Root(i);
     }
     w.tasks.retain(|t| !sched::done(*t));
-    if !w.tasks.is_empty() || w.others.iter().any(|(h, _)| Handle::into_raw(Some(*h)) == word) {
+    if !w.tasks.is_empty() || w.others.iter().any(|(h, _)| Handle::into_raw(Some(*h)) == word)
+        || w.root.images.iter().any(|i| Handle::into_raw(Some(i.handle())) == word)
+    {
         return Word::Other;
     }
     Word::Nothing
@@ -717,7 +719,7 @@ pub fn vfs(r: &mut Input) {
     invariant!(fs::ramfs::mount_at("/", false), "a ramfs would not mount at the root");
     let vfs = fs::vfs_instance().expect("the VFS");
     let mut w = World {
-        root: Fs { vfs, model: Model::new(Node::dir(), false, Limits::memory()), strict: true },
+        root: Fs::new(vfs, Model::new(Node::dir(), false, Limits::memory()), true),
         mounts: Vec::new(),
         ext2_dev: e.handle(),
         nano_dev: n.handle(),

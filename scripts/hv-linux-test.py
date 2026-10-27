@@ -960,7 +960,7 @@ def disk(args):
                x("acpid -l /acpid.log -p /acpid.pid"),
                "poweroff"]
     else:
-        rc += ["hv stop 0", RC_LAST]
+        rc += ["hv stop 0", "dmesg image:", RC_LAST]
     p, log, image = boot_rc(args, tmp, rc, {"disk.img": img}, powers_off=args.acpi)
     try:
         if args.acpi and p.poll() is None:
@@ -986,6 +986,16 @@ def disk(args):
                     r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
         pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
                  out(18)[-300:])
+        # The image -- held while the guest ran -- says as it is let go of
+        # what it read and wrote off the VFS's lock, and what through it:
+        # the guest's reads and its writes over blocks the image had, off
+        # it (`fs::image`); its writes into holes, through it.
+        held = r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock"
+        said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
+        m = re.search(held, said)
+        pt.check("the guest's disk was read and written off the VFS's lock",
+                 m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0,
+                 (re.search(r"(?m)^.*image: /disk\.img.*$", said) or [said[-600:]])[0])
         if args.acpi:
             # The halt's lines are on the serial console: the shell gave it
             # back as it stopped, before the modules went.
