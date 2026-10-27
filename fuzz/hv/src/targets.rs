@@ -43,6 +43,7 @@ pub static ALL: &[Target] = &[
     Target { name: "linux", run: linux, max_len: 4096 },
     Target { name: "pvh", run: pvh, max_len: 4096 },
     Target { name: "acpi", run: acpi, max_len: 512 },
+    Target { name: "smbios", run: crate::smbiosmodel::smbios_target, max_len: 512 },
     Target { name: "dhcp", run: dhcp, max_len: 1024 },
     Target { name: "switch", run: crate::guestnet::switch_target, max_len: 8192 },
     Target { name: "nat", run: crate::guestnet::nat_target, max_len: 8192 },

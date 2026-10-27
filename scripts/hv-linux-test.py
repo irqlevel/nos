@@ -905,6 +905,7 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None, powers_off=False):
     if args.initrd:
         shutil.copy(args.initrd, os.path.join(rootdir, "initrd"))
     for name, src in (extra or {}).items():
+        os.makedirs(os.path.dirname(os.path.join(rootdir, name)), exist_ok=True)
         shutil.copy(src, os.path.join(rootdir, name))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# scripts/hv-linux-test.py\n" + "\n".join(rc) + "\n")
@@ -1132,6 +1133,80 @@ def disk(args):
             last = subprocess.run(["debugfs", "-R", "cat /last.txt", back], capture_output=True)
             pt.check("and the file it wrote last is in it", b"nos-wrote-this-last" in last.stdout,
                      repr(last.stdout[-200:]) + last.stderr.decode(errors="replace")[-200:])
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def smbios(args):
+    """What a guest is told it is by its SMBIOS tables, as Linux reads them
+    into /sys/class/dmi/id: nos's hypervisor for its maker and product, nos's
+    version, its name for its serial, and a UUID that stays its own. A VM
+    whose vm.toml was written before VMs had UUIDs is given one at its first
+    start, written into the file -- added, the lines it had left as they
+    were -- and told the same at its next; one started from its kernel's
+    path is told the uuid= it is given, and its number for its serial."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvsmbios-")
+    toml = os.path.join(tmp, "vm.toml")
+    with open(toml, "w") as f:
+        f.write('# written by hand, before VMs had UUIDs\nkernel = "/bzImage"\ninitrd = "/initrd"\nmemory = %d\n'
+                % args.mem + ("cpus = %d\n" % args.cpus if args.cpus > 1 else "")
+                + 'cmdline = "%s"\n' % args.cmdline)
+    x = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
+    ids = ("cd /sys/class/dmi/id && for f in sys_vendor product_name product_version product_serial product_uuid "
+           "bios_vendor chassis_vendor; do echo $f=$(cat $f); done")
+    given = "4e4f5300-0000-4000-8000-00000000c0de"
+    rc = ["insmod /hv.ko", "hv on",
+          "hv start s0",
+          x("s0", "id", args.vm_secs),
+          x("s0", ids),
+          x("s0", "dmesg | grep -E 'SMBIOS|DMI:'"),
+          "cat /vms/s0/vm.toml",
+          "hv stop s0 secs=0",
+          "hv start s0",
+          x("s0", "id", args.vm_secs),
+          x("s0", ids),
+          "hv stop s0 secs=0",
+          "hv start /bzImage mem=%d%s initrd=/initrd uuid=%s cmdline=%s" % (args.mem, cpus_opt(args), given,
+                                                                           args.cmdline),
+          x(2, "id", args.vm_secs),
+          x(2, ids),
+          "hv stop 2 secs=0",
+          RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    p, log, image = boot_rc(args, tmp, rc, extra={"vms/s0/vm.toml": toml})
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        out = lambda line, n=0: output_of(secs, line, n) or ""
+        said = lambda text: dict(re.findall(r"(?m)^(\w+)=(.*?)\s*$", text))
+        first, second, third = said(out(rc[4])), said(out(rc[10], 1)), said(out(rc[14]))
+        pt.check("the guest reached its shell", "uid=0 gid=0" in out(rc[3]), out(rc[3])[-500:])
+        pt.check("its SMBIOS says nos's hypervisor made it", first.get("sys_vendor") == "nos"
+                 and first.get("product_name") == "nos hv" and first.get("bios_vendor") == "nos"
+                 and first.get("chassis_vendor") == "nos", out(rc[4])[-800:])
+        pt.check("and the version is nos's", re.match(r"\S+ \(\S+\)$", first.get("product_version", "")) is not None,
+                 out(rc[4])[-800:])
+        pt.check("its serial is its name", first.get("product_serial") == "s0", out(rc[4])[-800:])
+        uuid = first.get("product_uuid", "")
+        pt.check("it has a UUID, of version 4", re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-"
+                                                         r"[0-9a-f]{12}$", uuid) is not None, out(rc[4])[-800:])
+        pt.check("Linux found SMBIOS 3 where it scans for it", re.search(r"SMBIOS 3\.\d+\.\d+ present", out(rc[5]))
+                 is not None, out(rc[5])[-800:])
+        toml_now = out(rc[6])
+        pt.check("its vm.toml was given the UUID, its own lines kept",
+                 'uuid = "%s"' % uuid in toml_now and "written by hand, before VMs had UUIDs" in toml_now,
+                 toml_now[-800:])
+        pt.check("its next start tells it the same UUID", second.get("product_uuid") == uuid and uuid != "",
+                 out(rc[10], 1)[-800:])
+        pt.check("a VM started from its kernel's path is told the uuid= it is given, its number its serial",
+                 third.get("product_uuid") == given and third.get("product_serial") == "vm2", out(rc[14])[-800:])
+    finally:
+        pt.kill(p)
     if args.keep or pt.failures:
         print("log at " + log)
     else:
@@ -1604,6 +1679,9 @@ def main():
                     help="the guest's CPUs: with more than one, that it brings every one up, and that "
                          "each takes its timer's interrupts and IPIs (needs a guest kernel with SMP and "
                          "x2APIC; under TCG, QEMU 9.2 or later)")
+    ap.add_argument("--smbios", action="store_true",
+                    help="the guest kernel has DMI (DMI, DMIID): check what its SMBIOS tables say it is, and that "
+                         "a VM keeps its UUID from start to start")
     ap.add_argument("--acpi", action="store_true",
                     help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
                          "the machine's tables, reboots by the FADT's reset register, and shuts down when "
@@ -1679,10 +1757,13 @@ def main():
     if not os.path.exists(nos_iso(args)):
         sys.exit("build %s first (make%s)" % (nos_iso(args), " nos-test.iso" if args.nos_iso else ""))
 
-    if args.attach or args.disk or args.net:
+    if args.attach or args.disk or args.net or args.smbios:
         if not args.initrd:
-            sys.exit("--attach, --disk and --net need --initrd: the guest's shell is what is typed at")
-        attach(args) if args.attach else disk(args) if args.disk else network(args)
+            sys.exit("--attach, --disk, --net and --smbios need --initrd: the guest's shell is what is typed at")
+        if args.smbios:
+            smbios(args)
+        else:
+            attach(args) if args.attach else disk(args) if args.disk else network(args)
     else:
         run(args)
 
