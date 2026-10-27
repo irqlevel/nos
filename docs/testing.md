@@ -162,7 +162,7 @@ swallowing panic messages whole.
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
@@ -580,7 +580,25 @@ into one chain, or spread over mergeable buffers with their count in its
 header, a send carried whole with the header that says how to cut it, a
 checksum left to finish with the header that says where, or finished first
 for a driver that takes none so -- each used element held to the model's
-chain, length and bytes -- the page walker over random page tables, the decoder, the
+chain, length and bytes -- the notifications between the disk and the NIC
+and a driver (`virtq`): Linux's, written from `virtio_ring.c`,
+`virtio_blk.c` and `virtio_net.c` -- the kick decided by the device's word
+with EVENT_IDX and by its flag without, callbacks turned off, on and put
+off to three quarters of what is out, NAPI polls to a budget that refill
+the ring or put the refill off, a transmit queue stopped when full until
+an interrupt says there is room, and now and then a chain made available
+by another CPU after the device's next few looks at the ring, that CPU's
+kick decided by the word it read then -- with the device given no round
+but those the run loop is sure to make (a notify, the disk's backend
+serving, a frame whose wake is not held, `rx_due`, `more`); and held, once
+nothing more happens, to every request served and heard of, every frame
+sent and every frame received: a kick the device needed and never asked
+for, or an interrupt the driver asked for and never got, is a guest's disk
+or network stopped for good. Ten mutants of EVENT_IDX -- an ask left out on
+each queue, the ask at the next entry rather than the index seen, no look
+after it, the interrupt decided against the wrong index or the first one
+withheld, the driver's word or flag ignored -- each failed within its first
+1,500 inputs. The page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `config` holds a VM's `vm.toml` (`modules/hv/src/config.rs`): whatever the

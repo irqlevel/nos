@@ -1255,11 +1255,13 @@ impl LinuxGuest {
                 self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts, now);
                 /* When the devices' round has to come again on its own: a
                  * receive interrupt held, and frames that woke nobody while
-                 * it is (`Net::rx_due`) -- slept to, or armed before the
-                 * guest is entered, below. */
+                 * it is (`Net::rx_due`); a pass that ended at its bound, at
+                 * once (`more`) -- slept to, or armed before the guest is
+                 * entered, below. */
                 devices_due = p.pci_devs.iter().filter_map(|d| match d {
+                    PciDev::Nic(n) if n.more() => Some(now),
                     PciDev::Nic(n) => n.rx_due(now),
-                    PciDev::Disk(_) => None,
+                    PciDev::Disk(d) => d.more().then_some(now),
                 }).min();
                 pins |= sync_ioapic(&mut p, now);
                 self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
@@ -2243,7 +2245,15 @@ impl LinuxGuest {
             } else {
                 let value = v.save().rax as u32;
                 let raised = match dev {
-                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
+                    Some(PciDev::Disk(d)) => {
+                        let raised = d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
+                        /* A pass that ended at its bound on another CPU's
+                         * notify is the first CPU's round to go on with,
+                         * which may be asleep or in its guest: rung, it
+                         * looks. */
+                        first |= me != 0 && d.more();
+                        raised
+                    }
                     Some(PciDev::Nic(n)) => {
                         let window = n.rx_window();
                         let raised = n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
@@ -2257,7 +2267,7 @@ impl LinuxGuest {
                          * waiting: rung, it looks again. Pings between two
                          * guests on the EX44 had a 10 ms answer every few
                          * hundred without this, and none in 2,400 with it. */
-                        first |= me != 0 && n.rx_window() != window;
+                        first |= me != 0 && (n.rx_window() != window || n.more());
                         raised
                     }
                     None => Raise::default(),

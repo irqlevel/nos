@@ -178,7 +178,9 @@ const PASS: usize = QUEUE_SIZE as usize;
 
 /// Features: a limit on a segment's size and on the segments a request may
 /// have, flush, a disk that is read-only, and -- one that is not -- discard
-/// and a write of zeros.
+/// and a write of zeros; and the ring's EVENT_IDX, the device asking for a
+/// kick only when it has taken every chain there was, and none while its
+/// buffers are all with the backend -- a buffer coming back has it look.
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
 const F_RO: u32 = 1 << 5;
@@ -244,6 +246,10 @@ pub struct Stats {
     pub discarded_bytes: u64,
     pub zeroings: u64,
     pub zeroed_bytes: u64,
+    /// The driver's notifies -- each an exit -- and the interrupts raised
+    /// for it: what EVENT_IDX spares both of.
+    pub notifies: u64,
+    pub interrupts: u64,
 }
 
 /// A request with the backend, as the device keeps it: the chain it came in
@@ -312,7 +318,7 @@ impl Blk {
         /* A disk that may only be read has nothing to give back. */
         let ro = if backend.read_only() { F_RO } else { F_DISCARD | F_WRITE_ZEROES };
         Ok(Blk {
-            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | ro, queues),
+            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | ro, queues),
             backend,
             slots,
             waiting: false,
@@ -342,6 +348,13 @@ impl Blk {
     /// What was wrong with the ring, if the device stopped over one.
     pub fn broken(&self) -> Option<Broken> {
         self.broken
+    }
+
+    /// Whether a pass ended at its bound: the next round goes on with it,
+    /// and is due at once -- a driver that kicks only when asked
+    /// (EVENT_IDX) gives the device no other reason to come back.
+    pub fn more(&self) -> bool {
+        self.more
     }
 
     /// Whether its queue has its rings copied (`Transport::rings_copied`).
@@ -407,6 +420,7 @@ impl Blk {
         }
         match self.transport.write(offset, size, value, mem, now) {
             Asked::Notify(0) => {
+                self.stats.notifies += 1;
                 let answered = self.fill(mem);
                 if answered { self.interrupt(mem) } else { Raise::default() }
             }
@@ -449,7 +463,11 @@ impl Blk {
     /// waiting already, or the queue's MSI-X vector.
     fn interrupt(&mut self, mem: &GuestMemory) -> Raise {
         let wants = self.transport.queue(0).map_or(false, |q| q.wants_interrupt(mem));
-        if wants { self.transport.interrupt(0) } else { Raise::default() }
+        if !wants {
+            return Raise::default();
+        }
+        self.stats.interrupts += 1;
+        self.transport.interrupt(0)
     }
 
     /// Take what the driver has made available, while there is a buffer for
@@ -482,7 +500,16 @@ impl Blk {
                 Ok(Some(head)) => self.start(mem, slot, head, &segs),
                 Ok(None) => {
                     self.slots[slot].segs = segs;
-                    break;
+                    /* Every chain there was taken: a kick asked for the
+                     * next, and what came before the ask taken now. */
+                    match self.transport.queue(0).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            self.broken = Some(e);
+                            break;
+                        }
+                    }
                 }
                 Err(e) => Err(e),
             };
