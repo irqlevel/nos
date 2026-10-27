@@ -167,8 +167,13 @@ UNLOAD_SECS = 2
 
 
 # VIRTIO_RING_F_EVENT_IDX: its place in a virtio device's `features` in
-# sysfs, a character a bit from bit 0.
+# sysfs, a character a bit from bit 0; and virtio-net's control queue and
+# multiqueue, which a NIC offers a guest of more than one CPU -- a queue
+# pair a CPU, up to its most.
 EVENT_IDX = 29
+CTRL_VQ = 17
+MQ = 22
+MAX_PAIRS = 8
 
 
 def interrupt_check(args, text, queue):
@@ -1274,7 +1279,9 @@ def network(args):
            x(1, "dmesg | grep 'advertised ou[r] address'; echo heard-done"),
            "hv list",
            # What its driver took of the NIC's features: EVENT_IDX (29).
-           x(0, "cat /sys/class/net/eth0/device/features")]
+           x(0, "cat /sys/class/net/eth0/device/features"),
+           # Its queues: a pair for each of its CPUs, with more than one.
+           x(0, "ls /sys/class/net/eth0/queues")]
     xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
     folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
               % (args.mem, cpus_opt(args), args.cmdline),
@@ -1366,6 +1373,14 @@ def network(args):
         bits = re.search(r"(?m)^([01]{32,})\s*$", took)
         pt.check("the guest's virtio-net driver took EVENT_IDX", bits is not None and bits.group(1)[EVENT_IDX] == "1",
                  took[-300:])
+        pairs = min(args.cpus, MAX_PAIRS)
+        mq = "1" if pairs > 1 else "0"
+        pt.check("and multiqueue where it has more than one CPU" if pairs > 1 else "and no multiqueue, with one CPU",
+                 bits is not None and bits.group(1)[MQ] == mq and bits.group(1)[CTRL_VQ] == mq, took[-300:])
+        queues = six_out(14)
+        pt.check("it uses %d queue pair%s, one a CPU" % (pairs, "s" if pairs > 1 else ""),
+                 all("rx-%d" % i in queues and "tx-%d" % i in queues for i in range(pairs))
+                 and "rx-%d" % pairs not in queues, queues[-300:])
         listed = six_out(12)
         vm0 = re.search(r"(?m)^vm 0 .*$", listed)
         vm1 = re.search(r"(?m)^vm 1 .*$", listed)
@@ -1433,6 +1448,10 @@ def network(args):
                  len(guests) == 2 and not any("past its share" in g or "past their rate" in g for g in guests),
                  "\n".join(guests))
         pt.check(*interrupt_check(args, way(14), "input"))
+        if pairs > 1 and "pci=nomsi" not in args.cmdline.split():
+            pt.check("each queue pair's receive queue a vector of its own",
+                     all(re.search(r"PCI-MSIX\S*\s+\S+\s+virtio\d+-input\.%d\b" % i, way(14)) for i in range(pairs)),
+                     way(14)[-800:])
         claim = way(15)
         pt.check("a guest that claims another's address, ARP and IPv4, gets nothing back: nos heard none of it",
                  "claimed" in claim and re.search(r"Received 0 response", claim) is not None

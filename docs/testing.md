@@ -588,7 +588,12 @@ off to three quarters of what is out, NAPI polls to a budget that refill
 the ring or put the refill off, a transmit queue stopped when full until
 an interrupt says there is room, and now and then a chain made available
 by another CPU after the device's next few looks at the ring, that CPU's
-kick decided by the word it read then -- with the device given no round
+kick decided by the word it read then; a NIC of up to four queue pairs,
+the number in use set through the control queue -- each answer held to
+the protocol's, and no frame on a receive queue past those in use -- TCP
+frames of a few flows for its steering, and the driver now and then gone
+and a new one come, the rings zeroed, the first pair alone the device's
+again until it says more -- with the device given no round
 but those the run loop is sure to make (a notify, the disk's backend
 serving, a frame whose wake is not held, `rx_due`, `more`); and held, once
 nothing more happens, to every request served and heard of, every frame
@@ -598,7 +603,11 @@ or network stopped for good. Ten mutants of EVENT_IDX -- an ask left out on
 each queue, the ask at the next entry rather than the index seen, no look
 after it, the interrupt decided against the wrong index or the first one
 withheld, the driver's word or flag ignored -- each failed within its first
-1,500 inputs. The page walker over random page tables, the decoder, the
+1,500 inputs; and nine of the queue pairs' -- no delivery when the pairs in
+use change, frames steered past them, a count past those offered or with
+no multiqueue answered OK, the control queue looked for in the wrong place,
+the interrupts or what is owed one only the first pair's, the pairs in use
+kept across a reset -- each within its first 4,807. The page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `config` holds a VM's `vm.toml` (`modules/hv/src/config.rs`): whatever the

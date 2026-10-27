@@ -120,7 +120,6 @@ const _: () = assert!(linux::LOW_RAM_END <= MSIX_PAGES as u64);
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
 const DISK_VECTORS: u16 = 2;
-const NIC_VECTORS: u16 = 3;
 /// The most disks, and NICs, a guest has.
 pub const MAX_DISKS: usize = 4;
 pub const MAX_NICS: usize = 2;
@@ -907,7 +906,9 @@ impl LinuxGuest {
     }
 
     /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
-    /// `eth1`, a virtio network device on the PCI bus.
+    /// `eth1`, a virtio network device on the PCI bus -- with a queue pair
+    /// for each of its CPUs, up to `net::MAX_PAIRS`, where it has MSI-X to
+    /// give each queue an interrupt of its own.
     pub fn add_nic(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
         if self.loaded {
             return Err(Error::BadAddress);
@@ -917,14 +918,17 @@ impl LinuxGuest {
         if p.nics >= MAX_NICS {
             return Err(Error::NoMemory);
         }
-        let mut nic = Net::new(backend, mac)?;
+        let page = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)?;
+        let pairs = if page.is_some() { u16::try_from(self.cpus()).unwrap_or(net::MAX_PAIRS) } else { 1 };
+        let mut nic = Net::new(backend, mac, pairs)?;
         nic.set_rx_moderation(self.rx_moderation_ns);
         nic.set_offloads(self.offloads);
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
         let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
-        if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {
-            nic.offer_msix(NIC_VECTORS).ok_or(Error::NoMemory)?;
-            f = f.with_msix(NIC_VECTORS, page);
+        if let Some(page) = page {
+            let vectors = net::vectors(nic.queue_pairs().0);
+            nic.offer_msix(vectors).ok_or(Error::NoMemory)?;
+            f = f.with_msix(vectors, page);
         }
         p.pci.add(f)?;
         p.pci_devs.push(PciDev::Nic(nic));
@@ -949,15 +953,16 @@ impl LinuxGuest {
         v
     }
 
-    /// What each NIC has done: (statistics, whether a ring stopped it,
-    /// whether its rings are copied rather than mapped).
-    pub fn nic_stats(&self) -> Vec<(net::Stats, bool, bool)> {
+    /// What each NIC has done: (statistics, its queue pairs and how many
+    /// its driver uses, whether a ring stopped it, whether its rings are
+    /// copied rather than mapped).
+    pub fn nic_stats(&self) -> Vec<(net::Stats, (u16, u16), bool, bool)> {
         let p = self.platform.lock();
         let mut v = Vec::new();
         if v.try_reserve_exact(p.nics).is_ok() {
             for d in &p.pci_devs {
                 if let PciDev::Nic(n) = d {
-                    v.push((n.stats, n.broken().is_some(), n.rings_copied()));
+                    v.push((n.stats, n.queue_pairs(), n.broken().is_some(), n.rings_copied()));
                 }
             }
         }

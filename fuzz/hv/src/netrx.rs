@@ -240,7 +240,7 @@ fn tcp_send(r: &mut Input, payload: usize, mss: usize) -> Option<(Vec<u8>, Tcp4)
 pub fn netrx_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let state = Arc::new(Mutex::new(NicState::default()));
-    let Ok(mut nic) = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 7]) else { return };
+    let Ok(mut nic) = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 7], 1) else { return };
     let now = crate::time::boot_time_ns();
 
     /* The features, as a driver accepts them: mergeable buffers or not,
