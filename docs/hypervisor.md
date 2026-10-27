@@ -1843,6 +1843,30 @@ send is cut, or handed on whole, before the notify returns; what waits for
 the guest is put into the buffers it has posted each time round the run
 loop, one frame held by the device while it has posted too few.
 
+**A queue pair for each of the guest's CPUs** (`VIRTIO_NET_F_MQ`, with its
+control queue, `F_CTRL_VQ`): a guest of more than one CPU -- which has
+MSI-X -- is offered as many pairs as it has CPUs, up to eight, and a
+control queue after them, through which its driver says how many it uses;
+the device uses the first alone until it does, and refuses a count past
+those offered. Each queue has its vector, which Linux gives each CPU its own
+of: what a CPU sends it is told of on that CPU, and what comes for it is
+taken there, its NAPI poll on that CPU's softirq, where one ring and one
+interrupt had every CPU's traffic go through one. A frame for the guest
+goes to the pair the guest last sent its flow from -- virtio's automatic
+receive steering, a table of 256 slots by a hash of the flow's two ends,
+learned as it sends -- and a flow it has not sent to the pair its hash
+picks. The one frame the device holds for want of buffers is the device's
+and not a pair's: held for a ring that is empty, it holds up the frames
+behind it for the others until that ring's refill, which the device asked
+a notify for; and when the driver changes how many pairs it uses, the
+device delivers at once, steered anew -- a frame held for a pair the driver
+had just stopped using waited on a notify that would never come, and every
+frame behind it with it, which the hv fuzzer's `virtq` target found at its
+1,825th input. The report says how many pairs the driver uses (`hv stop`).
+Under TCG, Linux 6.18 on two CPUs through `hv-linux-test.py --net --cpus 2`
+took both pairs, and its receive interrupts each on its own CPU: 41 of the
+first pair's on its first CPU, 72 of the second's on its second.
+
 **Offloads, both ways.** The device completes a checksum the driver leaves
 to it (`VIRTIO_NET_F_CSUM`) -- a UDP datagram's that comes to 0 as all ones,
 over IPv4 or over IPv6 past its extension headers, since 0 there is no

@@ -185,16 +185,18 @@ impl GuestMemory {
         Ok(Mapping { shared: self.shared.clone(), base: gpa, bytes: pages * PAGE as usize })
     }
 
-    /// The mappings its one device made since `since`, on the fuzzer's
-    /// clock, held to what the device may make: a burst of eight, and one a
-    /// second after (`virtio::Maps`) -- each a host-wide shootdown when it
-    /// is undone, which a guest setting its queues up over and over must not
-    /// have at will.
-    pub fn held_to_map_budget(&self, since: u64) {
+    /// The mappings its one device of `queues` queues made since `since`, on
+    /// the fuzzer's clock, held to what the device may make: a burst of two
+    /// boots' worth of its queues, eight at the least, and one a second after
+    /// (`virtio::Maps`) -- each a host-wide shootdown when it is undone,
+    /// which a guest setting its queues up over and over must not have at
+    /// will.
+    pub fn held_to_map_budget(&self, since: u64, queues: usize) {
         let made = self.maps.load(Ordering::Relaxed) as u64;
         let earned = crate::time::boot_time_ns().saturating_sub(since) / 1_000_000_000;
-        invariant!(made <= MAPS_BURST + earned,
-                   "{} ring mappings made in {} s, past the {} and one a second a device may make", made, earned, MAPS_BURST);
+        let burst = MAPS_BURST.max(2 * queues as u64);
+        invariant!(made <= burst + earned,
+                   "{} ring mappings made in {} s, past the {} and one a second a device may make", made, earned, burst);
     }
 }
 
