@@ -104,7 +104,7 @@ void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
     set_entry(irq, data);
 }
 
-void IoApic::set_irq_destination(u8 irq, u64 apic_id)
+u64 IoApic::set_irq_destination(u8 irq, u64 apic_id)
 {
     apic_id = check_dest(irq, apic_id);
 
@@ -115,8 +115,7 @@ void IoApic::set_irq_destination(u8 irq, u64 apic_id)
     high = (high & 0x00FFFFFFU) | ((u32)apic_id << 24);
     write_register(RED_TBL + 2 * irq + 1, high);
 
-    trace(IO_APIC_LL, "set_irq_destination irq 0x%lX apic_id 0x%lX",
-        (ulong)irq, (ulong)apic_id);
+    return apic_id;
 }
 
 void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
