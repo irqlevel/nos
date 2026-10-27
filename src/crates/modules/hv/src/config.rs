@@ -57,6 +57,10 @@ pub struct Options {
     pub port: Option<u32>,
     /// nos's ports relayed to its own once it runs: (nos's, the guest's).
     pub forwards: Vec<(u16, u16)>,
+    /// The UUID its SMBIOS gives it, as RFC 4122 writes one: what its OS
+    /// knows the machine by, the same at every start. A VM with a folder is
+    /// given one at its first start, written into its vm.toml.
+    pub uuid: Option<[u8; 16]>,
 }
 
 /// A vm.toml: the options, and what only a VM with a folder has.
@@ -95,9 +99,10 @@ enum Key {
     Apicv,
     Rxmod,
     Offload,
+    Uuid,
 }
 
-const KEYS: [(&str, Key); 19] = [
+const KEYS: [(&str, Key); 20] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
@@ -117,6 +122,7 @@ const KEYS: [(&str, Key); 19] = [
     ("apicv", Key::Apicv),
     ("rxmod", Key::Rxmod),
     ("offload", Key::Offload),
+    ("uuid", Key::Uuid),
 ];
 
 /// A value as the file writes it.
@@ -187,6 +193,10 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
         (Key::Initrd, Value::Str(s)) if !s.is_empty() => o.initrd = Some(s),
         (Key::Kernel | Key::Initrd, Value::Str(_)) => return Err(error(line, &alloc::format!("{} is an empty path", name))),
         (Key::Cmdline, Value::Str(s)) => o.cmdline = Some(s),
+        (Key::Uuid, Value::Str(s)) => {
+            o.uuid = Some(uuid(&s).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a UUID -- \
+                                                                              8-4-4-4-12 hex digits", s)))?);
+        }
         (Key::Input, Value::Str(s)) => o.input = s,
         (Key::Memory, Value::Int(n)) => o.mem_mib = Some(n),
         (Key::Rxmod, Value::Int(n)) => o.rxmod_us = Some(n),
@@ -222,13 +232,46 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
                 o.forwards.push(pair);
             }
         }
-        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input, v) => return Err(wrong("a string", &v)),
+        (Key::Kernel | Key::Initrd | Key::Cmdline | Key::Input | Key::Uuid, v) => return Err(wrong("a string", &v)),
         (Key::Memory | Key::Rxmod | Key::Cpus | Key::Cpu | Key::Port, v) => return Err(wrong("a number", &v)),
         (Key::Disks | Key::Forward, v) => return Err(wrong("a list of strings", &v)),
         (_, v) => return Err(wrong("true or false", &v)),
     }
     Ok(())
 }
+
+/// A UUID as RFC 4122 writes one -- 8-4-4-4-12 hex digits, either case --
+/// its bytes most significant first.
+pub fn uuid(text: &str) -> Option<[u8; 16]> {
+    let b = text.as_bytes();
+    if b.len() != UUID_TEXT || UUID_DASHES.iter().any(|&at| b[at] != b'-') {
+        return None;
+    }
+    let mut digits = b.iter().enumerate().filter(|(i, _)| !UUID_DASHES.contains(i)).map(|(_, &c)| c);
+    let mut out = [0u8; 16];
+    for byte in out.iter_mut() {
+        let hi = char::from(digits.next()?).to_digit(16)?;
+        let lo = char::from(digits.next()?).to_digit(16)?;
+        *byte = (hi << 4 | lo) as u8;
+    }
+    Some(out)
+}
+
+/// A UUID as RFC 4122 writes one, lower case.
+pub fn uuid_text(u: &[u8; 16]) -> String {
+    let mut s = String::new();
+    for (i, byte) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        let _ = write!(s, "{:02x}", byte);
+    }
+    s
+}
+
+/// A UUID's text: its length, and where its dashes are.
+const UUID_TEXT: usize = 36;
+const UUID_DASHES: [usize; 4] = [8, 13, 18, 23];
 
 /// A disk as a word and the file say it: a path, `:ro` after it for one the
 /// guest cannot write.
@@ -577,6 +620,9 @@ pub fn render(c: &Config) -> Option<String> {
     }
     if o.nooffload {
         s.push_str("offload = false\n");
+    }
+    if let Some(u) = &o.uuid {
+        put(&mut s, "uuid", &uuid_text(u));
     }
     Some(s)
 }

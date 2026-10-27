@@ -63,6 +63,7 @@ use kcore::sync::Mutex;
 use kcore::time;
 
 use crate::acpi;
+use crate::smbios;
 use crate::cr;
 use crate::dr;
 use crate::devices::blk::{self, Blk};
@@ -645,6 +646,23 @@ pub struct LinuxGuest {
     offloads: bool,
     /// Where its CPUs sit, as their CPUID tells them (`set_shape`).
     shape: Shape,
+    /// What its SMBIOS says it is (`set_identity`).
+    identity: Identity,
+}
+
+/* The SMBIOS tables after the ACPI ones in the BIOS area, laid out in the
+ * same buffer. */
+const _: () = assert!(acpi::AREA + acpi::MAX_BYTES as u64 <= smbios::AREA
+                      && smbios::AREA + smbios::MAX_BYTES as u64 <= acpi::AREA_END
+                      && smbios::MAX_BYTES <= acpi::MAX_BYTES);
+
+/// What a guest's SMBIOS tables say of it (`smbios`): its UUID, as RFC 4122
+/// writes it -- all zeros, SMBIOS's "not set", until it is given one -- its
+/// serial number, and the hypervisor's version.
+pub struct Identity {
+    pub uuid: [u8; 16],
+    pub serial: String,
+    pub version: String,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -790,8 +808,16 @@ impl LinuxGuest {
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
+            identity: Identity { uuid: [0; 16], serial: String::new(), version: String::new() },
         };
         Ok((guest, vcpus))
+    }
+
+    /// What its SMBIOS tables say it is: set before it boots, and the same
+    /// at every boot -- a UUID, above all, that an OS takes for the
+    /// machine's own.
+    pub fn set_identity(&mut self, identity: Identity) {
+        self.identity = identity;
     }
 
     /// What its CPUs' CPUID tells them of where they sit -- what their
@@ -985,7 +1011,7 @@ impl LinuxGuest {
         let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
-        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
         linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         linux::set_entry(bsp.cpu.backend_mut(), &layout);
         self.loaded = true;
@@ -1009,7 +1035,7 @@ impl LinuxGuest {
         let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
         let (n, msix) = self.pci_routes(&mut routes)?;
         let ioapic = self.has_ioapic();
-        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        let firmware = self.write_firmware(&routes[..n], msix, ioapic)?;
         pvh::build(&self.memory, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         pvh::set_entry(bsp.cpu.backend_mut(), image);
         self.loaded = true;
@@ -1036,10 +1062,11 @@ impl LinuxGuest {
         Ok((n, msix))
     }
 
-    /// The ACPI tables, for the machine as it is now -- its CPUs, its
-    /// IO-APIC when `ioapic`, and each device on the bus, `routes` -- laid
-    /// out in the BIOS area.
-    fn write_acpi(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
+    /// The tables a PC's firmware leaves, laid out in the BIOS area: the
+    /// ACPI ones, for the machine as it is now -- its CPUs, its IO-APIC when
+    /// `ioapic`, and each device on the bus, `routes` -- and the SMBIOS ones,
+    /// what it is (`set_identity`).
+    fn write_firmware(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
         /* The window covers every slot's page, whichever have one. */
         let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
         let machine = acpi::Machine {
@@ -1055,6 +1082,15 @@ impl LinuxGuest {
         buf.resize(acpi::MAX_BYTES, 0);
         let len = acpi::build(&machine, &mut buf).ok_or(Error::NoMemory)?;
         self.memory.write(acpi::AREA, &buf[..len])?;
+
+        let machine = smbios::Machine {
+            uuid: self.identity.uuid,
+            serial: &self.identity.serial,
+            version: &self.identity.version,
+        };
+        buf.fill(0);
+        let len = smbios::build(&machine, &mut buf[..smbios::MAX_BYTES]).ok_or(Error::NoMemory)?;
+        self.memory.write(smbios::AREA, &buf[..len])?;
         Ok(linux::Firmware { rsdp: acpi::AREA, start: acpi::AREA, end: acpi::AREA_END })
     }
 

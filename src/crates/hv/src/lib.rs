@@ -25,7 +25,8 @@
 //! exits decoded -- that runs the built-in guests of [`guests`]; and a PC
 //! for a Linux guest of one CPU or several ([`run`]), with the devices it
 //! boots with, a local APIC for each CPU ([`lapic`]), what its CPUs reach
-//! each other by ([`smp`]), and the ACPI tables that describe it (`acpi`).
+//! each other by ([`smp`]), and the ACPI tables that describe it (`acpi`)
+//! and the SMBIOS ones that say what it is (`smbios`).
 //! Arm's EL2 comes later, under the same names.
 
 extern crate alloc;
@@ -57,6 +58,8 @@ pub mod linux;
 pub mod pvh;
 #[cfg(target_arch = "x86_64")]
 mod acpi;
+#[cfg(target_arch = "x86_64")]
+mod smbios;
 #[cfg(target_arch = "x86_64")]
 mod insn;
 #[cfg(target_arch = "x86_64")]

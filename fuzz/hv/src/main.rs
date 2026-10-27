@@ -101,6 +101,8 @@ pub mod place;
 pub mod policy;
 #[path = "../../../src/crates/hv/src/run.rs"]
 pub mod run;
+#[path = "../../../src/crates/hv/src/smbios.rs"]
+pub mod smbios;
 #[path = "../../../src/crates/hv/src/smp.rs"]
 pub mod smp;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
@@ -121,6 +123,7 @@ mod placemodel;
 mod platform;
 mod policymodel;
 mod recycle;
+mod smbiosmodel;
 mod targets;
 mod virtq;
 
