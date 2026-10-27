@@ -66,6 +66,38 @@ unsafe extern "C" {
     pub safe fn kernel_file_fsync(file: usize) -> i32;
 }
 
+/* A file held as a guest's disk image -- nothing else may write it, cut it
+   or move it while the image is held -- and read and written off the VFS's
+   lock. An image is a word looked up on every call, as a file held open
+   is; one that is no image's reads as none. All of them sleep. */
+unsafe extern "C" {
+    /// Holds a regular file as an image, for reading, and with `write` not
+    /// 0 for writing too: the image, or 0.
+    pub fn kernel_image_open(path: *const u8, path_len: usize, write: i32) -> usize;
+    /// Lets go of it; a word that is no image's is nothing to close.
+    pub safe fn kernel_image_close(image: usize);
+    /// Its size in bytes, or -1.
+    pub safe fn kernel_image_length(image: usize) -> i64;
+    /// The mount its file is on, never 0 -- or 0. With `kernel_image_key`,
+    /// which file it is (as `kernel_file_mount` and `kernel_file_key` say).
+    pub safe fn kernel_image_mount(image: usize) -> u64;
+    pub safe fn kernel_image_key(image: usize) -> u64;
+    /// Fills `len` bytes from `offset`, all of them inside the image: 0, or
+    /// -1.
+    pub fn kernel_image_read(image: usize, offset: u64, buf: *mut u8, len: usize) -> i32;
+    /// Writes `len` bytes at `offset`, all of them inside the image, which
+    /// never grows: 0, or -1. Not synced.
+    pub fn kernel_image_write(image: usize, offset: u64, data: *const u8, len: usize) -> i32;
+    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// filesystem -- holes, reading as zeros: 0, or -1.
+    pub safe fn kernel_image_discard(image: usize, offset: u64, len: u64) -> i32;
+    /// `len` bytes from `offset` made zeros, the whole blocks among them
+    /// given back with `unmap` not 0: 0, or -1.
+    pub safe fn kernel_image_write_zeroes(image: usize, offset: u64, len: u64, unmap: i32) -> i32;
+    /// Everything written to the image on its disk's medium: 0, or -1.
+    pub safe fn kernel_image_sync(image: usize) -> i32;
+}
+
 /* What procfs puts in its files. Each writes into the buffer given and
    answers how many bytes it wrote. */
 unsafe extern "C" {

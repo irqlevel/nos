@@ -170,7 +170,7 @@ const TERMINAL: [&[u8]; 9] = [b"\x1b[6n", b"\x1b[1;2H", b"\x1b[6", b"\x1b[", b"\
 
 fn uart(r: &mut Input) {
     let mut u = Uart::new();
-    while let Some(op) = r.op(9) {
+    while let Some(op) = r.op(10) {
         let offset = r.below(8) as u16;
         match op {
             8 => {
@@ -201,6 +201,20 @@ fn uart(r: &mut Input) {
             }
             6 => {
                 u.take_pulse();
+            }
+            9 => {
+                /* A line typed in whole: the next held back until the shell
+                 * asks where the cursor is again. */
+                u.line_taken();
+                invariant!(!u.prompt_seen(), "at a prompt still after a line went in");
+                /* The divisor latch closed, and loopback off: the query to
+                 * the line, not back to the receiver. */
+                u.write(3, 0x03);
+                u.write(4, 0x00);
+                for &b in b"\x1b[6n" {
+                    u.write(0, b);
+                }
+                invariant!(u.prompt_seen(), "not at a prompt after the shell asked where the cursor is");
             }
             _ => {
                 u.irq_line();
@@ -388,6 +402,7 @@ const APIC_ICR: u32 = 0x30;
 const APIC_ICR_HIGH: u32 = 0x31;
 const APIC_LVT_TIMER: u32 = 0x32;
 const APIC_TIMER_INITIAL: u32 = 0x38;
+const APIC_TIMER_CURRENT: u32 = 0x39;
 const APIC_TIMER_DIVIDE: u32 = 0x3E;
 const APIC_SELF_IPI: u32 = 0x3F;
 
@@ -410,8 +425,11 @@ pub fn apic_value(r: &mut Input, reg: u32) -> u64 {
     match reg {
         APIC_SVR => 0x100 | vector | u64::from(r.u8() & 0x10) << 8,
         APIC_LVT_TIMER | 0x33..=0x37 => {
-            vector | (r.below(8) << 8) | u64::from(r.bool()) << 16 | u64::from(r.bool()) << 17
-                | u64::from(r.bool()) << 13 | u64::from(r.bool()) << 15
+            /* The timer's TSC-deadline mode now and then: bit 18 with 17,
+             * the reserved mode, rarely. */
+            let deadline = reg == APIC_LVT_TIMER && r.u8() < 64;
+            vector | (r.below(8) << 8) | u64::from(r.bool()) << 16 | u64::from(r.bool() && (!deadline || r.rare())) << 17
+                | u64::from(deadline) << 18 | u64::from(r.bool()) << 13 | u64::from(r.bool()) << 15
         }
         APIC_TIMER_INITIAL => r.pick(&[1u64, 2, 100, 10_000, 1_000_000, 0xFFFF_FFFF]),
         APIC_TIMER_DIVIDE => r.below(16),
@@ -455,11 +473,33 @@ fn apic_write(a: &mut Lapic, r: &mut Input, reg: u32, value: u64, now: u64) {
     }
 }
 
+/// The timer's mode, LVT bits 18:17, as the guest reads its entry -- through
+/// the MSR in x2APIC mode, the page in xAPIC mode; None with the APIC off.
+fn timer_mode(a: &Lapic, now: u64) -> Option<u32> {
+    apic_read(a, APIC_LVT_TIMER, now).map(|lvt| (lvt >> 17) & 0b11)
+}
+
+/// TSC-deadline mode's code in those bits.
+const TIMER_DEADLINE: u32 = 0b10;
+
+/// Register `reg` as the guest reads it, in the APIC's mode; None with the
+/// APIC off.
+fn apic_read(a: &Lapic, reg: u32, now: u64) -> Option<u32> {
+    if !a.enabled() {
+        return None;
+    }
+    if a.xapic() {
+        Some(a.mmio_read(reg << 4, 4, now))
+    } else {
+        a.rdmsr(lapic::MSR_X2APIC_FIRST + reg, now).ok().map(|v| v as u32)
+    }
+}
+
 fn lapic_target(r: &mut Input) {
     let (id, bsp, x2apic) = (r.below(16) as u32, r.bool(), r.bool());
     let mut a = Lapic::new(id, bsp, x2apic);
     let mut now = time::boot_time_ns();
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         match op {
             0 => {
                 let reg = apic_reg(r);
@@ -515,6 +555,48 @@ fn lapic_target(r: &mut Input) {
             10 => a.init(),
             11 => {
                 apic_write(&mut a, r, APIC_SVR, 0x1FF, now);
+            }
+            13 => {
+                /* IA32_TSC_DEADLINE, in whatever mode the timer is: in
+                 * TSC-deadline mode a deadline armed and read back, gone
+                 * once the timer has run out; in any other, nothing taken
+                 * and 0 read (SDM 11.5.4.1). */
+                let before = timer_mode(&a, now);
+                if r.u8() < 128 {
+                    let entry = 0x4_0000 | (16 + r.below(240));
+                    apic_write(&mut a, r, APIC_LVT_TIMER, entry, now);
+                }
+                /* The mode as the guest reads it in the timer's entry. */
+                let mode = timer_mode(&a, now);
+                if mode == Some(TIMER_DEADLINE) {
+                    invariant!(before == mode || a.tsc_deadline() == 0,
+                               "IA32_TSC_DEADLINE {:#x} on the way into TSC-deadline mode", a.tsc_deadline());
+                    invariant!(apic_read(&a, APIC_TIMER_CURRENT, now) == Some(0),
+                               "the current count read {:?} in TSC-deadline mode", apic_read(&a, APIC_TIMER_CURRENT, now));
+                }
+                let value = if r.u8() < 32 { 0 } else { r.value64() };
+                let at = time::later(now, r.time_step());
+                let next = a.next_timer_ns();
+                a.set_tsc_deadline(value, at);
+                let read = a.tsc_deadline();
+                match mode {
+                    Some(TIMER_DEADLINE) => {
+                        invariant!(read == value, "IA32_TSC_DEADLINE read {:#x} after {:#x} was written", read, value);
+                        if value != 0 {
+                            let later = time::later(at, r.time_step());
+                            a.timer(later);
+                            invariant!(a.tsc_deadline() == 0, "IA32_TSC_DEADLINE {:#x} once the timer ran out",
+                                       a.tsc_deadline());
+                            now = later;
+                        }
+                    }
+                    Some(other) => {
+                        invariant!(read == 0, "IA32_TSC_DEADLINE read {:#x} in timer mode {}", read, other);
+                        invariant!(a.next_timer_ns() == next, "IA32_TSC_DEADLINE written in timer mode {} moved the \
+                                   timer from {:?} to {:?}", other, next, a.next_timer_ns());
+                    }
+                    None => {}
+                }
             }
             _ => {
                 a.sync_cr8(r.u8() & 0xF);
@@ -588,6 +670,8 @@ fn msi(r: &mut Input) {
 const MEM: u64 = 1 << 20;
 const PAGE: u64 = 4096;
 /* The legacy header's registers. */
+/// What the driver takes of the device's features, legacy virtio's way.
+const GUEST_FEATURES: u16 = 0x04;
 const QUEUE_PFN: u16 = 0x08;
 const QUEUE_SELECT: u16 = 0x0E;
 const QUEUE_NOTIFY: u16 = 0x10;
@@ -733,11 +817,14 @@ pub struct DiskState {
     /// Requests the fuzzer has said are served, to be taken.
     pub ready: usize,
     pub fail: bool,
+    /// Which of those it has said are served comes back next: a backend
+    /// serves several at once, and gives each back as it finishes.
+    pub order: u64,
 }
 
 impl DiskState {
     pub fn new(size: u64, read_only: bool) -> DiskState {
-        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false }
+        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
     }
 
     pub fn size(&self) -> u64 {
@@ -765,8 +852,21 @@ impl blk::Backend for Disk {
                            "a request of {} bytes at {} on a disk of {}", len, req.offset(), s.size);
             }
             blk::Op::Flush => {}
+            blk::Op::Discard | blk::Op::WriteZeroes => {
+                /* The device's copy, checked: what the backend acts on */
+                let ranges: Vec<blk::Range> = req.ranges().collect();
+                invariant!(!ranges.is_empty() && ranges.len() <= 8, "{} ranges handed over", ranges.len());
+                for r in &ranges {
+                    invariant!(r.offset % blk::SECTOR == 0 && r.len % blk::SECTOR == 0,
+                               "a range of {} bytes at {}, not whole sectors", r.len, r.offset);
+                    invariant!(r.offset.checked_add(r.len).is_some_and(|end| end <= s.size),
+                               "a range of {} bytes at {} on a disk of {}", r.len, r.offset, s.size);
+                    invariant!(!r.unmap || req.op() == blk::Op::WriteZeroes, "an unmap flag handed over on a discard");
+                }
+                RANGES_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        invariant!(!(s.read_only && req.op() == blk::Op::Write), "a write handed to a read-only disk");
+        invariant!(!(s.read_only && req.op().writes()), "a write, discard or write of zeros handed to a read-only disk");
         if req.op() == blk::Op::Read {
             req.data_mut().fill(0xA5);
         }
@@ -779,7 +879,15 @@ impl blk::Backend for Disk {
         }
         s.ready -= 1;
         let fail = s.fail;
-        let mut req = s.queue.pop_front()?;
+        if s.queue.is_empty() {
+            return None;
+        }
+        let at = (s.order % s.queue.len() as u64) as usize;
+        s.order = s.order.rotate_left(17).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        if at != 0 {
+            DISK_OUT_OF_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut req = s.queue.remove(at)?;
         req.done(!fail);
         Some(req)
     }
@@ -789,16 +897,35 @@ impl blk::Backend for Disk {
 /// data, and the status byte the device writes; in memory of `limit` bytes.
 pub fn blk_segments(mem: &dyn Memory, r: &mut Input, limit: u64) -> Vec<(u64, u32, bool)> {
     let header = gpa_in(r, limit) & !7;
-    let kind = r.pick(&[0u32, 1, 4, 8, 0xFFFF_FFFF]);
+    let kind = r.pick(&[0u32, 1, 4, 8, 11, 13, 0xFFFF_FFFF]);
     let sector = if r.bool() { r.below(1 << 20) } else { r.value64() };
     let mut h = [0u8; 16];
     h[..4].copy_from_slice(&kind.to_le_bytes());
     h[8..].copy_from_slice(&sector.to_le_bytes());
     mem.put(header, &h);
     let mut segs = vec![(header, if r.u8() < 240 { 16 } else { r.value32() }, false)];
-    for _ in 0..r.below(4) {
-        let len = if r.bool() { 512 * (1 + r.below(128)) as u32 } else { r.value32() };
-        segs.push((gpa_in(r, limit), len, kind != 1));
+    if (kind == 11 || kind == 13) && r.u8() < 200 {
+        /* A discard's or a write of zeros' ranges, as a driver lays them
+         * out: a sector, a count and flags each -- mostly plausible ones. */
+        let count = if r.u8() < 230 { 1 + r.below(8) } else { r.below(12) };
+        let at = gpa_in(r, limit) & !7;
+        for i in 0..count {
+            let mut range = [0u8; 16];
+            let first = if r.u8() < 220 { r.below(1 << 14) } else { r.value64() };
+            let sectors = if r.u8() < 220 { r.below(1 << 12) as u32 } else { r.value32() };
+            let flags = if r.u8() < 200 { (r.u8() & 1) as u32 } else { r.value32() };
+            range[..8].copy_from_slice(&first.to_le_bytes());
+            range[8..12].copy_from_slice(&sectors.to_le_bytes());
+            range[12..].copy_from_slice(&flags.to_le_bytes());
+            mem.put(at.wrapping_add(16 * i), &range);
+        }
+        let len = if r.u8() < 230 { 16 * count as u32 } else { r.value32() };
+        segs.push((at, len, false));
+    } else {
+        for _ in 0..r.below(4) {
+            let len = if r.bool() { 512 * (1 + r.below(128)) as u32 } else { r.value32() };
+            segs.push((gpa_in(r, limit), len, kind != 1));
+        }
     }
     segs.push((gpa_in(r, limit), if r.u8() < 240 { 1 } else { r.value32() }, true));
     segs
@@ -841,6 +968,12 @@ fn blk_target(r: &mut Input) {
                 setup_queue(r, &mut write, &mut q, index);
             }
             3 => {
+                if r.bool() {
+                    /* What the driver takes: everything offered, mostly --
+                     * discard and a write of zeros among it. */
+                    let features = if r.u8() < 200 { u32::MAX } else { r.value32() };
+                    disk.io_write(GUEST_FEATURES, 4, features, &mem, time::boot_time_ns());
+                }
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
                 disk.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
@@ -869,6 +1002,7 @@ fn blk_target(r: &mut Input) {
                 let mut s = state.lock().unwrap();
                 s.ready += 1 + r.below(4) as usize;
                 s.fail = r.u8() % 8 == 0;
+                s.order = if r.bool() { 0 } else { r.u64() };
             }
             11 => {
                 disk.set_msix_enabled(r.bool());
@@ -1383,11 +1517,17 @@ fn elf_image(r: &mut Input) -> Vec<u8> {
 static PVH_PARSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PVH_PLANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PVH_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A disk's requests given back before one handed over earlier.
+static DISK_OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Discards and writes of zeros handed to the backend.
+static RANGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
              PVH_BUILT.load(Relaxed));
+    println!("  disks: {} requests given back before one handed over earlier, {} discards and writes of zeros \
+              handed over", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {

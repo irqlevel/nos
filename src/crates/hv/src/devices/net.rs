@@ -106,6 +106,8 @@ const LINK_UP: u16 = 1;
 const CFG_MAC: usize = 0;
 const CFG_STATUS: usize = 6;
 const CFG_BYTES: usize = 8;
+const _: () = assert!(virtio::DEVICE_CONFIG_MSIX as usize + CFG_BYTES <= BAR_SIZE as usize,
+                      "the configuration fits the BAR, MSI-X's header and all");
 
 /// Legacy's header, before every frame either way: ten bytes, and two more
 /// -- how many buffers a frame was spread over -- once the driver takes

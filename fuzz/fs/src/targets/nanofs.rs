@@ -96,15 +96,15 @@ pub fn nanofs(r: &mut Input) {
     reached(if ro { "mounted read-only" } else { "mounted for writing" });
     let vfs = fs::vfs_instance().expect("the VFS");
     let limits = Limits::fixed(img::MAX_FILE as u64, img::MAX_ENTRIES);
-    let mut f = Fs { vfs, model: Model::new(tree, ro, limits), strict: !faults };
+    let mut f = Fs::new(vfs, Model::new(tree, ro, limits), !faults);
 
     let mut ops = 0;
     while r.more() && ops < 200 {
         ops += 1;
         if r.chance(8) {
-            let busy = !f.model.open.is_empty();
+            let busy = f.busy();
             let done = vfs.unmount(b"/");
-            invariant!(done != busy, "an unmount with {} files open {}", f.model.open.len(),
+            invariant!(done != busy, "an unmount with {} files and {} images open {}", f.model.open.len(), f.images.len(),
                        if done { "went through" } else { "was refused" });
             if done {
                 let again = fs::nanofs::mount_at("/", dev.handle(), ro);
@@ -268,7 +268,7 @@ pub fn nanofsbad(r: &mut Input) {
     reached("a damaged image mounted");
     let vfs = fs::vfs_instance().expect("the VFS");
     let limits = Limits::fixed(img::MAX_FILE as u64, img::MAX_ENTRIES);
-    let mut f = Fs { vfs, model: Model::new(Node::dir(), ro, limits), strict: false };
+    let mut f = Fs::new(vfs, Model::new(Node::dir(), ro, limits), false);
     crate::targets::ext2bad::walk(&mut f, b"/", 0);
     let settled = crate::machine::heap::live();
     crate::targets::ext2bad::walk(&mut f, b"/", 0);

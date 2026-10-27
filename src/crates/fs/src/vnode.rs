@@ -83,6 +83,13 @@ pub struct Node {
     pub dir_loaded: bool,
     /// Handles open on this node, which the VFS keeps
     pub open_count: usize,
+    /// Of those, the ones open for writing.
+    pub writers: usize,
+    /// Of those, the ones that hold it as a disk's image (`vfs::OPEN_HOLD`):
+    /// while one does, nothing else may write it, cut it or grow it, so
+    /// that the blocks it has stay its own for as long as the image reads
+    /// and writes them off the VFS's lock (`image`).
+    pub holds: usize,
 }
 
 impl Node {
@@ -196,6 +203,8 @@ impl Tree {
             ino: 0,
             dir_loaded: false,
             open_count: 0,
+            writers: 0,
+            holds: 0,
         };
         node.set_name(name);
 

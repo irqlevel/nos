@@ -78,6 +78,7 @@ use crate::pvh;
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::mmio;
+use crate::place::Shape;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
 use crate::svm::Exit;
 use crate::vm::{Cpu, Refusal};
@@ -93,10 +94,10 @@ const VECTOR_DB: u8 = 1;
 const VECTOR_AC: u8 = 17;
 
 /// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
-/// the disks' from 0xC000, the NICs' from 0xC100 -- and the IRQs they share:
-/// 11 and 10, free on a PC, on the slave PIC.
+/// the disks' from 0xC000, the NICs' past every disk's -- and the IRQs they
+/// share: 11 and 10, free on a PC, on the slave PIC.
 const DISK_IO_BASE: u16 = 0xC000;
-const NIC_IO_BASE: u16 = 0xC100;
+const NIC_IO_BASE: u16 = DISK_IO_BASE + (MAX_DISKS as u16) * (blk::BAR_SIZE as u16);
 const DISK_IRQ: u8 = 11;
 const NIC_IRQ: u8 = 10;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
@@ -317,6 +318,9 @@ pub struct Counts {
     /// not offer, or one a CPU would not take where it was.
     pub cr4: u64,
     pub cr4_gp: u64,
+    /// EOIs the guest made through its PV EOI word (KVM's), each done here
+    /// at its next exit in place of one of its own.
+    pub pv_eoi: u64,
     /// `mov`s to and from DR0-DR3 the guest stopped at (AMD-V,
     /// `crate::dr`), and of those the ones not made: a #GP above CPL 0, or
     /// a #DB with DR7's general detect on.
@@ -371,6 +375,7 @@ impl Counts {
         self.cr0 += o.cr0;
         self.cr4 += o.cr4;
         self.cr4_gp += o.cr4_gp;
+        self.pv_eoi += o.pv_eoi;
         self.dr += o.dr;
         self.dr_refused += o.dr_refused;
         self.xsetbv += o.xsetbv;
@@ -491,8 +496,23 @@ pub struct GuestCpu {
     /// The last interrupt injected came from the 8259: when it and the APIC
     /// both have one, they take turns (`LinuxGuest::deliver`).
     last_from_pic: bool,
+    /// MSR_KVM_PV_EOI_EN as the guest wrote it: its PV EOI word's address
+    /// and, in bit 0, whether it is on; and whether the word was set before
+    /// the last entry (`pv_eoi_arm`), for the exit after to look at.
+    pv_eoi: u64,
+    pv_eoi_armed: bool,
     counts: Counts,
 }
+
+/* KVM's PV EOI (`policy::MSR_KVM_PV_EOI_EN`): the MSR's on bit, the bit of
+ * the guest's word set while its EOI need not exit, and the MSR's bit that
+ * a word aligned to 4 bytes leaves clear -- set, a #GP, as KVM gives. */
+const PV_EOI_ON: u64 = 1;
+const PV_EOI_PENDING: u8 = 1;
+const PV_EOI_RESERVED: u64 = 1 << 1;
+/// What every hypercall is answered in RAX: -KVM_ENOSYS, as KVM answers one
+/// it does not know -- none is offered.
+const KVM_ENOSYS: u64 = (-1000i64) as u64;
 
 /// What a CPU asleep for good does next (`LinuxGuest::sleep_for_good`).
 enum Sleep {
@@ -624,6 +644,8 @@ pub struct LinuxGuest {
     /// offloads (`set_offloads`).
     rx_moderation_ns: u64,
     offloads: bool,
+    /// Where its CPUs sit, as their CPUID tells them (`set_shape`).
+    shape: Shape,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -709,6 +731,8 @@ impl LinuxGuest {
                 nmi_pending: false,
                 exception: None,
                 last_from_pic: false,
+                pv_eoi: 0,
+                pv_eoi_armed: false,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -766,8 +790,20 @@ impl LinuxGuest {
             notified: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
+            shape: Shape::cores(cpus),
         };
         Ok((guest, vcpus))
+    }
+
+    /// What its CPUs' CPUID tells them of where they sit -- what their
+    /// placement made of them (`place::Placement::shape`) -- set before it
+    /// boots; each a core of its own, sharing the cache, unless told. A
+    /// shape of another number of CPUs is not this guest's, and changes
+    /// nothing.
+    pub fn set_shape(&mut self, shape: Shape) {
+        if shape.cpus() == self.cpus() {
+            self.shape = shape;
+        }
     }
 
     /// Its memory: for the kernel and the initrd to be streamed into.
@@ -1293,6 +1329,7 @@ impl LinuxGuest {
                 gc.counts.vid += 1;
             } else {
                 gc.cpu.backend_mut().apicv_off();
+                self.pv_eoi_arm(gc);
             }
 
             /* Its timers' next edge, if one is coming: the host CPU's own
@@ -1311,6 +1348,10 @@ impl LinuxGuest {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
                 gc.lapic.from_cpu(&irr, &isr, tpr);
             }
+            /* What the guest did with its PV EOI word, first: an EOI made
+             * through it comes before whatever the exit is -- an EOI written
+             * to the register after it, which ends the vector beneath. */
+            self.pv_eoi_sync(gc);
             let (exit, host_cpu) = match entered {
                 Ok(entered) => entered,
                 Err(refusal) => {
@@ -1342,7 +1383,9 @@ impl LinuxGuest {
                     let v = gc.cpu.backend_mut();
                     let sub = v.regs().rcx as u32;
                     let leaf = v.save().rax as u32;
-                    let asker = crate::policy::Asker { apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0() };
+                    let asker = crate::policy::Asker {
+                        apic_id: gc.lapic.id(), apic, cr4: v.cr4(), xcr0: v.xcr0(), shape: self.shape,
+                    };
                     let answer = crate::policy::cpuid(leaf, sub, &asker);
                     let (save, regs) = v.save_and_regs_mut();
                     crate::policy::apply_cpuid(save, regs, &answer);
@@ -1518,11 +1561,13 @@ impl LinuxGuest {
                     None
                 }
                 Exit::Hypercall => {
-                    /* No paravirtualisation is offered; a VMMCALL is a fault
-                     * to the guest. Step past it so a stray one does not
-                     * spin, and inject nothing -- the guest that meant it
-                     * will notice its result did not change. */
-                    gc.cpu.backend_mut().skip_vmmcall();
+                    /* KVM's hypercalls: none is offered, and each is answered
+                     * -KVM_ENOSYS in RAX, as KVM answers one it does not
+                     * know -- a driver that probes for one, as ptp_kvm does
+                     * for its clock pairing, reads that as not there. */
+                    let v = gc.cpu.backend_mut();
+                    v.save_mut().rax = KVM_ENOSYS;
+                    v.skip_vmmcall();
                     None
                 }
                 other => Some(Stop::Unexpected { exit: other, rip }),
@@ -1670,6 +1715,9 @@ impl LinuxGuest {
              * (`send`), and never comes this far. */
             gc.counts.init += 1;
             gc.lapic.init();
+            /* MSR_KVM_PV_EOI_EN back to off, as KVM's reset has it. */
+            gc.pv_eoi = 0;
+            gc.pv_eoi_armed = false;
             self.publish(gc);
             gc.cpu.backend_mut().init_reset();
             /* What the CPU had to deliver goes with the reset. */
@@ -2309,6 +2357,46 @@ impl LinuxGuest {
             gc.counts.msr_read += 1;
         }
 
+        /* KVM's PV EOI: where the guest's word is, and whether it is on --
+         * a word in its memory, aligned to 4 bytes, or a #GP. */
+        if self.has_apic() && msr == crate::policy::MSR_KVM_PV_EOI_EN {
+            if write {
+                let word = value & !(PV_EOI_ON | PV_EOI_RESERVED);
+                if value & PV_EOI_RESERVED == 0
+                    && (value & PV_EOI_ON == 0 || self.memory.read(word, &mut [0u8]).is_ok())
+                {
+                    gc.pv_eoi = value;
+                    gc.cpu.backend_mut().skip_msr();
+                } else {
+                    self.msr_fault(gc, msr, value, true);
+                }
+            } else {
+                let value = gc.pv_eoi;
+                let b = gc.cpu.backend_mut();
+                let (save, regs) = b.save_and_regs_mut();
+                set_msr_read(save, regs, value);
+                b.skip_msr();
+            }
+            return None;
+        }
+
+        /* The APIC timer's deadline, where the guest is offered the
+         * TSC-deadline timer: the TSC is the host's, and the deadline it
+         * names is turned into the host's time as it is written. */
+        if self.has_apic() && msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
+            if write {
+                gc.lapic.set_tsc_deadline(value, tsc_ns(value));
+                gc.cpu.backend_mut().skip_msr();
+            } else {
+                let deadline = gc.lapic.tsc_deadline();
+                let b = gc.cpu.backend_mut();
+                let (save, regs) = b.save_and_regs_mut();
+                set_msr_read(save, regs, deadline);
+                b.skip_msr();
+            }
+            return None;
+        }
+
         if self.has_apic() && lapic::owns(msr) {
             let now = time::boot_time_ns();
             if write {
@@ -2368,6 +2456,46 @@ impl LinuxGuest {
         None
     }
 
+    /// Before an entry with the run loop delivering the APIC's interrupts:
+    /// the end of the interrupt in service left to the guest's PV EOI word
+    /// where it may be (`Lapic::eoi_may_be_quiet`) -- its bit set in guest
+    /// memory, which the guest's EOI then clears rather than exiting -- and
+    /// noted, for the exit after.
+    fn pv_eoi_arm(&self, gc: &mut GuestCpu) {
+        if gc.pv_eoi & PV_EOI_ON == 0 || gc.pv_eoi_armed || !gc.lapic.eoi_may_be_quiet() {
+            return;
+        }
+        let word = gc.pv_eoi & !(PV_EOI_ON | PV_EOI_RESERVED);
+        if self.memory.write(word, &[PV_EOI_PENDING]).is_ok() {
+            gc.pv_eoi_armed = true;
+        }
+    }
+
+    /// After an exit: what the guest did with its PV EOI word, if it was set
+    /// -- cleared, its EOI, done here as a write of the register would do it;
+    /// still set, none yet, and the word cleared, so that an EOI it makes
+    /// from here exits (it is set again before the next entry where it still
+    /// may be).
+    fn pv_eoi_sync(&self, gc: &mut GuestCpu) {
+        if !core::mem::take(&mut gc.pv_eoi_armed) {
+            return;
+        }
+        let word = gc.pv_eoi & !(PV_EOI_ON | PV_EOI_RESERVED);
+        let mut bits = [0u8];
+        match self.memory.read(word, &mut bits).map(|()| bits[0]) {
+            Ok(bits) if bits & PV_EOI_PENDING == 0 => {
+                gc.counts.pv_eoi += 1;
+                if let Some(vector) = gc.lapic.quiet_eoi() {
+                    self.level_eoi(gc, vector);
+                }
+            }
+            Ok(_) => {
+                let _ = self.memory.write(word, &[0]);
+            }
+            Err(_) => {}
+        }
+    }
+
     /// An MSR access refused: the #GP the CPU would give, and a note for
     /// the report.
     fn msr_fault(&self, gc: &mut GuestCpu, msr: u32, value: u64, write: bool) {
@@ -2379,6 +2507,15 @@ impl LinuxGuest {
             p.msr_faults.push((msr, value, write));
         }
     }
+}
+
+/// When the TSC -- a guest's, which is the host's -- reaches `tsc`, in host
+/// nanoseconds: now, if it has already, or if the TSC's rate is not known.
+fn tsc_ns(tsc: u64) -> u64 {
+    let (now_tsc, now) = (time::cycle_counter(), time::boot_time_ns());
+    let Some(hz) = time::cycle_counter_hz() else { return now };
+    let ahead = u128::from(tsc.saturating_sub(now_tsc)) * u128::from(kcore::consts::NS_PER_SEC) / u128::from(hz);
+    now.saturating_add(u64::try_from(ahead).unwrap_or(u64::MAX))
 }
 
 /// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
@@ -2475,8 +2612,9 @@ fn sync_msix(p: &mut Platform) {
 /// Hand the guest's receive register its next byte when it is free: first
 /// any answer it is waiting for to a terminal query (the cursor position a
 /// shell's line editor asks for before it reads), then a byte of what was
-/// typed -- held back until the guest has reached a prompt, so the boot
-/// does not swallow it. On every round of the first CPU's loop and not only
+/// typed -- held back until the guest is at a prompt, so the boot does not
+/// swallow it, and after each line until the next prompt, so a line is not
+/// typed ahead of the shell. On every round of the first CPU's loop and not only
 /// at an idle HLT: while a shell's line editor reads the answer to its
 /// cursor query it spins polling the port rather than halting, so a byte
 /// offered only at HLT would never arrive and the editor would time out.
@@ -2488,6 +2626,9 @@ fn feed_console(p: &mut Platform, host: &dyn Host) {
         p.uart.set_rx(byte);
     } else if let Some(byte) = host.input(p.uart.prompt_seen()) {
         p.uart.set_rx(byte);
+        if byte == b'\n' || byte == b'\r' {
+            p.uart.line_taken();
+        }
     }
 }
 

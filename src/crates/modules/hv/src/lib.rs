@@ -15,7 +15,8 @@
 //! NICs will be served by this module over the kernel's own, never by
 //! registering new ones.
 //!
-//!     insmod /hv.ko    -- vms=<folder>: where the VMs' folders are, /vms if not
+//!     insmod /hv.ko    -- vms=<folder>: where the VMs' folders are, /vms if not;
+//!                         stop_secs=N: what rmmod gives the guests (120 s)
 //!     hv info          -- what this machine has
 //!     hv on            -- turn the extension on
 //!     hv run all       -- run the built-in guests, each in a VM of its own
@@ -25,7 +26,9 @@
 //!     hv stop 0        -- its power button pressed: it shuts down, or is stopped
 //!     hv convert /noble.img /noble.raw          -- a cloud's qcow2 image made a raw disk
 //!     hv off
-//!     rmmod hv         -- stops every guest still running first, where it is
+//!     rmmod hv         -- every guest's power button pressed first, and the
+//!                         ones still running after stop_secs stopped where
+//!                         they are -- as nos's own poweroff and reboot do
 //!
 //! The built-in guests are a few bytes each (`hv::guests`); the Linux ones
 //! are x86-64 only, so far (`plans/03-hypervisor.md`).
@@ -122,7 +125,9 @@ hv wait <vm> [secs=N] [boot=N] <text>
 hv restart <vm>                    boot it again from its files, running or stopped
 hv stop <vm|all> [secs=N]          press its power button and give it secs (30) to turn
                                    itself off, then stop it; say how it ended, take it off
-                                   the list -- secs=0 stops it without asking
+                                   the list -- secs=0 stops it without asking. rmmod hv,
+                                   and nos's poweroff and reboot, stop all of them so,
+                                   given what insmod hv.ko was as stop_secs=N (120)
 hv forward [add <port> <vm> <guest-port> | del <port>]
                                    a port of nos's relayed to a guest's (net guests)
 hv convert <image> <disk>          a qcow2 image -- a cloud's, as QEMU writes them -- made
@@ -144,6 +149,11 @@ struct State {
     /// Where the VMs' folders are: `vms=` of `insmod`'s, or `/vms`.
     #[cfg(target_arch = "x86_64")]
     vms_root: String,
+    /// What the module's going gives the guests to turn themselves off once
+    /// their power buttons are pressed: `stop_secs=` of `insmod`'s, or
+    /// `vms::UNLOAD_STOP_DEFAULT_S`. 0 stops them where they are.
+    #[cfg(target_arch = "x86_64")]
+    stop_secs: u64,
     /// Set as the module starts to go: an `hv boot` running then stops at
     /// once instead of at the end of its time.
     #[cfg(target_arch = "x86_64")]
@@ -169,7 +179,7 @@ impl Drop for Hv {
         {
             self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
             self.state.forwards.close();
-            self.state.vms.close();
+            self.state.vms.close(self.state.stop_secs);
         }
 
         /* Then the command: `kernel_cmd_unregister` returns only once any
@@ -203,11 +213,20 @@ impl Drop for Hv {
     }
 }
 
-/// `insmod /hv.ko [vms=<folder>]`: where the VMs' folders are -- `/vms`
-/// unless given. Anything else is refused, said on insmod's output.
+/// What `insmod` was told.
 #[cfg(target_arch = "x86_64")]
-fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<String> {
+struct Params {
+    vms_root: String,
+    stop_secs: u64,
+}
+
+/// `insmod /hv.ko [vms=<folder>] [stop_secs=N]`: where the VMs' folders are
+/// -- `/vms` unless given -- and what the module's going gives the guests to
+/// turn themselves off. Anything else is refused, said on insmod's output.
+#[cfg(target_arch = "x86_64")]
+fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Params> {
     let mut root = None;
+    let mut stop_secs = None;
     for (key, value) in params.words() {
         match (key, value) {
             ("vms", Some(path)) if root.is_none() => match store::root(path) {
@@ -221,22 +240,34 @@ fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Str
                 let _ = writeln!(out, "hv: vms= takes a folder, and is given once");
                 return Err(kcore::error::Error::InvalidValue);
             }
+            ("stop_secs", Some(v)) if stop_secs.is_none() => match v.parse::<u64>() {
+                Ok(secs) if secs <= vms::WAIT_MAX_S => stop_secs = Some(secs),
+                _ => {
+                    let _ = writeln!(out, "hv: stop_secs={} is not a number of seconds 0..{}", v, vms::WAIT_MAX_S);
+                    return Err(kcore::error::Error::InvalidValue);
+                }
+            },
+            ("stop_secs", _) => {
+                let _ = writeln!(out, "hv: stop_secs= takes a number of seconds, and is given once");
+                return Err(kcore::error::Error::InvalidValue);
+            }
             _ => {
-                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder> is", key);
+                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder> and stop_secs=N are",
+                                 key);
                 return Err(kcore::error::Error::InvalidValue);
             }
         }
     }
-    match root {
-        Some(root) => Ok(root),
-        None => Ok(String::from(store::DEFAULT_ROOT)),
-    }
+    Ok(Params {
+        vms_root: root.unwrap_or_else(|| String::from(store::DEFAULT_ROOT)),
+        stop_secs: stop_secs.unwrap_or(vms::UNLOAD_STOP_DEFAULT_S),
+    })
 }
 
 /// No Linux guest runs here yet, so there is nothing for a parameter to say:
 /// one given is refused rather than kept and never used.
 #[cfg(not(target_arch = "x86_64"))]
-fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<()> {
+fn params(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<()> {
     if let Some((key, _)) = params.words().next() {
         let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's on this architecture -- it runs no Linux guest \
                                yet, and takes none", key);
@@ -245,11 +276,11 @@ fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<()>
     Ok(())
 }
 
-fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
+fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
     #[cfg(target_arch = "x86_64")]
-    let vms_root = vms_root(params, out)?;
+    let Params { vms_root, stop_secs } = params(given, out)?;
     #[cfg(not(target_arch = "x86_64"))]
-    vms_root(params, out)?;
+    params(given, out)?;
 
     /* A machine with no virtualization still gets a `Machine` and still
      * loads: `hv info` is a diagnostic, and the machine that most needs one
@@ -265,6 +296,8 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
         forwards: forward::Forwards::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         vms_root,
+        #[cfg(target_arch = "x86_64")]
+        stop_secs,
         #[cfg(target_arch = "x86_64")]
         unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     });
@@ -389,11 +422,19 @@ fn command(state: &State, args: &str, out: &mut Output) {
     }
 }
 
-/// Where the VMs' folders are, under what `hv` says of the CPUs.
+/// Where the VMs' folders are, and what the module's going gives the guests,
+/// under what `hv` says of the CPUs.
 #[cfg(target_arch = "x86_64")]
 fn vms_status(state: &State, out: &mut Output) {
     let _ = writeln!(out, "hv: vms kept in {}{}", state.vms_root,
                      if state.vms_root == store::DEFAULT_ROOT { "" } else { ", as insmod was told" });
+    let told = if state.stop_secs == vms::UNLOAD_STOP_DEFAULT_S { "" } else { ", as insmod was told" };
+    let _ = match state.stop_secs {
+        0 => writeln!(out, "hv: an unload -- rmmod, nos's poweroff or reboot -- stops the guests where they are, \
+                            without pressing their power buttons{}", told),
+        secs => writeln!(out, "hv: an unload -- rmmod, nos's poweroff or reboot -- presses the guests' power buttons \
+                               and gives them {} s to turn themselves off{}", secs, told),
+    };
 }
 
 /// `hv forward [add <port> <vm> <guest-port> | del <port>]`.

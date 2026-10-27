@@ -131,6 +131,86 @@ impl Drop for File {
     }
 }
 
+/// A file held as a guest's disk image, and let go of when this goes: while
+/// it is held nothing else may write the file, cut it, grow it, rename it or
+/// remove it -- and its reads and writes go to the device off the VFS's
+/// lock, where the filesystem keeps the file's blocks on one (`fs::image`),
+/// so one guest's disk does not wait behind another's or behind nos's own
+/// files. Held to read, any number may hold a file nobody writes; held to
+/// write, one alone. Every call takes the kernel's word for it, looked up.
+pub struct Image {
+    handle: usize,
+}
+
+impl Image {
+    /// The regular file at `path`, held for reading -- and with `write` for
+    /// writing too. NotFound when there is none, or it cannot be held so: a
+    /// directory, a read-only mount, someone else writing it or holding it
+    /// for writing, no memory.
+    pub fn open(path: &str, write: bool) -> Result<Image> {
+        let handle = unsafe { fs::kernel_image_open(path.as_ptr(), path.len(), i32::from(write)) };
+        if handle == 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(Image { handle })
+    }
+
+    /// Its size in bytes: the disk's, for as long as it is held.
+    pub fn size(&self) -> Result<u64> {
+        u64::try_from(fs::kernel_image_length(self.handle)).map_err(|_| Error::IoError)
+    }
+
+    /// Which file this is, as `File::identity` says it: what a claim on it
+    /// is keyed by.
+    pub fn identity(&self) -> Option<FileId> {
+        let mount = fs::kernel_image_mount(self.handle);
+        let key = fs::kernel_image_key(self.handle);
+        (mount != 0 && key != 0).then_some(FileId { mount, key })
+    }
+
+    /// Fills `buf` from `offset`, all of it inside the image.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        /* `buf` is writable for its length, and the handle is looked up. */
+        let rc = unsafe { fs::kernel_image_read(self.handle, offset, buf.as_mut_ptr(), buf.len()) };
+        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// Writes `data` at `offset`, all of it inside the image, which never
+    /// grows. Not synced: `sync` is.
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        /* `data` is readable for its length, and the handle is looked up. */
+        let rc = unsafe { fs::kernel_image_write(self.handle, offset, data.as_ptr(), data.len()) };
+        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// filesystem -- holes from here on, reading as zeros, the image's size
+    /// as it was: a guest's discard. What it covers of a block only in part
+    /// is left as it is.
+    pub fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        if fs::kernel_image_discard(self.handle, offset, len) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// `len` bytes from `offset` made zeros: with `unmap` the whole blocks
+    /// among them given back, the rest written over.
+    pub fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> Result<()> {
+        let rc = fs::kernel_image_write_zeroes(self.handle, offset, len, i32::from(unmap));
+        if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// Everything written to the image, on its disk's medium: a guest's
+    /// flush.
+    pub fn sync(&self) -> Result<()> {
+        if fs::kernel_image_sync(self.handle) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        fs::kernel_image_close(self.handle);
+    }
+}
+
 /// Which file an open file is (`File::identity`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileId {
