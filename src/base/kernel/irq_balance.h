@@ -81,7 +81,10 @@ private:
        takes it before the table goes. Nothing is traced under it -- a line
        goes to the console as it is written, about 10 ms of it on the EX44's
        framebuffer, and balance()'s four lines under it held it there past
-       the watchdog's 25 ms. */
+       the watchdog's 25 ms. IoApic::set_irq_destination, called under it,
+       says nothing for the same reason; only its backstop would, for an
+       apic id the entry cannot name -- one line, and a broken invariant
+       worth the lock's time. */
     SpinLock lock_;
 };
 

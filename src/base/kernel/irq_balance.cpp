@@ -66,8 +66,10 @@ ulong IrqBalance::next_cpu_lock_held(bool io_apic)
 
 void IrqBalance::apply_lock_held(Entry& entry)
 {
+    /* A line's destination as the IOAPIC took it, so that trace_entry says
+       where the line really goes */
     if (entry.kind == KIND_IO_APIC)
-        IoApic::get_instance().set_irq_destination(entry.gsi, entry.cpu);
+        entry.cpu = IoApic::get_instance().set_irq_destination(entry.gsi, entry.cpu);
     else
         entry.table->retarget(entry.index, (u32)entry.cpu);
 }
