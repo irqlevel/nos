@@ -149,6 +149,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
+| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out -- and a journal debugfs left unreplayed, read through without a byte written |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
@@ -1143,6 +1144,15 @@ closed). The targets:
   it lists that can be looked up, a file that reads no more than its size, a
   walk of it all that changes nothing leaving the kernel's heap as it found
   it, nothing read or written once it is unmounted;
+- `ext4mkfs`, `ext4` and `ext4bad`: images of ext4's judge's mkfs -- made
+  and nothing more, for `--e2fsck` to judge; mounted by the ext4 driver,
+  read-only as all it does yet, with the disk's every write a finding, and
+  worked through the VFS, every answer the model's and the whole tree read
+  back at the end, a journal holding the newest copies of blocks whose homes
+  are noise read through so that the tree is still the one mkfs was given;
+  and damaged -- a byte or three of the metadata at the start of the first
+  groups, or of anything else -- refused, or mounted and walked as ext2bad's
+  are, never a panic, a write or a leak;
 - `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
   and ramfs mounted beside it and taken down again at paths nested,
   doubled, without a slash and too long; tasks of their own at work on those

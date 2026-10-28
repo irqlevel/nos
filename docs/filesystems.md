@@ -287,6 +287,60 @@ indirect block of each level last used are kept in memory, so a file read or
 written a piece at a time does not read its inode back for every piece, and
 a sequential pass does not re-read its indirect blocks per data block.
 
+## ext4
+
+`src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
+-- through `src/crates/extfmt`, the on-disk format and its checksums as a
+crate with no kernel in it. It is read-only for now: writing, through the
+journal, is the next step, and until then every filesystem it mounts is
+mounted read-only whatever was asked, and nothing it does writes to the
+device. ext2's driver stays as it is, for the roots made before ext4.
+
+Which driver a filesystem gets is `extfs::driver_for`'s to say, for
+`root=`, the fallback layout and `mount`: ext2's takes what it always
+took -- revision 1, no incompatible feature but filetype -- but a
+filesystem with a journal, which it would write past; ext4's takes the
+rest of the family. `mount ext4 <disk> <path>` names the driver outright.
+
+What is refused, mounted read-only or (once it writes) written is
+`extfmt::features::classify`'s: refused are inline_data, bigalloc, meta_bg,
+encryption, casefold, verity, ea_inode, largedir, mmp, an external journal
+and a filesystem with no filetype; read-only, whatever this driver comes to
+write, a filesystem without a journal, without extents (ext3), without
+metadata_csum, with orphan_file, quota or project quotas. Past what extfmt
+checks of a superblock, the driver refuses a block it cannot read in a page,
+more blocks than the device has, groups more than their bitmaps cover, an
+inode count that is not what the groups hold, and descriptors whose bitmaps
+or tables lie outside the filesystem.
+
+Every checksum on what is read is held to the one it should be, and what
+fails is said and not used: the superblock and every descriptor at the
+mount -- either refuses it -- and an inode, an extent block, a directory's
+leaf (by its tail) or index block (by its own) when they are read, which
+fails the read, or leaves an entry out of its directory, with a line saying
+which. An inode in a part of its group's table never written -- an
+uninitialised group's, or past `itable_unused` -- is not read at all.
+Unwritten extents read as zeros, whatever their blocks hold. Directories
+are read as ext2's are, the first time a walk enters them and all of one or
+nothing; an htree directory as the linear one it also is. Names of 64
+bytes or more, symlinks and device nodes are left out of the tree.
+
+A journal holding transactions nobody replayed -- a crash under Linux, or
+under nos once it writes -- is not replayed by a read-only mount, which
+writes nothing: extfmt's recovery planner works out what a replay would
+write (`extfmt::recovery`, held to e2fsck's replay byte for byte by
+`extfmt-test.py`), and every read of a block the plan names is served from
+its newest copy in the journal. The superblock and the descriptors are read
+again through it if it has newer copies of them, as a replay would have
+left them. `mounts` says so (`journal-not-replayed=<blocks>`), and while it
+is so a disk's image of a file here is read through the VFS, not off the
+VFS's lock from where the file's blocks are on the device -- whose copies
+are older. A journal the planner refuses -- a descriptor damaged under a
+sound commit, a copy failing its checksum, features it does not know -- has
+the mount refused, as a filesystem read around it would be neither as it
+was nor as it was to be; a log the superblock does not say needs replaying
+is read past, as Linux discards it.
+
 ## nanofs, ramfs, procfs
 
 nanofs (`src/crates/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
