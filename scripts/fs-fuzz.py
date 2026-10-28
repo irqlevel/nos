@@ -66,7 +66,9 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-OUT = os.path.join(ROOT, 'out', 'fs-fuzz')
+# FS_FUZZ_OUT for a build of its own: the nos-builder container's, say,
+# beside the host's in one checkout.
+OUT = os.environ.get('FS_FUZZ_OUT') or os.path.join(ROOT, 'out', 'fs-fuzz')
 VENDOR = os.path.join(ROOT, 'src', 'crates', 'vendor')
 
 # The gate's seed. How many inputs of each target it runs is the target's
@@ -96,6 +98,35 @@ def fnv(data):
     return h
 
 
+# What e2fsck says of a filesystem the kernel's ext4 left that is no
+# damage: a lost+found the calls removed -- a convention of e2fsck's, which
+# would make it again, not a part of the format -- and, after a crash, the
+# superblock's free counts, which Linux keeps lazily too.
+NO_LPF = re.compile(r'^/lost\+found not found\.')
+LAZY_COUNTS = re.compile(r'^Free (blocks|inodes) count wrong \(')
+
+
+def e2fsck_problems(work, lazy):
+    """What `e2fsck -fn` finds in `work`, but for what is no damage: every
+    question it answers no, by the problem it asks of."""
+    r = subprocess.run(['e2fsck', '-fn', '-E', 'no_optimize_extents', work], capture_output=True, text=True)
+    if r.returncode not in (0, 4):
+        return ['e2fsck -fn, exit %d: %s' % (r.returncode, r.stdout[-1500:])]
+    out = r.stdout.splitlines()
+    benign = [NO_LPF] + ([LAZY_COUNTS] if lazy else [])
+    asked, bad = 0, []
+    for k, line in enumerate(out):
+        if not line.rstrip().endswith('? no'):
+            continue
+        asked += 1
+        said = [line, out[k - 1] if k else '']
+        if not any(b.match(t) for b in benign for t in said):
+            bad.append(' / '.join(t for t in said if t))
+    if bad or (r.returncode != 0 and asked == 0):
+        return ['e2fsck -fn, exit %d: %s: %s' % (r.returncode, bad[:4], r.stdout[-1500:])]
+    return []
+
+
 def judge_ext4(img, manifest, tmp):
     """An ext4 image held to e2fsck and to its manifest: what is wrong with
     it, nothing for a sound one."""
@@ -106,14 +137,13 @@ def judge_ext4(img, manifest, tmp):
     shutil.copyfile(img, work)
     problems = []
     if journaled:
-        r = subprocess.run(['e2fsck', '-fy', '-E', 'journal_only', work], capture_output=True, text=True)
+        # The replay alone: with -f, e2fsck goes on to check and repair.
+        r = subprocess.run(['e2fsck', '-y', '-E', 'journal_only', work], capture_output=True, text=True)
         if r.returncode not in (0, 1):
             problems.append('e2fsck -E journal_only, exit %d: %s' % (r.returncode, r.stdout[-600:]))
     # An extent tree wider or deeper than its file needs is the format's to
     # allow, and the kernel's to leave: not e2fsck's to call a problem.
-    r = subprocess.run(['e2fsck', '-fn', '-E', 'no_optimize_extents', work], capture_output=True, text=True)
-    if r.returncode != 0:
-        problems.append('e2fsck -fn, exit %d: %s' % (r.returncode, r.stdout[-1500:]))
+    problems += e2fsck_problems(work, False)
     out = os.path.join(tmp, 'rdump')
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -122,7 +152,9 @@ def judge_ext4(img, manifest, tmp):
     for l in lines:
         w = l.split()
         if w and w[0] in ('d', 'f'):
-            want[bytes.fromhex(w[1]).decode('utf-8', 'replace')] = w
+            # As os.walk names what rdump wrote: bytes that are not UTF-8
+            # escaped, not replaced.
+            want[os.fsdecode(bytes.fromhex(w[1]))] = w
     seen = set()
     for d, dirs, files in os.walk(out):
         for n in dirs + files:
@@ -330,7 +362,7 @@ def e2fsck_judged(args):
     os.makedirs(dump)
     env = dict(os.environ, FS_FUZZ_DUMP=dump)
     binary = os.path.join(OUT, 'release', 'fs-fuzz')
-    for target, n in (('ext4mkfs', it), ('ext2', max(it // 3, 1))):
+    for target, n in (('ext4mkfs', it), ('ext2', max(it // 3, 1)), ('ext4rw', it)):
         r = subprocess.run([binary, '--target', target, '--iterations', str(n), '--seed', seed], env=env, cwd=tmp)
         if r.returncode != 0:
             print('fs-fuzz --e2fsck: the %s target found something first' % target)
@@ -341,11 +373,23 @@ def e2fsck_judged(args):
             continue
         img = os.path.join(dump, f)
         tag = f.rsplit('-', 2)[0]
-        if tag == 'ext4mkfs':
+        if tag in ('ext4mkfs', 'ext4rw'):
+            # ext4rw's: what the kernel's driver left at a clean unmount.
             problems = judge_ext4(img, img[:-4] + '.manifest', tmp)
             if os.path.exists(img[:-4] + '.replayed'):
                 problems += replay_agrees(img, img[:-4] + '.replayed', tmp)
                 judged['judge-replay'] = judged.get('judge-replay', 0) + 1
+        elif tag == 'ext4rw-crash':
+            # What the power going left of the kernel's writing: e2fsck's
+            # replay of its journal leaves nothing for e2fsck to find.
+            work = os.path.join(tmp, 'work.img')
+            shutil.copyfile(img, work)
+            # The replay alone: with -f, e2fsck goes on to check and repair.
+            r = subprocess.run(['e2fsck', '-y', '-E', 'journal_only', work], capture_output=True, text=True)
+            problems = [] if r.returncode in (0, 1) else ['e2fsck -E journal_only, exit %d: %s'
+                                                          % (r.returncode, r.stdout[-600:])]
+            problems += e2fsck_problems(work, True)
+            os.unlink(work)
         elif tag in ('mkfs', 'crash-clean', 'crash-unclean'):
             r = subprocess.run(['e2fsck', '-fn', img], capture_output=True, text=True)
             said = r.returncode != 0 or any(l.rstrip().endswith('? no') for l in r.stdout.splitlines())

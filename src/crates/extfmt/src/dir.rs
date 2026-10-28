@@ -11,7 +11,7 @@
 use alloc::string::String;
 
 use crate::crc::crc32c;
-use crate::{le16, le32};
+use crate::{le16, le32, set_le16, set_le32};
 
 /// An entry's fixed part: inode, record length, name length, type.
 pub const ENTRY_HEADER: usize = 8;
@@ -132,6 +132,53 @@ pub fn tail(block: &[u8]) -> Option<u32> {
 /// over everything before the tail (`ext4_dirblock_csum`).
 pub fn leaf_csum(inode_seed: u32, block: &[u8]) -> u32 {
     crc32c(inode_seed, &block[..block.len().saturating_sub(TAIL)])
+}
+
+/// The bytes an entry for a name of `name_len` bytes takes: its fixed part
+/// and the name, rounded up to four (`EXT4_DIR_REC_LEN`).
+pub fn entry_len(name_len: usize) -> usize {
+    (ENTRY_HEADER + name_len + 3) & !3
+}
+
+/// Write an entry at `at`: `rec_len` bytes naming inode `ino` as `name`, of
+/// type `file_type`. The caller has checked that it fits the block.
+pub fn put_entry(block: &mut [u8], at: usize, ino: u32, rec_len: usize, name: &[u8], file_type: u8) {
+    set_le32(block, at, ino);
+    set_le16(block, at + 4, rec_len as u16);
+    block[at + 6] = name.len() as u8;
+    block[at + 7] = file_type;
+    block[at + ENTRY_HEADER..at + ENTRY_HEADER + name.len()].copy_from_slice(name);
+}
+
+/// End a leaf block in its tail: an entry naming nothing, `TAIL` bytes
+/// long, of the tail's type, its checksum still to be put on it.
+pub fn put_tail(block: &mut [u8]) {
+    let at = block.len() - TAIL;
+    block[at..].fill(0);
+    set_le16(block, at + 4, TAIL as u16);
+    block[at + 7] = TAIL_FT;
+}
+
+/// Put on a leaf block the checksum its tail should carry: false for a
+/// block that ends in no tail.
+pub fn set_leaf_csum(inode_seed: u32, block: &mut [u8]) -> bool {
+    if tail(block).is_none() {
+        return false;
+    }
+    let c = leaf_csum(inode_seed, block);
+    let at = block.len() - TAIL + 8;
+    set_le32(block, at, c);
+    true
+}
+
+/// Put on an index block the checksum its tail should carry: false for a
+/// block that is no index block, or has no room for its tail.
+pub fn set_dx_csum(inode_seed: u32, block: &mut [u8]) -> bool {
+    let Some((_, c)) = dx_csum(inode_seed, block) else { return false };
+    let Some(count_offset) = dx_count_offset(block) else { return false };
+    let (limit, _) = dx_count_limit(block, count_offset);
+    set_le32(block, count_offset + usize::from(limit) * DX_ENTRY + 4, c);
+    true
 }
 
 /// Where an index block's count and limit are, if it is one

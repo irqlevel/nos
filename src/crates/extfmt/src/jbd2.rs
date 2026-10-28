@@ -249,6 +249,12 @@ impl JournalSuper {
     pub fn set_sequence(&mut self, v: u32) {
         set_be32(&mut self.raw, S_SEQUENCE, v);
     }
+    pub fn set_incompat(&mut self, v: u32) {
+        set_be32(&mut self.raw, S_FEATURE_INCOMPAT, v);
+    }
+    pub fn set_checksum_type(&mut self, v: u8) {
+        self.raw[S_CHECKSUM_TYPE] = v;
+    }
     pub fn set_checksum(&mut self) {
         if self.csum_v2or3() {
             let c = self.compute_checksum();

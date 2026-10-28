@@ -134,7 +134,9 @@ jobs:
       # A judge wrong about the format holds every driver to the wrong
       # thing, and agrees with it: the images the fuzzer's judges make and
       # call clean, and the power cuts they call unclean, held to e2fsck --
-      # an ext4 image's every file to what debugfs reads out of it.
+      # an ext4 image's every file to what debugfs reads out of it -- and
+      # the images the kernel's ext4 driver writes, and what its power cuts
+      # leave, held to e2fsck's verdict too.
       - name: Storage fuzz judges against e2fsprogs (host)
         if: matrix.arch == 'x86_64'
         run: |
@@ -176,9 +178,11 @@ jobs:
         run: python3 scripts/ext2-test.py --tcg
 
       # The fuzzer holds ext4 to images of its own; this holds it to
-      # mke2fs's, as Linux's distributions make them, and to a journal
-      # debugfs left unreplayed -- read through by a mount that must write
-      # nothing.
+      # mke2fs's, as Linux's distributions make them -- read, names written
+      # into one that e2fsck must then find nothing in, and a boot killed
+      # under its writing whose journal e2fsck and Linux must replay clean --
+      # and to a journal debugfs left unreplayed, read through by a mount
+      # that must write nothing.
       - name: ext4 test (mke2fs, debugfs, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext4-test.py --tcg

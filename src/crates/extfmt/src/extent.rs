@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::crc::crc32c;
-use crate::{le16, le32, Map, ReadBlock};
+use crate::{le16, le32, set_le16, set_le32, Map, ReadBlock};
 
 pub const MAGIC: u16 = 0xF30A;
 pub const HEADER: usize = 12;
@@ -93,6 +93,54 @@ pub fn index(node: &[u8], i: usize) -> Index {
 /// Where a block node's checksum is: after the last entry it has room for.
 pub fn tail_offset(max: u16) -> usize {
     HEADER + usize::from(max) * ENTRY
+}
+
+/// The entries the root, in an inode's `i_block`, has room for.
+pub const ROOT_MAX: u16 = ((ROOT_BYTES - HEADER) / ENTRY) as u16;
+
+/// The entries a block node of `block_size` bytes has room for, its tail
+/// after them (`ext4_ext_space_block`).
+pub fn block_max(block_size: usize) -> u16 {
+    ((block_size - HEADER) / ENTRY).min(usize::from(u16::MAX)) as u16
+}
+
+pub fn set_header(node: &mut [u8], h: Header) {
+    set_le16(node, 0, MAGIC);
+    set_le16(node, 2, h.entries);
+    set_le16(node, 4, h.max);
+    set_le16(node, 6, h.depth);
+    set_le32(node, 8, h.generation);
+}
+
+fn entry_mut(node: &mut [u8], i: usize) -> &mut [u8] {
+    &mut node[HEADER + i * ENTRY..HEADER + (i + 1) * ENTRY]
+}
+
+/// Store leaf entry `i`: `l.len` at most `INIT_MAX_LEN`, or
+/// `UNINIT_MAX_LEN` unwritten.
+pub fn set_leaf(node: &mut [u8], i: usize, l: Leaf) {
+    let e = entry_mut(node, i);
+    set_le32(e, 0, l.first);
+    set_le16(e, 4, if l.unwritten { l.len + INIT_MAX_LEN } else { l.len } as u16);
+    set_le16(e, 6, (l.start >> 32) as u16);
+    set_le32(e, 8, l.start as u32);
+}
+
+pub fn set_index(node: &mut [u8], i: usize, x: Index) {
+    let e = entry_mut(node, i);
+    set_le32(e, 0, x.first);
+    set_le32(e, 4, x.child as u32);
+    set_le16(e, 8, (x.child >> 32) as u16);
+    set_le16(e, 10, 0);
+}
+
+/// Put on block node `node` the checksum it should carry: false for a node
+/// with no room for one.
+pub fn set_node_csum(inode_seed: u32, node: &mut [u8]) -> bool {
+    let Some(c) = node_csum(inode_seed, node) else { return false };
+    let at = header(node).map(|h| tail_offset(h.max)).unwrap_or(0);
+    set_le32(node, at, c);
+    true
 }
 
 /// The checksum block node `node` should carry -- from the inode's seed
