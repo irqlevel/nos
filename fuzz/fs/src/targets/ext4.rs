@@ -1,0 +1,237 @@
+//! ext4, on images the fuzzer's own mkfs makes from the format: every block
+//! size, 32- and 64-byte descriptors, flex_bg or not, metadata_csum with
+//! its own seed or the UUID's, groups left uninitialised with garbage where
+//! nothing was written, files in extent trees of any depth with unwritten
+//! extents over garbage, entries the kernel's tree does not show, and
+//! journals holding transactions nobody replayed.
+//!
+//! `ext4mkfs` makes images and nothing else: with FS_FUZZ_DUMP set it
+//! writes each out beside a manifest of its tree, for `fs-fuzz.py
+//! --e2fsck` to hold to e2fsck and debugfs -- the judge held to the
+//! format's own tools before any driver is held to the judge.
+
+use std::collections::BTreeMap;
+
+use crate::image::ext4::{self as img, Geometry, Style};
+use crate::model::{Data, Node};
+use crate::{reached, Input};
+
+/// When the images are made: before the kernel's wall clock starts.
+const MKFS_TIME: u32 = 1_749_000_000;
+
+/// True about one time in `n`, and false past the input's end, whose zeros
+/// are the ordinary choice (`Input::chance` is in 256ths).
+fn one_in(r: &mut Input, n: u8) -> bool {
+    r.u8() % n == 1
+}
+
+/// A geometry mke2fs could make, small enough to be quick.
+pub fn geometry(r: &mut Input) -> Geometry {
+    let log = r.below(3) as u32;
+    let bs = 1024u64 << log;
+    let isz: u16 = if r.u8() % 4 == 0 { 128 } else { 256 };
+    let bpg: u32 = match r.u8() % 3 {
+        0 => 8 * bs as u32,
+        1 => 2048,
+        _ => 1024 + 8 * r.below(64) as u32,
+    }
+    .min(8 * bs as u32);
+    let per_block = (bs / isz as u64) as u32;
+    let ipg = (per_block.max(8) * r.range(1, 8) as u32).min(8 * bs as u32);
+    let groups = r.range(1, 6);
+    let first = (log == 0) as u64;
+    let blocks = (first + groups * bpg as u64 - if groups > 1 { r.below(bpg as u64 / 2) } else { 0 })
+        .min((24 << 20) / bs);
+    let mut label = [0u8; 16];
+    label[..3].copy_from_slice(b"nos");
+    let mut uuid = [0u8; 16];
+    for b in uuid.iter_mut() {
+        *b = r.u8();
+    }
+    let mut g = Geometry {
+        log_block_size: log,
+        blocks,
+        blocks_per_group: bpg,
+        inodes_per_group: ipg,
+        inode_size: isz,
+        bit64: r.bool(),
+        log_groups_per_flex: r.pick(&[0, 1, 2, 4]),
+        csum_seed: one_in(r, 4),
+        journal_blocks: if one_in(r, 8) { 0 } else { 1024 },
+        label,
+        uuid,
+    };
+    while !g.valid() && g.groups() > 1 {
+        g.blocks = first + (g.groups() - 1) * bpg as u64;
+    }
+    if !g.valid() {
+        g.log_groups_per_flex = 0;
+        g.blocks_per_group = 8 * bs as u32;
+        g.inodes_per_group = per_block.max(8) * 4;
+        g.blocks = (first + 4096).min(first + 8 * bs);
+    }
+    g
+}
+
+pub fn style(r: &mut Input) -> Style {
+    Style {
+        scatter: r.pick(&[0, 0, 3, 16]),
+        fill: r.pick(&[0, 0, 0, 2, 3, 7]),
+        unwritten: one_in(r, 3),
+        uninit: r.bool(),
+        garbage: one_in(r, 3),
+        hidden: one_in(r, 3),
+        slack: one_in(r, 3),
+        journal_csum: r.bool(),
+        journaled: 0,
+    }
+}
+
+/// What a file holds: nothing, a little, a block either side of a few
+/// edges, many small pieces apart -- each an extent of its own -- or a few
+/// pieces far apart, past 4 GiB, with holes between.
+fn content(r: &mut Input, bs: u64, budget: &mut u64) -> Data {
+    let mut d = Data::new();
+    match r.u8() % 8 {
+        0 => {}
+        1 => d = Data::from(&crate::input::noise(r.u32(), r.below(100) as usize)),
+        2 => d = Data::from(&crate::input::noise(r.u32(), (bs * r.range(1, 6) + r.below(3) - 1) as usize)),
+        3 | 4 => {
+            /* Pieces a block apart: an extent each, enough to fill leaves. */
+            let pieces = r.range(5, 600);
+            for k in 0..pieces {
+                d.write(k * 2 * bs, &crate::input::noise(r.u32(), bs as usize));
+            }
+        }
+        5 => {
+            let len = r.range(4, 6) << 30;
+            for _ in 0..r.range(1, 4) {
+                let at = r.below(len);
+                let n = r.below(2 * bs).min(len - at);
+                d.write(at, &crate::input::noise(r.u32(), n as usize));
+            }
+            d.truncate(len);
+        }
+        _ => d = Data::from(&crate::input::noise(r.u32(), r.below(8 * bs) as usize)),
+    }
+    let blocks = d.nonzero_blocks(bs).len() as u64 * 2 + 8;
+    if blocks > *budget {
+        return Data::new();
+    }
+    *budget -= blocks;
+    d
+}
+
+fn name(r: &mut Input) -> Vec<u8> {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+    let len = r.range(1, 40) as usize;
+    (0..len).map(|_| CHARS[r.below(CHARS.len() as u64) as usize]).collect()
+}
+
+/// A tree of directories and files within a budget of blocks and inodes.
+pub fn tree(r: &mut Input, bs: u64, budget: &mut u64, inodes: &mut u64) -> Node {
+    fn level(r: &mut Input, bs: u64, budget: &mut u64, inodes: &mut u64, depth: u32) -> Node {
+        let mut children = BTreeMap::new();
+        for _ in 0..r.below(if depth == 0 { 24 } else { 8 }) {
+            if *inodes < 6 || *budget < 16 {
+                break;
+            }
+            let n = name(r);
+            if n == b"lost+found" || children.contains_key(&n) {
+                continue;
+            }
+            *inodes -= 1;
+            if depth < 4 && one_in(r, 4) {
+                *budget -= 2;
+                children.insert(n, level(r, bs, budget, inodes, depth + 1));
+            } else {
+                children.insert(n, Node::File(content(r, bs, budget)));
+            }
+        }
+        Node::Dir(children)
+    }
+    level(r, bs, budget, inodes, 0)
+}
+
+/// Where a target's images go for a look with e2fsck: `FS_FUZZ_DUMP=<dir>`,
+/// each with a manifest of what its tree holds -- a line a directory or a
+/// file, a file's size and the FNV-1a of its bytes, holes as zeros.
+pub fn dump(tag: &str, made: &img::Made, tree: &Node, bytes: u64) {
+    let Some(dir) = std::env::var_os("FS_FUZZ_DUMP") else { return };
+    let base = format!("{}/{}-{}-{}", dir.to_string_lossy(), tag, std::process::id(),
+                       crate::machine::sched::now());
+    /* Written sparse: what was never written is zeros, and costs nothing. */
+    if let Ok(mut f) = std::fs::File::create(format!("{}.img", base)) {
+        use std::io::{Seek, SeekFrom, Write};
+        let bytes_all = made.media.to_vec(bytes);
+        let _ = f.set_len(bytes);
+        for (k, piece) in bytes_all.chunks(64 << 10).enumerate() {
+            if piece.iter().any(|&b| b != 0) {
+                let _ = f.seek(SeekFrom::Start(k as u64 * (64 << 10))).and_then(|_| f.write_all(piece));
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    fn walk(n: &Node, at: &mut Vec<u8>, lines: &mut Vec<String>) {
+        for (name, child) in n.children().expect("a directory") {
+            let len = at.len();
+            at.push(b'/');
+            at.extend_from_slice(name);
+            let hex: String = at.iter().map(|b| format!("{:02x}", b)).collect();
+            match child {
+                Node::Dir(_) => {
+                    lines.push(format!("d {}", hex));
+                    walk(child, at, lines);
+                }
+                Node::File(d) => {
+                    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+                    for &b in d.to_vec().iter() {
+                        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+                    }
+                    lines.push(format!("f {} {} {:016x}", hex, d.len(), h));
+                }
+            }
+            at.truncate(len);
+        }
+    }
+    walk(tree, &mut Vec::new(), &mut lines);
+    lines.push(format!("hidden {}", made.hidden));
+    lines.push(format!("journaled {}", made.journaled.len()));
+    let _ = std::fs::write(format!("{}.manifest", base), lines.join("\n") + "\n");
+}
+
+/// Images made, from geometries, trees and styles the input chooses --
+/// a journal with transactions nobody replayed now and then.
+pub fn ext4mkfs(r: &mut Input) {
+    let g = geometry(r);
+    let mut st = style(r);
+    if g.journal_blocks > 0 && one_in(r, 3) {
+        st.journaled = r.range(1, 12) as u8;
+    }
+    let bs = g.block_size();
+    let mut budget = g.blocks / 2;
+    let mut inodes = g.inodes() / 2;
+    /* Files a dump's reader can read whole: no far ones when dumping. */
+    let tree = tree(r, bs, &mut budget, &mut inodes);
+    let dumping = std::env::var_os("FS_FUZZ_DUMP").is_some();
+    if dumping && too_big(&tree) {
+        return;
+    }
+    match img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) {
+        Ok(made) => {
+            reached("ext4mkfs: an image made");
+            if !made.journaled.is_empty() {
+                reached("ext4mkfs: its journal holding what its homes do not");
+            }
+            dump("ext4mkfs", &made, &tree, g.blocks * bs);
+        }
+        Err(_) => reached("ext4mkfs: a tree the geometry could not hold"),
+    }
+}
+
+fn too_big(n: &Node) -> bool {
+    match n {
+        Node::File(d) => d.len() > 64 << 20,
+        Node::Dir(c) => c.values().any(too_big),
+    }
+}

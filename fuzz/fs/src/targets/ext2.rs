@@ -416,7 +416,10 @@ pub fn ext2(r: &mut Input) {
     let crashes = disk::with(0, |d| std::mem::take(&mut d.crashes));
     for (n, snap) in crashes {
         let c = img::check(&snap, dev_bytes);
-        dump(if c.unclean.is_empty() && c.corrupt.is_empty() { "crash-clean" } else { "crash-unclean" }, &snap, dev_bytes);
+        /* Tagged as e2fsck -fn would have it: a filesystem left marked
+         * mounted, and nothing else, is one it finds nothing in. */
+        let fsck_clean = c.corrupt.is_empty() && c.unclean.iter().all(|u| u == img::NOT_CLEANLY_UNMOUNTED);
+        dump(if fsck_clean { "crash-clean" } else { "crash-unclean" }, &snap, dev_bytes);
         reached("a power cut judged");
         invariant!(c.corrupt.is_empty(), "the power going before request {} leaves the image corrupt: {:?}", n,
                    c.corrupt);

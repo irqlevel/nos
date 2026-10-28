@@ -34,6 +34,9 @@ pub const COMPAT_DIR_INDEX: u32 = 0x0020;
 pub const LARGE_FILE_SIZE: u64 = 1 << 31;
 /// State: cleanly unmounted
 pub const STATE_VALID: u16 = 0x0001;
+/// What `check` says of a filesystem whose state was left mounted: unclean,
+/// but nothing e2fsck -fn fixes -- it says nothing of the state.
+pub const NOT_CLEANLY_UNMOUNTED: &str = "the filesystem is not marked cleanly unmounted";
 
 pub const S_IFMT: u16 = 0xF000;
 pub const S_IFDIR: u16 = 0x4000;
@@ -1184,7 +1187,7 @@ pub fn check(img: &Media, dev_bytes: u64) -> Check {
                           free_inodes_total));
     }
     if rd16(&s, sb::STATE) & STATE_VALID == 0 {
-        c.unclean("the filesystem is not marked cleanly unmounted".into());
+        c.unclean(NOT_CLEANLY_UNMOUNTED.into());
     }
 
     /* The tree, from the root down. */
