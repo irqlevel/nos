@@ -1,0 +1,16 @@
+[package]
+name = "extfmt"
+version = "0.1.0"
+edition = "2021"
+
+# The ext2/3/4 on-disk format -- the superblock, group descriptors, inodes,
+# extent trees and block maps, directory and extended attribute blocks --
+# and every checksum metadata_csum (and gdt_csum before it) puts on them,
+# as plain Rust over bytes, with no kernel in it: hvboot reads a guest's
+# /boot through it, the kernel's ext4 driver is to read and write through
+# it, and fuzz/extfmt holds it to the filesystems e2fsprogs makes and to
+# what e2fsck says of them damaged. No dependency, so it builds offline;
+# nothing in it is unsafe (`forbid`).
+[lib]
+
+[dependencies]

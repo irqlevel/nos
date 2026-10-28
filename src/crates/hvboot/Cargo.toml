@@ -12,4 +12,7 @@ description = "The loader a guest of nos's hypervisor is started in by PVH: it b
 crate-type = ["staticlib"]
 path = "src/lib.rs"
 
+# The ext2/3/4 format, which the kernel's ext4 driver reads through too: a
+# crate of the tree's with no kernel in it.
 [dependencies]
+extfmt = { path = "../extfmt" }

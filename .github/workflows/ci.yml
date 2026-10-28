@@ -86,6 +86,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hvboot-test.py
 
+      # The ext2/3/4 format hvboot reads through, and the kernel's ext4
+      # driver is to: a checksum computed wrong is a filesystem the driver
+      # refuses as corrupt -- or one it writes that Linux does. Every
+      # checksum of filesystems mke2fs makes, held to extfmt's; bytes
+      # changed, and extfmt and e2fsck held to both saying so; and fuzzed.
+      - name: ext2/3/4 format test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/extfmt-test.py
+
       # A cloud's image is a download, and `hv convert` reads it in the
       # kernel: a cluster read wrong is a guest's disk with the wrong bytes
       # in it, and nothing to say so. Converted on the host and held to

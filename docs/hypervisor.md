@@ -3095,7 +3095,8 @@ the guest. It reads:
   descriptors, flex_bg, htree directories read as the linear ones they
   also are, inline data, symlinks, holes; an incompatible feature it does
   not read is refused by name, and the journal is not replayed, as GRUB
-  does not replay it (`ext.rs`);
+  does not replay it (`ext.rs`, over the format crate `src/crates/extfmt`,
+  which the kernel's ext4 driver reads through too);
 - the first `/boot/grub/grub.cfg` or `/grub/grub.cfg` (or grub2's) on
   them, and grubenv beside it: the menu, submenus too, each entry's `linux`,
   `initrd` and the `search` or `set root` naming its filesystem -- by UUID,
