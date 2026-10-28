@@ -11,7 +11,9 @@
 //! a text frame of JSON, `{"channel": ..., ...}`. The client says nothing
 //! but its pongs and its close; the server pings it every half of its idle
 //! time, and one that answers nothing for the whole of it is let go. Every
-//! channel is a read: a client of either role may open it.
+//! channel is a read: a client of either role may open it -- while its key
+//! is on the list: taken off, the stream is closed within a turn of its
+//! loop.
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -23,8 +25,8 @@ use tls::server::Read;
 use web::http::Request;
 use web::ws::{Decoder, Event, Opcode};
 
-use crate::http::{send, Ending, Session, Who};
-use crate::server::Shared;
+use super::http::{send, Ending, Session, Who};
+use super::server::Shared;
 
 const NS_PER_MS: u64 = 1_000_000;
 const METRICS_NS: u64 = 1_000 * NS_PER_MS;
@@ -41,6 +43,8 @@ const ANSWER_LIMITS: Limits = Limits { bytes: 256 * 1024, depth: 16, values: 1 <
 /// Going away: the server stops.
 const CLOSE_GOING_AWAY: u16 = 1001;
 const CLOSE_NORMAL: u16 = 1000;
+/// Its key taken off the list (RFC 6455's policy violation).
+const CLOSE_POLICY: u16 = 1008;
 
 pub struct Params {
     accept: [u8; 28],
@@ -105,7 +109,7 @@ fn raw_or_null(w: &mut Writer, key: &str, value: &Option<Vec<u8>>) {
     }
 }
 
-pub fn run(shared: &Shared, s: &mut Session, _who: &Who, p: Params, idle_ns: u64) -> Ending {
+pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64) -> Ending {
     let accept = core::str::from_utf8(&p.accept).unwrap_or("");
     let mut head = Vec::new();
     let headers = [("Upgrade", "websocket"), ("Connection", "Upgrade"), ("Sec-WebSocket-Accept", accept), ("Server", "nos")];
@@ -122,6 +126,12 @@ pub fn run(shared: &Shared, s: &mut Session, _who: &Who, p: Params, idle_ns: u64
     let mut heard = start;
     let mut last_jobs: Vec<u8> = Vec::new();
     loop {
+        /* A key taken off the list is let have nothing more: not even
+         * what a read would show it */
+        if shared.client(&who.key).is_none() {
+            close(s, CLOSE_POLICY, "this client's key is let in no more", idle_ns);
+            return Ending::Reset;
+        }
         if shared.stop.load(Ordering::Acquire) {
             close(s, CLOSE_GOING_AWAY, "the server stops", idle_ns);
             return Ending::Reset;

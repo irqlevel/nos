@@ -45,7 +45,9 @@ A client's **role** is in `clients` beside its key:
 What a method is, is what its provider registered it as on the bus, never
 what a request says. The list is read again by `api reload`, and changed by
 `api client add` and `api client del`: from the next handshake on, and a
-connection whose key was taken off is refused its next request (403).
+connection whose key was taken off is a stranger's -- nothing it sends is
+parsed, its next request is refused (403), and a stream of it is closed
+(1008) within a quarter of a second.
 
 ## The folder
 
@@ -102,7 +104,11 @@ called as a call, or the other way), `conflict` and `cancelled` 409,
 `too_large` 413, `busy` 429 with `Retry-After`, `failed` 500, `unsupported`
 501, `gone` 503. An unknown route is a 404, a method a route does not take a
 405 with `Allow`, a request the parser refuses its own status (`web::http`),
-a request larger than 74 KiB a 413; each of those last closes the connection.
+a request larger than 74 KiB a 413, a request on a connection whose key was
+taken off the list a 403; each of those last closes the connection. Their
+code is the one the bus answers that status with -- `forbidden`,
+`too_large`, `unsupported` -- or `invalid` where there is none (405, 414,
+426, 431, 505): a client can go by the code alone.
 
 Connections are kept alive. One task serves a connection in both directions,
 with no poll or select: a read that waits a second at most, the answer put
@@ -124,7 +130,8 @@ WebSocket. Each message is a text frame of JSON, `{"channel": ...}`:
 
 The client says nothing but its pongs and its close. The server pings it
 every half of its idle time, and lets go of one that answers nothing for the
-whole of it. Every channel is a read: either role may open it. A guest's
+whole of it. Every channel is a read: either role may open it, while its key
+is on the list. A guest's
 console will be a channel of the `vm` provider's.
 
 ## The api provider
@@ -171,6 +178,11 @@ the symbol table backtraces name functions by.
 ## Tested
 
 `scripts/api-test.py` (arm64, and `--arch x86_64` its short form):
-docs/testing.md has what it checks. Every boot's `test_module_bus` has
+docs/testing.md has what it checks. `net-fuzz.py`'s `api` target runs the
+module's own source on the host, against clients of each role and of none
+that ask for every route and break HTTP, the stream and TLS, while the
+console changes the keys and stops the server: it holds every answer to a
+model of the routes, the roles and the limits, and what ran to what an
+admin asked for. Every boot's `test_module_bus` has
 modtest ask the bus as a module does (`modtest bus`): the caller's side of
 the bus's C ABI, which the API is built on.

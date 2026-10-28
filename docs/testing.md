@@ -1044,13 +1044,55 @@ own, TCP's flags in combinations that mean something. The targets:
   a stranger's or none, speak TLS 1.3 or 1.2 alone, offer the API's
   protocol, HTTP/1.1, both, none or only `h2`, or break the protocol: an
   HTTP request where the ClientHello would be, nothing at all, a
-  ClientHello and goodbye, a record tampered with. Over any link no key but
+  ClientHello and goodbye, a record tampered with -- or say goodbye with
+  their last line, before the answers. Over any link no key but
   the known one is ever let in, and no client without it is answered a
   byte; over a good one each is refused for its own reason -- unknown key,
   no certificate, incompatible, protocol, timeout, closed -- or let in with
   the protocol both prefer, every line back in order and a goodbye; the
   server is never the side left in TIME-WAIT, and once it stops nothing is
   left behind;
+- `api`: the host API module's own source (`modules/api`) on a ramfs root,
+  its api.toml and clients written there first, its host key found there or
+  made on its first start; on the bus the kernel's system provider (its
+  source too), the network layer's, the module's own and one of the
+  fuzzer's -- a read, an action and a job, each keeping the tag its caller
+  gave it. The world's clients (`tlsc.rs` speaking HTTP and WebSocket
+  through `httpc.rs`, which reads the server's answers and frames as
+  strictly as HTTP and RFC 6455 have a server's) show the admin's key, the
+  reader's, a stranger's, none or the admin's certificate signed by
+  another, or break TLS, and ask for every route the API has and some it
+  has not: descriptors and then with their ETags, reads, actions and jobs,
+  a job's record and a cancel, the stream; a method a route does not take,
+  HEAD, requests the parser refuses, one past the size, HTTP/1.0; one after
+  another with a pause or all at once, a body after the server's 100
+  Continue, the connection to close, or kept open and quiet; a stream that
+  answers the pings or not, pings, closes, or sends what the server will
+  not take. Meanwhile the console takes a key off the list and puts it
+  back, writes a clients file the API must refuse and reloads it, and stops
+  and starts the server. What must hold: no byte of HTTP for a client the
+  server was not given a key of, or one its allowlist keeps out; a reader
+  never makes an action or a job run -- the provider holds the tags of what
+  ran -- and every action an admin was told ran, ran once, a line of the
+  audit log each and no other line; every answer well formed, of the
+  status the model gives the route, the method's kind and the role, its
+  error's code the bus's for that status; a key taken off the list let do
+  nothing more -- nothing it sends parsed, a stream of it closed; the
+  server's own count of its
+  connections (`api.status`) within api.toml's limits, in all, in the
+  handshake and of a key; a stream's messages of the channels asked for,
+  its log lines each once and in order, its quiet client let go at its idle
+  time and not before; `api stop` within three seconds whatever is
+  connected; the server never the side left in TIME-WAIT; and once the
+  module is unloaded, nothing left behind. Its first runs found a HEAD
+  answered with its body, refusals of HTTP's coded `invalid` whatever their
+  status, a request of a key taken off the list parsed before it was
+  refused, and `Connection` read from its first line alone (in
+  `web::http`), a stream that went on after its key was taken off the
+  list, and a client's close_notify that came with its last request taken
+  for the session's end (in `tls::server`, whose own target now sends
+  one); 27 bugs planted in the module one at a time were each caught, 26 of
+  them within the gate's 500 inputs;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
   that lines repeat and a search finds them, with runs of one key past the

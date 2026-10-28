@@ -2,6 +2,7 @@
 //! machine and what the machine's programs ask of it, and holds what comes
 //! of it to what the protocol -- and this stack, of itself -- says.
 
+mod api;
 mod dhcp;
 mod dns;
 mod http;
@@ -29,6 +30,7 @@ pub static ALL: &[Target] = &[
     Target { name: "ssh", run: ssh::ssh, max_len: 1024, gate: 300 },
     Target { name: "tls_server", run: tls_server::tls_server, max_len: 1024, gate: 300 },
     Target { name: "terminal", run: terminal::terminal, max_len: 4096, gate: 20000 },
+    Target { name: "api", run: api::api, max_len: 1024, gate: 500 },
 ];
 
 /// Everything the machine still holds of what an input did, once it has

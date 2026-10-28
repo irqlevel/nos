@@ -84,6 +84,21 @@ fn ws_vectors(f: &mut Fails) {
             accept.map(|a| String::from_utf8_lossy(&a).into_owned()));
     f.check("a key not 16 bytes has no accept key", ws::accept_key(b"dGhlIHNhbXBsZQ==").is_none(), ());
     f.check("a key not base64 has no accept key", ws::accept_key(b"!!!!!!!!!!!!!!!!!!!!!!==").is_none(), ());
+    /* An upgrade's tokens on lines of their own: one list, as RFC 9110 5.3
+     * has it -- and without one, no upgrade */
+    let shake = |connection: &str| {
+        let text = format!("GET /v1/stream HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n{}Sec-WebSocket-Version: 13\r\n\
+                            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", connection);
+        match http::parse(text.as_bytes(), &http::Limits::API) {
+            http::Parsed::Request(r, _) => ws::handshake(&r).map(|a| a.to_vec()).map_err(|r| r.status),
+            _ => Err(0),
+        }
+    };
+    let want = Ok(b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".to_vec());
+    f.check("an upgrade on a line of Connection's own", shake("Connection: keep-alive\r\nConnection: Upgrade\r\n") == want,
+            shake("Connection: keep-alive\r\nConnection: Upgrade\r\n"));
+    f.check("an upgrade in a list", shake("Connection: keep-alive, Upgrade\r\n") == want, ());
+    f.check("no upgrade on any line", shake("Connection: keep-alive\r\nConnection: close\r\n") == Err(426), ());
 
     /* RFC 6455 5.7: a masked "Hello" */
     let hello = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
@@ -395,6 +410,22 @@ fn http_vectors(f: &mut Fails) {
         f.check("close said", !r.keep_alive(), ());
     } else {
         f.check("a request with a query", false, ());
+    }
+    /* A list header is all its lines: the second line's close holds, and
+     * the first's upgrade */
+    let lines = b"GET /v1/stream HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n";
+    if let http::Parsed::Request(r, _) = http::parse(lines, &http::Limits::API) {
+        f.check("close said on a second line", !r.keep_alive(), ());
+        f.check("a token on either line", r.has_token("connection", "upgrade") && r.has_token("CONNECTION", "Close")
+                && !r.has_token("connection", "keep-alive"), ());
+    } else {
+        f.check("a request with two Connection lines", false, ());
+    }
+    let one_oh_kept = b"GET / HTTP/1.0\r\nConnection: x\r\nConnection: keep-alive\r\n\r\n";
+    if let http::Parsed::Request(r, _) = http::parse(one_oh_kept, &http::Limits::API) {
+        f.check("HTTP/1.0's keep-alive on a second line", r.keep_alive(), ());
+    } else {
+        f.check("HTTP/1.0 with two Connection lines", false, ());
     }
 
     let long_line = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(2100));

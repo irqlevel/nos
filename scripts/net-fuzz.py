@@ -24,13 +24,17 @@ booted machine.
 The targets: stack (frames of every kind), tcp, http, https, dns, dhcp,
 icmp (ping and ARP), udpshell, netconsole, ssh, tls_server (the host API's
 TLS server, against rustls clients with the key it knows, a stranger's,
-none, or the known certificate signed by another) and terminal (the SSH
-session's line editor, against a model of it). Each holds what it drives
+none, or the known certificate signed by another), terminal (the SSH
+session's line editor, against a model of it) and api (the host API
+module's own source serving the management bus to clients of each role and
+none, over HTTP and its stream, while the console changes its keys and
+stops it). Each holds what it drives
 to what the protocol, and this stack of itself, says: a frame no stack
 should send, a byte of a stream delivered that was never sent, a lease kept
 past its end, an ARP cache holding what nobody said, a log line twice, a
 login for a key the server does not know, a TLS client let in or answered
-without the key it was given -- and, everywhere, a slot, a frame
+without the key it was given, an action run for a reader or twice for an
+admin -- and, everywhere, a slot, a frame
 or a task kept for good, a lock taken in both orders, a spin lock held
 across a sleep, memory allocated with interrupts off. Those, a panic, a
 spin, a crash and a hang are each reported with the seed and iteration that

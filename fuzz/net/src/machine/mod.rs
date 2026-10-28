@@ -94,3 +94,36 @@ pub unsafe extern "C" fn kernel_netconsole_params(ip: *mut u32, port: *mut u16, 
         None => 0,
     }
 }
+
+/* ---- what the system provider reads of the boot: the host API's target ---- */
+
+/// The command line, as `sn_printf` would put it: cut to fit,
+/// NUL-terminated; the bytes written, the NUL aside.
+///
+/// # Safety
+/// `buf` is `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_cmdline_string(buf: *mut u8, len: usize) -> usize {
+    const CMDLINE: &[u8] = b"net-fuzz";
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let n = CMDLINE.len().min(len - 1);
+    // SAFETY: the caller's buffer, `n + 1 <= len` bytes of it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(CMDLINE.as_ptr(), buf, n);
+        *buf.add(n) = 0;
+    }
+    n
+}
+
+/// The machine's NIC is code: no interrupt source counts anything.
+#[no_mangle]
+pub extern "C" fn kernel_interrupt_source_count() -> usize {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_interrupt_source(_index: usize, _name: *mut u8, _name_len: usize) -> isize {
+    -1
+}

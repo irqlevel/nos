@@ -255,8 +255,9 @@ def common(k, pin, arch, sh=None):
     pt.check("a method a route does not take: 405, and what it does", s == 405 and h.get("allow") == "GET", (s, h))
     s, _, body = a.request("POST", "/v1/call/system/set_log_level", b"{level: 1")
     pt.check("parameters that are not JSON: 400", s == 400 and body.get("error", {}).get("code") == "invalid", (s, body))
-    s, h, _ = a.request("POST", "/v1/call/system/info", b"x" * (70 * 1024))
-    pt.check("a body past the limit: 413, and the connection closed", s == 413 and h.get("connection") == "close", (s, h))
+    s, h, body = a.request("POST", "/v1/call/system/info", b"x" * (70 * 1024))
+    pt.check("a body past the limit: 413 too_large, and the connection closed",
+             s == 413 and body.get("error", {}).get("code") == "too_large" and h.get("connection") == "close", (s, h, body))
     a.close()
 
     # The stream
@@ -442,7 +443,8 @@ def arm64(args, tmp, k):
         out = sh.run("api client del reader")
         pt.check("api client del takes a key off the list", "let in no more" in out, out)
         s2, _, body = r.request("GET", "/v1/host")
-        pt.check("its next request on a connection it holds: 403, and closed", s == 200 and s2 == 403, (s, s2, body))
+        pt.check("its next request on a connection it holds: 403 forbidden, and closed",
+                 s == 200 and s2 == 403 and body.get("error", {}).get("code") == "forbidden", (s, s2, body))
         r.close()
         pt.check("and its next handshake is refused", tls_refused(k["reader"][0], k["reader"][1]) is not None)
         out = sh.run("api client add reader read %s" % k["reader"][2])

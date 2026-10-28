@@ -9,7 +9,8 @@
 //! 1.2 alone; offering the API's protocol, HTTP/1.1, both, none, or only one
 //! the server does not speak; or breaking the protocol -- an HTTP request
 //! where the ClientHello would be, nothing at all, a ClientHello and then
-//! goodbye, a record of data tampered with.
+//! goodbye, a record of data tampered with; or saying its goodbye with its
+//! last line, before the answers -- which it must still be given.
 //!
 //! What must hold of every connection: the server lets in exactly the
 //! clients with the known key that speak TLS 1.3 and a protocol it has --
@@ -237,6 +238,7 @@ fn plan(r: &mut Input) -> Plan {
         3 => Break::Tamper,
         4 => Break::Tls12,
         5 => Break::Alpn,
+        6 | 7 => Break::Bye,
         _ => Break::None,
     };
     let alpn: Vec<&'static [u8]> = match (brk, r.u8() % 5) {
@@ -252,7 +254,7 @@ fn plan(r: &mut Input) -> Plan {
         l.push(b'\n');
         l
     }).collect();
-    Plan { who, brk, alpn, lines }
+    Plan { who, brk, alpn, lines, pin: None }
 }
 
 /// What the server made of a client, by its port.
@@ -291,8 +293,8 @@ fn judge(c: &Client, s: &Option<Seen>, known: &Fingerprint) {
         Break::Cut => refused(&[Refused::Closed]),
         Break::Tls12 => refused(&[Refused::Incompatible]),
         Break::Alpn => refused(&[Refused::Incompatible]),
-        Break::Tamper | Break::None => match p.who {
-            Who::Stranger => refused(&[Refused::UnknownKey]),
+        Break::Tamper | Break::None | Break::Bye => match p.who {
+            Who::Stranger | Who::Reader => refused(&[Refused::UnknownKey]),
             Who::Nobody => refused(&[Refused::NoCertificate]),
             /* Its certificate is the known key's, but it does not hold it:
              * the handshake's signature gives it away */
