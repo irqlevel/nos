@@ -2471,7 +2471,11 @@ $ hv start noble
   window a download of gigabytes needs, which a module's own TCP
   connection is not given. Only a 2xx answer is a body -- "the server
   answered 404" otherwise -- a body cut short is no image, and a file there
-  already is not written over; a failed download leaves no file.
+  already is not written over; a failed download leaves no file. The
+  client hands the module how much is in the file as the body comes, and
+  asks it whether to go on: hv says the progress lines, and a stop -- the
+  module going -- ends the download as the next of the body arrives, the
+  file removed.
 - **The disk**: a qcow2 image is converted ([A disk from a cloud's
   image](#a-disk-from-a-clouds-image)) and the download removed; a raw one
   is taken as it is; anything else is refused by what it is. `size=` (K,

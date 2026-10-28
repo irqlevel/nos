@@ -550,6 +550,16 @@ impl Vfs {
         Some(inner.mounts[index].as_ref()?.id)
     }
 
+    /// The space of the filesystem a path is on -- the one the VFS resolves
+    /// it through (`FileSystem::space`): what a file written there may take,
+    /// whether the path is there yet or not. None for a path no mount holds,
+    /// or a filesystem that does not say.
+    pub fn space_of(&self, path: &[u8]) -> Option<Space> {
+        let inner = self.inner.lock();
+        let (index, _) = Self::find_mount(&inner, path)?;
+        inner.mounts[index].as_ref()?.fs.space()
+    }
+
     pub fn mount_count(&self) -> usize {
         self.inner.lock().count
     }

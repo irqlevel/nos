@@ -30,6 +30,7 @@ use core::fmt::Write;
 use diskimage::iso;
 use diskimage::{detect, Format};
 use kcore::cmd::Output;
+use kcore::consts::NS_PER_SEC;
 
 use crate::config::{self, Config};
 use crate::guest;
@@ -57,7 +58,36 @@ const SECS_PER_HOUR: u64 = 3600;
 const SECS_PER_MINUTE: u64 = 60;
 /// The seed's label, as cloud-init's NoCloud looks for it.
 const SEED_LABEL: &str = "cidata";
-const MIB: u64 = 1024 * 1024;
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+/// How far apart the download's progress lines are, as wget's: a tenth of
+/// the time so far, from two seconds to thirty.
+const REPORT_MIN_NS: u64 = 2 * NS_PER_SEC;
+const REPORT_MAX_NS: u64 = 30 * NS_PER_SEC;
+const REPORT_SHARE: u64 = 10;
+const NS_PER_TENTH: u64 = NS_PER_SEC / 10;
+
+/// Bytes over a time, as a rate: MiB/s to a tenth from one up, KiB/s below.
+struct Rate(u64);
+
+impl Rate {
+    fn of(bytes: u64, ns: u64) -> Rate {
+        if ns == 0 {
+            return Rate(0);
+        }
+        Rate(u64::try_from(u128::from(bytes) * u128::from(NS_PER_SEC) / u128::from(ns)).unwrap_or(u64::MAX))
+    }
+}
+
+impl core::fmt::Display for Rate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 >= MIB {
+            write!(f, "{}.{} MiB/s", self.0 / MIB, self.0 % MIB * 10 / MIB)
+        } else {
+            write!(f, "{} KiB/s", self.0 / KIB)
+        }
+    }
+}
 
 /// Whether the word after `hv create <name>` is a URL: the other form.
 pub fn is_url(word: &str) -> bool {
@@ -268,7 +298,25 @@ fn fill(folder: &Folder, url: &str, own: &Own, text: &str, file: &str, made: &mu
     let seed_path = join(SEED)?;
 
     let _ = writeln!(out, "hv: {} -- into {}", url, download);
-    kcore::http::fetch(url, &download, out).map_err(|e| alloc::format!("{}: {}", url, e))?;
+    let started = kcore::time::boot_time_ns();
+    let mut reported = started;
+    let mut progress = |done: u64, total: u64| {
+        let now = kcore::time::boot_time_ns();
+        let every = (now.saturating_sub(started) / REPORT_SHARE).clamp(REPORT_MIN_NS, REPORT_MAX_NS);
+        if now.saturating_sub(reported) >= every {
+            reported = now;
+            let _ = write!(out, "download: {} MiB", done / MIB);
+            if total != 0 {
+                let _ = write!(out, " of {} MiB, {}%", total / MIB, (u128::from(done) * 100 / u128::from(total)).min(100));
+            }
+            let _ = writeln!(out, ", {}", Rate::of(done, now.saturating_sub(started)));
+        }
+        true
+    };
+    let len = kcore::http::fetch(url, &download, &mut progress).map_err(|e| alloc::format!("{}: {}", url, e))?;
+    let ns = kcore::time::boot_time_ns().saturating_sub(started);
+    let _ = writeln!(out, "download: {} bytes in {}.{} s, {}", len, ns / NS_PER_SEC, ns % NS_PER_SEC / NS_PER_TENTH,
+                     Rate::of(len, ns));
     made.files.push(download.clone());
 
     /* What it is, by its first bytes: from the heap, the task's stack
