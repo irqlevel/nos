@@ -81,6 +81,15 @@ max_handshakes = 2           # in their handshake
 idle_secs = 60               # a connection that says nothing this long is let go
 ```
 
+Past a limit a connection is reset: at the door for the connections in all
+and those in their handshake, just after its handshake for its key's -- what
+a client reads as ECONNRESET, `busy` in `api status`. A client keeps within
+them: the panel makes one connection to a host at a time, keeps two for its
+requests and one for its stream, and tries a connection reset at the door
+again a little later (`panel/src/lib/nosapi.ts`). One that opened them as it
+pleased -- the panel's own, at first -- has its pages fail on a real host
+while a mock with no limits lets everything in; the mock has them now.
+
 `hv0` is made the first time hv loads, so its listener looks for it once a
 second; a net device is never taken back, so the listener stays good through
 hv's unloads and loads after. eth0 is for an external panel, `nosctl` from
