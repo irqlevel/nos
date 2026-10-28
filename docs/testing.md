@@ -161,6 +161,7 @@ swallowing panic messages whole.
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
+| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
@@ -1848,6 +1849,44 @@ under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
 half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
+
+### `extfmt-test.py` -- the ext2/3/4 format, held to e2fsprogs
+
+`src/crates/extfmt` is the ext2/3/4 on-disk format as bytes -- views of the
+superblock, the group descriptors, inodes, extent trees and block maps,
+directory and extended attribute blocks -- and every checksum metadata_csum,
+and gdt_csum before it, puts on them. hvboot reads a guest's /boot through it,
+and the kernel's ext4 driver is to read and write through it, so a checksum
+computed wrong would be a sound filesystem refused as corrupt -- or, once the
+driver writes, one Linux refuses. `fuzz/extfmt` compiles the crate into a host
+program, and the gate runs it over filesystems mke2fs makes: ext4 as it makes
+one by default (metadata_csum, 64bit, flex_bg, extents, 256-byte inodes) with
+4 KiB blocks; with metadata_csum_seed and its UUID changed after it was made,
+so that the seed is no longer the UUID's; with 1 KiB blocks, 128-byte inodes
+-- whose checksums are 16 bits -- and 32-byte descriptors; with gdt_csum's
+CRC16 in place of metadata_csum; ext3 and ext2. Each holds small and large
+files, a sparse file of two thousand pieces whose extent tree is two levels
+deep, a directory of four hundred entries indexed by `e2fsck -D`, fast and
+slow symlinks, and extended attributes in an inode and in a block of their
+own (`debugfs ea_set`); and `e2fsck -fn` must pass it.
+
+On each, every checksum of every piece of metadata a driver reads -- the
+superblock, every descriptor, both bitmaps of every group that has them
+written, every inode in use, every extent block of every tree, every block
+of every directory (leaves by their tail, index blocks by theirs), every
+attribute block -- must be the one extfmt computes, and there must be at
+least one of every kind the image's features put a checksum on. Then bytes
+the checksums cover are changed one at a time, each kind in turn, and both
+extfmt and `e2fsck -fn` must say so: e2fsck's answering no to a fix counts as
+much as its exit code, since a descriptor's checksum wrong with its fields
+sound is reported and left out of the code. Then each image is fuzzed: up to
+eight bytes of the metadata its walk read changed at a time, two thousand
+times, the walk held to never panicking (overflow checks on) and always
+ending.
+
+Needs cargo and e2fsprogs: Linux, or on a Mac the nos-builder container
+(`docker run --platform linux/amd64 --rm -v "$PWD":/src -w /src nos-builder
+python3 scripts/extfmt-test.py`), where it takes under a minute.
 
 ### `edit-test.py` -- the editor, decided on the host
 
