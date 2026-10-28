@@ -5,7 +5,11 @@
 // alone, the providers' own descriptors read from the tree, and a host whose
 // numbers move: CPUs idling, interfaces counting, a log growing, VMs
 // starting, stopping and printing on their consoles, jobs that take a few
-// seconds and say so.
+// seconds and say so. It lets in at once what api.ko lets in with no
+// api.toml -- two connections in their handshake, four of one key, eight in
+// all -- and resets one past them as nos does, `busy` in api.status counting
+// them: a panel that opens connections as it pleases fails here as it fails
+// against a real host, with ECONNRESET.
 //
 //     node mock/server.mjs [--port 39234] [--state mock/state] [--name nos]
 //                          [--trust <admin.crt>]
@@ -278,7 +282,8 @@ const reads = {
   'block.disks': () => ({ disks: [{ name: 'nvme0n1', size_bytes: 512 * 1024 * MIB, holder: null }] }),
   'fs.mounts': () => ({ mounts: [{ path: '/', fs: 'ext2', device: 'nvme0n1p5', read_only: false,
     total_bytes: 400 * 1024 * MIB, free_bytes: 310 * 1024 * MIB }] }),
-  'api.status': () => ({ serving: true, port: 39234, connections: [], key: hostPin }),
+  'api.status': () => ({ serving: true, port: 39234, connections: [], key: hostPin, accepted: limits.accepted,
+    busy: limits.busy }),
   'api.clients': () => ({ clients: [{ name: 'panel', role: 'admin', key: adminPin }, { name: 'reader', role: 'read', key: readerPin }] }),
   'vm.list': () => ({ vms: [...vms.values()].map(vmJson) }),
   'vm.get': (p) => {
@@ -749,14 +754,71 @@ const hostId = [hostPin.slice(0, 8), hostPin.slice(8, 12), '4' + hostPin.slice(1
   hostPin.slice(20, 32)].join('-');
 const all = descriptors();
 
-/** Who the connection's certificate says it is, by its key alone. */
-function whoOf(socket) {
+/* ---- what nos lets in at once ---- */
+
+/* api.ko's limits with no api.toml (modules/api/src/config.rs): connections
+ * in all, of one client's key, and in their handshake. One past them is
+ * reset as nos resets it -- at the door, or right after its handshake when it
+ * is its key's -- and counted as api.status counts it on nos, `busy`. */
+const MAX_CONNECTIONS = 8;
+const MAX_PER_KEY = 4;
+const MAX_HANDSHAKES = 2;
+const limits = { accepted: 0, busy: 0, open: new Set(), handshaking: 0 };
+
+/** The SHA-256 of the key a TLS connection's certificate has, or null. */
+function keyOf(socket) {
   const cert = socket.getPeerCertificate(false);
   if (!cert || !cert.raw) {
     return null;
   }
   const spki = new crypto.X509Certificate(cert.raw).publicKey.export({ type: 'spki', format: 'der' });
-  return clients.get(crypto.createHash('sha256').update(spki).digest('hex')) || null;
+  return crypto.createHash('sha256').update(spki).digest('hex');
+}
+
+/** A TCP connection, at the door: taken while the limits allow it. */
+function admit(raw) {
+  if (limits.open.size >= MAX_CONNECTIONS || limits.handshaking >= MAX_HANDSHAKES) {
+    limits.busy += 1;
+    raw.resetAndDestroy();
+    return;
+  }
+  limits.accepted += 1;
+  limits.open.add(raw);
+  limits.handshaking += 1;
+  raw.nosHandshaking = true;
+  raw.once('close', () => {
+    limits.open.delete(raw);
+    handshakeOver(raw);
+  });
+}
+
+function handshakeOver(raw) {
+  if (raw.nosHandshaking) {
+    raw.nosHandshaking = false;
+    limits.handshaking -= 1;
+  }
+}
+
+/** Its handshake done: its key's fourth connection at most. */
+function secured(tlsSocket) {
+  const raw = tlsSocket._parent;
+  if (!raw || !limits.open.has(raw)) {
+    return;
+  }
+  handshakeOver(raw);
+  const key = keyOf(tlsSocket);
+  if (key && [...limits.open].filter((r) => r.nosKey === key).length >= MAX_PER_KEY) {
+    limits.busy += 1;
+    raw.resetAndDestroy();
+    return;
+  }
+  raw.nosKey = key;
+}
+
+/** Who the connection's certificate says it is, by its key alone. */
+function whoOf(socket) {
+  const key = keyOf(socket);
+  return key ? clients.get(key) || null : null;
 }
 
 const server = https.createServer({
@@ -771,6 +833,8 @@ const server = https.createServer({
   }
   route(req, res, who).catch((e) => error(res, 500, 'failed', String(e)));
 });
+server.on('connection', admit);
+server.on('secureConnection', secured);
 server.on('upgrade', (req, socket) => {
   const who = whoOf(socket);
   if (!who || req.url.split('?')[0] !== '/v1/stream') {

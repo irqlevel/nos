@@ -6,6 +6,14 @@
 // connections a host, each one request at a time, as the API serves them --
 // and the stream, a WebSocket of RFC 6455's over a connection of its own.
 //
+// Within what a host lets in at once (modules/api/src/config.rs): two
+// connections in their handshake, of all its clients, and four of one key --
+// one past either is reset, which a page's requests read as ECONNRESET. So
+// the panel makes one connection to a host at a time, keeps two for
+// requests and one for the stream, one pool a process whichever of Next.js's
+// bundles asks; and one reset at the door, a limit another client had the
+// host at a moment ago, is tried again a little later.
+//
 // Node's own `https` sends what it was asked to as soon as the handshake is
 // done, and checks a key only through a CA's chain; so the request is
 // written here, after the pin is checked, on the socket the check was made
@@ -44,8 +52,15 @@ export class HostError extends Error {
  * handshake: a host under TCG is slow, a dead one is not waited on. */
 const ANSWER_MS = 30_000;
 const CONNECT_MS = 10_000;
-/** Connections a host, at most: the API lets a key have four. */
-const POOL = 3;
+/** Connections a host for requests, at most: the API lets a key have four,
+ * the stream is one, and one is left for a stream being made again while the
+ * host still holds the last. */
+const POOL = 2;
+/** A connection reset before its handshake is done is tried this many times
+ * in all, waiting this long before the second and twice as long each time
+ * after: the host was at its limit of handshakes or connections. */
+const CONNECT_TRIES = 4;
+const CONNECT_BACKOFF_MS = 100;
 /** The most of an answer: the API's own. */
 const ANSWER_MAX = 512 * 1024;
 
@@ -90,6 +105,42 @@ export function connect(link: HostLink): Promise<tls.TLSSocket> {
       reject(new HostError(`${host}:${port}: ${e.message}`, 'connect'));
     });
   });
+}
+
+/* One of each a process: Next.js may load this module once for each of its
+ * bundles, and a pool each would be counted against the host's limits all
+ * together (hub.ts and catalog.ts keep theirs the same way). */
+const g = globalThis as unknown as {
+  __nosPools?: Map<string, { link: HostLink; pool: Pool }>;
+  __nosDialing?: Map<string, Promise<void>>;
+};
+
+/** A connection to the host, its key checked, made once no other of the
+ * panel's to that host is in its handshake: the host takes two at once of all
+ * its clients and resets a third. Reset at the door -- the host at a limit
+ * of its, which another client may have had it at -- it is tried again, up
+ * to CONNECT_TRIES times; a wrong key, or no answer, is not. */
+export async function dial(link: HostLink): Promise<tls.TLSSocket> {
+  const dialing = (g.__nosDialing ??= new Map());
+  const before = dialing.get(link.id) ?? Promise.resolve();
+  let done!: () => void;
+  const mine = new Promise<void>((resolve) => (done = resolve));
+  dialing.set(link.id, before.then(() => mine));
+  try {
+    await before;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await connect(link);
+      } catch (e) {
+        if (!(e instanceof HostError) || e.kind !== 'connect' || attempt >= CONNECT_TRIES) {
+          throw e;
+        }
+        await new Promise((resolve) => setTimeout(resolve, CONNECT_BACKOFF_MS * 2 ** (attempt - 1)));
+      }
+    }
+  } finally {
+    done();
+  }
 }
 
 /** An HTTP/1.1 answer read off `socket`, `head` true for a HEAD's. */
@@ -167,7 +218,7 @@ class Pool {
       if (this.busy < POOL) {
         this.busy += 1;
         try {
-          return await connect(this.link);
+          return await dial(this.link);
         } catch (e) {
           this.busy -= 1;
           this.wake();
@@ -217,9 +268,8 @@ class Pool {
   }
 }
 
-const pools = new Map<string, { link: HostLink; pool: Pool }>();
-
 function poolOf(link: HostLink): Pool {
+  const pools = (g.__nosPools ??= new Map());
   const had = pools.get(link.id);
   if (had && had.link.url === link.url && had.link.pin === link.pin && had.link.cert === link.cert) {
     return had.pool;
@@ -272,7 +322,7 @@ function clientFrame(opcode: number, payload: Buffer): Buffer {
  * over -- the host closed it, or it broke. */
 export async function stream(link: HostLink, query: string, onMessage: (m: unknown) => void,
                              onEnd: (why: string) => void): Promise<Stream> {
-  const socket = await connect(link);
+  const socket = await dial(link);
   const key = crypto.randomBytes(16).toString('base64');
   const { host } = address(link.url);
   socket.write(`GET /v1/stream${query} HTTP/1.1\r\nHost: ${host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
