@@ -25,4 +25,5 @@ pub mod tcp;
 pub mod http;
 pub mod acpi;
 pub mod cmd;
+pub mod mgmt;
 pub mod fs;

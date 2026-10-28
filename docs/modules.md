@@ -304,6 +304,14 @@ module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e
 A module built outside the Makefile carries `unset` and is refused by a kernel
 that was not.
 
+A module cannot call another module. What it offers others -- the host API
+above all -- it offers on the [management bus](mgmt.md): `kcore::mgmt::
+Provider::register(name, methods, descriptor, handler)` registers it, and the
+`Provider` kept in the module's state unregisters it when the module is
+dropped. The unregister waits out the provider's calls and jobs, so an unload
+never leaves a call in code that is gone. modtest has one, which the boot's
+`test_module_bus` calls and unloads under a running job.
+
 ## blkload
 
 `blkload` (`src/crates/modules/blkload`) runs a short load test against a block
