@@ -141,6 +141,7 @@ class Api:
     def request(self, method, path, body=None, headers=None):
         """One request on the kept-alive connection: its status, headers and
         body (JSON parsed when it is JSON)."""
+        reused = self.sock is not None
         if self.sock is None:
             self.connect()
         data = b'' if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
@@ -149,7 +150,18 @@ class Api:
             lines.append('Content-Type: application/json')
         for k, v in (headers or {}).items():
             lines.append('%s: %s' % (k, v))
-        self.sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode() + data)
+        request = ('\r\n'.join(lines) + '\r\n\r\n').encode() + data
+        try:
+            self.sock.sendall(request)
+        except OSError:
+            if not reused:
+                raise
+            # A kept-alive connection the host let go while it said nothing
+            # (api.toml's idle_secs): the request never reached it, so it
+            # goes again on a new one
+            self.close()
+            self.connect()
+            self.sock.sendall(request)
         status, hdrs = self._head()
         # A HEAD's answer, a 204's and a 304's have no body, whatever their
         # Content-Length says

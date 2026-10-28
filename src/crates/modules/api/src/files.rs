@@ -234,28 +234,32 @@ fn uuid() -> Option<String> {
     Some(s)
 }
 
-fn make(dir: &Dir, ips: &[[u8; 4]]) -> Result<(), String> {
+/// A new key, and a certificate for it of `name`, good for `days` from a
+/// day ago (a peer's clock a day behind ours) -- refused while the wall
+/// clock is not set, since it would start in 1970, and while the kernel's
+/// pool has no randomness for the key.
+pub fn new_key(name: &str, ips: &[[u8; 4]], dns: &[&str], days: u64, usage: web::x509::Usage)
+               -> Result<web::x509::Identity, String> {
     let now = kcore::time::wall_clock_secs();
     if now == 0 {
-        return Err(String::from("the wall clock is not set: the host's certificate would start in 1970 -- set it \
-                                 (an RTC, NTP) and start again"));
+        return Err(alloc::format!("the wall clock is not set: {}'s certificate would start in 1970 -- set it (an \
+                                   RTC, NTP) and try again", name));
     }
     let mut serial = [0u8; 16];
     if !kcore::random::fill_random(&mut serial) {
-        return Err(String::from("no randomness yet for the host's key: the kernel's pool has no source -- no \
-                                 RDRAND, RNDR or virtio-rng (`random` says) -- and no TLS handshake can be done \
-                                 without one either"));
+        return Err(alloc::format!("no randomness yet for {}'s key: the kernel's pool has no source -- no RDRAND, \
+                                   RNDR or virtio-rng (`random` says) -- and no TLS handshake can be done without \
+                                   one either", name));
     }
     serial[0] &= 0x7F;
     let req = web::x509::Request {
-        name: "nos host API",
+        name,
         ips,
-        dns: &[DNS_NAME],
+        dns,
         serial,
-        /* A day of a client's clock behind the host's */
         not_before: now.saturating_sub(SECS_PER_DAY),
-        not_after: now + CERT_DAYS * SECS_PER_DAY,
-        usage: web::x509::Usage::Server,
+        not_after: now + days * SECS_PER_DAY,
+        usage,
     };
     let mut secret = [0u8; 32];
     let mut made = None;
@@ -272,12 +276,16 @@ fn make(dir: &Dir, ips: &[[u8; 4]]) -> Result<(), String> {
             Err(web::x509::Error::BadKey) => continue,
             Err(e) => {
                 secret.zeroize();
-                return Err(alloc::format!("the host's certificate could not be made: {:?}", e));
+                return Err(alloc::format!("{}'s certificate could not be made: {:?}", name, e));
             }
         }
     }
     secret.zeroize();
-    let id = made.ok_or_else(|| String::from("no randomness for the host's key"))?;
+    made.ok_or_else(|| alloc::format!("no randomness for {}'s key", name))
+}
+
+fn make(dir: &Dir, ips: &[[u8; 4]]) -> Result<(), String> {
+    let id = new_key("nos host API", ips, &[DNS_NAME], CERT_DAYS, web::x509::Usage::Server)?;
     let key_pem = zeroize::Zeroizing::new(web::x509::pem("PRIVATE KEY", &id.key).map_err(|_| String::from("out of memory"))?);
     let cert_pem = web::x509::pem("CERTIFICATE", &id.cert).map_err(|_| String::from("out of memory"))?;
     let host = uuid().ok_or_else(|| String::from("no randomness for the host's id"))?;

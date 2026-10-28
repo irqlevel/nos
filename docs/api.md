@@ -12,6 +12,7 @@ api client add panel admin 3fe5cf7a...570d
 api start
 api                     what it serves, who is connected, what it refused
 api stop
+api panel create        the management panel, a VM of the host's (below)
 ```
 
 ## Who is let in
@@ -43,8 +44,9 @@ A client's **role** is in `clients` beside its key:
 | `admin` | everything: actions, jobs, cancels |
 
 What a method is, is what its provider registered it as on the bus, never
-what a request says. The list is read again by `api reload`, and changed by
-`api client add` and `api client del`: from the next handshake on, and a
+what a request says. The list is read again by `api reload` -- with
+api.toml's allowlists -- and changed by `api client add` and `api client
+del`: from the next handshake on, and a
 connection whose key was taken off is a stranger's -- nothing it sends is
 parsed, its next request is refused (403), and a stream of it is closed
 (1008) within a quarter of a second.
@@ -61,6 +63,8 @@ the machine's own:
 | `host` | the host's id, a UUID made with them: what a cluster's panel knows the host by, whatever its addresses |
 | `clients` | the keys let in, a line each: `<fingerprint> <admin\|read> <name>`; written whole through the file ABI's replace, so a write cut short leaves the old list or the new |
 | `audit.log` | a line for every call that changes something -- an action, a job started, a cancel: the wall clock, the client, its address, what, how it ended -- turned over to `audit.log.1` at a megabyte. Each is in the kernel's log too |
+| `panel.pass` | root's password for the panel, as scrypt hashed it: `scrypt$N$r$p$salt$hash`, made by `nos-install --panel`, which prints the password once |
+| `panel.pem` | the panel's certificate as a server, which `api panel` prints the fingerprint of |
 
 ## api.toml
 
@@ -82,6 +86,13 @@ second; a net device is never taken back, so the listener stays good through
 hv's unloads and loads after. eth0 is for an external panel, `nosctl` from
 another machine and a cluster's other hosts: on it the allowlist is the
 first thing to set.
+
+`api reload` reads the allowlists again, for the next connection on; the
+rest of the file is taken as the API starts (`api stop`, `api start`), which
+`api reload` says when the file has changed it. `api panel create` adds the
+panel's address to `allow_hv0` -- with it alone where the file had none,
+which from then on takes nothing else on hv0 -- every other line, comment
+and blank left as it was.
 
 ## The routes
 
@@ -143,9 +154,80 @@ too. A message is at most 4 KiB, as a VM's input is.
 ## The api provider
 
 The module registers a provider of its own: `api.status` -- where it
-listens, every connection and whose it is, what it has taken, refused and
-reset, what its handshakes cost -- and `api.clients`. Both are reads, so the
-panel shows them, and a test reads the counters through the API itself.
+listens and whom each interface takes, every connection and whose it is,
+what it has taken, refused and reset, what its handshakes cost -- and
+`api.clients`. Both are reads, so the panel shows them, and a test reads the
+counters through the API itself.
+
+## The management panel
+
+The panel (`panel/`, [its README](../panel/README.md)) runs in a VM of the
+host's own, and manages the host through this API like any other client --
+a browser reaches it at `https://<the host's eth0 address>:39233`, which hv
+relays to the VM's HTTPS, and logs in as root. `nos-install --panel`
+([Install](install.md)) makes root's password, prints it once and keeps its
+hash in `panel.pass`, and gives `/etc/rc` what makes the panel at the first
+boot and starts it at every one after:
+
+```
+insmod /lib/modules/hv.ko
+hv on
+insmod /lib/modules/api.ko
+api start
+api panel create
+```
+
+`api panel create [image=<url>] [bundle=<url> sha256=<hex>] [port=<n>]
+[memory=<MiB>]` makes what the panel needs of the host, then has hv's `vm`
+provider make the VM, as a job -- `mgmt job <n>` follows it -- which
+downloads the image, makes the VM's disk of it and starts it:
+
+- the panel's identity as this API's client: a P-256 key and a certificate,
+  let in as `panel`, an admin; the key goes nowhere but the seed;
+- its certificate as a server, for the browser, for the host's eth0 address
+  and the name `nos-panel` -- made here so that what a browser shows can be
+  held to the fingerprint `api panel` prints (`panel.pem`);
+- the seed, cloud-init's user-data: the API's address on hv0 and its key,
+  the panel's identity, root's password's hash, the certificate and its
+  key, nos's `authorized_keys` for the image's user, and a script that
+  fetches the panel's bundle, holds it to its SHA-256 and installs it;
+- the VM: Debian 13's cloud image unless `image=` names another, 1 GiB, one
+  CPU, the highest port of the switch no VM has -- an address the same at
+  every start, which `allow_hv0` then lets in -- nos's port 39233 forwarded
+  to its 443, `protected`, booted again when it resets itself.
+
+The bundle is `nos-panel-<version>.tar.gz` of the release the system image
+came with, which names its URL and SHA-256 in `/lib/panel/bundle`
+(`make image PANEL_BUNDLE=... PANEL_BUNDLE_URL=...`); an image built without
+one has no `/lib/panel`, and `api panel create` asks for `bundle=` and
+`sha256=`. `scripts/panel-bundle.py` builds it: Node 24 and Caddy at pinned
+versions held to the checksums their releases publish, the panel built
+standalone, and `panel/appliance/` -- `install.sh`, the Caddyfile and two
+systemd units. In the VM it is `/opt/nos-panel`, the panel's data
+`/var/lib/nos-panel`, and it runs as `nos-panel`: Node on 127.0.0.1:3000,
+Caddy in front of it on 443 with the certificate nos made, HTTP/2, no HTTP/3
+(the relay carries TCP alone), the name `nos-panel` taken for a browser that
+reaches it by an address and sends none.
+
+`api panel create` with the panel there already starts it if it is not
+running, and does nothing else: what /etc/rc runs at every boot. `api
+panel` says what its VM is doing, where it is and its certificate's
+fingerprint.
+
+What it does not do yet:
+
+- every browser's connection reaches the panel from hv0's address, since the
+  relay is a TCP connection of nos's own: the panel's count of wrong
+  passwords -- 8 in 10 minutes -- is one count for everyone, so a stranger's
+  tries lock root out for those minutes too;
+- the panel's data is on its system disk: a new bundle installed over it
+  keeps it, a new system disk would not;
+- its certificate as a server is good for 825 days and made once: `hv delete
+  panel force` and `api panel create` make a new panel, with a new one;
+- a VM with no port of its own takes the lowest free one as it starts, the
+  panel the highest; but while the panel's VM is stopped, a VM may take its
+  port -- and with it the address `allow_hv0` lets in, though not the
+  panel's key.
 
 ## nosctl
 
@@ -191,7 +273,11 @@ the symbol table backtraces name functions by.
 ## Tested
 
 `scripts/api-test.py` (arm64, and `--arch x86_64` its short form):
-docs/testing.md has what it checks. `net-fuzz.py`'s `api` target runs the
+docs/testing.md has what it checks -- on x86-64, `api panel create` from
+/etc/rc and what it leaves on nos's root, read once nos is off.
+`scripts/panel-appliance-test.py` runs the panel's bundle as its VM does, in
+Debian's image against the mock API; `image-test.py` holds `nos-install
+--panel` to its password and its lines of /etc/rc. `net-fuzz.py`'s `api` target runs the
 module's own source on the host, against clients of each role and of none
 that ask for every route and break HTTP, the stream and TLS, while the
 console changes the keys and stops the server: it holds every answer to a
