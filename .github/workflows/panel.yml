@@ -1,0 +1,43 @@
+name: Panel
+
+# The management panel (panel/): typechecked, built for production, and
+# driven by Playwright against the mock host API -- which serves the
+# providers' own descriptors from the tree, so a descriptor changed in the
+# kernel is a panel tested again.
+on:
+  push:
+    branches: [master]
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', '.github/workflows/panel.yml']
+  pull_request:
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', '.github/workflows/panel.yml']
+
+jobs:
+  panel:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 22 (node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck (the dictionaries are one shape: a word missing fails here)
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Playwright against the mock API
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test
