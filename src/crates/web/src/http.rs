@@ -110,14 +110,22 @@ impl<'a> Request<'a> {
         })
     }
 
+    /// Whether the list header `name` has `token` in it, any case: on any
+    /// of its lines, since a list may be given on as many as the sender
+    /// likes -- `Connection: upgrade` and `Connection: close` are
+    /// `Connection: upgrade, close` (RFC 9110 5.3).
+    pub fn has_token(&self, name: &str, token: &str) -> bool {
+        self.headers[..self.count].iter().filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .any(|(_, v)| core::str::from_utf8(v).is_ok_and(|v| has_token(v, token)))
+    }
+
     /// Whether the connection stays open after the response: HTTP/1.1's
     /// unless it says `close`, HTTP/1.0's only if it says `keep-alive`.
     pub fn keep_alive(&self) -> bool {
-        let tokens = self.header_str("connection").unwrap_or("");
         if self.minor >= 1 {
-            !has_token(tokens, "close")
+            !self.has_token("connection", "close")
         } else {
-            has_token(tokens, "keep-alive")
+            self.has_token("connection", "keep-alive")
         }
     }
 }

@@ -125,6 +125,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "conf"
+version = "0.1.0"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -453,11 +457,14 @@ name = "net-fuzz"
 version = "0.1.0"
 dependencies = [
  "chacha20",
+ "conf",
  "ed25519-dalek",
  "ffi",
  "fs",
  "kcore",
  "kmod",
+ "mgmt",
+ "mgmtwire",
  "net",
  "netwire",
  "poly1305",
@@ -468,6 +475,7 @@ dependencies = [
  "tls",
  "web",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

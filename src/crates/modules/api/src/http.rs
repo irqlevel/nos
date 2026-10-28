@@ -39,8 +39,8 @@ use web::http::{Limits, Method, Parsed, Request};
 
 use alloc::sync::Arc;
 
-use crate::files::Role;
-use crate::server::{ConnCtx, Counters, Phase, Shared, POLL_MS};
+use super::files::Role;
+use super::server::{ConnCtx, Counters, Phase, Shared, POLL_MS};
 
 const NS_PER_MS: u64 = 1_000_000;
 const NS_PER_SEC: u64 = 1_000_000_000;
@@ -179,11 +179,14 @@ pub struct Response {
     /// For a 405: the methods the route has.
     pub allow: Option<&'static str>,
     pub close: bool,
+    /// The answer to a HEAD: its head alone is sent, its Content-Length
+    /// the body's it would have had.
+    pub head: bool,
 }
 
 impl Response {
     fn json(status: u16, body: Vec<u8>) -> Response {
-        Response { status, body, etag: None, allow: None, close: false }
+        Response { status, body, etag: None, allow: None, close: false, head: false }
     }
 
     /// `{"error": {"code", "message"}}`, as the bus words its own.
@@ -202,7 +205,7 @@ impl Response {
 /// What a route answers: a response, or the WebSocket it opens.
 enum Answer {
     Response(Response),
-    Stream(crate::stream::Params),
+    Stream(super::stream::Params),
 }
 
 /// The HTTP status a bus status is answered with.
@@ -221,11 +224,25 @@ pub fn http_status(s: Status) -> u16 {
     }
 }
 
+/// The bus's status a refusal of HTTP's says as its code: the one that is
+/// answered with that HTTP status, where there is one -- `invalid` for the
+/// rest, which no status of the bus's is.
+fn refused_as(status: u16) -> Status {
+    match status {
+        403 => Status::Forbidden,
+        413 => Status::TooLarge,
+        501 => Status::Unsupported,
+        _ => Status::Invalid,
+    }
+}
+
 /// What one turn of the request loop found in what has arrived.
 enum Step {
     Partial { continue_wanted: bool },
     Refused(u16, &'static str),
-    Answer(Answer, bool, usize),
+    /// What the route answered, whether to keep the connection, whether
+    /// the request was a HEAD, and its length.
+    Answer(Answer, bool, bool, usize),
 }
 
 fn serve(shared: &Shared, s: &mut Session, who: &Who) -> Ending {
@@ -235,20 +252,23 @@ fn serve(shared: &Shared, s: &mut Session, who: &Who) -> Ending {
     let mut last = boot_time_ns();
     let mut continued = false;
     loop {
-        /* Every request already whole, answered */
+        /* Every request already whole, answered -- by the list as it
+         * stands: a key taken off it is a stranger's, nothing it sends is
+         * parsed, and a role changed holds from the next request */
         loop {
-            let step = match web::http::parse(&buf, &Limits::API) {
-                Parsed::Partial { continue_wanted } => Step::Partial { continue_wanted },
-                Parsed::Refused(r) => Step::Refused(r.status, r.why),
-                Parsed::Request(req, used) => match shared.client(&who.key) {
-                    /* Each request by the list as it stands: a key taken off
-                     * it is let do nothing more, and a role changed holds
-                     * from the next request */
-                    Some(now) => {
-                        let current = Who { name: now.name, role: now.role, ip: who.ip, key: who.key };
-                        Step::Answer(route(shared, &req, &current), req.keep_alive(), used)
+            let current = match shared.client(&who.key) {
+                Some(now) => Some(Who { name: now.name, role: now.role, ip: who.ip, key: who.key }),
+                None if buf.is_empty() => break,
+                None => None,
+            };
+            let step = match current {
+                None => Step::Refused(403, "this client's key is let in no more"),
+                Some(current) => match web::http::parse(&buf, &Limits::API) {
+                    Parsed::Partial { continue_wanted } => Step::Partial { continue_wanted },
+                    Parsed::Refused(r) => Step::Refused(r.status, r.why),
+                    Parsed::Request(req, used) => {
+                        Step::Answer(route(shared, &req, &current), req.keep_alive(), req.method == Method::Head, used)
                     }
-                    None => Step::Refused(403, "this client's key is let in no more"),
                 },
             };
             match step {
@@ -262,17 +282,18 @@ fn serve(shared: &Shared, s: &mut Session, who: &Who) -> Ending {
                     break;
                 }
                 Step::Refused(status, why) => {
-                    let mut r = Response::error(status, Status::Invalid, why);
+                    let mut r = Response::error(status, refused_as(status), why);
                     r.close = true;
                     return if respond(s, &r, idle_ns) { Ending::Close } else { Ending::Reset };
                 }
-                Step::Answer(answer, keep_alive, used) => {
+                Step::Answer(answer, keep_alive, head, used) => {
                     continued = false;
                     Counters::add(&shared.counters.requests);
                     buf.drain(..used);
                     match answer {
                         Answer::Response(mut r) => {
                             r.close |= !keep_alive;
+                            r.head = head;
                             if !respond(s, &r, idle_ns) {
                                 return Ending::Reset;
                             }
@@ -282,7 +303,7 @@ fn serve(shared: &Shared, s: &mut Session, who: &Who) -> Ending {
                         }
                         Answer::Stream(params) => {
                             Counters::add(&shared.counters.streams);
-                            return crate::stream::run(shared, s, who, params, idle_ns);
+                            return super::stream::run(shared, s, who, params, idle_ns);
                         }
                     }
                 }
@@ -373,12 +394,15 @@ fn respond(s: &mut Session, r: &Response, stall_ns: u64) -> bool {
     if r.close {
         headers.push(("Connection", "close"));
     }
+    /* A HEAD's answer is its head alone: a client that sent one reads no
+     * body, and would read this one as the next answer */
+    let body: &[u8] = if r.head { &[] } else { &r.body };
     let mut out = Vec::new();
     if web::http::write_head(&mut out, r.status, &headers, Some(r.body.len())).is_err()
-        || out.try_reserve(r.body.len()).is_err() {
+        || out.try_reserve(body.len()).is_err() {
         return false;
     }
-    out.extend_from_slice(&r.body);
+    out.extend_from_slice(body);
     send(s, &out, stall_ns)
 }
 
@@ -452,7 +476,7 @@ fn route(shared: &Shared, req: &Request, who: &Who) -> Answer {
         ["jobs", _] => not_allowed("GET"),
         ["jobs", _, _] => not_allowed("POST"),
         ["stream"] if get => match web::ws::handshake(req) {
-            Ok(accept) => Answer::Stream(crate::stream::Params::of(req, accept)),
+            Ok(accept) => Answer::Stream(super::stream::Params::of(req, accept)),
             Err(r) => Answer::Response(Response::error(r.status, Status::Invalid, r.why)),
         },
         ["stream"] => not_allowed("GET"),
@@ -606,7 +630,7 @@ fn host(shared: &Shared, who: &Who) -> Response {
         t => w.uint(t),
     }
     w.field_uint("uptime_ms", boot_time_ns() / NS_PER_MS);
-    w.field_str("key", &crate::files::hex(&shared.identity.key_fingerprint));
+    w.field_str("key", &super::files::hex(&shared.identity.key_fingerprint));
     w.key("client");
     w.begin_object();
     w.field_str("name", &who.name);
@@ -620,7 +644,7 @@ fn host(shared: &Shared, who: &Who) -> Response {
 fn audit(shared: &Shared, who: &Who, what: &str, s: Status) {
     let line = alloc::format!("{} {} {} {}", who.name, Ip(who.ip), what, s.name());
     kcore::trace!(0, "api: {}", line);
-    shared.audit.with(|_| crate::files::audit(&shared.dir, &line));
+    shared.audit.with(|_| super::files::audit(&shared.dir, &line));
 }
 
 /// `core::fmt::Write` into a byte buffer.

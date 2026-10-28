@@ -123,7 +123,11 @@ panels of other hosts -- each holding a key the host was given.
   reading holds up its own connection's task and nobody else.
 - **The way out.** `close` sends a close_notify and hands the socket back to
   be closed, after the client's own goodbye, so the server is never the
-  side left in TIME-WAIT; `into_socket` hands it back for a reset.
+  side left in TIME-WAIT; `into_socket` hands it back for a reset. A
+  client's close_notify closes its side alone (TLS 1.3, RFC 8446 6.1):
+  `read` answers `End` once what it said before is read, and `write` still
+  takes the answer to it -- a client that says goodbye with its last
+  request, before the answer, is answered, and then told goodbye.
 
 Its gate is `net-fuzz.py`'s `tls_server` target (docs/testing.md), which
 runs it as the module will -- a listener and a task a connection, over the

@@ -10,7 +10,7 @@
 //! text message valid UTF-8; a close frame's code one a peer may send. What
 //! breaks any of that is an error naming the close code to answer with.
 
-use crate::http::{has_token, Method, Refusal, Request};
+use crate::http::{Method, Refusal, Request};
 use crate::sha1::Sha1;
 use alloc::vec::Vec;
 use base64ct::{Base64, Encoding};
@@ -42,9 +42,7 @@ pub fn handshake(req: &Request) -> Result<[u8; 28], Refusal> {
     if req.method != Method::Get || req.minor != 1 {
         return Err(Refusal { status: 400, why: "a WebSocket is asked for with a GET over HTTP/1.1" });
     }
-    let upgrade = req.header_str("upgrade").unwrap_or("");
-    let connection = req.header_str("connection").unwrap_or("");
-    if !has_token(upgrade, "websocket") || !has_token(connection, "upgrade") {
+    if !req.has_token("upgrade", "websocket") || !req.has_token("connection", "upgrade") {
         return Err(Refusal { status: 426, why: "not a WebSocket upgrade" });
     }
     if req.header_str("sec-websocket-version") != Some("13") {
