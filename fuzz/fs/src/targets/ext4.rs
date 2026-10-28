@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 
 use crate::image::ext4::{self as img, Geometry, Style};
+use crate::machine::disk;
 use crate::model::{Data, Node};
+use crate::targets::fsops::{self, Fs, Limits, Model};
 use crate::{reached, Input};
 
 /// When the images are made: before the kernel's wall clock starts.
@@ -227,6 +229,117 @@ pub fn ext4mkfs(r: &mut Input) {
         }
         Err(_) => reached("ext4mkfs: a tree the geometry could not hold"),
     }
+}
+
+/// ext4 mounted -- read-only, all its driver does yet -- on images the
+/// fuzzer's mkfs made: a journal nobody replayed among them now and then,
+/// its homes stale, which the driver must read through. Every call's answer
+/// the model's, whose tree is the one mkfs was given -- lost+found beside
+/// it, and none of the entries the kernel's tree leaves out -- and nothing
+/// written to the disk at all, as a read-only mount must not.
+pub fn ext4(r: &mut Input) {
+    let g = geometry(r);
+    let mut st = style(r);
+    if g.journal_blocks > 0 && one_in(r, 3) {
+        st.journaled = r.range(1, 12) as u8;
+    }
+    let bs = g.block_size();
+    let mut budget = g.blocks / 2;
+    let mut inodes = g.inodes() / 2;
+    let tree = tree(r, bs, &mut budget, &mut inodes);
+    let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
+    let sizes: Vec<u64> = [512, 1024, 2048, 4096].into_iter().filter(|s| *s <= bs).collect();
+    let ss = r.pick(&sizes);
+    let sectors = g.blocks * bs / ss + r.below(8);
+    let journaled = !made.journaled.is_empty();
+    let mut d = disk::Disk::new("vda", ss, sectors, made.media);
+    d.latency = r.chance(64);
+    d.no_writes = Some("ext4 mounts read-only, and writes nothing".into());
+    disk::insert(0, d);
+    let Some(dev) = disk::register(0) else { return };
+    let mounted = fs::ext4::mount_at("/", dev.handle(), r.bool());
+    invariant!(mounted == 1, "ext4 did not mount, read-only, an image of the fuzzer's mkfs ({:?}, {:?}): {}", g, st,
+               mounted);
+    reached(if journaled { "mounted, a journal not replayed read through" } else { "mounted" });
+    let mut want = tree;
+    want.children_mut().expect("a directory").insert(b"lost+found".to_vec(), Node::dir());
+    let vfs = fs::vfs_instance().expect("the VFS");
+    let mut f = Fs::new(vfs, Model::new(want, true, Limits::fixed(1 << 44, usize::MAX)), true);
+    let mut ops = 0;
+    while r.more() && ops < 120 {
+        ops += 1;
+        fsops::step(&mut f, r, bs);
+    }
+    f.compare();
+    f.close_all();
+    invariant!(vfs.unmount(b"/"), "the unmount at the end was refused");
+}
+
+/// ext4 on the fuzzer's images damaged: bytes of the superblock, the
+/// descriptors, bitmaps and inode tables, and of anything else changed --
+/// a journal nobody replayed among them now and then. Refused, or mounted
+/// and walked -- every directory listed, every name looked up, every file
+/// read -- three times, the third leaving nothing allocated the second did
+/// not; and nothing written, nothing panicking, nothing read once it is
+/// unmounted.
+pub fn ext4bad(r: &mut Input) {
+    let g = geometry(r);
+    let mut st = style(r);
+    if g.journal_blocks > 0 && one_in(r, 3) {
+        st.journaled = r.range(1, 8) as u8;
+    }
+    let bs = g.block_size();
+    let mut budget = 96;
+    let mut inodes = 32;
+    let tree = tree(r, bs, &mut budget, &mut inodes);
+    let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
+    let mut media = made.media;
+    let len = g.blocks * bs;
+    for _ in 0..r.range(1, 4) {
+        /* The metadata at the start of the first groups, mostly; else
+         * anywhere -- a directory's block, an extent block, the journal. */
+        let at = if r.u8() % 5 < 3 { r.below(len.min(512 * bs)) } else { r.below(len) };
+        let byte = match r.u8() % 3 {
+            0 => 0,
+            1 => 0xFF,
+            _ => r.u8(),
+        };
+        media.write(at, &[byte]);
+    }
+    let sizes: Vec<u64> = [512, 1024, 4096].into_iter().filter(|s| *s <= bs).collect();
+    let ss = r.pick(&sizes);
+    let mut d = disk::Disk::new("vda", ss, len.div_ceil(ss) + r.below(4), media);
+    d.latency = r.chance(32);
+    d.no_writes = Some("ext4 mounts read-only, and writes nothing".into());
+    disk::insert(0, d);
+    let Some(dev) = disk::register(0) else { return };
+    let _ = fs::extfs::driver_for(&dev);
+    if fs::ext4::mount_at("/", dev.handle(), r.bool()) < 0 {
+        reached("a damaged image refused");
+        return;
+    }
+    reached("a damaged image mounted");
+    let vfs = fs::vfs_instance().expect("the VFS");
+    let mut f = Fs::new(vfs, Model::new(tree, true, Limits::fixed(1 << 44, usize::MAX)), false);
+    let walk = crate::targets::ext2bad::walk;
+    walk(&mut f, b"/", 0);
+    walk(&mut f, b"/", 0);
+    let settled = crate::machine::heap::live();
+    walk(&mut f, b"/", 0);
+    let after = crate::machine::heap::live();
+    invariant!(after <= settled, "a walk of a damaged image that changed nothing left {} bytes more allocated than \
+               the walk before it", after - settled);
+    let mut ops = 0;
+    while r.more() && ops < 100 {
+        ops += 1;
+        fsops::step(&mut f, r, bs);
+    }
+    walk(&mut f, b"/", 0);
+    f.close_all();
+    invariant!(vfs.unmount(b"/"), "the unmount of a damaged image was refused");
+    let before = disk::with(0, |d| d.log.len());
+    let _ = vfs.stat(b"/");
+    invariant!(disk::with(0, |d| d.log.len()) == before, "the disk was read after its filesystem was unmounted");
 }
 
 fn too_big(n: &Node) -> bool {
