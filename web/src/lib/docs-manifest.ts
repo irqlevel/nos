@@ -151,6 +151,22 @@ export const docsManifest: Record<string, DocInfo> = {
             ru: "Корневая ФС и root=, файловый API, что и как пишет драйвер ext2, создание и проверка корневого образа.",
         },
     },
+    api: {
+        group: "internals",
+        title: { en: "The host API", ru: "API хоста" },
+        description: {
+            en: "What nos is managed through by programs: the management bus served over TLS 1.3 to clients let in by their keys, its routes, stream and roles, and the management panel.",
+            ru: "Через что nos управляют программы: шина управления по TLS 1.3 для клиентов, пущенных по их ключам, её маршруты, поток и роли, и панель управления.",
+        },
+    },
+    mgmt: {
+        group: "internals",
+        title: { en: "The management bus", ru: "Шина управления" },
+        description: {
+            en: "Where the kernel's layers and modules answer by name what the host API asks: providers, methods, descriptors, calls and jobs.",
+            ru: "Где слои ядра и модули отвечают по имени на то, что спрашивает API хоста: провайдеры, методы, дескрипторы, вызовы и задачи.",
+        },
+    },
     modules: {
         group: "internals",
         title: { en: "Loadable modules", ru: "Загружаемые модули" },
