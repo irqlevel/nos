@@ -83,8 +83,9 @@ through the login, the dashboard, the providers' pages in both languages, a
 VM made, cloned and deleted as jobs -- its name typed again before it goes
 -- a protected one's delete refused, a console typed at, a second host
 added and reached by the panel's key while one showing another key is not,
-the theme and the language -- and that through all of it, and a dozen
-requests at once, the panel never went past what a host lets in at once
-(the mock's `busy`). `npm run typecheck` is the
+the theme and the language -- the charts drawn in the theme the page is in,
+switched on an open page too, and a table's values each on one line in a
+narrow window -- and that through all of it, and a dozen requests at once,
+the panel never went past what a host lets in at once (the mock's `busy`). `npm run typecheck` is the
 translations' gate: the Russian dictionary is the English one's shape.
 CI runs all of it (`.github/workflows/panel.yml`).
