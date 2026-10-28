@@ -99,6 +99,16 @@ impl<'a> Params<'a> {
         Ok(Some(n))
     }
 
+    /// A whole number from `min` to `max`, below 0 as well: a nice.
+    pub fn int(&mut self, key: &'a str, min: i64, max: i64) -> Result<i64, Invalid<'a>> {
+        let v = self.take(key).ok_or(Invalid { field: key, why: "is needed" })?;
+        let n = v.as_i64().ok_or(Invalid { field: key, why: "is a whole number" })?;
+        if n < min || n > max {
+            return Err(Invalid { field: key, why: "is out of its range" });
+        }
+        Ok(n)
+    }
+
     pub fn bool(&mut self, key: &'a str) -> Result<bool, Invalid<'a>> {
         self.opt_bool(key)?.ok_or(Invalid { field: key, why: "is needed" })
     }

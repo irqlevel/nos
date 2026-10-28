@@ -26,4 +26,5 @@ pub mod http;
 pub mod acpi;
 pub mod cmd;
 pub mod mgmt;
+pub mod system;
 pub mod fs;

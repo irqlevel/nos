@@ -135,7 +135,8 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
     /* A provider on the management bus, for the test to call, and to start
        a job of that its unload has to stop and wait for */
     let methods = [Method { name: "echo", kind: Kind::Read }, Method { name: "wait", kind: Kind::Job }];
-    let provider = Provider::register("modtest", &methods, "{}", provide).map_err(|_| Error::Busy)?;
+    let provider = Provider::register("modtest", &methods, include_str!("modtest.descriptor.json"), provide)
+        .map_err(|_| Error::Busy)?;
 
     kcore::trace!(0, "modtest: loaded, every check passed");
     Ok(Box::new(ModTest { _cmd: cmd, _provider: provider }))

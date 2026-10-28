@@ -26,7 +26,8 @@ A provider registers three things, all copied:
   - **action** changes something, and is done when it returns;
   - **job** takes long, and runs on a task of the bus's own;
 - **a descriptor:** up to 16 KiB of JSON, for a client to build its views
-  from. The bus keeps it and does not read it.
+  from. The bus checks it once, as the provider registers (below), keeps
+  it, and hands it to whoever asks.
 
 A call's parameters and its answer are JSON as `mgmtwire` has it:
 
@@ -45,6 +46,49 @@ statuses in `mgmtwire::Status`: `no_provider`, `no_method`, `invalid`,
 In the image, a provider implements `mgmt::Provider` and registers with
 `mgmt::register`. A module uses `kcore::mgmt::Provider::register`; dropping
 the `Provider` -- which a module's unload does -- unregisters it.
+
+## Descriptors
+
+A client -- the panel above all -- builds its pages, tables, forms and
+charts from the descriptors, and a page for a provider's method from the
+method's entry: a descriptor that does not say what its provider has shows
+a method that is not there, or lets a form call a read with an action's
+parameters. So `mgmt::register` and `kernel_mgmt_register` check it
+(`mgmtwire::descriptor::check`) and refuse the provider, `invalid` and a
+line in the log saying where and why, if it does not hold:
+
+- **JSON as the bus reads it**, within its limits: 16 KiB, 12 deep;
+- **`"schema": 1`**, and **`"provider"`** its name;
+- **`"methods"`**: exactly the methods it registers, each once with its
+  `kind` (`read`, `action`, `job`), a `title`, and optionally `help`,
+  `confirm` (an action or a job: what the client asks before it calls),
+  `params` (fields, below) and `result` (a name);
+- **`"resources"`**: optional, each a table of things the provider has --
+  `list` (a read) and the `items` of its answer that are the rows, `key`
+  and `columns` among its `fields`, optionally `get` (a read), `parent`
+  (another resource) and `actions` (actions and jobs, each `params` a
+  field of the row as `"$name"` or a value);
+- **`"metrics"`**: optional, each a number a client charts -- the `method`
+  (a read) and the `field`, for each of the `items` by `key` or for the
+  answer as a whole, a `gauge` or a `rate`, with its `unit`;
+- **`"ui"`**: optional, the `section` of the client it goes in, its `order`
+  and an `icon`;
+- **fields**: a `type` -- `string`, `text`, `int`, `bool`, `enum` (with its
+  `values`), `bytes`, `duration_ns`, `duration_ms`, `time_s`, `ipv4`,
+  `mac`, `port`, or a `list` `of` one of them -- a `title`, and optionally
+  `help`, `unit`, `min` and `max` (numbers), `required` and a `default`;
+- **every text a person reads** -- each `title`, `help`, `confirm` and
+  enum value -- an object of exactly `en` and `ru`, neither empty;
+- **nothing the format does not have**: a misspelt member is refused rather
+  than ignored.
+
+A count says its unit in its name (`_bytes`, `_ns`, `_ms`, `_s`) and is
+never a fraction: a client makes a rate from two answers.
+
+The image's descriptors are files beside their providers
+(`*.descriptor.json`, `include_str!`-ed), which `web-test.py` checks on the
+host as well: as the bus does, for the methods each says it has, and every
+text by Python, no key twice and none left untranslated.
 
 ## A call
 
@@ -81,6 +125,35 @@ the job is called on a task of its own (`mgmt/job<N>`).
 - **Limits:** at most 4 jobs not done (a fifth is refused `busy`) and 32
   records kept, done ones the first to go.
 - **A job whose provider went before it started** ends `gone`.
+
+## The providers in the image
+
+Each layer registers its own as it comes up, for good; none takes long, and
+each reads its data the way its shell commands do -- copied under the lock
+that guards it, and written out with no lock held.
+
+| Provider | Registered by | Reads | Actions |
+|---|---|---|---|
+| `system` | `src/crates/kernel/src/system.rs` | `info` (version, revision, arch, CPU model, CPUs, uptime, the wall clock, the log level, the command line), `cpus` (each CPU's time in its idle task, the stretch it is in now included), `memory`, `tasks`, `log` (`since`, `max_bytes`), `modules`, `interrupts` | `set_log_level`, `set_nice`, `load_module` (a module of `/lib/modules` by its name, and its parameters), `unload_module`, `power_off`, `reboot` |
+| `net` | `src/crates/net/src/provider.rs` | `interfaces` (addresses, and the frames and bytes each has moved), `tcp` (the slots, those used, and each connection), `arp`, `pool` | |
+| `block` | `src/crates/block/src/provider.rs` | `disks` (every disk and partition: its size, the disk it is on and where, and who holds it) | |
+| `fs` | `src/crates/fs/src/provider.rs` | `mounts` (where, which filesystem, on which device, and its size and free space, from `FileSystem::space`) | |
+
+What the C++ holds it copies out through `kcore::system`, into the
+caller's buffer and with nothing allocated: the tasks
+(`TaskTable::snapshot`), the modules (`ModuleTable::snapshot`, which gives
+no address), the log by number (`Dmesg::read_since`: every message has a
+number, given as it goes on the log under its lock, and a message dropped
+takes its number too, so a reader sees the gap), and a CPU's idle time
+(`Task::get_runtime_ns`, under the idle task's lock). Its actions go
+through what the shell's commands call: the module loader's `start_load`
+and `start_unload`, which now say how they ended (`JobOutcome`), the
+tracer's level, `set_task_nice`, and the shell's own power-off and reboot.
+
+`power_off` and `reboot` are actions, not jobs: each asks the shell's watch
+for the halt and returns, its answer on its way before the halt has begun.
+As a job it would never end -- the halt waits for every job to (`stop`),
+and this one would be waiting for the halt.
 
 ## When a provider goes
 
@@ -124,14 +197,21 @@ What it prints is gathered first and printed with no lock held.
 
 ## Tested
 
-Every boot runs two tests, on both architectures:
+Every boot runs three tests, on both architectures:
 
 - **`mgmt::selftest`**, in `rust_test`, with a provider of its own:
+  - descriptors refused that do not say what the provider has: an empty
+    one, one with a method of the wrong kind;
   - calls answered, and refused as they should be: no provider, no method,
     a job called as a call, an answer past its limit;
   - a job run to its end, its progress, log and result kept;
   - one told to stop by its provider's unregister, which waits for it;
   - the name free again after.
+- **`system::selftest`**, after it: every read of every provider in the
+  image -- system's, net's, block's and fs's -- called as a client would,
+  each answer held to being JSON as the bus reads it; and the log read by
+  number, a line logged just before found after the number the log had,
+  and nothing at or before the number asked after.
 - **`test_module_bus`**, after it:
   - modtest loaded, its provider called through `mgmt call`;
   - a job of it started and seen running;

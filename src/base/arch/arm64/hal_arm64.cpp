@@ -85,6 +85,34 @@ const char* pmu_name()
     return "none";
 }
 
+/* Who made the core, by MIDR_EL1's implementer field */
+static const char* implementer_name(ulong implementer)
+{
+    switch (implementer)
+    {
+    case 0x41: return "ARM";
+    case 0x42: return "Broadcom";
+    case 0x43: return "Cavium";
+    case 0x4E: return "NVIDIA";
+    case 0x50: return "APM";
+    case 0x51: return "Qualcomm";
+    case 0x61: return "Apple";
+    case 0x00: return "reserved/emulated";
+    default: return "unknown";
+    }
+}
+
+void cpu_model(char* buf, unsigned long len)
+{
+    if (buf == nullptr || len == 0)
+        return;
+
+    ulong midr;
+    asm volatile("mrs %0, midr_el1" : "=r"(midr));
+    stdlib::sn_printf(buf, len, "%s part 0x%lX r%lup%lu", implementer_name((midr >> 24) & 0xFF),
+        (midr >> 4) & 0xFFF, (midr >> 20) & 0xF, midr & 0xF);
+}
+
 void print_cpu_info(stdlib::Printer& con)
 {
     ulong midr, ctr, mmfr0;
@@ -93,19 +121,7 @@ void print_cpu_info(stdlib::Printer& con)
     asm volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
 
     ulong implementer = (midr >> 24) & 0xFF;
-    const char* name = "unknown";
-    switch (implementer)
-    {
-    case 0x41: name = "ARM"; break;
-    case 0x42: name = "Broadcom"; break;
-    case 0x43: name = "Cavium"; break;
-    case 0x4E: name = "NVIDIA"; break;
-    case 0x50: name = "APM"; break;
-    case 0x51: name = "Qualcomm"; break;
-    case 0x61: name = "Apple"; break;
-    case 0x00: name = "reserved/emulated"; break;
-    default: break;
-    }
+    const char* name = implementer_name(implementer);
 
     con.printf("implementer 0x%lX (%s)\n", implementer, name);
     con.printf("part 0x%lX variant %lu revision %lu, midr 0x%lX\n",

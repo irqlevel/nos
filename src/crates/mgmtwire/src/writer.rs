@@ -188,10 +188,38 @@ impl<'a> Writer<'a> {
         self.bool(b);
     }
 
+    /// Bytes that should be UTF-8 and may not be -- a line of the log, a
+    /// name a disk gave -- as a string: each run that is not valid UTF-8
+    /// written as U+FFFD, as `String::from_utf8_lossy` has it, and nothing
+    /// allocated.
+    pub fn str_lossy(&mut self, b: &[u8]) {
+        self.before_value();
+        self.raw(b"\"");
+        for chunk in b.utf8_chunks() {
+            self.escaped(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                self.raw("\u{FFFD}".as_bytes());
+            }
+        }
+        self.raw(b"\"");
+    }
+
+    /// `key` and `str_lossy`, in the object open.
+    pub fn field_str_lossy(&mut self, key: &str, b: &[u8]) {
+        self.key(key);
+        self.str_lossy(b);
+    }
+
     /// A string, quoted and escaped where JSON needs it: a quote, a
     /// backslash, a control character. The rest goes as it is, UTF-8.
     fn string(&mut self, s: &str) {
         self.raw(b"\"");
+        self.escaped(s);
+        self.raw(b"\"");
+    }
+
+    /// `s` escaped, unquoted.
+    fn escaped(&mut self, s: &str) {
         let b = s.as_bytes();
         let mut start = 0;
         for (i, &c) in b.iter().enumerate() {
@@ -217,7 +245,6 @@ impl<'a> Writer<'a> {
             start = i + 1;
         }
         self.raw(&b[start..]);
-        self.raw(b"\"");
     }
 }
 

@@ -11,8 +11,9 @@ use web::{cidr, http, sha1, ws, x509};
 pub fn run(seed: u64, iters: u64) -> usize {
     let mut f = Fails::default();
     let mut rng = Rng(seed);
-    let targets: [(&str, fn(&mut Rng, &mut Fails)); 7] = [
+    let targets: [(&str, fn(&mut Rng, &mut Fails)); 8] = [
         ("json", json_one),
+        ("descriptor", crate::descriptors::one),
         ("http", http_one),
         ("ws", ws_one),
         ("cidr", cidr_one),
@@ -34,7 +35,7 @@ pub fn run(seed: u64, iters: u64) -> usize {
                 break;
             }
         }
-        println!("fuzz {:<5} {} inputs, {} failed", name, n, f.0 - before);
+        println!("fuzz {:<10} {} inputs, {} failed", name, n, f.0 - before);
     }
     f.0
 }
@@ -94,7 +95,7 @@ fn write_value(w: &mut Writer, v: &Value) {
 
 /// Bytes changed the ways that break texts: one flipped, one dropped, one
 /// put in, a run cut out, the end cut off.
-fn mutate(rng: &mut Rng, b: &mut Vec<u8>, specials: &[u8]) {
+pub fn mutate(rng: &mut Rng, b: &mut Vec<u8>, specials: &[u8]) {
     for _ in 0..1 + rng.below(3) {
         let at = rng.below(b.len() as u64 + 1) as usize;
         match rng.below(5) {

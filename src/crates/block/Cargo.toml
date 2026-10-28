@@ -10,3 +10,5 @@ kcore = { path = "../kcore" }
 # The table below implements the C ABI the ffi crate declares, so it takes
 # the layout of an ops table from there rather than restating it.
 ffi = { path = "../ffi" }
+# The management bus, which the layer's provider registers on.
+mgmt = { path = "../mgmt" }
