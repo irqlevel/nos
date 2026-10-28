@@ -87,6 +87,54 @@ tls: InvalidCertificate(ExpiredContext { time: UnixTime(1788984857),
                                          not_after: UnixTime(1428883199) })
 ```
 
+## The server, for the host API
+
+`tls::server` (the `server` feature, which the API module's build turns on and
+the kernel's own does not) is the other side: a TLS server for the
+[host API](mgmt.md), whose clients are programs -- the panel, `nosctl`, the
+panels of other hosts -- each holding a key the host was given.
+
+- **TLS 1.3 alone, and a client's certificate required.** A client is known
+  by its key: the SHA-256 of the SubjectPublicKeyInfo of the certificate it
+  shows (`tls::server::fingerprint`), which has to be on the list the
+  server was made with. The certificate's dates, issuer and chain are not
+  looked at -- the list names the key, as `authorized_keys` does -- but the
+  handshake's signature is, with the provider's algorithms
+  (`verify_tls13_signature`): the client has to hold the key it showed.
+- **Decided in the handshake.** A client whose key is not on the list, that
+  shows none, speaks TLS 1.2, offers no protocol the server speaks by ALPN,
+  or breaks the protocol, is refused there: rustls' alert goes out within a
+  second, and `accept` hands its socket back with why (`Refused`) for the
+  caller to reset. With a client's certificate asked for, rustls sends no
+  data before the client's Finished, so nothing of what the server says
+  reaches a client it refuses -- and `accept` returns no session, so nothing
+  the client says reaches whoever reads one. A handshake that has not
+  finished in 10 s (`HANDSHAKE_MS`) is let go.
+- **No resumption.** No tickets and no session cache: every connection
+  shows its key afresh, and a list that has changed holds from the next
+  handshake on. The list is the server's, fixed when it is made
+  (`Server::new`); the API module makes the server again when it changes,
+  and a connection keeps the server it was accepted by.
+- **Every wait bounded.** The session runs over a `tls::server::Socket`,
+  whose reads and sends each wait at most what they are given. `read` with
+  nothing in its time answers `Idle`, which is no error; `write` encrypts
+  into the session's own queue, bounded by what the caller allows, and
+  `flush` sends from it for as long as it is given -- so a client that stops
+  reading holds up its own connection's task and nobody else.
+- **The way out.** `close` sends a close_notify and hands the socket back to
+  be closed, after the client's own goodbye, so the server is never the
+  side left in TIME-WAIT; `into_socket` hands it back for a reset.
+
+Its gate is `net-fuzz.py`'s `tls_server` target (docs/testing.md), which
+runs it as the module will -- a listener and a task a connection, over the
+kernel's TCP -- against the world's rustls clients; and a build of
+`tls --features server` for both kernel targets, since nothing in the
+kernel's own build compiles it. `pub mod server` is the last thing in
+`lib.rs`: with it anywhere above the client, the client's line numbers
+move -- in its debug info and its panics' locations, compiled into the
+network layer that uses it -- and the kernel's image, which has the feature
+off, would no longer come out the same to the byte.
+
 ## Building: two things to know
 
 **External crates.** These are the first dependencies in the tree that are not

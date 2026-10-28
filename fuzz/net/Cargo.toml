@@ -17,7 +17,10 @@ ffi = { path = "../../src/crates/ffi" }
 kcore = { path = "../../src/crates/kcore" }
 netwire = { path = "../../src/crates/netwire" }
 net = { path = "../../src/crates/net" }
-tls = { path = "../../src/crates/tls" }
+# The server too: the host API's (the tls_server target).
+tls = { path = "../../src/crates/tls", features = ["server"] }
+# The certificates of the world's TLS clients and of the server they talk to.
+web = { path = "../../src/crates/web" }
 fs = { path = "../../src/crates/fs" }
 ssh = { path = "../../src/crates/ssh" }
 # What the sshd module's source needs of a module's runtime.
