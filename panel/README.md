@@ -31,8 +31,10 @@ sessions, the pages -- is here, in Linux; nos keeps its API alone.
 ## On the mock
 
 `mock/server.mjs` is the host API as the panel sees it, with the providers'
-own descriptors read from the tree and numbers that move. To run the panel
-against it:
+own descriptors read from the tree and numbers that move, and what api.ko
+lets in at once with no api.toml -- two connections in their handshake, four
+of one key -- one past them reset as nos resets it. To run the panel against
+it:
 
 ```
 cd panel && npm install
@@ -81,6 +83,8 @@ through the login, the dashboard, the providers' pages in both languages, a
 VM made, cloned and deleted as jobs -- its name typed again before it goes
 -- a protected one's delete refused, a console typed at, a second host
 added and reached by the panel's key while one showing another key is not,
-the theme and the language. `npm run typecheck` is the
+the theme and the language -- and that through all of it, and a dozen
+requests at once, the panel never went past what a host lets in at once
+(the mock's `busy`). `npm run typecheck` is the
 translations' gate: the Russian dictionary is the English one's shape.
 CI runs all of it (`.github/workflows/panel.yml`).

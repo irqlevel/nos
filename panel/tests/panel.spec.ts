@@ -14,6 +14,16 @@ async function login(page: Page, locale = 'en') {
   return page.url().split('/h/')[1]!.split('/')[0]!;
 }
 
+/** How many connections a host has reset for going past what it lets in at
+ * once, as its api.status says (`busy`): asked through the panel. */
+async function pastLimits(page: Page, host: string): Promise<number> {
+  const res = await page.request.post(`/api/h/${host}/call/api/status`, {
+    headers: { Origin: new URL(page.url()).origin }, data: {},
+  });
+  expect(res.status()).toBe(200);
+  return (await res.json()).busy;
+}
+
 test('a wrong password is refused, the right one lets in', async ({ page }) => {
   await page.goto('/en/login');
   await page.fill('input[autocomplete=current-password]', 'not-it');
@@ -153,10 +163,13 @@ test('a cluster: a second host added by its address and its key, the panel let i
   const b = page.getByTestId('host-nos-b');
   await expect(b).toContainText('online', { timeout: 20_000 });
 
-  /* Its own pages, its own numbers: the panel reaches it with its key */
+  /* Its own pages, its own numbers: the panel reaches it with its key --
+   * from cold, within what the host lets in at once */
   await b.getByRole('link', { name: 'nos-b' }).click();
   await expect(page.getByTestId('host-state')).toHaveText('online', { timeout: 15_000 });
   await expect(page.getByTestId('log')).toContainText('boot: complete', { timeout: 15_000 });
+  const hostB = page.url().split('/h/')[1]!.split('/')[0]!;
+  expect(await pastLimits(page, hostB)).toBe(0);
 
   await page.goto('/en/hosts');
   await page.getByTestId('host-wrong').getByRole('button', { name: 'Remove' }).click();
@@ -173,4 +186,15 @@ test('the theme switches, and the language', async ({ page }) => {
   await page.getByRole('link', { name: 'RU' }).click();
   await expect(page.getByRole('link', { name: 'Обзор' })).toBeVisible();
   expect(host).toBeTruthy();
+});
+
+test('a page\'s requests at once: every one answered, none past what the host lets in', async ({ page }) => {
+  /* The mock resets a connection past api.ko's limits -- two in their
+   * handshake, four of one key -- as nos does: a panel that opened them as it
+   * pleased had its pages fail with ECONNRESET on a real host. Here, after
+   * every page the tests before opened, and a burst of a dozen at once. */
+  const host = await login(page);
+  const answers = await Promise.all(Array.from({ length: 12 }, () => page.request.get(`/api/h/${host}/providers`)));
+  expect(answers.map((a) => a.status())).toEqual(Array(12).fill(200));
+  expect(await pastLimits(page, host)).toBe(0);
 });
