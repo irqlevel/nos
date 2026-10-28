@@ -185,7 +185,7 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, and `hv create` of VMs from a web server's images; on both, `hv convert` |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
@@ -369,7 +369,17 @@ it checks:
 `--arch x86_64` is its short form: nos.iso, a root whose /etc/rc loads the
 modules and starts the API, and what needs no shell -- every check above
 but the shell's own commands, sshd, the client list's changes and the unload.
-Needs openssl and QEMU; a few minutes on arm64 under HVF.
+And on x86-64, where the guests are, hv.ko and hvboot too, and the `vm`
+provider through the API: a VM of hvboot -- which, given no disk, turns its
+guest off -- started as a job and found stopped, its console read by a
+reader and streamed to one, the reader's typing refused and an admin's at a
+VM that does not run refused saying why; a VM made of a raw image the test
+serves, its download in its job's log, its disks the image and the seed;
+cloned, the clone's seed made anew and its disk no more written than it
+holds, and deleted; a protected VM's delete refused without `force`; and a
+create of an image served slowly -- 64 MiB, a chunk at a time -- cancelled
+while it downloads, ending `cancelled` with nothing of it left. Needs
+openssl and QEMU; a few minutes on arm64 under HVF.
 
 ### `sshd-test.py` -- the listening side, and modules
 
@@ -1730,7 +1740,19 @@ zeros by its SHA-256 -- its folder holding the disk, the seed and a
 vm.toml that boots it by hvboot, the download gone; a raw image taken as it
 is; and a name that has a vm.toml, a URL with nothing at it (404), a file
 that is no image and a `size=` under the image's each refused, the last
-three leaving no folder behind.
+three leaving no folder behind. Then what is done to them
+([Cloned, deleted, changed](hypervisor.md#cloned-deleted-changed)): the
+first cloned, the clone's disk held to the source's by its SHA-256 and
+written no more than it holds -- 2 MiB of its 16, the rest a hole -- its
+folder the disk, a seed made anew, the user-data kept and a vm.toml with a
+UUID of its own; a clone to a name taken refused; a forward added through
+the `vm` provider (`mgmt call vm forward_add`) and found in the clone's
+vm.toml, the file's other lines as they were and the old one kept beside it
+as vm.toml.prev, then taken out; the clone made protected through the
+provider's `config_set`, its delete refused without `force` and the
+provider saying it is protected and off, then forced; the provider's list;
+and the second deleted keeping its disks, which stay in a folder `hv vms`
+no longer lists.
 
 ### `hvboot-test.py` -- what hvboot would boot, decided on the host
 
