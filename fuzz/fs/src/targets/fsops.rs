@@ -442,7 +442,7 @@ pub fn offset(r: &mut Input, size: u64, block: u64, max: u64) -> u64 {
 /// Whether the filesystem ran out of room -- blocks, inodes -- in what was
 /// traced since `mark`: what makes a call fail that the model, which does
 /// not count them, has succeed.
-fn out_of_room(mark: u64) -> bool {
+pub fn out_of_room(mark: u64) -> bool {
     crate::machine::traced_since(mark).iter().any(|l| {
         let l = String::from_utf8_lossy(l);
         l.contains("no free blocks") || l.contains("no free inodes") || l.contains("no free data blocks")

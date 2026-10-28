@@ -33,9 +33,15 @@ pub struct Style {
     pub hidden: bool,
     /// Deleted entries and gaps between a directory's live ones.
     pub slack: bool,
+    /// Directories now and then indexed, as Linux indexes one past a block:
+    /// an htree of one level, its names placed by their half-MD4 hashes.
+    pub htree: bool,
     /// The journal carries v3's checksums, as Linux leaves it; else none,
     /// as mke2fs makes it.
     pub journal_csum: bool,
+    /// The journal's tags and revoke records 64-bit on a filesystem that is
+    /// not -- as one shrunk by `resize2fs -s` keeps its journal.
+    pub journal_64: bool,
     /// How many metadata blocks' newest copies are only in the journal, in
     /// transactions nobody replayed, their homes holding garbage: 0 for a
     /// clean journal.
@@ -49,6 +55,8 @@ pub struct Made {
     pub media: Media,
     pub inodes: BTreeMap<Vec<Vec<u8>>, u32>,
     pub hidden: u32,
+    /// The directories holding those entries, by path, and their names.
+    pub hidden_at: BTreeMap<Vec<Vec<u8>>, Vec<Vec<u8>>>,
     pub journaled: Vec<u64>,
 }
 
@@ -76,6 +84,9 @@ struct Builder<'a> {
     /// extent blocks -- which a journal may hold the newest copies of.
     meta: BTreeSet<u64>,
     hidden: u32,
+    hidden_at: BTreeMap<Vec<Vec<u8>>, Vec<Vec<u8>>>,
+    /// The superblock's seed of the directories' name hash.
+    hash_seed: [u32; 4],
 }
 
 impl Builder<'_> {
@@ -370,22 +381,108 @@ impl Builder<'_> {
         blocks
     }
 
+    /// An htree directory's blocks for `children`: the index's root -- `.`,
+    /// a `..` spanning it, one level of entries and the index's tail --
+    /// then the leaves, each the names of its range of hashes, none split
+    /// across two. None where they would not take one level.
+    fn dx_blocks(&mut self, n: u32, parent: u32, children: &[(u32, Vec<u8>, u8)], seed: u32)
+        -> Option<Vec<Vec<u8>>> {
+        let bs = self.bs;
+        let usable = bs - 12;
+        let mut named: Vec<(u32, (u32, Vec<u8>, u8))> =
+            children.iter().map(|c| (hash::name_hash(&c.1, &self.hash_seed), c.clone())).collect();
+        named.sort_by_key(|e| e.0);
+        let cap = usable * (2 + (self.rand() % 3) as usize) / 4;
+        let mut leaves: Vec<(u32, Vec<(u32, Vec<u8>, u8)>)> = Vec::new();
+        let (mut cur, mut used, mut bound) = (Vec::new(), 0usize, 0u32);
+        for k in 0..named.len() {
+            let need = (8 + named[k].1 .1.len()).div_ceil(4) * 4;
+            if used + need > cap && !cur.is_empty() && named[k - 1].0 != named[k].0 {
+                leaves.push((bound, std::mem::take(&mut cur)));
+                used = 0;
+                bound = named[k].0;
+            }
+            if used + need > usable {
+                return None;
+            }
+            cur.push(named[k].1.clone());
+            used += need;
+        }
+        leaves.push((bound, cur));
+        let limit = (bs - 40) / 8;
+        if leaves.len() > limit {
+            return None;
+        }
+        let mut root = vec![0u8; bs];
+        wr32(&mut root, 0, n);
+        wr16(&mut root, 4, 12);
+        root[6] = 1;
+        root[7] = FT_DIR;
+        root[8] = b'.';
+        wr32(&mut root, 12, parent);
+        wr16(&mut root, 16, (bs - 12) as u16);
+        root[18] = 2;
+        root[19] = FT_DIR;
+        root[20..22].copy_from_slice(b"..");
+        /* dx_root_info: half-MD4, 8 bytes of it, one level. */
+        root[28] = 1;
+        root[29] = 8;
+        wr16(&mut root, 32, limit as u16);
+        wr16(&mut root, 34, leaves.len() as u16);
+        wr32(&mut root, 36, 1);
+        for (k, (low, _)) in leaves.iter().enumerate().skip(1) {
+            wr32(&mut root, 32 + 8 * k, *low);
+            wr32(&mut root, 32 + 8 * k + 4, k as u32 + 1);
+        }
+        let tail = 32 + 8 * limit;
+        let mut x = crc32c(seed, &root[..32 + 8 * leaves.len()]);
+        x = crc32c(x, &root[tail..tail + 4]);
+        x = crc32c(x, &[0, 0, 0, 0]);
+        wr32(&mut root, tail + 4, x);
+        let mut out = vec![root];
+        let slack = self.style.slack;
+        self.style.slack = false;
+        for (_, entries) in &leaves {
+            let mut blocks = self.dir_blocks(entries);
+            if blocks.len() != 1 {
+                self.style.slack = slack;
+                return None;
+            }
+            out.push(blocks.remove(0));
+        }
+        self.style.slack = slack;
+        Some(out)
+    }
+
     fn dir(&mut self, n: u32, parent: u32, children: &[(u32, Vec<u8>, u8)], subdirs: u32) -> Result<(), String> {
         let mut entries = vec![(n, b".".to_vec(), FT_DIR), (parent, b"..".to_vec(), FT_DIR)];
         entries.extend_from_slice(children);
         let links = if 2 + subdirs > 65000 { 1 } else { 2 + subdirs } as u16;
         let mut i = self.new_inode(S_IFDIR | 0o755, links);
         let seed = self.inode_seed(n, &i);
-        let blocks = self.dir_blocks(&entries);
+        let indexed = self.style.htree && children.len() >= 4 && self.rand() % 2 == 0;
+        let dx = if indexed { self.dx_blocks(n, parent, children, seed) } else { None };
+        let indexed = dx.is_some();
+        let blocks = match dx {
+            Some(blocks) => {
+                let flags = rd32(&i, ino::FLAGS) | ino::INDEX_FL;
+                wr32(&mut i, ino::FLAGS, flags);
+                blocks
+            }
+            None => self.dir_blocks(&entries),
+        };
         let mut placed = Vec::new();
         for (l, mut blk) in blocks.into_iter().enumerate() {
             /* The tail: an entry of nothing, 12 bytes, of the checksum's
-             * type, holding the checksum of what is before it. */
-            let at = self.bs - 12;
-            wr16(&mut blk, at + 4, 12);
-            blk[at + 7] = FT_DIR_CSUM;
-            let c = crc32c(seed, &blk[..at]);
-            wr32(&mut blk, at + 8, c);
+             * type, holding the checksum of what is before it -- but on an
+             * index's root, which carries its own. */
+            if !(indexed && l == 0) {
+                let at = self.bs - 12;
+                wr16(&mut blk, at + 4, 12);
+                blk[at + 7] = FT_DIR_CSUM;
+                let c = crc32c(seed, &blk[..at]);
+                wr32(&mut blk, at + 8, c);
+            }
             let b = self.alloc_block()?;
             self.write_block(b, &blk);
             self.meta.insert(b);
@@ -425,6 +522,7 @@ impl Builder<'_> {
         }
         if self.style.hidden && self.rand() % 3 == 0 {
             let h = self.hidden_entries()?;
+            self.hidden_at.insert(at.clone(), h.iter().map(|e| e.1.clone()).collect());
             children.extend(h);
         }
         self.dir(n, parent, &children, subdirs)?;
@@ -494,7 +592,12 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         seed,
         meta: BTreeSet::new(),
         hidden: 0,
+        hidden_at: BTreeMap::new(),
+        hash_seed: [0; 4],
     };
+    for k in 0..4 {
+        b.hash_seed[k] = b.rand() as u32;
+    }
     for i in 0..g.first_data_block() as usize {
         b.used[i] = true;
     }
@@ -532,7 +635,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
     };
     write_super(&mut b, &uuid, journal.as_deref(), !journaled.is_empty());
     let hidden = b.hidden;
-    Ok(Made { media: b.img, inodes, hidden, journaled })
+    Ok(Made { media: b.img, inodes, hidden, hidden_at: b.hidden_at, journaled })
 }
 
 /// The groups: inode tables, bitmaps and descriptors, each with its
@@ -705,7 +808,7 @@ fn set_inode_csum(seed: u32, n: u32, i: &mut [u8]) {
 fn write_journal(b: &mut Builder, blocks: &[u64], uuid: &[u8; 16]) -> Result<Vec<u64>, String> {
     let bs = b.bs;
     let seq = 1 + (b.rand() % 1000) as u32;
-    let mut j = Journal::new(bs, blocks.to_vec(), b.style.journal_csum, b.g.bit64, *uuid, seq);
+    let mut j = Journal::new(bs, blocks.to_vec(), b.style.journal_csum, b.g.bit64 || b.style.journal_64, *uuid, seq);
     let mut stale = Vec::new();
     if b.style.journaled > 0 {
         let candidates: Vec<u64> = b.meta.iter().copied().collect();
@@ -793,8 +896,7 @@ fn write_super(b: &mut Builder, uuid: &[u8; 16], journal: Option<&[u64]>, recove
     s[sb::UUID..sb::UUID + 16].copy_from_slice(uuid);
     s[sb::VOLUME_NAME..sb::VOLUME_NAME + 16].copy_from_slice(&g.label);
     for k in 0..4 {
-        let w = b.rand() as u32;
-        wr32(&mut s, sb::HASH_SEED + 4 * k, w);
+        wr32(&mut s, sb::HASH_SEED + 4 * k, b.hash_seed[k]);
     }
     s[sb::DEF_HASH_VERSION] = 1;
     if g.bit64 {

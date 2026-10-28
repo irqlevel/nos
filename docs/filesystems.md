@@ -291,10 +291,11 @@ a sequential pass does not re-read its indirect blocks per data block.
 
 `src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
 -- through `src/crates/extfmt`, the on-disk format and its checksums as a
-crate with no kernel in it. It is read-only for now: writing, through the
-journal, is the next step, and until then every filesystem it mounts is
-mounted read-only whatever was asked, and nothing it does writes to the
-device. ext2's driver stays as it is, for the roots made before ext4.
+crate with no kernel in it, and writes it through its journal. What it
+writes so far is names: files and directories made, renamed and moved,
+removed -- a file's data, its size changed, is the next step, and until
+then a write or a truncate is refused and said. ext2's driver stays as it
+is, for the roots made before ext4.
 
 Which driver a filesystem gets is `extfs::driver_for`'s to say, for
 `root=`, the fallback layout and `mount`: ext2's takes what it always
@@ -302,12 +303,18 @@ took -- revision 1, no incompatible feature but filetype -- but a
 filesystem with a journal, which it would write past; ext4's takes the
 rest of the family. `mount ext4 <disk> <path>` names the driver outright.
 
-What is refused, mounted read-only or (once it writes) written is
+What is refused, mounted read-only or written is
 `extfmt::features::classify`'s: refused are inline_data, bigalloc, meta_bg,
 encryption, casefold, verity, ea_inode, largedir, mmp, an external journal
-and a filesystem with no filetype; read-only, whatever this driver comes to
-write, a filesystem without a journal, without extents (ext3), without
-metadata_csum, with orphan_file, quota or project quotas. Past what extfmt
+and a filesystem with no filetype; read-only, a filesystem without a
+journal, without extents (ext3), without metadata_csum, with orphan_file,
+quota or project quotas. A mount asked to write is read-only too -- the
+reason said -- for a filesystem marked with errors or not marked valid, a
+journal that recorded an error, is of the first version or holds a log the
+superblock does not say needs replaying, a transaction whose commit fails
+its checksum (e2fsck should look), and orphans to release, which the
+driver does not do yet; and refused for a journal whose blocks are the
+filesystem's own metadata. Past what extfmt
 checks of a superblock, the driver refuses a block it cannot read in a page,
 more blocks than the device has, groups more than their bitmaps cover, an
 inode count that is not what the groups hold, and descriptors whose bitmaps
@@ -340,6 +347,71 @@ sound commit, a copy failing its checksum, features it does not know -- has
 the mount refused, as a filesystem read around it would be neither as it
 was nor as it was to be; a log the superblock does not say needs replaying
 is read past, as Linux discards it.
+
+### Writing, through the journal
+
+A mount for writing replays the journal if it holds a log -- the planner's
+copies written home, flushed, the log marked empty and the superblock's
+error fields kept as they were before the replay -- sets the features its
+own commits use (v3 checksums, revokes, 64-bit tags on a 64bit filesystem),
+and says the filesystem needs recovery, forced to the medium, before
+anything else is written. A clean unmount takes that back last, once a
+checkpoint has put everything home and the log is marked empty, the
+superblock's free counts made the groups'.
+
+Every call that changes metadata is one transaction (`ext4/txn.rs`): what
+it changes is kept apart, as copies of whole blocks, until the journal
+holds all of it, and a call that fails before then leaves nothing changed
+-- on the disk, in the descriptors and superblock in memory, in the tree.
+A block is changed only as a kind -- a bitmap, the descriptors, an inode
+table block, a directory's leaf or index block, an extent block, an
+attribute block -- and every checksum its kind carries is put on it as the
+transaction is sealed; an inode's as it is stored. The transaction holds
+the device, the cache and the journal for as long as it lives, so that no
+checkpoint can write anything home meanwhile, and it is bounded: a quarter
+of the journal, and never more than 512 blocks.
+
+A commit (`ext4/journal.rs`) writes the log's start into the journal's
+superblock first if the log was empty, then revoke blocks, descriptors and
+copies -- a copy whose first word is the journal's magic escaped -- flushes,
+and writes the commit block forced to the medium, its time never earlier
+than the last. Only then are the blocks what reads see -- pinned in memory
+until a checkpoint writes them home, the only copy of each meanwhile. A
+checkpoint -- when the log is half full, when more than 1024 blocks are
+pinned, when a commit would not fit, at the unmount -- writes every pinned
+block home,
+flushes, and moves the log's start past them. A block freed is not handed
+out again by its own transaction, is never written home by a checkpoint
+after, and is revoked when the live log holds a copy of it, so that no
+replay writes that copy over what the block becomes. A write that fails in
+a commit or a checkpoint -- or a flush, `sync`'s among them, whose order
+nothing after could count on -- aborts the journal: nothing more is written, the
+call fails, reads go on, `sync` fails, `mounts` says `journal-aborted`, and
+the unmount writes nothing, leaving the filesystem to the next mount's
+replay -- or e2fsck's.
+
+Names: a new inode is the lowest free in the first group from its parent's
+that has one -- so that the part of a table never written shrinks by one --
+written whole, its extra fields among them, a random generation; a group
+never initialised has its bitmaps made as the kernel makes them, its block
+bitmap from the system zone (every group's metadata and the journal, which
+no file is given whatever a bitmap says) with the bits past its end set. An
+entry goes into the first entry with room after it, else into a new block at
+the directory's end, the extent tree grown to take it -- the last extent
+stretched, a new leaf and levels down to it under the lowest node with
+room, a level more at the root. An indexed directory has its index dropped
+in the same transaction before an entry goes into it: its root made the `.`
+and `..` it also is, its other index blocks empty leaves, the flag cleared
+-- linear, which is all a reader without htree reads; an entry taken out of
+one leaves the index as it is, true still. A name is looked for on the disk,
+not in the tree, which leaves some out; a directory is removed only once
+the disk shows nothing in it, and a recursive remove starts only once every
+directory under it is known to hold nothing the tree does not show -- a
+node at a time after that, deepest first, each its own transaction. A file
+loses a link at a time; its last one gives back its blocks and its tree's,
+and its share of an attribute block, which goes with its last reference. A
+directory's link count is kept as dir_nlink keeps it: 1 past 65000, and 1
+kept.
 
 ## nanofs, ramfs, procfs
 
