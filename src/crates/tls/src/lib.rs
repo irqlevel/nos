@@ -1,6 +1,6 @@
 #![no_std]
 
-//! A TLS client for the kernel's HTTP client.
+//! A TLS client for the kernel's HTTP client; [`server`], the host API's.
 //!
 //! rustls drives the protocol over a [`Transport`]: the HTTP client's TCP
 //! connection. The kernel has no `std`, so this uses rustls' unbuffered API:
@@ -431,3 +431,8 @@ impl<T: Transport> Drop for TlsStream<T> {
         self.close();
     }
 }
+
+/* Last in the file, so that turning it on moves no line above: the kernel's
+   build, which has it off, comes out the same to the byte */
+#[cfg(feature = "server")]
+pub mod server;

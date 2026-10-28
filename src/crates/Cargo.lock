@@ -1145,6 +1145,8 @@ dependencies = [
  "kcore",
  "rustls",
  "rustls-rustcrypto",
+ "rustls-webpki 0.103.15",
+ "sha2",
  "webpki-roots",
 ]
 

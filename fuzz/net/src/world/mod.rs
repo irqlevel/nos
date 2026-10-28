@@ -19,6 +19,7 @@ pub mod lan;
 pub mod link;
 pub mod sshc;
 pub mod tcpm;
+pub mod tlsc;
 pub mod tlsd;
 
 use std::collections::BTreeMap;
