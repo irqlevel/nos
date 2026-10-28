@@ -4229,7 +4229,7 @@ Acquire::http::Pipeline-Depth=0` takes 2 s again.
 Then the mapping itself: a copy's page went through the temporary window's
 shared slots, under their lock, with a reference taken and two TLB flushes,
 and that cost the vCPU as much as the copy. Each CPU has a slot of its own
-for it now ([Paging](paging.md#tmpmap-the-window-onto-physical-memory)), a
+for it now ([Paging](paging.md#tmp_map-the-window-onto-physical-memory)), a
 page still mapped only for the length of its copy. On the AX41 (56b6da8):
 
 | in the Debian guest | shared slots | a slot per CPU |
