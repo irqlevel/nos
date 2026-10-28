@@ -198,3 +198,39 @@ test('a page\'s requests at once: every one answered, none past what the host le
   expect(answers.map((a) => a.status())).toEqual(Array(12).fill(200));
   expect(await pastLimits(page, host)).toBe(0);
 });
+
+test('the charts are drawn in the theme the page is in, switched on an open page too', async ({ page }) => {
+  /* A canvas knows no CSS variables: a chart made once kept the light
+   * theme's grid on the dark page, until a reload. */
+  await login(page);
+  const charts = page.getByTestId('chart');
+  await expect(charts.first()).toHaveAttribute('data-theme', /^(dark|light)$/, { timeout: 15_000 });
+  const theme = async () => ((await page.locator('html').getAttribute('class')) ?? '').includes('dark') ? 'dark' : 'light';
+  for (let i = 0; i < 2; i++) {
+    await page.getByRole('button', { name: 'Theme' }).click();
+    const now = await theme();
+    for (const chart of await charts.all()) {
+      await expect(chart).toHaveAttribute('data-theme', now);
+    }
+  }
+});
+
+test('a table\'s values keep to one line in a narrow window: the table scrolls instead', async ({ page }) => {
+  const host = await login(page);
+  await page.setViewportSize({ width: 900, height: 800 });
+  await page.goto(`/en/h/${host}/vms`);
+  const cells = page.getByTestId('resource-vms').locator('tbody td');
+  await expect(cells.first()).toBeVisible({ timeout: 15_000 });
+  /* Every cell one line high: "8,192 MiB" and "38 min 32 s" were broken over
+   * two and four */
+  const tall = await cells.evaluateAll((tds) => tds.filter((td) => {
+    /* Its text's own lines, by where each line box starts: a row is as tall
+     * as its tallest cell, so a cell's height would name the whole row */
+    const range = document.createRange();
+    range.selectNodeContents(td);
+    const tops = new Set([...range.getClientRects()].map((rect) => Math.round(rect.top)));
+    return tops.size > 1 && !td.querySelector('form, button');
+  }).map((td) => td.textContent));
+  expect(tall).toEqual([]);
+});
+
