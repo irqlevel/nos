@@ -55,8 +55,8 @@ export function ResourceTable({ host, d, id, r, locale, w, every = 0, extra }: {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs text-muted">
-                {r.columns.map((c) => <th key={c} className="px-4 py-2 font-medium">{text(r.fields[c]?.title, locale) || c}</th>)}
-                {(r.actions?.length || extra) && <th className="px-4 py-2 font-medium">{w.actions}</th>}
+                {r.columns.map((c) => <th key={c} className="px-4 py-2 font-medium whitespace-nowrap">{text(r.fields[c]?.title, locale) || c}</th>)}
+                {(r.actions?.length || extra) && <th className="px-4 py-2 font-medium whitespace-nowrap">{w.actions}</th>}
               </tr>
             </thead>
             <tbody>
@@ -65,7 +65,9 @@ export function ResourceTable({ host, d, id, r, locale, w, every = 0, extra }: {
                 return [
                   <tr key={String(key)} className="border-t border-line">
                     {r.columns.map((c) => (
-                      <td key={c} className="px-4 py-2 font-mono text-xs text-fg-soft">
+                      /* A value on one line: the table scrolls in its box where
+                       * the window is narrow, not "8,192 / MiB" */
+                      <td key={c} className="px-4 py-2 font-mono text-xs text-fg-soft whitespace-nowrap">
                         {extra && c === r.key ? extra(row) : show(r.fields[c], row[c], locale)}
                       </td>
                     ))}
