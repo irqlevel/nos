@@ -39,11 +39,21 @@ says what a push and a pop cost on one CPU and how long each run took
 moves. The [management bus](mgmt.md)'s (`mgmt/src/selftest.rs`) uses a
 provider of its own:
 
+- a descriptor that does not say what the provider has refused: an empty
+  one, one with a method of the wrong kind;
 - calls answered, and refused as they should be;
 - an answer held to its limit;
 - a job run to its end, its progress, log and result kept;
 - a job told to stop by its provider's unregister, which waits for it;
 - the name free again after.
+
+`system::selftest` (`kernel/src/system.rs`) then calls every read of every
+provider in the image -- `system`'s, `net`'s, `block`'s, `fs`'s -- as a
+client would, and holds each answer to being JSON as the bus reads it: a
+provider that writes past its own object, leaves a list open or puts a
+fraction in one fails the boot here, not in the panel. And it reads the log
+by number: a line logged just before must come back after the number the log
+had, and nothing at or before the number asked after.
 
 Then `test_module_bus` does the same for a module, once there are tasks to
 run its job on:
@@ -2025,6 +2035,18 @@ compiles the `web` and `mgmtwire` crates, as they are, into a host program:
   certificate and checks the name it was asked for, and refuses a name the
   certificate is not for; a server that asks for a client's certificate
   takes the client's.
+- **The descriptors.** A descriptor with every member the format has must
+  be taken, and each of thirty-one defects of it refused -- a text without
+  its Russian, a method not described or of another kind, a read that asks
+  to be confirmed, a type the format does not have, an enum without its
+  values, a resource listed by an action, a column that is no field, a
+  parameter from a field there is not, a resource its own parent, a metric
+  read by an action, a bound written as a string -- and the same descriptor
+  broken at random is never a panic. Then every `*.descriptor.json` in the
+  tree is checked as the bus checks it, for the methods it says it has (the
+  boot then holds those to what the provider registers), and read by
+  Python as well: no key twice, every title, help, confirmation and enum
+  value in English and Russian, none empty, none left untranslated.
 
 Nineteen mutants of the two crates -- a key twice, a leading zero or a lone
 surrogate taken; a big count written as a number, a quote not escaped; a

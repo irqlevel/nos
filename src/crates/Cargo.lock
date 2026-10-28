@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -324,6 +325,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -459,6 +461,7 @@ dependencies = [
  "igb",
  "kcore",
  "mgmt",
+ "mgmtwire",
  "net",
  "nvme",
  "r8125",
@@ -608,6 +611,7 @@ dependencies = [
  "ffi",
  "fs",
  "kcore",
+ "mgmt",
  "netwire",
  "tls",
 ]

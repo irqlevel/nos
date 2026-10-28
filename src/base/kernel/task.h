@@ -162,6 +162,12 @@ public:
     PRINTF_FORMAT(2, 3) void set_name(const char *fmt, ...);
     const char* get_name();
 
+    /* Its time on a CPU so far, the stretch it is on one now included --
+       which a task that keeps its CPU, the idle task above all, has not
+       been charged yet: under its lock, which every update_runtime() is
+       made under */
+    ulong get_runtime_ns();
+
     /* Bytes of this task's stack that the poison scan still finds intact --
        the part it has never reached. 0 when it has no stack yet. */
     ulong get_stack_free();
@@ -294,6 +300,9 @@ public:
     bool switched_out_runnable_;
 
     stdlib::Time run_start_time_;
+    /* Written under lock_ (update_runtime), and read through
+       get_runtime_ns, which takes it: a read from another CPU without it
+       races the scheduler's write */
     stdlib::Time runtime_;
     stdlib::Time start_time_;
     stdlib::Time exit_time_;
@@ -369,6 +378,30 @@ public:
     };
 
     size_t sample_cpu(CpuSample* out, size_t max);
+
+    /* A task as the management bus lists it (`system.tasks`), copied out
+       under the bucket lock into the caller's array -- nothing allocated --
+       as ps reads it: its state, what its flags say, its time on a CPU and
+       how often it was switched to. The C ABI's, kernel_task_snapshot's:
+       ffi::system::TaskInfo is its Rust */
+    struct TaskSnapshot
+    {
+        u64 pid;
+        u64 runtime_ns;
+        u64 context_switches;
+        /* 1 waiting, 2 running, 3 exited: Task's STATE_* */
+        u32 state;
+        /* SNAPSHOT_* */
+        u32 flags;
+        char name[TASK_NAME_LEN];
+    };
+
+    static const u32 SNAPSHOT_STOPPING = 1;
+    static const u32 SNAPSHOT_IDLE = 2;
+    static const u32 SNAPSHOT_BLOCKED = 4;
+    static const u32 SNAPSHOT_IDLING = 8;
+
+    size_t snapshot(TaskSnapshot* out, size_t max);
 
 private:
     TaskTable(const TaskTable& other) = delete;

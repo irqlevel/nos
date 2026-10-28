@@ -1,0 +1,110 @@
+{
+  "schema": 1,
+  "provider": "system",
+  "title": {"en": "System", "ru": "Система"},
+  "help": {"en": "The kernel: its version, CPUs, memory, tasks, log and modules, and its power.", "ru": "Ядро: версия, процессоры, память, задачи, журнал и модули, питание."},
+  "ui": {"section": "system", "order": 10, "icon": "cpu"},
+  "methods": {
+    "info": {"kind": "read", "title": {"en": "Overview", "ru": "Обзор"}, "result": "info"},
+    "cpus": {"kind": "read", "title": {"en": "CPUs", "ru": "Процессоры"}},
+    "memory": {"kind": "read", "title": {"en": "Memory", "ru": "Память"}},
+    "tasks": {"kind": "read", "title": {"en": "Tasks", "ru": "Задачи"}},
+    "log": {"kind": "read", "title": {"en": "Kernel log", "ru": "Журнал ядра"},
+      "help": {"en": "The messages numbered after since, oldest first.", "ru": "Сообщения с номерами после since, от старых к новым."},
+      "params": {
+        "since": {"type": "int", "min": 0, "title": {"en": "After message", "ru": "После сообщения"}},
+        "max_bytes": {"type": "bytes", "min": 1, "max": 131072, "title": {"en": "At most", "ru": "Не больше"}}
+      }},
+    "modules": {"kind": "read", "title": {"en": "Modules", "ru": "Модули"}},
+    "interrupts": {"kind": "read", "title": {"en": "Interrupts", "ru": "Прерывания"}},
+    "set_log_level": {"kind": "action", "title": {"en": "Set the log level", "ru": "Уровень журнала"},
+      "params": {
+        "level": {"type": "int", "min": 0, "max": 5, "required": true, "title": {"en": "Level", "ru": "Уровень"},
+          "help": {"en": "0 is always shown; each level above it is louder.", "ru": "0 виден всегда; каждый уровень выше подробнее."}}
+      }},
+    "set_nice": {"kind": "action", "title": {"en": "Set the nice", "ru": "Приоритет (nice)"},
+      "params": {
+        "pid": {"type": "int", "min": 0, "required": true, "title": {"en": "Task", "ru": "Задача"}},
+        "nice": {"type": "int", "min": -20, "max": 19, "required": true, "title": {"en": "Nice", "ru": "Nice"},
+          "help": {"en": "-20 gets the most of its CPU, 19 the least.", "ru": "-20 получает больше всего процессора, 19 меньше всего."}}
+      }},
+    "load_module": {"kind": "action", "title": {"en": "Load a module", "ru": "Загрузить модуль"},
+      "help": {"en": "Only a module of /lib/modules, by its name.", "ru": "Только модуль из /lib/modules, по имени."},
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Module", "ru": "Модуль"}},
+        "params": {"type": "string", "title": {"en": "Parameters", "ru": "Параметры"}}
+      }},
+    "unload_module": {"kind": "action", "title": {"en": "Unload", "ru": "Выгрузить"},
+      "confirm": {"en": "Unload this module? What it serves stops.", "ru": "Выгрузить модуль? То, что он обслуживает, остановится."},
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Module", "ru": "Модуль"}}
+      }},
+    "power_off": {"kind": "action", "title": {"en": "Power off", "ru": "Выключить"},
+      "confirm": {"en": "Power the machine off? Its guests are stopped first.", "ru": "Выключить машину? Сначала будут остановлены её гости."}},
+    "reboot": {"kind": "action", "title": {"en": "Reboot", "ru": "Перезагрузить"},
+      "confirm": {"en": "Reboot the machine? Its guests are stopped first.", "ru": "Перезагрузить машину? Сначала будут остановлены её гости."}}
+  },
+  "resources": {
+    "tasks": {
+      "title": {"en": "Tasks", "ru": "Задачи"},
+      "list": "tasks", "items": "tasks", "key": "pid",
+      "fields": {
+        "pid": {"type": "int", "title": {"en": "PID", "ru": "PID"}},
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "state": {"type": "enum", "title": {"en": "State", "ru": "Состояние"}, "values": {
+          "running": {"en": "running", "ru": "выполняется"},
+          "waiting": {"en": "waiting", "ru": "ждёт"},
+          "exited": {"en": "exited", "ru": "завершена"},
+          "unknown": {"en": "unknown", "ru": "неизвестно"}}},
+        "idle": {"type": "bool", "title": {"en": "Idle task", "ru": "Задача простоя"}},
+        "blocked": {"type": "bool", "title": {"en": "Blocked", "ru": "Заблокирована"}},
+        "stopping": {"type": "bool", "title": {"en": "Stopping", "ru": "Останавливается"}},
+        "runtime_ns": {"type": "duration_ns", "title": {"en": "CPU time", "ru": "Время ЦП"}},
+        "switches": {"type": "int", "title": {"en": "Switches", "ru": "Переключения"}}
+      },
+      "columns": ["pid", "name", "state", "runtime_ns", "switches"],
+      "actions": [{"method": "set_nice", "params": {"pid": "$pid"}}]
+    },
+    "modules": {
+      "title": {"en": "Modules", "ru": "Модули"},
+      "list": "modules", "items": "modules", "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "size_bytes": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "imports": {"type": "int", "title": {"en": "Kernel imports", "ru": "Импорты ядра"}},
+        "state": {"type": "enum", "title": {"en": "State", "ru": "Состояние"}, "values": {
+          "live": {"en": "loaded", "ru": "загружен"},
+          "loading": {"en": "loading", "ru": "загружается"},
+          "unloading": {"en": "unloading", "ru": "выгружается"},
+          "unknown": {"en": "unknown", "ru": "неизвестно"}}},
+        "permanent": {"type": "bool", "title": {"en": "Permanent", "ru": "Постоянный"}}
+      },
+      "columns": ["name", "state", "size_bytes", "imports", "permanent"],
+      "actions": [{"method": "unload_module", "params": {"name": "$name"}}]
+    },
+    "cpus": {
+      "title": {"en": "CPUs", "ru": "Процессоры"},
+      "list": "cpus", "items": "cpus", "key": "cpu",
+      "fields": {
+        "cpu": {"type": "int", "title": {"en": "CPU", "ru": "ЦП"}},
+        "idle_ns": {"type": "duration_ns", "title": {"en": "Idle since boot", "ru": "Простой с загрузки"}}
+      },
+      "columns": ["cpu", "idle_ns"]
+    },
+    "interrupts": {
+      "title": {"en": "Interrupts", "ru": "Прерывания"},
+      "list": "interrupts", "items": "sources", "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Source", "ru": "Источник"}},
+        "count": {"type": "int", "title": {"en": "Count", "ru": "Количество"}}
+      },
+      "columns": ["name", "count"]
+    }
+  },
+  "metrics": {
+    "cpu_idle": {"title": {"en": "CPU idle", "ru": "Простой ЦП"}, "method": "cpus", "items": "cpus", "key": "cpu",
+      "field": "idle_ns", "kind": "rate", "unit": "ns"},
+    "memory_free": {"title": {"en": "Free memory", "ru": "Свободная память"}, "method": "memory",
+      "field": "free_bytes", "kind": "gauge", "unit": "B"}
+  }
+}

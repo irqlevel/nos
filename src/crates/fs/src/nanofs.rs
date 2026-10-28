@@ -22,7 +22,7 @@ use kcore::crc32::{crc32_update, crc32_with_hole};
 use kcore::dma::DmaBuffer;
 use kcore::trace;
 
-use crate::vfs::FileSystem;
+use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub const MAGIC: u32 = 0x4E41_4E4F; // "NANO"
@@ -1440,6 +1440,17 @@ impl FileSystem for NanoFs {
 
     fn device(&self) -> usize {
         self.io.dev.handle()
+    }
+
+    /// Its data blocks, and those the data bitmap has clear.
+    fn space(&self) -> Option<Space> {
+        if !self.mounted {
+            return None;
+        }
+        let map = &self.sb.as_slice()[SB_DATA_BITMAP..SB_DATA_BITMAP + SB_DATA_BITMAP_LEN];
+        let free = (0..DATA_BLOCK_COUNT as usize).filter(|&b| !bit_test(map, b)).count() as u64;
+        let block = BLOCK_SIZE as u64;
+        Some(Space { total_bytes: u64::from(DATA_BLOCK_COUNT) * block, free_bytes: free * block })
     }
 
     fn mount(&mut self, read_only: bool) -> Option<bool> {

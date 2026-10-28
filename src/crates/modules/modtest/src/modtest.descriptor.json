@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "provider": "modtest",
+  "title": {"en": "Module loader test", "ru": "Проверка загрузчика модулей"},
+  "help": {"en": "The loader's self-test module, loaded and unloaded by the boot's tests.", "ru": "Модуль самопроверки загрузчика: тесты при загрузке загружают и выгружают его."},
+  "methods": {
+    "echo": {"kind": "read", "title": {"en": "Echo", "ru": "Эхо"}},
+    "wait": {"kind": "job", "title": {"en": "A job that waits to be stopped", "ru": "Задача, ждущая остановки"}}
+  }
+}

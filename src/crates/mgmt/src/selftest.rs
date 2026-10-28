@@ -58,6 +58,7 @@ impl Provider for Test {
 }
 
 static TEST: Test = Test;
+const DESCRIPTOR: &str = include_str!("selftest.descriptor.json");
 static METHODS: [Method; 5] = [
     Method { name: "echo", kind: Kind::Read },
     Method { name: "refuse", kind: Kind::Action },
@@ -65,6 +66,14 @@ static METHODS: [Method; 5] = [
     Method { name: "quick", kind: Kind::Job },
     Method { name: "wait", kind: Kind::Job },
 ];
+
+/// The descriptor with `refuse` a read: what the bus must not take.
+const MISKINDED: &str = r#"{"schema": 1, "provider": "selftest", "title": {"en": "t", "ru": "t"}, "methods": {
+    "echo": {"kind": "read", "title": {"en": "t", "ru": "t"}},
+    "refuse": {"kind": "read", "title": {"en": "t", "ru": "t"}},
+    "big": {"kind": "read", "title": {"en": "t", "ru": "t"}},
+    "quick": {"kind": "job", "title": {"en": "t", "ru": "t"}},
+    "wait": {"kind": "job", "title": {"en": "t", "ru": "t"}}}}"#;
 
 fn check(ok: bool, what: &str) {
     if !ok {
@@ -94,9 +103,15 @@ fn wait_for(id: u64, state: JobState) -> crate::JobInfo {
 
 pub fn selftest() {
     crate::init();
-    let reg = register("selftest", &METHODS, "{}", &TEST);
+    /* A descriptor that does not say what the provider has is refused --
+     * one with no methods, one with a method of the wrong kind -- and
+     * nothing registered */
+    check(matches!(register("selftest", &METHODS, "{}", &TEST), Err(Status::Invalid)), "an empty descriptor refused");
+    check(matches!(register("selftest", &METHODS, MISKINDED, &TEST), Err(Status::Invalid)),
+          "a method of the wrong kind refused");
+    let reg = register("selftest", &METHODS, DESCRIPTOR, &TEST);
     check(reg.is_ok(), "the provider registered");
-    check(matches!(register("selftest", &METHODS, "{}", &TEST), Err(Status::Conflict)), "a name twice refused");
+    check(matches!(register("selftest", &METHODS, DESCRIPTOR, &TEST), Err(Status::Conflict)), "a name twice refused");
 
     let (s, got) = call_text("selftest", "echo", br#"{"n":42}"#, 64);
     check(s == Status::Ok && got == br#"{"n":42}"#, "a call answered");
@@ -135,7 +150,7 @@ pub fn selftest() {
     check(info.is_some_and(|i| i.state == JobState::Done && i.status == Status::Cancelled),
           "the unregister told the job to stop and waited for it");
     check(call_text("selftest", "echo", b"", 64).0 == Status::NoProvider, "no call of a provider gone");
-    let again = register("selftest", &METHODS, "{}", &TEST);
+    let again = register("selftest", &METHODS, DESCRIPTOR, &TEST);
     check(again.is_ok(), "the name free again");
     drop(again);
     trace!(0, "mgmt: selftest passed");

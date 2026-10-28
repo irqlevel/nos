@@ -29,7 +29,7 @@ mod selftest;
 mod shell;
 
 pub use job::{job_cancel, job_info, job_list, job_notes, job_result, job_start, JobInfo, JobState};
-pub use mgmtwire::{Status, Writer};
+pub use mgmtwire::{Invalid, Params, Status, Value, Writer};
 pub use selftest::selftest;
 
 use alloc::boxed::Box;
@@ -259,6 +259,20 @@ pub(crate) fn add<'a>(name: &str, methods: impl Iterator<Item = (&'a str, Kind)>
         }
         copies.push((copy(m)?, kind));
     }
+    if copies.len() != count {
+        return Err(Status::Invalid);
+    }
+    /* What a client builds its views from says what the provider has, or
+     * the provider is not taken: checked here, before anything is
+     * registered */
+    let mut named: Vec<(&str, &str)> = Vec::new();
+    named.try_reserve_exact(count).map_err(|_| Status::Busy)?;
+    named.extend(copies.iter().map(|(m, k)| (m.as_str(), k.name())));
+    if let Err(e) = mgmtwire::descriptor::check(descriptor, name, &named) {
+        trace!(0, "mgmt: provider {}'s descriptor refused: {} {}", name, e.at, e.why);
+        return Err(Status::Invalid);
+    }
+    drop(named);
     let name = copy(name)?;
     let mut desc = Vec::new();
     desc.try_reserve_exact(descriptor.len()).map_err(|_| Status::Busy)?;
@@ -497,6 +511,75 @@ impl Call {
     pub fn cancelled(&self) -> bool {
         self.state.job().is_some_and(|j| j.cancelled())
     }
+
+    /// The answer written as JSON by `write`: Ok, or TooLarge if it was not
+    /// all taken.
+    pub fn answer(&mut self, write: impl FnOnce(&mut Writer)) -> Status {
+        if self.json(write) { Status::Ok } else { Status::TooLarge }
+    }
+
+    /// The call refused: `{"error": ...}` answered, and `status` returned
+    /// for the call to end with.
+    pub fn refuse(&mut self, status: Status, message: &str, field: Option<&str>) -> Status {
+        self.json(|w| status.write_error(w, message, field));
+        status
+    }
+
+    /// A parameter refused, as `refuse` says it.
+    pub fn invalid(&mut self, e: Invalid) -> Status {
+        self.refuse(Status::Invalid, e.why, Some(e.field))
+    }
+}
+
+/// Text made with `write!` into `N` bytes on the stack -- an address, a MAC
+/// -- for an answer's `Writer`. What does not fit is cut, at a character.
+pub struct Text<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Text<N> {
+    pub fn new() -> Self {
+        Text { buf: [0; N], len: 0 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        /* Only whole characters are ever put in */
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> Default for Text<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> core::fmt::Write for Text<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let mut take = s.len().min(N - self.len);
+        while !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len += take;
+        Ok(())
+    }
+}
+
+/// `args` as a `Text` of `N` bytes: `mgmt::text::<16>(format_args!(...))`.
+pub fn text<const N: usize>(args: core::fmt::Arguments) -> Text<N> {
+    let mut t = Text::new();
+    let _ = core::fmt::Write::write_fmt(&mut t, args);
+    t
+}
+
+/// A method's parameters read, as the bus takes them: none at all is none.
+pub fn parse_params(params: &[u8]) -> Result<Value, Status> {
+    if params.is_empty() {
+        return Ok(Value::Null);
+    }
+    mgmtwire::json::parse(params, &mgmtwire::Limits::PARAMS).map_err(|_| Status::Invalid)
 }
 
 /// The state of the call `id`, if it runs on this task: what a module's
