@@ -123,7 +123,10 @@ the job is called on a task of its own (`mgmt/job<N>`).
   unregister and by the halt. Stopping is its method's to do: it looks, and
   ends.
 - **Limits:** at most 4 jobs not done (a fifth is refused `busy`) and 32
-  records kept, done ones the first to go.
+  records kept, done ones the first to go. Its parameters are up to 64 KiB,
+  what the host API takes in a body -- a VM's user-data among them, the
+  panel's keys in it -- held while it waits and taken by its task as it
+  runs: a record kept once it is done holds none.
 - **A job whose provider went before it started** ends `gone`.
 
 ## The providers in the image

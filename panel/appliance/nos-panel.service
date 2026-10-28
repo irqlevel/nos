@@ -1,0 +1,44 @@
+# nos's management panel: the Next.js server, on 127.0.0.1:3000 behind Caddy
+# (nos-panel-caddy.service). Its data -- the SQLite of its user, sessions,
+# hosts and their history -- is /var/lib/nos-panel; the host it was made on
+# is in its seed, /etc/nos-panel/seed.json.
+[Unit]
+Description=nos management panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nos-panel
+Group=nos-panel
+WorkingDirectory=/opt/nos-panel/app
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOSTNAME=127.0.0.1
+Environment=PANEL_DATA=/var/lib/nos-panel
+Environment=PANEL_SEED=/etc/nos-panel/seed.json
+ExecStart=/opt/nos-panel/node/bin/node server.js
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/nos-panel
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

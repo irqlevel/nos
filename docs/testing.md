@@ -197,7 +197,11 @@ swallowing panic messages whole.
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
-| `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
+| `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
+| `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
+| `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
+| `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
+| `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
 
 ### `wx-test.sh` -- W^X
 
@@ -378,8 +382,49 @@ serves, its download in its job's log, its disks the image and the seed;
 cloned, the clone's seed made anew and its disk no more written than it
 holds, and deleted; a protected VM's delete refused without `force`; and a
 create of an image served slowly -- 64 MiB, a chunk at a time -- cancelled
-while it downloads, ending `cancelled` with nothing of it left. Needs
-openssl and QEMU; a few minutes on arm64 under HVF.
+while it downloads, ending `cancelled` with nothing of it left.
+
+And the management panel: /etc/rc's `api panel create`, given a password's
+hash in `panel.pass`, the test's raw image, a stand-in for a bundle and its
+SHA-256, has the vm provider make the panel's VM and start it as one job --
+the highest port of the switch its own, its address, nos's 39233 forwarded
+to its 443 and `protected` in its vm.toml, a delete without `force` refused
+-- lets its key in as `panel`, an admin, and its address alone in on hv0, as
+`api.status` says. Then nos is powered off through the API, and its root
+read with debugfs: the VM's user-data is cloud-config (which PyYAML reads,
+where it is there) whose seed names the API on hv0 and the host's key and
+holds the password's hash; its client certificate's key is the one let in;
+its certificate as a server is the one the host keeps in `panel.pem`; both
+pairs are taken by OpenSSL as they are, each key its certificate's, in a TLS
+1.3 handshake whose server requires the client's certificate; the bundle is
+fetched by its URL and held to its SHA-256; and api.toml has the address in
+`allow_hv0` with every line it had kept. Booted again from that root, /etc/rc's
+`api panel create` must make nothing and start the panel's VM -- a `vm.start`
+job that ends ok -- as it does at every boot after the first. Needs openssl
+and QEMU; a few minutes on arm64 under HVF.
+
+### `panel-appliance-test.py` -- the panel's bundle, run as its VM runs it
+
+`nos-panel-<version>.tar.gz` is what the panel's VM downloads and runs, and
+nothing else runs it: a release that built it wrong -- a Node without
+`node:sqlite`, a Caddyfile Caddy refuses, a standalone build missing a file
+-- would be a panel that never comes up, on a machine whose operator has
+nothing but a browser's error. The test unpacks it in Debian 13's image (x86-64,
+under emulation on an arm64 Mac) where the VM has it, `/opt/nos-panel`, and
+runs it as its units do: the bundle's Node runs the panel with
+`nos-panel.service`'s environment and a seed as `api panel create` makes
+one, and its Caddy serves it with the bundle's Caddyfile and a P-256
+certificate for `nos-panel`; the mock host API (`panel/mock`) stands in for
+nos, run by the bundle's Node too. Then, from outside, as a browser through
+nos's relay: TLS by the address alone, with no server name, answered with
+the panel's certificate and HTTP/2 taken; a wrong password refused, and a
+login from no page of the panel's; root's login with the password the
+seed's hash is of, its session in a `__Host-` cookie, Secure and HttpOnly;
+the host the seed names, its key pinned as the seed has it, reached --
+the panel's stream of its numbers up -- and a call through the panel
+answered by the host API over mTLS; nothing of the hosts without a session.
+`install.sh` is read by `sh -n`; cloud-init and systemd are the VM's alone.
+Needs Docker and openssl; a minute, more under emulation.
 
 ### `sshd-test.py` -- the listening side, and modules
 
@@ -461,8 +506,14 @@ entry, over what nos wrote: e2fsck finds the partition clean, the host key
 nos made stays, every file of the image is there again, the old kernel,
 modules, hvboot and `/VERSION` go to `.prev`, the UDP shell it
 is asked for goes into the kernel parameters and a boot is armed; the third
-boot must answer with the same host key and, now, on the UDP shell. Last,
-`status`, `rollback` and `uninstall`, and e2fsck once more. Needs
+boot must answer with the same host key and, now, on the UDP shell. The
+update is given `--panel`: root's password for the panel printed once, the
+partition's `/etc/api/panel.pass` the scrypt hash of it alone -- checked
+against the password printed -- and `/etc/rc` given the panel's lines in
+order after the image's own; the third boot's api.ko serves, and its `api
+panel create` -- of an image built without a bundle, as CI's is -- makes no
+panel and says why. Last, `status`, `rollback` and `uninstall`, and e2fsck
+once more. Needs
 `qemu-system-x86_64`, `ssh`, `ssh-keygen`, `ssh-keyscan`, and the image
 built (`make image`, `scripts/build-image.sh`); about four minutes under TCG.
 

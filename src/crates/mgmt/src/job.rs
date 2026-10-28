@@ -29,9 +29,11 @@ use kcore::trace;
 pub const MAX_RUNNING: usize = 4;
 /// Records kept, done ones the first to go.
 pub const MAX_RECORDS: usize = 32;
-/// A job's result, its parameters, a line of its log, its lines kept.
+/// A job's result, its parameters, a line of its log, its lines kept. Its
+/// parameters are what the host API takes in a body -- a VM's user-data
+/// among them -- held while it is not done, at most MAX_RUNNING of them.
 pub const RESULT_MAX: usize = 16 * 1024;
-pub const PARAMS_MAX: usize = 4 * 1024;
+pub const PARAMS_MAX: usize = 64 * 1024;
 pub const NOTE_MAX: usize = 200;
 pub const NOTES: usize = 64;
 
@@ -75,7 +77,9 @@ pub(crate) struct Job {
     /// The registration it was started on: a provider of that name
     /// registered again is not it.
     handle: u64,
-    params: Vec<u8>,
+    /// Taken by its task as it runs: a record kept once it is done holds
+    /// none, and no secret handed in them outlives the run.
+    params: Mutex<Vec<u8>>,
     cancel: AtomicBool,
     finished: AtomicBool,
     inner: Mutex<Inner>,
@@ -203,6 +207,7 @@ pub fn job_start(provider: &str, method: &str, params: &[u8]) -> Result<u64, Sta
     let mut p = Vec::new();
     p.try_reserve_exact(params.len()).map_err(|_| Status::Busy)?;
     p.extend_from_slice(params);
+    let p = Mutex::new(p).ok_or(Status::Busy)?;
     let inner = Mutex::new(Inner {
         state: JobState::Queued,
         status: Status::Ok,
@@ -297,7 +302,8 @@ fn run_job(job: Arc<Job>) {
         Err(s) => s,
         Ok((handler, begun)) => {
             job.started();
-            let s = run(handler, &begun, &job.method, &job.params, &state);
+            let params = core::mem::take(&mut *job.params.lock());
+            let s = run(handler, &begun, &job.method, &params, &state);
             drop(begun);
             s
         }
