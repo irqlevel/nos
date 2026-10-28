@@ -11,7 +11,10 @@
 //! from: none said, any. A client still has to show a key the API was given
 //! (`clients`); the allowlist is what keeps everyone else from even its
 //! handshake. Every key is optional; a key the file does not have, or one
-//! given twice, is refused with its line.
+//! given twice, is refused with its line. The allowlists are read again by
+//! `api reload`; the rest is taken as the API starts. `api panel create`
+//! adds the panel's VM to `allow_hv0` (`allowing`), every other line left as
+//! it was.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -42,11 +45,13 @@ pub const MAX_BYTES: usize = 16 * 1024;
 /// An interface's name, as `net` names them.
 const NIC_NAME_MAX: usize = 15;
 
+/// Each interface's allowlist, for those that have one.
+pub type Allow = Vec<(String, Vec<Cidr>)>;
+
 pub struct Config {
     pub port: u16,
     pub listen: Vec<String>,
-    /// Each interface's allowlist, for those that have one.
-    pub allow: Vec<(String, Vec<Cidr>)>,
+    pub allow: Allow,
     pub max_connections: usize,
     pub max_per_key: usize,
     pub max_handshakes: usize,
@@ -66,13 +71,21 @@ impl Config {
         }
     }
 
-    /// Whether a connection on `nic` from `ip` may be taken: its
-    /// interface's allowlist has it, or the interface has none.
-    pub fn allows(&self, nic: &str, ip: u32) -> bool {
-        match self.allow.iter().find(|(n, _)| n == nic) {
-            Some((_, nets)) => nets.iter().any(|c| c.contains(ip)),
-            None => true,
-        }
+    /// Whether `other` would start the same server: its port, its
+    /// interfaces and its limits -- what `api reload` cannot change.
+    pub fn same_server(&self, other: &Config) -> bool {
+        self.port == other.port && self.listen == other.listen && self.max_connections == other.max_connections
+            && self.max_per_key == other.max_per_key && self.max_handshakes == other.max_handshakes
+            && self.idle_secs == other.idle_secs
+    }
+}
+
+/// Whether a connection on `nic` from `ip` may be taken: its interface's
+/// allowlist has it, or the interface has none.
+pub fn allows(allow: &Allow, nic: &str, ip: u32) -> bool {
+    match allow.iter().find(|(n, _)| n == nic) {
+        Some((_, nets)) => nets.iter().any(|c| c.contains(ip)),
+        None => true,
     }
 }
 
@@ -87,6 +100,8 @@ pub fn network(text: &str) -> Option<Cidr> {
 
 struct Reader {
     c: Config,
+    /// Each allowlist as the file writes it: what `allowing` writes back.
+    texts: Vec<(String, Vec<String>)>,
 }
 
 const KEYS: [&str; 6] = ["port", "listen", "max_connections", "max_per_key", "max_handshakes", "idle_secs"];
@@ -142,6 +157,8 @@ impl conf::Keys for Reader {
                 }
                 c.allow.try_reserve(1).map_err(|_| String::from("out of memory"))?;
                 c.allow.push((nic.to_string(), nets));
+                self.texts.try_reserve(1).map_err(|_| String::from("out of memory"))?;
+                self.texts.push((nic.to_string(), texts));
             }
         }
         Ok(())
@@ -150,7 +167,36 @@ impl conf::Keys for Reader {
 
 /// api.toml's text read; what is not said is its default.
 pub fn parse(text: &str) -> Result<Config, String> {
-    let mut reader = Reader { c: Config::defaults() };
+    let mut reader = Reader { c: Config::defaults(), texts: Vec::new() };
     conf::parse(text, "api.toml", &mut reader)?;
     Ok(reader.c)
+}
+
+/// api.toml's text with the address `ip` let in on `nic`: its
+/// `allow_<nic>` with the address added -- or made, with it alone, where the
+/// file has none, which lets nothing else in on `nic` from then on -- and
+/// every other line as it was. None where the allowlist has it already.
+pub fn allowing(text: &str, nic: &str, ip: u32) -> Result<Option<String>, String> {
+    let mut reader = Reader { c: Config::defaults(), texts: Vec::new() };
+    conf::parse(text, "api.toml", &mut reader)?;
+    let mut texts = match reader.texts.iter().position(|(n, _)| n == nic) {
+        Some(_) if allows(&reader.c.allow, nic, ip) => return Ok(None),
+        Some(i) => core::mem::take(&mut reader.texts[i].1),
+        None => Vec::new(),
+    };
+    if texts.len() >= ALLOW_MAX {
+        return Err(alloc::format!("allow_{} has {} networks, all there may be", nic, ALLOW_MAX));
+    }
+    texts.push(alloc::format!("{}", super::http::Ip(ip)));
+    let key = alloc::format!("allow_{}", nic);
+    let mut line = alloc::format!("{} = [", key);
+    for (i, t) in texts.iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        conf::quoted(&mut line, t);
+    }
+    line.push_str("]\n");
+    let mut reader = Reader { c: Config::defaults(), texts: Vec::new() };
+    conf::edit(text, "api.toml", &mut reader, &[conf::Edit { key: &key, line: Some(line) }]).map(Some)
 }

@@ -116,6 +116,9 @@ pub struct Recipe<'a> {
     pub password: Option<&'a str>,
     pub hvboot: &'a str,
     pub user_data: Option<&'a str>,
+    /// Its vm.toml's `protected`: stopped and deleted only when told
+    /// `force` -- the management panel's VM.
+    pub protected: bool,
 }
 
 /// What a VM made of a cloud's image came to: its vm.toml, its disk's size,
@@ -130,7 +133,8 @@ pub struct Created {
 pub fn command(root: &str, vms: &Vms, name: &str, url: &str, words: &str, work: &mut dyn Work) {
     let made = own_words(words).and_then(|(own, rest)| {
         let o = guest::words(&alloc::format!("{} {}", own.hvboot, rest), store::CREATE_USAGE)?;
-        let recipe = Recipe { url, size: own.size, password: own.password, hvboot: own.hvboot, user_data: None };
+        let recipe = Recipe { url, size: own.size, password: own.password, hvboot: own.hvboot, user_data: None,
+                              protected: false };
         create(root, vms, name, &recipe, o, work)
     });
     if let Err(e) = made {
@@ -332,8 +336,13 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     o.disks.extend(theirs);
     let path = store::join(root, name).ok_or_else(|| String::from("out of memory"))?;
     let folder = Folder { name: String::from(name), path };
-    let config = Config::new(o);
+    let mut config = Config::new(o);
+    config.protected = recipe.protected;
     store::options_checked(&folder, &config)?;
+    /* A port of its own is no other VM's, by its vm.toml or as it runs. */
+    if let Some(p) = config.options.port {
+        crate::clone::port_for(root, vms, Some(p))?;
+    }
     let file = store::join(&folder.path, store::CONFIG).ok_or_else(|| String::from("out of memory"))?;
     if kcore::fs::size(&file).is_ok() {
         return Err(alloc::format!("{} is there already -- not written over", file));

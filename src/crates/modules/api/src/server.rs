@@ -20,7 +20,7 @@ use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream};
 use tls::server::Fingerprint;
 
-use super::config::Config;
+use super::config::{self, Allow, Config};
 use super::files::{Client, Dir, Identity, Role};
 
 /// Connections the kernel keeps for the port before the listener takes
@@ -107,7 +107,10 @@ pub enum Listening {
 
 pub struct Shared {
     pub stop: AtomicBool,
+    /// api.toml as the server was started with it, but its allowlists:
     pub config: Config,
+    /// those, which `api reload` gives it again.
+    pub allow: Locked<Allow>,
     pub dir: Dir,
     pub identity: Identity,
     /// The TLS server, made again whole when the clients change: a
@@ -138,6 +141,12 @@ impl Shared {
     /// key taken off it since the connection's server was made.
     pub fn client(&self, key: &Fingerprint) -> Option<Client> {
         self.clients.with(|v| v.iter().find(|c| c.key == *key).cloned())
+    }
+
+    /// Whether a connection on `nic` from `ip` may be taken, as the
+    /// allowlists stand now.
+    pub fn allows(&self, nic: &str, ip: u32) -> bool {
+        self.allow.with(|a| config::allows(a, nic, ip))
     }
 
     /// A new list of clients, and the TLS server for it.
@@ -233,7 +242,7 @@ fn reap(shared: &Shared, tasks: &mut Vec<(u64, TaskHandle)>) {
 /// and its task started.
 fn admit(shared: &Arc<Shared>, stream: TcpStream, nic: &str) -> Option<(u64, TaskHandle)> {
     let (ip, port) = stream.peer();
-    if !shared.config.allows(nic, ip) {
+    if !shared.allows(nic, ip) {
         Counters::add(&shared.counters.not_allowed);
         stream.abort();
         return None;

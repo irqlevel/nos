@@ -43,7 +43,19 @@ console read and streamed, a reader's typing at it refused, an admin's
 refused for a VM that does not run, and stopped; a VM made of an image the
 test serves, cloned, the clone deleted; a protected VM's delete refused
 without force; and a create of an image served slowly cancelled midway,
-nothing of it left behind.
+nothing of it left behind. And the management panel (panel_checks): /etc/rc's
+`api panel create`, given a password's hash, the test's image and a bundle
+the test serves, has the vm provider make the panel's VM and start it -- the
+highest port of the switch its own, nos's 39233 forwarded to its 443,
+protected -- and lets its key in as an admin and its address in on hv0. Once
+nos is powered off, its root read: the VM's user-data is cloud-config whose
+seed names the API on hv0 and its key, the password's hash and a key and
+certificate that pair -- the certificate's key the one let in -- and whose
+certificate as a server pairs with its key too, both taken by OpenSSL in a
+TLS handshake; it fetches the bundle by its URL and holds it to its SHA-256;
+and api.toml has the address in allow_hv0, every line it had kept. Booted
+again from that root, /etc/rc's `api panel create` makes nothing and starts
+the panel's VM, as it does at every boot after the first.
 
     scripts/api-test.py [--arch aarch64|x86_64] [--tcg]
 
@@ -111,11 +123,23 @@ SLOW_PAUSE = 0.05
 HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
 # What /etc/rc does for the vm checks: hv loaded and on, and a VM of hvboot.
 VM_RC = "insmod /hv.ko\nhv on\nhv create t1 /lib/hvboot mem=64\n"
+# The management panel's VM: the highest port of the switch, its address,
+# and what /etc/rc makes it with -- the test's raw image as its disk, the
+# test's stand-in for a bundle, 64 MiB.
+PANEL_PORT = 15
+PANEL_IP = "10.0.100.17"
+HV0_IP = "10.0.100.1"
+PANEL_RC = "api panel create image=%sraw.img bundle=%sbundle.tar.gz sha256=%s memory=64\n"
 
 
-def rootfs(tmp, arch, k, rc):
+def rootfs(tmp, arch, k, rc, panel=None):
+    """The root's image; `panel`, on x86-64, (the password's hash, the line
+    of /etc/rc that makes the panel)."""
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc", "api"))
+    if panel:
+        with open(os.path.join(rootdir, "etc", "api", "panel.pass"), "w") as f:
+            f.write(panel[0] + "\n")
     for m in ("api", "modtest", "sshd"):
         shutil.copy(pt.module_path(arch, m), rootdir)
     if arch == "x86_64":
@@ -130,7 +154,7 @@ def rootfs(tmp, arch, k, rc):
     if rc:
         with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
             f.write("# api-test.py\ninsmod /modtest.ko\ninsmod /api.ko\napi start\n"
-                    + (VM_RC if arch == "x86_64" else ""))
+                    + (VM_RC if arch == "x86_64" else "") + (panel[1] if panel else ""))
     image = os.path.join(tmp, "root.img")
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
@@ -529,6 +553,9 @@ def image_server(tmp):
     raw[510:512] = b"\x55\xaa"
     with open(os.path.join(www, "raw.img"), "wb") as f:
         f.write(raw)
+    # What the panel's VM would fetch: no bundle, but bytes it is held to
+    with open(os.path.join(www, "bundle.tar.gz"), "wb") as f:
+        f.write(random.Random(8).randbytes(4096))
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *args):
@@ -700,9 +727,196 @@ def vm_checks(k, pin, port):
     a.close()
 
 
+def scrypt_hash(password):
+    """A password hashed as nos-install hashes it."""
+    import base64
+    import hashlib
+    salt = os.urandom(16)
+    n, r, p = 1 << 15, 8, 1
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, maxmem=128 * n * r * 2, dklen=32)
+    return "scrypt$%d$%d$%d$%s$%s" % (n, r, p, base64.b64encode(salt).decode(), base64.b64encode(digest).decode())
+
+
+def panel_checks(k, pin, log):
+    """The panel's VM, as /etc/rc's `api panel create` has it made: its job,
+    and the VM, the client and the allowlist it leaves."""
+    a = client(k, "admin", pin)
+    found = None
+    end = time.time() + 120
+    while time.time() < end and not found:
+        found = re.search(r"api: the panel's VM is being made: job (\d+)", open(log, errors="replace").read())
+        time.sleep(1)
+    if not pt.check("/etc/rc's api panel create has the vm provider make the panel's VM, as a job", found,
+                    [line for line in open(log, errors="replace").read().splitlines() if "api" in line][-10:]):
+        return
+    job = int(found.group(1))
+    rec = None
+    end = time.time() + 300
+    while time.time() < end:
+        _, _, rec = a.request("GET", "/v1/jobs/%d" % job)
+        if rec.get("state") == "done":
+            break
+        time.sleep(1)
+    result = (rec or {}).get("result", {})
+    pt.check("which makes it and starts it: the highest port of the switch its own", rec is not None
+             and rec.get("status") == "ok" and result.get("port") == PANEL_PORT and isinstance(result.get("id"), int),
+             rec)
+    s, got = vm_get(a, "panel")
+    vm = got.get("vm", got) if s == 200 else {}
+    pt.check("the panel's VM: protected, its port's address, the memory it was told", vm.get("protected") is True
+             and vm.get("port") == PANEL_PORT and vm.get("ip") == PANEL_IP and vm.get("memory_mib") == 64, (s, got))
+    s, _, conf = a.request("POST", "/v1/call/vm/config_get", {"name": "panel"})
+    text = conf.get("text", "") if s == 200 else ""
+    pt.check("its vm.toml: nos's 39233 forwarded to its 443, its port, protected, booted again when it resets",
+             'forward = ["39233:443"]' in text and "port = %d" % PANEL_PORT in text and "protected = true" in text
+             and "restart = true" in text, text)
+    s, _, body = a.request("POST", "/v1/call/api/clients")
+    panel = [c for c in body.get("clients", []) if c.get("name") == "panel"] if s == 200 else []
+    pt.check("its key is let in as panel, an admin", len(panel) == 1 and panel[0].get("role") == "admin", (s, body))
+    s, _, status = a.request("POST", "/v1/call/api/status")
+    allow = {e.get("nic"): e.get("networks") for e in status.get("allow", [])} if s == 200 else {}
+    pt.check("and its address alone on hv0, from the next connection on", allow.get("hv0") == [PANEL_IP + "/32"],
+             (s, allow))
+    started, rec = vm_job(a, "delete", {"name": "panel"})
+    pt.check("the panel's VM is not deleted without force", rec is not None and rec.get("status") == "conflict",
+             (started, rec))
+    # Its core given back for the vm checks: a guest's cores are its own,
+    # and this machine has one to give
+    started, rec = vm_job(a, "stop", {"name": "panel"})
+    pt.check("nor stopped", rec is not None and rec.get("status") == "conflict", (started, rec))
+    started, rec = vm_job(a, "stop", {"name": "panel", "force": True, "secs": 0})
+    s, got = vm_get(a, "panel")
+    pt.check("but with force", rec is not None and rec.get("status") == "ok" and s == 200
+             and got.get("vm", {}).get("state") == "off", (started, rec, got))
+    a.close()
+    return panel[0]["key"] if panel else None
+
+
+def read_root(tmp, image, path):
+    """A file of nos's root, read off its image once nos is off: by
+    debugfs, here or in the builder image."""
+    cmd = "debugfs -R 'cat %s' %s 2>/dev/null"
+    if shutil.which("debugfs"):
+        out = subprocess.run(["sh", "-c", cmd % (path, image)], capture_output=True)
+    else:
+        out = subprocess.run(["docker", "run", "--platform", "linux/amd64", "--rm", "-v",
+                              "%s:/img:ro" % os.path.dirname(image), "nos-builder", "sh", "-c",
+                              cmd % (path, "/img/" + os.path.basename(image))], capture_output=True)
+    return out.stdout.decode(errors="replace")
+
+
+def literal_block(text, path):
+    """The content of the file `path` of cloud-config's write_files: its
+    literal block, unindented."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == "- path: " + path:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("content: |"):
+                j += 1
+            out = []
+            for line in lines[j + 1:]:
+                if line and not line.startswith("      "):
+                    break
+                out.append(line[6:])
+            return "\n".join(out).strip("\n") + "\n"
+    return ""
+
+
+def pem_pair_handshake(tmp, server_cert, server_key, client_cert, client_key):
+    """Whether OpenSSL takes the panel's certificates and keys as they
+    are -- each key its certificate's -- in a TLS 1.3 handshake, the server
+    requiring the client's certificate."""
+    import threading
+    files = {}
+    for name, text in (("sc", server_cert), ("sk", server_key), ("cc", client_cert), ("ck", client_key)):
+        files[name] = os.path.join(tmp, "panel-" + name + ".pem")
+        with open(files[name], "w") as f:
+            f.write(text)
+    try:
+        sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        sctx.load_cert_chain(files["sc"], files["sk"])
+        sctx.verify_mode = ssl.CERT_REQUIRED
+        sctx.load_verify_locations(files["cc"])
+        cctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        cctx.check_hostname = False
+        cctx.load_verify_locations(files["sc"])
+        cctx.load_cert_chain(files["cc"], files["ck"])
+    except (ssl.SSLError, OSError) as e:
+        return "loading: %s" % e
+    a, b = socket.socketpair()
+    got = {}
+
+    def serve():
+        try:
+            with sctx.wrap_socket(a, server_side=True) as s:
+                got["client"] = s.getpeercert(binary_form=True)
+                s.sendall(b"ok")
+        except (ssl.SSLError, OSError) as e:
+            got["error"] = str(e)
+
+    t = threading.Thread(target=serve)
+    t.start()
+    try:
+        with cctx.wrap_socket(b, server_hostname="nos-panel") as c:
+            c.recv(2)
+    except (ssl.SSLError, OSError) as e:
+        got["error"] = str(e)
+    t.join(10)
+    return got.get("error") or (None if got.get("client") else "no client certificate")
+
+
+def panel_files(tmp, image, pin, panel_key, password_hash, bundle_sha):
+    """What `api panel create` left on nos's root, read once nos is off."""
+    user = read_root(tmp, image, "/vms/panel/user-data")
+    pt.check("the panel's user-data is cloud-config", user.startswith("#cloud-config\n"), user[:300])
+    try:
+        import yaml
+        doc = yaml.safe_load(user)
+        paths = [f.get("path") for f in doc.get("write_files", [])]
+        pt.check("which YAML reads as written: the seed, the certificate, its key, the installer, run once",
+                 paths == ["/etc/nos-panel/seed.json", "/etc/nos-panel/tls/cert.pem", "/etc/nos-panel/tls/key.pem",
+                           "/usr/local/sbin/nos-panel-fetch"] and len(doc.get("runcmd", [])) == 1, doc)
+    except ImportError:
+        print("  (no PyYAML: the user-data read by lines alone)")
+    try:
+        seed = json.loads(literal_block(user, "/etc/nos-panel/seed.json"))
+    except ValueError:
+        seed = {}
+    pt.check("its seed names the API on hv0 and its key, and the password's hash",
+             seed.get("host_url") == "%s:%d" % (HV0_IP, PORT) and seed.get("host_pin") == pin
+             and seed.get("password_hash") == password_hash, seed.keys())
+    client_cert = seed.get("client_cert", "")
+    der = ssl.PEM_cert_to_DER_cert(client_cert) if "BEGIN CERTIFICATE" in client_cert else b""
+    pt.check("its client certificate's key is the one let in as panel", der and nc.fingerprint(der) == panel_key,
+             panel_key)
+    server_cert = literal_block(user, "/etc/nos-panel/tls/cert.pem")
+    kept = read_root(tmp, image, "/etc/api/panel.pem")
+    pt.check("its certificate as a server is the one the host keeps, for api panel to show",
+             "BEGIN CERTIFICATE" in server_cert and server_cert.strip() == kept.strip(), kept[:200])
+    why = pem_pair_handshake(tmp, server_cert, literal_block(user, "/etc/nos-panel/tls/key.pem"), client_cert,
+                             seed.get("client_key", ""))
+    pt.check("and OpenSSL takes both as they are, each key its certificate's, in a TLS 1.3 handshake", why is None,
+             why)
+    fetch = [line for line in user.splitlines() if line.startswith("  - [/usr/local/sbin/nos-panel-fetch")]
+    pt.check("it fetches the bundle by its URL, held to its SHA-256",
+             len(fetch) == 1 and "bundle.tar.gz" in fetch[0] and bundle_sha in fetch[0], fetch)
+    toml = read_root(tmp, image, "/etc/api/api.toml")
+    pt.check("api.toml lets the panel's address in on hv0, every line it had kept",
+             'allow_hv0 = ["%s"]' % PANEL_IP in toml and toml.startswith("# api-test.py\nport = %d\n" % PORT)
+             and "max_handshakes = 2" in toml, toml)
+
+
 def x86(args, tmp, k):
-    image = rootfs(tmp, "x86_64", k, rc=True)
+    import hashlib
+    import secrets
     server, port = image_server(tmp)
+    url = "http://10.0.2.2:%d/" % port
+    with open(os.path.join(tmp, "www", "bundle.tar.gz"), "rb") as f:
+        bundle_sha = hashlib.sha256(f.read()).hexdigest()
+    password_hash = scrypt_hash(secrets.token_urlsafe(18))
+    image = rootfs(tmp, "x86_64", k, rc=True, panel=(password_hash, PANEL_RC % (url, url, bundle_sha)))
     log = os.path.join(tmp, "serial.log")
     kvm = os.path.exists("/dev/kvm") and not args.tcg
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", "2",
@@ -730,8 +944,57 @@ def x86(args, tmp, k):
         pin = found.group(1)
         time.sleep(3)
         common(k, pin, "x86_64")
+        panel_key = panel_checks(k, pin, log)
         vm_checks(k, pin, port)
         pt.check("nothing panicked", "PANIC" not in open(log, errors="replace").read())
+        a = client(k, "admin", pin)
+        a.request("POST", "/v1/call/system/power_off")
+        a.close()
+        try:
+            p.wait(120)
+        except subprocess.TimeoutExpired:
+            pass
+        if pt.check("nos powers off, its root written back", p.poll() is not None):
+            panel_files(tmp, image, pin, panel_key, password_hash, bundle_sha)
+        else:
+            return
+
+        # Booted again from the same root: /etc/rc's api panel create finds
+        # the panel's VM there, off, and starts it -- what it does at every
+        # boot after the first
+        log = os.path.join(tmp, "serial2.log")
+        argv[argv.index("-serial") + 1] = "file:" + log
+        p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not pt.check("boots again from the same root", pt.wait_log(log, "api: serving port", 400)):
+            return
+        found = None
+        end = time.time() + 120
+        while time.time() < end and not found:
+            found = re.search(r"api: the panel's VM is there -- being started: job (\d+)",
+                              open(log, errors="replace").read())
+            time.sleep(1)
+        text = open(log, errors="replace").read()
+        pt.check("/etc/rc's api panel create finds the panel's VM there, makes nothing, and starts it",
+                 found and "the panel's VM is being made" not in text,
+                 [line for line in text.splitlines() if "api" in line][-8:])
+        if found:
+            a = client(k, "admin", pin)
+            rec = None
+            end = time.time() + 120
+            while time.time() < end:
+                _, _, rec = a.request("GET", "/v1/jobs/%s" % found.group(1))
+                if rec.get("state") == "done":
+                    break
+                time.sleep(1)
+            pt.check("which starts it: a vm start that ends ok", rec is not None and rec.get("method") == "start"
+                     and rec.get("status") == "ok", rec)
+            a.request("POST", "/v1/call/system/power_off")
+            a.close()
+            try:
+                p.wait(120)
+            except subprocess.TimeoutExpired:
+                pass
+        pt.check("nothing panicked the second time", "PANIC" not in open(log, errors="replace").read())
     finally:
         server.shutdown()
         stop(p)

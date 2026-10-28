@@ -15,7 +15,9 @@
 //!   `disk_add`, `disk_grow`;
 //! - jobs: `start`, `stop`, `restart`, `create` (a cloud's image by its URL:
 //!   the user-data of the caller's own if given -- a job, which only an
-//!   admin starts), `clone`, `delete`. Each says as it goes what the command
+//!   admin starts -- a port of the switch of its own, nos's ports forwarded,
+//!   `protected`, and started once made, as the call asks), `clone`,
+//!   `delete`. Each says as it goes what the command
 //!   would, its progress and whether it is stopped; a cancel -- or the
 //!   module's going -- stops a download, a conversion and a copy where they
 //!   are, what they made taken away.
@@ -532,6 +534,18 @@ fn host(state: &State, p: Params, call: &mut Call) -> Status {
             }
             None => w.null(),
         }
+        /* The host's own address on the switch, what its guests reach nos
+         * at -- the host API on hv0 among it -- and the address each of its
+         * ports gives its VM, by number: a VM with a port of its own
+         * (`port`) has it at every start. The same before the switch is
+         * made, as it is at the first VM's start. */
+        ipv4(w, "host_ip", net::HOST_IP);
+        w.key("port_ips");
+        w.begin_list();
+        for p in 0..net::MAX_PORTS {
+            w.str(&net::dotted(net::port_ip(p)));
+        }
+        w.end_list();
         w.end_object();
     })
 }
@@ -1087,11 +1101,18 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let network = p.opt_str("network", config::NETWORK_NAME_MAX)?;
         let password = p.opt_str("password", cloud::MAX_PASSWORD)?;
         let user_data = p.opt_text("user_data", cloud::MAX_USER_DATA)?;
-        Ok((size, mem, cpus, network, password, user_data))
+        let port = p.opt_uint("port", 0, net::MAX_PORTS as u64 - 1)?;
+        let protected = p.opt_bool("protected")?.unwrap_or(false);
+        let start = p.opt_bool("start")?.unwrap_or(false);
+        Ok((size, mem, cpus, network, password, user_data, port, protected, start))
     })();
-    let (size, mem, cpus, network, password, user_data) = match fields {
+    let (size, mem, cpus, network, password, user_data, port, protected, start) = match fields {
         Ok(f) => f,
         Err(e) => return invalid(call, e),
+    };
+    let forwards = match forwards_param(&mut p, call) {
+        Ok(f) => f,
+        Err(s) => return s,
     };
     if let Err(s) = finish(p, call) {
         return s;
@@ -1103,28 +1124,78 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
     if store::folder_of(&state.vms_root, name).is_ok() {
         return refuse(call, Status::Conflict, &alloc::format!("{} is there already", name), Some("name"));
     }
+    /* What would keep it from starting is said before an image is fetched
+     * for it: a relay of nos's port another VM has now. */
+    if let Some(&(host, _)) = forwards.iter().find(|(host, _)| state.forwards.vm_of(*host).is_some()) {
+        return refuse(call, Status::Conflict, &alloc::format!("nos's port {} is forwarded to another vm now", host),
+                      Some("forwards"));
+    }
+    if start {
+        if let Err(e) = hv::run::ensure_runnable(&state.machine) {
+            return refuse(call, Status::Unsupported, &alloc::format!("no guest can run here -- {}", e), Some("start"));
+        }
+    }
     let o = Options {
         mem_mib: mem,
         cpus: cpus.map(|n| n as u32),
         network: network.map(String::from),
+        port: port.map(|n| n as u32),
+        forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { url, size, password, hvboot: cloud::HVBOOT, user_data };
-    let created = {
-        let mut job = Job::new(call, &state.unloading);
-        cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job)
+    let recipe = cloud::Recipe { url, size, password, hvboot: cloud::HVBOOT, user_data, protected };
+    let mut job = Job::new(call, &state.unloading);
+    let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
+    /* Started once it is made, when asked: by the same job, its reservation
+     * of the name given back by now. */
+    let started = match &created {
+        Ok(_) if start && !job.cancelled() => Some(store::folder_of(&state.vms_root, name).and_then(|folder| {
+            state.vms.start_from(&state.machine, &state.cores, &state.forwards, folder, &mut job)
+        })),
+        _ => None,
     };
-    match created {
-        Ok(c) => answer(call, |w| {
+    drop(job);
+    match (created, started) {
+        (Ok(_), Some(Err(e))) => failed(call, &alloc::format!("{} was made, but did not start -- {}", name, e)),
+        (Ok(c), started) => answer(call, |w| {
             w.begin_object();
             w.field_str("name", name);
             w.field_str("file", &c.file);
             w.field_uint("disk_bytes", c.disk_bytes);
             w.field_uint("keys", c.keys as u64);
+            w.key("port");
+            match port {
+                Some(p) => w.uint(p),
+                None => w.null(),
+            }
+            w.key("id");
+            match started {
+                Some(Ok(id)) => w.uint(u64::from(id)),
+                _ => w.null(),
+            }
             w.end_object();
         }),
-        Err(e) => failed(call, &e),
+        (Err(e), _) => failed(call, &e),
     }
+}
+
+/// `forwards`: nos's ports relayed to the guest's, each `"<nos's>:<the
+/// guest's>"` as vm.toml's `forward` has them.
+fn forwards_param(p: &mut Params, call: &mut Call) -> Result<Vec<(u16, u16)>, Status> {
+    let items = p.list("forwards", forward::MAX_FORWARDS).map_err(|e| invalid(call, e))?;
+    let mut forwards = Vec::new();
+    if forwards.try_reserve_exact(items.len()).is_err() {
+        return Err(refuse(call, Status::Busy, "out of memory", None));
+    }
+    for item in items {
+        let pair = item.as_str().and_then(config::forward);
+        match pair {
+            Some(pair) if !forwards.iter().any(|&(host, _)| host == pair.0) => forwards.push(pair),
+            _ => return Err(refuse(call, Status::Invalid, "is a list of \"<nos's port>:<the guest's>\", each 1..65535 \
+                                                          and each of nos's ports once", Some("forwards"))),
+        }
+    }
+    Ok(forwards)
 }
 
 fn clone(state: &State, mut p: Params, call: &mut Call) -> Status {

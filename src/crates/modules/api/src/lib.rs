@@ -16,13 +16,16 @@
 //! management bus (http.rs has the routes); it runs no command of the
 //! shell's, and no client can make it. Its folder's files are in files.rs;
 //! where it listens, and whom it takes before any of that, is api.toml
-//! (config.rs). docs/api.md has the rest.
+//! (config.rs). `api panel create` makes the management panel, a VM of hv's
+//! that is a client of the API like any other (panel.rs). docs/api.md has
+//! the rest.
 
 extern crate alloc;
 
 mod config;
 mod files;
 mod http;
+mod panel;
 mod server;
 mod stream;
 
@@ -42,7 +45,7 @@ use files::{Client, Dir, Role};
 use http::Ip;
 use server::{Counters, Listening, Locked, Phase, Server, Shared};
 
-const HELP: &str = "api [start | stop | clients | client add|del | reload | cert] - the host API";
+const HELP: &str = "api [start | stop | clients | client add|del | reload | cert | panel] - the host API";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: api                         what it serves, and to whom\n\
@@ -51,8 +54,11 @@ const USAGE: &str = "usage: api                         what it serves, and to w
                      \x20      api clients                 the keys let in\n\
                      \x20      api client add <name> <admin|read> <fingerprint | cert=<file.pem>>\n\
                      \x20      api client del <name>\n\
-                     \x20      api reload                  the clients file read again\n\
-                     \x20      api cert                    the host's certificate, and its key's fingerprint";
+                     \x20      api reload                  the clients file and api.toml's allowlists read again\n\
+                     \x20      api cert                    the host's certificate, and its key's fingerprint\n\
+                     \x20      api panel                   the management panel's VM, and where it is\n\
+                     \x20      api panel create [image=<url>] [bundle=<url> sha256=<hex>] [port=<n>] [memory=<MiB>]\n\
+                     \x20                                  the panel made, and started (at every boot: /etc/rc)";
 
 /// The interfaces a certificate is made for, by name, when they are there.
 const CERT_NICS: [&str; 2] = ["eth0", "hv0"];
@@ -187,6 +193,22 @@ fn status_json(w: &mut kcore::mgmt::Writer, state: &State, sh: Option<&Shared>) 
             w.end_object();
         }
         w.end_list();
+        /* Each interface's allowlist, for those that have one: none, any
+         * address */
+        w.key("allow");
+        w.begin_list();
+        for (nic, nets) in sh.allow.with(|a| a.clone()) {
+            w.begin_object();
+            w.field_str("nic", &nic);
+            w.key("networks");
+            w.begin_list();
+            for c in &nets {
+                w.str(&network(c));
+            }
+            w.end_list();
+            w.end_object();
+        }
+        w.end_list();
         let conns: Vec<(u64, String, u32, u16, bool, String, Option<Role>, u64)> = sh.conns.with(|v| {
             v.iter().map(|c| (c.id, c.nic.clone(), c.ip, c.port, c.phase == Phase::Open, c.name.clone(), c.role,
                               c.since_ns)).collect()
@@ -244,6 +266,7 @@ fn run(state: &State, args: &str, out: &mut Output) -> Result<(), String> {
         },
         Some("reload") => reload(state, out),
         Some("cert") => cert(state, out),
+        Some("panel") => panel::run(state, words, out),
         Some(other) => Err(alloc::format!("what is '{}'?\n{}", other, USAGE)),
     }
 }
@@ -278,7 +301,8 @@ fn start(state: &State, out: &mut Output) -> Result<(), String> {
 }
 
 fn start_locked(state: &State, out: &mut Output) -> Result<(), String> {
-    let config = read_config(&state.dir)?;
+    let mut config = read_config(&state.dir)?;
+    let allow = core::mem::take(&mut config.allow);
     let (identity, made) = state.files.with(|_| files::identity(&state.dir, &cert_ips()))?;
     if made {
         kcore::trace!(0, "api: the host's key made: {}", files::hex(&identity.key_fingerprint));
@@ -289,6 +313,7 @@ fn start_locked(state: &State, out: &mut Output) -> Result<(), String> {
     let shared = Arc::new(Shared {
         stop: AtomicBool::new(false),
         config,
+        allow: Locked::new(allow).ok_or_else(|| String::from("no memory"))?,
         dir: Dir::new(&state.dir.root),
         identity,
         tls: Locked::new(tls).ok_or_else(|| String::from("no memory"))?,
@@ -333,13 +358,26 @@ fn status(state: &State, out: &mut Output) {
                      kcore::time::boot_time_ns().saturating_sub(sh.started_ns) / 1_000_000_000, sh.dir.root, sh.identity.id);
     let _ = writeln!(out, "api: host key {}", files::hex(&sh.identity.key_fingerprint));
     let listeners: Vec<(String, Listening)> = sh.listeners.with(|v| v.clone());
+    let allow = sh.allow.with(|a| a.clone());
     for (nic, l) in &listeners {
         let what = match l {
             Listening::Waiting => "waiting for it",
             Listening::Bound => "listening",
             Listening::Failed => "cannot bind -- trying again",
         };
-        let _ = writeln!(out, "  {}: {}", nic, what);
+        let _ = write!(out, "  {}: {}", nic, what);
+        match allow.iter().find(|(n, _)| n == nic) {
+            Some((_, nets)) => {
+                let _ = write!(out, ", from");
+                for c in nets {
+                    let _ = write!(out, " {}", network(c));
+                }
+                let _ = writeln!(out);
+            }
+            None => {
+                let _ = writeln!(out, ", from anywhere");
+            }
+        }
     }
     let conns: Vec<(u64, String, u32, u16, bool, String, Option<Role>, u64)> = sh.conns.with(|v| {
         v.iter().map(|c| (c.id, c.nic.clone(), c.ip, c.port, c.phase == Phase::Open, c.name.clone(), c.role,
@@ -359,6 +397,12 @@ fn status(state: &State, out: &mut Output) {
     let _ = writeln!(out, "api: handshakes {}, last {} us, slowest {} us, mean {} us", handshakes,
                      get(&c.handshake_us_last), get(&c.handshake_us_max),
                      get(&c.handshake_us_total).checked_div(handshakes).unwrap_or(0));
+}
+
+/// A network of an allowlist, as api.toml would write it.
+fn network(c: &web::cidr::Cidr) -> String {
+    let (net, bits) = c.parts();
+    alloc::format!("{}/{}", Ip(net), bits)
 }
 
 fn clients(state: &State, out: &mut Output) -> Result<(), String> {
@@ -429,10 +473,30 @@ fn client_del(state: &State, name: Option<&str>, out: &mut Output) -> Result<(),
     Ok(())
 }
 
+/// The clients file and api.toml's allowlists read again, and given to the
+/// server if it runs -- the clients from the next handshake on, the
+/// allowlists from the next connection.
 fn reload(state: &State, out: &mut Output) -> Result<(), String> {
     let list = state.files.with(|_| files::read_clients(&state.dir))?;
     apply(state, list, out);
+    let config = read_config(&state.dir)?;
+    apply_allow(state, config, out);
     Ok(())
+}
+
+/// api.toml's allowlists given to the server, if it runs; what else it says
+/// waits for the next start, and is said to.
+fn apply_allow(state: &State, mut config: config::Config, out: &mut Output) {
+    let shared = state.server.with(|s| s.as_ref().map(|s| s.shared.clone()));
+    let Some(sh) = shared else { return };
+    let allow = core::mem::take(&mut config.allow);
+    let lists = allow.len();
+    sh.allow.with(|a| *a = allow);
+    let _ = writeln!(out, "api: {} allowlists from the next connection on", lists);
+    if !sh.config.same_server(&config) {
+        let _ = writeln!(out, "api: api.toml's port, interfaces and limits are taken as it starts -- api stop, api \
+                               start");
+    }
 }
 
 /// A list of clients, given to the server if it runs: from the next

@@ -123,9 +123,10 @@ fn in_folder<'a>(folder: &Folder, path: &'a str) -> Option<&'a str> {
     path.strip_prefix(folder.path.as_str())?.strip_prefix('/').filter(|rest| !rest.is_empty())
 }
 
-/// A port of the switch for the clone: `asked`, or the lowest no VM's
-/// vm.toml under `root` names and no VM on the list holds.
-fn port_for(root: &str, vms: &Vms, asked: Option<u32>) -> Result<u32, String> {
+/// A port of the switch for a clone, or a VM made with one of its own:
+/// `asked`, or the lowest no VM's vm.toml under `root` names and no VM on
+/// the list holds.
+pub fn port_for(root: &str, vms: &Vms, asked: Option<u32>) -> Result<u32, String> {
     let mut used = [false; net::MAX_PORTS];
     for p in vms.ports_held() {
         if let Some(u) = used.get_mut(p) {
