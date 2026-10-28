@@ -5,6 +5,7 @@
 mod disklog;
 mod ext2;
 mod ext2bad;
+mod ext4;
 mod find;
 mod fsops;
 mod nanofs;
@@ -41,6 +42,7 @@ pub static ALL: &[Target] = &[
     Target { name: "disklog", run: audited!(disklog::disklog), max_len: 1024, gate: 5000 },
     Target { name: "ext2", run: audited!(ext2::ext2), max_len: 8192, gate: 5000 },
     Target { name: "ext2bad", run: audited!(ext2bad::ext2bad), max_len: 2048, gate: 10000 },
+    Target { name: "ext4mkfs", run: audited!(ext4::ext4mkfs), max_len: 2048, gate: 300 },
     Target { name: "nanofs", run: audited!(nanofs::nanofs), max_len: 8192, gate: 2000 },
     Target { name: "nanofsbad", run: audited!(nanofs::nanofsbad), max_len: 2048, gate: 5000 },
     Target { name: "vfs", run: audited!(vfs::vfs), max_len: 8192, gate: 4000 },
