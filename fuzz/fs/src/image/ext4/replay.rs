@@ -155,7 +155,14 @@ pub fn replay(img: &mut Media) -> Result<Replayed, String> {
         }
     }
     let needs = rd32(&s, sb::FEATURE_INCOMPAT) & INCOMPAT_RECOVER != 0;
-    if start == 0 || !needs {
+    if !needs {
+        return Ok(done);
+    }
+    if start == 0 {
+        /* Needing recovery with nothing in the log -- a mount that wrote
+         * nothing through its journal yet: e2fsck finds nothing to replay
+         * and clears the flag, and so does this. */
+        recovered(img);
         return Ok(done);
     }
     if start < first || start >= maxlen {
@@ -292,13 +299,19 @@ pub fn replay(img: &mut Media) -> Result<Replayed, String> {
         jbd2::wbe32(&mut j, 0xFC, c);
     }
     img.write(map[0] * bs, &j);
+    recovered(img);
+    Ok(done)
+}
+
+/// The filesystem no longer needing recovery, its superblock's checksum
+/// put right.
+fn recovered(img: &mut Media) {
     let mut s = img.bytes(sb::OFFSET, 1024);
     let features = rd32(&s, sb::FEATURE_INCOMPAT) & !INCOMPAT_RECOVER;
     wr32(&mut s, sb::FEATURE_INCOMPAT, features);
     let c = crc32c(!0, &s[..sb::CHECKSUM]);
     wr32(&mut s, sb::CHECKSUM, c);
     img.write(sb::OFFSET, &s);
-    Ok(done)
 }
 
 fn rd64_be(b: &[u8], at: usize) -> u64 {

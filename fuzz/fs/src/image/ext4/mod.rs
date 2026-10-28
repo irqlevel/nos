@@ -15,6 +15,7 @@
 //! does not show (long names, symlinks, device nodes).
 
 pub mod check;
+pub mod hash;
 pub mod jbd2;
 pub mod mkfs;
 pub mod replay;
@@ -144,6 +145,7 @@ pub mod ino {
     pub const CHECKSUM_HI: usize = 0x82;
     pub const CRTIME: usize = 0x90;
     pub const EXTENTS_FL: u32 = 0x8_0000;
+    pub const INDEX_FL: u32 = 0x1000;
 }
 
 pub const S_IFMT: u16 = 0xF000;

@@ -149,7 +149,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
-| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out -- and a journal debugfs left unreplayed, read through without a byte written |
+| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names changed from the shell -- made, moved, an indexed directory written into, files and a tree removed -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount; and a journal debugfs left unreplayed, read through without a byte written |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
@@ -1078,7 +1078,9 @@ noise where nothing was written, files in extent trees up to four levels
 deep -- deeper than their files need, at times -- with runs of zeros
 allocated as unwritten extents over noise, which must read as zeros, entries
 the kernel's tree leaves out (names of 64 bytes or more, fast and slow
-symlinks, a device node), and a journal: clean, or holding the newest copies
+symlinks, a device node), directories indexed now and then -- an htree of
+one level, each name in the leaf of its half-MD4 hash's range, by a hash of
+the judge's own (`ext4::hash`) -- and a journal: clean, or holding the newest copies
 of some metadata blocks in transactions nobody replayed, their homes given
 noise -- with a noise copy of a block a later transaction revokes, and a
 last transaction never committed, both of which a replay must leave alone.
@@ -1168,14 +1170,41 @@ to the tree `e2fsck -fy` leaves. The targets:
   walk of it all that changes nothing leaving the kernel's heap as it found
   it, nothing read or written once it is unmounted;
 - `ext4mkfs`, `ext4` and `ext4bad`: images of ext4's judge's mkfs -- made
-  and nothing more, for `--e2fsck` to judge; mounted by the ext4 driver,
-  read-only as all it does yet, with the disk's every write a finding, and
-  worked through the VFS, every answer the model's and the whole tree read
-  back at the end, a journal holding the newest copies of blocks whose homes
-  are noise read through so that the tree is still the one mkfs was given;
-  and damaged -- a byte or three of the metadata at the start of the first
-  groups, or of anything else -- refused, or mounted and walked as ext2bad's
-  are, never a panic, a write or a leak;
+  and nothing more, for `--e2fsck` to judge; mounted read-only by the ext4
+  driver, with the disk's every write a finding, and worked through the VFS,
+  every answer the model's and the whole tree read back at the end, a
+  journal holding the newest copies of blocks whose homes are noise read
+  through so that the tree is still the one mkfs was given; and damaged -- a
+  byte or three of the metadata at the start of the first groups, or of
+  anything else -- refused, or mounted and walked as ext2bad's are, never a
+  panic, a write or a leak;
+- `ext4rw`: the same images mounted for writing -- a planted journal
+  replayed by the mount -- and worked with what the driver writes so far,
+  names: files and directories made, a directory grown by a hundred
+  entries, renames and moves, removes, recursive ones among them, now and
+  then a name only the disk has (refused) and an htree directory written
+  into (its index dropped), unmounted and mounted again midway, every answer
+  the model's -- but a refusal for want of an inode or a block, which the
+  model does not count. The image a clean unmount leaves must be clean to the
+  judge, nothing left to replay, and the model's tree. With the power cut at
+  chosen requests, each picture is replayed by the judge's own reader and
+  must be clean to it, then mounted read-only -- the journal read through --
+  and for writing -- the journal replayed -- by the kernel, the three views
+  the same, and what that mount's unmount leaves clean to the judge, its
+  tree what the call in flight may leave: the tree before it or
+  after it, or for a remove, a node at a time, the tree before less some of
+  what was under the path. With requests failing, no call may succeed that
+  the model does not have, nothing may be written in a mount after its first
+  write failed (the journal aborted), and the image, replayed, must be the
+  model's -- or, after a remove that failed, what a remove part way may
+  leave. A filesystem whose journal is 64-bit where the filesystem is not
+  (as `resize2fs -s` leaves one) is among the images: every reader of a
+  revoke record must take its width from the journal. `--e2fsck` holds the
+  clean images to e2fsck -fn and their tree to debugfs's rdump, and every
+  picture, replayed by e2fsck alone (`-E journal_only` without `-f`, which
+  would go on to repair), to e2fsck -fn -- but for the superblock's free
+  counts after a crash, which Linux keeps lazily too, and a lost+found the
+  calls removed, which only e2fsck's convention wants;
 - `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
   and ramfs mounted beside it and taken down again at paths nested,
   doubled, without a slash and too long; tasks of their own at work on those

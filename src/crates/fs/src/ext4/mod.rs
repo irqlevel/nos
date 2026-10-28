@@ -1,9 +1,10 @@
-//! ext4, read-only for now: the format through extfmt, every checksum on
-//! what is read held to the one it should be, and a journal nobody
-//! replayed read through rather than replayed (journal.rs) -- so that a
-//! mount writes nothing. Writing, through the journal, is the next step
-//! (docs/filesystems.md, "ext4"); until then every filesystem this mounts
-//! is mounted read-only, whatever was asked.
+//! ext4: the format through extfmt, every checksum on what is read held to
+//! the one it should be -- and metadata written only through the journal,
+//! one transaction a call (txn.rs, journal.rs). A mount that only reads
+//! writes nothing: a journal nobody replayed is read through, not replayed.
+//! A mount that writes replays it first, says the filesystem needs
+//! recovery before anything else is written, and clears that only at a
+//! clean unmount, once a checkpoint has put everything home.
 //!
 //! What is refused, read-only or written is extfmt's `features::classify`;
 //! what is checked of the geometry past what extfmt checks is here, so
@@ -12,76 +13,67 @@
 //! them, all or nothing, as ext2's are; an htree directory is read as the
 //! linear one it also is, its index blocks checked by their own tails.
 //! Names of 64 bytes or more, symlinks and device nodes are left out of
-//! the tree, as ext2 leaves them.
+//! the tree, as ext2 leaves them -- and a directory holding any is never
+//! removed. What is written so far: names -- files and directories made,
+//! renamed, removed; a file's data is the next step.
 
+mod bitmaps;
+mod cache;
+mod dirs;
+mod extents;
+mod inodes;
+mod io;
 mod journal;
+mod meta;
+mod ops;
+mod source;
+mod txn;
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use block::Disk;
-use extfmt::features::{self, ro_compat, Support};
-use extfmt::group::{self, Desc, INODE_UNINIT};
-use extfmt::inode::{self as xinode, Inode, EXTENTS_FL, INDEX_FL, S_IFDIR, S_IFREG};
-use extfmt::sb::{Super, DESC_SIZE_64};
-use extfmt::{blockmap, dir, extent, Map};
+use extfmt::dir;
+use extfmt::features::{self, incompat, Support};
+use extfmt::inode::{Inode, INDEX_FL, S_IFDIR, S_IFREG};
+use extfmt::sb::{Super, DESC_SIZE_64, STATE_ERROR, STATE_VALID};
+use extfmt::{group, Map};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
+use kcore::time::wall_clock_secs;
 use kcore::trace;
 
 use crate::vfs::FileSystem;
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
+use cache::Cache;
+use io::Io;
+use journal::{Journal, Opened, Overlay};
+use meta::Meta;
+use source::{Reader, Source};
+
 const ROOT_INO: u32 = 2;
 
-/// The device, by blocks: every read through one page the device may DMA
-/// into, held to the filesystem's bounds.
-struct Io {
-    dev: Disk,
-    bs: usize,
-    sector_size: usize,
-    blocks: u64,
-    scratch: DmaBuffer,
-}
-
-impl Io {
-    /// Block `block` into `out`, a block long.
-    fn read(&mut self, block: u64, out: &mut [u8]) -> bool {
-        if block >= self.blocks {
-            trace!(0, "ext4: a read of block {}, past the filesystem's {}", block, self.blocks);
-            return false;
-        }
-        let sector = block * (self.bs / self.sector_size) as u64;
-        let buf = &mut self.scratch.as_mut_slice()[..self.bs];
-        if self.dev.read(sector, buf).is_err() {
-            trace!(0, "ext4: block {} does not read", block);
-            return false;
-        }
-        out[..self.bs].copy_from_slice(buf);
-        true
-    }
-}
+/// The superblock's error fields -- the count and the first and last
+/// errors -- which a replay must not take back to what the journal's copy
+/// had (`EXT4_S_ERR_START`, `EXT4_S_ERR_LEN`).
+const ERR_FIELDS: core::ops::Range<usize> = 0x194..0x200;
 
 pub struct Ext4 {
     io: Io,
-    sb: Option<Super>,
-    seed: u32,
-    csum: bool,
-    /// Whether descriptors' uninit flags mean anything: with metadata_csum
-    /// or gdt_csum.
-    uninit: bool,
-    gdt: Vec<u8>,
-    groups: u64,
-    desc_size: usize,
-    inode_size: usize,
-    ipg: u32,
+    m: Option<Meta>,
+    cache: Cache,
+    jnl: Option<Journal>,
+    overlay: Overlay,
     tree: Tree,
     root: Option<NodeId>,
     mounted: bool,
-    overlay: journal::Overlay,
-    /// The inode table block last read, and its bytes.
-    itab: Option<(u64, Vec<u8>)>,
+    read_only: bool,
+    /// Per directory inode read, the entries of it the tree leaves out.
+    hidden: BTreeMap<u32, u32>,
 }
 
 /// The superblock off a device: the sectors that hold its 1024 bytes.
@@ -117,42 +109,44 @@ pub fn probe_super(dev: &Disk) -> Option<Super> {
 
 impl Ext4 {
     pub fn new(dev: Disk) -> Option<Ext4> {
-        let sector_size = dev.sector_size() as usize;
-        if sector_size == 0 || sector_size > PAGE_SIZE {
-            return None;
-        }
         Some(Ext4 {
-            io: Io { dev, bs: 0, sector_size, blocks: 0, scratch: DmaBuffer::new(1)? },
-            sb: None,
-            seed: 0,
-            csum: false,
-            uninit: false,
-            gdt: Vec::new(),
-            groups: 0,
-            desc_size: 0,
-            inode_size: 0,
-            ipg: 0,
+            io: Io::new(dev)?,
+            m: None,
+            cache: Cache::new(),
+            jnl: None,
+            overlay: Overlay::new(),
             tree: Tree::new(),
             root: None,
             mounted: false,
-            overlay: journal::Overlay::new(),
-            itab: None,
+            read_only: true,
+            hidden: BTreeMap::new(),
         })
     }
 
-    /// Block `b`: its newest copy, in a journal nobody replayed if it is
-    /// there, else its home.
-    fn block(&mut self, b: u64, out: &mut [u8]) -> bool {
-        if let Some(&(copy, escaped)) = self.overlay.get(&b) {
-            if !self.io.read(copy, out) {
-                return false;
-            }
-            if escaped {
-                out[..4].copy_from_slice(&extfmt::jbd2::MAGIC.to_be_bytes());
-            }
-            return true;
-        }
-        self.io.read(b, out)
+    fn reader(&mut self) -> Option<Reader<'_>> {
+        Some(Reader { io: &mut self.io, cache: &mut self.cache, overlay: &self.overlay, m: self.m.as_ref()? })
+    }
+
+    fn inode(&mut self, ino: u32) -> Option<Vec<u8>> {
+        source::inode(&mut self.reader()?, ino)
+    }
+
+    fn map(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
+        source::map(&mut self.reader()?, ino, raw, lblock)
+    }
+
+    /// Metadata block `b`, as a read sees it.
+    fn meta_block(&mut self, b: u64, out: &mut [u8]) -> bool {
+        self.reader().is_some_and(|mut r| r.block(b, out))
+    }
+
+    /// A file's data block `b`: what a read sees of it, kept nowhere.
+    fn data_block(&mut self, b: u64, out: &mut [u8]) -> bool {
+        source::read_block(&mut self.io, &mut self.cache, &self.overlay, b, out, false)
+    }
+
+    fn largedir(&self) -> bool {
+        self.m.as_ref().is_some_and(|m| m.largedir())
     }
 
     /// What the driver requires of a superblock past what extfmt does: a
@@ -167,7 +161,7 @@ impl Ext4 {
             "a block size this cannot read"
         } else if sb.blocks_count() > device {
             "more blocks than the device has"
-        } else if bpg > 8 * bs || ipg > 8 * bs || u64::from(sb.clusters_per_group()) != bpg {
+        } else if bpg > 8 * bs || ipg > 8 * bs || u64::from(sb.clusters_per_group()) != bpg || ipg == 0 || bpg == 0 {
             "groups more than their bitmaps cover"
         } else if sb.group_count().checked_mul(ipg) != Some(u64::from(sb.inodes_count())) {
             "an inode count that is not the groups'"
@@ -186,42 +180,37 @@ impl Ext4 {
         false
     }
 
-    fn desc(&self, group: u64) -> Option<Desc<'_>> {
-        let at = (group as usize).checked_mul(self.desc_size)?;
-        Desc::new(self.gdt.get(at..at + self.desc_size)?)
-    }
-
-    /// The descriptors, read and held to their checksums and to the
-    /// filesystem: every group's bitmaps and table inside it.
-    fn read_descriptors(&mut self, sb: &Super) -> bool {
-        let bs = self.io.bs;
-        let bytes = (self.groups as usize).saturating_mul(self.desc_size);
-        let gdt_blocks = bytes.div_ceil(bs);
+    /// The descriptors into `m`, read -- through the overlay -- and held to
+    /// their checksums and to the filesystem: every group's bitmaps and
+    /// table inside it.
+    fn read_descriptors(&mut self, m: &mut Meta) -> bool {
+        let bs = m.bs;
+        let gdt_blocks = m.gdt_len() as usize;
         let mut gdt = Vec::new();
         if gdt.try_reserve_exact(gdt_blocks * bs).is_err() {
             trace!(0, "ext4: no memory for {} bytes of descriptors", gdt_blocks * bs);
             return false;
         }
         gdt.resize(gdt_blocks * bs, 0);
-        let first = u64::from(sb.first_data_block()) + 1;
+        let mut blk = vec![0u8; bs];
         for k in 0..gdt_blocks {
-            let mut blk = vec![0u8; bs];
-            if !self.block(first + k as u64, &mut blk) {
+            if !source::read_block(&mut self.io, &mut self.cache, &self.overlay, m.gdt_first() + k as u64, &mut blk,
+                false) {
                 return false;
             }
             gdt[k * bs..(k + 1) * bs].copy_from_slice(&blk);
         }
-        self.gdt = gdt;
-        let table_blocks = u64::from(sb.inodes_per_group()) * sb.inode_size() / bs as u64;
-        for g in 0..self.groups {
-            let Some(d) = self.desc(g) else { return false };
-            if let Some(c) = group::desc_csum(sb, g as u32, d.raw()) {
+        m.gdt = gdt;
+        let table_blocks = m.table_blocks();
+        for g in 0..m.groups {
+            let Some(d) = m.desc(g) else { return false };
+            if let Some(c) = group::desc_csum(&m.sb, g as u32, d.raw()) {
                 if c != d.checksum() {
                     trace!(0, "ext4: refused: group {}'s descriptor fails its checksum", g);
                     return false;
                 }
             }
-            let inside = |b: u64, n: u64| b > u64::from(sb.first_data_block()) && b.checked_add(n).is_some_and(|e| e <= self.io.blocks);
+            let inside = |b: u64, n: u64| b > m.first_data && b.checked_add(n).is_some_and(|e| e <= m.blocks);
             if !inside(d.block_bitmap(), 1) || !inside(d.inode_bitmap(), 1) || !inside(d.inode_table(), table_blocks) {
                 trace!(0, "ext4: refused: group {}'s bitmaps or table outside the filesystem", g);
                 return false;
@@ -230,161 +219,276 @@ impl Ext4 {
         true
     }
 
-    pub fn mount(&mut self, read_only: bool) -> bool {
-        let _ = read_only;
-        let Some(sb) = read_super(&self.io.dev, &mut self.io.scratch) else { return false };
-        match features::classify(&sb) {
-            Support::Refused(why) => {
-                trace!(0, "ext4: refused: {}", why);
-                return false;
-            }
-            Support::ReadOnly(why) => trace!(0, "ext4: read-only: {}", why),
-            Support::Writable => {}
-        }
-        if !self.check_super(&sb) {
-            return false;
+    /// The superblock and the descriptors, read and held to the device: a
+    /// Meta, or None, the reason said.
+    fn load(&mut self, sb: &Super) -> Option<Meta> {
+        if !self.check_super(sb) {
+            return None;
         }
         self.io.bs = sb.block_size() as usize;
         self.io.blocks = sb.blocks_count();
-        self.seed = sb.csum_seed();
-        self.csum = sb.metadata_csum();
-        self.uninit = self.csum || sb.ro_compat() & ro_compat::GDT_CSUM != 0;
-        self.groups = sb.group_count();
-        self.desc_size = sb.desc_size() as usize;
-        self.inode_size = sb.inode_size() as usize;
-        self.ipg = sb.inodes_per_group();
-        self.overlay.clear();
-        self.itab = None;
-        if !self.read_descriptors(&sb) {
-            return false;
-        }
-        self.sb = Some(sb.clone());
-        if sb.compat() & features::compat::HAS_JOURNAL != 0 {
-            match journal::overlay(self, &sb) {
-                Ok(o) => self.overlay = o,
-                Err(e) => {
-                    trace!(0, "ext4: refused: the journal: {}", e);
-                    return false;
-                }
-            }
-            /* The superblock and descriptors as the journal has them, if it
-             * has newer copies: as a replay would have left them. */
-            let first = u64::from(sb.first_data_block());
-            let gdt_blocks = (self.groups as usize * self.desc_size).div_ceil(self.io.bs) as u64;
-            if (first..=first + gdt_blocks).any(|b| self.overlay.contains_key(&b)) {
-                let mut blk = vec![0u8; self.io.bs];
-                let at = extfmt::sb::OFFSET as usize % self.io.bs;
-                if !self.block(first, &mut blk) {
-                    return false;
-                }
-                let newer = match Super::parse(&blk[at..at + extfmt::sb::SIZE]) {
-                    Ok(s) if s.blocks_count() == sb.blocks_count() && s.inodes_count() == sb.inodes_count()
-                        && s.block_size() == sb.block_size() && s.checksum_ok() => s,
-                    _ => {
-                        trace!(0, "ext4: refused: the journal's superblock is not this filesystem's");
-                        return false;
-                    }
-                };
-                self.itab = None;
-                if !self.read_descriptors(&newer) {
-                    return false;
-                }
-                self.sb = Some(newer);
-            }
-        }
-        let Some(raw) = self.inode(ROOT_INO) else { return false };
-        if Inode::new(&raw).is_none_or(|i| !i.is_dir()) {
-            trace!(0, "ext4: refused: the root is not a directory");
-            return false;
-        }
-        self.tree.clear();
-        self.root = self.new_vnode(None, b"", Kind::Dir, ROOT_INO, 0);
-        if self.root.is_none() {
-            return false;
-        }
-        self.mounted = true;
-        true
+        let mut m = Meta::new(sb);
+        self.read_descriptors(&mut m).then_some(m)
     }
 
-    pub fn unmount(&mut self) {
+    /// The superblock in the journal's newer copy of it, where a read-only
+    /// mount's overlay has one: the filesystem as a replay would leave it.
+    fn reload_through_overlay(&mut self, sb: &Super) -> Option<Meta> {
+        let m = self.m.as_ref()?;
+        let (first, last) = (m.sb_block(), m.gdt_first() + m.gdt_len());
+        if !(first..last).any(|b| self.overlay.contains_key(&b)) {
+            return self.m.take();
+        }
+        let at = m.sb_at();
+        let mut blk = vec![0u8; self.io.bs];
+        if !source::read_block(&mut self.io, &mut self.cache, &self.overlay, first, &mut blk, false) {
+            return None;
+        }
+        let newer = match Super::parse(&blk[at..at + extfmt::sb::SIZE]) {
+            Ok(s) if s.blocks_count() == sb.blocks_count() && s.inodes_count() == sb.inodes_count()
+                && s.block_size() == sb.block_size() && s.checksum_ok() => s,
+            _ => {
+                trace!(0, "ext4: refused: the journal's superblock is not this filesystem's");
+                return None;
+            }
+        };
+        let mut m = Meta::new(&newer);
+        self.read_descriptors(&mut m).then_some(m)
+    }
+
+    /// The superblock as it is now, onto its block on the device and past
+    /// the device's cache.
+    fn write_super(&mut self) -> bool {
+        let Some(m) = self.m.as_mut() else { return false };
+        m.sb.set_checksum();
+        let (b, at) = (m.sb_block(), m.sb_at());
+        let raw = *m.sb.raw();
+        let mut blk = vec![0u8; self.io.bs];
+        if !source::read_block(&mut self.io, &mut self.cache, &self.overlay, b, &mut blk, false) {
+            return false;
+        }
+        blk[at..at + extfmt::sb::SIZE].copy_from_slice(&raw);
+        self.cache.forget(b);
+        self.io.write(b, &blk, true)
+    }
+
+    /// Mount: read-only when asked or when the filesystem says so -- the
+    /// reason said -- else for writing. Some(whether read-only), or None.
+    pub fn mount(&mut self, read_only: bool) -> Option<bool> {
+        self.reset();
+        let sb = read_super(&self.io.dev, &mut self.io.scratch)?;
+        let mut ro_why: Option<String> = read_only.then(|| String::from("asked"));
+        match features::classify(&sb) {
+            Support::Refused(why) => {
+                trace!(0, "ext4: refused: {}", why);
+                return None;
+            }
+            Support::ReadOnly(why) => {
+                ro_why.get_or_insert_with(|| String::from(why));
+            }
+            Support::Writable => {}
+        }
+        if sb.state() & STATE_ERROR != 0 {
+            ro_why.get_or_insert_with(|| String::from("the filesystem says it has errors (e2fsck it)"));
+        } else if sb.state() & STATE_VALID == 0 {
+            ro_why.get_or_insert_with(|| String::from("the filesystem is not marked valid (e2fsck it)"));
+        }
+        self.m = Some(self.load(&sb)?);
+        let has_journal = sb.compat() & features::compat::HAS_JOURNAL != 0;
+        let mut journal_map: Vec<u64> = Vec::new();
+        if has_journal {
+            journal_map = match journal::blocks(&mut self.reader()?, &sb) {
+                Ok(map) => map,
+                Err(e) => {
+                    trace!(0, "ext4: refused: the journal: {}", e);
+                    return None;
+                }
+            };
+        }
+        if has_journal && ro_why.is_none() {
+            /* The log is written over the journal's blocks, and a replay
+             * writes too: none of them may be the filesystem's own
+             * metadata. */
+            let Some(m) = self.m.as_mut() else { return None };
+            if !m.build_system_zone(&[]) {
+                trace!(0, "ext4: no memory for the system zone");
+                self.reset();
+                return None;
+            }
+            if let Some(&b) = journal_map.iter().find(|&&b| m.in_system(b)) {
+                trace!(0, "ext4: refused: the journal's block {} is the filesystem's own metadata", b);
+                self.reset();
+                return None;
+            }
+            self.io.writable = true;
+            let errors: Vec<u8> = sb.raw()[ERR_FIELDS].to_vec();
+            match Journal::open(&mut self.io, journal_map.clone(), &sb) {
+                Err(e) => {
+                    trace!(0, "ext4: refused: the journal: {}", e);
+                    self.io.writable = false;
+                    return None;
+                }
+                Ok(Opened::ReadOnly(why)) => {
+                    self.io.writable = false;
+                    ro_why = Some(why);
+                }
+                Ok(Opened::Ready(jnl, replayed)) => {
+                    self.jnl = Some(jnl);
+                    if replayed {
+                        /* What the replay left, the error fields as they
+                         * were before it. */
+                        self.cache.clear();
+                        let mut newer = read_super(&self.io.dev, &mut self.io.scratch)?;
+                        newer.raw_mut()[ERR_FIELDS].copy_from_slice(&errors);
+                        if newer.blocks_count() != sb.blocks_count() || newer.inodes_count() != sb.inodes_count()
+                            || newer.block_size() != sb.block_size()
+                            || features::classify(&newer) != Support::Writable {
+                            trace!(0, "ext4: refused: the replayed superblock is another filesystem's");
+                            self.reset();
+                            return None;
+                        }
+                        newer.set_checksum();
+                        let Some(m) = self.load(&newer) else {
+                            self.reset();
+                            return None;
+                        };
+                        self.m = Some(m);
+                    }
+                }
+            }
+        }
+        if ro_why.is_none() && self.m.as_ref().is_some_and(|m| m.sb.last_orphan() != 0) {
+            ro_why = Some(String::from("orphans to release, which this does not do yet"));
+            self.jnl = None;
+            self.io.writable = false;
+        }
+        if let Some(why) = &ro_why {
+            if why != "asked" {
+                trace!(0, "ext4: read-only: {}", why);
+            }
+            if has_journal && self.jnl.is_none() {
+                match journal::overlay(&mut self.io, &journal_map, &sb) {
+                    Ok(o) => self.overlay = o,
+                    Err(e) => {
+                        trace!(0, "ext4: refused: the journal: {}", e);
+                        self.reset();
+                        return None;
+                    }
+                }
+                let m = self.reload_through_overlay(&sb);
+                let Some(m) = m else {
+                    self.reset();
+                    return None;
+                };
+                self.m = Some(m);
+            }
+        } else {
+            let now = wall_clock_secs() as u32;
+            let Some(m) = self.m.as_mut() else { return None };
+            if !m.build_system_zone(&journal_map) {
+                trace!(0, "ext4: no memory for the system zone");
+                self.reset();
+                return None;
+            }
+            /* Needing recovery, on the medium, before the journal is
+             * written at all. */
+            let incompat_now = m.sb.incompat() | incompat::RECOVER;
+            m.sb.set_incompat(incompat_now);
+            m.sb.set_mtime(now);
+            let count = m.sb.mnt_count();
+            m.sb.set_mnt_count(count.wrapping_add(1));
+            if !self.write_super() {
+                trace!(0, "ext4: refused: the superblock does not write");
+                self.reset();
+                return None;
+            }
+        }
+        self.read_only = ro_why.is_some();
+        let Some(raw) = self.inode(ROOT_INO) else {
+            self.reset();
+            return None;
+        };
+        if Inode::new(&raw).is_none_or(|i| !i.is_dir()) {
+            trace!(0, "ext4: refused: the root is not a directory");
+            self.reset();
+            return None;
+        }
+        self.root = self.new_vnode(None, b"", Kind::Dir, ROOT_INO, 0);
+        if self.root.is_none() {
+            self.reset();
+            return None;
+        }
+        self.mounted = true;
+        Some(self.read_only)
+    }
+
+    /// Everything a mount set up, gone -- nothing written.
+    fn reset(&mut self) {
         self.tree.clear();
         self.root = None;
         self.overlay.clear();
-        self.gdt = Vec::new();
-        self.itab = None;
+        self.cache.clear();
+        self.hidden.clear();
+        self.jnl = None;
+        self.m = None;
+        self.io.writable = false;
         self.mounted = false;
+        self.read_only = true;
     }
 
-    /// Inode `ino`'s bytes: None for one outside the filesystem, in a part
-    /// of an inode table never written, or failing its checksum -- each
-    /// said.
-    fn inode(&mut self, ino: u32) -> Option<Vec<u8>> {
-        let count = self.sb.as_ref()?.inodes_count();
-        if ino == 0 || ino > count {
-            trace!(0, "ext4: inode {} of {}", ino, count);
-            return None;
-        }
-        let (group, index) = (u64::from((ino - 1) / self.ipg), (ino - 1) % self.ipg);
-        let (flags, unused, table) = self.desc(group).map(|d| (d.flags(), d.itable_unused(), d.inode_table()))?;
-        if self.uninit && (flags & INODE_UNINIT != 0 || index >= self.ipg.saturating_sub(unused)) {
-            trace!(0, "ext4: inode {} is in a part of its group's table never written", ino);
-            return None;
-        }
-        let at = u64::from(index) * self.inode_size as u64;
-        let block = table + at / self.io.bs as u64;
-        let within = (at % self.io.bs as u64) as usize;
-        if self.itab.as_ref().is_none_or(|(b, _)| *b != block) {
-            let mut blk = vec![0u8; self.io.bs];
-            if !self.block(block, &mut blk) {
-                return None;
+    /// A clean unmount, for a mount that wrote: everything committed home,
+    /// the log empty, and the filesystem no longer needing recovery -- its
+    /// free counts the groups' -- each forced to the medium. After an abort
+    /// nothing at all: the journal is left for a replay.
+    pub fn unmount(&mut self) {
+        if self.mounted && !self.read_only {
+            let closed = match self.jnl.as_mut() {
+                Some(j) => j.close(&mut self.io, &mut self.cache),
+                None => false,
+            };
+            if closed {
+                if let Some(m) = self.m.as_mut() {
+                    let (mut blocks, mut inodes) = (0u64, 0u64);
+                    for g in 0..m.groups {
+                        if let Some(d) = m.desc(g) {
+                            blocks += u64::from(d.free_blocks_count());
+                            inodes += u64::from(d.free_inodes_count());
+                        }
+                    }
+                    m.sb.set_free_blocks_count(blocks);
+                    m.sb.set_free_inodes_count(inodes as u32);
+                    let incompat_now = m.sb.incompat() & !incompat::RECOVER;
+                    m.sb.set_incompat(incompat_now);
+                    m.sb.set_wtime(wall_clock_secs() as u32);
+                }
+                if !self.write_super() {
+                    trace!(0, "ext4: the superblock does not write at the unmount: left needing recovery");
+                }
+            } else {
+                trace!(0, "ext4: unmounted with the journal aborted: left for a replay");
             }
-            self.itab = Some((block, blk));
         }
-        let raw = self.itab.as_ref()?.1.get(within..within + self.inode_size)?.to_vec();
-        let zero = raw[..xinode::GOOD_OLD_SIZE].iter().all(|&b| b == 0);
-        if self.csum && !zero && !xinode::csum_matches(self.seed, ino, &raw) {
-            trace!(0, "ext4: inode {} fails its checksum", ino);
-            return None;
-        }
-        Some(raw)
+        self.reset();
     }
 
-    fn largedir(&self) -> bool {
-        self.sb.as_ref().is_some_and(|s| s.largedir())
-    }
-
-    /// Where block `lblock` of the file inode `ino` (`raw`) is: through its
-    /// extent tree, every node of it held to its checksum, or its block map.
-    fn map(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
-        let node = Inode::new(raw)?;
-        let iseed = xinode::seed(self.seed, ino, node.generation());
-        let (fs_blocks, bs, csum) = (self.io.blocks, self.io.bs, self.csum);
-        let extents = node.flags() & EXTENTS_FL != 0;
-        let mut read = |b: u64, buf: &mut [u8]| {
-            if !self.block(b, buf) {
-                return Err(alloc::format!("block {} does not read", b));
-            }
-            if csum && extents && extent::stored_csum(buf).zip(extent::node_csum(iseed, buf)).is_none_or(|(s, c)| s != c) {
-                return Err(alloc::format!("inode {}'s extent block {} fails its checksum", ino, b));
-            }
-            Ok(())
-        };
-        let mapped = if extents {
-            extent::map(node.i_block(), lblock, fs_blocks, bs, ino, &mut read)
-        } else {
-            blockmap::map(node.i_block(), lblock, bs, ino, &mut read)
-        };
-        match mapped {
-            Ok(Map::Blocks { block, run }) if block.checked_add(run).is_none_or(|e| e > fs_blocks) => {
-                trace!(0, "ext4: inode {}: blocks {}..+{} past the filesystem", ino, block, run);
-                None
-            }
-            Ok(m) => Some(m),
-            Err(e) => {
-                trace!(0, "ext4: {}", e);
-                None
-            }
+    pub fn sync(&mut self) -> bool {
+        if !self.mounted || self.read_only {
+            return true;
         }
+        if self.jnl.as_ref().is_none_or(|j| j.aborted) {
+            trace!(0, "ext4: the journal is aborted: nothing is synced");
+            return false;
+        }
+        /* Every commit is on the medium already: its blocks flushed, its
+         * commit block forced. A flush the device fails is one whose order
+         * nothing after it can count on: the journal aborts. */
+        if self.io.flush() {
+            return true;
+        }
+        if let Some(j) = self.jnl.as_mut() {
+            j.abort("the device does not flush");
+        }
+        false
     }
 
     fn new_vnode(&mut self, parent: Option<NodeId>, name: &[u8], kind: Kind, ino: u32, size: usize) -> Option<NodeId> {
@@ -432,10 +536,12 @@ impl Ext4 {
             trace!(0, "ext4: inode {} is not a directory", ino);
             return false;
         }
-        let iseed = xinode::seed(self.seed, ino, node.generation());
+        let Some(seed) = self.m.as_ref().map(|m| m.seed) else { return false };
+        let iseed = extfmt::inode::seed(seed, ino, node.generation());
         let indexed = node.flags() & INDEX_FL != 0;
         let bs = self.io.bs as u64;
         let blocks = node.size(self.largedir()).div_ceil(bs);
+        self.hidden.insert(ino, 0);
         let mut lblock = 0u64;
         let mut blk = vec![0u8; self.io.bs];
         while lblock < blocks {
@@ -444,7 +550,7 @@ impl Ext4 {
                 Some(Map::Hole { run }) => lblock = lblock.saturating_add(run.max(1)),
                 Some(Map::Blocks { block, run }) => {
                     for k in 0..run.min(blocks - lblock) {
-                        if !self.block(block + k, &mut blk) || !self.dir_block(dir, ino, iseed, indexed, lblock + k, &blk) {
+                        if !self.meta_block(block + k, &mut blk) || !self.dir_block(dir, ino, iseed, indexed, lblock + k, &blk) {
                             return false;
                         }
                     }
@@ -459,7 +565,7 @@ impl Ext4 {
     /// block's tail, or a leaf's -- and its entries adopted.
     fn dir_block(&mut self, dir: NodeId, ino: u32, iseed: u32, indexed: bool, lblock: u64, blk: &[u8]) -> bool {
         let spans = extfmt::le32(blk, 0) == 0 && dir::rec_len_from_disk(extfmt::le16(blk, 4), blk.len()) == blk.len();
-        if self.csum {
+        if self.m.as_ref().is_some_and(|m| m.csum) {
             let ok = if indexed && (lblock == 0 || spans) {
                 dir::dx_csum(iseed, blk).is_some_and(|(s, c)| s == c)
             } else {
@@ -487,32 +593,41 @@ impl Ext4 {
         for (name, child, file_type) in entries {
             if name.len() >= NAME_MAX {
                 trace!(0, "ext4: a name of {} bytes in directory {} is too long, skipped", name.len(), ino);
+                self.hide(ino);
                 continue;
             }
-            if !self.adopt(dir, &name, child, file_type) {
-                return false;
+            match self.adopt(dir, &name, child, file_type) {
+                Some(true) => {}
+                Some(false) => self.hide(ino),
+                None => return false,
             }
         }
         true
     }
 
-    /// A vnode for one entry, if it names a file or a directory: what else
-    /// it names, and an inode that does not read, are left out (the latter
-    /// said). False only when there is no memory for it.
-    fn adopt(&mut self, dir: NodeId, name: &[u8], ino: u32, file_type: u8) -> bool {
+    /// One more entry of directory `ino` the tree leaves out.
+    fn hide(&mut self, ino: u32) {
+        *self.hidden.entry(ino).or_insert(0) += 1;
+    }
+
+    /// A vnode for one entry, if it names a file or a directory: Some(true)
+    /// when one is made, Some(false) when the entry is left out -- one that
+    /// names something else, or an inode that does not read (said) -- and
+    /// None when there is no memory for it.
+    fn adopt(&mut self, dir: NodeId, name: &[u8], ino: u32, file_type: u8) -> Option<bool> {
         if file_type != dir::FT_REG_FILE && file_type != dir::FT_DIR && file_type != dir::FT_UNKNOWN {
-            return true;
+            return Some(false);
         }
         let Some(raw) = self.inode(ino) else {
             trace!(0, "ext4: an entry of directory {} names inode {}, which does not read: skipped",
                 self.tree[dir].ino, ino);
-            return true;
+            return Some(false);
         };
-        let Some(node) = Inode::new(&raw) else { return true };
+        let Some(node) = Inode::new(&raw) else { return Some(false) };
         let kind = match node.file_type() {
             S_IFDIR => Kind::Dir,
             S_IFREG => Kind::File,
-            _ => return true,
+            _ => return Some(false),
         };
         if kind == Kind::Dir {
             /* An entry leading back up the tree is a cycle in the image. */
@@ -520,13 +635,13 @@ impl Ext4 {
             while let Some(at) = up {
                 if self.tree[at].ino == ino as usize {
                     trace!(0, "ext4: an entry of inode {} is an ancestor, skipped", self.tree[dir].ino);
-                    return true;
+                    return Some(false);
                 }
                 up = self.tree[at].parent();
             }
         }
         let size = usize::try_from(node.size(self.largedir())).unwrap_or(usize::MAX);
-        self.new_vnode(Some(dir), name, kind, ino, size).is_some()
+        self.new_vnode(Some(dir), name, kind, ino, size).map(|_| true)
     }
 
     pub fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
@@ -563,7 +678,7 @@ impl Ext4 {
                     pos += n as u64;
                 }
                 Some(Map::Blocks { block, .. }) => {
-                    if !self.block(block, &mut blk) {
+                    if !self.data_block(block, &mut blk) {
                         return false;
                     }
                     let n = (self.io.bs - within).min((end - pos) as usize);
@@ -605,8 +720,8 @@ impl FileSystem for Ext4 {
 
     fn info(&self, out: &mut dyn core::fmt::Write) {
         let _ = out.write_str(self.io.dev.name());
-        if let Some(sb) = &self.sb {
-            let label = sb.volume_name();
+        if let Some(m) = &self.m {
+            let label = m.sb.volume_name();
             let end = label.iter().position(|b| *b == 0).unwrap_or(label.len());
             if let Ok(label) = core::str::from_utf8(&label[..end]) {
                 if !label.is_empty() {
@@ -617,15 +732,22 @@ impl FileSystem for Ext4 {
         if !self.overlay.is_empty() {
             let _ = write!(out, " journal-not-replayed={}", self.overlay.len());
         }
+        if let Some(j) = &self.jnl {
+            if j.aborted {
+                let _ = out.write_str(" journal-aborted");
+            } else {
+                let (used, ring, seq) = j.info();
+                let _ = write!(out, " journal={}/{} seq={}", used, ring, seq);
+            }
+        }
     }
 
     fn device(&self) -> usize {
         self.io.dev.handle()
     }
 
-    /// Read-only, whatever was asked: this driver does not write yet.
     fn mount(&mut self, read_only: bool) -> Option<bool> {
-        if Ext4::mount(self, read_only) { Some(true) } else { None }
+        Ext4::mount(self, read_only)
     }
 
     fn unmount(&mut self) {
@@ -652,32 +774,44 @@ impl FileSystem for Ext4 {
         Ext4::lookup(self, dir, name)
     }
 
-    fn create_file(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
-        None
+    fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        self.create(dir, name, false)
     }
 
-    fn create_dir(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
-        None
+    fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        self.create(dir, name, true)
     }
 
     fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
         Ext4::read(self, file, buf, offset)
     }
 
+    /// Not yet: a file's data is the step after names.
     fn write(&mut self, _file: NodeId, _data: &[u8], _offset: usize) -> bool {
+        trace!(0, "ext4: a file's data is not written yet");
         false
     }
 
-    fn truncate(&mut self, _file: NodeId, _size: usize) -> bool {
+    /// Only to the size the file has: cutting or growing one is the step
+    /// after names.
+    fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        if self.tree.get(file).is_some_and(|n| n.is_file() && n.size == size) {
+            return true;
+        }
+        trace!(0, "ext4: a file's size is not changed yet");
         false
     }
 
-    fn rename(&mut self, _node: NodeId, _dir: NodeId, _name: &[u8]) -> bool {
-        false
+    fn rename(&mut self, node: NodeId, dir: NodeId, name: &[u8]) -> bool {
+        Ext4::rename(self, node, dir, name)
     }
 
-    fn remove(&mut self, _node: NodeId) -> bool {
-        false
+    fn remove(&mut self, node: NodeId) -> bool {
+        Ext4::remove(self, node)
+    }
+
+    fn sync(&mut self) -> bool {
+        Ext4::sync(self)
     }
 
     /// What extents number: 2^32 blocks.
@@ -696,8 +830,8 @@ impl FileSystem for Ext4 {
     }
 }
 
-/// Mount the device's ext4 at `path`: 1 when mounted (read-only, all this
-/// driver does yet), -1 when not.
+/// Mount the device's ext4 at `path`: 1 when mounted read-only, 0 when
+/// for writing, -1 when not mounted.
 pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {
     let Some(dev) = Disk::from_handle(device) else { return -1 };
     let Some(vfs) = crate::vfs_instance() else { return -1 };
