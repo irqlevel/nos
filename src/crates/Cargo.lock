@@ -522,6 +522,19 @@ name = "mgmtwire"
 version = "0.1.0"
 
 [[package]]
+name = "mod-api"
+version = "0.1.0"
+dependencies = [
+ "conf",
+ "kcore",
+ "kmod",
+ "mgmtwire",
+ "tls",
+ "web",
+ "zeroize",
+]
+
+[[package]]
 name = "mod-blkload"
 version = "0.1.0"
 dependencies = [
