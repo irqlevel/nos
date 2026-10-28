@@ -46,21 +46,32 @@ const MAX_LOCATION: usize = 256;
 
 /* ---- a body that goes to a file ---- */
 
+/// Who a download into a file reports to as it goes, and asks whether to go
+/// on: the wget command, which prints its progress lines; or a module
+/// (`fetch`), which is handed the counts and may stop it.
+trait Watch {
+    /// `done` bytes of the body taken so far, of `length` (0: not said),
+    /// `now` and when it `started`, in nanoseconds since boot: false stops
+    /// the download, the body cut short there.
+    fn progress(&mut self, done: usize, length: usize, started: u64, now: u64) -> bool;
+
+    /// A write of the file failed, `written` bytes into it.
+    fn write_failed(&mut self, written: usize);
+}
+
 /// The sink's state between calls.
 struct FileSink<'a> {
     file: &'a Open<'static>,
-    out: &'a mut Output,
-    /// What its lines begin with: the command's name.
-    who: &'static str,
+    watch: &'a mut dyn Watch,
     buf: alloc::boxed::Box<[u8]>,
     used: usize,
     written: usize,
     /// The body's length, when the server said it; 0 when it did not
     length: usize,
-    /// When the download began, and when progress was last told, in
-    /// nanoseconds since boot
+    /// When the download began, in nanoseconds since boot
     started: u64,
-    reported: u64,
+    /// The watcher said to stop: nothing more is taken.
+    stopped: bool,
 }
 
 impl http::Sink for FileSink<'_> {
@@ -69,6 +80,9 @@ impl http::Sink for FileSink<'_> {
     }
 
     fn take(&mut self, data: &[u8]) -> usize {
+        if self.stopped {
+            return 0;
+        }
         let before = self.written;
         let mut taken = 0;
 
@@ -86,14 +100,13 @@ impl http::Sink for FileSink<'_> {
             }
         }
 
+        /* A short take is what ends a body early: the client reads no
+         * more of it. */
         let now = kcore::time::boot_time_ns();
-        let every = (now.saturating_sub(self.started) / REPORT_SHARE)
-            .clamp(REPORT_MIN_NS, REPORT_MAX_NS);
-        if now.saturating_sub(self.reported) >= every {
-            self.reported = now;
-            self.progress(now);
+        if !self.watch.progress(self.written + self.used, self.length, self.started, now) {
+            self.stopped = true;
+            return 0;
         }
-
         taken
     }
 }
@@ -108,25 +121,60 @@ impl FileSink<'_> {
         self.used = 0;
 
         if !self.file.write(&self.buf[..len]) {
-            let _ = writeln!(self.out, "{}: write failed after {} bytes", self.who, self.written);
+            self.watch.write_failed(self.written);
             return false;
         }
 
         self.written += len;
         true
     }
+}
 
-    /// The progress line: how much, of how much when the server said, and
-    /// how fast since the start.
-    fn progress(&mut self, now: u64) {
-        let total = self.written + self.used;
-        let _ = write!(self.out, "{}: {} MiB", self.who, total as u64 / MIB);
-        if self.length != 0 {
-            let percent = (total as u128 * 100 / self.length as u128).min(100);
-            let _ = write!(self.out, " of {} MiB, {}%", self.length as u64 / MIB, percent);
+/// The wget command's watcher: a progress line now and then -- how much, of
+/// how much when the server said, and how fast since the start.
+struct Printed<'a> {
+    out: &'a mut Output,
+    /// What its lines begin with: the command's name.
+    who: &'static str,
+    /// When progress was last told, in nanoseconds since boot; None before
+    /// the first line.
+    reported: Option<u64>,
+}
+
+impl Watch for Printed<'_> {
+    fn progress(&mut self, done: usize, length: usize, started: u64, now: u64) -> bool {
+        let every = (now.saturating_sub(started) / REPORT_SHARE).clamp(REPORT_MIN_NS, REPORT_MAX_NS);
+        if now.saturating_sub(self.reported.unwrap_or(started)) < every {
+            return true;
         }
-        let _ = writeln!(self.out, ", {}", Rate::of(total, now.saturating_sub(self.started)));
+        self.reported = Some(now);
+        let _ = write!(self.out, "{}: {} MiB", self.who, done as u64 / MIB);
+        if length != 0 {
+            let percent = (done as u128 * 100 / length as u128).min(100);
+            let _ = write!(self.out, " of {} MiB, {}%", length as u64 / MIB, percent);
+        }
+        let _ = writeln!(self.out, ", {}", Rate::of(done, now.saturating_sub(started)));
+        true
     }
+
+    fn write_failed(&mut self, written: usize) {
+        let _ = writeln!(self.out, "{}: write failed after {} bytes", self.who, written);
+    }
+}
+
+/// A module's watcher (`fetch`): the counts handed to it, and its answer
+/// whether to go on taken.
+struct Handed<'a> {
+    progress: &'a mut dyn FnMut(u64, u64) -> bool,
+}
+
+impl Watch for Handed<'_> {
+    fn progress(&mut self, done: usize, length: usize, _started: u64, _now: u64) -> bool {
+        (self.progress)(done as u64, length as u64)
+    }
+
+    /* What the module is told of it is the fetch's own answer. */
+    fn write_failed(&mut self, _written: usize) {}
 }
 
 /// Bytes over a time, as a rate: MiB/s to a tenth from one up, KiB/s below.
@@ -281,14 +329,15 @@ struct Download {
     /// What reached the file, and whether the last of it did.
     written: usize,
     flushed: bool,
+    /// The watcher stopped it.
+    stopped: bool,
     /// How long it all took.
     ns: u64,
 }
 
-/// `url`'s answer streamed into `file`, progress told as `who`'s -- or None
-/// out of memory.
-fn download(nic: &crate::nic::Nic, url: &str, file: &Open<'static>, who: &'static str, out: &mut Output)
-            -> Option<Download> {
+/// `url`'s answer streamed into `file`, told to `watch` as it comes -- or
+/// None out of memory.
+fn download(nic: &crate::nic::Nic, url: &str, file: &Open<'static>, watch: &mut dyn Watch) -> Option<Download> {
     let mut buf = alloc::vec::Vec::new();
     buf.try_reserve_exact(WRITE_BUF).ok()?;
     buf.resize(WRITE_BUF, 0);
@@ -296,12 +345,12 @@ fn download(nic: &crate::nic::Nic, url: &str, file: &Open<'static>, who: &'stati
     let mut location = [0u8; MAX_LOCATION];
     let started = kcore::time::boot_time_ns();
     let mut sink = FileSink {
-        file, out, who, buf: buf.into_boxed_slice(),
-        used: 0, written: 0, length: 0, started, reported: started,
+        file, watch, buf: buf.into_boxed_slice(), used: 0, written: 0, length: 0, started, stopped: false,
     };
     let resp = http::get_with_location(nic, url.as_bytes(), &mut sink, &mut location);
-    let flushed = sink.flush();
-    Some(Download { resp, location, written: sink.written, flushed,
+    /* What a stopped download had buffered is not wanted: the file goes. */
+    let flushed = !sink.stopped && sink.flush();
+    Some(Download { resp, location, written: sink.written, flushed, stopped: sink.stopped,
                     ns: kcore::time::boot_time_ns().saturating_sub(started) })
 }
 
@@ -319,11 +368,12 @@ fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
         None => { let _ = writeln!(out, "wget: cannot open {} for writing", path); return; }
     };
 
-    let Some(got) = download(nic, url, &file, "wget", out) else {
+    let got = download(nic, url, &file, &mut Printed { out: &mut *out, who: "wget", reported: None });
+    let Some(got) = got else {
         let _ = writeln!(out, "wget: out of memory");
         return;
     };
-    let Download { resp, location, written, flushed, ns } = got;
+    let Download { resp, location, written, flushed, ns, .. } = got;
 
     /* The handle goes before the file may be taken away: an open one keeps
      * the filesystem from removing it. */
@@ -383,6 +433,8 @@ pub enum Fetch {
     Write,
     /// The body was cut short: an idle timeout, or a peer that closed early.
     Cut,
+    /// The caller said to stop.
+    Cancelled,
 }
 
 impl From<http::Failure> for Fetch {
@@ -400,10 +452,11 @@ impl From<http::Failure> for Fetch {
 }
 
 /// `url`'s body, by HTTP or HTTPS, in a new file at `path` -- made here, never
-/// one that is there -- its progress told on `out` as wget's is, but as
-/// `who`'s: the body's length, or why not, and then no file. Only a 2xx
-/// answer is a body: what a server says with a 404 is no image.
-pub fn fetch(url: &str, path: &str, who: &'static str, out: &mut Output) -> Result<u64, Fetch> {
+/// one that is there -- `progress` handed the bytes in it so far and the
+/// body's length (0 when the server did not say) as they come, and asked
+/// whether to go on: the body's length, or why not, and then no file. Only a
+/// 2xx answer is a body: what a server says with a 404 is no image.
+pub fn fetch(url: &str, path: &str, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<u64, Fetch> {
     if url.is_empty() || url.len() >= MAX_URL_LEN {
         return Err(Fetch::Url);
     }
@@ -426,21 +479,18 @@ pub fn fetch(url: &str, path: &str, who: &'static str, out: &mut Output) -> Resu
         return Err(Fetch::Create);
     };
 
-    let got = download(&nic, url, &file, who, out);
+    let got = download(&nic, url, &file, &mut Handed { progress });
     /* Closed before it may be removed. */
     drop(file);
     let result = match got {
         None => Err(Fetch::NoMemory),
+        Some(d) if d.stopped => Err(Fetch::Cancelled),
         Some(d) if d.resp.ok == 0 => Err(Fetch::from(d.resp.failure)),
         Some(d) if d.resp.url_too_long != 0 => Err(Fetch::Url),
         Some(d) if !(200..300).contains(&d.resp.status) => Err(Fetch::Status(d.resp.status.clamp(0, 999) as u16)),
         Some(d) if !d.flushed => Err(Fetch::Write),
         Some(d) if d.resp.truncated != 0 => Err(Fetch::Cut),
-        Some(d) => {
-            let _ = writeln!(out, "{}: {} bytes in {}.{} s, {}", who, d.written, d.ns / NS_PER_SEC,
-                             d.ns % NS_PER_SEC / (NS_PER_SEC / 10), Rate::of(d.written, d.ns));
-            Ok(d.written as u64)
-        }
+        Some(d) => Ok(d.written as u64),
     };
     if result.is_err() {
         vfs.remove(path.as_bytes());

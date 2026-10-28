@@ -183,6 +183,20 @@ impl Image {
         if rc == 0 { Ok(()) } else { Err(Error::IoError) }
     }
 
+    /// Where the image has data from `offset` on, as `(start, end)`: holes
+    /// from `offset` to `start`, and what its filesystem keeps on the device
+    /// from `start` to `end`, where the next hole begins -- at most a few
+    /// thousand blocks looked at, and never past the end. `start == end`
+    /// where the blocks looked at are all holes: holes up to there, and the
+    /// next call goes on from it. What a copy that leaves the holes out
+    /// reads, a call at a time; `(size, size)` from the end on.
+    pub fn extent(&self, offset: u64) -> Result<(u64, u64)> {
+        let mut out = [0u64; 2];
+        /* `out` takes two u64s, and the handle is looked up. */
+        let rc = unsafe { fs::kernel_image_extent(self.handle, offset, out.as_mut_ptr()) };
+        if rc == 0 { Ok((out[0], out[1])) } else { Err(Error::IoError) }
+    }
+
     /// The whole blocks inside `len` bytes from `offset` given back to the
     /// filesystem -- holes from here on, reading as zeros, the image's size
     /// as it was: a guest's discard. What it covers of a block only in part
@@ -309,6 +323,23 @@ pub fn append(path: &str, data: &[u8]) -> Result<()> {
 pub fn rename(from: &str, to: &str) -> Result<()> {
     let rc = unsafe { fs::kernel_file_rename(from.as_ptr(), from.len(), to.as_ptr(), to.len()) };
     if rc == 0 { Ok(()) } else { Err(Error::IoError) }
+}
+
+/// What a filesystem has room for, in bytes: what a file's data may take on
+/// it, and how much of that no file has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+/// The space of the filesystem `path` is on, whether the path is there yet
+/// or not: NotFound when no mount holds it, or its filesystem does not say.
+pub fn space(path: &str) -> Result<Space> {
+    let mut out = [0u64; 2];
+    /* `path` is readable for its length, and `out` takes two u64s. */
+    let rc = unsafe { fs::kernel_fs_space(path.as_ptr(), path.len(), out.as_mut_ptr()) };
+    if rc == 0 { Ok(Space { total_bytes: out[0], free_bytes: out[1] }) } else { Err(Error::NotFound) }
 }
 
 /// Removes the file: NotFound when there was nothing to remove, or it could
