@@ -153,6 +153,9 @@ CLAIMED_BYTES = 1 << 20
 # CPUs fills a core's two threads, and leaves the other core to the next.
 NOS_SMP = "4,sockets=1,cores=2,threads=2"
 DEFAULT_CMDLINE_SMP = "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
+# The lines of `seq` a guest's httpd serves through hv forward: 938,895
+# bytes, each line its own number, so a byte out of place is seen.
+SEQ_LINES = 150000
 
 # The last line of /etc/rc, and how the console shows it has run: its echo
 # and the line it prints. Once the shell has the console, the kernel's own
@@ -1468,6 +1471,7 @@ def network(args):
           "ping 10.0.100.2",
           x(1, "mkdir -p /www"),
           x(1, "echo nos-http-hello > /www/index.html"),
+          x(1, "seq 1 %d > /www/seq" % SEQ_LINES),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
           "hv forward", "insmod /sshd.ko", "sshd start"] + six + kept + way_out + folder + [RC_LAST]
@@ -1495,7 +1499,8 @@ def network(args):
         pt.check("a guest pings the other", ok_ping(out(9)), out(9)[-600:])
         pt.check("and the other pings it back", ok_ping(out(10)), out(10)[-600:])
         pt.check("nos pings a guest, out of hv0", "reply from 10.0.100.2" in out(11), out(11)[-600:])
-        pt.check("hv forward add", "port 8080 forwarded to vm 1, 10.0.100.3:80" in out(15), out(15))
+        added = out(rc.index("hv forward add 8080 1 80"))
+        pt.check("hv forward add", "port 8080 forwarded to vm 1, 10.0.100.3:80" in added, added)
         # From outside: the host's port, QEMU's forward into nos's 8080, and
         # nos's into the guest's httpd.
         import urllib.request
@@ -1509,6 +1514,24 @@ def network(args):
                 time.sleep(3)
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
+        # Then a megabyte the same way: more than a connection's own 8 KiB
+        # can hold in flight, through the forward's bulk listener, its
+        # congestion control and the relay, every byte in its place.
+        want = "".join("%d\n" % i for i in range(1, SEQ_LINES + 1)).encode()
+        got = b""
+        began = time.time()
+        for attempt in range(5):
+            try:
+                got = urllib.request.urlopen("http://127.0.0.1:%d/seq" % port, timeout=300).read()
+                break
+            except Exception as e:
+                got = repr(e).encode()
+                time.sleep(3)
+        took = time.time() - began
+        print("  through hv forward: %d bytes in %.1f s" % (len(got), took))
+        pt.check("a megabyte from the guest's httpd through hv forward, every byte in its place", got == want,
+                 "%d bytes of %d, the first difference at %s" % (len(got), len(want),
+                 next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))))
 
         # IPv6, each line by its own occurrence: "hv list" is run before
         # them, and the count of echoes twice.

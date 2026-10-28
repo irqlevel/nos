@@ -122,6 +122,11 @@ pub fn mss(value: u16) -> Vec<u8> {
     o
 }
 
+/// A window scale option, a NOP before it to keep the header in words.
+pub fn ws(shift: u8) -> Vec<u8> {
+    vec![tcp::OPT_NOP, tcp::OPT_WS, tcp::OPT_WS_LEN, shift]
+}
+
 pub fn icmp(kind: u8, code: u8, id: u16, seq: u16, payload: &[u8], sum: Sum) -> Vec<u8> {
     let mut m = vec![0u8; wire::ICMP_HDR_LEN];
     m.extend_from_slice(payload);

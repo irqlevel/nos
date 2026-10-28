@@ -2593,6 +2593,72 @@ stdlib::Error test_line_editor()
    takes, refused; then damaged copies, which the loader must turn away --
    the last three only after mapping and relocating them, so the cleanup of
    a load that fails halfway runs too. */
+/* The management bus's module side (src/crates/mgmt), through the `mgmt`
+   command: modtest's provider answers a call with its parameters, and a job
+   of it that runs until it is told to stop is started -- and seen running,
+   so that it is the unload, next, that has to stop it and wait it out */
+static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
+{
+    static const ulong JOB_WAIT_POLLS = 2000;
+
+    /* The bus as a module asks it -- the host API's way in */
+    out.reset();
+    Cmd::dispatch("modtest bus", out);
+    if (stdlib::str_str(out.get(), "modtest bus: ok") == nullptr)
+    {
+        trace(0, "test_module_bus: the module asking the bus: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    out.reset();
+    Cmd::dispatch("mgmt call modtest echo {\"n\":42}", out);
+    if (stdlib::str_str(out.get(), "{\"n\":42}") == nullptr)
+    {
+        trace(0, "test_module_bus: the module's provider answered: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    out.reset();
+    Cmd::dispatch("mgmt start modtest wait", out);
+    if (stdlib::str_str(out.get(), "started") == nullptr)
+    {
+        trace(0, "test_module_bus: the module's job was not started: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+    for (ulong i = 0; i < JOB_WAIT_POLLS; i++)
+    {
+        out.reset();
+        Cmd::dispatch("mgmt jobs", out);
+        if (stdlib::str_str(out.get(), "modtest.wait running") != nullptr)
+            return make_success();
+        sleep(consts::NANO_SECS_IN_MS);
+    }
+    trace(0, "test_module_bus: the module's job never ran: %s", out.get());
+    return make_error(stdlib::Error::UNSUCCESSFUL);
+}
+
+/* After the unload: the job was told to stop and ended so, and the provider
+   is gone with its module */
+static stdlib::Error check_bus_unloaded(stdlib::BufferPrinter& out)
+{
+    out.reset();
+    Cmd::dispatch("mgmt jobs", out);
+    if (stdlib::str_str(out.get(), "modtest.wait done cancelled") == nullptr)
+    {
+        trace(0, "test_module_bus: the job the unload had to stop: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
+    out.reset();
+    Cmd::dispatch("mgmt call modtest echo {}", out);
+    if (stdlib::str_str(out.get(), "mgmt: no_provider") == nullptr)
+    {
+        trace(0, "test_module_bus: the provider outlived its module: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+    return make_success();
+}
+
 stdlib::Error test_modules()
 {
     /* kmod::ModuleInfo: the magic "NOSM", the version, then the digest of the
@@ -2743,6 +2809,39 @@ stdlib::Error test_modules()
 
     trace(0, "test_modules: complete");
     return make_success();
+}
+
+/* The management bus's module side, once there are tasks to run a job on
+   (test_modules runs before there are): modtest loaded again, its provider
+   called, a job of it started, and the module's unload -- which takes the
+   provider off the bus -- telling the job to stop and waiting it out. */
+bool test_module_bus()
+{
+    static const ulong OUTPUT_SIZE = 1024;
+
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
+
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+    if (!err.ok())
+    {
+        trace(0, "test_module_bus: load failed: %s", out.get());
+        return false;
+    }
+
+    err = check_bus_loaded(out);
+    out.reset();
+    stdlib::Error unloaded = modules.unload("modtest", out);
+    if (!unloaded.ok() || modules.is_loaded("modtest"))
+    {
+        trace(0, "test_module_bus: unload failed: %s", out.get());
+        return false;
+    }
+    if (!err.ok())
+        return false;
+
+    return check_bus_unloaded(out).ok();
 }
 
 stdlib::Error test()

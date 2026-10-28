@@ -3,6 +3,12 @@ name = "tls"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# The host API's TLS server (server.rs): what the API module's build turns
+# on. The kernel's own tls -- the HTTP client's -- is built without it, and
+# so without the two crates it needs.
+server = ["dep:webpki", "dep:sha2"]
+
 [dependencies]
 kcore = { path = "../kcore" }
 ffi = { path = "../ffi" }
@@ -12,3 +18,9 @@ webpki-roots = "1.0"
 # getrandom has no backend for a bare-metal target: register the kernel's
 # entropy source as its custom one (see lib.rs).
 getrandom = { version = "0.2", features = ["custom"] }
+# The server's: a client's certificate read for the key it has, which is what
+# the server lets it in by -- the webpki rustls verifies the handshake's
+# signature with, and SHA-256 for the key's fingerprint. force-soft for the
+# reason the kernel crate gives.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"], optional = true }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"], optional = true }

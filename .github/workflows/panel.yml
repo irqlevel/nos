@@ -1,0 +1,60 @@
+name: Panel
+
+# The management panel (panel/): typechecked, built for production, and
+# driven by Playwright against the mock host API -- which serves the
+# providers' own descriptors from the tree, so a descriptor changed in the
+# kernel is a panel tested again. Then its bundle, as a release makes it,
+# run as the panel's VM runs it.
+on:
+  push:
+    branches: [master]
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-*.py', '.github/workflows/panel.yml']
+  pull_request:
+    paths: ['panel/**', 'src/crates/**/*.descriptor.json', 'scripts/panel-*.py', '.github/workflows/panel.yml']
+
+jobs:
+  panel:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node 24, as the appliance runs it (node:sqlite)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: panel/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: "Typecheck (the dictionaries are one shape: a word missing fails here)"
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Playwright against the mock API
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test
+
+  # The bundle a release has (scripts/panel-bundle.py) -- Node and Caddy held
+  # to their pinned checksums, the panel built standalone in Node's image --
+  # run as the panel's VM runs it, in Debian's image, against the mock API
+  # (scripts/panel-appliance-test.py).
+  bundle:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bundle
+        run: python3 scripts/panel-bundle.py --version ci --out out/panel
+
+      - name: The appliance, run
+        run: python3 scripts/panel-appliance-test.py out/panel/nos-panel-ci.tar.gz

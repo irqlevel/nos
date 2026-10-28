@@ -10,3 +10,5 @@ kcore = { path = "../kcore" }
 # The disks a filesystem is mounted on: the block layer itself, not the C ABI
 # a module reaches it by.
 block = { path = "../block" }
+# The management bus, which the layer's provider registers on.
+mgmt = { path = "../mgmt" }

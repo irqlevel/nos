@@ -1,0 +1,34 @@
+# The host API's wire crates on the host: web (HTTP/1.1, WebSocket, SHA-1,
+# IPv4 networks, the self-signed certificate) and mgmtwire (the bus's JSON,
+# its parameters and statuses), as the API module links them. Known-answer
+# vectors, the parsers fuzzed with random and broken inputs, and the
+# certificates written out for OpenSSL and Python's ssl to judge
+# (scripts/web-test.py). Its dependencies are the kernel's vendored ones, so
+# it builds offline.
+[package]
+name = "web-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+web = { path = "../../src/crates/web" }
+mgmtwire = { path = "../../src/crates/mgmtwire" }
+# To read back what web::x509 wrote: the key out of its PKCS#8, and the
+# certificate's signature checked against it.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+
+# No CPU features, as net-fuzz has it and for its reason: the RustCrypto
+# crates on their software backends, the ones the kernel runs -- and the
+# real crate would ask macOS through libc, which the vendored tree does not
+# carry.
+[patch.crates-io]
+cpufeatures = { path = "../net/standins/cpufeatures" }
+
+# Overflow checks on, as a RUSTUB=1 build has them: an overflow in a parser
+# is a bug of its own, and in the kernel a panic.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]

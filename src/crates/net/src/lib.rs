@@ -26,6 +26,7 @@ pub mod icmp;
 pub mod nat;
 pub mod netconsole;
 pub mod nic;
+pub mod provider;
 pub mod selftest;
 pub mod shell;
 pub mod tcp;
@@ -59,4 +60,5 @@ pub fn register<D: NetDriver>(
 /// `rust_init`, before the shell starts.
 pub fn init() {
     shell::register_all();
+    provider::init();
 }

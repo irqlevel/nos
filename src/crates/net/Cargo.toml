@@ -17,3 +17,5 @@ tls = { path = "../tls" }
 # `wget` saves to a file: the filesystem layer itself, not the C ABI a module
 # reaches it by.
 fs = { path = "../fs" }
+# The management bus, which the layer's provider registers on.
+mgmt = { path = "../mgmt" }

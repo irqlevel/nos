@@ -105,6 +105,9 @@ pub mod run;
 pub mod smbios;
 #[path = "../../../src/crates/hv/src/smp.rs"]
 pub mod smp;
+/// `hv forward`'s relay, from the module: two streams carried both ways.
+#[path = "../../../src/crates/modules/hv/src/relay.rs"]
+pub mod relay;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
 #[path = "../../../src/crates/modules/hv/src/net.rs"]
 pub mod switch;
@@ -123,6 +126,7 @@ mod placemodel;
 mod platform;
 mod policymodel;
 mod recycle;
+mod relaymodel;
 mod smbiosmodel;
 mod targets;
 mod virtq;

@@ -12,9 +12,13 @@ namespace kernel
 
 struct DmesgMsg final
 {
-    char str[256 - sizeof(stdlib::ListEntry) - sizeof(Atomic)];
+    char str[256 - sizeof(stdlib::ListEntry) - sizeof(Atomic) - sizeof(u64)];
     stdlib::ListEntry list_entry;
     Atomic usage;
+    /* Its number among every message logged since boot, from 1: set as it
+       goes on the list, under the lock, so the list's are in order and a
+       reader can ask for what came after the last it had (`since`) */
+    u64 seq;
 
     void init()
     {
@@ -67,6 +71,20 @@ public:
     /* Messages the log no longer has: recycled to make room, or dropped. */
     ulong get_lost();
 
+    /* The number the next message logged will have */
+    u64 get_next_seq();
+
+    /* The messages numbered after `since`, oldest first, copied into buf as
+       records -- the number (8 bytes, least significant first), the text's
+       length (2 bytes, the same) and the text, with no NUL -- for as many as
+       fit whole. The bytes written come back; `last` is the number of the
+       last message copied, or `since` when none was. A gap between `since`
+       and the first record's number is what the log lost meanwhile. */
+    ulong read_since(u64 since, u8* buf, ulong len, u64& last);
+
+    /* A record's number and length, before its text */
+    static const ulong READ_HEADER = sizeof(u64) + sizeof(u16);
+
     void reset();
 
     /* The list cannot hold more messages than the buffer has slots, so a walk
@@ -107,6 +125,7 @@ private:
 
     /* Guarded by Lock. */
     ulong lost_;
+    u64 next_seq_;
 };
 
 }

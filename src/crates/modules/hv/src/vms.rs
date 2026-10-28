@@ -98,7 +98,7 @@ const ATTACH_KEYS: usize = 256;
 /// How long `hv stop` gives a guest to turn itself off once its power
 /// button is pressed, unless told: long enough for a distribution's init to
 /// stop its services and unmount its disks.
-const STOP_DEFAULT_S: u64 = 30;
+pub(crate) const STOP_DEFAULT_S: u64 = 30;
 /// How long the module's going gives the guests to turn themselves off once
 /// their power buttons are pressed, unless `insmod` said (`stop_secs=`):
 /// longer than `hv stop`'s, as nobody is at a prompt waiting for it and every
@@ -337,6 +337,12 @@ impl Shared {
         self.running.load(Ordering::Acquire)
     }
 
+    /// How it ended last, copied out: printed after, with the lock free for
+    /// its task -- a VM that restarts writes the next one there.
+    fn reason_copy(&self) -> String {
+        self.reason.lock().clone()
+    }
+
     /// Press its power button, when it is running: the first CPU's loop
     /// takes the press, woken to it now. Whether it was pressed.
     fn press(&self) -> bool {
@@ -456,7 +462,7 @@ impl Shared {
 /// What became of `hv stop`'s press of a guest's power button, as it adds
 /// to how the guest ended.
 #[derive(Clone, Copy)]
-enum Asked {
+pub enum Asked {
     /// Not pressed -- `secs=0`, or the guest was not running -- or answered:
     /// the guest stopped by itself, and how it ended says how.
     Nothing,
@@ -464,6 +470,64 @@ enum Asked {
     Unheard,
     /// It heard, and was still running after this many seconds.
     Unanswered(u64),
+}
+
+impl Asked {
+    /// What it is, as the host API says it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Asked::Nothing => "answered",
+            Asked::Unheard => "unheard",
+            Asked::Unanswered(_) => "unanswered",
+        }
+    }
+}
+
+/// Room a terminal's page may need past its bytes: what `TermFilter` holds
+/// of a sequence, and lets out as it ends.
+const TERM_SLACK: usize = 64;
+
+/// A page of a VM's console (`Vms::console_page`).
+pub struct ConsolePage {
+    pub text: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+    pub total: u64,
+}
+
+/// A VM on the list, as the host API reads it (`Vms::listed`).
+pub struct Listed {
+    pub id: u32,
+    /// Its folder's, when it was started from one.
+    pub name: Option<String>,
+    /// "running", "stopping" or "stopped".
+    pub state: &'static str,
+    /// The host CPUs its CPUs run on.
+    pub cpus: Vec<u32>,
+    pub mem_mib: u64,
+    /// Its port of the switch.
+    pub port: Option<usize>,
+    /// How long its boot has run, or ran.
+    pub uptime_ms: u64,
+    pub restarts: u32,
+    /// How it ended; empty while it runs.
+    pub reason: String,
+    pub exits: u64,
+    pub kernel: String,
+    /// What it has written to its console in all.
+    pub console_bytes: u64,
+}
+
+/// How a VM `stop_vm` stopped ended.
+pub struct Stopped {
+    pub id: u32,
+    /// How it ended, and what became of its power button's press.
+    pub reason: String,
+    pub asked: Asked,
+    /// Its forwards taken away with it.
+    pub forwarded: usize,
+    /// Its last boot's report.
+    pub report: String,
 }
 
 impl core::fmt::Display for Asked {
@@ -801,11 +865,69 @@ struct Vm {
     log: Option<Log>,
 }
 
+/// A VM as `hv list` shows it, copied out of the table under its lock: what
+/// is printed goes to whoever asked -- an SSH session that may be slow to
+/// take it -- with the lock free meanwhile for every start and stop. Its
+/// counters are the guest's own, read live after.
+struct VmView {
+    shared: Arc<Shared>,
+    cpus: Vec<u32>,
+    disk_cpu: Option<u32>,
+    kernel: String,
+    mem_mib: u64,
+    port: Option<usize>,
+    name: Option<String>,
+}
+
 struct Table {
     next: u32,
     vms: Vec<Vm>,
     /// The module is on its way out: no VM is added from here on.
     closing: bool,
+    /// Names held while their folders are made, cloned or deleted, with
+    /// what is being done: no VM of one starts, and nothing else of the
+    /// kind is done to it (`Vms::reserve`).
+    reserved: Vec<(String, &'static str)>,
+}
+
+/// Names held at once, at most: folders made, cloned -- each clone holds
+/// two -- and deleted together.
+const MAX_RESERVED: usize = 16;
+
+/// Why a VM of a name may not start now.
+enum Taken {
+    /// A VM of the name is on the list: this one.
+    Listed(u32),
+    /// Its folder is being made, cloned or deleted.
+    Doing(&'static str),
+}
+
+impl Taken {
+    fn said(&self, name: &str) -> String {
+        match self {
+            Taken::Listed(id) => alloc::format!("vm {} is {} already -- hv restart {}, or hv stop {} first", id, name,
+                                                name, name),
+            Taken::Doing(doing) => alloc::format!("{} is being {} -- not started", name, doing),
+        }
+    }
+}
+
+/// A name held while its folder is made, cloned or deleted, given back when
+/// this goes (`Vms::reserve`).
+pub struct Reserved<'a> {
+    vms: &'a Vms,
+    name: String,
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        let gone = {
+            let mut table = self.vms.table.lock();
+            table.reserved.iter().position(|(n, _)| *n == self.name).map(|i| table.reserved.swap_remove(i))
+        };
+        /* Freed off the lock. */
+        drop(gone);
+    }
 }
 
 /// Every VM this module has started and not yet taken off the list.
@@ -898,8 +1020,10 @@ impl Vms {
     pub fn new() -> Option<Vms> {
         let mut vms = Vec::new();
         vms.try_reserve_exact(MAX_VMS).ok()?;
+        let mut reserved = Vec::new();
+        reserved.try_reserve_exact(MAX_RESERVED).ok()?;
         Some(Vms {
-            table: Mutex::new(Table { next: 0, vms, closing: false })?,
+            table: Mutex::new(Table { next: 0, vms, closing: false, reserved })?,
             switch: Mutex::new(None)?,
             claims: Arc::new(Claims::new()?),
         })
@@ -908,6 +1032,57 @@ impl Vms {
     /// The claims the guests' disks hold on their images (`disk::Claims`).
     pub fn claims(&self) -> Arc<Claims> {
         self.claims.clone()
+    }
+
+    /// `name` held for what is done to its folder -- `what`: "made",
+    /// "cloned", "deleted" -- until the hold goes: no VM of it starts
+    /// meanwhile, and nothing else of the kind is done to it. Refused while
+    /// a VM of the name is on the list, the name is held already, or the
+    /// module is going.
+    pub fn reserve(&self, name: &str, what: &'static str) -> Result<Reserved<'_>, String> {
+        let mut kept = String::new();
+        let mut held = String::new();
+        if kept.try_reserve_exact(name.len()).is_err() || held.try_reserve_exact(name.len()).is_err() {
+            return Err(String::from("out of memory"));
+        }
+        kept.push_str(name);
+        held.push_str(name);
+        /* Asked and taken under the lock, said after it. */
+        enum No {
+            Closing,
+            Listed(u32),
+            Doing(&'static str),
+            Full,
+        }
+        let refused = {
+            let mut table = self.table.lock();
+            if table.closing {
+                Some(No::Closing)
+            } else if let Some(vm) = table.vms.iter().find(|vm| vm.name.as_deref() == Some(name)) {
+                Some(No::Listed(vm.shared.id))
+            } else if let Some((_, doing)) = table.reserved.iter().find(|(n, _)| n == name) {
+                Some(No::Doing(doing))
+            } else if table.reserved.len() >= MAX_RESERVED {
+                Some(No::Full)
+            } else {
+                /* Into the room taken when the table was made. */
+                table.reserved.push((kept, what));
+                None
+            }
+        };
+        match refused {
+            None => Ok(Reserved { vms: self, name: held }),
+            Some(No::Closing) => Err(String::from("the module is being unloaded")),
+            Some(No::Listed(id)) => Err(alloc::format!("vm {} is {} -- hv stop {} first", id, name, name)),
+            Some(No::Doing(doing)) => Err(alloc::format!("{} is being {} -- not now", name, doing)),
+            Some(No::Full) => Err(alloc::format!("{} vms are being made, cloned or deleted already -- not now",
+                                                 MAX_RESERVED)),
+        }
+    }
+
+    /// What is being done to the folder of `name`, if it is held.
+    pub fn doing(&self, name: &str) -> Option<&'static str> {
+        self.table.lock().reserved.iter().find(|(n, _)| n == name).map(|&(_, doing)| doing)
     }
 
     /// A running VM with a CPU on a host CPU in `mask`, if there is one, and
@@ -929,7 +1104,7 @@ impl Vms {
         let by_id = word.parse::<u32>().ok().and_then(|id| table.vms.iter().find(|vm| vm.shared.id == id));
         by_id.or_else(|| table.vms.iter().find(|vm| vm.name.as_deref() == Some(word)))
             .map(|vm| vm.shared.clone())
-            .ok_or_else(|| alloc::format!("hv: no vm {}", word))
+            .ok_or_else(|| alloc::format!("no vm {}", word))
     }
 
     /// The number of the VM `word` names (`find`).
@@ -948,107 +1123,116 @@ impl Vms {
     /// its kernel's path and the words after it, or a VM from its folder --
     /// a name's under `root` -- built, put on a vCPU task, and come back.
     pub fn start(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, root: &str, args: &str,
-                 out: &mut Output) {
+                 out: &mut dyn Write) {
         if let Err(e) = hv::run::ensure_runnable(machine) {
             let _ = writeln!(out, "hv: no guest can run here -- {}", e);
             return;
         }
         let (first, rest) = after_word(args);
-        match store::find(root, first) {
+        let started = match store::find(root, first) {
             Ok(Some(folder)) => {
                 if !rest.is_empty() {
                     let _ = writeln!(out, "hv: a vm started from its folder is started as its {} says -- no words after \
                                            its name", store::CONFIG);
                     return;
                 }
-                let config = match store::load(&folder) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = writeln!(out, "hv: {}", e);
-                        return;
-                    }
-                };
-                let spec = match store::options_checked(&folder, &config) {
-                    Ok(spec) => spec,
-                    Err(e) => {
-                        let _ = writeln!(out, "hv: {}/{}: {}", folder.path, store::CONFIG, e);
-                        return;
-                    }
-                };
-                let log = config.console_log;
-                self.launch(machine, cores, forwards, spec, Some((folder, log)), out);
+                self.start_from(machine, cores, forwards, folder, out)
             }
             Ok(None) => match guest::parse(args, START_USAGE) {
                 Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, out),
-                Ok(_) => {
-                    let _ = writeln!(out, "hv: secs= is hv boot's -- a started vm runs until hv stop");
-                }
+                Ok(_) => Err(String::from("secs= is hv boot's -- a started vm runs until hv stop")),
                 Err(usage) => {
                     let _ = writeln!(out, "{}", usage);
+                    return;
                 }
             },
-            Err(e) => {
-                let _ = writeln!(out, "hv: {}", e);
-            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = started {
+            let _ = writeln!(out, "hv: {}", e);
         }
     }
 
+    /// The VM of `folder` started as its vm.toml says: its number, or why
+    /// not -- what a start of it by name, from the shell or the host API,
+    /// comes to.
+    pub fn start_from(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, folder: Folder,
+                      out: &mut dyn Write) -> Result<u32, String> {
+        hv::run::ensure_runnable(machine).map_err(|e| alloc::format!("no guest can run here -- {}", e))?;
+        let config = store::load(&folder)?;
+        let spec = store::options_checked(&folder, &config)
+            .map_err(|e| alloc::format!("{}/{}: {}", folder.path, store::CONFIG, e))?;
+        let log = config.console_log;
+        self.launch(machine, cores, forwards, spec, Some((folder, log)), out)
+    }
+
+    /// Why a VM of `name` may not start now -- one on the list already, the
+    /// name held for its folder -- asked under the table's lock.
+    fn name_taken(table: &Table, name: Option<&str>) -> Option<Taken> {
+        let n = name?;
+        if let Some(vm) = table.vms.iter().find(|vm| vm.name.as_deref() == Some(n)) {
+            return Some(Taken::Listed(vm.shared.id));
+        }
+        table.reserved.iter().find(|(r, _)| r == n).map(|&(_, doing)| Taken::Doing(doing))
+    }
+
     /// Start the guest `spec` describes -- from its folder, given one, and
-    /// whether to keep its console.log there.
+    /// whether to keep its console.log there: its number, or why not.
     fn launch(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, mut spec: Spec,
-              stored: Option<(Folder, bool)>, out: &mut Output) {
+              stored: Option<(Folder, bool)>, out: &mut dyn Write) -> Result<u32, String> {
         let name = stored.as_ref().map(|(f, _)| f.name.as_str());
-        /* A name on the list already is said first, and before anything is
-         * taken for it -- not a want of cores. Looked at again as the number
-         * is taken and as the VM goes on the list, for two starts at once. */
-        if let Some(n) = name {
-            let table = self.table.lock();
-            if let Some(vm) = table.vms.iter().find(|vm| vm.name.as_deref() == Some(n)) {
-                let _ = writeln!(out, "hv: vm {} is {} already -- hv restart {}, or hv stop {} first", vm.shared.id, n, n, n);
-                return;
-            }
+        /* A name on the list already -- or held while its folder is made,
+         * cloned or deleted -- is said first, and before anything is taken
+         * for it: not a want of cores. Looked at again as the number is
+         * taken and as the VM goes on the list, for two starts at once. */
+        let taken = Self::name_taken(&self.table.lock(), name);
+        if let Some(taken) = taken {
+            return Err(taken.said(name.unwrap_or("")));
         }
         /* Its place, and its hold on it, before anything is made: two
          * starts at once are given cores apart. The hold is named once the
          * VM has a number, and given back with the task -- or here, on the
          * way out of a start that goes no further. */
         let has_disks = !spec.disks.is_empty();
-        let (place, core_hold) = match cores.take(machine, spec.cpu, spec.cpus, has_disks, None) {
-            Ok(taken) => taken,
-            Err(why) => {
-                let _ = writeln!(out, "hv: {}", why);
-                return;
-            }
-        };
+        let (place, core_hold) = cores.take(machine, spec.cpu, spec.cpus, has_disks, None)?;
         spec.shape = place.shape;
         let placement = place.vcpus;
         let disk_cpu = place.disk;
         let cpu = placement[0];
         if spec.input.len() > INPUT_MAX {
-            let _ = writeln!(out, "hv: input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX);
-            return;
+            return Err(alloc::format!("input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX));
+        }
+        enum No {
+            Closing,
+            Full,
+            Taken(Taken),
+            Numbers,
         }
         let id = {
             let mut table = self.table.lock();
-            if table.closing {
-                let _ = writeln!(out, "hv: the module is being unloaded");
-                return;
-            }
-            if table.vms.len() >= MAX_VMS {
-                let _ = writeln!(out, "hv: {} vms already -- hv stop one first", MAX_VMS);
-                return;
-            }
-            if let Some(vm) = name.and_then(|n| table.vms.iter().find(|vm| vm.name.as_deref() == Some(n))) {
-                let n = name.unwrap_or("");
-                let _ = writeln!(out, "hv: vm {} is {} already -- hv restart {}, or hv stop {} first", vm.shared.id, n, n, n);
-                return;
-            }
-            let Some(next) = table.next.checked_add(1) else {
-                let _ = writeln!(out, "hv: out of vm numbers -- reload the module");
-                return;
+            let no = if table.closing {
+                Some(No::Closing)
+            } else if table.vms.len() >= MAX_VMS {
+                Some(No::Full)
+            } else if let Some(taken) = Self::name_taken(&table, name) {
+                Some(No::Taken(taken))
+            } else {
+                None
             };
-            core::mem::replace(&mut table.next, next)
+            match no {
+                Some(no) => Err(no),
+                None => match table.next.checked_add(1) {
+                    Some(next) => Ok(core::mem::replace(&mut table.next, next)),
+                    None => Err(No::Numbers),
+                },
+            }
         };
+        let id = id.map_err(|no| match no {
+            No::Closing => String::from("the module is being unloaded"),
+            No::Full => alloc::format!("{} vms already -- hv stop one first", MAX_VMS),
+            No::Taken(taken) => taken.said(name.unwrap_or("")),
+            No::Numbers => String::from("out of vm numbers -- reload the module"),
+        })?;
         core_hold.held_by(Holder::Vm(id));
 
         /* What its SMBIOS calls it, and the UUID it gives it: its vm.toml's
@@ -1071,37 +1255,22 @@ impl Vms {
         }
 
         let logged = stored.as_ref().is_some_and(|(_, log)| *log);
-        let shared = match Shared::new(id, spec.log, &spec.input, spec.cpus, logged) {
-            Some(shared) => Arc::new(shared),
-            None => {
-                let _ = writeln!(out, "hv: vm {} not started -- out of memory for its console", id);
-                return;
-            }
-        };
+        let shared = Shared::new(id, spec.log, &spec.input, spec.cpus, logged)
+            .map(Arc::new)
+            .ok_or_else(|| alloc::format!("vm {} not started -- out of memory for its console", id))?;
+        let not_started = |why: &dyn core::fmt::Display| alloc::format!("vm {} not started -- {}", id, why);
 
         /* With `net`, a port on the switch -- made by the first such guest --
          * and the address that goes with it on the guest's command line;
          * given back if the start goes no further. */
         let mut hold = None;
         if spec.net {
-            let switch = match self.switch() {
-                Ok(switch) => switch,
-                Err(why) => {
-                    let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
-                    return;
-                }
-            };
+            let switch = self.switch().map_err(|why| not_started(&why))?;
             let claimed = match spec.port {
                 Some(p) => switch.claim_at(p, &shared, spec.network.as_deref()),
                 None => switch.claim(&shared, spec.network.as_deref()),
             };
-            let port = match claimed {
-                Ok(port) => port,
-                Err(why) => {
-                    let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
-                    return;
-                }
-            };
+            let port = claimed.map_err(|why| not_started(&why))?;
             /* Its way out, and the DNS server it is told of: a guest with no
              * way out still reaches nos and the other guests. */
             if let Err(why) = switch.way_out() {
@@ -1115,10 +1284,7 @@ impl Vms {
 
         /* Its disks are served off the vCPU's CPU, and wake it. */
         let mut label = String::new();
-        if label.try_reserve(16).is_err() {
-            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
-            return;
-        }
+        label.try_reserve(16).map_err(|_| not_started(&"out of memory"))?;
         let _ = write!(label, "vm{}", id);
         let runner = Runner {
             wake: shared.clone(),
@@ -1130,18 +1296,9 @@ impl Vms {
 
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */
-        let built = match guest::build(machine, &spec, &runner, shared.doorbells.clone()) {
-            Ok(built) => built,
-            Err(why) => {
-                let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
-                return;
-            }
-        };
+        let built = guest::build(machine, &spec, &runner, shared.doorbells.clone()).map_err(|why| not_started(&why))?;
         let mut cpus = Vec::new();
-        if cpus.try_reserve_exact(placement.len()).is_err() {
-            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
-            return;
-        }
+        cpus.try_reserve_exact(placement.len()).map_err(|_| not_started(&"out of memory"))?;
         cpus.extend_from_slice(&placement);
         let mem_mib = spec.mem_bytes / (1024 * 1024);
         let mut kernel = String::new();
@@ -1152,8 +1309,7 @@ impl Vms {
             || said.try_reserve(SAID_BYTES + spec.kernel.len() + spec.cmdline.len()).is_err()
             || host_cpus.try_reserve(8 + 4 * placement.len()).is_err()
         {
-            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
-            return;
+            return Err(not_started(&"out of memory"));
         }
         host_cpus.push_str(if placement.len() == 1 { "cpu " } else { "cpus " });
         for (i, c) in placement.iter().enumerate() {
@@ -1168,17 +1324,11 @@ impl Vms {
 
         let mut wanted = Vec::new();
         let mut vm_name = None;
-        if wanted.try_reserve_exact(spec.forwards.len()).is_err() {
-            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
-            return;
-        }
+        wanted.try_reserve_exact(spec.forwards.len()).map_err(|_| not_started(&"out of memory"))?;
         wanted.extend_from_slice(&spec.forwards);
         if let Some(n) = name {
             let mut s = String::new();
-            if s.try_reserve_exact(n.len()).is_err() {
-                let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
-                return;
-            }
+            s.try_reserve_exact(n.len()).map_err(|_| not_started(&"out of memory"))?;
             s.push_str(n);
             vm_name = Some(s);
         }
@@ -1191,15 +1341,9 @@ impl Vms {
         let start = Start {
             shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement, hold: core_hold,
         };
-        let task = match kcore::task::spawn_on_with(&task_name, 1u64 << cpu, start, vcpu) {
-            Some(task) => task,
-            None => {
-                /* The start -- the guest in it -- went with the spawn that
-                 * failed. */
-                let _ = writeln!(out, "hv: vm {} not started -- no task for it", id);
-                return;
-            }
-        };
+        /* The start -- the guest in it -- goes with a spawn that fails. */
+        let task = kcore::task::spawn_on_with(&task_name, 1u64 << cpu, start, vcpu)
+            .ok_or_else(|| not_started(&"no task for it"))?;
 
         /* Its log from its first byte on: the ring has everything the guest
          * has printed since its task began. */
@@ -1214,8 +1358,7 @@ impl Vms {
         };
         let refused = {
             let mut table = self.table.lock();
-            let taken = name.is_some_and(|n| table.vms.iter().any(|v| v.name.as_deref() == Some(n)));
-            if table.closing || table.vms.len() >= MAX_VMS || taken {
+            if table.closing || table.vms.len() >= MAX_VMS || Self::name_taken(&table, name).is_some() {
                 Some(vm)
             } else {
                 /* Into the room taken when the table was made (`MAX_VMS`). */
@@ -1227,9 +1370,8 @@ impl Vms {
          * this one read its files: stop the guest again, off the lock. */
         if let Some(vm) = refused {
             finish(vm);
-            let _ = writeln!(out, "hv: vm {} stopped again at once -- no room for it, its name taken meanwhile, or \
-                                   the module is going", id);
-            return;
+            return Err(alloc::format!("vm {} stopped again at once -- no room for it, its name taken meanwhile, or \
+                                       the module is going", id));
         }
         /* On the list: its port is given back when it comes off. */
         if let Some(h) = hold.as_mut() {
@@ -1247,20 +1389,49 @@ impl Vms {
          * added, or why not -- the guest runs either way. */
         if let (Some(port), Some(host)) = (port, self.host_nic()) {
             for (host_port, guest_port) in wanted {
-                forwards.add(host_port, id, guest_port, net::port_ip(port), host.clone(), out);
+                if let Err(e) = forwards.add(host_port, id, guest_port, net::port_ip(port), host.clone(), out) {
+                    let _ = writeln!(out, "hv: {}", e);
+                }
             }
         }
+        Ok(id)
     }
 
     /// `hv list`.
+    /// Every VM on the list as it is now, copied out of the table under its
+    /// lock; None when there was no memory for the copy.
+    fn snapshot(&self) -> Option<Vec<VmView>> {
+        let table = self.table.lock();
+        let mut views = Vec::new();
+        views.try_reserve_exact(table.vms.len()).ok()?;
+        for vm in &table.vms {
+            views.push(VmView {
+                shared: vm.shared.clone(),
+                cpus: vm.cpus.clone(),
+                disk_cpu: vm.disk_cpu,
+                kernel: vm.kernel.clone(),
+                mem_mib: vm.mem_mib,
+                port: vm.port,
+                name: vm.name.clone(),
+            });
+        }
+        Some(views)
+    }
+
     pub fn list(&self, out: &mut Output) {
         let now = kcore::time::boot_time_ns();
-        let table = self.table.lock();
-        if table.vms.is_empty() {
+        let Some(views) = self.snapshot() else {
+            let _ = writeln!(out, "hv: out of memory");
+            return;
+        };
+        if views.is_empty() {
             let _ = writeln!(out, "hv: no vms");
             return;
         }
-        for vm in &table.vms {
+        /* The switch out of its lock too: its counters are atomics, its
+         * networks under a lock of its own. */
+        let switch = self.switch.lock().clone();
+        for vm in &views {
             let s = &vm.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
@@ -1284,7 +1455,7 @@ impl Vms {
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
-                match self.switch.lock().as_ref().and_then(|s| s.network_of(port)) {
+                match switch.as_ref().and_then(|s| s.network_of(port)) {
                     Some(network) => {
                         let _ = write!(out, " on {}", network);
                     }
@@ -1293,7 +1464,7 @@ impl Vms {
                     }
                 }
             }
-            let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
+            let lost = vm.port.and_then(|p| switch.as_ref().map(|s| s.counts(p))).unwrap_or_default();
             if lost.dropped != 0 {
                 let _ = write!(out, "  {} frames dropped for it", lost.dropped);
             }
@@ -1317,12 +1488,11 @@ impl Vms {
             let _ = write!(out, "  exits {}  irq {}  hlt {}  kicks {}  {}",
                 exits, irq, hlt, s.doorbells.kicks(), vm.kernel);
             if !running {
-                let _ = write!(out, "  -- {}", *s.reason.lock());
+                let _ = write!(out, "  -- {}", s.reason_copy());
             }
             let _ = writeln!(out);
         }
-        drop(table);
-        if let Some(s) = self.switch.lock().as_ref() {
+        if let Some(s) = switch.as_ref() {
             let (to_host, refused, dhcp, foreign) = s.host_counts();
             let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers, \
                                    {} of nothing the switch carries (dropped)",
@@ -1349,7 +1519,7 @@ impl Vms {
         let shared = match self.find(word) {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(out, "{}", e);
+                let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
@@ -1393,7 +1563,7 @@ impl Vms {
         let shared = match self.find(word) {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(out, "{}", e);
+                let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
@@ -1427,7 +1597,7 @@ impl Vms {
         let shared = match self.find(word) {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(out, "{}", e);
+                let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
@@ -1527,7 +1697,7 @@ impl Vms {
         let shared = match self.find(word) {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(out, "{}", e);
+                let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
@@ -1573,7 +1743,7 @@ impl Vms {
             }
             if !running {
                 let _ = writeln!(out, "hv: vm {} stopped without printing \"{}\" -- {}",
-                                 shared.id, text, *shared.reason.lock());
+                                 shared.id, text, shared.reason_copy());
                 return;
             }
             if kcore::time::boot_time_ns().saturating_sub(start) >= secs * NS_PER_SEC {
@@ -1595,7 +1765,7 @@ impl Vms {
         let shared = match self.find(word) {
             Ok(s) => s,
             Err(e) => {
-                let _ = writeln!(out, "{}", e);
+                let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
@@ -1663,18 +1833,25 @@ impl Vms {
     /// one, as a reset button would, or one that has stopped. The VM's task
     /// does it; this waits until the new boot is built, or has failed to be,
     /// so that what comes next in a script finds it booting.
-    pub fn restart(&self, args: &str, out: &mut Output) {
+    pub fn restart(&self, args: &str, out: &mut dyn Write) {
         let (word, _) = after_word(args);
-        let shared = match self.find(word) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(out, "{}", e);
-                return;
+        match self.restart_vm(word, &|| false) {
+            Ok(id) => {
+                let _ = writeln!(out, "hv: vm {} restarted", id);
             }
-        };
+            Err(e) => {
+                let _ = writeln!(out, "hv: {}", e);
+            }
+        }
+    }
+
+    /// The VM `word` names booted again (`restart`): its number once the new
+    /// boot is built, or why not -- and no longer waited for once `give_up`
+    /// says so: a job cancelled, the module going.
+    pub fn restart_vm(&self, word: &str, give_up: &dyn Fn() -> bool) -> Result<u32, String> {
+        let shared = self.find(word)?;
         if shared.stopping.load(Ordering::Acquire) {
-            let _ = writeln!(out, "hv: vm {} is being stopped -- not restarted", shared.id);
-            return;
+            return Err(alloc::format!("vm {} is being stopped -- not restarted", shared.id));
         }
         let before = shared.restarts.load(Ordering::Acquire);
         shared.reset.store(true, Ordering::Release);
@@ -1684,25 +1861,24 @@ impl Vms {
         loop {
             kcore::task::sleep_ms(POLL_MS);
             if shared.restarts.load(Ordering::Acquire) != before {
-                let _ = writeln!(out, "hv: vm {} restarted", shared.id);
-                return;
+                return Ok(shared.id);
             }
             /* Stopped meanwhile -- by a command, or the unload: its task
              * leaves on the stop flag without taking the reset up, and there
              * is nothing to wait for. */
             if shared.stop.load(Ordering::Acquire) {
-                let _ = writeln!(out, "hv: vm {} was stopped -- not restarted", shared.id);
-                return;
+                return Err(alloc::format!("vm {} was stopped -- not restarted", shared.id));
             }
             /* Taken up, and not running: its build failed, or it was
              * stopped meanwhile -- the reason says which. */
             if !shared.reset.load(Ordering::Acquire) && !shared.running() {
-                let _ = writeln!(out, "hv: vm {} not restarted -- {}", shared.id, *shared.reason.lock());
-                return;
+                return Err(alloc::format!("vm {} not restarted -- {}", shared.id, shared.reason_copy()));
             }
             if kcore::time::boot_time_ns() >= deadline {
-                let _ = writeln!(out, "hv: vm {} is still not booted again after {} s", shared.id, RESTART_WAIT_S);
-                return;
+                return Err(alloc::format!("vm {} is still not booted again after {} s", shared.id, RESTART_WAIT_S));
+            }
+            if give_up() {
+                return Err(alloc::format!("vm {} is being booted again -- not waited for", shared.id));
             }
         }
     }
@@ -1713,7 +1889,7 @@ impl Vms {
     /// is still running, wait for its vCPUs, and say how it ended. One that
     /// does not listen to the button is stopped at once, and `secs=0` stops
     /// it without asking.
-    pub fn stop(&self, args: &str, out: &mut Output, forwards: &Forwards) {
+    pub fn stop(&self, args: &str, out: &mut dyn Write, forwards: &Forwards) {
         let (word, rest) = after_word(args);
         let secs = match stop_secs(rest) {
             Ok(s) => s,
@@ -1730,55 +1906,55 @@ impl Vms {
             let _ = writeln!(out, "hv stop <id|name|all> [secs=N]");
             return;
         }
-        let id = match self.id_of(word) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = writeln!(out, "{}", e);
-                return;
+        match self.stop_vm(word, secs, forwards, &|| false) {
+            Ok(s) => {
+                let _ = writeln!(out, "hv: vm {} stopped -- {}{}", s.id, s.reason, s.asked);
+                if s.forwarded != 0 {
+                    let _ = writeln!(out, "hv: its {} forward(s) taken away with it", s.forwarded);
+                }
+                let _ = out.write_str(&s.report);
             }
-        };
+            Err(e) => {
+                let _ = writeln!(out, "hv: {}", e);
+            }
+        }
+    }
+
+    /// The VM `word` names stopped (`stop`), given `secs` to turn itself off
+    /// once its power button is pressed -- 0 to stop it where it is, and
+    /// stopped there too once `give_up` says so: how it ended, or why it was
+    /// not stopped here.
+    pub fn stop_vm(&self, word: &str, secs: u64, forwards: &Forwards, give_up: &dyn Fn() -> bool)
+                   -> Result<Stopped, String> {
+        let id = self.id_of(word)?;
         /* On the list while its power button has its time: its CPUs are
          * still in use, and an unload has to see it. */
-        let shared = {
-            let table = self.table.lock();
-            match table.vms.iter().find(|vm| vm.shared.id == id) {
-                Some(vm) => vm.shared.clone(),
-                None => {
-                    let _ = writeln!(out, "hv: no vm {}", id);
-                    return;
-                }
-            }
-        };
+        let shared = self.table.lock().vms.iter().find(|vm| vm.shared.id == id).map(|vm| vm.shared.clone());
+        let shared = shared.ok_or_else(|| alloc::format!("no vm {}", id))?;
         if shared.stopping.swap(true, Ordering::AcqRel) {
-            let _ = writeln!(out, "hv: vm {} is being stopped already", id);
-            return;
+            return Err(alloc::format!("vm {} is being stopped already", id));
         }
         if secs != 0 && shared.press() {
             /* An unload meanwhile gives it its own time, and whichever of
              * the two runs out first takes it off the list: this wait ends
              * there too, the guest no longer running. */
-            wait_shut_down(secs, || shared.shutting_down());
+            wait_shut_down(secs, || shared.shutting_down() && !give_up());
         }
         let asked = shared.asked(secs);
         let vm = {
             let mut table = self.table.lock();
             table.vms.iter().position(|vm| vm.shared.id == id).map(|i| table.vms.remove(i))
         };
-        let Some(vm) = vm else {
-            /* `hv stop all`, or the unload, took it meanwhile, and says how
-             * it ended. */
-            let _ = writeln!(out, "hv: vm {} was stopped meanwhile", id);
-            return;
-        };
+        /* `hv stop all`, or the unload, took it meanwhile, and says how it
+         * ended. */
+        let vm = vm.ok_or_else(|| alloc::format!("vm {} was stopped meanwhile", id))?;
         let port = vm.port;
         finish(vm);
         self.release(port);
         let forwarded = forwards.drop_vm(id);
-        let _ = writeln!(out, "hv: vm {} stopped -- {}{}", id, *shared.reason.lock(), asked);
-        if forwarded != 0 {
-            let _ = writeln!(out, "hv: its {} forward(s) taken away with it", forwarded);
-        }
-        out.write_bytes(shared.report.lock().as_bytes());
+        let reason = shared.reason_copy();
+        let report = shared.report.lock().clone();
+        Ok(Stopped { id, reason, asked, forwarded, report })
     }
 
     /// Stop every VM and take it off the list, saying how each ended -- to
@@ -1788,7 +1964,7 @@ impl Vms {
     /// giving its time already is not pressed again, only waited for. Each
     /// one's forwards go with it, when there are `forwards` still to take
     /// them from.
-    pub fn stop_all(&self, mut out: Option<&mut Output>, secs: u64, forwards: Option<&Forwards>) {
+    pub fn stop_all(&self, mut out: Option<&mut dyn Write>, secs: u64, forwards: Option<&Forwards>) {
         let mut pressed = 0usize;
         for vm in &self.table.lock().vms {
             if !vm.shared.stopping.swap(true, Ordering::AcqRel) && secs != 0 && vm.shared.press() {
@@ -1861,6 +2037,85 @@ impl Vms {
         drop(switch);
     }
 
+    /// Every VM on the list as the host API reads it, copied out under the
+    /// table's lock and read live after (`snapshot`); None out of memory.
+    pub fn listed(&self) -> Option<Vec<Listed>> {
+        let now = kcore::time::boot_time_ns();
+        let views = self.snapshot()?;
+        let mut all = Vec::new();
+        all.try_reserve_exact(views.len()).ok()?;
+        for v in views {
+            let s = &v.shared;
+            let running = s.running();
+            let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
+            let state = match (running, s.stopping.load(Ordering::Acquire)) {
+                (true, true) => "stopping",
+                (true, false) => "running",
+                (false, _) => "stopped",
+            };
+            let (exits, _, _) = s.totals();
+            all.push(Listed {
+                id: s.id,
+                name: v.name,
+                state,
+                cpus: v.cpus,
+                mem_mib: v.mem_mib,
+                port: v.port,
+                uptime_ms: until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_MS,
+                restarts: s.restarts.load(Ordering::Relaxed),
+                reason: if running { String::new() } else { s.reason_copy() },
+                exits,
+                kernel: v.kernel,
+                console_bytes: s.console_total(),
+            });
+        }
+        Some(all)
+    }
+
+    /// The console of the VM `word` names from byte `from` on, at most `max`
+    /// bytes of it: its control sequences taken out (`guest::printable`) --
+    /// or, for a `terminal`, filtered as `hv attach` filters them
+    /// (`TermFilter`), a sequence the page would cut in two left for the
+    /// next. The text, where what it was made of begins -- after `from` when
+    /// the ring no longer has what came before -- and ends, the next page's
+    /// `from`; and where the console is now.
+    pub fn console_page(&self, word: &str, from: u64, max: usize, terminal: bool) -> Result<ConsolePage, String> {
+        let shared = self.find(word)?;
+        let mut raw = Vec::new();
+        let (start, total) = {
+            let ring = shared.console.lock();
+            let start = ring.page(from, max, &mut raw).ok_or_else(|| String::from("out of memory"))?;
+            (start, ring.total())
+        };
+        let mut text = Vec::new();
+        let taken = if terminal {
+            text.try_reserve(raw.len() + 2 * TERM_SLACK).map_err(|_| String::from("out of memory"))?;
+            TermFilter::new().filter_whole(&raw, &mut text)
+        } else if guest::printable(&raw, &mut text) {
+            raw.len()
+        } else {
+            return Err(String::from("out of memory"));
+        };
+        Ok(ConsolePage { text, start, end: start + taken as u64, total })
+    }
+
+    /// `bytes` typed at the VM `word` names, as `hv send` types them: now,
+    /// as at a terminal. How many were queued.
+    pub fn type_at(&self, word: &str, bytes: &[u8]) -> Result<usize, String> {
+        let shared = self.find(word)?;
+        if !shared.running() {
+            return Err(alloc::format!("vm {} is not running", shared.id));
+        }
+        shared.typed.store(true, Ordering::Release);
+        shared.type_in(bytes).map(|_| bytes.len())
+            .ok_or_else(|| alloc::format!("vm {}'s input is full -- nothing typed", shared.id))
+    }
+
+    /// The guests' switch, if one is up.
+    pub fn switch_now(&self) -> Option<Arc<Switch>> {
+        self.switch.lock().clone()
+    }
+
     /// The guests' switch, made the first time it is asked for.
     fn switch(&self) -> Result<Arc<Switch>, String> {
         let mut switch = self.switch.lock();
@@ -1884,6 +2139,28 @@ impl Vms {
     /// The guests' switch, if there is one: for `hv forward`.
     pub fn host_nic(&self) -> Option<kcore::net::Nic> {
         self.switch.lock().as_ref().and_then(|s| s.host_nic())
+    }
+
+    /// The ports of the switch the VMs on the list hold.
+    pub fn ports_held(&self) -> Vec<usize> {
+        let mut ports = Vec::new();
+        if ports.try_reserve_exact(MAX_VMS).is_err() {
+            return ports;
+        }
+        let table = self.table.lock();
+        /* Into the room taken above: the table holds MAX_VMS at most. */
+        ports.extend(table.vms.iter().filter_map(|vm| vm.port));
+        ports
+    }
+
+    /// The name of VM `id`, when it was started from its folder.
+    pub fn name_of(&self, id: u32) -> Option<String> {
+        let table = self.table.lock();
+        let name = table.vms.iter().find(|vm| vm.shared.id == id)?.name.as_deref()?;
+        let mut copy = String::new();
+        copy.try_reserve_exact(name.len()).ok()?;
+        copy.push_str(name);
+        Some(copy)
     }
 
     /// The address of the running VM `id`, when it has a NIC.

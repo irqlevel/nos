@@ -377,6 +377,9 @@ pub fn ext2(r: &mut Input) {
     }
     f.compare();
     f.close_all();
+    /* What the driver says it has room for, before it goes: its counts as
+     * the unmount writes them, which the check reads back from the bitmaps. */
+    let space = vfs.space_of(b"/a/path/not/there/yet");
     invariant!(vfs.unmount(b"/"), "the unmount at the end was refused");
     disk::with(0, |d| d.no_writes = Some("its ext2 is unmounted".into()));
 
@@ -392,6 +395,10 @@ pub fn ext2(r: &mut Input) {
     }
     invariant!(c.corrupt.is_empty(), "the image after a clean unmount is corrupt: {:?}", c.corrupt);
     invariant!(c.unclean.is_empty(), "the image after a clean unmount is not clean: {:?}", c.unclean);
+    let counted = fs::vfs::Space { total_bytes: c.data_bytes, free_bytes: c.free_bytes };
+    invariant!(space == Some(counted), "ext2 said it had {:?} before its clean unmount, and its bitmaps say {:?}",
+               space, counted);
+    reached("ext2's space held to its bitmaps");
     far_reached(&f.model.tree, bs);
     let ro_compat = img::rd32(&media.bytes(img::SB_OFFSET, 1024), img::sb::FEATURE_RO_COMPAT);
     if !g.large_file && ro_compat & img::RO_COMPAT_LARGE_FILE != 0 && !made_large(&tree) {
@@ -409,6 +416,8 @@ pub fn ext2(r: &mut Input) {
     }
     let again = fs::ext2::mount_at("/", dev.handle(), read_only);
     invariant!(again == read_only as i32, "ext2 mounted at the end as {}", again);
+    invariant!(vfs.space_of(b"/") == Some(counted), "ext2 mounted again says it has {:?}, and its bitmaps {:?}",
+               vfs.space_of(b"/"), counted);
     f.compare();
     invariant!(vfs.unmount(b"/"), "the last unmount was refused");
 

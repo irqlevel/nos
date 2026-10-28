@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -122,6 +123,10 @@ dependencies = [
  "inout",
  "zeroize",
 ]
+
+[[package]]
+name = "conf"
+version = "0.1.0"
 
 [[package]]
 name = "const-oid"
@@ -324,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -445,6 +451,7 @@ name = "kcore"
 version = "0.1.0"
 dependencies = [
  "ffi",
+ "mgmtwire",
 ]
 
 [[package]]
@@ -457,6 +464,8 @@ dependencies = [
  "hello",
  "igb",
  "kcore",
+ "mgmt",
+ "mgmtwire",
  "net",
  "nvme",
  "r8125",
@@ -500,6 +509,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "mgmt"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+ "mgmtwire",
+]
+
+[[package]]
+name = "mgmtwire"
+version = "0.1.0"
+
+[[package]]
+name = "mod-api"
+version = "0.1.0"
+dependencies = [
+ "conf",
+ "kcore",
+ "kmod",
+ "mgmtwire",
+ "tls",
+ "web",
+ "zeroize",
+]
+
+[[package]]
 name = "mod-blkload"
 version = "0.1.0"
 dependencies = [
@@ -536,10 +571,12 @@ dependencies = [
 name = "mod-hv"
 version = "0.1.0"
 dependencies = [
+ "conf",
  "diskimage",
  "hv",
  "kcore",
  "kmod",
+ "mgmtwire",
  "netwire",
 ]
 
@@ -593,6 +630,7 @@ dependencies = [
  "ffi",
  "fs",
  "kcore",
+ "mgmt",
  "netwire",
  "tls",
 ]
@@ -1126,6 +1164,8 @@ dependencies = [
  "kcore",
  "rustls",
  "rustls-rustcrypto",
+ "rustls-webpki 0.103.15",
+ "sha2",
  "webpki-roots",
 ]
 
@@ -1218,6 +1258,16 @@ name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+
+[[package]]
+name = "web"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "p256",
+ "sha2",
+ "zeroize",
+]
 
 [[package]]
 name = "webpki-roots"
