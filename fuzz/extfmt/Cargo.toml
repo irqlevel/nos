@@ -1,0 +1,21 @@
+# extfmt on the host: the ext2/3/4 format crate hvboot and the kernel's ext4
+# driver read through, run over filesystems e2fsprogs made -- every checksum
+# of every metadata block checked against what extfmt computes -- and over
+# them damaged at random (scripts/extfmt-test.py). Its one dependency is
+# extfmt itself, a path of the tree's, so it builds offline.
+[package]
+name = "extfmt-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+extfmt = { path = "../../src/crates/extfmt" }
+
+# Overflow checks on, as a RUSTUB=1 build has them: what a disk says is
+# untrusted, and an overflow on it is a bug of its own.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]
