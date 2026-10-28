@@ -1313,7 +1313,7 @@ static bool is_blank(char c)
     return c == ' ' || c == '\t';
 }
 
-void ModuleTable::start_load(const char* args, stdlib::Printer& out)
+ModuleTable::JobOutcome ModuleTable::start_load(const char* args, stdlib::Printer& out)
 {
     /* The path is the first word, the parameters everything after it but
        the blanks between: handed to the module's init as they are */
@@ -1327,32 +1327,33 @@ void ModuleTable::start_load(const char* args, stdlib::Printer& out)
     if (path_len > PATH_LEN_MAX)
     {
         out.printf("insmod: the path is longer than %lu\n", PATH_LEN_MAX);
-        return;
+        return JobOutcome::NotStarted;
     }
     if (stdlib::str_len(params) > PARAMS_MAX)
     {
         out.printf("insmod: the parameters are longer than %lu\n", PARAMS_MAX);
-        return;
+        return JobOutcome::NotStarted;
     }
 
     char path[PATH_LEN_MAX + 1];
     stdlib::mem_cpy(path, args, path_len);
     path[path_len] = '\0';
-    start_job(false, path, params, out);
+    return start_job(false, path, params, out);
 }
 
-void ModuleTable::start_unload(const char* name, stdlib::Printer& out)
+ModuleTable::JobOutcome ModuleTable::start_unload(const char* name, stdlib::Printer& out)
 {
-    start_job(true, name, "", out);
+    return start_job(true, name, "", out);
 }
 
-void ModuleTable::start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out)
+ModuleTable::JobOutcome ModuleTable::start_job(bool unload, const char* arg, const char* params,
+    stdlib::Printer& out)
 {
     const char* what = unload ? "rmmod" : "insmod";
     if (stdlib::str_len(arg) > PATH_LEN_MAX || stdlib::str_len(params) > PARAMS_MAX)
     {
         out.printf("%s: %s is too long\n", what, arg);
-        return;
+        return JobOutcome::NotStarted;
     }
 
     ModuleJob* job = mm::talloc<ModuleJob, TAG>(unload, arg, params);
@@ -1365,7 +1366,7 @@ void ModuleTable::start_job(bool unload, const char* arg, const char* params, st
         if (job != nullptr)
             mm::free(job);
         out.printf("%s: cannot start a task for it\n", what);
-        return;
+        return JobOutcome::NotStarted;
     }
 
     /* The run queue keeps a reference of its own until the task has exited */
@@ -1375,19 +1376,25 @@ void ModuleTable::start_job(bool unload, const char* arg, const char* params, st
          waited += JOB_POLL_MS)
         sleep(JOB_POLL_MS * consts::NANO_SECS_IN_MS);
 
+    JobOutcome outcome = JobOutcome::Done;
     if (job->state.cmpxchg(JOB_ABANDONED, JOB_RUNNING) == JOB_RUNNING)
     {
         out.printf("%s: %s is taking its time and goes on in the background --"
             " lsmod shows where it is, the kernel log will say how it ended\n", what, arg);
+        outcome = JobOutcome::Pending;
     }
     else
     {
         out.print_string(job->output);
         if (job->result != stdlib::Error::SUCCESS)
+        {
             out.printf("%s: %s failed, error %lu\n", what, arg, (ulong)job->result);
+            outcome = JobOutcome::Failed;
+        }
     }
 
     put_job(job);
+    return outcome;
 }
 
 bool ModuleTable::is_loaded(const char* name)
@@ -1396,6 +1403,32 @@ bool ModuleTable::is_loaded(const char* name)
     const bool loaded = (find_locked(name) != nullptr);
     lock_.unlock_irq_restore(flags);
     return loaded;
+}
+
+ulong ModuleTable::snapshot(ModuleSnapshot* out, ulong max)
+{
+    if (out == nullptr)
+        return 0;
+
+    ulong n = 0;
+    const ulong flags = lock_.lock_irq_save();
+    for (stdlib::ListEntry* entry = list_.flink; entry != &list_ && n < max; entry = entry->flink)
+    {
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, list_entry);
+        stdlib::mem_cpy(out[n].name, module->name, sizeof(out[n].name));
+        out[n].name[sizeof(out[n].name) - 1] = '\0';
+        out[n].size = module->image.count * consts::PAGE_SIZE;
+        out[n].imports = module->imports;
+        out[n].phase = SNAPSHOT_LIVE;
+        if (module->phase == ModulePhase::Loading)
+            out[n].phase = SNAPSHOT_LOADING;
+        else if (module->phase == ModulePhase::Unloading)
+            out[n].phase = SNAPSHOT_UNLOADING;
+        out[n].permanent = (module->permanent_by != nullptr) ? 1 : 0;
+        n++;
+    }
+    lock_.unlock_irq_restore(flags);
+    return n;
 }
 
 void ModuleTable::dump(stdlib::Printer& out)

@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "provider": "block",
+  "title": {"en": "Disks", "ru": "Диски"},
+  "help": {"en": "Every block device: the disks, the partitions the kernel found on them, and who holds each.", "ru": "Все блочные устройства: диски, найденные на них разделы и кто их занимает."},
+  "ui": {"section": "storage", "order": 30, "icon": "disk"},
+  "methods": {
+    "disks": {"kind": "read", "title": {"en": "Disks and partitions", "ru": "Диски и разделы"}}
+  },
+  "resources": {
+    "disks": {
+      "title": {"en": "Disks and partitions", "ru": "Диски и разделы"},
+      "list": "disks", "items": "disks", "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "disk": {"type": "string", "title": {"en": "On disk", "ru": "На диске"},
+          "help": {"en": "The disk a partition is on; none for a whole disk.", "ru": "Диск, на котором раздел; пусто для целого диска."}},
+        "start_sector": {"type": "int", "title": {"en": "First sector", "ru": "Первый сектор"}},
+        "sectors": {"type": "int", "title": {"en": "Sectors", "ru": "Секторов"}},
+        "sector_bytes": {"type": "bytes", "title": {"en": "Sector", "ru": "Сектор"}},
+        "size_bytes": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "partitions": {"type": "int", "title": {"en": "Partitions", "ru": "Разделов"}},
+        "held_by": {"type": "string", "title": {"en": "Held by", "ru": "Занят"}}
+      },
+      "columns": ["name", "disk", "size_bytes", "partitions", "held_by"]
+    }
+  }
+}

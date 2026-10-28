@@ -37,7 +37,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `disklog` | Kernel-log-to-disk state: off unless the kernel was booted with `disklog=on`; otherwise the prepared area it found (if any), boot number, sectors written, lines queued and dropped. The area is laid down under the host OS with `scripts/disklog.py format` and read back with `scripts/disklog.py read` |
 | `irqstat` | Show per-device interrupt counters |
 | `help` | List commands |
-| `net` | List network devices and per-protocol stats |
+| `net` | List network devices: the frames and bytes each has sent and received, and per-protocol stats |
 | `arp` | Show ARP table |
 | `nat` / `nat allow <a.b.c.d[/n]>` / `nat deny <a.b.c.d[/n]>` | Whether NAT is on, between which devices and from which address; the first mappings, each with its protocol, the guest's side, where it goes, the external port it has and how long it has left; where the guests are kept from -- link-local (a cloud's metadata server), the private networks, the shared space, the uplink's own subnet -- and what `nat allow` let through of it; and what NAT has done -- packets out and back, mappings made and those made by taking the least lately used flow of the guest holding the most (a full table), and the packets it had no room, next hop or frame for, does not take, or denied. `allow` lets the guests reach a network the deny list keeps them from, up to 16, and `deny` takes that back. The hypervisor's switch turns it on for its guests. See [The way out](hypervisor.md#the-way-out-nat-dhcp-and-dns) |
 | `netpool` | Show the recycled net frame pool: frames in the ring, in per-CPU caches, in flight |

@@ -12,7 +12,9 @@
 //! - [`Params`]: the parameters a method is handed, taken by name and
 //!   checked, and refused whole if one is left over that it does not know;
 //! - [`Status`]: what a call ends with, as a code the C ABI carries and a
-//!   name a client reads.
+//!   name a client reads;
+//! - [`descriptor`]: a provider's descriptor checked against what it
+//!   registers.
 //!
 //! It runs in the kernel, so nothing here allocates without being able to
 //! fail: what a text would make is refused when there is no memory for it,
@@ -23,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod descriptor;
 pub mod json;
 mod params;
 mod status;

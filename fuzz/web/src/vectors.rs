@@ -19,6 +19,7 @@ pub fn run() -> usize {
     http_vectors(&mut f);
     cidr_vectors(&mut f);
     x509_vectors(&mut f);
+    crate::descriptors::vectors(&mut f);
     println!("vectors: {} failed", f.0);
     f.0
 }

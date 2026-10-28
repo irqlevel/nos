@@ -6,6 +6,7 @@ extern crate alloc;
 mod frames;
 mod ring;
 mod sha256;
+mod system;
 
 use ffi::alloc::KernelAllocator;
 
@@ -26,9 +27,11 @@ fn alloc_error(layout: core::alloc::Layout) -> ! {
 pub extern "C" fn rust_init() {
     hello::hello();
     /* The management bus, first: the layers register their providers on it
-       as they come up. Made earlier still if the boot's test of modules
-       needed it (rust_mgmt_init); then this is nothing. */
+       as they come up. The bus itself may have been made earlier still, by
+       a module the boot's test of modules loaded; this puts its command in
+       front of whoever runs one. Then the kernel's own provider. */
     mgmt::init();
+    system::init();
     /* The pool itself was seeded from Main2 (rust_random_setup); this puts
        its `random` and `entropy` commands in front of whoever runs one. */
     random::init();
@@ -126,6 +129,9 @@ fn tco_init() {
 pub extern "C" fn rust_test() {
     hello::test();
     mgmt::selftest();
+    /* Every layer has registered its provider by now: each read of each
+       answered, as JSON */
+    system::selftest();
     random::selftest();
     sha256::selftest();
     frames::selftest();

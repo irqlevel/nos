@@ -10,11 +10,14 @@
 //!   back what its writer wrote, to answering a prefix of anything whole
 //!   with "not yet", and to the limits it is given;
 //! - `web-test cert <dir>`: certificates and keys written out for OpenSSL and
-//!   Python's ssl to judge (scripts/web-test.py).
+//!   Python's ssl to judge (scripts/web-test.py);
+//! - `web-test descriptor <file>...`: providers' descriptors checked as the
+//!   bus checks them, each for the methods it says it has.
 //!
 //! Exit code 0: every check held; 1: one did not.
 
 mod certs;
+mod descriptors;
 mod fuzzing;
 mod vectors;
 
@@ -78,8 +81,9 @@ fn main() -> ExitCode {
             fuzzing::run(seed, iters)
         }
         Some("cert") if args.len() == 2 => certs::write(&args[1]),
+        Some("descriptor") if args.len() >= 2 => args[1..].iter().map(|p| descriptors::file(p)).sum(),
         _ => {
-            eprintln!("usage: web-test vectors | fuzz [--seed N] [--iters N] | cert <dir>");
+            eprintln!("usage: web-test vectors | fuzz [--seed N] [--iters N] | cert <dir> | descriptor <file>...");
             return ExitCode::from(2);
         }
     };
