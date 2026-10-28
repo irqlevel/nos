@@ -32,6 +32,10 @@ pub struct Check {
     /// The superblock says the filesystem is mounted: not cleanly
     /// unmounted, as a crash leaves it.
     pub mounted: bool,
+    /// By block, whether it holds none of the filesystem's metadata: it is
+    /// nobody's, or a regular file's data. Empty when the image is too
+    /// damaged to say.
+    pub no_metadata: Vec<bool>,
 }
 
 impl Check {
@@ -730,6 +734,16 @@ pub fn check(media: &Media, dev_bytes: u64) -> Check {
         }
         if fs.wide16(&d, gd::USED_DIRS, gd::USED_DIRS_HI) != dirs_g {
             c.unclean(format!("group {} counts {} directories, has {}", g, fs.wide16(&d, gd::USED_DIRS, gd::USED_DIRS_HI), dirs_g));
+        }
+    }
+    c.no_metadata = (0..blocks).map(|b| b >= first && fs.owner[b as usize] == Owner::Free).collect();
+    for (&n, u) in &in_use {
+        if n >= FIRST_INO && u.mode & S_IFMT == S_IFREG {
+            for &(b, _) in u.data.values() {
+                if let Some(x) = c.no_metadata.get_mut(b as usize) {
+                    *x = true;
+                }
+            }
         }
     }
     if c.corrupt.iter().any(|e| e.contains("root")) || !in_use.contains_key(&ROOT_INO) {

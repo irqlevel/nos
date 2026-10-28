@@ -52,7 +52,9 @@ impl Txn<'_> {
                 return None;
             }
             inodes::set_size(&mut raw, bs as u64);
-            inodes::add_blocks(self.m, &mut raw, 1);
+            if !inodes::add_blocks(self.m, &mut raw, 1) {
+                return None;
+            }
         }
         if !self.put_inode(ino, &mut raw) || !self.add_entry(dir, name, ino, if is_dir { FT_DIR } else { FT_REG_FILE }) {
             return None;
@@ -160,7 +162,7 @@ impl Txn<'_> {
 impl Ext4 {
     /// Whether a call may change the filesystem: mounted for writing, its
     /// journal not aborted.
-    fn writable(&self) -> bool {
+    pub(super) fn writable(&self) -> bool {
         if !self.mounted || self.read_only {
             trace!(0, "ext4: read-only");
             return false;
@@ -173,7 +175,7 @@ impl Ext4 {
     }
 
     /// A transaction, for one call.
-    fn begin(&mut self) -> Option<Txn<'_>> {
+    pub(super) fn begin(&mut self) -> Option<Txn<'_>> {
         let now = wall_clock_secs() as u32;
         Some(Txn::new(&mut self.io, self.m.as_mut()?, &mut self.cache, self.jnl.as_mut()?, now))
     }

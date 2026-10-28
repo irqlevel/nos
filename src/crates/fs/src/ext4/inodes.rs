@@ -10,6 +10,8 @@ use extfmt::extent::{self, Header, ROOT_MAX};
 use extfmt::inode::{self as xinode, EXTENTS_FL, HUGE_FILE_FL};
 use extfmt::{le16, le32, set_le16, set_le32};
 
+use kcore::trace;
+
 use super::meta::Meta;
 
 /// How long a directory's link count can be before dir_nlink holds it at 1
@@ -68,18 +70,25 @@ pub fn touch(raw: &mut [u8], now: u32, content: bool) {
     }
 }
 
-/// `blocks` filesystem blocks more counted in its i_blocks: in 512-byte
-/// units, or in blocks for an inode huge_file flags so.
-pub fn add_blocks(m: &Meta, raw: &mut [u8], blocks: u64) {
+/// `blocks` filesystem blocks more -- or fewer -- counted in its i_blocks:
+/// in 512-byte units, or in blocks for an inode huge_file flags so. False,
+/// nothing changed, for a count its fields cannot hold: a file of more
+/// than 2 TiB of blocks where the filesystem has no huge_file.
+pub fn add_blocks(m: &Meta, raw: &mut [u8], blocks: i64) -> bool {
     let huge = m.huge_file() && le32(raw, xinode::I_FLAGS) & HUGE_FILE_FL != 0;
-    let units = if huge { blocks } else { blocks * (m.bs as u64 / 512) };
+    let units = if huge { blocks } else { blocks * (m.bs as i64 / 512) };
     let have = u64::from(le32(raw, xinode::I_BLOCKS_LO))
         | if m.huge_file() { u64::from(le16(raw, xinode::I_BLOCKS_HIGH)) << 32 } else { 0 };
-    let total = have + units;
+    let room = if m.huge_file() { (1u64 << 48) - 1 } else { u64::from(u32::MAX) };
+    let Some(total) = have.checked_add_signed(units).filter(|&t| t <= room) else {
+        trace!(0, "ext4: an inode's block count past what its fields hold");
+        return false;
+    };
     set_le32(raw, xinode::I_BLOCKS_LO, total as u32);
     if m.huge_file() {
         set_le16(raw, xinode::I_BLOCKS_HIGH, (total >> 32) as u16);
     }
+    true
 }
 
 /// Deleted at `now`: no links, nothing mapped, nothing counted -- what the

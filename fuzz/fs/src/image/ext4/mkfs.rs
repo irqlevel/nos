@@ -42,6 +42,9 @@ pub struct Style {
     /// The journal's tags and revoke records 64-bit on a filesystem that is
     /// not -- as one shrunk by `resize2fs -s` keeps its journal.
     pub journal_64: bool,
+    /// Second names, each of a file in the same directory: (the link's
+    /// path, the path of what it names) -- one inode, two links.
+    pub links: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
     /// How many metadata blocks' newest copies are only in the journal, in
     /// transactions nobody replayed, their homes holding garbage: 0 for a
     /// clean journal.
@@ -58,6 +61,8 @@ pub struct Made {
     /// The directories holding those entries, by path, and their names.
     pub hidden_at: BTreeMap<Vec<Vec<u8>>, Vec<Vec<u8>>>,
     pub journaled: Vec<u64>,
+    /// The file blocks of each file allocated unwritten, by path.
+    pub unwritten: BTreeMap<Vec<Vec<u8>>, Vec<u64>>,
 }
 
 /// A file's runs: logical block, device block, length, unwritten.
@@ -87,6 +92,8 @@ struct Builder<'a> {
     hidden_at: BTreeMap<Vec<Vec<u8>>, Vec<Vec<u8>>>,
     /// The superblock's seed of the directories' name hash.
     hash_seed: [u32; 4],
+    /// The file blocks of each inode allocated unwritten.
+    unwritten: BTreeMap<u32, Vec<u64>>,
 }
 
 impl Builder<'_> {
@@ -295,6 +302,7 @@ impl Builder<'_> {
                 let junk = self.noise(self.bs);
                 self.write_block(b, &junk);
                 blocks.push((l, b, true));
+                self.unwritten.entry(n).or_default().push(l);
             }
         }
         let runs = Self::runs(&blocks);
@@ -504,6 +512,11 @@ impl Builder<'_> {
         let mut sub: Vec<(u32, &Node, Vec<u8>)> = Vec::new();
         for (name, child) in node.children().expect("a directory") {
             at.push(name.clone());
+            if self.style.links.iter().any(|(l, _)| l == at) {
+                /* A second name: made below, once what it names is. */
+                at.pop();
+                continue;
+            }
             match child {
                 Node::File(content) => {
                     let c = self.file(content)?;
@@ -519,6 +532,18 @@ impl Builder<'_> {
                 }
             }
             at.pop();
+        }
+        for (link, target) in self.style.links.clone() {
+            if link.len() != at.len() + 1 || !link.starts_with(at) {
+                continue;
+            }
+            let Some(&c) = inodes.get(&target) else { return Err("a link to nothing".into()) };
+            inodes.insert(link.clone(), c);
+            children.push((c, link.last().cloned().unwrap_or_default(), FT_REG));
+            if let Some(i) = self.table.get_mut(&c) {
+                let n = rd16(i, ino::LINKS);
+                wr16(i, ino::LINKS, n + 1);
+            }
         }
         if self.style.hidden && self.rand() % 3 == 0 {
             let h = self.hidden_entries()?;
@@ -594,6 +619,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         hidden: 0,
         hidden_at: BTreeMap::new(),
         hash_seed: [0; 4],
+        unwritten: BTreeMap::new(),
     };
     for k in 0..4 {
         b.hash_seed[k] = b.rand() as u32;
@@ -635,7 +661,8 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
     };
     write_super(&mut b, &uuid, journal.as_deref(), !journaled.is_empty());
     let hidden = b.hidden;
-    Ok(Made { media: b.img, inodes, hidden, hidden_at: b.hidden_at, journaled })
+    let unwritten = inodes.iter().filter_map(|(p, n)| b.unwritten.get(n).map(|v| (p.clone(), v.clone()))).collect();
+    Ok(Made { media: b.img, inodes, hidden, hidden_at: b.hidden_at, journaled, unwritten })
 }
 
 /// The groups: inode tables, bitmaps and descriptors, each with its

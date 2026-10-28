@@ -149,7 +149,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
-| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names changed from the shell -- made, moved, an indexed directory written into, files and a tree removed -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount; and a journal debugfs left unreplayed, read through without a byte written |
+| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names and data changed from the shell -- made, moved, an indexed directory written into, files and a tree removed, `fstest`, a copy, a file grown past 4 GiB and cut back -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image and debugfs's extents what was written; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount, every file's MD5 the model's; and a journal debugfs left unreplayed, read through without a byte written |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
@@ -1178,26 +1178,36 @@ to the tree `e2fsck -fy` leaves. The targets:
   byte or three of the metadata at the start of the first groups, or of
   anything else -- refused, or mounted and walked as ext2bad's are, never a
   panic, a write or a leak;
-- `ext4rw`: the same images mounted for writing -- a planted journal
-  replayed by the mount -- and worked with what the driver writes so far,
-  names: files and directories made, a directory grown by a hundred
-  entries, renames and moves, removes, recursive ones among them, now and
-  then a name only the disk has (refused) and an htree directory written
-  into (its index dropped), unmounted and mounted again midway, every answer
-  the model's -- but a refusal for want of an inode or a block, which the
-  model does not count. The image a clean unmount leaves must be clean to the
-  judge, nothing left to replay, and the model's tree. With the power cut at
-  chosen requests, each picture is replayed by the judge's own reader and
-  must be clean to it, then mounted read-only -- the journal read through --
-  and for writing -- the journal replayed -- by the kernel, the three views
-  the same, and what that mount's unmount leaves clean to the judge, its
-  tree what the call in flight may leave: the tree before it or
-  after it, or for a remove, a node at a time, the tree before less some of
-  what was under the path. With requests failing, no call may succeed that
-  the model does not have, nothing may be written in a mount after its first
-  write failed (the journal aborted), and the image, replayed, must be the
-  model's -- or, after a remove that failed, what a remove part way may
-  leave. A filesystem whose journal is 64-bit where the filesystem is not
+- `ext4rw` (`targets/ext4rw.rs`): the same images mounted for writing -- a
+  planted journal replayed by the mount -- and worked as the VFS's callers
+  work a filesystem: files and directories made, a directory grown by
+  dozens of entries, renames and moves, removes, recursive ones among them,
+  now and then a name only the disk has (refused) and an htree directory
+  written into (its index dropped); files opened, written, read, sought,
+  grown and cut through their handles and by path, written whole; disks'
+  images held, read, written and discarded off the VFS's lock -- some
+  writes aimed at blocks mkfs left unwritten -- and files of two names, one
+  held as an image while the other is opened for writing (refused);
+  unmounted and mounted again midway. Every answer is the model's -- but a
+  refusal for want of an inode or a block, which the model does not count
+  -- and the image a clean unmount leaves must be clean to the judge,
+  nothing left to replay, and the model's tree. With the power cut at
+  chosen requests -- and now and then before every request of one call --
+  each picture is judged when its call is done: replayed by the judge's own
+  reader and clean to it, its tree what the call may leave -- the tree
+  before it or after it; for a remove, a node at a time, the tree before
+  less some of what was under the path; for a write, every sector of the
+  file (and its other names) what it held or what it was given, its size
+  between, and nothing of any other file's -- and then mounted by the
+  kernel, on a disk of its own beside the one under test, read-only (the
+  journal read through) and for writing (replayed), both holding the
+  judge's tree, the image that unmount leaves clean. With requests failing,
+  no call may succeed that the model does not have, nothing may be written
+  in a mount after its first failed write of anything but a file's data
+  (the journal aborted) -- a file's data block that does not write fails
+  its call alone, which the judge's map of every block tells apart -- and
+  the image, replayed, must be what the call that met the failure may
+  leave, between the tree before it and the tree it was asked for. A filesystem whose journal is 64-bit where the filesystem is not
   (as `resize2fs -s` leaves one) is among the images: every reader of a
   revoke record must take its width from the journal. `--e2fsck` holds the
   clean images to e2fsck -fn and their tree to debugfs's rdump, and every

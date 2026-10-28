@@ -287,8 +287,9 @@ impl Image {
     /// in part is left as it is, as a disk may leave it. False for a range
     /// not inside the image, an image held for reading, or an I/O error. On
     /// a filesystem with no blocks of its own there is nothing to give back,
-    /// and that is done. The filesystem has its metadata written before it
-    /// is done, so a sync after it is the device's alone.
+    /// and that is done. What the filesystem changed of its own metadata is
+    /// its own to put on the medium -- a journal's commit may come later --
+    /// so the next sync is the filesystem's, as after a write through it.
     pub fn discard(&mut self, offset: u64, len: u64) -> bool {
         if !self.writable || !self.inside_len(offset, len) {
             return false;
@@ -298,6 +299,9 @@ impl Image {
         match vfs.punch(handle, offset, len) {
             Some(given) => {
                 direct.punched += given;
+                if given != 0 {
+                    direct.through_vfs = true;
+                }
                 true
             }
             None => false,
