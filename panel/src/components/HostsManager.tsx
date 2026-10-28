@@ -6,9 +6,10 @@ import type { Words } from '@/lib/i18n';
 
 interface HostRow { id: string; name: string; url: string; pin: string; online: boolean; why: string | null }
 
-/** The hosts the panel manages, whether each answers, and another added:
- * its API's address and its key, which `api status` prints on it -- and
- * there, the panel's key let in. */
+/** The hosts the panel manages, whether each answers -- and why not, when
+ * it does not -- and another added: its API's address and its key, which
+ * `api status` prints on it; and there, the panel's key let in, by a name
+ * of its own: `panel` is that host's own panel's, if it has one. */
 export function HostsManager({ locale, w }: { locale: string; w: Words }) {
   const [list, setList] = useState<HostRow[]>([]);
   const [panelKey, setPanelKey] = useState<string | null>(null);
@@ -58,14 +59,16 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
       {list.length === 0 && <p className="text-sm text-muted">{w.noHosts}</p>}
       <ul className="space-y-2">
         {list.map((h) => (
-          <li key={h.id} className="flex items-center justify-between rounded-xl border border-line bg-card px-4 py-3 text-sm">
-            <div>
+          <li key={h.id} data-testid={`host-${h.name}`}
+            className="flex items-center justify-between gap-4 rounded-xl border border-line bg-card px-4 py-3 text-sm">
+            <div className="min-w-0">
               <Link href={`/${locale}/h/${h.id}`} className="font-medium text-accent hover:underline">{h.name}</Link>
               <span className="ml-2 font-mono text-xs text-muted">{h.url}</span>
               <div className="font-mono text-xs text-muted">{h.pin.slice(0, 16)}…</div>
+              {!h.online && h.why && <div className="mt-1 break-words text-xs text-bad">{h.why}</div>}
             </div>
-            <div className="flex items-center gap-3">
-              <span className={h.online ? 'text-ok' : 'text-bad'} title={h.why ?? ''}>{h.online ? w.online : w.offline}</span>
+            <div className="flex shrink-0 items-center gap-3">
+              <span className={h.online ? 'text-ok' : 'text-bad'}>{h.online ? w.online : w.offline}</span>
               <button type="button" onClick={() => void remove(h.id)} className="text-xs text-muted hover:text-bad">{w.remove}</button>
             </div>
           </li>
@@ -73,12 +76,14 @@ export function HostsManager({ locale, w }: { locale: string; w: Words }) {
       </ul>
       <form onSubmit={add} className="space-y-3 rounded-xl border border-line bg-card p-4">
         <h2 className="text-sm font-medium text-fg">{w.addHost}</h2>
-        <label className="block text-sm text-fg-soft">{w.name}<input value={name} onChange={(e) => setName(e.target.value)} className={input} /></label>
-        <label className="block text-sm text-fg-soft">{w.hostAddress}<input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="203.0.113.5:39234" className={input} /></label>
-        <label className="block text-sm text-fg-soft">{w.hostKey}<input value={pin} onChange={(e) => setPin(e.target.value)} className={input + ' font-mono text-xs'} /></label>
+        <label className="block text-sm text-fg-soft">{w.name}<input name="name" value={name} onChange={(e) => setName(e.target.value)} className={input} /></label>
+        <label className="block text-sm text-fg-soft">{w.hostAddress}<input name="url" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="203.0.113.5:39234" className={input} /></label>
+        <label className="block text-sm text-fg-soft">{w.hostKey}<input name="pin" value={pin} onChange={(e) => setPin(e.target.value)} className={input + ' font-mono text-xs'} /></label>
         {panelKey && (
-          <p className="text-xs text-muted">{w.panelKey}{' '}
-            <code className="rounded bg-bg-soft px-1 font-mono text-fg">api client add panel {panelKey} role=admin</code>
+          <p className="text-xs text-muted" data-testid="panel-key">{w.panelKey}{' '}
+            <code className="break-all rounded bg-bg-soft px-1 font-mono text-fg">
+              api client add panel-{panelKey.slice(0, 8)} admin {panelKey}
+            </code>
           </p>
         )}
         {error && <p role="alert" className="text-sm text-bad">{error}</p>}

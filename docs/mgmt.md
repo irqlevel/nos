@@ -62,7 +62,10 @@ line in the log saying where and why, if it does not hold:
 - **`"methods"`**: exactly the methods it registers, each once with its
   `kind` (`read`, `action`, `job`), a `title`, and optionally `help`,
   `confirm` (an action or a job: what the client asks before it calls),
-  `params` (fields, below) and `result` (a name);
+  `confirm_typed` (with a confirm: the parameter -- a string the call is
+  always given -- whose value the user types again before the client calls,
+  as `vm.delete` has its VM's name typed), `params` (fields, below) and
+  `result` (a name);
 - **`"resources"`**: optional, each a table of things the provider has --
   `list` (a read) and the `items` of its answer that are the rows, `key`
   and `columns` among its `fields`, optionally `get` (a read), `parent`

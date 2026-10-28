@@ -214,6 +214,17 @@ running, and does nothing else: what /etc/rc runs at every boot. `api
 panel` says what its VM is doing, where it is and its certificate's
 fingerprint.
 
+**More hosts.** The panel manages every host added on its Hosts page by its
+API's address and key -- a cluster's hosts, each its own dashboard, pages
+and history -- as one client of all of them, by the key its seed gave it. On
+another host: `api client add panel-<the key's first 8 digits> admin <the
+key>`, which the Hosts page prints (`panel` is that host's own panel's name
+where it has one); `listen = ["hv0", "eth0"]` and `allow_eth0` the panel's
+host's address in its api.toml -- the panel's VM reaches it through hv's NAT,
+from that address -- and `api stop`, `api start`; then, on the Hosts page,
+its address and port and the key its `api status` prints. A host that shows
+another key is never reached, and the Hosts page says which key it showed.
+
 What it does not do yet:
 
 - every browser's connection reaches the panel from hv0's address, since the
