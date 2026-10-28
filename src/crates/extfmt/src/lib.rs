@@ -2,7 +2,9 @@
 //! group descriptors, inodes, extent trees and block maps, directory blocks
 //! and extended attribute blocks, each read through accessors over the
 //! bytes it is stored in -- and every checksum metadata_csum, and gdt_csum
-//! before it, puts on them, computed as the kernel computes it.
+//! before it, puts on them, computed as the kernel computes it. And the
+//! journal's own format, JBD2's ([`jbd2`]), with what replaying a journal
+//! writes worked out as a plan before anything is written ([`recovery`]).
 //!
 //! There is no kernel in it and nothing unsafe: hvboot reads a guest's
 //! /boot through it, the kernel's ext4 driver is to read and write through
@@ -29,6 +31,8 @@ pub mod extent;
 pub mod features;
 pub mod group;
 pub mod inode;
+pub mod jbd2;
+pub mod recovery;
 pub mod sb;
 pub mod xattr;
 

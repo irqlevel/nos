@@ -23,6 +23,30 @@
 //! walks the same image with 1 to 8 of its metadata's bytes changed at a
 //! time, each run a different image, and holds the code to never panicking
 //! and always ending: what a disk says is the disk's to choose.
+//!
+//!     extfmt-test replay <image> <out>
+//!
+//! replays the image's journal by extfmt's planner into a copy -- every copy
+//! the plan names to its home block, the journal marked empty, the
+//! filesystem no longer needing recovery -- and says what the plan was;
+//! `REFUSED` and exit 3 for a journal the planner will not replay.
+//!
+//!     extfmt-test rotate <image> <out> <before>
+//!     extfmt-test log <image>
+//!
+//! turn the journal's ring so that its log starts `before` blocks short of
+//! the ring's end and wraps (the same journal: its blocks say nothing of
+//! where they are), and list the ring's blocks that have a header -- what a
+//! test needs to have e2fsck replay a wrapping log and to damage one block
+//! of a kind.
+//!
+//!     extfmt-test fuzz-journal <image> [--seed N] [--iterations N]
+//!
+//! plans the image's journal with bytes of its superblock and its log
+//! changed at random, and holds the planner to never panicking, always
+//! ending and planning nothing from outside the journal's ring.
+
+mod journal;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -469,19 +493,101 @@ fn fuzz(path: &str, seed: u64, iterations: u64) -> i32 {
     0
 }
 
+fn replay(path: &str, out: &str) -> i32 {
+    let mut img = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            return 2;
+        }
+    };
+    match journal::replay(&mut img) {
+        Ok(plan) => {
+            println!("replayed: {} transactions, {} copies written, {} revoked, next sequence {}",
+                     plan.transactions, plan.writes.len(), plan.revoked, plan.next_sequence);
+            if let Some(t) = plan.failed_commit {
+                println!("corrupt: transaction {}'s commit fails its checksum: not replayed, the log ended there", t);
+            }
+            for w in &plan.writes {
+                println!("write {} {} {} {}", w.home, w.log, u8::from(w.escaped), w.sequence);
+            }
+            if let Err(e) = std::fs::write(out, &img) {
+                eprintln!("{}: {}", out, e);
+                return 2;
+            }
+            0
+        }
+        Err(e) => {
+            println!("REFUSED: {}", e);
+            3
+        }
+    }
+}
+
+fn rotate(path: &str, out: &str, before: &str) -> i32 {
+    let (Ok(mut img), Ok(before)) = (std::fs::read(path), before.parse::<u32>()) else {
+        eprintln!("rotate: {} unreadable, or {} not a number", path, before);
+        return 2;
+    };
+    match journal::rotate(&mut img, before) {
+        Ok(start) => {
+            println!("rotated: the log starts at journal block {}", start);
+            if std::fs::write(out, &img).is_ok() { 0 } else { 2 }
+        }
+        Err(e) => {
+            eprintln!("rotate: {}", e);
+            2
+        }
+    }
+}
+
+fn log(path: &str) -> i32 {
+    let blocks = std::fs::read(path).map_err(|e| e.to_string()).and_then(|img| journal::log(&img));
+    match blocks {
+        Ok((offsets, blocks)) => {
+            for (b, at) in offsets.iter().enumerate() {
+                println!("map {} at {}", b, at);
+            }
+            for (b, kind, seq, at) in blocks {
+                println!("block {} type {} sequence {} at {}", b, kind, seq, at);
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("log: {}", e);
+            2
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let code = match args.get(1).map(String::as_str) {
         Some("crc") => crc(),
         Some("verify") if args.len() >= 3 => verify(&args[2], args.iter().any(|a| a == "--regions")),
+        Some("replay") if args.len() >= 4 => replay(&args[2], &args[3]),
+        Some("rotate") if args.len() >= 5 => rotate(&args[2], &args[3], &args[4]),
+        Some("log") if args.len() >= 3 => log(&args[2]),
+        Some("fuzz-journal") if args.len() >= 3 => {
+            let seed = flag("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
+            let iterations = flag("--iterations").and_then(|s| s.parse().ok()).unwrap_or(2000);
+            match std::fs::read(&args[2]) {
+                Ok(mut img) => journal::fuzz(&mut img, seed, iterations),
+                Err(e) => {
+                    eprintln!("{}: {}", args[2], e);
+                    2
+                }
+            }
+        }
         Some("fuzz") if args.len() >= 3 => {
             let seed = flag("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
             let iterations = flag("--iterations").and_then(|s| s.parse().ok()).unwrap_or(2000);
             fuzz(&args[2], seed, iterations)
         }
         _ => {
-            eprintln!("usage: extfmt-test crc | verify <image> [--regions] | fuzz <image> [--seed N] [--iterations N]");
+            eprintln!("usage: extfmt-test crc | verify <image> [--regions] | fuzz <image> [--seed N] [--iterations N] \
+                       | replay <image> <out> | fuzz-journal <image> [--seed N] [--iterations N]");
             2
         }
     };

@@ -24,6 +24,19 @@ extfmt computes; to agreeing with e2fsck -- bytes of checksummed metadata
 changed one at a time, and extfmt and `e2fsck -fn` both say so; and to never
 panicking and always ending over each image damaged at random.
 
+Then the journal. debugfs writes transactions into an image's journal and
+leaves them unreplayed -- with v3's checksums and without, 64-bit tags and
+32-bit: blocks written and written again, a block whose first word is the
+journal's magic, revokes before and after a write, three hundred blocks at
+once, one transaction left uncommitted -- and extfmt's recovery planner and
+`e2fsck -E journal_only` each replay it: the two images must be the same
+byte for byte but for the superblock fields e2fsck keeps for itself, and so
+must they with the journal's ring turned so that its log wraps. A torn
+commit must end the log where e2fsck ends it; a descriptor damaged under a
+sound commit, and a copy that fails its checksum, must be refused; and the
+planner, fuzzed over damaged journals, must never panic or plan a copy from
+outside the ring.
+
     python3 scripts/extfmt-test.py                     # the gate
     python3 scripts/extfmt-test.py --iterations 20000  # a longer campaign
 
@@ -192,6 +205,198 @@ def damage(tmp, name, img, regions, rng, trials):
           % (name, trials, ", ".join(kinds)), not missed, "\n".join(missed[:20]))
 
 
+# Journals: images whose journal debugfs wrote and nobody replayed -- with
+# checksums (v3) and without, 64-bit tags and 32-bit -- each replayed by
+# extfmt's planner and by e2fsck, which must leave the same image.
+JOURNAL_IMAGES = [
+    ("journal-4k-csum", ["-t", "ext4", "-b", "4096"], "-c"),
+    ("journal-4k", ["-t", "ext4", "-b", "4096"], ""),
+    ("journal-1k-32bit-csum", ["-t", "ext4", "-b", "1024", "-O", "^64bit"], "-c"),
+    ("journal-1k-32bit", ["-t", "ext4", "-b", "1024", "-O", "^64bit"], ""),
+]
+
+# The superblock fields e2fsck's replay sets for itself -- the time it wrote
+# the superblock, the time of its check, the kilobytes it counts written --
+# and the checksum that covers them: the only bytes in which its image and
+# extfmt's may differ. (The write time is the second e2fsck ran in: the same
+# as debugfs's, mostly.)
+SB_E2FSCK_OWN = [(0x30, 4), (0x40, 4), (0x178, 8), (0x3FC, 4)]
+
+
+def masked(img):
+    b = bytearray(img)
+    for at, n in SB_E2FSCK_OWN:
+        b[1024 + at:1024 + at + n] = bytes(n)
+    return bytes(b)
+
+
+def first_diff(a, b, block):
+    """Where two images first differ: the block, and the byte and the two
+    values there -- None where they do not."""
+    for i in range(0, min(len(a), len(b)), block):
+        if a[i:i + block] != b[i:i + block]:
+            at = next(k for k in range(i, i + block) if a[k] != b[k])
+            return "block %d, byte %#x: %#04x and %#04x" % (i // block, at, a[at], b[at])
+    return None if len(a) == len(b) else "lengths %d and %d" % (len(a), len(b))
+
+
+def journal_image(tmp, name, opts, csum, rng):
+    """An image whose journal holds what one debugfs session wrote: a
+    transaction of three blocks; one of a block whose first word is the
+    journal's magic (escaped in the log); one that only revokes a block of
+    the first; one writing a block of the first again; a revoke, and then
+    the revoked block written again (replayed: the revoke covers only what
+    came before it); three hundred blocks at once, more than a descriptor
+    holds; and one left uncommitted."""
+    block = 1024 if "1024" in opts else 4096
+    img = os.path.join(tmp, name + ".img")
+    with open(img, "wb") as f:
+        f.truncate(64 << 20)
+    r = run(["mke2fs", "-q", "-F"] + opts + [img])
+    if not check("%s: mke2fs %s" % (name, " ".join(opts)), r.returncode == 0, r.stdout + r.stderr):
+        return None, None, None
+    # Home blocks in the filesystem's second half: past its metadata and
+    # its journal, so that no replayed block is one the replay reads.
+    base = (64 << 20) // block // 2
+    files = {}
+    for fname, n in (("d3", 3), ("d1", 1), ("d1b", 1), ("big", 300)):
+        files[fname] = rng.randbytes(n * block)
+    files["magic"] = bytes.fromhex("c03b3998") + rng.randbytes(block - 4)
+    for fname, data in files.items():
+        with open(os.path.join(tmp, "%s.%s" % (name, fname)), "wb") as f:
+            f.write(data)
+    p = lambda fname: os.path.join(tmp, "%s.%s" % (name, fname))
+    b = lambda i: base + i
+    cmds = "\n".join([
+        "jo %s" % csum,
+        "jw -b %d,%d,%d %s" % (b(0), b(1), b(2), p("d3")),
+        "jw -b %d %s" % (b(10), p("magic")),
+        "jw -r %d" % b(1),
+        "jw -b %d %s" % (b(0), p("d1")),
+        "jw -r %d" % b(20),
+        "jw -b %d %s" % (b(20), p("d1b")),
+        "jw -b %d-%d %s" % (b(100), b(399), p("big")),
+        "jw -b %d -c %s" % (b(500), p("d1")),
+        "jc", ""])
+    path = os.path.join(tmp, name + ".debugfs")
+    with open(path, "w") as f:
+        f.write(cmds)
+    r = run(["debugfs", "-w", "-f", path, img])
+    ok = check("%s: debugfs writes eight transactions to the journal, one uncommitted" % name,
+               r.returncode == 0 and "rror" not in r.stdout + r.stderr, r.stdout + r.stderr)
+    # What a replay must leave at each home block: the newest copy of it
+    # that no later revoke covers, the escaped block's magic restored.
+    with open(img, "rb") as f:
+        before = f.read()
+    expect = {b(0): files["d1"], b(1): before[b(1) * block:(b(1) + 1) * block], b(2): files["d3"][2 * block:],
+              b(10): files["magic"], b(20): files["d1b"], b(500): before[b(500) * block:(b(500) + 1) * block]}
+    for i in range(300):
+        expect[b(100 + i)] = files["big"][i * block:(i + 1) * block]
+    return (img, block, expect) if ok else (None, None, None)
+
+
+def replay_both(tmp, name, img, block):
+    """The image replayed by extfmt's plan and by e2fsck: both images, and
+    what each said."""
+    ours = img + ".ours"
+    r = run([BIN, "replay", img, ours])
+    theirs = img + ".theirs"
+    shutil.copyfile(img, theirs)
+    e = run(["e2fsck", "-fy", "-E", "journal_only", theirs])
+    a = open(ours, "rb").read() if r.returncode == 0 else None
+    t = open(theirs, "rb").read()
+    return r, e, a, t
+
+
+def journal_tests(tmp, rng, args):
+    for name, opts, csum in JOURNAL_IMAGES:
+        img, block, expect = journal_image(tmp, name, opts, csum, rng)
+        if img is None:
+            continue
+        r, e, ours, theirs = replay_both(tmp, name, img, block)
+        check("%s: extfmt plans the journal: %s" % (name, r.stdout.splitlines()[0] if r.stdout else ""),
+              r.returncode == 0 and "replayed: 7 transactions" in r.stdout, r.stdout + r.stderr)
+        if ours is None:
+            continue
+        check("%s: e2fsck -E journal_only replays it" % name, e.returncode in (0, 1), e.stdout + e.stderr)
+        d = first_diff(masked(ours), masked(theirs), block)
+        check("%s: the image extfmt's replay leaves is e2fsck's, byte for byte but for e2fsck's own fields"
+              % name, d is None, "first differing block %s" % d)
+        wrong = [h for h, data in expect.items() if ours[h * block:(h + 1) * block] != data]
+        check("%s: newest copies home, revoked ones not, the magic restored, the uncommitted left out" % name,
+              not wrong, "blocks %s" % wrong[:10])
+        r = run([BIN, "verify", img + ".ours"])
+        check("%s: the replayed filesystem's checksums all match" % name, r.returncode == 0, r.stdout + r.stderr)
+
+        # The same journal turned round its ring, its log wrapping.
+        rot = img + ".rot"
+        r = run([BIN, "rotate", img, rot, "5"])
+        if check("%s: the ring turned, the log starting 5 blocks short of its end" % name, r.returncode == 0,
+                 r.stdout + r.stderr):
+            r, e, ours_r, theirs_r = replay_both(tmp, name, rot, block)
+            d = first_diff(masked(ours_r), masked(theirs_r), block) if ours_r else "no replay"
+            check("%s: the wrapping log replayed as e2fsck replays it" % name, d is None,
+                  "first differing block %s: %s" % (d, r.stdout + r.stderr))
+
+        if csum:
+            damage_journal(tmp, name, img, block)
+        r = run([BIN, "fuzz-journal", img, "--seed", str(args.seed), "--iterations", str(args.iterations)],
+                timeout=3600)
+        check("%s: %d damaged journals planned: no panic, nothing planned from outside the ring (%s)"
+              % (name, args.iterations, r.stdout.strip()), r.returncode == 0, r.stdout + r.stderr)
+
+
+def damage_journal(tmp, name, img, block):
+    """A journal damaged where it matters, with v3's checksums: a torn
+    commit ends the log before its transaction, as e2fsck ends it; a
+    descriptor damaged under a sound commit, and a copy damaged, are
+    refused."""
+    r = run([BIN, "log", img])
+    lines = r.stdout.splitlines()
+    where = {int(l.split()[1]): int(l.split()[3]) for l in lines if l.startswith("map ")}
+    blocks = [tuple(int(w) for w in l.split()[1::2]) for l in lines if l.startswith("block ")]
+    commits = [b for b in blocks if b[1] == 2]
+    descriptors = [b for b in blocks if b[1] == 1]
+    with open(img, "rb") as f:
+        base = f.read()
+
+    def damaged(at, tag):
+        b = bytearray(base)
+        b[at] ^= 0x5A
+        path = "%s.%s" % (img, tag)
+        with open(path, "wb") as f:
+            f.write(b)
+        return path
+
+    # The last commit torn: its transaction -- the three hundred blocks --
+    # is not replayed, and the log ends where e2fsck ends it.
+    last = max(commits, key=lambda c: c[2])
+    path = damaged(last[3] + 100, "torn")
+    r, e, ours, theirs = replay_both(tmp, name, path, block)
+    d = first_diff(masked(ours), masked(theirs), block) if ours else "no replay"
+    check("%s: a torn commit ends the log before its transaction, as e2fsck ends it (%s)"
+          % (name, r.stdout.splitlines()[0] if r.stdout else ""),
+          d is None and "replayed: 6 transactions" in r.stdout, "first differing block %s: %s" % (d, r.stdout))
+    check("%s: and both say the transaction was corrupt" % name,
+          "corrupt: transaction 7's commit" in r.stdout and "transaction 7 was corrupt" in e.stdout,
+          r.stdout[:300] + "\n" + e.stdout[:500])
+
+    # A descriptor damaged under its transaction's sound commit.
+    desc = sorted(descriptors, key=lambda c: c[2])[1]
+    path = damaged(desc[3] + 40, "descriptor")
+    r = run([BIN, "replay", path, path + ".ours"])
+    check("%s: a descriptor damaged under a sound commit is refused" % name,
+          r.returncode == 3 and "REFUSED" in r.stdout, r.stdout + r.stderr)
+
+    # A copy damaged: the first transaction's first copy, after its
+    # descriptor.
+    first = sorted(descriptors, key=lambda c: c[2])[0]
+    path = damaged(where[first[0] + 1] + 7, "copy")
+    r = run([BIN, "replay", path, path + ".ours"])
+    check("%s: a copy that fails its tag's checksum is refused" % name,
+          r.returncode == 3 and "REFUSED" in r.stdout, r.stdout + r.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=1)
@@ -229,6 +434,7 @@ def main():
                     timeout=3600)
             check("%s: %d images damaged at random walked: no panic, every walk ending (%s)"
                   % (name, args.iterations, r.stdout.strip()), r.returncode == 0, r.stdout + r.stderr)
+        journal_tests(tmp, rng, args)
     finally:
         if args.keep or failures:
             print("images in " + tmp)
