@@ -291,10 +291,10 @@ a sequential pass does not re-read its indirect blocks per data block.
 
 `src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
 -- through `src/crates/extfmt`, the on-disk format and its checksums as a
-crate with no kernel in it, and writes it through its journal. What it
-writes so far is names: files and directories made, renamed and moved,
-removed -- a file's data, its size changed, is the next step, and until
-then a write or a truncate is refused and said. ext2's driver stays as it
+crate with no kernel in it, and writes it through its journal: names and
+data. What it does not do yet is free at scale -- a truncate, a remove or
+a punch whose blocks one transaction cannot give back, and the orphans
+another kernel left -- which is the next step. ext2's driver stays as it
 is, for the roots made before ext4.
 
 Which driver a filesystem gets is `extfs::driver_for`'s to say, for
@@ -388,7 +388,11 @@ a commit or a checkpoint -- or a flush, `sync`'s among them, whose order
 nothing after could count on -- aborts the journal: nothing more is written, the
 call fails, reads go on, `sync` fails, `mounts` says `journal-aborted`, and
 the unmount writes nothing, leaving the filesystem to the next mount's
-replay -- or e2fsck's.
+replay -- or e2fsck's. A block of a file's data that does not write fails
+its call alone: its transaction is undone, so nothing maps what failed, and
+the filesystem stays writable -- one file's bad sector, a guest disk's, is
+not every file's, as Linux's ordered mode by default (`data_err=ignore`)
+has it too.
 
 Names: a new inode is the lowest free in the first group from its parent's
 that has one -- so that the part of a table never written shrinks by one --
@@ -412,6 +416,40 @@ loses a link at a time; its last one gives back its blocks and its tree's,
 and its share of an attribute block, which goes with its last reference. A
 directory's link count is kept as dir_nlink keeps it: 1 past 65000, and 1
 kept.
+
+Data (`ext4/data.rs`): a write is cut into transactions of at most 256
+blocks, and each one's data is on the device before its commit -- whose
+flush comes first -- as Linux's data=ordered has it, so that no block a
+commit maps into a file can show what it held before. A block mapped and
+written is written over in place, read first where the write covers only
+part of it; one in a hole is allocated and written whole, zeros around what
+goes into it; one in an unwritten extent is written, then made written --
+the extent split around it. A write that fails part way leaves the
+transactions before it committed and the file the size they gave it --
+and writes zeros again over what it put past the old end into the last
+block, in place, which the size that would have covered it never did. Every
+write commits, so a write that returns is on the medium. A truncate gives
+back everything mapped past the new end -- unwritten extents past the old
+one among them -- and writes zeros over what of the new last block lies
+past it, so that a file reads as zeros wherever it grows over; one that
+reaches 2 GiB sets large_file in the superblock, in the same transaction. A
+punch -- a guest's discard of its disk's image -- gives back the blocks of a
+range inside the file, its size as it was. The extent tree is changed a
+leaf at a time (`ext4/extents.rs`): the leaf's entries edited as a list --
+an extent put in where nothing maps, run on into its neighbours; a range
+taken out, an extent trimmed or split around it; part of an unwritten
+extent made written -- and then the path to it settled: a node that
+overflows split, past the change where it is at the end as files grow; the
+root a level deeper when it fills; a node left empty freed and taken out of
+its parent; every index entry's key its child's first block; an emptied
+tree a leaf again. A disk's image maps its file's blocks and reads and
+writes them off the VFS's lock (`image.rs`): a hole -- or an unwritten
+extent, which maps as one -- goes through the VFS, as it must for blocks to
+be allocated or made written, and a discard makes the next sync the
+filesystem's. What holds a file as an image is counted by the file -- its
+mount and inode -- and not by the name it was opened by (`vfs.rs`): a
+second name, a hard link, does not get past the hold. A file of more than
+one name has every name's vnode given its size.
 
 ## nanofs, ramfs, procfs
 

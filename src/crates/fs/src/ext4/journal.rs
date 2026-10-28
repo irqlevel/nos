@@ -17,9 +17,11 @@
 //!   64bit, v3 checksums, revokes -- are set, forced, before the first
 //!   commit; a copy whose first word is the journal's magic is escaped; a
 //!   commit's time never goes back.
-//! - Nothing more is written once a write fails (`abort`): the journal, and
-//!   the filesystem's state, are left for the next mount's replay -- or
-//!   e2fsck's -- to settle.
+//! - Nothing more is written once a write of the journal, of a block's
+//!   home or of a superblock fails, or a flush does (`abort`): the journal,
+//!   and the filesystem's state, are left for the next mount's replay -- or
+//!   e2fsck's -- to settle. A file's data that does not write fails its
+//!   call alone (`data.rs`).
 
 use alloc::collections::BTreeMap;
 use alloc::format;
