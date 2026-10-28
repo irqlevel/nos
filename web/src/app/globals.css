@@ -302,6 +302,8 @@ body {
 
 .prose-nos :where(img) {
     border-radius: 8px;
+    /* A screenshot's own background is the page's: its edge would not show */
+    border: 1px solid var(--line);
 }
 
 /* Shiki emits both themes' colours as variables; the theme picks one. */
