@@ -147,6 +147,176 @@ def judge_ext4(img, manifest, tmp):
     return problems
 
 
+# The superblock fields e2fsck's replay sets for itself -- its write and
+# check times, the kilobytes it counts written -- and the checksum over them.
+SB_E2FSCK_OWN = [(0x30, 4), (0x40, 4), (0x178, 8), (0x3FC, 4)]
+
+
+def masked(img):
+    b = bytearray(img)
+    for at, n in SB_E2FSCK_OWN:
+        b[1024 + at:1024 + at + n] = bytes(n)
+    return bytes(b)
+
+
+def replay_agrees(img, replayed, tmp):
+    """The judge's replay of an image's journal, held to e2fsck's: the same
+    image byte for byte, but for e2fsck's own superblock fields."""
+    work = os.path.join(tmp, 'replay.img')
+    shutil.copyfile(img, work)
+    # The replay alone: with -f e2fsck would go on to check, and with -y to
+    # put right silently what it keeps for itself (the superblock's free
+    # counts, a group's unused inodes) -- its repairs, not its replay.
+    r = subprocess.run(['e2fsck', '-y', '-E', 'journal_only', work], capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        return ['e2fsck -E journal_only, exit %d: %s' % (r.returncode, r.stdout[-400:])]
+    a, b = masked(open(work, 'rb').read()), masked(open(replayed, 'rb').read())
+    if a == b:
+        return []
+    at = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+    return ['the judge\'s replay differs from e2fsck\'s at byte %#x (block %d of 4 KiB)' % (at, at // 4096)]
+
+
+def judge_of(binary, img, tmp):
+    """The judge's check of an image from outside: its verdict line, and
+    what it found."""
+    env = dict(os.environ, FS_FUZZ_IMAGE=img)
+    r = subprocess.run([binary, '--target', 'ext4judge', '--iterations', '1', '--seed', '1'], env=env, cwd=tmp,
+                       capture_output=True, text=True)
+    lines = r.stdout.splitlines()
+    verdict = next((l.split()[1] for l in lines if l.startswith('verdict ')), 'none')
+    return verdict, '\n'.join(l for l in lines if l.startswith(('verdict', 'corrupt:', 'unclean:')))
+
+
+def e2fsck_says(img):
+    r = subprocess.run(['e2fsck', '-fn', '-E', 'no_optimize_extents', img], capture_output=True, text=True)
+    return r.returncode != 0 or any(l.rstrip().endswith('? no') for l in r.stdout.splitlines()), r.stdout
+
+
+def mke2fs_images(tmp, rng):
+    """ext4 images as mke2fs makes them -- 1.46's defaults, 1 KiB blocks
+    with 128-byte inodes and no 64bit, metadata_csum_seed with the UUID
+    changed after -- holding files of every size, a sparse one of many
+    pieces, a directory e2fsck -D indexed, a long name, a symlink and
+    attributes in a block of their own."""
+    content = os.path.join(tmp, 'content')
+    os.makedirs(os.path.join(content, 'big'))
+    os.makedirs(os.path.join(content, 'a', 'b'))
+    open(os.path.join(content, 'small'), 'wb').write(b'small\n')
+    open(os.path.join(content, 'medium'), 'wb').write(rng.randbytes(70000))
+    with open(os.path.join(content, 'sparse'), 'wb') as f:
+        for k in range(600):
+            f.seek(k * 16384)
+            f.write(rng.randbytes(4096))
+    for k in range(200):
+        open(os.path.join(content, 'big', 'entry-%04d' % k), 'wb').write(b'%d' % k)
+    open(os.path.join(content, 'a', 'b', 'deep'), 'wb').write(b'deep')
+    open(os.path.join(content, 'n' * 70), 'wb').write(b'long')
+    os.symlink('small', os.path.join(content, 'link'))
+    open(os.path.join(tmp, 'value'), 'wb').write(rng.randbytes(1200).hex().encode())
+    made = []
+    for name, opts in (('mke2fs-4k', ['-b', '4096']), ('mke2fs-1k', ['-b', '1024', '-I', '128', '-O', '^64bit']),
+                       ('mke2fs-seed', ['-b', '4096', '-O', 'metadata_csum_seed'])):
+        img = os.path.join(tmp, name + '.img')
+        with open(img, 'wb') as f:
+            f.truncate(48 << 20)
+        r = subprocess.run(['mke2fs', '-q', '-F', '-t', 'ext4'] + opts + ['-d', content, img], capture_output=True,
+                           text=True)
+        if r.returncode != 0:
+            print('fs-fuzz --e2fsck: mke2fs %s: %s' % (' '.join(opts), r.stderr))
+            return None
+        if name == 'mke2fs-seed':
+            subprocess.run(['tune2fs', '-U', 'random', img], capture_output=True)
+        subprocess.run(['e2fsck', '-fyD', img], capture_output=True)
+        cmds = os.path.join(tmp, 'cmds')
+        open(cmds, 'w').write('ea_set -f %s /medium user.big\n' % os.path.join(tmp, 'value'))
+        subprocess.run(['debugfs', '-w', '-f', cmds, img], capture_output=True)
+        made.append((name, img))
+    return made
+
+
+def inode_of(img, path):
+    r = subprocess.run(['debugfs', '-R', 'stat %s' % path, img], capture_output=True, text=True)
+    m = re.search(r'Inode: (\d+)', r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def orphans_agree(binary, tmp, base):
+    """Orphans, as a crash between the transactions of one removal or one
+    truncation leaves them: a file of no links named nowhere, and one cut
+    to a block whose extents still run past it, each on the superblock's
+    list -- left by debugfs. The judge releases them as e2fsck does: the
+    image clean to it, and the tree it reads the one `e2fsck -fy` leaves."""
+    problems = []
+    for kind in ('deleted', 'truncated'):
+        img = os.path.join(tmp, 'orphan-%s.img' % kind)
+        shutil.copyfile(base, img)
+        name = '/small' if kind == 'deleted' else '/medium'
+        n = inode_of(img, name)
+        cmds = ['sif <%d> links_count 0' % n, 'unlink %s' % name] if kind == 'deleted' else ['sif <%d> size 4096' % n]
+        cmds += ['sif <%d> dtime 0' % n, 'ssv last_orphan %d' % n]
+        open(os.path.join(tmp, 'cmds'), 'w').write('\n'.join(cmds) + '\n')
+        subprocess.run(['debugfs', '-w', '-f', os.path.join(tmp, 'cmds'), img], capture_output=True)
+        ours, said = judge_of(binary, img, tmp)
+        fixed = img + '.fixed'
+        shutil.copyfile(img, fixed)
+        subprocess.run(['e2fsck', '-fy', fixed], capture_output=True)
+        clean, out = e2fsck_says(fixed)
+        theirs, said_fixed = judge_of(binary, fixed, tmp)
+        tree = lambda s: re.search(r'files \d+ dirs \d+', s).group(0) if re.search(r'files \d+ dirs \d+', s) else s
+        if ours != 'clean' or 'orphans 1' not in said:
+            problems.append('orphan-%s: the judge does not release the orphan as e2fsck does:\n%s' % (kind, said))
+        elif clean or theirs != 'clean' or tree(said) != tree(said_fixed):
+            problems.append('orphan-%s: the tree after the judge releases the orphan, %s, is not the one e2fsck -fy '
+                            'leaves, %s:\n%s' % (kind, tree(said), tree(said_fixed), out[-400:]))
+    return problems
+
+
+def judge_against_mke2fs(binary, tmp, seed):
+    """The judge's check held to e2fsck on mke2fs's images: clean where
+    e2fsck finds them clean, and every byte of their metadata e2fsck notices
+    changed noticed by the judge too."""
+    import random
+    rng = random.Random(int(seed))
+    made = mke2fs_images(tmp, rng)
+    if made is None:
+        return ['mke2fs failed']
+    problems, judged, stricter, resize_only = [], 0, 0, 0
+    for name, img in made:
+        verdict, said = judge_of(binary, img, tmp)
+        judged += 1
+        if verdict != 'clean':
+            problems.append('%s: the judge finds mke2fs\'s image %s:\n%s' % (name, verdict, said))
+            continue
+        base = open(img, 'rb').read()
+        for trial in range(30):
+            at = rng.randrange(min(len(base), 2 << 20))
+            bad = bytearray(base)
+            bad[at] ^= rng.randrange(1, 256)
+            path = os.path.join(tmp, 'damaged.img')
+            open(path, 'wb').write(bad)
+            theirs, out = e2fsck_says(path)
+            # The resize inode's tree of reserved descriptor blocks is
+            # e2fsck's to judge and nos's never to write: the judge leaves
+            # it alone, and a byte of it changed is not held against it.
+            said_lines = [l for l in out.splitlines() if l.rstrip().endswith('? no') or 'IGNORED' in l]
+            if said_lines and all(re.search(r'\b[Ii]node 7\b', l) for l in said_lines):
+                resize_only += 1
+                continue
+            ours, said = judge_of(binary, path, tmp)
+            judged += 1
+            if theirs and ours == 'clean':
+                problems.append('%s, byte %#x changed: e2fsck says so and the judge does not:\n%s' % (name, at, out[-600:]))
+            elif ours != 'clean' and not theirs:
+                stricter += 1
+    problems += orphans_agree(binary, tmp, made[0][1])
+    if stricter:
+        print('fs-fuzz --e2fsck: %d changed bytes the judge noticed and e2fsck did not' % stricter)
+    print('fs-fuzz --e2fsck: %d of mke2fs\'s images judged, damaged and not; %d bytes of the resize inode\'s left '
+          'to e2fsck' % (judged, resize_only))
+    return problems
+
+
 def e2fsck_judged(args):
     """--e2fsck: the targets' images, held to e2fsprogs."""
     for tool in ('e2fsck', 'debugfs'):
@@ -173,6 +343,9 @@ def e2fsck_judged(args):
         tag = f.rsplit('-', 2)[0]
         if tag == 'ext4mkfs':
             problems = judge_ext4(img, img[:-4] + '.manifest', tmp)
+            if os.path.exists(img[:-4] + '.replayed'):
+                problems += replay_agrees(img, img[:-4] + '.replayed', tmp)
+                judged['judge-replay'] = judged.get('judge-replay', 0) + 1
         elif tag in ('mkfs', 'crash-clean', 'crash-unclean'):
             r = subprocess.run(['e2fsck', '-fn', img], capture_output=True, text=True)
             said = r.returncode != 0 or any(l.rstrip().endswith('? no') for l in r.stdout.splitlines())
@@ -187,6 +360,9 @@ def e2fsck_judged(args):
             print('FAIL: %s' % f)
             for p in problems[:4]:
                 print('  ' + p.replace('\n', '\n  '))
+    for p in judge_against_mke2fs(binary, tmp, seed):
+        failed.append(p.split(':')[0])
+        print('FAIL: ' + p.replace('\n', '\n  '))
     print('fs-fuzz --e2fsck: %s judged, %d at odds with e2fsprogs'
           % (', '.join('%d %s' % (n, t) for t, n in sorted(judged.items())), len(failed)))
     if failed:

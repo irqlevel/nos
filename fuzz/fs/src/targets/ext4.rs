@@ -162,15 +162,13 @@ pub fn dump(tag: &str, made: &img::Made, tree: &Node, bytes: u64) {
     let Some(dir) = std::env::var_os("FS_FUZZ_DUMP") else { return };
     let base = format!("{}/{}-{}-{}", dir.to_string_lossy(), tag, std::process::id(),
                        crate::machine::sched::now());
-    /* Written sparse: what was never written is zeros, and costs nothing. */
-    if let Ok(mut f) = std::fs::File::create(format!("{}.img", base)) {
-        use std::io::{Seek, SeekFrom, Write};
-        let bytes_all = made.media.to_vec(bytes);
-        let _ = f.set_len(bytes);
-        for (k, piece) in bytes_all.chunks(64 << 10).enumerate() {
-            if piece.iter().any(|&b| b != 0) {
-                let _ = f.seek(SeekFrom::Start(k as u64 * (64 << 10))).and_then(|_| f.write_all(piece));
-            }
+    write_sparse(&format!("{}.img", base), &made.media, bytes);
+    if !made.journaled.is_empty() {
+        /* And as the judge's replay leaves it, for e2fsck's to be compared
+         * with. */
+        let mut replayed = made.media.clone();
+        if img::replay::replay(&mut replayed).is_ok() {
+            write_sparse(&format!("{}.replayed", base), &replayed, bytes);
         }
     }
     let mut lines = Vec::new();
@@ -202,6 +200,45 @@ pub fn dump(tag: &str, made: &img::Made, tree: &Node, bytes: u64) {
     let _ = std::fs::write(format!("{}.manifest", base), lines.join("\n") + "\n");
 }
 
+/// The judge's check of an image from outside -- one mke2fs made, damaged
+/// or not -- for `fs-fuzz.py --e2fsck` to hold the judge to e2fsck by:
+/// FS_FUZZ_IMAGE names it, and what the check found is printed. Without it
+/// there is nothing to do; the input is not used.
+pub fn ext4judge(_r: &mut Input) {
+    let Some(path) = std::env::var_os("FS_FUZZ_IMAGE") else { return };
+    let Ok(bytes) = std::fs::read(&path) else {
+        println!("verdict unreadable");
+        return;
+    };
+    let c = img::check(&crate::machine::disk::Media::from_bytes(&bytes), bytes.len() as u64);
+    let verdict = if !c.corrupt.is_empty() { "corrupt" } else if !c.unclean.is_empty() { "unclean" } else { "clean" };
+    fn count(n: &Node) -> (u64, u64) {
+        match n {
+            Node::File(_) => (1, 0),
+            Node::Dir(c) => c.values().map(count).fold((0, 1), |a, b| (a.0 + b.0, a.1 + b.1)),
+        }
+    }
+    let (files, dirs) = c.tree.as_ref().map(count).unwrap_or((0, 0));
+    println!("verdict {} replayed {} orphans {} files {} dirs {}", verdict, c.replayed, c.orphans, files, dirs);
+    for e in c.corrupt.iter().map(|e| ("corrupt", e)).chain(c.unclean.iter().map(|e| ("unclean", e))) {
+        println!("{}: {}", e.0, e.1);
+    }
+}
+
+/// A medium written out sparse: what was never written is zeros, and
+/// costs nothing.
+fn write_sparse(path: &str, media: &crate::machine::disk::Media, bytes: u64) {
+    use std::io::{Seek, SeekFrom, Write};
+    let Ok(mut f) = std::fs::File::create(path) else { return };
+    let all = media.to_vec(bytes);
+    let _ = f.set_len(bytes);
+    for (k, piece) in all.chunks(64 << 10).enumerate() {
+        if piece.iter().any(|&b| b != 0) {
+            let _ = f.seek(SeekFrom::Start(k as u64 * (64 << 10))).and_then(|_| f.write_all(piece));
+        }
+    }
+}
+
 /// Images made, from geometries, trees and styles the input chooses --
 /// a journal with transactions nobody replayed now and then.
 pub fn ext4mkfs(r: &mut Input) {
@@ -225,10 +262,26 @@ pub fn ext4mkfs(r: &mut Input) {
             if !made.journaled.is_empty() {
                 reached("ext4mkfs: its journal holding what its homes do not");
             }
+            agree(&g, &st, &made, &tree);
             dump("ext4mkfs", &made, &tree, g.blocks * bs);
         }
         Err(_) => reached("ext4mkfs: a tree the geometry could not hold"),
     }
+}
+
+/// The judge's mkfs and its check, agreeing -- or every verdict it gives is
+/// worth nothing: the image clean, its journal replayed if it holds
+/// anything, and the tree mkfs was given, lost+found beside it.
+fn agree(g: &Geometry, st: &Style, made: &img::Made, tree: &Node) {
+    let c = img::check(&made.media, g.blocks * g.block_size());
+    invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the judge's mkfs made an image its check faults ({:?}, \
+               {:?}): {:?}, {:?}", g, st, c.corrupt, c.unclean);
+    invariant!((c.replayed > 0) == !made.journaled.is_empty(), "the check replayed {} transactions of a journal mkfs \
+               planted {} blocks in", c.replayed, made.journaled.len());
+    let mut want = tree.clone();
+    want.children_mut().expect("a directory").insert(b"lost+found".to_vec(), Node::dir());
+    invariant!(c.tree.as_ref() == Some(&want), "the judge's check reads another tree than its mkfs made: {:?}",
+               c.tree.as_ref().and_then(|t| want.diff(t)));
 }
 
 /// ext4 mounted -- read-only, all its driver does yet -- on images the
@@ -248,6 +301,7 @@ pub fn ext4(r: &mut Input) {
     let mut inodes = g.inodes() / 2;
     let tree = tree(r, bs, &mut budget, &mut inodes);
     let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
+    agree(&g, &st, &made, &tree);
     let sizes: Vec<u64> = [512, 1024, 2048, 4096].into_iter().filter(|s| *s <= bs).collect();
     let ss = r.pick(&sizes);
     let sectors = g.blocks * bs / ss + r.below(8);
