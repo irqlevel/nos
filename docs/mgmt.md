@@ -155,6 +155,23 @@ for the halt and returns, its answer on its way before the halt has begun.
 As a job it would never end -- the halt waits for every job to (`stop`),
 and this one would be waiting for the halt.
 
+## The providers of modules
+
+| Provider | Registered by | Reads | Actions | Jobs |
+|---|---|---|---|---|
+| `api` | `modules/api` | `status`, `clients` | | |
+| `vm` | `modules/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `forwards` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow` | `start`, `stop`, `restart`, `create`, `clone`, `delete` |
+| `modtest` | `modules/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
+
+A module's provider is unregistered with the module, which waits out its
+calls and jobs -- told to stop -- before anything they use goes: hv drops
+its provider before its forwards and its VMs, so no job of it starts a guest
+behind the unload ([On the management bus](hypervisor.md#on-the-management-bus)).
+A job that takes long looks at its cancel as it goes: the vm provider's
+create looks at it as each piece of a download arrives and after each
+cluster it converts, its clone after each quarter of a MiB it copies, and a
+stop or a restart stops waiting for the guest.
+
 ## When a provider goes
 
 Unregistering follows the protocol of the shell's table of module commands

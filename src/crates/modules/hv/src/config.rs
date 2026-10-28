@@ -69,11 +69,15 @@ pub struct Config {
     pub options: Options,
     /// Its console written to `console.log` in its folder: on unless told.
     pub console_log: bool,
+    /// Kept from what is done to it by mistake: the host API stops it and
+    /// deletes it only when told `force`, and `hv delete` only with
+    /// `force` -- the management panel's own VM has it.
+    pub protected: bool,
 }
 
 impl Config {
     pub fn new(options: Options) -> Config {
-        Config { options, console_log: true }
+        Config { options, console_log: true, protected: false }
     }
 }
 
@@ -101,9 +105,11 @@ enum Key {
     Offload,
     Uuid,
     Network,
+    Protected,
 }
 
-const KEYS: [(&str, Key); 21] = [
+/// The keys there are, in the order `render` writes them.
+const KEYS: [(&str, Key); 22] = [
     ("kernel", Key::Kernel),
     ("initrd", Key::Initrd),
     ("cmdline", Key::Cmdline),
@@ -112,9 +118,11 @@ const KEYS: [(&str, Key); 21] = [
     ("cpu", Key::Cpu),
     ("disks", Key::Disks),
     ("net", Key::Net),
+    ("network", Key::Network),
     ("port", Key::Port),
     ("forward", Key::Forward),
     ("restart", Key::Restart),
+    ("protected", Key::Protected),
     ("console_log", Key::ConsoleLog),
     ("log", Key::Log),
     ("input", Key::Input),
@@ -124,7 +132,6 @@ const KEYS: [(&str, Key); 21] = [
     ("rxmod", Key::Rxmod),
     ("offload", Key::Offload),
     ("uuid", Key::Uuid),
-    ("network", Key::Network),
 ];
 
 /// The longest a network's name is.
@@ -139,32 +146,35 @@ pub fn valid_network(name: &str) -> bool {
         && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
+/// vm.toml's keys, as `conf` reads the file: a key the table does not have
+/// is refused before its value is read.
+struct Reader {
+    c: Config,
+}
+
+impl conf::Keys for Reader {
+    fn known(&mut self, line: usize, name: &str) -> Result<(), String> {
+        match KEYS.iter().any(|(n, _)| *n == name) {
+            true => Ok(()),
+            false => Err(error(line, &alloc::format!("\"{}\" is not a key a vm.toml has", name))),
+        }
+    }
+
+    fn assign(&mut self, line: usize, name: &str, value: Value) -> Result<(), String> {
+        let key = KEYS.iter().find(|(n, _)| *n == name).map(|&(_, k)| k)
+            .ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a key a vm.toml has", name)))?;
+        assign(&mut self.c, key, name, value, line)
+    }
+}
+
+/// What a vm.toml is called in what is said of one.
+const WHAT: &str = "a vm.toml";
+
 /// The file's text read as the configuration it is, or what is wrong with
 /// it -- the first thing, with its line.
 pub fn parse(text: &str) -> Result<Config, String> {
-    /// vm.toml's keys, as `conf` reads the file: a key the table does not
-    /// have is refused before its value is read.
-    struct Reader {
-        c: Config,
-    }
-
-    impl conf::Keys for Reader {
-        fn known(&mut self, line: usize, name: &str) -> Result<(), String> {
-            match KEYS.iter().any(|(n, _)| *n == name) {
-                true => Ok(()),
-                false => Err(error(line, &alloc::format!("\"{}\" is not a key a vm.toml has", name))),
-            }
-        }
-
-        fn assign(&mut self, line: usize, name: &str, value: Value) -> Result<(), String> {
-            let key = KEYS.iter().find(|(n, _)| *n == name).map(|&(_, k)| k)
-                .ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a key a vm.toml has", name)))?;
-            assign(&mut self.c, key, name, value, line)
-        }
-    }
-
     let mut reader = Reader { c: Config::new(Options::default()) };
-    conf::parse(text, "a vm.toml", &mut reader)?;
+    conf::parse(text, WHAT, &mut reader)?;
     let c = reader.c;
     if c.options.kernel.is_empty() {
         return Err(String::from("no kernel: a vm.toml says kernel = \"<its bzImage>\""));
@@ -206,6 +216,7 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
         (Key::Net, Value::Bool(b)) => o.net = b,
         (Key::Restart, Value::Bool(b)) => o.restart = b,
         (Key::ConsoleLog, Value::Bool(b)) => c.console_log = b,
+        (Key::Protected, Value::Bool(b)) => c.protected = b,
         (Key::Log, Value::Bool(b)) => o.log = b,
         (Key::Ioapic, Value::Bool(b)) => o.ioapic = b,
         (Key::Xapic, Value::Bool(b)) => o.xapic = b,
@@ -235,6 +246,24 @@ fn assign(c: &mut Config, key: Key, name: &str, value: Value, line: usize) -> Re
         (_, v) => return Err(wrong("true or false", &v)),
     }
     Ok(())
+}
+
+/// What a command line says without its `ip=`: the switch gives a guest
+/// its address at every start, and a clone's source's would be another's.
+/// The line as it was when it has none; its other words in their order,
+/// a space apart, when it has.
+pub fn without_ip(cmdline: &str) -> String {
+    if !cmdline.split_ascii_whitespace().any(|w| w.starts_with("ip=")) {
+        return String::from(cmdline);
+    }
+    let mut out = String::new();
+    for word in cmdline.split_ascii_whitespace().filter(|w| !w.starts_with("ip=")) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 /// A UUID as RFC 4122 writes one -- 8-4-4-4-12 hex digits, either case --
@@ -300,89 +329,150 @@ pub fn forward(word: &str) -> Option<(u16, u16)> {
 
 /* ---- the writer ---- */
 
+/// What every vm.toml `render` writes begins with.
+const HEADER: &str = "# A VM of nos's hypervisor: hv start <this folder's name> boots it (docs/hypervisor.md)\n";
+
+/// What a vm.toml says of `key` -- named `name` -- for `c`: its line, the
+/// newline with it, or None where the file says nothing of it, `c` having
+/// it as a file without the key does. Err out of memory.
+fn line(c: &Config, key: Key, name: &str) -> Result<Option<String>, String> {
+    let o = &c.options;
+    /* Room for the line: a string's every character may be written as an
+     * escape of six. */
+    let text = |v: &str| v.len() * 6 + 2;
+    let room = name.len() + 4 + match key {
+        Key::Kernel => text(&o.kernel),
+        Key::Initrd => o.initrd.as_deref().map_or(0, text),
+        Key::Cmdline => o.cmdline.as_deref().map_or(0, text),
+        Key::Input => text(&o.input),
+        Key::Network => o.network.as_deref().map_or(0, text),
+        Key::Disks => o.disks.iter().map(|(d, _)| text(d) + 5).sum::<usize>() + 2,
+        Key::Forward => o.forwards.len() * 16 + 2,
+        _ => 48,
+    };
+    let mut s = String::new();
+    s.try_reserve(room).map_err(|_| String::from("out of memory"))?;
+    let said = |s: &mut String, value: &dyn core::fmt::Display| {
+        let _ = writeln!(s, "{} = {}", name, value);
+    };
+    match key {
+        Key::Kernel => put(&mut s, name, &o.kernel),
+        Key::Initrd => match &o.initrd {
+            Some(v) => put(&mut s, name, v),
+            None => return Ok(None),
+        },
+        Key::Cmdline => match &o.cmdline {
+            Some(v) => put(&mut s, name, v),
+            None => return Ok(None),
+        },
+        Key::Memory => match o.mem_mib {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Cpus => match o.cpus {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Cpu => match o.cpu {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Disks => {
+            if o.disks.is_empty() {
+                return Ok(None);
+            }
+            s.push_str(name);
+            s.push_str(" = [");
+            for (i, (path, ro)) in o.disks.iter().enumerate() {
+                if i != 0 {
+                    s.push_str(", ");
+                }
+                let mut word = String::new();
+                word.try_reserve(path.len() + 3).map_err(|_| String::from("out of memory"))?;
+                word.push_str(path);
+                if *ro {
+                    word.push_str(":ro");
+                }
+                quoted(&mut s, &word);
+            }
+            s.push_str("]\n");
+        }
+        Key::Net if o.net => said(&mut s, &true),
+        Key::Network => match &o.network {
+            Some(v) => put(&mut s, name, v),
+            None => return Ok(None),
+        },
+        Key::Port => match o.port {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Forward => {
+            if o.forwards.is_empty() {
+                return Ok(None);
+            }
+            s.push_str(name);
+            s.push_str(" = [");
+            for (i, (host, guest)) in o.forwards.iter().enumerate() {
+                let _ = write!(s, "{}\"{}:{}\"", if i == 0 { "" } else { ", " }, host, guest);
+            }
+            s.push_str("]\n");
+        }
+        Key::Restart if o.restart => said(&mut s, &true),
+        Key::Protected if c.protected => said(&mut s, &true),
+        Key::ConsoleLog => said(&mut s, &c.console_log),
+        Key::Log if o.log => said(&mut s, &true),
+        Key::Input if !o.input.is_empty() => put(&mut s, name, &o.input),
+        Key::Ioapic if o.ioapic => said(&mut s, &true),
+        Key::Xapic if o.xapic => said(&mut s, &true),
+        Key::Apicv => match o.apicv {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Rxmod => match o.rxmod_us {
+            Some(v) => said(&mut s, &v),
+            None => return Ok(None),
+        },
+        Key::Offload if o.nooffload => said(&mut s, &false),
+        Key::Uuid => match &o.uuid {
+            Some(u) => put(&mut s, name, &uuid_text(u)),
+            None => return Ok(None),
+        },
+        Key::Net | Key::Restart | Key::Protected | Key::Log | Key::Input | Key::Ioapic | Key::Xapic
+        | Key::Offload => return Ok(None),
+    }
+    Ok(Some(s))
+}
+
 /// The configuration as a vm.toml says it: what `parse` reads back as the
 /// same configuration. None out of memory.
 pub fn render(c: &Config) -> Option<String> {
-    let o = &c.options;
     let mut s = String::new();
-    s.try_reserve(512 + o.kernel.len() + o.cmdline.as_ref().map_or(0, |l| l.len()) * 2 + o.input.len() * 6
-                  + o.disks.iter().map(|(d, _)| d.len() * 2 + 8).sum::<usize>() + o.forwards.len() * 16).ok()?;
-    s.push_str("# A VM of nos's hypervisor: hv start <this folder's name> boots it (docs/hypervisor.md)\n");
-    put(&mut s, "kernel", &o.kernel);
-    if let Some(v) = &o.initrd {
-        put(&mut s, "initrd", v);
-    }
-    if let Some(v) = &o.cmdline {
-        put(&mut s, "cmdline", v);
-    }
-    if let Some(v) = o.mem_mib {
-        let _ = writeln!(s, "memory = {}", v);
-    }
-    if let Some(v) = o.cpus {
-        let _ = writeln!(s, "cpus = {}", v);
-    }
-    if let Some(v) = o.cpu {
-        let _ = writeln!(s, "cpu = {}", v);
-    }
-    if !o.disks.is_empty() {
-        s.push_str("disks = [");
-        for (i, (path, ro)) in o.disks.iter().enumerate() {
-            if i != 0 {
-                s.push_str(", ");
-            }
-            let mut word = String::new();
-            word.try_reserve(path.len() + 3).ok()?;
-            word.push_str(path);
-            if *ro {
-                word.push_str(":ro");
-            }
-            quoted(&mut s, &word);
+    s.try_reserve(HEADER.len() + 512).ok()?;
+    s.push_str(HEADER);
+    for &(name, key) in KEYS.iter() {
+        if let Some(l) = line(c, key, name).ok()? {
+            s.try_reserve(l.len()).ok()?;
+            s.push_str(&l);
         }
-        s.push_str("]\n");
-    }
-    if o.net {
-        s.push_str("net = true\n");
-    }
-    if let Some(v) = &o.network {
-        put(&mut s, "network", v);
-    }
-    if let Some(v) = o.port {
-        let _ = writeln!(s, "port = {}", v);
-    }
-    if !o.forwards.is_empty() {
-        s.push_str("forward = [");
-        for (i, (host, guest)) in o.forwards.iter().enumerate() {
-            let _ = write!(s, "{}\"{}:{}\"", if i == 0 { "" } else { ", " }, host, guest);
-        }
-        s.push_str("]\n");
-    }
-    if o.restart {
-        s.push_str("restart = true\n");
-    }
-    let _ = writeln!(s, "console_log = {}", c.console_log);
-    if o.log {
-        s.push_str("log = true\n");
-    }
-    if !o.input.is_empty() {
-        put(&mut s, "input", &o.input);
-    }
-    if o.ioapic {
-        s.push_str("ioapic = true\n");
-    }
-    if o.xapic {
-        s.push_str("xapic = true\n");
-    }
-    if let Some(v) = o.apicv {
-        let _ = writeln!(s, "apicv = {}", v);
-    }
-    if let Some(v) = o.rxmod_us {
-        let _ = writeln!(s, "rxmod = {}", v);
-    }
-    if o.nooffload {
-        s.push_str("offload = false\n");
-    }
-    if let Some(u) = &o.uuid {
-        put(&mut s, "uuid", &uuid_text(u));
     }
     Some(s)
+}
+
+/// `text`, a vm.toml, made to say `new`: the line of every key whose value
+/// differs from the text's replaced, taken out or added at the end
+/// (`conf::edit`), and every other line -- the comments, the blank lines,
+/// the keys `new` leaves as they were -- as the operator wrote it. What
+/// `text` cannot be read as is refused as `parse` refuses it.
+pub fn rewrite(text: &str, new: &Config) -> Result<String, String> {
+    let old = parse(text)?;
+    let mut edits = Vec::new();
+    edits.try_reserve_exact(KEYS.len()).map_err(|_| String::from("out of memory"))?;
+    for &(name, key) in KEYS.iter() {
+        let now = line(new, key, name)?;
+        if line(&old, key, name)? != now {
+            edits.push(conf::Edit { key: name, line: now });
+        }
+    }
+    let mut reader = Reader { c: Config::new(Options::default()) };
+    conf::edit(text, WHAT, &mut reader, &edits)
 }

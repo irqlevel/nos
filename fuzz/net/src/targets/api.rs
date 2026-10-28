@@ -112,6 +112,7 @@ static FUZZP_METHODS: [mgmt::Method; 3] = [
 fn descriptor_of(name: &str) -> Option<&'static str> {
     match name {
         "fuzzp" => Some(FUZZP_DESCRIPTOR),
+        "vm" => Some(FVM_DESCRIPTOR),
         "system" => Some(include_str!("../../../../src/crates/kernel/src/system.descriptor.json")),
         "net" => Some(include_str!("../../../../src/crates/net/src/net.descriptor.json")),
         "api" => Some(include_str!("../../../../src/crates/modules/api/src/api.descriptor.json")),
@@ -214,6 +215,119 @@ impl mgmt::Provider for Fuzzp {
     }
 }
 
+/* ---- a VM's console, as the vm provider pages it ---- */
+
+const FVM_DESCRIPTOR: &str = r#"{
+  "schema": 1,
+  "provider": "vm",
+  "title": {"en": "The fuzzer's VM", "ru": "Машина фаззера"},
+  "help": {"en": "A console that prints as time goes, and keeps what is typed.", "ru": "Консоль, печатающая со временем и запоминающая ввод."},
+  "methods": {
+    "console_read": {"kind": "read", "title": {"en": "Console", "ru": "Консоль"}},
+    "console_write": {"kind": "action", "title": {"en": "Type", "ru": "Ввод"}}
+  }
+}"#;
+
+static FVM_METHODS: [mgmt::Method; 2] = [
+    mgmt::Method { name: "console_read", kind: mgmt::Kind::Read },
+    mgmt::Method { name: "console_write", kind: mgmt::Kind::Action },
+];
+
+/// The one VM the fuzzer's console has.
+const VM: &str = "t1";
+/// What its guest prints: this, over and over, `CONSOLE_PER_MS` bytes a
+/// millisecond -- and the most of it the ring keeps.
+const CONSOLE_PATTERN: &[u8] = b"nos console 0123456789 abcdefghijklmnopqrstuvwxyz\r\n";
+const CONSOLE_PER_MS: u64 = 3;
+const CONSOLE_RING: u64 = 8192;
+
+/// The console's byte `i`.
+fn console_byte(i: u64) -> u8 {
+    CONSOLE_PATTERN[(i % CONSOLE_PATTERN.len() as u64) as usize]
+}
+
+/// What the console has printed in all by `now`.
+fn console_total(now: u64) -> u64 {
+    now.saturating_sub(sched::START) / MS * CONSOLE_PER_MS
+}
+
+/// What was typed at the console, as the provider was handed it.
+static TYPED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+fn typed() -> MutexGuard<'static, Vec<Vec<u8>>> {
+    TYPED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct Fvm;
+static FVM: Fvm = Fvm;
+
+impl mgmt::Provider for Fvm {
+    fn call(&self, method: &str, params: &[u8], call: &mut mgmt::Call) -> mgmt::Status {
+        let value = match mgmt::parse_params(params) {
+            Ok(v) => v,
+            Err(s) => return call.refuse(s, "the parameters are not JSON", None),
+        };
+        let mut p = match mgmt::Params::new(&value) {
+            Ok(p) => p,
+            Err(e) => return call.invalid(e),
+        };
+        let name = match p.str("name", 32) {
+            Ok(n) => n,
+            Err(e) => return call.invalid(e),
+        };
+        if name != VM {
+            return call.refuse(mgmt::Status::NotFound, "no such vm", Some("name"));
+        }
+        match method {
+            "console_read" => {
+                let got = (|| {
+                    let from = p.opt_uint("from", 0, u64::MAX)?.unwrap_or(0);
+                    let max = p.opt_uint("max_bytes", 1, 65536)?.unwrap_or(16384);
+                    let terminal = p.opt_bool("terminal")?.unwrap_or(false);
+                    Ok((from, max, terminal))
+                })();
+                let (from, max, _terminal) = match got {
+                    Ok(g) => g,
+                    Err(e) => return call.invalid(e),
+                };
+                if let Err(e) = p.finish() {
+                    return call.invalid(e);
+                }
+                let total = console_total(kcore::time::boot_time_ns());
+                let start = from.max(total.saturating_sub(CONSOLE_RING)).min(total);
+                let end = (start + max).min(total);
+                let text: Vec<u8> = (start..end).map(console_byte).collect();
+                call.answer(|w| {
+                    w.begin_object();
+                    w.field_uint("from", start);
+                    w.field_uint("next", end);
+                    w.field_uint("total", total);
+                    w.field_str_lossy("text", &text);
+                    w.end_object();
+                })
+            }
+            "console_write" => {
+                let text = match p.any("text", 4096) {
+                    Ok(t) => t,
+                    Err(e) => return call.invalid(e),
+                };
+                if let Err(e) = p.finish() {
+                    return call.invalid(e);
+                }
+                let bytes = text.as_bytes().to_vec();
+                let n = bytes.len();
+                sched::harness(|| typed().push(bytes));
+                call.answer(|w| {
+                    w.begin_object();
+                    w.field_uint("queued", n as u64);
+                    w.end_object();
+                })
+            }
+            _ => mgmt::Status::NoMethod,
+        }
+    }
+}
+
 /* ---- what the clients ask ---- */
 
 /// What a client asks, as its plan has it.
@@ -230,7 +344,8 @@ enum Ask {
     /// The last job the client started, or one nobody did.
     Job { mine: bool, notes_since: u64 },
     Cancel { mine: bool },
-    Stream { channels: Option<&'static str>, log_since: Option<u64>, shake: Shake, ws: WsPlan },
+    Stream { channels: Option<&'static str>, log_since: Option<u64>, vm: Option<&'static str>, shake: Shake,
+             ws: WsPlan },
     /// `WRONG[i]`: a route the API has not got, or a method it does not
     /// take there.
     Wrong(usize),
@@ -289,9 +404,16 @@ enum Then {
     Unmasked,
     /// A frame past what the server takes: 1009, and a reset.
     TooBig,
-    /// A message, which the server ignores.
+    /// A message: what the server ignores -- or types at the console, when
+    /// the stream has it.
     Text,
+    /// A message of keys a terminal sends: control keys and an escape
+    /// sequence among them.
+    Keys,
 }
+
+/// What `Then::Keys` sends: ^C, an arrow, a word past ASCII, and Enter.
+const KEYS: &[u8] = "\u{3}\u{1b}[Aок\r".as_bytes();
 
 /// A route the API has not got, or a method one does not take: the status,
 /// and what Allow must say.
@@ -402,6 +524,20 @@ struct Ws {
     closed: Option<u16>,
     broken: Option<String>,
     rng: u64,
+    /// The client's number, in what it types: whose a key typed at the
+    /// console was.
+    id: usize,
+}
+
+/// What a client types at the console as its `then`: the plan's text and
+/// its number, by which the judge knows it again.
+fn typing(then: Then, id: usize) -> Vec<u8> {
+    let mut t = match then {
+        Then::Keys => KEYS.to_vec(),
+        _ => b"hello".to_vec(),
+    };
+    t.extend_from_slice(format!(" {}", id).as_bytes());
+    t
 }
 
 fn step(rng: &mut u64) -> u64 {
@@ -459,7 +595,7 @@ impl Ws {
                 Then::Close => Some(httpc::client_frame(OP_CLOSE, &1000u16.to_be_bytes(), mask)),
                 Then::Unmasked => Some(httpc::client_frame(OP_TEXT, b"{}", None)),
                 Then::TooBig => Some(httpc::client_frame(OP_BINARY, &[0x5A; 5000], mask)),
-                Then::Text => Some(httpc::client_frame(OP_TEXT, b"hello", mask)),
+                Then::Text | Then::Keys => Some(httpc::client_frame(OP_TEXT, &typing(self.plan.then, self.id), mask)),
             };
             if frame.is_some() {
                 self.said = now;
@@ -544,7 +680,8 @@ impl Conv {
                     (Ask::Stream { ws, .. }, 101) => {
                         self.ws = Some(Ws { plan: *ws, start: g.used, parsed: 0, frames: Vec::new(), messages: 0,
                                             queue: VecDeque::new(), ping: None, then_done: false, opened: now,
-                                            said: now, closed: None, broken: None, rng: self.rng ^ 0x5DEECE66D });
+                                            said: now, closed: None, broken: None, rng: self.rng ^ 0x5DEECE66D,
+                                            id: self.id });
                     }
                     _ => {}
                 }
@@ -590,7 +727,7 @@ impl Conv {
                 went.job = if *mine { self.jobs.last().copied().unwrap_or(999_999) } else { 999_999 };
                 ("POST", format!("/v1/jobs/{}/cancel", went.job), Vec::new())
             }
-            Ask::Stream { channels, log_since, shake, .. } => {
+            Ask::Stream { channels, log_since, vm, shake, .. } => {
                 let mut target = "/v1/stream".to_string();
                 let mut q = Vec::new();
                 if let Some(c) = channels {
@@ -598,6 +735,9 @@ impl Conv {
                 }
                 if let Some(s) = log_since {
                     q.push(format!("log_since={}", s));
+                }
+                if let Some(v) = vm {
+                    q.push(format!("vm={}", v));
                 }
                 if !q.is_empty() {
                     target = format!("{}?{}", target, q.join("&"));
@@ -869,23 +1009,28 @@ fn ask(r: &mut Input) -> Ask {
         43..=45 => Ask::Cancel { mine: r.u8() < 200 },
         46..=51 => {
             let channels = r.pick(&[None, None, Some("metrics"), Some("log"), Some("jobs"), Some("metrics,jobs"),
-                                    Some("log,jobs"), Some("nothing")]);
+                                    Some("log,jobs"), Some("nothing"), Some("console"), Some("console"),
+                                    Some("jobs,console")]);
             let log_since = r.pick(&[None, None, Some(0u64), Some(5), Some(1 << 40)]);
+            /* Its VM: the console's, one there is not, a name no VM may
+             * have, or none. */
+            let vm = r.pick(&[Some(VM), Some(VM), Some(VM), Some("t2"), Some("-x"), None]);
             let shake = match r.u8() % 16 {
                 0 => Shake::NoKey,
                 1 => Shake::Version,
                 2 => Shake::NoUpgrade,
                 _ => Shake::Ok,
             };
-            let then = match r.u8() % 8 {
+            let then = match r.u8() % 9 {
                 0 | 1 => Then::Close,
                 2 => Then::Unmasked,
                 3 => Then::TooBig,
                 4 => Then::Text,
+                5 => Then::Keys,
                 _ => Then::Stay,
             };
             let ws = WsPlan { pongs: r.u8() < 192, ping: r.u8() < 64, then, after: r.pick(&[0usize, 1, 3, 8]) };
-            Ask::Stream { channels, log_since, shake, ws }
+            Ask::Stream { channels, log_since, vm, shake, ws }
         }
         52..=55 => Ask::Wrong(r.below(WRONG.len() as u64) as usize),
         56 => Ask::Old,
@@ -1281,13 +1426,18 @@ const KEY_SEEN: u64 = SEC;
 /// A stream's frames, held to what the server must send.
 fn judge_stream(c: &Conv, ws: &Ws, k: usize, end: u64, tl: &Timeline, what: &dyn Fn() -> String) {
     invariant!(ws.broken.is_none(), "{}: the stream sent what is no WebSocket: {:?}", what(), ws.broken);
-    let Ask::Stream { channels, log_since, .. } = &c.reqs[k].ask else { return };
+    let Ask::Stream { channels, log_since, vm, .. } = &c.reqs[k].ask else { return };
     let channels = channels.unwrap_or("metrics,log,jobs");
     let asked = |ch: &str| channels.split(',').any(|x| x == ch);
     let mut last_seq: Option<u64> = log_since.map(|s| s.min(u64::MAX));
     let mut last_jobs: Option<Vec<u8>> = None;
     let mut metrics = 0;
     let mut pong = false;
+    /* The console: of a name a VM may have, or not; where its last page
+     * ended. */
+    let named = vm.is_some_and(|v| v == VM || v == "t2");
+    let mut console_next: Option<u64> = None;
+    let mut console_error = 0;
     for (at, f) in &ws.frames {
         match f.opcode {
             OP_TEXT => {
@@ -1323,6 +1473,43 @@ fn judge_stream(c: &Conv, ws: &Ws, k: usize, end: u64, tl: &Timeline, what: &dyn
                         invariant!(data.is_some() && data != last_jobs, "{}: a jobs message that changed nothing",
                                    what());
                         last_jobs = data;
+                    }
+                    "console" if v.get("error").is_some() => {
+                        console_error += 1;
+                        invariant!(!named && console_error == 1, "{}: a console error for vm {:?}, its {}", what(), vm,
+                                   console_error);
+                        crate::common::runner::reached("api: a console of no vm's name refused");
+                    }
+                    "console" if v.get("refused").is_some() => {
+                        /* What the client typed, refused: a reader's, or at a
+                         * VM there is not. */
+                        let code = v.get("refused").and_then(Value::as_str).unwrap_or("");
+                        let want = if c.who == Who::Reader { "forbidden" } else { "not_found" };
+                        invariant!(named && code == want && (c.who == Who::Reader || *vm == Some("t2")),
+                                   "{}: typing at vm {:?} refused {:?}", what(), vm, code);
+                        crate::common::runner::reached(if c.who == Who::Reader {
+                            "api: a reader's typing at a console refused"
+                        } else {
+                            "api: typing at a vm there is not refused"
+                        });
+                    }
+                    "console" => {
+                        invariant!(*vm == Some(VM), "{}: a console page of vm {:?}", what(), vm);
+                        let data = v.get("data");
+                        let at = |key: &str| data.and_then(|d| d.get(key)).and_then(Value::as_u64);
+                        let (from, next) = (at("from").unwrap_or(0), at("next").unwrap_or(0));
+                        let text = data.and_then(|d| d.get("text")).and_then(Value::as_str).unwrap_or("");
+                        invariant!(from <= next && console_next.is_none_or(|n| from >= n) && next > from,
+                                   "{}: a console page {}..{} after one that ended at {:?}", what(), from, next,
+                                   console_next);
+                        let want: Vec<u8> = (from..next).map(console_byte).collect();
+                        invariant!(text.as_bytes() == want, "{}: the console's bytes {}..{} as other bytes", what(),
+                                   from, next);
+                        if console_next.is_some_and(|n| from > n) {
+                            crate::common::runner::reached("api: a console page after a gap the ring left");
+                        }
+                        console_next = Some(next);
+                        crate::common::runner::reached("api: a console page");
                     }
                     _ => {}
                 }
@@ -1482,7 +1669,9 @@ fn setup(limits: Limits, allow: Option<bool>, identity: bool) -> Setup {
     let mounted = fs::ramfs::mount_at("/", false);
     fs::init();
     system::init();
-    let registered = mgmt::register("fuzzp", &FUZZP_METHODS, FUZZP_DESCRIPTOR, &FUZZP).map(core::mem::forget).is_ok();
+    let registered = mgmt::register("fuzzp", &FUZZP_METHODS, FUZZP_DESCRIPTOR, &FUZZP).map(core::mem::forget).is_ok()
+        && mgmt::register("vm", &FVM_METHODS, FVM_DESCRIPTOR, &FVM).map(core::mem::forget).is_ok();
+    sched::harness(|| typed().clear());
     let mut toml = format!("port = {}\nlisten = [\"eth0\"]\nmax_connections = {}\nmax_per_key = {}\n\
                             max_handshakes = {}\nidle_secs = {}\n", PORT, limits.conns, limits.per_key,
                            limits.handshakes, IDLE_SECS);
@@ -1785,6 +1974,25 @@ pub fn api(r: &mut Input) {
                            c.went[k].tag);
             }
         }
+    }
+    /* What was typed at the console: each an admin's, of a stream of VM
+     * t1's console, as it sent it -- once. */
+    let keys = sched::harness(|| typed().clone());
+    for (i, t) in keys.iter().enumerate() {
+        let id = String::from_utf8_lossy(t).rsplit(' ').next().and_then(|n| n.parse::<usize>().ok());
+        let sent = peers.borrow().iter().filter_map(|p| p.conv.clone()).any(|c| {
+            let c = c.borrow();
+            Some(c.id) == id && c.who == Who::Known && c.reqs.iter().any(|r| match &r.ask {
+                Ask::Stream { channels: Some(ch), vm: Some(v), ws, .. } => {
+                    ch.split(',').any(|x| x == "console") && *v == VM && typing(ws.then, c.id) == *t
+                }
+                _ => false,
+            })
+        });
+        invariant!(sent, "{:?} typed at the console, which no admin's stream of it sent",
+                   String::from_utf8_lossy(t));
+        crate::common::runner::reached("api: an admin's keys typed at a console");
+        invariant!(!keys[..i].contains(t), "{:?} typed at the console twice", String::from_utf8_lossy(t));
     }
     let app = App::spawn("audit", 1, || kcore::fs::read("/etc/api/audit.log", 1 << 20).unwrap_or_default());
     invariant!(w.wait_app(&app, 60 * SEC), "the audit log never read");

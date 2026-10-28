@@ -945,6 +945,23 @@ impl Ring {
         true
     }
 
+    /// The first `max` of the kept bytes from absolute position `from` on
+    /// -- from the oldest kept if it is older -- onto `out`: where they
+    /// begin, for a reader that pages through the console a piece at a
+    /// time. None if memory ran out.
+    pub fn page(&self, from: u64, max: usize, out: &mut Vec<u8>) -> Option<u64> {
+        let oldest = self.oldest();
+        let from = from.max(oldest).min(self.total);
+        let skip = (from - oldest) as usize;
+        let n = (self.len - skip).min(max);
+        out.try_reserve(n).ok()?;
+        let cap = self.buf.len();
+        for i in 0..n {
+            out.push(self.buf[(self.head + skip + i) % cap]);
+        }
+        Some(from)
+    }
+
     /// Whether `needle` is among the kept bytes from absolute position
     /// `from` on.
     pub fn contains_since(&self, from: u64, needle: &[u8]) -> bool {
@@ -1215,6 +1232,56 @@ impl TermFilter {
         out.extend_from_slice(&self.csi[..self.csi_len]);
         self.csi_len = 0;
     }
+
+    /// `bytes`, filtered as `filter` does, onto `out` -- but for a sequence
+    /// they end in the middle of, which is left out and the filter's place
+    /// in it forgotten: how many of them were taken, the rest the next
+    /// call's to begin with. For a reader that keeps nothing between pages
+    /// of the console -- the host API's -- and so must not cut a sequence in
+    /// two. All of them where the open sequence began at the first byte --
+    /// one longer than a page -- so that the reader always gets on; and
+    /// where it is a CSI too long to hold, which is let through as it comes.
+    pub fn filter_whole(&mut self, bytes: &[u8], out: &mut Vec<u8>) -> usize {
+        /* Where the sequence open now began, and how much of `out` there
+         * was then: nothing of it is pushed until it ends. */
+        let mut open: Option<(usize, usize)> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            let was_text = self.state == Term::Text;
+            self.filter(core::slice::from_ref(&b), out);
+            if self.state == Term::Text {
+                open = None;
+            } else if was_text {
+                open = Some((i, out.len()));
+            }
+        }
+        match (open, self.state) {
+            (Some((at, kept)), Term::Esc | Term::Csi | Term::Str | Term::StrEsc) if at > 0 => {
+                out.truncate(kept);
+                *self = TermFilter::new();
+                at
+            }
+            _ => bytes.len(),
+        }
+    }
+}
+
+/// The console's bytes as text a client shows: its control sequences
+/// taken out, and every control character but the newline and the tab --
+/// what `sanitize` leaves, and the bytes past ASCII kept as they are, for
+/// the client to read as UTF-8. False if memory ran out.
+pub fn printable(bytes: &[u8], out: &mut Vec<u8>) -> bool {
+    if out.try_reserve(bytes.len()).is_err() {
+        return false;
+    }
+    let mut esc = Esc::Text;
+    for &b in bytes {
+        let (next, text) = esc.step(b);
+        esc = next;
+        if text && matches!(b, b'\n' | b'\t' | 0x20..=0x7E | 0x80..=0xFF) {
+            out.push(b);
+        }
+    }
+    true
 }
 
 /// A guest's console as it is safe to print to whoever asked: printable

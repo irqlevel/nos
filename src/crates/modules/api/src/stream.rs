@@ -5,16 +5,27 @@
 //!   client makes its rates from two of them; its history is its own);
 //! - `log`, the kernel's log from where the client asks (`log_since`) -- or
 //!   from now -- by its messages' numbers, a gap in them what the log lost;
-//! - `jobs`, every job's record, whenever one has changed.
+//! - `jobs`, every job's record, whenever one has changed;
+//! - `console`, a VM's console as a terminal shows it (`?vm=<name>`, from
+//!   its byte `console_from=`, or all the ring keeps): the vm provider's
+//!   pages of it (`vm.console_read`, terminal), each with where it begins
+//!   and ends in all the guest has printed -- a gap between two is what the
+//!   ring lost while the client read slower than the guest printed. The
+//!   stream reads the ring as the client takes what it sends, and holds no
+//!   more than a page.
 //!
-//! `?channels=metrics,log` picks; all three unless asked. Each message is
-//! a text frame of JSON, `{"channel": ..., ...}`. The client says nothing
-//! but its pongs and its close; the server pings it every half of its idle
-//! time, and one that answers nothing for the whole of it is let go. Every
-//! channel is a read: a client of either role may open it -- while its key
-//! is on the list: taken off, the stream is closed within a turn of its
-//! loop.
+//! `?channels=metrics,log` picks; the first three unless asked. Each
+//! message is a text frame of JSON, `{"channel": ..., ...}`. The server pings
+//! the client every half of its idle time, and one that answers nothing for
+//! the whole of it is let go. Every channel is a read: a client of either
+//! role may open it -- while its key is on the list: taken off, the stream is
+//! closed within a turn of its loop. The client says nothing but its pongs
+//! and its close -- or, with the console open, what it types at the VM: a
+//! message is typed at the console as it is (`vm.console_write`), an
+//! admin's alone, the first of a stream in the audit log; a reader's is
+//! answered that it is not.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -25,6 +36,7 @@ use tls::server::Read;
 use web::http::Request;
 use web::ws::{Decoder, Event, Opcode};
 
+use super::files::Role;
 use super::http::{send, Ending, Session, Who};
 use super::server::Shared;
 
@@ -45,6 +57,14 @@ const CLOSE_GOING_AWAY: u16 = 1001;
 const CLOSE_NORMAL: u16 = 1000;
 /// Its key taken off the list (RFC 6455's policy violation).
 const CLOSE_POLICY: u16 = 1008;
+/// How often the console is looked at, and how long a read waits while it
+/// is open: what a key typed takes to come back as its echo, at most.
+const CONSOLE_NS: u64 = 30 * NS_PER_MS;
+const CONSOLE_READ_MS: u64 = 20;
+/// What of the console one message carries, at most.
+const CONSOLE_BYTES: u64 = 16 * 1024;
+/// A VM's name, at most: its folder's.
+const VM_NAME_MAX: usize = 32;
 
 pub struct Params {
     accept: [u8; 28],
@@ -52,6 +72,19 @@ pub struct Params {
     log: bool,
     jobs: bool,
     log_since: Option<u64>,
+    /// The console asked for, and of which VM -- None where `vm=` names
+    /// none a VM may have -- and from where.
+    console: bool,
+    vm: Option<String>,
+    console_from: u64,
+}
+
+/// Whether `name` may be a VM's: what its folder's may be, and so safe in
+/// the JSON the stream writes its parameters in.
+fn vm_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty() && b.len() <= VM_NAME_MAX && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
 impl Params {
@@ -64,6 +97,9 @@ impl Params {
             log: has("log"),
             jobs: has("jobs"),
             log_since: req.query("log_since").and_then(|v| v.parse::<u64>().ok()),
+            console: has("console"),
+            vm: req.query("vm").filter(|v| vm_name(v)).map(String::from),
+            console_from: req.query("console_from").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
         }
     }
 }
@@ -125,6 +161,21 @@ pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64)
     let mut next_ping = start + idle_ns / 2;
     let mut heard = start;
     let mut last_jobs: Vec<u8> = Vec::new();
+    /* The console: of which VM, from where, when it is next looked at, and
+     * whether the client has typed at it yet. */
+    let console = if p.console { p.vm.as_deref() } else { None };
+    if p.console && console.is_none() && !message(s, idle_ns, |w| {
+        w.begin_object();
+        w.field_str("channel", "console");
+        w.field_str("error", "vm= names no vm: a letter or a digit, then letters, digits, . _ and -");
+        w.end_object();
+    }) {
+        return Ending::Reset;
+    }
+    let mut console_from = p.console_from;
+    let mut next_console = start;
+    let mut typed = false;
+    let read_ms = if console.is_some() { CONSOLE_READ_MS } else { READ_MS };
     loop {
         /* A key taken off the list is let have nothing more: not even
          * what a read would show it */
@@ -197,6 +248,33 @@ pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64)
                 }
             }
         }
+        if let Some(vm) = console.filter(|_| now >= next_console) {
+            next_console = now + CONSOLE_NS;
+            let params = alloc::format!("{{\"name\":\"{}\",\"from\":{},\"max_bytes\":{},\"terminal\":true}}", vm,
+                                        console_from, CONSOLE_BYTES);
+            if let Some(answer) = read("vm", "console_read", params.as_bytes()) {
+                let parsed = json::parse(&answer, &ANSWER_LIMITS).ok();
+                let at = |key: &str| parsed.as_ref().and_then(|v| v.get(key)).and_then(|v| v.as_u64());
+                let (next, total) = (at("next").unwrap_or(console_from), at("total").unwrap_or(0));
+                if next != console_from || at("from").is_some_and(|f| f != console_from) {
+                    console_from = next;
+                    /* More than a page waits: the next, at once. */
+                    if next < total {
+                        next_console = now;
+                    }
+                    let data = Some(answer);
+                    if !message(s, idle_ns, |w| {
+                        w.begin_object();
+                        w.field_str("channel", "console");
+                        w.field_str("vm", vm);
+                        raw_or_null(w, "data", &data);
+                        w.end_object();
+                    }) {
+                        return Ending::Reset;
+                    }
+                }
+            }
+        }
         if now >= next_ping {
             next_ping = now + idle_ns / 2;
             let mut frame = Vec::new();
@@ -207,7 +285,7 @@ pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64)
         if boot_time_ns().saturating_sub(heard) >= idle_ns {
             return Ending::Reset;
         }
-        match s.read(&mut chunk, READ_MS) {
+        match s.read(&mut chunk, read_ms) {
             Read::Data(n) => {
                 if incoming.len() + n > 2 * MESSAGE_MAX + 16 || incoming.try_reserve(n).is_err() {
                     close(s, web::ws::WsError::TooBig.close_code(), "more than a stream's client sends", idle_ns);
@@ -231,7 +309,17 @@ pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64)
                                     let _ = web::ws::write_close(&mut reply, CLOSE_NORMAL, "");
                                     done = true;
                                 }
-                                Some(Event::Pong(_)) | Some(Event::Message { .. }) | None => {}
+                                Some(Event::Message { data, .. }) => {
+                                    if let Some(vm) = console {
+                                        let said = type_at(shared, who, vm, data, &mut typed);
+                                        if let Some(said) = said {
+                                            if web::ws::write_frame(&mut reply, Opcode::Text, &said).is_err() {
+                                                return Ending::Reset;
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Event::Pong(_)) | None => {}
                             }
                             incoming.drain(..used);
                             if !reply.is_empty() && !send(s, &reply, idle_ns) {
@@ -253,6 +341,54 @@ pub fn run(shared: &Shared, s: &mut Session, who: &Who, p: Params, idle_ns: u64)
             Read::Failed => return Ending::Reset,
         }
     }
+}
+
+/// What the client typed, at the console of `vm`: an admin's typed there
+/// (`vm.console_write`), the first of a stream in the audit log; a reader's
+/// refused. What the client is told back, when anything: the refusal, or
+/// why it did not go in.
+fn type_at(shared: &Shared, who: &Who, vm: &str, keys: &[u8], typed: &mut bool) -> Option<Vec<u8>> {
+    let told = |why: &str, status: Status| {
+        let mut body = Vec::new();
+        let mut sink = |b: &[u8]| {
+            body.try_reserve(b.len()).is_ok() && {
+                body.extend_from_slice(b);
+                true
+            }
+        };
+        let mut w = Writer::new(&mut sink);
+        w.begin_object();
+        w.field_str("channel", "console");
+        w.field_str("vm", vm);
+        w.field_str("refused", status.name());
+        w.field_str("message", why);
+        w.end_object();
+        w.ok().then_some(body)
+    };
+    if who.role != Role::Admin {
+        return told("a reader types at no console", Status::Forbidden);
+    }
+    let mut params = Vec::new();
+    let mut sink = |b: &[u8]| {
+        params.try_reserve(b.len()).is_ok() && {
+            params.extend_from_slice(b);
+            true
+        }
+    };
+    let mut w = Writer::new(&mut sink);
+    w.begin_object();
+    w.field_str("name", vm);
+    w.field_str_lossy("text", keys);
+    w.end_object();
+    if !w.ok() {
+        return told("no memory for what was typed", Status::Busy);
+    }
+    let status = bus::call("vm", "console_write", &params, 1024, &mut |_| true);
+    if !*typed {
+        *typed = true;
+        super::http::audit(shared, who, &alloc::format!("console {} typed at", vm), status);
+    }
+    (status != Status::Ok).then(|| told("not typed", status)).flatten()
 }
 
 /// A close frame, sent if it can be: what the client is told before the

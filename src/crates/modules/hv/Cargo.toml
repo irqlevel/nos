@@ -23,3 +23,6 @@ netwire = { path = "../../netwire" }
 diskimage = { path = "../../diskimage" }
 # vm.toml's text: the strict TOML the host API's api.toml is written in too.
 conf = { path = "../../conf" }
+# The vm provider's side of the management bus: the parameters a call is
+# handed, read strictly.
+mgmtwire = { path = "../../mgmtwire" }

@@ -121,18 +121,24 @@ before it closes, so the slot left in TIME-WAIT is the client's. Anything else
 
 ## The stream
 
-`GET /v1/stream[?channels=metrics,log,jobs][&log_since=N]`, upgraded to a
-WebSocket. Each message is a text frame of JSON, `{"channel": ...}`:
+`GET /v1/stream[?channels=metrics,log,jobs,console][&log_since=N][&vm=<name>][&console_from=N]`,
+upgraded to a WebSocket. Each message is a text frame of JSON, `{"channel": ...}`:
 
 - `metrics`, once a second: `cpus` (each CPU's idle time), `memory` and `interfaces` (each one's counters), as `system` and `net` answer them -- a client makes its rates from two, and keeps its own history;
 - `log`, every half second when there is something new: the `system.log` answer, from `log_since` or from now -- a gap in the messages' numbers is what the log lost;
-- `jobs`, every job's record, whenever one has changed.
+- `jobs`, every job's record, whenever one has changed;
+- `console`, a VM's console as a terminal shows it (`vm=` names the VM, `console_from=` the byte of all it has printed to begin from -- 0, all the ring keeps, unless told): each message the `vm.console_read` answer of a page (`from`, `next`, `total`, `text`), every 30 ms while there is something new, a page after another at once while more waits. The pages follow each other: one that begins past where the last ended is what the ring -- 64 KiB -- lost while the client read slower than the guest printed. The stream holds no more than a page, so a client that takes nothing holds nothing.
 
-The client says nothing but its pongs and its close. The server pings it
-every half of its idle time, and lets go of one that answers nothing for the
-whole of it. Every channel is a read: either role may open it, while its key
-is on the list. A guest's
-console will be a channel of the `vm` provider's.
+The first three are what a stream has unless asked. The server pings the
+client every half of its idle time, and lets go of one that answers nothing
+for the whole of it. Every channel is a read: either role may open it, while
+its key is on the list. The client says nothing but its pongs and its close
+-- or, with the console open, what it types: each message is typed at the VM
+as it is, control keys and escape sequences among it (`vm.console_write`),
+an admin's alone, the first of a stream a line of the audit log; a reader's
+is answered `{"channel": "console", "refused": "forbidden", ...}`, and one
+that does not go in -- the VM not running, its input full -- is answered so
+too. A message is at most 4 KiB, as a VM's input is.
 
 ## The api provider
 
@@ -155,10 +161,17 @@ nosctl host
 nosctl call system info
 nosctl start modtest nap; nosctl wait 5
 nosctl stream metrics,log 30
+nosctl vm list
+nosctl vm create noble https://cloud-images.ubuntu.com/.../noble-server-cloudimg-amd64.img '{"size_bytes": 21474836480}'
+nosctl vm clone noble noble2; nosctl vm start noble2
+nosctl vm console noble2                  # live, typed at -- ^] detaches
 ```
 
 A host showing a key other than the pinned one is refused before a request
-is sent.
+is sent. `vm start`, `stop`, `restart`, `create`, `clone` and `delete` start
+the `vm` provider's job and follow it to its end, its log printed as it
+comes ([On the management bus](hypervisor.md#on-the-management-bus)); `vm
+console` opens the stream's console channel on a raw terminal.
 
 ## What it costs
 
@@ -183,6 +196,9 @@ module's own source on the host, against clients of each role and of none
 that ask for every route and break HTTP, the stream and TLS, while the
 console changes the keys and stops the server: it holds every answer to a
 model of the routes, the roles and the limits, and what ran to what an
-admin asked for. Every boot's `test_module_bus` has
+admin asked for -- a VM's console among it, a provider of the fuzzer's
+paging one that prints as time goes: every page the console's own bytes,
+none before where the last ended, and every key typed at it an admin's
+stream's, once. Every boot's `test_module_bus` has
 modtest ask the bus as a module does (`modtest bus`): the caller's side of
 the bus's C ABI, which the API is built on.

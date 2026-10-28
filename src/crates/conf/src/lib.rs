@@ -57,6 +57,12 @@ pub trait Keys {
 
     /// The key's value, once read and its line ended.
     fn assign(&mut self, line: usize, key: &str, value: Value) -> Result<(), String>;
+
+    /// Where the key's entry is in the text, once its value is assigned:
+    /// from its first byte to the end of its last line, the newline taken
+    /// with it -- for `edit`, which changes a key and leaves every other
+    /// line as it was.
+    fn span(&mut self, _key: &str, _from: usize, _to: usize) {}
 }
 
 /// `text` read, each key and its value handed to `keys` in the order they
@@ -71,6 +77,7 @@ pub fn parse(text: &str, what: &str, keys: &mut dyn Keys) -> Result<(), String> 
             break;
         }
         let line = p.line;
+        let from = p.at;
         let name = p.key()?;
         keys.known(line, name)?;
         if seen.contains(&name) {
@@ -86,8 +93,87 @@ pub fn parse(text: &str, what: &str, keys: &mut dyn Keys) -> Result<(), String> 
         let value = p.value()?;
         p.end()?;
         keys.assign(line, name, value)?;
+        keys.span(name, from, p.at);
     }
     Ok(())
+}
+
+/// A change `edit` makes to a file's text: the entry of `key` made `line` --
+/// a whole `key = value` line, its newline with it -- or taken out where
+/// `line` is None.
+pub struct Edit<'a> {
+    pub key: &'a str,
+    pub line: Option<String>,
+}
+
+/// `text` -- which `parse` reads with `keys`, refused as it refuses it --
+/// with each of `edits` made: an entry the text has replaced where it is, or
+/// taken out; one it does not have added at its end. Every other line --
+/// the other keys, the comments, the blank lines -- is left as it was, but
+/// a comment after a value on its line, which goes with the value. A key
+/// edited twice is the first edit's.
+pub fn edit(text: &str, what: &str, keys: &mut dyn Keys, edits: &[Edit]) -> Result<String, String> {
+    /// The file's keys as `keys` has them, and where each entry is.
+    struct Spans<'k> {
+        keys: &'k mut dyn Keys,
+        spans: Vec<(String, usize, usize)>,
+        /// A span not kept for want of memory: the edit is refused.
+        lost: bool,
+    }
+
+    impl Keys for Spans<'_> {
+        fn known(&mut self, line: usize, key: &str) -> Result<(), String> {
+            self.keys.known(line, key)
+        }
+
+        fn assign(&mut self, line: usize, key: &str, value: Value) -> Result<(), String> {
+            self.keys.assign(line, key, value)
+        }
+
+        fn span(&mut self, key: &str, from: usize, to: usize) {
+            let mut name = String::new();
+            if name.try_reserve_exact(key.len()).is_err() || self.spans.try_reserve(1).is_err() {
+                self.lost = true;
+                return;
+            }
+            name.push_str(key);
+            self.spans.push((name, from, to));
+        }
+    }
+
+    let mut found = Spans { keys, spans: Vec::new(), lost: false };
+    parse(text, what, &mut found)?;
+    if found.lost {
+        return Err(String::from("out of memory"));
+    }
+    let spans = found.spans;
+    let room = edits.iter().map(|e| e.line.as_ref().map_or(0, String::len)).sum::<usize>();
+    let mut out = String::new();
+    out.try_reserve(text.len() + room + 1).map_err(|_| String::from("out of memory"))?;
+    /* In the text's order: every span the parse recorded, a key once, and
+     * what is between them copied as it is. */
+    let mut at = 0;
+    for (name, from, to) in &spans {
+        out.push_str(&text[at..*from]);
+        match edits.iter().find(|e| e.key == name.as_str()) {
+            Some(Edit { line: Some(line), .. }) => out.push_str(line),
+            Some(Edit { line: None, .. }) => {}
+            None => out.push_str(&text[*from..*to]),
+        }
+        at = *to;
+    }
+    out.push_str(&text[at..]);
+    for (i, e) in edits.iter().enumerate() {
+        let first = edits[..i].iter().all(|before| before.key != e.key);
+        let there = spans.iter().any(|(name, _, _)| name.as_str() == e.key);
+        if let (true, false, Some(line)) = (first, there, &e.line) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(line);
+        }
+    }
+    Ok(out)
 }
 
 /* ---- the reader ---- */

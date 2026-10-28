@@ -18,8 +18,9 @@
 //!     GET  /v1/jobs                      every job's record
 //!     GET  /v1/jobs/<id>[?notes_since=N] one's record, log and result
 //!     POST /v1/jobs/<id>/cancel          one told to stop
-//!     GET  /v1/stream                    a WebSocket of metrics, the log
-//!                                        and the jobs (stream.rs)
+//!     GET  /v1/stream                    a WebSocket of metrics, the log,
+//!                                        the jobs and a VM's console
+//!                                        (stream.rs)
 //!
 //! What a client may call is the kind its method is registered as on the
 //! bus -- never what the request says -- against the client's role: `read`
@@ -641,7 +642,7 @@ fn host(shared: &Shared, who: &Who) -> Response {
 }
 
 /// A line of the audit log, and of the kernel's.
-fn audit(shared: &Shared, who: &Who, what: &str, s: Status) {
+pub(super) fn audit(shared: &Shared, who: &Who, what: &str, s: Status) {
     let line = alloc::format!("{} {} {} {}", who.name, Ip(who.ip), what, s.name());
     kcore::trace!(0, "api: {}", line);
     shared.audit.with(|_| super::files::audit(&shared.dir, &line));
