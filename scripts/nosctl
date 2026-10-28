@@ -13,6 +13,12 @@
     wait <id>                         a job followed to its end, its log as it comes
     cancel <id>                       one told to stop
     stream [channels] [seconds]       the WebSocket's messages, a line each
+    vm list                           the VMs, a line each
+    vm <start|stop|restart|delete> <name> [json]
+                                      a job of the vm provider's, followed to its end
+    vm create <name> <url> [json]     a VM of a cloud's image, followed to its end
+    vm clone <name> <to>              a VM's copy, followed to its end
+    vm console <name>                 its console, live, typed at -- ^] detaches
     keygen <name> <dir>               a client's key and certificate (openssl), its fingerprint
     fingerprint <cert.pem>            a certificate's key, as the host pins a client by
 
@@ -30,6 +36,7 @@ import base64
 import hashlib
 import json
 import os
+import select
 import socket
 import ssl
 import struct
@@ -216,6 +223,96 @@ class Api:
         except OSError:
             pass
 
+    def type(self, text):
+        """`text` as a message of the client's: what the console channel
+        types at the VM."""
+        self._frame_out(0x1, text.encode())
+
+    def waiting(self):
+        """Whether a message, or the start of one, is there to read."""
+        return bool(self.buf) or self.sock.pending() > 0
+
+
+DETACH = '\x1d'
+
+
+def follow(api, job_id):
+    """The job followed to its end, its log printed as it comes: its record."""
+    since = 0
+    while True:
+        status, _, rec = api.request('GET', '/v1/jobs/%s?notes_since=%d' % (job_id, since))
+        if status != 200:
+            return status, rec
+        for n in rec.get('notes', []):
+            print('  %4d %s' % (n['seq'], n['text']))
+        since = rec.get('notes_next', since)
+        if rec.get('state') == 'done':
+            return status, rec
+        time.sleep(0.5)
+
+
+def vm_job(api, method, params):
+    """A job of the vm provider's started and followed to its end: 0 when it
+    ended ok."""
+    status, _, body = api.request('POST', '/v1/jobs/vm/%s' % method, params)
+    if status != 202 and status != 200:
+        return show(status, body)
+    status, rec = follow(api, body['id'])
+    show(status, rec)
+    return 0 if rec.get('status') == 'ok' else 1
+
+
+def vm_console(api, name):
+    """The console of `name`, live: what it prints written out as it comes,
+    what is typed sent -- the terminal raw, ^] detaching."""
+    import termios
+    import tty
+    api.stream('?channels=console&vm=' + name)
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+    if saved:
+        tty.setraw(fd)
+    try:
+        while True:
+            ready = [] if api.waiting() else select.select([api.sock, fd], [], [], 0.5)[0]
+            if fd in ready:
+                keys = os.read(fd, 1024).decode(errors='replace')
+                if DETACH in keys:
+                    keys = keys[:keys.index(DETACH)]
+                    if keys:
+                        api.type(keys)
+                    break
+                if keys:
+                    api.type(keys)
+            if api.waiting() or api.sock in ready:
+                msg = api.message()
+                if msg is None:
+                    break
+                data = msg.get('data') or {}
+                if 'text' in data:
+                    sys.stdout.write(data['text'])
+                    sys.stdout.flush()
+                elif 'refused' in msg or 'error' in msg:
+                    sys.stdout.write('\r\nnosctl: %s\r\n' % (msg.get('message') or msg.get('error')))
+                    sys.stdout.flush()
+    finally:
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        api.say_goodbye()
+    print()
+    return 0
+
+
+def vm_list(api):
+    status, _, body = api.request('POST', '/v1/call/vm/list')
+    if status != 200:
+        return show(status, body)
+    for v in body.get('vms', []):
+        print('%-20s %-9s %2s cpu  %5s MiB  %-15s %s' % (
+            v.get('name') or 'vm%s' % v.get('id'), v.get('state'), v.get('cpus'), v.get('memory_mib'),
+            v.get('ip') or '-', '%d s' % (v['uptime_ms'] // 1000) if 'uptime_ms' in v else ''))
+    return 0
+
 
 # ---- the commands ----
 
@@ -283,17 +380,26 @@ def main(argv):
         if cmd == 'cancel' and len(rest) == 1:
             return show(*api.request('POST', '/v1/jobs/%s/cancel' % rest[0])[::2])
         if cmd == 'wait' and len(rest) == 1:
-            since = 0
-            while True:
-                status, _, rec = api.request('GET', '/v1/jobs/%s?notes_since=%d' % (rest[0], since))
-                if status != 200:
-                    return show(status, rec)
-                for n in rec.get('notes', []):
-                    print('  %4d %s' % (n['seq'], n['text']))
-                since = rec.get('notes_next', since)
-                if rec.get('state') == 'done':
-                    return show(200, rec) if rec.get('status') == 'ok' else (show(200, rec) or 1)
-                time.sleep(0.5)
+            status, rec = follow(api, rest[0])
+            if status != 200:
+                return show(status, rec)
+            return show(200, rec) if rec.get('status') == 'ok' else (show(200, rec) or 1)
+        if cmd == 'vm' and rest:
+            verb, more = rest[0], rest[1:]
+            if verb == 'list' and not more:
+                return vm_list(api)
+            if verb in ('start', 'stop', 'restart', 'delete') and len(more) in (1, 2):
+                params = json.loads(more[1]) if len(more) == 2 else {}
+                params['name'] = more[0]
+                return vm_job(api, verb, params)
+            if verb == 'create' and len(more) in (2, 3):
+                params = json.loads(more[2]) if len(more) == 3 else {}
+                params.update(name=more[0], url=more[1])
+                return vm_job(api, 'create', params)
+            if verb == 'clone' and len(more) == 2:
+                return vm_job(api, 'clone', {'name': more[0], 'to': more[1]})
+            if verb == 'console' and len(more) == 1:
+                return vm_console(api, more[0])
         if cmd == 'stream' and len(rest) <= 2:
             query = '?channels=' + rest[0] if rest else ''
             end = time.time() + (float(rest[1]) if len(rest) == 2 else 1e9)

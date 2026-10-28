@@ -69,13 +69,28 @@ impl<'a> Params<'a> {
     /// Text of up to `max` bytes: lines, tabs, any characters but the other
     /// control ones -- a configuration file's.
     pub fn text(&mut self, key: &'a str, max: usize) -> Result<&'a str, Invalid<'a>> {
-        let v = self.take(key).ok_or(Invalid { field: key, why: "is needed" })?;
+        self.opt_text(key, max)?.ok_or(Invalid { field: key, why: "is needed" })
+    }
+
+    pub fn opt_text(&mut self, key: &'a str, max: usize) -> Result<Option<&'a str>, Invalid<'a>> {
+        let Some(v) = self.take(key) else { return Ok(None) };
         let s = v.as_str().ok_or(Invalid { field: key, why: "is a string" })?;
         if s.len() > max {
             return Err(Invalid { field: key, why: "is too long" });
         }
         if s.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
             return Err(Invalid { field: key, why: "has a control character in it" });
+        }
+        Ok(Some(s))
+    }
+
+    /// A string of up to `max` bytes, any characters in it: what is typed at
+    /// a terminal, its control keys among them.
+    pub fn any(&mut self, key: &'a str, max: usize) -> Result<&'a str, Invalid<'a>> {
+        let v = self.take(key).ok_or(Invalid { field: key, why: "is needed" })?;
+        let s = v.as_str().ok_or(Invalid { field: key, why: "is a string" })?;
+        if s.len() > max {
+            return Err(Invalid { field: key, why: "is too long" });
         }
         Ok(s)
     }

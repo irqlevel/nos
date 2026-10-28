@@ -36,6 +36,15 @@ through nosctl's own client:
   - what a handshake costs, and how deep the connection's task went in it,
     are printed.
 
+On x86-64, where the guests are, hv.ko is loaded too, and its vm provider
+taken through the API (vm_checks): a VM of hvboot -- which, given no disk,
+says so and powers the guest off -- started as a job, found stopped, its
+console read and streamed, a reader's typing at it refused, an admin's
+refused for a VM that does not run, and stopped; a VM made of an image the
+test serves, cloned, the clone deleted; a protected VM's delete refused
+without force; and a create of an image served slowly cancelled midway,
+nothing of it left behind.
+
     scripts/api-test.py [--arch aarch64|x86_64] [--tcg]
 
 arm64 is the whole of it, over the UDP shell. `--arch x86_64` is the short
@@ -91,11 +100,28 @@ def keys(tmp):
     return out
 
 
+# The images the vm provider's create downloads (x86-64): a raw disk -- a
+# partition table's signature and random bytes -- and one served slowly, a
+# chunk at a time, for a create to be cancelled while it downloads.
+RAW_SIZE = 2 * 1024 * 1024
+SLOW_SIZE = 64 * 1024 * 1024
+SLOW_CHUNK = 64 * 1024
+SLOW_PAUSE = 0.05
+# hvboot, as `make hvboot` builds it: the kernel of the VM the test starts.
+HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
+# What /etc/rc does for the vm checks: hv loaded and on, and a VM of hvboot.
+VM_RC = "insmod /hv.ko\nhv on\nhv create t1 /lib/hvboot mem=64\n"
+
+
 def rootfs(tmp, arch, k, rc):
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc", "api"))
     for m in ("api", "modtest", "sshd"):
         shutil.copy(pt.module_path(arch, m), rootdir)
+    if arch == "x86_64":
+        shutil.copy(pt.module_path(arch, "hv"), rootdir)
+        os.makedirs(os.path.join(rootdir, "lib"))
+        shutil.copy(HVBOOT, os.path.join(rootdir, "lib", "hvboot"))
     with open(os.path.join(rootdir, "etc", "api", "api.toml"), "w") as f:
         f.write("# api-test.py\nport = %d\nlisten = [\"eth0\"]\nidle_secs = %d\nmax_connections = %d\n"
                 "max_per_key = %d\nmax_handshakes = 2\n" % (PORT, IDLE_SECS, MAX_CONNECTIONS, MAX_PER_KEY))
@@ -103,7 +129,8 @@ def rootfs(tmp, arch, k, rc):
         f.write("%s admin admin\n%s read reader\n" % (k["admin"][2], k["reader"][2]))
     if rc:
         with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
-            f.write("# api-test.py\ninsmod /modtest.ko\ninsmod /api.ko\napi start\n")
+            f.write("# api-test.py\ninsmod /modtest.ko\ninsmod /api.ko\napi start\n"
+                    + (VM_RC if arch == "x86_64" else ""))
     image = os.path.join(tmp, "root.img")
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
@@ -487,8 +514,195 @@ def arm64(args, tmp, k):
         stop(p)
 
 
+def image_server(tmp):
+    """A web server on the test machine, which QEMU's user network puts at
+    10.0.2.2 for nos: the raw disk as a file, and /slow.img written a chunk
+    at a time. The server, and its port."""
+    import functools
+    import http.server
+    import random
+    import threading
+
+    www = os.path.join(tmp, "www")
+    os.makedirs(www)
+    raw = bytearray(random.Random(7).randbytes(RAW_SIZE))
+    raw[510:512] = b"\x55\xaa"
+    with open(os.path.join(www, "raw.img"), "wb") as f:
+        f.write(raw)
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            if self.path != "/slow.img":
+                return super().do_GET()
+            self.send_response(200)
+            self.send_header("Content-Length", str(SLOW_SIZE))
+            self.end_headers()
+            chunk = bytes(SLOW_CHUNK)
+            try:
+                for _ in range(SLOW_SIZE // SLOW_CHUNK):
+                    self.wfile.write(chunk)
+                    time.sleep(SLOW_PAUSE)
+            except OSError:
+                pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=www))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+def vm_job(a, method, params, timeout=300):
+    """A job of the vm provider's started and followed to its end: its
+    starting answer, and its record once done (None if it never was)."""
+    s, _, body = a.request("POST", "/v1/jobs/vm/%s" % method, params)
+    if s != 202:
+        return (s, body), None
+    end = time.time() + timeout
+    while time.time() < end:
+        _, _, rec = a.request("GET", "/v1/jobs/%d" % body["id"])
+        if rec.get("state") == "done":
+            return (s, body), rec
+        time.sleep(0.5)
+    return (s, body), None
+
+
+def vm_get(a, name):
+    s, _, body = a.request("POST", "/v1/call/vm/get", {"name": name})
+    return s, body
+
+
+def vm_checks(k, pin, port):
+    """The vm provider through the API (x86-64): what the module's docstring
+    says of it."""
+    a = client(k, "admin", pin)
+    r = client(k, "reader", pin)
+    url = "http://10.0.2.2:%d/" % port
+
+    s, _, d = a.request("GET", "/v1/providers/vm")
+    pt.check("the vm provider is on the bus, its descriptor served", s == 200 and d.get("provider") == "vm", (s, d))
+    s, _, body = r.request("GET", "/v1/providers")
+    vm = [p for p in body.get("providers", []) if p.get("name") == "vm"] if s == 200 else []
+    methods = {m["name"]: m.get("kind") for m in vm[0]["methods"]} if vm else {}
+    pt.check("a reader is shown its reads alone", "list" in methods and "console_read" in methods
+             and all(kind == "read" for kind in methods.values()), (s, methods))
+    s, _, listed = r.request("POST", "/v1/call/vm/list")
+    t1 = [v for v in listed.get("vms", []) if v.get("name") == "t1"] if s == 200 else []
+    pt.check("the reader lists the vms: t1, off", t1 and t1[0].get("state") == "off" and t1[0].get("folder") is True,
+             (s, listed))
+
+    started, rec = vm_job(a, "start", {"name": "t1"})
+    pt.check("t1 started as a job, which ends ok with its number", rec is not None and rec.get("status") == "ok"
+             and isinstance(rec.get("result", {}).get("id"), int), (started, rec))
+    pt.check("the job's log says it started", rec is not None
+             and any("started on" in n.get("text", "") for n in rec.get("notes", [])), rec)
+    stopped = None
+    end = time.time() + 120
+    while time.time() < end:
+        s, got = vm_get(a, "t1")
+        if s == 200 and got.get("vm", {}).get("state") == "stopped":
+            stopped = got
+            break
+        time.sleep(1)
+    pt.check("hvboot, given no disk, turns the guest off: t1 is found stopped", stopped is not None,
+             vm_get(a, "t1"))
+
+    s, _, page = r.request("POST", "/v1/call/vm/console_read", {"name": "t1"})
+    pt.check("its console read by a reader: hvboot's lines, from where the ring begins",
+             s == 200 and "hvboot" in page.get("text", "") and page.get("from") == 0
+             and page.get("next") == page.get("total"), (s, page))
+    s, _, body = r.request("POST", "/v1/call/vm/console_write", {"name": "t1", "text": "x"})
+    pt.check("a reader may not type at it: 403", s == 403, (s, body))
+
+    r.close()
+    r.stream("?channels=console&vm=t1")
+    msg = r.message()
+    pt.check("the reader's stream of t1's console: what it printed, hvboot's lines among it",
+             msg is not None and msg.get("channel") == "console" and "hvboot" in msg.get("data", {}).get("text", ""),
+             msg)
+    r.type("x")
+    msg = r.message()
+    pt.check("and what the reader types is refused", msg is not None and msg.get("refused") == "forbidden", msg)
+    r.say_goodbye()
+    r.close()
+    a.close()
+    a.stream("?channels=console&vm=t1")
+    first = a.message()
+    a.type("x")
+    msg = a.message()
+    pt.check("an admin's typing at a vm that does not run is refused, saying why",
+             first is not None and msg is not None and msg.get("refused") == "conflict", (first, msg))
+    a.say_goodbye()
+    a.close()
+
+    started, rec = vm_job(a, "stop", {"name": "t1"})
+    pt.check("t1 stopped -- taken off the list -- as a job", rec is not None and rec.get("status") == "ok", (started, rec))
+    s, got = vm_get(a, "t1")
+    pt.check("and off", s == 200 and got.get("vm", {}).get("state") == "off", got)
+
+    started, rec = vm_job(a, "create", {"name": "c1", "url": url + "raw.img", "memory_mib": 256})
+    pt.check("c1 made of a raw image the test serves", rec is not None and rec.get("status") == "ok"
+             and rec.get("result", {}).get("disk_bytes") == RAW_SIZE, (started, rec))
+    pt.check("its download in the job's log", rec is not None
+             and any(n.get("text", "").startswith("download:") for n in rec.get("notes", [])), rec)
+    s, got = vm_get(a, "c1")
+    disks = {d.get("file"): d for d in got.get("disks", [])} if s == 200 else {}
+    pt.check("its disks: the image and the seed", disks.get("disk.raw", {}).get("size_bytes") == RAW_SIZE
+             and disks.get("seed.iso", {}).get("read_only") is True, got)
+
+    started, rec = vm_job(a, "clone", {"name": "c1", "to": "c2"})
+    copied = (rec or {}).get("result", {}).get("copied", [])
+    pt.check("c1 cloned to c2, its disk copied and its seed made anew", rec is not None and rec.get("status") == "ok"
+             and rec["result"].get("seed") is True and len(copied) == 1
+             and copied[0].get("size_bytes") == RAW_SIZE and copied[0].get("written_bytes") <= RAW_SIZE,
+             (started, rec))
+    started, rec = vm_job(a, "delete", {"name": "c2"})
+    pt.check("c2 deleted", rec is not None and rec.get("status") == "ok", (started, rec))
+    s, got = vm_get(a, "c2")
+    pt.check("and gone", s == 404, (s, got))
+
+    s, _, body = a.request("POST", "/v1/call/vm/config_set",
+                           {"name": "c1", "text": 'kernel = "/lib/hvboot"\nnet = true\nprotected = true\n'})
+    pt.check("c1 made protected through its vm.toml", s == 200 and body.get("changed") is True, (s, body))
+    started, rec = vm_job(a, "delete", {"name": "c1"})
+    pt.check("a protected vm's delete refused without force", rec is not None and rec.get("status") == "conflict",
+             (started, rec))
+    started, rec = vm_job(a, "delete", {"name": "c1", "force": True})
+    pt.check("and done with it", rec is not None and rec.get("status") == "ok", (started, rec))
+
+    s, _, body = a.request("POST", "/v1/jobs/vm/create", {"name": "c3", "url": url + "slow.img"})
+    job = body.get("id") if s == 202 else None
+    going = None
+    end = time.time() + 60
+    while job is not None and time.time() < end:
+        _, _, going = a.request("GET", "/v1/jobs/%d" % job)
+        if going.get("done", 0) > 0 or going.get("state") == "done":
+            break
+        time.sleep(0.2)
+    pt.check("a create of an image served slowly is under way", going is not None and going.get("state") == "running"
+             and going.get("done", 0) > 0, going)
+    if job is not None:
+        s, _, body = a.request("POST", "/v1/jobs/%d/cancel" % job)
+        rec = None
+        end = time.time() + 60
+        while time.time() < end:
+            _, _, rec = a.request("GET", "/v1/jobs/%d" % job)
+            if rec.get("state") == "done":
+                break
+            time.sleep(0.5)
+        pt.check("cancelled, it stops as the next of the image comes", rec is not None and rec.get("state") == "done"
+                 and rec.get("status") == "cancelled", rec)
+    s, got = vm_get(a, "c3")
+    s2, _, listed = a.request("POST", "/v1/call/vm/list")
+    pt.check("and leaves nothing behind: no c3, nor a folder being made",
+             s == 404 and not any(v.get("name") == "c3" for v in listed.get("vms", [])), (s, got, listed))
+    a.close()
+
+
 def x86(args, tmp, k):
     image = rootfs(tmp, "x86_64", k, rc=True)
+    server, port = image_server(tmp)
     log = os.path.join(tmp, "serial.log")
     kvm = os.path.exists("/dev/kvm") and not args.tcg
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", "2",
@@ -500,8 +714,8 @@ def x86(args, tmp, k):
             # TCG's CPU has no RDRAND: the pool's source, without which no
             # key is made and no handshake done
             "-device", "virtio-rng-pci"]
-    if kvm:
-        argv += ["-enable-kvm", "-cpu", "host"]
+    # Under TCG, -cpu max: the default CPU has no AMD-V for hv's guests.
+    argv += ["-enable-kvm", "-cpu", "host"] if kvm else ["-cpu", "max"]
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not pt.check("boots", pt.wait_log(log, "boot: complete", 400)):
@@ -516,8 +730,10 @@ def x86(args, tmp, k):
         pin = found.group(1)
         time.sleep(3)
         common(k, pin, "x86_64")
+        vm_checks(k, pin, port)
         pt.check("nothing panicked", "PANIC" not in open(log, errors="replace").read())
     finally:
+        server.shutdown()
         stop(p)
 
 
@@ -526,7 +742,7 @@ def main():
     ap.add_argument("--arch", choices=("aarch64", "x86_64"), default="aarch64")
     ap.add_argument("--tcg", action="store_true")
     args = ap.parse_args()
-    for m in ("api", "modtest", "sshd"):
+    for m in ("api", "modtest", "sshd") + (("hv",) if args.arch == "x86_64" else ()):
         if not os.path.exists(pt.module_path(args.arch, m)):
             sys.exit("no %s -- make modules%s first" % (pt.module_path(args.arch, m),
                                                        " ARCH=aarch64" if args.arch == "aarch64" else ""))
