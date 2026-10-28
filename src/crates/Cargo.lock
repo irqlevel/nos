@@ -125,6 +125,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "conf"
+version = "0.1.0"
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -554,6 +558,7 @@ dependencies = [
 name = "mod-hv"
 version = "0.1.0"
 dependencies = [
+ "conf",
  "diskimage",
  "hv",
  "kcore",

@@ -1,0 +1,11 @@
+[package]
+name = "conf"
+version = "0.1.0"
+edition = "2021"
+
+# A configuration file's text, as a strict subset of TOML: what a VM's
+# vm.toml (modules/hv) and the host API's api.toml (modules/api) are written
+# in. No kernel in it and no unsafe; fuzz/hv builds it as it is.
+[lib]
+
+[dependencies]
