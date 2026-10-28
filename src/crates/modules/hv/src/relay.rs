@@ -12,6 +12,11 @@
 //! - a stop is seen within one round of short waits;
 //! - a side that takes nothing for `stall_ns` ends the relay, rather than
 //!   keeping it -- and whoever joins its task -- for good.
+//!
+//! While bytes move the waits are the shortest a side has, `BUSY_WAIT_MS`:
+//! one direction carrying a download would otherwise wait out the other's
+//! idle read every round, 4 KiB a round -- 600 KiB/s, whatever TCP's
+//! windows let through. A round that moves nothing goes back to `wait_ms`.
 
 /// What a side's read gave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +52,10 @@ pub enum Ended {
 /// How much one direction holds while its receiver has no room.
 pub const BUF: usize = 4096;
 
+/// The wait of a read or a send in a round after one that moved bytes: the
+/// shortest -- 0 would be forever to the kernel.
+pub const BUSY_WAIT_MS: u64 = 1;
+
 /// One direction: what was read from one side and not yet taken by the
 /// other, `buf[start..end]`, and when it last moved -- read in, or taken in
 /// part.
@@ -65,19 +74,23 @@ impl Leg {
 
 /// Carry what each of `a` and `b` sends to the other until one ends or goes,
 /// one takes nothing of what waits for it for `stall_ns`, or `stop` says so.
-/// Each read and send waits at most `wait_ms`; `now_ns` is the clock a stall
-/// is timed by.
+/// Each read and send waits at most `wait_ms` -- `BUSY_WAIT_MS` while bytes
+/// move; `now_ns` is the clock a stall is timed by.
 pub fn relay<S: Side>(a: &mut S, b: &mut S, wait_ms: u64, stall_ns: u64, now_ns: &dyn Fn() -> u64,
                       stop: &dyn Fn() -> bool) -> Ended {
     let mut legs = [Leg::new(), Leg::new()];
+    /* Whether the last round read or delivered anything */
+    let mut moving = false;
     loop {
         if stop() {
             return Ended::Stopped;
         }
+        let wait = if moving { BUSY_WAIT_MS.min(wait_ms) } else { wait_ms };
+        moving = false;
         for (dir, leg) in legs.iter_mut().enumerate() {
             let (from, to) = if dir == 0 { (&mut *a, &mut *b) } else { (&mut *b, &mut *a) };
             if leg.start == leg.end {
-                match from.recv(&mut leg.buf, wait_ms) {
+                match from.recv(&mut leg.buf, wait) {
                     /* Nothing came, or a side that broke its word and said
                      * nothing came: the other direction next. */
                     Read::Idle | Read::Data(0) => continue,
@@ -86,10 +99,11 @@ pub fn relay<S: Side>(a: &mut S, b: &mut S, wait_ms: u64, stall_ns: u64, now_ns:
                         leg.start = 0;
                         leg.end = n.min(BUF);
                         leg.moved_ns = now_ns();
+                        moving = true;
                     }
                 }
             }
-            match to.send(&leg.buf[leg.start..leg.end], wait_ms) {
+            match to.send(&leg.buf[leg.start..leg.end], wait) {
                 None => return Ended::Closed,
                 Some(0) => {
                     if now_ns().saturating_sub(leg.moved_ns) >= stall_ns {
@@ -99,6 +113,7 @@ pub fn relay<S: Side>(a: &mut S, b: &mut S, wait_ms: u64, stall_ns: u64, now_ns:
                 Some(n) => {
                     leg.start += n.min(leg.end - leg.start);
                     leg.moved_ns = now_ns();
+                    moving = true;
                 }
             }
         }

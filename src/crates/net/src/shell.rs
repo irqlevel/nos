@@ -143,10 +143,10 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
             Some(line) => line,
             None => continue,
         };
-        let _ = write!(out, "  [{}] {}:{} -> {}:{}  {}  snd={}/{} rcv={}/{} wnd={}",
+        let _ = write!(out, "  [{}] {}:{} -> {}:{}  {}  snd={}/{} rcv={}/{} wnd={} cwnd={}",
             index, Ip(line.local_ip), line.local_port,
             Ip(line.remote_ip), line.remote_port, line.state.name(),
-            line.send_used, line.in_flight, line.recv_used, line.recv_size, line.window);
+            line.send_used, line.in_flight, line.recv_used, line.recv_size, line.window, line.cwnd);
         match line.scales {
             Some((ours, theirs)) => { let _ = writeln!(out, " scale={}/{}", ours, theirs); }
             None => { let _ = writeln!(out); }

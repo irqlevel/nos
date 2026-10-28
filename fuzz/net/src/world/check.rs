@@ -173,16 +173,18 @@ fn tcp_tx(src: u32, dst: u32, s: &[u8]) -> Result<(), String> {
     let payload = s.len() - hlen;
     ensure!(!(rst && payload != 0) && !(syn && payload != 0), "data on a SYN or a RST");
     ensure!(syn || rst || flags & tcp::ACK_FLAG != 0, "a TCP segment with no ACK, flags {:#04x}", flags);
-    /* The options this stack sends: an MSS on a SYN -- and, on a SYN that
-     * opens a connection of its own, a window scale after it, past a NOP and
-     * no more than RFC 7323's largest. Never one on a SYN-ACK: it scales no
-     * connection someone else opened. Nothing else, anywhere. */
+    /* The options this stack sends: an MSS on a SYN -- and a window scale
+     * after it, past a NOP and no more than RFC 7323's largest: on a SYN
+     * that opens a bulk connection of its own, and on a bulk listener's
+     * SYN-ACK. Whether that SYN-ACK answers a SYN that offered one is the
+     * TCP model's to say, which knows what the peer's SYN said. Nothing
+     * else, anywhere. */
     if hlen > tcp::HDR_LEN {
         let o = &s[tcp::HDR_LEN..hlen];
         let mss = o.len() >= 4 && o[0] == tcp::OPT_MSS && o[1] == tcp::OPT_MSS_LEN;
         let ws = o.len() == 8 && o[4] == tcp::OPT_NOP && o[5] == tcp::OPT_WS && o[6] == tcp::OPT_WS_LEN
             && o[7] <= tcp::MAX_WSCALE;
-        ensure!(syn && mss && (o.len() == 4 || (ws && flags & tcp::ACK_FLAG == 0)), "TCP options {:02x?}", o);
+        ensure!(syn && mss && (o.len() == 4 || ws), "TCP options {:02x?}", o);
     }
     Ok(())
 }

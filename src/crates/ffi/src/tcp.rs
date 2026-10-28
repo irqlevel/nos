@@ -16,11 +16,12 @@ unsafe extern "C" {
 /* A server of Rust's owns its connections: it listens on a port of a
    device -- a kernel_net_find handle -- accepts what arrives, and closes
    both what it accepted and the listener. The listener holds `backlog`
-   connections nobody has accepted at most (taken into 1..=16). Accepting
+   connections nobody has accepted at most (taken into 1..=16), and with
+   `bulk` gives each it accepts bulk buffers both ways -- a relay's. Accepting
    returns null once timeout_ms (0: forever) passes with nobody, or once the
    listener is closed. */
 unsafe extern "C" {
-    pub safe fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize) -> *mut c_void;
+    pub safe fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk: bool) -> *mut c_void;
     /// An active open to ip:port (host byte order) through the device, from
     /// an ephemeral port: null when nothing answered in time. Sleeps.
     pub safe fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> *mut c_void;

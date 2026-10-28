@@ -6,6 +6,7 @@
 //!   else does: what the relay offers a side is exactly what it holds for it;
 //! - a side is read from only while the relay holds none of its bytes, and
 //!   then every round: a direction with no room never holds the other back;
+//! - no read or send waits longer than the relay was told to;
 //! - an end or a failure ends the relay at once, a stop within a round;
 //! - a direction that has moved nothing for the stall time ends the relay
 //!   the moment its receiver is offered it and takes nothing -- never before.
@@ -107,7 +108,8 @@ impl Side for Model<'_, '_> {
         w.enter();
         let side = self.side;
         invariant!(w.pending(side) == 0, "side {} read from with {} of its bytes still held", side, w.pending(side));
-        invariant!(wait_ms > 0 && !buf.is_empty(), "a read into {} bytes, waiting {} ms", buf.len(), wait_ms);
+        invariant!(wait_ms > 0 && wait_ms <= WAIT_MS && !buf.is_empty(), "a read into {} bytes, waiting {} ms",
+                   buf.len(), wait_ms);
         w.since_read[side] = 0;
         match w.input.op(16) {
             /* Past the end of the script, the sides end. */
@@ -148,7 +150,7 @@ impl Side for Model<'_, '_> {
         };
         invariant!(!buf.is_empty() && held, "side {} offered {} bytes, not the {} the relay holds for it",
                    to, buf.len(), w.pending(d));
-        invariant!(wait_ms > 0, "a send waiting 0 ms");
+        invariant!(wait_ms > 0 && wait_ms <= WAIT_MS, "a send waiting {} ms", wait_ms);
         if w.input.below(16) == 0 {
             w.shut[to] = !w.shut[to];
         }
