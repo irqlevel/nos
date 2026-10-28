@@ -91,6 +91,9 @@ jobs:
       # refuses as corrupt -- or one it writes that Linux does. Every
       # checksum of filesystems mke2fs makes, held to extfmt's; bytes
       # changed, and extfmt and e2fsck held to both saying so; and fuzzed.
+      # And a journal replayed wrong is a filesystem neither as it was nor
+      # as it was to be: journals debugfs writes, replayed by extfmt's plan
+      # to the image e2fsck's replay leaves, byte for byte.
       - name: ext2/3/4 format test (host)
         if: matrix.arch == 'x86_64'
         run: |

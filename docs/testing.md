@@ -161,7 +161,7 @@ swallowing panic messages whole.
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
-| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed |
+| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
@@ -1883,6 +1883,31 @@ sound is reported and left out of the code. Then each image is fuzzed: up to
 eight bytes of the metadata its walk read changed at a time, two thousand
 times, the walk held to never panicking (overflow checks on) and always
 ending.
+
+Then the journal, which extfmt's recovery planner (`extfmt::recovery`) is to
+replay for the driver: the transactions in the log as a plan of which copy
+goes to which home block, worked out before anything is written. debugfs
+writes into an image's journal and leaves it unreplayed (`jo -c` for v3's
+checksums, `jw -b` blocks, `jw -r` revokes, `jw -c` a transaction left
+uncommitted, `jc`), on images with v3's checksums and without, 64-bit tags
+and 32-bit: a transaction of three blocks; one of a block whose first word is
+the journal's magic, escaped in the log; one that only revokes a block of the
+first; one writing a block of the first again; a revoke and then the revoked
+block written again, which is replayed, the revoke covering only what came
+before it; three hundred blocks at once, more than a descriptor holds; and one
+uncommitted. The planner's replay and `e2fsck -E journal_only`'s must leave
+the same image byte for byte but for the superblock fields e2fsck sets for
+itself -- the time of its check, the kilobytes it counts written, and the
+checksum over them -- the journal's superblock included, empty at the same
+next sequence; and so must they with the journal's ring turned so that its log
+starts five blocks short of the ring's end and wraps. With checksums: the last
+commit torn must end the log before its transaction, where e2fsck ends it; a
+descriptor damaged under a sound commit, and a copy that fails its tag's
+checksum, must be refused, as a replay around them would leave the filesystem
+neither as it was nor as it was to be. And the planner is fuzzed over each
+journal damaged at random -- its superblock and its log's first blocks above
+all -- held to never panicking, always ending and planning no copy from outside
+the ring.
 
 Needs cargo and e2fsprogs: Linux, or on a Mac the nos-builder container
 (`docker run --platform linux/amd64 --rm -v "$PWD":/src -w /src nos-builder
