@@ -14,6 +14,7 @@
 
 pub mod check;
 pub mod frames;
+pub mod httpc;
 pub mod httpd;
 pub mod lan;
 pub mod link;

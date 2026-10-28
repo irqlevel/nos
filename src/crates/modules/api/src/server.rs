@@ -20,8 +20,8 @@ use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream};
 use tls::server::Fingerprint;
 
-use crate::config::Config;
-use crate::files::{Client, Dir, Identity, Role};
+use super::config::Config;
+use super::files::{Client, Dir, Identity, Role};
 
 /// Connections the kernel keeps for the port before the listener takes
 /// them: it takes each within a poll, and resets what is past its limits.
@@ -257,7 +257,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream, nic: &str) -> Option<(u64, Tas
     }
     Counters::add(&shared.counters.accepted);
     let ctx = ConnCtx { shared: shared.clone(), stream, id };
-    match kcore::task::spawn_with("api/conn", ctx, crate::http::conn_main) {
+    match kcore::task::spawn_with("api/conn", ctx, super::http::conn_main) {
         Some(task) => Some((id, task)),
         None => {
             /* The context, and the connection in it, went with the failed

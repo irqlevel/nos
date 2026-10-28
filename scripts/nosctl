@@ -144,7 +144,9 @@ class Api:
             lines.append('%s: %s' % (k, v))
         self.sock.sendall(('\r\n'.join(lines) + '\r\n\r\n').encode() + data)
         status, hdrs = self._head()
-        n = int(hdrs.get('content-length', '0'))
+        # A HEAD's answer, a 204's and a 304's have no body, whatever their
+        # Content-Length says
+        n = 0 if method == 'HEAD' or status in (204, 304) else int(hdrs.get('content-length', '0'))
         while len(self.buf) < n:
             self._read_more()
         payload, self.buf = self.buf[:n], self.buf[n:]

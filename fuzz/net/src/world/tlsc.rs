@@ -7,7 +7,9 @@
 //!
 //! A client that is let in says its lines, each once the one before has
 //! come back as the server answers it ("ok " and the line), then says
-//! goodbye: its close_notify, and its FIN.
+//! goodbye: its close_notify, and its FIN -- or, given a `Talk`, says what
+//! the talk says to, as it says to, and says goodbye when it is done: the
+//! host API's clients, which speak HTTP.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -28,6 +30,8 @@ use crate::world::Net;
 pub enum Who {
     /// The key the server lets in.
     Known,
+    /// Another the host API lets in, for a client of the read role.
+    Reader,
     /// One it does not.
     Stranger,
     /// None at all.
@@ -69,6 +73,9 @@ pub enum Break {
     Tls12,
     /// A protocol the server does not speak, and no other.
     Alpn,
+    /// Its goodbye -- close_notify and FIN -- with its last line, before
+    /// the answers: it closed its side, and the server still answers.
+    Bye,
 }
 
 /// What a client does.
@@ -80,6 +87,17 @@ pub struct Plan {
     pub alpn: Vec<&'static [u8]>,
     /// What it says once it is in: lines, each ending in a newline.
     pub lines: Vec<Vec<u8>>,
+    /// The server's key it pins: the world's server's unless it says.
+    pub pin: Option<[u8; 32]>,
+}
+
+/// What a client says once it is in, when it is not lines: asked each time
+/// it may write, with everything the server has sent so far.
+pub trait Talk {
+    /// What to say now, if anything: each answer one record.
+    fn next(&mut self, got: &[u8]) -> Option<Vec<u8>>;
+    /// Whether it has said all it will, and says goodbye.
+    fn done(&self, got: &[u8]) -> bool;
 }
 
 /// How a client's connection ended.
@@ -99,6 +117,7 @@ pub enum Ending {
 pub struct Keys {
     pub server: web::x509::Identity,
     pub known: web::x509::Identity,
+    pub reader: web::x509::Identity,
     pub stranger: web::x509::Identity,
 }
 
@@ -118,6 +137,7 @@ pub fn keys() -> &'static Keys {
             server: make(0x11, "nos 10.0.2.15", web::x509::Usage::Server, &[[10, 0, 2, 15]]),
             known: make(0x22, "panel", web::x509::Usage::Client, &[]),
             stranger: make(0x33, "stranger", web::x509::Usage::Client, &[]),
+            reader: make(0x44, "viewer", web::x509::Usage::Client, &[]),
         }
     })
 }
@@ -168,7 +188,9 @@ fn config(plan: &Plan) -> Arc<ClientConfig> {
     let algs = provider.signature_verification_algorithms;
     let versions: &[&'static rustls::SupportedProtocolVersion] =
         if plan.brk == Break::Tls12 { &[&rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
-    let server = tls::server::fingerprint(&keys.server.cert).expect("the server's certificate");
+    let server = plan.pin.unwrap_or_else(|| {
+        tls::server::fingerprint(&keys.server.cert).expect("the server's certificate")
+    });
     let builder = ClientConfig::builder_with_details(provider.clone(), Arc::new(Clock))
         .with_protocol_versions(versions)
         .expect("versions the provider has")
@@ -176,6 +198,7 @@ fn config(plan: &Plan) -> Arc<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(PinnedServer { key: server, algs }));
     let id = match plan.who {
         Who::Known => Some(&keys.known),
+        Who::Reader => Some(&keys.reader),
         Who::Stranger => Some(&keys.stranger),
         Who::Nobody | Who::Impostor => None,
     };
@@ -206,6 +229,8 @@ const RECORD: usize = 16 * 1024 + 512;
 pub struct Client {
     pub ep: usize,
     pub plan: Plan,
+    /// What it says, when it is not its plan's lines.
+    pub talk: Option<Box<dyn Talk>>,
     conn: Option<UnbufferedClientConnection>,
     /// How much of what the connection received has been handed in.
     fed: usize,
@@ -231,8 +256,15 @@ impl Client {
             _ => Some(UnbufferedClientConnection::new(config(&plan), ServerName::try_from("nos").expect("a name")
                                                          .to_owned()).expect("a client connection")),
         };
-        Client { ep, plan, conn, fed: 0, incoming: Vec::new(), started: false, up: false, lines_sent: 0, got: Vec::new(),
-                 said_bye: false, ending: None, tampered: false, at: sched::now() }
+        Client { ep, plan, talk: None, conn, fed: 0, incoming: Vec::new(), started: false, up: false, lines_sent: 0,
+                 got: Vec::new(), said_bye: false, ending: None, tampered: false, at: sched::now() }
+    }
+
+    /// A client that says what `talk` says.
+    pub fn talking(ep: usize, plan: Plan, talk: Box<dyn Talk>) -> Client {
+        let mut c = Client::new(ep, plan);
+        c.talk = Some(talk);
+        c
     }
 
     pub fn over(&self) -> bool {
@@ -335,7 +367,27 @@ impl Client {
                 Ok(ConnectionState::TransmitTlsData(transmit)) => transmit.done(),
                 Ok(ConnectionState::WriteTraffic(mut writer)) => {
                     self.up = true;
-                    if self.lines_sent < self.plan.lines.len() && self.got.len() >= before[self.lines_sent] {
+                    if let Some(talk) = self.talk.as_mut() {
+                        if let Some(bytes) = talk.next(&self.got) {
+                            let mut buf = vec![0u8; bytes.len() + 512];
+                            match writer.encrypt(&bytes, &mut buf) {
+                                Ok(n) => Self::raw(tcp, net, self.ep, &buf[..n]),
+                                Err(e) => {
+                                    self.ending = Some(Ending::Error(format!("{:?}", e)));
+                                    stop = true;
+                                }
+                            }
+                        } else if !self.said_bye && talk.done(&self.got) {
+                            self.said_bye = true;
+                            let mut buf = vec![0u8; 512];
+                            if let Ok(n) = writer.queue_close_notify(&mut buf) {
+                                Self::raw(tcp, net, self.ep, &buf[..n]);
+                            }
+                            tcp.close(net, self.ep);
+                        } else {
+                            stop = true;
+                        }
+                    } else if self.lines_sent < self.plan.lines.len() && self.got.len() >= before[self.lines_sent] {
                         let line = self.plan.lines[self.lines_sent].clone();
                         let mut buf = vec![0u8; line.len() + 512];
                         match writer.encrypt(&line, &mut buf) {
@@ -346,6 +398,14 @@ impl Client {
                                 }
                                 Self::raw(tcp, net, self.ep, &buf[..n]);
                                 self.lines_sent += 1;
+                                if self.plan.brk == Break::Bye && self.lines_sent == self.plan.lines.len() {
+                                    self.said_bye = true;
+                                    let mut bye = vec![0u8; 512];
+                                    if let Ok(n) = writer.queue_close_notify(&mut bye) {
+                                        Self::raw(tcp, net, self.ep, &bye[..n]);
+                                    }
+                                    tcp.close(net, self.ep);
+                                }
                             }
                             Err(e) => {
                                 self.ending = Some(Ending::Error(format!("{:?}", e)));

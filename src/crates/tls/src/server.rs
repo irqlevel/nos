@@ -315,6 +315,10 @@ enum Turn {
     /// The session is up, with nothing of the client's left to process.
     Ready,
     Data,
+    /// The client's close_notify: it says no more, and the session can
+    /// still be written to and closed (TLS 1.3, RFC 8446 6.1).
+    PeerClosed,
+    /// Both ends have closed.
     Closed,
     Failed(Error),
     /// No memory to keep what the turn made.
@@ -483,7 +487,8 @@ impl<S: Socket> ServerStream<S> {
                 }
                 None => Turn::Ready,
             },
-            Ok(ConnectionState::PeerClosed) | Ok(ConnectionState::Closed) => Turn::Closed,
+            Ok(ConnectionState::PeerClosed) => Turn::PeerClosed,
+            Ok(ConnectionState::Closed) => Turn::Closed,
             Ok(_) => Turn::Progress,
         };
         if discard != 0 {
@@ -554,11 +559,11 @@ impl<S: Socket> ServerStream<S> {
                  * close_notify in one flight, and rustls says it closed
                  * before it says the session is up: a handshake done, a
                  * session let in and already over */
-                Turn::Closed if !self.conn.is_handshaking() => {
+                Turn::PeerClosed | Turn::Closed if !self.conn.is_handshaking() => {
                     self.closed = true;
                     return self.admitted();
                 }
-                Turn::Closed => return Err(Refused::Closed),
+                Turn::PeerClosed | Turn::Closed => return Err(Refused::Closed),
                 Turn::NoMemory => return Err(Refused::NoMemory),
                 Turn::Failed(e) => {
                     self.send_alert();
@@ -641,7 +646,7 @@ impl<S: Socket> ServerStream<S> {
                         Recv::End | Recv::Failed => self.failed = true,
                     }
                 }
-                Turn::Closed => self.closed = true,
+                Turn::PeerClosed | Turn::Closed => self.closed = true,
                 Turn::Failed(_) | Turn::NoMemory => self.failed = true,
             }
         }
@@ -653,9 +658,11 @@ impl<S: Socket> ServerStream<S> {
     /// would leave more than `max_pending` waiting: false then, nothing
     /// taken, and the caller flushes first. False for a session that has
     /// failed too. A `data` longer than `max_pending` never fits: it goes in
-    /// pieces.
+    /// pieces. A client that has said its close_notify is still written to:
+    /// it closed its side, not the server's -- an answer to what it said
+    /// before goes out, and the server's own goodbye after.
     pub fn write(&mut self, data: &[u8], max_pending: usize) -> bool {
-        if self.failed || self.closed {
+        if self.failed {
             return false;
         }
         if self.pending().saturating_add(data.len()) > max_pending {
@@ -669,6 +676,9 @@ impl<S: Socket> ServerStream<S> {
             match self.turn(&mut out) {
                 Turn::Ready if out.is_none() => return true,
                 Turn::Ready | Turn::Progress | Turn::Data => {}
+                /* What it said before is in `plain`, still to be read; from
+                 * here on it says nothing more */
+                Turn::PeerClosed => self.closed = true,
                 Turn::NeedRead | Turn::Closed | Turn::Failed(_) | Turn::NoMemory => break,
             }
         }
