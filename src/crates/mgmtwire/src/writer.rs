@@ -188,6 +188,14 @@ impl<'a> Writer<'a> {
         self.bool(b);
     }
 
+    /// A value that is JSON already -- read as such by `json::parse`, which
+    /// is the caller's to have done -- written as it is: a provider's
+    /// answer, handed on whole.
+    pub fn raw_value(&mut self, json: &[u8]) {
+        self.before_value();
+        self.raw(json);
+    }
+
     /// Bytes that should be UTF-8 and may not be -- a line of the log, a
     /// name a disk gave -- as a string: each run that is not valid UTF-8
     /// written as U+FFFD, as `String::from_utf8_lossy` has it, and nothing

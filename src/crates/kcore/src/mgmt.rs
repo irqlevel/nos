@@ -165,3 +165,101 @@ impl Call {
         mgmt::kernel_mgmt_cancelled(self.id)
     }
 }
+
+/* ---- the bus asked: what the host API module calls ---- */
+
+/// Which kinds of method `providers` lists.
+pub const KINDS_READ: u32 = mgmt::MGMT_KINDS_READ;
+pub const KINDS_ALL: u32 = mgmt::MGMT_KINDS_ALL;
+
+type Sink<'a> = &'a mut dyn FnMut(&[u8]) -> bool;
+
+/// # Safety
+/// `ctx` is the `&mut Sink` one of the calls below passed, alive until it
+/// returns, which is the bus's to keep to; `buf` is `len` bytes to read.
+unsafe extern "C" fn sink_trampoline(ctx: *mut c_void, buf: *const u8, len: usize) -> bool {
+    let sink = unsafe { &mut *(ctx as *mut Sink) };
+    if len == 0 {
+        return true;
+    }
+    sink(unsafe { core::slice::from_raw_parts(buf, len) })
+}
+
+/// `provider`'s `method` called with `params` (JSON), its answer -- at most
+/// `max_reply` bytes -- handed to `sink`: what the call ended with. Sleeps
+/// for as long as the method takes.
+pub fn call(provider: &str, method: &str, params: &[u8], max_reply: usize, sink: &mut dyn FnMut(&[u8]) -> bool)
+            -> Status {
+    let mut sink: Sink = sink;
+    let ctx = &mut sink as *mut Sink as *mut c_void;
+    /* The strings and params are valid for their lengths, `ctx` until this
+     * returns -- which is as long as the bus may call it */
+    let code = unsafe {
+        mgmt::kernel_mgmt_call(provider.as_ptr(), provider.len(), method.as_ptr(), method.len(), params.as_ptr(),
+                               params.len(), max_reply, sink_trampoline, ctx)
+    };
+    Status::from_code(code)
+}
+
+/// What `provider`'s `method` is registered as.
+pub fn kind(provider: &str, method: &str) -> Result<Kind, Status> {
+    /* The strings are valid for their lengths */
+    let code = unsafe { mgmt::kernel_mgmt_kind(provider.as_ptr(), provider.len(), method.as_ptr(), method.len()) };
+    match code {
+        c if c == mgmt::MGMT_READ as i32 => Ok(Kind::Read),
+        c if c == mgmt::MGMT_ACTION as i32 => Ok(Kind::Action),
+        c if c == mgmt::MGMT_JOB as i32 => Ok(Kind::Job),
+        c => Err(Status::from_code(c)),
+    }
+}
+
+/// Runs one of the bus's JSON answers into `sink`.
+fn answered(sink: &mut dyn FnMut(&[u8]) -> bool, f: impl FnOnce(mgmt::MgmtSink, *mut c_void) -> i32) -> Status {
+    let mut sink: Sink = sink;
+    let ctx = &mut sink as *mut Sink as *mut c_void;
+    Status::from_code(f(sink_trampoline, ctx))
+}
+
+/// The providers with a method of `kinds` (`KINDS_READ`, `KINDS_ALL`), as
+/// JSON, to `sink`.
+pub fn providers(kinds: u32, sink: &mut dyn FnMut(&[u8]) -> bool) -> Status {
+    /* `ctx` is the sink, alive until the call returns */
+    answered(sink, |s, ctx| unsafe { mgmt::kernel_mgmt_providers(kinds, s, ctx) })
+}
+
+/// `provider`'s descriptor, to `sink`.
+pub fn describe(provider: &str, sink: &mut dyn FnMut(&[u8]) -> bool) -> Status {
+    /* As providers'; the name is valid for its length */
+    answered(sink, |s, ctx| unsafe { mgmt::kernel_mgmt_describe(provider.as_ptr(), provider.len(), s, ctx) })
+}
+
+/// A job of `provider`'s `method` started with `params`: its number.
+pub fn job_start(provider: &str, method: &str, params: &[u8]) -> Result<u64, Status> {
+    /* The strings and params are valid for their lengths */
+    let id = unsafe {
+        mgmt::kernel_mgmt_job_start(provider.as_ptr(), provider.len(), method.as_ptr(), method.len(), params.as_ptr(),
+                                    params.len())
+    };
+    match u64::try_from(id) {
+        Ok(id) if id != 0 => Ok(id),
+        _ => Err(Status::from_code(i32::try_from(id).unwrap_or(Status::Failed.code()))),
+    }
+}
+
+/// The job `id`'s record, its log from line `notes_since` and its result,
+/// as JSON, to `sink`.
+pub fn job(id: u64, notes_since: u64, sink: &mut dyn FnMut(&[u8]) -> bool) -> Status {
+    /* As providers' */
+    answered(sink, |s, ctx| unsafe { mgmt::kernel_mgmt_job(id, notes_since, s, ctx) })
+}
+
+/// Every job's record, as JSON, to `sink`.
+pub fn jobs(sink: &mut dyn FnMut(&[u8]) -> bool) -> Status {
+    /* As providers' */
+    answered(sink, |s, ctx| unsafe { mgmt::kernel_mgmt_jobs(s, ctx) })
+}
+
+/// The job `id` told to stop: NotFound for none there is, or one done.
+pub fn job_cancel(id: u64) -> Status {
+    Status::from_code(mgmt::kernel_mgmt_job_cancel(id))
+}

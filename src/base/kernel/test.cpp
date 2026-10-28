@@ -2601,6 +2601,15 @@ static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
 {
     static const ulong JOB_WAIT_POLLS = 2000;
 
+    /* The bus as a module asks it -- the host API's way in */
+    out.reset();
+    Cmd::dispatch("modtest bus", out);
+    if (stdlib::str_str(out.get(), "modtest bus: ok") == nullptr)
+    {
+        trace(0, "test_module_bus: the module asking the bus: %s", out.get());
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    }
+
     out.reset();
     Cmd::dispatch("mgmt call modtest echo {\"n\":42}", out);
     if (stdlib::str_str(out.get(), "{\"n\":42}") == nullptr)
