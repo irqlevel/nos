@@ -1,0 +1,15 @@
+[package]
+name = "mgmtwire"
+version = "0.1.0"
+edition = "2021"
+
+# What the management bus carries, with no kernel in it: JSON as the bus
+# takes it -- whole numbers only, no key twice, every limit checked -- a
+# writer that keeps to the rules it reads by, the parameters a method is
+# handed taken strictly, and the status codes. The bus (src/crates/mgmt), the
+# providers in the image and in modules, and the API module all link it;
+# fuzz/web runs it on the host (scripts/web-test.py). No dependency, and
+# nothing in it is unsafe (`forbid`).
+[lib]
+
+[dependencies]

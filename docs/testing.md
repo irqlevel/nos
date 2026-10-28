@@ -1976,6 +1976,48 @@ nine files and more than 1 MiB are refused.
 compare`, writing no second copy: Ubuntu 24.04's, serial 20261017, was
 identical on 2026-10-25. Needs cargo, qemu-img and qemu-io.
 
+### `web-test.py` -- the host API's wire, decided on the host
+
+The host API reads what anyone who connects sends it: a request, a
+WebSocket frame, a JSON text. A misread there is a panic in the kernel, or
+two readers that disagree about where a request ends; a certificate made
+wrong is one no client takes, or one that takes the wrong thing. `fuzz/web`
+compiles the `web` and `mgmtwire` crates, as they are, into a host program:
+
+- **Known answers.** SHA-1's FIPS 180 vectors (a million a's among them);
+  RFC 6455's accept key and its masked "Hello"; requests, frames, JSON
+  texts, parameters and networks, each with what it must make or the status
+  it must be refused with -- a line ended by LF alone, two Content-Lengths,
+  a Transfer-Encoding, a header folded; a client's frame unmasked, a length
+  not in its shortest form, a ping fragmented, a close code nobody may send;
+  a fraction, a leading zero, a key twice, a surrogate alone. A response's
+  head with a CRLF in a value is refused, not written.
+- **Every parser fuzzed**, with what a generator makes and then breaks:
+  never a panic (overflow checks on, as a RUSTUB=1 kernel has them); what
+  the JSON writer wrote read back the same, and what parses written again
+  and read back the same; every prefix of a whole request or frame "not
+  yet"; every message of a generated WebSocket stream, fragments and pings
+  between them, read back as it was sent; the limits it is given kept.
+- **The certificates judged by others.** OpenSSL reads the server's, the
+  client's and one valid into 2050 -- version 3, ECDSA over P-256, no CA,
+  signing only, for a server or a client, the addresses and names asked for,
+  its end a GeneralizedTime -- and its fingerprint and its key's are the ones
+  `web::x509` gives. Python's ssl takes the server's key as its
+  certificate's, serves TLS with them to a client that trusts the
+  certificate and checks the name it was asked for, and refuses a name the
+  certificate is not for; a server that asks for a client's certificate
+  takes the client's.
+
+Nineteen mutants of the two crates -- a key twice, a leading zero or a lone
+surrogate taken; a big count written as a number, a quote not escaped; a
+parameter not taken let through; a bare LF, two Content-Lengths, a
+Transfer-Encoding, a body not waited for, a CR in a header written; an
+unmasked frame, text not UTF-8, a message past its limit in fragments within
+it; SHA-1's round constant; GeneralizedTime from 2051, a client's
+certificate for servers, a serial's top bit set; a leading zero in an
+address -- each failed it. Needs cargo and openssl; `--seed N --iters N` for
+a campaign.
+
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 
 The third and fourth of the hypervisor demos ([the hypervisor
