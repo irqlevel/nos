@@ -44,6 +44,7 @@ extern "C" void rust_net_stop_netconsole();
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
 extern "C" void kernel_vfs_unmount_all();
+extern "C" void rust_mgmt_stop();
 
 /* The disk log is Rust (src/crates/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
@@ -308,6 +309,12 @@ static void bp_startup_arm(void* ctx)
     rust_init();
     rust_test();
 
+    if (!test::test_module_bus())
+    {
+        PANIC("Module bus test failed");
+        return;
+    }
+
     if (!SoftIrq::get_instance().init())
     {
         PANIC("Can't init softirq");
@@ -366,6 +373,11 @@ static void bp_startup_arm(void* ctx)
                its exit runs now, while the files and block I/O it may still
                need are there (as in kernel/main.cpp) */
             ModuleTable::get_instance().unload_all();
+
+            /* The management bus after the modules -- whose providers their exits
+               took off it -- and before the files go: its jobs are told to stop and
+               waited for, and nothing starts on it again */
+            rust_mgmt_stop();
 
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */

@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use kcore::cmd::{Command, Output};
+use kcore::mgmt::{Call, Kind, Method, Provider, Status};
 use kcore::error::{Error, Result};
 
 /* Initialized data, zeroed data, and a table of function pointers. The first
@@ -58,6 +59,8 @@ impl Shape for Rect {
 
 struct ModTest {
     _cmd: Command,
+    /* Dropped with the module: its unregister waits out a job of it */
+    _provider: Provider,
 }
 
 impl kmod::Module for ModTest {}
@@ -129,8 +132,41 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         let _ = writeln!(out, "modtest: answer {} args '{}' double at {}", answer, args, probe);
     })?;
 
+    /* A provider on the management bus, for the test to call, and to start
+       a job of that its unload has to stop and wait for */
+    let methods = [Method { name: "echo", kind: Kind::Read }, Method { name: "wait", kind: Kind::Job }];
+    let provider = Provider::register("modtest", &methods, "{}", provide).map_err(|_| Error::Busy)?;
+
     kcore::trace!(0, "modtest: loaded, every check passed");
-    Ok(Box::new(ModTest { _cmd: cmd }))
+    Ok(Box::new(ModTest { _cmd: cmd, _provider: provider }))
+}
+
+/// How long `wait` waits, at most, before it says nobody told it to stop.
+const WAIT_LIMIT_MS: u64 = 10_000;
+
+/// The provider's methods: `echo` answers with its parameters; `wait`, a
+/// job, runs until it is told to stop -- by the module's unload.
+fn provide(method: &str, params: &[u8], call: &mut Call) -> Status {
+    match method {
+        "echo" => {
+            call.reply(params);
+            Status::Ok
+        }
+        "wait" => {
+            call.note("modtest: waiting to be told to stop");
+            let mut ms = 0;
+            while !call.cancelled() {
+                call.progress(ms, 0);
+                kcore::task::sleep_ms(1);
+                ms += 1;
+                if ms > WAIT_LIMIT_MS {
+                    return Status::Failed;
+                }
+            }
+            Status::Cancelled
+        }
+        _ => Status::NoMethod,
+    }
 }
 
 kmod::module!(name: "modtest", init_with_params: init);
