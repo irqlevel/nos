@@ -735,6 +735,11 @@ pub struct Check {
     /// The tree, read back: None when the superblock or the root does not
     /// parse.
     pub tree: Option<Node>,
+    /// The blocks past the first data block, and those of them the bitmaps
+    /// have free -- as bytes, what the driver's `space` should say of it: 0
+    /// where the check stopped before the bitmaps.
+    pub data_bytes: u64,
+    pub free_bytes: u64,
 }
 
 impl Check {
@@ -1175,6 +1180,8 @@ pub fn check(img: &Media, dev_bytes: u64) -> Check {
         free_blocks_total += free as u64;
         free_inodes_total += ifree as u64;
     }
+    c.data_bytes = u64::from(blocks - first_data_block) * bs as u64;
+    c.free_bytes = free_blocks_total * bs as u64;
     if rd32(&s, sb::FREE_BLOCKS) as u64 != free_blocks_total {
         c.unclean(format!("the superblock counts {} free blocks, the groups {}", rd32(&s, sb::FREE_BLOCKS),
                           free_blocks_total));

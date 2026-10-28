@@ -39,7 +39,7 @@ use kcore::pod::{self, Pod};
 use kcore::time::wall_clock_secs;
 use kcore::trace;
 
-use crate::vfs::FileSystem;
+use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub const MAGIC: u16 = 0xEF53;
@@ -3182,6 +3182,19 @@ impl FileSystem for Ext2 {
                 let _ = write!(out, " label={}", label);
             }
         }
+    }
+
+    /// The blocks past the first data block, and those the group
+    /// descriptors count free: what is kept in memory as every allocation
+    /// and free changes it.
+    fn space(&self) -> Option<Space> {
+        if !self.mounted {
+            return None;
+        }
+        let block = self.block_size() as u64;
+        let data = u64::from(self.io.block_count.saturating_sub(self.io.first_data_block));
+        let free: u64 = (0..self.group_count).map(|g| u64::from(self.gd_free_blocks(g))).sum();
+        Some(Space { total_bytes: data * block, free_bytes: free.min(data) * block })
     }
 
     fn device(&self) -> usize {

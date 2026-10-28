@@ -22,6 +22,7 @@ use crate::disk::Holder;
 /// One guest's hold: the CPUs its vCPUs run on, the one its disks' task
 /// does when it has disks, and whose it is -- None for a guest being
 /// started, which has no number yet.
+#[derive(Clone, Copy)]
 struct Holding {
     id: u64,
     vcpus: u64,
@@ -131,8 +132,24 @@ impl Cores {
         } else {
             "cores shared -- guests may be given threads of one core"
         });
-        let holds = self.inner.holds.lock();
-        for h in &holds.list {
+        /* Copied out under the lock and printed after: placing a guest waits
+         * on this lock, and what is printed goes to whoever asked -- an SSH
+         * session that may be slow to take it. */
+        let holds = {
+            let holds = self.inner.holds.lock();
+            let mut copy = Vec::new();
+            if copy.try_reserve_exact(holds.list.len()).is_ok() {
+                copy.extend(holds.list.iter().copied());
+                Some(copy)
+            } else {
+                None
+            }
+        };
+        let Some(holds) = holds else {
+            let _ = writeln!(out, "hv: out of memory");
+            return;
+        };
+        for h in &holds {
             let _ = match h.holder {
                 Some(holder) => write!(out, "  {}: cpu", holder),
                 None => write!(out, "  a guest being started: cpu"),

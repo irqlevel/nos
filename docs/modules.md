@@ -304,6 +304,14 @@ module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e
 A module built outside the Makefile carries `unset` and is refused by a kernel
 that was not.
 
+A module cannot call another module. What it offers others -- the host API
+above all -- it offers on the [management bus](mgmt.md): `kcore::mgmt::
+Provider::register(name, methods, descriptor, handler)` registers it, and the
+`Provider` kept in the module's state unregisters it when the module is
+dropped. The unregister waits out the provider's calls and jobs, so an unload
+never leaves a call in code that is gone. modtest has one, which the boot's
+`test_module_bus` calls and unloads under a running job.
+
 ## blkload
 
 `blkload` (`src/crates/modules/blkload`) runs a short load test against a block
@@ -494,6 +502,20 @@ its output handed back (`kcore::cmd::dispatch`), files (`kcore::fs`) and the
 calling task's identity (`kcore::task::current_id`). And it carries its own
 copy of the cryptography the TLS client uses: modules share nothing with the
 kernel but the exported functions.
+
+## api
+
+`api` (`src/crates/modules/api`) is the host API: the management bus served
+over HTTP/1.1 and a WebSocket, TLS 1.3 with a client's certificate required,
+to the programs that manage the machine -- the panel, `nosctl`, other hosts'
+panels. `api client add <name> <role> <fingerprint>`, `api start`. Its page is
+[The host API](api.md).
+
+It is the bus's first caller from a module: `kcore::mgmt::call`, `kind`,
+`providers`, `describe` and the jobs, over the bus's C ABI (`kernel_mgmt_call`
+and the rest), as well as a provider of its own (`api.status`). And it links
+the TLS server -- `tls` with its `server` feature, which the kernel's own build
+leaves off -- the `web` crate's HTTP and WebSocket, and `conf` for api.toml.
 
 ## edit
 

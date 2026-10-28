@@ -474,6 +474,14 @@ pub(crate) fn sector_size(handle: usize) -> u64 {
     device(handle).map_or(0, |dev| dev.sector_size)
 }
 
+/// The sector of its disk a partition starts at; None for a whole disk.
+pub(crate) fn start(handle: usize) -> Option<u64> {
+    match device(handle)?.backend {
+        Backend::Partition { start } => Some(start),
+        Backend::Driver(_) => None,
+    }
+}
+
 /// How many partitions of the device the kernel found.
 pub(crate) fn partitions(handle: usize) -> u32 {
     if handle == 0 {
@@ -617,6 +625,13 @@ pub(crate) fn claim(handle: usize, holder: &'static CStr) -> Result<usize, &'sta
     let claim = (claims.generation << SLOT_BITS) | (slot + 1);
     claims.entries[slot] = ClaimEntry { device: handle, holder, claim };
     Ok(claim)
+}
+
+/// Who holds a claim on the device itself -- not on one it overlaps -- if
+/// anyone: copied under the claims' lock.
+pub(crate) fn holder(handle: usize) -> Option<&'static CStr> {
+    let claims = CLAIMS.get()?.lock();
+    claims.entries.iter().find(|e| e.claim != 0 && e.device == handle).map(|e| e.holder)
 }
 
 /// Give a claim back. A claim that is not the one the slot holds -- a stale

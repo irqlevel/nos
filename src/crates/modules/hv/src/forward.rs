@@ -5,11 +5,15 @@
 //! Each forward is a task that listens on nos's port and accepts; for each
 //! connection it opens one to the guest's port through `hv0`, and hands the
 //! two to a relay task of their own, which carries what each side sends to
-//! the other until either ends. The relay alternates between the two with
-//! short waits rather than blocking on one, so it needs no second task and
-//! nothing shared between two. A forward is to the address its guest had
-//! when it was made -- a guest restarted keeps it; one stopped takes it away,
-//! and connections to it then fail.
+//! the other until either ends (`relay.rs`). The relay alternates between
+//! the two with short waits rather than blocking on one, so it needs no
+//! second task and nothing shared between two -- and what one side sent
+//! waits at the relay for room at the other a short wait at a time, so a side
+//! that takes nothing neither holds the other direction back nor keeps a
+//! stop waiting: after `RELAY_STALL_NS` of taking nothing it is given up. A
+//! forward is to the address its guest had when it was made -- a guest
+//! restarted keeps it; one stopped takes it away, and connections to it then
+//! fail.
 //!
 //! The kernel has 64 TCP connections in all and a forwarded one takes two,
 //! so a forward relays at most `MAX_CONNS` at once and refuses the rest.
@@ -21,32 +25,43 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use kcore::cmd::Output;
+use kcore::consts::NS_PER_SEC;
 use kcore::net::Nic;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
 
 use crate::net;
+use crate::relay::{self, Ended, Read};
 
 pub const MAX_FORWARDS: usize = 8;
 const MAX_CONNS: usize = 8;
+/// Connections the kernel holds for a forward's port that its listener has
+/// not taken yet, at most: it takes each within a wait, so a few are
+/// plenty, and a flood of SYNs at the port costs the kernel's 64 connection
+/// slots no more than this.
+const LISTEN_BACKLOG: usize = 4;
 /// How long the listener waits for a connection before it looks at its stop
 /// flag; and a relay's wait on each side before it looks at the other.
 const ACCEPT_WAIT_MS: u64 = 500;
 const RELAY_WAIT_MS: u64 = 5;
-const RELAY_BUF: usize = 4096;
+/// A side that takes none of what it is sent for this long -- its TCP
+/// window shut -- is not coming back for it: the connection is given up, as
+/// sshd gives up such a client.
+const RELAY_STALL_NS: u64 = 5 * 60 * NS_PER_SEC;
 /// The device a forward listens through: nos's own.
 const PUBLIC_IF: &str = "eth0";
 
 /// What a forward's tasks share.
 struct Shared {
     stop: AtomicBool,
-    /// Connections being relayed, and all ever accepted, refused and failed.
+    /// Connections being relayed, and all ever accepted, refused and failed,
+    /// and given up for a side that took nothing.
     active: AtomicUsize,
     accepted: AtomicU64,
     refused: AtomicU64,
     failed: AtomicU64,
+    stalled: AtomicU64,
     /// Where to: the guest's address and port, and the device it is behind.
     guest_ip: u32,
     guest_port: u16,
@@ -54,6 +69,19 @@ struct Shared {
     /// The relays' tasks, joined when the forward goes -- and the finished
     /// ones as new ones start.
     relays: Mutex<Vec<(Arc<AtomicBool>, TaskHandle)>>,
+}
+
+/// A forward as the host API reads it (`Forwards::rows`).
+pub struct Row {
+    pub port: u16,
+    pub vm: u32,
+    pub guest_ip: u32,
+    pub guest_port: u16,
+    pub active: usize,
+    pub accepted: u64,
+    pub refused: u64,
+    pub failed: u64,
+    pub stalled: u64,
 }
 
 struct Forward {
@@ -141,21 +169,36 @@ struct Relay {
     b: TcpStream,
 }
 
+/// A connection as the relay drives it: its waits short, never forever.
+impl relay::Side for TcpStream {
+    fn recv(&mut self, buf: &mut [u8], wait_ms: u64) -> Read {
+        /* 0 would be forever to the kernel */
+        let n = TcpStream::recv(self, buf, wait_ms.max(1));
+        if n > 0 {
+            Read::Data(n as usize)
+        } else if n == RECV_TIMEOUT {
+            Read::Idle
+        } else {
+            Read::End
+        }
+    }
+
+    fn send(&mut self, buf: &[u8], wait_ms: u64) -> Option<usize> {
+        let n = TcpStream::send(self, buf, wait_ms.max(1));
+        if n < 0 { None } else { Some(n as usize) }
+    }
+}
+
 fn relay_task(relay: Relay) {
     let Relay { shared, done, mut a, mut b } = relay;
-    let mut buf = [0u8; RELAY_BUF];
-    'relay: while !shared.stop.load(Ordering::Acquire) {
-        for dir in 0..2 {
-            let (from, to) = if dir == 0 { (&mut a, &mut b) } else { (&mut b, &mut a) };
-            let n = from.recv(&mut buf, RELAY_WAIT_MS);
-            if n == RECV_TIMEOUT {
-                continue;
-            }
-            if n <= 0 || !to.send_all(&buf[..n as usize]) {
-                /* An end, or a failure, on either side: both close. */
-                break 'relay;
-            }
-        }
+    let stop = || shared.stop.load(Ordering::Acquire);
+    /* An end, a failure or a stall on either side: both close. */
+    if relay::relay(&mut a, &mut b, RELAY_WAIT_MS, RELAY_STALL_NS, &kcore::time::boot_time_ns, &stop)
+        == Ended::Stalled
+    {
+        shared.stalled.fetch_add(1, Ordering::Relaxed);
+        kcore::trace!(0, "hv: a forwarded connection given up -- a side took nothing for {} s",
+                      RELAY_STALL_NS / NS_PER_SEC);
     }
     drop(a);
     drop(b);
@@ -170,52 +213,44 @@ impl Forwards {
         Some(Forwards { table: Mutex::new(table)? })
     }
 
-    /// `hv forward add <port> <vm> <guest-port>`.
-    pub fn add(&self, port: u16, vm: u32, guest_port: u16, guest_ip: u32, host: Nic, out: &mut Output) {
-        let Some(public) = Nic::find(PUBLIC_IF) else {
-            let _ = writeln!(out, "hv: no {} to listen through", PUBLIC_IF);
-            return;
-        };
-        {
+    /// `hv forward add <port> <vm> <guest-port>`: nos's `port` relayed to
+    /// `guest_port` of VM `vm`, at `guest_ip` behind `host` -- said on `out`
+    /// once it listens -- or why not.
+    pub fn add(&self, port: u16, vm: u32, guest_port: u16, guest_ip: u32, host: Nic, out: &mut dyn Write)
+               -> Result<(), String> {
+        let public = Nic::find(PUBLIC_IF).ok_or_else(|| alloc::format!("no {} to listen through", PUBLIC_IF))?;
+        /* Asked under the lock, said after it: nothing is printed with the
+         * table held, a VM's stop taking its forwards away waits on it. */
+        let (full, taken) = {
             let table = self.table.lock();
-            if table.len() >= MAX_FORWARDS {
-                let _ = writeln!(out, "hv: {} forwards already", MAX_FORWARDS);
-                return;
-            }
-            if table.iter().any(|f| f.port == port) {
-                let _ = writeln!(out, "hv: port {} is forwarded already", port);
-                return;
-            }
+            (table.len() >= MAX_FORWARDS, table.iter().any(|f| f.port == port))
+        };
+        if full {
+            return Err(alloc::format!("{} forwards already", MAX_FORWARDS));
         }
-        let listener = match TcpListener::bind(&public, port) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = writeln!(out, "hv: port {} would not listen -- {}", port, e);
-                return;
-            }
-        };
-        let relays = match Mutex::new(Vec::new()) {
-            Some(m) => m,
-            None => {
-                let _ = writeln!(out, "hv: out of memory");
-                return;
-            }
-        };
+        if taken {
+            return Err(alloc::format!("port {} is forwarded already", port));
+        }
+        /* Bulk: a forwarded port carries a guest's downloads and uploads to
+         * the other end of a long round trip, which the 8 KiB of a small
+         * connection held to 120 KiB/s at the EX44's 62 ms */
+        let listener = TcpListener::bind_bulk(&public, port, LISTEN_BACKLOG)
+            .map_err(|e| alloc::format!("port {} would not listen -- {}", port, e))?;
+        let relays = Mutex::new(Vec::new()).ok_or_else(|| String::from("out of memory"))?;
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             accepted: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            stalled: AtomicU64::new(0),
             guest_ip,
             guest_port,
             host,
             relays,
         });
-        let Some(task) = kcore::task::spawn_with("hv/forward", Listen { shared: shared.clone(), listener }, listen) else {
-            let _ = writeln!(out, "hv: no task for the forward");
-            return;
-        };
+        let task = kcore::task::spawn_with("hv/forward", Listen { shared: shared.clone(), listener }, listen)
+            .ok_or_else(|| String::from("no task for the forward"))?;
         let forward = Forward { port, vm, shared, task: Some(task) };
         let refused = {
             let mut table = self.table.lock();
@@ -229,41 +264,82 @@ impl Forwards {
         };
         if let Some(f) = refused {
             end(f);
-            let _ = writeln!(out, "hv: port {} was forwarded meanwhile", port);
-            return;
+            return Err(alloc::format!("port {} was forwarded meanwhile", port));
         }
         let _ = writeln!(out, "hv: port {} forwarded to vm {}, {}:{}", port, vm, net::dotted(guest_ip), guest_port);
+        Ok(())
     }
 
-    /// `hv forward del <port>`.
-    pub fn del(&self, port: u16, out: &mut Output) {
+    /// `hv forward del <port>`: the forward of nos's `port` taken away, its
+    /// listener and relays ended -- the VM it was to's number, or why not.
+    pub fn del(&self, port: u16) -> Result<u32, String> {
         let forward = {
             let mut table = self.table.lock();
-            match table.iter().position(|f| f.port == port) {
-                Some(i) => table.swap_remove(i),
-                None => {
-                    let _ = writeln!(out, "hv: port {} is not forwarded", port);
-                    return;
-                }
-            }
+            table.iter().position(|f| f.port == port).map(|i| table.swap_remove(i))
         };
+        let forward = forward.ok_or_else(|| alloc::format!("port {} is not forwarded", port))?;
+        let vm = forward.vm;
         end(forward);
-        let _ = writeln!(out, "hv: port {} no longer forwarded", port);
+        Ok(vm)
+    }
+
+    /// The VM nos's `port` is forwarded to, if it is.
+    pub fn vm_of(&self, port: u16) -> Option<u32> {
+        self.table.lock().iter().find(|f| f.port == port).map(|f| f.vm)
+    }
+
+    /// Every forward as the host API reads it, copied out under the lock --
+    /// with nothing allocated there, the table holding MAX_FORWARDS at most
+    /// -- its counters read after.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut held: [Option<(u16, u32, Arc<Shared>)>; MAX_FORWARDS] = Default::default();
+        {
+            let table = self.table.lock();
+            for (row, f) in held.iter_mut().zip(table.iter()) {
+                *row = Some((f.port, f.vm, f.shared.clone()));
+            }
+        }
+        let mut rows = Vec::new();
+        if rows.try_reserve_exact(MAX_FORWARDS).is_err() {
+            return rows;
+        }
+        for (port, vm, s) in held.iter().filter_map(Option::as_ref) {
+            rows.push(Row {
+                port: *port,
+                vm: *vm,
+                guest_ip: s.guest_ip,
+                guest_port: s.guest_port,
+                active: s.active.load(Ordering::Relaxed),
+                accepted: s.accepted.load(Ordering::Relaxed),
+                refused: s.refused.load(Ordering::Relaxed),
+                failed: s.failed.load(Ordering::Relaxed),
+                stalled: s.stalled.load(Ordering::Relaxed),
+            });
+        }
+        rows
     }
 
     /// `hv forward`.
-    pub fn list(&self, out: &mut Output) {
-        let table = self.table.lock();
-        if table.is_empty() {
+    pub fn list(&self, out: &mut dyn Write) {
+        /* Copied out under the lock -- with nothing allocated, the table
+         * holding MAX_FORWARDS at most -- and printed after it. */
+        let mut rows: [Option<(u16, u32, Arc<Shared>)>; MAX_FORWARDS] = Default::default();
+        {
+            let table = self.table.lock();
+            for (row, f) in rows.iter_mut().zip(table.iter()) {
+                *row = Some((f.port, f.vm, f.shared.clone()));
+            }
+        }
+        if rows[0].is_none() {
             let _ = writeln!(out, "hv: no forwards");
             return;
         }
-        for f in table.iter() {
-            let s = &f.shared;
-            let _ = writeln!(out, "port {} -> vm {} {}:{}  {} active, {} accepted, {} refused, {} failed",
-                f.port, f.vm, net::dotted(s.guest_ip), s.guest_port, s.active.load(Ordering::Relaxed),
+        for (port, vm, s) in rows.iter().filter_map(Option::as_ref) {
+            let _ = writeln!(out, "port {} -> vm {} {}:{}  {} active, {} accepted, {} refused, {} failed, \
+                                   {} given up stalled",
+                port, vm, net::dotted(s.guest_ip), s.guest_port, s.active.load(Ordering::Relaxed),
                 s.accepted.load(Ordering::Relaxed), s.refused.load(Ordering::Relaxed),
-                s.failed.load(Ordering::Relaxed));
+                s.failed.load(Ordering::Relaxed), s.stalled.load(Ordering::Relaxed));
         }
     }
 

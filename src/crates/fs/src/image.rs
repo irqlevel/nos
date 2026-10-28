@@ -54,6 +54,11 @@ use crate::vfs::{Handle, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
 /// The most blocks a batch moves: a page of the buffer each.
 const BATCH_PAGES: usize = 64;
 
+/// The most blocks `extent` looks at in one call: 16 MiB of 4 KiB blocks, a
+/// map of a batch's at a time under the VFS's lock -- let go of between
+/// them, and the caller's to stop between calls.
+const EXTENT_BLOCKS: u64 = 4096;
+
 /// What zeros are written from, a piece at a time (`write_zeroes`).
 const ZERO_CHUNK: usize = 16 * 1024;
 static ZEROS: [u8; ZERO_CHUNK] = [0; ZERO_CHUNK];
@@ -140,6 +145,55 @@ impl Image {
     /// its own on a device -- or changes nothing.
     pub fn gives_back(&self) -> bool {
         self.direct.is_some()
+    }
+
+    /// Where the image has data from `offset` on, as `(start, end)`: holes
+    /// from `offset` to `start`, and from `start` to `end` blocks that are
+    /// on the device -- `start` is `offset` unless a hole was there, `end`
+    /// where the next hole begins, at most `EXTENT_BLOCKS` blocks on from
+    /// `offset`'s and never past the image's end. `start == end` where none
+    /// of the blocks looked at holds data: holes up to there, and the next
+    /// call goes on from it. So a copy that leaves the holes out -- a VM's
+    /// disk cloned -- reads only what is there, and walks a sparse disk of
+    /// gigabytes a call at a time, free to stop between them. What a hole
+    /// is, is the filesystem's map (`Vfs::map`): a block it reads as zeros
+    /// without one. Where its filesystem keeps no blocks of its own, every
+    /// byte is data. `(size, size)` from the end on; None on an I/O error.
+    pub fn extent(&mut self, offset: u64) -> Option<(u64, u64)> {
+        let size = self.size;
+        if offset >= size {
+            return Some((size, size));
+        }
+        let (vfs, handle) = (self.vfs, self.handle);
+        let Some(direct) = self.direct.as_mut() else { return Some((offset, size)) };
+        let block = direct.block as u64;
+        let first = offset / block;
+        let last = size.div_ceil(block).min(first.saturating_add(EXTENT_BLOCKS));
+        /* Byte offsets of blocks inside the image: below `size`, which a
+         * file's length keeps far from the top of a u64. */
+        let at_block = |b: u64| (b * block).min(size);
+        let mut data_from = None;
+        let mut at = first;
+        while at < last {
+            let n = usize::try_from(last - at).map_or(direct.sectors.len(), |n| n.min(direct.sectors.len()));
+            if !vfs.map(handle, at, &mut direct.sectors[..n]) {
+                return None;
+            }
+            for (k, &sector) in direct.sectors[..n].iter().enumerate() {
+                let b = at + k as u64;
+                match (data_from, sector != 0) {
+                    (None, true) => data_from = Some(b),
+                    (Some(from), false) => return Some((at_block(from).max(offset), at_block(b))),
+                    _ => {}
+                }
+            }
+            at += n as u64;
+        }
+        let end = at_block(last);
+        Some(match data_from {
+            Some(from) => (at_block(from).max(offset), end),
+            None => (end, end),
+        })
     }
 
     /// Whether `len` bytes from `offset` are all inside the image.
@@ -566,6 +620,29 @@ pub unsafe extern "C" fn kernel_image_write(image: usize, offset: u64, data: *co
     let data = unsafe { core::slice::from_raw_parts(data, len) };
     match with(image, |image| image.write_at(offset, data)) {
         Some(true) => 0,
+        _ => -1,
+    }
+}
+
+/// Where the image has data from `offset` on (`Image::extent`): the first
+/// byte of it into `out[0]`, holes before it, and the end of its run into
+/// `out[1]` -- the two the same where none of the blocks looked at holds
+/// any: 0, or -1.
+///
+/// # Safety
+/// `out` takes two `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_image_extent(image: usize, offset: u64, out: *mut u64) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return -1;
+    }
+    match with(image, |image| image.extent(offset)) {
+        Some(Some((start, end))) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(out, 2) };
+            out[0] = start;
+            out[1] = end;
+            0
+        }
         _ => -1,
     }
 }

@@ -2,11 +2,10 @@
 //! new file -- through the image's own client, with TLS and the bulk receive
 //! window a module's own TCP connection is not given (`net::wget::fetch`).
 
+use core::ffi::c_void;
 use core::fmt;
 
 use ffi::http;
-
-use crate::cmd::Output;
 
 /// Why a download left no file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +28,8 @@ pub enum Error {
     Write,
     /// The body was cut short.
     Cut,
+    /// The caller's progress said to stop.
+    Cancelled,
     /// An answer that is no body: the status, not 2xx.
     Status(u16),
 }
@@ -49,20 +50,38 @@ impl fmt::Display for Error {
             Error::Create => f.write_str("the file could not be made"),
             Error::Write => f.write_str("writing the file failed -- is the filesystem full?"),
             Error::Cut => f.write_str("the body was cut short -- the server went quiet, or closed early"),
+            Error::Cancelled => f.write_str("stopped, as asked"),
             Error::Status(404) => f.write_str("the server answered 404 -- there is nothing at that URL"),
             Error::Status(status) => write!(f, "the server answered {}, not a body", status),
         }
     }
 }
 
+type Progress<'a> = &'a mut dyn FnMut(u64, u64) -> bool;
+
+/// # Safety
+/// `ctx` is the `&mut Progress` `fetch` passed, alive until it returns --
+/// and the download calls this only until then.
+unsafe extern "C" fn progress_trampoline(ctx: *mut c_void, done: u64, total: u64) -> bool {
+    let progress = unsafe { &mut *(ctx as *mut Progress) };
+    progress(done, total)
+}
+
 /// What `url` answers with, by HTTP or HTTPS, in a new file at `path` --
-/// never one that is there -- a "download:" line on `out` every few seconds:
-/// the body's length, or why not, and then no file. Only a 2xx answer is a
-/// body. Sleeps as long as the download takes.
-pub fn fetch(url: &str, path: &str, out: &mut Output) -> Result<u64, Error> {
-    /* The strings are readable for their lengths, and the printer is one
-     * the kernel handed this module, live for as long as `out` is. */
-    let got = unsafe { http::kernel_http_fetch(url.as_ptr(), url.len(), path.as_ptr(), path.len(), out.raw()) };
+/// never one that is there -- `progress` handed the bytes in the file so far
+/// and the body's length (0 when the server did not say) as they come, and
+/// asked whether to go on: the body's length, or why not, and then no file.
+/// Only a 2xx answer is a body. Sleeps as long as the download takes; a stop
+/// is seen as the next of the body comes, so a server gone quiet holds it
+/// for the client's idle time.
+pub fn fetch(url: &str, path: &str, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<u64, Error> {
+    let mut progress: Progress = progress;
+    let ctx = &mut progress as *mut Progress as *mut c_void;
+    /* The strings are readable for their lengths, and `ctx` is the progress
+     * the trampoline takes it for, alive until the call returns. */
+    let got = unsafe {
+        http::kernel_http_fetch(url.as_ptr(), url.len(), path.as_ptr(), path.len(), progress_trampoline, ctx)
+    };
     if let Ok(len) = u64::try_from(got) {
         return Ok(len);
     }
@@ -79,6 +98,7 @@ pub fn fetch(url: &str, path: &str, out: &mut Output) -> Result<u64, Error> {
         http::HTTP_FETCH_CREATE => Error::Create,
         http::HTTP_FETCH_WRITE => Error::Write,
         http::HTTP_FETCH_CUT => Error::Cut,
+        http::HTTP_FETCH_CANCELLED => Error::Cancelled,
         code => match u16::try_from(http::HTTP_FETCH_STATUS - code) {
             Ok(status) if code <= http::HTTP_FETCH_STATUS => Error::Status(status),
             _ => Error::Answer,

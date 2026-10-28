@@ -1,0 +1,21 @@
+# nos's management panel: HTTPS on 443 with the certificate nos made for it
+# -- `api panel` on the host prints its fingerprint, to hold what a browser
+# is shown to -- and the panel behind it on 127.0.0.1:3000.
+#
+# A browser reaches it through nos's relay of its port 39233, by the host's
+# address: it sends no server name, and `default_sni` has that be the name
+# the certificate is for. TCP alone is relayed: no HTTP/3.
+{
+	admin off
+	auto_https off
+	default_sni nos-panel
+	servers {
+		protocols h1 h2
+	}
+}
+
+:443 {
+	tls /etc/nos-panel/tls/cert.pem /etc/nos-panel/tls/key.pem
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000
+}

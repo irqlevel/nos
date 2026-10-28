@@ -11,7 +11,10 @@
 //!   (`diskimage::iso`): its meta-data naming the machine, its user-data
 //!   giving the image's own user the keys nos's sshd lets in
 //!   (/etc/ssh/authorized_keys) -- and with `password=` a password, for its
-//!   console;
+//!   console -- or, given by the host API's caller, user-data of its own.
+//!   The user-data says nothing of the machine -- the meta-data names it --
+//!   and is kept in the folder as `user-data`, for a clone of the VM to give
+//!   its own first boot as it is (`clone`);
 //! - and its vm.toml, written last: hvboot as its kernel -- which boots the
 //!   one its own disk's GRUB would -- the disk its first disk and the seed
 //!   its second, read-only; on the switch, booted again when it reboots
@@ -20,8 +23,11 @@
 //! The words after the URL are `hv start`'s but a kernel and an initrd --
 //! hvboot is the kernel -- and its own three: `size=` (K, M, G or T),
 //! `password=`, and `hvboot=`, where hvboot is: /lib/hvboot, the system
-//! image's, unless told. What fails leaves nothing behind: what this made
-//! goes, the folder too when this made it.
+//! image's, unless told. The host API's create gives the same as a job's
+//! parameters (`provider`). The name is held while the folder is made, so
+//! no VM of it starts and nothing else is done to it meanwhile; what fails,
+//! or is stopped, leaves nothing behind: what this made goes, the folder
+//! too when this made it.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -29,18 +35,22 @@ use core::fmt::Write;
 
 use diskimage::iso;
 use diskimage::{detect, Format};
-use kcore::cmd::Output;
+use kcore::consts::NS_PER_SEC;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, Options};
 use crate::guest;
 use crate::image;
 use crate::store::{self, Folder};
+use crate::vms::Vms;
+use crate::work::{self, Work};
 
 /// Where the system image keeps hvboot.
-const HVBOOT: &str = "/lib/hvboot";
-/// The folder's files: the disk, and the seed.
-const DISK: &str = "disk.raw";
-const SEED: &str = "seed.iso";
+pub const HVBOOT: &str = "/lib/hvboot";
+/// The folder's files: the disk, the seed, and the user-data kept for a
+/// clone's seed.
+pub const DISK: &str = "disk.raw";
+pub const SEED: &str = "seed.iso";
+pub const USER_DATA: &str = "user-data";
 /// What the image is downloaded as when its URL's last step is no name a
 /// file of the folder's may have.
 const IMAGE: &str = "image";
@@ -51,43 +61,119 @@ const DEFAULT_MEM_MIB: u64 = 1024;
 /// The keys nos's sshd lets in, given to the guest's user.
 const AUTHORIZED_KEYS: &str = "/etc/ssh/authorized_keys";
 const MAX_KEYS_BYTES: usize = 64 * 1024;
-const MAX_PASSWORD: usize = 128;
+pub const MAX_PASSWORD: usize = 128;
+/// The most user-data a VM is given -- what a seed of cloud-init's holds
+/// many times over.
+pub const MAX_USER_DATA: usize = 64 * 1024;
 const SECS_PER_DAY: u64 = 86_400;
 const SECS_PER_HOUR: u64 = 3600;
 const SECS_PER_MINUTE: u64 = 60;
 /// The seed's label, as cloud-init's NoCloud looks for it.
 const SEED_LABEL: &str = "cidata";
-const MIB: u64 = 1024 * 1024;
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+/// How far apart the download's progress lines are, as wget's: a tenth of
+/// the time so far, from two seconds to thirty.
+const REPORT_MIN_NS: u64 = 2 * NS_PER_SEC;
+const REPORT_MAX_NS: u64 = 30 * NS_PER_SEC;
+const REPORT_SHARE: u64 = 10;
+const NS_PER_TENTH: u64 = NS_PER_SEC / 10;
+
+/// Bytes over a time, as a rate: MiB/s to a tenth from one up, KiB/s below.
+pub struct Rate(u64);
+
+impl Rate {
+    pub fn of(bytes: u64, ns: u64) -> Rate {
+        if ns == 0 {
+            return Rate(0);
+        }
+        Rate(u64::try_from(u128::from(bytes) * u128::from(NS_PER_SEC) / u128::from(ns)).unwrap_or(u64::MAX))
+    }
+}
+
+impl core::fmt::Display for Rate {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 >= MIB {
+            write!(f, "{}.{} MiB/s", self.0 / MIB, self.0 % MIB * 10 / MIB)
+        } else {
+            write!(f, "{} KiB/s", self.0 / KIB)
+        }
+    }
+}
 
 /// Whether the word after `hv create <name>` is a URL: the other form.
 pub fn is_url(word: &str) -> bool {
     word.starts_with("http://") || word.starts_with("https://")
 }
 
+/// What a VM of a cloud's image is made with, beside what `hv start` takes:
+/// the image's URL, the size its disk is grown to, a password for its
+/// console, where hvboot is -- and user-data of the caller's own in place of
+/// nos's, which only the host API gives.
+pub struct Recipe<'a> {
+    pub url: &'a str,
+    pub size: Option<u64>,
+    pub password: Option<&'a str>,
+    pub hvboot: &'a str,
+    pub user_data: Option<&'a str>,
+    /// Its vm.toml's `protected`: stopped and deleted only when told
+    /// `force` -- the management panel's VM.
+    pub protected: bool,
+}
+
+/// What a VM made of a cloud's image came to: its vm.toml, its disk's size,
+/// and how many keys its user-data gave.
+pub struct Created {
+    pub file: String,
+    pub disk_bytes: u64,
+    pub keys: usize,
+}
+
 /// `hv create <name> <url> [words]`, its name checked already.
-pub fn create(root: &str, name: &str, url: &str, words: &str, out: &mut Output) {
-    if let Err(e) = run(root, name, url, words, out) {
-        let _ = writeln!(out, "hv: {}", e);
+pub fn command(root: &str, vms: &Vms, name: &str, url: &str, words: &str, work: &mut dyn Work) {
+    let made = own_words(words).and_then(|(own, rest)| {
+        let o = guest::words(&alloc::format!("{} {}", own.hvboot, rest), store::CREATE_USAGE)?;
+        let recipe = Recipe { url, size: own.size, password: own.password, hvboot: own.hvboot, user_data: None,
+                              protected: false };
+        create(root, vms, name, &recipe, o, work)
+    });
+    if let Err(e) = made {
+        let _ = writeln!(work, "hv: {}", e);
     }
 }
 
 /// What this has made so far, to take away again if it fails: files, and
 /// the folder when it made that too.
-struct Made {
-    files: Vec<String>,
-    folder: Option<String>,
+pub struct Made {
+    pub files: Vec<String>,
+    pub folder: Option<String>,
 }
 
 impl Made {
-    fn undo(&mut self) {
+    pub fn new() -> Made {
+        Made { files: Vec::new(), folder: None }
+    }
+
+    /// Everything kept from here on: the work is done.
+    pub fn keep(&mut self) {
+        self.files.clear();
+        self.folder = None;
+    }
+
+    pub fn undo(&mut self) {
         for path in self.files.iter().rev() {
             let _ = kcore::fs::remove(path);
         }
         if let Some(folder) = &self.folder {
             let _ = kcore::fs::remove(folder);
         }
-        self.files.clear();
-        self.folder = None;
+        self.keep();
+    }
+}
+
+impl Drop for Made {
+    fn drop(&mut self) {
+        self.undo();
     }
 }
 
@@ -129,7 +215,7 @@ fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
 }
 
 /// `20G` and the like: binary multiples.
-fn bytes(text: &str) -> Option<u64> {
+pub fn bytes(text: &str) -> Option<u64> {
     let (digits, shift) = match text.as_bytes().last()? {
         b'K' | b'k' => (&text[..text.len() - 1], 10),
         b'M' | b'm' => (&text[..text.len() - 1], 20),
@@ -149,7 +235,7 @@ fn image_name(url: &str) -> &str {
     let last = path.rsplit('/').next().unwrap_or("");
     let ok = !last.is_empty() && last.len() <= MAX_IMAGE_NAME && !last.starts_with('.')
         && last.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
-        && ![DISK, SEED, store::CONFIG, "console.log", "console.log.1"].contains(&last);
+        && ![DISK, SEED, USER_DATA, store::CONFIG, store::CONFIG_PREV, "console.log", "console.log.1"].contains(&last);
     if ok { last } else { IMAGE }
 }
 
@@ -172,7 +258,7 @@ fn quoted(text: &str) -> String {
 }
 
 /// The keys nos's sshd lets in: the file's lines that are not comments.
-fn keys() -> Vec<String> {
+pub fn keys() -> Vec<String> {
     let Ok(text) = kcore::fs::read(AUTHORIZED_KEYS, MAX_KEYS_BYTES) else { return Vec::new() };
     let Ok(text) = core::str::from_utf8(&text) else { return Vec::new() };
     text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(String::from).collect()
@@ -193,14 +279,11 @@ fn now() -> iso::When {
     }
 }
 
-/// cloud-init's seed: the machine named, its user given the keys, and the
-/// password when there is one. A new instance-id for every VM made, so that
-/// cloud-init runs for it as for a new machine.
-fn seed(name: &str, keys: &[String], password: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut meta = String::new();
-    let _ = write!(meta, "instance-id: nos-{}-{}\nlocal-hostname: {}\n", name, kcore::time::wall_clock_secs(), name);
+/// cloud-init's user-data as nos writes it: the image's own user given
+/// `keys`, and the password when there is one -- nothing of the machine's
+/// own, which the meta-data names, so that a clone's seed gives it as it is.
+pub fn user_data(keys: &[String], password: Option<&str>) -> String {
     let mut user = String::from("#cloud-config\n");
-    let _ = writeln!(user, "hostname: {}", name);
     if !keys.is_empty() {
         user.push_str("ssh_authorized_keys:\n");
         for k in keys {
@@ -210,21 +293,39 @@ fn seed(name: &str, keys: &[String], password: Option<&str>) -> Result<Vec<u8>, 
     if let Some(p) = password {
         let _ = write!(user, "password: {}\nchpasswd:\n  expire: false\n", quoted(p));
     }
-    let files = [iso::File { name: "meta-data", data: meta.as_bytes() }, iso::File { name: "user-data", data: user.as_bytes() }];
+    user
+}
+
+/// cloud-init's seed for the VM `name`: its meta-data naming the machine,
+/// with an instance-id of its own -- a new one for every VM made or cloned,
+/// so that cloud-init runs for it as for a new machine: its own name, its
+/// own SSH host keys -- and `user_data`.
+pub fn seed(name: &str, user_data: &str) -> Result<Vec<u8>, String> {
+    let mut meta = String::new();
+    let _ = write!(meta, "instance-id: nos-{}-{}\nlocal-hostname: {}\n", name, kcore::time::wall_clock_secs(), name);
+    let files = [iso::File { name: "meta-data", data: meta.as_bytes() },
+                 iso::File { name: USER_DATA, data: user_data.as_bytes() }];
     iso::image(SEED_LABEL, &files, now()).map_err(|e| alloc::format!("the seed: {}", e))
 }
 
-fn run(root: &str, name: &str, url: &str, words: &str, out: &mut Output) -> Result<(), String> {
-    let (own, rest) = own_words(words)?;
+/// A VM made of a cloud's image, `<root>/<name>`, as `recipe` says, with
+/// `o` -- `hv start`'s words, or the host API's parameters -- for its
+/// vm.toml: hvboot its kernel, the disk and the seed its first two disks.
+/// Its lines, its progress and whether to stop are `work`'s.
+pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options, work: &mut dyn Work)
+              -> Result<Created, String> {
     /* Checked as a start would check it, before anything is fetched: a VM
      * that cannot boot is no use made. */
-    let mut o = guest::words(&alloc::format!("{} {}", own.hvboot, rest), store::CREATE_USAGE)?;
     if o.initrd.is_some() {
         return Err(String::from("initrd= is no cloud image's: hvboot boots the one its disk's GRUB names"));
     }
     if o.secs.is_some() {
         return Err(String::from("secs= is hv boot's -- a vm runs until hv stop"));
     }
+    if recipe.user_data.is_some_and(|u| u.len() > MAX_USER_DATA) {
+        return Err(alloc::format!("its user-data is more than {} bytes", MAX_USER_DATA));
+    }
+    o.kernel = String::from(recipe.hvboot);
     o.mem_mib = o.mem_mib.or(Some(DEFAULT_MEM_MIB));
     o.net = true;
     o.restart = true;
@@ -235,40 +336,77 @@ fn run(root: &str, name: &str, url: &str, words: &str, out: &mut Output) -> Resu
     o.disks.extend(theirs);
     let path = store::join(root, name).ok_or_else(|| String::from("out of memory"))?;
     let folder = Folder { name: String::from(name), path };
-    let config = Config::new(o);
+    let mut config = Config::new(o);
+    config.protected = recipe.protected;
     store::options_checked(&folder, &config)?;
+    /* A port of its own is no other VM's, by its vm.toml or as it runs. */
+    if let Some(p) = config.options.port {
+        crate::clone::port_for(root, vms, Some(p))?;
+    }
     let file = store::join(&folder.path, store::CONFIG).ok_or_else(|| String::from("out of memory"))?;
     if kcore::fs::size(&file).is_ok() {
         return Err(alloc::format!("{} is there already -- not written over", file));
     }
-    if kcore::fs::size(own.hvboot).is_err() {
-        return Err(alloc::format!("no {} -- hvboot= says where hvboot is", own.hvboot));
+    if kcore::fs::size(recipe.hvboot).is_err() {
+        return Err(alloc::format!("no {} -- hvboot= says where hvboot is", recipe.hvboot));
     }
+    /* Held from here on: no start of it, and no other create, clone or
+     * delete of it, until this is done -- the vm.toml written last, by a
+     * create that refuses one there. */
+    let _held = vms.reserve(name, "made")?;
     let text = config::render(&config).ok_or_else(|| String::from("out of memory"))?;
 
-    let mut made = Made { files: Vec::new(), folder: None };
+    let mut made = Made::new();
     if kcore::fs::list(&folder.path).is_err() {
         store::make_dirs(&folder.path).map_err(|_| alloc::format!("{} could not be made", folder.path))?;
         made.folder = Some(folder.path.clone());
     }
-    let result = fill(&folder, url, &own, &text, &file, &mut made, out);
-    if result.is_err() {
-        made.undo();
-    }
-    result
+    let created = fill(&folder, recipe, &text, &file, &mut made, work)?;
+    made.keep();
+    Ok(created)
 }
 
 /// The folder's files, each kept in `made` as it is: the image, the disk
-/// made of it, the seed, and last the vm.toml.
-fn fill(folder: &Folder, url: &str, own: &Own, text: &str, file: &str, made: &mut Made, out: &mut Output)
-        -> Result<(), String> {
+/// made of it, the user-data and the seed, and last the vm.toml.
+fn fill(folder: &Folder, recipe: &Recipe, text: &str, file: &str, made: &mut Made, work: &mut dyn Work)
+        -> Result<Created, String> {
     let join = |f: &str| store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"));
-    let download = join(image_name(url))?;
+    let url = recipe.url;
+    /* The URL's name where the path it makes is one the VFS takes. */
+    let named = image_name(url);
+    let named = if folder.path.len() + 1 + named.len() <= store::PATH_MAX { named } else { IMAGE };
+    let download = join(named)?;
     let disk = join(DISK)?;
     let seed_path = join(SEED)?;
+    let user_path = join(USER_DATA)?;
 
-    let _ = writeln!(out, "hv: {} -- into {}", url, download);
-    kcore::http::fetch(url, &download, out).map_err(|e| alloc::format!("{}: {}", url, e))?;
+    let _ = writeln!(work, "hv: {} -- into {}", url, download);
+    let started = kcore::time::boot_time_ns();
+    let mut reported = started;
+    let mut progress = |done: u64, total: u64| {
+        if work.cancelled() {
+            return false;
+        }
+        work.progress(done, total);
+        let now = kcore::time::boot_time_ns();
+        let every = (now.saturating_sub(started) / REPORT_SHARE).clamp(REPORT_MIN_NS, REPORT_MAX_NS);
+        if now.saturating_sub(reported) >= every {
+            reported = now;
+            let _ = write!(work, "download: {} MiB", done / MIB);
+            if total != 0 {
+                let _ = write!(work, " of {} MiB, {}%", total / MIB, (u128::from(done) * 100 / u128::from(total)).min(100));
+            }
+            let _ = writeln!(work, ", {}", Rate::of(done, now.saturating_sub(started)));
+        }
+        true
+    };
+    let len = kcore::http::fetch(url, &download, &mut progress).map_err(|e| match e {
+        kcore::http::Error::Cancelled => String::from(work::STOPPED),
+        e => alloc::format!("{}: {}", url, e),
+    })?;
+    let ns = kcore::time::boot_time_ns().saturating_sub(started);
+    let _ = writeln!(work, "download: {} bytes in {}.{} s, {}", len, ns / NS_PER_SEC, ns % NS_PER_SEC / NS_PER_TENTH,
+                     Rate::of(len, ns));
     made.files.push(download.clone());
 
     /* What it is, by its first bytes: from the heap, the task's stack
@@ -279,7 +417,7 @@ fn fill(folder: &Folder, url: &str, own: &Own, text: &str, file: &str, made: &mu
     let n = kcore::fs::read_at(&download, 0, &mut head).map_err(|e| alloc::format!("{}: {}", download, e))?;
     match detect(&head[..n]) {
         Format::Qcow2 => {
-            image::convert(&download, &disk, out)?;
+            image::convert(&download, &disk, work)?;
             made.files.push(disk.clone());
             /* The disk is what the VM has; the image is the download's. */
             if kcore::fs::remove(&download).is_ok() {
@@ -293,29 +431,43 @@ fn fill(folder: &Folder, url: &str, own: &Own, text: &str, file: &str, made: &mu
         }
         format => return Err(image::refused(&download, format)),
     }
+    if work.cancelled() {
+        return Err(String::from(work::STOPPED));
+    }
 
-    let size = grow(&disk, own.size)?;
+    let size = grow(&disk, recipe.size)?;
     let keys = keys();
-    let seed = seed(&folder.name, &keys, own.password)?;
+    let user = match recipe.user_data {
+        Some(u) => String::from(u),
+        None => user_data(&keys, recipe.password),
+    };
+    kcore::fs::create(&user_path, user.as_bytes())
+        .map_err(|e| alloc::format!("{} could not be written -- {}", user_path, e))?;
+    made.files.push(user_path);
+    let seed = seed(&folder.name, &user)?;
     kcore::fs::create(&seed_path, &seed).map_err(|e| alloc::format!("{} could not be written -- {}", seed_path, e))?;
     made.files.push(seed_path);
     kcore::fs::create(file, text.as_bytes()).map_err(|e| alloc::format!("{} could not be written -- {}", file, e))?;
     made.files.push(String::from(file));
 
-    let _ = writeln!(out, "hv: {} written -- hv start {} boots it: hvboot, a {} MiB disk, cloud-init given {} key{}{}",
-                     file, folder.name, size.div_ceil(MIB), keys.len(), if keys.len() == 1 { "" } else { "s" },
-                     if own.password.is_some() { " and a password" } else { "" });
-    if keys.is_empty() && own.password.is_none() {
-        let _ = writeln!(out, "hv: no key in {} and no password= -- nobody can log in to it", AUTHORIZED_KEYS);
+    if recipe.user_data.is_some() {
+        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: hvboot, a {} MiB disk, cloud-init given the \
+                                user-data it was asked to", file, folder.name, size.div_ceil(MIB));
+    } else {
+        let _ = writeln!(work, "hv: {} written -- hv start {} boots it: hvboot, a {} MiB disk, cloud-init given {} \
+                                key{}{}", file, folder.name, size.div_ceil(MIB), keys.len(),
+                         if keys.len() == 1 { "" } else { "s" },
+                         if recipe.password.is_some() { " and a password" } else { "" });
+        if keys.is_empty() && recipe.password.is_none() {
+            let _ = writeln!(work, "hv: no key in {} and no password= -- nobody can log in to it", AUTHORIZED_KEYS);
+        }
     }
-    made.files.clear();
-    made.folder = None;
-    Ok(())
+    Ok(Created { file: String::from(file), disk_bytes: size, keys: if recipe.user_data.is_some() { 0 } else { keys.len() } })
 }
 
 /// The disk grown to `size`, when given: never shrunk under what the image
 /// holds. Its size, either way.
-fn grow(disk: &str, size: Option<u64>) -> Result<u64, String> {
+pub fn grow(disk: &str, size: Option<u64>) -> Result<u64, String> {
     let f = kcore::fs::File::open(disk, true).map_err(|e| alloc::format!("{}: {}", disk, e))?;
     let now = f.size().map_err(|e| alloc::format!("{}: {}", disk, e))?;
     let Some(want) = size else { return Ok(now) };

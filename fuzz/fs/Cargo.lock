@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -20,6 +21,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -37,4 +39,18 @@ name = "kcore"
 version = "0.1.0"
 dependencies = [
  "ffi",
+ "mgmtwire",
 ]
+
+[[package]]
+name = "mgmt"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+ "mgmtwire",
+]
+
+[[package]]
+name = "mgmtwire"
+version = "0.1.0"

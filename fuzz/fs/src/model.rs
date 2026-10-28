@@ -35,6 +35,21 @@ impl Data {
         self.len == 0
     }
 
+    /// Whether the `n` bytes from `at` -- those of them inside -- are all
+    /// zeros: what a hole may hold. Looked at a page kept at a time, not
+    /// read out.
+    pub fn zeros(&self, at: u64, n: u64) -> bool {
+        let end = at.saturating_add(n).min(self.len);
+        if at >= end {
+            return true;
+        }
+        self.chunks.range(at / CHUNK..=(end - 1) / CHUNK).all(|(&i, chunk)| {
+            let base = i * CHUNK;
+            let (from, to) = (base.max(at), (base + CHUNK).min(end));
+            chunk[(from - base) as usize..(to - base) as usize].iter().all(|&b| b == 0)
+        })
+    }
+
     /// `n` bytes from `at`, or as many as there are.
     pub fn read(&self, at: u64, n: u64) -> Vec<u8> {
         let end = at.saturating_add(n).min(self.len);

@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -122,6 +123,10 @@ dependencies = [
  "inout",
  "zeroize",
 ]
+
+[[package]]
+name = "conf"
+version = "0.1.0"
 
 [[package]]
 name = "const-oid"
@@ -311,6 +316,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "kcore",
+ "mgmt",
 ]
 
 [[package]]
@@ -390,6 +396,7 @@ name = "kcore"
 version = "0.1.0"
 dependencies = [
  "ffi",
+ "mgmtwire",
 ]
 
 [[package]]
@@ -421,12 +428,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "mgmt"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+ "mgmtwire",
+]
+
+[[package]]
+name = "mgmtwire"
+version = "0.1.0"
+
+[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [
  "ffi",
  "fs",
  "kcore",
+ "mgmt",
  "netwire",
  "tls",
 ]
@@ -436,11 +457,14 @@ name = "net-fuzz"
 version = "0.1.0"
 dependencies = [
  "chacha20",
+ "conf",
  "ed25519-dalek",
  "ffi",
  "fs",
  "kcore",
  "kmod",
+ "mgmt",
+ "mgmtwire",
  "net",
  "netwire",
  "poly1305",
@@ -449,7 +473,9 @@ dependencies = [
  "sha2",
  "ssh",
  "tls",
+ "web",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -950,6 +976,8 @@ dependencies = [
  "kcore",
  "rustls",
  "rustls-rustcrypto",
+ "rustls-webpki 0.103.15",
+ "sha2",
  "webpki-roots",
 ]
 
@@ -986,6 +1014,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "web"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "p256",
+ "sha2",
+ "zeroize",
+]
 
 [[package]]
 name = "webpki-roots"

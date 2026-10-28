@@ -1,8 +1,13 @@
 //! `tcp`: connections between the machine's programs and a peer on the
 //! wire -- opened either way, data both ways, closed or aborted either way
 //! -- over a link that loses, repeats, delays and reorders what it carries,
-//! with an attacker putting segments of its own into them, ICMP errors
-//! quoting them, and time passing through every timer the machine has.
+//! and loses some of what the machine sends too, so that its sender finds a
+//! loss by duplicate acknowledgements and by its timer and sends again what
+//! went missing; with an attacker putting segments of its own into them,
+//! ICMP errors quoting them, and time passing through every timer the
+//! machine has. One port's listener is a bulk one (`Buffers::Bulk`): what it
+//! accepts has its buffers grown as it is taken, what had arrived moved
+//! across, and scales its window when the peer's SYN offers to.
 //!
 //! What the machine's programs are handed by `recv` must be the peer's
 //! stream, byte for byte and in order, and end only where the peer ended
@@ -13,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use net::tcp::{Conn, Receive, TCP};
+use net::tcp::{Buffers, Conn, Receive, LISTEN_BACKLOG, TCP};
 use netwire::{icmp, tcp as seg, IP_PROTO_ICMP, IP_PROTO_TCP};
 
 use crate::machine::{sched, ETH0_MAC};
@@ -31,9 +36,11 @@ const NEAR_IP: u32 = 0x0A00_0264;
 const NEAR_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x64];
 const FAR_IP: u32 = 0x5DB8_D822;
 
-/// The ports the machine listens on, and where the peer's own listening
-/// ports -- one for each connect of the machine's -- begin.
-const LISTEN_PORTS: [u16; 3] = [7001, 7002, 22];
+/// The ports the machine listens on -- one of them a bulk listener's -- and
+/// where the peer's own listening ports -- one for each connect of the
+/// machine's -- begin.
+const LISTEN_PORTS: [u16; 4] = [7001, 7002, 22, BULK_PORT];
+const BULK_PORT: u16 = 7003;
 const PEER_PORT_BASE: u16 = 8000;
 const PEER_SRC_BASE: u16 = 30000;
 
@@ -51,6 +58,26 @@ struct Wire {
     tcp: Tcp,
     /// Segments that are not the peer's: for the attacker's quotes.
     seen: Vec<Vec<u8>>,
+    /// Of what the machine sends with data in it, how much in 256 the link
+    /// loses on its way to the peer, and the stream of choices that says
+    /// which (xorshift, from the input).
+    machine_loss: u32,
+    choices: u64,
+}
+
+impl Wire {
+    /// Whether the link loses a segment of the machine's carrying `data`:
+    /// one with data in it, at `machine_loss` in 256. Its pure
+    /// acknowledgements, its SYNs and its FINs all arrive.
+    fn loses(&mut self, data: usize) -> bool {
+        if self.machine_loss == 0 || data == 0 {
+            return false;
+        }
+        self.choices ^= self.choices << 13;
+        self.choices ^= self.choices >> 7;
+        self.choices ^= self.choices << 17;
+        (self.choices % 256) < u64::from(self.machine_loss)
+    }
 }
 
 impl Peers for Wire {
@@ -59,6 +86,10 @@ impl Peers for Wire {
             return;
         }
         if let Some(p) = crate::world::check::ipv4_parts(frame) {
+            if p.proto == IP_PROTO_TCP && self.loses(tcp_payload_len(frame)) {
+                crate::common::runner::reached("tcp: the link lost a segment of the machine's");
+                return;
+            }
             if p.proto == IP_PROTO_TCP && self.seen.len() < 256 {
                 self.seen.push(frame.to_vec());
             }
@@ -192,9 +223,15 @@ impl State {
                 o.extend_from_slice(&frames::mss(r.pick(&[0u16, 1, 1460, 65535])));
                 o
             }
+            /* A window scale offered: a bulk listener's connection scales */
+            2 | 3 => {
+                let mut o = frames::mss(r.pick(&[1460u16, 536, 1400, 100]));
+                o.extend_from_slice(&frames::ws(r.pick(&[0u8, 2, 7, 14, 15])));
+                o
+            }
             _ => frames::mss(r.pick(&[1460u16, 536, 1400, 100])),
         };
-        let window = r.pick(&[8192u32, 65535, 1024, 0, 600]);
+        let window = r.pick(&[8192u32, 65535, 1024, 0, 600, 262_144, 1 << 20]);
         let s = iss(r);
         self.w.peers.tcp.connect(&mut self.w.net, id, port, ETH0_IP, mport, s, opts, window);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
@@ -499,6 +536,23 @@ impl State {
     }
 }
 
+/// How much data a TCP frame of the machine's carries: its IP datagram's
+/// length less the IP and TCP headers.
+fn tcp_payload_len(frame: &[u8]) -> usize {
+    const ETH: usize = 14;
+    if frame.len() < ETH + 20 + 20 {
+        return 0;
+    }
+    let ip = &frame[ETH..];
+    let ihl = usize::from(ip[0] & 0x0F) * 4;
+    let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    if ihl < 20 || total < ihl + 20 || ip.len() < ihl + 20 {
+        return 0;
+    }
+    let doff = usize::from(ip[ihl + 12] >> 4) * 4;
+    total.saturating_sub(ihl + doff)
+}
+
 /// An initial sequence number: anything, and often one about to wrap.
 fn iss(r: &mut Input) -> u32 {
     match r.u8() % 4 {
@@ -516,10 +570,19 @@ pub fn tcp(r: &mut Input) {
     let far = r.u8() < 64;
     let (peer_ip, peer_mac) = if far { (FAR_IP, GW_MAC) } else { (NEAR_IP, NEAR_MAC) };
     let link = Link::from_input(r);
-    let lossy = link.loss > 8;
+    /* Now and then the machine's own data lost too, and a lot of it now and
+     * then: what its sender's recovery is for */
+    let machine_loss = match r.u8() {
+        0..=95 => 0,
+        96..=223 => 1 + r.below(16) as u32,
+        _ => 17 + r.below(48) as u32,
+    };
+    let lossy = link.loss > 8 || machine_loss > 16;
     let mut lan = Lan::new();
     lan.add(NEAR_IP, NEAR_MAC);
-    let mut w = World::new(link, Wire { lan, tcp: Tcp::new(peer_ip, peer_mac), seen: Vec::new() });
+    let choices = r.u64() | 1;
+    let mut w = World::new(link, Wire { lan, tcp: Tcp::new(peer_ip, peer_mac), seen: Vec::new(), machine_loss,
+                                        choices });
     w.net.expect.ips = vec![ETH0_IP];
     /* The machine's own sequence numbers, when the input says: where they
      * wrap. */
@@ -528,7 +591,9 @@ pub fn tcp(r: &mut Input) {
         crate::machine::random_queue(&v.to_le_bytes());
     }
 
-    let listeners = LISTEN_PORTS.iter().map(|&p| (p, TCP.listen(&nic, p))).collect();
+    let listeners = LISTEN_PORTS.iter().map(|&p| {
+        (p, if p == BULK_PORT { TCP.listen_with(&nic, p, LISTEN_BACKLOG, Buffers::Bulk) } else { TCP.listen(&nic, p) })
+    }).collect();
     /* Now and then the second device, which nothing listens on: the
      * hypervisor's switch, with a guest behind it. */
     let guest = if r.u8() < 96 {
@@ -644,6 +709,35 @@ pub fn tcp(r: &mut Input) {
     wind_down(&mut st);
 }
 
+/// The machine's end of each connection whose peer has let its end go --
+/// reset it, or given up on it -- while the machine's reset or the peer's
+/// never arrived: reset by the peer's host, as it would the next segment it
+/// had from it, once. Without it a machine that neither sends nor is sent
+/// anything keeps a connection to nobody for good, as TCP does with no
+/// keepalive -- which is what it is meant to do.
+fn reset_abandoned(st: &mut State, told: &mut Vec<bool>) {
+    told.resize(st.w.peers.tcp.eps.len(), false);
+    for e in 0..st.w.peers.tcp.eps.len() {
+        let ep = &st.w.peers.tcp.eps[e];
+        if told[e] || ep.st != S::Closed || !matches!(ep.reset, Some(tcpm::Reset::ByPeer) | Some(tcpm::Reset::GaveUp)) {
+            continue;
+        }
+        told[e] = true;
+        /* At the machine's own edge: what its program has read and what it
+         * holds unread is all it has taken of the stream -- more than the
+         * peer knows was taken, when the machine's acknowledgements were
+         * lost. */
+        let id = ep.id;
+        let Some(k) = st.links.iter().position(|l| l.id == id) else { continue };
+        let held = st.slot(k).map_or(0, |c| c.recv_used as u64);
+        let edge = ep.iss.wrapping_add(1).wrapping_add((st.links[k].got + held) as u32);
+        let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, edge, 0, seg::RST, 0, &[], &[], Sum::Right);
+        let f = frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s);
+        st.w.net.inject(f);
+        st.links[k].fragile = true;
+    }
+}
+
 /// The input is over: everyone finishes what they have, over a good link,
 /// and then the machine must hold nothing -- and every stream that ended
 /// the ordinary way must have arrived whole.
@@ -674,27 +768,10 @@ fn wind_down(st: &mut State) {
     }
     /* A peer that has let its end go -- reset it, or given up on it --
      * while the machine's reset or the peer's never arrived: its host
-     * resets the machine's end now, as it would the next segment it had
-     * from it. Without it a machine that neither sends nor is sent
-     * anything keeps a connection to nobody for good, as TCP does with no
-     * keepalive -- which is what it is meant to do. */
-    for e in 0..st.w.peers.tcp.eps.len() {
-        let ep = &st.w.peers.tcp.eps[e];
-        if ep.st == S::Closed && matches!(ep.reset, Some(tcpm::Reset::ByPeer) | Some(tcpm::Reset::GaveUp)) {
-            /* At the machine's own edge: what its program has read and
-             * what it holds unread is all it has taken of the stream --
-             * more than the peer knows was taken, when the machine's
-             * acknowledgements were lost. */
-            let id = ep.id;
-            let Some(k) = st.links.iter().position(|l| l.id == id) else { continue };
-            let held = st.slot(k).map_or(0, |c| c.recv_used as u64);
-            let edge = ep.iss.wrapping_add(1).wrapping_add((st.links[k].got + held) as u32);
-            let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, edge, 0, seg::RST, 0, &[], &[], Sum::Right);
-            let f = frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s);
-            st.w.net.inject(f);
-            st.links[k].fragile = true;
-        }
-    }
+     * resets the machine's end, now or when the peer gives up -- one back
+     * from away may still have retransmits to run out first. */
+    let mut told = Vec::new();
+    reset_abandoned(st, &mut told);
     /* Sixty seconds, and on for as long as the calls still waiting are
      * getting somewhere: a transfer to a peer that takes a hundred bytes
      * at a time, one retransmit a second, is slow, not stuck. */
@@ -719,6 +796,7 @@ fn wind_down(st: &mut State) {
         }
         st.w.run_for(100 * MS);
         st.harvest();
+        reset_abandoned(st, &mut told);
         let busy = st.links.iter().any(|l| l.call.is_some()) || !st.accepts.is_empty();
         if !busy {
             break;
