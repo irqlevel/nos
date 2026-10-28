@@ -1089,7 +1089,30 @@ reads out of it, byte for byte. e2fsck runs with `-E no_optimize_extents`:
 a tree wider or deeper than its file needs is the format's to allow and the
 kernel's to leave. Four levels, not the kernel's five: e2fsck 1.46.5 writes
 past a five-level array on a tree of five (the bug CVE-2022-1304's fix
-closed). The targets:
+closed).
+
+Its check (`ext4::check`) reads an image as e2fsck -fn does, after doing
+first what e2fsck does first: replaying the journal by a JBD2 reader of its
+own (`ext4::replay`), and releasing the superblock's orphans -- one of no
+links deleted, its blocks and inode free; one with links truncated to its
+size, its blocks past it free and its block count put right as it goes.
+Then the passes: every inode in use below its group's unused tail, its
+checksum and its extent tree -- each node's magic, depth, checksum, entries
+in order, every block claimed once and none of it metadata -- or its block
+map; directories, by their tails or their index blocks' own; where every
+directory hangs, its `..`; link counts; the bitmaps, their checksums and an
+uninitialised group's as its own metadata makes it, against what owns each
+block; the groups' counts. Corrupt and unclean as ext2's are; the
+superblock's free counts not judged, Linux keeping them lazily. The resize
+inode's tree of reserved descriptor blocks is left to e2fsck: nos never
+writes it. `--e2fsck` holds the check to e2fsprogs three more ways: its
+replay of each planted journal to `e2fsck -E journal_only`'s, byte for byte
+but for e2fsck's own superblock fields; mke2fs's images -- 1.46's defaults,
+1 KiB blocks with 128-byte inodes and no 64bit, metadata_csum_seed with the
+UUID changed, an htree directory, an attribute block -- clean to it, and
+every byte of their metadata e2fsck notices changed noticed by it too, thirty
+a filesystem; and orphans debugfs leaves -- deleted and truncated -- released
+to the tree `e2fsck -fy` leaves. The targets:
 
 - `part`: MBRs and GPTs of every shape -- protective and not, CRCs right
   and wrong, entry sizes and counts past sense, slots overlapping, LBAs at

@@ -14,9 +14,12 @@
 //! zeros allocated but unwritten over garbage, entries the kernel's tree
 //! does not show (long names, symlinks, device nodes).
 
+pub mod check;
 pub mod jbd2;
 pub mod mkfs;
+pub mod replay;
 
+pub use check::check;
 pub use mkfs::{mkfs, Made, Style};
 
 pub use super::ext2::{rd16, rd32, wr16, wr32};
