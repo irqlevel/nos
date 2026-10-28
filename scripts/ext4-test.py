@@ -17,19 +17,26 @@ e2fsck -D indexed, a name too long for the kernel's tree, a symlink:
     one grown past a block, files made, renamed and moved, a directory
     moved, the indexed directory given an entry (which drops its index),
     files removed, a sparse one of a thousand extents among them, and a
-    directory tree -- `find` and `crc32` must show what the changes make,
-    and again after it is unmounted and mounted read-only; after the boot
-    `e2fsck -fn` must find nothing at all in the image;
+    directory tree -- and data: the kernel's own `fstest` in a directory of
+    its own (files written and read back, holes, a file far past 4 GiB, a
+    disk's image read, written and discarded off the VFS's lock), the 5 MiB
+    file copied, text written and appended, a file grown to 5 and 6 GiB with
+    a hole and cut back to a megabyte. `find` and `crc32` must show what the
+    changes make, and again after it is unmounted and mounted read-only;
+    after the boot `e2fsck -fn` must find nothing at all in the image, and
+    debugfs's extents of the copy must map its every block, of the cut file
+    none;
   - an image whose journal debugfs left unreplayed, a transaction in it
     rewriting a block of a file: the driver must read the file as the
     replay would leave it, and write nothing -- the image's bytes are the
     same after the boot as before it;
   - then nos powers off, and nothing panicked on the way;
-  - a second boot changes names on a fresh copy of mke2fs's image and is
-    killed, never unmounted: e2fsck must replay its journal and find
-    nothing after, and Linux (a loop mount, under sudo or in the nos-builder
-    image --privileged) must replay it too, show the tree the changes make
-    and leave nothing for e2fsck.
+  - a second boot changes names and writes data on a fresh copy of mke2fs's
+    image and is killed, never unmounted: e2fsck must replay its journal
+    and find nothing after, and Linux (a loop mount, under sudo or in the
+    nos-builder image --privileged) must replay it too, show the tree the
+    changes make, every file's MD5 the bytes the model has, and leave
+    nothing for e2fsck.
 
     scripts/ext4-test.py [--tcg] [--keep]
 
@@ -216,6 +223,34 @@ class Model:
         self.files = {p: d for p, d in self.files.items() if not gone(p)}
         self.dirs = {p for p in self.dirs if not gone(p)}
 
+    def write(self, sh, top, path, text):
+        out = sh.run("write %s/%s %s" % (top, path, text))
+        self.files[path] = text.encode()
+        return out
+
+    def append(self, sh, top, path, text):
+        out = sh.run("append %s/%s %s" % (top, path, text))
+        self.files[path] = self.files.get(path, b"") + text.encode()
+        return out
+
+    def cp(self, sh, top, src, dst):
+        out = sh.run("cp %s/%s %s/%s" % (top, src, top, dst))
+        self.files[dst] = self.files[src]
+        return out
+
+    def truncate(self, sh, top, path, size, text):
+        """Cut or grow to `size` bytes, given as `text` to the shell."""
+        out = sh.run("truncate %s/%s %s" % (top, path, text))
+        data = self.files.get(path) or b""
+        # A file of gigabytes is not kept: its bytes are not read back.
+        self.files[path] = data[:size] + b"\0" * max(0, size - len(data)) if size <= 64 << 20 else None
+        return out
+
+
+def stat_size(sh, path):
+    m = re.search(r"file, (\d+) bytes", sh.run("stat %s" % path))
+    return int(m.group(1)) if m else None
+
 
 def change(sh, top, m, grow):
     """Names changed under `top`, as the model has them -- what both boots
@@ -237,6 +272,42 @@ def change(sh, top, m, grow):
     m.rm(sh, top, "sparse.bin")
     m.rm(sh, top, "made/a")
     m.rm(sh, top, "empty")
+
+
+def write_data(sh, top, m, full):
+    """A file's data written from the shell, as the model has it: the copy
+    and the text in both boots; with `full` the kernel's own fstest and the
+    file grown far past 4 GiB too. Every file the model has a size for."""
+    m.cp(sh, top, "large.bin", "made/large-copy.bin")
+    m.write(sh, top, "made/w.txt", "hello")
+    # The shell takes the text after the path's space: none of its own.
+    m.append(sh, top, "made/w.txt", "-world")
+    out = sh.run("cat %s/made/w.txt" % top)
+    pt.check("%s: text written and appended reads back" % top, "hello-world" in out, out)
+    if not full:
+        return
+    sh.run("mkdir %s/fst" % top)
+    out = sh.run("fstest %s/fst" % top)
+    pt.check("%s: fstest passes on ext4" % top, "fstest: passed" in out, out[-1500:])
+    sh.run("rm %s/fst" % top)
+    big = "made/big5"
+    m.truncate(sh, top, big, 5 << 30, "5G")
+    got5 = stat_size(sh, "%s/%s" % (top, big))
+    m.truncate(sh, top, big, 6 << 30, "6G")
+    got6 = stat_size(sh, "%s/%s" % (top, big))
+    sh.run("append %s/%s tail" % (top, big))
+    got7 = stat_size(sh, "%s/%s" % (top, big))
+    m.truncate(sh, top, big, 1 << 20, "1M")
+    got1 = stat_size(sh, "%s/%s" % (top, big))
+    pt.check("%s: a file grown to 5 and 6 GiB, written at its end and cut to 1 MiB" % top,
+             (got5, got6, got7, got1) == (5 << 30, 6 << 30, (6 << 30) + 4, 1 << 20), str((got5, got6, got7, got1)))
+
+
+def extents(tmp, img, path):
+    """The leaf extents debugfs reads of `path` in `img`: (logical, length)."""
+    code, out = e2(tmp, "debugfs", "-R", "ex %s" % path, "{}/" + img)
+    rows = re.findall(r"^\s*\d+/\s*\d+\s+\d+/\s*\d+\s+(\d+)\s*-\s*(\d+)\s+\d+\s*-\s*\d+\s+(\d+)", out, re.M)
+    return code, [(int(a), int(n)) for a, _, n in rows], out
 
 
 def held_to(sh, top, m, what):
@@ -274,9 +345,8 @@ def fsck_clean(tmp, name, what, crashed=False):
 LINUX_MOUNT = r"""set -e
 mkdir -p /tmp/m
 mount -o loop "$IMG" /tmp/m
-(cd /tmp/m && find . -mindepth 1 \( -type d -printf 'd %P
-' \) -o \( -type f -printf 'f %P
-' \)) > "$OUT"
+(cd /tmp/m && find . -mindepth 1 \( -type d -printf 'd %P\n' \) -o \( -type f -printf 'f %P\n' \)) > "$OUT"
+(cd /tmp/m && find . -type f -exec md5sum {} +) > "$OUT.md5"
 umount /tmp/m
 e2fsck -fn "$IMG"
 """
@@ -300,7 +370,12 @@ def linux_mount(tmp, name):
     r = subprocess.run(argv, capture_output=True, text=True)
     path = os.path.join(tmp, "linux.txt")
     listed = open(path).read() if os.path.exists(path) else ""
-    return r.returncode == 0, listed, (r.stdout + r.stderr)[-2000:]
+    sums = {}
+    if os.path.exists(path + ".md5"):
+        for line in open(path + ".md5", errors="surrogateescape"):
+            digest, _, name = line.rstrip("\n").partition("  ")
+            sums[name[2:] if name.startswith("./") else name] = digest
+    return r.returncode == 0, listed, sums, (r.stdout + r.stderr)[-2000:]
 
 
 def disk_named(sh, mib):
@@ -383,7 +458,8 @@ def main():
         out = sh.run("mount ext4 %s /e4" % e4)
         pt.check("mke2fs's ext4 mounted for writing", "mounted ext4 on /e4" in out and "(ro)" not in out, out)
         change(sh, "/e4", model, 150)
-        held_to(sh, "/e4", model, "names changed")
+        write_data(sh, "/e4", model, True)
+        held_to(sh, "/e4", model, "names and data changed")
         out = sh.run("mounts")
         pt.check("mounts shows its journal", re.search(r"journal=\d+/\d+ seq=\d+", out) is not None, out)
         out = sh.run("umount /e4")
@@ -420,6 +496,12 @@ def main():
     text = open(log, errors="replace").read()
     pt.check("nothing panicked, the way down included", "PANIC" not in text, text[-2000:])
     fsck_clean(tmp, "ext4.img", "the image the driver wrote and unmounted")
+    code, ext, out = extents(tmp, "ext4.img", "/made/large-copy.bin")
+    blocks = len(files["large.bin"]) // 4096
+    pt.check("debugfs's extents of the copy map its %d blocks, in order" % blocks,
+             code == 0 and sum(n for _, n in ext) == blocks and [a for a, _ in ext] == sorted(a for a, _ in ext), out)
+    code, ext, out = extents(tmp, "ext4.img", "/made/big5")
+    pt.check("debugfs's extents of the file cut back to its hole: none", code == 0 and not ext, out)
 
     # The second boot: names changed, and the machine killed under them.
     klog = os.path.join(tmp, "kill.log")
@@ -433,6 +515,7 @@ def main():
             if pt.check("mke2fs's ext4 mounted for writing, again",
                         "mounted ext4 on /k4" in out and "(ro)" not in out, out):
                 change(sh, "/k4", killed, 40)
+                write_data(sh, "/k4", killed, False)
                 held_to(sh, "/k4", killed, "before the kill")
     finally:
         if p.poll() is None:
@@ -450,9 +533,14 @@ def main():
     if linux is None:
         print("SKIP: Linux's loop mount of the killed image (neither sudo nor docker)")
     else:
-        ok, listed, said = linux
+        ok, listed, sums, said = linux
         pt.check("the killed image: Linux mounts it, replaying its journal, and e2fsck finds nothing after",
                  ok, said)
+        want_sums = {p: hashlib.md5(d).hexdigest() for p, d in killed.files.items() if d is not None}
+        want_sums["n" * 70] = hashlib.md5(b"hidden by its name\n").hexdigest()
+        wrong = sorted(p for p, d in want_sums.items() if sums.get(p) != d)
+        pt.check("the killed image: every file Linux reads holds the bytes the model has", not wrong,
+                 "%d of %d differ: %s" % (len(wrong), len(want_sums), wrong[:5]))
         dirs = {line[2:] for line in listed.splitlines() if line.startswith("d ")}
         dirs = {d for d in dirs if d != "lost+found" and not d.startswith("lost+found/")}
         seen = {line[2:] for line in listed.splitlines() if line.startswith("f ")}

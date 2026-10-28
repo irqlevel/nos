@@ -16,7 +16,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use extfmt::features::ro_compat;
 use extfmt::group::{self, Desc, DescMut};
+use extfmt::sb::Super;
 use extfmt::{dir, extent, inode as xinode, xattr};
 use kcore::trace;
 
@@ -26,10 +28,11 @@ use super::journal::{Journal, Overlay};
 use super::meta::Meta;
 use super::source::{read_block, Source};
 
-/// What a changed block is, which says what checksum it carries. The
-/// superblock is never one yet: nothing a call does so far changes it.
+/// What a changed block is, which says what checksum it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind {
+    /// The superblock's block: a feature set when a file first needs it.
+    Super,
     Gdt,
     BlockBitmap(u64),
     InodeBitmap(u64),
@@ -169,6 +172,23 @@ impl<'a> Txn<'a> {
         super::source::inode(self, ino)
     }
 
+    /// The superblock saying a file may be 2 GiB or more (large_file), as
+    /// e2fsck wants of a filesystem that has one -- in this transaction,
+    /// with the file that first needs it.
+    pub fn large_file(&mut self) -> bool {
+        if self.m.sb.ro_compat() & ro_compat::LARGE_FILE != 0 {
+            return true;
+        }
+        let (b, at) = (self.m.sb_block(), self.m.sb_at());
+        let Some(blk) = self.modify(b, Kind::Super) else { return false };
+        let Ok(mut s) = Super::parse(&blk[at..at + extfmt::sb::SIZE]) else { return false };
+        let features = s.ro_compat() | ro_compat::LARGE_FILE;
+        s.set_ro_compat(features);
+        blk[at..at + extfmt::sb::SIZE].copy_from_slice(s.raw());
+        trace!(1, "ext4: a file of 2 GiB or more: large_file set");
+        true
+    }
+
     /// Put on every block the checksum its kind says it carries: the
     /// bitmaps' into their descriptors first, then the descriptors' own,
     /// then every other block's. False, and the
@@ -200,9 +220,18 @@ impl<'a> Txn<'a> {
         }
         let (bs, ds, groups, gdt_first, fs_seed) = (self.m.bs, self.m.desc_size, self.m.groups, self.m.gdt_first(),
             self.m.seed);
+        let (sb_block, sb_at) = (self.m.sb_block(), self.m.sb_at());
         let sb = self.m.sb.clone();
         for (&b, d) in self.dirty.iter_mut() {
             let ok = match d.kind {
+                Kind::Super => b == sb_block && match Super::parse(&d.data[sb_at..sb_at + extfmt::sb::SIZE]) {
+                    Ok(mut s) => {
+                        s.set_checksum();
+                        d.data[sb_at..sb_at + extfmt::sb::SIZE].copy_from_slice(s.raw());
+                        true
+                    }
+                    Err(_) => false,
+                },
                 Kind::Gdt => {
                     let first = (b - gdt_first) * (bs / ds) as u64;
                     for k in 0..bs / ds {

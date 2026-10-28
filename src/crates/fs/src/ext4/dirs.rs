@@ -157,7 +157,9 @@ impl Txn<'_> {
                 }
                 let size = Inode::new(&raw).map_or(0, |i| i.size(self.m.largedir()));
                 inode::set_size(&mut raw, size + bs as u64);
-                inode::add_blocks(self.m, &mut raw, 1);
+                if !inode::add_blocks(self.m, &mut raw, 1) {
+                    return false;
+                }
             }
         }
         inode::touch(&mut raw, now, true);

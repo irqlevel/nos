@@ -1,6 +1,8 @@
 //! ext4: the format through extfmt, every checksum on what is read held to
 //! the one it should be -- and metadata written only through the journal,
-//! one transaction a call (txn.rs, journal.rs). A mount that only reads
+//! one transaction a call, or a few hundred blocks of a write's data
+//! (txn.rs, journal.rs, data.rs), the data before the commit that maps it,
+//! as data=ordered has it. A mount that only reads
 //! writes nothing: a journal nobody replayed is read through, not replayed.
 //! A mount that writes replays it first, says the filesystem needs
 //! recovery before anything else is written, and clears that only at a
@@ -14,11 +16,11 @@
 //! linear one it also is, its index blocks checked by their own tails.
 //! Names of 64 bytes or more, symlinks and device nodes are left out of
 //! the tree, as ext2 leaves them -- and a directory holding any is never
-//! removed. What is written so far: names -- files and directories made,
-//! renamed, removed; a file's data is the next step.
+//! removed.
 
 mod bitmaps;
 mod cache;
+mod data;
 mod dirs;
 mod extents;
 mod inodes;
@@ -786,20 +788,12 @@ impl FileSystem for Ext4 {
         Ext4::read(self, file, buf, offset)
     }
 
-    /// Not yet: a file's data is the step after names.
-    fn write(&mut self, _file: NodeId, _data: &[u8], _offset: usize) -> bool {
-        trace!(0, "ext4: a file's data is not written yet");
-        false
+    fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        Ext4::write(self, file, data, offset)
     }
 
-    /// Only to the size the file has: cutting or growing one is the step
-    /// after names.
     fn truncate(&mut self, file: NodeId, size: usize) -> bool {
-        if self.tree.get(file).is_some_and(|n| n.is_file() && n.size == size) {
-            return true;
-        }
-        trace!(0, "ext4: a file's size is not changed yet");
-        false
+        Ext4::truncate(self, file, size)
     }
 
     fn rename(&mut self, node: NodeId, dir: NodeId, name: &[u8]) -> bool {
@@ -814,9 +808,9 @@ impl FileSystem for Ext4 {
         Ext4::sync(self)
     }
 
-    /// What extents number: 2^32 blocks.
+    /// What extents number: 2^32 - 1 blocks.
     fn sparse_max(&self) -> usize {
-        if self.mounted { usize::try_from((1u64 << 32) * self.io.bs as u64).unwrap_or(usize::MAX) } else { 0 }
+        if self.mounted { usize::try_from(self.max_size()).unwrap_or(usize::MAX) } else { 0 }
     }
 
     /// The filesystem's blocks, read off the VFS's lock by an image -- but
@@ -827,6 +821,10 @@ impl FileSystem for Ext4 {
 
     fn map_blocks(&mut self, file: NodeId, first: u64, out: &mut [u64]) -> bool {
         Ext4::map_blocks(self, file, first, out)
+    }
+
+    fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
+        Ext4::punch(self, file, first, count)
     }
 }
 
