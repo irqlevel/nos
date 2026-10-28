@@ -1225,7 +1225,13 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   held to a model of the tree and the files open on it (`targets/fsops.rs`,
   the VFS's rules and the filesystem's limits written down), the tree read
   back through the VFS held to the model's, the image a clean unmount
-  leaves clean and holding the model's tree, and mounted again, the same. A
+  leaves clean and holding the model's tree, and mounted again, the same;
+  what ext2 says it has room for (`Vfs::space_of`) held, before that
+  unmount and after the mount again, to the blocks its bitmaps leave free.
+  A file held as a disk's image is walked for where it has data
+  (`Image::extent`), a call at a time to its end: what a call says is holes
+  must be zeros in the model, so that a VM's disk cloned with its holes left
+  out loses nothing -- and the walk goes forward, inside the file. A
   call the filesystem refused for want of room is held to having changed
   nothing -- a write to having left the file its size, a first part of the
   new data in it at most -- and now and then the filesystem is filled to its

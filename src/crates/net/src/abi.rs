@@ -251,21 +251,22 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
 
 /// A download, for a module: what `url` answers with, by HTTP or HTTPS, in a
 /// new file at `path`, through the image's own client -- TLS, and the bulk
-/// receive window `kernel_tcp_connect` does not give -- its progress printed
-/// on `out` (`wget::fetch`). The body's length, or an `HTTP_FETCH_` code.
+/// receive window `kernel_tcp_connect` does not give -- `progress` called
+/// with `ctx` as the body comes, and stopping it when it answers false
+/// (`wget::fetch`). The body's length, or an `HTTP_FETCH_` code.
 ///
 /// # Safety
-/// `url` and `path` point at `url_len` and `path_len` bytes, and `out` is
-/// the printer a command handler or a module's init was given, live for the
-/// call.
+/// `url` and `path` point at `url_len` and `path_len` bytes, and `progress`
+/// may be called with `ctx` until this returns.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_http_fetch(
-    url: *const u8, url_len: usize, path: *const u8, path_len: usize, out: *mut core::ffi::c_void,
+    url: *const u8, url_len: usize, path: *const u8, path_len: usize, progress: ffi::http::HttpProgress,
+    ctx: *mut core::ffi::c_void,
 ) -> i64 {
     use ffi::http::*;
     use crate::wget::Fetch;
 
-    if url.is_null() || path.is_null() || out.is_null() {
+    if url.is_null() || path.is_null() {
         return HTTP_FETCH_URL;
     }
     let url = unsafe { core::slice::from_raw_parts(url, url_len) };
@@ -273,8 +274,9 @@ pub unsafe extern "C" fn kernel_http_fetch(
     let (Ok(url), Ok(path)) = (core::str::from_utf8(url), core::str::from_utf8(path)) else {
         return HTTP_FETCH_URL;
     };
-    let mut out = unsafe { kcore::cmd::Output::from_raw(out) };
-    match crate::wget::fetch(url, path, "download", &mut out) {
+    /* The caller's to be called with its `ctx` until this returns */
+    let mut watch = |done: u64, total: u64| unsafe { progress(ctx, done, total) };
+    match crate::wget::fetch(url, path, &mut watch) {
         Ok(len) => i64::try_from(len).unwrap_or(i64::MAX),
         Err(Fetch::Url) => HTTP_FETCH_URL,
         Err(Fetch::Resolve) => HTTP_FETCH_RESOLVE,
@@ -288,6 +290,7 @@ pub unsafe extern "C" fn kernel_http_fetch(
         Err(Fetch::Create) => HTTP_FETCH_CREATE,
         Err(Fetch::Write) => HTTP_FETCH_WRITE,
         Err(Fetch::Cut) => HTTP_FETCH_CUT,
+        Err(Fetch::Cancelled) => HTTP_FETCH_CANCELLED,
         Err(Fetch::Status(status)) => HTTP_FETCH_STATUS - i64::from(status),
     }
 }

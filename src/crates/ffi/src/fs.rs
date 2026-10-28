@@ -32,6 +32,11 @@ unsafe extern "C" {
     /// Removes the file -- and the next content a replace of it left, if it
     /// left one: 0 once neither is there, -1 when nothing was.
     pub fn kernel_file_remove(path: *const u8, path_len: usize) -> i32;
+    /// The space of the filesystem the path is on, there yet or not: the
+    /// bytes a file's data may take into out[0], those of them free into
+    /// out[1] -- 0, or -1 when no mount holds it or its filesystem does not
+    /// say.
+    pub fn kernel_fs_space(path: *const u8, path_len: usize, out: *mut u64) -> i32;
 }
 
 /* A file held open -- a guest's disk image, for as long as the guest runs:
@@ -88,6 +93,11 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, all of them inside the image, which
     /// never grows: 0, or -1. Not synced.
     pub fn kernel_image_write(image: usize, offset: u64, data: *const u8, len: usize) -> i32;
+    /// Where the image has data from `offset` on: its first byte into
+    /// out[0], holes before it, and the end of its run into out[1] -- the
+    /// two the same where the blocks looked at, a few thousand at most, are
+    /// all holes: 0, or -1.
+    pub fn kernel_image_extent(image: usize, offset: u64, out: *mut u64) -> i32;
     /// The whole blocks inside `len` bytes from `offset` given back to the
     /// filesystem -- holes, reading as zeros: 0, or -1.
     pub safe fn kernel_image_discard(image: usize, offset: u64, len: u64) -> i32;
