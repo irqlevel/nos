@@ -2136,8 +2136,14 @@ addresses only on their switch; a forward listens on a port of nos's and,
 for each connection, opens one to the guest's port through `hv0`
 (`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
 task of its own. The kernel has 64 TCP connections and a forwarded one takes
-two, so a forward carries eight at once and refuses the rest. The other way,
-the guests reach the world through NAT (next).
+two, so a forward carries eight at once and refuses the rest. Its listener is
+a bulk one (`TcpListener::bind_bulk`): a connection it accepts has buffers of
+up to 512 KiB each way and scales its window, where a connection's own 8 KiB
+would hold a client 62 ms away -- the EX44 from a desk in another country --
+to 120 KiB/s, whatever the line; and while bytes move, its relay waits a
+millisecond on the side that has nothing rather than five, which held a
+download to 4 KiB a round. The other way, the guests reach the world through
+NAT (next).
 
 ### The way out: NAT, DHCP and DNS
 

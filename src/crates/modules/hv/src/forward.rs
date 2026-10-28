@@ -231,7 +231,10 @@ impl Forwards {
         if taken {
             return Err(alloc::format!("port {} is forwarded already", port));
         }
-        let listener = TcpListener::bind(&public, port, LISTEN_BACKLOG)
+        /* Bulk: a forwarded port carries a guest's downloads and uploads to
+         * the other end of a long round trip, which the 8 KiB of a small
+         * connection held to 120 KiB/s at the EX44's 62 ms */
+        let listener = TcpListener::bind_bulk(&public, port, LISTEN_BACKLOG)
             .map_err(|e| alloc::format!("port {} would not listen -- {}", port, e))?;
         let relays = Mutex::new(Vec::new()).ok_or_else(|| String::from("out of memory"))?;
         let shared = Arc::new(Shared {

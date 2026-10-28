@@ -56,10 +56,23 @@ impl TcpListener {
     /// the whole kernel has, so a server that accepts few at a time asks for
     /// few, and a flood of SYNs at its port costs the kernel no more.
     pub fn bind(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
+        Self::listen(nic, port, backlog, false)
+    }
+
+    /// `bind`, each connection it accepts given bulk buffers both ways --
+    /// up to 512 KiB each, from the heap, as it is accepted, its window
+    /// scaled when the peer offers to: what a relay carrying downloads over
+    /// a long round trip needs, which 8 KiB a round trip holds to 130 KiB/s
+    /// at 62 ms. The slot's own 8 KiB when the heap has none to give.
+    pub fn bind_bulk(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
+        Self::listen(nic, port, backlog, true)
+    }
+
+    fn listen(nic: &Nic, port: u16, backlog: usize, bulk: bool) -> Result<Self> {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = tcp::kernel_tcp_listen(nic.handle(), port, backlog);
+        let conn = tcp::kernel_tcp_listen(nic.handle(), port, backlog, bulk);
         if conn.is_null() {
             Err(Error::Busy)
         } else {

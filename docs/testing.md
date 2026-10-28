@@ -1035,10 +1035,13 @@ own, TCP's flags in combinations that mean something. The targets:
   and does what peers do: retransmits, probes a zero window, resets, goes
   quiet; and an attacker off the path injecting segments at every sequence
   number, an ICMP error at every quoted one. The machine's connects are
-  plain or bulk, and the peer scales its window or not, at any shift -- past
-  RFC 7323's 14 too -- so that the window the machine offers runs past 64
-  KiB and must never shrink, not even by the rounding of its units, and what
-  the link reorders is kept past a hole and taken in when it fills; and a
+  plain or bulk, and so is one of its listeners, and the peer scales its
+  window or not, at any shift -- past RFC 7323's 14 too -- so that the
+  window the machine offers runs past 64 KiB and must never shrink, not even
+  by the rounding of its units, and what the link reorders is kept past a
+  hole and taken in when it fills; the link loses the machine's own data, a
+  little or a lot, for its sender's recovery -- fast retransmit, NewReno,
+  a timeout's slow start -- to fill every hole and keep every byte; and a
   blind reset in the window, past the edge of everything the peer sent, must
   change nothing (RFC 5961). And now and then a second
   device, eth1, standing for the hypervisor's switch, from which a guest

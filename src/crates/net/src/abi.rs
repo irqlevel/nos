@@ -211,9 +211,10 @@ pub unsafe extern "C" fn kernel_tcp_recv(
 /// accepted and the listener. `dev` is a `kernel_net_find` handle; `backlog`
 /// is how many connections nobody has accepted yet the listener holds at
 /// most, taken into 1..=16 -- past them a SYN is dropped and its peer tries
-/// again.
+/// again; `bulk`, that each connection it accepts is given bulk buffers both
+/// ways (`tcp::Buffers::Bulk`): a relay's.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize) -> ConnPtr {
+pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk: bool) -> ConnPtr {
     if dev == 0 || port == 0 {
         return core::ptr::null_mut();
     }
@@ -221,7 +222,8 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize) -> Co
         Some(nic) => nic,
         None => return core::ptr::null_mut(),
     };
-    match TCP.listen_with(&nic, port, backlog) {
+    let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
+    match TCP.listen_with(&nic, port, backlog, buffers) {
         Some(conn) => conn as *const Conn as ConnPtr,
         None => core::ptr::null_mut(),
     }
