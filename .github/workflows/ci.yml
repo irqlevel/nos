@@ -131,6 +131,16 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/fs-fuzz.py
 
+      # A judge wrong about the format holds every driver to the wrong
+      # thing, and agrees with it: the images the fuzzer's judges make and
+      # call clean, and the power cuts they call unclean, held to e2fsck --
+      # an ext4 image's every file to what debugfs reads out of it.
+      - name: Storage fuzz judges against e2fsprogs (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/fs-fuzz.py --e2fsck
+
       # Everything the network hands the kernel is somebody else's to choose,
       # and a panic, a lock broken or a spin there is anyone's to cause: the
       # network layer, TLS and sshd fuzzed on the host, the same inputs every

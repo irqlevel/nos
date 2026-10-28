@@ -1062,9 +1062,33 @@ bitmaps and every count -- and sorts what it finds into *corrupt* (what no
 crash of a correct driver may leave: a block in use and free, a block two
 inodes hold, a name leading to an inode not in use) and *unclean* (what
 e2fsck still fixes: a leak, a count, a link count, the state bit). The two
-were checked against e2fsprogs over hundreds of images (`FS_FUZZ_DUMP=<dir>`
-writes each image judged): what `check` calls clean, e2fsck passes; what
-e2fsck faults, `check` calls unclean or corrupt. The targets:
+are held to e2fsprogs by `fs-fuzz.py --e2fsck` (in CI on the x86-64 leg;
+`FS_FUZZ_DUMP=<dir>` writes each image judged): what `check` calls clean,
+e2fsck passes; what it calls unclean for more than the state bit, e2fsck
+faults.
+
+ext4's judge (`fuzz/fs/src/image/ext4/`) is the fuzzer's own as ext2's is,
+sharing nothing with `extfmt` -- `fs-fuzz.py` refuses to run if a judge uses
+it. Its mkfs makes what the ext4 driver is to read and write: blocks of 1, 2
+and 4 KiB, 32- and 64-byte descriptors, flex_bg or not, metadata_csum seeded
+by the UUID or by the superblock's own seed (the UUID changed after), every
+checksum on every block, groups that hold nothing left uninitialised with
+noise where nothing was written, files in extent trees up to four levels
+deep -- deeper than their files need, at times -- with runs of zeros
+allocated as unwritten extents over noise, which must read as zeros, entries
+the kernel's tree leaves out (names of 64 bytes or more, fast and slow
+symlinks, a device node), and a journal: clean, or holding the newest copies
+of some metadata blocks in transactions nobody replayed, their homes given
+noise -- with a noise copy of a block a later transaction revokes, and a
+last transaction never committed, both of which a replay must leave alone.
+The `ext4mkfs` target makes such images, and `--e2fsck` holds each to
+e2fsprogs: clean by `e2fsck -fn` (its journal replayed by `-E journal_only`
+first), and every directory and file of its tree in what `debugfs rdump`
+reads out of it, byte for byte. e2fsck runs with `-E no_optimize_extents`:
+a tree wider or deeper than its file needs is the format's to allow and the
+kernel's to leave. Four levels, not the kernel's five: e2fsck 1.46.5 writes
+past a five-level array on a tree of five (the bug CVE-2022-1304's fix
+closed). The targets:
 
 - `part`: MBRs and GPTs of every shape -- protective and not, CRCs right
   and wrong, entry sizes and counts past sense, slots overlapping, LBAs at
