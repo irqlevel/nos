@@ -337,6 +337,12 @@ impl Shared {
         self.running.load(Ordering::Acquire)
     }
 
+    /// How it ended last, copied out: printed after, with the lock free for
+    /// its task -- a VM that restarts writes the next one there.
+    fn reason_copy(&self) -> String {
+        self.reason.lock().clone()
+    }
+
     /// Press its power button, when it is running: the first CPU's loop
     /// takes the press, woken to it now. Whether it was pressed.
     fn press(&self) -> bool {
@@ -801,6 +807,20 @@ struct Vm {
     log: Option<Log>,
 }
 
+/// A VM as `hv list` shows it, copied out of the table under its lock: what
+/// is printed goes to whoever asked -- an SSH session that may be slow to
+/// take it -- with the lock free meanwhile for every start and stop. Its
+/// counters are the guest's own, read live after.
+struct VmView {
+    shared: Arc<Shared>,
+    cpus: Vec<u32>,
+    disk_cpu: Option<u32>,
+    kernel: String,
+    mem_mib: u64,
+    port: Option<usize>,
+    name: Option<String>,
+}
+
 struct Table {
     next: u32,
     vms: Vec<Vm>,
@@ -1253,14 +1273,40 @@ impl Vms {
     }
 
     /// `hv list`.
+    /// Every VM on the list as it is now, copied out of the table under its
+    /// lock; None when there was no memory for the copy.
+    fn snapshot(&self) -> Option<Vec<VmView>> {
+        let table = self.table.lock();
+        let mut views = Vec::new();
+        views.try_reserve_exact(table.vms.len()).ok()?;
+        for vm in &table.vms {
+            views.push(VmView {
+                shared: vm.shared.clone(),
+                cpus: vm.cpus.clone(),
+                disk_cpu: vm.disk_cpu,
+                kernel: vm.kernel.clone(),
+                mem_mib: vm.mem_mib,
+                port: vm.port,
+                name: vm.name.clone(),
+            });
+        }
+        Some(views)
+    }
+
     pub fn list(&self, out: &mut Output) {
         let now = kcore::time::boot_time_ns();
-        let table = self.table.lock();
-        if table.vms.is_empty() {
+        let Some(views) = self.snapshot() else {
+            let _ = writeln!(out, "hv: out of memory");
+            return;
+        };
+        if views.is_empty() {
             let _ = writeln!(out, "hv: no vms");
             return;
         }
-        for vm in &table.vms {
+        /* The switch out of its lock too: its counters are atomics, its
+         * networks under a lock of its own. */
+        let switch = self.switch.lock().clone();
+        for vm in &views {
             let s = &vm.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
@@ -1284,7 +1330,7 @@ impl Vms {
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
-                match self.switch.lock().as_ref().and_then(|s| s.network_of(port)) {
+                match switch.as_ref().and_then(|s| s.network_of(port)) {
                     Some(network) => {
                         let _ = write!(out, " on {}", network);
                     }
@@ -1293,7 +1339,7 @@ impl Vms {
                     }
                 }
             }
-            let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
+            let lost = vm.port.and_then(|p| switch.as_ref().map(|s| s.counts(p))).unwrap_or_default();
             if lost.dropped != 0 {
                 let _ = write!(out, "  {} frames dropped for it", lost.dropped);
             }
@@ -1317,12 +1363,11 @@ impl Vms {
             let _ = write!(out, "  exits {}  irq {}  hlt {}  kicks {}  {}",
                 exits, irq, hlt, s.doorbells.kicks(), vm.kernel);
             if !running {
-                let _ = write!(out, "  -- {}", *s.reason.lock());
+                let _ = write!(out, "  -- {}", s.reason_copy());
             }
             let _ = writeln!(out);
         }
-        drop(table);
-        if let Some(s) = self.switch.lock().as_ref() {
+        if let Some(s) = switch.as_ref() {
             let (to_host, refused, dhcp, foreign) = s.host_counts();
             let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers, \
                                    {} of nothing the switch carries (dropped)",
@@ -1573,7 +1618,7 @@ impl Vms {
             }
             if !running {
                 let _ = writeln!(out, "hv: vm {} stopped without printing \"{}\" -- {}",
-                                 shared.id, text, *shared.reason.lock());
+                                 shared.id, text, shared.reason_copy());
                 return;
             }
             if kcore::time::boot_time_ns().saturating_sub(start) >= secs * NS_PER_SEC {
@@ -1697,7 +1742,7 @@ impl Vms {
             /* Taken up, and not running: its build failed, or it was
              * stopped meanwhile -- the reason says which. */
             if !shared.reset.load(Ordering::Acquire) && !shared.running() {
-                let _ = writeln!(out, "hv: vm {} not restarted -- {}", shared.id, *shared.reason.lock());
+                let _ = writeln!(out, "hv: vm {} not restarted -- {}", shared.id, shared.reason_copy());
                 return;
             }
             if kcore::time::boot_time_ns() >= deadline {
@@ -1739,15 +1784,10 @@ impl Vms {
         };
         /* On the list while its power button has its time: its CPUs are
          * still in use, and an unload has to see it. */
-        let shared = {
-            let table = self.table.lock();
-            match table.vms.iter().find(|vm| vm.shared.id == id) {
-                Some(vm) => vm.shared.clone(),
-                None => {
-                    let _ = writeln!(out, "hv: no vm {}", id);
-                    return;
-                }
-            }
+        let shared = self.table.lock().vms.iter().find(|vm| vm.shared.id == id).map(|vm| vm.shared.clone());
+        let Some(shared) = shared else {
+            let _ = writeln!(out, "hv: no vm {}", id);
+            return;
         };
         if shared.stopping.swap(true, Ordering::AcqRel) {
             let _ = writeln!(out, "hv: vm {} is being stopped already", id);

@@ -55,6 +55,8 @@ mod image;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(target_arch = "x86_64")]
+mod relay;
+#[cfg(target_arch = "x86_64")]
 mod store;
 #[cfg(target_arch = "x86_64")]
 mod vmlog;

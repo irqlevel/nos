@@ -180,9 +180,10 @@ can.
   the internet is knocked on all day, and what knocks must not crowd out the
   login that matters. A connection past either is reset at once, as is one
   that ends without a login: closed the usual way, the side that closes first
-  keeps a TCP slot through a minute of TIME-WAIT, and the kernel has 64. A
-  listener holds at most 16 connections nobody has accepted yet, so a flood
-  of SYNs costs the pool those and no more.
+  keeps a TCP slot through a minute of TIME-WAIT, and the kernel has 64.
+  sshd's listener holds at most 8 connections nobody has accepted yet (its
+  backlog, which every listener now asks for -- 16 at most, 4 for an `hv
+  forward`), so a flood of SYNs costs the pool those and no more.
 - 30 seconds from the connection to a login, rekeys included, and 6 failed
   attempts.
 - A client quiet for 60 seconds is asked whether it is still there

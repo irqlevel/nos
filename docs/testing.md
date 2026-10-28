@@ -621,6 +621,21 @@ its strings full of quotes, backslashes, control characters and characters
 past ASCII -- comes back from its own rendering whole, and that rendering
 cut, spliced and scribbled on is still read without a panic. A control run
 with backslashes left unescaped was found at the 4th input.
+`relay` holds `hv forward`'s relay (`modules/hv/src/relay.rs`) between two
+sides a script drives (`fuzz/hv/src/relaymodel.rs`): what each sends and
+when, a window shut for a while and open again, a side that ends or goes, a
+clock that jumps, a stop. Every byte one side sent reaches the other in
+order, once, and nothing else does; a side is read from only while the
+relay holds none of its bytes, and then every round -- so a direction whose
+receiver has no room never holds the other back; an end ends the relay at
+once, a stop within a round; and a direction that has moved nothing for the
+stall time ends it the moment it is offered and taken nothing, never
+before. Eleven mutants -- the `send_all` it had before (a send waited on
+until there is room, which kept a relay to a client that stopped reading,
+and every join of it, for good), the stall check gone, early or late,
+progress not timed, a read with bytes held, the stop, an end or a gone
+side ignored, a partial send taken whole, one direction drained before the
+other -- each failed within the first 40 inputs.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)
 to a model of its own (`fuzz/hv/src/placemodel.rs`), over hosts made up an
 input -- one, two or four threads a core, caches shared by one to sixteen

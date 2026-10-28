@@ -49,11 +49,17 @@ impl TcpListener {
     /// device, so a guest behind the hypervisor's switch does not reach a
     /// server on eth0. Busy when someone listens on the port already, or
     /// every connection slot the kernel has is taken.
-    pub fn bind(nic: &Nic, port: u16) -> Result<Self> {
+    ///
+    /// `backlog` is how many connections nobody has accepted yet it holds
+    /// at most (taken into 1..=16): past them a SYN is dropped, and its peer
+    /// tries again a second later. Each is one of the 64 connection slots
+    /// the whole kernel has, so a server that accepts few at a time asks for
+    /// few, and a flood of SYNs at its port costs the kernel no more.
+    pub fn bind(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = tcp::kernel_tcp_listen(nic.handle(), port);
+        let conn = tcp::kernel_tcp_listen(nic.handle(), port, backlog);
         if conn.is_null() {
             Err(Error::Busy)
         } else {
