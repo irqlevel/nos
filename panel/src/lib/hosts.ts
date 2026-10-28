@@ -2,8 +2,9 @@
 // their API's address and key. The panel is one client to all of them --
 // its certificate and key, made by nos for the host it was made on and
 // handed to it in its seed -- and each host lets it in by its key's
-// fingerprint, which `api client add panel <fingerprint> role=admin` puts in
-// that host's list. Each host's own key is pinned as it is added.
+// fingerprint, which `api client add panel-<its first 8 digits> admin
+// <fingerprint>` puts in that host's list (`panel` is that host's own
+// panel's, where it has one). Each host's own key is pinned as it is added.
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';

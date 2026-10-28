@@ -171,7 +171,7 @@ fn check_ui(ui: &Value) -> Result<(), DescriptorError> {
 
 fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
     let Some(members) = m.as_object() else { return refuse("methods", "are objects") };
-    only(members, &["kind", "title", "help", "confirm", "params", "result"], "methods")?;
+    only(members, &["kind", "title", "help", "confirm", "confirm_typed", "params", "result"], "methods")?;
     if m.get("kind").and_then(Value::as_str) != Some(kind) {
         return refuse("methods.kind", "is the kind the method is registered as");
     }
@@ -182,6 +182,22 @@ fn check_method(m: &Value, kind: &str) -> Result<(), DescriptorError> {
             return refuse("methods.confirm", "is for what changes something, not a read");
         }
         text_of(Some(confirm), "methods.confirm")?;
+    }
+    if let Some(typed) = m.get("confirm_typed") {
+        /* The parameter whose value the client has typed again before it
+         * calls -- a pool's name before it is destroyed: one the call is
+         * always given, a string, asked with the confirm */
+        let Some(name) = typed.as_str() else { return refuse("methods.confirm_typed", "names a parameter") };
+        if m.get("confirm").is_none() {
+            return refuse("methods.confirm_typed", "goes with a confirm");
+        }
+        let field = m.get("params").and_then(|p| p.get(name));
+        let typed_ok = field.is_some_and(|f| {
+            f.get("type").and_then(Value::as_str) == Some("string") && f.get("required").and_then(Value::as_bool) == Some(true)
+        });
+        if !typed_ok {
+            return refuse("methods.confirm_typed", "names a parameter of the method's that is a string, required");
+        }
     }
     if let Some(params) = m.get("params") {
         let Some(params) = params.as_object() else { return refuse("methods.params", "is an object") };

@@ -44,12 +44,43 @@ PANEL_SEED=/tmp/nos-seed.json PANEL_DATA=/tmp/nos-panel npx next dev -p 3100
 and log in at http://localhost:3100 as `root`. `nosctl` works against the
 mock too: its keys are in the state folder, and it prints the host key.
 
+A second host, for the Hosts page: another state folder is another host,
+`--name` names it, and `--trust` lets the panel's key in -- the first
+mock's admin's, which the seed made of it -- as `api client add` would on a
+second nos:
+
+```
+node mock/server.mjs --port 39300 --state /tmp/nos-mock-b --name nos-b --trust /tmp/nos-mock/admin.crt &
+```
+
+then add it on the Hosts page by `127.0.0.1:39300` and the key it prints.
+
+## More hosts
+
+The panel manages every host added on its Hosts page by its API's address
+and key, each its own dashboard, pages and history; the panel is one client
+of all of them, by the key its seed gave it. On a host to add:
+
+```
+api client add panel-3fe5cf7a admin 3fe5cf7a...   # what the Hosts page prints: the panel's key
+edit /etc/api/api.toml                            # listen = ["hv0", "eth0"], allow_eth0 = [<the panel's host's address>]
+api stop; api start
+api status                                        # the host's key, which the panel pins
+```
+
+The panel's VM reaches another host from its own host's address, through
+hv's NAT -- the address to let in on eth0. `panel` is that host's own
+panel's name, where it has one; the panel's is `panel-` and its key's first
+digits.
+
 ## Tests
 
 `npx playwright test` builds nothing itself: `npm run build` first. It
 starts the mock and the panel (`playwright.config.ts`) and drives a browser
 through the login, the dashboard, the providers' pages in both languages, a
-VM made, cloned and deleted as jobs, a protected one's delete refused, a
-console typed at, the theme and the language. `npm run typecheck` is the
+VM made, cloned and deleted as jobs -- its name typed again before it goes
+-- a protected one's delete refused, a console typed at, a second host
+added and reached by the panel's key while one showing another key is not,
+the theme and the language. `npm run typecheck` is the
 translations' gate: the Russian dictionary is the English one's shape.
 CI runs all of it (`.github/workflows/panel.yml`).

@@ -18,8 +18,9 @@ const BASE: &str = r#"{"schema": 1, "provider": "demo",
   "list": {"kind": "read", "title": {"en": "List", "ru": "Список"}},
   "get": {"kind": "read", "title": {"en": "Get", "ru": "Получить"}, "result": "thing",
     "params": {"name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}}}},
-  "make": {"kind": "action", "title": {"en": "Make", "ru": "Создать"}, "confirm": {"en": "Sure?", "ru": "Точно?"},
-    "params": {"size": {"type": "bytes", "min": 1, "max": 100, "unit": "B", "default": 10, "title": {"en": "Size", "ru": "Размер"}},
+  "make": {"kind": "action", "title": {"en": "Make", "ru": "Создать"}, "confirm": {"en": "Sure?", "ru": "Точно?"}, "confirm_typed": "label",
+    "params": {"label": {"type": "string", "required": true, "title": {"en": "Label", "ru": "Метка"}},
+               "size": {"type": "bytes", "min": 1, "max": 100, "unit": "B", "default": 10, "title": {"en": "Size", "ru": "Размер"}},
                "mode": {"type": "enum", "title": {"en": "Mode", "ru": "Режим"}, "values": {"a": {"en": "A", "ru": "А"}}},
                "tags": {"type": "list", "of": "string", "title": {"en": "Tags", "ru": "Метки"}}}},
   "drop": {"kind": "job", "title": {"en": "Drop", "ru": "Удалить"}}
@@ -39,7 +40,7 @@ const METHODS: [(&str, &str); 4] = [("list", "read"), ("get", "read"), ("make", 
 
 /// Each defect, as what in BASE becomes what: the descriptor it makes must
 /// be refused.
-const DEFECTS: [(&str, &str, &str); 31] = [
+const DEFECTS: [(&str, &str, &str); 35] = [
     ("another schema", r#""schema": 1"#, r#""schema": 2"#),
     ("a text without a language", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo"}"#),
     ("a text in a language more", r#""title": {"en": "Demo", "ru": "Демо"}"#, r#""title": {"en": "Demo", "ru": "Демо", "de": "Demo"}"#),
@@ -73,6 +74,11 @@ const DEFECTS: [(&str, &str, &str); 31] = [
     ("a metric neither gauge nor rate", r#""kind": "gauge""#, r#""kind": "average""#),
     ("a metric read by an action", r#""method":"list""#, r#""method":"make""#),
     ("a metric with no unit", r#""unit": "B"}}"#, r#""unit": ""}}"#),
+    ("a typed confirm with no confirm", r#""confirm": {"en": "Sure?", "ru": "Точно?"}, "#, ""),
+    ("a typed confirm of a parameter there is not", r#""confirm_typed": "label""#, r#""confirm_typed": "nosuch""#),
+    ("a typed confirm of a parameter not always given", r#""label": {"type": "string", "required": true"#,
+     r#""label": {"type": "string""#),
+    ("a typed confirm of what is no string", r#""label": {"type": "string""#, r#""label": {"type": "int""#),
 ];
 
 pub fn vectors(f: &mut Fails) {
