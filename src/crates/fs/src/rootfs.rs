@@ -1,9 +1,10 @@
 //! What gets mounted at boot, and where.
 //!
 //! `root=` names the filesystem that becomes `/`: a device, a label, a UUID,
-//! or `auto`, which takes the ext2 whose volume label is `nos` -- what
-//! scripts/mkrootfs.sh and scripts/build-disk.sh put on theirs. A device that
-//! carries no ext2 is tried as nanofs.
+//! or `auto`, which takes the ext2 or ext4 whose volume label is `nos` --
+//! what scripts/mkrootfs.sh and scripts/build-disk.sh put on theirs -- by
+//! the driver for it (`extfs`). A device that carries neither is tried as
+//! nanofs.
 //!
 //! With no root on disk there is a fallback layout instead, the one the ISO
 //! had before there was a root to boot from: a ramfs on `/`, the first ext2
@@ -15,6 +16,7 @@ use kcore::procinfo::{self, Root};
 use kcore::trace;
 
 use crate::ext2;
+use crate::extfs;
 use crate::nanofs;
 use crate::procfs;
 use crate::ramfs;
@@ -65,14 +67,14 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
 
     if ext2::probe(dev, &mut id) {
-        let mounted = ext2::mount_at("/", dev.handle(), read_only);
+        let (mounted, driver) = extfs::mount_at("/", dev, read_only);
         if mounted >= 0 {
-            trace!(0, "MountRootFs: mounted ext2 on / from {} ({})",
+            trace!(0, "MountRootFs: mounted {} on / from {} ({})", driver,
                 dev.name(),
                 if mounted == 1 { "ro" } else { "rw" });
             return true;
         }
-        trace!(0, "MountRootFs: mounting ext2 from {} failed",
+        trace!(0, "MountRootFs: mounting {} from {} failed", driver,
             dev.name());
         return false;
     }
@@ -115,8 +117,9 @@ fn mount_fallback_layout() {
         if !ext2::probe(&dev, &mut id) {
             continue;
         }
-        if ext2::mount_at("/boot", dev.handle(), true) >= 0 {
-            trace!(0, "MountRootFs: mounted ext2 on /boot from {} (ro)",
+        let (mounted, driver) = extfs::mount_at("/boot", &dev, true);
+        if mounted >= 0 {
+            trace!(0, "MountRootFs: mounted {} on /boot from {} (ro)", driver,
                 dev.name());
             break;
         }
