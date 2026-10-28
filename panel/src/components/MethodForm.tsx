@@ -40,7 +40,8 @@ function valueOf(f: Field, raw: string, unit: number): { ok: true; v: unknown } 
 
 /** A method's form: its parameters from its descriptor, those the caller
  * fixed (`fixed`, a row's key) given and not asked; its confirm asked
- * before it runs; a job followed to its end. */
+ * before it runs -- with the value of `confirm_typed`'s parameter typed
+ * again, where it has one; a job followed to its end. */
 export function MethodForm({ host, provider, name, method, fixed = {}, locale, w, onDone }: {
   host: string; provider: string; name: string; method: Method; fixed?: Record<string, unknown>;
   locale: Locale; w: Words; onDone?: () => void;
@@ -54,7 +55,13 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   const [answer, setAnswer] = useState<unknown>(null);
   const [job, setJob] = useState<number | null>(null);
   const [asking, setAsking] = useState(false);
+  const [typed, setTyped] = useState('');
   const [busy, setBusy] = useState(false);
+  /* What the user types to go on, when the method asks: the parameter's
+   * value, as given or fixed */
+  const mustType = method.confirm_typed
+    ? String(method.confirm_typed in fixed ? fixed[method.confirm_typed] ?? '' : raw[method.confirm_typed] ?? '')
+    : null;
 
   async function run() {
     const body: Record<string, unknown> = { ...fixed };
@@ -90,7 +97,11 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
   function submit(e: React.FormEvent) {
     e.preventDefault();
     if (method.confirm && !asking) {
+      setTyped('');
       setAsking(true);
+      return;
+    }
+    if (mustType !== null && (mustType === '' || typed !== mustType)) {
       return;
     }
     setAsking(false);
@@ -136,8 +147,16 @@ export function MethodForm({ host, provider, name, method, fixed = {}, locale, w
         </label>
       ))}
       {asking && method.confirm && <p className="rounded-lg bg-accent-soft px-3 py-2 text-sm text-fg">{text(method.confirm, locale)}</p>}
+      {asking && mustType !== null && (
+        <label className="block text-sm text-fg-soft">
+          <span className="font-mono text-xs text-fg">{mustType}</span>
+          <input value={typed} onChange={(e) => setTyped(e.target.value)} name="confirm_typed" autoComplete="off"
+            aria-label={w.typeToConfirm} placeholder={w.typeToConfirm}
+            className="mt-1 w-full rounded-lg border border-line bg-bg px-2 py-1.5 font-mono text-fg" />
+        </label>
+      )}
       <div className="flex gap-2">
-        <button type="submit" disabled={busy || job !== null}
+        <button type="submit" disabled={busy || job !== null || (asking && mustType !== null && (mustType === '' || typed !== mustType))}
           className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-bg hover:bg-accent-strong disabled:opacity-60">
           {asking ? w.confirm : text(method.title, locale) || w.run}
         </button>

@@ -7,12 +7,16 @@
 // starting, stopping and printing on their consoles, jobs that take a few
 // seconds and say so.
 //
-//     node mock/server.mjs [--port 39234] [--state mock/state]
+//     node mock/server.mjs [--port 39234] [--state mock/state] [--name nos]
+//                          [--trust <admin.crt>]
 //
 // It makes, in its state folder, the host's key and certificate and an
 // admin's and a reader's, and prints the host's key and where the clients'
-// are -- what the panel is pointed at (panel/README.md). No dependency but
-// Node's own and openssl for the keys.
+// are -- what the panel is pointed at (panel/README.md). Its id is its key's,
+// so each state folder is a host of its own; --name names it, and --trust
+// lets another's key in as an admin -- the panel's, made for the first
+// host, as `api client add` lets it in on a second (a cluster). No
+// dependency but Node's own and openssl for the keys.
 
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -31,6 +35,8 @@ const opt = (name, fallback) => {
 };
 const PORT = Number(opt('port', '39234'));
 const STATE = path.resolve(opt('state', path.join(HERE, 'state')));
+const NAME = opt('name', 'nos');
+const TRUST = opt('trust', null);
 
 /* ---- keys ---- */
 
@@ -488,7 +494,7 @@ async function route(req, res, who) {
   const admin = who.role === 'admin';
   const [, what, a, b, c] = parts;
   if (what === 'host' && req.method === 'GET') {
-    return send(res, 200, { id: '00000000-0000-4000-8000-000000000001', name: 'nos', version: '0.0.28-mock',
+    return send(res, 200, { id: hostId, name: NAME, version: '0.0.28-mock',
       revision: 'mock', arch: 'x86_64', module_abi: 'mock', api: 1, capabilities: ['call', 'jobs', 'stream'],
       time_s: Math.floor(Date.now() / 1000), uptime_ms: uptimeMs(), key: hostPin, client: { name: who.name, role: who.role } });
   }
@@ -734,6 +740,13 @@ const hostPin = host.pin;
 const adminPin = admin.pin;
 const readerPin = reader.pin;
 const clients = new Map([[adminPin, { name: 'panel', role: 'admin' }], [readerPin, { name: 'reader', role: 'read' }]]);
+if (TRUST) {
+  clients.set(fingerprint(fs.readFileSync(TRUST, 'utf8')), { name: 'trusted', role: 'admin' });
+}
+/** The host's id, as nos makes one at random once: here its key's, so a
+ * state folder is the same host at every start, and another is another. */
+const hostId = [hostPin.slice(0, 8), hostPin.slice(8, 12), '4' + hostPin.slice(13, 16), '8' + hostPin.slice(17, 20),
+  hostPin.slice(20, 32)].join('-');
 const all = descriptors();
 
 /** Who the connection's certificate says it is, by its key alone. */
@@ -767,8 +780,11 @@ server.on('upgrade', (req, socket) => {
   stream(req, socket, who);
 });
 server.listen(PORT, '127.0.0.1', () => {
-  console.log('nos mock API on https://127.0.0.1:' + PORT);
+  console.log('nos mock API on https://127.0.0.1:' + PORT + ', host ' + NAME + ' (' + hostId + ')');
   console.log('  host key   ' + hostPin);
+  if (TRUST) {
+    console.log('  trusted    ' + TRUST);
+  }
   console.log('  admin      ' + admin.crt + ' ' + admin.key);
   console.log('  reader     ' + reader.crt + ' ' + reader.key);
   console.log('  providers  ' + Object.keys(all).join(', '));

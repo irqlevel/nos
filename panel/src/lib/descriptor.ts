@@ -24,6 +24,9 @@ export interface Method {
   title: Text;
   help?: Text;
   confirm?: Text;
+  /** The parameter whose value the user types again before the call: a
+   * pool's name before it is destroyed. */
+  confirm_typed?: string;
   params?: Record<string, Field>;
   result?: string;
 }

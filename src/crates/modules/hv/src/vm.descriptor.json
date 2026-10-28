@@ -76,7 +76,8 @@
         "to": {"type": "string", "required": true, "title": {"en": "New name", "ru": "Новое имя"}},
         "port": {"type": "int", "min": 0, "max": 15, "title": {"en": "Switch port", "ru": "Порт коммутатора"}}}},
     "delete": {"kind": "job", "title": {"en": "Delete", "ru": "Удалить"},
-      "confirm": {"en": "Delete this VM and its disks? This cannot be undone.", "ru": "Удалить машину и её диски? Это нельзя отменить."},
+      "confirm": {"en": "This VM and its disks are deleted, and cannot be brought back. Type its name to go on.", "ru": "Машина и её диски будут удалены без возможности вернуть. Введите её имя, чтобы продолжить."},
+      "confirm_typed": "name",
       "params": {"name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
         "keep_disks": {"type": "bool", "title": {"en": "Keep its disks", "ru": "Оставить диски"}},
         "force": {"type": "bool", "title": {"en": "Even if protected", "ru": "Даже защищённую"}}}}
