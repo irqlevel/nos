@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "provider": "api",
+  "title": {"en": "Host API", "ru": "API хоста"},
+  "help": {"en": "The API this host is managed through: where it listens, who is connected, and what it has refused.", "ru": "API, через которое управляется этот хост: где оно слушает, кто подключён и кому отказано."},
+  "ui": {"section": "system", "order": 15, "icon": "key"},
+  "methods": {
+    "status": {"kind": "read", "title": {"en": "Status", "ru": "Состояние"}},
+    "clients": {"kind": "read", "title": {"en": "Clients", "ru": "Клиенты"},
+      "help": {"en": "The keys let in, as api client add and del change them.", "ru": "Допущенные ключи; их меняют api client add и del."}}
+  },
+  "resources": {
+    "connections": {
+      "title": {"en": "Connections", "ru": "Соединения"},
+      "list": "status", "items": "connections", "key": "id",
+      "fields": {
+        "id": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "nic": {"type": "string", "title": {"en": "Interface", "ru": "Интерфейс"}},
+        "ip": {"type": "ipv4", "title": {"en": "From", "ru": "Откуда"}},
+        "port": {"type": "port", "title": {"en": "Port", "ru": "Порт"}},
+        "open": {"type": "bool", "title": {"en": "Let in", "ru": "Допущено"}},
+        "client": {"type": "string", "title": {"en": "Client", "ru": "Клиент"}},
+        "role": {"type": "string", "title": {"en": "Role", "ru": "Роль"}},
+        "seconds": {"type": "int", "unit": "s", "title": {"en": "Connected for", "ru": "Подключено"}}
+      },
+      "columns": ["id", "client", "role", "ip", "nic", "seconds"]
+    },
+    "clients": {
+      "title": {"en": "Clients", "ru": "Клиенты"},
+      "list": "clients", "items": "clients", "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "role": {"type": "enum", "title": {"en": "Role", "ru": "Роль"}, "values": {
+          "admin": {"en": "everything", "ru": "всё"},
+          "read": {"en": "reads alone", "ru": "только чтение"}}},
+        "key": {"type": "string", "title": {"en": "Key", "ru": "Ключ"}}
+      },
+      "columns": ["name", "role", "key"]
+    }
+  },
+  "metrics": {
+    "requests": {"title": {"en": "Requests", "ru": "Запросы"}, "method": "status", "field": "requests", "kind": "rate", "unit": "req"}
+  }
+}

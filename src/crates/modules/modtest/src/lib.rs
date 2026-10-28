@@ -129,12 +129,24 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
     let answer = given.unwrap_or(shape.area() + data);
     let probe = double as fn(u32) -> u32 as usize;
     let cmd = Command::register("modtest", "modtest - the loader self-test module's command", move |args, out| {
+        if args.trim() == "bus" {
+            match bus() {
+                Ok(()) => {
+                    let _ = writeln!(out, "modtest bus: ok");
+                }
+                Err(what) => {
+                    let _ = writeln!(out, "modtest bus: {} went wrong", what);
+                }
+            }
+            return;
+        }
         let _ = writeln!(out, "modtest: answer {} args '{}' double at {}", answer, args, probe);
     })?;
 
     /* A provider on the management bus, for the test to call, and to start
        a job of that its unload has to stop and wait for */
-    let methods = [Method { name: "echo", kind: Kind::Read }, Method { name: "wait", kind: Kind::Job }];
+    let methods = [Method { name: "echo", kind: Kind::Read }, Method { name: "wait", kind: Kind::Job },
+                   Method { name: "nap", kind: Kind::Job }];
     let provider = Provider::register("modtest", &methods, include_str!("modtest.descriptor.json"), provide)
         .map_err(|_| Error::Busy)?;
 
@@ -146,11 +158,19 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
 const WAIT_LIMIT_MS: u64 = 10_000;
 
 /// The provider's methods: `echo` answers with its parameters; `wait`, a
-/// job, runs until it is told to stop -- by the module's unload.
+/// job, runs until it is told to stop -- by the module's unload; `nap`, a
+/// job that ends on its own, with a line of its log and a result.
 fn provide(method: &str, params: &[u8], call: &mut Call) -> Status {
     match method {
         "echo" => {
             call.reply(params);
+            Status::Ok
+        }
+        "nap" => {
+            call.note("modtest: napping");
+            kcore::task::sleep_ms(10);
+            call.progress(1, 1);
+            call.reply(br#"{"napped":true}"#);
             Status::Ok
         }
         "wait" => {
@@ -168,6 +188,82 @@ fn provide(method: &str, params: &[u8], call: &mut Call) -> Status {
         }
         _ => Status::NoMethod,
     }
+}
+
+/// What the bus answers into `f`'s sink: its status and every byte.
+fn answered(f: impl FnOnce(&mut dyn FnMut(&[u8]) -> bool) -> Status) -> (Status, Vec<u8>) {
+    let mut got = Vec::new();
+    let status = f(&mut |b| {
+        got.extend_from_slice(b);
+        true
+    });
+    (status, got)
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `modtest bus`: the bus as a module asks it -- the host API's way in --
+/// gone through once: what a method is registered as, a call of this
+/// module's own provider and of the kernel's, the providers a reader and an
+/// admin are shown, a descriptor, and a job started, run to its end, its
+/// log and result read. What went wrong first, if anything.
+fn bus() -> core::result::Result<(), &'static str> {
+    use kcore::mgmt as m;
+    if m::kind("system", "power_off") != Ok(Kind::Action) || m::kind("system", "info") != Ok(Kind::Read) {
+        return Err("a method's kind");
+    }
+    if m::kind("nobody", "info") != Err(Status::NoProvider) || m::kind("system", "nope") != Err(Status::NoMethod) {
+        return Err("a kind there is not");
+    }
+    let (s, got) = answered(|sink| m::call("modtest", "echo", br#"{"n":7}"#, 64, sink));
+    if s != Status::Ok || got != br#"{"n":7}"# {
+        return Err("a call of the module's own provider");
+    }
+    let (s, got) = answered(|sink| m::call("system", "info", b"", 4096, sink));
+    if s != Status::Ok || !has(&got, b"\"arch\"") {
+        return Err("a call of the kernel's");
+    }
+    let (s, got) = answered(|sink| m::providers(m::KINDS_READ, sink));
+    if s != Status::Ok || !has(&got, b"\"system\"") || has(&got, b"\"power_off\"") {
+        return Err("the providers a reader is shown");
+    }
+    let (s, got) = answered(|sink| m::providers(m::KINDS_ALL, sink));
+    if s != Status::Ok || !has(&got, b"\"power_off\"") {
+        return Err("the providers an admin is shown");
+    }
+    let (s, got) = answered(|sink| m::describe("modtest", sink));
+    if s != Status::Ok || !has(&got, b"\"provider\": \"modtest\"") {
+        return Err("a descriptor");
+    }
+    if m::job_start("modtest", "echo", b"") != Err(Status::Kind) {
+        return Err("a call started as a job");
+    }
+    let id = m::job_start("modtest", "nap", b"").map_err(|_| "a job started")?;
+    let want_id = alloc::format!("\"id\":{}", id);
+    for _ in 0..5000 {
+        let (s, got) = answered(|sink| m::job(id, 0, sink));
+        if s != Status::Ok {
+            return Err("a job's record");
+        }
+        if has(&got, b"\"state\":\"done\"") {
+            if !has(&got, b"\"status\":\"ok\"") || !has(&got, b"\"result\":{\"napped\":true}")
+                || !has(&got, b"modtest: napping") {
+                return Err("a job done: its status, log or result");
+            }
+            if m::job_cancel(id) != Status::NotFound {
+                return Err("a job done told to stop");
+            }
+            let (s, got) = answered(|sink| m::jobs(sink));
+            if s != Status::Ok || !has(&got, want_id.as_bytes()) {
+                return Err("the list of jobs");
+            }
+            return Ok(());
+        }
+        kcore::task::sleep_ms(1);
+    }
+    Err("a job that never ended")
 }
 
 kmod::module!(name: "modtest", init_with_params: init);

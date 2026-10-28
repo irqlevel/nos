@@ -333,6 +333,44 @@ after all of it the connection table has to be back where it started,
 because a leak of one slot per connection is invisible until the
 sixty-fourth.
 
+### `api-test.py` -- the host API, end to end
+
+The host API is the one module everything managing the machine goes through,
+and what it must not do is the kind of thing that looks like success: let a
+stranger's bytes reach its parser, answer a reader's action, leave a slot in
+TIME-WAIT for every client it served, hold an unload for a handshake. nos
+boots with api.ko, modtest.ko and sshd.ko on its root, an api.toml that
+listens on eth0, and two clients' keys -- an admin's and a reader's, made by
+`nosctl keygen` -- and a stranger's in no file. Through nosctl's own client
+it checks:
+
+- the host's key is the one `api start` and `api cert` print, and the one
+  the connection shows; a host with another is refused before a request;
+- a stranger, and a client with no certificate, are refused in the TLS
+  handshake, counted so -- and the count of requests parsed does not move;
+- a reader calls reads and is refused (403) an action, a job and a cancel,
+  and is shown no method but reads; an admin calls everything, and each
+  change is a line of the audit log;
+- a job runs to its end through the API, its log and result read back;
+  another is cancelled; a job called as a call is a 409;
+- a descriptor's ETag and its 304; a 404, a 405 with `Allow`, a 400, a 413;
+- the stream's metrics, and an action's audit line in its log channel;
+- a fifth connection of one key let go after its handshake, a ninth reset at
+  the door, a third handshake reset while two are going -- and the two let
+  go at their time -- a connection let go after its idle time;
+- sshd answering while the API holds all eight;
+- a client taken off the list refused its next request and its next
+  handshake, and let in again once put back;
+- no slot of the API's port in TIME-WAIT, the clients having closed first;
+- rmmod api with a stream, a connection and a handshake under way unloads at
+  once and leaves no slot of the port;
+- and it prints what a handshake costs and how deep a connection's task went.
+
+`--arch x86_64` is its short form: nos.iso, a root whose /etc/rc loads the
+modules and starts the API, and what needs no shell -- every check above
+but the shell's own commands, sshd, the client list's changes and the unload.
+Needs openssl and QEMU; a few minutes on arm64 under HVF.
+
 ### `sshd-test.py` -- the listening side, and modules
 
 End to end against OpenSSH's own client (see [sshd](sshd.md)). On arm64 it

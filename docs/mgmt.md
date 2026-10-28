@@ -180,6 +180,28 @@ calls `rust_mgmt_stop`:
 - every job is told to stop and waited for;
 - any module's provider still registered is named in the log.
 
+## A module asking the bus
+
+The host API is a module, and the bus is in the image: what it calls goes
+through the bus's C ABI, as a provider's answers do the other way.
+`kcore::mgmt` has it as functions:
+
+- `call(provider, method, params, max_reply, sink)` -- a read or an action,
+  its answer handed to the module's sink in pieces;
+- `kind(provider, method)` -- what the method is registered as: what a role
+  is let call by;
+- `providers(kinds, sink)` -- the providers and their methods as JSON, the
+  methods of the kinds asked alone (a reader's: the reads);
+- `describe(provider, sink)` -- a descriptor;
+- `job_start`, `job(id, notes_since, sink)`, `jobs(sink)`, `job_cancel`.
+
+The JSON is the bus's own (`mgmt/src/view.rs`), written so it is handed on as
+it is: a job's result is embedded as the JSON it is once the bus has read it
+as such, and as a string if it is not. Every length a module hands over is
+checked before a slice is made of it; the sink is called only while its call
+runs. Every boot's `test_module_bus` goes through all of it once, from
+modtest (`modtest bus`).
+
 ## The `mgmt` command
 
 ```

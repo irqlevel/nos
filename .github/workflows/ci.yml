@@ -185,6 +185,13 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: python3 scripts/netload-test.py --tcg
 
+      # The host API end to end (docs/api.md): a stranger refused in the
+      # handshake with not a byte parsed, the roles, jobs, the stream, the
+      # limits, no TIME-WAIT left on its port, an unload under a handshake.
+      - name: Host API test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/api-test.py --tcg
+
       # The same kernel with both halves checking themselves (docs/build.md):
       # UBSAN=1 puts clang's sanitizer in front of every operation the C++
       # leaves undefined, RUSTUB=1 turns on core's checks of the preconditions

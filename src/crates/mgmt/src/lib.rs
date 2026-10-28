@@ -27,6 +27,7 @@ mod abi;
 mod job;
 mod selftest;
 mod shell;
+pub mod view;
 
 pub use job::{job_cancel, job_info, job_list, job_notes, job_result, job_start, JobInfo, JobState};
 pub use mgmtwire::{Invalid, Params, Status, Value, Writer};
@@ -640,6 +641,14 @@ pub fn descriptor(name: &str) -> Option<Vec<u8>> {
     d.try_reserve_exact(s.descriptor.len()).ok()?;
     d.extend_from_slice(&s.descriptor);
     Some(d)
+}
+
+/// The kind `provider`'s `method` is registered as: what the host API lets a
+/// client of a role call by -- never what the client says it is.
+pub fn method_kind(provider: &str, method: &str) -> Result<Kind, Status> {
+    let r = bus().ok_or(Status::Busy)?.lock();
+    let s = r.slots.iter().flatten().find(|s| s.name == provider && !s.removing).ok_or(Status::NoProvider)?;
+    s.methods.iter().find(|(n, _)| n == method).map(|(_, k)| *k).ok_or(Status::NoMethod)
 }
 
 /// The registration of `provider`, if it has `method` and that is a job.

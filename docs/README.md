@@ -20,6 +20,7 @@ How it works, by subsystem:
 - [Randomness](random.md) — the ChaCha20 pool, the entropy sources each machine turns out to have, and what timing jitter is worth
 - [Rust in the kernel](rust.md) — how the crates are layered, how a kernel service reaches Rust, the type each shape that used to need `unsafe` has now, a map of `kcore`, and how a driver is written
 - [Filesystems](filesystems.md) — the root filesystem and `root=`, the file API, what the ext2 driver writes and how, making and checking a root image
+- [The host API](api.md) — what nos is managed through by programs: a module serving the management bus over TLS 1.3 to clients let in by their keys, its routes and stream, its roles, its folder, and `nosctl`
 - [The management bus](mgmt.md) — where the kernel's layers and modules answer by name what the host API and the `mgmt` command ask: providers, methods and descriptors, calls, jobs, and what keeps a call out of a module that is gone
 - [Loadable modules](modules.md) — kernel services written in Rust, built into `.ko` files and put into a running kernel with `insmod`: writing one, building it, and how the loader maps, binds, relocates and protects it
 - [netblk](netblk.md) — an NVMe disk served over UDP by a module, zero-copy both ways: the data path from NIC to disk and back, the protocol, and how Linux compares

@@ -73,3 +73,64 @@ unsafe extern "C" {
     /// Whether the job has been told to stop.
     pub safe fn kernel_mgmt_cancelled(call: u64) -> bool;
 }
+
+/* A module calling the bus -- the host API module's side: a call, what a
+   method is, the providers, a descriptor and the jobs, each answered to a
+   sink of the caller's, in pieces, for the length of the call. */
+
+/// Where an answer goes: the ctx the caller passed, and a piece of it. False
+/// when the caller takes no more.
+pub type MgmtSink = unsafe extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize) -> bool;
+
+/// Which kinds of method `kernel_mgmt_providers` lists.
+pub const MGMT_KINDS_READ: u32 = 1;
+pub const MGMT_KINDS_ACTION: u32 = 2;
+pub const MGMT_KINDS_JOB: u32 = 4;
+pub const MGMT_KINDS_ALL: u32 = 7;
+
+unsafe extern "C" {
+    /// `provider`'s `method` called with `params`, its answer, at most
+    /// `max_reply` bytes, to `sink`: the status code it ended with. Sleeps
+    /// for as long as the method takes, so from a task alone.
+    pub fn kernel_mgmt_call(
+        provider: *const u8,
+        provider_len: usize,
+        method: *const u8,
+        method_len: usize,
+        params: *const u8,
+        params_len: usize,
+        max_reply: usize,
+        sink: MgmtSink,
+        ctx: *mut c_void,
+    ) -> i32;
+
+    /// The kind `provider`'s `method` is registered as -- `MGMT_READ` and
+    /// the rest -- or a status code below 0.
+    pub fn kernel_mgmt_kind(provider: *const u8, provider_len: usize, method: *const u8, method_len: usize) -> i32;
+
+    /// The providers with a method of `kinds`, as JSON, to `sink`.
+    pub fn kernel_mgmt_providers(kinds: u32, sink: MgmtSink, ctx: *mut c_void) -> i32;
+
+    /// `provider`'s descriptor to `sink`.
+    pub fn kernel_mgmt_describe(provider: *const u8, provider_len: usize, sink: MgmtSink, ctx: *mut c_void) -> i32;
+
+    /// A job started: its number above 0, or a status code below it.
+    pub fn kernel_mgmt_job_start(
+        provider: *const u8,
+        provider_len: usize,
+        method: *const u8,
+        method_len: usize,
+        params: *const u8,
+        params_len: usize,
+    ) -> i64;
+
+    /// A job's record, its log from line `notes_since` and its result, as
+    /// JSON, to `sink`.
+    pub fn kernel_mgmt_job(id: u64, notes_since: u64, sink: MgmtSink, ctx: *mut c_void) -> i32;
+
+    /// Every job's record, as JSON, to `sink`.
+    pub fn kernel_mgmt_jobs(sink: MgmtSink, ctx: *mut c_void) -> i32;
+
+    /// A job told to stop: 0, or a status code below it.
+    pub safe fn kernel_mgmt_job_cancel(id: u64) -> i32;
+}
