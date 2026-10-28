@@ -10,6 +10,8 @@ crate-type = ["staticlib"]
 ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
 random = { path = "../random" }
+# The management bus: below every layer, so each can register its provider.
+mgmt = { path = "../mgmt" }
 block = { path = "../block" }
 fs = { path = "../fs" }
 net = { path = "../net" }

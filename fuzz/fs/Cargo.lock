@@ -37,4 +37,9 @@ name = "kcore"
 version = "0.1.0"
 dependencies = [
  "ffi",
+ "mgmtwire",
 ]
+
+[[package]]
+name = "mgmtwire"
+version = "0.1.0"

@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 ffi = { path = "../ffi" }
+# The management bus's JSON writer and status codes, for a provider's answer.
+mgmtwire = { path = "../mgmtwire" }

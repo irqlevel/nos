@@ -36,7 +36,25 @@ is what catches it: a ring whose sequences were relaxed failed eight boots
 of eight under HVF, while TCG on an x86 host may never show it. Its line
 says what a push and a pop cost on one CPU and how long each run took
 (`ring selftest: passed ...`): a number every boot prints is noticed when it
-moves. And on every CPU `test_sleep_prompt` has a task of its own sleep a
+moves. The [management bus](mgmt.md)'s (`mgmt/src/selftest.rs`) uses a
+provider of its own:
+
+- calls answered, and refused as they should be;
+- an answer held to its limit;
+- a job run to its end, its progress, log and result kept;
+- a job told to stop by its provider's unregister, which waits for it;
+- the name free again after.
+
+Then `test_module_bus` does the same for a module, once there are tasks to
+run its job on:
+
+- modtest is loaded, and its provider is called through `mgmt call`;
+- a job of it is started and seen running;
+- the module's unload must stop that job and wait it out: its record says
+  `cancelled`, and the provider goes with its module.
+
+An unregister that does not tell its jobs to stop, or does not wait for its
+calls, fails the boot (`mgmt selftest: ...`). And on every CPU `test_sleep_prompt` has a task of its own sleep a
 millisecond twenty-one times while the CPU halts between interrupts: the
 median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
 CPU's timer is not armed for a sleeper's deadline and the tick wakes it
