@@ -139,6 +139,11 @@ pub struct Ep {
     /// The furthest right edge the machine's window ever offered: it must
     /// never fall back from it.
     machine_edge: Option<u32>,
+    /// The peer opened it (`connect`): the machine's end is a listener's
+    peer_opened: bool,
+    /// When the machine's stream last came past a hole, until the hole
+    /// filled: how long its sender took to find the loss
+    hole_since: Option<u64>,
 
     rto_at: u64,
     rto: u64,
@@ -307,7 +312,7 @@ impl Tcp {
             iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_wnd: 0, wl1: 0, wl2: 0, mss: DEFAULT_MSS, our_mss,
             queued: 0, fin_queued: false, fin_seq: None,
             irs: 0, rcv_nxt: 0, rcv_cap: window, unread: 0, got: 0, fin_got: None, ooo: Vec::new(), ooo_fin: None,
-            right_edge: 0, snd_shift: 0, rcv_shift: 0, machine_edge: None,
+            right_edge: 0, snd_shift: 0, rcv_shift: 0, machine_edge: None, peer_opened: true, hole_since: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
             silent: false, tainted: false, reset: None, syn_opts: opts, offered: 0, closed_at: None, data: None,
         };
@@ -399,7 +404,7 @@ impl Tcp {
             irs: seq, rcv_nxt: seq.wrapping_add(1), rcv_cap: self.accept_window, unread: 0, got: 0, fin_got: None,
             ooo: Vec::new(), ooo_fin: None,
             right_edge: seq.wrapping_add(1).wrapping_add(self.accept_window.min(0xFFFF)),
-            snd_shift, rcv_shift, machine_edge: None,
+            snd_shift, rcv_shift, machine_edge: None, peer_opened: false, hole_since: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
             silent: false, tainted: false, reset: None, syn_opts: our_opts, offered: 0, closed_at: None,
             data: if self.serve.contains(&port) { Some(Data::default()) } else { None },
@@ -460,6 +465,11 @@ impl Tcp {
                 invariant!(payload.is_empty(), "data on the machine's SYN-ACK");
                 ep.irs = seq;
                 ep.rcv_nxt = seq.wrapping_add(1);
+                /* A SYN-ACK may offer a window scale only to a SYN that
+                 * offered one (RFC 7323 1.3): scaled windows to a peer that
+                 * reads them unscaled are windows it never meant. */
+                invariant!(ws_of(opts).is_none() || ws_of(&ep.syn_opts).is_some(),
+                           "the machine's SYN-ACK offers a window scale to a SYN that offered none");
                 /* Scaled from here when both SYNs offered a scale; the
                  * SYN-ACK's own window is not. */
                 if let (Some(theirs), Some(ours)) = (ws_of(opts), ws_of(&ep.syn_opts)) {
@@ -553,6 +563,9 @@ impl Tcp {
             if wnd << ep.snd_shift > 0xFFFF {
                 crate::common::runner::reached("tcp: the machine offered a window past 64 KiB");
             }
+            if ep.peer_opened && wnd << ep.snd_shift > 8192 {
+                crate::common::runner::reached("tcp: a connection the peer opened offered past 8 KiB (a bulk listener's)");
+            }
             /* The machine acknowledges every segment it takes, and none of
              * its acknowledgements is lost on the way: one that moves on by
              * more than a segment took in what it had kept past a hole. */
@@ -615,6 +628,15 @@ impl Tcp {
                 let from = ep.machine_offset(seq);
                 let to = from + payload.len() as u64;
                 if from <= ep.got && ep.got < to {
+                    if let Some(since) = ep.hole_since.take() {
+                        /* What the machine's sender found lost, sent again:
+                         * within a timeout, by duplicate acknowledgements */
+                        crate::common::runner::reached(if now.saturating_sub(since) < 900_000_000 {
+                            "tcp: a hole in the machine's stream filled within a timeout (fast retransmit)"
+                        } else {
+                            "tcp: a hole in the machine's stream filled after a timeout"
+                        });
+                    }
                     let room = u64::from(ep.rcv_cap.saturating_sub(ep.unread));
                     let (got, upto) = (ep.got, to.min(ep.got + room));
                     if let Some(d) = ep.data.as_mut() {
@@ -622,6 +644,7 @@ impl Tcp {
                     }
                     ep.take(upto);
                 } else if from > ep.got && from < 1 << 31 && before_eq(end, ep.right_edge) && ep.data.is_none() {
+                    ep.hole_since.get_or_insert(now);
                     ep.ooo.push((from, to));
                 }
                 ep.drain_ooo();

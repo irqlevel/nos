@@ -375,6 +375,144 @@ pub extern "C" fn kernel_dmesg_replay(line: extern "C" fn(ctx: *mut u8, s: *cons
     }
 }
 
+/* ---- what the kernel holds of itself: the system provider's ---- */
+
+/// `s`, as much of it as fits in the caller's `len` bytes at `buf`: the
+/// bytes written.
+///
+/// # Safety
+/// `buf` is `len` writable bytes.
+unsafe fn put(buf: *mut u8, len: usize, s: &[u8]) -> usize {
+    let n = s.len().min(len);
+    if n != 0 {
+        // SAFETY: the caller's buffer, `n <= len` bytes of it.
+        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), buf, n) };
+    }
+    n
+}
+
+/// # Safety
+/// `buf` is `len` writable bytes and `last` writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dmesg_read(since: u64, buf: *mut u8, len: usize, last: *mut u64) -> usize {
+    let (records, got) = sched::harness(|| super::dmesg_since(since, len));
+    // SAFETY: the caller's buffer and its `last`, `kcore::system::log_since`'s.
+    unsafe {
+        *last = got;
+        put(buf, len, &records)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_dmesg_next_seq() -> u64 {
+    sched::harness(super::dmesg_counts).0
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_dmesg_lost() -> u64 {
+    sched::harness(super::dmesg_counts).1
+}
+
+/// # Safety
+/// `buf` is `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_version_field(which: u32, buf: *mut u8, len: usize) -> usize {
+    let s: &[u8] = if which == ffi::system::VERSION { b"0.0.0-fuzz" } else { b"fuzz" };
+    // SAFETY: the caller's buffer.
+    unsafe { put(buf, len, s) }
+}
+
+/// # Safety
+/// `buf` is `len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_cpu_model(buf: *mut u8, len: usize) -> usize {
+    // SAFETY: the caller's buffer.
+    unsafe { put(buf, len, b"the fuzzer's CPU") }
+}
+
+/// The machine's memory, as a machine of a gigabyte with half of it free
+/// would say it.
+///
+/// # Safety
+/// `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_mem_info(out: *mut ffi::system::MemInfo) {
+    let info = ffi::system::MemInfo { page_bytes: 4096, total_pages: 1 << 18, free_pages: 1 << 17,
+                                      huge_block_bytes: 2 << 20, huge_blocks: 0, huge_free: 0 };
+    // SAFETY: the caller's struct.
+    unsafe { *out = info };
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_cpu_idle_ns(_cpu: u32) -> u64 {
+    0
+}
+
+/// The machine's tasks, as the kernel's table copies them.
+///
+/// # Safety
+/// `out` is `max` writable `TaskInfo`s.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_task_snapshot(out: *mut ffi::system::TaskInfo, max: usize) -> usize {
+    let tasks = sched::harness(sched::tasks);
+    let mut n = 0;
+    for (id, name, _, st, _) in tasks.iter().take(max) {
+        let mut info = ffi::system::TaskInfo::ZERO;
+        info.pid = *id as u64;
+        info.state = match st {
+            sched::St::Done => ffi::system::TASK_EXITED,
+            sched::St::Blocked(_) => ffi::system::TASK_WAITING,
+            sched::St::Ready | sched::St::Running => ffi::system::TASK_RUNNING,
+        };
+        let len = name.len().min(info.name.len() - 1);
+        info.name[..len].copy_from_slice(&name.as_bytes()[..len]);
+        // SAFETY: the caller's array, `n < max` of it.
+        unsafe { *out.add(n) = info };
+        n += 1;
+    }
+    n
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_trace_level() -> u32 {
+    super::trace_level()
+}
+
+/// Taken as the kernel takes one, and nothing changed: the fuzzer's log
+/// keeps its level.
+#[no_mangle]
+pub extern "C" fn kernel_trace_set_level(level: u32) -> i32 {
+    (level <= 9) as i32
+}
+
+/// No task is the shell's to renice here: none is found.
+#[no_mangle]
+pub extern "C" fn kernel_task_set_nice(_pid: u64, _nice: i64) -> i32 {
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_module_list(_out: *mut ffi::system::ModuleInfo, _max: usize) -> usize {
+    0
+}
+
+/// No module is loaded through the loader on the fuzzer's machine: a target
+/// loads its module's source itself.
+#[no_mangle]
+pub extern "C" fn kernel_module_command(_unload: i32, _arg: *const u8, _arg_len: usize, _params: *const u8,
+                                        _params_len: usize, _sink: ffi::cmd::CmdSink, _ctx: *mut c_void) -> i32 {
+    ffi::system::MODULE_NOT_STARTED
+}
+
+/// Power-offs and reboots asked for: counted, and nothing done -- a target
+/// that never asks for one holds this to 0.
+pub static POWER_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[no_mangle]
+pub extern "C" fn kernel_power_request(_what: u32) {
+    POWER_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /* ---- the shell's command table ---- */
 
 /// # Safety

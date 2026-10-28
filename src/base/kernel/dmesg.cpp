@@ -7,6 +7,7 @@ namespace kernel
 Dmesg::Dmesg()
     : active_(false)
     , lost_(0)
+    , next_seq_(1)
 {
 }
 
@@ -51,6 +52,7 @@ restart:
         if (msg_list_.is_empty())
         {
             lost_++;
+            next_seq_++;
             return;
         }
 
@@ -75,6 +77,7 @@ restart:
                 goto restart;
 
             lost_++;
+            next_seq_++;
             return;
         }
 
@@ -94,6 +97,7 @@ restart:
 
     stdlib::AutoLock lock(lock_);
     BUG_ON(msg->usage.get() != 0);
+    msg->seq = next_seq_++;
     msg_list_.insert_tail(&msg->list_entry);
 }
 
@@ -181,6 +185,74 @@ ulong Dmesg::get_lost()
 {
     stdlib::AutoLock lock(lock_);
     return lost_;
+}
+
+u64 Dmesg::get_next_seq()
+{
+    stdlib::AutoLock lock(lock_);
+    return next_seq_;
+}
+
+ulong Dmesg::read_since(u64 since, u8* buf, ulong len, u64& last)
+{
+    last = since;
+    if (buf == nullptr)
+        return 0;
+
+    /* Back from the tail to the newest message the reader has had, then
+       forward from there: one that keeps up asks for a few lines at the
+       end of a log of thousands. The list is in the order of the numbers
+       -- each is given as its message goes on at the tail, under the lock
+       -- so the walk back can stop at the first it has seen. A walk off
+       the head (prev() releasing the head's pin as it goes) starts again
+       from the head, whose messages are all newer. */
+    DmesgMsg* msg = prev(nullptr);
+    for (ulong visited = 0; msg != nullptr && msg->seq > since; visited++)
+    {
+        if (visited + 1 == MAX_MSGS)
+        {
+            release(msg);
+            return 0;
+        }
+        DmesgMsg* earlier = prev(msg);
+        if (earlier == nullptr)
+        {
+            msg = next(nullptr);
+            break;
+        }
+        msg = earlier;
+    }
+
+    ulong off = 0;
+    for (ulong visited = 0; msg != nullptr; visited++)
+    {
+        if (msg->seq > since)
+        {
+            ulong text = 0;
+            while (text < sizeof(msg->str) && msg->str[text] != '\0')
+                text++;
+            if (off + READ_HEADER + text > len)
+            {
+                release(msg);
+                break;
+            }
+            for (ulong i = 0; i < sizeof(u64); i++)
+                buf[off + i] = (u8)(msg->seq >> (8 * i));
+            buf[off + sizeof(u64)] = (u8)text;
+            buf[off + sizeof(u64) + 1] = (u8)(text >> 8);
+            stdlib::mem_cpy(buf + off + READ_HEADER, msg->str, text);
+            off += READ_HEADER + text;
+            last = msg->seq;
+        }
+
+        if (visited + 1 == MAX_MSGS)
+        {
+            release(msg);
+            break;
+        }
+        msg = next(msg);
+    }
+    return off;
 }
 
 DmesgMsg* Dmesg::tail_start(ulong last_lines)

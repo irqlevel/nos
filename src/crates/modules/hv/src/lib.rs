@@ -38,6 +38,8 @@ extern crate alloc;
 #[cfg(target_arch = "x86_64")]
 mod boot;
 #[cfg(target_arch = "x86_64")]
+mod clone;
+#[cfg(target_arch = "x86_64")]
 mod cloud;
 #[cfg(target_arch = "x86_64")]
 mod config;
@@ -55,11 +57,16 @@ mod image;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(target_arch = "x86_64")]
+mod provider;
+#[cfg(target_arch = "x86_64")]
+mod relay;
+#[cfg(target_arch = "x86_64")]
 mod store;
 #[cfg(target_arch = "x86_64")]
 mod vmlog;
 #[cfg(target_arch = "x86_64")]
 mod vms;
+mod work;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -71,10 +78,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use hv::Machine;
 use kcore::cmd::{Command, Output};
+use work::Shell;
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|clone|delete|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|convert|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -110,6 +118,12 @@ hv create <name> <http(s)://image> [size=N[K|M|G|T]] [password=...] [hvboot=path
                                    its folder and made its disk, grown to size=; cloud-init
                                    given the keys nos's sshd lets in, and the password; and
                                    a vm.toml booting it by hvboot, on the switch, 1 GiB
+hv clone <from> <to> [port=N]      a vm's folder copied into a new one: its disks with their
+                                   holes left out, a new UUID, a port of its own if it had
+                                   one, no forwards, and cloud-init's seed made anew
+hv delete <name> [keep-disks] [force]
+                                   a stopped vm's folder taken away, all of it or all but its
+                                   disks; force for one whose vm.toml says protected
 hv vms                             the vms in the vms' folder, and which of them run
 hv cores [own|shared]              whether a guest's cores are its own -- whole cores no
                                    other guest has a CPU on, its CPUs filling their
@@ -131,7 +145,8 @@ hv stop <vm|all> [secs=N]          press its power button and give it secs (30) 
                                    and nos's poweroff and reboot, stop all of them so,
                                    given what insmod hv.ko was as stop_secs=N (120)
 hv forward [add <port> <vm> <guest-port> | del <port>]
-                                   a port of nos's relayed to a guest's (net guests)
+                                   a port of nos's relayed to a guest's (net guests) -- and
+                                   kept in, or taken out of, a vm's vm.toml when it has one
 hv convert <image> <disk>          a qcow2 image -- a cloud's, as QEMU writes them -- made
                                    the raw disk a guest is given: a new file, its holes
                                    kept, and removed again if the conversion fails
@@ -157,12 +172,17 @@ struct State {
     #[cfg(target_arch = "x86_64")]
     stop_secs: u64,
     /// Set as the module starts to go: an `hv boot` running then stops at
-    /// once instead of at the end of its time.
-    #[cfg(target_arch = "x86_64")]
+    /// once instead of at the end of its time, and a download, a conversion
+    /// or a clone where it is, taking back what it made.
     unloading: Arc<core::sync::atomic::AtomicBool>,
 }
 
 struct Hv {
+    /// The `vm` provider on the management bus: unregistered first, which
+    /// waits out its calls and jobs -- told to stop -- before anything they
+    /// use goes.
+    #[cfg(target_arch = "x86_64")]
+    provider: Option<kcore::mgmt::Provider>,
     /// In an `Option` so that unregistering -- which waits out a call of the
     /// command still running on another CPU -- happens before the machine is
     /// let go of, and not in whatever order the fields happen to be in.
@@ -176,10 +196,15 @@ impl Drop for Hv {
     fn drop(&mut self) {
         /* The guests first: an `hv boot` running, and every `hv start`ed one
          * -- so that an `hv wait` or `hv exec` waiting on one returns, and it
-         * is those calls the unregister below waits for. */
+         * is those calls the unregister below waits for. A download, a
+         * conversion or a clone stops where it is, as told by the flag. */
+        self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
         #[cfg(target_arch = "x86_64")]
         {
-            self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
+            /* The provider before them: its jobs -- a start, a clone, a
+             * create -- stop where they are, and its unregister waits for
+             * them, so none starts a guest or a forward behind the close. */
+            drop(self.provider.take());
             self.state.forwards.close();
             self.state.vms.close(self.state.stop_secs);
         }
@@ -300,12 +325,21 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
         vms_root,
         #[cfg(target_arch = "x86_64")]
         stop_secs,
-        #[cfg(target_arch = "x86_64")]
         unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     });
 
     let for_cmd = state.clone();
     let cmd = Command::register("hv", HELP, move |args, out| command(&for_cmd, args, out))?;
+    /* The VMs on the management bus, where the guests are: refused only by
+     * a bus that is full or stopping, which the module runs without. */
+    #[cfg(target_arch = "x86_64")]
+    let provider = match provider::register(state.clone()) {
+        Ok(p) => Some(p),
+        Err(status) => {
+            kcore::trace!(0, "hv: the vm provider is not on the management bus -- {}", status.name());
+            None
+        }
+    };
 
     match machine.ext() {
         Ok(ext) => {
@@ -322,7 +356,12 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
         Err(e) => kcore::trace!(0, "hv: loaded -- no guest can run here: {}", e),
     }
 
-    Ok(Box::new(Hv { cmd: Some(cmd), state }))
+    Ok(Box::new(Hv {
+        #[cfg(target_arch = "x86_64")]
+        provider,
+        cmd: Some(cmd),
+        state,
+    }))
 }
 
 /// An `hv::Error` as the kernel's, for the one place the two meet: what
@@ -381,7 +420,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "on" => switch(state, words.next(), true, out),
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
-        "convert" => image::command(rest, out),
+        "convert" => image::command(rest, &mut Shell { out, unloading: &state.unloading }),
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]
@@ -389,7 +428,11 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "start" => state.vms.start(machine, &state.cores, &state.forwards, &state.vms_root, rest, out),
         #[cfg(target_arch = "x86_64")]
-        "create" => store::create(&state.vms_root, rest, out),
+        "create" => store::create(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(target_arch = "x86_64")]
+        "clone" => clone::command(&state.vms_root, &state.vms, rest, &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(target_arch = "x86_64")]
+        "delete" => store::delete_command(&state.vms_root, &state.vms, rest, out),
         #[cfg(target_arch = "x86_64")]
         "vms" => store::list(&state.vms_root, &state.vms, out),
         #[cfg(target_arch = "x86_64")]
@@ -413,8 +456,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "create" | "vms" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart"
-        | "stop" | "forward" | "bench" | "cores" => {
+        "boot" | "start" | "create" | "clone" | "delete" | "vms" | "list" | "console" | "attach" | "send" | "exec"
+        | "wait" | "restart" | "stop" | "forward" | "bench" | "cores" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
@@ -453,7 +496,7 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
             let vm = match state.vms.id_of(vm) {
                 Ok(id) => id,
                 Err(e) => {
-                    let _ = writeln!(out, "{}", e);
+                    let _ = writeln!(out, "hv: {}", e);
                     return;
                 }
             };
@@ -469,16 +512,58 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
                 let _ = writeln!(out, "hv: the guests' switch is not up");
                 return;
             };
-            state.forwards.add(port, vm, guest_port, ip, host, out);
+            match state.forwards.add(port, vm, guest_port, ip, host, out) {
+                Ok(()) => keep_forward(state, vm, port, Some(guest_port), out),
+                Err(e) => {
+                    let _ = writeln!(out, "hv: {}", e);
+                }
+            }
         }
         (Some("del"), Some(port), None, None) => match port.parse::<u16>() {
-            Ok(port) => state.forwards.del(port, out),
+            Ok(port) => match state.forwards.del(port) {
+                Ok(vm) => {
+                    let _ = writeln!(out, "hv: port {} no longer forwarded", port);
+                    keep_forward(state, vm, port, None, out);
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "hv: {}", e);
+                }
+            },
             Err(_) => {
                 let _ = writeln!(out, "{}", forward::usage());
             }
         },
         _ => {
             let _ = writeln!(out, "{}", forward::usage());
+        }
+    }
+}
+
+/// A forward of nos's `port` -- to the guest's `guest_port`, or taken away
+/// -- kept in the vm.toml of VM `vm`, when it was started from its folder:
+/// at its next start it has it, or not, as now.
+#[cfg(target_arch = "x86_64")]
+fn keep_forward(state: &State, vm: u32, port: u16, guest_port: Option<u16>, out: &mut Output) {
+    let Some(name) = state.vms.name_of(vm) else { return };
+    let kept = store::folder_of(&state.vms_root, &name).and_then(|folder| {
+        store::update(&folder, |c| {
+            c.options.forwards.retain(|&(host, _)| host != port);
+            if let Some(guest) = guest_port {
+                c.options.forwards.try_reserve(1).map_err(|_| String::from("out of memory"))?;
+                c.options.forwards.push((port, guest));
+            }
+            Ok(())
+        })
+        .map(|changed| (folder, changed))
+    });
+    match kept {
+        Ok((_, false)) => {}
+        Ok((folder, true)) => {
+            let _ = writeln!(out, "hv: {} {}/{}", if guest_port.is_some() { "kept in" } else { "taken out of" },
+                             folder.path, store::CONFIG);
+        }
+        Err(e) => {
+            let _ = writeln!(out, "hv: not changed in {}'s {} -- {}", name, store::CONFIG, e);
         }
     }
 }

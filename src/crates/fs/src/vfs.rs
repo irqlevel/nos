@@ -60,6 +60,13 @@ pub trait FileSystem: Send {
         0
     }
 
+    /// How big it is and how much of it is free, as `df` says it -- from
+    /// what the filesystem counts in memory, nothing read: None for one
+    /// that keeps no such count, or is not mounted
+    fn space(&self) -> Option<Space> {
+        None
+    }
+
     /// Take the filesystem. `Some(true)` if it may only be read -- asked to
     /// be, or found to be -- `Some(false)` if it may be written, and `None`
     /// if it cannot be mounted at all.
@@ -133,6 +140,14 @@ pub trait FileSystem: Send {
     }
 }
 
+/// What `FileSystem::space` answers, in bytes: the blocks a file's data may
+/// take, and those of them no file has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Space {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
 /// What `stat` answers.
 pub struct FileStat {
     pub kind: Kind,
@@ -173,6 +188,9 @@ pub struct MountInfo {
     pub fs_name: &'static str,
     info: Line,
     pub read_only: bool,
+    /// The block device it is on, as a handle, or 0
+    pub device: usize,
+    pub space: Option<Space>,
 }
 
 impl MountInfo {
@@ -532,6 +550,16 @@ impl Vfs {
         Some(inner.mounts[index].as_ref()?.id)
     }
 
+    /// The space of the filesystem a path is on -- the one the VFS resolves
+    /// it through (`FileSystem::space`): what a file written there may take,
+    /// whether the path is there yet or not. None for a path no mount holds,
+    /// or a filesystem that does not say.
+    pub fn space_of(&self, path: &[u8]) -> Option<Space> {
+        let inner = self.inner.lock();
+        let (index, _) = Self::find_mount(&inner, path)?;
+        inner.mounts[index].as_ref()?.fs.space()
+    }
+
     pub fn mount_count(&self) -> usize {
         self.inner.lock().count
     }
@@ -539,17 +567,29 @@ impl Vfs {
     /// What the index'th mount is, for `mounts` to print.
     pub fn mount_info(&self, index: usize) -> Option<MountInfo> {
         let inner = self.inner.lock();
-        let mount = inner.mounts.get(index)?.as_ref()?;
+        Some(Self::info_of(inner.mounts.get(index)?.as_ref()?))
+    }
 
+    /// Every mount, as `mount_info` has each, copied under one hold of the
+    /// lock: a mount that comes or goes meanwhile cannot make another be
+    /// seen twice, or not at all.
+    pub fn mount_infos(&self) -> [Option<MountInfo>; MAX_MOUNTS] {
+        let inner = self.inner.lock();
+        core::array::from_fn(|i| inner.mounts[i].as_ref().map(Self::info_of))
+    }
+
+    fn info_of(mount: &Mount) -> MountInfo {
         let mut info = MountInfo {
             path: mount.path,
             path_len: mount.path_len,
             fs_name: mount.fs.name(),
             info: Line { text: [0; INFO_MAX], len: 0 },
             read_only: mount.read_only,
+            device: mount.fs.device(),
+            space: mount.fs.space(),
         };
         mount.fs.info(&mut info.info);
-        Some(info)
+        info
     }
 
     /* ---- resolution ---- */

@@ -127,6 +127,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/net-fuzz.py
 
+      # The host API reads what anyone who connects sends it: a request, a
+      # WebSocket frame, a JSON text -- and a misread is a panic in the
+      # kernel, or two readers that disagree about where a request ends. Its
+      # wire crates on the host: known answers, every parser fuzzed, and the
+      # certificates it makes judged by OpenSSL and Python's ssl.
+      - name: Host API wire test (host)
+        if: matrix.arch == 'aarch64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/web-test.py
+
       # The device tree the arm64 boot is handed, the Multiboot2 tags and
       # the ACPI tables the x86 one is, the firmware's memory map, the
       # command line, the GRUB environment block on /boot, a module's .ko:
@@ -173,6 +184,13 @@ jobs:
       - name: netload test (TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/netload-test.py --tcg
+
+      # The host API end to end (docs/api.md): a stranger refused in the
+      # handshake with not a byte parsed, the roles, jobs, the stream, the
+      # limits, no TIME-WAIT left on its port, an unload under a handshake.
+      - name: Host API test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/api-test.py --tcg
 
       # The same kernel with both halves checking themselves (docs/build.md):
       # UBSAN=1 puts clang's sanitizer in front of every operation the C++
