@@ -998,6 +998,21 @@ own, TCP's flags in combinations that mean something. The targets:
   it -- run with none, or after a pty-req of a size and window-changes to
   others, sizes of 0 and of `u32::MAX` among them -- and must say the last
   size sent and how many changes there were, as `edit` is told them;
+- `tls_server`: the TLS server the host API serves over (`tls::server`), run
+  as the module runs it -- a listener and a task a connection over the
+  kernel's TCP, at most four at once -- letting in one key and answering
+  each line said to it; and the world's TLS clients (`tlsc.rs`, rustls'
+  own, pinning the server's key as `nosctl` does) that show the known key,
+  a stranger's or none, speak TLS 1.3 or 1.2 alone, offer the API's
+  protocol, HTTP/1.1, both, none or only `h2`, or break the protocol: an
+  HTTP request where the ClientHello would be, nothing at all, a
+  ClientHello and goodbye, a record tampered with. Over any link no key but
+  the known one is ever let in, and no client without it is answered a
+  byte; over a good one each is refused for its own reason -- unknown key,
+  no certificate, incompatible, protocol, timeout, closed -- or let in with
+  the protocol both prefer, every line back in order and a goodbye; the
+  server is never the side left in TIME-WAIT, and once it stops nothing is
+  left behind;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
   that lines repeat and a search finds them, with runs of one key past the
