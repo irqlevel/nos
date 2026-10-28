@@ -105,10 +105,13 @@ pub(crate) const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_MAX: u16 = 65535;
 
 /// Connections a listener holds that nobody has accepted yet -- handshakes
-/// under way, and ones done and waiting. Past this a SYN to its port is
-/// dropped, as a full accept queue drops it: a flood of SYNs to a listening
-/// port then costs the pool this many slots, not all of them.
-const LISTEN_BACKLOG: usize = 16;
+/// under way, and ones done and waiting -- at most, and by default. Past its
+/// own a SYN to its port is dropped, as a full accept queue drops it: a
+/// flood of SYNs to a listening port then costs the pool that many slots,
+/// not all of them -- and a server that takes few at a time (`listen_with`)
+/// asks for fewer, so that two ports flooded do not take half the pool.
+pub const LISTEN_BACKLOG: usize = 16;
+const _: () = assert!(LISTEN_BACKLOG <= u8::MAX as usize);
 
 /// What `recv` answers below zero.
 pub const RECV_ERROR: isize = -1;
@@ -541,13 +544,16 @@ struct Slot {
     /// (`hv0`) reaches neither a service listening on eth0 nor a
     /// connection made over it.
     device: Option<Nic>,
+    /// A listener's: the connections it holds that nobody has accepted yet,
+    /// at most, 1..=LISTEN_BACKLOG. 0 for a connection.
+    backlog: u8,
 }
 
 impl Slot {
     const FREE: Slot = Slot {
         used: false, listening: false,
         local_ip: 0, local_port: 0, remote_ip: 0, remote_port: 0,
-        device: None,
+        device: None, backlog: 0,
     };
 
     fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, nic: &Nic) -> bool {
@@ -1519,21 +1525,25 @@ impl Tcp {
         /* A SYN for something listening -- a SYN alone: in LISTEN an ACK
          * is answered with a reset, a RST ignored (RFC 9293 3.10.7.2), and
          * a SYN that carries either, or a FIN, is no request to connect. */
-        if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN
-            && pool.find_listener(local_ip, local_port, nic).is_some()
-        {
+        let listener = if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN {
+            pool.find_listener(local_ip, local_port, nic)
+        } else {
+            None
+        };
+        if let Some(listener) = listener {
             let mut pool = pool;
 
             /* Dropped, as a full accept queue drops it: the peer tries again
              * and the pool keeps its slots. */
-            if self.backlog_full(&pool, local_port) {
+            let backlog = usize::from(pool.slots[listener].backlog);
+            if self.backlog_full(&pool, local_port, backlog) {
                 return;
             }
 
             let index = match pool.alloc(Slot {
                 used: true, listening: false,
                 local_ip, local_port, remote_ip, remote_port,
-                device: Some(*nic),
+                device: Some(*nic), backlog: 0,
             }) {
                 Some(index) => index,
                 None => return,
@@ -1596,11 +1606,11 @@ impl Tcp {
     }
 
     /// Whether the port's listener holds all the connections it may that
-    /// nobody has accepted. The caller holds the pool lock and no
-    /// connection's: whether one is waiting to be accepted is its own state,
-    /// read under its own lock, and the pool says which slots are worth
-    /// asking.
-    fn backlog_full(&'static self, pool: &Pool, port: u16) -> bool {
+    /// nobody has accepted -- `backlog`, its own. The caller holds the pool
+    /// lock and no connection's: whether one is waiting to be accepted is
+    /// its own state, read under its own lock, and the pool says which slots
+    /// are worth asking.
+    fn backlog_full(&'static self, pool: &Pool, port: u16, backlog: usize) -> bool {
         let mut pending = 0;
         for i in 0..MAX_CONNECTIONS {
             let slot = &pool.slots[i];
@@ -1616,7 +1626,7 @@ impl Tcp {
                 pending += 1;
             }
         }
-        pending >= LISTEN_BACKLOG
+        pending >= backlog
     }
 
     /// A destination unreachable quoting a segment this machine sent, come
@@ -1717,7 +1727,7 @@ impl Tcp {
         let index = match pool.alloc(Slot {
             used: true, listening: false,
             local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
-            device: Some(*nic),
+            device: Some(*nic), backlog: 0,
         }) {
             Some(index) => index,
             None => {
@@ -1791,7 +1801,14 @@ impl Tcp {
     /// this machine has, and none that comes in by another device -- a
     /// guest behind the hypervisor's switch does not reach a service
     /// listening on eth0. A connection belongs to the device it arrives on.
+    /// It holds LISTEN_BACKLOG connections nobody has accepted, at most.
     pub fn listen(&'static self, nic: &Nic, port: u16) -> Option<&'static Conn> {
+        self.listen_with(nic, port, LISTEN_BACKLOG)
+    }
+
+    /// `listen`, holding `backlog` connections nobody has accepted at most --
+    /// taken into 1..=LISTEN_BACKLOG.
+    pub fn listen_with(&'static self, nic: &Nic, port: u16, backlog: usize) -> Option<&'static Conn> {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
         }
@@ -1812,6 +1829,8 @@ impl Tcp {
             used: true, listening: true,
             local_ip: 0, local_port: port, remote_ip: 0, remote_port: 0,
             device: Some(*nic),
+            /* LISTEN_BACKLOG fits a byte: checked where it is defined */
+            backlog: backlog.clamp(1, LISTEN_BACKLOG) as u8,
         })?;
 
         let mut inner = self.take_fresh(index);

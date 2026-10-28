@@ -208,9 +208,12 @@ pub unsafe extern "C" fn kernel_tcp_recv(
 
 /// A server of Rust's -- sshd's -- owns its connections rather than borrowing
 /// one: it listens on a device's port, accepts, and closes both what it
-/// accepted and the listener. `dev` is a `kernel_net_find` handle.
+/// accepted and the listener. `dev` is a `kernel_net_find` handle; `backlog`
+/// is how many connections nobody has accepted yet the listener holds at
+/// most, taken into 1..=16 -- past them a SYN is dropped and its peer tries
+/// again.
 #[no_mangle]
-pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16) -> ConnPtr {
+pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize) -> ConnPtr {
     if dev == 0 || port == 0 {
         return core::ptr::null_mut();
     }
@@ -218,7 +221,7 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16) -> ConnPtr {
         Some(nic) => nic,
         None => return core::ptr::null_mut(),
     };
-    match TCP.listen(&nic, port) {
+    match TCP.listen_with(&nic, port, backlog) {
         Some(conn) => conn as *const Conn as ConnPtr,
         None => core::ptr::null_mut(),
     }
