@@ -47,6 +47,10 @@
 //! ending and planning nothing from outside the journal's ring.
 
 mod journal;
+mod longlog;
+
+#[global_allocator]
+static HEAP: longlog::Tracking = longlog::Tracking;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -508,7 +512,7 @@ fn replay(path: &str, out: &str) -> i32 {
             if let Some(t) = plan.failed_commit {
                 println!("corrupt: transaction {}'s commit fails its checksum: not replayed, the log ended there", t);
             }
-            for w in &plan.writes {
+            for w in plan.writes.values() {
                 println!("write {} {} {} {}", w.home, w.log, u8::from(w.escaped), w.sequence);
             }
             if let Err(e) = std::fs::write(out, &img) {
@@ -565,6 +569,7 @@ fn main() {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let code = match args.get(1).map(String::as_str) {
         Some("crc") => crc(),
+        Some("long-log") => longlog::run(),
         Some("verify") if args.len() >= 3 => verify(&args[2], args.iter().any(|a| a == "--regions")),
         Some("replay") if args.len() >= 4 => replay(&args[2], &args[3]),
         Some("rotate") if args.len() >= 5 => rotate(&args[2], &args[3], &args[4]),
@@ -586,8 +591,8 @@ fn main() {
             fuzz(&args[2], seed, iterations)
         }
         _ => {
-            eprintln!("usage: extfmt-test crc | verify <image> [--regions] | fuzz <image> [--seed N] [--iterations N] \
-                       | replay <image> <out> | fuzz-journal <image> [--seed N] [--iterations N]");
+            eprintln!("usage: extfmt-test crc | long-log | verify <image> [--regions] | fuzz <image> [--seed N] \
+                       [--iterations N] | replay <image> <out> | fuzz-journal <image> [--seed N] [--iterations N]");
             2
         }
     };

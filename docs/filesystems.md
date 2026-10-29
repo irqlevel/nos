@@ -343,8 +343,13 @@ worked out. Kept whole, a 16 GiB root's 128 MiB journal made the system zone
 520 KiB, and its mount for writing was refused. Past what extfmt
 checks of a superblock, the driver refuses a block it cannot read in a page,
 more blocks than the device has, groups more than their bitmaps cover, an
-inode count that is not what the groups hold, and descriptors whose bitmaps
-or tables lie outside the filesystem.
+inode count that is not what the groups hold, a first inode files may have
+below 11, descriptors of more than 1024 bytes, and descriptors whose bitmaps
+or tables lie outside the filesystem or on its superblock, its descriptors
+and the blocks kept for them to grow into; a journal written through must
+be in the filesystem's blocks and of 1024 blocks at least, as Linux has it,
+or the mount only reads. The root inode is read before anything is
+written: a filesystem whose root does not read is refused as it was found.
 
 Every checksum on what is read is held to the one it should be, and what
 fails is said and not used: the superblock and every descriptor at the
@@ -353,7 +358,17 @@ leaf (by its tail) or index block (by its own) when they are read, which
 fails the read, or leaves an entry out of its directory, with a line saying
 which. An inode in a part of its group's table never written -- an
 uninitialised group's, or past `itable_unused` -- is not read at all.
-Unwritten extents read as zeros, whatever their blocks hold. A file is read
+Unwritten extents read as zeros, whatever their blocks hold. No file may
+own a block of the filesystem's own -- the superblock, the descriptors, the
+bitmaps, the inode tables, the journal: an extent that names one is
+refused wherever it is met, as Linux refuses it (`Meta::file_may_own`, the
+kernel's `ext4_inode_block_valid`) -- a read, a write in place, a disk's
+image mapped off the VFS's lock, a cut's tail made zeros -- and every node
+of a tree a call is about to change is held, as the kernel holds every node
+it reads, to extents in order and apart, none of no blocks or past the
+2^32 a file has. An entry naming an inode of the filesystem's own (below
+the first a file may have, but the root), one deleted, or a file bigger than
+a file here can be, is left out of the tree, said. A file is read
 a run of an extent at a time: as many of its blocks as the read reaches
 and a batch holds -- 64, a page each -- in one call (`Disk::read_pieces`),
 in flight together where the device takes several requests at once.
@@ -366,7 +381,15 @@ A journal holding transactions nobody replayed -- a crash under Linux, or
 under nos once it writes -- is not replayed by a read-only mount, which
 writes nothing: extfmt's recovery planner works out what a replay would
 write (`extfmt::recovery`, held to e2fsck's replay byte for byte by
-`extfmt-test.py`), and every read of a block the plan names is served from
+`extfmt-test.py`) -- in three passes over the log, as the kernel's
+recovery reads it: the scan to its end, noting every home a copy names;
+the revokes of the transactions found whole, of those homes; the copies,
+the newest of each home kept. What it holds grows with the log's blocks and
+no more, in maps a node at a time: a list of every transaction once asked
+the kernel's heap for 917504 bytes at once for a log of 8193 of them --
+which nos's own journal reaches after hours of small commits on a root of
+32 GiB or more, its journal mke2fs's 256 MiB -- and every mount after the
+crash that left it panicked. Every read of a block the plan names is served from
 its newest copy in the journal -- a file's data among them, as Linux's
 data=journal leaves it, the rest of the batch off the device. The
 superblock and the descriptors are read
@@ -417,7 +440,9 @@ out again by its own transaction, is never written home by a checkpoint
 after, and is revoked when the live log holds a copy of it, so that no
 replay writes that copy over what the block becomes. A write that fails in
 a commit or a checkpoint -- or a flush, `sync`'s among them, whose order
-nothing after could count on -- aborts the journal: nothing more is written, the
+nothing after could count on -- aborts the journal: nothing more is written --
+the device itself refuses every write and flush from there on (`Io`), and
+no call begins another transaction -- the
 call fails, reads go on, `sync` fails, `mounts` says `journal-aborted`, and
 the unmount writes nothing, leaving the filesystem to the next mount's
 replay -- or e2fsck's. A block of a file's data that does not write fails
@@ -500,9 +525,17 @@ list in its last; a crash between them leaves an inode of no links named
 nowhere, or a file whose extents run past its size, which a mount for
 writing releases after its replay -- as Linux and e2fsck release another
 kernel's -- writing zeros over what a cut file's last block holds past its
-size, as Linux does. Calls run one at a time, so an inode always leaves the
-list from its head. A directory gives its blocks back in one transaction:
-it is empty when it goes, and what it holds is a run or a few. A punch goes on in transactions of its own, each a
+size, as Linux does. An inode is on the list once at most and leaves it
+wherever on it it is, found by the list's own links: a call whose giving
+back does not finish -- a read that fails part way -- leaves its inode on
+the list with the filesystem still written, and a later cut of the same
+file leaves it where it is, a remove of it takes it off the list before
+the inode is freed, and an inode put on the list above it does not stop it
+leaving. An inode with no extents on the list -- a fifo, a socket, a device
+node, a fast symlink Linux left there still open -- has nothing to give back
+but itself and its attribute block. A directory gives its blocks back as a
+file does, a bounded share a transaction, through the orphan list: an empty
+one that once held millions of names keeps every block they took. A punch goes on in transactions of its own, each a
 range given back whole, and may take the last few free blocks
 (`RESERVE`), which nothing else is given: a punch inside an extent splits
 it, and on a full disk the leaf the split needs must not be what stops a

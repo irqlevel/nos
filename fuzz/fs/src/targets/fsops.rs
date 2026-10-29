@@ -1347,21 +1347,24 @@ impl Fs {
                 if file.size() as u64 != data.len() {
                     return Some(format!("{} is {} bytes, and the model's {}", show(p), file.size(), data.len()));
                 }
-                let mut ranges: Vec<(u64, u64)> = Vec::new();
-                if data.len() <= 1 << 20 {
-                    ranges.push((0, data.len()));
-                } else {
-                    for b in data.nonzero_blocks(4096) {
-                        ranges.push((b * 4096, 4096));
+                let ranges: Vec<(u64, u64)> = crate::machine::sched::harness(|| {
+                    let mut ranges = Vec::new();
+                    if data.len() <= 1 << 20 {
+                        ranges.push((0, data.len()));
+                    } else {
+                        for b in data.nonzero_blocks(4096) {
+                            ranges.push((b * 4096, 4096));
+                        }
+                        ranges.push((data.len().saturating_sub(4096), 4096));
+                        for k in 1..8u64 {
+                            ranges.push((data.len() / 8 * k, 4096));
+                        }
                     }
-                    ranges.push((data.len().saturating_sub(4096), 4096));
-                    for k in 1..8u64 {
-                        ranges.push((data.len() / 8 * k, 4096));
-                    }
-                }
+                    ranges
+                });
                 for (off, n) in ranges {
                     let n = n.min(data.len().saturating_sub(off));
-                    let mut buf = vec![0u8; n as usize];
+                    let mut buf = crate::machine::sched::harness(|| vec![0u8; n as usize]);
                     let mut got = 0usize;
                     if !file.seek(off as usize) {
                         return Some(format!("{} does not seek to {}", show(p), off));
