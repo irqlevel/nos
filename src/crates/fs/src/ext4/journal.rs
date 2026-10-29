@@ -319,7 +319,9 @@ impl Journal {
     /// once a checkpoint has put everything home: what a clean unmount
     /// leaves.
     pub fn close(&mut self, io: &mut Io, cache: &mut Cache) -> bool {
-        if self.aborted || !checkpoint(io, cache, self) {
+        /* The superblock written once, empty: a crash before it replays
+         * only what is home already. */
+        if self.aborted || !write_home(io, cache, self, false) {
             return false;
         }
         self.jsb.set_start(0);
@@ -365,6 +367,12 @@ fn replay(io: &mut Io, map: &[u64], plan: &Plan) -> Result<(), String> {
 /// the live log empty. False, and the journal aborted, when a write fails
 /// -- what is pinned stays pinned, the only copy the reads have.
 pub(super) fn checkpoint(io: &mut Io, cache: &mut Cache, jnl: &mut Journal) -> bool {
+    write_home(io, cache, jnl, true)
+}
+
+/// `checkpoint`, the log's start moved in the journal's superblock only
+/// with `restart`: without, its caller writes the superblock (`close`).
+fn write_home(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, restart: bool) -> bool {
     if jnl.aborted {
         return false;
     }
@@ -381,7 +389,7 @@ pub(super) fn checkpoint(io: &mut Io, cache: &mut Cache, jnl: &mut Journal) -> b
         jnl.abort("the device does not flush a checkpoint");
         return false;
     }
-    if jnl.started {
+    if restart && jnl.started {
         jnl.jsb.set_start(jnl.head);
         jnl.jsb.set_sequence(jnl.next_seq);
         if !jnl.write_jsb(io) {
@@ -541,10 +549,14 @@ impl Txn<'_> {
             self.jnl.in_log.insert(b, seq);
             self.cache.pin(b, d.data);
         }
-        for &b in &self.freed {
-            self.cache.unpin(b);
-            self.jnl.in_log.remove(&b);
+        for (start, end) in self.freed.iter() {
+            self.cache.unpin_range(start, end);
+            let logged: Vec<u64> = self.jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
+            for b in logged {
+                self.jnl.in_log.remove(&b);
+            }
         }
+        self.m.free_blocks = self.m.free_blocks.saturating_sub(self.allocated) + self.freed.blocks();
         if self.cache.pinned_len() > PIN_MAX || self.jnl.used > self.jnl.ring() / 2 {
             /* Committed whatever comes of it: a checkpoint that fails
              * aborts the journal for the calls after this one. */

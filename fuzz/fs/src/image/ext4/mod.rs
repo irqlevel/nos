@@ -21,7 +21,7 @@ pub mod mkfs;
 pub mod replay;
 
 pub use check::check;
-pub use mkfs::{mkfs, Made, Style};
+pub use mkfs::{mkfs, Made, Orphan, Style, FILLER};
 
 pub use super::ext2::{rd16, rd32, wr16, wr32};
 
@@ -79,6 +79,7 @@ pub mod sb {
     pub const UUID: usize = 0x68;
     pub const VOLUME_NAME: usize = 0x78;
     pub const JOURNAL_INUM: usize = 0xE0;
+    pub const LAST_ORPHAN: usize = 0xE8;
     pub const HASH_SEED: usize = 0xEC;
     pub const DEF_HASH_VERSION: usize = 0xFC;
     pub const JNL_BACKUP_TYPE: usize = 0xFD;

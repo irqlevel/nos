@@ -408,7 +408,7 @@ pub fn check(media: &Media, dev_bytes: u64) -> Check {
      * size. */
     let mut deleted: BTreeSet<u32> = BTreeSet::new();
     let mut truncated: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut next = rd32(&s, 0xE8);
+    let mut next = rd32(&s, sb::LAST_ORPHAN);
     while next != 0 {
         if next > inodes || !inode_bit[next as usize - 1] || c.orphans > inodes || deleted.contains(&next)
             || truncated.contains_key(&next)

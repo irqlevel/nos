@@ -49,6 +49,27 @@ pub struct Style {
     /// transactions nobody replayed, their homes holding garbage: 0 for a
     /// clean journal.
     pub journaled: u8,
+    /// Orphans, as a crash between the transactions of one remove or one
+    /// cut leaves them, each put at the head of the superblock's list in
+    /// turn.
+    pub orphans: Vec<Orphan>,
+    /// A file of unwritten extents in the root -- what fallocate leaves a
+    /// disk's image -- made last, over every free block but about this
+    /// many: a disk all but full.
+    pub leave_free: Option<u64>,
+}
+
+/// The name of the file `Style::leave_free` makes.
+pub const FILLER: &[u8] = b"preallocated";
+
+/// An orphan mkfs leaves.
+#[derive(Clone, Debug)]
+pub enum Orphan {
+    /// A file of this content, of no links, named nowhere.
+    Deleted(Data),
+    /// The file at this path cut to this size: its extents running on past
+    /// it, and what its last block held past it still there.
+    Cut(Vec<Vec<u8>>, u64),
 }
 
 /// What `mkfs` made: the image, which inode each path became, how many
@@ -63,6 +84,8 @@ pub struct Made {
     pub journaled: Vec<u64>,
     /// The file blocks of each file allocated unwritten, by path.
     pub unwritten: BTreeMap<Vec<Vec<u8>>, Vec<u64>>,
+    /// The size of the file `Style::leave_free` made, if it made one.
+    pub filled: Option<u64>,
 }
 
 /// A file's runs: logical block, device block, length, unwritten.
@@ -94,6 +117,8 @@ struct Builder<'a> {
     hash_seed: [u32; 4],
     /// The file blocks of each inode allocated unwritten.
     unwritten: BTreeMap<u32, Vec<u64>>,
+    /// The head of the orphan list.
+    last_orphan: u32,
 }
 
 impl Builder<'_> {
@@ -310,6 +335,50 @@ impl Builder<'_> {
         self.set_blocks(&mut i, blocks.len() as u64 + taken);
         self.table.insert(n, i);
         Ok(n)
+    }
+
+    /// Inode `n`, a file of unwritten extents over the free blocks in
+    /// order, as many as leave about `left` free once its tree has its own
+    /// -- and no more runs than a tree this deep holds: its size.
+    fn filler(&mut self, n: u32, left: u64) -> Result<u64, String> {
+        let first = self.g.first_data_block() as usize;
+        let cap = ((self.bs - 12) / 12) as u64;
+        let fill = if self.style.fill == 0 { cap } else { u64::from(self.style.fill).clamp(2, cap) };
+        let max_runs = 4 * fill.pow(u32::from(MAX_DEPTH));
+        let tree_blocks = |runs: u64| {
+            let (mut level, mut t) = (runs, 0u64);
+            while level > 4 {
+                level = level.div_ceil(fill);
+                t += level;
+            }
+            t
+        };
+        let free: Vec<u64> = (first..self.used.len()).filter(|&b| !self.used[b]).map(|b| b as u64).collect();
+        let mut blocks: Vec<(u64, u64, bool)> = Vec::new();
+        let (mut runs, mut run_len) = (0u64, 0u32);
+        for &b in &free {
+            let follows = blocks.last().is_some_and(|&(_, p, _)| p + 1 == b) && run_len < EXT_INIT_MAX_LEN - 1;
+            let r = if follows { runs } else { runs + 1 };
+            if r > max_runs || blocks.len() as u64 + 1 + tree_blocks(r) + left > free.len() as u64 {
+                break;
+            }
+            run_len = if follows { run_len + 1 } else { 1 };
+            runs = r;
+            blocks.push((blocks.len() as u64, b, true));
+        }
+        for &(_, b, _) in &blocks {
+            self.used[b as usize] = true;
+        }
+        let mut i = self.new_inode(S_IFREG | 0o644, 1);
+        let size = blocks.len() as u64 * self.bs as u64;
+        wr32(&mut i, ino::SIZE, size as u32);
+        wr32(&mut i, ino::SIZE_HIGH, (size >> 32) as u32);
+        let runs = Self::runs(&blocks);
+        let taken = self.extents(n, &mut i, &runs)?;
+        self.set_blocks(&mut i, blocks.len() as u64 + taken);
+        self.unwritten.insert(n, (0..blocks.len() as u64).collect());
+        self.table.insert(n, i);
+        Ok(size)
     }
 
     /// A file of a name the tree does not show, or a symlink or device node
@@ -620,6 +689,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         hidden_at: BTreeMap::new(),
         hash_seed: [0; 4],
         unwritten: BTreeMap::new(),
+        last_orphan: 0,
     };
     for k in 0..4 {
         b.hash_seed[k] = b.rand() as u32;
@@ -642,7 +712,55 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
     }
     let mut inodes = BTreeMap::new();
     b.dir(lf, ROOT_INO, &[], 0)?;
-    b.populate(tree, ROOT_INO, ROOT_INO, &mut Vec::new(), &mut inodes, &[(lf, b"lost+found".to_vec(), FT_DIR)])?;
+    /* The filler named in the root as it is made, and given its blocks
+     * once everything else has its own. */
+    if style.leave_free.is_some() && tree.children().is_some_and(|c| c.contains_key(FILLER)) {
+        return Err("the tree has a file of the filler's name".into());
+    }
+    let filler = match style.leave_free {
+        Some(_) => Some(b.alloc_inode()?),
+        None => None,
+    };
+    let mut top = vec![(lf, b"lost+found".to_vec(), FT_DIR)];
+    if let Some(n) = filler {
+        top.push((n, FILLER.to_vec(), FT_REG));
+    }
+    b.populate(tree, ROOT_INO, ROOT_INO, &mut Vec::new(), &mut inodes, &top)?;
+    for o in &style.orphans {
+        let n = match o {
+            Orphan::Deleted(content) => {
+                let n = b.file(content)?;
+                if let Some(i) = b.table.get_mut(&n) {
+                    wr16(i, ino::LINKS, 0);
+                }
+                n
+            }
+            Orphan::Cut(path, size) => {
+                let Some(&n) = inodes.get(path) else { return Err("a cut of nothing".into()) };
+                let Some(i) = b.table.get_mut(&n) else { return Err("a cut of no inode".into()) };
+                let len = rd32(i, ino::SIZE) as u64 | (rd32(i, ino::SIZE_HIGH) as u64) << 32;
+                if *size >= len || rd16(i, ino::LINKS) != 1 {
+                    return Err("a cut of a file not bigger, or of two names".into());
+                }
+                wr32(i, ino::SIZE, *size as u32);
+                wr32(i, ino::SIZE_HIGH, (*size >> 32) as u32);
+                n
+            }
+        };
+        let head = b.last_orphan;
+        if let Some(i) = b.table.get_mut(&n) {
+            wr32(i, ino::DTIME, head);
+        }
+        b.last_orphan = n;
+    }
+    let filled = match (filler, style.leave_free) {
+        (Some(n), Some(left)) => {
+            let size = b.filler(n, left)?;
+            inodes.insert(vec![FILLER.to_vec()], n);
+            Some(size)
+        }
+        _ => None,
+    };
 
     if style.garbage {
         /* Noise in some free blocks: a hole must read as zeros, never as
@@ -662,7 +780,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
     write_super(&mut b, &uuid, journal.as_deref(), !journaled.is_empty());
     let hidden = b.hidden;
     let unwritten = inodes.iter().filter_map(|(p, n)| b.unwritten.get(n).map(|v| (p.clone(), v.clone()))).collect();
-    Ok(Made { media: b.img, inodes, hidden, hidden_at: b.hidden_at, journaled, unwritten })
+    Ok(Made { media: b.img, inodes, hidden, hidden_at: b.hidden_at, journaled, unwritten, filled })
 }
 
 /// The groups: inode tables, bitmaps and descriptors, each with its
@@ -930,6 +1048,7 @@ fn write_super(b: &mut Builder, uuid: &[u8; 16], journal: Option<&[u64]>, recove
         wr16(&mut s, sb::DESC_SIZE, 64);
     }
     wr32(&mut s, sb::MKFS_TIME, b.now);
+    wr32(&mut s, sb::LAST_ORPHAN, b.last_orphan);
     if let Some(blocks) = journal {
         wr32(&mut s, sb::JOURNAL_INUM, JOURNAL_INO);
         /* s_jnl_blocks: the journal inode's i_block, then its size. */

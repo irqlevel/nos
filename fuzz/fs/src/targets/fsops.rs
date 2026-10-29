@@ -389,11 +389,15 @@ pub struct Fs {
     pub strict: bool,
     /// The images held: `model.holds`, one for one.
     pub images: Vec<Image>,
+    /// Whether an image's discard may be refused for want of a block: the
+    /// filesystem had fewer free when it was mounted than it keeps for a
+    /// punch's split, a disk another system filled.
+    pub punch_room: bool,
 }
 
 impl Fs {
     pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
-        Fs { vfs, model, strict, images: Vec::new() }
+        Fs { vfs, model, strict, images: Vec::new(), punch_room: false }
     }
 }
 
@@ -597,6 +601,49 @@ impl Fs {
         }
     }
 
+    /// A punch of bytes `first..end` of the file at `path` that was refused
+    /// part way: the file must be `old` but for some last part of the range
+    /// -- what the transactions before the refusal gave back, from its end
+    /// -- made zeros; and the model takes what it is.
+    fn resync_punch(&mut self, path: &[Vec<u8>], old: &Data, first: u64, end: u64) {
+        let p = join(path);
+        let Some(file) = fs::vfs::Open::new(self.vfs, &p, OPEN_READ) else {
+            self.check(false, format_args!("{} does not open after a punch of it was refused", show(&p)));
+            return;
+        };
+        let mut got = old.clone();
+        let mut ranges = vec![(first, end - first)];
+        for b in old.nonzero_blocks(4096) {
+            ranges.push((b * 4096, 4096));
+        }
+        for (off, n) in ranges {
+            let n = n.min(old.len().saturating_sub(off));
+            let mut buf = vec![0u8; n as usize];
+            let mut k = 0;
+            if file.seek(off as usize) {
+                while k < buf.len() {
+                    match file.read(&mut buf[k..]) {
+                        Some(0) | None => break,
+                        Some(r) => k += r,
+                    }
+                }
+            }
+            got.write(off, &buf[..k]);
+        }
+        let size = file.size() as u64;
+        drop(file);
+        let inside = got.read(first, end - first);
+        let was = old.read(first, end - first);
+        let k = inside.iter().zip(&was).position(|(g, o)| g != o).unwrap_or(inside.len());
+        let ok = size == old.len() && got.same_range(old, 0, first) && got.same_range(old, end, u64::MAX)
+            && inside[k..].iter().all(|&b| b == 0);
+        self.check(ok, format_args!("a punch of {}..{} of {} ({} bytes) refused for room left it other than as \
+                   it was with an end of the range given back", first, end, show(&p), old.len()));
+        if let Some(d) = self.model.file_mut(path) {
+            *d = got;
+        }
+    }
+
     pub fn stat(&mut self, p: &[u8]) {
         let got = self.vfs.stat(p);
         let want = match self.model.resolve(p) {
@@ -791,6 +838,20 @@ impl Fs {
                 _ => Data::new(),
             };
             self.resync_partial(&path, &old, at, &vec![0u8; len as usize]);
+            return;
+        }
+        if zeroes.is_none() && self.punch_room && self.refused_for_room(got, want, mark, &saved) {
+            /* A punch gives back from the range's end, a transaction at a
+             * time: what it gave back before the refusal is the kernel's
+             * to say. */
+            let old = match self.model.node(&path) {
+                Some(Node::File(d)) => d.clone(),
+                _ => Data::new(),
+            };
+            let block = self.model.punch_block.max(1);
+            let (first, end) = (at.div_ceil(block) * block, ((at + len) / block * block).min(size));
+            self.resync_punch(&path, &old, first, end.max(first));
+            reached("an image's discard refused for room, on a disk filled past what ext4 keeps for one");
             return;
         }
         self.check(got == want, format_args!("an image's {} of {} bytes of {} ({} bytes) at {} {}",

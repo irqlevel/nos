@@ -30,6 +30,12 @@ e2fsck -D indexed, a name too long for the kernel's tree, a symlink:
     rewriting a block of a file: the driver must read the file as the
     replay would leave it, and write nothing -- the image's bytes are the
     same after the boot as before it;
+  - an image with two orphans on its list, as a crash between the
+    transactions of a remove and of a cut leaves them (debugfs's): mounted
+    for writing, the driver must release both -- the cut file's thousand
+    extents a few transactions at a time -- the cut file reading to its cut
+    and, grown again, zeros past it; after the boot e2fsck -fn must find
+    nothing, the list empty, debugfs's extents of the cut file ending at it;
   - then nos powers off, and nothing panicked on the way;
   - a second boot changes names and writes data on a fresh copy of mke2fs's
     image and is killed, never unmounted: e2fsck must replay its journal
@@ -71,6 +77,7 @@ spec.loader.exec_module(pt)
 SHELL_PORT = pt.SHELL_PORT
 EXT4_MIB = 96
 JOURNAL_MIB = 80
+ORPHAN_MIB = 72
 
 
 def e2(tmp, *args):
@@ -159,6 +166,36 @@ def journaled(tmp, files, rng):
     pt.check("journal.img: debugfs leaves a transaction unreplayed", code == 0 and "needs_recovery" in stats,
              out + stats[:400])
     return img, newer + files["medium.bin"][4096:]
+
+
+def inode_of(tmp, name, path):
+    code, out = e2(tmp, "debugfs", "-R", "stat %s" % path, "{}/" + name)
+    m = re.search(r"Inode: (\d+)", out)
+    return int(m.group(1)) if code == 0 and m else None
+
+
+def orphaned(tmp):
+    """The image with two orphans on its list, as a crash between the
+    transactions of a remove and of a cut leaves them: large.bin of no
+    links, named nowhere; sparse.bin -- a thousand extents -- cut inside a
+    block of its data, its extents running on past the cut and that block
+    holding past it what it held. The size sparse.bin is cut to."""
+    img = make(tmp, "orphan.img", ORPHAN_MIB)
+    if img is None:
+        return None, None
+    gone, cut = inode_of(tmp, "orphan.img", "/large.bin"), inode_of(tmp, "orphan.img", "/sparse.bin")
+    if not pt.check("orphan.img: its two files found", gone is not None and cut is not None):
+        return None, None
+    size = 4 * 4096 * 500 + 1234
+    cmds = ["sif <%d> links_count 0" % gone, "unlink /large.bin", "sif <%d> dtime 0" % gone,
+            "sif <%d> size %d" % (cut, size), "sif <%d> dtime %d" % (cut, gone), "ssv last_orphan %d" % cut]
+    with open(os.path.join(tmp, "cmds"), "w") as f:
+        f.write("\n".join(cmds) + "\n")
+    code, out = e2(tmp, "debugfs", "-w", "-f", "{}/cmds", "{}/orphan.img")
+    _, stats = e2(tmp, "dumpe2fs", "-h", "{}/orphan.img")
+    pt.check("orphan.img: debugfs leaves two orphans on its list", code == 0
+             and re.search(r"First orphan inode:\s+%d" % cut, stats) is not None, out + stats[:600])
+    return img, size
 
 
 def crc_of(sh, path):
@@ -401,7 +438,8 @@ def main():
     files = content(tmp, rng)
     ext4 = make(tmp, "ext4.img", EXT4_MIB)
     jimg, j_medium = journaled(tmp, files, rng)
-    if ext4 is None or jimg is None:
+    oimg, o_size = orphaned(tmp)
+    if ext4 is None or jimg is None or oimg is None:
         return 1
     with open(jimg, "rb") as f:
         before = hashlib.sha256(f.read()).hexdigest()
@@ -427,7 +465,7 @@ def main():
         return subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     model = Model(files)
-    p = qemu([ext4, jimg], log)
+    p = qemu([ext4, jimg, oimg], log)
     try:
         if not pt.check("boots to its shell", pt.wait_log(log, "boot: complete", 300)):
             return 1
@@ -477,6 +515,29 @@ def main():
         out = sh.run("mounts")
         pt.check("mounts says the journal was read through, not replayed", "journal-not-replayed=" in out, out)
 
+        o4 = disk_named(sh, ORPHAN_MIB)
+        out = sh.run("mount ext4 %s /o4" % o4)
+        pt.check("the image with orphans mounted for writing", "mounted ext4 on /o4" in out and "(ro)" not in out,
+                 out)
+        # What the shell's commands trace is held back from the console
+        # while the shell runs, and is in dmesg.
+        said = sh.run("dmesg 40 orphan")
+        pt.check("its mount releases the orphan list's two inodes", "the orphan list released: 2 inodes" in said,
+                 said)
+        cut = files["sparse.bin"][:o_size]
+        got = crc_of(sh, "/o4/sparse.bin")
+        pt.check("the cut file reads to its cut", got == (zlib.crc32(cut), len(cut)),
+                 "%s, want %08X of %d" % (got, zlib.crc32(cut), len(cut)))
+        listed = sh.run("find /o4 -type f")
+        pt.check("the deleted file is nowhere", "large.bin" not in listed and "/o4/medium.bin" in listed, listed)
+        out = sh.run("truncate /o4/sparse.bin %d" % (o_size + 8192))
+        grown = cut + bytes(8192)
+        got = crc_of(sh, "/o4/sparse.bin")
+        pt.check("grown again, it reads zeros past the cut: its last block's tail was made zeros",
+                 got == (zlib.crc32(grown), len(grown)), "%s, want %08X: %s" % (got, zlib.crc32(grown), out))
+        out = sh.run("umount /o4")
+        pt.check("the image with orphans unmounted", "unmounted /o4" in out, out)
+
         sh.sock.settimeout(5)
         try:
             sh.run("poweroff")
@@ -502,6 +563,13 @@ def main():
              code == 0 and sum(n for _, n in ext) == blocks and [a for a, _ in ext] == sorted(a for a, _ in ext), out)
     code, ext, out = extents(tmp, "ext4.img", "/made/big5")
     pt.check("debugfs's extents of the file cut back to its hole: none", code == 0 and not ext, out)
+    fsck_clean(tmp, "orphan.img", "the image whose orphans the driver released")
+    _, stats = e2(tmp, "dumpe2fs", "-h", "{}/orphan.img")
+    pt.check("its orphan list is empty", "First orphan inode" not in stats, stats[:600])
+    code, ext, out = extents(tmp, "orphan.img", "/sparse.bin")
+    blocks = (o_size + 4095) // 4096
+    pt.check("debugfs's extents of the cut file end at its cut, its regrowth a hole",
+             code == 0 and bool(ext) and all(a + n <= blocks for a, n in ext), out)
 
     # The second boot: names changed, and the machine killed under them.
     klog = os.path.join(tmp, "kill.log")
