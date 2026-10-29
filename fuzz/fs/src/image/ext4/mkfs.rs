@@ -1,6 +1,7 @@
 //! mkfs: an ext4 image of a geometry holding a tree, as mke2fs and a copy
 //! in would leave it -- and, asked, with the newest copies of some of its
-//! metadata only in a journal nobody replayed, their homes stale.
+//! metadata, and of its files' data as Linux's data=journal has a journal
+//! hold them, only in a journal nobody replayed, their homes stale.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,9 +46,9 @@ pub struct Style {
     /// Second names, each of a file in the same directory: (the link's
     /// path, the path of what it names) -- one inode, two links.
     pub links: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
-    /// How many metadata blocks' newest copies are only in the journal, in
-    /// transactions nobody replayed, their homes holding garbage: 0 for a
-    /// clean journal.
+    /// How many blocks' newest copies -- metadata's, and files' data -- are
+    /// only in the journal, in transactions nobody replayed, their homes
+    /// holding garbage: 0 for a clean journal.
     pub journaled: u8,
     /// Orphans, as a crash between the transactions of one remove or one
     /// cut leaves them, each put at the head of the superblock's list in
@@ -111,6 +112,10 @@ struct Builder<'a> {
     /// Blocks of metadata written outside the groups' own -- directory and
     /// extent blocks -- which a journal may hold the newest copies of.
     meta: BTreeSet<u64>,
+    /// Blocks of files' data, written: which a journal may hold the newest
+    /// copies of too, as Linux's data=journal leaves them -- and a read of
+    /// the file mounted read-only must then take from the journal.
+    data: BTreeSet<u64>,
     hidden: u32,
     hidden_at: BTreeMap<Vec<Vec<u8>>, Vec<Vec<u8>>>,
     /// The superblock's seed of the directories' name hash.
@@ -319,6 +324,7 @@ impl Builder<'_> {
                 let mut data = content.read(l * bs, bs);
                 data.resize(self.bs, 0);
                 self.write_block(b, &data);
+                self.data.insert(b);
                 blocks.push((l, b, false));
             } else if self.style.unwritten && self.rand() % 3 == 0 {
                 /* Allocated, never written: what is there is whatever the
@@ -685,6 +691,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         chaos: chaos | 1,
         seed,
         meta: BTreeSet::new(),
+        data: BTreeSet::new(),
         hidden: 0,
         hidden_at: BTreeMap::new(),
         hash_seed: [0; 4],
@@ -946,28 +953,31 @@ fn set_inode_csum(seed: u32, n: u32, i: &mut [u8]) {
 }
 
 /// The journal: its superblock and, with `style.journaled`, transactions
-/// holding the newest copies of that many metadata blocks -- their homes
-/// then given garbage -- among others a replay must leave alone: a copy
-/// of a block a later transaction revokes, and a last transaction never
-/// committed. The blocks whose homes are stale.
+/// holding the newest copies of that many blocks, metadata's and files'
+/// data's about evenly -- their homes then given garbage -- among others a
+/// replay must leave alone: a copy of a block a later transaction revokes,
+/// and a last transaction never committed. The blocks whose homes are
+/// stale.
 fn write_journal(b: &mut Builder, blocks: &[u64], uuid: &[u8; 16]) -> Result<Vec<u64>, String> {
     let bs = b.bs;
     let seq = 1 + (b.rand() % 1000) as u32;
     let mut j = Journal::new(bs, blocks.to_vec(), b.style.journal_csum, b.g.bit64 || b.style.journal_64, *uuid, seq);
     let mut stale = Vec::new();
     if b.style.journaled > 0 {
-        let candidates: Vec<u64> = b.meta.iter().copied().collect();
+        let meta: Vec<u64> = b.meta.iter().copied().collect();
+        let data: Vec<u64> = b.data.iter().copied().collect();
         let mut picked: Vec<u64> = Vec::new();
         for _ in 0..b.style.journaled {
-            if candidates.is_empty() {
+            let from = if data.is_empty() || (!meta.is_empty() && b.rand() % 2 == 0) { &meta } else { &data };
+            if from.is_empty() {
                 break;
             }
-            let c = candidates[b.rand() as usize % candidates.len()];
+            let c = from[b.rand() as usize % from.len()];
             if !picked.contains(&c) {
                 picked.push(c);
             }
         }
-        let others: Vec<u64> = candidates.iter().copied().filter(|c| !picked.contains(c)).collect();
+        let others: Vec<u64> = meta.iter().chain(&data).copied().filter(|c| !picked.contains(c)).collect();
         let read = |b: &Builder, blk: u64| b.img.bytes(blk * bs as u64, bs);
         let mut time = b.now as u64;
         /* A garbage copy of a block, revoked by a later transaction. */

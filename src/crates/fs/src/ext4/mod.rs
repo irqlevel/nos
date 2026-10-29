@@ -153,6 +153,13 @@ impl Ext4 {
         source::read_block(&mut self.io, &mut self.cache, &self.overlay, b, out, false)
     }
 
+    /// Whether a read of block `b` is answered by a copy held -- the
+    /// journal's newer one a read-only mount reads through, the cache's --
+    /// and not by its home: what `data_block` reads first.
+    fn held(&mut self, b: u64) -> bool {
+        self.overlay.contains_key(&b) || self.cache.get(b).is_some()
+    }
+
     fn largedir(&self) -> bool {
         self.m.as_ref().is_some_and(|m| m.largedir())
     }
@@ -728,23 +735,49 @@ impl Ext4 {
         let end = (offset as u64).saturating_add(buf.len() as u64).min(size);
         let mut pos = offset as u64;
         let mut blk = vec![0u8; self.io.bs];
+        let mut batch: Vec<(usize, u64)> = Vec::with_capacity(self.io.batch_blocks());
         while pos < end {
-            let (lblock, within) = (pos / bs, (pos % bs) as usize);
-            let at = (pos - offset as u64) as usize;
+            let lblock = pos / bs;
             match self.map(ino, &raw, lblock) {
                 None => return false,
                 Some(Map::Hole { run }) => {
-                    let n = run.saturating_mul(bs).saturating_sub(within as u64).min(end - pos) as usize;
+                    let (within, at) = (pos % bs, (pos - offset as u64) as usize);
+                    let n = run.saturating_mul(bs).saturating_sub(within).min(end - pos) as usize;
                     buf[at..at + n].fill(0);
                     pos += n as u64;
                 }
-                Some(Map::Blocks { block, .. }) => {
-                    if !self.data_block(block, &mut blk) {
+                Some(Map::Blocks { block, run }) => {
+                    /* As much of the run as the read reaches and a batch
+                     * holds, off the device in one batch -- but a block
+                     * whose copy is held, the journal's newer one a
+                     * read-only mount reads through, read from that, as a
+                     * read of it alone would be. */
+                    let blocks = ((end - 1) / bs - lblock + 1).min(run).min(self.io.batch_blocks() as u64).max(1);
+                    batch.clear();
+                    for k in 0..blocks as usize {
+                        let b = block + k as u64;
+                        if !self.held(b) {
+                            batch.push((k, b));
+                        }
+                    }
+                    if !self.io.read_batch(&batch) {
                         return false;
                     }
-                    let n = (self.io.bs - within).min((end - pos) as usize);
-                    buf[at..at + n].copy_from_slice(&blk[within..within + n]);
-                    pos += n as u64;
+                    let mut next = 0;
+                    for k in 0..blocks as usize {
+                        let (within, at) = ((pos % bs) as usize, (pos - offset as u64) as usize);
+                        let n = (self.io.bs - within).min((end - pos) as usize);
+                        if batch.get(next).is_some_and(|&(j, _)| j == k) {
+                            buf[at..at + n].copy_from_slice(&self.io.slot(k)[within..within + n]);
+                            next += 1;
+                        } else {
+                            if !self.data_block(block + k as u64, &mut blk) {
+                                return false;
+                            }
+                            buf[at..at + n].copy_from_slice(&blk[within..within + n]);
+                        }
+                        pos += n as u64;
+                    }
                 }
             }
         }

@@ -1083,8 +1083,9 @@ the kernel's tree leaves out (names of 64 bytes or more, fast and slow
 symlinks, a device node), directories indexed now and then -- an htree of
 one level, each name in the leaf of its half-MD4 hash's range, by a hash of
 the judge's own (`ext4::hash`) -- and a journal: clean, or holding the newest copies
-of some metadata blocks in transactions nobody replayed, their homes given
-noise -- with a noise copy of a block a later transaction revokes, and a
+of some metadata blocks, and of some of the files' data as Linux's
+data=journal has a journal hold it, in transactions nobody replayed, their
+homes given noise -- with a noise copy of a block a later transaction revokes, and a
 last transaction never committed, both of which a replay must leave alone.
 The `ext4mkfs` target makes such images, and `--e2fsck` holds each to
 e2fsprogs: clean by `e2fsck -fn` (its journal replayed by `-E journal_only`
