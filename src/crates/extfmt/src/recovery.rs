@@ -3,12 +3,22 @@
 //! in the log goes to -- that a driver applies, or reads through without
 //! writing anything on a read-only mount.
 //!
-//! The log is scanned from where the superblock says it starts: block after
+//! The log is read in three passes, as the kernel's recovery reads it. The
+//! scan goes from where the superblock says the log starts: block after
 //! block of the expected sequence, a transaction whole once its commit block
-//! is found, the log ending at the first block that is not the next of it.
-//! Then revokes: a home block revoked by a transaction is not replayed from
-//! that transaction or any before it. Then the copies, oldest first, each
-//! checked against its tag's checksum.
+//! is found, the log ending at the first block that is not the next of it --
+//! and it notes every home block a copy in it names. Then the revokes of the
+//! transactions found whole: a home block revoked by a transaction is not
+//! replayed from that transaction or any before it. Then the copies, oldest
+//! first, each checked against its tag's checksum, the newest of each home
+//! block the one the plan keeps.
+//!
+//! Nothing held grows past the log's own blocks, and nothing is one
+//! allocation the size of the log: maps of the homes named, of their
+//! revokes and of their newest copies, a node at a time. A list of every
+//! transaction and every copy, which this once kept, asked a kernel's heap
+//! for 917504 bytes at once for a log of 8193 transactions -- past what one
+//! allocation of it gives -- and the mount that read such a log panicked.
 //!
 //! What may be stale is not trusted and what is corrupt is refused, as the
 //! kernel decides between them: a commit block whose checksum fails ends
@@ -21,12 +31,11 @@
 //! replaying around it would leave the filesystem neither as it was nor as
 //! it was to be. So is a copy whose checksum fails.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
-use alloc::vec::Vec;
 
-use crate::jbd2::{self, JournalSuper, Tag};
+use crate::jbd2::{self, JournalSuper};
 
 /// One copy to write: journal block `log` to home block `home`, its first
 /// word put back to the magic if it was escaped.
@@ -38,11 +47,11 @@ pub struct Write {
     pub sequence: u32,
 }
 
-/// What a replay writes, in order -- a later write of a home block is a
-/// newer copy of it -- and what it found.
+/// What a replay writes -- the newest copy of each home block the log
+/// holds, by home -- and what it found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    pub writes: Vec<Write>,
+    pub writes: BTreeMap<u64, Write>,
     /// The transactions found whole.
     pub transactions: u32,
     /// The sequence the next transaction is to have: one past the first
@@ -57,15 +66,6 @@ pub struct Plan {
     /// e2fsck have it -- a transaction that was corrupt, for the driver to
     /// say so, not the quiet end a stale block is.
     pub failed_commit: Option<u32>,
-}
-
-/// A transaction found in the scan.
-struct Txn {
-    sequence: u32,
-    copies: Vec<(Tag, u32)>,
-    revokes: Vec<u64>,
-    /// A descriptor or revoke block of it failed its checksum.
-    damaged: bool,
 }
 
 /// How a journal's blocks are read: whole journal block `block` -- its
@@ -113,17 +113,17 @@ pub fn plan(sb: &JournalSuper, block_size: usize, read: &mut ReadJournal) -> Res
         return Err(alloc::format!("journal blocks of {} bytes in a filesystem of {}", sb.blocksize(), block_size));
     }
     let seed = sb.csum_seed();
-    let (first, last) = (sb.first(), sb.last());
-    let ring = last - first;
-    let next = |b: u32| if b + 1 >= last { first } else { b + 1 };
+    let ring = sb.last() - sb.first();
+    let mut buf = vec![0u8; block_size];
 
-    let mut done: Vec<Txn> = Vec::new();
+    /* The scan: where the log ends, and every home a copy in it names. */
+    let mut homes: BTreeSet<u64> = BTreeSet::new();
     let mut block = sb.start();
     let mut sequence = sb.sequence();
-    let mut current = Txn { sequence, copies: Vec::new(), revokes: Vec::new(), damaged: false };
+    let mut whole = 0u32;
+    let mut damaged = false;
     let mut last_commit_time = 0u64;
     let mut failed_commit = None;
-    let mut buf = vec![0u8; block_size];
     let mut scanned = 0u32;
     'scan: while scanned < ring {
         read(block, &mut buf)?;
@@ -135,25 +135,20 @@ pub fn plan(sb: &JournalSuper, block_size: usize, read: &mut ReadJournal) -> Res
         match kind {
             jbd2::DESCRIPTOR_BLOCK => {
                 if sb.csum_v2or3() && !jbd2::block_tail_ok(seed, &buf) {
-                    current.damaged = true;
+                    damaged = true;
                 }
                 for tag in jbd2::tags(&buf, sb) {
-                    block = next(block);
+                    block = next(sb, block);
                     if scanned >= ring {
                         break 'scan;
                     }
                     scanned += 1;
-                    current.copies.push((tag, block));
+                    homes.insert(tag.block);
                 }
             }
             jbd2::REVOKE_BLOCK => {
-                if sb.csum_v2or3() && !jbd2::block_tail_ok(seed, &buf) {
-                    current.damaged = true;
-                } else {
-                    match jbd2::revoke_records(&buf, sb) {
-                        Ok(r) => current.revokes.extend(r),
-                        Err(_) => current.damaged = true,
-                    }
+                if (sb.csum_v2or3() && !jbd2::block_tail_ok(seed, &buf)) || jbd2::revoke_records(&buf, sb).is_err() {
+                    damaged = true;
                 }
             }
             jbd2::COMMIT_BLOCK => {
@@ -168,7 +163,7 @@ pub fn plan(sb: &JournalSuper, block_size: usize, read: &mut ReadJournal) -> Res
                     }
                     break;
                 }
-                if current.damaged {
+                if damaged {
                     if time < last_commit_time {
                         /* Stale blocks from before the log last passed
                          * here, taken for this transaction's: the log ends. */
@@ -179,42 +174,111 @@ pub fn plan(sb: &JournalSuper, block_size: usize, read: &mut ReadJournal) -> Res
                 }
                 last_commit_time = time;
                 sequence = sequence.wrapping_add(1);
-                let whole = core::mem::replace(&mut current,
-                    Txn { sequence, copies: Vec::new(), revokes: Vec::new(), damaged: false });
-                done.push(whole);
+                whole += 1;
+                damaged = false;
             }
             _ => break,
         }
-        block = next(block);
+        block = next(sb, block);
     }
 
-    /* A block revoked by a transaction is not replayed from it or from any
-     * transaction before it: the latest revoke of each block. */
+    /* The revokes of the transactions found whole: a block revoked by a
+     * transaction is not replayed from it or from any transaction before
+     * it -- the latest revoke of each block, of the blocks a copy names. */
     let mut revoked: BTreeMap<u64, u32> = BTreeMap::new();
-    for t in &done {
-        for &home in &t.revokes {
-            revoked.insert(home, t.sequence);
+    let mut walk = Walk { block: sb.start(), sequence: sb.sequence(), left: whole };
+    while let Some(kind) = walk.step(sb, read, &mut buf)? {
+        match kind {
+            jbd2::DESCRIPTOR_BLOCK => {
+                walk.pass_copies(sb, jbd2::tags(&buf, sb).len());
+            }
+            jbd2::REVOKE_BLOCK => {
+                for home in jbd2::revoke_records(&buf, sb)? {
+                    if homes.contains(&home) {
+                        revoked.insert(home, walk.sequence);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    let revoked_at = |home: u64| revoked.get(&home).copied();
+    drop(homes);
 
-    let mut plan = Plan { transactions: done.len() as u32, next_sequence: sequence.wrapping_add(1), failed_commit,
+    /* The copies, oldest first: the newest of each home kept. */
+    let mut plan = Plan { transactions: whole, next_sequence: sequence.wrapping_add(1), failed_commit,
                           ..Plan::default() };
-    for t in &done {
-        for &(tag, log) in &t.copies {
-            if revoked_at(tag.block).is_some_and(|s| !tid_gt(t.sequence, s)) {
+    let mut copy = vec![0u8; block_size];
+    let mut walk = Walk { block: sb.start(), sequence: sb.sequence(), left: whole };
+    while let Some(kind) = walk.step(sb, read, &mut buf)? {
+        if kind != jbd2::DESCRIPTOR_BLOCK {
+            continue;
+        }
+        let seq = walk.sequence;
+        for tag in jbd2::tags(&buf, sb) {
+            let log = walk.pass_copies(sb, 1);
+            if revoked.get(&tag.block).is_some_and(|&s| !tid_gt(seq, s)) {
                 plan.revoked += 1;
                 continue;
             }
-            read(log, &mut buf)?;
-            if !jbd2::copy_ok(sb, seed, t.sequence, &tag, &buf) {
+            read(log, &mut copy)?;
+            if !jbd2::copy_ok(sb, seed, seq, &tag, &copy) {
                 return Err(alloc::format!("transaction {}: the copy of block {} at journal block {} fails its \
-                                           checksum", t.sequence, tag.block, log));
+                                           checksum", seq, tag.block, log));
             }
-            plan.writes.push(Write { home: tag.block, log, escaped: tag.escaped(), sequence: t.sequence });
+            plan.writes.insert(tag.block, Write { home: tag.block, log, escaped: tag.escaped(), sequence: seq });
         }
     }
     Ok(plan)
+}
+
+/// The ring's block after `b`.
+fn next(sb: &JournalSuper, b: u32) -> u32 {
+    if b + 1 >= sb.last() { sb.first() } else { b + 1 }
+}
+
+/// A walk of the transactions the scan found whole, again: block by block
+/// from the log's start, each held to be what the scan read there.
+struct Walk {
+    block: u32,
+    sequence: u32,
+    /// Transactions not yet walked.
+    left: u32,
+}
+
+impl Walk {
+    /// The next descriptor, revoke or commit block into `buf`, and its
+    /// kind -- the sequence moved on past a commit, whose kind is still
+    /// returned -- or None past the last transaction found whole. A block
+    /// that is not the scan's is a journal changed under the replay.
+    fn step(&mut self, sb: &JournalSuper, read: &mut ReadJournal, buf: &mut [u8]) -> Result<Option<u32>, String> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        read(self.block, buf)?;
+        let kind = match jbd2::header(buf) {
+            Some((kind @ (jbd2::DESCRIPTOR_BLOCK | jbd2::REVOKE_BLOCK | jbd2::COMMIT_BLOCK), seq))
+                if seq == self.sequence => kind,
+            _ => return Err(alloc::format!("journal block {}, of transaction {}, is not what it was a pass before",
+                                           self.block, self.sequence)),
+        };
+        self.block = next(sb, self.block);
+        if kind == jbd2::COMMIT_BLOCK {
+            self.sequence = self.sequence.wrapping_add(1);
+            self.left -= 1;
+        }
+        Ok(Some(kind))
+    }
+
+    /// `n` blocks of copies after a descriptor passed: where the last of
+    /// them is.
+    fn pass_copies(&mut self, sb: &JournalSuper, n: usize) -> u32 {
+        let mut at = self.block;
+        for _ in 0..n {
+            at = self.block;
+            self.block = next(sb, self.block);
+        }
+        at
+    }
 }
 
 /// Whether sequence `a` is after `b`, in sequences that wrap

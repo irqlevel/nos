@@ -139,6 +139,14 @@ pub trait FileSystem: Send {
     fn punch(&mut self, _file: NodeId, _first: u64, _count: u64) -> Option<u64> {
         None
     }
+
+    /// How many names the filesystem's own record says `file` has -- its
+    /// inode's link count -- or None where it keeps none (a file of one
+    /// name), the default. What a remove asks of a file held as a disk's
+    /// image by another name: whether this name is the last.
+    fn links(&mut self, _file: NodeId) -> Option<u32> {
+        None
+    }
 }
 
 /// What `FileSystem::space` answers, in bytes: the blocks a file's data may
@@ -1281,6 +1289,23 @@ impl Vfs {
         }
     }
 
+    /// The files at or under `top` held as a disk's image by any of their
+    /// names -- by identity, as `held` asks; a few, a guest's disk each.
+    fn held_under(inner: &Inner, resolved: &Resolved, top: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let Some(mount) = inner.mounts[resolved.mount].as_ref() else { return out };
+        let tree = mount.fs.tree();
+        let mut at = Some(top);
+        while let Some(id) = at {
+            if tree.get(id).is_some_and(|n| n.is_file())
+                && inner.opens(mount.id, identity_key(&*mount.fs, id)).holds != 0 {
+                out.push(id);
+            }
+            at = tree.next_under(top, id);
+        }
+        out
+    }
+
     /// The mount a resolved path is on, if it may be written.
     fn writable<'a>(inner: &'a mut Inner, resolved: &Resolved) -> Option<&'a mut Mount> {
         let mount = inner.mounts[resolved.mount].as_mut()?;
@@ -1330,7 +1355,17 @@ impl Vfs {
             trace!(0, "vfs: something under that path is open");
             return None;
         }
-
+        /* A file held by another name, whose link count says this name is
+         * its last: given back, its blocks would go to the next file while
+         * its image went on writing them off this lock. A sound filesystem
+         * counts every name; one that counts fewer is no reason to let a
+         * guest's disk become another file. */
+        let held = Self::held_under(inner, &resolved, node);
+        let fs = &mut Self::writable(inner, &resolved)?.fs;
+        if held.iter().any(|&file| fs.links(file).is_some_and(|n| n <= 1)) {
+            trace!(0, "vfs: under that path is the last name of a disk's image held by another, while it is open");
+            return None;
+        }
         fs.remove(node).then_some(())
     }
 

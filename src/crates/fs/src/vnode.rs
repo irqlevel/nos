@@ -351,8 +351,10 @@ impl Tree {
 
     /// The node after `at` in a walk of everything under `top`, parents
     /// before their children. No recursion and no list of its own: the links
-    /// are the stack.
-    fn next_under(&self, top: NodeId, at: NodeId) -> Option<NodeId> {
+    /// are the stack -- so that a walk of a directory of any size asks the
+    /// heap for nothing, where a list of the nodes still to visit grew past
+    /// what one allocation of the kernel's holds at 65537 of them.
+    pub fn next_under(&self, top: NodeId, at: NodeId) -> Option<NodeId> {
         if let Some(child) = self.first_child(at) {
             return Some(child);
         }

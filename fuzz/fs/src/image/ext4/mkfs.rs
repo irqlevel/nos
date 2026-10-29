@@ -71,7 +71,18 @@ pub enum Orphan {
     /// The file at this path cut to this size: its extents running on past
     /// it, and what its last block held past it still there.
     Cut(Vec<Vec<u8>>, u64),
+    /// An inode of this mode, of no links, named nowhere, with no extents:
+    /// a fifo, a socket, a device node or a fast symlink -- what Linux puts
+    /// on the list when one still open loses its last name.
+    Special(u16),
 }
+
+/// The modes `Orphan::Special` takes: a fifo, a socket, a character
+/// device, a fast symlink.
+pub const SPECIAL_MODES: [u16; 4] = [0x1000 | 0o644, 0xC000 | 0o755, S_IFCHR | 0o600, S_IFLNK | 0o777];
+
+/// What a fast symlink orphan points at, in its i_block.
+const SPECIAL_LINK: &[u8] = b"../somewhere/else";
 
 /// What `mkfs` made: the image, which inode each path became, how many
 /// entries it made that the tree does not show, and which blocks only the
@@ -661,6 +672,10 @@ impl Builder<'_> {
 /// in would leave it: a filesystem e2fsck -fn passes, or, with
 /// `style.journaled`, one that passes it once its journal is replayed.
 pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> Result<Made, String> {
+    crate::machine::sched::harness(|| make(g, tree, style, now, chaos))
+}
+
+fn make(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> Result<Made, String> {
     if !g.valid() {
         return Err(format!("not a geometry mkfs makes: {:?}", g));
     }
@@ -740,6 +755,16 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
                 if let Some(i) = b.table.get_mut(&n) {
                     wr16(i, ino::LINKS, 0);
                 }
+                n
+            }
+            Orphan::Special(mode) => {
+                let n = b.alloc_inode()?;
+                let mut i = b.new_inode(*mode, 0);
+                if *mode & S_IFMT == S_IFLNK {
+                    wr32(&mut i, ino::SIZE, SPECIAL_LINK.len() as u32);
+                    i[ino::BLOCK..ino::BLOCK + SPECIAL_LINK.len()].copy_from_slice(SPECIAL_LINK);
+                }
+                b.table.insert(n, i);
                 n
             }
             Orphan::Cut(path, size) => {

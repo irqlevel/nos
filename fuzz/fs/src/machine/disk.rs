@@ -86,7 +86,7 @@ impl Media {
     }
 
     pub fn bytes(&self, at: u64, len: usize) -> Vec<u8> {
-        let mut v = vec![0u8; len];
+        let mut v = sched::harness(|| vec![0u8; len]);
         self.read(at, &mut v);
         v
     }

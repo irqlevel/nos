@@ -181,7 +181,13 @@ impl Txn<'_> {
                 let (free, dirs, unused, flags) = (v.free_inodes_count(), v.used_dirs_count(), v.itable_unused(), v.flags());
                 d.set_free_inodes_count(free.saturating_sub(1));
                 if dir {
-                    d.set_used_dirs_count(dirs + 1);
+                    /* A count past the group's inodes is damage: refused,
+                     * where it would overflow or say what cannot be. */
+                    let Some(dirs) = dirs.checked_add(1).filter(|&n| n <= ipg) else {
+                        trace!(0, "ext4: group {} counts {} directories of {} inodes", g, dirs, ipg);
+                        return None;
+                    };
+                    d.set_used_dirs_count(dirs);
                 }
                 if uninit && i >= u64::from(ipg.saturating_sub(unused)) {
                     d.set_itable_unused(ipg - i as u32 - 1);
@@ -233,9 +239,16 @@ impl Txn<'_> {
                 }
                 set_bit(&mut d.data, i, false);
             }
+            let len = self.m.group_len(g);
             let Some(mut desc) = self.group_mut(g) else { return false };
             let free = desc.view().free_blocks_count();
-            desc.set_free_blocks_count(free + (stop - b) as u32);
+            /* A count past the group's blocks is damage: refused, where it
+             * would overflow or say what cannot be. */
+            let Some(free) = free.checked_add((stop - b) as u32).filter(|&n| u64::from(n) <= len) else {
+                trace!(0, "ext4: group {} would count {}+{} free of {} blocks", g, free, stop - b, len);
+                return false;
+            };
+            desc.set_free_blocks_count(free);
             b = stop;
         }
         let logged: Vec<u64> = self.jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
@@ -262,7 +275,11 @@ impl Txn<'_> {
         set_bit(&mut d.data, i, false);
         let Some(mut desc) = self.group_mut(g) else { return false };
         let (free, dirs) = (desc.view().free_inodes_count(), desc.view().used_dirs_count());
-        desc.set_free_inodes_count(free + 1);
+        let Some(free) = free.checked_add(1).filter(|&n| n <= ipg) else {
+            trace!(0, "ext4: group {} would count {}+1 free of {} inodes", g, free, ipg);
+            return false;
+        };
+        desc.set_free_inodes_count(free);
         if dir {
             if dirs == 0 {
                 trace!(0, "ext4: group {} counts no directories, and one is freed", g);
