@@ -91,6 +91,20 @@ pub fn add_blocks(m: &Meta, raw: &mut [u8], blocks: i64) -> bool {
     true
 }
 
+/// Whether inode `raw` holds blocks of its own past its attribute block:
+/// one with no extents holding none -- a device node, a fifo, a socket, a
+/// fast symlink, an empty file of ext3's -- has nothing to give back but
+/// itself and that block; one mapped by blocks that holds some has, which
+/// this does not do.
+pub fn holds_blocks(m: &Meta, raw: &[u8]) -> bool {
+    let huge = m.huge_file() && le32(raw, xinode::I_FLAGS) & HUGE_FILE_FL != 0;
+    let units = if huge { 1 } else { (m.bs / 512) as u64 };
+    let have = u64::from(le32(raw, xinode::I_BLOCKS_LO))
+        | if m.huge_file() { u64::from(le16(raw, xinode::I_BLOCKS_HIGH)) << 32 } else { 0 };
+    let acl = u64::from(le32(raw, xinode::I_FILE_ACL_LO)) | (u64::from(le16(raw, xinode::I_FILE_ACL_HIGH)) << 32);
+    have > if acl != 0 { units } else { 0 }
+}
+
 /// Deleted at `now`: no links, nothing mapped, nothing counted -- what the
 /// kernel leaves of an inode it frees, whose blocks are given back.
 pub fn delete(raw: &mut [u8], now: u32) {

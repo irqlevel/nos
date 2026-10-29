@@ -1253,7 +1253,16 @@ fail. Every request is checked where it arrives, as the block layer's
 contract with a driver says: whole sectors, inside the device, never from
 where the caller may not sleep, and no write to a disk nothing should be
 writing -- a filesystem mounted read-only or not mounted, a partition table
-being read.
+being read. And every allocation of the kernel's code is held to the kernel
+heap's ceiling -- 128 pages at once, past which `kernel_alloc` returns null
+and what cannot fail panics -- where the host's allocator would give
+gigabytes (`fuzz/common/machine/heap.rs`): the fuzzer's own big allocations,
+its model's buffers, images and judges, are marked as its own
+(`sched::harness`), and a refusal says the backtrace of what asked. A list
+grown with a disk's contents once reached 512 KiB unseen by every gate --
+the journal replay's, at 8193 transactions -- and panicked the mount of a
+real root. The `vfs` target lifts the ceiling for itself: ramfs keeps a
+file's data as one allocation, which its model grows past 512 KiB.
 
 The images are the fuzzer's own (`src/image/`), made from the formats and
 not from the drivers: an ext2 as mke2fs lays one out -- every block size,
@@ -1446,6 +1455,15 @@ to the tree `e2fsck -fy` leaves. The targets:
   would go on to repair), to e2fsck -fn -- but for the superblock's free
   counts after a crash, which Linux keeps lazily too, and a lost+found the
   calls removed, which only e2fsck's convention wants;
+- `ext4sys` (`targets/ext4sys.rs`): an image whose one file's extent names
+  the filesystem's own blocks -- an inode table, the descriptors, the
+  journal's log -- its inode's checksum put right, mounted for writing:
+  a write to the file, a read, a cut, a disk's image of it read and written,
+  a remove, each refused; the file beside it read as it was; the blocks the
+  damaged file names left as they were by the time of the unmount; and the
+  filesystem written to after, mounted again. The driver once trusted a
+  file's own extent, and the control -- the system zone not held to -- is
+  found at the first input, its write going over the inode table;
 - `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
   and ramfs mounted beside it and taken down again at paths nested,
   doubled, without a slash and too long; tasks of their own at work on those
@@ -2246,7 +2264,12 @@ checksum, must be refused, as a replay around them would leave the filesystem
 neither as it was nor as it was to be. And the planner is fuzzed over each
 journal damaged at random -- its superblock and its log's first blocks above
 all -- held to never panicking, always ending and planning no copy from outside
-the ring.
+the ring. And a log of 9000 transactions, a copy each, is planned
+(`long-log`) without the planner asking the heap for more than 128 pages at
+once, what one allocation of the kernel's gives: a list of every transaction
+asked for 917504 bytes at 8193 of them -- nos's own journal on a root of 32
+GiB or more holds that many after hours of small commits -- and the mount that
+replayed it panicked, every boot.
 
 Needs cargo and e2fsprogs: Linux, or on a Mac the nos-builder container
 (`docker run --platform linux/amd64 --rm -v "$PWD":/src -w /src nos-builder

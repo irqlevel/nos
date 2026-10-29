@@ -169,9 +169,9 @@ impl Image {
         let block = direct.block as u64;
         let first = offset / block;
         let last = size.div_ceil(block).min(first.saturating_add(EXTENT_BLOCKS));
-        /* Byte offsets of blocks inside the image: below `size`, which a
-         * file's length keeps far from the top of a u64. */
-        let at_block = |b: u64| (b * block).min(size);
+        /* Byte offsets of blocks inside the image: at most `size`, however
+         * near the top of a u64 a damaged length puts it. */
+        let at_block = |b: u64| b.checked_mul(block).map_or(size, |at| at.min(size));
         let mut data_from = None;
         let mut at = first;
         while at < last {
@@ -372,9 +372,13 @@ impl Image {
         }
         let end = offset + len;
         if let Some(block) = self.direct.as_ref().map(|direct| direct.block as u64).filter(|_| unmap) {
-            let (from, to) = (offset.div_ceil(block) * block, end / block * block);
-            if from < to {
-                return self.discard(from, to - from) && self.zero(offset, from) && self.zero(to, end);
+            /* The whole blocks inside: none, where the first one past
+             * `offset` would lie past a u64 -- never a discard from 0. */
+            if let Some(from) = offset.div_ceil(block).checked_mul(block) {
+                let to = end / block * block;
+                if from < to {
+                    return self.discard(from, to - from) && self.zero(offset, from) && self.zero(to, end);
+                }
             }
         }
         self.zero(offset, end)
@@ -390,7 +394,8 @@ impl Image {
         let chunk = ZERO_CHUNK as u64;
         let mut at = from;
         while at < to {
-            let n = (to.min((at / chunk + 1) * chunk) - at) as usize;
+            let piece_end = (at / chunk + 1).checked_mul(chunk).map_or(to, |e| e.min(to));
+            let n = (piece_end - at) as usize;
             if !self.write_at(at, &ZEROS[..n]) {
                 return false;
             }

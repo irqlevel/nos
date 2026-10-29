@@ -114,7 +114,7 @@ pub fn plan_of(img: &[u8]) -> Result<(Super, Journal, JournalSuper, Plan), Strin
 /// needing recovery.
 pub fn replay(img: &mut [u8]) -> Result<Plan, String> {
     let (sb, j, jsb, plan) = plan_of(img)?;
-    for w in &plan.writes {
+    for w in plan.writes.values() {
         if w.home >= sb.blocks_count() {
             return Err(format!("a copy for block {}, past the filesystem's {}", w.home, sb.blocks_count()));
         }
@@ -229,7 +229,7 @@ pub fn fuzz(img: &mut [u8], seed: u64, iterations: u64) -> i32 {
         match plan_of(img) {
             Ok((_, _, jsb, plan)) => {
                 planned += 1;
-                if let Some(w) = plan.writes.iter().find(|w| w.log < jsb.first() || w.log >= jsb.last()) {
+                if let Some(w) = plan.writes.values().find(|w| w.log < jsb.first() || w.log >= jsb.last()) {
                     eprintln!("FINDING: seed {} iteration {}: a copy planned from journal block {}, outside the \
                                ring {}..{}", seed, it, w.log, jsb.first(), jsb.last());
                     return 1;

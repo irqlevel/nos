@@ -4,9 +4,10 @@
 //! with things in it is one transaction a node, deepest first, so that a
 //! crash part way leaves what is left whole; and it starts only once every
 //! directory in it is known to hold on the disk nothing the tree leaves
-//! out, so that a refusal leaves everything. A file whose blocks one
-//! transaction cannot give back leaves its directory in the first, on the
-//! orphan list, and is given back by the transactions after (`orphans.rs`).
+//! out, so that a refusal leaves everything. A file -- or a directory --
+//! whose blocks one transaction cannot give back leaves its directory in the
+//! first, on the orphan list, and is given back by the transactions after
+//! (`orphans.rs`).
 
 use alloc::vec::Vec;
 
@@ -75,18 +76,20 @@ impl Txn<'_> {
     }
 
     /// The name `name` of `ino` taken out of directory `parent`: a
-    /// directory -- which must be empty on the disk -- freed with it, a
-    /// file freed with its last link: whole, or as much of it as this
+    /// directory -- which must be empty on the disk -- or a file of its
+    /// last link freed with it: whole, or as much of it as this
     /// transaction holds, from its end back, the inode then an orphan for
-    /// the transactions after. Whether it is, or None.
+    /// the transactions after -- a directory as a file, since one that once
+    /// held millions of names keeps every block they took. Whether it is
+    /// an orphan, or None.
     fn unlink(&mut self, parent: u32, name: &[u8], ino: u32, is_dir: bool) -> Option<bool> {
         if !self.remove_entry(parent, name, ino) {
             return None;
         }
         let mut raw = self.inode(ino)?;
-        let node = Inode::new(&raw)?;
+        let node_is_dir = Inode::new(&raw)?.is_dir();
         if is_dir {
-            if !node.is_dir() {
+            if !node_is_dir {
                 return None;
             }
             match self.dir_empty(ino, &raw) {
@@ -97,19 +100,22 @@ impl Txn<'_> {
                 }
                 None => return None,
             }
-            return (self.link_dir(parent, false) && self.release(ino, &mut raw, true)).then_some(false);
-        }
-        let links = inodes::links(&raw);
-        if links > 1 {
-            inodes::set_links(&mut raw, links - 1);
-            inodes::touch(&mut raw, self.now, false);
-            return self.put_inode(ino, &mut raw).then_some(false);
+            if !self.link_dir(parent, false) {
+                return None;
+            }
+        } else {
+            let links = inodes::links(&raw);
+            if links > 1 {
+                inodes::set_links(&mut raw, links - 1);
+                inodes::touch(&mut raw, self.now, false);
+                return self.put_inode(ino, &mut raw).then_some(false);
+            }
         }
         inodes::set_links(&mut raw, 0);
         let pieces = self.free_pieces();
         let (_, end) = self.ext_unmap_tail(ino, &mut raw, 0, 1 << 32, pieces)?;
         if end == 0 {
-            return self.release(ino, &mut raw, false).then_some(false);
+            return self.release(ino, &mut raw, is_dir).then_some(false);
         }
         inodes::touch(&mut raw, self.now, false);
         (self.orphan_add(ino, &mut raw) && self.put_inode(ino, &mut raw)).then_some(true)
@@ -117,8 +123,13 @@ impl Txn<'_> {
 
     /// Inode `ino` (`raw`), named nowhere now, given back: every block it
     /// holds, its share of an attribute block, and the inode itself, left
-    /// as the kernel leaves one it deletes.
+    /// as the kernel leaves one it deletes -- and off the orphan list first
+    /// if it is on it, since its dtime, the list's link to the next, is
+    /// about to say when it was deleted.
     pub(super) fn release(&mut self, ino: u32, raw: &mut [u8], is_dir: bool) -> bool {
+        if !self.orphan_forget(ino, raw) {
+            return false;
+        }
         let Some((runs, tree)) = self.file_blocks(ino, raw) else { return false };
         for (start, len) in runs {
             if !self.free_run(start, len) {
@@ -183,8 +194,15 @@ impl Ext4 {
         true
     }
 
-    /// A transaction, for one call.
+    /// A transaction, for one call -- or none once the journal is aborted:
+    /// a call of several transactions (a write of many chunks, a remove of
+    /// a tree, an orphan given back) stops at the first that would follow
+    /// an abort, as nothing more is written.
     pub(super) fn begin(&mut self) -> Option<Txn<'_>> {
+        if self.jnl.as_ref().is_none_or(|j| j.aborted) {
+            trace!(0, "ext4: the journal is aborted: nothing more is written");
+            return None;
+        }
         let now = wall_clock_secs() as u32;
         Some(Txn::new(&mut self.io, self.m.as_mut()?, &mut self.cache, self.jnl.as_mut()?, now))
     }
@@ -208,7 +226,13 @@ impl Ext4 {
             trace!(0, "ext4: a name of {} bytes cannot be made", name.len());
             return None;
         }
-        if self.lookup(dir, name).is_some() {
+        /* Loaded first, and refused if it does not load: made into a
+         * directory not loaded, the new node would meet a second of itself
+         * when the directory is. */
+        if !self.load_dir(dir) {
+            return None;
+        }
+        if self.tree.find_child(dir, name).is_some() {
             trace!(0, "ext4: there is something by that name already");
             return None;
         }
@@ -255,7 +279,10 @@ impl Ext4 {
             trace!(0, "ext4: a name of {} bytes cannot be made", new_name.len());
             return false;
         }
-        if self.lookup(new_dir, new_name).is_some() {
+        if !self.load_dir(new_dir) {
+            return false;
+        }
+        if self.tree.find_child(new_dir, new_name).is_some() {
             trace!(0, "ext4: there is something by that name already");
             return false;
         }
@@ -280,23 +307,23 @@ impl Ext4 {
     }
 
     /// Whether everything at and under `top` may go: every directory in it
-    /// readable, and holding on the disk nothing the tree leaves out.
+    /// readable, and holding on the disk nothing the tree leaves out. A
+    /// walk by the tree's own links (`Tree::next_under`), each directory
+    /// loaded as it is reached so that the walk goes on into it.
     fn removable(&mut self, top: NodeId) -> bool {
-        let mut stack: Vec<NodeId> = Vec::new();
-        stack.push(top);
-        while let Some(at) = stack.pop() {
-            let Some((ino, is_dir)) = self.tree.get(at).map(|n| (n.ino as u32, n.is_dir())) else { return false };
-            if !is_dir {
-                continue;
+        let mut at = Some(top);
+        while let Some(id) = at {
+            let Some((ino, is_dir)) = self.tree.get(id).map(|n| (n.ino as u32, n.is_dir())) else { return false };
+            if is_dir {
+                if !self.load_dir(id) {
+                    return false;
+                }
+                if self.hidden.get(&ino).copied().unwrap_or(0) != 0 {
+                    trace!(0, "ext4: directory {} holds entries the tree does not show: nothing removed", ino);
+                    return false;
+                }
             }
-            if !self.load_dir(at) {
-                return false;
-            }
-            if self.hidden.get(&ino).copied().unwrap_or(0) != 0 {
-                trace!(0, "ext4: directory {} holds entries the tree does not show: nothing removed", ino);
-                return false;
-            }
-            stack.extend(self.tree.children(at));
+            at = self.tree.next_under(top, id);
         }
         true
     }
