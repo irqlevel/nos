@@ -131,7 +131,9 @@ Silicon, about four times as fast.
 The x86-64 smoke boot attaches virtio-blk (modern), virtio-scsi (legacy),
 NVMe, virtio-net and virtio-rng, so it covers the Rust drivers and the MSI-X
 path as well as the C++ underneath them. The arm64 one attaches virtio-mmio
-blk, net and rng. Both boot with `fstest=on`. The arm64 one boots with
+blk, net and rng. Both boot with `fstest=on`, on an ext4 root of 1 KiB
+blocks, as new installs get one (`scripts/mkrootfs.sh`): ext2's root is
+`ext2-test.py`'s. The arm64 one boots with
 `hugepages=64M` too: the huge pool reserved right after the free list, and a
 block of it handed out, written through its pages and given back by the
 frames' selftest (`huge frame selftest: passed`) -- x86's boots nos.iso,
@@ -177,6 +179,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
+| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names and data changed from the shell -- made, moved, an indexed directory written into, files and a tree removed, `fstest`, a copy, a file grown past 4 GiB and cut back -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image and debugfs's extents what was written; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount, every file's MD5 the model's; a journal debugfs left unreplayed, read through without a byte written; and orphans debugfs left on the list -- a file deleted, one of a thousand extents cut inside a block -- released by the mount for writing, the cut file zeros past its cut when grown again, the image clean to e2fsck after, its list empty |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
@@ -189,6 +192,7 @@ swallowing panic messages whole.
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
+| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
@@ -290,7 +294,7 @@ stands on a stack of its own now, and halts in a loop that touches no memory
 ### `nanofs-test.py` -- nanofs
 
 nanofs is the kernel's own small checksummed filesystem, and nothing else in
-the suite touches it: the smoke boots and `ext2-test.py` both run on ext2.
+the suite touches it: the smoke boots run on ext4, `ext2-test.py` on ext2.
 The gate is the `fstest` self-test over a freshly formatted disk, then files
 written, synced, unmounted and read back from a second mount, so that what
 is judged is what reached the disk rather than what a cache still held --
@@ -451,7 +455,7 @@ resized and the screen drawn again whole at the new size, `^Q`, the file
 read back; then the connection killed under a change, which must turn up in
 `<file>.save` with the file as it was saved; and `edit` with no terminal
 must say it needs one. On x86-64 it boots an
-ext2 root that already carries the module, a key and an `/etc/rc`, and logs
+ext4 root that already carries the module, a key and an `/etc/rc`, and logs
 in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
@@ -1263,9 +1267,59 @@ bitmaps and every count -- and sorts what it finds into *corrupt* (what no
 crash of a correct driver may leave: a block in use and free, a block two
 inodes hold, a name leading to an inode not in use) and *unclean* (what
 e2fsck still fixes: a leak, a count, a link count, the state bit). The two
-were checked against e2fsprogs over hundreds of images (`FS_FUZZ_DUMP=<dir>`
-writes each image judged): what `check` calls clean, e2fsck passes; what
-e2fsck faults, `check` calls unclean or corrupt. The targets:
+are held to e2fsprogs by `fs-fuzz.py --e2fsck` (in CI on the x86-64 leg;
+`FS_FUZZ_DUMP=<dir>` writes each image judged): what `check` calls clean,
+e2fsck passes; what it calls unclean for more than the state bit, e2fsck
+faults.
+
+ext4's judge (`fuzz/fs/src/image/ext4/`) is the fuzzer's own as ext2's is,
+sharing nothing with `extfmt` -- `fs-fuzz.py` refuses to run if a judge uses
+it. Its mkfs makes what the ext4 driver is to read and write: blocks of 1, 2
+and 4 KiB, 32- and 64-byte descriptors, flex_bg or not, metadata_csum seeded
+by the UUID or by the superblock's own seed (the UUID changed after), every
+checksum on every block, groups that hold nothing left uninitialised with
+noise where nothing was written, files in extent trees up to four levels
+deep -- deeper than their files need, at times -- with runs of zeros
+allocated as unwritten extents over noise, which must read as zeros, entries
+the kernel's tree leaves out (names of 64 bytes or more, fast and slow
+symlinks, a device node), directories indexed now and then -- an htree of
+one level, each name in the leaf of its half-MD4 hash's range, by a hash of
+the judge's own (`ext4::hash`) -- and a journal: clean, or holding the newest copies
+of some metadata blocks, and of some of the files' data as Linux's
+data=journal has a journal hold it, in transactions nobody replayed, their
+homes given noise -- with a noise copy of a block a later transaction revokes, and a
+last transaction never committed, both of which a replay must leave alone.
+The `ext4mkfs` target makes such images, and `--e2fsck` holds each to
+e2fsprogs: clean by `e2fsck -fn` (its journal replayed by `-E journal_only`
+first), and every directory and file of its tree in what `debugfs rdump`
+reads out of it, byte for byte. e2fsck runs with `-E no_optimize_extents`:
+a tree wider or deeper than its file needs is the format's to allow and the
+kernel's to leave. Four levels, not the kernel's five: e2fsck 1.46.5 writes
+past a five-level array on a tree of five (the bug CVE-2022-1304's fix
+closed).
+
+Its check (`ext4::check`) reads an image as e2fsck -fn does, after doing
+first what e2fsck does first: replaying the journal by a JBD2 reader of its
+own (`ext4::replay`), and releasing the superblock's orphans -- one of no
+links deleted, its blocks and inode free; one with links truncated to its
+size, its blocks past it free and its block count put right as it goes.
+Then the passes: every inode in use below its group's unused tail, its
+checksum and its extent tree -- each node's magic, depth, checksum, entries
+in order, every block claimed once and none of it metadata -- or its block
+map; directories, by their tails or their index blocks' own; where every
+directory hangs, its `..`; link counts; the bitmaps, their checksums and an
+uninitialised group's as its own metadata makes it, against what owns each
+block; the groups' counts. Corrupt and unclean as ext2's are; the
+superblock's free counts not judged, Linux keeping them lazily. The resize
+inode's tree of reserved descriptor blocks is left to e2fsck: nos never
+writes it. `--e2fsck` holds the check to e2fsprogs three more ways: its
+replay of each planted journal to `e2fsck -E journal_only`'s, byte for byte
+but for e2fsck's own superblock fields; mke2fs's images -- 1.46's defaults,
+1 KiB blocks with 128-byte inodes and no 64bit, metadata_csum_seed with the
+UUID changed, an htree directory, an attribute block -- clean to it, and
+every byte of their metadata e2fsck notices changed noticed by it too, thirty
+a filesystem; and orphans debugfs leaves -- deleted and truncated -- released
+to the tree `e2fsck -fy` leaves. The targets:
 
 - `part`: MBRs and GPTs of every shape -- protective and not, CRCs right
   and wrong, entry sizes and counts past sense, slots overlapping, LBAs at
@@ -1285,7 +1339,9 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   through the VFS -- opens with every flag, reads, writes and seeks at every
   edge of a block and of the indirect blocks of every level, across 2 and
   4 GiB and at the end of what a file can be, truncates both ways, creates,
-  renames, removes, chains of directories forty deep -- each call's answer
+  renames, removes, chains of directories forty deep, files of two names
+  (ext2's, as Linux makes them: one name removed, the other the file, and
+  what one is given, both have) -- each call's answer
   held to a model of the tree and the files open on it (`targets/fsops.rs`,
   the VFS's rules and the filesystem's limits written down), the tree read
   back through the VFS held to the model's, the image a clean unmount
@@ -1326,6 +1382,70 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   it lists that can be looked up, a file that reads no more than its size, a
   walk of it all that changes nothing leaving the kernel's heap as it found
   it, nothing read or written once it is unmounted;
+- `ext4mkfs`, `ext4` and `ext4bad`: images of ext4's judge's mkfs -- made
+  and nothing more, for `--e2fsck` to judge; mounted read-only by the ext4
+  driver, with the disk's every write a finding, and worked through the VFS,
+  every answer the model's and the whole tree read back at the end, a
+  journal holding the newest copies of blocks whose homes are noise read
+  through so that the tree is still the one mkfs was given, and orphans
+  mkfs left on the list -- a file of no links named nowhere, a file cut
+  short, its extents and its last block's old bytes running on past the cut
+  -- read as the release would leave them; and damaged -- a
+  byte or three of the metadata at the start of the first groups, or of
+  anything else -- refused, or mounted and walked as ext2bad's are, never a
+  panic, a write or a leak;
+- `ext4rw` (`targets/ext4rw.rs`): the same images mounted for writing -- a
+  planted journal replayed by the mount, planted orphans released by it,
+  now and then a disk all but full, a file of unwritten extents (what
+  fallocate leaves a disk's image) over every free block but a few, held as
+  an image and written into and discarded from -- and worked as the VFS's callers
+  work a filesystem: files and directories made, a directory grown by
+  dozens of entries, renames and moves, removes, recursive ones among them,
+  now and then a name only the disk has (refused) and an htree directory
+  written into (its index dropped); files opened, written, read, sought,
+  grown and cut through their handles and by path, written whole; disks'
+  images held, read, written and discarded off the VFS's lock -- some
+  writes aimed at blocks mkfs left unwritten -- and files of two names, one
+  held as an image while the other is opened for writing (refused);
+  unmounted and mounted again midway. Every answer is the model's -- but a
+  refusal for want of an inode or a block, which the model does not count,
+  and a punch is never refused for one on a disk that had what ext4 keeps
+  for a punch free when it was mounted, however full it is now -- one mkfs
+  left with less may refuse it, and must leave the range as it was with an
+  end of it given back -- and the
+  image a clean unmount leaves must be clean to the judge, nothing left to
+  replay or release, and the model's tree. A remove or a cut of a file of
+  more extents than a transaction gives back goes through the orphan list,
+  so that a picture taken between its transactions holds an orphan, which
+  the judge's replay releases as e2fsck does and the kernel's replay of the
+  picture must release too, leaving none. With the power cut at
+  chosen requests -- and now and then before every request of one call --
+  each picture is judged when its call is done: replayed by the judge's own
+  reader and clean to it, its tree what the call may leave -- the tree
+  before it or after it; for a remove, a node at a time, the tree before
+  less some of what was under the path; for a write, every sector of the
+  file (and its other names) what it held or what it was given, its size
+  between, and nothing of any other file's -- and then mounted by the
+  kernel, on a disk of its own beside the one under test, read-only (the
+  journal read through) and for writing (replayed), both holding the
+  judge's tree, the image that unmount leaves clean -- a picture whose
+  superblock a checkpoint tore across its two sectors among them, which
+  only the journal's copy makes sound. With requests failing,
+  no call may succeed that the model does not have, nothing may be written
+  in a mount after its first failed write of anything but a file's data or
+  a disk image's own flush (the journal aborted) -- a file's data block that
+  does not write fails its call alone, which the judge's map of every block
+  tells apart, and a disk's image goes on writing its file's blocks and
+  flushing off the VFS's lock whatever its filesystem's state -- and
+  the image, replayed, must be what the call that met the failure may
+  leave, between the tree before it and the tree it was asked for. A filesystem whose journal is 64-bit where the filesystem is not
+  (as `resize2fs -s` leaves one) is among the images: every reader of a
+  revoke record must take its width from the journal. `--e2fsck` holds the
+  clean images to e2fsck -fn and their tree to debugfs's rdump, and every
+  picture, replayed by e2fsck alone (`-E journal_only` without `-f`, which
+  would go on to repair), to e2fsck -fn -- but for the superblock's free
+  counts after a crash, which Linux keeps lazily too, and a lost+found the
+  calls removed, which only e2fsck's convention wants;
 - `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
   and ramfs mounted beside it and taken down again at paths nested,
   doubled, without a slash and too long; tasks of their own at work on those
@@ -2068,6 +2188,69 @@ under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
 half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
+
+### `extfmt-test.py` -- the ext2/3/4 format, held to e2fsprogs
+
+`src/crates/extfmt` is the ext2/3/4 on-disk format as bytes -- views of the
+superblock, the group descriptors, inodes, extent trees and block maps,
+directory and extended attribute blocks -- and every checksum metadata_csum,
+and gdt_csum before it, puts on them. hvboot reads a guest's /boot through it,
+and the kernel's ext4 driver is to read and write through it, so a checksum
+computed wrong would be a sound filesystem refused as corrupt -- or, once the
+driver writes, one Linux refuses. `fuzz/extfmt` compiles the crate into a host
+program, and the gate runs it over filesystems mke2fs makes: ext4 as it makes
+one by default (metadata_csum, 64bit, flex_bg, extents, 256-byte inodes) with
+4 KiB blocks; with metadata_csum_seed and its UUID changed after it was made,
+so that the seed is no longer the UUID's; with 1 KiB blocks, 128-byte inodes
+-- whose checksums are 16 bits -- and 32-byte descriptors; with gdt_csum's
+CRC16 in place of metadata_csum; ext3 and ext2. Each holds small and large
+files, a sparse file of two thousand pieces whose extent tree is two levels
+deep, a directory of four hundred entries indexed by `e2fsck -D`, fast and
+slow symlinks, and extended attributes in an inode and in a block of their
+own (`debugfs ea_set`); and `e2fsck -fn` must pass it.
+
+On each, every checksum of every piece of metadata a driver reads -- the
+superblock, every descriptor, both bitmaps of every group that has them
+written, every inode in use, every extent block of every tree, every block
+of every directory (leaves by their tail, index blocks by theirs), every
+attribute block -- must be the one extfmt computes, and there must be at
+least one of every kind the image's features put a checksum on. Then bytes
+the checksums cover are changed one at a time, each kind in turn, and both
+extfmt and `e2fsck -fn` must say so: e2fsck's answering no to a fix counts as
+much as its exit code, since a descriptor's checksum wrong with its fields
+sound is reported and left out of the code. Then each image is fuzzed: up to
+eight bytes of the metadata its walk read changed at a time, two thousand
+times, the walk held to never panicking (overflow checks on) and always
+ending.
+
+Then the journal, which extfmt's recovery planner (`extfmt::recovery`) is to
+replay for the driver: the transactions in the log as a plan of which copy
+goes to which home block, worked out before anything is written. debugfs
+writes into an image's journal and leaves it unreplayed (`jo -c` for v3's
+checksums, `jw -b` blocks, `jw -r` revokes, `jw -c` a transaction left
+uncommitted, `jc`), on images with v3's checksums and without, 64-bit tags
+and 32-bit: a transaction of three blocks; one of a block whose first word is
+the journal's magic, escaped in the log; one that only revokes a block of the
+first; one writing a block of the first again; a revoke and then the revoked
+block written again, which is replayed, the revoke covering only what came
+before it; three hundred blocks at once, more than a descriptor holds; and one
+uncommitted. The planner's replay and `e2fsck -E journal_only`'s must leave
+the same image byte for byte but for the superblock fields e2fsck sets for
+itself -- the time of its check, the kilobytes it counts written, and the
+checksum over them -- the journal's superblock included, empty at the same
+next sequence; and so must they with the journal's ring turned so that its log
+starts five blocks short of the ring's end and wraps. With checksums: the last
+commit torn must end the log before its transaction, where e2fsck ends it; a
+descriptor damaged under a sound commit, and a copy that fails its tag's
+checksum, must be refused, as a replay around them would leave the filesystem
+neither as it was nor as it was to be. And the planner is fuzzed over each
+journal damaged at random -- its superblock and its log's first blocks above
+all -- held to never panicking, always ending and planning no copy from outside
+the ring.
+
+Needs cargo and e2fsprogs: Linux, or on a Mac the nos-builder container
+(`docker run --platform linux/amd64 --rm -v "$PWD":/src -w /src nos-builder
+python3 scripts/extfmt-test.py`), where it takes under a minute.
 
 ### `edit-test.py` -- the editor, decided on the host
 

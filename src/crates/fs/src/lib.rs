@@ -17,6 +17,8 @@
 extern crate alloc;
 
 pub mod ext2;
+pub mod ext4;
+pub mod extfs;
 pub mod files;
 pub mod find;
 pub mod image;

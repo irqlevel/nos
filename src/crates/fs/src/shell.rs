@@ -16,7 +16,7 @@ use crate::paths::{base_name, is_under, Path};
 use crate::vfs::{FileStat, Open, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
                  OPEN_WRITE};
 use crate::vnode::Kind;
-use crate::{ext2, nanofs, ramfs, vfs_instance};
+use crate::{ext2, ext4, nanofs, ramfs, vfs_instance};
 
 /// What `format`'s claim on its device says to whoever is refused it.
 const FORMAT_HOLDER: &core::ffi::CStr = c"format";
@@ -51,6 +51,7 @@ fn find_disk(name: &str, out: &mut Output) -> Option<Disk> {
 const MOUNT_USAGE_RAMFS: &str = "usage: mount ramfs <path>";
 const MOUNT_USAGE_NANOFS: &str = "usage: mount nanofs <disk> <path>";
 const MOUNT_USAGE_EXT2: &str = "usage: mount ext2 <disk> <path> [ro]";
+const MOUNT_USAGE_EXT4: &str = "usage: mount ext4 <disk> <path> [ro]";
 
 pub fn mount(args: &str, out: &mut Output) {
     let mut tokens = args_of(args);
@@ -60,6 +61,7 @@ pub fn mount(args: &str, out: &mut Output) {
             let _ = writeln!(out, "{}", MOUNT_USAGE_RAMFS);
             let _ = writeln!(out, "       mount nanofs <disk> <path>");
             let _ = writeln!(out, "       mount ext2 <disk> <path> [ro]");
+            let _ = writeln!(out, "       mount ext4 <disk> <path> [ro]");
             return;
         }
     };
@@ -88,21 +90,27 @@ pub fn mount(args: &str, out: &mut Output) {
                 let _ = writeln!(out, "mount failed");
             }
         }
-        "ext2" => {
+        "ext2" | "ext4" => {
+            let usage = if fs_name == "ext2" { MOUNT_USAGE_EXT2 } else { MOUNT_USAGE_EXT4 };
             let (disk, path) = match (tokens.next(), tokens.next()) {
                 (Some(disk), Some(path)) => (disk, path),
-                _ => { let _ = writeln!(out, "{}", MOUNT_USAGE_EXT2); return; }
+                _ => { let _ = writeln!(out, "{}", usage); return; }
             };
             let read_only = match tokens.next() {
                 None => false,
                 Some("ro") => true,
-                Some(_) => { let _ = writeln!(out, "{}", MOUNT_USAGE_EXT2); return; }
+                Some(_) => { let _ = writeln!(out, "{}", usage); return; }
             };
             let dev = match find_disk(disk, out) { Some(dev) => dev, None => return };
-            match ext2::mount_at(path, dev.handle(), read_only) {
+            let mounted = if fs_name == "ext2" {
+                ext2::mount_at(path, dev.handle(), read_only)
+            } else {
+                ext4::mount_at(path, dev.handle(), read_only)
+            };
+            match mounted {
                 mounted if mounted < 0 => { let _ = writeln!(out, "mount failed"); }
                 mounted => {
-                    let _ = writeln!(out, "mounted ext2 on {} ({})", path,
+                    let _ = writeln!(out, "mounted {} on {} ({})", fs_name, path,
                         if mounted == 1 { "ro" } else { "rw" });
                 }
             }
@@ -534,7 +542,7 @@ pub fn fstest(args: &str, out: &mut Output) {
 pub fn register_all() {
     let commands: &[(&str, &str, fn(&str, &mut Output))] = &[
         ("format", "format nanofs <disk> - format disk", format),
-        ("mount", "mount <ramfs|nanofs|ext2> ... - mount filesystem", mount),
+        ("mount", "mount <ramfs|nanofs|ext2|ext4> ... - mount filesystem", mount),
         ("umount", "umount <path> - unmount filesystem", umount),
         ("mounts", "mounts - list mount points", mounts),
         ("ls", "ls [path] - list directory (default /)", ls),

@@ -2681,8 +2681,36 @@ impl Ext2 {
             }
         }
 
-        self.tree[file].size = size_of(&inode) as usize;
+        self.sized(file, &inode);
         ok
+    }
+
+    /// The vnodes of the file `file` is a name of given the size `inode`
+    /// says: `file`'s, and -- for a file of more than one name, a hard link
+    /// Linux made -- every loaded one of its others, which would go on
+    /// showing the size they had.
+    fn sized(&mut self, file: NodeId, inode: &Inode) {
+        let size = size_of(inode) as usize;
+        let Some(ino) = self.tree.get_mut(file).map(|n| {
+            n.size = size;
+            n.ino
+        }) else {
+            return;
+        };
+        if inode.links_count <= 1 {
+            return;
+        }
+        let Some(root) = self.root else { return };
+        let mut stack = alloc::vec![root];
+        while let Some(at) = stack.pop() {
+            let Some(n) = self.tree.get_mut(at) else { continue };
+            if n.is_file() && n.ino == ino {
+                n.size = size;
+            }
+            if n.is_dir() {
+                stack.extend(self.tree.children(at));
+            }
+        }
     }
 
     pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
@@ -2731,7 +2759,7 @@ impl Ext2 {
             return false;
         }
 
-        self.tree[file].size = size_of(&inode) as usize;
+        self.sized(file, &inode);
         ok
     }
 
@@ -3089,7 +3117,9 @@ impl Ext2 {
     /// Take `node` -- a file, or a directory with nothing left in it --
     /// out of its parent, release its blocks and inode, and free the vnode.
     /// The name goes first, so a crash leaves at worst an orphan for
-    /// e2fsck.
+    /// e2fsck. A file another name has still -- a hard link, which nos
+    /// makes none of and Linux does -- loses one link and nothing else: its
+    /// blocks and its inode are that other name's.
     fn remove_node(&mut self, node: NodeId) -> bool {
         let (ino, is_dir) = match self.tree.get(node) {
             Some(found) => (found.ino as u32, found.is_dir()),
@@ -3129,6 +3159,15 @@ impl Ext2 {
             Some(inode) => inode,
             None => return false,
         };
+        if !is_dir && inode.links_count > 1 {
+            inode.links_count -= 1;
+            inode.create_time = wall_clock_secs() as u32;
+            if !self.write_inode(ino, &inode) {
+                return false;
+            }
+            self.tree.free_tree(node);
+            return true;
+        }
         if !self.truncate_inode(ino, &mut inode, 0) {
             return false;
         }

@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use crate::image::ext2::{self as img, Geometry, Style};
 use crate::machine::disk::{self, Media};
-use crate::model::{Data, Node};
+use crate::model::{join, Data, Node};
 use crate::targets::fsops::{self, Fs, Limits, Model, NAME_MAX};
 use fs::vfs::{OPEN_CREATE, OPEN_WRITE};
 use crate::{reached, Input};
@@ -266,8 +266,13 @@ pub fn ext2(r: &mut Input) {
     }).sum::<u64>();
     let mut budget = data_blocks / 2;
     let mut inodes = (g.inodes() as u64).saturating_sub(img::FIRST_INO as u64 + 2) / 2;
-    let tree = dir(r, 0, bs, &mut budget, &mut inodes);
-    let mut style = Style { holes: r.bool(), slack: r.bool(), scatter: r.pick(&[0, 0, 4, 16]) };
+    let mut tree = dir(r, 0, bs, &mut budget, &mut inodes);
+    let mut style = Style { holes: r.bool(), slack: r.bool(), scatter: r.pick(&[0, 0, 4, 16]), links: Vec::new() };
+    if r.chance(64) {
+        /* Files of two names, as Linux makes them: a remove of one takes a
+         * link away and leaves the other the file. */
+        style.links = fsops::add_links(r, &mut tree);
+    }
     /* A tree that does not fit written whole has its holes left holes */
     if dense_blocks(&tree, bs) > data_blocks / 2 {
         style.holes = true;
@@ -343,6 +348,10 @@ pub fn ext2(r: &mut Input) {
     let mut f = Fs::new(vfs, Model::new(want, read_only, Limits::fixed(max_file(bs), usize::MAX)), !faults);
     /* ext2 gives an image's discarded blocks back whole */
     f.model.punch_block = bs;
+    f.model.links = fsops::link_groups(&style.links);
+    if !f.model.links.is_empty() {
+        reached("ext2: files with two names");
+    }
 
     /* Now and then the filesystem filled to its last block first, through a
      * file of its own: the writes after it run out of room part way, which
@@ -370,6 +379,19 @@ pub fn ext2(r: &mut Input) {
                 }
                 invariant!(again == read_only as i32, "ext2 mounted again as {}", again);
                 reached("remounted midway");
+            }
+            continue;
+        }
+        let linked: Vec<Vec<Vec<u8>>> = f.model.links.iter().filter(|g| g.len() > 1).flatten().cloned().collect();
+        if !linked.is_empty() && !f.model.read_only && r.chance(24) {
+            /* One name of a file of several taken away, nothing open or
+             * held -- which would refuse it: the others must go on holding
+             * the file, its link count one less. */
+            f.close_all();
+            let p = linked[r.below(linked.len() as u64) as usize].clone();
+            f.remove(&join(&p));
+            if f.model.node(&p).is_none() {
+                reached("ext2: a name of a file of several removed");
             }
             continue;
         }
@@ -425,7 +447,16 @@ pub fn ext2(r: &mut Input) {
     let crashes = disk::with(0, |d| std::mem::take(&mut d.crashes));
     for (n, snap) in crashes {
         let c = img::check(&snap, dev_bytes);
-        dump(if c.unclean.is_empty() && c.corrupt.is_empty() { "crash-clean" } else { "crash-unclean" }, &snap, dev_bytes);
+        /* Tagged as e2fsck -fn would have it: a filesystem left marked
+         * mounted, and nothing else, is one it finds nothing in. */
+        let fsck_clean = c.corrupt.is_empty() && c.unclean.iter().all(|u| u == img::NOT_CLEANLY_UNMOUNTED);
+        /* Not where this run set a feature of its own in the superblock to
+         * have the mount read-only: e2fsck would judge the feature -- its
+         * descriptors' checksums, which the image never had -- and not
+         * what the driver left. */
+        if !ro_features {
+            dump(if fsck_clean { "crash-clean" } else { "crash-unclean" }, &snap, dev_bytes);
+        }
         reached("a power cut judged");
         invariant!(c.corrupt.is_empty(), "the power going before request {} leaves the image corrupt: {:?}", n,
                    c.corrupt);

@@ -47,9 +47,10 @@ $ rc
 ```
 
 `rc` alone shows the file, `rc del <n>` takes a line out, `rc clear` removes it
-and `rc run` runs it now. The file is on the root filesystem, so it takes an
-ext2 root to outlive a reboot ([Filesystems](filesystems.md)); a root image can
-also be made with it inside -- `scripts/mkrootfs.sh` copies a directory in.
+and `rc run` runs it now. The file is on the root filesystem, so it takes a
+root on disk -- ext4, or an ext2 made before it -- to outlive a reboot
+([Filesystems](filesystems.md)); a root image can also be made with it
+inside -- `scripts/mkrootfs.sh` copies a directory in.
 When a line in it keeps the machine from coming up, `rc=off` on the kernel
 command line skips the file.
 

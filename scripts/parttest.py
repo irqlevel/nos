@@ -227,9 +227,11 @@ def dump_bytes(out):
     return rows
 
 
-def mkrootfs(image):
+def mkrootfs(image, fstype="ext4"):
+    """A root image of 64 MiB and 1 KiB blocks: ext4, as new installs get,
+    or ext2, as the roots made before it are."""
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", "", "1024"],
-                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL, env=dict(os.environ, FSTYPE=fstype))
 
 
 def disks_of(tmp):

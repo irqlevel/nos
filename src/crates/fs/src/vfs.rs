@@ -13,6 +13,7 @@
 //! that was closed, or never opened, reads as no file.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
@@ -299,14 +300,43 @@ struct FileSlot {
     file: Option<OpenFile>,
 }
 
+/// How a file is open, across all its names: its writers and its holds.
+/// What refuses a write to a disk's image is counted by the file -- its
+/// mount and inode (`identity_key`) -- and not by the name it was opened
+/// by, so that a second name, a hard link, does not get past the hold.
+#[derive(Clone, Copy, Default)]
+struct Opens {
+    writers: usize,
+    holds: usize,
+}
+
+/// Marks a node's key apart from an inode number (`identity_key`).
+const NODE_KEY: u64 = 1 << 63;
+
+/// Which file `node` of `fs` is: its on-disk inode, so that two names of
+/// one file are one -- or, on a filesystem that keeps none, the node.
+fn identity_key(fs: &dyn FileSystem, node: NodeId) -> u64 {
+    match fs.tree().get(node).map(|n| n.ino) {
+        Some(ino) if ino != 0 => ino as u64,
+        _ => NODE_KEY | node.key(),
+    }
+}
+
 struct Inner {
     mounts: [Option<Mount>; MAX_MOUNTS],
     count: usize,
     next_id: u64,
     files: Vec<FileSlot>,
+    /// The writers and holds of every file open, by mount and identity.
+    opens: BTreeMap<(u64, u64), Opens>,
 }
 
 impl Inner {
+    /// How file `key` of mount `mount_id` is open.
+    fn opens(&self, mount_id: u64, key: u64) -> Opens {
+        self.opens.get(&(mount_id, key)).copied().unwrap_or_default()
+    }
+
     fn mount_by_id(&mut self, id: u64) -> Option<&mut Mount> {
         self.mounts.iter_mut().flatten().find(|mount| mount.id == id)
     }
@@ -358,6 +388,7 @@ impl Inner {
                 slot.generation = slot.generation.wrapping_add(1);
             }
         }
+        self.opens.retain(|&(id, _), _| id != mount_id);
     }
 
     fn remove_mount(&mut self, index: usize) -> Option<Mount> {
@@ -411,6 +442,7 @@ impl Vfs {
                 count: 0,
                 next_id: 1,
                 files: Vec::new(),
+                opens: BTreeMap::new(),
             })?,
         }))
     }
@@ -805,15 +837,18 @@ impl Vfs {
             }
         };
 
+        let key = identity_key(&*mount.fs, node);
+        let opens = inner.opens.get(&(mount.id, key)).copied().unwrap_or_default();
         let size = match mount.fs.tree().get(node) {
             Some(found) if found.is_file() => {
                 /* A disk's image is its holder's alone to write -- and only
-                 * what nobody else writes is held. */
-                if found.holds != 0 && writes {
+                 * what nobody else writes is held: counted by the file, so
+                 * that another name of it is the same file. */
+                if opens.holds != 0 && writes {
                     trace!(0, "vfs: that file is a disk's image, held while it is open");
                     return None;
                 }
-                if flags & OPEN_HOLD != 0 && found.writers != 0 {
+                if flags & OPEN_HOLD != 0 && opens.writers != 0 {
                     trace!(0, "vfs: that file is open for writing, and cannot be held as a disk's image");
                     return None;
                 }
@@ -849,6 +884,13 @@ impl Vfs {
             }
         }
         mount.open_files += 1;
+        let counted = inner.opens.entry((mount_id, key)).or_default();
+        if flags & OPEN_WRITE != 0 {
+            counted.writers += 1;
+        }
+        if flags & OPEN_HOLD != 0 {
+            counted.holds += 1;
+        }
         Some(handle)
     }
 
@@ -882,7 +924,9 @@ impl Vfs {
             None => return,
         };
 
+        let mut key = None;
         if let Some(mount) = inner.mount_by_id(file.mount_id) {
+            key = Some(identity_key(&*mount.fs, file.node));
             if let Some(node) = mount.fs.tree_mut().get_mut(file.node) {
                 node.open_count = node.open_count.saturating_sub(1);
                 if file.flags & OPEN_WRITE != 0 {
@@ -893,6 +937,19 @@ impl Vfs {
                 }
             }
             mount.open_files = mount.open_files.saturating_sub(1);
+        }
+        if let Some(key) = key {
+            if let Some(counted) = inner.opens.get_mut(&(file.mount_id, key)) {
+                if file.flags & OPEN_WRITE != 0 {
+                    counted.writers = counted.writers.saturating_sub(1);
+                }
+                if file.flags & OPEN_HOLD != 0 {
+                    counted.holds = counted.holds.saturating_sub(1);
+                }
+                if counted.writers == 0 && counted.holds == 0 {
+                    inner.opens.remove(&(file.mount_id, key));
+                }
+            }
         }
     }
 
@@ -1034,10 +1091,12 @@ impl Vfs {
             trace!(0, "vfs: that handle is not open for writing");
             return false;
         }
+        let held = inner.mount_by_id(mount_id).map(|mount| identity_key(&*mount.fs, node))
+            .is_some_and(|key| inner.opens(mount_id, key).holds != 0);
         match inner.mount_by_id(mount_id) {
             Some(mount) if !mount.read_only => {
                 match mount.fs.tree().get(node) {
-                    Some(found) if found.is_file() && found.holds == 0 => {}
+                    Some(found) if found.is_file() && !held => {}
                     Some(found) if found.is_file() => {
                         trace!(0, "vfs: that file is a disk's image, its size held while it is open");
                         return false;
@@ -1190,17 +1249,15 @@ impl Vfs {
     /// that two names of one file are one; or, on a filesystem that keeps
     /// none, its node. Neither is ever 0.
     pub fn identity(&self, handle: Handle) -> Option<(u64, u64)> {
-        /// Marks a node's key apart from an inode number.
-        const NODE_KEY: u64 = 1 << 63;
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let (mount_id, node) = {
             let file = inner.file(handle)?;
             (file.mount_id, file.node)
         };
-        let ino = inner.mount_by_id(mount_id)?.fs.tree().get(node)?.ino;
-        let key = if ino != 0 { ino as u64 } else { NODE_KEY | node.key() };
-        Some((mount_id, key))
+        let fs = &inner.mount_by_id(mount_id)?.fs;
+        fs.tree().get(node)?;
+        Some((mount_id, identity_key(&**fs, node)))
     }
 
     /// The open file's size, or None for a handle that is no open file's.
@@ -1213,6 +1270,15 @@ impl Vfs {
             (file.mount_id, file.node)
         };
         Some(inner.mount_by_id(mount_id)?.fs.tree().get(node)?.size)
+    }
+
+    /// Whether the file `node` of the mount a path resolved to is held as a
+    /// disk's image, by whatever name.
+    fn held(inner: &Inner, resolved: &Resolved, node: NodeId) -> bool {
+        match inner.mounts[resolved.mount].as_ref() {
+            Some(mount) => inner.opens(mount.id, identity_key(&*mount.fs, node)).holds != 0,
+            None => false,
+        }
     }
 
     /// The mount a resolved path is on, if it may be written.
@@ -1286,16 +1352,17 @@ impl Vfs {
     fn truncate_locked(inner: &mut Inner, path: &[u8], size: usize) -> Option<()> {
         let resolved = Self::resolve(inner, path)?;
         let node = resolved.node?;
+        let held = Self::held(inner, &resolved, node);
         let fs = &mut Self::writable(inner, &resolved)?.fs;
 
         let found = fs.tree().get(node)?;
         if !found.is_file() {
             return None;
         }
-        /* Cut under a disk's image, the blocks its map named would go back
-         * to the filesystem -- and to the next file -- while the image still
-         * wrote them. */
-        if found.holds != 0 {
+        /* Cut under a disk's image -- by any name of it -- the blocks its
+         * map named would go back to the filesystem, and to the next file,
+         * while the image still wrote them. */
+        if held {
             trace!(0, "vfs: that file is a disk's image, held while it is open");
             return None;
         }
@@ -1372,6 +1439,7 @@ impl Vfs {
 
     fn write_file_locked(inner: &mut Inner, path: &[u8], data: &[u8]) -> Option<()> {
         let resolved = Self::resolve(inner, path)?;
+        let held = resolved.node.is_some_and(|node| Self::held(inner, &resolved, node));
         let fs = &mut Self::writable(inner, &resolved)?.fs;
 
         let node = match resolved.node {
@@ -1386,7 +1454,7 @@ impl Vfs {
             /* A disk's image is its holder's alone to write (`OPEN_HOLD`):
              * cut to nothing under it, its blocks would go to the next file
              * while the image still wrote them. */
-            Some(found) if found.is_file() && found.holds != 0 => {
+            Some(found) if found.is_file() && held => {
                 trace!(0, "vfs: that file is a disk's image, held while it is open");
                 return None;
             }
