@@ -334,7 +334,13 @@ bytes are two, half the old and half the new, which agree on where
 everything is -- while the journal still holds its copy, the log's start
 moving past one only once its home is on the medium: it is used to find the
 journal and nothing more, and a replay must then write a sound one home, or
-a read-only mount find one in the log, or the mount is refused. Past what extfmt
+a read-only mount find one in the log, or the mount is refused. What a mount
+holds of a filesystem's geometry is kept in pieces, none of them growing with
+it past what one allocation of the kernel's heap holds (512 KiB): the
+descriptors a block each, the journal's map as the runs its inode maps it in,
+the system zone -- the blocks no file may own -- as runs joined as they are
+worked out. Kept whole, a 16 GiB root's 128 MiB journal made the system zone
+520 KiB, and its mount for writing was refused. Past what extfmt
 checks of a superblock, the driver refuses a block it cannot read in a page,
 more blocks than the device has, groups more than their bitmaps cover, an
 inode count that is not what the groups hold, and descriptors whose bitmaps

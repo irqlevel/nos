@@ -3,17 +3,24 @@
 //! the system zone: every block its own metadata and its journal take,
 //! which no file is ever given, whatever a bitmap says.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use extfmt::features::{compat, ro_compat};
 use extfmt::group::Desc;
 use extfmt::sb::Super;
 
+use super::journal::JournalMap;
+
 pub(super) struct Meta {
     /// The superblock as last committed, or as read.
     pub sb: Super,
     /// The descriptors, as last committed: whole blocks of them.
-    pub gdt: Vec<u8>,
+    /// The descriptor blocks, as the device or the last commit has them: a
+    /// block each, so that no one allocation holds every descriptor of a
+    /// filesystem of terabytes -- 512 KiB of them at a TiB's 8192 groups,
+    /// past what the kernel's heap gives at once.
+    pub gdt: Vec<Vec<u8>>,
     pub bs: usize,
     pub blocks: u64,
     pub groups: u64,
@@ -107,7 +114,8 @@ impl Meta {
             return None;
         }
         let at = (g as usize).checked_mul(self.desc_size)?;
-        Desc::new(self.gdt.get(at..at + self.desc_size)?)
+        let within = at % self.bs;
+        Desc::new(self.gdt.get(at / self.bs)?.get(within..within + self.desc_size)?)
     }
 
     pub fn table_blocks(&self) -> u64 {
@@ -160,36 +168,34 @@ impl Meta {
     /// The system zone, worked out: each group's copies of the superblock
     /// and descriptors, its bitmaps and inode table, and the journal's
     /// blocks. False with no memory for it.
-    pub fn build_system_zone(&mut self, journal: &[u64]) -> bool {
-        let mut runs: Vec<(u64, u64)> = Vec::new();
-        let groups = self.groups as usize;
-        if runs.try_reserve(groups.saturating_mul(4).saturating_add(journal.len())).is_err() {
-            return false;
-        }
+    pub fn build_system_zone(&mut self, journal: &JournalMap) -> bool {
+        /* Joined as it is worked out, so that what is held is as many runs
+         * as the metadata lies in -- with flex_bg a run or two a flex group,
+         * the journal one or a few -- not four a group and one a journal
+         * block: a 16 GiB filesystem's 128 MiB journal made that 520 KiB, past
+         * what the kernel's heap gives at once, and its mount refused. */
+        let mut zone: BTreeMap<u64, u64> = BTreeMap::new();
         let table = self.table_blocks();
         for g in 0..self.groups {
             let base = self.base_meta(g);
             if base > 0 {
-                runs.push((self.group_start(g), self.group_start(g) + base));
+                zone_add(&mut zone, self.group_start(g), self.group_start(g) + base);
             }
             if let Some(d) = self.desc(g) {
-                runs.push((d.block_bitmap(), d.block_bitmap() + 1));
-                runs.push((d.inode_bitmap(), d.inode_bitmap() + 1));
-                runs.push((d.inode_table(), d.inode_table() + table));
+                let (bb, ib, it) = (d.block_bitmap(), d.inode_bitmap(), d.inode_table());
+                zone_add(&mut zone, bb, bb + 1);
+                zone_add(&mut zone, ib, ib + 1);
+                zone_add(&mut zone, it, it + table);
             }
         }
-        runs.extend(journal.iter().map(|&b| (b, b + 1)));
-        runs.sort_unstable();
+        for (dev, n) in journal.runs() {
+            zone_add(&mut zone, dev, dev + n);
+        }
         let mut merged: Vec<(u64, u64)> = Vec::new();
-        if merged.try_reserve(runs.len()).is_err() {
+        if merged.try_reserve_exact(zone.len()).is_err() {
             return false;
         }
-        for (s, e) in runs {
-            match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
-            }
-        }
+        merged.extend(zone);
         self.system = merged;
         true
     }
@@ -204,4 +210,20 @@ impl Meta {
         let at = self.system.partition_point(|&(_, e)| e <= start);
         self.system.get(at).is_some_and(|&(s, _)| s < end)
     }
+}
+
+/// Blocks `s..e` into `zone` -- runs apart from each other, by where each
+/// starts -- joined with every run they touch.
+fn zone_add(zone: &mut BTreeMap<u64, u64>, mut s: u64, mut e: u64) {
+    if let Some((&ps, &pe)) = zone.range(..=s).next_back() {
+        if pe >= s {
+            s = ps;
+            e = e.max(pe);
+        }
+    }
+    while let Some((&ns, &ne)) = zone.range(s..=e).next() {
+        e = e.max(ne);
+        zone.remove(&ns);
+    }
+    zone.insert(s, e);
 }

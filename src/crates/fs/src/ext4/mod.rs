@@ -56,7 +56,7 @@ use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 use cache::Cache;
 use io::Io;
-use journal::{Journal, Opened, Overlay};
+use journal::{Journal, JournalMap, Opened, Overlay};
 use meta::Meta;
 /// The free blocks only a punch may take: what a filesystem that had at
 /// least these free when it was mounted can never refuse a punch for.
@@ -204,19 +204,18 @@ impl Ext4 {
     fn read_descriptors(&mut self, m: &mut Meta) -> bool {
         let bs = m.bs;
         let gdt_blocks = m.gdt_len() as usize;
-        let mut gdt = Vec::new();
-        if gdt.try_reserve_exact(gdt_blocks * bs).is_err() {
-            trace!(0, "ext4: no memory for {} bytes of descriptors", gdt_blocks * bs);
+        let mut gdt: Vec<Vec<u8>> = Vec::new();
+        if gdt.try_reserve_exact(gdt_blocks).is_err() {
+            trace!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
             return false;
         }
-        gdt.resize(gdt_blocks * bs, 0);
-        let mut blk = vec![0u8; bs];
         for k in 0..gdt_blocks {
+            let mut blk = vec![0u8; bs];
             if !source::read_block(&mut self.io, &mut self.cache, &self.overlay, m.gdt_first() + k as u64, &mut blk,
                 false) {
                 return false;
             }
-            gdt[k * bs..(k + 1) * bs].copy_from_slice(&blk);
+            gdt.push(blk);
         }
         m.gdt = gdt;
         let table_blocks = m.table_blocks();
@@ -334,7 +333,7 @@ impl Ext4 {
         }
         self.m = Some(self.load_held(&sb, !torn)?);
         let has_journal = sb.compat() & features::compat::HAS_JOURNAL != 0;
-        let mut journal_map: Vec<u64> = Vec::new();
+        let mut journal_map = JournalMap::default();
         if has_journal {
             journal_map = match journal::blocks(&mut self.reader()?, &sb) {
                 Ok(map) => map,
@@ -349,13 +348,14 @@ impl Ext4 {
              * writes too: none of them may be the filesystem's own
              * metadata. */
             let Some(m) = self.m.as_mut() else { return None };
-            if !m.build_system_zone(&[]) {
+            if !m.build_system_zone(&JournalMap::default()) {
                 trace!(0, "ext4: no memory for the system zone");
                 self.reset();
                 return None;
             }
-            if let Some(&b) = journal_map.iter().find(|&&b| m.in_system(b)) {
-                trace!(0, "ext4: refused: the journal's block {} is the filesystem's own metadata", b);
+            if let Some((dev, n)) = journal_map.runs().find(|&(dev, n)| m.overlaps_system(dev, dev + n)) {
+                trace!(0, "ext4: refused: the journal's blocks {}..{} are the filesystem's own metadata", dev,
+                       dev + n);
                 self.reset();
                 return None;
             }

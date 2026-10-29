@@ -78,6 +78,12 @@ SHELL_PORT = pt.SHELL_PORT
 EXT4_MIB = 96
 JOURNAL_MIB = 80
 ORPHAN_MIB = 72
+# A TiB, sparse: 8192 groups, whose descriptors are 512 KiB, and a journal of
+# a GiB, 262144 blocks -- each past what one allocation of the kernel's
+# heap holds, as a mount that kept them whole needed (the EX44's 16 GiB root,
+# a 128 MiB journal, was refused that way).
+BIG_MIB = 1 << 20
+BIG_TEXT = "written-on-a-TiB"
 
 
 def e2(tmp, *args):
@@ -142,6 +148,20 @@ def make(tmp, name, mib):
         return None
     code, out = e2(tmp, "e2fsck", "-fyD", "{}/" + name)
     pt.check("%s: e2fsck -D indexes its directories" % name, code in (0, 1), out)
+    return img
+
+
+def make_big(tmp):
+    """An empty ext4 of BIG_MIB, mke2fs's features, a 1 GiB journal: made
+    lazily, its inode tables and journal left as the sparse file has them
+    (zeros), so that the file stays small."""
+    img = os.path.join(tmp, "big.img")
+    with open(img, "wb") as f:
+        f.truncate(BIG_MIB << 20)
+    code, out = e2(tmp, "mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", "-L", "big", "-J", "size=1024",
+                   "-E", "lazy_itable_init=1,lazy_journal_init=1", "{}/big.img")
+    if not pt.check("big.img: mke2fs -t ext4 of a TiB, a 1 GiB journal", code == 0, out):
+        return None
     return img
 
 
@@ -439,7 +459,8 @@ def main():
     ext4 = make(tmp, "ext4.img", EXT4_MIB)
     jimg, j_medium = journaled(tmp, files, rng)
     oimg, o_size = orphaned(tmp)
-    if ext4 is None or jimg is None or oimg is None:
+    bimg = make_big(tmp)
+    if ext4 is None or jimg is None or oimg is None or bimg is None:
         return 1
     with open(jimg, "rb") as f:
         before = hashlib.sha256(f.read()).hexdigest()
@@ -465,7 +486,7 @@ def main():
         return subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     model = Model(files)
-    p = qemu([ext4, jimg, oimg], log)
+    p = qemu([ext4, jimg, oimg, bimg], log)
     try:
         if not pt.check("boots to its shell", pt.wait_log(log, "boot: complete", 300)):
             return 1
@@ -538,6 +559,17 @@ def main():
         out = sh.run("umount /o4")
         pt.check("the image with orphans unmounted", "unmounted /o4" in out, out)
 
+        b4 = disk_named(sh, BIG_MIB)
+        out = sh.run("mount ext4 %s /b4" % b4)
+        pt.check("a TiB filesystem -- 8192 groups, a 1 GiB journal -- mounted for writing",
+                 "mounted ext4 on /b4" in out and "(ro)" not in out, out)
+        sh.run("write /b4/%s.txt %s" % (BIG_TEXT, BIG_TEXT))
+        got = crc_of(sh, "/b4/%s.txt" % BIG_TEXT)
+        want = (zlib.crc32(BIG_TEXT.encode()), len(BIG_TEXT))
+        pt.check("a file written there reads back", got == want, "%s, want %s" % (got, want))
+        out = sh.run("umount /b4")
+        pt.check("the TiB filesystem unmounted", "unmounted /b4" in out, out)
+
         sh.sock.settimeout(5)
         try:
             sh.run("poweroff")
@@ -557,6 +589,7 @@ def main():
     text = open(log, errors="replace").read()
     pt.check("nothing panicked, the way down included", "PANIC" not in text, text[-2000:])
     fsck_clean(tmp, "ext4.img", "the image the driver wrote and unmounted")
+    fsck_clean(tmp, "big.img", "the TiB filesystem the driver wrote and unmounted")
     code, ext, out = extents(tmp, "ext4.img", "/made/large-copy.bin")
     blocks = len(files["large.bin"]) // 4096
     pt.check("debugfs's extents of the copy map its %d blocks, in order" % blocks,
