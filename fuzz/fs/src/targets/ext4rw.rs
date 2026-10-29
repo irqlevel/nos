@@ -629,43 +629,6 @@ fn sync(run: &mut Run, _r: &mut Input) -> Leave {
     Leave::Either
 }
 
-/// Second names for some of the files, each in its own directory: the
-/// tree given them, and the pairs for mkfs.
-fn add_links(r: &mut Input, tree: &mut Node) -> Vec<(Path, Path)> {
-    fn walk(r: &mut Input, n: &mut Node, at: &mut Path, out: &mut Vec<(Path, Path)>) {
-        let Some(children) = n.children_mut() else { return };
-        let files: Vec<Vec<u8>> = children.iter().filter(|(_, c)| !c.is_dir()).map(|(k, _)| k.clone()).collect();
-        for name in files {
-            if r.u8() % 4 != 1 {
-                continue;
-            }
-            let mut link = name.clone();
-            link.extend_from_slice(b"-ln");
-            if link.len() >= fsops::NAME_MAX || children.contains_key(&link) {
-                continue;
-            }
-            let Some(content) = children.get(&name).cloned() else { continue };
-            children.insert(link.clone(), content);
-            let mut l = at.clone();
-            l.push(link);
-            let mut t = at.clone();
-            t.push(name);
-            out.push((l, t));
-        }
-        let dirs: Vec<Vec<u8>> = children.iter().filter(|(_, c)| c.is_dir()).map(|(k, _)| k.clone()).collect();
-        for d in dirs {
-            at.push(d.clone());
-            if let Some(c) = children.get_mut(&d) {
-                walk(r, c, at, out);
-            }
-            at.pop();
-        }
-    }
-    let mut out = Vec::new();
-    walk(r, tree, &mut Vec::new(), &mut out);
-    out
-}
-
 pub fn ext4rw(r: &mut Input) {
     let mut g = geometry(r);
     if g.journal_blocks == 0 {
@@ -683,7 +646,7 @@ pub fn ext4rw(r: &mut Input) {
     let mut inodes = g.inodes() / 3;
     let mut tree = tree(r, bs, &mut budget, &mut inodes);
     if r.chance(128) {
-        st.links = add_links(r, &mut tree);
+        st.links = fsops::add_links(r, &mut tree);
     }
     /* Orphans a crash between the transactions of a remove or a cut left,
      * which the mount for writing must release; and now and then a disk
@@ -758,11 +721,7 @@ pub fn ext4rw(r: &mut Input) {
     let max_file = ((1u64 << 32) - 1) * bs;
     let mut model = Model::new(want, false, Limits::fixed(max_file, usize::MAX));
     model.punch_block = bs;
-    let mut groups: BTreeMap<Path, Vec<Path>> = BTreeMap::new();
-    for (link, target) in &st.links {
-        groups.entry(target.clone()).or_insert_with(|| vec![target.clone()]).push(link.clone());
-    }
-    model.links = groups.into_values().collect();
+    model.links = fsops::link_groups(&st.links);
     if !model.links.is_empty() {
         reached("ext4rw: files with two names");
     }
