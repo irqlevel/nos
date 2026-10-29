@@ -53,7 +53,7 @@ Boot from the disk image (with virtio-blk):
 ./scripts/qemu-disk.sh
 ```
 
-Its ext2 partition is the root filesystem, mounted read-write, so files
+Its ext4 partition is the root filesystem, mounted read-write, so files
 written from the shell are there on the next boot. To give an ISO boot the
 same persistence, attach a root image made with `scripts/mkrootfs.sh` as a
 raw disk; `root=auto` finds it by its label (see

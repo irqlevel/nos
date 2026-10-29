@@ -99,11 +99,15 @@ What `install` does, in order, stopping at the first thing that is wrong:
    partitions on it, not held by md, LVM or the device mapper, not one of the
    running system's filesystems. Warns when the disk is not NVMe or virtio,
    when no network card nos drives is there, when Secure Boot is on.
-2. A partition with nothing on it gets an ext2 filesystem labelled `nos`
-   (`mkfs.ext2 -O ^dir_index`, the format nos writes, docs/filesystems.md).
-   One that has an ext2 nos can write keeps everything on it; one with
-   anything else is refused, unless `--format` says to make a new
-   filesystem in its place -- which loses what was there.
+2. A partition with nothing on it gets an ext4 filesystem labelled `nos`:
+   its features named one by one from none, as nos's ext4 writes them and
+   GRUB 2.06 reads them, nothing this machine's `mke2fs.conf` would add, its
+   inode tables and journal written whole (docs/filesystems.md). One that
+   has an ext4 or an ext2 nos can write -- an install before ext4 made an
+   ext2 -- keeps everything on it, its journal replayed first where nos
+   left it without unmounting; one with anything else is refused, unless
+   `--format` says to make a new filesystem in its place -- which loses
+   what was there.
 3. Mounts it and puts the kernel, the modules, hvboot, `nos.cfg` and
    `/VERSION` there. On a partition that had them, the old ones but
    `nos.cfg` go to `.prev`, together, for `rollback`. `/etc` is the
@@ -265,8 +269,8 @@ it finds one. So does an `/etc/rc` that loads a module from outside
   server to pour it onto.
 - One partition per server: `42_nos` names one. Installing onto another moves
   the entry to it.
-- nos's ext2 has no symlinks or device files, and no file over 4 GiB at 4 KiB
-  blocks ([Filesystems](filesystems.md)).
+- nos makes no symlinks or device files on its root, and leaves out of its
+  tree the ones another system made there ([Filesystems](filesystems.md)).
 - A server whose disks or network card nos has no driver for is not one this
   works on: see the first section.
 

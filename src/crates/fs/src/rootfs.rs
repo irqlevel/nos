@@ -1,15 +1,15 @@
 //! What gets mounted at boot, and where.
 //!
 //! `root=` names the filesystem that becomes `/`: a device, a label, a UUID,
-//! or `auto`, which takes the ext2 or ext4 whose volume label is `nos` --
-//! what scripts/mkrootfs.sh and scripts/build-disk.sh put on theirs -- by
-//! the driver for it (`extfs`). A device that carries neither is tried as
-//! nanofs.
+//! or `auto`, which takes the ext4 or ext2 whose volume label is `nos` --
+//! an ext4 is what nos-install, scripts/mkrootfs.sh and scripts/build-disk.sh
+//! make, an ext2 what an install before ext4 made -- by the driver for it
+//! (`extfs`). A device that carries neither is tried as nanofs.
 //!
 //! With no root on disk there is a fallback layout instead, the one the ISO
-//! had before there was a root to boot from: a ramfs on `/`, the first ext2
-//! found read-only on `/boot`, and the first nanofs found read-write on
-//! `/data`. A procfs goes on `/proc` either way.
+//! had before there was a root to boot from: a ramfs on `/`, the first of
+//! the ext family found read-only on `/boot`, and the first nanofs found
+//! read-write on `/data`. A procfs goes on `/proc` either way.
 
 use block::Disk;
 use kcore::procinfo::{self, Root};
@@ -21,7 +21,7 @@ use crate::nanofs;
 use crate::procfs;
 use crate::ramfs;
 
-/// `root=auto` takes the ext2 carrying this label.
+/// `root=auto` takes the ext4 or ext2 carrying this label.
 const LABEL_AUTO: &[u8] = b"nos";
 
 /// Big enough to cross the direct and the single-indirect block range at any
@@ -62,7 +62,8 @@ fn find_root(mode: &Root, value: &[u8], uuid: &[u8; 16]) -> Option<Disk> {
     None
 }
 
-/// ext2 if the device carries one, else nanofs; false when neither mounts.
+/// ext4 or ext2 if the device carries one, else nanofs; false when neither
+/// mounts.
 fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
 
@@ -92,8 +93,8 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     false
 }
 
-/// No root on disk: a ramfs on /, the first ext2 found read-only on /boot,
-/// the first nanofs found read-write on /data.
+/// No root on disk: a ramfs on /, the first of the ext family found
+/// read-only on /boot, the first nanofs found read-write on /data.
 fn mount_fallback_layout() {
     let vfs = match crate::vfs_instance() {
         Some(vfs) => vfs,

@@ -31,7 +31,8 @@
 # <partition> is named on install; afterwards the GRUB entry names it
 # (/etc/grub.d/42_nos). Runs under Linux, as root, on the machine itself.
 #
-# Install pours the image onto a plain partition as an ext2 filesystem that
+# Install pours the image onto a plain partition as an ext4 filesystem --
+# or the ext2 one an install before ext4 made, kept as it is -- that
 # nos mounts read-write as its root -- the kernel in /boot, the modules built
 # with it in /lib/modules, hvboot in /lib, /etc/rc, the grubenv -- and adds
 # the entry to this machine's GRUB that boots it. The machine's default does
@@ -60,6 +61,13 @@ CMDLINE_MAX=191
 # What nos's ext2 reads and writes (docs/filesystems.md): any other feature
 # is a filesystem it mounts read-only, or not at all
 EXT2_FEATURES_OK=" ext_attr resize_inode dir_index filetype sparse_super large_file "
+# What a new filesystem is made with, named from none -- so that this
+# machine's mke2fs.conf adds nothing: not orphan_file or metadata_csum_seed,
+# which nos mounts read-only and GRUB 2.06 cannot read -- and what an ext4
+# may have that nos writes: the same, and needs_recovery, which a replay
+# clears (scripts/mkrootfs.sh and scripts/build-disk.sh make the same)
+EXT4_FEATURES=none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum
+EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum needs_recovery "
 # What of an image goes where. The system is replaced whole by an update,
 # and what it replaces is kept as .prev, all of it together, for rollback:
 # the kernel, the modules built with it, hvboot -- the loader hv boots a
@@ -249,12 +257,19 @@ check_hardware() {
     fi
 }
 
-check_ext2() {
-    local feats f bad=
+# The filesystem on $1, of type $2 (ext2 or ext4), one nos writes: every
+# feature it has one nos's driver for it writes
+check_fs() {
+    local feats f bad= ok
+    case "$2" in
+        ext2) ok=$EXT2_FEATURES_OK ;;
+        ext4) ok=$EXT4_FEATURES_OK ;;
+        *) die "$1 has a $2 filesystem on it, which nos does not take" ;;
+    esac
     feats=$(dumpe2fs -h "$1" 2>/dev/null | sed -n 's/^Filesystem features:[[:space:]]*//p')
-    [ -n "$feats" ] || die "cannot read the ext2 superblock of $1"
+    [ -n "$feats" ] || die "cannot read the $2 superblock of $1"
     for f in $feats; do
-        case "$EXT2_FEATURES_OK" in
+        case "$ok" in
             *" $f "*) ;;
             *) bad="$bad $f" ;;
         esac
@@ -272,10 +287,17 @@ MOUNTED_HERE=0
 
 # e2fsck before a write as well as after: what is found after should be
 # what the write did, not what was there. A filesystem mounted elsewhere
-# cannot be checked, and is not
+# cannot be checked, and is not. A journal that needs replaying -- nos
+# stopped without unmounting -- is replayed first, its orphans released, as
+# any mount would: e2fsck -fn looks at what the replay leaves (-y with
+# journal_only and no -f replays, and goes no further)
 fsck_partition() {
     local dev=$1 when=$2
     [ -z "$(findmnt -rno TARGET --source "$dev" 2>/dev/null || true)" ] || return 0
+    if dumpe2fs -h "$dev" 2>/dev/null | grep -q '^Filesystem features:.*needs_recovery'; then
+        say "replaying the journal of $dev"
+        e2fsck -y -E journal_only "$dev" >/dev/null 2>&1 || true
+    fi
     if ! e2fsck -fn "$dev" >/dev/null 2>&1; then
         e2fsck -fn "$dev" >&2 || true
         die "e2fsck finds $dev damaged $when -- e2fsck -f $dev repairs it"
@@ -681,7 +703,7 @@ only_options() {
 
 cmd_install() {
     local mode=$1 fs uuid before cmdline
-    need blkid findmnt lsblk mount umount mountpoint mkfs.ext2 dumpe2fs e2fsck
+    need blkid findmnt lsblk mount umount mountpoint mkfs.ext4 dumpe2fs e2fsck
     need_editenv
     if [ "$mode" = install ]; then
         [ -n "$PART" ] || die "install onto which partition? (nos-install install /dev/nvme0n1p4)"
@@ -699,15 +721,16 @@ cmd_install() {
         [ "$mode" = install ] || die "$PART has no filesystem: install the image on it"
         [ -z "$(findmnt -rno TARGET --source "$PART" 2>/dev/null || true)" ] ||
             die "$PART is mounted: unmount it to make a new filesystem there"
-        say "making an ext2 filesystem on $PART${fs:+, in place of its $fs}"
-        mkfs.ext2 -F -q -L "$LABEL" -b 4096 -m 0 -O ^dir_index "$PART" ||
-            die "mkfs.ext2 on $PART failed"
-        # This machine's mke2fs.conf may have added what nos cannot write
-        check_ext2 "$PART"
+        say "making an ext4 filesystem on $PART${fs:+, in place of its $fs}"
+        mkfs.ext4 -F -q -L "$LABEL" -b 4096 -m 0 -O "$EXT4_FEATURES" \
+            -E lazy_itable_init=0,lazy_journal_init=0 "$PART" ||
+            die "mkfs.ext4 on $PART failed"
+        # What it made, held to what nos writes all the same
+        check_fs "$PART" ext4
         # A new filesystem starts from what the options say
         SET_CMDLINE=1
-    elif [ "$fs" = ext2 ]; then
-        check_ext2 "$PART"
+    elif [ "$fs" = ext2 ] || [ "$fs" = ext4 ]; then
+        check_fs "$PART" "$fs"
         fsck_partition "$PART" "before anything is written"
     else
         die "$PART has a $fs filesystem on it, which nos does not take -- --format makes a new one in its place (everything on it is lost)"

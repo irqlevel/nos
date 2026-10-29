@@ -169,10 +169,11 @@ jobs:
       - name: Partition table test (${{ matrix.arch }}, TCG)
         run: python3 scripts/parttest.py --arch ${{ matrix.arch }} --tcg
 
-      # The smoke boot's fstest checks that ext2 reads back what it wrote;
-      # this checks that what it leaves on the disk is a filesystem e2fsck
-      # still calls clean. It drives the shell over UDP, which is the arm64
-      # boot's command line.
+      # The smoke boots' roots are ext4, as new installs' are; this boot's is
+      # ext2, as the roots made before ext4 are: its fstest checks that ext2
+      # reads back what it wrote, and e2fsck that what it leaves on the disk
+      # is a filesystem it still calls clean. It drives the shell over UDP,
+      # which is the arm64 boot's command line.
       - name: ext2 write test (e2fsck, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext2-test.py --tcg
@@ -181,8 +182,9 @@ jobs:
       # mke2fs's, as Linux's distributions make them -- read, names written
       # into one that e2fsck must then find nothing in, and a boot killed
       # under its writing whose journal e2fsck and Linux must replay clean --
-      # and to a journal debugfs left unreplayed, read through by a mount
-      # that must write nothing.
+      # to a journal debugfs left unreplayed, read through by a mount that
+      # must write nothing, and to orphans debugfs left, released by a mount
+      # for writing.
       - name: ext4 test (mke2fs, debugfs, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext4-test.py --tcg
