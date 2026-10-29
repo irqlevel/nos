@@ -154,7 +154,7 @@ pub fn run(line: &str) -> String {
     let out: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     dispatch(line.as_bytes(), sink, None, None, &out as *const Mutex<Vec<u8>> as usize);
     let bytes = out.into_inner().unwrap_or_else(|e| e.into_inner());
-    String::from_utf8_lossy(&bytes).into_owned()
+    sched::harness(|| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The fuzzer's stand-ins for the kernel's built-in commands.

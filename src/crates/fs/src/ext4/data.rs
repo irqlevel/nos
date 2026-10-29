@@ -218,15 +218,14 @@ impl Ext4 {
             return;
         }
         let Some(root) = self.root else { return };
-        let mut stack = vec![root];
-        while let Some(at) = stack.pop() {
-            let Some(n) = self.tree.get_mut(at) else { continue };
-            if n.is_file() && n.ino == ino as usize {
-                n.size = size;
+        let mut at = Some(root);
+        while let Some(id) = at {
+            if let Some(n) = self.tree.get_mut(id) {
+                if n.is_file() && n.ino == ino as usize {
+                    n.size = size;
+                }
             }
-            if n.is_dir() {
-                stack.extend(self.tree.children(at));
-            }
+            at = self.tree.next_under(root, id);
         }
     }
 
@@ -259,8 +258,17 @@ impl Ext4 {
                 None => false,
             };
             if !committed {
-                self.zero_past_end(ino, size, pos, n as u64);
-                self.flush_failed();
+                /* What the chunk wrote in place past the old end made zeros
+                 * again -- only where its transaction surely never reached
+                 * the log, as every failure of a commit that does reach it
+                 * aborts the journal: there whether its commit block is on
+                 * the medium is not known, a replay may give the file the
+                 * size that covers what was written, and nothing more is
+                 * written at all. */
+                if self.jnl.as_ref().is_some_and(|j| !j.aborted) {
+                    self.zero_past_end(ino, size, pos, n as u64);
+                    self.flush_failed();
+                }
                 ok = false;
                 break;
             }
@@ -291,7 +299,7 @@ impl Ext4 {
         };
         if !zeroed {
             if let Some(j) = self.jnl.as_mut() {
-                j.abort("what a failed write left past a file's end cannot be made zeros again");
+                j.abort(&mut self.io, "what a failed write left past a file's end cannot be made zeros again");
             }
         }
     }
@@ -306,7 +314,7 @@ impl Ext4 {
             return;
         }
         if let Some(j) = self.jnl.as_mut() {
-            j.abort("the device does not flush what a failed write left");
+            j.abort(&mut self.io, "the device does not flush what a failed write left");
         }
     }
 
