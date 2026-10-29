@@ -54,9 +54,9 @@ pub fn net(_args: &str, out: &mut Output) {
             };
             let name = core::str::from_utf8(dev.name()).unwrap_or("?");
             let st = dev.stats();
-            let _ = writeln!(out, "{}  {}  ip:{}  tx:{} rx:{} drop:{}",
+            let _ = writeln!(out, "{}  {}  ip:{}  tx:{} rx:{} drop:{}  bytes tx:{} rx:{}",
                 name, MacHex(dev.mac()), Ip(dev.ip()),
-                st.tx_total, st.rx_total, st.rx_drop);
+                st.tx_total, st.rx_total, st.rx_drop, st.tx_bytes, st.rx_bytes);
             let _ = writeln!(out, "  rx  icmp:{} udp:{} tcp:{} arp:{} other:{} nat:{}",
                 st.rx_icmp, st.rx_udp, st.rx_tcp, st.rx_arp, st.rx_other, st.rx_nat);
             let _ = writeln!(out, "  tx  icmp:{} udp:{} tcp:{} arp:{} other:{} refused:{}",
@@ -143,10 +143,10 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
             Some(line) => line,
             None => continue,
         };
-        let _ = write!(out, "  [{}] {}:{} -> {}:{}  {}  snd={}/{} rcv={}/{} wnd={}",
+        let _ = write!(out, "  [{}] {}:{} -> {}:{}  {}  snd={}/{} rcv={}/{} wnd={} cwnd={}",
             index, Ip(line.local_ip), line.local_port,
             Ip(line.remote_ip), line.remote_port, line.state.name(),
-            line.send_used, line.in_flight, line.recv_used, line.recv_size, line.window);
+            line.send_used, line.in_flight, line.recv_used, line.recv_size, line.window, line.cwnd);
         match line.scales {
             Some((ours, theirs)) => { let _ = writeln!(out, " scale={}/{}", ours, theirs); }
             None => { let _ = writeln!(out); }

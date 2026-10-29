@@ -295,22 +295,12 @@ void print_feature(stdlib::Printer& con, const char* name, bool present,
 
 }
 
-void print_cpu_info(stdlib::Printer& con)
+static const u32 EXTENDED_LEAF_BASE = 0x80000000;
+
+/* The brand string, leaves 0x80000002-4, into brand -- "" where the CPU has
+   none */
+static void read_brand(char (&brand)[49], u32 max_extended)
 {
-    static const u32 EXTENDED_LEAF_BASE = 0x80000000;
-
-    CpuidResult r0 = cpuid(0);
-
-    /* Vendor string is EBX:EDX:ECX, in that order. */
-    char vendor[13];
-    stdlib::mem_cpy(&vendor[0], &r0.ebx, 4);
-    stdlib::mem_cpy(&vendor[4], &r0.edx, 4);
-    stdlib::mem_cpy(&vendor[8], &r0.ecx, 4);
-    vendor[12] = '\0';
-
-    u32 max_extended = cpuid(EXTENDED_LEAF_BASE).eax;
-
-    char brand[49];
     brand[0] = '\0';
     if (max_extended >= EXTENDED_LEAF_BASE + 4)
     {
@@ -324,6 +314,37 @@ void print_cpu_info(stdlib::Printer& con)
         }
         brand[48] = '\0';
     }
+}
+
+void cpu_model(char* buf, unsigned long len)
+{
+    if (buf == nullptr || len == 0)
+        return;
+
+    char brand[49];
+    read_brand(brand, cpuid(EXTENDED_LEAF_BASE).eax);
+    /* Intel pads it with blanks in front */
+    const char* model = brand;
+    while (*model == ' ')
+        model++;
+    stdlib::sn_printf(buf, len, "%s", model);
+}
+
+void print_cpu_info(stdlib::Printer& con)
+{
+    CpuidResult r0 = cpuid(0);
+
+    /* Vendor string is EBX:EDX:ECX, in that order. */
+    char vendor[13];
+    stdlib::mem_cpy(&vendor[0], &r0.ebx, 4);
+    stdlib::mem_cpy(&vendor[4], &r0.edx, 4);
+    stdlib::mem_cpy(&vendor[8], &r0.ecx, 4);
+    vendor[12] = '\0';
+
+    u32 max_extended = cpuid(EXTENDED_LEAF_BASE).eax;
+
+    char brand[49];
+    read_brand(brand, max_extended);
 
     CpuidResult r1 = cpuid(1);
 

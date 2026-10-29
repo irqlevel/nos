@@ -33,6 +33,9 @@
 #include "parameters.h"
 #include "version_gen.h"
 #include "dmesg.h"
+#include "module.h"
+#include "object_table.h"
+#include <hal/console.h>
 
 static const ulong RUST_ALLOC_TAG = 'rust';
 
@@ -1764,6 +1767,257 @@ long kernel_interrupt_source(unsigned long index, char* name, unsigned long name
     if (name != nullptr && name_len != 0)
         stdlib::sn_printf(name, name_len, "%s", kernel::InterruptStats::get_name(src));
     return kernel::InterruptStats::get(src);
+}
+
+/* ---- What the management bus says of the system ---- */
+
+/* src/crates/kernel's `system` provider: what the C++'s own tables hold,
+   copied into the caller's buffers under the lock each table keeps and with
+   nothing allocated (TaskTable::snapshot, ModuleTable::snapshot,
+   Dmesg::read_since), and the few things it changes, each checked here
+   first. The structs are the C ABI's; ffi::system has their Rust. */
+
+static_assert(sizeof(kernel::TaskTable::TaskSnapshot) == 64, "ffi::system::TaskInfo");
+static_assert(sizeof(kernel::ModuleTable::ModuleSnapshot) == 56, "ffi::system::ModuleInfo");
+
+/* Every task, at most max of them, into out: how many were copied */
+unsigned long kernel_task_snapshot(kernel::TaskTable::TaskSnapshot* out, unsigned long max)
+{
+    if (out == nullptr)
+        return 0;
+
+    return kernel::TaskTable::get_instance().snapshot(out, max);
+}
+
+/* How long the CPU numbered `cpu` has spent in its idle task, the stretch it
+   is in now included: 0 for one that is not running */
+unsigned long long kernel_cpu_idle_ns(unsigned int cpu)
+{
+    auto& cpus = kernel::CpuTable::get_instance();
+    if (cpu >= kernel::MAX_CPUS || (cpus.get_running_cpus() & (1UL << cpu)) == 0)
+        return 0;
+
+    kernel::Task* idle = cpus.get_cpu(cpu).get_idle_task();
+    return (idle != nullptr) ? idle->get_runtime_ns() : 0;
+}
+
+/* The page allocator's pages and the huge pool's blocks: ffi::system::MemInfo */
+struct RustMemInfo
+{
+    unsigned long long page_bytes;
+    unsigned long long total_pages;
+    unsigned long long free_pages;
+    unsigned long long huge_block_bytes;
+    unsigned long long huge_blocks;
+    unsigned long long huge_free;
+};
+
+void kernel_mem_info(RustMemInfo* out)
+{
+    if (out == nullptr)
+        return;
+
+    auto& pt = kernel::mm::PageTable::get_instance();
+    out->page_bytes = consts::PAGE_SIZE;
+    out->total_pages = pt.get_total_pages_count();
+    out->free_pages = pt.get_free_pages_count();
+    out->huge_block_bytes = kernel::mm::PageTable::HUGE_FRAME_SIZE;
+    out->huge_blocks = pt.get_huge_pool_blocks();
+    out->huge_free = pt.get_huge_pool_free();
+}
+
+/* The length of what buf holds up to its NUL, never past len */
+static unsigned long bounded_len(const char* buf, unsigned long len)
+{
+    unsigned long n = 0;
+    while (n < len && buf[n] != '\0')
+        n++;
+    return n;
+}
+
+/* What the CPU is called (hal::cpu_model), into buf: the bytes written,
+   without the NUL */
+unsigned long kernel_cpu_model(char* buf, unsigned long len)
+{
+    if (buf == nullptr || len == 0)
+        return 0;
+
+    hal::cpu_model(buf, len);
+    return bounded_len(buf, len);
+}
+
+/* The version (0) or the git revision it was built from (1), into buf: the
+   bytes written, without the NUL; 0 for anything else */
+unsigned long kernel_version_field(unsigned int which, char* buf, unsigned long len)
+{
+    static const unsigned int VERSION = 0;
+    static const unsigned int REVISION = 1;
+    if (buf == nullptr || len == 0 || (which != VERSION && which != REVISION))
+        return 0;
+
+    stdlib::sn_printf(buf, len, "%s", (which == VERSION) ? KERNEL_VERSION : KERNEL_GIT_REV);
+    return bounded_len(buf, len);
+}
+
+unsigned int kernel_trace_level()
+{
+    const int level = kernel::Tracer::get_instance().get_level();
+    return (level > 0) ? (unsigned int)level : 0;
+}
+
+/* The trace level set, as `loglevel N` sets it: 1, or 0 -- and nothing
+   changed -- for a level past MAX_TRACE_LEVEL */
+int kernel_trace_set_level(unsigned int level)
+{
+    if (level > (unsigned int)kernel::MAX_TRACE_LEVEL)
+        return 0;
+
+    kernel::Tracer::get_instance().set_level((int)level);
+    return 1;
+}
+
+/* A task's nice, as `sched nice` sets it: 0 done, 1 no such task, 2 a nice
+   out of range */
+int kernel_task_set_nice(unsigned long pid, long nice)
+{
+    if (nice < kernel::SchedEntity::NICE_MIN || nice > kernel::SchedEntity::NICE_MAX)
+        return 2;
+
+    kernel::ObjectPtr<kernel::Task> task(kernel::TaskTable::get_instance().lookup(pid));
+    if (!task)
+        return 1;
+
+    kernel::set_task_nice(task.get(), nice);
+    return 0;
+}
+
+/* Every loaded module, at most max of them, into out: how many were copied */
+unsigned long kernel_module_list(kernel::ModuleTable::ModuleSnapshot* out, unsigned long max)
+{
+    if (out == nullptr)
+        return 0;
+
+    return kernel::ModuleTable::get_instance().snapshot(out, max);
+}
+
+/* What kernel_module_command collects of what insmod or rmmod says: their
+   job's output and the line after it */
+static const unsigned long MODULE_COMMAND_OUTPUT = 4 * consts::KB;
+
+/* Whether the len bytes at s are printable ASCII, a blank allowed or not:
+   no NUL to cut a C string short, and nothing that would end a line */
+static bool printable(const unsigned char* s, unsigned long len, bool blanks)
+{
+    for (unsigned long i = 0; i < len; i++)
+    {
+        if (s[i] < ' ' || s[i] > '~' || (!blanks && s[i] == ' '))
+            return false;
+    }
+    return true;
+}
+
+/* insmod (unload 0) of the module at the path arg, its init handed params,
+   or rmmod (1) of the module named arg -- as the shell runs them, in a task
+   of their own waited for SHELL_WAIT_MS -- what they said handed to
+   sink(ctx, ...) once they have said it. Answers how it ended: 0 done, 1
+   failed, 2 still going, 3 never started -- a path, name or parameters too
+   long, empty where they may not be, or with anything in them but printable
+   ASCII (a blank in params alone), or no memory. Task context only: it
+   sleeps. */
+int kernel_module_command(int unload, const unsigned char* arg, unsigned long arg_len,
+    const unsigned char* params, unsigned long params_len, SinkPrinter::SinkFn sink, void* ctx)
+{
+    static const int DONE = 0;
+    static const int FAILED = 1;
+    static const int PENDING = 2;
+    static const int NOT_STARTED = 3;
+    using kernel::ModuleTable;
+
+    if (arg == nullptr || sink == nullptr || arg_len == 0 || arg_len > ModuleTable::PATH_LEN_MAX ||
+        !printable(arg, arg_len, false))
+        return NOT_STARTED;
+    if (params_len != 0 && (params == nullptr || unload != 0 || params_len > ModuleTable::PARAMS_MAX ||
+        !printable(params, params_len, true)))
+        return NOT_STARTED;
+
+    /* insmod's line: the path, a blank, the parameters */
+    char line[ModuleTable::PATH_LEN_MAX + 1 + ModuleTable::PARAMS_MAX + 1];
+    stdlib::mem_cpy(line, arg, arg_len);
+    unsigned long at = arg_len;
+    if (params_len != 0)
+    {
+        line[at++] = ' ';
+        stdlib::mem_cpy(line + at, params, params_len);
+        at += params_len;
+    }
+    line[at] = '\0';
+
+    auto* text = static_cast<char*>(kernel::mm::alloc(MODULE_COMMAND_OUTPUT, RUST_ALLOC_TAG));
+    if (text == nullptr)
+        return NOT_STARTED;
+    text[0] = '\0';
+
+    stdlib::BufferPrinter out(text, MODULE_COMMAND_OUTPUT);
+    auto& modules = ModuleTable::get_instance();
+    const auto outcome = (unload != 0) ? modules.start_unload(line, out) : modules.start_load(line, out);
+
+    const unsigned long len = bounded_len(text, MODULE_COMMAND_OUTPUT);
+    if (len != 0)
+        sink(ctx, reinterpret_cast<const unsigned char*>(text), len);
+    kernel::mm::free(text);
+
+    switch (outcome)
+    {
+    case ModuleTable::JobOutcome::Done:
+        return DONE;
+    case ModuleTable::JobOutcome::Failed:
+        return FAILED;
+    case ModuleTable::JobOutcome::Pending:
+        return PENDING;
+    case ModuleTable::JobOutcome::NotStarted:
+        return NOT_STARTED;
+    }
+    return NOT_STARTED;
+}
+
+/* The log's messages numbered after `since`, as Dmesg::read_since copies
+   them into buf: the bytes written, and the number of the last copied --
+   `since` for none -- into last */
+unsigned long kernel_dmesg_read(unsigned long long since, unsigned char* buf, unsigned long len,
+    unsigned long long* last)
+{
+    if (buf == nullptr || last == nullptr)
+        return 0;
+
+    u64 got = since;
+    const unsigned long n = kernel::Dmesg::get_instance().read_since(since, buf, len, got);
+    *last = got;
+    return n;
+}
+
+/* The number the next message logged will have */
+unsigned long long kernel_dmesg_next_seq()
+{
+    return kernel::Dmesg::get_instance().get_next_seq();
+}
+
+/* Messages the log no longer has: recycled to make room, or dropped */
+unsigned long long kernel_dmesg_lost()
+{
+    return kernel::Dmesg::get_instance().get_lost();
+}
+
+/* A power-off (0) or a reboot (1) asked for, as the shell's commands ask
+   for one: the halt runs on the shell's own watch, after this returns.
+   Anything else is nothing. */
+void kernel_power_request(unsigned int what)
+{
+    static const unsigned int POWER_OFF = 0;
+    static const unsigned int REBOOT = 1;
+    if (what == POWER_OFF)
+        kernel::Cmd::get_instance().request_shutdown();
+    else if (what == REBOOT)
+        kernel::Cmd::get_instance().request_reboot();
 }
 
 /* What netconsole= asked for: the collector's address into ip, its port into

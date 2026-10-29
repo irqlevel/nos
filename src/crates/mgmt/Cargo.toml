@@ -1,0 +1,15 @@
+[package]
+name = "mgmt"
+version = "0.1.0"
+edition = "2021"
+
+# The management bus, in the kernel image: providers -- the kernel's layers,
+# and modules through the C ABI -- registered by name with their methods and
+# descriptors, the calls made of them, the jobs that take long, and the
+# `mgmt` command. Below every layer, so each can register its own provider.
+[lib]
+
+[dependencies]
+ffi = { path = "../ffi" }
+kcore = { path = "../kcore" }
+mgmtwire = { path = "../mgmtwire" }

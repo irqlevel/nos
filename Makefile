@@ -295,7 +295,11 @@ RUST_LIB = $(RUST_LIB_$(ARCH))
 # all: without these prerequisites the $(RUST_LIB) rule never re-runs once the
 # archive exists, and a plain `make` after editing Rust silently links the
 # stale staticlib.  Hence `make rust && make nocheck` in scripts/smoke-test.sh.
-RUST_SRC = $(shell find src/crates -name '*.rs' -not -path 'src/crates/target/*') \
+# Every file of a crate's src/ is one, not its .rs alone: what a crate takes
+# in whole as it compiles (include_str!, a provider's descriptor) is a
+# source too -- a descriptor changed alone rebuilt nothing, and hv.ko went on
+# registering the one it was built with.
+RUST_SRC = $(shell find src/crates -path src/crates/target -prune -o \( -name '*.rs' -o -path '*/src/*' \) -type f -print) \
     $(wildcard src/crates/Cargo.toml src/crates/Cargo.lock src/crates/*/Cargo.toml \
         src/crates/drivers/*/Cargo.toml src/crates/modules/*/Cargo.toml \
         src/crates/.cargo/config.toml \
@@ -407,7 +411,7 @@ $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit
+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]
@@ -509,8 +513,16 @@ nos-arm64.img: $(KERNEL)
 # from the header the kernel was compiled with, so the two cannot differ;
 # VERSION, the release name, is the make variable, as the kernel's is -- give
 # `make image` the one the kernel was built with.
+#
+# PANEL_BUNDLE, the management panel's bundle released with it
+# (scripts/panel-bundle.py), and PANEL_BUNDLE_URL, where the release has it,
+# put both in /lib/panel/bundle -- the URL and the bundle's SHA-256, which
+# `api panel create` fetches it by and holds it to. Without them the image
+# has no /lib/panel, and `api panel create` is told bundle= and sha256=.
 IMAGE = nos-$(ARCH).squashfs
 IMAGE_STAGE = $(OUT)/image
+PANEL_BUNDLE ?=
+PANEL_BUNDLE_URL ?=
 
 ifeq ($(ARCH),x86_64)
 image: $(IMAGE)
@@ -528,6 +540,14 @@ $(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc sc
 	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
 	install -m 0644 build/image/rc $(IMAGE_STAGE)/etc/rc
 	install -m 0755 scripts/nos-install $(IMAGE_STAGE)/nos-install
+	@if [ -n '$(PANEL_BUNDLE)' ] || [ -n '$(PANEL_BUNDLE_URL)' ]; then \
+	    [ -f '$(PANEL_BUNDLE)' ] && [ -n '$(PANEL_BUNDLE_URL)' ] || \
+	        { echo "$@: PANEL_BUNDLE (a file) and PANEL_BUNDLE_URL go together" >&2; exit 1; }; \
+	    mkdir -p $(IMAGE_STAGE)/lib/panel; \
+	    printf 'url=%s\nsha256=%s\n' '$(PANEL_BUNDLE_URL)' \
+	        "$$(sha256sum '$(PANEL_BUNDLE)' | cut -d' ' -f1)" > $(IMAGE_STAGE)/lib/panel/bundle; \
+	    chmod 0644 $(IMAGE_STAGE)/lib/panel/bundle; \
+	fi
 	printf 'version=%s\nrevision=%s\narch=%s\nmodule_abi=%s\n' '$(VERSION)' \
 	    "$$(sed -n 's/^#define KERNEL_GIT_REV "\(.*\)"$$/\1/p' $(OUT)/version_gen.h)" \
 	    '$(ARCH)' '$(MODULE_ABI)' > $(IMAGE_STAGE)/VERSION

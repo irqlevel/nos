@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""nosctl: nos's host API from the command line (docs/api.md).
+
+    nosctl [--host H] [--port P] [--cert C] [--key K] [--pin FP] <command>
+
+    host                              what the host is, and who is asking
+    providers                         the providers and their methods
+    describe <provider>               one's descriptor
+    call <provider> <method> [json]   a read or an action
+    start <provider> <method> [json]  a job started: its number
+    jobs                              every job's record
+    job <id> [since]                  one's record, its log from line `since`
+    wait <id>                         a job followed to its end, its log as it comes
+    cancel <id>                       one told to stop
+    stream [channels] [seconds]       the WebSocket's messages, a line each
+    vm list                           the VMs, a line each
+    vm <start|stop|restart|delete> <name> [json]
+                                      a job of the vm provider's, followed to its end
+    vm create <name> <url> [json]     a VM of a cloud's image, followed to its end
+    vm clone <name> <to>              a VM's copy, followed to its end
+    vm console <name>                 its console, live, typed at -- ^] detaches
+    keygen <name> <dir>               a client's key and certificate (openssl), its fingerprint
+    fingerprint <cert.pem>            a certificate's key, as the host pins a client by
+
+The connection is TLS 1.3 with the client's certificate (--cert, --key),
+and the host's key pinned (--pin): the SHA-256 of the SubjectPublicKeyInfo
+of its certificate, which `api status` and `api cert` print. A host whose
+key is not the pinned one is refused before a request is sent; there are
+no CAs. Each option may come from the environment instead: NOSCTL_HOST,
+NOSCTL_PORT, NOSCTL_CERT, NOSCTL_KEY, NOSCTL_PIN.
+
+Python's standard library alone, and openssl for `keygen`. Exit code 0: the
+call answered 2xx; 1: it answered otherwise; 2: no answer at all.
+"""
+import base64
+import hashlib
+import json
+import os
+import select
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+
+DEFAULT_PORT = 39234
+
+
+# ---- the host's key, read off its certificate ----
+
+def der_tlv(b, i):
+    """The TLV at b[i]: its tag, where its content starts, and where it ends."""
+    tag = b[i]
+    n = b[i + 1]
+    j = i + 2
+    if n & 0x80:
+        count = n & 0x7F
+        n = int.from_bytes(b[j:j + count], 'big')
+        j += count
+    return tag, j, j + n
+
+
+def spki(cert_der):
+    """The SubjectPublicKeyInfo of a certificate, its whole TLV: past the
+    TBSCertificate's version, serial, signature, issuer, validity and
+    subject."""
+    _, c0, _ = der_tlv(cert_der, 0)            # Certificate
+    _, t0, t1 = der_tlv(cert_der, c0)          # TBSCertificate
+    i = t0
+    if cert_der[i] == 0xA0:                    # [0] version
+        i = der_tlv(cert_der, i)[2]
+    for _ in range(5):                         # serial .. subject
+        i = der_tlv(cert_der, i)[2]
+    _, _, end = der_tlv(cert_der, i)
+    return cert_der[i:end]
+
+
+def fingerprint(cert_der):
+    return hashlib.sha256(spki(cert_der)).hexdigest()
+
+
+def pem_cert(path):
+    with open(path) as f:
+        return ssl.PEM_cert_to_DER_cert(f.read())
+
+
+# ---- a connection ----
+
+class Api:
+    def __init__(self, host, port, cert, key, pin, timeout=30):
+        self.host, self.port, self.pin, self.timeout = host, port, (pin or '').lower(), timeout
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        # No CA vouches for a host: its key is pinned, and checked below
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(cert, key)
+        ctx.set_alpn_protocols(['nos-api/1', 'http/1.1'])
+        self.ctx = ctx
+        self.sock = None
+
+    def connect(self):
+        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        sock = self.ctx.wrap_socket(raw, server_hostname=self.host)
+        der = sock.getpeercert(binary_form=True)
+        got = fingerprint(der)
+        if self.pin and got != self.pin:
+            sock.close()
+            raise ssl.SSLError('the host shows the key %s, not the one pinned (%s)' % (got, self.pin))
+        self.sock = sock
+        self.buf = b''
+        return got
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    def _read_more(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise ConnectionError('the host closed the connection')
+        self.buf += data
+
+    def _head(self):
+        while b'\r\n\r\n' not in self.buf:
+            self._read_more()
+        head, self.buf = self.buf.split(b'\r\n\r\n', 1)
+        lines = head.decode('latin-1').split('\r\n')
+        status = int(lines[0].split()[1])
+        headers = {}
+        for line in lines[1:]:
+            k, _, v = line.partition(':')
+            headers[k.strip().lower()] = v.strip()
+        return status, headers
+
+    def request(self, method, path, body=None, headers=None):
+        """One request on the kept-alive connection: its status, headers and
+        body (JSON parsed when it is JSON)."""
+        reused = self.sock is not None
+        if self.sock is None:
+            self.connect()
+        data = b'' if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
+        lines = ['%s %s HTTP/1.1' % (method, path), 'Host: %s' % self.host, 'Content-Length: %d' % len(data)]
+        if data:
+            lines.append('Content-Type: application/json')
+        for k, v in (headers or {}).items():
+            lines.append('%s: %s' % (k, v))
+        request = ('\r\n'.join(lines) + '\r\n\r\n').encode() + data
+        try:
+            self.sock.sendall(request)
+        except OSError:
+            if not reused:
+                raise
+            # A kept-alive connection the host let go while it said nothing
+            # (api.toml's idle_secs): the request never reached it, so it
+            # goes again on a new one
+            self.close()
+            self.connect()
+            self.sock.sendall(request)
+        status, hdrs = self._head()
+        # A HEAD's answer, a 204's and a 304's have no body, whatever their
+        # Content-Length says
+        n = 0 if method == 'HEAD' or status in (204, 304) else int(hdrs.get('content-length', '0'))
+        while len(self.buf) < n:
+            self._read_more()
+        payload, self.buf = self.buf[:n], self.buf[n:]
+        if hdrs.get('connection', '').lower() == 'close':
+            self.close()
+        if hdrs.get('content-type', '').startswith('application/json') and payload:
+            return status, hdrs, json.loads(payload)
+        return status, hdrs, payload
+
+    # ---- the WebSocket ----
+
+    def stream(self, query=''):
+        """/v1/stream opened: messages, one at a time, through `messages`."""
+        if self.sock is None:
+            self.connect()
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = ('GET /v1/stream%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+               'Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n') % (query, self.host, key)
+        self.sock.sendall(req.encode())
+        status, hdrs = self._head()
+        want = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
+        if status != 101 or hdrs.get('sec-websocket-accept', '').encode() != want:
+            raise ConnectionError('no WebSocket: %d %s' % (status, hdrs))
+
+    def _frame_out(self, opcode, payload):
+        mask = os.urandom(4)
+        head = bytes([0x80 | opcode])
+        n = len(payload)
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack('!H', n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack('!Q', n)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def message(self):
+        """The next message the server sends (a text's JSON parsed), pings
+        answered on the way; None once it closes."""
+        while True:
+            while len(self.buf) < 2:
+                self._read_more()
+            b0, b1 = self.buf[0], self.buf[1]
+            n, at = b1 & 0x7F, 2
+            if n == 126:
+                while len(self.buf) < 4:
+                    self._read_more()
+                n, at = struct.unpack('!H', self.buf[2:4])[0], 4
+            elif n == 127:
+                while len(self.buf) < 10:
+                    self._read_more()
+                n, at = struct.unpack('!Q', self.buf[2:10])[0], 10
+            while len(self.buf) < at + n:
+                self._read_more()
+            payload, self.buf = self.buf[at:at + n], self.buf[at + n:]
+            opcode = b0 & 0x0F
+            if opcode == 0x9:
+                self._frame_out(0xA, payload)
+            elif opcode == 0x8:
+                return None
+            elif opcode == 0x1:
+                return json.loads(payload)
+
+    def say_goodbye(self):
+        try:
+            self._frame_out(0x8, struct.pack('!H', 1000))
+        except OSError:
+            pass
+
+    def type(self, text):
+        """`text` as a message of the client's: what the console channel
+        types at the VM."""
+        self._frame_out(0x1, text.encode())
+
+    def waiting(self):
+        """Whether a message, or the start of one, is there to read."""
+        return bool(self.buf) or self.sock.pending() > 0
+
+
+DETACH = '\x1d'
+
+
+def follow(api, job_id):
+    """The job followed to its end, its log printed as it comes: its record."""
+    since = 0
+    while True:
+        status, _, rec = api.request('GET', '/v1/jobs/%s?notes_since=%d' % (job_id, since))
+        if status != 200:
+            return status, rec
+        for n in rec.get('notes', []):
+            print('  %4d %s' % (n['seq'], n['text']))
+        since = rec.get('notes_next', since)
+        if rec.get('state') == 'done':
+            return status, rec
+        time.sleep(0.5)
+
+
+def vm_job(api, method, params):
+    """A job of the vm provider's started and followed to its end: 0 when it
+    ended ok."""
+    status, _, body = api.request('POST', '/v1/jobs/vm/%s' % method, params)
+    if status != 202 and status != 200:
+        return show(status, body)
+    status, rec = follow(api, body['id'])
+    show(status, rec)
+    return 0 if rec.get('status') == 'ok' else 1
+
+
+def vm_console(api, name):
+    """The console of `name`, live: what it prints written out as it comes,
+    what is typed sent -- the terminal raw, ^] detaching."""
+    import termios
+    import tty
+    api.stream('?channels=console&vm=' + name)
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+    if saved:
+        tty.setraw(fd)
+    try:
+        while True:
+            ready = [] if api.waiting() else select.select([api.sock, fd], [], [], 0.5)[0]
+            if fd in ready:
+                keys = os.read(fd, 1024).decode(errors='replace')
+                if DETACH in keys:
+                    keys = keys[:keys.index(DETACH)]
+                    if keys:
+                        api.type(keys)
+                    break
+                if keys:
+                    api.type(keys)
+            if api.waiting() or api.sock in ready:
+                msg = api.message()
+                if msg is None:
+                    break
+                data = msg.get('data') or {}
+                if 'text' in data:
+                    sys.stdout.write(data['text'])
+                    sys.stdout.flush()
+                elif 'refused' in msg or 'error' in msg:
+                    sys.stdout.write('\r\nnosctl: %s\r\n' % (msg.get('message') or msg.get('error')))
+                    sys.stdout.flush()
+    finally:
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        api.say_goodbye()
+    print()
+    return 0
+
+
+def vm_list(api):
+    status, _, body = api.request('POST', '/v1/call/vm/list')
+    if status != 200:
+        return show(status, body)
+    for v in body.get('vms', []):
+        print('%-20s %-9s %2s cpu  %5s MiB  %-15s %s' % (
+            v.get('name') or 'vm%s' % v.get('id'), v.get('state'), v.get('cpus'), v.get('memory_mib'),
+            v.get('ip') or '-', '%d s' % (v['uptime_ms'] // 1000) if 'uptime_ms' in v else ''))
+    return 0
+
+
+# ---- the commands ----
+
+def keygen(name, folder):
+    os.makedirs(folder, exist_ok=True)
+    key, cert = os.path.join(folder, name + '.key'), os.path.join(folder, name + '.crt')
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+                    '-nodes', '-keyout', key, '-out', cert, '-days', '825', '-subj', '/CN=' + name],
+                   check=True, capture_output=True)
+    print('%s %s %s' % (fingerprint(pem_cert(cert)), key, cert))
+    return 0
+
+
+def show(status, body):
+    if isinstance(body, (dict, list)):
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+    elif body:
+        sys.stdout.write(body.decode(errors='replace'))
+    return 0 if 200 <= status < 300 else 1
+
+
+def main(argv):
+    opts = {'host': os.environ.get('NOSCTL_HOST', '127.0.0.1'), 'port': os.environ.get('NOSCTL_PORT', str(DEFAULT_PORT)),
+            'cert': os.environ.get('NOSCTL_CERT'), 'key': os.environ.get('NOSCTL_KEY'),
+            'pin': os.environ.get('NOSCTL_PIN')}
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith('--') and a[2:] in opts and i + 1 < len(argv):
+            opts[a[2:]] = argv[i + 1]
+            i += 2
+            continue
+        args.append(a)
+        i += 1
+    if not args:
+        print(__doc__)
+        return 2
+    cmd, rest = args[0], args[1:]
+    if cmd == 'keygen' and len(rest) == 2:
+        return keygen(rest[0], rest[1])
+    if cmd == 'fingerprint' and len(rest) == 1:
+        print(fingerprint(pem_cert(rest[0])))
+        return 0
+    if not opts['cert'] or not opts['key']:
+        print('nosctl: --cert and --key (or NOSCTL_CERT, NOSCTL_KEY) are needed', file=sys.stderr)
+        return 2
+    api = Api(opts['host'], int(opts['port']), opts['cert'], opts['key'], opts['pin'])
+    try:
+        if cmd == 'host':
+            return show(*api.request('GET', '/v1/host')[::2])
+        if cmd == 'providers':
+            return show(*api.request('GET', '/v1/providers')[::2])
+        if cmd == 'describe' and len(rest) == 1:
+            return show(*api.request('GET', '/v1/providers/' + rest[0])[::2])
+        if cmd in ('call', 'start') and len(rest) in (2, 3):
+            body = rest[2].encode() if len(rest) == 3 else b''
+            path = ('/v1/call/%s/%s' if cmd == 'call' else '/v1/jobs/%s/%s') % (rest[0], rest[1])
+            return show(*api.request('POST', path, body)[::2])
+        if cmd == 'jobs':
+            return show(*api.request('GET', '/v1/jobs')[::2])
+        if cmd == 'job' and len(rest) in (1, 2):
+            since = '?notes_since=%s' % rest[1] if len(rest) == 2 else ''
+            return show(*api.request('GET', '/v1/jobs/%s%s' % (rest[0], since))[::2])
+        if cmd == 'cancel' and len(rest) == 1:
+            return show(*api.request('POST', '/v1/jobs/%s/cancel' % rest[0])[::2])
+        if cmd == 'wait' and len(rest) == 1:
+            status, rec = follow(api, rest[0])
+            if status != 200:
+                return show(status, rec)
+            return show(200, rec) if rec.get('status') == 'ok' else (show(200, rec) or 1)
+        if cmd == 'vm' and rest:
+            verb, more = rest[0], rest[1:]
+            if verb == 'list' and not more:
+                return vm_list(api)
+            if verb in ('start', 'stop', 'restart', 'delete') and len(more) in (1, 2):
+                params = json.loads(more[1]) if len(more) == 2 else {}
+                params['name'] = more[0]
+                return vm_job(api, verb, params)
+            if verb == 'create' and len(more) in (2, 3):
+                params = json.loads(more[2]) if len(more) == 3 else {}
+                params.update(name=more[0], url=more[1])
+                return vm_job(api, 'create', params)
+            if verb == 'clone' and len(more) == 2:
+                return vm_job(api, 'clone', {'name': more[0], 'to': more[1]})
+            if verb == 'console' and len(more) == 1:
+                return vm_console(api, more[0])
+        if cmd == 'stream' and len(rest) <= 2:
+            query = '?channels=' + rest[0] if rest else ''
+            end = time.time() + (float(rest[1]) if len(rest) == 2 else 1e9)
+            api.stream(query)
+            while time.time() < end:
+                msg = api.message()
+                if msg is None:
+                    break
+                print(json.dumps(msg, ensure_ascii=False))
+                sys.stdout.flush()
+            api.say_goodbye()
+            return 0
+    except (OSError, ssl.SSLError, ConnectionError, ValueError) as e:
+        print('nosctl: %s' % e, file=sys.stderr)
+        return 2
+    finally:
+        api.close()
+    print(__doc__)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

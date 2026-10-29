@@ -62,14 +62,28 @@ public:
        still loading or unloading is left to it. */
     void unload_all();
 
+    /* How an insmod or rmmod ended, as start_load and start_unload saw it */
+    enum class JobOutcome
+    {
+        /* Done, and it said so */
+        Done,
+        /* Done, and failed: what it said says why */
+        Failed,
+        /* Still going after SHELL_WAIT_MS: lsmod shows where, the log will
+           say how it ended */
+        Pending,
+        /* Never started: too long, or no task or memory for it */
+        NotStarted,
+    };
+
     /* insmod and rmmod: load_file or Unload in a task of its own, waited for
        for at most SHELL_WAIT_MS. What it says is printed on out if it is done
        by then; if not, it carries on in the background -- lsmod shows the
        module loading or unloading meanwhile -- and the kernel log says how
        it ended. insmod's args are the path, its first word, and the
        module's parameters, the rest of the line. */
-    void start_load(const char* args, stdlib::Printer& out);
-    void start_unload(const char* name, stdlib::Printer& out);
+    JobOutcome start_load(const char* args, stdlib::Printer& out);
+    JobOutcome start_unload(const char* name, stdlib::Printer& out);
 
     bool is_loaded(const char* name);
 
@@ -93,6 +107,28 @@ public:
     /* The longest a module's parameters may be, as insmod gives them */
     static const ulong PARAMS_MAX = 255;
 
+    /* A module as the management bus lists it (`system.modules`), copied
+       out under the lock into the caller's array -- nothing allocated -- and
+       not where it is: the API says no kernel address. The C ABI's,
+       kernel_module_list's: ffi::system::ModuleInfo is its Rust */
+    struct ModuleSnapshot
+    {
+        char name[NAME_LEN_MAX + 1];
+        u64 size;
+        u64 imports;
+        /* SNAPSHOT_* */
+        u32 phase;
+        /* 1 when what it imports keeps it from being unloaded */
+        u32 permanent;
+    };
+
+    static const u32 SNAPSHOT_LIVE = 0;
+    static const u32 SNAPSHOT_LOADING = 1;
+    static const u32 SNAPSHOT_UNLOADING = 2;
+
+    ulong snapshot(ModuleSnapshot* out, ulong max);
+
+
     /* How long insmod and rmmod wait for their task before they leave it to
        finish on its own */
     static const ulong SHELL_WAIT_MS = 5000;
@@ -105,7 +141,7 @@ private:
     ModuleTable& operator=(const ModuleTable& other) = delete;
     ModuleTable& operator=(ModuleTable&& other) = delete;
 
-    void start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out);
+    JobOutcome start_job(bool unload, const char* arg, const char* params, stdlib::Printer& out);
     LoadedModule* find_locked(const char* name);
     void remove(LoadedModule* module);
 

@@ -2136,8 +2136,14 @@ addresses only on their switch; a forward listens on a port of nos's and,
 for each connection, opens one to the guest's port through `hv0`
 (`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
 task of its own. The kernel has 64 TCP connections and a forwarded one takes
-two, so a forward carries eight at once and refuses the rest. The other way,
-the guests reach the world through NAT (next).
+two, so a forward carries eight at once and refuses the rest. Its listener is
+a bulk one (`TcpListener::bind_bulk`): a connection it accepts has buffers of
+up to 512 KiB each way and scales its window, where a connection's own 8 KiB
+would hold a client 62 ms away -- the EX44 from a desk in another country --
+to 120 KiB/s, whatever the line; and while bytes move, its relay waits a
+millisecond on the side that has nothing rather than five, which held a
+download to 4 KiB a round. The other way, the guests reach the world through
+NAT (next).
 
 ### The way out: NAT, DHCP and DNS
 
@@ -2471,7 +2477,11 @@ $ hv start noble
   window a download of gigabytes needs, which a module's own TCP
   connection is not given. Only a 2xx answer is a body -- "the server
   answered 404" otherwise -- a body cut short is no image, and a file there
-  already is not written over; a failed download leaves no file.
+  already is not written over; a failed download leaves no file. The
+  client hands the module how much is in the file as the body comes, and
+  asks it whether to go on: hv says the progress lines, and a stop -- the
+  module going -- ends the download as the next of the body arrives, the
+  file removed.
 - **The disk**: a qcow2 image is converted ([A disk from a cloud's
   image](#a-disk-from-a-clouds-image)) and the download removed; a raw one
   is taken as it is; anything else is refused by what it is. `size=` (K,
@@ -2481,12 +2491,17 @@ $ hv start noble
 - **The seed**: `seed.iso`, the VM's second disk, read-only -- an ISO 9660
   labelled `cidata` with Rock Ridge's names (`diskimage::iso`), which
   cloud-init's NoCloud finds by its label. Its meta-data names the machine
-  after the VM, with an instance-id of its own (`nos-<name>-<time>`), so
-  that cloud-init takes it for a new machine; its user-data gives the
-  image's own user -- `ubuntu`, `debian` -- the keys nos's sshd lets in
+  after the VM -- `local-hostname`, which cloud-init sets the guest's name
+  from -- with an instance-id of its own (`nos-<name>-<time>`), so that
+  cloud-init takes it for a new machine; its user-data gives the image's
+  own user -- `ubuntu`, `debian` -- the keys nos's sshd lets in
   (`/etc/ssh/authorized_keys`), and with `password=` a password, for its
   console. Every string in it is YAML's double-quoted, so that a key's
-  comment is never read as YAML.
+  comment is never read as YAML. The user-data says nothing of the machine,
+  and is kept in the folder as `user-data`: a clone's seed gives its own
+  first boot the same ([below](#cloned-deleted-changed)). The host API's
+  create may give user-data of its own instead -- a job, which only an
+  admin starts.
 - **The vm.toml**, written last: hvboot as its kernel (`/lib/hvboot`, the
   system image's, or `hvboot=`), which boots the kernel the image's own
   GRUB would ([A guest's own kernel](#a-guests-own-kernel-pvh-and-hvboot));
@@ -2497,7 +2512,11 @@ $ hv start noble
   sshd -- `cmdline=`, which hvboot puts after the entry's own line.
 - **Nothing is left of a failure**: what the command made -- the download,
   the disk, the seed, and the folder when it made that too -- goes, and
-  why it failed is said.
+  why it failed is said. Nor of a stop: the module's going, or the host
+  API's cancel of its job, ends the download as the next of the body
+  arrives, or the conversion at the next cluster, and takes the same away.
+  The name is held while the folder is made: no start of it meanwhile, and
+  no other create, clone or delete.
 
 What it does not do yet: check the image against its distribution's
 `SHA256SUMS` (TLS's certificate is what vouches for the bytes now), resume
@@ -2511,6 +2530,94 @@ itself through Debian's redirect, booted by hvboot off its own /boot, its
 root grown into the 4 GiB disk, and cloud-init done from `DataSourceNoCloud
 [seed=/dev/vdb]` 50 s after the VM started -- its user logged in with the
 seed's password, nos's key in its authorized_keys.
+
+### Cloned, deleted, changed
+
+`hv clone <from> <to> [port=N]` (`modules/hv/src/clone.rs`) copies a VM's
+folder into a new one: a VM of the same machine, its disks as they are now,
+that boots as a machine of its own.
+
+```
+$ hv clone noble noble2
+hv: /vms/noble/disk.raw -- 20480 MiB, 2215 MiB of it data -- into /vms/noble2/disk.raw
+hv: /vms/noble2/disk.raw: 2190 MiB written of 20480 MiB, the rest holes
+hv: /vms/noble2/vm.toml written -- hv start noble2 boots it, cloud-init given a seed of its own
+```
+
+- **Its disks** in the folder are copied with their holes left out: only
+  what the source's filesystem keeps on the device is read -- the image's
+  extents (`kcore::fs::Image::extent`, over ext2's block map) -- and of that
+  only the blocks that are not zeros are written, into a file grown to the
+  disk's size with a hole first. A read-only disk outside the folder -- an
+  installer's ISO -- is shared by its path; a written one is refused, as two
+  VMs writing one disk wreck it. The source's disks are held to read while
+  they are copied (`kcore::fs::Image`), so nothing writes them meanwhile --
+  and the room the copy takes is asked of the filesystem first
+  (`kcore::fs::space`), with a sixty-fourth and a MiB to spare.
+- **Its seed** is made anew: a new instance-id and its own name in the
+  meta-data, and the source's user-data, which `hv create` keeps in the
+  folder -- so that cloud-init runs for it as for a new machine: its own
+  name, its own SSH host keys. A VM made before folders kept it gets the
+  keys of `/etc/ssh/authorized_keys`, which its disk has already. What
+  cloud-init does not make anew, the clone keeps: systemd's
+  `/etc/machine-id`, which a distribution writes once, on the disk -- a
+  clone that must have its own clears it before its first boot
+  (`systemd-machine-id-setup` makes one at the next).
+- **Its vm.toml** is the source's, the operator's lines and comments kept,
+  with what makes a machine itself made new: a new `uuid`; a `port` of the
+  switch -- an address and a MAC -- that no other VM's vm.toml names and no
+  VM on the list holds, when the source had one (`port=` says which); no
+  `forward`, which would be the source's ports; no `ip=` on its command
+  line; and not `protected`.
+
+It is refused while the source is on the list -- `hv stop` it first -- and
+when the new name has a folder; both names are held while it runs, so
+neither starts and nothing else is done to either. What fails, or is
+stopped -- the module's going, the host API's cancel -- leaves nothing
+behind.
+
+`hv delete <name> [keep-disks] [force]` (`store::delete`) takes a VM's
+folder away: every file in it and every folder under it -- or, with
+`keep-disks`, all but the disks its vm.toml names in it, which stay where
+they are, the folder with them -- its vm.toml last, so that a delete that
+fails part way (a file open, a disk another VM holds) leaves the VM there
+for another. Disks its vm.toml names outside the folder are not touched.
+It is refused while the VM is on the list, and for a VM whose vm.toml says
+`protected = true` -- or cannot be read -- unless told `force`. `hv vms`
+lists no folder without a vm.toml: what a delete that kept the disks left.
+
+**What hv changes in a vm.toml** after it is made, it changes key by key
+(`config::rewrite`, over `conf::edit`): the line of a key whose value is
+another replaced where it is, one taken away taken out, one the file has not
+added at its end -- and every other line, the operator's comments and blank
+lines among them, left as it was; the file as it was kept beside it as
+`vm.toml.prev`, each written whole before it takes the old one's place. So
+does `hv forward add` -- a forward to a VM with a folder is kept in its
+`forward = [...]`, for its next start to have it, and `hv forward del` takes
+it out -- and so do the host API's edits ([below](#on-the-management-bus)).
+
+### On the management bus
+
+The `vm` provider (`modules/hv/src/provider.rs`, x86-64) is the VMs as the
+host API ([The host API](api.md)), the management panel and `mgmt` reach
+them -- each by its folder's name -- through the same functions the
+commands are:
+
+| | |
+|---|---|
+| reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks`, `forwards` |
+| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev`), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow` |
+| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`: with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
+
+A job says as it goes what the command would, as its log, and how far it
+has got; its cancel -- or the module's going -- stops a download, a
+conversion and a copy where they are, what they made taken away, and stops
+waiting for a guest's power button. A VM whose vm.toml says `protected =
+true` is stopped and deleted only when the call says `force`: the panel's
+own VM has it. The provider is unregistered first when the module goes,
+which waits out its calls and jobs, and only then do the forwards, the VMs
+and the command go. Its descriptor is `vm.descriptor.json`
+([Descriptors](mgmt.md#descriptors)).
 
 ### Where the folders are
 
@@ -2541,9 +2648,9 @@ gives the guests to turn themselves off
 ([above](#acpi)), and `hv` says it.
 
 `rc add insmod /hv.ko vms=/data/vms` loads it so at every boot. `vms=` is
-at most 208 bytes: the VFS takes paths of 255, and under the folder go a
+at most 205 bytes: the VFS takes paths of 255, and under the folder go a
 VM's name of up to 32 and the longest file hv writes there,
-`console.log.1`. On arm64, which runs no Linux guest yet, hv takes no
+`vm.toml.prev` on its way in (`vm.toml.prev.new`). On arm64, which runs no Linux guest yet, hv takes no
 parameter, and refuses one. How a module is handed its parameters is in
 [Loadable modules](modules.md#parameters).
 
@@ -2583,6 +2690,7 @@ console_log = true
 | `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | the first free one |
 | `forward` | `"<nos's port>:<the guest's>"`s, relayed once it runs and taken away with it | none |
 | `restart` | booted again when it resets itself | `false` |
+| `protected` | stopped and deleted through the host API, and deleted by `hv delete`, only when told `force` | `false` |
 | `console_log` | its console to `console.log` in the folder | `true` |
 | `log` | its console to the kernel log too | `false` |
 | `input` | typed at its first prompt | none |
@@ -2615,9 +2723,8 @@ What it reaches the folder with is three calls of the file ABI made for it:
 
 **What it does not do yet:** read the file again at `hv restart`, which
 boots with what the start read -- `hv stop` and `hv start` take a changed
-file; start a VM when the module loads; or make, fetch or take away a disk
--- `truncate` makes one, `wget` fetches a raw image into the folder, `rm`
-takes a folder away.
+file; start a VM when the module loads; or clone a VM that runs, whose
+disks its guest writes.
 
 **Checked by:** `hv-linux-test.py`'s VM phase, which makes a folder with `hv
 create` -- and is refused a second time -- boots it by its name, types at it
@@ -2634,9 +2741,24 @@ them, and refuse a parameter hv has not got, a `vms=` that is no absolute
 path and a `stop_secs=` past 600;
 `hv-fuzz.py`'s `config` target, which holds the parser to never
 panicking on any text and `render` and `parse` to giving each other back what
-they were given, and whose `switch` target claims a port asked for as well as
-the first free one; and `fs-fuzz.py`'s `vfs` target, which holds the three
-file calls to its model of the tree.
+they were given, a vm.toml with an operator's comments rewritten to say
+another configuration to being read back as that one, every comment of a line
+of its own kept in its order, and a clone's command line to every word but
+`ip=`'s -- and whose `switch` target claims a port asked for as well as the
+first free one; and `fs-fuzz.py`'s `vfs` target, which holds the three file
+calls to its model of the tree. A clone, a delete and the vm provider:
+`hv-test.py` (x86-64) clones a VM made from a URL -- its disk held to the
+source's by SHA-256, mostly a hole, its seed made anew, its vm.toml the
+source's with a UUID of its own -- is refused a clone to a name taken, adds a
+forward through the provider and finds it kept in the vm.toml, the rest of
+the file as it was and the old beside it, makes a VM protected through the
+provider and is refused its delete without `force`, and deletes a VM keeping
+its disks; `api-test.py --arch x86_64` takes the provider through the host
+API -- a VM of hvboot started as a job and found stopped, its console read
+and streamed, a reader's typing refused; a VM made of an image, cloned, the
+clone deleted; a protected VM's delete refused without `force`; a create of
+an image served slowly cancelled midway, nothing of it left -- and
+`fs-fuzz.py` holds the extents a clone copies by to the model's data.
 
 ## ACPI
 
@@ -4108,7 +4230,7 @@ Acquire::http::Pipeline-Depth=0` takes 2 s again.
 Then the mapping itself: a copy's page went through the temporary window's
 shared slots, under their lock, with a reference taken and two TLB flushes,
 and that cost the vCPU as much as the copy. Each CPU has a slot of its own
-for it now ([Paging](paging.md#tmpmap-the-window-onto-physical-memory)), a
+for it now ([Paging](paging.md#tmp_map-the-window-onto-physical-memory)), a
 page still mapped only for the length of its copy. On the AX41 (56b6da8):
 
 | in the Debian guest | shared slots | a slot per CPU |

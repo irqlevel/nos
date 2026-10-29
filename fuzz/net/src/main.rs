@@ -5,11 +5,11 @@
 //! DHCP client and the resolver, every byte an SSH client sends the server
 //! -- so a panic, an overflow, a lock broken or a loop that never ends
 //! anywhere on those paths is one somebody else can cause. This program is
-//! the kernel's own crates -- `net`, `tls`, `fs`, `ssh`, the sshd module's
-//! source, over `kcore` and `ffi` as they are -- linked with the rest of a kernel
-//! written for the purpose: its C++ half (`machine`: the locks, tasks, soft
-//! IRQs, timers, the clock, the entropy pool, the command table), a NIC
-//! whose wire is the fuzzer's, and the network around the machine
+//! the kernel's own crates -- `net`, `tls`, `fs`, `ssh`, `mgmt`, the sshd and
+//! api modules' sources, over `kcore` and `ffi` as they are -- linked with
+//! the rest of a kernel written for the purpose: its C++ half (`machine`:
+//! the locks, tasks, soft IRQs, timers, the clock, the entropy pool, the
+//! command table), a NIC whose wire is the fuzzer's, and the network around the machine
 //! (`world`: the hosts on it -- a gateway, a DNS server, a DHCP server, an
 //! HTTP server, a TLS server, an SSH client, a stranger -- each speaking its
 //! protocol, well and badly). Each target turns random bytes into what the

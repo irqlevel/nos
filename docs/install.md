@@ -132,9 +132,32 @@ The server's default boot entry does not change.
 | `--udpshell[=PORT]` | the UDP shell, on 9000 or PORT. **Off unless given**: it runs any command for anyone who can send the machine a datagram ([UDP shell](udp-shell.md)) |
 | `--netconsole IP:PORT` | the kernel log, over UDP, to IP:PORT ([Netconsole](netconsole.md)) -- the one way to see a boot that dies after the network is up |
 | `--cmdline "ARGS"` | more kernel parameters ([Kernel parameters](kernel-parameters.md)) |
+| `--panel` | the management panel (below); `--no-panel` takes `api panel create` out of `/etc/rc` again |
 | `--format` | a new filesystem on the partition, even over one there |
 | `--boot-once`, `--reboot` | boot nos once, the next time -- and reboot now |
 | `--image FILE` | the image, when this `nos-install` is not the one inside it |
+
+### The management panel
+
+`--panel` gives the machine the management panel: a VM of nos's own, which
+manages it in a browser ([The management panel](api.md#the-management-panel)).
+nos-install makes root's password for it, prints it once with where the panel
+will be, and keeps only its scrypt hash, in `/etc/api/panel.pass` on the
+partition; and it gives `/etc/rc` the lines that load hv and the host API
+and run `api panel create`, each added only where the file does not have it:
+
+```
+nos-install: the panel: https://203.0.113.5:39233 once nos has made it, minutes after its first boot
+nos-install: the panel's user is root, its password qD1Rf...
+nos-install: that password is printed this once: /etc/api/panel.pass on /dev/nvme0n1p4 has its hash alone
+```
+
+At nos's first boot `api panel create` downloads Debian's cloud image and the
+panel's bundle -- the release's, which the image names in `/lib/panel/bundle`
+-- and makes the VM; the panel is up once its VM has installed it, minutes
+later, its certificate the one `api panel` prints the fingerprint of. An
+update with `--panel` keeps the password there is. `python3` is needed for
+the hash (`hashlib.scrypt`).
 
 ## Booting nos
 
@@ -243,12 +266,14 @@ On the partition, which is nos's root:
 | `/boot/grub/nos.cfg` | the image | the entries `nos` and `nos-next` |
 | `/lib/modules/`, `/lib/modules.prev/` | the image | the kernel's modules, and the ones before them |
 | `/lib/hvboot`, `.prev` | the image | the loader of a guest's own kernel, and the one before it |
+| `/lib/panel/bundle`, `/lib/panel.prev` | the image, when released with a panel | the panel's bundle: its URL and SHA-256, which `api panel create` fetches it by |
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
 | `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
 | `/grubenv` | nos-install | `nos_cmdline`, this machine's kernel parameters; `nos_next`, the one-shot flag |
 | `/etc/rc` | the image, the first time | the boot script: the machine's after that (`rc` edits it) |
 | `/etc/ssh/authorized_keys` | `--ssh-key` | the keys sshd lets in (`sshd allow` adds one from inside) |
 | `/etc/ssh/ssh_host_ed25519_key` | sshd, at its first start | nos's host key |
+| `/etc/api/` | `--panel`, and the host API at its first start | `panel.pass`, root's password's hash for the panel; the host API's key, its clients, api.toml ([The host API](api.md#the-folder)) |
 
 On the server's Linux there is one file, `/etc/grub.d/42_nos`, which holds
 the partition's UUID and nothing else of the machine's. It is run by

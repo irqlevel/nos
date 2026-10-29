@@ -136,6 +136,48 @@ pub fn trace_mark() -> u64 {
     TRACED.load(Ordering::Relaxed)
 }
 
+/// The level the log takes lines at.
+pub fn trace_level() -> u32 {
+    LOG_LEVEL
+}
+
+/// A log record's header, as `kernel_dmesg_read` writes one: the number and
+/// the text's length.
+const DMESG_RECORD_HEADER: usize = 10;
+
+/// The log's lines numbered after `since`, as `kernel_dmesg_read` hands
+/// them on -- a record each, its number (8 bytes) and its text's length (2)
+/// before the text -- for as many as fit whole in `max` bytes; and the
+/// number of the last one, `since` for none. A line's number is one more
+/// than its place in what was traced: the kernel's log numbers from 1.
+pub fn dmesg_since(since: u64, max: usize) -> (Vec<u8>, u64) {
+    let d = DMESG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    let mut last = since;
+    for (n, line) in d.iter() {
+        let seq = n + 1;
+        if seq <= since {
+            continue;
+        }
+        if out.len() + DMESG_RECORD_HEADER + line.len() > max {
+            break;
+        }
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&(line.len() as u16).to_le_bytes());
+        out.extend_from_slice(line);
+        last = seq;
+    }
+    (out, last)
+}
+
+/// The number the next line logged will have, and how many the log no
+/// longer holds: the two read together.
+pub fn dmesg_counts() -> (u64, u64) {
+    let d = DMESG.lock().unwrap_or_else(|e| e.into_inner());
+    let traced = TRACED.load(Ordering::Relaxed);
+    (traced + 1, traced - d.len() as u64)
+}
+
 /// The lines traced since `mark` that the log still holds.
 pub fn traced_since(mark: u64) -> Vec<Vec<u8>> {
     DMESG.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(n, _)| *n >= mark).map(|(_, l)| l.clone()).collect()

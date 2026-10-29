@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "provider": "selftest",
+  "title": {"en": "Bus self-test", "ru": "Самопроверка шины"},
+  "help": {"en": "The bus's own provider, registered for the boot's test and gone after it.", "ru": "Собственный провайдер шины: регистрируется на время проверки при загрузке и снимается после неё."},
+  "methods": {
+    "echo": {"kind": "read", "title": {"en": "Echo", "ru": "Эхо"}},
+    "refuse": {"kind": "action", "title": {"en": "Refuse", "ru": "Отказ"}, "confirm": {"en": "Refuse, as asked?", "ru": "Отказать, как просили?"}},
+    "big": {"kind": "read", "title": {"en": "A large answer", "ru": "Большой ответ"}},
+    "quick": {"kind": "job", "title": {"en": "A quick job", "ru": "Быстрая задача"}},
+    "wait": {"kind": "job", "title": {"en": "A job that waits to be stopped", "ru": "Задача, ждущая остановки"}}
+  }
+}

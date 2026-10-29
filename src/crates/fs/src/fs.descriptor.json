@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "provider": "fs",
+  "title": {"en": "Filesystems", "ru": "Файловые системы"},
+  "help": {"en": "Every mount: where, what filesystem, on which device, and how much of it is free.", "ru": "Все точки монтирования: где, какая файловая система, на каком устройстве и сколько в ней свободно."},
+  "ui": {"section": "storage", "order": 31, "icon": "folder"},
+  "methods": {
+    "mounts": {"kind": "read", "title": {"en": "Mounts", "ru": "Монтирования"}}
+  },
+  "resources": {
+    "mounts": {
+      "title": {"en": "Mounts", "ru": "Монтирования"},
+      "list": "mounts", "items": "mounts", "key": "path",
+      "fields": {
+        "path": {"type": "string", "title": {"en": "Mounted on", "ru": "Точка монтирования"}},
+        "type": {"type": "string", "title": {"en": "Filesystem", "ru": "Файловая система"}},
+        "device": {"type": "string", "title": {"en": "Device", "ru": "Устройство"}},
+        "read_only": {"type": "bool", "title": {"en": "Read-only", "ru": "Только чтение"}},
+        "info": {"type": "string", "title": {"en": "Details", "ru": "Подробности"}},
+        "total_bytes": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"},
+          "help": {"en": "None for a filesystem kept in memory, which counts no blocks.", "ru": "Пусто для файловой системы в памяти: она не считает блоки."}},
+        "free_bytes": {"type": "bytes", "title": {"en": "Free", "ru": "Свободно"}}
+      },
+      "columns": ["path", "type", "device", "total_bytes", "free_bytes", "read_only"]
+    }
+  },
+  "metrics": {
+    "free_bytes": {"title": {"en": "Free space", "ru": "Свободное место"}, "method": "mounts", "items": "mounts", "key": "path",
+      "field": "free_bytes", "kind": "gauge", "unit": "B"}
+  }
+}

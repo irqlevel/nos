@@ -21,6 +21,14 @@
 #                         kernel. Off unless asked for
 #   --netconsole IP:PORT  the kernel log, over UDP, to IP:PORT
 #   --cmdline "ARGS"      more kernel parameters (docs/kernel-parameters.md)
+#   --panel               the management panel: a VM of nos's that manages it
+#                         in a browser, at https://<this machine>:39233, as
+#                         root -- with a password made now and printed once.
+#                         nos makes the VM at its first boot, of Debian's
+#                         cloud image and the panel's bundle, both downloaded
+#                         (docs/api.md). /etc/rc is given its lines
+#   --no-panel            /etc/rc without `api panel create`: the panel's VM
+#                         is neither made nor started at boot
 #   --boot-once           boot nos once, the next time
 #   --reboot              and reboot now
 #
@@ -77,8 +85,21 @@ EXT4_FEATURES_OK=" has_journal ext_attr resize_inode dir_index filetype extent 6
 # the image. An image holding anything else is refused: poured, that part
 # would be left out without a word, as /lib/hvboot was by v0.0.26's own
 # nos-install, so a file the image gains is added here too
-SYSTEM="boot/kernel64.elf lib/modules lib/hvboot VERSION"
-LAYOUT=" $SYSTEM boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
+SYSTEM="boot/kernel64.elf lib/modules lib/hvboot lib/panel VERSION"
+LAYOUT=" $SYSTEM lib/panel/bundle boot/grub/nos.cfg etc/rc nos-install boot boot/grub etc lib "
+# The management panel's lines of /etc/rc (--panel): hv and the host API,
+# then the panel's VM -- made at the first boot, started at every one after
+PANEL_RC=(
+    "insmod /lib/modules/hv.ko"
+    "hv on"
+    "insmod /lib/modules/api.ko"
+    "api start"
+    "api panel create"
+)
+# root's password for the panel, as scrypt hashed it: what `api panel create`
+# hands the panel (panel/src/lib/auth.ts checks it), N=2^15, r=8, p=1
+PANEL_PASS=etc/api/panel.pass
+PANEL_PORT=39233
 
 die() { echo "nos-install: $*" >&2; exit 1; }
 warn() { echo "nos-install: WARNING: $*" >&2; }
@@ -478,6 +499,7 @@ put_system() {
     done
 
     put_ucode "$mnt"
+    put_panel "$mnt"
 
     # The grubenv: what this machine boots nos with, and the one-shot flag
     # GRUB reads and clears (42_nos) -- in place, its one block, which is
@@ -486,6 +508,67 @@ put_system() {
     if [ "$SET_CMDLINE" = 1 ]; then
         editenv "$mnt/grubenv" set "nos_cmdline=$CMDLINE"
     fi
+}
+
+# The management panel (--panel, --no-panel): /etc/rc's lines, and root's
+# password -- made once, its hash kept, the password itself printed and
+# kept nowhere. An update with --panel keeps the password there is.
+put_panel() {
+    local mnt=$1 rc=$1/etc/rc line password addr
+    case "$PANEL" in
+        1)
+            for line in "${PANEL_RC[@]}"; do
+                grep -qxF -- "$line" "$rc" && continue
+                if [ -s "$rc" ] && [ -n "$(tail -c 1 "$rc")" ]; then
+                    echo >> "$rc"
+                fi
+                echo "$line" >> "$rc"
+                say "/etc/rc: $line"
+            done
+            if [ -f "$mnt/$PANEL_PASS" ]; then
+                say "the panel's password is the one made with it: /$PANEL_PASS has its hash"
+                return 0
+            fi
+            mkdir -p "$mnt/etc/api"
+            password=$(panel_password "$mnt/$PANEL_PASS") || die "the panel's password could not be made"
+            addr=$(this_address)
+            [ -n "$addr" ] || addr="<this machine's address>"
+            say "the panel: https://$addr:$PANEL_PORT once nos has made it, minutes after its first boot"
+            say "the panel's user is root, its password $password"
+            say "that password is printed this once: /$PANEL_PASS on $PART has its hash alone" ;;
+        0)
+            if grep -qxF "api panel create" "$rc"; then
+                grep -vxF "api panel create" "$rc" > "$rc.new" || true
+                mv -T "$rc.new" "$rc"
+                say "/etc/rc: api panel create taken out -- the panel's VM is left as it is"
+            fi ;;
+    esac
+}
+
+# This machine's address, as a route out has it: what nos's eth0 is given
+# too, where DHCP gives the same machine the same address
+this_address() {
+    ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true
+}
+
+# root's password for the panel: random, its scrypt hash written to $1 (0600)
+# and the password itself on stdout
+panel_password() {
+    command -v python3 >/dev/null 2>&1 || die "--panel needs python3: the password's hash is scrypt, Python's"
+    python3 - "$1" <<'PY'
+import base64, hashlib, os, secrets, sys
+password = secrets.token_urlsafe(18)
+salt = os.urandom(16)
+n, r, p = 1 << 15, 8, 1
+digest = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, maxmem=128 * n * r * 2, dklen=32)
+line = "scrypt$%d$%d$%d$%s$%s\n" % (n, r, p, base64.b64encode(salt).decode(), base64.b64encode(digest).decode())
+fd = os.open(sys.argv[1] + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, line.encode())
+os.fsync(fd)
+os.close(fd)
+os.replace(sys.argv[1] + ".new", sys.argv[1])
+print(password)
+PY
 }
 
 # This machine's microcode, from its own system, which keeps it current:
@@ -645,6 +728,8 @@ reboot_now() {
 FORMAT=0
 BOOT_ONCE=0
 REBOOT=0
+# --panel 1, --no-panel 0, neither: /etc/rc as it is
+PANEL=
 # The options given, for the commands that take few of them
 SEEN=
 
@@ -678,6 +763,8 @@ parse_options() {
                 SET_CMDLINE=1 ;;
             --cmdline) [ $# -ge 2 ] || usage; EXTRA=$2; SET_CMDLINE=1; shift ;;
             --cmdline=*) EXTRA=${1#*=}; SET_CMDLINE=1 ;;
+            --panel) PANEL=1 ;;
+            --no-panel) PANEL=0 ;;
             --boot-once) BOOT_ONCE=1 ;;
             --reboot) BOOT_ONCE=1; REBOOT=1 ;;
             -h|--help) usage 0 ;;

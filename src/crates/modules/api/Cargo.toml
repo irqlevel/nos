@@ -1,0 +1,23 @@
+[package]
+name = "mod-api"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_api"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }
+# The server: TLS 1.3, a client let in by its key's fingerprint alone.
+tls = { path = "../../tls", features = ["server"] }
+# HTTP/1.1 and WebSocket as the API speaks them, the allowlists' networks,
+# and the host's certificate.
+web = { path = "../../web" }
+# The bus's JSON: the parameters a call is handed, what is written back.
+mgmtwire = { path = "../../mgmtwire" }
+# api.toml's text.
+conf = { path = "../../conf" }
+# The host key's secret wiped once its certificate is made.
+zeroize = { version = "1", default-features = false }

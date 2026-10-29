@@ -1,0 +1,8 @@
+node_modules/
+.next/
+next-env.d.ts
+mock/state/
+data/
+test-results/
+playwright-report/
+*.tsbuildinfo
