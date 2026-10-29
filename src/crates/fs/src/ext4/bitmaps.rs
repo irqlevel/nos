@@ -12,7 +12,7 @@ use extfmt::group::{self, BLOCK_UNINIT, INODE_UNINIT};
 use kcore::trace;
 
 use super::source::Source;
-use super::txn::{Kind, Txn};
+use super::txn::{Kind, Txn, RESERVE};
 
 fn bit(map: &[u8], i: u64) -> bool {
     map[(i / 8) as usize] & (1 << (i % 8)) != 0
@@ -105,8 +105,16 @@ impl Txn<'_> {
 
     /// A block, free and the filesystem's to give: the first at `goal` or
     /// after it in its group, then in the groups after. None, said, when
-    /// there is none -- or a bitmap is damaged.
+    /// there is none -- or a bitmap is damaged -- and, but for a punch,
+    /// when only the reserve is left.
     pub fn alloc_block(&mut self, goal: u64) -> Option<u64> {
+        if self.m.free_blocks.saturating_sub(self.allocated) <= RESERVE {
+            if !self.may_reserve {
+                trace!(0, "ext4: no free blocks but the {} kept for giving blocks back", RESERVE);
+                return None;
+            }
+            trace!(1, "ext4: the disk is full: a punch takes one of the blocks kept for it");
+        }
         let (groups, first, blocks) = (self.m.groups, self.m.first_data, self.m.blocks);
         let goal = goal.clamp(first, blocks.saturating_sub(1));
         let g0 = self.m.group_of(goal);
@@ -121,7 +129,7 @@ impl Txn<'_> {
             let found = {
                 let data = &self.dirty.get(&map)?.data;
                 let freed = &self.freed;
-                (from..len).chain(0..from).find(|&i| !bit(data, i) && !freed.contains(&(start + i)))
+                (from..len).chain(0..from).find(|&i| !bit(data, i) && !freed.contains(start + i))
             };
             let Some(i) = found else {
                 trace!(0, "ext4: group {} counts free blocks, and its bitmap has none", g);
@@ -138,6 +146,7 @@ impl Txn<'_> {
             d.set_free_blocks_count(free.saturating_sub(1));
             d.set_flags(flags & !BLOCK_UNINIT);
             self.cache.forget(b);
+            self.allocated += 1;
             return Some(b);
         }
         trace!(0, "ext4: no free blocks");
@@ -189,33 +198,49 @@ impl Txn<'_> {
         None
     }
 
-    /// Block `b` given back: free in its bitmap and its group's count, not
-    /// handed out again before the commit, kept from any checkpoint, and --
-    /// where the live log holds a copy of it -- revoked, so that no replay
-    /// writes that copy over whatever the block becomes. False for a block
-    /// outside the filesystem's data, or free already: damage.
+    /// Block `b` given back (`free_run`).
     pub fn free_block(&mut self, b: u64) -> bool {
-        if b < self.m.first_data || b >= self.m.blocks || self.m.in_system(b) {
-            trace!(0, "ext4: a block to free, {}, outside the filesystem's data: refused", b);
+        self.free_run(b, 1)
+    }
+
+    /// Blocks `start..start + n` given back: free in their bitmaps and their
+    /// groups' counts -- a group at a time -- not handed out again before
+    /// the commit, kept from any checkpoint, and -- each the live log holds
+    /// a copy of -- revoked, so that no replay writes that copy over
+    /// whatever the block becomes. False for blocks outside the
+    /// filesystem's data, or free already: damage.
+    pub fn free_run(&mut self, start: u64, n: u64) -> bool {
+        let Some(end) = start.checked_add(n) else { return false };
+        if start < self.m.first_data || end > self.m.blocks || self.m.overlaps_system(start, end) {
+            trace!(0, "ext4: blocks to free, {}..{}, outside the filesystem's data: refused", start, end);
             return false;
         }
-        self.dirty.remove(&b);
-        let g = self.m.group_of(b);
-        let Some(map) = self.bitmap(g, false) else { return false };
-        let i = b - self.m.group_start(g);
-        let Some(d) = self.dirty.get_mut(&map) else { return false };
-        if !bit(&d.data, i) {
-            trace!(0, "ext4: block {} to free, and its bitmap has it free already", b);
-            return false;
+        let held: Vec<u64> = self.dirty.range(start..end).map(|(&b, _)| b).collect();
+        for b in held {
+            self.dirty.remove(&b);
         }
-        set_bit(&mut d.data, i, false);
-        let Some(mut desc) = self.group_mut(g) else { return false };
-        let free = desc.view().free_blocks_count();
-        desc.set_free_blocks_count(free + 1);
-        if self.jnl.in_log.contains_key(&b) {
-            self.revoke.insert(b);
+        let mut b = start;
+        while b < end {
+            let g = self.m.group_of(b);
+            let at = self.m.group_start(g);
+            let stop = end.min(at + self.m.group_len(g));
+            let Some(map) = self.bitmap(g, false) else { return false };
+            let Some(d) = self.dirty.get_mut(&map) else { return false };
+            for i in b - at..stop - at {
+                if !bit(&d.data, i) {
+                    trace!(0, "ext4: block {} to free, and its bitmap has it free already", at + i);
+                    return false;
+                }
+                set_bit(&mut d.data, i, false);
+            }
+            let Some(mut desc) = self.group_mut(g) else { return false };
+            let free = desc.view().free_blocks_count();
+            desc.set_free_blocks_count(free + (stop - b) as u32);
+            b = stop;
         }
-        self.freed.insert(b);
+        let logged: Vec<u64> = self.jnl.in_log.range(start..end).map(|(&b, _)| b).collect();
+        self.revoke.extend(logged);
+        self.freed.insert(start, end);
         true
     }
 

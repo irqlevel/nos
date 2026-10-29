@@ -56,11 +56,14 @@ impl Cache {
         self.pinned.insert(b, data);
     }
 
-    /// `b` freed: its committed copy is nobody's, and no checkpoint is to
-    /// write it over whatever the block becomes.
-    pub fn unpin(&mut self, b: u64) {
-        self.pinned.remove(&b);
-        self.forget(b);
+    /// Blocks `start..end` freed: their committed copies are nobody's, and
+    /// no checkpoint is to write them over whatever the blocks become.
+    pub fn unpin_range(&mut self, start: u64, end: u64) {
+        let pinned: Vec<u64> = self.pinned.range(start..end).map(|(&b, _)| b).collect();
+        for b in pinned {
+            self.pinned.remove(&b);
+        }
+        self.clean.retain(|(k, _)| !(start..end).contains(k));
     }
 
     pub fn pinned(&self) -> impl Iterator<Item = (&u64, &Vec<u8>)> {

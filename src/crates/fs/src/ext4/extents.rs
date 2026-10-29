@@ -363,14 +363,14 @@ impl Txn<'_> {
                 }
                 hint = out.len().saturating_sub(1);
             }
+            if cut.is_empty() {
+                /* Nothing of the range in this leaf: left as it is. */
+                pos = next;
+                continue;
+            }
             leaf.leaves = out;
             for (start, n) in cut {
-                for b in start..start + n {
-                    if !self.free_block(b) {
-                        return None;
-                    }
-                }
-                if !inode::add_blocks(self.m, raw, -(n as i64)) {
+                if !self.free_run(start, n) || !inode::add_blocks(self.m, raw, -(n as i64)) {
                     return None;
                 }
                 freed += n;
@@ -381,6 +381,58 @@ impl Txn<'_> {
             pos = next;
         }
         Some(freed)
+    }
+
+    /// The last extent that maps any of file blocks `from..to` of inode
+    /// `ino` (`raw`), or None: the one before `to` in the leaf that would
+    /// map `to - 1`, whose index keys say no extent after it starts before.
+    fn ext_last(&mut self, ino: u32, iseed: u32, raw: &[u8], from: u64, to: u64) -> Option<Option<Leaf>> {
+        if from >= to {
+            return Some(None);
+        }
+        let l = u32::try_from(to - 1).unwrap_or(u32::MAX);
+        let path = self.path_to(ino, iseed, raw, l)?;
+        let leaf = path.nodes.last()?;
+        Some(leaf.leaves.iter().rev().copied().find(|e| u64::from(e.first) < to)
+            .filter(|e| u64::from(e.first) + u64::from(e.len) > from))
+    }
+
+    /// The blocks freeing one extent may change: the bitmaps and
+    /// descriptors of the groups the longest spans, the path to its leaf,
+    /// and a node freed on the way.
+    fn piece_room(&self) -> usize {
+        let groups = (u64::from(INIT_MAX_LEN) / u64::from(self.m.bpg.max(1)) + 2) as usize;
+        2 * groups + usize::from(MAX_DEPTH) + 4
+    }
+
+    /// The extents one transaction gives back at most: enough that a file
+    /// of a few hundred takes a handful of transactions, few enough that
+    /// each stays small beside what the journal holds.
+    pub fn free_pieces(&self) -> usize {
+        (self.jnl.max_txn / 16).clamp(4, 32)
+    }
+
+    /// What maps file blocks `from..to` of inode `ino` (`raw`) taken out from
+    /// the end back, an extent at a time: at most `pieces` of them, and once
+    /// this transaction holds about half what one may, no more -- but always
+    /// the first, so that every transaction gets somewhere. The blocks given
+    /// back, and where what is left of the range ends: `from` when nothing
+    /// of it is mapped now.
+    pub fn ext_unmap_tail(&mut self, ino: u32, raw: &mut [u8], from: u64, to: u64, pieces: usize)
+                          -> Option<(u64, u64)> {
+        let iseed = self.iseed(ino, raw)?;
+        let room = self.piece_room();
+        let (mut freed, mut end) = (0u64, to);
+        for k in 0..=pieces {
+            let Some(e) = self.ext_last(ino, iseed, raw, from, end)? else { return Some((freed, from)) };
+            if k == pieces || (k > 0 && self.dirty.len() + room > self.jnl.max_txn / 2) {
+                return Some((freed, end));
+            }
+            let at = u64::from(e.first).max(from);
+            freed += self.ext_unmap(ino, raw, at, end)?;
+            end = at;
+        }
+        Some((freed, end))
     }
 
     /// File blocks `l..l + n` of inode `ino`, inside one unwritten extent,

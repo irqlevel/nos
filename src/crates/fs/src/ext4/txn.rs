@@ -10,7 +10,12 @@
 //! What it frees stays out of reach until it commits: a block freed is not
 //! handed out again by the same transaction, and a block the live log holds
 //! a copy of is revoked, so that no replay writes that copy over whatever
-//! the block becomes next (`free_block`).
+//! the block becomes next (`free_run`). What it frees is kept as runs, so
+//! that a file of millions of blocks is a handful of them.
+//!
+//! The last few free blocks are kept for a punch (`RESERVE`): one inside
+//! an extent splits it, and on a full disk the leaf the split needs would
+//! otherwise be what stops a guest giving its disk's blocks back.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -51,6 +56,54 @@ pub(super) struct Dirty {
     pub kind: Kind,
 }
 
+/// The free blocks only a punch may take: what a split extent's new leaf
+/// and the nodes above it could need, the tree as deep as it goes.
+pub const RESERVE: u64 = 8;
+
+/// Blocks as runs, each `start..end`, sorted and apart.
+#[derive(Default)]
+pub(super) struct Runs {
+    runs: BTreeMap<u64, u64>,
+}
+
+impl Runs {
+    pub fn contains(&self, b: u64) -> bool {
+        self.runs.range(..=b).next_back().is_some_and(|(_, &end)| b < end)
+    }
+
+    /// `start..end` in, run on into the runs it meets.
+    pub fn insert(&mut self, mut start: u64, mut end: u64) {
+        if let Some((&s, &e)) = self.runs.range(..=start).next_back() {
+            if e >= start {
+                start = s;
+                end = end.max(e);
+                self.runs.remove(&s);
+            }
+        }
+        while let Some((&s, &e)) = self.runs.range(start..).next() {
+            if s > end {
+                break;
+            }
+            end = end.max(e);
+            self.runs.remove(&s);
+        }
+        self.runs.insert(start, end);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.runs.iter().map(|(&s, &e)| (s, e))
+    }
+
+    /// How many blocks the runs hold.
+    pub fn blocks(&self) -> u64 {
+        self.runs.iter().map(|(&s, &e)| e - s).sum()
+    }
+}
+
 pub(super) struct Txn<'a> {
     pub io: &'a mut Io,
     pub m: &'a mut Meta,
@@ -58,9 +111,13 @@ pub(super) struct Txn<'a> {
     pub jnl: &'a mut Journal,
     pub dirty: BTreeMap<u64, Dirty>,
     /// Blocks freed: not handed out again before the commit.
-    pub freed: BTreeSet<u64>,
+    pub freed: Runs,
     /// Blocks freed that the live log holds a copy of.
     pub revoke: BTreeSet<u64>,
+    /// Blocks handed out, which the free count loses at the commit.
+    pub allocated: u64,
+    /// Whether this may take the free blocks kept for a punch.
+    pub may_reserve: bool,
     /// The wall clock as the call began: every time it stores.
     pub now: u32,
 }
@@ -71,12 +128,15 @@ static NO_OVERLAY: Overlay = Overlay::new();
 
 impl<'a> Txn<'a> {
     pub fn new(io: &'a mut Io, m: &'a mut Meta, cache: &'a mut Cache, jnl: &'a mut Journal, now: u32) -> Txn<'a> {
-        Txn { io, m, cache, jnl, dirty: BTreeMap::new(), freed: BTreeSet::new(), revoke: BTreeSet::new(), now }
+        Txn {
+            io, m, cache, jnl, dirty: BTreeMap::new(), freed: Runs::default(), revoke: BTreeSet::new(), allocated: 0,
+            may_reserve: false, now,
+        }
     }
 
     /// Room for one more block, or why not.
     fn admit(&mut self, b: u64) -> bool {
-        if self.freed.contains(&b) {
+        if self.freed.contains(b) {
             trace!(0, "ext4: block {} changed after it was freed in the same transaction: refused", b);
             return false;
         }
@@ -172,21 +232,40 @@ impl<'a> Txn<'a> {
         super::source::inode(self, ino)
     }
 
+    /// The superblock as this transaction has it.
+    pub fn super_now(&self) -> Option<Super> {
+        let (b, at) = (self.m.sb_block(), self.m.sb_at());
+        match self.dirty.get(&b) {
+            Some(d) => Super::parse(&d.data[at..at + extfmt::sb::SIZE]).ok(),
+            None => Some(self.m.sb.clone()),
+        }
+    }
+
+    /// The superblock changed by `change`, in this transaction.
+    pub fn change_super(&mut self, change: impl FnOnce(&mut Super)) -> bool {
+        let (b, at) = (self.m.sb_block(), self.m.sb_at());
+        let Some(blk) = self.modify(b, Kind::Super) else { return false };
+        let Ok(mut s) = Super::parse(&blk[at..at + extfmt::sb::SIZE]) else { return false };
+        change(&mut s);
+        blk[at..at + extfmt::sb::SIZE].copy_from_slice(s.raw());
+        true
+    }
+
     /// The superblock saying a file may be 2 GiB or more (large_file), as
     /// e2fsck wants of a filesystem that has one -- in this transaction,
     /// with the file that first needs it.
     pub fn large_file(&mut self) -> bool {
-        if self.m.sb.ro_compat() & ro_compat::LARGE_FILE != 0 {
+        if self.super_now().is_some_and(|s| s.ro_compat() & ro_compat::LARGE_FILE != 0) {
             return true;
         }
-        let (b, at) = (self.m.sb_block(), self.m.sb_at());
-        let Some(blk) = self.modify(b, Kind::Super) else { return false };
-        let Ok(mut s) = Super::parse(&blk[at..at + extfmt::sb::SIZE]) else { return false };
-        let features = s.ro_compat() | ro_compat::LARGE_FILE;
-        s.set_ro_compat(features);
-        blk[at..at + extfmt::sb::SIZE].copy_from_slice(s.raw());
-        trace!(1, "ext4: a file of 2 GiB or more: large_file set");
-        true
+        let set = self.change_super(|s| {
+            let features = s.ro_compat() | ro_compat::LARGE_FILE;
+            s.set_ro_compat(features);
+        });
+        if set {
+            trace!(1, "ext4: a file of 2 GiB or more: large_file set");
+        }
+        set
     }
 
     /// Put on every block the checksum its kind says it carries: the

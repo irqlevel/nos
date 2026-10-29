@@ -292,10 +292,10 @@ a sequential pass does not re-read its indirect blocks per data block.
 `src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
 -- through `src/crates/extfmt`, the on-disk format and its checksums as a
 crate with no kernel in it, and writes it through its journal: names and
-data. What it does not do yet is free at scale -- a truncate, a remove or
-a punch whose blocks one transaction cannot give back, and the orphans
-another kernel left -- which is the next step. ext2's driver stays as it
-is, for the roots made before ext4.
+data, and what a remove, a cut or a punch gives back, however much -- in
+transactions of a bounded share, through the orphan list, which a mount for
+writing releases, its own crash's or another kernel's. ext2's driver stays
+as it is, for the roots made before ext4.
 
 Which driver a filesystem gets is `extfs::driver_for`'s to say, for
 `root=`, the fallback layout and `mount`: ext2's takes what it always
@@ -312,9 +312,17 @@ quota or project quotas. A mount asked to write is read-only too -- the
 reason said -- for a filesystem marked with errors or not marked valid, a
 journal that recorded an error, is of the first version or holds a log the
 superblock does not say needs replaying, a transaction whose commit fails
-its checksum (e2fsck should look), and orphans to release, which the
-driver does not do yet; and refused for a journal whose blocks are the
-filesystem's own metadata. Past what extfmt
+its checksum (e2fsck should look), and an orphan list that is not sound --
+an inode on it no file may be, or not in use, or failing its checksum, or
+mapped by blocks, or named twice; and refused for a journal whose blocks are
+the filesystem's own metadata. A superblock that fails only its checksum,
+on a filesystem with a journal, is the one a power cut tears as a
+checkpoint or a replay writes it home -- with 512-byte sectors its 1024
+bytes are two, half the old and half the new, which agree on where
+everything is -- while the journal still holds its copy, the log's start
+moving past one only once its home is on the medium: it is used to find the
+journal and nothing more, and a replay must then write a sound one home, or
+a read-only mount find one in the log, or the mount is refused. Past what extfmt
 checks of a superblock, the driver refuses a block it cannot read in a page,
 more blocks than the device has, groups more than their bitmaps cover, an
 inode count that is not what the groups hold, and descriptors whose bitmaps
@@ -450,6 +458,30 @@ filesystem's. What holds a file as an image is counted by the file -- its
 mount and inode -- and not by the name it was opened by (`vfs.rs`): a
 second name, a hard link, does not get past the hold. A file of more than
 one name has every name's vnode given its size.
+
+Giving back (`ext4/orphans.rs`): a file's blocks go back from its end, an
+extent at a time, a transaction taking a bounded share -- as many extents
+as a sixteenth of the blocks one may hold, four to thirty-two, and none
+past the first once it holds half what one may -- and what it frees kept
+as runs, so that a file of millions of blocks is a handful of them. A remove of a file's last
+name, or a cut, that one transaction cannot finish puts the inode on the
+superblock's orphan list in its first -- the name gone, or the size cut,
+with it -- gives back the rest in the ones after, and takes it off the
+list in its last; a crash between them leaves an inode of no links named
+nowhere, or a file whose extents run past its size, which a mount for
+writing releases after its replay -- as Linux and e2fsck release another
+kernel's -- writing zeros over what a cut file's last block holds past its
+size, as Linux does. Calls run one at a time, so an inode always leaves the
+list from its head. A directory gives its blocks back in one transaction:
+it is empty when it goes, and what it holds is a run or a few. A punch goes on in transactions of its own, each a
+range given back whole, and may take the last few free blocks
+(`RESERVE`), which nothing else is given: a punch inside an extent splits
+it, and on a full disk the leaf the split needs must not be what stops a
+guest giving its disk's blocks back. A disk another system filled past them
+may still refuse one, leaving the range as it was but for the end of it the
+transactions before gave back. A write that fails part way
+forces what it wrote in place to the medium before it returns, as every
+call leaves what it did: no commit came to flush it.
 
 ## nanofs, ramfs, procfs
 

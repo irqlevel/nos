@@ -5,8 +5,10 @@
 //! as data=ordered has it. A mount that only reads
 //! writes nothing: a journal nobody replayed is read through, not replayed.
 //! A mount that writes replays it first, says the filesystem needs
-//! recovery before anything else is written, and clears that only at a
-//! clean unmount, once a checkpoint has put everything home.
+//! recovery before anything else is written, releases the orphans the
+//! superblock's list holds (orphans.rs) -- a file whose blocks one
+//! transaction cannot give back is one -- and clears that only at a clean
+//! unmount, once a checkpoint has put everything home.
 //!
 //! What is refused, read-only or written is extfmt's `features::classify`;
 //! what is checked of the geometry past what extfmt checks is here, so
@@ -28,6 +30,7 @@ mod io;
 mod journal;
 mod meta;
 mod ops;
+mod orphans;
 mod source;
 mod txn;
 
@@ -55,6 +58,9 @@ use cache::Cache;
 use io::Io;
 use journal::{Journal, Opened, Overlay};
 use meta::Meta;
+/// The free blocks only a punch may take: what a filesystem that had at
+/// least these free when it was mounted can never refuse a punch for.
+pub use txn::RESERVE;
 use source::{Reader, Source};
 
 const ROOT_INO: u32 = 2;
@@ -154,7 +160,10 @@ impl Ext4 {
     /// What the driver requires of a superblock past what extfmt does: a
     /// block it can read in a page, a filesystem inside the device, groups
     /// whose bitmaps cover them, the inode count what the groups hold.
-    fn check_super(&self, sb: &Super) -> bool {
+    /// Whether `sb` describes a filesystem this can read off this device --
+    /// its checksum held to, unless `csum` says otherwise (`mount`'s torn
+    /// superblock).
+    fn check_super(&self, sb: &Super, csum: bool) -> bool {
         let bs = sb.block_size();
         let bpg = u64::from(sb.blocks_per_group());
         let ipg = u64::from(sb.inodes_per_group());
@@ -173,7 +182,7 @@ impl Ext4 {
             "64bit with descriptors under 64 bytes"
         } else if u64::from(sb.first_data_block()) != (bs == 1024) as u64 {
             "a first data block that is not the block size's"
-        } else if !sb.checksum_ok() {
+        } else if csum && !sb.checksum_ok() {
             "a superblock that fails its checksum"
         } else {
             return true;
@@ -224,7 +233,12 @@ impl Ext4 {
     /// The superblock and the descriptors, read and held to the device: a
     /// Meta, or None, the reason said.
     fn load(&mut self, sb: &Super) -> Option<Meta> {
-        if !self.check_super(sb) {
+        self.load_held(sb, true)
+    }
+
+    /// `load`, the superblock's checksum held to or not.
+    fn load_held(&mut self, sb: &Super, csum: bool) -> Option<Meta> {
+        if !self.check_super(sb, csum) {
             return None;
         }
         self.io.bs = sb.block_size() as usize;
@@ -235,9 +249,14 @@ impl Ext4 {
 
     /// The superblock in the journal's newer copy of it, where a read-only
     /// mount's overlay has one: the filesystem as a replay would leave it.
-    fn reload_through_overlay(&mut self, sb: &Super) -> Option<Meta> {
+    /// A `torn` superblock must have one.
+    fn reload_through_overlay(&mut self, sb: &Super, torn: bool) -> Option<Meta> {
         let m = self.m.as_ref()?;
         let (first, last) = (m.sb_block(), m.gdt_first() + m.gdt_len());
+        if torn && !self.overlay.contains_key(&first) {
+            trace!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy of it");
+            return None;
+        }
         if !(first..last).any(|b| self.overlay.contains_key(&b)) {
             return self.m.take();
         }
@@ -290,12 +309,23 @@ impl Ext4 {
             }
             Support::Writable => {}
         }
+        /* A superblock that fails only its checksum, on a filesystem with a
+         * journal: one a power cut tore as a checkpoint or a replay wrote it
+         * -- its sectors half the old, half the new, which agree on where
+         * everything is -- while the journal still holds its copy, as the
+         * log's start moves past a copy only once its home is on the
+         * medium. Used to find the journal and nothing more: a replay must
+         * write a sound one home, or a read through it find one. */
+        let torn = !sb.checksum_ok() && sb.compat() & features::compat::HAS_JOURNAL != 0;
+        if torn {
+            trace!(0, "ext4: the superblock fails its checksum: the journal's copy of it is wanted");
+        }
         if sb.state() & STATE_ERROR != 0 {
             ro_why.get_or_insert_with(|| String::from("the filesystem says it has errors (e2fsck it)"));
         } else if sb.state() & STATE_VALID == 0 {
             ro_why.get_or_insert_with(|| String::from("the filesystem is not marked valid (e2fsck it)"));
         }
-        self.m = Some(self.load(&sb)?);
+        self.m = Some(self.load_held(&sb, !torn)?);
         let has_journal = sb.compat() & features::compat::HAS_JOURNAL != 0;
         let mut journal_map: Vec<u64> = Vec::new();
         if has_journal {
@@ -341,6 +371,12 @@ impl Ext4 {
                          * were before it. */
                         self.cache.clear();
                         let mut newer = read_super(&self.io.dev, &mut self.io.scratch)?;
+                        if torn && !newer.checksum_ok() {
+                            trace!(0, "ext4: refused: the superblock fails its checksum, and the journal held no \
+                                       copy of it");
+                            self.reset();
+                            return None;
+                        }
                         newer.raw_mut()[ERR_FIELDS].copy_from_slice(&errors);
                         if newer.blocks_count() != sb.blocks_count() || newer.inodes_count() != sb.inodes_count()
                             || newer.block_size() != sb.block_size()
@@ -355,14 +391,23 @@ impl Ext4 {
                             return None;
                         };
                         self.m = Some(m);
+                    } else if torn {
+                        trace!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy \
+                                   of it");
+                        self.reset();
+                        return None;
                     }
                 }
             }
         }
         if ro_why.is_none() && self.m.as_ref().is_some_and(|m| m.sb.last_orphan() != 0) {
-            ro_why = Some(String::from("orphans to release, which this does not do yet"));
-            self.jnl = None;
-            self.io.writable = false;
+            /* Walked before anything is written: released once the
+             * superblock says the filesystem needs recovery. */
+            if let Err(why) = self.orphans_sound() {
+                ro_why = Some(why);
+                self.jnl = None;
+                self.io.writable = false;
+            }
         }
         if let Some(why) = &ro_why {
             if why != "asked" {
@@ -377,7 +422,7 @@ impl Ext4 {
                         return None;
                     }
                 }
-                let m = self.reload_through_overlay(&sb);
+                let m = self.reload_through_overlay(&sb, torn);
                 let Some(m) = m else {
                     self.reset();
                     return None;
@@ -392,6 +437,7 @@ impl Ext4 {
                 self.reset();
                 return None;
             }
+            m.count_free_blocks();
             /* Needing recovery, on the medium, before the journal is
              * written at all. */
             let incompat_now = m.sb.incompat() | incompat::RECOVER;
@@ -403,6 +449,19 @@ impl Ext4 {
                 trace!(0, "ext4: refused: the superblock does not write");
                 self.reset();
                 return None;
+            }
+            match self.release_orphans() {
+                Ok(0) => {}
+                Ok(n) => trace!(0, "ext4: the orphan list released: {} inodes", n),
+                Err(why) => {
+                    /* Left for whoever mounts it next: nothing more is
+                     * written, the list as the last commit left it. */
+                    trace!(0, "ext4: read-only: {}", why);
+                    if let Some(j) = self.jnl.as_mut() {
+                        j.abort(&why);
+                    }
+                    ro_why = Some(why);
+                }
             }
         }
         self.read_only = ro_why.is_some();
