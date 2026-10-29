@@ -103,7 +103,9 @@ Silicon, about four times as fast.
 The x86-64 smoke boot attaches virtio-blk (modern), virtio-scsi (legacy),
 NVMe, virtio-net and virtio-rng, so it covers the Rust drivers and the MSI-X
 path as well as the C++ underneath them. The arm64 one attaches virtio-mmio
-blk, net and rng. Both boot with `fstest=on`. The arm64 one boots with
+blk, net and rng. Both boot with `fstest=on`, on an ext4 root of 1 KiB
+blocks, as new installs get one (`scripts/mkrootfs.sh`): ext2's root is
+`ext2-test.py`'s. The arm64 one boots with
 `hugepages=64M` too: the huge pool reserved right after the free list, and a
 block of it handed out, written through its pages and given back by the
 frames' selftest (`huge frame selftest: passed`) -- x86's boots nos.iso,
@@ -260,7 +262,7 @@ stands on a stack of its own now, and halts in a loop that touches no memory
 ### `nanofs-test.py` -- nanofs
 
 nanofs is the kernel's own small checksummed filesystem, and nothing else in
-the suite touches it: the smoke boots and `ext2-test.py` both run on ext2.
+the suite touches it: the smoke boots run on ext4, `ext2-test.py` on ext2.
 The gate is the `fstest` self-test over a freshly formatted disk, then files
 written, synced, unmounted and read back from a second mount, so that what
 is judged is what reached the disk rather than what a cache still held --
@@ -332,7 +334,7 @@ resized and the screen drawn again whole at the new size, `^Q`, the file
 read back; then the connection killed under a change, which must turn up in
 `<file>.save` with the file as it was saved; and `edit` with no terminal
 must say it needs one. On x86-64 it boots an
-ext2 root that already carries the module, a key and an `/etc/rc`, and logs
+ext4 root that already carries the module, a key and an `/etc/rc`, and logs
 in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.

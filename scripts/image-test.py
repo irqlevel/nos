@@ -439,7 +439,7 @@ def run(tmp, image):
               "QEMU", "Module ucode 0x" in text and "microcode: not loaded:" in text,
               [line for line in text.splitlines() if "ucode" in line or "microcode" in line][:6])
         check("its root is the partition, by UUID, read-write",
-              "MountRootFs: mounted ext2 on /" in text and "(rw)" in text, text[-3000:])
+              "MountRootFs: mounted ext4 on /" in text and "(rw)" in text, text[-3000:])
         version = m.wait_ssh(300)
         check("sshd from the image's /etc/rc lets in the key install was given", version is not None)
         first_key = m.host_key()

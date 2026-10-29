@@ -14,10 +14,10 @@ does what `root=` on the command line asks:
 | Command line | What ends up on `/` |
 |---|---|
 | nothing | nothing; the VFS starts empty and filesystems are mounted from the shell |
-| `root=auto` | the ext2 filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/`, the first ext2 found read-only on `/boot`, the first nanofs found read-write on `/data` (the layout the ISO had before there was a root on disk) |
-| `root=vda1`, `root=nvme01` | that block device, ext2 if it carries one, else nanofs |
-| `root=LABEL=nos` | the ext2 filesystem with that label |
-| `root=UUID=…` | the ext2 filesystem with that UUID, as `blkid` prints it |
+| `root=auto` | the ext4 -- or ext2 -- filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/`, the first of the ext family found read-only on `/boot`, the first nanofs found read-write on `/data` (the layout the ISO had before there was a root on disk) |
+| `root=vda1`, `root=nvme01` | that block device, ext4 or ext2 if it carries one, else nanofs |
+| `root=LABEL=nos` | the ext4 or ext2 filesystem with that label |
+| `root=UUID=…` | the ext4 or ext2 filesystem with that UUID, as `blkid` prints it |
 
 `ro` mounts the root read-only. A procfs goes on `/proc` in every case (the
 directory is created on the root if it is missing). If the named root is not
@@ -294,8 +294,17 @@ a sequential pass does not re-read its indirect blocks per data block.
 crate with no kernel in it, and writes it through its journal: names and
 data, and what a remove, a cut or a punch gives back, however much -- in
 transactions of a bounded share, through the orphan list, which a mount for
-writing releases, its own crash's or another kernel's. ext2's driver stays
-as it is, for the roots made before ext4.
+writing releases, its own crash's or another kernel's. It is what new roots
+are: `nos-install`, `scripts/mkrootfs.sh` and `scripts/build-disk.sh` make
+an ext4 of the features named one by one from none -- has_journal, ext_attr,
+resize_inode, dir_index, filetype, extent, 64bit, flex_bg, sparse_super,
+large_file, huge_file, dir_nlink, extra_isize, metadata_csum: e2fsprogs
+1.46's ext4, which GRUB 2.06 reads -- so that what a newer mke2fs.conf adds,
+orphan_file and metadata_csum_seed among them, is not there; and with its
+inode tables and its journal written whole (`lazy_itable_init=0`,
+`lazy_journal_init=0`), so that nothing an earlier use of the blocks left is
+ever read as either. ext2's driver stays as it is, for the roots made
+before ext4.
 
 Which driver a filesystem gets is `extfs::driver_for`'s to say, for
 `root=`, the fallback layout and `mount`: ext2's takes what it always
@@ -510,11 +519,14 @@ consistent; `/proc/version` and `/proc/cmdline` are written once at mount.
 ```sh
 scripts/mkrootfs.sh root.img 256 rootdir        # 256 MiB, populated from rootdir/
 scripts/mkrootfs.sh root.img 64 "" 1024         # empty, 1 KiB blocks (what the smoke tests use)
+FSTYPE=ext2 scripts/mkrootfs.sh root.img 64     # ext2, as the roots made before ext4 (ext2-test.py's)
 ```
 
-This is `mke2fs -L nos -O ^dir_index -d rootdir`: the label `root=auto`
-looks for, no directory index, populated from a directory without loop
-devices or root privileges (inside the `nos-builder` Docker image on macOS,
+This is `mke2fs -t ext4 -L nos -O none,<the features above>
+-E lazy_itable_init=0,lazy_journal_init=0 -d rootdir` -- for ext2,
+`mke2fs -t ext2 -L nos -O ^dir_index`, no directory index, which ext2's
+driver does not write: the label `root=auto` looks for, populated from a
+directory without loop devices or root privileges (inside the `nos-builder` Docker image on macOS,
 where the copy goes through a directory in the container because a macOS
 bind mount serves no extended attributes). Attach it to QEMU as a raw disk
 and the ISO boot mounts it:
@@ -524,16 +536,20 @@ qemu-system-x86_64 ... -cdrom nos.iso -drive file=root.img,format=raw,if=virtio
 ```
 
 `scripts/build-disk.sh` makes `nos.qcow2` the same way — one MBR partition,
-ext2 labelled `nos`, `/boot/kernel64.elf` and `/boot/grub` inside it, GRUB's
+ext4 labelled `nos`, `/boot/kernel64.elf` and `/boot/grub` inside it, GRUB's
 boot code in the boot sector, `ROOTFS=dir` to add content (modules under
-`lib/modules`) — and runs `e2fsck` over the result. Nothing in it needs
+`lib/modules`) — and fails on anything `e2fsck -fn` finds in the result
+(given the partition as `image?offset=`; it has no `-E offset=`, which it
+refused while its exit code was ignored). Nothing in it needs
 `--privileged`.
 
-On a machine that dual-boots Ubuntu (the Hetzner boxes) the root is an ext2
-partition made under Ubuntu, `mkfs.ext2 -L nos -O ^dir_index /dev/nvme0n1pN`,
-filled by mounting it there, and named on the `nos` command line by label or
-UUID. After a `nos` session, `e2fsck -f` under Ubuntu is the check that the
-driver left it as it should.
+On a machine that dual-boots Ubuntu (the Hetzner boxes) the root is a
+partition `nos-install` made an ext4 under Ubuntu ([Install](install.md)),
+or the ext2 one an install before ext4 made, which keeps it; named on the
+`nos` command line by UUID. After a `nos` session, `e2fsck -f` under Ubuntu
+is the check that the driver left it as it should -- for an ext4 nos left
+without unmounting it, after Ubuntu's mount or `e2fsck`'s replay of its
+journal.
 
 ## Checking it
 
