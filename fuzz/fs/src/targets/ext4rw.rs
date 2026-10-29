@@ -23,7 +23,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::image::ext4 as img;
 use crate::machine::disk;
 use crate::model::{join, show, Data, Node, CHUNK};
-use crate::targets::ext4::{agree, dump, geometry, one_in, orphans, style, too_big, tree, write_sparse, MKFS_TIME};
+use crate::targets::ext4::{agree, dump, geometry, one_in, orphans, space_of, style, too_big, tree, write_sparse,
+                            MKFS_TIME};
 use crate::targets::fsops::{self, Fs, Limits, Model, Res};
 use crate::{reached, Input};
 
@@ -853,11 +854,16 @@ pub fn ext4rw(r: &mut Input) {
             _ => run.call(r, look),
         }
     }
+    let mut space = None;
     if live {
         if !faults && run.uncertain.is_none() {
             run.f.compare();
         }
         run.f.close_all();
+        /* What the driver says it has room for, before it goes: the
+         * groups' counts as its last commit left them, which the check
+         * reads back from what owns each block. */
+        space = Some(run.f.vfs.space_of(b"/a/path/not/there/yet"));
         run.call(r, |run, _| {
             invariant!(run.f.vfs.unmount(b"/"), "the unmount at the end was refused");
             Leave::Either
@@ -930,6 +936,11 @@ pub fn ext4rw(r: &mut Input) {
                c.corrupt, c.unclean);
     invariant!(!c.mounted && c.replayed == 0 && c.orphans == 0, "the image after a clean unmount is left mounted \
                ({}), with {} transactions to replay or {} orphans", c.mounted, c.replayed, c.orphans);
+    if let Some(said) = space {
+        invariant!(said == Some(space_of(&c, bs)), "ext4 said it had {:?} before its clean unmount, and the image \
+                   {:?}", said, space_of(&c, bs));
+        reached("ext4rw: ext4's space held to what owns each block");
+    }
     if let Some(t) = &c.tree {
         if let Some(diff) = run.f.model.tree.diff(t) {
             panic!("invariant: the image after a clean unmount holds another tree than the model's: {}", diff);
