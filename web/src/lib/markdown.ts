@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import type { Element, ElementContent, Root as HastRoot } from "hast";
 import type { Html, Paragraph, Root as MdastRoot, Text } from "mdast";
@@ -127,6 +128,15 @@ function rehypeExtract() {
 
 const schemeRe = /^[a-z][a-z0-9+.-]*:/i;
 
+/* The files the site serves as they are -- a post's images -- from public/ */
+const publicDir = path.join(process.cwd(), "public");
+
+/** Whether a site path (no locale, e.g. "/images/x/a.webp") is a file of public/. */
+function isPublicFile(sitePath: string): boolean {
+    const file = path.join(publicDir, decodeURI(sitePath));
+    return file.startsWith(publicDir + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile();
+}
+
 function splitHash(href: string): [string, string] {
     const at = href.indexOf("#");
     return at === -1 ? [href, ""] : [href.slice(0, at), href.slice(at)];
@@ -137,13 +147,17 @@ function splitHash(href: string): [string, string] {
  * a site path gets the page's locale, a link between files of docs/ becomes a
  * link between doc pages, and one that leaves docs/ goes to the file on GitHub.
  * A link to a page that does not exist is collected and reported, so a typo is
- * a failed build rather than a 404 somebody finds later.
+ * a failed build rather than a 404 somebody finds later. A link to a file of
+ * public/ -- an image's full size -- is left as it is.
  */
 function rewriteHref(href: string, ctx: RenderContext, errors: string[]): string {
     if (href.startsWith("#") || href.startsWith("//") || schemeRe.test(href)) {
         return href;
     }
     const [target, hash] = splitHash(href);
+    if (target.startsWith("/") && isPublicFile(target)) {
+        return href;
+    }
     if (target.startsWith("/")) {
         const segments = target.split("/").filter(Boolean);
         const prefixed = isLocale(segments[0]);
@@ -187,6 +201,8 @@ function rehypeLinks() {
                 const src = node.properties.src;
                 if (!schemeRe.test(src) && !src.startsWith("/") && ctx.repoDir !== null) {
                     node.properties.src = site.repoRaw + path.posix.normalize(path.posix.join(ctx.repoDir, src));
+                } else if (src.startsWith("/") && !src.startsWith("//") && !isPublicFile(src)) {
+                    errors.push(`${src}: no such file in public/`);
                 }
                 node.properties.loading = "lazy";
                 node.properties.decoding = "async";

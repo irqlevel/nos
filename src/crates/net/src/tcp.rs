@@ -7,11 +7,26 @@
 //! -- connect, accept, send, receive -- sleep in a task and look again.
 //!
 //! A connection buffers 8 KiB each way in its slot: enough for a shell, or a
-//! request and its answer, and all that a connection someone else opens is
-//! ever given. One this machine opens to fetch in bulk asks for more
-//! (`Receive::Bulk`) -- a receive buffer of up to 512 KiB from the heap, and
-//! its window scaled to match (RFC 7323) when the peer agrees: a transfer
-//! moves a window a round trip, and 8 KiB a round trip is 200 KiB/s at 40 ms.
+//! request and its answer. A transfer moves a window a round trip, and 8 KiB
+//! a round trip is 130 KiB/s at 62 ms -- what `hv forward` carried between
+//! the EX44 and a browser. One this machine opens to fetch in bulk asks for
+//! more (`Receive::Bulk`) -- a receive buffer of up to 512 KiB from the heap,
+//! and its window scaled to match (RFC 7323) when the peer agrees; a listener
+//! that relays in bulk (`Buffers::Bulk`) has every connection it accepts
+//! given bulk buffers both ways, as `accept` hands it out, its window scaled
+//! from the SYN-ACK on when the peer's SYN offers to.
+//!
+//! With a window of hundreds of kilobytes in flight the sender has to stop
+//! short of what the path takes, and find a loss quicker than its timer
+//! does: congestion control (RFC 5681) -- ten segments to start with (RFC
+//! 6928), slow start and congestion avoidance, a lost segment sent again on
+//! the third duplicate acknowledgement, and the losses after it in the same
+//! window one a partial acknowledgement (NewReno, RFC 6582). A timeout sends
+//! one segment again, and the acknowledgements it brings send the rest of
+//! what was outstanding as the window grows -- go-back-N, ACK by ACK, where
+//! it was everything at once, once a second. A connection of 8 KiB never
+//! has more in flight than its first window, so for it nothing but a
+//! timeout changes.
 //!
 //! What is written down here rather than left to be rediscovered:
 //!
@@ -29,9 +44,10 @@
 //!   that is merely slow to read -- a suspended ssh client -- as a dead one,
 //!   in under a minute. The persist timer probes instead.
 //! - **Nothing is allocated or freed under a lock.** A bulk buffer comes from
-//!   the heap before `connect` takes one, and goes back once the connection
-//!   is done with it: the timer takes it out under the locks and drops it
-//!   after them.
+//!   the heap before `connect` takes one -- and before `accept` hands a bulk
+//!   listener's connection out, once one is waiting -- and goes back once the
+//!   connection is done with it: the timer takes it out under the locks and
+//!   drops it after them.
 //! - **The window offered never shrinks.** A scaled window is said in units
 //!   of two to the shift, rounded down; one unit of the buffer is kept spare,
 //!   so that the edge offered before can always be kept, rounded up, inside
@@ -68,8 +84,9 @@ pub const RECV_BUF: usize = RING_BUF;
 /// A bulk connection's receive buffer: the first of these the heap has --
 /// the largest block the page allocator hands out (128 pages), then less.
 const BULK_SIZES: [usize; 3] = [512 * 1024, 256 * 1024, 128 * 1024];
-/// The most bulk buffers out at once, whoever asks: 4 MiB of heap.
-const MAX_BULK: usize = 8;
+/// The most bulk buffers out at once, whoever asks -- a download's receive
+/// buffer, both of a bulk listener's connection's: 16 MiB of heap.
+const MAX_BULK: usize = 32;
 /* Every one more than 16 bits say, so that its shift is never 0: a
  * connection scales exactly when this end's shift is not 0. */
 const _: () = assert!(BULK_SIZES[BULK_SIZES.len() - 1] > u16::MAX as usize);
@@ -81,6 +98,16 @@ const MAX_OOO: usize = 8;
 pub const DEFAULT_MSS: u16 = 536;
 pub const OUR_MSS: u16 = 1460;
 
+/// The congestion window a connection starts with (RFC 6928): ten segments,
+/// within 14,600 bytes and two segments at least.
+const IW_SEGMENTS: u32 = 10;
+const IW_BYTES: u32 = 14_600;
+/// The duplicate acknowledgements that say a segment was lost (RFC 5681
+/// 3.2), rather than overtaken.
+const DUP_ACKS: u32 = 3;
+/// What the congestion window grows to at most: far past any buffer, short
+/// of where adding to it could wrap.
+const CWND_MAX: u32 = 1 << 30;
 const INITIAL_RTO_MS: u64 = 1000;
 const MAX_RTO_MS: u64 = 8000;
 const MAX_RETRANSMITS: u32 = 8;
@@ -105,10 +132,13 @@ pub(crate) const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_MAX: u16 = 65535;
 
 /// Connections a listener holds that nobody has accepted yet -- handshakes
-/// under way, and ones done and waiting. Past this a SYN to its port is
-/// dropped, as a full accept queue drops it: a flood of SYNs to a listening
-/// port then costs the pool this many slots, not all of them.
-const LISTEN_BACKLOG: usize = 16;
+/// under way, and ones done and waiting -- at most, and by default. Past its
+/// own a SYN to its port is dropped, as a full accept queue drops it: a
+/// flood of SYNs to a listening port then costs the pool that many slots,
+/// not all of them -- and a server that takes few at a time (`listen_with`)
+/// asks for fewer, so that two ports flooded do not take half the pool.
+pub const LISTEN_BACKLOG: usize = 16;
+const _: () = assert!(LISTEN_BACKLOG <= u8::MAX as usize);
 
 /// What `recv` answers below zero.
 pub const RECV_ERROR: isize = -1;
@@ -226,6 +256,19 @@ impl Drop for BulkBuf {
     fn drop(&mut self) {
         BULK_OUT.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// What every connection a listener accepts buffers each way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Buffers {
+    /// The slot's own 8 KiB each way, the window unscaled: a server that
+    /// talks -- a shell, a request and its answer.
+    Small,
+    /// Bulk buffers both ways, given as `accept` hands the connection out,
+    /// and the window scaled from the SYN-ACK on when the peer's SYN offers
+    /// to: a relay of a forwarded port, carrying a download either way. The
+    /// slot's own when the heap has none, or `MAX_BULK` are out already.
+    Bulk,
 }
 
 /// The least shift that says a window as big as `size` in the 16 bits a
@@ -351,6 +394,25 @@ impl Ring {
         self.reset();
     }
 
+    /// A bulk buffer in place of the slot's own on a connection under way:
+    /// what is buffered, and what lies past it in the free space -- what
+    /// arrived ahead of a hole, where the stream has it -- moved across in
+    /// the stream's order from the head on, so that each byte keeps its
+    /// place from the head. The bulk buffer is the larger: all of it fits.
+    fn grow(&mut self, mut bulk: BulkBuf) {
+        assert!(self.bulk.is_none() && bulk.0.len() >= self.size, "tcp: a ring grown into less, or twice");
+        let used = self.used();
+        let size = self.size;
+        let at = self.head % size;
+        let first = size - at;
+        bulk.0[..first].copy_from_slice(&self.data[at..]);
+        bulk.0[first..size].copy_from_slice(&self.data[..at]);
+        self.size = bulk.0.len();
+        self.bulk = Some(bulk);
+        self.head = 0;
+        self.tail = used;
+    }
+
     /// The bulk buffer back, if there is one, for the caller to drop once no
     /// lock is held -- and the slot's own in its place, empty.
     fn detach(&mut self) -> Option<BulkBuf> {
@@ -361,6 +423,20 @@ impl Ring {
 }
 
 /* ---- a connection ---- */
+
+/// What a loss has the sender doing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Recovery {
+    None,
+    /// The third duplicate acknowledgement sent a segment again: until
+    /// everything outstanding then is acknowledged (`recover`), each partial
+    /// acknowledgement sends the next hole (RFC 6582).
+    Fast,
+    /// A timeout sent one segment again: everything outstanding then
+    /// (`recover`) counts as lost, and goes again from `retx_nxt` as the
+    /// window allows, sent from the acknowledgements that come in.
+    Timeout,
+}
 
 struct Inner {
     /* Who it is between */
@@ -412,6 +488,23 @@ struct Inner {
     ooo: [(u32, u32); MAX_OOO],
     ooo_len: usize,
 
+    /* Congestion control (RFC 5681, RFC 6582) */
+    /// How much may be in flight, the peer's window aside
+    cwnd: u32,
+    /// Where slow start gives way to congestion avoidance
+    ssthresh: u32,
+    /// Duplicate acknowledgements in a row
+    dup_acks: u32,
+    recovery: Recovery,
+    /// The highest sequence number sent when the recovery began: an
+    /// acknowledgement of all of it ends the recovery, and only one past it
+    /// starts another
+    recover: u32,
+    /// In a timeout's recovery, the next sequence number to send again
+    retx_nxt: u32,
+    /// A connection of a bulk listener's, which `accept` gives bulk buffers
+    bulk_wanted: bool,
+
     rto_ms: u64,
     retransmit_at: u64,
     /// Retransmits with no acknowledgement in between
@@ -446,6 +539,8 @@ impl Inner {
             send_buf: Ring::new(),
             recv_buf: Ring::new(),
             ooo: [(0, 0); MAX_OOO], ooo_len: 0,
+            cwnd: IW_BYTES, ssthresh: u32::MAX, dup_acks: 0, recovery: Recovery::None, recover: 0, retx_nxt: 0,
+            bulk_wanted: false,
             rto_ms: INITIAL_RTO_MS,
             retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
@@ -480,10 +575,18 @@ impl Inner {
         self.max_snd_wnd = 0;
         /* A bulk buffer goes back before its slot does, outside the locks
          * this runs under: one still here would be dropped under them. */
-        assert!(self.recv_buf.bulk.is_none(), "tcp: a slot handed out again with its bulk buffer");
+        assert!(self.recv_buf.bulk.is_none() && self.send_buf.bulk.is_none(),
+                "tcp: a slot handed out again with its bulk buffer");
         self.send_buf.reset();
         self.recv_buf.reset();
         self.ooo_len = 0;
+        self.cwnd = IW_BYTES;
+        self.ssthresh = u32::MAX;
+        self.dup_acks = 0;
+        self.recovery = Recovery::None;
+        self.recover = 0;
+        self.retx_nxt = 0;
+        self.bulk_wanted = false;
         self.rto_ms = INITIAL_RTO_MS;
         self.retransmit_at = 0;
         self.retransmit_count = 0;
@@ -541,13 +644,18 @@ struct Slot {
     /// (`hv0`) reaches neither a service listening on eth0 nor a
     /// connection made over it.
     device: Option<Nic>,
+    /// A listener's: the connections it holds that nobody has accepted yet,
+    /// at most, 1..=LISTEN_BACKLOG. 0 for a connection.
+    backlog: u8,
+    /// A listener's: what its connections buffer is `Buffers::Bulk`
+    bulk: bool,
 }
 
 impl Slot {
     const FREE: Slot = Slot {
         used: false, listening: false,
         local_ip: 0, local_port: 0, remote_ip: 0, remote_port: 0,
-        device: None,
+        device: None, backlog: 0, bulk: false,
     };
 
     fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, nic: &Nic) -> bool {
@@ -912,10 +1020,14 @@ impl Tcp {
 
     /* ---- the pieces every state shares ---- */
 
-    /// An acknowledgement: the window it advertises, and the bytes it frees.
+    /// An acknowledgement: the window it advertises, the bytes it frees, and
+    /// what it says of the path (congestion control). `pure` when the
+    /// segment carries nothing else -- no data, no SYN, no FIN -- which a
+    /// duplicate acknowledgement has to be.
     fn process_ack(&'static self, inner: &mut Inner, segment_seq: u32, ack: u32,
-        wnd: u16, now: u64)
+        wnd: u16, now: u64, pure: bool)
     {
+        let window_was = inner.snd_wnd;
         /* RFC 9293 3.10.7.4: take the advertisement only from a segment
          * that acknowledges something this end sent -- SND.UNA =< SEG.ACK
          * =< SND.NXT, so that one which is no part of the peer's stream
@@ -940,6 +1052,13 @@ impl Tcp {
         /* snd_una < ack <= snd_nxt, wrap-safe */
         let advance = ack.wrapping_sub(inner.snd_una) as i32;
         if advance <= 0 || before(inner.snd_nxt, ack) {
+            /* Nothing new acknowledged. A duplicate acknowledgement when it
+             * is nothing else (RFC 5681 2): at SND.UNA, carrying nothing,
+             * the window as it was, with data outstanding -- the peer
+             * saying a segment came past a hole. */
+            if advance == 0 && pure && inner.snd_wnd == window_was && inner.send_buf.used() > 0 {
+                self.duplicate_ack(inner);
+            }
             return;
         }
 
@@ -953,6 +1072,68 @@ impl Tcp {
         inner.rto_ms = INITIAL_RTO_MS;
         inner.retransmit_count = 0;
         inner.retransmit_at = if inner.snd_una == inner.snd_nxt { 0 } else { now + inner.rto_ms };
+        self.newly_acked(inner, acked as u32);
+    }
+
+    /// A duplicate acknowledgement: the third, out of recovery, sends the
+    /// segment at SND.UNA again and halves the window (RFC 5681 3.2) --
+    /// unless the acknowledgement covers no more than the last recovery did,
+    /// which says only that the segments that recovery sent again came twice
+    /// (RFC 6582 3.2); each one more in a fast recovery is a segment that
+    /// left the network, and lets one more in.
+    fn duplicate_ack(&'static self, inner: &mut Inner) {
+        let mss = seg_size(inner);
+        inner.dup_acks = inner.dup_acks.saturating_add(1);
+        match inner.recovery {
+            Recovery::None if inner.dup_acks == DUP_ACKS && before(inner.recover, inner.snd_una) => {
+                let flight = inner.snd_nxt.wrapping_sub(inner.snd_una);
+                inner.ssthresh = (flight / 2).max(2 * mss);
+                inner.recover = inner.snd_nxt;
+                inner.recovery = Recovery::Fast;
+                let una = inner.snd_una;
+                self.send_again(inner, una);
+                inner.cwnd = inner.ssthresh.saturating_add(3 * mss);
+                self.retransmits.fetch_add(1, Ordering::Relaxed);
+            }
+            Recovery::Fast => inner.cwnd = inner.cwnd.saturating_add(mss).min(CWND_MAX),
+            _ => {}
+        }
+    }
+
+    /// What congestion control makes of `acked` bytes newly acknowledged.
+    fn newly_acked(&'static self, inner: &mut Inner, acked: u32) {
+        let mss = seg_size(inner);
+        inner.dup_acks = 0;
+        match inner.recovery {
+            Recovery::Fast if before(inner.snd_una, inner.recover) => {
+                /* A partial acknowledgement (RFC 6582 3.2 step 5): the next
+                 * hole of the same window, sent at once; the window less
+                 * what was acknowledged, and a segment back for the one
+                 * sent */
+                let una = inner.snd_una;
+                self.send_again(inner, una);
+                inner.cwnd = inner.cwnd.saturating_sub(acked).saturating_add(mss).max(mss);
+            }
+            Recovery::Fast => {
+                /* All that was outstanding at the loss acknowledged: the
+                 * window the loss left (RFC 6582 3.2 step 3) */
+                let flight = inner.snd_nxt.wrapping_sub(inner.snd_una);
+                inner.cwnd = inner.ssthresh.min(flight.saturating_add(mss)).max(mss);
+                inner.recovery = Recovery::None;
+            }
+            Recovery::Timeout => {
+                grow_cwnd(inner, acked);
+                if before(inner.snd_una, inner.recover) {
+                    if before(inner.retx_nxt, inner.snd_una) {
+                        inner.retx_nxt = inner.snd_una;
+                    }
+                    self.retransmit_window(inner);
+                } else {
+                    inner.recovery = Recovery::None;
+                }
+            }
+            Recovery::None => grow_cwnd(inner, acked),
+        }
     }
 
     /// A segment's data into the receive buffer, and the acknowledgement it
@@ -1010,43 +1191,146 @@ impl Tcp {
         }
     }
 
-    /// What a timeout sends again: everything unacknowledged, from SND.UNA
-    /// -- the send buffer holds exactly that -- in segments of the peer's
-    /// MSS, as far as its window reaches, the first whatever the window, as
-    /// the probe it then is; at most `RESEND_SEGMENTS` of them; then the FIN,
-    /// when `fin` says one is out and all before it went. One segment a
-    /// timeout, as it was, gave back a window lost whole -- a NIC's ring
-    /// stalled under it -- a second a segment: two hours and more for 8 KiB
-    /// at the MSS of one byte a peer may ask for. True if anything went.
-    fn resend(&'static self, inner: &mut Inner, fin: bool) -> bool {
-        let saved = inner.snd_nxt;
+    /// One segment of what was sent before, again: the stream from `seq` --
+    /// which the send buffer holds from SND.UNA on -- as much as a segment
+    /// carries. The bytes it carried: 0 when the buffer has none there.
+    fn send_again(&'static self, inner: &mut Inner, seq: u32) -> u32 {
+        let offset = seq.wrapping_sub(inner.snd_una) as usize;
         let used = inner.send_buf.used();
-        let mss = (inner.peer_mss as usize).clamp(1, OUR_MSS as usize);
-        let window = inner.snd_wnd as usize;
+        if offset >= used {
+            return 0;
+        }
+        let len = (used - offset).min(seg_size(inner) as usize);
         let mut segment = [0u8; OUR_MSS as usize];
-        let mut offset = 0;
-        let mut sent = 0;
+        let got = inner.send_buf.peek(&mut segment[..len], offset);
+        let saved = inner.snd_nxt;
+        inner.snd_nxt = seq;
+        self.send_segment(inner, seg::ACK_FLAG | seg::PSH, &segment[..got]);
+        inner.snd_nxt = saved;
+        got as u32
+    }
 
-        while offset < used && sent < RESEND_SEGMENTS && (sent == 0 || offset < window) {
-            let len = (used - offset).min(mss);
-            let got = inner.send_buf.peek(&mut segment[..len], offset);
-            if got == 0 {
+    /// The FIN again, at the end of the data.
+    fn send_fin_again(&'static self, inner: &mut Inner, seq: u32) {
+        let saved = inner.snd_nxt;
+        inner.snd_nxt = seq;
+        self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
+        inner.snd_nxt = saved;
+    }
+
+    /// In a timeout's recovery: more of what was outstanding when it came,
+    /// from where the last went, as far as the congestion window and the
+    /// peer's window reach -- and the FIN after the data, when it is one of
+    /// them. Without selective acknowledgements nothing says what of it
+    /// arrived, so all of it counts as lost (go-back-N): what is in flight
+    /// is what has gone again and is not acknowledged. At most
+    /// `RESEND_SEGMENTS` an acknowledgement.
+    fn retransmit_window(&'static self, inner: &mut Inner) {
+        let mss = seg_size(inner);
+        let limit = inner.cwnd.min(inner.snd_wnd);
+        let end = inner.snd_una.wrapping_add(inner.send_buf.used() as u32);
+        let fin = fin_sent(inner.state);
+        let mut sent = 0;
+        while sent < RESEND_SEGMENTS && before(inner.retx_nxt, inner.recover) {
+            let pipe = inner.retx_nxt.wrapping_sub(inner.snd_una);
+            if before(inner.retx_nxt, end) {
+                let len = end.wrapping_sub(inner.retx_nxt).min(mss);
+                if pipe.saturating_add(len) > limit {
+                    break;
+                }
+                let retx = inner.retx_nxt;
+                let got = self.send_again(inner, retx);
+                if got == 0 {
+                    break;
+                }
+                inner.retx_nxt = retx.wrapping_add(got);
+            } else if fin && inner.retx_nxt == end && pipe < limit {
+                self.send_fin_again(inner, end);
+                inner.retx_nxt = end.wrapping_add(1);
+            } else {
                 break;
             }
-            inner.snd_nxt = inner.snd_una.wrapping_add(offset as u32);
-            self.send_segment(inner, seg::ACK_FLAG | seg::PSH, &segment[..got]);
-            offset += got;
             sent += 1;
         }
-        if fin && offset == used && sent < RESEND_SEGMENTS {
-            inner.snd_nxt = inner.snd_una.wrapping_add(used as u32);
-            self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
-            sent += 1;
-        }
-
-        inner.snd_nxt = saved;
-        sent != 0
     }
+
+    /// A retransmission timeout with something outstanding (RFC 5681 3.1,
+    /// RFC 6298 5): the threshold half of what was in flight -- at the
+    /// first timeout of a loss, not at each backoff after it -- the window
+    /// one segment, and the first of what is outstanding sent again whatever
+    /// the windows say, the probe it then is; the acknowledgements it brings
+    /// send the rest (`retransmit_window`). One segment a timeout once gave
+    /// back a window lost whole a second a segment; now it is a round trip
+    /// for each doubling of the window. True if anything went.
+    fn timeout(&'static self, inner: &mut Inner) -> bool {
+        let mss = seg_size(inner);
+        if inner.recovery != Recovery::Timeout {
+            let flight = inner.snd_nxt.wrapping_sub(inner.snd_una);
+            inner.ssthresh = (flight / 2).max(2 * mss);
+            inner.recover = inner.snd_nxt;
+        }
+        inner.cwnd = mss;
+        inner.recovery = Recovery::Timeout;
+        inner.dup_acks = 0;
+        inner.retx_nxt = inner.snd_una;
+
+        let end = inner.snd_una.wrapping_add(inner.send_buf.used() as u32);
+        if before(inner.retx_nxt, end) {
+            let una = inner.snd_una;
+            let got = self.send_again(inner, una);
+            inner.retx_nxt = una.wrapping_add(got);
+            got != 0
+        } else if fin_sent(inner.state) && before(inner.snd_una, inner.snd_nxt) {
+            self.send_fin_again(inner, end);
+            inner.retx_nxt = end.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The most of the stream one segment carries: the peer's MSS, no more than
+/// this end's, never 0.
+fn seg_size(inner: &Inner) -> u32 {
+    u32::from(inner.peer_mss).clamp(1, u32::from(OUR_MSS))
+}
+
+/// The congestion window a connection starts with (RFC 6928): ten segments,
+/// within 14,600 bytes, two at least.
+fn initial_window(mss: u32) -> u32 {
+    (IW_SEGMENTS * mss).min((2 * mss).max(IW_BYTES))
+}
+
+/// Congestion control from the handshake on (RFC 5681 3.1): the initial
+/// window, a threshold as high as it goes, no loss yet -- and `recover`
+/// just behind SND.UNA, so that the first loss may start a recovery.
+fn start_congestion(inner: &mut Inner) {
+    inner.cwnd = initial_window(seg_size(inner));
+    inner.ssthresh = u32::MAX;
+    inner.dup_acks = 0;
+    inner.recovery = Recovery::None;
+    inner.recover = inner.snd_una.wrapping_sub(1);
+    inner.retx_nxt = inner.snd_una;
+}
+
+/// The window grown by `acked` bytes acknowledged: by as much, up to a
+/// segment, in slow start (RFC 5681 3.1; RFC 3465's L of one segment), by a
+/// segment a round trip past the threshold.
+fn grow_cwnd(inner: &mut Inner, acked: u32) {
+    let mss = seg_size(inner);
+    let more = if inner.cwnd < inner.ssthresh {
+        acked.min(mss)
+    } else {
+        (mss.saturating_mul(mss) / inner.cwnd.max(1)).max(1)
+    };
+    inner.cwnd = inner.cwnd.saturating_add(more).min(CWND_MAX);
+}
+
+/// Whether this end's FIN has gone: what a timeout sends again after the
+/// data.
+fn fin_sent(state: State) -> bool {
+    matches!(state, State::FinWait1 | State::Closing | State::LastAck)
 }
 
 /// The window to advertise in a segment that is no SYN, as its field says
@@ -1170,6 +1454,8 @@ impl Tcp {
         let wnd = seg::window(segment);
         let now = now_ms();
         let len = payload.len() as u32;
+        /* Nothing but an acknowledgement: what a duplicate one has to be */
+        let pure = payload.is_empty() && flags & (seg::SYN | seg::FIN) == 0;
 
         /* A reset is valid in every state but LISTEN -- and then only at
          * exactly RCV.NXT (RFC 5961 3.2). Anywhere else in the window it is
@@ -1275,6 +1561,7 @@ impl Tcp {
                     inner.state = State::Established;
                     inner.rto_ms = INITIAL_RTO_MS;
                     inner.retransmit_at = 0;
+                    start_congestion(inner);
 
                     self.send_ack(inner);
                     conn.conn_ready.store(true, Ordering::Release);
@@ -1292,6 +1579,7 @@ impl Tcp {
                     inner.state = State::Established;
                     inner.rto_ms = INITIAL_RTO_MS;
                     inner.retransmit_at = 0;
+                    start_congestion(inner);
                     conn.conn_ready.store(true, Ordering::Release);
                     return Event::Accepted;
                 }
@@ -1299,7 +1587,7 @@ impl Tcp {
 
             State::Established => {
                 if flags & seg::ACK_FLAG != 0 {
-                    self.process_ack(inner, seq, ack, wnd, now);
+                    self.process_ack(inner, seq, ack, wnd, now, pure);
                 }
                 if !payload.is_empty() {
                     self.process_payload(conn, inner, seq, payload);
@@ -1320,7 +1608,7 @@ impl Tcp {
                  * FIN, so the retransmit timer stops resending stale bytes
                  * and our FIN can be acknowledged once everything is. */
                 if flags & seg::ACK_FLAG != 0 {
-                    self.process_ack(inner, seq, ack, wnd, now);
+                    self.process_ack(inner, seq, ack, wnd, now, pure);
                     if inner.snd_una == inner.snd_nxt {
                         inner.fin_acked = true;
                     }
@@ -1365,7 +1653,7 @@ impl Tcp {
 
             State::Closing => {
                 if flags & seg::ACK_FLAG != 0 {
-                    self.process_ack(inner, seq, ack, wnd, now);
+                    self.process_ack(inner, seq, ack, wnd, now, pure);
                     if inner.snd_una == inner.snd_nxt {
                         inner.state = State::TimeWait;
                         inner.time_wait_at = now + TIME_WAIT_MS;
@@ -1379,7 +1667,7 @@ impl Tcp {
 
             State::LastAck => {
                 if flags & seg::ACK_FLAG != 0 {
-                    self.process_ack(inner, seq, ack, wnd, now);
+                    self.process_ack(inner, seq, ack, wnd, now, pure);
                     if inner.snd_una == inner.snd_nxt {
                         inner.state = State::Closed;
                         conn.conn_ready.store(true, Ordering::Release);
@@ -1389,7 +1677,7 @@ impl Tcp {
 
             State::CloseWait => {
                 if flags & seg::ACK_FLAG != 0 {
-                    self.process_ack(inner, seq, ack, wnd, now);
+                    self.process_ack(inner, seq, ack, wnd, now, pure);
                 }
                 if flags & seg::FIN != 0 {
                     self.send_ack(inner);
@@ -1519,21 +1807,26 @@ impl Tcp {
         /* A SYN for something listening -- a SYN alone: in LISTEN an ACK
          * is answered with a reset, a RST ignored (RFC 9293 3.10.7.2), and
          * a SYN that carries either, or a FIN, is no request to connect. */
-        if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN
-            && pool.find_listener(local_ip, local_port, nic).is_some()
-        {
+        let listener = if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN {
+            pool.find_listener(local_ip, local_port, nic)
+        } else {
+            None
+        };
+        if let Some(listener) = listener {
             let mut pool = pool;
 
             /* Dropped, as a full accept queue drops it: the peer tries again
              * and the pool keeps its slots. */
-            if self.backlog_full(&pool, local_port) {
+            let backlog = usize::from(pool.slots[listener].backlog);
+            let bulk = pool.slots[listener].bulk;
+            if self.backlog_full(&pool, local_port, backlog) {
                 return;
             }
 
             let index = match pool.alloc(Slot {
                 used: true, listening: false,
                 local_ip, local_port, remote_ip, remote_port,
-                device: Some(*nic),
+                device: Some(*nic), backlog: 0, bulk: false,
             }) {
                 Some(index) => index,
                 None => return,
@@ -1554,8 +1847,7 @@ impl Tcp {
             inner.iss = initial_sequence();
             inner.snd_nxt = inner.iss;
             inner.snd_una = inner.iss;
-            /* Unscaled: this end offers no window scale on a connection it
-             * did not open, so neither end scales (RFC 7323 1.3) */
+            /* A SYN's window is never scaled (RFC 7323 2.2) */
             inner.snd_wnd = seg::window(segment) as u32;
             inner.max_snd_wnd = inner.snd_wnd;
             inner.snd_wl1 = inner.irs;
@@ -1563,6 +1855,20 @@ impl Tcp {
             inner.peer_mss = seg::parse_mss(segment, OUR_MSS, DEFAULT_MSS);
             /* Where the frame came from: no resolution needed */
             inner.peer_mac = peer_mac;
+            /* A bulk listener's connection scales its window when the
+             * peer's SYN offers to -- by the shift its largest buffer
+             * needs, which `accept` gives it -- and neither end does
+             * otherwise (RFC 7323 1.3). Its SYN-ACK says what the slot's
+             * own 8 KiB has room for, unscaled as a SYN's window is. */
+            if bulk {
+                inner.bulk_wanted = true;
+                if let Some(theirs) = seg::parse_wscale(segment) {
+                    let ours = wscale_for(BULK_SIZES[0]);
+                    inner.wscale_offer = Some(ours);
+                    inner.rcv_wscale = ours;
+                    inner.snd_wscale = theirs;
+                }
+            }
 
             self.send_segment(&mut inner, seg::SYN | seg::ACK_FLAG, &[]);
             /* A SYN takes a sequence number */
@@ -1596,11 +1902,11 @@ impl Tcp {
     }
 
     /// Whether the port's listener holds all the connections it may that
-    /// nobody has accepted. The caller holds the pool lock and no
-    /// connection's: whether one is waiting to be accepted is its own state,
-    /// read under its own lock, and the pool says which slots are worth
-    /// asking.
-    fn backlog_full(&'static self, pool: &Pool, port: u16) -> bool {
+    /// nobody has accepted -- `backlog`, its own. The caller holds the pool
+    /// lock and no connection's: whether one is waiting to be accepted is
+    /// its own state, read under its own lock, and the pool says which slots
+    /// are worth asking.
+    fn backlog_full(&'static self, pool: &Pool, port: u16, backlog: usize) -> bool {
         let mut pending = 0;
         for i in 0..MAX_CONNECTIONS {
             let slot = &pool.slots[i];
@@ -1616,7 +1922,7 @@ impl Tcp {
                 pending += 1;
             }
         }
-        pending >= LISTEN_BACKLOG
+        pending >= backlog
     }
 
     /// A destination unreachable quoting a segment this machine sent, come
@@ -1717,7 +2023,7 @@ impl Tcp {
         let index = match pool.alloc(Slot {
             used: true, listening: false,
             local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
-            device: Some(*nic),
+            device: Some(*nic), backlog: 0, bulk: false,
         }) {
             Some(index) => index,
             None => {
@@ -1791,7 +2097,16 @@ impl Tcp {
     /// this machine has, and none that comes in by another device -- a
     /// guest behind the hypervisor's switch does not reach a service
     /// listening on eth0. A connection belongs to the device it arrives on.
+    /// It holds LISTEN_BACKLOG connections nobody has accepted, at most.
     pub fn listen(&'static self, nic: &Nic, port: u16) -> Option<&'static Conn> {
+        self.listen_with(nic, port, LISTEN_BACKLOG, Buffers::Small)
+    }
+
+    /// `listen`, holding `backlog` connections nobody has accepted at most --
+    /// taken into 1..=LISTEN_BACKLOG -- each buffering what `buffers` says.
+    pub fn listen_with(&'static self, nic: &Nic, port: u16, backlog: usize, buffers: Buffers)
+        -> Option<&'static Conn>
+    {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
         }
@@ -1812,6 +2127,9 @@ impl Tcp {
             used: true, listening: true,
             local_ip: 0, local_port: port, remote_ip: 0, remote_port: 0,
             device: Some(*nic),
+            /* LISTEN_BACKLOG fits a byte: checked where it is defined */
+            backlog: backlog.clamp(1, LISTEN_BACKLOG) as u8,
+            bulk: buffers == Buffers::Bulk,
         })?;
 
         let mut inner = self.take_fresh(index);
@@ -1843,8 +2161,15 @@ impl Tcp {
 
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
         let mut poll = Poll::new();
+        /* A bulk listener's connection is given its buffers as it is taken:
+         * from the heap, so with no lock held, once one is waiting -- a
+         * listener nobody connects to takes none, each of which would cost
+         * every CPU a TLB shootdown going back -- and, should they go to
+         * nobody, dropped after the locks: declared before them, they are
+         * the last thing dropped. */
+        let mut bulk: Option<(Option<BulkBuf>, Option<BulkBuf>)> = None;
 
-        loop {
+        'look: loop {
             let pool = self.pool.lock();
 
             let slot = &pool.slots[listener_index];
@@ -1869,8 +2194,21 @@ impl Tcp {
                 if !inner.accepted && !inner.owned_by_app
                     && matches!(inner.state, State::Established | State::CloseWait)
                 {
+                    if inner.bulk_wanted && bulk.is_none() {
+                        /* Its buffers first, off the locks; then the
+                         * listener's connections are looked through again */
+                        drop(inner);
+                        drop(pool);
+                        bulk = Some((BulkBuf::new(), BulkBuf::new()));
+                        continue 'look;
+                    }
                     inner.accepted = true;
                     inner.owned_by_app = true;
+                    if inner.bulk_wanted {
+                        if let Some((recv, send)) = bulk.as_mut() {
+                            self.attach_bulk(&mut inner, recv, send);
+                        }
+                    }
                     return Some(&self.conns[i]);
                 }
             }
@@ -1880,6 +2218,29 @@ impl Tcp {
                 return None;
             }
             poll.sleep();
+        }
+    }
+
+    /// A bulk listener's connection given its buffers, as `accept` hands it
+    /// out -- each taken out of its `Option` only when it is put in place, so
+    /// that one not used is dropped by the caller, after the locks: what has
+    /// arrived already moved across into the receive buffer, the send buffer
+    /// in place while nothing is in it, and the room offered at once, since
+    /// the peer has been held to the 8 KiB the SYN-ACK said.
+    fn attach_bulk(&'static self, inner: &mut Inner, recv: &mut Option<BulkBuf>, send: &mut Option<BulkBuf>) {
+        if inner.recv_buf.bulk.is_none() {
+            if let Some(buf) = recv.take() {
+                inner.recv_buf.grow(buf);
+                inner.rcv_wnd = inner.recv_buf.free() as u32;
+            }
+        }
+        if inner.send_buf.bulk.is_none() && inner.send_buf.used() == 0 {
+            if let Some(buf) = send.take() {
+                inner.send_buf.attach(buf);
+            }
+        }
+        if inner.state == State::Established {
+            self.send_ack(inner);
         }
     }
 
@@ -1912,9 +2273,13 @@ impl Tcp {
             }
 
             /* Never past the peer's window: the bytes in flight must stay
-             * within what it said it would take. */
+             * within what it said it would take -- nor past the congestion
+             * window, what the path is thought to take; and nothing new
+             * while a timeout's recovery sends again what was outstanding,
+             * which goes first. */
             let in_flight = inner.snd_nxt.wrapping_sub(inner.snd_una);
-            if inner.snd_wnd <= in_flight {
+            let limit = inner.snd_wnd.min(inner.cwnd);
+            if limit <= in_flight || inner.recovery == Recovery::Timeout {
                 /* Shut, or full. Not a byte into a shut window: the peer's
                  * duplicate acknowledgements would never advance anything,
                  * and the retransmit count would give up on a peer that is
@@ -1927,7 +2292,7 @@ impl Tcp {
                 poll.sleep();
                 continue;
             }
-            let window_room = (inner.snd_wnd - in_flight) as usize;
+            let window_room = (limit - in_flight) as usize;
 
             let chunk = (data.len() - sent)
                 .min(room)
@@ -2182,9 +2547,10 @@ impl Tcp {
     pub fn process_retransmits(&'static self) {
         let now = now_ms();
         let mut any_cleanup = false;
-        /* Bulk buffers given back: taken out under the locks, dropped once
-         * none is held */
-        let mut released: [Option<BulkBuf>; MAX_CONNECTIONS] = [const { None }; MAX_CONNECTIONS];
+        /* Bulk buffers given back, a connection's two: taken out under the
+         * locks, dropped once none is held */
+        let mut released: [(Option<BulkBuf>, Option<BulkBuf>); MAX_CONNECTIONS] =
+            [const { (None, None) }; MAX_CONNECTIONS];
 
         /* What each connection owes, with only its own lock */
         for i in 0..MAX_CONNECTIONS {
@@ -2202,7 +2568,12 @@ impl Tcp {
             if !inner.owned_by_app && matches!(inner.state, State::TimeWait | State::Closed) {
                 if let Some(bulk) = inner.recv_buf.detach() {
                     inner.rcv_wnd = inner.recv_buf.free() as u32;
-                    released[i] = Some(bulk);
+                    released[i].0 = Some(bulk);
+                }
+                /* Nothing is sent from either state: what the buffer held is
+                 * acknowledged, or will never be */
+                if let Some(bulk) = inner.send_buf.detach() {
+                    released[i].1 = Some(bulk);
                 }
             }
 
@@ -2245,11 +2616,11 @@ impl Tcp {
                     }
                     /* Whatever data is unacknowledged, and then our FIN */
                     State::FinWait1 | State::LastAck | State::Closing => {
-                        retransmitted = self.resend(&mut inner, true);
+                        retransmitted = self.timeout(&mut inner);
                     }
                     _ => {
                         if inner.snd_una != inner.snd_nxt && inner.send_buf.used() > 0 {
-                            retransmitted = self.resend(&mut inner, false);
+                            retransmitted = self.timeout(&mut inner);
                         }
                     }
                 }
@@ -2323,10 +2694,14 @@ impl Tcp {
                     && !inner.owned_by_app
                 {
                     /* Closed by its program since the walk above passed it:
-                     * its bulk buffer goes back now, never with the slot. */
+                     * its bulk buffers go back now, never with the slot. */
                     if let Some(bulk) = inner.recv_buf.detach() {
-                        assert!(released[i].is_none(), "tcp: a slot's bulk buffer given back twice");
-                        released[i] = Some(bulk);
+                        assert!(released[i].0.is_none(), "tcp: a slot's bulk buffer given back twice");
+                        released[i].0 = Some(bulk);
+                    }
+                    if let Some(bulk) = inner.send_buf.detach() {
+                        assert!(released[i].1.is_none(), "tcp: a slot's bulk buffer given back twice");
+                        released[i].1 = Some(bulk);
                     }
                     inner.state = State::Free;
                     inner.need_cleanup = false;
@@ -2380,6 +2755,7 @@ impl Tcp {
                 recv_used: inner.recv_buf.used(),
                 recv_size: inner.recv_buf.size,
                 window: inner.advertised_wnd as usize,
+                cwnd: inner.cwnd as usize,
                 /* This end's shift is never 0 on a connection that scales */
                 scales: if inner.rcv_wscale != 0 {
                     Some((inner.rcv_wscale, inner.snd_wscale))
@@ -2419,6 +2795,9 @@ pub struct ConnInfo {
     pub recv_size: usize,
     /// The window last offered, in bytes
     pub window: usize,
+    /// The congestion window: how much the sender lets be in flight, the
+    /// peer's window allowing
+    pub cwnd: usize,
     /// This end's shift and the peer's, on a connection that scales
     pub scales: Option<(u8, u8)>,
 }

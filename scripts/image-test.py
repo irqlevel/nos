@@ -20,7 +20,12 @@ again: GRUB cleared the flag. Then nos-install update over what nos has
 written: the kernel, its modules and hvboot replaced -- every file of the
 image there again -- and the old ones kept for a rollback, with their
 VERSION, /etc and the host key kept, and the kernel parameters it is given
--- the UDP shell -- taken; and status, rollback and uninstall.
+-- the UDP shell -- taken. The update is given --panel too: root's password
+for the management panel printed once, its scrypt hash alone on the
+partition, as the panel checks it, and /etc/rc given the panel's lines --
+whose api.ko then serves at the next boot, and whose `api panel create`
+makes no panel of an image released without one, and says so. Then status,
+rollback and uninstall.
 
 The disk: an MBR with a "host" partition holding GRUB as a server's /boot
 would -- its default entry stands in for the machine's own OS and says so on
@@ -39,6 +44,8 @@ Build the image first: make image, or scripts/build-image.sh.
 """
 
 import argparse
+import base64
+import hashlib
 import os
 import platform
 import shutil
@@ -126,19 +133,23 @@ nos_install() {
     NOS_GRUB_D="$T/grub.d" NOS_UPDATE_GRUB=true NOS_ALLOW_ANY_DISK=1 \
         NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/${IMG_DIR:-img}/nos-install" "$@"
 }
-# same_as_image DIR WHEN: every file of the image is in DIR as it is in the
-# image -- nos-install aside, which stays in it -- or the ones that are not
-# are named. Not from nos-install's list of what goes where: a file it leaves
-# out is one that list does not have
+# same_as_image DIR WHEN [FILE...]: every file of the image is in DIR as it
+# is in the image -- nos-install aside, which stays in it, and the FILEs
+# named, which are the machine's by then -- or the ones that are not are
+# named. Not from nos-install's list of what goes where: a file it leaves out
+# is one that list does not have
 same_as_image() {
-    local f bad=0
+    local f bad=0 dir=$1 when=$2
+    shift 2
     while IFS= read -r f; do
-        cmp -s "img/$f" "$1/$f" || { echo "$2: not on the partition as in the image: /$f"; bad=1; }
+        case " $* " in *" $f "*) continue ;; esac
+        cmp -s "img/$f" "$dir/$f" || { echo "$when: not on the partition as in the image: /$f"; bad=1; }
     done < <(cd img && find . -type f ! -path ./nos-install | sed 's|^\./||' | sort)
-    [ "$bad" = 1 ] || echo "$2: every file of the image"
+    [ "$bad" = 1 ] || echo "$when: every file of the image"
 }
 mount_at "$IMAGE" img loop,ro
 cp img/VERSION img-version.out
+cat img/lib/panel/bundle > img-bundle.out 2>/dev/null || echo none > img-bundle.out
 """
 
 PREPARE = r"""
@@ -206,15 +217,19 @@ sha256sum part/etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1 > hostkey1.sum || ec
 unmount_last
 
 # no partition named: the GRUB entry names it
-nos_install update --udpshell --boot-once > update.out 2>&1 || { cat update.out; exit 1; }
+nos_install update --udpshell --boot-once --panel > update.out 2>&1 || { cat update.out; exit 1; }
 cat update.out
 
 mount_at "$NOS" part ro
+cp part/etc/rc rc2.out
+cat part/etc/api/panel.pass > panelpass2.out 2>/dev/null || echo none > panelpass2.out
 grub-editenv part/grubenv list > grubenv2.out
 sha256sum part/etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1 > hostkey2.sum
 ls part part/boot part/lib > layout2.out
 cat part/VERSION > version2.out
-same_as_image part update
+# /etc/rc is the machine's after the first install, and --panel gave it its
+# lines: those are checked from rc2.out
+same_as_image part update etc/rc
 """
 
 FINAL = r"""
@@ -401,6 +416,31 @@ def expected_version(text):
     return "nos %s (%s)" % (fields.get("version", "?"), fields.get("revision", "?"))
 
 
+# The management panel's lines nos-install --panel gives /etc/rc, in order
+PANEL_RC = ["insmod /lib/modules/hv.ko", "hv on", "insmod /lib/modules/api.ko", "api start", "api panel create"]
+
+
+def scrypt_matches(password, line):
+    """Whether `line` -- scrypt$N$r$p$salt$hash, as the panel reads it -- is
+    the hash of `password`."""
+    parts = line.split("$")
+    if len(parts) != 6 or parts[0] != "scrypt":
+        return False
+    n, r, p = (int(x) for x in parts[1:4])
+    want = base64.b64decode(parts[5])
+    got = hashlib.scrypt(password.encode(), salt=base64.b64decode(parts[4]), n=n, r=r, p=p,
+                         maxmem=128 * n * r * 2, dklen=len(want))
+    return got == want
+
+
+def in_order(lines, wanted):
+    at = 0
+    for line in lines:
+        if at < len(wanted) and line.strip() == wanted[at]:
+            at += 1
+    return at == len(wanted)
+
+
 def run(tmp, image):
     linux = Linux(tmp)
     shutil.copy(image, os.path.join(tmp, "image.squashfs"))
@@ -481,6 +521,19 @@ def run(tmp, image):
     env2 = linux.read("grubenv2.out")
     check("update takes the UDP shell it was given, and arms a boot",
           "nos_cmdline=udpshell=9000" in env2 and "nos_next=nos" in env2, env2)
+    said = [line.split("its password ", 1)[1].strip() for line in out.splitlines()
+            if "the panel's user is root, its password " in line]
+    password = said[0] if len(said) == 1 else None
+    check("update --panel prints root's password for the panel, once", password is not None and
+          out.count(password) == 1, [line for line in out.splitlines() if "panel" in line])
+    hashed = linux.read("panelpass2.out").strip()
+    check("and keeps its scrypt hash alone on the partition, as the panel checks it",
+          password is not None and scrypt_matches(password, hashed) and password not in hashed, hashed)
+    rc2 = [line.strip() for line in linux.read("rc2.out").splitlines()]
+    check("and gives /etc/rc the panel's lines, in order, after the image's own",
+          in_order(rc2, PANEL_RC) and "insmod /lib/modules/sshd.ko" in rc2 and
+          rc2.index("insmod /lib/modules/sshd.ko") < rc2.index("api panel create"), rc2)
+    has_bundle = linux.read("img-bundle.out").startswith("url=")
 
     # Boot 3: the update, with the UDP shell asked for
     m.boot("3")
@@ -491,6 +544,15 @@ def run(tmp, image):
         check("with the host key it made the first time", m.host_key() == first_key)
         out = m.udp_shell("version", timeout=10)
         check("the UDP shell answers, now that it was asked for", out is not None and out.startswith("nos "), out)
+        rc, out = m.ssh(["api"])
+        check("/etc/rc's api.ko serves the host API", rc == 0 and "api: serving port 39234" in out, out)
+        rc, out = m.ssh(["dmesg"])
+        if has_bundle:
+            print("  (the image has /lib/panel/bundle: its api panel create downloads, which this test does not)")
+        else:
+            check("its api panel create makes no panel of an image released without one, and says why",
+                  rc == 0 and "no /lib/panel/bundle" in out,
+                  [line for line in out.splitlines() if "api" in line][-8:])
         m.ssh(["poweroff"], timeout=60)
         check("nos powers off", m.wait_exit(120))
     finally:

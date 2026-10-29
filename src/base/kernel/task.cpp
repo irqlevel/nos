@@ -680,6 +680,20 @@ const char* Task::get_name()
     return name_;
 }
 
+ulong Task::get_runtime_ns()
+{
+    stdlib::AutoLock lock(lock_);
+    ulong ns = runtime_.get_value();
+    if (state_.get() == STATE_RUNNING)
+    {
+        const ulong now = get_boot_time().get_value();
+        const ulong since = run_start_time_.get_value();
+        if (now > since)
+            ns += now - since;
+    }
+    return ns;
+}
+
 void Task::update_runtime()
 {
     auto now = get_boot_time();
@@ -850,13 +864,70 @@ size_t TaskTable::sample_cpu(CpuSample* out, size_t max)
             Task* task = CONTAINING_RECORD(curr_entry, Task, table_list_entry_);
 
             out[n].pid = task->pid_;
-            out[n].runtime_ns = task->runtime_.get_value();
+            out[n].runtime_ns = task->get_runtime_ns();
             stdlib::mem_cpy(out[n].name, task->get_name(), sizeof(out[n].name));
             out[n].name[sizeof(out[n].name) - 1] = '\0';
             n++;
         }
     }
 
+    return n;
+}
+
+size_t TaskTable::snapshot(TaskSnapshot* out, size_t max)
+{
+    if (out == nullptr)
+        return 0;
+
+    size_t n = 0;
+    /* A list that does not end, said once its lock is down */
+    size_t runaway = stdlib::array_size(task_list_);
+
+    for (size_t i = 0; i < stdlib::array_size(task_list_) && n < max; i++)
+    {
+        stdlib::AutoLock lock(lock_[i]);
+
+        size_t walked = 0;
+        for (auto curr_entry = task_list_[i].flink;
+            curr_entry != &task_list_[i] && n < max;
+            curr_entry = curr_entry->flink)
+        {
+            if (++walked > MAX_TASKS_PER_LIST)
+            {
+                runaway = i;
+                break;
+            }
+
+            Task* task = CONTAINING_RECORD(curr_entry, Task, table_list_entry_);
+            u32 flags = 0;
+            if (task->flags_.test_bit(Task::FLAG_STOPPING_BIT))
+                flags |= SNAPSHOT_STOPPING;
+            if (task->flags_.test_bit(Task::FLAG_IDLE_BIT))
+                flags |= SNAPSHOT_IDLE;
+            if (task->is_blocked())
+                flags |= SNAPSHOT_BLOCKED;
+            if (task->flags_.test_bit(Task::FLAG_IDLING_BIT))
+                flags |= SNAPSHOT_IDLING;
+
+            out[n].pid = task->pid_;
+            out[n].runtime_ns = task->get_runtime_ns();
+            out[n].context_switches = (u64)task->context_switches_.get();
+            out[n].state = (u32)task->state_.get();
+            out[n].flags = flags;
+            stdlib::mem_cpy(out[n].name, task->get_name(), sizeof(out[n].name));
+            out[n].name[sizeof(out[n].name) - 1] = '\0';
+            n++;
+        }
+
+        if (runaway != stdlib::array_size(task_list_))
+            break;
+    }
+
+    if (runaway != stdlib::array_size(task_list_))
+    {
+        trace(0, "snapshot: task list %lu does not end after %lu entries",
+            (ulong)runaway, (ulong)MAX_TASKS_PER_LIST);
+    }
     return n;
 }
 
@@ -927,9 +998,10 @@ void TaskTable::ps(stdlib::Printer& printer)
             ulong flags = (ulong)task->flags_.get();
             if (task->is_blocked())
                 flags |= 1UL << Task::FLAG_BLOCKED_BIT;
+            stdlib::Time runtime(task->get_runtime_ns());
             printer.printf("%lu %lu 0x%lX %lu.%lu %lu %s\n",
-                task->pid_, task->state_.get(), flags, task->runtime_.get_secs(),
-                task->runtime_.get_usecs(), task->context_switches_.get(), task->get_name());
+                task->pid_, task->state_.get(), flags, runtime.get_secs(),
+                runtime.get_usecs(), task->context_switches_.get(), task->get_name());
         }
     }
 }

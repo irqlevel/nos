@@ -136,7 +136,11 @@ impl<D: NetDriver> RxHalf for RxOf<D> {
 pub struct TxQueue<'a> {
     queue: &'a mut FrameQueue,
     done: &'a mut FrameQueue,
-    sent: &'a AtomicUsize,
+    /// What `dequeue` handed the driver, counted here and added to the
+    /// device's counters once, when the flush is done: an atomic add per
+    /// frame -- two, with the bytes -- is what the transmit path needs least.
+    frames: usize,
+    bytes: usize,
 }
 
 impl TxQueue<'_> {
@@ -148,7 +152,8 @@ impl TxQueue<'_> {
     /// back to the pool and out again while the card is still reading it.
     pub fn dequeue(&mut self) -> Option<Frame> {
         let frame = self.queue.pop()?;
-        self.sent.fetch_add(1, Ordering::Relaxed);
+        self.frames += 1;
+        self.bytes += frame.len();
         Some(frame)
     }
 
@@ -346,12 +351,43 @@ struct Tx {
 }
 
 impl Tx {
-    /// The driver's turn: what is queued, into the hardware.
-    fn flush(&mut self, sent: &AtomicUsize) {
+    /// The driver's turn: what is queued, into the hardware -- and what it
+    /// took, onto the device's counters.
+    fn flush(&mut self, sent: &Counted) {
         let Tx { queue, done, driver } = self;
         if let Some(driver) = driver.as_mut() {
-            driver.flush(&mut TxQueue { queue, done, sent });
+            let mut q = TxQueue { queue, done, frames: 0, bytes: 0 };
+            driver.flush(&mut q);
+            sent.add(q.frames, q.bytes);
         }
+    }
+}
+
+/// Frames and their bytes, counted for good: what `net` and the management
+/// bus report. Each pass adds what it moved once, at its end.
+struct Counted {
+    frames: AtomicUsize,
+    bytes: AtomicUsize,
+}
+
+impl Counted {
+    const fn new() -> Counted {
+        Counted { frames: AtomicUsize::new(0), bytes: AtomicUsize::new(0) }
+    }
+
+    fn add(&self, frames: usize, bytes: usize) {
+        if frames != 0 {
+            self.frames.fetch_add(frames, Ordering::Relaxed);
+            self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn frames(&self) -> usize {
+        self.frames.load(Ordering::Relaxed)
+    }
+
+    fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -381,8 +417,9 @@ pub struct Device {
 
     rx_proto: PerCpu<RxCounters>,
     tx_proto: PerCpu<TxCounters>,
-    tx_packets: AtomicUsize,
-    rx_packets: AtomicUsize,
+    /// What the driver took to send, and what the stack was handed
+    tx_sent: Counted,
+    rx_seen: Counted,
     /// Datagrams refused for an address no packet may go to.
     tx_refused: AtomicUsize,
 }
@@ -408,8 +445,8 @@ impl Device {
             listener_in_flight: AtomicUsize::new(0),
             rx_proto: PerCpu::new(),
             tx_proto: PerCpu::new(),
-            tx_packets: AtomicUsize::new(0),
-            rx_packets: AtomicUsize::new(0),
+            tx_sent: Counted::new(),
+            rx_seen: Counted::new(),
             tx_refused: AtomicUsize::new(0),
         }
     }
@@ -534,7 +571,7 @@ impl Device {
             /* The driver, with the queue and its own ring both lent out of
              * what this lock guards. */
             if queued != 0 {
-                tx.flush(&self.tx_packets);
+                tx.flush(&self.tx_sent);
             }
         }
 
@@ -574,7 +611,7 @@ impl Device {
         {
             let mut guard = self.tx.lock();
             if !guard.queue.is_empty() {
-                guard.flush(&self.tx_packets);
+                guard.flush(&self.tx_sent);
             }
         }
 
@@ -719,13 +756,17 @@ impl Device {
         };
         let listeners = &listeners[..count];
 
+        let mut seen = 0;
+        let mut seen_bytes = 0;
         while let Some(frame) = batch.pop() {
-            self.rx_packets.fetch_add(1, Ordering::Relaxed);
+            seen += 1;
+            seen_bytes += frame.len();
             self.dispatch_one(counters, &frame, listeners, rx);
             /* The receive path's reference goes here. A listener that kept
              * the frame took one of its own. */
             drop(frame);
         }
+        self.rx_seen.add(seen, seen_bytes);
 
         /* The batch is dispatched: a listener that answers from here hands
          * its replies over now, together. Still inside the in-flight count,
@@ -985,8 +1026,10 @@ impl Device {
 
     pub fn stats(&self) -> Stats {
         let mut stats = Stats {
-            tx_total: self.tx_packets.load(Ordering::Relaxed),
-            rx_total: self.rx_packets.load(Ordering::Relaxed),
+            tx_total: self.tx_sent.frames(),
+            rx_total: self.rx_seen.frames(),
+            tx_bytes: self.tx_sent.bytes(),
+            rx_bytes: self.rx_seen.bytes(),
             tx_refused: self.tx_refused.load(Ordering::Relaxed),
             rx_drop: 0, rx_icmp: 0, rx_udp: 0, rx_tcp: 0, rx_arp: 0, rx_other: 0, rx_nat: 0,
             tx_icmp: 0, tx_udp: 0, tx_tcp: 0, tx_arp: 0, tx_other: 0,
@@ -1016,6 +1059,9 @@ impl Device {
 pub struct Stats {
     pub tx_total: usize,
     pub rx_total: usize,
+    /// The bytes of those frames, Ethernet header on
+    pub tx_bytes: usize,
+    pub rx_bytes: usize,
     /// Datagrams to an address no packet may go to, never sent.
     pub tx_refused: usize,
     pub rx_drop: usize,

@@ -62,6 +62,11 @@ const KEYS_FILE_MAX: usize = 64 * 1024;
    crowd out the login that matters */
 const MAX_SESSIONS: usize = 8;
 const MAX_LOGGING_IN: usize = 4;
+/* Connections the kernel holds for the port that the listener has not
+   taken yet -- it takes each within a poll, and refuses what is past the
+   limits above -- so a few more than log in at once: a flood of SYNs at
+   port 22 costs the kernel's 64 connection slots no more than this */
+const LISTEN_BACKLOG: usize = 8;
 /* The longest wait for a connection, or on one, at a time: how soon a stop
    is noticed */
 const POLL_MS: u64 = 250;
@@ -223,7 +228,7 @@ fn start<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Outp
         .files
         .with(|_| -> Result<(HostKey, usize), String> { Ok((load_host_key(out)?, load_keys(&state.keys, out)?)) })?;
     let fingerprint = host.public().fingerprint();
-    let listener = TcpListener::bind(&nic, port)
+    let listener = TcpListener::bind(&nic, port, LISTEN_BACKLOG)
         .map_err(|_| format!("cannot listen on TCP port {}: someone has it, or no connection slot is free", port))?;
 
     let shared = Arc::new(Shared {

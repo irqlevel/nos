@@ -12,13 +12,15 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt::Write;
+
+use core::cell::Cell;
 
 use diskimage::qcow2::{Error, Qcow2, Stats};
 use diskimage::{detect, Format};
-use kcore::cmd::Output;
 use kcore::consts::NS_PER_SEC;
 use kcore::fs::File;
+
+use crate::work::{self, Work};
 
 const USAGE: &str = "hv convert <image> <disk> -- a qcow2 image made a raw disk, its holes kept";
 const KIB: u64 = 1024;
@@ -54,34 +56,40 @@ impl diskimage::Source for Image {
 }
 
 /// The disk, written where the converter says: always inside its size,
-/// which `set_len` gave it first.
+/// which `set_len` gave it first -- and nothing more once `stopped` is set,
+/// which ends the conversion.
 struct Disk<'a> {
     file: &'a File,
+    stopped: &'a Cell<bool>,
 }
 
 impl diskimage::Sink for Disk<'_> {
     type Error = kcore::error::Error;
 
     fn write_at(&mut self, offset: u64, data: &[u8]) -> kcore::error::Result<()> {
+        if self.stopped.get() {
+            return Err(kcore::error::Error::Busy);
+        }
         self.file.write_at(offset, data)
     }
 }
 
 /// `hv convert <image> <disk>`.
-pub fn command(args: &str, out: &mut Output) {
+pub fn command(args: &str, work: &mut dyn Work) {
     let mut words = args.split_ascii_whitespace();
     let (Some(from), Some(to), None) = (words.next(), words.next(), words.next()) else {
-        let _ = writeln!(out, "{}", USAGE);
+        let _ = writeln!(work, "{}", USAGE);
         return;
     };
-    if let Err(e) = convert(from, to, out) {
-        let _ = writeln!(out, "hv: {}", e);
+    if let Err(e) = convert(from, to, work) {
+        let _ = writeln!(work, "hv: {}", e);
     }
 }
 
 /// `from`, an image, converted into `to`, a new raw disk: Ok once the disk
-/// is written and synced, or why not -- and `to` then removed.
-pub fn convert(from: &str, to: &str, out: &mut Output) -> Result<(), String> {
+/// is written and synced, or why not -- and `to` then removed. Its lines,
+/// its progress and whether to stop are `work`'s.
+pub fn convert(from: &str, to: &str, work: &mut dyn Work) -> Result<(), String> {
     let file = File::open(from, false).map_err(|e| alloc::format!("{}: {}", from, e))?;
     let len = file.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
     let mut image = Image { file, len };
@@ -112,14 +120,15 @@ pub fn convert(from: &str, to: &str, out: &mut Output) -> Result<(), String> {
             return Err(alloc::format!("{} could not be opened -- {}", to, e));
         }
     };
-    let _ = writeln!(out, "hv: {}: qcow2 version {}, a disk of {} MiB in clusters of {} KiB{} -- into {}", from,
+    let _ = writeln!(work, "hv: {}: qcow2 version {}, a disk of {} MiB in clusters of {} KiB{} -- into {}", from,
                      img.version(), img.size().div_ceil(MIB), img.cluster_size() / KIB,
                      if img.extended_l2() { " with subclusters" } else { "" }, to);
     if img.dirty() {
-        let _ = writeln!(out, "hv: {}: QEMU did not close it cleanly -- its data is read as its tables have it", from);
+        let _ = writeln!(work, "hv: {}: QEMU did not close it cleanly -- its data is read as its tables have it", from);
     }
 
     let started = kcore::time::boot_time_ns();
+    let stopped = Cell::new(false);
     let result = disk
         .set_len(img.size())
         .map_err(|e| alloc::format!("{}: {} bytes do not fit there -- {}", to, img.size(), e))
@@ -127,15 +136,26 @@ pub fn convert(from: &str, to: &str, out: &mut Output) -> Result<(), String> {
             let size = img.size();
             let mut reported = started;
             let mut progress = |at: u64| {
+                /* Asked after every cluster: the next write the disk is
+                 * handed is refused once the work is to stop. */
+                if work.cancelled() {
+                    stopped.set(true);
+                    return;
+                }
+                work.progress(at, size);
                 let now = kcore::time::boot_time_ns();
                 let every = (now.saturating_sub(started) / REPORT_SHARE).clamp(REPORT_MIN_NS, REPORT_MAX_NS);
                 if now.saturating_sub(reported) >= every && at < size {
                     reported = now;
-                    let _ = writeln!(out, "hv: {} of {} MiB of the disk, {} s", at / MIB, size.div_ceil(MIB),
+                    let _ = writeln!(work, "hv: {} of {} MiB of the disk, {} s", at / MIB, size.div_ceil(MIB),
                                      now.saturating_sub(started) / NS_PER_SEC);
                 }
             };
-            img.convert(&mut image, &mut Disk { file: &disk }, &mut progress).map_err(|e| said(e, from, to))
+            let mut sink = Disk { file: &disk, stopped: &stopped };
+            img.convert(&mut image, &mut sink, &mut progress).map_err(|e| match stopped.get() {
+                true => String::from(work::STOPPED),
+                false => said(e, from, to),
+            })
         })
         .and_then(|stats| {
             disk.sync().map_err(|e| alloc::format!("{}: syncing it failed -- {}", to, e))?;
@@ -145,12 +165,12 @@ pub fn convert(from: &str, to: &str, out: &mut Output) -> Result<(), String> {
     drop(disk);
     match result {
         Ok(stats) => {
-            report(&img, &stats, to, kcore::time::boot_time_ns().saturating_sub(started), out);
+            report(&img, &stats, to, kcore::time::boot_time_ns().saturating_sub(started), work);
             Ok(())
         }
         Err(e) => {
             if kcore::fs::remove(to).is_err() {
-                let _ = writeln!(out, "hv: {} could not be removed -- what is in it is not the disk", to);
+                let _ = writeln!(work, "hv: {} could not be removed -- what is in it is not the disk", to);
             }
             Err(e)
         }
@@ -184,8 +204,8 @@ pub(crate) fn refused(from: &str, format: Format) -> String {
 }
 
 /// What was converted, in a line.
-fn report(img: &Qcow2, stats: &Stats, to: &str, ns: u64, out: &mut Output) {
-    let _ = writeln!(out, "hv: {}: {} MiB written of {} MiB, the rest holes -- {} clusters inflated, {} copied, {} \
+fn report(img: &Qcow2, stats: &Stats, to: &str, ns: u64, work: &mut dyn Work) {
+    let _ = writeln!(work, "hv: {}: {} MiB written of {} MiB, the rest holes -- {} clusters inflated, {} copied, {} \
                            zeros, {} not there -- in {}.{} s",
                      to, stats.written.div_ceil(MIB), img.size().div_ceil(MIB), stats.compressed, stats.stored,
                      stats.zeros, stats.holes, ns / NS_PER_SEC, ns % NS_PER_SEC / NS_PER_TENTH);

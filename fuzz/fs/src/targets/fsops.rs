@@ -72,6 +72,8 @@ pub fn link_groups(links: &[(Path, Path)]) -> Vec<Vec<Path>> {
 /// Power cuts set going into a discard, a request apart: more than a punch
 /// of a few batches takes.
 const PUNCH_CUTS: u64 = 48;
+/// The most calls an extent walk makes: a few windows of the image's.
+const EXTENT_CALLS: usize = 64;
 
 /// What the filesystem under the VFS holds at most.
 #[derive(Clone, Copy, Debug)]
@@ -959,6 +961,52 @@ impl Fs {
         }
     }
 
+    /// Where an image has data, walked from `at` (`Image::extent`), a call
+    /// at a time to its end or `EXTENT_CALLS`: what each call says is holes
+    /// is zeros in the model -- a copy that leaves it out loses nothing --
+    /// and the walk goes on, inside the file, without going back.
+    pub fn image_extent(&mut self, i: usize, at: u64) {
+        let Some((path, _)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_extent of {} from {}", show(&join(&path)), at));
+        let size = self.model.size(&path);
+        let d = match self.model.node(&path) {
+            Some(Node::File(d)) => d.clone(),
+            _ => Data::new(),
+        };
+        let mut from = at;
+        for _ in 0..EXTENT_CALLS {
+            let got = self.images[i].extent(from);
+            let Some((start, end)) = got else {
+                self.check(false, format_args!("an image's extent of {} at {} failed", show(&join(&path)), from));
+                return;
+            };
+            if from >= size {
+                self.check((start, end) == (size, size), format_args!("an image's extent of {} ({} bytes) at {}, \
+                           past its end, was {}..{}", show(&join(&path)), size, from, start, end));
+                return;
+            }
+            self.check(from <= start && start <= end && end <= size && end > from,
+                       format_args!("an image's extent of {} ({} bytes) at {} was {}..{}: backwards, outside, or \
+                                     nowhere", show(&join(&path)), size, from, start, end));
+            if !(from <= start && start <= end && end <= size && end > from) {
+                return;
+            }
+            self.check(d.zeros(from, start - from), format_args!("an image's extent of {} at {} said {}..{} was \
+                       holes, and the model has data there", show(&join(&path)), from, from, start));
+            if start > from {
+                reached("an image's hole skipped");
+            }
+            if start < end {
+                reached("an image's data found");
+            }
+            from = end;
+            if from >= size {
+                reached("an image's extents walked to its end");
+                return;
+            }
+        }
+    }
+
     pub fn image_sync(&mut self, i: usize) {
         if let Some(image) = self.images.get_mut(i) {
             let ok = image.sync();
@@ -1432,9 +1480,13 @@ fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
         21 | 22 if held != 0 => {
             let i = pick_held(r);
             let size = f.model.holds.get(i).map_or(0, |(p, _)| f.model.size(p));
-            match r.u8() % 10 {
+            match r.u8() % 11 {
                 0 => f.image_sync(i),
                 1 => f.image_close(i),
+                10 => {
+                    let at = if r.bool() { 0 } else { offset(r, size, block, f.model.limits.span) };
+                    f.image_extent(i, at);
+                }
                 8 | 9 => {
                     /* A discard, or a write of zeros, over a few blocks */
                     let at = offset(r, size, block, f.model.limits.span);

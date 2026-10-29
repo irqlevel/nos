@@ -17,6 +17,7 @@ extern crate alloc;
 mod disk;
 mod disklog;
 mod part;
+mod provider;
 mod selftest;
 mod shell;
 mod table;
@@ -122,6 +123,7 @@ pub fn init() {
     register("diskread", "diskread <disk> <sector> - read sector", shell::diskread);
     register("diskwrite", "diskwrite <disk> <sector> <hex> - write sector", shell::diskwrite);
     register("disklog", "disklog - kernel log to disk area state", disklog::dump);
+    provider::init();
 }
 
 fn register(name: &'static str, help: &'static str, handler: fn(&str, &mut Output)) {

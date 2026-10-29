@@ -1,0 +1,25 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+
+# HTTP/1.1 and WebSocket as nos's host API serves them, with no kernel in
+# it: a request read in place, with a limit on everything and nothing
+# allocated; a response's head written with nothing a value could inject;
+# WebSocket frames read and written; SHA-1 for the handshake's key; IPv4
+# networks for an allowlist; and a self-signed X.509 certificate made for a
+# P-256 key. The API module (modules/api) links it; fuzz/web runs it on the
+# host (scripts/web-test.py). Nothing in it is unsafe (`forbid`).
+[lib]
+
+[dependencies]
+# The certificate's key and its signature: ECDSA over P-256 with SHA-256,
+# signed as RFC 6979 has it, so no randomness is needed past the key's.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# force-soft for the reason the kernel crate gives: sha2 would otherwise pick
+# the CPU's SHA instructions at run time, SIMD the kernel keeps off -- and a
+# module's build does not get the kernel's features.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+base64ct = { version = "1", default-features = false }
+# The private key's bytes wiped when they are dropped.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
