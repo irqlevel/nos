@@ -28,6 +28,9 @@ extern "C" {
 /// commands in the table, as `rust_init` does it. The disks are each
 /// input's own. No thread is made and none parked: see `sched::boot`.
 pub fn boot() {
+    /* Every big allocation of the fuzzer's own is marked as its own: the
+     * kernel's code is held to what the kernel's heap gives at once. */
+    heap::hold_to_ceiling();
     sched::boot();
     sched::set_wall_base(WALL_BASE);
     set_trace_sink(disklog_line);

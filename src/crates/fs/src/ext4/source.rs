@@ -109,8 +109,24 @@ pub(super) fn inode(src: &mut dyn Source, ino: u32) -> Option<Vec<u8>> {
 
 /// Where block `lblock` of the file inode `ino` (`raw`) is: through its
 /// extent tree, every node of it held to its checksum, or its block map.
-/// An unwritten run is a hole: it reads as zeros.
+/// An unwritten run is a hole: it reads as zeros. A run on blocks no file
+/// may own (`Meta::file_may_own`) is refused, said: what is read there, or
+/// written in place -- a guest's disk off the VFS's lock -- would be the
+/// filesystem's own metadata.
 pub(super) fn map(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
+    match map_any(src, ino, raw, lblock)? {
+        Map::Blocks { block, run } if !src.meta().file_may_own(block, run) => {
+            trace!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
+                   run);
+            None
+        }
+        m => Some(m),
+    }
+}
+
+/// `map`, but for the journal's inode, whose blocks are the system zone's
+/// by what they are: held only to the filesystem's bounds.
+pub(super) fn map_any(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
     let node = Inode::new(raw)?;
     let (fs_blocks, bs, csum, seed) = {
         let m = src.meta();

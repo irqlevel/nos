@@ -12,6 +12,13 @@ use extfmt::sb::Super;
 
 use super::journal::JournalMap;
 
+/// The most runs the system zone is: what one allocation of the kernel's
+/// heap holds of them (512 KiB of 16-byte runs). Past it the zone is not
+/// worked out at all, and the mount does not write: a filesystem whose
+/// metadata lies in more pieces than this has groups by the hundred
+/// thousand, no flex_bg, or descriptors that are damage.
+const ZONE_RUNS_MAX: usize = 32768;
+
 pub(super) struct Meta {
     /// The superblock as last committed, or as read.
     pub sb: Super,
@@ -187,9 +194,18 @@ impl Meta {
                 zone_add(&mut zone, ib, ib + 1);
                 zone_add(&mut zone, it, it + table);
             }
+            /* Held to what the runs can be kept in as it grows, not only
+             * once whole: a map of millions of runs would take the heap
+             * a node at a time before the list of them was refused. */
+            if zone.len() > ZONE_RUNS_MAX {
+                return false;
+            }
         }
         for (dev, n) in journal.runs() {
             zone_add(&mut zone, dev, dev + n);
+            if zone.len() > ZONE_RUNS_MAX {
+                return false;
+            }
         }
         let mut merged: Vec<(u64, u64)> = Vec::new();
         if merged.try_reserve_exact(zone.len()).is_err() {
@@ -198,6 +214,18 @@ impl Meta {
         merged.extend(zone);
         self.system = merged;
         true
+    }
+
+    /// Whether blocks `start..start + n` may be a file's: at least one,
+    /// inside the filesystem, past the superblock and the descriptors, and
+    /// -- on a mount that writes, which works the zone out -- none of them
+    /// the system zone's: what the kernel holds every extent to
+    /// (`ext4_inode_block_valid`). A file mapped onto an inode table or the
+    /// journal would have its data written over them, in place, past the
+    /// journal -- and a guest's disk, off the VFS's lock.
+    pub fn file_may_own(&self, start: u64, n: u64) -> bool {
+        n > 0 && start >= self.gdt_first() + self.gdt_len() && start.checked_add(n).is_some_and(|e| e <= self.blocks)
+            && !self.overlaps_system(start, start + n)
     }
 
     pub fn in_system(&self, b: u64) -> bool {

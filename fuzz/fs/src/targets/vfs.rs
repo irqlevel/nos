@@ -702,6 +702,10 @@ fn small_tree(r: &mut Input) -> Node {
 }
 
 pub fn vfs(r: &mut Input) {
+    /* ramfs keeps a file's data as one allocation, which the kernel's heap
+     * refuses past 512 KiB; this target's model grows ramfs files past
+     * that, so the heap's ceiling is not held to here (heap.rs). */
+    let _lifted = machine::heap::lift_ceiling();
     let mut p = machine::params();
     p.cmdline = b"root=auto dhcp=off".to_vec();
     p.interrupts = vec![(b"timer".to_vec(), 12345), (b"nvme0-q1".to_vec(), 7), (b"a-name-longer-than-its-column".to_vec(), i64::MAX)];
