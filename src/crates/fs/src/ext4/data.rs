@@ -4,7 +4,9 @@
 //! has it, so that no block a commit maps into a file can show what it held
 //! before: a block mapped and written is written over in place, one in a
 //! hole is allocated and written whole -- zeros around what goes into it --
-//! and one in an unwritten extent is written and then made written. A write
+//! and one in an unwritten extent is written whole and made written. The
+//! blocks go to the device in batches of as many as the batch holds, each
+//! one call (`Io::write_batch`), the last before the commit. A write
 //! that fails part way leaves the transactions before it committed, and the
 //! file the size they gave it. Where only a block of its data did not
 //! write, the filesystem stays writable: that block's transaction is
@@ -22,6 +24,7 @@
 //! (`orphans.rs`); a punch goes on in more, each a range punched whole.
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use extfmt::extent::Leaf;
 use extfmt::inode::{Inode, EXTENTS_FL};
@@ -44,7 +47,7 @@ const LARGE_FILE_SIZE: u64 = 1 << 31;
 impl Txn<'_> {
     /// Regular file `ino`'s inode, to change: refused for one mapped by
     /// blocks, which this does not write.
-    fn file_inode(&mut self, ino: u32) -> Option<alloc::vec::Vec<u8>> {
+    fn file_inode(&mut self, ino: u32) -> Option<Vec<u8>> {
         let raw = self.inode(ino)?;
         let node = Inode::new(&raw)?;
         if !node.is_file() {
@@ -60,57 +63,62 @@ impl Txn<'_> {
 
     /// `data` written into file `ino` (`raw`) at byte `at`, block by block:
     /// over what is there, into a block allocated for a hole, or into an
-    /// unwritten extent's block, made written after. Every block's data is
-    /// on the device -- in its cache -- before this returns.
+    /// unwritten extent's block, made written. Each block is made whole in a
+    /// page of the batch -- what one written over in part holds read in
+    /// first, zeros around what goes into one that showed none -- and the
+    /// batch is written when it is full, and at the end: every block's data
+    /// is on the device -- in its cache -- before this returns, and so
+    /// before the commit that maps it.
     fn write_data(&mut self, ino: u32, raw: &mut [u8], data: &[u8], at: u64) -> bool {
         let bs = self.m.bs;
         let mut goal = self.m.group_start(u64::from((ino - 1) / self.m.ipg));
-        let mut blk = vec![0u8; bs];
+        let mut batch: Vec<(usize, u64)> = Vec::with_capacity(self.io.batch_blocks());
         let mut done = 0usize;
         while done < data.len() {
             let pos = at + done as u64;
             let (l, within) = (pos / bs as u64, (pos % bs as u64) as usize);
             let n = (bs - within).min(data.len() - done);
             let Ok(l) = u32::try_from(l) else { return false };
-            let piece = &data[done..done + n];
+            let k = batch.len();
             let Some(found) = self.ext_lookup(ino, raw, l) else { return false };
-            match found {
+            let b = match found {
                 Some(e) if !e.unwritten => {
                     let b = e.start + u64::from(l - e.first);
-                    if n < bs && !self.io.read(b, &mut blk) {
+                    if n < bs && !self.io.read_slot(b, k) {
                         return false;
                     }
-                    blk[within..within + n].copy_from_slice(piece);
-                    if !self.io.write(b, &blk, false) {
-                        return false;
-                    }
-                    goal = b + 1;
+                    b
                 }
                 Some(e) => {
                     /* Unwritten: it reads as zeros, whatever its block holds. */
-                    let b = e.start + u64::from(l - e.first);
-                    blk.fill(0);
-                    blk[within..within + n].copy_from_slice(piece);
-                    if !self.io.write(b, &blk, false) || self.ext_mark_written(ino, raw, l, 1).is_none() {
+                    if self.ext_mark_written(ino, raw, l, 1).is_none() {
                         return false;
                     }
-                    goal = b + 1;
+                    self.io.slot_mut(k).fill(0);
+                    e.start + u64::from(l - e.first)
                 }
                 None => {
                     let Some(b) = self.alloc_block(goal) else { return false };
-                    blk.fill(0);
-                    blk[within..within + n].copy_from_slice(piece);
-                    if !self.io.write(b, &blk, false)
-                        || !self.ext_insert(ino, raw, Leaf { first: l, len: 1, start: b, unwritten: false })
+                    if !self.ext_insert(ino, raw, Leaf { first: l, len: 1, start: b, unwritten: false })
                         || !inode::add_blocks(self.m, raw, 1) {
                         return false;
                     }
-                    goal = b + 1;
+                    self.io.slot_mut(k).fill(0);
+                    b
                 }
+            };
+            self.io.slot_mut(k)[within..within + n].copy_from_slice(&data[done..done + n]);
+            batch.push((k, b));
+            if batch.len() == self.io.batch_blocks() {
+                if !self.io.write_batch(&batch) {
+                    return false;
+                }
+                batch.clear();
             }
+            goal = b + 1;
             done += n;
         }
-        true
+        self.io.write_batch(&batch)
     }
 
     /// One transaction of a write: `data` into file `ino` at `at`, the size

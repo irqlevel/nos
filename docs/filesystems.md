@@ -347,7 +347,11 @@ leaf (by its tail) or index block (by its own) when they are read, which
 fails the read, or leaves an entry out of its directory, with a line saying
 which. An inode in a part of its group's table never written -- an
 uninitialised group's, or past `itable_unused` -- is not read at all.
-Unwritten extents read as zeros, whatever their blocks hold. Directories
+Unwritten extents read as zeros, whatever their blocks hold. A file is read
+a run of an extent at a time: as many of its blocks as the read reaches
+and a batch holds -- 64, a page each -- in one call (`Disk::read_pieces`),
+in flight together where the device takes several requests at once.
+Directories
 are read as ext2's are, the first time a walk enters them and all of one or
 nothing; an htree directory as the linear one it also is. Names of 64
 bytes or more, symlinks and device nodes are left out of the tree.
@@ -357,7 +361,9 @@ under nos once it writes -- is not replayed by a read-only mount, which
 writes nothing: extfmt's recovery planner works out what a replay would
 write (`extfmt::recovery`, held to e2fsck's replay byte for byte by
 `extfmt-test.py`), and every read of a block the plan names is served from
-its newest copy in the journal. The superblock and the descriptors are read
+its newest copy in the journal -- a file's data among them, as Linux's
+data=journal leaves it, the rest of the batch off the device. The
+superblock and the descriptors are read
 again through it if it has newer copies of them, as a replay would have
 left them. `mounts` says so (`journal-not-replayed=<blocks>`), and while it
 is so a disk's image of a file here is read through the VFS, not off the
@@ -443,8 +449,13 @@ flush comes first -- as Linux's data=ordered has it, so that no block a
 commit maps into a file can show what it held before. A block mapped and
 written is written over in place, read first where the write covers only
 part of it; one in a hole is allocated and written whole, zeros around what
-goes into it; one in an unwritten extent is written, then made written --
-the extent split around it. A write that fails part way leaves the
+goes into it; one in an unwritten extent is written whole and made
+written -- the extent split around it. The blocks go to the device in
+batches, each block made whole in a page of the mount's buffer of 64 and
+as many as it holds sent together (`Disk::write_pieces`: in flight at once
+on NVMe and virtio-blk), the last before the commit; a batch that fails is
+the write's failure there, as one block's would be. A
+write that fails part way leaves the
 transactions before it committed and the file the size they gave it --
 and writes zeros again over what it put past the old end into the last
 block, in place, which the size that would have covered it never did. Every
