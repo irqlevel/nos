@@ -506,6 +506,34 @@ transactions before gave back. A write that fails part way
 forces what it wrote in place to the medium before it returns, as every
 call leaves what it did: no commit came to flush it.
 
+### What is not done yet
+
+Each of these is left until a measurement or a need asks for it:
+
+- **Group commit.** Every call that changes metadata commits before it
+  returns -- a flush, the log, a flush and the commit block written
+  through -- so what a small call costs is the device's flushes, not its
+  data: 0.58 ms a small file copied under QEMU, more on an NVMe whose flush
+  is slow. Calls that come together could share one commit.
+- **Preallocation.** There is no `fallocate`: a disk's image `hv create`
+  makes is a sparse file, its blocks allocated as the guest first writes
+  them -- through the VFS, not off its lock -- and nothing keeps the room
+  for them. Unwritten extents are read and made written, never made.
+- **orphan_file.** A filesystem with it -- Debian 13's mke2fs makes one by
+  default -- mounts read-only; the installs leave it out.
+- **Indexed directories, written.** A directory is read whole whether it
+  is indexed or not, and loses its index to the first name nos adds, so
+  Linux looks names up in a big one a block at a time from then on.
+- **Discard.** What a remove, a cut or a punch gives back is not discarded
+  on the device: the block layer has no discard, and an SSD under a
+  filesystem that grows and shrinks never hears of the free space.
+- **CRC32C by the CPU.** Every checksum is computed a byte at a time from
+  a table (`extfmt::crc`); arm64's CRC32C instructions and x86's SSE4.2
+  `crc32` are not used.
+- **Writing what the installs do not make.** A filesystem without a
+  journal, without extents or without metadata_csum, or with quotas, stays
+  read-only, and the refused features stay refused (above).
+
 ## nanofs, ramfs, procfs
 
 nanofs (`src/crates/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
