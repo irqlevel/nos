@@ -201,8 +201,7 @@ impl<'a> Txn<'a> {
             if !self.admit(b) {
                 return None;
             }
-            let k = ((b - self.m.gdt_first()) as usize) * self.m.bs;
-            let data = self.m.gdt.get(k..k + self.m.bs)?.to_vec();
+            let data = self.m.gdt.get((b - self.m.gdt_first()) as usize)?.clone();
             self.dirty.insert(b, Dirty { data, kind: Kind::Gdt });
         }
         let d = self.dirty.get_mut(&b)?;

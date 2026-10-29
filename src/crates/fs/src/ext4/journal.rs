@@ -54,9 +54,64 @@ const MAX_TXN: usize = 512;
 /// The committed blocks a checkpoint is due at: what memory holds of them.
 const PIN_MAX: usize = 1024;
 
+/// Where the journal's blocks are on the device: the runs its inode maps
+/// them in, joined where one goes on from the last. A journal is a run or a
+/// few however long it is, so its map is too -- where one block number a
+/// block made a gigabyte's journal two MiB, past what one allocation of the
+/// kernel's holds, and its mount refused.
+#[derive(Clone, Default)]
+pub(super) struct JournalMap {
+    /// (first journal block, first device block, blocks), in the journal's
+    /// order, each run starting where the one before it ends.
+    runs: Vec<(u64, u64, u64)>,
+    len: u64,
+}
+
+impl JournalMap {
+    /// How many blocks the journal has.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// The device block journal block `j` is.
+    pub fn get(&self, j: u64) -> Option<u64> {
+        if j >= self.len {
+            return None;
+        }
+        let at = self.runs.partition_point(|&(first, _, _)| first <= j);
+        let &(first, dev, _) = self.runs.get(at.checked_sub(1)?)?;
+        Some(dev + (j - first))
+    }
+
+    /// The runs on the device: (first block, blocks).
+    pub fn runs(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.runs.iter().map(|&(_, dev, n)| (dev, n))
+    }
+
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// `n` more of the journal's blocks, from device block `dev` on; false
+    /// with no memory for another run.
+    fn push(&mut self, dev: u64, n: u64) -> bool {
+        match self.runs.last_mut() {
+            Some(last) if last.1 + last.2 == dev => last.2 += n,
+            _ => {
+                if self.runs.try_reserve(1).is_err() {
+                    return false;
+                }
+                self.runs.push((self.len, dev, n));
+            }
+        }
+        self.len += n;
+        true
+    }
+}
+
 /// The journal's blocks on the device: every block of its inode's size,
 /// none a hole or unwritten, each inside the filesystem.
-pub(super) fn blocks(src: &mut dyn Source, sb: &Super) -> Result<Vec<u64>, String> {
+pub(super) fn blocks(src: &mut dyn Source, sb: &Super) -> Result<JournalMap, String> {
     let ino = sb.journal_inum();
     let raw = source::inode(src, ino).ok_or_else(|| format!("the journal's inode {} does not read", ino))?;
     let node = Inode::new(&raw).ok_or("a short journal inode")?;
@@ -68,16 +123,19 @@ pub(super) fn blocks(src: &mut dyn Source, sb: &Super) -> Result<Vec<u64>, Strin
     if n > u64::from(u32::MAX) || n < 2 {
         return Err(format!("a journal of {} blocks", n));
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(n as usize).map_err(|_| String::from("no memory for the journal's map"))?;
+    let mut out = JournalMap::default();
     let mut l = 0u64;
     while l < n {
         match source::map(src, ino, &raw, l) {
             Some(Map::Blocks { block, run }) => {
-                for k in 0..run.min(n - l) {
-                    out.push(block + k);
+                let take = run.min(n - l);
+                if take == 0 {
+                    return Err(String::from("the journal's map does not read"));
                 }
-                l += run;
+                if !out.push(block, take) {
+                    return Err(String::from("no memory for the journal's map"));
+                }
+                l += take;
             }
             Some(Map::Hole { .. }) => return Err(format!("the journal has a hole, or an unwritten run, at {}", l)),
             None => return Err(String::from("the journal's map does not read")),
@@ -87,13 +145,14 @@ pub(super) fn blocks(src: &mut dyn Source, sb: &Super) -> Result<Vec<u64>, Strin
 }
 
 /// The journal's superblock, and its block whole, off the device.
-fn read_jsb(io: &mut Io, map: &[u64]) -> Result<(JournalSuper, Vec<u8>), String> {
+fn read_jsb(io: &mut Io, map: &JournalMap) -> Result<(JournalSuper, Vec<u8>), String> {
     let mut buf = vec![0u8; io.bs];
-    if !io.read(map[0], &mut buf) {
+    let at = map.get(0).ok_or_else(|| String::from("a journal of no blocks"))?;
+    if !io.read(at, &mut buf) {
         return Err(String::from("the journal's superblock does not read"));
     }
     let jsb = JournalSuper::parse(&buf)?;
-    if jsb.maxlen() as usize > map.len() {
+    if u64::from(jsb.maxlen()) > map.len() {
         return Err(format!("a journal of {} blocks in an inode of {}", jsb.maxlen(), map.len()));
     }
     Ok((jsb, buf))
@@ -101,25 +160,30 @@ fn read_jsb(io: &mut Io, map: &[u64]) -> Result<(JournalSuper, Vec<u8>), String>
 
 /// The replay's plan of a journal that has a log, its copies held inside
 /// the filesystem and off the journal itself.
-fn plan_of(io: &mut Io, map: &[u64], jsb: &JournalSuper) -> Result<Plan, String> {
+fn plan_of(io: &mut Io, map: &JournalMap, jsb: &JournalSuper) -> Result<Plan, String> {
     let bs = io.bs;
     let plan = {
-        let mut read = |jb: u32, out: &mut [u8]| match map.get(jb as usize) {
-            Some(&dev) if io.read(dev, out) => Ok(()),
+        let mut read = |jb: u32, out: &mut [u8]| match map.get(u64::from(jb)) {
+            Some(dev) if io.read(dev, out) => Ok(()),
             _ => Err(format!("journal block {} does not read", jb)),
         };
         recovery::plan(jsb, bs, &mut read)?
     };
-    let mut sorted: Vec<u64> = map.to_vec();
-    sorted.sort_unstable();
+    /* The journal's runs by where they are on the device, to look a home
+     * up in. */
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    runs.try_reserve_exact(map.run_count()).map_err(|_| String::from("no memory for the journal's runs"))?;
+    runs.extend(map.runs());
+    runs.sort_unstable();
     for w in &plan.writes {
         if w.home >= io.blocks {
             return Err(format!("a journal copy for block {}, past the filesystem", w.home));
         }
-        if sorted.binary_search(&w.home).is_ok() {
+        let at = runs.partition_point(|&(dev, _)| dev <= w.home);
+        if at > 0 && w.home - runs[at - 1].0 < runs[at - 1].1 {
             return Err(format!("a journal copy for block {}, the journal's own", w.home));
         }
-        if w.log as usize >= map.len() {
+        if u64::from(w.log) >= map.len() {
             return Err(format!("a journal copy at journal block {}, past the journal", w.log));
         }
     }
@@ -131,7 +195,7 @@ fn plan_of(io: &mut Io, map: &[u64], jsb: &JournalSuper) -> Result<Plan, String>
 /// nothing to replay; why not for one that cannot be read through -- a
 /// mount then refused, as a replay around it would show the filesystem
 /// neither as it was nor as it was to be.
-pub(super) fn overlay(io: &mut Io, map: &[u64], sb: &Super) -> Result<Overlay, String> {
+pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overlay, String> {
     let (jsb, _) = read_jsb(io, map)?;
     let needs = sb.incompat() & incompat::RECOVER != 0;
     if jsb.start() != 0 && !needs {
@@ -153,7 +217,9 @@ pub(super) fn overlay(io: &mut Io, map: &[u64], sb: &Super) -> Result<Overlay, S
     }
     let mut out = Overlay::new();
     for w in &plan.writes {
-        out.insert(w.home, (map[w.log as usize], w.escaped));
+        let copy = map.get(u64::from(w.log))
+            .ok_or_else(|| format!("a journal copy at journal block {}, past the journal", w.log))?;
+        out.insert(w.home, (copy, w.escaped));
     }
     trace!(0, "ext4: {} transactions in the journal not replayed: read through them, {} blocks", plan.transactions,
         out.len());
@@ -170,7 +236,7 @@ pub(super) enum Opened {
 
 pub(super) struct Journal {
     /// Journal block to device block.
-    pub map: Vec<u64>,
+    pub map: JournalMap,
     jsb: JournalSuper,
     /// The superblock's block as the device has it: what lies past the
     /// superblock in it is kept.
@@ -212,7 +278,7 @@ impl Journal {
     /// and the log marked empty -- and its features set for writing,
     /// forced to the medium, before anything is written through it. An
     /// error refuses the mount.
-    pub fn open(io: &mut Io, map: Vec<u64>, sb: &Super) -> Result<Opened, String> {
+    pub fn open(io: &mut Io, map: JournalMap, sb: &Super) -> Result<Opened, String> {
         let (mut jsb, jsb_block) = read_jsb(io, &map)?;
         let needs = sb.incompat() & incompat::RECOVER != 0;
         if jsb.version() != jbd2::SUPERBLOCK_V2 {
@@ -293,7 +359,8 @@ impl Journal {
         self.jsb.set_checksum();
         let mut blk = self.jsb_block.clone();
         blk[..jbd2::SB_SIZE].copy_from_slice(self.jsb.raw());
-        if !io.write(self.map[0], &blk, true) {
+        let Some(at) = self.map.get(0) else { return false };
+        if !io.write(at, &blk, true) {
             return false;
         }
         self.jsb_block = blk;
@@ -340,14 +407,17 @@ impl Journal {
 }
 
 /// The plan's copies written home, the newest of each, and flushed.
-fn replay(io: &mut Io, map: &[u64], plan: &Plan) -> Result<(), String> {
+fn replay(io: &mut Io, map: &JournalMap, plan: &Plan) -> Result<(), String> {
     let mut newest: BTreeMap<u64, (u32, bool)> = BTreeMap::new();
     for w in &plan.writes {
         newest.insert(w.home, (w.log, w.escaped));
     }
     let mut buf = vec![0u8; io.bs];
     for (&home, &(log, escaped)) in &newest {
-        if !io.read(map[log as usize], &mut buf) {
+        let Some(at) = map.get(u64::from(log)) else {
+            return Err(format!("journal block {} is past the journal", log));
+        };
+        if !io.read(at, &mut buf) {
             return Err(format!("journal block {} does not read", log));
         }
         if escaped {
@@ -470,7 +540,7 @@ impl Txn<'_> {
             }
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !io.write(jnl.map[pos as usize], &blk, false) {
+            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
                 jnl.abort("a revoke block does not write");
                 return false;
             }
@@ -499,13 +569,13 @@ impl Txn<'_> {
             }
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !io.write(jnl.map[pos as usize], &blk, false) {
+            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
                 jnl.abort("a descriptor block does not write");
                 return false;
             }
             pos = jnl.next(pos);
             for (_, copy, _) in chunk {
-                if !io.write(jnl.map[pos as usize], copy, false) {
+                if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, false)) {
                     jnl.abort("a block's copy does not write to the journal");
                     return false;
                 }
@@ -521,7 +591,7 @@ impl Txn<'_> {
         set_be64(&mut blk, jbd2::H_COMMIT_SEC, sec);
         let c = jbd2::commit_csum(jnl.seed, &blk).unwrap_or(0);
         set_be32(&mut blk, jbd2::H_CHKSUM, c);
-        if !io.write(jnl.map[pos as usize], &blk, true) {
+        if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, true)) {
             jnl.abort("a commit block does not write");
             return false;
         }
@@ -543,8 +613,9 @@ impl Txn<'_> {
                 }
             }
             if b >= gdt_first && b < gdt_first + gdt_len {
-                let k = ((b - gdt_first) as usize) * bs;
-                self.m.gdt[k..k + bs].copy_from_slice(&d.data);
+                if let Some(blk) = self.m.gdt.get_mut((b - gdt_first) as usize) {
+                    blk.copy_from_slice(&d.data);
+                }
             }
             self.jnl.in_log.insert(b, seq);
             self.cache.pin(b, d.data);
