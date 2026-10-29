@@ -19,6 +19,56 @@ use crate::{reached, Input};
 /// A name is shorter than this, in the VFS and every filesystem under it.
 pub const NAME_MAX: usize = 64;
 
+/// A path, a component at a time.
+pub type Path = Vec<Vec<u8>>;
+
+/// Second names for some of the files of `tree`, each beside what it names:
+/// the tree given them, and the pairs (the link, what it names) for a mkfs.
+pub fn add_links(r: &mut Input, tree: &mut Node) -> Vec<(Path, Path)> {
+    fn walk(r: &mut Input, n: &mut Node, at: &mut Path, out: &mut Vec<(Path, Path)>) {
+        let Some(children) = n.children_mut() else { return };
+        let files: Vec<Vec<u8>> = children.iter().filter(|(_, c)| !c.is_dir()).map(|(k, _)| k.clone()).collect();
+        for name in files {
+            if r.u8() % 4 != 1 {
+                continue;
+            }
+            let mut link = name.clone();
+            link.extend_from_slice(b"-ln");
+            if link.len() >= NAME_MAX || children.contains_key(&link) {
+                continue;
+            }
+            let Some(content) = children.get(&name).cloned() else { continue };
+            children.insert(link.clone(), content);
+            let mut l = at.clone();
+            l.push(link);
+            let mut t = at.clone();
+            t.push(name);
+            out.push((l, t));
+        }
+        let dirs: Vec<Vec<u8>> = children.iter().filter(|(_, c)| c.is_dir()).map(|(k, _)| k.clone()).collect();
+        for d in dirs {
+            at.push(d.clone());
+            if let Some(c) = children.get_mut(&d) {
+                walk(r, c, at, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(r, tree, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The names of one file each, as `Model::links` keeps them, from mkfs's
+/// pairs.
+pub fn link_groups(links: &[(Path, Path)]) -> Vec<Vec<Path>> {
+    let mut groups: std::collections::BTreeMap<Path, Vec<Path>> = std::collections::BTreeMap::new();
+    for (link, target) in links {
+        groups.entry(target.clone()).or_insert_with(|| vec![target.clone()]).push(link.clone());
+    }
+    groups.into_values().collect()
+}
+
 /// Power cuts set going into a discard, a request apart: more than a punch
 /// of a few batches takes.
 const PUNCH_CUTS: u64 = 48;
@@ -109,6 +159,36 @@ impl Model {
                 if let Some(t) = self.file_mut(&q) {
                     *t = d.clone();
                 }
+            }
+        }
+    }
+
+    /// What every name of a file of several holds, by its path: what
+    /// `propagate_changed` holds them to after a call.
+    pub fn linked_contents(&self) -> std::collections::BTreeMap<Path, Data> {
+        let mut out = std::collections::BTreeMap::new();
+        for g in self.links.iter().filter(|g| g.len() > 1) {
+            for p in g {
+                if let Some(Node::File(d)) = self.node(p) {
+                    out.insert(p.clone(), d.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// After a call: the content of whichever name of a file it changed --
+    /// held to what it held before (`linked_contents`) -- given to the
+    /// file's other names, as the inode they share has it.
+    pub fn propagate_changed(&mut self, before: &std::collections::BTreeMap<Path, Data>) {
+        let groups = self.links.clone();
+        for g in groups {
+            let changed = g.iter().find(|p| match (before.get(*p), self.node(p)) {
+                (Some(b), Some(Node::File(d))) => b != d,
+                _ => false,
+            });
+            if let Some(p) = changed.cloned() {
+                self.propagate(&p);
             }
         }
     }
@@ -1328,6 +1408,13 @@ pub fn say(what: std::fmt::Arguments) {
 
 /// One operation of the input's on the filesystem.
 pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
+    /* A file of several names: what one of them is given, every one has. */
+    let before = f.model.linked_contents();
+    step_once(f, r, block);
+    f.model.propagate_changed(&before);
+}
+
+fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
     let open = f.model.open.len() as u64;
     let pick_open = |r: &mut Input| r.below(open.max(1)) as usize;
     let held = f.images.len() as u64;

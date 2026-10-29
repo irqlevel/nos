@@ -310,6 +310,10 @@ pub struct Style {
     /// Blocks are taken from anywhere in the filesystem rather than from
     /// the start, so that a file is in more than one group.
     pub scatter: u64,
+    /// Second names, each of a file in the same directory: (the link's
+    /// path, the path of what it names) -- one inode, two links, as Linux
+    /// makes them and nos does not.
+    pub links: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
 }
 
 /// What `mkfs` made: the image, and which inode each path became.
@@ -549,6 +553,11 @@ impl Builder<'_> {
         let mut sub: Vec<(u32, &Node, Vec<u8>)> = Vec::new();
         for (name, child) in node.children().expect("a directory") {
             at.push(name.clone());
+            if self.style.links.iter().any(|(l, _)| l == at) {
+                /* A second name: made below, once what it names is. */
+                at.pop();
+                continue;
+            }
             match child {
                 Node::File(content) => {
                     let n = self.file(content)?;
@@ -564,6 +573,18 @@ impl Builder<'_> {
                 }
             }
             at.pop();
+        }
+        for (link, target) in self.style.links.clone() {
+            if link.len() != at.len() + 1 || !link.starts_with(at) {
+                continue;
+            }
+            let Some(&n) = inodes.get(&target) else { return Err("a link to nothing".into()) };
+            inodes.insert(link.clone(), n);
+            children.push((n, link.last().cloned().unwrap_or_default(), FT_REG));
+            if let Some(i) = self.table.get_mut(&n) {
+                let count = rd16(i, ino::LINKS);
+                wr16(i, ino::LINKS, count + 1);
+            }
         }
         self.dir(ino_no, parent, &children, subdirs)?;
         for (n, child, name) in sub {

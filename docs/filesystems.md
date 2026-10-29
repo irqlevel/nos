@@ -253,7 +253,10 @@ the journal ext2 does not have:
   maps. A remove takes the name out of its directory first, so a crash
   leaves an orphan for `lost+found`, never a name leading nowhere; a
   directory goes deepest first, by a walk and not a recursion, as deep as
-  the paths reach.
+  the paths reach. A file of more than one name -- a hard link, which nos
+  makes none of and Linux does -- loses one link to a remove, the others
+  keeping it, and every one of its names shows the size a write or a cut
+  gave it.
 - **`large_file`** is set in the superblock, on the medium, before the
   inode of the first file of 2 GiB or more is -- what Linux does, and what
   e2fsck wants of a filesystem that has one.
