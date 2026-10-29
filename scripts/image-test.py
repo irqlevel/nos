@@ -72,6 +72,8 @@ SHELL_LAST = 1
 SHELL_PORT = 9000
 
 BOOT_TIMEOUT = 600
+# Seconds a boot's /etc/rc is given to start the host API after sshd answers.
+API_WAIT = 60
 HOST_MARKER = "IMAGE-TEST: the host's own entry"
 
 failures = []
@@ -544,7 +546,13 @@ def run(tmp, image):
         check("with the host key it made the first time", m.host_key() == first_key)
         out = m.udp_shell("version", timeout=10)
         check("the UDP shell answers, now that it was asked for", out is not None and out.startswith("nos "), out)
-        rc, out = m.ssh(["api"])
+        # /etc/rc starts sshd in its first lines and the API after hv's: a
+        # session may come in before `api start` has run.
+        for _ in range(API_WAIT):
+            rc, out = m.ssh(["api"])
+            if rc == 0 and "api: serving port 39234" in out:
+                break
+            time.sleep(1)
         check("/etc/rc's api.ko serves the host API", rc == 0 and "api: serving port 39234" in out, out)
         rc, out = m.ssh(["dmesg"])
         if has_bundle:
