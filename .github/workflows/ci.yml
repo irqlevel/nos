@@ -86,6 +86,20 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hvboot-test.py
 
+      # The ext2/3/4 format hvboot reads through, and the kernel's ext4
+      # driver is to: a checksum computed wrong is a filesystem the driver
+      # refuses as corrupt -- or one it writes that Linux does. Every
+      # checksum of filesystems mke2fs makes, held to extfmt's; bytes
+      # changed, and extfmt and e2fsck held to both saying so; and fuzzed.
+      # And a journal replayed wrong is a filesystem neither as it was nor
+      # as it was to be: journals debugfs writes, replayed by extfmt's plan
+      # to the image e2fsck's replay leaves, byte for byte.
+      - name: ext2/3/4 format test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/extfmt-test.py
+
       # A cloud's image is a download, and `hv convert` reads it in the
       # kernel: a cluster read wrong is a guest's disk with the wrong bytes
       # in it, and nothing to say so. Converted on the host and held to
@@ -116,6 +130,18 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/fs-fuzz.py
+
+      # A judge wrong about the format holds every driver to the wrong
+      # thing, and agrees with it: the images the fuzzer's judges make and
+      # call clean, and the power cuts they call unclean, held to e2fsck --
+      # an ext4 image's every file to what debugfs reads out of it -- and
+      # the images the kernel's ext4 driver writes, and what its power cuts
+      # leave, held to e2fsck's verdict too.
+      - name: Storage fuzz judges against e2fsprogs (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/fs-fuzz.py --e2fsck
 
       # Everything the network hands the kernel is somebody else's to choose,
       # and a panic, a lock broken or a spin there is anyone's to cause: the
@@ -154,13 +180,25 @@ jobs:
       - name: Partition table test (${{ matrix.arch }}, TCG)
         run: python3 scripts/parttest.py --arch ${{ matrix.arch }} --tcg
 
-      # The smoke boot's fstest checks that ext2 reads back what it wrote;
-      # this checks that what it leaves on the disk is a filesystem e2fsck
-      # still calls clean. It drives the shell over UDP, which is the arm64
-      # boot's command line.
+      # The smoke boots' roots are ext4, as new installs' are; this boot's is
+      # ext2, as the roots made before ext4 are: its fstest checks that ext2
+      # reads back what it wrote, and e2fsck that what it leaves on the disk
+      # is a filesystem it still calls clean. It drives the shell over UDP,
+      # which is the arm64 boot's command line.
       - name: ext2 write test (e2fsck, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext2-test.py --tcg
+
+      # The fuzzer holds ext4 to images of its own; this holds it to
+      # mke2fs's, as Linux's distributions make them -- read, names written
+      # into one that e2fsck must then find nothing in, and a boot killed
+      # under its writing whose journal e2fsck and Linux must replay clean --
+      # to a journal debugfs left unreplayed, read through by a mount that
+      # must write nothing, and to orphans debugfs left, released by a mount
+      # for writing.
+      - name: ext4 test (mke2fs, debugfs, TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/ext4-test.py --tcg
 
       # nanofs is the one filesystem no smoke boot mounts, so without this
       # nothing here would notice it breaking.

@@ -4,17 +4,21 @@
 //! and what a run of operations should have left (the targets' models).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A file's content: its length, and what of it is not zeros -- kept a
 /// page at a time, so that a file of gigabytes with a few pages written
-/// costs a few pages.
+/// costs a few pages; and each page shared until it is written, so that a
+/// copy of a whole tree -- a model's before a call -- costs its pages'
+/// pointers.
 #[derive(Clone, Debug, Default)]
 pub struct Data {
     len: u64,
-    chunks: BTreeMap<u64, Vec<u8>>,
+    chunks: BTreeMap<u64, Arc<Vec<u8>>>,
 }
 
-const CHUNK: u64 = 4096;
+/// The page the content is kept in.
+pub const CHUNK: u64 = 4096;
 
 impl Data {
     pub fn new() -> Data {
@@ -75,8 +79,8 @@ impl Data {
             let take = (CHUNK as usize - off).min(bytes.len() - done);
             let piece = &bytes[done..done + take];
             if piece.iter().any(|b| *b != 0) || self.chunks.contains_key(&i) {
-                let chunk = self.chunks.entry(i).or_insert_with(|| vec![0u8; CHUNK as usize]);
-                chunk[off..off + take].copy_from_slice(piece);
+                let chunk = self.chunks.entry(i).or_insert_with(|| Arc::new(vec![0u8; CHUNK as usize]));
+                Arc::make_mut(chunk)[off..off + take].copy_from_slice(piece);
             }
             done += take;
         }
@@ -88,7 +92,7 @@ impl Data {
         if len < self.len {
             self.chunks.retain(|&i, _| i * CHUNK < len);
             if let Some(chunk) = self.chunks.get_mut(&(len / CHUNK)) {
-                chunk[(len % CHUNK) as usize..].fill(0);
+                Arc::make_mut(chunk)[(len % CHUNK) as usize..].fill(0);
             }
         }
         self.len = len;
@@ -107,6 +111,11 @@ impl Data {
         }
         out.dedup();
         out
+    }
+
+    /// The pages that may hold something other than zeros, by index.
+    pub fn pages(&self) -> impl Iterator<Item = u64> + '_ {
+        self.chunks.keys().copied()
     }
 
     /// The whole of it, for a file small enough to have whole.

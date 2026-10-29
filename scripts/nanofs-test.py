@@ -202,10 +202,9 @@ class Image:
 def root_device(sh):
     """Which disk the root filesystem is on, as `mounts` names it."""
     for line in sh.run("mounts").splitlines():
-        if line.strip().startswith("ext2 on /"):
-            parts = line.split()
-            if len(parts) >= 4:
-                return parts[3]
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] in ("ext2", "ext4") and parts[1:3] == ["on", "/"]:
+            return parts[3]
     return None
 
 
