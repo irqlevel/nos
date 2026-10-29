@@ -172,7 +172,7 @@ pub fn ext2bad(r: &mut Input) {
     let mut budget = 64;
     let mut inodes_left = 24;
     let tree = crate::targets::ext2::tree(r, bs, &mut budget, &mut inodes_left);
-    let style = Style { holes: r.bool(), slack: r.bool(), scatter: 0 };
+    let style = Style { holes: r.bool(), slack: r.bool(), scatter: 0, links: Vec::new() };
     let Ok(made) = img::mkfs(&g, &tree, &style, 1_749_000_000, r.u64()) else { return };
     let inodes: Vec<u32> = made.inodes.values().copied().collect();
     let mut media = made.media;

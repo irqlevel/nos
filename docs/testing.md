@@ -1136,7 +1136,9 @@ to the tree `e2fsck -fy` leaves. The targets:
   through the VFS -- opens with every flag, reads, writes and seeks at every
   edge of a block and of the indirect blocks of every level, across 2 and
   4 GiB and at the end of what a file can be, truncates both ways, creates,
-  renames, removes, chains of directories forty deep -- each call's answer
+  renames, removes, chains of directories forty deep, files of two names
+  (ext2's, as Linux makes them: one name removed, the other the file, and
+  what one is given, both have) -- each call's answer
   held to a model of the tree and the files open on it (`targets/fsops.rs`,
   the VFS's rules and the filesystem's limits written down), the tree read
   back through the VFS held to the model's, the image a clean unmount
