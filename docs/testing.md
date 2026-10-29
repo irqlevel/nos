@@ -149,7 +149,7 @@ swallowing panic messages whole.
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
-| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names and data changed from the shell -- made, moved, an indexed directory written into, files and a tree removed, `fstest`, a copy, a file grown past 4 GiB and cut back -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image and debugfs's extents what was written; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount, every file's MD5 the model's; and a journal debugfs left unreplayed, read through without a byte written |
+| `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names and data changed from the shell -- made, moved, an indexed directory written into, files and a tree removed, `fstest`, a copy, a file grown past 4 GiB and cut back -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image and debugfs's extents what was written; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount, every file's MD5 the model's; a journal debugfs left unreplayed, read through without a byte written; and orphans debugfs left on the list -- a file deleted, one of a thousand extents cut inside a block -- released by the mount for writing, the cut file zeros past its cut when grown again, the image clean to e2fsck after, its list empty |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
@@ -1174,12 +1174,18 @@ to the tree `e2fsck -fy` leaves. The targets:
   driver, with the disk's every write a finding, and worked through the VFS,
   every answer the model's and the whole tree read back at the end, a
   journal holding the newest copies of blocks whose homes are noise read
-  through so that the tree is still the one mkfs was given; and damaged -- a
+  through so that the tree is still the one mkfs was given, and orphans
+  mkfs left on the list -- a file of no links named nowhere, a file cut
+  short, its extents and its last block's old bytes running on past the cut
+  -- read as the release would leave them; and damaged -- a
   byte or three of the metadata at the start of the first groups, or of
   anything else -- refused, or mounted and walked as ext2bad's are, never a
   panic, a write or a leak;
 - `ext4rw` (`targets/ext4rw.rs`): the same images mounted for writing -- a
-  planted journal replayed by the mount -- and worked as the VFS's callers
+  planted journal replayed by the mount, planted orphans released by it,
+  now and then a disk all but full, a file of unwritten extents (what
+  fallocate leaves a disk's image) over every free block but a few, held as
+  an image and written into and discarded from -- and worked as the VFS's callers
   work a filesystem: files and directories made, a directory grown by
   dozens of entries, renames and moves, removes, recursive ones among them,
   now and then a name only the disk has (refused) and an htree directory
@@ -1189,9 +1195,17 @@ to the tree `e2fsck -fy` leaves. The targets:
   writes aimed at blocks mkfs left unwritten -- and files of two names, one
   held as an image while the other is opened for writing (refused);
   unmounted and mounted again midway. Every answer is the model's -- but a
-  refusal for want of an inode or a block, which the model does not count
-  -- and the image a clean unmount leaves must be clean to the judge,
-  nothing left to replay, and the model's tree. With the power cut at
+  refusal for want of an inode or a block, which the model does not count,
+  and a punch is never refused for one on a disk that had what ext4 keeps
+  for a punch free when it was mounted, however full it is now -- one mkfs
+  left with less may refuse it, and must leave the range as it was with an
+  end of it given back -- and the
+  image a clean unmount leaves must be clean to the judge, nothing left to
+  replay or release, and the model's tree. A remove or a cut of a file of
+  more extents than a transaction gives back goes through the orphan list,
+  so that a picture taken between its transactions holds an orphan, which
+  the judge's replay releases as e2fsck does and the kernel's replay of the
+  picture must release too, leaving none. With the power cut at
   chosen requests -- and now and then before every request of one call --
   each picture is judged when its call is done: replayed by the judge's own
   reader and clean to it, its tree what the call may leave -- the tree
@@ -1201,11 +1215,15 @@ to the tree `e2fsck -fy` leaves. The targets:
   between, and nothing of any other file's -- and then mounted by the
   kernel, on a disk of its own beside the one under test, read-only (the
   journal read through) and for writing (replayed), both holding the
-  judge's tree, the image that unmount leaves clean. With requests failing,
+  judge's tree, the image that unmount leaves clean -- a picture whose
+  superblock a checkpoint tore across its two sectors among them, which
+  only the journal's copy makes sound. With requests failing,
   no call may succeed that the model does not have, nothing may be written
-  in a mount after its first failed write of anything but a file's data
-  (the journal aborted) -- a file's data block that does not write fails
-  its call alone, which the judge's map of every block tells apart -- and
+  in a mount after its first failed write of anything but a file's data or
+  a disk image's own flush (the journal aborted) -- a file's data block that
+  does not write fails its call alone, which the judge's map of every block
+  tells apart, and a disk's image goes on writing its file's blocks and
+  flushing off the VFS's lock whatever its filesystem's state -- and
   the image, replayed, must be what the call that met the failure may
   leave, between the tree before it and the tree it was asked for. A filesystem whose journal is 64-bit where the filesystem is not
   (as `resize2fs -s` leaves one) is among the images: every reader of a

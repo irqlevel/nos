@@ -30,6 +30,9 @@ pub(super) struct Meta {
     pub uninit: bool,
     /// Runs of blocks, sorted and apart: what no file may own.
     pub system: Vec<(u64, u64)>,
+    /// The free blocks the descriptors count, as last committed: what the
+    /// reserve a punch may dip into is kept out of (`txn::RESERVE`).
+    pub free_blocks: u64,
 }
 
 impl Meta {
@@ -52,7 +55,14 @@ impl Meta {
             csum: sb.metadata_csum(),
             uninit: sb.metadata_csum() || sb.ro_compat() & ro_compat::GDT_CSUM != 0,
             system: Vec::new(),
+            free_blocks: 0,
         }
+    }
+
+    /// The free blocks every descriptor counts, summed: once a mount has
+    /// them, and then kept by each commit.
+    pub fn count_free_blocks(&mut self) {
+        self.free_blocks = (0..self.groups).filter_map(|g| self.desc(g)).map(|d| u64::from(d.free_blocks_count())).sum();
     }
 
     pub fn largedir(&self) -> bool {
@@ -187,5 +197,11 @@ impl Meta {
     pub fn in_system(&self, b: u64) -> bool {
         let at = self.system.partition_point(|&(s, _)| s <= b);
         at > 0 && b < self.system[at - 1].1
+    }
+
+    /// Whether any of blocks `start..end` is the system zone's.
+    pub fn overlaps_system(&self, start: u64, end: u64) -> bool {
+        let at = self.system.partition_point(|&(_, e)| e <= start);
+        self.system.get(at).is_some_and(|&(s, _)| s < end)
     }
 }

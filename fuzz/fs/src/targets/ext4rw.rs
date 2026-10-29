@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::image::ext4 as img;
 use crate::machine::disk;
 use crate::model::{join, show, Data, Node, CHUNK};
-use crate::targets::ext4::{agree, dump, geometry, one_in, style, too_big, tree, write_sparse, MKFS_TIME};
+use crate::targets::ext4::{agree, dump, geometry, one_in, orphans, style, too_big, tree, write_sparse, MKFS_TIME};
 use crate::targets::fsops::{self, Fs, Limits, Model, Res};
 use crate::{reached, Input};
 
@@ -228,9 +228,19 @@ impl Run {
     fn call(&mut self, r: &mut Input, op: impl FnOnce(&mut Run, &mut Input) -> Leave) {
         let before = self.f.model.tree.clone();
         let start = disk::with(0, |d| d.log.len());
+        let mark = crate::machine::trace_mark();
         let leave = op(self, r);
         let after = self.f.model.tree.clone();
         let end = disk::with(0, |d| d.log.len());
+        for line in crate::machine::traced_since(mark) {
+            let line = String::from_utf8_lossy(&line);
+            if line.contains("on the orphan list, the rest of its blocks") {
+                reached("ext4rw: a remove or a cut given back through the orphan list");
+            }
+            if line.contains("a punch takes one of the blocks kept for it") {
+                reached("ext4rw: a punch on a full disk, given a block of the reserve");
+            }
+        }
         if !self.strict && self.uncertain.is_none() && disk::with(0, |d| d.log[start..end].iter().any(|io| !io.ok)) {
             self.uncertain = Some((before.clone(), after.clone(), leave.clone()));
         }
@@ -254,6 +264,9 @@ impl Run {
         let c = img::check(&snap, self.dev_bytes);
         invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the power going before request {} leaves a \
                    picture the judge's replay finds wrong: {:?} {:?}", n, c.corrupt, c.unclean);
+        if c.orphans > 0 {
+            reached("ext4rw: a power cut's picture holding orphans");
+        }
         let Some(t) = c.tree else { panic!("invariant: the judge reads no tree out of a power cut's picture") };
         if let Err(e) = may_leave(leave, before, after, &t, self.sector) {
             panic!("invariant: the power going before request {} leaves a tree the call could not ({:?}): {}", n,
@@ -288,9 +301,9 @@ impl Run {
             d.current.clone()
         });
         let k = img::check(&left, self.dev_bytes);
-        invariant!(k.corrupt.is_empty() && k.unclean.is_empty() && !k.mounted && k.replayed == 0, "a power cut's \
-                   picture, replayed by the kernel and unmounted, is not clean: {:?} {:?} mounted {} replayed {}",
-                   k.corrupt, k.unclean, k.mounted, k.replayed);
+        invariant!(k.corrupt.is_empty() && k.unclean.is_empty() && !k.mounted && k.replayed == 0 && k.orphans == 0,
+                   "a power cut's picture, replayed by the kernel and unmounted, is not clean: {:?} {:?} mounted {} \
+                   replayed {} orphans {}", k.corrupt, k.unclean, k.mounted, k.replayed, k.orphans);
         invariant!(k.tree.as_ref() == Some(&t), "the kernel's replay of a picture leaves another tree than the judge's: \
                    {:?}", k.tree.as_ref().and_then(|x| t.diff(x)));
         reached("ext4rw: a power cut's picture mounted by the kernel, read through and replayed");
@@ -672,8 +685,34 @@ pub fn ext4rw(r: &mut Input) {
     if r.chance(128) {
         st.links = add_links(r, &mut tree);
     }
+    /* Orphans a crash between the transactions of a remove or a cut left,
+     * which the mount for writing must release; and now and then a disk
+     * all but full, a preallocated file over what is free. */
+    let (planted, released) = orphans(r, &tree, bs, &mut budget, &st.links);
+    st.orphans = planted;
+    if r.chance(24) {
+        st.leave_free = Some(r.below(24));
+    }
     let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
+    let mut tree = released;
+    if let Some(size) = made.filled {
+        let mut d = Data::new();
+        d.truncate(size);
+        tree.children_mut().expect("a directory").insert(img::FILLER.to_vec(), Node::File(d));
+        reached("ext4rw: a disk all but full");
+    }
+    /* A disk left with fewer free than ext4 keeps for a punch is one nos
+     * would never fill: a punch there may want a block nobody has. */
+    let punch_room = st.leave_free.is_some_and(|left| left < fs::ext4::RESERVE);
     agree(&g, &st, &made, &tree);
+    let mut unwritten_at = made.unwritten.clone();
+    for o in &st.orphans {
+        if let img::Orphan::Cut(path, size) = o {
+            if let Some(v) = unwritten_at.get_mut(path) {
+                v.retain(|&l| l < size.div_ceil(bs));
+            }
+        }
+    }
     let sizes: Vec<u64> = [512, 1024, 2048, 4096].into_iter().filter(|s| *s <= bs).collect();
     let ss = r.pick(&sizes);
     let sectors = g.blocks * bs / ss + r.below(8);
@@ -736,11 +775,44 @@ pub fn ext4rw(r: &mut Input) {
         sector: ss,
         block: bs,
         uncertain: None,
-        unwritten: made.unwritten.iter().map(|(p, v)| (p.clone(), v.iter().copied().collect())).collect(),
+        unwritten: unwritten_at.iter().map(|(p, v)| (p.clone(), v.iter().copied().collect())).collect(),
         image_syncs: Vec::new(),
     };
-    /* Pictures the mount's own writes left: the tree as it was. */
+    run.f.punch_room = punch_room;
+    /* Pictures the mount's own writes left -- its orphans' release among
+     * them: the tree as it was. */
+    if !st.orphans.is_empty() {
+        reached("ext4rw: mounted, its orphans released");
+    }
     run.call(r, |_, _| Leave::Either);
+    if made.filled.is_some() && r.bool() {
+        /* The preallocated file held as a disk's image: written into and
+         * discarded from, its unwritten extents split on a full disk. */
+        let filler = vec![img::FILLER.to_vec()];
+        run.call(r, |run, _| {
+            run.f.image_open(&join(&filler), true);
+            Leave::Either
+        });
+        let size = made.filled.unwrap_or(0);
+        if run.f.images.len() == 1 && size >= 16 * bs {
+            /* Holes punched across it, each splitting an extent, until the
+             * node that holds them fills and a block must be found for
+             * another -- on a disk with nothing but the reserve left. */
+            for _ in 0..r.range(4, 12) {
+                if run.uncertain.is_some() {
+                    break;
+                }
+                let at = r.below(size / bs - 4) * bs;
+                let len = bs * r.range(1, 4);
+                run.call(r, |run, _| {
+                    run.f.image_discard(0, at, len, None, false);
+                    run.image_sync(0);
+                    data(run, &filler, false, false)
+                });
+            }
+            reached("ext4rw: holes punched across a full disk's preallocated file");
+        }
+    }
 
     /* Where each mount begins among the disk's requests: a failed write
      * stops what the rest of its mount writes. */
@@ -861,7 +933,10 @@ pub fn ext4rw(r: &mut Input) {
                 reached("ext4rw: a file's data, or an image's flush, failed, and the filesystem went on");
             }
             if let Some(k) = (from..to).find(|&k| writes(&log[k]) && !log[k].ok && !others(k, &log[k])) {
-                let after = (k + 1..to).find(|&j| writes(&log[j]) && log[j].ok);
+                /* Nothing of the filesystem's own: a disk's image goes on
+                 * writing its file's blocks, and flushing, off the VFS's
+                 * lock, as the guest does whatever its filesystem's state. */
+                let after = (k + 1..to).find(|&j| writes(&log[j]) && log[j].ok && !others(j, &log[j]));
                 invariant!(after.is_none(), "request {} was written after request {}, a write of metadata or a \
                            flush, failed", after.unwrap_or(0), k);
                 reached("ext4rw: a write failed, and nothing written after it");
@@ -894,8 +969,8 @@ pub fn ext4rw(r: &mut Input) {
     let c = img::check(&media, dev_bytes);
     invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the image after a clean unmount is not clean: {:?} {:?}",
                c.corrupt, c.unclean);
-    invariant!(!c.mounted && c.replayed == 0, "the image after a clean unmount is left mounted ({}) or with {} \
-               transactions to replay", c.mounted, c.replayed);
+    invariant!(!c.mounted && c.replayed == 0 && c.orphans == 0, "the image after a clean unmount is left mounted \
+               ({}), with {} transactions to replay or {} orphans", c.mounted, c.replayed, c.orphans);
     if let Some(t) = &c.tree {
         if let Some(diff) = run.f.model.tree.diff(t) {
             panic!("invariant: the image after a clean unmount holds another tree than the model's: {}", diff);
@@ -904,7 +979,7 @@ pub fn ext4rw(r: &mut Input) {
     if !too_big(&run.f.model.tree) {
         /* For e2fsck, and for debugfs to read every file out of whole. */
         let written = img::Made { media, inodes: BTreeMap::new(), hidden: made.hidden, hidden_at: BTreeMap::new(),
-                                  journaled: Vec::new(), unwritten: BTreeMap::new() };
+                                  journaled: Vec::new(), unwritten: BTreeMap::new(), filled: None };
         dump("ext4rw", &written, &run.f.model.tree, g.blocks * bs);
     }
 }

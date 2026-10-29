@@ -15,8 +15,11 @@
 //! extents beyond the old end among them -- and writes zeros over what of
 //! the new last block lies past it, so that a file reads as zeros wherever
 //! it grows over; a punch gives back the blocks of a range inside the file,
-//! the size as it was. Each is one transaction: a file whose blocks it
-//! could not give back in one is the next step's (S7, the orphan list).
+//! the size as it was, and may take the free blocks kept for it
+//! (`txn::RESERVE`). Each gives back from the end of its range, as much as
+//! a transaction holds: a truncate that one cannot finish has its size and
+//! the file on the orphan list in the first, for the ones after to finish
+//! (`orphans.rs`); a punch goes on in more, each a range punched whole.
 
 use alloc::vec;
 
@@ -130,48 +133,61 @@ impl Txn<'_> {
     }
 
     /// File `ino` cut, or grown, to `size` bytes: past a smaller one every
-    /// mapping given back and the new last block's tail made zeros.
-    fn truncate_inode(&mut self, ino: u32, size: u64) -> bool {
-        let Some(mut raw) = self.file_inode(ino) else { return false };
+    /// mapping given back -- or as much as this transaction holds, the file
+    /// then an orphan for the transactions after -- and the new last
+    /// block's tail made zeros. Whether it is an orphan now, or None.
+    fn truncate_inode(&mut self, ino: u32, size: u64) -> Option<bool> {
+        let mut raw = self.file_inode(ino)?;
         let old = Inode::new(&raw).map_or(0, |i| i.size(true));
         let bs = self.m.bs as u64;
+        let mut orphaned = false;
+        let mut tail: Option<u64> = None;
         if size < old {
-            if self.ext_unmap(ino, &mut raw, size.div_ceil(bs), 1 << 32).is_none() {
-                return false;
-            }
+            let keep = size.div_ceil(bs);
+            let pieces = self.free_pieces();
+            let (_, end) = self.ext_unmap_tail(ino, &mut raw, keep, 1 << 32, pieces)?;
+            orphaned = end > keep;
             if size % bs != 0 {
                 let l = (size / bs) as u32;
-                match self.ext_lookup(ino, &raw, l) {
-                    None => return false,
-                    Some(Some(e)) if !e.unwritten => {
-                        let b = e.start + u64::from(l - e.first);
-                        let mut blk = vec![0u8; self.m.bs];
-                        if !self.io.read(b, &mut blk) {
-                            return false;
-                        }
-                        blk[(size % bs) as usize..].fill(0);
-                        if !self.io.write(b, &blk, false) {
-                            return false;
-                        }
-                    }
-                    Some(_) => {}
-                }
+                tail = self.ext_lookup(ino, &raw, l)?.filter(|e| !e.unwritten).map(|e| e.start + u64::from(l - e.first));
             }
         }
         if size >= LARGE_FILE_SIZE && !self.large_file() {
-            return false;
+            return None;
         }
         inode::set_size(&mut raw, size);
         inode::touch(&mut raw, self.now, true);
-        self.put_inode(ino, &mut raw)
+        if orphaned && !self.orphan_add(ino, &mut raw) {
+            return None;
+        }
+        if !self.put_inode(ino, &mut raw) {
+            return None;
+        }
+        /* The new last block's tail made zeros last, in place: before the
+         * commit, as data=ordered has it, and after everything else of the
+         * transaction is done, so that only the commit can fail after it. */
+        if let Some(b) = tail {
+            let mut blk = vec![0u8; self.m.bs];
+            if !self.io.read(b, &mut blk) {
+                return None;
+            }
+            blk[(size % bs) as usize..].fill(0);
+            if !self.io.write(b, &blk, false) {
+                return None;
+            }
+        }
+        Some(orphaned)
     }
 
-    /// File blocks `first..to` of `ino` given back: how many.
-    fn punch_inode(&mut self, ino: u32, first: u64, to: u64) -> Option<u64> {
+    /// File blocks `first..to` of `ino` given back from the end, as many as
+    /// this transaction holds: how many, and where what is left of the
+    /// range ends -- `first` when nothing is.
+    fn punch_inode(&mut self, ino: u32, first: u64, to: u64) -> Option<(u64, u64)> {
         let mut raw = self.file_inode(ino)?;
-        let freed = self.ext_unmap(ino, &mut raw, first, to)?;
+        let pieces = self.free_pieces();
+        let (freed, end) = self.ext_unmap_tail(ino, &mut raw, first, to, pieces)?;
         inode::touch(&mut raw, self.now, true);
-        self.put_inode(ino, &mut raw).then_some(freed)
+        self.put_inode(ino, &mut raw).then_some((freed, end))
     }
 }
 
@@ -236,6 +252,7 @@ impl Ext4 {
             };
             if !committed {
                 self.zero_past_end(ino, size, pos, n as u64);
+                self.flush_failed();
                 ok = false;
                 break;
             }
@@ -271,6 +288,20 @@ impl Ext4 {
         }
     }
 
+    /// After a write that never committed, what it wrote in place -- over
+    /// blocks the file had, and the zeros put back past its end -- forced to
+    /// the medium, as everything a call leaves is when it returns: no commit
+    /// came to flush it, and a power cut would otherwise take the file back
+    /// from what it reads as. A flush the device fails aborts the journal.
+    fn flush_failed(&mut self) {
+        if self.jnl.as_ref().is_none_or(|j| j.aborted) || self.io.flush() {
+            return;
+        }
+        if let Some(j) = self.jnl.as_mut() {
+            j.abort("the device does not flush what a failed write left");
+        }
+    }
+
     pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
         if !self.writable() {
             return false;
@@ -284,11 +315,19 @@ impl Ext4 {
             return false;
         }
         let done = match self.begin() {
-            Some(mut t) => t.truncate_inode(ino, size as u64) && t.commit(),
-            None => false,
+            Some(mut t) => match t.truncate_inode(ino, size as u64) {
+                Some(orphaned) => t.commit().then_some(orphaned),
+                None => None,
+            },
+            None => None,
         };
+        /* Cut with the first transaction, whatever comes of the rest: what
+         * a later one fails to give back, the next mount does. */
+        if done == Some(true) {
+            self.finish_orphan(ino);
+        }
         self.sized(file, ino);
-        done
+        done.is_some()
     }
 
     /// The blocks of `count` blocks of `file` from block `first` -- of those
@@ -303,12 +342,22 @@ impl Ext4 {
             return None;
         };
         let size = self.tree.get(file)?.size as u64;
-        let to = first.saturating_add(count).min(size.div_ceil(self.io.bs as u64));
-        if first >= to {
-            return Some(0);
+        let mut end = first.saturating_add(count).min(size.div_ceil(self.io.bs as u64));
+        let mut given = 0u64;
+        while end > first {
+            let mut t = self.begin()?;
+            t.may_reserve = true;
+            let (freed, left) = t.punch_inode(ino, first, end)?;
+            if !t.commit() {
+                return None;
+            }
+            if left >= end {
+                trace!(0, "ext4: a punch of inode {} gave nothing back of {}..{}", ino, first, end);
+                return None;
+            }
+            given += freed;
+            end = left;
         }
-        let mut t = self.begin()?;
-        let freed = t.punch_inode(ino, first, to)?;
-        t.commit().then_some(freed)
+        Some(given)
     }
 }

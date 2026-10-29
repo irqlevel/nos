@@ -326,11 +326,17 @@ impl Image {
         self.zero(offset, end)
     }
 
-    /// Zeros written over `[from, to)`, a piece at a time.
+    /// Zeros written over `[from, to)`, a piece at a time: each piece ending
+    /// at a multiple of `ZERO_CHUNK` in the image -- which every block size
+    /// divides -- so that no block is written by two of them, and a power
+    /// cut between two leaves every sector what it held or zeros. Pieces
+    /// counted from `from` itself would split a sector between two writes
+    /// wherever `from` is not a multiple of one.
     fn zero(&mut self, from: u64, to: u64) -> bool {
+        let chunk = ZERO_CHUNK as u64;
         let mut at = from;
         while at < to {
-            let n = ((to - at) as usize).min(ZERO_CHUNK);
+            let n = (to.min((at / chunk + 1) * chunk) - at) as usize;
             if !self.write_at(at, &ZEROS[..n]) {
                 return false;
             }

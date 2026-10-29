@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::image::ext4::{self as img, Geometry, Style};
+use crate::image::ext4::{self as img, Geometry, Orphan, Style};
 use crate::machine::disk;
 use crate::model::{Data, Node};
 use crate::targets::fsops::{self, Fs, Limits, Model};
@@ -89,7 +89,55 @@ pub fn style(r: &mut Input) -> Style {
         journal_64: one_in(r, 4),
         links: Vec::new(),
         journaled: 0,
+        orphans: Vec::new(),
+        leave_free: None,
     }
+}
+
+/// Every file under `n`, by path, and its size.
+fn files(n: &Node, at: &mut Vec<Vec<u8>>, out: &mut Vec<(Vec<Vec<u8>>, u64)>) {
+    for (name, child) in n.children().into_iter().flatten() {
+        at.push(name.clone());
+        match child {
+            Node::File(d) => out.push((at.clone(), d.len())),
+            Node::Dir(_) => files(child, at, out),
+        }
+        at.pop();
+    }
+}
+
+/// Now and then orphans for `tree`'s image -- a file of no links named
+/// nowhere, a file of one name cut short, none of the names `links` gives
+/// a second -- and the tree a mount that releases them leaves, or a read
+/// sees: `tree` with each cut made.
+pub(super) fn orphans(r: &mut Input, tree: &Node, bs: u64, budget: &mut u64, links: &[(Vec<Vec<u8>>, Vec<Vec<u8>>)])
+                      -> (Vec<Orphan>, Node) {
+    let mut out = Vec::new();
+    let mut want = tree.clone();
+    if !one_in(r, 6) {
+        return (out, want);
+    }
+    let mut all = Vec::new();
+    files(tree, &mut Vec::new(), &mut all);
+    all.retain(|(p, len)| *len > 0 && !links.iter().any(|(l, t)| l == p || t == p));
+    for _ in 0..r.range(1, 4) {
+        if all.is_empty() || r.bool() {
+            out.push(Orphan::Deleted(content(r, bs, budget)));
+            continue;
+        }
+        let (path, len) = all.swap_remove(r.below(all.len() as u64) as usize);
+        let size = match r.u8() % 3 {
+            0 => 0,
+            1 => len - 1 - r.below(len.min(bs)),
+            _ => r.below(len),
+        };
+        if let Some(Node::File(d)) = want.get_mut(&path) {
+            d.truncate(size);
+        }
+        out.push(Orphan::Cut(path, size));
+    }
+    reached("ext4: an image with orphans");
+    (out, want)
 }
 
 /// What a file holds: nothing, a little, a block either side of a few
@@ -281,6 +329,8 @@ pub(super) fn agree(g: &Geometry, st: &Style, made: &img::Made, tree: &Node) {
                {:?}): {:?}, {:?}", g, st, c.corrupt, c.unclean);
     invariant!((c.replayed > 0) == !made.journaled.is_empty(), "the check replayed {} transactions of a journal mkfs \
                planted {} blocks in", c.replayed, made.journaled.len());
+    invariant!(c.orphans as usize == st.orphans.len(), "the check released {} orphans of the {} mkfs planted",
+               c.orphans, st.orphans.len());
     let mut want = tree.clone();
     want.children_mut().expect("a directory").insert(b"lost+found".to_vec(), Node::dir());
     invariant!(c.tree.as_ref() == Some(&want), "the judge's check reads another tree than its mkfs made: {:?}",
@@ -303,7 +353,12 @@ pub fn ext4(r: &mut Input) {
     let mut budget = g.blocks / 2;
     let mut inodes = g.inodes() / 2;
     let tree = tree(r, bs, &mut budget, &mut inodes);
+    /* Orphans a read-only mount leaves as they are: a deleted file named
+     * nowhere, a cut one read to its size. */
+    let (planted, tree_seen) = orphans(r, &tree, bs, &mut budget, &[]);
+    st.orphans = planted;
     let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
+    let tree = tree_seen;
     agree(&g, &st, &made, &tree);
     let sizes: Vec<u64> = [512, 1024, 2048, 4096].into_iter().filter(|s| *s <= bs).collect();
     let ss = r.pick(&sizes);

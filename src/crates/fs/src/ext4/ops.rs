@@ -4,7 +4,9 @@
 //! with things in it is one transaction a node, deepest first, so that a
 //! crash part way leaves what is left whole; and it starts only once every
 //! directory in it is known to hold on the disk nothing the tree leaves
-//! out, so that a refusal leaves everything.
+//! out, so that a refusal leaves everything. A file whose blocks one
+//! transaction cannot give back leaves its directory in the first, on the
+//! orphan list, and is given back by the transactions after (`orphans.rs`).
 
 use alloc::vec::Vec;
 
@@ -74,46 +76,53 @@ impl Txn<'_> {
 
     /// The name `name` of `ino` taken out of directory `parent`: a
     /// directory -- which must be empty on the disk -- freed with it, a
-    /// file freed with its last link.
-    fn unlink(&mut self, parent: u32, name: &[u8], ino: u32, is_dir: bool) -> bool {
+    /// file freed with its last link: whole, or as much of it as this
+    /// transaction holds, from its end back, the inode then an orphan for
+    /// the transactions after. Whether it is, or None.
+    fn unlink(&mut self, parent: u32, name: &[u8], ino: u32, is_dir: bool) -> Option<bool> {
         if !self.remove_entry(parent, name, ino) {
-            return false;
+            return None;
         }
-        let Some(mut raw) = self.inode(ino) else { return false };
-        let Some(node) = Inode::new(&raw) else { return false };
+        let mut raw = self.inode(ino)?;
+        let node = Inode::new(&raw)?;
         if is_dir {
             if !node.is_dir() {
-                return false;
+                return None;
             }
             match self.dir_empty(ino, &raw) {
                 Some(true) => {}
                 Some(false) => {
                     trace!(0, "ext4: directory {} holds entries on the disk the tree does not show: not removed", ino);
-                    return false;
+                    return None;
                 }
-                None => return false,
+                None => return None,
             }
-            return self.link_dir(parent, false) && self.release(ino, &mut raw, true);
+            return (self.link_dir(parent, false) && self.release(ino, &mut raw, true)).then_some(false);
         }
         let links = inodes::links(&raw);
         if links > 1 {
             inodes::set_links(&mut raw, links - 1);
             inodes::touch(&mut raw, self.now, false);
-            return self.put_inode(ino, &mut raw);
+            return self.put_inode(ino, &mut raw).then_some(false);
         }
-        self.release(ino, &mut raw, false)
+        inodes::set_links(&mut raw, 0);
+        let pieces = self.free_pieces();
+        let (_, end) = self.ext_unmap_tail(ino, &mut raw, 0, 1 << 32, pieces)?;
+        if end == 0 {
+            return self.release(ino, &mut raw, false).then_some(false);
+        }
+        inodes::touch(&mut raw, self.now, false);
+        (self.orphan_add(ino, &mut raw) && self.put_inode(ino, &mut raw)).then_some(true)
     }
 
     /// Inode `ino` (`raw`), named nowhere now, given back: every block it
     /// holds, its share of an attribute block, and the inode itself, left
     /// as the kernel leaves one it deletes.
-    fn release(&mut self, ino: u32, raw: &mut [u8], is_dir: bool) -> bool {
+    pub(super) fn release(&mut self, ino: u32, raw: &mut [u8], is_dir: bool) -> bool {
         let Some((runs, tree)) = self.file_blocks(ino, raw) else { return false };
         for (start, len) in runs {
-            for b in start..start + len {
-                if !self.free_block(b) {
-                    return false;
-                }
+            if !self.free_run(start, len) {
+                return false;
             }
         }
         for b in tree {
@@ -320,19 +329,27 @@ impl Ext4 {
     }
 
     /// `node` -- a file, or a directory with nothing left under it -- out
-    /// of its parent and given back, one transaction.
+    /// of its parent and given back: one transaction, or for a file whose
+    /// blocks one cannot give back, the first, and its orphan's after. Gone
+    /// from its directory with the first, whatever comes of the rest: what a
+    /// later one fails to give back, the next mount does.
     fn remove_one(&mut self, node: NodeId) -> bool {
         let Some((ino, is_dir)) = self.tree.get(node).map(|n| (n.ino as u32, n.is_dir())) else { return false };
         let Some(parent) = self.tree.parent(node).and_then(|p| self.dir_ino(p)) else { return false };
         let name: Vec<u8> = self.tree[node].name().to_vec();
         let done = match self.begin() {
-            Some(mut t) => t.unlink(parent, &name, ino, is_dir) && t.commit(),
-            None => false,
+            Some(mut t) => match t.unlink(parent, &name, ino, is_dir) {
+                Some(orphaned) => t.commit().then_some(orphaned),
+                None => None,
+            },
+            None => None,
         };
-        if done {
-            self.tree.free_tree(node);
-            self.hidden.remove(&ino);
+        let Some(orphaned) = done else { return false };
+        self.tree.free_tree(node);
+        self.hidden.remove(&ino);
+        if orphaned {
+            self.finish_orphan(ino);
         }
-        done
+        true
     }
 }
