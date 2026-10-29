@@ -414,6 +414,11 @@ def main():
 
     r = run([BIN, "crc"])
     check("CRC32C and CRC16 against known answers", r.returncode == 0, r.stdout + r.stderr)
+    # A log the kernel's heap could not have listed whole: planned in maps a
+    # node at a time, never one allocation past the 512 KiB it gives.
+    r = run([BIN, "long-log"])
+    check("a journal of 9000 transactions planned whole, the newest copy of each block, nothing asked of the heap "
+          "past the kernel's 512 KiB at once (%s)" % r.stdout.strip(), r.returncode == 0, r.stdout + r.stderr)
 
     rng = random.Random(args.seed)
     tmp = tempfile.mkdtemp(prefix="nos-extfmt-")

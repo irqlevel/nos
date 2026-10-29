@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::machine::sched;
+
 /// A file's content: its length, and what of it is not zeros -- kept a
 /// page at a time, so that a file of gigabytes with a few pages written
 /// costs a few pages; and each page shared until it is written, so that a
@@ -60,7 +62,7 @@ impl Data {
         if at >= end {
             return Vec::new();
         }
-        let mut v = vec![0u8; (end - at) as usize];
+        let mut v = sched::harness(|| vec![0u8; (end - at) as usize]);
         for (&i, chunk) in self.chunks.range(at / CHUNK..=(end - 1) / CHUNK) {
             let base = i * CHUNK;
             let from = base.max(at);
@@ -100,6 +102,10 @@ impl Data {
 
     /// The indices of the `block`-byte blocks that are not all zeros.
     pub fn nonzero_blocks(&self, block: u64) -> Vec<u64> {
+        sched::harness(|| self.nonzero_blocks_of(block))
+    }
+
+    fn nonzero_blocks_of(&self, block: u64) -> Vec<u64> {
         let mut out: Vec<u64> = Vec::new();
         for (&i, chunk) in &self.chunks {
             for (k, piece) in chunk.chunks(block.min(CHUNK) as usize).enumerate() {

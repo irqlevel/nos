@@ -323,7 +323,7 @@ pub fn check(img: &Media) -> Check {
                     c.corrupt(format!("inode {} claims {} bytes", n, size));
                     return None;
                 }
-                let mut content = vec![0u8; size];
+                let mut content = crate::machine::sched::harness(|| vec![0u8; size]);
                 for k in 0..size.div_ceil(BLOCK) {
                     let b = block(k);
                     if !claim(b, c) {

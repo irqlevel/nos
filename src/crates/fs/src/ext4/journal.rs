@@ -54,6 +54,10 @@ const MAX_TXN: usize = 512;
 /// The committed blocks a checkpoint is due at: what memory holds of them.
 const PIN_MAX: usize = 1024;
 
+/// The fewest blocks a journal written through may have
+/// (`JBD2_MIN_JOURNAL_BLOCKS`): what the kernel and e2fsck take.
+const MIN_JOURNAL_BLOCKS: u32 = 1024;
+
 /// Where the journal's blocks are on the device: the runs its inode maps
 /// them in, joined where one goes on from the last. A journal is a run or a
 /// few however long it is, so its map is too -- where one block number a
@@ -126,7 +130,7 @@ pub(super) fn blocks(src: &mut dyn Source, sb: &Super) -> Result<JournalMap, Str
     let mut out = JournalMap::default();
     let mut l = 0u64;
     while l < n {
-        match source::map(src, ino, &raw, l) {
+        match source::map_any(src, ino, &raw, l) {
             Some(Map::Blocks { block, run }) => {
                 let take = run.min(n - l);
                 if take == 0 {
@@ -175,7 +179,7 @@ fn plan_of(io: &mut Io, map: &JournalMap, jsb: &JournalSuper) -> Result<Plan, St
     runs.try_reserve_exact(map.run_count()).map_err(|_| String::from("no memory for the journal's runs"))?;
     runs.extend(map.runs());
     runs.sort_unstable();
-    for w in &plan.writes {
+    for w in plan.writes.values() {
         if w.home >= io.blocks {
             return Err(format!("a journal copy for block {}, past the filesystem", w.home));
         }
@@ -216,7 +220,7 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
         trace!(0, "ext4: journal transaction {} was corrupt: read up to it", t);
     }
     let mut out = Overlay::new();
-    for w in &plan.writes {
+    for w in plan.writes.values() {
         let copy = map.get(u64::from(w.log))
             .ok_or_else(|| format!("a journal copy at journal block {}, past the journal", w.log))?;
         out.insert(w.home, (copy, w.escaped));
@@ -283,6 +287,16 @@ impl Journal {
         let needs = sb.incompat() & incompat::RECOVER != 0;
         if jsb.version() != jbd2::SUPERBLOCK_V2 {
             return Ok(Opened::ReadOnly(String::from("a journal of the first version, which has no features")));
+        }
+        /* A log written in blocks its superblock does not say would be one
+         * no replay -- this one's, e2fsck's, the kernel's -- reads. */
+        if jsb.blocksize() as usize != io.bs {
+            return Ok(Opened::ReadOnly(format!("a journal of {}-byte blocks in a filesystem of {}", jsb.blocksize(),
+                                               io.bs)));
+        }
+        if jsb.maxlen() < MIN_JOURNAL_BLOCKS {
+            return Ok(Opened::ReadOnly(format!("a journal of {} blocks, fewer than the {} one is written through in",
+                                               jsb.maxlen(), MIN_JOURNAL_BLOCKS)));
         }
         recovery::check_features(&jsb)?;
         if jsb.errno() != 0 {
@@ -367,13 +381,17 @@ impl Journal {
         true
     }
 
-    /// Nothing more is to be written: said once.
-    pub fn abort(&mut self, why: &str) {
+    /// Nothing more is to be written: said once, and held to by the device
+    /// itself (`Io::writable`), which refuses every write and flush from
+    /// here on -- whatever a caller goes on to try after a failure it did
+    /// not see.
+    pub fn abort(&mut self, io: &mut Io, why: &str) {
         if !self.aborted {
             trace!(0, "ext4: the journal is aborted: {}; nothing more is written, and the filesystem is left for a \
                        replay", why);
         }
         self.aborted = true;
+        io.writable = false;
     }
 
     /// The blocks a transaction of `copies` blocks and `revokes` revoked
@@ -394,7 +412,7 @@ impl Journal {
         self.jsb.set_start(0);
         self.jsb.set_sequence(self.next_seq);
         if !self.write_jsb(io) {
-            self.abort("the journal's superblock does not write");
+            self.abort(io, "the journal's superblock does not write");
             return false;
         }
         self.started = false;
@@ -406,25 +424,22 @@ impl Journal {
     }
 }
 
-/// The plan's copies written home, the newest of each, and flushed.
+/// The plan's copies written home -- the newest of each, which is all the
+/// plan keeps -- and flushed.
 fn replay(io: &mut Io, map: &JournalMap, plan: &Plan) -> Result<(), String> {
-    let mut newest: BTreeMap<u64, (u32, bool)> = BTreeMap::new();
-    for w in &plan.writes {
-        newest.insert(w.home, (w.log, w.escaped));
-    }
     let mut buf = vec![0u8; io.bs];
-    for (&home, &(log, escaped)) in &newest {
-        let Some(at) = map.get(u64::from(log)) else {
-            return Err(format!("journal block {} is past the journal", log));
+    for w in plan.writes.values() {
+        let Some(at) = map.get(u64::from(w.log)) else {
+            return Err(format!("journal block {} is past the journal", w.log));
         };
         if !io.read(at, &mut buf) {
-            return Err(format!("journal block {} does not read", log));
+            return Err(format!("journal block {} does not read", w.log));
         }
-        if escaped {
+        if w.escaped {
             buf[..4].copy_from_slice(&jbd2::MAGIC.to_be_bytes());
         }
-        if !io.write(home, &buf, false) {
-            return Err(format!("block {} does not write in the replay", home));
+        if !io.write(w.home, &buf, false) {
+            return Err(format!("block {} does not write in the replay", w.home));
         }
     }
     if !io.flush() {
@@ -451,19 +466,19 @@ fn write_home(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, restart: bool) 
     }
     for (&b, data) in cache.pinned() {
         if !io.write(b, data, false) {
-            jnl.abort("a checkpoint's write home failed");
+            jnl.abort(io, "a checkpoint's write home failed");
             return false;
         }
     }
     if !io.flush() {
-        jnl.abort("the device does not flush a checkpoint");
+        jnl.abort(io, "the device does not flush a checkpoint");
         return false;
     }
     if restart && jnl.started {
         jnl.jsb.set_start(jnl.head);
         jnl.jsb.set_sequence(jnl.next_seq);
         if !jnl.write_jsb(io) {
-            jnl.abort("the journal's superblock does not write");
+            jnl.abort(io, "the journal's superblock does not write");
             return false;
         }
     }
@@ -517,7 +532,7 @@ impl Txn<'_> {
             jnl.jsb.set_start(jnl.head);
             jnl.jsb.set_sequence(seq);
             if !jnl.write_jsb(io) {
-                jnl.abort("the journal's superblock does not write");
+                jnl.abort(io, "the journal's superblock does not write");
                 return false;
             }
             jnl.started = true;
@@ -541,7 +556,7 @@ impl Txn<'_> {
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
             if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
-                jnl.abort("a revoke block does not write");
+                jnl.abort(io, "a revoke block does not write");
                 return false;
             }
             pos = jnl.next(pos);
@@ -570,20 +585,20 @@ impl Txn<'_> {
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
             if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
-                jnl.abort("a descriptor block does not write");
+                jnl.abort(io, "a descriptor block does not write");
                 return false;
             }
             pos = jnl.next(pos);
             for (_, copy, _) in chunk {
                 if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, false)) {
-                    jnl.abort("a block's copy does not write to the journal");
+                    jnl.abort(io, "a block's copy does not write to the journal");
                     return false;
                 }
                 pos = jnl.next(pos);
             }
         }
         if !io.flush() {
-            jnl.abort("the device does not flush a transaction");
+            jnl.abort(io, "the device does not flush a transaction");
             return false;
         }
         header(&mut blk, jbd2::COMMIT_BLOCK);
@@ -592,7 +607,7 @@ impl Txn<'_> {
         let c = jbd2::commit_csum(jnl.seed, &blk).unwrap_or(0);
         set_be32(&mut blk, jbd2::H_CHKSUM, c);
         if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, true)) {
-            jnl.abort("a commit block does not write");
+            jnl.abort(io, "a commit block does not write");
             return false;
         }
         pos = jnl.next(pos);

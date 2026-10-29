@@ -122,7 +122,14 @@ pub(super) fn orphans(r: &mut Input, tree: &Node, bs: u64, budget: &mut u64, lin
     all.retain(|(p, len)| *len > 0 && !links.iter().any(|(l, t)| l == p || t == p));
     for _ in 0..r.range(1, 4) {
         if all.is_empty() || r.bool() {
-            out.push(Orphan::Deleted(content(r, bs, budget)));
+            /* Now and then one with no extents, as Linux leaves a fifo, a
+             * socket or a symlink still open when its last name went. */
+            if one_in(r, 3) {
+                out.push(Orphan::Special(r.pick(&img::SPECIAL_MODES)));
+                reached("ext4: an orphan with no extents");
+            } else {
+                out.push(Orphan::Deleted(content(r, bs, budget)));
+            }
             continue;
         }
         let (path, len) = all.swap_remove(r.below(all.len() as u64) as usize);
@@ -256,6 +263,13 @@ pub fn dump(tag: &str, made: &img::Made, tree: &Node, bytes: u64) {
 /// FS_FUZZ_IMAGE names it, and what the check found is printed. Without it
 /// there is nothing to do; the input is not used.
 pub fn ext4judge(_r: &mut Input) {
+    /* The fuzzer's own work, every byte of it -- an image read whole, the
+     * judge's maps of it -- none of it the kernel's code to be held to the
+     * kernel heap's size. */
+    crate::machine::sched::harness(judge_image);
+}
+
+fn judge_image() {
     let Some(path) = std::env::var_os("FS_FUZZ_IMAGE") else { return };
     let Ok(bytes) = std::fs::read(&path) else {
         println!("verdict unreadable");

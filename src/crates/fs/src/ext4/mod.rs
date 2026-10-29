@@ -65,6 +65,14 @@ use source::{Reader, Source};
 
 const ROOT_INO: u32 = 2;
 
+/// The first inode a file may have is never below this (`EXT4_GOOD_OLD_FIRST_INO`):
+/// those under it are the filesystem's own -- the journal's among them.
+const FIRST_INO_MIN: u32 = 11;
+
+/// The largest descriptor the kernel takes (`EXT4_MAX_DESC_SIZE`): what a
+/// mount holds of the descriptors grows with it, a block of them at a time.
+const DESC_SIZE_MAX: u64 = 1024;
+
 /// The superblock's error fields -- the count and the first and last
 /// errors -- which a replay must not take back to what the journal's copy
 /// had (`EXT4_S_ERR_START`, `EXT4_S_ERR_LEN`).
@@ -187,6 +195,10 @@ impl Ext4 {
             "inode tables that do not fill their blocks"
         } else if sb.is_64bit() && sb.desc_size() < DESC_SIZE_64 {
             "64bit with descriptors under 64 bytes"
+        } else if sb.desc_size() > DESC_SIZE_MAX {
+            "descriptors of more than 1024 bytes"
+        } else if sb.first_ino() < FIRST_INO_MIN {
+            "a first inode files may have below 11"
         } else if u64::from(sb.first_data_block()) != (bs == 1024) as u64 {
             "a first data block that is not the block size's"
         } else if csum && !sb.checksum_ok() {
@@ -210,7 +222,12 @@ impl Ext4 {
             return false;
         }
         for k in 0..gdt_blocks {
-            let mut blk = vec![0u8; bs];
+            let mut blk = Vec::new();
+            if blk.try_reserve_exact(bs).is_err() {
+                trace!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
+                return false;
+            }
+            blk.resize(bs, 0);
             if !source::read_block(&mut self.io, &mut self.cache, &self.overlay, m.gdt_first() + k as u64, &mut blk,
                 false) {
                 return false;
@@ -219,6 +236,10 @@ impl Ext4 {
         }
         m.gdt = gdt;
         let table_blocks = m.table_blocks();
+        /* Past the superblock, the descriptors and the blocks kept for them
+         * to grow into -- group 0's copy, the one this writes: a bitmap there
+         * would be written over the descriptors, and they over it. */
+        let base = m.first_data + m.base_meta(0);
         for g in 0..m.groups {
             let Some(d) = m.desc(g) else { return false };
             if let Some(c) = group::desc_csum(&m.sb, g as u32, d.raw()) {
@@ -227,9 +248,10 @@ impl Ext4 {
                     return false;
                 }
             }
-            let inside = |b: u64, n: u64| b > m.first_data && b.checked_add(n).is_some_and(|e| e <= m.blocks);
+            let inside = |b: u64, n: u64| b >= base && b.checked_add(n).is_some_and(|e| e <= m.blocks);
             if !inside(d.block_bitmap(), 1) || !inside(d.inode_bitmap(), 1) || !inside(d.inode_table(), table_blocks) {
-                trace!(0, "ext4: refused: group {}'s bitmaps or table outside the filesystem", g);
+                trace!(0, "ext4: refused: group {}'s bitmaps or table outside the filesystem, or on its superblock \
+                           and descriptors", g);
                 return false;
             }
         }
@@ -279,6 +301,15 @@ impl Ext4 {
                 return None;
             }
         };
+        /* Read through, it is what the mount reads by: held to all the
+         * device's is held to. */
+        if !self.check_super(&newer, true) {
+            return None;
+        }
+        if let Support::Refused(why) = features::classify(&newer) {
+            trace!(0, "ext4: refused: the journal's superblock: {}", why);
+            return None;
+        }
         let mut m = Meta::new(&newer);
         self.read_descriptors(&mut m).then_some(m)
     }
@@ -322,7 +353,7 @@ impl Ext4 {
          * log's start moves past a copy only once its home is on the
          * medium. Used to find the journal and nothing more: a replay must
          * write a sound one home, or a read through it find one. */
-        let torn = !sb.checksum_ok() && sb.compat() & features::compat::HAS_JOURNAL != 0;
+        let mut torn = !sb.checksum_ok() && sb.compat() & features::compat::HAS_JOURNAL != 0;
         if torn {
             trace!(0, "ext4: the superblock fails its checksum: the journal's copy of it is wanted");
         }
@@ -398,6 +429,26 @@ impl Ext4 {
                             return None;
                         };
                         self.m = Some(m);
+                        /* The superblock the replay wrote home is sound: a
+                         * read-only mount from here on reads it, with no copy
+                         * in a journal now empty. */
+                        torn = false;
+                        /* What the replay left says how the filesystem is,
+                         * as the device's said before it: errors, or not
+                         * valid, and it is only read. */
+                        let state = newer.state();
+                        let why = if state & STATE_ERROR != 0 {
+                            Some("the replayed filesystem says it has errors (e2fsck it)")
+                        } else if state & STATE_VALID == 0 {
+                            Some("the replayed filesystem is not marked valid (e2fsck it)")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = why {
+                            ro_why = Some(String::from(why));
+                            self.jnl = None;
+                            self.io.writable = false;
+                        }
                     } else if torn {
                         trace!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy \
                                    of it");
@@ -436,7 +487,20 @@ impl Ext4 {
                 };
                 self.m = Some(m);
             }
-        } else {
+        }
+        /* The root, read before anything is written: a filesystem whose
+         * root does not read is refused as it was found -- no superblock
+         * written, no orphan released. */
+        let Some(raw) = self.inode(ROOT_INO) else {
+            self.reset();
+            return None;
+        };
+        if Inode::new(&raw).is_none_or(|i| !i.is_dir()) {
+            trace!(0, "ext4: refused: the root is not a directory");
+            self.reset();
+            return None;
+        }
+        if ro_why.is_none() {
             let now = wall_clock_secs() as u32;
             let Some(m) = self.m.as_mut() else { return None };
             if !m.build_system_zone(&journal_map) {
@@ -465,7 +529,7 @@ impl Ext4 {
                      * written, the list as the last commit left it. */
                     trace!(0, "ext4: read-only: {}", why);
                     if let Some(j) = self.jnl.as_mut() {
-                        j.abort(&why);
+                        j.abort(&mut self.io, &why);
                     }
                     ro_why = Some(why);
                 }
@@ -479,15 +543,6 @@ impl Ext4 {
             if let Some(m) = self.m.as_mut() {
                 m.count_free_blocks();
             }
-        }
-        let Some(raw) = self.inode(ROOT_INO) else {
-            self.reset();
-            return None;
-        };
-        if Inode::new(&raw).is_none_or(|i| !i.is_dir()) {
-            trace!(0, "ext4: refused: the root is not a directory");
-            self.reset();
-            return None;
         }
         self.root = self.new_vnode(None, b"", Kind::Dir, ROOT_INO, 0);
         if self.root.is_none() {
@@ -532,7 +587,7 @@ impl Ext4 {
                         }
                     }
                     m.sb.set_free_blocks_count(blocks);
-                    m.sb.set_free_inodes_count(inodes as u32);
+                    m.sb.set_free_inodes_count(u32::try_from(inodes).unwrap_or(u32::MAX).min(m.sb.inodes_count()));
                     let incompat_now = m.sb.incompat() & !incompat::RECOVER;
                     m.sb.set_incompat(incompat_now);
                     m.sb.set_wtime(wall_clock_secs() as u32);
@@ -562,7 +617,7 @@ impl Ext4 {
             return true;
         }
         if let Some(j) = self.jnl.as_mut() {
-            j.abort("the device does not flush");
+            j.abort(&mut self.io, "the device does not flush");
         }
         false
     }
@@ -688,10 +743,19 @@ impl Ext4 {
 
     /// A vnode for one entry, if it names a file or a directory: Some(true)
     /// when one is made, Some(false) when the entry is left out -- one that
-    /// names something else, or an inode that does not read (said) -- and
-    /// None when there is no memory for it.
+    /// names something else, or an inode that does not read, or one no
+    /// entry may name: the filesystem's own (the journal's, say, whose
+    /// blocks a write to it would go over), one deleted, a file bigger than
+    /// a file here can be (each said) -- and None when there is no memory
+    /// for it.
     fn adopt(&mut self, dir: NodeId, name: &[u8], ino: u32, file_type: u8) -> Option<bool> {
         if file_type != dir::FT_REG_FILE && file_type != dir::FT_DIR && file_type != dir::FT_UNKNOWN {
+            return Some(false);
+        }
+        let first_ino = self.m.as_ref().map_or(FIRST_INO_MIN, |m| m.first_ino);
+        if ino != ROOT_INO && ino < first_ino {
+            trace!(0, "ext4: an entry of directory {} names inode {}, one of the filesystem's own: skipped",
+                self.tree[dir].ino, ino);
             return Some(false);
         }
         let Some(raw) = self.inode(ino) else {
@@ -705,6 +769,16 @@ impl Ext4 {
             S_IFREG => Kind::File,
             _ => return Some(false),
         };
+        if node.links_count() == 0 {
+            trace!(0, "ext4: an entry of directory {} names inode {}, which is deleted: skipped",
+                self.tree[dir].ino, ino);
+            return Some(false);
+        }
+        if kind == Kind::File && node.size(self.largedir()) > self.max_size() {
+            trace!(0, "ext4: an entry of directory {} names inode {}, of {} bytes, more than a file here can be: \
+                       skipped", self.tree[dir].ino, ino, node.size(self.largedir()));
+            return Some(false);
+        }
         if kind == Kind::Dir {
             /* An entry leading back up the tree is a cycle in the image. */
             let mut up = Some(dir);
@@ -936,6 +1010,12 @@ impl FileSystem for Ext4 {
 
     fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
         Ext4::punch(self, file, first, count)
+    }
+
+    fn links(&mut self, file: NodeId) -> Option<u32> {
+        let ino = self.file_ino(file)?;
+        let raw = self.inode(ino)?;
+        Inode::new(&raw).map(|i| u32::from(i.links_count()))
     }
 }
 

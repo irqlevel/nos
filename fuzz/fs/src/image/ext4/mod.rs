@@ -21,7 +21,7 @@ pub mod mkfs;
 pub mod replay;
 
 pub use check::check;
-pub use mkfs::{mkfs, Made, Orphan, Style, FILLER};
+pub use mkfs::{mkfs, Made, Orphan, Style, FILLER, SPECIAL_MODES};
 
 pub use super::ext2::{rd16, rd32, wr16, wr32};
 

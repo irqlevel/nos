@@ -139,13 +139,44 @@ impl Txn<'_> {
         Some(data)
     }
 
+    /// Whether node `n` of inode `ino`'s tree holds what a node may, as the
+    /// kernel holds every node it reads to (`ext4_valid_extent_entries`): a
+    /// leaf's extents each of a block at least, inside the 2^32 a file has,
+    /// on blocks a file may own (`Meta::file_may_own`), in order and apart;
+    /// an index's keys rising. What a change of the tree, a write in place
+    /// or a cut does with an extent past these would write over metadata,
+    /// or wrap to block 0 and leave the leaf out of order.
+    fn node_sound(&self, ino: u32, n: &Node) -> bool {
+        if n.depth == 0 {
+            let mut end = 0u64;
+            for e in &n.leaves {
+                let (first, len) = (u64::from(e.first), u64::from(e.len));
+                if len == 0 || first < end || first + len > 1 << 32 || !self.m.file_may_own(e.start, len) {
+                    trace!(0, "ext4: inode {} has an extent of file blocks {}..+{} on {}, which no file may hold",
+                           ino, e.first, e.len, e.start);
+                    return false;
+                }
+                end = first + len;
+            }
+        } else if n.index.windows(2).any(|w| w[1].first <= w[0].first) {
+            trace!(0, "ext4: inode {} has an index node whose keys do not rise", ino);
+            return false;
+        }
+        true
+    }
+
     /// The path to the leaf that maps -- or would map -- file block `l` of
-    /// inode `ino` (`raw`), which must be mapped by extents.
+    /// inode `ino` (`raw`), which must be mapped by extents: every node on
+    /// it held to what a node may hold (`node_sound`) -- but those this
+    /// transaction made or changed, which are its own.
     fn path_to(&mut self, ino: u32, iseed: u32, raw: &[u8], l: u32) -> Option<Path> {
         let Some(root) = Node::parse(None, &raw[xinode::I_BLOCK..xinode::I_BLOCK + ROOT_BYTES]) else {
             trace!(0, "ext4: inode {}'s extent root is damaged", ino);
             return None;
         };
+        if !self.node_sound(ino, &root) {
+            return None;
+        }
         let mut path = Path { nodes: vec![root], taken: Vec::new(), limit: u64::MAX };
         loop {
             let n = path.nodes.last()?;
@@ -161,8 +192,12 @@ impl Txn<'_> {
                 path.limit = path.limit.min(u64::from(next.first));
             }
             let (child, depth) = (n.index[k].child, n.depth - 1);
+            let made = self.dirty.contains_key(&child);
             let bytes = self.node(ino, iseed, child, depth)?;
             let node = Node::parse(Some(child), &bytes)?;
+            if !made && !self.node_sound(ino, &node) {
+                return None;
+            }
             path.taken.push(k);
             path.nodes.push(node);
         }
@@ -477,8 +512,13 @@ impl Txn<'_> {
     pub fn file_blocks(&mut self, ino: u32, raw: &[u8]) -> Option<(Vec<(u64, u64)>, Vec<u64>)> {
         let node = Inode::new(raw)?;
         if node.flags() & EXTENTS_FL == 0 {
-            trace!(0, "ext4: inode {} is mapped by blocks, which this does not free", ino);
-            return None;
+            if inode::holds_blocks(self.m, raw) {
+                trace!(0, "ext4: inode {} is mapped by blocks, which this does not free", ino);
+                return None;
+            }
+            /* Nothing mapped: a device node, a fifo, a socket, a fast
+             * symlink -- i_block is no map. */
+            return Some((Vec::new(), Vec::new()));
         }
         let iseed = xinode::seed(self.m.seed, ino, node.generation());
         let root = node.i_block()[..ROOT_BYTES].to_vec();
@@ -486,17 +526,28 @@ impl Txn<'_> {
             trace!(0, "ext4: inode {}'s extent root is damaged", ino);
             return None;
         };
-        let (mut runs, mut tree) = (Vec::new(), Vec::new());
+        /* What the tree holds can be anything a disk says: every list grows
+         * by what the heap gives, and a tree too big for it is refused --
+         * though by the time a file's inode is freed its extents have gone
+         * back a bounded share at a time (`ext_unmap_tail`), and its tree is
+         * empty. */
+        let (mut runs, mut tree): (Vec<(u64, u64)>, Vec<u64>) = (Vec::new(), Vec::new());
         let mut seen = BTreeSet::new();
         let mut stack: Vec<(Vec<u8>, u16)> = vec![(root, h.depth)];
+        let no_room = |what: &str| {
+            trace!(0, "ext4: inode {}'s tree holds more {} than there is memory for", ino, what);
+        };
         while let Some((n, depth)) = stack.pop() {
             let h = extent::header(&n).ok()?;
             for i in 0..usize::from(h.entries) {
                 if depth == 0 {
                     let e = extent::leaf(&n, i);
-                    if e.len == 0 || e.start < self.m.first_data
-                        || e.start.checked_add(u64::from(e.len)).is_none_or(|end| end > self.m.blocks) {
-                        trace!(0, "ext4: inode {} maps blocks {}..+{}, outside the filesystem", ino, e.start, e.len);
+                    if !self.m.file_may_own(e.start, u64::from(e.len)) {
+                        trace!(0, "ext4: inode {} maps blocks {}..+{}, which no file may hold", ino, e.start, e.len);
+                        return None;
+                    }
+                    if runs.try_reserve(1).is_err() {
+                        no_room("extents");
                         return None;
                     }
                     runs.push((e.start, u64::from(e.len)));
@@ -507,6 +558,10 @@ impl Txn<'_> {
                         return None;
                     }
                     let child = self.node(ino, iseed, x.child, depth - 1)?;
+                    if tree.try_reserve(1).is_err() || stack.try_reserve(1).is_err() {
+                        no_room("nodes");
+                        return None;
+                    }
                     tree.push(x.child);
                     stack.push((child, depth - 1));
                 }

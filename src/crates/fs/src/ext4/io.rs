@@ -24,7 +24,9 @@ pub(super) struct Io {
     pub bs: usize,
     pub sector_size: usize,
     pub blocks: u64,
-    /// Set by a mount for writing, and only then.
+    /// Set by a mount for writing, and only then; cleared for good when its
+    /// journal aborts (`Journal::abort`), so that nothing more reaches the
+    /// device whoever asks.
     pub writable: bool,
     pub scratch: DmaBuffer,
     /// A file's data on its way to or from the device, a block a page.
@@ -83,7 +85,8 @@ impl Io {
     /// this returns, else in the device's cache.
     pub fn write(&mut self, block: u64, data: &[u8], fua: bool) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a write of block {} to a filesystem not mounted for writing: refused", block);
+            trace!(0, "ext4: a write of block {} to a filesystem not mounted for writing, or whose journal is \
+                       aborted: refused", block);
             return false;
         }
         if block >= self.blocks || data.len() < self.bs {
@@ -103,7 +106,8 @@ impl Io {
     /// Everything written so far onto the medium.
     pub fn flush(&mut self) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a flush of a filesystem not mounted for writing: refused");
+            trace!(0, "ext4: a flush of a filesystem not mounted for writing, or whose journal is aborted: \
+                       refused");
             return false;
         }
         if self.dev.flush().is_err() {
@@ -172,7 +176,8 @@ impl Io {
     /// returns. False on a failure, by when some may be written.
     pub fn write_batch(&mut self, blocks: &[(usize, u64)]) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a write of {} blocks to a filesystem not mounted for writing: refused", blocks.len());
+            trace!(0, "ext4: a write of {} blocks to a filesystem not mounted for writing, or whose journal is \
+                       aborted: refused", blocks.len());
             return false;
         }
         if !self.pieces_of(blocks) {

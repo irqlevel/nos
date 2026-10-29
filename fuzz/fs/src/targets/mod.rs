@@ -7,6 +7,7 @@ mod ext2;
 mod ext2bad;
 mod ext4;
 mod ext4rw;
+mod ext4sys;
 mod find;
 mod fsops;
 mod nanofs;
@@ -47,6 +48,7 @@ pub static ALL: &[Target] = &[
     Target { name: "ext4", run: audited!(ext4::ext4), max_len: 8192, gate: 3000 },
     Target { name: "ext4bad", run: audited!(ext4::ext4bad), max_len: 2048, gate: 6000 },
     Target { name: "ext4rw", run: audited!(ext4rw::ext4rw), max_len: 8192, gate: 3000 },
+    Target { name: "ext4sys", run: audited!(ext4sys::ext4sys), max_len: 256, gate: 300 },
     Target { name: "ext4judge", run: audited!(ext4::ext4judge), max_len: 16, gate: 1 },
     Target { name: "nanofs", run: audited!(nanofs::nanofs), max_len: 8192, gate: 2000 },
     Target { name: "nanofsbad", run: audited!(nanofs::nanofsbad), max_len: 2048, gate: 5000 },

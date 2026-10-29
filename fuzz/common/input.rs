@@ -102,7 +102,7 @@ impl<'a> Input<'a> {
 /// payload drawn from the input a byte at a time would take most of it.
 pub fn noise(seed: u32, n: usize) -> Vec<u8> {
     let mut x = u64::from(seed) | 1 << 40;
-    let mut v = Vec::with_capacity(n + 8);
+    let mut v = crate::common::machine::sched::harness(|| Vec::with_capacity(n + 8));
     while v.len() < n {
         x ^= x << 13;
         x ^= x >> 7;
