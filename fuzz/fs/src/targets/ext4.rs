@@ -323,7 +323,7 @@ pub fn ext4mkfs(r: &mut Input) {
 /// The judge's mkfs and its check, agreeing -- or every verdict it gives is
 /// worth nothing: the image clean, its journal replayed if it holds
 /// anything, and the tree mkfs was given, lost+found beside it.
-pub(super) fn agree(g: &Geometry, st: &Style, made: &img::Made, tree: &Node) {
+pub(super) fn agree(g: &Geometry, st: &Style, made: &img::Made, tree: &Node) -> img::check::Check {
     let c = img::check(&made.media, g.blocks * g.block_size());
     invariant!(c.corrupt.is_empty() && c.unclean.is_empty(), "the judge's mkfs made an image its check faults ({:?}, \
                {:?}): {:?}, {:?}", g, st, c.corrupt, c.unclean);
@@ -335,6 +335,15 @@ pub(super) fn agree(g: &Geometry, st: &Style, made: &img::Made, tree: &Node) {
     want.children_mut().expect("a directory").insert(b"lost+found".to_vec(), Node::dir());
     invariant!(c.tree.as_ref() == Some(&want), "the judge's check reads another tree than its mkfs made: {:?}",
                c.tree.as_ref().and_then(|t| want.diff(t)));
+    c
+}
+
+/// What ext4's `space` should say of an image the check has `c` of: its
+/// blocks past the first data block, and those nothing owns but the few the
+/// driver keeps for a punch.
+pub(super) fn space_of(c: &img::check::Check, bs: u64) -> fs::vfs::Space {
+    let free = c.free_bytes.saturating_sub(fs::ext4::RESERVE * bs).min(c.data_bytes);
+    fs::vfs::Space { total_bytes: c.data_bytes, free_bytes: free }
 }
 
 /// ext4 mounted read-only on images the fuzzer's mkfs made: a journal
@@ -359,7 +368,7 @@ pub fn ext4(r: &mut Input) {
     st.orphans = planted;
     let Ok(made) = img::mkfs(&g, &tree, &st, MKFS_TIME, r.u64()) else { return };
     let tree = tree_seen;
-    agree(&g, &st, &made, &tree);
+    let judged = agree(&g, &st, &made, &tree);
     let sizes: Vec<u64> = [512, 1024, 2048, 4096].into_iter().filter(|s| *s <= bs).collect();
     let ss = r.pick(&sizes);
     let sectors = g.blocks * bs / ss + r.below(8);
@@ -376,6 +385,13 @@ pub fn ext4(r: &mut Input) {
     let mut want = tree;
     want.children_mut().expect("a directory").insert(b"lost+found".to_vec(), Node::dir());
     let vfs = fs::vfs_instance().expect("the VFS");
+    /* What it says it has room for: the groups' counts as mkfs left them --
+     * through the journal, where it holds newer ones -- which the check
+     * reads from what owns each block. */
+    let space = vfs.space_of(b"/");
+    invariant!(space == Some(space_of(&judged, bs)), "ext4 mounted read-only says it has {:?}, and the image {:?}",
+               space, space_of(&judged, bs));
+    reached("ext4's space, read-only, held to what owns each block");
     let mut f = Fs::new(vfs, Model::new(want, true, Limits::fixed(1 << 44, usize::MAX)), true);
     let mut ops = 0;
     while r.more() && ops < 120 {

@@ -51,7 +51,7 @@ use kcore::dma::DmaBuffer;
 use kcore::time::wall_clock_secs;
 use kcore::trace;
 
-use crate::vfs::FileSystem;
+use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 use cache::Cache;
@@ -472,6 +472,14 @@ impl Ext4 {
             }
         }
         self.read_only = ro_why.is_some();
+        if self.read_only {
+            /* What `space` says of a filesystem only read: the groups'
+             * counts as the mount read them -- through the journal, where
+             * it holds newer ones. */
+            if let Some(m) = self.m.as_mut() {
+                m.count_free_blocks();
+            }
+        }
         let Some(raw) = self.inode(ROOT_INO) else {
             self.reset();
             return None;
@@ -907,6 +915,17 @@ impl FileSystem for Ext4 {
 
     /// The filesystem's blocks, read off the VFS's lock by an image -- but
     /// not while a journal holds newer copies the device does not.
+    /// The blocks past the first data block, and of them those the groups
+    /// count free -- as the last commit left them -- but the few kept for a
+    /// punch (`RESERVE`), which no file's data is given.
+    fn space(&self) -> Option<Space> {
+        let m = self.m.as_ref().filter(|_| self.mounted)?;
+        let bs = m.bs as u64;
+        let data = m.blocks.saturating_sub(m.first_data);
+        let free = m.free_blocks.saturating_sub(RESERVE).min(data);
+        Some(Space { total_bytes: data * bs, free_bytes: free * bs })
+    }
+
     fn data_block_size(&self) -> usize {
         if self.mounted && self.overlay.is_empty() { self.io.bs } else { 0 }
     }

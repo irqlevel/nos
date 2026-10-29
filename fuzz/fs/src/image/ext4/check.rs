@@ -36,6 +36,12 @@ pub struct Check {
     /// nobody's, or a regular file's data. Empty when the image is too
     /// damaged to say.
     pub no_metadata: Vec<bool>,
+    /// The blocks past the first data block, and those of them nothing
+    /// owns, as the groups should count them before any orphan is released
+    /// -- in bytes, what a driver's `space` starts from: 0 where the check
+    /// stopped before its last pass.
+    pub data_bytes: u64,
+    pub free_bytes: u64,
 }
 
 impl Check {
@@ -707,6 +713,7 @@ pub fn check(media: &Media, dev_bytes: u64) -> Check {
             c.unclean(format!("block {} is marked in use and is nobody's", b));
         }
     }
+    let mut free_total = 0u64;
     for g in 0..groups {
         let d = fs.desc(g).to_vec();
         let start = first + g * bpg as u64;
@@ -715,6 +722,7 @@ pub fn check(media: &Media, dev_bytes: u64) -> Check {
          * e2fsck puts right as it releases them, it says nothing of. */
         let free_b = (start..start + len)
             .filter(|&b| fs.owner[b as usize] == Owner::Free && !freed.contains(&b)).count() as u32;
+        free_total += u64::from(free_b);
         let free_i = (0..ipg).filter(|&k| {
             let n = (g * ipg as u64 + k as u64 + 1) as u32;
             !in_use.contains_key(&n) && !deleted.contains(&n) && !(n < FIRST_INO && inode_bit[n as usize - 1])
@@ -736,6 +744,8 @@ pub fn check(media: &Media, dev_bytes: u64) -> Check {
             c.unclean(format!("group {} counts {} directories, has {}", g, fs.wide16(&d, gd::USED_DIRS, gd::USED_DIRS_HI), dirs_g));
         }
     }
+    c.data_bytes = (blocks - first) * fs.bs;
+    c.free_bytes = free_total * fs.bs;
     c.no_metadata = (0..blocks).map(|b| b >= first && fs.owner[b as usize] == Owner::Free).collect();
     for (&n, u) in &in_use {
         if n >= FIRST_INO && u.mode & S_IFMT == S_IFREG {
