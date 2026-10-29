@@ -555,6 +555,33 @@ pub unsafe extern "C" fn kernel_dir_create(path: *const u8, path_len: usize) -> 
     }
 }
 
+/// The space of the filesystem `path` is on (`Vfs::space_of`), whether the
+/// path is there yet or not: the bytes a file's data may take into
+/// `out[0]`, and those of them free into `out[1]` -- 0, or -1 for a path no
+/// mount holds, or a filesystem that does not say.
+///
+/// # Safety
+/// `path` points at `path_len` bytes; `out` takes two `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_fs_space(path: *const u8, path_len: usize, out: *mut u64) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return -1;
+    }
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    match vfs.space_of(path.as_bytes()) {
+        Some(space) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(out, 2) };
+            out[0] = space.total_bytes;
+            out[1] = space.free_bytes;
+            0
+        }
+        None => -1,
+    }
+}
+
 /// What `kernel_dir_entry` says an entry is.
 pub const ENTRY_FILE: u32 = 1;
 pub const ENTRY_DIR: u32 = 2;

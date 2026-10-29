@@ -1,0 +1,37 @@
+{
+  "name": "nos-panel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "nos's management panel: the appliance VM that manages a nos host -- or a cluster of them -- through each host's API, in English and Russian.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "mock": "node mock/server.mjs",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "5.3.0",
+    "@fontsource-variable/jetbrains-mono": "5.3.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
+    "next": "16.4.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "uplot": "1.6.32"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3"
+  }
+}

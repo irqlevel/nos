@@ -20,6 +20,15 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: ./scripts/build-disk.sh
 
+      # The management panel's bundle (docs/api.md): Node, Caddy and the
+      # panel, which `api panel create` has the panel's VM install -- built
+      # before the system image, which says where the release has it and its
+      # SHA-256 (/lib/panel/bundle).
+      - name: Build the panel's bundle
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: python3 scripts/panel-bundle.py --version "$VERSION" --out dist-panel
+
       # The system image a server's partition is poured from (docs/install.md):
       # the kernel and modules the step above built, in the builder image it
       # left, with the same VERSION and commit -- so nothing is rebuilt and the
@@ -27,10 +36,12 @@ jobs:
       - name: Build the system image
         env:
           VERSION: ${{ github.ref_name }}
+          PANEL_BUNDLE: dist-panel/nos-panel-${{ github.ref_name }}.tar.gz
+          PANEL_BUNDLE_URL: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos-panel-${{ github.ref_name }}.tar.gz
         run: |
           # GIT_DESC as build-disk.sh worked it out: a checkout has no
           # changes, so the commit alone
-          docker run --platform linux/amd64 --rm -e VERSION \
+          docker run --platform linux/amd64 --rm -e VERSION -e PANEL_BUNDLE -e PANEL_BUNDLE_URL \
             -e GIT_DESC="$(git rev-parse --short HEAD)" \
             -v "$PWD:/src" -w /src nos-builder make image
 
@@ -41,6 +52,7 @@ jobs:
           cp nos.iso          dist/nos.iso
           cp nos.qcow2        dist/nos.qcow2
           cp nos-x86_64.squashfs dist/nos-x86_64.squashfs
+          cp dist-panel/nos-panel-*.tar.gz dist/
           # Every module the Makefile builds, named for the kernel it loads
           # into: blkload.ko goes up as blkload-x86_64.ko. No match leaves
           # the pattern itself, and cp fails the step on it.
@@ -152,6 +164,15 @@ jobs:
             /mnt/nos-install install /dev/nvme0n1p4 --ssh-key ~/.ssh/id_ed25519.pub --reboot
             ```
 
+            ### The management panel
+
+            `nos-panel-${{ github.ref_name }}.tar.gz`: the panel, Node and Caddy,
+            which `api panel create` has the panel's VM download and install --
+            the system image above names it and its SHA-256 in
+            `/lib/panel/bundle`. `nos-install --panel` makes root's password and
+            has `/etc/rc` make the panel at nos's first boot
+            ([docs/api.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/api.md)).
+
             ### Kernel modules
 
             Every loadable module in the tree, built with the kernels above:
@@ -175,5 +196,6 @@ jobs:
             dist/nos.iso
             dist/nos.qcow2
             dist/nos-x86_64.squashfs
+            dist/nos-panel-*.tar.gz
             dist/*.ko
             dist/SHA256SUMS

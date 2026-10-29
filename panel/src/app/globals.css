@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+/* With JavaScript the theme script always leaves .dark or .light on <html>. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Colours are variables, so a component names what a colour is for (bg, fg,
+ * muted, line, accent) and the theme decides what it is. The theme is a class
+ * on <html> that a small script in <head> sets before the first paint, from
+ * the visitor's choice or else the system's; without JavaScript the media
+ * query below still follows the system.
+ */
+:root {
+    --bg: #fbfaf7;
+    --bg-soft: #f3f1ea;
+    --card: #ffffff;
+    --fg: #16171b;
+    --fg-soft: #33363e;
+    --muted: #5f6571;
+    --line: #e3e0d6;
+    --line-strong: #cfcbbf;
+    --accent: #a14a06;
+    --accent-strong: #7c3a05;
+    --accent-soft: #fbf0dd;
+    --code-bg: #f4f2ec;
+    --ok: #15803d;
+    --info: #1d4ed8;
+    color-scheme: light;
+}
+
+:root.dark {
+    --bg: #0d0e11;
+    --bg-soft: #13151a;
+    --card: #15171c;
+    --fg: #ebe9e4;
+    --fg-soft: #c8c6c0;
+    --muted: #9a9fa9;
+    --line: #262930;
+    --line-strong: #363a44;
+    --accent: #f2a93b;
+    --accent-strong: #ffc46e;
+    --accent-soft: #2a1e0c;
+    --code-bg: #111318;
+    --ok: #4ade80;
+    --info: #7cb3ff;
+    color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+        --bg: #0d0e11;
+        --bg-soft: #13151a;
+        --card: #15171c;
+        --fg: #ebe9e4;
+        --fg-soft: #c8c6c0;
+        --muted: #9a9fa9;
+        --line: #262930;
+        --line-strong: #363a44;
+        --accent: #f2a93b;
+        --accent-strong: #ffc46e;
+        --accent-soft: #2a1e0c;
+        --code-bg: #111318;
+        --ok: #4ade80;
+        --info: #7cb3ff;
+        color-scheme: dark;
+    }
+}
+
+@theme inline {
+    --color-bg: var(--bg);
+    --color-bg-soft: var(--bg-soft);
+    --color-card: var(--card);
+    --color-fg: var(--fg);
+    --color-fg-soft: var(--fg-soft);
+    --color-muted: var(--muted);
+    --color-line: var(--line);
+    --color-line-strong: var(--line-strong);
+    --color-accent: var(--accent);
+    --color-accent-strong: var(--accent-strong);
+    --color-accent-soft: var(--accent-soft);
+    --color-ok: var(--ok);
+    --color-info: var(--info);
+    --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+    scroll-padding-top: 5rem;
+}
+
+body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+}
+
+::selection {
+    background: var(--accent-soft);
+    color: var(--fg);
+}
+
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+.skip-link {
+    position: absolute;
+    left: 1rem;
+    top: -3rem;
+    z-index: 100;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 600;
+}
+
+.skip-link:focus {
+    top: 0.75rem;
+}
+
+/* The status a value is in: ok, a warning, an error. */
+:root {
+    --warn: #b45309;
+    --bad: #b91c1c;
+}
+
+:root.dark {
+    --warn: #fbbf24;
+    --bad: #f87171;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+        --warn: #fbbf24;
+        --bad: #f87171;
+    }
+}
+
+@theme inline {
+    --color-warn: var(--warn);
+    --color-bad: var(--bad);
+}
+
+/* A VM's console: dark in both themes, as a serial console is. */
+.terminal {
+    background: #0b0c0f;
+    border: 1px solid #23262d;
+    border-radius: 8px;
+    padding: 6px;
+}
+
+/* uPlot's own, in the theme's colours. */
+.uplot,
+.uplot * {
+    font-family: var(--font-sans);
+    color: var(--muted);
+}

@@ -26,6 +26,11 @@ bool test_idle_takes_turns();
    by their weights -- on a CPU other than the BSP's, from the BSP */
 bool test_eevdf();
 
+/* The management bus's module side: modtest's provider called, a job of it
+   stopped and waited out by the module's unload. Needs tasks: run after
+   rust_test. */
+bool test_module_bus();
+
 }
 
 }

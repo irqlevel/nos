@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "provider": "net",
+  "title": {"en": "Network", "ru": "Сеть"},
+  "help": {"en": "The network devices and what each has moved, TCP's connections, ARP and the frame pool.", "ru": "Сетевые устройства и их трафик, соединения TCP, ARP и пул кадров."},
+  "ui": {"section": "network", "order": 20, "icon": "network"},
+  "methods": {
+    "interfaces": {"kind": "read", "title": {"en": "Interfaces", "ru": "Интерфейсы"}},
+    "tcp": {"kind": "read", "title": {"en": "TCP connections", "ru": "Соединения TCP"},
+      "help": {"en": "The kernel has a fixed number of TCP slots; a closed connection keeps its slot for a minute in TIME_WAIT.", "ru": "Слотов TCP в ядре фиксированное число; закрытое соединение держит слот минуту в TIME_WAIT."}},
+    "arp": {"kind": "read", "title": {"en": "ARP cache", "ru": "Кэш ARP"}},
+    "pool": {"kind": "read", "title": {"en": "Frame pool", "ru": "Пул кадров"}}
+  },
+  "resources": {
+    "interfaces": {
+      "title": {"en": "Interfaces", "ru": "Интерфейсы"},
+      "list": "interfaces", "items": "interfaces", "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "mac": {"type": "mac", "title": {"en": "MAC", "ru": "MAC"}},
+        "ipv4": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+        "netmask": {"type": "ipv4", "title": {"en": "Netmask", "ru": "Маска"}},
+        "gateway": {"type": "ipv4", "title": {"en": "Gateway", "ru": "Шлюз"}},
+        "rx_frames": {"type": "int", "title": {"en": "Frames in", "ru": "Кадров принято"}},
+        "rx_bytes": {"type": "bytes", "title": {"en": "Received", "ru": "Принято"}},
+        "rx_dropped": {"type": "int", "title": {"en": "Dropped", "ru": "Отброшено"}},
+        "tx_frames": {"type": "int", "title": {"en": "Frames out", "ru": "Кадров отправлено"}},
+        "tx_bytes": {"type": "bytes", "title": {"en": "Sent", "ru": "Отправлено"}},
+        "tx_refused": {"type": "int", "title": {"en": "Refused", "ru": "Отказано"}}
+      },
+      "columns": ["name", "ipv4", "mac", "rx_bytes", "tx_bytes", "rx_dropped"]
+    },
+    "connections": {
+      "title": {"en": "TCP connections", "ru": "Соединения TCP"},
+      "list": "tcp", "items": "connections", "key": "slot",
+      "fields": {
+        "slot": {"type": "int", "title": {"en": "Slot", "ru": "Слот"}},
+        "state": {"type": "string", "title": {"en": "State", "ru": "Состояние"}},
+        "local_ip": {"type": "ipv4", "title": {"en": "Local address", "ru": "Локальный адрес"}},
+        "local_port": {"type": "port", "title": {"en": "Local port", "ru": "Локальный порт"}},
+        "remote_ip": {"type": "ipv4", "title": {"en": "Remote address", "ru": "Удалённый адрес"}},
+        "remote_port": {"type": "port", "title": {"en": "Remote port", "ru": "Удалённый порт"}},
+        "send_queued_bytes": {"type": "bytes", "title": {"en": "To send", "ru": "К отправке"}},
+        "in_flight_bytes": {"type": "bytes", "title": {"en": "In flight", "ru": "В пути"}},
+        "recv_queued_bytes": {"type": "bytes", "title": {"en": "To read", "ru": "К чтению"}},
+        "window_bytes": {"type": "bytes", "title": {"en": "Window", "ru": "Окно"}}
+      },
+      "columns": ["slot", "state", "local_ip", "local_port", "remote_ip", "remote_port", "in_flight_bytes"]
+    },
+    "arp": {
+      "title": {"en": "ARP cache", "ru": "Кэш ARP"},
+      "list": "arp", "items": "entries", "key": "ipv4",
+      "fields": {
+        "ipv4": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+        "mac": {"type": "mac", "title": {"en": "MAC", "ru": "MAC"}}
+      },
+      "columns": ["ipv4", "mac"]
+    }
+  },
+  "metrics": {
+    "rx_bytes": {"title": {"en": "Received", "ru": "Принято"}, "method": "interfaces", "items": "interfaces", "key": "name",
+      "field": "rx_bytes", "kind": "rate", "unit": "B"},
+    "tx_bytes": {"title": {"en": "Sent", "ru": "Отправлено"}, "method": "interfaces", "items": "interfaces", "key": "name",
+      "field": "tx_bytes", "kind": "rate", "unit": "B"},
+    "tcp_used": {"title": {"en": "TCP slots in use", "ru": "Занятые слоты TCP"}, "method": "tcp",
+      "field": "used", "kind": "gauge", "unit": "slots"}
+  }
+}

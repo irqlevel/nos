@@ -147,7 +147,36 @@ def create_script(port):
         "hv create c5 %simg.qcow2 size=1M" % url,
         "ls /vms",
         "hv vms",
-    ]
+    ] + CLONE
+
+
+# What is done to the VMs made, once they are there, and what each must
+# answer (clone_checks): c1 cloned to c6 -- its disk copied with its holes
+# left out and held to c1's by its SHA-256, its seed made anew, its vm.toml
+# c1's with a UUID of its own -- and the name taken refused; a forward added
+# through the vm provider and kept in c6's vm.toml, the file as it was kept
+# beside it, and taken out again; c6 made protected through the provider,
+# a delete refused for it and then forced; the provider's list; and c2
+# deleted keeping its disks, which stay, its folder no VM's.
+CLONE = [
+    "hv clone c1 c6",
+    "ls /vms/c6",
+    "sha256 /vms/c6/disk.raw",
+    "cat /vms/c6/vm.toml",
+    "hv clone c1 c6",
+    'mgmt call vm forward_add {"name":"c6","port":8022,"guest_port":22}',
+    "cat /vms/c6/vm.toml",
+    "ls /vms/c6",
+    'mgmt call vm forward_del {"name":"c6","port":8022}',
+    'mgmt call vm config_set {"name":"c6","text":"kernel = \\"/lib/hvboot\\"\\nnet = true\\nprotected = true\\n"}',
+    "hv delete c6",
+    'mgmt call vm get {"name":"c6"}',
+    "hv delete c6 force",
+    "mgmt call vm list",
+    "hv delete c2 keep-disks",
+    "ls /vms/c2",
+    "hv vms",
+]
 
 
 # The size hv create grows the disk to, and a raw image's.
@@ -453,6 +482,65 @@ def create_checks(out, grown, raw):
     pt.check("and those three left nothing behind",
              "c1" in out[10] and "c2" in out[10] and not any(n in out[10] for n in ("c3", "c4", "c5")), out[10])
     pt.check("hv vms lists the two made", "c1  not running" in out[11] and "c2  not running" in out[11], out[11])
+    clone_checks(out[12:], grown)
+
+
+def clone_checks(out, grown):
+    """What CLONE was answered, in order: out[0] is its first line's."""
+    import json
+
+    def answer(text):
+        """The JSON a `mgmt call` printed, or None."""
+        try:
+            return json.loads(text.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    pt.check("hv clone: c1's disk copied into c6 with its holes left out, a seed of its own made, its vm.toml written",
+             re.search(r"/vms/c6/disk\.raw: \d+ MiB written of 16 MiB, the rest holes", out[0]) is not None
+             and "/vms/c6/vm.toml written -- hv start c6 boots it, cloud-init given a seed of its own" in out[0],
+             out[0])
+    written = re.search(r"/vms/c6/disk\.raw: (\d+) MiB written of 16 MiB", out[0])
+    pt.check("and only what the disk has written: its 16 MiB are mostly a hole",
+             written is not None and int(written.group(1)) < 16, out[0])
+    pt.check("c6's folder: the disk, the seed, the user-data kept and the vm.toml",
+             all(f in out[1] for f in ("disk.raw", "seed.iso", "user-data", "vm.toml")), out[1])
+    pt.check("the disk is c1's, byte for byte (its SHA-256)", grown in out[2], out[2] + "\nwant " + grown)
+    uuid = re.search(r'uuid = "([0-9a-f-]{36})"', out[3])
+    pt.check("c6's vm.toml is c1's, with a UUID of its own",
+             all(w in out[3] for w in ('kernel = "/lib/hvboot"', "memory = 512",
+                                       'disks = ["disk.raw", "seed.iso:ro"]', "net = true"))
+             and uuid is not None, out[3])
+    pt.check("a clone to a name that has a folder is refused", "is there already -- not written over" in out[4],
+             out[4])
+    added = answer(out[5])
+    pt.check("the vm provider adds a forward to c6, which is not running: kept, not relayed",
+             added == {"kept": True, "live": False}, out[5])
+    pt.check("kept in c6's vm.toml, the rest of the file as it was",
+             'forward = ["8022:22"]' in out[6] and out[6].count("uuid = ") == 1
+             and (uuid is None or uuid.group(1) in out[6])
+             and out[6].startswith(out[3].rstrip("\n").splitlines()[0]), out[6])
+    pt.check("and the file as it was kept beside it", "vm.toml.prev" in out[7], out[7])
+    pt.check("the forward taken out again", answer(out[8]) == {"kept": True, "live": False}, out[8])
+    pt.check("a vm.toml set through the provider, protected", answer(out[9]) == {"changed": True}, out[9])
+    pt.check("a protected vm's delete refused without force",
+             "c6 is protected -- force deletes it all the same" in out[10], out[10])
+    got = answer(out[11]) or {}
+    vm = got.get("vm", {})
+    pt.check("the provider says so of it, and that it is off",
+             vm.get("protected") is True and vm.get("state") == "off" and vm.get("name") == "c6", out[11])
+    pt.check("and deleted with it", re.search(r"hv: c6 deleted -- \d+ files and folders taken away", out[12])
+             is not None, out[12])
+    listed = answer(out[13]) or {}
+    names = sorted(v.get("name") for v in listed.get("vms", []))
+    pt.check("the provider's list: c1 and c2, both off", names == ["c1", "c2"]
+             and all(v.get("state") == "off" for v in listed.get("vms", [])), out[13])
+    pt.check("c2 deleted, its disks kept", "hv: c2 deleted" in out[14] and "/vms/c2/disk.raw kept" in out[14]
+             and "/vms/c2/seed.iso kept" in out[14], out[14])
+    pt.check("its disks alone left in its folder", "disk.raw" in out[15] and "seed.iso" in out[15]
+             and "vm.toml" not in out[15] and "user-data" not in out[15], out[15])
+    pt.check("which is no vm's: hv vms lists c1 alone", "c1  not running" in out[16] and "c2" not in out[16],
+             out[16])
 
 
 def convert_checks(out, digest):

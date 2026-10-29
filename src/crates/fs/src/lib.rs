@@ -25,6 +25,7 @@ pub mod image;
 pub mod nanofs;
 pub mod paths;
 pub mod procfs;
+pub mod provider;
 pub mod rootfs;
 pub mod ramfs;
 pub mod selftest;
@@ -44,6 +45,7 @@ static VFS: OnceBox<Vfs> = OnceBox::new();
 /// `rust_init`, before the shell starts.
 pub fn init() {
     shell::register_all();
+    provider::init();
 }
 
 /// The one VFS, made on first use. That is early in boot, in task context,

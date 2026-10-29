@@ -23,6 +23,11 @@ void print_cpu_state(stdlib::Printer& out);
    model number. Defined per arch. */
 void print_cpu_info(stdlib::Printer& out);
 
+/* What the CPU is called, NUL-terminated into buf, cut to fit: x86's brand
+   string, arm64's implementer and part -- the line a report heads its CPU
+   with. Defined per arch. */
+void cpu_model(char* buf, unsigned long len);
+
 void console_write(const char *msg);
 
 /* Panic-context variant: must be usable with interrupts off and locks

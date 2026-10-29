@@ -37,6 +37,8 @@ pub mod static_ring;
 pub mod hpet;
 pub mod acpi;
 pub mod cmd;
+pub mod mgmt;
+pub mod system;
 pub mod fs;
 pub mod vnic;
 #[cfg(target_arch = "x86_64")]
