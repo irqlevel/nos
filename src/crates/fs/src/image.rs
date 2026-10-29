@@ -341,8 +341,9 @@ impl Image {
     /// in part is left as it is, as a disk may leave it. False for a range
     /// not inside the image, an image held for reading, or an I/O error. On
     /// a filesystem with no blocks of its own there is nothing to give back,
-    /// and that is done. The filesystem has its metadata written before it
-    /// is done, so a sync after it is the device's alone.
+    /// and that is done. What the filesystem changed of its own metadata is
+    /// its own to put on the medium -- a journal's commit may come later --
+    /// so the next sync is the filesystem's, as after a write through it.
     pub fn discard(&mut self, offset: u64, len: u64) -> bool {
         if !self.writable || !self.inside_len(offset, len) {
             return false;
@@ -352,6 +353,9 @@ impl Image {
         match vfs.punch(handle, offset, len) {
             Some(given) => {
                 direct.punched += given;
+                if given != 0 {
+                    direct.through_vfs = true;
+                }
                 true
             }
             None => false,
@@ -376,11 +380,17 @@ impl Image {
         self.zero(offset, end)
     }
 
-    /// Zeros written over `[from, to)`, a piece at a time.
+    /// Zeros written over `[from, to)`, a piece at a time: each piece ending
+    /// at a multiple of `ZERO_CHUNK` in the image -- which every block size
+    /// divides -- so that no block is written by two of them, and a power
+    /// cut between two leaves every sector what it held or zeros. Pieces
+    /// counted from `from` itself would split a sector between two writes
+    /// wherever `from` is not a multiple of one.
     fn zero(&mut self, from: u64, to: u64) -> bool {
+        let chunk = ZERO_CHUNK as u64;
         let mut at = from;
         while at < to {
-            let n = ((to - at) as usize).min(ZERO_CHUNK);
+            let n = (to.min((at / chunk + 1) * chunk) - at) as usize;
             if !self.write_at(at, &ZEROS[..n]) {
                 return false;
             }

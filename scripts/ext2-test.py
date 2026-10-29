@@ -12,7 +12,9 @@ truncated, renamed and removed.
 
 arm64 only, because it drives the shell over UDP and that is the boot whose
 command line carries one; the ext2 driver itself is the same code on either
-architecture, and x86 exercises it through the smoke test's `fstest=on`.
+architecture. The smoke boots' roots are ext4, as new installs' are: this
+boot's root is the one ext2 root a boot has, made by mkrootfs.sh with
+FSTYPE=ext2, its `fstest` ext2's.
 
 e2fsck is the host's, or the one in the nos-builder image when the host has
 none, as mkrootfs does. Exit code 0 = every check passed and the image is
@@ -273,7 +275,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="nos-ext2test-")
     image = os.path.join(tmp, "root.img")
     log = os.path.join(tmp, "serial.log")
-    pt.mkrootfs(image)
+    pt.mkrootfs(image, "ext2")
 
     code, out = fsck(image)
     if not pt.check("the fresh image is clean to start with", code == 0, out):

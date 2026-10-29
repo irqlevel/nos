@@ -10,11 +10,21 @@
 //! a block outside the filesystem, a descriptor or an inode outside its
 //! table, an extent tree deeper than the format allows or whose node lies
 //! about its entries, a directory entry running past its block -- each an
-//! error, never an index out of range.
+//! error, never an index out of range. The format itself -- superblock,
+//! descriptors, inodes, extent trees, block maps, directory entries -- is
+//! extfmt's, which the kernel's ext4 driver is to read it through as well; what
+//! is here is GRUB's way of using it: which features are read, a path
+//! walked, a file read whole.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+
+use extfmt::features::incompat;
+use extfmt::group::Desc;
+use extfmt::inode::{EXTENTS_FL, INLINE_DATA_FL, I_BLOCK_BYTES, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use extfmt::sb::Super;
+use extfmt::Map;
 
 /// A filesystem's bytes: `buf.len()` of them at `offset`, both whole
 /// sectors.
@@ -22,87 +32,21 @@ pub trait Source {
     fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String>;
 }
 
-const SUPERBLOCK_AT: u64 = 1024;
-const SUPERBLOCK_BYTES: usize = 1024;
-const MAGIC: u16 = 0xEF53;
+/* Incompatible features: those read, and the rest refused. What GRUB reads
+ * past -- a journal not replayed, MMP's block, ea_inode's attributes, the
+ * seed of checksums it does not check -- is read past here too. */
+const INCOMPAT_READ: u32 = incompat::FILETYPE | incompat::RECOVER | incompat::EXTENTS | incompat::BIT64
+    | incompat::MMP | incompat::FLEX_BG | incompat::EA_INODE | incompat::CSUM_SEED | incompat::LARGEDIR
+    | incompat::INLINE_DATA;
 
-/* Superblock offsets (the kernel's struct ext4_super_block). */
-const S_INODES_COUNT: usize = 0;
-const S_BLOCKS_COUNT_LO: usize = 4;
-const S_FIRST_DATA_BLOCK: usize = 20;
-const S_LOG_BLOCK_SIZE: usize = 24;
-const S_BLOCKS_PER_GROUP: usize = 32;
-const S_INODES_PER_GROUP: usize = 40;
-const S_MAGIC: usize = 56;
-const S_REV_LEVEL: usize = 76;
-const S_INODE_SIZE: usize = 88;
-const S_FEATURE_INCOMPAT: usize = 96;
-const S_UUID: usize = 104;
-const S_VOLUME_NAME: usize = 120;
-const S_DESC_SIZE: usize = 254;
-const S_BLOCKS_COUNT_HI: usize = 336;
-
-/* Incompatible features: those read, and the rest refused. */
-const INCOMPAT_FILETYPE: u32 = 0x2;
-const INCOMPAT_RECOVER: u32 = 0x4;
-const INCOMPAT_EXTENTS: u32 = 0x40;
-const INCOMPAT_64BIT: u32 = 0x80;
-const INCOMPAT_MMP: u32 = 0x100;
-const INCOMPAT_FLEX_BG: u32 = 0x200;
-const INCOMPAT_EA_INODE: u32 = 0x400;
-const INCOMPAT_CSUM_SEED: u32 = 0x2000;
-const INCOMPAT_LARGEDIR: u32 = 0x4000;
-const INCOMPAT_INLINE_DATA: u32 = 0x8000;
-const INCOMPAT_READ: u32 = INCOMPAT_FILETYPE | INCOMPAT_RECOVER | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_MMP
-    | INCOMPAT_FLEX_BG | INCOMPAT_EA_INODE | INCOMPAT_CSUM_SEED | INCOMPAT_LARGEDIR | INCOMPAT_INLINE_DATA;
-
-/* A group descriptor's inode table, low and (64-bit) high halves. */
-const BG_INODE_TABLE_LO: usize = 8;
-const BG_INODE_TABLE_HI: usize = 0x28;
-const DESC_SIZE_32: u64 = 32;
-const DESC_SIZE_64: u64 = 64;
-
-/* Inode offsets. */
-const I_MODE: usize = 0;
-const I_SIZE_LO: usize = 4;
-const I_FLAGS: usize = 32;
-const I_BLOCK: usize = 40;
-const I_BLOCK_BYTES: usize = 60;
-const I_SIZE_HIGH: usize = 108;
-const INODE_MIN: u64 = 128;
-const S_IFMT: u16 = 0xF000;
-const S_IFREG: u16 = 0x8000;
-const S_IFDIR: u16 = 0x4000;
-const S_IFLNK: u16 = 0xA000;
-const EXTENTS_FL: u32 = 0x8_0000;
-const INLINE_DATA_FL: u32 = 0x1000_0000;
 const ROOT_INO: u32 = 2;
-
-/* The extent tree: a node is a header, then entries -- an index's naming a
- * child block, a leaf's a run of blocks. */
-const EXT_MAGIC: u16 = 0xF30A;
-const EXT_HEADER: usize = 12;
-const EXT_ENTRY: usize = 12;
-const EXT_MAX_DEPTH: u16 = 5;
-/// A leaf's length above this is an uninitialized extent, which reads as
-/// zeroes, of length less this.
-const EXT_INIT_MAX_LEN: u64 = 32768;
 
 /// Block sizes read: 1, 2 and 4 KiB -- what mkfs makes on x86.
 const MAX_LOG_BLOCK_SIZE: u32 = 2;
-/// Directory entry: inode, record length, name length, type, name.
-const DIRENT_HEADER: usize = 8;
 const MAX_SYMLINKS: u32 = 8;
 const MAX_LINK_BYTES: u64 = 4096;
 /// The most blocks of a directory searched.
 const MAX_DIR_BLOCKS: u64 = 1 << 16;
-
-fn u16_at(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
-fn u32_at(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
 
 /// An inode, as read.
 #[derive(Clone, Debug)]
@@ -126,13 +70,6 @@ impl Inode {
     }
 }
 
-/// Where a file block is: a run of `run` blocks from `block`, or a hole of
-/// `run` blocks that reads as zeroes.
-enum Map {
-    Blocks { block: u64, run: u64 },
-    Hole { run: u64 },
-}
-
 pub struct Fs<S> {
     src: S,
     block_size: u64,
@@ -152,51 +89,24 @@ pub struct Fs<S> {
 impl<S: Source> Fs<S> {
     /// The filesystem on `src`, if there is one this reads.
     pub fn mount(mut src: S) -> Result<Fs<S>, String> {
-        let mut sb = [0u8; SUPERBLOCK_BYTES];
-        src.read(SUPERBLOCK_AT, &mut sb)?;
-        if u16_at(&sb, S_MAGIC) != MAGIC {
-            return Err(String::from("no ext2/3/4 superblock"));
-        }
-        let log = u32_at(&sb, S_LOG_BLOCK_SIZE);
+        let mut raw = [0u8; extfmt::sb::SIZE];
+        src.read(extfmt::sb::OFFSET, &mut raw)?;
+        /* The magic and a geometry that holds together are the format's to
+         * check; which block sizes and features are read is GRUB's. */
+        let sb = Super::parse(&raw)?;
+        let log = sb.log_block_size();
         if log > MAX_LOG_BLOCK_SIZE {
             return Err(alloc::format!("blocks of {} KiB, more than this reads", 1u64 << log.min(20)));
         }
-        let block_size = 1024u64 << log;
-        let incompat = u32_at(&sb, S_FEATURE_INCOMPAT);
+        let incompat = sb.incompat();
         if incompat & !INCOMPAT_READ != 0 {
             return Err(alloc::format!("incompatible features {:#x} this does not read", incompat & !INCOMPAT_READ));
         }
-        let wide = incompat & INCOMPAT_64BIT != 0;
-        let mut blocks = u64::from(u32_at(&sb, S_BLOCKS_COUNT_LO));
-        if wide {
-            blocks |= u64::from(u32_at(&sb, S_BLOCKS_COUNT_HI)) << 32;
-        }
-        let first_data_block = u64::from(u32_at(&sb, S_FIRST_DATA_BLOCK));
-        let blocks_per_group = u64::from(u32_at(&sb, S_BLOCKS_PER_GROUP));
-        let inodes = u32_at(&sb, S_INODES_COUNT);
-        let inodes_per_group = u32_at(&sb, S_INODES_PER_GROUP);
-        if blocks <= first_data_block || blocks_per_group == 0 || inodes == 0 || inodes_per_group == 0 {
-            return Err(String::from("a superblock with no blocks or no inodes"));
-        }
-        let groups = (blocks - first_data_block).div_ceil(blocks_per_group);
-        if groups.checked_mul(u64::from(inodes_per_group)).is_none_or(|n| n < u64::from(inodes)) {
-            return Err(String::from("a superblock whose groups hold fewer inodes than it has"));
-        }
-        let inode_size = if u32_at(&sb, S_REV_LEVEL) == 0 { INODE_MIN } else { u64::from(u16_at(&sb, S_INODE_SIZE)) };
-        if inode_size < INODE_MIN || !inode_size.is_power_of_two() || inode_size > block_size {
-            return Err(alloc::format!("inodes of {} bytes", inode_size));
-        }
-        let desc_size = if wide { u64::from(u16_at(&sb, S_DESC_SIZE)) } else { DESC_SIZE_32 };
-        if desc_size < DESC_SIZE_32 || !desc_size.is_power_of_two() || desc_size > block_size {
-            return Err(alloc::format!("group descriptors of {} bytes", desc_size));
-        }
-        let descriptors = (first_data_block + 1) * block_size;
-        let mut uuid = [0u8; 16];
-        uuid.copy_from_slice(&sb[S_UUID..S_UUID + 16]);
-        let mut label = [0u8; 16];
-        label.copy_from_slice(&sb[S_VOLUME_NAME..S_VOLUME_NAME + 16]);
-        Ok(Fs { src, block_size, blocks, inodes, inodes_per_group, groups, inode_size, desc_size, descriptors,
-                incompat, uuid, label })
+        let block_size = sb.block_size();
+        let descriptors = (u64::from(sb.first_data_block()) + 1) * block_size;
+        Ok(Fs { src, block_size, blocks: sb.blocks_count(), inodes: sb.inodes_count(),
+                inodes_per_group: sb.inodes_per_group(), groups: sb.group_count(), inode_size: sb.inode_size(),
+                desc_size: sb.desc_size(), descriptors, incompat, uuid: sb.uuid(), label: sb.volume_name() })
     }
 
     /// Its UUID as GRUB's `search --fs-uuid` writes one: 8-4-4-4-12 lowercase
@@ -220,7 +130,7 @@ impl<S: Source> Fs<S> {
 
     /// Left needing its journal replayed: read as it is on disk regardless.
     pub fn needs_recovery(&self) -> bool {
-        self.incompat & INCOMPAT_RECOVER != 0
+        self.incompat & incompat::RECOVER != 0
     }
 
     /// Read whole block `block` into `buf`, a block long.
@@ -247,146 +157,33 @@ impl<S: Source> Fs<S> {
         let at = self.descriptors + group * self.desc_size;
         self.read_block(at / bs, &mut buf)?;
         let d = (at % bs) as usize;
-        let mut table = u64::from(u32_at(&buf, d + BG_INODE_TABLE_LO));
-        if self.desc_size >= DESC_SIZE_64 {
-            table |= u64::from(u32_at(&buf, d + BG_INODE_TABLE_HI)) << 32;
-        }
+        /* The descriptor size divides the block (a power of two no bigger
+         * than it), so a descriptor never straddles two. */
+        let table = Desc::new(&buf[d..d + self.desc_size as usize])
+            .ok_or_else(|| alloc::format!("group {}'s descriptor of {} bytes", group, self.desc_size))?
+            .inode_table();
         let at = table
             .checked_mul(bs)
             .and_then(|t| t.checked_add(index * self.inode_size))
             .ok_or_else(|| alloc::format!("group {}'s inode table at block {}", group, table))?;
         self.read_block(at / bs, &mut buf)?;
         let i = (at % bs) as usize;
-        let raw = &buf[i..i + self.inode_size as usize];
+        let raw = extfmt::inode::Inode::new(&buf[i..i + self.inode_size as usize])
+            .ok_or_else(|| alloc::format!("inode {} of {} bytes", ino, self.inode_size))?;
         let mut block = [0u8; I_BLOCK_BYTES];
-        block.copy_from_slice(&raw[I_BLOCK..I_BLOCK + I_BLOCK_BYTES]);
-        let mut size = u64::from(u32_at(raw, I_SIZE_LO));
-        let mode = u16_at(raw, I_MODE);
-        if mode & S_IFMT == S_IFREG {
-            size |= u64::from(u32_at(raw, I_SIZE_HIGH)) << 32;
-        }
-        Ok(Inode { ino, mode, flags: u32_at(raw, I_FLAGS), size, block })
+        block.copy_from_slice(raw.i_block());
+        /* The size's high word is a regular file's alone, as GRUB reads it. */
+        Ok(Inode { ino, mode: raw.mode(), flags: raw.flags(), size: raw.size(false), block })
     }
 
     /// Where the file's block `lblock` is.
     fn map(&mut self, inode: &Inode, lblock: u64) -> Result<Map, String> {
+        let (blocks, bs) = (self.blocks, self.block_size as usize);
+        let mut read = |block: u64, buf: &mut [u8]| self.read_block(block, buf);
         if inode.flags & EXTENTS_FL != 0 {
-            self.map_extent(inode, lblock)
+            extfmt::extent::map(&inode.block, lblock, blocks, bs, inode.ino, &mut read)
         } else {
-            self.map_indirect(inode, lblock)
-        }
-    }
-
-    fn map_extent(&mut self, inode: &Inode, lblock: u64) -> Result<Map, String> {
-        let mut node: Vec<u8> = inode.block.to_vec();
-        /* The blocks this subtree covers end where the next index entry
-         * up begins: no run reaches past it. */
-        let mut limit = u64::MAX;
-        let mut depth_wanted: Option<u16> = None;
-        loop {
-            if node.len() < EXT_HEADER || u16_at(&node, 0) != EXT_MAGIC {
-                return Err(alloc::format!("inode {}: an extent node with no header", inode.ino));
-            }
-            let entries = usize::from(u16_at(&node, 2));
-            let max = usize::from(u16_at(&node, 4));
-            let depth = u16_at(&node, 6);
-            if entries > max || EXT_HEADER + max * EXT_ENTRY > node.len() || depth > EXT_MAX_DEPTH
-                || depth_wanted.is_some_and(|d| d != depth)
-            {
-                return Err(alloc::format!("inode {}: an extent node of {} entries in {}, depth {}", inode.ino,
-                                          entries, max, depth));
-            }
-            let entry = |i: usize| &node[EXT_HEADER + i * EXT_ENTRY..EXT_HEADER + (i + 1) * EXT_ENTRY];
-            if depth == 0 {
-                for i in 0..entries {
-                    let e = entry(i);
-                    let first = u64::from(u32_at(e, 0));
-                    let mut len = u64::from(u16_at(e, 4));
-                    let start = (u64::from(u16_at(e, 6)) << 32) | u64::from(u32_at(e, 8));
-                    let unwritten = len > EXT_INIT_MAX_LEN;
-                    if unwritten {
-                        len -= EXT_INIT_MAX_LEN;
-                    }
-                    if lblock < first {
-                        return Ok(Map::Hole { run: (first - lblock).min(limit.saturating_sub(lblock)) });
-                    }
-                    if lblock - first < len {
-                        let run = (len - (lblock - first)).min(limit.saturating_sub(lblock));
-                        if unwritten {
-                            return Ok(Map::Hole { run });
-                        }
-                        let block = start + (lblock - first);
-                        if block.checked_add(run).is_none_or(|end| end > self.blocks) {
-                            return Err(alloc::format!("inode {}: an extent at block {} past the filesystem",
-                                                      inode.ino, start));
-                        }
-                        return Ok(Map::Blocks { block, run });
-                    }
-                }
-                return Ok(Map::Hole { run: limit.saturating_sub(lblock).max(1) });
-            }
-            /* The last index entry starting at or before the block. */
-            let mut child = None;
-            for i in 0..entries {
-                let e = entry(i);
-                let first = u64::from(u32_at(e, 0));
-                if first > lblock {
-                    limit = limit.min(first);
-                    break;
-                }
-                child = Some((u64::from(u16_at(e, 8)) << 32) | u64::from(u32_at(e, 4)));
-            }
-            let Some(child) = child else {
-                return Ok(Map::Hole { run: limit.saturating_sub(lblock).max(1) });
-            };
-            let mut next = vec![0u8; self.block_size as usize];
-            self.read_block(child, &mut next)?;
-            node = next;
-            depth_wanted = Some(depth - 1);
-        }
-    }
-
-    /// The block map of ext2 and ext3: twelve direct pointers, then a
-    /// single, a double and a triple indirect block. A run is as long as
-    /// consecutive pointers in one array point at consecutive blocks.
-    fn map_indirect(&mut self, inode: &Inode, lblock: u64) -> Result<Map, String> {
-        let per = self.block_size / 4;
-        let direct = |i: usize| u64::from(u32_at(&inode.block, i * 4));
-        if lblock < 12 {
-            let i = lblock as usize;
-            return Ok(run_of((i..12).map(direct)));
-        }
-        /* Which of the single, double and triple indirect trees the block is
-         * in, and where in it: `cover` blocks the tree maps, `rest` the
-         * block's place among them. */
-        let mut rest = lblock - 12;
-        let mut level = 1usize;
-        let mut cover = per;
-        while rest >= cover {
-            rest -= cover;
-            level += 1;
-            if level > 3 {
-                return Err(alloc::format!("inode {}: block {} past a block map's reach", inode.ino, lblock));
-            }
-            cover = cover.saturating_mul(per);
-        }
-        let mut ptr = direct(11 + level);
-        let mut buf = vec![0u8; self.block_size as usize];
-        loop {
-            if ptr == 0 {
-                /* A hole as long as what this pointer would have mapped,
-                 * from the block on -- and not a block past it. */
-                return Ok(Map::Hole { run: cover - rest });
-            }
-            self.read_block(ptr, &mut buf)?;
-            let child = cover / per;
-            let i = (rest / child) as usize;
-            if child == 1 {
-                return Ok(run_of((i..per as usize).map(|j| u64::from(u32_at(&buf, j * 4)))));
-            }
-            ptr = u64::from(u32_at(&buf, i * 4));
-            rest %= child;
-            cover = child;
+            extfmt::blockmap::map(&inode.block, lblock, bs, inode.ino, &mut read)
         }
     }
 
@@ -458,10 +255,10 @@ impl<S: Source> Fs<S> {
         if dir.flags & INLINE_DATA_FL != 0 {
             /* An inline directory: its parent's inode first, then entries. */
             if name == b".." {
-                return Ok(Some(u32_at(&dir.block, 0)));
+                return Ok(Some(extfmt::le32(&dir.block, 0)));
             }
             let end = (dir.size as usize).min(I_BLOCK_BYTES);
-            return find_entry(&dir.block[4.min(end)..end], name, dir.ino);
+            return extfmt::dir::find_entry(&dir.block[4.min(end)..end], name, dir.ino);
         }
         let bs = self.block_size;
         let blocks = dir.size.div_ceil(bs).min(MAX_DIR_BLOCKS);
@@ -473,7 +270,7 @@ impl<S: Source> Fs<S> {
                 Map::Blocks { block, run } => {
                     for k in 0..run.min(blocks - lblock) {
                         self.read_block(block + k, &mut buf)?;
-                        if let Some(ino) = find_entry(&buf, name, dir.ino)? {
+                        if let Some(ino) = extfmt::dir::find_entry(&buf, name, dir.ino)? {
                             return Ok(Some(ino));
                         }
                     }
@@ -531,43 +328,4 @@ impl<S: Source> Fs<S> {
         }
         Ok(current)
     }
-}
-
-/// A run of blocks from the pointers of a block map, the first being the
-/// block asked for: how many are consecutive, or how many holes.
-fn run_of(mut ptrs: impl Iterator<Item = u64>) -> Map {
-    let Some(first) = ptrs.next() else { return Map::Hole { run: 1 } };
-    if first == 0 {
-        let run = 1 + ptrs.take_while(|&p| p == 0).count() as u64;
-        return Map::Hole { run };
-    }
-    let mut run = 1u64;
-    for p in ptrs {
-        if p != first + run {
-            break;
-        }
-        run += 1;
-    }
-    Map::Blocks { block: first, run }
-}
-
-/// The inode named `name` among the entries of one directory block.
-fn find_entry(block: &[u8], name: &[u8], dir: u32) -> Result<Option<u32>, String> {
-    let mut at = 0usize;
-    while at + DIRENT_HEADER <= block.len() {
-        let ino = u32_at(block, at);
-        let rec_len = usize::from(u16_at(block, at + 4));
-        let name_len = usize::from(block[at + 6]);
-        if rec_len < DIRENT_HEADER || rec_len % 4 != 0 || at + rec_len > block.len()
-            || DIRENT_HEADER + name_len > rec_len
-        {
-            return Err(alloc::format!("directory {}: an entry at {} of {} bytes, its name {}", dir, at, rec_len,
-                                      name_len));
-        }
-        if ino != 0 && &block[at + DIRENT_HEADER..at + DIRENT_HEADER + name_len] == name {
-            return Ok(Some(ino));
-        }
-        at += rec_len;
-    }
-    Ok(None)
 }

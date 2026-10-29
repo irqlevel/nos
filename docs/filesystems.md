@@ -14,10 +14,10 @@ does what `root=` on the command line asks:
 | Command line | What ends up on `/` |
 |---|---|
 | nothing | nothing; the VFS starts empty and filesystems are mounted from the shell |
-| `root=auto` | the ext2 filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/`, the first ext2 found read-only on `/boot`, the first nanofs found read-write on `/data` (the layout the ISO had before there was a root on disk) |
-| `root=vda1`, `root=nvme01` | that block device, ext2 if it carries one, else nanofs |
-| `root=LABEL=nos` | the ext2 filesystem with that label |
-| `root=UUID=…` | the ext2 filesystem with that UUID, as `blkid` prints it |
+| `root=auto` | the ext4 -- or ext2 -- filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/`, the first of the ext family found read-only on `/boot`, the first nanofs found read-write on `/data` (the layout the ISO had before there was a root on disk) |
+| `root=vda1`, `root=nvme01` | that block device, ext4 or ext2 if it carries one, else nanofs |
+| `root=LABEL=nos` | the ext4 or ext2 filesystem with that label |
+| `root=UUID=…` | the ext4 or ext2 filesystem with that UUID, as `blkid` prints it |
 
 `ro` mounts the root read-only. A procfs goes on `/proc` in every case (the
 directory is created on the root if it is missing). If the named root is not
@@ -253,7 +253,10 @@ the journal ext2 does not have:
   maps. A remove takes the name out of its directory first, so a crash
   leaves an orphan for `lost+found`, never a name leading nowhere; a
   directory goes deepest first, by a walk and not a recursion, as deep as
-  the paths reach.
+  the paths reach. A file of more than one name -- a hard link, which nos
+  makes none of and Linux does -- loses one link to a remove, the others
+  keeping it, and every one of its names shows the size a write or a cut
+  gave it.
 - **`large_file`** is set in the superblock, on the medium, before the
   inode of the first file of 2 GiB or more is -- what Linux does, and what
   e2fsck wants of a filesystem that has one.
@@ -287,6 +290,250 @@ indirect block of each level last used are kept in memory, so a file read or
 written a piece at a time does not read its inode back for every piece, and
 a sequential pass does not re-read its indirect blocks per data block.
 
+## ext4
+
+`src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
+-- through `src/crates/extfmt`, the on-disk format and its checksums as a
+crate with no kernel in it, and writes it through its journal: names and
+data, and what a remove, a cut or a punch gives back, however much -- in
+transactions of a bounded share, through the orphan list, which a mount for
+writing releases, its own crash's or another kernel's. It is what new roots
+are: `nos-install`, `scripts/mkrootfs.sh` and `scripts/build-disk.sh` make
+an ext4 of the features named one by one from none -- has_journal, ext_attr,
+resize_inode, dir_index, filetype, extent, 64bit, flex_bg, sparse_super,
+large_file, huge_file, dir_nlink, extra_isize, metadata_csum: e2fsprogs
+1.46's ext4, which GRUB 2.06 reads -- so that what a newer mke2fs.conf adds,
+orphan_file and metadata_csum_seed among them, is not there; and with its
+inode tables and its journal written whole (`lazy_itable_init=0`,
+`lazy_journal_init=0`), so that nothing an earlier use of the blocks left is
+ever read as either. ext2's driver stays as it is, for the roots made
+before ext4.
+
+Which driver a filesystem gets is `extfs::driver_for`'s to say, for
+`root=`, the fallback layout and `mount`: ext2's takes what it always
+took -- revision 1, no incompatible feature but filetype -- but a
+filesystem with a journal, which it would write past; ext4's takes the
+rest of the family. `mount ext4 <disk> <path>` names the driver outright.
+
+What is refused, mounted read-only or written is
+`extfmt::features::classify`'s: refused are inline_data, bigalloc, meta_bg,
+encryption, casefold, verity, ea_inode, largedir, mmp, an external journal
+and a filesystem with no filetype; read-only, a filesystem without a
+journal, without extents (ext3), without metadata_csum, with orphan_file,
+quota or project quotas. A mount asked to write is read-only too -- the
+reason said -- for a filesystem marked with errors or not marked valid, a
+journal that recorded an error, is of the first version or holds a log the
+superblock does not say needs replaying, a transaction whose commit fails
+its checksum (e2fsck should look), and an orphan list that is not sound --
+an inode on it no file may be, or not in use, or failing its checksum, or
+mapped by blocks, or named twice; and refused for a journal whose blocks are
+the filesystem's own metadata. A superblock that fails only its checksum,
+on a filesystem with a journal, is the one a power cut tears as a
+checkpoint or a replay writes it home -- with 512-byte sectors its 1024
+bytes are two, half the old and half the new, which agree on where
+everything is -- while the journal still holds its copy, the log's start
+moving past one only once its home is on the medium: it is used to find the
+journal and nothing more, and a replay must then write a sound one home, or
+a read-only mount find one in the log, or the mount is refused. Past what extfmt
+checks of a superblock, the driver refuses a block it cannot read in a page,
+more blocks than the device has, groups more than their bitmaps cover, an
+inode count that is not what the groups hold, and descriptors whose bitmaps
+or tables lie outside the filesystem.
+
+Every checksum on what is read is held to the one it should be, and what
+fails is said and not used: the superblock and every descriptor at the
+mount -- either refuses it -- and an inode, an extent block, a directory's
+leaf (by its tail) or index block (by its own) when they are read, which
+fails the read, or leaves an entry out of its directory, with a line saying
+which. An inode in a part of its group's table never written -- an
+uninitialised group's, or past `itable_unused` -- is not read at all.
+Unwritten extents read as zeros, whatever their blocks hold. A file is read
+a run of an extent at a time: as many of its blocks as the read reaches
+and a batch holds -- 64, a page each -- in one call (`Disk::read_pieces`),
+in flight together where the device takes several requests at once.
+Directories
+are read as ext2's are, the first time a walk enters them and all of one or
+nothing; an htree directory as the linear one it also is. Names of 64
+bytes or more, symlinks and device nodes are left out of the tree.
+
+A journal holding transactions nobody replayed -- a crash under Linux, or
+under nos once it writes -- is not replayed by a read-only mount, which
+writes nothing: extfmt's recovery planner works out what a replay would
+write (`extfmt::recovery`, held to e2fsck's replay byte for byte by
+`extfmt-test.py`), and every read of a block the plan names is served from
+its newest copy in the journal -- a file's data among them, as Linux's
+data=journal leaves it, the rest of the batch off the device. The
+superblock and the descriptors are read
+again through it if it has newer copies of them, as a replay would have
+left them. `mounts` says so (`journal-not-replayed=<blocks>`), and while it
+is so a disk's image of a file here is read through the VFS, not off the
+VFS's lock from where the file's blocks are on the device -- whose copies
+are older. A journal the planner refuses -- a descriptor damaged under a
+sound commit, a copy failing its checksum, features it does not know -- has
+the mount refused, as a filesystem read around it would be neither as it
+was nor as it was to be; a log the superblock does not say needs replaying
+is read past, as Linux discards it.
+
+### Writing, through the journal
+
+A mount for writing replays the journal if it holds a log -- the planner's
+copies written home, flushed, the log marked empty and the superblock's
+error fields kept as they were before the replay -- sets the features its
+own commits use (v3 checksums, revokes, 64-bit tags on a 64bit filesystem),
+and says the filesystem needs recovery, forced to the medium, before
+anything else is written. A clean unmount takes that back last, once a
+checkpoint has put everything home and the log is marked empty, the
+superblock's free counts made the groups'.
+
+Every call that changes metadata is one transaction (`ext4/txn.rs`): what
+it changes is kept apart, as copies of whole blocks, until the journal
+holds all of it, and a call that fails before then leaves nothing changed
+-- on the disk, in the descriptors and superblock in memory, in the tree.
+A block is changed only as a kind -- a bitmap, the descriptors, an inode
+table block, a directory's leaf or index block, an extent block, an
+attribute block -- and every checksum its kind carries is put on it as the
+transaction is sealed; an inode's as it is stored. The transaction holds
+the device, the cache and the journal for as long as it lives, so that no
+checkpoint can write anything home meanwhile, and it is bounded: a quarter
+of the journal, and never more than 512 blocks.
+
+A commit (`ext4/journal.rs`) writes the log's start into the journal's
+superblock first if the log was empty, then revoke blocks, descriptors and
+copies -- a copy whose first word is the journal's magic escaped -- flushes,
+and writes the commit block forced to the medium, its time never earlier
+than the last. Only then are the blocks what reads see -- pinned in memory
+until a checkpoint writes them home, the only copy of each meanwhile. A
+checkpoint -- when the log is half full, when more than 1024 blocks are
+pinned, when a commit would not fit, at the unmount -- writes every pinned
+block home,
+flushes, and moves the log's start past them. A block freed is not handed
+out again by its own transaction, is never written home by a checkpoint
+after, and is revoked when the live log holds a copy of it, so that no
+replay writes that copy over what the block becomes. A write that fails in
+a commit or a checkpoint -- or a flush, `sync`'s among them, whose order
+nothing after could count on -- aborts the journal: nothing more is written, the
+call fails, reads go on, `sync` fails, `mounts` says `journal-aborted`, and
+the unmount writes nothing, leaving the filesystem to the next mount's
+replay -- or e2fsck's. A block of a file's data that does not write fails
+its call alone: its transaction is undone, so nothing maps what failed, and
+the filesystem stays writable -- one file's bad sector, a guest disk's, is
+not every file's, as Linux's ordered mode by default (`data_err=ignore`)
+has it too.
+
+Names: a new inode is the lowest free in the first group from its parent's
+that has one -- so that the part of a table never written shrinks by one --
+written whole, its extra fields among them, a random generation; a group
+never initialised has its bitmaps made as the kernel makes them, its block
+bitmap from the system zone (every group's metadata and the journal, which
+no file is given whatever a bitmap says) with the bits past its end set. An
+entry goes into the first entry with room after it, else into a new block at
+the directory's end, the extent tree grown to take it -- the last extent
+stretched, a new leaf and levels down to it under the lowest node with
+room, a level more at the root. An indexed directory has its index dropped
+in the same transaction before an entry goes into it: its root made the `.`
+and `..` it also is, its other index blocks empty leaves, the flag cleared
+-- linear, which is all a reader without htree reads; an entry taken out of
+one leaves the index as it is, true still. A name is looked for on the disk,
+not in the tree, which leaves some out; a directory is removed only once
+the disk shows nothing in it, and a recursive remove starts only once every
+directory under it is known to hold nothing the tree does not show -- a
+node at a time after that, deepest first, each its own transaction. A file
+loses a link at a time; its last one gives back its blocks and its tree's,
+and its share of an attribute block, which goes with its last reference. A
+directory's link count is kept as dir_nlink keeps it: 1 past 65000, and 1
+kept.
+
+Data (`ext4/data.rs`): a write is cut into transactions of at most 256
+blocks, and each one's data is on the device before its commit -- whose
+flush comes first -- as Linux's data=ordered has it, so that no block a
+commit maps into a file can show what it held before. A block mapped and
+written is written over in place, read first where the write covers only
+part of it; one in a hole is allocated and written whole, zeros around what
+goes into it; one in an unwritten extent is written whole and made
+written -- the extent split around it. The blocks go to the device in
+batches, each block made whole in a page of the mount's buffer of 64 and
+as many as it holds sent together (`Disk::write_pieces`: in flight at once
+on NVMe and virtio-blk), the last before the commit; a batch that fails is
+the write's failure there, as one block's would be. A
+write that fails part way leaves the
+transactions before it committed and the file the size they gave it --
+and writes zeros again over what it put past the old end into the last
+block, in place, which the size that would have covered it never did. Every
+write commits, so a write that returns is on the medium. A truncate gives
+back everything mapped past the new end -- unwritten extents past the old
+one among them -- and writes zeros over what of the new last block lies
+past it, so that a file reads as zeros wherever it grows over; one that
+reaches 2 GiB sets large_file in the superblock, in the same transaction. A
+punch -- a guest's discard of its disk's image -- gives back the blocks of a
+range inside the file, its size as it was. The extent tree is changed a
+leaf at a time (`ext4/extents.rs`): the leaf's entries edited as a list --
+an extent put in where nothing maps, run on into its neighbours; a range
+taken out, an extent trimmed or split around it; part of an unwritten
+extent made written -- and then the path to it settled: a node that
+overflows split, past the change where it is at the end as files grow; the
+root a level deeper when it fills; a node left empty freed and taken out of
+its parent; every index entry's key its child's first block; an emptied
+tree a leaf again. A disk's image maps its file's blocks and reads and
+writes them off the VFS's lock (`image.rs`): a hole -- or an unwritten
+extent, which maps as one -- goes through the VFS, as it must for blocks to
+be allocated or made written, and a discard makes the next sync the
+filesystem's. What holds a file as an image is counted by the file -- its
+mount and inode -- and not by the name it was opened by (`vfs.rs`): a
+second name, a hard link, does not get past the hold. A file of more than
+one name has every name's vnode given its size.
+
+Giving back (`ext4/orphans.rs`): a file's blocks go back from its end, an
+extent at a time, a transaction taking a bounded share -- as many extents
+as a sixteenth of the blocks one may hold, four to thirty-two, and none
+past the first once it holds half what one may -- and what it frees kept
+as runs, so that a file of millions of blocks is a handful of them. A remove of a file's last
+name, or a cut, that one transaction cannot finish puts the inode on the
+superblock's orphan list in its first -- the name gone, or the size cut,
+with it -- gives back the rest in the ones after, and takes it off the
+list in its last; a crash between them leaves an inode of no links named
+nowhere, or a file whose extents run past its size, which a mount for
+writing releases after its replay -- as Linux and e2fsck release another
+kernel's -- writing zeros over what a cut file's last block holds past its
+size, as Linux does. Calls run one at a time, so an inode always leaves the
+list from its head. A directory gives its blocks back in one transaction:
+it is empty when it goes, and what it holds is a run or a few. A punch goes on in transactions of its own, each a
+range given back whole, and may take the last few free blocks
+(`RESERVE`), which nothing else is given: a punch inside an extent splits
+it, and on a full disk the leaf the split needs must not be what stops a
+guest giving its disk's blocks back. A disk another system filled past them
+may still refuse one, leaving the range as it was but for the end of it the
+transactions before gave back. A write that fails part way
+forces what it wrote in place to the medium before it returns, as every
+call leaves what it did: no commit came to flush it.
+
+### What is not done yet
+
+Each of these is left until a measurement or a need asks for it:
+
+- **Group commit.** Every call that changes metadata commits before it
+  returns -- a flush, the log, a flush and the commit block written
+  through -- so what a small call costs is the device's flushes, not its
+  data: 0.58 ms a small file copied under QEMU, more on an NVMe whose flush
+  is slow. Calls that come together could share one commit.
+- **Preallocation.** There is no `fallocate`: a disk's image `hv create`
+  makes is a sparse file, its blocks allocated as the guest first writes
+  them -- through the VFS, not off its lock -- and nothing keeps the room
+  for them. Unwritten extents are read and made written, never made.
+- **orphan_file.** A filesystem with it -- Debian 13's mke2fs makes one by
+  default -- mounts read-only; the installs leave it out.
+- **Indexed directories, written.** A directory is read whole whether it
+  is indexed or not, and loses its index to the first name nos adds, so
+  Linux looks names up in a big one a block at a time from then on.
+- **Discard.** What a remove, a cut or a punch gives back is not discarded
+  on the device: the block layer has no discard, and an SSD under a
+  filesystem that grows and shrinks never hears of the free space.
+- **CRC32C by the CPU.** Every checksum is computed a byte at a time from
+  a table (`extfmt::crc`); arm64's CRC32C instructions and x86's SSE4.2
+  `crc32` are not used.
+- **Writing what the installs do not make.** A filesystem without a
+  journal, without extents or without metadata_csum, or with quotas, stays
+  read-only, and the refused features stay refused (above).
+
 ## nanofs, ramfs, procfs
 
 nanofs (`src/crates/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
@@ -314,11 +561,14 @@ consistent; `/proc/version` and `/proc/cmdline` are written once at mount.
 ```sh
 scripts/mkrootfs.sh root.img 256 rootdir        # 256 MiB, populated from rootdir/
 scripts/mkrootfs.sh root.img 64 "" 1024         # empty, 1 KiB blocks (what the smoke tests use)
+FSTYPE=ext2 scripts/mkrootfs.sh root.img 64     # ext2, as the roots made before ext4 (ext2-test.py's)
 ```
 
-This is `mke2fs -L nos -O ^dir_index -d rootdir`: the label `root=auto`
-looks for, no directory index, populated from a directory without loop
-devices or root privileges (inside the `nos-builder` Docker image on macOS,
+This is `mke2fs -t ext4 -L nos -O none,<the features above>
+-E lazy_itable_init=0,lazy_journal_init=0 -d rootdir` -- for ext2,
+`mke2fs -t ext2 -L nos -O ^dir_index`, no directory index, which ext2's
+driver does not write: the label `root=auto` looks for, populated from a
+directory without loop devices or root privileges (inside the `nos-builder` Docker image on macOS,
 where the copy goes through a directory in the container because a macOS
 bind mount serves no extended attributes). Attach it to QEMU as a raw disk
 and the ISO boot mounts it:
@@ -328,16 +578,20 @@ qemu-system-x86_64 ... -cdrom nos.iso -drive file=root.img,format=raw,if=virtio
 ```
 
 `scripts/build-disk.sh` makes `nos.qcow2` the same way — one MBR partition,
-ext2 labelled `nos`, `/boot/kernel64.elf` and `/boot/grub` inside it, GRUB's
+ext4 labelled `nos`, `/boot/kernel64.elf` and `/boot/grub` inside it, GRUB's
 boot code in the boot sector, `ROOTFS=dir` to add content (modules under
-`lib/modules`) — and runs `e2fsck` over the result. Nothing in it needs
+`lib/modules`) — and fails on anything `e2fsck -fn` finds in the result
+(given the partition as `image?offset=`; it has no `-E offset=`, which it
+refused while its exit code was ignored). Nothing in it needs
 `--privileged`.
 
-On a machine that dual-boots Ubuntu (the Hetzner boxes) the root is an ext2
-partition made under Ubuntu, `mkfs.ext2 -L nos -O ^dir_index /dev/nvme0n1pN`,
-filled by mounting it there, and named on the `nos` command line by label or
-UUID. After a `nos` session, `e2fsck -f` under Ubuntu is the check that the
-driver left it as it should.
+On a machine that dual-boots Ubuntu (the Hetzner boxes) the root is a
+partition `nos-install` made an ext4 under Ubuntu ([Install](install.md)),
+or the ext2 one an install before ext4 made, which keeps it; named on the
+`nos` command line by UUID. After a `nos` session, `e2fsck -f` under Ubuntu
+is the check that the driver left it as it should -- for an ext4 nos left
+without unmounting it, after Ubuntu's mount or `e2fsck`'s replay of its
+journal.
 
 ## Checking it
 

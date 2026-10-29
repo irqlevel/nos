@@ -10,5 +10,8 @@ kcore = { path = "../kcore" }
 # The disks a filesystem is mounted on: the block layer itself, not the C ABI
 # a module reaches it by.
 block = { path = "../block" }
+# The ext2/3/4 on-disk format and its checksums, which ext4 reads through: a
+# crate of the tree's with no kernel in it.
+extfmt = { path = "../extfmt" }
 # The management bus, which the layer's provider registers on.
 mgmt = { path = "../mgmt" }

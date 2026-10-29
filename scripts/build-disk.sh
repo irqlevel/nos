@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build a bootable MBR disk image: GRUB in the boot sector, one ext2
+# Build a bootable MBR disk image: GRUB in the boot sector, one ext4
 # partition labelled "nos" holding /boot/kernel64.elf, /boot/grub and the
 # root filesystem the kernel mounts read-write at boot (root=auto finds it
 # by the label). Everything runs inside Docker, and nothing needs root:
@@ -51,7 +51,7 @@ dd if=/dev/zero of=$IMG bs=1M count=0 seek=$SIZE_MB status=none
 
 echo "Creating MBR partition table..."
 parted -s $IMG mklabel msdos
-parted -s $IMG mkpart primary ext2 1MiB 100%
+parted -s $IMG mkpart primary ext4 1MiB 100%
 parted -s $IMG set 1 boot on
 
 echo "Staging the root filesystem..."
@@ -66,9 +66,13 @@ cp /src/build/grub-disk.cfg $STAGE/boot/grub/grub.cfg
 # GRUB modules so normal.mod etc. are available at boot
 cp -r /usr/lib/grub/i386-pc $STAGE/boot/grub/
 
-echo "Formatting partition 1 as ext2 (label nos)..."
-# No htree index: the kernel writes directories linearly (see docs/filesystems.md)
-mkfs.ext2 -q -F -L nos -b 4096 -O ^dir_index -E offset=$P1_OFFSET -d $STAGE $IMG ${P1_SIZE_MB}M
+echo "Formatting partition 1 as ext4 (label nos)..."
+# Its features named from none, as scripts/mkrootfs.sh and nos-install name
+# them: what the ext4 of nos writes and GRUB 2.06 reads, nothing this mke2fs
+# adds; its inode tables and journal written whole (docs/filesystems.md)
+EXT4_FEATURES=none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,dir_nlink,extra_isize,metadata_csum
+mkfs.ext4 -q -F -L nos -b 4096 -O $EXT4_FEATURES \
+    -E offset=$P1_OFFSET,lazy_itable_init=0,lazy_journal_init=0 -d $STAGE $IMG ${P1_SIZE_MB}M
 rm -rf $STAGE
 
 # Custom GRUB core.img with a hardcoded root device: the default
@@ -92,11 +96,15 @@ dd if=/usr/lib/grub/i386-pc/boot.img of=$IMG bs=440 count=1 conv=notrunc status=
 dd if=/tmp/core.img of=$IMG bs=512 seek=1 conv=notrunc status=none
 
 echo "Checking the filesystem..."
-e2fsck -f -n -E offset=$P1_OFFSET $IMG > /dev/null 2>&1 || true
+# e2fsck takes the offset of the partition in the name of the image: it
+# has no -E offset=, which it refused -- and so checked nothing -- while its
+# exit code was ignored
+e2fsck -f -n "$IMG?offset=$P1_OFFSET" > /tmp/e2fsck.log 2>&1 ||
+    { cat /tmp/e2fsck.log; echo "e2fsck finds the new filesystem damaged"; exit 1; }
 
 echo "Converting to qcow2..."
 qemu-img convert -f raw -O qcow2 $IMG $QCOW
 rm -f $IMG
 
-echo "Done: nos.qcow2 (${SIZE_MB}MB, MBR, ext2 root labelled nos)"
+echo "Done: nos.qcow2 (${SIZE_MB}MB, MBR, ext4 root labelled nos)"
 '

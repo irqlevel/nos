@@ -231,7 +231,7 @@ longer than its buffer was dropped whole rather than truncated
 
 ## Disk image
 
-Build a bootable qcow2 disk image (MBR, one ext2 partition labelled `nos`
+Build a bootable qcow2 disk image (MBR, one ext4 partition labelled `nos`
 that is both where GRUB finds `/boot/kernel64.elf` and the root filesystem
 the kernel mounts read-write):
 

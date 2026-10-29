@@ -19,6 +19,56 @@ use crate::{reached, Input};
 /// A name is shorter than this, in the VFS and every filesystem under it.
 pub const NAME_MAX: usize = 64;
 
+/// A path, a component at a time.
+pub type Path = Vec<Vec<u8>>;
+
+/// Second names for some of the files of `tree`, each beside what it names:
+/// the tree given them, and the pairs (the link, what it names) for a mkfs.
+pub fn add_links(r: &mut Input, tree: &mut Node) -> Vec<(Path, Path)> {
+    fn walk(r: &mut Input, n: &mut Node, at: &mut Path, out: &mut Vec<(Path, Path)>) {
+        let Some(children) = n.children_mut() else { return };
+        let files: Vec<Vec<u8>> = children.iter().filter(|(_, c)| !c.is_dir()).map(|(k, _)| k.clone()).collect();
+        for name in files {
+            if r.u8() % 4 != 1 {
+                continue;
+            }
+            let mut link = name.clone();
+            link.extend_from_slice(b"-ln");
+            if link.len() >= NAME_MAX || children.contains_key(&link) {
+                continue;
+            }
+            let Some(content) = children.get(&name).cloned() else { continue };
+            children.insert(link.clone(), content);
+            let mut l = at.clone();
+            l.push(link);
+            let mut t = at.clone();
+            t.push(name);
+            out.push((l, t));
+        }
+        let dirs: Vec<Vec<u8>> = children.iter().filter(|(_, c)| c.is_dir()).map(|(k, _)| k.clone()).collect();
+        for d in dirs {
+            at.push(d.clone());
+            if let Some(c) = children.get_mut(&d) {
+                walk(r, c, at, out);
+            }
+            at.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(r, tree, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The names of one file each, as `Model::links` keeps them, from mkfs's
+/// pairs.
+pub fn link_groups(links: &[(Path, Path)]) -> Vec<Vec<Path>> {
+    let mut groups: std::collections::BTreeMap<Path, Vec<Path>> = std::collections::BTreeMap::new();
+    for (link, target) in links {
+        groups.entry(target.clone()).or_insert_with(|| vec![target.clone()]).push(link.clone());
+    }
+    groups.into_values().collect()
+}
+
 /// Power cuts set going into a discard, a request apart: more than a punch
 /// of a few batches takes.
 const PUNCH_CUTS: u64 = 48;
@@ -83,11 +133,88 @@ pub struct Model {
     /// as zeros -- or 0 where the filesystem gives nothing back and a
     /// discard changes nothing.
     pub punch_block: u64,
+    /// Paths that are one file, a group each: the names of an inode with
+    /// more than one -- what holds and writers are counted by, and what
+    /// writing one of them writes.
+    pub links: Vec<Vec<Vec<Vec<u8>>>>,
 }
 
 impl Model {
     pub fn new(tree: Node, read_only: bool, limits: Limits) -> Model {
-        Model { tree, read_only, limits, open: Vec::new(), holds: Vec::new(), punch_block: 0 }
+        Model { tree, read_only, limits, open: Vec::new(), holds: Vec::new(), punch_block: 0, links: Vec::new() }
+    }
+
+    /// The names of the file at `p`: its other ones, and itself.
+    pub fn names_of(&self, p: &[Vec<u8>]) -> Vec<Vec<Vec<u8>>> {
+        match self.links.iter().find(|g| g.iter().any(|q| q == p)) {
+            Some(g) => g.clone(),
+            None => vec![p.to_vec()],
+        }
+    }
+
+    /// The content of the file at `p` given to its other names, as the
+    /// inode they share has it.
+    pub fn propagate(&mut self, p: &[Vec<u8>]) {
+        let Some(Node::File(d)) = self.node(p).cloned() else { return };
+        for q in self.names_of(p) {
+            if q != p {
+                if let Some(t) = self.file_mut(&q) {
+                    *t = d.clone();
+                }
+            }
+        }
+    }
+
+    /// What every name of a file of several holds, by its path: what
+    /// `propagate_changed` holds them to after a call.
+    pub fn linked_contents(&self) -> std::collections::BTreeMap<Path, Data> {
+        let mut out = std::collections::BTreeMap::new();
+        for g in self.links.iter().filter(|g| g.len() > 1) {
+            for p in g {
+                if let Some(Node::File(d)) = self.node(p) {
+                    out.insert(p.clone(), d.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// After a call: the content of whichever name of a file it changed --
+    /// held to what it held before (`linked_contents`) -- given to the
+    /// file's other names, as the inode they share has it.
+    pub fn propagate_changed(&mut self, before: &std::collections::BTreeMap<Path, Data>) {
+        let groups = self.links.clone();
+        for g in groups {
+            let changed = g.iter().find(|p| match (before.get(*p), self.node(p)) {
+                (Some(b), Some(Node::File(d))) => b != d,
+                _ => false,
+            });
+            if let Some(p) = changed.cloned() {
+                self.propagate(&p);
+            }
+        }
+    }
+
+    /// The groups after a rename of `from` to `to`, or -- `to` None -- a
+    /// remove of `from`: every name at or under it moved, or gone.
+    fn relink(&mut self, from: &[Vec<u8>], to: Option<&[Vec<u8>]>) {
+        for g in self.links.iter_mut() {
+            g.retain_mut(|q| {
+                if !q.starts_with(from) {
+                    return true;
+                }
+                match to {
+                    Some(to) => {
+                        let mut n = to.to_vec();
+                        n.extend_from_slice(&q[from.len()..]);
+                        *q = n;
+                        true
+                    }
+                    None => false,
+                }
+            });
+        }
+        self.links.retain(|g| g.len() > 1);
     }
 
     pub fn resolve(&self, path: &[u8]) -> Res {
@@ -137,10 +264,11 @@ impl Model {
         self.open.iter().any(|(_, o)| o.path.starts_with(p)) || self.holds.iter().any(|(h, _)| h.starts_with(p))
     }
 
-    /// Whether the file at `p` is held as an image: nothing but the image
-    /// may write it.
+    /// Whether the file at `p` -- by any of its names -- is held as an
+    /// image: nothing but the image may write it.
     pub fn held(&self, p: &[Vec<u8>]) -> bool {
-        self.holds.iter().any(|(h, _)| h == p)
+        let names = self.names_of(p);
+        self.holds.iter().any(|(h, _)| names.contains(h))
     }
 
     /// What `Image::open` should do, done to the model: the file it holds.
@@ -151,8 +279,9 @@ impl Model {
         if !matches!(self.node(&path), Some(Node::File(_))) || (write && self.read_only) {
             return None;
         }
-        let written = self.open.iter().any(|(_, o)| o.path == path && o.flags & OPEN_WRITE != 0)
-            || self.holds.iter().any(|(h, w)| *h == path && *w);
+        let names = self.names_of(&path);
+        let written = self.open.iter().any(|(_, o)| names.contains(&o.path) && o.flags & OPEN_WRITE != 0)
+            || self.holds.iter().any(|(h, w)| names.contains(h) && *w);
         if written || (write && self.held(&path)) {
             return None;
         }
@@ -202,8 +331,11 @@ impl Model {
             Some(Node::File(d)) => d.len(),
             _ => return None,
         };
-        /* A disk's image is its holder's alone to write. */
+        /* A disk's image is its holder's alone to write -- by whatever name. */
         if writes && m.held(&path) {
+            if !m.holds.iter().any(|(h, _)| *h == path) {
+                reached("a write refused, its file held as an image by another name");
+            }
             return None;
         }
         if flags & OPEN_TRUNCATE != 0 && size != 0 {
@@ -235,7 +367,10 @@ impl Model {
         }
         let node = m.tree.get_mut(sdir).and_then(Node::children_mut).and_then(|c| c.remove(sname));
         let Some(node) = node else { return false };
+        let mut moved = dir.clone();
+        moved.push(name.clone());
         m.tree.get_mut(&dir).and_then(Node::children_mut).expect("resolved").insert(name, node);
+        m.relink(&src, Some(&moved));
         true
     }
 
@@ -289,7 +424,11 @@ impl Model {
         match self.resolve(p) {
             Res::Node(n) if !n.is_empty() && !self.read_only && !self.busy(&n) => {
                 let (name, dir) = n.split_last().expect("not the root");
-                self.tree.get_mut(dir).and_then(Node::children_mut).is_some_and(|c| c.remove(name).is_some())
+                let gone = self.tree.get_mut(dir).and_then(Node::children_mut).is_some_and(|c| c.remove(name).is_some());
+                if gone {
+                    self.relink(&n, None);
+                }
+                gone
             }
             _ => false,
         }
@@ -332,11 +471,15 @@ pub struct Fs {
     pub strict: bool,
     /// The images held: `model.holds`, one for one.
     pub images: Vec<Image>,
+    /// Whether an image's discard may be refused for want of a block: the
+    /// filesystem had fewer free when it was mounted than it keeps for a
+    /// punch's split, a disk another system filled.
+    pub punch_room: bool,
 }
 
 impl Fs {
     pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
-        Fs { vfs, model, strict, images: Vec::new() }
+        Fs { vfs, model, strict, images: Vec::new(), punch_room: false }
     }
 }
 
@@ -444,7 +587,7 @@ pub fn offset(r: &mut Input, size: u64, block: u64, max: u64) -> u64 {
 /// Whether the filesystem ran out of room -- blocks, inodes -- in what was
 /// traced since `mark`: what makes a call fail that the model, which does
 /// not count them, has succeed.
-fn out_of_room(mark: u64) -> bool {
+pub fn out_of_room(mark: u64) -> bool {
     crate::machine::traced_since(mark).iter().any(|l| {
         let l = String::from_utf8_lossy(l);
         l.contains("no free blocks") || l.contains("no free inodes") || l.contains("no free data blocks")
@@ -473,6 +616,16 @@ impl Fs {
         if self.strict && !ok {
             panic!("invariant: {}", what);
         }
+    }
+
+    /// Whether the model takes a change the kernel answered `got` to and
+    /// the model `want`: where both did it -- or, with requests failing,
+    /// wherever the model does, as `write`, `truncate` and `write_file`
+    /// take theirs: a call that met a failure may have done part of it, and
+    /// what it may leave is judged between the tree before it and the tree
+    /// it was asked for.
+    fn takes(&self, got: bool, want: bool) -> bool {
+        want && (got || !self.strict)
     }
 
     /// A call the kernel refused and the model did not, for want of room:
@@ -525,6 +678,49 @@ impl Fs {
         self.check(partial_write(old, &got, at, data), format_args!("a write of {} bytes at {} to {} ({} bytes) that \
                    ran out of room left {} bytes, not the old ones with a first part of the new", data.len(), at,
                    show(&p), old.len(), got.len()));
+        if let Some(d) = self.model.file_mut(path) {
+            *d = got;
+        }
+    }
+
+    /// A punch of bytes `first..end` of the file at `path` that was refused
+    /// part way: the file must be `old` but for some last part of the range
+    /// -- what the transactions before the refusal gave back, from its end
+    /// -- made zeros; and the model takes what it is.
+    fn resync_punch(&mut self, path: &[Vec<u8>], old: &Data, first: u64, end: u64) {
+        let p = join(path);
+        let Some(file) = fs::vfs::Open::new(self.vfs, &p, OPEN_READ) else {
+            self.check(false, format_args!("{} does not open after a punch of it was refused", show(&p)));
+            return;
+        };
+        let mut got = old.clone();
+        let mut ranges = vec![(first, end - first)];
+        for b in old.nonzero_blocks(4096) {
+            ranges.push((b * 4096, 4096));
+        }
+        for (off, n) in ranges {
+            let n = n.min(old.len().saturating_sub(off));
+            let mut buf = vec![0u8; n as usize];
+            let mut k = 0;
+            if file.seek(off as usize) {
+                while k < buf.len() {
+                    match file.read(&mut buf[k..]) {
+                        Some(0) | None => break,
+                        Some(r) => k += r,
+                    }
+                }
+            }
+            got.write(off, &buf[..k]);
+        }
+        let size = file.size() as u64;
+        drop(file);
+        let inside = got.read(first, end - first);
+        let was = old.read(first, end - first);
+        let k = inside.iter().zip(&was).position(|(g, o)| g != o).unwrap_or(inside.len());
+        let ok = size == old.len() && got.same_range(old, 0, first) && got.same_range(old, end, u64::MAX)
+            && inside[k..].iter().all(|&b| b == 0);
+        self.check(ok, format_args!("a punch of {}..{} of {} ({} bytes) refused for room left it other than as \
+                   it was with an end of the range given back", first, end, show(&p), old.len()));
         if let Some(d) = self.model.file_mut(path) {
             *d = got;
         }
@@ -679,11 +875,13 @@ impl Fs {
         }
         self.check(got == want, format_args!("an image's write of {} bytes to {} ({} bytes) at {} {}", data.len(),
                    show(&join(&path)), size, at, if got { "succeeded" } else { "failed" }));
-        if got && want && !data.is_empty() {
+        if self.takes(got, want) && !data.is_empty() {
             if let Some(d) = self.model.file_mut(&path) {
                 d.write(at, data);
             }
-            reached("an image written");
+            if got {
+                reached("an image written");
+            }
         }
     }
 
@@ -724,10 +922,24 @@ impl Fs {
             self.resync_partial(&path, &old, at, &vec![0u8; len as usize]);
             return;
         }
+        if zeroes.is_none() && self.punch_room && self.refused_for_room(got, want, mark, &saved) {
+            /* A punch gives back from the range's end, a transaction at a
+             * time: what it gave back before the refusal is the kernel's
+             * to say. */
+            let old = match self.model.node(&path) {
+                Some(Node::File(d)) => d.clone(),
+                _ => Data::new(),
+            };
+            let block = self.model.punch_block.max(1);
+            let (first, end) = (at.div_ceil(block) * block, ((at + len) / block * block).min(size));
+            self.resync_punch(&path, &old, first, end.max(first));
+            reached("an image's discard refused for room, on a disk filled past what ext4 keeps for one");
+            return;
+        }
         self.check(got == want, format_args!("an image's {} of {} bytes of {} ({} bytes) at {} {}",
                    if zeroes.is_some() { "write of zeros" } else { "discard" }, len, show(&join(&path)), size, at,
                    if got { "succeeded" } else { "failed" }));
-        if !(got && want) {
+        if !self.takes(got, want) {
             return;
         }
         let zeroed = match zeroes {
@@ -743,7 +955,9 @@ impl Fs {
             if let Some(d) = self.model.file_mut(&path) {
                 d.write(from, &vec![0u8; (to - from) as usize]);
             }
-            reached(if zeroes.is_some() { "an image's range made zeros" } else { "an image's blocks given back" });
+            if got {
+                reached(if zeroes.is_some() { "an image's range made zeros" } else { "an image's blocks given back" });
+            }
         }
     }
 
@@ -921,7 +1135,7 @@ impl Fs {
         }
         self.check(got == want, format_args!("write_within {} of {} bytes to {} ({} bytes) {}", at, data.len(),
                    show(&join(&o.path)), size, if got { "succeeded" } else { "failed" }));
-        if got && want && !data.is_empty() {
+        if self.takes(got, want) && !data.is_empty() {
             if let Some(d) = self.model.file_mut(&o.path) {
                 d.write(at, data);
             }
@@ -990,11 +1204,11 @@ impl Fs {
             && matches!(self.model.node(&o.path), Some(Node::File(_)));
         self.check(got == want, format_args!("set_length {} to {} {}, where the model {}", show(&join(&o.path)), size,
                    if got { "succeeded" } else { "failed" }, if want { "does it" } else { "does not" }));
-        if got && want {
+        if self.takes(got, want) {
             if let Some(d) = self.model.file_mut(&o.path) {
                 d.truncate(size);
             }
-            if size > old {
+            if got && size > old {
                 reached("a file grown through its handle");
             }
         }
@@ -1060,23 +1274,35 @@ impl Fs {
         }
     }
 
+    /// The tree mounted at `top` read back and held to the model's: where
+    /// they differ, or None.
+    pub fn differs_under(&mut self, top: &[u8]) -> Option<String> {
+        let model = self.model.tree.clone();
+        self.compare_at(top, &model, 0)
+    }
+
     /// Which file each open handle is, through the file ABI a guest's disk
     /// claims its image by (`kernel_file_mount`, `kernel_file_key`): one
     /// for two handles on one path, another for two on two -- a sound tree
     /// has no file under two names.
     fn identities(&self) {
-        let ids: Vec<(Vec<u8>, Option<(u64, u64)>)> = self.model.open.iter().map(|(h, o)| {
+        let ids: Vec<(Vec<Vec<u8>>, Option<(u64, u64)>)> = self.model.open.iter().map(|(h, o)| {
             let w = Handle::into_raw(Some(*h));
             let (mount, key) = (fs::files::kernel_file_mount(w), fs::files::kernel_file_key(w));
-            (join(&o.path), (mount != 0 && key != 0).then_some((mount, key)))
+            (o.path.clone(), (mount != 0 && key != 0).then_some((mount, key)))
         }).collect();
-        for (i, (p, id)) in ids.iter().enumerate() {
-            self.check(id.is_some(), format_args!("the open file {} is no file, by its identity", show(p)));
-            for (q, other) in &ids[..i] {
-                self.check((p == q) == (id == other), format_args!("the open files {} and {} are {:?} and {:?}",
-                                                                   show(p), show(q), id, other));
+        for (i, (pc, id)) in ids.iter().enumerate() {
+            let p = join(pc);
+            self.check(id.is_some(), format_args!("the open file {} is no file, by its identity", show(&p)));
+            for (qc, other) in &ids[..i] {
+                let q = join(qc);
+                let one = self.model.names_of(pc).contains(qc);
+                self.check(one == (id == other), format_args!("the open files {} and {} are {:?} and {:?}",
+                                                              show(&p), show(&q), id, other));
                 if p == q {
                     reached("one file open twice, one identity");
+                } else if one {
+                    reached("two names of one file open, one identity");
                 } else if id.map(|x| x.0) == other.map(|x| x.0) {
                     reached("two files open on one mount, two identities");
                 }
@@ -1230,6 +1456,13 @@ pub fn say(what: std::fmt::Arguments) {
 
 /// One operation of the input's on the filesystem.
 pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
+    /* A file of several names: what one of them is given, every one has. */
+    let before = f.model.linked_contents();
+    step_once(f, r, block);
+    f.model.propagate_changed(&before);
+}
+
+fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
     let open = f.model.open.len() as u64;
     let pick_open = |r: &mut Input| r.below(open.max(1)) as usize;
     let held = f.images.len() as u64;

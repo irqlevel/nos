@@ -2,7 +2,7 @@
 """End-to-end test of the sshd module (docs/sshd.md), in QEMU, with OpenSSH.
 
 aarch64 (HVF on an Apple Silicon Mac unless --tcg): boots nos-arm64.img from
-an ext2 root, loads sshd.ko over the UDP shell, and has the ssh client work
+an ext4 root, loads sshd.ko over the UDP shell, and has the ssh client work
 it -- commands, a shell with a terminal and one without, 3 MiB of output
 through the client's window with rekeys in the middle, a key it has to
 refuse, sessions at once, a stop and an rmmod from inside a session -- and
@@ -14,7 +14,7 @@ puts the module in /etc/rc, reboots, and checks it came back by itself with
 the same host key, and that poweroff unloads it before the filesystems go and
 then switches the machine off with nothing panicking on the way.
 
-x86_64: boots nos.iso from an ext2 root that already carries sshd.ko, an
+x86_64: boots nos.iso from an ext4 root that already carries sshd.ko, an
 authorized key and an /etc/rc that starts it, and logs in: no shell is
 touched at all.
 

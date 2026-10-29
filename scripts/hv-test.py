@@ -106,9 +106,10 @@ ALL_MASK = "0x%x" % ((1 << CPUS) - 1)
 # What `hv convert` is asked, with hv loaded -- on x86-64 from the boot
 # script, on arm64 one at a time -- and what each must answer: images
 # qemu-img made of a disk made here (convert_images), converted on nos's own
-# ext2 and held to the disk by its SHA-256; a second conversion over the
-# first refused; an image cut short refused and nothing left of it; a disk
-# that is raw already refused, saying so; and the usage.
+# root, ext4 as new installs get, and held to the disk by its SHA-256; a
+# second conversion over the first refused; an image cut short refused and
+# nothing left of it; a disk that is raw already refused, saying so; and the
+# usage.
 CONVERT = [
     "hv convert /img.qcow2 /img.raw",
     "sha256 /img.raw",

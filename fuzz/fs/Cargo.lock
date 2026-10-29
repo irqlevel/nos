@@ -12,6 +12,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "extfmt"
+version = "0.1.0"
+
+[[package]]
 name = "ffi"
 version = "0.1.0"
 
@@ -20,6 +24,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "extfmt",
  "kcore",
  "mgmt",
 ]

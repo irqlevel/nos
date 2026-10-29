@@ -292,6 +292,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "extfmt"
+version = "0.1.0"
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,6 +332,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "extfmt",
  "kcore",
  "mgmt",
 ]
@@ -428,6 +433,9 @@ dependencies = [
 [[package]]
 name = "hvboot"
 version = "0.1.0"
+dependencies = [
+ "extfmt",
+]
 
 [[package]]
 name = "igb"

@@ -63,8 +63,8 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
 - `hwrng=off` — ignore the CPU's random instruction (RDRAND/RDSEED, RNDR), leaving the entropy pool with virtio-rng and timing jitter. How the fallback path gets exercised on a machine that has one; `entropy` then reports whether anything else reached the pool. See [Randomness](random.md)
 - `rc=off` — do not run `/etc/rc`, the shell commands the shell's task runs once the network is up (the `rc` command edits it). The way past a line in it that keeps the machine from coming up. See [sshd](sshd.md#starting-it-at-boot)
-- `root=auto` — mount the ext2 filesystem labelled `nos` read-write on `/`; without one, a ramfs on `/`, the first ext2 found read-only on `/boot` and the first nanofs found read-write on `/data`. Without `root=` the VFS starts empty and filesystems are mounted from the shell
-- `root=<device>` / `root=LABEL=<label>` / `root=UUID=<uuid>` — the root by block device name (`vda1`, `nvme01`), ext2 volume label or UUID. A root that is not found falls back to the `auto` layout, so the shell is always there. See [Filesystems](filesystems.md)
+- `root=auto` — mount the ext4 (or ext2) filesystem labelled `nos` read-write on `/`; without one, a ramfs on `/`, the first of the ext family found read-only on `/boot` and the first nanofs found read-write on `/data`. Without `root=` the VFS starts empty and filesystems are mounted from the shell
+- `root=<device>` / `root=LABEL=<label>` / `root=UUID=<uuid>` — the root by block device name (`vda1`, `nvme01`), ext4 or ext2 volume label or UUID. A root that is not found falls back to the `auto` layout, so the shell is always there. See [Filesystems](filesystems.md)
 - `ro` — mount the root read-only
 - `fstest=on` — run the filesystem self-test on `/` once it is mounted (prints `fstest: passed` or `fstest: FAILED`); the smoke tests boot with it
 

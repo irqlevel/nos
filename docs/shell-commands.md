@@ -56,6 +56,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `mount ramfs <path>` | Mount a ramfs at path |
 | `mount nanofs <disk> <path>` | Mount nanofs from disk at path |
 | `mount ext2 <disk> <path> [ro]` | Mount ext2 from disk at path, read-write unless `ro` (or unless the image carries features the driver does not write; see [Filesystems](filesystems.md)) |
+| `mount ext4 <disk> <path> [ro]` | Mount ext4 (or ext3) from disk at path: read-only, all the driver does yet; a journal nobody replayed is read through, not replayed (see [Filesystems](filesystems.md#ext4)) |
 | `umount <path>` | Unmount filesystem |
 | `mounts` | List mount points |
 | `ls [path]` | List directory contents (default `/`) |
