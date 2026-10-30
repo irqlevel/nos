@@ -85,18 +85,38 @@ in dmesg) on the disk under a mounted partition, on the disk log's area, or
 on a device a write test is running on; and those, in turn, keep off a
 mounted one. Reads need no claim.
 
-One mutex serialises every VFS call, so a multi-megabyte read holds up an
-`ls` from the UDP shell for its duration. Everything it guards is inside it:
-the mounts, each owning its filesystem, and the open files.
+Each mount has a mutex of its own, held across every call on its
+filesystem down to the device and back, so a filesystem sees one call at a
+time -- and calls on two mounts go on side by side: a multi-megabyte read
+off one disk holds up an `ls` of the same filesystem for its duration, and
+nothing on any other. Everything a mount's lock guards is inside it: the
+filesystem, the files open on it and what is counted of them. The mount
+points are a table of their own, under a mutex held only to look a path's
+mount up or to change the table, never across a call into a filesystem;
+and a mount, an unmount and the halt's unmount of everything go one at a
+time, each for the whole of it -- a journal replayed or written home
+included -- while calls on the mounts there are go on. The locks are taken
+in that order -- the mounting, a mount's, the table -- never two mounts' at
+once, and an open file's handle names its mount, so a read or a write
+through one takes that mount's lock and no other (`fs/src/vfs.rs`).
+
+The mutex is the kernel's: a task that finds it held gives its CPU to any
+other task that can run there, and spins only when none can -- which a
+long call on a busy mount now costs the callers of that mount alone.
+`fstest` holds every boot to the promise: it mounts a filesystem of its
+own whose lookup it holds, and while that call waits a file must be
+written, read back and removed on the filesystem under test, and a second
+call on the held mount must not get in.
 
 ### A disk's image
 
 A guest's disk that is a file of nos's (`hv start ... disk=/vms/a/disk.img`)
 is read and written for as long as the guest runs, a request at a time,
-and through that one mutex it would wait behind every other guest's disk and
-behind nos's own files. So it is opened as an image (`fs::image::Image`,
-`kcore::fs::Image` for a module): the file is **held** (`OPEN_HOLD`), and an
-image takes only what it must under the lock -- where the blocks of the
+and through its mount's mutex it would wait behind every other guest's disk
+on that filesystem and behind nos's own files there. So it is opened as an
+image (`fs::image::Image`, `kcore::fs::Image` for a module): the file is
+**held** (`OPEN_HOLD`), and an image takes only what it must under the
+lock -- where the blocks of the
 range it is asked for are on the device (`Vfs::map`, the filesystem's
 `map_blocks`: ext2 walks the file's pointers, through its caches, and
 allocates nothing) -- and reads and writes those blocks itself with the lock
@@ -151,8 +171,10 @@ A filesystem is a type that implements `vfs::FileSystem`, mounted as a
 whole seam: `mount`/`unmount`, `root`, `lookup`, `load_dir`, `create_file`,
 `create_dir`, `read`, `write`, `truncate`, `rename`, `remove`, `sync`, and
 `name`/`info`/`device` for what `mounts` prints and the device it claims.
-Every call arrives with the VFS lock held, so a filesystem sees one call at
-a time and does no locking of its own.
+Every call arrives with its mount's lock held, so a filesystem sees one
+call at a time and does no locking of its own; calls on two filesystems run
+side by side, so what two mounts would share needs a lock of its own --
+none of the filesystems here shares anything.
 
 What a filesystem holds is a `vnode::Tree`: an arena of nodes -- a name, a
 kind, a size, an inode number, the children of a directory in order -- named

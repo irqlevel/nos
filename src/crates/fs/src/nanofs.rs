@@ -11,8 +11,8 @@
 //! buys: there is no directory to load later, and a lookup is a walk of a
 //! list that is already in memory.
 //!
-//! Every call arrives with the VFS lock held (see `FileSystem`), so there is
-//! no locking here.
+//! Every call arrives with its mount's lock held (see `FileSystem`), so there
+//! is no locking here.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
