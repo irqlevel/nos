@@ -20,6 +20,7 @@
 //! read-only, a partition table being read.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use super::sched;
@@ -35,6 +36,12 @@ const CHUNK: usize = 4096;
 /// How long a request takes: a task waiting on one lets the others run, as
 /// it does on a machine.
 const IO_NS: u64 = 50_000;
+
+/// Requests that have waited on their disk's latency: begun, and woken. One
+/// begun and not woken has its caller asleep in the middle of its call --
+/// with whatever lock that call holds -- which the clock alone ends.
+pub static ASLEEP: AtomicU64 = AtomicU64::new(0);
+pub static WOKEN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Default)]
 pub struct Media {
@@ -312,7 +319,9 @@ impl RamDisk {
             ok
         });
         if with(self.index, |d| d.latency) {
+            ASLEEP.fetch_add(1, Ordering::SeqCst);
             sched::sleep_ns(IO_NS);
+            WOKEN.fetch_add(1, Ordering::SeqCst);
         }
         ok
     }
