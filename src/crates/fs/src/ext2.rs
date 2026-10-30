@@ -7,8 +7,8 @@
 //! ext2's magic, so the magic alone says little -- and what it could read
 //! but not safely write it mounts read-only.
 //!
-//! Every call arrives with the VFS lock held (see `FsOps`), so there is no
-//! locking here: two calls never overlap on the same filesystem.
+//! Every call arrives with its mount's lock held (see `FileSystem`), so there
+//! is no locking here: two calls never overlap on the same filesystem.
 //!
 //! The commit order is what e2fsck judges, and it is the same everywhere: the
 //! allocation bitmap, then the data and the indirect blocks, then the device
