@@ -1,8 +1,8 @@
 //! The `fs` provider on the management bus: every mount -- where, what
 //! filesystem, on which device, read-only or not -- and how big each is and
 //! how much of it is free, from what the filesystem counts in memory
-//! (`FileSystem::space`). Copied under the VFS's lock a mount at a time, as
-//! `mounts` reads it, and written with no lock held.
+//! (`FileSystem::space`). Copied a mount at a time under each one's lock, as
+//! `mounts` reads them, and written with no lock held.
 
 use crate::vfs_instance;
 use block::Disk;
@@ -45,7 +45,7 @@ fn mounts(call: &mut Call) -> Status {
     let Some(vfs) = vfs_instance() else {
         return call.refuse(Status::Busy, "no filesystem layer: no memory for it", None);
     };
-    /* All of them copied under the lock, before any is written */
+    /* All of them copied, each under its mount's lock, before any is written */
     let mounts = vfs.mount_infos();
     call.answer(|w| {
         w.begin_object();

@@ -116,6 +116,14 @@ loads the `modtest` module embedded in the image, with a parameter and
 without, and then feeds the loader damaged copies of it (see [Loadable modules](modules.md#testing)), and
 `fstest=on` runs the filesystem self-test on `/` once it is mounted
 (`fstest: passed` or `fstest: FAILED`; see [Filesystems](filesystems.md)).
+Part of it is the VFS's promise of a lock a mount: a filesystem of the
+test's own mounted under its directory, a call held in it, and meanwhile a
+file written, read back and removed on the filesystem under test, and a
+second call on the held mount kept waiting -- `two mounts at once: a call
+on the other went through`, a marker of both smoke boots. On the VFS of one
+lock the control fails it (`a call waited behind one held on another
+mount`). The C++ `test_vfs` runs the same self-test over a ramfs before
+there are tasks, and that part says it is not tried there.
 
 ## Smoke boots
 
@@ -1467,7 +1475,11 @@ to the tree `e2fsck -fy` leaves. The targets:
 - `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
   and ramfs mounted beside it and taken down again at paths nested,
   doubled, without a slash and too long; tasks of their own at work on those
-  meanwhile; the C ABI (`kernel_vfs_*`) handed words that are open files,
+  meanwhile, their disks now and then slow enough that a task's call sleeps
+  on one holding its mount's lock -- and a call on the root through before
+  it wakes, which a VFS of one lock never lets be (reached in a sixth of the
+  gate's inputs; 0 on the VFS before the lock a mount, the control); the C
+  ABI (`kernel_vfs_*`) handed words that are open files,
   were, and never were; and the file ABI (`kernel_file_*`) a module keeps its
   configuration through, each call held to what its composition of VFS
   calls does to the model -- a directory read an entry at a time

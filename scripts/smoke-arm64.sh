@@ -83,10 +83,15 @@ QEMU_PID=$!
 #   "MountRootFs: mounted ext4 on /"  - the root image was found and mounted rw
 #   "a sparse file past 4 GiB"        - and took a file of it past 2 and 4 GiB,
 #                                       holes between its extents
+#   "two mounts at once: a call on the other went through"
+#                                     - a call on it went through while one on
+#                                       a mount of fstest's own was held, and a
+#                                       second there waited: a lock a mount
 #   "fstest: passed"                  - the filesystem self-test ran on it
 #   "boot: complete"                  - shell started, BSP reached the idle loop
 MARKERS=("Self test passed" "Cpus started" "After test" "MountRootFs: mounted ext4 on /"
-         "a sparse file past 4 GiB" "fstest: passed" "EntropySource registered: rng0" "boot: complete")
+         "a sparse file past 4 GiB" "two mounts at once: a call on the other went through" "fstest: passed"
+         "EntropySource registered: rng0" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do

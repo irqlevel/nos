@@ -3,14 +3,15 @@
 //! kernel calls them by.
 //!
 //! [`vfs`] is the mount table, path resolution and the open files; under it
-//! [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and [`procfs`], each
-//! a [`vfs::FileSystem`] seeing one call at a time under the VFS lock, and
-//! each keeping what it holds in a [`vnode::Tree`]. [`image`] is a file held
-//! as a guest's disk, read and written off that lock. [`rootfs`] is what the
-//! kernel command line asks to be mounted at boot. C++ and the modules come
-//! in through the C ABI at the bottom of this file and of [`files`], and
-//! never see a vnode: an open file is a handle to them, and a handle is
-//! looked up, not followed.
+//! [`ext4`] and [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and
+//! [`procfs`], each a [`vfs::FileSystem`] seeing one call at a time under its
+//! mount's lock -- and calls on two mounts side by side -- and each keeping
+//! what it holds in a [`vnode::Tree`]. [`image`] is a file held as a guest's
+//! disk, read and written off that lock. [`rootfs`] is what the kernel
+//! command line asks to be mounted at boot. C++ and the modules come in
+//! through the C ABI at the bottom of this file and of [`files`], and never
+//! see a vnode: an open file is a handle to them, and a handle is looked up,
+//! not followed.
 
 #![no_std]
 
@@ -49,7 +50,7 @@ pub fn init() {
 }
 
 /// The one VFS, made on first use. That is early in boot, in task context,
-/// where its mutex can be allocated; two callers racing here both get the
+/// where its mutexes can be allocated; two callers racing here both get the
 /// same one. Public for the rest of the kernel image: another crate's
 /// command opens a file with `vfs::Open::new(fs::vfs_instance()?, ..)`, the
 /// way this crate's own commands do -- the `kernel_file_*` names are for
