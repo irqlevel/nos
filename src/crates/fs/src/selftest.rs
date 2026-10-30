@@ -4,19 +4,27 @@
 //! It uses nothing but the file API, so it is the same test over ext2,
 //! nanofs and ramfs alike -- and what it is really checking is that each of
 //! them means the same thing by a write at an offset, a truncate that grows,
-//! a rename across directories and a recursive remove.
+//! a rename across directories and a recursive remove. And one promise of
+//! the VFS's own, over a filesystem of the test's: a call held up on one
+//! mount holds up no call on another, and every other call on its own.
 
+use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kcore::cmd::Output;
+use kcore::sync::Event;
+use kcore::task::{self, TaskHandle};
+use kcore::time::Duration;
 use kcore::trace;
 
 use crate::files::buffer;
 use crate::image::Image;
 use crate::paths::Path;
-use crate::vfs::{FileStat, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
-                 OPEN_WRITE};
-use crate::vnode::Kind;
+use crate::vfs::{FileStat, FileSystem, Open, Vfs, MAX_MOUNTS, OPEN_APPEND, OPEN_CREATE, OPEN_READ,
+                 OPEN_TRUNCATE, OPEN_WRITE};
+use crate::vnode::{Kind, NodeId, Tree};
 use crate::vfs_instance;
 
 /// The big file is written in chunks of one size and read back in chunks of
@@ -519,6 +527,266 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
     true
 }
 
+/* ---- two mounts at once ---- */
+
+/// How long the gate holds a call before letting it go of itself: what ends
+/// a test gone wrong, rather than a boot that never does.
+const GATE_HOLD_SECS: u64 = 30;
+/// How long a call on another mount may take while one is held at the gate:
+/// well inside the hold, so that a VFS that made it wait for the held call
+/// is caught waiting, and not let through when the hold runs out.
+const APART_SECS: u64 = 10;
+/// How long a second call on the gate's own mount is watched: it must still
+/// be waiting at the end.
+const SAME_MS: u64 = 100;
+
+const APART_TEXT: &[u8] = b"written while a call on another mount was held";
+
+/// What the gate's filesystem, the test and its tasks share.
+struct Apart {
+    /// Signalled by each call as it comes into the gate's filesystem
+    entered: Event,
+    /// What lets the held call go
+    release: Event,
+    /// Whether a call that comes in is held there: the first one is
+    hold: AtomicBool,
+    /// The calls in the gate's filesystem now, and the most at once
+    inside: AtomicUsize,
+    most: AtomicUsize,
+    /// The call on the other mount: through, and whether it did what it was
+    /// to
+    apart_done: Event,
+    apart_ok: AtomicBool,
+    /// The second call on the gate's mount: about to be made, and through
+    same_started: Event,
+    same_done: Event,
+}
+
+/// A filesystem of an empty root whose lookups are held at a gate: a call
+/// on a mount whose device is slow, as the rest of the machine sees it.
+struct GateFs {
+    tree: Tree,
+    root: Option<NodeId>,
+    shared: Arc<Apart>,
+}
+
+impl FileSystem for GateFs {
+    fn name(&self) -> &'static str {
+        "gate"
+    }
+
+    fn mount(&mut self, _read_only: bool) -> Option<bool> {
+        Some(true)
+    }
+
+    fn unmount(&mut self) {}
+
+    fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    fn tree_mut(&mut self) -> &mut Tree {
+        &mut self.tree
+    }
+
+    fn root(&self) -> Option<NodeId> {
+        self.root
+    }
+
+    fn lookup(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
+        let shared = &self.shared;
+        let others = shared.inside.fetch_add(1, Ordering::SeqCst);
+        shared.most.fetch_max(others + 1, Ordering::SeqCst);
+        shared.entered.signal();
+        /* Held only when alone in here: a second waiter on the one event
+         * would be a bug of the test's own, on top of the one it found. */
+        if others == 0 && shared.hold.load(Ordering::SeqCst) {
+            shared.release.wait_for(Duration::from_secs(GATE_HOLD_SECS));
+        }
+        shared.inside.fetch_sub(1, Ordering::SeqCst);
+        None
+    }
+
+    fn create_file(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
+        None
+    }
+
+    fn create_dir(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
+        None
+    }
+
+    fn read(&mut self, _file: NodeId, _buf: &mut [u8], _offset: usize) -> bool {
+        false
+    }
+
+    fn write(&mut self, _file: NodeId, _data: &[u8], _offset: usize) -> bool {
+        false
+    }
+
+    fn truncate(&mut self, _file: NodeId, _size: usize) -> bool {
+        false
+    }
+
+    fn rename(&mut self, _node: NodeId, _dir: NodeId, _name: &[u8]) -> bool {
+        false
+    }
+
+    fn remove(&mut self, _node: NodeId) -> bool {
+        false
+    }
+}
+
+/// What a task of the test is handed: the VFS, what it shares, and the path
+/// it calls on.
+struct Probe {
+    vfs: &'static Vfs,
+    shared: Arc<Apart>,
+    path: Path,
+}
+
+/// The call held at the gate, its mount's lock with it.
+fn held_call(probe: Probe) {
+    let _ = probe.vfs.stat(probe.path.as_bytes());
+}
+
+/// A file written, read back and removed on the other mount.
+fn apart_call(probe: Probe) {
+    let (vfs, path) = (probe.vfs, probe.path.as_str());
+    let mut back = [0u8; APART_TEXT.len()];
+    let ok = vfs.write_file(path.as_bytes(), APART_TEXT)
+        && read_whole(vfs, path, &mut back) == Some(APART_TEXT.len())
+        && back == APART_TEXT
+        && vfs.remove(path.as_bytes());
+    probe.shared.apart_ok.store(ok, Ordering::SeqCst);
+    probe.shared.apart_done.signal();
+}
+
+/// A second call on the gate's mount.
+fn same_call(probe: Probe) {
+    probe.shared.same_started.signal();
+    let _ = probe.vfs.stat(probe.path.as_bytes());
+    probe.shared.same_done.signal();
+}
+
+/// The calls made while one is held at the gate, each in a task of its own
+/// in `tasks`: what went other than it should, or nothing.
+fn watch(vfs: &'static Vfs, shared: &Arc<Apart>, paths: [Path; 3], tasks: &mut [Option<TaskHandle>; 3])
+    -> Result<(), &'static str>
+{
+    let [held, apart, same] = paths;
+    let probe = |path| Probe { vfs, shared: shared.clone(), path };
+
+    tasks[0] = task::spawn_with("fstest-held", probe(held), held_call);
+    if tasks[0].is_none() {
+        return Err("no task for the call to hold");
+    }
+    if !shared.entered.wait_for(Duration::from_secs(APART_SECS)) {
+        return Err("the call to hold never came into the gate");
+    }
+
+    tasks[1] = task::spawn_with("fstest-apart", probe(apart), apart_call);
+    if tasks[1].is_none() {
+        return Err("no task for the call on the other mount");
+    }
+    if !shared.apart_done.wait_for(Duration::from_secs(APART_SECS)) {
+        return Err("a call waited behind one held on another mount");
+    }
+    if !shared.apart_ok.load(Ordering::SeqCst) {
+        return Err("a file written, read and removed while a call on another mount was held came out wrong");
+    }
+
+    tasks[2] = task::spawn_with("fstest-same", probe(same), same_call);
+    if tasks[2].is_none() {
+        return Err("no task for a second call on the gate's mount");
+    }
+    if !shared.same_started.wait_for(Duration::from_secs(APART_SECS)) {
+        return Err("the second call on the gate's mount never started");
+    }
+    if shared.same_done.wait_for(Duration::from_millis(SAME_MS)) {
+        return Err("a second call on one mount went in beside the first");
+    }
+    Ok(())
+}
+
+/// Two mounts at once: a filesystem whose call is held, mounted under the
+/// test's directory, and while the call is held a file written, read back
+/// and removed in that directory -- on the filesystem under test -- and a
+/// second call on the held one's mount, which must wait. Skipped, and said
+/// so, where the mount table has no room.
+fn two_mounts(vfs: &'static Vfs, base: &Path, report: &mut Reporter) -> bool {
+    let at = base.as_str();
+    /* The calls are made by tasks, and waited for in one: early in boot,
+     * where test_vfs runs the test over a ramfs, there are none yet. */
+    if task::current_id_or_none() == 0 {
+        report.say(at, "not in a task: two mounts at once not tried");
+        return true;
+    }
+    if vfs.mount_count() >= MAX_MOUNTS {
+        report.say(at, "no room in the mount table for the gate: two mounts at once not tried");
+        return true;
+    }
+    let paths = (Path::join(at, "gate"), Path::join(at, "gate/held"), Path::join(at, "apart.txt"),
+                 Path::join(at, "gate/same"));
+    let (Some(gate), Some(held), Some(apart), Some(same)) = paths else {
+        report.say(at, "path too long");
+        return false;
+    };
+    let events = (Event::new(), Event::new(), Event::new(), Event::new(), Event::new());
+    let (Some(entered), Some(release), Some(apart_done), Some(same_started), Some(same_done)) = events else {
+        report.say(at, "no memory for the gate's events");
+        return false;
+    };
+    let shared = Arc::new(Apart {
+        entered,
+        release,
+        hold: AtomicBool::new(true),
+        inside: AtomicUsize::new(0),
+        most: AtomicUsize::new(0),
+        apart_done,
+        apart_ok: AtomicBool::new(false),
+        same_started,
+        same_done,
+    });
+
+    let mut tree = Tree::new();
+    let Some(root) = tree.alloc(b"/", Kind::Dir) else {
+        report.say(at, "no memory for the gate's root");
+        return false;
+    };
+    tree[root].dir_loaded = true;
+    let fs = GateFs { tree, root: Some(root), shared: shared.clone() };
+    if vfs.mount(gate.as_bytes(), Box::new(fs), true).is_none() {
+        report.say(gate.as_str(), "the gate's filesystem would not mount");
+        return false;
+    }
+
+    let mut tasks: [Option<TaskHandle>; 3] = [None, None, None];
+    let verdict = watch(vfs, &shared, [held, apart, same], &mut tasks);
+    /* Whatever came of it: the held call let go, and every task of the test
+     * waited out -- each ends, the held one when the hold runs out at the
+     * latest. */
+    shared.hold.store(false, Ordering::SeqCst);
+    shared.release.signal();
+    drop(tasks);
+
+    let unmounted = vfs.unmount(gate.as_bytes());
+    if let Err(why) = verdict {
+        report.say(gate.as_str(), why);
+        return false;
+    }
+    if shared.most.load(Ordering::SeqCst) != 1 {
+        report.say(gate.as_str(), "two calls were in one filesystem at once");
+        return false;
+    }
+    if !unmounted {
+        report.say(gate.as_str(), "the gate's filesystem would not unmount");
+        return false;
+    }
+    report.say(gate.as_str(), "two mounts at once: a call on the other went through while one here was held, and a \
+                               second one here waited for it");
+    true
+}
+
 /* ---- the whole test ---- */
 
 pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
@@ -665,6 +933,10 @@ fn body(vfs: &'static Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path
     }
 
     if !image_file(vfs, image.as_str(), report) {
+        return false;
+    }
+
+    if !two_mounts(vfs, base, report) {
         return false;
     }
 

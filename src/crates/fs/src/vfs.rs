@@ -1,23 +1,42 @@
 //! The VFS: the mount table, path resolution, and the file API everything
 //! else in the kernel reads and writes through.
 //!
-//! One call at a time, under one mutex -- which is what lets a filesystem
-//! below have no locking of its own, and is the contract `FileSystem` is
-//! written to. The composed calls (`replace_file`, `locate`) take no lock
-//! themselves: they are made of the calls that do.
+//! One call at a time on each filesystem, under its mount's mutex -- which
+//! is what lets a filesystem below have no locking of its own, and is the
+//! contract `FileSystem` is written to -- and calls on two mounts side by
+//! side: a read of megabytes off one disk holds up nobody else's. The
+//! composed calls (`replace_file`, `locate`) take no lock themselves: they
+//! are made of the calls that do.
 //!
-//! Everything the mutex guards is inside it: the mounts, each owning its
-//! filesystem, and the open files. An open file is named by a `Handle` -- a
-//! slot in a table and the generation of what is in it -- so a handle from
-//! anywhere, the C++ shell's included, is looked up rather than followed: one
-//! that was closed, or never opened, reads as no file.
+//! Each lock owns what it guards, and they are taken in this order:
+//!
+//! - `admin`: a mount, an unmount and `unmount_all`, one at a time and each
+//!   for the whole of it -- the filesystem's own mount and unmount, a journal
+//!   replayed or written home, among it -- so that what one finds of the
+//!   table stays so until it is done.
+//! - a mount's slot: its filesystem, and the files open on it with what is
+//!   counted of them; held across every call into the filesystem, down to
+//!   the device and back.
+//! - `table`: the mount points, which a path is resolved through; held only
+//!   to read one or to change one, and never across a call into a
+//!   filesystem.
+//!
+//! No two slots are held at once, and none is waited for with the table
+//! held: a call waits for its own mount and nothing else, and the table is
+//! never held up behind a filesystem.
+//!
+//! An open file is named by a `Handle` -- its mount's slot, a slot in that
+//! mount's table of files and the generation of what is in it -- so a
+//! handle from anywhere, the C++ shell's included, is looked up rather than
+//! followed, under its mount's lock alone: one that was closed, or never
+//! opened, reads as no file.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
-use kcore::sync::Mutex;
+use kcore::sync::{Mutex, MutexGuard};
 use kcore::trace;
 
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
@@ -45,10 +64,14 @@ pub const OPEN_HOLD: usize = 32;
 /// What a filesystem is to the VFS: the tree of what it holds, and the calls
 /// that change it.
 ///
-/// Every call arrives with the VFS lock held, so an implementation needs no
-/// locking of its own: two calls never overlap on the same filesystem. A
-/// `NodeId` it is handed is one of its own tree's, live when the call was
-/// made -- the VFS found it there under the same lock.
+/// Every call arrives with its mount's lock held -- `mount` and `unmount`
+/// excepted, made before the filesystem is in its slot and after it is out
+/// of it, where nothing else can reach it -- so an implementation needs no
+/// locking of its own: two calls never overlap on the same filesystem.
+/// Calls on two filesystems do: what one keeps is its own, and anything two
+/// mounts share has a lock of its own. A `NodeId` it is handed is one of
+/// its own tree's, live when the call was made -- the VFS found it there
+/// under the same lock.
 pub trait FileSystem: Send {
     /// What `mounts` shows the filesystem as
     fn name(&self) -> &'static str;
@@ -227,22 +250,86 @@ impl core::fmt::Write for Line {
     }
 }
 
-struct Mount {
+/* ---- the mounts ---- */
+
+/// What the table holds of a mount: where it is, which it is and the device
+/// it is on -- what a path is resolved through, and a second mount of the
+/// device refused by, without the mount's own lock.
+struct Entry {
     path: [u8; MAX_PATH],
     path_len: usize,
+    /// Its mount's: tells it from the one that takes its place
+    id: u64,
+    /// The block device it is on, as a handle, or 0
+    device: usize,
+}
+
+impl Entry {
+    fn path(&self) -> &[u8] {
+        &self.path[..self.path_len]
+    }
+}
+
+/// The mount points: a mount's entry at its slot's index, there from when
+/// its filesystem is in the slot until before it is taken out -- so that
+/// whoever finds a path here and then takes the slot's lock finds the mount
+/// in it, unless it was taken down in between.
+struct Table {
+    entries: [Option<Entry>; MAX_MOUNTS],
+}
+
+/// What only a mount, an unmount and `unmount_all` touch, and hold for the
+/// whole of each.
+struct Admin {
+    next_id: u64,
+}
+
+struct Mount {
+    /// Tells this mount from the one that takes its place: its entry's
+    id: u64,
     fs: Box<dyn FileSystem>,
     read_only: bool,
     /// On the filesystem's device, for as long as it is mounted
     claim: usize,
     /// Handles open on it, which is what refuses an unmount
     open_files: usize,
-    /// Tells this mount from the one that takes its place
-    id: u64,
+    /// The writers and holds of every file open on it, by identity.
+    opens: BTreeMap<u64, Opens>,
 }
 
 impl Mount {
-    fn path(&self) -> &[u8] {
-        &self.path[..self.path_len]
+    /// How file `key` is open.
+    fn opens(&self, key: u64) -> Opens {
+        self.opens.get(&key).copied().unwrap_or_default()
+    }
+
+    /// Whether the file `node` is held as a disk's image, by whatever name.
+    fn held(&self, node: NodeId) -> bool {
+        self.opens(identity_key(&*self.fs, node)).holds != 0
+    }
+
+    /// The files at or under `top` held as a disk's image by any of their
+    /// names -- by identity, as `held` asks; a few, a guest's disk each.
+    fn held_under(&self, top: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let tree = self.fs.tree();
+        let mut at = Some(top);
+        while let Some(id) = at {
+            if tree.get(id).is_some_and(|n| n.is_file()) && self.held(id) {
+                out.push(id);
+            }
+            at = tree.next_under(top, id);
+        }
+        out
+    }
+
+    /// The mount, if it may be written.
+    fn writable(&mut self) -> Option<&mut Mount> {
+        if self.read_only {
+            trace!(0, "vfs: that mount is read-only");
+            return None;
+        }
+        Some(self)
     }
 
     /// Off its device and gone. The filesystem is released with it.
@@ -252,27 +339,57 @@ impl Mount {
     }
 }
 
+/// A mount's place: what is mounted in it, if anything, and the files open
+/// on that.
+struct MountSlot {
+    /// Which it is: what a handle into it says
+    index: usize,
+    /// Kept across the mounts the slot has, so that the generations go on
+    /// rising and no handle into a mount gone names a file of the next.
+    files: Files,
+    mount: Option<Mount>,
+}
+
 /* ---- open files ---- */
 
 /// An open file, as everyone outside the VFS knows it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Handle(NonZeroUsize);
 
-/* The slot, plus one, below; the generation above. */
+/* The slot, plus one, below -- the file's slot in its mount's table above
+ * the mount's slot -- and the generation above. */
 const HANDLE_SLOT_BITS: u32 = 32;
 const HANDLE_SLOT_MASK: usize = (1 << HANDLE_SLOT_BITS) - 1;
 const _: () = assert!(usize::BITS == 2 * HANDLE_SLOT_BITS, "a handle is a slot and a generation");
+/// The bits of a handle's slot that say which mount's it is.
+const HANDLE_MOUNT_BITS: u32 = 4;
+const HANDLE_MOUNT_MASK: usize = (1 << HANDLE_MOUNT_BITS) - 1;
+const _: () = assert!(MAX_MOUNTS <= 1 << HANDLE_MOUNT_BITS, "a handle says which mount's slot it is in");
+/// The files one mount may have open at once: as many as a handle's slot
+/// has room for beside its mount's.
+const MAX_FILES: usize = (HANDLE_SLOT_MASK >> HANDLE_MOUNT_BITS) - 1;
 
 impl Handle {
-    fn new(slot: usize, generation: u32) -> Option<Handle> {
-        if slot >= HANDLE_SLOT_MASK {
+    fn new(mount_slot: usize, file_slot: usize, generation: u32) -> Option<Handle> {
+        if mount_slot >= MAX_MOUNTS || file_slot >= MAX_FILES {
             return None;
         }
+        let slot = (file_slot << HANDLE_MOUNT_BITS) | mount_slot;
         NonZeroUsize::new(((generation as usize) << HANDLE_SLOT_BITS) | (slot + 1)).map(Handle)
     }
 
     fn slot(self) -> usize {
         (self.0.get() & HANDLE_SLOT_MASK) - 1
+    }
+
+    /// The slot of the mount it is on.
+    fn mount_slot(self) -> usize {
+        self.slot() & HANDLE_MOUNT_MASK
+    }
+
+    /// Its slot in its mount's table of files.
+    fn file_slot(self) -> usize {
+        self.slot() >> HANDLE_MOUNT_BITS
     }
 
     fn generation(self) -> u32 {
@@ -295,9 +412,8 @@ impl Handle {
     }
 }
 
-/// A position over a node, and the mount it belongs to.
+/// A position over a node of its mount's filesystem.
 struct OpenFile {
-    mount_id: u64,
     node: NodeId,
     pos: usize,
     flags: usize,
@@ -306,6 +422,62 @@ struct OpenFile {
 struct FileSlot {
     generation: u32,
     file: Option<OpenFile>,
+}
+
+/// The files open on a mount, each in a slot of its own.
+struct Files {
+    slots: Vec<FileSlot>,
+}
+
+impl Files {
+    fn get(&mut self, handle: Handle) -> Option<&mut OpenFile> {
+        let slot = self.slots.get_mut(handle.file_slot())?;
+        if slot.generation != handle.generation() {
+            return None;
+        }
+        slot.file.as_mut()
+    }
+
+    /// A slot for an open file on the mount in slot `mount_slot`, or None
+    /// when there is no memory for another.
+    fn add(&mut self, mount_slot: usize, file: OpenFile) -> Option<Handle> {
+        let index = match self.slots.iter().position(|slot| slot.file.is_none()) {
+            Some(index) => index,
+            None => {
+                if self.slots.try_reserve(1).is_err() {
+                    return None;
+                }
+                self.slots.push(FileSlot { generation: 0, file: None });
+                self.slots.len() - 1
+            }
+        };
+
+        let slot = &mut self.slots[index];
+        let handle = Handle::new(mount_slot, index, slot.generation)?;
+        slot.file = Some(file);
+        Some(handle)
+    }
+
+    fn take(&mut self, handle: Handle) -> Option<OpenFile> {
+        let slot = self.slots.get_mut(handle.file_slot())?;
+        if slot.generation != handle.generation() {
+            return None;
+        }
+        let file = slot.file.take()?;
+        /* The handle names nothing from here on, whatever takes the slot. */
+        slot.generation = slot.generation.wrapping_add(1);
+        Some(file)
+    }
+
+    /// Every file abandoned: its mount is going, and a handle kept past the
+    /// unmount finds no file rather than a filesystem that is gone.
+    fn abandon(&mut self) {
+        for slot in self.slots.iter_mut() {
+            if slot.file.take().is_some() {
+                slot.generation = slot.generation.wrapping_add(1);
+            }
+        }
+    }
 }
 
 /// How a file is open, across all its names: its writers and its holds.
@@ -330,96 +502,18 @@ fn identity_key(fs: &dyn FileSystem, node: NodeId) -> u64 {
     }
 }
 
-struct Inner {
-    mounts: [Option<Mount>; MAX_MOUNTS],
-    count: usize,
-    next_id: u64,
-    files: Vec<FileSlot>,
-    /// The writers and holds of every file open, by mount and identity.
-    opens: BTreeMap<(u64, u64), Opens>,
-}
-
-impl Inner {
-    /// How file `key` of mount `mount_id` is open.
-    fn opens(&self, mount_id: u64, key: u64) -> Opens {
-        self.opens.get(&(mount_id, key)).copied().unwrap_or_default()
-    }
-
-    fn mount_by_id(&mut self, id: u64) -> Option<&mut Mount> {
-        self.mounts.iter_mut().flatten().find(|mount| mount.id == id)
-    }
-
-    fn file(&mut self, handle: Handle) -> Option<&mut OpenFile> {
-        let slot = self.files.get_mut(handle.slot())?;
-        if slot.generation != handle.generation() {
-            return None;
-        }
-        slot.file.as_mut()
-    }
-
-    /// A slot for an open file, or None when there is no memory for another.
-    fn add_file(&mut self, file: OpenFile) -> Option<Handle> {
-        let index = match self.files.iter().position(|slot| slot.file.is_none()) {
-            Some(index) => index,
-            None => {
-                if self.files.try_reserve(1).is_err() {
-                    return None;
-                }
-                self.files.push(FileSlot { generation: 0, file: None });
-                self.files.len() - 1
-            }
-        };
-
-        let slot = &mut self.files[index];
-        let handle = Handle::new(index, slot.generation)?;
-        slot.file = Some(file);
-        Some(handle)
-    }
-
-    fn take_file(&mut self, handle: Handle) -> Option<OpenFile> {
-        let slot = self.files.get_mut(handle.slot())?;
-        if slot.generation != handle.generation() {
-            return None;
-        }
-        let file = slot.file.take()?;
-        /* The handle names nothing from here on, whatever takes the slot. */
-        slot.generation = slot.generation.wrapping_add(1);
-        Some(file)
-    }
-
-    /// The files of a mount that is going: abandoned, so that a handle kept
-    /// past the unmount finds no file rather than a filesystem that is gone.
-    fn drop_files_of(&mut self, mount_id: u64) {
-        for slot in self.files.iter_mut() {
-            if slot.file.as_ref().is_some_and(|file| file.mount_id == mount_id) {
-                slot.file = None;
-                slot.generation = slot.generation.wrapping_add(1);
-            }
-        }
-        self.opens.retain(|&(id, _), _| id != mount_id);
-    }
-
-    fn remove_mount(&mut self, index: usize) -> Option<Mount> {
-        let mount = self.mounts[index].take()?;
-        for at in index..self.count - 1 {
-            self.mounts[at] = self.mounts[at + 1].take();
-        }
-        self.count -= 1;
-        self.drop_files_of(mount.id);
-        Some(mount)
-    }
-}
-
 pub struct Vfs {
-    inner: Mutex<Inner>,
+    admin: Mutex<Admin>,
+    table: Mutex<Table>,
+    /// Each mount under its own lock, at its entry's index in the table
+    mounts: Box<[Mutex<MountSlot>; MAX_MOUNTS]>,
 }
 
 /// What a mount's claim on its device says to whoever is refused it.
 const MOUNT_HOLDER: &core::ffi::CStr = c"a mounted filesystem";
 
-/// What a path came to.
+/// What a path came to, on its mount.
 struct Resolved {
-    mount: usize,
     /// None when the last component does not exist; `parent` and `last` then
     /// say where it would go
     node: Option<NodeId>,
@@ -444,14 +538,15 @@ impl Resolved {
 
 impl Vfs {
     pub fn new() -> Option<Box<Vfs>> {
+        let mut mounts = Vec::new();
+        mounts.try_reserve_exact(MAX_MOUNTS).ok()?;
+        for index in 0..MAX_MOUNTS {
+            mounts.push(Mutex::new(MountSlot { index, files: Files { slots: Vec::new() }, mount: None })?);
+        }
         Some(Box::new(Vfs {
-            inner: Mutex::new(Inner {
-                mounts: [const { None }; MAX_MOUNTS],
-                count: 0,
-                next_id: 1,
-                files: Vec::new(),
-                opens: BTreeMap::new(),
-            })?,
+            admin: Mutex::new(Admin { next_id: 1 })?,
+            table: Mutex::new(Table { entries: [const { None }; MAX_MOUNTS] })?,
+            mounts: mounts.into_boxed_slice().try_into().ok()?,
         }))
     }
 
@@ -465,25 +560,34 @@ impl Vfs {
             return None;
         }
 
-        let mut inner = self.inner.lock();
+        /* Mounts and unmounts one at a time: what is found of the table here
+         * stays so until this is done -- the filesystem's own mount, which
+         * may replay a journal, among it -- while calls on every mount there
+         * is go on. */
+        let mut admin = self.admin.lock();
 
         let device = fs.device();
 
-        for mount in inner.mounts.iter().flatten() {
-            if mount.path() == path {
-                trace!(0, "vfs: something is mounted on that path already");
-                return None;
+        let index = {
+            let table = self.table.lock();
+            for entry in table.entries.iter().flatten() {
+                if entry.path() == path {
+                    trace!(0, "vfs: something is mounted on that path already");
+                    return None;
+                }
+                if device != 0 && entry.device == device {
+                    trace!(0, "vfs: that device is mounted already");
+                    return None;
+                }
             }
-            if device != 0 && mount.fs.device() == device {
-                trace!(0, "vfs: that device is mounted already");
-                return None;
+            match table.entries.iter().position(Option::is_none) {
+                Some(index) => index,
+                None => {
+                    trace!(0, "vfs: {} mounts is all there is room for", MAX_MOUNTS);
+                    return None;
+                }
             }
-        }
-
-        if inner.count >= MAX_MOUNTS {
-            trace!(0, "vfs: {} mounts is all there is room for", MAX_MOUNTS);
-            return None;
-        }
+        };
 
         /* The device is the filesystem's while it is mounted: nothing may
          * write to it around the filesystem -- the disk log, a module going
@@ -509,44 +613,46 @@ impl Vfs {
             }
         };
 
-        let mut entry = Mount {
-            path: [0; MAX_PATH],
-            path_len: path.len(),
-            fs,
-            read_only,
-            claim,
-            open_files: 0,
-            id: inner.next_id,
-        };
+        let id = admin.next_id;
+        admin.next_id += 1;
+        let mut entry = Entry { path: [0; MAX_PATH], path_len: path.len(), id, device };
         entry.path[..path.len()].copy_from_slice(path);
-        inner.next_id += 1;
 
-        let slot = inner.count;
-        inner.mounts[slot] = Some(entry);
-        inner.count += 1;
+        /* The filesystem in its slot before its path is in the table: whoever
+         * finds the path finds the mount. */
+        let mut slot = self.mounts[index].lock();
+        assert!(slot.mount.is_none(), "vfs: a slot the table has no entry for holds a mount");
+        slot.mount = Some(Mount { id, fs, read_only, claim, open_files: 0, opens: BTreeMap::new() });
+        self.table.lock().entries[index] = Some(entry);
         Some(read_only)
     }
 
     /// Take a filesystem off its mount point and release it. False if it is
     /// not mounted there, or is busy.
     pub fn unmount(&self, path: &[u8]) -> bool {
-        let mut inner = self.inner.lock();
+        let _admin = self.admin.lock();
 
-        let index = match inner.mounts.iter().flatten().position(|mount| mount.path() == path) {
-            Some(index) => index,
-            None => {
-                trace!(0, "vfs: nothing is mounted there");
-                return false;
-            }
+        let found = {
+            let table = self.table.lock();
+            table.entries.iter().enumerate().find_map(|(index, entry)| {
+                entry.as_ref().filter(|entry| entry.path() == path).map(|entry| (index, entry.id))
+            })
+        };
+        let Some((index, id)) = found else {
+            trace!(0, "vfs: nothing is mounted there");
+            return false;
         };
 
-        let open_files = inner.mounts[index].as_ref().map_or(0, |mount| mount.open_files);
+        let mut slot = self.lock_mounted(index, id);
+        let open_files = slot.mount.as_ref().map_or(0, |mount| mount.open_files);
         if open_files != 0 {
             trace!(0, "vfs: the mount is busy, {} files open", open_files);
             return false;
         }
 
-        if let Some(mount) = inner.remove_mount(index) {
+        let mount = self.take_mount(&mut slot);
+        drop(slot);
+        if let Some(mount) = mount {
             mount.take_down();
         }
         true
@@ -555,25 +661,29 @@ impl Vfs {
     /// Take everything down, deepest mount first, releasing each filesystem.
     /// This is shutdown: a handle left open is abandoned, not honoured.
     pub fn unmount_all(&self) {
-        let mut inner = self.inner.lock();
+        let _admin = self.admin.lock();
 
-        while inner.count > 0 {
+        loop {
             /* Deepest first, so a mount inside another goes before it. */
-            let mut deepest = 0;
-            let mut longest = 0;
-            for (index, mount) in inner.mounts.iter().flatten().enumerate() {
-                if mount.path_len >= longest {
-                    longest = mount.path_len;
-                    deepest = index;
+            let found = {
+                let table = self.table.lock();
+                let mut deepest: Option<(usize, &Entry)> = None;
+                for (index, entry) in table.entries.iter().enumerate() {
+                    let Some(entry) = entry else { continue };
+                    if deepest.is_none_or(|(_, longest)| entry.path_len >= longest.path_len) {
+                        deepest = Some((index, entry));
+                    }
                 }
-            }
-
-            let mount = match inner.remove_mount(deepest) {
-                Some(mount) => mount,
-                None => return,
+                deepest.map(|(index, entry)| (index, entry.id, entry.path, entry.path_len))
             };
+            let Some((index, id, path, path_len)) = found else { return };
 
-            trace!(0, "vfs: unmounting {}", core::str::from_utf8(mount.path()).unwrap_or("?"));
+            let mut slot = self.lock_mounted(index, id);
+            let mount = self.take_mount(&mut slot);
+            drop(slot);
+            let Some(mount) = mount else { continue };
+
+            trace!(0, "vfs: unmounting {}", core::str::from_utf8(&path[..path_len]).unwrap_or("?"));
             if mount.open_files != 0 {
                 trace!(0, "vfs: unmounting with {} files still open", mount.open_files);
             }
@@ -581,13 +691,32 @@ impl Vfs {
         }
     }
 
+    /// The slot at `index`, locked, holding the mount `id` its entry names:
+    /// under `admin`, which alone changes either, it holds what the table
+    /// says.
+    fn lock_mounted(&self, index: usize, id: u64) -> MutexGuard<'_, MountSlot> {
+        let slot = self.mounts[index].lock();
+        assert!(slot.mount.as_ref().is_some_and(|mount| mount.id == id),
+                "vfs: the table names a mount its slot does not hold");
+        slot
+    }
+
+    /// The mount in `slot` out of the table and out of the slot, the files
+    /// open on it abandoned: no path finds it from here on, and no handle.
+    /// The caller holds `admin`, and the slot's lock.
+    fn take_mount(&self, slot: &mut MountSlot) -> Option<Mount> {
+        self.table.lock().entries[slot.index] = None;
+        slot.files.abandon();
+        slot.mount.take()
+    }
+
     /// Which mount a path is on -- the one the VFS resolves it through --
     /// as an identity no other mount has had or will have: for a walk that
     /// keeps to one filesystem (`find -xdev`).
     pub fn mount_id(&self, path: &[u8]) -> Option<u64> {
-        let inner = self.inner.lock();
-        let (index, _) = Self::find_mount(&inner, path)?;
-        Some(inner.mounts[index].as_ref()?.id)
+        let table = self.table.lock();
+        let (index, _) = Self::find_mount(&table, path)?;
+        Some(table.entries[index].as_ref()?.id)
     }
 
     /// The space of the filesystem a path is on -- the one the VFS resolves
@@ -595,52 +724,83 @@ impl Vfs {
     /// whether the path is there yet or not. None for a path no mount holds,
     /// or a filesystem that does not say.
     pub fn space_of(&self, path: &[u8]) -> Option<Space> {
-        let inner = self.inner.lock();
-        let (index, _) = Self::find_mount(&inner, path)?;
-        inner.mounts[index].as_ref()?.fs.space()
+        let (slot, _) = self.locate_path(path)?;
+        slot.mount.as_ref()?.fs.space()
     }
 
     pub fn mount_count(&self) -> usize {
-        self.inner.lock().count
+        self.table.lock().entries.iter().flatten().count()
+    }
+
+    /// The mounts in the order they were taken -- each one's slot and id,
+    /// the empty slots last -- as the table has them at one moment, to be
+    /// walked without it.
+    fn mounted(&self) -> [Option<(usize, u64)>; MAX_MOUNTS] {
+        let mut order: [Option<(usize, u64)>; MAX_MOUNTS] = {
+            let table = self.table.lock();
+            core::array::from_fn(|index| table.entries[index].as_ref().map(|entry| (index, entry.id)))
+        };
+        /* Every mount is given a higher id than the one before */
+        order.sort_unstable_by_key(|mounted| mounted.map_or(u64::MAX, |(_, id)| id));
+        order
     }
 
     /// What the index'th mount is, for `mounts` to print.
     pub fn mount_info(&self, index: usize) -> Option<MountInfo> {
-        let inner = self.inner.lock();
-        Some(Self::info_of(inner.mounts.get(index)?.as_ref()?))
+        let (slot, id) = (*self.mounted().get(index)?)?;
+        self.info_of(slot, id)
     }
 
-    /// Every mount, as `mount_info` has each, copied under one hold of the
-    /// lock: a mount that comes or goes meanwhile cannot make another be
-    /// seen twice, or not at all.
+    /// Every mount, as `mount_info` has each: those the table had at one
+    /// moment, in the order they were taken, each copied under its own lock
+    /// -- one taken down meanwhile left out, none seen twice.
     pub fn mount_infos(&self) -> [Option<MountInfo>; MAX_MOUNTS] {
-        let inner = self.inner.lock();
-        core::array::from_fn(|i| inner.mounts[i].as_ref().map(Self::info_of))
+        let mut infos: [Option<MountInfo>; MAX_MOUNTS] = [const { None }; MAX_MOUNTS];
+        let mut at = 0;
+        for (slot, id) in self.mounted().into_iter().flatten() {
+            if let Some(info) = self.info_of(slot, id) {
+                infos[at] = Some(info);
+                at += 1;
+            }
+        }
+        infos
     }
 
-    fn info_of(mount: &Mount) -> MountInfo {
+    /// What the mount in slot `index` is, while it is still the mount `id`:
+    /// None for one taken down since.
+    fn info_of(&self, index: usize, id: u64) -> Option<MountInfo> {
+        let slot = self.mounts.get(index)?.lock();
+        let mount = slot.mount.as_ref().filter(|mount| mount.id == id)?;
         let mut info = MountInfo {
-            path: mount.path,
-            path_len: mount.path_len,
+            path: [0; MAX_PATH],
+            path_len: 0,
             fs_name: mount.fs.name(),
             info: Line { text: [0; INFO_MAX], len: 0 },
             read_only: mount.read_only,
             device: mount.fs.device(),
             space: mount.fs.space(),
         };
+        {
+            /* Its entry: in the table for as long as the slot holds it */
+            let table = self.table.lock();
+            let entry = table.entries[index].as_ref()?;
+            info.path = entry.path;
+            info.path_len = entry.path_len;
+        }
         mount.fs.info(&mut info.info);
-        info
+        Some(info)
     }
 
     /* ---- resolution ---- */
 
-    /// The mount a path is on: the longest mount path it starts with, and
-    /// what is left of it after that.
-    fn find_mount<'a>(inner: &Inner, path: &'a [u8]) -> Option<(usize, &'a [u8])> {
+    /// The mount a path is on: the slot of the longest mount path it starts
+    /// with, and what is left of it after that.
+    fn find_mount<'p>(table: &Table, path: &'p [u8]) -> Option<(usize, &'p [u8])> {
         let mut best: Option<(usize, usize)> = None;
 
-        for (index, mount) in inner.mounts.iter().flatten().enumerate() {
-            let mpath = mount.path();
+        for (index, entry) in table.entries.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let mpath = entry.path();
             if mpath.is_empty() || path.len() < mpath.len() || &path[..mpath.len()] != mpath {
                 continue;
             }
@@ -665,21 +825,56 @@ impl Vfs {
         Some((index, rest))
     }
 
-    /// Walk a path to what it names.
-    fn resolve(inner: &mut Inner, path: &[u8]) -> Option<Resolved> {
-        let (index, rest) = match Self::find_mount(inner, path) {
-            Some(found) => found,
-            None => {
-                trace!(0, "vfs: no mount holds that path");
-                return None;
+    /// The slot `pick` finds in the table, locked, and what else it found
+    /// there -- as long as the slot still holds the mount the table named.
+    /// One taken down between the two has `pick` ask the table again, as it
+    /// is then, which no longer has it: each time round follows an unmount
+    /// that went through, so the walk ends. None when `pick` finds nothing.
+    fn locate<R>(&self, mut pick: impl FnMut(&Table) -> Option<(usize, R)>)
+        -> Option<(MutexGuard<'_, MountSlot>, R)>
+    {
+        loop {
+            let (index, id, found) = {
+                let table = self.table.lock();
+                let (index, found) = pick(&table)?;
+                (index, table.entries.get(index)?.as_ref()?.id, found)
+            };
+            let slot = self.mounts.get(index)?.lock();
+            if slot.mount.as_ref().is_some_and(|mount| mount.id == id) {
+                return Some((slot, found));
             }
-        };
+        }
+    }
 
-        let fs = &mut inner.mounts[index].as_mut()?.fs;
+    /// The mount `path` is on, locked, and what is left of the path past
+    /// where it is mounted.
+    fn locate_path<'p>(&self, path: &'p [u8]) -> Option<(MutexGuard<'_, MountSlot>, &'p [u8])> {
+        self.locate(|table| Self::find_mount(table, path))
+    }
+
+    /// The mount `path` is on, locked, and the path walked there to what it
+    /// names.
+    fn lock_resolved(&self, path: &[u8]) -> Option<(MutexGuard<'_, MountSlot>, Resolved)> {
+        let Some((mut slot, rest)) = self.locate_path(path) else {
+            trace!(0, "vfs: no mount holds that path");
+            return None;
+        };
+        let resolved = Self::resolve(slot.mount.as_mut()?, rest)?;
+        Some((slot, resolved))
+    }
+
+    /// The slot of the mount the open file `handle` is on, locked: the one
+    /// lock a call on an open file takes.
+    fn lock_handle(&self, handle: Handle) -> Option<MutexGuard<'_, MountSlot>> {
+        Some(self.mounts.get(handle.mount_slot())?.lock())
+    }
+
+    /// Walk what is left of a path past its mount point to what it names.
+    fn resolve(mount: &mut Mount, rest: &[u8]) -> Option<Resolved> {
+        let fs = &mut mount.fs;
         let mut at = fs.root()?;
 
         let mut resolved = Resolved {
-            mount: index,
             node: None,
             parent: None,
             last: [0; NAME_MAX],
@@ -754,11 +949,8 @@ impl Vfs {
 
 impl Vfs {
     pub fn stat(&self, path: &[u8]) -> Option<FileStat> {
-        let mut inner = self.inner.lock();
-
-        let resolved = Self::resolve(&mut inner, path)?;
-        let mount = inner.mounts[resolved.mount].as_ref()?;
-        let node = mount.fs.tree().get(resolved.node?)?;
+        let (slot, resolved) = self.lock_resolved(path)?;
+        let node = slot.mount.as_ref()?.fs.tree().get(resolved.node?)?;
 
         Some(FileStat {
             kind: node.kind,
@@ -777,11 +969,9 @@ impl Vfs {
     /// last, and an error that says why when there is no directory to read
     /// -- so that one the filesystem cannot read is told from an empty one.
     pub fn dir_entry(&self, path: &[u8], index: usize) -> Result<Option<DirEntry>, DirError> {
-        let mut inner = self.inner.lock();
-
-        let resolved = Self::resolve(&mut inner, path).ok_or(DirError::NotFound)?;
+        let (mut slot, resolved) = self.lock_resolved(path).ok_or(DirError::NotFound)?;
         let dir = resolved.node.ok_or(DirError::NotFound)?;
-        let fs = &mut inner.mounts[resolved.mount].as_mut().ok_or(DirError::NotFound)?.fs;
+        let fs = &mut slot.mount.as_mut().ok_or(DirError::NotFound)?.fs;
 
         if !fs.tree().get(dir).ok_or(DirError::NotFound)?.is_dir() {
             return Err(DirError::NotDir);
@@ -815,13 +1005,11 @@ impl Vfs {
             return None;
         }
 
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
-
         let writes = flags & (OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE) != 0;
 
-        let resolved = Self::resolve(inner, path)?;
-        let mount = inner.mounts[resolved.mount].as_mut()?;
+        let (mut guard, resolved) = self.lock_resolved(path)?;
+        let slot = &mut *guard;
+        let mount = slot.mount.as_mut()?;
 
         if writes && mount.read_only {
             trace!(0, "vfs: that mount is read-only");
@@ -846,7 +1034,7 @@ impl Vfs {
         };
 
         let key = identity_key(&*mount.fs, node);
-        let opens = inner.opens.get(&(mount.id, key)).copied().unwrap_or_default();
+        let opens = mount.opens(key);
         let size = match mount.fs.tree().get(node) {
             Some(found) if found.is_file() => {
                 /* A disk's image is its holder's alone to write -- and only
@@ -877,11 +1065,9 @@ impl Vfs {
         }
 
         let pos = if flags & OPEN_APPEND != 0 { size } else { 0 };
-        let mount_id = mount.id;
 
-        let handle = inner.add_file(OpenFile { mount_id, node, pos, flags })?;
+        let handle = slot.files.add(slot.index, OpenFile { node, pos, flags })?;
 
-        let mount = inner.mounts[resolved.mount].as_mut()?;
         if let Some(found) = mount.fs.tree_mut().get_mut(node) {
             found.open_count += 1;
             if flags & OPEN_WRITE != 0 {
@@ -892,7 +1078,7 @@ impl Vfs {
             }
         }
         mount.open_files += 1;
-        let counted = inner.opens.entry((mount_id, key)).or_default();
+        let counted = mount.opens.entry(key).or_default();
         if flags & OPEN_WRITE != 0 {
             counted.writers += 1;
         }
@@ -913,13 +1099,14 @@ impl Vfs {
     }
 
     fn close_as(&self, handle: Handle, image: bool) {
-        let mut inner = self.inner.lock();
+        let Some(mut guard) = self.lock_handle(handle) else { return };
+        let slot = &mut *guard;
 
         /* A held file is let go of by its image alone: a word that names its
          * handle -- guessed, or one a caller of the file ABI got wrong --
          * must not take the hold away from under the reads and writes the
          * image goes on making off this lock. */
-        match inner.file(handle) {
+        match slot.files.get(handle) {
             Some(file) if file.flags & OPEN_HOLD != 0 && !image => {
                 trace!(0, "vfs: a disk's image is let go of by its image, not closed");
                 return;
@@ -927,55 +1114,48 @@ impl Vfs {
             Some(_) => {}
             None => return,
         }
-        let file = match inner.take_file(handle) {
-            Some(file) => file,
-            None => return,
-        };
+        let Some(file) = slot.files.take(handle) else { return };
+        let Some(mount) = slot.mount.as_mut() else { return };
 
-        let mut key = None;
-        if let Some(mount) = inner.mount_by_id(file.mount_id) {
-            key = Some(identity_key(&*mount.fs, file.node));
-            if let Some(node) = mount.fs.tree_mut().get_mut(file.node) {
-                node.open_count = node.open_count.saturating_sub(1);
-                if file.flags & OPEN_WRITE != 0 {
-                    node.writers = node.writers.saturating_sub(1);
-                }
-                if file.flags & OPEN_HOLD != 0 {
-                    node.holds = node.holds.saturating_sub(1);
-                }
+        let key = identity_key(&*mount.fs, file.node);
+        if let Some(node) = mount.fs.tree_mut().get_mut(file.node) {
+            node.open_count = node.open_count.saturating_sub(1);
+            if file.flags & OPEN_WRITE != 0 {
+                node.writers = node.writers.saturating_sub(1);
             }
-            mount.open_files = mount.open_files.saturating_sub(1);
+            if file.flags & OPEN_HOLD != 0 {
+                node.holds = node.holds.saturating_sub(1);
+            }
         }
-        if let Some(key) = key {
-            if let Some(counted) = inner.opens.get_mut(&(file.mount_id, key)) {
-                if file.flags & OPEN_WRITE != 0 {
-                    counted.writers = counted.writers.saturating_sub(1);
-                }
-                if file.flags & OPEN_HOLD != 0 {
-                    counted.holds = counted.holds.saturating_sub(1);
-                }
-                if counted.writers == 0 && counted.holds == 0 {
-                    inner.opens.remove(&(file.mount_id, key));
-                }
+        mount.open_files = mount.open_files.saturating_sub(1);
+        if let Some(counted) = mount.opens.get_mut(&key) {
+            if file.flags & OPEN_WRITE != 0 {
+                counted.writers = counted.writers.saturating_sub(1);
+            }
+            if file.flags & OPEN_HOLD != 0 {
+                counted.holds = counted.holds.saturating_sub(1);
+            }
+            if counted.writers == 0 && counted.holds == 0 {
+                mount.opens.remove(&key);
             }
         }
     }
 
     /// What was read into `buf`: 0 at the end of the file, None on error.
     pub fn read(&self, handle: Handle, buf: &mut [u8]) -> Option<usize> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, node, pos, flags) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node, file.pos, file.flags)
+        let (node, pos, flags) = {
+            let file = slot.files.get(handle)?;
+            (file.node, file.pos, file.flags)
         };
         if flags & OPEN_READ == 0 {
             trace!(0, "vfs: that handle is not open for reading");
             return None;
         }
 
-        let fs = &mut inner.mount_by_id(mount_id)?.fs;
+        let fs = &mut slot.mount.as_mut()?.fs;
         let size = fs.tree().get(node)?.size;
         if pos >= size || buf.is_empty() {
             return Some(0);
@@ -986,7 +1166,7 @@ impl Vfs {
             return None;
         }
 
-        inner.file(handle)?.pos = pos + take;
+        slot.files.get(handle)?.pos = pos + take;
         Some(take)
     }
 
@@ -995,12 +1175,12 @@ impl Vfs {
     }
 
     fn write_at(&self, handle: Handle, data: &[u8]) -> Option<()> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, node, pos, flags) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node, file.pos, file.flags)
+        let (node, pos, flags) = {
+            let file = slot.files.get(handle)?;
+            (file.node, file.pos, file.flags)
         };
         if flags & OPEN_WRITE == 0 {
             trace!(0, "vfs: that handle is not open for writing");
@@ -1015,7 +1195,7 @@ impl Vfs {
             return Some(());
         }
 
-        let fs = &mut inner.mount_by_id(mount_id)?.fs;
+        let fs = &mut slot.mount.as_mut()?.fs;
         let pos = if flags & OPEN_APPEND != 0 { fs.tree().get(node)?.size } else { pos };
         let end = pos.checked_add(data.len())?;
 
@@ -1023,7 +1203,7 @@ impl Vfs {
             return None;
         }
 
-        inner.file(handle)?.pos = end;
+        slot.files.get(handle)?.pos = end;
         Some(())
     }
 
@@ -1031,19 +1211,19 @@ impl Vfs {
     /// or past its end, None on an error. The handle's position is not
     /// moved, so two callers of one handle do not race on it.
     pub fn read_at(&self, handle: Handle, offset: usize, buf: &mut [u8]) -> Option<usize> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, node, flags) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node, file.flags)
+        let (node, flags) = {
+            let file = slot.files.get(handle)?;
+            (file.node, file.flags)
         };
         if flags & OPEN_READ == 0 {
             trace!(0, "vfs: that handle is not open for reading");
             return None;
         }
 
-        let fs = &mut inner.mount_by_id(mount_id)?.fs;
+        let fs = &mut slot.mount.as_mut()?.fs;
         let size = fs.tree().get(node)?.size;
         if offset >= size || buf.is_empty() {
             return Some(0);
@@ -1057,11 +1237,11 @@ impl Vfs {
     /// has, or none of it: a disk image, whose size is its disk's, is never
     /// grown by what its guest writes. The handle's position is not moved.
     pub fn write_within(&self, handle: Handle, offset: usize, data: &[u8]) -> bool {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
 
-        let (mount_id, node, flags) = match inner.file(handle) {
-            Some(file) => (file.mount_id, file.node, file.flags),
+        let (node, flags) = match slot.files.get(handle) {
+            Some(file) => (file.node, file.flags),
             None => return false,
         };
         if flags & OPEN_WRITE == 0 {
@@ -1069,7 +1249,7 @@ impl Vfs {
             return false;
         }
 
-        let Some(fs) = inner.mount_by_id(mount_id).map(|mount| &mut mount.fs) else {
+        let Some(fs) = slot.mount.as_mut().map(|mount| &mut mount.fs) else {
             return false;
         };
         let size = match fs.tree().get(node) {
@@ -1088,37 +1268,29 @@ impl Vfs {
     /// image made the size of its disk before anything is written into it.
     /// The handle's position is not moved.
     pub fn set_length(&self, handle: Handle, size: usize) -> bool {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
 
-        let (mount_id, node, flags) = match inner.file(handle) {
-            Some(file) => (file.mount_id, file.node, file.flags),
+        let (node, flags) = match slot.files.get(handle) {
+            Some(file) => (file.node, file.flags),
             None => return false,
         };
         if flags & OPEN_WRITE == 0 {
             trace!(0, "vfs: that handle is not open for writing");
             return false;
         }
-        let held = inner.mount_by_id(mount_id).map(|mount| identity_key(&*mount.fs, node))
-            .is_some_and(|key| inner.opens(mount_id, key).holds != 0);
-        match inner.mount_by_id(mount_id) {
-            Some(mount) if !mount.read_only => {
-                match mount.fs.tree().get(node) {
-                    Some(found) if found.is_file() && !held => {}
-                    Some(found) if found.is_file() => {
-                        trace!(0, "vfs: that file is a disk's image, its size held while it is open");
-                        return false;
-                    }
-                    _ => return false,
-                }
-                mount.fs.truncate(node, size)
+        let Some(mount) = slot.mount.as_mut() else { return false };
+        let held = mount.held(node);
+        let Some(mount) = mount.writable() else { return false };
+        match mount.fs.tree().get(node) {
+            Some(found) if found.is_file() && !held => {}
+            Some(found) if found.is_file() => {
+                trace!(0, "vfs: that file is a disk's image, its size held while it is open");
+                return false;
             }
-            Some(_) => {
-                trace!(0, "vfs: that mount is read-only");
-                false
-            }
-            None => false,
+            _ => return false,
         }
+        mount.fs.truncate(node, size)
     }
 
     /// The device the blocks of the file `handle` holds (`OPEN_HOLD`) are on,
@@ -1126,17 +1298,14 @@ impl Vfs {
     /// or None where its filesystem keeps no blocks of its own on a device,
     /// or the handle holds nothing.
     pub fn geometry(&self, handle: Handle) -> Option<(usize, usize)> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, flags) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.flags)
-        };
+        let flags = slot.files.get(handle)?.flags;
         if flags & OPEN_HOLD == 0 {
             return None;
         }
-        let fs = &inner.mount_by_id(mount_id)?.fs;
+        let fs = &slot.mount.as_ref()?.fs;
         match (fs.device(), fs.data_block_size()) {
             (0, _) | (_, 0) => None,
             (device, size) => Some((device, size)),
@@ -1150,18 +1319,18 @@ impl Vfs {
     /// this lock, stays the file's -- and nobody else's to write -- for as
     /// long as the hold does.
     pub fn map(&self, handle: Handle, first: u64, out: &mut [u64]) -> bool {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
 
-        let (mount_id, node, flags) = match inner.file(handle) {
-            Some(file) => (file.mount_id, file.node, file.flags),
+        let (node, flags) = match slot.files.get(handle) {
+            Some(file) => (file.node, file.flags),
             None => return false,
         };
         if flags & OPEN_HOLD == 0 {
             trace!(0, "vfs: only a file held as a disk's image is mapped");
             return false;
         }
-        let Some(mount) = inner.mount_by_id(mount_id) else { return false };
+        let Some(mount) = slot.mount.as_mut() else { return false };
         let size = match mount.fs.tree().get(node) {
             Some(found) => found.size as u64,
             None => return false,
@@ -1184,18 +1353,18 @@ impl Vfs {
     /// -- the image -- has no read of its own under way off this lock on
     /// what it gives back: the next file may have those blocks.
     pub fn punch(&self, handle: Handle, offset: u64, len: u64) -> Option<u64> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, node, flags) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node, file.flags)
+        let (node, flags) = {
+            let file = slot.files.get(handle)?;
+            (file.node, file.flags)
         };
         if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
             trace!(0, "vfs: only a file held for writing as a disk's image is punched");
             return None;
         }
-        let mount = inner.mount_by_id(mount_id)?;
+        let mount = slot.mount.as_mut()?;
         if mount.read_only {
             trace!(0, "vfs: that mount is read-only");
             return None;
@@ -1215,18 +1384,18 @@ impl Vfs {
     /// The filesystem the file is on, synced: everything written to it on
     /// its disk's medium.
     pub fn sync_file(&self, handle: Handle) -> bool {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
 
-        let mount_id = match inner.file(handle) {
-            Some(file) => file.mount_id,
-            None => return false,
-        };
-        inner.mount_by_id(mount_id).is_some_and(|mount| mount.fs.sync())
+        if slot.files.get(handle).is_none() {
+            return false;
+        }
+        slot.mount.as_mut().is_some_and(|mount| mount.fs.sync())
     }
 
     pub fn seek(&self, handle: Handle, pos: usize) -> bool {
-        match self.inner.lock().file(handle) {
+        let Some(mut slot) = self.lock_handle(handle) else { return false };
+        match slot.files.get(handle) {
             Some(file) => {
                 file.pos = pos;
                 true
@@ -1236,18 +1405,16 @@ impl Vfs {
     }
 
     pub fn tell(&self, handle: Handle) -> usize {
-        self.inner.lock().file(handle).map_or(0, |file| file.pos)
+        let Some(mut slot) = self.lock_handle(handle) else { return 0 };
+        slot.files.get(handle).map_or(0, |file| file.pos)
     }
 
     pub fn size(&self, handle: Handle) -> usize {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let Some(mut guard) = self.lock_handle(handle) else { return 0 };
+        let slot = &mut *guard;
 
-        let (mount_id, node) = match inner.file(handle) {
-            Some(file) => (file.mount_id, file.node),
-            None => return 0,
-        };
-        inner.mount_by_id(mount_id)
+        let Some(node) = slot.files.get(handle).map(|file| file.node) else { return 0 };
+        slot.mount.as_ref()
             .and_then(|mount| mount.fs.tree().get(node))
             .map_or(0, |node| node.size)
     }
@@ -1257,73 +1424,31 @@ impl Vfs {
     /// that two names of one file are one; or, on a filesystem that keeps
     /// none, its node. Neither is ever 0.
     pub fn identity(&self, handle: Handle) -> Option<(u64, u64)> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
-        let (mount_id, node) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node)
-        };
-        let fs = &inner.mount_by_id(mount_id)?.fs;
-        fs.tree().get(node)?;
-        Some((mount_id, identity_key(&**fs, node)))
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
+
+        let node = slot.files.get(handle)?.node;
+        let mount = slot.mount.as_ref()?;
+        mount.fs.tree().get(node)?;
+        Some((mount.id, identity_key(&*mount.fs, node)))
     }
 
     /// The open file's size, or None for a handle that is no open file's.
     pub fn length(&self, handle: Handle) -> Option<usize> {
-        let mut guard = self.inner.lock();
-        let inner = &mut *guard;
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
 
-        let (mount_id, node) = {
-            let file = inner.file(handle)?;
-            (file.mount_id, file.node)
-        };
-        Some(inner.mount_by_id(mount_id)?.fs.tree().get(node)?.size)
-    }
-
-    /// Whether the file `node` of the mount a path resolved to is held as a
-    /// disk's image, by whatever name.
-    fn held(inner: &Inner, resolved: &Resolved, node: NodeId) -> bool {
-        match inner.mounts[resolved.mount].as_ref() {
-            Some(mount) => inner.opens(mount.id, identity_key(&*mount.fs, node)).holds != 0,
-            None => false,
-        }
-    }
-
-    /// The files at or under `top` held as a disk's image by any of their
-    /// names -- by identity, as `held` asks; a few, a guest's disk each.
-    fn held_under(inner: &Inner, resolved: &Resolved, top: NodeId) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        let Some(mount) = inner.mounts[resolved.mount].as_ref() else { return out };
-        let tree = mount.fs.tree();
-        let mut at = Some(top);
-        while let Some(id) = at {
-            if tree.get(id).is_some_and(|n| n.is_file())
-                && inner.opens(mount.id, identity_key(&*mount.fs, id)).holds != 0 {
-                out.push(id);
-            }
-            at = tree.next_under(top, id);
-        }
-        out
-    }
-
-    /// The mount a resolved path is on, if it may be written.
-    fn writable<'a>(inner: &'a mut Inner, resolved: &Resolved) -> Option<&'a mut Mount> {
-        let mount = inner.mounts[resolved.mount].as_mut()?;
-        if mount.read_only {
-            trace!(0, "vfs: that mount is read-only");
-            return None;
-        }
-        Some(mount)
+        let node = slot.files.get(handle)?.node;
+        Some(slot.mount.as_ref()?.fs.tree().get(node)?.size)
     }
 
     pub fn create(&self, path: &[u8], directory: bool) -> bool {
-        let mut inner = self.inner.lock();
-        Self::create_locked(&mut inner, path, directory).is_some()
+        self.try_create(path, directory).is_some()
     }
 
-    fn create_locked(inner: &mut Inner, path: &[u8], directory: bool) -> Option<NodeId> {
-        let resolved = Self::resolve(inner, path)?;
-        let mount = Self::writable(inner, &resolved)?;
+    fn try_create(&self, path: &[u8], directory: bool) -> Option<NodeId> {
+        let (mut slot, resolved) = self.lock_resolved(path)?;
+        let mount = slot.mount.as_mut()?.writable()?;
 
         if resolved.node.is_some() {
             trace!(0, "vfs: that path exists already");
@@ -1339,19 +1464,18 @@ impl Vfs {
     }
 
     pub fn remove(&self, path: &[u8]) -> bool {
-        let mut inner = self.inner.lock();
-        Self::remove_locked(&mut inner, path).is_some()
+        self.try_remove(path).is_some()
     }
 
-    fn remove_locked(inner: &mut Inner, path: &[u8]) -> Option<()> {
-        let resolved = Self::resolve(inner, path)?;
+    fn try_remove(&self, path: &[u8]) -> Option<()> {
+        let (mut slot, resolved) = self.lock_resolved(path)?;
         let node = resolved.node?;
-        let fs = &mut Self::writable(inner, &resolved)?.fs;
+        let mount = slot.mount.as_mut()?.writable()?;
 
-        if fs.tree().get(node)?.is_dir() && !fs.load_dir(node) {
+        if mount.fs.tree().get(node)?.is_dir() && !mount.fs.load_dir(node) {
             return None;
         }
-        if fs.tree().has_open_files(node) {
+        if mount.fs.tree().has_open_files(node) {
             trace!(0, "vfs: something under that path is open");
             return None;
         }
@@ -1360,37 +1484,35 @@ impl Vfs {
          * its image went on writing them off this lock. A sound filesystem
          * counts every name; one that counts fewer is no reason to let a
          * guest's disk become another file. */
-        let held = Self::held_under(inner, &resolved, node);
-        let fs = &mut Self::writable(inner, &resolved)?.fs;
-        if held.iter().any(|&file| fs.links(file).is_some_and(|n| n <= 1)) {
+        let held = mount.held_under(node);
+        if held.iter().any(|&file| mount.fs.links(file).is_some_and(|n| n <= 1)) {
             trace!(0, "vfs: under that path is the last name of a disk's image held by another, while it is open");
             return None;
         }
-        fs.remove(node).then_some(())
+        mount.fs.remove(node).then_some(())
     }
 
     pub fn truncate(&self, path: &[u8], size: usize) -> bool {
-        let mut inner = self.inner.lock();
-        Self::truncate_locked(&mut inner, path, size).is_some()
+        self.try_truncate(path, size).is_some()
     }
 
     /// `FileSystem::sparse_max` of the filesystem `path` is on: 0 when no
     /// mount holds it.
     pub fn sparse_max(&self, path: &[u8]) -> usize {
-        let inner = self.inner.lock();
-        match Self::find_mount(&inner, path) {
-            Some((index, _)) => inner.mounts[index].as_ref().map_or(0, |mount| mount.fs.sparse_max()),
+        match self.locate_path(path) {
+            Some((slot, _)) => slot.mount.as_ref().map_or(0, |mount| mount.fs.sparse_max()),
             None => 0,
         }
     }
 
-    fn truncate_locked(inner: &mut Inner, path: &[u8], size: usize) -> Option<()> {
-        let resolved = Self::resolve(inner, path)?;
+    fn try_truncate(&self, path: &[u8], size: usize) -> Option<()> {
+        let (mut slot, resolved) = self.lock_resolved(path)?;
         let node = resolved.node?;
-        let held = Self::held(inner, &resolved, node);
-        let fs = &mut Self::writable(inner, &resolved)?.fs;
+        let mount = slot.mount.as_mut()?;
+        let held = mount.held(node);
+        let mount = mount.writable()?;
 
-        let found = fs.tree().get(node)?;
+        let found = mount.fs.tree().get(node)?;
         if !found.is_file() {
             return None;
         }
@@ -1401,66 +1523,73 @@ impl Vfs {
             trace!(0, "vfs: that file is a disk's image, held while it is open");
             return None;
         }
-        fs.truncate(node, size).then_some(())
+        mount.fs.truncate(node, size).then_some(())
     }
 
     pub fn rename(&self, from: &[u8], to: &[u8]) -> bool {
-        let mut inner = self.inner.lock();
-        Self::rename_locked(&mut inner, from, to).is_some()
+        self.try_rename(from, to).is_some()
     }
 
-    fn rename_locked(inner: &mut Inner, from: &[u8], to: &[u8]) -> Option<()> {
-        let (from_mount, _) = Self::find_mount(inner, from)?;
-        let (to_mount, _) = Self::find_mount(inner, to)?;
-
-        if from_mount != to_mount {
+    fn try_rename(&self, from: &[u8], to: &[u8]) -> Option<()> {
+        /* Both paths found in the table as it is at one moment: on one mount,
+         * or no rename. */
+        let mut across = false;
+        let found = self.locate(|table| {
+            let (from_mount, from_rest) = Self::find_mount(table, from)?;
+            let (to_mount, to_rest) = Self::find_mount(table, to)?;
+            across = from_mount != to_mount;
+            (!across).then_some((from_mount, (from_rest, to_rest)))
+        });
+        if across {
             trace!(0, "vfs: a rename across two mounts is not a rename");
             return None;
         }
+        let (mut slot, (from_rest, to_rest)) = found?;
+        let mount = slot.mount.as_mut()?;
 
-        let source = Self::resolve(inner, from)?;
+        let source = Self::resolve(mount, from_rest)?;
         let node = source.node?;
         {
-            let fs = &mut Self::writable(inner, &source)?.fs;
+            let mount = mount.writable()?;
 
-            if fs.tree().parent(node).is_none() {
+            if mount.fs.tree().parent(node).is_none() {
                 trace!(0, "vfs: the root of a mount cannot be renamed");
                 return None;
             }
-            if fs.tree().get(node)?.is_dir() && !fs.load_dir(node) {
+            if mount.fs.tree().get(node)?.is_dir() && !mount.fs.load_dir(node) {
                 return None;
             }
-            if fs.tree().has_open_files(node) {
+            if mount.fs.tree().has_open_files(node) {
                 trace!(0, "vfs: something under that path is open");
                 return None;
             }
         }
 
-        let target = Self::resolve(inner, to)?;
+        let target = Self::resolve(mount, to_rest)?;
         if target.node.is_some() {
             trace!(0, "vfs: the new path exists already");
             return None;
         }
         let (new_parent, new_name) = target.new_entry()?;
 
-        let fs = &mut inner.mounts[source.mount].as_mut()?.fs;
-
         /* A directory cannot be moved inside itself. */
-        if fs.tree().is_ancestor(node, new_parent) {
+        if mount.fs.tree().is_ancestor(node, new_parent) {
             trace!(0, "vfs: that would move a directory inside itself");
             return None;
         }
 
-        fs.rename(node, new_parent, new_name).then_some(())
+        mount.fs.rename(node, new_parent, new_name).then_some(())
     }
 
+    /// Every filesystem synced, a mount at a time.
     pub fn sync(&self) -> bool {
-        let mut inner = self.inner.lock();
-
         let mut ok = true;
-        for mount in inner.mounts.iter_mut().flatten() {
-            if !mount.fs.sync() {
-                ok = false;
+        for slot in self.mounts.iter() {
+            let mut slot = slot.lock();
+            if let Some(mount) = slot.mount.as_mut() {
+                if !mount.fs.sync() {
+                    ok = false;
+                }
             }
         }
         ok
@@ -1468,14 +1597,14 @@ impl Vfs {
 
     /// Replace a file's contents, creating it if it is missing.
     pub fn write_file(&self, path: &[u8], data: &[u8]) -> bool {
-        let mut inner = self.inner.lock();
-        Self::write_file_locked(&mut inner, path, data).is_some()
+        self.try_write_file(path, data).is_some()
     }
 
-    fn write_file_locked(inner: &mut Inner, path: &[u8], data: &[u8]) -> Option<()> {
-        let resolved = Self::resolve(inner, path)?;
-        let held = resolved.node.is_some_and(|node| Self::held(inner, &resolved, node));
-        let fs = &mut Self::writable(inner, &resolved)?.fs;
+    fn try_write_file(&self, path: &[u8], data: &[u8]) -> Option<()> {
+        let (mut slot, resolved) = self.lock_resolved(path)?;
+        let mount = slot.mount.as_mut()?;
+        let held = resolved.node.is_some_and(|node| mount.held(node));
+        let fs = &mut mount.writable()?.fs;
 
         let node = match resolved.node {
             Some(node) => node,

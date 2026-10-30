@@ -1,15 +1,15 @@
 //! A disk's image: a file of nos's that a guest's disk is, held for as long
 //! as the disk is open and read and written off the VFS's lock.
 //!
-//! The VFS is one lock, held across every call down to the device and back
-//! (`vfs`): a guest's disk read and written through it waits behind every
-//! other guest's and behind nos's own files, a request at a time, machine-
-//! wide. An image takes only what it must under that lock -- where the
-//! blocks of the range it is asked for are on the device (`Vfs::map`), which
-//! the filesystem's pointers say and its caches mostly hold -- and does the
-//! reads and writes themselves to the device straight, with the lock let
-//! go, through a buffer of its own, in batches the driver has in flight
-//! together.
+//! The VFS holds a mount's lock across every call on its filesystem, down to
+//! the device and back (`vfs`): a guest's disk read and written through it
+//! waits behind every other guest's disk on that filesystem and behind nos's
+//! own files there, a request at a time. An image takes only what it must
+//! under that lock -- where the blocks of the range it is asked for are on
+//! the device (`Vfs::map`), which the filesystem's pointers say and its
+//! caches mostly hold -- and does the reads and writes themselves to the
+//! device straight, with the lock let go, through a buffer of its own, in
+//! batches the driver has in flight together.
 //!
 //! What makes that safe is the hold (`vfs::OPEN_HOLD`): while an image is
 //! open nothing else may write the file, cut it, grow it, rename it or

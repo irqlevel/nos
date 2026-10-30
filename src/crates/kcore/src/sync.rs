@@ -15,7 +15,10 @@ use ffi::sync;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 
-/// The kernel's mutex: a taker that finds it held sleeps. Task context only.
+/// The kernel's mutex: a taker that finds it held gives its CPU to any other
+/// task that can run there, and spins only when none can (kernel/mutex.cpp)
+/// -- so a mutex held across a long call costs its waiters' CPUs whatever
+/// else they had to do. Task context only.
 pub struct Mutex<T> {
     handle: usize,
     data: UnsafeCell<T>,
