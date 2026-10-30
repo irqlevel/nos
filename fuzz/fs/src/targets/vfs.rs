@@ -5,12 +5,16 @@
 //! the modules reach it by (`kernel_vfs_*`, and the file ABI `kernel_file_*`
 //! a module keeps its configuration through), fed words that are open
 //! files, were, and never were; and tasks of their own at work on the
-//! other mounts meanwhile. Held to what the VFS documents: a mount taken
-//! exactly when its path is free and well-formed, its device nobody else's,
-//! and there is room; an unmount refused while anything is open on it, and
-//! a handle into it dead afterwards; a rename between two mounts refused;
-//! every call of the file ABI what its composition of the VFS's calls
-//! says; and the images of the filesystems taken down clean.
+//! other mounts meanwhile -- their disks, now and then, slow enough that a
+//! task's call waits on its device, and the root's calls go on beside it,
+//! each mount under its own lock. Held to what the VFS documents: a mount
+//! taken exactly when its path is free and well-formed, its device nobody
+//! else's, and there is room; an unmount refused while anything is open on
+//! it, and a handle into it dead afterwards; a rename between two mounts
+//! refused; every call of the file ABI what its composition of the VFS's
+//! calls says; and the images of the filesystems taken down clean.
+
+use std::sync::atomic::Ordering;
 
 use fs::vfs::{Handle, MAX_MOUNTS, MAX_PATH, OPEN_READ, OPEN_WRITE};
 
@@ -715,9 +719,15 @@ pub fn vfs(r: &mut Input) {
     let g = crate::targets::ext2::geometry(r);
     let Ok(made) = ext2img::mkfs(&g, &small_tree(r), &Default::default(), 1_749_000_000, r.u64()) else { return };
     let bs = g.block_size() as u64;
-    disk::insert(0, disk::Disk::new("vda", 512, g.blocks as u64 * bs / 512, made.media));
+    /* A request a scheduling point, now and then: a call on a mount then
+     * waits on its device -- with the mount's lock -- and the others go on. */
+    let mut vda = disk::Disk::new("vda", 512, g.blocks as u64 * bs / 512, made.media);
+    vda.latency = r.bool();
+    disk::insert(0, vda);
     let Ok(nano) = nanoimg::mkfs(&small_tree(r), [3u8; 16], 0) else { return };
-    disk::insert(1, disk::Disk::new("vdb", 4096, nanoimg::DEVICE_BYTES / 4096, nano.media));
+    let mut vdb = disk::Disk::new("vdb", 4096, nanoimg::DEVICE_BYTES / 4096, nano.media);
+    vdb.latency = r.bool();
+    disk::insert(1, vdb);
     let (Some(e), Some(n)) = (disk::register(0), disk::register(1)) else { return };
 
     invariant!(fs::ramfs::mount_at("/", false), "a ramfs would not mount at the root");
@@ -734,7 +744,17 @@ pub fn vfs(r: &mut Input) {
     while r.more() && ops < 200 {
         ops += 1;
         match r.u8() % 14 {
-            0..=4 => fsops::step(&mut w.root, r, 4096),
+            0..=4 => {
+                /* A call on the root while a task's call on another mount
+                 * sleeps on its disk, holding that mount's lock: through
+                 * before it wakes, as a VFS of one lock never lets it be. */
+                let (asleep, woken) = (disk::ASLEEP.load(Ordering::SeqCst), disk::WOKEN.load(Ordering::SeqCst));
+                let _ = vfs.stat(b"/");
+                if asleep > woken && disk::WOKEN.load(Ordering::SeqCst) == woken {
+                    reached("a call on the root through while a task's call on another mount waited on its disk");
+                }
+                fsops::step(&mut w.root, r, 4096);
+            }
             5 => w.mount(r),
             6 => w.unmount(r),
             7 | 8 => w.other(r),

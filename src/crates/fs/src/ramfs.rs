@@ -4,8 +4,8 @@
 //! the boot self-test use. A file is one growing buffer, a directory is a
 //! list of children, and nothing survives a reboot.
 //!
-//! Every call arrives with the VFS lock held (see `FileSystem`), so there is
-//! no locking here.
+//! Every call arrives with its mount's lock held (see `FileSystem`), so there
+//! is no locking here.
 
 use alloc::boxed::Box;
 
