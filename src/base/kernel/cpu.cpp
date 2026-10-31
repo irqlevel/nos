@@ -73,7 +73,14 @@ void Cpu::idle()
     Task* self = Task::try_get_current_task();
     if (self != nullptr)
         self->set_idling(true);
-    cpu_halt();
+    /* Deep where the next timer is far enough off, a HLT nearer it. The
+       timer's deadline is read with interrupts off: its own interrupt
+       re-arms it on this CPU. */
+    ulong flags = hal::irq_save();
+    ulong armed = timer_armed_at_;
+    hal::irq_restore(flags);
+    ulong now = get_boot_time().get_value();
+    hal::cpu_idle(armed > now && armed - now >= IDLE_DEEP_NS);
     if (self != nullptr)
         self->set_idling(false);
 }
