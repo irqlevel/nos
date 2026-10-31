@@ -191,6 +191,26 @@ const POLL_MAX_NS: u64 = 200 * kcore::consts::NS_PER_US;
 /// guest's own.
 const TIMER_ADVANCE_NS: u64 = 10 * kcore::consts::NS_PER_US;
 
+/// How late past its edge a timer's interrupt is counted as waited for by
+/// its CPU's task -- an edge lost, rather than a wake's cost -- and by what
+/// the task did last (`Counts::late_slept`), as is a sleep that ended this
+/// long past its time: where the 10 ms that the EX44's guests' timers came
+/// at most past their edges were spent.
+const LATE_NS: u64 = kcore::consts::NS_PER_MS;
+
+/// What a CPU's task did last, before the round that looks at its timers:
+/// where an edge found late was waited for (`LATE_NS`).
+#[derive(Clone, Copy)]
+enum Step {
+    /// Its guest ran -- or the entry was turned back -- and was left at
+    /// `at`: by an interrupt of the host's, or by an exit of its own.
+    Ran { at: u64, host: bool },
+    /// The task slept or spun, for a ring or an edge.
+    Slept,
+    /// Neither: the round came again for something else.
+    Other,
+}
+
 /// The longest a CPU asleep for good -- halted with interrupts off, or
 /// waiting for a start-up IPI -- sleeps before it looks again. Only another
 /// CPU can wake one, by ringing it, and a stop rings every CPU; this is a
@@ -306,6 +326,20 @@ pub struct Counts {
     /// Sleeps to its own timer's edge woken short of it and spun the rest
     /// (`TIMER_ADVANCE_NS`).
     pub advanced: u64,
+    /// The timer's interrupts requested more than `LATE_NS` past their
+    /// edges, by what the task did before the round that found them (`Step`):
+    /// slept; ran its guest, and came round more than `LATE_NS` after the
+    /// exit -- off its CPU, or busy; ran its guest until an interrupt of the
+    /// host's took it out; until an exit of its own; anything else.
+    pub late_slept: u64,
+    pub late_off_cpu: u64,
+    pub late_host: u64,
+    pub late_exit: u64,
+    pub late_other: u64,
+    /// Sleeps to a time that ended more than `LATE_NS` past it, and the most
+    /// any ended past its time.
+    pub overslept: u64,
+    pub overslept_max: u64,
     /// Entries made at once after a write of its TSC deadline or of an IPI
     /// to other CPUs, without the loop's round.
     pub fast: u64,
@@ -423,6 +457,13 @@ impl Counts {
         self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
         self.timer_raced += o.timer_raced;
         self.advanced += o.advanced;
+        self.late_slept += o.late_slept;
+        self.late_off_cpu += o.late_off_cpu;
+        self.late_host += o.late_host;
+        self.late_exit += o.late_exit;
+        self.late_other += o.late_other;
+        self.overslept += o.overslept;
+        self.overslept_max = self.overslept_max.max(o.overslept_max);
         self.fast += o.fast;
         self.polls += o.polls;
         self.polled += o.polled;
@@ -567,6 +608,8 @@ pub struct GuestCpu {
     /// Its last exit a write the next entry may follow without the loop's
     /// round (`msr`): its TSC deadline, an IPI to other CPUs.
     fast: bool,
+    /// What its task did last (`LATE_NS`).
+    step: Step,
     counts: Counts,
 }
 
@@ -819,6 +862,7 @@ impl LinuxGuest {
                 pv_eoi_armed: false,
                 poll_ns: 0,
                 fast: false,
+                step: Step::Other,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1371,6 +1415,15 @@ impl LinuxGuest {
                 let late = now.saturating_sub(due.unwrap_or(now));
                 gc.counts.timer_late_ns += late;
                 gc.counts.timer_late_max = gc.counts.timer_late_max.max(late);
+                if late > LATE_NS {
+                    match gc.step {
+                        Step::Slept => gc.counts.late_slept += 1,
+                        Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => gc.counts.late_off_cpu += 1,
+                        Step::Ran { host: true, .. } => gc.counts.late_host += 1,
+                        Step::Ran { host: false, .. } => gc.counts.late_exit += 1,
+                        Step::Other => gc.counts.late_other += 1,
+                    }
+                }
             }
             shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
 
@@ -1454,6 +1507,7 @@ impl LinuxGuest {
                         }
                         Sleep::Wait => {
                             bell.wait(ASLEEP_WAIT_NS.min(deadline.saturating_sub(now)).max(1));
+                            gc.step = Step::Slept;
                             continue;
                         }
                     }
@@ -1485,6 +1539,7 @@ impl LinuxGuest {
                                 gc.counts.polls += 1;
                                 if bell.poll(gc.poll_ns) {
                                     gc.counts.polled += 1;
+                                    gc.step = Step::Slept;
                                     continue;
                                 }
                             }
@@ -1500,8 +1555,15 @@ impl LinuxGuest {
                             let wake_at = if advance { until - TIMER_ADVANCE_NS } else { until };
                             let slept_from = time::boot_time_ns();
                             let rung = bell.wait(wake_at.saturating_sub(slept_from).max(1));
+                            let woke = time::boot_time_ns();
                             gc.counts.sleeps += 1;
-                            gc.counts.slept_ns += time::boot_time_ns().saturating_sub(slept_from);
+                            gc.counts.slept_ns += woke.saturating_sub(slept_from);
+                            if !rung {
+                                let over = woke.saturating_sub(wake_at.max(slept_from + 1));
+                                gc.counts.overslept += u64::from(over > LATE_NS);
+                                gc.counts.overslept_max = gc.counts.overslept_max.max(over);
+                            }
+                            gc.step = Step::Slept;
                             if advance && !rung {
                                 let at = time::boot_time_ns();
                                 if at < until {
@@ -1541,6 +1603,7 @@ impl LinuxGuest {
             if timers <= time::boot_time_ns() {
                 kick.cancel();
                 gc.counts.timer_raced += 1;
+                gc.step = Step::Other;
                 continue;
             }
 
@@ -1581,6 +1644,7 @@ impl LinuxGuest {
                 }
             };
             shared.host_cpu.store(host_cpu, Ordering::Relaxed);
+            gc.step = Step::Ran { at: exit_at, host: matches!(exit, Exit::Host) };
             exited = Some((exit_at, matches!(exit, Exit::Msr { write: true })));
             gc.counts.exits += 1;
             if gc.counts.exits % PROGRESS_EVERY == 0 {

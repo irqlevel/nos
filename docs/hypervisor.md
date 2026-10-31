@@ -2449,7 +2449,14 @@ arms the host's timer for their next edge a few hundred nanoseconds later
 the two was owed to a guest that then ran on to its next exit, a host tick
 for one that computes. The EX44's guests saw one 10 ms late at most. The loop
 looks again after arming, before anything is handed in for the entry, and
-goes round again where an edge has come.
+goes round again where an edge has come. That was not all of it: the EX44's
+guests still saw an edge 10009 us late at most after it (64d61a78), so the
+report says where such edges were waited for -- `late`: the timer interrupts
+more than 1 ms past their edges (`LATE_NS`), by what the vCPU's task did
+before the round that found them (slept; came round more than 1 ms after an
+exit, off its CPU or busy; ran its guest until an interrupt of the host's
+took it out, or an exit of its own), and the sleeps that ended more than 1
+ms past their time.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
