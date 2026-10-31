@@ -72,6 +72,17 @@ pub const OPEN_HOLD: usize = 32;
 /// mounts share has a lock of its own. A `NodeId` it is handed is one of
 /// its own tree's, live when the call was made -- the VFS found it there
 /// under the same lock.
+/// A run of a file's blocks, as its filesystem's map has them
+/// (`FileSystem::map_runs`): `len` blocks from the device's sector
+/// `sector` -- 0 for a hole -- and whether they are unwritten: the file's,
+/// reading as zeros until they are made written (`mark_written`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MapRun {
+    pub sector: u64,
+    pub len: u64,
+    pub unwritten: bool,
+}
+
 pub trait FileSystem: Send {
     /// What `mounts` shows the filesystem as
     fn name(&self) -> &'static str;
@@ -154,17 +165,17 @@ pub trait FileSystem: Send {
     }
 
     /// Where `count` blocks of `file` from block `first` are on the device,
-    /// as runs in their order, appended to `out`: `(sector, blocks)` each,
-    /// the first sector of blocks that follow one another on the device --
-    /// or 0 for a hole -- the runs' blocks `count` in all, every one inside
-    /// the file. What a disk's image takes its map from, once (`image`),
+    /// as runs in their order, appended to `out`: each the first sector of
+    /// blocks that follow one another on the device -- or 0 for a hole --
+    /// how many, and whether they are unwritten (`MapRun`), the runs' blocks
+    /// `count` in all, every one inside the file. What a disk's image takes its map from, once (`image`),
     /// rather than ask `map_blocks` for every batch: so a hole is to be one
     /// run however long, and an answer as long as what the file has, not
     /// as what it covers. Nothing is allocated or changed on the device.
     /// false as `map_blocks` is, when `out` cannot grow -- and from a
     /// filesystem that cannot answer so, the default, whose images ask for
     /// every batch.
-    fn map_runs(&mut self, _file: NodeId, _first: u64, _count: u64, _out: &mut Vec<(u64, u64)>) -> bool {
+    fn map_runs(&mut self, _file: NodeId, _first: u64, _count: u64, _out: &mut Vec<MapRun>) -> bool {
         false
     }
 
@@ -179,16 +190,28 @@ pub trait FileSystem: Send {
     }
 
     /// Blocks for every hole among `count` blocks of `file` from block
-    /// `first`, of those inside it: made zeros on the device and only then
-    /// the file's, in the filesystem's own order, so that no crash leaves
-    /// the file mapping what a block held before it was the file's -- what
-    /// reads as zeros reads as zeros still, and the size is as it was. What
-    /// a disk's image grows by, a chunk at a time, ahead of its guest's
-    /// writes. How many blocks were given, or None: an I/O error, no room,
-    /// or a filesystem that gives none so, the default -- whose images write
-    /// into their holes through it.
+    /// `first`, of those inside it, as unwritten extents: the file's, and
+    /// read as zeros whatever their blocks hold until they are made written
+    /// (`mark_written`), so that no crash leaves the file showing what a
+    /// block held before it was the file's -- what reads as zeros reads as
+    /// zeros still, and the size is as it was. Nothing is written to the
+    /// blocks themselves. What a disk's image grows by, a chunk at a time,
+    /// ahead of its guest's writes, which it then writes over off the lock.
+    /// How many blocks were given, or None: an I/O error, no room, or a
+    /// filesystem that gives none so, the default -- whose images write into
+    /// their holes through it.
     fn allocate(&mut self, _file: NodeId, _first: u64, _count: u64) -> Option<u64> {
         None
+    }
+
+    /// The blocks of `file` named by `runs` -- each a first block and a
+    /// count -- made written where they are unwritten: what a disk's image
+    /// wrote over the blocks `allocate` gave it, its device flushed first,
+    /// so that they hold its data on the medium before the file says so.
+    /// What is written already, or a hole, is left. false on an I/O error or
+    /// no room for the tree to split in, by when some may be.
+    fn mark_written(&mut self, _file: NodeId, _runs: &[(u64, u64)]) -> bool {
+        false
     }
 
     /// Whether `allocate` gives blocks at all: asked once, as an image is
@@ -1328,6 +1351,26 @@ impl Vfs {
         mount.fs.truncate(node, size)
     }
 
+    /// The blocks of the file `handle` holds for writing named by `runs`
+    /// made written where they are unwritten (`FileSystem::mark_written`):
+    /// what its image wrote over the unwritten extents `allocate` gave it,
+    /// the device flushed by the image first.
+    pub fn mark_written(&self, handle: Handle, runs: &[(u64, u64)]) -> bool {
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
+        let Some((node, flags)) = slot.files.get(handle).map(|file| (file.node, file.flags)) else { return false };
+        if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
+            trace!(0, "vfs: only a file held for writing as a disk's image is made written");
+            return false;
+        }
+        let Some(mount) = slot.mount.as_mut() else { return false };
+        if mount.read_only {
+            trace!(0, "vfs: that mount is read-only");
+            return false;
+        }
+        mount.fs.mark_written(node, runs)
+    }
+
     /// Whether the filesystem of the file `handle` holds for writing gives
     /// blocks ahead of writes (`FileSystem::allocates`): what an image grows
     /// its holes by, a chunk at a time.
@@ -1397,7 +1440,7 @@ impl Vfs {
     /// file `handle` holds, from block `first`, are on its device, appended
     /// to `out` as `(sector, blocks)` -- 0 for a hole. Held files only, and
     /// only blocks inside them, as `map`.
-    pub fn map_runs(&self, handle: Handle, first: u64, count: u64, out: &mut Vec<(u64, u64)>) -> bool {
+    pub fn map_runs(&self, handle: Handle, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
         let Some(mut guard) = self.lock_handle(handle) else { return false };
         let slot = &mut *guard;
 

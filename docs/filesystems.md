@@ -143,32 +143,54 @@ that keeps no blocks of its own on a device (`data_block_size` 0: ramfs,
 and nanofs for now) has its images read and written through the VFS whole.
 
 **A write into a hole grows the file a chunk at a time** (`CHUNK_BYTES`, 16
-MiB): the filesystem gives the chunk around it every block it lacks
-(`Vfs::allocate`, ext4's `allocate`) -- allocated, made zeros on the device
-(the device's own write of zeros where it has one -- NVMe's Write Zeroes,
-each run's first and last block read back to be sure -- else zeros
-written), and only then committed, one transaction, so that after any
-crash a block is the file's, zeros or the guest's data, or free, never what
-it held before -- and the write then goes to the device as an overwrite.
-Each chunk is taken into the map again after it. Where the filesystem
-gives no blocks ahead of a write (ext2: `FileSystem::allocates`, asked once
-as the image is held), or has none left to give, the batch goes through the
-VFS as every write once did -- a transaction of its own -- and the next
-flush is then the filesystem's sync (its metadata, then the device);
-otherwise a flush is the device's alone. A chunk ext4 refuses is said at
-the first and counted, and the image says how many as it is let go of: the
-write still lands, through the VFS, so nothing but the count shows it --
-which is how a refusal of every chunk past the first hole of each went
-unseen, until a Linux guest's disk said so (an allocation's read of the
-extent leaf it had just changed, held to a checksum the change had not put
-on it yet; a transaction's dirty blocks now read with the checksum their
-commit will give them, `Source for Txn`). `fs-fuzz` holds ext4's images to
-having no chunk refused but for want of room, a failed request or the
-kernel heap's ceiling. ext4 commits every
-call as it is made, so a write through it into a hole cost a commit -- the
-log written, flushed, its commit block FUA -- for every batch: a guest
-filling a fresh disk wrote at 28 MiB/s on the EX44 where the same disk
-under KVM took 4.6 GB/s.
+MiB): the filesystem gives the chunk around it every block it lacks, as
+unwritten extents (`Vfs::allocate`, ext4's `allocate`) -- the file's, and
+read as zeros whatever their blocks held, so that no crash can show what a
+block held before it was the file's, and nothing written to them -- one
+transaction, and the guest's data then goes to the device as an overwrite,
+off the lock. Each chunk is taken into the map again after it, its runs
+said unwritten. A block of one that the image has not written reads as
+zeros, and a write over part of one takes zeros for the rest; what the
+image writes over them it keeps (`Pending`), reads from the device from
+then on, and makes written at the next sync -- the device flushed first, so
+that the data is on the medium before the file says it is there, and then
+one transaction (`Vfs::mark_written`, ext4's `mark_written`: the extents
+split around what was written, a run at a time) -- and as it is let go
+of. A guest that flushes as filesystems do keeps few such runs; one that
+keeps more than `PENDING_MAX` has them made written there and then, so the
+host's memory for them is bounded. A crash before the sync leaves the
+blocks unwritten: zeros, as a disk may give for writes it was not told to
+keep. A punch takes its blocks out of what is kept -- given again as an
+unwritten extent and found there, a block would read whatever the device
+held.
+
+Neither the allocation nor the conversion orders any data -- the first
+maps none, the second maps what the image flushed -- so each commits
+without the flush before its commit block (`Txn::ordered`), its log written
+with FUA instead, where the device has FUA of its own (`Disk::fua_native`:
+NVMe; virtio-blk's FUA is a write and a flush, and there the commit flushes
+as before). A flush pushes out the device's whole cache: the zeros of a
+chunk, first, and then the guest's last chunk of data, which on the EX44's
+Samsung made every 16 MiB of a new file's first write wait for a flush of
+16 MiB -- a guest filling a fresh disk wrote at 883 MiB/s where KVM's wrote
+4.6 GB/s (28 MiB/s before chunks, when ext4 committed every batch). That
+NVMe has no Write Zeroes, so the zeros were written too.
+
+Where the filesystem gives no blocks ahead of a write (ext2:
+`FileSystem::allocates`, asked once as the image is held), or has none left
+to give, the batch goes through the VFS as every write once did -- a
+transaction of its own, what the image keeps made written first, since the
+VFS's write reads an unwritten block as zeros -- and the next flush is then
+the filesystem's sync (its metadata, then the device). A chunk ext4 refuses
+is said at the first and counted, and the image says how many as it is let
+go of: the write still lands, through the VFS, so nothing but the count
+shows it -- which is how a refusal of every chunk past the first hole of
+each went unseen, until a Linux guest's disk said so (an allocation's read
+of the extent leaf it had just changed, held to a checksum the change had
+not put on it yet; a transaction's dirty blocks now read with the checksum
+their commit will give them, `Source for Txn`). `fs-fuzz` holds ext4's
+images to having no chunk refused but for want of room, a failed request or
+the kernel heap's ceiling.
 
 **Reads and writes go a vector at a time** (`Image::read_vec`,
 `write_vec`): the requests a guest's disk has out at once are one batch,

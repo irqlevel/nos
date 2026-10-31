@@ -118,6 +118,13 @@ pub(super) struct Txn<'a> {
     pub allocated: u64,
     /// Whether this may take the free blocks kept for a punch.
     pub may_reserve: bool,
+    /// Whether data this call wrote in place is to be on the medium before
+    /// the commit that maps it (data=ordered): the device flushed before the
+    /// commit block, as by default. A transaction that orders none --
+    /// unwritten extents given, blocks made written whose data the caller
+    /// flushed -- commits without that flush, its log written with FUA,
+    /// where the device has FUA of its own (`Io::fua_native`).
+    pub ordered: bool,
     /// The wall clock as the call began: every time it stores.
     pub now: u32,
 }
@@ -130,7 +137,7 @@ impl<'a> Txn<'a> {
     pub fn new(io: &'a mut Io, m: &'a mut Meta, cache: &'a mut Cache, jnl: &'a mut Journal, now: u32) -> Txn<'a> {
         Txn {
             io, m, cache, jnl, dirty: BTreeMap::new(), freed: Runs::default(), revoke: BTreeSet::new(), allocated: 0,
-            may_reserve: false, now,
+            may_reserve: false, ordered: true, now,
         }
     }
 
