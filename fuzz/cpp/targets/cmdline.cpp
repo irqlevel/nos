@@ -51,6 +51,7 @@ struct Expected
     bool trace_vga = false, panic_vga = false, smp_off = false, its_enabled = true, hw_rng_off = false;
     int wx_probe = 0; /* off, text, heap */
     bool usb_off = false, rc_off = false, hwp_off = false, ucode_off = false;
+    bool idle_mwait = false; /* idle=mwait, the last idle= said */
     ulong panic_reset_secs = 0;
     int console = 0; /* both, serial, vga */
     int dhcp = 0;    /* on, auto, off */
@@ -171,6 +172,8 @@ void take(Expected& e, const std::string& token)
         e.hwp_off = value == "off";
     else if (key == "ucode")
         e.ucode_off = value == "off";
+    else if (key == "idle")
+        e.idle_mwait = value == "mwait";
     else if (key == "wxprobe")
     {
         if (value == "on" || value == "text")
@@ -349,7 +352,7 @@ Expected read(const std::string& line)
 
 /* ---- the line ---- */
 
-const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "wxprobe", "smp",
+const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
                              "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages"};
 
@@ -363,7 +366,8 @@ const char* const BAD_IPS[] = {"1.2.3", "1.2.3.4.5", "01.2.3.4", "1..2.3", "a.b.
 const char* const STRAYS[] = {"quiet", "splash", "r", "=", "a=", "=b", "foo=bar", "nokaslr", "console=ttyS0,115200",
                               "ro=1"};
 
-const char* const VALUES[] = {"on", "off", "vga", "serial", "both", "auto", "text", "heap", "warn", "", "0", "1",
+const char* const VALUES[] = {"on", "off", "vga", "serial", "both", "auto", "text", "heap", "warn", "mwait",
+                              "mwai", "mwaits", "MWAIT", "halt", "", "0", "1",
                               "64", "65", "65535", "65536", "1024", "1025", "3600", "3601", "5", "6",
                               "18446744073709551615", "18446744073709551616", "-1", "1x", "abc"};
 
@@ -473,6 +477,7 @@ void run(fuzz::Input& in)
         "trace, panic or smp read wrong");
     INVARIANT(p.get_panic_reset_secs() == e.panic_reset_secs, "panic=%lu, not %lu", p.get_panic_reset_secs(), e.panic_reset_secs);
     INVARIANT(p.is_hwp_off() == e.hwp_off && p.is_ucode_off() == e.ucode_off, "hwp or ucode read wrong");
+    INVARIANT(p.is_idle_mwait() == e.idle_mwait, "idle=mwait read %s", p.is_idle_mwait() ? "on" : "off");
     INVARIANT(p.is_its_enabled() == e.its_enabled && p.is_hw_rng_off() == e.hw_rng_off && p.is_usb_off() == e.usb_off &&
         p.is_rc_off() == e.rc_off, "its, hwrng, usb or rc read wrong");
     INVARIANT(p.is_wx_probe_text() == (e.wx_probe == 1) && p.is_wx_probe_heap() == (e.wx_probe == 2), "wxprobe read wrong");
