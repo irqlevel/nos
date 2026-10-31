@@ -236,12 +236,19 @@ impl Image {
         if rc == 0 { Ok((out[0], out[1])) } else { Err(Error::IoError) }
     }
 
-    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// The whole chunks inside `len` bytes from `offset` given back to the
     /// filesystem -- holes from here on, reading as zeros, the image's size
-    /// as it was: a guest's discard. What it covers of a block only in part
-    /// is left as it is.
+    /// as it was: a guest's discard. What it covers of a chunk only in part
+    /// is left as it is (`discard_unit`).
     pub fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if fs::kernel_image_discard(self.handle, offset, len) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// What a discard gives back whole, in bytes -- the image's chunk -- or 0
+    /// where it gives back nothing: what a guest's disk tells its driver to
+    /// align its discards to.
+    pub fn discard_unit(&self) -> u64 {
+        fs::kernel_image_discard_unit(self.handle)
     }
 
     /// `len` bytes from `offset` made zeros: with `unmap` the whole blocks

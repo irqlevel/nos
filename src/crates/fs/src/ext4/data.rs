@@ -450,15 +450,28 @@ impl Ext4 {
             trace!(0, "ext4: an allocation in something that is not a file");
             return None;
         };
-        let size = self.tree.get(file)?.size as u64;
+        let Some(size) = self.tree.get(file).map(|n| n.size as u64) else {
+            trace!(0, "ext4: an allocation in inode {}, which the tree has not got", ino);
+            return None;
+        };
         let end = first.saturating_add(count).min(size.div_ceil(self.io.bs as u64));
+        if end <= first {
+            trace!(0, "ext4: an allocation of blocks {}..+{} of inode {}, past its {} bytes", first, count, ino, size);
+        }
         let mut given = 0u64;
         let mut l = first;
         while l < end {
             let to = end.min(l + ALLOC_BLOCKS);
-            let mut t = self.begin()?;
-            let (got, reached) = t.allocate_range(ino, l, to)?;
+            let Some(mut t) = self.begin() else {
+                trace!(0, "ext4: no transaction for an allocation in inode {}", ino);
+                return None;
+            };
+            let Some((got, reached)) = t.allocate_range(ino, l, to) else {
+                trace!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
+                return None;
+            };
             if !t.commit() {
+                trace!(0, "ext4: an allocation in inode {} did not commit", ino);
                 return None;
             }
             given += got;

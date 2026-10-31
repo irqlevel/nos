@@ -191,6 +191,13 @@ pub trait FileSystem: Send {
         None
     }
 
+    /// Whether `allocate` gives blocks at all: asked once, as an image is
+    /// held, so that one on a filesystem that gives none -- the default --
+    /// writes into its holes through it without asking at every write.
+    fn allocates(&self) -> bool {
+        false
+    }
+
     /// How many names the filesystem's own record says `file` has -- its
     /// inode's link count -- or None where it keeps none (a file of one
     /// name), the default. What a remove asks of a file held as a disk's
@@ -1321,6 +1328,19 @@ impl Vfs {
         mount.fs.truncate(node, size)
     }
 
+    /// Whether the filesystem of the file `handle` holds for writing gives
+    /// blocks ahead of writes (`FileSystem::allocates`): what an image grows
+    /// its holes by, a chunk at a time.
+    pub fn allocates(&self, handle: Handle) -> bool {
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
+        let Some(file) = slot.files.get(handle) else { return false };
+        if file.flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
+            return false;
+        }
+        slot.mount.as_ref().is_some_and(|m| !m.read_only && m.fs.data_block_size() != 0 && m.fs.allocates())
+    }
+
     /// The device the blocks of the file `handle` holds (`OPEN_HOLD`) are on,
     /// and how big one is: what its image reads and writes off the lock --
     /// or None where its filesystem keeps no blocks of its own on a device,
@@ -1445,23 +1465,30 @@ impl Vfs {
     /// file's from now on, its size as it was -- a disk's image growing a
     /// chunk at a time. How many blocks were given, or None.
     pub fn allocate(&self, handle: Handle, first: u64, count: u64) -> Option<u64> {
-        let mut guard = self.lock_handle(handle)?;
+        let Some(mut guard) = self.lock_handle(handle) else {
+            trace!(0, "vfs: an allocation for a handle that is no open file's");
+            return None;
+        };
         let slot = &mut *guard;
 
-        let (node, flags) = {
-            let file = slot.files.get(handle)?;
-            (file.node, file.flags)
+        let Some((node, flags)) = slot.files.get(handle).map(|file| (file.node, file.flags)) else {
+            trace!(0, "vfs: an allocation for a handle its mount has no file of");
+            return None;
         };
         if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
             trace!(0, "vfs: only a file held for writing as a disk's image is allocated in");
             return None;
         }
-        let mount = slot.mount.as_mut()?;
+        let Some(mount) = slot.mount.as_mut() else {
+            trace!(0, "vfs: an allocation in a file whose filesystem is gone");
+            return None;
+        };
         if mount.read_only {
             trace!(0, "vfs: that mount is read-only");
             return None;
         }
         if mount.fs.data_block_size() == 0 {
+            trace!(0, "vfs: an allocation in a filesystem that keeps no blocks of its own on a device");
             return None;
         }
         mount.fs.allocate(node, first, count)

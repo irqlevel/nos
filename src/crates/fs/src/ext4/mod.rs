@@ -1050,6 +1050,10 @@ impl FileSystem for Ext4 {
         Ext4::allocate(self, file, first, count)
     }
 
+    fn allocates(&self) -> bool {
+        true
+    }
+
     fn links(&mut self, file: NodeId) -> Option<u32> {
         let ino = self.file_ino(file)?;
         let raw = self.inode(ino)?;

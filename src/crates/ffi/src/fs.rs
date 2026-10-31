@@ -119,9 +119,12 @@ unsafe extern "C" {
     /// two the same where the blocks looked at, a few thousand at most, are
     /// all holes: 0, or -1.
     pub fn kernel_image_extent(image: usize, offset: u64, out: *mut u64) -> i32;
-    /// The whole blocks inside `len` bytes from `offset` given back to the
+    /// The whole chunks inside `len` bytes from `offset` given back to the
     /// filesystem -- holes, reading as zeros: 0, or -1.
     pub safe fn kernel_image_discard(image: usize, offset: u64, len: u64) -> i32;
+    /// What a discard gives back whole, in bytes -- the image's chunk -- or 0
+    /// where it gives back nothing, and for a word that is no image's.
+    pub safe fn kernel_image_discard_unit(image: usize) -> u64;
     /// `len` bytes from `offset` made zeros, the whole blocks among them
     /// given back with `unmap` not 0: 0, or -1.
     pub safe fn kernel_image_write_zeroes(image: usize, offset: u64, len: u64, unmap: i32) -> i32;

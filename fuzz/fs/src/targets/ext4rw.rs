@@ -740,6 +740,7 @@ pub fn ext4rw(r: &mut Input) {
         image_syncs: Vec::new(),
     };
     run.f.punch_room = punch_room;
+    run.f.allocates = true;
     /* Pictures the mount's own writes left -- its orphans' release among
      * them: the tree as it was. */
     if !st.orphans.is_empty() {

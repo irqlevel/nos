@@ -351,9 +351,27 @@ impl Source for Txn<'_> {
         }
     }
 
+    /// A block this transaction changed is read as its commit will write
+    /// it: an extent node, a directory's block and an attribute block with
+    /// the checksum `seal` will put on them, so that a reader holding every
+    /// such block to its checksum (`source::map`) reads the transaction's
+    /// own changes rather than refusing them -- as it refused a leaf a
+    /// chunk's first run had gone into, and with it the chunk.
     fn block(&mut self, b: u64, out: &mut [u8]) -> bool {
         if let Some(d) = self.dirty.get(&b) {
-            out[..d.data.len()].copy_from_slice(&d.data);
+            let Some(out) = out.get_mut(..d.data.len()) else { return false };
+            out.copy_from_slice(&d.data);
+            if self.m.csum {
+                /* A block that cannot carry its checksum is read as it is:
+                 * its reader refuses it, as `seal` would its commit. */
+                let _ = match d.kind {
+                    Kind::Extent { seed } => extent::set_node_csum(seed, out),
+                    Kind::Dir { seed, dx: true } => dir::set_dx_csum(seed, out),
+                    Kind::Dir { seed, dx: false } => dir::set_leaf_csum(seed, out),
+                    Kind::Xattr => xattr::set_block_csum(self.m.seed, b, out),
+                    Kind::Super | Kind::Gdt | Kind::BlockBitmap(_) | Kind::InodeBitmap(_) | Kind::Inodes => true,
+                };
+            }
             return true;
         }
         read_block(self.io, self.cache, &NO_OVERLAY, b, out, true)

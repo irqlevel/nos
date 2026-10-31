@@ -1715,7 +1715,10 @@ many through it.
 and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the
 guest may only read offers neither): a guest's `fstrim`, ext4 mounted
 with `discard`, `blkdiscard`, `mkfs` of its own disk -- ranges of sectors,
-up to eight a request and 64 MiB a range, aligned best to 4 KiB. The device
+up to eight a request and 64 MiB a range, aligned best to what the image
+gives back whole -- its chunk (`Backend::discard_sectors`,
+`Image::discard_unit`), 4 KiB where it gives back nothing -- so that the
+guest splits its discards on a chunk's edge and sends none shorter. The device
 copies the ranges out of the guest's memory once, checks them in its own
 copy -- whole sectors inside the disk, no flag but a write of zeros'
 unmap -- and hands the backend that copy (`Request::ranges`): a guest that

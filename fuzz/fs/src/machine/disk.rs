@@ -288,6 +288,16 @@ pub fn register(index: usize) -> Option<block::Disk> {
     Some(dev)
 }
 
+/// How many requests have failed on every disk there is, in all: what a
+/// target tells a call refused for a failed request apart from one refused
+/// for no reason by.
+pub fn failures() -> u64 {
+    sched::harness(|| {
+        let g = DISK.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().flatten().map(|d| d.log.iter().filter(|io| !io.ok).count() as u64).sum()
+    })
+}
+
 /// Which slot's disk the block layer's handle `handle` is, if one is.
 pub fn index_of(handle: usize) -> Option<usize> {
     sched::harness(|| {

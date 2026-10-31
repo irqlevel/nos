@@ -475,12 +475,23 @@ pub struct Fs {
     /// filesystem had fewer free when it was mounted than it keeps for a
     /// punch's split, a disk another system filled.
     pub punch_room: bool,
+    /// Whether the filesystem gives an image blocks ahead of its writes, a
+    /// chunk at a time (`FileSystem::allocates`): ext4's, whose refusal of a
+    /// chunk for no reason is a finding (`chunks_held`).
+    pub allocates: bool,
 }
 
 impl Fs {
     pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
-        Fs { vfs, model, strict, images: Vec::new(), punch_room: false }
+        Fs { vfs, model, strict, images: Vec::new(), punch_room: false, allocates: false }
     }
+}
+
+/// What a chunk refused around an image's write may have had for a reason:
+/// requests failed and allocations the kernel heap's ceiling refused so far
+/// (`chunks_held`).
+fn reasons_so_far() -> (u64, u64) {
+    (crate::machine::disk::failures(), crate::machine::heap::refusals())
 }
 
 /* ---- what the input chooses ---- */
@@ -837,6 +848,28 @@ impl Fs {
         }
     }
 
+    /// The chunks image `i`'s filesystem gave around a write, held: where it
+    /// gives an image blocks ahead of its writes and the answers are the
+    /// model's, a chunk refused is a finding unless the filesystem ran out
+    /// of room, a request failed or the kernel heap's ceiling refused an
+    /// allocation meanwhile. A refusal for no reason sends every write into
+    /// a hole through the VFS, a commit each, with every answer right -- so
+    /// nothing else here would see it: an allocation's read of the extent
+    /// tree it was changing, held to a checksum the change had not put on
+    /// it yet, refused every chunk past the first hole of each so.
+    fn chunks_held(&mut self, i: usize, refused: u64, reasons: (u64, u64), mark: u64) {
+        let Some(image) = self.images.get(i) else { return };
+        if !self.allocates || image.chunks_refused() == refused {
+            return;
+        }
+        if reasons_so_far() != reasons || out_of_room(mark) {
+            reached("an image's chunk refused for a reason");
+            return;
+        }
+        self.check(false, format_args!("image {}'s filesystem refused a chunk ahead of a write, with room for it, no \
+                                        request failed and no allocation refused", i));
+    }
+
     /// The map image `i` holds held to its filesystem's: what it reads and
     /// writes off the VFS's lock is resolved there.
     fn image_map_held(&mut self, i: usize) {
@@ -879,7 +912,9 @@ impl Fs {
         let Some((path, write)) = self.model.holds.get(i).cloned() else { return };
         say(format_args!("image_write {} bytes to {} at {}", data.len(), show(&join(&path)), at));
         let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
         let got = self.images[i].write_at(at, data);
+        self.chunks_held(i, refused, reasons, mark);
         let size = self.model.size(&path);
         let want = write && at.checked_add(data.len() as u64).is_some_and(|end| end <= size);
         if self.refused_for_room(got, want, mark, &saved) {
@@ -938,7 +973,9 @@ impl Fs {
         say(format_args!("image_write_vec {} parts of {}", parts.len(), show(&join(&path))));
         let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
         let ios: Vec<(u64, &[u8])> = parts.iter().map(|(at, d)| (*at, &d[..])).collect();
+        let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
         let got = self.images[i].write_vec(&ios);
+        self.chunks_held(i, refused, reasons, mark);
         let size = self.model.size(&path);
         let want = write && parts.iter().all(|(at, d)| at.checked_add(d.len() as u64).is_some_and(|end| end <= size));
         if self.refused_for_room(got, want, mark, &saved) {
