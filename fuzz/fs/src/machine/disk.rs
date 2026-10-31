@@ -157,11 +157,6 @@ pub struct Disk {
     pub no_writes: Option<String>,
     /// Whether a request is a scheduling point.
     pub latency: bool,
-    /// Whether it says its FUA is its own (`BlockDriver::fua_native`): a
-    /// FUA write on the medium as it completes, nothing else of the cache
-    /// with it -- as `put` does it either way -- so that a journal may write
-    /// its log so where a commit orders no data.
-    pub fua_native: bool,
     /// The table's handle, once registered.
     pub handle: usize,
     /// Which of the cache's writes a power cut finds on the medium.
@@ -186,17 +181,14 @@ impl Disk {
             crashes: Vec::new(),
             no_writes: None,
             latency: false,
-            fua_native: false,
             handle: 0,
             chaos: 0x2545_F491_4F6C_DD1D,
         }
     }
 
-    /// What a power cut keeps of the cache -- and from the same seed whether
-    /// the device says its FUA is its own.
+    /// What a power cut keeps of the cache.
     pub fn seed_chaos(&mut self, seed: u64) {
         self.chaos = seed | 1;
-        self.fua_native = (seed >> 8) & 1 != 0;
     }
 
     /// `data` written at byte `at`: on the medium where the device has no
@@ -392,7 +384,4 @@ impl block::BlockDriver for RamDisk {
         self.request(Op::Flush, 0, 0, |d, _| d.flush_cache())
     }
 
-    fn fua_native(&'static self) -> bool {
-        with(self.index, |d| d.fua_native)
-    }
 }

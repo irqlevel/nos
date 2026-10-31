@@ -32,10 +32,6 @@ pub(super) struct Io {
     /// A file's data on its way to or from the device, a block a page.
     batch: DmaBuffer,
     pieces: Vec<Piece>,
-    /// Whether a write with FUA is the device's own (`Disk::fua_native`):
-    /// what lets a commit that orders no data write its log so, rather than
-    /// flush the device's whole cache before its commit block.
-    pub fua_native: bool,
 }
 
 /// `BATCH_PAGES`, or the largest run of pages that can be had short of it,
@@ -62,9 +58,7 @@ impl Io {
         let batch = batch_buffer()?;
         let mut pieces = Vec::new();
         pieces.try_reserve_exact(batch.pages()).ok()?;
-        let fua_native = dev.fua_native();
-        Some(Io { dev, bs: 0, sector_size, blocks: 0, writable: false, scratch: DmaBuffer::new(1)?, batch, pieces,
-                  fua_native })
+        Some(Io { dev, bs: 0, sector_size, blocks: 0, writable: false, scratch: DmaBuffer::new(1)?, batch, pieces })
     }
 
     fn sector(&self, block: u64) -> u64 {
