@@ -177,6 +177,12 @@ void run(fuzz::Input& in)
         fmt += c;
     }
 
+    /* Now and then a line, as every trace is: the format's last character
+       a newline, which end_cut_line gives back to one cut short */
+    const bool line = in.chance(4);
+    if (line)
+        fmt += '\n';
+
     char host[1024];
     const int host_len = host_call(shape, host, sizeof(host), fmt.c_str(), a);
     INVARIANT(host_len >= 0 && static_cast<size_t>(host_len) < sizeof(host), "the host's own snprintf failed on '%s'",
@@ -216,6 +222,23 @@ void run(fuzz::Input& in)
         INVARIANT(got == want, "'%s' into %zu bytes made '%s' (%d) where the host's cut and marked is '%s'",
                   fmt.c_str(), size, show(got).c_str(), len, show(want).c_str());
         fuzz::reached("output cut short");
+    }
+    if (line)
+    {
+        /* A line cut short given its newline back (Tracer::output, dmesg's
+           records): what fits, then "...\n" -- one too short for that, and
+           one that fits, left as they are */
+        static const size_t CUT_BYTES = 5; /* "...\n" and the NUL */
+        const int ended = stdlib::end_cut_line(buf.data(), size, len);
+        INVARIANT(ended == len, "end_cut_line said %d of a line of %d, on '%s'", ended, len, fmt.c_str());
+        INVARIANT(buf[size] == '\x7F', "end_cut_line wrote past the %zu bytes it was given, on '%s'", size,
+                  fmt.c_str());
+        const bool was_cut = static_cast<size_t>(host_len) >= size;
+        const std::string ended_as(buf.data(), len);
+        const std::string want = (was_cut && size >= CUT_BYTES) ? full.substr(0, size - CUT_BYTES) + "...\n" : got;
+        INVARIANT(ended_as == want, "'%s' into %zu bytes ended as '%s' where it should be '%s'", fmt.c_str(), size,
+                  show(ended_as).c_str(), show(want).c_str());
+        fuzz::reached(was_cut ? "a line cut short, its newline given back" : "a line that fits, left as it is");
     }
     if (narrow)
         fuzz::reached("h or hh");

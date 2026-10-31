@@ -454,6 +454,15 @@ int vsn_printf(char *s, size_t size, const char *fmt, va_list arg)
     return len;
 }
 
+int end_cut_line(char *s, size_t size, int len)
+{
+    static const char CUT[] = "...\n";
+    if (len < 0 || size < sizeof(CUT) || static_cast<size_t>(len) != size - 1 || s[len - 1] == '\n')
+        return len;
+    mem_cpy(s + size - sizeof(CUT), CUT, sizeof(CUT));
+    return len;
+}
+
 int sn_printf(char* buf, size_t size, const char* fmt, ...)
 {
     va_list args;
