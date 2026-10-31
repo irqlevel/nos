@@ -198,6 +198,23 @@ const TIMER_ADVANCE_NS: u64 = 10 * kcore::consts::NS_PER_US;
 /// at most past their edges were spent.
 const LATE_NS: u64 = kcore::consts::NS_PER_MS;
 
+/// The latest timer interrupt of a run, past its edge, and how it was
+/// waited for: `how` in `Counts::late_*`'s order, 1 to 8 -- a sleep that
+/// woke late, one that woke on time, one without the edge, a spin or a
+/// sleep for good, a round late after an exit, a host's interrupt, an exit
+/// of the guest's own, anything else. After the guest ran, when it was
+/// entered, what the host's timer was asked for as it was, and when it left
+/// -- host nanoseconds on the boot clock, as `due` is.
+#[derive(Clone, Copy, Default)]
+pub struct Worst {
+    pub late: u64,
+    pub how: u8,
+    pub due: u64,
+    pub entered: u64,
+    pub asked: u64,
+    pub left: u64,
+}
+
 /// The sooner of two times, either of which may be none.
 fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
@@ -211,8 +228,10 @@ fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
 #[derive(Clone, Copy)]
 enum Step {
     /// Its guest ran -- or the entry was turned back -- and was left at
-    /// `at`: by an interrupt of the host's, or by an exit of its own.
-    Ran { at: u64, host: bool },
+    /// `at`: by an interrupt of the host's, or by an exit of its own. It was
+    /// entered at `entered`, the host's timer asked for `asked` as it was
+    /// (`Kick::arm_at`; 0 for nothing).
+    Ran { at: u64, host: bool, entered: u64, asked: u64 },
     /// The task slept until `wake_at` -- its timer's edge then `edge` --
     /// and woke at `woke`, rung or not.
     Slept { wake_at: u64, edge: Option<u64>, woke: u64, rung: bool },
@@ -334,6 +353,8 @@ pub struct Counts {
     pub timer: u64,
     pub timer_late_ns: u64,
     pub timer_late_max: u64,
+    /// The latest of them, and what came before it.
+    pub worst: Worst,
     /// Entries not made because an edge of its timers came between the look
     /// at them and the arming of the host's timer -- which arms none for an
     /// edge gone by -- the loop round again to take it.
@@ -487,6 +508,9 @@ impl Counts {
         self.slept_ns += o.slept_ns;
         self.timer_late_ns += o.timer_late_ns;
         self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
+        if o.worst.late > self.worst.late {
+            self.worst = o.worst;
+        }
         self.timer_raced += o.timer_raced;
         self.advanced += o.advanced;
         self.late_woke_late += o.late_woke_late;
@@ -652,6 +676,8 @@ pub struct GuestCpu {
     /// for an entry made without the round, which arms the host's timer for
     /// it too.
     other_due: Option<u64>,
+    /// What the host's timer was last asked for (`Kick::arm_at`).
+    asked: Option<u64>,
     counts: Counts,
 }
 
@@ -906,6 +932,7 @@ impl LinuxGuest {
                 fast: false,
                 step: Step::Other,
                 other_due: None,
+                asked: None,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1435,7 +1462,8 @@ impl LinuxGuest {
                 && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now);
             if fast {
                 let edge = gc.lapic.next_timer_ns();
-                kick.arm_at(sooner(edge, gc.other_due.filter(|&due| due > now)));
+                gc.asked = sooner(edge, gc.other_due.filter(|&due| due > now));
+                kick.arm_at(gc.asked);
                 fast = edge.is_none_or(|edge| edge > time::boot_time_ns());
             }
             let apicv = if fast {
@@ -1457,20 +1485,38 @@ impl LinuxGuest {
                 let late = now.saturating_sub(due.unwrap_or(now));
                 gc.counts.timer_late_ns += late;
                 gc.counts.timer_late_max = gc.counts.timer_late_max.max(late);
+                let how = match gc.step {
+                    Step::Slept { edge, .. } if edge != due => 3,
+                    Step::Slept { wake_at, woke, .. } if woke > wake_at + LATE_NS => 1,
+                    Step::Slept { .. } => 2,
+                    Step::Spun => 4,
+                    Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => 5,
+                    Step::Ran { host: true, .. } => 6,
+                    Step::Ran { host: false, .. } => 7,
+                    Step::Other => 8,
+                };
                 if late > LATE_NS {
-                    match gc.step {
-                        Step::Slept { edge, .. } if edge != due => gc.counts.late_not_slept_for += 1,
-                        Step::Slept { wake_at, woke, rung, .. } if woke > wake_at + LATE_NS => {
-                            gc.counts.late_woke_late += 1;
-                            gc.counts.late_woke_late_rung += u64::from(rung);
+                    let c = &mut gc.counts;
+                    match how {
+                        1 => {
+                            c.late_woke_late += 1;
+                            c.late_woke_late_rung += u64::from(matches!(gc.step, Step::Slept { rung: true, .. }));
                         }
-                        Step::Slept { .. } => gc.counts.late_woke_on_time += 1,
-                        Step::Spun => gc.counts.late_spun += 1,
-                        Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => gc.counts.late_off_cpu += 1,
-                        Step::Ran { host: true, .. } => gc.counts.late_host += 1,
-                        Step::Ran { host: false, .. } => gc.counts.late_exit += 1,
-                        Step::Other => gc.counts.late_other += 1,
+                        2 => c.late_woke_on_time += 1,
+                        3 => c.late_not_slept_for += 1,
+                        4 => c.late_spun += 1,
+                        5 => c.late_off_cpu += 1,
+                        6 => c.late_host += 1,
+                        7 => c.late_exit += 1,
+                        _ => c.late_other += 1,
                     }
+                }
+                if late > gc.counts.worst.late {
+                    let (entered, asked, left) = match gc.step {
+                        Step::Ran { at, entered, asked, .. } => (entered, asked, at),
+                        _ => (0, 0, 0),
+                    };
+                    gc.counts.worst = Worst { late, how, due: due.unwrap_or(0), entered, asked, left };
                 }
             }
             shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
@@ -1649,7 +1695,8 @@ impl LinuxGuest {
              * back for one that comes after this. */
             let timers = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
             let edge = timers.min(devices_due.unwrap_or(u64::MAX));
-            kick.arm_at((edge != u64::MAX).then_some(edge));
+            gc.asked = (edge != u64::MAX).then_some(edge);
+            kick.arm_at(gc.asked);
             gc.other_due = sooner(pit_edge, devices_due);
             if timers <= time::boot_time_ns() {
                 kick.cancel();
@@ -1681,6 +1728,7 @@ impl LinuxGuest {
              * VM's, across its boots; this run's are told from it entry by
              * entry. */
             let edges_passed = kick.edges_passed();
+            let entered_at = time::boot_time_ns();
             let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
             let exit_at = time::boot_time_ns();
             if apicv {
@@ -1699,7 +1747,8 @@ impl LinuxGuest {
                 }
             };
             shared.host_cpu.store(host_cpu, Ordering::Relaxed);
-            gc.step = Step::Ran { at: exit_at, host: matches!(exit, Exit::Host) };
+            gc.step = Step::Ran { at: exit_at, host: matches!(exit, Exit::Host), entered: entered_at,
+                                  asked: gc.asked.unwrap_or(0) };
             exited = Some((exit_at, matches!(exit, Exit::Msr { write: true })));
             gc.counts.exits += 1;
             if gc.counts.exits % PROGRESS_EVERY == 0 {

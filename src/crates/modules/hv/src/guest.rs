@@ -800,6 +800,24 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.late(), total.late_woke_late, total.late_woke_late_rung, total.late_woke_on_time,
             total.late_not_slept_for, total.late_spun, total.late_off_cpu, total.late_host, total.late_exit,
             total.late_other, total.overslept, total.overslept_rung, total.overslept_max / NS_PER_US);
+        let w = total.worst;
+        const HOW: [&str; 9] = ["nothing", "a sleep that had the edge and woke late", "a sleep that woke on time",
+                                "a sleep without that edge", "a spin or a sleep for good",
+                                "a round more than 1 ms after an exit", "an interrupt of the host's took the guest out",
+                                "an exit of its own", "something else"];
+        let rel = |t: u64| (t as i64).saturating_sub(w.due as i64) / NS_PER_US as i64;
+        let _ = write!(out, "  worst      {} us past its edge, after {}", w.late / NS_PER_US,
+                       HOW.get(usize::from(w.how)).copied().unwrap_or("?"));
+        if w.entered != 0 {
+            let _ = write!(out, ": the guest entered {} us from the edge, ", rel(w.entered));
+            if w.asked == 0 {
+                let _ = write!(out, "the host's timer asked for nothing, ");
+            } else {
+                let _ = write!(out, "the host's timer asked for {} us from it, ", rel(w.asked));
+            }
+            let _ = write!(out, "and left {} us from it", rel(w.left));
+        }
+        let _ = writeln!(out);
     }
     let (posted, notified) = guest.posted_stats();
     if posted != 0 {
