@@ -140,16 +140,53 @@ entries) waited for one by one, and a disk serves one guest request at a time.
   the nested pages' leaves, the uncore's clock.
 - **E2.** The guest's boot, 7.2 s against 5.2 (kernel and userspace).
 
+## Measured after the first group
+
+The same comparison on 2026-10-31 evening: branch `vm-perf` at 40f31a68
+(D1-D5, G1, W1, C1, the exit counters), the guest's disk a fresh copy of
+the same image each time, run twice -- once with the kernel line the
+machine has (`hugepages=32G`, HLT idle), once with `idle=mwait`. nos's
+results as a share of KVM's, as above; `out/ex44-bench/run2` has the kit's
+second half and every log.
+
+| | KVM | bced1539 | vm-perf | + idle=mwait |
+|---|---:|---:|---:|---:|
+| sysbench cpu, 1 / 4 threads | 1589 / 3259 | 94% / 95% | 94% / 95% | 96% / 98% |
+| 7-Zip, 4 threads; its clock | 21 530; 4768 MHz | 95% | 95%; 4460 | 95%; 4460-4715 |
+| openssl, aes-256-gcm / chacha20 / sha256 | | 94% | 94% | 96-97% |
+| random reads of memory, 1 thread | 949 MiB/s | 84% | 84% | 85% |
+| perf sched pipe, us an op | 6.0 | 14.3 (42%) | 9.3 (65%) | 8.5 (71%) |
+| cyclictest, average us | 31 | 76 (41%) | 73 (42%) | 75.5 (41%) |
+| fio: a new file's first write, 1M QD8 | 4643 MiB/s | 1% | 885 (19%) | 883 (19%) |
+| fio: 4k random reads QD1 / QD32 | 20.1k / 195k | 59% / 8% | 89% / 41% | 92% / 41% |
+| fio: 4k random writes QD1 / QD32 | 39.9k / 178k | 42% / 15% | 84% / 72% | 86% / 74% |
+| fio: 1M reads / writes QD8 | 1456 / 3694 MiB/s | 12% / 5% | 93% / 63% | 92% / 63% |
+| fio: 4k writes with fdatasync | 620 | 115% | 116% | 116% |
+| kernel build (`make -j4` defconfig) | 318 s | -- | 333 s (95%) | 333 s (96%) |
+| pgbench init | 6.5 s | -- | 10.9 s (60%) | 10.7 s (61%) |
+| pgbench -S, 1 / 4 / 16 clients | 61.6k / 272k / 238k | -- | 79% / 100% / 99% | 82% / 100% / 99% |
+| pgbench (TPC-B), 1 / 4 / 16 clients | 411 / 1211 / 4655 | -- | 156% / 112% / 105% | 156% / 113% / 105% |
+| the guest's boot (kernel + userspace) | 5.24 s | 7.2 s | -- | 4.56 s |
+
+What the numbers say, item by item, is in the status below. In short: the
+disk is near KVM wherever one request is in flight at a time, and ahead of
+it wherever a guest flushes; it is held back where many requests are out at
+once (8 in flight per disk) and where a guest writes where the file has
+none (this NVMe has no Write Zeroes, so a chunk's zeros are written, every
+block twice). The guest boots faster than under KVM. What is left is the
+latency of a wakeup -- one guest CPU waking another, a timer -- and the
+clock a busy core runs at.
+
 ## Status
 
 | item | state |
 |---|---|
-| D1-D5 | done 2026-10-31 on branch `vm-perf`: smoke both arches, `fs-fuzz.py` (the image's map held to the filesystem's after every change, chunks of 1 to 64 blocks, vectors with sectors of one block, disks whose write of zeros is there, missing or a lie), `hv-test.py`. Then `hv-linux-test.py --disk`, a real Linux guest's disk, found D2 giving nothing on it: ext4 refused every chunk past its first hole -- its allocation read the extent leaf it had just changed, held to a checksum the change had not put on it yet -- and every write into a hole went through the VFS, correct and a commit each, which no other gate could see. Fixed where reads go through a transaction, the image now counts refusals and `fs-fuzz.py` holds ext4's to having a reason; the guest's disk aligns its discards to the chunk. On both roots the guest's 64 MiB went in four chunks, every write off the VFS's lock, two chunks given back by its trim. To measure on the EX44 |
-| G1 | done: PCID was offered all along, and Ubuntu's 6.8 turned it off itself on reading microcode revision 0 -- the guest is told the host's (`hvarch::x86::cpu::microcode_revision`), as KVM tells it; `hv-fuzz.py`, `hv-test.py` |
-| W1 | done: halt polling, KVM's growth and drop, never spun to a timer's edge (a first version that was found a spin by `hv-fuzz.py`'s `platform` target); `hv-fuzz.py`, `hv-test.py` |
-| C1 | done behind `idle=mwait` (off by default), on bare metal with ARAT. First as MWAIT into leaf 5's deepest C-state wherever the next timer was 2 ms off -- which would have had every NVMe completion and every vCPU's IPI pay C10's exit (680 us on intel_idle's table for this part) on the CPUs that wait for them; now Linux's way: MWAIT with interrupts masked, so that each idle's length is exact, deep only after four idles of 2 ms or more in a row with the timer as far off, C1 otherwise. QEMU offers no C-state under a hypervisor, so only the EX44 runs it -- to measure there, the clock and the latencies both, and to make the default once it has been |
-| T1 | measuring: `hv stop` says how late past their edges the guest timers' interrupts were requested, on average and at most |
-| W2 | measuring first. `hv bench profile` on the EX44 (bced1539, a P-core): an exit 1115 ns -- checks and VMPTRLD 13, the VMCS written 13, x87/SSE in 50 (the load skipped, XCR0 already the guest's: XGETBV and the checks), vmresume to the exit 590, x87/SSE out 61, the VMCS read 29, the exit handled and the loop 359. So the FPU's switch is lazy already on the way in; the save on the way out is what a lazy one would spare, which needs one guest's state saved by another's entry. `hv stop` now says what a Linux guest's exits cost past the world switch -- handled, and to the next entry, and a write of an MSR's -- for the EX44 to say where W2's fast path goes |
+| D1-D5 | measured on the EX44: reads and writes of 1M 93% and 63% of KVM (12% and 5% before), 4k at QD1 84-92% (latency 48-50 us, KVM's 47), fdatasync 116%, pgbench's TPC-B 105-156%; at QD32 41% -- the device has 8 requests out per disk (`blk::IN_FLIGHT`), and 8 at ~100 us is the 80k IOPS measured: next, 32; a new file's first write 19% (1% before) -- this NVMe (Samsung MZVL2512HCJQ, `oncs=0x57`) has no Write Zeroes, so each chunk's zeros are written before the guest's data goes over them, and a commit a chunk: next, zeros from one page in commands of MDTS with many out, or unwritten extents converted at the guest's flush. Found by `hv-linux-test.py --disk` first: ext4 had refused every chunk past its first hole (f4a1a68f) |
+| G1 | done and measured: the guest keeps PCID and INVPCID (`hvarch::x86::cpu::microcode_revision`, as KVM tells it) |
+| W1 | measured: 89% of halts caught in the spin (KVM's 90%), pipe 14.3 us -> 9.3 (KVM 6.0), and the guest's boot lost its 1.75 s (E2) |
+| C1 | measured: a busy core's clock 4460-4715 MHz with `idle=mwait`, 4460 without, KVM's 4768 -- CPU-bound work 96-98% of KVM's against 94-95%, and nothing slower for it: 4k QD1 48 us against 50, pipe 8.5 us against 9.3, cyclictest within its noise. Off by default still; the default when that is decided. What is left of the clock is cores woken too often to sleep deep: every idle CPU's 100 Hz tick among them, which Linux stops |
+| T1 | measured: the guests' timer interrupts requested 9-10 us past their edges on average -- and 10 ms at most, an edge left for the host's next tick: a wakeup lost somewhere, to find. cyclictest 73-76 us against KVM's 31, unchanged by W1 and C1 |
+| W2 | measured: past the world switch an exit costs 545-559 ns handled and 479-496 ns to the next entry -- about a microsecond of the host's a guest exit, of 122 million in 43 minutes, 54 million of them writes of an MSR (an IPI, a TSC deadline: 466-479 ns handled), 48 million halts; `hv bench profile` 1092-1127 ns an exit on a P-core, 1692 on an E-core. The fast path's target is the microsecond: what pipe (65-71%) and pgbench -S with one client (79-82%) wait on |
 | G2 | left: XSAVES, WAITPKG, MOVDIRI/MOVDIR64B and the TSC's frequency in KVM's leaf move nothing the suite measures -- the guest's XSAVEC and XSAVEOPT do what XSAVES would for it, and the rest is a delay loop's TPAUSE, an accelerator's stores and a calibration at boot |
-| E1 | to measure: after C1, whose ring and LLC clock may be what makes random reads 16% slower |
-| E2 | found: the guest's kernel is at `/init` in 0.26 s under nos, 0.9 under KVM (q35's AHCI probed); the second lost is 1.75 s after `async_tx: api initialized` -- modules' text patched and the clocksource switched, both waiting on every CPU's answer to an IPI, which a halted vCPU gave only once its host task was woken -- where KVM took 64 ms. W1's polling is for that: to measure |
+| E1 | measured: random reads 84-85% with the clock 4% higher under `idle=mwait` as without -- not the clock: the nested walk, the TLB, to look at |
+| E2 | solved: the guest's kernel up in 1.64 s (KVM 2.35 s), its boot 4.56 s against 5.24 -- the 1.75 s of IPIs waited on after `async_tx` gone with W1 |
