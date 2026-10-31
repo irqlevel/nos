@@ -96,11 +96,14 @@ public:
     void local_timer_wake(ulong deadline);
     void local_timer_tick();
 
-    /* How far off this CPU's next timer has to be for its idle to sleep
-       deep (hal::cpu_idle): past the residency a deep C-state takes to pay
-       for its entry and its exit, and short of a 100 Hz tick, so that a CPU
-       idle between ticks sleeps deep. */
+    /* How long an idle has to be for the next to sleep deep, and its next
+       timer as far off (idle_mwait): past the residency a deep C-state takes
+       to pay for its entry and its exit, and short of a 100 Hz tick, so that
+       a CPU idle between ticks sleeps deep. And how many such idles in a row
+       it takes: one woken sooner -- by a disk, by an IPI -- starts the count
+       again, in C1. */
     static const ulong IDLE_DEEP_NS = 2 * consts::NANO_SECS_IN_MS;
+    static const ulong IDLE_LONG_RUN = 4;
 
     static const ulong STATE_INITED = 0x1;
     static const ulong STATE_RUNNING = 0x2;
@@ -147,6 +150,8 @@ private:
     /* Set by park(), last; see is_parked */
     Atomic parked_;
 
+    void idle_mwait();
+
     void local_timer_arm(ulong when, ulong now);
 
     /* The local timer (LocalTimer*): one-shot here, the next tick's due
@@ -157,6 +162,10 @@ private:
     ulong tick_due_;
     ulong timer_armed_at_;
     bool timer_walk_;
+    /* How many idles in a row lasted IDLE_DEEP_NS or more, up to
+       IDLE_LONG_RUN: what idle_mwait goes deep by. This CPU's alone, with
+       interrupts off. */
+    ulong idle_long_run_;
 
     /* Ticks are a period apart; an interrupt this close before the next
        is that tick, rather than one more interrupt a moment later. */
