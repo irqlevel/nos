@@ -143,38 +143,47 @@ that keeps no blocks of its own on a device (`data_block_size` 0: ramfs,
 and nanofs for now) has its images read and written through the VFS whole.
 
 **A write into a hole grows the file a chunk at a time** (`CHUNK_BYTES`, 16
-MiB): the filesystem gives the chunk around it every block it lacks, as
-unwritten extents (`Vfs::allocate`, ext4's `allocate`) -- the file's, and
-read as zeros whatever their blocks held, so that no crash can show what a
-block held before it was the file's, and nothing written to them -- one
+MiB) -- or more: a hole that begins where the last growth ended is given
+twice the last one's chunks, up to `GROW_MAX_CHUNKS` (256 MiB), so that a
+guest filling its disk from one end costs a commit for every 256 MiB it
+writes rather than every 16 -- and no more than 256 MiB, nor an eighth of
+the free blocks (`GROW_SHARE`), is given that it may never write; where
+what is ahead is refused all the same, what the write needs is asked for
+alone. The filesystem gives the chunks every block they lack, as
+unwritten extents (`Vfs::allocate`, ext4's `allocate`, a run of free bits
+taken at a time -- `alloc_run` -- not a block) -- the file's, and read as
+zeros whatever their blocks held, so that no crash can show what a block
+held before it was the file's, and nothing written to them -- one
 transaction, and the guest's data then goes to the device as an overwrite,
-off the lock. Each chunk is taken into the map again after it, its runs
+off the lock. Each growth is taken into the map again after it, its runs
 said unwritten. A block of one that the image has not written reads as
 zeros, and a write over part of one takes zeros for the rest; what the
 image writes over them it keeps (`Pending`), reads from the device from
-then on, and makes written at the next sync -- the device flushed first, so
-that the data is on the medium before the file says it is there, and then
-one transaction (`Vfs::mark_written`, ext4's `mark_written`: the extents
-split around what was written, a run at a time) -- and as it is let go
-of. A guest that flushes as filesystems do keeps few such runs; one that
-keeps more than `PENDING_MAX` has them made written there and then, so the
-host's memory for them is bounded. A crash before the sync leaves the
-blocks unwritten: zeros, as a disk may give for writes it was not told to
-keep. A punch takes its blocks out of what is kept -- given again as an
-unwritten extent and found there, a block would read whatever the device
-held.
+then on, and makes written at the next sync, and as it is let go of: a
+transaction (`Vfs::mark_written`, ext4's `mark_written`: the extents split
+around what was written, a run at a time) whose commit flushes the device
+before its commit block, as every commit does -- so the data is on the
+medium before the file says it is there, and the guest's flush needs no
+flush of the image's own (a conversion with nothing to change flushes the
+device itself). A guest that flushes as filesystems do keeps few such
+runs; one that keeps more than `PENDING_MAX` has them made written there
+and then, so the host's memory for them is bounded. A crash before the
+sync leaves the blocks unwritten: zeros, as a disk may give for writes it
+was not told to keep. A punch takes its blocks out of what is kept --
+given again as an unwritten extent and found there, a block would read
+whatever the device held.
 
-Neither the allocation nor the conversion orders any data -- the first
-maps none, the second maps what the image flushed -- so each commits
-without the flush before its commit block (`Txn::ordered`), its log written
-with FUA instead, where the device has FUA of its own (`Disk::fua_native`:
-NVMe; virtio-blk's FUA is a write and a flush, and there the commit flushes
-as before). A flush pushes out the device's whole cache: the zeros of a
-chunk, first, and then the guest's last chunk of data, which on the EX44's
-Samsung made every 16 MiB of a new file's first write wait for a flush of
-16 MiB -- a guest filling a fresh disk wrote at 883 MiB/s where KVM's wrote
-4.6 GB/s (28 MiB/s before chunks, when ext4 committed every batch). That
-NVMe has no Write Zeroes, so the zeros were written too.
+What a guest's first writes cost is the flushes. Before unwritten extents
+a chunk was its zeros written -- the EX44's Samsung has no Write Zeroes --
+and then a commit, whose flush pushed them out with the guest's last chunk
+of data: a guest filling a fresh disk wrote at 883 MiB/s where KVM's wrote
+4.6 GB/s (28 MiB/s before chunks, when ext4 committed every batch). The
+first try at unwritten extents committed the allocation and the
+conversion without the flush before the commit block, their logs written
+with FUA instead, the image flushing the device itself before a
+conversion -- and on that Samsung a FUA write costs what a flush does, six
+to eight of them a commit, so the same fill fell to 422 MiB/s. A commit is
+the log, a flush and the commit block again, whatever it orders.
 
 Where the filesystem gives no blocks ahead of a write (ext2:
 `FileSystem::allocates`, asked once as the image is held), or has none left

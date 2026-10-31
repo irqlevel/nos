@@ -206,8 +206,10 @@ pub trait FileSystem: Send {
 
     /// The blocks of `file` named by `runs` -- each a first block and a
     /// count -- made written where they are unwritten: what a disk's image
-    /// wrote over the blocks `allocate` gave it, its device flushed first,
-    /// so that they hold its data on the medium before the file says so.
+    /// wrote over the blocks `allocate` gave it, before the call. Its data
+    /// is to be on the medium before the file says it is there -- the
+    /// device flushed before the commit that says so -- and on true all of
+    /// it there, the device flushed where nothing had to be made written.
     /// What is written already, or a hole, is left. false on an I/O error or
     /// no room for the tree to split in, by when some may be.
     fn mark_written(&mut self, _file: NodeId, _runs: &[(u64, u64)]) -> bool {
@@ -1354,7 +1356,7 @@ impl Vfs {
     /// The blocks of the file `handle` holds for writing named by `runs`
     /// made written where they are unwritten (`FileSystem::mark_written`):
     /// what its image wrote over the unwritten extents `allocate` gave it,
-    /// the device flushed by the image first.
+    /// on the medium before the file says so, and all of it on true.
     pub fn mark_written(&self, handle: Handle, runs: &[(u64, u64)]) -> bool {
         let Some(mut guard) = self.lock_handle(handle) else { return false };
         let slot = &mut *guard;
@@ -1504,9 +1506,10 @@ impl Vfs {
     }
 
     /// Blocks for the holes among `count` blocks of the file `handle` holds
-    /// for writing, from block `first` (`FileSystem::allocate`): zeros, the
-    /// file's from now on, its size as it was -- a disk's image growing a
-    /// chunk at a time. How many blocks were given, or None.
+    /// for writing, from block `first` (`FileSystem::allocate`): unwritten
+    /// extents, zeros to a read, the file's from now on, its size as it was
+    /// -- a disk's image growing a chunk or more at a time. How many blocks
+    /// were given, or None.
     pub fn allocate(&self, handle: Handle, first: u64, count: u64) -> Option<u64> {
         let Some(mut guard) = self.lock_handle(handle) else {
             trace!(0, "vfs: an allocation for a handle that is no open file's");
@@ -1535,6 +1538,17 @@ impl Vfs {
             return None;
         }
         mount.fs.allocate(node, first, count)
+    }
+
+    /// The space of the filesystem the file `handle` is open on
+    /// (`FileSystem::space`): what a disk's image may give itself ahead of
+    /// its guest's writes. None for a handle that is no open file's, or a
+    /// filesystem that does not say.
+    pub fn space_of_file(&self, handle: Handle) -> Option<Space> {
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
+        slot.files.get(handle)?;
+        slot.mount.as_ref()?.fs.space()
     }
 
     /// The filesystem the file is on, synced: everything written to it on

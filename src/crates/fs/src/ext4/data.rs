@@ -45,11 +45,12 @@ use crate::vnode::NodeId;
 /// what a transaction holds.
 const CHUNK_BLOCKS: u64 = 256;
 
-/// The most blocks one transaction of an allocation gives: 16 MiB of 4 KiB
-/// blocks -- a chunk of a disk's image -- each run of them an extent, and
-/// the transaction ended sooner where the runs' leaves fill half of what the
-/// journal takes at once.
-const ALLOC_BLOCKS: u64 = 4096;
+/// The most blocks one transaction of an allocation gives: 256 MiB of 4 KiB
+/// blocks -- the most a disk's image asks for at once, ahead of a guest
+/// writing from one end of it on (`image::GROW_MAX_CHUNKS`) -- each run of
+/// them an extent, and the transaction ended sooner where the runs' leaves
+/// fill half of what the journal takes at once.
+const ALLOC_BLOCKS: u64 = 1 << 16;
 
 /// The size at which a filesystem must say large_file.
 const LARGE_FILE_SIZE: u64 = 1 << 31;
@@ -223,21 +224,10 @@ impl Txn<'_> {
                 }
             };
             /* Blocks one after another for as long as they come, each run an
-             * extent of its own -- run on into the one before it where it
-             * follows it. */
+             * extent of its own. */
             let end = l + hole;
             while l < end {
-                let start = self.alloc_block(goal)?;
-                let mut len = 1u64;
-                let mut next = None;
-                while l + len < end && len < u64::from(UNINIT_MAX_LEN) {
-                    let b = self.alloc_block(start + len)?;
-                    if b != start + len {
-                        next = Some(b);
-                        break;
-                    }
-                    len += 1;
-                }
+                let (start, len) = self.alloc_run(goal, (end - l).min(u64::from(UNINIT_MAX_LEN)))?;
                 let run_first = u32::try_from(l).ok()?;
                 if !self.ext_insert(ino, &mut raw, Leaf { first: run_first, len: len as u32, start, unwritten: true })
                     || !inode::add_blocks(self.m, &mut raw, len as i64) {
@@ -246,18 +236,6 @@ impl Txn<'_> {
                 given += len;
                 l += len;
                 goal = start + len;
-                if let Some(b) = next {
-                    /* Taken, and not where the run went on: the start of the
-                     * next run, a block long so far. */
-                    let lu = u32::try_from(l).ok()?;
-                    if l >= end || !self.ext_insert(ino, &mut raw, Leaf { first: lu, len: 1, start: b, unwritten: true })
-                        || !inode::add_blocks(self.m, &mut raw, 1) {
-                        return None;
-                    }
-                    given += 1;
-                    l += 1;
-                    goal = b + 1;
-                }
                 if self.dirty.len() > self.jnl.max_txn / 2 {
                     break 'holes;
                 }
@@ -478,9 +456,8 @@ impl Ext4 {
     /// Blocks for every hole among `count` blocks of `file` from block
     /// `first`, of those inside it, as unwritten extents, a transaction at a
     /// time -- the size as it was, and what reads as zeros reading as zeros
-    /// still. Each orders no data, so it commits without a flush where the
-    /// device has FUA of its own: nothing the device holds for anyone else
-    /// is pushed out for it. How many blocks were given, or None.
+    /// still: nothing is written to them, so a chunk costs what its commit
+    /// does, however big. How many blocks were given, or None.
     pub fn allocate(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
         if !self.writable() {
             return None;
@@ -505,7 +482,6 @@ impl Ext4 {
                 trace!(0, "ext4: no transaction for an allocation in inode {}", ino);
                 return None;
             };
-            t.ordered = false;
             let Some((got, reached)) = t.allocate_range(ino, l, to) else {
                 trace!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
                 return None;
@@ -527,12 +503,15 @@ impl Ext4 {
     /// The blocks of `file` named by `runs` -- each a first block and a
     /// count, in order -- made written where they are unwritten, a
     /// transaction at a time: what a disk's image wrote over the extents
-    /// `allocate` gave it, its device flushed by the image first, so that
-    /// none says written before its data is on the medium. Each orders no
-    /// data -- what it maps is there already -- and commits as `allocate`'s
-    /// do, and may take the free blocks kept for a punch: a split of the
-    /// tree is all it can need, and a guest's flush is not to fail for the
-    /// room for one. false on an I/O error, or no room even so.
+    /// `allocate` gave it. The data is the caller's, written before the
+    /// call; the first commit's flush before its commit block puts it on the
+    /// medium ahead of any extent that says it is there (data=ordered), so
+    /// the caller needs no flush of its own first -- and where there was
+    /// nothing to commit, the device is flushed all the same: on true, what
+    /// the caller wrote before the call is on the medium. Each may take the
+    /// free blocks kept for a punch: a split of the tree is all it can need,
+    /// and a guest's flush is not to fail for the room for one. false on an
+    /// I/O error, or no room even so.
     pub fn mark_written(&mut self, file: NodeId, runs: &[(u64, u64)]) -> bool {
         if !self.writable() {
             return false;
@@ -542,17 +521,18 @@ impl Ext4 {
             return false;
         };
         let (mut run, mut l) = (0usize, runs.first().map_or(0, |r| r.0));
+        let mut flushed = false;
         while run < runs.len() {
             let Some(mut t) = self.begin() else {
                 trace!(0, "ext4: no transaction to make blocks of inode {} written", ino);
                 return false;
             };
-            t.ordered = false;
             t.may_reserve = true;
             let Some((next_run, next_l)) = t.written_range(ino, runs, run, l) else {
                 trace!(0, "ext4: blocks of inode {} not made written, from block {}", ino, l);
                 return false;
             };
+            flushed |= !t.dirty.is_empty();
             if !t.commit() {
                 trace!(0, "ext4: blocks of inode {} made written did not commit", ino);
                 return false;
@@ -562,6 +542,10 @@ impl Ext4 {
                 return false;
             }
             (run, l) = (next_run, next_l);
+        }
+        if !flushed && !self.io.flush() {
+            trace!(0, "ext4: a flush for blocks of inode {} found written already failed", ino);
+            return false;
         }
         true
     }

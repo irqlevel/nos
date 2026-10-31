@@ -153,6 +153,73 @@ impl Txn<'_> {
         None
     }
 
+    /// Up to `want` blocks, free and the filesystem's to give, one after
+    /// another: the first as `alloc_block` finds it from `goal`, and on from
+    /// it -- into the groups after, where a group ends free -- to the first
+    /// that is not free. Its first block and how many: a run, its group's
+    /// count changed and the cache's copies dropped once a group, where
+    /// `alloc_block` does both for every block it takes. None as
+    /// `alloc_block`, and when a bitmap says a block of the system zone
+    /// among the run's is free.
+    pub fn alloc_run(&mut self, goal: u64, want: u64) -> Option<(u64, u64)> {
+        let start = self.alloc_block(goal)?;
+        let mut len = 1u64;
+        while len < want {
+            let more = self.take_following(start + len, want - len)?;
+            if more == 0 {
+                break;
+            }
+            len += more;
+        }
+        Some((start, len))
+    }
+
+    /// Blocks from `b` on, in `b`'s group: as many as are free one after
+    /// another there, up to `want` and to what the reserve leaves, taken.
+    /// How many -- 0 when `b` itself is not free, or past the filesystem --
+    /// or None on a damaged bitmap.
+    fn take_following(&mut self, b: u64, want: u64) -> Option<u64> {
+        if b >= self.m.blocks {
+            return Some(0);
+        }
+        let left = self.m.free_blocks.saturating_sub(self.allocated);
+        let want = want.min(if self.may_reserve { left } else { left.saturating_sub(RESERVE) });
+        let g = self.m.group_of(b);
+        if want == 0 || self.group(g)?.free_blocks_count() == 0 {
+            return Some(0);
+        }
+        let map = self.bitmap(g, false)?;
+        let (start, len) = (self.m.group_start(g), self.m.group_len(g));
+        let (from, mut to) = (b - start, (b - start + want).min(len));
+        if let Some(f) = self.freed.first_from(b) {
+            to = to.min(f.saturating_sub(start));
+        }
+        let n = {
+            let data = &self.dirty.get(&map)?.data;
+            (from..to).take_while(|&i| !bit(data, i)).count() as u64
+        };
+        if n == 0 {
+            return Some(0);
+        }
+        if self.m.overlaps_system(b, b + n) {
+            trace!(0, "ext4: group {}'s bitmap has blocks of the filesystem's own among {}..+{} free: refused", g, b, n);
+            return None;
+        }
+        {
+            let data = &mut self.dirty.get_mut(&map)?.data;
+            for i in from..from + n {
+                set_bit(data, i, true);
+            }
+        }
+        let mut d = self.group_mut(g)?;
+        let (free, flags) = (d.view().free_blocks_count(), d.view().flags());
+        d.set_free_blocks_count(free.saturating_sub(n as u32));
+        d.set_flags(flags & !BLOCK_UNINIT);
+        self.cache.forget_range(b, b + n);
+        self.allocated += n;
+        Some(n)
+    }
+
     /// An inode, the lowest free in the first group from `goal` on that has
     /// one -- so that the part of a table never written shrinks by one -- a
     /// directory's counted as one. Its group's block bitmap is initialised

@@ -537,12 +537,6 @@ impl Txn<'_> {
             }
             jnl.started = true;
         }
-        /* The log's blocks with FUA where this orders no data and the
-         * device has FUA of its own: each on the medium as it is written,
-         * so the commit block after them needs no flush first -- a flush
-         * pushes out the device's whole cache, a guest's last chunk of data
-         * with it, where these few blocks are all that has to be there. */
-        let fua_log = !self.ordered && io.fua_native;
         let mut pos = jnl.head;
         let mut blk = vec![0u8; bs];
         let header = |blk: &mut [u8], kind: u32| {
@@ -561,7 +555,7 @@ impl Txn<'_> {
             }
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, fua_log)) {
+            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
                 jnl.abort(io, "a revoke block does not write");
                 return false;
             }
@@ -590,20 +584,20 @@ impl Txn<'_> {
             }
             let c = jbd2::block_tail_csum(jnl.seed, &blk).unwrap_or(0);
             set_be32(&mut blk, bs - jbd2::BLOCK_TAIL, c);
-            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, fua_log)) {
+            if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, &blk, false)) {
                 jnl.abort(io, "a descriptor block does not write");
                 return false;
             }
             pos = jnl.next(pos);
             for (_, copy, _) in chunk {
-                if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, fua_log)) {
+                if !jnl.map.get(u64::from(pos)).is_some_and(|at| io.write(at, copy, false)) {
                     jnl.abort(io, "a block's copy does not write to the journal");
                     return false;
                 }
                 pos = jnl.next(pos);
             }
         }
-        if !fua_log && !io.flush() {
+        if !io.flush() {
             jnl.abort(io, "the device does not flush a transaction");
             return false;
         }

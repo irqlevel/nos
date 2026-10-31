@@ -29,12 +29,16 @@
 //! file.
 //!
 //! A write into a hole grows the file by the chunk around it first
-//! (`Vfs::allocate`, `CHUNK_BYTES`): its blocks made zeros on the device and
-//! given to the file in one commit, and the write then goes to the device
-//! as an overwrite -- a commit a chunk, where a write through the VFS was a
-//! commit a batch. A guest's discard gives whole chunks back to the
-//! filesystem (`discard`, `Vfs::punch`): holes from then on, as a write of
-//! zeros with its unmap flag does with the chunks it covers whole
+//! (`Vfs::allocate`, `CHUNK_BYTES`) -- by twice as many as the last time
+//! where the hole begins where that growth ended, to `GROW_MAX_CHUNKS` --
+//! its blocks given to the file in one commit as unwritten extents, which
+//! read as zeros and have nothing written to them, and the write then goes
+//! to the device as an overwrite: a commit a chunk, where a write through
+//! the VFS was a commit a batch. What it wrote there is made written at the
+//! guest's next flush (`Vfs::mark_written`), whose commit's own flush puts
+//! the data on the medium first. A guest's discard gives whole chunks back
+//! to the filesystem (`discard`, `Vfs::punch`): holes from then on, as a
+//! write of zeros with its unmap flag does with the chunks it covers whole
 //! (`write_zeroes`), the rest of it zeros written. Blocks given
 //! back may be the next file's the moment the punch is done -- which is safe
 //! because, the image's calls coming one at a time, no read of its own is
@@ -74,10 +78,25 @@ const EXTENT_BLOCKS: u64 = 4096;
 const MAP_WINDOW: u64 = 1 << 22;
 
 /// What a write into a hole grows an image by (`Vfs::allocate`): the 16
-/// MiB around it, made zeros and given to the file in one commit rather
-/// than a commit for every batch the guest writes into it -- and what a
-/// guest's discard gives back whole, the rest of its range left as it is.
+/// MiB around it, given to the file as unwritten extents in one commit
+/// rather than a commit for every batch the guest writes into it -- and
+/// what a guest's discard gives back whole, the rest of its range left as
+/// it is.
 pub const CHUNK_BYTES: u64 = 16 << 20;
+
+/// The most chunks a write into a hole grows an image by at once: one, then
+/// twice the last for every hole that begins where the last growth ended --
+/// a guest writing its disk from one end on, whose next write is into the
+/// next hole -- up to 256 MiB of 16 MiB chunks. A commit and its flushes for
+/// every 256 MiB the guest writes, not every 16; and no more than 256 MiB
+/// given that it may never write.
+pub const GROW_MAX_CHUNKS: u64 = 16;
+
+/// What a growth gives ahead of the chunks its write needs, at most: an
+/// eighth of the filesystem's free blocks, so that the last of the room is
+/// not given to writes that may never come -- and a refusal of what is
+/// ahead never sends a write that fits through the VFS.
+const GROW_SHARE: u64 = 8;
 
 /// What zeros are written from, a piece at a time (`write_zeroes`).
 const ZERO_CHUNK: usize = 16 * 1024;
@@ -366,6 +385,10 @@ struct Direct {
     /// What a write into a hole grows the file by, and a discard gives back
     /// whole, in blocks: `CHUNK_BYTES`, unless told otherwise.
     chunk: u64,
+    /// Where the last growth ended, in blocks, and how many chunks it was:
+    /// a hole beginning there is given twice as many (`grow`).
+    grown_to: u64,
+    span: u64,
     /// A write went through the VFS since the last sync -- blocks were
     /// allocated, the filesystem's own metadata changed -- so the next sync
     /// is the filesystem's, not only the device's.
@@ -912,11 +935,11 @@ impl Image {
         true
     }
 
-    /// Everything written to the image so far on its disk's medium: the
-    /// device's cache pushed out -- and what it wrote over unwritten extents
-    /// made written after it (`make_written`), which pushes nothing out a
-    /// second time -- or, after a write the VFS took, the filesystem synced,
-    /// which pushes it out after its own metadata.
+    /// Everything written to the image so far on its disk's medium: what it
+    /// wrote over unwritten extents made written (`make_written`), whose
+    /// commit pushes the device's cache out before it says so, or the cache
+    /// pushed out where there were none -- or, after a write the VFS took,
+    /// the filesystem synced, which pushes it out after its own metadata.
     pub fn sync(&mut self) -> bool {
         let (vfs, handle) = (self.vfs, self.handle);
         let flushed = match self.direct.as_mut() {
@@ -1015,8 +1038,9 @@ impl Direct {
         fresh.resize(batch.pages(), false);
         let chunk = (CHUNK_BYTES / block as u64).max(1);
         Some(Direct { disk, block, batch, sectors, unwritten, fresh, pieces, stretches, map: None, chunk,
-                      through_vfs: false, read_off: 0, written_off: 0, written_through: 0, punched: 0, allocated: 0,
-                      grows: false, refused: 0, pending: Pending::default(), made_written: 0 })
+                      grown_to: u64::MAX, span: 0, through_vfs: false, read_off: 0, written_off: 0,
+                      written_through: 0, punched: 0, allocated: 0, grows: false, refused: 0,
+                      pending: Pending::default(), made_written: 0 })
     }
 
     /// Where each of `n` blocks from `first` is on the device, into
@@ -1056,18 +1080,15 @@ impl Direct {
     }
 
     /// What it wrote over unwritten extents -- and `also`, a run it could
-    /// not keep -- made written: the device flushed first, so that their data
-    /// is on the medium before the file says it is there, then the
-    /// filesystem told (`Vfs::mark_written`), and the map taken again where
-    /// it changed. What is kept is kept until it is done. false on a failure,
-    /// by when some may be.
+    /// not keep -- made written: the filesystem told (`Vfs::mark_written`),
+    /// whose commit flushes the device before its commit block, so that the
+    /// data is on the medium before the file says it is there -- and on true
+    /// all of it on the medium, a flush of the device's own -- and the map
+    /// taken again where it changed. What is kept is kept until it is done.
+    /// false on a failure, by when some may be.
     fn make_written(&mut self, vfs: &Vfs, handle: Handle, also: Option<(u64, u64)>) -> bool {
         if self.pending.runs.is_empty() && also.is_none() {
             return true;
-        }
-        if self.disk.flush().is_err() {
-            trace!(0, "image: a flush before blocks are made written failed");
-            return false;
         }
         let mut runs = Vec::new();
         let kept = self.pending.as_counts(&mut runs);
@@ -1101,34 +1122,55 @@ impl Direct {
     }
 
     /// The chunks blocks `first..first + n` are in, of a file of `blocks`
-    /// blocks, given every block they lack -- zeros, and the file's -- and
-    /// taken into the map: whether the filesystem gave them.
+    /// blocks -- and as many after them as make twice the last growth's,
+    /// where they begin where it ended (`GROW_MAX_CHUNKS`, `GROW_SHARE`) --
+    /// given every block they lack, as unwritten extents, and taken into the
+    /// map: whether the filesystem gave them.
     fn grow(&mut self, vfs: &Vfs, handle: Handle, first: u64, n: u64, blocks: u64) -> bool {
-        let from = first / self.chunk * self.chunk;
-        let to = (first + n).div_ceil(self.chunk).saturating_mul(self.chunk).min(blocks);
-        if from >= to {
+        let chunk = self.chunk;
+        let from = first / chunk * chunk;
+        let need = (first + n).div_ceil(chunk).saturating_mul(chunk).min(blocks);
+        if from >= need {
             return false;
         }
+        let span = if from == self.grown_to { self.span.saturating_mul(2).clamp(1, GROW_MAX_CHUNKS) } else { 1 };
+        let room = vfs.space_of_file(handle).map_or(0, |s| s.free_bytes / self.block as u64 / GROW_SHARE);
+        let ahead = from.saturating_add(span.saturating_mul(chunk)).min(blocks).saturating_sub(need).min(room);
+        let ahead = ahead / chunk * chunk;
+        /* What is ahead with what the write needs, and where that is
+         * refused -- the room went meanwhile -- what it needs alone. */
+        let to = if ahead > 0 && self.give(vfs, handle, from, need + ahead) {
+            need + ahead
+        } else if self.give(vfs, handle, from, need) {
+            need
+        } else {
+            0
+        };
+        if to > 0 {
+            (self.grown_to, self.span) = (to, (to - from).div_ceil(chunk));
+            return true;
+        }
+        /* Not wrong -- the write goes through the VFS, as every one into a
+         * hole did before chunks -- but a commit for each such write, which
+         * is what chunks are for: said at the first, and counted. */
+        if self.refused == 0 {
+            trace!(0, "image: its filesystem refused blocks {}..+{} ahead of a write into a hole: such writes go \
+                       through the VFS", from, need - from);
+        }
+        self.refused += 1;
+        false
+    }
+
+    /// Blocks `from..to` given every block they lack (`Vfs::allocate`) and
+    /// taken into the map again, whatever came of it: what the filesystem
+    /// gave before a refusal is the file's all the same. Whether it gave
+    /// them all.
+    fn give(&mut self, vfs: &Vfs, handle: Handle, from: u64, to: u64) -> bool {
         let given = vfs.allocate(handle, from, to - from);
         self.retake(vfs, handle, from, to - from);
-        match given {
-            Some(given) => {
-                self.allocated += given;
-                true
-            }
-            None => {
-                /* Not wrong -- the write goes through the VFS, as every one
-                 * into a hole did before chunks -- but a commit for each
-                 * such write, which is what chunks are for: said at the
-                 * first, and counted. */
-                if self.refused == 0 {
-                    trace!(0, "image: its filesystem refused blocks {}..+{} ahead of a write into a hole: such \
-                               writes go through the VFS", from, to - from);
-                }
-                self.refused += 1;
-                false
-            }
-        }
+        let Some(given) = given else { return false };
+        self.allocated += given;
+        true
     }
 }
 
