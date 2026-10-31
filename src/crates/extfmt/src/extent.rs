@@ -164,9 +164,30 @@ pub fn stored_csum(node: &[u8]) -> Option<u32> {
 /// the next entry of any node on the way begins; a hole reaches to there,
 /// or is a single block past the last entry. Every node on the way is held
 /// to its header, each a level below its parent; a run is held inside a
-/// filesystem of `fs_blocks` blocks. `ino` names the file in an error.
+/// filesystem of `fs_blocks` blocks. `ino` names the file in an error. An
+/// unwritten run is a hole: it reads as zeros, whatever its blocks hold.
 pub fn map(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32,
            read: &mut ReadBlock) -> Result<Map, String> {
+    Ok(match walk(root, lblock, fs_blocks, block_size, ino, read, false)? {
+        (Map::Blocks { run, .. }, true) => Map::Hole { run },
+        (m, _) => m,
+    })
+}
+
+/// `map`, but an unwritten run named as the blocks it has, and as
+/// unwritten (true): what whoever writes them -- a disk's image, into the
+/// unwritten extents its file was given ahead of its writes -- needs, and
+/// no reader does. Held inside the filesystem as a written run is.
+pub fn map_extent(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32,
+                  read: &mut ReadBlock) -> Result<(Map, bool), String> {
+    walk(root, lblock, fs_blocks, block_size, ino, read, true)
+}
+
+/// The walk `map` and `map_extent` share: an unwritten run held inside the
+/// filesystem only with `unwritten_held`, as `map` reads one as zeros
+/// whatever blocks it names.
+fn walk(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32, read: &mut ReadBlock,
+        unwritten_held: bool) -> Result<(Map, bool), String> {
     let mut node: Vec<u8> = root.to_vec();
     /* The blocks this subtree covers end where the next index entry up
      * begins: no run reaches past it. */
@@ -184,22 +205,20 @@ pub fn map(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32
                 let e = leaf(&node, i);
                 let (first, len) = (u64::from(e.first), u64::from(e.len));
                 if lblock < first {
-                    return Ok(Map::Hole { run: (first - lblock).min(limit.saturating_sub(lblock)) });
+                    return Ok((Map::Hole { run: (first - lblock).min(limit.saturating_sub(lblock)) }, false));
                 }
                 if lblock - first < len {
                     let run = (len - (lblock - first)).min(limit.saturating_sub(lblock));
-                    if e.unwritten {
-                        return Ok(Map::Hole { run });
-                    }
                     let block = e.start + (lblock - first);
-                    if block.checked_add(run).is_none_or(|end| end > fs_blocks) {
+                    let held = !e.unwritten || unwritten_held;
+                    if held && block.checked_add(run).is_none_or(|end| end > fs_blocks) {
                         return Err(alloc::format!("inode {}: an extent at block {} past the filesystem", ino,
                                                   e.start));
                     }
-                    return Ok(Map::Blocks { block, run });
+                    return Ok((Map::Blocks { block, run }, e.unwritten));
                 }
             }
-            return Ok(Map::Hole { run: limit.saturating_sub(lblock).max(1) });
+            return Ok((Map::Hole { run: limit.saturating_sub(lblock).max(1) }, false));
         }
         /* The last index entry starting at or before the block. */
         let mut child = None;
@@ -212,7 +231,7 @@ pub fn map(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, ino: u32
             child = Some(e.child);
         }
         let Some(child) = child else {
-            return Ok(Map::Hole { run: limit.saturating_sub(lblock).max(1) });
+            return Ok((Map::Hole { run: limit.saturating_sub(lblock).max(1) }, false));
         };
         let mut next = vec![0u8; block_size];
         read(child, &mut next)?;

@@ -1140,6 +1140,11 @@ impl BlockDriver for NvmeDevice {
         self.transfer(sector, data.as_ptr(), data.len(), true, fua)
     }
 
+    /// A Write's FUA bit, which every controller takes (NVMe 1.0 on).
+    fn fua_native(&'static self) -> bool {
+        true
+    }
+
     fn write_pieces(&'static self, base: u64, buf: &dma::DmaBuffer, pieces: &[Piece]) -> bool {
         self.batch(OPC_WRITE, buf.phys(), base, pieces)
     }

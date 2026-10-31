@@ -54,7 +54,7 @@ use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::trace;
 
-use crate::vfs::{Handle, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
+use crate::vfs::{Handle, MapRun, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
 use ffi::fs::{ImageIo, IMAGE_VEC_MAX};
 
 /// The most blocks a batch moves: a page of the buffer each -- 2 MiB, so
@@ -91,6 +91,9 @@ struct Run {
     len: u64,
     /// Where its first block begins on the device
     sector: u64,
+    /// An unwritten extent's: the file's, reading as zeros until made
+    /// written -- a chunk given ahead of the guest's writes (`grow`).
+    unwritten: bool,
 }
 
 /// Where the file's blocks are on the device, as the image holds it: the
@@ -124,17 +127,18 @@ impl Map {
     }
 
     /// Where each of `out.len()` blocks from `first` begins on the device,
-    /// 0 for a hole: what `Vfs::map` says of them.
-    fn fill(&self, first: u64, out: &mut [u64]) {
+    /// 0 for a hole, and whether it is an unwritten extent's, into
+    /// `unwritten` beside it.
+    fn fill(&self, first: u64, out: &mut [u64], unwritten: &mut [bool]) {
         let mut i = self.index(first);
-        for (k, slot) in out.iter_mut().enumerate() {
+        for (k, (slot, flag)) in out.iter_mut().zip(unwritten.iter_mut()).enumerate() {
             let b = first + k as u64;
             while self.runs.get(i).is_some_and(|r| r.first + r.len <= b) {
                 i += 1;
             }
-            *slot = match self.runs.get(i) {
-                Some(r) if r.first <= b => r.sector + (b - r.first) * self.per_block,
-                _ => 0,
+            (*slot, *flag) = match self.runs.get(i) {
+                Some(r) if r.first <= b => (r.sector + (b - r.first) * self.per_block, r.unwritten),
+                _ => (0, false),
             };
         }
     }
@@ -152,7 +156,7 @@ impl Map {
         }
         let left = b - r.first;
         self.runs[i].len = left;
-        self.runs.insert(i + 1, Run { first: b, len: r.len - left, sector: r.sector + left * self.per_block });
+        self.runs.insert(i + 1, Run { first: b, len: r.len - left, sector: r.sector + left * self.per_block, ..r });
         true
     }
 
@@ -163,7 +167,7 @@ impl Map {
             return;
         }
         let (a, b) = (self.runs[i - 1], self.runs[i]);
-        if a.first + a.len == b.first && a.sector + a.len * self.per_block == b.sector {
+        if a.first + a.len == b.first && a.sector + a.len * self.per_block == b.sector && a.unwritten == b.unwritten {
             self.runs[i - 1].len += b.len;
             self.runs.remove(i);
         }
@@ -191,7 +195,7 @@ impl Map {
                 return false;
             }
             let mut b = at;
-            for &(sector, len) in &got {
+            for &MapRun { sector, len, unwritten } in &got {
                 if len == 0 || len > at + n - b {
                     trace!(0, "image: the filesystem's map of {} blocks from {} does not add up", n, at);
                     return false;
@@ -200,6 +204,7 @@ impl Map {
                     let carries_on = at_run > 0 && {
                         let prev = self.runs[at_run - 1];
                         prev.first + prev.len == b && prev.sector + prev.len * self.per_block == sector
+                            && prev.unwritten == unwritten
                     };
                     if carries_on {
                         self.runs[at_run - 1].len += len;
@@ -207,7 +212,7 @@ impl Map {
                         if self.runs.try_reserve(1).is_err() {
                             return false;
                         }
-                        self.runs.insert(at_run, Run { first: b, len, sector });
+                        self.runs.insert(at_run, Run { first: b, len, sector, unwritten });
                         at_run += 1;
                     }
                 }
@@ -226,7 +231,8 @@ impl Map {
 
 /// A request's part in a batch: which request, where in its bytes and how
 /// many, the batch's first page it takes -- a page a block -- where in that
-/// block it starts, and how many blocks it takes.
+/// block it starts, how many blocks it takes, and the first of them in the
+/// file.
 #[derive(Clone, Copy)]
 struct Stretch {
     req: usize,
@@ -235,7 +241,108 @@ struct Stretch {
     page: usize,
     skip: usize,
     blocks: usize,
+    first: u64,
 }
+
+/// File blocks an image wrote over unwritten extents since its filesystem
+/// gave them (`grow`), as runs `start..end`, sorted, apart and not touching:
+/// what reads read from the device until they are made written -- rather
+/// than as zeros, as an unwritten extent's are -- and what its next sync
+/// makes written (`Vfs::mark_written`), after flushing the device. A punch
+/// takes its blocks out: one of them given again as an unwritten extent,
+/// and found here, would read whatever the device held there.
+#[derive(Default)]
+struct Pending {
+    runs: Vec<(u64, u64)>,
+}
+
+impl Pending {
+    fn contains(&self, b: u64) -> bool {
+        let i = self.runs.partition_point(|&(_, end)| end <= b);
+        self.runs.get(i).is_some_and(|&(start, _)| start <= b)
+    }
+
+    /// `start..end` in, run on into the runs it meets or touches: false,
+    /// and nothing changed, when there is no memory for one more run.
+    fn insert(&mut self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
+        let i = self.runs.partition_point(|&(_, e)| e < start);
+        let mut j = i;
+        let (mut s, mut e) = (start, end);
+        while let Some(&(rs, re)) = self.runs.get(j) {
+            if rs > e {
+                break;
+            }
+            s = s.min(rs);
+            e = e.max(re);
+            j += 1;
+        }
+        if j > i {
+            self.runs[i] = (s, e);
+            self.runs.drain(i + 1..j);
+            return true;
+        }
+        if self.runs.try_reserve(1).is_err() {
+            return false;
+        }
+        self.runs.insert(i, (s, e));
+        true
+    }
+
+    /// `start..end` out: false, and nothing changed, when a run it splits
+    /// in two finds no memory for the second half.
+    fn remove(&mut self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
+        let i = self.runs.partition_point(|&(_, e)| e <= start);
+        let mut j = i;
+        while self.runs.get(j).is_some_and(|&(rs, _)| rs < end) {
+            j += 1;
+        }
+        if i == j {
+            return true;
+        }
+        let (first, last) = (self.runs[i].0, self.runs[j - 1].1);
+        let mut kept = [(0u64, 0u64); 2];
+        let mut n = 0;
+        if first < start {
+            kept[n] = (first, start);
+            n += 1;
+        }
+        if last > end {
+            kept[n] = (end, last);
+            n += 1;
+        }
+        if n > j - i && self.runs.try_reserve(n - (j - i)).is_err() {
+            return false;
+        }
+        self.runs.splice(i..j, kept[..n].iter().copied());
+        true
+    }
+
+    /// The runs as first blocks and counts: what `Vfs::mark_written` takes.
+    fn as_counts(&self, out: &mut Vec<(u64, u64)>) -> bool {
+        out.clear();
+        if out.try_reserve_exact(self.runs.len()).is_err() {
+            return false;
+        }
+        out.extend(self.runs.iter().map(|&(s, e)| (s, e - s)));
+        true
+    }
+
+    fn blocks(&self) -> u64 {
+        self.runs.iter().map(|&(s, e)| e - s).sum()
+    }
+}
+
+/// The most runs an image keeps written and not yet made written: past
+/// them, it makes them written there and then, as a sync would -- a guest
+/// writing all over an unwritten disk for long without a flush costs the
+/// host no more memory than this.
+const PENDING_MAX: usize = 1024;
 
 /// What an image reads and writes off the VFS's lock with: the device its
 /// file's blocks are on, and a page of the buffer for each block of a batch.
@@ -244,8 +351,13 @@ struct Direct {
     /// A block of the file's, in bytes: a page or a whole fraction of one.
     block: usize,
     batch: DmaBuffer,
-    /// Where each block of the batch is on the device, 0 for a hole.
+    /// Where each block of the batch is on the device, 0 for a hole; and
+    /// beside it whether it is an unwritten extent's, and whether that has
+    /// not been written since (`fresh`): a block that reads as zeros, its
+    /// device's bytes no one's to see.
     sectors: Vec<u64>,
+    unwritten: Vec<bool>,
+    fresh: Vec<bool>,
     pieces: Vec<Piece>,
     /// The requests' parts the batch is made of.
     stretches: Vec<Stretch>,
@@ -270,6 +382,10 @@ struct Direct {
     /// (`Vfs::allocates`): where it does not, a write into a hole goes
     /// through the VFS without asking it for a chunk first.
     grows: bool,
+    /// What it wrote over unwritten extents and has not made written yet,
+    /// and the blocks it has made so: the next sync's work, and what it did.
+    pending: Pending,
+    made_written: u64,
     /// Chunks its filesystem refused, though it gives blocks ahead of writes
     /// -- each such write going through the VFS, as every one into a hole did
     /// before chunks: said at the first, and counted.
@@ -379,7 +495,7 @@ impl Image {
             }
             for (k, &sector) in direct.sectors[..n].iter().enumerate() {
                 let b = at + k as u64;
-                match (data_from, sector != 0) {
+                match (data_from, sector != 0 && !direct.fresh[k]) {
                     (None, true) => data_from = Some(b),
                     (Some(from), false) => return Some((at_block(from).max(offset), at_block(b))),
                     _ => {}
@@ -467,19 +583,22 @@ impl Image {
                 let skip = (at % block as u64) as usize;
                 let blocks = (skip + len - done).div_ceil(block).min(pages - used);
                 let take = (blocks * block - skip).min(len - done);
-                if !direct.resolve(vfs, handle, at / block as u64, used, blocks) {
+                let first = at / block as u64;
+                if !direct.resolve(vfs, handle, first, used, blocks) {
                     return false;
                 }
-                direct.stretches.push(Stretch { req, from: done, len: take, page: used, skip, blocks });
+                direct.stretches.push(Stretch { req, from: done, len: take, page: used, skip, blocks, first });
                 used += blocks;
                 done += take;
             }
 
             /* The blocks that are there, a page of the buffer each, read in
-             * one go -- with no lock held */
+             * one go -- with no lock held. An unwritten extent's that nothing
+             * has written reads as zeros: its bytes on the device are what it
+             * held before it was the file's, no one's to see. */
             direct.pieces.clear();
             for (k, &sector) in direct.sectors[..used].iter().enumerate() {
-                if sector != 0 {
+                if sector != 0 && !direct.fresh[k] {
                     direct.pieces.push(Piece { sector, at: k * PAGE_SIZE, len: block });
                 }
             }
@@ -495,11 +614,12 @@ impl Image {
                 while off < st.len {
                     let chunk = (block - skip).min(st.len - off);
                     let to = &mut buf[off..off + chunk];
-                    if direct.sectors[k] != 0 {
+                    if direct.sectors[k] != 0 && !direct.fresh[k] {
                         let from = k * PAGE_SIZE + skip;
                         to.copy_from_slice(&direct.batch.as_slice()[from..from + chunk]);
                     } else {
-                        /* A hole reads as zeros */
+                        /* A hole, or an unwritten extent's block nothing has
+                         * written, reads as zeros */
                         to.fill(0);
                     }
                     off += chunk;
@@ -572,6 +692,12 @@ impl Image {
                      * it, as every write went before */
                     direct.through_vfs = true;
                     let Ok(to) = usize::try_from(at) else { return false };
+                    /* What it wrote over unwritten extents made written first:
+                     * the VFS's write reads an unwritten block as zeros, and
+                     * would put them back around its own bytes in one */
+                    if !direct.make_written(vfs, handle, None) {
+                        return false;
+                    }
                     let written = vfs.write_within(handle, to, &data[done..done + take]);
                     /* Blocks given, as far as the write got: the map's from now */
                     direct.retake(vfs, handle, first, blocks as u64);
@@ -582,7 +708,7 @@ impl Image {
                     done += take;
                     continue;
                 }
-                direct.stretches.push(Stretch { req, from: done, len: take, page: used, skip, blocks });
+                direct.stretches.push(Stretch { req, from: done, len: take, page: used, skip, blocks, first });
                 used += blocks;
                 done += take;
             }
@@ -591,16 +717,24 @@ impl Image {
             }
 
             /* The first block and the last of each part, where it takes only
-             * part of them: what the rest of each holds, read first */
+             * part of them: what the rest of each holds, read first -- zeros,
+             * for an unwritten extent's block nothing has written */
             direct.pieces.clear();
             for st in &direct.stretches {
                 let end = st.skip + st.len;
+                let mut ends = [None; 2];
                 if st.skip != 0 {
-                    direct.pieces.push(Piece { sector: direct.sectors[st.page], at: st.page * PAGE_SIZE, len: block });
+                    ends[0] = Some(st.page);
                 }
                 if end % block != 0 && (st.blocks > 1 || st.skip == 0) {
-                    let last = st.page + st.blocks - 1;
-                    direct.pieces.push(Piece { sector: direct.sectors[last], at: last * PAGE_SIZE, len: block });
+                    ends[1] = Some(st.page + st.blocks - 1);
+                }
+                for k in ends.into_iter().flatten() {
+                    if direct.fresh[k] {
+                        direct.batch.as_mut_slice()[k * PAGE_SIZE..k * PAGE_SIZE + block].fill(0);
+                    } else {
+                        direct.pieces.push(Piece { sector: direct.sectors[k], at: k * PAGE_SIZE, len: block });
+                    }
                 }
             }
             if direct.disk.read_pieces(&mut direct.batch, &direct.pieces).is_err() {
@@ -629,6 +763,26 @@ impl Image {
                 return false;
             }
             direct.written_off += 1;
+
+            /* What went over an unwritten extent's blocks, kept to be made
+             * written: read from the device from now, not as zeros */
+            for k in 0..direct.stretches.len() {
+                let st = direct.stretches[k];
+                let mut b = 0;
+                while b < st.blocks {
+                    if !direct.unwritten[st.page + b] {
+                        b += 1;
+                        continue;
+                    }
+                    let from = b;
+                    while b < st.blocks && direct.unwritten[st.page + b] {
+                        b += 1;
+                    }
+                    if !direct.note_written(vfs, handle, st.first + from as u64, st.first + b as u64) {
+                        return false;
+                    }
+                }
+            }
         }
         true
     }
@@ -693,6 +847,15 @@ impl Image {
         let (first, end) = (offset.div_ceil(block), (offset + len) / block);
         if first < end {
             direct.retake(vfs, handle, first, end - first);
+            /* Out of what is kept to be made written: given again, as an
+             * unwritten extent, a block found there would read whatever the
+             * device holds. With no memory to take them out, all of it made
+             * written now -- the punched blocks are holes, and left -- and
+             * nothing kept. */
+            if !direct.pending.remove(first, end) {
+                let _ = direct.make_written(vfs, handle, None);
+                direct.pending.runs.clear();
+            }
         }
         match given {
             Some(given) => {
@@ -750,11 +913,23 @@ impl Image {
     }
 
     /// Everything written to the image so far on its disk's medium: the
-    /// device's cache pushed out -- or, after a write the VFS took, the
-    /// filesystem synced, which pushes it out after its own metadata.
+    /// device's cache pushed out -- and what it wrote over unwritten extents
+    /// made written after it (`make_written`), which pushes nothing out a
+    /// second time -- or, after a write the VFS took, the filesystem synced,
+    /// which pushes it out after its own metadata.
     pub fn sync(&mut self) -> bool {
+        let (vfs, handle) = (self.vfs, self.handle);
+        let flushed = match self.direct.as_mut() {
+            Some(direct) if !direct.pending.runs.is_empty() => {
+                if !direct.make_written(vfs, handle, None) {
+                    return false;
+                }
+                true
+            }
+            _ => false,
+        };
         match self.direct.as_mut() {
-            Some(direct) if !direct.through_vfs => direct.disk.flush().is_ok(),
+            Some(direct) if !direct.through_vfs => flushed || direct.disk.flush().is_ok(),
             Some(direct) => {
                 if !self.vfs.sync_file(self.handle) {
                     return false;
@@ -770,13 +945,23 @@ impl Image {
 impl Drop for Image {
     fn drop(&mut self) {
         let path = core::str::from_utf8(&self.path).unwrap_or("(a path that is not UTF-8)");
+        let (vfs, handle) = (self.vfs, self.handle);
+        if let Some(direct) = self.direct.as_mut() {
+            /* What it wrote over unwritten extents made written as it goes,
+             * as a sync would: let go of with no sync, a guest's last writes
+             * are the file's all the same, as a disk's are. */
+            if !direct.make_written(vfs, handle, None) {
+                trace!(0, "image: {}: {} blocks it wrote over unwritten extents were not made written: they read as \
+                           zeros", path, direct.pending.blocks());
+            }
+        }
         match &self.direct {
             /* Two lines, each short of what a line of the log holds whole. */
             Some(d) => {
                 trace!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} written \
                            through it; {}", path, d.read_off, d.written_off, d.written_through, MapSays(d.map.as_ref()));
-                trace!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back", path,
-                       d.allocated, d.refused, d.punched);
+                trace!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back, {} \
+                           made written", path, d.allocated, d.refused, d.punched, d.made_written);
             }
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
@@ -816,30 +1001,90 @@ impl Direct {
     fn new(disk: Disk, block: usize) -> Option<Direct> {
         let batch = batch_buffer()?;
         let mut sectors = Vec::new();
+        let mut unwritten = Vec::new();
+        let mut fresh = Vec::new();
         let mut pieces = Vec::new();
         let mut stretches = Vec::new();
         sectors.try_reserve_exact(batch.pages()).ok()?;
+        unwritten.try_reserve_exact(batch.pages()).ok()?;
+        fresh.try_reserve_exact(batch.pages()).ok()?;
         pieces.try_reserve_exact(batch.pages()).ok()?;
         stretches.try_reserve_exact(batch.pages()).ok()?;
         sectors.resize(batch.pages(), 0);
+        unwritten.resize(batch.pages(), false);
+        fresh.resize(batch.pages(), false);
         let chunk = (CHUNK_BYTES / block as u64).max(1);
-        Some(Direct { disk, block, batch, sectors, pieces, stretches, map: None, chunk, through_vfs: false,
-                      read_off: 0, written_off: 0, written_through: 0, punched: 0, allocated: 0, grows: false,
-                      refused: 0 })
+        Some(Direct { disk, block, batch, sectors, unwritten, fresh, pieces, stretches, map: None, chunk,
+                      through_vfs: false, read_off: 0, written_off: 0, written_through: 0, punched: 0, allocated: 0,
+                      grows: false, refused: 0, pending: Pending::default(), made_written: 0 })
     }
 
     /// Where each of `n` blocks from `first` is on the device, into
-    /// `sectors` from `slot` on: from the map the image holds, or asked of
-    /// the VFS where it holds none.
+    /// `sectors` from `slot` on -- and whether it is an unwritten extent's,
+    /// and fresh -- from the map the image holds, or asked of the VFS where
+    /// it holds none, which says an unwritten extent's blocks are holes.
     fn resolve(&mut self, vfs: &Vfs, handle: Handle, first: u64, slot: usize, n: usize) -> bool {
         let out = &mut self.sectors[slot..slot + n];
+        let unwritten = &mut self.unwritten[slot..slot + n];
+        let fresh = &mut self.fresh[slot..slot + n];
         match &self.map {
             Some(map) => {
-                map.fill(first, out);
+                map.fill(first, out, unwritten);
+                for (k, (f, &u)) in fresh.iter_mut().zip(unwritten.iter()).enumerate() {
+                    *f = u && !self.pending.contains(first + k as u64);
+                }
                 true
             }
-            None => vfs.map(handle, first, out),
+            None => {
+                unwritten.fill(false);
+                fresh.fill(false);
+                vfs.map(handle, first, out)
+            }
         }
+    }
+
+    /// File blocks `start..end`, written over unwritten extents, kept to be
+    /// made written by the next sync -- or made written now, with what was
+    /// kept, where there are as many runs kept as `PENDING_MAX` or no memory
+    /// for one more: never a block written and not kept, which would read as
+    /// zeros. false when they could not be made written.
+    fn note_written(&mut self, vfs: &Vfs, handle: Handle, start: u64, end: u64) -> bool {
+        if self.pending.insert(start, end) {
+            return self.pending.runs.len() < PENDING_MAX || self.make_written(vfs, handle, None);
+        }
+        self.make_written(vfs, handle, Some((start, end - start)))
+    }
+
+    /// What it wrote over unwritten extents -- and `also`, a run it could
+    /// not keep -- made written: the device flushed first, so that their data
+    /// is on the medium before the file says it is there, then the
+    /// filesystem told (`Vfs::mark_written`), and the map taken again where
+    /// it changed. What is kept is kept until it is done. false on a failure,
+    /// by when some may be.
+    fn make_written(&mut self, vfs: &Vfs, handle: Handle, also: Option<(u64, u64)>) -> bool {
+        if self.pending.runs.is_empty() && also.is_none() {
+            return true;
+        }
+        if self.disk.flush().is_err() {
+            trace!(0, "image: a flush before blocks are made written failed");
+            return false;
+        }
+        let mut runs = Vec::new();
+        let kept = self.pending.as_counts(&mut runs);
+        let done = kept && vfs.mark_written(handle, &runs)
+            && also.is_none_or(|run| vfs.mark_written(handle, &[run]));
+        /* Taken again whatever came of it: what the filesystem did make
+         * written is so in the map from now. */
+        for &(first, count) in runs.iter().chain(also.iter()) {
+            self.retake(vfs, handle, first, count);
+        }
+        if !done {
+            trace!(0, "image: {} blocks written over unwritten extents were not made written", self.pending.blocks());
+            return false;
+        }
+        self.made_written += self.pending.blocks() + also.map_or(0, |(_, n)| n);
+        self.pending.runs.clear();
+        true
     }
 
     /// Blocks `first..first + count`, which the filesystem may have changed

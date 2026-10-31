@@ -119,6 +119,13 @@ impl Disk {
         if table::flush(self.handle) { Ok(()) } else { Err(Error::IoError) }
     }
 
+    /// Whether `write` with `fua` is the device's own, on the medium when
+    /// it returns and nothing else pushed out with it -- or a write and a
+    /// flush of the whole cache (`BlockDriver::fua_native`).
+    pub fn fua_native(&self) -> bool {
+        table::fua_native(self.handle)
+    }
+
     /// Makes `count` sectors from `sector` read as zeros by the device's own
     /// command for it -- in its cache, as a write is, until a flush: true
     /// once it has. False from a device with no such command, or when the
