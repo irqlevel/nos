@@ -19,24 +19,28 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use hvarch::x86::svm::Kick;
 use kcore::sync::Event;
-use kcore::time::Duration;
+use kcore::time::{self, Duration};
 
 /// What wakes one vCPU: its task's event, for when it has nothing to run
-/// and waits, and its kick, for when it is in its guest.
+/// and waits, and its kick, for when it is in its guest -- and a word that
+/// says it was rung, for a halted one that spins a while before it waits
+/// (`poll`).
 pub struct Doorbell {
     event: Event,
     kick: Kick,
+    rung: AtomicBool,
 }
 
 impl Doorbell {
     pub fn new() -> Option<Doorbell> {
-        Some(Doorbell { event: Event::new()?, kick: Kick::new() })
+        Some(Doorbell { event: Event::new()?, kick: Kick::new(), rung: AtomicBool::new(false) })
     }
 
     /// Something waits for the vCPU, put where it looks before this: its
     /// task woken if it waits, and it leaves its guest if it is in there.
     /// From any context, interrupts off included.
     pub fn ring(&self) {
+        self.rung.store(true, Ordering::Release);
         self.event.signal();
         self.kick.kick();
     }
@@ -44,13 +48,36 @@ impl Doorbell {
     /// Wake the vCPU's task if it waits, and leave a guest that runs to its
     /// next exit: for what can wait that long -- a key typed at its console.
     pub fn signal(&self) {
+        self.rung.store(true, Ordering::Release);
         self.event.signal();
+    }
+
+    /// The vCPU's task, halted: spin for up to `ns` until rung -- on a CPU
+    /// that is its guest's own, which nothing else waits for -- rather than
+    /// sleep for a wake that comes that soon, and pay a wakeup and a
+    /// schedule for it. True when rung. The event the ring signalled keeps
+    /// the signal, so the next `wait` comes back at once: one look round the
+    /// loop, which finds nothing. What was rung for is found by the loop's
+    /// own look after either, as after `wait`: the word only stops the spin.
+    pub fn poll(&self, ns: u64) -> bool {
+        let end = time::boot_time_ns().saturating_add(ns);
+        loop {
+            if self.rung.swap(false, Ordering::Acquire) {
+                return true;
+            }
+            if time::boot_time_ns() >= end {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     /// The vCPU's task, with nothing to run: wait until rung, or until `ns`
     /// have passed. True when rung.
     pub fn wait(&self, ns: u64) -> bool {
-        self.event.wait_for(Duration::from_nanos(ns))
+        let rung = self.event.wait_for(Duration::from_nanos(ns));
+        self.rung.store(false, Ordering::Relaxed);
+        rung
     }
 
     /// The vCPU's task with no guest at all to run -- parked between one

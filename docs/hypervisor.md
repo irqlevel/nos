@@ -2399,6 +2399,23 @@ one alone took 0.1%. Blocking, the same two take 0.1% each, and sixteen idle
 guests on the AX41's twelve CPUs -- four of them carrying two -- keep the
 machine 1.6% busy, 0.1% a vCPU.
 
+**A halt that ends soon is spun through** (halt polling, KVM's way: the
+`POLL_*` constants in `hv/src/run.rs`). Before its task sleeps, a halted
+vCPU spins on its doorbell for a while (`Doorbell::poll`) -- on a host CPU
+that is its guest's own -- so that a ring that comes within the spin, an IPI
+from another of the guest's CPUs or a disk's answer, costs no wakeup and no
+schedule. The spin starts at none, doubles from 10 us after every halt that
+was short and outlasted it, up to 200 us, and is dropped after a halt longer
+than that: a guest that idles until its next tick spins not at all, and one
+whose CPUs wake each other within microseconds -- a pipe between two
+processes, a database's clients and its server -- is caught spinning. It is
+never spun up to an edge of the guest's own timers: an edge sooner than the
+spin is slept to, as before, so the loop always waits once a halt goes
+unanswered. The report counts the halts spun for and those a ring ended in
+the spin. Under KVM, on the EX44, the polls caught 36 million of a Linux
+guest's 40 million halts in a benchmark's run, and the pipe's round trip
+took 6 us where nos's took 14 ([`plans/vm-performance.md`](../plans/vm-performance.md)).
+
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
 what keeps the CPU safe: every entry checks, with interrupts off until the
@@ -4858,7 +4875,12 @@ someone else's; then speed.
 
 #### Speed
 
-1. **The CPU a guest is shown**, above, is the largest lever on Intel.
+1. **The CPU a guest is shown**, above, is the largest lever on Intel. One
+   piece of it: the microcode revision a guest reads (IA32_BIOS_SIGN_ID) is
+   the host's on Intel, as KVM tells it, where it was 0 -- Ubuntu's 6.8
+   then took the EX44's Raptor Lake for one with the INVLPG erratum's old
+   microcode and turned PCID off ("Incomplete global flushes, disabling
+   PCID"), a whole TLB flush at every switch of process.
 2. ~~**The disk is one request at a time, machine-wide.**~~ A guest's
    image is held and read and written off the VFS's lock (`fs::image`):
    its block map resolved under it, the blocks moved without it, a flush

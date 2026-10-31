@@ -145,4 +145,6 @@ entries) waited for one by one, and a disk serves one guest request at a time.
 | item | state |
 |---|---|
 | D1-D5 | done 2026-10-31 on branch `vm-perf`: smoke both arches, `fs-fuzz.py` (the image's map held to the filesystem's after every change, chunks of 1 to 64 blocks, vectors with sectors of one block, disks whose write of zeros is there, missing or a lie), `hv-test.py`; to measure on the EX44 |
-| C1, W1, W2, T1, G1, G2, E1, E2 | to do |
+| G1 | done: PCID was offered all along, and Ubuntu's 6.8 turned it off itself on reading microcode revision 0 -- the guest is told the host's (`hvarch::x86::cpu::microcode_revision`), as KVM tells it; `hv-fuzz.py`, `hv-test.py` |
+| W1 | done: halt polling, KVM's growth and drop, never spun to a timer's edge (a first version that was found a spin by `hv-fuzz.py`'s `platform` target); `hv-fuzz.py`, `hv-test.py` |
+| C1, W2, T1, G2, E1, E2 | to do |

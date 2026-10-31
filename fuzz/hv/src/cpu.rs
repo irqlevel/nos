@@ -137,6 +137,12 @@ pub mod x86 {
             (host() & (1 << 46) != 0, host() & (1 << 47) != 0)
         }
 
+        /// The microcode revision an Intel host runs, made up with the rest
+        /// of it; 0 on an AMD one, as the kernel's answers.
+        pub fn microcode_revision() -> u32 {
+            if host_is_intel() { (host() >> 13) as u32 } else { 0 }
+        }
+
         /// The host's IA32_ARCH_CAPABILITIES, where its CPUID offers it (leaf
         /// 7, EDX bit 29): every bit made up with the rest of the host.
         pub fn arch_capabilities() -> Option<u64> {
