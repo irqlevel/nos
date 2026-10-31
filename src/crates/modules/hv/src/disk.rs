@@ -195,6 +195,9 @@ pub struct FileDisk {
     pipe: Arc<Pipe>,
     size: u64,
     read_only: bool,
+    /// What the device tells the guest to align its discards to
+    /// (`Backend::discard_sectors`): the image's chunk.
+    discard_sectors: u32,
     /// The disk's task: told to stop, and waited for, when the disk goes.
     task: Option<TaskHandle>,
     /// Its claim on its image (`Claims`): a field, and so given back only
@@ -225,6 +228,12 @@ impl FileDisk {
         if size == 0 {
             return Err(alloc::format!("{}: not a sector long", path));
         }
+        /* What the image gives back of a discard: whole chunks, and nothing
+         * of less -- what the guest is told to align its discards to, so
+         * that its long ones are split on a chunk's edge. A block where it
+         * gives back nothing at all. */
+        let discard_sectors = u32::try_from(image.discard_unit() / blk::SECTOR).ok().filter(|&s| s != 0)
+            .unwrap_or(blk::DISCARD_ALIGNMENT);
 
         let mut todo = VecDeque::new();
         let mut done = VecDeque::new();
@@ -242,7 +251,7 @@ impl FileDisk {
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
         let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu, Serve { pipe: pipe.clone(), image }, serve)
             .ok_or_else(|| alloc::format!("{}: no task to serve it", path))?;
-        Ok(FileDisk { pipe, size, read_only, task: Some(task), _claim: claim })
+        Ok(FileDisk { pipe, size, read_only, discard_sectors, task: Some(task), _claim: claim })
     }
 }
 
@@ -253,6 +262,10 @@ impl blk::Backend for FileDisk {
 
     fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    fn discard_sectors(&self) -> u32 {
+        self.discard_sectors
     }
 
     fn submit(&mut self, req: Request) {

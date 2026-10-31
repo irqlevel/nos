@@ -266,6 +266,14 @@ struct Direct {
     /// Blocks given back by discards, and given to the file ahead of writes.
     punched: u64,
     allocated: u64,
+    /// Whether its filesystem gives blocks ahead of writes at all
+    /// (`Vfs::allocates`): where it does not, a write into a hole goes
+    /// through the VFS without asking it for a chunk first.
+    grows: bool,
+    /// Chunks its filesystem refused, though it gives blocks ahead of writes
+    /// -- each such write going through the VFS, as every one into a hole did
+    /// before chunks: said at the first, and counted.
+    refused: u64,
 }
 
 pub struct Image {
@@ -303,6 +311,7 @@ impl Image {
              * sectors: through the VFS, as a filesystem with none. */
             if let Some(disk) = Direct::fits(device, block) {
                 let mut direct = Direct::new(disk, block)?;
+                direct.grows = write && vfs.allocates(handle);
                 let per_block = block as u64 / direct.disk.sector_size();
                 direct.map = Map::load(vfs, handle, image.size.div_ceil(block as u64), per_block);
                 if direct.map.is_none() {
@@ -544,7 +553,7 @@ impl Image {
                 if !direct.resolve(vfs, handle, first, used, blocks) {
                     return false;
                 }
-                if direct.sectors[used..used + blocks].contains(&0)
+                if direct.grows && direct.sectors[used..used + blocks].contains(&0)
                     && direct.grow(vfs, handle, first, blocks as u64, file_blocks)
                     && !direct.resolve(vfs, handle, first, used, blocks) {
                     return false;
@@ -622,6 +631,13 @@ impl Image {
             direct.written_off += 1;
         }
         true
+    }
+
+    /// How many chunks the image's filesystem refused ahead of a write into
+    /// a hole, though it gives blocks so: what its fuzzer holds to its
+    /// having had a reason -- no room, a request that failed.
+    pub fn chunks_refused(&self) -> u64 {
+        self.direct.as_ref().map_or(0, |d| d.refused)
     }
 
     /// What a discard gives back whole, in bytes -- a chunk -- or 0 where
@@ -755,10 +771,13 @@ impl Drop for Image {
     fn drop(&mut self) {
         let path = core::str::from_utf8(&self.path).unwrap_or("(a path that is not UTF-8)");
         match &self.direct {
-            Some(d) => trace!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} \
-                                  written through it, {} blocks given back and {} given ahead of writes; {}", path,
-                              d.read_off, d.written_off, d.written_through, d.punched, d.allocated,
-                              MapSays(d.map.as_ref())),
+            /* Two lines, each short of what a line of the log holds whole. */
+            Some(d) => {
+                trace!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} written \
+                           through it; {}", path, d.read_off, d.written_off, d.written_through, MapSays(d.map.as_ref()));
+                trace!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back", path,
+                       d.allocated, d.refused, d.punched);
+            }
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
         }
@@ -805,7 +824,8 @@ impl Direct {
         sectors.resize(batch.pages(), 0);
         let chunk = (CHUNK_BYTES / block as u64).max(1);
         Some(Direct { disk, block, batch, sectors, pieces, stretches, map: None, chunk, through_vfs: false,
-                      read_off: 0, written_off: 0, written_through: 0, punched: 0, allocated: 0 })
+                      read_off: 0, written_off: 0, written_through: 0, punched: 0, allocated: 0, grows: false,
+                      refused: 0 })
     }
 
     /// Where each of `n` blocks from `first` is on the device, into
@@ -851,7 +871,18 @@ impl Direct {
                 self.allocated += given;
                 true
             }
-            None => false,
+            None => {
+                /* Not wrong -- the write goes through the VFS, as every one
+                 * into a hole did before chunks -- but a commit for each
+                 * such write, which is what chunks are for: said at the
+                 * first, and counted. */
+                if self.refused == 0 {
+                    trace!(0, "image: its filesystem refused blocks {}..+{} ahead of a write into a hole: such \
+                               writes go through the VFS", from, to - from);
+                }
+                self.refused += 1;
+                false
+            }
         }
     }
 }
@@ -981,6 +1012,14 @@ pub extern "C" fn kernel_image_close(image: usize) {
 #[no_mangle]
 pub extern "C" fn kernel_image_length(image: usize) -> i64 {
     with(image, |image| i64::try_from(image.size()).unwrap_or(-1)).unwrap_or(-1)
+}
+
+/// What a discard of the image gives back whole, in bytes -- its chunk --
+/// or 0 where a discard gives back nothing, and for a word that is no
+/// image's (`Image::discard_unit`).
+#[no_mangle]
+pub extern "C" fn kernel_image_discard_unit(image: usize) -> u64 {
+    with(image, |image| image.discard_unit()).unwrap_or(0)
 }
 
 /// The mount the image's file is on, never 0 -- or 0 for a word that is no
