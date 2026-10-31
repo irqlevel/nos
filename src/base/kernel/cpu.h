@@ -96,6 +96,12 @@ public:
     void local_timer_wake(ulong deadline);
     void local_timer_tick();
 
+    /* How far off this CPU's next timer has to be for its idle to sleep
+       deep (hal::cpu_idle): past the residency a deep C-state takes to pay
+       for its entry and its exit, and short of a 100 Hz tick, so that a CPU
+       idle between ticks sleeps deep. */
+    static const ulong IDLE_DEEP_NS = 2 * consts::NANO_SECS_IN_MS;
+
     static const ulong STATE_INITED = 0x1;
     static const ulong STATE_RUNNING = 0x2;
     static const ulong STATE_EXITING = 0x4;

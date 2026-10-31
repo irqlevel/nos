@@ -55,6 +55,19 @@ bool setup_cpu_performance(CpuPerformance* out)
     return false;
 }
 
+bool setup_idle(u32* hint)
+{
+    /* WFI, the only idle there is here without PSCI's CPU_SUSPEND. */
+    *hint = 0;
+    return false;
+}
+
+void cpu_idle(bool deep)
+{
+    (void)deep;
+    cpu_halt();
+}
+
 ulong cycle_counter_hz()
 {
     /* The generic timer's rate, which firmware sets and nothing changes:

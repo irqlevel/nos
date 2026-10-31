@@ -287,8 +287,11 @@ pub struct Counts {
     pub edges0: u64,
     /// Interrupts injected from the local APIC: its timer's, IPIs, its own.
     pub apic: u64,
-    /// The local APIC timer's interrupts requested.
+    /// The local APIC timer's interrupts requested, and how late past their
+    /// edges: in all, and the latest.
     pub timer: u64,
+    pub timer_late_ns: u64,
+    pub timer_late_max: u64,
     /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
     /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
     /// stopped the guest after, of level-triggered vectors.
@@ -390,6 +393,8 @@ impl Counts {
         self.pause += o.pause;
         self.sleeps += o.sleeps;
         self.slept_ns += o.slept_ns;
+        self.timer_late_ns += o.timer_late_ns;
+        self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
         self.polls += o.polls;
         self.polled += o.polled;
         self.ud += o.ud;
@@ -1281,8 +1286,15 @@ impl LinuxGuest {
             }
             self.take_mail(gc);
             self.take_posted(gc, shared);
+            let due = gc.lapic.next_timer_ns();
             if gc.lapic.timer(now) {
                 gc.counts.timer += 1;
+                /* How late its interrupt is requested, past the edge it was
+                 * due at: what a guest's timer latency is made of here, the
+                 * host's wakeup of a halted vCPU above all. */
+                let late = now.saturating_sub(due.unwrap_or(now));
+                gc.counts.timer_late_ns += late;
+                gc.counts.timer_late_max = gc.counts.timer_late_max.max(late);
             }
             shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
 
