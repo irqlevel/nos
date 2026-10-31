@@ -71,10 +71,10 @@ public:
        than turning on hardware P-states (hal::setup_cpu_performance) */
     bool is_hwp_off();
 
-    /* idle=mwait -- x86: an idle CPU with a while to its next timer sleeps
-       in the deepest C-state MWAIT offers, rather than halting
-       (hal::setup_idle): what lets a busy core run at the turbo of few busy
-       cores. HLT by default. */
+    /* x86: an idle CPU sleeps by MWAIT, deep once its idles have been long
+       (hal::setup_idle, Cpu::idle_mwait): what lets a busy core run at the
+       turbo of few busy cores. The default, where the CPU offers it;
+       idle=halt for HLT alone, idle=mwait to say it. */
     bool is_idle_mwait();
 
     /* ucode=off -- x86: load no microcode from the module GRUB put beside
