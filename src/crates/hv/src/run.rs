@@ -205,8 +205,12 @@ enum Step {
     /// Its guest ran -- or the entry was turned back -- and was left at
     /// `at`: by an interrupt of the host's, or by an exit of its own.
     Ran { at: u64, host: bool },
-    /// The task slept or spun, for a ring or an edge.
-    Slept,
+    /// The task slept until `wake_at` -- its timer's edge then `edge` --
+    /// and woke at `woke`, rung or not.
+    Slept { wake_at: u64, edge: Option<u64>, woke: u64, rung: bool },
+    /// The task spun through a halt until rung, or slept until another CPU
+    /// woke it -- halted with interrupts off, or waiting for a start-up IPI.
+    Spun,
     /// Neither: the round came again for something else.
     Other,
 }
@@ -328,17 +332,26 @@ pub struct Counts {
     pub advanced: u64,
     /// The timer's interrupts requested more than `LATE_NS` past their
     /// edges, by what the task did before the round that found them (`Step`):
-    /// slept; ran its guest, and came round more than `LATE_NS` after the
-    /// exit -- off its CPU, or busy; ran its guest until an interrupt of the
-    /// host's took it out; until an exit of its own; anything else.
-    pub late_slept: u64,
+    /// slept to a time with that edge in it, and woke more than `LATE_NS` past
+    /// it -- rung, or not; woke on time, the edge in the sleep; slept without
+    /// that edge -- none armed, or another; spun or slept for good; ran its
+    /// guest, and came round more than `LATE_NS` after the exit -- off its
+    /// CPU, or busy; ran its guest until an interrupt of the host's took it
+    /// out; until an exit of its own; anything else.
+    pub late_woke_late: u64,
+    pub late_woke_late_rung: u64,
+    pub late_woke_on_time: u64,
+    pub late_not_slept_for: u64,
+    pub late_spun: u64,
     pub late_off_cpu: u64,
     pub late_host: u64,
     pub late_exit: u64,
     pub late_other: u64,
-    /// Sleeps to a time that ended more than `LATE_NS` past it, and the most
-    /// any ended past its time.
+    /// Sleeps to a time that ended more than `LATE_NS` past it -- by their
+    /// time, or by a ring that came after it -- those of them rung, and the
+    /// most any ended past its time.
     pub overslept: u64,
+    pub overslept_rung: u64,
     pub overslept_max: u64,
     /// Entries made at once after a write of its TSC deadline or of an IPI
     /// to other CPUs, without the loop's round.
@@ -421,6 +434,13 @@ pub struct Counts {
 
 impl Counts {
     /// Another CPU's counts into these: a guest's, from its CPUs'.
+    /// The timer's interrupts requested more than `LATE_NS` past their
+    /// edges, however they were waited for.
+    pub fn late(&self) -> u64 {
+        self.late_woke_late + self.late_woke_on_time + self.late_not_slept_for + self.late_spun + self.late_off_cpu
+            + self.late_host + self.late_exit + self.late_other
+    }
+
     pub fn add(&mut self, o: &Counts) {
         self.port_in += o.port_in;
         self.port_out += o.port_out;
@@ -457,12 +477,17 @@ impl Counts {
         self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
         self.timer_raced += o.timer_raced;
         self.advanced += o.advanced;
-        self.late_slept += o.late_slept;
+        self.late_woke_late += o.late_woke_late;
+        self.late_woke_late_rung += o.late_woke_late_rung;
+        self.late_woke_on_time += o.late_woke_on_time;
+        self.late_not_slept_for += o.late_not_slept_for;
+        self.late_spun += o.late_spun;
         self.late_off_cpu += o.late_off_cpu;
         self.late_host += o.late_host;
         self.late_exit += o.late_exit;
         self.late_other += o.late_other;
         self.overslept += o.overslept;
+        self.overslept_rung += o.overslept_rung;
         self.overslept_max = self.overslept_max.max(o.overslept_max);
         self.fast += o.fast;
         self.polls += o.polls;
@@ -1417,7 +1442,13 @@ impl LinuxGuest {
                 gc.counts.timer_late_max = gc.counts.timer_late_max.max(late);
                 if late > LATE_NS {
                     match gc.step {
-                        Step::Slept => gc.counts.late_slept += 1,
+                        Step::Slept { edge, .. } if edge != due => gc.counts.late_not_slept_for += 1,
+                        Step::Slept { wake_at, woke, rung, .. } if woke > wake_at + LATE_NS => {
+                            gc.counts.late_woke_late += 1;
+                            gc.counts.late_woke_late_rung += u64::from(rung);
+                        }
+                        Step::Slept { .. } => gc.counts.late_woke_on_time += 1,
+                        Step::Spun => gc.counts.late_spun += 1,
                         Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => gc.counts.late_off_cpu += 1,
                         Step::Ran { host: true, .. } => gc.counts.late_host += 1,
                         Step::Ran { host: false, .. } => gc.counts.late_exit += 1,
@@ -1507,7 +1538,7 @@ impl LinuxGuest {
                         }
                         Sleep::Wait => {
                             bell.wait(ASLEEP_WAIT_NS.min(deadline.saturating_sub(now)).max(1));
-                            gc.step = Step::Slept;
+                            gc.step = Step::Spun;
                             continue;
                         }
                     }
@@ -1539,7 +1570,7 @@ impl LinuxGuest {
                                 gc.counts.polls += 1;
                                 if bell.poll(gc.poll_ns) {
                                     gc.counts.polled += 1;
-                                    gc.step = Step::Slept;
+                                    gc.step = Step::Spun;
                                     continue;
                                 }
                             }
@@ -1551,19 +1582,22 @@ impl LinuxGuest {
                              * on the EX44 -- comes before the edge rather than
                              * after it, and the guest's interrupt on time.
                              * KVM's timer advance, fixed. */
-                            let advance = gc.lapic.next_timer_ns() == Some(until) && until - now > TIMER_ADVANCE_NS;
+                            let edge = gc.lapic.next_timer_ns();
+                            let advance = edge == Some(until) && until - now > TIMER_ADVANCE_NS;
                             let wake_at = if advance { until - TIMER_ADVANCE_NS } else { until };
                             let slept_from = time::boot_time_ns();
                             let rung = bell.wait(wake_at.saturating_sub(slept_from).max(1));
                             let woke = time::boot_time_ns();
                             gc.counts.sleeps += 1;
                             gc.counts.slept_ns += woke.saturating_sub(slept_from);
-                            if !rung {
-                                let over = woke.saturating_sub(wake_at.max(slept_from + 1));
-                                gc.counts.overslept += u64::from(over > LATE_NS);
-                                gc.counts.overslept_max = gc.counts.overslept_max.max(over);
+                            let wake_at = wake_at.max(slept_from + 1);
+                            let over = woke.saturating_sub(wake_at);
+                            if over > LATE_NS {
+                                gc.counts.overslept += 1;
+                                gc.counts.overslept_rung += u64::from(rung);
                             }
-                            gc.step = Step::Slept;
+                            gc.counts.overslept_max = gc.counts.overslept_max.max(over);
+                            gc.step = Step::Slept { wake_at, edge, woke, rung };
                             if advance && !rung {
                                 let at = time::boot_time_ns();
                                 if at < until {
