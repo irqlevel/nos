@@ -406,9 +406,12 @@ const IMAGE_WRITES: [(usize, usize, u8); 5] =
     [(8192 + 100, 3, 2), (30000, 6000, 3), (4000, 20000, 4), (8192, 8192, 5), (IMAGE_SIZE - 512, 512, 6)];
 
 /// Then zeros over it -- at, length, unmap -- across blocks and holes, given
-/// back and written; and a discard of whole blocks of every size ext2 has.
+/// back and written; and discards (`image_file`).
 const IMAGE_ZEROES: [(usize, usize, bool); 2] = [(10000, 20000, true), (40000, 1000, false)];
-const IMAGE_DISCARD: (usize, usize) = (32768, 4096);
+
+/// The image's chunk, in blocks: two, so that an image of 96 KiB grows a
+/// chunk at a time and gives chunks back whole, as one of gigabytes does.
+const IMAGE_CHUNK: u64 = 2;
 
 /// A disk's image (`image`): a file with holes held, and read and written
 /// as a guest's disk is -- off the VFS's lock where its filesystem keeps
@@ -441,6 +444,7 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
         report.say(path, "the file could not be held as an image");
         return false;
     };
+    image.set_chunk(IMAGE_CHUNK);
 
     let refused = open(vfs, path, OPEN_WRITE).is_none()
         && open(vfs, path, OPEN_APPEND).is_none()
@@ -473,10 +477,11 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
         return false;
     }
 
-    /* What a guest gives back: a write of zeros, its whole blocks given back
-     * or written; and a discard, whose whole blocks read as zeros after it
-     * where the filesystem gives blocks back, and as they were where it
-     * gives nothing back -- what it covers of a block in part as it was */
+    /* What a guest gives back: a write of zeros, its whole chunks given
+     * back and the rest written; and a discard, whose whole chunks read as
+     * zeros after it where the filesystem gives blocks back -- and as they
+     * were where it gives nothing back -- what it covers of a chunk in part
+     * as it was: a chunk whole, and half of one */
     for (at, len, unmap) in IMAGE_ZEROES {
         expect[at..at + len].fill(0);
         if !image.write_zeroes(at as u64, len as u64, unmap) || !image.read_at(0, &mut got) || got != expect {
@@ -484,13 +489,16 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
             return false;
         }
     }
-    let (at, len) = IMAGE_DISCARD;
-    if image.gives_back() {
-        expect[at..at + len].fill(0);
-    }
-    if !image.discard(at as u64, len as u64) || !image.read_at(0, &mut got) || got != expect {
-        report.say(path, "a discard of the image failed, or reads back wrong");
-        return false;
+    let unit = image.discard_unit() as usize;
+    let discards = if unit == 0 { [(32768, 4096), (49152, 2048)] } else { [(4 * unit, unit), (6 * unit, unit / 2)] };
+    for (k, (at, len)) in discards.into_iter().enumerate() {
+        if unit != 0 && k == 0 {
+            expect[at..at + len].fill(0);
+        }
+        if !image.discard(at as u64, len as u64) || !image.read_at(0, &mut got) || got != expect {
+            report.say(path, "a discard of the image failed, or reads back wrong");
+            return false;
+        }
     }
     if image.discard(IMAGE_SIZE as u64 - 512, 1024) || image.write_zeroes(IMAGE_SIZE as u64, 1, true) {
         report.say(path, "the image took a discard or a write of zeros past its end");
