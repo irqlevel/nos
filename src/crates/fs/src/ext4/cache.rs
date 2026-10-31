@@ -49,6 +49,11 @@ impl Cache {
         self.clean.retain(|(k, _)| *k != b);
     }
 
+    /// Whatever clean copies of blocks `start..end` are held, dropped.
+    pub fn forget_range(&mut self, start: u64, end: u64) {
+        self.clean.retain(|(k, _)| !(start..end).contains(k));
+    }
+
     /// A transaction's copy of `b`, committed: the current one, until a
     /// checkpoint writes it home.
     pub fn pin(&mut self, b: u64, data: Vec<u8>) {
