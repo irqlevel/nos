@@ -119,8 +119,6 @@ pub enum Op {
     /// A write forced to the medium
     WriteFua,
     Flush,
-    /// The device's own write of zeros
-    WriteZeroes,
 }
 
 /// One request, as the device saw it.
@@ -159,10 +157,6 @@ pub struct Disk {
     pub no_writes: Option<String>,
     /// Whether a request is a scheduling point.
     pub latency: bool,
-    /// Whether the device has a write of zeros of its own -- and whether
-    /// that write lies, doing nothing: what its caller must not trust.
-    pub zeroes: bool,
-    pub zeroes_lie: bool,
     /// Whether it says its FUA is its own (`BlockDriver::fua_native`): a
     /// FUA write on the medium as it completes, nothing else of the cache
     /// with it -- as `put` does it either way -- so that a journal may write
@@ -192,8 +186,6 @@ impl Disk {
             crashes: Vec::new(),
             no_writes: None,
             latency: false,
-            zeroes: false,
-            zeroes_lie: false,
             fua_native: false,
             handle: 0,
             chaos: 0x2545_F491_4F6C_DD1D,
@@ -201,11 +193,9 @@ impl Disk {
     }
 
     /// What a power cut keeps of the cache -- and from the same seed whether
-    /// the device writes zeros of its own, and now and then lies about it.
+    /// the device says its FUA is its own.
     pub fn seed_chaos(&mut self, seed: u64) {
         self.chaos = seed | 1;
-        self.zeroes = seed & 2 != 0;
-        self.zeroes_lie = self.zeroes && (seed >> 2) % 8 == 0;
         self.fua_native = (seed >> 8) & 1 != 0;
     }
 
@@ -348,7 +338,7 @@ impl RamDisk {
                            d.sectors);
                 }
             }
-            if matches!(op, Op::Write | Op::WriteFua | Op::WriteZeroes) {
+            if matches!(op, Op::Write | Op::WriteFua) {
                 if let Some(why) = &d.no_writes {
                     panic!("invariant: disk {} written at sector {} while {}", d.name, sector, why);
                 }
@@ -396,19 +386,6 @@ impl block::BlockDriver for RamDisk {
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         let op = if fua { Op::WriteFua } else { Op::Write };
         self.request(op, sector, data.len(), |d, at| d.put(at, data, fua))
-    }
-
-    fn write_zeroes(&'static self, sector: u64, count: u64) -> Option<bool> {
-        let (has, lie, ss) = with(self.index, |d| (d.zeroes, d.zeroes_lie, d.sector_size));
-        if !has {
-            return None;
-        }
-        let len = usize::try_from(count.checked_mul(ss)?).ok()?;
-        Some(self.request(Op::WriteZeroes, sector, len, |d, at| {
-            if !lie {
-                d.put(at, &vec![0u8; len], false);
-            }
-        }))
     }
 
     fn flush(&'static self) -> bool {
