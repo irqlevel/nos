@@ -779,16 +779,17 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
      * the look at what is waiting before the next entry. */
     let exits = total.exits.max(1);
     let _ = writeln!(out, "  loop       {} ns an exit handled and {} ns to the next entry, on average; {} ns a write of an MSR's \
-                           handling",
-        total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / total.msr_write.max(1));
+                           handling; {} entries made without the loop's round",
+        total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / total.msr_write.max(1), total.fast);
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
     if total.apic != 0 || counts.len() > 1 {
         let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers -- late past their edges \
-                               by {} us on average, {} us at most; {} IPIs sent, {} taken; {} MSIs",
+                               by {} us on average, {} us at most, {} come on the way in and taken a round later, {} \
+                               slept to short of them and spun; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.timer_late_ns / total.timer.max(1) / NS_PER_US, total.timer_late_max / NS_PER_US,
-            total.ipi_sent, total.ipi_taken, total.msi);
+            total.timer_raced, total.advanced, total.ipi_sent, total.ipi_taken, total.msi);
     }
     let (posted, notified) = guest.posted_stats();
     if posted != 0 {

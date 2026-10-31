@@ -24,24 +24,37 @@ use kcore::time::{self, Duration};
 /// What wakes one vCPU: its task's event, for when it has nothing to run
 /// and waits, and its kick, for when it is in its guest -- and a word that
 /// says it was rung, for a halted one that spins a while before it waits
-/// (`poll`).
+/// (`poll`), and one that says it is spinning so, which a ring then needs
+/// not wake: the word is all a spinner looks at.
 pub struct Doorbell {
     event: Event,
     kick: Kick,
     rung: AtomicBool,
+    polling: AtomicBool,
 }
 
 impl Doorbell {
     pub fn new() -> Option<Doorbell> {
-        Some(Doorbell { event: Event::new()?, kick: Kick::new(), rung: AtomicBool::new(false) })
+        Some(Doorbell { event: Event::new()?, kick: Kick::new(), rung: AtomicBool::new(false),
+                        polling: AtomicBool::new(false) })
     }
 
     /// Something waits for the vCPU, put where it looks before this: its
     /// task woken if it waits, and it leaves its guest if it is in there.
     /// From any context, interrupts off included.
+    ///
+    /// A vCPU spinning in `poll` sees the word, and its event is not
+    /// signalled -- a schedule's worth of work for a task that is not asleep
+    /// -- as KVM wakes no vCPU that polls. The word is stored, and only then
+    /// the spinner looked for; `poll` stops looking, and only then looks at
+    /// the word once more: of the two, one sees the other, so a ring that
+    /// finds the spinner gone has the event signalled for the wait it goes
+    /// to, and one that finds it spinning is seen by it.
     pub fn ring(&self) {
-        self.rung.store(true, Ordering::Release);
-        self.event.signal();
+        self.rung.store(true, Ordering::SeqCst);
+        if !self.polling.load(Ordering::SeqCst) {
+            self.event.signal();
+        }
         self.kick.kick();
     }
 
@@ -52,6 +65,14 @@ impl Doorbell {
         self.event.signal();
     }
 
+    /// The vCPU's, after `Kick::prepare` and before its look at what waits
+    /// for it: whether it was rung since the last look, the word cleared --
+    /// what rang before is found by the look, and what rings after rings it
+    /// again, and turns its entry back.
+    pub fn take_rung(&self) -> bool {
+        self.rung.swap(false, Ordering::SeqCst)
+    }
+
     /// The vCPU's task, halted: spin for up to `ns` until rung -- on a CPU
     /// that is its guest's own, which nothing else waits for -- rather than
     /// sleep for a wake that comes that soon, and pay a wakeup and a
@@ -60,16 +81,22 @@ impl Doorbell {
     /// loop, which finds nothing. What was rung for is found by the loop's
     /// own look after either, as after `wait`: the word only stops the spin.
     pub fn poll(&self, ns: u64) -> bool {
+        self.polling.store(true, Ordering::SeqCst);
         let end = time::boot_time_ns().saturating_add(ns);
-        loop {
+        let rung = loop {
             if self.rung.swap(false, Ordering::Acquire) {
-                return true;
+                break true;
             }
             if time::boot_time_ns() >= end {
-                return false;
+                break false;
             }
             core::hint::spin_loop();
-        }
+        };
+        self.polling.store(false, Ordering::SeqCst);
+        /* A ring between the last look and the store above found it spinning
+         * and signalled nothing: looked for once more, now that a ring
+         * signals the event again. */
+        rung || self.rung.swap(false, Ordering::SeqCst)
     }
 
     /// The vCPU's task, with nothing to run: wait until rung, or until `ns`
