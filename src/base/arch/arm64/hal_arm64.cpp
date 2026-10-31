@@ -62,8 +62,15 @@ bool setup_idle(u32* hint)
     return false;
 }
 
-void cpu_idle(bool deep)
+bool idle_masked()
 {
+    return false;
+}
+
+void cpu_idle_masked(bool deep)
+{
+    /* Not called: idle_masked() is false. WFI ends on a pending interrupt
+       with interrupts masked too, so it would be right if it were. */
     (void)deep;
     cpu_halt();
 }
