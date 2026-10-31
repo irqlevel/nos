@@ -2453,10 +2453,31 @@ goes round again where an edge has come. That was not all of it: the EX44's
 guests still saw an edge 10009 us late at most after it (64d61a78), so the
 report says where such edges were waited for -- `late`: the timer interrupts
 more than 1 ms past their edges (`LATE_NS`), by what the vCPU's task did
-before the round that found them (slept; came round more than 1 ms after an
-exit, off its CPU or busy; ran its guest until an interrupt of the host's
-took it out, or an exit of its own), and the sleeps that ended more than 1
-ms past their time.
+before the round that found them (slept to a time with that edge in it and
+woke more than 1 ms past it, rung or not; woke on time; slept without that
+edge; spun, or slept for good; came round more than 1 ms after an exit, off
+its CPU or busy; ran its guest until an interrupt of the host's took it out,
+or an exit of its own), the sleeps that ended more than 1 ms past their
+time, and each CPU its own. It said (a68aeb3a): of 12388 such interrupts in
+a run, 241 after a host's interrupt took a guest out that had computed past
+its edge -- the 10 ms, a host tick -- and 12078 after sleeps that had the
+edge and ended 1-3 ms past their time, 0.12% of the sleeps, nearly all by a
+ring. Those are the machine's own: its cyclictest's most is 3.1 ms under
+KVM as under nos, and the scheduler's wake-ups on every CPU come at most
+3-4.6 ms late since boot.
+
+**The host's timer is armed for the edge as the entry is made**
+(`Kick::arm_at`, `Kick::entering`), with interrupts off on the CPU from there
+until the guest runs. Armed in the loop's round, a few hundred nanoseconds
+before, it was lost to any interrupt of the host's timer that came between
+-- a sleeper's deadline, the slice's end -- whose handler re-arms the timer
+for the host's next tick (`Cpu::local_timer_fired`): the guest then computed
+past its edge until that tick. An edge that has come by the entry turns it
+back, for the round to take it. The report counts those among the entries
+turned back (`kicked`). hv-fuzz's platform target has the host's tick land
+on the way in, re-arming its timer so, and holds every entry to a timer armed
+no later than the edge its loop asked for: the old arming, in the round, is
+found at its 167th input.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not

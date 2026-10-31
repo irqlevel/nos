@@ -198,6 +198,14 @@ const TIMER_ADVANCE_NS: u64 = 10 * kcore::consts::NS_PER_US;
 /// at most past their edges were spent.
 const LATE_NS: u64 = kcore::consts::NS_PER_MS;
 
+/// The sooner of two times, either of which may be none.
+fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What a CPU's task did last, before the round that looks at its timers:
 /// where an edge found late was waited for (`LATE_NS`).
 #[derive(Clone, Copy)]
@@ -309,8 +317,11 @@ pub struct Counts {
     pub mmio: u64,
     pub host: u64,
     /// Entries refused because a frame, a disk's answer or an IPI came for
-    /// the guest on its way in (`Kick`): handed over first.
+    /// the guest on its way in (`Kick`): handed over first -- and those of
+    /// them turned back for an edge of its timers come by the entry
+    /// (`Kick::arm_at`), taken a round later.
     pub kicked: u64,
+    pub edges_passed: u64,
     /// Interrupts injected from the 8259.
     pub irq: u64,
     pub irq0: u64,
@@ -451,6 +462,7 @@ impl Counts {
         self.mmio += o.mmio;
         self.host += o.host;
         self.kicked += o.kicked;
+        self.edges_passed += o.edges_passed;
         self.irq += o.irq;
         self.irq0 += o.irq0;
         self.irq4 += o.irq4;
@@ -635,6 +647,11 @@ pub struct GuestCpu {
     fast: bool,
     /// What its task did last (`LATE_NS`).
     step: Step,
+    /// The first CPU's other timers' next edge, as its last round armed it
+    /// besides its APIC's -- the PIT's, the devices' (`devices_due`) -- kept
+    /// for an entry made without the round, which arms the host's timer for
+    /// it too.
+    other_due: Option<u64>,
     counts: Counts,
 }
 
@@ -888,6 +905,7 @@ impl LinuxGuest {
                 poll_ns: 0,
                 fast: false,
                 step: Step::Other,
+                other_due: None,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1416,10 +1434,9 @@ impl LinuxGuest {
                 && gc.exception.is_none() && !gc.nmi_pending
                 && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now);
             if fast {
-                if let Some(edge) = gc.lapic.next_timer_ns() {
-                    kcore::cpu::timer_at(edge);
-                    fast = edge > time::boot_time_ns();
-                }
+                let edge = gc.lapic.next_timer_ns();
+                kick.arm_at(sooner(edge, gc.other_due.filter(|&due| due > now)));
+                fast = edge.is_none_or(|edge| edge > time::boot_time_ns());
             }
             let apicv = if fast {
                 gc.counts.fast += 1;
@@ -1621,19 +1638,19 @@ impl LinuxGuest {
                 Activity::Running => {}
             }
             /* Its timers' next edge, if one is coming: the host CPU's own
-             * timer armed for it, so that a guest computing with no exit is
-             * taken out of it then, as a halted one is woken then -- not at
-             * the host's next tick, ten edges of a 1000 Hz guest late. An
-             * edge of its own timers' that came since they were looked at
-             * above is one the host's timer is not armed for -- it arms none
-             * gone by -- and the guest would run on to its next exit with it
-             * owed, the host's tick for one that computes: round again to
-             * take it, before anything is handed in for this entry. */
+             * timer armed for it as the entry is made (`Kick::arm_at`), so
+             * that a guest computing with no exit is taken out of it then, as
+             * a halted one is woken then -- not at the host's next tick, ten
+             * edges of a 1000 Hz guest late. An edge of its own timers' that
+             * came since they were looked at above is one the host's timer is
+             * not armed for -- it arms none gone by -- and the guest would run
+             * on to its next exit with it owed: round again to take it, before
+             * anything is handed in for this entry; the entry itself turns
+             * back for one that comes after this. */
             let timers = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
             let edge = timers.min(devices_due.unwrap_or(u64::MAX));
-            if edge != u64::MAX {
-                kcore::cpu::timer_at(edge);
-            }
+            kick.arm_at((edge != u64::MAX).then_some(edge));
+            gc.other_due = sooner(pit_edge, devices_due);
             if timers <= time::boot_time_ns() {
                 kick.cancel();
                 gc.counts.timer_raced += 1;
@@ -1660,6 +1677,10 @@ impl LinuxGuest {
 
             gc.counts.to_entry_ns += time::boot_time_ns().saturating_sub(now);
             entered_apicv = apicv;
+            /* The kick's count of entries turned back for an edge is the
+             * VM's, across its boots; this run's are told from it entry by
+             * entry. */
+            let edges_passed = kick.edges_passed();
             let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
             let exit_at = time::boot_time_ns();
             if apicv {
@@ -1694,6 +1715,7 @@ impl LinuxGuest {
                 /* Not entered: round again, and what came goes in. */
                 Exit::Kicked => {
                     gc.counts.kicked += 1;
+                    gc.counts.edges_passed += u64::from(kick.edges_passed() != edges_passed);
                     None
                 }
                 Exit::Io(io) => self.io(gc, &io, host),
