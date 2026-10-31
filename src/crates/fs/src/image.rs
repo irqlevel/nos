@@ -56,6 +56,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
+use kcore::time::boot_time_ns;
 use kcore::trace;
 
 use crate::vfs::{Handle, MapRun, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
@@ -413,6 +414,38 @@ struct Direct {
     /// -- each such write going through the VFS, as every one into a hole did
     /// before chunks: said at the first, and counted.
     refused: u64,
+    /// Its growths and its conversions of what it wrote over unwritten
+    /// extents (`make_written`) -- each a commit of the filesystem's, which a
+    /// guest's write or flush waits for -- and how long they took, in all
+    /// and at most: what a guest's I/O that met one waited.
+    grows_timed: Timed,
+    conversions: Timed,
+}
+
+/// How many of something there were and how long they took, in all and at
+/// most, in nanoseconds.
+#[derive(Default, Clone, Copy)]
+struct Timed {
+    count: u64,
+    ns: u64,
+    max_ns: u64,
+}
+
+impl Timed {
+    fn add(&mut self, from: u64) {
+        let ns = boot_time_ns().saturating_sub(from);
+        self.count += 1;
+        self.ns += ns;
+        self.max_ns = self.max_ns.max(ns);
+    }
+
+    fn average_us(&self) -> u64 {
+        self.ns / self.count.max(1) / 1000
+    }
+
+    fn max_us(&self) -> u64 {
+        self.max_ns / 1000
+    }
 }
 
 pub struct Image {
@@ -985,6 +1018,10 @@ impl Drop for Image {
                            through it; {}", path, d.read_off, d.written_off, d.written_through, MapSays(d.map.as_ref()));
                 trace!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back, {} \
                            made written", path, d.allocated, d.refused, d.punched, d.made_written);
+                trace!(0, "image: {}: {} growths, {} us on average and {} us at most; {} conversions, {} us on \
+                           average and {} us at most", path, d.grows_timed.count, d.grows_timed.average_us(),
+                       d.grows_timed.max_us(), d.conversions.count, d.conversions.average_us(),
+                       d.conversions.max_us());
             }
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
@@ -1040,7 +1077,8 @@ impl Direct {
         Some(Direct { disk, block, batch, sectors, unwritten, fresh, pieces, stretches, map: None, chunk,
                       grown_to: u64::MAX, span: 0, through_vfs: false, read_off: 0, written_off: 0,
                       written_through: 0, punched: 0, allocated: 0, grows: false, refused: 0,
-                      pending: Pending::default(), made_written: 0 })
+                      pending: Pending::default(), made_written: 0, grows_timed: Timed::default(),
+                      conversions: Timed::default() })
     }
 
     /// Where each of `n` blocks from `first` is on the device, into
@@ -1092,8 +1130,10 @@ impl Direct {
         }
         let mut runs = Vec::new();
         let kept = self.pending.as_counts(&mut runs);
+        let from = boot_time_ns();
         let done = kept && vfs.mark_written(handle, &runs)
             && also.is_none_or(|run| vfs.mark_written(handle, &[run]));
+        self.conversions.add(from);
         /* Taken again whatever came of it: what the filesystem did make
          * written is so in the map from now. */
         for &(first, count) in runs.iter().chain(also.iter()) {
@@ -1134,6 +1174,7 @@ impl Direct {
             return false;
         }
         let span = if from == self.grown_to { self.span.saturating_mul(2).clamp(1, GROW_MAX_CHUNKS) } else { 1 };
+        let started = boot_time_ns();
         let room = vfs.space_of_file(handle).map_or(0, |s| s.free_bytes / self.block as u64 / GROW_SHARE);
         let ahead = from.saturating_add(span.saturating_mul(chunk)).min(blocks).saturating_sub(need).min(room);
         let ahead = ahead / chunk * chunk;
@@ -1146,6 +1187,7 @@ impl Direct {
         } else {
             0
         };
+        self.grows_timed.add(started);
         if to > 0 {
             (self.grown_to, self.span) = (to, (to - from).div_ceil(chunk));
             return true;

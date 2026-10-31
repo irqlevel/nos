@@ -149,24 +149,33 @@ machine has (`hugepages=32G`, HLT idle), once with `idle=mwait`. nos's
 results as a share of KVM's, as above; `out/ex44-bench/run2` has the kit's
 second half and every log.
 
-| | KVM | bced1539 | vm-perf | + idle=mwait |
-|---|---:|---:|---:|---:|
-| sysbench cpu, 1 / 4 threads | 1589 / 3259 | 94% / 95% | 94% / 95% | 96% / 98% |
-| 7-Zip, 4 threads; its clock | 21 530; 4768 MHz | 95% | 95%; 4460 | 95%; 4460-4715 |
-| openssl, aes-256-gcm / chacha20 / sha256 | | 94% | 94% | 96-97% |
-| random reads of memory, 1 thread | 949 MiB/s | 84% | 84% | 85% |
-| perf sched pipe, us an op | 6.0 | 14.3 (42%) | 9.3 (65%) | 8.5 (71%) |
-| cyclictest, average us | 31 | 76 (41%) | 73 (42%) | 75.5 (41%) |
-| fio: a new file's first write, 1M QD8 | 4643 MiB/s | 1% | 885 (19%) | 883 (19%) |
-| fio: 4k random reads QD1 / QD32 | 20.1k / 195k | 59% / 8% | 89% / 41% | 92% / 41% |
-| fio: 4k random writes QD1 / QD32 | 39.9k / 178k | 42% / 15% | 84% / 72% | 86% / 74% |
-| fio: 1M reads / writes QD8 | 1456 / 3694 MiB/s | 12% / 5% | 93% / 63% | 92% / 63% |
-| fio: 4k writes with fdatasync | 620 | 115% | 116% | 116% |
-| kernel build (`make -j4` defconfig) | 318 s | -- | 333 s (95%) | 333 s (96%) |
-| pgbench init | 6.5 s | -- | 10.9 s (60%) | 10.7 s (61%) |
-| pgbench -S, 1 / 4 / 16 clients | 61.6k / 272k / 238k | -- | 79% / 100% / 99% | 82% / 100% / 99% |
-| pgbench (TPC-B), 1 / 4 / 16 clients | 411 / 1211 / 4655 | -- | 156% / 112% / 105% | 156% / 113% / 105% |
-| the guest's boot (kernel + userspace) | 5.24 s | 7.2 s | -- | 4.56 s |
+| | KVM | bced1539 | vm-perf | + idle=mwait | 64d61a78 | 311baf25 |
+|---|---:|---:|---:|---:|---:|---:|
+| sysbench cpu, 1 / 4 threads | 1589 / 3259 | 94% / 95% | 94% / 95% | 96% / 98% | 96% / 98% | 97% / 98% |
+| 7-Zip, 4 threads; its clock | 21 530; 4768 MHz | 95% | 95%; 4460 | 95%; 4460-4715 | 96% | 96% |
+| openssl, aes-256-gcm / chacha20 / sha256 | | 94% | 94% | 96-97% | 96-97% | 96-97% |
+| random reads of memory, 1 thread | 949 MiB/s | 84% | 84% | 85% | 85% | 84% |
+| perf sched pipe, us an op | 6.0 | 14.3 (42%) | 9.3 (65%) | 8.5 (71%) | 9.1 (66%) | 8.95 (67%) |
+| cyclictest, average us | 31 | 76 (41%) | 73 (42%) | 75.5 (41%) | 66.2 (47%) | 67.0 (46%) |
+| fio: a new file's first write, 1M QD8 | 4643 MiB/s | 1% | 885 (19%) | 883 (19%) | 422 (9%) | 1954 (42%) |
+| fio: 4k random reads QD1 / QD32 | 20.1k / 195k | 59% / 8% | 89% / 41% | 92% / 41% | 92% / 84% | 90% / 84% |
+| fio: 4k random writes QD1 / QD32 | 39.9k / 178k | 42% / 15% | 84% / 72% | 86% / 74% | 81% / 75% | 80% / 78% |
+| fio: 1M reads / writes QD8 | 1456 / 3694 MiB/s | 12% / 5% | 93% / 63% | 92% / 63% | 93% / 62% | 93% / 62% |
+| fio: 4k writes with fdatasync; a write's p99 | 620; 166 us | 115% | 116%; 61 us | 116%; 54 us | 115%; 56 us | 114%; 716 us |
+| kernel untar | 6.14 s | -- | 7.07 s (87%) | 7.09 s (87%) | 8.22 s (75%) | 6.96 s (88%) |
+| kernel build (`make -j4` defconfig) | 318 s | -- | 333 s (95%) | 333 s (96%) | 332 s (96%) | 332 s (96%) |
+| pgbench init | 6.5 s | -- | 10.9 s (60%) | 10.7 s (61%) | 15.7 s (42%) | 10.2 s (64%) |
+| pgbench -S, 1 / 4 / 16 clients | 61.6k / 272k / 238k | -- | 79% / 100% / 99% | 82% / 100% / 99% | 80% / 101% / 100% | 83% / 101% / 100% |
+| pgbench (TPC-B), 1 / 4 / 16 clients | 411 / 1211 / 4655 | -- | 156% / 112% / 105% | 156% / 113% / 105% | 156% / 111% / 103% | 156% / 111% / 104% |
+| the guest's boot (kernel + userspace) | 5.24 s | 7.2 s | -- | 4.56 s | 4.86 s | 4.62 s |
+
+64d61a78 is items 1-4 of the status below with MWAIT idle the default
+(32 requests in flight, chunks as unwritten extents committed with their
+logs written with FUA, the exit fast path, the timer's edge taken a round
+later); 311baf25 is 64d61a78 with the second of them revised: a commit is
+its log, a flush and its commit block whatever it orders, the image no
+longer flushes before a conversion, and a growth that follows the last
+doubles, to 256 MiB.
 
 What the numbers say, item by item, is in the status below. In short: the
 disk is near KVM wherever one request is in flight at a time, and ahead of
@@ -181,12 +190,12 @@ clock a busy core runs at.
 
 | item | state |
 |---|---|
-| D1-D5 | measured on the EX44: reads and writes of 1M 93% and 63% of KVM (12% and 5% before), 4k at QD1 84-92% (latency 48-50 us, KVM's 47), fdatasync 116%, pgbench's TPC-B 105-156%; at QD32 41% -- the device has 8 requests out per disk (`blk::IN_FLIGHT`), and 8 at ~100 us is the 80k IOPS measured: next, 32; a new file's first write 19% (1% before) -- this NVMe (Samsung MZVL2512HCJQ, `oncs=0x57`) has no Write Zeroes, so each chunk's zeros are written before the guest's data goes over them, and a commit a chunk: next, zeros from one page in commands of MDTS with many out, or unwritten extents converted at the guest's flush. Found by `hv-linux-test.py --disk` first: ext4 had refused every chunk past its first hole (f4a1a68f) |
+| D1-D5 | measured on the EX44: reads and writes of 1M 93% and 63% of KVM (12% and 5% before), 4k at QD1 84-92% (latency 48-50 us, KVM's 47), fdatasync 116%, pgbench's TPC-B 105-156%; at QD32 41% -- the device has 8 requests out per disk (`blk::IN_FLIGHT`), and 8 at ~100 us is the 80k IOPS measured: next, 32; a new file's first write 19% (1% before) -- this NVMe (Samsung MZVL2512HCJQ, `oncs=0x57`) has no Write Zeroes, so each chunk's zeros are written before the guest's data goes over them, and a commit a chunk: next, zeros from one page in commands of MDTS with many out, or unwritten extents converted at the guest's flush. Found by `hv-linux-test.py --disk` first: ext4 had refused every chunk past its first hole (f4a1a68f); then items 1 and 2 (64d61a78, 311baf25): 32 requests out per disk -- QD32 84% (164k IOPS), 4x16 78% -- and a chunk given as unwritten extents, made written at the guest's flush, nothing written to it, its growth doubling to 256 MiB where a guest writes from one end: a new file's first write 1954 MiB/s, 42% (9% while the commits' logs were written with FUA -- on this Samsung a FUA write costs what a flush does), untar 88%, pgbench init 64%. Left: in the fdatasync job a write's p99 716 us where it was 56 (KVM's 166) -- the image's growths and conversions timed in its report (`Timed`), to find; 1M writes 62% |
 | G1 | done and measured: the guest keeps PCID and INVPCID (`hvarch::x86::cpu::microcode_revision`, as KVM tells it) |
 | W1 | measured: 89% of halts caught in the spin (KVM's 90%), pipe 14.3 us -> 9.3 (KVM 6.0), and the guest's boot lost its 1.75 s (E2) |
-| C1 | measured: a busy core's clock 4460-4715 MHz with `idle=mwait`, 4460 without, KVM's 4768 -- CPU-bound work 96-98% of KVM's against 94-95%, and nothing slower for it: 4k QD1 48 us against 50, pipe 8.5 us against 9.3, cyclictest within its noise. Off by default still; the default when that is decided. What is left of the clock is cores woken too often to sleep deep: every idle CPU's 100 Hz tick among them, which Linux stops |
-| T1 | measured: the guests' timer interrupts requested 9-10 us past their edges on average -- and 10 ms at most, an edge left for the host's next tick: a wakeup lost somewhere, to find. cyclictest 73-76 us against KVM's 31, unchanged by W1 and C1 |
-| W2 | measured: past the world switch an exit costs 545-559 ns handled and 479-496 ns to the next entry -- about a microsecond of the host's a guest exit, of 122 million in 43 minutes, 54 million of them writes of an MSR (an IPI, a TSC deadline: 466-479 ns handled), 48 million halts; `hv bench profile` 1092-1127 ns an exit on a P-core, 1692 on an E-core. The fast path's target is the microsecond: what pipe (65-71%) and pgbench -S with one client (79-82%) wait on |
+| C1 | measured: a busy core's clock 4460-4715 MHz with `idle=mwait`, 4460 without, KVM's 4768 -- CPU-bound work 96-98% of KVM's against 94-95%, and nothing slower for it: 4k QD1 48 us against 50, pipe 8.5 us against 9.3, cyclictest within its noise. The default since 64d61a78 (`idle=halt` for HLT alone): 96-98% in both runs since. What is left of the clock is cores woken too often to sleep deep: every idle CPU's 100 Hz tick among them, which Linux stops |
+| T1 | measured: the guests' timer interrupts requested 9-10 us past their edges on average -- and 10 ms at most, an edge left for the host's next tick: a wakeup lost somewhere, to find. cyclictest 73-76 us against KVM's 31, unchanged by W1 and C1. With the edge between the loop's look and the host timer's arming taken a round later (64d61a78: 48926-51809 such a run) the average is 7 us and cyclictest 66-67 us -- and the most still 10009-10010 us, in both runs: another path, 10 ms and a wake's cost, as long as `MAX_HALT_WAIT_NS` and the host's tick. The report's `late` line (28af927d) says where edges more than 1 ms late were waited for |
+| W2 | measured: past the world switch an exit costs 545-559 ns handled and 479-496 ns to the next entry -- about a microsecond of the host's a guest exit, of 122 million in 43 minutes, 54 million of them writes of an MSR (an IPI, a TSC deadline: 466-479 ns handled), 48 million halts; `hv bench profile` 1092-1127 ns an exit on a P-core, 1692 on an E-core. The fast path's target is the microsecond: what pipe (65-71%) and pgbench -S with one client (79-82%) wait on. The fast path for the two writes (64d61a78): 52.8-54.2 million of 125 million exits re-entered without the loop's round, the loop 601-609 ns handled and 406-417 ns to the next entry; pipe 8.95-9.1 us (66-67%) and pgbench -S with one client 80-83% as before -- not what they wait on |
 | G2 | left: XSAVES, WAITPKG, MOVDIRI/MOVDIR64B and the TSC's frequency in KVM's leaf move nothing the suite measures -- the guest's XSAVEC and XSAVEOPT do what XSAVES would for it, and the rest is a delay loop's TPAUSE, an accelerator's stores and a calibration at boot |
 | E1 | measured: random reads 84-85% with the clock 4% higher under `idle=mwait` as without -- not the clock: the nested walk, the TLB, to look at |
 | E2 | solved: the guest's kernel up in 1.64 s (KVM 2.35 s), its boot 4.56 s against 5.24 -- the 1.75 s of IPIs waited on after `async_tx` gone with W1 |
