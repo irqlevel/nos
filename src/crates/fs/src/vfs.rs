@@ -153,6 +153,21 @@ pub trait FileSystem: Send {
         false
     }
 
+    /// Where `count` blocks of `file` from block `first` are on the device,
+    /// as runs in their order, appended to `out`: `(sector, blocks)` each,
+    /// the first sector of blocks that follow one another on the device --
+    /// or 0 for a hole -- the runs' blocks `count` in all, every one inside
+    /// the file. What a disk's image takes its map from, once (`image`),
+    /// rather than ask `map_blocks` for every batch: so a hole is to be one
+    /// run however long, and an answer as long as what the file has, not
+    /// as what it covers. Nothing is allocated or changed on the device.
+    /// false as `map_blocks` is, when `out` cannot grow -- and from a
+    /// filesystem that cannot answer so, the default, whose images ask for
+    /// every batch.
+    fn map_runs(&mut self, _file: NodeId, _first: u64, _count: u64, _out: &mut Vec<(u64, u64)>) -> bool {
+        false
+    }
+
     /// Give back the blocks of `count` blocks of `file` from block `first`,
     /// of those inside it -- holes from here on, reading as zeros, the
     /// file's size as it was -- in the filesystem's own order, so that no
@@ -160,6 +175,19 @@ pub trait FileSystem: Send {
     /// or None: an I/O error, or a filesystem with no blocks of its own
     /// (`data_block_size` 0), the default.
     fn punch(&mut self, _file: NodeId, _first: u64, _count: u64) -> Option<u64> {
+        None
+    }
+
+    /// Blocks for every hole among `count` blocks of `file` from block
+    /// `first`, of those inside it: made zeros on the device and only then
+    /// the file's, in the filesystem's own order, so that no crash leaves
+    /// the file mapping what a block held before it was the file's -- what
+    /// reads as zeros reads as zeros still, and the size is as it was. What
+    /// a disk's image grows by, a chunk at a time, ahead of its guest's
+    /// writes. How many blocks were given, or None: an I/O error, no room,
+    /// or a filesystem that gives none so, the default -- whose images write
+    /// into their holes through it.
+    fn allocate(&mut self, _file: NodeId, _first: u64, _count: u64) -> Option<u64> {
         None
     }
 
@@ -1345,6 +1373,37 @@ impl Vfs {
         }
     }
 
+    /// `map`, as runs (`FileSystem::map_runs`): where `count` blocks of the
+    /// file `handle` holds, from block `first`, are on its device, appended
+    /// to `out` as `(sector, blocks)` -- 0 for a hole. Held files only, and
+    /// only blocks inside them, as `map`.
+    pub fn map_runs(&self, handle: Handle, first: u64, count: u64, out: &mut Vec<(u64, u64)>) -> bool {
+        let Some(mut guard) = self.lock_handle(handle) else { return false };
+        let slot = &mut *guard;
+
+        let (node, flags) = match slot.files.get(handle) {
+            Some(file) => (file.node, file.flags),
+            None => return false,
+        };
+        if flags & OPEN_HOLD == 0 {
+            trace!(0, "vfs: only a file held as a disk's image is mapped");
+            return false;
+        }
+        let Some(mount) = slot.mount.as_mut() else { return false };
+        let size = match mount.fs.tree().get(node) {
+            Some(found) => found.size as u64,
+            None => return false,
+        };
+        let block = mount.fs.data_block_size() as u64;
+        if block == 0 {
+            return false;
+        }
+        match first.checked_add(count) {
+            Some(end) if end <= size.div_ceil(block) => mount.fs.map_runs(node, first, count, out),
+            _ => false,
+        }
+    }
+
     /// The whole blocks inside `len` bytes from `offset` of the file `handle`
     /// holds for writing given back to its filesystem (`FileSystem::punch`):
     /// holes, reading as zeros, the file's size as it was -- a guest's
@@ -1379,6 +1438,33 @@ impl Vfs {
             return Some(0);
         }
         mount.fs.punch(node, first, end - first)
+    }
+
+    /// Blocks for the holes among `count` blocks of the file `handle` holds
+    /// for writing, from block `first` (`FileSystem::allocate`): zeros, the
+    /// file's from now on, its size as it was -- a disk's image growing a
+    /// chunk at a time. How many blocks were given, or None.
+    pub fn allocate(&self, handle: Handle, first: u64, count: u64) -> Option<u64> {
+        let mut guard = self.lock_handle(handle)?;
+        let slot = &mut *guard;
+
+        let (node, flags) = {
+            let file = slot.files.get(handle)?;
+            (file.node, file.flags)
+        };
+        if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
+            trace!(0, "vfs: only a file held for writing as a disk's image is allocated in");
+            return None;
+        }
+        let mount = slot.mount.as_mut()?;
+        if mount.read_only {
+            trace!(0, "vfs: that mount is read-only");
+            return None;
+        }
+        if mount.fs.data_block_size() == 0 {
+            return None;
+        }
+        mount.fs.allocate(node, first, count)
     }
 
     /// The filesystem the file is on, synced: everything written to it on

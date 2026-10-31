@@ -43,6 +43,10 @@ a prerequisite for the next):
 | 4 | [04-control-plane.md](04-control-plane.md) | HTTP API creates/destroys/consoles VMs; host-side virtio; guest networking |
 | 5 | [05-live-update.md](05-live-update.md) | kexec-style live update of the host kernel under running guests, <100 ms downtime |
 
+Alongside the stages, [vm-performance.md](vm-performance.md) is the plan for
+making a guest as fast under nos as under KVM, from a comparison of the two on
+the same machine.
+
 ### Reordering history
 
 The stages were renumbered from an earlier draft. Originally the hypervisor was

@@ -75,6 +75,20 @@ unsafe extern "C" {
    or move it while the image is held -- and read and written off the VFS's
    lock. An image is a word looked up on every call, as a file held open
    is; one that is no image's reads as none. All of them sleep. */
+/// A part of a vectored read or write of a disk's image: where in the image,
+/// and its bytes -- written into for a read, read from for a write.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ImageIo {
+    pub offset: u64,
+    pub buf: *mut u8,
+    pub len: usize,
+}
+
+/// The most parts one vectored call of an image takes: every request a
+/// guest's disk may have out, and as many again.
+pub const IMAGE_VEC_MAX: usize = 16;
+
 unsafe extern "C" {
     /// Holds a regular file as an image, for reading, and with `write` not
     /// 0 for writing too: the image, or 0.
@@ -93,6 +107,13 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, all of them inside the image, which
     /// never grows: 0, or -1. Not synced.
     pub fn kernel_image_write(image: usize, offset: u64, data: *const u8, len: usize) -> i32;
+    /// Fills each of `n` parts' buffers -- `ios`, at most `IMAGE_VEC_MAX` --
+    /// from its offset, all of them inside the image, as many in one batch
+    /// to the device as it holds: 0, or -1. No two buffers overlap.
+    pub fn kernel_image_read_vec(image: usize, ios: *const ImageIo, n: usize) -> i32;
+    /// Writes each of `n` parts at its offset, as `kernel_image_read_vec`
+    /// reads them: 0, or -1. Not synced.
+    pub fn kernel_image_write_vec(image: usize, ios: *const ImageIo, n: usize) -> i32;
     /// Where the image has data from `offset` on: its first byte into
     /// out[0], holes before it, and the end of its run into out[1] -- the
     /// two the same where the blocks looked at, a few thousand at most, are

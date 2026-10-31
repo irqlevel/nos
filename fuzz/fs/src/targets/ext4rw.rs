@@ -552,7 +552,8 @@ fn image(run: &mut Run, r: &mut Input) -> Leave {
         if held < 4 {
             let p = fsops::path(r, &run.f.model);
             let write = !r.chance(4);
-            run.f.image_open(&p, write);
+            let chunk = fsops::chunk(r);
+            run.f.image_open(&p, write, chunk);
             /* Another name of what is held, opened for writing: the hold is
              * the file's, by whatever name. */
             if let (Res::Node(n), true) = (run.f.model.resolve(&p), r.bool()) {
@@ -749,8 +750,9 @@ pub fn ext4rw(r: &mut Input) {
         /* The preallocated file held as a disk's image: written into and
          * discarded from, its unwritten extents split on a full disk. */
         let filler = vec![img::FILLER.to_vec()];
-        run.call(r, |run, _| {
-            run.f.image_open(&join(&filler), true);
+        run.call(r, |run, r| {
+            let chunk = fsops::chunk(r);
+            run.f.image_open(&join(&filler), true, chunk);
             Leave::Either
         });
         let size = made.filled.unwrap_or(0);

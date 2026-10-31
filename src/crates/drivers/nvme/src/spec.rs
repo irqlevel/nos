@@ -59,6 +59,16 @@ pub const OPC_IDENTIFY:     u8 = 0x06;
 pub const OPC_FLUSH: u8 = 0x00;
 pub const OPC_WRITE: u8 = 0x01;
 pub const OPC_READ:  u8 = 0x02;
+pub const OPC_WRITE_ZEROES: u8 = 0x08;
+
+/* A PRP list: a page of 8-byte entries, each a page's address */
+pub const PRP_ENTRY_SIZE: usize = 8;
+pub const PRP_LIST_ENTRIES: usize = kcore::consts::PAGE_SIZE / PRP_ENTRY_SIZE;
+
+/* Write Zeroes, CDW12: the blocks less one in bits 15:0, and Deallocate --
+ * the controller may unmap them, which still reads back as zeros. */
+pub const WZ_NLB_MAX: u64 = 1 << 16;
+pub const WZ_DEAC: u32 = 1 << 25;
 
 /* Identify CNS values */
 pub const CNS_CONTROLLER: u32 = 0x01;
@@ -72,6 +82,9 @@ pub const SQ_PC:         u16 = 1 << 0;  /* Physically Contiguous */
 /* Completion status: Status Code Type */
 pub const SCT_GENERIC: u8 = 0x0;
 pub const SC_SUCCESS:  u8 = 0x0;
+/* ... and two of its codes, as the status word has them: SC | SCT << 8 */
+pub const SC_INVALID_OPCODE: u16 = 0x01;
+pub const SC_INVALID_FIELD:  u16 = 0x02;
 
 /* --- NVMe Submission Queue Entry (64 bytes) --- */
 #[repr(C)]
@@ -144,10 +157,14 @@ pub const ID_CTRL_SN_LEN:  usize = 20;
 pub const ID_CTRL_MN_AT:   usize = 24;  /* model number, 40 bytes of ASCII */
 pub const ID_CTRL_MN_LEN:  usize = 40;
 pub const ID_CTRL_MDTS_AT: usize = 77;  /* Max Data Transfer Size (2^n pages, 0 = unlimited) */
+pub const ID_CTRL_ONCS_AT: usize = 520; /* Optional NVM Command Support, u16 */
+pub const ONCS_WRITE_ZEROES: u16 = 1 << 3;
 
 /* Identify Namespace */
 pub const ID_NS_NSZE_AT:  usize = 0;    /* Namespace Size (total blocks), u64 */
 pub const ID_NS_FLBAS_AT: usize = 26;   /* Formatted LBA Size: bits[3:0] = lbaf index */
+pub const ID_NS_DLFEAT_AT: usize = 33;  /* Deallocate Logical Block Features */
+pub const DLFEAT_WZ_DEAC: u8 = 1 << 3;  /* Write Zeroes takes Deallocate */
 pub const ID_NS_LBAF_AT:  usize = 128;  /* the LBA formats, four bytes apiece */
 pub const ID_NS_LBAF_SIZE: usize = 4;
 pub const LBAF_LBADS_AT:  usize = 2;    /* LBA Data Size: sector size = 2^lbads */

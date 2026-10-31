@@ -77,6 +77,16 @@ pub trait BlockDriver: Sync + 'static {
         true
     }
 
+    /// Make `count` sectors from `sector` -- never none -- read as zeros,
+    /// by the device's own command for it, and return once the device has
+    /// it, as `write` does: in its cache, until a flush. `Some(false)` when
+    /// it failed, and by then some may be zeros and some not. None from a
+    /// device with no such command, the default: whoever asked writes zeros
+    /// itself (`Disk::write_zeroes`).
+    fn write_zeroes(&'static self, _sector: u64, _count: u64) -> Option<bool> {
+        None
+    }
+
     /// Write each of `pieces` of `buf` at its sector, `base` sectors on --
     /// where the partition the table was asked for starts -- and return
     /// once every one is on the device. False when one failed; and by then
@@ -321,6 +331,23 @@ pub(crate) fn read_pieces(handle: usize, buf: &mut DmaBuffer, pieces: &[Piece]) 
     match batch_target(handle, buf.len(), pieces) {
         Some((driver, base)) => driver.read_pieces(base, buf, pieces),
         None => false,
+    }
+}
+
+/// `count` sectors of the device `handle` names, from `sector`, made zeros
+/// by its driver's command for it (`BlockDriver::write_zeroes`): inside the
+/// device, as a write is; None from a driver with no such command.
+pub(crate) fn write_zeroes(handle: usize, sector: u64, count: u64) -> Option<bool> {
+    let dev = device(handle)?;
+    if count == 0 {
+        return Some(true);
+    }
+    if !dev.within(sector, count) {
+        return Some(false);
+    }
+    match dev.backend {
+        Backend::Driver(driver) => driver.write_zeroes(sector, count),
+        Backend::Partition { start } => write_zeroes(dev.parent, start.checked_add(sector)?, count),
     }
 }
 

@@ -119,6 +119,15 @@ impl Disk {
         if table::flush(self.handle) { Ok(()) } else { Err(Error::IoError) }
     }
 
+    /// Makes `count` sectors from `sector` read as zeros by the device's own
+    /// command for it -- in its cache, as a write is, until a flush: true
+    /// once it has. False from a device with no such command, or when the
+    /// command failed, some sectors zeros and some not: whoever asked writes
+    /// zeros over them itself, which it can do in either case.
+    pub fn write_zeroes(&self, sector: u64, count: u64) -> bool {
+        table::write_zeroes(self.handle, sector, count) == Some(true)
+    }
+
     /// Writes each of `pieces` of `buf` at its sector, and returns once
     /// every one is on the device -- in flight together where the device
     /// takes several at once, as NVMe and virtio-blk do, one after another

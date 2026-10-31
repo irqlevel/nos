@@ -119,6 +119,8 @@ pub enum Op {
     /// A write forced to the medium
     WriteFua,
     Flush,
+    /// The device's own write of zeros
+    WriteZeroes,
 }
 
 /// One request, as the device saw it.
@@ -157,6 +159,10 @@ pub struct Disk {
     pub no_writes: Option<String>,
     /// Whether a request is a scheduling point.
     pub latency: bool,
+    /// Whether the device has a write of zeros of its own -- and whether
+    /// that write lies, doing nothing: what its caller must not trust.
+    pub zeroes: bool,
+    pub zeroes_lie: bool,
     /// The table's handle, once registered.
     pub handle: usize,
     /// Which of the cache's writes a power cut finds on the medium.
@@ -181,13 +187,42 @@ impl Disk {
             crashes: Vec::new(),
             no_writes: None,
             latency: false,
+            zeroes: false,
+            zeroes_lie: false,
             handle: 0,
             chaos: 0x2545_F491_4F6C_DD1D,
         }
     }
 
+    /// What a power cut keeps of the cache -- and from the same seed whether
+    /// the device writes zeros of its own, and now and then lies about it.
     pub fn seed_chaos(&mut self, seed: u64) {
         self.chaos = seed | 1;
+        self.zeroes = seed & 2 != 0;
+        self.zeroes_lie = self.zeroes && (seed >> 2) % 8 == 0;
+    }
+
+    /// `data` written at byte `at`: on the medium where the device has no
+    /// cache or `fua` says so, else a sector at a time into the cache.
+    fn put(&mut self, at: u64, data: &[u8], fua: bool) {
+        self.current.write(at, data);
+        if !self.volatile {
+            self.durable.write(at, data);
+            return;
+        }
+        let ss = self.sector_size as usize;
+        let first = at / self.sector_size;
+        if fua {
+            /* On the medium now, and whatever the cache held of these
+             * sectors superseded. */
+            self.durable.write(at, data);
+            let end = first + (data.len() / ss) as u64;
+            self.cache.retain(|(s, _)| *s < first || *s >= end);
+        } else {
+            for (i, piece) in data.chunks(ss).enumerate() {
+                self.cache.push((first + i as u64, piece.to_vec()));
+            }
+        }
     }
 
     fn chaos_next(&mut self) -> u64 {
@@ -296,7 +331,7 @@ impl RamDisk {
                            d.sectors);
                 }
             }
-            if matches!(op, Op::Write | Op::WriteFua) {
+            if matches!(op, Op::Write | Op::WriteFua | Op::WriteZeroes) {
                 if let Some(why) = &d.no_writes {
                     panic!("invariant: disk {} written at sector {} while {}", d.name, sector, why);
                 }
@@ -343,26 +378,20 @@ impl block::BlockDriver for RamDisk {
 
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         let op = if fua { Op::WriteFua } else { Op::Write };
-        self.request(op, sector, data.len(), |d, at| {
-            d.current.write(at, data);
-            if !d.volatile {
-                d.durable.write(at, data);
-                return;
+        self.request(op, sector, data.len(), |d, at| d.put(at, data, fua))
+    }
+
+    fn write_zeroes(&'static self, sector: u64, count: u64) -> Option<bool> {
+        let (has, lie, ss) = with(self.index, |d| (d.zeroes, d.zeroes_lie, d.sector_size));
+        if !has {
+            return None;
+        }
+        let len = usize::try_from(count.checked_mul(ss)?).ok()?;
+        Some(self.request(Op::WriteZeroes, sector, len, |d, at| {
+            if !lie {
+                d.put(at, &vec![0u8; len], false);
             }
-            let ss = d.sector_size as usize;
-            let first = at / d.sector_size;
-            if fua {
-                /* On the medium now, and whatever the cache held of these
-                 * sectors superseded. */
-                d.durable.write(at, data);
-                let end = first + (data.len() / ss) as u64;
-                d.cache.retain(|(s, _)| *s < first || *s >= end);
-            } else {
-                for (i, piece) in data.chunks(ss).enumerate() {
-                    d.cache.push((first + i as u64, piece.to_vec()));
-                }
-            }
-        })
+        }))
     }
 
     fn flush(&'static self) -> bool {
