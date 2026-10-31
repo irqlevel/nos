@@ -739,7 +739,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         total.exits, total.port_in, total.port_out, total.cpuid,
         total.msr_read, total.msr_write, total.msr_gp, total.irq + total.apic, total.hlt, total.pause, total.host);
     if total.kicked != 0 {
-        let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in", total.kicked);
+        let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in, \
+                               or an edge of its timers -- {} of them", total.kicked, total.edges_passed);
     }
     if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 || total.reflected != 0 {
         let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x), {} #DB and #AC given back",

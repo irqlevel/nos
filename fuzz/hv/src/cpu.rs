@@ -381,11 +381,41 @@ pub mod x86 {
         pub struct Kick {
             sent: AtomicU64,
             in_guest: AtomicBool,
+            /// What hvarch's arms the host's timer for as the entry is made
+            /// (`arm_at`, `vm::Cpu::enter`); 0 for none.
+            edge: AtomicU64,
+            edges_passed: AtomicU64,
         }
 
         impl Kick {
             pub fn new() -> Kick {
-                Kick { sent: AtomicU64::new(0), in_guest: AtomicBool::new(false) }
+                Kick { sent: AtomicU64::new(0), in_guest: AtomicBool::new(false), edge: AtomicU64::new(0),
+                       edges_passed: AtomicU64::new(0) }
+            }
+            pub fn arm_at(&self, at: Option<u64>) {
+                self.edge.store(at.unwrap_or(0), Ordering::Relaxed);
+            }
+            pub fn edges_passed(&self) -> u64 {
+                self.edges_passed.load(Ordering::Relaxed)
+            }
+            /// What the loop asked the host's timer to be armed for.
+            pub fn edge(&self) -> u64 {
+                self.edge.load(Ordering::Relaxed)
+            }
+            /// The entry's, as hvarch's `entering` has it: the host's timer
+            /// armed for the edge `arm_at` named, or false -- the entry
+            /// turned back -- where it has come.
+            pub fn arm_or_turn_back(&self) -> bool {
+                let edge = self.edge.load(Ordering::Relaxed);
+                if edge == 0 {
+                    return true;
+                }
+                if edge <= crate::time::peek() {
+                    self.edges_passed.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                crate::vm::arm_timer(edge);
+                true
             }
             pub fn sent(&self) -> u64 {
                 self.sent.load(Ordering::Relaxed)
@@ -1283,8 +1313,14 @@ pub mod vm {
         }
     }
 
+    /// The host's tick, as `Cpu::local_timer_fired` re-arms the timer for
+    /// the next of them: what one that lands between the loop's round and
+    /// the entry does to an arming the round made (`vm::Cpu::enter`).
+    const HOST_TICK_NS: u64 = 10_000_000;
+
     thread_local! {
         static ARMED: Cell<u64> = const { Cell::new(u64::MAX) };
+        static LAST_TICK: Cell<u64> = const { Cell::new(0) };
         static VCPU: Cell<usize> = const { Cell::new(0) };
         /// The descriptor this thread's vCPU takes its posted interrupts
         /// from (`Backend::set_posted`).
@@ -1459,6 +1495,25 @@ pub mod vm {
             let me = VCPU.with(|v| v.get());
             invariant!(crate::sync::held() == 0, "CPU {} enters its guest with {} of the kernel's locks held", me,
                        crate::sync::held());
+            /* The host's tick, where one came since the last entry: its
+             * interrupt, taken on the way in, re-arms the timer for the next
+             * tick whatever it was armed for -- an arming of the guest's edge
+             * made in the loop's round among it. */
+            let now = crate::time::peek();
+            if now / HOST_TICK_NS != LAST_TICK.with(|t| t.get()) / HOST_TICK_NS {
+                LAST_TICK.with(|t| t.set(now));
+                ARMED.with(|a| a.set((now / HOST_TICK_NS + 1) * HOST_TICK_NS));
+            }
+            if let Some(k) = kick {
+                if !k.arm_or_turn_back() {
+                    k.left();
+                    return Ok((Exit::Kicked, me as u32));
+                }
+                let edge = k.edge();
+                invariant!(edge == 0 || ARMED.with(|a| a.get()) <= edge,
+                           "CPU {} enters its guest with the host's timer armed for {} ns, past the edge {} ns its loop \
+                            asked for", me, ARMED.with(|a| a.get()), edge);
+            }
             self.backend.entered();
             let exit = loop {
                 crate::time::progressed();

@@ -431,6 +431,12 @@ pub struct Kick {
     /// Interrupts sent: kicks that found the vCPU in its guest or on its
     /// way in.
     sent: AtomicU64,
+    /// When the host's timer is to take the guest out, host nanoseconds on
+    /// the boot clock -- its timers' next edge -- armed as its next entry is
+    /// made (`arm_at`); 0 for none. The vCPU's own.
+    edge: AtomicU64,
+    /// Entries turned back because that edge had come by then.
+    edges_passed: AtomicU64,
 }
 
 /* A vCPU's modes. */
@@ -440,7 +446,31 @@ const EXITING_GUEST: u8 = 2;
 
 impl Kick {
     pub const fn new() -> Kick {
-        Kick { mode: AtomicU8::new(OUTSIDE_GUEST), cpu: AtomicU32::new(0), sent: AtomicU64::new(0) }
+        Kick {
+            mode: AtomicU8::new(OUTSIDE_GUEST),
+            cpu: AtomicU32::new(0),
+            sent: AtomicU64::new(0),
+            edge: AtomicU64::new(0),
+            edges_passed: AtomicU64::new(0),
+        }
+    }
+
+    /// The vCPU's, before it enters: the host's timer to take the guest out
+    /// at `at` -- its timers' next edge -- armed as the entry is made, with
+    /// interrupts off on the CPU it is made on and nothing left to run before
+    /// it: an interrupt taken between an arming in the loop's round and the
+    /// entry re-armed the timer for the host's next tick in its handler, and
+    /// a guest computing past the edge was taken out only then, 10 ms late on
+    /// the EX44. And the entry turned back if the edge has come by then, for
+    /// the loop's round to take it (`edges_passed`). None for no edge.
+    pub fn arm_at(&self, at: Option<u64>) {
+        self.edge.store(at.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Entries turned back because the edge they were to be taken out at
+    /// had come.
+    pub fn edges_passed(&self) -> u64 {
+        self.edges_passed.load(Ordering::Relaxed)
     }
 
     /// How many kicks interrupted the vCPU's CPU.
@@ -491,15 +521,27 @@ impl Kick {
 
     /// [`Guest::run`]'s, with interrupts off on `cpu`: whether to enter.
     /// The CPU is stored before the mode is read, so that a kick that finds
-    /// the vCPU in its guest after this interrupts the CPU it is on.
+    /// the vCPU in its guest after this interrupts the CPU it is on. The
+    /// host's timer armed for the edge `arm_at` named, or the entry turned
+    /// back if it has come: interrupts stay off from here until the guest
+    /// runs, so nothing re-arms the timer meanwhile, and one due by then
+    /// takes the guest out at once.
     pub(crate) fn entering(&self, cpu: u32) -> bool {
         self.cpu.store(cpu, Ordering::SeqCst);
-        if self.mode.load(Ordering::SeqCst) == IN_GUEST {
-            true
-        } else {
+        if self.mode.load(Ordering::SeqCst) != IN_GUEST {
             self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
-            false
+            return false;
         }
+        let edge = self.edge.load(Ordering::Relaxed);
+        if edge != 0 {
+            if edge <= kcore::time::boot_time_ns() {
+                self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+                self.edges_passed.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            kcore::cpu::timer_at(edge);
+        }
+        true
     }
 
     pub(crate) fn left(&self) {
