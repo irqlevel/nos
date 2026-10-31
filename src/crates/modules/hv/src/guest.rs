@@ -790,13 +790,15 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
                                slept to short of them and spun; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.timer_late_ns / total.timer.max(1) / NS_PER_US, total.timer_late_max / NS_PER_US,
             total.timer_raced, total.advanced, total.ipi_sent, total.ipi_taken, total.msi);
-        let _ = writeln!(out, "  late       {} timer interrupts more than 1 ms past their edges: {} after a sleep, {} with \
+        let _ = writeln!(out, "  late       {} timer interrupts more than 1 ms past their edges: {} after a sleep that had \
+                               the edge and woke more than 1 ms past its time ({} of them rung), {} after one that woke \
+                               on time, {} after a sleep without that edge, {} after a spin or a sleep for good, {} with \
                                the loop round more than 1 ms after an exit, {} after an interrupt of the host's took the \
                                guest out, {} after an exit of its own, {} otherwise; {} sleeps ended more than 1 ms past \
-                               their time, {} us at most",
-            total.late_slept + total.late_off_cpu + total.late_host + total.late_exit + total.late_other,
-            total.late_slept, total.late_off_cpu, total.late_host, total.late_exit, total.late_other, total.overslept,
-            total.overslept_max / NS_PER_US);
+                               their time ({} by a ring after it), {} us at most",
+            total.late(), total.late_woke_late, total.late_woke_late_rung, total.late_woke_on_time,
+            total.late_not_slept_for, total.late_spun, total.late_off_cpu, total.late_host, total.late_exit,
+            total.late_other, total.overslept, total.overslept_rung, total.overslept_max / NS_PER_US);
     }
     let (posted, notified) = guest.posted_stats();
     if posted != 0 {
@@ -825,8 +827,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             counts.len(), guest.cpus_started(), total.init, total.started);
         for (i, c) in counts.iter().enumerate() {
             let (activity, host) = states.get(i).copied().unwrap_or((hv::run::Activity::Running, None));
-            let _ = write!(out, "  cpu {:<2}     {} exits, {} apic irq, {} ipi sent, {} hlt, slept {}% -- {}",
-                i, c.exits, c.apic, c.ipi_sent, c.hlt, c.slept_ns * 100 / run_ns, activity.name());
+            let _ = write!(out, "  cpu {:<2}     {} exits, {} apic irq, {} ipi sent, {} hlt, {} timer interrupts more than 1 \
+                                 ms late, slept {}% -- {}",
+                i, c.exits, c.apic, c.ipi_sent, c.hlt, c.late(), c.slept_ns * 100 / run_ns, activity.name());
             match host {
                 Some(h) => { let _ = writeln!(out, ", on host cpu {}", h); }
                 None => { let _ = writeln!(out, ", never entered"); }

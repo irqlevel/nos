@@ -1489,12 +1489,23 @@ static PV_EOI_BY_REGISTER: AtomicU64 = AtomicU64::new(0);
 static FAST: AtomicU64 = AtomicU64::new(0);
 static RACED: AtomicU64 = AtomicU64::new(0);
 static ADVANCED: AtomicU64 = AtomicU64::new(0);
+/// Timer interrupts the loop requested more than 1 ms past their edges,
+/// after a sleep and otherwise, and sleeps that ended that long past their
+/// time (`run::LATE_NS`).
+static LATE_SLEPT: AtomicU64 = AtomicU64::new(0);
+static LATE_OTHER: AtomicU64 = AtomicU64::new(0);
+static OVERSLEPT: AtomicU64 = AtomicU64::new(0);
 
 /// A guest CPU's run's exits, its ways round counted.
 fn exits_of(counts: crate::run::Counts) -> u64 {
     FAST.fetch_add(counts.fast, Ordering::Relaxed);
     RACED.fetch_add(counts.timer_raced, Ordering::Relaxed);
     ADVANCED.fetch_add(counts.advanced, Ordering::Relaxed);
+    LATE_SLEPT.fetch_add(counts.late_woke_late + counts.late_woke_on_time + counts.late_not_slept_for,
+                         Ordering::Relaxed);
+    LATE_OTHER.fetch_add(counts.late() - counts.late_woke_late - counts.late_woke_on_time - counts.late_not_slept_for,
+                         Ordering::Relaxed);
+    OVERSLEPT.fetch_add(counts.overslept, Ordering::Relaxed);
     counts.exits
 }
 
@@ -1516,6 +1527,9 @@ pub fn report() {
     println!("  platform: {} entries made without the loop's round, {} timer edges taken a round later, {} sleeps \
               ended short of a timer edge and spun", FAST.load(Ordering::Relaxed), RACED.load(Ordering::Relaxed),
              ADVANCED.load(Ordering::Relaxed));
+    println!("  platform: {} timer interrupts more than 1 ms late after a sleep, {} otherwise; {} sleeps ended more \
+              than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
+             OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
     println!("  platform: PV EOIs {} through the word, {} by the register", PV_EOI_BY_WORD.load(Ordering::Relaxed),
