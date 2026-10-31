@@ -86,8 +86,9 @@ pub struct ImageIo {
 }
 
 /// The most parts one vectored call of an image takes: every request a
-/// guest's disk may have out, and as many again.
-pub const IMAGE_VEC_MAX: usize = 16;
+/// guest's disk may have out (`hv::devices::blk::IN_FLIGHT`), so that they
+/// are one batch -- with the device at once -- rather than one after another.
+pub const IMAGE_VEC_MAX: usize = 32;
 
 unsafe extern "C" {
     /// Holds a regular file as an image, for reading, and with `write` not

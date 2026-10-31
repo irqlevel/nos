@@ -212,8 +212,11 @@ const SEG_MAX: u32 = 64;
 /// The most data one request has, and so the size of a buffer.
 pub const REQUEST_BYTES: usize = (SIZE_MAX * SEG_MAX) as usize;
 /// The most requests with the backend at once, and so how many buffers the
-/// device has.
-pub const IN_FLIGHT: usize = 8;
+/// device has: 8 MiB of them. 32, as much as a guest's random reads at QD32
+/// keep out -- at 8, its 4 KiB reads at QD32 were 8 at the device, each
+/// about 100 us, the 80k IOPS the EX44 measured where KVM did 195k -- and
+/// what the NVMe driver lets one batch have with the controller at once.
+pub const IN_FLIGHT: usize = 32;
 
 /// Request types, and statuses.
 const T_IN: u32 = 0;
