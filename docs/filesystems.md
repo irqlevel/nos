@@ -151,10 +151,20 @@ written), and only then committed, one transaction, so that after any
 crash a block is the file's, zeros or the guest's data, or free, never what
 it held before -- and the write then goes to the device as an overwrite.
 Each chunk is taken into the map again after it. Where the filesystem
-gives no blocks ahead of a write (ext2), or has none left to give, the
-batch goes through the VFS as every write once did -- a transaction of its
-own -- and the next flush is then the filesystem's sync (its metadata, then
-the device); otherwise a flush is the device's alone. ext4 commits every
+gives no blocks ahead of a write (ext2: `FileSystem::allocates`, asked once
+as the image is held), or has none left to give, the batch goes through the
+VFS as every write once did -- a transaction of its own -- and the next
+flush is then the filesystem's sync (its metadata, then the device);
+otherwise a flush is the device's alone. A chunk ext4 refuses is said at
+the first and counted, and the image says how many as it is let go of: the
+write still lands, through the VFS, so nothing but the count shows it --
+which is how a refusal of every chunk past the first hole of each went
+unseen, until a Linux guest's disk said so (an allocation's read of the
+extent leaf it had just changed, held to a checksum the change had not put
+on it yet; a transaction's dirty blocks now read with the checksum their
+commit will give them, `Source for Txn`). `fs-fuzz` holds ext4's images to
+having no chunk refused but for want of room, a failed request or the
+kernel heap's ceiling. ext4 commits every
 call as it is made, so a write through it into a hole cost a commit -- the
 log written, flushed, its commit block FUA -- for every batch: a guest
 filling a fresh disk wrote at 28 MiB/s on the EX44 where the same disk
@@ -181,7 +191,12 @@ with its unmap flag and writes zeros over the rest. That the next file may
 have a block the moment the punch is done is safe because an image's calls
 come one at a time: none of its reads is under way off the lock on a block
 it mapped before. A filesystem with no blocks of its own gives nothing
-back, and its discard does nothing.
+back, and its discard does nothing. A guest's disk tells the guest what a
+discard gives back whole (`Image::discard_unit`, the device's
+`discard_sector_alignment`): Linux then splits a long discard on a chunk's
+edge, rather than 64 MiB on from wherever its free run began -- across a
+chunk once in four -- and `fstrim` leaves out free runs shorter than a
+chunk, which would give nothing back.
 
 `fstest` holds one at every smoke boot, its chunk two blocks -- holes read
 as zeros, a write into one, into part of a block, across both, a write of
