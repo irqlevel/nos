@@ -51,7 +51,7 @@ struct Expected
     bool trace_vga = false, panic_vga = false, smp_off = false, its_enabled = true, hw_rng_off = false;
     int wx_probe = 0; /* off, text, heap */
     bool usb_off = false, rc_off = false, hwp_off = false, ucode_off = false;
-    bool idle_mwait = false; /* idle=mwait, the last idle= said */
+    bool idle_mwait = true; /* MWAIT unless the last idle= that says one way or the other says halt */
     ulong panic_reset_secs = 0;
     int console = 0; /* both, serial, vga */
     int dhcp = 0;    /* on, auto, off */
@@ -173,7 +173,12 @@ void take(Expected& e, const std::string& token)
     else if (key == "ucode")
         e.ucode_off = value == "off";
     else if (key == "idle")
-        e.idle_mwait = value == "mwait";
+    {
+        if (value == "halt")
+            e.idle_mwait = false;
+        else if (value == "mwait")
+            e.idle_mwait = true;
+    }
     else if (key == "wxprobe")
     {
         if (value == "on" || value == "text")
@@ -367,7 +372,7 @@ const char* const STRAYS[] = {"quiet", "splash", "r", "=", "a=", "=b", "foo=bar"
                               "ro=1"};
 
 const char* const VALUES[] = {"on", "off", "vga", "serial", "both", "auto", "text", "heap", "warn", "mwait",
-                              "mwai", "mwaits", "MWAIT", "halt", "", "0", "1",
+                              "mwai", "mwaits", "MWAIT", "halt", "hal", "halts", "HALT", "", "0", "1",
                               "64", "65", "65535", "65536", "1024", "1025", "3600", "3601", "5", "6",
                               "18446744073709551615", "18446744073709551616", "-1", "1x", "abc"};
 
