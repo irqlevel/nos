@@ -184,6 +184,13 @@ const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
 const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
 const POLL_MAX_NS: u64 = 200 * kcore::consts::NS_PER_US;
 
+/// How far short of its own timer's edge a halted vCPU's sleep ends, the
+/// rest spun: what a wake costs the host's sleeper -- its timer interrupt, a
+/// schedule, a switch -- which made the EX44's guests' timer interrupts 9-10
+/// us late on average. Spun for at most this a wake, on a CPU that is the
+/// guest's own.
+const TIMER_ADVANCE_NS: u64 = 10 * kcore::consts::NS_PER_US;
+
 /// The longest a CPU asleep for good -- halted with interrupts off, or
 /// waiting for a start-up IPI -- sleeps before it looks again. Only another
 /// CPU can wake one, by ringing it, and a stop rings every CPU; this is a
@@ -292,6 +299,16 @@ pub struct Counts {
     pub timer: u64,
     pub timer_late_ns: u64,
     pub timer_late_max: u64,
+    /// Entries not made because an edge of its timers came between the look
+    /// at them and the arming of the host's timer -- which arms none for an
+    /// edge gone by -- the loop round again to take it.
+    pub timer_raced: u64,
+    /// Sleeps to its own timer's edge woken short of it and spun the rest
+    /// (`TIMER_ADVANCE_NS`).
+    pub advanced: u64,
+    /// Entries made at once after a write of its TSC deadline or of an IPI
+    /// to other CPUs, without the loop's round.
+    pub fast: u64,
     /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
     /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
     /// stopped the guest after, of level-triggered vectors.
@@ -404,6 +421,9 @@ impl Counts {
         self.slept_ns += o.slept_ns;
         self.timer_late_ns += o.timer_late_ns;
         self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
+        self.timer_raced += o.timer_raced;
+        self.advanced += o.advanced;
+        self.fast += o.fast;
         self.polls += o.polls;
         self.polled += o.polled;
         self.handled_ns += o.handled_ns;
@@ -544,6 +564,9 @@ pub struct GuestCpu {
     pv_eoi_armed: bool,
     /// How long its task spins for a ring when it halts (`POLL_MAX_NS`).
     poll_ns: u64,
+    /// Its last exit a write the next entry may follow without the loop's
+    /// round (`msr`): its TSC deadline, an IPI to other CPUs.
+    fast: bool,
     counts: Counts,
 }
 
@@ -795,6 +818,7 @@ impl LinuxGuest {
                 pv_eoi: 0,
                 pv_eoi_armed: false,
                 poll_ns: 0,
+                fast: false,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1276,6 +1300,9 @@ impl LinuxGuest {
         /* When the last exit came, and whether it was a write of an MSR: the
          * time to the next look is the exit's handling (`handled_ns`). */
         let mut exited: Option<(u64, bool)> = None;
+        /* Whether its last entry had the CPU deliver the APIC's interrupts:
+         * what an entry made without the round's reload of them needs. */
+        let mut entered_apicv = false;
         loop {
             let now = time::boot_time_ns();
             if let Some((at, msr_write)) = exited.take() {
@@ -1302,6 +1329,33 @@ impl LinuxGuest {
              * devices -- is what arrived before the ring, and anything later
              * rings it. */
             kick.prepare();
+            /* What rang since the last look is what the round looks at. And
+             * the round left out, the entry made at once, after a write of
+             * its TSC deadline or of an IPI to other CPUs -- KVM's fast path
+             * for the same two -- where its last entry had the CPU deliver
+             * the APIC's interrupts and nothing waits: no ring, no mail,
+             * nothing posted that the CPU has not taken, no edge of its own
+             * timer due, nothing to give back. The host's timer is armed for
+             * that timer's edge, which the write may have moved; one that
+             * came meanwhile is the round's to take. The devices, the mail
+             * and the APIC's reload are left for when they have something:
+             * each rings it, or is armed for. */
+            let rung = bell.take_rung();
+            let mut fast = core::mem::take(&mut gc.fast) && entered_apicv && !rung
+                && gc.activity == Activity::Running && !shared.mail.has_mail()
+                && shared.posted.as_ref().is_none_or(|p| !p.outstanding())
+                && gc.exception.is_none() && !gc.nmi_pending
+                && gc.lapic.next_timer_ns().is_none_or(|edge| edge > now);
+            if fast {
+                if let Some(edge) = gc.lapic.next_timer_ns() {
+                    kcore::cpu::timer_at(edge);
+                    fast = edge > time::boot_time_ns();
+                }
+            }
+            let apicv = if fast {
+                gc.counts.fast += 1;
+                true
+            } else {
             if matches!(gc.activity, Activity::Asleep | Activity::WaitForSipi) {
                 /* Awake while it looks, before it takes anything. */
                 self.asleep.fetch_and(!(1u64 << me), Ordering::AcqRel);
@@ -1434,10 +1488,27 @@ impl LinuxGuest {
                                     continue;
                                 }
                             }
+                            /* Its own timer the next to wake it, an edge that
+                             * raises an interrupt (`next_timer_ns`): slept to
+                             * a little short of it and the rest spun, so that
+                             * what a wake from a sleep costs the host -- its
+                             * timer's interrupt, a schedule, a switch, 9-10 us
+                             * on the EX44 -- comes before the edge rather than
+                             * after it, and the guest's interrupt on time.
+                             * KVM's timer advance, fixed. */
+                            let advance = gc.lapic.next_timer_ns() == Some(until) && until - now > TIMER_ADVANCE_NS;
+                            let wake_at = if advance { until - TIMER_ADVANCE_NS } else { until };
                             let slept_from = time::boot_time_ns();
-                            bell.wait(until.saturating_sub(slept_from).max(1));
+                            let rung = bell.wait(wake_at.saturating_sub(slept_from).max(1));
                             gc.counts.sleeps += 1;
                             gc.counts.slept_ns += time::boot_time_ns().saturating_sub(slept_from);
+                            if advance && !rung {
+                                let at = time::boot_time_ns();
+                                if at < until {
+                                    gc.counts.advanced += 1;
+                                    bell.poll(until - at);
+                                }
+                            }
                             let halt = time::boot_time_ns().saturating_sub(now);
                             gc.poll_ns = if halt > POLL_MAX_NS {
                                 0
@@ -1453,6 +1524,26 @@ impl LinuxGuest {
                 }
                 Activity::Running => {}
             }
+            /* Its timers' next edge, if one is coming: the host CPU's own
+             * timer armed for it, so that a guest computing with no exit is
+             * taken out of it then, as a halted one is woken then -- not at
+             * the host's next tick, ten edges of a 1000 Hz guest late. An
+             * edge of its own timers' that came since they were looked at
+             * above is one the host's timer is not armed for -- it arms none
+             * gone by -- and the guest would run on to its next exit with it
+             * owed, the host's tick for one that computes: round again to
+             * take it, before anything is handed in for this entry. */
+            let timers = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
+            let edge = timers.min(devices_due.unwrap_or(u64::MAX));
+            if edge != u64::MAX {
+                kcore::cpu::timer_at(edge);
+            }
+            if timers <= time::boot_time_ns() {
+                kick.cancel();
+                gc.counts.timer_raced += 1;
+                continue;
+            }
+
             /* The CPU delivers the APIC's interrupts itself where it can,
              * and the guest's APIC is in x2APIC mode and on: handed where
              * the APIC stands, and given back what it did at the exit, before
@@ -1467,19 +1558,11 @@ impl LinuxGuest {
                 gc.cpu.backend_mut().apicv_off();
                 self.pv_eoi_arm(gc);
             }
-
-            /* Its timers' next edge, if one is coming: the host CPU's own
-             * timer armed for it, so that a guest computing with no exit is
-             * taken out of it then, as a halted one is woken then -- not at
-             * the host's next tick, ten edges of a 1000 Hz guest late. */
-            let edge = pit_edge.unwrap_or(u64::MAX)
-                .min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX))
-                .min(devices_due.unwrap_or(u64::MAX));
-            if edge != u64::MAX {
-                kcore::cpu::timer_at(edge);
-            }
+            apicv
+            };
 
             gc.counts.to_entry_ns += time::boot_time_ns().saturating_sub(now);
+            entered_apicv = apicv;
             let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
             let exit_at = time::boot_time_ns();
             if apicv {
@@ -1998,9 +2081,10 @@ impl LinuxGuest {
     /// into the mailbox of each CPU it is for, whose doorbell then rings --
     /// a CPU asleep wakes, and takes it. One for the sender itself goes
     /// straight into its own APIC.
-    fn send(&self, from: &mut GuestCpu, ipi: Ipi) {
+    fn send(&self, from: &mut GuestCpu, ipi: Ipi) -> bool {
         from.counts.ipi_sent += 1;
         let me = from.index;
+        let mut own = false;
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
             let addressing = if id == me { from.lapic.addressing() } else { target.addressing() };
@@ -2010,12 +2094,13 @@ impl LinuxGuest {
             match ipi.delivery {
                 Delivery::Fixed | Delivery::LowestPriority if id == me => {
                     from.lapic.accept(ipi.vector);
+                    own = true;
                 }
                 Delivery::Fixed | Delivery::LowestPriority => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
                     if ipi.delivery == Delivery::LowestPriority {
-                        return;
+                        return own;
                     }
                     continue;
                 }
@@ -2026,7 +2111,7 @@ impl LinuxGuest {
                      * of. */
                     let rip = from.cpu.backend().save().rip;
                     self.stop_with(Stop::Init { rip }, from);
-                    return;
+                    return true;
                 }
                 Delivery::Init => target.mail.post_init(),
                 Delivery::Startup => target.mail.post_sipi(ipi.vector),
@@ -2040,9 +2125,10 @@ impl LinuxGuest {
             }
             /* Lowest priority is one CPU's, of those it names: the first. */
             if ipi.delivery == Delivery::LowestPriority {
-                return;
+                return own;
             }
         }
+        own
     }
 
     /// Ring the CPUs that take the 8259's interrupts, after a port access of
@@ -2487,7 +2573,9 @@ impl LinuxGuest {
             match wrote {
                 Wrote::Done => {}
                 Wrote::Tpr(tpr) => v.set_cr8(tpr >> 4),
-                Wrote::Ipi(ipi) => self.send(gc, ipi),
+                Wrote::Ipi(ipi) => {
+                    self.send(gc, ipi);
+                }
                 Wrote::Eoi(vector) => self.level_eoi(gc, vector),
             }
             /* The logical ID and the model are this page's to write. */
@@ -2545,6 +2633,7 @@ impl LinuxGuest {
             if write {
                 gc.lapic.set_tsc_deadline(value, tsc_ns(value));
                 gc.cpu.backend_mut().skip_msr();
+                gc.fast = true;
             } else {
                 let deadline = gc.lapic.tsc_deadline();
                 let b = gc.cpu.backend_mut();
@@ -2567,7 +2656,9 @@ impl LinuxGuest {
                     }
                     Ok(Wrote::Ipi(ipi)) => {
                         gc.cpu.backend_mut().skip_msr();
-                        self.send(gc, ipi);
+                        /* To other CPUs alone, the next entry may follow
+                         * at once: its own APIC is as it left it. */
+                        gc.fast = !self.send(gc, ipi);
                     }
                     Ok(Wrote::Eoi(vector)) => {
                         gc.cpu.backend_mut().skip_msr();

@@ -2413,11 +2413,43 @@ than that: a guest that idles until its next tick spins not at all, and one
 whose CPUs wake each other within microseconds -- a pipe between two
 processes, a database's clients and its server -- is caught spinning. It is
 never spun up to an edge of the guest's own timers: an edge sooner than the
-spin is slept to, as before, so the loop always waits once a halt goes
-unanswered. The report counts the halts spun for and those a ring ended in
-the spin. Under KVM, on the EX44, the polls caught 36 million of a Linux
-guest's 40 million halts in a benchmark's run, and the pipe's round trip
-took 6 us where nos's took 14 ([`plans/vm-performance.md`](../plans/vm-performance.md)).
+spin is slept to, so the loop always waits once a halt goes unanswered --
+and a sleep to its own APIC timer's edge ends 10 us short of it, the rest
+spun (`TIMER_ADVANCE_NS`, KVM's timer advance), so that what a wake costs
+the host -- its timer's interrupt, a schedule, a switch, which made the
+EX44's guests' timer interrupts 9-10 us late on average -- comes before the
+edge rather than after it. A ring of a vCPU that spins sets the word it
+watches and signals nothing (`Doorbell::ring`), its task not being asleep:
+the word is stored before the spinner is looked for, and the spinner stops
+before it looks at the word a last time, so of the two one sees the other.
+The report counts the halts spun for and those a ring ended in the spin.
+Under KVM, on the EX44, the polls caught 36 million of a Linux guest's 40
+million halts in a benchmark's run, and the pipe's round trip took 6 us
+where nos's took 14 ([`plans/vm-performance.md`](../plans/vm-performance.md));
+with the spin, 89% of 50 million and 8.5-9.3 us.
+
+**After a write of its TSC deadline, or of an IPI to other CPUs, a CPU goes
+straight back in** -- KVM's fast path for the same two writes, half of a
+Linux guest's exits. The loop's round -- the mail, what was posted, the
+devices' work, the APIC's state handed in again -- is left out where the last
+entry had the CPU deliver the APIC's interrupts and nothing waits: no ring
+since the last look (`Doorbell::take_rung`), no mail, nothing posted that the
+CPU has not taken -- a notification that came as a host interrupt after the
+exit leaves its descriptor's ON bit set (`PostedInterrupts::outstanding`) --
+no edge of its own timer due, nothing to give back. The host's timer is armed
+for the timer's edge, which the write may have moved. An IPI that reaches the
+sender's own APIC changes what the round would hand in, and goes the round.
+On the EX44 an exit cost the host 545-559 ns handled and 479-496 ns to the
+next entry, past the world switch.
+
+**An edge of its own timers that comes on the way in is taken a round
+later**, not at the host's next tick. The loop looks at its timers, and
+arms the host's timer for their next edge a few hundred nanoseconds later
+-- and the host's timer is armed for none gone by: an edge that fell between
+the two was owed to a guest that then ran on to its next exit, a host tick
+for one that computes. The EX44's guests saw one 10 ms late at most. The loop
+looks again after arming, before anything is handed in for the entry, and
+goes round again where an edge has come.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
