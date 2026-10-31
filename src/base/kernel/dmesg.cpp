@@ -94,6 +94,10 @@ restart:
         msg_buf_.free(msg);
 		return;
     }
+    /* A record is a line: one longer than a record holds -- a trace line
+       holds up to 255 bytes, a record fewer -- ends its line still, so that
+       the next record printed after it starts one of its own. */
+    stdlib::end_cut_line(msg->str, sizeof(msg->str), size);
 
     stdlib::AutoLock lock(lock_);
     BUG_ON(msg->usage.get() != 0);
