@@ -45,6 +45,7 @@ Cpu::Cpu()
     , tick_due_(0)
     , timer_armed_at_(~0UL)
     , timer_walk_(false)
+    , idle_long_run_(0)
 {
     ipi_task_list_.init();
 }
@@ -73,16 +74,41 @@ void Cpu::idle()
     Task* self = Task::try_get_current_task();
     if (self != nullptr)
         self->set_idling(true);
-    /* Deep where the next timer is far enough off, a HLT nearer it. The
-       timer's deadline is read with interrupts off: its own interrupt
-       re-arms it on this CPU. */
-    ulong flags = hal::irq_save();
-    ulong armed = timer_armed_at_;
-    hal::irq_restore(flags);
-    ulong now = get_boot_time().get_value();
-    hal::cpu_idle(armed > now && armed - now >= IDLE_DEEP_NS);
+    if (hal::idle_masked())
+        idle_mwait();
+    else
+        cpu_halt();
     if (self != nullptr)
         self->set_idling(false);
+}
+
+/* An idle by MWAIT, interrupts off throughout, so that how long it lasted
+   is known exactly: the wake is read before the interrupt that ended it is
+   taken, and whatever that interrupt then runs counts for nothing. Deep only
+   once this CPU's last IDLE_LONG_RUN idles each lasted IDLE_DEEP_NS or more
+   and its next timer is as far off -- what no timer predicts, a disk's
+   completion or another CPU's IPI, would otherwise pay a deep C-state's
+   exit at every wake: on a desktop part's C10, hundreds of microseconds.
+   C1 otherwise, as a HLT. The timer's deadline is read with interrupts off:
+   its own interrupt re-arms it on this CPU. */
+void Cpu::idle_mwait()
+{
+    ulong flags = hal::irq_save();
+    ulong now = get_boot_time().get_value();
+    ulong armed = timer_armed_at_;
+    bool deep = idle_long_run_ >= IDLE_LONG_RUN && armed > now && armed - now >= IDLE_DEEP_NS;
+    hal::cpu_idle_masked(deep);
+    ulong woke = get_boot_time().get_value();
+    if (woke > now && woke - now >= IDLE_DEEP_NS)
+    {
+        if (idle_long_run_ < IDLE_LONG_RUN)
+            idle_long_run_++;
+    }
+    else
+    {
+        idle_long_run_ = 0;
+    }
+    hal::irq_restore(flags);
 }
 
 ulong Cpu::get_state()
