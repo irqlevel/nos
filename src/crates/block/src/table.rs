@@ -87,6 +87,15 @@ pub trait BlockDriver: Sync + 'static {
         None
     }
 
+    /// Whether a write with `fua` is the device's own -- on the medium when
+    /// it completes, nothing else in its cache pushed out with it -- rather
+    /// than a write and then a flush of everything, the default (virtio-blk
+    /// has no FUA). What a journal may write its log with in place of a
+    /// flush before its commit, where nothing else needs one.
+    fn fua_native(&'static self) -> bool {
+        false
+    }
+
     /// Write each of `pieces` of `buf` at its sector, `base` sectors on --
     /// where the partition the table was asked for starts -- and return
     /// once every one is on the device. False when one failed; and by then
@@ -348,6 +357,16 @@ pub(crate) fn write_zeroes(handle: usize, sector: u64, count: u64) -> Option<boo
     match dev.backend {
         Backend::Driver(driver) => driver.write_zeroes(sector, count),
         Backend::Partition { start } => write_zeroes(dev.parent, start.checked_add(sector)?, count),
+    }
+}
+
+pub(crate) fn fua_native(handle: usize) -> bool {
+    match device(handle) {
+        Some(dev) => match dev.backend {
+            Backend::Driver(driver) => driver.fua_native(),
+            Backend::Partition { .. } => fua_native(dev.parent),
+        },
+        None => false,
     }
 }
 

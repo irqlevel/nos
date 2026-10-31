@@ -51,7 +51,7 @@ use kcore::dma::DmaBuffer;
 use kcore::time::wall_clock_secs;
 use kcore::trace;
 
-use crate::vfs::{FileSystem, Space};
+use crate::vfs::{FileSystem, MapRun, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 use cache::Cache;
@@ -149,6 +149,10 @@ impl Ext4 {
 
     fn map(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
         source::map(&mut self.reader()?, ino, raw, lblock)
+    }
+
+    fn map_extent(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<(Map, bool)> {
+        source::map_extent(&mut self.reader()?, ino, raw, lblock)
     }
 
     /// Metadata block `b`, as a read sees it.
@@ -888,10 +892,10 @@ impl Ext4 {
         true
     }
 
-    /// `map_blocks` as runs: an extent's blocks one run, a hole -- an
-    /// unwritten extent among them -- another, each held to the blocks a
-    /// file may own as every map is (`source::map`).
-    pub fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<(u64, u64)>) -> bool {
+    /// `map_blocks` as runs: an extent's blocks one run -- an unwritten
+    /// extent's said so -- a hole another, each held to the blocks a file
+    /// may own as every map is (`source::map_extent`).
+    pub fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
         if !self.overlay.is_empty() {
             return false;
         }
@@ -901,9 +905,9 @@ impl Ext4 {
         let Some(end) = first.checked_add(count) else { return false };
         let mut l = first;
         while l < end {
-            let (sector, run) = match self.map(ino, &raw, l) {
-                Some(Map::Blocks { block, run }) => (block * sectors, run),
-                Some(Map::Hole { run }) => (0, run),
+            let (sector, run, unwritten) = match self.map_extent(ino, &raw, l) {
+                Some((Map::Blocks { block, run }, unwritten)) => (block * sectors, run, unwritten),
+                Some((Map::Hole { run }, _)) => (0, run, false),
                 None => return false,
             };
             /* A run is at least the block asked about, and no further than
@@ -912,7 +916,7 @@ impl Ext4 {
             if out.try_reserve(1).is_err() {
                 return false;
             }
-            out.push((sector, n));
+            out.push(MapRun { sector, len: n, unwritten });
             l += n;
         }
         true
@@ -1038,7 +1042,7 @@ impl FileSystem for Ext4 {
         Ext4::map_blocks(self, file, first, out)
     }
 
-    fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<(u64, u64)>) -> bool {
+    fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
         Ext4::map_runs(self, file, first, count, out)
     }
 
@@ -1052,6 +1056,10 @@ impl FileSystem for Ext4 {
 
     fn allocates(&self) -> bool {
         true
+    }
+
+    fn mark_written(&mut self, file: NodeId, runs: &[(u64, u64)]) -> bool {
+        Ext4::mark_written(self, file, runs)
     }
 
     fn links(&mut self, file: NodeId) -> Option<u32> {
