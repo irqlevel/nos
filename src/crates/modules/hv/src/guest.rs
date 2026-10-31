@@ -775,6 +775,12 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         total.slept_ns / NS_PER_MS, total.sleeps,
         total.slept_ns * 100 / run_ns / counts.len().max(1) as u64,
         if counts.len() > 1 { " (of each CPU's, on average)" } else { "" }, total.polls, total.polled);
+    /* What an exit costs the host past the world switch: its handling, and
+     * the look at what is waiting before the next entry. */
+    let exits = total.exits.max(1);
+    let _ = writeln!(out, "  loop       {} ns an exit handled and {} ns to the next entry, on average; {} ns a write of an MSR's \
+                           handling",
+        total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / total.msr_write.max(1));
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);

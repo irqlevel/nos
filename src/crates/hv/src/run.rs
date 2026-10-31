@@ -326,6 +326,15 @@ pub struct Counts {
     /// and those a ring ended in the spin, no sleep at all.
     pub polls: u64,
     pub polled: u64,
+    /// The host's time between a guest's exit and its next entry, in two
+    /// parts: the exit handled, up to the top of the loop -- of which the
+    /// writes of an MSR alone, the guest's IPIs and timer deadlines among
+    /// them -- and the loop's look at what is waiting, up to the entry. No
+    /// sleep of a halted vCPU is in either: what an exit costs the host
+    /// past the world switch, which `hv bench` times.
+    pub handled_ns: u64,
+    pub msr_write_ns: u64,
+    pub to_entry_ns: u64,
     /// Instructions the guest was told (by CPUID) it does not have, run
     /// anyway and answered with #UD -- or, RDPMC, the #GP of a counter not
     /// there; WBINVDs stepped past; `mov`s to and from CR8 answered from the
@@ -397,6 +406,9 @@ impl Counts {
         self.timer_late_max = self.timer_late_max.max(o.timer_late_max);
         self.polls += o.polls;
         self.polled += o.polled;
+        self.handled_ns += o.handled_ns;
+        self.msr_write_ns += o.msr_write_ns;
+        self.to_entry_ns += o.to_entry_ns;
         self.ud += o.ud;
         self.reflected += o.reflected;
         self.wbinvd += o.wbinvd;
@@ -1261,8 +1273,18 @@ impl LinuxGuest {
             }
         }
 
+        /* When the last exit came, and whether it was a write of an MSR: the
+         * time to the next look is the exit's handling (`handled_ns`). */
+        let mut exited: Option<(u64, bool)> = None;
         loop {
             let now = time::boot_time_ns();
+            if let Some((at, msr_write)) = exited.take() {
+                let handled = now.saturating_sub(at);
+                gc.counts.handled_ns += handled;
+                if msr_write {
+                    gc.counts.msr_write_ns += handled;
+                }
+            }
             if self.stopping.load(Ordering::Acquire) {
                 break;
             }
@@ -1457,7 +1479,9 @@ impl LinuxGuest {
                 kcore::cpu::timer_at(edge);
             }
 
+            gc.counts.to_entry_ns += time::boot_time_ns().saturating_sub(now);
             let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
+            let exit_at = time::boot_time_ns();
             if apicv {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
                 gc.lapic.from_cpu(&irr, &isr, tpr);
@@ -1474,6 +1498,7 @@ impl LinuxGuest {
                 }
             };
             shared.host_cpu.store(host_cpu, Ordering::Relaxed);
+            exited = Some((exit_at, matches!(exit, Exit::Msr { write: true })));
             gc.counts.exits += 1;
             if gc.counts.exits % PROGRESS_EVERY == 0 {
                 host.progress(gc.index, &gc.counts);
