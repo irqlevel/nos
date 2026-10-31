@@ -99,6 +99,32 @@ pub fn arch_capabilities() -> Option<u64> {
     Some(unsafe { rdmsr(MSR_ARCH_CAPABILITIES) })
 }
 
+/// IA32_BIOS_SIGN_ID: Intel's microcode revision, in its high half.
+const MSR_BIOS_SIGN_ID: u32 = 0x8B;
+/// CPUID leaf 1, ECX bit 31: under a hypervisor.
+const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
+
+/// The microcode revision an Intel CPU runs, as the SDM has it read
+/// (10.11.7.1): IA32_BIOS_SIGN_ID cleared, CPUID's leaf 1 run, the MSR's
+/// high half -- what Linux reads of every Intel CPU at boot, and what KVM
+/// tells a guest of the host's: a fact of the silicon, by which Linux keeps
+/// PCID on a Raptor Lake whose microcode has the fix for its INVLPG
+/// erratum. 0 on any other vendor's CPU, and under a hypervisor, whose
+/// answer is its own business -- as the kernel's microcode loader leaves
+/// it.
+pub fn microcode_revision() -> u32 {
+    if vendor_id() != *b"GenuineIntel" || __cpuid(1).ecx & LEAF1_ECX_HYPERVISOR != 0 {
+        return 0;
+    }
+    // SAFETY: every Intel CPU since the P6 has IA32_BIOS_SIGN_ID, and the
+    // protocol writes it 0 before the CPUID that loads the revision into it
+    // -- the write changes nothing but what the next read returns.
+    unsafe { wrmsr(MSR_BIOS_SIGN_ID, 0) };
+    let _ = __cpuid(1);
+    // SAFETY: as above.
+    (unsafe { rdmsr(MSR_BIOS_SIGN_ID) } >> 32) as u32
+}
+
 /// # Safety
 /// The CPU has this MSR. Reading one it does not have is a #GP, and this
 /// kernel's #GP handler panics -- so every caller here reads the CPUID bit

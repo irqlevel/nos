@@ -172,6 +172,18 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// until the deadline, and is woken at its CPU's next scheduling point, the
 /// tick at the latest).
 const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+/// Halt polling, as KVM has it: a halted vCPU's task spins this long for a
+/// ring before it sleeps (`Doorbell::poll`) -- grown, doubling from the
+/// first, after a halt that was short and longer than the spin, and taken
+/// back to none after one longer than the most: so a guest whose CPUs wake
+/// each other within microseconds -- a pipe between two processes, a
+/// database's client and server -- is caught spinning, and one that idles
+/// until its next tick spins not at all. On the EX44 KVM's polls caught 36
+/// million of a Linux guest's 40 million halts in a benchmark's run, and its
+/// pipe's round trip took 6 us where nos's sleeping vCPUs took 14.
+const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
+const POLL_MAX_NS: u64 = 200 * kcore::consts::NS_PER_US;
+
 /// The longest a CPU asleep for good -- halted with interrupts off, or
 /// waiting for a start-up IPI -- sleeps before it looks again. Only another
 /// CPU can wake one, by ringing it, and a stop rings every CPU; this is a
@@ -307,6 +319,10 @@ pub struct Counts {
     /// the host CPU this guest gave back while it had nothing to do.
     pub sleeps: u64,
     pub slept_ns: u64,
+    /// Halts the task spun for a ring before it slept (`Doorbell::poll`),
+    /// and those a ring ended in the spin, no sleep at all.
+    pub polls: u64,
+    pub polled: u64,
     /// Instructions the guest was told (by CPUID) it does not have, run
     /// anyway and answered with #UD -- or, RDPMC, the #GP of a counter not
     /// there; WBINVDs stepped past; `mov`s to and from CR8 answered from the
@@ -374,6 +390,8 @@ impl Counts {
         self.pause += o.pause;
         self.sleeps += o.sleeps;
         self.slept_ns += o.slept_ns;
+        self.polls += o.polls;
+        self.polled += o.polled;
         self.ud += o.ud;
         self.reflected += o.reflected;
         self.wbinvd += o.wbinvd;
@@ -507,6 +525,8 @@ pub struct GuestCpu {
     /// the last entry (`pv_eoi_arm`), for the exit after to look at.
     pv_eoi: u64,
     pv_eoi_armed: bool,
+    /// How long its task spins for a ring when it halts (`POLL_MAX_NS`).
+    poll_ns: u64,
     counts: Counts,
 }
 
@@ -757,6 +777,7 @@ impl LinuxGuest {
                 last_from_pic: false,
                 pv_eoi: 0,
                 pv_eoi_armed: false,
+                poll_ns: 0,
                 counts: Counts::default(),
             });
             shared.push(CpuShared {
@@ -1364,9 +1385,33 @@ impl LinuxGuest {
                             .min(now.saturating_add(MAX_HALT_WAIT_NS))
                             .min(deadline);
                         if until > now {
-                            bell.wait(until - now);
+                            /* A ring that comes within the spin is caught in
+                             * it; one that does not, the task sleeps for, to
+                             * the edge -- never spun to: an edge the spin ran
+                             * into would have the loop look again with no
+                             * sleep at all, and one that wakes nothing look
+                             * for good. The spin is grown after a halt that
+                             * was short, and dropped after one that was long,
+                             * KVM's way. */
+                            if gc.poll_ns != 0 && until - now > gc.poll_ns {
+                                gc.counts.polls += 1;
+                                if bell.poll(gc.poll_ns) {
+                                    gc.counts.polled += 1;
+                                    continue;
+                                }
+                            }
+                            let slept_from = time::boot_time_ns();
+                            bell.wait(until.saturating_sub(slept_from).max(1));
                             gc.counts.sleeps += 1;
-                            gc.counts.slept_ns += time::boot_time_ns().saturating_sub(now);
+                            gc.counts.slept_ns += time::boot_time_ns().saturating_sub(slept_from);
+                            let halt = time::boot_time_ns().saturating_sub(now);
+                            gc.poll_ns = if halt > POLL_MAX_NS {
+                                0
+                            } else if halt > gc.poll_ns {
+                                gc.poll_ns.saturating_mul(2).clamp(POLL_FIRST_NS, POLL_MAX_NS)
+                            } else {
+                                gc.poll_ns
+                            };
                         }
                         continue;
                     }
