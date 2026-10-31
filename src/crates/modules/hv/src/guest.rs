@@ -15,7 +15,7 @@ use hv::linux::Header;
 use hv::place::Shape;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
 use hv::{Doorbells, Machine};
-use kcore::consts::{NS_PER_MS, NS_PER_SEC};
+use kcore::consts::{NS_PER_MS, NS_PER_SEC, NS_PER_US};
 use kcore::sync::Mutex;
 
 use crate::config::Options;
@@ -779,8 +779,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
     if total.apic != 0 || counts.len() > 1 {
-        let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken; {} MSIs",
-            total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
+        let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers -- late past their edges \
+                               by {} us on average, {} us at most; {} IPIs sent, {} taken; {} MSIs",
+            total.apic, total.timer, total.timer_late_ns / total.timer.max(1) / NS_PER_US, total.timer_late_max / NS_PER_US,
+            total.ipi_sent, total.ipi_taken, total.msi);
     }
     let (posted, notified) = guest.posted_stats();
     if posted != 0 {

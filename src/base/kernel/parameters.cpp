@@ -37,6 +37,7 @@ Parameters::Parameters()
     , its_enabled_(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , hw_rng_off_(false)
     , hwp_off_(false)
+    , idle_mwait_(false)
     , ucode_off_(false)
     , wx_probe_md_(WxProbeOff)
     , usb_off_(false)
@@ -100,6 +101,11 @@ bool Parameters::is_hw_rng_off()
 bool Parameters::is_hwp_off()
 {
     return hwp_off_;
+}
+
+bool Parameters::is_idle_mwait()
+{
+    return idle_mwait_;
 }
 
 bool Parameters::is_ucode_off()
@@ -431,6 +437,10 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "hwp") == 0)
     {
         hwp_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "idle") == 0)
+    {
+        idle_mwait_ = (stdlib::str_cmp(value, "mwait") == 0);
     }
     else if (stdlib::str_cmp(key, "ucode") == 0)
     {
