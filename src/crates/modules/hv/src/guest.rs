@@ -790,6 +790,13 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
                                slept to short of them and spun; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.timer_late_ns / total.timer.max(1) / NS_PER_US, total.timer_late_max / NS_PER_US,
             total.timer_raced, total.advanced, total.ipi_sent, total.ipi_taken, total.msi);
+        let _ = writeln!(out, "  late       {} timer interrupts more than 1 ms past their edges: {} after a sleep, {} with \
+                               the loop round more than 1 ms after an exit, {} after an interrupt of the host's took the \
+                               guest out, {} after an exit of its own, {} otherwise; {} sleeps ended more than 1 ms past \
+                               their time, {} us at most",
+            total.late_slept + total.late_off_cpu + total.late_host + total.late_exit + total.late_other,
+            total.late_slept, total.late_off_cpu, total.late_host, total.late_exit, total.late_other, total.overslept,
+            total.overslept_max / NS_PER_US);
     }
     let (posted, notified) = guest.posted_stats();
     if posted != 0 {
