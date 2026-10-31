@@ -32,6 +32,9 @@ pub(super) struct Io {
     /// A file's data on its way to or from the device, a block a page.
     batch: DmaBuffer,
     pieces: Vec<Piece>,
+    /// Whether the device's own write of zeros is used: until the first
+    /// one that left anything but zeros where it was asked for them.
+    device_zeroes: bool,
 }
 
 /// `BATCH_PAGES`, or the largest run of pages that can be had short of it,
@@ -58,7 +61,8 @@ impl Io {
         let batch = batch_buffer()?;
         let mut pieces = Vec::new();
         pieces.try_reserve_exact(batch.pages()).ok()?;
-        Some(Io { dev, bs: 0, sector_size, blocks: 0, writable: false, scratch: DmaBuffer::new(1)?, batch, pieces })
+        Some(Io { dev, bs: 0, sector_size, blocks: 0, writable: false, scratch: DmaBuffer::new(1)?, batch, pieces,
+                  device_zeroes: true })
     }
 
     fn sector(&self, block: u64) -> u64 {
@@ -188,6 +192,63 @@ impl Io {
             return false;
         }
         true
+    }
+
+    /// Blocks `start..start + n` made zeros on the device -- in its cache
+    /// when this returns, as `write_batch` leaves what it writes: by the
+    /// device's own command for it where it has one, its first and last
+    /// block read back to be sure -- a device whose command leaves anything
+    /// else there is written zeros from then on -- and otherwise the batch's
+    /// pages, zeros, written over them a batch at a time. False on a
+    /// failure, by when some may be zeros and some not.
+    pub fn zero_blocks(&mut self, start: u64, n: u64) -> bool {
+        if !self.writable {
+            trace!(0, "ext4: zeros over {} blocks of a filesystem not mounted for writing, or whose journal is \
+                       aborted: refused", n);
+            return false;
+        }
+        let Some(end) = start.checked_add(n).filter(|&end| end <= self.blocks) else {
+            trace!(0, "ext4: zeros over blocks {}..+{}, past the filesystem's {}", start, n, self.blocks);
+            return false;
+        };
+        if n == 0 {
+            return true;
+        }
+        let per = (self.bs / self.sector_size) as u64;
+        if self.device_zeroes && self.dev.write_zeroes(self.sector(start), n * per) {
+            if self.reads_zeros(start) && self.reads_zeros(end - 1) {
+                return true;
+            }
+            trace!(0, "ext4: the device's write of zeros over blocks {}..{} left other bytes there: zeros are \
+                       written from here on", start, end);
+            self.device_zeroes = false;
+        }
+        let pages = self.batch.pages();
+        for k in 0..pages {
+            self.slot_mut(k).fill(0);
+        }
+        let mut blocks: Vec<(usize, u64)> = Vec::new();
+        if blocks.try_reserve_exact(pages).is_err() {
+            return false;
+        }
+        let mut at = start;
+        while at < end {
+            let m = (end - at).min(pages as u64) as usize;
+            blocks.clear();
+            blocks.extend((0..m).map(|k| (k, at + k as u64)));
+            if !self.write_batch(&blocks) {
+                return false;
+            }
+            at += m as u64;
+        }
+        true
+    }
+
+    /// Whether block `b` reads back as zeros.
+    fn reads_zeros(&mut self, b: u64) -> bool {
+        let sector = self.sector(b);
+        let buf = &mut self.scratch.as_mut_slice()[..self.bs];
+        self.dev.read(sector, buf).is_ok() && buf.iter().all(|&x| x == 0)
     }
 
     /// Each `(k, block)` of `blocks`: `block` read into the batch's `k`th

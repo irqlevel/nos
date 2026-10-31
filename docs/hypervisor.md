@@ -1679,7 +1679,11 @@ on the AX41 a guest writing back what `apt-get update` had fetched stalled
 for seconds at a time ([On real hardware](#on-real-hardware)). Now the notify
 only takes the requests off the ring -- a write's data copied out of guest
 memory into a buffer of the device's -- and hands them to the backend, which
-serves them in order on a task of its own, on a CPU other than the vCPU's.
+serves them in order on a task of its own, on a CPU other than the vCPU's:
+every request waiting at once as one lot -- a run of reads one vector to
+the image and a run of writes another, their blocks with the device
+together, and a flush, a discard or a write of zeros on its own between
+them (`modules/hv/src/disk.rs`).
 Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
 an interrupt; and as it finishes each the task wakes a halted vCPU or kicks
@@ -1697,17 +1701,17 @@ request and gives it back served): the module's `FileDisk` holds the image
 else may write the file, cut it, grow it, rename it or remove it while the
 disk has it, nor its filesystem be unmounted -- [A disk's
 image](filesystems.md#a-disks-image)), reads and writes it where the guest
-asks -- within the file's size, never growing it -- off the VFS's lock,
-the image mapping the blocks under it and moving them itself, and for a
-guest's flush, offered and taken by ext4, flushes the device: the
-filesystem's sync only after a write into a hole, which goes through the
-VFS. Which file it is comes first, so that a second guest's disk on it is
+asks -- within the file's size, never growing it -- with no lock of the
+VFS's taken, through the file's map the image holds, a write into a hole
+first growing the file by the 16 MiB chunk around it, and for a guest's
+flush, offered and taken by ext4, flushes the device: the filesystem's sync
+only after a write the filesystem had to take itself. Which file it is comes first, so that a second guest's disk on it is
 refused saying whose it is (`Claims`), and only then is it held. The
 report counts each disk's reads, writes, flushes and errors, and the image
 says as it is let go of how many of its batches went off the lock and how
 many through it.
 
-**What a guest no longer needs it gives back.** The disk offers discard
+**What a guest no longer needs it gives back -- a chunk at a time.** The disk offers discard
 and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the
 guest may only read offers neither): a guest's `fstrim`, ext4 mounted
 with `discard`, `blkdiscard`, `mkfs` of its own disk -- ranges of sectors,
@@ -1716,10 +1720,11 @@ copies the ranges out of the guest's memory once, checks them in its own
 copy -- whole sectors inside the disk, no flag but a write of zeros'
 unmap -- and hands the backend that copy (`Request::ranges`): a guest that
 changes them after the check changes nothing it was checked on. The image
-gives the whole blocks of a discard back to nos's root (`Image::discard`,
-`Vfs::punch`, ext2's `punch`): holes in its file from then on, reading as
-zeros, its size as it was -- so an image no longer only grows. A write of
-zeros with unmap gives back the blocks it covers whole and writes zeros
+gives the whole chunks of a discard back to nos's root (`Image::discard`,
+`Vfs::punch`, ext4's and ext2's `punch`): holes in its file from then on,
+reading as zeros, its size as it was -- so an image no longer only grows;
+what a discard covers of a chunk only in part is left the guest's. A write
+of zeros with unmap gives back the chunks it covers whole and writes zeros
 over the rest; without, it writes zeros, its blocks kept. ext2 gives the
 blocks back in batches in truncate's order -- each batch's pointers
 cleared and on the disk, the inode committed, and only then the blocks
@@ -4866,16 +4871,23 @@ someone else's; then speed.
    off its own image: 1.30 and 1.35 s each where it was 1.86 and 1.69,
    reads of 64 KiB 0.74 where they were 1.02, writes of 4 KiB 1.55 and 1.61
    where they were 1.84 and 1.69; one guest alone the same, within the
-   spread. Left: each disk serves its requests one at a time, on its one
-   task. Four tasks a disk -- the image's reads side by side in lanes of
-   their own, its writes one at a time -- were tried and measured, and left
+   spread. Then (2026-10-31, [`plans/vm-performance.md`](../plans/vm-performance.md),
+   after a comparison with QEMU/KVM on the EX44 found a guest's first
+   write into its disk at 1% of KVM's speed and its queued reads at 8%):
+   the image holds the file's map and takes no lock of the VFS's at all; a
+   write into a hole grows the file by the 16 MiB chunk around it, zeroed
+   by the device, a commit a chunk rather than one a batch; the NVMe
+   driver's commands are as big as MDTS lets them be, a batch's contiguous
+   blocks one command named by a PRP list, where every 4 KiB block was a
+   command of its own waited for alone; and a disk's task serves every
+   request waiting at once as one batch, where it served them one at a
+   time. Four tasks a disk -- the image's reads side by side in lanes of
+   their own, its writes one at a time -- were tried before that and left
    out: slower wherever they differed, two guests' four writers of 64 KiB
    8.5 s each where they were 1.2, since four lanes' batches of up to 16
-   pieces take every one of the NVMe driver's 64 command IDs and the one
-   left waiting sleeps 50 microseconds at a time, and each extra task's
-   wakeup is an IPI that nested under KVM is an exit. A disk with many
-   requests in flight wants the block layer's asynchronous path from one
-   task (`Disk::submit`), its command IDs budgeted, not more tasks.
+   pieces took every one of the NVMe driver's 64 command IDs and the one
+   left waiting slept 50 microseconds at a time, and each extra task's
+   wakeup is an IPI that nested under KVM is an exit.
 3. **Fewer exits a request.** EVENT_IDX done ([A disk](#a-disk)): the
    receive ring's refills no longer notify, and a disk with every buffer
    out takes no notify it cannot act on. Left: NO_NOTIFY, the flag's way of

@@ -183,6 +183,45 @@ impl Image {
         if rc == 0 { Ok(()) } else { Err(Error::IoError) }
     }
 
+    /// Fills each buffer of `ios` from its offset, all of them inside the
+    /// image -- the blocks of as many as one batch holds read together, so
+    /// that the requests a guest's disk has out at once are with the device
+    /// at once.
+    pub fn read_vec(&self, ios: &mut [(u64, &mut [u8])]) -> Result<()> {
+        for group in ios.chunks_mut(fs::IMAGE_VEC_MAX) {
+            let mut raw = [fs::ImageIo { offset: 0, buf: core::ptr::null_mut(), len: 0 }; fs::IMAGE_VEC_MAX];
+            for (r, (offset, buf)) in raw.iter_mut().zip(group.iter_mut()) {
+                *r = fs::ImageIo { offset: *offset, buf: buf.as_mut_ptr(), len: buf.len() };
+            }
+            /* Each buffer is writable for its length and none overlaps
+             * another -- they are distinct `&mut`s -- and the handle is looked
+             * up. */
+            let rc = unsafe { fs::kernel_image_read_vec(self.handle, raw.as_ptr(), group.len()) };
+            if rc != 0 {
+                return Err(Error::IoError);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes each of `ios` at its offset, all of them inside the image, as
+    /// `read_vec` reads them. Not synced: `sync` is.
+    pub fn write_vec(&self, ios: &[(u64, &[u8])]) -> Result<()> {
+        for group in ios.chunks(fs::IMAGE_VEC_MAX) {
+            let mut raw = [fs::ImageIo { offset: 0, buf: core::ptr::null_mut(), len: 0 }; fs::IMAGE_VEC_MAX];
+            for (r, (offset, data)) in raw.iter_mut().zip(group.iter()) {
+                *r = fs::ImageIo { offset: *offset, buf: data.as_ptr().cast_mut(), len: data.len() };
+            }
+            /* Each part is readable for its length -- the call only reads
+             * them -- and the handle is looked up. */
+            let rc = unsafe { fs::kernel_image_write_vec(self.handle, raw.as_ptr(), group.len()) };
+            if rc != 0 {
+                return Err(Error::IoError);
+            }
+        }
+        Ok(())
+    }
+
     /// Where the image has data from `offset` on, as `(start, end)`: holes
     /// from `offset` to `start`, and what its filesystem keeps on the device
     /// from `start` to `end`, where the next hole begins -- at most a few
