@@ -26,6 +26,10 @@
     --code-bg: #f4f2ec;
     --ok: #15803d;
     --info: #1d4ed8;
+    /* A chart's marks (src/lib/chart.ts): what it shows now, what it showed before, the line between */
+    --chart-after: #a14a06;
+    --chart-before: #8f8d86;
+    --chart-link: #c4c0b4;
     color-scheme: light;
 }
 
@@ -44,6 +48,9 @@
     --code-bg: #111318;
     --ok: #4ade80;
     --info: #7cb3ff;
+    --chart-after: #c97f1c;
+    --chart-before: #6f737b;
+    --chart-link: #41454e;
     color-scheme: dark;
 }
 
@@ -63,6 +70,9 @@
         --code-bg: #111318;
         --ok: #4ade80;
         --info: #7cb3ff;
+        --chart-after: #c97f1c;
+        --chart-before: #6f737b;
+        --chart-link: #41454e;
         color-scheme: dark;
     }
 }
@@ -300,10 +310,265 @@ body {
     vertical-align: top;
 }
 
+/* A column Markdown aligns (---: for figures) comes with an align attribute, which the typography plugin's text-align: start would override. */
+.prose-nos :where(td, th)[align="right"] {
+    text-align: right;
+}
+
+.prose-nos :where(td, th)[align="center"] {
+    text-align: center;
+}
+
 .prose-nos :where(img) {
     border-radius: 8px;
     /* A screenshot's own background is the page's: its edge would not show */
     border: 1px solid var(--line);
+}
+
+/*
+ * A ```chart block, as src/lib/chart.ts renders it: rows of a label and a
+ * plot, on one grid so every plot starts where the longest label ends. The
+ * gridlines and the reference line are one layer under all the rows; a dot
+ * and a value carry a ring and a patch of the surface they sit on, so a line
+ * passing under them does not cut through. Narrower than 30rem, each label
+ * goes above its plot.
+ */
+.chart {
+    --chart-surface: var(--bg);
+    --chart-row: 1.625rem;
+    /* Room past the plot's end for the value of a row near it */
+    --chart-end: 2.75rem;
+    container-type: inline-size;
+    margin: 2rem 0;
+    color: var(--fg-soft);
+    font-size: 0.8125rem;
+    line-height: 1.35;
+}
+
+.chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1.25rem;
+    margin-bottom: 0.5rem;
+}
+
+.chart-key {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+.chart-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+}
+
+.chart-swatch-ref {
+    width: 2px;
+    height: 14px;
+    border-radius: 1px;
+    background: var(--muted);
+}
+
+.chart-plot {
+    position: relative;
+    isolation: isolate;
+    display: grid;
+    grid-template-columns: fit-content(45%) minmax(0, 1fr);
+}
+
+.chart-row {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-template-columns: fit-content(45%) minmax(0, 1fr);
+    grid-template-columns: subgrid;
+    border-radius: 4px;
+}
+
+.chart-row:not(.chart-axis):hover {
+    --chart-surface: var(--bg-soft);
+    background: var(--bg-soft);
+}
+
+.chart-row:hover .chart-label {
+    color: var(--fg);
+}
+
+.chart-label {
+    display: flex;
+    align-items: center;
+    min-height: var(--chart-row);
+    padding: 0.15rem 0.75rem 0.15rem 0.25rem;
+}
+
+.chart-cell {
+    position: relative;
+    z-index: 1;
+    min-height: var(--chart-row);
+}
+
+.chart-area {
+    position: absolute;
+    inset: 0 var(--chart-end) 0 0;
+}
+
+.chart-scale {
+    position: absolute;
+    grid-column: 2;
+    top: var(--chart-row);
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 0;
+}
+
+.chart-grid,
+.chart-ref {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--line);
+    transform: translateX(-50%);
+}
+
+.chart-ref {
+    width: 2px;
+    background: var(--muted);
+}
+
+.chart-tick {
+    position: absolute;
+    bottom: 0.3rem;
+    transform: translateX(-50%);
+    color: var(--muted);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.chart-link {
+    position: absolute;
+    top: 50%;
+    height: 2px;
+    margin-top: -1px;
+    background: var(--chart-link);
+}
+
+.chart-dot {
+    position: absolute;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 0 2px var(--chart-surface);
+}
+
+.chart-before {
+    background: var(--chart-before);
+}
+
+.chart-after {
+    background: var(--chart-after);
+}
+
+.chart-value {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-left: 0.5rem;
+    padding: 0 0.2rem;
+    border-radius: 3px;
+    background: var(--chart-surface);
+    color: var(--fg-soft);
+    font-size: 0.75rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.25;
+    white-space: nowrap;
+}
+
+.chart-gap {
+    grid-column: 1 / -1;
+    height: 0.625rem;
+}
+
+.chart-group {
+    position: relative;
+    z-index: 1;
+    grid-column: 1 / -1;
+    padding: 0.5rem 0.25rem 0.15rem;
+    background: var(--chart-surface);
+    color: var(--fg);
+    font-weight: 600;
+}
+
+.chart-caption {
+    margin-top: 0.75rem;
+    color: var(--muted);
+    font-size: 0.875rem;
+    line-height: 1.55;
+}
+
+@container (max-width: 30rem) {
+    .chart-plot,
+    .chart-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .chart-scale {
+        grid-column: 1;
+    }
+
+    /* Nothing to the left of the plot now: room for the first tick's label and a dot at zero. */
+    .chart-area {
+        left: 0.75rem;
+    }
+
+    /* The label has a line of its own now: it hides the gridlines behind it. */
+    .chart-label {
+        position: relative;
+        z-index: 1;
+        min-height: 0;
+        padding: 0.4rem 0.25rem 0;
+        background: var(--chart-surface);
+    }
+
+    .chart-axis .chart-label {
+        display: none;
+    }
+}
+
+/* Windows' contrast themes replace every background: keep the marks visible in theirs. */
+@media (forced-colors: active) {
+    .chart-dot,
+    .chart-swatch,
+    .chart-link,
+    .chart-grid,
+    .chart-ref {
+        forced-color-adjust: none;
+    }
+
+    .chart-after {
+        background: Highlight;
+    }
+
+    .chart-before,
+    .chart-link,
+    .chart-grid {
+        background: GrayText;
+    }
+
+    .chart-ref,
+    .chart-swatch-ref {
+        background: CanvasText;
+    }
+
+    .chart-dot {
+        box-shadow: 0 0 0 2px Canvas;
+    }
 }
 
 /* Shiki emits both themes' colours as variables; the theme picks one. */
