@@ -17,27 +17,70 @@ Inside the guest, a script runs at boot: sysbench (CPU and memory), 7-Zip, opens
 
 ## The numbers
 
-nos as a percentage of KVM (over 100% means nos was faster), before the work (master at bced1539) and after it (ddcbd4c6):
+The table has the results under KVM and under nos, before the work (master at bced1539) and after it (ddcbd4c6). In brackets is nos as a percentage of KVM, always counted so that over 100% means nos was faster; for times, that is KVM's time divided by nos's.
 
 | | KVM | before | after |
 |---|---:|---:|---:|
-| sysbench CPU, 1 / 4 threads | 1589 / 3259 | 94% / 95% | 96% / 98% |
-| 7-Zip, 4 threads | 21,530 MIPS | 95% | 96% |
-| random memory reads, 1 thread | 949 MiB/s | 84% | 85% |
-| perf pipe, one round trip | 6.0 µs | 14.3 µs (42%) | 9.6 µs (63%) |
-| cyclictest, average | 31 µs | 76 µs (41%) | 65 µs (48%) |
-| fio: first write to a new file, 1M QD8 | 4643 MiB/s | 28 MiB/s (1%) | 1954 MiB/s (42%) |
-| fio: 4k random reads, QD1 / QD32 | 20.1k / 195k IOPS | 59% / 8% | 91% / 76% |
-| fio: 4k random writes, QD1 / QD32 | 39.9k / 178k IOPS | 42% / 15% | 81% / 72% |
-| fio: 1M reads / writes, QD8 | 1456 / 3694 MiB/s | 12% / 5% | 93% / 63% |
-| fio: 4k writes with fdatasync | 620 IOPS | 115% | 112% |
-| kernel build, `make -j4` | 318 s | -- | 331 s (96%) |
-| pgbench init | 6.5 s | -- | 10.0 s (65%) |
-| pgbench read-only, 1 / 4 clients | 61.6k / 272k tps | -- | 80% / 101% |
-| pgbench TPC-B, 1 / 16 clients | 411 / 4655 tps | -- | 154% / 103% |
-| guest boot | 5.24 s | 7.20 s | 4.57 s |
+| sysbench CPU, 1 thread | 1589 events/s | 1489 (94%) | 1528 (96%) |
+| sysbench CPU, 4 threads | 3259 events/s | 3112 (95%) | 3188 (98%) |
+| 7-Zip, 4 threads | 21,530 MIPS | 20,545 (95%) | 20,632 (96%) |
+| random memory reads, 1 thread | 949 MiB/s | 793 (84%) | 803 (85%) |
+| perf pipe, one round trip | 6.0 µs | 14.3 (42%) | 9.6 (63%) |
+| cyclictest, average | 31 µs | 76 (41%) | 65 (48%) |
+| fio: first write to a new file, 1M QD8 | 4643 MiB/s | 28 (1%) | 1954 (42%) |
+| fio: 4k random reads, QD1 | 20.1k IOPS | 11.9k (59%) | 18.3k (91%) |
+| fio: 4k random reads, QD32 | 195k IOPS | 15.5k (8%) | 149k (76%) |
+| fio: 4k random writes, QD1 | 39.9k IOPS | 16.9k (42%) | 32.2k (81%) |
+| fio: 4k random writes, QD32 | 178k IOPS | 26.9k (15%) | 128k (72%) |
+| fio: 1M reads, QD8 | 1456 MiB/s | 169 (12%) | 1357 (93%) |
+| fio: 1M writes, QD8 | 3694 MiB/s | 173 (5%) | 2314 (63%) |
+| fio: 4k writes with fdatasync | 620 IOPS | 711 (115%) | 695 (112%) |
+| kernel build, `make -j4` | 318 s | -- | 331 (96%) |
+| pgbench init | 6.5 s | -- | 10.0 (65%) |
+| pgbench read-only, 1 client | 61.6k tps | -- | 49.0k (80%) |
+| pgbench read-only, 4 clients | 272k tps | -- | 274k (101%) |
+| pgbench TPC-B, 1 client | 411 tps | -- | 635 (154%) |
+| pgbench TPC-B, 16 clients | 4655 tps | -- | 4777 (103%) |
+| guest boot | 5.24 s | 7.20 (73%) | 4.57 (115%) |
 
 We stopped the first run before the kernel build. With the disk at 1% of KVM there was no point in waiting for the rest.
+
+```chart
+type: before-after
+unit: "%"
+max: 160
+step: 25
+reference: { value: 100, label: "KVM = 100%" }
+series: { before: before, after: after }
+caption: "nos as a percentage of KVM, from the table above. Over 100% means nos was faster; a row with one dot has no measurement from before the work."
+groups:
+  - rows:
+      - { label: "sysbench CPU, 1 thread", before: 94, after: 96 }
+      - { label: "sysbench CPU, 4 threads", before: 95, after: 98 }
+      - { label: "7-Zip, 4 threads", before: 95, after: 96 }
+      - { label: "random memory reads, 1 thread", before: 84, after: 85 }
+  - rows:
+      - { label: "perf pipe, one round trip", before: 42, after: 63 }
+      - { label: "cyclictest, average", before: 41, after: 48 }
+  - rows:
+      - { label: "fio: first write to a new file, 1M QD8", before: 1, after: 42 }
+      - { label: "fio: 4k random reads, QD1", before: 59, after: 91 }
+      - { label: "fio: 4k random reads, QD32", before: 8, after: 76 }
+      - { label: "fio: 4k random writes, QD1", before: 42, after: 81 }
+      - { label: "fio: 4k random writes, QD32", before: 15, after: 72 }
+      - { label: "fio: 1M reads, QD8", before: 12, after: 93 }
+      - { label: "fio: 1M writes, QD8", before: 5, after: 63 }
+      - { label: "fio: 4k writes with fdatasync", before: 115, after: 112 }
+  - rows:
+      - { label: "kernel build, make -j4", after: 96 }
+      - { label: "pgbench init", after: 65 }
+      - { label: "pgbench read-only, 1 client", after: 80 }
+      - { label: "pgbench read-only, 4 clients", after: 101 }
+      - { label: "pgbench TPC-B, 1 client", after: 154 }
+      - { label: "pgbench TPC-B, 16 clients", after: 103 }
+  - rows:
+      - { label: "guest boot", before: 73, after: 115 }
+```
 
 ## The disk
 
