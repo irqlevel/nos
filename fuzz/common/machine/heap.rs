@@ -24,7 +24,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 
 use super::sched;
 
@@ -75,6 +75,14 @@ pub fn hold_to_ceiling() {
 }
 /// A refusal has been said, its backtrace with it: once is enough.
 static SAID: AtomicBool = AtomicBool::new(false);
+/// Allocations of the kernel's code the ceiling refused: what a target
+/// tells a refusal for want of memory apart from one for no reason by.
+static REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// How many allocations of the kernel's code the ceiling has refused.
+pub fn refusals() -> u64 {
+    REFUSALS.load(Ordering::Relaxed)
+}
 
 thread_local! {
     /// Inside the saying of a refusal: what its backtrace allocates is let be.
@@ -109,6 +117,7 @@ fn kernel_gives(size: usize, align: usize) -> bool {
         || PANICKING.load(Ordering::Relaxed) || LIFTED.load(Ordering::Relaxed) || SAYING.with(|s| s.get()) {
         return true;
     }
+    REFUSALS.fetch_add(1, Ordering::Relaxed);
     SAYING.with(|s| s.set(true));
     let _ = writeln!(std::io::stderr(), "fuzz heap: task {} asks for {} bytes at once, past the {} KiB the kernel's \
                                          heap gives: refused, as kernel_alloc refuses it", sched::me(), size,

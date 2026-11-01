@@ -1,0 +1,32 @@
+hv: vm 1 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff87a03fb7
+  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff87a03fb7, after 2597377 ms
+  exits      124725975 total: 363170 port in, 14301336 port out, 1860820 cpuid, 344 rdmsr, 53136853 wrmsr (11 #GP), 4157 irq, 47374659 hlt, 22030 pause, 6628889 host
+  kicked     1033926 entries turned back for a frame, a disk's answer or an IPI that came on the way in, or an edge of its timers -- 50823 of them
+  answered   0 #UD for instructions CPUID did not offer, 13 WBINVD stepped past, 0 CR8 from the shadow TPR, 8 CR0 writes (VT-x), 0 #DB and #AC given back
+  cr4        20 reads and writes performed (AMD-V), 0 writes refused with #GP
+  dr0-3      24 reads and writes of its own (AMD-V), 0 not made: a #GP or a #DB in their place
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  halted     slept 4592734 ms in 10243843 sleeps, 44% of the run (of each CPU's, on average); 46812713 halts spun for a ring first, 42465688 of them woken in the spin
+  loop       617 ns an exit handled and 321 ns to the next entry, on average; 454 ns a write of an MSR's handling; 52908477 entries made without the loop's round
+  irq        4157 from the 8259 (0 timer, 4157 serial), 0 edges, 3885 blocked; PIC irr 0x00 isr 0x00 imr 0xff; PIT ch0 mode 0 reload 0 run true
+  apic       0 interrupts from the local APICs, 7904792 of their timers -- late past their edges by 7 us on average, 3026 us at most, 36129 come on the way in and taken a round later, 1891540 slept to short of them and spun; 39569844 IPIs sent, 44836858 taken; 6903361 MSIs
+  late       12578 timer interrupts more than 1 ms past their edges: 12255 after a sleep that had the edge and woke more than 1 ms past its time (11896 of them rung), 1 after one that woke on time, 0 after a sleep without that edge, 20 after a spin or a sleep for good, 19 with the loop round more than 1 ms after an exit, 228 after an interrupt of the host's took the guest out, 51 after an exit of its own, 4 otherwise; 12285 sleeps ended more than 1 ms past their time (11902 by a ring after it), 3036 us at most
+  worst      3026 us past its edge, after a sleep that had the edge and woke late
+  posted     46478099 interrupts posted for a CPU to take in its guest, 2007678 with a notification sent to the CPU it ran on
+  apicv      71817164 entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); 0 EOIs it stopped the guest after, of level-triggered vectors
+  cpus       4, 3 started by the guest (3 INITs, 3 start-up IPIs taken)
+  cpu 0      29236511 exits, 0 apic irq, 8127807 ipi sent, 10149754 hlt, 2772 timer interrupts more than 1 ms late, slept 40% -- running, on host cpu 41
+  cpu 1      34410400 exits, 0 apic irq, 9934115 ipi sent, 11074657 hlt, 2772 timer interrupts more than 1 ms late, slept 46% -- halted with interrupts off, on host cpu 40
+  cpu 2      25839214 exits, 0 apic irq, 9303911 ipi sent, 10435689 hlt, 2466 timer interrupts more than 1 ms late, slept 47% -- halted with interrupts off, on host cpu 33
+  cpu 3      35239850 exits, 0 apic irq, 12204011 ipi sent, 15714559 hlt, 4568 timer interrupts more than 1 ms late, slept 42% -- halted with interrupts off, on host cpu 32
+  acpi       taken by the guest's OS; 0 SCIs, the power button pressed 0 times
+  vda        8192 MiB: 11982026 reads (96377353 KiB), 7701571 writes (146572770 KiB), 508544 flushes, 0 errors; 3842 discards (40766972 KiB), 0 writes of zeros (0 KiB); 14154592 notifies, 6903298 interrupts
+  eth0       38 frames sent, 32 received, 0 dropped; 0 sends of TCP up to 64 KiB, 0 received whole; notifies 38 to send, 4 to receive; interrupts 38 for sends, 25 for receives; 4 of 4 queue pairs in use, 1 commands (0 refused)
+  busiest in ports 0x21:4157 0x71:111 0x2e9:3 0x2f9:3 0x3e9:3 0x20:1

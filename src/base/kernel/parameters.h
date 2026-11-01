@@ -71,6 +71,12 @@ public:
        than turning on hardware P-states (hal::setup_cpu_performance) */
     bool is_hwp_off();
 
+    /* x86: an idle CPU sleeps by MWAIT, deep once its idles have been long
+       (hal::setup_idle, Cpu::idle_mwait): what lets a busy core run at the
+       turbo of few busy cores. The default, where the CPU offers it;
+       idle=halt for HLT alone, idle=mwait to say it. */
+    bool is_idle_mwait();
+
     /* ucode=off -- x86: load no microcode from the module GRUB put beside
        the kernel; the CPUs run firmware's (arch/x86_64/microcode.h) */
     bool is_ucode_off();
@@ -195,6 +201,7 @@ private:
     bool its_enabled_;
     bool hw_rng_off_;
     bool hwp_off_;
+    bool idle_mwait_;
     bool ucode_off_;
     WxProbeMode wx_probe_md_;
     bool usb_off_;

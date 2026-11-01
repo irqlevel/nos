@@ -546,13 +546,18 @@ fn write_file(run: &mut Run, r: &mut Input) -> Leave {
     data(run, &path, true, false)
 }
 
+/// The most bytes a write of an image filled from one end writes at once:
+/// a chunk, where the image's is no bigger.
+const FILL_WRITE_MAX: u64 = 256 << 10;
+
 fn image(run: &mut Run, r: &mut Input) -> Leave {
     let held = run.f.images.len();
     if held == 0 || r.u8() % 4 == 0 {
         if held < 4 {
             let p = fsops::path(r, &run.f.model);
             let write = !r.chance(4);
-            run.f.image_open(&p, write);
+            let chunk = fsops::chunk(r);
+            run.f.image_open(&p, write, chunk);
             /* Another name of what is held, opened for writing: the hold is
              * the file's, by whatever name. */
             if let (Res::Node(n), true) = (run.f.model.resolve(&p), r.bool()) {
@@ -567,10 +572,35 @@ fn image(run: &mut Run, r: &mut Input) -> Leave {
     let Some((path, _)) = run.f.model.holds.get(i).cloned() else { return Leave::Either };
     let size = run.f.model.size(&path);
     let span = run.f.model.limits.span;
-    match r.u8() % 8 {
+    match r.u8() % 9 {
         0 => {
             run.f.image_close(i);
             Leave::Either
+        }
+        8 => {
+            /* A guest filling its disk from one end: writes one after
+             * another from `at`, a chunk or two each, synced at the end --
+             * each hole met where the image's last growth ended, so that
+             * the growth doubles, its runs of blocks are long and what it
+             * gives ahead is held to the room there is. */
+            let unit = run.f.images[i].discard_unit().clamp(run.block, FILL_WRITE_MAX);
+            let mut at = fsops::offset(r, size, run.block, span) / unit * unit;
+            for _ in 0..r.range(2, 24) {
+                if at >= size || i >= run.f.images.len() {
+                    break;
+                }
+                let n = (unit * r.range(1, 3)).min(size - at);
+                let data_in = crate::input::noise(r.u32(), n as usize);
+                run.f.image_write(i, at, &data_in);
+                into_unwritten(run, &path, at, n);
+                at += n;
+            }
+            reached("ext4rw: an image written from one end on");
+            if i < run.f.images.len() {
+                run.image_sync(i);
+            }
+            run.f.model.propagate(&path);
+            data(run, &path, false, false)
         }
         1 => {
             run.image_sync(i);
@@ -739,6 +769,7 @@ pub fn ext4rw(r: &mut Input) {
         image_syncs: Vec::new(),
     };
     run.f.punch_room = punch_room;
+    run.f.allocates = true;
     /* Pictures the mount's own writes left -- its orphans' release among
      * them: the tree as it was. */
     if !st.orphans.is_empty() {
@@ -749,8 +780,9 @@ pub fn ext4rw(r: &mut Input) {
         /* The preallocated file held as a disk's image: written into and
          * discarded from, its unwritten extents split on a full disk. */
         let filler = vec![img::FILLER.to_vec()];
-        run.call(r, |run, _| {
-            run.f.image_open(&join(&filler), true);
+        run.call(r, |run, r| {
+            let chunk = fsops::chunk(r);
+            run.f.image_open(&join(&filler), true, chunk);
             Leave::Either
         });
         let size = made.filled.unwrap_or(0);

@@ -1,0 +1,15 @@
+[Unit]
+Description=The KVM-vs-nos benchmark suite, once, when /opt/bench/AUTORUN exists
+ConditionPathExists=/opt/bench/AUTORUN
+After=multi-user.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+ExecStart=/opt/bench/run.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

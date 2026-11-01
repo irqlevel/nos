@@ -984,6 +984,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         if (hal::setup_cpu_performance(&perf))
             trace(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
                 perf.lowest, perf.highest, perf.guaranteed);
+        /* How an idle CPU sleeps, decided before the APs start: they idle
+           the same way. */
+        u32 idle_hint;
+        if (hal::setup_idle(&idle_hint))
+            trace(0, "cpu: idle by MWAIT, 0x%x -- the deepest C-state offered -- after %lu idles of %lu us or more "
+                "with the next timer as far off, C1 otherwise", idle_hint, Cpu::IDLE_LONG_RUN,
+                Cpu::IDLE_DEEP_NS / consts::NANO_SECS_IN_USEC);
         ulong t0 = (ulong)kernel_start, t1 = (ulong)kernel_text;
         ulong r1 = (ulong)kernel_rodata, e = (ulong)kernel_end;
         pt.protect_range(t0, t1 - t0, false, true);   /* RX */

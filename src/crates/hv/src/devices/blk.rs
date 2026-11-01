@@ -54,6 +54,14 @@ pub trait Backend: Send {
     fn read_only(&self) -> bool {
         false
     }
+    /// The sectors a discard is best aligned to and best of at least: what
+    /// the backend gives back whole, which the device tells the driver --
+    /// Linux then splits a discard on those boundaries, and leaves out free
+    /// runs shorter. `DISCARD_ALIGNMENT` unless the backend says otherwise;
+    /// never more than a discard's range takes.
+    fn discard_sectors(&self) -> u32 {
+        DISCARD_ALIGNMENT
+    }
     /// Serve `req`. The device never has more than `IN_FLIGHT` handed over
     /// and not yet taken back, and a backend takes that many.
     fn submit(&mut self, req: Request);
@@ -194,9 +202,9 @@ const MAX_RANGE_SECTORS: u32 = 1 << 17;
 const RANGE_BYTES: usize = 16;
 /// A write of zeros' range may have its blocks given back.
 const RANGE_UNMAP: u32 = 1;
-/// The sectors a discard is best aligned to: 4 KiB, the block an image on
-/// nos's filesystem gives back whole.
-const DISCARD_ALIGNMENT: u32 = 8;
+/// The sectors a discard is best aligned to unless the backend says
+/// otherwise (`Backend::discard_sectors`): 4 KiB, a block.
+pub const DISCARD_ALIGNMENT: u32 = 8;
 /// What a request may carry, which the driver is told: data segments of at
 /// most a page, and this many of them.
 const SIZE_MAX: u32 = 4096;
@@ -204,8 +212,11 @@ const SEG_MAX: u32 = 64;
 /// The most data one request has, and so the size of a buffer.
 pub const REQUEST_BYTES: usize = (SIZE_MAX * SEG_MAX) as usize;
 /// The most requests with the backend at once, and so how many buffers the
-/// device has.
-pub const IN_FLIGHT: usize = 8;
+/// device has: 8 MiB of them. 32, as much as a guest's random reads at QD32
+/// keep out -- at 8, its 4 KiB reads at QD32 were 8 at the device, each
+/// about 100 us, the 80k IOPS the EX44 measured where KVM did 195k -- and
+/// what the NVMe driver lets one batch have with the controller at once.
+pub const IN_FLIGHT: usize = 32;
 
 /// Request types, and statuses.
 const T_IN: u32 = 0;
@@ -371,7 +382,8 @@ impl Blk {
         let at = usize::from(CFG_SEG_MAX);
         c[at..at + 4].copy_from_slice(&SEG_MAX.to_le_bytes());
         for (at, value) in [(CFG_MAX_DISCARD_SECTORS, MAX_RANGE_SECTORS), (CFG_MAX_DISCARD_SEG, MAX_RANGES as u32),
-                            (CFG_DISCARD_ALIGNMENT, DISCARD_ALIGNMENT), (CFG_MAX_ZEROES_SECTORS, MAX_RANGE_SECTORS),
+                            (CFG_DISCARD_ALIGNMENT, self.backend.discard_sectors().clamp(1, MAX_RANGE_SECTORS)),
+                            (CFG_MAX_ZEROES_SECTORS, MAX_RANGE_SECTORS),
                             (CFG_MAX_ZEROES_SEG, MAX_RANGES as u32)] {
             let at = usize::from(at);
             c[at..at + 4].copy_from_slice(&value.to_le_bytes());

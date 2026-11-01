@@ -51,7 +51,7 @@ use kcore::dma::DmaBuffer;
 use kcore::time::wall_clock_secs;
 use kcore::trace;
 
-use crate::vfs::{FileSystem, Space};
+use crate::vfs::{FileSystem, MapRun, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 use cache::Cache;
@@ -149,6 +149,10 @@ impl Ext4 {
 
     fn map(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
         source::map(&mut self.reader()?, ino, raw, lblock)
+    }
+
+    fn map_extent(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<(Map, bool)> {
+        source::map_extent(&mut self.reader()?, ino, raw, lblock)
     }
 
     /// Metadata block `b`, as a read sees it.
@@ -887,6 +891,36 @@ impl Ext4 {
         }
         true
     }
+
+    /// `map_blocks` as runs: an extent's blocks one run -- an unwritten
+    /// extent's said so -- a hole another, each held to the blocks a file
+    /// may own as every map is (`source::map_extent`).
+    pub fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
+        if !self.overlay.is_empty() {
+            return false;
+        }
+        let Some(ino) = self.file_ino(file) else { return false };
+        let Some(raw) = self.inode(ino) else { return false };
+        let sectors = (self.io.bs / self.io.sector_size) as u64;
+        let Some(end) = first.checked_add(count) else { return false };
+        let mut l = first;
+        while l < end {
+            let (sector, run, unwritten) = match self.map_extent(ino, &raw, l) {
+                Some((Map::Blocks { block, run }, unwritten)) => (block * sectors, run, unwritten),
+                Some((Map::Hole { run }, _)) => (0, run, false),
+                None => return false,
+            };
+            /* A run is at least the block asked about, and no further than
+             * asked: a hole past the last extent reaches as far as a u64. */
+            let n = run.max(1).min(end - l);
+            if out.try_reserve(1).is_err() {
+                return false;
+            }
+            out.push(MapRun { sector, len: n, unwritten });
+            l += n;
+        }
+        true
+    }
 }
 
 impl FileSystem for Ext4 {
@@ -1008,8 +1042,24 @@ impl FileSystem for Ext4 {
         Ext4::map_blocks(self, file, first, out)
     }
 
+    fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
+        Ext4::map_runs(self, file, first, count, out)
+    }
+
     fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
         Ext4::punch(self, file, first, count)
+    }
+
+    fn allocate(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
+        Ext4::allocate(self, file, first, count)
+    }
+
+    fn allocates(&self) -> bool {
+        true
+    }
+
+    fn mark_written(&mut self, file: NodeId, runs: &[(u64, u64)]) -> bool {
+        Ext4::mark_written(self, file, runs)
     }
 
     fn links(&mut self, file: NodeId) -> Option<u32> {

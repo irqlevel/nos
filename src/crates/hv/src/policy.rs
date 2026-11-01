@@ -992,9 +992,14 @@ const MSR_MTRR_DEF_TYPE: u32 = 0x2FF;
 /// and panics.
 const MSR_MCG_CAP: u32 = 0x179;
 const MSR_MCG_STATUS: u32 = 0x17A;
-/// The microcode revision, Intel's BIOS_SIGN_ID and AMD's patch level: none,
-/// the host's being the host's to know. Intel's protocol writes 0 to it,
-/// then runs CPUID and reads it back, which Linux does on every Intel CPU.
+/// The microcode revision, Intel's BIOS_SIGN_ID and AMD's patch level: the
+/// host's on Intel, in the high half as the CPU has it -- what KVM tells a
+/// guest -- and none on AMD. Intel's protocol writes 0 to it, then runs
+/// CPUID and reads it back, which Linux does on every Intel CPU; and Linux
+/// keeps PCID on a Raptor Lake only where the revision it reads has the fix
+/// for its INVLPG erratum: told 0, the EX44's guest ran without it, a whole
+/// TLB flush at every switch of process ("Incomplete global flushes,
+/// disabling PCID").
 const MSR_UCODE_REV: u32 = 0x8B;
 /// Intel's platform ID, which a microcode loader reads first and with no
 /// fallback for a fault -- Linux 6.1 does even under a hypervisor, when its
@@ -1058,14 +1063,18 @@ const MSR_AMD_DE_CFG: u32 = 0xC001_1029;
 const DE_CFG_LFENCE_SERIALIZE: u64 = 1 << 1;
 
 /// What an MSR this policy names, but keeps nothing of, reads -- and the
-/// writes it takes: one that leaves it as it reads (`Fixed`), or none
-/// (`ReadOnly`), as the CPU's own read-only registers take none. A write
+/// writes it takes: one that leaves it as it reads (`Fixed`), that and the
+/// 0 a microcode revision is read by (`Revision`), or none (`ReadOnly`), as
+/// the CPU's own read-only registers take none. A write
 /// that would change one is refused, a #GP: there is nothing behind it to
 /// change, and a guest told its write went in would believe what is not so.
 #[derive(Clone, Copy)]
 enum Constant {
     ReadOnly(u64),
     Fixed(u64),
+    /// Reads this, and takes a write of 0 -- the microcode revision's
+    /// protocol -- and of what it reads.
+    Revision(u64),
 }
 
 /// Whose MSRs the guest's CPU has: the host's vendor's, whose name CPUID's
@@ -1091,7 +1100,8 @@ fn constant(msr: u32) -> Option<Constant> {
     let vendor = vendor();
     Some(match msr {
         MSR_MTRR_CAP | MSR_MCG_CAP => Constant::ReadOnly(0),
-        MSR_MTRR_DEF_TYPE | MSR_MCG_STATUS | MSR_UCODE_REV => Constant::Fixed(0),
+        MSR_MTRR_DEF_TYPE | MSR_MCG_STATUS => Constant::Fixed(0),
+        MSR_UCODE_REV => Constant::Revision(u64::from(cpu::microcode_revision()) << 32),
         MSR_PLATFORM_ID if vendor == Vendor::Intel => Constant::ReadOnly(0),
         /* Where the host's CPUID offers it, which is what offers it to the
          * guest too (`LEAF7_EDX_KEEP`), whoever made the CPU. */
@@ -1160,7 +1170,7 @@ pub fn rdmsr(save: &Save, own: &Own, msr: u32) -> Option<u64> {
         MSR_TSC_AUX if has_tsc_aux() => own.tsc_aux,
         MSR_SPEC_CTRL if spec::guest_controls().spec_ctrl != 0 => own.spec_ctrl,
         _ => match constant(msr)? {
-            Constant::ReadOnly(v) | Constant::Fixed(v) => v,
+            Constant::ReadOnly(v) | Constant::Fixed(v) | Constant::Revision(v) => v,
         },
     };
     Some(value)
@@ -1213,7 +1223,11 @@ pub fn wrmsr(save: &mut Save, own: &mut Own, msr: u32, value: u64) -> bool {
                 own.ibpbs = own.ibpbs.wrapping_add(1);
             }
         }
-        _ => return matches!(constant(msr), Some(Constant::Fixed(v)) if v == value),
+        _ => return match constant(msr) {
+            Some(Constant::Fixed(v)) => v == value,
+            Some(Constant::Revision(v)) => value == 0 || value == v,
+            _ => false,
+        },
     }
     true
 }

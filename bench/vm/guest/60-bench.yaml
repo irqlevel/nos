@@ -1,0 +1,10 @@
+# Any virtio NIC by DHCP, under either host: cloud-init's file named the MAC
+# of the machine it first booted on.
+network:
+  version: 2
+  ethernets:
+    nic:
+      match:
+        name: "en*"
+      dhcp4: true
+      optional: true

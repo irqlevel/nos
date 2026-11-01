@@ -1,0 +1,30 @@
+# The server's own values for the KVM-vs-nos comparison: copy this file to
+# out/vm-bench/bench.conf (or name another with BENCH_CONF) and fill it in.
+# Nothing in it is secret, but it is the server's: out/ is not committed.
+
+# An ssh config with two hosts at the server's one address: nos's sshd, while
+# nos runs, and the server's Linux, while that does -- each with the key it
+# lets in, and the Linux one with a known_hosts of its own (the two systems
+# answer with different host keys). BatchMode, and ServerAliveInterval: a run
+# of hours polls them both.
+SSH_CONFIG=$HOME/.ssh/nos-bench.config
+NOS_HOST=bench-nos
+LINUX_HOST=bench-linux
+
+# The partition nos's root filesystem is on, as the server's Linux names it
+# (blkid): both runs keep the guest's disk image there, so that the disk
+# under KVM and under nos is the same partition of the same NVMe.
+NOS_ROOT=/dev/disk/by-uuid/00000000-0000-0000-0000-000000000000
+
+# Where nos's hv puts a guest of four CPUs with nothing else running -- its
+# vCPUs 0-3 and its disks' task, as `hv list` shows them -- by APIC ID; KVM's
+# threads are pinned to the same CPUs. The lowest APIC ID of the slow cores,
+# where the rest of QEMU is kept; and a fast core for `hv bench profile`.
+# These are the Hetzner EX44's (an i5-13500).
+VCPU_APIC="41 40 33 32"
+IO_APIC=62
+E_CORE_APIC_FIRST=48
+PROFILE_CPU=16
+
+# A VM nos's /etc/rc starts that is stopped for the run (empty for none).
+PANEL_VM=panel

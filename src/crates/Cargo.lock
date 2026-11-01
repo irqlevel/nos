@@ -333,6 +333,7 @@ version = "0.1.0"
 dependencies = [
  "block",
  "extfmt",
+ "ffi",
  "kcore",
  "mgmt",
 ]

@@ -2616,6 +2616,13 @@ impl PostedInterrupts {
         Some(words)
     }
 
+    /// Whether a notification is outstanding (ON): something posted that
+    /// neither the CPU nor `take` has taken yet -- one that came as a host
+    /// interrupt after the guest left, which only `take` hands in.
+    pub fn outstanding(&self) -> bool {
+        self.control.load(Ordering::SeqCst) & PI_ON != 0
+    }
+
     /// Where the CPU finds it.
     fn phys(&self) -> u64 {
         kcore::dma::virt_to_phys(self as *const PostedInterrupts as *const u8)

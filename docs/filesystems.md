@@ -111,58 +111,135 @@ call on the held mount must not get in.
 ### A disk's image
 
 A guest's disk that is a file of nos's (`hv start ... disk=/vms/a/disk.img`)
-is read and written for as long as the guest runs, a request at a time,
-and through its mount's mutex it would wait behind every other guest's disk
-on that filesystem and behind nos's own files there. So it is opened as an
-image (`fs::image::Image`, `kcore::fs::Image` for a module): the file is
-**held** (`OPEN_HOLD`), and an image takes only what it must under the
-lock -- where the blocks of the
-range it is asked for are on the device (`Vfs::map`, the filesystem's
-`map_blocks`: ext2 walks the file's pointers, through its caches, and
-allocates nothing) -- and reads and writes those blocks itself with the lock
-let go, through a buffer of its own, in batches the driver has in flight
-together (`Disk::read_pieces`, `write_pieces`).
+is read and written for as long as the guest runs, and through its mount's
+mutex it would wait behind every other guest's disk on that filesystem and
+behind nos's own files there. So it is opened as an image
+(`fs::image::Image`, `kcore::fs::Image` for a module): the file is **held**
+(`OPEN_HOLD`), and the image takes the file's map from the filesystem once,
+as it opens -- runs of blocks one after another on the device, a hole one
+run however long (`Vfs::map_runs`, the filesystem's `map_runs`: ext4 walks
+its extents, each held to the blocks a file may own) -- and holds it
+(`image::Map`). Every read and write after that is resolved there, with no
+lock taken, and goes to the device straight, through a buffer of its own,
+in batches the driver has in flight together (`Disk::read_pieces`,
+`write_pieces`). A filesystem that gives no such map -- ext2, whose default
+`map_runs` refuses -- has its images ask `Vfs::map` (`map_blocks`) for every
+batch, under the lock, as they all once did.
 
 The hold is what makes that safe: while it lasts nothing else may write the
 file -- open it for writing, appending or truncating, cut it by its path,
 `write_file` it, grow it through a handle -- and, open, it cannot be
-renamed or removed, nor its filesystem unmounted; so the blocks a map named
-stay the file's, and nobody else writes them, until the image lets go. A
-file someone else has open for writing cannot be held, and one held for
-writing cannot be held again; any number may hold one to read while nobody
-writes it. Only its image lets go of it: the VFS handle under it is closed
-by the image's going, and refused to the file ABI's close, which a word
-guessed or kept too long could otherwise reach. What only the filesystem
-can do is left to it: a batch with a hole in it -- blocks to allocate and
-point at, in order -- is written through the VFS, and the next flush is then
-the filesystem's sync (its metadata, then the device); otherwise a flush is
-the device's alone. A part of a block -- a guest's sector in a block of 4
-KiB -- is read, changed and written back whole, which an image may do
-because its calls come one at a time and nobody else writes the file. A
-filesystem that keeps no blocks of its own on a device (`data_block_size`
-0: ramfs, and nanofs for now) has its images read and written through the
-VFS whole.
+renamed or removed, nor its filesystem unmounted; so the blocks the map
+names stay the file's, nobody else writes them, and nothing but the image
+changes the map, until the image lets go. A file someone else has open for
+writing cannot be held, and one held for writing cannot be held again; any
+number may hold one to read while nobody writes it. Only its image lets go
+of it: the VFS handle under it is closed by the image's going, and refused
+to the file ABI's close, which a word guessed or kept too long could
+otherwise reach. A part of a block -- a guest's sector in a block of 4 KiB
+-- is read, changed and written back whole, which an image may do because
+its calls come one at a time and nobody else writes the file. A filesystem
+that keeps no blocks of its own on a device (`data_block_size` 0: ramfs,
+and nanofs for now) has its images read and written through the VFS whole.
 
-A guest's discard gives whole blocks back (`Image::discard`, `Vfs::punch`):
+**A write into a hole grows the file a chunk at a time** (`CHUNK_BYTES`, 16
+MiB) -- or more: a hole that begins where the last growth ended is given
+twice the last one's chunks, up to `GROW_MAX_CHUNKS` (256 MiB), so that a
+guest filling its disk from one end costs a commit for every 256 MiB it
+writes rather than every 16 -- and no more than 256 MiB, nor an eighth of
+the free blocks (`GROW_SHARE`), is given that it may never write; where
+what is ahead is refused all the same, what the write needs is asked for
+alone. The filesystem gives the chunks every block they lack, as
+unwritten extents (`Vfs::allocate`, ext4's `allocate`, a run of free bits
+taken at a time -- `alloc_run` -- not a block) -- the file's, and read as
+zeros whatever their blocks held, so that no crash can show what a block
+held before it was the file's, and nothing written to them -- one
+transaction, and the guest's data then goes to the device as an overwrite,
+off the lock. Each growth is taken into the map again after it, its runs
+said unwritten. A block of one that the image has not written reads as
+zeros, and a write over part of one takes zeros for the rest; what the
+image writes over them it keeps (`Pending`), reads from the device from
+then on, and makes written at the next sync, and as it is let go of: a
+transaction (`Vfs::mark_written`, ext4's `mark_written`: the extents split
+around what was written, a run at a time) whose commit flushes the device
+before its commit block, as every commit does -- so the data is on the
+medium before the file says it is there, and the guest's flush needs no
+flush of the image's own (a conversion with nothing to change flushes the
+device itself). A guest that flushes as filesystems do keeps few such
+runs; one that keeps more than `PENDING_MAX` has them made written there
+and then, so the host's memory for them is bounded. A crash before the
+sync leaves the blocks unwritten: zeros, as a disk may give for writes it
+was not told to keep. A punch takes its blocks out of what is kept --
+given again as an unwritten extent and found there, a block would read
+whatever the device held.
+
+What a guest's first writes cost is the flushes. Before unwritten extents
+a chunk was its zeros written -- the EX44's Samsung has no Write Zeroes --
+and then a commit, whose flush pushed them out with the guest's last chunk
+of data: a guest filling a fresh disk wrote at 883 MiB/s where KVM's wrote
+4.6 GB/s (28 MiB/s before chunks, when ext4 committed every batch). The
+first try at unwritten extents committed the allocation and the
+conversion without the flush before the commit block, their logs written
+with FUA instead, the image flushing the device itself before a
+conversion -- and on that Samsung a FUA write costs what a flush does, six
+to eight of them a commit, so the same fill fell to 422 MiB/s. A commit is
+the log, a flush and the commit block again, whatever it orders.
+
+Where the filesystem gives no blocks ahead of a write (ext2:
+`FileSystem::allocates`, asked once as the image is held), or has none left
+to give, the batch goes through the VFS as every write once did -- a
+transaction of its own, what the image keeps made written first, since the
+VFS's write reads an unwritten block as zeros -- and the next flush is then
+the filesystem's sync (its metadata, then the device). A chunk ext4 refuses
+is said at the first and counted, and the image says how many as it is let
+go of: the write still lands, through the VFS, so nothing but the count
+shows it -- which is how a refusal of every chunk past the first hole of
+each went unseen, until a Linux guest's disk said so (an allocation's read
+of the extent leaf it had just changed, held to a checksum the change had
+not put on it yet; a transaction's dirty blocks now read with the checksum
+their commit will give them, `Source for Txn`). `fs-fuzz` holds ext4's
+images to having no chunk refused but for want of room, a failed request or
+the kernel heap's ceiling.
+
+**Reads and writes go a vector at a time** (`Image::read_vec`,
+`write_vec`): the requests a guest's disk has out at once are one batch,
+as many as its 2 MiB hold, so that they are with the device at once rather
+than one after another. A block two of them write -- two sectors of one
+block, each read and written back whole -- is never in one batch twice:
+the second waits for the next batch, and both land.
+
+A guest's discard gives whole chunks back (`Image::discard`, `Vfs::punch`):
 the filesystem's `punch` -- ext2's frees the data blocks of the range in
 truncate's batches, pointers cleared and on the disk and the inode
 committed before the bitmap frees them, and keeps the indirect blocks,
 which map what is past the range too -- leaves holes that read as zeros,
-the file's size as it was; what the range covers of a block only in part
-is left as it was. A write of zeros gives back the whole blocks it covers
+the file's size as it was. What the range covers of a chunk only in part is
+left as it is: its blocks stay the file's, holding the guest's own data,
+which a discard allows -- and a guest that discards as it frees, as ext4
+mounted with `discard` does, costs the filesystem a commit a chunk rather
+than one a range. A write of zeros gives back the whole chunks it covers
 with its unmap flag and writes zeros over the rest. That the next file may
 have a block the moment the punch is done is safe because an image's calls
 come one at a time: none of its reads is under way off the lock on a block
 it mapped before. A filesystem with no blocks of its own gives nothing
-back, and its discard does nothing.
+back, and its discard does nothing. A guest's disk tells the guest what a
+discard gives back whole (`Image::discard_unit`, the device's
+`discard_sector_alignment`): Linux then splits a long discard on a chunk's
+edge, rather than 64 MiB on from wherever its free run began -- across a
+chunk once in four -- and `fstrim` leaves out free runs shorter than a
+chunk, which would give nothing back.
 
-`fstest` holds one at every smoke boot -- holes read as zeros, a write into
-one, into part of a block, across both, a write of zeros given back and one
-written, a discard, everything else refused while it is held, the file as
-the image left it once it lets go -- and `fs-fuzz`'s targets hold, read,
-write, discard, zero, sync and let go of images among every other call,
-each held to the model's rules, ext2's images judged by its e2fsck after a
-clean unmount and after every power cut.
+`fstest` holds one at every smoke boot, its chunk two blocks -- holes read
+as zeros, a write into one, into part of a block, across both, a write of
+zeros given back and one written, a discard of a whole chunk and of half
+of one, everything else refused while it is held, the file as the image
+left it once it lets go -- and `fs-fuzz`'s targets hold, read, write --
+alone and a vector at a time, sectors of one block among them -- discard,
+zero, sync and let go of images among every other call, each with a chunk
+of its own, each held to the model's rules and its map to the
+filesystem's, on disks whose write of zeros is there, missing or a lie,
+ext2's and ext4's images judged after a clean unmount and after every
+power cut.
 
 ## What a filesystem is
 

@@ -7,6 +7,9 @@ edition = "2021"
 
 [dependencies]
 kcore = { path = "../kcore" }
+# The vectored calls of a disk's image (`image.rs`) implement the C ABI the
+# ffi crate declares, so they take its types from there.
+ffi = { path = "../ffi" }
 # The disks a filesystem is mounted on: the block layer itself, not the C ABI
 # a module reaches it by.
 block = { path = "../block" }

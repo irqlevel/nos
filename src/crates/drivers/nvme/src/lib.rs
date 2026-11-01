@@ -80,6 +80,10 @@ struct NvmeDevice {
     sector_size: u32,    /* bytes per LBA */
     max_transfer: u32,   /* max sectors per command (2-PRP-entry limit) */
 
+    /* The most bytes one command of a batch moves: MDTS, and what a PRP
+     * list page names -- two pages where there are no lists. */
+    batch_max: usize,
+
     /* Asynchronous commands that may be in flight at once: the synchronous
      * path keeps SYNC_RESERVED_CIDS of the IDs. */
     async_limit: usize,
@@ -130,6 +134,13 @@ struct Submission {
 
     /* The asynchronous path's completion target per CID. */
     targets: [Option<AsyncTarget>; IO_QUEUE_DEPTH],
+
+    /* A page of PRP entries for each CID: where a batch's command bigger
+     * than two pages names the rest of its pages. Written under this lock
+     * as the command is made, read by the controller while the command is
+     * in flight -- its CID nobody else's until it is done. None where the
+     * pages could not be had: a batch's commands are two pages at most. */
+    prp_lists: Option<dma::DmaBuffer>,
 }
 
 impl Submission {
@@ -263,15 +274,17 @@ fn init_device(dev: pci::PciDevice) {
         return;
     }
 
-    {
+    let mdts = {
         let id_ctrl = id_buf.as_slice();
         let text = |at: usize, len: usize| {
             core::str::from_utf8(&id_ctrl[at..at + len]).unwrap_or("?").trim()
         };
-        trace!(0, "NVMe: ctrl sn={} mn={} mdts={}",
-            text(ID_CTRL_SN_AT, ID_CTRL_SN_LEN), text(ID_CTRL_MN_AT, ID_CTRL_MN_LEN),
-            id_ctrl[ID_CTRL_MDTS_AT]);
-    }
+        let mdts = id_ctrl[ID_CTRL_MDTS_AT];
+        let oncs = u16::from_le_bytes([id_ctrl[ID_CTRL_ONCS_AT], id_ctrl[ID_CTRL_ONCS_AT + 1]]);
+        trace!(0, "NVMe: ctrl sn={} mn={} mdts={} oncs={:#x}",
+            text(ID_CTRL_SN_AT, ID_CTRL_SN_LEN), text(ID_CTRL_MN_AT, ID_CTRL_MN_LEN), mdts, oncs);
+        mdts
+    };
 
     /* --- Identify Namespace 1 --- */
     let mut cmd = SubmissionEntry::new(OPC_IDENTIFY, admin.next_cid());
@@ -315,6 +328,21 @@ fn init_device(dev: pci::PciDevice) {
      * pages, mdts >= 1 -> >= 2 pages), so the 2-page cap is always the
      * binding limit.  Computed in device sectors, not 512-byte units. */
     let max_transfer = (2 * PAGE_SIZE / sector_size as usize) as u32;
+
+    /* A batch's contiguous pages one command: as many as MDTS lets one
+     * command move and a page of PRP entries names, past the first. */
+    let prp_lists = dma::DmaBuffer::new(IO_QUEUE_DEPTH);
+    let batch_max = match &prp_lists {
+        Some(_) => {
+            let mdts_bytes = if mdts == 0 || mdts >= 40 { usize::MAX } else { PAGE_SIZE << mdts };
+            mdts_bytes.min((PRP_LIST_ENTRIES + 1) * PAGE_SIZE).max(2 * PAGE_SIZE)
+        }
+        None => {
+            trace!(0, "NVMe: no memory for PRP lists: a batch's commands are two pages at most");
+            2 * PAGE_SIZE
+        }
+    };
+    trace!(0, "NVMe: a batch's commands up to {} KiB", batch_max / 1024);
 
     /* --- Allocate I/O queues --- */
     let io_depth = IO_QUEUE_DEPTH.min(mqes);
@@ -405,6 +433,7 @@ fn init_device(dev: pci::PciDevice) {
         doorbell_owed: false,
         async_in_flight: 0,
         targets: [None; IO_QUEUE_DEPTH],
+        prp_lists,
     });
     let (submission, completion, irq) = match (
         submission, sync::SpinLock::new(io_cq), sync::SpinLock::new(None),
@@ -430,6 +459,7 @@ fn init_device(dev: pci::PciDevice) {
         capacity,
         sector_size,
         max_transfer,
+        batch_max,
         async_limit: (io_depth - 1).saturating_sub(SYNC_RESERVED_CIDS).max(1),
         kind: [const { AtomicU8::new(CID_IDLE) }; IO_QUEUE_DEPTH],
         done,
@@ -885,36 +915,74 @@ impl NvmeDevice {
 const BATCH_WINDOW: usize = IO_QUEUE_DEPTH / 2;
 
 impl NvmeDevice {
-    /* The command for one piece of a batch: where it is in memory and on the
-     * namespace. None for a piece the controller cannot take -- the table
-     * checked it against the device already; these are the controller's own
-     * limits, checked where they are known. */
-    fn piece_command(&self, opcode: u8, cid: u16, buf_phys: u64, base: u64, piece: &Piece)
-        -> Option<SubmissionEntry>
+    /* How many of `pieces`, from the first, one command takes: pieces that
+     * follow one another in the buffer and on the namespace, each but the
+     * last a whole page from the start of one, no more bytes than a command
+     * of a batch moves. */
+    fn run_len(&self, pieces: &[Piece]) -> usize {
+        let per_page = (PAGE_SIZE / self.sector_size as usize) as u64;
+        let mut bytes = pieces[0].len;
+        let mut n = 1;
+        while let Some(next) = pieces.get(n) {
+            let prev = &pieces[n - 1];
+            let follows = prev.len == PAGE_SIZE && prev.at % PAGE_SIZE == 0
+                && next.at == prev.at + PAGE_SIZE
+                && prev.sector.checked_add(per_page) == Some(next.sector);
+            if !follows || bytes + next.len > self.batch_max {
+                break;
+            }
+            bytes += next.len;
+            n += 1;
+        }
+        n
+    }
+
+    /* The command for a run of a batch's pieces (`run_len`): where they are
+     * in memory and on the namespace -- the pages past the second named by
+     * the CID's PRP list, written here. None for a run the controller
+     * cannot take: the table checked every piece against the device
+     * already; these are the controller's own limits, checked where they
+     * are known. */
+    fn run_command(&self, opcode: u8, cid: u16, buf_phys: u64, base: u64, run: &[Piece],
+                   lists: Option<&mut dma::DmaBuffer>) -> Option<SubmissionEntry>
     {
         let sector_size = self.sector_size as usize;
-        if piece.len == 0 || piece.len % sector_size != 0 {
+        let len: usize = run.iter().map(|p| p.len).sum();
+        if len == 0 || len % sector_size != 0 || run.iter().any(|p| p.len == 0) {
             return None;
         }
-        let count = piece.len / sector_size;
-        let sector = base.checked_add(piece.sector)?;
-        if count > self.max_transfer as usize || sector >= self.capacity
-            || count as u64 > self.capacity - sector
-        {
+        let count = len / sector_size;
+        let sector = base.checked_add(run[0].sector)?;
+        if len > self.batch_max || sector >= self.capacity || count as u64 > self.capacity - sector {
             return None;
         }
 
-        /* PRP entries as `transfer` makes them: a piece is at most a page, so
-         * a second one is there only for a piece that runs into the next. */
-        let prp1 = buf_phys.checked_add(piece.at as u64)?;
+        let prp1 = buf_phys.checked_add(run[0].at as u64)?;
         let offset = prp1 as usize & (PAGE_SIZE - 1);
-        if prp1 & 3 != 0 || offset + piece.len > 2 * PAGE_SIZE {
+        if prp1 & 3 != 0 {
             return None;
         }
-        let prp2 = if offset + piece.len > PAGE_SIZE {
+        let prp2 = if offset + len <= PAGE_SIZE {
+            0
+        } else if offset + len <= 2 * PAGE_SIZE {
+            /* The page after: an address, which is all a PRP is */
             (prp1 & !(PAGE_SIZE as u64 - 1)) + PAGE_SIZE as u64
         } else {
-            0
+            /* More pages than two entries name: the first's own, and a list
+             * of the rest -- a run is whole pages from the start of one, so
+             * its pages are one after another in the buffer. */
+            let lists = lists?;
+            if offset != 0 || run.len() > PRP_LIST_ENTRIES + 1 {
+                return None;
+            }
+            let at = cid as usize * PAGE_SIZE;
+            for (k, piece) in run.iter().enumerate().skip(1) {
+                let page = buf_phys.checked_add(piece.at as u64)?;
+                if !lists.store(at + (k - 1) * PRP_ENTRY_SIZE, page) {
+                    return None;
+                }
+            }
+            lists.phys() + at as u64
         };
 
         let mut cmd = SubmissionEntry::new(opcode, cid);
@@ -927,8 +995,10 @@ impl NvmeDevice {
         Some(cmd)
     }
 
-    /* Every piece of a batch as a synchronous command of its own -- the ISR
-     * wakes done[cid] for it as it does for `execute` -- up to BATCH_WINDOW
+    /* Every run of a batch's pieces (`run_len`) as a synchronous command of
+     * its own -- a run of a whole batch's contiguous blocks one command, a
+     * single wait -- the ISR waking done[cid] for it as it does for
+     * `execute`, up to BATCH_WINDOW
      * of them with the controller at once, and the doorbell rung once for
      * each lot queued. They are waited for in the order they went in, each
      * ID given back as its command is done, so the window slides along the
@@ -963,10 +1033,12 @@ impl NvmeDevice {
                         let mut cid = first;
                         let mut queued = 0usize;
                         loop {
-                            let piece = &pieces[next];
-                            let Some(cmd) = self.piece_command(opcode, cid, buf_phys, base, piece) else {
-                                trace!(0, "NVMe: batch: {} bytes at sector {} is no command the controller takes",
-                                    piece.len, piece.sector);
+                            let n = self.run_len(&pieces[next..]);
+                            let run = &pieces[next..next + n];
+                            let Some(cmd) = self.run_command(opcode, cid, buf_phys, base, run,
+                                                             submission.prp_lists.as_mut()) else {
+                                trace!(0, "NVMe: batch: {} pieces at sector {} are no command the controller takes",
+                                    n, run[0].sector);
                                 submission.free_cid(cid);
                                 ok = false;
                                 break;
@@ -980,7 +1052,7 @@ impl NvmeDevice {
                             submission.queue.submit(&cmd);
                             window[(head + out) % BATCH_WINDOW] = cid;
                             out += 1;
-                            next += 1;
+                            next += n;
                             queued += 1;
                             if next == pieces.len() || out == BATCH_WINDOW {
                                 break;
@@ -1038,6 +1110,7 @@ impl BlockDriver for NvmeDevice {
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         self.transfer(sector, data.as_ptr(), data.len(), true, fua)
     }
+
 
     fn write_pieces(&'static self, base: u64, buf: &dma::DmaBuffer, pieces: &[Piece]) -> bool {
         self.batch(OPC_WRITE, buf.phys(), base, pieces)
