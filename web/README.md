@@ -73,6 +73,14 @@ A how-to is the same with `order: <n>` and `updated: YYYY-MM-DD` instead of
 The tags a post may carry are listed in `src/lib/content.ts` (`tagNames`) and
 translated in `src/lib/dictionaries.ts`.
 
+A chart is a fenced block of YAML whose language is `chart`; the build turns
+it into HTML in the page's own font and theme, with no image and no script.
+One kind so far, `before-after`: each row's value before and after a change,
+against a reference line (the chasing-kvm post has one). The comment at the top
+of `src/lib/chart.ts` shows a block with every key it takes. A chart
+illustrates a table, which stays in the post beside it: screen readers are
+given the table and the chart's caption, not the plot.
+
 Links inside content are written **without** a language: `/docs/hypervisor#a-disk`,
 `/howto/build`, `/blog/<slug>`, `/about`, `/hypervisor` -- the site adds `/en` or
 `/ru`. Source files and commits link to GitHub with full URLs.
@@ -87,6 +95,8 @@ Links inside content are written **without** a language: `/docs/hypervisor#a-dis
   switcher would lead to a 404)
 - a missing or unknown frontmatter key, a date that is not `YYYY-MM-DD`, a tag
   that is not in the list
+- a `chart` block with a key the renderer does not know, a value off its scale
+  or anything it needs missing
 - no `SITE_URL`, or one that is not a bare `https://host` origin
 
 ## Languages
