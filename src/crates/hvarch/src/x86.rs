@@ -2,6 +2,7 @@
 
 pub mod cpu;
 pub mod fp;
+pub mod kick;
 pub mod msrs;
 pub mod spec;
 pub mod svm;

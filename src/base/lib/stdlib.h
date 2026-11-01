@@ -300,6 +300,14 @@ int ulong_to_string(ulong src, u8 dst_base, char *dst, size_t dst_size, bool low
    returned. */
 PRINTF_FORMAT(3, 0) int vsn_printf(char *s, size_t size, const char *fmt, va_list arg);
 
+/* A line meant to end with a newline that vsn_printf cut to fit `size`
+   bytes -- `len` of them written, filling the buffer -- given its newline
+   back: its last bytes made "...\n", the mark and then the newline the cut
+   took, so that whatever is printed after it starts a line of its own --
+   on the console, in dmesg, to whoever reads either. Anything else is left
+   as it is. Its length, `len` either way. */
+int end_cut_line(char *s, size_t size, int len);
+
 PRINTF_FORMAT(3, 4) int sn_printf(char* buf, size_t size, const char* fmt, ...);
 
 int str_cmp(const char *s1, const char *s2);

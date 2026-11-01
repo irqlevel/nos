@@ -564,6 +564,10 @@ enum Kind {
     Fixed(u64),
     /// Intel's MISC_ENABLE: fixed, at what the host's fast strings make it.
     MiscEnable,
+    /// The microcode revision: the host's, in the high half, on an Intel
+    /// host (none on AMD); a write of 0, the protocol's, taken, and of what
+    /// it reads.
+    Revision,
     /// IA32_ARCH_CAPABILITIES: read-only, the host's masked to `ARCH_CAP`,
     /// where the host has it; a #GP where it has not.
     ArchCapabilities,
@@ -621,7 +625,7 @@ const MSRS: &[(u32, Of, Kind)] = &[
     (0x179, Of::Every, Kind::ReadOnly(0)),               // MCG_CAP: no banks
     (0x2FF, Of::Every, Kind::Fixed(0)),                  // the MTRRs' default type: off
     (0x17A, Of::Every, Kind::Fixed(0)),                  // MCG_STATUS: nothing
-    (0x8B, Of::Every, Kind::Fixed(0)),                   // the microcode revision: none
+    (0x8B, Of::Every, Kind::Revision),                   // the microcode revision: the host's on Intel
     (0x17, Of::Intel, Kind::ReadOnly(0)),                // the platform ID
     (0x1A0, Of::Intel, Kind::MiscEnable),
     (0x10A, Of::Every, Kind::ArchCapabilities),
@@ -680,6 +684,12 @@ fn kind(msr: u32) -> Option<Kind> {
     MSRS.iter().find(|&&(m, of, _)| m == msr && has(of)).map(|&(_, _, k)| k)
 }
 
+/// The microcode revision a guest reads, from the manual: the host's, in
+/// the high half of IA32_BIOS_SIGN_ID, on an Intel host; none on AMD.
+fn revision() -> u64 {
+    u64::from(cpu::microcode_revision()) << 32
+}
+
 /// Intel's MISC_ENABLE: fast strings as the host has them, branch tracing
 /// and PEBS unavailable.
 fn misc_enable() -> u64 {
@@ -702,6 +712,7 @@ fn takes(k: Kind, value: u64, save: &Save) -> bool {
         Kind::Tsc | Kind::ReadOnly(_) | Kind::ArchCapabilities => false,
         Kind::Fixed(v) => value == v,
         Kind::MiscEnable => value == misc_enable(),
+        Kind::Revision => value == 0 || value == revision(),
         Kind::TscAux => value >> 32 == 0,
         Kind::SpecCtrl => value & !promised().0 == 0,
         Kind::PredCmd => value & !promised().1 == 0,
@@ -722,6 +733,7 @@ fn check_rdmsr(save: &Save, own: &Own, msr: u32) {
         Some(Kind::Own(_)) | Some(Kind::Efer) | Some(Kind::Tsc) => got.is_some(),
         Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => got == Some(v),
         Some(Kind::MiscEnable) => got == Some(misc_enable()),
+        Some(Kind::Revision) => got == Some(revision()),
         Some(Kind::ArchCapabilities) => got == cpu::arch_capabilities().map(|v| v & ARCH_CAP),
         Some(Kind::TscAux) => got == Some(own.tsc_aux),
         Some(Kind::SpecCtrl) => got == Some(own.spec_ctrl),
@@ -778,6 +790,7 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
         0 => match k {
             Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => v,
             Some(Kind::MiscEnable) => misc_enable(),
+            Some(Kind::Revision) => if r.bool() { 0 } else { revision() },
             Some(Kind::ArchCapabilities) => cpu::arch_capabilities().unwrap_or(0),
             Some(Kind::Efer) => r.pick(&[EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE, EFER_LME, EFER_SCE | EFER_NXE]),
             Some(Kind::TscAux) => u64::from(r.u32()),

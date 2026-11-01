@@ -475,12 +475,23 @@ pub struct Fs {
     /// filesystem had fewer free when it was mounted than it keeps for a
     /// punch's split, a disk another system filled.
     pub punch_room: bool,
+    /// Whether the filesystem gives an image blocks ahead of its writes, a
+    /// chunk at a time (`FileSystem::allocates`): ext4's, whose refusal of a
+    /// chunk for no reason is a finding (`chunks_held`).
+    pub allocates: bool,
 }
 
 impl Fs {
     pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
-        Fs { vfs, model, strict, images: Vec::new(), punch_room: false }
+        Fs { vfs, model, strict, images: Vec::new(), punch_room: false, allocates: false }
     }
+}
+
+/// What a chunk refused around an image's write may have had for a reason:
+/// requests failed and allocations the kernel heap's ceiling refused so far
+/// (`chunks_held`).
+fn reasons_so_far() -> (u64, u64) {
+    (crate::machine::disk::failures(), crate::machine::heap::refusals())
 }
 
 /* ---- what the input chooses ---- */
@@ -811,9 +822,17 @@ impl Fs {
 
     /* ---- images ---- */
 
-    pub fn image_open(&mut self, p: &[u8], write: bool) {
-        say(format_args!("image_open {} write {}", show(p), write));
-        let got = Image::open(self.vfs, p, write);
+    /// `p` held as a disk's image, its chunk `chunk` blocks -- 0 for the
+    /// kernel's own: small ones, so that a file of kilobytes grows a chunk
+    /// at a time and gives chunks back whole as a disk of gigabytes does.
+    pub fn image_open(&mut self, p: &[u8], write: bool, chunk: u64) {
+        say(format_args!("image_open {} write {} chunk {}", show(p), write, chunk));
+        let got = Image::open(self.vfs, p, write).map(|mut image| {
+            if chunk != 0 {
+                image.set_chunk(chunk);
+            }
+            image
+        });
         let want = self.model.hold(p, write);
         self.check(got.is_some() == want.is_some(), format_args!("an image of {} for {} {}, where the model {}",
                    show(p), if write { "writing" } else { "reading" }, if got.is_some() { "was held" } else { "was refused" },
@@ -825,7 +844,38 @@ impl Fs {
             }
             self.images.push(image);
             self.model.holds.push((path, write));
+            self.image_map_held(self.images.len() - 1);
         }
+    }
+
+    /// The chunks image `i`'s filesystem gave around a write, held: where it
+    /// gives an image blocks ahead of its writes and the answers are the
+    /// model's, a chunk refused is a finding unless the filesystem ran out
+    /// of room, a request failed or the kernel heap's ceiling refused an
+    /// allocation meanwhile. A refusal for no reason sends every write into
+    /// a hole through the VFS, a commit each, with every answer right -- so
+    /// nothing else here would see it: an allocation's read of the extent
+    /// tree it was changing, held to a checksum the change had not put on
+    /// it yet, refused every chunk past the first hole of each so.
+    fn chunks_held(&mut self, i: usize, refused: u64, reasons: (u64, u64), mark: u64) {
+        let Some(image) = self.images.get(i) else { return };
+        if !self.allocates || image.chunks_refused() == refused {
+            return;
+        }
+        if reasons_so_far() != reasons || out_of_room(mark) {
+            reached("an image's chunk refused for a reason");
+            return;
+        }
+        self.check(false, format_args!("image {}'s filesystem refused a chunk ahead of a write, with room for it, no \
+                                        request failed and no allocation refused", i));
+    }
+
+    /// The map image `i` holds held to its filesystem's: what it reads and
+    /// writes off the VFS's lock is resolved there.
+    fn image_map_held(&mut self, i: usize) {
+        let Some(image) = self.images.get_mut(i) else { return };
+        let ok = image.map_is_the_filesystems();
+        self.check(ok, format_args!("image {}'s map is not its filesystem's", i));
     }
 
     pub fn image_close(&mut self, i: usize) {
@@ -862,7 +912,9 @@ impl Fs {
         let Some((path, write)) = self.model.holds.get(i).cloned() else { return };
         say(format_args!("image_write {} bytes to {} at {}", data.len(), show(&join(&path)), at));
         let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
         let got = self.images[i].write_at(at, data);
+        self.chunks_held(i, refused, reasons, mark);
         let size = self.model.size(&path);
         let want = write && at.checked_add(data.len() as u64).is_some_and(|end| end <= size);
         if self.refused_for_room(got, want, mark, &saved) {
@@ -881,6 +933,76 @@ impl Fs {
             }
             if got {
                 reached("an image written");
+                self.image_map_held(i);
+            }
+        }
+    }
+
+    /// Reads of image `i` at once (`Image::read_vec`): every part held to
+    /// the model, as a read of each alone would be.
+    pub fn image_read_vec(&mut self, i: usize, parts: &[(u64, usize)]) {
+        let Some((path, _)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_read_vec {} parts of {}", parts.len(), show(&join(&path))));
+        let mut bufs: Vec<Vec<u8>> = parts.iter().map(|&(_, n)| vec![0u8; n]).collect();
+        let got = {
+            let mut ios: Vec<(u64, &mut [u8])> = parts.iter().zip(bufs.iter_mut()).map(|(&(at, _), b)| (at, &mut b[..])).collect();
+            self.images[i].read_vec(&mut ios)
+        };
+        let size = self.model.size(&path);
+        let want = parts.iter().all(|&(at, n)| at.checked_add(n as u64).is_some_and(|end| end <= size));
+        self.check(got == want, format_args!("an image's read of {} parts of {} ({} bytes) {}", parts.len(),
+                   show(&join(&path)), size, if got { "succeeded" } else { "failed" }));
+        if got && want {
+            for (&(at, n), buf) in parts.iter().zip(&bufs) {
+                let d = match self.model.node(&path) {
+                    Some(Node::File(d)) => d.read(at, n as u64),
+                    _ => Vec::new(),
+                };
+                self.check(*buf == d, format_args!("an image's read of {} parts of {} gave other bytes at {} than \
+                           were written", parts.len(), show(&join(&path)), at));
+            }
+            reached("an image read a vector at a time");
+        }
+    }
+
+    /// Writes of image `i` at once (`Image::write_vec`), in their order:
+    /// the model's, a later part over an earlier where two meet -- in one
+    /// block above all, which the image reads and writes back whole.
+    pub fn image_write_vec(&mut self, i: usize, parts: &[(u64, Vec<u8>)]) {
+        let Some((path, write)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_write_vec {} parts of {}", parts.len(), show(&join(&path))));
+        let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let ios: Vec<(u64, &[u8])> = parts.iter().map(|(at, d)| (*at, &d[..])).collect();
+        let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
+        let got = self.images[i].write_vec(&ios);
+        self.chunks_held(i, refused, reasons, mark);
+        let size = self.model.size(&path);
+        let want = write && parts.iter().all(|(at, d)| at.checked_add(d.len() as u64).is_some_and(|end| end <= size));
+        if self.refused_for_room(got, want, mark, &saved) {
+            for (at, d) in parts {
+                let old = match self.model.node(&path) {
+                    Some(Node::File(d)) => d.clone(),
+                    _ => Data::new(),
+                };
+                self.resync_partial(&path, &old, *at, d);
+            }
+            return;
+        }
+        self.check(got == want, format_args!("an image's write of {} parts to {} ({} bytes) {}", parts.len(),
+                   show(&join(&path)), size, if got { "succeeded" } else { "failed" }));
+        if self.takes(got, want) {
+            if let Some(file) = self.model.file_mut(&path) {
+                for (at, d) in parts {
+                    file.write(*at, d);
+                }
+            }
+            if got {
+                let block = parts.first().map_or(0, |(at, _)| at / 4096);
+                if parts.len() > 1 && parts.iter().all(|(at, _)| at / 4096 == block) {
+                    reached("an image's vector wrote one block twice");
+                }
+                reached("an image written a vector at a time");
+                self.image_map_held(i);
             }
         }
     }
@@ -930,8 +1052,8 @@ impl Fs {
                 Some(Node::File(d)) => d.clone(),
                 _ => Data::new(),
             };
-            let block = self.model.punch_block.max(1);
-            let (first, end) = (at.div_ceil(block) * block, ((at + len) / block * block).min(size));
+            let unit = self.images[i].discard_unit().max(1);
+            let (first, end) = (at.div_ceil(unit) * unit, ((at + len) / unit * unit).min(size));
             self.resync_punch(&path, &old, first, end.max(first));
             reached("an image's discard refused for room, on a disk filled past what ext4 keeps for one");
             return;
@@ -942,11 +1064,15 @@ impl Fs {
         if !self.takes(got, want) {
             return;
         }
+        if got && !cut {
+            self.image_map_held(i);
+        }
         let zeroed = match zeroes {
             Some(_) => Some((at, at + len)),
             None if self.model.punch_block != 0 => {
-                let block = self.model.punch_block;
-                let (first, end) = (at.div_ceil(block) * block, (at + len) / block * block);
+                /* The whole chunks inside, the rest as it was */
+                let unit = self.images[i].discard_unit().max(1);
+                let (first, end) = (at.div_ceil(unit) * unit, (at + len) / unit * unit);
                 (first < end).then_some((first, end.min(size)))
             }
             None => None,
@@ -1465,6 +1591,11 @@ pub fn step(f: &mut Fs, r: &mut Input, block: u64) {
     f.model.propagate_changed(&before);
 }
 
+/// An image's chunk, in blocks: a few now and then the kernel's own (0).
+pub fn chunk(r: &mut Input) -> u64 {
+    if r.chance(8) { 0 } else { 1 << r.below(7) }
+}
+
 fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
     let open = f.model.open.len() as u64;
     let pick_open = |r: &mut Input| r.below(open.max(1)) as usize;
@@ -1477,7 +1608,8 @@ fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
             let p = path(r, &f.model);
             if f.images.len() < 4 {
                 let write = !r.chance(4);
-                f.image_open(&p, write);
+                let chunk = chunk(r);
+                f.image_open(&p, write, chunk);
             }
         }
         21 | 22 if held != 0 => {
@@ -1500,6 +1632,28 @@ fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
                      * each of the discard's requests. */
                     let cut = f.model.punch_block != 0 && r.chance(8);
                     f.image_discard(i, at, len, zeroes, cut);
+                }
+                k if r.chance(48) => {
+                    /* A vector: what a guest's disk has out at once -- now and
+                     * then all of it in one block, sectors apart or on top
+                     * of each other. */
+                    let n = 2 + r.below(7) as usize;
+                    let near = r.bool().then(|| offset(r, size, block, f.model.limits.span));
+                    let mut at_len = Vec::new();
+                    for _ in 0..n {
+                        let (at, len) = match near {
+                            Some(base) => (base + 512 * r.below(8), 512 * (1 + r.below(2) as usize)),
+                            None => (offset(r, size, block, f.model.limits.span), length(r)),
+                        };
+                        at_len.push((at, len));
+                    }
+                    if k % 2 == 0 {
+                        f.image_read_vec(i, &at_len);
+                    } else {
+                        let parts: Vec<(u64, Vec<u8>)> =
+                            at_len.iter().map(|&(at, len)| (at, crate::input::noise(r.u32(), len))).collect();
+                        f.image_write_vec(i, &parts);
+                    }
                 }
                 k => {
                     let at = offset(r, size, block, f.model.limits.span);

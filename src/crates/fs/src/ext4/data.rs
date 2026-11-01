@@ -16,7 +16,10 @@
 //! A truncate gives back everything mapped past the new end -- unwritten
 //! extents beyond the old end among them -- and writes zeros over what of
 //! the new last block lies past it, so that a file reads as zeros wherever
-//! it grows over; a punch gives back the blocks of a range inside the file,
+//! it grows over; an allocation gives the holes of a range inside the file
+//! blocks, made zeros before the commit that maps them -- a disk's image
+//! growing a chunk at a time ahead of what its guest writes; a punch gives
+//! back the blocks of a range inside the file,
 //! the size as it was, and may take the free blocks kept for it
 //! (`txn::RESERVE`). Each gives back from the end of its range, as much as
 //! a transaction holds: a truncate that one cannot finish has its size and
@@ -26,12 +29,13 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use extfmt::extent::Leaf;
+use extfmt::extent::{Leaf, UNINIT_MAX_LEN};
 use extfmt::inode::{Inode, EXTENTS_FL};
 use extfmt::Map;
 use kcore::trace;
 
 use super::inodes as inode;
+use super::source;
 use super::txn::Txn;
 use super::Ext4;
 use crate::vnode::NodeId;
@@ -40,6 +44,13 @@ use crate::vnode::NodeId;
 /// bitmaps, the descriptors, the inode, the tree's leaves -- well inside
 /// what a transaction holds.
 const CHUNK_BLOCKS: u64 = 256;
+
+/// The most blocks one transaction of an allocation gives: 256 MiB of 4 KiB
+/// blocks -- the most a disk's image asks for at once, ahead of a guest
+/// writing from one end of it on (`image::GROW_MAX_CHUNKS`) -- each run of
+/// them an extent, and the transaction ended sooner where the runs' leaves
+/// fill half of what the journal takes at once.
+const ALLOC_BLOCKS: u64 = 1 << 16;
 
 /// The size at which a filesystem must say large_file.
 const LARGE_FILE_SIZE: u64 = 1 << 31;
@@ -185,6 +196,102 @@ impl Txn<'_> {
             }
         }
         Some(orphaned)
+    }
+
+    /// Blocks for the holes among file `ino`'s blocks `from..to`, as many as
+    /// this transaction holds: given, each run of them an unwritten extent,
+    /// so that they read as zeros whatever they held before they were the
+    /// file's -- with no crash able to show it -- and nothing written to
+    /// them: what writes them makes them written (`mark_written`). An
+    /// extent there already is left as it is. How many blocks were given,
+    /// and where the transaction stopped -- `to` when it got there.
+    fn allocate_range(&mut self, ino: u32, from: u64, to: u64) -> Option<(u64, u64)> {
+        let mut raw = self.file_inode(ino)?;
+        let mut goal = self.m.group_start(u64::from((ino - 1) / self.m.ipg));
+        let mut given = 0u64;
+        let mut l = from;
+        'holes: while l < to {
+            let lu = u32::try_from(l).ok()?;
+            if let Some(e) = self.ext_lookup(ino, &raw, lu)? {
+                l = u64::from(e.first) + u64::from(e.len);
+                continue;
+            }
+            let hole = match source::map(self, ino, &raw, l)? {
+                Map::Hole { run } => run.max(1).min(to - l),
+                Map::Blocks { .. } => {
+                    trace!(0, "ext4: block {} of inode {} is in no extent and mapped", l, ino);
+                    return None;
+                }
+            };
+            /* Blocks one after another for as long as they come, each run an
+             * extent of its own. */
+            let end = l + hole;
+            while l < end {
+                let (start, len) = self.alloc_run(goal, (end - l).min(u64::from(UNINIT_MAX_LEN)))?;
+                let run_first = u32::try_from(l).ok()?;
+                if !self.ext_insert(ino, &mut raw, Leaf { first: run_first, len: len as u32, start, unwritten: true })
+                    || !inode::add_blocks(self.m, &mut raw, len as i64) {
+                    return None;
+                }
+                given += len;
+                l += len;
+                goal = start + len;
+                if self.dirty.len() > self.jnl.max_txn / 2 {
+                    break 'holes;
+                }
+            }
+        }
+        inode::touch(&mut raw, self.now, false);
+        self.put_inode(ino, &mut raw).then_some((given, l))
+    }
+
+    /// File `ino`'s blocks of `runs`, from run `run` and block `l` of it,
+    /// made written where they are unwritten, as many as this transaction
+    /// holds: where it stopped (the run, the block), `runs.len()` when it got
+    /// to their end. A block in an extent written already, or in a hole, is
+    /// left: an extent at a time, so that a written one never hides an
+    /// unwritten one after it in a run.
+    fn written_range(&mut self, ino: u32, runs: &[(u64, u64)], mut run: usize, mut l: u64) -> Option<(usize, u64)> {
+        let mut raw = self.file_inode(ino)?;
+        let mut changed = false;
+        while let Some(&(first, count)) = runs.get(run) {
+            let end = first.checked_add(count)?;
+            l = l.max(first);
+            if l >= end {
+                run += 1;
+                continue;
+            }
+            if self.dirty.len() > self.jnl.max_txn / 2 {
+                break;
+            }
+            let lu = u32::try_from(l).ok()?;
+            match self.ext_lookup(ino, &raw, lu)? {
+                Some(e) => {
+                    let e_end = u64::from(e.first) + u64::from(e.len);
+                    let n = (e_end.min(end) - l) as u32;
+                    if e.unwritten {
+                        let m = self.ext_mark_written(ino, &mut raw, lu, n)?;
+                        changed = true;
+                        l += u64::from(m.max(1));
+                    } else {
+                        l += u64::from(n);
+                    }
+                }
+                None => {
+                    /* A hole -- given back since it was written: nothing to
+                     * make written there. */
+                    let hole = match source::map(self, ino, &raw, l)? {
+                        Map::Hole { run } => run.max(1),
+                        Map::Blocks { .. } => 1,
+                    };
+                    l += hole.min(end - l);
+                }
+            }
+        }
+        if changed && !self.put_inode(ino, &mut raw) {
+            return None;
+        }
+        Some((run, l))
     }
 
     /// File blocks `first..to` of `ino` given back from the end, as many as
@@ -344,6 +451,103 @@ impl Ext4 {
         }
         self.sized(file, ino);
         done.is_some()
+    }
+
+    /// Blocks for every hole among `count` blocks of `file` from block
+    /// `first`, of those inside it, as unwritten extents, a transaction at a
+    /// time -- the size as it was, and what reads as zeros reading as zeros
+    /// still: nothing is written to them, so a chunk costs what its commit
+    /// does, however big. How many blocks were given, or None.
+    pub fn allocate(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
+        if !self.writable() {
+            return None;
+        }
+        let Some(ino) = self.file_ino(file) else {
+            trace!(0, "ext4: an allocation in something that is not a file");
+            return None;
+        };
+        let Some(size) = self.tree.get(file).map(|n| n.size as u64) else {
+            trace!(0, "ext4: an allocation in inode {}, which the tree has not got", ino);
+            return None;
+        };
+        let end = first.saturating_add(count).min(size.div_ceil(self.io.bs as u64));
+        if end <= first {
+            trace!(0, "ext4: an allocation of blocks {}..+{} of inode {}, past its {} bytes", first, count, ino, size);
+        }
+        let mut given = 0u64;
+        let mut l = first;
+        while l < end {
+            let to = end.min(l + ALLOC_BLOCKS);
+            let Some(mut t) = self.begin() else {
+                trace!(0, "ext4: no transaction for an allocation in inode {}", ino);
+                return None;
+            };
+            let Some((got, reached)) = t.allocate_range(ino, l, to) else {
+                trace!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
+                return None;
+            };
+            if !t.commit() {
+                trace!(0, "ext4: an allocation in inode {} did not commit", ino);
+                return None;
+            }
+            given += got;
+            if reached <= l {
+                trace!(0, "ext4: an allocation in inode {} got nowhere at block {}", ino, l);
+                return None;
+            }
+            l = reached;
+        }
+        Some(given)
+    }
+
+    /// The blocks of `file` named by `runs` -- each a first block and a
+    /// count, in order -- made written where they are unwritten, a
+    /// transaction at a time: what a disk's image wrote over the extents
+    /// `allocate` gave it. The data is the caller's, written before the
+    /// call; the first commit's flush before its commit block puts it on the
+    /// medium ahead of any extent that says it is there (data=ordered), so
+    /// the caller needs no flush of its own first -- and where there was
+    /// nothing to commit, the device is flushed all the same: on true, what
+    /// the caller wrote before the call is on the medium. Each may take the
+    /// free blocks kept for a punch: a split of the tree is all it can need,
+    /// and a guest's flush is not to fail for the room for one. false on an
+    /// I/O error, or no room even so.
+    pub fn mark_written(&mut self, file: NodeId, runs: &[(u64, u64)]) -> bool {
+        if !self.writable() {
+            return false;
+        }
+        let Some(ino) = self.file_ino(file) else {
+            trace!(0, "ext4: blocks made written in something that is not a file");
+            return false;
+        };
+        let (mut run, mut l) = (0usize, runs.first().map_or(0, |r| r.0));
+        let mut flushed = false;
+        while run < runs.len() {
+            let Some(mut t) = self.begin() else {
+                trace!(0, "ext4: no transaction to make blocks of inode {} written", ino);
+                return false;
+            };
+            t.may_reserve = true;
+            let Some((next_run, next_l)) = t.written_range(ino, runs, run, l) else {
+                trace!(0, "ext4: blocks of inode {} not made written, from block {}", ino, l);
+                return false;
+            };
+            flushed |= !t.dirty.is_empty();
+            if !t.commit() {
+                trace!(0, "ext4: blocks of inode {} made written did not commit", ino);
+                return false;
+            }
+            if (next_run, next_l) == (run, l) {
+                trace!(0, "ext4: blocks of inode {} made written got nowhere at block {}", ino, l);
+                return false;
+            }
+            (run, l) = (next_run, next_l);
+        }
+        if !flushed && !self.io.flush() {
+            trace!(0, "ext4: a flush for blocks of inode {} found written already failed", ino);
+            return false;
+        }
+        true
     }
 
     /// The blocks of `count` blocks of `file` from block `first` -- of those

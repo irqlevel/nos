@@ -178,6 +178,10 @@ EVENT_IDX = 29
 CTRL_VQ = 17
 MQ = 22
 MAX_PAIRS = 8
+# A chunk of a disk's image on nos's root, in the root's blocks of 4 KiB
+# (`fs::image::CHUNK_BYTES`): what a write into a hole has the filesystem
+# give the image first, and what a discard gives back whole.
+CHUNK_BLOCKS = (16 << 20) // 4096
 
 
 def interrupt_check(args, text, queue):
@@ -965,7 +969,10 @@ def disk(args):
     with open(os.path.join(content, "hello.txt"), "w") as f:
         f.write("nos-disk-hello\n")
     img = os.path.join(tmp, "disk.img")
-    subprocess.run(["mke2fs", "-q", "-F", "-t", "ext4", "-d", content, img, "%dM" % args.disk_mib],
+    # Blocks of 4 KiB, as a distribution's are: of 1 KiB, a small ext4 has
+    # a group every 8 MiB and a superblock's copy in every 16 MiB chunk of
+    # the image, none of which a trim could then give back whole.
+    subprocess.run(["mke2fs", "-q", "-F", "-t", "ext4", "-b", "4096", "-d", content, img, "%dM" % args.disk_mib],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
@@ -980,9 +987,12 @@ def disk(args):
           x("mkdir -p /mnt"),
           x("mount /dev/vda /mnt"),
           x("cat /mnt/hello.txt"),
-          x("dd if=/dev/zero of=/mnt/big bs=64k count=64", 120),
+          # 40 MiB: whole 16 MiB chunks of the image written into its
+          # holes -- each given to it ahead of the writes -- and, deleted
+          # and trimmed below, given back whole.
+          x("dd if=/dev/zero of=/mnt/big bs=1M count=40", 300),
           x("echo nos-wrote-this > /mnt/written.txt"),
-          x("sync", 120),
+          x("sync", 300),
           x("umount /mnt", 120),
           x("mount /dev/vda /mnt"),
           x("cat /mnt/written.txt"),
@@ -1043,10 +1053,10 @@ def disk(args):
         pt.check("vda is the image's size: %d sectors" % sectors, re.search(r"(?m)^%d$" % sectors, out(5)) is not None, out(5))
         pt.check("it mounts", "hv: vm 0:" not in out(7) and "mount:" not in out(7), out(7))
         pt.check("what the host put there reads back", "nos-disk-hello" in out(8), out(8))
-        pt.check("4 MiB written", re.search(r"4194304 bytes|64\+0 records out", out(9)) is not None, out(9))
+        pt.check("40 MiB written", re.search(r"41943040 bytes|40\+0 records out", out(9)) is not None, out(9))
         pt.check("sync returns", "hv: vm 0:" not in out(11), out(11))
         pt.check("remounted, what the guest wrote reads back", "nos-wrote-this" in out(14), out(14))
-        pt.check("so does the size of the big one", "4194304" in out(15), out(15))
+        pt.check("so does the size of the big one", "41943040" in out(15), out(15))
         pt.check(*interrupt_check(args, out(17), "req"))
         # Its disk's task on its own core -- the other thread of its vCPU's
         # -- or, its CPUs filling that core, on the core no guest has.
@@ -1070,16 +1080,26 @@ def disk(args):
         # the guest's reads and its writes over blocks the image had, off
         # it (`fs::image`); its writes into holes, through it.
         held = (r"image: /disk\.img let go of -- (\d+) batches read and (\d+) written off the VFS's lock, "
-                r"\d+ written through it, (\d+) blocks given back")
+                r"\d+ written through it")
+        chunks = r"image: /disk\.img: (\d+) blocks given ahead of writes, (\d+) chunks refused, (\d+) blocks given back"
         said = open(log, errors="replace").read() if args.acpi else (output_of(secs, "dmesg image:", 0) or "")
         m = re.search(held, said)
-        line = (re.search(r"(?m)^.*image: /disk\.img.*$", said) or [said[-600:]])[0]
+        g = re.search(chunks, said)
+        line = "\n".join(re.findall(r"(?m)^.*image: /disk\.img.*$", said)) or said[-600:]
         pt.check("the guest's disk was read and written off the VFS's lock",
                  m is not None and int(m.group(1)) > 0 and int(m.group(2)) > 0, line)
-        # 8 MiB written and deleted: at least half of it given back, in
-        # nos's root's blocks of 4 KiB.
-        pt.check("and what the guest trimmed given back to nos's root: 4 MiB at least",
-                 m is not None and int(m.group(3)) >= 1024, line)
+        # Its writes into holes: the chunk around each given to the file
+        # first, its blocks zeros, and the guest's data written over them
+        # off the lock -- a commit a chunk, rather than one a write. None
+        # refused: a refusal sends the write through the VFS, correct and a
+        # commit each, which nothing else here would see.
+        pt.check("its writes into holes given whole chunks of 16 MiB ahead of them, none refused",
+                 g is not None and int(g.group(1)) >= CHUNK_BLOCKS and int(g.group(2)) == 0, line)
+        # 44 MiB written and deleted, its discards aligned to the image's
+        # chunk: at least one chunk given back whole, in nos's root's blocks
+        # of 4 KiB.
+        pt.check("and what the guest trimmed given back to nos's root: a whole chunk at least",
+                 g is not None and int(g.group(3)) >= CHUNK_BLOCKS, line)
         if args.acpi:
             # The halt's lines are on the serial console: the shell gave it
             # back as it stopped, before the modules went.
@@ -1106,16 +1126,23 @@ def disk(args):
         pt.kill(p)
 
     # nos's own root, which every write of the guest's went through -- the
-    # holes of the image filled, blocks of it written over -- as nos left it:
-    # stopped, not unmounted, which e2fsck is to find clean all the same; or,
-    # with --acpi, unmounted by nos's own poweroff.
-    fsck = subprocess.run(["e2fsck", "-fn", image], capture_output=True)
+    # holes of the image filled, blocks of it written over -- as its next
+    # mount would find it: stopped, not unmounted, the newest of its changes
+    # in its journal, which nos writes home later and which neither e2fsck
+    # -n nor debugfs reads -- so replayed first, on a copy; or, with --acpi,
+    # unmounted by nos's own poweroff, nothing to replay.
+    judged = os.path.join(tmp, "root-replayed.img")
+    shutil.copyfile(image, judged)
+    replay = subprocess.run(["e2fsck", "-y", "-E", "journal_only", judged], capture_output=True)
+    pt.check("nos's root's journal replays", replay.returncode in (0, 1),
+             replay.stdout.decode(errors="replace")[-800:])
+    fsck = subprocess.run(["e2fsck", "-fn", judged], capture_output=True)
     pt.check("e2fsck finds nos's root clean after the guest's writes", fsck.returncode == 0,
              fsck.stdout.decode(errors="replace")[-800:])
 
     # The image as nos's root filesystem has it, after the guest's writes.
     back = os.path.join(tmp, "back.img")
-    got = subprocess.run(["debugfs", "-R", "dump /disk.img " + back, image], capture_output=True)
+    got = subprocess.run(["debugfs", "-R", "dump /disk.img " + back, judged], capture_output=True)
     pt.check("the image comes back out of nos's root", got.returncode == 0 and os.path.exists(back),
              got.stderr.decode(errors="replace")[-300:])
     if os.path.exists(back):
@@ -1852,7 +1879,7 @@ def main():
     ap.add_argument("--disk", action="store_true",
                     help="instead: a virtio disk for the guest (needs --initrd, and a guest kernel with PCI, "
                          "legacy virtio-pci, virtio-blk and ext4)")
-    ap.add_argument("--disk-mib", type=int, default=32, help="the guest disk image's size")
+    ap.add_argument("--disk-mib", type=int, default=64, help="the guest disk image's size")
     ap.add_argument("--nvme-root", action="store_true",
                     help="nos's root filesystem on an NVMe disk rather than virtio-blk (the AX41's)")
     ap.add_argument("--net", action="store_true",
