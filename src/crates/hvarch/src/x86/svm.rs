@@ -10,7 +10,7 @@
 
 use core::arch::{asm, naked_asm};
 use core::mem::offset_of;
-use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kcore::dma::DmaBuffer;
 use kcore::percpu::ConstInit;
@@ -406,106 +406,7 @@ pub enum NotRun {
     Xstate { cpu: u32, xcr0: u64 },
 }
 
-/// What another CPU does to have a guest that is running leave it -- the
-/// guests' switch with a frame for it, a disk's task with what it asked --
-/// and what [`Guest::run`] looks at, with interrupts off, before it enters:
-/// KVM's vCPU mode, as its kick uses it.
-///
-/// A guest's turn ends when the host takes an interrupt, and not before.
-/// Work handed to a vCPU that is in its guest waits for that -- the host's
-/// next tick, milliseconds, while a busy guest's inbox overflows -- unless
-/// its CPU is interrupted now. The vCPU's side, in this order: `prepare`,
-/// then its last look at what may be waiting for the guest, then
-/// [`Guest::run`] -- which enters only if no kick came meanwhile, and marks
-/// the vCPU outside again on the way back -- or `cancel`, when it does not
-/// enter at all. The other side: what it has for the guest made visible,
-/// then `kick`. The vCPU's last look finds the work, or the kick finds the
-/// vCPU in its guest or on its way in: then its CPU is interrupted, which
-/// ends the guest's turn -- or, taken by the host before interrupts went
-/// off there, leaves the entry to be refused. One interrupt at most per
-/// entry, however many kick.
-pub struct Kick {
-    mode: AtomicU8,
-    /// The CPU the vCPU last entered its guest on.
-    cpu: AtomicU32,
-    /// Interrupts sent: kicks that found the vCPU in its guest or on its
-    /// way in.
-    sent: AtomicU64,
-}
-
-/* A vCPU's modes. */
-const OUTSIDE_GUEST: u8 = 0;
-const IN_GUEST: u8 = 1;
-const EXITING_GUEST: u8 = 2;
-
-impl Kick {
-    pub const fn new() -> Kick {
-        Kick { mode: AtomicU8::new(OUTSIDE_GUEST), cpu: AtomicU32::new(0), sent: AtomicU64::new(0) }
-    }
-
-    /// How many kicks interrupted the vCPU's CPU.
-    pub fn sent(&self) -> u64 {
-        self.sent.load(Ordering::Relaxed)
-    }
-
-    /// The vCPU's: from here a kick refuses its next entry. Before its last
-    /// look at what may be waiting for the guest -- the fence orders the two,
-    /// against `kick`'s.
-    pub fn prepare(&self) {
-        self.mode.store(IN_GUEST, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-    }
-
-    /// The vCPU's: it will not enter after all -- it halts, or stops.
-    pub fn cancel(&self) {
-        self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
-    }
-
-    /// Another CPU's, from any context: something is waiting for the guest,
-    /// made visible before this.
-    pub fn kick(&self) {
-        fence(Ordering::SeqCst);
-        if self.mode.compare_exchange(IN_GUEST, EXITING_GUEST, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-            kcore::cpu::kick(self.cpu.load(Ordering::SeqCst));
-            self.sent.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Another CPU's, from any context, once it has posted an interrupt for
-    /// the vCPU (`vmx::PostedInterrupts::post`): the posted-interrupt
-    /// notification to the CPU the vCPU is in its guest on, or on its way
-    /// in to -- which takes what was posted there without an exit -- and
-    /// true; false when it is neither, for the caller to wake it instead.
-    /// A vCPU on its way in looks at what was posted after `prepare`, so it
-    /// either finds the interrupt or is sent the notification; one that
-    /// left meanwhile takes the notification as a host interrupt with
-    /// nothing to do, and what was posted at its next look.
-    pub fn notify(&self) -> bool {
-        fence(Ordering::SeqCst);
-        if self.mode.load(Ordering::SeqCst) != IN_GUEST {
-            return false;
-        }
-        kcore::cpu::notify(self.cpu.load(Ordering::SeqCst));
-        true
-    }
-
-    /// [`Guest::run`]'s, with interrupts off on `cpu`: whether to enter.
-    /// The CPU is stored before the mode is read, so that a kick that finds
-    /// the vCPU in its guest after this interrupts the CPU it is on.
-    pub(crate) fn entering(&self, cpu: u32) -> bool {
-        self.cpu.store(cpu, Ordering::SeqCst);
-        if self.mode.load(Ordering::SeqCst) == IN_GUEST {
-            true
-        } else {
-            self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
-            false
-        }
-    }
-
-    pub(crate) fn left(&self) {
-        self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
-    }
-}
+pub use super::kick::Kick;
 
 /// A nested page table as an entry needs it: the physical address of its
 /// top level, and an identity no other table ever has -- nor this one, once

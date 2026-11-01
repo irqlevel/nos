@@ -1679,7 +1679,11 @@ on the AX41 a guest writing back what `apt-get update` had fetched stalled
 for seconds at a time ([On real hardware](#on-real-hardware)). Now the notify
 only takes the requests off the ring -- a write's data copied out of guest
 memory into a buffer of the device's -- and hands them to the backend, which
-serves them in order on a task of its own, on a CPU other than the vCPU's.
+serves them in order on a task of its own, on a CPU other than the vCPU's:
+every request waiting at once as one lot -- a run of reads one vector to
+the image and a run of writes another, their blocks with the device
+together, and a flush, a discard or a write of zeros on its own between
+them (`modules/hv/src/disk.rs`).
 Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
 an interrupt; and as it finishes each the task wakes a halted vCPU or kicks
@@ -1697,29 +1701,33 @@ request and gives it back served): the module's `FileDisk` holds the image
 else may write the file, cut it, grow it, rename it or remove it while the
 disk has it, nor its filesystem be unmounted -- [A disk's
 image](filesystems.md#a-disks-image)), reads and writes it where the guest
-asks -- within the file's size, never growing it -- off the VFS's lock,
-the image mapping the blocks under it and moving them itself, and for a
-guest's flush, offered and taken by ext4, flushes the device: the
-filesystem's sync only after a write into a hole, which goes through the
-VFS. Which file it is comes first, so that a second guest's disk on it is
+asks -- within the file's size, never growing it -- with no lock of the
+VFS's taken, through the file's map the image holds, a write into a hole
+first growing the file by the 16 MiB chunk around it, and for a guest's
+flush, offered and taken by ext4, flushes the device: the filesystem's sync
+only after a write the filesystem had to take itself. Which file it is comes first, so that a second guest's disk on it is
 refused saying whose it is (`Claims`), and only then is it held. The
 report counts each disk's reads, writes, flushes and errors, and the image
 says as it is let go of how many of its batches went off the lock and how
 many through it.
 
-**What a guest no longer needs it gives back.** The disk offers discard
+**What a guest no longer needs it gives back -- a chunk at a time.** The disk offers discard
 and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the
 guest may only read offers neither): a guest's `fstrim`, ext4 mounted
 with `discard`, `blkdiscard`, `mkfs` of its own disk -- ranges of sectors,
-up to eight a request and 64 MiB a range, aligned best to 4 KiB. The device
+up to eight a request and 64 MiB a range, aligned best to what the image
+gives back whole -- its chunk (`Backend::discard_sectors`,
+`Image::discard_unit`), 4 KiB where it gives back nothing -- so that the
+guest splits its discards on a chunk's edge and sends none shorter. The device
 copies the ranges out of the guest's memory once, checks them in its own
 copy -- whole sectors inside the disk, no flag but a write of zeros'
 unmap -- and hands the backend that copy (`Request::ranges`): a guest that
 changes them after the check changes nothing it was checked on. The image
-gives the whole blocks of a discard back to nos's root (`Image::discard`,
-`Vfs::punch`, ext2's `punch`): holes in its file from then on, reading as
-zeros, its size as it was -- so an image no longer only grows. A write of
-zeros with unmap gives back the blocks it covers whole and writes zeros
+gives the whole chunks of a discard back to nos's root (`Image::discard`,
+`Vfs::punch`, ext4's and ext2's `punch`): holes in its file from then on,
+reading as zeros, its size as it was -- so an image no longer only grows;
+what a discard covers of a chunk only in part is left the guest's. A write
+of zeros with unmap gives back the chunks it covers whole and writes zeros
 over the rest; without, it writes zeros, its blocks kept. ext2 gives the
 blocks back in batches in truncate's order -- each batch's pointers
 cleared and on the disk, the inode committed, and only then the blocks
@@ -2393,6 +2401,95 @@ each other without end -- 46% of it each, the idle task never running -- where
 one alone took 0.1%. Blocking, the same two take 0.1% each, and sixteen idle
 guests on the AX41's twelve CPUs -- four of them carrying two -- keep the
 machine 1.6% busy, 0.1% a vCPU.
+
+**A halt that ends soon is spun through** (halt polling, KVM's way: the
+`POLL_*` constants in `hv/src/run.rs`). Before its task sleeps, a halted
+vCPU spins on its doorbell for a while (`Doorbell::poll`) -- on a host CPU
+that is its guest's own -- so that a ring that comes within the spin, an IPI
+from another of the guest's CPUs or a disk's answer, costs no wakeup and no
+schedule. The spin starts at none, doubles from 10 us after every halt that
+was short and outlasted it, up to 200 us, and is dropped after a halt longer
+than that: a guest that idles until its next tick spins not at all, and one
+whose CPUs wake each other within microseconds -- a pipe between two
+processes, a database's clients and its server -- is caught spinning. It is
+never spun up to an edge of the guest's own timers: an edge sooner than the
+spin is slept to, so the loop always waits once a halt goes unanswered --
+and a sleep to its own APIC timer's edge ends 10 us short of it, the rest
+spun (`TIMER_ADVANCE_NS`, KVM's timer advance), so that what a wake costs
+the host -- its timer's interrupt, a schedule, a switch, which made the
+EX44's guests' timer interrupts 9-10 us late on average -- comes before the
+edge rather than after it. A ring of a vCPU that spins sets the word it
+watches and signals nothing (`Doorbell::ring`), its task not being asleep:
+the word is stored before the spinner is looked for, and the spinner stops
+before it looks at the word a last time, so of the two one sees the other.
+The report counts the halts spun for and those a ring ended in the spin.
+Under KVM, on the EX44, the polls caught 36 million of a Linux guest's 40
+million halts in a benchmark's run, and the pipe's round trip took 6 us
+where nos's took 14 ([`plans/vm-performance.md`](../plans/vm-performance.md));
+with the spin, 89% of 50 million and 8.5-9.3 us.
+
+**After a write of its TSC deadline, or of an IPI to other CPUs, a CPU goes
+straight back in** -- KVM's fast path for the same two writes, half of a
+Linux guest's exits. The loop's round -- the mail, what was posted, the
+devices' work, the APIC's state handed in again -- is left out where the last
+entry had the CPU deliver the APIC's interrupts and nothing waits: no ring
+since the last look (`Doorbell::take_rung`), no mail, nothing posted that the
+CPU has not taken -- a notification that came as a host interrupt after the
+exit leaves its descriptor's ON bit set (`PostedInterrupts::outstanding`) --
+no edge of its own timer due, nothing to give back. The host's timer is armed
+for the timer's edge, which the write may have moved. An IPI that reaches the
+sender's own APIC changes what the round would hand in, and goes the round.
+On the EX44 an exit cost the host 545-559 ns handled and 479-496 ns to the
+next entry, past the world switch.
+
+**An edge of its own timers that comes on the way in is taken a round
+later**, not at the host's next tick. The loop looks at its timers, and
+arms the host's timer for their next edge a few hundred nanoseconds later
+-- and the host's timer is armed for none gone by: an edge that fell between
+the two was owed to a guest that then ran on to its next exit, a host tick
+for one that computes. The EX44's guests saw one 10 ms late at most. The loop
+looks again after arming, before anything is handed in for the entry, and
+goes round again where an edge has come. That was not all of it: the EX44's
+guests still saw an edge 10009 us late at most after it (64d61a78), so the
+report says where such edges were waited for -- `late`: the timer interrupts
+more than 1 ms past their edges (`LATE_NS`), by what the vCPU's task did
+before the round that found them (slept to a time with that edge in it and
+woke more than 1 ms past it, rung or not; woke on time; slept without that
+edge; spun, or slept for good; came round more than 1 ms after an exit, off
+its CPU or busy; ran its guest until an interrupt of the host's took it out,
+or an exit of its own), the sleeps that ended more than 1 ms past their
+time, and each CPU its own. It said (a68aeb3a): of 12388 such interrupts in
+a run, 241 after a host's interrupt took a guest out that had computed past
+its edge -- the 10 ms, a host tick -- and 12078 after sleeps that had the
+edge and ended 1-3 ms past their time, 0.12% of the sleeps, nearly all by a
+ring. Those are the machine's own: its cyclictest's most is 3.1 ms under
+KVM as under nos, and the scheduler's wake-ups on every CPU come at most
+3-4.6 ms late since boot.
+
+**The host's timer is armed for the edge as the entry is made**
+(`Kick::arm_at`, `Kick::entering`), with interrupts off on the CPU from there
+until the guest runs. Armed in the loop's round, a few hundred nanoseconds
+before, it was lost to any interrupt of the host's timer that came between
+-- a sleeper's deadline, the slice's end -- whose handler re-arms the timer
+for the host's next tick (`Cpu::local_timer_fired`): the guest then computed
+past its edge until that tick. An edge that has come by the entry turns it
+back, for the round to take it. The report counts those among the entries
+turned back (`kicked`), and its `worst` line says how the latest timer
+interrupt of a run was waited for -- after the guest ran, when it was
+entered, what the host's timer was asked for and when it left. The order
+in `entering` is the arming first and the look after: `timer_at` arms
+nothing for an edge gone by, and with the look first an edge that went by
+between the two -- a few hundred nanoseconds -- left the timer unarmed and
+the guest computing for 10 ms (7ae441c4, whose `worst` line said: "10009
+us past its edge, after an interrupt of the host's took the guest out: the
+guest entered 0 us from the edge, the host's timer asked for 0 us from it").
+hv-fuzz's platform target runs hvarch's `Kick` as it is
+(`hvarch/src/x86/kick.rs`, kept apart from the backends for that), has the
+host's tick land on the way in, re-arming its timer so, and the clock reach
+the deadline `timer_at` is asked for now and then as it is asked, and holds
+every entry to a timer armed no later than the edge its loop asked for: the
+arming in the round is found at its 167th input, the look before the arming
+at its 43rd.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
@@ -4853,7 +4950,12 @@ someone else's; then speed.
 
 #### Speed
 
-1. **The CPU a guest is shown**, above, is the largest lever on Intel.
+1. **The CPU a guest is shown**, above, is the largest lever on Intel. One
+   piece of it: the microcode revision a guest reads (IA32_BIOS_SIGN_ID) is
+   the host's on Intel, as KVM tells it, where it was 0 -- Ubuntu's 6.8
+   then took the EX44's Raptor Lake for one with the INVLPG erratum's old
+   microcode and turned PCID off ("Incomplete global flushes, disabling
+   PCID"), a whole TLB flush at every switch of process.
 2. ~~**The disk is one request at a time, machine-wide.**~~ A guest's
    image is held and read and written off the VFS's lock (`fs::image`):
    its block map resolved under it, the blocks moved without it, a flush
@@ -4866,16 +4968,23 @@ someone else's; then speed.
    off its own image: 1.30 and 1.35 s each where it was 1.86 and 1.69,
    reads of 64 KiB 0.74 where they were 1.02, writes of 4 KiB 1.55 and 1.61
    where they were 1.84 and 1.69; one guest alone the same, within the
-   spread. Left: each disk serves its requests one at a time, on its one
-   task. Four tasks a disk -- the image's reads side by side in lanes of
-   their own, its writes one at a time -- were tried and measured, and left
+   spread. Then (2026-10-31, [`plans/vm-performance.md`](../plans/vm-performance.md),
+   after a comparison with QEMU/KVM on the EX44 found a guest's first
+   write into its disk at 1% of KVM's speed and its queued reads at 8%):
+   the image holds the file's map and takes no lock of the VFS's at all; a
+   write into a hole grows the file by the 16 MiB chunk around it, zeroed
+   by the device, a commit a chunk rather than one a batch; the NVMe
+   driver's commands are as big as MDTS lets them be, a batch's contiguous
+   blocks one command named by a PRP list, where every 4 KiB block was a
+   command of its own waited for alone; and a disk's task serves every
+   request waiting at once as one batch, where it served them one at a
+   time. Four tasks a disk -- the image's reads side by side in lanes of
+   their own, its writes one at a time -- were tried before that and left
    out: slower wherever they differed, two guests' four writers of 64 KiB
    8.5 s each where they were 1.2, since four lanes' batches of up to 16
-   pieces take every one of the NVMe driver's 64 command IDs and the one
-   left waiting sleeps 50 microseconds at a time, and each extra task's
-   wakeup is an IPI that nested under KVM is an exit. A disk with many
-   requests in flight wants the block layer's asynchronous path from one
-   task (`Disk::submit`), its command IDs budgeted, not more tasks.
+   pieces took every one of the NVMe driver's 64 command IDs and the one
+   left waiting slept 50 microseconds at a time, and each extra task's
+   wakeup is an IPI that nested under KVM is an exit.
 3. **Fewer exits a request.** EVENT_IDX done ([A disk](#a-disk)): the
    receive ring's refills no longer notify, and a disk with every buffer
    out takes no notify it cannot act on. Left: NO_NOTIFY, the flag's way of

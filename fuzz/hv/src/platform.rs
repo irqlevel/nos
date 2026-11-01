@@ -1482,6 +1482,32 @@ static NOTIFIED: AtomicU64 = AtomicU64::new(0);
 /// the host -- and those it made by the register, the word clear.
 static PV_EOI_BY_WORD: AtomicU64 = AtomicU64::new(0);
 static PV_EOI_BY_REGISTER: AtomicU64 = AtomicU64::new(0);
+/// The run loop's own ways round, for `HV_FUZZ_STATS`: entries made without
+/// its round (a TSC deadline's or an IPI's write), timer edges that came on
+/// the way in and were taken a round later, sleeps ended short of a timer
+/// edge and spun to it.
+static FAST: AtomicU64 = AtomicU64::new(0);
+static RACED: AtomicU64 = AtomicU64::new(0);
+static ADVANCED: AtomicU64 = AtomicU64::new(0);
+/// Timer interrupts the loop requested more than 1 ms past their edges,
+/// after a sleep and otherwise, and sleeps that ended that long past their
+/// time (`run::LATE_NS`).
+static LATE_SLEPT: AtomicU64 = AtomicU64::new(0);
+static LATE_OTHER: AtomicU64 = AtomicU64::new(0);
+static OVERSLEPT: AtomicU64 = AtomicU64::new(0);
+
+/// A guest CPU's run's exits, its ways round counted.
+fn exits_of(counts: crate::run::Counts) -> u64 {
+    FAST.fetch_add(counts.fast, Ordering::Relaxed);
+    RACED.fetch_add(counts.timer_raced, Ordering::Relaxed);
+    ADVANCED.fetch_add(counts.advanced, Ordering::Relaxed);
+    LATE_SLEPT.fetch_add(counts.late_woke_late + counts.late_woke_on_time + counts.late_not_slept_for,
+                         Ordering::Relaxed);
+    LATE_OTHER.fetch_add(counts.late() - counts.late_woke_late - counts.late_woke_on_time - counts.late_not_slept_for,
+                         Ordering::Relaxed);
+    OVERSLEPT.fetch_add(counts.overslept, Ordering::Relaxed);
+    counts.exits
+}
 
 fn mov_checked(what: &'static str) {
     *MOV_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
@@ -1498,6 +1524,12 @@ pub fn report() {
     for (what, n) in MOV_CHECKED.lock().unwrap().iter() {
         println!("  {}: {}", what, n);
     }
+    println!("  platform: {} entries made without the loop's round, {} timer edges taken a round later, {} sleeps \
+              ended short of a timer edge and spun", FAST.load(Ordering::Relaxed), RACED.load(Ordering::Relaxed),
+             ADVANCED.load(Ordering::Relaxed));
+    println!("  platform: {} timer interrupts more than 1 ms late after a sleep, {} otherwise; {} sleeps ended more \
+              than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
+             OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
     println!("  platform: PV EOIs {} through the word, {} by the register", PV_EOI_BY_WORD.load(Ordering::Relaxed),
@@ -1568,7 +1600,7 @@ fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machin
             time::progressed();
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 vm::wait_turn(i);
-                guest.run(&mut gc, &machine, deadline, &*host).exits
+                exits_of(guest.run(&mut gc, &machine, deadline, &*host))
             }));
             if ran.is_err() {
                 vm::abort();
@@ -1704,7 +1736,7 @@ pub fn platform(r: &mut Input) {
     let (guest, machine) = (Arc::new(guest), Arc::new(machine));
     let exits = if n == 1 {
         vm::set_vcpu(0);
-        guest.run(&mut vcpus[0], &machine, deadline, &*fuzz_host).exits
+        exits_of(guest.run(&mut vcpus[0], &machine, deadline, &*fuzz_host))
     } else {
         run_threads(&guest, vcpus, &machine, deadline, &fuzz_host)
     };

@@ -216,6 +216,80 @@ bool setup_cpu_performance(CpuPerformance* out)
     return true;
 }
 
+/* What idle sleeps with (setup_idle): the deep MWAIT hint, and whether it
+   is set up -- written on the BSP before any AP starts, and only read
+   after. The line MONITOR arms is one nothing writes: an interrupt is what
+   wakes an idle CPU here, as from a HLT. */
+static u32 idle_mwait_hint;
+static bool idle_mwait_on;
+static u64 idle_monitor_line[8] __attribute__((aligned(64)));
+
+bool setup_idle(u32* hint)
+{
+    static const u32 LEAF_BASIC = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_MWAIT = 5;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_MONITOR = 1U << 3;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_EAX_ARAT = 1U << 2;
+    /* Leaf 5, ECX: MWAIT's extensions enumerated, and among them an
+       interrupt ending an MWAIT though interrupts are masked */
+    static const u32 MWAIT_ECX_EXTENSIONS = 1U << 0;
+    static const u32 MWAIT_ECX_INTERRUPT_BREAK = 1U << 1;
+    /* Leaf 5, EDX: the sub-states MWAIT takes of each C-state, four bits
+       each, C0 first -- of C-state n, the hint's bits 7:4 are n - 1 and its
+       bits 3:0 the sub-state */
+    static const u32 MWAIT_STATES = 8;
+    static const u32 MWAIT_STATE_BITS = 4;
+    static const u32 MWAIT_STATE_MASK = 0xF;
+
+    *hint = 0;
+    if (!kernel::Parameters::get_instance().is_idle_mwait())
+        return false;
+    if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
+        return false;
+    CpuidResult f = cpuid(LEAF_FEATURES);
+    if (!(f.ecx & FEATURES_ECX_MONITOR) || (f.ecx & FEATURES_ECX_HYPERVISOR))
+        return false;
+    if (!(cpuid(LEAF_POWER).eax & POWER_EAX_ARAT))
+        return false;
+    CpuidResult mwait = cpuid(LEAF_MWAIT);
+    static const u32 MWAIT_ECX_NEEDED = MWAIT_ECX_EXTENSIONS | MWAIT_ECX_INTERRUPT_BREAK;
+    if ((mwait.ecx & MWAIT_ECX_NEEDED) != MWAIT_ECX_NEEDED)
+        return false;
+    u32 states = mwait.edx;
+    for (u32 n = MWAIT_STATES - 1; n >= 1; n--)
+    {
+        u32 subs = (states >> (n * MWAIT_STATE_BITS)) & MWAIT_STATE_MASK;
+        if (subs != 0)
+        {
+            idle_mwait_hint = ((n - 1) << MWAIT_STATE_BITS) | (subs - 1);
+            idle_mwait_on = true;
+            *hint = idle_mwait_hint;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool idle_masked()
+{
+    return idle_mwait_on;
+}
+
+void cpu_idle_masked(bool deep)
+{
+    /* ECX bit 0: an interrupt ends the MWAIT though interrupts are off --
+       one already pending ends it at once -- and is taken once they are on
+       again. C1 is hint 0, as a HLT. */
+    static const ulong MWAIT_INTERRUPT_BREAK = 1;
+    static const ulong MWAIT_C1 = 0;
+    ulong hint = (deep && idle_mwait_on) ? (ulong)idle_mwait_hint : MWAIT_C1;
+    asm volatile("monitor" : : "a"(idle_monitor_line), "c"(0UL), "d"(0UL) : "memory");
+    asm volatile("mwait" : : "a"(hint), "c"(MWAIT_INTERRUPT_BREAK) : "memory");
+}
+
 ulong mmio_premapped_va(ulong phys_addr, ulong size_bytes)
 {
     (void)phys_addr;

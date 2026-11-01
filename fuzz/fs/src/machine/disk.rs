@@ -186,8 +186,32 @@ impl Disk {
         }
     }
 
+    /// What a power cut keeps of the cache.
     pub fn seed_chaos(&mut self, seed: u64) {
         self.chaos = seed | 1;
+    }
+
+    /// `data` written at byte `at`: on the medium where the device has no
+    /// cache or `fua` says so, else a sector at a time into the cache.
+    fn put(&mut self, at: u64, data: &[u8], fua: bool) {
+        self.current.write(at, data);
+        if !self.volatile {
+            self.durable.write(at, data);
+            return;
+        }
+        let ss = self.sector_size as usize;
+        let first = at / self.sector_size;
+        if fua {
+            /* On the medium now, and whatever the cache held of these
+             * sectors superseded. */
+            self.durable.write(at, data);
+            let end = first + (data.len() / ss) as u64;
+            self.cache.retain(|(s, _)| *s < first || *s >= end);
+        } else {
+            for (i, piece) in data.chunks(ss).enumerate() {
+                self.cache.push((first + i as u64, piece.to_vec()));
+            }
+        }
     }
 
     fn chaos_next(&mut self) -> u64 {
@@ -251,6 +275,16 @@ pub fn register(index: usize) -> Option<block::Disk> {
     let dev = block::register_driver(&name, &DRIVERS[index])?;
     with(index, |d| d.handle = dev.handle());
     Some(dev)
+}
+
+/// How many requests have failed on every disk there is, in all: what a
+/// target tells a call refused for a failed request apart from one refused
+/// for no reason by.
+pub fn failures() -> u64 {
+    sched::harness(|| {
+        let g = DISK.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().flatten().map(|d| d.log.iter().filter(|io| !io.ok).count() as u64).sum()
+    })
 }
 
 /// Which slot's disk the block layer's handle `handle` is, if one is.
@@ -343,29 +377,11 @@ impl block::BlockDriver for RamDisk {
 
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         let op = if fua { Op::WriteFua } else { Op::Write };
-        self.request(op, sector, data.len(), |d, at| {
-            d.current.write(at, data);
-            if !d.volatile {
-                d.durable.write(at, data);
-                return;
-            }
-            let ss = d.sector_size as usize;
-            let first = at / d.sector_size;
-            if fua {
-                /* On the medium now, and whatever the cache held of these
-                 * sectors superseded. */
-                d.durable.write(at, data);
-                let end = first + (data.len() / ss) as u64;
-                d.cache.retain(|(s, _)| *s < first || *s >= end);
-            } else {
-                for (i, piece) in data.chunks(ss).enumerate() {
-                    d.cache.push((first + i as u64, piece.to_vec()));
-                }
-            }
-        })
+        self.request(op, sector, data.len(), |d, at| d.put(at, data, fua))
     }
 
     fn flush(&'static self) -> bool {
         self.request(Op::Flush, 0, 0, |d, _| d.flush_cache())
     }
+
 }

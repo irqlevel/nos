@@ -148,6 +148,29 @@ struct CpuPerformance
    each AP. Defined per arch. */
 bool setup_cpu_performance(CpuPerformance* out);
 
+/* How an idle CPU sleeps (cpu_idle_masked), decided once on the BSP, before
+   the APs start: on x86, by MWAIT, deep in the deepest C-state CPUID's leaf
+   5 offers -- where the kernel was booted with idle=mwait, the CPU has
+   MONITOR/MWAIT and takes an interrupt as the end of one though interrupts
+   are masked, an APIC timer that runs in every C-state (ARAT), which is the
+   only timer this kernel is woken by, and no hypervisor under it. True when
+   it was set up, `hint` the deep MWAIT hint; false where an idle CPU halts,
+   always: HLT, or arm64's WFI. Defined per arch. */
+bool setup_idle(u32* hint);
+
+/* Whether setup_idle set MWAIT up: an idle CPU sleeps by cpu_idle_masked
+   then, and halts with interrupts on otherwise. Defined per arch. */
+bool idle_masked();
+
+/* With interrupts off, and only where idle_masked(): this CPU idle until an
+   interrupt is pending -- in the C-state setup_idle chose where `deep`, the
+   CPU out of the count of busy cores a busy core's turbo is figured from
+   and slower to wake, and in C1 otherwise -- or until a spurious wake. It
+   returns with interrupts still off, so that its caller can read the clock
+   before the interrupt is taken; the interrupt is taken as they are turned
+   back on. Defined per arch. */
+void cpu_idle_masked(bool deep);
+
 /* How fast read_cycle_counter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.
    Defined per arch. */

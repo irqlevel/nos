@@ -124,9 +124,30 @@ pub(super) fn map(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Op
     }
 }
 
+/// `map`, but an unwritten run named as the blocks it has, and as
+/// unwritten (true): what a disk's image writes into, its file given them
+/// ahead of its writes -- held, as a written run is, to the blocks a file
+/// may own. A file mapped by blocks has none.
+pub(super) fn map_extent(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<(Map, bool)> {
+    match walk(src, ino, raw, lblock, true)? {
+        (Map::Blocks { block, run }, _) if !src.meta().file_may_own(block, run) => {
+            trace!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
+                   run);
+            None
+        }
+        m => Some(m),
+    }
+}
+
 /// `map`, but for the journal's inode, whose blocks are the system zone's
 /// by what they are: held only to the filesystem's bounds.
 pub(super) fn map_any(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
+    walk(src, ino, raw, lblock, false).map(|(m, _)| m)
+}
+
+/// The walk the maps share: an unwritten run a hole unless `unwritten`
+/// asks for it as its blocks.
+fn walk(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64, unwritten: bool) -> Option<(Map, bool)> {
     let node = Inode::new(raw)?;
     let (fs_blocks, bs, csum, seed) = {
         let m = src.meta();
@@ -143,13 +164,15 @@ pub(super) fn map_any(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -
         }
         Ok(())
     };
-    let mapped = if extents {
-        extent::map(node.i_block(), lblock, fs_blocks, bs, ino, &mut read)
+    let mapped = if extents && unwritten {
+        extent::map_extent(node.i_block(), lblock, fs_blocks, bs, ino, &mut read)
+    } else if extents {
+        extent::map(node.i_block(), lblock, fs_blocks, bs, ino, &mut read).map(|m| (m, false))
     } else {
-        blockmap::map(node.i_block(), lblock, bs, ino, &mut read)
+        blockmap::map(node.i_block(), lblock, bs, ino, &mut read).map(|m| (m, false))
     };
     match mapped {
-        Ok(Map::Blocks { block, run }) if block.checked_add(run).is_none_or(|e| e > fs_blocks) => {
+        Ok((Map::Blocks { block, run }, _)) if block.checked_add(run).is_none_or(|e| e > fs_blocks) => {
             trace!(0, "ext4: inode {}: blocks {}..+{} past the filesystem", ino, block, run);
             None
         }

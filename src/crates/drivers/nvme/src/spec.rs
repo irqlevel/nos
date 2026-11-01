@@ -60,6 +60,10 @@ pub const OPC_FLUSH: u8 = 0x00;
 pub const OPC_WRITE: u8 = 0x01;
 pub const OPC_READ:  u8 = 0x02;
 
+/* A PRP list: a page of 8-byte entries, each a page's address */
+pub const PRP_ENTRY_SIZE: usize = 8;
+pub const PRP_LIST_ENTRIES: usize = kcore::consts::PAGE_SIZE / PRP_ENTRY_SIZE;
+
 /* Identify CNS values */
 pub const CNS_CONTROLLER: u32 = 0x01;
 pub const CNS_NAMESPACE:  u32 = 0x00;
@@ -144,6 +148,7 @@ pub const ID_CTRL_SN_LEN:  usize = 20;
 pub const ID_CTRL_MN_AT:   usize = 24;  /* model number, 40 bytes of ASCII */
 pub const ID_CTRL_MN_LEN:  usize = 40;
 pub const ID_CTRL_MDTS_AT: usize = 77;  /* Max Data Transfer Size (2^n pages, 0 = unlimited) */
+pub const ID_CTRL_ONCS_AT: usize = 520; /* Optional NVM Command Support, u16 */
 
 /* Identify Namespace */
 pub const ID_NS_NSZE_AT:  usize = 0;    /* Namespace Size (total blocks), u64 */
