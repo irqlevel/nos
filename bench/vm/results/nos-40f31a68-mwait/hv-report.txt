@@ -1,0 +1,30 @@
+hv: vm 1 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffffa7c03fb7
+  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffffa7c03fb7, after 2597271 ms
+  exits      123289690 total: 357434 port in, 8554730 port out, 1860814 cpuid, 342 rdmsr, 54363581 wrmsr (11 #GP), 1202 irq, 48990259 hlt, 20231 pause, 6665835 host
+  kicked     2475491 entries turned back for a frame, a disk's answer or an IPI that came on the way in
+  answered   0 #UD for instructions CPUID did not offer, 13 WBINVD stepped past, 0 CR8 from the shadow TPR, 8 CR0 writes (VT-x), 0 #DB and #AC given back
+  cr4        20 reads and writes performed (AMD-V), 0 writes refused with #GP
+  dr0-3      24 reads and writes of its own (AMD-V), 0 not made: a #GP or a #DB in their place
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  halted     slept 4541471 ms in 12348427 sleeps, 43% of the run (of each CPU's, on average); 50199967 halts spun for a ring first, 44532967 of them woken in the spin
+  loop       545 ns an exit handled and 479 ns to the next entry, on average; 466 ns a write of an MSR's handling
+  irq        1202 from the 8259 (0 timer, 1202 serial), 0 edges, 905 blocked; PIC irr 0x00 isr 0x00 imr 0xff; PIT ch0 mode 0 reload 0 run true
+  apic       0 interrupts from the local APICs, 7895152 of their timers -- late past their edges by 9 us on average, 10013 us at most; 40486586 IPIs sent, 46399833 taken; 7548444 MSIs
+  posted     48039915 interrupts posted for a CPU to take in its guest, 1999076 with a notification sent to the CPU it ran on
+  apicv      123289356 entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); 0 EOIs it stopped the guest after, of level-triggered vectors
+  cpus       4, 3 started by the guest (3 INITs, 3 start-up IPIs taken)
+  cpu 0      27972761 exits, 0 apic irq, 7113637 ipi sent, 8555149 hlt, slept 42% -- running, on host cpu 41
+  cpu 1      31688911 exits, 0 apic irq, 10921728 ipi sent, 13165419 hlt, slept 45% -- halted with interrupts off, on host cpu 40
+  cpu 2      30253037 exits, 0 apic irq, 11410571 ipi sent, 12347132 hlt, slept 46% -- halted with interrupts off, on host cpu 33
+  cpu 3      33374981 exits, 0 apic irq, 11040650 ipi sent, 14922559 hlt, slept 40% -- halted with interrupts off, on host cpu 32
+  acpi       taken by the guest's OS; 0 SCIs, the power button pressed 0 times
+  vda        8192 MiB: 6459512 reads (73852921 KiB), 7937958 writes (148167914 KiB), 518383 flushes, 0 errors; 3685 discards (38115656 KiB), 0 writes of zeros (0 KiB); 8420043 notifies, 7548379 interrupts
+  eth0       40 frames sent, 33 received, 0 dropped; 0 sends of TCP up to 64 KiB, 0 received whole; notifies 40 to send, 4 to receive; interrupts 40 for sends, 25 for receives; 4 of 4 queue pairs in use, 1 commands (0 refused)
+  busiest in ports 0x21:1202 0x71:111 0x2e9:3 0x2f9:3 0x3e9:3 0x87:1
