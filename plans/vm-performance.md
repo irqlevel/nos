@@ -4,6 +4,10 @@
 hypervisor as under QEMU/KVM on Linux -- and where it is not, a measured
 reason that is a choice, not an accident.
 
+**The kit and what is left:** the comparison is [`bench/vm`](../bench/vm/README.md),
+every run's results kept there; what still falls behind, and where to look,
+is [`vm-perf-todo.md`](vm-perf-todo.md).
+
 **Where it comes from:** the comparison on the EX44 of 2026-10-31. One disk
 image -- Ubuntu 24.04's cloud image (serial 20261017, kernel 6.8.0-147), 4
 vCPUs, 8 GiB, an 8 GiB disk -- run under QEMU 8.2 / KVM on the machine's
