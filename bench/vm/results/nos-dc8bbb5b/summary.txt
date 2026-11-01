@@ -1,0 +1,78 @@
+BENCH kernel 6.8.0-147-generic
+BENCH cpu 13th Gen Intel(R) Core(TM) i5-13500
+BENCH nproc 4 mem_kib 8129880
+BENCH clocksource tsc
+BENCH cpuidle none
+BENCH hypervisor Hypervisor detected: KVM
+BENCH cmdline BOOT_IMAGE=/vmlinuz-6.8.0-147-generic root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0 console=ttyS0 ip=10.0.100.2::10.0.100.1:255.255.255.0:::off:185.12.64.1 noapic tsc_early_khz=2496301
+BENCH boot Startup finished in 1.633s (kernel) + 2.977s (userspace) = 4.610s 
+BENCH state running failed=[]
+BENCH vda queues=1 nr_requests=256 max_sectors_kb=1280 wc=write back discard_max=67108864
+BENCH thp always [madvise] never
+BENCH vuln gather_data_sampling:Not affected;indirect_target_selection:Not affected;itlb_multihit:Not affected;l1tf:Not affected;mds:Not affected;meltdown:Not affected;mmio_stale_data:Not affected;reg_file_data_sampling:Mitigation: Clear Register File;retbleed:Not affected;spec_rstack_overflow:Not affected;spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl;swapgs barriers and __user pointer sanitization; Automatic IBRS; IBPB: conditional; PBRSB-eIBRS: SW sequence; BHI: BHI_DIS_S;srbds:Not affected;tsa:Not affected;tsx_async_abort:Not affected;vmscape:Not affected;
+BENCH flags fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 avx_vnni arat umip pku ospke gfni vaes vpclmulqdq rdpid fsrm md_clear serialize arch_capabilities
+BENCH sysbench_cpu t1 r1 1533.71 events/s
+BENCH sysbench_cpu t1 r2 1529.64 events/s
+BENCH sysbench_cpu t1 r3 1529.25 events/s
+BENCH sysbench_cpu t4 r1 3183.91 events/s
+BENCH sysbench_cpu t4 r2 3184.17 events/s
+BENCH sysbench_cpu t4 r3 3187.86 events/s
+BENCH 7z mt1 tot_mips 6298 avr [Avr: 7087 100 7352 7365 | 60002 100 5240 5230]
+BENCH 7z mt4 tot_mips 20724 avr [Avr: 25016 371 7072 26235 | 174603 399 3810 15212]
+BENCH openssl aes-256-gcm 16k_bytes 7419336.02k
+BENCH openssl chacha20-poly1305 16k_bytes 2705806.68k
+BENCH openssl sha256 16k_bytes 2208443.05k
+BENCH sysbench_mem seq_read t1 25062.64 MiB/s
+BENCH sysbench_mem seq_write t1 16151.32 MiB/s
+BENCH sysbench_mem rnd_read t1 802.46 MiB/s
+BENCH sysbench_mem seq_read t4 72483.42 MiB/s
+BENCH sysbench_mem seq_write t4 46364.00 MiB/s
+BENCH sysbench_mem rnd_read t4 1530.20 MiB/s
+BENCH perf_pipe r1 9.792454 us/op
+BENCH perf_messaging r1 5.403 s
+BENCH perf_syscall r1 0.068113 us/op
+BENCH perf_pipe r2 9.920893 us/op
+BENCH perf_messaging r2 5.413 s
+BENCH perf_syscall r2 0.068515 us/op
+BENCH perf_pipe r3 9.866382 us/op
+BENCH perf_messaging r3 5.389 s
+BENCH perf_syscall r3 0.068511 us/op
+BENCH cyclictest T0 min=4 avg=72 max=3091; T1 min=4 avg=60 max=3098; T2 min=7 avg=67 max=3078; T3 min=4 avg=64 max=3098; us
+BENCH fio layout_seqwrite_1m_qd8 bw_mib=1943 secs=1.053
+BENCH fio randread_4k_qd1 iops=18103 bw_mib=70 lat_us=49 p99_us=55 p999_us=67
+BENCH fio randread_4k_qd32 iops=155632 bw_mib=607 lat_us=200 p99_us=252 p999_us=3129
+BENCH fio randread_4k_4x16 iops=168647 bw_mib=658 lat_us=377 p99_us=477 p999_us=3424
+BENCH fio randwrite_4k_qd1 iops=32269 bw_mib=126 lat_us=24 p99_us=29 p999_us=264
+BENCH fio randwrite_4k_qd32 iops=123503 bw_mib=482 lat_us=252 p99_us=268 p999_us=3162
+BENCH fio read_1m_qd8 iops=1357 bw_mib=1357 lat_us=5869 p99_us=9240 p999_us=11075
+BENCH fio write_1m_qd8 iops=2303 bw_mib=2303 lat_us=3434 p99_us=8093 p999_us=8585
+BENCH fio randwrite_4k_fdatasync iops=699 bw_mib=2 lat_us=61 p99_us=872 p999_us=1089
+BENCH kbuild untar_ms 6822
+BENCH kbuild make_j4_ms 330724 rc=0
+BENCH kbuild rm_ms 815
+BENCH pgbench init_s100 ms=9947 rc=0 [done in 9.43 s (drop tables 0.09 s, create tables 0.24 s, client-side generate 7.49 s, vacuum 0.11 s, primary keys 1.50 s).]
+BENCH pgbench db_size 1503 MB
+BENCH pgbench ro c1 r1 tps=50317.339257 lat_ms=0.020
+BENCH pgbench ro c4 r1 tps=269090.155733 lat_ms=0.015
+BENCH pgbench ro c8 r1 tps=259061.359530 lat_ms=0.031
+BENCH pgbench ro c16 r1 tps=236403.747996 lat_ms=0.068
+BENCH pgbench rw c1 r1 tps=630.713135 lat_ms=1.586
+BENCH pgbench rw c4 r1 tps=1331.430715 lat_ms=3.004
+BENCH pgbench rw c8 r1 tps=2588.626922 lat_ms=3.090
+BENCH pgbench rw c16 r1 tps=4742.676552 lat_ms=3.374
+BENCH pgbench ro c1 r2 tps=49920.166787 lat_ms=0.020
+BENCH pgbench ro c4 r2 tps=272759.113399 lat_ms=0.015
+BENCH pgbench ro c8 r2 tps=258461.879581 lat_ms=0.031
+BENCH pgbench ro c16 r2 tps=234938.585797 lat_ms=0.068
+BENCH pgbench rw c1 r2 tps=640.893310 lat_ms=1.560
+BENCH pgbench rw c4 r2 tps=1336.386919 lat_ms=2.993
+BENCH pgbench rw c8 r2 tps=2602.262871 lat_ms=3.074
+BENCH pgbench rw c16 r2 tps=4743.454451 lat_ms=3.373
+BENCH pgbench ro c1 r3 tps=49081.400543 lat_ms=0.020
+BENCH pgbench ro c4 r3 tps=272658.475875 lat_ms=0.015
+BENCH pgbench ro c8 r3 tps=255937.461412 lat_ms=0.031
+BENCH pgbench ro c16 r3 tps=235010.277340 lat_ms=0.068
+BENCH pgbench rw c1 r3 tps=628.409803 lat_ms=1.591
+BENCH pgbench rw c4 r3 tps=1336.547260 lat_ms=2.993
+BENCH pgbench rw c8 r3 tps=2613.498981 lat_ms=3.061
+BENCH pgbench rw c16 r3 tps=4783.131766 lat_ms=3.345

@@ -1,0 +1,49 @@
+BENCH kernel 6.8.0-147-generic
+BENCH cpu 13th Gen Intel(R) Core(TM) i5-13500
+BENCH nproc 4 mem_kib 8129884
+BENCH clocksource tsc
+BENCH cpuidle none
+BENCH hypervisor Hypervisor detected: KVM
+BENCH cmdline BOOT_IMAGE=/vmlinuz-6.8.0-147-generic root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0 console=ttyS0 ip=10.0.100.2::10.0.100.1:255.255.255.0:::off:185.12.64.1 noapic tsc_early_khz=2496261
+BENCH boot Startup finished in 3.727s (kernel) + 3.476s (userspace) = 7.203s 
+BENCH state running failed=[]
+BENCH vda queues=1 nr_requests=256 max_sectors_kb=1280 wc=write back discard_max=67108864
+BENCH thp always [madvise] never
+BENCH vuln gather_data_sampling:Not affected;indirect_target_selection:Not affected;itlb_multihit:Not affected;l1tf:Not affected;mds:Not affected;meltdown:Not affected;mmio_stale_data:Not affected;reg_file_data_sampling:Mitigation: Clear Register File;retbleed:Not affected;spec_rstack_overflow:Not affected;spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl;swapgs barriers and __user pointer sanitization; Automatic IBRS; IBPB: conditional; PBRSB-eIBRS: SW sequence; BHI: BHI_DIS_S;srbds:Not affected;tsa:Not affected;tsx_async_abort:Not affected;vmscape:Not affected;
+BENCH flags fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 avx_vnni arat umip pku ospke gfni vaes vpclmulqdq rdpid fsrm md_clear serialize arch_capabilities
+BENCH sysbench_cpu t1 r1 1488.95 events/s
+BENCH sysbench_cpu t1 r2 1489.50 events/s
+BENCH sysbench_cpu t1 r3 1488.34 events/s
+BENCH sysbench_cpu t4 r1 3112.42 events/s
+BENCH sysbench_cpu t4 r2 3109.94 events/s
+BENCH sysbench_cpu t4 r3 3112.09 events/s
+BENCH 7z mt1 tot_mips 6174 avr [Avr: 6962 100 7241 7237 | 58634 100 5108 5111]
+BENCH 7z mt4 tot_mips 20545 avr [Avr: 24842 368 7078 26064 | 172473 399 3763 15027]
+BENCH openssl aes-256-gcm 16k_bytes 7232126.98k
+BENCH openssl chacha20-poly1305 16k_bytes 2661466.11k
+BENCH openssl sha256 16k_bytes 2151448.58k
+BENCH sysbench_mem seq_read t1 25085.31 MiB/s
+BENCH sysbench_mem seq_write t1 16359.95 MiB/s
+BENCH sysbench_mem rnd_read t1 793.29 MiB/s
+BENCH sysbench_mem seq_read t4 72799.64 MiB/s
+BENCH sysbench_mem seq_write t4 48553.69 MiB/s
+BENCH sysbench_mem rnd_read t4 1545.29 MiB/s
+BENCH perf_pipe r1 14.276405 us/op
+BENCH perf_messaging r1 5.439 s
+BENCH perf_syscall r1 0.070539 us/op
+BENCH perf_pipe r2 17.943214 us/op
+BENCH perf_messaging r2 5.424 s
+BENCH perf_syscall r2 0.070500 us/op
+BENCH perf_pipe r3 13.389808 us/op
+BENCH perf_messaging r3 5.429 s
+BENCH perf_syscall r3 0.070400 us/op
+BENCH cyclictest T0 min=8 avg=74 max=3095; T1 min=10 avg=78 max=3200; T2 min=46 avg=79 max=3079; T3 min=9 avg=74 max=3072; us
+BENCH fio layout_seqwrite_1m_qd8 bw_mib=28 secs=71.512
+BENCH fio randread_4k_qd1 iops=11947 bw_mib=46 lat_us=78 p99_us=85 p999_us=120
+BENCH fio randread_4k_qd32 iops=15482 bw_mib=60 lat_us=2064 p99_us=4227 p999_us=5013
+BENCH fio randread_4k_4x16 iops=15558 bw_mib=60 lat_us=4111 p99_us=6520 p999_us=7045
+BENCH fio randwrite_4k_qd1 iops=16867 bw_mib=65 lat_us=53 p99_us=58 p999_us=1089
+BENCH fio randwrite_4k_qd32 iops=26868 bw_mib=104 lat_us=1188 p99_us=3784 p999_us=4177
+BENCH fio read_1m_qd8 iops=169 bw_mib=169 lat_us=47257 p99_us=47972 p999_us=52690
+BENCH fio write_1m_qd8 iops=173 bw_mib=173 lat_us=46026 p99_us=46399 p999_us=68681
+BENCH fio randwrite_4k_fdatasync iops=711 bw_mib=2 lat_us=62 p99_us=77 p999_us=1089
