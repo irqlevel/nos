@@ -65,13 +65,41 @@ impl Caps {
 #[path = "../../../src/crates/hvarch/src/x86/svm/vmcb.rs"]
 pub mod vmcb;
 
+#[path = "../../../src/crates/hvarch/src/x86/kick.rs"]
+pub mod kick;
+
+/// How often the clock reaches the deadline `timer_at` is asked for as it
+/// is asked -- the edge coming between a vCPU's look at it and the arming,
+/// a few hundred nanoseconds on a host: one call in this many.
+const EDGE_IN_THE_ARMING: u64 = 16;
+
+thread_local! {
+    static TIMER_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `kcore::cpu::timer_at`: the host CPU's own timer armed to interrupt it by
 /// `deadline_ns` -- the vCPU on this thread, entered, leaves its guest at it
 /// with a host interrupt's exit, as on a host (`vm::Cpu::enter`). Nothing
-/// for a deadline past, as the kernel has it.
+/// for a deadline past, as the kernel has it -- and now and then the
+/// deadline passed as it is armed, as a host's call takes time.
 pub fn timer_at(deadline_ns: u64) {
+    let calls = TIMER_CALLS.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    });
+    if calls % EDGE_IN_THE_ARMING == 0 {
+        crate::time::reach(deadline_ns);
+    }
     vm::arm_timer(deadline_ns);
 }
+
+/// `kcore::cpu::kick`: the IPI that takes a vCPU out of its guest. There is
+/// no guest to take out here.
+pub fn kick(_cpu: u32) {}
+
+/// `kcore::cpu::notify`: the posted-interrupt notification, which the CPU
+/// model takes as the vCPU's turn comes again (`vm::Cpu::enter`).
+pub fn notify(_cpu: u32) {}
 
 pub mod x86 {
     pub mod cpu {
@@ -350,8 +378,6 @@ pub mod x86 {
     }
 
     pub mod svm {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
         pub use crate::cpu::vmcb;
 
         #[repr(C)]
@@ -373,70 +399,8 @@ pub mod x86 {
             pub r15: u64,
         }
 
-        /// What takes a vCPU out of its guest. There is no guest to take it
-        /// out of here; kicks are counted. Whether the vCPU is in its guest,
-        /// or on its way in, as hvarch's keeps it: what a posted interrupt's
-        /// notification goes to (`notify`), the CPU model taking what was
-        /// posted when the vCPU's turn comes again (`vm::Cpu::enter`).
-        pub struct Kick {
-            sent: AtomicU64,
-            in_guest: AtomicBool,
-            /// What hvarch's arms the host's timer for as the entry is made
-            /// (`arm_at`, `vm::Cpu::enter`); 0 for none.
-            edge: AtomicU64,
-            edges_passed: AtomicU64,
-        }
-
-        impl Kick {
-            pub fn new() -> Kick {
-                Kick { sent: AtomicU64::new(0), in_guest: AtomicBool::new(false), edge: AtomicU64::new(0),
-                       edges_passed: AtomicU64::new(0) }
-            }
-            pub fn arm_at(&self, at: Option<u64>) {
-                self.edge.store(at.unwrap_or(0), Ordering::Relaxed);
-            }
-            pub fn edges_passed(&self) -> u64 {
-                self.edges_passed.load(Ordering::Relaxed)
-            }
-            /// What the loop asked the host's timer to be armed for.
-            pub fn edge(&self) -> u64 {
-                self.edge.load(Ordering::Relaxed)
-            }
-            /// The entry's, as hvarch's `entering` has it: the host's timer
-            /// armed for the edge `arm_at` named, or false -- the entry
-            /// turned back -- where it has come.
-            pub fn arm_or_turn_back(&self) -> bool {
-                let edge = self.edge.load(Ordering::Relaxed);
-                if edge == 0 {
-                    return true;
-                }
-                if edge <= crate::time::peek() {
-                    self.edges_passed.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-                crate::vm::arm_timer(edge);
-                true
-            }
-            pub fn sent(&self) -> u64 {
-                self.sent.load(Ordering::Relaxed)
-            }
-            pub fn prepare(&self) {
-                self.in_guest.store(true, Ordering::SeqCst);
-            }
-            pub fn cancel(&self) {
-                self.in_guest.store(false, Ordering::SeqCst);
-            }
-            pub fn kick(&self) {
-                self.sent.fetch_add(1, Ordering::Relaxed);
-            }
-            pub fn notify(&self) -> bool {
-                self.in_guest.load(Ordering::SeqCst)
-            }
-            /// The vCPU left its guest (hvarch's, after an exit).
-            pub fn left(&self) {
-                self.in_guest.store(false, Ordering::SeqCst);
-            }
-        }
+        /// hvarch's own, as it is (`hvarch/src/x86/kick.rs`).
+        pub use crate::cpu::kick::Kick;
     }
 
     /// hvarch's posted-interrupt descriptor: the same atomics, as the run
@@ -1505,14 +1469,14 @@ pub mod vm {
                 ARMED.with(|a| a.set((now / HOST_TICK_NS + 1) * HOST_TICK_NS));
             }
             if let Some(k) = kick {
-                if !k.arm_or_turn_back() {
+                if !k.entering(me as u32) {
                     k.left();
                     return Ok((Exit::Kicked, me as u32));
                 }
-                let edge = k.edge();
-                invariant!(edge == 0 || ARMED.with(|a| a.get()) <= edge,
-                           "CPU {} enters its guest with the host's timer armed for {} ns, past the edge {} ns its loop \
-                            asked for", me, ARMED.with(|a| a.get()), edge);
+                let armed = ARMED.with(|a| a.get());
+                invariant!(k.edge().is_none_or(|edge| armed <= edge),
+                           "CPU {} enters its guest with the host's timer armed for {} ns, past the edge {:?} ns its \
+                            loop asked for", me, armed, k.edge());
             }
             self.backend.entered();
             let exit = loop {

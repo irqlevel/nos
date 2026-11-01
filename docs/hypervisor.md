@@ -2474,10 +2474,22 @@ before, it was lost to any interrupt of the host's timer that came between
 for the host's next tick (`Cpu::local_timer_fired`): the guest then computed
 past its edge until that tick. An edge that has come by the entry turns it
 back, for the round to take it. The report counts those among the entries
-turned back (`kicked`). hv-fuzz's platform target has the host's tick land
-on the way in, re-arming its timer so, and holds every entry to a timer armed
-no later than the edge its loop asked for: the old arming, in the round, is
-found at its 167th input.
+turned back (`kicked`), and its `worst` line says how the latest timer
+interrupt of a run was waited for -- after the guest ran, when it was
+entered, what the host's timer was asked for and when it left. The order
+in `entering` is the arming first and the look after: `timer_at` arms
+nothing for an edge gone by, and with the look first an edge that went by
+between the two -- a few hundred nanoseconds -- left the timer unarmed and
+the guest computing for 10 ms (7ae441c4, whose `worst` line said: "10009
+us past its edge, after an interrupt of the host's took the guest out: the
+guest entered 0 us from the edge, the host's timer asked for 0 us from it").
+hv-fuzz's platform target runs hvarch's `Kick` as it is
+(`hvarch/src/x86/kick.rs`, kept apart from the backends for that), has the
+host's tick land on the way in, re-arming its timer so, and the clock reach
+the deadline `timer_at` is asked for now and then as it is asked, and holds
+every entry to a timer armed no later than the edge its loop asked for: the
+arming in the round is found at its 167th input, the look before the arming
+at its 43rd.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
