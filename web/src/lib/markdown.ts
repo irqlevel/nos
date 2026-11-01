@@ -13,6 +13,7 @@ import remarkRehype from "remark-rehype";
 import { unified } from "unified";
 import { SKIP, visit } from "unist-util-visit";
 import { VFile } from "vfile";
+import { renderChart } from "./chart";
 import { isLocale, type Locale } from "./i18n";
 import { site } from "./site";
 
@@ -219,6 +220,29 @@ function rehypeLinks() {
     };
 }
 
+/*
+ * A ```chart block becomes the chart its YAML describes (src/lib/chart.ts).
+ * It runs after rehypeExtract, which skips code blocks, so a chart's labels
+ * are not counted into the reading time twice -- its table has them already.
+ */
+function rehypeCharts() {
+    return (tree: HastRoot, file: VFile) => {
+        const ctx = data(file).ctx;
+        visit(tree, "element", (node: Element, index, parent) => {
+            if (node.tagName !== "pre" || !parent || index === undefined) {
+                return undefined;
+            }
+            const code = node.children.find((child): child is Element => isElement(child, "code"));
+            const classes = code?.properties.className;
+            if (!code || !Array.isArray(classes) || !classes.includes("language-chart")) {
+                return undefined;
+            }
+            parent.children[index] = renderChart(toString(code), ctx.locale, ctx.file);
+            return SKIP;
+        });
+    };
+}
+
 // Wide tables scroll inside their own box instead of widening the page on a phone.
 function rehypeWrapTables() {
     return (tree: HastRoot) => {
@@ -245,6 +269,7 @@ const processor = unified()
     .use(remarkRehype)
     .use(rehypeSlug)
     .use(rehypeExtract)
+    .use(rehypeCharts)
     .use(rehypeLinks)
     .use(rehypeWrapTables)
     .use(rehypeAutolinkHeadings, {
