@@ -40,9 +40,12 @@ pub const CQE_SIZE: usize = 16;
 /* Where in a completion entry the status word -- phase bit and all -- is */
 pub const CQE_STATUS_AT: usize = 14;
 
-/* Queue depths */
+/* Queue depths. The I/O queue's: every request a guest's disk has out
+ * at once -- 64 of them, each a command or a few -- with the controller
+ * at once, and room besides for the batches of the filesystem and the
+ * other disks' servers; a page of PRP entries a command ID, 1 MiB. */
 pub const ADMIN_QUEUE_DEPTH: usize = 16;
-pub const IO_QUEUE_DEPTH:    usize = 64;
+pub const IO_QUEUE_DEPTH:    usize = 256;
 
 /* Minimum controller ready/disable timeout when CAP.TO = 0 (ms).
  * The NVMe spec treats TO=0 as "unspecified", not "instant". */
