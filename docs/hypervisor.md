@@ -1668,7 +1668,14 @@ another CPU that saw no ask yet, has no notify coming for it and is taken
 then. A pass that ends at its bound (`more`) is the first CPU's round to go
 on with at once -- that CPU rung, if the pass ran on another's -- since a
 driver that notifies only when asked gives the device no other reason to
-come back. The interrupt is the driver's to place: the device raises one
+come back. A disk's pass is bound by the data it moves as well: 512 KiB of
+writes taken out of the guest's memory and reads given back into it, two
+of the largest requests (`blk::PASS_BYTES`). It runs under the platform's
+lock, which every other CPU's port and MMIO access waits for, and a guest
+writing a megabyte at a time eight deep once had 8 MiB copied under one:
+Linux's clocksource watchdog on another of its CPUs found a read of the PM
+timer taking 800 us. hv-fuzz holds every call into the disk to what one
+pass may move, and the report says how many passes were cut short. The interrupt is the driver's to place: the device raises one
 when the used index has passed the driver's word since it last decided
 (`wants_interrupt`), and Linux puts its word three quarters of the way
 through what it has out for its transmit queue, and leaves it behind while

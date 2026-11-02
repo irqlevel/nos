@@ -228,6 +228,17 @@ const SIZE_MAX: u32 = 4096;
 const SEG_MAX: u32 = 64;
 /// The most data one request has, and so the size of a buffer.
 pub const REQUEST_BYTES: usize = (SIZE_MAX * SEG_MAX) as usize;
+/// The most data a pass moves between the guest's memory and the backend's
+/// buffers -- a write's taken out, a read's given back -- before it ends at
+/// its bound (`more`), the next round going on with the rest. A pass runs
+/// under the platform's lock, which every other CPU's port and MMIO access
+/// waits for: unbounded, a guest writing a megabyte at a time eight deep
+/// had all of it copied under one -- 8 MiB -- and Linux's clocksource
+/// watchdog on another of its CPUs found a read of the PM timer taking
+/// 800 us. Two of the largest requests: a pass of tens of microseconds, and
+/// always one request at least.
+pub const PASS_BYTES: usize = 2 * REQUEST_BYTES;
+
 /// The most requests with the backend at once, and so how many buffers the
 /// backend has: 16 MiB of them. 64, as much as a guest's four jobs of 16
 /// random reads each keep out -- under KVM 217k IOPS where 32 of them made
@@ -279,6 +290,8 @@ pub struct Stats {
     /// for it: what EVENT_IDX spares both of.
     pub notifies: u64,
     pub interrupts: u64,
+    /// Passes ended at their bound on the data they moved (`PASS_BYTES`).
+    pub cut: u64,
 }
 
 /// A request with the backend, as the device keeps it: the chain it came in
@@ -314,9 +327,12 @@ pub struct Blk {
     /// A chain may be waiting on the ring for a slot: the device looks again
     /// when a buffer comes back.
     waiting: bool,
-    /// A pass ended at its bound, with chains perhaps still on the ring: the
-    /// next round goes on with them.
+    /// A pass ended at its bound, with chains perhaps still on the ring, or
+    /// requests the backend served still with it: the next round goes on
+    /// with them.
     more: bool,
+    /// The data the pass under way has moved so far (`PASS_BYTES`).
+    moved: usize,
     id: [u8; ID_BYTES],
     /// Set when the driver made a ring this device will not follow: no more
     /// requests are taken until it resets the device.
@@ -350,6 +366,7 @@ impl Blk {
             slots,
             waiting: false,
             more: false,
+            moved: 0,
             id: name,
             broken: None,
             stats: Stats::default(),
@@ -449,6 +466,7 @@ impl Blk {
         match self.transport.write(offset, size, value, mem, now) {
             Asked::Notify(0) => {
                 self.stats.notifies += 1;
+                self.moved = 0;
                 let answered = self.fill(mem);
                 if answered { self.interrupt(mem) } else { Raise::default() }
             }
@@ -472,16 +490,29 @@ impl Blk {
     /// into its buffers, the status, the chain on the used ring -- and what
     /// waited on the ring for a buffer, taken now there is one, or what a
     /// pass left at its bound -- and the interrupts that leaves the device
-    /// with. Every time round the run loop, so it costs next to nothing when
-    /// there is nothing.
+    /// with. A pass's worth of data at most (`PASS_BYTES`), the rest the
+    /// next round's. Every time round the run loop, so it costs next to
+    /// nothing when there is nothing.
     pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
+        self.moved = 0;
         let mut answered = false;
         let mut back = false;
-        while let Some(req) = self.backend.take() {
+        let mut cut = false;
+        loop {
+            if self.moved >= PASS_BYTES {
+                /* Perhaps nothing more with the backend: a round for nothing
+                 * then, which ends the bound. */
+                cut = true;
+                break;
+            }
+            let Some(req) = self.backend.take() else { break };
             back = true;
             answered |= self.complete(mem, req);
         }
-        if self.more || (back && self.waiting) {
+        if cut {
+            self.stats.cut += 1;
+            self.more = true;
+        } else if self.more || (back && self.waiting) {
             answered |= self.fill(mem);
         }
         if answered { self.interrupt(mem) } else { Raise::default() }
@@ -508,7 +539,10 @@ impl Blk {
         let mut answered = false;
         let mut left = PASS;
         while self.broken.is_none() {
-            if left == 0 {
+            if left == 0 || self.moved >= PASS_BYTES {
+                if left != 0 {
+                    self.stats.cut += 1;
+                }
                 self.more = true;
                 break;
             }
@@ -577,6 +611,9 @@ impl Blk {
         if let Some(ranges) = ranges {
             copy[..len].copy_from_slice(&ranges[..len]);
         }
+        if op == Op::Write {
+            self.moved = self.moved.saturating_add(len);
+        }
         if op == Op::Write
             && !self.backend.with_buffer(slot, &mut |buf| {
                 buf.len() >= len && copy_out(mem, segs, HEADER as u64, &mut buf[..len])
@@ -605,6 +642,9 @@ impl Blk {
         let segs = core::mem::take(&mut s.segs);
         let answered = match head {
             Some(head) if self.broken.is_none() => {
+                if ok && op == Op::Read {
+                    self.moved = self.moved.saturating_add(len);
+                }
                 let (status, written) = if !ok {
                     (S_IOERR, 0)
                 } else if op != Op::Read {

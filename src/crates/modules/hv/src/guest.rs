@@ -885,6 +885,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
                 s.discarded_bytes / 1024, s.zeroings, s.zeroed_bytes / 1024);
         }
         let _ = write!(out, "; {} notifies, {} interrupts", s.notifies, s.interrupts);
+        if s.cut != 0 {
+            let _ = write!(out, "; {} passes cut short at {} KiB moved", s.cut, hv::disk::PASS_BYTES / 1024);
+        }
         let _ = writeln!(out, "{}{}", if broken { "; stopped over a ring the driver broke" } else { "" },
             copied_note(copied));
     }

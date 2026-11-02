@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::pod::{self, Pod};
@@ -112,6 +112,10 @@ pub struct GuestMemory {
     /// Mappings made: each one undone is an address the real kernel shoots
     /// down on every CPU, which a device makes only so many of (`held_to`).
     maps: AtomicUsize,
+    /// Bytes read and written by `read` and `write`, which a device's data
+    /// goes through: what a disk's pass moved, under the platform's lock
+    /// (`moved`).
+    moved: AtomicU64,
 }
 
 impl GuestMemory {
@@ -122,6 +126,7 @@ impl GuestMemory {
             absent: Mutex::new(Vec::new()),
             refuse_maps: AtomicBool::new(false),
             maps: AtomicUsize::new(0),
+            moved: AtomicU64::new(0),
         })
     }
 
@@ -394,13 +399,20 @@ impl GuestMemory {
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
         self.inside(gpa, buf.len())?;
         self.shared.read(gpa, buf);
+        self.moved.fetch_add(buf.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn write(&self, gpa: u64, data: &[u8]) -> Result<()> {
         self.inside(gpa, data.len())?;
         self.shared.write(gpa, data);
+        self.moved.fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The bytes `read` and `write` have moved so far.
+    pub fn moved(&self) -> u64 {
+        self.moved.load(Ordering::Relaxed)
     }
 
     /// A word read whole, as the real one reads it (one access); refused at
