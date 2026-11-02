@@ -389,6 +389,9 @@ pub fn ext4(r: &mut Input) {
     let journaled = !made.journaled.is_empty();
     let mut d = disk::Disk::new("vda", ss, sectors, made.media);
     d.latency = r.chance(64);
+    if r.bool() {
+        d.take_async(r.pick(&[4096, 8192, 65536, 1 << 20]), r.range(1, 64) as usize);
+    }
     d.no_writes = Some("ext4 mounts read-only, and writes nothing".into());
     disk::insert(0, d);
     let Some(dev) = disk::register(0) else { return };

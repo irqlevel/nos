@@ -118,6 +118,13 @@ pub trait BlockDriver: Sync + 'static {
 
     /// Ring the doorbell for what `submit` queued without one.
     fn kick(&'static self) {}
+
+    /// The most bytes one asynchronous I/O moves from a page's start: two
+    /// pages, or what the device takes through lists of them. 0 where there
+    /// is no asynchronous path, which is the default.
+    fn submit_max(&self) -> usize {
+        0
+    }
 }
 
 /// A registered device, kept for the life of the kernel because nothing
@@ -341,6 +348,17 @@ pub(crate) fn can_submit(handle: usize) -> bool {
             Backend::Partition { .. } => can_submit(dev.parent),
         },
         None => false,
+    }
+}
+
+pub(crate) fn submit_max(handle: usize) -> usize {
+    match device(handle) {
+        Some(dev) => match dev.backend {
+            Backend::Driver(driver) if driver.is_async() => driver.submit_max(),
+            Backend::Driver(_) => 0,
+            Backend::Partition { .. } => submit_max(dev.parent),
+        },
+        None => 0,
     }
 }
 

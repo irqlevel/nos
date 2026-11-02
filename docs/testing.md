@@ -193,7 +193,7 @@ swallowing panic messages whole.
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
-| `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
+| `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
@@ -2609,7 +2609,11 @@ unmounted; and the image, taken back out of it with `debugfs`, must pass
 guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 `--nvme-root` puts nos's root on an NVMe disk instead of virtio-blk: each
 driver takes ext2's batches of blocks its own way, and NVMe's is the one the
-AX41 runs.
+AX41 runs -- and NVMe's is the one with an asynchronous path, so there the
+guest's requests go to the disk through the image's queue as they come,
+each back when it is done (`fs::image`'s `start` and `reap`; the image says
+how many it served so); on virtio-blk the queue serves every one by the
+batch.
 
 `--cpus N` gives every guest of the run N CPUs, the boot's and the VMs'.
 The boot must say `smp: Brought up 1 node, N CPUs`, and its report that the
