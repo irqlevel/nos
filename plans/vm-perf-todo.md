@@ -105,10 +105,14 @@ reading the clock, under nos 50-80 us and under KVM 25-30 -- the same kernel.
   (`hv`'s report over a run of cyclictest alone, against its cycles), and
   which -- the tick restarted on idle's exit is a write of TSC_DEADLINE, an
   IPI a write of the ICR.
-- The guest's paravirtual features: under KVM it has PV TLB flushes, PV
-  IPIs to many CPUs in one hypercall, PV sched yield, PV spinlocks and
-  kvm-clock; under nos only PV EOI ("PV spinlocks disabled, no host
-  support"). Each spares it exits or IPIs.
+- Not the paravirtual features KVM's guest has and nos's has not. nos offers
+  KVM's signature, NOP_IO_DELAY and PV EOI (03e3ede8) and leaves the rest
+  out on purpose (`src/crates/hv/src/policy.rs`): PV TLB flushes, PV sched
+  yield and PV spinlocks stand on steal time and help a guest whose CPUs get
+  preempted, which a guest on cores of its own is not; kvmclock does what
+  the invariant TSC does. KVM's PV IPIs spare a guest in physical x2APIC mode
+  -- as KVM's is -- an ICR write a destination; nos's guest is in cluster
+  mode, one write for all four of its CPUs.
 - The guest's clock: under KVM it runs on `kvm-clock` and its CPUID says
   `tsc_known_freq`; under nos it is told the TSC's frequency on its command
   line (`tsc_early_khz`, which hvboot adds), runs on `tsc`, and its CPUID says
