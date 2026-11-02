@@ -38,6 +38,10 @@ const PCI_PROGIF_NVME:     u8 = 0x02;
 /* Number of pages to map for BAR0 (covers regs + doorbells for 2 queues) */
 const BAR0_MAP_PAGES: usize = 32;
 
+/* The words of the command IDs' bitmap: one bit an ID. */
+const CID_WORDS: usize = IO_QUEUE_DEPTH / 64;
+const _: () = assert!(IO_QUEUE_DEPTH % 64 == 0 && IO_QUEUE_DEPTH <= 1 << 16, "a whole word of IDs, each one a u16");
+
 /* What a command ID in flight is, which is what tells the ISR whom to tell */
 const CID_IDLE:  u8 = 0;
 const CID_SYNC:  u8 = 1;   /* a task waits on done[cid] */
@@ -119,11 +123,11 @@ struct Submission {
     queue: SubmissionQueue,
 
     /* Bitmask of in-use CID slots (1 = in use).  Avoids CID reuse while a
-     * previous command is still in flight.  W=1 → 64 slots, matches
-     * IO_QUEUE_DEPTH=64.  Slots beyond the actual queue depth are permanently
-     * reserved at init so in-flight commands never exceed what the SQ can
-     * hold (spec full condition is depth-1 entries). */
-    cid_map: BitMap<1>,
+     * previous command is still in flight: a bit an ID of IO_QUEUE_DEPTH.
+     * Slots beyond the actual queue depth are permanently reserved at init
+     * so in-flight commands never exceed what the SQ can hold (spec full
+     * condition is depth-1 entries). */
+    cid_map: BitMap<CID_WORDS>,
 
     /* Commands in the SQ whose doorbell a kick still owes the controller:
      * an asynchronous batch rings it once, at the end. */
@@ -141,7 +145,42 @@ struct Submission {
      * controller while the command is in flight -- its CID nobody else's
      * until it is done. None where the pages could not be had: a batch's
      * commands, and the asynchronous ones, are two pages at most. */
-    prp_lists: Option<dma::DmaBuffer>,
+    prp_lists: Option<PrpLists>,
+}
+
+/* The PRP list pages, a page a command ID, in runs of PRP_RUN pages: no
+ * more than the page allocator gives physically contiguous at once
+ * (`PageTable::MAX_CONTIGUOUS_PAGES`), which a list page for each of
+ * IO_QUEUE_DEPTH IDs is past. */
+const PRP_RUN: usize = 64;
+const _: () = assert!(IO_QUEUE_DEPTH % PRP_RUN == 0, "the IDs a whole number of runs");
+
+struct PrpLists {
+    runs: Vec<dma::DmaBuffer>,
+}
+
+impl PrpLists {
+    /* Every run, or None where one could not be had. */
+    fn new() -> Option<PrpLists> {
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(IO_QUEUE_DEPTH / PRP_RUN).ok()?;
+        for _ in 0..IO_QUEUE_DEPTH / PRP_RUN {
+            runs.push(dma::DmaBuffer::new(PRP_RUN).filter(|b| b.pages() >= PRP_RUN)?);
+        }
+        Some(PrpLists { runs })
+    }
+
+    /* Entry `k` of `cid`'s page set to `value`: false past the page. */
+    fn store(&mut self, cid: usize, k: usize, value: u64) -> bool {
+        let at = (cid % PRP_RUN) * PAGE_SIZE + k * PRP_ENTRY_SIZE;
+        k < PRP_LIST_ENTRIES && self.runs.get_mut(cid / PRP_RUN).is_some_and(|run| run.store(at, value))
+    }
+
+    /* Where `cid`'s page is, for the command's PRP2. */
+    fn phys(&self, cid: usize) -> Option<u64> {
+        let run = self.runs.get(cid / PRP_RUN)?;
+        Some(run.phys() + ((cid % PRP_RUN) * PAGE_SIZE) as u64)
+    }
 }
 
 impl Submission {
@@ -332,7 +371,7 @@ fn init_device(dev: pci::PciDevice) {
 
     /* A batch's contiguous pages one command: as many as MDTS lets one
      * command move and a page of PRP entries names, past the first. */
-    let prp_lists = dma::DmaBuffer::new(IO_QUEUE_DEPTH);
+    let prp_lists = PrpLists::new();
     let batch_max = match &prp_lists {
         Some(_) => {
             let mdts_bytes = if mdts == 0 || mdts >= 40 { usize::MAX } else { PAGE_SIZE << mdts };
@@ -764,11 +803,9 @@ impl NvmeDevice {
             /* The pages after the first, in the CID's page of entries: its
              * own until its command is done. */
             let first = io.phys & !(PAGE_SIZE as u64 - 1);
-            let at = cid * PAGE_SIZE;
             let listed = match submission.prp_lists.as_mut() {
-                Some(lists) => (1..pages).all(|k| {
-                    lists.store(at + (k - 1) * PRP_ENTRY_SIZE, first + (k * PAGE_SIZE) as u64)
-                }).then(|| lists.phys() + at as u64),
+                Some(lists) => (1..pages).all(|k| lists.store(cid, k - 1, first + (k * PAGE_SIZE) as u64))
+                    .then(|| lists.phys(cid)).flatten(),
                 None => None,
             };
             let Some(list) = listed else {
@@ -962,7 +999,7 @@ impl NvmeDevice {
      * already; these are the controller's own limits, checked where they
      * are known. */
     fn run_command(&self, opcode: u8, cid: u16, buf_phys: u64, base: u64, run: &[Piece],
-                   lists: Option<&mut dma::DmaBuffer>) -> Option<SubmissionEntry>
+                   lists: Option<&mut PrpLists>) -> Option<SubmissionEntry>
     {
         let sector_size = self.sector_size as usize;
         let len: usize = run.iter().map(|p| p.len).sum();
@@ -993,14 +1030,13 @@ impl NvmeDevice {
             if offset != 0 || run.len() > PRP_LIST_ENTRIES + 1 {
                 return None;
             }
-            let at = cid as usize * PAGE_SIZE;
             for (k, piece) in run.iter().enumerate().skip(1) {
                 let page = buf_phys.checked_add(piece.at as u64)?;
-                if !lists.store(at + (k - 1) * PRP_ENTRY_SIZE, page) {
+                if !lists.store(cid as usize, k - 1, page) {
                     return None;
                 }
             }
-            lists.phys() + at as u64
+            lists.phys(cid as usize)?
         };
 
         let mut cmd = SubmissionEntry::new(opcode, cid);
