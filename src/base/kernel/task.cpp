@@ -27,6 +27,7 @@ Task::Task()
     , flags_(0)
     , sleep_until_(0)
     , wake_time_(0)
+    , woke_at_deadline_(0)
     , switched_out_runnable_(false)
     , prev_(nullptr)
     , magic_(TASK_MAGIC)
@@ -157,6 +158,7 @@ void Task::unblock()
     if (run_state_.cmpxchg(RUN_WAKING, RUN_SLEEPING) != RUN_SLEEPING)
         return;
 
+    woke_at_deadline_.set(0);
     wake_time_.set((long)get_boot_time().get_value());
     task_queue_->push_wake(this);
 }
