@@ -18,6 +18,7 @@ mod disk;
 mod disklog;
 mod part;
 mod provider;
+pub mod queue;
 mod selftest;
 mod shell;
 mod table;

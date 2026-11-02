@@ -25,8 +25,8 @@
 //! A partial block -- a sector of a guest's in a filesystem block of 4 KiB
 //! -- is read, changed and written back whole. That is safe because an
 //! image is one writer's: its calls come one at a time (`&mut self`, and the
-//! slot's lock across the C ABI), and the hold keeps everyone else off the
-//! file.
+//! slot's lock across the C ABI), each waiting for its queue's I/O first,
+//! and the hold keeps everyone else off the file.
 //!
 //! A write into a hole grows the file by the chunk around it first
 //! (`Vfs::allocate`, `CHUNK_BYTES`) -- by twice as many as the last time
@@ -36,31 +36,44 @@
 //! to the device as an overwrite: a commit a chunk, where a write through
 //! the VFS was a commit a batch. What it wrote there is made written at the
 //! guest's next flush (`Vfs::mark_written`), whose commit's own flush puts
-//! the data on the medium first. A guest's discard gives whole chunks back
+//! the data on the medium first -- noted as written once it is done, not
+//! when it is started. A guest's discard gives whole chunks back
 //! to the filesystem (`discard`, `Vfs::punch`): holes from then on, as a
 //! write of zeros with its unmap flag does with the chunks it covers whole
 //! (`write_zeroes`), the rest of it zeros written. Blocks given
 //! back may be the next file's the moment the punch is done -- which is safe
-//! because, the image's calls coming one at a time, no read of its own is
-//! under way off the VFS's lock on a block it mapped before them.
+//! because, the image's calls coming one at a time and each waiting for its
+//! queue's I/O first, no read or write of its own is under way off the VFS's
+//! lock on a block it mapped before them.
+//!
+//! A guest's disk is served through the image's queue (`Flights`, `start`,
+//! `reap`): buffers of its own, a request each, which the device reads and
+//! writes as they are -- a read or a write of whole mapped blocks with the
+//! device asynchronously, as many at once as the guest has out, each back
+//! when it is done; anything else after everything in flight is done, by
+//! the synchronous path above.
 //!
 //! A loadable module reaches one through the C ABI at the bottom -- an image
 //! is a slot of this file's table and the generation of what is in it, looked
-//! up on every call (`kcore::fs::Image`).
+//! up on every call (`kcore::fs::Image`, `kcore::fs::ImageQueue`).
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
+use block::queue::Queue;
 use block::{Disk, Piece};
+use kcore::block::SubmitError;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
-use kcore::time::boot_time_ns;
+use kcore::time::{boot_time_ns, Duration};
 use kcore::trace;
 
 use crate::vfs::{Handle, MapRun, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
-use ffi::fs::{ImageIo, IMAGE_VEC_MAX};
+use ffi::fs::{ImageDone, IMAGE_QUEUE_MAX};
 
 /// The most blocks a batch moves: a page of the buffer each -- 2 MiB, so
 /// that every request a guest's disk has out at once (eight, of up to 256
@@ -448,6 +461,62 @@ impl Timed {
     }
 }
 
+/// What an image serves a guest's disk's requests in (`start`, `reap`):
+/// buffers of its own, one a request, and the I/O of those it has with the
+/// device -- asynchronous, where its disk takes that and the request's
+/// blocks are all mapped already: a read or a write of whole blocks the map
+/// names, a read's holes and unwritten blocks zeros. Those go to the device
+/// straight from the buffer, with no copy and no lock, as many at once as
+/// the guest has out, and each comes back as it is done. Anything else -- a
+/// write into a hole, a partial block, a flush, a discard, any of the
+/// image's other calls -- waits for everything in flight first (`drain`),
+/// and is served by the synchronous path as before: so nothing the image
+/// changes of its map, its file or its pending conversions moves under I/O
+/// the device has, and a punched block goes to nobody else while a write of
+/// the guest's is on its way to it.
+struct Flights {
+    queue: Queue,
+    slots: Vec<Flight>,
+    /// Requests done that `reap` has not given back yet, in the order they
+    /// finished: room for every buffer.
+    done: VecDeque<(usize, bool)>,
+    /// A request's commands as `start_fast` makes them: where in its
+    /// buffer, how long, the sector. Room for one a block.
+    commands: Vec<(usize, usize, u64)>,
+    /// Requests served by the device's asynchronous path, and the others.
+    fast: u64,
+    slow: u64,
+}
+
+/// A buffer's request while the image has it.
+#[derive(Default)]
+struct Flight {
+    /// Whether the image has it: from `start` until `reap` gives it back.
+    busy: bool,
+    write: bool,
+    /// Its commands not yet done, and whether every one went well.
+    left: usize,
+    ok: bool,
+    /// For a write, the runs of blocks it writes over unwritten extents --
+    /// noted as written (`note_written`) once it is done, and not before:
+    /// until then a read of one finds the zeros it held.
+    unwritten: Vec<(u64, u64)>,
+}
+
+/// How long a drain waits for a completion before it looks again, and
+/// before it says it is still waiting.
+const DRAIN_STEP_MS: u64 = 100;
+const DRAIN_SAY_NS: u64 = 10_000_000_000;
+
+/// What `start` did with a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Started {
+    /// With the device: `reap` gives it back.
+    InFlight,
+    /// Done already, well or not.
+    Done(bool),
+}
+
 pub struct Image {
     vfs: &'static Vfs,
     handle: Handle,
@@ -461,6 +530,8 @@ pub struct Image {
     /// None: its filesystem keeps no blocks of its own on a device, and
     /// everything goes through the VFS.
     direct: Option<Direct>,
+    /// Its queue, once it has one (`make_queue`).
+    flights: Option<Flights>,
 }
 
 impl Image {
@@ -475,7 +546,8 @@ impl Image {
         name.extend_from_slice(path);
         let handle = vfs.open(path, flags)?;
         /* Closed by its drop from here on, whatever is refused below. */
-        let mut image = Image { vfs, handle, path: name, size: 0, writable: write, identity: (0, 0), direct: None };
+        let mut image =
+            Image { vfs, handle, path: name, size: 0, writable: write, identity: (0, 0), direct: None, flights: None };
         image.size = vfs.length(handle)? as u64;
         image.identity = vfs.identity(handle)?;
         if let Some((device, block)) = vfs.geometry(handle) {
@@ -614,6 +686,7 @@ impl Image {
         if ios.iter().any(|(at, buf)| !self.inside(*at, buf.len())) {
             return false;
         }
+        self.drain();
         let (vfs, handle) = (self.vfs, self.handle);
         let Some(direct) = self.direct.as_mut() else {
             return ios.iter_mut().all(|(at, buf)| {
@@ -701,6 +774,7 @@ impl Image {
         if !self.writable || ios.iter().any(|(at, data)| !self.inside(*at, data.len())) {
             return false;
         }
+        self.drain();
         let (vfs, handle, size) = (self.vfs, self.handle, self.size);
         let Some(direct) = self.direct.as_mut() else {
             return ios.iter().all(|(at, data)| usize::try_from(*at).is_ok_and(|at| vfs.write_within(handle, at, data)));
@@ -883,6 +957,7 @@ impl Image {
         if !self.writable || !self.inside_len(offset, len) {
             return false;
         }
+        self.drain();
         let unit = self.discard_unit();
         if unit == 0 {
             return true;
@@ -894,6 +969,10 @@ impl Image {
     /// The whole blocks inside `len` bytes from `offset` given back to the
     /// filesystem (`Vfs::punch`), and holes in the map from then on.
     fn punch(&mut self, offset: u64, len: u64) -> bool {
+        /* Blocks given back may be another file's the moment the punch is
+         * done: never with a write of the guest's on its way to them. */
+        assert!(self.flights.as_ref().is_none_or(|f| f.queue.in_flight() == 0),
+                "image: a punch with I/O of its queue's in flight");
         let (vfs, handle) = (self.vfs, self.handle);
         let Some(direct) = self.direct.as_mut() else { return true };
         let given = vfs.punch(handle, offset, len);
@@ -933,6 +1012,7 @@ impl Image {
         if !self.writable || !self.inside_len(offset, len) {
             return false;
         }
+        self.drain();
         let end = offset + len;
         let unit = self.discard_unit();
         if unmap && unit != 0 {
@@ -974,6 +1054,9 @@ impl Image {
     /// pushed out where there were none -- or, after a write the VFS took,
     /// the filesystem synced, which pushes it out after its own metadata.
     pub fn sync(&mut self) -> bool {
+        /* What the guest was told is done is on the device: everything in
+         * flight done first, so that nothing of it is left out. */
+        self.drain();
         let (vfs, handle) = (self.vfs, self.handle);
         let flushed = match self.direct.as_mut() {
             Some(direct) if !direct.pending.runs.is_empty() => {
@@ -996,10 +1079,308 @@ impl Image {
             None => self.vfs.sync_file(self.handle),
         }
     }
+
+    /* ---- the queue: a guest's disk's requests, as many at once as it has ---- */
+
+    /// The image's queue (`Flights`): `buffers` buffers of `pages` pages
+    /// each, a request's at a time -- false when there is no memory for
+    /// them, or it has one already.
+    pub fn make_queue(&mut self, buffers: usize, pages: usize) -> bool {
+        if self.flights.is_some() || buffers == 0 || pages == 0 {
+            return false;
+        }
+        let disk = self.direct.as_ref().map(|d| d.disk);
+        let Some(queue) = Queue::new(disk, buffers, pages) else { return false };
+        let mut slots = Vec::new();
+        let mut done = VecDeque::new();
+        let mut commands = Vec::new();
+        /* The most runs a request's blocks make, every other one unwritten. */
+        let runs = pages / 2 + 1;
+        if slots.try_reserve_exact(buffers).is_err() || done.try_reserve_exact(buffers).is_err()
+            || commands.try_reserve_exact(pages).is_err()
+        {
+            return false;
+        }
+        for _ in 0..buffers {
+            let mut unwritten = Vec::new();
+            if unwritten.try_reserve_exact(runs).is_err() {
+                return false;
+            }
+            slots.push(Flight { unwritten, ..Flight::default() });
+        }
+        self.flights = Some(Flights { queue, slots, done, commands, fast: 0, slow: 0 });
+        true
+    }
+
+    /// The number of its queue's entry, which `block::queue::wake` and
+    /// `block::queue::wait` take: None while it has none.
+    pub fn queue_entry(&self) -> Option<usize> {
+        self.flights.as_ref().map(|f| f.queue.entry())
+    }
+
+    /// Where buffer `k` of its queue is, for whoever fills and empties it
+    /// between its requests (`kernel_image_queue`).
+    pub fn buffer_address(&mut self, k: usize) -> Option<*mut u8> {
+        self.flights.as_mut()?.queue.address(k)
+    }
+
+    /// Buffer `k`'s bytes, while the image has no request of it: what a
+    /// request's data is put in before `start`, and taken from after.
+    pub fn buffer(&mut self, k: usize) -> Option<&mut [u8]> {
+        let fl = self.flights.as_mut()?;
+        if fl.slots.get(k)?.busy {
+            return None;
+        }
+        fl.queue.bytes(k)
+    }
+
+    /// Buffer `k`'s request -- `len` bytes from `offset` read into it, or
+    /// with `write` written from it, all of them inside the image -- taken:
+    /// with the device and given back by `reap` (`InFlight`), or done now.
+    /// A buffer the image has a request of already, one past the queue, a
+    /// request longer than a buffer or not inside the image, and a write to
+    /// one held for reading are each done, and failed. What the device is
+    /// handed waits for `kick`.
+    pub fn start(&mut self, k: usize, write: bool, offset: u64, len: usize) -> Started {
+        let Some(fl) = self.flights.as_ref() else { return Started::Done(false) };
+        if fl.slots.get(k).is_none_or(|f| f.busy) || len == 0 || len > fl.queue.buffer_len()
+            || !self.inside(offset, len) || (write && !self.writable)
+        {
+            return Started::Done(false);
+        }
+        if let Some(started) = self.start_fast(k, write, offset, len) {
+            return started;
+        }
+        /* The synchronous path, after everything in flight: the batch's,
+         * through the image's own buffer -- with the queue out of the way
+         * meanwhile, whose buffer this request's data is in. */
+        self.drain();
+        let Some(mut fl) = self.flights.take() else { return Started::Done(false) };
+        let ok = match fl.queue.bytes(k) {
+            Some(bytes) if write => self.write_vec(&[(offset, &bytes[..len])]),
+            Some(bytes) => self.read_vec(&mut [(offset, &mut bytes[..len])]),
+            None => false,
+        };
+        fl.slow += 1;
+        self.flights = Some(fl);
+        Started::Done(ok)
+    }
+
+    /// `start`'s asynchronous path (`Flights`): the request as commands to
+    /// the device, runs of blocks one after another there -- or None, and
+    /// nothing done, for one it does not take.
+    fn start_fast(&mut self, k: usize, write: bool, offset: u64, len: usize) -> Option<Started> {
+        let (vfs, handle) = (self.vfs, self.handle);
+        let direct = self.direct.as_mut()?;
+        let fl = self.flights.as_mut()?;
+        let max = fl.queue.asynchronous()?;
+        let block = direct.block;
+        if direct.map.is_none() || offset % block as u64 != 0 || len % block != 0 {
+            return None;
+        }
+        let (first, n) = (offset / block as u64, len / block);
+        if n > direct.sectors.len() || !direct.resolve(vfs, handle, first, 0, n) {
+            return None;
+        }
+        if write && direct.sectors[..n].contains(&0) {
+            /* A hole: blocks only its filesystem can give it, in order. */
+            return None;
+        }
+
+        /* Runs of blocks one after another on the device, up to what one
+         * command moves; a read's blocks that are holes, or unwritten and
+         * not written since, zeros in the buffer and no command at all. */
+        let per_block = block as u64 / direct.disk.sector_size();
+        fl.commands.clear();
+        {
+            let bytes = fl.queue.bytes(k)?;
+            let mut b = 0;
+            while b < n {
+                let sector = direct.sectors[b];
+                if !write && (sector == 0 || direct.fresh[b]) {
+                    bytes[b * block..(b + 1) * block].fill(0);
+                    b += 1;
+                    continue;
+                }
+                let from = b;
+                b += 1;
+                while b < n && (b - from + 1) * block <= max
+                    && direct.sectors[b] == sector + (b - from) as u64 * per_block
+                    && (write || !direct.fresh[b])
+                {
+                    b += 1;
+                }
+                fl.commands.push((from * block, (b - from) * block, sector));
+            }
+        }
+        let slot = &mut fl.slots[k];
+        slot.unwritten.clear();
+        if write {
+            let mut b = 0;
+            while b < n {
+                if !direct.unwritten[b] {
+                    b += 1;
+                    continue;
+                }
+                let from = b;
+                while b < n && direct.unwritten[b] {
+                    b += 1;
+                }
+                /* Into the room taken at `make_queue`: a request's runs. */
+                slot.unwritten.push((first + from as u64, first + b as u64));
+            }
+        }
+        if fl.commands.is_empty() {
+            /* Zeros, every block: nothing for the device to do. */
+            fl.fast += 1;
+            return Some(Started::Done(true));
+        }
+
+        let count = fl.commands.len();
+        let slot = &mut fl.slots[k];
+        (slot.busy, slot.write, slot.left, slot.ok) = (true, write, count, true);
+        let began = boot_time_ns();
+        for i in 0..count {
+            let (at, len, sector) = fl.commands[i];
+            loop {
+                match fl.queue.start(k, at, len, sector, write) {
+                    Ok(()) => break,
+                    Err(SubmitError::Busy) if i == 0 && fl.queue.in_flight() == 0 => {
+                        /* Full of someone else's commands, none of the
+                         * image's own to wait for: this one by the
+                         * synchronous path, which waits for a command ID. */
+                        fl.slots[k].busy = false;
+                        return None;
+                    }
+                    Err(SubmitError::Busy) if boot_time_ns().saturating_sub(began) < DRAIN_SAY_NS => {
+                        /* The device's queue is full: one of the image's own
+                         * commands done makes room, or -- none of them out --
+                         * someone else's, looked for again shortly. */
+                        fl.queue.kick();
+                        let step = if fl.queue.in_flight() > 0 { DRAIN_STEP_MS } else { 1 };
+                        fl.queue.wait(Duration::from_millis(step));
+                        while let Some((buf, ok)) = fl.queue.reap() {
+                            command_done(direct, fl, vfs, handle, buf, ok);
+                        }
+                    }
+                    Err(_) => {
+                        /* Never, for a request checked as this one was --
+                         * but said, and failed: what was handed over is
+                         * still the device's, and the request is done when
+                         * that is. */
+                        trace!(0, "image: a command of {} bytes at sector {} was refused, or found no room on its \
+                                   disk for {} s", len, sector, DRAIN_SAY_NS / 1_000_000_000);
+                        let slot = &mut fl.slots[k];
+                        slot.ok = false;
+                        slot.left -= count - i;
+                        if slot.left == 0 {
+                            slot.busy = false;
+                            return Some(Started::Done(false));
+                        }
+                        return Some(Started::InFlight);
+                    }
+                }
+            }
+        }
+        fl.fast += 1;
+        Some(Started::InFlight)
+    }
+
+    /// The doorbell for what `start` handed the device.
+    pub fn kick(&mut self) {
+        if let Some(fl) = self.flights.as_ref() {
+            fl.queue.kick();
+        }
+    }
+
+    /// A request done, if one is -- its buffer, and whether it went well --
+    /// in the order they finished: never one `start` said was done.
+    pub fn reap(&mut self) -> Option<(usize, bool)> {
+        let (vfs, handle) = (self.vfs, self.handle);
+        let fl = self.flights.as_mut()?;
+        if fl.done.is_empty() {
+            while let Some((buf, ok)) = fl.queue.reap() {
+                match self.direct.as_mut() {
+                    Some(direct) => command_done(direct, fl, vfs, handle, buf, ok),
+                    None => trace!(0, "image: a completion for buffer {}, with no device to have come from", buf),
+                }
+            }
+        }
+        fl.done.pop_front()
+    }
+
+    /// Sleeps until one of its commands is done, or `block::queue::wake`
+    /// wakes its queue, or `timeout` is up: whether one came. At once, with
+    /// nothing to wait on, for an image with no queue.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.flights.as_ref().is_some_and(|fl| fl.queue.wait(timeout))
+    }
+
+    /// Everything the queue has with the device done: its requests kept for
+    /// `reap`. Said, while it waits long -- a disk that has stopped
+    /// answering, whose guest's disk stops with it.
+    fn drain(&mut self) {
+        let (vfs, handle) = (self.vfs, self.handle);
+        let Some(fl) = self.flights.as_mut() else { return };
+        if fl.queue.in_flight() == 0 {
+            return;
+        }
+        fl.queue.kick();
+        let (began, mut said) = (boot_time_ns(), false);
+        loop {
+            while let Some((buf, ok)) = fl.queue.reap() {
+                if let Some(direct) = self.direct.as_mut() {
+                    command_done(direct, fl, vfs, handle, buf, ok);
+                }
+            }
+            if fl.queue.in_flight() == 0 {
+                return;
+            }
+            fl.queue.wait(Duration::from_millis(DRAIN_STEP_MS));
+            let waited = boot_time_ns().saturating_sub(began);
+            if waited >= DRAIN_SAY_NS && !said {
+                said = true;
+                trace!(0, "image: {}: has waited {} s for {} commands of its disk's", show(&self.path),
+                       waited / 1_000_000_000, fl.queue.in_flight());
+            }
+        }
+    }
+}
+
+/// One of buffer `buf`'s commands done: its request too, with the last --
+/// what it wrote over unwritten extents noted as written now, and not
+/// before (`Flight::unwritten`) -- and kept for `reap`.
+fn command_done(direct: &mut Direct, fl: &mut Flights, vfs: &Vfs, handle: Handle, buf: usize, ok: bool) {
+    let Some(slot) = fl.slots.get_mut(buf).filter(|s| s.busy && s.left > 0) else {
+        trace!(0, "image: a completion for buffer {}, which has no command out", buf);
+        return;
+    };
+    slot.ok &= ok;
+    slot.left -= 1;
+    if slot.left != 0 {
+        return;
+    }
+    let mut ok = slot.ok;
+    if slot.write && ok {
+        for &(from, to) in &slot.unwritten {
+            ok &= direct.note_written(vfs, handle, from, to);
+        }
+    }
+    slot.busy = false;
+    /* Into the room taken at `make_queue`: a request a buffer. */
+    fl.done.push_back((buf, ok));
+}
+
+/// A path the image was given, as what it says shows it.
+fn show(path: &[u8]) -> &str {
+    core::str::from_utf8(path).unwrap_or("(a path that is not UTF-8)")
 }
 
 impl Drop for Image {
     fn drop(&mut self) {
+        /* Its buffers are the device's until then, and what it wrote over
+         * unwritten extents is noted when it is done. */
+        self.drain();
         let path = core::str::from_utf8(&self.path).unwrap_or("(a path that is not UTF-8)");
         let (vfs, handle) = (self.vfs, self.handle);
         if let Some(direct) = self.direct.as_mut() {
@@ -1022,6 +1403,10 @@ impl Drop for Image {
                            average and {} us at most", path, d.grows_timed.count, d.grows_timed.average_us(),
                        d.grows_timed.max_us(), d.conversions.count, d.conversions.average_us(),
                        d.conversions.max_us());
+                if let Some(fl) = self.flights.as_ref() {
+                    trace!(0, "image: {}: {} requests served with the device asynchronously, {} by the batch",
+                           path, fl.fast, fl.slow);
+                }
             }
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
@@ -1275,6 +1660,23 @@ fn word(slot: usize, generation: u32) -> usize {
     ((generation as usize) << SLOT_BITS) | (slot + 1)
 }
 
+/// Per slot, the queue of the image in it (`kernel_image_queue`): the
+/// image's generation above, its queue's entry plus one below -- 0 for none.
+/// What `kernel_image_wait` and `kernel_image_wake` find it by without the
+/// slot's lock, which the queue's owner may hold for as long as a growth of
+/// the image's file takes: the vCPU that wakes it is never held up by it.
+static WAITS: [AtomicU64; MAX_IMAGES] = [const { AtomicU64::new(0) }; MAX_IMAGES];
+
+/// The queue entry of the image `image` names, from `WAITS`: None for a
+/// word that names no image with a queue.
+fn queue_of(image: usize) -> Option<usize> {
+    let at = (image & SLOT_MASK).checked_sub(1)?;
+    let generation = (image >> SLOT_BITS) as u32;
+    let word = WAITS.get(at)?.load(Ordering::Acquire);
+    let entry = ((word & 0xFFFF_FFFF) as usize).checked_sub(1)?;
+    ((word >> 32) as u32 == generation).then_some(entry)
+}
+
 /// The image `image` names, locked, for `work` -- or None for a word that
 /// names none.
 fn with<R>(image: usize, work: impl FnOnce(&mut Image) -> R) -> Option<R> {
@@ -1329,6 +1731,7 @@ pub extern "C" fn kernel_image_close(image: usize) {
             return;
         }
         let taken = slot.image.take();
+        WAITS[at].store(0, Ordering::Release);
         /* The word names nothing from here on, whatever takes the slot. */
         slot.generation = slot.generation.wrapping_add(1);
         taken
@@ -1399,55 +1802,6 @@ pub unsafe extern "C" fn kernel_image_write(image: usize, offset: u64, data: *co
     }
 }
 
-/// Fills each of the `n` parts of `ios` from its offset of the image
-/// (`Image::read_vec`): 0, or -1.
-///
-/// # Safety
-/// `ios` points at `n` parts, each `buf` at `len` writable bytes, and no two
-/// of the buffers overlap.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_image_read_vec(image: usize, ios: *const ImageIo, n: usize) -> i32 {
-    if ios.is_null() || !ios.is_aligned() || n == 0 || n > IMAGE_VEC_MAX {
-        return -1;
-    }
-    let ios = unsafe { core::slice::from_raw_parts(ios, n) };
-    if ios.iter().any(|io| io.buf.is_null() || isize::try_from(io.len).is_err()) {
-        return -1;
-    }
-    let mut parts: [(u64, &mut [u8]); IMAGE_VEC_MAX] = core::array::from_fn(|_| (0, Default::default()));
-    for (part, io) in parts.iter_mut().zip(ios) {
-        *part = (io.offset, unsafe { core::slice::from_raw_parts_mut(io.buf, io.len) });
-    }
-    match with(image, |image| image.read_vec(&mut parts[..n])) {
-        Some(true) => 0,
-        _ => -1,
-    }
-}
-
-/// Writes each of the `n` parts of `ios` at its offset of the image
-/// (`Image::write_vec`): 0, or -1. Not synced: `kernel_image_sync` is.
-///
-/// # Safety
-/// `ios` points at `n` parts, each `buf` at `len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_image_write_vec(image: usize, ios: *const ImageIo, n: usize) -> i32 {
-    if ios.is_null() || !ios.is_aligned() || n == 0 || n > IMAGE_VEC_MAX {
-        return -1;
-    }
-    let ios = unsafe { core::slice::from_raw_parts(ios, n) };
-    if ios.iter().any(|io| io.buf.is_null() || isize::try_from(io.len).is_err()) {
-        return -1;
-    }
-    let mut parts: [(u64, &[u8]); IMAGE_VEC_MAX] = [(0, &[]); IMAGE_VEC_MAX];
-    for (part, io) in parts.iter_mut().zip(ios) {
-        *part = (io.offset, unsafe { core::slice::from_raw_parts(io.buf, io.len) });
-    }
-    match with(image, |image| image.write_vec(&parts[..n])) {
-        Some(true) => 0,
-        _ => -1,
-    }
-}
-
 /// Where the image has data from `offset` on (`Image::extent`): the first
 /// byte of it into `out[0]`, holes before it, and the end of its run into
 /// `out[1]` -- the two the same where none of the blocks looked at holds
@@ -1498,5 +1852,120 @@ pub extern "C" fn kernel_image_sync(image: usize) -> i32 {
     match with(image, Image::sync) {
         Some(true) => 0,
         _ => -1,
+    }
+}
+
+/* ---- an image's queue: a guest's disk's requests, as many at once as it
+ * has, in buffers of the image's own (`Image::start`) ----
+ *
+ * The buffers are the image's, freed when it is let go of and not before --
+ * once every request of them is done. Whoever holds the image fills a
+ * buffer with a write's data before it starts the request, and takes a
+ * read's out once it is reaped, and keeps off it in between: the image's,
+ * and the device's, until `kernel_image_reap` gives it back. Every call but
+ * `kernel_image_wake` from one task. */
+
+/// Its queue (`Image::make_queue`): `buffers` buffers of `bytes` each, a
+/// whole number of pages, their addresses into `out` -- 0, or -1: no
+/// memory, a queue already, a word that is no image's.
+///
+/// # Safety
+/// `out` takes `buffers` pointers.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8) -> i32 {
+    if out.is_null() || !out.is_aligned() || buffers == 0 || buffers > IMAGE_QUEUE_MAX || bytes == 0
+        || bytes % PAGE_SIZE != 0
+    {
+        return -1;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out, buffers) };
+    let Some(at) = (image & SLOT_MASK).checked_sub(1) else { return -1 };
+    let made = with(image, |img| {
+        if !img.make_queue(buffers, bytes / PAGE_SIZE) {
+            return None;
+        }
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = img.buffer_address(k)?;
+        }
+        img.queue_entry()
+    });
+    match made {
+        Some(Some(entry)) => {
+            /* Under no lock: a word stale by now is the next image's, whose
+             * wake is a spurious one -- never a wait on what is gone. */
+            WAITS[at].store(((image >> SLOT_BITS) as u64) << 32 | (entry as u64 + 1), Ordering::Release);
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Buffer `buffer`'s request -- `len` bytes from `offset` read into it, or
+/// with `write` not 0 written from it -- to the image (`Image::start`): 1
+/// while it is with the device, until `kernel_image_reap` gives it back; 0
+/// done now; -1 done, and failed. Its doorbell waits for
+/// `kernel_image_kick`.
+#[no_mangle]
+pub extern "C" fn kernel_image_start(image: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32 {
+    match with(image, |img| img.start(buffer, write != 0, offset, len)) {
+        Some(Started::InFlight) => 1,
+        Some(Started::Done(true)) => 0,
+        _ => -1,
+    }
+}
+
+/// The doorbell for the requests started.
+#[no_mangle]
+pub extern "C" fn kernel_image_kick(image: usize) {
+    with(image, Image::kick);
+}
+
+/// Requests done, as many as there are and `max` at most, into `out` --
+/// each its buffer and how it went: how many, or -1 for a word that is no
+/// image's with a queue.
+///
+/// # Safety
+/// `out` takes `max` of them.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_image_reap(image: usize, out: *mut ImageDone, max: usize) -> isize {
+    if out.is_null() || !out.is_aligned() || max == 0 || isize::try_from(max).is_err() {
+        return -1;
+    }
+    let out = unsafe { core::slice::from_raw_parts_mut(out, max) };
+    let reaped = with(image, |img| {
+        img.flights.as_ref()?;
+        let mut n = 0;
+        while n < out.len() {
+            let Some((buffer, ok)) = img.reap() else { break };
+            out[n] = ImageDone { buffer: buffer as u32, ok: u32::from(ok) };
+            n += 1;
+        }
+        Some(n)
+    });
+    match reaped {
+        Some(Some(n)) => n as isize,
+        _ => -1,
+    }
+}
+
+/// Sleeps until one of the image's commands is done, or `kernel_image_wake`
+/// wakes it, or `timeout_ns` is up -- with no lock of the image's held: 1
+/// when one came, 0 when the time ran out, -1 at once for a word that is no
+/// image's with a queue.
+#[no_mangle]
+pub extern "C" fn kernel_image_wait(image: usize, timeout_ns: u64) -> i32 {
+    match queue_of(image) {
+        Some(entry) => i32::from(block::queue::wait(entry, Duration::from_nanos(timeout_ns))),
+        None => -1,
+    }
+}
+
+/// Wakes the image's queue's waiter, from anywhere: what a request handed
+/// to its owner wakes it with. Nothing, for a word that is no image's with
+/// a queue.
+#[no_mangle]
+pub extern "C" fn kernel_image_wake(image: usize) {
+    if let Some(entry) = queue_of(image) {
+        block::queue::wake(entry);
     }
 }

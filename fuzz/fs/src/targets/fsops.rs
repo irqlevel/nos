@@ -9,7 +9,7 @@
 //! written off the VFS's lock where its filesystem keeps blocks on a device
 //! -- and while it is held, everything else that would write it refused.
 
-use fs::image::Image;
+use fs::image::{Image, Started};
 use fs::vfs::{FileStat, Handle, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
 use fs::vnode::Kind;
 
@@ -553,6 +553,66 @@ pub fn path(r: &mut Input, m: &Model) -> Vec<u8> {
     p
 }
 
+/// One request of a batch through an image's queue (`Fs::image_queue_batch`).
+#[derive(Clone)]
+pub enum QueueReq {
+    Read(u64, usize),
+    Write(u64, Vec<u8>),
+    /// A flush among them.
+    Sync,
+}
+
+/// What an image's queue has here: a few buffers of a few pages -- fewer
+/// than a batch's requests, so that a batch waits for some.
+pub const QUEUE_BUFFERS: usize = 6;
+pub const QUEUE_PAGES: usize = 16;
+pub const QUEUE_BYTES: usize = QUEUE_PAGES * 4096;
+
+/// A batch's requests in flight: the buffers free, which request each of
+/// the others is, and how each request went.
+struct Batch {
+    free: Vec<usize>,
+    flying: Vec<Option<usize>>,
+    got: Vec<Option<bool>>,
+}
+
+/// A batch of a guest's disk's requests at `size` bytes into a file: whole
+/// blocks mostly -- the queue's asynchronous path -- now and then a part of
+/// one, a run longer than a buffer, one past the end, and a flush; no two
+/// reaching the same block.
+pub fn queue_batch(r: &mut Input, size: u64, block: u64, span: u64, focus: Option<(u64, u64)>) -> Vec<QueueReq> {
+    let mut reqs = Vec::new();
+    let mut taken: Vec<(u64, u64)> = Vec::new();
+    /* The blocks most requests fall in: `focus`'s -- blocks the file has,
+     * written just before -- or the whole file's. */
+    let (lo, hi) = focus.map_or((0, size / 4096), |(from, to)| (from / 4096, to.min(size) / 4096));
+    for _ in 0..r.range(1, 24) {
+        if r.chance(16) {
+            reqs.push(QueueReq::Sync);
+            continue;
+        }
+        let (at, len) = if hi > lo && r.chance(192) {
+            /* Whole blocks inside the file: the asynchronous path's. */
+            let b = lo + r.below(hi - lo);
+            (b * 4096, 4096 * r.range(1, (hi - b).min(QUEUE_PAGES as u64)) as usize)
+        } else if r.chance(160) {
+            let at = offset(r, size, block, span) / 4096 * 4096;
+            /* Now and then a page longer than a buffer: refused. */
+            let most = QUEUE_PAGES as u64 + u64::from(r.chance(16));
+            (at, 4096 * r.range(1, most) as usize)
+        } else {
+            (offset(r, size, block, span), length(r).max(1))
+        };
+        let (b0, b1) = (at / 4096, at.saturating_add(len as u64).div_ceil(4096));
+        if taken.iter().any(|&(x0, x1)| b0 < x1 && x0 < b1) {
+            continue;
+        }
+        taken.push((b0, b1));
+        reqs.push(if r.bool() { QueueReq::Write(at, crate::input::noise(r.u32(), len)) } else { QueueReq::Read(at, len) });
+    }
+    reqs
+}
+
 /// How much a write writes.
 pub fn length(r: &mut Input) -> usize {
     match r.u8() % 8 {
@@ -622,6 +682,33 @@ fn partial_write(old: &Data, got: &Data, at: u64, data: &[u8]) -> bool {
     mid[k..] == old.read(start + k as u64, end - start - k as u64)[..]
 }
 
+/// Whether `got` is `old` with each of `writes` -- apart, none reaching
+/// another's bytes -- done in part, as a run of writes that met a lack of
+/// room leaves it: every byte no write reaches the old one, and each write's
+/// range a first part of its new bytes and the old ones after.
+fn partial_writes(old: &Data, got: &Data, writes: &[(u64, &[u8])]) -> bool {
+    if got.len() != old.len() {
+        return false;
+    }
+    let size = old.len();
+    let mut ranges: Vec<(u64, u64, &[u8])> = writes.iter()
+        .map(|&(at, d)| (at.min(size), (at + d.len() as u64).min(size).max(at.min(size)), d)).collect();
+    ranges.sort_by_key(|r| r.0);
+    let mut from = 0;
+    for &(start, end, data) in &ranges {
+        if start < from || !got.same_range(old, from, start) {
+            return false;
+        }
+        let mid = got.read(start, end - start);
+        let k = mid.iter().zip(data).position(|(g, d)| g != d).unwrap_or(mid.len());
+        if mid[k..] != old.read(start + k as u64, end - start - k as u64)[..] {
+            return false;
+        }
+        from = end;
+    }
+    got.same_range(old, from, u64::MAX)
+}
+
 impl Fs {
     fn check(&self, ok: bool, what: std::fmt::Arguments) {
         if self.strict && !ok {
@@ -673,7 +760,9 @@ impl Fs {
         }
         for (off, n) in ranges {
             let n = n.min(size.saturating_sub(off));
-            let mut buf = vec![0u8; n as usize];
+            /* The fuzzer's own: no allocation of the kernel's to be held to
+             * the kernel heap's ceiling. */
+            let mut buf = crate::machine::sched::harness(|| vec![0u8; n as usize]);
             let mut k = 0;
             if file.seek(off as usize) {
                 while k < buf.len() {
@@ -689,6 +778,44 @@ impl Fs {
         self.check(partial_write(old, &got, at, data), format_args!("a write of {} bytes at {} to {} ({} bytes) that \
                    ran out of room left {} bytes, not the old ones with a first part of the new", data.len(), at,
                    show(&p), old.len(), got.len()));
+        if let Some(d) = self.model.file_mut(path) {
+            *d = got;
+        }
+    }
+
+    /// Writes of a batch to `path` refused for want of room, some of them
+    /// done and some not (`partial_writes`): the model takes what the file
+    /// is.
+    fn resync_batch(&mut self, path: &[Vec<u8>], old: &Data, writes: &[(u64, &[u8])]) {
+        let p = join(path);
+        let Some(file) = fs::vfs::Open::new(self.vfs, &p, OPEN_READ) else {
+            self.check(false, format_args!("{} does not open after writes to it ran out of room", show(&p)));
+            return;
+        };
+        let size = file.size() as u64;
+        let mut got = old.clone();
+        got.truncate(size);
+        let mut ranges: Vec<(u64, u64)> = writes.iter().map(|&(at, d)| (at.min(size), d.len() as u64)).collect();
+        for b in old.nonzero_blocks(4096) {
+            ranges.push((b * 4096, 4096));
+        }
+        for (off, n) in ranges {
+            let n = n.min(size.saturating_sub(off));
+            let mut buf = crate::machine::sched::harness(|| vec![0u8; n as usize]);
+            let mut k = 0;
+            if file.seek(off as usize) {
+                while k < buf.len() {
+                    match file.read(&mut buf[k..]) {
+                        Some(0) | None => break,
+                        Some(r) => k += r,
+                    }
+                }
+            }
+            got.write(off, &buf[..k]);
+        }
+        drop(file);
+        self.check(partial_writes(old, &got, writes), format_args!("{} writes to {} ({} bytes) that ran out of room \
+                   left it not the old bytes with a first part of each's new ones", writes.len(), show(&p), old.len()));
         if let Some(d) = self.model.file_mut(path) {
             *d = got;
         }
@@ -1005,6 +1132,180 @@ impl Fs {
                 self.image_map_held(i);
             }
         }
+    }
+
+    /// A guest's disk's requests through image `i`'s queue (`Image::start`,
+    /// `Image::reap`), the queue made the first time: as many with the disk
+    /// at once as there are buffers, each done when it is, a read's bytes
+    /// held to the model as it comes back and the writes the model's at the
+    /// end -- the asynchronous path's whole blocks among the synchronous
+    /// path's, which waits for them (a part of a block, a write into a
+    /// hole), and flushes. With `close`, the image let go of with them in
+    /// flight: its drop waits for them, and they are written. No two of
+    /// them reach one block (`queue_batch`), as a guest has it.
+    pub fn image_queue_batch(&mut self, i: usize, reqs: &[QueueReq], close: bool) {
+        let Some((path, writable)) = self.model.holds.get(i).cloned() else { return };
+        say(format_args!("image_queue_batch {} requests of {}{}", reqs.len(), show(&join(&path)),
+                         if close { ", let go of with them in flight" } else { "" }));
+        if self.images[i].queue_entry().is_none() && !self.images[i].make_queue(QUEUE_BUFFERS, QUEUE_PAGES) {
+            self.check(false, format_args!("image {}'s queue could not be made", i));
+            return;
+        }
+        let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
+        let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
+        let size = self.model.size(&path);
+        let before = match self.model.node(&path) {
+            Some(Node::File(d)) => d.clone(),
+            _ => Data::new(),
+        };
+        let want = |req: &QueueReq| match req {
+            QueueReq::Sync => true,
+            QueueReq::Read(at, len) => *len != 0 && *len <= QUEUE_BYTES
+                && at.checked_add(*len as u64).is_some_and(|end| end <= size),
+            QueueReq::Write(at, d) => writable && !d.is_empty() && d.len() <= QUEUE_BYTES
+                && at.checked_add(d.len() as u64).is_some_and(|end| end <= size),
+        };
+        let mut q = Batch {
+            free: (0..QUEUE_BUFFERS).rev().collect(),
+            flying: vec![None; QUEUE_BUFFERS],
+            got: vec![None; reqs.len()],
+        };
+        let mut aside = false;
+        for (n, req) in reqs.iter().enumerate() {
+            let (write, at, len) = match req {
+                QueueReq::Sync => {
+                    q.got[n] = Some(self.images[i].sync());
+                    continue;
+                }
+                QueueReq::Read(at, len) => (false, *at, *len),
+                QueueReq::Write(at, d) => (true, *at, d.len()),
+            };
+            let k = loop {
+                if let Some(k) = q.free.pop() {
+                    break k;
+                }
+                if !self.queue_reap(i, &mut q, reqs, &before) {
+                    self.images[i].wait(kcore::time::Duration::from_millis(1));
+                }
+            };
+            if let QueueReq::Write(_, d) = req {
+                let Some(buf) = self.images[i].buffer(k) else {
+                    self.check(false, format_args!("image {}'s buffer {} not to be had between its requests", i, k));
+                    return;
+                };
+                let m = d.len().min(buf.len());
+                buf[..m].copy_from_slice(&d[..m]);
+            }
+            match self.images[i].start(k, write, at, len) {
+                Started::InFlight => {
+                    reached("an image's request with its disk asynchronously");
+                    q.flying[k] = Some(n);
+                }
+                Started::Done(ok) => {
+                    if q.flying.iter().any(Option::is_some) {
+                        aside = true;
+                    }
+                    q.got[n] = Some(ok);
+                    if ok && !write {
+                        self.queue_read_held(i, k, at, len, &before);
+                    }
+                    q.free.push(k);
+                }
+            }
+        }
+        self.images[i].kick();
+        if aside {
+            reached("an image's request served by the batch while others were with its disk");
+        }
+        if close {
+            /* Whatever was in flight done by the drop, and written: its
+             * answers nobody's to hear, so taken as the model's. */
+            if q.flying.iter().any(Option::is_some) {
+                reached("an image let go of with requests in flight");
+            }
+            for (n, req) in reqs.iter().enumerate() {
+                if q.got[n].is_none() {
+                    q.got[n] = Some(want(req));
+                }
+            }
+            drop(self.images.remove(i));
+            self.model.holds.remove(i);
+        } else {
+            while q.flying.iter().any(Option::is_some) {
+                if !self.queue_reap(i, &mut q, reqs, &before) {
+                    self.images[i].wait(kcore::time::Duration::from_millis(1));
+                }
+            }
+            self.chunks_held(i, refused, reasons, mark);
+        }
+
+        let (mut got_all, mut want_all) = (true, true);
+        for (n, req) in reqs.iter().enumerate() {
+            let (got, want) = (q.got[n].unwrap_or(false), want(req));
+            match req {
+                QueueReq::Sync => self.check(got || !self.strict, format_args!("an image's sync among its queue's \
+                                                                                requests failed")),
+                QueueReq::Read(at, len) => self.check(got == want, format_args!("an image's queued read of {} \
+                    bytes of {} ({} bytes) at {} {}", len, show(&join(&path)), size, at,
+                    if got { "succeeded" } else { "failed" })),
+                QueueReq::Write(..) if want => {
+                    got_all &= got;
+                }
+                QueueReq::Write(at, d) => self.check(!got, format_args!("an image's queued write of {} bytes to {} \
+                    ({} bytes) at {} succeeded", d.len(), show(&join(&path)), size, at)),
+            }
+            want_all &= want || !matches!(req, QueueReq::Write(..));
+        }
+        let writes: Vec<(u64, &Vec<u8>)> = reqs.iter().filter_map(|r| match r {
+            QueueReq::Write(at, d) => Some((*at, d)),
+            _ => None,
+        }).filter(|(at, d)| want(&QueueReq::Write(*at, d.to_vec()))).collect();
+        if self.refused_for_room(got_all, !writes.is_empty(), mark, &saved) {
+            let parts: Vec<(u64, &[u8])> = writes.iter().map(|(at, d)| (*at, &d[..])).collect();
+            self.resync_batch(&path, &before, &parts);
+            return;
+        }
+        self.check(got_all, format_args!("an image's queued writes to {} ({} bytes) failed", show(&join(&path)),
+                                         size));
+        let _ = want_all;
+        if self.takes(got_all, true) {
+            if let Some(file) = self.model.file_mut(&path) {
+                for (at, d) in &writes {
+                    file.write(*at, d);
+                }
+            }
+        }
+        if !close {
+            self.image_map_held(i);
+        }
+    }
+
+    /// What image `i`'s queue has done given back to the batch's requests,
+    /// a read's bytes held to the model: whether anything was.
+    fn queue_reap(&mut self, i: usize, q: &mut Batch, reqs: &[QueueReq], before: &Data) -> bool {
+        let mut any = false;
+        while let Some((k, ok)) = self.images[i].reap() {
+            any = true;
+            let Some(n) = q.flying.get_mut(k).and_then(Option::take) else {
+                self.check(false, format_args!("image {} gave back buffer {}, which had no request out", i, k));
+                continue;
+            };
+            q.got[n] = Some(ok);
+            if let (QueueReq::Read(at, len), true) = (&reqs[n], ok) {
+                self.queue_read_held(i, k, *at, *len, before);
+            }
+            q.free.push(k);
+        }
+        any
+    }
+
+    /// Buffer `k` of image `i`, a read of `len` bytes at `at` done in it:
+    /// what the model has there.
+    fn queue_read_held(&mut self, i: usize, k: usize, at: u64, len: usize, before: &Data) {
+        let want = crate::machine::sched::harness(|| before.read(at, len as u64));
+        let same = self.images[i].buffer(k).is_some_and(|b| b.len() >= len && b[..len] == want[..]);
+        self.check(same, format_args!("an image's queued read of {} bytes at {} gave other bytes than were \
+                                       written", len, at));
     }
 
     /// An image's discard (`zeroes` None) or write of zeros: a discard's
@@ -1621,6 +1922,12 @@ fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
                 10 => {
                     let at = if r.bool() { 0 } else { offset(r, size, block, f.model.limits.span) };
                     f.image_extent(i, at);
+                }
+                7 if r.chance(128) => {
+                    /* A guest's disk's requests through the image's queue */
+                    let reqs = queue_batch(r, size, block, f.model.limits.span, None);
+                    let close = r.chance(16);
+                    f.image_queue_batch(i, &reqs, close);
                 }
                 8 | 9 => {
                     /* A discard, or a write of zeros, over a few blocks */
