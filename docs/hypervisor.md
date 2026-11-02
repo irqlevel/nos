@@ -2487,9 +2487,14 @@ time, and each CPU its own. It said (a68aeb3a): of 12388 such interrupts in
 a run, 241 after a host's interrupt took a guest out that had computed past
 its edge -- the 10 ms, a host tick -- and 12078 after sleeps that had the
 edge and ended 1-3 ms past their time, 0.12% of the sleeps, nearly all by a
-ring. Those are the machine's own: its cyclictest's most is 3.1 ms under
-KVM as under nos, and the scheduler's wake-ups on every CPU come at most
-3-4.6 ms late since boot.
+ring. Those were taken for the machine's own -- its cyclictest's most was 3.1
+ms under KVM as under nos, and the scheduler's wake-ups on every CPU came at
+most 3-4.6 ms late since boot -- and were the host's idle task: out of its
+idling it was counted as any task, and an interrupt's decision left it the
+CPU over a vCPU rung just then, which waited out its 3 ms slice
+([scheduler](scheduler.md#the-idle-task)). With that closed (d92695bc) a run
+of the suite has no sleep ending more than 1 ms past its time, 2 timer
+interrupts more than 1 ms late, and cyclictest's most 205 us.
 
 **The host's timer is armed for the edge as the entry is made**
 (`Kick::arm_at`, `Kick::entering`), with interrupts off on the CPU from there
