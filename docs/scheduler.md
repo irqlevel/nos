@@ -622,7 +622,22 @@ and its self-tests, which are what the bring-up function runs before its
 loop, or the shutdown -- it is a task like any other, counted in V and
 displaced back to the run list to take its turns: it joins the count as it
 stops idling, placed as a task waking, and leaves it, its lag kept, as it
-idles again. It used to be the last resort whatever it
+idles again. Each time round its loop it puts the flag up first and then
+looks at its queue: with a task there it can run, it takes the flag down
+again and yields (`yield_to_runnable`) instead of halting. Out of its
+idling -- woken, round the loop, at the reap -- it is counted as any task,
+and an interrupt's decision leaves the CPU to the task it lands on unless
+another's deadline comes sooner: a task woken then, its deadline a slice
+off like the idle task's, waited on the list while the idle task halted
+again, until the idle task's slice ended on the timer 3 ms on. On the EX44
+a guest's vCPU woken just after its CPU had taken another interrupt -- its
+disk's completion, a ring from another vCPU -- met it: its guest's timer
+interrupts were more than a millisecond late thousands of times a run, and
+a task woken on those CPUs waited 2-4 ms at the 99th percentile with
+nothing else on the queue. The look comes after the
+flag, so no window is left between them: a decision before the flag has
+put its task on the run list, where the look counts it; one after finds
+the flag and switches. It used to be the last resort whatever it
 ran, and a task the boot started on the boot CPU that never blocked kept the
 boot itself off that CPU for as long as it ran: the ring selftest's producer,
 pinned to the boot CPU and polling for a consumer the boot had not started
