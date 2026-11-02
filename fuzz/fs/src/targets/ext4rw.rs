@@ -210,6 +210,11 @@ struct Run {
     /// be the image's own, off the VFS's lock (`Image::sync`), which the
     /// filesystem's commits -- each forcing its own -- do not count on.
     image_syncs: Vec<(usize, usize)>,
+    /// The stretch of an image's file its last call wrote whole blocks of,
+    /// by the image's index: where its next batch through the queue mostly
+    /// falls (`fsops::queue_batch`) -- blocks the file has, which the queue
+    /// sends its disk as they are.
+    written: Option<(usize, u64, u64)>,
 }
 
 impl Run {
@@ -572,10 +577,53 @@ fn image(run: &mut Run, r: &mut Input) -> Leave {
     let Some((path, _)) = run.f.model.holds.get(i).cloned() else { return Leave::Either };
     let size = run.f.model.size(&path);
     let span = run.f.model.limits.span;
-    match r.u8() % 9 {
+    match r.u8() % 12 {
         0 => {
             run.f.image_close(i);
+            run.written = None;
             Leave::Either
+        }
+        9 if size >= 4096 => {
+            /* A stretch of whole blocks written, for the queue's next batch
+             * to find its blocks there (`written`) -- a call of its own: a
+             * power cut between it and the batch leaves what neither the
+             * tree before them nor after has. */
+            let at = r.below(size / 4096) * 4096;
+            let n = (2 * fsops::QUEUE_BYTES as u64).min(size - at);
+            let data_in = crate::input::noise(r.u32(), n as usize);
+            run.f.image_write(i, at, &data_in);
+            into_unwritten(run, &path, at, n);
+            run.written = Some((i, at, at + n));
+            if i < run.f.images.len() {
+                run.image_sync(i);
+            }
+            run.f.model.propagate(&path);
+            data(run, &path, false, false)
+        }
+        9..=11 => {
+            /* A guest's disk's requests through the image's queue, as many
+             * with the disk at once as it has buffers -- synced as part of
+             * it, as the writes above are. */
+            let focus = run.written.filter(|w| w.0 == i).map(|(_, from, to)| (from, to));
+            let reqs = fsops::queue_batch(r, size, run.block, span, focus);
+            let close = r.chance(16);
+            run.f.image_queue_batch(i, &reqs, close);
+            if close {
+                run.written = None;
+            }
+            for req in &reqs {
+                /* A write longer than a buffer is refused whole. */
+                if let fsops::QueueReq::Write(at, d) = req {
+                    if d.len() <= fsops::QUEUE_BYTES {
+                        into_unwritten(run, &path, *at, d.len() as u64);
+                    }
+                }
+            }
+            if !close && i < run.f.images.len() {
+                run.image_sync(i);
+            }
+            run.f.model.propagate(&path);
+            data(run, &path, false, false)
         }
         8 => {
             /* A guest filling its disk from one end: writes one after
@@ -715,6 +763,9 @@ pub fn ext4rw(r: &mut Input) {
     d.seed_chaos(r.u64());
     d.volatile = r.u8() % 4 != 0;
     d.latency = r.chance(64);
+    if r.bool() {
+        d.take_async(r.pick(&[4096, 8192, 65536, 1 << 20]), r.range(1, 64) as usize);
+    }
     let faults = r.chance(24);
     let cuts = !faults && d.volatile;
     if faults {
@@ -767,6 +818,7 @@ pub fn ext4rw(r: &mut Input) {
         uncertain: None,
         unwritten: unwritten_at.iter().map(|(p, v)| (p.clone(), v.iter().copied().collect())).collect(),
         image_syncs: Vec::new(),
+        written: None,
     };
     run.f.punch_room = punch_room;
     run.f.allocates = true;

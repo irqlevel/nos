@@ -344,6 +344,14 @@ pub unsafe extern "C" fn kernel_alloc_dma_pages(count: usize, phys_out: *mut u64
 /// What `kernel_alloc_dma_pages` gave out, and how: to give back.
 static DMA: std::sync::Mutex<Vec<(usize, std::alloc::Layout)>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether `len` bytes from `addr` lie inside DMA pages given out and not
+/// given back: what a device that is code may reach -- its I/O into
+/// anything else a finding, memory the kernel freed under it above all.
+pub fn dma_live(addr: usize, len: usize) -> bool {
+    let d = DMA.lock().unwrap_or_else(|e| e.into_inner());
+    d.iter().any(|&(at, layout)| addr >= at && addr.checked_add(len).is_some_and(|end| end <= at + layout.size()))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn kernel_free_dma_pages(ptr: *mut u8) {
     super::heap::check("frees DMA pages at", ptr as usize);

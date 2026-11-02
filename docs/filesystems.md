@@ -201,12 +201,41 @@ their commit will give them, `Source for Txn`). `fs-fuzz` holds ext4's
 images to having no chunk refused but for want of room, a failed request or
 the kernel heap's ceiling.
 
-**Reads and writes go a vector at a time** (`Image::read_vec`,
-`write_vec`): the requests a guest's disk has out at once are one batch,
-as many as its 2 MiB hold, so that they are with the device at once rather
-than one after another. A block two of them write -- two sectors of one
-block, each read and written back whole -- is never in one batch twice:
-the second waits for the next batch, and both land.
+**A guest's requests go to the device as they come, and come back as
+each is done** (the image's queue: `Image::make_queue`, `start`, `reap`;
+`kcore::fs::ImageQueue` for a module). The queue has buffers of the
+image's own, one a request the guest's disk may have out -- which are the
+virtio device's buffers too: the vCPU copies a write's data into one and a
+read's out of one, and the image's disk reads and writes them as they are,
+with no copy of the image's. A read or a write of whole blocks the map
+names -- a read's holes and unwritten blocks zeros in the buffer -- goes to
+the device on its asynchronous path (`block::queue::Queue`, over
+`Disk::submit`: NVMe, its commands through a page of PRP entries a command
+ID): runs of blocks one after another on the device a command each, as
+many requests with the device at once as the guest has out, each given
+back when its commands are -- not with the slowest of a batch -- and what a
+write wrote over unwritten extents noted when it is done, not before.
+Anything else -- a write into a hole, a part of a block, a flush, a
+discard, a disk with no asynchronous path, any of the image's other calls
+-- first waits for everything in flight (`drain`) and is served by the
+synchronous path below: so nothing the image changes of its map, its file
+or its pending conversions moves under I/O the device has, and a block a
+punch gives back goes to no other file while a write of the guest's is on
+its way to it (`punch` panics if one is). The queue's buffers are freed
+with the image, once every request of them is done; a buffer goes from
+nobody's to lent (the vCPU's, to fill or empty) to the image's and back by
+a compare-and-swap of its state (`kcore::fs::Lent`), so its bytes are never
+reached while its request is the device's. Its owner sleeps on the queue
+(`kernel_image_wait`), which a command done wakes and so does a request
+handed over (`kernel_image_wake`) -- neither taking the image's lock,
+which the owner may hold for as long as a growth of the file takes.
+
+**The synchronous path goes a vector at a time** (`Image::read_vec`,
+`write_vec`): the requests of a vector are one batch, as many as its 2 MiB
+hold, so that they are with the device at once rather than one after
+another. A block two of them write -- two sectors of one block, each read
+and written back whole -- is never in one batch twice: the second waits
+for the next batch, and both land.
 
 A guest's discard gives whole chunks back (`Image::discard`, `Vfs::punch`):
 the filesystem's `punch` -- ext2's frees the data blocks of the range in
@@ -220,8 +249,9 @@ mounted with `discard` does, costs the filesystem a commit a chunk rather
 than one a range. A write of zeros gives back the whole chunks it covers
 with its unmap flag and writes zeros over the rest. That the next file may
 have a block the moment the punch is done is safe because an image's calls
-come one at a time: none of its reads is under way off the lock on a block
-it mapped before. A filesystem with no blocks of its own gives nothing
+come one at a time and a punch waits for its queue's I/O first: none of its
+reads or writes is under way off the lock on a block it mapped before. A
+filesystem with no blocks of its own gives nothing
 back, and its discard does nothing. A guest's disk tells the guest what a
 discard gives back whole (`Image::discard_unit`, the device's
 `discard_sector_alignment`): Linux then splits a long discard on a chunk's

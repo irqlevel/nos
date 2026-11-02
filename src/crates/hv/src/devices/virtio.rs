@@ -36,6 +36,16 @@
 //! reason -- every buffer of its own in use, a frame that has its buffers
 //! already, a pass at its bound -- asks for none, and comes back by itself:
 //! the driver's chains meanwhile cost the guest no exit.
+//!
+//! A device that offers indirect descriptors (`F_INDIRECT_DESC`) takes a
+//! chain whose last descriptor names a table of descriptors in guest memory
+//! rather than a buffer: the rest of the chain, one ring entry for any number
+//! of buffers. Without it a request takes a descriptor of the ring for every
+//! buffer it has, and a ring holds only so many of the largest at once --
+//! three of a disk's, which is all a guest then had with its disk however
+//! deep its queue. The table is the guest's to write too, and is checked as
+//! the ring is: whole descriptors, followed by their `next` inside it, none
+//! of them a table again, the chain no longer than the queue.
 
 use alloc::vec::Vec;
 
@@ -80,6 +90,12 @@ const DESC_INDIRECT: u16 = 4;
 /// A descriptor's size in the table, and a used element's.
 const DESC_SIZE: usize = 16;
 const USED_ELEM_SIZE: usize = 8;
+/// How many descriptors of an indirect table are copied out of guest memory
+/// at once: a copy through the kernel's window is a page mapped and unmapped,
+/// so a table is read a stretch at a time rather than a descriptor at a time
+/// -- a disk's largest request is 66 of them -- and the stretch is short
+/// enough for the vCPU's stack.
+const TABLE_STRETCH: usize = 16;
 /// The available ring's flag: the driver wants no interrupt. Not looked at
 /// with EVENT_IDX, whose `used_event` says when.
 const AVAIL_NO_INTERRUPT: u16 = 1;
@@ -87,6 +103,10 @@ const AVAIL_NO_INTERRUPT: u16 = 1;
 /// of the other's work -- a feature of the ring, which a device offers when
 /// it asks for its kicks (`Queue::ask_kick`).
 pub const F_EVENT_IDX: u32 = 1 << 29;
+/// VIRTIO_RING_F_INDIRECT_DESC: a chain may end in a descriptor that names a
+/// table of descriptors rather than a buffer -- a feature of the ring, which
+/// a device offers when it follows them (`Queue::indirect`).
+pub const F_INDIRECT_DESC: u32 = 1 << 28;
 
 /// Whether moving an index from `old` to `new` passed `event` -- the entry
 /// the other side asked to hear of -- as the virtio spec has it
@@ -137,7 +157,9 @@ pub enum Broken {
     Loop,
     /// More chains available than the queue holds.
     Overrun,
-    /// An indirect descriptor, which was not offered.
+    /// An indirect descriptor where none was taken, or a table the device
+    /// will not follow: not whole descriptors, a table within a table, a
+    /// descriptor that names one and a next one too.
     Indirect,
     /// A ring, or a buffer, outside guest memory.
     Memory,
@@ -165,6 +187,8 @@ pub struct Queue {
     /// The driver took EVENT_IDX: interrupts by its `used_event`, kicks by
     /// the device's `avail_event`.
     event_idx: bool,
+    /// The driver took indirect descriptors: a chain may end in a table.
+    indirect: bool,
     /// The used index the last interrupt decision was made at, once one was:
     /// what `used_event` is held against, entries given back since.
     signalled_used: Option<u16>,
@@ -172,7 +196,8 @@ pub struct Queue {
 
 impl Queue {
     pub fn new(size: u16) -> Queue {
-        Queue { size, pfn: 0, next_avail: 0, next_used: 0, seen: 0, mapped: None, event_idx: false, signalled_used: None }
+        Queue { size, pfn: 0, next_avail: 0, next_used: 0, seen: 0, mapped: None, event_idx: false, indirect: false,
+                signalled_used: None }
     }
 
     fn reset(&mut self) {
@@ -305,7 +330,14 @@ impl Queue {
             let flags = (rest >> 32) as u16;
             let next = (rest >> 48) as u16;
             if flags & DESC_INDIRECT != 0 {
-                return Err(Broken::Indirect);
+                /* The rest of the chain is the table's: a descriptor that
+                 * names one has no next of its own, and its write flag is
+                 * nothing -- the table's descriptors say what is written. */
+                if !self.indirect || flags & DESC_NEXT != 0 {
+                    return Err(Broken::Indirect);
+                }
+                self.table(mem, addr, len, segs)?;
+                break;
             }
             /* The capacity is the queue's size, checked above. */
             segs.push(Seg { addr, len, write: flags & DESC_WRITE != 0 });
@@ -315,6 +347,55 @@ impl Queue {
             index = next;
         }
         Ok(head)
+    }
+
+    /// The descriptors of the indirect table at `addr`, `len` bytes of it,
+    /// onto `segs` after what the chain had before it: followed from the
+    /// first by their `next`, which counts inside the table. Whole
+    /// descriptors, none of them a table again, the chain no longer than the
+    /// queue -- which also ends a table whose `next`s go round in a loop --
+    /// and all of it in guest memory; anything else a ring the device will
+    /// not follow. Read a stretch at a time (`TABLE_STRETCH`): a driver lays
+    /// its table out in order, so a stretch is mostly every descriptor its
+    /// `next`s visit.
+    fn table(&self, mem: &GuestMemory, addr: u64, len: u32, segs: &mut Vec<Seg>) -> Result<(), Broken> {
+        let len = len as usize;
+        if len == 0 || len % DESC_SIZE != 0 {
+            return Err(Broken::Indirect);
+        }
+        let count = len / DESC_SIZE;
+        let mut stretch = [0u8; TABLE_STRETCH * DESC_SIZE];
+        /* The descriptors the stretch holds: from `first`, `held` of them. */
+        let (mut first, mut held) = (0usize, 0usize);
+        let mut index = 0usize;
+        loop {
+            if index >= count {
+                return Err(Broken::Index);
+            }
+            if segs.len() >= usize::from(self.size) {
+                return Err(Broken::Loop);
+            }
+            if index < first || index >= first + held {
+                first = index;
+                held = (count - index).min(TABLE_STRETCH);
+                let at = addr.checked_add((index * DESC_SIZE) as u64).ok_or(Broken::Memory)?;
+                mem.read(at, &mut stretch[..held * DESC_SIZE]).map_err(|_| Broken::Memory)?;
+            }
+            let d = &stretch[(index - first) * DESC_SIZE..(index - first + 1) * DESC_SIZE];
+            let addr = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
+            let len = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
+            let flags = u16::from_le_bytes([d[12], d[13]]);
+            let next = u16::from_le_bytes([d[14], d[15]]);
+            if flags & DESC_INDIRECT != 0 {
+                return Err(Broken::Indirect);
+            }
+            /* The capacity is the queue's size, checked above. */
+            segs.push(Seg { addr, len, write: flags & DESC_WRITE != 0 });
+            if flags & DESC_NEXT == 0 {
+                return Ok(());
+            }
+            index = usize::from(next);
+        }
     }
 
     /// Give the chain at `head` back, `len` bytes of it written by the
@@ -581,6 +662,7 @@ impl Transport {
         self.driver_features = features;
         for q in &mut self.queues {
             q.event_idx = features & F_EVENT_IDX != 0;
+            q.indirect = features & F_INDIRECT_DESC != 0;
         }
     }
 
