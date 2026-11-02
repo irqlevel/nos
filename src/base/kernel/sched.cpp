@@ -238,7 +238,13 @@ void TaskQueue::switch_complete(void* ctx)
     curr->task_queue_->switch_complete(curr);
 }
 
-void TaskQueue::note_run(Task* next, ulong now)
+/* A task's name into a LateWake's field, cut to fit */
+static void late_name(char* to, const char* name)
+{
+    stdlib::sn_printf(to, TaskQueue::LateWake::NAME_LEN, "%s", name ? name : "?");
+}
+
+void TaskQueue::note_run(Task* next, Task* prev, ulong now)
 {
     /* The idle task waits for nothing: it runs when nobody else can */
     if (next->is_idle())
@@ -260,7 +266,28 @@ void TaskQueue::note_run(Task* next, ulong now)
        this one */
     ulong woke = (ulong)next->wake_time_.get();
     if (woke != 0 && woke >= out && now >= woke)
-        stats_.wake(now - woke);
+    {
+        ulong waited = now - woke;
+        stats_.wake(waited);
+        if (waited >= LATE_WAKE_NS)
+        {
+            late_.count++;
+            if (waited > late_.waited_ns)
+            {
+                late_.waited_ns = waited;
+                late_.at_ns = now;
+                late_.deadline = next->woke_at_deadline_.get() != 0;
+                late_name(late_.task, next->get_name());
+                late_name(late_.before, prev->get_name());
+            }
+        }
+    }
+}
+
+void TaskQueue::read_late(LateWake& out)
+{
+    stdlib::AutoLock lock(lock_);
+    out = late_;
 }
 
 void TaskQueue::switch_to(Task* next, Task* curr)
@@ -280,7 +307,7 @@ void TaskQueue::switch_to(Task* next, Task* curr)
     BUG_ON(next->state_.get() == Task::STATE_EXITED);
     next->state_.set(Task::STATE_RUNNING);
     stdlib::Time now = get_boot_time();
-    note_run(next, now.get_value());
+    note_run(next, curr, now.get_value());
     next->run_start_time_ = now;
     next->sched_.exec_start = now.get_value();
     next->prev_ = curr;
@@ -472,6 +499,7 @@ void TaskQueue::wake_due(ulong now, ulong& touched)
            stack, and the next drain puts it on the run list */
         if (task->run_state_.cmpxchg(Task::RUN_QUEUED, Task::RUN_SLEEPING) == Task::RUN_SLEEPING)
         {
+            task->woke_at_deadline_.set(1);
             task->wake_time_.set((long)until);
             enqueue(task);
         }

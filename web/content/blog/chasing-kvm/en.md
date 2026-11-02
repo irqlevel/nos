@@ -1,11 +1,12 @@
 ---
 title: "Chasing KVM: the same Ubuntu VM under KVM and under nos"
-description: "We ran one Ubuntu VM under KVM and under nos on the same server. The disk started at 1% of KVM. Here is what we fixed in two days and what is still slower."
+description: "We ran one Ubuntu VM under KVM and under nos on the same server. The disk started at 1% of KVM. What we fixed in two rounds of work, and what is still slower."
 date: 2026-11-01
+updated: 2026-11-02
 tags: [hypervisor, performance, storage, testing, x86-64]
 ---
 
-nos has its own hypervisor, and sooner or later someone was going to ask how much slower a Linux guest is under it than under KVM. On 31 October we finally measured it properly. It was worse than we expected: the guest's disk ran at about 1% of KVM's speed. We spent the next two days fixing things and measuring again, and this post is about how that went.
+nos has its own hypervisor, and sooner or later someone was going to ask how much slower a Linux guest is under it than under KVM. On 31 October we finally measured it properly. It was worse than we expected: the guest's disk ran at about 1% of KVM's speed. We spent the next two days fixing things and measuring again, and this post is about how that went. A second round followed on 2 November; it is [at the end](#update-2-november-2026-the-second-round).
 
 ## The setup
 
@@ -98,7 +99,7 @@ The obvious fix was ext4's unwritten extents: allocate the blocks without writin
 
 [311baf25](https://github.com/irqlevel/nos/commit/311baf25e60eb853e4d19555081efaedaf304271) undid both. Commits went back to journal, flush, commit block. The conversion's own commit already flushes the guest's data before any extent says it's there, so the extra flush wasn't needed. We also made the growth adaptive: when the guest keeps writing right where the last chunk ended, the next allocation doubles, up to 256 MiB, so a guest filling its disk sequentially pays for a commit every 256 MiB instead of every 16. fs-fuzz's random writes never triggered the doubling, so we added a step that fills an image from one end; a bug we planted in the new allocator on purpose was caught on input 166. First writes are now at 1954 MiB/s, 42% of KVM. Untarring a kernel went from 75% to 92% of KVM, and pgbench's init from 42% to 65%.
 
-One thing got worse, and we don't understand it yet. In the fio job that writes random 4 KiB blocks with an fdatasync after each, throughput didn't change (112% of KVM). But since 311baf25 about one write in a thousand takes a millisecond, and in four runs out of six one in a hundred takes 0.7–0.9 ms. Before, the 99th percentile was 56 µs, and KVM's is 166 µs. These writes go to blocks that already exist, so they shouldn't run into any allocation or conversion of their own. It's at the top of the to-do list.
+One thing got worse, and we don't understand it yet. In the fio job that writes random 4 KiB blocks with an fdatasync after each, throughput didn't change (112% of KVM). But since 311baf25 about one write in a thousand takes a millisecond, and in four runs out of six one in a hundred takes 0.7–0.9 ms. Before, the 99th percentile was 56 µs, and KVM's is 166 µs. These writes go to blocks that already exist, so they shouldn't run into any allocation or conversion of their own. It's at the top of the to-do list. (It was gone after the second round; see the update below.)
 
 ## The CPU
 
@@ -114,7 +115,7 @@ nos's report for each guest tracks how late its timer interrupts arrive. On aver
 
 There was an obvious race in the code. The loop checked the guest's timers and armed the host timer a few hundred nanoseconds later, so a deadline that fell in between got missed. We fixed it by checking again after arming. The 10 ms stayed.
 
-So we taught the report to say where these late interrupts came from ([28af927d](https://github.com/irqlevel/nos/commit/28af927da63b78817c5feee8af32417d6cbb1237), [a68aeb3a](https://github.com/irqlevel/nos/commit/a68aeb3aeb41e9bc94a2c6d92a958c0c1848c346)). Of 12,388 interrupts that were more than 1 ms late, 12,078 came after a halted vCPU overslept by 1–3 ms, and it was nearly always another CPU that woke it, not its own timer. That turned out to be the machine itself. cyclictest's worst case under KVM is 3.1–3.3 ms too, and the host scheduler's wakeups on those CPUs run up to 3–4.6 ms late. Something pauses the whole machine for a few milliseconds every now and then, most likely SMIs, and there's nothing nos can do about it. Another 241 were the real problem: a guest kept running past its timer deadline until a host interrupt finally kicked it out, 10 ms later.
+So we taught the report to say where these late interrupts came from ([28af927d](https://github.com/irqlevel/nos/commit/28af927da63b78817c5feee8af32417d6cbb1237), [a68aeb3a](https://github.com/irqlevel/nos/commit/a68aeb3aeb41e9bc94a2c6d92a958c0c1848c346)). Of 12,388 interrupts that were more than 1 ms late, 12,078 came after a halted vCPU overslept by 1–3 ms, and it was nearly always another CPU that woke it, not its own timer. We put that down to the machine itself. cyclictest's worst case under KVM is 3.1–3.3 ms too, and the host scheduler's wakeups on those CPUs ran up to 3–4.6 ms late, so it looked as if something, most likely SMIs, paused the whole machine for a few milliseconds now and then. That was wrong: it was nos's own scheduler all along, and the update at the end explains how. The other 241 were a separate bug: a guest kept running past its timer deadline until a host interrupt finally kicked it out, 10 ms later.
 
 It turned out the loop armed the host timer for the guest's deadline with interrupts enabled. If any other timer interrupt fired before the VM entry, for another task's deadline or the end of a time slice, its handler re-armed the timer for the next host tick, and the guest's deadline was gone. [7ae441c4](https://github.com/irqlevel/nos/commit/7ae441c443c739414532d6b7e70f6a9c08ec7f5c) moved the arming into the VM entry itself, where interrupts stay disabled until the guest runs, and cancels the entry if the deadline has already passed. The next run cancelled 38,943 entries that way, and the worst case was still 10,009 µs.
 
@@ -124,7 +125,7 @@ So we added one more thing to the report: the single latest interrupt of the run
 worst      10009 us past its edge, after an interrupt of the host's took the guest out: the guest entered 0 us from the edge, the host's timer asked for 0 us from it, and left 10009 us from it
 ```
 
-The guest had been entered right at its deadline, with the host timer set for exactly that deadline, and it left one tick later. The bug was in our own fix. The new entry code first checked whether the deadline had passed, saw that it hadn't, and only then armed the timer, and arming a timer for a moment that has already gone by does nothing. If the deadline passed in the few hundred nanoseconds between the check and the arming, the guest ran with no timer at all. [ddcbd4c6](https://github.com/irqlevel/nos/commit/ddcbd4c6d07486d3fd8f91f0435b14211bf9ef12) arms first and checks afterwards. In the next run the worst case was 3026 µs, and that one was the machine's own stall.
+The guest had been entered right at its deadline, with the host timer set for exactly that deadline, and it left one tick later. The bug was in our own fix. The new entry code first checked whether the deadline had passed, saw that it hadn't, and only then armed the timer, and arming a timer for a moment that has already gone by does nothing. If the deadline passed in the few hundred nanoseconds between the check and the arming, the guest ran with no timer at all. [ddcbd4c6](https://github.com/irqlevel/nos/commit/ddcbd4c6d07486d3fd8f91f0435b14211bf9ef12) arms first and checks afterwards. In the next run the worst case was 3026 µs, which we also put down to the machine. (It wasn't; see the update below.)
 
 Our fuzzer could not have caught this. It used its own copy of the entry code, which happened to have the right order, and in its model time never moved between two reads of the clock. The entry code now lives in a separate file that hv-fuzz runs as is, and the fuzzer's clock sometimes jumps to the deadline right in the middle of arming it. With that, the wrong order is caught on input 43, and arming in the loop on input 167.
 
@@ -138,16 +139,97 @@ Mitigations also cut against nos. Since nos tells the guest the host's microcode
 
 ## What's left
 
-The full list, with the files to look at and how to measure each item, is in [plans/vm-perf-todo.md](https://github.com/irqlevel/nos/blob/master/plans/vm-perf-todo.md). In short:
+The full list, with the files to look at and how to measure each item, is in [plans/vm-perf-todo.md](https://github.com/irqlevel/nos/blob/master/plans/vm-perf-todo.md). This was the list on 1 November; the update below says what has changed since. In short:
 
-- The new fdatasync tail. Our best guess is that the write waits behind something else that holds the disk image: calls into the image are serialized, a growth takes 6 ms on average (up to 18), and a conversion 5.6 ms (up to 29). The next step is to time every call into the image, not just growths and conversions.
-- First writes at 42% of KVM. Every growth and every conversion is a commit that the guest's write or flush has to wait for. Linux's ext4 under KVM converts extents in a background workqueue and batches many conversions into one commit.
-- 1 MiB writes at 63% and 4k QD32 at 72–84%. Every byte gets copied through the image's own buffer on the slow core, while under KVM the NVMe reads and writes the guest's pages directly. The guest's memory is made of physically contiguous 2 MiB pages, so the NVMe's PRP lists could point at it too.
+- The new fdatasync tail. Our best guess is that the write waits behind something else that holds the disk image: calls into the image are serialized, a growth takes 6 ms on average (up to 18), and a conversion 5.6 ms (up to 29). The next step is to time every call into the image, not just growths and conversions. (Gone after the second round.)
+- First writes at 42% of KVM. Every growth and every conversion is a commit that the guest's write or flush has to wait for. Linux's ext4 under KVM converts extents in a background workqueue and batches many conversions into one commit. (67% after the second round.)
+- 1 MiB writes at 63% and 4k QD32 at 72–84%. Every byte gets copied through the image's own buffer on the slow core, while under KVM the NVMe reads and writes the guest's pages directly. The guest's memory is made of physically contiguous 2 MiB pages, so the NVMe's PRP lists could point at it too. (1 MiB writes are at KVM's speed now; 4k from a single job is still behind, for a different reason.)
 - Waking up a guest CPU: cyclictest 65 µs against 31, perf's pipe 9.6 µs against 6.0. Timers are on time now, so the cost is in getting from an IPI or a timer to the guest actually running again. There's also the guest's clock: under KVM its CPUID reports `tsc_known_freq` and it runs on `kvm-clock`, under nos it does neither.
 - Random memory reads at 85%. It's not the clock, so probably the nested page walk or the TLB.
 - CPU-bound work at 96–98%. Idle CPUs under nos still get a timer tick 100 times a second, and under Linux they don't.
 
-We also learned something about benchmarking itself. Running the same code twice can move some numbers by 5–10%: QD32 reads went from 84% to 76% between two runs of almost the same code, and the fdatasync tail comes and goes. So we only believe a change if it shows up across several runs. Each run also takes the server's VMs down for about an hour and reboots it twice, so runs have to be planned. The KVM run and all ten nos runs are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results).
+We also learned something about benchmarking itself. Running the same code twice can move some numbers by 5–10%: QD32 reads went from 84% to 76% between two runs of almost the same code, and the fdatasync tail comes and goes. So we only believe a change if it shows up across several runs. Each run also takes the server's VMs down for about an hour and reboots it twice, so runs have to be planned. The KVM run and every nos run are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results).
+
+## Update, 2 November 2026: the second round
+
+After the first round, two items on that list looked related: 1 MiB writes were stuck at 63%, and 4k reads at QD32 at about 150k IOPS, while the NVMe could clearly do more. So the second round went after the disk again, and on the way it found what had really been behind the machine's "stalls".
+
+The 1 MiB writes had a limit we hadn't noticed. Unless the device offers indirect descriptors, Linux's virtio-blk driver puts every page of a request into its own entry of the ring. A 256 KiB request took 66 of the ring's 256 entries, so the guest could never have more than three of them in flight, whatever its queue depth said. The disk now offers indirect descriptors ([c88699b5](https://github.com/irqlevel/nos/commit/c88699b5ab8c9bc9420d4c4ad0f5c1ff7a7fab4b)): a request takes one entry, and its pages sit in a table of their own.
+
+Then we changed how the disk's task serves requests ([9fde9bd7](https://github.com/irqlevel/nos/commit/9fde9bd75b1f535c3a331e934e5a689577631f9f)). Before, it took a batch off the ring, ran the whole batch through the disk image and handed it all back, so every request waited for the slowest one in its batch. Now each read or write goes to the NVMe as soon as the task sees it, straight from a buffer the NVMe reads and writes itself, and goes back to the guest as soon as it is done. The guest can have 64 requests in flight, and the NVMe driver 256 commands ([16f9eb9d](https://github.com/irqlevel/nos/commit/16f9eb9d0b5164408d1f326d458ca42c5bb121ab)). There was one trap on the way. nos's page allocator hands out at most 128 physically contiguous pages, and the PRP lists for 256 commands asked for 256. The allocation failed without a word, and the driver quietly went back to 8 KiB commands. The lists now come in runs of 64 pages.
+
+The first run with all of this was a mixed bag. 1 MiB reads went up to 135% of KVM and writes to 74%, but 4k reads at QD32 fell from 149k IOPS to 13k, and cyclictest's first thread averaged 853 µs. The report counted 21,112 timer interrupts more than 1 ms late.
+
+The scheduler's statistics on the vCPUs' CPUs showed woken tasks waiting up to 4 ms at the 99th percentile, with nothing else on the run queue. Here is what was going on. When nos's idle task wakes up from MWAIT, it runs a bit of its own loop before going back to sleep, and while it does, the scheduler counts it as an ordinary task. If a vCPU was woken at that moment, the scheduler compared the two deadlines, left the CPU to the idle task, and the idle task went back into MWAIT with the vCPU still waiting on the run queue. Nothing woke the CPU again until the idle task's 3 ms time slice ran out. The window is short, but with the new disk path every finished request wakes a vCPU, often right after its CPU has taken some other interrupt, so the window was hit all the time. [d0a4b493](https://github.com/irqlevel/nos/commit/d0a4b493c93fb76ed05e5f52376d7ca9089319b3) makes the idle task check its run queue before it goes back to sleep, and [d92695bc](https://github.com/irqlevel/nos/commit/d92695bc030ece6526849e454ac0acc35c2c753e) closes what was left of the window: the idle task now marks itself idle first and looks at the queue after that.
+
+That also settled an old question. Earlier in this post we put about 12,000 late wakeups a run down to the machine, most likely SMIs. It was this same window, and it had been there all along. With it closed, a whole run had 2 timer interrupts more than 1 ms late instead of about 12,000, no vCPU slept more than 1 ms past its time, and cyclictest's worst case was 205 µs. Under KVM, on the same machine, it is 3280 µs, so whatever causes KVM's 2–3 ms spikes, it isn't the hardware.
+
+One more fix came from the guest's own log. During the 1 MiB write test, Linux's clocksource watchdog complained that a read of the PM timer had taken 800 µs. All of a guest's devices share one lock in nos, and a single notify from the guest could copy all of its queued writes, 8 MiB, while holding it, so every other vCPU that needed a device waited. A pass over the queue now copies at most 512 KiB before it lets go ([96281a83](https://github.com/irqlevel/nos/commit/96281a83467640194aa376942c57a0106baed710)). hv-fuzz checks every call into the disk against that limit; with the limit taken out, it fails on input 6517.
+
+Here is the second round next to the first, against the same KVM run. The percentages are counted as before.
+
+| | KVM | first round | second round |
+|---|---:|---:|---:|
+| perf pipe, one round trip | 6.0 µs | 9.6 (63%) | 8.2 (73%) |
+| cyclictest, average | 31 µs | 65 (48%) | 72 (43%) |
+| cyclictest, worst case | 3280 µs | 3091 (106%) | 205 (1600%) |
+| fio: first write to a new file, 1M QD8 | 4643 MiB/s | 1954 (42%) | 3103 (67%) |
+| fio: 4k random reads, QD1 | 20.1k IOPS | 18.3k (91%) | 16.7k (83%) |
+| fio: 4k random reads, QD32 | 195k IOPS | 149k (76%) | 149k (76%) |
+| fio: 4k random reads, 4 jobs at QD16 | 217k IOPS | 169k (78%) | 372k (171%) |
+| fio: 4k random writes, QD1 | 39.9k IOPS | 32.2k (81%) | 29.4k (74%) |
+| fio: 4k random writes, QD32 | 178k IOPS | 128k (72%) | 126k (71%) |
+| fio: 1M reads, QD8 | 1456 MiB/s | 1357 (93%) | 2187 (150%) |
+| fio: 1M writes, QD8 | 3694 MiB/s | 2314 (63%) | 3763 (102%) |
+| fio: 4k writes with fdatasync | 620 IOPS | 695 (112%) | 710 (115%) |
+| the same, 99.9th percentile of a write | 226 µs | 1090 (21%) | 72 (314%) |
+| kernel build, `make -j4` | 318 s | 331 (96%) | 330 (96%) |
+| pgbench init | 6.5 s | 10.0 (65%) | 9.8 (67%) |
+| pgbench read-only, 1 client | 61.6k tps | 49.0k (80%) | 53.8k (87%) |
+| pgbench TPC-B, 16 clients | 4655 tps | 4777 (103%) | 4928 (106%) |
+| guest boot | 5.24 s | 4.57 (115%) | 5.29 (99%) |
+
+```chart
+type: before-after
+unit: "%"
+max: 180
+step: 25
+reference: { value: 100, label: "KVM = 100%" }
+series: { before: "first round", after: "second round" }
+caption: "nos as a percentage of KVM after each round, from the table above. Over 100% means nos was faster."
+groups:
+  - rows:
+      - { label: "perf pipe, one round trip", before: 63, after: 73 }
+      - { label: "cyclictest, average", before: 48, after: 43 }
+  - rows:
+      - { label: "fio: first write to a new file, 1M QD8", before: 42, after: 67 }
+      - { label: "fio: 4k random reads, QD1", before: 91, after: 83 }
+      - { label: "fio: 4k random reads, QD32", before: 76, after: 76 }
+      - { label: "fio: 4k random reads, 4 jobs at QD16", before: 78, after: 171 }
+      - { label: "fio: 4k random writes, QD1", before: 81, after: 74 }
+      - { label: "fio: 4k random writes, QD32", before: 72, after: 71 }
+      - { label: "fio: 1M reads, QD8", before: 93, after: 150 }
+      - { label: "fio: 1M writes, QD8", before: 63, after: 102 }
+      - { label: "fio: 4k writes with fdatasync", before: 112, after: 115 }
+  - rows:
+      - { label: "kernel build, make -j4", before: 96, after: 96 }
+      - { label: "pgbench init", before: 65, after: 67 }
+      - { label: "pgbench read-only, 1 client", before: 80, after: 87 }
+      - { label: "pgbench TPC-B, 16 clients", before: 103, after: 106 }
+```
+
+1 MiB reads and writes are now at KVM's speed or above it, and so are 4k reads from four jobs at once: 372k IOPS against 217k. The fdatasync tail from the first round is gone: one write in a thousand takes up to 72 µs, against 226 under KVM. The CPU-bound benchmarks didn't move (96–98%).
+
+Two numbers went down. 4k at QD1 lost about 4 µs a request, reads from 91% of KVM to 83% and writes from 81% to 74%. The old path waited for the NVMe in a loop that never went to sleep. The new one puts the disk's task to sleep until the NVMe's interrupt wakes it, and that wakeup is what costs the time. And the guest took 5.29 s to boot instead of about 4.6 s in every earlier run, because four systemd services that start together each took about 0.7 s longer. That was a single run, so we'll see whether it repeats.
+
+What's left now, in short (the full list is in [plans/vm-perf-todo.md](https://github.com/irqlevel/nos/blob/master/plans/vm-perf-todo.md), as before):
+
+- 4k I/O from a single job, at 71–83% of KVM. According to fio, submitting a request takes 6–7 µs under nos and 1–2 µs under KVM. Under nos the guest's notify exits to the host, and the whole request is handled right there on the guest's CPU: it is taken off the ring, a write's data is copied, and the disk's task is woken. Under KVM the notify only wakes QEMU's I/O thread, and a busy thread polls the ring itself with notifications switched off, so the guest doesn't have to notify it. A short spin before the disk's task goes to sleep should also win back the 4 µs at QD1.
+- cyclictest averages 72 µs against 31. The host now delivers the guest's timer interrupt 3 µs after its deadline on average, so the rest of the time is spent inside the guest, and we don't know yet where.
+- First writes at 67%, still waiting on growths and conversions.
+- Random memory reads at 85% and CPU-bound work at 96–98%, as before.
+
+Both new runs are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results) next to the others.
 
 ## Commits
 
@@ -162,3 +244,10 @@ We also learned something about benchmarking itself. Running the same code twice
 | [64d61a78](https://github.com/irqlevel/nos/commit/64d61a78ba5d0e6eb5136b94237e0568737aabf6) | Fast path for timer deadline and IPI writes; the first timer race fix |
 | [7ae441c4](https://github.com/irqlevel/nos/commit/7ae441c443c739414532d6b7e70f6a9c08ec7f5c), [ddcbd4c6](https://github.com/irqlevel/nos/commit/ddcbd4c6d07486d3fd8f91f0435b14211bf9ef12) | The host timer is armed during VM entry, then checked; the fuzzer runs the real entry code |
 | [1ade6604](https://github.com/irqlevel/nos/commit/1ade6604cf1f8b309d686d3a8f1bee923418457e) | The benchmark kit and all results in the repository, plus the to-do list |
+| [c88699b5](https://github.com/irqlevel/nos/commit/c88699b5ab8c9bc9420d4c4ad0f5c1ff7a7fab4b) | Indirect descriptors: a disk request takes one entry of the ring |
+| [9fde9bd7](https://github.com/irqlevel/nos/commit/9fde9bd75b1f535c3a331e934e5a689577631f9f) | Each disk request goes to the NVMe as it comes and back as soon as it is done |
+| [16f9eb9d](https://github.com/irqlevel/nos/commit/16f9eb9d0b5164408d1f326d458ca42c5bb121ab) | 64 requests in flight, 256 NVMe commands, PRP lists in runs of 64 pages |
+| [ef2638b7](https://github.com/irqlevel/nos/commit/ef2638b743db0dcbb4285dd63d22cb76064b2f2f) | `sched` shows each CPU's longest wakeup since boot |
+| [d0a4b493](https://github.com/irqlevel/nos/commit/d0a4b493c93fb76ed05e5f52376d7ca9089319b3), [d92695bc](https://github.com/irqlevel/nos/commit/d92695bc030ece6526849e454ac0acc35c2c753e) | The idle task no longer leaves a woken task waiting out its time slice |
+| [96281a83](https://github.com/irqlevel/nos/commit/96281a83467640194aa376942c57a0106baed710) | One pass over the disk's queue copies at most 512 KiB under the devices' lock |
+| [1b791bf2](https://github.com/irqlevel/nos/commit/1b791bf2cdd4182648fce4eecca6bea33ef33e86) | The second round's results and the updated to-do list |

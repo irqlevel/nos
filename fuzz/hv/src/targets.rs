@@ -712,6 +712,21 @@ const DEVICE_STATUS: u16 = 0x12;
 const QUEUE_SIZE: u64 = 256;
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
+const DESC_INDIRECT: u16 = 4;
+
+/// Chains made with some of their buffers in an indirect table, for
+/// `HV_FUZZ_STATS`.
+static INDIRECT_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A descriptor's sixteen bytes.
+fn descriptor(addr: u64, len: u32, flags: u16, next: u16) -> [u8; 16] {
+    let mut d = [0u8; 16];
+    d[..8].copy_from_slice(&addr.to_le_bytes());
+    d[8..12].copy_from_slice(&len.to_le_bytes());
+    d[12..14].copy_from_slice(&flags.to_le_bytes());
+    d[14..16].copy_from_slice(&next.to_le_bytes());
+    d
+}
 
 /// What a guest's driver keeps of one queue: where it is, and where it has
 /// got to in its descriptors and its available ring.
@@ -799,7 +814,14 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
         return;
     }
     let head = q.next_desc % QUEUE_SIZE;
-    for (i, &(addr, len, write)) in segs.iter().enumerate() {
+    /* Now and then the buffers -- all of them, or all past the first few --
+     * in an indirect table, as a driver that took indirect descriptors makes
+     * a chain: for a device that offers none, a ring it will not follow. */
+    let direct = if r.u8() % 8 == 0 { r.below(segs.len() as u64) as usize } else { segs.len() };
+    if direct < segs.len() {
+        INDIRECT_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    for (i, &(addr, len, write)) in segs[..direct].iter().enumerate() {
         let last = i + 1 == segs.len();
         let mut flags = if write { DESC_WRITE } else { 0 };
         let mut next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
@@ -811,16 +833,45 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
         match r.u8() % 32 {
             0 => next = head as u16,
             1 => next = r.u16(),
-            2 => flags |= 4,
+            2 => flags |= DESC_INDIRECT,
             3 => flags = r.u16(),
             _ => {}
         }
-        let mut d = [0u8; 16];
-        d[..8].copy_from_slice(&addr.to_le_bytes());
-        d[8..12].copy_from_slice(&len.to_le_bytes());
-        d[12..14].copy_from_slice(&flags.to_le_bytes());
-        d[14..16].copy_from_slice(&next.to_le_bytes());
-        mem.put(q.desc(q.next_desc), &d);
+        mem.put(q.desc(q.next_desc), &descriptor(addr, len, flags, next));
+        q.next_desc += 1;
+    }
+    if direct < segs.len() {
+        /* The rest in a table, each entry's next the one after it, and the
+         * descriptor that names it last -- or, sometimes, any of it wrong:
+         * a table of no whole descriptors, one within it, a next past its
+         * end or back to its start, the descriptor that names it with a
+         * next of its own (or a write flag, which the device ignores). */
+        let rest = &segs[direct..];
+        let table = if r.u8() < 230 { gpa_in(r, MEM) & !15 } else { gpa_in(r, MEM) };
+        for (i, &(addr, len, write)) in rest.iter().enumerate() {
+            let last = i + 1 == rest.len();
+            let mut flags = if write { DESC_WRITE } else { 0 } | if last { 0 } else { DESC_NEXT };
+            let mut next = i as u16 + 1;
+            match r.u8() % 48 {
+                0 => next = 0,
+                1 => next = r.u16(),
+                2 => flags |= DESC_INDIRECT,
+                3 => flags = r.u16(),
+                _ => {}
+            }
+            mem.put(table.wrapping_add(16 * i as u64), &descriptor(addr, len, flags, next));
+        }
+        let mut len = 16 * rest.len() as u32;
+        let mut flags = DESC_INDIRECT;
+        match r.u8() % 32 {
+            0 => len = r.value32(),
+            1 => len -= 16,
+            2 => flags |= DESC_NEXT,
+            3 => flags |= DESC_WRITE,
+            _ => {}
+        }
+        let next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
+        mem.put(q.desc(q.next_desc), &descriptor(table, len, flags, next));
         q.next_desc += 1;
     }
     let slot = u64::from(q.avail_idx) % QUEUE_SIZE;
@@ -846,6 +897,9 @@ fn setup_queue(r: &mut Input, write: &mut dyn FnMut(u16, u8, u32), q: &mut Drive
 pub struct DiskState {
     size: u64,
     read_only: bool,
+    /// A request's buffer a slot, as a backend has them, and which of them
+    /// it has the request of.
+    bufs: Vec<Vec<u8>>,
     queue: VecDeque<blk::Request>,
     /// Requests the fuzzer has said are served, to be taken.
     pub ready: usize,
@@ -857,7 +911,8 @@ pub struct DiskState {
 
 impl DiskState {
     pub fn new(size: u64, read_only: bool) -> DiskState {
-        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
+        let bufs = (0..blk::IN_FLIGHT).map(|_| vec![0u8; blk::REQUEST_BYTES]).collect();
+        DiskState { size, read_only, bufs, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
     }
 
     pub fn size(&self) -> u64 {
@@ -879,10 +934,23 @@ impl blk::Backend for Disk {
     fn read_only(&self) -> bool {
         self.0.lock().unwrap().read_only
     }
-    fn submit(&mut self, mut req: blk::Request) {
+    fn with_buffer(&mut self, slot: usize, use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool {
+        let mut s = self.0.lock().unwrap();
+        /* The device reaches a buffer only while the request of it is not
+         * with the backend: a buffer the device fills or empties meanwhile
+         * is a request's data changed under the backend serving it. */
+        invariant!(!s.queue.iter().any(|r| r.slot() == slot), "buffer {} reached while its request is served", slot);
+        match s.bufs.get_mut(slot) {
+            Some(buf) => use_it(buf),
+            None => false,
+        }
+    }
+    fn submit(&mut self, req: blk::Request) {
         let mut s = self.0.lock().unwrap();
         invariant!(s.queue.len() < blk::IN_FLIGHT, "a request past the {} in flight", blk::IN_FLIGHT);
-        let len = req.data().len() as u64;
+        invariant!(req.slot() < blk::IN_FLIGHT && !s.queue.iter().any(|r| r.slot() == req.slot()),
+                   "a request handed over in slot {}, which has one", req.slot());
+        let len = req.len() as u64;
         match req.op() {
             blk::Op::Read | blk::Op::Write => {
                 invariant!(req.offset() % blk::SECTOR == 0, "a request at byte {}, not a sector", req.offset());
@@ -906,7 +974,8 @@ impl blk::Backend for Disk {
         }
         invariant!(!(s.read_only && req.op().writes()), "a write, discard or write of zeros handed to a read-only disk");
         if req.op() == blk::Op::Read {
-            req.data_mut().fill(0xA5);
+            let slot = req.slot();
+            s.bufs[slot][..len as usize].fill(0xA5);
         }
         s.queue.push_back(req);
     }
@@ -974,6 +1043,25 @@ fn blk_request(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
     chain(mem, q, r, &segs);
 }
 
+/// The most of the guest's memory one call into the disk -- a notify, a
+/// round, each a pass under the platform's lock in the hypervisor -- reads
+/// and writes: its data held to `blk::PASS_BYTES` and the request that
+/// crosses it, and for each chain of a pass (a queue's worth at most) its
+/// descriptors -- a whole table's -- its header, ranges and status, and the
+/// rings' words. Unbounded, a notify of a queue full of the largest writes
+/// copied every one of them: 16 MiB.
+const PASS_MOST: u64 = (blk::PASS_BYTES + blk::REQUEST_BYTES) as u64 + QUEUE_SIZE * (16 * QUEUE_SIZE + 256);
+
+/// `call`, into the disk, held to what one pass of it may move.
+fn held_to_a_pass<R>(mem: &GuestMemory, call: impl FnOnce() -> R) -> R {
+    let before = mem.moved();
+    let result = call();
+    let moved = mem.moved() - before;
+    invariant!(moved <= PASS_MOST, "a call into the disk moved {} bytes of the guest's memory, past the {} a pass \
+               may under the platform's lock", moved, PASS_MOST);
+    result
+}
+
 fn blk_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let since = time::boot_time_ns();
@@ -989,14 +1077,14 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                disk.io_write(offset, size, value, &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(offset, size, value, &mem, time::boot_time_ns()));
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
@@ -1017,7 +1105,7 @@ fn blk_target(r: &mut Input) {
             }
             4 => {
                 let queue = if r.u8() < 240 { 0 } else { r.u16() };
-                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns()));
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -1031,10 +1119,10 @@ fn blk_target(r: &mut Input) {
                 for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
                     blk_request(&mem, &mut q, r);
                 }
-                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
             }
             8 | 9 => {
-                disk.poll(&mem);
+                held_to_a_pass(&mem, || disk.poll(&mem));
             }
             10 => {
                 let mut s = state.lock().unwrap();
@@ -1047,7 +1135,7 @@ fn blk_target(r: &mut Input) {
                 disk.line();
                 disk.broken();
             }
-            _ => {
+            12 => {
                 /* A request, then another CPU posting it again and again
                  * while the device takes from the ring: one answered at once
                  * -- a GET_ID, one past the disk -- takes no buffer, so the
@@ -1055,15 +1143,39 @@ fn blk_target(r: &mut Input) {
                 blk_request(&mem, &mut q, r);
                 let notify = r.bool();
                 racing(&mem, &mut q, || {
-                    if notify {
-                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
-                    } else {
-                        disk.poll(&mem);
-                    }
+                    held_to_a_pass(&mem, || {
+                        if notify {
+                            disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                        } else {
+                            disk.poll(&mem);
+                        }
+                    })
                 });
             }
+            13 => {
+                /* The largest reads and writes the driver may send, more at
+                 * once than the device takes: their data copied a pass's
+                 * worth at a time (`blk::PASS_BYTES`), the writes' as they
+                 * are taken and the reads' as they are given back. */
+                let sectors = blk::REQUEST_BYTES as u64 / blk::SECTOR;
+                for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
+                    let kind = if r.bool() { 1u32 } else { 0 };
+                    let sector = r.below((size / blk::SECTOR).saturating_sub(sectors).max(1));
+                    let header = gpa(r) & !7;
+                    let mut h = [0u8; 16];
+                    h[..4].copy_from_slice(&kind.to_le_bytes());
+                    h[8..].copy_from_slice(&sector.to_le_bytes());
+                    mem.put(header, &h);
+                    let (data, status) = (r.below(MEM - blk::REQUEST_BYTES as u64), gpa(r));
+                    chain(&mem, &mut q, r, &[(header, 16, false), (data, blk::REQUEST_BYTES as u32, kind == 0),
+                                              (status, 1, true)]);
+                }
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
+            }
+            _ => {}
         }
     }
+    PASSES_CUT.fetch_add(disk.stats.cut, std::sync::atomic::Ordering::Relaxed);
     mem.held_to_map_budget(since, 1);
 }
 
@@ -1589,13 +1701,17 @@ static PVH_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static DISK_OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Discards and writes of zeros handed to the backend.
 static RANGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A disk's passes ended at their bound on the data they moved.
+static PASSES_CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
              PVH_BUILT.load(Relaxed));
     println!("  disks: {} requests given back before one handed over earlier, {} discards and writes of zeros \
-              handed over", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed));
+              handed over; {} chains made with buffers in an indirect table; {} passes cut short by the data they \
+              moved", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed), INDIRECT_MADE.load(Relaxed),
+             PASSES_CUT.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {

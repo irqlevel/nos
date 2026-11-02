@@ -287,11 +287,37 @@ private:
     Atomic task_count_;
     Atomic runnable_count_;
 
-    /* The waits next has just ended, as it is switched in at now: woken,
-       or displaced while runnable (SchedStats). Under Lock. */
-    void note_run(Task* next, ulong now);
+    /* The waits next has just ended, as it is switched in at now in prev's
+       place: woken, or displaced while runnable (SchedStats), and a wakeup
+       that waited long noted (LateWake). Under Lock. */
+    void note_run(Task* next, Task* prev, ulong now);
 
     SchedStats stats_;
+
+public:
+    /* The longest a task woken on this queue waited for the CPU since boot
+       -- from someone's unblock(), or from its deadline for one asleep until
+       one -- what ran on the CPU just before it, and how many waited past
+       LATE_WAKE_NS: whether a late wakeup was a CPU taken by another task, or
+       one nobody gave it (its timer's interrupt late, a wakeup lost). What
+       `sched` says of each CPU. */
+    struct LateWake
+    {
+        static const ulong NAME_LEN = 24;
+        ulong count = 0;
+        ulong waited_ns = 0;
+        ulong at_ns = 0;
+        bool deadline = false;
+        char task[NAME_LEN] = {};
+        char before[NAME_LEN] = {};
+    };
+    static const ulong LATE_WAKE_NS = consts::NANO_SECS_IN_MS;
+
+    /* A copy of it, taken under Lock */
+    void read_late(LateWake& out);
+
+private:
+    LateWake late_;
 };
 
 

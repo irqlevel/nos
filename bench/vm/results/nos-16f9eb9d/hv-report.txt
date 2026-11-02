@@ -1,0 +1,32 @@
+hv: vm 1 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff86a03fb7
+  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff86a03fb7, after 2612610 ms
+  exits      107323799 total: 356529 port in, 5195973 port out, 1861851 cpuid, 346 rdmsr, 51096456 wrmsr (11 #GP), 1298 irq, 41993601 hlt, 23318 pause, 5894294 host
+  kicked     900323 entries turned back for a frame, a disk's answer or an IPI that came on the way in, or an edge of its timers -- 51751 of them
+  answered   0 #UD for instructions CPUID did not offer, 13 WBINVD stepped past, 0 CR8 from the shadow TPR, 8 CR0 writes (VT-x), 0 #DB and #AC given back
+  cr4        20 reads and writes performed (AMD-V), 0 writes refused with #GP
+  dr0-3      24 reads and writes of its own (AMD-V), 0 not made: a #GP or a #DB in their place
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  halted     slept 4776556 ms in 9488383 sleeps, 45% of the run (of each CPU's, on average); 40126508 halts spun for a ring first, 35948624 of them woken in the spin
+  loop       876 ns an exit handled and 413 ns to the next entry, on average; 468 ns a write of an MSR's handling; 50869499 entries made without the loop's round
+  irq        1298 from the 8259 (0 timer, 1298 serial), 0 edges, 1041 blocked; PIC irr 0x00 isr 0x00 imr 0xff; PIT ch0 mode 0 reload 0 run true
+  apic       0 interrupts from the local APICs, 7710859 of their timers -- late past their edges by 11 us on average, 3525 us at most, 45121 come on the way in and taken a round later, 1788694 slept to short of them and spun; 37983572 IPIs sent, 39651472 taken; 3426206 MSIs
+  late       21112 timer interrupts more than 1 ms past their edges: 20766 after a sleep that had the edge and woke more than 1 ms past its time (10849 of them rung), 26 after one that woke on time, 0 after a sleep without that edge, 8 after a spin or a sleep for good, 31 with the loop round more than 1 ms after an exit, 232 after an interrupt of the host's took the guest out, 41 after an exit of its own, 8 otherwise; 20801 sleeps ended more than 1 ms past their time (10852 by a ring after it), 3039 us at most
+  worst      3525 us past its edge, after something else
+  posted     41414365 interrupts posted for a CPU to take in its guest, 2112266 with a notification sent to the CPU it ran on
+  apicv      56453965 entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); 0 EOIs it stopped the guest after, of level-triggered vectors
+  cpus       4, 3 started by the guest (3 INITs, 3 start-up IPIs taken)
+  cpu 0      25769112 exits, 0 apic irq, 8765245 ipi sent, 9698450 hlt, 12513 timer interrupts more than 1 ms late, slept 43% -- running, on host cpu 41
+  cpu 1      25299341 exits, 0 apic irq, 8315572 ipi sent, 9629538 hlt, 2630 timer interrupts more than 1 ms late, slept 47% -- halted with interrupts off, on host cpu 40
+  cpu 2      27809183 exits, 0 apic irq, 10470704 ipi sent, 11031431 hlt, 2781 timer interrupts more than 1 ms late, slept 48% -- halted with interrupts off, on host cpu 33
+  cpu 3      28446163 exits, 0 apic irq, 10432051 ipi sent, 11634182 hlt, 3188 timer interrupts more than 1 ms late, slept 43% -- halted with interrupts off, on host cpu 32
+  acpi       taken by the guest's OS; 0 SCIs, the power button pressed 0 times
+  vda        8192 MiB: 3118444 reads (82369157 KiB), 3314623 writes (144029210 KiB), 499960 flushes, 0 errors; 3650 discards (53550768 KiB), 0 writes of zeros (0 KiB); 5060176 notifies, 3425532 interrupts
+  eth0       313 frames sent, 1501 received, 0 dropped; 0 sends of TCP up to 64 KiB, 0 received whole; notifies 313 to send, 4 to receive; interrupts 313 for sends, 361 for receives; 4 of 4 queue pairs in use, 1 commands (0 refused)
+  busiest in ports 0x21:1298 0x71:111 0x2e9:3 0x2f9:3 0x3e9:3 0x87:1

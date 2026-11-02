@@ -74,6 +74,29 @@ void Cpu::idle()
     Task* self = Task::try_get_current_task();
     if (self != nullptr)
         self->set_idling(true);
+
+    /* Nothing to idle for while another task can run: given the CPU now,
+       rather than slept on until the next interrupt does. Out of its idling
+       -- woken, round the loop, at the reap -- the idle task is counted as
+       any task (TaskQueue::count_idle), and an interrupt's decision leaves
+       the CPU to the task it lands on unless another's deadline is sooner:
+       one woken then, a slice's deadline as late as the idle task's, waited
+       on the list while the idle task went back to idling -- until its slice
+       ended on the timer, 3 ms on. A guest's vCPU woken just after another
+       interrupt of its CPU's -- its disk's completion, a ring from another
+       vCPU -- waited so: its guest's timer interrupts 1-3 ms late, and at a
+       disk's queue depth of 32 every request. Looked at with the flag up,
+       so that no window is left between the two: a task whose decision came
+       before the flag is on the run list by now, counted here, and one
+       whose decision comes after it finds the flag and is switched to. */
+    if (get_task_queue().get_runnable_count() > 0)
+    {
+        if (self != nullptr)
+            self->set_idling(false);
+        yield_to_runnable();
+        return;
+    }
+
     if (hal::idle_masked())
         idle_mwait();
     else

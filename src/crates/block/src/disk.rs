@@ -165,6 +165,12 @@ impl Disk {
         table::kick(self.handle)
     }
 
+    /// The most bytes one asynchronous I/O moves, from a page's start: 0
+    /// where `can_submit` says there is no asynchronous path.
+    pub fn submit_max(&self) -> usize {
+        table::submit_max(self.handle)
+    }
+
     fn whole_sectors(&self, len: usize) -> Result<()> {
         let size = self.sector_size() as usize;
         if size == 0 || len == 0 || len % size != 0 {

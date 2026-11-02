@@ -295,6 +295,11 @@ public:
        waker, from any CPU and any context. */
     Atomic wake_time_;
 
+    /* 1 when the last wake was its deadline's coming (TaskQueue::wake_due),
+       0 when it was someone's unblock(): what a late wakeup's report says
+       of it (TaskQueue::LateWake). Written beside wake_time_. */
+    Atomic woke_at_deadline_;
+
     /* It left the CPU able to run -- displaced, not blocked: the wait until
        it runs again is a delay, not a wakeup's (SchedStats). Under Lock. */
     bool switched_out_runnable_;

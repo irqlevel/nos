@@ -75,20 +75,18 @@ unsafe extern "C" {
    or move it while the image is held -- and read and written off the VFS's
    lock. An image is a word looked up on every call, as a file held open
    is; one that is no image's reads as none. All of them sleep. */
-/// A part of a vectored read or write of a disk's image: where in the image,
-/// and its bytes -- written into for a read, read from for a write.
+/// A request of an image's queue done (`kernel_image_reap`): its buffer,
+/// and 1 where it went well.
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ImageIo {
-    pub offset: u64,
-    pub buf: *mut u8,
-    pub len: usize,
+#[derive(Clone, Copy, Default)]
+pub struct ImageDone {
+    pub buffer: u32,
+    pub ok: u32,
 }
 
-/// The most parts one vectored call of an image takes: every request a
-/// guest's disk may have out (`hv::devices::blk::IN_FLIGHT`), so that they
-/// are one batch -- with the device at once -- rather than one after another.
-pub const IMAGE_VEC_MAX: usize = 32;
+/// The most buffers an image's queue has: every request a guest's disk may
+/// have out (`hv::devices::blk::IN_FLIGHT`), and as many again.
+pub const IMAGE_QUEUE_MAX: usize = 256;
 
 unsafe extern "C" {
     /// Holds a regular file as an image, for reading, and with `write` not
@@ -108,13 +106,6 @@ unsafe extern "C" {
     /// Writes `len` bytes at `offset`, all of them inside the image, which
     /// never grows: 0, or -1. Not synced.
     pub fn kernel_image_write(image: usize, offset: u64, data: *const u8, len: usize) -> i32;
-    /// Fills each of `n` parts' buffers -- `ios`, at most `IMAGE_VEC_MAX` --
-    /// from its offset, all of them inside the image, as many in one batch
-    /// to the device as it holds: 0, or -1. No two buffers overlap.
-    pub fn kernel_image_read_vec(image: usize, ios: *const ImageIo, n: usize) -> i32;
-    /// Writes each of `n` parts at its offset, as `kernel_image_read_vec`
-    /// reads them: 0, or -1. Not synced.
-    pub fn kernel_image_write_vec(image: usize, ios: *const ImageIo, n: usize) -> i32;
     /// Where the image has data from `offset` on: its first byte into
     /// out[0], holes before it, and the end of its run into out[1] -- the
     /// two the same where the blocks looked at, a few thousand at most, are
@@ -131,6 +122,28 @@ unsafe extern "C" {
     pub safe fn kernel_image_write_zeroes(image: usize, offset: u64, len: u64, unmap: i32) -> i32;
     /// Everything written to the image on its disk's medium: 0, or -1.
     pub safe fn kernel_image_sync(image: usize) -> i32;
+
+    /* Its queue: a guest's disk's requests, as many at once as it has, in
+       buffers of the image's own -- filled before a request is started and
+       emptied once it is reaped, and kept off in between. Every call but
+       the wake from one task. */
+    /// `buffers` buffers of `bytes` each, a whole number of pages, at most
+    /// `IMAGE_QUEUE_MAX`, their addresses into `out`: 0, or -1.
+    pub fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8) -> i32;
+    /// Buffer `buffer`'s request -- `len` bytes from `offset` read into it,
+    /// or with `write` not 0 written from it: 1 while it is with the device
+    /// (`kernel_image_reap` gives it back), 0 done now, -1 done and failed.
+    pub safe fn kernel_image_start(image: usize, buffer: usize, write: i32, offset: u64, len: usize) -> i32;
+    /// The doorbell for the requests started.
+    pub safe fn kernel_image_kick(image: usize);
+    /// Requests done into `out`, `max` at most: how many, or -1.
+    pub fn kernel_image_reap(image: usize, out: *mut ImageDone, max: usize) -> isize;
+    /// Sleeps, with no lock of the image's held, until one of its commands
+    /// is done or a wake comes or `timeout_ns` is up: 1 when one came, 0
+    /// when the time ran out, -1 at once for no image with a queue.
+    pub safe fn kernel_image_wait(image: usize, timeout_ns: u64) -> i32;
+    /// Wakes the waiter, from anywhere.
+    pub safe fn kernel_image_wake(image: usize);
 }
 
 /* What procfs puts in its files. Each writes into the buffer given and
