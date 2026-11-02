@@ -59,6 +59,8 @@ static LATE: AtomicU64 = AtomicU64::new(0);
 static MQ_RUNS: AtomicU64 = AtomicU64::new(0);
 static RESETS: AtomicU64 = AtomicU64::new(0);
 static STOPPED: AtomicU64 = AtomicU64::new(0);
+static INDIRECT_RUNS: AtomicU64 = AtomicU64::new(0);
+static INDIRECT_CHAINS: AtomicU64 = AtomicU64::new(0);
 
 pub fn report() {
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -66,9 +68,10 @@ pub fn report() {
               {} interrupts taken; \
               {} requests, {} frames sent, {} received; {} refills put off, {} frames come to a ring with no \
               buffers, {} transmit queues stopped; {} chains made available by another CPU while the device worked; \
-              {} NICs reset and brought up again",
+              {} NICs reset and brought up again; {} disks with indirect descriptors, {} chains made in tables",
              l(&EVENT_RUNS), l(&FLAG_RUNS), l(&MQ_RUNS), l(&KICKS), l(&SPARED), l(&INTERRUPTS), l(&REQUESTS),
-             l(&FRAMES_SENT), l(&FRAMES_RECEIVED), l(&DRY), l(&STARVED), l(&STOPPED), l(&LATE), l(&RESETS));
+             l(&FRAMES_SENT), l(&FRAMES_RECEIVED), l(&DRY), l(&STARVED), l(&STOPPED), l(&LATE), l(&RESETS),
+             l(&INDIRECT_RUNS), l(&INDIRECT_CHAINS));
 }
 
 const MEM: u64 = 16 << 20;
@@ -98,6 +101,8 @@ const F_EVENT_IDX: u32 = 1 << 29;
 
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
+const DESC_INDIRECT: u16 = 4;
+const F_INDIRECT_DESC: u32 = 1 << 28;
 const AVAIL_NO_INTERRUPT: u16 = 1;
 const USED_NO_NOTIFY: u16 = 1;
 
@@ -127,15 +132,21 @@ fn need_event(event: u16, new: u16, old: u16) -> bool {
 }
 
 /// One split ring, as Linux's driver keeps it (`struct vring_virtqueue`):
-/// each descriptor's buffer a page of its own.
+/// each descriptor's buffer a page of its own -- and, with indirect
+/// descriptors taken (`tables`), a chain of more than one buffer is one
+/// descriptor of the ring naming a table of its own, as `virtqueue_add_split`
+/// makes it: the table a page by the head's index, its buffers pages of
+/// their own after the tables.
 struct Ring {
     base: u64,
     bufs: u64,
     event: bool,
+    /// Where the indirect tables are, when the driver took them.
+    tables: Option<u64>,
     free: Vec<u16>,
-    /// The chains made available and not yet used: their descriptors, by
-    /// head.
-    chains: HashMap<u16, Vec<u16>>,
+    /// The chains made available and not yet used: their descriptors, and
+    /// their first buffer's address, by head.
+    chains: HashMap<u16, (Vec<u16>, u64)>,
     avail_shadow: u16,
     num_added: u16,
     last_used: u16,
@@ -149,6 +160,7 @@ impl Ring {
             base,
             bufs,
             event,
+            tables: None,
             free: (0..SIZE).rev().collect(),
             chains: HashMap::new(),
             avail_shadow: 0,
@@ -197,6 +209,9 @@ impl Ring {
     /// A chain's descriptors written and taken, not yet made available: its
     /// head, and its buffers' addresses.
     fn prepare(&mut self, mem: &GuestMemory, segs: &[(u32, bool)]) -> Option<(u16, Vec<u64>)> {
+        if let Some(tables) = self.tables.filter(|_| segs.len() > 1) {
+            return self.prepare_indirect(mem, tables, segs);
+        }
         if segs.is_empty() || self.free.len() < segs.len() {
             return None;
         }
@@ -215,7 +230,40 @@ impl Ring {
             addrs.push(self.buf(descs[i]));
         }
         let head = descs[0];
-        self.chains.insert(head, descs);
+        self.chains.insert(head, (descs, addrs[0]));
+        Some((head, addrs))
+    }
+
+    /// `virtqueue_add_split` with indirect descriptors: the chain's buffers
+    /// in a table of their own -- each entry's `next` the one after it, as
+    /// Linux lays one out -- and one descriptor of the ring naming it.
+    fn prepare_indirect(&mut self, mem: &GuestMemory, tables: u64, segs: &[(u32, bool)]) -> Option<(u16, Vec<u64>)> {
+        let head = self.free.pop()?;
+        let table = tables + PAGE * u64::from(head);
+        let mut addrs = Vec::new();
+        let mut at = INDIRECT_BUFS + INDIRECT_AREA * u64::from(head);
+        for (i, &(len, write)) in segs.iter().enumerate() {
+            let last = i + 1 == segs.len();
+            let flags = (if write { DESC_WRITE } else { 0 }) | (if last { 0 } else { DESC_NEXT });
+            let next = if last { 0 } else { i as u16 + 1 };
+            let buf = at;
+            at += u64::from(len).next_multiple_of(16);
+            invariant!(at <= INDIRECT_BUFS + INDIRECT_AREA * (u64::from(head) + 1), "a request longer than its area");
+            let mut e = [0u8; 16];
+            e[..8].copy_from_slice(&buf.to_le_bytes());
+            e[8..12].copy_from_slice(&len.to_le_bytes());
+            e[12..14].copy_from_slice(&flags.to_le_bytes());
+            e[14..16].copy_from_slice(&next.to_le_bytes());
+            mem.write(table + 16 * i as u64, &e).expect("the table in memory");
+            addrs.push(buf);
+        }
+        let mut e = [0u8; 16];
+        e[..8].copy_from_slice(&table.to_le_bytes());
+        e[8..12].copy_from_slice(&(16 * segs.len() as u32).to_le_bytes());
+        e[12..14].copy_from_slice(&DESC_INDIRECT.to_le_bytes());
+        mem.write(self.base + 16 * u64::from(head), &e).expect("the ring in memory");
+        INDIRECT_CHAINS.fetch_add(1, Ordering::Relaxed);
+        self.chains.insert(head, (vec![head], addrs[0]));
         Some((head, addrs))
     }
 
@@ -276,14 +324,15 @@ impl Ring {
         let len = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
         invariant!(id < u32::from(SIZE), "a used element for descriptor {}, past the ring", id);
         let head = id as u16;
-        let descs = self.chains.remove(&head);
-        invariant!(descs.is_some(), "a used element for chain {}, which the driver has not made available", head);
-        self.free.extend_from_slice(&descs.unwrap_or_default());
+        let chain = self.chains.remove(&head);
+        invariant!(chain.is_some(), "a used element for chain {}, which the driver has not made available", head);
+        let (descs, first) = chain.unwrap_or_default();
+        self.free.extend_from_slice(&descs);
         self.last_used = self.last_used.wrapping_add(1);
         if self.flags_shadow & AVAIL_NO_INTERRUPT == 0 {
             Self::put(mem, self.used_event(), self.last_used);
         }
-        Some((self.buf(head), len))
+        Some((first, len))
     }
 
     /// `virtqueue_disable_cb_split`: no interrupt wanted -- the event put
@@ -435,6 +484,12 @@ pub fn virtq_target(r: &mut Input) {
 
 const BLK_PFN: u64 = 1;
 const BLK_BUFS: u64 = 1 << 20;
+/// With indirect descriptors: a table a page by its head's index, and the
+/// buffers its entries name one after another in `INDIRECT_AREA` bytes of
+/// their own a head -- room for the longest request made here.
+const BLK_TABLES: u64 = 2 << 20;
+const INDIRECT_BUFS: u64 = 4 << 20;
+const INDIRECT_AREA: u64 = 32 << 10;
 const DISK_BYTES: u64 = 1 << 20;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
@@ -523,10 +578,16 @@ impl BlkWorld {
         let each = r.u8() < 64;
         for _ in 0..1 + r.below(12) {
             let kind = r.pick(&[T_IN, T_IN, T_OUT, T_OUT, T_FLUSH]);
-            let sectors = 1 + r.below(8);
+            /* The data in one buffer, or -- as a request of a guest's
+             * scattered pages has it -- a buffer a sector, more of them
+             * than a stretch of a table holds. */
+            let split = r.u8() < 64;
+            let sectors = if split { 1 + r.below(24) } else { 1 + r.below(8) };
             let sector = r.below(DISK_BYTES / blk::SECTOR - sectors);
             let mut segs = vec![(16u32, false)];
-            if kind != T_FLUSH {
+            if kind != T_FLUSH && split {
+                segs.extend((0..sectors).map(|_| (blk::SECTOR as u32, kind == T_IN)));
+            } else if kind != T_FLUSH {
                 segs.push(((sectors * blk::SECTOR) as u32, kind == T_IN));
             }
             segs.push((1, true));
@@ -616,7 +677,10 @@ fn blk_run(r: &mut Input) {
     if r.u8() < 32 {
         mem.refuse_maps(true);
     }
-    let accept = if r.bool() { u32::MAX } else { !F_EVENT_IDX };
+    let mut accept = if r.bool() { u32::MAX } else { !F_EVENT_IDX };
+    if r.u8() < 64 {
+        accept &= !F_INDIRECT_DESC;
+    }
     let offered = disk.io_read(DEVICE_FEATURES, 4);
     let features = {
         let mut write = |o: u16, s: u8, v: u32| {
@@ -626,11 +690,16 @@ fn blk_run(r: &mut Input) {
     };
     let event = features & F_EVENT_IDX != 0;
     if event { &EVENT_RUNS } else { &FLAG_RUNS }.fetch_add(1, Ordering::Relaxed);
+    let mut ring = Ring::new(BLK_PFN * PAGE, BLK_BUFS, event);
+    if features & F_INDIRECT_DESC != 0 {
+        INDIRECT_RUNS.fetch_add(1, Ordering::Relaxed);
+        ring.tables = Some(BLK_TABLES);
+    }
     let mut w = BlkWorld {
         mem,
         disk,
         state,
-        ring: Ring::new(BLK_PFN * PAGE, BLK_BUFS, event),
+        ring,
         pending: Pending { irq, queues: 1, intx: false, vectors: 0 },
         outstanding: HashMap::new(),
         late: false,
