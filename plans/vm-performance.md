@@ -190,6 +190,43 @@ block twice). The guest boots faster than under KVM. What is left is the
 latency of a wakeup -- one guest CPU waking another, a timer -- and the
 clock a busy core runs at.
 
+## Measured after the second group
+
+The same comparison on 2026-11-02, branch `vm-perf2` from master (ddcbd4c6's
+code): 16f9eb9d is the disk's requests sent to the device as they come --
+indirect descriptors, the image's queue of buffers the device reads and
+writes as they are, 64 requests out with a guest's disk and 256 commands
+with the NVMe; 96281a83 is 16f9eb9d with the idle task's window closed
+(d0a4b493, d92695bc) and a disk's pass bound by the data it moves. nos's
+results as a share of KVM's; `bench/vm/results/comparison.md` has all of it.
+
+| | KVM | ddcbd4c6 | 16f9eb9d | 96281a83 |
+|---|---:|---:|---:|---:|
+| sysbench cpu, 1 / 4 threads | 1589 / 3259 | 96% / 98% | 97% / 98% | 96% / 98% |
+| random reads of memory, 1 thread | 949 MiB/s | 85% | 84% | 85% |
+| perf sched pipe, us an op | 6.0 | 9.6 (63%) | 9.49 (63%) | 8.19 (73%) |
+| cyclictest, average / most, us | 31 / 3280 | 65 / 3091 | 262 / 3188 | 72 / 205 |
+| fio: a new file's first write, 1M QD8 | 4643 MiB/s | 1954 (42%) | 2257 (49%) | 3103 (67%) |
+| fio: 4k random reads QD1 / QD32 / 4x16 | 20.1k / 195k / 217k | 91% / 76% / 78% | 82% / 7% / 23% | 83% / 76% / 171% |
+| fio: 4k random writes QD1 / QD32 | 39.9k / 178k | 81% / 72% | 61% / 8% | 74% / 71% |
+| fio: 1M reads / writes QD8 | 1456 / 3694 MiB/s | 93% / 63% | 135% / 74% | 150% / 102% |
+| fio: 4k writes with fdatasync; a write's p99 / p99.9 | 620; 167 / 226 us | 112%; 709 / 1090 | 114%; 61 / 1073 | 115%; 62 / 72 |
+| pgbench init | 6.5 s | 65% | 62% | 67% |
+| pgbench -S, 1 client | 61.6k | 80% | 80% | 87% |
+| pgbench (TPC-B), 1 / 16 clients | 411 / 4655 | 154% / 103% | 152% / 98% | 156% / 106% |
+
+16f9eb9d's run had 4k reads at QD32 at 13k IOPS and cyclictest's first
+thread at 853 us on average, with 21 112 of the guest's timer interrupts more
+than 1 ms late: out of its idling the idle task is counted as any task, and
+an interrupt's decision left it the CPU over a task woken then -- a vCPU rung
+just after its CPU took another interrupt -- which waited out the idle task's
+3 ms slice. The disk's completions, each now its own, rang the vCPUs that
+often. It had always been there: the ~12 000 late sleeps a run that T1 left
+to "the machine's own stalls" were it. With it closed (96281a83): 2 timer
+interrupts more than 1 ms late in the run, no sleep ending more than 1 ms
+past its time, cyclictest's most 205 us. What is left is in
+[`vm-perf-todo.md`](vm-perf-todo.md).
+
 ## Status
 
 | item | state |
