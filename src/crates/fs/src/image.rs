@@ -433,6 +433,8 @@ struct Direct {
     /// and at most: what a guest's I/O that met one waited.
     grows_timed: Timed,
     conversions: Timed,
+    /// The guest's flushes (`Image::sync`), each the whole call.
+    syncs: Spread,
 }
 
 /// How many of something there were and how long they took, in all and at
@@ -461,6 +463,59 @@ impl Timed {
     }
 }
 
+/// How long something took, a log2 bucket of microseconds each -- 0 for
+/// under 1 us, k for 2^(k-1) up to 2^k -- and at most: where a tail is, which
+/// an average does not say (the image's let-go lines).
+#[derive(Clone, Copy)]
+struct Spread {
+    buckets: [u64; SPREAD_BUCKETS],
+    max_ns: u64,
+}
+
+/// Buckets up to 2^24 us -- 16 s -- the last of them everything past.
+const SPREAD_BUCKETS: usize = 26;
+
+impl Spread {
+    const fn new() -> Spread {
+        Spread { buckets: [0; SPREAD_BUCKETS], max_ns: 0 }
+    }
+
+    fn add(&mut self, from: u64) {
+        let ns = boot_time_ns().saturating_sub(from);
+        let us = ns / 1000;
+        let k = (u64::BITS - us.leading_zeros()) as usize;
+        self.buckets[k.min(SPREAD_BUCKETS - 1)] += 1;
+        self.max_ns = self.max_ns.max(ns);
+    }
+
+    fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+
+    /// The top of the bucket the `per_mille`'th of them falls in, in us.
+    fn bound(&self, per_mille: u64) -> u64 {
+        let want = (self.count() * per_mille).div_ceil(1000).max(1);
+        let mut seen = 0;
+        for (k, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= want {
+                return 1u64 << k;
+            }
+        }
+        1 << (SPREAD_BUCKETS - 1)
+    }
+}
+
+impl core::fmt::Display for Spread {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.count() == 0 {
+            return f.write_str("none");
+        }
+        write!(f, "{}, half within {} us, 99% {}, 99.9% {}, the longest {}", self.count(), self.bound(500),
+               self.bound(990), self.bound(999), self.max_ns / 1000)
+    }
+}
+
 /// What an image serves a guest's disk's requests in (`start`, `reap`):
 /// buffers of its own, one a request, and the I/O of those it has with the
 /// device -- asynchronous, where its disk takes that and the request's
@@ -486,6 +541,12 @@ struct Flights {
     /// Requests served by the device's asynchronous path, and the others.
     fast: u64,
     slow: u64,
+    /// How long they took: an asynchronous one from its start until its
+    /// last command was done, the others the call; and how long the image
+    /// waited for its I/O before anything else (`drain`).
+    fast_took: Spread,
+    slow_took: Spread,
+    drained: Spread,
 }
 
 /// A buffer's request while the image has it.
@@ -497,6 +558,8 @@ struct Flight {
     /// Its commands not yet done, and whether every one went well.
     left: usize,
     ok: bool,
+    /// When it was started.
+    began: u64,
     /// For a write, the runs of blocks it writes over unwritten extents --
     /// noted as written (`note_written`) once it is done, and not before:
     /// until then a read of one finds the zeros it held.
@@ -1054,6 +1117,15 @@ impl Image {
     /// pushed out where there were none -- or, after a write the VFS took,
     /// the filesystem synced, which pushes it out after its own metadata.
     pub fn sync(&mut self) -> bool {
+        let began = boot_time_ns();
+        let ok = self.sync_now();
+        if let Some(direct) = self.direct.as_mut() {
+            direct.syncs.add(began);
+        }
+        ok
+    }
+
+    fn sync_now(&mut self) -> bool {
         /* What the guest was told is done is on the device: everything in
          * flight done first, so that nothing of it is left out. */
         self.drain();
@@ -1108,7 +1180,8 @@ impl Image {
             }
             slots.push(Flight { unwritten, ..Flight::default() });
         }
-        self.flights = Some(Flights { queue, slots, done, commands, fast: 0, slow: 0 });
+        self.flights = Some(Flights { queue, slots, done, commands, fast: 0, slow: 0, fast_took: Spread::new(),
+                                      slow_took: Spread::new(), drained: Spread::new() });
         true
     }
 
@@ -1154,6 +1227,7 @@ impl Image {
         /* The synchronous path, after everything in flight: the batch's,
          * through the image's own buffer -- with the queue out of the way
          * meanwhile, whose buffer this request's data is in. */
+        let began = boot_time_ns();
         self.drain();
         let Some(mut fl) = self.flights.take() else { return Started::Done(false) };
         let ok = match fl.queue.bytes(k) {
@@ -1162,6 +1236,7 @@ impl Image {
             None => false,
         };
         fl.slow += 1;
+        fl.slow_took.add(began);
         self.flights = Some(fl);
         Started::Done(ok)
     }
@@ -1237,9 +1312,9 @@ impl Image {
         }
 
         let count = fl.commands.len();
-        let slot = &mut fl.slots[k];
-        (slot.busy, slot.write, slot.left, slot.ok) = (true, write, count, true);
         let began = boot_time_ns();
+        let slot = &mut fl.slots[k];
+        (slot.busy, slot.write, slot.left, slot.ok, slot.began) = (true, write, count, true, began);
         for i in 0..count {
             let (at, len, sector) = fl.commands[i];
             loop {
@@ -1334,6 +1409,7 @@ impl Image {
                 }
             }
             if fl.queue.in_flight() == 0 {
+                fl.drained.add(began);
                 return;
             }
             fl.queue.wait(Duration::from_millis(DRAIN_STEP_MS));
@@ -1367,6 +1443,7 @@ fn command_done(direct: &mut Direct, fl: &mut Flights, vfs: &Vfs, handle: Handle
         }
     }
     slot.busy = false;
+    fl.fast_took.add(slot.began);
     /* Into the room taken at `make_queue`: a request a buffer. */
     fl.done.push_back((buf, ok));
 }
@@ -1406,7 +1483,11 @@ impl Drop for Image {
                 if let Some(fl) = self.flights.as_ref() {
                     trace!(0, "image: {}: {} requests served with the device asynchronously, {} by the batch",
                            path, fl.fast, fl.slow);
+                    trace!(0, "image: {}: with the device {}", path, fl.fast_took);
+                    trace!(0, "image: {}: by the batch {}", path, fl.slow_took);
+                    trace!(0, "image: {}: waited for {}", path, fl.drained);
                 }
+                trace!(0, "image: {}: syncs {}", path, d.syncs);
             }
             None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
@@ -1463,7 +1544,7 @@ impl Direct {
                       grown_to: u64::MAX, span: 0, through_vfs: false, read_off: 0, written_off: 0,
                       written_through: 0, punched: 0, allocated: 0, grows: false, refused: 0,
                       pending: Pending::default(), made_written: 0, grows_timed: Timed::default(),
-                      conversions: Timed::default() })
+                      conversions: Timed::default(), syncs: Spread::new() })
     }
 
     /// Where each of `n` blocks from `first` is on the device, into
