@@ -1043,6 +1043,25 @@ fn blk_request(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
     chain(mem, q, r, &segs);
 }
 
+/// The most of the guest's memory one call into the disk -- a notify, a
+/// round, each a pass under the platform's lock in the hypervisor -- reads
+/// and writes: its data held to `blk::PASS_BYTES` and the request that
+/// crosses it, and for each chain of a pass (a queue's worth at most) its
+/// descriptors -- a whole table's -- its header, ranges and status, and the
+/// rings' words. Unbounded, a notify of a queue full of the largest writes
+/// copied every one of them: 16 MiB.
+const PASS_MOST: u64 = (blk::PASS_BYTES + blk::REQUEST_BYTES) as u64 + QUEUE_SIZE * (16 * QUEUE_SIZE + 256);
+
+/// `call`, into the disk, held to what one pass of it may move.
+fn held_to_a_pass<R>(mem: &GuestMemory, call: impl FnOnce() -> R) -> R {
+    let before = mem.moved();
+    let result = call();
+    let moved = mem.moved() - before;
+    invariant!(moved <= PASS_MOST, "a call into the disk moved {} bytes of the guest's memory, past the {} a pass \
+               may under the platform's lock", moved, PASS_MOST);
+    result
+}
+
 fn blk_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let since = time::boot_time_ns();
@@ -1058,14 +1077,14 @@ fn blk_target(r: &mut Input) {
         mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                disk.io_write(offset, size, value, &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(offset, size, value, &mem, time::boot_time_ns()));
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
@@ -1086,7 +1105,7 @@ fn blk_target(r: &mut Input) {
             }
             4 => {
                 let queue = if r.u8() < 240 { 0 } else { r.u16() };
-                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns()));
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -1100,10 +1119,10 @@ fn blk_target(r: &mut Input) {
                 for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
                     blk_request(&mem, &mut q, r);
                 }
-                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
             }
             8 | 9 => {
-                disk.poll(&mem);
+                held_to_a_pass(&mem, || disk.poll(&mem));
             }
             10 => {
                 let mut s = state.lock().unwrap();
@@ -1116,7 +1135,7 @@ fn blk_target(r: &mut Input) {
                 disk.line();
                 disk.broken();
             }
-            _ => {
+            12 => {
                 /* A request, then another CPU posting it again and again
                  * while the device takes from the ring: one answered at once
                  * -- a GET_ID, one past the disk -- takes no buffer, so the
@@ -1124,15 +1143,39 @@ fn blk_target(r: &mut Input) {
                 blk_request(&mem, &mut q, r);
                 let notify = r.bool();
                 racing(&mem, &mut q, || {
-                    if notify {
-                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
-                    } else {
-                        disk.poll(&mem);
-                    }
+                    held_to_a_pass(&mem, || {
+                        if notify {
+                            disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
+                        } else {
+                            disk.poll(&mem);
+                        }
+                    })
                 });
             }
+            13 => {
+                /* The largest reads and writes the driver may send, more at
+                 * once than the device takes: their data copied a pass's
+                 * worth at a time (`blk::PASS_BYTES`), the writes' as they
+                 * are taken and the reads' as they are given back. */
+                let sectors = blk::REQUEST_BYTES as u64 / blk::SECTOR;
+                for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
+                    let kind = if r.bool() { 1u32 } else { 0 };
+                    let sector = r.below((size / blk::SECTOR).saturating_sub(sectors).max(1));
+                    let header = gpa(r) & !7;
+                    let mut h = [0u8; 16];
+                    h[..4].copy_from_slice(&kind.to_le_bytes());
+                    h[8..].copy_from_slice(&sector.to_le_bytes());
+                    mem.put(header, &h);
+                    let (data, status) = (r.below(MEM - blk::REQUEST_BYTES as u64), gpa(r));
+                    chain(&mem, &mut q, r, &[(header, 16, false), (data, blk::REQUEST_BYTES as u32, kind == 0),
+                                              (status, 1, true)]);
+                }
+                held_to_a_pass(&mem, || disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns()));
+            }
+            _ => {}
         }
     }
+    PASSES_CUT.fetch_add(disk.stats.cut, std::sync::atomic::Ordering::Relaxed);
     mem.held_to_map_budget(since, 1);
 }
 
@@ -1658,14 +1701,17 @@ static PVH_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static DISK_OUT_OF_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Discards and writes of zeros handed to the backend.
 static RANGES_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A disk's passes ended at their bound on the data they moved.
+static PASSES_CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
     println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
              PVH_BUILT.load(Relaxed));
     println!("  disks: {} requests given back before one handed over earlier, {} discards and writes of zeros \
-              handed over; {} chains made with buffers in an indirect table", DISK_OUT_OF_ORDER.load(Relaxed),
-             RANGES_SERVED.load(Relaxed), INDIRECT_MADE.load(Relaxed));
+              handed over; {} chains made with buffers in an indirect table; {} passes cut short by the data they \
+              moved", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed), INDIRECT_MADE.load(Relaxed),
+             PASSES_CUT.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {
