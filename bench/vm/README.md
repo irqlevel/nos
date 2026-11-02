@@ -100,6 +100,8 @@ E-cores, a Samsung MZVL2512HCJQ NVMe), October and November 2026:
 | `nos-311baf25` | the chunks' commits flushing as before, growth doubling to 256 MiB |
 | `nos-ea1dc0fe` ... `nos-dc8bbb5b` | the same, with the report telling where late timer interrupts were waited for |
 | `nos-ddcbd4c6` | the host's timer armed for a guest's edge as the entry is made, and only then looked at |
+| `nos-16f9eb9d` | indirect descriptors, every request to the device as it comes and back as each is done, 64 requests out -- and the idle task's window, which left a woken vCPU waiting out a 3 ms slice: 4k reads at QD32 13k IOPS |
+| `nos-96281a83` | the same, the idle task looking at its queue with its flag up, and a disk's pass bound by the data it moves |
 
 `results/comparison.md` is `compare-n.py` over the reference and the runs
 that changed something. The same code run twice moves some numbers by 5-10%
