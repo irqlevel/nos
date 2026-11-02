@@ -1002,6 +1002,22 @@ static void cmd_sched(const char* args, stdlib::Printer& con)
 
     sched_line("all", total_tasks, total, total_now, con);
 
+    /* Each CPU's longest wakeup since boot, where one waited past a
+       millisecond: who, how it was woken, and what had the CPU before it --
+       another task, or the idle one (nobody gave it the CPU sooner) */
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!(mask & (1UL << i)))
+            continue;
+        TaskQueue::LateWake late;
+        cpus.get_cpu(i).get_task_queue().read_late(late);
+        if (late.count == 0)
+            continue;
+        con.printf("cpu %lu: %lu wakeups past %lu us since boot, the longest %lu us at %lu ms: %s, %s, after %s\n", i,
+            late.count, TaskQueue::LATE_WAKE_NS / consts::NANO_SECS_IN_USEC, late.waited_ns / consts::NANO_SECS_IN_USEC,
+            late.at_ns / consts::NANO_SECS_IN_MS, late.task, late.deadline ? "its deadline come" : "woken", late.before);
+    }
+
     mm::free(snaps);
 }
 
