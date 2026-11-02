@@ -10,8 +10,8 @@
 //!
 //! The disk works beside the guest, as a disk of its own would. When the
 //! driver notifies, the vCPU takes what it made available off the ring --
-//! the data of a write copied out of guest memory then, into a buffer of the
-//! device's -- and hands each request to the backend, which serves them
+//! the data of a write copied out of guest memory then, into the request's
+//! buffer -- and hands each request to the backend, which serves them
 //! while the guest runs on: in whatever order it likes, several at once if
 //! it can -- virtio orders nothing between requests in flight; a driver
 //! that needs a write done before another waits for it, and before a
@@ -19,7 +19,11 @@
 //! is given back: a read's data copied into the guest, the status written,
 //! the chain on the used ring, and an interrupt.
 //! The guest's memory is only ever touched here, on the vCPU's task: the
-//! backend sees buffers of the device's and nothing else.
+//! backend sees its own buffers and nothing else. They are the backend's --
+//! one a request it may be handed, which the device reaches by number
+//! (`Backend::with_buffer`) while the request is not with the backend -- so
+//! that a backend can have its device read and write them as they are,
+//! with no copy of its own.
 //!
 //! A discard and a write of zeros come as ranges -- sectors, a count, and
 //! for a write of zeros whether the blocks may be given back -- which the
@@ -28,11 +32,11 @@
 //! after the check changes nothing it was checked on.
 //!
 //! At most `IN_FLIGHT` requests are with the backend at once, each in a
-//! buffer of `REQUEST_BYTES` taken when the device is made -- what the driver
-//! is told a request may carry, `SEG_MAX` segments of at most `SIZE_MAX` -- so
-//! nothing is allocated on the way, and a guest that keeps its ring full
-//! waits for its disk rather than growing anything of the host's: what does
-//! not fit stays on the ring until a buffer comes back.
+//! buffer of `REQUEST_BYTES` the backend has from the start -- what the
+//! driver is told a request may carry, `SEG_MAX` segments of at most
+//! `SIZE_MAX` -- so nothing is allocated on the way, and a guest that keeps
+//! its ring full waits for its disk rather than growing anything of the
+//! host's: what does not fit stays on the ring until a buffer comes back.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -62,8 +66,15 @@ pub trait Backend: Send {
     fn discard_sectors(&self) -> u32 {
         DISCARD_ALIGNMENT
     }
-    /// Serve `req`. The device never has more than `IN_FLIGHT` handed over
-    /// and not yet taken back, and a backend takes that many.
+    /// Buffer `slot`'s bytes, at least `REQUEST_BYTES` of them, for `use_it`
+    /// -- what a write's data is copied into before its request is handed
+    /// over, and a read's taken from once it is back: its result, or false
+    /// where the backend has no such buffer, or has the request of it. One
+    /// buffer a slot, `0..IN_FLIGHT`, the backend's for as long as it is.
+    fn with_buffer(&mut self, slot: usize, use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool;
+    /// Serve `req`, whose data is in its slot's buffer. The device never has
+    /// more than `IN_FLIGHT` handed over and not yet taken back -- one a
+    /// slot -- and a backend takes that many.
     fn submit(&mut self, req: Request);
     /// A request served, if one is: in the order they were served, which
     /// need not be the order they were submitted in.
@@ -101,16 +112,18 @@ pub struct Range {
     pub unmap: bool,
 }
 
-/// One request, on its way to the backend and back. Its buffer is the
-/// device's, and so is the request: a backend serves one it was handed and
-/// gives it back, and has no way to make one of its own.
+/// One request, on its way to the backend and back: the device's -- a
+/// backend serves one it was handed and gives it back, and has no way to
+/// make one of its own. Its data is in its slot's buffer, the backend's.
 pub struct Request {
     op: Op,
     offset: u64,
     len: usize,
-    buf: Box<[u8]>,
     ok: bool,
     slot: usize,
+    /// A discard's or a write of zeros' ranges, as the device checked them:
+    /// `len` bytes of them.
+    ranges: [u8; MAX_RANGES * RANGE_BYTES],
 }
 
 impl Request {
@@ -124,15 +137,15 @@ impl Request {
         self.offset
     }
 
-    /// A write's data.
-    pub fn data(&self) -> &[u8] {
-        &self.buf[..self.len]
+    /// A read's or a write's bytes: whole sectors, at most `REQUEST_BYTES`,
+    /// from the start of its buffer.
+    pub fn len(&self) -> usize {
+        self.len
     }
 
-    /// Where a read's data goes: exactly as many bytes as the guest asked
-    /// for.
-    pub fn data_mut(&mut self) -> &mut [u8] {
-        &mut self.buf[..self.len]
+    /// Which buffer of the backend's its data is in (`Backend::with_buffer`).
+    pub fn slot(&self) -> usize {
+        self.slot
     }
 
     /// How it went: false for an error the guest is to see.
@@ -144,7 +157,7 @@ impl Request {
     /// in its own copy: every one whole sectors inside the disk. None for
     /// any other request.
     pub fn ranges(&self) -> impl Iterator<Item = Range> + '_ {
-        let ranges = if matches!(self.op, Op::Discard | Op::WriteZeroes) { &self.buf[..self.len] } else { &[] };
+        let ranges = if matches!(self.op, Op::Discard | Op::WriteZeroes) { &self.ranges[..self.len] } else { &[] };
         ranges.chunks_exact(RANGE_BYTES).map(|r| {
             let sector = u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]);
             let count = u32::from_le_bytes([r[8], r[9], r[10], r[11]]);
@@ -271,11 +284,11 @@ pub struct Stats {
 /// on -- its head, and its buffers, where a read's data goes and the status
 /// after it. What it asked comes back with the request.
 struct Slot {
-    /// The buffer, while the device has it; with the backend otherwise.
-    buf: Option<Box<[u8]>>,
+    /// Whether the backend has the slot's request, and its buffer.
+    out: bool,
     /// The chain being served, until it is given back. None when the slot is
     /// free -- or when a reset forgot its chain while the backend still has
-    /// the buffer, which is then taken back and given to nobody.
+    /// the request, which is then taken back and given to nobody.
     head: Option<u16>,
     /// The chain's buffers: room for the longest chain the queue holds.
     segs: Vec<Seg>,
@@ -322,10 +335,7 @@ impl Blk {
         for _ in 0..IN_FLIGHT {
             let mut segs = Vec::new();
             segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(REQUEST_BYTES).map_err(|_| Error::NoMemory)?;
-            buf.resize(REQUEST_BYTES, 0);
-            slots.push(Slot { buf: Some(buf.into_boxed_slice()), head: None, segs });
+            slots.push(Slot { out: false, head: None, segs });
         }
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
@@ -502,7 +512,7 @@ impl Blk {
                 break;
             }
             left -= 1;
-            let Some(slot) = self.slots.iter().position(|s| s.head.is_none() && s.buf.is_some()) else {
+            let Some(slot) = self.slots.iter().position(|s| s.head.is_none() && !s.out) else {
                 /* Every buffer is with the backend: the rest waits on the
                  * ring until one comes back. */
                 self.waiting = true;
@@ -555,24 +565,29 @@ impl Blk {
             Next::Serve(op, offset, len) => (op, offset, len, None),
             Next::Ranges(op, count, ranges) => (op, 0, count * RANGE_BYTES, Some(ranges)),
         };
-        let Some(mut buf) = self.slots[slot].buf.take() else {
+        if self.slots[slot].out {
             /* `fill` chose the slot for having its buffer. */
             self.stats.errors += 1;
             self.finish(mem, segs, head, S_IOERR, 0)?;
             return Ok(true);
-        };
-        if let Some(ranges) = ranges {
-            /* The copy the ranges were checked in, not the guest's memory again */
-            buf[..len].copy_from_slice(&ranges[..len]);
         }
-        if op == Op::Write && !copy_out(mem, segs, HEADER as u64, &mut buf[..len]) {
-            self.slots[slot].buf = Some(buf);
+        /* The copy the ranges were checked in, not the guest's memory again */
+        let mut copy = [0u8; MAX_RANGES * RANGE_BYTES];
+        if let Some(ranges) = ranges {
+            copy[..len].copy_from_slice(&ranges[..len]);
+        }
+        if op == Op::Write
+            && !self.backend.with_buffer(slot, &mut |buf| {
+                buf.len() >= len && copy_out(mem, segs, HEADER as u64, &mut buf[..len])
+            })
+        {
             self.stats.errors += 1;
             self.finish(mem, segs, head, S_IOERR, 0)?;
             return Ok(true);
         }
-        self.slots[slot].head = Some(head);
-        self.backend.submit(Request { op, offset, len, buf, ok: false, slot });
+        let s = &mut self.slots[slot];
+        (s.head, s.out) = (Some(head), true);
+        self.backend.submit(Request { op, offset, len, ok: false, slot, ranges: copy });
         Ok(false)
     }
 
@@ -580,11 +595,12 @@ impl Blk {
     /// whatever became of the chain, and the chain to the driver when there
     /// is still one to give it back to. True when something was.
     fn complete(&mut self, mem: &GuestMemory, req: Request) -> bool {
-        let Request { op, len, buf, ok, slot, .. } = req;
+        let Request { op, len, ok, slot, ranges, .. } = req;
         let Some(s) = self.slots.get_mut(slot) else {
             return false;
         };
         let head = s.head.take();
+        s.out = false;
         let segs = core::mem::take(&mut s.segs);
         let answered = match head {
             Some(head) if self.broken.is_none() => {
@@ -592,7 +608,9 @@ impl Blk {
                     (S_IOERR, 0)
                 } else if op != Op::Read {
                     (S_OK, 0)
-                } else if copy_in(mem, &segs, 0, &buf[..len]) {
+                } else if self.backend.with_buffer(slot, &mut |buf| {
+                    buf.len() >= len && copy_in(mem, &segs, 0, &buf[..len])
+                }) {
                     (S_OK, clamp32(len as u64))
                 } else {
                     (S_IOERR, 0)
@@ -610,11 +628,11 @@ impl Blk {
                         Op::Flush => self.stats.flushes += 1,
                         Op::Discard => {
                             self.stats.discards += 1;
-                            self.stats.discarded_bytes += ranged_bytes(&buf[..len]);
+                            self.stats.discarded_bytes += ranged_bytes(&ranges[..len]);
                         }
                         Op::WriteZeroes => {
                             self.stats.zeroings += 1;
-                            self.stats.zeroed_bytes += ranged_bytes(&buf[..len]);
+                            self.stats.zeroed_bytes += ranged_bytes(&ranges[..len]);
                         }
                     }
                 } else {
@@ -632,9 +650,7 @@ impl Blk {
              * follows: nothing to give back to. */
             _ => false,
         };
-        let s = &mut self.slots[slot];
-        s.segs = segs;
-        s.buf = Some(buf);
+        self.slots[slot].segs = segs;
         answered
     }
 

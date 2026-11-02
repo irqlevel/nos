@@ -1631,9 +1631,19 @@ virtio`). A queue's descriptors, its available ring and its used ring sit in
 guest memory, where the guest may write any of them at any moment. Every
 index, address and length read from them is checked before it is used: a
 descriptor past the queue, a chain longer than the queue -- a loop --, more
-chains than the queue holds, an indirect descriptor (not offered), or a
-buffer outside guest memory stop the device, which takes nothing more until
-the driver resets it. A request's header, data and status are taken as
+chains than the queue holds, an indirect descriptor where none was taken, a
+table the device will not follow, or a buffer outside guest memory stop the
+device, which takes nothing more until the driver resets it. **A disk's
+request is one entry of its ring** (`VIRTIO_RING_F_INDIRECT_DESC`, which the
+disks offer and the NICs do not): its buffers in a table of descriptors in
+guest memory that the chain's last descriptor names -- read 16 at a time,
+one copy through the kernel's window each, and checked as the ring is:
+whole descriptors, followed by their `next` inside the table, none of them
+a table again, the chain no longer than the queue. Without it a request
+took a descriptor of the ring a segment plus two, a 256 KiB one 66 of 256,
+and Linux, which takes descriptors from the ring until there are none, had
+three of them -- 768 KiB -- with its disk at once, whatever its queue's
+depth: a 1 MiB write at a depth of 8 that has 8 MiB out under KVM. A request's header, data and status are taken as
 streams across its readable and writable buffers, whatever the layout; its
 sector range is checked against the disk's size, and its size against what
 the driver was told a request may carry.
@@ -1647,7 +1657,7 @@ at which entry it wants to hear of the other's work: the driver at which
 used entry it wants an interrupt (`used_event`), the device at which
 available entry it wants a notify (`avail_event`). The device asks only
 when it stops for want of chains: a disk once it has taken every request
-there was -- with every one of its eight buffers out it asks for none, a
+there was -- with every one of its buffers out it asks for none, a
 request coming back has it look -- a NIC's transmit queue once it has sent
 every frame, its receive queue only when a frame waits for buffers, so the
 guest's refills of its receive ring cost no exit at all, the next frame
@@ -1678,22 +1688,29 @@ notify that made it available returned, the vCPU waiting for its disk -- and
 on the AX41 a guest writing back what `apt-get update` had fetched stalled
 for seconds at a time ([On real hardware](#on-real-hardware)). Now the notify
 only takes the requests off the ring -- a write's data copied out of guest
-memory into a buffer of the device's -- and hands them to the backend, which
-serves them in order on a task of its own, on a CPU other than the vCPU's:
-every request waiting at once as one lot -- a run of reads one vector to
-the image and a run of writes another, their blocks with the device
-together, and a flush, a discard or a write of zeros on its own between
-them (`modules/hv/src/disk.rs`).
+memory into the request's buffer -- and hands them to the backend, which
+serves them on a task of its own, on a CPU other than the vCPU's: each
+request started the moment the task finds it, a read or a write of blocks
+its image has with the device asynchronously and a flush, a discard or a
+write of zeros served then and there, once the image's I/O in flight is
+done (`modules/hv/src/disk.rs`; the image's queue, [A disk's
+image](filesystems.md#a-disks-image)). So the disk has every request the
+guest has out, as under KVM, and each comes back when it is done rather
+than with the slowest of a lot -- where the lot was the guest's unit, it
+saw its disk at a depth of what the last lot left out.
 Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
-an interrupt; and as it finishes each the task wakes a halted vCPU or kicks
-a running one out of its guest, the NICs' way ([A network](#a-network)).
-Guest memory is touched on the vCPU's task and nowhere else. At most eight
-requests are out at once, each in a 256 KiB buffer taken when the disk is
-made -- the driver is told a request carries at most 64 segments of a page
-(`seg_max`, `size_max`), and the ring's 256 entries hold three of the
-largest -- so nothing is allocated on the way, and a guest that keeps its
-ring full waits for its disk rather than growing anything of nos's.
+an interrupt; and as it finishes each lot the task wakes a halted vCPU or
+kicks a running one out of its guest, the NICs' way ([A network](#a-network)).
+Guest memory is touched on the vCPU's task and nowhere else. At most 32
+requests are out at once, each in a 256 KiB buffer of the backend's taken
+when the disk is made (`Backend::with_buffer`) -- the driver is told a
+request carries at most 64 segments of a page (`seg_max`, `size_max`) --
+so nothing is allocated on the way, and a guest that keeps its ring full
+waits for its disk rather than growing anything of nos's. The buffers are
+the image's (`kcore::fs::ImageQueue`): its disk reads and writes them as
+they are, so a request's bytes are copied once, between the guest's memory
+and the buffer, on the vCPU.
 
 **The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
 request and gives it back served): the module's `FileDisk` holds the image
@@ -1709,7 +1726,8 @@ only after a write the filesystem had to take itself. Which file it is comes fir
 refused saying whose it is (`Claims`), and only then is it held. The
 report counts each disk's reads, writes, flushes and errors, and the image
 says as it is let go of how many of its batches went off the lock and how
-many through it.
+many through it, and how many requests its queue served with the device
+asynchronously and how many by the batch.
 
 **What a guest no longer needs it gives back -- a chunk at a time.** The disk offers discard
 and a write of zeros (`VIRTIO_BLK_F_DISCARD`, `F_WRITE_ZEROES`; a disk the

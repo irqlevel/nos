@@ -136,10 +136,11 @@ struct Submission {
     targets: [Option<AsyncTarget>; IO_QUEUE_DEPTH],
 
     /* A page of PRP entries for each CID: where a batch's command bigger
-     * than two pages names the rest of its pages. Written under this lock
-     * as the command is made, read by the controller while the command is
-     * in flight -- its CID nobody else's until it is done. None where the
-     * pages could not be had: a batch's commands are two pages at most. */
+     * than two pages names the rest of its pages, and an asynchronous one
+     * likewise. Written under this lock as the command is made, read by the
+     * controller while the command is in flight -- its CID nobody else's
+     * until it is done. None where the pages could not be had: a batch's
+     * commands, and the asynchronous ones, are two pages at most. */
     prp_lists: Option<dma::DmaBuffer>,
 }
 
@@ -718,30 +719,30 @@ impl NvmeDevice {
      * try again after a completion. The completion calls io.done from the
      * ISR above. */
     fn queue_async(&self, io: &BlockIo) -> Result<(), SubmitError> {
-        let (opcode, prp1, prp2, cdw12) = match io.op {
+        /* The pages past the first the transfer reaches: past one more,
+         * the CID's PRP list names them. */
+        let mut pages = 0usize;
+        let (opcode, prp1, mut prp2, cdw12) = match io.op {
             IO_READ | IO_WRITE => {
                 let count = io.count;
                 if count == 0
-                    || count > self.max_transfer
                     || io.sector >= self.capacity
                     || count as u64 > self.capacity - io.sector
                 {
                     return Err(SubmitError::Invalid);
                 }
 
-                /* Two PRP entries, no lists: the first may start anywhere
-                 * dword aligned, the second is the page after it -- the range
-                 * is physically contiguous, the caller's promise. */
+                /* The first PRP entry may start anywhere dword aligned, and
+                 * every page after it is the next -- the range is physically
+                 * contiguous, the caller's promise: the second entry that
+                 * page, or past two pages a list of them (`submit_max`). */
                 let bytes = count as usize * self.sector_size as usize;
                 let offset = io.phys as usize & (PAGE_SIZE - 1);
-                if io.phys & 3 != 0 || offset + bytes > 2 * PAGE_SIZE {
+                pages = (offset + bytes).div_ceil(PAGE_SIZE);
+                if io.phys & 3 != 0 || (pages > 2 && (bytes > self.batch_max || pages > PRP_LIST_ENTRIES + 1)) {
                     return Err(SubmitError::Invalid);
                 }
-                let prp2 = if offset + bytes > PAGE_SIZE {
-                    (io.phys & !(PAGE_SIZE as u64 - 1)) + PAGE_SIZE as u64
-                } else {
-                    0
-                };
+                let prp2 = if pages == 2 { (io.phys & !(PAGE_SIZE as u64 - 1)) + PAGE_SIZE as u64 } else { 0 };
 
                 let write = io.op == IO_WRITE;
                 let fua: u32 = if write && io.fua != 0 { 1 << 30 } else { 0 };
@@ -759,6 +760,23 @@ impl NvmeDevice {
             Some(c) => c as usize,
             None => return Err(SubmitError::Busy),
         };
+        if pages > 2 {
+            /* The pages after the first, in the CID's page of entries: its
+             * own until its command is done. */
+            let first = io.phys & !(PAGE_SIZE as u64 - 1);
+            let at = cid * PAGE_SIZE;
+            let listed = match submission.prp_lists.as_mut() {
+                Some(lists) => (1..pages).all(|k| {
+                    lists.store(at + (k - 1) * PRP_ENTRY_SIZE, first + (k * PAGE_SIZE) as u64)
+                }).then(|| lists.phys() + at as u64),
+                None => None,
+            };
+            let Some(list) = listed else {
+                submission.free_cid(cid as u16);
+                return Err(SubmitError::Invalid);
+            };
+            prp2 = list;
+        }
         submission.async_in_flight += 1;
 
         submission.targets[cid] = Some(AsyncTarget { done: io.done, ctx: io.ctx as usize });
@@ -1135,6 +1153,12 @@ impl BlockDriver for NvmeDevice {
             }
             None => false,
         }
+    }
+
+    /* One asynchronous command moves what a batch's does: past two pages,
+     * through the CID's PRP list. */
+    fn submit_max(&self) -> usize {
+        self.batch_max
     }
 
     /* A kick rings the doorbell whatever became of this command -- the ones

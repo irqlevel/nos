@@ -897,6 +897,9 @@ fn setup_queue(r: &mut Input, write: &mut dyn FnMut(u16, u8, u32), q: &mut Drive
 pub struct DiskState {
     size: u64,
     read_only: bool,
+    /// A request's buffer a slot, as a backend has them, and which of them
+    /// it has the request of.
+    bufs: Vec<Vec<u8>>,
     queue: VecDeque<blk::Request>,
     /// Requests the fuzzer has said are served, to be taken.
     pub ready: usize,
@@ -908,7 +911,8 @@ pub struct DiskState {
 
 impl DiskState {
     pub fn new(size: u64, read_only: bool) -> DiskState {
-        DiskState { size, read_only, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
+        let bufs = (0..blk::IN_FLIGHT).map(|_| vec![0u8; blk::REQUEST_BYTES]).collect();
+        DiskState { size, read_only, bufs, queue: VecDeque::new(), ready: 0, fail: false, order: 0 }
     }
 
     pub fn size(&self) -> u64 {
@@ -930,10 +934,23 @@ impl blk::Backend for Disk {
     fn read_only(&self) -> bool {
         self.0.lock().unwrap().read_only
     }
-    fn submit(&mut self, mut req: blk::Request) {
+    fn with_buffer(&mut self, slot: usize, use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool {
+        let mut s = self.0.lock().unwrap();
+        /* The device reaches a buffer only while the request of it is not
+         * with the backend: a buffer the device fills or empties meanwhile
+         * is a request's data changed under the backend serving it. */
+        invariant!(!s.queue.iter().any(|r| r.slot() == slot), "buffer {} reached while its request is served", slot);
+        match s.bufs.get_mut(slot) {
+            Some(buf) => use_it(buf),
+            None => false,
+        }
+    }
+    fn submit(&mut self, req: blk::Request) {
         let mut s = self.0.lock().unwrap();
         invariant!(s.queue.len() < blk::IN_FLIGHT, "a request past the {} in flight", blk::IN_FLIGHT);
-        let len = req.data().len() as u64;
+        invariant!(req.slot() < blk::IN_FLIGHT && !s.queue.iter().any(|r| r.slot() == req.slot()),
+                   "a request handed over in slot {}, which has one", req.slot());
+        let len = req.len() as u64;
         match req.op() {
             blk::Op::Read | blk::Op::Write => {
                 invariant!(req.offset() % blk::SECTOR == 0, "a request at byte {}, not a sector", req.offset());
@@ -957,7 +974,8 @@ impl blk::Backend for Disk {
         }
         invariant!(!(s.read_only && req.op().writes()), "a write, discard or write of zeros handed to a read-only disk");
         if req.op() == blk::Op::Read {
-            req.data_mut().fill(0xA5);
+            let slot = req.slot();
+            s.bufs[slot][..len as usize].fill(0xA5);
         }
         s.queue.push_back(req);
     }
