@@ -712,6 +712,21 @@ const DEVICE_STATUS: u16 = 0x12;
 const QUEUE_SIZE: u64 = 256;
 const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
+const DESC_INDIRECT: u16 = 4;
+
+/// Chains made with some of their buffers in an indirect table, for
+/// `HV_FUZZ_STATS`.
+static INDIRECT_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A descriptor's sixteen bytes.
+fn descriptor(addr: u64, len: u32, flags: u16, next: u16) -> [u8; 16] {
+    let mut d = [0u8; 16];
+    d[..8].copy_from_slice(&addr.to_le_bytes());
+    d[8..12].copy_from_slice(&len.to_le_bytes());
+    d[12..14].copy_from_slice(&flags.to_le_bytes());
+    d[14..16].copy_from_slice(&next.to_le_bytes());
+    d
+}
 
 /// What a guest's driver keeps of one queue: where it is, and where it has
 /// got to in its descriptors and its available ring.
@@ -799,7 +814,14 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
         return;
     }
     let head = q.next_desc % QUEUE_SIZE;
-    for (i, &(addr, len, write)) in segs.iter().enumerate() {
+    /* Now and then the buffers -- all of them, or all past the first few --
+     * in an indirect table, as a driver that took indirect descriptors makes
+     * a chain: for a device that offers none, a ring it will not follow. */
+    let direct = if r.u8() % 8 == 0 { r.below(segs.len() as u64) as usize } else { segs.len() };
+    if direct < segs.len() {
+        INDIRECT_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    for (i, &(addr, len, write)) in segs[..direct].iter().enumerate() {
         let last = i + 1 == segs.len();
         let mut flags = if write { DESC_WRITE } else { 0 };
         let mut next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
@@ -811,16 +833,45 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
         match r.u8() % 32 {
             0 => next = head as u16,
             1 => next = r.u16(),
-            2 => flags |= 4,
+            2 => flags |= DESC_INDIRECT,
             3 => flags = r.u16(),
             _ => {}
         }
-        let mut d = [0u8; 16];
-        d[..8].copy_from_slice(&addr.to_le_bytes());
-        d[8..12].copy_from_slice(&len.to_le_bytes());
-        d[12..14].copy_from_slice(&flags.to_le_bytes());
-        d[14..16].copy_from_slice(&next.to_le_bytes());
-        mem.put(q.desc(q.next_desc), &d);
+        mem.put(q.desc(q.next_desc), &descriptor(addr, len, flags, next));
+        q.next_desc += 1;
+    }
+    if direct < segs.len() {
+        /* The rest in a table, each entry's next the one after it, and the
+         * descriptor that names it last -- or, sometimes, any of it wrong:
+         * a table of no whole descriptors, one within it, a next past its
+         * end or back to its start, the descriptor that names it with a
+         * next of its own (or a write flag, which the device ignores). */
+        let rest = &segs[direct..];
+        let table = if r.u8() < 230 { gpa_in(r, MEM) & !15 } else { gpa_in(r, MEM) };
+        for (i, &(addr, len, write)) in rest.iter().enumerate() {
+            let last = i + 1 == rest.len();
+            let mut flags = if write { DESC_WRITE } else { 0 } | if last { 0 } else { DESC_NEXT };
+            let mut next = i as u16 + 1;
+            match r.u8() % 48 {
+                0 => next = 0,
+                1 => next = r.u16(),
+                2 => flags |= DESC_INDIRECT,
+                3 => flags = r.u16(),
+                _ => {}
+            }
+            mem.put(table.wrapping_add(16 * i as u64), &descriptor(addr, len, flags, next));
+        }
+        let mut len = 16 * rest.len() as u32;
+        let mut flags = DESC_INDIRECT;
+        match r.u8() % 32 {
+            0 => len = r.value32(),
+            1 => len -= 16,
+            2 => flags |= DESC_NEXT,
+            3 => flags |= DESC_WRITE,
+            _ => {}
+        }
+        let next = ((q.next_desc + 1) % QUEUE_SIZE) as u16;
+        mem.put(q.desc(q.next_desc), &descriptor(table, len, flags, next));
         q.next_desc += 1;
     }
     let slot = u64::from(q.avail_idx) % QUEUE_SIZE;
@@ -1595,7 +1646,8 @@ pub fn report() {
     println!("  pvh: {} images parsed, {} planned, {} built", PVH_PARSED.load(Relaxed), PVH_PLANNED.load(Relaxed),
              PVH_BUILT.load(Relaxed));
     println!("  disks: {} requests given back before one handed over earlier, {} discards and writes of zeros \
-              handed over", DISK_OUT_OF_ORDER.load(Relaxed), RANGES_SERVED.load(Relaxed));
+              handed over; {} chains made with buffers in an indirect table", DISK_OUT_OF_ORDER.load(Relaxed),
+             RANGES_SERVED.load(Relaxed), INDIRECT_MADE.load(Relaxed));
 }
 
 fn pvh(r: &mut Input) {

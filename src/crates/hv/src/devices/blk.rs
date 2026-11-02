@@ -172,9 +172,12 @@ const _: () = assert!(virtio::DEVICE_CONFIG_MSIX as usize + CFG_BYTES <= BAR_SIZ
                       "the configuration fits the BAR, MSI-X's header and all");
 
 pub const SECTOR: u64 = 512;
-/// The queue's size. A request takes a descriptor a segment plus two, so a
-/// ring this size holds three of the largest at once -- and the device has
-/// one on its way back while the backend serves the next.
+/// The queue's size. A request takes one descriptor of it, its buffers in a
+/// table of their own (`virtio::F_INDIRECT_DESC`) -- so a ring this size
+/// holds every request the device takes at once and as many again waiting.
+/// Without indirect descriptors a request takes a descriptor a segment plus
+/// two: three of the largest at once, 768 KiB -- all a guest writing its
+/// disk in megabytes had with it, whatever its queue's depth.
 const QUEUE_SIZE: u16 = 256;
 /// The most chains taken off the queue in one pass: a queue's worth, all a
 /// driver can have available at once. A request answered here -- a GET_ID,
@@ -188,7 +191,8 @@ const PASS: usize = QUEUE_SIZE as usize;
 /// have, flush, a disk that is read-only, and -- one that is not -- discard
 /// and a write of zeros; and the ring's EVENT_IDX, the device asking for a
 /// kick only when it has taken every chain there was, and none while its
-/// buffers are all with the backend -- a buffer coming back has it look.
+/// buffers are all with the backend -- a buffer coming back has it look --
+/// and its indirect descriptors (`QUEUE_SIZE`).
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
 const F_RO: u32 = 1 << 5;
@@ -329,7 +333,8 @@ impl Blk {
         /* A disk that may only be read has nothing to give back. */
         let ro = if backend.read_only() { F_RO } else { F_DISCARD | F_WRITE_ZEROES };
         Ok(Blk {
-            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | ro, queues),
+            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC | ro,
+                                      queues),
             backend,
             slots,
             waiting: false,
