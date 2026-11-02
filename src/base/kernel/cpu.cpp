@@ -67,6 +67,23 @@ void Cpu::idle()
        path); safe here because interrupts are enabled. */
     get_task_queue().reap_exited();
 
+    /* Nothing to idle for while another task can run: given the CPU now,
+       rather than slept on until the next interrupt does. Out of its idling
+       -- woken, round the loop, at the reap -- the idle task is counted as
+       any task (TaskQueue::count_idle), and an interrupt's decision leaves
+       the CPU to the task it lands on unless another's deadline is sooner:
+       one woken then, a slice's deadline as late as the idle task's, waited
+       on the list while the idle task went back to idling -- until its slice
+       ended on the timer, 3 ms on. A guest's vCPU woken just after another
+       interrupt of its CPU's -- its disk's completion, a ring from another
+       vCPU -- waited so: its guest's timer interrupts 1-3 ms late, and at a
+       disk's queue depth of 32 every request. */
+    if (get_task_queue().get_runnable_count() > 0)
+    {
+        yield_to_runnable();
+        return;
+    }
+
     /* The last resort from here until it wakes: an interrupt that finds
        something else to run switches to it and leaves this task in its
        place, rather than in the turns (Task::set_idling). Not before the
