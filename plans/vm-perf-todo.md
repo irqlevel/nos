@@ -87,7 +87,14 @@ the task woken), where KVM's ioeventfd only signals its iothread.
 - The notify's own cost: profile the vCPU's host CPU during the QD32 job
   (`docs/profiler.md`) to see where its 4-5 us go before moving any of it --
   the pass could hand the chain over and leave the rest to the disk's task.
-- At QD1 a completion goes from the disk's task to the first vCPU, whose
+- At QD1 the requests sent as they come lost about 4 us each against the
+  batches they replaced (reads 91% -> 83% of KVM, writes 81% -> 74%): the
+  disk's task sleeps on its queue's event between a request and its
+  completion (`block::queue::wait`), and the NVMe's interrupt wakes it, where
+  a batch waited on the NVMe's `WaitGroup`, which spins on `schedule()` and
+  never sleeps. A short poll of the completion ring before the sleep, grown
+  and dropped as the halt poll is -- QEMU's iothread polls its AioContext so.
+- Then a completion goes from the disk's task to the first vCPU, whose
   round gives it to the guest (`run.rs`: the devices' rounds are the first
   CPU's): a wake more than KVM's irqfd, when the job is on another CPU.
 
