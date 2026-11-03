@@ -45,7 +45,8 @@ bool TraceRing::init(ulong chunks, ulong tag)
         return false;
     for (ulong i = 0; i < chunks; i++)
     {
-        table[i] = static_cast<u64*>(mm::alloc(CHUNK_BYTES, tag));
+        /* Zeroed below, once: mm::alloc would zero it too */
+        table[i] = static_cast<u64*>(mm::alloc_uninit(CHUNK_BYTES, tag));
         if (table[i] == nullptr)
         {
             /* Nothing kept of a part: given back in the reverse order. */

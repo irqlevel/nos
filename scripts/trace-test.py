@@ -44,7 +44,7 @@ SCHED_RECORD = re.compile(r"^\s*\d+\.\d{6}\s+(\d+)\s+([a-z_]+): (.*)$")
 SWITCH = re.compile(
     r"prev_pid=(\d+) prev_comm=(\S+) next_pid=(\d+) next_comm=(\S+) next_cpu=(\d+) "
     r"prev_state=(\w+) reason=(\w+)$")
-WAKEUP = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) deadline=([01]) waker_pid=(\d+)$")
+WAKEUP = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) deadline=([01]) waker_pid=(\d+) late_ns=([0-9.]+)us$")
 BLOCK = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) deadline=([01]) ran_ns=([0-9.]+)us$")
 MIGRATE = re.compile(r"pid=(\d+) comm=(\S+) from=(\d+) to=(\d+)$")
 IPI = re.compile(r"cpu=(\d+) tasks=(\d+)$")
@@ -55,8 +55,12 @@ LATENCY = re.compile(
     r"trace latency: (\d+) records on (\d+) cpus -- (\d+) wakeups, (\d+) ran in the window, (\d+) not run in it")
 PERCENTILES = re.compile(r"wait p50 (\S+) p90 (\S+) p99 (\S+) max (\S+)")
 LONGEST = re.compile(r"^\s+(\S+) pid (\d+) (\S+)\s+cpu (\d+) -> (\d+)$")
-WAIT_TIME = re.compile(r"^\d+(\.\d+)?(ns|us|ms)$")
+WAIT_TIME = re.compile(r"^\d+(\.\d+)?(ns|us|ms|s)$")
 DUMPED = re.compile(r'^\s*\{"t":(\d+),"cpu":(\d+),"ev":(null|"[a-z_]+")')
+# `trace list`'s lines: on or off, the event, its group
+LISTED = re.compile(r"^\s*(on|off)\s+([a-z_]+)\s+([a-z_]+)\s", re.M)
+# `trace stat`'s rows: cpu, written, kept, dropped
+STAT_ROW = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", re.M)
 
 
 def sched_records(reply):
@@ -87,8 +91,12 @@ def held_sched(records):
             if m.group(2) == "idle0" and m.group(4) == "idle0":
                 return f"a switch from a task to itself: {fields}"
         elif name == "sched_wakeup":
-            if not WAKEUP.match(fields):
+            m = WAKEUP.match(fields)
+            if not m:
                 return f"a sched_wakeup not as its description says: {fields}"
+            # Only a deadline's is late: an unblock()'s is the moment it came
+            if m.group(4) == "0" and float(m.group(6)) != 0:
+                return f"an unblock()'s sched_wakeup late past a deadline it has none of: {fields}"
         elif name == "sched_block":
             m = BLOCK.match(fields)
             if not m or float(m.group(5)) < 0:
@@ -108,6 +116,9 @@ def held_sched(records):
             m = PREEMPT_DEFERRED.match(fields)
             if not m or int(m.group(3)) != cpu:
                 return f"a sched_preempt_deferred not as its description says: {fields}"
+            # Deferred because preemption was off: the count as found, 1 up
+            if int(m.group(4)) < 1:
+                return f"a reschedule deferred with preemption on: {fields}"
         elif name in ("idle_enter", "idle_exit"):
             m = IDLE.match(fields)
             if not m or int(m.group(1)) != cpu:
@@ -117,6 +128,20 @@ def held_sched(records):
             if not m or int(m.group(1)) != cpu:
                 return f"a sched_slice not as its description says: {fields}"
     return None
+
+
+# How far a block's ran_ns may be from what its records' times say: each
+# time is read a few hundred ns from the clock the field was computed from
+RAN_SLACK_NS = 50000
+
+
+def dumped_records(reply):
+    """The records `trace dump` printed, as objects, oldest first."""
+    out = []
+    for line in reply.splitlines():
+        if DUMPED.match(line.strip()):
+            out.append(json.loads(line[line.find("{"):]))
+    return out
 
 
 def test_records(reply):
@@ -276,7 +301,11 @@ def exercise(shell):
     nb.check("1 events off" in shell.run("trace off debug"), "trace off debug")
 
     shell.run("trace off all")
-    nb.check("no rings" not in shell.run("trace stat"), "trace off all keeps the rings")
+    reply = shell.run("trace stat")
+    kept = [int(m.group(3)) for m in STAT_ROW.finditer(reply)]
+    nb.check("none made yet" not in reply and len(kept) > 0 and sum(kept) > 0,
+             f"trace off all keeps the rings and what they hold ({sum(kept)} records)")
+    ring_cpus = {int(m.group(1)) for m in STAT_ROW.finditer(reply)}
 
     # `trace latency`: the window's wakeups, each paired with the switch
     # that answered it. Sched alone -- the idle events of a few CPUs fill a
@@ -301,8 +330,8 @@ def exercise(shell):
                  "each a time in ns, us or ms: " + " ".join(p.groups()))
     longest = [LONGEST.match(line) for line in reply.splitlines() if LONGEST.match(line)]
     nb.check(0 < len(longest) <= 5, f"{len(longest)} of the longest waits, five at most")
-    nb.check(all(int(m.group(4)) < 64 and int(m.group(5)) < 64 for m in longest),
-             "each with the cpus it was woken on and ran on")
+    nb.check(all(int(m.group(4)) in ring_cpus and int(m.group(5)) in ring_cpus for m in longest),
+             f"each with the cpus it was woken on and ran on, of the {len(ring_cpus)} with rings")
 
     # `trace freeze wakeup>N`: armed, the rings freeze on the first wait
     # over N, and what froze them is there to read. Armed first at a second
@@ -336,6 +365,9 @@ def exercise(shell):
     shell.run("trace clear")
     shell.run("sched probe spinners=1 ms=200")
     reply = shell.run("trace dump 20", timeout=60)
+    header = [json.loads(line[line.find("{"):]) for line in reply.splitlines() if '{"window"' in line]
+    nb.check(len(header) == 1 and header[0]["window"].get("records") == 20,
+             "the dump's first line says what its window holds, and from when it is whole")
     lines = [line.strip() for line in reply.splitlines() if DUMPED.match(line.strip())]
     nb.check(len(lines) == 20, f"trace dump printed 20 records ({len(lines)})")
     parsed = []
@@ -366,6 +398,106 @@ def exercise(shell):
                  "and a wakeup as an instant event")
     finally:
         shutil.rmtree(dump_dir, ignore_errors=True)
+
+    # A window's words: a group names its events, as `trace on` takes it;
+    # a word that names nothing is refused, not taken as a filter that
+    # matches nothing and shows an empty trace.
+    groups = {m.group(2): m.group(3) for m in LISTED.finditer(shell.run("trace list"))}
+    shell.run("trace off all")
+    shell.run("trace on sched")
+    shell.run("sched probe spinners=1 ms=100")
+    recs = sched_records(shell.run("trace show 30 sched", timeout=60))
+    nb.check(len(recs) > 0 and all(groups.get(n) == "sched" for _, n, _ in recs),
+             f"trace show sched shows the group's events and only them ({len(recs)})")
+    nb.check("no event or group called nonesuch" in shell.run("trace show 5 nonesuch"),
+             "a window's word that names nothing refused")
+    nb.check("a window is 1 to 4096 records" in shell.run("trace show 0"), "a window of no records refused")
+    nb.check("no running cpu 63" in shell.run("trace show 5 cpu=63"), "a window of a cpu not running refused")
+
+    # What a block says it ran is the stretch from the switch that gave the
+    # task its CPU -- read from the dump, its ns whole -- not from the last
+    # decision that let it keep it. `trace bench` keeps the shell's command
+    # task on its CPU some 10 ms, across the tick's decisions that leave it
+    # there, before it blocks for the next command.
+    shell.run("trace off all")
+    shell.run("trace on sched_switch,sched_block")
+    shell.run("trace clear")
+    shell.run("sched probe spinners=2 ms=200")
+    shell.run("trace bench", timeout=120)
+    dumped = dumped_records(shell.run("trace dump 150", timeout=60))
+    switched_in = {}
+    held, worst = 0, 0
+    for r in dumped:
+        if r["ev"] == "sched_switch":
+            switched_in[r["cpu"]] = (r["f"]["next_pid"], r["t"])
+        elif r["ev"] == "sched_block":
+            got = switched_in.get(r["cpu"])
+            if got and got[0] == r["f"]["pid"]:
+                worst = max(worst, abs(r["f"]["ran_ns"] - (r["t"] - got[1])))
+                held += 1
+    nb.check(held > 0 and worst < RAN_SLACK_NS,
+             f"every block's ran_ns the stretch since its switch in ({held} of them, {worst} ns off at most)")
+
+    # A task's records in the order it lived: none switched to before its
+    # sched_new, and none's sched_exit after a later task's sched_new under
+    # its pid -- each written before the hand-off that lets the other side on.
+    shell.run("trace off all")
+    shell.run("trace on sched_new,sched_exit,sched_switch")
+    shell.run("trace clear")
+    shell.run("sched probe spinners=2 ms=20")
+    dumped = dumped_records(shell.run("trace dump 150", timeout=60))
+    news = [i for i, r in enumerate(dumped) if r["ev"] == "sched_new"]
+    nb.check(len(news) > 0, f"the probe's tasks made in the window ({len(news)})")
+    problem = None
+    for i in news:
+        pid, comm = dumped[i]["f"]["pid"], dumped[i]["f"]["comm"]
+        exits = [j for j in range(i) if dumped[j]["ev"] == "sched_exit" and dumped[j]["f"]["pid"] == pid]
+        since = exits[-1] + 1 if exits else 0
+        if any(r["ev"] == "sched_switch" and r["f"]["next_pid"] == pid for r in dumped[since:i]):
+            problem = f"pid {pid} ({comm}) switched to before its sched_new"
+        later = [r for r in dumped[i + 1:] if r["ev"] in ("sched_exit", "sched_new") and r["f"]["pid"] == pid]
+        if later and later[0]["ev"] == "sched_exit" and later[0]["f"]["comm"] != comm:
+            problem = f"pid {pid}: {later[0]['f']['comm']}'s sched_exit after {comm}'s sched_new"
+    nb.check(problem is None, "each task's records in the order it lived" + (f" ({problem})" if problem else ""))
+
+    # An idle is over before its CPU switches to anything: every switch on a
+    # CPU falls outside its idle_enter and idle_exit.
+    shell.run("trace off all")
+    shell.run("trace on idle sched_switch")
+    shell.run("trace clear")
+    shell.run("sched probe spinners=1 ms=20")
+    dumped = dumped_records(shell.run("trace dump 150", timeout=60))
+    inside, problem, enters = {}, None, 0
+    for r in dumped:
+        cpu = r["cpu"]
+        if r["ev"] == "idle_enter":
+            if inside.get(cpu):
+                problem = f"cpu {cpu}: an idle_enter inside an idle"
+            inside[cpu] = True
+            enters += 1
+        elif r["ev"] == "idle_exit":
+            inside[cpu] = False
+        elif r["ev"] == "sched_switch" and inside.get(cpu):
+            problem = f"cpu {cpu}: a switch to {r['f']['next_comm']} inside an idle"
+    nb.check(enters > 0 and problem is None,
+             f"every switch outside its CPU's idles ({enters} idles)" + (f" ({problem})" if problem else ""))
+
+    # `trace bench` times a ring of its own: no CPU's ring moves under it
+    shell.run("trace off all")
+    before = [(int(m.group(1)), int(m.group(2))) for m in STAT_ROW.finditer(shell.run("trace stat"))]
+    nb.check("into a ring of its own" in shell.run("trace bench"), "trace bench times one that is on")
+    after = [(int(m.group(1)), int(m.group(2))) for m in STAT_ROW.finditer(shell.run("trace stat"))]
+    nb.check(before == after and len(before) > 0, "and no cpu's ring was written by it")
+
+    # Frozen rings say so wherever a trace would look empty, and `trace free`
+    # is the state before the first `trace on`: thawed.
+    shell.run("trace freeze")
+    nb.check("the rings are frozen" in shell.run("trace on test"), "trace on says the rings are frozen")
+    nb.check("frozen -- `trace thaw` first" in shell.run("trace test 5"), "trace test refuses frozen rings")
+    shell.run("trace free")
+    shell.run("trace on test")
+    nb.check("5 test records" in shell.run("trace test 5") and len(test_records(shell.run("trace show 5 test"))) == 5,
+             "after trace free the next rings record")
 
     shell.run("trace off all")
     shell.run("trace free")

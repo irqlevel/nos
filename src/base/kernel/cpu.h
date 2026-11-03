@@ -150,7 +150,8 @@ private:
     /* Set by park(), last; see is_parked */
     Atomic parked_;
 
-    void idle_mwait();
+    void idle_mwait(Task* self);
+    void idle_ended(Task* self);
 
     void local_timer_arm(ulong when, ulong now);
 

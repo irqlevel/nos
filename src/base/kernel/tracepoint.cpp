@@ -1,10 +1,12 @@
 #include "tracepoint.h"
 #include "trace_ring.h"
+#include "trace_window.h"
 
 #include "cpu.h"
 #include "klog.h"
 #include "mutex.h"
 #include "panic.h"
+#include "preempt.h"
 #include "task.h"
 #include "time.h"
 #include <hal/barrier.h>
@@ -82,6 +84,9 @@ const Field SCHED_WAKEUP_FIELDS[] = {
     /* Who woke it: the task the waker ran on -- the one an interrupt landed
        on, for a wakeup from an interrupt's context */
     { "waker_pid", __builtin_offsetof(SchedWakeup, waker_pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* A deadline's: how late the sleep list was walked past it -- the wait
+       is counted from the deadline */
+    { "late_ns", __builtin_offsetof(SchedWakeup, late_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
 };
 
 const Field SCHED_BLOCK_FIELDS[] = {
@@ -160,7 +165,8 @@ const Event EVENTS[COUNT] = {
       sizeof(SchedMigrate), sizeof(SCHED_MIGRATE_FIELDS) / sizeof(SCHED_MIGRATE_FIELDS[0]), SCHED_MIGRATE_FIELDS },
     { "sched_new", "sched", "a task put on a CPU's queue for the first time it runs",
       sizeof(SchedNew), sizeof(SCHED_NEW_FIELDS) / sizeof(SCHED_NEW_FIELDS[0]), SCHED_NEW_FIELDS },
-    { "sched_exit", "sched", "a task that has exited, and whose CPU takes its last reference and its stack",
+    { "sched_exit", "sched", "a task that has exited, as it gives its pid back: before any later task can be "
+      "given that pid",
       sizeof(SchedExit), sizeof(SCHED_EXIT_FIELDS) / sizeof(SCHED_EXIT_FIELDS[0]), SCHED_EXIT_FIELDS },
     { "sched_ipi", "sched", "an interrupt another CPU sent, and the queued work it found: a wakeup's reschedule, a "
       "TLB shootdown",
@@ -171,7 +177,8 @@ const Event EVENTS[COUNT] = {
       SCHED_PREEMPT_DEFERRED_FIELDS },
     { "idle_enter", "idle", "a CPU with nothing to run, about to halt",
       sizeof(Idle), sizeof(IDLE_FIELDS) / sizeof(IDLE_FIELDS[0]), IDLE_FIELDS },
-    { "idle_exit", "idle", "that CPU back from the halt",
+    { "idle_exit", "idle", "that CPU's idle over: the halt returned, or a decision took the CPU from the idle "
+      "task first",
       sizeof(Idle), sizeof(IDLE_FIELDS) / sizeof(IDLE_FIELDS[0]), IDLE_FIELDS },
     { "sched_slice", "debug", "the slice the current task was given, from the decision that armed this CPU's timer "
       "for its deadline",
@@ -214,26 +221,53 @@ struct WakeupTrigger
 
 WakeupTrigger trigger = {};
 
-/* Disarm the trigger: the next one armed starts from nothing. Task context
-   (`trace freeze`, `trace thaw`); a firing already claimed finishes. */
-void disarm_trigger()
+/* The trigger off, and every firing of what was armed before done with:
+   note_wakeup runs with interrupts off (TaskQueue::note_run, inside the
+   decision), so a CPU that has taken an interrupt since the threshold went
+   to 0 is out of any note_wakeup that read the old one -- its record
+   written, its freeze and its threshold of 0 stored -- and none can land
+   after what the caller does next. With `forget`, what it fired on is
+   forgotten as well. Under control(); task context. */
+void disarm_trigger(bool forget)
 {
     __atomic_store_n(&wakeup_trigger_ns, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&trigger.claim, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&trigger.seq, 0, __ATOMIC_RELEASE);
+    hal::smp_mb();
+    CpuTable::get_instance().synchronize("trace trigger");
+    if (forget)
+    {
+        __atomic_store_n(&trigger.claim, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&trigger.seq, 0, __ATOMIC_RELEASE);
+    }
+}
+
+/* Armed at `over_ns`, recording: whatever it fired on before forgotten,
+   and the rings thawed -- a frozen ring has nothing for it to keep. Under
+   control(). */
+void arm_trigger(u64 over_ns)
+{
+    disarm_trigger(true);
+    __atomic_store_n(&frozen, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&wakeup_trigger_ns, over_ns, __ATOMIC_RELEASE);
 }
 
 /* What the trigger fired on, if it has: a seqlock read of the record, as a
-   ring slot's is. False before any firing. */
-bool triggered(WakeupTrigger& out)
+   ring slot's is. False before any firing; false and `busy` when it was
+   being written at every look -- a writer has interrupts off for a few
+   stores, so that is a report, not a wait. */
+bool triggered(WakeupTrigger& out, bool& busy)
 {
-    for (;;)
+    const ulong LOOKS = 1000;
+    busy = false;
+    for (ulong look = 0; look < LOOKS; look++)
     {
         u32 seq = __atomic_load_n(&trigger.seq, __ATOMIC_ACQUIRE);
         if (seq == 0)
             return false;
         if ((seq & 1) != 0)
+        {
+            cpu_relax();
             continue;
+        }
         out.seq = seq;
         out.claim = 1;
         out.waited_ns = __atomic_load_n(&trigger.waited_ns, __ATOMIC_RELAXED);
@@ -245,6 +279,17 @@ bool triggered(WakeupTrigger& out)
         if (__atomic_load_n(&trigger.seq, __ATOMIC_ACQUIRE) == seq)
             return true;
     }
+    busy = true;
+    return false;
+}
+
+/* Back to recording, with no trigger and nothing it fired on: what
+   `trace thaw` does, and `trace free` and `trace size`, whose rings are
+   new. Under control(). */
+void thaw()
+{
+    disarm_trigger(true);
+    __atomic_store_n(&frozen, 0, __ATOMIC_RELEASE);
 }
 
 /* The size `trace on` makes each CPU's ring at, in KiB: a chunk's (64 KiB)
@@ -348,15 +393,6 @@ bool have_rings()
 
 /* ---- reading ---- */
 
-/* One CPU's records for `trace show`: the newest `want` of them still in its
-   ring, oldest first. */
-struct Window
-{
-    TraceRing::Record* records;
-    ulong count;
-    ulong next;
-};
-
 /* Nanoseconds since boot of a record taken at `cycles`, given the counter
    and the clock read together at `now_cycles` and `now_ns`. */
 ulong record_ns(u64 cycles, u64 now_cycles, ulong now_ns)
@@ -453,26 +489,30 @@ void print_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
     con.printf("\n");
 }
 
-/* Whether `name` is in the comma- or space-separated list of `filter`'s
-   words; every name is, for no filter. */
-bool name_in(const char* name, const char* const* filter, ulong filter_count)
+/* Whether `word` names events -- one's name, a group's, or `all` -- with
+   their bits put into `mask`. */
+bool name_mask(const char* word, EventMask& mask)
 {
-    if (filter_count == 0)
-        return true;
-    for (ulong i = 0; i < filter_count; i++)
+    bool found = false;
+    for (ulong i = 0; i < COUNT; i++)
     {
-        if (stdlib::str_cmp(filter[i], name) == 0)
-            return true;
+        if (stdlib::str_cmp(word, "all") == 0 || stdlib::str_cmp(word, EVENTS[i].name) == 0
+            || stdlib::str_cmp(word, EVENTS[i].group) == 0)
+        {
+            mask |= event_bit(i);
+            found = true;
+        }
     }
-    return false;
+    return found;
 }
 
-/* The newest `count` records of every ring (or of cpu `only`), those of the
-   events `filter` names, per CPU and oldest first: what show, dump and
-   latency walk. Returns how many there are, across the CPUs. Under
-   control(). A CPU whose ring would not fit in memory is left out, said. */
-ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only,
-    const char* const* filter, ulong filter_count)
+/* The window show, dump and latency read: the newest `count` records of the
+   events in `mask` of every ring -- or of cpu `only`'s -- a Window a CPU,
+   each oldest first (read_window): how many there are across them. Under
+   control(); what it holds is the caller's, given back by release_windows.
+   A CPU whose part will not fit in memory is said and left out, its part
+   marked COMPLETE_NEVER: no wait is paired across a CPU nobody read. */
+ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only, EventMask mask)
 {
     ulong total = 0;
     for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
@@ -482,38 +522,29 @@ ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong
         if (ring == nullptr || (only != MAX_CPUS && cpu != only))
             continue;
 
+        /* Room for `count`, but no more than the ring holds or was written
+           since the clear */
         u64 head = ring->head();
-        u64 from = cleared_at[cpu];
-        if (head > ring->capacity() && head - ring->capacity() > from)
-            from = head - ring->capacity();
-        /* A filter's records are found among more than `count`: the window
-           is the whole ring then, bounded by what is printed at most. */
-        ulong span = (filter_count == 0) ? count : SHOW_MAX;
-        if (head > from && head - from > span)
-            from = head - span;
-        if (head <= from)
+        if (head <= cleared_at[cpu])
+            continue;
+        ulong want = count;
+        if (want > ring->capacity())
+            want = ring->capacity();
+        if (head - cleared_at[cpu] < want)
+            want = (ulong)(head - cleared_at[cpu]);
+        if (want == 0)
             continue;
 
-        ulong want = (ulong)(head - from);
         auto records = static_cast<TraceRing::Record*>(mm::alloc(want * sizeof(TraceRing::Record), TAG));
         if (records == nullptr)
         {
-            con.printf("trace: no memory to read cpu %lu's ring\n", cpu);
+            con.printf("trace: no memory to read cpu %lu's ring: left out\n", cpu);
+            windows[cpu].complete_from = COMPLETE_NEVER;
             continue;
         }
-
-        ulong kept = 0;
-        for (u64 index = from; index < head; index++)
-        {
-            TraceRing::Record& r = records[kept];
-            if (!ring->read(index, r))
-                continue;
-            if (r.id < COUNT && !name_in(EVENTS[r.id].name, filter, filter_count))
-                continue;
-            r.cpu = (u32)cpu;
-            kept++;
-        }
-        windows[cpu] = { records, kept, 0 };
+        u64 complete;
+        ulong kept = read_window(*ring, cleared_at[cpu], want, mask, (u32)cpu, records, complete);
+        windows[cpu] = { records, kept, 0, complete };
         total += kept;
     }
     return total;
@@ -526,26 +557,8 @@ void release_windows(Window windows[MAX_CPUS])
     {
         if (windows[cpu].records != nullptr)
             mm::free(windows[cpu].records);
+        windows[cpu] = {};
     }
-}
-
-/* The next record of the windows, oldest first across the CPUs: what a walk
-   of them takes one at a time. False when they are spent. */
-bool next_record(Window windows[MAX_CPUS], const TraceRing::Record*& out)
-{
-    ulong best = MAX_CPUS;
-    for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
-    {
-        const Window& w = windows[cpu];
-        if (w.next >= w.count)
-            continue;
-        if (best == MAX_CPUS || w.records[w.next].cycles < windows[best].records[windows[best].next].cycles)
-            best = cpu;
-    }
-    if (best == MAX_CPUS)
-        return false;
-    out = &windows[best].records[windows[best].next++];
-    return true;
 }
 
 /* The clock and the counter together, once: every record's time is counted
@@ -558,21 +571,81 @@ void now_point(u64& now_cycles, ulong& now_ns)
     hal::irq_restore(flags);
 }
 
-/* The newest `count` records of every ring (or of cpu `only`), merged by
-   their cycle counts, of the events `filter` names. Under control(). */
-void show(stdlib::Printer& con, ulong count, ulong only, const char* const* filter, ulong filter_count)
+/* Why there is nothing to show: no ring, or the rings frozen, or nothing in
+   them. */
+void nothing_recorded(stdlib::Printer& con)
 {
-    Window windows[MAX_CPUS] = {};
-    ulong total = collect(windows, con, count, only, filter, filter_count);
+    if (!have_rings())
+        con.printf("trace: nothing recorded -- no event has been turned on\n");
+    else if (__atomic_load_n(&frozen, __ATOMIC_RELAXED))
+        con.printf("trace: nothing recorded -- the rings are frozen: `trace thaw` to record\n");
+    else
+        con.printf("trace: nothing recorded\n");
+}
+
+/* The cycle count of the window's first record past the `skip` oldest: where
+   what is shown begins. The windows' places are put back. */
+u64 first_shown(Window windows[MAX_CPUS], ulong skip)
+{
+    const TraceRing::Record* r = nullptr;
+    u64 first = 0;
+    for (ulong taken = 0; merge_next(windows, MAX_CPUS, r); taken++)
+    {
+        if (taken == skip)
+        {
+            first = r->cycles;
+            break;
+        }
+    }
+    for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
+        windows[cpu].next = 0;
+    return first;
+}
+
+/* A CPU's part of what is shown that begins later than the rest -- its older
+   records written over, or left out for room -- said, so that its silence
+   before then is not read as a CPU that did nothing. */
+void say_cut(stdlib::Printer& con, Window windows[MAX_CPUS], ulong skip, u64 now_cycles, ulong now_ns)
+{
+    u64 first = first_shown(windows, skip);
+    for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
+    {
+        u64 from = windows[cpu].complete_from;
+        if (from == COMPLETE_NEVER)
+        {
+            con.printf("trace: cpu %lu: nothing of it could be read\n", cpu);
+            continue;
+        }
+        if (from == 0 || from <= first)
+            continue;
+        ulong ns = record_ns(from, now_cycles, now_ns);
+        con.printf("trace: cpu %lu: nothing before %lu.%06lu -- its older records were written over\n", cpu,
+            ns / consts::NANO_SECS_IN_SEC, (ns / consts::NANO_SECS_IN_USEC) % USECS_IN_SEC);
+    }
+}
+
+/* The newest `count` records of every ring (or of cpu `only`'s), merged by
+   their cycle counts, of the events in `mask`. Takes control() to read the
+   rings, and prints with it let go. */
+void show(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+{
+    Window windows[MAX_CPUS];
+    ulong total;
+    {
+        stdlib::AutoLock lock(control());
+        total = collect(windows, con, count, only, mask);
+    }
     u64 now_cycles;
     ulong now_ns;
     now_point(now_cycles, now_ns);
 
     /* Merged oldest first, the oldest past the newest `count` passed over. */
     ulong skip = (total > count) ? total - count : 0;
+    if (total != 0)
+        say_cut(con, windows, skip, now_cycles, now_ns);
     const TraceRing::Record* r;
     ulong taken = 0;
-    while (next_record(windows, r))
+    while (merge_next(windows, MAX_CPUS, r))
     {
         if (taken++ < skip)
             continue;
@@ -581,7 +654,7 @@ void show(stdlib::Printer& con, ulong count, ulong only, const char* const* filt
 
     release_windows(windows);
     if (total == 0)
-        con.printf("trace: nothing recorded%s\n", have_rings() ? "" : " -- no event has been turned on");
+        nothing_recorded(con);
 }
 
 /* ---- `trace dump`: the window as JSON lines, a record a line ---- */
@@ -657,46 +730,52 @@ void dump_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
     con.printf("}}\n");
 }
 
-void dump(stdlib::Printer& con, ulong count, ulong only, const char* const* filter, ulong filter_count)
+void dump(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
 {
-    Window windows[MAX_CPUS] = {};
-    ulong total = collect(windows, con, count, only, filter, filter_count);
+    Window windows[MAX_CPUS];
+    ulong total;
+    {
+        stdlib::AutoLock lock(control());
+        total = collect(windows, con, count, only, mask);
+    }
     u64 now_cycles;
     ulong now_ns;
     now_point(now_cycles, now_ns);
 
+    if (total == 0)
+    {
+        release_windows(windows);
+        nothing_recorded(con);
+        return;
+    }
+
+    /* The window first: how many records follow, and from when on none of
+       them is missing -- where a reader of the dump may pair waits from, as
+       `trace latency` does (scripts/trace-decode.py): 0 when nothing is,
+       null when a CPU's part could not be read at all. */
     ulong skip = (total > count) ? total - count : 0;
+    ulong limit_cpu;
+    u64 start = window_start(windows, MAX_CPUS, limit_cpu);
+    con.printf("{\"window\":{\"records\":%lu,\"complete_from\":", total - skip);
+    if (start == COMPLETE_NEVER)
+        con.printf("null,\"cpu\":%lu}}\n", limit_cpu);
+    else if (start == 0)
+        con.printf("0,\"cpu\":null}}\n");
+    else
+        con.printf("%lu,\"cpu\":%lu}}\n", record_ns(start, now_cycles, now_ns), limit_cpu);
+
     const TraceRing::Record* r;
     ulong taken = 0;
-    while (next_record(windows, r))
+    while (merge_next(windows, MAX_CPUS, r))
     {
         if (taken++ < skip)
             continue;
         dump_record(con, *r, record_ns(r->cycles, now_cycles, now_ns));
     }
     release_windows(windows);
-    if (total == 0)
-        con.printf("trace: nothing recorded%s\n", have_rings() ? "" : " -- no event has been turned on");
 }
 
 /* ---- `trace latency`: how long a woken task waited for its CPU ---- */
-
-/* The pids a task's can be: ObjectTable's ids, 0 to 255 -- its
-   MAX_OBJECT_ID, which it does not lend out. A wakeup's table by pid, then,
-   with no map and no allocation on the walk. */
-const ulong PID_SLOTS = 256;
-
-/* One wakeup that a switch in the window answered. */
-struct WakeWait
-{
-    /* Clamped to what a u32 holds of ns */
-    u32 ns;
-    u32 pid;
-    u16 woken_cpu;
-    u16 ran_cpu;
-    /* The task's name, terminated for the print */
-    char comm[COMM_BYTES + 1];
-};
 
 /* A wait as text: ns, then us, then ms, then s, three decimals past the
    point -- the units a person reads a scheduler's waits in. */
@@ -715,229 +794,150 @@ void wait_text(char* to, ulong len, u64 ns)
             (ulong)((ns / consts::NANO_SECS_IN_MS) % 1000));
 }
 
-/* One range on the sort's own stack: checked before it is written, so that a
-   count past what the stack holds is a report rather than a smashed frame --
-   the smaller-half rule keeps it within log2 of the count, 13 for the 4096
-   records a window is at most. */
-bool push_range(long* stack_lo, long* stack_hi, ulong& top, ulong most, long lo, long hi)
-{
-    if (top >= most)
-    {
-        BUG_ON(top >= most);
-        return false;
-    }
-    stack_lo[top] = lo;
-    stack_hi[top] = hi;
-    top++;
-    return true;
-}
+void print_waits(stdlib::Printer& con, const WakePairing& pairing, WakeWait* waits, ulong walked, ulong cpus,
+    u64 start, ulong limit_cpu, u64 now_cycles, ulong now_ns);
 
-/* The array, smallest first: quicksort, the smaller half sorted in the loop
-   and the larger stacked. Signed indices: the two walks meet at the ends,
-   and `j` below `lo` must end the loop rather than wrap. */
-void sort_u32(u32* v, ulong n)
+/* Each wakeup of the window `trace show` prints paired with the first
+   switch to its task after it (WakePairing): the waits' percentiles, and
+   the longest with their tasks and CPUs. Only from where every CPU's part
+   of the window is whole (window_start): before, a wakeup's switch may be
+   among what a ring lost. */
+void latency(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
 {
-    const ulong STACK_MAX = 32;
-    long stack_lo[STACK_MAX];
-    long stack_hi[STACK_MAX];
-    ulong top = 0;
-    if (n > 1 && !push_range(stack_lo, stack_hi, top, STACK_MAX, 0, (long)n - 1))
-        return;
-
-    while (top != 0)
+    Window windows[MAX_CPUS];
+    ulong total;
     {
-        top--;
-        long lo = stack_lo[top];
-        long hi = stack_hi[top];
-        while (lo < hi)
-        {
-            /* A value of the range's own: each walk stops at it at the
-               latest, so neither passes the ends */
-            u32 pivot = v[lo + (hi - lo) / 2];
-            long i = lo;
-            long j = hi;
-            while (i <= j)
-            {
-                while (v[i] < pivot)
-                    i++;
-                while (v[j] > pivot)
-                    j--;
-                if (i <= j)
-                {
-                    u32 t = v[i];
-                    v[i] = v[j];
-                    v[j] = t;
-                    i++;
-                    j--;
-                }
-            }
-            /* [lo, j] is the smaller side: sorted here, the other stacked */
-            if (j - lo < hi - i)
-            {
-                if (lo < j && !push_range(stack_lo, stack_hi, top, STACK_MAX, lo, j))
-                    return;
-                lo = i;
-            }
-            else
-            {
-                if (i < hi && !push_range(stack_lo, stack_hi, top, STACK_MAX, i, hi))
-                    return;
-                hi = j;
-            }
-        }
-    }
-}
-
-/* A wakeup paired with the first switch to that task after it: what
-   `trace latency` walks, over the same window `trace show` prints. */
-void latency(stdlib::Printer& con, ulong count, ulong only, const char* const* filter, ulong filter_count)
-{
-    Window windows[MAX_CPUS] = {};
-    ulong total = collect(windows, con, count, only, filter, filter_count);
-    ulong cpus = 0;
-    for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
-    {
-        if (windows[cpu].count != 0)
-            cpus++;
+        stdlib::AutoLock lock(control());
+        total = collect(windows, con, count, only, mask);
     }
     u64 now_cycles;
     ulong now_ns;
     now_point(now_cycles, now_ns);
 
-    /* A task woken and not yet switched to in the window: its wakeup's
-       cycles, and the CPU it was queued on */
-    u64 wake_at[PID_SLOTS] = {};
-    u16 wake_cpu[PID_SLOTS] = {};
+    ulong cpus = 0;
+    for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
+        cpus += (windows[cpu].count != 0) ? 1 : 0;
 
-    auto waits = static_cast<WakeWait*>(mm::alloc((total != 0 ? total : 1) * sizeof(WakeWait), TAG));
-    ulong ran = 0;
-    ulong wakeups = 0;
-    ulong strange = 0;
+    ulong limit_cpu;
+    u64 start = window_start(windows, MAX_CPUS, limit_cpu);
+    if (start == COMPLETE_NEVER)
+    {
+        con.printf("trace latency: cpu %lu's ring could not be read: no wait is paired across it\n", limit_cpu);
+        release_windows(windows);
+        return;
+    }
 
-    ulong skip = (total > count) ? total - count : 0;
+    /* The walk meets at most the window's newest `count`, and a wait is a
+       switch among them: room for that many */
+    ulong walked = (total < count) ? total : count;
+    WakeWait* waits = nullptr;
+    if (walked != 0)
+    {
+        waits = static_cast<WakeWait*>(mm::alloc(walked * sizeof(WakeWait), TAG));
+        if (waits == nullptr)
+        {
+            con.printf("trace latency: no memory to hold %lu waits\n", walked);
+            release_windows(windows);
+            return;
+        }
+    }
+
+    /* A pid's table of a few KiB: the heap's, not the shell's stack */
+    auto pairing = new (mm::NO_THROW) WakePairing(waits, walked, start, cycle_counter_delta_to_ns);
+    if (pairing == nullptr)
+    {
+        con.printf("trace latency: no memory to pair waits\n");
+        if (waits != nullptr)
+            mm::free(waits);
+        release_windows(windows);
+        return;
+    }
+    ulong skip = total - walked;
     const TraceRing::Record* r;
     ulong taken = 0;
-    while (next_record(windows, r))
+    while (merge_next(windows, MAX_CPUS, r))
     {
         if (taken++ < skip)
             continue;
-
-        if (r->id == (u16)Id::SchedWakeup && r->size == sizeof(SchedWakeup))
-        {
-            SchedWakeup w;
-            stdlib::mem_cpy(&w, r->payload, sizeof(w));
-            wakeups++;
-            if (w.pid >= PID_SLOTS)
-                strange++;
-            else if (wake_at[w.pid] == 0)
-            {
-                wake_at[w.pid] = r->cycles;
-                wake_cpu[w.pid] = (u16)((w.cpu < MAX_CPUS) ? w.cpu : 0);
-            }
-        }
-        else if (r->id == (u16)Id::SchedSwitch && r->size == sizeof(SchedSwitch) && waits != nullptr)
-        {
-            SchedSwitch s;
-            stdlib::mem_cpy(&s, r->payload, sizeof(s));
-            if (s.next_pid < PID_SLOTS && wake_at[s.next_pid] != 0 && r->cycles >= wake_at[s.next_pid])
-            {
-                u64 delta = cycle_counter_delta_to_ns(r->cycles - wake_at[s.next_pid]);
-                WakeWait& ww = waits[ran++];
-                ww.ns = (delta > (u64)0xFFFFFFFF) ? 0xFFFFFFFFU : (u32)delta;
-                ww.pid = s.next_pid;
-                ww.woken_cpu = wake_cpu[s.next_pid];
-                ww.ran_cpu = (u16)((r->cpu < MAX_CPUS) ? r->cpu : 0);
-                stdlib::mem_set(ww.comm, 0, sizeof(ww.comm));
-                stdlib::mem_cpy(ww.comm, s.next_comm, COMM_BYTES);
-                wake_at[s.next_pid] = 0;
-            }
-        }
+        pairing->feed(*r);
     }
     release_windows(windows);
+    print_waits(con, *pairing, waits, walked, cpus, start, limit_cpu, now_cycles, now_ns);
+    delete pairing;
+    if (waits != nullptr)
+        mm::free(waits);
+}
 
-    ulong pending = 0;
-    for (ulong pid = 0; pid < PID_SLOTS; pid++)
-    {
-        if (wake_at[pid] != 0)
-            pending++;
-    }
-
+/* What latency paired, said: the counts, why some were left out, the
+   percentiles and the longest five. */
+void print_waits(stdlib::Printer& con, const WakePairing& pairing, WakeWait* waits, ulong walked, ulong cpus,
+    u64 start, ulong limit_cpu, u64 now_cycles, ulong now_ns)
+{
+    ulong ran = pairing.waits();
     con.printf("trace latency: %lu records on %lu cpus -- %lu wakeups, %lu ran in the window, %lu not run in it\n",
-        total, cpus, wakeups, ran, pending);
-    if (strange != 0)
-        con.printf("  %lu wakeups named a pid the table has no room for, and are left out\n", strange);
+        walked, cpus, pairing.wakeups(), ran, pairing.pending());
+    if (pairing.before_start() != 0)
+    {
+        ulong ns = record_ns(start, now_cycles, now_ns);
+        con.printf("  the oldest %lu left out: cpu %lu holds nothing before %lu.%06lu -- its older records were "
+            "written over\n", pairing.before_start(), limit_cpu, ns / consts::NANO_SECS_IN_SEC,
+            (ns / consts::NANO_SECS_IN_USEC) % USECS_IN_SEC);
+    }
+    if (pairing.superseded() != 0)
+        con.printf("  %lu wakeups were followed by another of their task's before any switch to it\n",
+            pairing.superseded());
+    if (pairing.strange() != 0)
+        con.printf("  %lu wakeups named a pid past the table's %lu, and are left out\n", pairing.strange(),
+            WakePairing::PID_SLOTS);
+    if (pairing.dropped() != 0)
+        con.printf("  %lu waits found no room, and are left out\n", pairing.dropped());
     if (ran == 0)
     {
-        if (total != 0)
+        if (walked != 0)
             con.printf("  no wakeup of the window was followed by its task's switch -- "
                 "`trace on sched_switch,sched_wakeup`, and a window with both in it\n");
-        if (waits != nullptr)
-            mm::free(waits);
-        return;
-    }
-    if (waits == nullptr)
-    {
-        con.printf("  no memory to hold %lu waits\n", ran);
         return;
     }
 
-    /* p50, p90, p99 and the most: the waits sorted, so a percentile is one
-       index -- anything else needs a histogram's bounds between the numbers
-       and the answer */
+    /* p50, p90, p99 and the most: the waits sorted, so that a percentile is
+       one index -- a histogram's would be its buckets' bounds */
     auto sorted = static_cast<u32*>(mm::alloc(ran * sizeof(u32), TAG));
     if (sorted == nullptr)
     {
         con.printf("  no memory to sort %lu waits\n", ran);
-        mm::free(waits);
         return;
     }
     for (ulong i = 0; i < ran; i++)
         sorted[i] = waits[i].ns;
     sort_u32(sorted, ran);
 
+    const ulong P50 = 50;
+    const ulong P90 = 90;
+    const ulong P99 = 99;
     char p50[32];
     char p90[32];
     char p99[32];
     char pmax[32];
-    wait_text(p50, sizeof(p50), sorted[(ran - 1) * 50 / 100]);
-    wait_text(p90, sizeof(p90), sorted[(ran - 1) * 90 / 100]);
-    wait_text(p99, sizeof(p99), sorted[(ran - 1) * 99 / 100]);
+    wait_text(p50, sizeof(p50), sorted[percentile_index(ran, P50)]);
+    wait_text(p90, sizeof(p90), sorted[percentile_index(ran, P90)]);
+    wait_text(p99, sizeof(p99), sorted[percentile_index(ran, P99)]);
     wait_text(pmax, sizeof(pmax), sorted[ran - 1]);
     con.printf("  wait p50 %s p90 %s p99 %s max %s\n", p50, p90, p99, pmax);
 
-    /* The five longest, each with the task and the CPUs: what a histogram
+    /* The five longest, each with its task and CPUs: what a histogram
        cannot say */
     const ulong WORST = 5;
-    ulong worst[WORST] = {};
-    ulong worst_count = 0;
-    for (ulong i = 0; i < ran; i++)
-    {
-        ulong at = worst_count;
-        while (at > 0 && waits[worst[at - 1]].ns < waits[i].ns)
-            at--;
-        if (at >= WORST)
-            continue;
-        ulong move = (worst_count < WORST) ? worst_count : WORST - 1;
-        while (move > at)
-        {
-            worst[move] = worst[move - 1];
-            move--;
-        }
-        worst[at] = i;
-        if (worst_count < WORST)
-            worst_count++;
-    }
+    ulong worst[WORST];
+    ulong n = top_waits(waits, ran, worst, WORST);
     con.printf("  the longest:\n");
-    for (ulong i = 0; i < worst_count; i++)
+    for (ulong i = 0; i < n; i++)
     {
         const WakeWait& ww = waits[worst[i]];
         char text[32];
         wait_text(text, sizeof(text), ww.ns);
         con.printf("    %9s pid %u %-12s cpu %u -> %u\n", text, ww.pid, ww.comm, ww.woken_cpu, ww.ran_cpu);
     }
-
     mm::free(sorted);
-    mm::free(waits);
 }
 
 void stat(stdlib::Printer& con)
@@ -956,15 +956,21 @@ void stat(stdlib::Printer& con)
     }
 
     WakeupTrigger t;
-    if (triggered(t))
+    bool busy;
+    if (triggered(t, busy))
     {
         char text[32];
         char name[COMM_BYTES + 1] = {};
         stdlib::mem_cpy(name, t.comm, COMM_BYTES);
         wait_text(text, sizeof(text), t.waited_ns);
+        ulong at = (ulong)t.at_ns;
         con.printf("trace: frozen by the wakeup trigger: pid %u %s waited %s on cpu %u, at %lu.%06lu\n",
-            (u32)(t.pid_cpu >> 32), name, text, (u32)t.pid_cpu, t.at_ns / consts::NANO_SECS_IN_SEC,
-            (t.at_ns / consts::NANO_SECS_IN_USEC) % USECS_IN_SEC);
+            (u32)(t.pid_cpu >> 32), name, text, (u32)t.pid_cpu, at / consts::NANO_SECS_IN_SEC,
+            (at / consts::NANO_SECS_IN_USEC) % USECS_IN_SEC);
+    }
+    else if (busy)
+    {
+        con.printf("trace: the wakeup trigger's record was being written at every look: ask again\n");
     }
 
     con.printf("cpu      written       kept    dropped\n");
@@ -990,7 +996,9 @@ void list(stdlib::Printer& con)
     }
 }
 
-/* `trace test [n]`: n Test records on this CPU. */
+/* `trace test [n]`: n Test records on this CPU -- one CPU's: preemption is
+   off for the loop, so that nothing moves the shell to another CPU midway
+   and the records stay in the ring the line names. */
 void test_records(stdlib::Printer& con, ulong n)
 {
     if (!on(Id::Test))
@@ -998,15 +1006,42 @@ void test_records(stdlib::Printer& con, ulong n)
         con.printf("trace: `trace on test` first\n");
         return;
     }
+    if (__atomic_load_n(&frozen, __ATOMIC_RELAXED))
+    {
+        con.printf("trace: the rings are frozen -- `trace thaw` first\n");
+        return;
+    }
+    preempt_disable();
+    ulong cpu = CpuTable::get_instance().get_current_cpu_id();
     for (ulong i = 0; i < n; i++)
     {
         Test t = { i, i * 0x9E3779B97F4A7C15ULL };
         emit(Id::Test, &t, sizeof(t));
     }
-    con.printf("trace: %lu test records on cpu %lu\n", n, CpuTable::get_instance().get_current_cpu_id());
+    preempt_enable();
+    con.printf("trace: %lu test records on cpu %lu\n", n, cpu);
 }
 
-/* `trace bench`: what a tracepoint costs this CPU off, and on. */
+/* A record of event `n` into the ring `table` has for this CPU, as emit()
+   writes one: with interrupts off, from the table's slot for the CPU it
+   runs on. The kernel's rings, or `trace bench`'s own. */
+void write_through(TraceRing** table, ulong n, const void* payload, ulong size)
+{
+    ulong flags = hal::irq_save();
+    ulong cpu = hal::get_current_cpu_hw_id();
+    if (cpu < MAX_CPUS)
+    {
+        TraceRing* ring = __atomic_load_n(&table[cpu], __ATOMIC_ACQUIRE);
+        if (ring != nullptr)
+            ring->write((u16)n, hal::read_cycle_counter(), payload, size);
+    }
+    hal::irq_restore(flags);
+}
+
+/* `trace bench`: what a tracepoint costs this CPU off, and on. The one that
+   is on writes into a ring of its own -- every CPU's slot of a table of its
+   own pointing at it, the shell's task its only writer -- so that what the
+   kernel's rings hold stays as it was, frozen or not. */
 void bench(stdlib::Printer& con)
 {
     static const ulong OFF_LOOPS = 10000000;
@@ -1033,26 +1068,30 @@ void bench(stdlib::Printer& con)
     con.printf("trace bench: a tracepoint that is off, %lu.%03lu ns over an empty loop's iteration (%lu loops)\n",
         off_ps / 1000, off_ps % 1000, OFF_LOOPS);
 
-    if (have_rings())
-    {
-        __atomic_store_n(&enabled[(ulong)Id::Test], 1, __ATOMIC_RELEASE);
-        start = hal::read_cycle_counter();
-        for (ulong i = 0; i < ON_LOOPS; i++)
-        {
-            Test t = { i, i };
-            emit(Id::Test, &t, sizeof(t));
-        }
-        u64 on_cycles = hal::read_cycle_counter() - start;
-        ulong on_ps = cycle_counter_delta_to_ns(on_cycles) * 1000 / ON_LOOPS;
-        con.printf("trace bench: one that is on, %lu.%03lu ns a record (%lu records into this cpu's ring)\n",
-            on_ps / 1000, on_ps % 1000, ON_LOOPS);
-    }
-    else
-    {
-        con.printf("trace bench: no rings -- `trace on test` first to time one that is on\n");
-    }
     __atomic_store_n(&enabled[(ulong)Id::Test], was_on ? 1 : 0, __ATOMIC_RELEASE);
     (void)hits;
+
+    TraceRing ring;
+    if (!ring.init(1, TAG))
+    {
+        con.printf("trace bench: no memory for a ring of its own, to time one that is on\n");
+        return;
+    }
+    TraceRing* table[MAX_CPUS];
+    for (ulong i = 0; i < MAX_CPUS; i++)
+        table[i] = &ring;
+
+    start = hal::read_cycle_counter();
+    for (ulong i = 0; i < ON_LOOPS; i++)
+    {
+        Test t = { i, i };
+        write_through(table, (ulong)Id::Test, &t, sizeof(t));
+    }
+    u64 on_cycles = hal::read_cycle_counter() - start;
+    ulong on_ps = cycle_counter_delta_to_ns(on_cycles) * 1000 / ON_LOOPS;
+    con.printf("trace bench: one that is on, %lu.%03lu ns a record (%lu records into a ring of its own)\n",
+        on_ps / 1000, on_ps % 1000, ON_LOOPS);
+    ring.release();
 }
 
 /* The words of `args` past the first, each into `words` (up to `max`, of
@@ -1102,16 +1141,7 @@ void emit(Id id, const void* payload, ulong size)
         return;
     if (__atomic_load_n(&frozen, __ATOMIC_RELAXED))
         return;
-
-    ulong flags = hal::irq_save();
-    ulong cpu = hal::get_current_cpu_hw_id();
-    if (cpu < MAX_CPUS)
-    {
-        TraceRing* ring = __atomic_load_n(&rings[cpu], __ATOMIC_ACQUIRE);
-        if (ring != nullptr)
-            ring->write((u16)n, hal::read_cycle_counter(), payload, size);
-    }
-    hal::irq_restore(flags);
+    write_through(rings, n, payload, size);
 }
 
 bool set_ring_kib(ulong kib, stdlib::Printer& con)
@@ -1127,11 +1157,15 @@ bool set_ring_kib(ulong kib, stdlib::Printer& con)
     ulong was = __atomic_load_n(&ring_kib, __ATOMIC_RELAXED);
     __atomic_store_n(&ring_kib, kib, __ATOMIC_RELAXED);
     /* Rings made already are made again at the new size: what they held
-       goes with them. */
-    if (have_rings() && !make_rings(con))
+       goes with them, and so does a freeze, or a trigger armed to keep it */
+    if (have_rings())
     {
-        __atomic_store_n(&ring_kib, was, __ATOMIC_RELAXED);
-        return false;
+        if (!make_rings(con))
+        {
+            __atomic_store_n(&ring_kib, was, __ATOMIC_RELAXED);
+            return false;
+        }
+        thaw();
     }
     return true;
 }
@@ -1146,6 +1180,9 @@ void free_rings()
     stdlib::AutoLock lock(control());
     for (ulong i = 0; i < COUNT; i++)
         __atomic_store_n(&enabled[i], 0, __ATOMIC_RELEASE);
+    /* As it was before the first `trace on`: no freeze, no trigger, so that
+       the rings the next one makes record */
+    thaw();
     TraceRing* none[MAX_CPUS] = {};
     swap_rings(none);
 }
@@ -1199,25 +1236,15 @@ long set(const char* what, bool turn_on, stdlib::Printer& con)
         return -1;
     }
 
-    bool chosen[COUNT] = {};
-    long named = 0;
+    EventMask chosen = 0;
     for (ulong w = 0; w < n; w++)
     {
-        bool found = false;
-        for (ulong i = 0; i < COUNT; i++)
-        {
-            if (stdlib::str_cmp(words[w], "all") == 0 || stdlib::str_cmp(words[w], EVENTS[i].name) == 0
-                || stdlib::str_cmp(words[w], EVENTS[i].group) == 0)
-            {
-                chosen[i] = true;
-                found = true;
-            }
-        }
-        if (!found)
+        if (!name_mask(words[w], chosen))
             con.printf("trace: no event or group called %s\n", words[w]);
     }
+    long named = 0;
     for (ulong i = 0; i < COUNT; i++)
-        named += chosen[i] ? 1 : 0;
+        named += ((chosen & event_bit(i)) != 0) ? 1 : 0;
     if (named == 0)
         return -1;
 
@@ -1226,9 +1253,12 @@ long set(const char* what, bool turn_on, stdlib::Printer& con)
         return -1;
     for (ulong i = 0; i < COUNT; i++)
     {
-        if (chosen[i])
+        if ((chosen & event_bit(i)) != 0)
             __atomic_store_n(&enabled[i], turn_on ? 1 : 0, __ATOMIC_RELEASE);
     }
+    /* On, and recording nothing, would be a trace that looks empty */
+    if (turn_on && __atomic_load_n(&frozen, __ATOMIC_RELAXED))
+        con.printf("trace: the rings are frozen -- nothing is recorded until `trace thaw`\n");
     return named;
 }
 
@@ -1272,30 +1302,55 @@ void boot_on(const char* list)
         klog(0, "trace: %ld events on from boot (tracepoints=%s)", named, list);
 }
 
-/* show's, dump's and latency's arguments: [n] [cpu=N] [event...]. */
+/* show's, dump's and latency's arguments: [n] [cpu=N] [event|group|all...]. */
 struct WindowArgs
 {
     ulong count;
     ulong only;
-    const char* filter[WORDS_MAX];
-    ulong filter_count;
+    EventMask mask;
 };
 
-void window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out)
+/* The window the words after the verb ask for -- false, said, for a word
+   that is none of n (1 up; SHOW_MAX at most, more taken as it), cpu=N of a
+   running CPU, or what `trace on` takes: a word that names nothing is a
+   mistake to say, not a filter that silently matches nothing. */
+bool window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out, stdlib::Printer& con)
 {
+    const ulong CPU_PREFIX_LEN = 4;
     out.count = SHOW_DEFAULT;
     out.only = MAX_CPUS;
-    out.filter_count = 0;
+    out.mask = 0;
     for (ulong w = 1; w < n; w++)
     {
         ulong value;
-        if (stdlib::mem_cmp(words[w], "cpu=", 4) == 0 && stdlib::parse_ulong(words[w] + 4, value) && value < MAX_CPUS)
+        if (stdlib::mem_cmp(words[w], "cpu=", CPU_PREFIX_LEN) == 0)
+        {
+            if (!stdlib::parse_ulong(words[w] + CPU_PREFIX_LEN, value) || value >= MAX_CPUS
+                || (CpuTable::get_instance().get_running_cpus() & (1UL << value)) == 0)
+            {
+                con.printf("trace: no running cpu %s\n", words[w] + CPU_PREFIX_LEN);
+                return false;
+            }
             out.only = value;
-        else if (stdlib::parse_ulong(words[w], value) && value != 0)
+        }
+        else if (stdlib::parse_ulong(words[w], value))
+        {
+            if (value == 0)
+            {
+                con.printf("trace: a window is 1 to %lu records\n", SHOW_MAX);
+                return false;
+            }
             out.count = (value < SHOW_MAX) ? value : SHOW_MAX;
-        else if (out.filter_count < WORDS_MAX)
-            out.filter[out.filter_count++] = words[w];
+        }
+        else if (!name_mask(words[w], out.mask))
+        {
+            con.printf("trace: no event or group called %s\n", words[w]);
+            return false;
+        }
     }
+    if (out.mask == 0)
+        out.mask = ALL_EVENTS;
+    return true;
 }
 
 /* `wakeup>N` and a unit -- ns, us, ms or s -- as `trace freeze` takes it. */
@@ -1304,37 +1359,7 @@ bool parse_wakeup_trigger(const char* word, u64& ns)
     const ulong PREFIX_LEN = 7;
     if (stdlib::mem_cmp(word, "wakeup>", PREFIX_LEN) != 0)
         return false;
-
-    const char* p = word + PREFIX_LEN;
-    u64 value = 0;
-    ulong digits = 0;
-    while (*p >= '0' && *p <= '9')
-    {
-        value = value * 10 + (u64)(*p - '0');
-        /* A billion of any unit is more than this measures, and keeps the
-           scale below from wrapping */
-        if (value > 1000000000ULL)
-            return false;
-        p++;
-        digits++;
-    }
-    if (digits == 0)
-        return false;
-
-    u64 scale;
-    if (stdlib::str_cmp(p, "ns") == 0)
-        scale = 1;
-    else if (stdlib::str_cmp(p, "us") == 0)
-        scale = consts::NANO_SECS_IN_USEC;
-    else if (stdlib::str_cmp(p, "ms") == 0)
-        scale = consts::NANO_SECS_IN_MS;
-    else if (stdlib::str_cmp(p, "s") == 0)
-        scale = consts::NANO_SECS_IN_SEC;
-    else
-        return false;
-
-    ns = value * scale;
-    return ns != 0;
+    return parse_duration(word + PREFIX_LEN, ns);
 }
 
 void command(const char* args, stdlib::Printer& con)
@@ -1364,15 +1389,16 @@ void command(const char* args, stdlib::Printer& con)
     else if (stdlib::str_cmp(verb, "show") == 0 || stdlib::str_cmp(verb, "dump") == 0
         || stdlib::str_cmp(verb, "latency") == 0)
     {
+        /* Each takes control() to read the rings, and prints with it let go */
         WindowArgs window;
-        window_args(words, n, window);
-        stdlib::AutoLock lock(control());
+        if (!window_args(words, n, window, con))
+            return;
         if (stdlib::str_cmp(verb, "show") == 0)
-            show(con, window.count, window.only, window.filter, window.filter_count);
+            show(con, window.count, window.only, window.mask);
         else if (stdlib::str_cmp(verb, "dump") == 0)
-            dump(con, window.count, window.only, window.filter, window.filter_count);
+            dump(con, window.count, window.only, window.mask);
         else
-            latency(con, window.count, window.only, window.filter, window.filter_count);
+            latency(con, window.count, window.only, window.mask);
     }
     else if (stdlib::str_cmp(verb, "stat") == 0)
     {
@@ -1415,22 +1441,28 @@ void command(const char* args, stdlib::Printer& con)
                 return;
             }
 
-            /* Armed, and recording: a frozen ring has nothing for a trigger
-               to keep */
             stdlib::AutoLock lock(control());
-            disarm_trigger();
-            __atomic_store_n(&frozen, 0, __ATOMIC_RELEASE);
-            __atomic_store_n(&wakeup_trigger_ns, over, __ATOMIC_RELEASE);
+            arm_trigger(over);
             char text[32];
             wait_text(text, sizeof(text), over);
             con.printf("trace: armed -- the rings freeze when a wakeup waits over %s\n", text);
             return;
         }
 
+        /* A freeze keeps what a trigger fired on, for `trace stat`; a thaw
+           forgets it */
         stdlib::AutoLock lock(control());
-        disarm_trigger();
-        __atomic_store_n(&frozen, freeze ? 1 : 0, __ATOMIC_RELEASE);
-        con.printf("trace: %s\n", freeze ? "frozen -- nothing more is recorded until `trace thaw`" : "recording");
+        if (freeze)
+        {
+            disarm_trigger(false);
+            __atomic_store_n(&frozen, 1, __ATOMIC_RELEASE);
+            con.printf("trace: frozen -- nothing more is recorded until `trace thaw`\n");
+        }
+        else
+        {
+            thaw();
+            con.printf("trace: recording\n");
+        }
     }
     else if (stdlib::str_cmp(verb, "test") == 0)
     {
@@ -1449,9 +1481,9 @@ void command(const char* args, stdlib::Printer& con)
     }
     else
     {
-        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event...] | "
-            "dump [n] [cpu=N] [event...] | latency [n] [cpu=N] [event...] | stat | clear | size <KiB> | free | "
-            "freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench\n");
+        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | "
+            "dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | "
+            "size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench\n");
     }
 }
 
@@ -1501,7 +1533,7 @@ void emit_sched_switch(Task* prev, Task* next, ulong cpu, u8 state, u8 reason)
     emit(Id::SchedSwitch, &s, sizeof(s));
 }
 
-void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker)
+void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker, ulong late_ns)
 {
     SchedWakeup w = {};
     w.pid = task_pid(task);
@@ -1509,6 +1541,7 @@ void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker)
     w.cpu = (u32)cpu;
     w.deadline = deadline ? 1 : 0;
     w.waker_pid = task_pid(waker);
+    w.late_ns = (u32)stdlib::min(late_ns, (ulong)~0U);
     emit(Id::SchedWakeup, &w, sizeof(w));
 }
 

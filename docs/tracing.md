@@ -17,7 +17,10 @@ every CPU's ring merged by time:
 The log (`klog()`, `klog!`) is for lines a person reads; a tracepoint is for
 events too many and too fast for that -- every context switch, every wakeup --
 recorded in a few dozen nanoseconds, with no formatting until someone asks.
-The code is `kernel/tracepoint.{h,cpp}` and `kernel/trace_ring.{h,cpp}`.
+The code is `kernel/tracepoint.{h,cpp}`, `kernel/trace_ring.{h,cpp}` (a CPU's
+ring) and `kernel/trace_window.{h,cpp}` (what the shell's readers make of the
+rings: the window, the merge, the waits -- with nothing of the kernel in it,
+so that a fuzzer runs it on the host).
 
 ## What a tracepoint costs
 
@@ -32,7 +35,9 @@ if (unlikely(tp::on(tp::Id::SchedSwitch)))
 No arguments are computed and no call is made until the event is on. One
 that is on is a call to `tp::emit()`: interrupts off, the cycle counter read,
 eight 64-bit stores and two barriers into this CPU's ring, interrupts back.
-`trace bench` measures both on the CPU it runs on:
+`trace bench` measures both on the CPU it runs on -- the one that is on into
+a ring of its own, through the same path, so that what the kernel's rings
+hold is left as it was:
 
 | | off, over an empty loop's iteration | on, a record |
 |---|---:|---:|
@@ -82,22 +87,30 @@ An NMI that comes in while its CPU is writing takes nothing and is counted
 | `trace [list]` | every event: on or off, its group, what it records |
 | `trace on <event\|group\|all>...` | turned on (the rings made first, if there are none); names may be comma-separated |
 | `trace off <...>` | turned off; what was recorded stays |
-| `trace show [n] [cpu=N] [event...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events named, only theirs |
-| `trace dump [n] [cpu=N] [event...]` | the same window as JSON, a record a line, times in exact ns: what `scripts/trace-decode.py` reads |
-| `trace latency [n] [cpu=N] [event...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs |
+| `trace show [n] [cpu=N] [event\|group\|all...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events or groups named, only theirs. A word that names nothing -- or a cpu not running, or `n` of 0 -- is refused, not taken for a filter that matches nothing |
+| `trace dump [n] [cpu=N] [event\|group\|all...]` | the same window as JSON, a record a line, times in exact ns, after a line saying from when the window is whole: what `scripts/trace-decode.py` reads |
+| `trace latency [n] [cpu=N] [event\|group\|all...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs ([below](#how-long-a-woken-task-waited)) |
 | `trace stat` | each CPU's ring: written, kept, dropped; and the wakeup trigger, armed or what it fired on |
 | `trace clear` | what is recorded forgotten: `show` starts after it |
-| `trace size <KiB>` | the rings' size, 64 KiB times a power of two up to 64 MiB; rings there are made again at it, what they held with them |
-| `trace free` | every event off, every ring given back |
-| `trace freeze [wakeup>N<ns\|us\|ms\|s>]` / `thaw` | nothing more recorded until thawed, so that what is in the rings stays as it was -- at once, or when a wakeup waits longer than N ([below](#a-wakeup-that-waited-too-long)) |
-| `trace test [n]` | `n` records of the `test` event on this CPU |
+| `trace size <KiB>` | the rings' size, 64 KiB times a power of two up to 64 MiB; rings there are made again at it, what they held with them -- and a freeze, or a trigger armed to keep it |
+| `trace free` | every event off, every ring given back, no freeze or trigger left: as before the first `trace on` |
+| `trace freeze [wakeup>N<ns\|us\|ms\|s>]` / `thaw` | nothing more recorded until thawed, so that what is in the rings stays as it was -- at once, or when a wakeup waits longer than N ([below](#a-wakeup-that-waited-too-long)). `trace on` says so when it turns events on into frozen rings, and `trace test` refuses them |
+| `trace test [n]` | `n` records of the `test` event on this CPU, preemption off for the loop so that all of them are |
 | `trace bench` | what a tracepoint costs this CPU off and on |
 
 A record prints as its time since boot, its CPU, the event's name and its
 fields as `name=value` -- from the event's description, one format for all.
 `dump` prints the same records as objects -- `{"t":<ns>,"cpu":N,"ev":"<name>","f":{...}}`,
 the CPU outside the fields' object, as some of them are called `cpu` too --
-so a host reads numbers, not a format.
+so a host reads numbers, not a format. Its first line is the window's own,
+`{"window":{"records":N,"complete_from":<ns>,"cpu":K}}`: from when on no CPU's
+part of it lacks a record, and whose part sets that (0 when nothing is
+missing; `null` when a CPU's part could not be read at all).
+
+A CPU whose part begins later than what is shown -- its older records
+written over by its ring, or left out for room -- is said above the records
+(`cpu 3: nothing before 4.123456`), so that its silence before then is not
+read as a CPU that did nothing.
 
 `tracepoints=<list>` on the kernel command line turns events on as the boot
 ends, once every CPU has its ring ([kernel parameters](kernel-parameters.md)).
@@ -110,9 +123,20 @@ how long between? It walks the window `show` prints -- the newest `n`
 records of every CPU, merged by time -- keeping each `sched_wakeup`'s pid
 and instant in a table by pid (ids are 0 to 255, so the table is an array),
 and pairs it with the first `sched_switch` after it whose next task is that
-pid. The difference is the wait. A wakeup whose switch is not in the window
--- still waiting, or its record written over -- is counted as not run in
-it, never guessed.
+pid. The difference is the wait; a deadline's wakeup is counted from the
+deadline itself, its record's `late_ns` before it, as `sched` and the
+trigger below count it. A wakeup whose switch is not in the window -- still
+waiting, or after it -- is counted as not run in it, never guessed.
+
+Each CPU's part of the window is its own ring's newest records, and a busy
+CPU's ring reaches back milliseconds where an idle one's reaches back
+seconds: before the latest point from which every part is whole (the
+`complete_from` above), a wakeup's switch may be among what one ring lost,
+and the next switch to its task -- after it was displaced and put back --
+would be taken for it. So the walk starts there, and what is older is
+counted and left out (`the oldest 120 left out: cpu 2 holds nothing before
+...`). A task woken again before any switch to it says the window lost one,
+and is said too.
 
 ```
 > trace on sched
@@ -124,8 +148,9 @@ trace latency: 2000 records on 4 cpus -- 43 wakeups, 43 ran in the window, 0 not
      15.3us pid 11 probe/wait  cpu 3 -> 3
 ```
 
-The percentiles are exact, not buckets: the waits are sorted (a quicksort
-over an explicit 32-entry stack, no allocation beyond the array). The five
+The percentiles are exact, not buckets: the waits are sorted -- a heapsort,
+in place and n log n whatever the order, where a quicksort's stack pushed
+the wrong half and was a panic on waits that rose and fell. The five
 longest say what a histogram cannot: which task, and whether it ran on the
 CPU it was queued on. `sched`'s own wakeup histogram ([Scheduler](scheduler.md#what-it-is-measured-by))
 is the live one, always on and coarse; this is the window's, exact, and it
@@ -155,12 +180,18 @@ trace: frozen by the wakeup trigger: pid 42 probe/wait waited 12.400ms on cpu 0,
 ```
 
 Arming it thaws the rings first -- a frozen ring has nothing for a trigger
-to keep -- and it is armed and spent with an atomic each way: the scheduler
-reads a word that is 0 unless a trigger is armed, and the first CPU to fire
-claims the record with an exchange, the record a seqlock `trace stat` reads
-as any other. `trace thaw` records again and disarms. A wakeup that
-claimed the trigger a moment before it was re-armed can still freeze the
-new arming; the record says which wait it was.
+to keep. The scheduler reads a word that is 0 unless a trigger is armed, and
+the first CPU to fire claims the record with an exchange and writes it as a
+seqlock, then freezes the rings and puts the word back to 0. Every arming,
+disarming and thaw first puts that word to 0 and waits out every CPU
+(`CpuTable::synchronize`): the trigger is asked with interrupts off, inside
+the decision, so a CPU that has taken an interrupt since is out of any
+firing of the arming before -- none of its stores can land after the new
+arming, after a thaw's "recording", or into a record being reset. `trace
+stat` reads the record a bounded number of times and says so if it was
+being written at every look, rather than waiting on it. `trace thaw`
+records again and forgets the record; a plain `trace freeze` keeps it;
+`trace free` and `trace size` leave neither a freeze nor a trigger.
 
 ## Reading a trace on the host
 
@@ -187,7 +218,9 @@ scripts/trace-decode.py --latency dump.txt            # every wait, longest firs
 Its text says how many switches, wakeups, blocks and idles the window has,
 which task ran on each CPU and for how long, and the waits -- the same
 pairing the kernel's `trace latency` does, computed a second way from the
-same records. The Chrome trace is a track a CPU, a slice every stretch a
+same records: from where the dump's `window` line says every part is whole
+(the latest of them, for a dump read in parts), a deadline's wakeup from its
+deadline. The Chrome trace is a track a CPU, a slice every stretch a
 task ran on it, a wakeup or a block an instant event on the track of the
 CPU it happened on: a schedule read as a picture of what waited for what.
 
@@ -201,14 +234,14 @@ where the lines were cut.
 | event | group | what it records |
 |---|---|---|
 | `sched_switch` | sched | a CPU's next task and the one it left: `prev_pid`/`prev_comm`, `next_pid`/`next_comm`, `next_cpu`, what `prev_state` went to be (runnable, blocked, sleeping, exited) and the decision's `reason` (voluntary, yield, preempt) |
-| `sched_wakeup` | sched | a task handed back to its queue: `pid`, `comm`, the `cpu`, whether its `deadline` came or someone's `unblock()`, and the task that woke it (`waker_pid` -- the one an interrupt landed on, from an interrupt's context -- 4294967295 where nobody did) |
-| `sched_block` | sched | a task that left its CPU because it cannot run: whether it is `deadline`-bound, and how long it `ran_ns` this time |
+| `sched_wakeup` | sched | a task handed back to its queue: `pid`, `comm`, the `cpu`, whether its `deadline` came or someone's `unblock()`, the task that woke it (`waker_pid` -- the one an interrupt landed on, from an interrupt's context -- 4294967295 where nobody did), and for a deadline's how late the sleep list was walked past it (`late_ns`): its wait is counted from the deadline |
+| `sched_block` | sched | a task that left its CPU because it cannot run: whether it is `deadline`-bound, and how long it `ran_ns` -- from the switch that gave it the CPU, across every decision that left it there |
 | `sched_migrate` | sched | the load balancer moving a runnable task: `from` and `to` a CPU's queue |
-| `sched_new` | sched | a task put on a queue for the first time |
-| `sched_exit` | sched | a task whose CPU is taking its last reference and its stack |
+| `sched_new` | sched | a task put on a queue for the first time, before it can run |
+| `sched_exit` | sched | a task that has exited, as it gives its pid back: before any task started after it can be given that pid |
 | `sched_ipi` | sched | an interrupt another CPU sent, and the queued work it found (`tasks`) -- a wakeup's reschedule, a TLB shootdown |
-| `sched_preempt_deferred` | sched | a reschedule that landed on a task with preemption disabled: its count, and whether it was an idle task -- the case a woken vCPU waited a slice in |
-| `idle_enter`, `idle_exit` | idle | a CPU about to halt and back from it: the idle task's `pid`. What an idle cost is the two's distance |
+| `sched_preempt_deferred` | sched | a reschedule that landed on a task with preemption disabled: its count as the reschedule found it (1 for one lock held), and whether it was an idle task -- the case a woken vCPU waited a slice in |
+| `idle_enter`, `idle_exit` | idle | a CPU about to halt, and its idle over -- the halt returned, or a decision took the CPU from the idle task first: the idle task's `pid`. What an idle cost is the two's distance |
 | `sched_slice` | debug | the slice the decision gave the current task, and how many could run -- a record each decision, so opt in |
 
 `trace on sched` turns the eight decision events on; `trace on idle` the
@@ -226,18 +259,46 @@ check at 0.14-0.37 ns an iteration, in both builds. That the measurement
 would see the sites at all: the same boot with `sched` and `idle` on, every
 decision recording, put it at 1.0 us.
 
-Where each sits, and why there: `sched_switch` in `TaskQueue::switch_to`
-(the two tasks as the CPU leaves them, the queue's lock still held);
-`sched_block` where the decision took the task off the run list, so that
-`ran_ns` is the stretch it just ran; `sched_wakeup` at the compare-and-swap
-that made a task `RUN_WAKING`, and at the sleep list's walk for a
-deadline's own; `sched_migrate` after the task is on its new queue;
-`sched_new` where a task is first put on one; `sched_exit` before its stack
-is given back; `sched_ipi` in `Cpu::ipi`; `sched_preempt_deferred` where
-`schedule_current` puts the reschedule off; the two idle events around the
-halt itself. The names they record are a task's own, written when it is
-made and never moved, so reading one in an interrupt's context needs no
-lock.
+`TaskQueue::switch_to` comes after the decision's cost is taken, so what it
+gained when the idle's end and `sched_block`'s base moved into it was
+counted in the code instead: against the build before, its path with the
+events off has three instructions more on arm64 -- a store of
+`switched_in_at_`, a byte's load of the open-idle flag, a `cbnz` not taken
+-- and four on x86-64 (the store, the load, `testb`, a `jne` not taken);
+the rest of the difference is the block that closes an open idle, out of
+the path's line, and the registers it renamed.
+
+Where each sits, and why there. A record that hands a task to another --
+a queue, a CPU, a pid's next owner -- is written before the hand-off, so
+that nothing the other side does can come before it in the merged trace,
+and so that the task is still the writer's alone to read: `sched_wakeup`
+after the compare-and-swap that made the task `RUN_WAKING` and before
+`push_wake` hands it to its CPU (which may run it, see it exit and clear
+`task_queue_`), and at the sleep list's walk before the enqueue;
+`sched_new` before the insert that lets it run -- an interrupt the insert's
+unlock lets in may switch to it on that very CPU; `sched_migrate` with the
+task off the old queue and not yet on the new; `sched_exit` in
+`Task::exit` before the pid goes back to the `TaskTable`, which gives the
+lowest free id to the next task started anywhere. `sched_switch` is in
+`TaskQueue::switch_to`, the two tasks as the CPU leaves them, the queue's
+lock still held; `sched_block` where the decision took the task off the run
+list, `ran_ns` from `Task::switched_in_at_` -- set by the switch alone,
+where `run_start_time_` moves on at every decision that leaves the task its
+CPU; `sched_ipi` in `Cpu::ipi`; `sched_preempt_deferred` where
+`schedule_current` puts the reschedule off.
+
+The idle events: `idle_enter` before the halt opens an idle
+(`TaskQueue::open_idle`), and the first of three closes it with the
+`idle_exit` -- MWAIT's wake, read before the interrupt that ended it is
+taken (`Cpu::idle_mwait`); the switch that takes the CPU from the idle task
+(`TaskQueue::switch_to`, before its `sched_switch`); or the halt returning
+to `Cpu::idle`. So no switch on a CPU falls inside its idle, and the time a
+woken task then ran is not counted as one. An interrupt in the few
+instructions between the enter and the halt that switches away ends the
+idle there; the halt the idle task then makes when it is switched back to
+goes unrecorded. The names the events record are a task's own, written
+when it is made and never moved, so reading one in an interrupt's context
+needs no lock.
 
 ## An event of its own
 
@@ -266,15 +327,47 @@ too.
   writer thread against a reader, every record kept the one its index says.
   Control: a writer that does not clear the sequence word first is caught at
   the 103rd input, a torn record.
+- `cpp-fuzz.py --target tracewin` (host, in CI): `kernel/trace_window.cpp`
+  on rings of `trace_ring.cpp`'s own. A schedule is made up and played out
+  on up to six CPUs -- tasks woken by one CPU onto another's queue, some at
+  a deadline and late, switched to, displaced, switched to again, blocked,
+  idle and IPI records between, a `trace clear` now and then, rings that
+  wrap -- and the window read as `trace latency` reads it, with a window
+  size and an event filter of the input's, is held to what the schedule
+  did: each CPU's part the newest records its ring holds that the filter
+  keeps, each as written; nothing the CPU wrote missing from where its part
+  says it is whole; the merge the newest of them all in time order; every
+  wait paired one the schedule had -- its task, its CPUs, from its wakeup
+  (a deadline's from the deadline) to the first switch to it -- none left
+  out, and with switches in the window no task found woken twice. Then the
+  sort against `std::sort` on orders made to be a quicksort's worst, the
+  five longest against a stable sort, a duration's parse against a model,
+  and a writer thread filling a ring while its window is read. Controls:
+  the quicksort it replaced is a panic at the 48th input; the window's
+  start ignored -- the pairing across a ring's loss behind `trace latency`'s
+  made-up waits -- is caught at the 44th.
 - `trace-test.py` (arm64; x86-64 where grub-mkrescue is): a kernel booted
   with `tracepoints=test`, and `trace` driven over the UDP shell -- the
   boot's events on, records shown merged and in order, rings made again at
   another size, three times round one of 1024, cleared, frozen and thawed,
   freed and made again, and every word the command refuses. Then the
-  scheduler's, in three phases: `sched_new` and `sched_exit` alone (a task
-  made and a task exiting); the decision events and the two the idle loop
-  makes, from a `sched probe`; and `sched_slice` on its own -- a record a
+  scheduler's, in phases: `sched_new` and `sched_exit` alone (a task made
+  and a task exiting); the decision events and the two the idle loop makes,
+  from a `sched probe`; and `sched_slice` on its own -- a record a
   decision, so it fills a ring while the others' would be read. Every record
-  held to its description's fields, every name a switch records one a task
-  has and at most the field's 12 bytes, and the idle ones among the ones
-  `ps` lists.
+  held to its description's fields and to the CPU it was recorded on, every
+  name a switch records one a task has and at most the field's 12 bytes,
+  and the idle ones among the ones `ps` lists. Then `trace latency` over a
+  probe, the trigger armed at a second and still armed, re-armed at a
+  microsecond and fired, the rings then provably frozen; `trace dump`'s
+  window line and records parsed as JSON, and `trace-decode.py` reading
+  them. Then, each for a fault the review of these found: a group as a
+  window's filter, and a word naming nothing refused; every `sched_block`'s
+  `ran_ns` the stretch since its task's switch in, to within 50 us of the
+  two records' times -- `trace bench` keeping the shell's command task on
+  its CPU across the tick first, so that the formula it replaced, 30 ms off,
+  fails it; no task switched to before its `sched_new`, and no task's
+  `sched_exit` after a later task's `sched_new` under its pid; no switch
+  inside its CPU's idle; `trace bench` writing no CPU's ring; `trace on` and
+  `trace test` saying the rings are frozen, and `trace free` leaving them
+  thawed.
