@@ -35,7 +35,8 @@ use extfmt::jbd2::{self, set_be32, set_be64, JournalSuper};
 use extfmt::recovery::{self, Plan};
 use extfmt::sb::Super;
 use extfmt::Map;
-use kcore::time::wall_clock_secs;
+use kcore::time::{boot_time_ns, wall_clock_secs};
+use kcore::trace::{self, Ext4Commit};
 use kcore::klog;
 
 use super::cache::Cache;
@@ -488,13 +489,62 @@ fn write_home(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, restart: bool) 
     true
 }
 
+/// What a commit did, for its `ext4_commit` record: whether it wrote the log
+/// at all, the journal's blocks it took, and the time its checkpoints took
+/// -- measured only while the event is on.
+#[derive(Default)]
+struct CommitStat {
+    timed: bool,
+    wrote: bool,
+    blocks: u32,
+    checkpoint_ns: u64,
+}
+
+/// `checkpoint`, its time added to `stat`'s when it is timed.
+fn checkpoint_timed(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, stat: &mut CommitStat) -> bool {
+    if !stat.timed {
+        return checkpoint(io, cache, jnl);
+    }
+    let began = boot_time_ns();
+    let ok = checkpoint(io, cache, jnl);
+    stat.checkpoint_ns = stat.checkpoint_ns.saturating_add(boot_time_ns().saturating_sub(began));
+    ok
+}
+
+/// Nanoseconds as a trace record's field holds them: `u32::MAX` for that or
+/// more.
+fn ns_field(ns: u64) -> u32 {
+    u32::try_from(ns).unwrap_or(u32::MAX)
+}
+
 impl Txn<'_> {
     /// Into the journal, all of it, and only then into what the reads see:
     /// sealed, its blocks -- revokes, descriptors, copies -- written into
     /// the log, flushed, and the commit block forced to the medium. False
     /// with nothing changed in memory: refused (too big, sealed wrong), or a
-    /// write failed and the journal is aborted.
+    /// write failed and the journal is aborted. A commit that wrote the log,
+    /// or failed, is an `ext4_commit` record; one of nothing is none.
     pub fn commit(mut self) -> bool {
+        let mut stat = CommitStat { timed: trace::on::<Ext4Commit>(), ..CommitStat::default() };
+        let began = if stat.timed { boot_time_ns() } else { 0 };
+        let seq = self.jnl.next_seq;
+        let ok = self.commit_log(&mut stat);
+        if stat.timed && (stat.wrote || !ok) {
+            trace::emit(&Ext4Commit {
+                seq,
+                blocks: stat.blocks,
+                ns: ns_field(boot_time_ns().saturating_sub(began)),
+                checkpoint_ns: ns_field(stat.checkpoint_ns),
+                pid: trace::pid(),
+                ok: u8::from(ok),
+                _pad: [0; 3],
+            });
+        }
+        ok
+    }
+
+    /// `commit`'s work, what it did into `stat`.
+    fn commit_log(&mut self, stat: &mut CommitStat) -> bool {
         if self.jnl.aborted {
             klog!(0, "ext4: the journal is aborted: nothing is committed");
             return false;
@@ -520,9 +570,11 @@ impl Txn<'_> {
             klog!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
             return false;
         }
-        if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint(self.io, self.cache, self.jnl) {
+        stat.blocks = u32::try_from(n).unwrap_or(u32::MAX);
+        if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint_timed(self.io, self.cache, self.jnl, stat) {
             return false;
         }
+        stat.wrote = true;
         let seq = self.jnl.next_seq;
         let jnl = &mut *self.jnl;
         let io = &mut *self.io;
@@ -646,7 +698,7 @@ impl Txn<'_> {
         if self.cache.pinned_len() > PIN_MAX || self.jnl.used > self.jnl.ring() / 2 {
             /* Committed whatever comes of it: a checkpoint that fails
              * aborts the journal for the calls after this one. */
-            checkpoint(self.io, self.cache, self.jnl);
+            checkpoint_timed(self.io, self.cache, self.jnl, stat);
         }
         true
     }

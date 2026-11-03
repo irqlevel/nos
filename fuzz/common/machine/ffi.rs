@@ -249,6 +249,70 @@ pub extern "C" fn kernel_task_current_or_none() -> usize {
     sched::harness(|| if sched::ctx() == sched::Ctx::Task { sched::me() } else { 0 })
 }
 
+/* ---- the tracepoints ---- */
+
+/// The flags `kcore::trace` reads, a byte an event: every one on for an
+/// input whose header says so (`runner::begin`), off for the rest -- so that
+/// the layers' sites build their records, from values a disk or a peer chose,
+/// under the overflow checks too.
+static TP_FLAGS: [core::sync::atomic::AtomicU8; kcore::trace::ID_LIMIT] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; kcore::trace::ID_LIMIT];
+
+/// Every event on, or off.
+pub fn tp_set_all(on: bool) {
+    for f in &TP_FLAGS {
+        f.store(u8::from(on), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_flags() -> *const u8 {
+    TP_FLAGS.as_ptr() as *const u8
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_count() -> usize {
+    TP_FLAGS.len()
+}
+
+/// A record, held to what kcore declares of its event -- the kernel's
+/// description, which every boot holds kcore's to: its size, each enumerated
+/// field's value one its names cover, and its padding zero.
+///
+/// # Safety
+/// `payload` is `size` readable bytes, as `kcore::trace::emit` passes them.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tp_emit(id: u16, payload: *const u8, size: usize) {
+    let Some(e) = kcore::trace::EVENTS.iter().find(|e| e.id as u16 == id) else {
+        panic!("invariant: a record of event {}, which kcore declares no payload of", id);
+    };
+    if size != e.size {
+        panic!("invariant: a record of {} of {} bytes, its payload's being {}", e.name, size, e.size);
+    }
+    // SAFETY: the caller's `size` bytes, as the declaration's callers pass them.
+    let bytes = unsafe { core::slice::from_raw_parts(payload, size) };
+    for f in e.fields {
+        let Some(field) = bytes.get(f.offset..f.offset + f.size) else {
+            panic!("invariant: {}'s field {} past its payload", e.name, f.name);
+        };
+        if f.name.starts_with('_') && field.iter().any(|&b| b != 0) {
+            panic!("invariant: {}'s {} is not zero: {:?}", e.name, f.name, field);
+        }
+        if !f.names.is_empty() && (f.size != 1 || usize::from(field[0]) >= f.names.len()) {
+            panic!("invariant: {}'s {} is {:?}, which none of its {} names is", e.name, f.name, field, f.names.len());
+        }
+    }
+    /* What the stats count: which events the inputs had records of -- the
+     * fuzzer's own work, whose allocation is not the kernel's, wherever the
+     * record was made: under a spin lock, in an interrupt. */
+    sched::harness(|| super::super::runner::reached(e.name));
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_pid() -> u32 {
+    sched::harness(|| if sched::ctx() == sched::Ctx::Task { u32::try_from(sched::me()).unwrap_or(u32::MAX) } else { u32::MAX })
+}
+
 /* ---- soft IRQs and timers ---- */
 
 #[no_mangle]

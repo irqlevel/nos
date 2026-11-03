@@ -536,8 +536,9 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
     }
     for (i, (path, ro)) in spec.disks.iter().enumerate() {
-        let letter = (b'a' + i as u8) as char;
-        let disk = FileDisk::open(path, *ro, runner, letter)?;
+        let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
+        let letter = char::from(b'a'.saturating_add(index));
+        let disk = FileDisk::open(path, *ro, runner, index)?;
         let mut id = String::new();
         let _ = write!(id, "nos-vd{}", letter);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;

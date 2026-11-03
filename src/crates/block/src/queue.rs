@@ -33,6 +33,7 @@ use kcore::once::OnceBox;
 use kcore::ring::LocklessRing;
 use kcore::sync::Event;
 use kcore::time::{boot_time_ns, Duration};
+use kcore::trace::{self, BioDone, BioSubmit};
 use kcore::klog;
 
 use crate::Disk;
@@ -72,11 +73,28 @@ extern "C" fn on_done(ctx: *mut u8, status: i32) {
         klog!(0, "block: a completion for queue {}, which there is not", entry);
         return;
     };
+    /* Before it is handed on: whoever reaps it records after this. */
+    bio_done(entry, buffer, status == 0, false);
     if !done.ring.push(buffer << 1 | usize::from(status != 0)) {
         /* Never: the ring has room for every I/O the queue can have out. */
         klog!(0, "block: queue {} has no room for a completion: its owner waits for it for good", entry);
     }
     done.event.signal();
+}
+
+/// `bio_done`: queue `entry`'s command on `buffer` done -- `ok`, or not --
+/// or, `refused`, never handed to the device after all.
+#[inline]
+fn bio_done(entry: usize, buffer: usize, ok: bool, refused: bool) {
+    if trace::on::<BioDone>() {
+        trace::emit(&BioDone {
+            entry: u16::try_from(entry).unwrap_or(u16::MAX),
+            buffer: u16::try_from(buffer).unwrap_or(u16::MAX),
+            ok: u8::from(ok),
+            refused: u8::from(refused),
+            _pad: [0; 2],
+        });
+    }
 }
 
 /// An I/O's context: its queue's entry, plus one, above; its buffer below.
@@ -212,11 +230,29 @@ impl Queue {
             done: on_done,
             ctx: context(self.entry, buffer),
         };
+        /* Recorded before the device can have it -- its doorbell may be
+         * someone else's to ring -- so that its completion comes after; a
+         * refusal is the completion, said so. */
+        if trace::on::<BioSubmit>() {
+            trace::emit(&BioSubmit {
+                sector,
+                count,
+                pid: trace::pid(),
+                entry: u16::try_from(self.entry).unwrap_or(u16::MAX),
+                buffer: u16::try_from(buffer).unwrap_or(u16::MAX),
+                in_flight: u16::try_from(self.in_flight + 1).unwrap_or(u16::MAX),
+                write: u8::from(write),
+                _pad: 0,
+            });
+        }
         /* The range is inside a buffer the queue owns, contiguous and on a
          * page; the queue frees no buffer while it has I/O on it, and goes
          * only once all of it is done (`Drop`); nothing here hands out a
          * buffer with I/O on it (`bytes`). The context is a number. */
-        unsafe { disk.submit(&io, false) }?;
+        if let Err(e) = unsafe { disk.submit(&io, false) } {
+            bio_done(self.entry, buffer, false, true);
+            return Err(e);
+        }
         self.busy[buffer] += 1;
         self.in_flight += 1;
         Ok(())

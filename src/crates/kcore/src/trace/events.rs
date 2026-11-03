@@ -253,6 +253,27 @@ names! {
         /// Its event alone, for what can wait for its next exit
         Signalled = "signalled",
     }
+
+    /// What a guest disk's request is (`blk_*`'s and `disk_*`'s `op`): hv's
+    /// `Op`, a value a kind
+    BlkOp {
+        Read = "read",
+        Write = "write",
+        Flush = "flush",
+        Discard = "discard",
+        WriteZeroes = "write_zeroes",
+    }
+
+    /// How the disk's task served a request (`disk_done`'s `how`)
+    DiskHow {
+        /// With the device, and given back by the image's reap
+        Async = "async",
+        /// Done by the image's start then and there -- its synchronous path,
+        /// zeros, or a refusal
+        AtOnce = "at_once",
+        /// A flush, a discard or a write of zeros, served on its own
+        Command = "command",
+    }
 }
 
 events! {
@@ -332,5 +353,106 @@ events! {
         vcpu: u16,
         how: u8 as RingHow,
         _pad: u8,
+    }
+
+    /// `blk_submit`: a guest's request taken off its virtio disk's ring and
+    /// handed to the backend (`hv::devices::blk`)
+    BlkSubmit = 18, "blk_submit" {
+        offset: u64,
+        len: u32,
+        pid: u32,
+        slot: u16,
+        /// Its disk among its guest's, vda 0
+        disk: u8,
+        op: u8 as BlkOp,
+        _pad: [u8; 4],
+    }
+
+    /// `blk_complete`: that request back from the backend, to be given back
+    BlkComplete = 19, "blk_complete" {
+        offset: u64,
+        len: u32,
+        pid: u32,
+        slot: u16,
+        disk: u8,
+        op: u8 as BlkOp,
+        ok: u8,
+        _pad: [u8; 3],
+    }
+
+    /// `disk_start`: the request picked up by the disk's task
+    DiskStart = 20, "disk_start" {
+        offset: u64,
+        len: u32,
+        pid: u32,
+        slot: u16,
+        disk: u8,
+        op: u8 as BlkOp,
+        _pad: [u8; 4],
+    }
+
+    /// `disk_done`: the request done in the disk's task
+    DiskDone = 21, "disk_done" {
+        pid: u32,
+        slot: u16,
+        disk: u8,
+        op: u8 as BlkOp,
+        how: u8 as DiskHow,
+        ok: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `image_sync`: a request an image served then and there
+    ImageSync = 22, "image_sync" {
+        offset: u64,
+        ns: u32,
+        len: u32,
+        pid: u32,
+        write: u8,
+        ok: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `image_note`: an image's blocks noted written over unwritten extents
+    ImageNote = 23, "image_note" {
+        from: u64,
+        ns: u32,
+        blocks: u32,
+        pid: u32,
+        ok: u8,
+        _pad: [u8; 3],
+    }
+
+    /// `bio_submit`: a command handed to a device through the block layer's
+    /// asynchronous queue
+    BioSubmit = 24, "bio_submit" {
+        sector: u64,
+        count: u32,
+        pid: u32,
+        entry: u16,
+        buffer: u16,
+        in_flight: u16,
+        write: u8,
+        _pad: u8,
+    }
+
+    /// `bio_done`: its completion, or its refusal
+    BioDone = 25, "bio_done" {
+        entry: u16,
+        buffer: u16,
+        ok: u8,
+        refused: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `ext4_commit`: an ext4 transaction committed to its journal
+    Ext4Commit = 26, "ext4_commit" {
+        seq: u32,
+        blocks: u32,
+        ns: u32,
+        checkpoint_ns: u32,
+        pid: u32,
+        ok: u8,
+        _pad: [u8; 3],
     }
 }

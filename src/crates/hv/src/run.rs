@@ -1104,7 +1104,8 @@ impl LinuxGuest {
         if p.disks >= MAX_DISKS {
             return Err(Error::NoMemory);
         }
-        let mut disk = Blk::new(backend, id)?;
+        /* `p.disks` is under MAX_DISKS, checked above. */
+        let mut disk = Blk::new(backend, id, u8::try_from(p.disks).map_err(|_| Error::NoMemory)?)?;
         let io_base = DISK_IO_BASE + (p.disks as u16) * (blk::BAR_SIZE as u16);
         let mut f = Function::device(&Blk::identity(), io_base, blk::BAR_SIZE, DISK_IRQ);
         if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {

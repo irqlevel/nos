@@ -1,8 +1,9 @@
-//! The hypervisor's tracepoints (docs/tracing.md, group `hv`): each record
-//! built from what its site has in hand -- an exit's from what the exit and
-//! the CPU's registers say of it and from hvarch's stamps around the world
-//! switch (`Run`), the rest from values the run loop (`run.rs`) and the
-//! doorbells (`smp.rs`) already hold.
+//! The hypervisor's tracepoints (docs/tracing.md, group `hv`, and a guest
+//! disk's in groups `blk` and `disk`): each record built from what its site
+//! has in hand -- an exit's from what the exit and the CPU's registers say
+//! of it and from hvarch's stamps around the world switch (`Run`), the rest
+//! from values the run loop (`run.rs`), the doorbells (`smp.rs`), the
+//! virtio disk (`devices/blk.rs`) and the module's disk task already hold.
 //!
 //! Each asks `kcore::trace::on` first -- `exit`'s caller asks it, so as to
 //! read the registers only then -- so that off, a record costs a load and a
@@ -15,9 +16,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use hvarch::x86::svm::Run;
-use kcore::trace::{self, ExitReason, HaltUntil, HvExit, HvHalt, HvInject, HvRing, HvTimer, HvWake, InjectKind,
-    RingHow, TimerHow, WakeHow};
+use kcore::trace::{self, BlkComplete, BlkOp, BlkSubmit, DiskDone, DiskHow, DiskStart, ExitReason, HaltUntil, HvExit,
+    HvHalt, HvInject, HvRing, HvTimer, HvWake, InjectKind, RingHow, TimerHow, WakeHow};
 
+use crate::devices::blk::Op;
 use crate::svm::Exit;
 
 /// What a record of an exit reads of the CPU's registers, as the exit left
@@ -237,5 +239,95 @@ pub fn timer(vcpu: u32, how: TimerHow, late_ns: u64) {
 pub fn ring(vcpu: u32, how: RingHow) {
     if trace::on::<HvRing>() {
         trace::emit(&HvRing { pid: trace::pid(), vcpu: vcpu_field(vcpu), how: how as u8, _pad: 0 });
+    }
+}
+
+/* ---- a guest disk's requests (groups `blk` and `disk`) ---- */
+
+/// A request's kind, as the trace names it.
+pub fn blk_op(op: Op) -> BlkOp {
+    match op {
+        Op::Read => BlkOp::Read,
+        Op::Write => BlkOp::Write,
+        Op::Flush => BlkOp::Flush,
+        Op::Discard => BlkOp::Discard,
+        Op::WriteZeroes => BlkOp::WriteZeroes,
+    }
+}
+
+/// A slot's number as a record's field holds it.
+fn slot_field(slot: usize) -> u16 {
+    u16::try_from(slot).unwrap_or(u16::MAX)
+}
+
+/// A request's bytes as a record's field holds them: `u32::MAX` for that or
+/// more -- never, a request's being `REQUEST_BYTES` at most.
+fn len_field(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// `blk_submit`: disk `disk`'s request in `slot` -- `op`, `len` bytes at
+/// `offset` -- handed to its backend, by the running task.
+#[inline]
+pub fn blk_submit(disk: u8, slot: usize, op: Op, offset: u64, len: usize) {
+    if trace::on::<BlkSubmit>() {
+        trace::emit(&BlkSubmit {
+            offset,
+            len: len_field(len),
+            pid: trace::pid(),
+            slot: slot_field(slot),
+            disk,
+            op: blk_op(op) as u8,
+            _pad: [0; 4],
+        });
+    }
+}
+
+/// `blk_complete`: that request back from the backend, `ok` or not.
+#[inline]
+pub fn blk_complete(disk: u8, slot: usize, op: Op, offset: u64, len: usize, ok: bool) {
+    if trace::on::<BlkComplete>() {
+        trace::emit(&BlkComplete {
+            offset,
+            len: len_field(len),
+            pid: trace::pid(),
+            slot: slot_field(slot),
+            disk,
+            op: blk_op(op) as u8,
+            ok: u8::from(ok),
+            _pad: [0; 3],
+        });
+    }
+}
+
+/// `disk_start`: the request picked up by the disk's task, the running one.
+#[inline]
+pub fn disk_start(disk: u8, slot: usize, op: Op, offset: u64, len: usize) {
+    if trace::on::<DiskStart>() {
+        trace::emit(&DiskStart {
+            offset,
+            len: len_field(len),
+            pid: trace::pid(),
+            slot: slot_field(slot),
+            disk,
+            op: blk_op(op) as u8,
+            _pad: [0; 4],
+        });
+    }
+}
+
+/// `disk_done`: the request done in the disk's task, `how`, `ok` or not.
+#[inline]
+pub fn disk_done(disk: u8, slot: usize, op: Op, how: DiskHow, ok: bool) {
+    if trace::on::<DiskDone>() {
+        trace::emit(&DiskDone {
+            pid: trace::pid(),
+            slot: slot_field(slot),
+            disk,
+            op: blk_op(op) as u8,
+            how: how as u8,
+            ok: u8::from(ok),
+            _pad: [0; 2],
+        });
     }
 }

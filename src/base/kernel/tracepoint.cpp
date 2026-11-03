@@ -255,6 +255,136 @@ const Field HV_TIMER_FIELDS[] = {
     { "late_ns", __builtin_offsetof(HvTimer, late_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
 };
 
+/* ---- a guest disk's events ----
+   Its request from the guest's virtio disk to the device and back: taken
+   by the device (blk_submit), picked up by the disk's task (disk_start),
+   served -- by the image's commands (bio_submit, bio_done), or then and
+   there (image_sync), with what written over unwritten extents noted
+   (image_note) and the journal committed (ext4_commit) -- done in the task
+   (disk_done) and given back to the guest (blk_complete). */
+
+static_assert(sizeof(BlkSubmit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(BlkComplete) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(DiskStart) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(DiskDone) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(ImageSync) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(ImageNote) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(BioSubmit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(BioDone) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(Ext4Commit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* hv's `Op`, a request's (src/crates/hv/src/devices/blk.rs) */
+const char* const BLK_OPS[] = { "read", "write", "flush", "discard", "write_zeroes" };
+/* How the disk's task served a request: with the device and reaped, done
+   by the image's start then and there, or a command served on its own */
+const char* const DISK_HOW[] = { "async", "at_once", "command" };
+
+const Field BLK_SUBMIT_FIELDS[] = {
+    /* Its disk, vda 0, and its slot: a request is said by the two */
+    { "disk", __builtin_offsetof(BlkSubmit, disk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "slot", __builtin_offsetof(BlkSubmit, slot), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(BlkSubmit, op), sizeof(u8), Kind::Enum, BLK_OPS, sizeof(BLK_OPS) / sizeof(BLK_OPS[0]) },
+    /* Where on the disk, and how many bytes: a read's or a write's; a
+       discard's or a write of zeros' len the bytes of its table of ranges,
+       16 a range, at offset 0; a flush's both 0 */
+    { "offset", __builtin_offsetof(BlkSubmit, offset), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(BlkSubmit, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* The task that took it off the ring: a vCPU's, its notify's or the
+       first CPU's round */
+    { "pid", __builtin_offsetof(BlkSubmit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field BLK_COMPLETE_FIELDS[] = {
+    { "disk", __builtin_offsetof(BlkComplete, disk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "slot", __builtin_offsetof(BlkComplete, slot), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(BlkComplete, op), sizeof(u8), Kind::Enum, BLK_OPS,
+      sizeof(BLK_OPS) / sizeof(BLK_OPS[0]) },
+    { "ok", __builtin_offsetof(BlkComplete, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "offset", __builtin_offsetof(BlkComplete, offset), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(BlkComplete, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* The task that gave it back: the first CPU's, whose round does the
+       devices' work */
+    { "pid", __builtin_offsetof(BlkComplete, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field DISK_START_FIELDS[] = {
+    { "disk", __builtin_offsetof(DiskStart, disk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "slot", __builtin_offsetof(DiskStart, slot), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(DiskStart, op), sizeof(u8), Kind::Enum, BLK_OPS, sizeof(BLK_OPS) / sizeof(BLK_OPS[0]) },
+    { "offset", __builtin_offsetof(DiskStart, offset), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(DiskStart, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* The disk's task, hv/<vm>/vd<letter> */
+    { "pid", __builtin_offsetof(DiskStart, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field DISK_DONE_FIELDS[] = {
+    { "disk", __builtin_offsetof(DiskDone, disk), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "slot", __builtin_offsetof(DiskDone, slot), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "op", __builtin_offsetof(DiskDone, op), sizeof(u8), Kind::Enum, BLK_OPS, sizeof(BLK_OPS) / sizeof(BLK_OPS[0]) },
+    { "how", __builtin_offsetof(DiskDone, how), sizeof(u8), Kind::Enum, DISK_HOW,
+      sizeof(DISK_HOW) / sizeof(DISK_HOW[0]) },
+    { "ok", __builtin_offsetof(DiskDone, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(DiskDone, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field IMAGE_SYNC_FIELDS[] = {
+    /* A request the image served then and there, through its filesystem,
+       after everything it had in flight: a write into a hole, one its
+       blocks do not line up for, an image without a device of its own */
+    { "write", __builtin_offsetof(ImageSync, write), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "offset", __builtin_offsetof(ImageSync, offset), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "len", __builtin_offsetof(ImageSync, len), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ok", __builtin_offsetof(ImageSync, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* How long it took, the drain of what was in flight first included */
+    { "ns", __builtin_offsetof(ImageSync, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(ImageSync, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field IMAGE_NOTE_FIELDS[] = {
+    /* The image's blocks written over unwritten extents, kept until now --
+       a batch of runs, `from` the first's first, `blocks` how many in all
+       -- made written in its filesystem: a transaction of its, whose commit
+       flushes the device first */
+    { "from", __builtin_offsetof(ImageNote, from), sizeof(u64), Kind::Unsigned, nullptr, 0 },
+    { "blocks", __builtin_offsetof(ImageNote, blocks), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ok", __builtin_offsetof(ImageNote, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "ns", __builtin_offsetof(ImageNote, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(ImageNote, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field BIO_SUBMIT_FIELDS[] = {
+    /* The queue's entry, and the buffer the command moves to or from */
+    { "entry", __builtin_offsetof(BioSubmit, entry), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "buffer", __builtin_offsetof(BioSubmit, buffer), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "write", __builtin_offsetof(BioSubmit, write), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "sector", __builtin_offsetof(BioSubmit, sector), sizeof(u64), Kind::Hex, nullptr, 0 },
+    { "count", __builtin_offsetof(BioSubmit, count), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* The queue's commands with the device, this one included */
+    { "in_flight", __builtin_offsetof(BioSubmit, in_flight), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(BioSubmit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field BIO_DONE_FIELDS[] = {
+    { "entry", __builtin_offsetof(BioDone, entry), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "buffer", __builtin_offsetof(BioDone, buffer), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "ok", __builtin_offsetof(BioDone, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* 1: the device's driver would not take it, and it never went out --
+       the record of the submit it ends was written before the handing */
+    { "refused", __builtin_offsetof(BioDone, refused), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field EXT4_COMMIT_FIELDS[] = {
+    /* The transaction's sequence number, and the journal's blocks it took */
+    { "seq", __builtin_offsetof(Ext4Commit, seq), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "blocks", __builtin_offsetof(Ext4Commit, blocks), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ok", __builtin_offsetof(Ext4Commit, ok), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* How long it took, a checkpoint the journal needed for room first
+       included, and that part alone */
+    { "ns", __builtin_offsetof(Ext4Commit, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "checkpoint_ns", __builtin_offsetof(Ext4Commit, checkpoint_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(Ext4Commit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
 const Field HV_RING_FIELDS[] = {
     /* The guest CPU rung */
     { "vcpu", __builtin_offsetof(HvRing, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
@@ -322,6 +452,26 @@ const Event EVENTS[] = {
     { "hv_ring", "hv", "a guest CPU rung, or notified, by whoever has something for it: another CPU's IPI, a "
       "device, a stop",
       sizeof(HvRing), sizeof(HV_RING_FIELDS) / sizeof(HV_RING_FIELDS[0]), HV_RING_FIELDS },
+    { "blk_submit", "blk", "a guest's request taken off its virtio disk's ring and handed to the disk's backend",
+      sizeof(BlkSubmit), sizeof(BLK_SUBMIT_FIELDS) / sizeof(BLK_SUBMIT_FIELDS[0]), BLK_SUBMIT_FIELDS },
+    { "blk_complete", "blk", "that request back from the backend, about to be given back to the guest",
+      sizeof(BlkComplete), sizeof(BLK_COMPLETE_FIELDS) / sizeof(BLK_COMPLETE_FIELDS[0]), BLK_COMPLETE_FIELDS },
+    { "disk_start", "disk", "a guest disk's request picked up by the disk's task, about to go to its image",
+      sizeof(DiskStart), sizeof(DISK_START_FIELDS) / sizeof(DISK_START_FIELDS[0]), DISK_START_FIELDS },
+    { "disk_done", "disk", "that request done in the disk's task, and how it was served",
+      sizeof(DiskDone), sizeof(DISK_DONE_FIELDS) / sizeof(DISK_DONE_FIELDS[0]), DISK_DONE_FIELDS },
+    { "image_sync", "disk", "a disk image's request served then and there through its filesystem, and how long "
+      "it took",
+      sizeof(ImageSync), sizeof(IMAGE_SYNC_FIELDS) / sizeof(IMAGE_SYNC_FIELDS[0]), IMAGE_SYNC_FIELDS },
+    { "image_note", "disk", "a disk image's blocks written over unwritten extents, made written in its "
+      "filesystem at last",
+      sizeof(ImageNote), sizeof(IMAGE_NOTE_FIELDS) / sizeof(IMAGE_NOTE_FIELDS[0]), IMAGE_NOTE_FIELDS },
+    { "bio_submit", "disk", "a command handed to a disk's device through the block layer's asynchronous queue",
+      sizeof(BioSubmit), sizeof(BIO_SUBMIT_FIELDS) / sizeof(BIO_SUBMIT_FIELDS[0]), BIO_SUBMIT_FIELDS },
+    { "bio_done", "disk", "that command's completion, from the device's interrupt -- or its refusal",
+      sizeof(BioDone), sizeof(BIO_DONE_FIELDS) / sizeof(BIO_DONE_FIELDS[0]), BIO_DONE_FIELDS },
+    { "ext4_commit", "fs", "an ext4 transaction committed to its journal, and how long that took",
+      sizeof(Ext4Commit), sizeof(EXT4_COMMIT_FIELDS) / sizeof(EXT4_COMMIT_FIELDS[0]), EXT4_COMMIT_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
