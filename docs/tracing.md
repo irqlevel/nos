@@ -83,19 +83,118 @@ An NMI that comes in while its CPU is writing takes nothing and is counted
 | `trace on <event\|group\|all>...` | turned on (the rings made first, if there are none); names may be comma-separated |
 | `trace off <...>` | turned off; what was recorded stays |
 | `trace show [n] [cpu=N] [event...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events named, only theirs |
-| `trace stat` | each CPU's ring: written, kept, dropped |
+| `trace dump [n] [cpu=N] [event...]` | the same window as JSON, a record a line, times in exact ns: what `scripts/trace-decode.py` reads |
+| `trace latency [n] [cpu=N] [event...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs |
+| `trace stat` | each CPU's ring: written, kept, dropped; and the wakeup trigger, armed or what it fired on |
 | `trace clear` | what is recorded forgotten: `show` starts after it |
 | `trace size <KiB>` | the rings' size, 64 KiB times a power of two up to 64 MiB; rings there are made again at it, what they held with them |
 | `trace free` | every event off, every ring given back |
-| `trace freeze` / `thaw` | nothing more recorded until thawed, so that what is in the rings stays as it was |
+| `trace freeze [wakeup>N<ns\|us\|ms\|s>]` / `thaw` | nothing more recorded until thawed, so that what is in the rings stays as it was -- at once, or when a wakeup waits longer than N ([below](#a-wakeup-that-waited-too-long)) |
 | `trace test [n]` | `n` records of the `test` event on this CPU |
 | `trace bench` | what a tracepoint costs this CPU off and on |
 
 A record prints as its time since boot, its CPU, the event's name and its
 fields as `name=value` -- from the event's description, one format for all.
+`dump` prints the same records as objects -- `{"t":<ns>,"cpu":N,"ev":"<name>","f":{...}}`,
+the CPU outside the fields' object, as some of them are called `cpu` too --
+so a host reads numbers, not a format.
 
 `tracepoints=<list>` on the kernel command line turns events on as the boot
 ends, once every CPU has its ring ([kernel parameters](kernel-parameters.md)).
+
+## How long a woken task waited
+
+`trace latency` is the shell's own answer to the question a schedule trace
+is usually read for: a task woken at one instant and running at another,
+how long between? It walks the window `show` prints -- the newest `n`
+records of every CPU, merged by time -- keeping each `sched_wakeup`'s pid
+and instant in a table by pid (ids are 0 to 255, so the table is an array),
+and pairs it with the first `sched_switch` after it whose next task is that
+pid. The difference is the wait. A wakeup whose switch is not in the window
+-- still waiting, or its record written over -- is counted as not run in
+it, never guessed.
+
+```
+> trace on sched
+> trace latency 4000
+trace latency: 2000 records on 4 cpus -- 43 wakeups, 43 ran in the window, 0 not run in it
+  wait p50 208ns p90 10.1us p99 15.3us max 20.2us
+  the longest:
+     20.2us pid 9 udpsh        cpu 1 -> 1
+     15.3us pid 11 probe/wait  cpu 3 -> 3
+```
+
+The percentiles are exact, not buckets: the waits are sorted (a quicksort
+over an explicit 32-entry stack, no allocation beyond the array). The five
+longest say what a histogram cannot: which task, and whether it ran on the
+CPU it was queued on. `sched`'s own wakeup histogram ([Scheduler](scheduler.md#what-it-is-measured-by))
+is the live one, always on and coarse; this is the window's, exact, and it
+works on a frozen trace after the fact.
+
+The idle events are a CPU's own every few microseconds, so a ring holds
+milliseconds of them: leave `idle` out of a window a latency is read from,
+or the wakeups a probe left are written over before the read.
+
+## A wakeup that waited too long
+
+The rings wrap, so the trace of a 10 ms wait is gone a few milliseconds
+later unless something keeps it. `trace freeze wakeup>N` arms a trigger:
+the scheduler asks on every wakeup (the wait is already in its hand, in
+`TaskQueue::note_run`) and the first one over N freezes the rings where
+they are. The trigger then writes down what it fired on, which `trace stat`
+prints -- the wait itself is the one record that is not in the rings,
+because it froze them:
+
+```
+> trace freeze wakeup>1ms
+trace: armed -- the rings freeze when a wakeup waits over 1.000ms
+> ...
+> trace stat
+trace: rings of 1024 KiB a cpu (16384 records), frozen
+trace: frozen by the wakeup trigger: pid 42 probe/wait waited 12.400ms on cpu 0, at 3.249165
+```
+
+Arming it thaws the rings first -- a frozen ring has nothing for a trigger
+to keep -- and it is armed and spent with an atomic each way: the scheduler
+reads a word that is 0 unless a trigger is armed, and the first CPU to fire
+claims the record with an exchange, the record a seqlock `trace stat` reads
+as any other. `trace thaw` records again and disarms. A wakeup that
+claimed the trigger a moment before it was re-armed can still freeze the
+new arming; the record says which wait it was.
+
+## Reading a trace on the host
+
+`trace dump` is the window as JSON lines, and `scripts/trace-decode.py`
+reads them back from a file, a saved serial log or a netconsole capture:
+
+```
+> trace on sched
+> sched probe spinners=2 ms=300
+> trace dump 4000
+...
+```
+
+then, on the host (from the serial log, filtering out everything that is
+not a record):
+
+```
+scripts/trace-decode.py dump.txt                      # what the window holds
+scripts/trace-decode.py --chrome trace.json dump.txt  # chrome://tracing or Perfetto
+scripts/trace-decode.py --json raw.json dump.txt      # the records, normalised
+scripts/trace-decode.py --latency dump.txt            # every wait, longest first
+```
+
+Its text says how many switches, wakeups, blocks and idles the window has,
+which task ran on each CPU and for how long, and the waits -- the same
+pairing the kernel's `trace latency` does, computed a second way from the
+same records. The Chrome trace is a track a CPU, a slice every stretch a
+task ran on it, a wakeup or a block an instant event on the track of the
+CPU it happened on: a schedule read as a picture of what waited for what.
+
+The shell's UDP reply is 32 KiB, so a `dump` of more than a couple of
+hundred records does not arrive whole over it; read the serial console or
+netconsole for a big window, or dump in parts -- the decode does not care
+where the lines were cut.
 
 ## The scheduler's events
 
