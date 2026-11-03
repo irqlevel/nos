@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use kcore::consts::{MAX_CPUS, PAGE_SIZE};
 use kcore::frame::{huge_pool, Frame, HugeFrame, HUGE_PAGES, HUGE_SIZE};
-use kcore::trace;
+use kcore::klog;
 
 /// The byte the test writes at `at`: a different run on every line of the
 /// page, and never zero, which is what a fresh frame holds.
@@ -87,7 +87,7 @@ pub fn selftest() {
     let bad = check.bad.load(Ordering::Relaxed);
     assert!(bad == 0, "frame selftest: cpus {:#x} read the frame back wrong", bad);
 
-    trace!(0, "frame selftest: passed on cpus {:#x}", online);
+    klog!(0, "frame selftest: passed on cpus {:#x}", online);
     huge_selftest();
 }
 
@@ -128,5 +128,5 @@ fn huge_selftest() {
     drop(block);
     assert!(huge_pool().free == pool.free, "huge frame selftest: a block given back, and the pool's free count {} \
         where it was {}", huge_pool().free, pool.free);
-    trace!(0, "huge frame selftest: passed, a block of {} at {:#x} -- the pool {} of them", HUGE_SIZE, at, pool.blocks);
+    klog!(0, "huge frame selftest: passed, a block of {} at {:#x} -- the pool {} of them", HUGE_SIZE, at, pool.blocks);
 }

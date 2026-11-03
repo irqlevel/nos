@@ -1,7 +1,7 @@
 #include "cpu.h"
 #include "interrupt.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "watchdog.h"
 #include "softirq.h"
 #include "profiler.h"
@@ -175,7 +175,7 @@ void Cpu::init(ulong index)
     index_ = index;
     state_ |= STATE_INITED;
 
-    trace(0, "Cpu 0x%p %lu inited", this, index_);
+    klog(0, "Cpu 0x%p %lu inited", this, index_);
 }
 
 void Cpu::reset()
@@ -563,7 +563,7 @@ void Cpu::ipi(Context* ctx)
 
     if (exit)
     {
-        trace(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
+        klog(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
             index_, state_, ipi_conter_.get());
 
         /* Complete any IPI tasks queued during the exit transition and refuse

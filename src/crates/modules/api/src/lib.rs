@@ -305,7 +305,7 @@ fn start_locked(state: &State, out: &mut Output) -> Result<(), String> {
     let allow = core::mem::take(&mut config.allow);
     let (identity, made) = state.files.with(|_| files::identity(&state.dir, &cert_ips()))?;
     if made {
-        kcore::trace!(0, "api: the host's key made: {}", files::hex(&identity.key_fingerprint));
+        kcore::klog!(0, "api: the host's key made: {}", files::hex(&identity.key_fingerprint));
     }
     let clients = state.files.with(|_| files::read_clients(&state.dir))?;
     let tls = Arc::new(server::tls_server(&identity, &clients)?);
@@ -330,7 +330,7 @@ fn start_locked(state: &State, out: &mut Output) -> Result<(), String> {
     let port = shared.config.port;
     let names = shared.config.listen.join(", ");
     state.server.with(|s| *s = Some(Box::new(Server { shared, listeners })));
-    kcore::trace!(0, "api: serving port {} on {}, host key {}", port, names, fingerprint);
+    kcore::klog!(0, "api: serving port {} on {}, host key {}", port, names, fingerprint);
     let _ = writeln!(out, "api: serving port {} on {} -- host key {} -- {} clients", port, names, fingerprint, count);
     if count == 0 {
         let _ = writeln!(out, "api: nobody is let in yet -- api client add <name> <admin|read> <fingerprint>");

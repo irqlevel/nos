@@ -7,7 +7,7 @@
 
 use kcore::barrier::dma_wmb;
 use kcore::io::MmioRegion;
-use kcore::trace;
+use kcore::klog;
 
 use crate::queue::MAX_DESCRIPTORS;
 use crate::transport::{QueueLayout, Transport};
@@ -68,7 +68,7 @@ impl MmioTransport {
 
         let version = regs.read32(REG_VERSION);
         if version != VERSION {
-            trace!(0, "virtio-mmio {:#x}: version {} is not supported (needs \
+            klog!(0, "virtio-mmio {:#x}: version {} is not supported (needs \
                 -global virtio-mmio.force-legacy=false)", slot.base, version);
             return None;
         }

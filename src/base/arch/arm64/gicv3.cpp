@@ -1,7 +1,7 @@
 #include "gicv3.h"
 #include "board.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <mm/page_table.h>
 #include <mm/mmio.h>
@@ -76,7 +76,7 @@ bool Gic::setup(ulong gicd_phys, ulong gicr_phys, ulong gicr_size)
     {
     }
 
-    trace(0, "Gic: gicd 0x%lX gicr 0x%lX max_int_id %lu", gicd_base_, gicr_base_,
+    klog(0, "Gic: gicd 0x%lX gicr 0x%lX max_int_id %lu", gicd_base_, gicr_base_,
         (ulong)max_int_id);
 
     if (!cpu_init())
@@ -108,7 +108,7 @@ bool Gic::cpu_init()
     ulong rd = redist_base_for_cpu();
     if (rd == 0)
     {
-        trace(0, "Gic: no redistributor for mpidr 0x%lX", read_mpidr());
+        klog(0, "Gic: no redistributor for mpidr 0x%lX", read_mpidr());
         return false;
     }
 

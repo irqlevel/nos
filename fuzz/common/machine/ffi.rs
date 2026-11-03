@@ -295,7 +295,7 @@ pub unsafe extern "C" fn kernel_get_random(buf: *mut u8, len: usize) -> i32 {
 /// `msg` points at `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_trace(level: u32, msg: *const u8, len: usize) {
-    // SAFETY: the caller's message, `kcore::trace`'s buffer.
+    // SAFETY: the caller's message, `kcore::klog`'s buffer.
     let msg = unsafe { core::slice::from_raw_parts(msg, len) };
     sched::harness(|| super::trace(level, msg))
 }

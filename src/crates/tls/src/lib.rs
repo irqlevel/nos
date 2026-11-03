@@ -14,7 +14,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use kcore::trace;
+use kcore::klog;
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::{ServerName, UnixTime};
 use rustls::time_provider::TimeProvider;
@@ -118,7 +118,7 @@ impl<T: Transport> TlsStream<T> {
         let server_name = match ServerName::try_from(host) {
             Ok(name) => name.to_owned(),
             Err(e) => {
-                trace!(0, "tls: bad server name {}: {:?}", host, e);
+                klog!(0, "tls: bad server name {}: {:?}", host, e);
                 return None;
             }
         };
@@ -132,7 +132,7 @@ impl<T: Transport> TlsStream<T> {
         {
             Ok(builder) => builder,
             Err(e) => {
-                trace!(0, "tls: config: {:?}", e);
+                klog!(0, "tls: config: {:?}", e);
                 return None;
             }
         };
@@ -143,7 +143,7 @@ impl<T: Transport> TlsStream<T> {
         let conn = match UnbufferedClientConnection::new(Arc::new(config), server_name) {
             Ok(conn) => conn,
             Err(e) => {
-                trace!(0, "tls: connection: {:?}", e);
+                klog!(0, "tls: connection: {:?}", e);
                 return None;
             }
         };
@@ -174,7 +174,7 @@ impl<T: Transport> TlsStream<T> {
             .sock
             .recv(&mut self.incoming[self.incoming_used..], IO_TIMEOUT_MS);
         if got <= 0 {
-            trace!(0, "tls: receive ended: {}", got);
+            klog!(0, "tls: receive ended: {}", got);
             return got;
         }
 
@@ -201,7 +201,7 @@ impl<T: Transport> TlsStream<T> {
         let state = match state {
             Ok(state) => state,
             Err(e) => {
-                trace!(0, "tls: {:?}", e);
+                klog!(0, "tls: {:?}", e);
                 return None;
             }
         };
@@ -213,7 +213,7 @@ impl<T: Transport> TlsStream<T> {
                     let record = match record {
                         Ok(record) => record,
                         Err(e) => {
-                            trace!(0, "tls: record: {:?}", e);
+                            klog!(0, "tls: record: {:?}", e);
                             return None;
                         }
                     };
@@ -230,7 +230,7 @@ impl<T: Transport> TlsStream<T> {
             ConnectionState::EncodeTlsData(mut encoder) => match encoder.encode(outgoing) {
                 Ok(len) => {
                     if !sock.send_all(&outgoing[..len]) {
-                        trace!(0, "tls: send of {} bytes failed", len);
+                        klog!(0, "tls: send of {} bytes failed", len);
                         return None;
                     }
                     Step::Progress
@@ -238,7 +238,7 @@ impl<T: Transport> TlsStream<T> {
                 /* The buffer is sized for a TLS record; a handshake message
                    that does not fit is not something we can send. */
                 Err(e) => {
-                    trace!(0, "tls: encode: {:?}", e);
+                    klog!(0, "tls: encode: {:?}", e);
                     return None;
                 }
             },
@@ -257,12 +257,12 @@ impl<T: Transport> TlsStream<T> {
                     match writer.encrypt(data, outgoing) {
                         Ok(len) => {
                             if !sock.send_all(&outgoing[..len]) {
-                                trace!(0, "tls: send of {} bytes failed", len);
+                                klog!(0, "tls: send of {} bytes failed", len);
                                 return None;
                             }
                         }
                         Err(e) => {
-                            trace!(0, "tls: encrypt: {:?}", e);
+                            klog!(0, "tls: encrypt: {:?}", e);
                             return None;
                         }
                     }
@@ -301,7 +301,7 @@ impl<T: Transport> TlsStream<T> {
             }
         }
 
-        trace!(0, "tls: handshake unfinished after {} steps", MAX_HANDSHAKE_STEPS);
+        klog!(0, "tls: handshake unfinished after {} steps", MAX_HANDSHAKE_STEPS);
         self.failed = true;
         false
     }

@@ -17,7 +17,7 @@ use kcore::dma::PhysMapping;
 use kcore::io::{MmioRegion, Port};
 use kcore::msix::MsixTable;
 use kcore::pci::PciDevice;
-use kcore::trace;
+use kcore::klog;
 
 use crate::queue::MAX_DESCRIPTORS;
 use crate::transport::{QueueLayout, Transport};
@@ -129,7 +129,7 @@ impl PciTransport {
         while let Some(offset) = cap {
             seen += 1;
             if seen > MAX_CAPS {
-                trace!(0, "virtio-pci: the capability list is cyclic or too long");
+                klog!(0, "virtio-pci: the capability list is cyclic or too long");
                 return None;
             }
 
@@ -155,7 +155,7 @@ impl PciTransport {
                         }
                     }
                     None => {
-                        trace!(0, "virtio-pci: no BAR {} for capability type {}", bar, cfg_type);
+                        klog!(0, "virtio-pci: no BAR {} for capability type {}", bar, cfg_type);
                         return None;
                     }
                 }
@@ -171,7 +171,7 @@ impl PciTransport {
         let (notify_base, notify_multiplier) = match notify {
             Some(notify) => notify,
             None => {
-                trace!(0, "virtio-pci: a common config with no notify window");
+                klog!(0, "virtio-pci: a common config with no notify window");
                 return None;
             }
         };
@@ -181,7 +181,7 @@ impl PciTransport {
         let isr = match isr {
             Some(isr) => isr,
             None => {
-                trace!(0, "virtio-pci: a common config with no ISR block");
+                klog!(0, "virtio-pci: a common config with no ISR block");
                 return None;
             }
         };
@@ -204,7 +204,7 @@ impl PciTransport {
     fn probe_legacy(dev: &PciDevice) -> Option<Self> {
         let bar0 = dev.get_bar(0);
         if bar0 & 1 == 0 {
-            trace!(0, "virtio-pci: BAR0 is not an I/O port region");
+            klog!(0, "virtio-pci: BAR0 is not an I/O port region");
             return None;
         }
 
@@ -213,7 +213,7 @@ impl PciTransport {
             return None;
         }
 
-        trace!(0, "virtio-pci: legacy transport at I/O {:#x}", io);
+        klog!(0, "virtio-pci: legacy transport at I/O {:#x}", io);
         Some(Self {
             regs: Regs::Legacy { io },
             msix: None,
@@ -272,7 +272,7 @@ fn map_bar(
 
     let low = dev.get_bar(bar);
     if low & 1 != 0 {
-        trace!(0, "virtio-pci: BAR {} is an I/O port region, not memory", bar);
+        klog!(0, "virtio-pci: BAR {} is an I/O port region, not memory", bar);
         return None;
     }
 
@@ -309,7 +309,7 @@ fn map_bar(
     let mapping = PhysMapping::map(phys, pages)?;
     let va = mapping.as_mut_ptr() as u64;
 
-    trace!(0, "virtio-pci: BAR {} at {:#x}, {} pages, mapped at {:#x}", bar, phys, pages, va);
+    klog!(0, "virtio-pci: BAR {} at {:#x}, {} pages, mapped at {:#x}", bar, phys, pages, va);
 
     bars[index] = va;
     mappings[index] = Some(mapping);

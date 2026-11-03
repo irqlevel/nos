@@ -539,8 +539,8 @@ rounds the stack pointer down to a 32 KiB boundary and reads the pointer
 from there — no per-CPU variable, no register convention. It works because
 the page allocator's 8-page bucket hands out blocks aligned to their own
 size. The bottom page is a tripwire: a stack pointer inside it is a
-`BUG_ON`, not a silent corruption. There is deliberately no `trace()` in
-`get_current_task` — tracing takes a lock, which calls `preempt_disable`, which
+`BUG_ON`, not a silent corruption. There is deliberately no `klog()` in
+`get_current_task` — logging takes a lock, which calls `preempt_disable`, which
 calls `get_current_task`. Every lock asks that way (`preempt_current_task`) until a
 panic has begun; from then on a stack that is no task's -- x86's double
 fault's, a static one -- has nothing to count, since the panic switches to no

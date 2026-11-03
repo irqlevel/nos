@@ -230,13 +230,13 @@ impl Drop for Hv {
         if was.busy != 0 {
             /* Cannot be: every guest was stopped and dropped above, and a
              * dropped guest's VMCS is current nowhere. Said anyway. */
-            kcore::trace!(0, "hv: WARNING -- a guest's VMCS is still current on cpu mask 0x{:x}", was.busy);
+            kcore::klog!(0, "hv: WARNING -- a guest's VMCS is still current on cpu mask 0x{:x}", was.busy);
         }
         let left = machine.hardware_mask();
         if left != 0 {
-            kcore::trace!(0, "hv: WARNING -- unloading with the extension still on for cpu mask 0x{:x}", left);
+            kcore::klog!(0, "hv: WARNING -- unloading with the extension still on for cpu mask 0x{:x}", left);
         }
-        kcore::trace!(0, "hv: unloaded, extension off for cpu mask 0x{:x}", was.off);
+        kcore::klog!(0, "hv: unloaded, extension off for cpu mask 0x{:x}", was.off);
     }
 }
 
@@ -336,7 +336,7 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
     let provider = match provider::register(state.clone()) {
         Ok(p) => Some(p),
         Err(status) => {
-            kcore::trace!(0, "hv: the vm provider is not on the management bus -- {}", status.name());
+            kcore::klog!(0, "hv: the vm provider is not on the management bus -- {}", status.name());
             None
         }
     };
@@ -349,11 +349,11 @@ fn init(given: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn 
              * gone and the next `hv on` would hand it different ones. */
             let left_on = machine.hardware_mask();
             if left_on != 0 {
-                kcore::trace!(0, "hv: WARNING -- already on for cpu mask 0x{:x} before this load", left_on);
+                kcore::klog!(0, "hv: WARNING -- already on for cpu mask 0x{:x} before this load", left_on);
             }
-            kcore::trace!(0, "hv: loaded -- {}, ready", ext.vendor().name());
+            kcore::klog!(0, "hv: loaded -- {}, ready", ext.vendor().name());
         }
-        Err(e) => kcore::trace!(0, "hv: loaded -- no guest can run here: {}", e),
+        Err(e) => kcore::klog!(0, "hv: loaded -- no guest can run here: {}", e),
     }
 
     Ok(Box::new(Hv {

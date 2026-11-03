@@ -2,18 +2,18 @@ unsafe extern "C" {
     fn kernel_trace(level: u32, msg: *const u8, len: usize);
 }
 
-pub fn trace(level: u32, s: &str) {
+pub fn klog(level: u32, s: &str) {
     unsafe {
         kernel_trace(level, s.as_ptr(), s.len());
     }
 }
 
-pub struct TraceBuf {
+pub struct KlogBuf {
     buf: [u8; 512],
     pos: usize,
 }
 
-impl TraceBuf {
+impl KlogBuf {
     pub const fn new() -> Self {
         Self {
             buf: [0u8; 512],
@@ -35,7 +35,7 @@ impl TraceBuf {
     }
 }
 
-impl core::fmt::Write for TraceBuf {
+impl core::fmt::Write for KlogBuf {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         let bytes = s.as_bytes();
         let remaining = self.buf.len() - self.pos;
@@ -51,10 +51,10 @@ impl core::fmt::Write for TraceBuf {
 }
 
 #[macro_export]
-macro_rules! trace {
+macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
         use core::fmt::Write;
-        let mut buf = $crate::trace::__TraceBuf::new();
+        let mut buf = $crate::klog::__KlogBuf::new();
         let f = file!();
         let fname = match f.rfind('/') {
             Some(i) => &f[i + 1..],
@@ -62,8 +62,8 @@ macro_rules! trace {
         };
         let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
         let _ = write!(buf, $($arg)*);
-        $crate::trace::trace($level, buf.as_str());
+        $crate::klog::klog($level, buf.as_str());
     }};
 }
 
-pub use TraceBuf as __TraceBuf;
+pub use KlogBuf as __KlogBuf;

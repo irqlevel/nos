@@ -2,7 +2,7 @@
 
 #include <include/const.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 
 #include <lib/lock.h>
 #include <lib/stdlib.h>
@@ -27,10 +27,10 @@ Pool::~Pool()
 {
     stdlib::AutoLock lock(lock_);
 
-    trace(0, "0x%p block_size %lu peekBlockCount %lu", this, block_size_, peek_block_count_);
+    klog(0, "0x%p block_size %lu peekBlockCount %lu", this, block_size_, peek_block_count_);
 
     if (block_count_ != 0)
-        trace(0, "0x%p block_size %lu blockCount %lu", this, block_size_, block_count_);
+        klog(0, "0x%p block_size %lu blockCount %lu", this, block_size_, block_count_);
 
     /* The blocks nobody freed, page by page: the pool keeps no list of the
        blocks out, which every allocation would have to take Lock to join */
@@ -45,7 +45,7 @@ Pool::~Pool()
                 Block* block = block_at(page, i);
                 ulong tag = static_cast<ulong>(block->tag.get());
                 if (tag != FREED_TAG)
-                    trace(0, "0x%p block 0x%p tag 0x%lX", this, block, tag);
+                    klog(0, "0x%p block 0x%p tag 0x%lX", this, block, tag);
             }
         }
     }

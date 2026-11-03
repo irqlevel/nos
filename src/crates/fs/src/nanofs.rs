@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use block::Disk;
 use kcore::crc32::{crc32_update, crc32_with_hole};
 use kcore::dma::DmaBuffer;
-use kcore::trace;
+use kcore::klog;
 
 use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
@@ -129,7 +129,7 @@ impl Io {
         if self.dev.read(start, &mut buf[..BLOCK_SIZE]).is_ok() {
             return true;
         }
-        trace!(0, "nanofs: read of block {} failed", block);
+        klog!(0, "nanofs: read of block {} failed", block);
         false
     }
 
@@ -138,7 +138,7 @@ impl Io {
         if self.dev.write(start, &buf[..BLOCK_SIZE], fua).is_ok() {
             return true;
         }
-        trace!(0, "nanofs: write of block {} failed", block);
+        klog!(0, "nanofs: write of block {} failed", block);
         false
     }
 
@@ -183,7 +183,7 @@ impl NanoFs {
     pub fn new(dev: Disk) -> Option<NanoFs> {
         let sector_size = dev.sector_size();
         if sector_size == 0 || BLOCK_SIZE as u64 % sector_size != 0 {
-            trace!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
+            klog!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
             return None;
         }
 
@@ -194,7 +194,7 @@ impl NanoFs {
             || walking.try_reserve_exact(INODE_COUNT as usize).is_err()
             || verified.try_reserve_exact(INODE_COUNT as usize).is_err()
         {
-            trace!(0, "nanofs: no memory for the vnode table");
+            klog!(0, "nanofs: no memory for the vnode table");
             return None;
         }
         vnodes.resize(INODE_COUNT as usize, None);
@@ -242,7 +242,7 @@ impl NanoFs {
 
     fn read_inode(&mut self, idx: u32) -> bool {
         if idx >= INODE_COUNT {
-            trace!(0, "nanofs: inode {} is out of range", idx);
+            klog!(0, "nanofs: inode {} is out of range", idx);
             return false;
         }
         self.io.read_block(INODE_START + idx, self.inode.as_mut_slice())
@@ -250,7 +250,7 @@ impl NanoFs {
 
     fn write_inode(&mut self, idx: u32, fua: bool) -> bool {
         if idx >= INODE_COUNT {
-            trace!(0, "nanofs: inode {} is out of range", idx);
+            klog!(0, "nanofs: inode {} is out of range", idx);
             return false;
         }
         let sum = crc32_with_hole(&self.inode.as_slice()[..BLOCK_SIZE], IN_CHECKSUM);
@@ -291,7 +291,7 @@ impl NanoFs {
         match take_free_bit(self.inode_bitmap(), INODE_COUNT) {
             Some(idx) => Some(idx),
             None => {
-                trace!(0, "nanofs: no free inodes");
+                klog!(0, "nanofs: no free inodes");
                 None
             }
         }
@@ -309,7 +309,7 @@ impl NanoFs {
         match take_free_bit(self.data_bitmap(), DATA_BLOCK_COUNT) {
             Some(idx) => Some(idx),
             None => {
-                trace!(0, "nanofs: no free data blocks");
+                klog!(0, "nanofs: no free data blocks");
                 None
             }
         }
@@ -327,7 +327,7 @@ impl NanoFs {
 
     pub fn mount(&mut self, read_only: bool) -> bool {
         if self.mounted {
-            trace!(0, "nanofs: already mounted");
+            klog!(0, "nanofs: already mounted");
             return false;
         }
         if !fits(&self.io.dev) {
@@ -336,22 +336,22 @@ impl NanoFs {
         self.read_only = read_only;
 
         if !self.io.read_block(0, self.sb.as_mut_slice()) {
-            trace!(0, "nanofs: the superblock could not be read");
+            klog!(0, "nanofs: the superblock could not be read");
             return false;
         }
 
         if self.sb_u32(SB_MAGIC) != MAGIC {
-            trace!(0, "nanofs: bad magic {:#x}", self.sb_u32(SB_MAGIC));
+            klog!(0, "nanofs: bad magic {:#x}", self.sb_u32(SB_MAGIC));
             return false;
         }
         if self.sb_u32(SB_VERSION) != VERSION {
-            trace!(0, "nanofs: unsupported version {}", self.sb_u32(SB_VERSION));
+            klog!(0, "nanofs: unsupported version {}", self.sb_u32(SB_VERSION));
             return false;
         }
 
         let sum = crc32_with_hole(&self.sb.as_slice()[..BLOCK_SIZE], SB_CHECKSUM);
         if sum != self.sb_u32(SB_CHECKSUM) {
-            trace!(0, "nanofs: the superblock's checksum does not match");
+            klog!(0, "nanofs: the superblock's checksum does not match");
             return false;
         }
 
@@ -365,7 +365,7 @@ impl NanoFs {
             || self.sb_u32(SB_INODE_START) != INODE_START
             || self.sb_u32(SB_DATA_START) != DATA_START
         {
-            trace!(0, "nanofs: unsupported layout (block size {}, {} inodes, {} data blocks, inodes at {}, data at {})",
+            klog!(0, "nanofs: unsupported layout (block size {}, {} inodes, {} data blocks, inodes at {}, data at {})",
                 self.sb_u32(SB_BLOCK_SIZE), self.sb_u32(SB_INODE_COUNT),
                 self.sb_u32(SB_DATA_BLOCK_COUNT), self.sb_u32(SB_INODE_START),
                 self.sb_u32(SB_DATA_START));
@@ -373,7 +373,7 @@ impl NanoFs {
         }
 
         if !self.load_tree() {
-            trace!(0, "nanofs: the root inode could not be read");
+            klog!(0, "nanofs: the root inode could not be read");
             self.free_all();
             return false;
         }
@@ -381,7 +381,7 @@ impl NanoFs {
         self.mark_reachable_allocated();
 
         self.mounted = true;
-        trace!(0, "nanofs: mounted, {} inodes, {} data blocks", INODE_COUNT, DATA_BLOCK_COUNT);
+        klog!(0, "nanofs: mounted, {} inodes, {} data blocks", INODE_COUNT, DATA_BLOCK_COUNT);
         true
     }
 
@@ -416,7 +416,7 @@ impl NanoFs {
     /// filesystem mounted read-only.
     fn writable(&self) -> bool {
         if self.read_only {
-            trace!(0, "nanofs: read-only");
+            klog!(0, "nanofs: read-only");
         }
         !self.read_only
     }
@@ -438,7 +438,7 @@ impl NanoFs {
             }
 
             if !bit_test(self.inode_bitmap(), i as usize) {
-                trace!(0, "nanofs: reachable inode {} was not marked allocated, repairing", i);
+                klog!(0, "nanofs: reachable inode {} was not marked allocated, repairing", i);
                 bit_set(self.inode_bitmap(), i as usize);
                 repaired = true;
             }
@@ -460,7 +460,7 @@ impl NanoFs {
                 if block >= DATA_BLOCK_COUNT || bit_test(self.data_bitmap(), block as usize) {
                     continue;
                 }
-                trace!(0, "nanofs: live data block {} (inode {}) was not marked allocated, repairing",
+                klog!(0, "nanofs: live data block {} (inode {}) was not marked allocated, repairing",
                     block, i);
                 bit_set(self.data_bitmap(), block as usize);
                 repaired = true;
@@ -508,7 +508,7 @@ impl NanoFs {
             let parent = top.node;
 
             if child >= INODE_COUNT {
-                trace!(0, "nanofs: inode {} is out of range", child);
+                klog!(0, "nanofs: inode {} is out of range", child);
                 continue;
             }
             /* A corrupted image may name this directory itself, an
@@ -526,7 +526,7 @@ impl NanoFs {
             self.tree.insert_child(parent, node);
             if let Some(entries) = dir {
                 if stack.try_reserve(1).is_err() {
-                    trace!(0, "nanofs: no memory to walk directory {}", child);
+                    klog!(0, "nanofs: no memory to walk directory {}", child);
                     continue;
                 }
                 self.walking[child as usize] = true;
@@ -541,7 +541,7 @@ impl NanoFs {
     /// is free, damaged or out of range.
     fn load_inode(&mut self, idx: u32) -> Option<(NodeId, Option<Vec<u32>>)> {
         if idx >= INODE_COUNT {
-            trace!(0, "nanofs: inode {} is out of range", idx);
+            klog!(0, "nanofs: inode {} is out of range", idx);
             return None;
         }
 
@@ -550,11 +550,11 @@ impl NanoFs {
         }
         let node_type = self.in_u32(IN_TYPE);
         if node_type == TYPE_FREE {
-            trace!(0, "nanofs: inode {} is free", idx);
+            klog!(0, "nanofs: inode {} is free", idx);
             return None;
         }
         if !self.inode_ok() {
-            trace!(0, "nanofs: inode {}'s checksum does not match", idx);
+            klog!(0, "nanofs: inode {}'s checksum does not match", idx);
             return None;
         }
 
@@ -569,7 +569,7 @@ impl NanoFs {
             match self.tree.alloc(&name[..len], kind) {
                 Some(node) => node,
                 None => {
-                    trace!(0, "nanofs: no memory for the vnode of inode {}", idx);
+                    klog!(0, "nanofs: no memory for the vnode of inode {}", idx);
                     return None;
                 }
             }
@@ -593,7 +593,7 @@ impl NanoFs {
     fn dir_entries(&mut self, idx: u32, block: u32, count: u32) -> Vec<u32> {
         let mut entries = Vec::new();
         if block >= DATA_BLOCK_COUNT {
-            trace!(0, "nanofs: inode {} names data block {}, which is not one", idx, block);
+            klog!(0, "nanofs: inode {} names data block {}, which is not one", idx, block);
             return entries;
         }
         if !self.io.read_block(DATA_START + block, self.data.as_mut_slice()) {
@@ -602,7 +602,7 @@ impl NanoFs {
 
         let count = (count as usize).min(MAX_DIR_ENTRIES);
         if entries.try_reserve_exact(count).is_err() {
-            trace!(0, "nanofs: no memory for {} directory entries", count);
+            klog!(0, "nanofs: no memory for {} directory entries", count);
             return entries;
         }
         for i in 0..count {
@@ -626,14 +626,14 @@ impl NanoFs {
     /// Read a directory's inode into its own buffer, checked.
     fn read_dir_inode(&mut self, idx: u32) -> bool {
         if idx >= INODE_COUNT {
-            trace!(0, "nanofs: inode {} is out of range", idx);
+            klog!(0, "nanofs: inode {} is out of range", idx);
             return false;
         }
         if !self.io.read_block(INODE_START + idx, self.dir_inode.as_mut_slice()) {
             return false;
         }
         if self.dir_u32(IN_TYPE) != INODE_TYPE_DIR {
-            trace!(0, "nanofs: inode {} is not a directory", idx);
+            klog!(0, "nanofs: inode {} is not a directory", idx);
             return false;
         }
 
@@ -641,16 +641,16 @@ impl NanoFs {
          * write; an unchecked on-disk value would walk past the block. */
         let block = &self.dir_inode.as_slice()[..BLOCK_SIZE];
         if crc32_with_hole(block, IN_CHECKSUM) != rd_u32(block, IN_CHECKSUM) {
-            trace!(0, "nanofs: directory inode {}'s checksum does not match", idx);
+            klog!(0, "nanofs: directory inode {}'s checksum does not match", idx);
             return false;
         }
         if self.dir_u32(IN_SIZE) as usize > MAX_DIR_ENTRIES {
-            trace!(0, "nanofs: directory {} claims {} entries, more than the {} there is room for",
+            klog!(0, "nanofs: directory {} claims {} entries, more than the {} there is room for",
                 idx, self.dir_u32(IN_SIZE), MAX_DIR_ENTRIES);
             return false;
         }
         if self.dir_u32(IN_BLOCKS) >= DATA_BLOCK_COUNT {
-            trace!(0, "nanofs: directory {} names data block {}, which is not one",
+            klog!(0, "nanofs: directory {} names data block {}, which is not one",
                 idx, self.dir_u32(IN_BLOCKS));
             return false;
         }
@@ -670,7 +670,7 @@ impl NanoFs {
 
         let count = self.dir_u32(IN_SIZE) as usize;
         if count >= MAX_DIR_ENTRIES {
-            trace!(0, "nanofs: directory {} is full at {} entries", dir_idx, count);
+            klog!(0, "nanofs: directory {} is full at {} entries", dir_idx, count);
             return false;
         }
 
@@ -713,7 +713,7 @@ impl NanoFs {
         let at = match at {
             Some(at) => at,
             None => {
-                trace!(0, "nanofs: inode {} is not an entry of directory {}", child_idx, dir_idx);
+                klog!(0, "nanofs: inode {} is not an entry of directory {}", child_idx, dir_idx);
                 return false;
             }
         };
@@ -755,19 +755,19 @@ impl NanoFs {
     /// None when nothing may be made there.
     fn create_into(&mut self, dir: NodeId, name: &[u8]) -> Option<u32> {
         if name.is_empty() {
-            trace!(0, "nanofs: something made with no name");
+            klog!(0, "nanofs: something made with no name");
             return None;
         }
         if !self.tree.get(dir)?.is_dir() {
-            trace!(0, "nanofs: something made somewhere that is not a directory");
+            klog!(0, "nanofs: something made somewhere that is not a directory");
             return None;
         }
         if name.len() >= IN_NAME_LEN {
-            trace!(0, "nanofs: a name of {} bytes is too long", name.len());
+            klog!(0, "nanofs: a name of {} bytes is too long", name.len());
             return None;
         }
         if self.lookup(dir, name).is_some() {
-            trace!(0, "nanofs: there is something by that name already");
+            klog!(0, "nanofs: there is something by that name already");
             return None;
         }
         self.ino_of(dir)
@@ -790,7 +790,7 @@ impl NanoFs {
         let node = match self.tree.alloc(name, kind) {
             Some(node) => node,
             None => {
-                trace!(0, "nanofs: no memory for a vnode");
+                klog!(0, "nanofs: no memory for a vnode");
                 return None;
             }
         };
@@ -821,7 +821,7 @@ impl NanoFs {
 
         /* Commit the inode bitmap now the inode's contents are on disk */
         if !self.flush_super() || !self.add_dir_entry(dir_idx, idx) {
-            trace!(0, "nanofs: a file could not be added to directory {}", dir_idx);
+            klog!(0, "nanofs: a file could not be added to directory {}", dir_idx);
             self.give_back_inode(idx);
             return None;
         }
@@ -866,7 +866,7 @@ impl NanoFs {
 
         /* Commit both bitmaps now the inode and its block are on disk */
         if !self.flush_super() || !self.add_dir_entry(dir_idx, idx) {
-            trace!(0, "nanofs: a directory could not be added to directory {}", dir_idx);
+            klog!(0, "nanofs: a directory could not be added to directory {}", dir_idx);
             self.give_back_data_block(block);
             self.give_back_inode(idx);
             return None;
@@ -893,7 +893,7 @@ impl NanoFs {
         let current = match self.file_size(file) {
             Some(size) => size,
             None => {
-                trace!(0, "nanofs: a write to something that is not a file");
+                klog!(0, "nanofs: a write to something that is not a file");
                 return false;
             }
         };
@@ -904,7 +904,7 @@ impl NanoFs {
         let end = match offset.checked_add(data.len()) {
             Some(end) => end,
             None => {
-                trace!(0, "nanofs: a write of {} bytes at {} is past what a file holds",
+                klog!(0, "nanofs: a write of {} bytes at {} is past what a file holds",
                     data.len(), offset);
                 return false;
             }
@@ -918,7 +918,7 @@ impl NanoFs {
             Some(current) if current == size => true,
             Some(_) => self.rewrite(file, size, &[], 0),
             None => {
-                trace!(0, "nanofs: a truncate of something that is not a file");
+                klog!(0, "nanofs: a truncate of something that is not a file");
                 false
             }
         }
@@ -935,7 +935,7 @@ impl NanoFs {
             return false;
         }
         if new_size > MAX_FILE_SIZE {
-            trace!(0, "nanofs: a size of {} is more than the {} a file holds",
+            klog!(0, "nanofs: a size of {} is more than the {} a file holds",
                 new_size, MAX_FILE_SIZE);
             return false;
         }
@@ -952,7 +952,7 @@ impl NanoFs {
          * an in-range garbage index would give back a block another file
          * owns. */
         if !self.inode_ok() {
-            trace!(0, "nanofs: inode {}'s checksum does not match", idx);
+            klog!(0, "nanofs: inode {}'s checksum does not match", idx);
             return false;
         }
 
@@ -974,7 +974,7 @@ impl NanoFs {
             self.in_set_u32(IN_SIZE, 0);
             self.in_set_u32(IN_DATA_CHECKSUM, 0);
             if !self.write_inode(idx, true) {
-                trace!(0, "nanofs: the truncate of inode {} could not be committed", idx);
+                klog!(0, "nanofs: the truncate of inode {} could not be committed", idx);
                 return false;
             }
             for i in 0..old_count {
@@ -991,7 +991,7 @@ impl NanoFs {
             match self.take_data_block() {
                 Some(block) => new_blocks[i] = block,
                 None => {
-                    trace!(0, "nanofs: only {} of the {} blocks inode {} needs were free",
+                    klog!(0, "nanofs: only {} of the {} blocks inode {} needs were free",
                         i, new_count, idx);
                     for j in 0..i {
                         self.give_back_data_block(new_blocks[j]);
@@ -1010,7 +1010,7 @@ impl NanoFs {
                 if old_blocks[i] >= DATA_BLOCK_COUNT
                     || !self.io.read_block(DATA_START + old_blocks[i], self.data.as_mut_slice())
                 {
-                    trace!(0, "nanofs: block {} of inode {} could not be read", i, idx);
+                    klog!(0, "nanofs: block {} of inode {} could not be read", i, idx);
                     for j in 0..new_count {
                         self.give_back_data_block(new_blocks[j]);
                     }
@@ -1045,7 +1045,7 @@ impl NanoFs {
          * bitmap is flushed with FUA there -- or a crash loses data the
          * bitmap already accounts for. */
         if !self.io.flush() || !self.flush_super() {
-            trace!(0, "nanofs: the new blocks of inode {} could not be committed", idx);
+            klog!(0, "nanofs: the new blocks of inode {} could not be committed", idx);
             for j in 0..new_count {
                 self.give_back_data_block(new_blocks[j]);
             }
@@ -1060,7 +1060,7 @@ impl NanoFs {
         self.in_set_u32(IN_DATA_CHECKSUM, sum);
 
         if !self.write_inode(idx, true) {
-            trace!(0, "nanofs: inode {} could not be committed", idx);
+            klog!(0, "nanofs: inode {} could not be committed", idx);
             /* The inode on disk still names the old blocks; the new ones go
              * back instead. */
             for j in 0..new_count {
@@ -1110,7 +1110,7 @@ impl NanoFs {
         let idx = match self.tree.get(file) {
             Some(node) if node.is_file() => node.ino as u32,
             _ => {
-                trace!(0, "nanofs: a read of something that is not a file");
+                klog!(0, "nanofs: a read of something that is not a file");
                 return false;
             }
         };
@@ -1118,7 +1118,7 @@ impl NanoFs {
             return false;
         }
         if !self.inode_ok() {
-            trace!(0, "nanofs: inode {}'s checksum does not match", idx);
+            klog!(0, "nanofs: inode {}'s checksum does not match", idx);
             return false;
         }
 
@@ -1126,12 +1126,12 @@ impl NanoFs {
          * early and answer with bytes of the caller's buffer it never wrote */
         let size = self.in_u32(IN_SIZE) as usize;
         if size > MAX_FILE_SIZE {
-            trace!(0, "nanofs: inode {} claims {} bytes, more than the {} a file holds",
+            klog!(0, "nanofs: inode {} claims {} bytes, more than the {} a file holds",
                 idx, size, MAX_FILE_SIZE);
             return false;
         }
         if offset >= size {
-            trace!(0, "nanofs: a read at {} is past the {} bytes inode {} has", offset, size, idx);
+            klog!(0, "nanofs: a read at {} is past the {} bytes inode {} has", offset, size, idx);
             return false;
         }
 
@@ -1148,7 +1148,7 @@ impl NanoFs {
 
         while done < take && block < MAX_BLOCKS {
             if blocks[block] >= DATA_BLOCK_COUNT {
-                trace!(0, "nanofs: inode {} names data block {}, which is not one",
+                klog!(0, "nanofs: inode {} names data block {}, which is not one",
                     idx, blocks[block]);
                 return false;
             }
@@ -1165,13 +1165,13 @@ impl NanoFs {
 
         /* A short read would leave the caller consuming bytes nothing wrote */
         if done < take {
-            trace!(0, "nanofs: {} of the {} bytes asked of inode {} were there", done, take, idx);
+            klog!(0, "nanofs: {} of the {} bytes asked of inode {} were there", done, take, idx);
             return false;
         }
 
         if stored != 0 && !self.verified[idx as usize] {
             if self.data_checksum(&blocks[..], size) != stored {
-                trace!(0, "nanofs: the data of inode {} does not match its checksum", idx);
+                klog!(0, "nanofs: the data of inode {} does not match its checksum", idx);
                 return false;
             }
             self.verified[idx as usize] = true;
@@ -1241,20 +1241,20 @@ impl NanoFs {
         let idx = match self.ino_of(node) {
             Some(idx) => idx,
             None => {
-                trace!(0, "nanofs: a remove of nothing");
+                klog!(0, "nanofs: a remove of nothing");
                 return false;
             }
         };
         let parent_idx = match self.tree.parent(node).and_then(|parent| self.ino_of(parent)) {
             Some(parent_idx) => parent_idx,
             None => {
-                trace!(0, "nanofs: the root cannot be removed");
+                klog!(0, "nanofs: the root cannot be removed");
                 return false;
             }
         };
 
         if !self.remove_dir_entry(parent_idx, idx) {
-            trace!(0, "nanofs: inode {} could not be taken out of directory {}", idx, parent_idx);
+            klog!(0, "nanofs: inode {} could not be taken out of directory {}", idx, parent_idx);
             return false;
         }
 
@@ -1271,35 +1271,35 @@ impl NanoFs {
         let idx = match self.ino_of(node) {
             Some(idx) if !new_name.is_empty() => idx,
             _ => {
-                trace!(0, "nanofs: a rename of nothing");
+                klog!(0, "nanofs: a rename of nothing");
                 return false;
             }
         };
         let old_idx = match self.tree.parent(node).and_then(|parent| self.ino_of(parent)) {
             Some(old_idx) => old_idx,
             None => {
-                trace!(0, "nanofs: the root cannot be renamed");
+                klog!(0, "nanofs: the root cannot be renamed");
                 return false;
             }
         };
         let new_idx = match self.tree.get(new_dir) {
             Some(dir) if dir.is_dir() => dir.ino as u32,
             _ => {
-                trace!(0, "nanofs: the target of a rename is not a directory");
+                klog!(0, "nanofs: the target of a rename is not a directory");
                 return false;
             }
         };
         if new_name.len() >= NAME_MAX || new_name.len() >= IN_NAME_LEN {
-            trace!(0, "nanofs: a name of {} bytes is too long", new_name.len());
+            klog!(0, "nanofs: a name of {} bytes is too long", new_name.len());
             return false;
         }
         if self.lookup(new_dir, new_name).is_some() {
-            trace!(0, "nanofs: there is something by that name already");
+            klog!(0, "nanofs: there is something by that name already");
             return false;
         }
 
         if !self.read_inode(idx) || !self.inode_ok() {
-            trace!(0, "nanofs: inode {} could not be read", idx);
+            klog!(0, "nanofs: inode {} could not be read", idx);
             return false;
         }
 
@@ -1310,7 +1310,7 @@ impl NanoFs {
          * never lost. */
         let moved = new_idx != old_idx;
         if moved && !self.add_dir_entry(new_idx, idx) {
-            trace!(0, "nanofs: inode {} could not be added to directory {}", idx, new_idx);
+            klog!(0, "nanofs: inode {} could not be added to directory {}", idx, new_idx);
             return false;
         }
 
@@ -1327,7 +1327,7 @@ impl NanoFs {
         self.in_set_u32(IN_PARENT, new_idx);
 
         if !self.write_inode(idx, true) {
-            trace!(0, "nanofs: inode {} could not be committed", idx);
+            klog!(0, "nanofs: inode {} could not be committed", idx);
             if moved {
                 self.remove_dir_entry(new_idx, idx);
             }
@@ -1335,7 +1335,7 @@ impl NanoFs {
         }
 
         if moved && !self.remove_dir_entry(old_idx, idx) {
-            trace!(0, "nanofs: inode {} is in directory {} as well", idx, old_idx);
+            klog!(0, "nanofs: inode {} is in directory {} as well", idx, old_idx);
         }
 
         self.tree.rename(node, new_dir, new_name);
@@ -1350,7 +1350,7 @@ fn fits(dev: &Disk) -> bool {
     let need = (DATA_START as u64 + DATA_BLOCK_COUNT as u64) * BLOCK_SIZE as u64;
     let have = dev.sectors().saturating_mul(dev.sector_size());
     if have < need {
-        trace!(0, "nanofs: {} takes {} bytes, and the device has {}", dev.name(), need, have);
+        klog!(0, "nanofs: {} takes {} bytes, and the device has {}", dev.name(), need, have);
         return false;
     }
     true
@@ -1362,7 +1362,7 @@ fn fits(dev: &Disk) -> bool {
 pub fn format(dev: &Disk) -> bool {
     let sector_size = dev.sector_size();
     if sector_size == 0 || BLOCK_SIZE as u64 % sector_size != 0 {
-        trace!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
+        klog!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
         return false;
     }
     if !fits(dev) {
@@ -1388,7 +1388,7 @@ pub fn format(dev: &Disk) -> bool {
         wr_u32(sb, SB_INODE_START, INODE_START);
         wr_u32(sb, SB_DATA_START, DATA_START);
         if !kcore::random::fill_random(&mut sb[SB_UUID..SB_UUID + 16]) {
-            trace!(0, "nanofs: the filesystem will carry no uuid");
+            klog!(0, "nanofs: the filesystem will carry no uuid");
         }
         bit_set(&mut sb[SB_INODE_BITMAP..SB_INODE_BITMAP + SB_INODE_BITMAP_LEN], 0);
         bit_set(&mut sb[SB_DATA_BITMAP..SB_DATA_BITMAP + SB_DATA_BITMAP_LEN], 0);
@@ -1421,7 +1421,7 @@ pub fn format(dev: &Disk) -> bool {
         return false;
     }
 
-    trace!(0, "nanofs: formatted");
+    klog!(0, "nanofs: formatted");
     true
 }
 
@@ -1534,7 +1534,7 @@ fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     let fs = match NanoFs::new(dev) {
         Some(fs) => fs,
         None => {
-            trace!(0, "nanofs: no memory for the filesystem");
+            klog!(0, "nanofs: no memory for the filesystem");
             return -1;
         }
     };

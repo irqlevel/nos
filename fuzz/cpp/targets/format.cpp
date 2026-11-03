@@ -225,7 +225,7 @@ void run(fuzz::Input& in)
     }
     if (line)
     {
-        /* A line cut short given its newline back (Tracer::output, dmesg's
+        /* A line cut short given its newline back (Klog::output, dmesg's
            records): what fits, then "...\n" -- one too short for that, and
            one that fits, left as they are */
         static const size_t CUT_BYTES = 5; /* "...\n" and the NUL */

@@ -14,7 +14,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::{DmaBuffer, PhysMapping};
 use kcore::io::MmioRegion;
 use kcore::pci::PciDevice;
-use kcore::trace;
+use kcore::klog;
 
 use crate::descriptors::{self as usb, speed_name};
 use crate::device::{Attach, Device};
@@ -196,11 +196,11 @@ impl Controller {
         let mapping = match PhysMapping::map(phys, pages) {
             Some(mapping) => mapping,
             None => {
-                trace!(0, "Xhci: failed to map BAR0 phys 0x{:X} size 0x{:X}", phys, size);
+                klog!(0, "Xhci: failed to map BAR0 phys 0x{:X} size 0x{:X}", phys, size);
                 return None;
             }
         };
-        trace!(0, "Xhci: BAR0 phys 0x{:X} size 0x{:X} va 0x{:X}",
+        klog!(0, "Xhci: BAR0 phys 0x{:X} size 0x{:X} va 0x{:X}",
             phys, size, mapping.as_mut_ptr() as usize);
 
         let base = mapping.as_mut_ptr();
@@ -211,7 +211,7 @@ impl Controller {
         let hci_version = ((cap_dw0 >> 16) & 0xFFFF) as u16;
 
         if cap_length == 0 || cap_length == 0xFF {
-            trace!(0, "Xhci: implausible CAPLENGTH {}", cap_length);
+            klog!(0, "Xhci: implausible CAPLENGTH {}", cap_length);
             return None;
         }
 
@@ -227,19 +227,19 @@ impl Controller {
         let db_off = (cap.read32(CAP_DBOFF) & !0x3) as usize;
         let rts_off = (cap.read32(CAP_RTSOFF) & !0x1F) as usize;
 
-        trace!(0, "Xhci: {:04x}:{:04x} hci {:x}.{:x} caplen {} slots {} ports {}",
+        klog!(0, "Xhci: {:04x}:{:04x} hci {:x}.{:x} caplen {} slots {} ports {}",
             pci.vendor, pci.device, hci_version >> 8, hci_version & 0xFF,
             cap_length, max_slots, num_ports);
 
         if max_slots == 0 || num_ports == 0 {
-            trace!(0, "Xhci: no slots or ports");
+            klog!(0, "Xhci: no slots or ports");
             return None;
         }
 
         if !ac64 {
             /* Every DMA structure this driver allocates could sit above 4 GB;
              * refusing beats silently truncating a pointer. */
-            trace!(0, "Xhci: 32-bit-only controller not supported");
+            klog!(0, "Xhci: 32-bit-only controller not supported");
             return None;
         }
 
@@ -251,7 +251,7 @@ impl Controller {
         ) {
             (Some(op), Some(rt), Some(db)) => (op, rt, db),
             _ => {
-                trace!(0, "Xhci: register blocks outside BAR0 (op {} rt 0x{:X} db 0x{:X}, size 0x{:X})",
+                klog!(0, "Xhci: register blocks outside BAR0 (op {} rt 0x{:X} db 0x{:X}, size 0x{:X})",
                     cap_length, rts_off, db_off, size);
                 return None;
             }
@@ -292,7 +292,7 @@ impl Controller {
     fn bar0(pci: &PciDevice) -> Option<(u64, usize)> {
         let bar_low = pci.read_config32(0x10);
         if bar_low & 1 != 0 {
-            trace!(0, "Xhci: BAR0 is I/O space, not MMIO");
+            klog!(0, "Xhci: BAR0 is I/O space, not MMIO");
             return None;
         }
 
@@ -300,7 +300,7 @@ impl Controller {
         let bar_high = if is64 { pci.read_config32(0x14) } else { 0 };
         let phys = ((bar_high as u64) << 32) | (bar_low & !0xF) as u64;
         if phys == 0 {
-            trace!(0, "Xhci: BAR0 not assigned");
+            klog!(0, "Xhci: BAR0 not assigned");
             return None;
         }
 
@@ -344,9 +344,9 @@ impl Controller {
 
             if id == EXT_CAP_LEGACY_SUPPORT {
                 if cap & LEGACY_BIOS_OWNED == 0 && cap & LEGACY_OS_OWNED != 0 {
-                    trace!(0, "Xhci: already OS-owned");
+                    klog!(0, "Xhci: already OS-owned");
                 } else {
-                    trace!(0, "Xhci: requesting ownership from firmware (usblegsup 0x{:X})", cap);
+                    klog!(0, "Xhci: requesting ownership from firmware (usblegsup 0x{:X})", cap);
                     self.cap.write32(off, cap | LEGACY_OS_OWNED);
 
                     let deadline = now_ms() + BIOS_HANDOFF_TIMEOUT_MS;
@@ -360,7 +360,7 @@ impl Controller {
                              * Clear its bit by hand: the controller is about
                              * to be reset anyway, and leaving SMIs armed is
                              * worse. */
-                            trace!(0, "Xhci: BIOS handoff timed out, forcing ownership");
+                            klog!(0, "Xhci: BIOS handoff timed out, forcing ownership");
                             let cur = self.cap_read32(off);
                             self.cap.write32(off, (cur & !LEGACY_BIOS_OWNED) | LEGACY_OS_OWNED);
                             break;
@@ -413,7 +413,7 @@ impl Controller {
         let hs_mask = self.pci.read_config32(REG_XUSB2_PRM);
         self.pci.write_config32(REG_XUSB2_PR, hs_mask);
 
-        trace!(0, "Xhci: Intel port switch: usb3 0x{:X} usb2 0x{:X}", ss_mask, hs_mask);
+        klog!(0, "Xhci: Intel port switch: usb3 0x{:X} usb2 0x{:X}", ss_mask, hs_mask);
     }
 
     fn reset_controller(&self) -> bool {
@@ -421,7 +421,7 @@ impl Controller {
         let mut deadline = now_ms() + RESET_TIMEOUT_MS;
         while self.op_read32(OP_USBSTS) & USBSTS_CONTROLLER_NOT_READY != 0 {
             if now_ms() >= deadline {
-                trace!(0, "Xhci: controller not ready before reset");
+                klog!(0, "Xhci: controller not ready before reset");
                 return false;
             }
             sleep_ms(1);
@@ -435,7 +435,7 @@ impl Controller {
             deadline = now_ms() + RESET_TIMEOUT_MS;
             while self.op_read32(OP_USBSTS) & USBSTS_HALTED == 0 {
                 if now_ms() >= deadline {
-                    trace!(0, "Xhci: controller did not halt");
+                    klog!(0, "Xhci: controller did not halt");
                     return false;
                 }
                 sleep_ms(1);
@@ -451,7 +451,7 @@ impl Controller {
 
             /* A controller that has fallen off the bus reads back all-ones */
             if c == 0xFFFF_FFFF || s == 0xFFFF_FFFF {
-                trace!(0, "Xhci: controller vanished during reset");
+                klog!(0, "Xhci: controller vanished during reset");
                 return false;
             }
 
@@ -460,7 +460,7 @@ impl Controller {
             }
 
             if now_ms() >= deadline {
-                trace!(0, "Xhci: reset timed out (usbcmd 0x{:X} usbsts 0x{:X})", c, s);
+                klog!(0, "Xhci: reset timed out (usbcmd 0x{:X} usbsts 0x{:X})", c, s);
                 return false;
             }
             sleep_ms(1);
@@ -481,7 +481,7 @@ impl Controller {
 
         const MAX_SCRATCHPADS: u32 = 512;
         if count > MAX_SCRATCHPADS {
-            trace!(0, "Xhci: {} scratchpad buffers requested, capping at {}",
+            klog!(0, "Xhci: {} scratchpad buffers requested, capping at {}",
                 count, MAX_SCRATCHPADS);
             count = MAX_SCRATCHPADS;
         }
@@ -495,7 +495,7 @@ impl Controller {
 
             let pages_each = (self.page_size_bytes as usize / PAGE_SIZE).max(1);
             if self.scratchpads.try_reserve_exact(count as usize).is_err() {
-                trace!(0, "Xhci: out of memory for the scratchpad list");
+                klog!(0, "Xhci: out of memory for the scratchpad list");
                 return false;
             }
 
@@ -503,7 +503,7 @@ impl Controller {
                 let mut page = match DmaBuffer::new(pages_each) {
                     Some(page) => page,
                     None => {
-                        trace!(0, "Xhci: out of memory for scratchpad {}", i);
+                        klog!(0, "Xhci: out of memory for scratchpad {}", i);
                         return false;
                     }
                 };
@@ -518,7 +518,7 @@ impl Controller {
             self.scratchpad_array = Some(array);
         }
 
-        trace!(0, "Xhci: {} slots, {} ports, {} scratchpads, ctx {} bytes",
+        klog!(0, "Xhci: {} slots, {} ports, {} scratchpads, ctx {} bytes",
             self.max_slots, self.num_ports, count, self.context_size);
 
         let dcbaa_phys = dcbaa.phys();
@@ -562,7 +562,7 @@ impl Controller {
         let deadline = now_ms() + RESET_TIMEOUT_MS;
         while self.op_read32(OP_USBSTS) & USBSTS_HALTED != 0 {
             if now_ms() >= deadline {
-                trace!(0, "Xhci: controller did not start");
+                klog!(0, "Xhci: controller did not start");
                 return false;
             }
             sleep_ms(1);
@@ -660,7 +660,7 @@ impl Controller {
             return;
         }
 
-        trace!(USB_LL, "Xhci: stray command completion trb 0x{:X} code {}", trb_phys, code);
+        klog!(USB_LL, "Xhci: stray command completion trb 0x{:X} code {}", trb_phys, code);
     }
 
     fn handle_transfer_event(&mut self, param: u64, status: u32, control: u32) {
@@ -673,7 +673,7 @@ impl Controller {
         let index = match self.device_by_slot(slot) {
             Some(index) => index,
             None => {
-                trace!(USB_LL, "Xhci: transfer event for unknown slot {}", slot);
+                klog!(USB_LL, "Xhci: transfer event for unknown slot {}", slot);
                 return;
             }
         };
@@ -684,7 +684,7 @@ impl Controller {
         } else if dci == dev.intr_in.dci && dev.intr_in.dci != 0 {
             &mut dev.intr_in
         } else {
-            trace!(USB_LL, "Xhci: transfer event for unknown dci {} slot {}", dci, slot);
+            klog!(USB_LL, "Xhci: transfer event for unknown dci {} slot {}", dci, slot);
             return;
         };
 
@@ -734,9 +734,9 @@ impl Controller {
                 }
                 TRB_PORT_STATUS_CHANGE => {
                     self.port_change_pending = true;
-                    trace!(USB_LL, "Xhci: port status change, port {}", (ev.param >> 24) & 0xFF);
+                    klog!(USB_LL, "Xhci: port status change, port {}", (ev.param >> 24) & 0xFF);
                 }
-                other => trace!(USB_LL, "Xhci: event type {} ignored", other),
+                other => klog!(USB_LL, "Xhci: event type {} ignored", other),
             }
         }
 
@@ -754,7 +754,7 @@ impl Controller {
             self.port_change_pending = true;
         }
         if sts & (USBSTS_HOST_SYSTEM_ERROR | USBSTS_HOST_CONTROLLER_ERROR) != 0 {
-            trace!(0, "Xhci: host controller error, usbsts 0x{:X}", sts);
+            klog!(0, "Xhci: host controller error, usbsts 0x{:X}", sts);
             self.op_write32(OP_USBSTS,
                 sts & (USBSTS_HOST_SYSTEM_ERROR | USBSTS_HOST_CONTROLLER_ERROR));
             self.ready = false;
@@ -776,7 +776,7 @@ impl Controller {
                 break;
             }
             if now_ms() >= deadline {
-                trace!(0, "Xhci: command trb 0x{:X} timed out", trb_phys);
+                klog!(0, "Xhci: command trb 0x{:X} timed out", trb_phys);
                 self.pending_cmd_trb = 0;
                 return COMP_INVALID;
             }
@@ -844,7 +844,7 @@ impl Controller {
             }
             if now_ms() >= deadline {
                 let dci = Self::ep_mut(&mut self.devices[index], ep).dci;
-                trace!(0, "Xhci: transfer trb 0x{:X} dci {} timed out", trb_phys, dci);
+                klog!(0, "Xhci: transfer trb 0x{:X} dci {} timed out", trb_phys, dci);
                 let ep = Self::ep_mut(&mut self.devices[index], ep);
                 ep.in_flight = false;
                 ep.pending_trb = 0;
@@ -958,7 +958,7 @@ impl Controller {
                 break;
             }
             if now_ms() >= deadline {
-                trace!(0, "Xhci: port {} reset timed out (portsc 0x{:X})", port, cur);
+                klog!(0, "Xhci: port {} reset timed out (portsc 0x{:X})", port, cur);
                 return false;
             }
             sleep_ms(2);
@@ -974,7 +974,7 @@ impl Controller {
 
         /* A SuperSpeed link that failed to train needs a warm reset; the bit
          * is reserved on USB2 ports, where this write is a no-op. */
-        trace!(0, "Xhci: port {} not enabled after hot reset (portsc 0x{:X}), \
+        klog!(0, "Xhci: port {} not enabled after hot reset (portsc 0x{:X}), \
 trying warm reset", port, after);
 
         self.port_write32(port, 0, portsc_base(after) | PORTSC_WARM_RESET);
@@ -991,7 +991,7 @@ trying warm reset", port, after);
                 return true;
             }
             if now_ms() >= deadline {
-                trace!(0, "Xhci: port {} warm reset failed (portsc 0x{:X})", port, cur);
+                klog!(0, "Xhci: port {} warm reset failed (portsc 0x{:X})", port, cur);
                 return false;
             }
             sleep_ms(2);
@@ -1043,7 +1043,7 @@ trying warm reset", port, after);
 
         let (code, _) = self.run_command(input_phys, 0, control);
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: address device slot {} failed, code {}", slot_id, code);
+            klog!(0, "Xhci: address device slot {} failed, code {}", slot_id, code);
             return false;
         }
         true
@@ -1079,7 +1079,7 @@ trying warm reset", port, after);
                     keyboard_interface = usb::interface::number(desc);
                 }
 
-                trace!(USB_LL, "Xhci: interface {} class {}/{}/{}",
+                klog!(USB_LL, "Xhci: interface {} class {}/{}/{}",
                     usb::interface::number(desc), usb::interface::class(desc),
                     usb::interface::subclass(desc), usb::interface::protocol(desc));
             } else if kind == usb::DESC_ENDPOINT && len >= 7 {
@@ -1121,7 +1121,7 @@ trying warm reset", port, after);
         dev.interface_num = interface;
         dev.is_keyboard = true;
 
-        trace!(0, "Xhci: boot keyboard on interface {} ep 0x{:X} mps {} interval {} dci {}",
+        klog!(0, "Xhci: boot keyboard on interface {} ep 0x{:X} mps {} interval {} dci {}",
             interface, address, max_packet, interval, dci);
         true
     }
@@ -1174,7 +1174,7 @@ trying warm reset", port, after);
         let (code, _) = self.run_command(input_phys, 0,
             trb_type_field(TRB_CONFIGURE_ENDPOINT) | trb_slot_field(slot_id));
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: configure endpoint slot {} failed, code {}", slot_id, code);
+            klog!(0, "Xhci: configure endpoint slot {} failed, code {}", slot_id, code);
             return false;
         }
         true
@@ -1193,7 +1193,7 @@ trying warm reset", port, after);
         let portsc = self.port_read32(port, 0);
         let speed = ((portsc >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK) as u8;
 
-        trace!(0, "Xhci: port {} connected, {} speed", port, speed_name(speed));
+        klog!(0, "Xhci: port {} connected, {} speed", port, speed_name(speed));
 
         let at = port as usize;
         shared::update(self.index, |s| s.ports[at].speed = speed);
@@ -1219,7 +1219,7 @@ impl Controller {
         let index = match self.alloc_device() {
             Some(index) => index,
             None => {
-                trace!(0, "Xhci: no free device record for root port {} route 0x{:X}",
+                klog!(0, "Xhci: no free device record for root port {} route 0x{:X}",
                     info.root_port, info.route);
                 return None;
             }
@@ -1244,14 +1244,14 @@ impl Controller {
 
         let (code, slot_id) = self.run_command(0, 0, trb_type_field(TRB_ENABLE_SLOT));
         if code != COMP_SUCCESS || slot_id == 0 || slot_id > self.max_slots {
-            trace!(0, "Xhci: enable slot failed for root port {}, code {}", info.root_port, code);
+            klog!(0, "Xhci: enable slot failed for root port {}, code {}", info.root_port, code);
             self.devices[index].reset();
             return None;
         }
         self.devices[index].slot_id = slot_id;
 
         if !self.devices[index].alloc_dma() {
-            trace!(0, "Xhci: out of memory for slot {}", slot_id);
+            klog!(0, "Xhci: out of memory for slot {}", slot_id);
             self.release_device(index);
             return None;
         }
@@ -1271,7 +1271,7 @@ impl Controller {
             usb::DIR_IN | usb::TYPE_STANDARD | usb::RECIP_DEVICE,
             usb::REQ_GET_DESCRIPTOR, (usb::DESC_DEVICE as u16) << 8, 0, 8);
         if code != COMP_SUCCESS || got < 8 {
-            trace!(0, "Xhci: short device descriptor on slot {}, code {} got {}",
+            klog!(0, "Xhci: short device descriptor on slot {}, code {} got {}",
                 slot_id, code, got);
             self.release_device(index);
             return None;
@@ -1285,7 +1285,7 @@ impl Controller {
         };
 
         if real_mps != 0 && real_mps != self.devices[index].ep0.max_packet {
-            trace!(USB_LL, "Xhci: slot {} ep0 mps {} -> {}",
+            klog!(USB_LL, "Xhci: slot {} ep0 mps {} -> {}",
                 slot_id, self.devices[index].ep0.max_packet, real_mps);
             self.devices[index].ep0.max_packet = real_mps;
             self.evaluate_ep0(index, real_mps);
@@ -1296,7 +1296,7 @@ impl Controller {
             usb::REQ_GET_DESCRIPTOR, (usb::DESC_DEVICE as u16) << 8, 0,
             usb::DEVICE_DESC_LEN as u16);
         if code != COMP_SUCCESS || (got as usize) < usb::DEVICE_DESC_LEN {
-            trace!(0, "Xhci: device descriptor read failed on slot {}, code {}", slot_id, code);
+            klog!(0, "Xhci: device descriptor read failed on slot {}, code {}", slot_id, code);
             self.release_device(index);
             return None;
         }
@@ -1312,7 +1312,7 @@ impl Controller {
         }
 
         let dev_class = self.devices[index].device_class;
-        trace!(0, "Xhci: slot {} device {:04x}:{:04x} class {} route 0x{:X} tier {}",
+        klog!(0, "Xhci: slot {} device {:04x}:{:04x} class {} route 0x{:X} tier {}",
             slot_id, self.devices[index].vendor_id, self.devices[index].product_id,
             dev_class, info.route, info.tier);
 
@@ -1334,7 +1334,7 @@ impl Controller {
             usb::REQ_GET_DESCRIPTOR, (usb::DESC_CONFIGURATION as u16) << 8, 0,
             usb::CONFIG_DESC_LEN as u16);
         if code != COMP_SUCCESS || (got as usize) < usb::CONFIG_DESC_LEN {
-            trace!(0, "Xhci: config descriptor header failed, code {}", code);
+            klog!(0, "Xhci: config descriptor header failed, code {}", code);
             self.release_device(index);
             return None;
         }
@@ -1351,7 +1351,7 @@ impl Controller {
             usb::DIR_IN | usb::TYPE_STANDARD | usb::RECIP_DEVICE,
             usb::REQ_GET_DESCRIPTOR, (usb::DESC_CONFIGURATION as u16) << 8, 0, total_length);
         if code != COMP_SUCCESS || (got as usize) < usb::CONFIG_DESC_LEN {
-            trace!(0, "Xhci: config descriptor read failed, code {}", code);
+            klog!(0, "Xhci: config descriptor read failed, code {}", code);
             self.release_device(index);
             return None;
         }
@@ -1360,7 +1360,7 @@ impl Controller {
         let is_hub = dev_class == usb::CLASS_HUB && info.tier < MAX_TIER;
 
         if !is_keyboard && !is_hub {
-            trace!(0, "Xhci: slot {} is neither keyboard nor hub, releasing", slot_id);
+            klog!(0, "Xhci: slot {} is neither keyboard nor hub, releasing", slot_id);
             self.release_device(index);
             return None;
         }
@@ -1369,7 +1369,7 @@ impl Controller {
             usb::DIR_OUT | usb::TYPE_STANDARD | usb::RECIP_DEVICE,
             usb::REQ_SET_CONFIGURATION, config_value as u16, 0, 0);
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: set configuration {} failed, code {}", config_value, code);
+            klog!(0, "Xhci: set configuration {} failed, code {}", config_value, code);
             self.release_device(index);
             return None;
         }
@@ -1417,7 +1417,7 @@ impl Controller {
         let (code, _) = self.run_command(input_phys, 0,
             trb_type_field(TRB_EVALUATE_CONTEXT) | trb_slot_field(slot_id));
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: evaluate context slot {} failed, code {}", slot_id, code);
+            klog!(0, "Xhci: evaluate context slot {} failed, code {}", slot_id, code);
         }
     }
 
@@ -1438,14 +1438,14 @@ impl Controller {
             usb::DIR_OUT | usb::TYPE_CLASS | usb::RECIP_INTERFACE,
             usb::REQ_SET_PROTOCOL, usb::HID_PROTOCOL_BOOT, interface, 0);
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: set protocol(boot) failed, code {}", code);
+            klog!(0, "Xhci: set protocol(boot) failed, code {}", code);
         }
 
         let (code, _) = self.control_transfer(index,
             usb::DIR_OUT | usb::TYPE_CLASS | usb::RECIP_INTERFACE,
             usb::REQ_SET_IDLE, 0, interface, 0);
         if code != COMP_SUCCESS {
-            trace!(USB_LL, "Xhci: set idle failed, code {}", code);
+            klog!(USB_LL, "Xhci: set idle failed, code {}", code);
         }
 
         if info.tier == 0 && (info.root_port as usize) < MAX_PORTS {
@@ -1463,7 +1463,7 @@ impl Controller {
             return None;
         }
 
-        trace!(0, "Xhci: keyboard ready on root port {} slot {} route 0x{:X}",
+        klog!(0, "Xhci: keyboard ready on root port {} slot {} route 0x{:X}",
             info.root_port, slot_id, info.route);
         Some(index)
     }
@@ -1499,7 +1499,7 @@ impl Controller {
             usb::DIR_IN | usb::TYPE_CLASS | usb::RECIP_OTHER,
             0x00 /* GET_STATUS */, 0, port as u16, 4);
         if code != COMP_SUCCESS || got < 4 {
-            trace!(USB_LL, "Xhci: hub slot {} port {} status failed, code {}",
+            klog!(USB_LL, "Xhci: hub slot {} port {} status failed, code {}",
                 self.devices[hub].slot_id, port, code);
             return None;
         }
@@ -1528,7 +1528,7 @@ impl Controller {
 
     fn hub_reset_port(&mut self, hub: usize, port: u8) -> Option<u8> {
         if !self.hub_set_port_feature(hub, port, usb::HUB_FEATURE_PORT_RESET) {
-            trace!(0, "Xhci: hub slot {} port {} reset request failed",
+            klog!(0, "Xhci: hub slot {} port {} reset request failed",
                 self.devices[hub].slot_id, port);
             return None;
         }
@@ -1545,7 +1545,7 @@ impl Controller {
             }
 
             if now_ms() >= deadline {
-                trace!(0, "Xhci: hub slot {} port {} reset timed out (status 0x{:X})",
+                klog!(0, "Xhci: hub slot {} port {} reset timed out (status 0x{:X})",
                     self.devices[hub].slot_id, port, status);
                 return None;
             }
@@ -1559,7 +1559,7 @@ impl Controller {
 
         let (status, _) = self.hub_port_status(hub, port)?;
         if status & usb::HUB_PORT_STATUS_ENABLE == 0 {
-            trace!(0, "Xhci: hub slot {} port {} not enabled after reset (0x{:X})",
+            klog!(0, "Xhci: hub slot {} port {} not enabled after reset (0x{:X})",
                 self.devices[hub].slot_id, port, status);
             return None;
         }
@@ -1592,7 +1592,7 @@ impl Controller {
             usb::DIR_IN | usb::TYPE_CLASS | usb::RECIP_DEVICE,
             usb::REQ_GET_DESCRIPTOR, (desc_type as u16) << 8, 0, 9);
         if code != COMP_SUCCESS || (got as usize) < usb::HUB_DESC_MIN_LENGTH {
-            trace!(0, "Xhci: hub slot {} descriptor read failed, code {} got {}",
+            klog!(0, "Xhci: hub slot {} descriptor read failed, code {} got {}",
                 self.devices[hub].slot_id, code, got);
             return false;
         }
@@ -1613,7 +1613,7 @@ impl Controller {
             num_ports = 15;
         }
         if num_ports == 0 {
-            trace!(0, "Xhci: hub slot {} reports no ports", self.devices[hub].slot_id);
+            klog!(0, "Xhci: hub slot {} reports no ports", self.devices[hub].slot_id);
             return false;
         }
 
@@ -1625,7 +1625,7 @@ impl Controller {
             dev.hub_power_on_delay_ms = power_on as u16 * 2;
         }
 
-        trace!(0, "Xhci: hub slot {}: {} ports, ttt {}, power-on {} ms",
+        klog!(0, "Xhci: hub slot {}: {} ports, ttt {}, power-on {} ms",
             self.devices[hub].slot_id, num_ports, self.devices[hub].hub_ttt,
             self.devices[hub].hub_power_on_delay_ms);
 
@@ -1664,7 +1664,7 @@ impl Controller {
         let (code, _) = self.run_command(input_phys, 0,
             trb_type_field(TRB_CONFIGURE_ENDPOINT) | trb_slot_field(slot_id));
         if code != COMP_SUCCESS {
-            trace!(0, "Xhci: marking slot {} as a hub failed, code {}", slot_id, code);
+            klog!(0, "Xhci: marking slot {} as a hub failed, code {}", slot_id, code);
             return false;
         }
 
@@ -1676,7 +1676,7 @@ impl Controller {
         }
 
         if !any_powered {
-            trace!(0, "Xhci: hub slot {} refused port power", slot_id);
+            klog!(0, "Xhci: hub slot {} refused port power", slot_id);
             return false;
         }
 
@@ -1710,7 +1710,7 @@ impl Controller {
                             && self.devices[i].parent_slot == hub_slot
                             && self.devices[i].parent_port == p
                         {
-                            trace!(0, "Xhci: hub slot {} port {} disconnected", hub_slot, p);
+                            klog!(0, "Xhci: hub slot {} port {} disconnected", hub_slot, p);
                             self.release_device(i);
                         }
                     }
@@ -1757,7 +1757,7 @@ impl Controller {
                 info.mtt = false;
             }
 
-            trace!(0, "Xhci: hub slot {} port {}: {} speed device",
+            klog!(0, "Xhci: hub slot {} port {}: {} speed device",
                 h.slot_id, p, speed_name(child_speed));
 
             self.enumerate_device(info);
@@ -1836,7 +1836,7 @@ impl Controller {
                 /* Attempted, successfully or not: only an unplug re-arms it */
                 shared::update(self.index, |s| s.ports[at].enumerated = true);
             } else if !connected && was_enumerated {
-                trace!(0, "Xhci: port {} disconnected", port);
+                klog!(0, "Xhci: port {} disconnected", port);
 
                 for i in 0..MAX_DEVICES {
                     if self.devices[i].in_use && self.devices[i].root_port == port {
@@ -1899,7 +1899,7 @@ impl Controller {
         let dev = &self.devices[index];
         let (slot_id, dci, address) = (dev.slot_id, dev.intr_in.dci, dev.intr_in.address);
 
-        trace!(0, "Xhci: keyboard slot {} endpoint stalled, resetting", slot_id);
+        klog!(0, "Xhci: keyboard slot {} endpoint stalled, resetting", slot_id);
 
         self.run_command(0, 0, trb_type_field(TRB_RESET_ENDPOINT)
             | ((dci as u32) << 16) | trb_slot_field(slot_id));
@@ -1957,13 +1957,13 @@ impl Controller {
                 } else {
                     dev.errors += 1;
                     let slot = dev.slot_id;
-                    trace!(USB_LL, "Xhci: keyboard slot {} transfer code {}", slot, code);
+                    klog!(USB_LL, "Xhci: keyboard slot {} transfer code {}", slot, code);
                     self.publish_keyboard(index);
                 }
             }
 
             if !self.devices[index].intr_in.in_flight && !self.submit_report(index) {
-                trace!(0, "Xhci: cannot resubmit report for slot {}",
+                klog!(0, "Xhci: cannot resubmit report for slot {}",
                     self.devices[index].slot_id);
                 continue;
             }

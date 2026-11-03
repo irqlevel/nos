@@ -30,7 +30,7 @@ use kcore::msix::MsixInterrupt;
 use kcore::once::Once;
 use kcore::pci;
 use kcore::sync::{SpinLock, WaitGroup};
-use kcore::trace;
+use kcore::klog;
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -249,7 +249,7 @@ impl Hba {
         };
 
         if !queued {
-            trace!(0, "virtio-scsi: the request queue would not take a command");
+            klog!(0, "virtio-scsi: the request queue would not take a command");
             self.done[slot].done();
             self.done[slot].wait();
             self.give_slot(slot);
@@ -323,7 +323,7 @@ impl Disk {
         /* One physically contiguous run, which is what the block API asks its
          * callers for: a page, page-aligned. */
         if len > PAGE_SIZE || (buf as usize) & (PAGE_SIZE - 1) != 0 {
-            trace!(0, "virtio-scsi: {} bytes at {:p} is not one page-aligned run", len, buf);
+            klog!(0, "virtio-scsi: {} bytes at {:p} is not one page-aligned run", len, buf);
             return false;
         }
 
@@ -400,7 +400,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     }
 
     if virtio::negotiate(transport.as_ref(), 0).is_none() {
-        trace!(0, "virtio-scsi: the adapter would not agree on features");
+        klog!(0, "virtio-scsi: the adapter would not agree on features");
         return false;
     }
 
@@ -412,7 +412,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     /* The header this driver writes has room for a 32-byte CDB and 96 bytes
      * of sense data; an adapter that wants more is not one it can serve. */
     if cdb_size == 0 || cdb_size > 32 || sense_size == 0 || sense_size > 96 {
-        trace!(0, "virtio-scsi: cdb {} sense {} is not a shape this speaks", cdb_size, sense_size);
+        klog!(0, "virtio-scsi: cdb {} sense {} is not a shape this speaks", cdb_size, sense_size);
         virtio::failed(transport.as_ref());
         return false;
     }
@@ -422,7 +422,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
 
     /* Every slot's header and its response share one page. */
     if MAX_SLOTS * ((req_size + resp_size + 7) & !7) > PAGE_SIZE {
-        trace!(0, "virtio-scsi: {} slots of {}+{} bytes do not fit a page",
+        klog!(0, "virtio-scsi: {} slots of {}+{} bytes do not fit a page",
             MAX_SLOTS, req_size, resp_size);
         virtio::failed(transport.as_ref());
         return false;
@@ -430,7 +430,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
 
     let size = transport.select_queue(REQUEST_QUEUE);
     if size == 0 {
-        trace!(0, "virtio-scsi: the adapter has no request queue");
+        klog!(0, "virtio-scsi: the adapter has no request queue");
         virtio::failed(transport.as_ref());
         return false;
     }
@@ -509,7 +509,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
 
     ADAPTERS.fetch_add(1, Ordering::AcqRel);
 
-    trace!(0, "virtio-scsi: an adapter with cdb {} sense {}, targets up to {}",
+    klog!(0, "virtio-scsi: an adapter with cdb {} sense {}, targets up to {}",
         cdb_size, sense_size, hba.max_target);
 
     let mut found = 0;
@@ -522,7 +522,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     }
 
-    trace!(0, "virtio-scsi: {} disks behind the adapter", found);
+    klog!(0, "virtio-scsi: {} disks behind the adapter", found);
     true
 }
 
@@ -592,7 +592,7 @@ fn probe_lun(hba: &'static Hba, target: u8, lun: u16) -> bool {
     match block::register_driver(name, disk) {
         Some(_registration) => {
             DISKS.store(index + 1, Ordering::Release);
-            trace!(0, "virtio-scsi: {} is target {} lun {}, {} sectors of {} bytes",
+            klog!(0, "virtio-scsi: {} is target {} lun {}, {} sectors of {} bytes",
                 name, target, lun, capacity, sector_size);
             true
         }
@@ -610,7 +610,7 @@ fn arm_interrupt(hba: &'static Hba, source: IrqSource) -> Option<u16> {
                 let _ = hba.irq.set(Irq::Msix(irq));
                 return Some(0);
             }
-            None => trace!(0, "virtio-scsi: no MSI-X slot left, falling back on the line"),
+            None => klog!(0, "virtio-scsi: no MSI-X slot left, falling back on the line"),
         }
     }
 
@@ -621,7 +621,7 @@ fn arm_interrupt(hba: &'static Hba, source: IrqSource) -> Option<u16> {
 
     match registered {
         Some(irq) => { let _ = hba.irq.set(Irq::Legacy(irq)); }
-        None => trace!(0, "virtio-scsi: the adapter has no interrupt -- I/O will be polled"),
+        None => klog!(0, "virtio-scsi: the adapter has no interrupt -- I/O will be polled"),
     }
     None
 }
@@ -647,7 +647,7 @@ pub extern "C" fn rust_virtio_scsi_init() {
                 None => continue,
             };
 
-            trace!(0, "virtio-scsi: {} virtio-pci at {:02x}:{:02x}.{}",
+            klog!(0, "virtio-scsi: {} virtio-pci at {:02x}:{:02x}.{}",
                 if transport.is_legacy() { "legacy" } else { "modern" },
                 dev.bus, dev.slot, dev.func);
 
@@ -684,7 +684,7 @@ pub unsafe extern "C" fn rust_virtio_scsi_init_mmio(slots: *const Slot, count: u
             None => continue,
         };
 
-        trace!(0, "virtio-scsi: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
+        klog!(0, "virtio-scsi: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
         start(Box::new(transport), IrqSource::Line(slot.int_id as u8));
     }
 }

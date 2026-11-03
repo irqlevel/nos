@@ -70,7 +70,7 @@ use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
-use kcore::trace;
+use kcore::klog;
 
 use crate::vfs::{Handle, MapRun, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
 use ffi::fs::{ImageDone, IMAGE_QUEUE_MAX};
@@ -230,7 +230,7 @@ impl Map {
             let mut b = at;
             for &MapRun { sector, len, unwritten } in &got {
                 if len == 0 || len > at + n - b {
-                    trace!(0, "image: the filesystem's map of {} blocks from {} does not add up", n, at);
+                    klog!(0, "image: the filesystem's map of {} blocks from {} does not add up", n, at);
                     return false;
                 }
                 if sector != 0 {
@@ -252,7 +252,7 @@ impl Map {
                 b += len;
             }
             if b != at + n {
-                trace!(0, "image: the filesystem's map of {} blocks from {} does not add up", n, at);
+                klog!(0, "image: the filesystem's map of {} blocks from {} does not add up", n, at);
                 return false;
             }
             at += n;
@@ -622,7 +622,7 @@ impl Image {
                 let per_block = block as u64 / direct.disk.sector_size();
                 direct.map = Map::load(vfs, handle, image.size.div_ceil(block as u64), per_block);
                 if direct.map.is_none() {
-                    trace!(1, "image: {}: no map of its own -- every batch asks the VFS",
+                    klog!(1, "image: {}: no map of its own -- every batch asks the VFS",
                            core::str::from_utf8(path).unwrap_or("(a path that is not UTF-8)"));
                 }
                 image.direct = Some(direct);
@@ -711,7 +711,7 @@ impl Image {
         match Map::load(vfs, handle, size.div_ceil(*block as u64), map.per_block) {
             Some(now) if now.runs == map.runs => true,
             Some(_) => {
-                trace!(0, "image: its map is not its filesystem's");
+                klog!(0, "image: its map is not its filesystem's");
                 false
             }
             None => false,
@@ -795,7 +795,7 @@ impl Image {
                 }
             }
             if direct.disk.read_pieces(&mut direct.batch, &direct.pieces).is_err() {
-                trace!(0, "image: a read of {} blocks failed", direct.pieces.len());
+                klog!(0, "image: a read of {} blocks failed", direct.pieces.len());
                 return false;
             }
             direct.read_off += 1;
@@ -931,7 +931,7 @@ impl Image {
                 }
             }
             if direct.disk.read_pieces(&mut direct.batch, &direct.pieces).is_err() {
-                trace!(0, "image: a read of the ends of a write failed");
+                klog!(0, "image: a read of the ends of a write failed");
                 return false;
             }
 
@@ -952,7 +952,7 @@ impl Image {
                 direct.pieces.push(Piece { sector, at: k * PAGE_SIZE, len: block });
             }
             if direct.disk.write_pieces(&direct.batch, &direct.pieces).is_err() {
-                trace!(0, "image: a write of {} blocks failed", used);
+                klog!(0, "image: a write of {} blocks failed", used);
                 return false;
             }
             direct.written_off += 1;
@@ -1343,7 +1343,7 @@ impl Image {
                          * but said, and failed: what was handed over is
                          * still the device's, and the request is done when
                          * that is. */
-                        trace!(0, "image: a command of {} bytes at sector {} was refused, or found no room on its \
+                        klog!(0, "image: a command of {} bytes at sector {} was refused, or found no room on its \
                                    disk for {} s", len, sector, DRAIN_SAY_NS / 1_000_000_000);
                         let slot = &mut fl.slots[k];
                         slot.ok = false;
@@ -1377,7 +1377,7 @@ impl Image {
             while let Some((buf, ok)) = fl.queue.reap() {
                 match self.direct.as_mut() {
                     Some(direct) => command_done(direct, fl, vfs, handle, buf, ok),
-                    None => trace!(0, "image: a completion for buffer {}, with no device to have come from", buf),
+                    None => klog!(0, "image: a completion for buffer {}, with no device to have come from", buf),
                 }
             }
         }
@@ -1416,7 +1416,7 @@ impl Image {
             let waited = boot_time_ns().saturating_sub(began);
             if waited >= DRAIN_SAY_NS && !said {
                 said = true;
-                trace!(0, "image: {}: has waited {} s for {} commands of its disk's", show(&self.path),
+                klog!(0, "image: {}: has waited {} s for {} commands of its disk's", show(&self.path),
                        waited / 1_000_000_000, fl.queue.in_flight());
             }
         }
@@ -1428,7 +1428,7 @@ impl Image {
 /// before (`Flight::unwritten`) -- and kept for `reap`.
 fn command_done(direct: &mut Direct, fl: &mut Flights, vfs: &Vfs, handle: Handle, buf: usize, ok: bool) {
     let Some(slot) = fl.slots.get_mut(buf).filter(|s| s.busy && s.left > 0) else {
-        trace!(0, "image: a completion for buffer {}, which has no command out", buf);
+        klog!(0, "image: a completion for buffer {}, which has no command out", buf);
         return;
     };
     slot.ok &= ok;
@@ -1465,31 +1465,31 @@ impl Drop for Image {
              * as a sync would: let go of with no sync, a guest's last writes
              * are the file's all the same, as a disk's are. */
             if !direct.make_written(vfs, handle, None) {
-                trace!(0, "image: {}: {} blocks it wrote over unwritten extents were not made written: they read as \
+                klog!(0, "image: {}: {} blocks it wrote over unwritten extents were not made written: they read as \
                            zeros", path, direct.pending.blocks());
             }
         }
         match &self.direct {
             /* Two lines, each short of what a line of the log holds whole. */
             Some(d) => {
-                trace!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} written \
+                klog!(0, "image: {} let go of -- {} batches read and {} written off the VFS's lock, {} written \
                            through it; {}", path, d.read_off, d.written_off, d.written_through, MapSays(d.map.as_ref()));
-                trace!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back, {} \
+                klog!(0, "image: {}: {} blocks given ahead of writes, {} chunks refused, {} blocks given back, {} \
                            made written", path, d.allocated, d.refused, d.punched, d.made_written);
-                trace!(0, "image: {}: {} growths, {} us on average and {} us at most; {} conversions, {} us on \
+                klog!(0, "image: {}: {} growths, {} us on average and {} us at most; {} conversions, {} us on \
                            average and {} us at most", path, d.grows_timed.count, d.grows_timed.average_us(),
                        d.grows_timed.max_us(), d.conversions.count, d.conversions.average_us(),
                        d.conversions.max_us());
                 if let Some(fl) = self.flights.as_ref() {
-                    trace!(0, "image: {}: {} requests served with the device asynchronously, {} by the batch",
+                    klog!(0, "image: {}: {} requests served with the device asynchronously, {} by the batch",
                            path, fl.fast, fl.slow);
-                    trace!(0, "image: {}: with the device {}", path, fl.fast_took);
-                    trace!(0, "image: {}: by the batch {}", path, fl.slow_took);
-                    trace!(0, "image: {}: waited for {}", path, fl.drained);
+                    klog!(0, "image: {}: with the device {}", path, fl.fast_took);
+                    klog!(0, "image: {}: by the batch {}", path, fl.slow_took);
+                    klog!(0, "image: {}: waited for {}", path, fl.drained);
                 }
-                trace!(0, "image: {}: syncs {}", path, d.syncs);
+                klog!(0, "image: {}: syncs {}", path, d.syncs);
             }
-            None => trace!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
+            None => klog!(0, "image: {} let go of -- read and written through the VFS, its filesystem keeping no \
                                blocks of its own on a device", path),
         }
         self.vfs.release(self.handle);
@@ -1516,7 +1516,7 @@ impl Direct {
         let disk = Disk::from_handle(device)?;
         let sector = disk.sector_size() as usize;
         if block == 0 || block > PAGE_SIZE || PAGE_SIZE % block != 0 || sector == 0 || block % sector != 0 {
-            trace!(0, "image: blocks of {} bytes on sectors of {}: read and written through the VFS", block, sector);
+            klog!(0, "image: blocks of {} bytes on sectors of {}: read and written through the VFS", block, sector);
             return None;
         }
         Some(disk)
@@ -1606,7 +1606,7 @@ impl Direct {
             self.retake(vfs, handle, first, count);
         }
         if !done {
-            trace!(0, "image: {} blocks written over unwritten extents were not made written", self.pending.blocks());
+            klog!(0, "image: {} blocks written over unwritten extents were not made written", self.pending.blocks());
             return false;
         }
         self.made_written += self.pending.blocks() + also.map_or(0, |(_, n)| n);
@@ -1620,7 +1620,7 @@ impl Direct {
     fn retake(&mut self, vfs: &Vfs, handle: Handle, first: u64, count: u64) {
         if let Some(map) = self.map.as_mut() {
             if !map.retake(vfs, handle, first, count) {
-                trace!(0, "image: its map of blocks {}..+{} cannot be taken again: every batch asks the VFS from \
+                klog!(0, "image: its map of blocks {}..+{} cannot be taken again: every batch asks the VFS from \
                            here on", first, count);
                 self.map = None;
             }
@@ -1662,7 +1662,7 @@ impl Direct {
          * hole did before chunks -- but a commit for each such write, which
          * is what chunks are for: said at the first, and counted. */
         if self.refused == 0 {
-            trace!(0, "image: its filesystem refused blocks {}..+{} ahead of a write into a hole: such writes go \
+            klog!(0, "image: its filesystem refused blocks {}..+{} ahead of a write into a hole: such writes go \
                        through the VFS", from, need - from);
         }
         self.refused += 1;
@@ -1691,7 +1691,7 @@ fn batch_buffer() -> Option<DmaBuffer> {
             return Some(buf);
         }
         if pages == 1 {
-            trace!(0, "image: no memory for a buffer");
+            klog!(0, "image: no memory for a buffer");
             return None;
         }
         pages /= 2;
@@ -1727,7 +1727,7 @@ fn images() -> Option<&'static [Mutex<Slot>]> {
         Some(Box::new(slots))
     });
     if table.is_none() {
-        trace!(0, "image: no memory for the table of images");
+        klog!(0, "image: no memory for the table of images");
     }
     table.map(|slots| slots.as_slice())
 }
@@ -1795,7 +1795,7 @@ pub unsafe extern "C" fn kernel_image_open(path: *const u8, path_len: usize, wri
             return word(index, slot.generation);
         }
     }
-    trace!(0, "image: all {} images are held", MAX_IMAGES);
+    klog!(0, "image: all {} images are held", MAX_IMAGES);
     /* Closed as it goes, with no slot's lock held. */
     drop(image);
     0

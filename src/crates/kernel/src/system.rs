@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 use kcore::consts::NS_PER_MS;
 use kcore::system::{self, ModuleOutcome};
-use kcore::trace;
+use kcore::klog;
 use mgmt::{Call, Kind, Method, Params, Provider, Status};
 
 struct System;
@@ -68,7 +68,7 @@ const CMDLINE_MAX: usize = 1024;
 pub fn init() {
     match mgmt::register("system", &METHODS, DESCRIPTOR, &SYSTEM) {
         Ok(registration) => core::mem::forget(registration),
-        Err(status) => trace!(0, "system: cannot register the provider: {}", status.name()),
+        Err(status) => klog!(0, "system: cannot register the provider: {}", status.name()),
     }
 }
 
@@ -110,7 +110,7 @@ fn no_params(method: &str, p: Params, call: &mut Call) -> Status {
                 w.begin_object();
                 w.end_object();
             });
-            trace!(0, "system: power-off asked for through the management bus");
+            klog!(0, "system: power-off asked for through the management bus");
             system::power_off();
             status
         }
@@ -119,7 +119,7 @@ fn no_params(method: &str, p: Params, call: &mut Call) -> Status {
                 w.begin_object();
                 w.end_object();
             });
-            trace!(0, "system: reboot asked for through the management bus");
+            klog!(0, "system: reboot asked for through the management bus");
             system::reboot();
             status
         }
@@ -444,7 +444,7 @@ fn load_module(mut p: Params, call: &mut Call) -> Status {
         None => return call.refuse(Status::Invalid, "is too long", Some("name")),
     };
     let mut said = Vec::new();
-    trace!(0, "system: insmod {} through the management bus", path);
+    klog!(0, "system: insmod {} through the management bus", path);
     let outcome = system::load_module(path, params, &mut |b| collect(&mut said, b));
     module_answer(call, outcome, &said)
 }
@@ -459,7 +459,7 @@ fn unload_module(mut p: Params, call: &mut Call) -> Status {
         return s;
     }
     let mut said = Vec::new();
-    trace!(0, "system: rmmod {} through the management bus", name);
+    klog!(0, "system: rmmod {} through the management bus", name);
     let outcome = system::unload_module(name, &mut |b| collect(&mut said, b));
     module_answer(call, outcome, &said)
 }
@@ -506,14 +506,14 @@ pub fn selftest() {
         panic!("system selftest: no provider of the image's answered");
     }
     log_selftest();
-    trace!(0, "system: selftest passed, {} reads of the image's providers answered", checked);
+    klog!(0, "system: selftest passed, {} reads of the image's providers answered", checked);
 }
 
 /// The log read by number: a line logged now comes back after the number
 /// the log had before it, and asking after it brings nothing older.
 fn log_selftest() {
     let before = system::log_next_seq();
-    trace!(0, "system: selftest's own line {}", before);
+    klog!(0, "system: selftest's own line {}", before);
     let mut buf = Vec::new();
     if buf.try_reserve_exact(4096).is_err() {
         panic!("system selftest: no memory for the log");

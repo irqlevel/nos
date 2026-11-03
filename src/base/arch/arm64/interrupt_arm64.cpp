@@ -6,7 +6,7 @@
 #include <kernel/interrupt.h>
 #include <kernel/cpu.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/context.h>
 #include <hal/irqchip.h>
 
@@ -68,7 +68,7 @@ void register_common(InterruptHandler& handler, u8 int_id, bool edge, bool level
     gic.enable_irq(int_id, read_mpidr(), edge);
     handler.on_interrupt_register(int_id, int_id);
 
-    trace(0, "Interrupt: intid %lu registered %s", (ulong)int_id,
+    klog(0, "Interrupt: intid %lu registered %s", (ulong)int_id,
         level ? "level" : "edge");
 }
 

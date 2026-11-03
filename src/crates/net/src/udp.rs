@@ -6,7 +6,7 @@
 //! builds its own frames: the formats are `netwire`'s, which both share.)
 
 use crate::nic::Nic;
-use kcore::trace;
+use kcore::klog;
 
 use crate::arp::ArpTable;
 use crate::wire::{self, udp, Mac};
@@ -52,7 +52,7 @@ pub fn send(
     let dst_mac = match arp.destination(nic, dst_ip) {
         Some(mac) => mac,
         None => {
-            trace!(0, "udp: nothing answered for {}, not sent", wire::Ipv4(dst_ip));
+            klog!(0, "udp: nothing answered for {}, not sent", wire::Ipv4(dst_ip));
             return false;
         }
     };

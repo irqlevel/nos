@@ -1,7 +1,7 @@
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/mmu.h>
 
 #include "cpuid.h"
@@ -147,14 +147,14 @@ void BuiltinPageTable::map_high_ram()
 
     if (!cpu_has_giant_pages())
     {
-        trace(0, "mm: no 1GiB page support, RAM above 0x%lX stays unusable",
+        klog(0, "mm: no 1GiB page support, RAM above 0x%lX stays unusable",
             LOW_MAP_LIMIT);
         return;
     }
 
     if (ram_end > top_limit)
     {
-        trace(0, "mm: usable RAM ends at 0x%lX, past what one PDPT covers",
+        klog(0, "mm: usable RAM ends at 0x%lX, past what one PDPT covers",
             ram_end);
         ram_end = top_limit;
     }
@@ -185,7 +185,7 @@ void BuiltinPageTable::map_high_ram()
         return;
 
     mapped_limit_ = ram_end;
-    trace(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
+    klog(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
         mapped_limit_, blocks);
 }
 

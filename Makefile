@@ -136,7 +136,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/task.cpp \
     src/base/kernel/test.cpp \
     src/base/kernel/main.cpp \
-    src/base/kernel/trace.cpp \
+    src/base/kernel/klog.cpp \
     src/base/kernel/timer.cpp    \
     src/base/kernel/panic.cpp    \
     src/base/kernel/ubsan.cpp \
@@ -214,7 +214,7 @@ CXX_SRC_aarch64 = \
     src/base/arch/arm64/x86_driver_stubs.cpp \
     src/base/drivers/pci.cpp \
     src/base/kernel/icxxabi.cpp \
-    src/base/kernel/trace.cpp \
+    src/base/kernel/klog.cpp \
     src/base/kernel/dmesg.cpp \
     src/base/kernel/panic.cpp \
     src/base/kernel/ubsan.cpp \
