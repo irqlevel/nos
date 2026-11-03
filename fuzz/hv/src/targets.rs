@@ -647,6 +647,12 @@ fn lapic_target(r: &mut Input) {
 
 fn ioapic_target(r: &mut Input) {
     let mut io = IoApic::new(r.u8());
+    /* Each pin as the target has driven it: a line held up, asserted again,
+     * is no edge, and sends nothing -- a level's interrupt went when it rose
+     * or when it was ended, and an NMI or an INIT is edge-triggered whatever
+     * its entry says (an NMI at every look was a guest's CPU 0 never entered
+     * again). */
+    let mut up: u32 = 0;
     while let Some(op) = r.op(8) {
         /* Its page's registers, mostly -- the select, the window, EOI. */
         let offset = if r.u8() < 200 { r.pick(&[0x00, 0x10, 0x40]) } else { r.below(ioapic::PAGE_SIZE) as u32 };
@@ -663,8 +669,19 @@ fn ioapic_target(r: &mut Input) {
                 }
                 io.mmio_write(offset, r.mmio_size(), r.value32())
             }
-            3 => io.set_line(pin, r.bool()),
-            4 => io.edge(pin),
+            3 => {
+                let asserted = r.bool();
+                let bit = 1u32.checked_shl(pin as u32).unwrap_or(0);
+                let pins = io.set_line(pin, asserted);
+                invariant!(!(asserted && up & bit != 0) || pins & bit == 0,
+                           "pin {}, held up and asserted again, sent again: {:#x}", pin, pins);
+                if asserted { up |= bit } else { up &= !bit }
+                pins
+            }
+            4 => {
+                up |= 1u32.checked_shl(pin as u32).unwrap_or(0);
+                io.edge(pin)
+            }
             5 => io.eoi(r.u8()),
             6 => {
                 io.route(pin);

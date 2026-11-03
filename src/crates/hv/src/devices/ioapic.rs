@@ -18,7 +18,16 @@
 //! is asserted and the last one has been ended -- its remote IRR set when it
 //! is sent, and cleared by the EOI that ends it, which the local APIC that
 //! took it as a level broadcasts ([`IoApic::eoi`]; or the guest writes the
-//! EOI register), and a pin asserted still is sent again. Each of these
+//! EOI register), and a pin asserted still is sent again. Only a fixed or a
+//! lowest-priority interrupt is ever level-triggered: an NMI or an INIT is
+//! no interrupt a local APIC has in service, and nothing would end it --
+//! the 82093AA treats one "as an edge triggered interrupt, even if it is
+//! programmed as a level triggered interrupt" -- so an entry of either is
+//! edge-triggered whatever its trigger bit says ([`level_triggered`]). Taken
+//! as a level, a pin held up -- the SCI, by a guest that pointed its entry
+//! at NMI -- would send one at every look, and the CPU it is for turn back
+//! its own entry for each: a guest's CPU 0 never entered again (hv-fuzz
+//! found it). Each of these
 //! says which pins have an interrupt to send now, and [`IoApic::send`] makes
 //! each one's message: what the APIC bus carries, as a device's MSI does,
 //! for the caller to deliver to the CPUs it names.
@@ -104,6 +113,14 @@ const DELIVERY_INIT: u64 = 5;
 /// Pins, a bit each: those with an interrupt to send now, which the caller
 /// sends one at a time ([`IoApic::send`]).
 pub type Pins = u32;
+
+/// Whether entry `e` is level-triggered as it is sent: its trigger bit
+/// set, and its delivery a fixed or a lowest-priority interrupt's -- the
+/// only ones an EOI ends. Anything else is edge-triggered, whatever the bit.
+fn level_triggered(e: u64) -> bool {
+    e & RTE_LEVEL != 0
+        && matches!((e >> RTE_DELIVERY_SHIFT) & RTE_DELIVERY_MASK, DELIVERY_FIXED | DELIVERY_LOWEST)
+}
 
 /// An interrupt sent: the message, and whether the local APIC takes it as a
 /// level-triggered one -- its EOI broadcast back here.
@@ -225,7 +242,7 @@ impl IoApic {
                     (old & !u64::from(u32::MAX)) | u64::from(value)
                 };
                 self.rte[pin] = new & RTE_WRITABLE;
-                if new & RTE_LEVEL == 0 {
+                if !level_triggered(self.rte[pin]) {
                     self.remote_irr &= !(1 << pin);
                     return 0;
                 }
@@ -239,7 +256,7 @@ impl IoApic {
     fn level_pending(&self, pin: usize) -> Pins {
         let bit = 1 << pin;
         let e = self.rte[pin];
-        let ready = e & RTE_LEVEL != 0 && e & RTE_MASKED == 0 && self.lines & bit != 0 && self.remote_irr & bit == 0;
+        let ready = level_triggered(e) && e & RTE_MASKED == 0 && self.lines & bit != 0 && self.remote_irr & bit == 0;
         if ready { bit } else { 0 }
     }
 
@@ -255,7 +272,7 @@ impl IoApic {
         } else {
             self.lines &= !bit;
         }
-        if e & RTE_LEVEL != 0 {
+        if level_triggered(e) {
             return self.level_pending(pin);
         }
         if asserted && !was && e & RTE_MASKED == 0 { bit } else { 0 }
@@ -303,7 +320,7 @@ impl IoApic {
         };
         /* Only a fixed interrupt is ended by an EOI: an NMI or an INIT is
          * never in service anywhere. */
-        let level = e & RTE_LEVEL != 0 && matches!(delivery, Delivery::Fixed | Delivery::LowestPriority);
+        let level = level_triggered(e);
         if level {
             self.remote_irr |= 1 << pin;
             self.stats.level += 1;
