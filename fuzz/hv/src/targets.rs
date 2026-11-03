@@ -1084,7 +1084,7 @@ fn blk_target(r: &mut Input) {
     let since = time::boot_time_ns();
     let size = if r.bool() { blk::SECTOR * r.below(1 << 16) } else { r.value64() & !(blk::SECTOR - 1) };
     let state = Arc::new(Mutex::new(DiskState::new(size, r.bool())));
-    let mut disk = Blk::new(Box::new(Disk(state.clone())), "fuzz").expect("a disk");
+    let mut disk = Blk::new(Box::new(Disk(state.clone())), "fuzz", 0).expect("a disk");
     if r.bool() {
         disk.offer_msix(2);
     }

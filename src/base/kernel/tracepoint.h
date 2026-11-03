@@ -63,6 +63,21 @@ enum class Id : u16
     HvTimer,
     HvRing,
 
+    /* A guest's disk, a request at a time: group "blk", the guest's virtio
+       disk taking it and giving it back (the hv module's device); group
+       "disk", what serves it -- the disk's task, the image the disk is, and
+       the block layer's asynchronous queue the image's commands go to the
+       device through; group "fs", the ext4 journal's commits. */
+    BlkSubmit,
+    BlkComplete,
+    DiskStart,
+    DiskDone,
+    ImageSync,
+    ImageNote,
+    BioSubmit,
+    BioDone,
+    Ext4Commit,
+
     Count
 };
 
@@ -346,6 +361,114 @@ struct HvRing
     u16 vcpu;
     u8 how;
     u8 pad;
+};
+
+/* ---- a guest disk's payloads ----
+   Recorded by Rust as the hypervisor's are: the hv module's device and
+   disk task (src/crates/hv/src/devices/blk.rs, src/crates/modules/hv/src/
+   disk.rs), the image (src/crates/fs/src/image.rs), the block layer's
+   queue (src/crates/block/src/queue.rs) and ext4's journal
+   (src/crates/fs/src/ext4/journal.rs). A request is said by its disk --
+   its number among its guest's, vda 0 -- and its slot, the buffer it has
+   while it is out; a command to the device by its queue's entry and its
+   buffer. */
+
+struct BlkSubmit
+{
+    u64 offset;
+    u32 len;
+    u32 pid;
+    u16 slot;
+    u8 disk;
+    u8 op;
+    u8 pad[4];
+};
+
+struct BlkComplete
+{
+    u64 offset;
+    u32 len;
+    u32 pid;
+    u16 slot;
+    u8 disk;
+    u8 op;
+    u8 ok;
+    u8 pad[3];
+};
+
+struct DiskStart
+{
+    u64 offset;
+    u32 len;
+    u32 pid;
+    u16 slot;
+    u8 disk;
+    u8 op;
+    u8 pad[4];
+};
+
+struct DiskDone
+{
+    u32 pid;
+    u16 slot;
+    u8 disk;
+    u8 op;
+    u8 how;
+    u8 ok;
+    u8 pad[2];
+};
+
+struct ImageSync
+{
+    u64 offset;
+    u32 ns;
+    u32 len;
+    u32 pid;
+    u8 write;
+    u8 ok;
+    u8 pad[2];
+};
+
+struct ImageNote
+{
+    u64 from;
+    u32 ns;
+    u32 blocks;
+    u32 pid;
+    u8 ok;
+    u8 pad[3];
+};
+
+struct BioSubmit
+{
+    u64 sector;
+    u32 count;
+    u32 pid;
+    u16 entry;
+    u16 buffer;
+    u16 in_flight;
+    u8 write;
+    u8 pad;
+};
+
+struct BioDone
+{
+    u16 entry;
+    u16 buffer;
+    u8 ok;
+    u8 refused;
+    u8 pad[2];
+};
+
+struct Ext4Commit
+{
+    u32 seq;
+    u32 blocks;
+    u32 ns;
+    u32 checkpoint_ns;
+    u32 pid;
+    u8 ok;
+    u8 pad[3];
 };
 
 /* ---- the sites ----

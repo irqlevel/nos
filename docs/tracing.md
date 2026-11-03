@@ -392,6 +392,36 @@ interrupt in the guest.
 
 A time of 4.29 s or more is held at that, the most a u32 of nanoseconds has.
 
+## A guest disk's events
+
+A request from a guest's virtio disk to the device and back, a record at
+each hand-off: group `blk` the virtio disk (`hv/src/devices/blk.rs`),
+group `disk` what serves it -- the hv module's disk task
+(`modules/hv/src/disk.rs`), the image (`fs/src/image.rs`) and the block
+layer's asynchronous queue (`block/src/queue.rs`) -- and group `fs` the
+ext4 journal (`fs/src/ext4/journal.rs`). A request is said by its `disk`
+(vda 0) and its `slot`, the buffer it has while it is out; a command to
+the device by its queue's `entry` and `buffer`.
+
+| event | where, and what it records |
+|---|---|
+| `blk_submit` | the request taken off the ring and handed to the backend (`Blk::start`), by the vCPU whose notify it was -- or the first CPU's round: its `op` (read, write, flush, discard, write_zeroes), `offset` and `len` |
+| `disk_start` | picked up by the disk's task (`serve`), before it goes to the image |
+| `image_sync` | served by the image then and there, through its filesystem, after what it had in flight (`Image::start`'s synchronous path): a write into a hole, a request its blocks do not line up for; its `ns`, the drain included -- what a first write costs |
+| `bio_submit` | a command of the image's handed to the device (`Queue::start`), before the device can have it: its `sector`, `count` and the queue's commands `in_flight` with it |
+| `bio_done` | that command's completion, from the device's interrupt (`on_done`), on the CPU that took it -- or, `refused`, its submit's refusal, so that every `bio_submit` has its one `bio_done` |
+| `image_note` | the blocks written over unwritten extents, made written in the filesystem at last (`make_written`): `from`, `blocks`, `ns` |
+| `ext4_commit` | a transaction committed to the journal: its `seq`, the journal's `blocks` it took, its `ns` and the part of it a checkpoint took (`checkpoint_ns`) -- a commit of nothing is no record |
+| `disk_done` | the request done in the disk's task, before it goes back: `how` -- with the device and reaped (`async`), done by the image's start (`at_once`), or a flush, discard or write of zeros served on its own (`command`) |
+| `blk_complete` | back at the virtio disk (`Blk::complete`), in the first CPU's round, before it is given back to the guest |
+
+So a request's time is the sum of its hand-offs: `blk_submit` to
+`disk_start` is the disk's task waking for it, `disk_start` to `disk_done`
+the image's work -- `bio_submit` to `bio_done` the device's share of it --
+and `disk_done` to `blk_complete` the vCPU's round coming for it. With
+`trace on hv` beside it, the notify's `hv_exit` comes before the
+`blk_submit` and the interrupt's `hv_inject` after the `blk_complete`.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -458,6 +488,17 @@ too.
   for the IPI by CPU 1's, its timer's interrupt asked for once and -- where
   the host injects them -- the IPI and the timer's interrupt injected once
   each, every halt ended by a wake; and with every event off, nothing.
+- A guest disk's events: every boot's `rust_test` holds their payloads to
+  the descriptions; `hv-fuzz.py` builds `blk_submit` and `blk_complete`
+  under its overflow checks for half of every target's inputs -- the disk's
+  and the virtio queues' among them; `fs-fuzz.py` and `net-fuzz.py` run the
+  layers' own -- the image's, the block queue's, ext4's -- for half their
+  inputs, the machine's `kernel_tp_emit` holding each record to its
+  description, an enumeration's value one it names and every pad zero; and
+  `hv-test.py` (x86-64) traces hvboot's reads of a disk it is given -- each
+  taken off the ring, picked up by the disk's task, served by the image then
+  and there, done and given back, in that order, slot by slot, by the
+  disk's own task -- and a file written, its ext4 transactions committed.
 - `trace-test.py` (arm64; x86-64 where grub-mkrescue is): a kernel booted
   with `tracepoints=test`, and `trace` driven over the UDP shell -- the
   boot's events on, records shown merged and in order, rings made again at

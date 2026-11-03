@@ -70,6 +70,7 @@ use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
+use kcore::trace::{self, ImageNote, ImageSync};
 use kcore::klog;
 
 use crate::vfs::{Handle, MapRun, Vfs, OPEN_HOLD, OPEN_READ, OPEN_WRITE};
@@ -1238,6 +1239,17 @@ impl Image {
         fl.slow += 1;
         fl.slow_took.add(began);
         self.flights = Some(fl);
+        if trace::on::<ImageSync>() {
+            trace::emit(&ImageSync {
+                offset,
+                ns: ns_field(boot_time_ns().saturating_sub(began)),
+                len: u32::try_from(len).unwrap_or(u32::MAX),
+                pid: trace::pid(),
+                write: u8::from(write),
+                ok: u8::from(ok),
+                _pad: [0; 2],
+            });
+        }
         Started::Done(ok)
     }
 
@@ -1448,6 +1460,12 @@ fn command_done(direct: &mut Direct, fl: &mut Flights, vfs: &Vfs, handle: Handle
     fl.done.push_back((buf, ok));
 }
 
+/// Nanoseconds as a trace record's field holds them: `u32::MAX` for that or
+/// more.
+fn ns_field(ns: u64) -> u32 {
+    u32::try_from(ns).unwrap_or(u32::MAX)
+}
+
 /// A path the image was given, as what it says shows it.
 fn show(path: &[u8]) -> &str {
     core::str::from_utf8(path).unwrap_or("(a path that is not UTF-8)")
@@ -1600,6 +1618,17 @@ impl Direct {
         let done = kept && vfs.mark_written(handle, &runs)
             && also.is_none_or(|run| vfs.mark_written(handle, &[run]));
         self.conversions.add(from);
+        if trace::on::<ImageNote>() {
+            let blocks = runs.iter().chain(also.iter()).fold(0u64, |sum, &(_, n)| sum.saturating_add(n));
+            trace::emit(&ImageNote {
+                from: runs.first().or(also.as_ref()).map_or(0, |&(first, _)| first),
+                ns: ns_field(boot_time_ns().saturating_sub(from)),
+                blocks: u32::try_from(blocks).unwrap_or(u32::MAX),
+                pid: trace::pid(),
+                ok: u8::from(done),
+                _pad: [0; 3],
+            });
+        }
         /* Taken again whatever came of it: what the filesystem did make
          * written is so in the map from now. */
         for &(first, count) in runs.iter().chain(also.iter()) {

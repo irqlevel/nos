@@ -668,7 +668,7 @@ impl BlkWorld {
 fn blk_run(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let state = Arc::new(Mutex::new(DiskState::new(DISK_BYTES, false)));
-    let Ok(mut disk) = Blk::new(Box::new(Disk(state.clone())), "virtq") else { return };
+    let Ok(mut disk) = Blk::new(Box::new(Disk(state.clone())), "virtq", 0) else { return };
     let irq = r.pick(&[Irq::Intx, Irq::PerQueue, Irq::Shared]);
     if irq != Irq::Intx {
         disk.offer_msix(2);
