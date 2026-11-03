@@ -4117,7 +4117,13 @@ line is up and its last interrupt has been ended -- its remote IRR set as
 it sends, and cleared by the EOI of the local APIC that took it, which the
 APIC broadcasts for a vector it took as a level (its trigger-mode
 register), or by a write of the IO-APIC's EOI register; a line still up
-then sends again. A message goes as a device's MSI does: into the local
+then sends again. Only a fixed or a lowest-priority interrupt is ever a
+level: an NMI or an INIT is in service nowhere and nothing ends it, so an
+entry of either is edge-triggered whatever its trigger bit says, as the
+82093AA treats one -- taken as a level, a guest that pointed the SCI's
+entry at NMI had one sent at every look while the SCI was up, and its CPU 0
+turned back its own entry for each, never to run again (hv-fuzz found it).
+A message goes as a device's MSI does: into the local
 APIC of the CPU whose loop sent it, or through another's mailbox, the
 level bit with it. The serial port had to become a 16550 for this: its
 transmitter's interrupt pending until IIR reports it or a byte is written,
