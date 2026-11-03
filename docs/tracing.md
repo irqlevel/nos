@@ -36,7 +36,7 @@ eight 64-bit stores and two barriers into this CPU's ring, interrupts back.
 
 | | off, over an empty loop's iteration | on, a record |
 |---|---:|---:|
-| arm64, Apple Silicon under HVF | 0.01-0.13 ns | 31-47 ns |
+| arm64, Apple Silicon under HVF | 0.14-0.37 ns | 31-47 ns |
 | arm64, QEMU's TCG | 0.28 ns | 239 ns |
 
 There are no static keys -- the branch is not patched out of the code. The
@@ -97,6 +97,49 @@ fields as `name=value` -- from the event's description, one format for all.
 `tracepoints=<list>` on the kernel command line turns events on as the boot
 ends, once every CPU has its ring ([kernel parameters](kernel-parameters.md)).
 
+## The scheduler's events
+
+| event | group | what it records |
+|---|---|---|
+| `sched_switch` | sched | a CPU's next task and the one it left: `prev_pid`/`prev_comm`, `next_pid`/`next_comm`, `next_cpu`, what `prev_state` went to be (runnable, blocked, sleeping, exited) and the decision's `reason` (voluntary, yield, preempt) |
+| `sched_wakeup` | sched | a task handed back to its queue: `pid`, `comm`, the `cpu`, whether its `deadline` came or someone's `unblock()`, and the task that woke it (`waker_pid` -- the one an interrupt landed on, from an interrupt's context -- 4294967295 where nobody did) |
+| `sched_block` | sched | a task that left its CPU because it cannot run: whether it is `deadline`-bound, and how long it `ran_ns` this time |
+| `sched_migrate` | sched | the load balancer moving a runnable task: `from` and `to` a CPU's queue |
+| `sched_new` | sched | a task put on a queue for the first time |
+| `sched_exit` | sched | a task whose CPU is taking its last reference and its stack |
+| `sched_ipi` | sched | an interrupt another CPU sent, and the queued work it found (`tasks`) -- a wakeup's reschedule, a TLB shootdown |
+| `sched_preempt_deferred` | sched | a reschedule that landed on a task with preemption disabled: its count, and whether it was an idle task -- the case a woken vCPU waited a slice in |
+| `idle_enter`, `idle_exit` | idle | a CPU about to halt and back from it: the idle task's `pid`. What an idle cost is the two's distance |
+| `sched_slice` | debug | the slice the decision gave the current task, and how many could run -- a record each decision, so opt in |
+
+`trace on sched` turns the eight decision events on; `trace on idle` the
+two the idle loop makes; `trace on debug` the slice one. A trace of
+`trace on sched idle` is a schedule that can be read as a timeline:
+`sched_switch` from `prev` to `next` on a CPU, `sched_wakeup` for whoever
+was handed back, `idle_enter`/`idle_exit` around what the CPU did instead.
+
+What they cost when off was measured rather than assumed: ten interleaved
+boots of the build before and the build with them, fifteen 3 s windows of
+`sched` each (an idle 4-CPU machine under HVF), put the median window at
+897 ns a decision without the sites and 887 ns with them -- one build's own
+windows differ by 42 ns (one standard deviation) -- and `trace bench`'s own
+check at 0.14-0.37 ns an iteration, in both builds. That the measurement
+would see the sites at all: the same boot with `sched` and `idle` on, every
+decision recording, put it at 1.0 us.
+
+Where each sits, and why there: `sched_switch` in `TaskQueue::switch_to`
+(the two tasks as the CPU leaves them, the queue's lock still held);
+`sched_block` where the decision took the task off the run list, so that
+`ran_ns` is the stretch it just ran; `sched_wakeup` at the compare-and-swap
+that made a task `RUN_WAKING`, and at the sleep list's walk for a
+deadline's own; `sched_migrate` after the task is on its new queue;
+`sched_new` where a task is first put on one; `sched_exit` before its stack
+is given back; `sched_ipi` in `Cpu::ipi`; `sched_preempt_deferred` where
+`schedule_current` puts the reschedule off; the two idle events around the
+halt itself. The names they record are a task's own, written when it is
+made and never moved, so reading one in an interrupt's context needs no
+lock.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -128,4 +171,11 @@ too.
   with `tracepoints=test`, and `trace` driven over the UDP shell -- the
   boot's events on, records shown merged and in order, rings made again at
   another size, three times round one of 1024, cleared, frozen and thawed,
-  freed and made again, and every word the command refuses.
+  freed and made again, and every word the command refuses. Then the
+  scheduler's, in three phases: `sched_new` and `sched_exit` alone (a task
+  made and a task exiting); the decision events and the two the idle loop
+  makes, from a `sched probe`; and `sched_slice` on its own -- a record a
+  decision, so it fills a ring while the others' would be read. Every record
+  held to its description's fields, every name a switch records one a task
+  has and at most the field's 12 bytes, and the idle ones among the ones
+  `ps` lists.

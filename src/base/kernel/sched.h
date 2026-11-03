@@ -111,6 +111,11 @@ public:
     void insert(Task* task);
     void remove(Task* task);
 
+    /* The CPU this queue is its scheduler's: set once, by Cpu::init. What a
+       tracepoint records a task's home as. */
+    void set_index(ulong index) { index_ = index; }
+    ulong index() const { return index_; }
+
     void schedule(Task* curr, ScheduleReason why);
 
     /* A task's nice and slice (SchedEntity), set under this queue's lock --
@@ -240,7 +245,7 @@ private:
        runnable candidate before declaring the queue broken */
     static const ulong MAX_EXITED_RETRIES = 100000000;
 
-    void switch_to(Task* next, Task* curr);
+    void switch_to(Task* next, Task* curr, ScheduleReason why, bool prev_sleeping);
 
     void switch_complete(Task* curr);
 
@@ -262,6 +267,10 @@ private:
     /* The idle task is counted -- it runs something other than its idling,
        or waits for its turn to (count_idle) */
     bool idle_counted_;
+
+    /* This queue's CPU, as Cpu::init sets it: what a tracepoint records a
+       task's home as */
+    ulong index_;
 
     /* The tasks asleep until a deadline -- sleep(), Event::wait_for() --
        soonest first (Task::sleep_entry_): what this CPU's timer is armed for,

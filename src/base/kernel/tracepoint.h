@@ -4,6 +4,8 @@
 #include <lib/printer.h>
 #include <kernel/trace_ring.h>
 
+#include "forward.h"
+
 namespace kernel
 {
 namespace tp
@@ -33,6 +35,24 @@ enum class Id : u16
 {
     /* The self-test's, and `trace test`'s and `trace bench`'s. */
     Test,
+
+    /* The scheduler's (group "sched"): a decision and everything it does --
+       who left a CPU, who took it, who was woken by whom. */
+    SchedSwitch,
+    SchedWakeup,
+    SchedBlock,
+    SchedMigrate,
+    SchedNew,
+    SchedExit,
+    SchedIpi,
+    SchedPreemptDeferred,
+    /* Group "idle": a CPU about to halt, and back from it. */
+    IdleEnter,
+    IdleExit,
+    /* Group "debug": what the scheduler is expensive enough to be worth a
+       record of its own -- the slice armed on the timer. */
+    SchedSlice,
+
     Count
 };
 
@@ -67,6 +87,9 @@ enum class Kind : u8
     Pid,
     /* An index into the field's names. */
     Enum,
+    /* A task's name: the field's bytes, up to the first zero, printed as a
+       string -- what a task is called, not what it points at. */
+    Comm,
 };
 
 struct Field
@@ -128,6 +151,135 @@ struct Test
     u64 seq;
     u64 value;
 };
+
+/* A task's name in a payload: what fits, no terminator needed -- the field's
+   own size is where a reader stops, so a name longer than it is cut, never
+   read past. */
+const ulong COMM_BYTES = 12;
+
+/* waker_pid of a wakeup nobody made -- a deadline's, from the sleep list */
+const u32 NO_TASK_PID = 0xFFFFFFFF;
+
+/* ---- the scheduler's payloads (the sites are sched.cpp, task.cpp, cpu.cpp:
+   where each event is emitted, and why there, is in docs/tracing.md) ---- */
+
+/* The states `prev_state` names: what a task left its CPU to be. */
+enum class SwitchState : u8
+{
+    Runnable = 0, /* displaced while it could still run */
+    Blocked = 1,  /* waiting on someone else's wakeup */
+    Sleeping = 2, /* asleep until a deadline */
+    Exited = 3,
+};
+
+struct SchedSwitch
+{
+    u32 prev_pid;
+    char prev_comm[COMM_BYTES];
+    u32 next_pid;
+    char next_comm[COMM_BYTES];
+    u32 next_cpu;
+    u8 prev_state;
+    u8 reason;
+};
+
+struct SchedWakeup
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    /* The CPU whose queue it went back to */
+    u32 cpu;
+    /* 1: its deadline came; 0: someone's unblock() */
+    u8 deadline;
+    /* The task that woke it, when woken from one of a task's stacks --
+       from an interrupt's context it is the task the interrupt landed on */
+    u32 waker_pid;
+};
+
+struct SchedBlock
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    u32 cpu;
+    /* 1: asleep until a deadline; 0: waiting on someone else's wakeup */
+    u8 deadline;
+    /* How long it was on the CPU this time */
+    u32 ran_ns;
+};
+
+struct SchedMigrate
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    u32 from;
+    u32 to;
+};
+
+struct SchedNew
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    u32 cpu;
+};
+
+struct SchedExit
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    u32 cpu;
+};
+
+struct SchedIpi
+{
+    u32 cpu;
+    /* What queued work the interrupt found, a wakeup's reschedule or a TLB
+       shootdown among it */
+    u32 tasks;
+};
+
+struct SchedPreemptDeferred
+{
+    u32 pid;
+    char comm[COMM_BYTES];
+    u32 cpu;
+    /* Its preempt_disable_counter_ as the reschedule found it */
+    u32 count;
+    u8 idle;
+};
+
+/* idle_enter and idle_exit: the CPU, and its idle task. */
+struct Idle
+{
+    u32 cpu;
+    u32 pid;
+};
+
+struct SchedSlice
+{
+    u32 cpu;
+    u32 pid;
+    /* How long from now the current one's slice ends */
+    u32 slice_ns;
+    /* The tasks the queue had that could run */
+    u32 runnable;
+};
+
+/* ---- the sites ----
+   One function an event, building its payload off what the scheduler has in
+   its hands, so that a site is a line: the check, and the call with the
+   values it already has. Each is called only when its event is on, and the
+   task.h it needs for the pid and the name is tracepoint.cpp's to include
+   -- not this header's, which the scheduler's own includes read. */
+void emit_sched_switch(Task* prev, Task* next, ulong cpu, u8 state, u8 reason);
+void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker);
+void emit_sched_block(Task* task, ulong cpu, ulong ran_ns);
+void emit_sched_migrate(Task* task, ulong from, ulong to);
+void emit_sched_new(Task* task, ulong cpu);
+void emit_sched_exit(Task* task, ulong cpu);
+void emit_sched_ipi(ulong cpu, ulong tasks);
+void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle);
+void emit_idle(Id id, ulong cpu, Task* idle_task);
+void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable);
 
 }
 }

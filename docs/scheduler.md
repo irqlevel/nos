@@ -759,6 +759,7 @@ queue's.
 | `sched probe [spinners=N] [ms=M] [cpu=N]` | How long a woken task waits beside tasks that never yield, the lag it woke with, and each task's share ([above](#a-woken-task-behind-spinners)) |
 | `sched queue [cpu]` | What EEVDF has of each task a CPU can run, the one on it first: nice, slice, lag and deadline from V, eligible or not ([above](#who-runs-next-eevdf)) |
 | `sched nice <pid> <n>`, `sched slice <pid> <us>` | A task's nice, -20 to 19, and its slice, 100 us to 100 ms |
+| `trace on sched` (`idle`, `debug`) | The scheduler's own events, recorded into each CPU's ring as they happen and read back merged by time: every switch with what the one before went to be and the decision's reason, every wakeup and who made it, blocks with how long the task ran, migrations, IPIs, a task made and one exiting, the idles -- see [Tracepoints](tracing.md#the-schedulers-events) |
 | `stacks` | High-water mark of every task stack and every static boot stack |
 | `bt <pid>` | Where a task is and its stack trace (`Task::locate`, [above](#waiting-for-one-to-end)): read off its stack when it is off its CPU, caught by an IPI on the CPU running it, or the CPUs that would not answer one named |
 | `profile` | Where the time actually goes — see [Profiler](profiler.md) |
