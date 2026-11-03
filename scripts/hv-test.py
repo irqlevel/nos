@@ -68,7 +68,11 @@ KVM it is whatever the host CPU has):
     its second CPU's IPI, each written to the ICR and each ringing the CPU
     it is for, its timer's interrupt asked for once and both interrupts
     injected once (where the host injects them), every halt ended by a
-    wake; and with the events off, nothing recorded
+    wake; a guest disk's (`trace on blk disk fs`): hvboot's reads of a disk
+    it is given, each taken off the ring, picked up by the disk's task,
+    served by the image then and there, done and given back, in order, slot
+    by slot, and a file written, its ext4 transactions committed; and with
+    the events off, nothing recorded
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
@@ -245,7 +249,9 @@ SCRIPT = [
 ] + CONVERT
 
 # The hypervisor's tracepoints, after the creates' rmmod: two guests run
-# with the group on, each window read and then cleared, and a run with every
+# with the group on, each window read and then cleared; then a guest disk's
+# requests -- hvboot's reads of /disk.raw, given it as its disk -- and a
+# file written, with the disk's groups and ext4's on; and a run with every
 # event off. Indexed from the phase's first line (`trace_checks`).
 TRACE = [
     "insmod /hv.ko",        # 0
@@ -258,9 +264,14 @@ TRACE = [
     "trace show 4096 hv",   # 7
     "trace clear",          # 8
     "trace off all",        # 9
-    "hv run exits 0",       # 10
-    "trace show 4096 hv",   # 11
-    "rmmod hv",             # 12
+    "trace on blk disk fs",  # 10
+    "hv boot /hvboot mem=64 secs=120 disk=/disk.raw",  # 11
+    "write /traced.txt the disk path, traced",  # 12
+    "trace show 4096 blk disk fs",  # 13
+    "trace off all",        # 14
+    "hv run exits 0",       # 15
+    "trace show 4096 hv",   # 16
+    "rmmod hv",             # 17
 ]
 
 # What the `exits` guest does (hv/src/guests.rs): says "nos: ports and
@@ -762,7 +773,7 @@ RC_LAST = "version"
 RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 
 
-TRACE_LINE = re.compile(r"^\s*\d+\.\d+\s+\d+\s+(hv_\w+):((?: \w+=\S+)*)\s*$")
+TRACE_LINE = re.compile(r"^\s*\d+\.\d+\s+\d+\s+((?:hv|blk|disk|image|bio|ext4)_\w+):((?: \w+=\S+)*)\s*$")
 
 
 def trace_records(text):
@@ -857,8 +868,62 @@ def trace_checks(out, apicv):
              alternate and any(f.get("vcpu") == 0 and f.get("until") == "timer" for e, f in halts if e == "hv_halt"),
              out[7])
 
-    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[11], out[11])
-    pt.check("and hv unloads after", "hv unloaded" in out[12], out[12])
+    disk_checks(out[10], out[11], out[13])
+
+    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[16], out[16])
+    pt.check("and hv unloads after", "hv unloaded" in out[17], out[17])
+
+
+def disk_checks(on, boot, shown):
+    """A guest disk's requests, traced: hvboot's reads of /disk.raw -- a
+    disk of an MBR's signature and nothing else, which it reads its sectors
+    of and gives up on -- each taken off the ring, picked up by the disk's
+    task, served by the image through its filesystem (unaligned to its
+    blocks, so then and there), done and given back, in that order, slot by
+    slot; and a file written, ext4's transactions committed."""
+    pt.check("trace on blk disk fs turns the disk path's events on", re.search(r"\b9 events on", on) is not None,
+             on)
+    pt.check("hvboot, given /disk.raw, reads it and finds nothing to boot",
+             "cannot boot" in boot and "the guest powered itself off" in boot, boot)
+    recs = trace_records(shown)
+    submits = [f for e, f in recs if e == "blk_submit"]
+    pt.check("blk_submit: hvboot's reads of its disk, vda, taken off the ring -- its MBR at 0 first",
+             submits != [] and all(f.get("disk") == 0 and f.get("op") == "read" for f in submits)
+             and submits[0].get("offset") == 0 and submits[0].get("len") == 512, shown)
+    # Each request, slot by slot, through every stage in order: no stage of
+    # it before the one before, every stage of it there, done well.
+    order = ["blk_submit", "disk_start", "image_sync", "disk_done", "blk_complete"]
+    seen = []
+    whole = True
+    for e, f in recs:
+        if e not in order:
+            continue
+        if e == "blk_submit":
+            seen.append([e])
+        elif seen:
+            seen[-1].append(e)
+    for stages in seen:
+        whole = whole and stages == order
+    pt.check("each one picked up by the disk's task, served by the image then and there, done and given back, "
+             "in order", whole and len(seen) == len(submits), shown)
+    vcpu = {f.get("pid") for f in submits}
+    task = {f.get("pid") for e, f in recs if e in ("disk_start", "disk_done", "image_sync")}
+    pt.check("the disk's records its own task's, not the vCPU's", len(task) == 1 and not (task & vcpu), shown)
+    done = [f for e, f in recs if e == "disk_done"]
+    pt.check("disk_done: every one served at once, and well",
+             done != [] and all(f.get("how") == "at_once" and f.get("ok") == 1 for f in done), shown)
+    syncs = [f for e, f in recs if e == "image_sync"]
+    pt.check("image_sync: each read's offset and length the request's, its time said",
+             [(f.get("offset"), f.get("len")) for f in syncs] == [(f.get("offset"), f.get("len")) for f in submits]
+             and all(f.get("write") == 0 and f.get("ok") == 1 and f.get("ns", 0) > 0 for f in syncs), shown)
+    completes = [f for e, f in recs if e == "blk_complete"]
+    pt.check("blk_complete: each given back well, from the slot it went out in",
+             [(f.get("slot"), f.get("offset")) for f in completes] == [(f.get("slot"), f.get("offset")) for f in submits]
+             and all(f.get("ok") == 1 for f in completes), shown)
+    commits = [f for e, f in recs if e == "ext4_commit"]
+    pt.check("ext4_commit: the file written committed through the journal, each with its blocks and its time",
+             commits != [] and all(f.get("ok") == 1 and f.get("blocks", 0) > 0 and f.get("ns", 0) > 0 for f in commits),
+             shown)
 
 
 def wait_done(log, timeout):

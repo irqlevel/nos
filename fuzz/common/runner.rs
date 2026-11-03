@@ -85,6 +85,9 @@ fn begin(data: &[u8]) {
         seed[i] = *b;
     }
     let word = u64::from_le_bytes(seed);
+    /* The kernel's tracepoints on for half the inputs: every record a site
+     * of the layers' builds held to its description. */
+    super::machine::ffi::tp_set_all(seed[1] & 1 != 0);
     /* Preemption at a lock let go of: never, for half the inputs, and for
      * the rest one time in 64, 16 or 4. */
     let preempt = match seed[0] {

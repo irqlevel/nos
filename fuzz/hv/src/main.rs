@@ -199,9 +199,18 @@ fn input(target: &str, seed: u64, iter: u64, max_len: usize) -> Vec<u8> {
     v
 }
 
+/// The tracepoints on for an input of an odd length, off for the rest: half
+/// of every target's inputs build their records, and a replay of one -- the
+/// same bytes -- the same. A target may say otherwise from its input (the
+/// whole machine's does).
+fn trace_for(data: &[u8]) {
+    crate::trace::set_on(data.len() % 2 == 1);
+}
+
 /// Run `t` on `data`: None, or what went wrong.
 fn run_one(t: &Target, data: &[u8]) -> Option<String> {
     crate::time::reset();
+    trace_for(data);
     *LAST_PANIC.lock().unwrap() = None;
     let result = std::panic::catch_unwind(|| {
         let mut input = targets::Input::new(data);
@@ -262,6 +271,7 @@ fn main() {
         let t = targets::ALL.iter().find(|t| t.name == name).unwrap_or_else(|| usage());
         let data = unhex(&std::fs::read_to_string(&file).expect("the input's file"));
         crate::time::reset();
+        trace_for(&data);
         let mut input = targets::Input::new(&data);
         (t.run)(&mut input);
         println!("{}: ran to its end", name);
