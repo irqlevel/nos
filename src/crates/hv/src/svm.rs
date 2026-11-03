@@ -437,6 +437,17 @@ impl Vcpu {
         self.guest.profile()
     }
 
+    /// Its last entry's world switch, where it was timed (`arch::Run`).
+    pub fn last_run(&self) -> arch::Run {
+        self.guest.last_run()
+    }
+
+    /// The host's interrupt its last exit was for: never known here -- an
+    /// INTR exit takes the interrupt after `stgi`, saying nothing of it.
+    pub fn host_vector(&self) -> Option<u8> {
+        None
+    }
+
     pub fn next_rip_saved(&self) -> bool {
         self.nrip
     }

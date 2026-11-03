@@ -86,6 +86,14 @@ pub fn emit<E: Event>(event: &E) {
     unsafe { ffi::trace::kernel_tp_emit(E::ID as u16, bytes.as_ptr(), bytes.len()) }
 }
 
+/// The pid a record says the running task by: its own -- an interrupt's on
+/// a task's stack the task's -- or the kernel's none, `u32::MAX`, off one.
+/// What a site that records on its task's behalf puts in its payload.
+#[inline]
+pub fn pid() -> u32 {
+    ffi::trace::kernel_tp_pid()
+}
+
 /// What the kernel's description of an event says that this side's payload
 /// does not.
 #[derive(Debug)]
@@ -99,6 +107,10 @@ pub enum Mismatch {
     /// A field of the kernel's this side has not -- by its name, or not at
     /// its offset, or not of its size
     Field { index: usize },
+    /// That field's values named otherwise: an enumeration on one side and
+    /// not the other, of another count of values, or one of them called
+    /// another name
+    Names { index: usize },
     /// A field of this side's the kernel's description has not
     Missing,
 }
@@ -110,8 +122,9 @@ fn written(buf: &[u8]) -> &[u8] {
 }
 
 /// Every payload declared here held to the kernel's description of its
-/// event: its name, its size, and each field's name, offset and size, both
-/// ways. The first that differs, by the payload's name.
+/// event: its name, its size, each field's name, offset and size, both
+/// ways, and an enumeration's names value by value. The first that differs,
+/// by the payload's name.
 pub fn check() -> Result<(), (&'static str, Mismatch)> {
     /* More fields than any payload of 40 bytes can have: the bound on a walk
        of the kernel's that never says it is done */
@@ -139,18 +152,33 @@ pub fn check() -> Result<(), (&'static str, Mismatch)> {
             let mut field = [0u8; NAME_MAX];
             let mut offset = 0usize;
             let mut fsize = 0usize;
-            /* SAFETY: as above, the three of them this side's */
+            let mut names = 0usize;
+            /* SAFETY: as above, the four of them this side's */
             let there = unsafe {
-                ffi::trace::kernel_tp_field(id, index, field.as_mut_ptr(), field.len(), &mut offset, &mut fsize)
+                ffi::trace::kernel_tp_field(id, index, field.as_mut_ptr(), field.len(), &mut offset, &mut fsize,
+                    &mut names)
             };
             if there == 0 {
                 break;
             }
             theirs += 1;
             let named = written(&field);
-            match e.fields.iter().find(|f| f.name.as_bytes() == named) {
-                Some(f) if f.offset == offset && f.size == fsize => {}
+            let ours = match e.fields.iter().find(|f| f.name.as_bytes() == named) {
+                Some(f) if f.offset == offset && f.size == fsize => f,
                 _ => return Err((e.name, Mismatch::Field { index })),
+            };
+            if ours.names.len() != names {
+                return Err((e.name, Mismatch::Names { index }));
+            }
+            for (value, name) in ours.names.iter().enumerate() {
+                let mut kernels = [0u8; NAME_MAX];
+                /* SAFETY: the buffer is NAME_MAX bytes, as its length says */
+                let known = unsafe {
+                    ffi::trace::kernel_tp_field_name(id, index, value, kernels.as_mut_ptr(), kernels.len())
+                };
+                if known == 0 || written(&kernels) != name.as_bytes() {
+                    return Err((e.name, Mismatch::Names { index }));
+                }
             }
         }
         let ours = e.fields.iter().filter(|f| !f.name.starts_with('_')).count();

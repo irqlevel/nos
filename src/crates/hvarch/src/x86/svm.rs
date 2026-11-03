@@ -613,6 +613,41 @@ pub struct Profile {
     pub sync_out: u64,
 }
 
+/// The last entry's world switch as the cycle counter saw it -- read just
+/// before `vmrun` (VT-x's `vmlaunch` or `vmresume`) and just after its exit,
+/// with interrupts off -- and the exit of the entry before it: what an
+/// `hv_exit` record's times are made of (`hv::tp`). Taken only while that
+/// event is on, or a [`Profile`] is asked for; all 0 for an entry that was
+/// not timed, and `before` 0 when the one before it was not.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Run {
+    pub entered: u64,
+    pub exited: u64,
+    pub before: u64,
+}
+
+impl Run {
+    /// Make `self` the run after it, entered and exited at those counts
+    /// when timed; and when not, none -- so that the next one timed has no
+    /// `before` from before the gap. Off and already none, a load and a
+    /// branch, as the rest of the trace's sites are.
+    #[inline(always)]
+    pub fn next(&mut self, timed: bool, entered: u64, exited: u64) {
+        if timed {
+            *self = Run { entered, exited, before: self.exited };
+        } else if self.exited != 0 {
+            *self = Run::default();
+        }
+    }
+}
+
+/// Whether an entry is to be timed: a profile asked for, or the trace's
+/// `hv_exit` on -- a load and a branch when it is not.
+#[inline(always)]
+pub fn timed(profile: bool) -> bool {
+    profile || kcore::trace::on::<kcore::trace::HvExit>()
+}
+
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
 /// wait in while the guest runs, the x87, SSE and AVX state and XCR0,
@@ -636,6 +671,8 @@ pub struct Guest {
     /// a benchmark compares against.
     flush_always: bool,
     profile: Option<Profile>,
+    /// Its last entry's world switch, timed ([`Run`]).
+    last_run: Run,
 }
 
 impl Guest {
@@ -650,7 +687,13 @@ impl Guest {
             asid: None,
             flush_always: false,
             profile: None,
+            last_run: Run::default(),
         })
+    }
+
+    /// Its last entry's world switch, where it was timed ([`Run`]).
+    pub fn last_run(&self) -> Run {
+        self.last_run
     }
 
     /// Time each entry from now on ([`Profile`]), or stop.
@@ -817,13 +860,14 @@ impl Guest {
         let tag = &mut self.asid;
         let vmcb = &mut self.vmcb;
         let profile = &mut self.profile;
+        let last_run = &mut self.last_run;
         let stamp = |on: bool| if on { cpu::rdtsc() } else { 0 };
         /* `with` is None only on a CPU past the table, which no CPU the
          * extension is on for is. */
         let off = || NotRun::Off { cpu: kcore::cpu::id() };
         super::ENTRIES.with(|entries, cpu| {
             let cpu = cpu as u32;
-            let timed = profile.is_some();
+            let timed = timed(profile.is_some());
             let t0 = stamp(timed);
             let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(Ordering::Acquire));
             /* SVM on, and the host save area the one this CPU was given --
@@ -907,6 +951,7 @@ impl Guest {
             let t2 = stamp(timed);
             unsafe { vmrun_stub(guest, regs, host, flags) };
             let t3 = stamp(timed);
+            last_run.next(timed, t2, t3);
             if flags & RUN_IBPB != 0 {
                 speculation.count_exit_barrier(cpu);
             }

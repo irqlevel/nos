@@ -4,12 +4,15 @@
 
 use crate::pod::Pod;
 
-/// A payload's field, as the self-test holds it to the kernel's description.
+/// A payload's field, as the self-test holds it to the kernel's description:
+/// and for an enumeration, what its values from 0 up are called.
 #[derive(Debug)]
 pub struct FieldAt {
     pub name: &'static str,
     pub offset: usize,
     pub size: usize,
+    /// An enumeration's names, value by value; none for any other field
+    pub names: &'static [&'static str],
 }
 
 /// An event's payload: plain data of the layout the kernel's description
@@ -35,16 +38,55 @@ const fn described<E: Event>() -> Described {
     Described { id: E::ID, name: E::NAME, size: core::mem::size_of::<E>(), fields: E::FIELDS }
 }
 
+/// What an enumerated field's values are, from one list: the type a site
+/// says a value by -- `#[repr(u8)]`, its variants numbered from 0 in the
+/// list's order -- and `NAMES`, what the kernel's description calls each,
+/// which the boot's self-test holds to the kernel's value by value. A value
+/// is written into its payload's field as `Kind::Variant as u8`.
+macro_rules! names {
+    ($(
+        $(#[$meta:meta])*
+        $name:ident {
+            $($(#[$vmeta:meta])* $variant:ident = $text:literal,)*
+        }
+    )*) => {
+        $(
+            $(#[$meta])*
+            #[repr(u8)]
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            pub enum $name {
+                $($(#[$vmeta])* $variant,)*
+            }
+
+            impl $name {
+                /// What each value is called, from 0 up: the kernel's names
+                pub const NAMES: &'static [&'static str] = &[$($text,)*];
+            }
+        )*
+    };
+}
+
+/// The names a field's `as` gives it, or none.
+macro_rules! field_names {
+    () => {
+        &[]
+    };
+    ($names:ident) => {
+        $names::NAMES
+    };
+}
+
 /// The events, from one list: `Id` and its numbers, each payload's struct --
 /// `#[repr(C)]`, each field an integer or an array of them, and no padding,
 /// which is asserted -- the event it is a record of, and `EVENTS`, which the
 /// boot's self-test (`check`) walks. An event added to the list is in all of
-/// them at once: none can be left out of the check.
+/// them at once: none can be left out of the check. A field `as` a type of
+/// `names!` holds that type's values, by their names.
 macro_rules! events {
     ($(
         $(#[$meta:meta])*
         $name:ident = $num:literal, $text:literal {
-            $($(#[$fmeta:meta])* $field:ident: $ty:ty,)*
+            $($(#[$fmeta:meta])* $field:ident: $ty:ty $(as $names:ident)?,)*
         }
     )*) => {
         /// The kernel's events this side records, by the kernel's numbers
@@ -96,6 +138,7 @@ macro_rules! events {
                         name: stringify!($field),
                         offset: core::mem::offset_of!($name, $field),
                         size: core::mem::size_of::<$ty>(),
+                        names: field_names!($($names)?),
                     },)*
                 ];
             }
@@ -107,11 +150,187 @@ macro_rules! events {
     };
 }
 
+names! {
+    /// Why a guest CPU came out (`hv_exit`'s `reason`): one value a kind of
+    /// hv's `Exit` (src/crates/hv/src/svm.rs)
+    ExitReason {
+        Host = "host",
+        Kicked = "kicked",
+        Io = "io",
+        Hlt = "hlt",
+        Cpuid = "cpuid",
+        Msr = "msr",
+        Hypercall = "hypercall",
+        IrqWindow = "irq_window",
+        NmiWindow = "nmi_window",
+        NestedFault = "npf",
+        Exception = "exception",
+        MachineCheck = "machine_check",
+        Shutdown = "shutdown",
+        Invalid = "invalid",
+        Cr8 = "cr8",
+        Cr0 = "cr0",
+        Cr4 = "cr4",
+        Dr = "dr",
+        Eoi = "eoi",
+        Pause = "pause",
+        Undefined = "undefined",
+        Other = "other",
+    }
+
+    /// What goes in at an entry (`hv_inject`'s `kind`)
+    InjectKind {
+        /// An exception of the guest's own, given back
+        Exception = "exception",
+        Nmi = "nmi",
+        /// The 8259's, through LINT0
+        Pic = "pic",
+        /// Its local APIC's
+        Apic = "apic",
+        /// None it can take yet: the CPU is to exit when it can
+        Window = "window",
+    }
+
+    /// What a halted CPU sleeps until (`hv_halt`'s `until`)
+    HaltUntil {
+        /// Its local APIC timer's edge
+        Timer = "timer",
+        /// The PIT's next edge: the first CPU's
+        Pit = "pit",
+        /// The devices' next round: the first CPU's
+        Device = "device",
+        /// The end of its run
+        Deadline = "deadline",
+        /// Nothing armed: the longest it waits without a look
+        Nothing = "nothing",
+    }
+
+    /// How a halt ended (`hv_wake`'s `how`)
+    WakeHow {
+        /// Rung within the spin, never asleep
+        Polled = "polled",
+        /// Rung while asleep
+        Rung = "rung",
+        /// Its time came
+        Timed = "timed",
+        /// Woke short of its timer's edge, and spun the rest
+        Advanced = "advanced",
+    }
+
+    /// What a CPU's task did before the round that found its timer's edge
+    /// (`hv_timer`'s `how`, the run loop's `Step`): what made the interrupt
+    /// late, when it was
+    TimerHow {
+        /// No step yet: a count's, never a record's
+        Nothing = "nothing",
+        /// Slept to a time with the edge in it, and woke late
+        WokeLate = "woke_late",
+        /// Slept so, and woke on time
+        WokeOnTime = "woke_on_time",
+        /// Slept to a time without that edge: none armed, or another
+        NotSleptFor = "not_slept_for",
+        /// Spun, or slept for good
+        Spun = "spun",
+        /// Ran its guest and came round long after the exit: off its CPU, or
+        /// busy
+        OffCpu = "off_cpu",
+        /// Ran its guest until an interrupt of the host's took it out
+        Host = "host",
+        /// Ran its guest until an exit of its own
+        Exit = "exit",
+        Other = "other",
+    }
+
+    /// How a CPU was rung (`hv_ring`'s `how`)
+    RingHow {
+        /// Its event signalled, and its kick sent
+        Rung = "rung",
+        /// Found spinning for a ring: the word and the kick alone
+        Polling = "polling",
+        /// A posted interrupt: the CPU it runs on notified to take it in the
+        /// guest
+        Notified = "notified",
+        /// Its event alone, for what can wait for its next exit
+        Signalled = "signalled",
+    }
+}
+
 events! {
     /// `test`: what `trace test` and the boot's self-test record -- here,
     /// what the self-test has Rust record, by the path a module's sites take
     Test = 0, "test" {
         seq: u64,
         value: u64,
+    }
+
+    /// `hv_exit`: a guest CPU out of its guest -- or turned back on its way
+    /// in -- recorded for every entry (`hv::vm::Cpu::enter`). Its times are
+    /// the cycle counter's around the world switch (`hvarch`'s `Run`)
+    HvExit = 12, "hv_exit" {
+        /// What it was about, by its reason (`hv::tp::exit_fields`)
+        detail: u64,
+        rip: u64,
+        pid: u32,
+        /// From the entry to the exit
+        guest_ns: u32,
+        /// From the exit before to this entry: 0 when that one was not timed
+        out_ns: u32,
+        /// From the exit to the record
+        since_ns: u32,
+        /// More of it, by its reason
+        info: u32,
+        vcpu: u16,
+        reason: u8 as ExitReason,
+        _pad: u8,
+    }
+
+    /// `hv_inject`: what goes into a guest CPU at its entry
+    HvInject = 13, "hv_inject" {
+        pid: u32,
+        vcpu: u16,
+        vector: u8,
+        kind: u8 as InjectKind,
+    }
+
+    /// `hv_halt`: a halted CPU with nothing to take, about to spin and sleep
+    HvHalt = 14, "hv_halt" {
+        pid: u32,
+        wait_ns: u32,
+        /// The spin first: 0 for none
+        poll_ns: u32,
+        vcpu: u16,
+        until: u8 as HaltUntil,
+        _pad: u8,
+    }
+
+    /// `hv_wake`: that halt over
+    HvWake = 15, "hv_wake" {
+        pid: u32,
+        halted_ns: u32,
+        /// Past the time it slept to
+        late_ns: u32,
+        vcpu: u16,
+        how: u8 as WakeHow,
+        _pad: u8,
+    }
+
+    /// `hv_timer`: a CPU's APIC timer interrupt asked for
+    HvTimer = 16, "hv_timer" {
+        pid: u32,
+        /// Past its edge
+        late_ns: u32,
+        vcpu: u16,
+        how: u8 as TimerHow,
+        _pad: u8,
+    }
+
+    /// `hv_ring`: a guest CPU rung, or notified
+    HvRing = 17, "hv_ring" {
+        /// Whoever rang it
+        pid: u32,
+        /// The CPU rung
+        vcpu: u16,
+        how: u8 as RingHow,
+        _pad: u8,
     }
 }

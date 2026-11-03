@@ -149,7 +149,130 @@ const Field SCHED_SLICE_FIELDS[] = {
     { "runnable", __builtin_offsetof(SchedSlice, runnable), sizeof(u32), Kind::Unsigned, nullptr, 0 },
 };
 
-const Event EVENTS[COUNT] = {
+/* ---- the hypervisor's events ----
+   Their sites are the hv module's Rust, whose payloads (kcore/src/trace/
+   events.rs) every boot holds to these, an enumeration's names included:
+   a name changed here alone, or there alone, is a failed boot. Each field's
+   order here is the order it prints in; its offset is the payload's own. A
+   time of 4.29 s or more is held at that, the most a u32 of ns has. */
+
+static_assert(sizeof(HvExit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(HvInject) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(HvHalt) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(HvWake) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(HvTimer) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(HvRing) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* hv's `Exit`, a value a kind (src/crates/hv/src/svm.rs) */
+const char* const HV_EXIT_REASONS[] = { "host", "kicked", "io", "hlt", "cpuid", "msr", "hypercall", "irq_window",
+    "nmi_window", "npf", "exception", "machine_check", "shutdown", "invalid", "cr8", "cr0", "cr4", "dr", "eoi",
+    "pause", "undefined", "other" };
+const char* const HV_INJECT_KINDS[] = { "exception", "nmi", "pic", "apic", "window" };
+const char* const HV_HALT_UNTIL[] = { "timer", "pit", "device", "deadline", "nothing" };
+const char* const HV_WAKE_HOW[] = { "polled", "rung", "timed", "advanced" };
+/* The run loop's `Step` before the round that found the edge: what made the
+   interrupt late, when it was */
+const char* const HV_TIMER_HOW[] = { "nothing", "woke_late", "woke_on_time", "not_slept_for", "spun", "off_cpu",
+    "host", "exit", "other" };
+const char* const HV_RING_HOW[] = { "rung", "polling", "notified", "signalled" };
+
+const Field HV_EXIT_FIELDS[] = {
+    /* The guest's CPU, by its number in its guest */
+    { "vcpu", __builtin_offsetof(HvExit, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* Its task, which tells one VM's CPU 0 from another's */
+    { "pid", __builtin_offsetof(HvExit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "reason", __builtin_offsetof(HvExit, reason), sizeof(u8), Kind::Enum,
+      HV_EXIT_REASONS, sizeof(HV_EXIT_REASONS) / sizeof(HV_EXIT_REASONS[0]) },
+    /* What it was about, by its reason: io a port, msr an MSR, npf a guest
+       physical address, exception and eoi a vector, cpuid a leaf,
+       hypercall RAX, cr0 the value, cr4 and cr8 the general-purpose
+       register's number (0xFF where the instruction is decoded for it), dr
+       the debug register's; host the host's vector that took it out --
+       VT-x's, 0 under AMD-V, which does not say; other the CPU's own exit
+       code */
+    { "detail", __builtin_offsetof(HvExit, detail), sizeof(u64), Kind::Hex, nullptr, 0 },
+    /* And more, by its reason: io its size, 0x100 an IN, 0x200 a string,
+       0x400 REP; msr, cr0, cr4, cr8 and dr 1 for a write; cpuid the
+       subleaf; npf and exception the error code */
+    { "info", __builtin_offsetof(HvExit, info), sizeof(u32), Kind::Hex, nullptr, 0 },
+    /* In the guest: from its entry -- vmrun, vmlaunch, vmresume -- to its
+       exit, as the cycle counter has them; 0 for one kicked, never entered */
+    { "guest_ns", __builtin_offsetof(HvExit, guest_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* Out of the guest before that entry: from the exit before it -- the
+       host's handling of it, the loop's look, a halt's sleep; 0 when that
+       one was not timed, the event having been off */
+    { "out_ns", __builtin_offsetof(HvExit, out_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* From the exit to this record: the host's interrupt it was for, taken
+       first, and anything that ran in its wake */
+    { "since_ns", __builtin_offsetof(HvExit, since_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "rip", __builtin_offsetof(HvExit, rip), sizeof(u64), Kind::Hex, nullptr, 0 },
+};
+
+const Field HV_INJECT_FIELDS[] = {
+    { "vcpu", __builtin_offsetof(HvInject, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(HvInject, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* exception one of its own given back, nmi, pic the 8259's through
+       LINT0, apic its local APIC's; window none can go in, and the CPU is
+       to exit when one can */
+    { "kind", __builtin_offsetof(HvInject, kind), sizeof(u8), Kind::Enum,
+      HV_INJECT_KINDS, sizeof(HV_INJECT_KINDS) / sizeof(HV_INJECT_KINDS[0]) },
+    { "vector", __builtin_offsetof(HvInject, vector), sizeof(u8), Kind::Hex, nullptr, 0 },
+};
+
+const Field HV_HALT_FIELDS[] = {
+    { "vcpu", __builtin_offsetof(HvHalt, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(HvHalt, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* What its sleep ends at: its APIC timer's edge, the PIT's, the
+       devices' next round, the end of its run, or nothing armed -- the
+       longest it waits without a look */
+    { "until", __builtin_offsetof(HvHalt, until), sizeof(u8), Kind::Enum,
+      HV_HALT_UNTIL, sizeof(HV_HALT_UNTIL) / sizeof(HV_HALT_UNTIL[0]) },
+    { "wait_ns", __builtin_offsetof(HvHalt, wait_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* The spin for a ring it tries first: 0 for none */
+    { "poll_ns", __builtin_offsetof(HvHalt, poll_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field HV_WAKE_FIELDS[] = {
+    { "vcpu", __builtin_offsetof(HvWake, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(HvWake, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* polled: rung within the spin; rung: while asleep; timed: its time
+       came; advanced: woke short of its timer's edge and spun the rest */
+    { "how", __builtin_offsetof(HvWake, how), sizeof(u8), Kind::Enum,
+      HV_WAKE_HOW, sizeof(HV_WAKE_HOW) / sizeof(HV_WAKE_HOW[0]) },
+    /* The halt, from its look to now: the spin, the sleep and the wake */
+    { "halted_ns", __builtin_offsetof(HvWake, halted_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* How long past the time it slept to it woke: the host's wake of it */
+    { "late_ns", __builtin_offsetof(HvWake, late_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field HV_TIMER_FIELDS[] = {
+    { "vcpu", __builtin_offsetof(HvTimer, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "pid", __builtin_offsetof(HvTimer, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* What its task did before the round that found the edge */
+    { "how", __builtin_offsetof(HvTimer, how), sizeof(u8), Kind::Enum,
+      HV_TIMER_HOW, sizeof(HV_TIMER_HOW) / sizeof(HV_TIMER_HOW[0]) },
+    /* How long past its edge its interrupt was asked for */
+    { "late_ns", __builtin_offsetof(HvTimer, late_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field HV_RING_FIELDS[] = {
+    /* The guest CPU rung */
+    { "vcpu", __builtin_offsetof(HvRing, vcpu), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* The task that rang it: another of its guest's CPUs', a device's, or
+       the one an interrupt landed on */
+    { "pid", __builtin_offsetof(HvRing, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* rung: its event signalled and its kick sent; polling: found spinning
+       for one, the word and the kick alone; notified: a posted interrupt,
+       the CPU notified to take it in the guest; signalled: its event alone,
+       for what waits for its next exit */
+    { "how", __builtin_offsetof(HvRing, how), sizeof(u8), Kind::Enum,
+      HV_RING_HOW, sizeof(HV_RING_HOW) / sizeof(HV_RING_HOW[0]) },
+};
+
+/* Sized by its lines, not by COUNT: an event added to tp::Id without its line
+   here would be a description of zeroes -- a null name printed -- where now it
+   is a build that fails. */
+const Event EVENTS[] = {
     { "test", "test", "what `trace test` records: a sequence number and a value",
       sizeof(Test), sizeof(TEST_FIELDS) / sizeof(TEST_FIELDS[0]), TEST_FIELDS },
     { "sched_switch", "sched", "a CPU's next task, and the one it left behind: the decision's outcome, its reason and "
@@ -183,7 +306,24 @@ const Event EVENTS[COUNT] = {
     { "sched_slice", "debug", "the slice the current task was given, from the decision that armed this CPU's timer "
       "for its deadline",
       sizeof(SchedSlice), sizeof(SCHED_SLICE_FIELDS) / sizeof(SCHED_SLICE_FIELDS[0]), SCHED_SLICE_FIELDS },
+    { "hv_exit", "hv", "a guest CPU out of its guest, or turned back on its way in: why, what about, how long it ran "
+      "in the guest and was out before",
+      sizeof(HvExit), sizeof(HV_EXIT_FIELDS) / sizeof(HV_EXIT_FIELDS[0]), HV_EXIT_FIELDS },
+    { "hv_inject", "hv", "what goes into a guest CPU at its entry: an exception given back, an NMI, an interrupt "
+      "-- or none it can take yet",
+      sizeof(HvInject), sizeof(HV_INJECT_FIELDS) / sizeof(HV_INJECT_FIELDS[0]), HV_INJECT_FIELDS },
+    { "hv_halt", "hv", "a guest CPU halted with nothing to take, its task about to spin and sleep until what it "
+      "waits for",
+      sizeof(HvHalt), sizeof(HV_HALT_FIELDS) / sizeof(HV_HALT_FIELDS[0]), HV_HALT_FIELDS },
+    { "hv_wake", "hv", "that halt over: rung, or its time come, and how late past it",
+      sizeof(HvWake), sizeof(HV_WAKE_FIELDS) / sizeof(HV_WAKE_FIELDS[0]), HV_WAKE_FIELDS },
+    { "hv_timer", "hv", "a guest CPU's APIC timer interrupt asked for, and how late past its edge",
+      sizeof(HvTimer), sizeof(HV_TIMER_FIELDS) / sizeof(HV_TIMER_FIELDS[0]), HV_TIMER_FIELDS },
+    { "hv_ring", "hv", "a guest CPU rung, or notified, by whoever has something for it: another CPU's IPI, a "
+      "device, a stop",
+      sizeof(HvRing), sizeof(HV_RING_FIELDS) / sizeof(HV_RING_FIELDS[0]), HV_RING_FIELDS },
 };
+static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
 
 /* ---- the rings ---- */
