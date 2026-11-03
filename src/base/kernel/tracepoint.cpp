@@ -5,6 +5,7 @@
 #include "klog.h"
 #include "mutex.h"
 #include "panic.h"
+#include "task.h"
 #include "time.h"
 #include <hal/barrier.h>
 #include <hal/cpu.h>
@@ -33,10 +34,144 @@ const Field TEST_FIELDS[] = {
     { "value", __builtin_offsetof(Test, value), sizeof(u64), Kind::Hex, nullptr, 0 },
 };
 
+/* ---- the scheduler's events ----
+   A payload is 40 bytes: a task said by its pid and up to 12 bytes of its
+   name is 16, so a switch -- two of them, a CPU's id and two flags -- is
+   38, padded to the slot's 40; a CPU or a slice is one word of 4. A name is
+   written once, when the task is made, and never moved: what a record holds
+   of one is what it was called. */
+
+static_assert(sizeof(SchedSwitch) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedWakeup) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedBlock) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedMigrate) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedNew) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedExit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedIpi) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedPreemptDeferred) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(Idle) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SchedSlice) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+const char* const SCHED_REASONS[] = { "voluntary", "yield", "preempt" };
+const char* const SWITCH_STATES[] = { "runnable", "blocked", "sleeping", "exited" };
+
+const Field SCHED_SWITCH_FIELDS[] = {
+    { "prev_pid", __builtin_offsetof(SchedSwitch, prev_pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "prev_comm", __builtin_offsetof(SchedSwitch, prev_comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "next_pid", __builtin_offsetof(SchedSwitch, next_pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "next_comm", __builtin_offsetof(SchedSwitch, next_comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "next_cpu", __builtin_offsetof(SchedSwitch, next_cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    { "prev_state", __builtin_offsetof(SchedSwitch, prev_state), sizeof(u8), Kind::Enum,
+      SWITCH_STATES, sizeof(SWITCH_STATES) / sizeof(SWITCH_STATES[0]) },
+    { "reason", __builtin_offsetof(SchedSwitch, reason), sizeof(u8), Kind::Enum,
+      SCHED_REASONS, sizeof(SCHED_REASONS) / sizeof(SCHED_REASONS[0]) },
+};
+
+const Field SCHED_WAKEUP_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedWakeup, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedWakeup, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "cpu", __builtin_offsetof(SchedWakeup, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    /* 1: its deadline came; 0: someone's unblock() */
+    { "deadline", __builtin_offsetof(SchedWakeup, deadline), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* Who woke it: the task the waker ran on -- the one an interrupt landed
+       on, for a wakeup from an interrupt's context */
+    { "waker_pid", __builtin_offsetof(SchedWakeup, waker_pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field SCHED_BLOCK_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedBlock, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedBlock, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "cpu", __builtin_offsetof(SchedBlock, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    /* 1: asleep until a deadline (sleep, Event::wait_for); 0: waiting on
+       someone else's wakeup */
+    { "deadline", __builtin_offsetof(SchedBlock, deadline), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* How long it was on a CPU this time */
+    { "ran_ns", __builtin_offsetof(SchedBlock, ran_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field SCHED_MIGRATE_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedMigrate, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedMigrate, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "from", __builtin_offsetof(SchedMigrate, from), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    { "to", __builtin_offsetof(SchedMigrate, to), sizeof(u32), Kind::Cpu, nullptr, 0 },
+};
+
+const Field SCHED_NEW_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedNew, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedNew, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "cpu", __builtin_offsetof(SchedNew, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+};
+
+const Field SCHED_EXIT_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedExit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedExit, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "cpu", __builtin_offsetof(SchedExit, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+};
+
+const Field SCHED_IPI_FIELDS[] = {
+    { "cpu", __builtin_offsetof(SchedIpi, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    /* What queued work the interrupt found to run (process_ipi_tasks) */
+    { "tasks", __builtin_offsetof(SchedIpi, tasks), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field SCHED_PREEMPT_DEFERRED_FIELDS[] = {
+    { "pid", __builtin_offsetof(SchedPreemptDeferred, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    { "comm", __builtin_offsetof(SchedPreemptDeferred, comm), COMM_BYTES, Kind::Comm, nullptr, 0 },
+    { "cpu", __builtin_offsetof(SchedPreemptDeferred, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    /* Its preempt_disable_counter_ as the reschedule found it: a lock, most
+       likely, whose holder was still in it */
+    { "count", __builtin_offsetof(SchedPreemptDeferred, count), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "idle", __builtin_offsetof(SchedPreemptDeferred, idle), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field IDLE_FIELDS[] = {
+    { "cpu", __builtin_offsetof(Idle, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    { "pid", __builtin_offsetof(Idle, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field SCHED_SLICE_FIELDS[] = {
+    { "cpu", __builtin_offsetof(SchedSlice, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    { "pid", __builtin_offsetof(SchedSlice, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* How long from now the current one's slice ends */
+    { "slice_ns", __builtin_offsetof(SchedSlice, slice_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* The tasks the queue had that could run */
+    { "runnable", __builtin_offsetof(SchedSlice, runnable), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+};
+
 const Event EVENTS[COUNT] = {
     { "test", "test", "what `trace test` records: a sequence number and a value",
       sizeof(Test), sizeof(TEST_FIELDS) / sizeof(TEST_FIELDS[0]), TEST_FIELDS },
+    { "sched_switch", "sched", "a CPU's next task, and the one it left behind: the decision's outcome, its reason and "
+      "the state the one before went with",
+      sizeof(SchedSwitch), sizeof(SCHED_SWITCH_FIELDS) / sizeof(SCHED_SWITCH_FIELDS[0]), SCHED_SWITCH_FIELDS },
+    { "sched_wakeup", "sched", "a task asleep handed back to its queue by an unblock() or by its deadline",
+      sizeof(SchedWakeup), sizeof(SCHED_WAKEUP_FIELDS) / sizeof(SCHED_WAKEUP_FIELDS[0]), SCHED_WAKEUP_FIELDS },
+    { "sched_block", "sched", "a task that left its CPU because it cannot run: asleep until a deadline, or waiting "
+      "on someone else's wakeup",
+      sizeof(SchedBlock), sizeof(SCHED_BLOCK_FIELDS) / sizeof(SCHED_BLOCK_FIELDS[0]), SCHED_BLOCK_FIELDS },
+    { "sched_migrate", "sched", "a task that could still run, moved by the load balancer from one CPU's queue to "
+      "another's",
+      sizeof(SchedMigrate), sizeof(SCHED_MIGRATE_FIELDS) / sizeof(SCHED_MIGRATE_FIELDS[0]), SCHED_MIGRATE_FIELDS },
+    { "sched_new", "sched", "a task put on a CPU's queue for the first time it runs",
+      sizeof(SchedNew), sizeof(SCHED_NEW_FIELDS) / sizeof(SCHED_NEW_FIELDS[0]), SCHED_NEW_FIELDS },
+    { "sched_exit", "sched", "a task that has exited, and whose CPU takes its last reference and its stack",
+      sizeof(SchedExit), sizeof(SCHED_EXIT_FIELDS) / sizeof(SCHED_EXIT_FIELDS[0]), SCHED_EXIT_FIELDS },
+    { "sched_ipi", "sched", "an interrupt another CPU sent, and the queued work it found: a wakeup's reschedule, a "
+      "TLB shootdown",
+      sizeof(SchedIpi), sizeof(SCHED_IPI_FIELDS) / sizeof(SCHED_IPI_FIELDS[0]), SCHED_IPI_FIELDS },
+    { "sched_preempt_deferred", "sched", "a reschedule that found the task it landed on with preemption disabled, "
+      "and put it off until the count was back to zero",
+      sizeof(SchedPreemptDeferred), sizeof(SCHED_PREEMPT_DEFERRED_FIELDS) / sizeof(SCHED_PREEMPT_DEFERRED_FIELDS[0]),
+      SCHED_PREEMPT_DEFERRED_FIELDS },
+    { "idle_enter", "idle", "a CPU with nothing to run, about to halt",
+      sizeof(Idle), sizeof(IDLE_FIELDS) / sizeof(IDLE_FIELDS[0]), IDLE_FIELDS },
+    { "idle_exit", "idle", "that CPU back from the halt",
+      sizeof(Idle), sizeof(IDLE_FIELDS) / sizeof(IDLE_FIELDS[0]), IDLE_FIELDS },
+    { "sched_slice", "debug", "the slice the current task was given, from the decision that armed this CPU's timer "
+      "for its deadline",
+      sizeof(SchedSlice), sizeof(SCHED_SLICE_FIELDS) / sizeof(SCHED_SLICE_FIELDS[0]), SCHED_SLICE_FIELDS },
 };
+
 
 /* ---- the rings ---- */
 
@@ -220,6 +355,21 @@ void print_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
             else
                 con.printf(" %s=%lu", f.name, (ulong)v);
             break;
+        case Kind::Comm:
+        {
+            /* The name's bytes up to its first zero, as far as the field
+               holds: a record is copied out of the ring whole, so whatever
+               follows the zero in the payload is never printed. */
+            char name[COMM_BYTES + 1] = {};
+            ulong room = (f.size < COMM_BYTES) ? f.size : COMM_BYTES;
+            if (f.offset + room > sizeof(r.payload))
+                room = 0;
+            if (room != 0)
+                stdlib::mem_cpy(name, reinterpret_cast<const u8*>(r.payload) + f.offset, room);
+            name[room] = '\0';
+            con.printf(" %s=%s", f.name, name);
+            break;
+        }
         case Kind::Unsigned:
         case Kind::Cpu:
         case Kind::Pid:
@@ -741,6 +891,139 @@ void command(const char* args, stdlib::Printer& con)
         con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event...] | stat | "
             "clear | size <KiB> | free | freeze | thaw | test [n] | bench\n");
     }
+}
+
+/* ---- the scheduler's sites ---- */
+
+namespace
+{
+
+/* A task's name into a payload's field: what fits, zeroed past the name's
+   end, so that no byte of a record is whatever the stack held. Its name is
+   written once, when the task is made, and never changed after. */
+void put_comm(char* to, const char* name)
+{
+    stdlib::mem_set(to, 0, COMM_BYTES);
+    if (name == nullptr)
+        return;
+    ulong len = stdlib::str_len(name);
+    if (len > COMM_BYTES)
+        len = COMM_BYTES;
+    stdlib::mem_cpy(to, name, len);
+}
+
+u32 task_pid(Task* task)
+{
+    return (task != nullptr) ? (u32)task->pid_ : NO_TASK_PID;
+}
+
+/* A task's name as a task says it, or none. Reading it takes no lock: it is
+   written when the task is made, before anything can find it. */
+const char* task_name(Task* task)
+{
+    return (task != nullptr) ? task->get_name() : nullptr;
+}
+
+}
+
+void emit_sched_switch(Task* prev, Task* next, ulong cpu, u8 state, u8 reason)
+{
+    SchedSwitch s = {};
+    s.prev_pid = task_pid(prev);
+    put_comm(s.prev_comm, task_name(prev));
+    s.next_pid = task_pid(next);
+    put_comm(s.next_comm, task_name(next));
+    s.next_cpu = (u32)cpu;
+    s.prev_state = state;
+    s.reason = reason;
+    emit(Id::SchedSwitch, &s, sizeof(s));
+}
+
+void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker)
+{
+    SchedWakeup w = {};
+    w.pid = task_pid(task);
+    put_comm(w.comm, task_name(task));
+    w.cpu = (u32)cpu;
+    w.deadline = deadline ? 1 : 0;
+    w.waker_pid = task_pid(waker);
+    emit(Id::SchedWakeup, &w, sizeof(w));
+}
+
+void emit_sched_block(Task* task, ulong cpu, ulong ran_ns)
+{
+    SchedBlock b = {};
+    b.pid = task_pid(task);
+    put_comm(b.comm, task_name(task));
+    b.cpu = (u32)cpu;
+    b.deadline = ((ulong)task->sleep_until_.get() != 0) ? 1 : 0;
+    b.ran_ns = (u32)stdlib::min(ran_ns, (ulong)~0U);
+    emit(Id::SchedBlock, &b, sizeof(b));
+}
+
+void emit_sched_migrate(Task* task, ulong from, ulong to)
+{
+    SchedMigrate m = {};
+    m.pid = task_pid(task);
+    put_comm(m.comm, task_name(task));
+    m.from = (u32)from;
+    m.to = (u32)to;
+    emit(Id::SchedMigrate, &m, sizeof(m));
+}
+
+void emit_sched_new(Task* task, ulong cpu)
+{
+    SchedNew n = {};
+    n.pid = task_pid(task);
+    put_comm(n.comm, task_name(task));
+    n.cpu = (u32)cpu;
+    emit(Id::SchedNew, &n, sizeof(n));
+}
+
+void emit_sched_exit(Task* task, ulong cpu)
+{
+    SchedExit e = {};
+    e.pid = task_pid(task);
+    put_comm(e.comm, task_name(task));
+    e.cpu = (u32)cpu;
+    emit(Id::SchedExit, &e, sizeof(e));
+}
+
+void emit_sched_ipi(ulong cpu, ulong tasks)
+{
+    SchedIpi i = {};
+    i.cpu = (u32)cpu;
+    i.tasks = (u32)tasks;
+    emit(Id::SchedIpi, &i, sizeof(i));
+}
+
+void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle)
+{
+    SchedPreemptDeferred d = {};
+    d.pid = task_pid(task);
+    put_comm(d.comm, task_name(task));
+    d.cpu = (u32)cpu;
+    d.count = (u32)count;
+    d.idle = idle ? 1 : 0;
+    emit(Id::SchedPreemptDeferred, &d, sizeof(d));
+}
+
+void emit_idle(Id id, ulong cpu, Task* idle_task)
+{
+    Idle i = {};
+    i.cpu = (u32)cpu;
+    i.pid = task_pid(idle_task);
+    emit(id, &i, sizeof(i));
+}
+
+void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable)
+{
+    SchedSlice s = {};
+    s.cpu = (u32)cpu;
+    s.pid = task_pid(task);
+    s.slice_ns = (u32)stdlib::min(slice_ns, (ulong)~0U);
+    s.runnable = (u32)runnable;
+    emit(Id::SchedSlice, &s, sizeof(s));
 }
 
 }

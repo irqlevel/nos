@@ -11,6 +11,7 @@
 #include "mutex.h"
 #include "stack_trace.h"
 #include "symtab.h"
+#include "tracepoint.h"
 #include <mm/new.h>
 
 namespace kernel
@@ -161,6 +162,18 @@ void Task::unblock()
     woke_at_deadline_.set(0);
     wake_time_.set((long)get_boot_time().get_value());
     task_queue_->push_wake(this);
+
+    /* Woken by someone: the deadline flag is 0 here, and a deadline's own
+       wakeup is recorded where the sleep list is walked (TaskQueue::wake_due),
+       which knows what the queue's lock says. Who woke it is the task this
+       runs on, if any -- an interrupt's context has the task it landed on,
+       and before the scheduler is up, none -- looked up only once the event
+       is on. */
+    if (unlikely(tp::on(tp::Id::SchedWakeup)))
+    {
+        Task* waker = preempt_is_on() ? Task::try_get_current_task() : nullptr;
+        tp::emit_sched_wakeup(this, task_queue_->index(), false, waker);
+    }
 }
 
 bool Task::is_blocked()
@@ -575,6 +588,11 @@ bool Task::start(Func func, void* ctx)
     if (task_queue == nullptr)
         return false;
     task_queue->insert(this);
+
+    /* The first queue it lives on: before it can run anywhere, so that a
+       reader of the record has the task before any switch of it. */
+    if (unlikely(tp::on(tp::Id::SchedNew)))
+        tp::emit_sched_new(this, task_queue->index());
     return true;
 }
 
@@ -588,6 +606,10 @@ bool Task::run(class TaskQueue& task_queue, Func func, void* ctx)
     state_.set(STATE_RUNNING);
 
     task_queue.insert(this);
+
+    /* The first queue it lives on (Task::start) */
+    if (unlikely(tp::on(tp::Id::SchedNew)))
+        tp::emit_sched_new(this, task_queue.index());
 
     /* Never returns: Run is only used for the idle/boot task bodies */
     hal::run_on_stack((ulong)&stack_ptr_->stack_top[0], function_, ctx_);

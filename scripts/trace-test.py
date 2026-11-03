@@ -38,6 +38,79 @@ SMALL_RECORDS = SMALL_KIB * 1024 // 64
 
 RECORD = re.compile(r"^\s*\d+\.\d{6}\s+(\d+)\s+test: seq=(\d+) value=0x([0-9A-F]+)$")
 
+# A scheduler record: the event's name, then its fields as name=value.
+SCHED_RECORD = re.compile(r"^\s*\d+\.\d{6}\s+(\d+)\s+([a-z_]+): (.*)$")
+SWITCH = re.compile(
+    r"prev_pid=(\d+) prev_comm=(\S+) next_pid=(\d+) next_comm=(\S+) next_cpu=(\d+) "
+    r"prev_state=(\w+) reason=(\w+)$")
+WAKEUP = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) deadline=([01]) waker_pid=(\d+)$")
+BLOCK = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) deadline=([01]) ran_ns=([0-9.]+)us$")
+MIGRATE = re.compile(r"pid=(\d+) comm=(\S+) from=(\d+) to=(\d+)$")
+IPI = re.compile(r"cpu=(\d+) tasks=(\d+)$")
+PREEMPT_DEFERRED = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) count=(\d+) idle=([01])$")
+IDLE = re.compile(r"cpu=(\d+) pid=(\d+)$")
+SLICE = re.compile(r"cpu=(\d+) pid=(\d+) slice_ns=([0-9.]+)us runnable=(\d+)$")
+
+
+def sched_records(reply):
+    """Every scheduler record `trace show` printed: (cpu, event, fields text)."""
+    out = []
+    for line in reply.splitlines():
+        m = SCHED_RECORD.match(line)
+        if m and m.group(2) != "test":
+            out.append((int(m.group(1)), m.group(2), m.group(3)))
+    return out
+
+
+def held_sched(records):
+    """What each scheduler record must be, by its event: its fields parse,
+    its pids are tasks, its reason and state are the ones the kernel has, and
+    the CPU it names is the one it was recorded on -- where the event's CPU is
+    the recording CPU's (a switch's next, an IPI's, a slice's, the CPU whose
+    switch moved a task, an idle's)."""
+    states = {"runnable", "blocked", "sleeping", "exited"}
+    reasons = {"voluntary", "yield", "preempt"}
+    for cpu, name, fields in records:
+        if name == "sched_switch":
+            m = SWITCH.match(fields)
+            if not m or m.group(6) not in states or m.group(7) not in reasons:
+                return f"a sched_switch not as its description says: {fields}"
+            if int(m.group(5)) != cpu:
+                return f"a sched_switch on cpu {cpu} saying next_cpu {m.group(5)}"
+            if m.group(2) == "idle0" and m.group(4) == "idle0":
+                return f"a switch from a task to itself: {fields}"
+        elif name == "sched_wakeup":
+            if not WAKEUP.match(fields):
+                return f"a sched_wakeup not as its description says: {fields}"
+        elif name == "sched_block":
+            m = BLOCK.match(fields)
+            if not m or float(m.group(5)) < 0:
+                return f"a sched_block not as its description says: {fields}"
+        elif name == "sched_migrate":
+            m = MIGRATE.match(fields)
+            if not m or m.group(3) == m.group(4):
+                return f"a sched_migrate not as its description says: {fields}"
+            # Moved by the switch on the queue it was displaced on
+            if int(m.group(3)) != cpu:
+                return f"a sched_migrate on cpu {cpu} saying from {m.group(3)}"
+        elif name == "sched_ipi":
+            m = IPI.match(fields)
+            if not m or int(m.group(1)) != cpu:
+                return f"a sched_ipi not as its description says: {fields}"
+        elif name == "sched_preempt_deferred":
+            m = PREEMPT_DEFERRED.match(fields)
+            if not m or int(m.group(3)) != cpu:
+                return f"a sched_preempt_deferred not as its description says: {fields}"
+        elif name in ("idle_enter", "idle_exit"):
+            m = IDLE.match(fields)
+            if not m or int(m.group(1)) != cpu:
+                return f"an {name} not as its description says: {fields}"
+        elif name == "sched_slice":
+            m = SLICE.match(fields)
+            if not m or int(m.group(1)) != cpu:
+                return f"a sched_slice not as its description says: {fields}"
+    return None
+
 
 def test_records(reply):
     """The test records `trace show` printed: (cpu, seq, value) each."""
@@ -123,6 +196,80 @@ def exercise(shell):
     nb.check("1 events on" in reply and "rings of 64 KiB" in shell.run("trace stat"),
              "and the next trace on makes them again, at the size last set")
     shell.run("trace free")
+
+    # The scheduler's own events: a boot with a shell, a probe and an idle
+    # CPU makes them, each record as its description says. sched_migrate is
+    # the exception -- the balancer moves a displaced task, and a probe's are
+    # pinned -- so it is listed, and held to its description should it appear.
+    reply = shell.run("trace list")
+    for name in ("sched_switch", "sched_wakeup", "sched_block", "sched_migrate", "sched_new",
+                 "sched_exit", "sched_ipi", "sched_preempt_deferred", "idle_enter", "idle_exit",
+                 "sched_slice"):
+        nb.check(re.search(rf"^\s*off\s+{name}\s", reply, re.M) is not None, f"the {name} event listed")
+
+    # Rings of 1 MiB again: a CPU with nothing to run writes its two idle
+    # events every few microseconds, so the smallest ring is a few
+    # milliseconds of the machine, and what a probe left would be gone
+    # before it could be read.
+    nb.check("rings of 1024 KiB a cpu" in shell.run("trace size 1024"), "rings of 1 MiB again")
+
+    # A task's own records, alone: with the rest on, a ring holds a
+    # millisecond of a busy CPU and these are the first of a probe's.
+    nb.check("2 events on" in shell.run("trace on sched_new,sched_exit"),
+             "trace on names two events, comma-separated")
+    shell.run("sched probe spinners=2 ms=300")
+    for name in ("sched_new", "sched_exit"):
+        reply = shell.run(f"trace show 3 {name}", timeout=60)
+        got = [1 for _, n, _ in sched_records(reply) if n == name]
+        nb.check(len(got) == 3, f"the probe left records of {name}")
+        problem = held_sched(sched_records(reply))
+        nb.check(problem is None, f"every {name} record as its description says"
+                 + (f" ({problem})" if problem else ""))
+    shell.run("trace off all")
+
+    # The decision events and the two the idle loop makes.
+    nb.check("8 events on" in shell.run("trace on sched"), "trace on sched turns the decision events on")
+    nb.check("2 events on" in shell.run("trace on idle"), "trace on idle the two the idle loop makes")
+
+    shell.run("sched probe spinners=2 ms=400")
+
+    records = sched_records(shell.run("trace show 200", timeout=60))
+    names = {name for _, name, _ in records}
+    for name in ("sched_switch", "sched_wakeup", "sched_block", "idle_enter", "idle_exit"):
+        nb.check(name in names, f"the probe left {name} records")
+    problem = held_sched(records)
+    nb.check(problem is None, "every scheduler record as its description says" + (f" ({problem})" if problem else ""))
+
+    # A switch's two names are names a task has: not empty, at most the
+    # field's 12 bytes, and the idle ones are the CPUs' own -- `ps` has them.
+    switches = [(cpu, fields) for cpu, name, fields in records if name == "sched_switch"]
+    nb.check(len(switches) > 0, "sched_switch records read back")
+    names_seen = set()
+    for _, fields in switches:
+        m = SWITCH.match(fields)
+        names_seen.add(m.group(2))
+        names_seen.add(m.group(4))
+    nb.check(all(0 < len(n) <= 12 for n in names_seen),
+             "every name a switch records is one of at most the field's 12 bytes")
+    reply = shell.run("ps")
+    idles = set(re.findall(r"^\d+ \d+ 0x[0-9A-F]+ [\d.]+ \d+ (idle\d+)$", reply, re.M))
+    nb.check(bool(idles) and bool(idles & names_seen),
+             "the idle tasks `ps` has are among the names the switches recorded")
+    nb.check(any(n.startswith("probe/") for n in names_seen),
+             "and the probe's own tasks are among them")
+
+    # The debug group's, on its own: a record a decision each, so it would
+    # fill a ring while the others' were being read.
+    shell.run("trace off all")
+    nb.check("1 events on" in shell.run("trace on debug"), "trace on debug the slice event")
+    shell.run("sched probe spinners=2 ms=300")
+    reply = shell.run("trace show 4 sched_slice", timeout=60)
+    nb.check(len([1 for _, n, _ in sched_records(reply) if n == "sched_slice"]) == 4,
+             "the probe left the debug group's sched_slice records")
+    nb.check("1 events off" in shell.run("trace off debug"), "trace off debug")
+
+    shell.run("trace off all")
+    nb.check("no rings" not in shell.run("trace stat"), "trace off all keeps the rings")
 
 
 def main():
