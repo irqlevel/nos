@@ -15,6 +15,7 @@ runs anywhere QEMU does. Exit code 0 when every check held.
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -50,6 +51,12 @@ IPI = re.compile(r"cpu=(\d+) tasks=(\d+)$")
 PREEMPT_DEFERRED = re.compile(r"pid=(\d+) comm=(\S+) cpu=(\d+) count=(\d+) idle=([01])$")
 IDLE = re.compile(r"cpu=(\d+) pid=(\d+)$")
 SLICE = re.compile(r"cpu=(\d+) pid=(\d+) slice_ns=([0-9.]+)us runnable=(\d+)$")
+LATENCY = re.compile(
+    r"trace latency: (\d+) records on (\d+) cpus -- (\d+) wakeups, (\d+) ran in the window, (\d+) not run in it")
+PERCENTILES = re.compile(r"wait p50 (\S+) p90 (\S+) p99 (\S+) max (\S+)")
+LONGEST = re.compile(r"^\s+(\S+) pid (\d+) (\S+)\s+cpu (\d+) -> (\d+)$")
+WAIT_TIME = re.compile(r"^\d+(\.\d+)?(ns|us|ms)$")
+DUMPED = re.compile(r'^\s*\{"t":(\d+),"cpu":(\d+),"ev":(null|"[a-z_]+")')
 
 
 def sched_records(reply):
@@ -270,6 +277,98 @@ def exercise(shell):
 
     shell.run("trace off all")
     nb.check("no rings" not in shell.run("trace stat"), "trace off all keeps the rings")
+
+    # `trace latency`: the window's wakeups, each paired with the switch
+    # that answered it. Sched alone -- the idle events of a few CPUs fill a
+    # ring in milliseconds, and the probe's wakeups would be gone with them.
+    nb.check("2 events on" in shell.run("trace on sched_switch,sched_wakeup"),
+             "the two events a wait is read from, on")
+    shell.run("trace clear")
+    shell.run("sched probe spinners=2 ms=300")
+    reply = shell.run("trace latency 4000", timeout=60)
+    m = LATENCY.search(reply)
+    nb.check(m is not None, "trace latency says how many wakeups the window answered")
+    if m:
+        records, cpus, wakeups, ran, pending = (int(g) for g in m.groups())
+        nb.check(records > 0 and wakeups > 0, f"the probe left {wakeups} wakeups in {records} records")
+        nb.check(ran > 0, f"and {ran} of them a switch answered")
+        nb.check(ran + pending <= wakeups, "no more answered and waiting than there were wakeups")
+        nb.check(cpus >= 2, f"records from {cpus} cpus")
+    p = PERCENTILES.search(reply)
+    nb.check(p is not None, "the waits' percentiles are printed")
+    if p:
+        nb.check(all(WAIT_TIME.match(v) for v in p.groups()),
+                 "each a time in ns, us or ms: " + " ".join(p.groups()))
+    longest = [LONGEST.match(line) for line in reply.splitlines() if LONGEST.match(line)]
+    nb.check(0 < len(longest) <= 5, f"{len(longest)} of the longest waits, five at most")
+    nb.check(all(int(m.group(4)) < 64 and int(m.group(5)) < 64 for m in longest),
+             "each with the cpus it was woken on and ran on")
+
+    # `trace freeze wakeup>N`: armed, the rings freeze on the first wait
+    # over N, and what froze them is there to read. Armed first at a second
+    # -- no wakeup of this machine waits that long -- then re-armed at a
+    # microsecond, which the probe's spinners make every wait clear.
+    reply = shell.run("trace freeze wakeup>1s")
+    nb.check("armed -- the rings freeze when a wakeup waits over 1.000s" in reply,
+             "the wakeup trigger armed at a second")
+    nb.check("a wakeup trigger is armed" in shell.run("trace stat"),
+             "trace stat says a trigger is armed")
+    shell.run("sched probe spinners=1 ms=100")
+    reply = shell.run("trace stat")
+    nb.check("frozen" not in reply and "a wakeup trigger is armed" in reply,
+             "a second is past every wait of the machine's, and it is still armed")
+
+    nb.check("the rings freeze when a wakeup waits over 1.000us" in shell.run("trace freeze wakeup>1us"),
+             "re-armed at a microsecond")
+    shell.run("sched probe spinners=2 ms=200")
+    reply = shell.run("trace stat")
+    nb.check("frozen" in reply and "frozen by the wakeup trigger" in reply,
+             "the probe's wait froze the rings, and trace stat says what did")
+    nb.check("is armed" not in reply, "and the trigger is spent")
+    written = lambda text: [int(m.group(1)) for m in re.finditer(r"^\s*\d+\s+(\d+)\s+\d+\s+\d+\s*$", text, re.M)]
+    before = written(reply)
+    shell.run("sched probe spinners=1 ms=100")
+    nb.check(written(shell.run("trace stat")) == before, "frozen, nothing more is recorded")
+    nb.check("recording" in shell.run("trace thaw"), "trace thaw records again")
+    nb.check("is armed" not in shell.run("trace stat"), "and the trigger is off")
+
+    # `trace dump`: the same window as JSON, and the host decoder reading it.
+    shell.run("trace clear")
+    shell.run("sched probe spinners=1 ms=200")
+    reply = shell.run("trace dump 20", timeout=60)
+    lines = [line.strip() for line in reply.splitlines() if DUMPED.match(line.strip())]
+    nb.check(len(lines) == 20, f"trace dump printed 20 records ({len(lines)})")
+    parsed = []
+    for line in lines:
+        parsed.append(json.loads(line[line.find("{"):]))
+    nb.check(all({"t", "cpu", "ev", "f"} <= set(r) for r in parsed),
+             "each a JSON object of t, cpu, ev and its fields")
+    nb.check(all(b["t"] >= a["t"] for a, b in zip(parsed, parsed[1:])), "oldest first, merged by time")
+    nb.check(any(r["ev"] == "sched_switch" and "prev_comm" in r["f"] for r in parsed),
+             "a switch among them, its two names and its reason there")
+
+    dump_dir = tempfile.mkdtemp(prefix="trace-dump-")
+    dump = os.path.join(dump_dir, "dump.txt")
+    chrome = os.path.join(dump_dir, "chrome.json")
+    try:
+        with open(dump, "w") as f:
+            f.write(reply)
+        out = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--chrome", chrome, dump],
+                             capture_output=True, text=True)
+        nb.check(out.returncode == 0,
+                 "trace-decode.py read the dump" + (f": {out.stderr.strip()}" if out.returncode else ""))
+        with open(chrome) as f:
+            trace = json.load(f)
+        slices = [e for e in trace if e.get("ph") == "X"]
+        nb.check(len(slices) > 0 and all(e["dur"] >= 0 for e in slices),
+                 f"Chrome trace written: {len(slices)} run slices on the cpus' tracks")
+        nb.check(any(e.get("name") == "wakeup" and e.get("ph") == "i" for e in trace),
+                 "and a wakeup as an instant event")
+    finally:
+        shutil.rmtree(dump_dir, ignore_errors=True)
+
+    shell.run("trace off all")
+    shell.run("trace free")
 
 
 def main():

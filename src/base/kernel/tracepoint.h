@@ -281,5 +281,20 @@ void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle);
 void emit_idle(Id id, ulong cpu, Task* idle_task);
 void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable);
 
+/* The wakeup trigger: `trace freeze wakeup>N` arms it, and a task that gets
+   its CPU later than that after a wakeup freezes the rings where they are,
+   so that what led to the wait stays. The threshold in ns, 0 for none --
+   read by the scheduler's own check (TaskQueue::note_run). */
+extern u64 wakeup_trigger_ns;
+
+inline bool wakeup_trigger_armed()
+{
+    return __atomic_load_n(&wakeup_trigger_ns, __ATOMIC_RELAXED) != 0;
+}
+
+/* A wakeup's wait, from where the scheduler has it in its hand: freezes the
+   rings, once, if it is over the trigger's. */
+void note_wakeup(ulong waited_ns, ulong now_ns, Task* task, ulong cpu);
+
 }
 }

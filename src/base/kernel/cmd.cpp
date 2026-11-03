@@ -2015,7 +2015,7 @@ static const CmdEntry COMMANDS[] = {
     { "top",       cmd_top,       "top [ms] - per-task cpu use over a sampling window" },
     { "sched",     cmd_sched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice" },
     { "profile",   cmd_profile,   "profile [ms] [pid] - sample where the kernel spends its time" },
-    { "trace",     tp::command,   "trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event...] | stat | clear | size <KiB> | free | freeze | thaw | test [n] | bench - tracepoints: events recorded as they happen into each cpu's ring, and read back merged by time" },
+    { "trace",     tp::command,   "trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event...] | dump [n] [cpu=N] [event...] | latency [n] [cpu=N] [event...] | stat | clear | size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench - tracepoints: events recorded as they happen into each cpu's ring, and read back merged by time -- shown, dumped as JSON, or paired into how long a woken task waited for its cpu; `freeze wakeup>N` freezes the rings on a wakeup that waits longer" },
     { "watchdog",  cmd_watchdog,  "watchdog - show watchdog stats" },
     { "memusage",  cmd_memusage,  "memusage - show memory usage stats" },
     { "meminfo",   cmd_meminfo,   "meminfo - show the firmware memory map and what of it is used" },
