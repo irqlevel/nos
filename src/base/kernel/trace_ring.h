@@ -30,10 +30,13 @@ namespace kernel
 
    The slots are in chunks of CHUNK_BYTES from the kernel's heap, as many as
    init() is told -- a power of two, so that a slot is found with a mask and
-   a shift, no division on the write path. They are kept for the life of the
-   kernel (release() is a test's, for a ring nothing else reaches): a CPU may
-   be inside write() when another turns tracing off, and freeing under it
-   would be a use-after-free for the sake of a few megabytes. */
+   a shift, no division on the write path. A ring is released only once
+   nothing can be writing into it or reading it: a CPU may be inside write()
+   as another turns tracing off, so the kernel's rings are swapped out first
+   and released after every CPU has taken an interrupt since
+   (CpuTable::synchronize, tracepoint.cpp's swap_rings) -- write() runs with
+   interrupts off -- and a ring of a caller's own, `trace bench`'s or a
+   test's, when its one writer is done with it. */
 class TraceRing final
 {
 public:
@@ -79,8 +82,8 @@ public:
        kept of a part -- or a ring that has its slots already. */
     bool init(ulong chunks, ulong tag);
 
-    /* The slots given back. Only for a ring nothing else can reach any more:
-       a test's own. */
+    /* The slots given back: only for a ring nothing can write into or read
+       any more (the header's comment above says how the kernel's get so). */
     void release();
 
     /* Whether init() has given it its slots: what write() and read() look
