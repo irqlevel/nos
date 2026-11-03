@@ -24,8 +24,10 @@ environment block), module (the module loader), pagetable (the page tables
 and the physical page allocator), heap (the kernel heap), cmdline (the
 command line), multiboot (Multiboot2's tags), acpi (the ACPI tables, over
 an emulated tmp_map window), format (the kernel's printf, against the
-host's), eevdf (the scheduler's rules, against a model of EEVDF's) and
-lineedit (the console shell's line editor, what a terminal types at it).
+host's), eevdf (the scheduler's rules, against a model of EEVDF's),
+lineedit (the console shell's line editor, what a terminal types at it),
+trace (the tracepoints' ring) and tracewin (the window `trace latency`
+reads of the rings, against the truth of a schedule played out on them).
 docs/testing.md says what each checks.
 
 By default every target runs its own number of inputs from a fixed seed, the

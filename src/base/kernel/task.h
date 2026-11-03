@@ -305,6 +305,13 @@ public:
     bool switched_out_runnable_;
 
     stdlib::Time run_start_time_;
+    /* When it last got a CPU, in ns since boot: set by the switch to it
+       (TaskQueue::switch_to) -- by Task::run for a task that starts on its
+       own stack -- and read when it next leaves, for sched_block's ran_ns.
+       Not run_start_time_, which update_runtime moves on at every decision
+       that leaves it the CPU. Its CPU's alone: written and read under that
+       queue's lock, or before anything can find the task. */
+    ulong switched_in_at_;
     /* Written under lock_ (update_runtime), and read through
        get_runtime_ns, which takes it: a read from another CPU without it
        races the scheduler's write */

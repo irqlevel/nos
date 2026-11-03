@@ -11,8 +11,12 @@ Perfetto), a track a CPU of the tasks that ran on it, wakeups and blocks as
 instant events on their own.
 
 The pairing is the kernel's `trace latency`: a `sched_wakeup` and the first
-`sched_switch` after it whose next task is the woken one. A record the dump
-cut off (a wakeup whose switch is in the next page) is counted, not guessed.
+`sched_switch` after it whose next task is the woken one, a deadline's
+wakeup counted from its deadline (`late_ns`). It starts where the dump's
+first line -- `{"window": ...}` -- says every CPU's part of it is whole: a
+CPU whose ring wrapped holds nothing older, and a wakeup from before then
+could have its switch among what that ring lost. A wakeup whose switch is
+not in the dump is counted, not guessed.
 
 Usage: scripts/trace-decode.py [--chrome FILE] [--json FILE] [--latency]
                                [--cpu N] [FILE...]
@@ -30,44 +34,68 @@ import sys
 CHROME_PID_BASE = 1000
 
 
-def records(lines):
-    """The dump's records: every JSON object a line holds, oldest first."""
-    out = []
+def objects(lines):
+    """Every JSON object the lines hold, one a line."""
     for line in lines:
         at = line.find("{")
         if at < 0:
             continue
         try:
-            r = json.loads(line[at:])
+            o = json.loads(line[at:])
         except ValueError:
             continue
-        if not isinstance(r, dict) or "t" not in r or "cpu" not in r or "ev" not in r:
-            continue
-        if r["ev"] is None:
-            continue
-        out.append(r)
+        if isinstance(o, dict):
+            yield o
+
+
+def records(lines):
+    """The dump's records, oldest first."""
+    out = [o for o in objects(lines) if "t" in o and "cpu" in o and o.get("ev") is not None]
     out.sort(key=lambda r: (r["t"], r["cpu"]))
     return out
 
 
-def latencies(recs):
-    """Every wakeup a switch answered: (ns, pid, comm, woken_cpu, ran_cpu)."""
+def window_start(lines):
+    """From where on every CPU's part of the dump is whole, in ns: the
+    latest its `window` lines say -- a dump in parts has one a part -- 0
+    when none was cut, None when a part could not be read at all."""
+    start = 0
+    for o in objects(lines):
+        w = o.get("window")
+        if not isinstance(w, dict):
+            continue
+        if w.get("complete_from") is None:
+            return None
+        start = max(start, w["complete_from"])
+    return start
+
+
+def latencies(recs, start):
+    """Every wakeup a switch answered, from `start` on: (ns, pid, comm,
+    woken_cpu, ran_cpu) each, and how many were answered, are still
+    waiting, and were woken again before any switch to them."""
     waiting = {}
     waits = []
-    answered = 0
+    superseded = 0
     for r in recs:
+        if r["t"] < start:
+            continue
         f = r.get("f", {})
         if r["ev"] == "sched_wakeup":
             pid = f.get("pid")
-            if pid is not None and pid not in waiting:
-                waiting[pid] = (r["t"], f.get("cpu", r["cpu"]))
+            if pid is None:
+                continue
+            # Woken again with no switch between: the first one's switch is
+            # not in the dump, and this is the one the next switch answers
+            if pid in waiting:
+                superseded += 1
+            waiting[pid] = (r["t"] - f.get("late_ns", 0), f.get("cpu", r["cpu"]))
         elif r["ev"] == "sched_switch":
             pid = f.get("next_pid")
             if pid in waiting:
                 t0, woken_cpu = waiting.pop(pid)
                 waits.append((r["t"] - t0, pid, f.get("next_comm", "?"), woken_cpu, r["cpu"]))
-                answered += 1
-    return waits, answered, len(waiting)
+    return waits, len(waits), len(waiting), superseded
 
 
 def percentile(sorted_values, p):
@@ -103,9 +131,13 @@ def spans(recs):
     return out
 
 
-def summarize(recs):
+def summarize(recs, start):
     print(f"trace-decode: {len(recs)} records over {len({r['cpu'] for r in recs})} cpus, "
           f"{ns_text(recs[0]['t'])} to {ns_text(recs[-1]['t'])}")
+    if start is None:
+        print("  a cpu's part could not be read: no wait is paired across it")
+    elif start > recs[0]["t"]:
+        print(f"  every cpu's part whole from {ns_text(start)}: waits paired from there")
 
     switches = [r for r in recs if r["ev"] == "sched_switch"]
     print(f"  {len(switches)} switches, {sum(1 for r in recs if r['ev'] == 'sched_wakeup')} wakeups, "
@@ -121,7 +153,9 @@ def summarize(recs):
         text = ", ".join(f"{comm} {ns_text(dur)}" for (pid, comm), dur in top)
         print(f"  cpu {cpu}: {len(ran[cpu])} ran spans -- {text}")
 
-    waits, answered, pending = latencies(recs)
+    if start is None:
+        return
+    waits, answered, pending, superseded = latencies(recs, start)
     if answered:
         waits_ns = sorted(w[0] for w in waits)
         print(f"  wait: {answered} wakeups answered, {pending} not run in the window -- "
@@ -131,6 +165,8 @@ def summarize(recs):
             print(f"    {ns_text(ns):>9} pid {pid} {comm} (cpu {woken_cpu} -> {run_cpu})")
     elif pending:
         print(f"  wait: no wakeup of the window was followed by its switch ({pending} still waiting)")
+    if superseded:
+        print(f"  {superseded} wakeups were followed by another of their task's before any switch to it")
 
 
 def chrome(recs, path):
@@ -155,7 +191,8 @@ def chrome(recs, path):
             events.append({"name": "wakeup", "cat": "sched", "ph": "i", "s": "t", "ts": ts,
                            "pid": pid, "tid": pid,
                            "args": {"pid": f.get("pid"), "comm": f.get("comm"),
-                                    "waker": f.get("waker_pid"), "deadline": f.get("deadline")}})
+                                    "waker": f.get("waker_pid"), "deadline": f.get("deadline"),
+                                    "late_ns": f.get("late_ns")}})
         elif r["ev"] == "sched_block":
             events.append({"name": "block", "cat": "sched", "ph": "i", "s": "t", "ts": ts,
                            "pid": pid, "tid": pid,
@@ -194,6 +231,7 @@ def main():
         lines = sys.stdin.readlines()
 
     recs = records(lines)
+    start = window_start(lines)
     if args.cpu is not None:
         recs = [r for r in recs if r["cpu"] == args.cpu]
     if not recs:
@@ -208,12 +246,16 @@ def main():
         chrome(recs, args.chrome)
 
     if args.latency:
-        waits, answered, pending = latencies(recs)
+        if start is None:
+            print("trace-decode: a cpu's part could not be read: no wait is paired across it")
+            return 0
+        waits, answered, pending, superseded = latencies(recs, start)
         for ns, pid, comm, woken_cpu, run_cpu in sorted(waits, reverse=True):
             print(f"{ns:>12}ns pid {pid} {comm} (cpu {woken_cpu} -> {run_cpu})")
-        print(f"trace-decode: {answered} answered, {pending} not run in the window")
+        print(f"trace-decode: {answered} answered, {pending} not run in the window, "
+              f"{superseded} woken again before a switch")
     elif not (args.json or args.chrome):
-        summarize(recs)
+        summarize(recs, start)
     return 0
 
 

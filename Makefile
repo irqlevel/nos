@@ -139,6 +139,7 @@ CXX_SRC_x86_64 =   \
     src/base/kernel/klog.cpp \
     src/base/kernel/trace_ring.cpp \
     src/base/kernel/tracepoint.cpp \
+    src/base/kernel/trace_window.cpp \
     src/base/kernel/timer.cpp    \
     src/base/kernel/panic.cpp    \
     src/base/kernel/ubsan.cpp \
@@ -219,6 +220,7 @@ CXX_SRC_aarch64 = \
     src/base/kernel/klog.cpp \
     src/base/kernel/trace_ring.cpp \
     src/base/kernel/tracepoint.cpp \
+    src/base/kernel/trace_window.cpp \
     src/base/kernel/dmesg.cpp \
     src/base/kernel/panic.cpp \
     src/base/kernel/ubsan.cpp \

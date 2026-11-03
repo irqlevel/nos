@@ -100,21 +100,38 @@ void Cpu::idle()
 
     /* A CPU about to halt, and a CPU back from it: the two ends of one idle,
        where `sched`'s wakeup histogram would show a long sleep as a wait
-       for the CPU it never was. Between them the CPU runs nothing of the
-       kernel's, so a reader of the two knows what an idle cost. */
+       for the CPU it never was. The enter opens it (TaskQueue::open_idle)
+       and the first of three closes it: MWAIT's wake, read before the
+       interrupt that ended it is taken (idle_mwait); the decision of that
+       interrupt's that takes the CPU from this task (TaskQueue::switch_to);
+       or the halt returning here. Between the two records the CPU runs
+       nothing but the interrupt that woke it, so their distance is what an
+       idle cost. An interrupt landing in the instructions between the
+       enter and the halt that switches away ends the idle there; the halt
+       this task makes when it is switched back to goes unrecorded. */
     if (unlikely(tp::on(tp::Id::IdleEnter)))
+    {
         tp::emit_idle(tp::Id::IdleEnter, index_, self);
+        get_task_queue().open_idle();
+    }
 
     if (hal::idle_masked())
-        idle_mwait();
+        idle_mwait(self);
     else
         cpu_halt();
 
-    if (unlikely(tp::on(tp::Id::IdleExit)))
-        tp::emit_idle(tp::Id::IdleExit, index_, self);
+    idle_ended(self);
 
     if (self != nullptr)
         self->set_idling(false);
+}
+
+/* An idle the trace opened over, if nothing closed it yet: its idle_exit. */
+void Cpu::idle_ended(Task* self)
+{
+    TaskQueue& queue = get_task_queue();
+    if (unlikely(queue.idle_is_open()) && queue.close_idle() && tp::on(tp::Id::IdleExit))
+        tp::emit_idle(tp::Id::IdleExit, index_, self);
 }
 
 /* An idle by MWAIT, interrupts off throughout, so that how long it lasted
@@ -126,13 +143,16 @@ void Cpu::idle()
    exit at every wake: on a desktop part's C10, hundreds of microseconds.
    C1 otherwise, as a HLT. The timer's deadline is read with interrupts off:
    its own interrupt re-arms it on this CPU. */
-void Cpu::idle_mwait()
+void Cpu::idle_mwait(Task* self)
 {
     ulong flags = hal::irq_save();
     ulong now = get_boot_time().get_value();
     ulong armed = timer_armed_at_;
     bool deep = idle_long_run_ >= IDLE_LONG_RUN && armed > now && armed - now >= IDLE_DEEP_NS;
     hal::cpu_idle_masked(deep);
+    /* The wake, before the interrupt that ended it is taken: the idle's end
+       exactly, if the trace opened it */
+    idle_ended(self);
     ulong woke = get_boot_time().get_value();
     if (woke > now && woke - now >= IDLE_DEEP_NS)
     {
