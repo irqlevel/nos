@@ -13,6 +13,8 @@
 #include "elf.h"
 #include "symtab.h"
 #include "event.h"
+#include "tracepoint.h"
+#include "trace_ring.h"
 #include <hal/cpu.h>
 
 #include <lib/checksum.h>
@@ -4153,6 +4155,259 @@ bool test_wake_storm()
     return ok;
 }
 
+/* ---- tracepoints (kernel/tracepoint.h, kernel/trace_ring.h) ---- */
+
+/* What a test record of index `index` carries: anything else read back
+   under that index is a record torn, or another's. */
+static u64 trace_test_value(u64 index)
+{
+    return (index * 0x9E3779B97F4A7C15ULL) ^ 0xA5A5A5A5A5A5A5A5ULL;
+}
+
+static bool trace_ring_write(TraceRing& ring, u64 index)
+{
+    u64 payload[2] = { index, trace_test_value(index) };
+    ulong flags = hal::irq_save();
+    bool ok = ring.write((u16)tp::Id::Test, hal::read_cycle_counter(), payload, sizeof(payload));
+    hal::irq_restore(flags);
+    return ok;
+}
+
+static bool trace_ring_holds(const TraceRing& ring, u64 index)
+{
+    TraceRing::Record r;
+    return ring.read(index, r) && r.index == index && r.id == (u16)tp::Id::Test && r.size == 2 * sizeof(u64)
+        && r.payload[0] == index && r.payload[1] == trace_test_value(index);
+}
+
+struct TraceWriter
+{
+    TraceRing* ring;
+    Atomic stop;
+    Atomic written;
+};
+
+/* The other CPU's: records into the ring as fast as it can until told. */
+static void trace_writer_task(void* ctx)
+{
+    auto* w = static_cast<TraceWriter*>(ctx);
+    u64 index = 0;
+    while (w->stop.get() == 0)
+    {
+        if (trace_ring_write(*w->ring, index))
+            index++;
+    }
+    w->written.set((long)index);
+}
+
+/* A ring of its own: records read back in order, the ring wrapping with the
+   oldest written over and no longer read, a payload too large refused; then
+   a writer on another CPU and this one reading as it writes -- every record
+   kept must be whole, the one its index says; then the kernel's own rings
+   through emit(), a freeze, and every ring freed once no CPU can be writing
+   (CpuTable::synchronize, an IPI to each). */
+static bool test_tracepoints()
+{
+    TraceRing ring;
+    if (!ring.init(1, TAG))
+    {
+        klog(0, "Tracepoints: no memory for a test ring");
+        return false;
+    }
+    bool ok = true;
+    const u64 cap = ring.capacity();
+
+    for (u64 i = 0; i < 10 && ok; i++)
+        ok = trace_ring_write(ring, i);
+    for (u64 i = 0; i < 10 && ok; i++)
+        ok = trace_ring_holds(ring, i);
+    if (ok && (ring.head() != 10 || trace_ring_holds(ring, 10)))
+        ok = false;
+    if (!ok)
+        klog(0, "Tracepoints: ten records not read back as written");
+
+    u8 big[TraceRing::PAYLOAD_BYTES + 1] = {};
+    if (ok && ring.write((u16)tp::Id::Test, 0, big, sizeof(big)))
+    {
+        klog(0, "Tracepoints: a payload of %lu bytes taken", (ulong)sizeof(big));
+        ok = false;
+    }
+
+    /* Three times round: the newest `cap` kept, the one before them gone. */
+    const u64 last = 3 * cap;
+    for (u64 i = 10; i < last && ok; i++)
+        ok = trace_ring_write(ring, i);
+    for (u64 i = last - cap; i < last && ok; i++)
+    {
+        if (!trace_ring_holds(ring, i))
+        {
+            klog(0, "Tracepoints: record %lu of %lu not kept after the ring wrapped", (ulong)i, (ulong)last);
+            ok = false;
+        }
+    }
+    if (ok && trace_ring_holds(ring, last - cap - 1))
+    {
+        klog(0, "Tracepoints: record %lu read back after it was written over", (ulong)(last - cap - 1));
+        ok = false;
+    }
+    ring.release();
+    if (!ok)
+        return false;
+
+    /* A writer on another CPU, and this one reading what it writes as it
+       writes it. */
+    auto& cpus = CpuTable::get_instance();
+    ulong self = cpus.get_current_cpu_id();
+    ulong running = cpus.get_running_cpus();
+    ulong other = MAX_CPUS;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if ((running & (1UL << i)) && i != self)
+            other = i;
+    }
+    if (other != MAX_CPUS)
+    {
+        TraceRing shared;
+        TraceWriter w = { &shared, Atomic(0), Atomic(0) };
+        Task* writer = shared.init(1, TAG) ? mm::talloc<Task, TAG>() : nullptr;
+        if (writer == nullptr)
+        {
+            shared.release();
+            klog(0, "Tracepoints: no memory for the two-cpu test");
+            return false;
+        }
+        /* The writer there; this task -- the boot's, its CPU's idle task,
+           which never moves -- reads here. */
+        writer->set_cpu_affinity(1UL << other);
+        if (!writer->start(trace_writer_task, &w))
+        {
+            writer->put();
+            shared.release();
+            klog(0, "Tracepoints: the writer task did not start");
+            return false;
+        }
+
+        static const ulong READ_NS = 20 * consts::NANO_SECS_IN_MS;
+        ulong kept = 0, torn = 0, gone = 0;
+        stdlib::Time until = get_boot_time() + stdlib::Time(READ_NS);
+        while (get_boot_time() < until && torn == 0)
+        {
+            u64 head = shared.head();
+            u64 from = (head > cap) ? head - cap : 0;
+            for (u64 i = from; i < head; i++)
+            {
+                TraceRing::Record r;
+                if (!shared.read(i, r))
+                {
+                    gone++;
+                    continue;
+                }
+                if (r.payload[0] != i || r.payload[1] != trace_test_value(i) || r.index != i)
+                    torn++;
+                else
+                    kept++;
+            }
+        }
+        w.stop.set(1);
+        writer->wait();
+        writer->put();
+        ulong written = (ulong)w.written.get();
+        shared.release();
+
+        if (torn != 0 || kept == 0 || written < cap)
+        {
+            klog(0, "Tracepoints: cpu %lu writing, cpu %lu reading: %lu records written, %lu read whole, %lu "
+                 "not the record their index says, %lu written over as they were read",
+                 other, self, written, kept, torn, gone);
+            return false;
+        }
+        klog(TEST_LL, "Tracepoints: cpu %lu wrote %lu records while cpu %lu read %lu of them whole, %lu written "
+             "over as they were read, none torn", other, written, self, kept, gone);
+    }
+
+    /* The kernel's own rings: the smallest, the test event on, a hundred
+       records on this CPU read back; frozen, none taken; freed. */
+    char out[256];
+    stdlib::BufferPrinter con(out, sizeof(out));
+    const ulong size_was = tp::ring_size_kib();
+    if (!tp::set_ring_kib(64, con) || tp::set("test", true, con) != 1)
+    {
+        klog(0, "Tracepoints: the test event not turned on: %s", out);
+        tp::free_rings();
+        tp::set_ring_kib(size_was, con);
+        return false;
+    }
+
+    static const ulong RECORDS = 100;
+    ulong flags = hal::irq_save();
+    ulong cpu = cpus.get_current_cpu_id();
+    for (ulong i = 0; i < RECORDS; i++)
+    {
+        tp::Test t = { i, trace_test_value(i) };
+        tp::emit(tp::Id::Test, &t, sizeof(t));
+    }
+    hal::irq_restore(flags);
+
+    auto records = static_cast<TraceRing::Record*>(mm::alloc((RECORDS + 1) * sizeof(TraceRing::Record), TAG));
+    if (records == nullptr)
+    {
+        tp::free_rings();
+        tp::set_ring_kib(size_was, con);
+        return false;
+    }
+    ulong got = tp::read_cpu(cpu, tp::Id::Test, records, RECORDS + 1);
+    for (ulong i = 0; i < got && ok; i++)
+    {
+        tp::Test t;
+        stdlib::mem_cpy(&t, records[i].payload, sizeof(t));
+        ok = (t.seq == i && t.value == trace_test_value(i) && records[i].cpu == cpu);
+        if (ok && i != 0 && records[i].cycles < records[i - 1].cycles)
+            ok = false;
+    }
+    if (!ok || got != RECORDS)
+    {
+        char stat[512];
+        stdlib::BufferPrinter sp(stat, sizeof(stat));
+        tp::command("stat", sp);
+        klog(0, "Tracepoints: %lu records emitted on cpu %lu, %lu read back%s; the rings: %s", RECORDS, cpu, got,
+             ok ? "" : ", not as they were emitted", stat);
+        ok = false;
+    }
+
+    /* Frozen: nothing more is taken. */
+    tp::command("freeze", con);
+    if (ok)
+    {
+        tp::Test t = { RECORDS, 0 };
+        tp::emit(tp::Id::Test, &t, sizeof(t));
+        if (tp::read_cpu(cpu, tp::Id::Test, records, RECORDS + 1) != RECORDS)
+        {
+            klog(0, "Tracepoints: a record taken while recording was frozen");
+            ok = false;
+        }
+    }
+    tp::command("thaw", con);
+    mm::free(records);
+
+    tp::free_rings();
+    /* The size the boot found, for the rings anyone makes after. */
+    if (!tp::set_ring_kib(size_was, con))
+    {
+        klog(0, "Tracepoints: the ring size not put back to %lu KiB", size_was);
+        ok = false;
+    }
+    TraceRing::Record after;
+    if (ok && (tp::on(tp::Id::Test) || tp::read_cpu(cpu, tp::Id::Test, &after, 1) != 0))
+    {
+        klog(0, "Tracepoints: the test event on, or a record read, after every ring was freed");
+        ok = false;
+    }
+    if (ok)
+        klog(TEST_LL, "Tracepoints: %lu records through emit() on cpu %lu read back, none while frozen, the rings "
+             "freed", RECORDS, cpu);
+    return ok;
+}
+
 bool test_multi_tasking()
 {
     if (!test_spin_lock_preempt())
@@ -4171,6 +4426,14 @@ bool test_multi_tasking()
         return false;
 
     if (!test_event_wait_for())
+        return false;
+
+    /* Once, on the boot CPU, which comes here after every other CPU has
+       started: every CPU runs this function at once, and the rings and the
+       events are the kernel's, one set of them -- one CPU's free_rings()
+       under another's emit() and read back made the read find nothing. */
+    auto& cpus = CpuTable::get_instance();
+    if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_tracepoints())
         return false;
 
     Task *task[2] = {0};

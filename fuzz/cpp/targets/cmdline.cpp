@@ -67,6 +67,8 @@ struct Expected
     bool ubsan_set = false;
     /* hugepages=: a share in percent, or bytes -- the last one said */
     ulong huge_percent = 0, huge_bytes = 0;
+    /* tracepoints=: the list, as said last, cut to what the field holds */
+    std::string tracepoints;
     std::string kept;
 };
 
@@ -272,6 +274,10 @@ void take(Expected& e, const std::string& token)
             e.huge_percent = 0;
         }
     }
+    else if (key == "tracepoints")
+    {
+        e.tracepoints = value.substr(0, Parameters::TRACEPOINTS_LEN - 1);
+    }
     else if (key == "loglevel")
     {
         if (number(value, n) && n <= static_cast<unsigned long long>(kernel::MAX_LOG_LEVEL))
@@ -359,7 +365,7 @@ Expected read(const std::string& line)
 
 const char* const WORDS[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "idle", "wxprobe", "smp",
                              "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
-                             "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages"};
+                             "nctail", "loglevel", "root", "fstest", "disklog", "dns", "hugepages", "tracepoints"};
 
 const char* const HUGE_VALUES[] = {"50%", "100%", "101%", "0%", "1%", "32G", "512G", "513G", "0G", "512M", "524288M",
                                   "524289m", "1g", "2m", "G", "%", "M", "50", "50%%", "0050%", "%50", "18446744073709551615G",
@@ -401,6 +407,13 @@ std::string value(fuzz::Input& in, const std::string& key)
             return in.pick(HUGE_VALUES);
         const char* units[] = {"%", "G", "M", "g", "m", "K", ""};
         return std::to_string(in.chance(16) ? in.value32() : in.below(600)) + in.pick(units);
+    }
+    if (key == "tracepoints")
+    {
+        const char* lists[] = {"sched", "test", "all", "sched_switch,sched_wakeup", "idle,sched", "nonesuch", ",", "a,,b"};
+        if (in.chance(4))
+            return std::string(in.range(30, 40), 't');
+        return in.pick(lists);
     }
     if (key == "root")
     {
@@ -498,6 +511,8 @@ void run(fuzz::Input& in)
     INVARIANT(p.is_rx_poll_enabled() == e.rx_poll && p.is_dns_enabled() == e.dns && p.is_root_read_only() == e.ro &&
         p.is_fs_test() == e.fs_test && p.is_disk_log_on() == e.disk_log, "rxpoll, dns, ro, fstest or disklog wrong");
     INVARIANT(p.get_log_level() == e.log_level, "loglevel %d, not %d", p.get_log_level(), e.log_level);
+    INVARIANT(std::string(p.get_tracepoints()) == e.tracepoints, "tracepoints '%s', not '%s'", p.get_tracepoints(),
+        e.tracepoints.c_str());
     /* The pool asked of a machine of some size: the share of it, or the
        bytes, whichever the line said last */
     {

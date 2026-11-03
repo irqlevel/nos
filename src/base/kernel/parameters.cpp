@@ -62,6 +62,7 @@ Parameters::Parameters()
     cmdline_[0] = '\0';
     stdlib::mem_set(&root_, 0, sizeof(root_));
     root_.mode = RootNone;
+    stdlib::mem_set(tracepoints_, 0, sizeof(tracepoints_));
 }
 
 Parameters::~Parameters()
@@ -263,6 +264,11 @@ bool Parameters::is_dns_enabled()
 const Parameters::RootSpec& Parameters::get_root()
 {
     return root_;
+}
+
+const char* Parameters::get_tracepoints()
+{
+    return tracepoints_;
 }
 
 bool Parameters::is_root_read_only()
@@ -660,6 +666,12 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
             root_.mode = RootDevice;
             stdlib::strn_cpy(root_.value, value, sizeof(root_.value));
         }
+    }
+    else if (stdlib::str_cmp(key, "tracepoints") == 0)
+    {
+        /* Turned on by kernel/tracepoint.cpp once every CPU is up, which says
+           what of it it did not know. */
+        stdlib::strn_cpy(tracepoints_, value, sizeof(tracepoints_));
     }
     else if (stdlib::str_cmp(key, "fstest") == 0)
     {

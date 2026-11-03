@@ -41,6 +41,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `console=vga` — shell input and output on the screen only (VGA text or framebuffer)
 - `console=both` — both (the default); listed for completeness
 - `trace=vga` — x86-64 only: mirror the boot trace on the screen as well as the serial port. Off by default because redrawing glyphs costs a full repaint per scrolled row; on a machine with no UART the mirror is the default anyway, since there is nowhere else to put it
+- `tracepoints=<list>` — events to record from the boot on (`kernel/tracepoint.h`): their names, their groups or `all`, comma-separated -- turned on as the boot ends, once every CPU has its ring, and said so in the log; a name it does not know is said too. `trace` in the shell changes them afterwards. See [Tracepoints](tracing.md)
 - `loglevel=N` — log level to boot with (0-5, default 1). The `loglevel` shell command moves it afterwards, but only a boot parameter can make the *boot* chatty; the task lifecycle and the multitasking self-test are at level 3
 - `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address, so pair it with `dhcp=auto`. See [Netconsole](netconsole.md)
 - `nctail=N` — ship only the newest N KiB of the log buffered before the link came up (e.g. `nctail=16`); the rest is dropped. For a machine that wedges shortly after the network appears, this spends the little airtime it has on the lines around the wedge instead of on the head of the boot log

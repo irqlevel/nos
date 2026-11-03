@@ -167,6 +167,12 @@ public:
        a forced disk write per burst of lines. */
     bool is_disk_log_on();
 
+    /* tracepoints=<list>: the events (kernel/tracepoint.h) turned on once
+       every CPU is up -- names, groups or `all`, comma-separated. Empty when
+       none was asked for. */
+    const char* get_tracepoints();
+    static const ulong TRACEPOINTS_LEN = 40;
+
     const char* get_cmdline();
 
     Parameters();
@@ -223,6 +229,7 @@ private:
     bool root_read_only_;
     bool fs_test_;
     bool disk_log_on_;
+    char tracepoints_[TRACEPOINTS_LEN];
     bool parsed_;
 
     static bool parse_uuid(const char* text, u8* out);

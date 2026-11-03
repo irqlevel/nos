@@ -17,6 +17,7 @@
 #include <kernel/panic.h>
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
+#include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
@@ -351,6 +352,10 @@ static void bp_startup_arm(void* ctx)
     /* The netconsole, if the command line asked for one, and the shell over
        UDP: both on eth0, both the layer's to start. */
     rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
+
+    /* The events tracepoints= named, on now that every CPU has its ring --
+       after the self-tests, whose own use of the rings ends in freeing them. */
+    tp::boot_on(Parameters::get_instance().get_tracepoints());
 
     klog(0, "boot: complete");
 
