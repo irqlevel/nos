@@ -286,6 +286,11 @@ void TaskQueue::note_run(Task* next, Task* prev, ulong now)
     {
         ulong waited = now - woke;
         stats_.wake(waited);
+
+        /* `trace freeze wakeup>N`: the trace's trigger, off unless armed */
+        if (unlikely(tp::wakeup_trigger_armed()))
+            tp::note_wakeup(waited, now, next, index_);
+
         if (waited >= LATE_WAKE_NS)
         {
             late_.count++;
