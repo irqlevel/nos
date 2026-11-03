@@ -18,14 +18,14 @@ impl kmod::Module for SlowExit {}
 
 impl Drop for SlowExit {
     fn drop(&mut self) {
-        kcore::trace!(0, "slowexit: exit takes {} ms", EXIT_MS);
+        kcore::klog!(0, "slowexit: exit takes {} ms", EXIT_MS);
         kcore::task::sleep_ms(EXIT_MS);
-        kcore::trace!(0, "slowexit: exit done");
+        kcore::klog!(0, "slowexit: exit done");
     }
 }
 
 fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
-    kcore::trace!(0, "slowexit: loaded");
+    kcore::klog!(0, "slowexit: loaded");
     Ok(Box::new(SlowExit))
 }
 

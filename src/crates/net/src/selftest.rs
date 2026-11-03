@@ -14,7 +14,7 @@
 use crate::wire::{self, arp, eth, icmp, ip, udp, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP,
                   ARP_LEN, ARP_OP_REPLY, ARP_OP_REQUEST, ICMP_HDR_LEN, IP_HDR_LEN,
                   IP_PROTO_ICMP, IP_PROTO_UDP, MAC_BROADCAST};
-use kcore::trace;
+use kcore::klog;
 
 const US: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const THEM: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
@@ -23,7 +23,7 @@ const THEIR_IP: u32 = 0x0A00_0202; /* 10.0.2.2 */
 
 fn check(what: &str, ok: bool) -> bool {
     if !ok {
-        trace!(0, "net selftest: {} FAILED", what);
+        klog!(0, "net selftest: {} FAILED", what);
     }
     ok
 }
@@ -190,7 +190,7 @@ pub extern "C" fn rust_net_selftest() -> i32 {
         & crate::nat::selftest();
 
     if ok {
-        trace!(0, "net selftest: passed");
+        klog!(0, "net selftest: passed");
         0
     } else {
         -1

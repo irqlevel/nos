@@ -2,7 +2,7 @@
 #include "stack_trace.h"
 #include "symtab.h"
 #include "task.h"
-#include "trace.h"
+#include "klog.h"
 
 #include <hal/irqchip.h>
 #include <hal/pmu.h>
@@ -47,7 +47,7 @@ bool Profiler::allocate()
         cpu_[i].records = (Record*)mm::alloc(SAMPLES_PER_CPU * sizeof(Record), TAG);
         if (cpu_[i].records == nullptr)
         {
-            trace(0, "Profiler: no memory for cpu %lu buffer", i);
+            klog(0, "Profiler: no memory for cpu %lu buffer", i);
             return false;
         }
     }

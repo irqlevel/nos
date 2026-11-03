@@ -11,7 +11,7 @@
 use alloc::boxed::Box;
 
 use kcore::procinfo;
-use kcore::trace;
+use kcore::klog;
 
 use crate::ramfs::RamFs;
 use crate::vfs::FileSystem;
@@ -46,7 +46,7 @@ impl ProcFs {
 
         self.interrupts = self.ram.create_file(root, b"interrupts");
         if self.interrupts.is_none() {
-            trace!(0, "procfs: no memory for /proc/interrupts");
+            klog!(0, "procfs: no memory for /proc/interrupts");
         } else {
             self.refresh_interrupts();
         }
@@ -58,7 +58,7 @@ impl ProcFs {
     fn put(&mut self, root: NodeId, name: &[u8], content: &[u8]) {
         match self.ram.create_file(root, name) {
             Some(node) => { self.ram.write(node, content, 0); }
-            None => trace!(0, "procfs: no memory for a file"),
+            None => klog!(0, "procfs: no memory for a file"),
         }
     }
 

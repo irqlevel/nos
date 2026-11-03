@@ -11,7 +11,7 @@
 use alloc::boxed::Box;
 use crate::nic::Nic;
 use kcore::once::OnceBox;
-use kcore::trace;
+use kcore::klog;
 
 use crate::arp::ArpTable;
 use crate::dhcp::Dhcp;
@@ -32,7 +32,7 @@ pub(crate) fn arp_table() -> Option<&'static ArpTable> {
     match ARP.get_or_try_init(|| ArpTable::new().map(Box::new)) {
         Some(arp) => Some(arp),
         None => {
-            trace!(0, "arp: no memory for the table");
+            klog!(0, "arp: no memory for the table");
             None
         }
     }
@@ -42,7 +42,7 @@ pub(crate) fn icmp() -> Option<&'static Icmp> {
     match ICMP.get_or_try_init(|| Icmp::new().map(Box::new)) {
         Some(icmp) => Some(icmp),
         None => {
-            trace!(0, "icmp: no memory");
+            klog!(0, "icmp: no memory");
             None
         }
     }
@@ -52,7 +52,7 @@ pub(crate) fn dns() -> Option<&'static Dns> {
     match DNS.get_or_try_init(|| Dns::new().map(Box::new)) {
         Some(dns) => Some(dns),
         None => {
-            trace!(0, "dns: no memory for the resolver");
+            klog!(0, "dns: no memory for the resolver");
             None
         }
     }
@@ -62,7 +62,7 @@ pub(crate) fn dhcp() -> Option<&'static Dhcp> {
     match DHCP.get_or_try_init(|| Dhcp::new().map(Box::new)) {
         Some(dhcp) => Some(dhcp),
         None => {
-            trace!(0, "dhcp: no memory for the client");
+            klog!(0, "dhcp: no memory for the client");
             None
         }
     }
@@ -83,7 +83,7 @@ pub(crate) fn nat() -> Option<&'static Nat> {
     match NAT.get_or_try_init(|| Nat::new().map(Box::new)) {
         Some(nat) => Some(nat),
         None => {
-            trace!(0, "nat: no memory");
+            klog!(0, "nat: no memory");
             None
         }
     }
@@ -94,7 +94,7 @@ fn udp_shell() -> Option<&'static UdpShell> {
     match UDP_SHELL.get_or_try_init(|| UdpShell::new().map(Box::new)) {
         Some(shell) => Some(shell),
         None => {
-            trace!(0, "udpshell: no memory");
+            klog!(0, "udpshell: no memory");
             None
         }
     }

@@ -2,7 +2,7 @@
 #include "acpi.h"
 #include <hal/irqchip.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>
 #include <hal/cpu.h>
@@ -43,7 +43,7 @@ bool Hpet::setup()
     ulong base_phys = Acpi::get_instance().get_hpet_base_phys();
     if (base_phys == 0)
     {
-        trace(0, "HPET: no HPET ACPI table, using PIT");
+        klog(0, "HPET: no HPET ACPI table, using PIT");
         return false;
     }
 
@@ -51,7 +51,7 @@ bool Hpet::setup()
     ulong va = mm::PageTable::get_instance().map_mmio_region(base_phys, consts::PAGE_SIZE);
     if (va == 0)
     {
-        trace(0, "HPET: map_mmio_region failed for phys 0x%lX", base_phys);
+        klog(0, "HPET: map_mmio_region failed for phys 0x%lX", base_phys);
         return false;
     }
 
@@ -66,11 +66,11 @@ bool Hpet::setup()
        (COUNT_SIZE_CAP == 0) wraps ~every 43s and breaks TSC calibration and
        the get_boot_time fallback. QEMU's HPET is 64-bit; warn on anything else. */
     if (!(gcap & GCAP_COUNT_SIZE_CAP))
-        trace(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
+        klog(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
 
     if (period_fs_ == 0 || period_fs_ > 0x05F5E100ULL /* 100 ns max per spec */)
     {
-        trace(0, "HPET: invalid period %lu fs", (ulong)period_fs_);
+        klog(0, "HPET: invalid period %lu fs", (ulong)period_fs_);
         mmio_ = nullptr;
         return false;
     }
@@ -81,14 +81,14 @@ bool Hpet::setup()
     /* Nanoseconds per tick at DESIRED_HZ */
     tick_period_ns_ = consts::NANO_SECS_IN_SEC / DESIRED_HZ;
 
-    trace(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
+    klog(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
         base_phys, va, (ulong)period_fs_, freq_hz_, num_timers);
 
     /* Timer 0 must support periodic mode: the TYPE_CNF bit is ignored
        otherwise, the timer fires once and the system tick stops */
     if (!(read_reg(REG_TIMER0_CFG) & TIMER_PER_INT_CAP))
     {
-        trace(0, "HPET: timer 0 has no periodic mode, using PIT");
+        klog(0, "HPET: timer 0 has no periodic mode, using PIT");
         mmio_ = nullptr;
         return false;
     }
@@ -122,7 +122,7 @@ bool Hpet::setup()
     conf |= CONF_ENABLE_CNF | CONF_LEG_RT_CNF;
     write_reg(REG_GEN_CONF, conf);
 
-    trace(0, "HPET: configured, ticksPerInt %lu (100 Hz)", (ulong)ticks_per_interrupt);
+    klog(0, "HPET: configured, ticksPerInt %lu (100 Hz)", (ulong)ticks_per_interrupt);
     return true;
 }
 

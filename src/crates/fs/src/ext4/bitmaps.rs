@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use extfmt::group::{self, BLOCK_UNINIT, INODE_UNINIT};
-use kcore::trace;
+use kcore::klog;
 
 use super::source::Source;
 use super::txn::{Kind, Txn, RESERVE};
@@ -95,7 +95,7 @@ impl Txn<'_> {
         if csum {
             let computed = if inodes { group::inode_bitmap_csum(&sb, data) } else { group::block_bitmap_csum(&sb, data) };
             if computed.is_none_or(|c| !group::csum_matches(stored.0, stored.1, c)) {
-                trace!(0, "ext4: group {}'s {} bitmap fails its checksum", g, if inodes { "inode" } else { "block" });
+                klog!(0, "ext4: group {}'s {} bitmap fails its checksum", g, if inodes { "inode" } else { "block" });
                 return None;
             }
         }
@@ -110,10 +110,10 @@ impl Txn<'_> {
     pub fn alloc_block(&mut self, goal: u64) -> Option<u64> {
         if self.m.free_blocks.saturating_sub(self.allocated) <= RESERVE {
             if !self.may_reserve {
-                trace!(0, "ext4: no free blocks but the {} kept for giving blocks back", RESERVE);
+                klog!(0, "ext4: no free blocks but the {} kept for giving blocks back", RESERVE);
                 return None;
             }
-            trace!(1, "ext4: the disk is full: a punch takes one of the blocks kept for it");
+            klog!(1, "ext4: the disk is full: a punch takes one of the blocks kept for it");
         }
         let (groups, first, blocks) = (self.m.groups, self.m.first_data, self.m.blocks);
         let goal = goal.clamp(first, blocks.saturating_sub(1));
@@ -132,12 +132,12 @@ impl Txn<'_> {
                 (from..len).chain(0..from).find(|&i| !bit(data, i) && !freed.contains(start + i))
             };
             let Some(i) = found else {
-                trace!(0, "ext4: group {} counts free blocks, and its bitmap has none", g);
+                klog!(0, "ext4: group {} counts free blocks, and its bitmap has none", g);
                 continue;
             };
             let b = start + i;
             if self.m.in_system(b) {
-                trace!(0, "ext4: group {}'s bitmap has block {}, the filesystem's own, free: refused", g, b);
+                klog!(0, "ext4: group {}'s bitmap has block {}, the filesystem's own, free: refused", g, b);
                 return None;
             }
             set_bit(&mut self.dirty.get_mut(&map)?.data, i, true);
@@ -149,7 +149,7 @@ impl Txn<'_> {
             self.allocated += 1;
             return Some(b);
         }
-        trace!(0, "ext4: no free blocks");
+        klog!(0, "ext4: no free blocks");
         None
     }
 
@@ -202,7 +202,7 @@ impl Txn<'_> {
             return Some(0);
         }
         if self.m.overlaps_system(b, b + n) {
-            trace!(0, "ext4: group {}'s bitmap has blocks of the filesystem's own among {}..+{} free: refused", g, b, n);
+            klog!(0, "ext4: group {}'s bitmap has blocks of the filesystem's own among {}..+{} free: refused", g, b, n);
             return None;
         }
         {
@@ -237,7 +237,7 @@ impl Txn<'_> {
                 (0..u64::from(ipg)).find(|&i| !bit(data, i) && g * u64::from(ipg) + i + 1 >= u64::from(first_ino))
             };
             let Some(i) = found else {
-                trace!(0, "ext4: group {} counts free inodes, and its bitmap has none", g);
+                klog!(0, "ext4: group {} counts free inodes, and its bitmap has none", g);
                 continue;
             };
             set_bit(&mut self.dirty.get_mut(&map)?.data, i, true);
@@ -251,7 +251,7 @@ impl Txn<'_> {
                     /* A count past the group's inodes is damage: refused,
                      * where it would overflow or say what cannot be. */
                     let Some(dirs) = dirs.checked_add(1).filter(|&n| n <= ipg) else {
-                        trace!(0, "ext4: group {} counts {} directories of {} inodes", g, dirs, ipg);
+                        klog!(0, "ext4: group {} counts {} directories of {} inodes", g, dirs, ipg);
                         return None;
                     };
                     d.set_used_dirs_count(dirs);
@@ -267,7 +267,7 @@ impl Txn<'_> {
             }
             return Some((g * u64::from(ipg) + i + 1) as u32);
         }
-        trace!(0, "ext4: no free inodes");
+        klog!(0, "ext4: no free inodes");
         None
     }
 
@@ -285,7 +285,7 @@ impl Txn<'_> {
     pub fn free_run(&mut self, start: u64, n: u64) -> bool {
         let Some(end) = start.checked_add(n) else { return false };
         if start < self.m.first_data || end > self.m.blocks || self.m.overlaps_system(start, end) {
-            trace!(0, "ext4: blocks to free, {}..{}, outside the filesystem's data: refused", start, end);
+            klog!(0, "ext4: blocks to free, {}..{}, outside the filesystem's data: refused", start, end);
             return false;
         }
         let held: Vec<u64> = self.dirty.range(start..end).map(|(&b, _)| b).collect();
@@ -301,7 +301,7 @@ impl Txn<'_> {
             let Some(d) = self.dirty.get_mut(&map) else { return false };
             for i in b - at..stop - at {
                 if !bit(&d.data, i) {
-                    trace!(0, "ext4: block {} to free, and its bitmap has it free already", at + i);
+                    klog!(0, "ext4: block {} to free, and its bitmap has it free already", at + i);
                     return false;
                 }
                 set_bit(&mut d.data, i, false);
@@ -312,7 +312,7 @@ impl Txn<'_> {
             /* A count past the group's blocks is damage: refused, where it
              * would overflow or say what cannot be. */
             let Some(free) = free.checked_add((stop - b) as u32).filter(|&n| u64::from(n) <= len) else {
-                trace!(0, "ext4: group {} would count {}+{} free of {} blocks", g, free, stop - b, len);
+                klog!(0, "ext4: group {} would count {}+{} free of {} blocks", g, free, stop - b, len);
                 return false;
             };
             desc.set_free_blocks_count(free);
@@ -329,27 +329,27 @@ impl Txn<'_> {
     pub fn free_inode(&mut self, ino: u32, dir: bool) -> bool {
         let ipg = self.m.ipg;
         if ino < self.m.first_ino || ino > self.m.sb.inodes_count() {
-            trace!(0, "ext4: an inode to free, {}, that files cannot have: refused", ino);
+            klog!(0, "ext4: an inode to free, {}, that files cannot have: refused", ino);
             return false;
         }
         let (g, i) = (u64::from((ino - 1) / ipg), u64::from((ino - 1) % ipg));
         let Some(map) = self.bitmap(g, true) else { return false };
         let Some(d) = self.dirty.get_mut(&map) else { return false };
         if !bit(&d.data, i) {
-            trace!(0, "ext4: inode {} to free, and its bitmap has it free already", ino);
+            klog!(0, "ext4: inode {} to free, and its bitmap has it free already", ino);
             return false;
         }
         set_bit(&mut d.data, i, false);
         let Some(mut desc) = self.group_mut(g) else { return false };
         let (free, dirs) = (desc.view().free_inodes_count(), desc.view().used_dirs_count());
         let Some(free) = free.checked_add(1).filter(|&n| n <= ipg) else {
-            trace!(0, "ext4: group {} would count {}+1 free of {} inodes", g, free, ipg);
+            klog!(0, "ext4: group {} would count {}+1 free of {} inodes", g, free, ipg);
             return false;
         };
         desc.set_free_inodes_count(free);
         if dir {
             if dirs == 0 {
-                trace!(0, "ext4: group {} counts no directories, and one is freed", g);
+                klog!(0, "ext4: group {} counts no directories, and one is freed", g);
                 return false;
             }
             desc.set_used_dirs_count(dirs - 1);

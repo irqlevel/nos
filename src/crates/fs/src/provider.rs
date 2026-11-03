@@ -6,7 +6,7 @@
 
 use crate::vfs_instance;
 use block::Disk;
-use kcore::trace;
+use kcore::klog;
 use mgmt::{Call, Kind, Method, Params, Provider, Status};
 
 struct Fs;
@@ -21,7 +21,7 @@ static METHODS: [Method; 1] = [Method { name: "mounts", kind: Kind::Read }];
 pub fn init() {
     match mgmt::register("fs", &METHODS, DESCRIPTOR, &FS) {
         Ok(registration) => core::mem::forget(registration),
-        Err(status) => trace!(0, "fs: cannot register the provider: {}", status.name()),
+        Err(status) => klog!(0, "fs: cannot register the provider: {}", status.name()),
     }
 }
 

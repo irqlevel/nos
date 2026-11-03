@@ -569,7 +569,7 @@ pub fn register_all() {
         match kcore::cmd::Command::register(name, help, move |args, out| handler(args, out)) {
             /* The command is the kernel's own and stays for good. */
             Ok(cmd) => core::mem::forget(cmd),
-            Err(_) => kcore::trace!(0, "fs: cannot register the {} command", name),
+            Err(_) => kcore::klog!(0, "fs: cannot register the {} command", name),
         }
     }
 }

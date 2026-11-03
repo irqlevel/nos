@@ -23,7 +23,7 @@ impl kmod::Module for Hello {}
 
 impl Drop for Hello {
     fn drop(&mut self) {
-        kcore::trace!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
+        kcore::klog!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
     }
 }
 
@@ -34,7 +34,7 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         let _ = writeln!(out, "hello, {} -- call {} since the module was loaded", who, calls);
     })?;
 
-    kcore::trace!(0, "hello: loaded");
+    kcore::klog!(0, "hello: loaded");
     Ok(Box::new(Hello { _cmd: cmd }))
 }
 

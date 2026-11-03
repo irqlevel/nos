@@ -1,6 +1,6 @@
 #![no_std]
 
-pub mod trace;
+pub mod klog;
 pub mod alloc;
 pub mod panic;
 pub mod time;

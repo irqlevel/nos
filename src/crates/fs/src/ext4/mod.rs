@@ -49,7 +49,7 @@ use extfmt::{group, Map};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::time::wall_clock_secs;
-use kcore::trace;
+use kcore::klog;
 
 use crate::vfs::{FileSystem, MapRun, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
@@ -96,7 +96,7 @@ pub struct Ext4 {
 fn read_super(dev: &Disk, scratch: &mut DmaBuffer) -> Option<Super> {
     let ss = dev.sector_size() as usize;
     if ss == 0 || ss > PAGE_SIZE || !ss.is_power_of_two() {
-        trace!(0, "ext4: a sector of {} bytes", ss);
+        klog!(0, "ext4: a sector of {} bytes", ss);
         return None;
     }
     let off = extfmt::sb::OFFSET as usize;
@@ -104,13 +104,13 @@ fn read_super(dev: &Disk, scratch: &mut DmaBuffer) -> Option<Super> {
     let count = (within + extfmt::sb::SIZE).div_ceil(ss);
     let buf = scratch.as_mut_slice();
     if count * ss > buf.len() || dev.read(start as u64, &mut buf[..count * ss]).is_err() {
-        trace!(0, "ext4: the superblock does not read");
+        klog!(0, "ext4: the superblock does not read");
         return None;
     }
     match Super::parse(&buf[within..within + extfmt::sb::SIZE]) {
         Ok(sb) => Some(sb),
         Err(e) => {
-            trace!(0, "ext4: {}", e);
+            klog!(0, "ext4: {}", e);
             None
         }
     }
@@ -210,7 +210,7 @@ impl Ext4 {
         } else {
             return true;
         };
-        trace!(0, "ext4: refused: {}", why);
+        klog!(0, "ext4: refused: {}", why);
         false
     }
 
@@ -222,13 +222,13 @@ impl Ext4 {
         let gdt_blocks = m.gdt_len() as usize;
         let mut gdt: Vec<Vec<u8>> = Vec::new();
         if gdt.try_reserve_exact(gdt_blocks).is_err() {
-            trace!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
+            klog!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
             return false;
         }
         for k in 0..gdt_blocks {
             let mut blk = Vec::new();
             if blk.try_reserve_exact(bs).is_err() {
-                trace!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
+                klog!(0, "ext4: no memory for {} blocks of descriptors", gdt_blocks);
                 return false;
             }
             blk.resize(bs, 0);
@@ -248,13 +248,13 @@ impl Ext4 {
             let Some(d) = m.desc(g) else { return false };
             if let Some(c) = group::desc_csum(&m.sb, g as u32, d.raw()) {
                 if c != d.checksum() {
-                    trace!(0, "ext4: refused: group {}'s descriptor fails its checksum", g);
+                    klog!(0, "ext4: refused: group {}'s descriptor fails its checksum", g);
                     return false;
                 }
             }
             let inside = |b: u64, n: u64| b >= base && b.checked_add(n).is_some_and(|e| e <= m.blocks);
             if !inside(d.block_bitmap(), 1) || !inside(d.inode_bitmap(), 1) || !inside(d.inode_table(), table_blocks) {
-                trace!(0, "ext4: refused: group {}'s bitmaps or table outside the filesystem, or on its superblock \
+                klog!(0, "ext4: refused: group {}'s bitmaps or table outside the filesystem, or on its superblock \
                            and descriptors", g);
                 return false;
             }
@@ -286,7 +286,7 @@ impl Ext4 {
         let m = self.m.as_ref()?;
         let (first, last) = (m.sb_block(), m.gdt_first() + m.gdt_len());
         if torn && !self.overlay.contains_key(&first) {
-            trace!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy of it");
+            klog!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy of it");
             return None;
         }
         if !(first..last).any(|b| self.overlay.contains_key(&b)) {
@@ -301,7 +301,7 @@ impl Ext4 {
             Ok(s) if s.blocks_count() == sb.blocks_count() && s.inodes_count() == sb.inodes_count()
                 && s.block_size() == sb.block_size() && s.checksum_ok() => s,
             _ => {
-                trace!(0, "ext4: refused: the journal's superblock is not this filesystem's");
+                klog!(0, "ext4: refused: the journal's superblock is not this filesystem's");
                 return None;
             }
         };
@@ -311,7 +311,7 @@ impl Ext4 {
             return None;
         }
         if let Support::Refused(why) = features::classify(&newer) {
-            trace!(0, "ext4: refused: the journal's superblock: {}", why);
+            klog!(0, "ext4: refused: the journal's superblock: {}", why);
             return None;
         }
         let mut m = Meta::new(&newer);
@@ -342,7 +342,7 @@ impl Ext4 {
         let mut ro_why: Option<String> = read_only.then(|| String::from("asked"));
         match features::classify(&sb) {
             Support::Refused(why) => {
-                trace!(0, "ext4: refused: {}", why);
+                klog!(0, "ext4: refused: {}", why);
                 return None;
             }
             Support::ReadOnly(why) => {
@@ -359,7 +359,7 @@ impl Ext4 {
          * write a sound one home, or a read through it find one. */
         let mut torn = !sb.checksum_ok() && sb.compat() & features::compat::HAS_JOURNAL != 0;
         if torn {
-            trace!(0, "ext4: the superblock fails its checksum: the journal's copy of it is wanted");
+            klog!(0, "ext4: the superblock fails its checksum: the journal's copy of it is wanted");
         }
         if sb.state() & STATE_ERROR != 0 {
             ro_why.get_or_insert_with(|| String::from("the filesystem says it has errors (e2fsck it)"));
@@ -373,7 +373,7 @@ impl Ext4 {
             journal_map = match journal::blocks(&mut self.reader()?, &sb) {
                 Ok(map) => map,
                 Err(e) => {
-                    trace!(0, "ext4: refused: the journal: {}", e);
+                    klog!(0, "ext4: refused: the journal: {}", e);
                     return None;
                 }
             };
@@ -384,12 +384,12 @@ impl Ext4 {
              * metadata. */
             let Some(m) = self.m.as_mut() else { return None };
             if !m.build_system_zone(&JournalMap::default()) {
-                trace!(0, "ext4: no memory for the system zone");
+                klog!(0, "ext4: no memory for the system zone");
                 self.reset();
                 return None;
             }
             if let Some((dev, n)) = journal_map.runs().find(|&(dev, n)| m.overlaps_system(dev, dev + n)) {
-                trace!(0, "ext4: refused: the journal's blocks {}..{} are the filesystem's own metadata", dev,
+                klog!(0, "ext4: refused: the journal's blocks {}..{} are the filesystem's own metadata", dev,
                        dev + n);
                 self.reset();
                 return None;
@@ -398,7 +398,7 @@ impl Ext4 {
             let errors: Vec<u8> = sb.raw()[ERR_FIELDS].to_vec();
             match Journal::open(&mut self.io, journal_map.clone(), &sb) {
                 Err(e) => {
-                    trace!(0, "ext4: refused: the journal: {}", e);
+                    klog!(0, "ext4: refused: the journal: {}", e);
                     self.io.writable = false;
                     return None;
                 }
@@ -414,7 +414,7 @@ impl Ext4 {
                         self.cache.clear();
                         let mut newer = read_super(&self.io.dev, &mut self.io.scratch)?;
                         if torn && !newer.checksum_ok() {
-                            trace!(0, "ext4: refused: the superblock fails its checksum, and the journal held no \
+                            klog!(0, "ext4: refused: the superblock fails its checksum, and the journal held no \
                                        copy of it");
                             self.reset();
                             return None;
@@ -423,7 +423,7 @@ impl Ext4 {
                         if newer.blocks_count() != sb.blocks_count() || newer.inodes_count() != sb.inodes_count()
                             || newer.block_size() != sb.block_size()
                             || features::classify(&newer) != Support::Writable {
-                            trace!(0, "ext4: refused: the replayed superblock is another filesystem's");
+                            klog!(0, "ext4: refused: the replayed superblock is another filesystem's");
                             self.reset();
                             return None;
                         }
@@ -454,7 +454,7 @@ impl Ext4 {
                             self.io.writable = false;
                         }
                     } else if torn {
-                        trace!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy \
+                        klog!(0, "ext4: refused: the superblock fails its checksum, and the journal holds no copy \
                                    of it");
                         self.reset();
                         return None;
@@ -473,13 +473,13 @@ impl Ext4 {
         }
         if let Some(why) = &ro_why {
             if why != "asked" {
-                trace!(0, "ext4: read-only: {}", why);
+                klog!(0, "ext4: read-only: {}", why);
             }
             if has_journal && self.jnl.is_none() {
                 match journal::overlay(&mut self.io, &journal_map, &sb) {
                     Ok(o) => self.overlay = o,
                     Err(e) => {
-                        trace!(0, "ext4: refused: the journal: {}", e);
+                        klog!(0, "ext4: refused: the journal: {}", e);
                         self.reset();
                         return None;
                     }
@@ -500,7 +500,7 @@ impl Ext4 {
             return None;
         };
         if Inode::new(&raw).is_none_or(|i| !i.is_dir()) {
-            trace!(0, "ext4: refused: the root is not a directory");
+            klog!(0, "ext4: refused: the root is not a directory");
             self.reset();
             return None;
         }
@@ -508,7 +508,7 @@ impl Ext4 {
             let now = wall_clock_secs() as u32;
             let Some(m) = self.m.as_mut() else { return None };
             if !m.build_system_zone(&journal_map) {
-                trace!(0, "ext4: no memory for the system zone");
+                klog!(0, "ext4: no memory for the system zone");
                 self.reset();
                 return None;
             }
@@ -521,17 +521,17 @@ impl Ext4 {
             let count = m.sb.mnt_count();
             m.sb.set_mnt_count(count.wrapping_add(1));
             if !self.write_super() {
-                trace!(0, "ext4: refused: the superblock does not write");
+                klog!(0, "ext4: refused: the superblock does not write");
                 self.reset();
                 return None;
             }
             match self.release_orphans() {
                 Ok(0) => {}
-                Ok(n) => trace!(0, "ext4: the orphan list released: {} inodes", n),
+                Ok(n) => klog!(0, "ext4: the orphan list released: {} inodes", n),
                 Err(why) => {
                     /* Left for whoever mounts it next: nothing more is
                      * written, the list as the last commit left it. */
-                    trace!(0, "ext4: read-only: {}", why);
+                    klog!(0, "ext4: read-only: {}", why);
                     if let Some(j) = self.jnl.as_mut() {
                         j.abort(&mut self.io, &why);
                     }
@@ -597,10 +597,10 @@ impl Ext4 {
                     m.sb.set_wtime(wall_clock_secs() as u32);
                 }
                 if !self.write_super() {
-                    trace!(0, "ext4: the superblock does not write at the unmount: left needing recovery");
+                    klog!(0, "ext4: the superblock does not write at the unmount: left needing recovery");
                 }
             } else {
-                trace!(0, "ext4: unmounted with the journal aborted: left for a replay");
+                klog!(0, "ext4: unmounted with the journal aborted: left for a replay");
             }
         }
         self.reset();
@@ -611,7 +611,7 @@ impl Ext4 {
             return true;
         }
         if self.jnl.as_ref().is_none_or(|j| j.aborted) {
-            trace!(0, "ext4: the journal is aborted: nothing is synced");
+            klog!(0, "ext4: the journal is aborted: nothing is synced");
             return false;
         }
         /* Every commit is on the medium already: its blocks flushed, its
@@ -628,7 +628,7 @@ impl Ext4 {
 
     fn new_vnode(&mut self, parent: Option<NodeId>, name: &[u8], kind: Kind, ino: u32, size: usize) -> Option<NodeId> {
         let Some(node) = self.tree.alloc(name, kind) else {
-            trace!(0, "ext4: no memory for a vnode");
+            klog!(0, "ext4: no memory for a vnode");
             return None;
         };
         {
@@ -668,7 +668,7 @@ impl Ext4 {
         let Some(raw) = self.inode(ino) else { return false };
         let Some(node) = Inode::new(&raw) else { return false };
         if !node.is_dir() {
-            trace!(0, "ext4: inode {} is not a directory", ino);
+            klog!(0, "ext4: inode {} is not a directory", ino);
             return false;
         }
         let Some(seed) = self.m.as_ref().map(|m| m.seed) else { return false };
@@ -707,7 +707,7 @@ impl Ext4 {
                 dir::tail(blk).is_some_and(|s| s == dir::leaf_csum(iseed, blk))
             };
             if !ok {
-                trace!(0, "ext4: block {} of directory {} fails its checksum", lblock, ino);
+                klog!(0, "ext4: block {} of directory {} fails its checksum", lblock, ino);
                 return false;
             }
         }
@@ -720,14 +720,14 @@ impl Ext4 {
                     }
                 }
                 Err(e) => {
-                    trace!(0, "ext4: {}", e);
+                    klog!(0, "ext4: {}", e);
                     return false;
                 }
             }
         }
         for (name, child, file_type) in entries {
             if name.len() >= NAME_MAX {
-                trace!(0, "ext4: a name of {} bytes in directory {} is too long, skipped", name.len(), ino);
+                klog!(0, "ext4: a name of {} bytes in directory {} is too long, skipped", name.len(), ino);
                 self.hide(ino);
                 continue;
             }
@@ -758,12 +758,12 @@ impl Ext4 {
         }
         let first_ino = self.m.as_ref().map_or(FIRST_INO_MIN, |m| m.first_ino);
         if ino != ROOT_INO && ino < first_ino {
-            trace!(0, "ext4: an entry of directory {} names inode {}, one of the filesystem's own: skipped",
+            klog!(0, "ext4: an entry of directory {} names inode {}, one of the filesystem's own: skipped",
                 self.tree[dir].ino, ino);
             return Some(false);
         }
         let Some(raw) = self.inode(ino) else {
-            trace!(0, "ext4: an entry of directory {} names inode {}, which does not read: skipped",
+            klog!(0, "ext4: an entry of directory {} names inode {}, which does not read: skipped",
                 self.tree[dir].ino, ino);
             return Some(false);
         };
@@ -774,12 +774,12 @@ impl Ext4 {
             _ => return Some(false),
         };
         if node.links_count() == 0 {
-            trace!(0, "ext4: an entry of directory {} names inode {}, which is deleted: skipped",
+            klog!(0, "ext4: an entry of directory {} names inode {}, which is deleted: skipped",
                 self.tree[dir].ino, ino);
             return Some(false);
         }
         if kind == Kind::File && node.size(self.largedir()) > self.max_size() {
-            trace!(0, "ext4: an entry of directory {} names inode {}, of {} bytes, more than a file here can be: \
+            klog!(0, "ext4: an entry of directory {} names inode {}, of {} bytes, more than a file here can be: \
                        skipped", self.tree[dir].ino, ino, node.size(self.largedir()));
             return Some(false);
         }
@@ -788,7 +788,7 @@ impl Ext4 {
             let mut up = Some(dir);
             while let Some(at) = up {
                 if self.tree[at].ino == ino as usize {
-                    trace!(0, "ext4: an entry of inode {} is an ancestor, skipped", self.tree[dir].ino);
+                    klog!(0, "ext4: an entry of inode {} is an ancestor, skipped", self.tree[dir].ino);
                     return Some(false);
                 }
                 up = self.tree[at].parent();
@@ -1075,7 +1075,7 @@ pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {
     let Some(dev) = Disk::from_handle(device) else { return -1 };
     let Some(vfs) = crate::vfs_instance() else { return -1 };
     let Some(fs) = Ext4::new(dev) else {
-        trace!(0, "ext4: no memory for the filesystem");
+        klog!(0, "ext4: no memory for the filesystem");
         return -1;
     };
     match vfs.mount(path.as_bytes(), Box::new(fs), read_only) {

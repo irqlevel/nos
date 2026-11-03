@@ -8,7 +8,7 @@ pub mod const_init;
 pub mod consts;
 pub mod crc32;
 pub mod error;
-pub mod trace;
+pub mod klog;
 pub mod time;
 pub mod sync;
 pub mod task;
@@ -45,10 +45,10 @@ pub mod vnic;
 pub mod tco_wdt;
 
 #[macro_export]
-macro_rules! trace {
+macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
         use core::fmt::Write;
-        let mut buf = $crate::trace::__TraceBuf::new();
+        let mut buf = $crate::klog::__KlogBuf::new();
         let f = file!();
         let fname = match f.rfind('/') {
             Some(i) => &f[i + 1..],
@@ -56,6 +56,6 @@ macro_rules! trace {
         };
         let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
         let _ = write!(buf, $($arg)*);
-        $crate::trace::trace($level, buf.as_str());
+        $crate::klog::klog($level, buf.as_str());
     }};
 }

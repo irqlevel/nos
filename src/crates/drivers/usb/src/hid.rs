@@ -11,7 +11,7 @@
 //! previous report, and auto-repeat is synthesised here because a boot
 //! keyboard never repeats on its own.
 
-use kcore::trace;
+use kcore::klog;
 
 /// The per-subsystem trace level, as `kernel/trace.h` has it for KBD_LL.
 const KBD_LL: u32 = 3;
@@ -213,7 +213,7 @@ impl BootKeyboard {
         }
 
         if let Some(seq) = arrow_sequence(usage) {
-            trace!(KBD_LL, "UsbKbd: usage 0x{:X} arrow", usage);
+            klog!(KBD_LL, "UsbKbd: usage 0x{:X} arrow", usage);
             for &b in seq {
                 kcore::input::key(b, entry.ps2);
             }
@@ -241,7 +241,7 @@ impl BootKeyboard {
             c &= CTRL_MASK;
         }
 
-        trace!(KBD_LL, "UsbKbd: usage 0x{:X} char {}", usage, c as char);
+        klog!(KBD_LL, "UsbKbd: usage 0x{:X} char {}", usage, c as char);
         kcore::input::key(c, entry.ps2);
         true
     }

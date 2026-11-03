@@ -2,7 +2,7 @@
 #include "acpi.h"
 
 #include <arch/x86_64/asm.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 
 namespace kernel
 {
@@ -101,7 +101,7 @@ bool Rtc::read_time(RtcTime& t)
     else
         t.year = DEFAULT_CENTURY + yr1;
 
-    trace(0, "RTC: %lu-%lu-%lu %lu:%lu:%lu",
+    klog(0, "RTC: %lu-%lu-%lu %lu:%lu:%lu",
         (ulong)t.year, (ulong)t.month, (ulong)t.day,
         (ulong)t.hour, (ulong)t.minute, (ulong)t.second);
 

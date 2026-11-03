@@ -64,7 +64,7 @@ impl Log {
             || old.try_reserve(folder.len() + FILE.len() + OLD_SUFFIX.len() + 1).is_err()
             || name.try_reserve(24).is_err()
         {
-            kcore::trace!(0, "hv: vm {} keeps no console.log -- out of memory", id);
+            kcore::klog!(0, "hv: vm {} keeps no console.log -- out of memory", id);
             return None;
         }
         let _ = write!(path, "{}/{}", folder, FILE);
@@ -74,7 +74,7 @@ impl Log {
         match kcore::task::spawn_with(&name, job.clone(), write_log) {
             Some(task) => Some(Log { job, task: Some(task) }),
             None => {
-                kcore::trace!(0, "hv: vm {} keeps no console.log -- no task for it", id);
+                kcore::klog!(0, "hv: vm {} keeps no console.log -- no task for it", id);
                 None
             }
         }
@@ -94,7 +94,7 @@ impl Log {
 fn write_log(job: Arc<Job>) {
     let mut w = Writer { job: &job, at: 0, buf: Vec::new(), failed: false };
     if w.buf.try_reserve_exact(CHUNK).is_err() {
-        kcore::trace!(0, "hv: vm {} keeps no console.log -- out of memory", job.id);
+        kcore::klog!(0, "hv: vm {} keeps no console.log -- out of memory", job.id);
         return;
     }
     loop {
@@ -190,7 +190,7 @@ impl Writer<'_> {
             Ok(()) => self.failed = false,
             Err(_) if !self.failed => {
                 self.failed = true;
-                kcore::trace!(0, "hv: vm {}: {} is not being written -- what the guest prints meanwhile is not \
+                kcore::klog!(0, "hv: vm {}: {} is not being written -- what the guest prints meanwhile is not \
                                   in it", job.id, job.path);
             }
             Err(_) => {}

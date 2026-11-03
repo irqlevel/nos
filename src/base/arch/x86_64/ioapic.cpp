@@ -2,7 +2,7 @@
 #include <drivers/acpi.h>
 
 #include "asm.h"
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <mm/mmio.h>
 #include <lib/lock.h>
 
@@ -14,7 +14,7 @@ IoApic::IoApic()
 {
     base_address_ = Acpi::get_instance().get_io_apic_address();
 
-    trace(IO_APIC_LL, "IO Apic addr 0x%p", base_address_);
+    klog(IO_APIC_LL, "IO Apic addr 0x%p", base_address_);
 }
 
 IoApic::~IoApic()
@@ -58,7 +58,7 @@ void IoApic::enable()
         set_entry(i, 1 << MASKED_SHIFT);
     }
 
-    trace(IO_APIC_LL, "IO Apic ver 0x%X pins %lu", ver, pins);
+    klog(IO_APIC_LL, "IO Apic ver 0x%X pins %lu", ver, pins);
 }
 
 void IoApic::set_entry(u8 index, u64 data)
@@ -77,7 +77,7 @@ u64 IoApic::check_dest(u8 irq, u64 apic_id)
     /* Never silently alias onto whatever apic id the low four bits happen to
        name -- that is how an interrupt goes missing for good. Fall back to
        the boot CPU, which is always addressable, and say so. */
-    trace(0, "IoApic: irq 0x%lX apic_id %lu exceeds physical destination range %lu, using 0",
+    klog(0, "IoApic: irq 0x%lX apic_id %lu exceeds physical destination range %lu, using 0",
         (ulong)irq, (ulong)apic_id, (ulong)MAX_PHYSICAL_DEST);
 
     return 0;
@@ -98,7 +98,7 @@ void IoApic::set_irq(u8 irq, u64 apic_id, u8 vector)
     data |= 0 << MASKED_SHIFT; // disable: no
     data |= apic_id << DEST_SHIFT; //destination id
 
-    trace(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX",
+    klog(IO_APIC_LL, "set_irq irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX",
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data);
 
     set_entry(irq, data);
@@ -133,7 +133,7 @@ void IoApic::set_irq_level(u8 irq, u64 apic_id, u8 vector, bool active_high)
     data |= 0 << MASKED_SHIFT; // disable: no
     data |= apic_id << DEST_SHIFT; //destination id
 
-    trace(IO_APIC_LL, "set_irq_level irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX active_high %lu",
+    klog(IO_APIC_LL, "set_irq_level irq 0x%lX apic_id 0x%lX vector 0x%lX data 0x%lX active_high %lu",
         (ulong)irq, (ulong)apic_id, (ulong)vector, (ulong)data, (ulong)active_high);
 
     set_entry(irq, data);

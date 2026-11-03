@@ -1,7 +1,7 @@
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/mmu.h>
 
 #include "board.h"
@@ -104,7 +104,7 @@ void BuiltinPageTable::map_high_ram()
 
     if (ram_end > top_limit)
     {
-        trace(0, "mm: usable RAM ends at 0x%lX, past what one L1 table covers",
+        klog(0, "mm: usable RAM ends at 0x%lX, past what one L1 table covers",
             ram_end);
         ram_end = top_limit;
     }
@@ -134,7 +134,7 @@ void BuiltinPageTable::map_high_ram()
         return;
 
     mapped_limit_ = ram_end;
-    trace(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
+    klog(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
         mapped_limit_, blocks);
 }
 

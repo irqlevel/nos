@@ -25,7 +25,7 @@ use extfmt::features::ro_compat;
 use extfmt::group::{self, Desc, DescMut};
 use extfmt::sb::Super;
 use extfmt::{dir, extent, inode as xinode, xattr};
-use kcore::trace;
+use kcore::klog;
 
 use super::cache::Cache;
 use super::io::Io;
@@ -145,11 +145,11 @@ impl<'a> Txn<'a> {
     /// Room for one more block, or why not.
     fn admit(&mut self, b: u64) -> bool {
         if self.freed.contains(b) {
-            trace!(0, "ext4: block {} changed after it was freed in the same transaction: refused", b);
+            klog!(0, "ext4: block {} changed after it was freed in the same transaction: refused", b);
             return false;
         }
         if self.dirty.len() >= self.jnl.max_txn {
-            trace!(0, "ext4: a transaction of more than {} blocks, more than the journal takes at once: refused",
+            klog!(0, "ext4: a transaction of more than {} blocks, more than the journal takes at once: refused",
                 self.jnl.max_txn);
             return false;
         }
@@ -177,7 +177,7 @@ impl<'a> Txn<'a> {
         }
         let d = self.dirty.get_mut(&b)?;
         if d.kind != kind {
-            trace!(0, "ext4: block {} changed as {:?} and as {:?} in one transaction: refused", b, d.kind, kind);
+            klog!(0, "ext4: block {} changed as {:?} and as {:?} in one transaction: refused", b, d.kind, kind);
             return None;
         }
         Some(&mut d.data)
@@ -187,7 +187,7 @@ impl<'a> Txn<'a> {
     /// home holds.
     pub fn fresh(&mut self, b: u64, kind: Kind) -> Option<&mut [u8]> {
         if self.dirty.contains_key(&b) {
-            trace!(0, "ext4: block {} allocated twice in one transaction", b);
+            klog!(0, "ext4: block {} allocated twice in one transaction", b);
             return None;
         }
         if !self.admit(b) {
@@ -270,7 +270,7 @@ impl<'a> Txn<'a> {
             s.set_ro_compat(features);
         });
         if set {
-            trace!(1, "ext4: a file of 2 GiB or more: large_file set");
+            klog!(1, "ext4: a file of 2 GiB or more: large_file set");
         }
         set
     }
@@ -300,7 +300,7 @@ impl<'a> Txn<'a> {
                 _ => false,
             };
             if !ok {
-                trace!(0, "ext4: the bitmap in block {} cannot be sealed", b);
+                klog!(0, "ext4: the bitmap in block {} cannot be sealed", b);
                 return false;
             }
         }
@@ -338,7 +338,7 @@ impl<'a> Txn<'a> {
                 Kind::BlockBitmap(_) | Kind::InodeBitmap(_) | Kind::Inodes => true,
             };
             if !ok {
-                trace!(0, "ext4: block {}, a {:?}, cannot carry its checksum", b, d.kind);
+                klog!(0, "ext4: block {}, a {:?}, cannot carry its checksum", b, d.kind);
                 return false;
             }
         }

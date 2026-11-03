@@ -43,9 +43,9 @@ macro_rules! invariant {
     };
 }
 
-/// `kcore::trace!`: the formatting checked, the line dropped.
+/// `kcore::klog!`: the formatting checked, the line dropped.
 #[macro_export]
-macro_rules! trace {
+macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
         let _ = $level;
         let _ = format_args!($($arg)*);
@@ -90,8 +90,8 @@ pub mod pvh;
 #[path = "../../../src/crates/hv/src/mmio.rs"]
 pub mod mmio;
 /// NAT, from the net crate: what a guest's packets for the world, and the
-/// world's answers, go through. Its `use kcore::trace` is the kernel's macro;
-/// here `trace!` is the one above, in scope already, and the import unused.
+/// world's answers, go through. Its `use kcore::klog` is the kernel's macro;
+/// here `klog!` is the one above, in scope already, and the import unused.
 #[allow(unused_imports)]
 #[path = "../../../src/crates/net/src/nat.rs"]
 pub mod nat;

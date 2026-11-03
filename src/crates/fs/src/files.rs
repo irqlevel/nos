@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use kcore::cmd::Output;
-use kcore::trace;
+use kcore::klog;
 
 use crate::paths::Path;
 use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_WRITE};
@@ -94,7 +94,7 @@ pub fn read_file(path: &str, out: &mut Output) -> bool {
     let mut buf = match buffer(READ_CHUNK) {
         Some(buf) => buf,
         None => {
-            trace!(0, "fs: read_file: no memory for a {} byte buffer", READ_CHUNK);
+            klog!(0, "fs: read_file: no memory for a {} byte buffer", READ_CHUNK);
             let _ = writeln!(out, "read failed");
             return false;
         }
@@ -160,7 +160,7 @@ pub fn replace_file(path: &str, data: &[u8]) -> bool {
 
     if let Some(st) = stat(vfs, path.as_bytes()) {
         if st.kind != Kind::File {
-            trace!(0, "fs: replace_file: {} is not a file", path);
+            klog!(0, "fs: replace_file: {} is not a file", path);
             return false;
         }
     }

@@ -13,7 +13,7 @@
 #include <kernel/raw_spin_lock.h>
 #include <kernel/spin_lock.h>
 #include <kernel/time.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/stdlib.h>
 
 #include "fuzz.h"
@@ -214,17 +214,17 @@ namespace kernel
 
 /* ---- the tracer: its lines on stderr under --trace ---- */
 
-Tracer::Tracer()
+Klog::Klog()
     : level_(0)
     , console_suppressed_(false)
 {
 }
 
-Tracer::~Tracer()
+Klog::~Klog()
 {
 }
 
-void Tracer::output(const char* fmt, ...)
+void Klog::output(const char* fmt, ...)
 {
     char line[1024];
     va_list args;
@@ -235,7 +235,7 @@ void Tracer::output(const char* fmt, ...)
         fputs(line, stderr);
 }
 
-void Tracer::output(stdlib::Error& err, const char* fmt, ...)
+void Klog::output(stdlib::Error& err, const char* fmt, ...)
 {
     (void)err;
     char line[1024];
@@ -247,24 +247,24 @@ void Tracer::output(stdlib::Error& err, const char* fmt, ...)
         fputs(line, stderr);
 }
 
-void Tracer::set_level(int level)
+void Klog::set_level(int level)
 {
     level_ = level;
 }
 
-int Tracer::get_level()
+int Klog::get_level()
 {
     /* Every line formatted, whatever it would have been: a trace a level
        hides is still a call whose arguments must be sound. */
-    return MAX_TRACE_LEVEL;
+    return MAX_LOG_LEVEL;
 }
 
-void Tracer::set_console_suppressed(bool suppressed)
+void Klog::set_console_suppressed(bool suppressed)
 {
     console_suppressed_ = suppressed;
 }
 
-bool Tracer::is_console_suppressed()
+bool Klog::is_console_suppressed()
 {
     return console_suppressed_;
 }

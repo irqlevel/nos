@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use crate::nic::Nic;
-use kcore::trace;
+use kcore::klog;
 use tls::TlsStream;
 
 use crate::abi;
@@ -639,7 +639,7 @@ fn recv_response(
         }
 
         if total >= MAX_HEADER {
-            trace!(0, "http: headers larger than {} bytes", MAX_HEADER);
+            klog!(0, "http: headers larger than {} bytes", MAX_HEADER);
             return None;
         }
 
@@ -653,7 +653,7 @@ fn recv_response(
         } else if got == 0 {
             eof = true;
         } else {
-            trace!(0, "http: nothing more arrived while waiting for the headers");
+            klog!(0, "http: nothing more arrived while waiting for the headers");
             return None;
         }
     }
@@ -669,7 +669,7 @@ fn recv_response(
              * Taken for the body, a response cut in its headers -- by the
              * connection, or by a TLS session that broke -- came out as a
              * body made of its own status line, and "ok". */
-            trace!(0, "http: the connection ended inside the headers, {} bytes in", total);
+            klog!(0, "http: the connection ended inside the headers, {} bytes in", total);
             return None;
         }
     };
@@ -686,7 +686,7 @@ fn recv_response(
         if len >= MAX_URL_LEN {
             /* Following a cut-down target would fetch some other URL */
             if matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
-                trace!(0, "http: the {} redirect's target is longer than {} characters",
+                klog!(0, "http: the {} redirect's target is longer than {} characters",
                     resp.status, MAX_URL_LEN - 1);
                 resp.url_too_long = 1;
                 resp.ok = 1;
@@ -722,7 +722,7 @@ fn recv_response(
         } else if got == 0 {
             eof = true;
         } else {
-            trace!(0, "http: nothing more arrived after {} bytes of body",
+            klog!(0, "http: nothing more arrived after {} bytes of body",
                 body.writer.written);
             recv_failed = true;
             break;
@@ -746,7 +746,7 @@ fn exchange(
     let parsed = match parse_url(url) {
         Some(parsed) => parsed,
         None => {
-            trace!(0, "http: that is not a url this client can fetch");
+            klog!(0, "http: that is not a url this client can fetch");
             resp.failure = Failure::Url;
             return 0;
         }
@@ -755,7 +755,7 @@ fn exchange(
     let ip = match resolve(parsed.host()) {
         Some(ip) => ip,
         None => {
-            trace!(0, "http: the host could not be resolved");
+            klog!(0, "http: the host could not be resolved");
             resp.failure = Failure::Resolve;
             return 0;
         }
@@ -766,7 +766,7 @@ fn exchange(
     let conn = match TCP.connect(nic, ip, parsed.port, 0, Receive::Bulk) {
         Some(conn) => conn,
         None => {
-            trace!(0, "http: the connection could not be made");
+            klog!(0, "http: the connection could not be made");
             resp.failure = Failure::Connect;
             return 0;
         }
@@ -781,7 +781,7 @@ fn exchange(
         match session {
             Some(stream) => Transport::Tls(stream),
             None => {
-                trace!(0, "http: the tls handshake was refused");
+                klog!(0, "http: the tls handshake was refused");
                 resp.tls_failed = 1;
                 resp.failure = Failure::Tls;
                 TCP.close(conn);
@@ -797,12 +797,12 @@ fn exchange(
         match recv_response(&mut transport, sink, resp, location) {
             Some(len) => redirect_len = len,
             None => {
-                trace!(0, "http: no answer to the request");
+                klog!(0, "http: no answer to the request");
                 resp.failure = Failure::Answer;
             }
         }
     } else {
-        trace!(0, "http: the request could not be sent");
+        klog!(0, "http: the request could not be sent");
         resp.failure = Failure::Answer;
     }
 
@@ -821,7 +821,7 @@ pub fn get_with_location(
     let mut resp = Response::new();
 
     if url.is_empty() || url.len() >= MAX_URL_LEN {
-        trace!(0, "http: a url longer than {} characters", MAX_URL_LEN - 1);
+        klog!(0, "http: a url longer than {} characters", MAX_URL_LEN - 1);
         resp.url_too_long = 1;
         resp.failure = Failure::Url;
         return resp;
@@ -850,7 +850,7 @@ pub fn get_with_location(
         }
 
         if attempt == MAX_REDIRECTS {
-            trace!(0, "http: too many redirects");
+            klog!(0, "http: too many redirects");
             resp = Response::new();
             resp.failure = Failure::Redirects;
             break;
@@ -859,7 +859,7 @@ pub fn get_with_location(
         /* Only an absolute http:// or https:// target is followed */
         let target = &location[..redirect_len];
         if !target.starts_with(b"http://") && !target.starts_with(b"https://") {
-            trace!(0, "http: the {} redirect does not lead to http", resp.status);
+            klog!(0, "http: the {} redirect does not lead to http", resp.status);
             break;
         }
 

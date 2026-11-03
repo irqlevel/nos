@@ -23,7 +23,7 @@ use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::time::boot_time_ns;
-use kcore::trace;
+use kcore::klog;
 
 /// Jobs not done, at most: a fifth is refused (Busy).
 pub const MAX_RUNNING: usize = 4;
@@ -430,7 +430,7 @@ pub(crate) fn stop_all() {
         let now = boot_time_ns();
         if now.saturating_sub(said) >= 10 * NS_PER_SEC {
             said = now;
-            trace!(0, "mgmt: the halt has waited {} s for job {} ({}.{}) to stop",
+            klog!(0, "mgmt: the halt has waited {} s for job {} ({}.{}) to stop",
                    now.saturating_sub(start) / NS_PER_SEC, r.id, r.provider, r.method);
         }
         kcore::task::sleep_ms(10);

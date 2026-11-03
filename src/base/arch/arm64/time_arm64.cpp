@@ -1,5 +1,5 @@
 #include <kernel/time.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <mm/memory_map.h>
 
 #include "board.h"
@@ -51,7 +51,7 @@ void time_init()
         freq_hz = read_cntfrq();
         boot_count = read_cntvct();
     }
-    trace(0, "time_init: generic timer freq %lu Hz", freq_hz);
+    klog(0, "time_init: generic timer freq %lu Hz", freq_hz);
 
     /* PL031 RTC: seconds since the Unix epoch (QEMU virt), through the
        premapped device GiB. The x86 twin reads the CMOS RTC. */
@@ -63,7 +63,7 @@ void time_init()
         ulong booted_secs = count_to_ns(read_cntvct() - boot_count) /
             consts::NANO_SECS_IN_SEC;
         boot_epoch_secs = now - booted_secs;
-        trace(0, "time_init: rtc epoch %lu", (ulong)now);
+        klog(0, "time_init: rtc epoch %lu", (ulong)now);
     }
 }
 

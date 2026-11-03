@@ -16,7 +16,7 @@ pub mod pci;
 pub mod queue;
 pub mod transport;
 
-use kcore::trace;
+use kcore::klog;
 
 pub use queue::{Buf, Queue, MAX_DESCRIPTORS};
 pub use transport::{
@@ -43,7 +43,7 @@ pub mod device {
 pub fn setup_queue(transport: &dyn Transport, index: u16, msix: Option<u16>) -> Option<Queue> {
     let size = transport.select_queue(index);
     if size == 0 {
-        trace!(0, "virtio: queue {} is not there", index);
+        klog!(0, "virtio: queue {} is not there", index);
         return None;
     }
 

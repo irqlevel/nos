@@ -1,5 +1,5 @@
-pub use ffi::trace::trace;
-pub use ffi::trace::__TraceBuf;
+pub use ffi::klog::klog;
+pub use ffi::klog::__KlogBuf;
 
 /// Whether a panic has started. What tells code to stop waiting for locks:
 /// another CPU may hold one and is on its way to a halt.

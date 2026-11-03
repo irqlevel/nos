@@ -1,4 +1,4 @@
-#include "trace.h"
+#include "klog.h"
 #include "debug.h"
 #include "task.h"
 #include "sched.h"
@@ -35,19 +35,19 @@ static const ulong TAG = 'Test';
 
 stdlib::Error test_allocator()
 {
-    trace(0, "test_allocator: started");
+    klog(0, "test_allocator: started");
 
     for (size_t size = 1; size <= 8 * consts::PAGE_SIZE; size++)
     {
         if (size % 500 == 0)
         {
-            trace(0, "test_allocator: alloc size %lu", size);
+            klog(0, "test_allocator: alloc size %lu", size);
         }
 
         u8 *block = new (mm::NO_THROW) u8[size];
         if (block == nullptr)
         {
-            trace(0, "test_allocator: alloc failed at size %lu", size);
+            klog(0, "test_allocator: alloc failed at size %lu", size);
             return stdlib::Error::NO_MEMORY;
         }
 
@@ -57,13 +57,13 @@ stdlib::Error test_allocator()
         delete [] block;
     }
 
-    trace(0, "test_allocator: complete");
+    klog(0, "test_allocator: complete");
     return make_error(stdlib::Error::SUCCESS);
 }
 
 stdlib::Error test_ring_buffer()
 {
-    trace(0, "test_ring_buffer: started");
+    klog(0, "test_ring_buffer: started");
 
     stdlib::RingBuffer<u8, 3> rb;
 
@@ -124,7 +124,7 @@ static __attribute__((noinline)) size_t capture_at_depth3()
 
 stdlib::Error test_stack_trace()
 {
-    trace(0, "test_stack_trace: started");
+    klog(0, "test_stack_trace: started");
 
     ulong frames[20];
     size_t count;
@@ -201,13 +201,13 @@ stdlib::Error test_stack_trace()
             return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_stack_trace: complete");
+    klog(0, "test_stack_trace: complete");
     return make_success();
 }
 
 stdlib::Error test_parse_ulong()
 {
-    trace(0, "test_parse_ulong: started");
+    klog(0, "test_parse_ulong: started");
 
     ulong val;
 
@@ -240,7 +240,7 @@ stdlib::Error test_parse_ulong()
     if (stdlib::parse_ulong(" 5", val))
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_parse_ulong: complete");
+    klog(0, "test_parse_ulong: complete");
     return make_success();
 }
 
@@ -252,7 +252,7 @@ stdlib::Error test_parse_ulong()
    into its own instance, never the one the kernel booted with. */
 stdlib::Error test_parameters()
 {
-    trace(0, "test_parameters: started");
+    klog(0, "test_parameters: started");
 
     Parameters label;
     label.parse("dhcp=auto root=LABEL=nosenv");
@@ -320,13 +320,13 @@ stdlib::Error test_parameters()
         !long_line.is_dhcp_auto() || !long_line.is_dns_enabled())
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_parameters: complete");
+    klog(0, "test_parameters: complete");
     return make_success();
 }
 
 stdlib::Error test_hex_char_to_nibble()
 {
-    trace(0, "test_hex_char_to_nibble: started");
+    klog(0, "test_hex_char_to_nibble: started");
 
     /* Decimal digits */
     for (char c = '0'; c <= '9'; c++)
@@ -357,13 +357,13 @@ stdlib::Error test_hex_char_to_nibble()
     if (stdlib::hex_char_to_nibble('\0') != 0xFF)
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_hex_char_to_nibble: complete");
+    klog(0, "test_hex_char_to_nibble: complete");
     return make_success();
 }
 
 stdlib::Error test_hex_decode()
 {
-    trace(0, "test_hex_decode: started");
+    klog(0, "test_hex_decode: started");
 
     u8 out[16];
     ulong written;
@@ -418,13 +418,13 @@ stdlib::Error test_hex_decode()
     if (written != 2)
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_hex_decode: complete");
+    klog(0, "test_hex_decode: complete");
     return make_success();
 }
 
 stdlib::Error test_next_token()
 {
-    trace(0, "test_next_token: started");
+    klog(0, "test_next_token: started");
 
     const char* end;
     const char* tok;
@@ -487,7 +487,7 @@ stdlib::Error test_next_token()
     if (stdlib::str_cmp(tiny, "lon") != 0)
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_next_token: complete");
+    klog(0, "test_next_token: complete");
     return make_success();
 }
 
@@ -499,15 +499,15 @@ extern "C" int rust_block_selftest();
 
 static stdlib::Error test_block_device_table()
 {
-    trace(0, "test_block_device_table: started");
+    klog(0, "test_block_device_table: started");
 
     if (rust_block_selftest() != 0)
     {
-        trace(0, "test_block_device_table: failed");
+        klog(0, "test_block_device_table: failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_block_device_table: complete");
+    klog(0, "test_block_device_table: complete");
     return make_success();
 }
 
@@ -515,29 +515,29 @@ stdlib::Error test_contiguous_pages()
 {
     auto& pt = mm::PageTable::get_instance();
 
-    trace(0, "test_contiguous_pages: started");
+    klog(0, "test_contiguous_pages: started");
 
     /* count=0 must fail */
     if (pt.alloc_contiguous_pages(0) != nullptr)
     {
-        trace(0, "test_contiguous_pages: count=0 should fail");
+        klog(0, "test_contiguous_pages: count=0 should fail");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Alloc 1 page */
     ulong free_before = pt.get_free_pages_count();
-    trace(0, "test_contiguous_pages: free pages before %lu", free_before);
+    klog(0, "test_contiguous_pages: free pages before %lu", free_before);
 
     mm::Page* p1 = pt.alloc_contiguous_pages(1);
     if (!p1)
     {
-        trace(0, "test_contiguous_pages: alloc 1 page failed");
+        klog(0, "test_contiguous_pages: alloc 1 page failed");
         return make_error(stdlib::Error::NO_MEMORY);
     }
 
     if (pt.get_free_pages_count() != free_before - 1)
     {
-        trace(0, "test_contiguous_pages: free count mismatch after alloc 1");
+        klog(0, "test_contiguous_pages: free count mismatch after alloc 1");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -545,7 +545,7 @@ stdlib::Error test_contiguous_pages()
     ulong va1 = pt.tmp_map_page(p1->get_phy_address());
     if (!va1)
     {
-        trace(0, "test_contiguous_pages: tmp_map_page failed");
+        klog(0, "test_contiguous_pages: tmp_map_page failed");
         pt.free_page(p1);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
@@ -555,7 +555,7 @@ stdlib::Error test_contiguous_pages()
     {
         if (ptr1[i] != 0xAB)
         {
-            trace(0, "test_contiguous_pages: pattern mismatch at %lu", i);
+            klog(0, "test_contiguous_pages: pattern mismatch at %lu", i);
             pt.tmp_unmap_page(va1);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
@@ -565,7 +565,7 @@ stdlib::Error test_contiguous_pages()
     pt.free_page(p1);
     if (pt.get_free_pages_count() != free_before)
     {
-        trace(0, "test_contiguous_pages: free count mismatch after free 1");
+        klog(0, "test_contiguous_pages: free count mismatch after free 1");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -574,25 +574,25 @@ stdlib::Error test_contiguous_pages()
     mm::Page* p4 = pt.alloc_contiguous_pages(4);
     if (!p4)
     {
-        trace(0, "test_contiguous_pages: alloc 4 pages failed");
+        klog(0, "test_contiguous_pages: alloc 4 pages failed");
         return make_error(stdlib::Error::NO_MEMORY);
     }
 
     if (pt.get_free_pages_count() != free_before4 - 4)
     {
-        trace(0, "test_contiguous_pages: free count mismatch after alloc 4");
+        klog(0, "test_contiguous_pages: free count mismatch after alloc 4");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Verify physical contiguity */
     ulong base_phys = p4->get_phy_address();
-    trace(0, "test_contiguous_pages: 4 pages at phys 0x%lX", base_phys);
+    klog(0, "test_contiguous_pages: 4 pages at phys 0x%lX", base_phys);
     mm::Page* page_array = p4;
     for (ulong j = 0; j < 4; j++)
     {
         if (page_array[j].get_phy_address() != base_phys + j * consts::PAGE_SIZE)
         {
-            trace(0, "test_contiguous_pages: page %lu phys 0x%lX expected 0x%lX",
+            klog(0, "test_contiguous_pages: page %lu phys 0x%lX expected 0x%lX",
                 j, page_array[j].get_phy_address(), base_phys + j * consts::PAGE_SIZE);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
@@ -617,7 +617,7 @@ stdlib::Error test_contiguous_pages()
         {
             if (ptr[i] != expected)
             {
-                trace(0, "test_contiguous_pages: page %lu byte %lu: 0x%lX expected 0x%lX",
+                klog(0, "test_contiguous_pages: page %lu byte %lu: 0x%lX expected 0x%lX",
                     j, i, (ulong)ptr[i], (ulong)expected);
                 pt.tmp_unmap_page(va);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
@@ -634,7 +634,7 @@ stdlib::Error test_contiguous_pages()
 
     if (pt.get_free_pages_count() != free_before4)
     {
-        trace(0, "test_contiguous_pages: free count mismatch after free 4: %lu expected %lu",
+        klog(0, "test_contiguous_pages: free count mismatch after free 4: %lu expected %lu",
             pt.get_free_pages_count(), free_before4);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
@@ -646,13 +646,13 @@ stdlib::Error test_contiguous_pages()
         mm::Page* pages = pt.alloc_contiguous_pages(2);
         if (!pages)
         {
-            trace(0, "test_contiguous_pages: round %lu alloc failed", round);
+            klog(0, "test_contiguous_pages: round %lu alloc failed", round);
             return make_error(stdlib::Error::NO_MEMORY);
         }
 
         if (pages[1].get_phy_address() != pages[0].get_phy_address() + consts::PAGE_SIZE)
         {
-            trace(0, "test_contiguous_pages: round %lu not contiguous", round);
+            klog(0, "test_contiguous_pages: round %lu not contiguous", round);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -661,18 +661,18 @@ stdlib::Error test_contiguous_pages()
 
         if (pt.get_free_pages_count() != free_now)
         {
-            trace(0, "test_contiguous_pages: round %lu free count mismatch", round);
+            klog(0, "test_contiguous_pages: round %lu free count mismatch", round);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    trace(0, "test_contiguous_pages: complete");
+    klog(0, "test_contiguous_pages: complete");
     return make_success();
 }
 
 stdlib::Error test_page_allocator()
 {
-    trace(0, "test_page_allocator: started");
+    klog(0, "test_page_allocator: started");
 
     auto& pt = mm::PageTable::get_instance();
 
@@ -682,12 +682,12 @@ stdlib::Error test_page_allocator()
         void* ptr = mm::alloc_map_pages(1, &phys_addr);
         if (!ptr)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(1) failed");
+            klog(0, "test_page_allocator: alloc_map_pages(1) failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         if (phys_addr == 0)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(1) phys_addr is 0");
+            klog(0, "test_page_allocator: alloc_map_pages(1) phys_addr is 0");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -697,7 +697,7 @@ stdlib::Error test_page_allocator()
         {
             if (p[i] != 0xAA)
             {
-                trace(0, "test_page_allocator: alloc_map_pages(1) mismatch at %lu", i);
+                klog(0, "test_page_allocator: alloc_map_pages(1) mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -711,12 +711,12 @@ stdlib::Error test_page_allocator()
         void* ptr = mm::alloc_map_pages(2, &phys_addr);
         if (!ptr)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(2) failed");
+            klog(0, "test_page_allocator: alloc_map_pages(2) failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         if (phys_addr == 0)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(2) phys_addr is 0");
+            klog(0, "test_page_allocator: alloc_map_pages(2) phys_addr is 0");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -728,7 +728,7 @@ stdlib::Error test_page_allocator()
         {
             if (p[i] != 0xBB)
             {
-                trace(0, "test_page_allocator: alloc_map_pages(2) page0 mismatch at %lu", i);
+                klog(0, "test_page_allocator: alloc_map_pages(2) page0 mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -736,7 +736,7 @@ stdlib::Error test_page_allocator()
         {
             if (p[consts::PAGE_SIZE + i] != 0xCC)
             {
-                trace(0, "test_page_allocator: alloc_map_pages(2) page1 mismatch at %lu", i);
+                klog(0, "test_page_allocator: alloc_map_pages(2) page1 mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -751,7 +751,7 @@ stdlib::Error test_page_allocator()
         mm::Page* pages = pt.alloc_contiguous_pages(2);
         if (!pages)
         {
-            trace(0, "test_page_allocator: alloc_contiguous_pages(2) failed");
+            klog(0, "test_page_allocator: alloc_contiguous_pages(2) failed");
             return make_error(stdlib::Error::NO_MEMORY);
         }
 
@@ -762,7 +762,7 @@ stdlib::Error test_page_allocator()
         void* ptr = mm::map_pages(2, phys_addrs);
         if (!ptr)
         {
-            trace(0, "test_page_allocator: map_pages(2) failed");
+            klog(0, "test_page_allocator: map_pages(2) failed");
             pt.free_page(&pages[0]);
             pt.free_page(&pages[1]);
             return make_error(stdlib::Error::UNSUCCESSFUL);
@@ -777,7 +777,7 @@ stdlib::Error test_page_allocator()
         {
             if (p[i] != 0xDD)
             {
-                trace(0, "test_page_allocator: map_pages page0 mismatch at %lu", i);
+                klog(0, "test_page_allocator: map_pages page0 mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -785,7 +785,7 @@ stdlib::Error test_page_allocator()
         {
             if (p[consts::PAGE_SIZE + i] != 0xEE)
             {
-                trace(0, "test_page_allocator: map_pages page1 mismatch at %lu", i);
+                klog(0, "test_page_allocator: map_pages page1 mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -797,7 +797,7 @@ stdlib::Error test_page_allocator()
         ulong va0 = pt.tmp_map_page(phys_addrs[0]);
         if (!va0)
         {
-            trace(0, "test_page_allocator: tmp_map_page page0 after unmap_pages failed");
+            klog(0, "test_page_allocator: tmp_map_page page0 after unmap_pages failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         u8* t0 = (u8*)va0;
@@ -805,7 +805,7 @@ stdlib::Error test_page_allocator()
         {
             if (t0[i] != 0xDD)
             {
-                trace(0, "test_page_allocator: post-unmap page0 mismatch at %lu", i);
+                klog(0, "test_page_allocator: post-unmap page0 mismatch at %lu", i);
                 pt.tmp_unmap_page(va0);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
@@ -815,7 +815,7 @@ stdlib::Error test_page_allocator()
         ulong va1 = pt.tmp_map_page(phys_addrs[1]);
         if (!va1)
         {
-            trace(0, "test_page_allocator: tmp_map_page page1 after unmap_pages failed");
+            klog(0, "test_page_allocator: tmp_map_page page1 after unmap_pages failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         u8* t1 = (u8*)va1;
@@ -823,7 +823,7 @@ stdlib::Error test_page_allocator()
         {
             if (t1[i] != 0xEE)
             {
-                trace(0, "test_page_allocator: post-unmap page1 mismatch at %lu", i);
+                klog(0, "test_page_allocator: post-unmap page1 mismatch at %lu", i);
                 pt.tmp_unmap_page(va1);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
@@ -836,7 +836,7 @@ stdlib::Error test_page_allocator()
 
         if (pt.get_free_pages_count() != free_pages_before)
         {
-            trace(0, "test_page_allocator: free count mismatch: %lu expected %lu",
+            klog(0, "test_page_allocator: free count mismatch: %lu expected %lu",
                 pt.get_free_pages_count(), free_pages_before);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
@@ -850,7 +850,7 @@ stdlib::Error test_page_allocator()
             void* ptr = mm::alloc_map_pages(1, &phys_addr);
             if (!ptr)
             {
-                trace(0, "test_page_allocator: round %lu alloc_map_pages failed", round);
+                klog(0, "test_page_allocator: round %lu alloc_map_pages failed", round);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
@@ -858,7 +858,7 @@ stdlib::Error test_page_allocator()
             stdlib::mem_set(p, (u8)(0x10 + round), consts::PAGE_SIZE);
             if (p[0] != (u8)(0x10 + round))
             {
-                trace(0, "test_page_allocator: round %lu pattern mismatch", round);
+                klog(0, "test_page_allocator: round %lu pattern mismatch", round);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
@@ -873,7 +873,7 @@ stdlib::Error test_page_allocator()
             mm::Page* page = pt.alloc_contiguous_pages(1);
             if (!page)
             {
-                trace(0, "test_page_allocator: map_pages round %lu alloc failed", round);
+                klog(0, "test_page_allocator: map_pages round %lu alloc failed", round);
                 return make_error(stdlib::Error::NO_MEMORY);
             }
 
@@ -881,7 +881,7 @@ stdlib::Error test_page_allocator()
             void* ptr = mm::map_pages(1, &pa);
             if (!ptr)
             {
-                trace(0, "test_page_allocator: map_pages round %lu map failed", round);
+                klog(0, "test_page_allocator: map_pages round %lu map failed", round);
                 pt.free_page(page);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
@@ -890,7 +890,7 @@ stdlib::Error test_page_allocator()
             stdlib::mem_set(p, (u8)(0x50 + round), consts::PAGE_SIZE);
             if (p[0] != (u8)(0x50 + round))
             {
-                trace(0, "test_page_allocator: map_pages round %lu pattern mismatch", round);
+                klog(0, "test_page_allocator: map_pages round %lu pattern mismatch", round);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
 
@@ -920,12 +920,12 @@ stdlib::Error test_page_allocator()
         void* ptr = mm::alloc_map_pages(32, &phys_addr);
         if (!ptr)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(32) failed");
+            klog(0, "test_page_allocator: alloc_map_pages(32) failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         if (phys_addr == 0)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(32) phys_addr is 0");
+            klog(0, "test_page_allocator: alloc_map_pages(32) phys_addr is 0");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -940,7 +940,7 @@ stdlib::Error test_page_allocator()
             u8* base = p + pg * consts::PAGE_SIZE;
             if (base[0] != expected || base[consts::PAGE_SIZE - 1] != expected)
             {
-                trace(0, "test_page_allocator: alloc_map_pages(32) page %lu mismatch", pg);
+                klog(0, "test_page_allocator: alloc_map_pages(32) page %lu mismatch", pg);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -949,7 +949,7 @@ stdlib::Error test_page_allocator()
 
         if (pt.get_free_pages_count() != free_pages_before)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(32) free count mismatch: %lu expected %lu",
+            klog(0, "test_page_allocator: alloc_map_pages(32) free count mismatch: %lu expected %lu",
                 pt.get_free_pages_count(), free_pages_before);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
@@ -973,12 +973,12 @@ stdlib::Error test_page_allocator()
         void* ptr = mm::alloc_map_pages(128, &phys_addr);
         if (!ptr)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(128) failed");
+            klog(0, "test_page_allocator: alloc_map_pages(128) failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         if (phys_addr == 0)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(128) phys_addr is 0");
+            klog(0, "test_page_allocator: alloc_map_pages(128) phys_addr is 0");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -993,7 +993,7 @@ stdlib::Error test_page_allocator()
             u8* base = p + pg * consts::PAGE_SIZE;
             if (base[0] != expected || base[consts::PAGE_SIZE - 1] != expected)
             {
-                trace(0, "test_page_allocator: alloc_map_pages(128) page %lu mismatch", pg);
+                klog(0, "test_page_allocator: alloc_map_pages(128) page %lu mismatch", pg);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1002,19 +1002,19 @@ stdlib::Error test_page_allocator()
 
         if (pt.get_free_pages_count() != free_pages_before)
         {
-            trace(0, "test_page_allocator: alloc_map_pages(128) free count mismatch: %lu expected %lu",
+            klog(0, "test_page_allocator: alloc_map_pages(128) free count mismatch: %lu expected %lu",
                 pt.get_free_pages_count(), free_pages_before);
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    trace(0, "test_page_allocator: complete");
+    klog(0, "test_page_allocator: complete");
     return make_success();
 }
 
 stdlib::Error test_mem_set()
 {
-    trace(0, "test_mem_set: started");
+    klog(0, "test_mem_set: started");
 
     /* Basic fill */
     {
@@ -1024,7 +1024,7 @@ stdlib::Error test_mem_set()
         {
             if (buf[i] != 0xAA)
             {
-                trace(0, "test_mem_set: basic fill mismatch at %lu", i);
+                klog(0, "test_mem_set: basic fill mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1039,7 +1039,7 @@ stdlib::Error test_mem_set()
         {
             if (buf[i] != 0)
             {
-                trace(0, "test_mem_set: zero fill mismatch at %lu", i);
+                klog(0, "test_mem_set: zero fill mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1056,7 +1056,7 @@ stdlib::Error test_mem_set()
             {
                 if (buf[i] != 0xCD)
                 {
-                    trace(0, "test_mem_set: odd size %lu mismatch at %lu", sz, i);
+                    klog(0, "test_mem_set: odd size %lu mismatch at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
@@ -1065,20 +1065,20 @@ stdlib::Error test_mem_set()
             {
                 if (buf[i] != 0)
                 {
-                    trace(0, "test_mem_set: odd size %lu overflow at %lu", sz, i);
+                    klog(0, "test_mem_set: odd size %lu overflow at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
     }
 
-    trace(0, "test_mem_set: complete");
+    klog(0, "test_mem_set: complete");
     return make_success();
 }
 
 stdlib::Error test_mem_cpy()
 {
-    trace(0, "test_mem_cpy: started");
+    klog(0, "test_mem_cpy: started");
 
     /* Basic copy */
     {
@@ -1091,7 +1091,7 @@ stdlib::Error test_mem_cpy()
         {
             if (dst[i] != src[i])
             {
-                trace(0, "test_mem_cpy: basic copy mismatch at %lu", i);
+                klog(0, "test_mem_cpy: basic copy mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1110,7 +1110,7 @@ stdlib::Error test_mem_cpy()
             {
                 if (dst[i] != src[i])
                 {
-                    trace(0, "test_mem_cpy: odd size %lu mismatch at %lu", sz, i);
+                    klog(0, "test_mem_cpy: odd size %lu mismatch at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
@@ -1119,20 +1119,20 @@ stdlib::Error test_mem_cpy()
             {
                 if (dst[i] != 0)
                 {
-                    trace(0, "test_mem_cpy: odd size %lu overflow at %lu", sz, i);
+                    klog(0, "test_mem_cpy: odd size %lu overflow at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
         }
     }
 
-    trace(0, "test_mem_cpy: complete");
+    klog(0, "test_mem_cpy: complete");
     return make_success();
 }
 
 stdlib::Error test_mem_move()
 {
-    trace(0, "test_mem_move: started");
+    klog(0, "test_mem_move: started");
 
     /* Non-overlapping forward */
     {
@@ -1145,7 +1145,7 @@ stdlib::Error test_mem_move()
         {
             if (dst[i] != src[i])
             {
-                trace(0, "test_mem_move: non-overlap mismatch at %lu", i);
+                klog(0, "test_mem_move: non-overlap mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1161,7 +1161,7 @@ stdlib::Error test_mem_move()
         {
             if (buf[8 + i] != (u8)(i & 0xFF))
             {
-                trace(0, "test_mem_move: overlap fwd mismatch at %lu: 0x%lX expected 0x%lX",
+                klog(0, "test_mem_move: overlap fwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[8 + i], (ulong)(u8)(i & 0xFF));
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
@@ -1178,7 +1178,7 @@ stdlib::Error test_mem_move()
         {
             if (buf[i] != (u8)((i + 8) & 0xFF))
             {
-                trace(0, "test_mem_move: overlap bwd mismatch at %lu: 0x%lX expected 0x%lX",
+                klog(0, "test_mem_move: overlap bwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[i], (ulong)(u8)((i + 8) & 0xFF));
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
@@ -1195,7 +1195,7 @@ stdlib::Error test_mem_move()
         {
             if (buf[i] != (u8)(i & 0xFF))
             {
-                trace(0, "test_mem_move: same ptr mismatch at %lu", i);
+                klog(0, "test_mem_move: same ptr mismatch at %lu", i);
                 return make_error(stdlib::Error::UNSUCCESSFUL);
             }
         }
@@ -1208,7 +1208,7 @@ stdlib::Error test_mem_move()
         stdlib::mem_move(buf + 4, buf, 0);
         if (buf[4] != 0xAA)
         {
-            trace(0, "test_mem_move: zero size modified data");
+            klog(0, "test_mem_move: zero size modified data");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1229,7 +1229,7 @@ stdlib::Error test_mem_move()
             {
                 if (buf[3 + i] != expected[i])
                 {
-                    trace(0, "test_mem_move: odd sz %lu overlap fwd mismatch at %lu", sz, i);
+                    klog(0, "test_mem_move: odd sz %lu overlap fwd mismatch at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
@@ -1249,7 +1249,7 @@ stdlib::Error test_mem_move()
             {
                 if (buf[i] != (u8)((i + 3) & 0xFF))
                 {
-                    trace(0, "test_mem_move: odd sz %lu overlap bwd mismatch at %lu", sz, i);
+                    klog(0, "test_mem_move: odd sz %lu overlap bwd mismatch at %lu", sz, i);
                     return make_error(stdlib::Error::UNSUCCESSFUL);
                 }
             }
@@ -1262,18 +1262,18 @@ stdlib::Error test_mem_move()
         stdlib::mem_move(&b, &a, 1);
         if (b != 0x42)
         {
-            trace(0, "test_mem_move: single byte failed");
+            klog(0, "test_mem_move: single byte failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    trace(0, "test_mem_move: complete");
+    klog(0, "test_mem_move: complete");
     return make_success();
 }
 
 stdlib::Error test_mem_cmp()
 {
-    trace(0, "test_mem_cmp: started");
+    klog(0, "test_mem_cmp: started");
 
     /* Equal buffers */
     {
@@ -1282,7 +1282,7 @@ stdlib::Error test_mem_cmp()
         stdlib::mem_set(b, 0xAB, sizeof(b));
         if (stdlib::mem_cmp(a, b, sizeof(a)) != 0)
         {
-            trace(0, "test_mem_cmp: equal buffers returned non-zero");
+            klog(0, "test_mem_cmp: equal buffers returned non-zero");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1293,7 +1293,7 @@ stdlib::Error test_mem_cmp()
         u8 b[] = {1, 2, 4};
         if (stdlib::mem_cmp(a, b, 3) >= 0)
         {
-            trace(0, "test_mem_cmp: a < b not detected");
+            klog(0, "test_mem_cmp: a < b not detected");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1304,7 +1304,7 @@ stdlib::Error test_mem_cmp()
         u8 b[] = {1, 2, 4};
         if (stdlib::mem_cmp(a, b, 3) <= 0)
         {
-            trace(0, "test_mem_cmp: a > b not detected");
+            klog(0, "test_mem_cmp: a > b not detected");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1315,7 +1315,7 @@ stdlib::Error test_mem_cmp()
         u8 b[] = {0xFF, 0x00};
         if (stdlib::mem_cmp(a, b, 2) >= 0)
         {
-            trace(0, "test_mem_cmp: first byte a < b not detected");
+            klog(0, "test_mem_cmp: first byte a < b not detected");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1326,7 +1326,7 @@ stdlib::Error test_mem_cmp()
         u8 b[] = {2};
         if (stdlib::mem_cmp(a, b, 0) != 0)
         {
-            trace(0, "test_mem_cmp: zero length not equal");
+            klog(0, "test_mem_cmp: zero length not equal");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1341,43 +1341,43 @@ stdlib::Error test_mem_cmp()
         }
         if (stdlib::mem_cmp(a, b, sizeof(a)) != 0)
         {
-            trace(0, "test_mem_cmp: odd size equal mismatch");
+            klog(0, "test_mem_cmp: odd size equal mismatch");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
         b[16] = 0xFF;
         if (stdlib::mem_cmp(a, b, sizeof(a)) >= 0)
         {
-            trace(0, "test_mem_cmp: odd size diff at end not detected");
+            klog(0, "test_mem_cmp: odd size diff at end not detected");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    trace(0, "test_mem_cmp: complete");
+    klog(0, "test_mem_cmp: complete");
     return make_success();
 }
 
 stdlib::Error test_str_len()
 {
-    trace(0, "test_str_len: started");
+    klog(0, "test_str_len: started");
 
     /* Empty string */
     if (stdlib::str_len("") != 0)
     {
-        trace(0, "test_str_len: empty string failed");
+        klog(0, "test_str_len: empty string failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Single char */
     if (stdlib::str_len("A") != 1)
     {
-        trace(0, "test_str_len: single char failed");
+        klog(0, "test_str_len: single char failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Known string */
     if (stdlib::str_len("hello") != 5)
     {
-        trace(0, "test_str_len: 'hello' failed, got %lu", stdlib::str_len("hello"));
+        klog(0, "test_str_len: 'hello' failed, got %lu", stdlib::str_len("hello"));
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1386,7 +1386,7 @@ stdlib::Error test_str_len()
         char buf[10] = {'\xFF', '\xFE', '\x01', '\0', 'X', '\0'};
         if (stdlib::str_len(buf) != 3)
         {
-            trace(0, "test_str_len: high bytes failed, got %lu", stdlib::str_len(buf));
+            klog(0, "test_str_len: high bytes failed, got %lu", stdlib::str_len(buf));
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1394,105 +1394,105 @@ stdlib::Error test_str_len()
     /* Longer string (> 8 bytes, tests qword boundary) */
     if (stdlib::str_len("abcdefghijklmnop") != 16)
     {
-        trace(0, "test_str_len: 16-char string failed");
+        klog(0, "test_str_len: 16-char string failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_str_len: complete");
+    klog(0, "test_str_len: complete");
     return make_success();
 }
 
 stdlib::Error test_str_cmp()
 {
-    trace(0, "test_str_cmp: started");
+    klog(0, "test_str_cmp: started");
 
     /* Equal strings */
     if (stdlib::str_cmp("abc", "abc") != 0)
     {
-        trace(0, "test_str_cmp: equal strings failed");
+        klog(0, "test_str_cmp: equal strings failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Empty strings */
     if (stdlib::str_cmp("", "") != 0)
     {
-        trace(0, "test_str_cmp: empty strings failed");
+        klog(0, "test_str_cmp: empty strings failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* First < second */
     if (stdlib::str_cmp("abc", "abd") >= 0)
     {
-        trace(0, "test_str_cmp: abc < abd failed");
+        klog(0, "test_str_cmp: abc < abd failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* First > second */
     if (stdlib::str_cmp("abd", "abc") <= 0)
     {
-        trace(0, "test_str_cmp: abd > abc failed");
+        klog(0, "test_str_cmp: abd > abc failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Prefix: shorter < longer */
     if (stdlib::str_cmp("ab", "abc") >= 0)
     {
-        trace(0, "test_str_cmp: ab < abc failed");
+        klog(0, "test_str_cmp: ab < abc failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Prefix: longer > shorter */
     if (stdlib::str_cmp("abc", "ab") <= 0)
     {
-        trace(0, "test_str_cmp: abc > ab failed");
+        klog(0, "test_str_cmp: abc > ab failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Single char difference */
     if (stdlib::str_cmp("a", "b") >= 0)
     {
-        trace(0, "test_str_cmp: a < b failed");
+        klog(0, "test_str_cmp: a < b failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Empty vs non-empty */
     if (stdlib::str_cmp("", "a") >= 0)
     {
-        trace(0, "test_str_cmp: '' < 'a' failed");
+        klog(0, "test_str_cmp: '' < 'a' failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     if (stdlib::str_cmp("a", "") <= 0)
     {
-        trace(0, "test_str_cmp: 'a' > '' failed");
+        klog(0, "test_str_cmp: 'a' > '' failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     /* Longer strings (cross qword boundary) */
     if (stdlib::str_cmp("abcdefghij", "abcdefghij") != 0)
     {
-        trace(0, "test_str_cmp: long equal failed");
+        klog(0, "test_str_cmp: long equal failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     if (stdlib::str_cmp("abcdefghij", "abcdefghik") >= 0)
     {
-        trace(0, "test_str_cmp: long diff at end failed");
+        klog(0, "test_str_cmp: long diff at end failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_str_cmp: complete");
+    klog(0, "test_str_cmp: complete");
     return make_success();
 }
 
 stdlib::Error test_str_str()
 {
-    trace(0, "test_str_str: started");
+    klog(0, "test_str_str: started");
 
     /* Empty needle always matches at start */
     {
         const char* h = "hello";
         if (stdlib::str_str(h, "") != h)
         {
-            trace(0, "test_str_str: empty needle failed");
+            klog(0, "test_str_str: empty needle failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1503,7 +1503,7 @@ stdlib::Error test_str_str()
         const char* r = stdlib::str_str(h, "abc");
         if (r != h)
         {
-            trace(0, "test_str_str: match at start failed");
+            klog(0, "test_str_str: match at start failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1514,7 +1514,7 @@ stdlib::Error test_str_str()
         const char* r = stdlib::str_str(h, "world");
         if (r != h + 6)
         {
-            trace(0, "test_str_str: match in middle failed");
+            klog(0, "test_str_str: match in middle failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1525,7 +1525,7 @@ stdlib::Error test_str_str()
         const char* r = stdlib::str_str(h, "xyz");
         if (r != h + 3)
         {
-            trace(0, "test_str_str: match at end failed");
+            klog(0, "test_str_str: match at end failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1534,7 +1534,7 @@ stdlib::Error test_str_str()
     {
         if (stdlib::str_str("abcdef", "xyz") != nullptr)
         {
-            trace(0, "test_str_str: no match returned non-null");
+            klog(0, "test_str_str: no match returned non-null");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1545,7 +1545,7 @@ stdlib::Error test_str_str()
         const char* r = stdlib::str_str(h, "abd");
         if (r != h + 3)
         {
-            trace(0, "test_str_str: partial match failed");
+            klog(0, "test_str_str: partial match failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1554,7 +1554,7 @@ stdlib::Error test_str_str()
     {
         if (stdlib::str_str("ab", "abcdef") != nullptr)
         {
-            trace(0, "test_str_str: needle longer returned non-null");
+            klog(0, "test_str_str: needle longer returned non-null");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1564,7 +1564,7 @@ stdlib::Error test_str_str()
         const char* h = "";
         if (stdlib::str_str(h, "") != h)
         {
-            trace(0, "test_str_str: both empty failed");
+            klog(0, "test_str_str: both empty failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1575,7 +1575,7 @@ stdlib::Error test_str_str()
         const char* r = stdlib::str_str(h, "d");
         if (r != h + 3)
         {
-            trace(0, "test_str_str: single char match failed");
+            klog(0, "test_str_str: single char match failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -1585,12 +1585,12 @@ stdlib::Error test_str_str()
         const char* h = "exact";
         if (stdlib::str_str(h, "exact") != h)
         {
-            trace(0, "test_str_str: exact match failed");
+            klog(0, "test_str_str: exact match failed");
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
 
-    trace(0, "test_str_str: complete");
+    klog(0, "test_str_str: complete");
     return make_success();
 }
 
@@ -1635,7 +1635,7 @@ bool mem_check(const char* what, const u8* dst, ulong cap, ulong at, ulong n, co
             expected = set ? MEM_SET_BYTE : from[i - at];
         if (dst[i] != expected)
         {
-            trace(0, "test_mem_routines: %s of %lu at +%lu: byte %lu is 0x%x, not 0x%x", what, n, at, i,
+            klog(0, "test_mem_routines: %s of %lu at +%lu: byte %lu is 0x%x, not 0x%x", what, n, at, i,
                 static_cast<unsigned int>(dst[i]), static_cast<unsigned int>(expected));
             return false;
         }
@@ -1683,7 +1683,7 @@ bool mem_overlap(u8* buf, u8* ref, ulong cap, ulong src, ulong dst, ulong n)
         u8 expected = (i >= dst && i < dst + n) ? ref[i - dst] : mem_pattern(i);
         if (buf[i] != expected)
         {
-            trace(0, "test_mem_routines: mem_move of %lu from +%lu to +%lu: byte %lu is 0x%x, not 0x%x", n, src, dst,
+            klog(0, "test_mem_routines: mem_move of %lu from +%lu to +%lu: byte %lu is 0x%x, not 0x%x", n, src, dst,
                 i, static_cast<unsigned int>(buf[i]), static_cast<unsigned int>(expected));
             return false;
         }
@@ -1748,7 +1748,7 @@ void mem_rate(u8* src, u8* dst)
     const ulong bytes = MEM_RATE_ROUNDS * MEM_LARGE;
     const ulong copy_ns = (copied > start) ? copied - start : 1;
     const ulong set_ns = (set > copied) ? set - copied : 1;
-    trace(0, "test_mem_routines: mem_cpy %lu MB/s, mem_set %lu MB/s", bytes * NS_PER_US / copy_ns,
+    klog(0, "test_mem_routines: mem_cpy %lu MB/s, mem_set %lu MB/s", bytes * NS_PER_US / copy_ns,
         bytes * NS_PER_US / set_ns);
 }
 
@@ -1756,7 +1756,7 @@ void mem_rate(u8* src, u8* dst)
 
 stdlib::Error test_mem_routines()
 {
-    trace(0, "test_mem_routines: started");
+    klog(0, "test_mem_routines: started");
 
     u8* bufs = static_cast<u8*>(mm::alloc(3 * MEM_BUF_SIZE, MEM_TAG));
     if (bufs == nullptr)
@@ -1769,7 +1769,7 @@ stdlib::Error test_mem_routines()
     if (!ok)
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_mem_routines: complete");
+    klog(0, "test_mem_routines: complete");
     return make_success();
 }
 
@@ -1787,7 +1787,7 @@ stdlib::Error test_crc32()
         pieces = stdlib::crc32_update(pieces, CHECK + at, (len - at < 2) ? len - at : 2);
     if (whole != CHECK_CRC || pieces != CHECK_CRC || stdlib::crc32(CHECK, 0) != 0)
     {
-        trace(0, "test_crc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CHECK_CRC);
+        klog(0, "test_crc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CHECK_CRC);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     return make_success();
@@ -1795,7 +1795,7 @@ stdlib::Error test_crc32()
 
 stdlib::Error test_sn_printf()
 {
-    trace(0, "test_sn_printf: started");
+    klog(0, "test_sn_printf: started");
 
     char buf[128];
     int rc;
@@ -1804,28 +1804,28 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "hello %s", "world");
     if (rc < 0 || stdlib::str_cmp(buf, "hello world") != 0)
     {
-        trace(0, "test_sn_printf: %%s failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%s failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lu", (ulong)42);
     if (rc < 0 || stdlib::str_cmp(buf, "42") != 0)
     {
-        trace(0, "test_sn_printf: %%u failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%u failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%c", (int)'A');
     if (rc < 0 || stdlib::str_cmp(buf, "A") != 0)
     {
-        trace(0, "test_sn_printf: %%c failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%c failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lu", (ulong)0);
     if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        trace(0, "test_sn_printf: %%u zero failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%u zero failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1833,14 +1833,14 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "100%%");
     if (rc < 0 || stdlib::str_cmp(buf, "100%") != 0)
     {
-        trace(0, "test_sn_printf: %%%% failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%%% failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%%start");
     if (rc < 0 || stdlib::str_cmp(buf, "%start") != 0)
     {
-        trace(0, "test_sn_printf: %%%% at start failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%%% at start failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1848,28 +1848,28 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)42);
     if (rc < 0 || stdlib::str_cmp(buf, "42") != 0)
     {
-        trace(0, "test_sn_printf: %%d positive failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%d positive failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)-1);
     if (rc < 0 || stdlib::str_cmp(buf, "-1") != 0)
     {
-        trace(0, "test_sn_printf: %%d -1 failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%d -1 failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)-12345);
     if (rc < 0 || stdlib::str_cmp(buf, "-12345") != 0)
     {
-        trace(0, "test_sn_printf: %%d negative failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%d negative failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%ld", (long)0);
     if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        trace(0, "test_sn_printf: %%d zero failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%d zero failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1877,21 +1877,21 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)0);
     if (rc < 0 || stdlib::str_cmp(buf, "0") != 0)
     {
-        trace(0, "test_sn_printf: %%x zero failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%x zero failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)0xDEAD);
     if (rc < 0 || stdlib::str_cmp(buf, "dead") != 0)
     {
-        trace(0, "test_sn_printf: %%x deadbeef failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%x deadbeef failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lx", (ulong)255);
     if (rc < 0 || stdlib::str_cmp(buf, "ff") != 0)
     {
-        trace(0, "test_sn_printf: %%x 255 failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%x 255 failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1899,14 +1899,14 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lX", (ulong)0xDEAD);
     if (rc < 0 || stdlib::str_cmp(buf, "DEAD") != 0)
     {
-        trace(0, "test_sn_printf: %%X failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%X failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%lX", (ulong)255);
     if (rc < 0 || stdlib::str_cmp(buf, "FF") != 0)
     {
-        trace(0, "test_sn_printf: %%X 255 failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%X 255 failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1914,14 +1914,14 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%08lx", (ulong)0xFF);
     if (rc < 0 || stdlib::str_cmp(buf, "000000ff") != 0)
     {
-        trace(0, "test_sn_printf: %%08x failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%08x failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%016lX", (ulong)0xABCD1234);
     if (rc < 0 || stdlib::str_cmp(buf, "00000000ABCD1234") != 0)
     {
-        trace(0, "test_sn_printf: %%016X failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%016X failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1929,7 +1929,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%05lu", (ulong)42);
     if (rc < 0 || stdlib::str_cmp(buf, "00042") != 0)
     {
-        trace(0, "test_sn_printf: %%05u failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%05u failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1937,7 +1937,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%05ld", (long)-42);
     if (rc < 0 || stdlib::str_cmp(buf, "-0042") != 0)
     {
-        trace(0, "test_sn_printf: %%05d negative failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%05d negative failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1945,7 +1945,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%03ld", (long)12345);
     if (rc < 0 || stdlib::str_cmp(buf, "12345") != 0)
     {
-        trace(0, "test_sn_printf: %%03d overflow failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%03d overflow failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1953,14 +1953,14 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%5lu", (ulong)42);
     if (rc < 0 || stdlib::str_cmp(buf, "   42") != 0)
     {
-        trace(0, "test_sn_printf: %%5u space pad failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%5u space pad failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(buf, sizeof(buf), "%8lx", (ulong)0xFF);
     if (rc < 0 || stdlib::str_cmp(buf, "      ff") != 0)
     {
-        trace(0, "test_sn_printf: %%8x space pad failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%8x space pad failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1968,7 +1968,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%10s", "hi");
     if (rc < 0 || stdlib::str_cmp(buf, "        hi") != 0)
     {
-        trace(0, "test_sn_printf: %%10s failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%10s failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1977,7 +1977,7 @@ stdlib::Error test_sn_printf()
                           (long)-7, (ulong)100, (ulong)0xAB, (ulong)0xCD, "ok");
     if (rc < 0 || stdlib::str_cmp(buf, "-7 100 ab CD ok %") != 0)
     {
-        trace(0, "test_sn_printf: mixed failed: '%s'", buf);
+        klog(0, "test_sn_printf: mixed failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1985,7 +1985,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%s", (const char*)nullptr);
     if (rc < 0 || stdlib::str_cmp(buf, "(null)") != 0)
     {
-        trace(0, "test_sn_printf: null string failed: '%s'", buf);
+        klog(0, "test_sn_printf: null string failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1993,7 +1993,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(buf, sizeof(buf), "%p", (void*)(ulong)0xABCDEF);
     if (rc < 0 || stdlib::str_cmp(buf, "ABCDEF") != 0)
     {
-        trace(0, "test_sn_printf: %%p failed: '%s'", buf);
+        klog(0, "test_sn_printf: %%p failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2005,21 +2005,21 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(small, sizeof(small), "ab%s", "cdefghij");
     if (rc != 7 || stdlib::str_cmp(small, "abcd...") != 0)
     {
-        trace(0, "test_sn_printf: long %%s not truncated: '%s' (%d)", small, rc);
+        klog(0, "test_sn_printf: long %%s not truncated: '%s' (%d)", small, rc);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(small, sizeof(small), "abcdefghij");
     if (rc != 7 || stdlib::str_cmp(small, "abcd...") != 0)
     {
-        trace(0, "test_sn_printf: long text not truncated: '%s' (%d)", small, rc);
+        klog(0, "test_sn_printf: long text not truncated: '%s' (%d)", small, rc);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     rc = stdlib::sn_printf(small, sizeof(small), "%lu", (ulong)123456789);
     if (rc != 7 || stdlib::str_cmp(small, "1234...") != 0)
     {
-        trace(0, "test_sn_printf: long %%u not truncated: '%s' (%d)", small, rc);
+        klog(0, "test_sn_printf: long %%u not truncated: '%s' (%d)", small, rc);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2027,7 +2027,7 @@ stdlib::Error test_sn_printf()
     rc = stdlib::sn_printf(small, sizeof(small), "abcdefg");
     if (rc != 7 || stdlib::str_cmp(small, "abcdefg") != 0)
     {
-        trace(0, "test_sn_printf: exact fit failed: '%s' (%d)", small, rc);
+        klog(0, "test_sn_printf: exact fit failed: '%s' (%d)", small, rc);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2043,7 +2043,7 @@ stdlib::Error test_sn_printf()
     if (rc < 0 || stdlib::str_cmp(buf,
         "4294967295 1099511627776 -5 -6 ab cd00000000 7 8 -9 -10 EF 1200000000") != 0)
     {
-        trace(0, "test_sn_printf: widths failed: '%s'", buf);
+        klog(0, "test_sn_printf: widths failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2052,7 +2052,7 @@ stdlib::Error test_sn_printf()
         (u8)200, (s8)-3, (u16)60000, (s16)-30000);
     if (rc < 0 || stdlib::str_cmp(buf, "200 -3 60000 -30000") != 0)
     {
-        trace(0, "test_sn_printf: hh/h failed: '%s'", buf);
+        klog(0, "test_sn_printf: hh/h failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2061,11 +2061,11 @@ stdlib::Error test_sn_printf()
         (size_t)123, (long long)-9223372036854775807LL - 1, 18446744073709551615ULL, 0xABCULL);
     if (rc < 0 || stdlib::str_cmp(buf, "123 -9223372036854775808 18446744073709551615 abc") != 0)
     {
-        trace(0, "test_sn_printf: z/ll failed: '%s'", buf);
+        klog(0, "test_sn_printf: z/ll failed: '%s'", buf);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_sn_printf: complete");
+    klog(0, "test_sn_printf: complete");
     return make_success();
 }
 
@@ -2082,7 +2082,7 @@ stdlib::Error test_vfs()
 
     if (rust_ramfs_mount("/", 1, 0) != 0)
     {
-        trace(0, "test_vfs: mount failed");
+        klog(0, "test_vfs: mount failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2090,17 +2090,17 @@ stdlib::Error test_vfs()
 
     if (kernel_vfs_unmount("/", 1) != 0)
     {
-        trace(0, "test_vfs: unmount failed");
+        klog(0, "test_vfs: unmount failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
     if (!ok)
     {
-        trace(0, "test_vfs: self-test failed");
+        klog(0, "test_vfs: self-test failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_vfs: complete");
+    klog(0, "test_vfs: complete");
     return make_success();
 }
 
@@ -2113,15 +2113,15 @@ extern "C" int rust_net_selftest();
 
 stdlib::Error test_net_wire()
 {
-    trace(0, "test_net_wire: started");
+    klog(0, "test_net_wire: started");
 
     if (rust_net_selftest() != 0)
     {
-        trace(0, "test_net_wire: failed");
+        klog(0, "test_net_wire: failed");
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "test_net_wire: complete");
+    klog(0, "test_net_wire: complete");
     return make_success();
 }
 
@@ -2143,7 +2143,7 @@ static bool grub_env_has(stdlib::GrubEnvBlock& env, const char* name, const char
 
 stdlib::Error test_grub_env()
 {
-    trace(0, "test_grub_env: started");
+    klog(0, "test_grub_env: started");
 
     using stdlib::GrubEnvBlock;
 
@@ -2253,7 +2253,7 @@ stdlib::Error test_grub_env()
     if (env.is_valid() || env.set("nos_next", "nos-next") || env.get("a", value, sizeof(value)))
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_grub_env: complete");
+    klog(0, "test_grub_env: complete");
     return make_success();
 }
 
@@ -2274,7 +2274,7 @@ static stdlib::Error check_symbolizer(const char* output)
     const char* at = stdlib::str_str(output, MARKER);
     if (at == nullptr)
     {
-        trace(0, "test_modules: no address in: %s", output);
+        klog(0, "test_modules: no address in: %s", output);
         return make_error(stdlib::Error::NOT_FOUND);
     }
 
@@ -2294,7 +2294,7 @@ static stdlib::Error check_symbolizer(const char* output)
         stdlib::str_str(where, "mod_modtest::double+0x") == nullptr ||
         stdlib::str_str(where, "[modtest]") == nullptr)
     {
-        trace(0, "test_modules: modtest's double() at 0x%lX named '%s'", addr, where);
+        klog(0, "test_modules: modtest's double() at 0x%lX named '%s'", addr, where);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2303,7 +2303,7 @@ static stdlib::Error check_symbolizer(const char* output)
         stdlib::str_str(where, "check_symbolizer") == nullptr ||
         symtab.describe(0, where, sizeof(where)))
     {
-        trace(0, "test_modules: the kernel's own named '%s'", where);
+        klog(0, "test_modules: the kernel's own named '%s'", where);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2317,14 +2317,14 @@ static stdlib::Error check_symbolizer(const char* output)
     if (!symtab.describe_return(self + 1, where, sizeof(where)) ||
         stdlib::str_str(where, "check_symbolizer+0x1") == nullptr)
     {
-        trace(0, "test_modules: a return address a byte into check_symbolizer named '%s'", where);
+        klog(0, "test_modules: a return address a byte into check_symbolizer named '%s'", where);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     where[0] = '\0';
     if (symtab.describe_return(self, where, sizeof(where)) &&
         stdlib::str_str(where, "check_symbolizer+0x0") != nullptr)
     {
-        trace(0, "test_modules: a return address at check_symbolizer's start named '%s'", where);
+        klog(0, "test_modules: a return address at check_symbolizer's start named '%s'", where);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     where[0] = '\0';
@@ -2332,7 +2332,7 @@ static stdlib::Error check_symbolizer(const char* output)
         stdlib::str_str(where, "mod_modtest::double+0x1 [modtest]") == nullptr ||
         symtab.describe_return(0, where, sizeof(where)))
     {
-        trace(0, "test_modules: a return address a byte into modtest's double() named '%s'", where);
+        klog(0, "test_modules: a return address a byte into modtest's double() named '%s'", where);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2425,7 +2425,7 @@ public:
     {
         if (!broken_ && stdlib::str_cmp(row_, want) == 0)
             return true;
-        trace(0, "test_line_editor: step %lu shows '%s'%s, not '%s'", step, row_,
+        klog(0, "test_line_editor: step %lu shows '%s'%s, not '%s'", step, row_,
             broken_ ? " (broken)" : "", want);
         return false;
     }
@@ -2568,7 +2568,7 @@ static bool test_line_editor_on(LineEditor& ed)
    lineedit target holds it to a model over random keys. */
 stdlib::Error test_line_editor()
 {
-    trace(0, "test_line_editor: started");
+    klog(0, "test_line_editor: started");
 
     LineEditor* ed = new (mm::NO_THROW) LineEditor();
     if (ed == nullptr)
@@ -2580,7 +2580,7 @@ stdlib::Error test_line_editor()
     if (!ok)
         return make_error(stdlib::Error::UNSUCCESSFUL);
 
-    trace(0, "test_line_editor: complete");
+    klog(0, "test_line_editor: complete");
     return make_success();
 }
 
@@ -2606,7 +2606,7 @@ static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
     Cmd::dispatch("modtest bus", out);
     if (stdlib::str_str(out.get(), "modtest bus: ok") == nullptr)
     {
-        trace(0, "test_module_bus: the module asking the bus: %s", out.get());
+        klog(0, "test_module_bus: the module asking the bus: %s", out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2614,7 +2614,7 @@ static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
     Cmd::dispatch("mgmt call modtest echo {\"n\":42}", out);
     if (stdlib::str_str(out.get(), "{\"n\":42}") == nullptr)
     {
-        trace(0, "test_module_bus: the module's provider answered: %s", out.get());
+        klog(0, "test_module_bus: the module's provider answered: %s", out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2622,7 +2622,7 @@ static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
     Cmd::dispatch("mgmt start modtest wait", out);
     if (stdlib::str_str(out.get(), "started") == nullptr)
     {
-        trace(0, "test_module_bus: the module's job was not started: %s", out.get());
+        klog(0, "test_module_bus: the module's job was not started: %s", out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     for (ulong i = 0; i < JOB_WAIT_POLLS; i++)
@@ -2633,7 +2633,7 @@ static stdlib::Error check_bus_loaded(stdlib::BufferPrinter& out)
             return make_success();
         sleep(consts::NANO_SECS_IN_MS);
     }
-    trace(0, "test_module_bus: the module's job never ran: %s", out.get());
+    klog(0, "test_module_bus: the module's job never ran: %s", out.get());
     return make_error(stdlib::Error::UNSUCCESSFUL);
 }
 
@@ -2645,7 +2645,7 @@ static stdlib::Error check_bus_unloaded(stdlib::BufferPrinter& out)
     Cmd::dispatch("mgmt jobs", out);
     if (stdlib::str_str(out.get(), "modtest.wait done cancelled") == nullptr)
     {
-        trace(0, "test_module_bus: the job the unload had to stop: %s", out.get());
+        klog(0, "test_module_bus: the job the unload had to stop: %s", out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2653,7 +2653,7 @@ static stdlib::Error check_bus_unloaded(stdlib::BufferPrinter& out)
     Cmd::dispatch("mgmt call modtest echo {}", out);
     if (stdlib::str_str(out.get(), "mgmt: no_provider") == nullptr)
     {
-        trace(0, "test_module_bus: the provider outlived its module: %s", out.get());
+        klog(0, "test_module_bus: the provider outlived its module: %s", out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
     return make_success();
@@ -2684,7 +2684,7 @@ stdlib::Error test_modules()
         stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, ROUND_PARAMS[round], out);
         if (!err.ok())
         {
-            trace(0, "test_modules: load failed: %s", out.get());
+            klog(0, "test_modules: load failed: %s", out.get());
             return err;
         }
 
@@ -2692,7 +2692,7 @@ stdlib::Error test_modules()
         Cmd::dispatch("modtest 1 2", out);
         if (stdlib::str_str(out.get(), ROUND_ANSWERS[round]) == nullptr)
         {
-            trace(0, "test_modules: the module's command answered: %s", out.get());
+            klog(0, "test_modules: the module's command answered: %s", out.get());
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -2704,7 +2704,7 @@ stdlib::Error test_modules()
         err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
         if (err.get_code() != stdlib::Error::ALREADY_EXISTS || !modules.is_loaded("modtest"))
         {
-            trace(0, "test_modules: a second copy was not refused: %s", out.get());
+            klog(0, "test_modules: a second copy was not refused: %s", out.get());
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -2712,7 +2712,7 @@ stdlib::Error test_modules()
         err = modules.unload("modtest", out);
         if (!err.ok() || modules.is_loaded("modtest"))
         {
-            trace(0, "test_modules: unload failed: %s", out.get());
+            klog(0, "test_modules: unload failed: %s", out.get());
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
 
@@ -2720,7 +2720,7 @@ stdlib::Error test_modules()
         Cmd::dispatch("modtest", out);
         if (stdlib::str_str(out.get(), "not found") == nullptr)
         {
-            trace(0, "test_modules: the command outlived its module: %s", out.get());
+            klog(0, "test_modules: the command outlived its module: %s", out.get());
             return make_error(stdlib::Error::UNSUCCESSFUL);
         }
     }
@@ -2731,7 +2731,7 @@ stdlib::Error test_modules()
     if (err.get_code() != stdlib::Error::UNSUCCESSFUL || modules.is_loaded("modtest") ||
         stdlib::str_str(out.get(), "\"answr\" is not a parameter") == nullptr)
     {
-        trace(0, "test_modules: an unknown parameter: error %lu: %s", (ulong)err.get_code(), out.get());
+        klog(0, "test_modules: an unknown parameter: error %lu: %s", (ulong)err.get_code(), out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2743,7 +2743,7 @@ stdlib::Error test_modules()
     err = modules.load(nos_modtest_ko, nos_modtest_ko_size, long_params, out);
     if (err.get_code() != stdlib::Error::INVALID_VALUE || modules.is_loaded("modtest"))
     {
-        trace(0, "test_modules: parameters too long: error %lu: %s", (ulong)err.get_code(), out.get());
+        klog(0, "test_modules: parameters too long: error %lu: %s", (ulong)err.get_code(), out.get());
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -2797,7 +2797,7 @@ stdlib::Error test_modules()
         err = modules.load(copy, size, "", out);
         if (err.get_code() != expected || modules.is_loaded("modtest"))
         {
-            trace(0, "test_modules: %s: error %lu, expected %lu: %s", what,
+            klog(0, "test_modules: %s: error %lu, expected %lu: %s", what,
                 (ulong)err.get_code(), (ulong)expected, out.get());
             result = make_error(stdlib::Error::UNSUCCESSFUL);
         }
@@ -2807,7 +2807,7 @@ stdlib::Error test_modules()
     if (!result.ok())
         return result;
 
-    trace(0, "test_modules: complete");
+    klog(0, "test_modules: complete");
     return make_success();
 }
 
@@ -2826,7 +2826,7 @@ bool test_module_bus()
     stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
     if (!err.ok())
     {
-        trace(0, "test_module_bus: load failed: %s", out.get());
+        klog(0, "test_module_bus: load failed: %s", out.get());
         return false;
     }
 
@@ -2835,7 +2835,7 @@ bool test_module_bus()
     stdlib::Error unloaded = modules.unload("modtest", out);
     if (!unloaded.ok() || modules.is_loaded("modtest"))
     {
-        trace(0, "test_module_bus: unload failed: %s", out.get());
+        klog(0, "test_module_bus: unload failed: %s", out.get());
         return false;
     }
     if (!err.ok())
@@ -2848,7 +2848,7 @@ stdlib::Error test()
 {
     stdlib::Error err;
 
-    trace(0, "Self-test in progress, please wait...");
+    klog(0, "Self-test in progress, please wait...");
 
     err = test_allocator();
     if (!err.ok())
@@ -2967,7 +2967,7 @@ static bool test_spin_lock_preempt()
 {
     if (!preempt_can_block())
     {
-        trace(0, "test_spin_lock_preempt: cannot block before any lock is taken");
+        klog(0, "test_spin_lock_preempt: cannot block before any lock is taken");
         return false;
     }
 
@@ -3011,12 +3011,12 @@ static bool test_spin_lock_preempt()
         !released || !under_spin || !released_spin || !under_reads ||
         !under_read || !released_read || !under_write || !released_write)
     {
-        trace(0, "test_spin_lock_preempt: outer %lu inner %lu twice %lu "
+        klog(0, "test_spin_lock_preempt: outer %lu inner %lu twice %lu "
             "under inner %lu released %lu spin %lu released spin %lu",
             (ulong)under_outer, (ulong)inner_taken, (ulong)outer_taken_twice,
             (ulong)under_inner, (ulong)released, (ulong)under_spin,
             (ulong)released_spin);
-        trace(0, "test_spin_lock_preempt: rw reads %lu read %lu released %lu "
+        klog(0, "test_spin_lock_preempt: rw reads %lu read %lu released %lu "
             "write %lu released %lu", (ulong)under_reads, (ulong)under_read,
             (ulong)released_read, (ulong)under_write, (ulong)released_write);
         return false;
@@ -3033,7 +3033,7 @@ void test_multi_tasking_task_func(void *ctx)
     {
         auto& cpu = get_cpu();
         auto task = Task::get_current_task();
-        trace(TEST_LL, "Hello from task 0x%p pid %lu cpu %lu", task, task->pid_, cpu.get_index());
+        klog(TEST_LL, "Hello from task 0x%p pid %lu cpu %lu", task, task->pid_, cpu.get_index());
         sleep(100 * consts::NANO_SECS_IN_MS);
     }
 }
@@ -3139,7 +3139,7 @@ static bool test_event()
     mm::free(pp);
 
     if (!ok)
-        trace(0, "test_event: the ping-pong lost count");
+        klog(0, "test_event: the ping-pong lost count");
     return ok;
 }
 
@@ -3184,7 +3184,7 @@ static bool test_event_wait_for()
         task->wait();
         ok = (p->timed_out.get() == 1 && p->signalled.get() == 1);
         if (!ok)
-            trace(0, "test_event_wait_for: timed out %lu, signalled %lu",
+            klog(0, "test_event_wait_for: timed out %lu, signalled %lu",
                 (ulong)p->timed_out.get(), (ulong)p->signalled.get());
     }
     else
@@ -3263,14 +3263,14 @@ static bool test_sleep_blocks()
 
     if (!ok)
     {
-        trace(0, "test_sleep_blocks: no tasks for the test");
+        klog(0, "test_sleep_blocks: no tasks for the test");
         return false;
     }
 
     ulong slept_ns = stdlib::array_size(task) * SLEEP_TEST_ROUNDS * SLEEP_TEST_NS;
     if (run_ns * SLEEP_TEST_PERCENT > slept_ns * SLEEP_TEST_MAX_RUN_PERCENT)
     {
-        trace(0, "test_sleep_blocks: two sleepers on one CPU ran %lu us of the %lu us they slept",
+        klog(0, "test_sleep_blocks: two sleepers on one CPU ran %lu us of the %lu us they slept",
             run_ns / consts::NANO_SECS_IN_USEC, slept_ns / consts::NANO_SECS_IN_USEC);
         return false;
     }
@@ -3347,7 +3347,7 @@ static bool test_sleep_prompt()
         ulong median = p->took[SLEEP_PROMPT_ROUNDS / 2];
         ok = (median <= SLEEP_PROMPT_MAX_MEDIAN_NS);
         if (!ok)
-            trace(0, "test_sleep_prompt: sleeps of %lu us took %lu us at the median, %lu to %lu",
+            klog(0, "test_sleep_prompt: sleeps of %lu us took %lu us at the median, %lu to %lu",
                 SLEEP_PROMPT_NS / consts::NANO_SECS_IN_USEC, median / consts::NANO_SECS_IN_USEC,
                 p->took[0] / consts::NANO_SECS_IN_USEC, p->took[SLEEP_PROMPT_ROUNDS - 1] / consts::NANO_SECS_IN_USEC);
     }
@@ -3390,7 +3390,7 @@ static bool test_preempt_deferred()
 
     if (!pending_under || pending_after || !counted)
     {
-        trace(0, "test_preempt_deferred: pending under the lock %lu, after the unlock %lu, counted %lu",
+        klog(0, "test_preempt_deferred: pending under the lock %lu, after the unlock %lu, counted %lu",
             (ulong)pending_under, (ulong)pending_after, (ulong)counted);
         return false;
     }
@@ -3491,7 +3491,7 @@ static void locate_trace(const char* test, Task::Where& where)
 {
     char what[2 * SymbolTable::DESCRIBE_MAX];
     where.describe(what, sizeof(what));
-    trace(0, "%s: found %s, %lu frames", test, what, (ulong)where.count);
+    klog(0, "%s: found %s, %lu frames", test, what, (ulong)where.count);
 }
 
 /* A task made, started with p and on cpu (~0UL: any), or nullptr */
@@ -3569,7 +3569,7 @@ static bool test_locate_on_cpu(ulong cpu)
         task->put();
         if (p->gave_up.get() != 0)
         {
-            trace(0, "test_locate_on_cpu: the silent task was never told to stop");
+            klog(0, "test_locate_on_cpu: the silent task was never told to stop");
             ok = false;
         }
     }
@@ -3622,7 +3622,7 @@ static bool test_join_report()
         task->wait(JOIN_TEST_REPORT_NS);
         ok = (Task::get_join_report_count() > before);
         if (!ok)
-            trace(0, "test_join_report: a wait of %lu ms went unreported",
+            klog(0, "test_join_report: a wait of %lu ms went unreported",
                 JOIN_TEST_NAP_NS / consts::NANO_SECS_IN_MS);
     }
     task->put();
@@ -3700,7 +3700,7 @@ bool test_idle_takes_turns()
 
         ok = (took <= TURN_MAX_NS);
         if (!ok)
-            trace(0, "test_idle_takes_turns: a sleep of %lu us in the idle task took %lu us beside a task that yields",
+            klog(0, "test_idle_takes_turns: a sleep of %lu us in the idle task took %lu us beside a task that yields",
                 TURN_SLEEP_NS / consts::NANO_SECS_IN_USEC, took / consts::NANO_SECS_IN_USEC);
     }
     else
@@ -3928,7 +3928,7 @@ bool test_eevdf()
 
     bool ok = (one <= EEVDF_ONE_MEDIAN_NS && two <= EEVDF_TWO_MEDIAN_NS &&
                share >= EEVDF_SHARE_MIN_TENTHS && share <= EEVDF_SHARE_MAX_TENTHS);
-    trace(0, "test_eevdf: on cpu %lu a wakeup waits %lu us beside one spinner, %lu us beside two, "
+    klog(0, "test_eevdf: on cpu %lu a wakeup waits %lu us beside one spinner, %lu us beside two, "
         "at the median; nice 0 has %lu.%lu times nice %ld's CPU",
         cpu, (one == ~0UL) ? 0 : one / consts::NANO_SECS_IN_USEC, (two == ~0UL) ? 0 : two / consts::NANO_SECS_IN_USEC,
         (share == ~0UL) ? 0 : share / 10, (share == ~0UL) ? 0 : share % 10, EEVDF_LIGHT_NICE);
@@ -4054,7 +4054,7 @@ bool test_wake_storm()
     auto* p = mm::talloc<StormProbe, TAG>();
     if (p == nullptr)
     {
-        trace(0, "test_wake_storm: no memory");
+        klog(0, "test_wake_storm: no memory");
         return false;
     }
 
@@ -4116,19 +4116,19 @@ bool test_wake_storm()
             p->slots[holder].worker->locate(where);
             char what[2 * SymbolTable::DESCRIBE_MAX];
             where.describe(what, sizeof(what));
-            trace(0, "test_wake_storm: the token stopped after %lu of %lu passes, %lu ms without one: sent to %s, which is %s",
+            klog(0, "test_wake_storm: the token stopped after %lu of %lu passes, %lu ms without one: sent to %s, which is %s",
                 hops, STORM_HOPS, (now - last_at) / consts::NANO_SECS_IN_MS,
                 p->slots[holder].worker->get_name(), what);
             return false;
         }
 
-        trace(0, "test_wake_storm: %lu passes among %lu tasks on %lu cpus in %lu ms",
+        klog(0, "test_wake_storm: %lu passes among %lu tasks on %lu cpus in %lu ms",
             (ulong)p->hops.get(), p->count, cpu_count,
             (get_boot_time().get_value() - start) / consts::NANO_SECS_IN_MS);
     }
     else
     {
-        trace(0, "test_wake_storm: could not start its tasks");
+        klog(0, "test_wake_storm: could not start its tasks");
     }
 
     p->stop.set(1);

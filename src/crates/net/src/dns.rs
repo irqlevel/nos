@@ -9,7 +9,7 @@
 use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::{Mutex, SpinLock};
 use kcore::time;
-use kcore::trace;
+use kcore::klog;
 
 use crate::abi;
 use crate::udp;
@@ -127,14 +127,14 @@ impl Dns {
         let listener = match nic.listen(CLIENT_PORT, self) {
             Ok(listener) => listener,
             Err(err) => {
-                trace!(0, "dns: port {} could not be listened on ({:?})", CLIENT_PORT, err);
+                klog!(0, "dns: port {} could not be listened on ({:?})", CLIENT_PORT, err);
                 return false;
             }
         };
         *self.listener.lock() = Some(listener);
 
         self.ready.store(true, core::sync::atomic::Ordering::Release);
-        trace!(0, "dns: resolver started, server {}.{}.{}.{}",
+        klog!(0, "dns: resolver started, server {}.{}.{}.{}",
             (server_ip >> 24) & 0xFF, (server_ip >> 16) & 0xFF,
             (server_ip >> 8) & 0xFF, server_ip & 0xFF);
         true
@@ -286,7 +286,7 @@ impl Dns {
             return;
         }
         if flags & RCODE_MASK != 0 {
-            trace!(0, "dns: the server answered id {} with rcode {}", id, flags & RCODE_MASK);
+            klog!(0, "dns: the server answered id {} with rcode {}", id, flags & RCODE_MASK);
             return;
         }
 
@@ -381,7 +381,7 @@ impl Dns {
         };
 
         if !self.send_query(name, id) {
-            trace!(0, "dns: the query could not be sent");
+            klog!(0, "dns: the query could not be sent");
             return None;
         }
 
@@ -400,13 +400,13 @@ impl Dns {
                 if ttl_sec > 0 {
                     self.insert(name, ip, ttl_sec);
                 }
-                trace!(0, "dns: resolved to {}.{}.{}.{}",
+                klog!(0, "dns: resolved to {}.{}.{}.{}",
                     (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
                 return Some(ip);
             }
         }
 
-        trace!(0, "dns: nothing answered within {} ms", timeout_ms);
+        klog!(0, "dns: nothing answered within {} ms", timeout_ms);
         None
     }
 }

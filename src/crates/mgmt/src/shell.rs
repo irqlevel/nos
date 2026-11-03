@@ -15,7 +15,7 @@ use crate::{call, descriptor, job_cancel, job_info, job_list, job_notes, job_res
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kcore::cmd::{Command, Output};
-use kcore::trace;
+use kcore::klog;
 
 const HELP: &str = "mgmt [describe P | call P M [json] | start P M [json] | jobs | job ID | cancel ID]";
 
@@ -27,7 +27,7 @@ pub(crate) fn init() {
     match Command::register("mgmt", HELP, run) {
         /* The bus is the kernel's own, and its command stays for good */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "mgmt: cannot register the mgmt command"),
+        Err(_) => klog!(0, "mgmt: cannot register the mgmt command"),
     }
 }
 

@@ -335,7 +335,7 @@ fn serve(start: Serve) {
     {
         /* Nothing served: the guest's requests stay with the device, and
          * its disk goes quiet -- said, for whoever looks. */
-        kcore::trace!(0, "hv: a disk's task has no memory for its requests");
+        kcore::klog!(0, "hv: a disk's task has no memory for its requests");
         return;
     }
     flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
@@ -360,7 +360,7 @@ fn serve(start: Serve) {
                         }
                         Ok(Started::InFlight) => {
                             /* A slot the device has two requests of: never. */
-                            kcore::trace!(0, "hv: a disk's slot {} started twice", slot);
+                            kcore::klog!(0, "hv: a disk's slot {} started twice", slot);
                         }
                         Ok(Started::Done) => {
                             req.done(true);
@@ -391,7 +391,7 @@ fn serve(start: Serve) {
                 req.done(ok);
                 finished.push(req);
             }
-            None => kcore::trace!(0, "hv: a disk's image gave back slot {}, which it was not given", slot),
+            None => kcore::klog!(0, "hv: a disk's image gave back slot {}, which it was not given", slot),
         });
         if finished.is_empty() {
             /* A request handed over wakes it, and so does a command done --
