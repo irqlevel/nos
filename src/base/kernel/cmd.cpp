@@ -2006,7 +2006,7 @@ static const CmdEntry COMMANDS[] = {
     { "cpu",       cmd_cpu,       "cpu - dump cpu state" },
     { "lscpu",     cmd_lscpu,     "lscpu - identify the cpu and the features the kernel needs" },
     { "dmesg",     cmd_dmesg,     "dmesg [lines] [filter] - dump kernel log" },
-    { "loglevel",  cmd_loglevel,  "loglevel [N] - show or set trace level" },
+    { "loglevel",  cmd_loglevel,  "loglevel [N] - show or set the log level" },
     { "uptime",    cmd_uptime,    "uptime - show uptime" },
     { "date",      cmd_date,      "date - show wall clock time" },
     { "ps",        cmd_ps,        "ps - show tasks" },
