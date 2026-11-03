@@ -238,7 +238,7 @@ void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
 /* The export table the Makefile generates from the ffi declarations: a few
    names at made-up addresses, and the one that makes a module permanent. */
 extern "C" const ModuleExport nos_module_exports[] = {
-    {"kernel_trace", 0x10000},
+    {"kernel_klog", 0x10000},
     {"kernel_alloc", 0x20000},
     {"kernel_free", 0x30000},
     {"kernel_panic", 0x40000},
@@ -308,7 +308,7 @@ struct Ko
     std::vector<std::pair<ulong, std::string>> funcs;
 };
 
-const char* const EXPORTED[] = {"kernel_trace", "kernel_alloc", "kernel_free", "kernel_panic",
+const char* const EXPORTED[] = {"kernel_klog", "kernel_alloc", "kernel_free", "kernel_panic",
                                 "kernel_softirq_register", "kernel_get_boot_time"};
 
 ulong export_addr(const std::string& name)

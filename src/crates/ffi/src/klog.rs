@@ -1,11 +1,19 @@
 unsafe extern "C" {
-    fn kernel_trace(level: u32, msg: *const u8, len: usize);
+    fn kernel_klog(level: u32, msg: *const u8, len: usize);
+    /// Whether the log keeps a line of `level`: values only.
+    pub safe fn kernel_klog_wants(level: u32) -> i32;
 }
 
 pub fn klog(level: u32, s: &str) {
     unsafe {
-        kernel_trace(level, s.as_ptr(), s.len());
+        kernel_klog(level, s.as_ptr(), s.len());
     }
+}
+
+/// Whether a line of `level` is worth formatting: what `klog!` asks first.
+#[inline]
+pub fn wants(level: u32) -> bool {
+    kernel_klog_wants(level) != 0
 }
 
 pub struct KlogBuf {
@@ -53,16 +61,23 @@ impl core::fmt::Write for KlogBuf {
 #[macro_export]
 macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut buf = $crate::klog::__KlogBuf::new();
-        let f = file!();
-        let fname = match f.rfind('/') {
-            Some(i) => &f[i + 1..],
-            None => f,
-        };
-        let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
-        let _ = write!(buf, $($arg)*);
-        $crate::klog::klog($level, buf.as_str());
+        let level: u32 = $level;
+        /* The level first: a line is formatted -- core::fmt, into 512 bytes
+         * of stack -- only when the log keeps it. A klog!(3, ..) on a hot
+         * path used to be formatted at every level and thrown away by the
+         * C++ side's own look at it. */
+        if $crate::klog::wants(level) {
+            use core::fmt::Write;
+            let mut buf = $crate::klog::__KlogBuf::new();
+            let f = file!();
+            let fname = match f.rfind('/') {
+                Some(i) => &f[i + 1..],
+                None => f,
+            };
+            let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
+            let _ = write!(buf, $($arg)*);
+            $crate::klog::klog(level, buf.as_str());
+        }
     }};
 }
 

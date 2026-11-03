@@ -145,7 +145,7 @@ fn info(call: &mut Call) -> Status {
     let cpus = kcore::cpu::online_mask().count_ones();
     let uptime_ns = kcore::time::boot_time_ns();
     let wall = kcore::time::wall_clock_secs();
-    let level = system::trace_level();
+    let level = system::log_level();
 
     call.answer(|w| {
         w.begin_object();
@@ -347,7 +347,7 @@ fn set_log_level(mut p: Params, call: &mut Call) -> Status {
     if let Err(s) = finish(p, call) {
         return s;
     }
-    if !system::set_trace_level(level) {
+    if !system::set_log_level(level) {
         return call.refuse(Status::Invalid, "is past the highest level", Some("level"));
     }
     call.answer(|w| {
