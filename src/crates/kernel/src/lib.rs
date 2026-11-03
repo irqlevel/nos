@@ -7,6 +7,7 @@ mod frames;
 mod ring;
 mod sha256;
 mod system;
+mod trace;
 
 use ffi::alloc::KernelAllocator;
 
@@ -136,6 +137,7 @@ pub extern "C" fn rust_test() {
     sha256::selftest();
     frames::selftest();
     ring::selftest();
+    trace::selftest();
 }
 
 /* Contract: rust_fini must be the last thing before halt.  Block/net

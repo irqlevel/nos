@@ -4159,6 +4159,12 @@ bool test_wake_storm()
 
 /* What a test record of index `index` carries: anything else read back
    under that index is a record torn, or another's. */
+/* Rust's sites (kcore::trace), for the self-test below: `n` test records,
+   the `i`th of sequence number base + i and value (base + i) ^
+   RUST_TRACE_SALT -- src/crates/kernel/src/trace.rs says the same. */
+extern "C" u64 rust_trace_emit_test(u64 base, u64 n);
+static const u64 RUST_TRACE_SALT = 0xA5A5A5A5A5A5A5A5ULL;
+
 static u64 trace_test_value(u64 index)
 {
     return (index * 0x9E3779B97F4A7C15ULL) ^ 0xA5A5A5A5A5A5A5A5ULL;
@@ -4338,7 +4344,12 @@ static bool test_tracepoints()
         return false;
     }
 
+    /* A hundred from here, and a hundred more from Rust's sites through
+       kcore::trace -- the flags' address it asks once, the kernel's emit()
+       -- the path a module's tracepoints take into the rings. Interrupts off
+       for both, so that every one is this CPU's. */
     static const ulong RECORDS = 100;
+    static const ulong ALL = 2 * RECORDS;
     ulong flags = hal::irq_save();
     ulong cpu = cpus.get_current_cpu_id();
     for (ulong i = 0; i < RECORDS; i++)
@@ -4346,31 +4357,33 @@ static bool test_tracepoints()
         tp::Test t = { i, trace_test_value(i) };
         tp::emit(tp::Id::Test, &t, sizeof(t));
     }
+    u64 from_rust = rust_trace_emit_test(RECORDS, RECORDS);
     hal::irq_restore(flags);
 
-    auto records = static_cast<TraceRing::Record*>(mm::alloc((RECORDS + 1) * sizeof(TraceRing::Record), TAG));
+    auto records = static_cast<TraceRing::Record*>(mm::alloc((ALL + 1) * sizeof(TraceRing::Record), TAG));
     if (records == nullptr)
     {
         tp::free_rings();
         tp::set_ring_kib(size_was, con);
         return false;
     }
-    ulong got = tp::read_cpu(cpu, tp::Id::Test, records, RECORDS + 1);
+    ulong got = tp::read_cpu(cpu, tp::Id::Test, records, ALL + 1);
     for (ulong i = 0; i < got && ok; i++)
     {
         tp::Test t;
         stdlib::mem_cpy(&t, records[i].payload, sizeof(t));
-        ok = (t.seq == i && t.value == trace_test_value(i) && records[i].cpu == cpu);
+        u64 value = (i < RECORDS) ? trace_test_value(i) : (i ^ RUST_TRACE_SALT);
+        ok = (t.seq == i && t.value == value && records[i].cpu == cpu);
         if (ok && i != 0 && records[i].cycles < records[i - 1].cycles)
             ok = false;
     }
-    if (!ok || got != RECORDS)
+    if (!ok || got != ALL || from_rust != RECORDS)
     {
         char stat[512];
         stdlib::BufferPrinter sp(stat, sizeof(stat));
         tp::command("stat", sp);
-        klog(0, "Tracepoints: %lu records emitted on cpu %lu, %lu read back%s; the rings: %s", RECORDS, cpu, got,
-             ok ? "" : ", not as they were emitted", stat);
+        klog(0, "Tracepoints: %lu records emitted on cpu %lu, %lu of them by Rust, %lu read back%s; the rings: %s",
+             ALL, cpu, (ulong)from_rust, got, ok ? "" : ", not as they were emitted", stat);
         ok = false;
     }
 
@@ -4378,9 +4391,9 @@ static bool test_tracepoints()
     tp::command("freeze", con);
     if (ok)
     {
-        tp::Test t = { RECORDS, 0 };
+        tp::Test t = { ALL, 0 };
         tp::emit(tp::Id::Test, &t, sizeof(t));
-        if (tp::read_cpu(cpu, tp::Id::Test, records, RECORDS + 1) != RECORDS)
+        if (rust_trace_emit_test(ALL, 1) != 1 || tp::read_cpu(cpu, tp::Id::Test, records, ALL + 1) != ALL)
         {
             klog(0, "Tracepoints: a record taken while recording was frozen");
             ok = false;
@@ -4403,8 +4416,8 @@ static bool test_tracepoints()
         ok = false;
     }
     if (ok)
-        klog(TEST_LL, "Tracepoints: %lu records through emit() on cpu %lu read back, none while frozen, the rings "
-             "freed", RECORDS, cpu);
+        klog(TEST_LL, "Tracepoints: %lu records through emit() on cpu %lu read back, %lu of them Rust's, none "
+             "while frozen, the rings freed", ALL, cpu, RECORDS);
     return ok;
 }
 

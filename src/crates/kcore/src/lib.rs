@@ -28,6 +28,7 @@ pub mod input;
 pub mod interrupt;
 pub mod softirq;
 pub mod timer;
+pub mod trace;
 pub mod cpu;
 pub mod block;
 pub mod net;

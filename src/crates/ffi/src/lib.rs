@@ -28,3 +28,4 @@ pub mod cmd;
 pub mod mgmt;
 pub mod system;
 pub mod fs;
+pub mod trace;
