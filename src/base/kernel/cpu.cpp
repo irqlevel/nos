@@ -463,6 +463,64 @@ void CpuTable::send_tlb_ipi(ulong cpu_mask, IPITask tasks[MAX_CPUS])
             silent, cpu_mask);
 }
 
+namespace
+{
+
+void synchronize_func(void* ctx, Context* ipi_ctx)
+{
+    (void)ctx;
+    (void)ipi_ctx;
+}
+
+}
+
+void CpuTable::synchronize(const char* what)
+{
+    static const ulong ACK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
+    ulong cpu_mask = get_remote_cpu_mask();
+    if (cpu_mask == 0)
+        return;
+
+    IPITask tasks[MAX_CPUS];
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!(cpu_mask & (1UL << i)))
+        {
+            /* A task's completion starts at 1, and a WaitGroup that goes
+               with its count above 0 is a BUG: done, for one never sent. */
+            tasks[i].completion.done();
+            continue;
+        }
+        tasks[i].function = synchronize_func;
+        cpu_array_[i].queue_ipi_task_async(tasks[i]);
+    }
+
+    stdlib::Time deadline = get_boot_time() + stdlib::Time(ACK_TIMEOUT_NS);
+    ulong silent = 0;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!(cpu_mask & (1UL << i)))
+            continue;
+        while (tasks[i].completion.get_counter() != 0)
+        {
+            if (get_boot_time() >= deadline)
+            {
+                silent |= (1UL << i);
+                break;
+            }
+            /* yield_to_runnable, as the shootdown's wait is, for the same
+               reason: the answer comes from the other CPU's handler. */
+            yield_to_runnable();
+        }
+    }
+
+    /* Every task's answer had: none of them is the other CPU's any more,
+       and they go with this frame. */
+    if (silent != 0)
+        PANIC("%s: cpus 0x%lX never took the interrupt (asked 0x%lX)", what, silent, cpu_mask);
+}
+
 void CpuTable::invalidate_tlb_all()
 {
     mm::PageTable::invalidate_local_tlb();
