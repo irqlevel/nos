@@ -137,6 +137,7 @@ TaskQueue::TaskQueue()
     , stall_runnable_(0)
     , idle_counted_(false)
     , index_(0)
+    , idle_open_(0)
     , idle_task_(nullptr)
 {
     stdlib::AutoLock lock(lock_);
@@ -217,14 +218,14 @@ void TaskQueue::switch_complete(Task* curr)
                 from = prev->task_queue_->index();
             prev->task_queue_->remove(prev);
             prev->preempt_disable_counter_.dec();
-            task_queue->insert(prev);
 
-            /* Both queues' now: the one it left and the one it went to.
-               After the insert, so that a reader of the record finds the
-               task where it says it is -- and before put(), so that the
-               record never reads a task the put may have freed. */
+            /* The queue it left and the one it goes to, recorded while it is
+               on neither: once inserted, the other CPU may switch to it, and
+               a record after could come after that switch. Under the get()
+               above, so the record never reads a task put() may free. */
             if (tracing)
                 tp::emit_sched_migrate(prev, from, task_queue->index());
+            task_queue->insert(prev);
             prev->put();
         }
         else
@@ -242,10 +243,6 @@ void TaskQueue::switch_complete(Task* curr)
            remove_init'd in Schedule, so it is free to reuse. */
         stdlib::AutoLock lock(exited_lock_);
         exited_list_.insert_tail(&prev->list_entry_);
-
-        /* The last of it this CPU does before the task's stack is free */
-        if (unlikely(tp::on(tp::Id::SchedExit)))
-            tp::emit_sched_exit(prev, index_);
     }
 }
 
@@ -331,7 +328,14 @@ void TaskQueue::switch_to(Task* next, Task* curr, ScheduleReason why, bool prev_
     stdlib::Time now = get_boot_time();
     note_run(next, curr, now.get_value());
     next->run_start_time_ = now;
+    next->switched_in_at_ = now.get_value();
     next->sched_.exec_start = now.get_value();
+
+    /* An idle the trace opened (Cpu::idle) ends here when a decision takes
+       the CPU from its idle task before the halt has returned to it: the
+       CPU woke for `next`, and what `next` runs is no idle. */
+    if (unlikely(idle_is_open()) && close_idle() && tp::on(tp::Id::IdleExit))
+        tp::emit_idle(tp::Id::IdleExit, index_, curr);
 
     /* The switch, recorded with the two tasks as the CPU is leaving them:
        what the one before went to be, and why. Nothing of it is built while
@@ -545,12 +549,15 @@ void TaskQueue::wake_due(ulong now, ulong& touched)
         {
             task->woke_at_deadline_.set(1);
             task->wake_time_.set((long)until);
-            enqueue(task);
 
             /* A deadline's own wakeup: nobody called unblock(), so no waker
-               and the flag set -- what tells it from one someone made. */
+               and the flag set -- what tells it from one someone made. Its
+               wait is counted from the deadline (wake_time_, `sched`, the
+               trigger), so the record says how late this walk came to it.
+               Before the enqueue, as unblock()'s is before its hand-over. */
             if (unlikely(tp::on(tp::Id::SchedWakeup)))
-                tp::emit_sched_wakeup(task, index_, true, nullptr);
+                tp::emit_sched_wakeup(task, index_, true, nullptr, now - until);
+            enqueue(task);
         }
     }
 }
@@ -772,12 +779,14 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
                 curr->switched_out_runnable_ = false;
                 went_sleeping = true;
                 /* Recorded here, where the queue's lock still says what the
-                   task went to be. How long it was on the CPU is from
-                   run_start_time_, which the switch in set: exec_start is
-                   already past it -- account() above charged it to now. */
+                   task went to be. How long it was on the CPU is from the
+                   switch that gave it the CPU (switched_in_at_): exec_start
+                   is charged on at every decision, and run_start_time_ moved
+                   on at every one that left it the CPU. */
                 if (unlikely(tp::on(tp::Id::SchedBlock)))
                 {
-                    ulong ran = now - curr->run_start_time_.get_value();
+                    ulong in = curr->switched_in_at_;
+                    ulong ran = (now > in) ? now - in : 0;
                     tp::emit_sched_block(curr, CpuTable::get_instance().get_current_cpu_id(), ran);
                 }
             }
@@ -986,12 +995,13 @@ static void schedule_current(ScheduleReason why)
         if (curr->is_idle())
             preempts_deferred_idle.inc();
 
-        /* A reschedule that came and went: what the count was says whose
-           section it landed in, and `idle` whether the CPU was an idle
-           task's -- the case a woken vCPU waited a slice in (Cpu::idle). */
+        /* A reschedule that came and went: what the count was as it found
+           it -- the inc() above taken back out -- says whose section it
+           landed in, and `idle` whether the CPU was an idle task's -- the
+           case a woken vCPU waited a slice in (Cpu::idle). */
         if (unlikely(tp::on(tp::Id::SchedPreemptDeferred)))
             tp::emit_sched_preempt_deferred(curr, CpuTable::get_instance().get_current_cpu_id(),
-                (ulong)curr->preempt_disable_counter_.get(), curr->is_idle());
+                (ulong)curr->preempt_disable_counter_.get() - 1, curr->is_idle());
 
         stdlib::AutoLock lock(curr->lock_);
         curr->update_runtime();

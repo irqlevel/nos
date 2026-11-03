@@ -194,6 +194,11 @@ struct SchedWakeup
     /* The task that woke it, when woken from one of a task's stacks --
        from an interrupt's context it is the task the interrupt landed on */
     u32 waker_pid;
+    /* A deadline's: how long past the deadline the sleep list was walked
+       -- a timer late, a CPU with interrupts off. Its wait is counted from
+       the deadline, as `sched` and the wakeup trigger count it; 0 for an
+       unblock() */
+    u32 late_ns;
 };
 
 struct SchedBlock
@@ -271,7 +276,7 @@ struct SchedSlice
    task.h it needs for the pid and the name is tracepoint.cpp's to include
    -- not this header's, which the scheduler's own includes read. */
 void emit_sched_switch(Task* prev, Task* next, ulong cpu, u8 state, u8 reason);
-void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker);
+void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker, ulong late_ns);
 void emit_sched_block(Task* task, ulong cpu, ulong ran_ns);
 void emit_sched_migrate(Task* task, ulong from, ulong to);
 void emit_sched_new(Task* task, ulong cpu);

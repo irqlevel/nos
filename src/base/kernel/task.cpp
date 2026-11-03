@@ -30,6 +30,7 @@ Task::Task()
     , wake_time_(0)
     , woke_at_deadline_(0)
     , switched_out_runnable_(false)
+    , switched_in_at_(0)
     , prev_(nullptr)
     , magic_(TASK_MAGIC)
     , cpu_affinity_(~(0UL))
@@ -161,19 +162,22 @@ void Task::unblock()
 
     woke_at_deadline_.set(0);
     wake_time_.set((long)get_boot_time().get_value());
-    task_queue_->push_wake(this);
 
-    /* Woken by someone: the deadline flag is 0 here, and a deadline's own
-       wakeup is recorded where the sleep list is walked (TaskQueue::wake_due),
-       which knows what the queue's lock says. Who woke it is the task this
-       runs on, if any -- an interrupt's context has the task it landed on,
-       and before the scheduler is up, none -- looked up only once the event
-       is on. */
+    /* Woken by someone, recorded before the task is handed back: from
+       push_wake on its CPU may run it -- and see it exit, or move it, and
+       clear or change task_queue_ -- and a record after would come after the
+       switch it caused. Waking, it is still this caller's alone. A
+       deadline's own wakeup is recorded where the sleep list is walked
+       (TaskQueue::wake_due). Who woke it is the task this runs on, if any --
+       an interrupt's context has the task it landed on, and before the
+       scheduler is up, none -- looked up only once the event is on. */
     if (unlikely(tp::on(tp::Id::SchedWakeup)))
     {
         Task* waker = preempt_is_on() ? Task::try_get_current_task() : nullptr;
-        tp::emit_sched_wakeup(this, task_queue_->index(), false, waker);
+        tp::emit_sched_wakeup(this, task_queue_->index(), false, waker, 0);
     }
+
+    task_queue_->push_wake(this);
 }
 
 bool Task::is_blocked()
@@ -187,6 +191,13 @@ void Task::exit()
     BUG_ON(this != get_current_task());
 
     exit_time_ = get_boot_time();
+
+    /* Recorded while the pid is still its own: TaskTable hands the lowest
+       free id to the next task started, on any CPU, and a record after the
+       remove could come after that task's sched_new under the same pid */
+    if (unlikely(tp::on(tp::Id::SchedExit)))
+        tp::emit_sched_exit(this, CpuTable::get_instance().get_current_cpu_id());
+
     TaskTable::get_instance().remove(this);
     state_.set(STATE_EXITED);
 
@@ -587,12 +598,14 @@ bool Task::start(Func func, void* ctx)
     auto task_queue = select_next_task_queue();
     if (task_queue == nullptr)
         return false;
-    task_queue->insert(this);
 
-    /* The first queue it lives on: before it can run anywhere, so that a
-       reader of the record has the task before any switch of it. */
+    /* The first queue it lives on, recorded before the insert: from there it
+       can run -- an interrupt the insert's unlock lets in may switch to it on
+       this very CPU -- and a record after could come after its first
+       switch, or its exit. */
     if (unlikely(tp::on(tp::Id::SchedNew)))
         tp::emit_sched_new(this, task_queue->index());
+    task_queue->insert(this);
     return true;
 }
 
@@ -603,13 +616,14 @@ bool Task::run(class TaskQueue& task_queue, Func func, void* ctx)
 
     start_time_ = get_boot_time();
     run_start_time_ = get_boot_time();
+    switched_in_at_ = run_start_time_.get_value();
     state_.set(STATE_RUNNING);
 
-    task_queue.insert(this);
-
-    /* The first queue it lives on (Task::start) */
+    /* The first queue it lives on, before the insert (Task::start) */
     if (unlikely(tp::on(tp::Id::SchedNew)))
         tp::emit_sched_new(this, task_queue.index());
+
+    task_queue.insert(this);
 
     /* Never returns: Run is only used for the idle/boot task bodies */
     hal::run_on_stack((ulong)&stack_ptr_->stack_top[0], function_, ctx_);
