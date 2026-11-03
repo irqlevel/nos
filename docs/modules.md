@@ -293,9 +293,11 @@ it up.
 
 A module compiled against one version of those declarations and loaded into
 a kernel built from another would call functions with arguments they no
-longer take. The build hashes the `ffi` crate's sources into a digest that
-goes into every module's header and into the kernel, and the loader refuses a
-module whose digest is not the kernel's:
+longer take. The build hashes the `ffi` crate's sources -- and the
+tracepoints' payloads kcore declares (`kcore/src/trace/events.rs`), bytes a
+module's sites hand the kernel's `emit()` ([tracing](tracing.md#tracepoints-from-rust))
+-- into a digest that goes into every module's header and into the kernel,
+and the loader refuses a module whose digest is not the kernel's:
 
 ```
 module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e7...) -- rebuild it from this tree

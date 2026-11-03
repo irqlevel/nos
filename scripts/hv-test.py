@@ -61,6 +61,14 @@ KVM it is whatever the host CPU has):
     compressed, and version 2 -- the disk they were made of, as its SHA-256
     has it; refuses to write over a disk, an image cut short (leaving
     nothing behind) and a disk that is raw already (on arm64 too)
+  - the hypervisor's tracepoints (`trace on hv`): every exit of the `exits`
+    guest recorded -- its 21 port accesses, its CPUID and its HLT, each with
+    what it was about, and nothing but the host's own interrupts besides --
+    one task's, with its times; the `smp` guest's INIT and start-up IPIs and
+    its second CPU's IPI, each written to the ICR and each ringing the CPU
+    it is for, its timer's interrupt asked for once and both interrupts
+    injected once (where the host injects them), every halt ended by a
+    wake; and with the events off, nothing recorded
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
@@ -235,6 +243,42 @@ SCRIPT = [
     # whose lines need the port of the test's web server -- and an rmmod.
     "insmod /hv.ko",        # 37
 ] + CONVERT
+
+# The hypervisor's tracepoints, after the creates' rmmod: two guests run
+# with the group on, each window read and then cleared, and a run with every
+# event off. Indexed from the phase's first line (`trace_checks`).
+TRACE = [
+    "insmod /hv.ko",        # 0
+    "hv on",                # 1
+    "trace on hv",          # 2
+    "hv run exits 0",       # 3
+    "trace show 4096 hv",   # 4
+    "trace clear",          # 5
+    "hv run smp 0",         # 6
+    "trace show 4096 hv",   # 7
+    "trace clear",          # 8
+    "trace off all",        # 9
+    "hv run exits 0",       # 10
+    "trace show 4096 hv",   # 11
+    "rmmod hv",             # 12
+]
+
+# What the `exits` guest does (hv/src/guests.rs): says "nos: ports and
+# cpuid" a byte at a time through the debug port, reads it back once, asks
+# CPUID once and halts.
+EXITS_PORT = 0xE9
+EXITS_OUT = len("nos: ports and cpuid")
+EXITS_CPUID_LEAF = 0x4E4F5300
+# The x2APIC's interrupt command register, and the `smp` guest's two
+# vectors: its second CPU's IPI and its first's APIC timer.
+MSR_X2APIC_ICR = 0x830
+SMP_IPI_VECTOR = 0x40
+SMP_TIMER_VECTOR = 0x41
+# hv_exit's info for a port access's IN, and for a write (hv/src/tp.rs).
+IO_IN = 0x100
+WRITE = 0x1
+# What the trace says a pid off a task's stack is (tp::NO_TASK_PID).
+NO_TASK_PID = 0xFFFFFFFF
 
 # hvboot, as `make` builds it: the PVH image the script boots.
 HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
@@ -667,7 +711,7 @@ def x86(args):
     convert_images(tmp, staged)
     www, grown, raw = create_images(tmp, staged)
     server, port = web_server(www)
-    script = SCRIPT + create_script(port) + ["rmmod hv", RC_LAST]
+    script = SCRIPT + create_script(port) + ["rmmod hv"] + TRACE + [RC_LAST]
     image, digest = rootfs(tmp, "x86_64", script)
 
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
@@ -716,6 +760,105 @@ def x86(args):
 # with a command's output instead, as hv-linux-test's is.
 RC_LAST = "version"
 RC_DONE = re.compile(r"(?m)^> version\n.+\n")
+
+
+TRACE_LINE = re.compile(r"^\s*\d+\.\d+\s+\d+\s+(hv_\w+):((?: \w+=\S+)*)\s*$")
+
+
+def trace_records(text):
+    """The hv records `trace show` printed: (event, {field: value}) in time
+    order, a number's value an int -- hex, decimal, or a time's ns."""
+    recs = []
+    for line in text.splitlines():
+        m = TRACE_LINE.match(line)
+        if not m:
+            continue
+        fields = {}
+        for word in m.group(2).split():
+            key, value = word.split("=", 1)
+            if value.endswith("us") and re.match(r"^\d+\.\d{3}us$", value):
+                whole, frac = value[:-2].split(".")
+                fields[key] = int(whole) * 1000 + int(frac)
+            elif re.match(r"^0x[0-9A-Fa-f]+$", value):
+                fields[key] = int(value, 16)
+            elif re.match(r"^\d+$", value):
+                fields[key] = int(value)
+            else:
+                fields[key] = value
+        recs.append((m.group(1), fields))
+    return recs
+
+
+def trace_checks(out, apicv):
+    """The hypervisor's tracepoints: what `TRACE` ran, by its lines."""
+    pt.check("trace on hv turns the group's events on", re.search(r"\b6\b", out[2]) is not None
+             and "no event" not in out[2], out[2])
+
+    # The `exits` guest's run: every exit of its own recorded, each with
+    # what it was about -- and nothing else but the host's interrupts.
+    recs = trace_records(out[4])
+    exits = [f for e, f in recs if e == "hv_exit"]
+    io = [f for f in exits if f.get("reason") == "io"]
+    outs = [f for f in io if f.get("detail") == EXITS_PORT and f.get("info") == 1]
+    ins = [f for f in io if f.get("detail") == EXITS_PORT and f.get("info") == 1 | IO_IN]
+    pt.check("hv_exit records every port access of the exits guest: %d bytes out to 0xE9 and one read back, a "
+             "byte each" % EXITS_OUT, len(outs) == EXITS_OUT and len(ins) == 1 and len(io) == EXITS_OUT + 1, out[4])
+    pt.check("and its one CPUID, of its leaf, and its HLT",
+             [f.get("detail") for f in exits if f.get("reason") == "cpuid"] == [EXITS_CPUID_LEAF]
+             and len([f for f in exits if f.get("reason") == "hlt"]) == 1, out[4])
+    pt.check("and nothing else of it but the host's own interrupts",
+             all(f.get("reason") in ("io", "cpuid", "hlt", "host") for f in exits)
+             and all(e == "hv_exit" for e, _ in recs), out[4])
+    pids = {f.get("pid") for f in exits}
+    pt.check("all of them CPU 0's, of one task", exits != [] and all(f.get("vcpu") == 0 for f in exits)
+             and len(pids) == 1 and NO_TASK_PID not in pids, out[4])
+    # Times: each entry's out of the guest since the last exit, but the
+    # first -- the one before it was not timed -- and nothing a second long.
+    pt.check("each with its time in the guest, and out of it since the exit before but the first's",
+             all(f.get("guest_ns", -1) < 10 ** 9 and f.get("since_ns", -1) < 10 ** 9 for f in exits)
+             and all(f.get("out_ns", 0) > 0 for f in exits[1:]), out[4])
+
+    # The `smp` guest's run: the first CPU's INIT, its de-assert and two
+    # start-up IPIs written to the ICR, the second's IPI to the first; each
+    # rings the CPU it is for -- but the de-assert, which does nothing.
+    recs = trace_records(out[7])
+    exits = [f for e, f in recs if e == "hv_exit"]
+    icr = lambda cpu: [f for f in exits if f.get("vcpu") == cpu and f.get("reason") == "msr"
+                       and f.get("detail") == MSR_X2APIC_ICR and f.get("info") == WRITE]
+    pt.check("hv_exit records the smp guest's ICR writes: CPU 0's INIT, de-assert and two start-up IPIs, CPU 1's "
+             "IPI", len(icr(0)) == 4 and len(icr(1)) == 1, out[7])
+    pid = {cpu: {f.get("pid") for f in exits if f.get("vcpu") == cpu} for cpu in (0, 1)}
+    pt.check("each CPU's records of one task of its own",
+             all(len(pid[c]) == 1 for c in (0, 1)) and pid[0] != pid[1], out[7])
+    rings = [f for e, f in recs if e == "hv_ring"]
+    p0 = next(iter(pid[0]), None)
+    p1 = next(iter(pid[1]), None)
+    pt.check("hv_ring: CPU 1 rung by CPU 0's task for the INIT and both start-up IPIs",
+             len([f for f in rings if f.get("vcpu") == 1 and f.get("pid") == p0]) >= 3, out[7])
+    pt.check("and CPU 0 by CPU 1's for its IPI",
+             len([f for f in rings if f.get("vcpu") == 0 and f.get("pid") == p1]) >= 1, out[7])
+    timers = [f for e, f in recs if e == "hv_timer"]
+    pt.check("hv_timer: CPU 0's one-shot APIC timer asked for once",
+             len(timers) == 1 and timers[0].get("vcpu") == 0, out[7])
+    injects = [f for e, f in recs if e == "hv_inject" and f.get("kind") == "apic"]
+    if apicv:
+        pt.check("hv_inject: no APIC interrupt the host's to inject, the CPU delivering them", injects == [], out[7])
+    else:
+        pt.check("hv_inject: the IPI and the timer's interrupt each injected into CPU 0 once",
+                 sorted(f.get("vector") for f in injects) == [SMP_IPI_VECTOR, SMP_TIMER_VECTOR]
+                 and all(f.get("vcpu") == 0 for f in injects), out[7])
+    # A halt and what woke it, one after the other, CPU by CPU.
+    halts = [(e, f) for e, f in recs if e in ("hv_halt", "hv_wake")]
+    alternate = True
+    for cpu in (0, 1):
+        seq = [e for e, f in halts if f.get("vcpu") == cpu]
+        alternate = alternate and seq == ["hv_halt", "hv_wake"] * (len(seq) // 2) and len(seq) % 2 == 0
+    pt.check("hv_halt and hv_wake: CPU 0 halted for its IPI and its timer, every halt ended by a wake",
+             alternate and any(f.get("vcpu") == 0 and f.get("until") == "timer" for e, f in halts if e == "hv_halt"),
+             out[7])
+
+    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[11], out[11])
+    pt.check("and hv unloads after", "hv unloaded" in out[12], out[12])
 
 
 def wait_done(log, timeout):
@@ -955,10 +1098,12 @@ def x86_checks(ran, script, digest, grown, raw):
     pt.check("hv loads for hv convert", "hv loaded at" in out[37], out[37])
     convert_checks(out[38:38 + len(CONVERT)], digest)
     at = 38 + len(CONVERT)
-    # Of what is left: the creates, then `rmmod hv` and `RC_LAST`.
-    created = len(script) - 2 - at
+    # Of what is left: the creates, then `rmmod hv`, TRACE and `RC_LAST`.
+    created = len(script) - 2 - len(TRACE) - at
     create_checks(out[at:at + created], grown, raw)
     pt.check("and unloads after it", "hv unloaded" in out[at + created], out[at + created])
+    at += created + 1
+    trace_checks(out[at:at + len(TRACE)], apicv)
 
 
 def arm64(args):

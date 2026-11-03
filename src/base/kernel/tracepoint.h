@@ -53,6 +53,16 @@ enum class Id : u16
        record of its own -- the slice armed on the timer. */
     SchedSlice,
 
+    /* The hypervisor's (group "hv"), recorded by the hv module's Rust: a
+       guest CPU's exits, what goes in at its entries, its halts and what
+       woke it, its timer's interrupts, and the rings between its CPUs. */
+    HvExit,
+    HvInject,
+    HvHalt,
+    HvWake,
+    HvTimer,
+    HvRing,
+
     Count
 };
 
@@ -267,6 +277,75 @@ struct SchedSlice
     u32 slice_ns;
     /* The tasks the queue had that could run */
     u32 runnable;
+};
+
+/* ---- the hypervisor's payloads ----
+   Recorded by the hv module's Rust (src/crates/hv: vm.rs, run.rs, smp.rs),
+   which declares each in kcore/src/trace/events.rs: every boot holds those
+   to the descriptions in tracepoint.cpp, a field's name, offset and size and
+   an enumeration's names value by value, so the two are one layout. These
+   are here for the descriptions' offsets; nothing in C++ fills one. A guest
+   CPU is said by its number in its guest and its task's pid, which tells
+   one VM's from another's. `pad` keeps each free of padding, which Rust's
+   side has to be. */
+
+struct HvExit
+{
+    u64 detail;
+    u64 rip;
+    u32 pid;
+    u32 guest_ns;
+    u32 out_ns;
+    u32 since_ns;
+    u32 info;
+    u16 vcpu;
+    u8 reason;
+    u8 pad;
+};
+
+struct HvInject
+{
+    u32 pid;
+    u16 vcpu;
+    u8 vector;
+    u8 kind;
+};
+
+struct HvHalt
+{
+    u32 pid;
+    u32 wait_ns;
+    u32 poll_ns;
+    u16 vcpu;
+    u8 until;
+    u8 pad;
+};
+
+struct HvWake
+{
+    u32 pid;
+    u32 halted_ns;
+    u32 late_ns;
+    u16 vcpu;
+    u8 how;
+    u8 pad;
+};
+
+struct HvTimer
+{
+    u32 pid;
+    u32 late_ns;
+    u16 vcpu;
+    u8 how;
+    u8 pad;
+};
+
+struct HvRing
+{
+    u32 pid;
+    u16 vcpu;
+    u8 how;
+    u8 pad;
 };
 
 /* ---- the sites ----

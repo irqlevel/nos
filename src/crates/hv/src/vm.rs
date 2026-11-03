@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU64;
 
 use hvarch::x86::svm::vmcb::Save;
-use hvarch::x86::svm::{GuestRegs, Kick, Profile};
+use hvarch::x86::svm::{GuestRegs, Kick, Profile, Run};
 use hvarch::{Ext, Result};
 
 use crate::machine::Machine;
@@ -345,6 +345,14 @@ impl Backend {
     pub fn profile(&self) -> Option<Profile> {
         match self { Backend::Svm(v) => v.profile(), Backend::Vmx(v) => v.profile() }
     }
+    /// Its last entry's world switch, where it was timed ([`Run`]).
+    pub fn last_run(&self) -> Run {
+        match self { Backend::Svm(v) => v.last_run(), Backend::Vmx(v) => v.last_run() }
+    }
+    /// The host's interrupt its last exit was for, where the extension says.
+    pub fn host_vector(&self) -> Option<u8> {
+        match self { Backend::Svm(v) => v.host_vector(), Backend::Vmx(v) => v.host_vector() }
+    }
     pub fn asid(&self) -> Option<u32> {
         match self { Backend::Svm(v) => v.asid(), Backend::Vmx(v) => v.asid() }
     }
@@ -360,18 +368,20 @@ pub struct Cpu {
     backend: Backend,
     /// The identity of the nested table it was made for.
     table: u64,
+    /// Its number in its guest, which its trace records say it by.
+    index: u32,
 }
 
 impl Cpu {
-    /// A CPU for the guest whose memory is `memory`, of whichever kind the
-    /// machine runs, in no state yet, that stops at `exceptions`.
-    pub fn new(machine: &Machine, memory: &GuestMemory, exceptions: u32) -> Result<Self> {
+    /// CPU `index` of the guest whose memory is `memory`, of whichever kind
+    /// the machine runs, in no state yet, that stops at `exceptions`.
+    pub fn new(machine: &Machine, memory: &GuestMemory, exceptions: u32, index: u32) -> Result<Self> {
         let caps = machine.caps();
         let backend = match machine.ext()? {
             Ext::Svm => Backend::Svm(crate::svm::Vcpu::new(caps, exceptions)?),
             Ext::Vmx => Backend::Vmx(crate::vmx::Vcpu::new(caps, exceptions)?),
         };
-        Ok(Self { backend, table: memory.nested().id })
+        Ok(Self { backend, table: memory.nested().id, index })
     }
 
     pub fn backend(&self) -> &Backend {
@@ -388,13 +398,24 @@ impl Cpu {
     /// pages its nested table maps stay the guest's until it has left. With
     /// `kick`, the entry is the vCPU's in `Kick`'s sense, and one a kick
     /// refused is `Exit::Kicked`.
+    ///
+    /// Every entry of every guest comes through here, so here is where its
+    /// `hv_exit` is recorded -- a Linux guest's and a built-in one's alike.
     pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         if memory.nested().id != self.table {
             return Err(Refusal::NotItsMemory);
         }
-        self.backend.enter(memory, machine.host_areas(), kick)
+        let entered = self.backend.enter(memory, machine.host_areas(), kick);
+        if kcore::trace::on::<kcore::trace::HvExit>() {
+            if let Ok((exit, _)) = &entered {
+                let b = &self.backend;
+                let regs = crate::tp::ExitRegs { rip: b.save().rip, rax: b.save().rax, rcx: b.regs().rcx };
+                crate::tp::exit(self.index, exit, regs, b.last_run(), b.host_vector());
+            }
+        }
+        entered
     }
 }
 
@@ -411,7 +432,7 @@ impl Vm {
     /// memory yet, and a CPU in no state yet that stops at `exceptions`.
     pub fn new(machine: &Machine, exceptions: u32) -> Result<Self> {
         let memory = GuestMemory::new(machine.caps().vendor())?;
-        let cpu = Cpu::new(machine, &memory, exceptions)?;
+        let cpu = Cpu::new(machine, &memory, exceptions, 0)?;
         Ok(Self { memory, cpu })
     }
 
