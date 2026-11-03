@@ -1,5 +1,5 @@
 #include "memory_map.h"
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/stdlib.h>
 
 extern "C" char kernel_end;
@@ -24,14 +24,14 @@ bool MemoryMap::add_region(ulong addr, ulong len, ulong type)
 
     if (addr >= MAX_PHYS_ADDR)
     {
-        trace(0, "mm: region 0x%lX len 0x%lX type %lu is past the physical address space, dropped",
+        klog(0, "mm: region 0x%lX len 0x%lX type %lu is past the physical address space, dropped",
             addr, len, type);
         return true;
     }
 
     if (len > MAX_PHYS_ADDR - addr)
     {
-        trace(0, "mm: region 0x%lX len 0x%lX type %lu reaches past the physical address space, cut at 0x%lX",
+        klog(0, "mm: region 0x%lX len 0x%lX type %lu reaches past the physical address space, cut at 0x%lX",
             addr, len, type, MAX_PHYS_ADDR);
         len = MAX_PHYS_ADDR - addr;
     }

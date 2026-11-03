@@ -124,11 +124,11 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
        log. Nothing else runs yet to race it for the file. */
     let mut notes = String::new();
     match load_keys(&state.keys, &mut notes) {
-        Ok(count) => kcore::trace!(0, "sshd: {} authorized keys in {}", count, AUTHORIZED_KEYS_PATH),
-        Err(problem) => kcore::trace!(0, "sshd: {}", problem),
+        Ok(count) => kcore::klog!(0, "sshd: {} authorized keys in {}", count, AUTHORIZED_KEYS_PATH),
+        Err(problem) => kcore::klog!(0, "sshd: {}", problem),
     }
     for line in notes.lines() {
-        kcore::trace!(0, "{}", line);
+        kcore::klog!(0, "{}", line);
     }
 
     let st = state.clone();
@@ -265,7 +265,7 @@ fn start<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Outp
         return Err("started from somewhere else meanwhile".to_string());
     }
 
-    kcore::trace!(0, "sshd: listening on port {}, host key {}", port, fingerprint);
+    kcore::klog!(0, "sshd: listening on port {}, host key {}", port, fingerprint);
     let _ = writeln!(
         out,
         "sshd: listening on port {} -- {} {} -- host key {} (ED25519), {} authorized keys",
@@ -298,7 +298,7 @@ fn stop(state: &State, out: &mut Output) -> Result<(), String> {
     let port = server.port;
     /* Out of the lock: this waits for the listener and every session */
     drop(server);
-    kcore::trace!(0, "sshd: stopped serving port {}", port);
+    kcore::klog!(0, "sshd: stopped serving port {}", port);
     let _ = writeln!(out, "sshd: stopped serving port {}", port);
     Ok(())
 }
@@ -656,7 +656,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         shared.sessions.with(|v| (v.len(), v.iter().filter(|s| s.user.is_none()).count()));
     if total >= MAX_SESSIONS || logging_in >= MAX_LOGGING_IN {
         shared.stats.refused.fetch_add(1, Ordering::Relaxed);
-        kcore::trace!(1, "sshd: {} refused: {} sessions, {} of them logging in", peer, total, logging_in);
+        kcore::klog!(1, "sshd: {} refused: {} sessions, {} of them logging in", peer, total, logging_in);
         /* Reset, not closed: closing first on everyone turned away would
            keep a TCP slot a minute each, and run the kernel out of them */
         stream.abort();
@@ -687,7 +687,7 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
         None => {
             drop(unsafe { Box::from_raw(ctx as *mut SessionCtx) });
             shared.sessions.with(|v| v.retain(|s| s.id != id));
-            kcore::trace!(0, "sshd: no task for a session from {}", peer);
+            kcore::klog!(0, "sshd: no task for a session from {}", peer);
         }
     }
 }
@@ -719,12 +719,12 @@ extern "C" fn session_main(ctx: *mut u8) {
 
     let secs = boot_time_ns().saturating_sub(started) / NS_PER_SEC;
     match (&shell.user, result) {
-        (Some(user), Ok(())) => kcore::trace!(0, "sshd: {} from {} logged out after {} s", user, peer, secs),
-        (Some(user), Err(e)) => kcore::trace!(0, "sshd: {} from {} gone after {} s: {}", user, peer, secs, e),
+        (Some(user), Ok(())) => kcore::klog!(0, "sshd: {} from {} logged out after {} s", user, peer, secs),
+        (Some(user), Err(e)) => kcore::klog!(0, "sshd: {} from {} gone after {} s: {}", user, peer, secs, e),
         (None, Ok(())) => {}
         (None, Err(e)) => {
             shared.stats.unauthenticated.fetch_add(1, Ordering::Relaxed);
-            kcore::trace!(1, "sshd: {} gone before a login: {}", peer, e);
+            kcore::klog!(1, "sshd: {} gone before a login: {}", peer, e);
         }
     }
 
@@ -821,7 +821,7 @@ impl ssh::Shell for KernelShell<'_> {
             .keys
             .with(|keys| keys.iter().find(|k| k.key == *key).map(|k| k.comment.clone()))
             .unwrap_or_default();
-        kcore::trace!(0, "sshd: {} logged in from {} with {} {}", user, self.peer, key.fingerprint(), comment);
+        kcore::klog!(0, "sshd: {} logged in from {} with {} {}", user, self.peer, key.fingerprint(), comment);
     }
 
     fn run(&mut self, line: &str, io: &mut dyn ssh::Io) {

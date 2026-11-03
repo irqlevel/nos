@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::nic::Nic;
 use kcore::sync::SpinLock;
 use kcore::time;
-use kcore::trace;
+use kcore::klog;
 
 use crate::arp::ArpTable;
 use crate::wire::{self, eth, icmp, ip, ETH_HDR_LEN, ETH_TYPE_IP, ICMP_HDR_LEN,
@@ -142,7 +142,7 @@ impl Icmp {
             return;
         }
 
-        trace!(ICMP_LL, "icmp: echo request from {:#x} id {} seq {}",
+        klog!(ICMP_LL, "icmp: echo request from {:#x} id {} seq {}",
             ip::src(packet), icmp::id(msg), icmp::seq(msg));
 
         let mut reply = [0u8; MAX_FRAME];

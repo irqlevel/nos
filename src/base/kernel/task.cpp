@@ -1,6 +1,6 @@
 #include "task.h"
 #include "stack_probe.h"
-#include "trace.h"
+#include "klog.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
 #include <hal/barrier.h>
@@ -48,7 +48,7 @@ Task::Task(const char* name)
 {
     /* Cut as a format's output is, marked where it is cut */
     stdlib::sn_printf(name_, stdlib::array_size(name_), "%s", name);
-    trace(TASK_LL, "task 0x%p %s", this, name_);
+    klog(TASK_LL, "task 0x%p %s", this, name_);
 }
 
 Task::~Task()
@@ -57,7 +57,7 @@ Task::~Task()
     BUG_ON(stack_ptr_ != nullptr);
     BUG_ON(!sched_.entry.is_empty());
     BUG_ON(!sleep_entry_.is_empty());
-    trace(TASK_LL, "task 0x%p %s dtor", this, name_);
+    klog(TASK_LL, "task 0x%p %s dtor", this, name_);
 }
 
 void Task::release()
@@ -66,7 +66,7 @@ void Task::release()
 
     if (stack_ptr_ != nullptr)
     {
-        trace(TASK_LL, "task 0x%p %s free stack 0x%lX",
+        klog(TASK_LL, "task 0x%p %s free stack 0x%lX",
             this, name_, (ulong)stack_ptr_);
         delete stack_ptr_;
         stack_ptr_ = nullptr;
@@ -188,7 +188,7 @@ void Task::exec_callback()
     if (this != curr)
     {
         diagnose_get_current_task();
-        trace(0, "exec_callback: this 0x%lX get_current_task 0x%lX rsp 0x%lX",
+        klog(0, "exec_callback: this 0x%lX get_current_task 0x%lX rsp 0x%lX",
             (ulong)this, (ulong)curr, hal::get_sp());
         BUG_ON(true);
     }
@@ -513,7 +513,7 @@ void Task::report_join(ulong waited_ns)
     where.describe(what, sizeof(what));
 
     Task* waiter = try_get_current_task();
-    trace(0, "join: %s (pid %lu) has waited %lu ms for %s (pid %lu) to exit, and it is %s",
+    klog(0, "join: %s (pid %lu) has waited %lu ms for %s (pid %lu) to exit, and it is %s",
         (waiter != nullptr) ? waiter->get_name() : "?",
         (waiter != nullptr) ? waiter->pid_ : INVALID_OBJECT_ID,
         waited_ns / consts::NANO_SECS_IN_MS, get_name(), pid_, what);
@@ -523,9 +523,9 @@ void Task::report_join(ulong waited_ns)
     for (size_t i = 0; i < where.count; i++)
     {
         if (symtab.describe_return(where.frames[i], frame, sizeof(frame)))
-            trace(0, "join:   [%lu] 0x%lX %s", (ulong)i, where.frames[i], frame);
+            klog(0, "join:   [%lu] 0x%lX %s", (ulong)i, where.frames[i], frame);
         else
-            trace(0, "join:   [%lu] 0x%lX", (ulong)i, where.frames[i]);
+            klog(0, "join:   [%lu] 0x%lX", (ulong)i, where.frames[i]);
     }
 }
 
@@ -544,7 +544,7 @@ bool Task::prepare_start(Func func, void* ctx)
        never touched. */
     stack_probe::poison(&stack_ptr_->stack_bottom[0], sizeof(stack_ptr_->stack_bottom));
 
-    trace(TASK_LL, "task 0x%p %s stack 0x%lX top 0x%lX",
+    klog(TASK_LL, "task 0x%p %s stack 0x%lX top 0x%lX",
         this, name_, (ulong)stack_ptr_, (ulong)&stack_ptr_->stack_top[0]);
 
     if (!TaskTable::get_instance().insert(this))
@@ -598,7 +598,7 @@ Task* Task::get_current_task()
     /* Derive the task from RSP by rounding down to STACK_SIZE boundary.
        Returns nullptr if the stack doesn't look valid (e.g. during switch_complete
        before the new stack is fully set up, or on a non-task stack).
-       NOTE: no trace() calls here — Trace takes a lock which calls
+       NOTE: no klog() calls here — Trace takes a lock which calls
        preempt_disable -> get_current_task, causing infinite recursion. */
     ulong rsp = hal::get_sp();
     struct Stack* stack_ptr = reinterpret_cast<struct Stack *>(rsp & (~(STACK_SIZE - 1)));
@@ -652,17 +652,17 @@ void Task::diagnose_get_current_task()
     ulong rsp = hal::get_sp();
     struct Stack* stack_ptr = reinterpret_cast<struct Stack *>(rsp & (~(STACK_SIZE - 1)));
 
-    trace(0, "DiagTask: rsp 0x%lX base 0x%lX", rsp, (ulong)stack_ptr);
-    trace(0, "DiagTask: Magic1 0x%lX expect 0x%lX", stack_ptr->magic1, STACK_MAGIC1);
-    trace(0, "DiagTask: Magic2 0x%lX expect 0x%lX", stack_ptr->magic2, STACK_MAGIC2);
-    trace(0, "DiagTask: stack_bottom+page 0x%lX stack_top 0x%lX",
+    klog(0, "DiagTask: rsp 0x%lX base 0x%lX", rsp, (ulong)stack_ptr);
+    klog(0, "DiagTask: Magic1 0x%lX expect 0x%lX", stack_ptr->magic1, STACK_MAGIC1);
+    klog(0, "DiagTask: Magic2 0x%lX expect 0x%lX", stack_ptr->magic2, STACK_MAGIC2);
+    klog(0, "DiagTask: stack_bottom+page 0x%lX stack_top 0x%lX",
         (ulong)&stack_ptr->stack_bottom[0] + consts::PAGE_SIZE,
         (ulong)&stack_ptr->stack_top[0]);
 
     if (stack_ptr->magic1 == STACK_MAGIC1 && stack_ptr->magic2 == STACK_MAGIC2)
     {
         Task* task = stack_ptr->task;
-        trace(0, "DiagTask: Task 0x%lX TASK_MAGIC 0x%lX expect 0x%lX",
+        klog(0, "DiagTask: Task 0x%lX TASK_MAGIC 0x%lX expect 0x%lX",
             (ulong)task, task->magic_, TASK_MAGIC);
     }
 }
@@ -858,7 +858,7 @@ size_t TaskTable::sample_cpu(CpuSample* out, size_t max)
         {
             if (++walked > MAX_TASKS_PER_LIST)
             {
-                trace(0, "sample_cpu: task list %lu does not end after %lu entries",
+                klog(0, "sample_cpu: task list %lu does not end after %lu entries",
                     (ulong)i, (ulong)MAX_TASKS_PER_LIST);
                 break;
             }
@@ -927,7 +927,7 @@ size_t TaskTable::snapshot(TaskSnapshot* out, size_t max)
 
     if (runaway != stdlib::array_size(task_list_))
     {
-        trace(0, "snapshot: task list %lu does not end after %lu entries",
+        klog(0, "snapshot: task list %lu does not end after %lu entries",
             (ulong)runaway, (ulong)MAX_TASKS_PER_LIST);
     }
     return n;
@@ -991,7 +991,7 @@ void TaskTable::ps(stdlib::Printer& printer)
             {
                 printer.printf("task list %lu does not end after %lu entries\n",
                     (ulong)i, (ulong)MAX_TASKS_PER_LIST);
-                trace(0, "Ps: task list %lu does not end after %lu entries",
+                klog(0, "Ps: task list %lu does not end after %lu entries",
                     (ulong)i, (ulong)MAX_TASKS_PER_LIST);
                 break;
             }

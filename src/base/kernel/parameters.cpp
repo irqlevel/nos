@@ -1,7 +1,7 @@
 #include "parameters.h"
 #include "cpu.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "ubsan.h"
 
 namespace kernel
@@ -374,7 +374,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         /* The one bare word taken, as on Linux: ro */
         if (stdlib::str_cmp(param, "ro") == 0)
         {
-            trace(0, "Key %s", param);
+            klog(0, "Key %s", param);
             root_read_only_ = true;
             return true;
         }
@@ -389,7 +389,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     param[key_len] = '\0';
     const char *value = &param[key_len + 1];
 
-    trace(0, "Key %s value %s", key, value);
+    klog(0, "Key %s value %s", key, value);
 
     if (stdlib::str_cmp(key, "trace") == 0)
     {
@@ -399,7 +399,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "panic") == 0)
@@ -415,7 +415,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "its") == 0)
@@ -458,7 +458,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         else if (stdlib::str_cmp(value, "heap") == 0)
             wx_probe_md_ = WxProbeHeap;
         else
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
     }
     else if (stdlib::str_cmp(key, "smp") == 0)
     {
@@ -468,7 +468,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "maxcpus") == 0)
@@ -480,7 +480,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Invalid maxcpus %s", value);
+            klog(0, "Invalid maxcpus %s", value);
         }
     }
     else if (stdlib::str_cmp(key, "console") == 0)
@@ -499,7 +499,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "dhcp") == 0)
@@ -518,7 +518,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "udpshell") == 0)
@@ -530,7 +530,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Invalid udpshell port %s", value);
+            klog(0, "Invalid udpshell port %s", value);
         }
     }
     else if (stdlib::str_cmp(key, "netconsole") == 0)
@@ -539,7 +539,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         const char* colon = stdlib::str_chr_once(value, ':');
         if (colon == nullptr || colon == value || *(colon + 1) == '\0')
         {
-            trace(0, "Invalid netconsole value %s, expected ip:port", value);
+            klog(0, "Invalid netconsole value %s, expected ip:port", value);
         }
         else
         {
@@ -550,18 +550,18 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
             u32 ip = 0;
             if (ip_len >= sizeof(ip_buf))
             {
-                trace(0, "Invalid netconsole ip in %s", value);
+                klog(0, "Invalid netconsole ip in %s", value);
             }
             else
             {
                 stdlib::strn_cpy(ip_buf, value, ip_len + 1);
                 if (!parse_ip_v4(ip_buf, ip))
                 {
-                    trace(0, "Invalid netconsole ip %s", ip_buf);
+                    klog(0, "Invalid netconsole ip %s", ip_buf);
                 }
                 else if (!stdlib::parse_ulong(colon + 1, port) || port == 0 || port > 65535)
                 {
-                    trace(0, "Invalid netconsole port %s", colon + 1);
+                    klog(0, "Invalid netconsole port %s", colon + 1);
                 }
                 else
                 {
@@ -590,13 +590,13 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Invalid netframes %s", value);
+            klog(0, "Invalid netframes %s", value);
         }
     }
     else if (stdlib::str_cmp(key, "hugepages") == 0)
     {
         if (!parse_huge_pool(value))
-            trace(0, "Invalid hugepages %s: a share of RAM (50%%) or a size (32G, 512M)", value);
+            klog(0, "Invalid hugepages %s: a share of RAM (50%%) or a size (32G, 512M)", value);
     }
     else if (stdlib::str_cmp(key, "nctail") == 0)
     {
@@ -607,7 +607,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Invalid nctail %s", value);
+            klog(0, "Invalid nctail %s", value);
         }
     }
     else if (stdlib::str_cmp(key, "loglevel") == 0)
@@ -616,13 +616,13 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
            has already happened, and the chattier levels are exactly the ones
            worth having during bring-up on a machine you cannot log into. */
         ulong level = 0;
-        if (stdlib::parse_ulong(value, level) && level <= (ulong)MAX_TRACE_LEVEL)
+        if (stdlib::parse_ulong(value, level) && level <= (ulong)MAX_LOG_LEVEL)
         {
             log_level_ = (int)level;
         }
         else
         {
-            trace(0, "Invalid loglevel %s", value);
+            klog(0, "Invalid loglevel %s", value);
         }
     }
     else if (stdlib::str_cmp(key, "root") == 0)
@@ -652,7 +652,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
             }
             else
             {
-                trace(0, "Invalid UUID %s, key %s", value, key);
+                klog(0, "Invalid UUID %s, key %s", value, key);
             }
         }
         else
@@ -673,7 +673,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "disklog") == 0)
@@ -688,7 +688,7 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (stdlib::str_cmp(key, "dns") == 0)
@@ -699,12 +699,12 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         }
         else
         {
-            trace(0, "Unknown value %s, key %s", value, key);
+            klog(0, "Unknown value %s, key %s", value, key);
         }
     }
     else
     {
-        trace(0, "Unknown key %s, skipping", key);
+        klog(0, "Unknown key %s, skipping", key);
     }
 
     return true;
@@ -749,7 +749,7 @@ void Parameters::parse(const char *cmdline)
 
         char shown[MAX_PARAM_LEN + 1];
         stdlib::strn_cpy(shown, rest, sizeof(shown));
-        trace(0, "Cmdline: longer than %lu characters, ignoring from '%s'",
+        klog(0, "Cmdline: longer than %lu characters, ignoring from '%s'",
             (ulong)(CMDLINE_LEN - 1), shown);
     }
 
@@ -771,10 +771,10 @@ void Parameters::parse(const char *cmdline)
             char shown[MAX_PARAM_LEN + 1];
             stdlib::strn_cpy(shown, &cmdline_[start], shown_len + 1);
             if (i - start > MAX_PARAM_LEN)
-                trace(0, "Cmdline: ignoring '%s...', longer than the %lu characters "
+                klog(0, "Cmdline: ignoring '%s...', longer than the %lu characters "
                     "a parameter can have", shown, (ulong)MAX_PARAM_LEN);
             else
-                trace(0, "Cmdline: ignoring '%s'", shown);
+                klog(0, "Cmdline: ignoring '%s'", shown);
         }
         start = i + 1;
     }

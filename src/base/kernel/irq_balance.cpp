@@ -1,6 +1,6 @@
 #include "irq_balance.h"
 #include "cpu.h"
-#include "trace.h"
+#include "klog.h"
 
 #include <arch/x86_64/ioapic.h>
 #include <drivers/msix.h>
@@ -78,11 +78,11 @@ void IrqBalance::trace_entry(const Entry& entry)
 {
     if (entry.kind == KIND_IO_APIC)
     {
-        trace(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.gsi, entry.cpu);
+        klog(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.gsi, entry.cpu);
     }
     else
     {
-        trace(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
+        klog(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
             (ulong)entry.table, (ulong)entry.index, entry.cpu);
     }
 }
@@ -107,7 +107,7 @@ ulong IrqBalance::assign(Entry entry)
     }
 
     if (!recorded)
-        trace(0, "IrqBalance: entry table full, irq not balanced");
+        klog(0, "IrqBalance: entry table full, irq not balanced");
 
     return entry.cpu;
 }
@@ -185,7 +185,7 @@ void IrqBalance::balance()
     ulong cpu_mask = CpuTable::get_instance().get_running_cpus();
     ulong io_apic_mask = cpu_mask & IO_APIC_TARGET_MASK;
 
-    trace(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
+    klog(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
         count, cpu_mask, io_apic_mask);
 }
 

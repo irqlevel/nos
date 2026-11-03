@@ -197,7 +197,7 @@ fn relay_task(relay: Relay) {
         == Ended::Stalled
     {
         shared.stalled.fetch_add(1, Ordering::Relaxed);
-        kcore::trace!(0, "hv: a forwarded connection given up -- a side took nothing for {} s",
+        kcore::klog!(0, "hv: a forwarded connection given up -- a side took nothing for {} s",
                       RELAY_STALL_NS / NS_PER_SEC);
     }
     drop(a);

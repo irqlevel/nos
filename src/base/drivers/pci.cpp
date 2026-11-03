@@ -1,13 +1,13 @@
 #include "pci.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/pci.h>
 #include <kernel/raw_spin_lock.h>
 
 Pci::Pci()
     : device_count_(0)
 {
-    trace(0, "Pci 0x%p", this);
+    klog(0, "Pci 0x%p", this);
 }
 
 Pci::~Pci()
@@ -467,7 +467,7 @@ void Pci::scan()
                 u16 prog_if = get_prog_if(bus, slot, function);
                 u16 rev_id = get_revision_id(bus, slot, function);
 
-                trace(0, "vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX",
+                klog(0, "vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX",
                     vendor_to_str(vendor), (ulong)vendor, device_to_str(vendor, device), (ulong)device, class_to_str(cls), (ulong)cls, sub_class_to_str(cls, scls), (ulong)scls, (ulong)prog_if, (ulong)rev_id);
 
                 if (device_count_ < MAX_DEVICES)

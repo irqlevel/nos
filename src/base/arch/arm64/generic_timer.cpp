@@ -9,7 +9,7 @@
 #include <kernel/watchdog.h>
 #include <kernel/profiler.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/time.h>
 #include <hal/irqchip.h>
 
@@ -93,7 +93,7 @@ bool GenericTimer::setup()
 
     CpuTable::get_instance().get_current_cpu().local_timer_start();
 
-    trace(0, "GenericTimer: per-cpu tick %lu Hz, one-shot, counter %lu Hz, intid %lu",
+    klog(0, "GenericTimer: per-cpu tick %lu Hz, one-shot, counter %lu Hz, intid %lu",
         TICK_HZ, (ulong)read_cntfrq(), (ulong)timer_int_id_);
     return true;
 }

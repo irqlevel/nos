@@ -196,7 +196,7 @@ pub fn listener_main(ctx: ListenerCtx) {
                 }
                 Some(device) => match TcpListener::bind(&device, shared.config.port, LISTEN_BACKLOG) {
                     Ok(l) => {
-                        kcore::trace!(0, "api: listening on {} port {}", nic, shared.config.port);
+                        kcore::klog!(0, "api: listening on {} port {}", nic, shared.config.port);
                         listener = Some(l);
                         set(Listening::Bound);
                         continue;

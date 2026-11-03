@@ -36,7 +36,7 @@ use extfmt::recovery::{self, Plan};
 use extfmt::sb::Super;
 use extfmt::Map;
 use kcore::time::wall_clock_secs;
-use kcore::trace;
+use kcore::klog;
 
 use super::cache::Cache;
 use super::io::Io;
@@ -205,11 +205,11 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
     if jsb.start() != 0 && !needs {
         /* Linux throws such a log away (`jbd2_journal_wipe`): what is on
          * the disk is the filesystem. */
-        trace!(0, "ext4: the journal holds a log the filesystem does not say needs replaying: read as it is");
+        klog!(0, "ext4: the journal holds a log the filesystem does not say needs replaying: read as it is");
         return Ok(Overlay::new());
     }
     if jsb.errno() != 0 {
-        trace!(0, "ext4: the journal recorded error {}", jsb.errno() as i32);
+        klog!(0, "ext4: the journal recorded error {}", jsb.errno() as i32);
     }
     if jsb.start() == 0 {
         recovery::check_features(&jsb)?;
@@ -217,7 +217,7 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
     }
     let plan = plan_of(io, map, &jsb)?;
     if let Some(t) = plan.failed_commit {
-        trace!(0, "ext4: journal transaction {} was corrupt: read up to it", t);
+        klog!(0, "ext4: journal transaction {} was corrupt: read up to it", t);
     }
     let mut out = Overlay::new();
     for w in plan.writes.values() {
@@ -225,7 +225,7 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
             .ok_or_else(|| format!("a journal copy at journal block {}, past the journal", w.log))?;
         out.insert(w.home, (copy, w.escaped));
     }
-    trace!(0, "ext4: {} transactions in the journal not replayed: read through them, {} blocks", plan.transactions,
+    klog!(0, "ext4: {} transactions in the journal not replayed: read through them, {} blocks", plan.transactions,
         out.len());
     Ok(out)
 }
@@ -317,7 +317,7 @@ impl Journal {
                 return Ok(Opened::ReadOnly(format!("journal transaction {} is corrupt (e2fsck should look)", t)));
             }
             replay(io, &map, &plan)?;
-            trace!(0, "ext4: the journal replayed: {} transactions, {} blocks", plan.transactions,
+            klog!(0, "ext4: the journal replayed: {} transactions, {} blocks", plan.transactions,
                 plan.writes.len());
             next_seq = plan.next_sequence;
             replayed = true;
@@ -387,7 +387,7 @@ impl Journal {
     /// not see.
     pub fn abort(&mut self, io: &mut Io, why: &str) {
         if !self.aborted {
-            trace!(0, "ext4: the journal is aborted: {}; nothing more is written, and the filesystem is left for a \
+            klog!(0, "ext4: the journal is aborted: {}; nothing more is written, and the filesystem is left for a \
                        replay", why);
         }
         self.aborted = true;
@@ -496,7 +496,7 @@ impl Txn<'_> {
     /// write failed and the journal is aborted.
     pub fn commit(mut self) -> bool {
         if self.jnl.aborted {
-            trace!(0, "ext4: the journal is aborted: nothing is committed");
+            klog!(0, "ext4: the journal is aborted: nothing is committed");
             return false;
         }
         if self.dirty.is_empty() && self.revoke.is_empty() && self.freed.is_empty() {
@@ -517,7 +517,7 @@ impl Txn<'_> {
         let revokes: Vec<u64> = self.revoke.iter().copied().collect();
         let n = self.jnl.blocks_for(bs, copies.len(), revokes.len());
         if n >= self.jnl.ring() as usize {
-            trace!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
+            klog!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
             return false;
         }
         if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint(self.io, self.cache, self.jnl) {

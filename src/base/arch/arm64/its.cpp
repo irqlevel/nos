@@ -1,7 +1,7 @@
 #include "its.h"
 
 #include <kernel/interrupt.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <hal/context.h>
 #include <mm/new.h>
@@ -99,7 +99,7 @@ bool Its::setup(ulong its_phys, ulong gicr_base, ulong gicr_size)
     itt_entry_size_ = ((typer >> 4) & 0xF) + 1;
     pta_ = (typer >> 19) & 1;
 
-    trace(0, "Its: typer 0x%lX eventbits %lu devbits %lu itt-entsz %lu pta %lu",
+    klog(0, "Its: typer 0x%lX eventbits %lu devbits %lu itt-entsz %lu pta %lu",
         typer, (ulong)event_id_bits_, (ulong)device_id_bits_, (ulong)itt_entry_size_, (ulong)pta_);
 
     /* Config table covers all LPIs from 8192 up; size it to what we use.
@@ -133,7 +133,7 @@ bool Its::setup(ulong its_phys, ulong gicr_base, ulong gicr_size)
         return false;
 
     ready_ = true;
-    trace(0, "Its: ready");
+    klog(0, "Its: ready");
     return true;
 }
 
@@ -204,7 +204,7 @@ bool Its::enable_lpis_on_redist(ulong gicr_base, ulong gicr_size)
         boot_rd_base_ = 0;
     }
 
-    trace(0, "Its: LPIs enabled on rd 0x%lX propbaser 0x%lX", rd, propbaser);
+    klog(0, "Its: LPIs enabled on rd 0x%lX propbaser 0x%lX", rd, propbaser);
     return true;
 }
 
@@ -253,7 +253,7 @@ bool Its::provision_tables()
 
         write64(reg, val);
         u64 readback = read64(reg);
-        trace(0, "Its: baser[%lu] type %lu entsz %lu pages %lu -> 0x%lX",
+        klog(0, "Its: baser[%lu] type %lu entsz %lu pages %lu -> 0x%lX",
             (ulong)i, (ulong)type, (ulong)entry_size, pages, readback);
     }
     return true;
@@ -298,7 +298,7 @@ bool Its::wait_commands()
             return true;
         asm volatile("yield");
     }
-    trace(0, "Its: command queue stall (creadr 0x%lX cwriter 0x%lX)",
+    klog(0, "Its: command queue stall (creadr 0x%lX cwriter 0x%lX)",
         read64(its_base_ + GITS_CREADR), cmd_write_off_);
     return false;
 }
@@ -382,7 +382,7 @@ bool Its::map_device(u32 device_id, u32 num_events)
 
     devices_[free].device_id = device_id;
     devices_[free].used = true;
-    trace(0, "Its: mapped device 0x%lX itt 0x%lX eventbits %u",
+    klog(0, "Its: mapped device 0x%lX itt 0x%lX eventbits %u",
         (ulong)device_id, itt_phys, event_bits);
     return true;
 }
@@ -403,7 +403,7 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
     u32 lpi = alloc_lpi();
     if (lpi == 0)
     {
-        trace(0, "Its: out of LPIs");
+        klog(0, "Its: out of LPIs");
         return 0;
     }
 
@@ -432,7 +432,7 @@ u32 Its::map_event(u32 device_id, u32 event_id, InterruptHandler& handler,
 
     handler.on_interrupt_register((u8)0, (u8)0);
 
-    trace(0, "Its: event dev 0x%lX ev %lu -> lpi %lu addr 0x%lX",
+    klog(0, "Its: event dev 0x%lX ev %lu -> lpi %lu addr 0x%lX",
         (ulong)device_id, (ulong)event_id, (ulong)lpi, msi_addr);
     return event_id; /* MSI data = event_id */
 }

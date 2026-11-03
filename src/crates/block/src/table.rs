@@ -28,7 +28,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::{Once, OnceBox};
 use kcore::sync::SpinLock;
-use kcore::trace;
+use kcore::klog;
 
 /// What the table holds.
 pub const MAX_DEVICES: usize = 48;
@@ -175,13 +175,13 @@ fn add(dev: Device) -> usize {
     let slot = match reserve() {
         Some(slot) => slot,
         None => {
-            trace!(0, "block: the device table is full at {}", MAX_DEVICES);
+            klog!(0, "block: the device table is full at {}", MAX_DEVICES);
             return 0;
         }
     };
 
     if let Some(dev) = DEVICES[slot].get_or_try_init(|| Some(Box::new(dev))) {
-        trace!(0, "block: {} registered, {} sectors of {} bytes",
+        klog!(0, "block: {} registered, {} sectors of {} bytes",
             core::str::from_utf8(dev.name()).unwrap_or("?"), dev.capacity, dev.sector_size);
     }
     slot + 1
@@ -289,7 +289,7 @@ fn batch_target(handle: usize, buf_len: usize, pieces: &[Piece]) -> Option<(&'st
             _ => false,
         };
         if !inside {
-            trace!(0, "block: {}: a batch piece of {} bytes at {} of the buffer, to sector {}, is none a device takes",
+            klog!(0, "block: {}: a batch piece of {} bytes at {} of the buffer, to sector {}, is none a device takes",
                 core::str::from_utf8(top.name()).unwrap_or("?"), p.len, p.at, p.sector);
             return None;
         }

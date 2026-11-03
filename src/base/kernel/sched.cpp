@@ -1,6 +1,6 @@
 #include "sched.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "preempt.h"
 #include "time.h"
 #include <hal/cpu.h>
@@ -570,7 +570,7 @@ void TaskQueue::report_stall()
         return;
 
     stall_pending_ = false;
-    trace(0, "sched: %s (pid %lu) could run, and has waited %lu ms for cpu %lu, with %ld that can run there",
+    klog(0, "sched: %s (pid %lu) could run, and has waited %lu ms for cpu %lu, with %ld that can run there",
         stall_name_, stall_pid_, stall_waited_ms_, CpuTable::get_instance().get_current_cpu_id(), stall_runnable_);
 }
 
@@ -870,7 +870,7 @@ void TaskQueue::clear()
         task->put();
     }
 
-    trace(0, "TaskQueue 0x%p counters: sched %lu switch context %lu",
+    klog(0, "TaskQueue 0x%p counters: sched %lu switch context %lu",
         this, schedule_counter_.get(), switch_context_counter_.get());
 }
 

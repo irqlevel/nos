@@ -14,7 +14,7 @@
 
 #include <kernel/cpu.h>
 #include <kernel/parameters.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/ubsan.h>
 
 #include "fuzz.h"
@@ -274,7 +274,7 @@ void take(Expected& e, const std::string& token)
     }
     else if (key == "loglevel")
     {
-        if (number(value, n) && n <= static_cast<unsigned long long>(kernel::MAX_TRACE_LEVEL))
+        if (number(value, n) && n <= static_cast<unsigned long long>(kernel::MAX_LOG_LEVEL))
             e.log_level = static_cast<int>(n);
     }
     else if (key == "root")

@@ -10,7 +10,7 @@ use extfmt::extent::{self, Header, ROOT_MAX};
 use extfmt::inode::{self as xinode, EXTENTS_FL, HUGE_FILE_FL};
 use extfmt::{le16, le32, set_le16, set_le32};
 
-use kcore::trace;
+use kcore::klog;
 
 use super::meta::Meta;
 
@@ -81,7 +81,7 @@ pub fn add_blocks(m: &Meta, raw: &mut [u8], blocks: i64) -> bool {
         | if m.huge_file() { u64::from(le16(raw, xinode::I_BLOCKS_HIGH)) << 32 } else { 0 };
     let room = if m.huge_file() { (1u64 << 48) - 1 } else { u64::from(u32::MAX) };
     let Some(total) = have.checked_add_signed(units).filter(|&t| t <= room) else {
-        trace!(0, "ext4: an inode's block count past what its fields hold");
+        klog!(0, "ext4: an inode's block count past what its fields hold");
         return false;
     };
     set_le32(raw, xinode::I_BLOCKS_LO, total as u32);

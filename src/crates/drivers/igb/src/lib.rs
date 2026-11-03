@@ -52,7 +52,7 @@ use kcore::cmd::{Command, Output};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
 use kcore::time::boot_time_ns;
-use kcore::{dma, interrupt, io, msix, pci, softirq, trace};
+use kcore::{dma, interrupt, io, msix, pci, softirq, klog};
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -314,7 +314,7 @@ pub fn init() {
     match Command::register("igbdump", "igbdump - igb chip and ring state", dump) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "igb: cannot register the igbdump command"),
+        Err(_) => klog!(0, "igb: cannot register the igbdump command"),
     }
 
     for (device_id, generation) in SUPPORTED {
@@ -323,7 +323,7 @@ pub fn init() {
             match pci::find_device_from(PCI_VENDOR_INTEL, device_id, start) {
                 None => break,
                 Some((idx, dev)) => {
-                    trace!(
+                    klog!(
                         0,
                         "igb: found {} {:04x}:{:04x} at {:02x}:{:02x}.{} rev {:02x} irq={}",
                         generation.as_str(),
@@ -350,7 +350,7 @@ pub fn shutdown() {
             dev.quiesce();
         }
     }
-    trace!(0, "igb: shutdown complete, count={}", count);
+    klog!(0, "igb: shutdown complete, count={}", count);
 }
 
 /* ================================================================== */
@@ -377,7 +377,7 @@ fn reset(regs: &io::MmioRegion) -> bool {
     if !wait_for(100, 100, || {
         regs.read32(STATUS) & STATUS_GIO_MASTER_ENABLE == 0
     }) {
-        trace!(0, "igb: bus master did not go idle before reset");
+        klog!(0, "igb: bus master did not go idle before reset");
     }
 
     let ctrl = regs.read32(CTRL);
@@ -401,7 +401,7 @@ fn reset(regs: &io::MmioRegion) -> bool {
      * rejected further down as "no valid address", so the card would simply
      * not appear. Not fatal if it times out: the read below decides. */
     if !wait_for(1000, 100, || regs.read32(EEC) & EEC_AUTO_RD != 0) {
-        trace!(0, "igb: NVM auto-read did not complete; the MAC may not be loaded");
+        klog!(0, "igb: NVM auto-read did not complete; the MAC may not be loaded");
     }
 
     true
@@ -434,7 +434,7 @@ fn stop_engines(regs: &io::MmioRegion) {
         regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE == 0
             && regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE == 0
     }) {
-        trace!(0, "igb: queues did not report idle after being disabled");
+        klog!(0, "igb: queues did not report idle after being disabled");
     }
 }
 
@@ -588,7 +588,7 @@ fn phy_address(regs: &io::MmioRegion, generation: Generation) -> u32 {
     }
 
     let addr = (regs.read32(MDICNFG) & MDICNFG_PHY_MASK) >> MDICNFG_PHY_SHIFT;
-    trace!(0, "igb: MDICNFG selects an external PHY at address {}", addr);
+    klog!(0, "igb: MDICNFG selects an external PHY at address {}", addr);
     addr
 }
 
@@ -625,7 +625,7 @@ fn phy_start_link(regs: &io::MmioRegion, generation: Generation, phy_addr: u32) 
      * to it without the claim is not a race that shows up as a clean failure:
      * two masters on one MDIO bus produce reads that look like data. */
     if generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
-        trace!(0, "igb: could not take the PHY semaphore from firmware");
+        klog!(0, "igb: could not take the PHY semaphore from firmware");
         return false;
     }
 
@@ -642,7 +642,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
     let bmcr = match phy_read(regs, phy_addr, PHY_BMCR) {
         Some(v) => v,
         None => {
-            trace!(0, "igb: PHY did not answer on MDIC");
+            klog!(0, "igb: PHY did not answer on MDIC");
             return false;
         }
     };
@@ -653,7 +653,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
      * something else entirely. A reset puts the standard MII registers back
      * where they belong. */
     if !phy_write(regs, phy_addr, PHY_BMCR, BMCR_RESET) {
-        trace!(0, "igb: PHY reset write failed");
+        klog!(0, "igb: PHY reset write failed");
         return false;
     }
 
@@ -664,7 +664,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
             None => false,
         }
     }) {
-        trace!(0, "igb: PHY reset did not complete");
+        klog!(0, "igb: PHY reset did not complete");
         return false;
     }
 
@@ -677,12 +677,12 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
      * gigabit PHY settled on 10BASE-T full duplex on the first machine this
      * ran on. */
     if !phy_write(regs, phy_addr, PHY_ANAR, ANAR_ADVERTISE_ALL) {
-        trace!(0, "igb: PHY advertisement write failed");
+        klog!(0, "igb: PHY advertisement write failed");
         return false;
     }
 
     if !phy_write(regs, phy_addr, PHY_GCTL, GCTL_1000_FULL | GCTL_1000_HALF) {
-        trace!(0, "igb: PHY gigabit advertisement write failed");
+        klog!(0, "igb: PHY gigabit advertisement write failed");
         return false;
     }
 
@@ -694,7 +694,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         | BMCR_SPEED1000;
 
     if !phy_write(regs, phy_addr, PHY_BMCR, want) {
-        trace!(0, "igb: PHY control write failed");
+        klog!(0, "igb: PHY control write failed");
         return false;
     }
 
@@ -711,13 +711,13 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
     });
 
     if !up {
-        trace!(0, "igb: auto-negotiation has not completed yet");
+        klog!(0, "igb: auto-negotiation has not completed yet");
     }
 
     /* What was offered and what came back. A link that resolves lower than it
      * should is either an advertisement that did not take or a partner that
      * offered nothing better, and these two registers are the difference. */
-    trace!(
+    klog!(
         0,
         "igb: PHY advertised {:#06x}, partner offered {:#06x}, 1000 ctrl {:#06x} status {:#06x}",
         phy_read(regs, phy_addr, PHY_ANAR).unwrap_or(0),
@@ -814,7 +814,7 @@ fn sync_mac_speed(regs: &io::MmioRegion, phy_addr: u32) {
     }
     regs.write32(CTRL, ctrl);
 
-    trace!(
+    klog!(
         0,
         "igb: MAC was latched at speed {} duplex {}, link resolved to {} duplex {}; forced",
         latched,
@@ -827,7 +827,7 @@ fn sync_mac_speed(regs: &io::MmioRegion, phy_addr: u32) {
 fn trace_link(regs: &io::MmioRegion) {
     let status = regs.read32(STATUS);
     if status & STATUS_LU == 0 {
-        trace!(0, "igb: link down");
+        klog!(0, "igb: link down");
         return;
     }
 
@@ -838,7 +838,7 @@ fn trace_link(regs: &io::MmioRegion) {
         _ => 0,
     };
     let duplex = if status & STATUS_FD != 0 { "full" } else { "half" };
-    trace!(0, "igb: link up, {} Mbit/s {} duplex", speed, duplex);
+    klog!(0, "igb: link up, {} Mbit/s {} duplex", speed, duplex);
 }
 
 fn find_mmio_bar(pci_dev: &pci::PciDevice) -> u64 {
@@ -880,7 +880,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
      * goes through `stop_engines` or `quiesce`, which stop them first. */
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
-        trace!(0, "igb: too many devices (max {})", MAX_DEVICES);
+        klog!(0, "igb: too many devices (max {})", MAX_DEVICES);
         return;
     }
 
@@ -888,22 +888,22 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     let bar_phys = find_mmio_bar(pci_dev);
     if bar_phys == 0 {
-        trace!(0, "igb: no MMIO BAR found, skipping device");
+        klog!(0, "igb: no MMIO BAR found, skipping device");
         return;
     }
 
     let bar_mapping = match dma::PhysMapping::map(bar_phys, BAR_MAP_PAGES) {
         Some(m) => m,
         None => {
-            trace!(0, "igb: failed to map MMIO BAR at {:#x}", bar_phys);
+            klog!(0, "igb: failed to map MMIO BAR at {:#x}", bar_phys);
             return;
         }
     };
     let regs = io::MmioRegion::new(bar_mapping.as_mut_ptr(), BAR_MAP_PAGES * PAGE_SIZE);
-    trace!(0, "igb: MMIO BAR at {:#x}", bar_phys);
+    klog!(0, "igb: MMIO BAR at {:#x}", bar_phys);
 
     if !reset(&regs) {
-        trace!(0, "igb: chip reset timed out");
+        klog!(0, "igb: chip reset timed out");
         return;
     }
 
@@ -915,7 +915,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
      * so instead of leaving a silent link-down. */
     let link_mode = regs.read32(CTRL_EXT) & CTRL_EXT_LINK_MODE_MASK;
     if link_mode != CTRL_EXT_LINK_MODE_INTERNAL {
-        trace!(
+        klog!(
             0,
             "igb: link mode {:#x} is not the internal PHY; this driver drives copper only",
             link_mode >> 22
@@ -925,11 +925,11 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let mac = match read_mac(&regs) {
         Some(m) => m,
         None => {
-            trace!(0, "igb: no valid station address in RAL0/RAH0");
+            klog!(0, "igb: no valid station address in RAL0/RAH0");
             return;
         }
     };
-    trace!(
+    klog!(
         0,
         "igb: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0],
@@ -944,14 +944,14 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let tx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "igb: TX ring alloc failed");
+            klog!(0, "igb: TX ring alloc failed");
             return;
         }
     };
     let rx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "igb: RX ring alloc failed");
+            klog!(0, "igb: RX ring alloc failed");
             return;
         }
     };
@@ -959,7 +959,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
         (Some(tx), Some(rx)) => (tx, rx),
         _ => {
-            trace!(0, "igb: no memory for the rings' bookkeeping");
+            klog!(0, "igb: no memory for the rings' bookkeeping");
             return;
         }
     };
@@ -978,7 +978,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
             None => {
                 /* A partially filled ring still works: process_rx refills
                  * what it can each pass. */
-                trace!(0, "igb: RX frame alloc failed after {} slots", posted);
+                klog!(0, "igb: RX frame alloc failed after {} slots", posted);
                 break;
             }
         }
@@ -998,7 +998,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     );
 
     let phy_addr = phy_address(&regs, generation);
-    trace!(0, "igb: PHY at MDIO address {}", phy_addr);
+    klog!(0, "igb: PHY at MDIO address {}", phy_addr);
     phy_start_link(&regs, generation, phy_addr);
 
     /* --- Multicast table: nothing accepted by hash, broadcast handled by
@@ -1044,7 +1044,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let rxdctl = (regs.read32(RXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
     regs.write32(RXDCTL0, rxdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
-        trace!(0, "igb: RX queue did not enable");
+        klog!(0, "igb: RX queue did not enable");
         stop_engines(&regs);
         return;
     }
@@ -1071,7 +1071,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let txdctl = (regs.read32(TXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
     regs.write32(TXDCTL0, txdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
-        trace!(0, "igb: TX queue did not enable");
+        klog!(0, "igb: TX queue did not enable");
         stop_engines(&regs);
         return;
     }
@@ -1127,7 +1127,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     ));
 
     if !attach_interrupt(pci_dev, dev) {
-        trace!(0, "igb: no interrupt could be registered");
+        klog!(0, "igb: no interrupt could be registered");
         dev.quiesce();
         return;
     }
@@ -1141,7 +1141,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     trace_link(&dev.regs);
 
     if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
-        trace!(0, "igb: NetDevice registration failed");
+        klog!(0, "igb: NetDevice registration failed");
         dev.quiesce();
         return;
     }
@@ -1149,7 +1149,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let _ = DEVICES[idx as usize].set(dev);
     DEVICE_COUNT.store(idx + 1, Ordering::Release);
 
-    trace!(0, "igb: device {} ready ({})", idx, generation.as_str());
+    klog!(0, "igb: device {} ready ({})", idx, generation.as_str());
 }
 
 fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
@@ -1173,7 +1173,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
                 };
                 dev.two_vector.store(other.is_some(), Ordering::Release);
 
-                trace!(
+                klog!(
                     0,
                     "igb: MSI-X vector={} ({} entries), {}",
                     irq.vector(),
@@ -1189,7 +1189,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
                 return true;
             }
             None => {
-                trace!(0, "igb: MSI-X entry 0 unavailable, falling back to INTx");
+                klog!(0, "igb: MSI-X entry 0 unavailable, falling back to INTx");
             }
         }
     }
@@ -1204,7 +1204,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
 
     match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(irq) => {
-            trace!(0, "igb: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
+            klog!(0, "igb: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
             *dev.irqs.lock() = Some(Irqs {
                 _msix_irq: None,
                 _msix_irq_other: None,
@@ -1238,7 +1238,7 @@ fn arm_msix(regs: &io::MmioRegion, two_vector: bool) {
      * wrong. apply_eitr widens it again under load. */
     let inherited = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
     regs.write32(EITR0, EITR_INTERVAL_US << EITR_INTERVAL_SHIFT);
-    trace!(
+    klog!(
         0,
         "igb: interrupt throttle was {} us, set to {}",
         inherited,
@@ -1334,7 +1334,7 @@ fn isr_other(dev: &'static IgbDevice) {
     if icr & ICR_RXO != 0 {
         let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
-            trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
+            klog!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
         }
     }
 
@@ -1382,7 +1382,7 @@ fn isr(dev: &'static IgbDevice) {
     if icr & ICR_RXO != 0 {
         let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
         if n < 10 {
-            trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
+            klog!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
         }
     }
 
@@ -1423,7 +1423,7 @@ impl IgbDevice {
         let regs = &self.regs;
 
         if self.generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
-            trace!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
+            klog!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
             return;
         }
 

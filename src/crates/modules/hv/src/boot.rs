@@ -55,9 +55,9 @@ impl Host for BootHost {
         if c.line.push(byte) {
             if let Some(dropped) = c.line.admit(kcore::time::boot_time_ns()) {
                 if dropped != 0 {
-                    kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+                    kcore::klog!(0, "hvguest| ... {} lines not logged", dropped);
                 }
-                kcore::trace!(0, "hvguest| {}", c.line.text());
+                kcore::klog!(0, "hvguest| {}", c.line.text());
             }
             c.line.clear();
         }
@@ -175,10 +175,10 @@ impl Boot {
         let mut console = host.console.lock();
         let dropped = console.line.take_dropped();
         if dropped != 0 {
-            kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+            kcore::klog!(0, "hvguest| ... {} lines not logged", dropped);
         }
         if !console.line.text().is_empty() {
-            kcore::trace!(0, "hvguest| {}", console.line.text());
+            kcore::klog!(0, "hvguest| {}", console.line.text());
         }
 
         if !console.input.is_empty() {

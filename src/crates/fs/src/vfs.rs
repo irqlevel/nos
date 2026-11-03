@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 
 use kcore::sync::{Mutex, MutexGuard};
-use kcore::trace;
+use kcore::klog;
 
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
@@ -386,7 +386,7 @@ impl Mount {
     /// The mount, if it may be written.
     fn writable(&mut self) -> Option<&mut Mount> {
         if self.read_only {
-            trace!(0, "vfs: that mount is read-only");
+            klog!(0, "vfs: that mount is read-only");
             return None;
         }
         Some(self)
@@ -616,7 +616,7 @@ impl Vfs {
     /// filesystem released -- when it cannot be.
     pub fn mount(&self, path: &[u8], mut fs: Box<dyn FileSystem>, read_only: bool) -> Option<bool> {
         if path.is_empty() || path[0] != b'/' || path.len() >= MAX_PATH {
-            trace!(0, "vfs: a mount path must start with / and fit {} bytes", MAX_PATH);
+            klog!(0, "vfs: a mount path must start with / and fit {} bytes", MAX_PATH);
             return None;
         }
 
@@ -632,18 +632,18 @@ impl Vfs {
             let table = self.table.lock();
             for entry in table.entries.iter().flatten() {
                 if entry.path() == path {
-                    trace!(0, "vfs: something is mounted on that path already");
+                    klog!(0, "vfs: something is mounted on that path already");
                     return None;
                 }
                 if device != 0 && entry.device == device {
-                    trace!(0, "vfs: that device is mounted already");
+                    klog!(0, "vfs: that device is mounted already");
                     return None;
                 }
             }
             match table.entries.iter().position(Option::is_none) {
                 Some(index) => index,
                 None => {
-                    trace!(0, "vfs: {} mounts is all there is room for", MAX_MOUNTS);
+                    klog!(0, "vfs: {} mounts is all there is room for", MAX_MOUNTS);
                     return None;
                 }
             }
@@ -658,7 +658,7 @@ impl Vfs {
             claim = match block::claim_as(device, MOUNT_HOLDER) {
                 Ok(claim) => claim,
                 Err(held_by) => {
-                    trace!(0, "vfs: the device is in use by {}", held_by);
+                    klog!(0, "vfs: the device is in use by {}", held_by);
                     return None;
                 }
             };
@@ -699,14 +699,14 @@ impl Vfs {
             })
         };
         let Some((index, id)) = found else {
-            trace!(0, "vfs: nothing is mounted there");
+            klog!(0, "vfs: nothing is mounted there");
             return false;
         };
 
         let mut slot = self.lock_mounted(index, id);
         let open_files = slot.mount.as_ref().map_or(0, |mount| mount.open_files);
         if open_files != 0 {
-            trace!(0, "vfs: the mount is busy, {} files open", open_files);
+            klog!(0, "vfs: the mount is busy, {} files open", open_files);
             return false;
         }
 
@@ -743,9 +743,9 @@ impl Vfs {
             drop(slot);
             let Some(mount) = mount else { continue };
 
-            trace!(0, "vfs: unmounting {}", core::str::from_utf8(&path[..path_len]).unwrap_or("?"));
+            klog!(0, "vfs: unmounting {}", core::str::from_utf8(&path[..path_len]).unwrap_or("?"));
             if mount.open_files != 0 {
-                trace!(0, "vfs: unmounting with {} files still open", mount.open_files);
+                klog!(0, "vfs: unmounting with {} files still open", mount.open_files);
             }
             mount.take_down();
         }
@@ -916,7 +916,7 @@ impl Vfs {
     /// names.
     fn lock_resolved(&self, path: &[u8]) -> Option<(MutexGuard<'_, MountSlot>, Resolved)> {
         let Some((mut slot, rest)) = self.locate_path(path) else {
-            trace!(0, "vfs: no mount holds that path");
+            klog!(0, "vfs: no mount holds that path");
             return None;
         };
         let resolved = Self::resolve(slot.mount.as_mut()?, rest)?;
@@ -949,13 +949,13 @@ impl Vfs {
         let mut components = rest.split(|b| *b == b'/').filter(|c| !c.is_empty()).peekable();
         while let Some(component) = components.next() {
             if component.len() >= NAME_MAX {
-                trace!(0, "vfs: a name in that path is longer than {} bytes", NAME_MAX - 1);
+                klog!(0, "vfs: a name in that path is longer than {} bytes", NAME_MAX - 1);
                 return None;
             }
             /* No filesystem here keeps one: ext2's format forbids it, and
              * nanofs's names end at the first. */
             if component.contains(&0) {
-                trace!(0, "vfs: a name in that path has a NUL in it");
+                klog!(0, "vfs: a name in that path has a NUL in it");
                 return None;
             }
 
@@ -994,7 +994,7 @@ impl Vfs {
             match child {
                 Some(child) if fs.tree().get(child).is_some_and(|node| node.is_dir()) => at = child,
                 _ => {
-                    trace!(0, "vfs: a component of that path is not a directory");
+                    klog!(0, "vfs: a component of that path is not a directory");
                     return None;
                 }
             }
@@ -1061,7 +1061,7 @@ impl Vfs {
             flags |= OPEN_WRITE;
         }
         if flags & (OPEN_READ | OPEN_WRITE) == 0 {
-            trace!(0, "vfs: an open for neither reading nor writing");
+            klog!(0, "vfs: an open for neither reading nor writing");
             return None;
         }
 
@@ -1072,7 +1072,7 @@ impl Vfs {
         let mount = slot.mount.as_mut()?;
 
         if writes && mount.read_only {
-            trace!(0, "vfs: that mount is read-only");
+            klog!(0, "vfs: that mount is read-only");
             return None;
         }
 
@@ -1086,7 +1086,7 @@ impl Vfs {
                 match mount.fs.create_file(parent, name) {
                     Some(node) => node,
                     None => {
-                        trace!(0, "vfs: the file could not be created");
+                        klog!(0, "vfs: the file could not be created");
                         return None;
                     }
                 }
@@ -1101,17 +1101,17 @@ impl Vfs {
                  * what nobody else writes is held: counted by the file, so
                  * that another name of it is the same file. */
                 if opens.holds != 0 && writes {
-                    trace!(0, "vfs: that file is a disk's image, held while it is open");
+                    klog!(0, "vfs: that file is a disk's image, held while it is open");
                     return None;
                 }
                 if flags & OPEN_HOLD != 0 && opens.writers != 0 {
-                    trace!(0, "vfs: that file is open for writing, and cannot be held as a disk's image");
+                    klog!(0, "vfs: that file is open for writing, and cannot be held as a disk's image");
                     return None;
                 }
                 found.size
             }
             _ => {
-                trace!(0, "vfs: that path is not a file");
+                klog!(0, "vfs: that path is not a file");
                 return None;
             }
         };
@@ -1168,7 +1168,7 @@ impl Vfs {
          * image goes on making off this lock. */
         match slot.files.get(handle) {
             Some(file) if file.flags & OPEN_HOLD != 0 && !image => {
-                trace!(0, "vfs: a disk's image is let go of by its image, not closed");
+                klog!(0, "vfs: a disk's image is let go of by its image, not closed");
                 return;
             }
             Some(_) => {}
@@ -1211,7 +1211,7 @@ impl Vfs {
             (file.node, file.pos, file.flags)
         };
         if flags & OPEN_READ == 0 {
-            trace!(0, "vfs: that handle is not open for reading");
+            klog!(0, "vfs: that handle is not open for reading");
             return None;
         }
 
@@ -1243,12 +1243,12 @@ impl Vfs {
             (file.node, file.pos, file.flags)
         };
         if flags & OPEN_WRITE == 0 {
-            trace!(0, "vfs: that handle is not open for writing");
+            klog!(0, "vfs: that handle is not open for writing");
             return None;
         }
         /* A held file never grows: its holder writes within it. */
         if flags & OPEN_HOLD != 0 {
-            trace!(0, "vfs: a disk's image is written within its size");
+            klog!(0, "vfs: a disk's image is written within its size");
             return None;
         }
         if data.is_empty() {
@@ -1279,7 +1279,7 @@ impl Vfs {
             (file.node, file.flags)
         };
         if flags & OPEN_READ == 0 {
-            trace!(0, "vfs: that handle is not open for reading");
+            klog!(0, "vfs: that handle is not open for reading");
             return None;
         }
 
@@ -1305,7 +1305,7 @@ impl Vfs {
             None => return false,
         };
         if flags & OPEN_WRITE == 0 {
-            trace!(0, "vfs: that handle is not open for writing");
+            klog!(0, "vfs: that handle is not open for writing");
             return false;
         }
 
@@ -1336,7 +1336,7 @@ impl Vfs {
             None => return false,
         };
         if flags & OPEN_WRITE == 0 {
-            trace!(0, "vfs: that handle is not open for writing");
+            klog!(0, "vfs: that handle is not open for writing");
             return false;
         }
         let Some(mount) = slot.mount.as_mut() else { return false };
@@ -1345,7 +1345,7 @@ impl Vfs {
         match mount.fs.tree().get(node) {
             Some(found) if found.is_file() && !held => {}
             Some(found) if found.is_file() => {
-                trace!(0, "vfs: that file is a disk's image, its size held while it is open");
+                klog!(0, "vfs: that file is a disk's image, its size held while it is open");
                 return false;
             }
             _ => return false,
@@ -1362,12 +1362,12 @@ impl Vfs {
         let slot = &mut *guard;
         let Some((node, flags)) = slot.files.get(handle).map(|file| (file.node, file.flags)) else { return false };
         if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
-            trace!(0, "vfs: only a file held for writing as a disk's image is made written");
+            klog!(0, "vfs: only a file held for writing as a disk's image is made written");
             return false;
         }
         let Some(mount) = slot.mount.as_mut() else { return false };
         if mount.read_only {
-            trace!(0, "vfs: that mount is read-only");
+            klog!(0, "vfs: that mount is read-only");
             return false;
         }
         mount.fs.mark_written(node, runs)
@@ -1420,7 +1420,7 @@ impl Vfs {
             None => return false,
         };
         if flags & OPEN_HOLD == 0 {
-            trace!(0, "vfs: only a file held as a disk's image is mapped");
+            klog!(0, "vfs: only a file held as a disk's image is mapped");
             return false;
         }
         let Some(mount) = slot.mount.as_mut() else { return false };
@@ -1451,7 +1451,7 @@ impl Vfs {
             None => return false,
         };
         if flags & OPEN_HOLD == 0 {
-            trace!(0, "vfs: only a file held as a disk's image is mapped");
+            klog!(0, "vfs: only a file held as a disk's image is mapped");
             return false;
         }
         let Some(mount) = slot.mount.as_mut() else { return false };
@@ -1485,12 +1485,12 @@ impl Vfs {
             (file.node, file.flags)
         };
         if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
-            trace!(0, "vfs: only a file held for writing as a disk's image is punched");
+            klog!(0, "vfs: only a file held for writing as a disk's image is punched");
             return None;
         }
         let mount = slot.mount.as_mut()?;
         if mount.read_only {
-            trace!(0, "vfs: that mount is read-only");
+            klog!(0, "vfs: that mount is read-only");
             return None;
         }
         let block = mount.fs.data_block_size() as u64;
@@ -1512,29 +1512,29 @@ impl Vfs {
     /// were given, or None.
     pub fn allocate(&self, handle: Handle, first: u64, count: u64) -> Option<u64> {
         let Some(mut guard) = self.lock_handle(handle) else {
-            trace!(0, "vfs: an allocation for a handle that is no open file's");
+            klog!(0, "vfs: an allocation for a handle that is no open file's");
             return None;
         };
         let slot = &mut *guard;
 
         let Some((node, flags)) = slot.files.get(handle).map(|file| (file.node, file.flags)) else {
-            trace!(0, "vfs: an allocation for a handle its mount has no file of");
+            klog!(0, "vfs: an allocation for a handle its mount has no file of");
             return None;
         };
         if flags & (OPEN_HOLD | OPEN_WRITE) != OPEN_HOLD | OPEN_WRITE {
-            trace!(0, "vfs: only a file held for writing as a disk's image is allocated in");
+            klog!(0, "vfs: only a file held for writing as a disk's image is allocated in");
             return None;
         }
         let Some(mount) = slot.mount.as_mut() else {
-            trace!(0, "vfs: an allocation in a file whose filesystem is gone");
+            klog!(0, "vfs: an allocation in a file whose filesystem is gone");
             return None;
         };
         if mount.read_only {
-            trace!(0, "vfs: that mount is read-only");
+            klog!(0, "vfs: that mount is read-only");
             return None;
         }
         if mount.fs.data_block_size() == 0 {
-            trace!(0, "vfs: an allocation in a filesystem that keeps no blocks of its own on a device");
+            klog!(0, "vfs: an allocation in a filesystem that keeps no blocks of its own on a device");
             return None;
         }
         mount.fs.allocate(node, first, count)
@@ -1621,7 +1621,7 @@ impl Vfs {
         let mount = slot.mount.as_mut()?.writable()?;
 
         if resolved.node.is_some() {
-            trace!(0, "vfs: that path exists already");
+            klog!(0, "vfs: that path exists already");
             return None;
         }
 
@@ -1646,7 +1646,7 @@ impl Vfs {
             return None;
         }
         if mount.fs.tree().has_open_files(node) {
-            trace!(0, "vfs: something under that path is open");
+            klog!(0, "vfs: something under that path is open");
             return None;
         }
         /* A file held by another name, whose link count says this name is
@@ -1656,7 +1656,7 @@ impl Vfs {
          * guest's disk become another file. */
         let held = mount.held_under(node);
         if held.iter().any(|&file| mount.fs.links(file).is_some_and(|n| n <= 1)) {
-            trace!(0, "vfs: under that path is the last name of a disk's image held by another, while it is open");
+            klog!(0, "vfs: under that path is the last name of a disk's image held by another, while it is open");
             return None;
         }
         mount.fs.remove(node).then_some(())
@@ -1690,7 +1690,7 @@ impl Vfs {
          * map named would go back to the filesystem, and to the next file,
          * while the image still wrote them. */
         if held {
-            trace!(0, "vfs: that file is a disk's image, held while it is open");
+            klog!(0, "vfs: that file is a disk's image, held while it is open");
             return None;
         }
         mount.fs.truncate(node, size).then_some(())
@@ -1711,7 +1711,7 @@ impl Vfs {
             (!across).then_some((from_mount, (from_rest, to_rest)))
         });
         if across {
-            trace!(0, "vfs: a rename across two mounts is not a rename");
+            klog!(0, "vfs: a rename across two mounts is not a rename");
             return None;
         }
         let (mut slot, (from_rest, to_rest)) = found?;
@@ -1723,28 +1723,28 @@ impl Vfs {
             let mount = mount.writable()?;
 
             if mount.fs.tree().parent(node).is_none() {
-                trace!(0, "vfs: the root of a mount cannot be renamed");
+                klog!(0, "vfs: the root of a mount cannot be renamed");
                 return None;
             }
             if mount.fs.tree().get(node)?.is_dir() && !mount.fs.load_dir(node) {
                 return None;
             }
             if mount.fs.tree().has_open_files(node) {
-                trace!(0, "vfs: something under that path is open");
+                klog!(0, "vfs: something under that path is open");
                 return None;
             }
         }
 
         let target = Self::resolve(mount, to_rest)?;
         if target.node.is_some() {
-            trace!(0, "vfs: the new path exists already");
+            klog!(0, "vfs: the new path exists already");
             return None;
         }
         let (new_parent, new_name) = target.new_entry()?;
 
         /* A directory cannot be moved inside itself. */
         if mount.fs.tree().is_ancestor(node, new_parent) {
-            trace!(0, "vfs: that would move a directory inside itself");
+            klog!(0, "vfs: that would move a directory inside itself");
             return None;
         }
 
@@ -1789,7 +1789,7 @@ impl Vfs {
              * cut to nothing under it, its blocks would go to the next file
              * while the image still wrote them. */
             Some(found) if found.is_file() && held => {
-                trace!(0, "vfs: that file is a disk's image, held while it is open");
+                klog!(0, "vfs: that file is a disk's image, held while it is open");
                 return None;
             }
             Some(found) if found.is_file() => found.size,

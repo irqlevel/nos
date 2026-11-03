@@ -15,7 +15,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::SpinLock;
 use kcore::task::TaskHandle;
-use kcore::trace;
+use kcore::klog;
 
 use crate::abi;
 use crate::wire::{eth, ip, udp, Ipv4, Mac, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN,
@@ -229,7 +229,7 @@ impl Dhcp {
             }
             None => {
                 self.running.store(false, Ordering::Release);
-                trace!(0, "dhcp: no task to run in");
+                klog!(0, "dhcp: no task to run in");
                 false
             }
         }
@@ -267,7 +267,7 @@ impl Dhcp {
 
         match nic.listen(CLIENT_PORT, self) {
             Ok(listener) => *self.listener.lock() = Some(listener),
-            Err(err) => trace!(0, "dhcp: port {} could not be listened on ({:?})",
+            Err(err) => klog!(0, "dhcp: port {} could not be listened on ({:?})",
                 CLIENT_PORT, err),
         }
     }
@@ -579,7 +579,7 @@ impl Dhcp {
          * would have the machine send from an address no packet may come
          * from. */
         if !crate::wire::host_address(yiaddr, found.mask) {
-            trace!(0, "dhcp: {} offered {} mask {}, which no host may have: ignored",
+            klog!(0, "dhcp: {} offered {} mask {}, which no host may have: ignored",
                 Ipv4(found.server_ip), Ipv4(yiaddr), Ipv4(found.mask));
             return false;
         }
@@ -606,7 +606,7 @@ impl Dhcp {
             match self.acquire() {
                 Some(start) => self.keep(start),
                 None => {
-                    trace!(0, "dhcp: no lease");
+                    klog!(0, "dhcp: no lease");
                     sleep_until(now_ms() + NO_LEASE_MS);
                 }
             }
@@ -672,7 +672,7 @@ impl Dhcp {
                 }
 
                 let ask = if now >= times.t2 { Ask::Rebind } else { Ask::Renew };
-                trace!(0, "dhcp: {}", if ask == Ask::Renew { "renewing" } else { "rebinding" });
+                klog!(0, "dhcp: {}", if ask == Ask::Renew { "renewing" } else { "rebinding" });
                 self.listen();
                 self.next_transaction();
                 /* Not waited for past the lease's end, which comes when it
@@ -711,7 +711,7 @@ impl Dhcp {
         }
         self.ready.store(true, Ordering::Release);
 
-        trace!(0, "dhcp: {} ip {} mask {} gw {} lease {}", what, Ipv4(lease.ip),
+        klog!(0, "dhcp: {} ip {} mask {} gw {} lease {}", what, Ipv4(lease.ip),
             Ipv4(lease.mask), Ipv4(lease.router), lease.lease_secs);
     }
 
@@ -728,7 +728,7 @@ impl Dhcp {
                 nic.set_gw(0);
             }
         }
-        trace!(0, "dhcp: {}: {} let go", why, Ipv4(lease.ip));
+        klog!(0, "dhcp: {}: {} let go", why, Ipv4(lease.ip));
     }
 }
 

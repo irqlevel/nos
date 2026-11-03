@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::{Event, SpinLock};
 use kcore::task::TaskHandle;
-use kcore::trace;
+use kcore::klog;
 
 use crate::abi;
 use crate::udp;
@@ -134,7 +134,7 @@ impl UdpShell {
     pub fn new() -> Option<UdpShell> {
         let mut reply = Vec::new();
         if reply.try_reserve_exact(REPLY_CAP).is_err() {
-            trace!(0, "udpshell: no memory for the {} byte reply buffer", REPLY_CAP);
+            klog!(0, "udpshell: no memory for the {} byte reply buffer", REPLY_CAP);
             return None;
         }
 
@@ -184,7 +184,7 @@ impl UdpShell {
                 *self.task.lock() = Some(task);
             }
             Err(err) => {
-                trace!(0, "udpshell: port {} could not be listened on ({:?})", port, err);
+                klog!(0, "udpshell: port {} could not be listened on ({:?})", port, err);
                 task.request_stop();
                 self.arrived.signal();
                 drop(task);
@@ -193,7 +193,7 @@ impl UdpShell {
             }
         }
 
-        trace!(0, "udpshell: started on port {}", port);
+        klog!(0, "udpshell: started on port {}", port);
         true
     }
 
@@ -337,18 +337,18 @@ impl UdpShell {
 
             reply.clear();
             if too_long != 0 {
-                trace!(0, "udpshell: a command of {} bytes, not run", too_long);
+                klog!(0, "udpshell: a command of {} bytes, not run", too_long);
                 let _ = writeln!(reply, "command too long: {} bytes, at most {}", too_long, CMD_MAX);
             } else {
                 let line = match core::str::from_utf8(&cmd[..len]) {
                     Ok(line) => line,
                     Err(_) => {
-                        trace!(0, "udpshell: a command that is not text, dropped");
+                        klog!(0, "udpshell: a command that is not text, dropped");
                         continue;
                     }
                 };
 
-                trace!(0, "udpshell: cmd '{}' from {}.{}.{}.{}:{}", line,
+                klog!(0, "udpshell: cmd '{}' from {}.{}.{}.{}:{}", line,
                     (to_ip >> 24) & 0xFF, (to_ip >> 16) & 0xFF,
                     (to_ip >> 8) & 0xFF, to_ip & 0xFF, to_port);
 

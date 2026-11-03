@@ -1,6 +1,6 @@
 #include "ubsan.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "stack_trace.h"
 #include "symtab.h"
 
@@ -339,7 +339,7 @@ void announce()
     if (!enabled())
         return;
 
-    trace(0, "UBSan: on -- %s", __atomic_load_n(&warn_only, __ATOMIC_RELAXED)
+    klog(0, "UBSan: on -- %s", __atomic_load_n(&warn_only, __ATOMIC_RELAXED)
         ? "ubsan=warn: each site reports once, to the serial port and the disk log, and the kernel goes on"
         : "the first report is a panic");
 }

@@ -1,4 +1,4 @@
-#include "trace.h"
+#include "klog.h"
 #include "ubsan.h"
 #include "panic.h"
 #include "debug.h"
@@ -72,13 +72,13 @@ do {                                                    \
 
 void trace_cpu_state(ulong cpu)
 {
-    trace(0, "Cpu %lu cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
+    klog(0, "Cpu %lu cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
         cpu, get_cr0(), get_cr2(), get_cr3(), get_cr4());
 
-    trace(0, "Cpu %lu rflags 0x%lX rsp 0x%lX rip 0x%lX",
+    klog(0, "Cpu %lu rflags 0x%lX rsp 0x%lX rip 0x%lX",
         cpu, get_rflags(), get_rsp(), get_rip());
 
-    trace(0, "Cpu %lu ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
+    klog(0, "Cpu %lu ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
         cpu, (ulong)get_ss(), (ulong)get_cs(), (ulong)get_ds(),
         (ulong)get_gs(), (ulong)get_fs(), (ulong)get_es());
 }
@@ -124,7 +124,7 @@ static void halt_tco_watchdog()
     static const u16 TMR_HLT      = 1 << 11;
     static const u16 INTEL_VENDOR = 0x8086;
 
-    trace(0, "halt_tco_watchdog: started");
+    klog(0, "halt_tco_watchdog: started");
 
     /* An ACPI WDAT table means the firmware owns the watchdog and the Rust
        tco_wdt driver stands down.  The halt below still runs: WDAT normally
@@ -190,7 +190,7 @@ static void halt_tco_watchdog()
     outw(tco_base + TCO1_STS, 1 << 3);
     outw(tco_base + TCO2_STS, 1 << 1);
 
-    trace(0, "TCO watchdog halted (tco_base 0x%lX via %s%s)", (ulong)tco_base, source,
+    klog(0, "TCO watchdog halted (tco_base 0x%lX via %s%s)", (ulong)tco_base, source,
         firmware_watchdog ? ", ACPI WDAT owns it" : "");
 }
 
@@ -205,7 +205,7 @@ void ap_startup(void *ctx)
 
     auto& cpu = CpuTable::get_instance().get_current_cpu();
 
-    trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
+    klog(0, "Cpu %lu running rflags 0x%lX task 0x%p",
         cpu.get_index(), get_rflags(), Task::get_current_task());
 
     trace_cpu_state(cpu.get_index());
@@ -300,28 +300,28 @@ __attribute__((noinline)) void ap_main2()
     if (microcode::kept())
     {
         if (ucode.skipped == nullptr)
-            trace(0, "Cpu %lu: microcode revision 0x%x -> 0x%x", cpu.get_index(), ucode.before, ucode.after);
+            klog(0, "Cpu %lu: microcode revision 0x%x -> 0x%x", cpu.get_index(), ucode.before, ucode.after);
         else if (ucode.asked)
-            trace(0, "Cpu %lu: microcode %s (revision 0x%x)", cpu.get_index(), ucode.skipped, ucode.before);
+            klog(0, "Cpu %lu: microcode %s (revision 0x%x)", cpu.get_index(), ucode.skipped, ucode.before);
         else
-            trace(0, "Cpu %lu: microcode %s", cpu.get_index(), ucode.skipped);
+            klog(0, "Cpu %lu: microcode %s", cpu.get_index(), ucode.skipped);
     }
 
     /* Its clock its own to raise, as the BSP's is: each CPU's range its own,
        the two kinds of core of a hybrid part giving different ones. */
     hal::CpuPerformance perf;
     if (hal::setup_cpu_performance(&perf))
-        trace(0, "Cpu %lu: HWP on, performance %u to %u, %u guaranteed",
+        klog(0, "Cpu %lu: HWP on, performance %u to %u, %u guaranteed",
             cpu.get_index(), perf.lowest, perf.highest, perf.guaranteed);
 
     /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
     Gdt::get_instance().setup_tss_self(cpu.get_index());
 
-    trace(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.get_index(), get_rsp());
+    klog(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.get_index(), get_rsp());
 
     if (!cpu.run(ap_startup, nullptr))
     {
-        trace(0, "Can't run cpu %lu task", cpu.get_index());
+        klog(0, "Can't run cpu %lu task", cpu.get_index());
         return;
     }
 }
@@ -349,7 +349,7 @@ extern "C" void rust_fini();
 static void __attribute__((noinline, noreturn))
 finalize_on_static_stack(Task* task, HaltAction action)
 {
-    trace(0, "finalize_on_static_stack");
+    klog(0, "finalize_on_static_stack");
 
     task->put();
 
@@ -357,7 +357,7 @@ finalize_on_static_stack(Task* task, HaltAction action)
 
     __cxa_finalize(0);
 
-    trace(0, "Finalized");
+    klog(0, "Finalized");
 
     action();
 
@@ -374,11 +374,11 @@ static void prepare_halt(HaltAction action)
 
     preempt_disable();
 
-    trace(0, "Stopping cpu's");
+    klog(0, "Stopping cpu's");
 
     CpuTable::get_instance().exit_all_except_self();
 
-    trace(0, "Cpu's stopped");
+    klog(0, "Cpu's stopped");
 
     preempt_off();
 
@@ -499,7 +499,7 @@ void bp_startup(void* ctx)
         auto& cpu = cpus.get_current_cpu();
         auto& acpi = Acpi::get_instance();
 
-        trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
+        klog(0, "Cpu %lu running rflags 0x%lX task 0x%p",
             cpu.get_index(), get_rflags(), Task::get_current_task());
 
         trace_cpu_state(cpu.get_index());
@@ -517,14 +517,14 @@ void bp_startup(void* ctx)
             /* HPET in legacy replacement mode: timer 0 replaces PIT on IRQ 0.
                Use the same GSI that PIT would use (MADT may remap IRQ 0 → GSI 2). */
             Interrupt::register_handler(hpet, acpi.get_gsi_by_irq(0x0), 0x20);
-            trace(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
+            klog(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
         }
         else
         {
             // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
             Interrupt::register_handler(pit, acpi.get_gsi_by_irq(0x0), 0x20);
             pit.setup();
-            trace(0, "Using PIT as tick source");
+            klog(0, "Using PIT as tick source");
         }
 
         Interrupt::register_handler(kbd, acpi.get_gsi_by_irq(0x1), 0x21);
@@ -555,7 +555,7 @@ void bp_startup(void* ctx)
            on what the boot itself could be measured for. */
         rust_random_reseed();
 
-        trace(0, "Interrupts registered");
+        klog(0, "Interrupts registered");
 
         idt.set_descriptor(CpuTable::IPI_VECTOR, IdtDescriptor::encode(ip_interrupt_stub));
         idt.set_descriptor(CpuTable::TIMER_VECTOR,
@@ -566,23 +566,23 @@ void bp_startup(void* ctx)
            spurious IRQ counts a stat instead of hitting dummy_interrupt's panic. */
         idt.set_descriptor(Lapic::SPURIOUS_VECTOR, IdtDescriptor::encode(spurious_interrupt_stub));
 
-        trace(0, "IPI registred");
+        klog(0, "IPI registred");
 
         idt.save();
 
-        trace(0, "Idt saved");
+        klog(0, "Idt saved");
 
-        trace(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
+        klog(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
 
         BUG_ON(hal::is_interrupt_enabled());
 
-        trace(0, "Before interrupt enable");
+        klog(0, "Before interrupt enable");
 
         interrupt_enable();
 
         kernel_blockdev_set_interrupts_started();
 
-        trace(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
+        klog(0, "Interrupts enabled %lu", (ulong)hal::is_interrupt_enabled());
 
         /*
          * TSC calibration uses PIT channel 2 with busy-polling (~150ms).
@@ -609,21 +609,21 @@ void bp_startup(void* ctx)
             Lapic::start_timer(CpuTable::TIMER_VECTOR);
             cpus.get_current_cpu().local_timer_start();
             cpus.set_per_cpu_timer();
-            trace(0, "Tick: per-cpu local apic timer, one-shot, at %lu Hz", TICK_HZ);
+            klog(0, "Tick: per-cpu local apic timer, one-shot, at %lu Hz", TICK_HZ);
         }
         else
         {
-            trace(0, "Tick: local apic timer unavailable, keeping the broadcast tick");
+            klog(0, "Tick: local apic timer unavailable, keeping the broadcast tick");
         }
 
-        trace(0, "Before cpus start");
+        klog(0, "Before cpus start");
 
         if (!Parameters::get_instance().is_smp_off())
         {
             if (!cpus.start_all())
             {
                 /* Diagnostic: did the AP reach ap_main()? */
-                trace(0, "AP diag: ap_started_flag=%lu",
+                klog(0, "AP diag: ap_started_flag=%lu",
                       (ulong)ap_started_flag);
                 PANIC("Can't start all cpus");
                 return;
@@ -633,11 +633,11 @@ void bp_startup(void* ctx)
         /* All CPUs are running: spread device IRQs across them */
         IrqBalance::get_instance().balance();
 
-        trace(0, "Before preempt on");
+        klog(0, "Before preempt on");
 
         preempt_on();
 
-        trace(0, "Preempt is now on");
+        klog(0, "Preempt is now on");
 
         screen::printf("IPI test...\n");
 
@@ -731,7 +731,7 @@ void bp_startup(void* ctx)
             rust_usb_init();
 
             if (rust_usb_start() != 0)
-                trace(0, "Usb: failed to start the poll task");
+                klog(0, "Usb: failed to start the poll task");
         }
 
         screen::printf("Idle looping...\n");
@@ -746,7 +746,7 @@ void bp_startup(void* ctx)
            UDP: both on eth0, both the layer's to start. */
         rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
 
-        trace(0, "boot: complete");
+        klog(0, "boot: complete");
 
         for (;;)
         {
@@ -755,9 +755,9 @@ void bp_startup(void* ctx)
             {
                 do_reboot = cmd.should_reboot();
                 if (do_reboot)
-                    trace(0, "Reboot requested");
+                    klog(0, "Reboot requested");
                 else
-                    trace(0, "Shutdown requested");
+                    klog(0, "Shutdown requested");
                 rust_net_stop_shell();
                 rust_usb_stop();
                 cmd.stop();
@@ -814,15 +814,15 @@ static void wx_probe_heap()
     void* va = mm::alloc_map_pages(1, &phys);
     if (va == nullptr)
     {
-        trace(0, "W^X probe: no page for the heap probe");
+        klog(0, "W^X probe: no page for the heap probe");
         return;
     }
 
     *reinterpret_cast<volatile u8*>(va) = RET_OPCODE;
     hal::sync_instruction_cache((ulong)va, sizeof(RET_OPCODE));
-    trace(0, "W^X probe: calling into a heap page 0x%lX (expect page fault)", (ulong)va);
+    klog(0, "W^X probe: calling into a heap page 0x%lX (expect page fault)", (ulong)va);
     reinterpret_cast<void (*)()>(va)();
-    trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
+    klog(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
 /* Never inlined, as ap_main2 is not: see there */
@@ -833,10 +833,10 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     Panicker::get_instance();
     Watchdog::get_instance();
 
-    trace(0, "Cpu rsp 0x%lX rbp 0x%lX", get_rsp(), get_rbp());
+    klog(0, "Cpu rsp 0x%lX rbp 0x%lX", get_rsp(), get_rbp());
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        trace(0, "Static stack[%lu] base 0x%lX top 0x%lX",
+        klog(0, "Static stack[%lu] base 0x%lX top 0x%lX",
             i, (ulong)&stack[i][0], (ulong)&stack[i][CPU_STACK_SIZE]);
     }
 
@@ -879,9 +879,9 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         break;
     }
 
-    trace(0, "Paging root 0x%lX old cr3 0x%lX", bpt.get_root(), get_cr3());
+    klog(0, "Paging root 0x%lX old cr3 0x%lX", bpt.get_root(), get_cr3());
     set_cr3(bpt.get_root());
-    trace(0, "Set new cr3 0x%lX", get_cr3());
+    klog(0, "Set new cr3 0x%lX", get_cr3());
 
     Gdt::get_instance().save();
     ExceptionTable::get_instance().register_exception_handlers();
@@ -899,13 +899,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 
     /* Until the command line has been read there is nothing to read it from,
        so the earliest traces are always at the default level. */
-    Tracer::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
+    Klog::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
 
     //Screen::printf("Hello!\n");
 
     grub::parse_multi_boot_info((grub::MultiBootInfoHeader *)bpt.phys_to_virt((ulong)mb_info));
 
-    Tracer::get_instance().set_level(Parameters::get_instance().get_log_level());
+    Klog::get_instance().set_level(Parameters::get_instance().get_log_level());
 
     /* Microcode, as early as it can be: this CPU's update from the module
        GRUB loaded, while the bootstrap map still reaches it -- below 4 GiB,
@@ -917,13 +917,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
             microcode::Result ucode;
             microcode::load_on_bsp((const u8*)bpt.phys_to_virt(ucode_phys), ucode_len, &ucode);
             if (ucode.skipped == nullptr)
-                trace(0, "microcode: revision 0x%x -> 0x%x, of %04x-%02x-%02x", ucode.before, ucode.after,
+                klog(0, "microcode: revision 0x%x -> 0x%x, of %04x-%02x-%02x", ucode.before, ucode.after,
                     ucode.date & microcode::DATE_YEAR_MASK, ucode.date >> microcode::DATE_MONTH_SHIFT,
                     (ucode.date >> microcode::DATE_DAY_SHIFT) & microcode::DATE_DAY_MASK);
             else if (ucode.asked)
-                trace(0, "microcode: %s (revision 0x%x)", ucode.skipped, ucode.before);
+                klog(0, "microcode: %s (revision 0x%x)", ucode.skipped, ucode.before);
             else
-                trace(0, "microcode: %s", ucode.skipped);
+                klog(0, "microcode: %s", ucode.skipped);
         }
     }
 
@@ -932,7 +932,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     rust_netconsole_setup();
 
     auto& mmap = mm::MemoryMap::get_instance();
-    trace(0, "Enter kernel: start 0x%lX end 0x%lX",
+    klog(0, "Enter kernel: start 0x%lX end 0x%lX",
         mmap.get_kernel_start(), mmap.get_kernel_end());
 
     if (mmap.get_kernel_end() <= bpt.phys_to_virt(MB))
@@ -953,9 +953,9 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         break;
     }
 
-    trace(0, "Paging root 0x%lX old cr3 0x%lX", pt.get_root(), get_cr3());
+    klog(0, "Paging root 0x%lX old cr3 0x%lX", pt.get_root(), get_cr3());
     set_cr3(pt.get_root());
-    trace(0, "Set new cr3 0x%lX", get_cr3());
+    klog(0, "Set new cr3 0x%lX", get_cr3());
     if (!pt.setup_free_pages_list())
     {
         PANIC("Can't setup paging");
@@ -977,18 +977,18 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         /* The firmware's choice, said once: the APs make the same one
            (ap_main2). */
         if (hal::setup_serializing_lfence())
-            trace(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
+            klog(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
         /* The clock the CPU's own to pick, up to its turbo, rather than
            firmware's base: the APs do the same (ap_main2). */
         hal::CpuPerformance perf;
         if (hal::setup_cpu_performance(&perf))
-            trace(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
+            klog(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
                 perf.lowest, perf.highest, perf.guaranteed);
         /* How an idle CPU sleeps, decided before the APs start: they idle
            the same way. */
         u32 idle_hint;
         if (hal::setup_idle(&idle_hint))
-            trace(0, "cpu: idle by MWAIT, 0x%x -- the deepest C-state offered -- after %lu idles of %lu us or more "
+            klog(0, "cpu: idle by MWAIT, 0x%x -- the deepest C-state offered -- after %lu idles of %lu us or more "
                 "with the next timer as far off, C1 otherwise", idle_hint, Cpu::IDLE_LONG_RUN,
                 Cpu::IDLE_DEEP_NS / consts::NANO_SECS_IN_USEC);
         ulong t0 = (ulong)kernel_start, t1 = (ulong)kernel_text;
@@ -996,13 +996,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         pt.protect_range(t0, t1 - t0, false, true);   /* RX */
         pt.protect_range(t1, r1 - t1, false, false);  /* RO+NX */
         pt.protect_range(r1, e - r1, true, false);    /* RW+NX */
-        trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
+        klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             t0, t1, t1, r1, r1, e);
         if (Parameters::get_instance().is_wx_probe_text())
         {
-            trace(0, "W^X probe: writing to text 0x%lX (expect page fault)", t0);
+            klog(0, "W^X probe: writing to text 0x%lX (expect page fault)", t0);
             *reinterpret_cast<volatile u32*>(t0) = 0;
-            trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
+            klog(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
         }
     }
 
@@ -1012,14 +1012,14 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 
     //Test paging
     {
-        trace(0, "Test paging");
+        klog(0, "Test paging");
         auto page = pt.alloc_page();
         if (!page) {
             PANIC("Can't alloc page");
             break;
         }
         auto va = pt.tmp_map_page(page->get_phy_address());
-        trace(0, "va 0x%lX pha 0x%lX", va, page->get_phy_address());
+        klog(0, "va 0x%lX pha 0x%lX", va, page->get_phy_address());
         stdlib::mem_set((void *)va, 0, consts::PAGE_SIZE);
         pt.tmp_unmap_page(va);
         pt.free_page(page);
@@ -1033,13 +1033,13 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
 
     screen::printf("Hello!\n");
 
-    trace(0, "Parsing acpi...");
+    klog(0, "Parsing acpi...");
 
     auto& acpi = Acpi::get_instance();
     auto err = acpi.parse();
     if (!err.ok())
     {
-        trace_error(err, "Can't parse ACPI");
+        klog_error(err, "Can't parse ACPI");
         PANIC("Can't parse ACPI");
         break;
     }
@@ -1067,21 +1067,21 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
        folded in by the rust_random_reseed() in bp_startup. */
     hal::probe_hw_random();
     if (!rust_random_setup())
-        trace(0, "Random: unseeded at boot, https will fail until a source turns up");
+        klog(0, "Random: unseeded at boot, https will fail until a source turns up");
 
     screen::printf("Self test begin, please wait...\n");
 
-    trace(0, "Before test");
+    klog(0, "Before test");
 
     err = test::test();
     if (!err.ok())
     {
-        trace_error(err, "Test failed");
+        klog_error(err, "Test failed");
         PANIC("Self test failed");
         break;
     }
 
-    trace(0, "After test");
+    klog(0, "After test");
     ubsan::announce();
     screen::printf("Self test complete, error %lu\n", (ulong)err.get_code());
 
@@ -1121,7 +1121,7 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
         break;
     }
 
-    trace(0, "Before cpu run");
+    klog(0, "Before cpu run");
 
     if (!cpu.run(bp_startup, nullptr))
     {

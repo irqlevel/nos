@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use block::{Disk, Piece};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
-use kcore::trace;
+use kcore::klog;
 
 /// The most blocks a batch holds, a block to a page: 256 KiB of 4 KiB
 /// blocks. A buffer this size may not be there to be had; the largest that
@@ -68,13 +68,13 @@ impl Io {
     /// Block `block` into `out`, a block long.
     pub fn read(&mut self, block: u64, out: &mut [u8]) -> bool {
         if block >= self.blocks {
-            trace!(0, "ext4: a read of block {}, past the filesystem's {}", block, self.blocks);
+            klog!(0, "ext4: a read of block {}, past the filesystem's {}", block, self.blocks);
             return false;
         }
         let sector = self.sector(block);
         let buf = &mut self.scratch.as_mut_slice()[..self.bs];
         if self.dev.read(sector, buf).is_err() {
-            trace!(0, "ext4: block {} does not read", block);
+            klog!(0, "ext4: block {} does not read", block);
             return false;
         }
         out[..self.bs].copy_from_slice(buf);
@@ -85,19 +85,19 @@ impl Io {
     /// this returns, else in the device's cache.
     pub fn write(&mut self, block: u64, data: &[u8], fua: bool) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a write of block {} to a filesystem not mounted for writing, or whose journal is \
+            klog!(0, "ext4: a write of block {} to a filesystem not mounted for writing, or whose journal is \
                        aborted: refused", block);
             return false;
         }
         if block >= self.blocks || data.len() < self.bs {
-            trace!(0, "ext4: a write of block {}, past the filesystem's {}", block, self.blocks);
+            klog!(0, "ext4: a write of block {}, past the filesystem's {}", block, self.blocks);
             return false;
         }
         let sector = self.sector(block);
         let buf = &mut self.scratch.as_mut_slice()[..self.bs];
         buf.copy_from_slice(&data[..self.bs]);
         if self.dev.write(sector, buf, fua).is_err() {
-            trace!(0, "ext4: block {} does not write", block);
+            klog!(0, "ext4: block {} does not write", block);
             return false;
         }
         true
@@ -106,12 +106,12 @@ impl Io {
     /// Everything written so far onto the medium.
     pub fn flush(&mut self) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a flush of a filesystem not mounted for writing, or whose journal is aborted: \
+            klog!(0, "ext4: a flush of a filesystem not mounted for writing, or whose journal is aborted: \
                        refused");
             return false;
         }
         if self.dev.flush().is_err() {
-            trace!(0, "ext4: the device does not flush");
+            klog!(0, "ext4: the device does not flush");
             return false;
         }
         true
@@ -139,14 +139,14 @@ impl Io {
     /// Block `block` into the batch's `k`th block, as `read` reads it.
     pub fn read_slot(&mut self, block: u64, k: usize) -> bool {
         if block >= self.blocks {
-            trace!(0, "ext4: a read of block {}, past the filesystem's {}", block, self.blocks);
+            klog!(0, "ext4: a read of block {}, past the filesystem's {}", block, self.blocks);
             return false;
         }
         let sector = self.sector(block);
         let at = k * PAGE_SIZE;
         let bs = self.bs;
         if self.dev.read(sector, &mut self.batch.as_mut_slice()[at..at + bs]).is_err() {
-            trace!(0, "ext4: block {} does not read", block);
+            klog!(0, "ext4: block {} does not read", block);
             return false;
         }
         true
@@ -158,12 +158,12 @@ impl Io {
     fn pieces_of(&mut self, blocks: &[(usize, u64)]) -> bool {
         self.pieces.clear();
         if blocks.len() > self.batch.pages() {
-            trace!(0, "ext4: a batch of {} blocks, past the {} its buffer holds", blocks.len(), self.batch.pages());
+            klog!(0, "ext4: a batch of {} blocks, past the {} its buffer holds", blocks.len(), self.batch.pages());
             return false;
         }
         for &(k, block) in blocks {
             if block >= self.blocks || k >= self.batch.pages() {
-                trace!(0, "ext4: block {} in a batch, past the filesystem's {}", block, self.blocks);
+                klog!(0, "ext4: block {} in a batch, past the filesystem's {}", block, self.blocks);
                 return false;
             }
             self.pieces.push(Piece { sector: self.sector(block), at: k * PAGE_SIZE, len: self.bs });
@@ -176,7 +176,7 @@ impl Io {
     /// returns. False on a failure, by when some may be written.
     pub fn write_batch(&mut self, blocks: &[(usize, u64)]) -> bool {
         if !self.writable {
-            trace!(0, "ext4: a write of {} blocks to a filesystem not mounted for writing, or whose journal is \
+            klog!(0, "ext4: a write of {} blocks to a filesystem not mounted for writing, or whose journal is \
                        aborted: refused", blocks.len());
             return false;
         }
@@ -184,7 +184,7 @@ impl Io {
             return false;
         }
         if self.dev.write_pieces(&self.batch, &self.pieces).is_err() {
-            trace!(0, "ext4: a batch of {} blocks does not write", blocks.len());
+            klog!(0, "ext4: a batch of {} blocks does not write", blocks.len());
             return false;
         }
         true
@@ -197,7 +197,7 @@ impl Io {
             return false;
         }
         if self.dev.read_pieces(&mut self.batch, &self.pieces).is_err() {
-            trace!(0, "ext4: a batch of {} blocks does not read", blocks.len());
+            klog!(0, "ext4: a batch of {} blocks does not read", blocks.len());
             return false;
         }
         true

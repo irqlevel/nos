@@ -3,7 +3,7 @@
 #include <kernel/time.h>
 #include <drivers/acpi.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include "asm.h"
 #include <mm/mmio.h>
 
@@ -33,14 +33,14 @@ void Lapic::enable()
 {
     ulong msr = read_msr(BASE_MSR);
 
-    trace(LAPIC_LL, "Lapic: msr 0x%lX base 0x%p", msr, Acpi::get_instance().get_lapic_address());
+    klog(LAPIC_LL, "Lapic: msr 0x%lX base 0x%p", msr, Acpi::get_instance().get_lapic_address());
 
     /* Firmware may hand off with the APIC in x2APIC mode, where the
        MMIO window is dead. The SDM forbids switching x2APIC->xAPIC
        directly: go through the globally-disabled state first. */
     if (msr & BASE_MSR_X2_APIC_ENABLE)
     {
-        trace(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
+        klog(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
         write_msr(BASE_MSR, msr & ~(BASE_MSR_X2_APIC_ENABLE | BASE_MSR_GLOBAL_ENABLE));
         msr = msr & ~(BASE_MSR_X2_APIC_ENABLE | BASE_MSR_GLOBAL_ENABLE);
     }
@@ -57,10 +57,10 @@ void Lapic::enable()
     write_reg(TPR_INDEX, 0xFF);// Disable all interrupts
     write_reg(SP_IV_INDEX, 0x100 | SPURIOUS_VECTOR);// bit 8 = APIC software enable
 
-    trace(LAPIC_LL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
+    klog(LAPIC_LL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
         (ulong)read_reg(TPR_INDEX), (ulong)read_reg(DFR_INDEX), (ulong)read_reg(LDR_INDEX), (ulong)read_reg(SP_IV_INDEX));
 
-    trace(LAPIC_LL, "Lapic: apic_id 0x%lX", (ulong)get_apic_id());
+    klog(LAPIC_LL, "Lapic: apic_id 0x%lX", (ulong)get_apic_id());
 
     /* The ID is known and the MMIO window is live: give this CPU its GS slot
        so nothing has to come back here to ask again. */
@@ -80,7 +80,7 @@ void Lapic::mask_lvt(ulong index, const char* name)
     if (value & LVT_MASKED)
         return;
 
-    trace(0, "Lapic: masking lvt %s 0x%lX", name, (ulong)value);
+    klog(0, "Lapic: masking lvt %s 0x%lX", name, (ulong)value);
 
     write_reg(index, value | LVT_MASKED);
 }
@@ -228,7 +228,7 @@ bool Lapic::calibrate_timer()
     {
         /* Ran the counter to zero, or the clock did not move: either way
            the measurement is not one to build a tick on. */
-        trace(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
+        klog(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
             (ulong)remaining, elapsed);
         return false;
     }
@@ -243,12 +243,12 @@ bool Lapic::calibrate_timer()
        in a u64 below that. */
     if (ticks_per_sec == 0 || ticks_per_sec > 0xFFFFFFFFUL)
     {
-        trace(0, "Lapic: timer rate %lu out of range", ticks_per_sec);
+        klog(0, "Lapic: timer rate %lu out of range", ticks_per_sec);
         return false;
     }
 
     timer_ticks_per_sec_ = ticks_per_sec;
-    trace(0, "Lapic: timer %lu ticks/s", ticks_per_sec);
+    klog(0, "Lapic: timer %lu ticks/s", ticks_per_sec);
 
     return true;
 }

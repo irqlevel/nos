@@ -11,11 +11,11 @@
 //! the disks it was given.
 
 use crate::disk::{self as block, Disk};
-use kcore::trace;
+use kcore::klog;
 
 fn check(what: &str, ok: bool) -> bool {
     if !ok {
-        trace!(0, "block selftest: {} FAILED", what);
+        klog!(0, "block selftest: {} FAILED", what);
     }
     ok
 }
@@ -55,7 +55,7 @@ fn lookups() -> bool {
 #[no_mangle]
 pub extern "C" fn rust_block_selftest() -> i32 {
     if lookups() {
-        trace!(0, "block selftest: passed");
+        klog!(0, "block selftest: passed");
         0
     } else {
         -1

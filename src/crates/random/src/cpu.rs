@@ -4,7 +4,7 @@
 //! boots on all share; docs/random.md has which has what.
 
 use kcore::random::{hw_kind, hw_random, hw_random_seed, HwKind};
-use kcore::trace;
+use kcore::klog;
 
 use crate::Source;
 
@@ -47,11 +47,11 @@ pub fn self_test() -> bool {
     /* Half the draws failing is a source not worth having either: the retry
      * loops inside the HAL have already been patient. */
     if ok < DRAWS / 2 {
-        trace!(0, "HwRandom: only {} of {} draws succeeded", ok, DRAWS);
+        klog!(0, "HwRandom: only {} of {} draws succeeded", ok, DRAWS);
         return false;
     }
     if !differs {
-        trace!(0, "HwRandom: every draw returned {:#X}", first.unwrap_or(0));
+        klog!(0, "HwRandom: every draw returned {:#X}", first.unwrap_or(0));
         return false;
     }
     true

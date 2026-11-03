@@ -3,7 +3,7 @@
 #include "board.h"
 
 #include <drivers/pci.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
@@ -96,7 +96,7 @@ static u8 assign_bar(Pci& pci, Pci::DeviceInfo* d, u8 bar)
     ulong addr = (*next + (size - 1)) & ~(size - 1); /* natural alignment */
     if (addr + size > end)
     {
-        trace(0, "PciAssign: window exhausted for %lu:%lu.%lu bar%lu size 0x%lX",
+        klog(0, "PciAssign: window exhausted for %lu:%lu.%lu bar%lu size 0x%lX",
             (ulong)d->bus, (ulong)d->slot, (ulong)d->func, (ulong)bar, size);
         return is64 ? 2 : 1;
     }
@@ -107,7 +107,7 @@ static u8 assign_bar(Pci& pci, Pci::DeviceInfo* d, u8 bar)
     if (is64)
         pci.write_dword(d->bus, d->slot, d->func, (u16)(off + 4), (u32)(addr >> 32));
 
-    trace(0, "PciAssign: %lu:%lu.%lu bar%lu -> 0x%lX size 0x%lX %s",
+    klog(0, "PciAssign: %lu:%lu.%lu bar%lu -> 0x%lX size 0x%lX %s",
         (ulong)d->bus, (ulong)d->slot, (ulong)d->func, (ulong)bar, addr, size,
         is64 ? "64" : "32");
 
@@ -151,7 +151,7 @@ void pci_assign_resources(void* devices, ulong count, ulong stride)
             u8 int_id = (u8)(32 + 3 + ((d->slot + pin - 1) % 4));
             pci.write_byte(d->bus, d->slot, d->func, 0x3C, int_id);
             d->interrupt_line = int_id;
-            trace(0, "PciIntx: %lu:%lu.%lu pin %lu -> intid %lu",
+            klog(0, "PciIntx: %lu:%lu.%lu pin %lu -> intid %lu",
                 (ulong)d->bus, (ulong)d->slot, (ulong)d->func, (ulong)pin, (ulong)int_id);
         }
 
@@ -184,13 +184,13 @@ bool pci_ecam_setup()
     ulong va = mm::PageTable::get_instance().map_mmio_region(board.ecam_base_, map_bytes);
     if (va == 0)
     {
-        trace(0, "pci_ecam_setup: ECAM map failed");
+        klog(0, "pci_ecam_setup: ECAM map failed");
         return false;
     }
 
     ecam_va = va;
     ecam_buses_mapped = buses;
-    trace(0, "pci_ecam_setup: ecam 0x%lX va 0x%lX buses %lu mmio32 0x%lX+0x%lX",
+    klog(0, "pci_ecam_setup: ecam 0x%lX va 0x%lX buses %lu mmio32 0x%lX+0x%lX",
         board.ecam_base_, va, buses, board.pci_mmio32_base_, board.pci_mmio32_size_);
     return true;
 }

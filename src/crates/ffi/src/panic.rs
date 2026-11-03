@@ -7,7 +7,7 @@ unsafe extern "C" {
 
 pub fn panic_handler(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
-    let mut buf = crate::trace::__TraceBuf::new();
+    let mut buf = crate::klog::__KlogBuf::new();
     let _ = write!(buf, "{}", info);
     unsafe { kernel_panic(buf.as_str().as_ptr(), buf.as_str().len()) }
 }
@@ -22,7 +22,7 @@ pub fn panic_handler(info: &core::panic::PanicInfo) -> ! {
 /// handler's message is: nothing on this path may allocate.
 pub fn alloc_error(layout: core::alloc::Layout) -> ! {
     use core::fmt::Write;
-    let mut buf = crate::trace::__TraceBuf::new();
+    let mut buf = crate::klog::__KlogBuf::new();
     let _ = write!(buf, "alloc error: {} bytes, align {}", layout.size(), layout.align());
     unsafe { kernel_panic(buf.as_str().as_ptr(), buf.as_str().len()) }
 }

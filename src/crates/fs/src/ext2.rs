@@ -37,7 +37,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::pod::{self, Pod};
 use kcore::time::wall_clock_secs;
-use kcore::trace;
+use kcore::klog;
 
 use crate::vfs::{FileSystem, Space};
 use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
@@ -332,7 +332,7 @@ struct Io {
 impl Io {
     fn read_block(&self, block: u32, buf: &mut [u8]) -> bool {
         if block >= self.block_count {
-            trace!(0, "ext2: read of block {} beyond {}", block, self.block_count);
+            klog!(0, "ext2: read of block {} beyond {}", block, self.block_count);
             return false;
         }
         let sectors = self.block_size / self.sector_size;
@@ -342,7 +342,7 @@ impl Io {
 
     fn write_block(&self, block: u32, buf: &[u8], fua: bool) -> bool {
         if block >= self.block_count {
-            trace!(0, "ext2: write of block {} beyond {}", block, self.block_count);
+            klog!(0, "ext2: write of block {} beyond {}", block, self.block_count);
             return false;
         }
         let sectors = self.block_size / self.sector_size;
@@ -354,7 +354,7 @@ impl Io {
     /// the filesystem's end.
     fn piece(&self, block: u32, at: usize) -> Option<Piece> {
         if block >= self.block_count {
-            trace!(0, "ext2: block {} beyond {} in a batch", block, self.block_count);
+            klog!(0, "ext2: block {} beyond {} in a batch", block, self.block_count);
             return None;
         }
         let sectors = (self.block_size / self.sector_size) as u64;
@@ -477,7 +477,7 @@ fn batch_buffer() -> Option<DmaBuffer> {
 fn read_super_block(dev: &Disk, scratch: &mut [u8]) -> Option<SuperBlock> {
     let sector_size = dev.sector_size() as usize;
     if sector_size == 0 || sector_size > PAGE_SIZE || !sector_size.is_power_of_two() {
-        trace!(0, "ext2: unsupported sector size {}", sector_size);
+        klog!(0, "ext2: unsupported sector size {}", sector_size);
         return None;
     }
 
@@ -487,7 +487,7 @@ fn read_super_block(dev: &Disk, scratch: &mut [u8]) -> Option<SuperBlock> {
 
     scratch.fill(0);
     if dev.read(start as u64, &mut scratch[..count * sector_size]).is_err() {
-        trace!(0, "ext2: failed to read the superblock");
+        klog!(0, "ext2: failed to read the superblock");
         return None;
     }
 
@@ -618,7 +618,7 @@ impl Ext2 {
         let off = SUPER_BLOCK_OFFSET % self.block_size();
 
         if !self.io.read_block(block, self.tmp.as_mut_slice()) {
-            trace!(0, "ext2: read of the superblock's block failed");
+            klog!(0, "ext2: read of the superblock's block failed");
             return false;
         }
 
@@ -627,7 +627,7 @@ impl Ext2 {
             return false;
         }
         if !self.io.write_block(block, self.tmp.as_slice(), fua) {
-            trace!(0, "ext2: write of the superblock failed");
+            klog!(0, "ext2: write of the superblock failed");
             return false;
         }
         true
@@ -640,7 +640,7 @@ impl Ext2 {
              * page-aligned for block sizes under a page, and DMA needs it so */
             self.tmp.as_mut_slice()[..bs].copy_from_slice(&self.gdt[i * bs..(i + 1) * bs]);
             if !self.io.write_block(self.gdt_block + i as u32, self.tmp.as_slice(), fua) {
-                trace!(0, "ext2: write of group descriptor block {} failed", i);
+                klog!(0, "ext2: write of group descriptor block {} failed", i);
                 return false;
             }
         }
@@ -684,7 +684,7 @@ impl Ext2 {
 
     pub fn mount(&mut self, read_only: bool) -> bool {
         if self.mounted {
-            trace!(0, "ext2: already mounted");
+            klog!(0, "ext2: already mounted");
             return false;
         }
         self.read_only = read_only;
@@ -696,7 +696,7 @@ impl Ext2 {
         self.sb = sb;
 
         if self.sb.magic != MAGIC {
-            trace!(0, "ext2: bad magic {:#x}", self.sb.magic);
+            klog!(0, "ext2: bad magic {:#x}", self.sb.magic);
             return false;
         }
 
@@ -707,7 +707,7 @@ impl Ext2 {
             || self.sb.feature_incompat & !INCOMPAT_SUPPORTED != 0
             || self.sb.feature_incompat & INCOMPAT_FILETYPE == 0
         {
-            trace!(0, "ext2: unsupported rev {} / incompat features {:#x}",
+            klog!(0, "ext2: unsupported rev {} / incompat features {:#x}",
                 self.sb.rev_level, self.sb.feature_incompat);
             return false;
         }
@@ -715,7 +715,7 @@ impl Ext2 {
         /* log_block_size is raw disk data feeding a shift: bound it before
          * shifting, a count past the word size being undefined. */
         if self.sb.log_block_size > MAX_LOG_BLOCK_SIZE {
-            trace!(0, "ext2: unsupported log block size {}", self.sb.log_block_size);
+            klog!(0, "ext2: unsupported log block size {}", self.sb.log_block_size);
             return false;
         }
 
@@ -724,7 +724,7 @@ impl Ext2 {
             || block_size < self.io.sector_size
             || block_size % self.io.sector_size != 0
         {
-            trace!(0, "ext2: unsupported block size {} (sector size {})",
+            klog!(0, "ext2: unsupported block size {} (sector size {})",
                 block_size, self.io.sector_size);
             return false;
         }
@@ -742,7 +742,7 @@ impl Ext2 {
          * must be at least that and divide the block size evenly -- otherwise
          * a crafted image could make the copy straddle the end of tmp. */
         if self.inode_size < INODE_SIZE || block_size % self.inode_size != 0 {
-            trace!(0, "ext2: unsupported inode size {} (block size {})",
+            klog!(0, "ext2: unsupported inode size {} (block size {})",
                 self.inode_size, block_size);
             return false;
         }
@@ -755,13 +755,13 @@ impl Ext2 {
             || self.sb.inodes_per_group > bits
             || self.sb.blocks_per_group > bits
         {
-            trace!(0, "ext2: bad blocks/inodes per group {}/{}",
+            klog!(0, "ext2: bad blocks/inodes per group {}/{}",
                 self.sb.blocks_per_group, self.sb.inodes_per_group);
             return false;
         }
 
         if self.sb.first_data_block >= self.sb.block_count {
-            trace!(0, "ext2: first data block {} beyond {}",
+            klog!(0, "ext2: first data block {} beyond {}",
                 self.sb.first_data_block, self.sb.block_count);
             return false;
         }
@@ -771,7 +771,7 @@ impl Ext2 {
          * the device has. */
         let device_blocks = self.io.dev.sectors() / (block_size / self.io.sector_size) as u64;
         if self.sb.block_count as u64 > device_blocks {
-            trace!(0, "ext2: {} blocks do not fit the device's {}", self.sb.block_count, device_blocks);
+            klog!(0, "ext2: {} blocks do not fit the device's {}", self.sb.block_count, device_blocks);
             return false;
         }
         self.io.first_data_block = self.sb.first_data_block;
@@ -780,7 +780,7 @@ impl Ext2 {
         self.group_count = (self.sb.block_count - self.sb.first_data_block)
             .div_ceil(self.sb.blocks_per_group);
         if self.group_count == 0 {
-            trace!(0, "ext2: zero groups");
+            klog!(0, "ext2: zero groups");
             return false;
         }
 
@@ -789,7 +789,7 @@ impl Ext2 {
          * an inode's number, its group and its place in the table sums that
          * cannot overflow. */
         if self.group_count as u64 * self.sb.inodes_per_group as u64 != self.sb.inode_count as u64 {
-            trace!(0, "ext2: {} inodes, where {} groups of {} make {}", self.sb.inode_count,
+            klog!(0, "ext2: {} inodes, where {} groups of {} make {}", self.sb.inode_count,
                 self.group_count, self.sb.inodes_per_group,
                 self.group_count as u64 * self.sb.inodes_per_group as u64);
             return false;
@@ -804,14 +804,14 @@ impl Ext2 {
 
         let bytes = self.gdt_blocks * block_size;
         if self.gdt.try_reserve_exact(bytes).is_err() {
-            trace!(0, "ext2: no memory for {} bytes of group descriptors", bytes);
+            klog!(0, "ext2: no memory for {} bytes of group descriptors", bytes);
             return false;
         }
         self.gdt.resize(bytes, 0);
 
         for i in 0..self.gdt_blocks {
             if !self.io.read_block(self.gdt_block + i as u32, self.tmp.as_mut_slice()) {
-                trace!(0, "ext2: failed to read group descriptor block {}",
+                klog!(0, "ext2: failed to read group descriptor block {}",
                     self.gdt_block as usize + i);
                 return self.mount_failed();
             }
@@ -829,19 +829,19 @@ impl Ext2 {
                 || !self.io.is_data_block(table)
                 || table as u64 + table_blocks > self.sb.block_count as u64
             {
-                trace!(0, "ext2: group {} descriptor points outside the filesystem", g);
+                klog!(0, "ext2: group {} descriptor points outside the filesystem", g);
                 return self.mount_failed();
             }
         }
 
         self.root = self.new_vnode(None, b"/", Kind::Dir, ROOT_INODE, 0);
         if self.root.is_none() {
-            trace!(0, "ext2: no memory for the root vnode");
+            klog!(0, "ext2: no memory for the root vnode");
             return self.mount_failed();
         }
 
         if !self.read_only && self.sb.feature_ro_compat & !RO_COMPAT_WRITABLE != 0 {
-            trace!(0, "ext2: ro_compat features {:#x} are not maintained by this driver, mounting read-only",
+            klog!(0, "ext2: ro_compat features {:#x} are not maintained by this driver, mounting read-only",
                 self.sb.feature_ro_compat);
             self.read_only = true;
         }
@@ -851,20 +851,20 @@ impl Ext2 {
              * mounted for writing, so a crash shows as "not cleanly
              * unmounted" to the next mount and to e2fsck. */
             if self.sb.state & STATE_VALID == 0 {
-                trace!(0, "ext2: the filesystem was not cleanly unmounted");
+                klog!(0, "ext2: the filesystem was not cleanly unmounted");
             }
 
             self.sb.state &= !STATE_VALID;
             self.sb.mount_count = self.sb.mount_count.wrapping_add(1);
             self.sb.mount_time = wall_clock_secs() as u32;
             if !self.write_super(true) {
-                trace!(0, "ext2: cannot write the superblock, mounting read-only");
+                klog!(0, "ext2: cannot write the superblock, mounting read-only");
                 self.read_only = true;
             }
         }
 
         self.mounted = true;
-        trace!(0, "ext2: mounted {} blocks, {} inodes, blocksize {}, {} groups, {}",
+        klog!(0, "ext2: mounted {} blocks, {} inodes, blocksize {}, {} groups, {}",
             self.sb.block_count, self.sb.inode_count, block_size, self.group_count,
             if self.read_only { "ro" } else { "rw" });
         true
@@ -929,13 +929,13 @@ impl Ext2 {
     /// offset within that block.
     fn inode_place(&self, ino: u32) -> Option<(u32, usize)> {
         if ino == 0 || ino > self.sb.inode_count {
-            trace!(0, "ext2: inode {} out of range", ino);
+            klog!(0, "ext2: inode {} out of range", ino);
             return None;
         }
 
         let group = self.inode_group(ino);
         if group >= self.group_count {
-            trace!(0, "ext2: group {} out of range for inode {}", group, ino);
+            klog!(0, "ext2: group {} out of range for inode {}", group, ino);
             return None;
         }
 
@@ -964,7 +964,7 @@ impl Ext2 {
     fn read_inode(&mut self, ino: u32) -> Option<Inode> {
         let (block, off) = self.inode_place(ino)?;
         if !self.load_itab(block) {
-            trace!(0, "ext2: read of the block holding inode {} failed", ino);
+            klog!(0, "ext2: read of the block holding inode {} failed", ino);
             return None;
         }
         pod::read::<Inode>(self.itab.as_slice(), off)
@@ -987,7 +987,7 @@ impl Ext2 {
         };
 
         if !self.load_itab(block) {
-            trace!(0, "ext2: read of the block holding inode {} failed", ino);
+            klog!(0, "ext2: read of the block holding inode {} failed", ino);
             return false;
         }
 
@@ -995,7 +995,7 @@ impl Ext2 {
             return false;
         }
         if !self.io.write_block(block, self.itab.as_slice(), fua) {
-            trace!(0, "ext2: write of the block holding inode {} failed", ino);
+            klog!(0, "ext2: write of the block holding inode {} failed", ino);
             /* The cache holds what the disk may not: read it again. */
             self.itab_block = 0;
             return false;
@@ -1026,7 +1026,7 @@ impl Ext2 {
         }
 
         if !self.io.read_block(block, self.bitmap.as_mut_slice()) {
-            trace!(0, "ext2: read of bitmap block {} failed", block);
+            klog!(0, "ext2: read of bitmap block {} failed", block);
             self.bitmap_block = 0;
             return false;
         }
@@ -1048,7 +1048,7 @@ impl Ext2 {
         }
 
         if !self.io.write_block(self.bitmap_block, self.bitmap.as_slice(), fua) {
-            trace!(0, "ext2: write of bitmap block {} failed", self.bitmap_block);
+            klog!(0, "ext2: write of bitmap block {} failed", self.bitmap_block);
             return false;
         }
 
@@ -1142,7 +1142,7 @@ impl Ext2 {
                  * use, as Linux keeps a block "in system zone", and the next
                  * one looked for */
                 if self.is_metadata(block) {
-                    trace!(0, "ext2: block {} is the filesystem's own and was free in its bitmap: marked in use",
+                    klog!(0, "ext2: block {} is the filesystem's own and was free in its bitmap: marked in use",
                         block);
                     from = idx + 1;
                     continue;
@@ -1153,19 +1153,19 @@ impl Ext2 {
 
             /* The descriptor's count and the bitmap disagree: trust the
              * bitmap and stop the descriptor from sending us here again */
-            trace!(0, "ext2: group {} claims {} free blocks but its bitmap is full",
+            klog!(0, "ext2: group {} claims {} free blocks but its bitmap is full",
                 g, self.gd_free_blocks(g));
             self.gd_set_free_blocks(g, 0);
             self.meta_dirty = true;
         }
 
-        trace!(0, "ext2: no free blocks");
+        klog!(0, "ext2: no free blocks");
         None
     }
 
     fn free_block(&mut self, block: u32) -> bool {
         if !self.io.is_data_block(block) {
-            trace!(0, "ext2: free of block {} outside the filesystem", block);
+            klog!(0, "ext2: free of block {} outside the filesystem", block);
             return false;
         }
 
@@ -1179,7 +1179,7 @@ impl Ext2 {
 
         let bs = self.block_size();
         if !bit_test(&self.bitmap.as_slice()[..bs], idx) {
-            trace!(0, "ext2: block {} is free already", block);
+            klog!(0, "ext2: block {} is free already", block);
             return false;
         }
 
@@ -1236,19 +1236,19 @@ impl Ext2 {
                 return Some(ino);
             }
 
-            trace!(0, "ext2: group {} claims {} free inodes but its bitmap is full",
+            klog!(0, "ext2: group {} claims {} free inodes but its bitmap is full",
                 g, self.gd_free_inodes(g));
             self.gd_set_free_inodes(g, 0);
             self.meta_dirty = true;
         }
 
-        trace!(0, "ext2: no free inodes");
+        klog!(0, "ext2: no free inodes");
         None
     }
 
     fn free_inode(&mut self, ino: u32, is_dir: bool) -> bool {
         if ino < self.sb.first_inode || ino > self.sb.inode_count {
-            trace!(0, "ext2: free of inode {} out of range", ino);
+            klog!(0, "ext2: free of inode {} out of range", ino);
             return false;
         }
 
@@ -1261,7 +1261,7 @@ impl Ext2 {
 
         let bs = self.block_size();
         if !bit_test(&self.bitmap.as_slice()[..bs], idx) {
-            trace!(0, "ext2: inode {} is free already", ino);
+            klog!(0, "ext2: inode {} is free already", ino);
             return false;
         }
 
@@ -1292,7 +1292,7 @@ impl Ext2 {
             return true;
         }
         if !self.flush_bitmap_as(false) || !self.io.flush() {
-            trace!(0, "ext2: the flush before an indirect block's pointers failed");
+            klog!(0, "ext2: the flush before an indirect block's pointers failed");
             return false;
         }
         self.write_pointers()
@@ -1325,7 +1325,7 @@ impl Ext2 {
         let cache = &mut self.ptrs[level];
         cache.block = 0;
         if !self.io.read_block(block, cache.buf.as_mut_slice()) {
-            trace!(0, "ext2: read of {} block {} failed", LEVEL_NAMES[level], block);
+            klog!(0, "ext2: read of {} block {} failed", LEVEL_NAMES[level], block);
             return false;
         }
         cache.block = block;
@@ -1348,7 +1348,7 @@ impl Ext2 {
         if self.io.write_block(cache.block, cache.buf.as_slice(), false) {
             return true;
         }
-        trace!(0, "ext2: write of {} block {} failed", LEVEL_NAMES[level], cache.block);
+        klog!(0, "ext2: write of {} block {} failed", LEVEL_NAMES[level], cache.block);
         false
     }
 
@@ -1485,7 +1485,7 @@ impl Ext2 {
                 let b = inode.block[slot];
                 if b != 0 {
                     if !self.io.is_data_block(b) {
-                        trace!(0, "ext2: direct block {} points outside the filesystem", b);
+                        klog!(0, "ext2: direct block {} points outside the filesystem", b);
                         return None;
                     }
                     return Some((b, false));
@@ -1500,7 +1500,7 @@ impl Ext2 {
             }
             Some(Place::Tree { level, rel }) => (level, rel),
             None => {
-                trace!(0, "ext2: logical block {} is past what the triple indirect block maps", logical);
+                klog!(0, "ext2: logical block {} is past what the triple indirect block maps", logical);
                 return None;
             }
         };
@@ -1516,7 +1516,7 @@ impl Ext2 {
             inode.block[slot] = block;
             inode.blocks = inode.blocks.saturating_add(units);
         } else if !self.io.is_data_block(block) {
-            trace!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
+            klog!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
             return None;
         }
 
@@ -1532,7 +1532,7 @@ impl Ext2 {
             let index = (rel / ppb.pow(level as u32) % ppb) as u32;
             let next = self.ptr(level, index);
             if next != 0 && !self.io.is_data_block(next) {
-                trace!(0, "ext2: block {} in {} block {} points outside the filesystem", next,
+                klog!(0, "ext2: block {} in {} block {} points outside the filesystem", next,
                     LEVEL_NAMES[level], block);
                 return None;
             }
@@ -1619,7 +1619,7 @@ impl Ext2 {
             let slot = INDIRECT_SLOT + top;
             let mut block = inode.block[slot];
             if block != 0 && !self.io.is_data_block(block) {
-                trace!(0, "ext2: {} block {} points outside the filesystem, dropped", LEVEL_NAMES[top], block);
+                klog!(0, "ext2: {} block {} points outside the filesystem, dropped", LEVEL_NAMES[top], block);
                 inode.block[slot] = 0;
                 block = 0;
             }
@@ -1654,7 +1654,7 @@ impl Ext2 {
                 let child_first = first + u64::from(index) * below;
                 let valid = next != 0 && self.io.is_data_block(next);
                 if next != 0 && !valid {
-                    trace!(0, "ext2: {} block {} points outside the filesystem, dropped",
+                    klog!(0, "ext2: {} block {} points outside the filesystem, dropped",
                         LEVEL_NAMES[level - 1], next);
                     self.clear_ptr(level, index);
                     changed[level] = true;
@@ -1729,7 +1729,7 @@ impl Ext2 {
         /* Past it a block's number would not fit the word that numbers
          * them: no file of this filesystem's is that big */
         if file_size > self.max_size() {
-            trace!(0, "ext2: a file of {} bytes is past what one can be here", file_size);
+            klog!(0, "ext2: a file of {} bytes is past what one can be here", file_size);
             return false;
         }
         let file_size = file_size as usize;
@@ -1755,7 +1755,7 @@ impl Ext2 {
                 let (phys, _) = match self.map_block(&mut scratch, 0, block_idx, false) {
                     Some(mapped) => mapped,
                     None => {
-                        trace!(0, "ext2: logical block {} is unmappable", block_idx);
+                        klog!(0, "ext2: logical block {} is unmappable", block_idx);
                         return false;
                     }
                 };
@@ -1772,7 +1772,7 @@ impl Ext2 {
             }
 
             if !self.pieces.is_empty() && !self.io.read_pieces(&mut self.batch, &self.pieces) {
-                trace!(0, "ext2: a read of {} blocks failed", self.pieces.len());
+                klog!(0, "ext2: a read of {} blocks failed", self.pieces.len());
                 return false;
             }
 
@@ -1847,7 +1847,7 @@ impl Ext2 {
                 let (phys, fresh) = match self.map_block(inode, goal_group, block_idx, true) {
                     Some(mapped) => mapped,
                     None => {
-                        trace!(0, "ext2: logical block {} is unmappable", block_idx);
+                        klog!(0, "ext2: logical block {} is unmappable", block_idx);
                         failed = true;
                         break;
                     }
@@ -1865,7 +1865,7 @@ impl Ext2 {
                     } else if self.io.read_block(phys, self.data.as_mut_slice()) {
                         self.batch.as_mut_slice()[at..at + bs].copy_from_slice(&self.data.as_slice()[..bs]);
                     } else {
-                        trace!(0, "ext2: read of block {} failed", phys);
+                        klog!(0, "ext2: read of block {} failed", phys);
                         failed = true;
                         break;
                     }
@@ -1883,7 +1883,7 @@ impl Ext2 {
              * block it allocated then holds what was meant for it, not
              * whatever the disk had there before. */
             if !self.pieces.is_empty() && !self.io.write_pieces(&self.batch, &self.pieces) {
-                trace!(0, "ext2: a write of {} blocks failed", self.pieces.len());
+                klog!(0, "ext2: a write of {} blocks failed", self.pieces.len());
                 return false;
             }
             if failed {
@@ -1907,7 +1907,7 @@ impl Ext2 {
     /// to e2fsck and never leaves a block both in use and free.
     fn truncate_inode(&mut self, ino: u32, inode: &mut Inode, new_size: u64) -> bool {
         if new_size > self.max_size() {
-            trace!(0, "ext2: size {} is too large", new_size);
+            klog!(0, "ext2: size {} is too large", new_size);
             return false;
         }
 
@@ -1927,7 +1927,7 @@ impl Ext2 {
 
         let mut batch: Vec<u32> = Vec::new();
         if batch.try_reserve_exact(FREE_BATCH).is_err() {
-            trace!(0, "ext2: no memory for the batch of blocks to free");
+            klog!(0, "ext2: no memory for the batch of blocks to free");
             return false;
         }
 
@@ -1998,7 +1998,7 @@ impl Ext2 {
                     let p = inode.block[slot];
                     if p != 0 {
                         if !self.io.is_data_block(p) {
-                            trace!(0, "ext2: direct block {} points outside the filesystem", p);
+                            klog!(0, "ext2: direct block {} points outside the filesystem", p);
                             return false;
                         }
                         batch.push(p);
@@ -2023,7 +2023,7 @@ impl Ext2 {
                 continue;
             }
             if !self.io.is_data_block(block) {
-                trace!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
+                klog!(0, "ext2: {} block {} points outside the filesystem", LEVEL_NAMES[top], block);
                 return false;
             }
 
@@ -2038,7 +2038,7 @@ impl Ext2 {
                 let index = (rel / below % ppb) as u32;
                 let next_block = self.ptr(level, index);
                 if next_block != 0 && !self.io.is_data_block(next_block) {
-                    trace!(0, "ext2: block {} in {} block {} points outside the filesystem", next_block,
+                    klog!(0, "ext2: block {} in {} block {} points outside the filesystem", next_block,
                         LEVEL_NAMES[level], block);
                     return false;
                 }
@@ -2087,7 +2087,7 @@ impl Ext2 {
     fn punch_inode(&mut self, ino: u32, inode: &mut Inode, from: u64, to: u64) -> Option<u64> {
         let mut batch: Vec<u32> = Vec::new();
         if batch.try_reserve_exact(FREE_BATCH).is_err() {
-            trace!(0, "ext2: no memory for the batch of blocks to free");
+            klog!(0, "ext2: no memory for the batch of blocks to free");
             return None;
         }
         let mut freed = 0;
@@ -2124,7 +2124,7 @@ impl Ext2 {
         let node = match self.tree.alloc(name, kind) {
             Some(node) => node,
             None => {
-                trace!(0, "ext2: no memory for a vnode");
+                klog!(0, "ext2: no memory for a vnode");
                 return None;
             }
         };
@@ -2193,13 +2193,13 @@ impl Ext2 {
         let inode = match self.read_inode(dir_ino) {
             Some(inode) => inode,
             None => {
-                trace!(0, "ext2: read of directory inode {} failed", dir_ino);
+                klog!(0, "ext2: read of directory inode {} failed", dir_ino);
                 return false;
             }
         };
 
         if inode.mode & MODE_TYPE_MASK != MODE_DIR {
-            trace!(0, "ext2: inode {} is not a directory", dir_ino);
+            klog!(0, "ext2: inode {} is not a directory", dir_ino);
             return false;
         }
 
@@ -2216,7 +2216,7 @@ impl Ext2 {
                 continue;
             }
             if !self.io.read_block(phys, self.data.as_mut_slice()) {
-                trace!(0, "ext2: read of block {} of inode {} failed", blk, dir_ino);
+                klog!(0, "ext2: read of block {} of inode {} failed", blk, dir_ino);
                 return false;
             }
 
@@ -2231,7 +2231,7 @@ impl Ext2 {
                     || rec_len > bs - pos
                     || rec_len % DIR_ENTRY_ALIGN != 0
                 {
-                    trace!(0, "ext2: bad directory entry at offset {} of inode {}",
+                    klog!(0, "ext2: bad directory entry at offset {} of inode {}",
                         blk as usize * bs + pos, dir_ino);
                     break;
                 }
@@ -2247,7 +2247,7 @@ impl Ext2 {
                             /* A truncated name would collide with other long
                              * names in a lookup; skip the entry instead of
                              * silently shortening it */
-                            trace!(0, "ext2: a name of {} bytes in inode {} is too long, skipped",
+                            klog!(0, "ext2: a name of {} bytes in inode {} is too long, skipped",
                                 name_len, dir_ino);
                             true
                         } else {
@@ -2286,7 +2286,7 @@ impl Ext2 {
                     is_file = mode == MODE_FILE;
                     size = size_of(&child);
                     if is_file && size > self.max_size() {
-                        trace!(0, "ext2: inode {} is {} bytes, past what a file can be here, skipped", ino,
+                        klog!(0, "ext2: inode {} is {} bytes, past what a file can be here, skipped", ino,
                             size);
                         is_file = false;
                     }
@@ -2305,7 +2305,7 @@ impl Ext2 {
             while let Some(at) = up {
                 let node = &self.tree[at];
                 if node.ino == ino as usize {
-                    trace!(0, "ext2: an entry of inode {} is an ancestor, skipped",
+                    klog!(0, "ext2: an entry of inode {} is an ancestor, skipped",
                         self.tree[dir].ino);
                     is_dir = false;
                     break;
@@ -2367,7 +2367,7 @@ impl Ext2 {
                     || rec_len % DIR_ENTRY_ALIGN != 0
                     || (at_ino != 0 && rec_len < DIR_ENTRY_HEADER + name_len)
                 {
-                    trace!(0, "ext2: bad directory entry at offset {} of inode {}",
+                    klog!(0, "ext2: bad directory entry at offset {} of inode {}",
                         blk as usize * bs + pos, dir_ino);
                     return false;
                 }
@@ -2394,7 +2394,7 @@ impl Ext2 {
         /* No room: a new block holding this one entry -- while the size
          * the directory is given, its low word alone, holds it */
         let Some(grown) = dir_inode.size.checked_add(bs as u32) else {
-            trace!(0, "ext2: directory {} is as big as one can be", dir_ino);
+            klog!(0, "ext2: directory {} is as big as one can be", dir_ino);
             return false;
         };
         let (phys, _) = match self.map_block(dir_inode, goal_group, dir_blocks, true) {
@@ -2449,7 +2449,7 @@ impl Ext2 {
                     || rec_len > bs - pos
                     || rec_len % DIR_ENTRY_ALIGN != 0
                 {
-                    trace!(0, "ext2: bad directory entry at offset {} of inode {}",
+                    klog!(0, "ext2: bad directory entry at offset {} of inode {}",
                         blk as usize * bs + pos, dir_ino);
                     return false;
                 }
@@ -2476,7 +2476,7 @@ impl Ext2 {
             }
         }
 
-        trace!(0, "ext2: an entry to remove is not in inode {}", dir_ino);
+        klog!(0, "ext2: an entry to remove is not in inode {}", dir_ino);
         false
     }
 
@@ -2498,7 +2498,7 @@ impl Ext2 {
 
         let b = self.data.as_slice();
         if de_name_len(b, dot_len) != 2 || &b[dot_len + DIR_ENTRY_HEADER..dot_len + 10] != b".." {
-            trace!(0, "ext2: the second entry of a directory is not ..");
+            klog!(0, "ext2: the second entry of a directory is not ..");
             return false;
         }
 
@@ -2548,7 +2548,7 @@ impl Ext2 {
         let ino = match self.file_ino(file) {
             Some(ino) => ino,
             None => {
-                trace!(0, "ext2: a read of something that is not a file");
+                klog!(0, "ext2: a read of something that is not a file");
                 return false;
             }
         };
@@ -2559,7 +2559,7 @@ impl Ext2 {
         let inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
-                trace!(0, "ext2: read of inode {} failed", ino);
+                klog!(0, "ext2: read of inode {} failed", ino);
                 return false;
             }
         };
@@ -2575,7 +2575,7 @@ impl Ext2 {
     pub fn map_blocks(&mut self, file: NodeId, first: u64, out: &mut [u64]) -> bool {
         let Some(ino) = self.file_ino(file) else { return false };
         let Some(inode) = self.read_inode(ino) else {
-            trace!(0, "ext2: read of inode {} failed", ino);
+            klog!(0, "ext2: read of inode {} failed", ino);
             return false;
         };
         /* A walk maps but never allocates, so the inode is not modified */
@@ -2588,7 +2588,7 @@ impl Ext2 {
             *slot = match self.map_block(&mut scratch, 0, logical, false) {
                 Some((block, _)) => u64::from(block) * sectors,
                 None => {
-                    trace!(0, "ext2: logical block {} is unmappable", logical);
+                    klog!(0, "ext2: logical block {} is unmappable", logical);
                     return false;
                 }
             };
@@ -2600,12 +2600,12 @@ impl Ext2 {
         let ino = match self.file_ino(file) {
             Some(ino) => ino,
             None => {
-                trace!(0, "ext2: a write to something that is not a file");
+                klog!(0, "ext2: a write to something that is not a file");
                 return false;
             }
         };
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return false;
         }
         if data.is_empty() {
@@ -2617,7 +2617,7 @@ impl Ext2 {
          * size, which it never got to move. */
         let end = offset as u64 + data.len() as u64;
         if end > self.max_size() {
-            trace!(0, "ext2: a write of {} bytes at {} is past what ext2 holds here",
+            klog!(0, "ext2: a write of {} bytes at {} is past what ext2 holds here",
                 data.len(), offset);
             return false;
         }
@@ -2625,13 +2625,13 @@ impl Ext2 {
         let mut inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
-                trace!(0, "ext2: read of inode {} failed", ino);
+                klog!(0, "ext2: read of inode {} failed", ino);
                 return false;
             }
         };
 
         if inode.mode & MODE_TYPE_MASK != MODE_FILE {
-            trace!(0, "ext2: inode {} is not a regular file", ino);
+            klog!(0, "ext2: inode {} is not a regular file", ino);
             return false;
         }
         if !self.allow_size(end) {
@@ -2662,7 +2662,7 @@ impl Ext2 {
             true
         };
         if !committed {
-            trace!(0, "ext2: commit of inode {} failed", ino);
+            klog!(0, "ext2: commit of inode {} failed", ino);
             return false;
         }
 
@@ -2677,7 +2677,7 @@ impl Ext2 {
             if !self.truncate_inode(ino, &mut inode, size_of(&before))
                 || !self.flush_bitmap() || !self.commit_meta()
             {
-                trace!(0, "ext2: the blocks a failed write took past the end of inode {} were not given back", ino);
+                klog!(0, "ext2: the blocks a failed write took past the end of inode {} were not given back", ino);
             }
         }
 
@@ -2717,25 +2717,25 @@ impl Ext2 {
         let ino = match self.file_ino(file) {
             Some(ino) => ino,
             None => {
-                trace!(0, "ext2: a truncate of something that is not a file");
+                klog!(0, "ext2: a truncate of something that is not a file");
                 return false;
             }
         };
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return false;
         }
 
         let mut inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
-                trace!(0, "ext2: read of inode {} failed", ino);
+                klog!(0, "ext2: read of inode {} failed", ino);
                 return false;
             }
         };
 
         if inode.mode & MODE_TYPE_MASK != MODE_FILE {
-            trace!(0, "ext2: inode {} is not a regular file", ino);
+            klog!(0, "ext2: inode {} is not a regular file", ino);
             return false;
         }
 
@@ -2743,7 +2743,7 @@ impl Ext2 {
          * changed */
         let size = size as u64;
         if size > self.max_size() {
-            trace!(0, "ext2: a size of {} is past what a file can be here", size);
+            klog!(0, "ext2: a size of {} is past what a file can be here", size);
             return false;
         }
         if !self.allow_size(size) {
@@ -2755,7 +2755,7 @@ impl Ext2 {
         if !self.io.flush() || !self.write_inode(ino, &inode) || !self.flush_bitmap()
             || !self.commit_meta()
         {
-            trace!(0, "ext2: commit of inode {} failed", ino);
+            klog!(0, "ext2: commit of inode {} failed", ino);
             return false;
         }
 
@@ -2769,22 +2769,22 @@ impl Ext2 {
     /// discards gives back (`image`). How many were given back, or None.
     pub fn punch(&mut self, file: NodeId, first: u64, count: u64) -> Option<u64> {
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext2: a punch of something that is not a file");
+            klog!(0, "ext2: a punch of something that is not a file");
             return None;
         };
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return None;
         }
         let mut inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
-                trace!(0, "ext2: read of inode {} failed", ino);
+                klog!(0, "ext2: read of inode {} failed", ino);
                 return None;
             }
         };
         if inode.mode & MODE_TYPE_MASK != MODE_FILE {
-            trace!(0, "ext2: inode {} is not a regular file", ino);
+            klog!(0, "ext2: inode {} is not a regular file", ino);
             return None;
         }
         let blocks = size_of(&inode).div_ceil(self.block_size() as u64);
@@ -2797,7 +2797,7 @@ impl Ext2 {
         let freed = self.punch_inode(ino, &mut inode, first, to);
 
         if !self.io.flush() || !self.write_inode(ino, &inode) || !self.flush_bitmap() || !self.commit_meta() {
-            trace!(0, "ext2: commit of inode {} failed", ino);
+            klog!(0, "ext2: commit of inode {} failed", ino);
             return None;
         }
         freed
@@ -2815,11 +2815,11 @@ impl Ext2 {
         }
         self.sb.feature_ro_compat |= RO_COMPAT_LARGE_FILE;
         if self.write_super(true) {
-            trace!(0, "ext2: a file of 2 GiB or more: large_file set");
+            klog!(0, "ext2: a file of 2 GiB or more: large_file set");
             return true;
         }
         self.sb.feature_ro_compat &= !RO_COMPAT_LARGE_FILE;
-        trace!(0, "ext2: the superblock with large_file set could not be written");
+        klog!(0, "ext2: the superblock with large_file set could not be written");
         false
     }
 
@@ -2835,20 +2835,20 @@ impl Ext2 {
         let dir_ino = match self.dir_ino(dir) {
             Some(dir_ino) => dir_ino,
             None => {
-                trace!(0, "ext2: something made somewhere that is not a directory");
+                klog!(0, "ext2: something made somewhere that is not a directory");
                 return None;
             }
         };
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return None;
         }
         if !self.usable_name(name) {
-            trace!(0, "ext2: a name of {} bytes cannot be made", name.len());
+            klog!(0, "ext2: a name of {} bytes cannot be made", name.len());
             return None;
         }
         if self.lookup(dir, name).is_some() {
-            trace!(0, "ext2: there is something by that name already");
+            klog!(0, "ext2: there is something by that name already");
             return None;
         }
         Some(dir_ino)
@@ -2867,13 +2867,13 @@ impl Ext2 {
          * bitmap has free, for the next create to take. */
         let inode = Ext2::new_inode(MODE_FILE_DEFAULT);
         if !self.flush_bitmap() || !self.write_inode(ino, &inode) || !self.commit_meta() {
-            trace!(0, "ext2: commit of inode {} failed", ino);
+            klog!(0, "ext2: commit of inode {} failed", ino);
             self.give_back(ino, None, false);
             return None;
         }
 
         if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_FILE) {
-            trace!(0, "ext2: the directory entry could not be added");
+            klog!(0, "ext2: the directory entry could not be added");
             self.give_back(ino, None, false);
             return None;
         }
@@ -2881,7 +2881,7 @@ impl Ext2 {
         if !self.flush_bitmap() || !self.io.flush()
             || !self.write_inode(dir_ino, &dir_inode) || !self.commit_meta()
         {
-            trace!(0, "ext2: commit of directory inode {} failed", dir_ino);
+            klog!(0, "ext2: commit of directory inode {} failed", dir_ino);
             return None;
         }
 
@@ -2898,7 +2898,7 @@ impl Ext2 {
         let mut dead: Inode = pod::zeroed();
         dead.delete_time = wall_clock_secs() as u32;
         if !self.write_inode(ino, &dead) {
-            trace!(0, "ext2: inode {} could not be undone, and stays taken", ino);
+            klog!(0, "ext2: inode {} could not be undone, and stays taken", ino);
             return;
         }
         if let Some(block) = block {
@@ -2951,13 +2951,13 @@ impl Ext2 {
             || !self.write_inode(ino, &inode)
             || !self.commit_meta()
         {
-            trace!(0, "ext2: commit of inode {} failed", ino);
+            klog!(0, "ext2: commit of inode {} failed", ino);
             self.give_back(ino, Some(block), true);
             return None;
         }
 
         if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_DIR) {
-            trace!(0, "ext2: the directory entry could not be added");
+            klog!(0, "ext2: the directory entry could not be added");
             self.give_back(ino, Some(block), true);
             return None;
         }
@@ -2967,7 +2967,7 @@ impl Ext2 {
         if !self.flush_bitmap() || !self.io.flush()
             || !self.write_inode(dir_ino, &dir_inode) || !self.commit_meta()
         {
-            trace!(0, "ext2: commit of directory inode {} failed", dir_ino);
+            klog!(0, "ext2: commit of directory inode {} failed", dir_ino);
             return None;
         }
 
@@ -2981,34 +2981,34 @@ impl Ext2 {
         let (ino, is_dir) = match self.tree.get(node) {
             Some(found) => (found.ino as u32, found.is_dir()),
             None => {
-                trace!(0, "ext2: a rename of nothing");
+                klog!(0, "ext2: a rename of nothing");
                 return false;
             }
         };
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return false;
         }
         let old_dir = match self.tree.parent(node) {
             Some(old_dir) => old_dir,
             None => {
-                trace!(0, "ext2: the root cannot be renamed");
+                klog!(0, "ext2: the root cannot be renamed");
                 return false;
             }
         };
         let new_dir_ino = match self.dir_ino(new_dir) {
             Some(new_dir_ino) => new_dir_ino,
             None => {
-                trace!(0, "ext2: the target of a rename is not a directory");
+                klog!(0, "ext2: the target of a rename is not a directory");
                 return false;
             }
         };
         if !self.usable_name(new_name) {
-            trace!(0, "ext2: a name of {} bytes cannot be made", new_name.len());
+            klog!(0, "ext2: a name of {} bytes cannot be made", new_name.len());
             return false;
         }
         if self.lookup(new_dir, new_name).is_some() {
-            trace!(0, "ext2: there is something by that name already");
+            klog!(0, "ext2: there is something by that name already");
             return false;
         }
 
@@ -3032,7 +3032,7 @@ impl Ext2 {
          * rather than under neither */
         let file_type = if is_dir { DIR_TYPE_DIR } else { DIR_TYPE_FILE };
         if !self.add_dir_entry(new_dir_ino, &mut new_dir_inode, ino, new_name, file_type) {
-            trace!(0, "ext2: the directory entry could not be added");
+            klog!(0, "ext2: the directory entry could not be added");
             return false;
         }
 
@@ -3185,15 +3185,15 @@ impl Ext2 {
 
     pub fn remove(&mut self, node: NodeId) -> bool {
         if self.tree.get(node).is_none() {
-            trace!(0, "ext2: a remove of nothing");
+            klog!(0, "ext2: a remove of nothing");
             return false;
         }
         if self.read_only {
-            trace!(0, "ext2: read-only");
+            klog!(0, "ext2: read-only");
             return false;
         }
         if self.tree.parent(node).is_none() {
-            trace!(0, "ext2: the root cannot be removed");
+            klog!(0, "ext2: the root cannot be removed");
             return false;
         }
 
@@ -3343,7 +3343,7 @@ fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     let fs = match Ext2::new(dev) {
         Some(fs) => fs,
         None => {
-            trace!(0, "ext2: no memory for the filesystem");
+            klog!(0, "ext2: no memory for the filesystem");
             return -1;
         }
     };

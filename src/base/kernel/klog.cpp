@@ -1,4 +1,4 @@
-#include "trace.h"
+#include "klog.h"
 #include "dmesg.h"
 #include "parameters.h"
 
@@ -13,37 +13,37 @@ void rust_disklog_log(const char* line);
 namespace kernel
 {
 
-Tracer::Tracer()
+Klog::Klog()
     : level_(0)
     , console_suppressed_(false)
 {
 }
 
-void Tracer::set_level(int level)
+void Klog::set_level(int level)
 {
     level_ = level;
 }
 
-int Tracer::get_level()
+int Klog::get_level()
 {
     return level_;
 }
 
-void Tracer::set_console_suppressed(bool suppressed)
+void Klog::set_console_suppressed(bool suppressed)
 {
     console_suppressed_ = suppressed;
 }
 
-bool Tracer::is_console_suppressed()
+bool Klog::is_console_suppressed()
 {
     return console_suppressed_;
 }
 
-Tracer::~Tracer()
+Klog::~Klog()
 {
 }
 
-void Tracer::output(const char *fmt, ...)
+void Klog::output(const char *fmt, ...)
 {
     char msg[256];
 
@@ -59,7 +59,7 @@ void Tracer::output(const char *fmt, ...)
        whatever was formatted before it is printed if there is any. */
     if (size < 0 && msg[0] == '\0')
         return;
-    /* Every line here ends with a newline (trace(), kernel_trace): one cut
+    /* Every line here ends with a newline (klog(), kernel_trace): one cut
        short ends its line still, rather than have the next run on after it
        -- as a disk image's release line once ran into the shell's prompt. */
     stdlib::end_cut_line(msg, sizeof(msg), size);

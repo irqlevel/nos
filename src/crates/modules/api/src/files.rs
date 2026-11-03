@@ -313,6 +313,6 @@ pub fn audit(dir: &Dir, line: &str) {
     let mut text = String::new();
     let _ = writeln!(text, "{} {}", kcore::time::wall_clock_secs(), line);
     if kcore::fs::append(&path, text.as_bytes()).is_err() {
-        kcore::trace!(0, "api: cannot append to {}", path);
+        kcore::klog!(0, "api: cannot append to {}", path);
     }
 }

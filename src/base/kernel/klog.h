@@ -46,14 +46,14 @@ const int MODULE_LL = 3;
 
 /* The highest level any call site above uses, and the bound the shell's
    loglevel command accepts. Raise it together with a noisier call site. */
-const int MAX_TRACE_LEVEL = 5;
+const int MAX_LOG_LEVEL = 5;
 
-class Tracer
+class Klog
 {
 public:
-    static Tracer& get_instance()
+    static Klog& get_instance()
     {
-        static Tracer instance;
+        static Klog instance;
 
         return instance;
     }
@@ -70,41 +70,41 @@ public:
     bool is_console_suppressed();
 
 private:
-    Tracer();
-    virtual ~Tracer();
-    Tracer(const Tracer& other) = delete;
-    Tracer(Tracer&& other) = delete;
-    Tracer& operator=(const Tracer& other) = delete;
-    Tracer& operator=(Tracer&& other) = delete;
+    Klog();
+    virtual ~Klog();
+    Klog(const Klog& other) = delete;
+    Klog(Klog&& other) = delete;
+    Klog& operator=(const Klog& other) = delete;
+    Klog& operator=(Klog&& other) = delete;
 
     /* Written from the shell on one CPU while every other CPU reads it in
-       trace(); a stale read costs at most one line. */
+       klog(); a stale read costs at most one line. */
     volatile int level_;
     bool console_suppressed_;
 };
 
 }
 
-#define trace(level, fmt, ...)                                      \
+#define klog(level, fmt, ...)                                      \
 do {                                                                \
-    auto& macro_tracer = kernel::Tracer::get_instance();             \
-    if (unlikely((level) <= macro_tracer.get_level()))               \
+    auto& macro_klog = kernel::Klog::get_instance();             \
+    if (unlikely((level) <= macro_klog.get_level()))               \
     {                                                               \
         auto macro_time = kernel::get_boot_time();                    \
-        macro_tracer.output("%lu:%lu.%06lu:%s(),%s,%lu: " fmt "\n",  \
+        macro_klog.output("%lu:%lu.%06lu:%s(),%s,%lu: " fmt "\n",  \
             (ulong)(level), macro_time.get_secs(), macro_time.get_usecs(), \
             __func__, stdlib::truncate_file_name(__FILE__),           \
             (ulong)__LINE__, ##__VA_ARGS__);                        \
     }                                                               \
 } while (false)
 
-#define trace_error(err, fmt, ...)                                   \
+#define klog_error(err, fmt, ...)                                   \
 do {                                                                \
-    auto& macro_tracer = kernel::Tracer::get_instance();             \
-    if (unlikely(0 <= macro_tracer.get_level()))                     \
+    auto& macro_klog = kernel::Klog::get_instance();             \
+    if (unlikely(0 <= macro_klog.get_level()))                     \
     {                                                               \
         auto macro_time = kernel::get_boot_time();                    \
-        macro_tracer.output("%lu:%lu.%06lu:%s(),%s,%lu: Error %lu at %s(),%s,%lu: " fmt "\n", \
+        macro_klog.output("%lu:%lu.%06lu:%s(),%s,%lu: Error %lu at %s(),%s,%lu: " fmt "\n", \
             0UL, macro_time.get_secs(), macro_time.get_usecs(),       \
             __func__, stdlib::truncate_file_name(__FILE__),           \
             (ulong)__LINE__, (ulong)err.get_code(), err.get_func(), stdlib::truncate_file_name(err.get_file()),  \

@@ -219,7 +219,7 @@ able to say why.
 | Module | What is in it |
 |---|---|
 | `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
-| `trace` | `trace!(level, "fmt {}", arg)`; level 0 is always visible |
+| `klog` | `klog!(level, "fmt {}", arg)` -- a line of the kernel log; level 0 is always visible |
 | `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()`, `cycle_counter()` |
 | `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/crates/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |

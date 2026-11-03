@@ -69,7 +69,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::nic::Nic;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
-use kcore::trace;
+use kcore::klog;
 
 use crate::abi;
 use crate::wire::{self, eth, ip, tcp as seg, Mac, ETH_HDR_LEN, ETH_TYPE_IP,
@@ -863,13 +863,13 @@ impl Tcp {
         match kcore::timer::Timer::start_for(period, self, Tcp::on_tick) {
             Some(timer) => timer.leak(),
             None => {
-                trace!(0, "tcp: the retransmit timer could not be started");
+                klog!(0, "tcp: the retransmit timer could not be started");
                 return false;
             }
         }
 
         self.initialized.store(true, Ordering::Release);
-        trace!(0, "tcp: initialized, up to {} connections", MAX_CONNECTIONS);
+        klog!(0, "tcp: initialized, up to {} connections", MAX_CONNECTIONS);
         true
     }
 
@@ -1708,15 +1708,15 @@ impl Tcp {
     {
         let (recv_size, rcv_wscale, snd_wscale) = receive;
         match event {
-            Event::Rst => trace!(0, "tcp: reset received, {} -> {}",
+            Event::Rst => klog!(0, "tcp: reset received, {} -> {}",
                 local_port, remote_port),
             /* Whether the window is scaled is what says how fast it can go */
-            Event::Connected if rcv_wscale != 0 => trace!(0,
+            Event::Connected if rcv_wscale != 0 => klog!(0,
                 "tcp: connected {} -> {}, mss {}, receive {} KiB, window scale {}/{}",
                 local_port, remote_port, peer_mss, recv_size / 1024, rcv_wscale, snd_wscale),
-            Event::Connected => trace!(0, "tcp: connected {} -> {}, mss {}, receive {} KiB",
+            Event::Connected => klog!(0, "tcp: connected {} -> {}, mss {}, receive {} KiB",
                 local_port, remote_port, peer_mss, recv_size / 1024),
-            Event::Accepted => trace!(0, "tcp: accepted {} <- {}",
+            Event::Accepted => klog!(0, "tcp: accepted {} <- {}",
                 local_port, remote_port),
             Event::None => {}
         }
@@ -1959,7 +1959,7 @@ impl Tcp {
         conn.data_ready.store(true, Ordering::Release);
         drop(inner);
 
-        trace!(0, "tcp: icmp unreachable, {} -> {} aborted", local_port, remote_port);
+        klog!(0, "tcp: icmp unreachable, {} -> {} aborted", local_port, remote_port);
     }
 }
 
@@ -1993,7 +1993,7 @@ impl Tcp {
         let peer_mac = match arp.resolve(nic, nic.route_ip(dst_ip)) {
             Some(mac) => mac,
             None => {
-                trace!(0, "tcp: nothing answered for the address to connect to");
+                klog!(0, "tcp: nothing answered for the address to connect to");
                 return None;
             }
         };
@@ -2004,7 +2004,7 @@ impl Tcp {
             let port = pool.alloc_ephemeral_port();
             if port == 0 {
                 drop(pool);
-                trace!(0, "tcp: no ephemeral port is free");
+                klog!(0, "tcp: no ephemeral port is free");
                 return None;
             }
             port
@@ -2013,7 +2013,7 @@ impl Tcp {
              * other's segments. */
             if pool.lookup(nic.ip(), src_port, dst_ip, dst_port, nic).is_some() {
                 drop(pool);
-                trace!(0, "tcp: port {} is already connected to that address", src_port);
+                klog!(0, "tcp: port {} is already connected to that address", src_port);
                 return None;
             }
             src_port
@@ -2028,7 +2028,7 @@ impl Tcp {
             Some(index) => index,
             None => {
                 drop(pool);
-                trace!(0, "tcp: no free connection");
+                klog!(0, "tcp: no free connection");
                 return None;
             }
         };
@@ -2088,7 +2088,7 @@ impl Tcp {
             poll.sleep();
         }
 
-        trace!(0, "tcp: nothing answered {} -> {}", src_port, dst_port);
+        klog!(0, "tcp: nothing answered {} -> {}", src_port, dst_port);
         self.close(conn);
         None
     }
@@ -2116,7 +2116,7 @@ impl Tcp {
         /* A second listener on the same port would never be given anything */
         if pool.slots.iter().any(|slot| slot.used && slot.listening && slot.local_port == port) {
             drop(pool);
-            trace!(0, "tcp: port {} is listened on already", port);
+            klog!(0, "tcp: port {} is listened on already", port);
             return None;
         }
 
@@ -2471,7 +2471,7 @@ impl Tcp {
         }
 
         if count != 0 {
-            trace!(0, "tcp: listener on port {} closed, {} connections it never accepted were reset",
+            klog!(0, "tcp: listener on port {} closed, {} connections it never accepted were reset",
                 port, count);
         }
     }
@@ -2647,7 +2647,7 @@ impl Tcp {
                          * synchronous output. */
                         drop(inner);
 
-                        trace!(0, "tcp: {} -> {} in {} aborted after {} retransmits",
+                        klog!(0, "tcp: {} -> {} in {} aborted after {} retransmits",
                             local, remote, state.name(), count);
                         continue;
                     }

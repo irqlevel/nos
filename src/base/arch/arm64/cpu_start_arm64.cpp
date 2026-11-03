@@ -4,7 +4,7 @@
 #include <kernel/panic.h>
 #include <kernel/stack_probe.h>
 #include <kernel/parameters.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/time.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
@@ -118,7 +118,7 @@ bool CpuTable::start_all()
 
     ulong entry_phys = (ulong)&secondary_entry[0] - mm::MemoryMap::KERNEL_SPACE_BASE;
 
-    trace(0, "Starting cpus, entry 0x%lX", entry_phys);
+    klog(0, "Starting cpus, entry 0x%lX", entry_phys);
 
     /* The boot stack runs down into this guard, and past it into the
        identity tables every AP walks as it turns its MMU on (boot.S). A
@@ -162,7 +162,7 @@ bool CpuTable::start_all()
 
         if (max_cpus != 0 && running >= max_cpus)
         {
-            trace(0, "Cpu %lu left parked, maxcpus is %lu", index, max_cpus);
+            klog(0, "Cpu %lu left parked, maxcpus is %lu", index, max_cpus);
             continue;
         }
 
@@ -170,7 +170,7 @@ bool CpuTable::start_all()
             entry_phys, index);
         if (err != 0)
         {
-            trace(0, "Cpu %lu CPU_ON failed %ld", index, err);
+            klog(0, "Cpu %lu CPU_ON failed %ld", index, err);
             return false;
         }
 
@@ -214,13 +214,13 @@ bool CpuTable::start_all()
 
         if (!(get_cpu(index).get_state() & Cpu::STATE_RUNNING))
         {
-            trace(0, "Cpu %lu still not running after %lu ms",
+            klog(0, "Cpu %lu still not running after %lu ms",
                 index, ap_timeout_ms);
             return false;
         }
     }
 
-    trace(0, "Cpus started, %lu running", running);
+    klog(0, "Cpus started, %lu running", running);
 
     return true;
 }

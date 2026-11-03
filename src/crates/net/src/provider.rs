@@ -9,7 +9,7 @@ use crate::device::DEVICES;
 use crate::frame::POOL;
 use crate::tcp::{self, TCP};
 use crate::wire::{Ipv4 as Ip, Mac, MacHex};
-use kcore::trace;
+use kcore::klog;
 use mgmt::{Call, Kind, Method, Params, Provider, Status, Writer};
 
 struct Net;
@@ -32,7 +32,7 @@ const ARP_ENTRIES: usize = 32;
 pub fn init() {
     match mgmt::register("net", &METHODS, DESCRIPTOR, &NET) {
         Ok(registration) => core::mem::forget(registration),
-        Err(status) => trace!(0, "net: cannot register the provider: {}", status.name()),
+        Err(status) => klog!(0, "net: cannot register the provider: {}", status.name()),
     }
 }
 

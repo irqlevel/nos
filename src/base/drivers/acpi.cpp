@@ -1,6 +1,6 @@
 #include "acpi.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
@@ -55,7 +55,7 @@ bool Acpi::parse_rsdp(RSDPDescriptor20 *rsdp, ulong& root_phys_addr, bool& is_xs
 {
     if (compute_sum(rsdp, sizeof(rsdp->first_part)) != 0)
     {
-        trace(0, "Rsdp 0x%p checksum failed (sum 0x%lX)",
+        klog(0, "Rsdp 0x%p checksum failed (sum 0x%lX)",
             rsdp, (ulong)compute_sum(rsdp, sizeof(rsdp->first_part)));
         return false;
     }
@@ -64,7 +64,7 @@ bool Acpi::parse_rsdp(RSDPDescriptor20 *rsdp, ulong& root_phys_addr, bool& is_xs
     if (rsdp->first_part.revision >= 2 &&
         compute_sum(rsdp, sizeof(*rsdp)) != 0)
     {
-        trace(0, "Rsdp 0x%p extended checksum failed (sum 0x%lX)",
+        klog(0, "Rsdp 0x%p extended checksum failed (sum 0x%lX)",
             rsdp, (ulong)compute_sum(rsdp, sizeof(*rsdp)));
         return false;
     }
@@ -89,7 +89,7 @@ bool Acpi::parse_rsdp(RSDPDescriptor20 *rsdp, ulong& root_phys_addr, bool& is_xs
         is_xsdt = false;
     }
 
-    trace(0, "Rsdp 0x%p revision %lu oem_id_ %s %s 0x%lX",
+    klog(0, "Rsdp 0x%p revision %lu oem_id_ %s %s 0x%lX",
         rsdp, (ulong)rsdp->first_part.revision, oem_id_,
         is_xsdt ? "Xsdt" : "Rsdt", root_phys_addr);
 
@@ -110,7 +110,7 @@ bool Acpi::scan_rsdp_range(ulong phy_start, ulong phy_end, ulong& root_phys_addr
         ulong page_va = pt.tmp_map_page(curr);
         if (!page_va)
         {
-            trace(0, "Can't map 0x%lX", curr);
+            klog(0, "Can't map 0x%lX", curr);
             return false;
         }
 
@@ -123,7 +123,7 @@ bool Acpi::scan_rsdp_range(ulong phy_start, ulong phy_end, ulong& root_phys_addr
             RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(va);
             if (rsdp->first_part.signature == RSDP_SIGNATURE)
             {
-                trace(0, "Checking rsdp va 0x%p pha 0x%lX", rsdp, curr + (va - page_va));
+                klog(0, "Checking rsdp va 0x%p pha 0x%lX", rsdp, curr + (va - page_va));
                 /* parse_rsdp reads the full 36-byte RSDPDescriptor20 when
                    Revision >= 2; the loop bound only guarantees the 20-byte
                    first_part, so skip a 2.0 RSDP whose extended fields would
@@ -161,12 +161,12 @@ bool Acpi::find_root_table(ulong& root_phys_addr, bool& is_xsdt)
         if (copy.first_part.signature == RSDP_SIGNATURE &&
             parse_rsdp(&copy, root_phys_addr, is_xsdt))
         {
-            trace(0, "Rsdp from multiboot tag, %s 0x%lX",
+            klog(0, "Rsdp from multiboot tag, %s 0x%lX",
                 is_xsdt ? "Xsdt" : "Rsdt", root_phys_addr);
             return true;
         }
 
-        trace(0, "Multiboot rsdp tag invalid");
+        klog(0, "Multiboot rsdp tag invalid");
     }
 
     auto& pt = kernel::mm::PageTable::get_instance();
@@ -189,7 +189,7 @@ bool Acpi::find_root_table(ulong& root_phys_addr, bool& is_xsdt)
     if (scan_rsdp_range(0xE0000, 0x100000, root_phys_addr, is_xsdt))
         return true;
 
-    trace(0, "Rsdp not found");
+    klog(0, "Rsdp not found");
     return false;
 }
 
@@ -199,7 +199,7 @@ stdlib::Error Acpi::parse_root_table(ACPISDTHeader* root)
 
     if (stdlib::strn_cmp(root->signature, signature, sizeof(root->signature)) != 0)
     {
-        trace(ACPI_LL, "%s 0x%p invalid signature", signature, root);
+        klog(ACPI_LL, "%s 0x%p invalid signature", signature, root);
         return make_error(stdlib::Error::NOT_FOUND);
     }
 
@@ -207,7 +207,7 @@ stdlib::Error Acpi::parse_root_table(ACPISDTHeader* root)
     {
         if (compute_sum(root, root_length_) != 0)
         {
-            trace(ACPI_LL, "%s 0x%p checksum failed 0x%lX vs 0x%lX", signature,
+            klog(ACPI_LL, "%s 0x%p checksum failed 0x%lX vs 0x%lX", signature,
                 root, (ulong)compute_sum(root, root_length_), (ulong)root->checksum);
              return make_error(stdlib::Error::NOT_FOUND);
         }
@@ -269,14 +269,14 @@ Acpi::ACPISDTHeader* Acpi::map_header(ulong phys)
 {
     if (phys > mm::MemoryMap::MAX_PHYS_ADDR - sizeof(ACPISDTHeader))
     {
-        trace(0, "Acpi: table at 0x%lX, past the physical address space", phys);
+        klog(0, "Acpi: table at 0x%lX, past the physical address space", phys);
         return nullptr;
     }
 
     auto* header = reinterpret_cast<ACPISDTHeader*>(
         mm::PageTable::get_instance().tmp_map_range(phys, sizeof(ACPISDTHeader)));
     if (header == nullptr)
-        trace(0, "Acpi: can't map table at 0x%lX", phys);
+        klog(0, "Acpi: can't map table at 0x%lX", phys);
     return header;
 }
 
@@ -290,7 +290,7 @@ Acpi::ACPISDTHeader* Acpi::map_whole(ACPISDTHeader* header, ulong phys, u32& len
     if (length < sizeof(ACPISDTHeader) || length > MAX_TABLE_LENGTH ||
         length > mm::MemoryMap::MAX_PHYS_ADDR - phys)
     {
-        trace(0, "Acpi: %s at 0x%lX length %lu, not a table to map", signature, phys, (ulong)length);
+        klog(0, "Acpi: %s at 0x%lX length %lu, not a table to map", signature, phys, (ulong)length);
         unmap_table_range(header, sizeof(ACPISDTHeader));
         return nullptr;
     }
@@ -300,7 +300,7 @@ Acpi::ACPISDTHeader* Acpi::map_whole(ACPISDTHeader* header, ulong phys, u32& len
     unmap_table_range(header, sizeof(ACPISDTHeader));
     auto* table = reinterpret_cast<ACPISDTHeader*>(mm::PageTable::get_instance().tmp_map_range(phys, length));
     if (table == nullptr)
-        trace(0, "Acpi: can't map %s at 0x%lX length %lu", signature, phys, (ulong)length);
+        klog(0, "Acpi: can't map %s at 0x%lX length %lu", signature, phys, (ulong)length);
     return table;
 }
 
@@ -347,7 +347,7 @@ stdlib::Error Acpi::parse_table_pointers()
 
     const size_t entry_size = root_is_xsdt_ ? sizeof(u64) : sizeof(u32);
     size_t table_count = (root_length_ - OFFSET_OF(ACPISDTHeader, entry)) / entry_size;
-    trace(0, "Acpi: %s, %lu tables", root_is_xsdt_ ? "Xsdt" : "Rsdt", table_count);
+    klog(0, "Acpi: %s, %lu tables", root_is_xsdt_ ? "Xsdt" : "Rsdt", table_count);
 
     for (size_t i = 0; i < table_count; i++)
     {
@@ -367,7 +367,7 @@ stdlib::Error Acpi::parse_table_pointers()
         long wanted = wanted_index(table_signature);
         if (wanted < 0 || table_[wanted] != nullptr)
         {
-            trace(ACPI_LL, "Acpi: table %lu %s len %lu not kept", (ulong)i, table_signature,
+            klog(ACPI_LL, "Acpi: table %lu %s len %lu not kept", (ulong)i, table_signature,
                 (ulong)header->length);
             unmap_table_range(header, sizeof(ACPISDTHeader));
             continue;
@@ -378,7 +378,7 @@ stdlib::Error Acpi::parse_table_pointers()
         if (table == nullptr)
             continue;
 
-        trace(ACPI_LL, "Acpi: table 0x%p %s len %lu", table, table_signature, (ulong)table_length);
+        klog(ACPI_LL, "Acpi: table 0x%p %s len %lu", table, table_signature, (ulong)table_length);
 
         table_[wanted] = table;
         table_length_[wanted] = table_length;
@@ -401,22 +401,22 @@ stdlib::Error Acpi::parse_madt()
         return make_error(stdlib::Error::NOT_FOUND);
     }
 
-    trace(ACPI_LL, "Acpi: MADT 0x%p", sdt_header);
+    klog(ACPI_LL, "Acpi: MADT 0x%p", sdt_header);
 
     if (length < sizeof(ACPISDTHeader) + sizeof(MadtHeader))
     {
-        trace(0, "Acpi: MADT too short: %lu", (ulong)length);
+        klog(0, "Acpi: MADT too short: %lu", (ulong)length);
         return make_error(stdlib::Error::INVALID_VALUE);
     }
 
     MadtHeader* header = reinterpret_cast<MadtHeader*>(sdt_header + 1);
-    trace(ACPI_LL, "Acpi: MADT LIntCtrl 0x%lX flags 0x%lX",
+    klog(ACPI_LL, "Acpi: MADT LIntCtrl 0x%lX flags 0x%lX",
         (ulong)header->local_int_ctrl_address, (ulong)header->flags);
 
     const ulong lapic_phys = header->local_int_ctrl_address;
     if (!registers_in_page(lapic_phys, LAPIC_REGISTER_BYTES))
     {
-        trace(0, "Acpi: MADT local APIC at 0x%lX, not a page", lapic_phys);
+        klog(0, "Acpi: MADT local APIC at 0x%lX, not a page", lapic_phys);
         return make_error(stdlib::Error::INVALID_VALUE);
     }
 
@@ -435,7 +435,7 @@ stdlib::Error Acpi::parse_madt()
     while (stdlib::mem_add(entry, sizeof(MadtEntry)) <= madt_end &&
            stdlib::mem_add(entry, entry->length) <= madt_end)
     {
-        trace(ACPI_LL, "Acpi: MADT entry 0x%p type %lu len %lu",
+        klog(ACPI_LL, "Acpi: MADT entry 0x%p type %lu len %lu",
             entry, (ulong)entry->type, (ulong)entry->length);
 
         if (entry->length == 0)
@@ -451,14 +451,14 @@ stdlib::Error Acpi::parse_madt()
                 return make_error(stdlib::Error::INVALID_VALUE);
             MadtLapicEntry* lapic_entry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
 
-            trace(ACPI_LL, "Acpi: MADT lapic procId %lu apic_id %lu flags 0x%lX",
+            klog(ACPI_LL, "Acpi: MADT lapic procId %lu apic_id %lu flags 0x%lX",
                 (ulong)lapic_entry->acpi_process_id, (ulong)lapic_entry->apic_id, (ulong)lapic_entry->flags);
 
             if (lapic_entry->flags & 0x1)
             {
                 if (!CpuTable::get_instance().insert_cpu(lapic_entry->apic_id))
                 {
-                    trace(ACPI_LL, "Acpi: MADT lapic apic_id %lu ignored (max %lu)",
+                    klog(ACPI_LL, "Acpi: MADT lapic apic_id %lu ignored (max %lu)",
                         (ulong)lapic_entry->apic_id, (ulong)MAX_CPUS);
                 }
             }
@@ -470,7 +470,7 @@ stdlib::Error Acpi::parse_madt()
                 return make_error(stdlib::Error::INVALID_VALUE);
             MadtIoApicEntry* io_apic_entry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
 
-            trace(ACPI_LL, "Acpi: MADT ioApicId %lu addr 0x%lX gsi 0x%lX",
+            klog(ACPI_LL, "Acpi: MADT ioApicId %lu addr 0x%lX gsi 0x%lX",
                 (ulong)io_apic_entry->io_apic_id, (ulong)io_apic_entry->io_apic_address,
                 (ulong)io_apic_entry->global_system_interrupt_base);
 
@@ -483,7 +483,7 @@ stdlib::Error Acpi::parse_madt()
             const ulong io_apic_phys = io_apic_entry->io_apic_address;
             if (!registers_in_page(io_apic_phys, IO_APIC_REGISTER_BYTES))
             {
-                trace(0, "Acpi: MADT IO-APIC at 0x%lX, its registers across a page, ignored", io_apic_phys);
+                klog(0, "Acpi: MADT IO-APIC at 0x%lX, its registers across a page, ignored", io_apic_phys);
                 break;
             }
             if (io_apic_address_ != nullptr && (io_apic_gsi_base_ == 0 || base != 0))
@@ -507,7 +507,7 @@ stdlib::Error Acpi::parse_madt()
                 return make_error(stdlib::Error::INVALID_VALUE);
             MadtIntSrcOverrideEntry* iso_entry = reinterpret_cast<MadtIntSrcOverrideEntry*>(entry + 1);
 
-            trace(ACPI_LL, "Acpi: MADT bus 0x%lX irq 0x%lX gsi 0x%lX flags 0x%lX",
+            klog(ACPI_LL, "Acpi: MADT bus 0x%lX irq 0x%lX gsi 0x%lX flags 0x%lX",
                 (ulong)iso_entry->bus_source, (ulong)iso_entry->irq_source, (ulong)iso_entry->global_system_interrupt,
                 (ulong)iso_entry->flags);
 
@@ -525,7 +525,7 @@ stdlib::Error Acpi::parse_madt()
        boot would fault in its driver at address 0 */
     if (io_apic_address_ == nullptr)
     {
-        trace(0, "Acpi: MADT names no IO-APIC");
+        klog(0, "Acpi: MADT names no IO-APIC");
         return make_error(stdlib::Error::NOT_FOUND);
     }
 
@@ -538,7 +538,7 @@ void Acpi::parse_fadt()
     ACPISDTHeader* sdt_header = lookup_table("FACP", length);
     if (sdt_header == nullptr)
     {
-        trace(ACPI_LL, "Acpi: no FADT table");
+        klog(ACPI_LL, "Acpi: no FADT table");
         return;
     }
 
@@ -550,14 +550,14 @@ void Acpi::parse_fadt()
     if (body_len >= PM1A_CNT_BLK_END)
     {
         pm1a_cnt_port_ = fadt->pm1a_cnt_blk;
-        trace(ACPI_LL, "Acpi: FADT PM1a_CNT port 0x%lX", pm1a_cnt_port_);
+        klog(ACPI_LL, "Acpi: FADT PM1a_CNT port 0x%lX", pm1a_cnt_port_);
     }
 
     /* Flags + reset_reg + reset_value require at least 93 bytes of body (ACPI 2.0+) */
     static const ulong RESET_VALUE_END = OFFSET_OF(FadtFields, reset_value) + sizeof(fadt->reset_value);
     if (body_len >= RESET_VALUE_END)
     {
-        trace(ACPI_LL, "Acpi: FADT flags 0x%lX", (ulong)fadt->flags);
+        klog(ACPI_LL, "Acpi: FADT flags 0x%lX", (ulong)fadt->flags);
 
         /* RESET_REG_SUP is bit 10 of Flags */
         static const u32 RESET_REG_SUP = (1u << 10);
@@ -566,7 +566,7 @@ void Acpi::parse_fadt()
             reset_reg_valid_ = true;
             reset_reg_port_ = (ulong)fadt->reset_reg.address;
             reset_val_ = fadt->reset_value;
-            trace(ACPI_LL, "Acpi: FADT RESET_REG port 0x%lX value 0x%lX",
+            klog(ACPI_LL, "Acpi: FADT RESET_REG port 0x%lX value 0x%lX",
                 reset_reg_port_, (ulong)reset_val_);
         }
     }
@@ -577,7 +577,7 @@ void Acpi::parse_fadt()
     if (body_len >= CENTURY_END)
     {
         century_register_ = fadt->century;
-        trace(ACPI_LL, "Acpi: FADT century register 0x%lX", (ulong)century_register_);
+        klog(ACPI_LL, "Acpi: FADT century register 0x%lX", (ulong)century_register_);
     }
 }
 
@@ -592,13 +592,13 @@ void Acpi::parse_hpet()
     ACPISDTHeader* sdt_header = lookup_table("HPET", length);
     if (sdt_header == nullptr)
     {
-        trace(ACPI_LL, "Acpi: no HPET table");
+        klog(ACPI_LL, "Acpi: no HPET table");
         return;
     }
 
     if (length < sizeof(ACPISDTHeader) + sizeof(HpetTableBody))
     {
-        trace(0, "Acpi: HPET table too short: %lu", (ulong)length);
+        klog(0, "Acpi: HPET table too short: %lu", (ulong)length);
         return;
     }
 
@@ -607,14 +607,14 @@ void Acpi::parse_hpet()
     /* base_address must be system memory (address_space_id == 0) */
     if (hpet->base_address.address_space_id != 0)
     {
-        trace(0, "Acpi: HPET base not in system memory (id %lu)", (ulong)hpet->base_address.address_space_id);
+        klog(0, "Acpi: HPET base not in system memory (id %lu)", (ulong)hpet->base_address.address_space_id);
         return;
     }
 
     hpet_base_phys_ = (ulong)hpet->base_address.address;
     hpet_min_tick_  = hpet->minimum_clock_tick;
 
-    trace(ACPI_LL, "Acpi: HPET base 0x%lX minTick %lu blockId 0x%lX",
+    klog(ACPI_LL, "Acpi: HPET base 0x%lX minTick %lu blockId 0x%lX",
         hpet_base_phys_, (ulong)hpet_min_tick_, (ulong)hpet->event_timer_block_id);
 }
 
@@ -633,13 +633,13 @@ void Acpi::parse_wdat()
     ACPISDTHeader* sdt_header = lookup_table("WDAT", length);
     if (sdt_header == nullptr)
     {
-        trace(ACPI_LL, "Acpi: no WDAT table");
+        klog(ACPI_LL, "Acpi: no WDAT table");
         return;
     }
 
     if (length < sizeof(ACPISDTHeader) + sizeof(WdatTableBody))
     {
-        trace(0, "Acpi: WDAT table too short: %lu", (ulong)length);
+        klog(0, "Acpi: WDAT table too short: %lu", (ulong)length);
         return;
     }
 
@@ -651,7 +651,7 @@ void Acpi::parse_wdat()
     size_t entries = wdat->entries;
     if (entries > max_entries)
     {
-        trace(0, "Acpi: WDAT claims %lu entries, table holds %lu",
+        klog(0, "Acpi: WDAT claims %lu entries, table holds %lu",
             (ulong)entries, (ulong)max_entries);
         entries = max_entries;
     }
@@ -662,14 +662,14 @@ void Acpi::parse_wdat()
         if (entry[i].register_region.address_space_id == GAS_SPACE_SYSTEM_IO &&
             entry[i].register_region.address == RTC_PORT_BASE)
         {
-            trace(0, "Acpi: WDAT drives the RTC, ignoring it");
+            klog(0, "Acpi: WDAT drives the RTC, ignoring it");
             return;
         }
     }
 
     firmware_watchdog_ = true;
 
-    trace(0, "Acpi: WDAT present (%lu entries, period %lu ms), firmware owns the watchdog",
+    klog(0, "Acpi: WDAT present (%lu entries, period %lu ms), firmware owns the watchdog",
         (ulong)entries, (ulong)wdat->timer_period);
 }
 
@@ -762,14 +762,14 @@ void Acpi::register_irq_to_gsi(u8 irq, u32 gsi, u16 flags)
     {
         if (irq_to_gsi_[i].irq == irq)
         {
-            trace(0, "Acpi: second override of irq %lu (to gsi %lu) ignored", (ulong)irq, (ulong)gsi);
+            klog(0, "Acpi: second override of irq %lu (to gsi %lu) ignored", (ulong)irq, (ulong)gsi);
             return;
         }
     }
 
     if (gsi > MAX_GSI || irq_to_gsi_size_ >= stdlib::array_size(irq_to_gsi_))
     {
-        trace(0, "Acpi: override of irq %lu to gsi %lu ignored: %s", (ulong)irq, (ulong)gsi,
+        klog(0, "Acpi: override of irq %lu to gsi %lu ignored: %s", (ulong)irq, (ulong)gsi,
             (gsi > MAX_GSI) ? "past the GSIs taken" : "no room");
         return;
     }

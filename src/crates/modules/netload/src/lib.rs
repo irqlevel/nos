@@ -60,7 +60,7 @@ use kcore::percpu::{ConstInit, LocalCounter, PerCpu};
 use kcore::sync::{PreemptSpinLock, TryLock};
 use kcore::task::TaskHandle;
 use kcore::time::{boot_time_ns, Duration};
-use kcore::trace;
+use kcore::klog;
 
 use netwire::{eth, ip, udp, Ipv4, Mac, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN, IP_PROTO_UDP,
               UDP_HDR_LEN};
@@ -375,7 +375,7 @@ impl Target {
              * stop with it, the kernel itself is wedged. Nothing else here
              * can tell those apart. */
             let path = kcore::net::rx_stats();
-            trace!(0, "netload: rx {} (+{}), tx {}, failed {}, pool misses {}, in flight {}, rx polls {}, poll work {}, stalls {}",
+            klog!(0, "netload: rx {} (+{}), tx {}, failed {}, pool misses {}, in flight {}, rx polls {}, poll work {}, stalls {}",
                 now.rx_packets, self.rates.rx_pps.load(Ordering::Relaxed), now.tx_packets,
                 now.tx_failed, path.pool_misses, path.pool_in_flight, path.rx_polls,
                 path.rx_poll_work, path.rx_stalls);
@@ -422,7 +422,7 @@ impl Drop for TargetRun {
             drop(sampler);
         }
         if was_up {
-            trace!(0, "netload: stopped on port {}", self.target.port);
+            klog!(0, "netload: stopped on port {}", self.target.port);
         }
     }
 }
@@ -621,7 +621,7 @@ impl Source {
              * under. */
             if !self.is_done() || now.tx_packets != last.tx_packets {
                 let path = kcore::net::rx_stats();
-                trace!(0, "netload: sent {} (+{}), failed {}, echoes {}, pool misses {}, in flight {}",
+                klog!(0, "netload: sent {} (+{}), failed {}, echoes {}, pool misses {}, in flight {}",
                     now.tx_packets, self.rates.tx_pps.load(Ordering::Relaxed), now.tx_failed,
                     now.rx_packets, path.pool_misses, path.pool_in_flight);
             }
@@ -678,7 +678,7 @@ impl Drop for SourceRun {
             drop(sampler);
         }
         if self.announced {
-            trace!(0, "netload: source to {}:{} stopped", Ipv4(self.source.plan.ip),
+            klog!(0, "netload: source to {}:{} stopped", Ipv4(self.source.plan.ip),
                 self.source.plan.port);
         }
     }
@@ -788,7 +788,7 @@ fn build_target(port: u16, echo: bool) -> Result<TargetRun, &'static str> {
     match nic.listen(port, target.clone()) {
         Ok(listener) => run.listener = Some(listener),
         Err(err) => {
-            trace!(0, "netload: port {} could not be listened on ({:?})", port, err);
+            klog!(0, "netload: port {} could not be listened on ({:?})", port, err);
             return Err(match err {
                 kcore::net::ListenError::PortTaken => "the port is taken",
                 kcore::net::ListenError::TableFull => "no listener slot left on the device",
@@ -802,7 +802,7 @@ fn build_target(port: u16, echo: bool) -> Result<TargetRun, &'static str> {
     );
 
     target.running.store(true, Ordering::Release);
-    trace!(0, "netload: started on port {}, {}", port, if echo { "echo" } else { "sink" });
+    klog!(0, "netload: started on port {}, {}", port, if echo { "echo" } else { "sink" });
     Ok(run)
 }
 
@@ -881,7 +881,7 @@ fn build_source(plan: SendPlan) -> Result<SourceRun, &'static str> {
     }
 
     run.announced = true;
-    trace!(0, "netload: sending to {}:{} from port {}, {} byte datagrams, {} task(s)",
+    klog!(0, "netload: sending to {}:{} from port {}, {} byte datagrams, {} task(s)",
         Ipv4(plan.ip), plan.port, plan.source_port, plan.size, plan.tasks);
     Ok(run)
 }

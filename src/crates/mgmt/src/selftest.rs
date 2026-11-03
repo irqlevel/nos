@@ -6,7 +6,7 @@
 
 use crate::{call, job_info, job_notes, job_result, job_start, register, Call, JobState, Kind, Method, Provider, Status};
 use alloc::vec::Vec;
-use kcore::trace;
+use kcore::klog;
 
 struct Test;
 
@@ -153,5 +153,5 @@ pub fn selftest() {
     let again = register("selftest", &METHODS, DESCRIPTOR, &TEST);
     check(again.is_ok(), "the name free again");
     drop(again);
-    trace!(0, "mgmt: selftest passed");
+    klog!(0, "mgmt: selftest passed");
 }

@@ -107,7 +107,7 @@ static void terminate_on_error(char *s, size_t size, size_t pos)
    report the length written. The alternative -- what this did until a Rust
    panic came out as "RUST PANIC: " and nothing else -- was to return -1 and
    leave the caller to decide, which cost the whole line: the %s conversion
-   dropped its entire argument rather than part of it, and Tracer::output
+   dropped its entire argument rather than part of it, and Klog::output
    dropped every line that reported -1. The reports that overflow a buffer
    are the long ones, which is to say the ones worth reading. */
 static int truncate_at(char *s, size_t size, size_t pos)

@@ -1,6 +1,6 @@
 #include "pl011.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/cpu.h>
 
 namespace kernel

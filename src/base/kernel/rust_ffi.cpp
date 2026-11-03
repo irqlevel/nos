@@ -1,4 +1,4 @@
-#include "trace.h"
+#include "klog.h"
 #include "input.h"
 #include "panic.h"
 #include "time.h"
@@ -212,11 +212,11 @@ extern "C" {
 
 void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
 {
-    /* The level, as trace() has it. A trace!(3, ...) used to be printed at
+    /* The level, as klog() has it. A klog!(3, ...) used to be printed at
        every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
        forty thousand times in a few seconds of netblk load, each one
        formatted and logged from the handler. */
-    if (level > (unsigned int)kernel::Tracer::get_instance().get_level())
+    if (level > (unsigned int)kernel::Klog::get_instance().get_level())
         return;
 
     char buf[512];
@@ -224,7 +224,7 @@ void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long le
     stdlib::mem_cpy(buf, msg, n);
     buf[n] = '\0';
     auto time = kernel::get_boot_time();
-    kernel::Tracer::get_instance().output("%u:%lu.%06lu:%s\n",
+    kernel::Klog::get_instance().output("%u:%lu.%06lu:%s\n",
         level, time.get_secs(), time.get_usecs(), buf);
 }
 
@@ -561,7 +561,7 @@ void kernel_cpu_run_on(unsigned int cpu,
     if (!(state & kernel::Cpu::STATE_RUNNING) ||
         (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
     {
-        trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
+        klog(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
         return;
     }
@@ -1217,7 +1217,7 @@ unsigned long kernel_interrupt_register_level(
                 rust_irq_slots[i].ctx = nullptr;
                 rust_irq_slots[i].used = false;
                 rust_irq_lock.write_unlock_irq_restore(flags);
-                trace(0, "kernel_interrupt_register_level: irq %lu refused",
+                klog(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
                 return 0;
             }
@@ -1229,7 +1229,7 @@ unsigned long kernel_interrupt_register_level(
     }
     rust_irq_lock.write_unlock_irq_restore(flags);
 
-    trace(0, "kernel_interrupt_register_level: no free slots");
+    klog(0, "kernel_interrupt_register_level: no free slots");
     return 0;
 }
 
@@ -1520,7 +1520,7 @@ unsigned long kernel_msix_register_handler(
         }
     }
     rust_msix_lock.write_unlock_irq_restore(flags);
-    trace(0, "kernel_msix_register_handler: no free slots");
+    klog(0, "kernel_msix_register_handler: no free slots");
     return 0;
 }
 
@@ -1861,18 +1861,18 @@ unsigned long kernel_version_field(unsigned int which, char* buf, unsigned long 
 
 unsigned int kernel_trace_level()
 {
-    const int level = kernel::Tracer::get_instance().get_level();
+    const int level = kernel::Klog::get_instance().get_level();
     return (level > 0) ? (unsigned int)level : 0;
 }
 
 /* The trace level set, as `loglevel N` sets it: 1, or 0 -- and nothing
-   changed -- for a level past MAX_TRACE_LEVEL */
+   changed -- for a level past MAX_LOG_LEVEL */
 int kernel_trace_set_level(unsigned int level)
 {
-    if (level > (unsigned int)kernel::MAX_TRACE_LEVEL)
+    if (level > (unsigned int)kernel::MAX_LOG_LEVEL)
         return 0;
 
-    kernel::Tracer::get_instance().set_level((int)level);
+    kernel::Klog::get_instance().set_level((int)level);
     return 1;
 }
 
