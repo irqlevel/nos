@@ -133,7 +133,7 @@ private:
     void on_panic();
     void __attribute__((noreturn)) park();
     static void __attribute__((noreturn)) park_on_own_stack(void* ctx);
-    void process_ipi_tasks(Context* ctx);
+    ulong process_ipi_tasks(Context* ctx);
     void drain_and_close_ipi_tasks(Context* ctx);
 
     ulong index_;

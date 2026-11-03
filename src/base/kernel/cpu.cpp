@@ -6,6 +6,7 @@
 #include "softirq.h"
 #include "profiler.h"
 #include "timer.h"
+#include "tracepoint.h"
 
 #include <hal/irqchip.h>
 #include <hal/mmu.h>
@@ -97,10 +98,21 @@ void Cpu::idle()
         return;
     }
 
+    /* A CPU about to halt, and a CPU back from it: the two ends of one idle,
+       where `sched`'s wakeup histogram would show a long sleep as a wait
+       for the CPU it never was. Between them the CPU runs nothing of the
+       kernel's, so a reader of the two knows what an idle cost. */
+    if (unlikely(tp::on(tp::Id::IdleEnter)))
+        tp::emit_idle(tp::Id::IdleEnter, index_, self);
+
     if (hal::idle_masked())
         idle_mwait();
     else
         cpu_halt();
+
+    if (unlikely(tp::on(tp::Id::IdleExit)))
+        tp::emit_idle(tp::Id::IdleExit, index_, self);
+
     if (self != nullptr)
         self->set_idling(false);
 }
@@ -174,6 +186,9 @@ void Cpu::init(ulong index)
 
     index_ = index;
     state_ |= STATE_INITED;
+
+    /* The CPU its scheduler records a task's home as (TaskQueue::index) */
+    task_queue_.set_index(index);
 
     klog(0, "Cpu 0x%p %lu inited", this, index_);
 }
@@ -605,7 +620,13 @@ void Cpu::ipi(Context* ctx)
 {
     ipi_conter_.inc();
 
-    process_ipi_tasks(ctx);
+    ulong queued = process_ipi_tasks(ctx);
+
+    /* An interrupt another CPU sent: the work it found, which is what says
+       whether this CPU was interrupted for nothing (a wakeup already taken)
+       or for a TLB shootdown’s answer. */
+    if (unlikely(tp::on(tp::Id::SchedIpi)))
+        tp::emit_sched_ipi(index_, queued);
 
     if (Panicker::get_instance().is_active())
     {
@@ -818,7 +839,7 @@ void Cpu::queue_ipi_task(IPITask& task)
     task.completion.wait();
 }
 
-void Cpu::process_ipi_tasks(Context* ctx)
+ulong Cpu::process_ipi_tasks(Context* ctx)
 {
     stdlib::ListEntry local_list;
     local_list.init();
@@ -827,13 +848,16 @@ void Cpu::process_ipi_tasks(Context* ctx)
     local_list.move_tail_list(&ipi_task_list_);
     ipi_task_lock_.unlock_irq_restore(flags);
 
+    ulong count = 0;
     while (!local_list.is_empty())
     {
         auto* entry = local_list.remove_head();
         IPITask* task = CONTAINING_RECORD(entry, IPITask, list_entry);
         task->function(task->ctx, ctx);
         task->completion.done();
+        count++;
     }
+    return count;
 }
 
 void Cpu::drain_and_close_ipi_tasks(Context* ctx)
