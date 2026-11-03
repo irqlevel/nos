@@ -20,6 +20,7 @@
 #include <hal/irq_stubs.h>
 #include "softirq.h"
 #include "timer.h"
+#include "tracepoint.h"
 #include "cmd.h"
 #include <mm/new.h>
 #include <mm/page_allocator.h>
@@ -2218,5 +2219,59 @@ int kernel_root_fstest()
 /* Net devices from Rust, both sides of them -- the driver's and the
    consumer's -- are defined in src/crates/net/src/device.rs, alongside the
    devices themselves. Nothing of them is left here. */
+
+/* ---- the tracepoints (kernel/tracepoint.h), for Rust's sites: kcore::trace ---- */
+
+/* The events' flags, a byte an event: tp::enabled, the kernel's for its life */
+const unsigned char* kernel_tp_flags()
+{
+    return kernel::tp::enabled;
+}
+
+unsigned long kernel_tp_count()
+{
+    return kernel::tp::COUNT;
+}
+
+/* A record of event `id`, `size` bytes at `payload`: emit() holds both to
+   the event's description -- a BUG_ON for a site that disagrees with it. Any
+   u16 is a value of tp::Id, whose type is u16. */
+void kernel_tp_emit(unsigned short id, const unsigned char* payload, unsigned long size)
+{
+    kernel::tp::emit((kernel::tp::Id)id, payload, size);
+}
+
+/* Event `id`'s name and payload size, as its description has them: what
+   kcore::trace::check holds a Rust payload to */
+int kernel_tp_event(unsigned short id, char* name, unsigned long name_len, unsigned long* size)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", e.name);
+    if (size != nullptr)
+        *size = e.size;
+    return 1;
+}
+
+/* Field `index` of event `id`: its name, offset and size */
+int kernel_tp_field(unsigned short id, unsigned long index, char* name, unsigned long name_len,
+    unsigned long* offset, unsigned long* size)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (index >= e.field_count)
+        return 0;
+    const kernel::tp::Field& f = e.fields[index];
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", f.name);
+    if (offset != nullptr)
+        *offset = f.offset;
+    if (size != nullptr)
+        *size = f.size;
+    return 1;
+}
 
 } /* extern "C" */

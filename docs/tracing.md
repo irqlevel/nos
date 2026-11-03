@@ -300,6 +300,45 @@ goes unrecorded. The names the events record are a task's own, written
 when it is made and never moved, so reading one in an interrupt's context
 needs no lock.
 
+## Tracepoints from Rust
+
+Rust's sites -- in the image (the block, net and filesystem layers, the
+drivers) and in a module (`hv.ko`) alike -- record the kernel's events
+through `kcore::trace`, into the same rings by the same `emit()`:
+
+```rust
+if trace::on::<HvExit>() {
+    trace::emit(&HvExit { vcpu, reason, ..Default::default() });
+}
+```
+
+An event's description stays the kernel's, one table for both languages: its
+number in `tp::Id`, its payload struct and fields' table, its line in
+`EVENTS` (below). What Rust has of one is in
+`src/crates/kcore/src/trace/events.rs`, one list read by one macro
+(`events!`): the event's number, its payload -- a `#[repr(C)]` struct of
+integers and arrays of them, with no padding, which is asserted, since the
+ring copies out every byte -- and the event it records, which ties the two
+together, so that no payload can be emitted as another event's. A payload
+of the kernel's layout written twice, once in each language, is a payload
+that will one day differ: every boot's `rust_test` holds each one to the
+kernel's description -- its name, its size, and every field's name, offset
+and size, both ways (`kcore::trace::check`) -- and panics on the first that
+does not match, so a field added on one side alone fails the smoke boots.
+
+`on()` is two loads and a branch: the flags' address, asked of the kernel
+once by each copy of kcore -- the image's, and each module's, which reaches
+the kernel through its export table (`kernel_tp_flags`) and keeps the
+address -- and the event's byte. A module imports functions, not data, so it
+cannot read `tp::enabled` by name as the C++ does; that is the second load.
+`emit()` is the kernel's, BUG_ON and all: a payload of a size the
+description does not have stops the kernel at the first record.
+
+The boot's `test_tracepoints` has Rust write a hundred records of the test
+event (`rust_trace_emit_test`) into the ring it then reads back, beside the
+C++ side's hundred, each as written and in order -- the path a module's
+tracepoints take, from the flags' address to the ring.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -308,7 +347,10 @@ number), its payload struct (40 bytes at most, `static_assert`ed), its fields'
 table (name, `offsetof`, `sizeof`, how to print it), and its line in the
 `EVENTS` table (name, group, help, size). A site checks `tp::on()` and calls
 `tp::emit()` with exactly the payload's size -- a size its description does
-not have is a `BUG_ON`. The emit path takes no lock and allocates nothing:
+not have is a `BUG_ON`. An event Rust records has one thing more, its line in
+`kcore/src/trace/events.rs`: its number, and its payload's fields in the
+same order with the same names, which the boot's check holds to the C++
+table. The emit path takes no lock and allocates nothing:
 it may be called with locks held and interrupts off, from interrupt context
 too.
 
