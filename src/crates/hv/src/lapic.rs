@@ -198,8 +198,9 @@ const DIVIDE_WRITABLE: u32 = 0b1011;
 const BUS_NS_PER_TICK: u64 = 1;
 /// The shortest period the timer is let repeat at: a guest programming a
 /// period of a few ticks would otherwise be an interrupt storm the host
-/// pays for. KVM's floor is 200 us; a periodic tick is milliseconds.
-const MIN_PERIOD_NS: u64 = 100_000;
+/// pays for. KVM's floor is 200 us; a periodic tick is milliseconds. The
+/// PIT's periodic edges are held to it too (`devices::pit`).
+pub(crate) const MIN_PERIOD_NS: u64 = 100_000;
 /// The most periods a periodic timer that fell behind is owed: a second's
 /// worth, as for the PIT (`Pit::ch0_fire`). A guest the host did not run for
 /// longer takes its time up from its clocksource, not from a flood.
