@@ -1,0 +1,241 @@
+//! The hypervisor's tracepoints (docs/tracing.md, group `hv`): each record
+//! built from what its site has in hand -- an exit's from what the exit and
+//! the CPU's registers say of it and from hvarch's stamps around the world
+//! switch (`Run`), the rest from values the run loop (`run.rs`) and the
+//! doorbells (`smp.rs`) already hold.
+//!
+//! Each asks `kcore::trace::on` first -- `exit`'s caller asks it, so as to
+//! read the registers only then -- so that off, a record costs a load and a
+//! branch, and nothing else here runs. Every value a record holds is the
+//! guest's to choose -- a port, an MSR, an address, a register, a time it
+//! made the host wait -- so nothing here may fail on one: no arithmetic that
+//! can overflow, no conversion that can truncate unsaid. hv-fuzz runs it,
+//! under its overflow checks, on every exit its scripts make.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use hvarch::x86::svm::Run;
+use kcore::trace::{self, ExitReason, HaltUntil, HvExit, HvHalt, HvInject, HvRing, HvTimer, HvWake, InjectKind,
+    RingHow, TimerHow, WakeHow};
+
+use crate::svm::Exit;
+
+/// What a record of an exit reads of the CPU's registers, as the exit left
+/// them: where the guest was, and RAX and RCX -- an MSR's number, a CPUID
+/// leaf's, a hypercall's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExitRegs {
+    pub rip: u64,
+    pub rax: u64,
+    pub rcx: u64,
+}
+
+/// A port access's `info`: its size in the low byte, and these.
+pub const IO_IN: u32 = 1 << 8;
+pub const IO_STRING: u32 = 1 << 9;
+pub const IO_REP: u32 = 1 << 10;
+/// An MSR's or a control or debug register's `info`: a write.
+pub const WRITE: u32 = 1;
+/// A CR4 access's `detail` where the exit names no register, its
+/// instruction to be decoded for it (`crate::cr`).
+pub const NO_GPR: u64 = 0xFF;
+
+/// What `hv_exit`'s `reason`, `detail` and `info` say of `exit`: the kind,
+/// what it was about, and more of it (the fields' descriptions,
+/// kernel/tracepoint.cpp, say which for each).
+pub fn exit_fields(exit: &Exit, regs: &ExitRegs, host_vector: Option<u8>) -> (ExitReason, u64, u32) {
+    let low = |r: u64| r & u64::from(u32::MAX);
+    match *exit {
+        Exit::Host => (ExitReason::Host, host_vector.map_or(0, u64::from), 0),
+        Exit::Kicked => (ExitReason::Kicked, 0, 0),
+        Exit::Io(io) => {
+            let flags = if io.input { IO_IN } else { 0 } | if io.string { IO_STRING } else { 0 }
+                | if io.rep { IO_REP } else { 0 };
+            (ExitReason::Io, u64::from(io.port), u32::from(io.size) | flags)
+        }
+        Exit::Hlt => (ExitReason::Hlt, 0, 0),
+        /* The leaf is EAX and the subleaf ECX, the registers' low halves */
+        Exit::Cpuid => (ExitReason::Cpuid, low(regs.rax), low(regs.rcx) as u32),
+        Exit::Msr { write } => (ExitReason::Msr, low(regs.rcx), if write { WRITE } else { 0 }),
+        Exit::Hypercall => (ExitReason::Hypercall, regs.rax, 0),
+        Exit::IrqWindow => (ExitReason::IrqWindow, 0, 0),
+        Exit::NmiWindow => (ExitReason::NmiWindow, 0, 0),
+        /* The error code's low half: every bit AMD-V and VT-x set there */
+        Exit::NestedFault { gpa, error } => (ExitReason::NestedFault, gpa, error as u32),
+        Exit::Exception { vector, error } => (ExitReason::Exception, u64::from(vector), error.unwrap_or(0)),
+        Exit::MachineCheck => (ExitReason::MachineCheck, 0, 0),
+        Exit::Shutdown => (ExitReason::Shutdown, 0, 0),
+        Exit::Invalid => (ExitReason::Invalid, 0, 0),
+        Exit::Cr8 { write, gpr } => (ExitReason::Cr8, u64::from(gpr), if write { WRITE } else { 0 }),
+        Exit::Cr0Write { value } => (ExitReason::Cr0, value, WRITE),
+        Exit::Cr4 { write, gpr } => (ExitReason::Cr4, gpr.map_or(NO_GPR, u64::from), if write { WRITE } else { 0 }),
+        Exit::Dr { write, dr, .. } => (ExitReason::Dr, u64::from(dr), if write { WRITE } else { 0 }),
+        Exit::Eoi { vector } => (ExitReason::Eoi, u64::from(vector), 0),
+        Exit::Pause => (ExitReason::Pause, 0, 0),
+        Exit::Undefined => (ExitReason::Undefined, 0, 0),
+        Exit::Other(code) => (ExitReason::Other, code, 0),
+    }
+}
+
+/// Nanoseconds a cycle of the counter is, in 32.32 fixed point: worked out
+/// once, the rate being the kernel's for good once known. 0 until then.
+static NS_PER_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+const FRACTION_BITS: u32 = 32;
+
+#[cold]
+#[inline(never)]
+fn ns_per_cycle_asked() -> u64 {
+    let Some(hz) = kcore::time::cycle_counter_hz() else { return 0 };
+    /* A rate of 1 Hz is still a factor that fits: 10^9 << 32 is under 2^62. */
+    let factor = (kcore::consts::NS_PER_SEC << FRACTION_BITS) / hz;
+    NS_PER_CYCLE.store(factor, Ordering::Relaxed);
+    factor
+}
+
+/// `cycles` of the counter in nanoseconds, as a record's field holds them:
+/// `u32::MAX` for that or more, and 0 while the counter's rate is unknown.
+pub fn ns(cycles: u64) -> u32 {
+    let mut factor = NS_PER_CYCLE.load(Ordering::Relaxed);
+    if factor == 0 {
+        factor = ns_per_cycle_asked();
+    }
+    let ns = (u128::from(cycles) * u128::from(factor)) >> FRACTION_BITS;
+    u32::try_from(ns).unwrap_or(u32::MAX)
+}
+
+/// What `hv_exit`'s times say of `run`, the CPU's last entry as hvarch
+/// timed it, at counter `now`: in the guest, out of it before, and since
+/// the exit. All 0 for an entry not made -- a kick turned it back -- or not
+/// timed; and a count that went backwards -- another CPU's, not quite in
+/// step -- a time of 0, not a wrap.
+pub fn times(exit: &Exit, run: Run, now: u64) -> (u32, u32, u32) {
+    if matches!(exit, Exit::Kicked) || run.exited == 0 {
+        return (0, 0, 0);
+    }
+    let guest = ns(run.exited.saturating_sub(run.entered));
+    let out = if run.before == 0 { 0 } else { ns(run.entered.saturating_sub(run.before)) };
+    let since = ns(now.saturating_sub(run.exited));
+    (guest, out, since)
+}
+
+/// The `hv_exit` record of `exit`, CPU `vcpu`'s, its registers `regs` as
+/// the exit left them and its world switch `run` as hvarch timed it. The
+/// caller has asked `on` -- every entry's call site is `vm::Cpu::enter`.
+pub fn exit(vcpu: u32, exit: &Exit, regs: ExitRegs, run: Run, host_vector: Option<u8>) {
+    let (reason, detail, info) = exit_fields(exit, &regs, host_vector);
+    let (guest_ns, out_ns, since_ns) = times(exit, run, kcore::time::cycle_counter());
+    trace::emit(&HvExit {
+        detail,
+        rip: regs.rip,
+        pid: trace::pid(),
+        guest_ns,
+        out_ns,
+        since_ns,
+        info,
+        vcpu: vcpu_field(vcpu),
+        reason: reason as u8,
+        _pad: 0,
+    });
+}
+
+/// A guest CPU's number as a record's field holds it.
+fn vcpu_field(vcpu: u32) -> u16 {
+    u16::try_from(vcpu).unwrap_or(u16::MAX)
+}
+
+/// Nanoseconds as a record's field holds them: `u32::MAX` for that or more.
+pub fn ns_field(ns: u64) -> u32 {
+    u32::try_from(ns).unwrap_or(u32::MAX)
+}
+
+/// `hv_inject`: `kind`, of `vector`, into CPU `vcpu` at its entry.
+#[inline]
+pub fn inject(vcpu: u32, kind: InjectKind, vector: u8) {
+    if trace::on::<HvInject>() {
+        trace::emit(&HvInject { pid: trace::pid(), vcpu: vcpu_field(vcpu), vector, kind: kind as u8 });
+    }
+}
+
+/// What a halted CPU's loop looked at for the time it sleeps to: its APIC
+/// timer's next edge, the PIT's and the devices' next round -- the first
+/// CPU's -- and the end of its run.
+pub struct HaltFor {
+    pub timer: Option<u64>,
+    pub pit: Option<u64>,
+    pub devices: Option<u64>,
+    pub deadline: u64,
+}
+
+impl HaltFor {
+    /// Which of them `until` is, the soonest: the APIC timer's first, where
+    /// two are the same time; none of them, the longest a halt waits.
+    pub fn until(&self, until: u64) -> HaltUntil {
+        if self.timer == Some(until) {
+            HaltUntil::Timer
+        } else if self.pit == Some(until) {
+            HaltUntil::Pit
+        } else if self.devices == Some(until) {
+            HaltUntil::Device
+        } else if self.deadline == until {
+            HaltUntil::Deadline
+        } else {
+            HaltUntil::Nothing
+        }
+    }
+}
+
+/// `hv_halt`: CPU `vcpu` halted with nothing to take at `now`, to spin for
+/// `poll_ns` -- 0 for no spin -- and sleep to `until`, the soonest of `of`.
+#[inline]
+pub fn halt(vcpu: u32, now: u64, until: u64, of: &HaltFor, poll_ns: u64) {
+    if trace::on::<HvHalt>() {
+        trace::emit(&HvHalt {
+            pid: trace::pid(),
+            wait_ns: ns_field(until.saturating_sub(now)),
+            poll_ns: ns_field(poll_ns),
+            vcpu: vcpu_field(vcpu),
+            until: of.until(until) as u8,
+            _pad: 0,
+        });
+    }
+}
+
+/// `hv_wake`: that halt of CPU `vcpu` over, `how`, `halted_ns` after its
+/// look and `late_ns` past the time it slept to.
+#[inline]
+pub fn wake(vcpu: u32, how: WakeHow, halted_ns: u64, late_ns: u64) {
+    if trace::on::<HvWake>() {
+        trace::emit(&HvWake {
+            pid: trace::pid(),
+            halted_ns: ns_field(halted_ns),
+            late_ns: ns_field(late_ns),
+            vcpu: vcpu_field(vcpu),
+            how: how as u8,
+            _pad: 0,
+        });
+    }
+}
+
+/// `hv_timer`: CPU `vcpu`'s APIC timer interrupt asked for, `late_ns` past
+/// its edge, after `how`.
+#[inline]
+pub fn timer(vcpu: u32, how: TimerHow, late_ns: u64) {
+    if trace::on::<HvTimer>() {
+        trace::emit(&HvTimer {
+            pid: trace::pid(),
+            late_ns: ns_field(late_ns),
+            vcpu: vcpu_field(vcpu),
+            how: how as u8,
+            _pad: 0,
+        });
+    }
+}
+
+/// `hv_ring`: CPU `vcpu` rung, or notified, `how`, by the running task.
+#[inline]
+pub fn ring(vcpu: u32, how: RingHow) {
+    if trace::on::<HvRing>() {
+        trace::emit(&HvRing { pid: trace::pid(), vcpu: vcpu_field(vcpu), how: how as u8, _pad: 0 });
+    }
+}

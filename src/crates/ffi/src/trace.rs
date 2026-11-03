@@ -16,8 +16,16 @@ unsafe extern "C" {
     /// fit) and its payload's size into `size`: 1, or 0 for no such event.
     pub fn kernel_tp_event(id: u16, name: *mut u8, name_len: usize, size: *mut usize) -> i32;
     /// Field `index` of event `id`, as its description has it: its name, its
-    /// offset in the payload and its size -- 1, or 0 past the event's last
-    /// field or for no such event.
+    /// offset in the payload, its size, and how many names its values have
+    /// -- an enumeration's; 0 for any other field -- 1, or 0 past the
+    /// event's last field or for no such event.
     pub fn kernel_tp_field(id: u16, index: usize, name: *mut u8, name_len: usize, offset: *mut usize,
-        size: *mut usize) -> i32;
+        size: *mut usize, names: *mut usize) -> i32;
+    /// What value `value` of that field is called, into `name` (`name_len`
+    /// bytes, terminated, cut to fit): 1, or 0 for a field that is no
+    /// enumeration or a value it has no name for.
+    pub fn kernel_tp_field_name(id: u16, index: usize, value: usize, name: *mut u8, name_len: usize) -> i32;
+    /// The pid a record says the running task by -- its own, or the kernel's
+    /// none (`tp::NO_TASK_PID`) off a task's stack. Values only.
+    pub safe fn kernel_tp_pid() -> u32;
 }

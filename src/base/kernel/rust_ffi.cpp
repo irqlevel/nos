@@ -2255,9 +2255,10 @@ int kernel_tp_event(unsigned short id, char* name, unsigned long name_len, unsig
     return 1;
 }
 
-/* Field `index` of event `id`: its name, offset and size */
+/* Field `index` of event `id`: its name, offset and size, and how many
+   names its values have -- an enumeration's, 0 for any other field */
 int kernel_tp_field(unsigned short id, unsigned long index, char* name, unsigned long name_len,
-    unsigned long* offset, unsigned long* size)
+    unsigned long* offset, unsigned long* size, unsigned long* names)
 {
     if (id >= kernel::tp::COUNT)
         return 0;
@@ -2271,7 +2272,36 @@ int kernel_tp_field(unsigned short id, unsigned long index, char* name, unsigned
         *offset = f.offset;
     if (size != nullptr)
         *size = f.size;
+    if (names != nullptr)
+        *names = (f.kind == kernel::tp::Kind::Enum && f.names != nullptr) ? f.name_count : 0;
     return 1;
+}
+
+/* What value `value` of field `index` of event `id` is called -- an
+   enumeration's -- into `name`: 1, or 0 for no such field or value */
+int kernel_tp_field_name(unsigned short id, unsigned long index, unsigned long value, char* name,
+    unsigned long name_len)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (index >= e.field_count)
+        return 0;
+    const kernel::tp::Field& f = e.fields[index];
+    if (f.kind != kernel::tp::Kind::Enum || f.names == nullptr || value >= f.name_count)
+        return 0;
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", f.names[value]);
+    return 1;
+}
+
+/* The pid a record says the running task by: its own, or NO_TASK_PID off
+   a task's stack. Any context -- an interrupt's on a task's stack is that
+   task's, as sched_wakeup's waker is. */
+unsigned int kernel_tp_pid()
+{
+    kernel::Task* task = kernel::Task::try_get_current_task();
+    return (task != nullptr) ? (unsigned int)task->pid_ : kernel::tp::NO_TASK_PID;
 }
 
 } /* extern "C" */

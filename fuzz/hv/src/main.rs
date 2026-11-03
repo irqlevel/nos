@@ -55,7 +55,11 @@ macro_rules! klog {
 /* ---- what the sources reach of the kernel and of hvarch ---- */
 
 mod kernel;
-pub use kernel::{cmd, consts, dma, sync, time};
+pub use kernel::{cmd, consts, dma, sync, time, trace};
+/// The kernel's events, as kcore declares them for its sites: the payloads
+/// hv's sites build, held by `trace`'s emit to their descriptions.
+#[path = "../../../src/crates/kcore/src/trace/events.rs"]
+pub mod trace_events;
 mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
 pub use devices::offload;
@@ -105,6 +109,11 @@ pub mod run;
 pub mod smbios;
 #[path = "../../../src/crates/hv/src/smp.rs"]
 pub mod smp;
+/// hv's records of what its guests' CPUs do (`kcore::trace`'s events, group
+/// `hv`): built from every exit the scripts make, and every halt, wake,
+/// injection and ring the run loop meets, when a target turns them on.
+#[path = "../../../src/crates/hv/src/tp.rs"]
+pub mod tp;
 /// `hv forward`'s relay, from the module: two streams carried both ways.
 #[path = "../../../src/crates/modules/hv/src/relay.rs"]
 pub mod relay;

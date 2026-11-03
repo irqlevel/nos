@@ -436,9 +436,14 @@ MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
     -z noexecstack -z now --build-id=none --hash-style=sysv \
     --version-script=src/crates/kmod/module.ver -u nos_module_info
 # The kernel interface a module is built against, and which the loader holds
-# it to: a digest of the ffi crate's sources.
+# it to: a digest of the ffi crate's sources, and of the tracepoints' payloads
+# kcore declares (kcore/src/trace/events.rs) -- bytes a module's sites hand
+# the kernel's emit(), which holds them to the kernel's descriptions. The
+# boot holds the image's payloads to those; a module of other payloads is
+# one the loader refuses, not records printed wrong or an emit()'s BUG_ON.
 MODULE_FFI_SRC = $(sort $(wildcard src/crates/ffi/src/*.rs))
-MODULE_ABI := $(shell cat $(MODULE_FFI_SRC) | sha256sum | cut -c1-64)
+MODULE_ABI_SRC = $(MODULE_FFI_SRC) src/crates/kcore/src/trace/events.rs
+MODULE_ABI := $(shell cat $(MODULE_ABI_SRC) | sha256sum | cut -c1-64)
 
 modules: $(MODULE_KO)
 
@@ -479,7 +484,7 @@ $(HVBOOT): $(RUST_SRC) src/crates/hvboot/hvboot.ld $(FLAVOR_STAMP)
 	ld.lld $(HVBOOT_LDFLAGS) -o $@ src/crates/target/hvboot/$(RUST_TARGET)/release/libhvboot.a
 
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
-$(OUT)/kernel/module.o: $(MODULE_FFI_SRC)
+$(OUT)/kernel/module.o: $(MODULE_ABI_SRC)
 
 # The functions a module may bind to: those the ffi crate declares in its
 # extern blocks that the kernel defines. Generated from pass1.elf like the

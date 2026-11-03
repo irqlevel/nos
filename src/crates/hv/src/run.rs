@@ -61,6 +61,7 @@ use hvarch::x86::vmx::PostedInterrupts;
 use hvarch::{Error, Result};
 use kcore::sync::Mutex;
 use kcore::time;
+use kcore::trace::{self, HvHalt, HvWake, InjectKind, RingHow, TimerHow, WakeHow};
 
 use crate::acpi;
 use crate::smbios;
@@ -77,6 +78,7 @@ use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
 use crate::pvh;
+use crate::tp;
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
 use crate::mmio;
@@ -94,6 +96,8 @@ const COM1_IRQ: u8 = 4;
 /// cannot be made to deliver one inside another for good -- and gives back.
 const VECTOR_DB: u8 = 1;
 const VECTOR_AC: u8 = 17;
+/// An NMI's vector, as `hv_inject` says one.
+const VECTOR_NMI: u8 = 2;
 
 /// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
 /// the disks' from 0xC000, the NICs' past every disk's -- and the IRQs they
@@ -910,7 +914,7 @@ impl LinuxGuest {
         let mut shared = Vec::new();
         shared.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
         for i in 0..cpus {
-            let cpu = Cpu::new(machine, &memory, 0)?;
+            let cpu = Cpu::new(machine, &memory, 0, i)?;
             if i > 0 && !cpu.backend().runs_real_mode() {
                 return Err(Error::NoUnrestrictedGuest);
             }
@@ -1486,29 +1490,30 @@ impl LinuxGuest {
                 gc.counts.timer_late_ns += late;
                 gc.counts.timer_late_max = gc.counts.timer_late_max.max(late);
                 let how = match gc.step {
-                    Step::Slept { edge, .. } if edge != due => 3,
-                    Step::Slept { wake_at, woke, .. } if woke > wake_at + LATE_NS => 1,
-                    Step::Slept { .. } => 2,
-                    Step::Spun => 4,
-                    Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => 5,
-                    Step::Ran { host: true, .. } => 6,
-                    Step::Ran { host: false, .. } => 7,
-                    Step::Other => 8,
+                    Step::Slept { edge, .. } if edge != due => TimerHow::NotSleptFor,
+                    Step::Slept { wake_at, woke, .. } if woke > wake_at + LATE_NS => TimerHow::WokeLate,
+                    Step::Slept { .. } => TimerHow::WokeOnTime,
+                    Step::Spun => TimerHow::Spun,
+                    Step::Ran { at, .. } if now.saturating_sub(at) > LATE_NS => TimerHow::OffCpu,
+                    Step::Ran { host: true, .. } => TimerHow::Host,
+                    Step::Ran { host: false, .. } => TimerHow::Exit,
+                    Step::Other => TimerHow::Other,
                 };
+                tp::timer(gc.index, how, late);
                 if late > LATE_NS {
                     let c = &mut gc.counts;
                     match how {
-                        1 => {
+                        TimerHow::WokeLate => {
                             c.late_woke_late += 1;
                             c.late_woke_late_rung += u64::from(matches!(gc.step, Step::Slept { rung: true, .. }));
                         }
-                        2 => c.late_woke_on_time += 1,
-                        3 => c.late_not_slept_for += 1,
-                        4 => c.late_spun += 1,
-                        5 => c.late_off_cpu += 1,
-                        6 => c.late_host += 1,
-                        7 => c.late_exit += 1,
-                        _ => c.late_other += 1,
+                        TimerHow::WokeOnTime => c.late_woke_on_time += 1,
+                        TimerHow::NotSleptFor => c.late_not_slept_for += 1,
+                        TimerHow::Spun => c.late_spun += 1,
+                        TimerHow::OffCpu => c.late_off_cpu += 1,
+                        TimerHow::Host => c.late_host += 1,
+                        TimerHow::Exit => c.late_exit += 1,
+                        TimerHow::Nothing | TimerHow::Other => c.late_other += 1,
                     }
                 }
                 if late > gc.counts.worst.late {
@@ -1516,7 +1521,7 @@ impl LinuxGuest {
                         Step::Ran { at, entered, asked, .. } => (entered, asked, at),
                         _ => (0, 0, 0),
                     };
-                    gc.counts.worst = Worst { late, how, due: due.unwrap_or(0), entered, asked, left };
+                    gc.counts.worst = Worst { late, how: how as u8, due: due.unwrap_or(0), entered, asked, left };
                 }
             }
             shared.extint.store(gc.lapic.accepts_extint(), Ordering::Relaxed);
@@ -1629,11 +1634,22 @@ impl LinuxGuest {
                              * for good. The spin is grown after a halt that
                              * was short, and dropped after one that was long,
                              * KVM's way. */
-                            if gc.poll_ns != 0 && until - now > gc.poll_ns {
+                            let spin = gc.poll_ns != 0 && until - now > gc.poll_ns;
+                            if trace::on::<HvHalt>() {
+                                let of = tp::HaltFor {
+                                    timer: gc.lapic.next_timer_ns(), pit: pit_edge, devices: devices_due, deadline,
+                                };
+                                tp::halt(gc.index, now, until, &of, if spin { gc.poll_ns } else { 0 });
+                            }
+                            if spin {
                                 gc.counts.polls += 1;
                                 if bell.poll(gc.poll_ns) {
                                     gc.counts.polled += 1;
                                     gc.step = Step::Spun;
+                                    if trace::on::<HvWake>() {
+                                        let halted = time::boot_time_ns().saturating_sub(now);
+                                        tp::wake(gc.index, WakeHow::Polled, halted, 0);
+                                    }
                                     continue;
                                 }
                             }
@@ -1661,14 +1677,17 @@ impl LinuxGuest {
                             }
                             gc.counts.overslept_max = gc.counts.overslept_max.max(over);
                             gc.step = Step::Slept { wake_at, edge, woke, rung };
+                            let mut how = if rung { WakeHow::Rung } else { WakeHow::Timed };
                             if advance && !rung {
                                 let at = time::boot_time_ns();
                                 if at < until {
                                     gc.counts.advanced += 1;
                                     bell.poll(until - at);
+                                    how = WakeHow::Advanced;
                                 }
                             }
                             let halt = time::boot_time_ns().saturating_sub(now);
+                            tp::wake(gc.index, how, halt, over);
                             gc.poll_ns = if halt > POLL_MAX_NS {
                                 0
                             } else if halt > gc.poll_ns {
@@ -2083,6 +2102,11 @@ impl LinuxGuest {
             if let Some(d) = bell {
                 if d.kick().notify() {
                     self.notified.fetch_add(1, Ordering::Relaxed);
+                    /* After the notification, the one hand-off without a
+                     * record of its own: the CPU takes it in the guest, and
+                     * nothing of the target's is recorded for it to come
+                     * before. A ring, below, records itself first. */
+                    tp::ring(u32::try_from(i).unwrap_or(u32::MAX), RingHow::Notified);
                 } else {
                     d.ring();
                 }
@@ -2185,6 +2209,7 @@ impl LinuxGuest {
             if !v.event_queued() {
                 v.reflect_exception(vector, error);
                 gc.exception = None;
+                tp::inject(gc.index, InjectKind::Exception, vector);
             }
             return;
         }
@@ -2194,6 +2219,7 @@ impl LinuxGuest {
                 v.inject_nmi();
                 gc.nmi_pending = false;
                 gc.counts.nmi += 1;
+                tp::inject(gc.index, InjectKind::Nmi, VECTOR_NMI);
                 return;
             }
             /* In its handler for the last one, or in a shadow: told when it
@@ -2211,6 +2237,7 @@ impl LinuxGuest {
         if !v.interruptible() {
             gc.counts.blocked += 1;
             v.request_irq_window();
+            tp::inject(gc.index, InjectKind::Window, apic.unwrap_or(0));
             return;
         }
         if extint && (apic.is_none() || !gc.last_from_pic) {
@@ -2225,6 +2252,7 @@ impl LinuxGuest {
                 v.clear_irq_window();
                 gc.last_from_pic = true;
                 gc.counts.irq += 1;
+                tp::inject(gc.index, InjectKind::Pic, vector);
                 if irq == 0 {
                     gc.counts.irq0 += 1;
                 }
@@ -2241,6 +2269,7 @@ impl LinuxGuest {
                 v.clear_irq_window();
                 gc.last_from_pic = false;
                 gc.counts.apic += 1;
+                tp::inject(gc.index, InjectKind::Apic, vector);
             }
             None => v.clear_irq_window(),
         }

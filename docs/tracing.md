@@ -322,9 +322,20 @@ ring copies out every byte -- and the event it records, which ties the two
 together, so that no payload can be emitted as another event's. A payload
 of the kernel's layout written twice, once in each language, is a payload
 that will one day differ: every boot's `rust_test` holds each one to the
-kernel's description -- its name, its size, and every field's name, offset
-and size, both ways (`kcore::trace::check`) -- and panics on the first that
-does not match, so a field added on one side alone fails the smoke boots.
+kernel's description -- its name, its size, every field's name, offset and
+size, both ways, and an enumeration's names value by value
+(`kcore::trace::check`) -- and panics on the first that does not match, so a
+field added on one side alone, or a value named on one side alone, fails the
+smoke boots. An enumerated field is declared `as` a type of `names!` in the
+same file -- `reason: u8 as ExitReason` -- whose variants a site writes
+(`ExitReason::Msr as u8`) and whose names are the kernel's `Field::names`.
+
+A module's copy of kcore is never checked so: the payloads it builds are the
+ones its source declared. So the file is part of what the loader holds a
+module to -- `MODULE_ABI`, the digest every `.ko` carries, is of the `ffi`
+crate's sources and of `events.rs` -- and a module of other payloads is
+refused at `insmod`, rather than its records printed wrong or `emit()`'s
+`BUG_ON` reached.
 
 `on()` is two loads and a branch: the flags' address, asked of the kernel
 once by each copy of kcore -- the image's, and each module's, which reaches
@@ -339,6 +350,48 @@ event (`rust_trace_emit_test`) into the ring it then reads back, beside the
 C++ side's hundred, each as written and in order -- the path a module's
 tracepoints take, from the flags' address to the ring.
 
+## The hypervisor's events
+
+Group `hv`, recorded by the hv module (`src/crates/hv`): the payloads are
+kcore's (`events.rs`), the records built in `hv/src/tp.rs` and written at
+the sites named here. Each says its guest CPU by its number in its guest
+(`vcpu`) and its task's `pid` -- the BSP's is the task that runs the VM,
+each other's `hv/<vm>/cpu<n>` -- which tells one VM's from another's and
+ties the records to the scheduler's of the same task.
+
+| event | what it records |
+|---|---|
+| `hv_exit` | a guest CPU out of its guest, or turned back on its way in (`kicked`): its `reason` -- one value a kind of hv's `Exit` -- what it was about (`detail`: io the port, msr the MSR, npf the guest physical address, exception and eoi the vector, cpuid the leaf, hypercall RAX, cr0 the value, cr4 and cr8 the register's number, dr the debug register's, host the host's vector that took it out under VT-x -- AMD-V does not say -- other the CPU's own exit code) and more of it (`info`: a port access's size, 0x100 an IN, 0x200 a string, 0x400 REP; 1 for a write of an MSR or a register; cpuid the subleaf; npf and exception the error code), its `rip`, and three times: `guest_ns` from the entry to the exit, `out_ns` from the exit before to this entry -- the host's handling, the loop's look, a halt's sleep -- and `since_ns` from the exit to the record: the host's interrupt it was for, taken first, and whatever ran in its wake |
+| `hv_inject` | what went in at an entry: an `exception` of the guest's own given back, an `nmi`, an interrupt from the 8259 (`pic`) or the local APIC (`apic`), or `window` -- none it can take yet, the CPU asked to exit when it can -- and its `vector`. Under VT-x with APIC virtualization the CPU delivers the APIC's interrupts itself, and none of those is recorded |
+| `hv_halt` | a halted CPU with nothing to take: what it sleeps `until` -- its APIC timer's edge, the PIT's or the devices' next round (the first CPU's), the end of its run, or nothing armed (10 ms) -- `wait_ns` to it, and the spin it tries first (`poll_ns`, 0 for none) |
+| `hv_wake` | that halt over: `polled` (rung within the spin), `rung` (while asleep), `timed` (its time came) or `advanced` (woke short of its timer's edge and spun the rest); `halted_ns` from the halt's look, `late_ns` past the time it slept to |
+| `hv_timer` | a CPU's APIC timer interrupt asked for, `late_ns` past its edge, and what its task did before the round that found it (`how`, the run loop's `Step`: `woke_late`, `woke_on_time`, `not_slept_for`, `spun`, `off_cpu`, `host`, `exit`, `other`) -- what `hv`'s report counts the late ones by |
+| `hv_ring` | a CPU rung: its event signalled and its kick sent (`rung`), found spinning for a ring (`polling`), its event alone (`signalled`, a key at its console), or a posted interrupt's notification sent to the CPU it runs its guest on (`notified`); `pid` the task that rang -- another CPU's for an IPI, a device's, the one an interrupt landed on |
+
+`hv_exit` is written in `vm::Cpu::enter`, which every entry of every guest
+comes through -- a Linux guest's and a built-in one's -- after the exit is
+decoded. Its times are the cycle counter's, read by hvarch around the world
+switch with interrupts off (`hvarch::x86::svm::Run`): just before `vmrun`,
+`vmlaunch` or `vmresume`, and just after the exit. Off, an entry reads
+nothing: the stamps are taken only while `hv_exit` is on (or `hv bench`'s
+profile asks), so the off path is the flag's load and a branch in hvarch
+and the same in `Cpu::enter`. An exit's own time is its record's less
+`since_ns`, and the entry it ended its exit's less `guest_ns`; the host's
+time over an exit is the next record's `out_ns` -- so a trace of `hv_exit`
+alone, one record an exit, has every exit's cost in it.
+
+`hv_inject` is written in the run loop's `deliver`, as each event goes in;
+`hv_halt` and `hv_wake` around a halted CPU's spin and sleep (not a CPU
+asleep for good -- INIT-waiting, or halted with interrupts off -- which only
+another CPU wakes); `hv_timer` where the loop asks the APIC for the timer's
+interrupt. `hv_ring` is written by `Doorbell::ring` and `signal`, before the
+vCPU is woken or kicked -- the hand-off rule above, so that its `hv_wake`
+comes after it -- and in `post_edge` after a notification is sent, the one
+hand-off with no record of its own on the other side: the CPU takes a posted
+interrupt in the guest.
+
+A time of 4.29 s or more is held at that, the most a u32 of nanoseconds has.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -348,9 +401,11 @@ table (name, `offsetof`, `sizeof`, how to print it), and its line in the
 `EVENTS` table (name, group, help, size). A site checks `tp::on()` and calls
 `tp::emit()` with exactly the payload's size -- a size its description does
 not have is a `BUG_ON`. An event Rust records has one thing more, its line in
-`kcore/src/trace/events.rs`: its number, and its payload's fields in the
-same order with the same names, which the boot's check holds to the C++
-table. The emit path takes no lock and allocates nothing:
+`kcore/src/trace/events.rs`: its number, and its payload's fields with the
+same names, offsets and sizes -- an enumeration's with a `names!` type of
+the same names -- and its padding named, `_pad`, so that the struct has
+none; the boot's check holds it to the C++ table, which says the order a
+record prints its fields in. The emit path takes no lock and allocates nothing:
 it may be called with locks held and interrupts off, from interrupt context
 too.
 
@@ -388,6 +443,21 @@ too.
   the quicksort it replaced is a panic at the 48th input; the window's
   start ignored -- the pairing across a ring's loss behind `trace latency`'s
   made-up waits -- is caught at the 44th.
+- The hypervisor's events: every boot's `rust_test` holds their payloads to
+  the descriptions, names and all; `hv-fuzz.py` (host, in CI) builds them
+  with its overflow checks on, half its whole-machine runs with them on --
+  from every exit the scripts make, and every halt, wake, injection and
+  ring the run loop meets -- and holds each record to its description, an
+  enumeration's value one it has a name for and every pad zero; and
+  `hv-test.py` (x86-64) runs two built-in guests with `trace on hv`: the
+  `exits` guest's 21 port accesses, its CPUID of its leaf and its HLT, each
+  recorded with what it was about and nothing else but the host's own
+  interrupts, one task's, every entry but the first with its time out of
+  the guest; the `smp` guest's four ICR writes on CPU 0 and one on CPU 1,
+  CPU 1 rung for the INIT and both start-up IPIs by CPU 0's task and CPU 0
+  for the IPI by CPU 1's, its timer's interrupt asked for once and -- where
+  the host injects them -- the IPI and the timer's interrupt injected once
+  each, every halt ended by a wake; and with every event off, nothing.
 - `trace-test.py` (arm64; x86-64 where grub-mkrescue is): a kernel booted
   with `tracepoints=test`, and `trace` driven over the UDP shell -- the
   boot's events on, records shown merged and in order, rings made again at
