@@ -59,7 +59,7 @@ void Klog::output(const char *fmt, ...)
        whatever was formatted before it is printed if there is any. */
     if (size < 0 && msg[0] == '\0')
         return;
-    /* Every line here ends with a newline (klog(), kernel_trace): one cut
+    /* Every line here ends with a newline (klog(), kernel_klog): one cut
        short ends its line still, rather than have the next run on after it
        -- as a disk image's release line once ran into the shell's prompt. */
     stdlib::end_cut_line(msg, sizeof(msg), size);

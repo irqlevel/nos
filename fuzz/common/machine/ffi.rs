@@ -294,7 +294,7 @@ pub unsafe extern "C" fn kernel_get_random(buf: *mut u8, len: usize) -> i32 {
 /// # Safety
 /// `msg` points at `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_trace(level: u32, msg: *const u8, len: usize) {
+pub unsafe extern "C" fn kernel_klog(level: u32, msg: *const u8, len: usize) {
     // SAFETY: the caller's message, `kcore::klog`'s buffer.
     let msg = unsafe { core::slice::from_raw_parts(msg, len) };
     sched::harness(|| super::trace(level, msg))
@@ -482,14 +482,21 @@ pub unsafe extern "C" fn kernel_task_snapshot(out: *mut ffi::system::TaskInfo, m
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_trace_level() -> u32 {
+pub extern "C" fn kernel_klog_level() -> u32 {
     super::trace_level()
+}
+
+/// Every line under `--trace`, which echoes each whatever its level; the
+/// log's own otherwise.
+#[no_mangle]
+pub extern "C" fn kernel_klog_wants(level: u32) -> i32 {
+    (super::ECHO_TRACE.load(std::sync::atomic::Ordering::Relaxed) || level <= super::trace_level()) as i32
 }
 
 /// Taken as the kernel takes one, and nothing changed: the fuzzer's log
 /// keeps its level.
 #[no_mangle]
-pub extern "C" fn kernel_trace_set_level(level: u32) -> i32 {
+pub extern "C" fn kernel_klog_set_level(level: u32) -> i32 {
     (level <= 9) as i32
 }
 

@@ -210,7 +210,14 @@ private:
 
 extern "C" {
 
-void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
+/* What klog! asks before it formats a line: whether the log keeps one of
+   this level. */
+int kernel_klog_wants(unsigned int level)
+{
+    return (level <= (unsigned int)kernel::Klog::get_instance().get_level()) ? 1 : 0;
+}
+
+void kernel_klog(unsigned int level, const unsigned char* msg, unsigned long len)
 {
     /* The level, as klog() has it. A klog!(3, ...) used to be printed at
        every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
@@ -1859,7 +1866,7 @@ unsigned long kernel_version_field(unsigned int which, char* buf, unsigned long 
     return bounded_len(buf, len);
 }
 
-unsigned int kernel_trace_level()
+unsigned int kernel_klog_level()
 {
     const int level = kernel::Klog::get_instance().get_level();
     return (level > 0) ? (unsigned int)level : 0;
@@ -1867,7 +1874,7 @@ unsigned int kernel_trace_level()
 
 /* The trace level set, as `loglevel N` sets it: 1, or 0 -- and nothing
    changed -- for a level past MAX_LOG_LEVEL */
-int kernel_trace_set_level(unsigned int level)
+int kernel_klog_set_level(unsigned int level)
 {
     if (level > (unsigned int)kernel::MAX_LOG_LEVEL)
         return 0;

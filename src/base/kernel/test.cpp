@@ -2773,7 +2773,7 @@ stdlib::Error test_modules()
             break;
         case 2:
             what = "an import the kernel lacks";
-            patch_all(copy, size, "kernel_trace", "kernel_trac3");
+            patch_all(copy, size, "kernel_klog", "kernel_kl0g");
             expected = stdlib::Error::NOT_FOUND;
             break;
         case 3:

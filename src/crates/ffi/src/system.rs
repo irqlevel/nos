@@ -117,9 +117,9 @@ unsafe extern "C" {
     pub fn kernel_cpu_model(buf: *mut u8, len: usize) -> usize;
     /// `VERSION` or `REVISION`, into `buf`: the bytes written.
     pub fn kernel_version_field(which: u32, buf: *mut u8, len: usize) -> usize;
-    pub safe fn kernel_trace_level() -> u32;
+    pub safe fn kernel_klog_level() -> u32;
     /// 1 set; 0 -- nothing changed -- for a level past the highest.
-    pub safe fn kernel_trace_set_level(level: u32) -> i32;
+    pub safe fn kernel_klog_set_level(level: u32) -> i32;
     /// A task's nice, looked up by its pid: 0 set, 1 no such task, 2 out of
     /// range. Task context.
     pub safe fn kernel_task_set_nice(pid: u64, nice: i64) -> i32;

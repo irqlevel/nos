@@ -102,7 +102,7 @@ pub fn trace(level: u32, msg: &[u8]) {
     if level > LOG_LEVEL {
         return;
     }
-    /* The line as rust_ffi.cpp's kernel_trace prints it: the CPU, the time
+    /* The line as rust_ffi.cpp's kernel_klog prints it: the CPU, the time
      * since boot, the message. */
     let us = sched::now().saturating_sub(sched::START) / 1000;
     let mut line = format!("{}:{}.{:06}:", sched::cpu(), us / 1_000_000, us % 1_000_000).into_bytes();

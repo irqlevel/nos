@@ -1,4 +1,5 @@
 pub use ffi::klog::klog;
+pub use ffi::klog::wants;
 pub use ffi::klog::__KlogBuf;
 
 /// Whether a panic has started. What tells code to stop waiting for locks:

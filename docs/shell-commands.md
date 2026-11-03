@@ -10,7 +10,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `cpu` | Dump CPU state |
 | `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT), the performance counters it has (Intel architectural perfmon, or AMD core counters and PerfMonV2), and which of them `profile` will actually sample with |
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
-| `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
+| `loglevel [N]` | Show or set the log level (0-5) on a running kernel |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
 | `igbdump` | The igb chip's own state: MAC command/status registers, ring head and tail, receive statistics; the interrupt layout (INTx, one MSI-X vector, or a queue vector and another) with each vector's count, the throttle and the receive rate it follows, and how often under load the poll looked at an empty ring again rather than arm the interrupt, with the time that cost; and the PHY's view of the link — what it advertised, what the partner offered, both 1000BASE-T registers. What made the I210's 10 Mb/s latch diagnosable |
