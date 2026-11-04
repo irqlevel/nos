@@ -203,3 +203,26 @@ impl Drop for Performance {
         ffi::cpu::kernel_cpu_performance(self.cpu, 0);
     }
 }
+
+/// A CPU held to wake quickly for as long as this lives: its idles kept out
+/// of the C-state between C1 and the deepest, whose wake a guest's disk
+/// would wait for at the first request after its task idled -- what the CPU
+/// a guest's disk is served from asks while it is theirs. A `Performance`
+/// hold holds a CPU so too. Holds of one CPU are counted. Made and dropped
+/// in task context.
+pub struct Latency {
+    cpu: u32,
+}
+
+impl Latency {
+    pub fn hold(cpu: u32) -> Self {
+        ffi::cpu::kernel_cpu_latency(cpu, 1);
+        Self { cpu }
+    }
+}
+
+impl Drop for Latency {
+    fn drop(&mut self) {
+        ffi::cpu::kernel_cpu_latency(self.cpu, 0);
+    }
+}

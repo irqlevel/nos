@@ -78,10 +78,11 @@ bool setup_cpu_c1e(bool* was_on, bool* on)
     return false;
 }
 
-bool setup_idle(u32* hint)
+bool setup_idle(u32* hint, u32* mid)
 {
     /* WFI, the only idle there is here without PSCI's CPU_SUSPEND. */
     *hint = 0;
+    *mid = 0;
     return false;
 }
 
@@ -90,11 +91,11 @@ bool idle_masked()
     return false;
 }
 
-void cpu_idle_masked(bool deep)
+void cpu_idle_masked(IdleDepth depth)
 {
     /* Not called: idle_masked() is false. WFI ends on a pending interrupt
        with interrupts masked too, so it would be right if it were. */
-    (void)deep;
+    (void)depth;
     cpu_halt();
 }
 
