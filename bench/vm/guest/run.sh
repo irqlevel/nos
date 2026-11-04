@@ -134,6 +134,21 @@ fi
 
 fi
 
+# pipe-long: perf's pipe alone for about a minute, so that a trace window the
+# host takes after this step's mark lands in it -- perf-bench's own runs of it
+# last 8 s each, between its other benchmarks. Only when named in ONLY: no
+# whole run takes it.
+if [ -n "$ONLY" ] && want pipe-long; then
+step pipe-long
+PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | sort -V | tail -1)
+if [ -n "$PERF" ]; then
+    timeout 300 $PERF bench sched pipe -l "$(d 8000000 400000)" > $OUT/perf-pipe-long.txt 2>&1
+    say perf_pipe_long "$(awk '/usecs\/op/ {print $1}' $OUT/perf-pipe-long.txt)" us/op
+else
+    say perf_pipe_long FAILED no perf under /usr/lib/linux-tools
+fi
+fi
+
 if want cyclictest; then
 step cyclictest
 timeout 600 cyclictest -m -q -t 4 -a -p 95 -i 1000 -D "$(d 60 5)" > $OUT/cyclictest.txt 2>&1
@@ -147,6 +162,14 @@ F=/var/lib/bench/fio.dat
 SIZE=$(d 2g 256m)
 rm -f $F
 sync
+# layout-trace in ONLY (no step of its own, and in no whole run): a quiet
+# 15 s before the first write and 10 s after it, each marked, for the host
+# to start a trace window in the one and freeze it in the other -- the
+# write lasts under a second.
+if [ -n "$ONLY" ] && want layout-trace; then
+    step layout-ready
+    sleep 15
+fi
 # The file is new: its blocks are taken in the host's image as it is laid
 # out, so the first write is the allocating one; every test after it
 # reads and writes blocks the image has.
@@ -154,6 +177,10 @@ timeout 900 fio --name=layout --filename=$F --size=$SIZE --rw=write --bs=1m --io
     --ioengine=libaio --direct=1 --end_fsync=1 --output-format=json > $OUT/fio-layout.json 2> $OUT/fio-layout.err
 say fio layout_seqwrite_1m_qd8 "bw_mib=$(jq '.jobs[0].write.bw / 1024 | floor' $OUT/fio-layout.json 2>/dev/null)" \
     "secs=$(jq '.jobs[0].job_runtime / 1000' $OUT/fio-layout.json 2>/dev/null)"
+if [ -n "$ONLY" ] && want layout-trace; then
+    step layout-done
+    sleep 10
+fi
 # fio_job <name> <rw> <bs> <depth> <jobs> [fio options]
 fio_job() {
     local name=$1 rw=$2 bs=$3 qd=$4 jobs=$5 dir

@@ -49,6 +49,13 @@ is how either host knows it is done:
 | pgbench | init at scale 100, read-only and TPC-B at 1, 4, 8 and 16 clients |
 
 `/opt/bench/QUICK` beside it cuts every step short, to check the suite itself.
+`/opt/bench/ONLY` cuts the run to the steps it names (`sysbench-cpu`, `7zip`,
+`openssl`, `sysbench-memory`, `perf-bench`, `cyclictest`, `fio`, `kbuild`,
+`pgbench`) -- `bench-host.sh nos-stage <step>...` writes it -- and takes two
+words that no whole run has: `pipe-long`, perf's pipe alone for about a
+minute, and `layout-trace`, fio's first write marked by a `layout-ready`
+step 15 s before it and a `layout-done` 10 s after it -- each for a trace
+window to land in.
 The image is Ubuntu's cloud image, provisioned once by cloud-init under KVM
 (`guest/provision.sh`: the tools, PostgreSQL, nothing left that wakes by
 itself).
