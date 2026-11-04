@@ -33,7 +33,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::{trace, dma, io, interrupt, pci, softirq};
+use kcore::{klog, dma, io, interrupt, pci, softirq};
 use net::{Frame, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -102,7 +102,7 @@ pub fn init() {
         match pci::find_device_from(PCI_VENDOR_REALTEK, PCI_DEVICE_RTL8168, start) {
             None => break,
             Some((idx, dev)) => {
-                trace!(0, "r8168: found RTL8168 at {:02x}:{:02x}.{} irq={}",
+                klog!(0, "r8168: found RTL8168 at {:02x}:{:02x}.{} irq={}",
                     dev.bus, dev.slot, dev.func, dev.irq_line);
                 init_device(&dev);
                 start = idx + 1;
@@ -118,7 +118,7 @@ pub fn shutdown() {
             dev.quiesce();
         }
     }
-    trace!(0, "r8168: shutdown complete, count={}", count);
+    klog!(0, "r8168: shutdown complete, count={}", count);
 }
 
 /* ================================================================== */
@@ -133,16 +133,16 @@ fn init_device(pci_dev: &pci::PciDevice) {
      * at BAR 2 (type bit = 0).  We only need the MMIO BAR. */
     let bar_phys = find_mmio_bar(pci_dev);
     if bar_phys == 0 {
-        trace!(0, "r8168: no MMIO BAR found, skipping device");
+        klog!(0, "r8168: no MMIO BAR found, skipping device");
         return;
     }
-    trace!(0, "r8168: MMIO BAR at {:#x}", bar_phys);
+    klog!(0, "r8168: MMIO BAR at {:#x}", bar_phys);
 
     /* --- Map MMIO BAR --- */
     let bar_mapping = match dma::PhysMapping::map(bar_phys, BAR_MAP_PAGES) {
         Some(m) => m,
         None => {
-            trace!(0, "r8168: failed to map MMIO BAR");
+            klog!(0, "r8168: failed to map MMIO BAR");
             return;
         }
     };
@@ -150,27 +150,27 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
     /* --- Chip reset --- */
     if !chip_reset(&regs) {
-        trace!(0, "r8168: chip reset timed out");
+        klog!(0, "r8168: chip reset timed out");
         return;
     }
 
     /* --- Read MAC address (stable across reset) --- */
     let mac = read_mac(&regs);
-    trace!(0, "r8168: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+    klog!(0, "r8168: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     /* --- Allocate TX and RX descriptor rings (1 page each = 256 descs) --- */
     let tx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "r8168: TX DMA alloc failed");
+            klog!(0, "r8168: TX DMA alloc failed");
             return;
         }
     };
     let rx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "r8168: RX DMA alloc failed");
+            klog!(0, "r8168: RX DMA alloc failed");
             return;
         }
     };
@@ -178,7 +178,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
         (Some(tx), Some(rx)) => (tx, rx),
         _ => {
-            trace!(0, "r8168: no memory for the rings' bookkeeping");
+            klog!(0, "r8168: no memory for the rings' bookkeeping");
             return;
         }
     };
@@ -188,7 +188,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         match Frame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => rx_ring.post(i, frame),
             None => {
-                trace!(0, "r8168: RX frame alloc failed at slot {}", i);
+                klog!(0, "r8168: RX frame alloc failed at slot {}", i);
                 /* Ring is partially filled; stop here.  process_rx refills
                  * empty slots at its loop head once memory is available. */
                 break;
@@ -237,7 +237,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
      * never inflated by failed initialisations. */
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
-        trace!(0, "r8168: too many devices (max {})", MAX_DEVICES);
+        klog!(0, "r8168: too many devices (max {})", MAX_DEVICES);
         return;
     }
     let mut name_buf = [0u8; 16];
@@ -260,12 +260,12 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let irq = match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(i) => i,
         None => {
-            trace!(0, "r8168: failed to register interrupt");
+            klog!(0, "r8168: failed to register interrupt");
             dev.quiesce();
             return;
         }
     };
-    trace!(0, "r8168: IRQ vector={}", irq.vector());
+    klog!(0, "r8168: IRQ vector={}", irq.vector());
     *dev.irq.lock() = Some(irq);
 
     /* --- Enable TX + RX --- */
@@ -276,7 +276,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
     /* --- Register as NetDevice --- */
     if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
-        trace!(0, "r8168: NetDevice registration failed");
+        klog!(0, "r8168: NetDevice registration failed");
         dev.quiesce();
         return;
     }
@@ -285,7 +285,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
     /* The slot is this device's own: init is single-threaded. */
     let _ = DEVICES[idx as usize].set(dev);
-    trace!(0, "r8168: registered as {} (irq={})", name, pci_dev.irq_line);
+    klog!(0, "r8168: registered as {} (irq={})", name, pci_dev.irq_line);
 }
 
 /* ================================================================== */
@@ -385,11 +385,11 @@ fn isr(dev: &'static R8168Device) {
         regs.write16(INTR_STATUS, status);
 
         if status & ISR_SYS_ERR != 0 {
-            trace!(0, "r8168: fatal PCI system error in ISR");
+            klog!(0, "r8168: fatal PCI system error in ISR");
         }
 
         if status & ISR_TER != 0 {
-            trace!(0, "r8168: TX error in ISR");
+            klog!(0, "r8168: TX error in ISR");
         }
 
         /* TX completion: reaping stays in flush_tx (reaping here would race

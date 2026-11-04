@@ -1,6 +1,6 @@
 #![no_std]
 
-pub mod trace;
+pub mod klog;
 pub mod alloc;
 pub mod panic;
 pub mod time;
@@ -28,3 +28,4 @@ pub mod cmd;
 pub mod mgmt;
 pub mod system;
 pub mod fs;
+pub mod trace;

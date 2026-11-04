@@ -14,7 +14,7 @@
 #include <lib/stdlib.h>
 #include <lib/printer.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/parameters.h>
 #include <kernel/elf.h>
 #include <drivers/serial.h>
@@ -72,7 +72,7 @@ void setup_memory_types()
 
     if (!cpu_has_pat())
     {
-        trace(0, "PAT: not supported, MMIO stays uncached");
+        klog(0, "PAT: not supported, MMIO stays uncached");
         return;
     }
 
@@ -90,7 +90,7 @@ void setup_memory_types()
 
     write_combining_ready = true;
 
-    trace(0, "PAT: 0x%lX, entry %lu = WC", (ulong)pat, (ulong)WC_ENTRY);
+    klog(0, "PAT: 0x%lX, entry %lu = WC", (ulong)pat, (ulong)WC_ENTRY);
 }
 
 bool is_write_combining_available()
@@ -567,7 +567,7 @@ void run_on_stack(ulong stack_top, void (*fn)(void*), void* ctx)
         "callq *%0\n\t"
         :: "a"(fn), "r"(top), "D"(ctx)
         : "memory");
-    trace(0, "run_on_stack: fn returned");
+    klog(0, "run_on_stack: fn returned");
     while (1)
         cpu_halt();
 }
@@ -640,7 +640,7 @@ void console_panic_write(const char *msg)
 
 void power_off()
 {
-    trace(0, "ACPI shutdown");
+    klog(0, "ACPI shutdown");
 
     /* Try PM1a_CNT from FADT with SLP_TYP=5 (S5) | SLP_EN */
     ulong pm1a = kernel::Acpi::get_instance().get_pm1a_cnt_port();
@@ -662,7 +662,7 @@ void power_off()
 
 void reset()
 {
-    trace(0, "Reboot");
+    klog(0, "Reboot");
     reset_now();
 }
 

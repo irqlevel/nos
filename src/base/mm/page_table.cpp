@@ -1,7 +1,7 @@
 #include "page_table.h"
 #include "memory_map.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
 #include <hal/mmu.h>
@@ -26,7 +26,7 @@ BuiltinPageTable::BuiltinPageTable()
     stdlib::mem_set(&p2_kernel_page_[0], 0, sizeof(p2_kernel_page_));
     stdlib::mem_set(&p2_user_page_[0], 0, sizeof(p2_user_page_));
 
-    trace(0, "PageTable 0x%p p4_page_ 0x%p", this, &p4_page_);
+    klog(0, "PageTable 0x%p p4_page_ 0x%p", this, &p4_page_);
 }
 
 ulong BuiltinPageTable::virt_to_phys(ulong virt_addr)
@@ -73,7 +73,7 @@ PageTable::PageTable()
     , huge_pool_free_count_(0)
     , huge_pool_hint_(0)
 {
-    trace(0, "PageTable 0x%p", this);
+    klog(0, "PageTable 0x%p", this);
     for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
     {
         tmp_map_page_array_[i] = nullptr;
@@ -132,12 +132,12 @@ bool PageTable::get_free_pages(ulong exclude_limit)
         if (mem_end > builtin_map_limit)
             mem_end = builtin_map_limit;
 
-        trace(PAGE_ALLOCATOR_LL, "Phy mem_start 0x%lX mem_end 0x%lX", mem_start, mem_end);
+        klog(PAGE_ALLOCATOR_LL, "Phy mem_start 0x%lX mem_end 0x%lX", mem_start, mem_end);
 
         if (mem_start >= mem_end)
             continue;
 
-        trace(PAGE_ALLOCATOR_LL, "get_free_pages: region 0x%lX-0x%lX", mem_start, mem_end);
+        klog(PAGE_ALLOCATOR_LL, "get_free_pages: region 0x%lX-0x%lX", mem_start, mem_end);
 
         ulong address = mem_start;
         while (address < mem_end)
@@ -165,7 +165,7 @@ bool PageTable::get_free_pages(ulong exclude_limit)
 
                 if (total_pages_count_ >= next_progress)
                 {
-                    trace(0, "mm: free list, %lu of %lu MiB",
+                    klog(0, "mm: free list, %lu of %lu MiB",
                         (total_pages_count_ * consts::PAGE_SIZE) / consts::MB, usable_mib);
                     next_progress += progress_pages;
                 }
@@ -190,10 +190,10 @@ bool PageTable::get_free_pages(ulong exclude_limit)
                 *head = address;
             }
         }
-        trace(PAGE_ALLOCATOR_LL, "get_free_pages: inner loop done, total %lu", total_pages_count_);
+        klog(PAGE_ALLOCATOR_LL, "get_free_pages: inner loop done, total %lu", total_pages_count_);
     }
 
-    trace(PAGE_ALLOCATOR_LL, "get_free_pages done, highest_phy_addr_ 0x%lX TotalPages %lu",
+    klog(PAGE_ALLOCATOR_LL, "get_free_pages done, highest_phy_addr_ 0x%lX TotalPages %lu",
         highest_phy_addr_, total_pages_count_);
 
     /* Say plainly how much of the machine's RAM the kernel actually took.
@@ -203,12 +203,12 @@ bool PageTable::get_free_pages(ulong exclude_limit)
     ulong usable = mmap.get_usable_ram_bytes();
     ulong unreachable = mmap.get_usable_ram_bytes_above(builtin_map_limit);
 
-    trace(0, "mm: %lu MiB usable RAM reported, %lu MiB reachable (%lu pages)",
+    klog(0, "mm: %lu MiB usable RAM reported, %lu MiB reachable (%lu pages)",
         usable / consts::MB, (total_pages_count_ * consts::PAGE_SIZE) / consts::MB,
         total_pages_count_);
 
     if (unreachable != 0)
-        trace(0, "mm: %lu MiB of it is above the bootstrap map at 0x%lX and is not used",
+        klog(0, "mm: %lu MiB of it is above the bootstrap map at 0x%lX and is not used",
             unreachable / consts::MB, builtin_map_limit);
 
     return true;
@@ -273,7 +273,7 @@ void PageTable::drain_early_free_list()
 
         if (free_pages_count_ >= next_progress)
         {
-            trace(0, "mm: %lu MiB onto the free list",
+            klog(0, "mm: %lu MiB onto the free list",
                 (free_pages_count_ * consts::PAGE_SIZE) / consts::MB);
             next_progress += progress_pages;
         }
@@ -398,7 +398,7 @@ bool PageTable::setup_page(ulong virt_addr, ulong phy_addr, bool executable)
         root_ = get_free_page();
         if (!root_)
             return false;
-        trace(0, "Root 0x%lX", root_);
+        klog(0, "Root 0x%lX", root_);
     }
 
     PtePage* l4_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(root_);
@@ -440,7 +440,7 @@ bool PageTable::setup_page(ulong virt_addr, ulong phy_addr, bool executable)
     PtePage* l1_page = (PtePage*)BuiltinPageTable::get_instance().phys_to_virt(l2_entry->address());
     Pte *l1_entry = &l1_page->entry[l1_index];
 
-    trace(5, "va 0x%lX pha 0x%lX l4 %lu(0x%p) l3 %lu(0x%p) l2 %lu(0x%p) l1 %lu(0x%p)",
+    klog(5, "va 0x%lX pha 0x%lX l4 %lu(0x%p) l3 %lu(0x%p) l2 %lu(0x%p) l1 %lu(0x%p)",
         virt_addr, phy_addr, l4_index, l4_entry, l3_index, l3_entry, l2_index, l2_entry, l1_index, l1_entry);
 
     if (l1_entry->present())
@@ -652,7 +652,7 @@ Page* PageTable::get_page(ulong phy_addr)
 
 bool PageTable::setup()
 {
-    trace(0, "PageTable setup");
+    klog(0, "PageTable setup");
 
     auto& mmap = MemoryMap::get_instance();
     auto& bpt = BuiltinPageTable::get_instance();
@@ -681,7 +681,7 @@ bool PageTable::setup()
         stdlib::round_up(bpt.virt_to_phys(page_array_limit), HUGE_PAGE_SIZE));
     if (page_array_phys_ == 0)
     {
-        trace(0, "mm: no %lu MiB contiguous window for page_array_",
+        klog(0, "mm: no %lu MiB contiguous window for page_array_",
             page_array_bytes / consts::MB);
         return false;
     }
@@ -690,11 +690,11 @@ bool PageTable::setup()
        skips any page a reserved region covers. */
     if (!mmap.add_region(page_array_phys_, page_array_bytes, MemoryMap::RESERVED_TYPE))
     {
-        trace(0, "mm: no room in the memory map to reserve page_array_");
+        klog(0, "mm: no room in the memory map to reserve page_array_");
         return false;
     }
 
-    trace(0, "mm: page_array_ %lu MiB at phys 0x%lX, %lu huge pages",
+    klog(0, "mm: page_array_ %lu MiB at phys 0x%lX, %lu huge pages",
         page_array_bytes / consts::MB, page_array_phys_, page_array_bytes / HUGE_PAGE_SIZE);
 
     if (!get_free_pages(bpt.virt_to_phys(page_array_limit)))
@@ -707,12 +707,12 @@ bool PageTable::setup()
            it into text RX / rodata RO+NX / data RW+NX. */
         if (!setup_page(address, BuiltinPageTable::get_instance().virt_to_phys(address), true))
         {
-            trace(0, "can't setup page");
+            klog(0, "can't setup page");
             return false;
         }
     }
 
-    trace(0, "tmp_map_start_ 0x%lX", tmp_map_start_);
+    klog(0, "tmp_map_start_ 0x%lX", tmp_map_start_);
     for (size_t i = 0; i < TMP_MAP_PAGE_COUNT; i++)
     {
         if (!setup_page(tmp_map_start_ + i * consts::PAGE_SIZE, 0, false))
@@ -733,15 +733,15 @@ bool PageTable::setup()
     if (!setup_page(0, 0, false))
         return false;
 
-    trace(0, "page_array_ setup, highestPhyAddr 0x%lX", highest_phy_addr_);
+    klog(0, "page_array_ setup, highestPhyAddr 0x%lX", highest_phy_addr_);
 
-    trace(0, "page_array_ setup, page_array 0x%p page_array_limit 0x%lX", page_array_, page_array_limit);
+    klog(0, "page_array_ setup, page_array 0x%p page_array_limit 0x%lX", page_array_, page_array_limit);
 
     for (ulong offset = 0; offset < page_array_bytes; offset += HUGE_PAGE_SIZE)
     {
         if (!setup_huge_page((ulong)page_array_ + offset, page_array_phys_ + offset))
         {
-            trace(0, "mm: can't map page_array_ at 0x%lX", (ulong)page_array_ + offset);
+            klog(0, "mm: can't map page_array_ at 0x%lX", (ulong)page_array_ + offset);
             return false;
         }
     }
@@ -769,7 +769,7 @@ bool PageTable::setup()
 
     page_array_count_ = page_array_count;
 
-    trace(0, "page_array_ setup done, count %lu", page_array_count_);
+    klog(0, "page_array_ setup done, count %lu", page_array_count_);
     return true;
 }
 
@@ -788,7 +788,7 @@ bool PageTable::setup_free_pages_list()
         excluded_pages_ = 0;
     }
 
-    trace(0, "free_pages_count_ %lu", free_pages_count_);
+    klog(0, "free_pages_count_ %lu", free_pages_count_);
     return true;
 }
 
@@ -1006,13 +1006,13 @@ Page* PageTable::alloc_contiguous_pages(ulong count)
         }
 
         if (examined > LONG_SEARCH_ENTRIES)
-            trace(0, "alloc_contiguous_pages: %lu pages found after %lu entries",
+            klog(0, "alloc_contiguous_pages: %lu pages found after %lu entries",
                 count, examined);
 
         return first;
     }
 
-    trace(0, "alloc_contiguous_pages: no run of %lu pages in %lu entries",
+    klog(0, "alloc_contiguous_pages: no run of %lu pages in %lu entries",
         count, examined);
     return nullptr;
 }
@@ -1138,7 +1138,7 @@ ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
     }
     huge_pool_free_count_ = huge_pool_count_;
     /* Said either way: a pool cut short is guests that will not start. */
-    trace(0, "mm: hugepages: %lu 2MiB blocks reserved (%lu MiB) of %lu asked, %lu MiB left free",
+    klog(0, "mm: hugepages: %lu 2MiB blocks reserved (%lu MiB) of %lu asked, %lu MiB left free",
         huge_pool_count_, huge_pool_count_ * HUGE_FRAME_SIZE / consts::MB, want,
         free_pages_count_ * consts::PAGE_SIZE / consts::MB);
     return huge_pool_count_;

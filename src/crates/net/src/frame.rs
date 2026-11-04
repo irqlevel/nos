@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use kcore::once::Once;
 use kcore::percpu::{ConstInit, CpuLocal, LocalCounter, PerCpu};
 use kcore::ring::LocklessRing;
-use kcore::trace;
+use kcore::klog;
 
 /// Data bytes per frame. Two kilobytes covers a 1500-byte MTU with room for
 /// the headers a driver prepends, and keeps the whole frame inside one page.
@@ -463,7 +463,7 @@ impl FramePool {
         let ring = match LocklessRing::new(capacity) {
             Some(ring) => ring,
             None => {
-                trace!(0, "netpool: no ring of {} cells", capacity);
+                klog!(0, "netpool: no ring of {} cells", capacity);
                 return false;
             }
         };
@@ -482,7 +482,7 @@ impl FramePool {
         }
 
         if built == 0 {
-            trace!(0, "netpool: not one frame could be built");
+            klog!(0, "netpool: not one frame could be built");
             return false;
         }
 
@@ -493,7 +493,7 @@ impl FramePool {
             return false;
         }
 
-        trace!(0, "netpool: {} frames of {} bytes, ring capacity {}, {} KiB",
+        klog!(0, "netpool: {} frames of {} bytes, ring capacity {}, {} KiB",
             built, FRAME_CAPACITY, capacity,
             built * (core::mem::size_of::<RawFrame>() + FRAME_CAPACITY) / 1024);
         true

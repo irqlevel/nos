@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::{dma, interrupt, io, msix, pci, softirq, trace};
+use kcore::{dma, interrupt, io, msix, pci, softirq, klog};
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
@@ -152,7 +152,7 @@ pub fn init() {
     match Command::register("nicdump", "nicdump - r8125 chip and ring state", dump) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "r8125: cannot register the nicdump command"),
+        Err(_) => klog!(0, "r8125: cannot register the nicdump command"),
     }
 
     let mut start: usize = 0;
@@ -160,7 +160,7 @@ pub fn init() {
         match pci::find_device_from(PCI_VENDOR_REALTEK, PCI_DEVICE_RTL8125, start) {
             None => break,
             Some((idx, dev)) => {
-                trace!(
+                klog!(
                     0,
                     "r8125: found RTL8125 at {:02x}:{:02x}.{} rev {:02x} irq={}",
                     dev.bus,
@@ -183,7 +183,7 @@ pub fn shutdown() {
             dev.quiesce();
         }
     }
-    trace!(0, "r8125: shutdown complete, count={}", count);
+    klog!(0, "r8125: shutdown complete, count={}", count);
 }
 
 /* ================================================================== */
@@ -197,7 +197,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
      * only advanced once registration has succeeded. */
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
-        trace!(0, "r8125: too many devices (max {})", MAX_DEVICES);
+        klog!(0, "r8125: too many devices (max {})", MAX_DEVICES);
         return;
     }
 
@@ -205,14 +205,14 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
     let bar_phys = find_mmio_bar(pci_dev);
     if bar_phys == 0 {
-        trace!(0, "r8125: no MMIO BAR found, skipping device");
+        klog!(0, "r8125: no MMIO BAR found, skipping device");
         return;
     }
 
     let bar_mapping = match dma::PhysMapping::map(bar_phys, BAR_MAP_PAGES) {
         Some(m) => m,
         None => {
-            trace!(0, "r8125: failed to map MMIO BAR at {:#x}", bar_phys);
+            klog!(0, "r8125: failed to map MMIO BAR at {:#x}", bar_phys);
             return;
         }
     };
@@ -225,11 +225,11 @@ fn init_device(pci_dev: &pci::PciDevice) {
         None => {
             /* A revision newer than we know about is far more likely to be
              * 8125B-shaped than to need a different driver.  Say so and go on. */
-            trace!(0, "r8125: unknown XID {:#05x}, driving it as an RTL8125B", xid);
+            klog!(0, "r8125: unknown XID {:#05x}, driving it as an RTL8125B", xid);
             Chip::B
         }
     };
-    trace!(
+    klog!(
         0,
         "r8125: {} (xid {:#05x}) MMIO BAR at {:#x}",
         chip.as_str(),
@@ -240,18 +240,18 @@ fn init_device(pci_dev: &pci::PciDevice) {
     /* --- Take the MAC away from firmware, then soft-reset it --- */
     hw::hw_init(&regs, chip);
     if !hw::reset(&regs) {
-        trace!(0, "r8125: chip reset timed out");
+        klog!(0, "r8125: chip reset timed out");
         return;
     }
 
     let mac = match read_mac(&regs) {
         Some(m) => m,
         None => {
-            trace!(0, "r8125: no valid station address in the eFuse copy or the RAR");
+            klog!(0, "r8125: no valid station address in the eFuse copy or the RAR");
             return;
         }
     };
-    trace!(
+    klog!(
         0,
         "r8125: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0],
@@ -266,14 +266,14 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let tx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "r8125: TX ring alloc failed");
+            klog!(0, "r8125: TX ring alloc failed");
             return;
         }
     };
     let rx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
-            trace!(0, "r8125: RX ring alloc failed");
+            klog!(0, "r8125: RX ring alloc failed");
             return;
         }
     };
@@ -281,7 +281,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
         (Some(tx), Some(rx)) => (tx, rx),
         _ => {
-            trace!(0, "r8125: no memory for the rings' bookkeeping");
+            klog!(0, "r8125: no memory for the rings' bookkeeping");
             return;
         }
     };
@@ -290,7 +290,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         match Frame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => rx_ring.post(i, frame),
             None => {
-                trace!(0, "r8125: RX frame alloc failed at slot {}", i);
+                klog!(0, "r8125: RX frame alloc failed at slot {}", i);
                 /* Partially filled ring is fine: process_rx reposts empty
                  * slots at its loop head once memory frees up. */
                 break;
@@ -383,7 +383,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     }));
 
     if !attach_interrupt(pci_dev, dev) {
-        trace!(0, "r8125: no interrupt could be registered");
+        klog!(0, "r8125: no interrupt could be registered");
         dev.quiesce();
         return;
     }
@@ -394,7 +394,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     trace_link(&dev.regs);
 
     if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
-        trace!(0, "r8125: NetDevice registration failed");
+        klog!(0, "r8125: NetDevice registration failed");
         dev.quiesce();
         return;
     }
@@ -403,7 +403,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
     /* The slot is this device's own: init is single-threaded. */
     let _ = DEVICES[idx as usize].set(dev);
-    trace!(0, "r8125: registered as {}", name);
+    klog!(0, "r8125: registered as {}", name);
 }
 
 /* ================================================================== */
@@ -418,7 +418,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8125Device) -> bool
     if let Some(table) = msix::MsixTable::new(pci_dev) {
         match msix::MsixInterrupt::register_for(&table, 0, dev, isr) {
             Some(irq) => {
-                trace!(
+                klog!(
                     0,
                     "r8125: MSI-X vector={} ({} entries available)",
                     irq.vector(),
@@ -432,7 +432,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8125Device) -> bool
                 return true;
             }
             None => {
-                trace!(0, "r8125: MSI-X entry 0 unavailable, falling back to INTx");
+                klog!(0, "r8125: MSI-X entry 0 unavailable, falling back to INTx");
                 /* `table` is dropped here.  enable_vector never ran, so MSI-X
                  * was never enabled in config space and INTx is still live. */
             }
@@ -449,7 +449,7 @@ fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8125Device) -> bool
 
     match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(irq) => {
-            trace!(0, "r8125: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
+            klog!(0, "r8125: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
             *dev.irqs.lock() = Some(Irqs {
                 _msix_irq: None,
                 _msix_table: None,
@@ -515,7 +515,7 @@ fn read_mac(regs: &io::MmioRegion) -> Option<[u8; 6]> {
     if is_valid_mac(&mac) {
         return Some(mac);
     }
-    trace!(0, "r8125: eFuse address copy invalid, trying the RAR");
+    klog!(0, "r8125: eFuse address copy invalid, trying the RAR");
 
     for i in 0..6 {
         mac[i] = regs.read8(IDR0 + i);
@@ -549,7 +549,7 @@ fn write_mac(regs: &io::MmioRegion, mac: &[u8; 6]) {
  * on every link-change interrupt. */
 fn trace_link(regs: &io::MmioRegion) {
     let phy = regs.read8(PHY_STATUS);
-    trace!(
+    klog!(
         0,
         "r8125: link {} {} (phy {:#04x})",
         if phy & PHY_LINK_UP != 0 { "up" } else { "down" },
@@ -655,17 +655,17 @@ fn isr(dev: &'static R8125Device) {
         /* Not in INTR_MASK_BITS, but the chip still latches it: a set bit
          * here means a bus error the driver should not silently ignore. */
         if status & ISR_SYS_ERR != 0 {
-            trace!(0, "r8125: fatal PCI system error in ISR");
+            klog!(0, "r8125: fatal PCI system error in ISR");
         }
 
         if status & ISR_TER != 0 {
-            trace!(0, "r8125: TX error in ISR");
+            klog!(0, "r8125: TX error in ISR");
         }
 
         if status & (ISR_RDU | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
             let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
-                trace!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
+                klog!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
                     status, n + 1);
             }
         }

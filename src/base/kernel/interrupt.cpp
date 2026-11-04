@@ -2,7 +2,7 @@
 #include <arch/x86_64/idt.h>
 #include "cpu.h"
 #include "irq_balance.h"
-#include "trace.h"
+#include "klog.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
 #include <hal/irq_stubs.h>
@@ -18,7 +18,7 @@ Interrupt::VectorEntry Interrupt::vectors_[MAX_VECTORS];
 
 void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    trace(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
+    klog(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
         (ulong)irq, (ulong)vector, handler.get_handler_fn());
 
     /* `irq` is a GSI (callers pass acpi.get_gsi_by_irq()). Claiming a GSI or
@@ -30,14 +30,14 @@ void Interrupt::register_handler(InterruptHandler& handler, u8 irq, u8 vector)
         VectorEntry& other = vectors_[v];
         if (other.handler_count > 0 && other.gsi == irq)
         {
-            trace(0, "Register interrupt: gsi 0x%lX already owned by vector 0x%lX, refused",
+            klog(0, "Register interrupt: gsi 0x%lX already owned by vector 0x%lX, refused",
                 (ulong)irq, v);
             return;
         }
     }
     if (vectors_[vector].handler_count > 0)
     {
-        trace(0, "Register interrupt: vector 0x%lX already in use, refused",
+        klog(0, "Register interrupt: vector 0x%lX already in use, refused",
             (ulong)vector);
         return;
     }
@@ -80,7 +80,7 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
                    this GSI. Chaining a level PCI handler onto it would
                    re-program the pin and feed the edge handler phantom
                    interrupts -- refuse loudly instead. */
-                trace(0, "Register level interrupt irq 0x%lX: gsi 0x%lX owned by edge vector 0x%lX, refused",
+                klog(0, "Register level interrupt irq 0x%lX: gsi 0x%lX owned by edge vector 0x%lX, refused",
                     (ulong)irq, (ulong)gsi, v);
                 return;
             }
@@ -88,7 +88,7 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
             /* GSI already registered -- chain this handler onto the existing vector */
             if (ve.handler_count >= MAX_SHARED_HANDLERS)
             {
-                trace(0, "Register level interrupt irq 0x%lX: too many shared handlers", (ulong)irq);
+                klog(0, "Register level interrupt irq 0x%lX: too many shared handlers", (ulong)irq);
                 return;
             }
 
@@ -98,7 +98,7 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
             /* Switch to shared dispatch stub */
             Idt::get_instance().set_descriptor((u8)v, IdtDescriptor::encode(shared_interrupt_stub));
 
-            trace(0, "Register shared level interrupt irq 0x%lX vector 0x%lX handler %lu",
+            klog(0, "Register shared level interrupt irq 0x%lX vector 0x%lX handler %lu",
                 (ulong)irq, (ulong)v, (ulong)ve.handler_count);
 
             handler.on_interrupt_register(irq, (u8)v);
@@ -110,12 +110,12 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
        overwrite another device's IDT entry */
     if (vectors_[vector].handler_count > 0)
     {
-        trace(0, "Register level interrupt irq 0x%lX: vector 0x%lX already in use, refused",
+        klog(0, "Register level interrupt irq 0x%lX: vector 0x%lX already in use, refused",
             (ulong)irq, (ulong)vector);
         return;
     }
 
-    trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p active_high %lu",
+    klog(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p active_high %lu",
         (ulong)irq, (ulong)gsi, (ulong)vector, handler.get_handler_fn(), (ulong)active_high);
 
     ulong cpu = IrqBalance::get_instance().assign_io_apic_irq(gsi);

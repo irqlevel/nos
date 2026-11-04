@@ -1,6 +1,6 @@
 #include "stack_trace.h"
 #include <hal/cpu.h>
-#include "trace.h"
+#include "klog.h"
 #include "task.h"
 
 namespace kernel

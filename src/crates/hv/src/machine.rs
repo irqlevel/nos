@@ -390,6 +390,6 @@ impl Drop for Machine {
             }
         }
         drop(cpus);
-        kcore::trace!(0, "hv: cpu mask 0x{:x} stays in VMX operation: its pages are kept, never freed", left.busy);
+        kcore::klog!(0, "hv: cpu mask 0x{:x} stays in VMX operation: its pages are kept, never freed", left.busy);
     }
 }

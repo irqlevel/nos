@@ -5,7 +5,7 @@
 #include <include/const.h>
 #include <arch/x86_64/idt.h>
 #include <arch/x86_64/idt_descriptor.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 
 #include <arch/x86_64/lapic.h>
 #include <kernel/irq_balance.h>
@@ -77,7 +77,7 @@ bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_
 
     if (bar_val & 1)
     {
-        trace(0, "MsixTable: BAR%lu is I/O, not MMIO", (ulong)bar);
+        klog(0, "MsixTable: BAR%lu is I/O, not MMIO", (ulong)bar);
         return false;
     }
 
@@ -114,18 +114,18 @@ bool MsixTable::map_bar_for_table(Pci::DeviceInfo* dev, u8 bar, ulong offset_in_
 
     if (offset_in_bar + table_bytes > bar_size)
     {
-        trace(0, "MsixTable: table past BAR end");
+        klog(0, "MsixTable: table past BAR end");
         return false;
     }
 
-    trace(0, "MsixTable: BAR%lu phys 0x%lX size 0x%lX table off 0x%lX",
+    klog(0, "MsixTable: BAR%lu phys 0x%lX size 0x%lX table off 0x%lX",
         (ulong)bar, phys_addr, bar_size, offset_in_bar);
 
     auto& pt = mm::PageTable::get_instance();
     ulong va = pt.map_mmio_region(phys_addr, bar_size);
     if (va == 0)
     {
-        trace(0, "MsixTable: map_mmio_region failed");
+        klog(0, "MsixTable: map_mmio_region failed");
         return false;
     }
 
@@ -144,7 +144,7 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     u8 cap = pci.find_capability(dev->bus, dev->slot, dev->func, PCI_CAP_ID_MSIX);
     if (cap == 0)
     {
-        trace(0, "MsixTable: no MSI-X capability");
+        klog(0, "MsixTable: no MSI-X capability");
         table_ = nullptr;
         count_ = 0;
         cap_offset_ = 0;
@@ -176,7 +176,7 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     {
         table_ = (volatile u8*)(mapped_bars[bir] + off_in_bar);
         mapped = true;
-        trace(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
+        klog(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
             (ulong)bir, mapped_bars[bir], off_in_bar);
     }
 
@@ -192,7 +192,7 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     for (u16 i = 0; i < count_; i++)
         mask(i);
 
-    trace(0, "MsixTable: %lu entries cap 0x%lX", (ulong)count_, (ulong)cap);
+    klog(0, "MsixTable: %lu entries cap 0x%lX", (ulong)count_, (ulong)cap);
     return true;
 }
 
@@ -228,7 +228,7 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
     u8 vector = alloc_vector();
     if (vector == 0)
     {
-        trace(0, "MsixTable: out of vectors");
+        klog(0, "MsixTable: out of vectors");
         return 0;
     }
 

@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering
 use crate::nic::Nic;
 use kcore::sync::IrqSpinLock;
 use kcore::task::TaskHandle;
-use kcore::trace;
+use kcore::klog;
 
 use crate::abi;
 use crate::udp;
@@ -350,7 +350,7 @@ impl Netconsole {
         });
 
         self.enabled.store(true, Ordering::Release);
-        trace!(0, "netconsole: capturing for {}.{}.{}.{}:{}, backlog cap {} bytes",
+        klog!(0, "netconsole: capturing for {}.{}.{}.{}:{}, backlog cap {} bytes",
             (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
             port, tail_keep);
         true
@@ -381,10 +381,10 @@ impl Netconsole {
          * middle, and nothing about it says so. */
         let dropped = self.log.lock().ring.dropped;
         if dropped != 0 {
-            trace!(0, "netconsole: {} lines were dropped before the link came up", dropped);
+            klog!(0, "netconsole: {} lines were dropped before the link came up", dropped);
         }
 
-        trace!(0, "netconsole: started");
+        klog!(0, "netconsole: started");
         true
     }
 
@@ -394,7 +394,7 @@ impl Netconsole {
             /* Said into the ring the drain flushes as it stops, so that the
              * collector can tell a log that ended here from a machine that
              * died: the last line it is sent. */
-            trace!(0, "netconsole: stopping -- the last line sent");
+            klog!(0, "netconsole: stopping -- the last line sent");
             task.request_stop();
             drop(task);
         }
@@ -425,7 +425,7 @@ impl Netconsole {
 
         let text = &text[..text.len().min(MAX_RECORD)];
 
-        if kcore::trace::panic_active() {
+        if kcore::klog::panic_active() {
             self.in_panic(|log| log.ring.append(text));
             return;
         }
@@ -579,7 +579,7 @@ impl Netconsole {
         let len = format_trimmed(&mut msg, trimmed, keep);
         self.log.lock().ring.append(&msg[..len]);
 
-        trace!(0, "netconsole: link up, dropped {} backlog msgs over the {} byte cap",
+        klog!(0, "netconsole: link up, dropped {} backlog msgs over the {} byte cap",
             trimmed, keep);
     }
 

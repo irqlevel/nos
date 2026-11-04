@@ -1,7 +1,7 @@
 #include <kernel/cpu.h>
 #include <kernel/parameters.h>
 #include <kernel/time.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/boot64.h>
 
@@ -33,7 +33,7 @@ bool start_cpu(Cpu& cpu, ulong index, ulong startup_vector)
     static const ulong AP_TIMEOUT_MS = 1000;
     static const ulong AP_POLL_INTERVAL_MS = 1;
 
-    trace(0, "Cpu %lu: INIT+SIPI vector 0x%lX", index, startup_vector);
+    klog(0, "Cpu %lu: INIT+SIPI vector 0x%lX", index, startup_vector);
 
     Lapic::send_init(index);
     busy_wait(INIT_DELAY_MS * consts::NANO_SECS_IN_MS);
@@ -55,7 +55,7 @@ bool start_cpu(Cpu& cpu, ulong index, ulong startup_vector)
         busy_wait(AP_POLL_INTERVAL_MS * consts::NANO_SECS_IN_MS);
     }
 
-    trace(0, "Cpu %lu still not running after %lu ms", index, AP_TIMEOUT_MS);
+    klog(0, "Cpu %lu still not running after %lu ms", index, AP_TIMEOUT_MS);
 
     return false;
 }
@@ -66,7 +66,7 @@ bool CpuTable::start_all()
 {
     ulong startup_code = (ulong)ap_start16;
 
-    trace(0, "Starting cpus, startup_code 0x%lX", startup_code);
+    klog(0, "Starting cpus, startup_code 0x%lX", startup_code);
 
     if (startup_code & (consts::PAGE_SIZE - 1))
         return false;
@@ -87,7 +87,7 @@ bool CpuTable::start_all()
 
         if (max_cpus != 0 && running >= max_cpus)
         {
-            trace(0, "Cpu %lu left parked, maxcpus is %lu", index, max_cpus);
+            klog(0, "Cpu %lu left parked, maxcpus is %lu", index, max_cpus);
             continue;
         }
 
@@ -97,7 +97,7 @@ bool CpuTable::start_all()
         running++;
     }
 
-    trace(0, "Cpus started, %lu running", running);
+    klog(0, "Cpus started, %lu running", running);
 
     return true;
 }

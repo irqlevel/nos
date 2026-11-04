@@ -303,3 +303,60 @@ pub mod cmd {
         }
     }
 }
+
+/// kcore's tracepoints, as hv's sites reach them: the payloads from kcore's
+/// own list (`kcore/src/trace/events.rs`, `crate::trace_events` here),
+/// built as the kernel's sites build them and handed to an `emit` that holds
+/// each to what its description says it holds -- every enumeration's value
+/// one it has a name for, every pad zero. A target says whether the events
+/// are on, from its input, so that the sites build their payloads under the
+/// overflow checks too, from values a guest chose.
+pub mod trace {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub use crate::trace_events::*;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static EMITTED: AtomicU64 = AtomicU64::new(0);
+
+    /// The most a payload is: a ring's slot's (kernel/trace_ring.h).
+    const PAYLOAD_BYTES: usize = 40;
+
+    /// Every event on, or off: the target's to say.
+    pub fn set_on(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    pub fn on<E: Event>() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    pub fn emit<E: Event>(event: &E) {
+        let bytes = crate::pod::bytes_of(event);
+        invariant!(bytes.len() <= PAYLOAD_BYTES, "{}'s payload is {} bytes, past a slot's {}", E::NAME, bytes.len(),
+                   PAYLOAD_BYTES);
+        for f in E::FIELDS {
+            let Some(field) = bytes.get(f.offset..f.offset + f.size) else {
+                panic!("invariant: {}'s field {} past its payload", E::NAME, f.name);
+            };
+            if f.name.starts_with('_') {
+                invariant!(field.iter().all(|&b| b == 0), "{}'s {} is not zero: {:?}", E::NAME, f.name, field);
+            }
+            if !f.names.is_empty() {
+                invariant!(f.size == 1 && usize::from(field[0]) < f.names.len(),
+                           "{}'s {} is {:?}, which none of its {} names is", E::NAME, f.name, field, f.names.len());
+            }
+        }
+        EMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The running task's pid: a vCPU's thread's, as far as a record cares.
+    pub fn pid() -> u32 {
+        1
+    }
+
+    /// Records emitted, for `HV_FUZZ_STATS`.
+    pub fn emitted() -> u64 {
+        EMITTED.load(Ordering::Relaxed)
+    }
+}

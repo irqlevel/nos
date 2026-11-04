@@ -46,6 +46,7 @@ use kcore::fs::{File, FileId, Image, ImageQueue, Started};
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
+use kcore::trace::DiskHow;
 
 /// Whoever runs a guest's vCPU, told that one of its disks has served
 /// something for it: from the disk's task, while the vCPU may be halted --
@@ -189,10 +190,12 @@ struct Pipe {
 }
 
 /// What the disk's task starts from: the pipe, and the image's queue -- its
-/// calls the task's alone; the vCPU only lends its buffers and wakes it.
+/// calls the task's alone; the vCPU only lends its buffers and wakes it --
+/// and the disk's number among its guest's, which its records say.
 struct Serve {
     pipe: Arc<Pipe>,
     queue: Arc<ImageQueue>,
+    disk: u8,
 }
 
 /// How long the task sleeps with nothing to do before it looks again: a
@@ -219,9 +222,9 @@ pub struct FileDisk {
 
 impl FileDisk {
     /// The image at `path` -- read-only to the guest with `read_only` --
-    /// served for `runner`'s guest by a task called after it and the disk's
-    /// `letter`.
-    pub fn open(path: &str, read_only: bool, runner: &Runner, letter: char) -> Result<FileDisk, String> {
+    /// served for `runner`'s guest as its disk `index` (vda 0), by a task
+    /// called after it and the disk's letter.
+    pub fn open(path: &str, read_only: bool, runner: &Runner, index: u8) -> Result<FileDisk, String> {
         /* Which file it is, first: the claim says whose guest's disk has
          * it, where the hold below would only refuse. */
         let id = File::open(path, false).map_err(|e| alloc::format!("{}: {}", path, e))?
@@ -263,10 +266,11 @@ impl FileDisk {
         };
         let pipe = Arc::new(Pipe { requests, done: AtomicUsize::new(0), wake: runner.wake.clone() });
 
+        let letter = char::from(b'a'.saturating_add(index));
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
         let queue = Arc::new(queue);
         let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu,
-                                              Serve { pipe: pipe.clone(), queue: queue.clone() }, serve)
+                                              Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index }, serve)
             .ok_or_else(|| alloc::format!("{}: no task to serve it", path))?;
         Ok(FileDisk { pipe, queue, size, read_only, discard_sectors, task: Some(task), _claim: claim })
     }
@@ -326,16 +330,18 @@ impl Drop for FileDisk {
 /// -- a read's or a write's with the image's queue (`ImageQueue::start`), a
 /// flush, a discard or a write of zeros served then and there -- and each
 /// given back when it is done, every lot of them with a wake of the vCPU.
-/// Any call that fails is an error the guest is told of.
+/// Any call that fails is an error the guest is told of. Each request's
+/// `disk_start` is recorded as it is picked up, and its `disk_done` as it is
+/// done -- before it goes back the other way.
 fn serve(start: Serve) {
-    let Serve { pipe, queue } = start;
+    let Serve { pipe, queue, disk } = start;
     let (mut new, mut finished, mut flying) = (Vec::new(), Vec::new(), Vec::new());
     if new.try_reserve_exact(blk::IN_FLIGHT).is_err() || finished.try_reserve_exact(blk::IN_FLIGHT).is_err()
         || flying.try_reserve_exact(blk::IN_FLIGHT).is_err()
     {
         /* Nothing served: the guest's requests stay with the device, and
          * its disk goes quiet -- said, for whoever looks. */
-        kcore::trace!(0, "hv: a disk's task has no memory for its requests");
+        kcore::klog!(0, "hv: a disk's task has no memory for its requests");
         return;
     }
     flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
@@ -350,24 +356,27 @@ fn serve(start: Serve) {
         }
         let mut owed = false;
         for mut req in new.drain(..) {
-            match req.op() {
+            let (slot, op) = (req.slot(), req.op());
+            hv::tp::disk_start(disk, slot, op, req.offset(), req.len());
+            match op {
                 Op::Read | Op::Write => {
-                    let slot = req.slot();
-                    match queue.start(slot, req.op() == Op::Write, req.offset(), req.len()) {
+                    match queue.start(slot, op == Op::Write, req.offset(), req.len()) {
                         Ok(Started::InFlight) if flying.get(slot).is_some_and(Option::is_none) => {
                             owed = true;
                             flying[slot] = Some(req);
                         }
                         Ok(Started::InFlight) => {
                             /* A slot the device has two requests of: never. */
-                            kcore::trace!(0, "hv: a disk's slot {} started twice", slot);
+                            kcore::klog!(0, "hv: a disk's slot {} started twice", slot);
                         }
                         Ok(Started::Done) => {
                             req.done(true);
+                            hv::tp::disk_done(disk, slot, op, DiskHow::AtOnce, true);
                             finished.push(req);
                         }
                         Err(_) => {
                             req.done(false);
+                            hv::tp::disk_done(disk, slot, op, DiskHow::AtOnce, false);
                             finished.push(req);
                         }
                     }
@@ -378,7 +387,8 @@ fn serve(start: Serve) {
                     if core::mem::take(&mut owed) {
                         queue.kick();
                     }
-                    serve_one(queue.image(), &mut req);
+                    let ok = serve_one(queue.image(), &mut req);
+                    hv::tp::disk_done(disk, slot, op, DiskHow::Command, ok);
                     finished.push(req);
                 }
             }
@@ -389,9 +399,10 @@ fn serve(start: Serve) {
         queue.reap(|slot, ok| match flying.get_mut(slot).and_then(Option::take) {
             Some(mut req) => {
                 req.done(ok);
+                hv::tp::disk_done(disk, slot, req.op(), DiskHow::Async, ok);
                 finished.push(req);
             }
-            None => kcore::trace!(0, "hv: a disk's image gave back slot {}, which it was not given", slot),
+            None => kcore::klog!(0, "hv: a disk's image gave back slot {}, which it was not given", slot),
         });
         if finished.is_empty() {
             /* A request handed over wakes it, and so does a command done --
@@ -410,8 +421,9 @@ fn serve(start: Serve) {
     }
 }
 
-/// A request that is not a read or a write, through the image.
-fn serve_one(image: &Image, req: &mut Request) {
+/// A request that is not a read or a write, through the image: whether it
+/// went well.
+fn serve_one(image: &Image, req: &mut Request) -> bool {
     let ok = match req.op() {
         /* Never here: the queue's. */
         Op::Read | Op::Write => false,
@@ -421,4 +433,5 @@ fn serve_one(image: &Image, req: &mut Request) {
         Op::WriteZeroes => req.ranges().all(|r| image.write_zeroes(r.offset, r.len, r.unmap).is_ok()),
     };
     req.done(ok);
+    ok
 }

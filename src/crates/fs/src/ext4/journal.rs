@@ -35,8 +35,9 @@ use extfmt::jbd2::{self, set_be32, set_be64, JournalSuper};
 use extfmt::recovery::{self, Plan};
 use extfmt::sb::Super;
 use extfmt::Map;
-use kcore::time::wall_clock_secs;
-use kcore::trace;
+use kcore::time::{boot_time_ns, wall_clock_secs};
+use kcore::trace::{self, Ext4Commit};
+use kcore::klog;
 
 use super::cache::Cache;
 use super::io::Io;
@@ -205,11 +206,11 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
     if jsb.start() != 0 && !needs {
         /* Linux throws such a log away (`jbd2_journal_wipe`): what is on
          * the disk is the filesystem. */
-        trace!(0, "ext4: the journal holds a log the filesystem does not say needs replaying: read as it is");
+        klog!(0, "ext4: the journal holds a log the filesystem does not say needs replaying: read as it is");
         return Ok(Overlay::new());
     }
     if jsb.errno() != 0 {
-        trace!(0, "ext4: the journal recorded error {}", jsb.errno() as i32);
+        klog!(0, "ext4: the journal recorded error {}", jsb.errno() as i32);
     }
     if jsb.start() == 0 {
         recovery::check_features(&jsb)?;
@@ -217,7 +218,7 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
     }
     let plan = plan_of(io, map, &jsb)?;
     if let Some(t) = plan.failed_commit {
-        trace!(0, "ext4: journal transaction {} was corrupt: read up to it", t);
+        klog!(0, "ext4: journal transaction {} was corrupt: read up to it", t);
     }
     let mut out = Overlay::new();
     for w in plan.writes.values() {
@@ -225,7 +226,7 @@ pub(super) fn overlay(io: &mut Io, map: &JournalMap, sb: &Super) -> Result<Overl
             .ok_or_else(|| format!("a journal copy at journal block {}, past the journal", w.log))?;
         out.insert(w.home, (copy, w.escaped));
     }
-    trace!(0, "ext4: {} transactions in the journal not replayed: read through them, {} blocks", plan.transactions,
+    klog!(0, "ext4: {} transactions in the journal not replayed: read through them, {} blocks", plan.transactions,
         out.len());
     Ok(out)
 }
@@ -317,7 +318,7 @@ impl Journal {
                 return Ok(Opened::ReadOnly(format!("journal transaction {} is corrupt (e2fsck should look)", t)));
             }
             replay(io, &map, &plan)?;
-            trace!(0, "ext4: the journal replayed: {} transactions, {} blocks", plan.transactions,
+            klog!(0, "ext4: the journal replayed: {} transactions, {} blocks", plan.transactions,
                 plan.writes.len());
             next_seq = plan.next_sequence;
             replayed = true;
@@ -387,7 +388,7 @@ impl Journal {
     /// not see.
     pub fn abort(&mut self, io: &mut Io, why: &str) {
         if !self.aborted {
-            trace!(0, "ext4: the journal is aborted: {}; nothing more is written, and the filesystem is left for a \
+            klog!(0, "ext4: the journal is aborted: {}; nothing more is written, and the filesystem is left for a \
                        replay", why);
         }
         self.aborted = true;
@@ -488,15 +489,64 @@ fn write_home(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, restart: bool) 
     true
 }
 
+/// What a commit did, for its `ext4_commit` record: whether it wrote the log
+/// at all, the journal's blocks it took, and the time its checkpoints took
+/// -- measured only while the event is on.
+#[derive(Default)]
+struct CommitStat {
+    timed: bool,
+    wrote: bool,
+    blocks: u32,
+    checkpoint_ns: u64,
+}
+
+/// `checkpoint`, its time added to `stat`'s when it is timed.
+fn checkpoint_timed(io: &mut Io, cache: &mut Cache, jnl: &mut Journal, stat: &mut CommitStat) -> bool {
+    if !stat.timed {
+        return checkpoint(io, cache, jnl);
+    }
+    let began = boot_time_ns();
+    let ok = checkpoint(io, cache, jnl);
+    stat.checkpoint_ns = stat.checkpoint_ns.saturating_add(boot_time_ns().saturating_sub(began));
+    ok
+}
+
+/// Nanoseconds as a trace record's field holds them: `u32::MAX` for that or
+/// more.
+fn ns_field(ns: u64) -> u32 {
+    u32::try_from(ns).unwrap_or(u32::MAX)
+}
+
 impl Txn<'_> {
     /// Into the journal, all of it, and only then into what the reads see:
     /// sealed, its blocks -- revokes, descriptors, copies -- written into
     /// the log, flushed, and the commit block forced to the medium. False
     /// with nothing changed in memory: refused (too big, sealed wrong), or a
-    /// write failed and the journal is aborted.
+    /// write failed and the journal is aborted. A commit that wrote the log,
+    /// or failed, is an `ext4_commit` record; one of nothing is none.
     pub fn commit(mut self) -> bool {
+        let mut stat = CommitStat { timed: trace::on::<Ext4Commit>(), ..CommitStat::default() };
+        let began = if stat.timed { boot_time_ns() } else { 0 };
+        let seq = self.jnl.next_seq;
+        let ok = self.commit_log(&mut stat);
+        if stat.timed && (stat.wrote || !ok) {
+            trace::emit(&Ext4Commit {
+                seq,
+                blocks: stat.blocks,
+                ns: ns_field(boot_time_ns().saturating_sub(began)),
+                checkpoint_ns: ns_field(stat.checkpoint_ns),
+                pid: trace::pid(),
+                ok: u8::from(ok),
+                _pad: [0; 3],
+            });
+        }
+        ok
+    }
+
+    /// `commit`'s work, what it did into `stat`.
+    fn commit_log(&mut self, stat: &mut CommitStat) -> bool {
         if self.jnl.aborted {
-            trace!(0, "ext4: the journal is aborted: nothing is committed");
+            klog!(0, "ext4: the journal is aborted: nothing is committed");
             return false;
         }
         if self.dirty.is_empty() && self.revoke.is_empty() && self.freed.is_empty() {
@@ -517,12 +567,14 @@ impl Txn<'_> {
         let revokes: Vec<u64> = self.revoke.iter().copied().collect();
         let n = self.jnl.blocks_for(bs, copies.len(), revokes.len());
         if n >= self.jnl.ring() as usize {
-            trace!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
+            klog!(0, "ext4: a transaction of {} blocks, more than the journal's {} hold: refused", n, self.jnl.ring());
             return false;
         }
-        if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint(self.io, self.cache, self.jnl) {
+        stat.blocks = u32::try_from(n).unwrap_or(u32::MAX);
+        if n >= (self.jnl.ring() - self.jnl.used) as usize && !checkpoint_timed(self.io, self.cache, self.jnl, stat) {
             return false;
         }
+        stat.wrote = true;
         let seq = self.jnl.next_seq;
         let jnl = &mut *self.jnl;
         let io = &mut *self.io;
@@ -646,7 +698,7 @@ impl Txn<'_> {
         if self.cache.pinned_len() > PIN_MAX || self.jnl.used > self.jnl.ring() / 2 {
             /* Committed whatever comes of it: a checkpoint that fails
              * aborts the journal for the calls after this one. */
-            checkpoint(self.io, self.cache, self.jnl);
+            checkpoint_timed(self.io, self.cache, self.jnl, stat);
         }
         true
     }

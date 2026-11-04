@@ -401,6 +401,25 @@ pub mod x86 {
 
         /// hvarch's own, as it is (`hvarch/src/x86/kick.rs`).
         pub use crate::cpu::kick::Kick;
+
+        /// hvarch's: an entry's world switch as the cycle counter saw it,
+        /// for its `hv_exit` record -- here, as the fuzzer's clock has it.
+        #[derive(Clone, Copy, Default, Debug)]
+        pub struct Run {
+            pub entered: u64,
+            pub exited: u64,
+            pub before: u64,
+        }
+
+        impl Run {
+            pub fn next(&mut self, timed: bool, entered: u64, exited: u64) {
+                if timed {
+                    *self = Run { entered, exited, before: self.exited };
+                } else if self.exited != 0 {
+                    *self = Run::default();
+                }
+            }
+        }
     }
 
     /// hvarch's posted-interrupt descriptor: the same atomics, as the run
@@ -1433,15 +1452,27 @@ pub mod vm {
 
     pub struct Cpu {
         backend: Backend,
+        /// Its number in its guest, and its last entry as the clock saw it:
+        /// what vm.rs's records an exit with.
+        index: u32,
+        last_run: crate::x86::svm::Run,
+        /// The pid its records say its task by, as vm.rs's keeps it.
+        pid: u32,
     }
 
     impl Cpu {
-        pub fn new(machine: &Machine, _memory: &GuestMemory, _exceptions: u32) -> crate::Result<Cpu> {
+        pub fn new(machine: &Machine, _memory: &GuestMemory, _exceptions: u32, index: u32) -> crate::Result<Cpu> {
             let mut backend = Backend::new();
             backend.vmx = machine.caps().vendor() == crate::Vendor::Vmx;
             backend.vapic = backend.vmx && machine.vapic;
             backend.pi_capable = backend.vapic && machine.posted;
-            Ok(Cpu { backend })
+            Ok(Cpu { backend, index, last_run: Default::default(), pid: crate::trace::pid() })
+        }
+        pub fn note_task(&mut self) {
+            self.pid = crate::trace::pid();
+        }
+        pub fn pid(&self) -> u32 {
+            self.pid
         }
         pub fn backend(&self) -> &Backend {
             &self.backend
@@ -1452,8 +1483,24 @@ pub mod vm {
 
         /// Into the guest, which does what its script says -- to the end of
         /// which it shuts down -- letting the others run first when it says
-        /// so.
+        /// so. Its exit recorded as vm.rs's `Cpu::enter` records one, with
+        /// the event on: the record built from whatever the script left in
+        /// the registers.
         pub fn enter(&mut self, memory: &GuestMemory, _machine: &Machine, kick: Option<&Kick>)
+            -> core::result::Result<(Exit, u32), Refusal>
+        {
+            let entered = self.enter_script(memory, kick);
+            if crate::trace::on::<crate::trace::HvExit>() {
+                if let Ok((exit, _)) = &entered {
+                    let b = &self.backend;
+                    let regs = crate::tp::ExitRegs { rip: b.save().rip, rax: b.save().rax, rcx: b.regs().rcx };
+                    crate::tp::exit(self.index, self.pid, exit, regs, self.last_run, None);
+                }
+            }
+            entered
+        }
+
+        fn enter_script(&mut self, memory: &GuestMemory, kick: Option<&Kick>)
             -> core::result::Result<(Exit, u32), Refusal>
         {
             let me = VCPU.with(|v| v.get());
@@ -1479,6 +1526,7 @@ pub mod vm {
                             loop asked for", me, armed, k.edge());
             }
             self.backend.entered();
+            let entered_at = crate::time::cycle_counter();
             let exit = loop {
                 crate::time::progressed();
                 /* A notification of what other CPUs posted while it ran. */
@@ -1500,6 +1548,8 @@ pub mod vm {
                     Some(Next::Switch(to)) => switch_to(me, to),
                 }
             };
+            let timed = crate::trace::on::<crate::trace::HvExit>();
+            self.last_run.next(timed, entered_at, crate::time::cycle_counter());
             if let Some(k) = kick {
                 k.left();
             }

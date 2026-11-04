@@ -1,6 +1,6 @@
 #include "time.h"
 #include <arch/x86_64/tsc.h>
-#include "trace.h"
+#include "klog.h"
 #include <hal/cpu.h>
 
 #include <drivers/pit.h>
@@ -126,22 +126,22 @@ void time_init()
     }
     else
     {
-        trace(0, "Time: TSC calibration failed");
+        klog(0, "Time: TSC calibration failed");
     }
 
     /* Try kvmclock (takes priority over TSC for get_boot_time) */
     if (tsc.setup_kvm_clock())
     {
         set_clock_source(ClockKvmClock);
-        trace(0, "Time: using kvmclock");
+        klog(0, "Time: using kvmclock");
     }
     else if (active_source == ClockTsc)
     {
-        trace(0, "Time: using calibrated TSC");
+        klog(0, "Time: using calibrated TSC");
     }
     else
     {
-        trace(0, "Time: using PIT fallback");
+        klog(0, "Time: using PIT fallback");
     }
 
     /* Read RTC wall clock. Store the epoch of boot time zero, not of
@@ -151,13 +151,13 @@ void time_init()
     if (Rtc::get_instance().read_time(rtc))
     {
         rtc_epoch_secs = Rtc::to_unix_epoch(rtc) - get_boot_time().get_secs();
-        trace(0, "Time: RTC epoch %lu", rtc_epoch_secs);
+        klog(0, "Time: RTC epoch %lu", rtc_epoch_secs);
     }
 
     /* Counts from the kernel's own start, not from this line: the
        restart-at-zero this replaces hid how long the self test and the
        device probe really take. */
-    trace(0, "Time: boot time %lu ns", get_boot_time().get_value());
+    klog(0, "Time: boot time %lu ns", get_boot_time().get_value());
 }
 
 stdlib::Time get_boot_time()

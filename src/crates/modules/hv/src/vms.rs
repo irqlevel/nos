@@ -569,9 +569,9 @@ impl Host for VmHost {
                 if line.push(byte) {
                     if let Some(dropped) = line.admit(kcore::time::boot_time_ns()) {
                         if dropped != 0 {
-                            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+                            kcore::klog!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
                         }
-                        kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                        kcore::klog!(0, "hvvm{}| {}", self.shared.id, line.text());
                     }
                     line.clear();
                 }
@@ -632,10 +632,10 @@ impl VmHost {
         let Some(line) = line.as_mut() else { return };
         let dropped = line.take_dropped();
         if dropped != 0 {
-            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+            kcore::klog!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
         }
         if !line.text().is_empty() {
-            kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+            kcore::klog!(0, "hvvm{}| {}", self.shared.id, line.text());
             line.clear();
         }
     }
@@ -688,7 +688,7 @@ fn vcpu(start: Start) {
     let _hold = hold;
     let line = if shared.log { LogLine::new() } else { None };
     if shared.log && line.is_none() {
-        kcore::trace!(0, "hv: vm {} logs nothing of its console: no memory for a line", shared.id);
+        kcore::klog!(0, "hv: vm {} logs nothing of its console: no memory for a line", shared.id);
     }
     /* One host for every boot: the console, and where it has got to, is the
      * VM's and not a boot's. */
@@ -742,7 +742,7 @@ fn vcpu(start: Start) {
             Ok(ran) => ran,
             Err(why) => {
                 let _ = write!(reason, "not run -- {}", why);
-                kcore::trace!(0, "hv: vm {} not run -- {}", shared.id, why);
+                kcore::klog!(0, "hv: vm {} not run -- {}", shared.id, why);
                 drop(g);
                 stopped(&shared, reason, None, ended);
                 continue;
@@ -755,7 +755,7 @@ fn vcpu(start: Start) {
             let _ = guest::describe(&ran.stopped.stop, &mut reason);
             guest::report(&mut report, &g, &ran.stopped, &ran.counts, ran_ns);
         }
-        kcore::trace!(0, "hv: vm {} stopped after {} ms -- {}", shared.id, ran_ns / NS_PER_MS, reason);
+        kcore::klog!(0, "hv: vm {} stopped after {} ms -- {}", shared.id, ran_ns / NS_PER_MS, reason);
         /* Its memory, its CPUs and its devices go back before anything else
          * is built: a reboot needs as much again. Every CPU's task is done,
          * so this is the last of the guest. */
@@ -811,7 +811,7 @@ fn stopped(shared: &Shared, reason: String, report: Option<String>, ended: u64) 
 /// when there is one to keep.
 fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why: &str,
           report: Option<String>) -> Option<Built> {
-    kcore::trace!(0, "hv: vm {} restarting -- {}", shared.id, why);
+    kcore::klog!(0, "hv: vm {} restarting -- {}", shared.id, why);
     let mut note = String::new();
     if note.try_reserve(why.len() + 24).is_ok() {
         let _ = write!(note, "booting again -- {}", why);
@@ -836,7 +836,7 @@ fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why:
             if reason.try_reserve(REASON_BYTES).is_ok() {
                 let _ = write!(reason, "restart failed -- {}", e);
             }
-            kcore::trace!(0, "hv: vm {} not restarted -- {}", shared.id, e);
+            kcore::klog!(0, "hv: vm {} not restarted -- {}", shared.id, e);
             stopped(shared, reason, report, kcore::time::boot_time_ns());
             None
         }
@@ -1975,7 +1975,7 @@ impl Vms {
             /* Said where it can be seen: on the way down, a pause of up to
              * `secs` with nothing in the log would look like a wedge. */
             if pressed != 0 && out.is_none() {
-                kcore::trace!(0, "hv: unloading -- {} vm(s) asked to turn themselves off, given {} s", pressed, secs);
+                kcore::klog!(0, "hv: unloading -- {} vm(s) asked to turn themselves off, given {} s", pressed, secs);
             }
             wait_shut_down(secs, || self.table.lock().vms.iter().any(|vm| vm.shared.shutting_down()));
         }
@@ -2011,7 +2011,7 @@ impl Vms {
                 Some(out) => {
                     let _ = writeln!(out, "hv: vm {} stopped -- {}{}", shared.id, *reason, asked);
                 }
-                None => kcore::trace!(0, "hv: vm {} stopped for the unload -- {}{}", shared.id, *reason, asked),
+                None => kcore::klog!(0, "hv: vm {} stopped for the unload -- {}{}", shared.id, *reason, asked),
             }
         }
         if stopped == 0 {

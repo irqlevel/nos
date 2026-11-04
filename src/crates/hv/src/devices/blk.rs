@@ -334,6 +334,9 @@ pub struct Blk {
     /// The data the pass under way has moved so far (`PASS_BYTES`).
     moved: usize,
     id: [u8; ID_BYTES],
+    /// Its number among its guest's disks, vda 0: what its requests' trace
+    /// records say it by (`crate::tp`).
+    index: u8,
     /// Set when the driver made a ring this device will not follow: no more
     /// requests are taken until it resets the device.
     broken: Option<Broken>,
@@ -342,8 +345,8 @@ pub struct Blk {
 
 impl Blk {
     /// A disk of `backend`'s size -- whole sectors of it -- named `id` for
-    /// the driver's GET_ID.
-    pub fn new(backend: Box<dyn Backend>, id: &str) -> Result<Blk> {
+    /// the driver's GET_ID, its guest's disk `index` (vda 0).
+    pub fn new(backend: Box<dyn Backend>, id: &str, index: u8) -> Result<Blk> {
         let mut queues = Vec::new();
         queues.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
         queues.push(Queue::new(QUEUE_SIZE));
@@ -368,6 +371,7 @@ impl Blk {
             more: false,
             moved: 0,
             id: name,
+            index,
             broken: None,
             stats: Stats::default(),
         })
@@ -625,6 +629,9 @@ impl Blk {
         }
         let s = &mut self.slots[slot];
         (s.head, s.out) = (Some(head), true);
+        /* Before the hand-off: what the backend's task does with it is
+         * recorded after this. */
+        crate::tp::blk_submit(self.index, slot, op, offset, len);
         self.backend.submit(Request { op, offset, len, ok: false, slot, ranges: copy });
         Ok(false)
     }
@@ -633,7 +640,8 @@ impl Blk {
     /// whatever became of the chain, and the chain to the driver when there
     /// is still one to give it back to. True when something was.
     fn complete(&mut self, mem: &GuestMemory, req: Request) -> bool {
-        let Request { op, len, ok, slot, ranges, .. } = req;
+        let Request { op, offset, len, ok, slot, ranges } = req;
+        crate::tp::blk_complete(self.index, slot, op, offset, len, ok);
         let Some(s) = self.slots.get_mut(slot) else {
             return false;
         };

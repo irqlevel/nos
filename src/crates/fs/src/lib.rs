@@ -37,7 +37,7 @@ pub mod vnode;
 use core::ffi::c_void;
 
 use kcore::once::OnceBox;
-use kcore::trace;
+use kcore::klog;
 use vfs::{Handle, Vfs};
 
 static VFS: OnceBox<Vfs> = OnceBox::new();
@@ -58,7 +58,7 @@ pub fn init() {
 pub fn vfs_instance() -> Option<&'static Vfs> {
     let vfs = VFS.get_or_try_init(Vfs::new);
     if vfs.is_none() {
-        trace!(0, "vfs: no memory for the mount table");
+        klog!(0, "vfs: no memory for the mount table");
     }
     vfs
 }

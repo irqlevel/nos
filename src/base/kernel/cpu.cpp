@@ -1,11 +1,12 @@
 #include "cpu.h"
 #include "interrupt.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "watchdog.h"
 #include "softirq.h"
 #include "profiler.h"
 #include "timer.h"
+#include "tracepoint.h"
 
 #include <hal/irqchip.h>
 #include <hal/mmu.h>
@@ -97,12 +98,40 @@ void Cpu::idle()
         return;
     }
 
+    /* A CPU about to halt, and a CPU back from it: the two ends of one idle,
+       where `sched`'s wakeup histogram would show a long sleep as a wait
+       for the CPU it never was. The enter opens it (TaskQueue::open_idle)
+       and the first of three closes it: MWAIT's wake, read before the
+       interrupt that ended it is taken (idle_mwait); the decision of that
+       interrupt's that takes the CPU from this task (TaskQueue::switch_to);
+       or the halt returning here. Between the two records the CPU runs
+       nothing but the interrupt that woke it, so their distance is what an
+       idle cost. An interrupt landing in the instructions between the
+       enter and the halt that switches away ends the idle there; the halt
+       this task makes when it is switched back to goes unrecorded. */
+    if (unlikely(tp::on(tp::Id::IdleEnter)))
+    {
+        tp::emit_idle(tp::Id::IdleEnter, index_, self);
+        get_task_queue().open_idle();
+    }
+
     if (hal::idle_masked())
-        idle_mwait();
+        idle_mwait(self);
     else
         cpu_halt();
+
+    idle_ended(self);
+
     if (self != nullptr)
         self->set_idling(false);
+}
+
+/* An idle the trace opened over, if nothing closed it yet: its idle_exit. */
+void Cpu::idle_ended(Task* self)
+{
+    TaskQueue& queue = get_task_queue();
+    if (unlikely(queue.idle_is_open()) && queue.close_idle() && tp::on(tp::Id::IdleExit))
+        tp::emit_idle(tp::Id::IdleExit, index_, self);
 }
 
 /* An idle by MWAIT, interrupts off throughout, so that how long it lasted
@@ -114,13 +143,16 @@ void Cpu::idle()
    exit at every wake: on a desktop part's C10, hundreds of microseconds.
    C1 otherwise, as a HLT. The timer's deadline is read with interrupts off:
    its own interrupt re-arms it on this CPU. */
-void Cpu::idle_mwait()
+void Cpu::idle_mwait(Task* self)
 {
     ulong flags = hal::irq_save();
     ulong now = get_boot_time().get_value();
     ulong armed = timer_armed_at_;
     bool deep = idle_long_run_ >= IDLE_LONG_RUN && armed > now && armed - now >= IDLE_DEEP_NS;
     hal::cpu_idle_masked(deep);
+    /* The wake, before the interrupt that ended it is taken: the idle's end
+       exactly, if the trace opened it */
+    idle_ended(self);
     ulong woke = get_boot_time().get_value();
     if (woke > now && woke - now >= IDLE_DEEP_NS)
     {
@@ -175,7 +207,10 @@ void Cpu::init(ulong index)
     index_ = index;
     state_ |= STATE_INITED;
 
-    trace(0, "Cpu 0x%p %lu inited", this, index_);
+    /* The CPU its scheduler records a task's home as (TaskQueue::index) */
+    task_queue_.set_index(index);
+
+    klog(0, "Cpu 0x%p %lu inited", this, index_);
 }
 
 void Cpu::reset()
@@ -463,6 +498,64 @@ void CpuTable::send_tlb_ipi(ulong cpu_mask, IPITask tasks[MAX_CPUS])
             silent, cpu_mask);
 }
 
+namespace
+{
+
+void synchronize_func(void* ctx, Context* ipi_ctx)
+{
+    (void)ctx;
+    (void)ipi_ctx;
+}
+
+}
+
+void CpuTable::synchronize(const char* what)
+{
+    static const ulong ACK_TIMEOUT_NS = 10 * consts::NANO_SECS_IN_SEC;
+
+    ulong cpu_mask = get_remote_cpu_mask();
+    if (cpu_mask == 0)
+        return;
+
+    IPITask tasks[MAX_CPUS];
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!(cpu_mask & (1UL << i)))
+        {
+            /* A task's completion starts at 1, and a WaitGroup that goes
+               with its count above 0 is a BUG: done, for one never sent. */
+            tasks[i].completion.done();
+            continue;
+        }
+        tasks[i].function = synchronize_func;
+        cpu_array_[i].queue_ipi_task_async(tasks[i]);
+    }
+
+    stdlib::Time deadline = get_boot_time() + stdlib::Time(ACK_TIMEOUT_NS);
+    ulong silent = 0;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!(cpu_mask & (1UL << i)))
+            continue;
+        while (tasks[i].completion.get_counter() != 0)
+        {
+            if (get_boot_time() >= deadline)
+            {
+                silent |= (1UL << i);
+                break;
+            }
+            /* yield_to_runnable, as the shootdown's wait is, for the same
+               reason: the answer comes from the other CPU's handler. */
+            yield_to_runnable();
+        }
+    }
+
+    /* Every task's answer had: none of them is the other CPU's any more,
+       and they go with this frame. */
+    if (silent != 0)
+        PANIC("%s: cpus 0x%lX never took the interrupt (asked 0x%lX)", what, silent, cpu_mask);
+}
+
 void CpuTable::invalidate_tlb_all()
 {
     mm::PageTable::invalidate_local_tlb();
@@ -547,7 +640,13 @@ void Cpu::ipi(Context* ctx)
 {
     ipi_conter_.inc();
 
-    process_ipi_tasks(ctx);
+    ulong queued = process_ipi_tasks(ctx);
+
+    /* An interrupt another CPU sent: the work it found, which is what says
+       whether this CPU was interrupted for nothing (a wakeup already taken)
+       or for a TLB shootdown’s answer. */
+    if (unlikely(tp::on(tp::Id::SchedIpi)))
+        tp::emit_sched_ipi(index_, queued);
 
     if (Panicker::get_instance().is_active())
     {
@@ -563,7 +662,7 @@ void Cpu::ipi(Context* ctx)
 
     if (exit)
     {
-        trace(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
+        klog(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
             index_, state_, ipi_conter_.get());
 
         /* Complete any IPI tasks queued during the exit transition and refuse
@@ -760,7 +859,7 @@ void Cpu::queue_ipi_task(IPITask& task)
     task.completion.wait();
 }
 
-void Cpu::process_ipi_tasks(Context* ctx)
+ulong Cpu::process_ipi_tasks(Context* ctx)
 {
     stdlib::ListEntry local_list;
     local_list.init();
@@ -769,13 +868,16 @@ void Cpu::process_ipi_tasks(Context* ctx)
     local_list.move_tail_list(&ipi_task_list_);
     ipi_task_lock_.unlock_irq_restore(flags);
 
+    ulong count = 0;
     while (!local_list.is_empty())
     {
         auto* entry = local_list.remove_head();
         IPITask* task = CONTAINING_RECORD(entry, IPITask, list_entry);
         task->function(task->ctx, ctx);
         task->completion.done();
+        count++;
     }
+    return count;
 }
 
 void Cpu::drain_and_close_ipi_tasks(Context* ctx)

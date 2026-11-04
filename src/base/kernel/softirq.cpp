@@ -1,6 +1,6 @@
 #include "softirq.h"
 #include "task.h"
-#include "trace.h"
+#include "klog.h"
 #include "sched.h"
 #include "cpu.h"
 
@@ -60,7 +60,7 @@ bool SoftIrq::init()
 
     ready_.set(1);
 
-    trace(0, "SoftIrq: initialized");
+    klog(0, "SoftIrq: initialized");
     return true;
 }
 

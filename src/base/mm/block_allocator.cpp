@@ -1,6 +1,6 @@
 #include "block_allocator.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <kernel/stack_trace.h>
 
@@ -25,7 +25,7 @@ BlockAllocatorImpl::BlockAllocatorImpl()
 
 bool BlockAllocatorImpl::setup(ulong start_address, ulong end_address, ulong block_size)
 {
-    trace(0, "0x%p start 0x%lX end 0x%lX bsize %lu", this, start_address, end_address, block_size);
+    klog(0, "0x%p start 0x%lX end 0x%lX bsize %lu", this, start_address, end_address, block_size);
 
     stdlib::AutoLock lock(lock_);
     if (total_ != 0)
@@ -50,7 +50,7 @@ bool BlockAllocatorImpl::setup(ulong start_address, ulong end_address, ulong blo
         total_++;
     }
 
-    trace(0, "0x%p start 0x%lX end 0x%lX bsize %lu total %lu", this, start_address_, end_address_, block_size_, total_);
+    klog(0, "0x%p start 0x%lX end 0x%lX bsize %lu total %lu", this, start_address_, end_address_, block_size_, total_);
 
     return (total_ != 0) ? true : false;
 }
@@ -61,16 +61,16 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
 
     if (usage_ != 0)
     {
-        trace(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
+        klog(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
         for (ListEntry* le = active_block_list_.flink; le != &active_block_list_; le = le->flink)
         {
             BlockEntry* b = CONTAINING_RECORD(le, BlockEntry, list_link);
-            trace(0, "leak entry 0x%p magic 0x%lX frames %lu", b, b->magic, b->num_frames);
+            klog(0, "leak entry 0x%p magic 0x%lX frames %lu", b, b->magic, b->num_frames);
 
             for (size_t i = 0; i < b->num_frames; i++)
-                trace(0, "leak entry 0x%p stack[%lu]=0x%lX", b, i, b->frames[i]);
+                klog(0, "leak entry 0x%p stack[%lu]=0x%lX", b, i, b->frames[i]);
         }
-        trace(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
+        klog(0, "0x%p usage %lu block_size %lu", this, usage_, block_size_);
     }
 
     BUG_ON(usage_ != 0);

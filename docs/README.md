@@ -16,6 +16,7 @@ How it works, by subsystem:
 - [Scheduler](scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
 - [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
+- [Tracepoints](tracing.md) — events recorded as they happen into each CPU's ring, turned on and off with `trace`, and read back merged by time
 - [HTTPS](tls.md) — how `wget https://` works: the transport seam, rustls in `no_std`, certificates, and what it costs
 - [Randomness](random.md) — the ChaCha20 pool, the entropy sources each machine turns out to have, and what timing jitter is worth
 - [Rust in the kernel](rust.md) — how the crates are layered, how a kernel service reaches Rust, the type each shape that used to need `unsafe` has now, a map of `kcore`, and how a driver is written

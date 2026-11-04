@@ -8,7 +8,7 @@ pub mod const_init;
 pub mod consts;
 pub mod crc32;
 pub mod error;
-pub mod trace;
+pub mod klog;
 pub mod time;
 pub mod sync;
 pub mod task;
@@ -28,6 +28,7 @@ pub mod input;
 pub mod interrupt;
 pub mod softirq;
 pub mod timer;
+pub mod trace;
 pub mod cpu;
 pub mod block;
 pub mod net;
@@ -45,17 +46,24 @@ pub mod vnic;
 pub mod tco_wdt;
 
 #[macro_export]
-macro_rules! trace {
+macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut buf = $crate::trace::__TraceBuf::new();
-        let f = file!();
-        let fname = match f.rfind('/') {
-            Some(i) => &f[i + 1..],
-            None => f,
-        };
-        let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
-        let _ = write!(buf, $($arg)*);
-        $crate::trace::trace($level, buf.as_str());
+        let level: u32 = $level;
+        /* The level first: a line is formatted -- core::fmt, into 512 bytes
+         * of stack -- only when the log keeps it. A klog!(3, ..) on a hot
+         * path used to be formatted at every level and thrown away by the
+         * C++ side's own look at it. */
+        if $crate::klog::wants(level) {
+            use core::fmt::Write;
+            let mut buf = $crate::klog::__KlogBuf::new();
+            let f = file!();
+            let fname = match f.rfind('/') {
+                Some(i) => &f[i + 1..],
+                None => f,
+            };
+            let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
+            let _ = write!(buf, $($arg)*);
+            $crate::klog::klog(level, buf.as_str());
+        }
     }};
 }

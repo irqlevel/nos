@@ -31,7 +31,7 @@ use kcore::msix::MsixInterrupt;
 use kcore::once::Once;
 use kcore::pci;
 use kcore::softirq;
-use kcore::trace;
+use kcore::klog;
 use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
@@ -189,7 +189,7 @@ impl Net {
 
             let head = head as usize;
             if head >= rx.slot_of_head.len() {
-                trace!(0, "virtio-net: the device named descriptor {}, which is not one", head);
+                klog!(0, "virtio-net: the device named descriptor {}, which is not one", head);
                 continue;
             }
 
@@ -327,7 +327,7 @@ impl Net {
                     /* The ring would not take it. The frame goes back for
                      * release rather than being dropped here, for the same
                      * reason a completed one does. */
-                    trace!(0, "virtio-net: the transmit ring is full");
+                    klog!(0, "virtio-net: the transmit ring is full");
                     stack.done(frame);
                     break;
                 }
@@ -387,7 +387,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     let features = match virtio::negotiate(transport.as_ref(), FEATURE_MAC) {
         Some(features) => features,
         None => {
-            trace!(0, "virtio-net: the device would not agree on features");
+            klog!(0, "virtio-net: the device would not agree on features");
             return false;
         }
     };
@@ -399,7 +399,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     let rx_size = transport.select_queue(RX_QUEUE);
     let tx_size = transport.select_queue(TX_QUEUE);
     if rx_size == 0 || tx_size == 0 {
-        trace!(0, "virtio-net: the device is missing a queue ({} {})", rx_size, tx_size);
+        klog!(0, "virtio-net: the device is missing a queue ({} {})", rx_size, tx_size);
         virtio::failed(transport.as_ref());
         return false;
     }
@@ -513,12 +513,12 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
             handle.set_ip(DEFAULT_IP);
 
             DEVICES.store(index + 1, Ordering::Release);
-            trace!(0, "virtio-net: {} is up, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {} receive slots",
+            klog!(0, "virtio-net: {} is up, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {} receive slots",
                 name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], slots);
             true
         }
         None => {
-            trace!(0, "virtio-net: the device table would not take another card");
+            klog!(0, "virtio-net: the device table would not take another card");
             /* The device is told to stop, and what was made for it stays
              * where it is: its interrupt may still be on its way. */
             virtio::failed(transport);
@@ -539,7 +539,7 @@ fn arm_interrupt(net: &'static Net, source: IrqSource) -> Option<u16> {
                 let _ = net.irq.set(Irq::Msix(irq));
                 return Some(0);
             }
-            None => trace!(0, "virtio-net: no MSI-X slot left, falling back on the line"),
+            None => klog!(0, "virtio-net: no MSI-X slot left, falling back on the line"),
         }
     }
 
@@ -550,7 +550,7 @@ fn arm_interrupt(net: &'static Net, source: IrqSource) -> Option<u16> {
 
     match registered {
         Some(irq) => { let _ = net.irq.set(Irq::Legacy(irq)); }
-        None => trace!(0, "virtio-net: the device has no interrupt"),
+        None => klog!(0, "virtio-net: the device has no interrupt"),
     }
     None
 }
@@ -576,7 +576,7 @@ pub extern "C" fn rust_virtio_net_init() {
                 None => continue,
             };
 
-            trace!(0, "virtio-net: {} virtio-pci at {:02x}:{:02x}.{}",
+            klog!(0, "virtio-net: {} virtio-pci at {:02x}:{:02x}.{}",
                 if transport.is_legacy() { "legacy" } else { "modern" },
                 dev.bus, dev.slot, dev.func);
 
@@ -613,7 +613,7 @@ pub unsafe extern "C" fn rust_virtio_net_init_mmio(slots: *const Slot, count: us
             None => continue,
         };
 
-        trace!(0, "virtio-net: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
+        klog!(0, "virtio-net: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
         start(Box::new(transport), IrqSource::Line(slot.int_id as u8));
     }
 }

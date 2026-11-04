@@ -1,6 +1,7 @@
 #include "cmd.h"
 #include "version_gen.h"
-#include "trace.h"
+#include "klog.h"
+#include "tracepoint.h"
 #include <hal/cpu.h>
 #include <hal/console.h>
 #include "dmesg.h"
@@ -169,7 +170,7 @@ static void cmd_dmesg(const char* args, stdlib::Printer& con)
 
 static void cmd_loglevel(const char* args, stdlib::Printer& con)
 {
-    auto& tracer = Tracer::get_instance();
+    auto& tracer = Klog::get_instance();
 
     const char* end;
     const char* tok = stdlib::next_token(args, end);
@@ -183,9 +184,9 @@ static void cmd_loglevel(const char* args, stdlib::Printer& con)
     stdlib::token_copy(tok, end, buf, sizeof(buf));
 
     ulong level;
-    if (!stdlib::parse_ulong(buf, level) || level > (ulong)MAX_TRACE_LEVEL)
+    if (!stdlib::parse_ulong(buf, level) || level > (ulong)MAX_LOG_LEVEL)
     {
-        con.printf("usage: loglevel [0-%lu]\n", (ulong)MAX_TRACE_LEVEL);
+        con.printf("usage: loglevel [0-%lu]\n", (ulong)MAX_LOG_LEVEL);
         return;
     }
 
@@ -1747,12 +1748,12 @@ public:
             }
             line[n] = '\0';
             if (n != 0)
-                trace(0, "%s%s", prefix_, line);
+                klog(0, "%s%s", prefix_, line);
 
             start = (end < len_ && buf_[end] == '\n') ? end + 1 : end;
         }
         if (dropped_ != 0)
-            trace(0, "%s[%lu more bytes it printed not logged]", prefix_, dropped_);
+            klog(0, "%s[%lu more bytes it printed not logged]", prefix_, dropped_);
 
         len_ = 0;
         dropped_ = 0;
@@ -2006,7 +2007,7 @@ static const CmdEntry COMMANDS[] = {
     { "cpu",       cmd_cpu,       "cpu - dump cpu state" },
     { "lscpu",     cmd_lscpu,     "lscpu - identify the cpu and the features the kernel needs" },
     { "dmesg",     cmd_dmesg,     "dmesg [lines] [filter] - dump kernel log" },
-    { "loglevel",  cmd_loglevel,  "loglevel [N] - show or set trace level" },
+    { "loglevel",  cmd_loglevel,  "loglevel [N] - show or set the log level" },
     { "uptime",    cmd_uptime,    "uptime - show uptime" },
     { "date",      cmd_date,      "date - show wall clock time" },
     { "ps",        cmd_ps,        "ps - show tasks" },
@@ -2014,6 +2015,7 @@ static const CmdEntry COMMANDS[] = {
     { "top",       cmd_top,       "top [ms] - per-task cpu use over a sampling window" },
     { "sched",     cmd_sched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice" },
     { "profile",   cmd_profile,   "profile [ms] [pid] - sample where the kernel spends its time" },
+    { "trace",     tp::command,   "trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench - tracepoints: events recorded as they happen into each cpu's ring, and read back merged by time -- shown, dumped as JSON, or paired into how long a woken task waited for its cpu; `freeze wakeup>N` freezes the rings on a wakeup that waits longer" },
     { "watchdog",  cmd_watchdog,  "watchdog - show watchdog stats" },
     { "memusage",  cmd_memusage,  "memusage - show memory usage stats" },
     { "meminfo",   cmd_meminfo,   "meminfo - show the firmware memory map and what of it is used" },
@@ -2323,7 +2325,7 @@ void Cmd::run_boot_script()
 
     if (Parameters::get_instance().is_rc_off())
     {
-        trace(0, "rc: %s skipped, rc=off", RC_PATH);
+        klog(0, "rc: %s skipped, rc=off", RC_PATH);
         return;
     }
 
@@ -2331,11 +2333,11 @@ void Cmd::run_boot_script()
        alone, and the log says how much */
     char* buf = static_cast<char*>(mm::alloc(RC_LOG_SIZE, SCRIPT_TAG));
 
-    trace(0, "rc: running %s", RC_PATH);
+    klog(0, "rc: running %s", RC_PATH);
     LogPrinter log("rc: ", &Console::get_instance(), buf, (buf != nullptr) ? RC_LOG_SIZE : 0);
     run_script(RC_PATH, log, commit_log, &log);
     log.commit();
-    trace(0, "rc: %s done", RC_PATH);
+    klog(0, "rc: %s done", RC_PATH);
 
     if (buf != nullptr)
         mm::free(buf);
@@ -2453,7 +2455,7 @@ void Cmd::run()
     /* Wait for startup trace output to settle before suppressing console */
     sleep(100 * consts::NANO_SECS_IN_MS);
 
-    Tracer::get_instance().set_console_suppressed(true);
+    Klog::get_instance().set_console_suppressed(true);
 
     show_banner(con);
 
@@ -2498,7 +2500,7 @@ void Cmd::run()
         }
     }
 
-    Tracer::get_instance().set_console_suppressed(false);
+    Klog::get_instance().set_console_suppressed(false);
 }
 
 void Cmd::run_func(void *ctx)
@@ -2519,7 +2521,7 @@ void Cmd::on_char(char c, u8 code)
 
     if (!buf_.put(c))
     {
-        trace(0, "Can't save char");
+        klog(0, "Can't save char");
         return;
     }
 }
