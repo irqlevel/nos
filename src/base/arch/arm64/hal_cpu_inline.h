@@ -59,6 +59,16 @@ static inline __attribute__((always_inline)) u64 read_cycle_counter()
     return cnt;
 }
 
+// The counter without the ISB that orders the read after every instruction
+// before it (see hal/cpu.h): a pipeline's flush, which `trace bench` times
+// against this read.
+static inline __attribute__((always_inline)) u64 read_cycle_counter_unordered()
+{
+    u64 cnt;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(cnt));
+    return cnt;
+}
+
 // Halts this CPU for good, touching no memory -- no stack, no data: one
 // loop of two instructions, so that a wakeup only halts it again. WFI ends
 // at any pending interrupt, even a masked one. For a CPU whose stack and

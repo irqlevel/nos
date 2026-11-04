@@ -56,4 +56,9 @@ static inline u64 read_cycle_counter()
     return ++fuzz::cycles;
 }
 
+static inline u64 read_cycle_counter_unordered()
+{
+    return read_cycle_counter();
+}
+
 }

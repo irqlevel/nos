@@ -277,20 +277,30 @@ pub extern "C" fn kernel_tp_count() -> usize {
 
 /// A record, held to what kcore declares of its event -- the kernel's
 /// description, which every boot holds kcore's to: its size, each enumerated
-/// field's value one its names cover, and its padding zero.
-///
-/// # Safety
-/// `payload` is `size` readable bytes, as `kcore::trace::emit` passes them.
+/// field's value one its names cover, its padding zero, and the bytes of the
+/// slot's words past it zero, as `kcore::trace::emit` lays a payload into
+/// them. Values only, as the kernel's is.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_tp_emit(id: u16, payload: *const u8, size: usize) {
+pub extern "C" fn kernel_tp_record(id_size: u64, w0: u64, w1: u64, w2: u64, w3: u64, w4: u64) {
+    const RECORD_SIZE_SHIFT: u32 = 16;
+    let id = (id_size & 0xFFFF) as u16;
+    let size = usize::try_from(id_size >> RECORD_SIZE_SHIFT).unwrap_or(usize::MAX);
     let Some(e) = kcore::trace::EVENTS.iter().find(|e| e.id as u16 == id) else {
         panic!("invariant: a record of event {}, which kcore declares no payload of", id);
     };
     if size != e.size {
         panic!("invariant: a record of {} of {} bytes, its payload's being {}", e.name, size, e.size);
     }
-    // SAFETY: the caller's `size` bytes, as the declaration's callers pass them.
-    let bytes = unsafe { core::slice::from_raw_parts(payload, size) };
+    let mut slot = [0u8; 40];
+    for (chunk, word) in slot.chunks_exact_mut(8).zip([w0, w1, w2, w3, w4]) {
+        chunk.copy_from_slice(&word.to_ne_bytes());
+    }
+    let Some((bytes, past)) = slot.split_at_checked(size) else {
+        panic!("invariant: a record of {} of {} bytes, past a slot's", e.name, size);
+    };
+    if past.iter().any(|&b| b != 0) {
+        panic!("invariant: {}'s slot words past its {} bytes are not zero: {:?}", e.name, size, past);
+    }
     for f in e.fields {
         let Some(field) = bytes.get(f.offset..f.offset + f.size) else {
             panic!("invariant: {}'s field {} past its payload", e.name, f.name);

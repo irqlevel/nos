@@ -9,9 +9,13 @@ unsafe extern "C" {
     pub safe fn kernel_tp_flags() -> *const u8;
     /// How many events the kernel describes: the flags' length. Values only.
     pub safe fn kernel_tp_count() -> usize;
-    /// A record of event `id`: `size` bytes at `payload`, the event's
-    /// description's size exactly -- anything else is the kernel's BUG_ON.
-    pub fn kernel_tp_emit(id: u16, payload: *const u8, size: usize);
+    /// A record of an event: its number in `id_size`'s low 16 bits and its
+    /// payload's size above them, the payload in `w0`..`w4` -- a slot's
+    /// words, the bytes past its size zero -- each in a register, so that
+    /// nothing of it goes through memory on the way to the ring. The kernel
+    /// holds the number and the size to the event's description and panics
+    /// for either wrong (BUG_ON), writing nothing. Values only.
+    pub safe fn kernel_tp_record(id_size: u64, w0: u64, w1: u64, w2: u64, w3: u64, w4: u64);
     /// Event `id`'s name into `name` (`name_len` bytes, terminated, cut to
     /// fit) and its payload's size into `size`: 1, or 0 for no such event.
     pub fn kernel_tp_event(id: u16, name: *mut u8, name_len: usize, size: *mut usize) -> i32;

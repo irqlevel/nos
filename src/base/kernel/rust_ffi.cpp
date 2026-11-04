@@ -2233,12 +2233,14 @@ unsigned long kernel_tp_count()
     return kernel::tp::COUNT;
 }
 
-/* A record of event `id`, `size` bytes at `payload`: emit() holds both to
-   the event's description -- a BUG_ON for a site that disagrees with it. Any
-   u16 is a value of tp::Id, whose type is u16. */
-void kernel_tp_emit(unsigned short id, const unsigned char* payload, unsigned long size)
+/* A record of an event, its number and payload size in `id_size` and its
+   payload in `w0`..`w4`, in registers: record() holds the number and the
+   size to the event's description -- a BUG_ON for a site that disagrees with
+   it, and nothing written -- so any value of each is sound. */
+void kernel_tp_record(unsigned long id_size, unsigned long w0, unsigned long w1, unsigned long w2,
+    unsigned long w3, unsigned long w4)
 {
-    kernel::tp::emit((kernel::tp::Id)id, payload, size);
+    kernel::tp::record(id_size, w0, w1, w2, w3, w4);
 }
 
 /* Event `id`'s name and payload size, as its description has them: what

@@ -74,16 +74,35 @@ pub fn on<E: Event>() -> bool {
     flags()[E::ID as usize].load(Ordering::Relaxed) != 0
 }
 
+/// The most a payload is: a ring's slot's five words (kernel/trace_ring.h).
+const PAYLOAD_WORDS: usize = 5;
+const PAYLOAD_BYTES: usize = PAYLOAD_WORDS * 8;
+/// Where a record's payload size sits in `kernel_tp_record`'s first word:
+/// above the event's number (kernel/tracepoint.h, RECORD_SIZE_SHIFT).
+const RECORD_SIZE_SHIFT: u32 = 16;
+
 /// `event`'s record into this CPU's ring -- none when it has no ring, or
 /// recording is frozen. Any context: interrupts are off for the write, and
-/// nothing is locked or allocated.
+/// nothing is locked or allocated. The payload goes to the kernel as a
+/// slot's five words, in registers -- the size of each copy here known to
+/// the compiler, which makes them a few loads -- and the kernel stores them
+/// into the slot as they are.
 #[inline]
 pub fn emit<E: Event>(event: &E) {
+    const { assert!(core::mem::size_of::<E>() <= PAYLOAD_BYTES, "a payload fits a slot") };
     let bytes = bytes_of(event);
-    /* SAFETY: `bytes` is every byte of the payload, initialised (Pod), and
-       its length the payload's size: the event's description's, which
-       `check` holds it to and the kernel's emit() BUG_ONs on. */
-    unsafe { ffi::trace::kernel_tp_emit(E::ID as u16, bytes.as_ptr(), bytes.len()) }
+    let mut padded = [0u8; PAYLOAD_BYTES];
+    padded[..bytes.len()].copy_from_slice(bytes);
+    let mut words = [0u64; PAYLOAD_WORDS];
+    for (word, chunk) in words.iter_mut().zip(padded.chunks_exact(8)) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(chunk);
+        *word = u64::from_ne_bytes(b);
+    }
+    /* The size is at most PAYLOAD_BYTES (the assertion above): no bit of it
+       reaches past the word */
+    let id_size = u64::from(E::ID as u16) | ((bytes.len() as u64) << RECORD_SIZE_SHIFT);
+    ffi::trace::kernel_tp_record(id_size, words[0], words[1], words[2], words[3], words[4]);
 }
 
 /// The pid a record says the running task by: its own -- an interrupt's on

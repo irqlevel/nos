@@ -93,12 +93,45 @@ static inline __attribute__((always_inline)) bool on(Id id)
     return __atomic_load_n(&enabled[(ulong)id], __ATOMIC_RELAXED) != 0;
 }
 
-/* The record of event `id`: `size` bytes of `payload`, exactly its
-   description's size (BUG_ON otherwise -- a site that disagrees with its
-   own event is a bug). Into this CPU's ring, with the cycle counter; nothing
-   when there is no ring, or recording is frozen. Any context: interrupts
-   are turned off for the write. Out of line, called only when on(). */
-void emit(Id id, const void* payload, ulong size);
+/* Where a record's payload size sits in record()'s first argument: above
+   the event's number. */
+const ulong RECORD_SIZE_SHIFT = 16;
+const ulong RECORD_ID_MASK = (1UL << RECORD_SIZE_SHIFT) - 1;
+
+/* The record of an event, its payload in a slot's words: `id_size` the
+   event's number in its low 16 bits and its payload's size above them --
+   exactly its description's size (BUG_ON otherwise: a site that disagrees
+   with its own event is a bug) -- and `w0`..`w4` the payload, the bytes past
+   its size zero. Into this CPU's ring, with the cycle counter; nothing when
+   there is no ring, or recording is frozen. Any context: interrupts are
+   turned off for the write. Out of line, called only when on(). Six words,
+   every one in a register on both architectures, so that a payload goes
+   from the site that built it into the slot with no copy in memory
+   between: what Rust's sites reach it by too (kernel_tp_record). */
+void record(ulong id_size, u64 w0, u64 w1, u64 w2, u64 w3, u64 w4);
+
+static_assert(TraceRing::PAYLOAD_WORDS == 5, "record() takes a slot's payload words, five");
+
+/* A payload laid into a slot's words, `w` zero past it: a struct of its
+   event's description's layout with no padding -- every byte of it a
+   field's, so that no byte of the stack is copied out -- by a copy of a size
+   the compiler knows, which it makes a few moves. */
+template <typename T>
+inline __attribute__((always_inline)) void payload_words(const T& payload, u64 (&w)[TraceRing::PAYLOAD_WORDS])
+{
+    static_assert(sizeof(T) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+    static_assert(__has_unique_object_representations(T), "a payload has no padding");
+    __builtin_memcpy(w, &payload, sizeof(T));
+}
+
+/* The record of event `id`, its payload `payload` (payload_words). */
+template <typename T>
+inline __attribute__((always_inline)) void emit(Id id, const T& payload)
+{
+    u64 w[TraceRing::PAYLOAD_WORDS] = {};
+    payload_words(payload, w);
+    record((ulong)id | (sizeof(T) << RECORD_SIZE_SHIFT), w[0], w[1], w[2], w[3], w[4]);
+}
 
 /* How a field is printed. */
 enum class Kind : u8
@@ -206,6 +239,8 @@ struct SchedSwitch
     u32 next_cpu;
     u8 prev_state;
     u8 reason;
+    /* Zero: a payload has no padding the compiler put in (payload_words) */
+    u8 pad[2];
 };
 
 struct SchedWakeup
@@ -216,6 +251,7 @@ struct SchedWakeup
     u32 cpu;
     /* 1: its deadline came; 0: someone's unblock() */
     u8 deadline;
+    u8 pad[3];
     /* The task that woke it, when woken from one of a task's stacks --
        from an interrupt's context it is the task the interrupt landed on */
     u32 waker_pid;
@@ -233,6 +269,7 @@ struct SchedBlock
     u32 cpu;
     /* 1: asleep until a deadline; 0: waiting on someone else's wakeup */
     u8 deadline;
+    u8 pad[3];
     /* How long it was on the CPU this time */
     u32 ran_ns;
 };
@@ -275,6 +312,7 @@ struct SchedPreemptDeferred
     /* Its preempt_disable_counter_ as the reschedule found it */
     u32 count;
     u8 idle;
+    u8 pad[3];
 };
 
 /* idle_enter and idle_exit: the CPU, and its idle task. */

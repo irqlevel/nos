@@ -160,7 +160,11 @@ public:
     bool is_stopping();
 
     PRINTF_FORMAT(2, 3) void set_name(const char *fmt, ...);
-    const char* get_name();
+    /* Its name, zero past its end to TASK_NAME_LEN */
+    const char* get_name()
+    {
+        return name_;
+    }
 
     /* Its time on a CPU so far, the stretch it is on one now included --
        which a task that keeps its CPU, the idle task above all, has not
