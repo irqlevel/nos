@@ -207,6 +207,12 @@ pub struct Shared {
     /// console's total and the wall clock when it happened -- written there
     /// among the guest's own lines (`vmlog`).
     notes: Option<Mutex<VecDeque<(u64, u64, String)>>>,
+    /// The guest running, while it runs: what its disks' tasks hand what
+    /// they served to (`served`), under this lock for the whole call -- and
+    /// what the VM's task takes back under it before it lets the guest go,
+    /// so that a disk's task never holds the last of a guest, whose drop
+    /// waits for that task.
+    serving: Mutex<Option<Arc<hv::run::LinuxGuest>>>,
 }
 
 /// The most notes waiting for the log's writer: it takes them every second,
@@ -245,6 +251,7 @@ impl Shared {
             boot_ns: AtomicU64::new(kcore::time::boot_time_ns()),
             boot_at: AtomicU64::new(0),
             ended_ns: AtomicU64::new(0),
+            serving: Mutex::new(None)?,
             log,
             notes: if notes {
                 let mut q = VecDeque::new();
@@ -544,6 +551,22 @@ impl Wake for Shared {
     fn wake(&self) {
         self.wake_up();
     }
+
+    /// What disk `disk` served given to the guest from its task, the device's
+    /// interrupts posted from there (`LinuxGuest::serve_disk`): the first
+    /// CPU woken only when its round has to come anyway, or when no guest
+    /// runs.
+    fn served(&self, disk: u8) {
+        let serving = self.serving.lock();
+        let again = match serving.as_ref() {
+            Some(guest) => guest.serve_disk(disk),
+            None => true,
+        };
+        drop(serving);
+        if again {
+            self.wake_up();
+        }
+    }
 }
 
 /// The loops' side of a VM, which every CPU's task shares: the guest's
@@ -731,7 +754,11 @@ fn vcpu(start: Start) {
         let mut name = String::new();
         let _ = name.try_reserve(16);
         let _ = write!(name, "vm{}", shared.id);
+        /* Its disks' tasks serve the guest themselves while it runs; taken
+         * back -- under the lock their calls hold -- before the guest goes */
+        *shared.serving.lock() = Some(g.clone());
         let ran = guest::run_cpus(&g, built.cpus, &placement, &machine, u64::MAX, &host, &name);
+        *shared.serving.lock() = None;
         host.flush_line();
 
         let ended = kcore::time::boot_time_ns();
