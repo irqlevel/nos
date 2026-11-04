@@ -139,6 +139,57 @@ pub(super) fn map_extent(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64
     }
 }
 
+/// `map_extent` of every run from `lblock` up to `end` that one leaf of
+/// the file's tree maps, onto `out` in order, each held to the blocks a
+/// file may own as `map_extent` holds its one: a walk down the tree for a
+/// leaf's runs, where `map_extent` reads -- and holds to its checksum --
+/// every node on the way again for each. Where the runs end, from which a
+/// call goes on; a file mapped by blocks a run at a time.
+pub(super) fn leaf_runs(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64, end: u64,
+                        out: &mut Vec<(Map, bool)>) -> Option<u64> {
+    let node = Inode::new(raw)?;
+    if node.flags() & EXTENTS_FL == 0 {
+        let (m, unwritten) = map_extent(src, ino, raw, lblock)?;
+        let run = match m {
+            Map::Blocks { run, .. } | Map::Hole { run } => run.max(1).min(end.saturating_sub(lblock)),
+        };
+        out.push((m, unwritten));
+        return Some(lblock + run);
+    }
+    let (fs_blocks, bs, csum, seed) = {
+        let m = src.meta();
+        (m.blocks, m.bs, m.csum, m.seed)
+    };
+    let iseed = xinode::seed(seed, ino, node.generation());
+    let mut read = |b: u64, buf: &mut [u8]| {
+        if !src.block(b, buf) {
+            return Err(alloc::format!("block {} does not read", b));
+        }
+        if csum && extent::stored_csum(buf).zip(extent::node_csum(iseed, buf)).is_none_or(|(s, c)| s != c) {
+            return Err(alloc::format!("inode {}'s extent block {} fails its checksum", ino, b));
+        }
+        Ok(())
+    };
+    let from = out.len();
+    let reached = match extent::leaf_runs(node.i_block(), lblock, end, fs_blocks, bs, ino, &mut read, out) {
+        Ok(reached) => reached,
+        Err(e) => {
+            klog!(0, "ext4: {}", e);
+            return None;
+        }
+    };
+    for (m, _) in &out[from..] {
+        if let Map::Blocks { block, run } = *m {
+            if !src.meta().file_may_own(block, run) {
+                klog!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino,
+                      block, run);
+                return None;
+            }
+        }
+    }
+    Some(reached)
+}
+
 /// `map`, but for the journal's inode, whose blocks are the system zone's
 /// by what they are: held only to the filesystem's bounds.
 pub(super) fn map_any(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
