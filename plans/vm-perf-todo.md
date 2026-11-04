@@ -119,6 +119,39 @@ samples in `out/ex44-bench/results-nos-<sha>`; against KVM:
   switch (r20 -> r21: the IPIs its completions wake the other vCPUs by) and
   stayed there (276, 292): more queues are not a finding yet.
 
+## Rounds 24-27 (vm-perf3, 2026-11-04): turbo, halts, growth ahead tuned
+
+| | KVM | r23 c0650c51 | r24 aa6776a8 | r25 a4548330 |
+|---|---:|---:|---:|---:|
+| sysbench cpu t1 / t4 | 1589 / 3259 | 1534 / 3192 | **1579 / 3299** | 1579 / 3297 |
+| perf pipe | 6.0 us | 7.35 | **6.42** | 6.66 |
+| first write (2 GiB) | 4643 MiB/s | 3025 | 3220 | **3785** |
+| 1 MiB write QD8 | 3694 MiB/s | 1454 | **4604** | 4648 |
+| fdatasync | 620 | 371 | **713** | 729 |
+| 4k read QD32, p99 | 195k, 232 us | 288k, 337 | 296k, **154** | 293k, 154 |
+
+- **A core's C6 for idles 1 ms from their next timer** on CPUs no guest holds
+  (aa6776a8): the busy vCPU's core at 4763 MHz where it was at 4552-4581,
+  the housekeeping P-cores' idles 40-94% in C6 where they were 36-99% in C1;
+  CPU-bound work at KVM's.
+- **The HLT waited out in the world switch for what is posted** (79e4347f):
+  53 million HLTs a run ended there, 1.9 million went the loop's way; the
+  pipe's HLT 1.3 us out of the guest with its wait, where it was 2.4.
+- **The hole check** (aa2b4785) undid round 23's regression; growth ahead
+  four chunks first, to a gigabyte (a4548330): the first write at 82%.
+  Round 25's window: 19 commits of 5-33 ms by the growths ahead -- the later
+  with the device busy -- their stretches 108 MiB on average, every write of
+  the guest's elsewhere having begun the stream again: a stream now outlasts
+  STREAM_MISSES of them (dc529775), which moved the first write nowhere
+  (80% in rounds 26 and 27). What is left of its gap to KVM's is the commits
+  themselves, each two flushes of a device busy with the guest's data; KVM's
+  host commits once, at the guest's fsync.
+- **Rounds 26 and 27 are one image** (dc529775): 26's 1 MiB reads (97%),
+  writes (39%) and fdatasync (97%) were 149%, 127% and 117% in 27, whose
+  deploy found the NVMe drives at 38 and 32 C -- a device's state, not the
+  code's, and a reason to read any one round's dip twice before acting on
+  it. Memory random reads were at 92% (t1) and 97% (t4) in round 26.
+
 ## Done since ddcbd4c6
 
 - **The fdatasync job's tail** (p99 0.7-0.9 ms and p999 ~1 ms in every run
