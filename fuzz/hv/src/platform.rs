@@ -1367,6 +1367,24 @@ impl Script {
                         s.fail = r.u8() < 16;
                         s.order = if r.bool() { 0 } else { r.u64() };
                     }
+                    /* And now and then their task gives what they served to
+                     * the guest itself, from outside every CPU, as the hv
+                     * module's disks' tasks do -- the first CPU rung only
+                     * when the device says its round must come anyway */
+                    if r.u8() < 128 {
+                        let serving = SERVING.lock().unwrap().as_ref()
+                            .and_then(|(g, bells)| g.upgrade().map(|g| (g, bells.clone())));
+                        if let Some((guest, bells)) = serving {
+                            for i in 0..self.disks.len() {
+                                SERVED.fetch_add(1, Ordering::Relaxed);
+                                if guest.serve_disk(i as u8) {
+                                    if let Some(b) = bells.get(0) {
+                                        b.ring();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);
                         n.lock().unwrap().rx.push_back(((0..len).map(|i| i as u8).collect(), crate::offload::Rx::Done));
@@ -1476,6 +1494,12 @@ static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
 
 /// Interrupts posted for a CPU to take in its guest, and the notifications
 /// sent for them, for `HV_FUZZ_STATS`.
+/// The guest running, for a script's step to serve its disks as a disk's
+/// task does (`LinuxGuest::serve_disk`) -- its doorbells beside it, to ring
+/// the first CPU when the device says its round has to come anyway.
+static SERVING: Mutex<Option<(std::sync::Weak<LinuxGuest>, Arc<Doorbells>)>> = Mutex::new(None);
+static SERVED: AtomicU64 = AtomicU64::new(0);
+
 static POSTED: AtomicU64 = AtomicU64::new(0);
 static NOTIFIED: AtomicU64 = AtomicU64::new(0);
 /// EOIs the script's guest made through its PV EOI word -- found set by
@@ -1530,6 +1554,7 @@ pub fn report() {
     println!("  platform: {} timer interrupts more than 1 ms late after a sleep, {} otherwise; {} sleeps ended more \
               than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
              OVERSLEPT.load(Ordering::Relaxed));
+    println!("  platform: {} disks served from outside every CPU", SERVED.load(Ordering::Relaxed));
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
     println!("  platform: {} trace records built", crate::trace::emitted());
@@ -1642,7 +1667,8 @@ pub fn platform(r: &mut Input) {
     machine.vapic = vmx && r.bool();
     machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
-    let made = LinuxGuest::new(&machine, mem_bytes, huge, cpus, Arc::new(doorbells), x2apic, ioapic);
+    let doorbells = Arc::new(doorbells);
+    let made = LinuxGuest::new(&machine, mem_bytes, huge, cpus, doorbells.clone(), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {
         invariant!(made.is_err(), "a guest of {} MiB made, past the most there is", mem_bytes / MIB);
         return;
@@ -1738,6 +1764,7 @@ pub fn platform(r: &mut Input) {
     let deadline = time::boot_time_ns() + 3600 * crate::consts::NS_PER_SEC;
     let fuzz_host = Arc::new(FuzzHost(host.clone()));
     let (guest, machine) = (Arc::new(guest), Arc::new(machine));
+    *SERVING.lock().unwrap() = Some((Arc::downgrade(&guest), doorbells.clone()));
     let exits = if n == 1 {
         vm::set_vcpu(0);
         exits_of(guest.run(&mut vcpus[0], &machine, deadline, &*fuzz_host))
@@ -1745,6 +1772,7 @@ pub fn platform(r: &mut Input) {
         run_threads(&guest, vcpus, &machine, deadline, &fuzz_host)
     };
     vm::set_guest(None);
+    *SERVING.lock().unwrap() = None;
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");
     if let Some(s) = &stopped {

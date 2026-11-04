@@ -836,6 +836,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification sent to the CPU it ran on",
             posted, notified);
     }
+    let served = guest.served_msis();
+    if served != 0 {
+        let _ = writeln!(out, "  served     {} MSIs its disks' tasks sent as they served, from outside every CPU -- no CPU woken or taken out of its guest to hand a completion over",
+            served);
+    }
     if total.vid != 0 {
         let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",
             total.vid, total.eoi_exits);

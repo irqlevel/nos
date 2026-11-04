@@ -56,6 +56,15 @@ use kcore::trace::DiskHow;
 /// context.
 pub trait Wake: Send + Sync {
     fn wake(&self);
+
+    /// Disk `disk` -- vda 0 and on -- has served requests, which wait in its
+    /// pipe: given to the guest by whoever runs it -- by the disk's own task
+    /// here, where the guest lets it (`hv::run::LinuxGuest::serve_disk`) --
+    /// or the vCPU that does the devices' work woken for them.
+    fn served(&self, disk: u8) {
+        let _ = disk;
+        self.wake();
+    }
 }
 
 /// What a guest's disks are to know of whoever runs it: whom they wake,
@@ -445,7 +454,7 @@ fn serve(start: Serve) {
             requests.done.extend(finished.drain(..));
             pipe.done.store(requests.done.len(), Ordering::Release);
         }
-        pipe.wake.wake();
+        pipe.wake.served(disk);
     }
 }
 
