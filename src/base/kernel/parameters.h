@@ -42,6 +42,9 @@ public:
        whose next boot is its own OS: back there with no hand on it. */
     ulong get_panic_reset_secs();
     static const ulong PANIC_RESET_SECS_MAX = 3600;
+    /* hwp_epp=: intel_pstate's balance_performance, and the field's top */
+    static const ulong HWP_EPP_DEFAULT = 0x80;
+    static const ulong HWP_EPP_MAX = 0xFF;
     bool is_smp_off();
 
     /* maxcpus=N -- bring up at most N CPUs, the BSP included. 0 = no cap. */
@@ -70,6 +73,11 @@ public:
     /* hwp=off -- x86: leave the CPUs' clock where firmware left it rather
        than turning on hardware P-states (hal::setup_cpu_performance) */
     bool is_hwp_off();
+
+    /* hwp_epp=N -- x86: the energy/performance preference HWP is asked to
+       pick each CPU's clock by, 0 (performance) to 255 (energy); 128,
+       intel_pstate's balance_performance, by default */
+    ulong get_hwp_epp();
 
     /* c1e=firmware -- x86: leave C1E auto-promotion as firmware set it
        rather than turning it off (hal::setup_cpu_c1e) */
@@ -211,6 +219,7 @@ private:
     bool its_enabled_;
     bool hw_rng_off_;
     bool hwp_off_;
+    ulong hwp_epp_;
     bool c1e_firmware_;
     bool idle_mwait_;
     bool ucode_off_;

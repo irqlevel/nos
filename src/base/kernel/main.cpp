@@ -992,8 +992,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
            firmware's base: the APs do the same (ap_main2). */
         hal::CpuPerformance perf;
         if (hal::setup_cpu_performance(&perf))
-            klog(0, "cpu: HWP on, performance %u to %u, %u guaranteed -- the clock the CPU's own pick",
-                perf.lowest, perf.highest, perf.guaranteed);
+            klog(0, "cpu: HWP on, performance %u to %u, %u guaranteed, preference 0x%x -- the clock the CPU's own pick",
+                perf.lowest, perf.highest, perf.guaranteed, perf.epp);
         /* How an idle CPU sleeps, decided before the APs start: they idle
            the same way. */
         u32 idle_hint;

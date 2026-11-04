@@ -166,8 +166,6 @@ bool setup_cpu_performance(CpuPerformance* out)
     static const u32 REQ_MAX_SHIFT = 8;
     static const u32 REQ_DESIRED_SHIFT = 16;
     static const u32 REQ_EPP_SHIFT = 24;
-    /* intel_pstate's default preference, "balance_performance". */
-    static const u64 EPP_BALANCE_PERFORMANCE = 0x80;
 
     *out = CpuPerformance{};
     if (kernel::Parameters::get_instance().is_hwp_off())
@@ -203,16 +201,19 @@ bool setup_cpu_performance(CpuPerformance* out)
     u64 request = read_msr(HWP_REQUEST_MSR);
     request &= ~((FIELD_MASK << REQ_MIN_SHIFT) | (FIELD_MASK << REQ_MAX_SHIFT) | (FIELD_MASK << REQ_DESIRED_SHIFT));
     request |= (lowest << REQ_MIN_SHIFT) | (highest << REQ_MAX_SHIFT);
+    /* The preference hwp_epp= says, intel_pstate's balance_performance
+       (0x80) unless told */
     if (power & POWER_EAX_HWP_EPP)
     {
         request &= ~(FIELD_MASK << REQ_EPP_SHIFT);
-        request |= EPP_BALANCE_PERFORMANCE << REQ_EPP_SHIFT;
+        request |= ((u64)kernel::Parameters::get_instance().get_hwp_epp() & FIELD_MASK) << REQ_EPP_SHIFT;
     }
     write_msr(HWP_REQUEST_MSR, request);
 
     out->lowest = (u32)lowest;
     out->guaranteed = (u32)guaranteed;
     out->highest = (u32)highest;
+    out->epp = (power & POWER_EAX_HWP_EPP) ? (u32)((request >> REQ_EPP_SHIFT) & FIELD_MASK) : 0;
     return true;
 }
 
