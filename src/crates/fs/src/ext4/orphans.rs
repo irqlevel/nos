@@ -30,7 +30,7 @@ use alloc::vec;
 use extfmt::group::{self, INODE_UNINIT};
 use extfmt::inode::{Inode, EXTENTS_FL};
 use extfmt::{le32, set_le32, Map};
-use kcore::trace;
+use kcore::klog;
 
 use super::inodes;
 use super::txn::Txn;
@@ -59,11 +59,11 @@ impl Txn<'_> {
                 return Ok(Some(prev));
             }
             if !seen.insert(at) {
-                trace!(0, "ext4: the orphan list loops at inode {}", at);
+                klog!(0, "ext4: the orphan list loops at inode {}", at);
                 return Err(());
             }
             let Some(raw) = self.inode(at) else {
-                trace!(0, "ext4: orphan inode {} does not read", at);
+                klog!(0, "ext4: orphan inode {} does not read", at);
                 return Err(());
             };
             prev = Some(at);
@@ -80,13 +80,13 @@ impl Txn<'_> {
         match self.orphan_place(ino) {
             Err(()) => false,
             Ok(Some(_)) => {
-                trace!(1, "ext4: inode {} is on the orphan list already: left where it is", ino);
+                klog!(1, "ext4: inode {} is on the orphan list already: left where it is", ino);
                 true
             }
             Ok(None) => {
                 let Some(head) = self.super_now().map(|s| s.last_orphan()) else { return false };
                 set_next(raw, head);
-                trace!(1, "ext4: inode {} on the orphan list, the rest of its blocks for transactions of their own",
+                klog!(1, "ext4: inode {} on the orphan list, the rest of its blocks for transactions of their own",
                        ino);
                 self.change_super(|s| s.set_last_orphan(ino))
             }
@@ -99,7 +99,7 @@ impl Txn<'_> {
         match self.orphan_place(ino) {
             Err(()) => false,
             Ok(None) => {
-                trace!(0, "ext4: inode {} is to leave the orphan list, and is not on it", ino);
+                klog!(0, "ext4: inode {} is to leave the orphan list, and is not on it", ino);
                 false
             }
             Ok(Some(prev)) => self.orphan_unlink(ino, raw, prev),
@@ -124,7 +124,7 @@ impl Txn<'_> {
         match prev {
             None => self.change_super(|s| s.set_last_orphan(next)),
             Some(p) => {
-                trace!(1, "ext4: inode {} leaves the orphan list after inode {}", ino, p);
+                klog!(1, "ext4: inode {} leaves the orphan list after inode {}", ino, p);
                 let Some(mut before) = self.inode(p) else { return false };
                 set_next(&mut before, next);
                 self.put_inode(p, &mut before)
@@ -151,7 +151,7 @@ impl Txn<'_> {
                 return self.put_inode(ino, &mut raw).then_some(false);
             }
         } else if inodes::holds_blocks(self.m, &raw) {
-            trace!(0, "ext4: orphan inode {} is mapped by blocks, which this does not give back", ino);
+            klog!(0, "ext4: orphan inode {} is mapped by blocks, which this does not give back", ino);
             return None;
         }
         if !self.orphan_del(ino, &mut raw) {
@@ -184,7 +184,7 @@ impl Ext4 {
                 Some(true) => return true,
                 Some(false) if steps <= limit => {}
                 _ => {
-                    trace!(0, "ext4: inode {} is left on the orphan list, for the next mount to give back", ino);
+                    klog!(0, "ext4: inode {} is left on the orphan list, for the next mount to give back", ino);
                     return false;
                 }
             }

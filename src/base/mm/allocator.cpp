@@ -3,7 +3,7 @@
 #include <include/const.h>
 #include <kernel/cpu.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/lock.h>
 #include <lib/stdlib.h>
 
@@ -37,7 +37,7 @@ AllocatorImpl::AllocatorImpl(class PageAllocator* pg_alloc)
 
 AllocatorImpl::~AllocatorImpl()
 {
-    trace(0, "0x%p dtor", this);
+    klog(0, "0x%p dtor", this);
 }
 
 size_t AllocatorImpl::log2(size_t size)
@@ -84,7 +84,7 @@ void* AllocatorImpl::alloc_block(size_t size, ulong tag, bool zero_pages)
 
 	size_t log = log2(req_size);
 
-	trace(ALLOCATOR_LL, "0x%p size 0x%lX log 0x%lX", this, size, log);
+	klog(ALLOCATOR_LL, "0x%p size 0x%lX log 0x%lX", this, size, log);
 	if (BUG_ON(log < START_LOG || log > END_LOG || (log - START_LOG) >= stdlib::array_size(pool_)))
 	{
 		return nullptr;

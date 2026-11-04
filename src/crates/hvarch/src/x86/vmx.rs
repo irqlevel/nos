@@ -428,7 +428,7 @@ use kcore::consts::MAX_CPUS;
 
 use super::fp::GuestFp;
 use super::msrs::GuestMsrs;
-use super::svm::{GuestRegs, Kick, NotRun, Profile, VECTOR_AC, VECTOR_DB, VECTOR_MC};
+use super::svm::{GuestRegs, Kick, NotRun, Profile, Run, VECTOR_AC, VECTOR_DB, VECTOR_MC};
 use super::svm::vmcb::{Save, Segment};
 
 /// How many guests' VMCSs are current on each CPU: what [`disable`] refuses
@@ -839,6 +839,9 @@ pub struct Guest {
     posted: Option<alloc::sync::Arc<PostedInterrupts>>,
     posted_capable: bool,
     acked: Option<u8>,
+    /// The host's interrupt the last exit was for, as it acknowledged it:
+    /// kept for its `hv_exit` record once `acked` is handed over.
+    host_vector: Option<u8>,
     /// The guest state, kept in the same shape as an AMD-V save area so the
     /// policy layer is one set of code: synced to the VMCS before an entry
     /// and read back from it after.
@@ -981,6 +984,8 @@ pub struct Guest {
     whole_state: bool,
     /// Where each entry's time goes, while a benchmark asks.
     profile: Option<Profile>,
+    /// Its last entry's world switch, timed ([`Run`]).
+    last_run: Run,
 }
 
 impl Guest {
@@ -1028,6 +1033,7 @@ impl Guest {
             eoi_exit: [0; 4],
             posted: None,
             acked: None,
+            host_vector: None,
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
             fp,
@@ -1085,6 +1091,7 @@ impl Guest {
             entry_failed: false,
             whole_state: true,
             profile: None,
+            last_run: Run::default(),
         })
     }
 
@@ -1095,6 +1102,17 @@ impl Guest {
 
     pub fn profile(&self) -> Option<Profile> {
         self.profile
+    }
+
+    /// Its last entry's world switch, where it was timed ([`Run`]).
+    pub fn last_run(&self) -> Run {
+        self.last_run
+    }
+
+    /// The host's interrupt its last exit was for, as the exit acknowledged
+    /// it -- none for an exit of any other reason.
+    pub fn host_vector(&self) -> Option<u8> {
+        self.host_vector
     }
 
     /// The VPID the guest runs under, or None where the CPU has none.
@@ -2141,6 +2159,7 @@ impl Guest {
                 self.acked = Some((info & intr::VECTOR_MASK) as u8);
             }
         }
+        self.host_vector = self.acked;
         unsafe {
             self.exit_instr_len = if len { vmread(VMEXIT_INSTRUCTION_LEN) as u32 } else { 0 };
             self.exit_qual = if qual { vmread(EXIT_QUALIFICATION) } else { 0 };
@@ -2256,7 +2275,7 @@ impl Guest {
         kick: Option<&Kick>,
     ) -> core::result::Result<u32, NotRun> {
         let vmcs_phys = self.vmcs.phys();
-        let timed = self.profile.is_some();
+        let timed = super::svm::timed(self.profile.is_some());
         let stamp = |on: bool| if on { cpu::rdtsc() } else { 0 };
         let t0 = stamp(timed);
         let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(Ordering::Acquire));
@@ -2480,6 +2499,7 @@ impl Guest {
         let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
         entries.spec.exited(spec_ctrl.is_some());
         let t4 = stamp(timed);
+        self.last_run.next(timed, t3, t4);
 
         self.save.cr2 = cpu::read_cr2();
         unsafe { cpu::write_cr2(host_cr2) };

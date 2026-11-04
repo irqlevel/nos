@@ -3,7 +3,7 @@
 #include "preempt.h"
 #include "time.h"
 #include "panic.h"
-#include "trace.h"
+#include "klog.h"
 #include "cpu.h"
 
 static_assert(kernel::Watchdog::SLICE_CPUS == kernel::MAX_CPUS,
@@ -143,7 +143,7 @@ void Watchdog::check()
                 ulong delta_ns = cycle_counter_delta_to_ns(now - lock_time);
                 if (delta_ns > timeout_ns && lock->watchdog_reported_.cmpxchg(1, 0) == 0)
                 {
-                    trace(0, "Spinlock 0x%p is held too long %lu", lock, delta_ns);
+                    klog(0, "Spinlock 0x%p is held too long %lu", lock, delta_ns);
                 }
 
                 if (delta_ns > stuck_ns && stuck == nullptr)

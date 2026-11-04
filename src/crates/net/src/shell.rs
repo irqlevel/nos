@@ -373,7 +373,7 @@ pub fn register_all() {
         match kcore::cmd::Command::register(name, help, move |args, out| handler(args, out)) {
             /* The command is the kernel's own and stays for good. */
             Ok(cmd) => core::mem::forget(cmd),
-            Err(_) => kcore::trace!(0, "net: cannot register the {} command", name),
+            Err(_) => kcore::klog!(0, "net: cannot register the {} command", name),
         }
     }
 }
@@ -441,10 +441,10 @@ pub extern "C" fn rust_net_dhcp_stop() {
 pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
     if NETCONSOLE.is_enabled() {
         match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
-            None => kcore::trace!(0, "Netconsole: eth0 not found"),
+            None => kcore::klog!(0, "Netconsole: eth0 not found"),
             Some(dev) => {
                 if !NETCONSOLE.start(dev.as_nic()) {
-                    kcore::trace!(0, "Netconsole: failed to start");
+                    kcore::klog!(0, "Netconsole: failed to start");
                 }
             }
         }
@@ -452,10 +452,10 @@ pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
 
     if udp_shell_port != 0 {
         match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
-            None => kcore::trace!(0, "UdpShell: eth0 not found"),
+            None => kcore::klog!(0, "UdpShell: eth0 not found"),
             Some(dev) => {
                 if !abi::udp_shell_start(dev.as_nic(), udp_shell_port) {
-                    kcore::trace!(0, "UdpShell: failed to start on port {}", udp_shell_port);
+                    kcore::klog!(0, "UdpShell: failed to start on port {}", udp_shell_port);
                 }
             }
         }

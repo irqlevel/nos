@@ -1,7 +1,7 @@
 #include "vga.h"
 #include <arch/x86_64/asm.h>
 #include <kernel/watchdog.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
 #include <arch/x86_64/grub.h>
@@ -29,7 +29,7 @@ VgaTerm::VgaTerm()
        false, Buf stays null and all output methods are no-ops). */
     if (grub::has_framebuffer_info() && !grub::is_framebuffer_ega_text())
     {
-        trace(0, "Vga: no EGA text mode (pixel framebuffer), output disabled");
+        klog(0, "Vga: no EGA text mode (pixel framebuffer), output disabled");
         return;
     }
 
@@ -39,7 +39,7 @@ VgaTerm::VgaTerm()
         PANIC("Can't map page");
     }
 
-    trace(0, "Vga 0x%p buf 0x%lX mapped at 0x%p", this, buf_phy_addr_, buf_);
+    klog(0, "Vga 0x%p buf 0x%lX mapped at 0x%p", this, buf_phy_addr_, buf_);
 
     /* Set cursor shape to underline (scan lines 13-15) */
     outb(vga_base_, 0x0A);
@@ -55,7 +55,7 @@ VgaTerm::VgaTerm()
 
 VgaTerm::~VgaTerm()
 {
-    trace(0, "Vga 0x%p dtor", this);
+    klog(0, "Vga 0x%p dtor", this);
 
     stdlib::AutoLock lock(lock_);
 

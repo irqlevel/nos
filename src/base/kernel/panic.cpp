@@ -4,7 +4,7 @@
 #include <hal/context.h>
 #include "cpu.h"
 #include "parameters.h"
-#include "trace.h"
+#include "klog.h"
 #include "stack_trace.h"
 #include "symtab.h"
 #include "module.h"

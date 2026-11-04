@@ -2,7 +2,7 @@
 #include "fb_console.h"
 #include "vga.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <arch/x86_64/grub.h>
 
 namespace kernel
@@ -40,7 +40,7 @@ bool setup()
             return true;
         }
 
-        trace(0, "Screen: framebuffer console setup failed");
+        klog(0, "Screen: framebuffer console setup failed");
         return false;
     }
 
@@ -48,7 +48,7 @@ bool setup()
     {
         /* Indexed-color (palette) modes are not supported: there is no
            text mode to fall back to either, so the screen stays dark. */
-        trace(0, "Screen: unsupported framebuffer type %lu, no video console",
+        klog(0, "Screen: unsupported framebuffer type %lu, no video console",
             (ulong)fb->type);
         return false;
     }
@@ -58,7 +58,7 @@ bool setup()
     VgaTerm::get_instance();
 
     if (!VgaTerm::is_ready())
-        trace(0, "Screen: no video console (serial only)");
+        klog(0, "Screen: no video console (serial only)");
 
     return VgaTerm::is_ready();
 }

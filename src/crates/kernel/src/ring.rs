@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kcore::consts::MAX_CPUS;
 use kcore::ring::LocklessRing;
-use kcore::{task, time, trace};
+use kcore::{task, time, klog};
 
 /// The most producers a run has
 const MAX_PRODUCERS: usize = 2;
@@ -317,7 +317,7 @@ pub fn selftest() {
     let crowd = run(16, MAX_PRODUCERS, 2, each, cpus);
 
     let used = cpus.iter().fold(0u64, |mask, &cpu| mask | 1u64 << cpu);
-    trace!(0, "ring selftest: passed on cpus {:#x}: {} values one to one through 2 cells in {} us, \
+    klog!(0, "ring selftest: passed on cpus {:#x}: {} values one to one through 2 cells in {} us, \
         {} values two to two through 16 in {} us; a push and a pop {}.{} ns on one cpu",
         used, one, pair, MAX_PRODUCERS * each, crowd, tenths / 10, tenths % 10);
 }

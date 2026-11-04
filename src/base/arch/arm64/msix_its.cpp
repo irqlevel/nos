@@ -3,7 +3,7 @@
 #include "its.h"
 
 #include <drivers/mmio.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
@@ -129,7 +129,7 @@ bool MsixTable::setup(Pci::DeviceInfo* dev, const ulong* mapped_bars)
     u32 device_id = ((u32)dev->bus << 8) | ((u32)dev->slot << 3) | dev->func;
     Its::get_instance().map_device(device_id, count_);
 
-    trace(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
+    klog(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
         (ulong)count_, (ulong)cap, (ulong)device_id);
     return true;
 }
@@ -161,7 +161,7 @@ u8 MsixTable::enable_vector(u16 index, InterruptHandler& handler)
     u32 msi_data = Its::get_instance().map_event(device_id, index, handler, msi_addr);
     if (msi_addr == 0)
     {
-        trace(0, "MsixTable(its): map_event failed");
+        klog(0, "MsixTable(its): map_event failed");
         return 0;
     }
 

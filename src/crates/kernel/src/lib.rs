@@ -7,6 +7,7 @@ mod frames;
 mod ring;
 mod sha256;
 mod system;
+mod trace;
 
 use ffi::alloc::KernelAllocator;
 
@@ -69,19 +70,19 @@ fn tco_init() {
        the platform over the same hardware, so stand down; Linux skips the
        native iTCO driver on these systems for the same reason. */
     if kcore::acpi::has_firmware_watchdog() {
-        kcore::trace!(0, "TCO watchdog: ACPI WDAT present, firmware owns the watchdog");
+        kcore::klog!(0, "TCO watchdog: ACPI WDAT present, firmware owns the watchdog");
         return;
     }
 
     let wdt = match TcoWatchdog::probe() {
         Some(w) => w,
         None => {
-            kcore::trace!(0, "TCO watchdog: not found");
+            kcore::klog!(0, "TCO watchdog: not found");
             return;
         }
     };
 
-    kcore::trace!(0, "TCO watchdog: TCOBASE 0x{:04X} via {}{}",
+    kcore::klog!(0, "TCO watchdog: TCOBASE 0x{:04X} via {}{}",
         wdt.base(), wdt.source().as_str(),
         if wdt.source().no_reboot_cleared() { "" } else { ", NO_REBOOT left as firmware set it" });
 
@@ -98,7 +99,7 @@ fn tco_init() {
            not reset the machine.  Warn once. */
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !wdt.is_counting() && !WARNED.swap(true, Ordering::Relaxed) {
-            kcore::trace!(0, "TCO watchdog: timer not counting, reset-on-hang is not armed");
+            kcore::klog!(0, "TCO watchdog: timer not counting, reset-on-hang is not armed");
         }
 
         wdt.kick();
@@ -117,10 +118,10 @@ fn tco_init() {
         Some(t) => {
             t.leak();
             wdt.start(30);
-            kcore::trace!(0, "TCO watchdog: started, timeout=30s");
+            kcore::klog!(0, "TCO watchdog: started, timeout=30s");
         }
         None => {
-            kcore::trace!(0, "TCO watchdog: kick timer unavailable, not arming");
+            kcore::klog!(0, "TCO watchdog: kick timer unavailable, not arming");
         }
     }
 }
@@ -136,6 +137,7 @@ pub extern "C" fn rust_test() {
     sha256::selftest();
     frames::selftest();
     ring::selftest();
+    trace::selftest();
 }
 
 /* Contract: rust_fini must be the last thing before halt.  Block/net

@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::sync::IrqSpinLock;
 use kcore::time::{cycle_counter, wall_clock_secs};
-use kcore::trace;
+use kcore::klog;
 
 use chacha20::{BLOCK_SIZE, KEY_SIZE, NONCE_SIZE};
 
@@ -244,7 +244,7 @@ fn register(entry: Registered) -> bool {
         }
         sources.count = at + 1;
     }
-    trace!(0, "EntropySource registered: {}", entry.name);
+    klog!(0, "EntropySource registered: {}", entry.name);
     true
 }
 
@@ -281,7 +281,7 @@ fn setup() -> bool {
                 hardware = true;
             }
         } else {
-            trace!(0, "Random: {} failed its self test, not using it", name);
+            klog!(0, "Random: {} failed its self test, not using it", name);
         }
     }
 
@@ -297,11 +297,11 @@ fn setup() -> bool {
     POOL.seeded.store(seeded, Ordering::Release);
 
     match (hardware, jitter) {
-        (true, true) => trace!(0, "Random: seeded from {} and timing jitter", cpu::name().unwrap_or("none")),
-        (true, false) => trace!(0, "Random: seeded from {}", cpu::name().unwrap_or("none")),
-        (false, true) => trace!(0, "Random: seeded from timing jitter only -- this cpu has no \
+        (true, true) => klog!(0, "Random: seeded from {} and timing jitter", cpu::name().unwrap_or("none")),
+        (true, false) => klog!(0, "Random: seeded from {}", cpu::name().unwrap_or("none")),
+        (false, true) => klog!(0, "Random: seeded from timing jitter only -- this cpu has no \
             random instruction, see docs/random.md"),
-        (false, false) => trace!(0, "Random: nothing seeded the pool, https will not work"),
+        (false, false) => klog!(0, "Random: nothing seeded the pool, https will not work"),
     }
     seeded
 }
@@ -317,7 +317,7 @@ fn reseed() {
     for entry in list.iter().flatten() {
         let mut seed = [0u8; SEED_BYTES];
         if !entry.source.fill(&mut seed) {
-            trace!(RANDOM_LL, "Random: source {} gave nothing", entry.name);
+            klog!(RANDOM_LL, "Random: source {} gave nothing", entry.name);
             continue;
         }
         POOL.add_entropy(&seed);
@@ -343,7 +343,7 @@ fn reseed() {
         POOL.seeded.store(true, Ordering::Release);
     }
 
-    trace!(0, "Random: reseeded from {} of {} sources", contributed, count);
+    klog!(0, "Random: reseeded from {} of {} sources", contributed, count);
 }
 
 /* ---- the C ABI ---- */
@@ -460,7 +460,7 @@ pub fn init() {
         match Command::register(name, help, move |args, out| handler(args, out)) {
             /* The command is the kernel's own and stays for good. */
             Ok(cmd) => core::mem::forget(cmd),
-            Err(_) => trace!(0, "random: cannot register the {} command", name),
+            Err(_) => klog!(0, "random: cannot register the {} command", name),
         }
     }
 }
@@ -478,7 +478,7 @@ pub fn selftest() {
      * bug in this code -- boot says so already, and the checks below still
      * mean something, since they are about the generator and not the seed. */
     if !POOL.is_seeded() {
-        trace!(0, "random selftest: the pool is unseeded on this machine");
+        klog!(0, "random selftest: the pool is unseeded on this machine");
     }
 
     /* 33 bytes spans two blocks' output and ends mid-block, which is where a
@@ -521,5 +521,5 @@ pub fn selftest() {
     POOL.add_entropy(&[]);
     assert!(changes(), "random selftest: after an absorb, the pool gives the same u64");
 
-    trace!(0, "random selftest: passed");
+    klog!(0, "random selftest: passed");
 }

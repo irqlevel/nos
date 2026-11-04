@@ -87,13 +87,13 @@ fn field(which: u32, buf: &mut [u8]) -> usize {
     unsafe { system::kernel_version_field(which, buf.as_mut_ptr(), buf.len()) }.min(buf.len())
 }
 
-pub fn trace_level() -> u32 {
-    system::kernel_trace_level()
+pub fn log_level() -> u32 {
+    system::kernel_klog_level()
 }
 
-/// The trace level set: false -- nothing changed -- past the highest.
-pub fn set_trace_level(level: u32) -> bool {
-    system::kernel_trace_set_level(level) == 1
+/// The log level set: false -- nothing changed -- past the highest.
+pub fn set_log_level(level: u32) -> bool {
+    system::kernel_klog_set_level(level) == 1
 }
 
 /// Why a nice was not set.

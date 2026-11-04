@@ -249,6 +249,80 @@ pub extern "C" fn kernel_task_current_or_none() -> usize {
     sched::harness(|| if sched::ctx() == sched::Ctx::Task { sched::me() } else { 0 })
 }
 
+/* ---- the tracepoints ---- */
+
+/// The flags `kcore::trace` reads, a byte an event: every one on for an
+/// input whose header says so (`runner::begin`), off for the rest -- so that
+/// the layers' sites build their records, from values a disk or a peer chose,
+/// under the overflow checks too.
+static TP_FLAGS: [core::sync::atomic::AtomicU8; kcore::trace::ID_LIMIT] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; kcore::trace::ID_LIMIT];
+
+/// Every event on, or off.
+pub fn tp_set_all(on: bool) {
+    for f in &TP_FLAGS {
+        f.store(u8::from(on), core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_flags() -> *const u8 {
+    TP_FLAGS.as_ptr() as *const u8
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_count() -> usize {
+    TP_FLAGS.len()
+}
+
+/// A record, held to what kcore declares of its event -- the kernel's
+/// description, which every boot holds kcore's to: its size, each enumerated
+/// field's value one its names cover, its padding zero, and the bytes of the
+/// slot's words past it zero, as `kcore::trace::emit` lays a payload into
+/// them. Values only, as the kernel's is.
+#[no_mangle]
+pub extern "C" fn kernel_tp_record(id_size: u64, w0: u64, w1: u64, w2: u64, w3: u64, w4: u64) {
+    const RECORD_SIZE_SHIFT: u32 = 16;
+    let id = (id_size & 0xFFFF) as u16;
+    let size = usize::try_from(id_size >> RECORD_SIZE_SHIFT).unwrap_or(usize::MAX);
+    let Some(e) = kcore::trace::EVENTS.iter().find(|e| e.id as u16 == id) else {
+        panic!("invariant: a record of event {}, which kcore declares no payload of", id);
+    };
+    if size != e.size {
+        panic!("invariant: a record of {} of {} bytes, its payload's being {}", e.name, size, e.size);
+    }
+    let mut slot = [0u8; 40];
+    for (chunk, word) in slot.chunks_exact_mut(8).zip([w0, w1, w2, w3, w4]) {
+        chunk.copy_from_slice(&word.to_ne_bytes());
+    }
+    let Some((bytes, past)) = slot.split_at_checked(size) else {
+        panic!("invariant: a record of {} of {} bytes, past a slot's", e.name, size);
+    };
+    if past.iter().any(|&b| b != 0) {
+        panic!("invariant: {}'s slot words past its {} bytes are not zero: {:?}", e.name, size, past);
+    }
+    for f in e.fields {
+        let Some(field) = bytes.get(f.offset..f.offset + f.size) else {
+            panic!("invariant: {}'s field {} past its payload", e.name, f.name);
+        };
+        if f.name.starts_with('_') && field.iter().any(|&b| b != 0) {
+            panic!("invariant: {}'s {} is not zero: {:?}", e.name, f.name, field);
+        }
+        if !f.names.is_empty() && (f.size != 1 || usize::from(field[0]) >= f.names.len()) {
+            panic!("invariant: {}'s {} is {:?}, which none of its {} names is", e.name, f.name, field, f.names.len());
+        }
+    }
+    /* What the stats count: which events the inputs had records of -- the
+     * fuzzer's own work, whose allocation is not the kernel's, wherever the
+     * record was made: under a spin lock, in an interrupt. */
+    sched::harness(|| super::super::runner::reached(e.name));
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_tp_pid() -> u32 {
+    sched::harness(|| if sched::ctx() == sched::Ctx::Task { u32::try_from(sched::me()).unwrap_or(u32::MAX) } else { u32::MAX })
+}
+
 /* ---- soft IRQs and timers ---- */
 
 #[no_mangle]
@@ -294,8 +368,8 @@ pub unsafe extern "C" fn kernel_get_random(buf: *mut u8, len: usize) -> i32 {
 /// # Safety
 /// `msg` points at `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_trace(level: u32, msg: *const u8, len: usize) {
-    // SAFETY: the caller's message, `kcore::trace`'s buffer.
+pub unsafe extern "C" fn kernel_klog(level: u32, msg: *const u8, len: usize) {
+    // SAFETY: the caller's message, `kcore::klog`'s buffer.
     let msg = unsafe { core::slice::from_raw_parts(msg, len) };
     sched::harness(|| super::trace(level, msg))
 }
@@ -482,14 +556,21 @@ pub unsafe extern "C" fn kernel_task_snapshot(out: *mut ffi::system::TaskInfo, m
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_trace_level() -> u32 {
+pub extern "C" fn kernel_klog_level() -> u32 {
     super::trace_level()
+}
+
+/// Every line under `--trace`, which echoes each whatever its level; the
+/// log's own otherwise.
+#[no_mangle]
+pub extern "C" fn kernel_klog_wants(level: u32) -> i32 {
+    (super::ECHO_TRACE.load(std::sync::atomic::Ordering::Relaxed) || level <= super::trace_level()) as i32
 }
 
 /// Taken as the kernel takes one, and nothing changed: the fuzzer's log
 /// keeps its level.
 #[no_mangle]
-pub extern "C" fn kernel_trace_set_level(level: u32) -> i32 {
+pub extern "C" fn kernel_klog_set_level(level: u32) -> i32 {
     (level <= 9) as i32
 }
 

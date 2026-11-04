@@ -7,7 +7,7 @@ use core::fmt::Write;
 
 use fs::vfs::{Open, OPEN_READ};
 use kcore::cmd::{Command, Output};
-use kcore::trace;
+use kcore::klog;
 use sha2::{Digest, Sha256};
 
 /// A file is hashed this much at a time.
@@ -22,7 +22,7 @@ pub fn init() {
     ) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "sha256: cannot register the command"),
+        Err(_) => klog!(0, "sha256: cannot register the command"),
     }
 }
 
@@ -88,7 +88,7 @@ pub fn selftest() {
         0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
     ];
 
-    trace!(0, "sha256 selftest: started");
+    klog!(0, "sha256 selftest: started");
 
     let mut hash = Sha256::new();
     hash.update(b"abc");
@@ -102,5 +102,5 @@ pub fn selftest() {
     hash.update(b"c");
     assert!(hash.finalize()[..] == ABC_DIGEST, "sha256: wrong digest for \"abc\" in pieces");
 
-    trace!(0, "sha256 selftest: complete");
+    klog!(0, "sha256 selftest: complete");
 }

@@ -67,7 +67,7 @@ impl kmod::Module for ModTest {}
 
 impl Drop for ModTest {
     fn drop(&mut self) {
-        kcore::trace!(0, "modtest: unloaded");
+        kcore::klog!(0, "modtest: unloaded");
     }
 }
 
@@ -75,7 +75,7 @@ fn check(ok: bool, what: &str) -> Result<()> {
     if ok {
         return Ok(());
     }
-    kcore::trace!(0, "modtest: {} came out wrong", what);
+    kcore::klog!(0, "modtest: {} came out wrong", what);
     Err(Error::InvalidValue)
 }
 
@@ -150,7 +150,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
     let provider = Provider::register("modtest", &methods, include_str!("modtest.descriptor.json"), provide)
         .map_err(|_| Error::Busy)?;
 
-    kcore::trace!(0, "modtest: loaded, every check passed");
+    kcore::klog!(0, "modtest: loaded, every check passed");
     Ok(Box::new(ModTest { _cmd: cmd, _provider: provider }))
 }
 

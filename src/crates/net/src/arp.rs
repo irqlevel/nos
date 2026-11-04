@@ -25,7 +25,7 @@ use crate::frame::Frame;
 use crate::nic::Nic;
 use kcore::sync::SpinLock;
 use kcore::time;
-use kcore::trace;
+use kcore::klog;
 
 use crate::wire::{self, arp, eth, Mac, ARP_LEN, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP,
                   ARP_OP_REPLY, ARP_OP_REQUEST, MAC_BROADCAST};
@@ -230,7 +230,7 @@ impl ArpTable {
         if now.saturating_sub(last) >= CONFLICT_GAP_MS
             && self.conflict_ms.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
-            trace!(0, "arp: {} says it has this machine's address {}", wire::MacHex(*mac), wire::Ipv4(own));
+            klog!(0, "arp: {} says it has this machine's address {}", wire::MacHex(*mac), wire::Ipv4(own));
         }
     }
 
@@ -329,7 +329,7 @@ fn send(nic: &Nic, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32)
     let mut frame = match Frame::alloc_tx(len) {
         Some(frame) => frame,
         None => {
-            trace!(0, "arp: no frame to send with");
+            klog!(0, "arp: no frame to send with");
             return;
         }
     };
@@ -345,7 +345,7 @@ fn send(nic: &Nic, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32)
     }
 
     if !nic.transmit(frame) {
-        trace!(0, "arp: the frame could not be queued");
+        klog!(0, "arp: the frame could not be queued");
     }
 }
 

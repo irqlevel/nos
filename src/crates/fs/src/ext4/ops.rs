@@ -15,7 +15,7 @@ use extfmt::dir::{self, FT_DIR, FT_REG_FILE};
 use extfmt::inode::{self as xinode, Inode, S_IFDIR, S_IFREG};
 use extfmt::xattr;
 use kcore::time::wall_clock_secs;
-use kcore::trace;
+use kcore::klog;
 
 use super::inodes;
 use super::txn::{Kind, Txn};
@@ -95,7 +95,7 @@ impl Txn<'_> {
             match self.dir_empty(ino, &raw) {
                 Some(true) => {}
                 Some(false) => {
-                    trace!(0, "ext4: directory {} holds entries on the disk the tree does not show: not removed", ino);
+                    klog!(0, "ext4: directory {} holds entries on the disk the tree does not show: not removed", ino);
                     return None;
                 }
                 None => return None,
@@ -152,19 +152,19 @@ impl Txn<'_> {
     /// Attribute block `b`, one inode fewer naming it: freed with the last.
     fn release_xattr(&mut self, ino: u32, b: u64) -> bool {
         if b < self.m.first_data || b >= self.m.blocks || self.m.in_system(b) {
-            trace!(0, "ext4: inode {} names attribute block {}, which no file may hold", ino, b);
+            klog!(0, "ext4: inode {} names attribute block {}, which no file may hold", ino, b);
             return false;
         }
         let made = self.dirty.contains_key(&b);
         let Some(data) = self.read(b) else { return false };
         if xattr::magic(&data) != xattr::MAGIC
             || (self.m.csum && !made && xattr::block_csum(self.m.seed, b, &data) != Some(xattr::stored_csum(&data))) {
-            trace!(0, "ext4: inode {}'s attribute block {} is damaged", ino, b);
+            klog!(0, "ext4: inode {}'s attribute block {} is damaged", ino, b);
             return false;
         }
         match xattr::refcount(&data) {
             0 => {
-                trace!(0, "ext4: attribute block {} counts no references", b);
+                klog!(0, "ext4: attribute block {} counts no references", b);
                 false
             }
             1 => self.free_block(b),
@@ -184,11 +184,11 @@ impl Ext4 {
     /// journal not aborted.
     pub(super) fn writable(&self) -> bool {
         if !self.mounted || self.read_only {
-            trace!(0, "ext4: read-only");
+            klog!(0, "ext4: read-only");
             return false;
         }
         if self.jnl.as_ref().is_none_or(|j| j.aborted) {
-            trace!(0, "ext4: the journal is aborted: nothing more is written");
+            klog!(0, "ext4: the journal is aborted: nothing more is written");
             return false;
         }
         true
@@ -200,7 +200,7 @@ impl Ext4 {
     /// an abort, as nothing more is written.
     pub(super) fn begin(&mut self) -> Option<Txn<'_>> {
         if self.jnl.as_ref().is_none_or(|j| j.aborted) {
-            trace!(0, "ext4: the journal is aborted: nothing more is written");
+            klog!(0, "ext4: the journal is aborted: nothing more is written");
             return None;
         }
         let now = wall_clock_secs() as u32;
@@ -219,11 +219,11 @@ impl Ext4 {
             return None;
         }
         let Some(dir_ino) = self.dir_ino(dir) else {
-            trace!(0, "ext4: a create in something that is not a directory");
+            klog!(0, "ext4: a create in something that is not a directory");
             return None;
         };
         if !usable_name(name) {
-            trace!(0, "ext4: a name of {} bytes cannot be made", name.len());
+            klog!(0, "ext4: a name of {} bytes cannot be made", name.len());
             return None;
         }
         /* Loaded first, and refused if it does not load: made into a
@@ -233,11 +233,11 @@ impl Ext4 {
             return None;
         }
         if self.tree.find_child(dir, name).is_some() {
-            trace!(0, "ext4: there is something by that name already");
+            klog!(0, "ext4: there is something by that name already");
             return None;
         }
         let Some(node) = self.tree.alloc(name, if is_dir { VKind::Dir } else { VKind::File }) else {
-            trace!(0, "ext4: no memory for a vnode");
+            klog!(0, "ext4: no memory for a vnode");
             return None;
         };
         let generation = kcore::random::random_u64().map_or(wall_clock_secs() as u32 ^ 0x9E37_79B9, |r| r as u32);
@@ -268,22 +268,22 @@ impl Ext4 {
         }
         let Some((ino, is_dir)) = self.tree.get(node).map(|n| (n.ino as u32, n.is_dir())) else { return false };
         let Some(old_dir) = self.tree.parent(node) else {
-            trace!(0, "ext4: the root cannot be renamed");
+            klog!(0, "ext4: the root cannot be renamed");
             return false;
         };
         let (Some(old_ino), Some(new_ino)) = (self.dir_ino(old_dir), self.dir_ino(new_dir)) else {
-            trace!(0, "ext4: the target of a rename is not a directory");
+            klog!(0, "ext4: the target of a rename is not a directory");
             return false;
         };
         if !usable_name(new_name) {
-            trace!(0, "ext4: a name of {} bytes cannot be made", new_name.len());
+            klog!(0, "ext4: a name of {} bytes cannot be made", new_name.len());
             return false;
         }
         if !self.load_dir(new_dir) {
             return false;
         }
         if self.tree.find_child(new_dir, new_name).is_some() {
-            trace!(0, "ext4: there is something by that name already");
+            klog!(0, "ext4: there is something by that name already");
             return false;
         }
         let old_name: Vec<u8> = self.tree[node].name().to_vec();
@@ -319,7 +319,7 @@ impl Ext4 {
                     return false;
                 }
                 if self.hidden.get(&ino).copied().unwrap_or(0) != 0 {
-                    trace!(0, "ext4: directory {} holds entries the tree does not show: nothing removed", ino);
+                    klog!(0, "ext4: directory {} holds entries the tree does not show: nothing removed", ino);
                     return false;
                 }
             }
@@ -333,7 +333,7 @@ impl Ext4 {
             return false;
         }
         if self.tree.parent(node).is_none() {
-            trace!(0, "ext4: the root cannot be removed");
+            klog!(0, "ext4: the root cannot be removed");
             return false;
         }
         if !self.removable(node) {

@@ -13,10 +13,11 @@
 #include <mm/new.h>
 #include <mm/allocator.h>
 #include <hal/mmu.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
+#include <kernel/tracepoint.h>
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
@@ -125,7 +126,7 @@ static void finalize_on_boot_stack(void* ctx)
 {
     (void)ctx;
 
-    trace(0, "finalize_on_boot_stack");
+    klog(0, "finalize_on_boot_stack");
 
     halt_task->put();
 
@@ -133,7 +134,7 @@ static void finalize_on_boot_stack(void* ctx)
 
     __cxa_finalize(0);
 
-    trace(0, "Finalized");
+    klog(0, "Finalized");
 
     halt_action_fn();
 }
@@ -147,11 +148,11 @@ static void __attribute__((noreturn)) prepare_halt_arm(HaltAction action)
 
     preempt_disable();
 
-    trace(0, "Stopping cpu's");
+    klog(0, "Stopping cpu's");
 
     CpuTable::get_instance().exit_all_except_self();
 
-    trace(0, "Cpu's stopped");
+    klog(0, "Cpu's stopped");
 
     preempt_off();
 
@@ -172,7 +173,7 @@ static void ap_startup_arm(void* ctx)
 
     auto& cpu = CpuTable::get_instance().get_current_cpu();
 
-    trace(0, "Cpu %lu running task 0x%p", cpu.get_index(),
+    klog(0, "Cpu %lu running task 0x%p", cpu.get_index(),
         Task::get_current_task());
 
     BUG_ON(hal::is_interrupt_enabled());
@@ -240,7 +241,7 @@ static void bp_startup_arm(void* ctx)
             slots[count].reserved = 0;
             count++;
         }
-        trace(0, "virtio-mmio: %lu windows from the device tree", count);
+        klog(0, "virtio-mmio: %lu windows from the device tree", count);
 
         rust_virtio_blk_init_mmio(slots, count);
         rust_virtio_scsi_init_mmio(slots, count);
@@ -263,7 +264,7 @@ static void bp_startup_arm(void* ctx)
     }
 
     preempt_on();
-    trace(0, "Preempt is now on");
+    klog(0, "Preempt is now on");
 
     /* IPI round-trip test (mirrors kernel/main.cpp bp_startup) */
     ulong cpu_mask = cpus.get_running_cpus();
@@ -303,7 +304,7 @@ static void bp_startup_arm(void* ctx)
         return;
     }
 
-    trace(0, "After test");
+    klog(0, "After test");
     ubsan::announce();
 
     rust_init();
@@ -352,7 +353,11 @@ static void bp_startup_arm(void* ctx)
        UDP: both on eth0, both the layer's to start. */
     rust_net_start_services(Parameters::get_instance().get_udp_shell_port());
 
-    trace(0, "boot: complete");
+    /* The events tracepoints= named, on now that every CPU has its ring --
+       after the self-tests, whose own use of the rings ends in freeing them. */
+    tp::boot_on(Parameters::get_instance().get_tracepoints());
+
+    klog(0, "boot: complete");
 
     for (;;)
     {
@@ -361,9 +366,9 @@ static void bp_startup_arm(void* ctx)
         {
             bool reboot = cmd.should_reboot();
             if (reboot)
-                trace(0, "Reboot requested");
+                klog(0, "Reboot requested");
             else
-                trace(0, "Shutdown requested");
+                klog(0, "Shutdown requested");
 
             rust_net_stop_shell();
             cmd.stop();
@@ -419,15 +424,15 @@ static void wx_probe_heap()
     void* va = mm::alloc_map_pages(1, &phys);
     if (va == nullptr)
     {
-        trace(0, "W^X probe: no page for the heap probe");
+        klog(0, "W^X probe: no page for the heap probe");
         return;
     }
 
     *reinterpret_cast<volatile u32*>(va) = RET_INSN;
     hal::sync_instruction_cache((ulong)va, sizeof(RET_INSN));
-    trace(0, "W^X probe: calling into a heap page 0x%lX (expect instr abort)", (ulong)va);
+    klog(0, "W^X probe: calling into a heap page 0x%lX (expect instr abort)", (ulong)va);
     reinterpret_cast<void (*)()>(va)();
-    trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
+    klog(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
 /* PSCI CPU_ON lands here (via boot.S secondary_entry) on the AP boot stack */
@@ -445,7 +450,7 @@ extern "C" void ap_main_arm64(ulong index)
 
     if (!cpu.run(ap_startup_arm, nullptr))
     {
-        trace(0, "Can't run cpu %lu task", cpu.get_index());
+        klog(0, "Can't run cpu %lu task", cpu.get_index());
         return;
     }
 }
@@ -505,12 +510,12 @@ extern "C" void main_arm64(void* dtb)
 
     /* Until the command line has been read there is nothing to read it from,
        so the earliest traces are always at the default level. */
-    Tracer::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
+    Klog::get_instance().set_level(Parameters::DEFAULT_LOG_LEVEL);
 
-    trace(0, "nos arm64: dtb 0x%p bootargs '%s' cpus %lu", dtb,
+    klog(0, "nos arm64: dtb 0x%p bootargs '%s' cpus %lu", dtb,
         board.boot_args_, board.cpu_count_);
     if (board.refused_ != 0)
-        trace(0, "nos arm64: dtb: %lu values refused -- out of reach, not an interrupt the kernel "
+        klog(0, "nos arm64: dtb: %lu values refused -- out of reach, not an interrupt the kernel "
             "takes, or unreadable -- the defaults in their place", board.refused_);
 
     auto& mmap = mm::MemoryMap::get_instance();
@@ -518,7 +523,7 @@ extern "C" void main_arm64(void* dtb)
     {
         mmap.add_region(board.mem_regions_[i].addr, board.mem_regions_[i].size,
             MEM_REGION_USABLE_RAM);
-        trace(0, "memory 0x%lX size 0x%lX", board.mem_regions_[i].addr,
+        klog(0, "memory 0x%lX size 0x%lX", board.mem_regions_[i].addr,
             board.mem_regions_[i].size);
     }
     /* Keep the allocator away from the DTB */
@@ -530,13 +535,13 @@ extern "C" void main_arm64(void* dtb)
 
     Parameters::get_instance().parse(board.boot_args_);
 
-    Tracer::get_instance().set_level(Parameters::get_instance().get_log_level());
+    Klog::get_instance().set_level(Parameters::get_instance().get_log_level());
 
     /* Arm log capture as soon as the command line is known: the ring buffers
        everything until the network can carry it away. */
     rust_netconsole_setup();
 
-    trace(0, "Enter kernel: start 0x%lX end 0x%lX",
+    klog(0, "Enter kernel: start 0x%lX end 0x%lX",
         mmap.get_kernel_start(), mmap.get_kernel_end());
 
     auto& bpt = mm::BuiltinPageTable::get_instance();
@@ -545,15 +550,15 @@ extern "C" void main_arm64(void* dtb)
 
     bpt.map_high_ram();
 
-    trace(0, "Builtin paging root 0x%lX", bpt.get_root());
+    klog(0, "Builtin paging root 0x%lX", bpt.get_root());
     hal::set_translation_root(bpt.get_root());
-    trace(0, "Builtin paging active");
+    klog(0, "Builtin paging active");
 
     auto& pt = mm::PageTable::get_instance();
     if (!pt.setup())
         PANIC("Can't setup paging");
 
-    trace(0, "Paging root 0x%lX", pt.get_root());
+    klog(0, "Paging root 0x%lX", pt.get_root());
 
     /* Keep the UART (and the rest of the MMIO GiB) mapped across the
        root switch: install the device block while the builtin linear map
@@ -562,7 +567,7 @@ extern "C" void main_arm64(void* dtb)
         PANIC("Can't install device block");
 
     hal::set_translation_root(pt.get_root());
-    trace(0, "Paging active");
+    klog(0, "Paging active");
 
     if (!pt.setup_free_pages_list())
         PANIC("Can't setup free pages list");
@@ -584,25 +589,25 @@ extern "C" void main_arm64(void* dtb)
         pt.protect_range(text_end, rodata_end - text_end, false, false);      /* RO+NX */
         pt.protect_range(rodata_end, img_end - rodata_end, true, false);      /* RW+NX */
         asm volatile("dsb ish; isb");
-        trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
+        klog(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             text_start, text_end, text_end, rodata_end, rodata_end, img_end);
 
         if (Parameters::get_instance().is_wx_probe_text())
         {
-            trace(0, "W^X probe: writing to text 0x%lX (expect data abort)", text_start);
+            klog(0, "W^X probe: writing to text 0x%lX (expect data abort)", text_start);
             *reinterpret_cast<volatile u32*>(text_start) = 0;
-            trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
+            klog(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
         }
     }
 
     /* Test paging (mirrors Main2) */
     {
-        trace(0, "Test paging");
+        klog(0, "Test paging");
         auto page = pt.alloc_page();
         if (!page)
             PANIC("Can't alloc page");
         auto va = pt.tmp_map_page(page->get_phy_address());
-        trace(0, "va 0x%lX pha 0x%lX", va, page->get_phy_address());
+        klog(0, "va 0x%lX pha 0x%lX", va, page->get_phy_address());
         stdlib::mem_set((void *)va, 0, consts::PAGE_SIZE);
         pt.tmp_unmap_page(va);
         pt.free_page(page);
@@ -623,18 +628,18 @@ extern "C" void main_arm64(void* dtb)
        virtio-rng is folded in later, once the mmio slots have been probed. */
     hal::probe_hw_random();
     if (!rust_random_setup())
-        trace(0, "Random: unseeded at boot, https will fail until a source turns up");
+        klog(0, "Random: unseeded at boot, https will fail until a source turns up");
 
-    trace(0, "Before test");
+    klog(0, "Before test");
 
     auto err = test::test();
     if (!err.ok())
     {
-        trace_error(err, "Test failed");
+        klog_error(err, "Test failed");
         PANIC("Self test failed");
     }
 
-    trace(0, "Self test passed");
+    klog(0, "Self test passed");
 
     auto& gic = Gic::get_instance();
     if (!gic.setup(board.gicd_base_, board.gicr_base_, board.gicr_size_))
@@ -644,7 +649,7 @@ extern "C" void main_arm64(void* dtb)
     if (board.its_base_ != 0 && Parameters::get_instance().is_its_enabled())
     {
         if (!Its::get_instance().setup(board.its_base_, board.gicr_base_, board.gicr_size_))
-            trace(0, "ITS setup failed; PCIe MSI unavailable");
+            klog(0, "ITS setup failed; PCIe MSI unavailable");
     }
 
     /* PCIe over ECAM: map config space, enumerate, assign BARs */
@@ -664,7 +669,7 @@ extern "C" void main_arm64(void* dtb)
     if (!cpus.set_bsp_index(cpu.get_index()))
         PANIC("Can't set boot processor index");
 
-    trace(0, "Before cpu run");
+    klog(0, "Before cpu run");
 
     if (!cpu.run(bp_startup_arm, nullptr))
         PANIC("Can't run cpu task");

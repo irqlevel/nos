@@ -11,7 +11,7 @@
 //! bytes when the counter is too coarse to show any variance at all.
 
 use kcore::time::cycle_counter;
-use kcore::trace;
+use kcore::klog;
 
 use crate::Source;
 
@@ -62,7 +62,7 @@ fn collect(buf: &mut [u8]) -> bool {
                 /* Every measurement took exactly as long as the one before
                  * it: the counter is too coarse to see this much work, or it
                  * is not running. Biased bytes would be worse than none. */
-                trace!(0, "Jitter: no variance in {} cycle-counter measurements", 2 * MAX_PAIRS_PER_BYTE);
+                klog!(0, "Jitter: no variance in {} cycle-counter measurements", 2 * MAX_PAIRS_PER_BYTE);
                 return false;
             }
         }

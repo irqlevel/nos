@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use extfmt::dir;
 use extfmt::inode::{self as xinode, Inode, EXTENTS_FL, INDEX_FL};
 use extfmt::{le16, le32, set_le16, set_le32, Map};
-use kcore::trace;
+use kcore::klog;
 
 use super::inodes::{self as inode, LINK_MAX};
 use super::source;
@@ -34,7 +34,7 @@ impl Txn<'_> {
         let size = Inode::new(raw)?.size(self.m.largedir());
         let bs = self.m.bs as u64;
         if size % bs != 0 {
-            trace!(0, "ext4: directory {} is {} bytes, not whole blocks", ino, size);
+            klog!(0, "ext4: directory {} is {} bytes, not whole blocks", ino, size);
             return None;
         }
         let n = size / bs;
@@ -52,7 +52,7 @@ impl Txn<'_> {
                     l += run.max(1);
                 }
                 Map::Hole { .. } => {
-                    trace!(0, "ext4: directory {} has a hole at block {}", ino, l);
+                    klog!(0, "ext4: directory {} has a hole at block {}", ino, l);
                     return None;
                 }
             }
@@ -72,7 +72,7 @@ impl Txn<'_> {
                 dir::tail(&blk).is_some_and(|s| s == dir::leaf_csum(iseed, &blk))
             };
             if !ok {
-                trace!(0, "ext4: block {} of directory {} fails its checksum", l, ino);
+                klog!(0, "ext4: block {} of directory {} fails its checksum", l, ino);
                 return None;
             }
         }
@@ -85,11 +85,11 @@ impl Txn<'_> {
         let raw = self.inode(dir)?;
         let node = Inode::new(&raw)?;
         if !node.is_dir() {
-            trace!(0, "ext4: inode {} is not a directory", dir);
+            klog!(0, "ext4: inode {} is not a directory", dir);
             return None;
         }
         if node.flags() & EXTENTS_FL == 0 {
-            trace!(0, "ext4: directory {} is mapped by blocks, which this does not change", dir);
+            klog!(0, "ext4: directory {} is mapped by blocks, which this does not change", dir);
             return None;
         }
         let iseed = xinode::seed(self.m.seed, dir, node.generation());
@@ -116,12 +116,12 @@ impl Txn<'_> {
                 let e = match e {
                     Ok(e) => e,
                     Err(why) => {
-                        trace!(0, "ext4: {}", why);
+                        klog!(0, "ext4: {}", why);
                         return false;
                     }
                 };
                 if e.ino != 0 && e.name == name {
-                    trace!(0, "ext4: directory {} names that already", dir);
+                    klog!(0, "ext4: directory {} names that already", dir);
                     return false;
                 }
                 let keep = if e.ino == 0 { 0 } else { dir::entry_len(e.name.len()) };
@@ -186,7 +186,7 @@ impl Txn<'_> {
                 let e = match e {
                     Ok(e) => e,
                     Err(why) => {
-                        trace!(0, "ext4: {}", why);
+                        klog!(0, "ext4: {}", why);
                         return false;
                     }
                 };
@@ -205,7 +205,7 @@ impl Txn<'_> {
             inode::touch(&mut raw, self.now, true);
             return self.put_inode(dir, &mut raw);
         }
-        trace!(0, "ext4: directory {} has no entry of inode {} by that name", dir, child);
+        klog!(0, "ext4: directory {} has no entry of inode {} by that name", dir, child);
         false
     }
 
@@ -225,7 +225,7 @@ impl Txn<'_> {
                 let sound = dir::dx_count_offset(&blk) == Some(dir::DX_ROOT_COUNT) && blk[6] == 1 && blk[8] == b'.'
                     && blk[12 + 6] == 2 && &blk[12 + 8..12 + 10] == b"..";
                 if !sound {
-                    trace!(0, "ext4: directory {}'s index has no root", dir);
+                    klog!(0, "ext4: directory {}'s index has no root", dir);
                     return false;
                 }
                 Some((le32(&blk, 0), blk[7], le32(&blk, 12), blk[12 + 7]))
@@ -248,7 +248,7 @@ impl Txn<'_> {
         }
         let flags = le32(raw, xinode::I_FLAGS);
         set_le32(raw, xinode::I_FLAGS, flags & !INDEX_FL);
-        trace!(1, "ext4: directory {}'s index dropped: it is linear now", dir);
+        klog!(1, "ext4: directory {}'s index dropped: it is linear now", dir);
         true
     }
 
@@ -285,7 +285,7 @@ impl Txn<'_> {
         let Some(blk) = self.dir_block(dir, iseed, indexed, 0, b0) else { return false };
         let at = dir::rec_len_from_disk(le16(&blk, 4), blk.len());
         if at < 12 || at + 10 > blk.len() || blk[at + 6] != 2 || &blk[at + 8..at + 10] != b".." {
-            trace!(0, "ext4: directory {} has no '..' second", dir);
+            klog!(0, "ext4: directory {} has no '..' second", dir);
             return false;
         }
         let dx = is_dx(indexed, 0, &blk);
@@ -304,7 +304,7 @@ impl Txn<'_> {
             (_, 1) => 1,
             (true, n) if n >= LINK_MAX => {
                 if !self.m.dir_nlink() {
-                    trace!(0, "ext4: directory {} has all the subdirectories its link count holds", dir);
+                    klog!(0, "ext4: directory {} has all the subdirectories its link count holds", dir);
                     return false;
                 }
                 1
@@ -312,7 +312,7 @@ impl Txn<'_> {
             (true, n) => n + 1,
             (false, n) if n > 2 => n - 1,
             (false, n) => {
-                trace!(0, "ext4: directory {} counts {} links, and loses a subdirectory", dir, n);
+                klog!(0, "ext4: directory {} counts {} links, and loses a subdirectory", dir, n);
                 n
             }
         };

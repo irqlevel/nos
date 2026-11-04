@@ -2,7 +2,7 @@
 
 #include <hal/context.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/interrupt.h>
 
 /* EL1 exception entries called from vectors.S. The x86 twin is the

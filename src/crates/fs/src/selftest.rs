@@ -17,7 +17,7 @@ use kcore::cmd::Output;
 use kcore::sync::Event;
 use kcore::task::{self, TaskHandle};
 use kcore::time::Duration;
-use kcore::trace;
+use kcore::klog;
 
 use crate::files::buffer;
 use crate::image::Image;
@@ -44,7 +44,7 @@ struct Reporter<'a> {
 
 impl Reporter<'_> {
     fn say(&mut self, path: &str, what: &str) {
-        trace!(0, "fstest: {}: {}", path, what);
+        klog!(0, "fstest: {}: {}", path, what);
         if let Some(out) = self.out.as_mut() {
             let _ = writeln!(out, "fstest: {}: {}", path, what);
         }
@@ -256,7 +256,7 @@ fn verify(vfs: &Vfs, path: &str, rbuf: &mut [u8], expect_len: usize,
             };
             if *byte != want {
                 report.say(path, "content mismatch");
-                trace!(0, "fstest: {}: mismatch at {} {}", path, off, when);
+                klog!(0, "fstest: {}: mismatch at {} {}", path, off, when);
                 return false;
             }
         }
@@ -319,7 +319,7 @@ fn far_verify(vfs: &Vfs, path: &str, buf: &mut [u8], end: usize, report: &mut Re
         }
         if let Some(at) = (0..len).find(|i| buf[*i] != far_byte(from + i, end)) {
             report.say(path, "far file content mismatch");
-            trace!(0, "fstest: {}: mismatch at {} {}", path, from + at, when);
+            klog!(0, "fstest: {}: mismatch at {} {}", path, from + at, when);
             return false;
         }
     }
@@ -334,7 +334,7 @@ fn far_verify(vfs: &Vfs, path: &str, buf: &mut [u8], end: usize, report: &mut Re
 /// all.
 fn far_file(vfs: &Vfs, path: &str, report: &mut Reporter) -> bool {
     if vfs.sparse_max(path.as_bytes()) < FAR_SIZE {
-        trace!(0, "fstest: {}: no sparse file that big here, the far file skipped", path);
+        klog!(0, "fstest: {}: no sparse file that big here, the far file skipped", path);
         return true;
     }
     let mut buf = match buffer(FAR_PATCH + 2 * FAR_MARGIN) {

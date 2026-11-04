@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
-use kcore::trace;
+use kcore::klog;
 
 /// Disks looked at, and partitions registered, at most. The kernel's device
 /// table holds 48 in all (BlockDeviceTable::MAX_DEVICES), which these fit
@@ -108,7 +108,7 @@ pub extern "C" fn rust_partitions_probe() {
         }
     }
 
-    trace!(0, "part: {} partitions on {} disks", PART_COUNT.load(Ordering::Relaxed),
+    klog!(0, "part: {} partitions on {} disks", PART_COUNT.load(Ordering::Relaxed),
         PROBED_COUNT.load(Ordering::Relaxed));
 }
 
@@ -116,7 +116,7 @@ pub extern "C" fn rust_partitions_probe() {
 /// Called from `rust_init`, before anything can claim a device.
 pub fn init() {
     if !table::claims_setup() {
-        trace!(0, "block: no memory for the claim table -- writes will be refused");
+        klog!(0, "block: no memory for the claim table -- writes will be refused");
     }
 
     register("disks", "disks - list block devices", table::dump);
@@ -131,7 +131,7 @@ fn register(name: &'static str, help: &'static str, handler: fn(&str, &mut Outpu
     match Command::register(name, help, move |args, out| handler(args, out)) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "block: cannot register the {} command", name),
+        Err(_) => klog!(0, "block: cannot register the {} command", name),
     }
 }
 
@@ -154,7 +154,7 @@ fn remember(disk: Disk) -> Seen {
     }
 
     if probed >= MAX_DISKS {
-        trace!(0, "part: {} disks looked at already, the rest are not", MAX_DISKS);
+        klog!(0, "part: {} disks looked at already, the rest are not", MAX_DISKS);
         return Seen::NoRoom;
     }
 
@@ -227,7 +227,7 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
     };
 
     if !header.crc_ok {
-        trace!(0, "part: GPT header checksum mismatch, disk left alone");
+        klog!(0, "part: GPT header checksum mismatch, disk left alone");
         return;
     }
 
@@ -284,7 +284,7 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
 fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
     if start == 0 {
         /* Would alias the partition table itself. */
-        trace!(0, "part: partition {} starts at LBA 0, skipped", index + 1);
+        klog!(0, "part: partition {} starts at LBA 0, skipped", index + 1);
         return true;
     }
 
@@ -294,13 +294,13 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
     match start.checked_add(count) {
         Some(end) if end <= disk.sectors() => {}
         _ => {
-            trace!(0, "part: partition {} is not inside the disk, skipped", index + 1);
+            klog!(0, "part: partition {} is not inside the disk, skipped", index + 1);
             return true;
         }
     }
 
     if PART_COUNT.load(Ordering::Relaxed) >= MAX_PARTITIONS {
-        trace!(0, "part: {} partitions already, the rest are not registered", MAX_PARTITIONS);
+        klog!(0, "part: {} partitions already, the rest are not registered", MAX_PARTITIONS);
         return false;
     }
 
@@ -317,7 +317,7 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
     }
 
     PART_COUNT.fetch_add(1, Ordering::Relaxed);
-    trace!(0, "part: {} start {} size {}",
+    klog!(0, "part: {} start {} size {}",
         core::str::from_utf8(&name[..len]).unwrap_or("?"), start, count);
     true
 }

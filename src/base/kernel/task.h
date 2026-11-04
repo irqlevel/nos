@@ -160,7 +160,11 @@ public:
     bool is_stopping();
 
     PRINTF_FORMAT(2, 3) void set_name(const char *fmt, ...);
-    const char* get_name();
+    /* Its name, zero past its end to TASK_NAME_LEN */
+    const char* get_name()
+    {
+        return name_;
+    }
 
     /* Its time on a CPU so far, the stretch it is on one now included --
        which a task that keeps its CPU, the idle task above all, has not
@@ -305,6 +309,13 @@ public:
     bool switched_out_runnable_;
 
     stdlib::Time run_start_time_;
+    /* When it last got a CPU, in ns since boot: set by the switch to it
+       (TaskQueue::switch_to) -- by Task::run for a task that starts on its
+       own stack -- and read when it next leaves, for sched_block's ran_ns.
+       Not run_start_time_, which update_runtime moves on at every decision
+       that leaves it the CPU. Its CPU's alone: written and read under that
+       queue's lock, or before anything can find the task. */
+    ulong switched_in_at_;
     /* Written under lock_ (update_runtime), and read through
        get_runtime_ns, which takes it: a read from another CPU without it
        races the scheduler's write */

@@ -43,7 +43,7 @@ use kcore::consts::{NS_PER_MS, NS_PER_SEC};
 use kcore::once::OnceBox;
 use kcore::sync::Mutex;
 use kcore::time::boot_time_ns;
-use kcore::trace;
+use kcore::klog;
 
 /// Providers at once.
 pub const MAX_PROVIDERS: usize = 32;
@@ -206,7 +206,7 @@ fn bus() -> Option<&'static Mutex<Registry>> {
 /// task they run on with `current_id_or_none`, which is 0 there.
 pub fn init() {
     if bus().is_none() || job::jobs().is_none() {
-        trace!(0, "mgmt: no memory for the bus");
+        klog!(0, "mgmt: no memory for the bus");
         return;
     }
     shell::init();
@@ -270,7 +270,7 @@ pub(crate) fn add<'a>(name: &str, methods: impl Iterator<Item = (&'a str, Kind)>
     named.try_reserve_exact(count).map_err(|_| Status::Busy)?;
     named.extend(copies.iter().map(|(m, k)| (m.as_str(), k.name())));
     if let Err(e) = mgmtwire::descriptor::check(descriptor, name, &named) {
-        trace!(0, "mgmt: provider {}'s descriptor refused: {} {}", name, e.at, e.why);
+        klog!(0, "mgmt: provider {}'s descriptor refused: {} {}", name, e.at, e.why);
         return Err(Status::Invalid);
     }
     drop(named);
@@ -370,10 +370,10 @@ fn describe_wait(bus: &Mutex<Registry>, index: usize, waiting: u32, what: &[(usi
     fn text(b: &[u8]) -> &str {
         core::str::from_utf8(b).unwrap_or("?")
     }
-    trace!(0, "mgmt: provider {}'s unregister has waited {} s for {} calls and jobs of it to return",
+    klog!(0, "mgmt: provider {}'s unregister has waited {} s for {} calls and jobs of it to return",
            text(&name[..lens[4]]), ns / NS_PER_SEC, waiting);
     for (i, (_, task)) in what.iter().enumerate().filter(|(_, (m, _))| *m != usize::MAX) {
-        trace!(0, "mgmt:   {} on task {}", text(&methods[i][..lens[i]]), task);
+        klog!(0, "mgmt:   {} on task {}", text(&methods[i][..lens[i]]), task);
     }
 }
 
@@ -463,7 +463,7 @@ pub fn call(provider: &str, method: &str, params: &[u8], max_reply: usize, sink:
     drop(begun);
     let took = boot_time_ns().saturating_sub(start);
     if took >= SLOW_CALL_NS {
-        trace!(0, "mgmt: {}.{} took {} ms -- what takes long is a job", provider, method, took / NS_PER_MS);
+        klog!(0, "mgmt: {}.{} took {} ms -- what takes long is a job", provider, method, took / NS_PER_MS);
     }
     let (reply, whole) = state.take();
     if !whole || (!reply.is_empty() && !sink(&reply)) {
@@ -673,6 +673,6 @@ pub fn stop() {
     bus.lock().stopped = true;
     job::stop_all();
     for p in providers().iter().filter(|p| p.module) {
-        trace!(0, "mgmt: provider {} of a module still registered at the halt", p.name);
+        klog!(0, "mgmt: provider {} of a module still registered at the halt", p.name);
     }
 }

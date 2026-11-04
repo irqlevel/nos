@@ -1,7 +1,7 @@
 #include "fb_console.h"
 
 #include <kernel/watchdog.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
 #include <drivers/mmio.h>
@@ -290,25 +290,25 @@ bool FbTerm::setup(const FbInfo& info)
 
     if (info.bpp != 32 && info.bpp != 24 && info.bpp != 16)
     {
-        trace(0, "Fb: unsupported bpp %lu", (ulong)info.bpp);
+        klog(0, "Fb: unsupported bpp %lu", (ulong)info.bpp);
         return false;
     }
 
     if (info.width < FONT8X16_WIDTH || info.height < FONT8X16_HEIGHT)
     {
-        trace(0, "Fb: mode too small %lux%lu", (ulong)info.width, (ulong)info.height);
+        klog(0, "Fb: mode too small %lux%lu", (ulong)info.width, (ulong)info.height);
         return false;
     }
 
     if (info.phy_addr == 0 || (info.phy_addr & (consts::PAGE_SIZE - 1)) != 0)
     {
-        trace(0, "Fb: unaligned framebuffer 0x%lX", info.phy_addr);
+        klog(0, "Fb: unaligned framebuffer 0x%lX", info.phy_addr);
         return false;
     }
 
     if (info.pitch < (ulong)info.width * (info.bpp / 8))
     {
-        trace(0, "Fb: bad pitch %lu for bpp %lu", (ulong)info.pitch, (ulong)info.bpp);
+        klog(0, "Fb: bad pitch %lu for bpp %lu", (ulong)info.pitch, (ulong)info.bpp);
         return false;
     }
 
@@ -321,7 +321,7 @@ bool FbTerm::setup(const FbInfo& info)
         mm::PageTable::MmioWriteCombining);
     if (va == 0)
     {
-        trace(0, "Fb: can't map framebuffer 0x%lX size %lu", info.phy_addr, size_bytes);
+        klog(0, "Fb: can't map framebuffer 0x%lX size %lu", info.phy_addr, size_bytes);
         return false;
     }
 
@@ -349,7 +349,7 @@ bool FbTerm::setup(const FbInfo& info)
 
     ready_flag_ = true;
 
-    trace(0, "Fb: %lux%lu bpp %lu pitch %lu phys 0x%lX va 0x%lX grid %lux%lu",
+    klog(0, "Fb: %lux%lu bpp %lu pitch %lu phys 0x%lX va 0x%lX grid %lux%lu",
         (ulong)width_, (ulong)height_, (ulong)info.bpp, (ulong)pitch_,
         info.phy_addr, va, (ulong)cols_, (ulong)rows_);
 

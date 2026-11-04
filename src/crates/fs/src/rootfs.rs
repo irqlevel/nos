@@ -13,7 +13,7 @@
 
 use block::Disk;
 use kcore::procinfo::{self, Root};
-use kcore::trace;
+use kcore::klog;
 
 use crate::ext2;
 use crate::extfs;
@@ -70,25 +70,25 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     if ext2::probe(dev, &mut id) {
         let (mounted, driver) = extfs::mount_at("/", dev, read_only);
         if mounted >= 0 {
-            trace!(0, "MountRootFs: mounted {} on / from {} ({})", driver,
+            klog!(0, "MountRootFs: mounted {} on / from {} ({})", driver,
                 dev.name(),
                 if mounted == 1 { "ro" } else { "rw" });
             return true;
         }
-        trace!(0, "MountRootFs: mounting {} from {} failed", driver,
+        klog!(0, "MountRootFs: mounting {} from {} failed", driver,
             dev.name());
         return false;
     }
 
     let mounted = nanofs::mount_at("/", dev.handle(), read_only);
     if mounted >= 0 {
-        trace!(0, "MountRootFs: mounted nanofs on / from {} ({})",
+        klog!(0, "MountRootFs: mounted nanofs on / from {} ({})",
             dev.name(),
             if read_only { "ro" } else { "rw" });
         return true;
     }
 
-    trace!(0, "MountRootFs: {} carries no filesystem this kernel mounts",
+    klog!(0, "MountRootFs: {} carries no filesystem this kernel mounts",
         dev.name());
     false
 }
@@ -102,10 +102,10 @@ fn mount_fallback_layout() {
     };
 
     if !ramfs::mount_at("/", false) {
-        trace!(0, "MountRootFs: failed to mount ramfs on /");
+        klog!(0, "MountRootFs: failed to mount ramfs on /");
         return;
     }
-    trace!(0, "MountRootFs: mounted ramfs on / (rw)");
+    klog!(0, "MountRootFs: mounted ramfs on / (rw)");
 
     vfs.create(b"/boot", true);
 
@@ -120,7 +120,7 @@ fn mount_fallback_layout() {
         }
         let (mounted, driver) = extfs::mount_at("/boot", &dev, true);
         if mounted >= 0 {
-            trace!(0, "MountRootFs: mounted {} on /boot from {} (ro)", driver,
+            klog!(0, "MountRootFs: mounted {} on /boot from {} (ro)", driver,
                 dev.name());
             break;
         }
@@ -138,7 +138,7 @@ fn mount_fallback_layout() {
             continue;
         }
         if nanofs::mount_at("/data", dev.handle(), false) >= 0 {
-            trace!(0, "MountRootFs: mounted nanofs on /data from {} (rw)",
+            klog!(0, "MountRootFs: mounted nanofs on /data from {} (rw)",
                 dev.name());
             break;
         }
@@ -152,12 +152,12 @@ fn mount_procfs() {
     };
 
     if vfs.stat(b"/proc").is_none() && !vfs.create(b"/proc", true) {
-        trace!(0, "MountRootFs: no /proc directory and cannot make one");
+        klog!(0, "MountRootFs: no /proc directory and cannot make one");
         return;
     }
 
     if procfs::mount_at("/proc") {
-        trace!(0, "MountRootFs: mounted procfs on /proc (ro)");
+        klog!(0, "MountRootFs: mounted procfs on /proc (ro)");
     }
 }
 
@@ -178,7 +178,7 @@ pub extern "C" fn rust_mount_root_fs() {
         Some(dev) => mounted = mount_root_on(&dev, procinfo::root_read_only()),
         None => {
             if !matches!(mode, Root::Auto) {
-                trace!(0, "MountRootFs: root {} not found",
+                klog!(0, "MountRootFs: root {} not found",
                     core::str::from_utf8(value).unwrap_or("?"));
             }
         }
@@ -192,9 +192,9 @@ pub extern "C" fn rust_mount_root_fs() {
 
     if procinfo::root_fstest() {
         if crate::selftest::run("/", FSTEST_SIZE, None) {
-            trace!(0, "fstest: passed");
+            klog!(0, "fstest: passed");
         } else {
-            trace!(0, "fstest: FAILED");
+            klog!(0, "fstest: FAILED");
         }
     }
 }

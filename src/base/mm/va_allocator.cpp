@@ -3,7 +3,7 @@
 
 #include <include/const.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <lib/bitmap.h>
 
 namespace kernel
@@ -24,7 +24,7 @@ VaAllocator::VaAllocator()
 
 VaAllocator::~VaAllocator()
 {
-    trace(0, "0x%p dtor", this);
+    klog(0, "0x%p dtor", this);
 }
 
 bool VaAllocator::setup(ulong start, ulong end, ulong block_size)
@@ -75,7 +75,7 @@ bool VaAllocator::setup(ulong start, ulong end, ulong block_size)
     for (ulong i = 0; i < bitmap_blocks; i++)
         stdlib::Bitmap(bitmap_ptr_, block_count_).set_bit(i);
 
-    trace(0, "0x%p start 0x%lX end 0x%lX bsize 0x%lX bcount %lu bmpages %lu",
+    klog(0, "0x%p start 0x%lX end 0x%lX bsize 0x%lX bcount %lu bmpages %lu",
         this, va_start_, va_end_, block_size_, block_count_, bitmap_pages);
     return true;
 }

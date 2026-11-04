@@ -33,7 +33,8 @@ use kcore::once::OnceBox;
 use kcore::ring::LocklessRing;
 use kcore::sync::Event;
 use kcore::time::{boot_time_ns, Duration};
-use kcore::trace;
+use kcore::trace::{self, BioDone, BioSubmit};
+use kcore::klog;
 
 use crate::Disk;
 
@@ -69,14 +70,31 @@ extern "C" fn on_done(ctx: *mut u8, status: i32) {
     let word = ctx as usize;
     let (entry, buffer) = ((word >> 32).wrapping_sub(1), word & 0xFFFF_FFFF);
     let Some(done) = DONE.get(entry).and_then(OnceBox::get) else {
-        trace!(0, "block: a completion for queue {}, which there is not", entry);
+        klog!(0, "block: a completion for queue {}, which there is not", entry);
         return;
     };
+    /* Before it is handed on: whoever reaps it records after this. */
+    bio_done(entry, buffer, status == 0, false);
     if !done.ring.push(buffer << 1 | usize::from(status != 0)) {
         /* Never: the ring has room for every I/O the queue can have out. */
-        trace!(0, "block: queue {} has no room for a completion: its owner waits for it for good", entry);
+        klog!(0, "block: queue {} has no room for a completion: its owner waits for it for good", entry);
     }
     done.event.signal();
+}
+
+/// `bio_done`: queue `entry`'s command on `buffer` done -- `ok`, or not --
+/// or, `refused`, never handed to the device after all.
+#[inline]
+fn bio_done(entry: usize, buffer: usize, ok: bool, refused: bool) {
+    if trace::on::<BioDone>() {
+        trace::emit(&BioDone {
+            entry: u16::try_from(entry).unwrap_or(u16::MAX),
+            buffer: u16::try_from(buffer).unwrap_or(u16::MAX),
+            ok: u8::from(ok),
+            refused: u8::from(refused),
+            _pad: [0; 2],
+        });
+    }
 }
 
 /// An I/O's context: its queue's entry, plus one, above; its buffer below.
@@ -212,11 +230,29 @@ impl Queue {
             done: on_done,
             ctx: context(self.entry, buffer),
         };
+        /* Recorded before the device can have it -- its doorbell may be
+         * someone else's to ring -- so that its completion comes after; a
+         * refusal is the completion, said so. */
+        if trace::on::<BioSubmit>() {
+            trace::emit(&BioSubmit {
+                sector,
+                count,
+                pid: trace::pid(),
+                entry: u16::try_from(self.entry).unwrap_or(u16::MAX),
+                buffer: u16::try_from(buffer).unwrap_or(u16::MAX),
+                in_flight: u16::try_from(self.in_flight + 1).unwrap_or(u16::MAX),
+                write: u8::from(write),
+                _pad: 0,
+            });
+        }
         /* The range is inside a buffer the queue owns, contiguous and on a
          * page; the queue frees no buffer while it has I/O on it, and goes
          * only once all of it is done (`Drop`); nothing here hands out a
          * buffer with I/O on it (`bytes`). The context is a number. */
-        unsafe { disk.submit(&io, false) }?;
+        if let Err(e) = unsafe { disk.submit(&io, false) } {
+            bio_done(self.entry, buffer, false, true);
+            return Err(e);
+        }
         self.busy[buffer] += 1;
         self.in_flight += 1;
         Ok(())
@@ -248,7 +284,7 @@ impl Queue {
                     self.in_flight -= 1;
                     return Some((buffer, ok));
                 }
-                _ => trace!(0, "block: queue {} has a completion for buffer {}, which has no I/O in flight",
+                _ => klog!(0, "block: queue {} has a completion for buffer {}, which has no I/O in flight",
                             self.entry, buffer),
             }
         }
@@ -278,7 +314,7 @@ impl Drop for Queue {
             }
             let waited = boot_time_ns().saturating_sub(began);
             if waited >= DRAIN_GIVE_UP_NS {
-                trace!(0, "block: queue {} gives up on {} I/O its disk never finished: its buffers are kept for \
+                klog!(0, "block: queue {} gives up on {} I/O its disk never finished: its buffers are kept for \
                            good", self.entry, self.in_flight);
                 /* Kept: the device may write them yet, and the entry may be
                  * left a completion. */
@@ -289,7 +325,7 @@ impl Drop for Queue {
             }
             if waited >= DRAIN_SAY_NS && !said {
                 said = true;
-                trace!(0, "block: queue {} has waited {} s for {} I/O its disk has not finished", self.entry,
+                klog!(0, "block: queue {} has waited {} s for {} I/O its disk has not finished", self.entry,
                        waited / 1_000_000_000, self.in_flight);
             }
             self.wait(Duration::from_millis(100));
@@ -313,11 +349,11 @@ fn take_entry() -> Option<usize> {
         });
         if made.is_none() {
             TAKEN[i].store(false, Ordering::Release);
-            trace!(0, "block: no memory for a queue's completions");
+            klog!(0, "block: no memory for a queue's completions");
             return None;
         }
         return Some(i);
     }
-    trace!(0, "block: all {} queues are taken", QUEUES);
+    klog!(0, "block: all {} queues are taken", QUEUES);
     None
 }

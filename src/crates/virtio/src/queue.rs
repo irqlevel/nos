@@ -10,7 +10,7 @@
 use kcore::barrier::{dma_rmb, dma_wmb};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
-use kcore::trace;
+use kcore::klog;
 
 /// The most descriptors a queue here has. A device that asks for more is
 /// negotiated down (modern) or refused (legacy), because a driver's
@@ -71,7 +71,7 @@ impl Queue {
     /// available ring after it, and the used ring on the next page.
     pub fn new(size: u16) -> Option<Self> {
         if size == 0 || size > MAX_DESCRIPTORS || !size.is_power_of_two() {
-            trace!(0, "virtio: queue size {} is not one this supports", size);
+            klog!(0, "virtio: queue size {} is not one this supports", size);
             return None;
         }
 

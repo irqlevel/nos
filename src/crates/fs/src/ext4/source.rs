@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use extfmt::group::{Desc, INODE_UNINIT};
 use extfmt::inode::{self as xinode, Inode, EXTENTS_FL};
 use extfmt::{blockmap, extent, Map};
-use kcore::trace;
+use kcore::klog;
 
 use super::cache::Cache;
 use super::io::Io;
@@ -82,13 +82,13 @@ pub(super) fn inode(src: &mut dyn Source, ino: u32) -> Option<Vec<u8>> {
         (m.sb.inodes_count(), m.ipg, m.inode_size, m.bs, m.uninit, m.csum, m.seed)
     };
     if ino == 0 || ino > count {
-        trace!(0, "ext4: inode {} of {}", ino, count);
+        klog!(0, "ext4: inode {} of {}", ino, count);
         return None;
     }
     let (group, index) = (u64::from((ino - 1) / ipg), (ino - 1) % ipg);
     let (flags, unused, table) = src.group(group).map(|d| (d.flags(), d.itable_unused(), d.inode_table()))?;
     if uninit && (flags & INODE_UNINIT != 0 || index >= ipg.saturating_sub(unused)) {
-        trace!(0, "ext4: inode {} is in a part of its group's table never written", ino);
+        klog!(0, "ext4: inode {} is in a part of its group's table never written", ino);
         return None;
     }
     let at = u64::from(index) * isz as u64;
@@ -101,7 +101,7 @@ pub(super) fn inode(src: &mut dyn Source, ino: u32) -> Option<Vec<u8>> {
     let raw = blk.get(within..within + isz)?.to_vec();
     let zero = raw[..xinode::GOOD_OLD_SIZE].iter().all(|&b| b == 0);
     if csum && !zero && !xinode::csum_matches(seed, ino, &raw) {
-        trace!(0, "ext4: inode {} fails its checksum", ino);
+        klog!(0, "ext4: inode {} fails its checksum", ino);
         return None;
     }
     Some(raw)
@@ -116,7 +116,7 @@ pub(super) fn inode(src: &mut dyn Source, ino: u32) -> Option<Vec<u8>> {
 pub(super) fn map(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<Map> {
     match map_any(src, ino, raw, lblock)? {
         Map::Blocks { block, run } if !src.meta().file_may_own(block, run) => {
-            trace!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
+            klog!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
                    run);
             None
         }
@@ -131,7 +131,7 @@ pub(super) fn map(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Op
 pub(super) fn map_extent(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64) -> Option<(Map, bool)> {
     match walk(src, ino, raw, lblock, true)? {
         (Map::Blocks { block, run }, _) if !src.meta().file_may_own(block, run) => {
-            trace!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
+            klog!(0, "ext4: inode {}: blocks {}..+{} are the filesystem's own, which no file may hold", ino, block,
                    run);
             None
         }
@@ -173,12 +173,12 @@ fn walk(src: &mut dyn Source, ino: u32, raw: &[u8], lblock: u64, unwritten: bool
     };
     match mapped {
         Ok((Map::Blocks { block, run }, _)) if block.checked_add(run).is_none_or(|e| e > fs_blocks) => {
-            trace!(0, "ext4: inode {}: blocks {}..+{} past the filesystem", ino, block, run);
+            klog!(0, "ext4: inode {}: blocks {}..+{} past the filesystem", ino, block, run);
             None
         }
         Ok(m) => Some(m),
         Err(e) => {
-            trace!(0, "ext4: {}", e);
+            klog!(0, "ext4: {}", e);
             None
         }
     }

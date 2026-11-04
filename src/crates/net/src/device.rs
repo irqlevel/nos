@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use kcore::once::Once;
 use kcore::percpu::{ConstInit, LocalCounter, PerCpu};
 use kcore::sync::{IrqSpinLock, PreemptSpinLock};
-use kcore::trace;
+use kcore::klog;
 
 use crate::frame::{Frame, FrameQueue};
 use crate::wire::{eth, ip, udp, Mac, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP,
@@ -537,7 +537,7 @@ impl Device {
          * without it if it is not. Going on without it can race the holder
          * into the driver's ring; on a machine that is already dying, a
          * corrupted ring costs nothing and the report is worth everything. */
-        let mut guard = if kcore::trace::panic_active() {
+        let mut guard = if kcore::klog::panic_active() {
             self.tx.try_lock()
         } else {
             Some(self.tx.lock())
@@ -1197,7 +1197,7 @@ impl DeviceTable {
                 kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
         }
 
-        trace!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        klog!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             core::str::from_utf8(dev.name()).unwrap_or("?"),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         Some(dev)

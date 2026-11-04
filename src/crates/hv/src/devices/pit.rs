@@ -14,11 +14,24 @@
 //! count runs out -- what Linux's `i8253` clockevent device programs once it
 //! has a clocksource good enough for high-resolution timers, the TSC, and
 //! drives the tick and every timer from, a count at a time.
+//!
+//! Its periodic edges repeat no faster than the local APIC's timer is let
+//! repeat at (`lapic::MIN_PERIOD_NS`), whatever count a guest loads: the
+//! count it reads back runs at the reload it gave, and IRQ0 comes a period
+//! of at least that apart -- KVM's PIT has its floor too. A reload of a few
+//! ticks would otherwise be an edge owed every microsecond, which the first
+//! CPU's loop hands over one a round and rounds again for: with the timer's
+//! pin routed to another CPU, whose taking of it this loop cannot see, it
+//! never entered its own guest again (hv-fuzz found it).
 
 use kcore::time;
 
 /// The 8254 input frequency, in hertz.
 const PIT_HZ: u64 = 1_193_182;
+
+/// The fewest ticks apart channel 0's periodic edges come: the local
+/// APIC's floor, in the 8254's ticks, rounded up.
+const MIN_EDGE_TICKS: u64 = (PIT_HZ * crate::lapic::MIN_PERIOD_NS).div_ceil(kcore::consts::NS_PER_SEC);
 
 /* Ports. */
 pub const CH0: u16 = 0x40;
@@ -86,6 +99,12 @@ impl Channel {
 
     fn reload_ticks(&self) -> u64 {
         if self.reload == 0 { 65536 } else { self.reload as u64 }
+    }
+
+    /// Ticks between a periodic count's edges: its reload, but no fewer
+    /// than the floor (`MIN_EDGE_TICKS`).
+    fn edge_ticks(&self) -> u64 {
+        self.reload_ticks().max(MIN_EDGE_TICKS)
     }
 
     /// Ticks elapsed since the count was loaded.
@@ -280,8 +299,8 @@ impl Pit {
         if !periodic(ch.mode) {
             return false;
         }
-        let edges = ch.elapsed() / ch.reload_ticks();
-        let most_owed = (PIT_HZ / ch.reload_ticks()).max(1);
+        let edges = ch.elapsed() / ch.edge_ticks();
+        let most_owed = (PIT_HZ / ch.edge_ticks()).max(1);
         if edges > self.ch0_edges_given.saturating_add(most_owed) {
             self.ch0_edges_given = edges - most_owed;
         }
@@ -303,18 +322,19 @@ impl Pit {
         if !ch.running {
             return None;
         }
-        /* Edge k is due once `elapsed()` reaches k * reload ticks, which is
-         * the first nanosecond at or past k * reload * 1e9 / PIT_HZ: rounded
-         * up, so that at that instant `ch0_fire` does see it. A one-shot's
-         * one edge is edge 1. */
-        let edge = if one_shot(ch.mode) && self.ch0_armed {
-            1
+        /* Edge k is due once `elapsed()` reaches k times the ticks between
+         * edges -- the reload, or the floor for a periodic count -- which is
+         * the first nanosecond at or past that many ticks' 1e9 / PIT_HZ:
+         * rounded up, so that at that instant `ch0_fire` does see it. A
+         * one-shot's one edge is edge 1, at its reload. */
+        let (edge, every) = if one_shot(ch.mode) && self.ch0_armed {
+            (1, ch.reload_ticks())
         } else if periodic(ch.mode) {
-            self.ch0_edges_given as u128 + 1
+            (self.ch0_edges_given as u128 + 1, ch.edge_ticks())
         } else {
             return None;
         };
-        let ticks = edge * ch.reload_ticks() as u128;
+        let ticks = edge * every as u128;
         let ns = (ticks * kcore::consts::NS_PER_SEC as u128).div_ceil(PIT_HZ as u128);
         let at = (ch.loaded_ns as u128).saturating_add(ns);
         Some(u64::try_from(at).unwrap_or(u64::MAX))

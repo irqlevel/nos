@@ -20,6 +20,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use hvarch::x86::svm::Kick;
 use kcore::sync::Event;
 use kcore::time::{self, Duration};
+use kcore::trace::RingHow;
+
+use crate::tp;
 
 /// What wakes one vCPU: its task's event, for when it has nothing to run
 /// and waits, and its kick, for when it is in its guest -- and a word that
@@ -31,12 +34,14 @@ pub struct Doorbell {
     kick: Kick,
     rung: AtomicBool,
     polling: AtomicBool,
+    /// The CPU's number in its guest, which a record of a ring says.
+    index: u32,
 }
 
 impl Doorbell {
-    pub fn new() -> Option<Doorbell> {
+    pub fn new(index: u32) -> Option<Doorbell> {
         Some(Doorbell { event: Event::new()?, kick: Kick::new(), rung: AtomicBool::new(false),
-                        polling: AtomicBool::new(false) })
+                        polling: AtomicBool::new(false), index })
     }
 
     /// Something waits for the vCPU, put where it looks before this: its
@@ -50,9 +55,14 @@ impl Doorbell {
     /// the word once more: of the two, one sees the other, so a ring that
     /// finds the spinner gone has the event signalled for the wait it goes
     /// to, and one that finds it spinning is seen by it.
+    ///
+    /// Its `hv_ring` is recorded before the vCPU is woken or kicked, so that
+    /// a record of what it does about the ring comes after it.
     pub fn ring(&self) {
         self.rung.store(true, Ordering::SeqCst);
-        if !self.polling.load(Ordering::SeqCst) {
+        let polling = self.polling.load(Ordering::SeqCst);
+        tp::ring(self.index, if polling { RingHow::Polling } else { RingHow::Rung });
+        if !polling {
             self.event.signal();
         }
         self.kick.kick();
@@ -62,6 +72,7 @@ impl Doorbell {
     /// next exit: for what can wait that long -- a key typed at its console.
     pub fn signal(&self) {
         self.rung.store(true, Ordering::Release);
+        tp::ring(self.index, RingHow::Signalled);
         self.event.signal();
     }
 
@@ -140,8 +151,8 @@ impl Doorbells {
         }
         let mut v = Vec::new();
         v.try_reserve_exact(cpus).ok()?;
-        for _ in 0..cpus {
-            v.push(Doorbell::new()?);
+        for i in 0..cpus {
+            v.push(Doorbell::new(u32::try_from(i).ok()?)?);
         }
         Some(Doorbells { cpus: v })
     }

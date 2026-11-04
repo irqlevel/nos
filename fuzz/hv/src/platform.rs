@@ -1532,6 +1532,7 @@ pub fn report() {
              OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
+    println!("  platform: {} trace records built", crate::trace::emitted());
     println!("  platform: PV EOIs {} through the word, {} by the register", PV_EOI_BY_WORD.load(Ordering::Relaxed),
              PV_EOI_BY_REGISTER.load(Ordering::Relaxed));
     for (what, n) in vm::APICV.lock().unwrap().iter() {
@@ -1713,6 +1714,9 @@ pub fn platform(r: &mut Input) {
     let devices = disks.len() + nics.len();
     let n = cpus as usize;
     let first_xapic = cpus > 1 && (!x2apic || ioapic);
+    /* The hypervisor's tracepoints on for half the runs: every record its
+     * sites build of what this guest does, held to its description. */
+    crate::trace::set_on(r.u8() < 128);
     let script = Script {
         data: r.rest().to_vec(),
         at: 0,

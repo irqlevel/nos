@@ -190,7 +190,7 @@ swallowing panic messages whole.
 | `ext4-test.py` | arm64 | ext4 as mke2fs makes it, read by the driver from the shell -- every file's CRC-32 the host's, `find` listing what the host made and nothing the tree leaves out; names and data changed from the shell -- made, moved, an indexed directory written into, files and a tree removed, `fstest`, a copy, a file grown past 4 GiB and cut back -- `find` and `crc32` showing what they make, then `e2fsck -fn` finding nothing in the image and debugfs's extents what was written; a second boot killed under such changes, its image replayed clean by e2fsck and by Linux's loop mount, every file's MD5 the model's; a journal debugfs left unreplayed, read through without a byte written; and orphans debugfs left on the list -- a file deleted, one of a thousand extents cut inside a block -- released by the mount for writing, the cut file zeros past its cut when grown again, the image clean to e2fsck after, its list empty; and a filesystem of a TiB -- 8192 groups, a journal of a GiB -- mounted for writing, a file written and read back, the image clean to e2fsck: what a mount holds of a filesystem's geometry is in pieces no bigger than the kernel's heap gives at once, which the fuzzers' hosts would never refuse |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
-| `netconsole-test.py` | arm64 | the trace path, a net device, netconsole, what reaches the network as the machine halts |
+| `netconsole-test.py` | arm64 | the log path (`klog`), a net device, netconsole, what reaches the network as the machine halts |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
@@ -205,10 +205,11 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by, and what a terminal types at the console's line editor, and the tracepoints' ring against a model and a writer thread, and the window `trace latency` reads of the rings against the truth of a schedule played out on them -- and the memory management under everything: the page tables and the physical page allocator past `setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button -- with `--disk`, the one nos's own poweroff presses, the guest's disk left mounted coming back clean; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs; `--mem` past 4064 with `--nos-mem`, a guest with RAM from 4 GiB; `--nos-iso`, nos booted from `make nos-test.iso TEST_ISO_ARGS=hugepages=...`, every guest's memory the huge pool's, 2 MiB an entry of its nested table |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]] [--hvboot]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button; with `--hvboot`, Debian's and Ubuntu's booted by hvboot off their own /boot, nothing taken out of them; with `--create <url>`, a VM made by `hv create` of a cloud image nos fetches itself, booted and provisioned by cloud-init from nos's seed |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
+| `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
@@ -1775,7 +1776,28 @@ what its header says it does:
   the search's prompt, its query and what it found, exactly; a Backspace on
   an empty row, which erases the line above, is a finding too. A redraw one
   Backspace short failed the first input, and a search that kept no line
-  to come back to the tenth.
+  to come back to the tenth;
+- `trace`: the tracepoints' ring (`kernel/trace_ring.cpp`) held to a model:
+  `init` taking a power of two of chunks and keeping nothing of one that
+  failed for memory, every read the record the model wrote or none; and a
+  writer thread against a reader, every record kept the one its index says.
+  A writer that did not clear the sequence word first failed the 103rd
+  input, a torn record;
+- `tracewin`: what the shell's readers make of the rings
+  (`kernel/trace_window.cpp`), on rings of `trace_ring.cpp`'s own. A
+  schedule is played out on up to six CPUs -- wakeups onto other CPUs'
+  queues, some a deadline's and late, switches, displacements, blocks, idle
+  and IPI records, a `trace clear`, rings that wrap -- and the window read
+  as `trace latency` reads it, with a size and an event filter of the
+  input's, is held to what the schedule did: each CPU's part the newest
+  records its ring holds that the filter keeps; nothing the CPU wrote
+  missing from where the part says it is whole; the merge in time order;
+  every wait paired one the schedule had, none it had left out. Then the
+  heapsort against `std::sort` on orders made to be a quicksort's worst,
+  the five longest, a duration's parse, and a ring's window read while a
+  thread writes it. The quicksort it replaced is a panic at the 48th input,
+  and a window whose start is ignored -- waits paired across a switch a ring
+  lost -- fails the 44th.
 
 The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
 thing: inputs run in batches, one after another in a process forked for the

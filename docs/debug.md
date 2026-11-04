@@ -38,11 +38,11 @@ over the network instead:
 - `loglevel=N` at boot or `loglevel N` in the shell raises the trace level
   without a rebuild; see [Kernel parameters](kernel-parameters.md).
 
-A log line is formatted into a 256-byte buffer (`Tracer::output`), and a
+A log line is formatted into a 256-byte buffer (`Klog::output`), and a
 panic's message into 512 (`Panicker::message_`, reached from Rust through
 `kernel_panic`). What does not fit is **truncated and marked with `...`**,
 never dropped: until `stdlib::vsn_printf` learned to truncate, a `%s` that
-did not fit wrote none of its argument and returned -1, and `Tracer::output`
+did not fit wrote none of its argument and returned -1, and `Klog::output`
 threw away every line that reported it -- so the longest reports, a Rust
 panic's message among them, reached the console as their prefix and nothing
 else (`RUST PANIC: ` followed by the backtrace). `test_sn_printf` covers it.

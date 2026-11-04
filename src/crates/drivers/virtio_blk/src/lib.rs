@@ -29,7 +29,7 @@ use kcore::msix::MsixInterrupt;
 use kcore::once::Once;
 use kcore::pci;
 use kcore::sync::{SpinLock, WaitGroup};
-use kcore::trace;
+use kcore::klog;
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -248,7 +248,7 @@ impl Blk {
         };
 
         if !queued {
-            trace!(0, "virtio-blk: the queue would not take a request");
+            klog!(0, "virtio-blk: the queue would not take a request");
             self.done[slot].done();
             self.done[slot].wait();
             self.give_slot(slot);
@@ -324,7 +324,7 @@ impl Blk {
             head = (head + 1) % BATCH_SLOTS;
             out -= 1;
             if !self.finish(taken) {
-                trace!(0, "virtio-blk: a request of a batch failed");
+                klog!(0, "virtio-blk: a request of a batch failed");
                 ok = false;
             }
         }
@@ -360,7 +360,7 @@ impl Blk {
                     Some((head, _len)) => {
                         let head = head as usize;
                         if head >= inner.slot_of_head.len() {
-                            trace!(0, "virtio-blk: the device named descriptor {}, which is not one", head);
+                            klog!(0, "virtio-blk: the device named descriptor {}, which is not one", head);
                             continue;
                         }
                         let slot = inner.slot_of_head[head];
@@ -371,7 +371,7 @@ impl Blk {
             };
 
             if slot == NO_SLOT || slot as usize >= MAX_SLOTS {
-                trace!(0, "virtio-blk: a completion for a request nobody is waiting for");
+                klog!(0, "virtio-blk: a completion for a request nobody is waiting for");
                 continue;
             }
 
@@ -393,13 +393,13 @@ impl Blk {
          * buffer is a page at most and page-aligned -- what the block API asks
          * of its callers. */
         if len > PAGE_SIZE || (buf as usize) & (PAGE_SIZE - 1) != 0 {
-            trace!(0, "virtio-blk: {} bytes at {:p} is not one page-aligned run", len, buf);
+            klog!(0, "virtio-blk: {} bytes at {:p} is not one page-aligned run", len, buf);
             return false;
         }
 
         let phys = dma::virt_to_phys(buf);
         if phys == 0 {
-            trace!(0, "virtio-blk: no physical address for {:p}", buf);
+            klog!(0, "virtio-blk: no physical address for {:p}", buf);
             return false;
         }
 
@@ -471,7 +471,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     let features = match virtio::negotiate(transport.as_ref(), FEATURE_FLUSH) {
         Some(features) => features,
         None => {
-            trace!(0, "virtio-blk: the device would not agree on features");
+            klog!(0, "virtio-blk: the device would not agree on features");
             return false;
         }
     };
@@ -479,7 +479,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
 
     let size = transport.select_queue(REQUEST_QUEUE);
     if size == 0 {
-        trace!(0, "virtio-blk: the device has no request queue");
+        klog!(0, "virtio-blk: the device has no request queue");
         virtio::failed(transport.as_ref());
         return false;
     }
@@ -568,13 +568,13 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     match block::register_driver(name, blk) {
         Some(_registration) => {
             DEVICES.store(index + 1, Ordering::Release);
-            trace!(0, "virtio-blk: {} is a disk of {} sectors{}, {} slots",
+            klog!(0, "virtio-blk: {} is a disk of {} sectors{}, {} slots",
                 name, capacity,
                 if has_flush { " with a write cache" } else { "" }, MAX_SLOTS);
             true
         }
         None => {
-            trace!(0, "virtio-blk: the device table would not take another disk");
+            klog!(0, "virtio-blk: the device table would not take another disk");
             /* Told to stop, and left where it is: its interrupt may still
              * be on its way. */
             virtio::failed(transport);
@@ -602,7 +602,7 @@ fn arm_interrupt(blk: &'static Blk, source: IrqSource) -> Option<u16> {
                 let _ = blk.irq.set(Irq::Msix(irq));
                 return Some(0);
             }
-            None => trace!(0, "virtio-blk: no MSI-X slot left, falling back on the line"),
+            None => klog!(0, "virtio-blk: no MSI-X slot left, falling back on the line"),
         }
     }
 
@@ -613,7 +613,7 @@ fn arm_interrupt(blk: &'static Blk, source: IrqSource) -> Option<u16> {
 
     match registered {
         Some(irq) => { let _ = blk.irq.set(Irq::Legacy(irq)); }
-        None => trace!(0, "virtio-blk: the device has no interrupt -- I/O will be polled"),
+        None => klog!(0, "virtio-blk: the device has no interrupt -- I/O will be polled"),
     }
     None
 }
@@ -640,7 +640,7 @@ pub extern "C" fn rust_virtio_blk_init() {
                 None => continue,
             };
 
-            trace!(0, "virtio-blk: {} virtio-pci at {:02x}:{:02x}.{}",
+            klog!(0, "virtio-blk: {} virtio-pci at {:02x}:{:02x}.{}",
                 if transport.is_legacy() { "legacy" } else { "modern" },
                 dev.bus, dev.slot, dev.func);
 
@@ -677,7 +677,7 @@ pub unsafe extern "C" fn rust_virtio_blk_init_mmio(slots: *const Slot, count: us
             None => continue,
         };
 
-        trace!(0, "virtio-blk: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
+        klog!(0, "virtio-blk: virtio-mmio at {:#x}, irq {}", slot.base, slot.int_id);
         start(Box::new(transport), IrqSource::Line(slot.int_id as u8));
     }
 }

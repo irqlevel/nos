@@ -2,7 +2,7 @@
 
 #include "deleter.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/atomic.h>
 #include <kernel/panic.h>
 #include <mm/new.h>
@@ -22,12 +22,12 @@ public:
         counter_.set(1);
         object_ = object;
 
-        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p ctor", this, object_);
+        klog(SHARED_PTR_LL, "objref 0x%p obj 0x%p ctor", this, object_);
     }
 
     ~ObjectReference()
     {
-        trace(SHARED_PTR_LL, "objref 0x%p dtor", this);
+        klog(SHARED_PTR_LL, "objref 0x%p dtor", this);
 
         BUG_ON(object_ != nullptr);
         BUG_ON(counter_.get() != 0);
@@ -36,7 +36,7 @@ public:
     void inc_counter()
     {
         counter_.inc();
-        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p inc counter %ld", this, object_, counter_.get());
+        klog(SHARED_PTR_LL, "objref 0x%p obj 0x%p inc counter %ld", this, object_, counter_.get());
     }
 
     int get_counter()
@@ -61,13 +61,13 @@ public:
     {
         if (counter_.dec_and_test())
         {
-            trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
+            klog(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
 
             Deleter()(object_);
             object_ = nullptr;
             return true;
         }
-        trace(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
+        klog(SHARED_PTR_LL, "objref 0x%p obj 0x%p dec counter %ld", this, object_, counter_.get());
 
         return false;
     }
@@ -91,14 +91,14 @@ public:
     {
         object_ref_ = nullptr;
 
-        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(ObjectReference<T, Deleter> *object_ref)
     {
         object_ref_ = object_ref;
 
-        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(T *object)
@@ -106,7 +106,7 @@ public:
     {
         reset(object);
 
-        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(const SharedPtr& other)
@@ -118,7 +118,7 @@ public:
             object_ref_->inc_counter();
         }
 
-        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr(SharedPtr&& other)
@@ -127,7 +127,7 @@ public:
         object_ref_ = other.object_ref_;
         other.object_ref_ = nullptr;
 
-        trace(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p ctor obj 0x%p", this, get());
     }
 
     SharedPtr& operator=(const SharedPtr& other)
@@ -142,7 +142,7 @@ public:
             }
         }
 
-        trace(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
 
         return *this;
     }
@@ -156,7 +156,7 @@ public:
             other.object_ref_ = nullptr;
         }
 
-        trace(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
+        klog(SHARED_PTR_LL, "ptr 0x%p op= obj 0x%p", this, get());
 
         return *this;
     }
@@ -188,7 +188,7 @@ public:
 
     void reset(T* object)
     {
-        trace(SHARED_PTR_LL, "ptr 0x%p reset obj 0x%p new 0x%p", this, get(), object);
+        klog(SHARED_PTR_LL, "ptr 0x%p reset obj 0x%p new 0x%p", this, get(), object);
 
         BUG_ON(get() != nullptr && get() == object);
 

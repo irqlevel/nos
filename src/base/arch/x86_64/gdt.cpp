@@ -1,6 +1,6 @@
 #include "gdt.h"
 #include "asm.h"
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/panic.h>
 #include <kernel/cpu.h>
 
@@ -13,7 +13,7 @@ static_assert(Gdt::TSS_MAX_CPUS == MAX_CPUS, "TSS_MAX_CPUS must equal MAX_CPUS")
 
 Gdt::Gdt()
 {
-    trace(0, "Gdt 0x%p", this);
+    klog(0, "Gdt 0x%p", this);
 
     entry_[1].set_value(((u64)1<<43) | ((u64)1<<44) | ((u64)1<<47) | ((u64)1<<53));
 }

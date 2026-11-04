@@ -3,7 +3,7 @@
 #include "screen.h"
 #include <hal/irqchip.h>
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <arch/x86_64/asm.h>
 #include <kernel/interrupt.h>
 #include <mm/memory_map.h>
@@ -17,7 +17,7 @@ IO8042::IO8042()
     , ctrl_(0)
     , extended_(0)
 {
-    trace(0, "IO8042 0x%p status 0x%lX", this, (ulong)inb(STATUS_PORT));
+    klog(0, "IO8042 0x%p status 0x%lX", this, (ulong)inb(STATUS_PORT));
 
     screen::printf("IO8042 status 0x%lX\n", (ulong)inb(STATUS_PORT));
 
@@ -56,7 +56,7 @@ void IO8042::read_data()
 
         if (!buf_.put(inb(DATA_PORT)))
         {
-            trace(0, "Kbd: can't put new code");
+            klog(0, "Kbd: can't put new code");
         }
     }
 }
@@ -105,7 +105,7 @@ void IO8042::on_tick(TimerCallback& callback)
                                      "\0" "|ZXCVBNM<>?" "\0" "*\0 \0";
         u8 code = buf_.get();
 
-        trace(KBD_LL, "Kbd: code 0x%lX", (ulong)code);
+        klog(KBD_LL, "Kbd: code 0x%lX", (ulong)code);
 
         if (code == CODE_EXTENDED)
         {
@@ -158,7 +158,7 @@ void IO8042::on_tick(TimerCallback& callback)
                 c = static_cast<char>(c & CTRL_MASK);
             }
 
-            trace(KBD_LL, "Kbd: char %c", c);
+            klog(KBD_LL, "Kbd: char %c", c);
 
             KeyboardInput::get_instance().emit(c, code);
         }

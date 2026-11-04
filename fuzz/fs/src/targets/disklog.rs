@@ -140,7 +140,7 @@ pub fn disklog(r: &mut Input) {
     /* The boot so far: lines queued before anybody knows whether they are
      * wanted. */
     for k in 0..r.below(40) {
-        kcore::trace!(0, "before the command line {} {}", k, "x".repeat(r.below(200) as usize));
+        kcore::klog!(0, "before the command line {} {}", k, "x".repeat(r.below(200) as usize));
     }
     let on = r.u8() % 8 != 0;
     let mut p = machine::params();
@@ -181,7 +181,7 @@ pub fn disklog(r: &mut Input) {
         }
         match op {
             0 | 1 => {
-                kcore::trace!(0, "a line {} {}", lines, "y".repeat(r.below(230) as usize));
+                kcore::klog!(0, "a line {} {}", lines, "y".repeat(r.below(230) as usize));
                 lines += 1;
             }
             2 => {
@@ -189,7 +189,7 @@ pub fn disklog(r: &mut Input) {
                 let pad = r.below(100) as usize;
                 let id = sched::spawn("logger", sched::Kind::Kernel, machine::next_cpu(), Box::new(move || {
                     for k in 0..count {
-                        kcore::trace!(0, "from a task {} {}", k, "z".repeat(pad));
+                        kcore::klog!(0, "from a task {} {}", k, "z".repeat(pad));
                         if k % 3 == 0 {
                             kcore::task::yield_to_runnable();
                         }
@@ -200,7 +200,7 @@ pub fn disklog(r: &mut Input) {
             }
             3 => {
                 let pad = "w".repeat(r.below(100) as usize);
-                sched::interrupt(|| kcore::trace!(0, "from an interrupt {}", pad));
+                sched::interrupt(|| kcore::klog!(0, "from an interrupt {}", pad));
                 lines += 1;
             }
             _ => {

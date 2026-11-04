@@ -133,7 +133,7 @@ private:
     void on_panic();
     void __attribute__((noreturn)) park();
     static void __attribute__((noreturn)) park_on_own_stack(void* ctx);
-    void process_ipi_tasks(Context* ctx);
+    ulong process_ipi_tasks(Context* ctx);
     void drain_and_close_ipi_tasks(Context* ctx);
 
     ulong index_;
@@ -150,7 +150,8 @@ private:
     /* Set by park(), last; see is_parked */
     Atomic parked_;
 
-    void idle_mwait();
+    void idle_mwait(Task* self);
+    void idle_ended(Task* self);
 
     void local_timer_arm(ulong when, ulong now);
 
@@ -236,6 +237,15 @@ public:
     void invalidate_tlb_all();
     void invalidate_tlb_address(ulong virt_addr);
     void invalidate_tlb_range(ulong virt_addr, ulong count);
+
+    /* Every other running CPU interrupted, and waited for until each has
+       taken the interrupt: whatever it was in the middle of with interrupts
+       off when this was called, it has finished. What frees memory that code
+       running with interrupts off may still be using -- a tracepoint's ring
+       (kernel/tracepoint.cpp) once another has taken its place. Task
+       context; a panic naming the CPUs that never answered after ten
+       seconds, as a TLB shootdown's is, with `what` it was for. */
+    void synchronize(const char* what);
 
     void reset();
 

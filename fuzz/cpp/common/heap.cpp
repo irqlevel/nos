@@ -103,6 +103,13 @@ void* alloc(size_t size, ulong tag)
     return fuzz::heap_alloc(size);
 }
 
+/* As alloc: the stand-in's blocks are malloc's, zeroed by neither */
+void* alloc_uninit(size_t size, ulong tag)
+{
+    (void)tag;
+    return fuzz::heap_alloc(size);
+}
+
 void free(void* ptr)
 {
     fuzz::heap_free(ptr);

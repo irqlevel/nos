@@ -34,7 +34,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::sync::TryLock;
 use kcore::task::TaskHandle;
-use kcore::trace;
+use kcore::klog;
 
 use controller::{Controller, MAX_CONTROLLERS, MAX_PORTS, POLL_PERIOD_MS};
 use descriptors::speed_name;
@@ -55,7 +55,7 @@ pub fn init() {
     match Command::register("usb", "usb - show usb controllers and ports", dump) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "usb: cannot register the usb command"),
+        Err(_) => klog!(0, "usb: cannot register the usb command"),
     }
 }
 
@@ -97,7 +97,7 @@ fn init_all() {
             Some(mut controllers) => controllers[found] = Some(ctrl),
             None => {
                 /* Only a second `init` running beside this one could hold it. */
-                trace!(0, "Xhci: controller table busy, controller {} dropped", found);
+                klog!(0, "Xhci: controller table busy, controller {} dropped", found);
                 continue;
             }
         }
@@ -105,7 +105,7 @@ fn init_all() {
         COUNT.store(found, Ordering::Release);
     }
 
-    trace!(0, "Xhci: initialized {} controllers", found);
+    klog!(0, "Xhci: initialized {} controllers", found);
 }
 
 fn poll_all() {

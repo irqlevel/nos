@@ -47,7 +47,7 @@ use kcore::cmd::Output;
 use kcore::consts::NS_PER_SEC;
 use kcore::sync::SpinLock;
 use kcore::time;
-use kcore::trace;
+use kcore::klog;
 
 use crate::device::{Device, DEVICES};
 use crate::frame::Frame;
@@ -567,7 +567,7 @@ impl Nat {
         OUTER.store(outer.handle(), Ordering::Release);
         INNER.store(inner.handle(), Ordering::Release);
         drop(on);
-        trace!(0, "nat: on, {} out through {} ({})", name(inner), name(outer), Ipv4(outer.ip()));
+        klog!(0, "nat: on, {} out through {} ({})", name(inner), name(outer), Ipv4(outer.ip()));
         /* Where the guests' first packets go -- the gateway, and the DNS
          * server they are given when it is on the outer device's own subnet
          * -- asked for now if it has to be, rather than by those packets,
@@ -601,7 +601,7 @@ impl Nat {
         let was = old.is_some();
         drop(old);
         if was {
-            trace!(0, "nat: off");
+            klog!(0, "nat: off");
         }
         was
     }
@@ -1338,7 +1338,7 @@ fn policy() -> bool {
 
 fn check(what: &str, ok: bool) -> bool {
     if !ok {
-        trace!(0, "net selftest: nat: {} FAILED", what);
+        klog!(0, "net selftest: nat: {} FAILED", what);
     }
     ok
 }

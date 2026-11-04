@@ -53,6 +53,8 @@ pub mod vmx;
 #[cfg(target_arch = "x86_64")]
 pub mod vm;
 #[cfg(target_arch = "x86_64")]
+pub mod tp;
+#[cfg(target_arch = "x86_64")]
 pub mod linux;
 #[cfg(target_arch = "x86_64")]
 pub mod pvh;

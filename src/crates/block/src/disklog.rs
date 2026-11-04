@@ -47,7 +47,7 @@ use kcore::once::Once;
 use kcore::static_ring::Mailbox;
 use kcore::sync::{Event, TryLock};
 use kcore::task::{self, TaskHandle};
-use kcore::trace;
+use kcore::klog;
 
 /* ---- the on-disk header, first sector of the area ---- */
 
@@ -258,7 +258,7 @@ pub fn log(line: &[u8]) {
         return;
     }
 
-    if !ENABLED.load(Ordering::Relaxed) || trace::panic_active() {
+    if !ENABLED.load(Ordering::Relaxed) || klog::panic_active() {
         return;
     }
 
@@ -577,7 +577,7 @@ pub fn setup() -> bool {
         w.io = DmaBuffer::new(IO_BUF_SIZE / 4096);
         w.hdr = DmaBuffer::new(MAX_SECTOR_SIZE / 4096);
         if w.io.is_none() || w.hdr.is_none() {
-            trace!(0, "DiskLog: no memory for the transfer buffers");
+            klog!(0, "DiskLog: no memory for the transfer buffers");
             switch_off();
             return false;
         }
@@ -601,7 +601,7 @@ pub fn setup() -> bool {
         let claim = match block::claim_as(dev.handle(), HOLDER) {
             Ok(claim) => claim,
             Err(held_by) => {
-                trace!(0, "DiskLog: {} is in use by {}, not writing to it",
+                klog!(0, "DiskLog: {} is in use by {}, not writing to it",
                     dev.name(), held_by);
                 continue;
             }
@@ -630,7 +630,7 @@ pub fn setup() -> bool {
             return false;
         }
 
-        trace!(0, "DiskLog: {}, boot {}, {} sectors of {} bytes",
+        klog!(0, "DiskLog: {}, boot {}, {} sectors of {} bytes",
             dev.name(), boot,
             header.area_sectors, header.sector_size);
 
@@ -641,7 +641,7 @@ pub fn setup() -> bool {
         drop(writer);
 
         if !start_task() {
-            trace!(0, "DiskLog: no writer task, the log on disk stops here");
+            klog!(0, "DiskLog: no writer task, the log on disk stops here");
             flush();
             switch_off();
             block::release(CLAIM.swap(0, Ordering::Relaxed));
@@ -654,7 +654,7 @@ pub fn setup() -> bool {
     /* Asked for and not found: worth a line, since whoever asked is about to
      * go looking for a log that was never written. */
     switch_off();
-    trace!(0, "DiskLog: disklog=on, but no prepared area on any disk");
+    klog!(0, "DiskLog: disklog=on, but no prepared area on any disk");
     false
 }
 

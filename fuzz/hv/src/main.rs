@@ -43,9 +43,9 @@ macro_rules! invariant {
     };
 }
 
-/// `kcore::trace!`: the formatting checked, the line dropped.
+/// `kcore::klog!`: the formatting checked, the line dropped.
 #[macro_export]
-macro_rules! trace {
+macro_rules! klog {
     ($level:expr, $($arg:tt)*) => {{
         let _ = $level;
         let _ = format_args!($($arg)*);
@@ -55,7 +55,11 @@ macro_rules! trace {
 /* ---- what the sources reach of the kernel and of hvarch ---- */
 
 mod kernel;
-pub use kernel::{cmd, consts, dma, sync, time};
+pub use kernel::{cmd, consts, dma, sync, time, trace};
+/// The kernel's events, as kcore declares them for its sites: the payloads
+/// hv's sites build, held by `trace`'s emit to their descriptions.
+#[path = "../../../src/crates/kcore/src/trace/events.rs"]
+pub mod trace_events;
 mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
 pub use devices::offload;
@@ -90,8 +94,8 @@ pub mod pvh;
 #[path = "../../../src/crates/hv/src/mmio.rs"]
 pub mod mmio;
 /// NAT, from the net crate: what a guest's packets for the world, and the
-/// world's answers, go through. Its `use kcore::trace` is the kernel's macro;
-/// here `trace!` is the one above, in scope already, and the import unused.
+/// world's answers, go through. Its `use kcore::klog` is the kernel's macro;
+/// here `klog!` is the one above, in scope already, and the import unused.
 #[allow(unused_imports)]
 #[path = "../../../src/crates/net/src/nat.rs"]
 pub mod nat;
@@ -105,6 +109,11 @@ pub mod run;
 pub mod smbios;
 #[path = "../../../src/crates/hv/src/smp.rs"]
 pub mod smp;
+/// hv's records of what its guests' CPUs do (`kcore::trace`'s events, group
+/// `hv`): built from every exit the scripts make, and every halt, wake,
+/// injection and ring the run loop meets, when a target turns them on.
+#[path = "../../../src/crates/hv/src/tp.rs"]
+pub mod tp;
 /// `hv forward`'s relay, from the module: two streams carried both ways.
 #[path = "../../../src/crates/modules/hv/src/relay.rs"]
 pub mod relay;
@@ -190,9 +199,18 @@ fn input(target: &str, seed: u64, iter: u64, max_len: usize) -> Vec<u8> {
     v
 }
 
+/// The tracepoints on for an input of an odd length, off for the rest: half
+/// of every target's inputs build their records, and a replay of one -- the
+/// same bytes -- the same. A target may say otherwise from its input (the
+/// whole machine's does).
+fn trace_for(data: &[u8]) {
+    crate::trace::set_on(data.len() % 2 == 1);
+}
+
 /// Run `t` on `data`: None, or what went wrong.
 fn run_one(t: &Target, data: &[u8]) -> Option<String> {
     crate::time::reset();
+    trace_for(data);
     *LAST_PANIC.lock().unwrap() = None;
     let result = std::panic::catch_unwind(|| {
         let mut input = targets::Input::new(data);
@@ -253,6 +271,7 @@ fn main() {
         let t = targets::ALL.iter().find(|t| t.name == name).unwrap_or_else(|| usage());
         let data = unhex(&std::fs::read_to_string(&file).expect("the input's file"));
         crate::time::reset();
+        trace_for(&data);
         let mut input = targets::Input::new(&data);
         (t.run)(&mut input);
         println!("{}: ran to its end", name);

@@ -1,4 +1,4 @@
-#include "trace.h"
+#include "klog.h"
 #include "input.h"
 #include "panic.h"
 #include "time.h"
@@ -20,6 +20,7 @@
 #include <hal/irq_stubs.h>
 #include "softirq.h"
 #include "timer.h"
+#include "tracepoint.h"
 #include "cmd.h"
 #include <mm/new.h>
 #include <mm/page_allocator.h>
@@ -210,13 +211,20 @@ private:
 
 extern "C" {
 
-void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
+/* What klog! asks before it formats a line: whether the log keeps one of
+   this level. */
+int kernel_klog_wants(unsigned int level)
 {
-    /* The level, as trace() has it. A trace!(3, ...) used to be printed at
+    return (level <= (unsigned int)kernel::Klog::get_instance().get_level()) ? 1 : 0;
+}
+
+void kernel_klog(unsigned int level, const unsigned char* msg, unsigned long len)
+{
+    /* The level, as klog() has it. A klog!(3, ...) used to be printed at
        every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
        forty thousand times in a few seconds of netblk load, each one
        formatted and logged from the handler. */
-    if (level > (unsigned int)kernel::Tracer::get_instance().get_level())
+    if (level > (unsigned int)kernel::Klog::get_instance().get_level())
         return;
 
     char buf[512];
@@ -224,7 +232,7 @@ void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long le
     stdlib::mem_cpy(buf, msg, n);
     buf[n] = '\0';
     auto time = kernel::get_boot_time();
-    kernel::Tracer::get_instance().output("%u:%lu.%06lu:%s\n",
+    kernel::Klog::get_instance().output("%u:%lu.%06lu:%s\n",
         level, time.get_secs(), time.get_usecs(), buf);
 }
 
@@ -561,7 +569,7 @@ void kernel_cpu_run_on(unsigned int cpu,
     if (!(state & kernel::Cpu::STATE_RUNNING) ||
         (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
     {
-        trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
+        klog(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
         return;
     }
@@ -1217,7 +1225,7 @@ unsigned long kernel_interrupt_register_level(
                 rust_irq_slots[i].ctx = nullptr;
                 rust_irq_slots[i].used = false;
                 rust_irq_lock.write_unlock_irq_restore(flags);
-                trace(0, "kernel_interrupt_register_level: irq %lu refused",
+                klog(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
                 return 0;
             }
@@ -1229,7 +1237,7 @@ unsigned long kernel_interrupt_register_level(
     }
     rust_irq_lock.write_unlock_irq_restore(flags);
 
-    trace(0, "kernel_interrupt_register_level: no free slots");
+    klog(0, "kernel_interrupt_register_level: no free slots");
     return 0;
 }
 
@@ -1520,7 +1528,7 @@ unsigned long kernel_msix_register_handler(
         }
     }
     rust_msix_lock.write_unlock_irq_restore(flags);
-    trace(0, "kernel_msix_register_handler: no free slots");
+    klog(0, "kernel_msix_register_handler: no free slots");
     return 0;
 }
 
@@ -1859,20 +1867,20 @@ unsigned long kernel_version_field(unsigned int which, char* buf, unsigned long 
     return bounded_len(buf, len);
 }
 
-unsigned int kernel_trace_level()
+unsigned int kernel_klog_level()
 {
-    const int level = kernel::Tracer::get_instance().get_level();
+    const int level = kernel::Klog::get_instance().get_level();
     return (level > 0) ? (unsigned int)level : 0;
 }
 
 /* The trace level set, as `loglevel N` sets it: 1, or 0 -- and nothing
-   changed -- for a level past MAX_TRACE_LEVEL */
-int kernel_trace_set_level(unsigned int level)
+   changed -- for a level past MAX_LOG_LEVEL */
+int kernel_klog_set_level(unsigned int level)
 {
-    if (level > (unsigned int)kernel::MAX_TRACE_LEVEL)
+    if (level > (unsigned int)kernel::MAX_LOG_LEVEL)
         return 0;
 
-    kernel::Tracer::get_instance().set_level((int)level);
+    kernel::Klog::get_instance().set_level((int)level);
     return 1;
 }
 
@@ -2211,5 +2219,94 @@ int kernel_root_fstest()
 /* Net devices from Rust, both sides of them -- the driver's and the
    consumer's -- are defined in src/crates/net/src/device.rs, alongside the
    devices themselves. Nothing of them is left here. */
+
+/* ---- the tracepoints (kernel/tracepoint.h), for Rust's sites: kcore::trace ---- */
+
+/* The events' flags, a byte an event: tp::enabled, the kernel's for its life */
+const unsigned char* kernel_tp_flags()
+{
+    return kernel::tp::enabled;
+}
+
+unsigned long kernel_tp_count()
+{
+    return kernel::tp::COUNT;
+}
+
+/* A record of an event, its number and payload size in `id_size` and its
+   payload in `w0`..`w4`, in registers: record() holds the number and the
+   size to the event's description -- a BUG_ON for a site that disagrees with
+   it, and nothing written -- so any value of each is sound. A jump to it,
+   not a call -- musttail, which the kernel's -fno-optimize-sibling-calls
+   would otherwise forbid -- the arguments left where they came: what a
+   module's record crosses into the kernel by, at every guest exit hv
+   records. record()'s own types, which musttail holds a caller to. */
+void kernel_tp_record(ulong id_size, u64 w0, u64 w1, u64 w2, u64 w3, u64 w4)
+{
+    [[clang::musttail]] return kernel::tp::record(id_size, w0, w1, w2, w3, w4);
+}
+
+/* Event `id`'s name and payload size, as its description has them: what
+   kcore::trace::check holds a Rust payload to */
+int kernel_tp_event(unsigned short id, char* name, unsigned long name_len, unsigned long* size)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", e.name);
+    if (size != nullptr)
+        *size = e.size;
+    return 1;
+}
+
+/* Field `index` of event `id`: its name, offset and size, and how many
+   names its values have -- an enumeration's, 0 for any other field */
+int kernel_tp_field(unsigned short id, unsigned long index, char* name, unsigned long name_len,
+    unsigned long* offset, unsigned long* size, unsigned long* names)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (index >= e.field_count)
+        return 0;
+    const kernel::tp::Field& f = e.fields[index];
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", f.name);
+    if (offset != nullptr)
+        *offset = f.offset;
+    if (size != nullptr)
+        *size = f.size;
+    if (names != nullptr)
+        *names = (f.kind == kernel::tp::Kind::Enum && f.names != nullptr) ? f.name_count : 0;
+    return 1;
+}
+
+/* What value `value` of field `index` of event `id` is called -- an
+   enumeration's -- into `name`: 1, or 0 for no such field or value */
+int kernel_tp_field_name(unsigned short id, unsigned long index, unsigned long value, char* name,
+    unsigned long name_len)
+{
+    if (id >= kernel::tp::COUNT)
+        return 0;
+    const kernel::tp::Event& e = kernel::tp::event((kernel::tp::Id)id);
+    if (index >= e.field_count)
+        return 0;
+    const kernel::tp::Field& f = e.fields[index];
+    if (f.kind != kernel::tp::Kind::Enum || f.names == nullptr || value >= f.name_count)
+        return 0;
+    if (name != nullptr && name_len != 0)
+        stdlib::sn_printf(name, name_len, "%s", f.names[value]);
+    return 1;
+}
+
+/* The pid a record says the running task by: its own, or NO_TASK_PID off
+   a task's stack. Any context -- an interrupt's on a task's stack is that
+   task's, as sched_wakeup's waker is. */
+unsigned int kernel_tp_pid()
+{
+    kernel::Task* task = kernel::Task::try_get_current_task();
+    return (task != nullptr) ? (unsigned int)task->pid_ : kernel::tp::NO_TASK_PID;
+}
 
 } /* extern "C" */

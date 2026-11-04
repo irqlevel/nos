@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 use extfmt::extent::{Leaf, UNINIT_MAX_LEN};
 use extfmt::inode::{Inode, EXTENTS_FL};
 use extfmt::Map;
-use kcore::trace;
+use kcore::klog;
 
 use super::inodes as inode;
 use super::source;
@@ -62,11 +62,11 @@ impl Txn<'_> {
         let raw = self.inode(ino)?;
         let node = Inode::new(&raw)?;
         if !node.is_file() {
-            trace!(0, "ext4: inode {} is not a regular file", ino);
+            klog!(0, "ext4: inode {} is not a regular file", ino);
             return None;
         }
         if node.flags() & EXTENTS_FL == 0 {
-            trace!(0, "ext4: inode {} is mapped by blocks, which this does not write", ino);
+            klog!(0, "ext4: inode {} is mapped by blocks, which this does not write", ino);
             return None;
         }
         Some(raw)
@@ -219,7 +219,7 @@ impl Txn<'_> {
             let hole = match source::map(self, ino, &raw, l)? {
                 Map::Hole { run } => run.max(1).min(to - l),
                 Map::Blocks { .. } => {
-                    trace!(0, "ext4: block {} of inode {} is in no extent and mapped", l, ino);
+                    klog!(0, "ext4: block {} of inode {} is in no extent and mapped", l, ino);
                     return None;
                 }
             };
@@ -341,7 +341,7 @@ impl Ext4 {
             return false;
         }
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext4: a write to something that is not a file");
+            klog!(0, "ext4: a write to something that is not a file");
             return false;
         };
         if data.is_empty() {
@@ -349,7 +349,7 @@ impl Ext4 {
         }
         let end = offset as u64 + data.len() as u64;
         if end > self.max_size() {
-            trace!(0, "ext4: a write of {} bytes at {} is past what a file holds here", data.len(), offset);
+            klog!(0, "ext4: a write of {} bytes at {} is past what a file holds here", data.len(), offset);
             return false;
         }
         let bs = self.io.bs as u64;
@@ -430,11 +430,11 @@ impl Ext4 {
             return false;
         }
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext4: a truncate of something that is not a file");
+            klog!(0, "ext4: a truncate of something that is not a file");
             return false;
         };
         if size as u64 > self.max_size() {
-            trace!(0, "ext4: a size of {} is past what a file holds here", size);
+            klog!(0, "ext4: a size of {} is past what a file holds here", size);
             return false;
         }
         let done = match self.begin() {
@@ -463,36 +463,36 @@ impl Ext4 {
             return None;
         }
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext4: an allocation in something that is not a file");
+            klog!(0, "ext4: an allocation in something that is not a file");
             return None;
         };
         let Some(size) = self.tree.get(file).map(|n| n.size as u64) else {
-            trace!(0, "ext4: an allocation in inode {}, which the tree has not got", ino);
+            klog!(0, "ext4: an allocation in inode {}, which the tree has not got", ino);
             return None;
         };
         let end = first.saturating_add(count).min(size.div_ceil(self.io.bs as u64));
         if end <= first {
-            trace!(0, "ext4: an allocation of blocks {}..+{} of inode {}, past its {} bytes", first, count, ino, size);
+            klog!(0, "ext4: an allocation of blocks {}..+{} of inode {}, past its {} bytes", first, count, ino, size);
         }
         let mut given = 0u64;
         let mut l = first;
         while l < end {
             let to = end.min(l + ALLOC_BLOCKS);
             let Some(mut t) = self.begin() else {
-                trace!(0, "ext4: no transaction for an allocation in inode {}", ino);
+                klog!(0, "ext4: no transaction for an allocation in inode {}", ino);
                 return None;
             };
             let Some((got, reached)) = t.allocate_range(ino, l, to) else {
-                trace!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
+                klog!(0, "ext4: an allocation of blocks {}..{} in inode {} refused", l, to, ino);
                 return None;
             };
             if !t.commit() {
-                trace!(0, "ext4: an allocation in inode {} did not commit", ino);
+                klog!(0, "ext4: an allocation in inode {} did not commit", ino);
                 return None;
             }
             given += got;
             if reached <= l {
-                trace!(0, "ext4: an allocation in inode {} got nowhere at block {}", ino, l);
+                klog!(0, "ext4: an allocation in inode {} got nowhere at block {}", ino, l);
                 return None;
             }
             l = reached;
@@ -517,34 +517,34 @@ impl Ext4 {
             return false;
         }
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext4: blocks made written in something that is not a file");
+            klog!(0, "ext4: blocks made written in something that is not a file");
             return false;
         };
         let (mut run, mut l) = (0usize, runs.first().map_or(0, |r| r.0));
         let mut flushed = false;
         while run < runs.len() {
             let Some(mut t) = self.begin() else {
-                trace!(0, "ext4: no transaction to make blocks of inode {} written", ino);
+                klog!(0, "ext4: no transaction to make blocks of inode {} written", ino);
                 return false;
             };
             t.may_reserve = true;
             let Some((next_run, next_l)) = t.written_range(ino, runs, run, l) else {
-                trace!(0, "ext4: blocks of inode {} not made written, from block {}", ino, l);
+                klog!(0, "ext4: blocks of inode {} not made written, from block {}", ino, l);
                 return false;
             };
             flushed |= !t.dirty.is_empty();
             if !t.commit() {
-                trace!(0, "ext4: blocks of inode {} made written did not commit", ino);
+                klog!(0, "ext4: blocks of inode {} made written did not commit", ino);
                 return false;
             }
             if (next_run, next_l) == (run, l) {
-                trace!(0, "ext4: blocks of inode {} made written got nowhere at block {}", ino, l);
+                klog!(0, "ext4: blocks of inode {} made written got nowhere at block {}", ino, l);
                 return false;
             }
             (run, l) = (next_run, next_l);
         }
         if !flushed && !self.io.flush() {
-            trace!(0, "ext4: a flush for blocks of inode {} found written already failed", ino);
+            klog!(0, "ext4: a flush for blocks of inode {} found written already failed", ino);
             return false;
         }
         true
@@ -558,7 +558,7 @@ impl Ext4 {
             return None;
         }
         let Some(ino) = self.file_ino(file) else {
-            trace!(0, "ext4: a punch of something that is not a file");
+            klog!(0, "ext4: a punch of something that is not a file");
             return None;
         };
         let size = self.tree.get(file)?.size as u64;
@@ -572,7 +572,7 @@ impl Ext4 {
                 return None;
             }
             if left >= end {
-                trace!(0, "ext4: a punch of inode {} gave nothing back of {}..{}", ino, first, end);
+                klog!(0, "ext4: a punch of inode {} gave nothing back of {}..{}", ino, first, end);
                 return None;
             }
             given += freed;

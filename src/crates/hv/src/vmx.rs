@@ -150,6 +150,16 @@ impl Vcpu {
     pub fn profile(&self) -> Option<hvarch::x86::svm::Profile> {
         self.guest.profile()
     }
+    /// Its last entry's world switch, where it was timed
+    /// (`hvarch::x86::svm::Run`).
+    pub fn last_run(&self) -> hvarch::x86::svm::Run {
+        self.guest.last_run()
+    }
+    /// The host's interrupt its last exit was for, as the exit acknowledged
+    /// it.
+    pub fn host_vector(&self) -> Option<u8> {
+        self.guest.host_vector()
+    }
     /// The VPID the guest's translations are tagged with -- VT-x's ASID,
     /// held for the guest's life rather than handed out per CPU -- or None
     /// on a CPU without them.

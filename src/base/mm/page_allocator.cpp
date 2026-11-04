@@ -3,7 +3,7 @@
 
 #include <include/const.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <lib/list_entry.h>
 
@@ -20,7 +20,7 @@ FixedPageAllocator::FixedPageAllocator()
 
 FixedPageAllocator::~FixedPageAllocator()
 {
-    trace(0, "0x%p dtor", this);
+    klog(0, "0x%p dtor", this);
 }
 
 bool FixedPageAllocator::setup(ulong start, ulong end, ulong page_count)
@@ -28,7 +28,7 @@ bool FixedPageAllocator::setup(ulong start, ulong end, ulong page_count)
     page_count_ = page_count;
     ulong block_size = page_count * consts::PAGE_SIZE;
 
-    trace(0, "0x%p start 0x%lX end 0x%lX pages %lu", this, start, end, page_count_);
+    klog(0, "0x%p start 0x%lX end 0x%lX pages %lu", this, start, end, page_count_);
     return va_alloc_.setup(start, end, block_size);
 }
 
@@ -159,7 +159,7 @@ bool PageAllocatorImpl::setup()
     ulong start_address = pt.get_va_end();
     ulong end_address = start_address + ((7 * free_pages_count) / 10) * consts::PAGE_SIZE;
 
-    trace(0, "setup 0x%p start 0x%lX end 0x%lX free pages %lu", this, start_address, end_address, free_pages_count);
+    klog(0, "setup 0x%p start 0x%lX end 0x%lX free pages %lu", this, start_address, end_address, free_pages_count);
 
     size_t size_per_balloc = (end_address - start_address) / stdlib::array_size(fixed_pg_alloc_);
     for (size_t i = 0; i < stdlib::array_size(fixed_pg_alloc_); i++)
@@ -202,7 +202,7 @@ bool PageAllocatorImpl::setup()
 
 PageAllocatorImpl::~PageAllocatorImpl()
 {
-    trace(0, "0x%p dtor", this);
+    klog(0, "0x%p dtor", this);
 }
 
 void* PageAllocatorImpl::alloc(size_t num_pages, bool zero)
