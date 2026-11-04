@@ -49,6 +49,13 @@ is how either host knows it is done:
 | pgbench | init at scale 100, read-only and TPC-B at 1, 4, 8 and 16 clients |
 
 `/opt/bench/QUICK` beside it cuts every step short, to check the suite itself.
+`/opt/bench/ONLY` cuts the run to the steps it names (`sysbench-cpu`, `7zip`,
+`openssl`, `sysbench-memory`, `perf-bench`, `cyclictest`, `fio`, `kbuild`,
+`pgbench`) -- `bench-host.sh nos-stage <step>...` writes it -- and takes two
+words that no whole run has: `pipe-long`, perf's pipe alone for about a
+minute, and `layout-trace`, fio's first write marked by a `layout-ready`
+step 15 s before it and a `layout-done` 10 s after it -- each for a trace
+window to land in.
 The image is Ubuntu's cloud image, provisioned once by cloud-init under KVM
 (`guest/provision.sh`: the tools, PostgreSQL, nothing left that wakes by
 itself).
@@ -102,6 +109,8 @@ E-cores, a Samsung MZVL2512HCJQ NVMe), October and November 2026:
 | `nos-ddcbd4c6` | the host's timer armed for a guest's edge as the entry is made, and only then looked at |
 | `nos-16f9eb9d` | indirect descriptors, every request to the device as it comes and back as each is done, 64 requests out -- and the idle task's window, which left a woken vCPU waiting out a 3 ms slice: 4k reads at QD32 13k IOPS |
 | `nos-96281a83` | the same, the idle task looking at its queue with its flag up, and a disk's pass bound by the data it moves |
+| `nos-dc529775` | the third round (vm-perf3), the short suite -- sysbench, perf-bench, cyclictest, fio: a guest's CPUs at EPP 0, the disk's task serving its device, guest memory copied through the huge pool's window, the ICR, TSC-deadline and HLT exits answered in the world switch, C6 for the idle CPUs no guest holds, growth ahead of a guest's stream of writes |
+| `nos-dc529775-fio` | the same build again, fio alone: the first run's 1 MiB reads and writes (97%, 39%) were the device's state, back at 149% and 127% here |
 
 `results/comparison.md` is `compare-n.py` over the reference and the runs
 that changed something. The same code run twice moves some numbers by 5-10%

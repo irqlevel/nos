@@ -105,6 +105,36 @@ public:
     static const ulong IDLE_DEEP_NS = 2 * consts::NANO_SECS_IN_MS;
     static const ulong IDLE_LONG_RUN = 4;
 
+    /* And short of that, the C-state between (hal::IdleDepth::Mid, a core's
+       C6) once its next timer is this far off -- past the residency a C6
+       takes to pay for itself, 0.6 ms on the EX44's parts -- on a CPU no
+       guest's vCPU or disk holds (set_latency_held): an idle core out of the
+       count of busy cores a busy core's turbo is figured from, so that the
+       busy one runs at its own. With only C1 and the deepest, the EX44's
+       busy vCPU's core ran at 4.55 GHz while idle P-cores' threads spent
+       36-99% of the window in C1, where the same core under Linux ran at
+       4.8 (round 23's `cpufreq`). */
+    static const ulong IDLE_MID_NS = consts::NANO_SECS_IN_MS;
+
+    /* Whether a guest's vCPU or disk holds this CPU (kernel_cpu_performance):
+       its idles then never sleep in the C-state between, whose wake a guest
+       would wait for at every halt it is woken from. Set by the CPU itself,
+       in the IPI that sets its preference. */
+    void set_latency_held(bool held);
+
+    /* What this CPU's idles by MWAIT were since boot (idle_mwait): how many
+       of them, and how long in all, in C1 (0), in the C-state between (1)
+       and in its deepest (2) -- what it asked for, which the CPU may have
+       taken shallower. The CPU's own, written with interrupts off; read on
+       it, also with them off (`cpufreq`). */
+    static const ulong IDLE_KINDS = 3;
+    struct IdleCounts
+    {
+        ulong idles[IDLE_KINDS];
+        ulong ns[IDLE_KINDS];
+    };
+    IdleCounts get_idle_counts() const;
+
     static const ulong STATE_INITED = 0x1;
     static const ulong STATE_RUNNING = 0x2;
     static const ulong STATE_EXITING = 0x4;
@@ -167,6 +197,8 @@ private:
        IDLE_LONG_RUN: what idle_mwait goes deep by. This CPU's alone, with
        interrupts off. */
     ulong idle_long_run_;
+    IdleCounts idle_counts_;
+    bool latency_held_;
 
     /* Ticks are a period apart; an interrupt this close before the next
        is that tick, rather than one more interrupt a moment later. */

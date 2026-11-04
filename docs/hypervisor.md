@@ -2467,6 +2467,48 @@ sender's own APIC changes what the round would hand in, and goes the round.
 On the EX44 an exit cost the host 545-559 ns handled and 479-496 ns to the
 next entry, past the world switch.
 
+**And those two writes are answered inside the world switch itself**
+(`hvarch::x86::fast::FastExit`, KVM's `handle_fastpath_set_msr_irqoff`):
+after a WRMSR exit, still with interrupts off and the guest's x87, SSE, AVX
+and CR2 in the CPU, the backend's loop -- `vmx::Guest::enter`'s,
+`svm::Guest::run`'s -- offers the write to the run loop's `FastMsr`, and where
+it is answered steps the guest past it and enters again at once: no XSAVE,
+no XRSTOR, no round. What answers is the same code as the round's: an x2APIC
+ICR write of a fixed or lowest-priority IPI to other CPUs alone
+(`Lapic::fixed_ipi`, posted or mailed as `send` does), and a TSC-deadline
+write (the host's timer armed for the new edge). Everything else is refused
+with nothing done and goes the exit's usual way: an IPI that reaches the
+sender, an NMI, INIT or start-up, a reserved bit, xAPIC mode, any other MSR,
+a guest single-stepping (TF: its #DB after the instruction is the run
+loop's), and under AMD-V an exit with no next RIP or one that cut an event's
+delivery short. Each entry of the loop is an entry like any other -- VERW,
+the L1D flush where it is needed, the guest's SPEC_CTRL over the host's and
+the host's back after, AMD's IBPB at the exit -- and the kick decides each
+again (`Kick::entering`): a ring, mail, or the host timer's edge come since
+ends it, the write answered, as a kick's refusal of an entry, for the round
+to take what came. What may run there is what may run with interrupts off:
+the posts, the doorbells' rings and the tracepoint's record. The report
+counts the writes answered there (`answered`) and leaves them out of its
+average exit; `hv-fuzz.py`'s whole-machine runs offer three in four of their
+scripted WRMSRs to it, the rest going the round, and hold both to the same
+invariants.
+
+**A HLT that an IPI ends soon is waited out there too** (`FastExit::hlt`,
+VT-x with posted interrupts): with interrupts on in the guest, nothing in
+its virtual APIC (RVI 0) and no window asked for, the run loop's `FastMsr`
+spins with the host's interrupts off -- for as long as the CPU's halts have
+lately been ending within (`poll_ns`), to `HLT_SPIN_NS`, 50 us -- until
+something is posted for the CPU, and the loop steps past the HLT and enters
+again at once: the vCPU is in its guest as posters see it, so the poster
+sends the notification, which waits on this CPU and is taken in the guest
+as it enters. On the EX44 the round after a halt's wake took 983 ns to the
+next entry, and the exit to the halt 381 more (round 22, perf's pipe). A kick -- a ring for mail, a
+device, a stop --, the host timer's armed edge, or the time up ends the wait
+with nothing done and the HLT goes the loop's way; a CPU without posted
+interrupts, and AMD-V, never wait here. The report counts the HLTs ended so
+(`hlt_answered`), among the exits and the HLTs, none of them a halt of the
+loop's.
+
 **An edge of its own timers that comes on the way in is taken a round
 later**, not at the host's next tick. The loop looks at its timers, and
 arms the host's timer for their next edge a few hundred nanoseconds later
@@ -3436,6 +3478,23 @@ guest holds its cores until `hv stop` -- parked too, for the restart that
 runs it there again -- and an `hv boot` guest until its run is over. `hv
 cores` says the rule and who holds which CPUs; `hv list` says where each
 guest's disks are served.
+
+**A guest's CPUs run at the performance preference while they are its.**
+Where HWP picks a CPU's clock (Intel since Skylake, `docs/kernel-parameters.md`'s
+`hwp_epp=`), every CPU a guest's vCPUs run on is asked for EPP 0 for as long
+as the guest runs (`kcore::cpu::Performance`, held by `guest::run_cpus`),
+and given back the boot's preference -- `balance_performance` unless told --
+when the last who holds one lets go. Not the CPU its disks' task runs on:
+with that E-core at EPP 0 too, its task spinning there for the NVMe, every
+4k request took 3.8 us longer from the command to its completion's
+interrupt on another CPU -- reads and writes alike, 33.5k IOPS at QD1
+against 39.5k -- and without it they are back (rounds 15-17). A guest's CPUs idle between its ticks,
+and at the boot's preference HWP lowered their clock in every idle: on the
+EX44 the first microseconds after each wake ran five to ten times slower
+than on a busy core -- the TSC deadline's write that costs a busy core 1.3
+us cost 10 there -- and cyclictest in the guest saw 66 us on average, where
+the same guest under KVM saw 31 and under nos at EPP 0 saw 6 (round 14,
+`plans/vm-perf-todo.md`).
 
 What it costs: a guest's own CPUs share their core. On one core's two
 threads (13 and 12 on the AX41) two busy loops in a Debian guest took 14.7 s
