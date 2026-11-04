@@ -27,6 +27,11 @@ unsafe extern "C" {
     /// the IPI that writes the CPU's MSR. Nothing for a CPU not running or
     /// without HWP. Values only.
     pub safe fn kernel_cpu_performance(cpu: u32, hold: i32);
+    /// CPU `cpu` held to wake quickly -- its idles out of the C-state between
+    /// C1 and the deepest -- while its holds outnumber its releases, as a
+    /// performance hold holds it too. Task context: it waits for the IPI
+    /// that sets it on the CPU. Nothing for a CPU not running. Values only.
+    pub safe fn kernel_cpu_latency(cpu: u32, hold: i32);
 }
 
 /* Interrupts and preemption off, and back on, for code that holds a lock of

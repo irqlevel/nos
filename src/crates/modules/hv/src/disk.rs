@@ -207,6 +207,8 @@ struct Serve {
     pipe: Arc<Pipe>,
     queue: Arc<ImageQueue>,
     disk: u8,
+    /// The CPU it is bound to, held to wake quickly while it serves.
+    cpu: u32,
 }
 
 /// How long the task sleeps with nothing to do before it looks again: a
@@ -292,7 +294,8 @@ impl FileDisk {
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
         let queue = Arc::new(queue);
         let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu,
-                                              Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index }, serve)
+                                              Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index,
+                                                      cpu: runner.cpu }, serve)
             .ok_or_else(|| alloc::format!("{}: no task to serve it", path))?;
         Ok(FileDisk { pipe, queue, size, read_only, discard_sectors, task: Some(task), _claim: claim })
     }
@@ -356,7 +359,11 @@ impl Drop for FileDisk {
 /// `disk_start` is recorded as it is picked up, and its `disk_done` as it is
 /// done -- before it goes back the other way.
 fn serve(start: Serve) {
-    let Serve { pipe, queue, disk } = start;
+    let Serve { pipe, queue, disk, cpu } = start;
+    /* The CPU it serves from held to wake quickly while it does: its idles
+     * between the guest's requests out of the C-state between C1 and the
+     * deepest, whose wake each request after one would wait for. */
+    let _latency = kcore::cpu::Latency::hold(cpu);
     let (mut new, mut finished, mut flying) = (Vec::new(), Vec::new(), Vec::new());
     if new.try_reserve_exact(blk::IN_FLIGHT).is_err() || finished.try_reserve_exact(blk::IN_FLIGHT).is_err()
         || flying.try_reserve_exact(blk::IN_FLIGHT).is_err()

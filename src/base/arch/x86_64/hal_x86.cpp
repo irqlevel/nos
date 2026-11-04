@@ -222,10 +222,12 @@ bool setup_cpu_performance(CpuPerformance* out)
    after. The line MONITOR arms is one nothing writes: an interrupt is what
    wakes an idle CPU here, as from a HLT. */
 static u32 idle_mwait_hint;
+static u32 idle_mwait_mid_hint;
+static bool idle_mwait_mid_on;
 static bool idle_mwait_on;
 static u64 idle_monitor_line[8] __attribute__((aligned(64)));
 
-bool setup_idle(u32* hint)
+bool setup_idle(u32* hint, u32* mid)
 {
     static const u32 LEAF_BASIC = 0;
     static const u32 LEAF_FEATURES = 1;
@@ -244,8 +246,11 @@ bool setup_idle(u32* hint)
     static const u32 MWAIT_STATES = 8;
     static const u32 MWAIT_STATE_BITS = 4;
     static const u32 MWAIT_STATE_MASK = 0xF;
+    /* MWAIT's C3, whose hint is 0x20: a core's C6 on Intel's parts */
+    static const u32 MWAIT_MID_STATE = 3;
 
     *hint = 0;
+    *mid = 0;
     if (!kernel::Parameters::get_instance().is_idle_mwait())
         return false;
     if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
@@ -268,6 +273,15 @@ bool setup_idle(u32* hint)
             idle_mwait_hint = ((n - 1) << MWAIT_STATE_BITS) | (subs - 1);
             idle_mwait_on = true;
             *hint = idle_mwait_hint;
+            /* The state between, where it is offered and is not the
+               deepest: its first sub-state */
+            u32 mid_subs = (states >> (MWAIT_MID_STATE * MWAIT_STATE_BITS)) & MWAIT_STATE_MASK;
+            if (n > MWAIT_MID_STATE && mid_subs != 0)
+            {
+                idle_mwait_mid_hint = (MWAIT_MID_STATE - 1) << MWAIT_STATE_BITS;
+                idle_mwait_mid_on = true;
+                *mid = idle_mwait_mid_hint;
+            }
             return true;
         }
     }
@@ -379,14 +393,18 @@ bool setup_cpu_c1e(bool* was_on, bool* on)
     return true;
 }
 
-void cpu_idle_masked(bool deep)
+void cpu_idle_masked(IdleDepth depth)
 {
     /* ECX bit 0: an interrupt ends the MWAIT though interrupts are off --
        one already pending ends it at once -- and is taken once they are on
        again. C1 is hint 0, as a HLT. */
     static const ulong MWAIT_INTERRUPT_BREAK = 1;
     static const ulong MWAIT_C1 = 0;
-    ulong hint = (deep && idle_mwait_on) ? (ulong)idle_mwait_hint : MWAIT_C1;
+    ulong hint = MWAIT_C1;
+    if (depth == IdleDepth::Deep && idle_mwait_on)
+        hint = idle_mwait_hint;
+    else if (depth == IdleDepth::Mid && idle_mwait_mid_on)
+        hint = idle_mwait_mid_hint;
     asm volatile("monitor" : : "a"(idle_monitor_line), "c"(0UL), "d"(0UL) : "memory");
     asm volatile("mwait" : : "a"(hint), "c"(MWAIT_INTERRUPT_BREAK) : "memory");
 }

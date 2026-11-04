@@ -70,6 +70,55 @@ numbers against KVM's (`bench/vm/results/kvm`) and round 12's:
   QEMU's iothread with irqfd does -- the used ring written and the MSI posted
   from there, the ring looked at as it polls, vCPU 0 out of it.
 
+## Rounds 18-23 (vm-perf3, 2026-11-04): the disk's task, copies, fast exits, growth ahead
+
+The same short suite (sysbench cpu and memory, perf-bench, a long pipe,
+cyclictest, fio, the first write traced), each round's windows and `cpufreq`
+samples in `out/ex44-bench/results-nos-<sha>`; against KVM:
+
+| | KVM | r18 007650c6 | r20 6a8ece3c | r21 faa0484b | r23 c0650c51 |
+|---|---:|---:|---:|---:|---:|
+| 4k read QD32 | 195k | 215k | **290k** | 284k | 288k |
+| 4k read 4x16 | 217k, p99 358 us | 224k, 831 | **342k**, 880 | 347k, **268** | 325k, 292 |
+| 4k write QD32 | 178k | 130k | **174k** | 172k | 164k |
+| first write (2 GiB) | 4643 MiB/s | 3002 | 3351 | 3346 | 3025 |
+| 1 MiB write QD8 | 3694 MiB/s | 4281 | 4619 | 4627 | **1454** |
+| fdatasync | 620 | 733 | 737 | 734 | **371** |
+| perf pipe | 6.0 us | 8.26 | (8.34 long) | **7.39** | 7.35 |
+| cyclictest avg | 31 us | 6 | -- | **4** | 4 |
+| sysbench cpu t1 | 1589 | -- | -- | 1526 | 1534 |
+| memory random read t1 | 949 MiB/s | -- | 804 | 802 | 820 |
+
+- **The disk's task serves its device** (007650c6): QD32 reads past KVM.
+- **A guest's memory copied through the huge pool's window** (6a8ece3c): the
+  disk's task on its E-core paid ~1 us of tmp_map and invlpg per 4 KiB; the
+  4x16 job to 158%, QD32 writes to 98%.
+- **The ICR and TSC-deadline writes answered in the world switch** (faa0484b):
+  30.7 million of a run's 30.7 million WRMSRs; pipe 8.3 -> 7.4 us, cyclictest
+  6 -> 4 us. A TSC-deadline exit had cost 3.4 us of the host's.
+- **Growth ahead of a guest's stream of writes** (c0650c51) asked over blocks
+  the file already had, 664 times a run: the 1 MiB writes and fdatasync above
+  fell by half or more (round 23); aa2b4785 asks only where the image's map
+  has a hole, and the boot's fstest holds a second pass over a written file
+  to asking none.
+- **The turbo**: `cpufreq` (cdc0756f, bf65d154) found the busy vCPU's core at
+  4.55-4.58 GHz under sysbench, where Ubuntu on the same box runs it at 4.8
+  (round 23's deploy, a busy loop on cpu 8), with idle P-cores' threads
+  36-99% of the window in C1 -- nos's idle going deep only after four long
+  idles in a row. CPU-bound work's 3-4% to KVM is that size. Next: a core's
+  C6 for idles with the next timer 1 ms off, on CPUs no guest holds.
+- **perf's pipe** (round 22's window): of a HLT's 2.2 us out of the guest,
+  0.84 waiting for the ring, 0.98 from the wake to the next entry and 0.38
+  from the exit to the halt. Next: the HLT waited out in the world switch's
+  loop for what is posted (VT-x), the round left out.
+- **Memory random reads** stay at 83-86% with the SMT sibling idle (not
+  halt-polling), the EPT's leaves 2 MiB as KVM's are and the guest with PCID:
+  what is left wants a PMU to see.
+- **The guest has one virtio-blk queue**, KVM's four (one a vCPU). The 4x16
+  job's p99 fell from 880 to 268 us with the exits answered in the world
+  switch (r20 -> r21: the IPIs its completions wake the other vCPUs by) and
+  stayed there (276, 292): more queues are not a finding yet.
+
 ## Done since ddcbd4c6
 
 - **The fdatasync job's tail** (p99 0.7-0.9 ms and p999 ~1 ms in every run

@@ -195,23 +195,35 @@ bool setup_cpu_c1e(bool* was_on, bool* on);
    5 offers -- where the kernel was booted with idle=mwait, the CPU has
    MONITOR/MWAIT and takes an interrupt as the end of one though interrupts
    are masked, an APIC timer that runs in every C-state (ARAT), which is the
-   only timer this kernel is woken by, and no hypervisor under it. True when
-   it was set up, `hint` the deep MWAIT hint; false where an idle CPU halts,
-   always: HLT, or arm64's WFI. Defined per arch. */
-bool setup_idle(u32* hint);
+   only timer this kernel is woken by, and no hypervisor under it -- and in
+   between in MWAIT's C3, a core's C6 on Intel's parts, where leaf 5 offers
+   it short of the deepest. True when it was set up, `hint` the deep MWAIT
+   hint and `mid` the one between (0 for none); false where an idle CPU
+   halts, always: HLT, or arm64's WFI. Defined per arch. */
+bool setup_idle(u32* hint, u32* mid);
 
 /* Whether setup_idle set MWAIT up: an idle CPU sleeps by cpu_idle_masked
    then, and halts with interrupts on otherwise. Defined per arch. */
 bool idle_masked();
 
+/* How deep an idle sleeps (cpu_idle_masked): C1, as a HLT; the C-state
+   between that setup_idle found, a core's C6 -- out of the count of busy
+   cores a busy core's turbo is figured from, a wake of a hundred or two
+   microseconds -- or C1 where it found none; and the deepest, slower to
+   wake still. */
+enum class IdleDepth
+{
+    C1,
+    Mid,
+    Deep,
+};
+
 /* With interrupts off, and only where idle_masked(): this CPU idle until an
-   interrupt is pending -- in the C-state setup_idle chose where `deep`, the
-   CPU out of the count of busy cores a busy core's turbo is figured from
-   and slower to wake, and in C1 otherwise -- or until a spurious wake. It
+   interrupt is pending -- as deep as `depth` -- or until a spurious wake. It
    returns with interrupts still off, so that its caller can read the clock
    before the interrupt is taken; the interrupt is taken as they are turned
    back on. Defined per arch. */
-void cpu_idle_masked(bool deep);
+void cpu_idle_masked(IdleDepth depth);
 
 /* How fast read_cycle_counter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.

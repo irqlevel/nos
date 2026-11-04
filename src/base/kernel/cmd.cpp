@@ -395,9 +395,10 @@ static void cmd_cpufreq(const char* args, stdlib::Printer& con)
             count[k] = after[i].idle.idles[k] - before[i].idle.idles[k];
         }
         if (shown == 0)
-            con.printf("  cpu  MHz busy  busy%%  idle in C1, deep: share (idles)\n");
-        con.printf("  %3lu  %8lu  %3lu.%lu%%  %3lu.%lu%% (%lu), %3lu.%lu%% (%lu)\n", i, mhz, busy / 10, busy % 10,
-            share[0] / 10, share[0] % 10, count[0], share[1] / 10, share[1] % 10, count[1]);
+            con.printf("  cpu  MHz busy  busy%%  idle in C1, between, deepest: share (idles)\n");
+        con.printf("  %3lu  %8lu  %3lu.%lu%%  %3lu.%lu%% (%lu), %3lu.%lu%% (%lu), %3lu.%lu%% (%lu)\n", i, mhz,
+            busy / 10, busy % 10, share[0] / 10, share[0] % 10, count[0], share[1] / 10, share[1] % 10, count[1],
+            share[2] / 10, share[2] % 10, count[2]);
         shown++;
     }
     if (shown == 0)
