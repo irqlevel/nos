@@ -21,7 +21,9 @@
 #   bench-host.sh check      a copy of it booted: the tools there, the suite QUICK
 #   bench-host.sh arm        AUTORUN into golden.raw: its next boot runs the suite
 #   bench-host.sh kvm        the suite under KVM, the image on nos's root partition
-#   bench-host.sh nos-stage  a fresh copy and its vm.toml onto nos's root
+#   bench-host.sh nos-stage [step...]
+#                            a fresh copy and its vm.toml onto nos's root, the
+#                            kit's guest/run.sh in it, cut to the steps named
 #
 # Each prints what it did; the caller runs it detached and reads its exit
 # status from a file (the Mac's ssh path cuts a quiet session).
@@ -280,6 +282,29 @@ kvm() {
     echo 0 > /proc/sys/vm/nr_hugepages
 }
 
+# suite_into <disk> [step...]: the kit's guest/run.sh into the disk's
+# /opt/bench, so that the suite run is the tree's whatever golden.raw was
+# provisioned with, and the steps named -- run.sh's ONLY -- or every one
+suite_into() {
+    local disk=$1 loop
+    shift
+    [ -f $W/guest/run.sh ] || [ $# -gt 0 ] || return 0
+    loop=$(losetup -f --show -P "$disk")
+    mkdir -p /mnt/benchdisk
+    mount "${loop}p1" /mnt/benchdisk
+    if [ -f $W/guest/run.sh ]; then
+        install -m 755 $W/guest/run.sh /mnt/benchdisk/opt/bench/run.sh
+    fi
+    rm -f /mnt/benchdisk/opt/bench/ONLY
+    if [ $# -gt 0 ]; then
+        echo "$*" > /mnt/benchdisk/opt/bench/ONLY
+        step "the suite cut to: $*"
+    fi
+    ls -la /mnt/benchdisk/opt/bench
+    umount /mnt/benchdisk
+    losetup -d "$loop"
+}
+
 nos_stage() {
     cd $W
     mount_nosroot
@@ -288,6 +313,7 @@ nos_stage() {
     mkdir -p $MNT/vms/bench
     rm -f $MNT/vms/bench/disk.raw $MNT/vms/bench/console.log $MNT/vms/bench/console.log.1
     cp --sparse=always golden.raw $MNT/vms/bench/disk.raw
+    suite_into $MNT/vms/bench/disk.raw "$@"
     cat > $MNT/vms/bench/vm.toml <<'TOML'
 # The KVM-vs-nos comparison's guest: the same disk image QEMU/KVM ran on
 # Ubuntu, under nos's hv -- 4 CPUs, 8 GiB, its suite run at boot, then off.
@@ -312,6 +338,6 @@ case "${1:-}" in
     check) check ;;
     arm) arm ;;
     kvm) kvm ;;
-    nos-stage) nos_stage ;;
+    nos-stage) shift; nos_stage "$@" ;;
     *) echo "usage: $0 info|prep|check|arm|kvm|nos-stage" >&2; exit 2 ;;
 esac
