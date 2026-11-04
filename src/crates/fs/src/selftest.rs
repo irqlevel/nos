@@ -589,11 +589,26 @@ fn image_ahead(vfs: &'static Vfs, base: &Path, report: &mut Reporter) -> bool {
         return false;
     }
     let (aheads, _) = image.grown_ahead();
-    drop(image);
     if allocates && aheads == 0 {
         report.say(path, "an image written from one end was never grown ahead of its writes");
         return false;
     }
+    /* Written over from one end again, every block the file's now: nothing
+     * to grow, and nothing grown -- a growth asked over blocks the file has
+     * cost a guest's writes over its disk two thirds of their speed (round
+     * 23 on the EX44) */
+    for at in (0..AHEAD_SIZE).step_by(AHEAD_PIECE) {
+        fill(&mut piece, AHEAD_PIECE, at, SALT);
+        if !image.write_at(at as u64, &piece) {
+            report.say(path, "a write over the image from one end failed");
+            return false;
+        }
+    }
+    if !image.sync() || image.grown_ahead().0 != aheads {
+        report.say(path, "an image written over from one end was grown ahead of its writes, or did not sync");
+        return false;
+    }
+    drop(image);
     verify(vfs, path, &mut rbuf, AHEAD_SIZE, None, report, "after its image wrote it from one end")
 }
 
