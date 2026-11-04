@@ -14,7 +14,11 @@
 //! open nothing else may write the file, cut it, grow it, rename it or
 //! remove it, so the blocks the map names stay the file's -- and nobody else
 //! writes them -- until the image is closed, and nothing but the image
-//! changes the map. What only the filesystem can do is left to it: a write
+//! changes the map. The image's own task growing it ahead (`Ahead`) gives
+//! the file blocks only where it has none: until the image takes them into
+//! its map they are holes there, which read as the zeros they hold, and a
+//! write into them waits for the task rather than growing the image over
+//! what it gives. What only the filesystem can do is left to it: a write
 //! into a hole needs blocks allocated and pointed at in order, so a batch
 //! with a hole in it goes through the VFS as every write did -- the blocks
 //! it touched taken into the map again after it, as a punch's are -- and the
@@ -34,8 +38,13 @@
 //! its blocks given to the file in one commit as unwritten extents, which
 //! read as zeros and have nothing written to them, and the write then goes
 //! to the device as an overwrite: a commit a chunk, where a write through
-//! the VFS was a commit a batch. What it wrote there is made written at the
-//! guest's next flush (`Vfs::mark_written`), whose commit's own flush puts
+//! the VFS was a commit a batch. A guest writing its disk on from one end --
+//! each write beginning where the last ended -- has the stretch ahead of it
+//! given its blocks by a task of the image's own (`Ahead`), every hole in
+//! it, so that its writes meet none and wait for no commit: on the EX44 the
+//! disk's task of a guest's 2 GiB first write committed 28 times, 5-7 ms
+//! each, 18 of them in its first 150 ms. What it wrote there is made written
+//! at the guest's next flush (`Vfs::mark_written`), whose commit's own flush puts
 //! the data on the medium first -- noted as written once it is done, not
 //! when it is started. A guest's discard gives whole chunks back
 //! to the filesystem (`discard`, `Vfs::punch`): holes from then on, as a
@@ -59,8 +68,9 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use block::queue::Queue;
 use block::{Disk, Piece};
@@ -68,7 +78,9 @@ use kcore::block::SubmitError;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
-use kcore::sync::Mutex;
+use kcore::consts::NS_PER_SEC;
+use kcore::sync::{Event, Mutex};
+use kcore::task::{self, TaskHandle};
 use kcore::time::{boot_time_ns, Duration};
 use kcore::trace::{self, ImageNote, ImageSync};
 use kcore::klog;
@@ -112,6 +124,19 @@ pub const GROW_MAX_CHUNKS: u64 = 16;
 /// not given to writes that may never come -- and a refusal of what is
 /// ahead never sends a write that fits through the VFS.
 const GROW_SHARE: u64 = 8;
+
+/// How long a write into a hole waits for the growth the image's task is
+/// making over it before the wait is said in the log -- and again every
+/// time as long goes by (`Direct::wait_ahead`).
+const AHEAD_SAY_NS: u64 = 10 * NS_PER_SEC;
+
+/// The step of that wait.
+const AHEAD_STEP_MS: u64 = 100;
+
+/// How many writes in a row, each beginning where the last ended, make a
+/// guest's stream from one end of its disk -- past the first -- before the
+/// image grows ahead of it (`Direct::ask_ahead`).
+const STREAM_MIN: u64 = 2;
 
 /// What zeros are written from, a piece at a time (`write_zeroes`).
 const ZERO_CHUNK: usize = 16 * 1024;
@@ -404,6 +429,25 @@ struct Direct {
     /// a hole beginning there is given twice as many (`grow`).
     grown_to: u64,
     span: u64,
+    /// The guest's stream of writes from one end (`ask_ahead`): the block
+    /// the next write of it begins at, and how many in a row went on so;
+    /// and where the stretch last given ahead of it ends, and its chunks.
+    stream_at: u64,
+    stream_run: u64,
+    ahead_to: u64,
+    ahead_span: u64,
+    /// The growth under way ahead of its guest's writes, by a task of its
+    /// own (`ask_ahead`): one at a time, None between them.
+    ahead: Option<Grower>,
+    /// No growth ahead from here on -- no task could be had for one, or its
+    /// filesystem refused what one asked -- and each write into a hole grows
+    /// the image itself, as before.
+    ahead_off: bool,
+    /// Growths made ahead, the blocks they gave, and the writes that met one
+    /// still under way and waited for it.
+    aheads: u64,
+    ahead_blocks: u64,
+    ahead_waits: Timed,
     /// A write went through the VFS since the last sync -- blocks were
     /// allocated, the filesystem's own metadata changed -- so the next sync
     /// is the filesystem's, not only the device's.
@@ -706,8 +750,21 @@ impl Image {
     /// one of its blocks now -- taken afresh, as runs, and held to it -- or
     /// it holds none, and asks. For whoever holds the image to its
     /// filesystem (the fuzzer).
+    /// Growths made ahead of its writes by its own task, and the writes into
+    /// a hole that waited for one: for whoever holds the image to what it
+    /// reached (the fuzzer).
+    pub fn grown_ahead(&self) -> (u64, u64) {
+        self.direct.as_ref().map_or((0, 0), |d| (d.aheads, d.ahead_waits.count))
+    }
+
     pub fn map_is_the_filesystems(&mut self) -> bool {
         let (vfs, handle, size) = (self.vfs, self.handle, self.size);
+        /* A growth under way ahead is the file's before it is the map's:
+         * waited for and taken, so that the two are held to each other as
+         * they settle. */
+        if let Some(direct) = self.direct.as_mut() {
+            direct.settle_ahead(vfs, handle);
+        }
         let Some(Direct { map: Some(map), block, .. }) = self.direct.as_ref() else { return true };
         match Map::load(vfs, handle, size.div_ceil(*block as u64), map.per_block) {
             Some(now) if now.runs == map.runs => true,
@@ -847,6 +904,7 @@ impl Image {
         let block = direct.block;
         let pages = direct.sectors.len();
         let file_blocks = size.div_ceil(block as u64);
+        direct.take_ahead(vfs, handle);
         let (mut req, mut done) = (0usize, 0usize);
         while req < ios.len() {
             direct.stretches.clear();
@@ -867,10 +925,20 @@ impl Image {
                 if !direct.resolve(vfs, handle, first, used, blocks) {
                     return false;
                 }
-                if direct.grows && direct.sectors[used..used + blocks].contains(&0)
-                    && direct.grow(vfs, handle, first, blocks as u64, file_blocks)
-                    && !direct.resolve(vfs, handle, first, used, blocks) {
-                    return false;
+                if direct.grows && direct.sectors[used..used + blocks].contains(&0) {
+                    /* Being given already, by the image's task: waited for,
+                     * and not given a second time over it */
+                    if direct.wait_ahead(vfs, handle, first, blocks as u64)
+                        && !direct.resolve(vfs, handle, first, used, blocks)
+                    {
+                        return false;
+                    }
+                    if direct.sectors[used..used + blocks].contains(&0)
+                        && direct.grow(vfs, handle, first, blocks as u64, file_blocks)
+                        && !direct.resolve(vfs, handle, first, used, blocks)
+                    {
+                        return false;
+                    }
                 }
                 let (batch, part) = direct.sectors.split_at(used);
                 let part = &part[..blocks];
@@ -977,6 +1045,13 @@ impl Image {
                     }
                 }
             }
+        }
+        /* Its last write going on from the last growth: the next asked
+         * ahead of it, as a queue's write has it (`ask_ahead`) */
+        if let Some(&(at, data)) = ios.last() {
+            let first = at / block as u64;
+            let n = (at % block as u64 + data.len() as u64).div_ceil(block as u64);
+            direct.ask_ahead(vfs, handle, first, n, file_blocks);
         }
         true
     }
@@ -1222,7 +1297,11 @@ impl Image {
         {
             return Started::Done(false);
         }
+        self.take_ahead();
         if let Some(started) = self.start_fast(k, write, offset, len) {
+            if write {
+                self.ask_ahead(offset, len);
+            }
             return started;
         }
         /* A write into a hole: its chunks given first, and then to the
@@ -1234,6 +1313,7 @@ impl Image {
          * growth so, its device idle. */
         if write && self.grow_for(offset, len) {
             if let Some(started) = self.start_fast(k, write, offset, len) {
+                self.ask_ahead(offset, len);
                 return started;
             }
         }
@@ -1282,7 +1362,32 @@ impl Image {
         {
             return false;
         }
+        /* Being given already, by the image's task: waited for, and not
+         * given a second time over it. */
+        if direct.wait_ahead(vfs, handle, first, n as u64)
+            && direct.resolve(vfs, handle, first, 0, n) && !direct.sectors[..n].contains(&0)
+        {
+            return true;
+        }
         direct.grow(vfs, handle, first, n as u64, size.div_ceil(block as u64))
+    }
+
+    /// What the image's task grew ahead since the last look, into the map
+    /// (`Direct::take_ahead`).
+    fn take_ahead(&mut self) {
+        let (vfs, handle) = (self.vfs, self.handle);
+        if let Some(direct) = self.direct.as_mut() {
+            direct.take_ahead(vfs, handle);
+        }
+    }
+
+    /// A write of `len` bytes at `offset` started: the next growth asked
+    /// ahead of it where it goes on from the last (`Direct::ask_ahead`).
+    fn ask_ahead(&mut self, offset: u64, len: usize) {
+        let (vfs, handle, size) = (self.vfs, self.handle, self.size);
+        let Some(direct) = self.direct.as_mut() else { return };
+        let block = direct.block as u64;
+        direct.ask_ahead(vfs, handle, offset / block, (len as u64).div_ceil(block), size.div_ceil(block));
     }
 
     /// `start`'s asynchronous path (`Flights`): the request as commands to
@@ -1505,6 +1610,11 @@ fn show(path: &[u8]) -> &str {
 
 impl Drop for Image {
     fn drop(&mut self) {
+        /* The task growing it ahead stopped first: it gives blocks by the
+         * handle let go of below. */
+        if let Some(direct) = self.direct.as_mut() {
+            direct.stop_ahead();
+        }
         /* Its buffers are the device's until then, and what it wrote over
          * unwritten extents is noted when it is done. */
         self.drain();
@@ -1530,6 +1640,9 @@ impl Drop for Image {
                            average and {} us at most", path, d.grows_timed.count, d.grows_timed.average_us(),
                        d.grows_timed.max_us(), d.conversions.count, d.conversions.average_us(),
                        d.conversions.max_us());
+                klog!(0, "image: {}: {} growths made ahead of its writes, {} blocks; {} writes waited for one, {} us \
+                           on average and {} us at most", path, d.aheads, d.ahead_blocks, d.ahead_waits.count,
+                       d.ahead_waits.average_us(), d.ahead_waits.max_us());
                 if let Some(fl) = self.flights.as_ref() {
                     klog!(0, "image: {}: {} requests served with the device asynchronously, {} by the batch",
                            path, fl.fast, fl.slow);
@@ -1591,7 +1704,9 @@ impl Direct {
         fresh.resize(batch.pages(), false);
         let chunk = (CHUNK_BYTES / block as u64).max(1);
         Some(Direct { disk, block, batch, sectors, unwritten, fresh, pieces, stretches, map: None, chunk,
-                      grown_to: u64::MAX, span: 0, through_vfs: false, read_off: 0, written_off: 0,
+                      grown_to: u64::MAX, span: 0, stream_at: u64::MAX, stream_run: 0,
+                      ahead_to: 0, ahead_span: 0, ahead: None, ahead_off: false, aheads: 0,
+                      ahead_blocks: 0, ahead_waits: Timed::default(), through_vfs: false, read_off: 0, written_off: 0,
                       written_through: 0, punched: 0, allocated: 0, grows: false, refused: 0,
                       pending: Pending::default(), made_written: 0, grows_timed: Timed::default(),
                       conversions: Timed::default(), syncs: Spread::new() })
@@ -1741,6 +1856,201 @@ impl Direct {
         self.allocated += given;
         true
     }
+
+    /// The image's growth of blocks `from..to` made ahead of its writes by a
+    /// task of its own (`ahead_task`), started now: whether it was. Where
+    /// none can be had -- no memory, no task -- that is said once and the
+    /// image grows itself from here on.
+    fn start_ahead(&mut self, vfs: &'static Vfs, handle: Handle, from: u64, to: u64) -> bool {
+        let made = match (Mutex::new(None), Event::new()) {
+            (Some(given), Some(done)) => {
+                let shared = Arc::new(Ahead {
+                    vfs, handle, block: self.block as u64, from, to, given, done, ready: AtomicBool::new(false),
+                });
+                task::spawn_with("image-ahead", shared.clone(), ahead_task).map(|t| Grower { shared, task: Some(t) })
+            }
+            _ => None,
+        };
+        match made {
+            Some(grower) => {
+                self.ahead = Some(grower);
+                true
+            }
+            None => {
+                klog!(0, "image: no task to grow it ahead of its writes: each write into a hole grows it itself");
+                self.ahead_off = true;
+                false
+            }
+        }
+    }
+
+    /// The growth made ahead, once its task is done: taken into the map,
+    /// and the task let go of. Before every request, a load when there is
+    /// nothing. A refusal ends growing ahead.
+    fn take_ahead(&mut self, vfs: &Vfs, handle: Handle) {
+        if !self.ahead.as_ref().is_some_and(|g| g.shared.ready.load(Ordering::Acquire)) {
+            return;
+        }
+        let Some(mut g) = self.ahead.take() else { return };
+        /* Done with its file: its drop has nothing left to wait for. */
+        drop(g.task.take());
+        let (from, to) = (g.shared.from, g.shared.to);
+        let Some((end, given)) = *g.shared.given.lock() else { return };
+        /* Taken again whatever came of it: what the filesystem gave before a
+         * refusal is the file's all the same. */
+        if end > from {
+            self.retake(vfs, handle, from, end - from);
+        }
+        match given {
+            Some(n) if end > from => {
+                self.aheads += 1;
+                self.ahead_blocks += n;
+                self.allocated += n;
+            }
+            _ => {
+                klog!(0, "image: its filesystem refused blocks {}..+{} grown ahead of its writes, or had no room for \
+                           them: each write into a hole grows it itself from here on", from, to - from);
+                self.ahead_off = true;
+            }
+        }
+    }
+
+    /// A write of blocks `first..first + n` started, in a file of `blocks`.
+    /// One that begins where the last ended goes on with a guest's stream of
+    /// writes from one end of its disk; once it has gone on for
+    /// `STREAM_MIN` of them, the stretch ahead of it -- from where the last
+    /// one given ahead ends, or the chunk after the write, twice its chunks,
+    /// to `GROW_MAX_CHUNKS` -- is given every block it lacks by the image's
+    /// task, as soon as the write comes within half of the last stretch of
+    /// its end. What is there already is left as it is, so that a disk whose
+    /// free space is holes among blocks written once has its holes given
+    /// ahead of the guest as a disk of holes does. A write that begins
+    /// elsewhere ends the stream: a guest writing here and there has none
+    /// given ahead of it.
+    fn ask_ahead(&mut self, vfs: &'static Vfs, handle: Handle, first: u64, n: u64, blocks: u64) {
+        let end = first.saturating_add(n);
+        if first == self.stream_at {
+            self.stream_run = self.stream_run.saturating_add(1);
+        } else {
+            (self.stream_run, self.ahead_to, self.ahead_span) = (0, 0, 0);
+        }
+        self.stream_at = end;
+        if !self.grows || self.ahead_off || self.ahead.is_some() || self.map.is_none() || self.stream_run < STREAM_MIN
+        {
+            return;
+        }
+        let chunk = self.chunk;
+        /* The last stretch still more than half ahead of the write: not yet */
+        if self.ahead_to > end && self.ahead_to - end > self.ahead_span.saturating_mul(chunk) / 2 {
+            return;
+        }
+        let from = self.ahead_to.max(end.div_ceil(chunk).saturating_mul(chunk));
+        if from >= blocks {
+            return;
+        }
+        let span = self.ahead_span.saturating_mul(2).clamp(1, GROW_MAX_CHUNKS);
+        let to = from.saturating_add(span.saturating_mul(chunk)).min(blocks);
+        if self.start_ahead(vfs, handle, from, to) {
+            (self.ahead_to, self.ahead_span) = (to, span);
+        }
+    }
+
+    /// Whether blocks `first..first + n` are among what the growth under way
+    /// ahead is giving: then waited for -- said in the log every
+    /// `AHEAD_SAY_NS` it goes on -- and taken into the map, so that the
+    /// write finds them rather than growing the image over what the task
+    /// gives.
+    fn wait_ahead(&mut self, vfs: &Vfs, handle: Handle, first: u64, n: u64) -> bool {
+        let Some(g) = self.ahead.as_ref() else { return false };
+        let shared = g.shared.clone();
+        if first >= shared.to || shared.from >= first.saturating_add(n) {
+            return false;
+        }
+        let began = boot_time_ns();
+        let mut said = began;
+        while !shared.ready.load(Ordering::Acquire) {
+            if !shared.done.wait_for(Duration::from_millis(AHEAD_STEP_MS)) {
+                let now = boot_time_ns();
+                if now.saturating_sub(said) >= AHEAD_SAY_NS {
+                    klog!(0, "image: a write into blocks {}..+{} has waited {} s for the growth ahead of it", first,
+                           n, now.saturating_sub(began) / NS_PER_SEC);
+                    said = now;
+                }
+            }
+        }
+        self.ahead_waits.add(began);
+        self.take_ahead(vfs, handle);
+        true
+    }
+
+    /// The growth under way ahead, if one is, waited for and taken into the
+    /// map (`map_is_the_filesystems`) -- not counted as a write's wait.
+    fn settle_ahead(&mut self, vfs: &Vfs, handle: Handle) {
+        if let Some((from, to)) = self.ahead.as_ref().map(|g| (g.shared.from, g.shared.to)) {
+            let waits = self.ahead_waits;
+            self.wait_ahead(vfs, handle, from, to - from);
+            self.ahead_waits = waits;
+        }
+    }
+
+    /// The growth under way ahead waited for: before the image lets go of
+    /// its file, which the task gives blocks of by its handle.
+    fn stop_ahead(&mut self) {
+        if let Some(mut g) = self.ahead.take() {
+            /* Its drop waits for the task to end. */
+            drop(g.task.take());
+        }
+    }
+}
+
+/// A growth of an image made ahead of its guest's writes, shared by the
+/// image and the task of its own that makes it (`ahead_task`): the file,
+/// what to give, what came of it, and the image's wait for it where a write
+/// of its cannot go on without it (`Direct::wait_ahead`).
+struct Ahead {
+    vfs: &'static Vfs,
+    handle: Handle,
+    /// A block of the file's, in bytes: what the room it may take is counted
+    /// in.
+    block: u64,
+    /// Blocks `from..to` to give.
+    from: u64,
+    to: u64,
+    /// What it gave: where what it asked the filesystem for ends -- `to`,
+    /// or short of it for want of room -- and how many blocks it gave, None
+    /// where its filesystem refused them. None until it is done.
+    given: Mutex<Option<(u64, Option<u64>)>>,
+    /// The image's, when it waits: the growth done.
+    done: Event,
+    /// Set once `given` is: what the image's requests look at without the
+    /// lock.
+    ready: AtomicBool,
+}
+
+/// The image's side of a growth made ahead: what it shares with the task,
+/// and the task, let go of -- waited for -- once it is done or the image is.
+struct Grower {
+    shared: Arc<Ahead>,
+    task: Option<TaskHandle>,
+}
+
+/// A task of an image's own that gives it what is asked (`Vfs::allocate`)
+/// ahead of its guest's writes -- no more than the image's share of the
+/// room left (`GROW_SHARE`), whole chunks of it where that is less -- says
+/// so, and ends: one growth, one task.
+fn ahead_task(a: Arc<Ahead>) {
+    /* What was asked where the image's share of the room holds it -- the
+     * file's last blocks too, short of a chunk -- and whole chunks of that
+     * share where it does not: none, and a refusal, where not one is left. */
+    let block = a.block.max(1);
+    let chunk = (CHUNK_BYTES / block).max(1);
+    let room = a.vfs.space_of_file(a.handle).map_or(0, |s| s.free_bytes / block / GROW_SHARE);
+    let want = a.to.saturating_sub(a.from);
+    let len = if want <= room { want } else { room / chunk * chunk };
+    let given = if len > 0 { a.vfs.allocate(a.handle, a.from, len) } else { None };
+    *a.given.lock() = Some((a.from + len, given));
+    a.ready.store(true, Ordering::Release);
+    a.done.signal();
 }
 
 /// The data path's buffer: `BATCH_PAGES`, or the largest run of pages that
