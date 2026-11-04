@@ -116,6 +116,15 @@ impl HostState {
 /// fast path leaves to the run loop.
 const RFLAGS_TF: u64 = 1 << 8;
 
+/// RFLAGS.IF: a guest's HLT with it clear waits for nothing but an NMI or
+/// INIT, which the fast path leaves to the run loop.
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// The guest interrupt status's RVI, the highest vector waiting in the
+/// virtual APIC: a HLT with one there is the run loop's to step past and
+/// enter for it, not the fast path's to spin over.
+const GUEST_INTR_STATUS_RVI: u64 = 0xFF;
+
 /// Write-back: the only memory type a VMXON region or a VMCS may be in.
 const MEM_TYPE_WB: u64 = 6;
 
@@ -2530,18 +2539,34 @@ impl Guest {
             }
             self.launched.store(true, Ordering::Release);
             let Some(f) = fast.as_deref_mut() else { break (0, t3, t4) };
-            /* A WRMSR, past which nothing is owed: not under single-step,
-             * whose #DB after it is the run loop's to give. */
-            if unsafe { vmcs::vmread(vmcs::EXIT_REASON) } as u32 != vmcs::reason::WRMSR
-                || unsafe { vmcs::vmread(vmcs::GUEST_RFLAGS) } & RFLAGS_TF != 0
-            {
+            /* A WRMSR, past which nothing is owed; or a HLT with interrupts
+             * on and nothing waiting in the virtual APIC, where posted
+             * interrupts are what can end it here. Neither under
+             * single-step, whose #DB after the instruction is the run loop's
+             * to give, and the HLT not with a window asked for, which means
+             * the run loop has something waiting to inject. */
+            let reason = unsafe { vmcs::vmread(vmcs::EXIT_REASON) } as u32;
+            let rflags = unsafe { vmcs::vmread(vmcs::GUEST_RFLAGS) };
+            if rflags & RFLAGS_TF != 0 {
                 break (0, t3, t4);
             }
             let rip = unsafe { vmcs::vmread(vmcs::GUEST_RIP) };
             let mut ran = self.last_run;
             ran.next(timed, t3, t4);
-            let value = ((gpr.rdx & 0xFFFF_FFFF) << 32) | (gpr.rax & 0xFFFF_FFFF);
-            if !f.wrmsr(gpr.rcx as u32, value, rip, ran) {
+            let answered = match reason {
+                vmcs::reason::WRMSR => {
+                    let value = ((gpr.rdx & 0xFFFF_FFFF) << 32) | (gpr.rax & 0xFFFF_FFFF);
+                    f.wrmsr(gpr.rcx as u32, value, rip, ran)
+                }
+                vmcs::reason::HLT => {
+                    rflags & RFLAGS_IF != 0 && self.apicv_on && self.posted.is_some() && !self.irq_window
+                        && !self.nmi_window
+                        && unsafe { vmcs::vmread(vmcs::GUEST_INTR_STATUS) } & GUEST_INTR_STATUS_RVI == 0
+                        && f.hlt(rip, ran)
+                }
+                _ => false,
+            };
+            if !answered {
                 break (0, t3, t4);
             }
             self.last_run = ran;

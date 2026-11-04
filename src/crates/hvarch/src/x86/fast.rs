@@ -25,4 +25,15 @@ pub trait FastExit {
     /// way. `ran` is the world switch's stamps of the entry it ended, for a
     /// record of the exit.
     fn wrmsr(&mut self, msr: u32, value: u64, rip: u64, ran: crate::x86::svm::Run) -> bool;
+
+    /// The guest's HLT at `rip`, with interrupts on in it, nothing waiting
+    /// in its virtual APIC and posted interrupts what can end it (VT-x's;
+    /// AMD-V offers none here): true once an interrupt has been posted for
+    /// it -- waited for here, with interrupts off, for as long as the
+    /// answer chooses -- for the HLT to be stepped past and the guest
+    /// entered again at once, the CPU taking what was posted as it enters:
+    /// its notification is pending on this CPU, or comes, since the vCPU is
+    /// in its guest as posters see it. False, nothing done, for the exit to
+    /// go its way, the run loop's halt.
+    fn hlt(&mut self, rip: u64, ran: crate::x86::svm::Run) -> bool;
 }

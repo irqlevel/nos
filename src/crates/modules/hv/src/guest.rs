@@ -792,13 +792,14 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
      * the look at what is waiting before the next entry. */
     /* Of the exits the loop saw: those answered in the world switch's own
      * loop had none of its handling. */
-    let exits = total.exits.saturating_sub(total.answered).max(1);
+    let exits = total.exits.saturating_sub(total.answered + total.hlt_answered).max(1);
     let msr_writes = total.msr_write.saturating_sub(total.answered).max(1);
     let _ = writeln!(out, "  loop       {} ns an exit handled and {} ns to the next entry, on average; {} ns a write of an MSR's \
                            handling; {} entries made without the loop's round; {} writes of the ICR or the TSC deadline \
-                           answered in the world switch's own loop, the guest entered again from there",
+                           answered in the world switch's own loop, the guest entered again from there, and {} HLTs \
+                           ended there by an interrupt posted meanwhile",
         total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / msr_writes, total.fast,
-        total.answered);
+        total.answered, total.hlt_answered);
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
