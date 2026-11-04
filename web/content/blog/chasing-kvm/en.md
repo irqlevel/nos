@@ -1,12 +1,12 @@
 ---
 title: "Chasing KVM: the same Ubuntu VM under KVM and under nos"
-description: "We ran one Ubuntu VM under KVM and under nos on the same server. The disk started at 1% of KVM. What we fixed in two rounds of work, and what is still slower."
+description: "We ran one Ubuntu VM under KVM and under nos on the same server. The disk started at 1% of KVM. What we fixed in three rounds of work, and what is still slower."
 date: 2026-11-01
-updated: 2026-11-02
+updated: 2026-11-04
 tags: [hypervisor, performance, storage, testing, x86-64]
 ---
 
-nos has its own hypervisor, and sooner or later someone was going to ask how much slower a Linux guest is under it than under KVM. On 31 October we finally measured it properly. It was worse than we expected: the guest's disk ran at about 1% of KVM's speed. We spent the next two days fixing things and measuring again, and this post is about how that went. A second round followed on 2 November; it is [at the end](#update-2-november-2026-the-second-round).
+nos has its own hypervisor, and sooner or later someone was going to ask how much slower a Linux guest is under it than under KVM. On 31 October we finally measured it properly. It was worse than we expected: the guest's disk ran at about 1% of KVM's speed. We spent the next two days fixing things and measuring again, and this post is about how that went. A second round followed on 2 November and a third on 4 November; both are [at the end](#update-2-november-2026-the-second-round).
 
 ## The setup
 
@@ -144,9 +144,9 @@ The full list, with the files to look at and how to measure each item, is in [pl
 - The new fdatasync tail. Our best guess is that the write waits behind something else that holds the disk image: calls into the image are serialized, a growth takes 6 ms on average (up to 18), and a conversion 5.6 ms (up to 29). The next step is to time every call into the image, not just growths and conversions. (Gone after the second round.)
 - First writes at 42% of KVM. Every growth and every conversion is a commit that the guest's write or flush has to wait for. Linux's ext4 under KVM converts extents in a background workqueue and batches many conversions into one commit. (67% after the second round.)
 - 1 MiB writes at 63% and 4k QD32 at 72–84%. Every byte gets copied through the image's own buffer on the slow core, while under KVM the NVMe reads and writes the guest's pages directly. The guest's memory is made of physically contiguous 2 MiB pages, so the NVMe's PRP lists could point at it too. (1 MiB writes are at KVM's speed now; 4k from a single job is still behind, for a different reason.)
-- Waking up a guest CPU: cyclictest 65 µs against 31, perf's pipe 9.6 µs against 6.0. Timers are on time now, so the cost is in getting from an IPI or a timer to the guest actually running again. There's also the guest's clock: under KVM its CPUID reports `tsc_known_freq` and it runs on `kvm-clock`, under nos it does neither.
-- Random memory reads at 85%. It's not the clock, so probably the nested page walk or the TLB.
-- CPU-bound work at 96–98%. Idle CPUs under nos still get a timer tick 100 times a second, and under Linux they don't.
+- Waking up a guest CPU: cyclictest 65 µs against 31, perf's pipe 9.6 µs against 6.0. Timers are on time now, so the cost is in getting from an IPI or a timer to the guest actually running again. There's also the guest's clock: under KVM its CPUID reports `tsc_known_freq` and it runs on `kvm-clock`, under nos it does neither. (After the third round: 4 µs and 7.0.)
+- Random memory reads at 85%. It's not the clock, so probably the nested page walk or the TLB. (92% after the third round.)
+- CPU-bound work at 96–98%. Idle CPUs under nos still get a timer tick 100 times a second, and under Linux they don't. (That guess was wrong: it was the idle cores' C-states, see the third round. sysbench CPU is at 99–101% of KVM now.)
 
 We also learned something about benchmarking itself. Running the same code twice can move some numbers by 5–10%: QD32 reads went from 84% to 76% between two runs of almost the same code, and the fdatasync tail comes and goes. So we only believe a change if it shows up across several runs. Each run also takes the server's VMs down for about an hour and reboots it twice, so runs have to be planned. The KVM run and every nos run are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results).
 
@@ -224,12 +224,83 @@ Two numbers went down. 4k at QD1 lost about 4 µs a request, reads from 91% of K
 
 What's left now, in short (the full list is in [plans/vm-perf-todo.md](https://github.com/irqlevel/nos/blob/master/plans/vm-perf-todo.md), as before):
 
-- 4k I/O from a single job, at 71–83% of KVM. According to fio, submitting a request takes 6–7 µs under nos and 1–2 µs under KVM. Under nos the guest's notify exits to the host, and the whole request is handled right there on the guest's CPU: it is taken off the ring, a write's data is copied, and the disk's task is woken. Under KVM the notify only wakes QEMU's I/O thread, and a busy thread polls the ring itself with notifications switched off, so the guest doesn't have to notify it. A short spin before the disk's task goes to sleep should also win back the 4 µs at QD1.
-- cyclictest averages 72 µs against 31. The host now delivers the guest's timer interrupt 3 µs after its deadline on average, so the rest of the time is spent inside the guest, and we don't know yet where.
-- First writes at 67%, still waiting on growths and conversions.
-- Random memory reads at 85% and CPU-bound work at 96–98%, as before.
+- 4k I/O from a single job, at 71–83% of KVM (90–150% after the third round). According to fio, submitting a request takes 6–7 µs under nos and 1–2 µs under KVM. Under nos the guest's notify exits to the host, and the whole request is handled right there on the guest's CPU: it is taken off the ring, a write's data is copied, and the disk's task is woken. Under KVM the notify only wakes QEMU's I/O thread, and a busy thread polls the ring itself with notifications switched off, so the guest doesn't have to notify it. A short spin before the disk's task goes to sleep should also win back the 4 µs at QD1.
+- cyclictest averages 72 µs against 31. The host now delivers the guest's timer interrupt 3 µs after its deadline on average, so the rest of the time is spent inside the guest, and we don't know yet where. (It wasn't inside the guest: it was the host CPU's clock after an idle. 4 µs after the third round.)
+- First writes at 67%, still waiting on growths and conversions. (80% after the third round.)
+- Random memory reads at 85% and CPU-bound work at 96–98%, as before. (92% and 99–101% after the third round.)
 
 Both new runs are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results) next to the others.
+
+## Update, 4 November 2026: the third round
+
+The third round went after what the second one left: how long it takes to get a guest CPU back into the guest after an IPI or a timer, 4k I/O from a single job, and the CPU-bound gap. Every run of it is in [plans/vm-perf-todo.md](https://github.com/irqlevel/nos/blob/master/plans/vm-perf-todo.md). Here is what had an effect.
+
+cyclictest was slow because of the host CPU's clock, not the guest. A guest's CPUs idle between its timer ticks, and at the default balanced HWP preference the host CPU dropped its clock in every idle, so the first microseconds after each wake ran several times slower. Right after a wake, the guest's write of its next timer deadline took the host 10.1 µs to handle. The CPUs a guest runs on are now held at the performance preference while it runs ([2398e421](https://github.com/irqlevel/nos/commit/2398e421f767ca01bb0cd9e49e27e566f2fff297)), and cyclictest's average went from 72 µs to about 5.
+
+For 4k at QD1, the disk's task now spins for a short while before it goes to sleep, so it is still awake when the next request or the NVMe's completion comes ([8f8d14fa](https://github.com/irqlevel/nos/commit/8f8d14fa68362585e6b11bb5d5b2148a84175ec3)). At QD32 the problem was that all of the device's work happened on the guest's first vCPU. The disk's task now gives finished requests back to the guest and sends their interrupts itself, the way QEMU's I/O thread does with irqfd ([007650c6](https://github.com/irqlevel/nos/commit/007650c6f094b10abb4519dc4925a33e38a5ace5)), and the guest doesn't notify the disk while eight of its requests are in flight ([0ca91bcf](https://github.com/irqlevel/nos/commit/0ca91bcf3238b8409bb83c59fc99f88076196dd0)). The disk's task runs on an E-core, and each copy to or from the guest's memory used to map a page for that one copy and flush it from the TLB afterwards, about a microsecond per 4 KiB. A guest's memory comes from a pool of 2 MiB pages, and that pool is now mapped once at boot ([6a8ece3c](https://github.com/irqlevel/nos/commit/6a8ece3c7da9a4991770b2667b4cc85084fe45f0)). 4k reads at QD32 went from 76% of KVM to 150%, and 4k writes at QD32 from 71% to 90%.
+
+Then the exits. A guest's writes to the ICR, which send IPIs, and to the TSC-deadline MSR are now handled inside the loop that enters the guest, without the rest of the exit path ([faa0484b](https://github.com/irqlevel/nos/commit/faa0484b99a52af2e3c58d8e3a8b660e13e67269)). A deadline write used to cost the host 3.4 µs. A HLT that an IPI from another vCPU will end soon gets the same treatment: the loop waits for the IPI there and goes straight back into the guest ([79e4347f](https://github.com/irqlevel/nos/commit/79e4347f4d6a3e33778dab7b03148d71e3650eba)). In perf's pipe test, getting from such a wakeup to the next entry used to take almost a microsecond by itself. In the last run, about 54 million HLTs ended this way. The pipe's round trip went from 8.2 µs to 6.4–7.0 µs over the last three runs.
+
+The CPU-bound gap turned out to be the turbo clock. A new shell command, `cpufreq` ([cdc0756f](https://github.com/irqlevel/nos/commit/cdc0756f721562927dfe8437ff139e7e1552426e)), showed the core with the busy vCPU running at 4.55 GHz. Ubuntu on the same machine runs it at 4.8. Several idle P-cores spent most of their idle time in C1, not in a deep C-state, and a core in C1 still counts as busy when the CPU picks the turbo clock for the busy one. nos only went deep after four long idles in a row. Now an idle CPU that no guest is using goes to C6 if its next timer is at least 1 ms away ([aa6776a8](https://github.com/irqlevel/nos/commit/aa6776a8b617b6edd8d73897dd3e7581b8ab29ca)). The busy core runs at 4.76 GHz, and sysbench CPU is at 99–101% of KVM.
+
+Last, the first write to a new file. When the guest writes its disk from one end, a task of the disk image's own now allocates the space ahead of it, so the guest's writes don't stop at every hole to wait for an ext4 commit ([c0650c51](https://github.com/irqlevel/nos/commit/c0650c517a6f8a8ce84c1ded2132188ec4722ace), [a4548330](https://github.com/irqlevel/nos/commit/a45483306f7a16f279745dfc135ddf257da020a2)). The first version also asked for space where the file already had it, and in one run 1 MiB writes to an existing file fell to 39% of KVM. It now asks only where the image's block map has a hole ([aa2b4785](https://github.com/irqlevel/nos/commit/aa2b478510d3d1d01dee28d7d6d8447a85702a76)), and a boot test catches that mistake. First writes went from 67% to 80%.
+
+Here is the third round next to the second. We didn't run the kernel build or pgbench this time. The last build's first run had 1 MiB reads at 97% and writes at 39%; a second run of the same build had them back at 149% and 127%, so the fio numbers below come from the second run.
+
+| | KVM | second round | third round |
+|---|---:|---:|---:|
+| perf pipe, one round trip | 6.0 µs | 8.2 (73%) | 7.0 (86%) |
+| cyclictest, average | 31 µs | 72 (43%) | 4 (775%) |
+| cyclictest, worst case | 3280 µs | 205 (1600%) | 29 (11,310%) |
+| sysbench CPU, 1 thread | 1589 events/s | 1530 (96%) | 1579 (99%) |
+| sysbench CPU, 4 threads | 3259 events/s | 3188 (98%) | 3294 (101%) |
+| random memory reads, 1 thread | 949 MiB/s | 804 (85%) | 875 (92%) |
+| fio: first write to a new file, 1M QD8 | 4643 MiB/s | 3103 (67%) | 3696 (80%) |
+| fio: 4k random reads, QD1 | 20.1k IOPS | 16.7k (83%) | 20.3k (101%) |
+| fio: 4k random reads, QD32 | 195k IOPS | 149k (76%) | 294k (150%) |
+| fio: 4k random reads, 4 jobs at QD16 | 217k IOPS | 372k (171%) | 337k (155%) |
+| fio: 4k random writes, QD1 | 39.9k IOPS | 29.4k (74%) | 44.9k (113%) |
+| fio: 4k random writes, QD32 | 178k IOPS | 126k (71%) | 160k (90%) |
+| fio: 1M reads, QD8 | 1456 MiB/s | 2187 (150%) | 2172 (149%) |
+| fio: 1M writes, QD8 | 3694 MiB/s | 3763 (102%) | 4695 (127%) |
+| fio: 4k writes with fdatasync | 620 IOPS | 710 (115%) | 726 (117%) |
+| the same, 99.9th percentile of a write | 226 µs | 72 (314%) | 33 (685%) |
+
+```chart
+type: before-after
+unit: "%"
+max: 180
+step: 25
+reference: { value: 100, label: "KVM = 100%" }
+series: { before: "second round", after: "third round" }
+caption: "nos as a percentage of KVM after the second and third rounds, from the table above. Over 100% means nos was faster. cyclictest is off the scale: 43% and 775%."
+groups:
+  - rows:
+      - { label: "perf pipe, one round trip", before: 73, after: 86 }
+      - { label: "sysbench CPU, 1 thread", before: 96, after: 99 }
+      - { label: "sysbench CPU, 4 threads", before: 98, after: 101 }
+      - { label: "random memory reads, 1 thread", before: 85, after: 92 }
+  - rows:
+      - { label: "fio: first write to a new file, 1M QD8", before: 67, after: 80 }
+      - { label: "fio: 4k random reads, QD1", before: 83, after: 101 }
+      - { label: "fio: 4k random reads, QD32", before: 76, after: 150 }
+      - { label: "fio: 4k random reads, 4 jobs at QD16", before: 171, after: 155 }
+      - { label: "fio: 4k random writes, QD1", before: 74, after: 113 }
+      - { label: "fio: 4k random writes, QD32", before: 71, after: 90 }
+      - { label: "fio: 1M reads, QD8", before: 150, after: 149 }
+      - { label: "fio: 1M writes, QD8", before: 102, after: 127 }
+      - { label: "fio: 4k writes with fdatasync", before: 115, after: 117 }
+```
+
+One number went down: 4k reads from four jobs, from 372k IOPS to 337k. It is still 155% of KVM.
+
+What's left now:
+
+- First writes at 80%. Each growth is still an ext4 commit with two flushes, and it happens while the NVMe is busy with the guest's data. Under KVM the host's ext4 commits once, when the guest calls fsync.
+- Random memory reads at 92%. The other thread of the busy core is idle, the nested page tables use 2 MiB pages just like KVM's, and the guest has PCID. To go further we need the CPU's performance counters.
+- perf's pipe at 86–93%, and 4k writes at QD32 at 90%.
+
+Both runs of the last build are in [bench/vm/results](https://github.com/irqlevel/nos/tree/master/bench/vm/results) next to the others.
 
 ## Commits
 
@@ -251,3 +322,14 @@ Both new runs are in [bench/vm/results](https://github.com/irqlevel/nos/tree/mas
 | [d0a4b493](https://github.com/irqlevel/nos/commit/d0a4b493c93fb76ed05e5f52376d7ca9089319b3), [d92695bc](https://github.com/irqlevel/nos/commit/d92695bc030ece6526849e454ac0acc35c2c753e) | The idle task no longer leaves a woken task waiting out its time slice |
 | [96281a83](https://github.com/irqlevel/nos/commit/96281a83467640194aa376942c57a0106baed710) | One pass over the disk's queue copies at most 512 KiB under the devices' lock |
 | [1b791bf2](https://github.com/irqlevel/nos/commit/1b791bf2cdd4182648fce4eecca6bea33ef33e86) | The second round's results and the updated to-do list |
+| [2398e421](https://github.com/irqlevel/nos/commit/2398e421f767ca01bb0cd9e49e27e566f2fff297) | A guest's CPUs are held at HWP's performance preference while it runs |
+| [8f8d14fa](https://github.com/irqlevel/nos/commit/8f8d14fa68362585e6b11bb5d5b2148a84175ec3) | The disk's task spins for a short while before it sleeps |
+| [0ca91bcf](https://github.com/irqlevel/nos/commit/0ca91bcf3238b8409bb83c59fc99f88076196dd0) | The guest doesn't notify the disk while eight requests are in flight |
+| [007650c6](https://github.com/irqlevel/nos/commit/007650c6f094b10abb4519dc4925a33e38a5ace5) | The disk's task gives finished requests back to the guest and sends their interrupts itself |
+| [6a8ece3c](https://github.com/irqlevel/nos/commit/6a8ece3c7da9a4991770b2667b4cc85084fe45f0) | Guest memory is copied through the pool of 2 MiB pages, mapped once at boot |
+| [faa0484b](https://github.com/irqlevel/nos/commit/faa0484b99a52af2e3c58d8e3a8b660e13e67269) | ICR and TSC-deadline writes are handled in the loop that enters the guest |
+| [79e4347f](https://github.com/irqlevel/nos/commit/79e4347f4d6a3e33778dab7b03148d71e3650eba) | A HLT that an IPI ends soon is waited out in the same loop |
+| [cdc0756f](https://github.com/irqlevel/nos/commit/cdc0756f721562927dfe8437ff139e7e1552426e), [bf65d154](https://github.com/irqlevel/nos/commit/bf65d1543e7f1153557db2fb4b42f05ee917dc1b) | `cpufreq`: each CPU's clock, and how deep its idles were |
+| [aa6776a8](https://github.com/irqlevel/nos/commit/aa6776a8b617b6edd8d73897dd3e7581b8ab29ca) | C6 for idle CPUs no guest is using, when their next timer is at least 1 ms away |
+| [c0650c51](https://github.com/irqlevel/nos/commit/c0650c517a6f8a8ce84c1ded2132188ec4722ace), [aa2b4785](https://github.com/irqlevel/nos/commit/aa2b478510d3d1d01dee28d7d6d8447a85702a76), [a4548330](https://github.com/irqlevel/nos/commit/a45483306f7a16f279745dfc135ddf257da020a2), [dc529775](https://github.com/irqlevel/nos/commit/dc52977544a4267376f9943f16984b578cc198b5) | The disk image grows ahead of a guest writing from one end, only where it has holes |
+| [49ece047](https://github.com/irqlevel/nos/commit/49ece0479663e418df6ba863199f1bf17abe122b), [cddea62b](https://github.com/irqlevel/nos/commit/cddea62b8ef62e6e20cd032cc62b7f08e8c587a3) | The third round's to-do list and results |
