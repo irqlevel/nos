@@ -72,6 +72,7 @@ PageTable::PageTable()
     , huge_pool_count_(0)
     , huge_pool_free_count_(0)
     , huge_pool_hint_(0)
+    , huge_pool_window_on_(false)
 {
     klog(0, "PageTable 0x%p", this);
     for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
@@ -1211,6 +1212,157 @@ ulong PageTable::get_huge_pool_free()
 {
     stdlib::AutoLock lock(lock_);
     return huge_pool_free_count_;
+}
+
+PtePage* PageTable::walk_to_l2_locked(ulong virt_addr)
+{
+    if (root_ == 0)
+        return nullptr;
+
+    PtePage* table = (PtePage*)tmp_map_page(root_);
+    if (table == nullptr)
+        return nullptr;
+
+    for (ulong level = 4; level > 2; level--)
+    {
+        ulong index = (level == 4) ? Pte::l4_index(virt_addr) : Pte::l3_index(virt_addr);
+        Pte* entry = &table->entry[index];
+        if (entry->present() && entry->huge())
+        {
+            /* A 1GiB block where a table belongs: its GiB is somebody's */
+            tmp_unmap_page((ulong)table);
+            return nullptr;
+        }
+        if (!entry->present())
+        {
+            Page* page = alloc_page_no_lock();
+            if (page == nullptr)
+            {
+                tmp_unmap_page((ulong)table);
+                return nullptr;
+            }
+            entry->set_address(page->get_phy_address());
+            entry->set_writable();
+            /* No NX on the way down, as walk_to_l1_locked has it: execute
+               permission is a leaf's to take away. */
+            entry->set_present();
+        }
+
+        PtePage* next = (PtePage*)tmp_map_page(entry->address());
+        tmp_unmap_page((ulong)table);
+        if (next == nullptr)
+            return nullptr;
+        table = next;
+    }
+    return table;
+}
+
+/* The window's top-level entry was empty before map_huge_pool_window, so
+   every table under it is the window's own: the entry cleared first, so
+   that the walker reaches none of them, this CPU's TLB -- the only one
+   there is yet -- flushed of whatever of them it cached, and only then
+   each L2 table and the L3 table back on the free list. A tmp_map slot at a
+   time: a walk cut short for want of a second slot is one way here. */
+void PageTable::unmap_huge_pool_window_locked()
+{
+    PtePage* top = (PtePage*)tmp_map_page(root_);
+    if (top == nullptr)
+        PANIC("mm: no tmp_map slot to undo the huge pool's window");
+    Pte* l4_entry = &top->entry[Pte::l4_index(HUGE_POOL_WINDOW)];
+    const bool present = l4_entry->present();
+    const ulong l3_phys = l4_entry->address();
+    l4_entry->clear();
+    tmp_unmap_page((ulong)top);
+    hal::tlb_flush_all();
+    if (!present)
+        return;
+
+    PtePage* l3 = (PtePage*)tmp_map_page(l3_phys);
+    if (l3 == nullptr)
+        PANIC("mm: no tmp_map slot to undo the huge pool's window");
+    for (size_t i = 0; i < stdlib::array_size(l3->entry); i++)
+    {
+        if (!l3->entry[i].present())
+            continue;
+        /* Each a table of the window's, made by walk_to_l2_locked */
+        BUG_ON(l3->entry[i].huge());
+        free_page_no_lock(&page_array_[l3->entry[i].address() / consts::PAGE_SIZE]);
+    }
+    tmp_unmap_page((ulong)l3);
+    free_page_no_lock(&page_array_[l3_phys / consts::PAGE_SIZE]);
+}
+
+bool PageTable::map_huge_pool_window()
+{
+    static_assert(HUGE_POOL_WINDOW == MemoryMap::KERNEL_SPACE_BASE + 64 * 1024 * consts::GB,
+        "the window 64 TiB into the kernel's half, as page_table.h says");
+
+    stdlib::AutoLock lock(lock_);
+    BUG_ON(huge_pool_window_on_);
+    if (huge_pool_count_ == 0)
+        return false;
+
+    /* Its top-level entry its own: nothing else is mapped under it, and the
+       undoing of a window cut short frees every table there. */
+    PtePage* top = (PtePage*)tmp_map_page(root_);
+    if (top == nullptr)
+    {
+        klog(0, "mm: no tmp_map slot for the huge pool's window: guests' memory is copied through frame slots");
+        return false;
+    }
+    const bool taken = top->entry[Pte::l4_index(HUGE_POOL_WINDOW)].present();
+    tmp_unmap_page((ulong)top);
+    if (taken)
+    {
+        klog(0, "mm: the huge pool's window's top-level entry is taken: guests' memory is copied through frame slots");
+        return false;
+    }
+
+    const ulong blocks = stdlib::min(page_array_count_ / HUGE_FRAME_PAGES, HUGE_POOL_MAX_BLOCKS);
+    ulong mapped = 0;
+    for (ulong block = 0; block < blocks; block++)
+    {
+        if (!huge_pool_test(huge_pool_in_, block))
+            continue;
+        const ulong phys = block * HUGE_FRAME_SIZE;
+        const ulong va = HUGE_POOL_WINDOW + phys;
+        PtePage* l2 = walk_to_l2_locked(va);
+        if (l2 == nullptr)
+        {
+            unmap_huge_pool_window_locked();
+            klog(0, "mm: the huge pool's window cut short at block %lu of %lu: guests' memory is copied through "
+                "frame slots", mapped, huge_pool_count_);
+            return false;
+        }
+        Pte* entry = &l2->entry[Pte::l2_index(va)];
+        /* A table of the window's own, made empty: nothing there yet */
+        BUG_ON(entry->present());
+        /* Built aside and stored whole, so the walker never sees half of it */
+        Pte e;
+        e.set_address(phys);
+        e.set_writable();
+        e.set_no_execute();
+        e.set_huge();
+        e.set_present();
+        entry->value = e.value;
+        tmp_unmap_page((ulong)l2);
+        mapped++;
+    }
+    /* Not present before, so no TLB holds anything of them: only the
+       stores to make the walker's. */
+    hal::pte_made_valid();
+    huge_pool_window_on_ = true;
+    klog(0, "mm: the huge pool's %lu blocks mapped at 0x%lX on: guests' memory is copied through them", mapped,
+        HUGE_POOL_WINDOW);
+    return true;
+}
+
+ulong PageTable::huge_pool_window(ulong phy_addr)
+{
+    ulong block = 0;
+    if (!huge_pool_window_on_ || !huge_pool_block_of(phy_addr, block))
+        return 0;
+    return HUGE_POOL_WINDOW + phy_addr;
 }
 
 /* Sentinel for tmp_map_page_array_ when page was mapped without a Page struct (e.g. reserved ACPI region). */

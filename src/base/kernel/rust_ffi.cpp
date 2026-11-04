@@ -785,10 +785,13 @@ void kernel_frame_free(unsigned long phys)
     kernel::mm::PageTable::get_instance().free_frame(phys);
 }
 
-/* Copy between a frame and the caller's memory through this CPU's frame
-   slot of the temp-map window (PageTable::map_frame_slot): out of the frame
-   into `buf`, or `data` into it -- exactly one of the two is given.
-   Preemption and interrupts are off from the map to the unmap: that is what
+/* Copy between a frame and the caller's memory -- out of the frame into
+   `buf`, or `data` into it, exactly one of the two given -- through the
+   huge pool's window for a page of the pool (PageTable::huge_pool_window),
+   a guest's memory mapped for as long as the machine is up; and for any
+   other frame through this CPU's frame slot of the temp-map window
+   (PageTable::map_frame_slot). Preemption and interrupts are off from the
+   map to the unmap: that is what
    makes the slot this copy's alone, and the unmap invalidates only this
    CPU's TLB, so a task moved to another CPU mid-copy would leave the slot's
    translation stale behind it. (It went through the shared slots, under
@@ -817,6 +820,21 @@ static int frame_copy(unsigned long phys, unsigned long offset,
     auto& pt = kernel::mm::PageTable::get_instance();
     if (!pt.is_frame_address(phys))
         return -1;
+
+    /* A page of the huge pool -- a guest's memory -- through the pool's
+       window, which maps it for as long as the machine is up: nothing to
+       map, flush or keep to this CPU, so no interrupts off either. Inside
+       the page, as checked above. */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        void* frame = reinterpret_cast<void*>(window + offset);
+        if (data != nullptr)
+            stdlib::mem_cpy(frame, data, len);
+        else
+            stdlib::mem_cpy(buf, frame, len);
+        return 0;
+    }
 
     /* Through this CPU's own slot of the window, which interrupts off makes
        the copy's alone: no lock, no slot to search for, no reference. */
@@ -855,7 +873,8 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
    overrun. The load is an acquire and the store a release: what a driver
    published before its index is there to be read after the index is, and
    what this side wrote before its own index is there before the index
-   says so. The same slot of the window as frame_copy's, with preemption and
+   says so. Where frame_copy goes: the huge pool's window for a page of the
+   pool, else the same slot of the tmp_map window, with preemption and
    interrupts off for the same reason. -1, and nothing done, for a word
    that is not an aligned one inside a page of RAM. */
 static bool frame_word_inside(unsigned long phys, unsigned long offset)
@@ -870,6 +889,13 @@ int kernel_frame_load16(unsigned long phys, unsigned long offset, unsigned short
         return -1;
 
     auto& pt = kernel::mm::PageTable::get_instance();
+    /* The huge pool's window where the page is the pool's, as frame_copy */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        *value = __atomic_load_n(reinterpret_cast<unsigned short*>(window + offset), __ATOMIC_ACQUIRE);
+        return 0;
+    }
     ulong flags = kernel::preempt_irq_save();
     ulong va = pt.map_frame_slot(phys);
     /* Aligned, inside the page mapped at va: checked above. */
@@ -885,6 +911,13 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
         return -1;
 
     auto& pt = kernel::mm::PageTable::get_instance();
+    /* The huge pool's window where the page is the pool's, as frame_copy */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        __atomic_store_n(reinterpret_cast<unsigned short*>(window + offset), value, __ATOMIC_RELEASE);
+        return 0;
+    }
     ulong flags = kernel::preempt_irq_save();
     ulong va = pt.map_frame_slot(phys);
     __atomic_store_n(reinterpret_cast<unsigned short*>(va + offset), value, __ATOMIC_RELEASE);
