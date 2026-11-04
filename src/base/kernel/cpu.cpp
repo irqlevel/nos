@@ -1034,7 +1034,7 @@ bool Cpu::run(Task::Func func, void *ctx)
         return false;
     }
 
-    idle_task_ptr_->set_cpu_affinity(1UL << index_);
+    idle_task_ptr_->pin_to_cpu(index_);
     idle_task_ptr_->set_idle();
 
     return idle_task_ptr_->run(task_queue_, func, ctx);
