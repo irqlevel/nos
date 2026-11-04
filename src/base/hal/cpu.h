@@ -133,6 +133,9 @@ struct CpuPerformance
     u32 lowest;
     u32 guaranteed;
     u32 highest;
+    /* The energy/performance preference asked for (hwp_epp=), 0 for a CPU
+       without the field -- whose HWP has none to ask by */
+    u32 epp;
 };
 
 /* Let this CPU run as fast as it can while it is busy, rather than at the
