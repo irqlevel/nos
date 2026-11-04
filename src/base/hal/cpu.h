@@ -158,6 +158,25 @@ bool setup_cpu_performance(CpuPerformance* out);
    itself. True when it was set; nothing on arm64. Defined per arch. */
 bool set_cpu_epp(u32 epp);
 
+/* What this CPU's clock did, as the CPU counts it: its time-stamp counter,
+   and the two counters that run only while it is in C0 -- MPERF at the
+   TSC's rate, APERF at the clock it actually runs at -- so that over a
+   window APERF's delta over MPERF's, times the TSC's rate, is the clock it
+   ran at while busy, and MPERF's delta over the TSC's the share of the
+   window it was busy (`cpufreq`). */
+struct ClockCounters
+{
+    u64 tsc;
+    u64 aperf;
+    u64 mperf;
+};
+
+/* This CPU's ClockCounters, read as close together as three reads are, into
+   `out`: x86 where CPUID says it counts them (leaf 6, ECX bit 0) and not in
+   a hypervisor's guest, whose MSRs they would be; arm64: nothing. True with
+   `out` filled. Called on the CPU itself, interrupts off. Defined per arch. */
+bool read_clock_counters(ClockCounters* out);
+
 /* Whether this CPU's C1 is C1. Intel's firmware may let a CPU turn every
    request for C1 into C1E (MSR_POWER_CTL bit 1, "C1E enable"), its voltage
    and clock dropped while it waits, which it takes microseconds to climb

@@ -311,6 +311,31 @@ bool set_cpu_epp(u32 epp)
     return true;
 }
 
+bool read_clock_counters(ClockCounters* out)
+{
+    static const u32 LEAF_BASIC = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_ECX_APERF_MPERF = 1U << 0;
+    static const u32 MPERF_MSR = 0xE7;
+    static const u32 APERF_MSR = 0xE8;
+
+    *out = ClockCounters{};
+    if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    if (!(cpuid(LEAF_POWER).ecx & POWER_ECX_APERF_MPERF))
+        return false;
+    /* MPERF and APERF first, the TSC last and beside them: what the window
+       divides by is never narrower than what it divides */
+    out->mperf = read_msr(MPERF_MSR);
+    out->aperf = read_msr(APERF_MSR);
+    out->tsc = read_tsc();
+    return true;
+}
+
 bool setup_cpu_c1e(bool* was_on, bool* on)
 {
     static const u32 LEAF_VENDOR = 0;

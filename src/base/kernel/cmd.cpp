@@ -268,6 +268,127 @@ static void cmd_date(const char* args, stdlib::Printer& con)
    pinning one core reads 100%, and on a 20-CPU box the column can total
    2000%. Two samples a moment apart, because a cumulative runtime tells you
    what a task has ever done, not what it is doing. */
+/* A CPU's clock counters, as the IPI that lands on it reads them
+   (cmd_cpufreq) */
+struct ClockSample
+{
+    hal::ClockCounters counters;
+    bool ok;
+};
+
+static void read_clocks_here(void* ctx, Context*)
+{
+    auto* sample = static_cast<ClockSample*>(ctx);
+    sample->ok = hal::read_clock_counters(&sample->counters);
+}
+
+/* Each CPU of `mask` that runs read into `samples` -- MAX_CPUS of them -- by
+   an IPI to it that this waits for, one CPU after another; one that does
+   not run left unread */
+static void read_clocks(ClockSample* samples, ulong mask)
+{
+    auto& cpus = CpuTable::get_instance();
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        samples[i].ok = false;
+        if (!(mask & (1UL << i)))
+            continue;
+        auto& target = cpus.get_cpu(i);
+        ulong state = target.get_state();
+        if (!(state & Cpu::STATE_RUNNING) || (state & Cpu::STATE_EXITING) || target.is_parked())
+            continue;
+        IPITask task(read_clocks_here, &samples[i]);
+        target.queue_ipi_task(task);
+    }
+}
+
+/* What each CPU's clock did over a window: the clock it ran at while it was
+   busy and the share of the window it was -- its APERF and MPERF, against
+   the TSC: whether a busy core runs at its turbo clock, and whether a CPU
+   meant to idle does. */
+static void cmd_cpufreq(const char* args, stdlib::Printer& con)
+{
+    static const ulong DEFAULT_MS = 1000;
+    static const ulong MAX_MS = 10000;
+    static const ulong TAG = 'Freq';
+    static const ulong HZ_IN_KHZ = 1000;
+    static const ulong KHZ_IN_MHZ = 1000;
+    static const ulong PERMILLE = 1000;
+
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    ulong ms = DEFAULT_MS;
+    if (tok)
+    {
+        char buf[16];
+        stdlib::token_copy(tok, end, buf, sizeof(buf));
+        ulong value;
+        if (!stdlib::parse_ulong(buf, value) || value == 0 || value > MAX_MS)
+        {
+            con.printf("usage: cpufreq [ms, 1-%lu]\n", MAX_MS);
+            return;
+        }
+        ms = value;
+    }
+
+    ulong hz = hal::cycle_counter_hz();
+    if (hz == 0)
+    {
+        con.printf("cpufreq: the cycle counter's rate is not known yet\n");
+        return;
+    }
+
+    ulong bytes = MAX_CPUS * sizeof(ClockSample);
+    auto* before = (ClockSample*)mm::alloc(bytes, TAG);
+    if (!before)
+    {
+        con.printf("cpufreq: out of memory\n");
+        return;
+    }
+    auto* after = (ClockSample*)mm::alloc(bytes, TAG);
+    if (!after)
+    {
+        mm::free(before);
+        con.printf("cpufreq: out of memory\n");
+        return;
+    }
+
+    ulong mask = CpuTable::get_instance().get_running_cpus();
+    read_clocks(before, mask);
+    sleep(ms * consts::NANO_SECS_IN_MS);
+    read_clocks(after, mask);
+
+    con.printf("cpufreq: %lu ms, the cycle counter at %lu MHz\n", ms, hz / HZ_IN_KHZ / KHZ_IN_MHZ);
+    ulong shown = 0;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!before[i].ok || !after[i].ok)
+            continue;
+        const hal::ClockCounters& b = before[i].counters;
+        const hal::ClockCounters& a = after[i].counters;
+        /* Counters only go up; one that did not, written meanwhile, says
+           nothing of the window */
+        if (a.tsc <= b.tsc || a.aperf < b.aperf || a.mperf < b.mperf)
+            continue;
+        u64 dt = a.tsc - b.tsc;
+        u64 da = a.aperf - b.aperf;
+        u64 dm = a.mperf - b.mperf;
+        /* APERF over MPERF in kHz of the TSC first: a 10 s window's deltas
+           times a TSC's rate in kHz stay well inside 64 bits */
+        ulong mhz = (dm == 0) ? 0 : (ulong)(da * (hz / HZ_IN_KHZ) / dm / KHZ_IN_MHZ);
+        ulong busy = (ulong)((dm > dt ? dt : dm) * PERMILLE / dt);
+        if (shown == 0)
+            con.printf("  cpu  MHz busy  busy%%\n");
+        con.printf("  %3lu  %8lu  %3lu.%lu%%\n", i, mhz, busy / 10, busy % 10);
+        shown++;
+    }
+    if (shown == 0)
+        con.printf("cpufreq: no CPU here counts its clock (APERF and MPERF)\n");
+
+    mm::free(after);
+    mm::free(before);
+}
+
 static void cmd_top(const char* args, stdlib::Printer& con)
 {
     static const ulong MAX_SAMPLES = 256;
@@ -2227,6 +2348,7 @@ static const CmdEntry COMMANDS[] = {
     { "ps",        cmd_ps,        "ps - show tasks" },
     { "stacks",    cmd_stacks,    "stacks - stack high-water marks" },
     { "top",       cmd_top,       "top [ms] - per-task cpu use over a sampling window" },
+    { "cpufreq",   cmd_cpufreq,   "cpufreq [ms] - each cpu's clock while busy, and how busy, over a window (APERF/MPERF)" },
     { "sched",     cmd_sched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> | sched affinity <pid> [<cpus>] - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice; the cpus it may run on (8,9,24-25 or 0x3000300), a task off them moved" },
     { "profile",   cmd_profile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "trace",     tp::command,   "trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench - tracepoints: events recorded as they happen into each cpu's ring, and read back merged by time -- shown, dumped as JSON, or paired into how long a woken task waited for its cpu; `freeze wakeup>N` freezes the rings on a wakeup that waits longer" },
