@@ -68,6 +68,23 @@ pub mod vmcb;
 #[path = "../../../src/crates/hvarch/src/x86/kick.rs"]
 pub mod kick;
 
+/// hvarch's own, as it is: the trait the world switch's loop answers an
+/// exit through (`vm::Cpu::enter` below calls it as the backends do).
+#[path = "../../../src/crates/hvarch/src/x86/fast.rs"]
+pub mod fast;
+
+/// WRMSRs answered in the world switch's own loop (`vm::Cpu::enter`'s
+/// script), over the run: what the stats line says.
+pub static FAST_ANSWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the WRMSR of `value` at `rip` is offered to the fast path: three
+/// in four, so that the run loop's own answer to the same writes is driven
+/// too -- by the write itself, so that an input makes the same choices
+/// whatever ran before it.
+pub(crate) fn fast_turn(value: u64, rip: u64) -> bool {
+    (value ^ rip.rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 62 != 0
+}
+
 /// How often the clock reaches the deadline `timer_at` is asked for as it
 /// is asked -- the edge coming between a vCPU's look at it and the arming,
 /// a few hundred nanoseconds on a host: one call in this many.
@@ -102,6 +119,8 @@ pub fn kick(_cpu: u32) {}
 pub fn notify(_cpu: u32) {}
 
 pub mod x86 {
+    pub use crate::cpu::fast;
+
     pub mod cpu {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1486,10 +1505,11 @@ pub mod vm {
         /// so. Its exit recorded as vm.rs's `Cpu::enter` records one, with
         /// the event on: the record built from whatever the script left in
         /// the registers.
-        pub fn enter(&mut self, memory: &GuestMemory, _machine: &Machine, kick: Option<&Kick>)
+        pub fn enter(&mut self, memory: &GuestMemory, _machine: &Machine, kick: Option<&Kick>,
+                     fast: Option<&mut dyn crate::x86::fast::FastExit>)
             -> core::result::Result<(Exit, u32), Refusal>
         {
-            let entered = self.enter_script(memory, kick);
+            let entered = self.enter_script(memory, kick, fast);
             if crate::trace::on::<crate::trace::HvExit>() {
                 if let Ok((exit, _)) = &entered {
                     let b = &self.backend;
@@ -1500,7 +1520,8 @@ pub mod vm {
             entered
         }
 
-        fn enter_script(&mut self, memory: &GuestMemory, kick: Option<&Kick>)
+        fn enter_script(&mut self, memory: &GuestMemory, kick: Option<&Kick>,
+                        mut fast: Option<&mut dyn crate::x86::fast::FastExit>)
             -> core::result::Result<(Exit, u32), Refusal>
         {
             let me = VCPU.with(|v| v.get());
@@ -1526,7 +1547,7 @@ pub mod vm {
                             loop asked for", me, armed, k.edge());
             }
             self.backend.entered();
-            let entered_at = crate::time::cycle_counter();
+            let mut entered_at = crate::time::cycle_counter();
             let exit = loop {
                 crate::time::progressed();
                 /* A notification of what other CPUs posted while it ran. */
@@ -1544,6 +1565,42 @@ pub mod vm {
                     .and_then(|g| g.next(me, &mut self.backend, memory));
                 match next {
                     None => break Exit::Shutdown,
+                    /* A WRMSR, three in four of them offered to the world
+                     * switch's own loop as the backends offer every one
+                     * (`hvarch::x86::fast`) -- answered there, the guest goes
+                     * on past it, entered again as the entry above entered
+                     * it; the rest go the loop's way, as a refusal does. */
+                    Some(Next::Exit(Exit::Msr { write: true })) if fast.is_some() => {
+                        let (msr, value, rip) = {
+                            let b = &self.backend;
+                            (b.regs().rcx as u32, ((b.regs().rdx & 0xFFFF_FFFF) << 32) | (b.save().rax & 0xFFFF_FFFF),
+                             b.save().rip)
+                        };
+                        if !crate::cpu::fast_turn(value, rip) {
+                            break Exit::Msr { write: true };
+                        }
+                        let mut ran = self.last_run;
+                        ran.next(crate::trace::on::<crate::trace::HvExit>(), entered_at, crate::time::cycle_counter());
+                        if !fast.as_deref_mut().is_some_and(|f| f.wrmsr(msr, value, rip, ran)) {
+                            break Exit::Msr { write: true };
+                        }
+                        self.last_run = ran;
+                        self.backend.skip_msr();
+                        crate::cpu::FAST_ANSWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        invariant!(crate::sync::held() == 0, "CPU {} answered a WRMSR in the world switch with {} of the \
+                                   kernel's locks held", me, crate::sync::held());
+                        if let Some(k) = kick {
+                            if !k.entering(me as u32) {
+                                return Ok((Exit::Kicked, me as u32));
+                            }
+                            let armed = ARMED.with(|a| a.get());
+                            invariant!(k.edge().is_none_or(|edge| armed <= edge),
+                                       "CPU {} entered its guest again past a WRMSR with the host's timer armed for {} \
+                                        ns, past the edge {:?} ns", me, armed, k.edge());
+                        }
+                        self.backend.entered();
+                        entered_at = crate::time::cycle_counter();
+                    }
                     Some(Next::Exit(exit)) => break exit,
                     Some(Next::Switch(to)) => switch_to(me, to),
                 }

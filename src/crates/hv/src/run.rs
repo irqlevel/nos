@@ -227,6 +227,91 @@ fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// A guest CPU's exits the world switch's own loop answers
+/// (`hvarch::x86::fast`), the guest entered again at once past them: its
+/// writes of the x2APIC's ICR that send a fixed IPI to other CPUs alone --
+/// posted or mailed, and their CPUs notified or rung, as `send` does -- and
+/// of its TSC deadline, the host's timer armed for the edge as the run
+/// loop's round arms it. KVM answers the same two so
+/// (`handle_fastpath_set_msr_irqoff`). Anything else -- an IPI to itself
+/// too, or of another kind, a guest with no APIC -- is refused, and goes the
+/// way it always went. What comes meanwhile for the CPU kicks it, and the
+/// kick refuses the entry after the write (`Kick::entering`): the run
+/// loop's round then looks.
+///
+/// With interrupts off and the guest's registers the CPU's: what it calls
+/// are atomics, IPIs and doorbells, which an interrupt handler may ring.
+struct FastMsr<'a> {
+    guest: &'a LinuxGuest,
+    me: u32,
+    pid: u32,
+    lapic: &'a mut Lapic,
+    counts: &'a mut Counts,
+    kick: &'a hvarch::x86::svm::Kick,
+    /// The CPU's deadlines but its APIC timer's (`GuestCpu::other_due`)
+    other_due: Option<u64>,
+    /// The deadline its host timer is armed for (`GuestCpu::asked`)
+    asked: &'a mut Option<u64>,
+}
+
+impl hvarch::x86::fast::FastExit for FastMsr<'_> {
+    fn wrmsr(&mut self, msr: u32, value: u64, rip: u64, ran: hvarch::x86::svm::Run) -> bool {
+        if !self.guest.has_apic() {
+            return false;
+        }
+        let answered = if msr == lapic::MSR_X2APIC_ICR {
+            self.ipi(value)
+        } else if msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
+            self.tsc_deadline(value)
+        } else {
+            false
+        };
+        if answered {
+            self.counts.msr_write += 1;
+            self.counts.answered += 1;
+            if trace::on::<trace::HvExit>() {
+                let regs = tp::ExitRegs { rip, rax: value & 0xFFFF_FFFF, rcx: u64::from(msr) };
+                tp::exit(self.me, self.pid, &Exit::Msr { write: true }, regs, ran, None);
+            }
+        }
+        answered
+    }
+}
+
+impl FastMsr<'_> {
+    /// A fixed IPI, to other CPUs alone, sent as `send` sends one.
+    fn ipi(&mut self, value: u64) -> bool {
+        let me = self.me;
+        let Some(ipi) = self.lapic.fixed_ipi(value, me) else { return false };
+        self.counts.ipi_sent += 1;
+        for (i, target) in self.guest.cpus.iter().enumerate() {
+            let id = i as u32;
+            if id == me || !ipi.reaches(id, target.addressing(), me) {
+                continue;
+            }
+            self.guest.post_edge(i, target, ipi.vector);
+            /* Lowest priority is one CPU's, of those it names: the first. */
+            if ipi.delivery == Delivery::LowestPriority {
+                break;
+            }
+        }
+        true
+    }
+
+    /// The TSC deadline written, and the host's timer armed for the
+    /// soonest of its edge and the CPU's other deadlines, as the round's
+    /// look before an entry made without it arms it. An edge come already
+    /// refuses the entry after (`Kick::entering`), for the round to give
+    /// its interrupt.
+    fn tsc_deadline(&mut self, value: u64) -> bool {
+        self.lapic.set_tsc_deadline(value, tsc_ns(value));
+        let now = time::boot_time_ns();
+        *self.asked = sooner(self.lapic.next_timer_ns(), self.other_due.filter(|&due| due > now));
+        self.kick.arm_at(*self.asked);
+        true
+    }
+}
+
 /// What a CPU's task did last, before the round that looks at its timers:
 /// where an edge found late was waited for (`LATE_NS`).
 #[derive(Clone, Copy)]
@@ -392,6 +477,10 @@ pub struct Counts {
     /// Entries made at once after a write of its TSC deadline or of an IPI
     /// to other CPUs, without the loop's round.
     pub fast: u64,
+    /// Such writes answered inside the world switch's own loop, and the
+    /// guest entered again from there (`FastMsr`): exits counted among
+    /// `exits`, none of them seen by the loop.
+    pub answered: u64,
     /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
     /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
     /// stopped the guest after, of level-triggered vectors.
@@ -530,6 +619,7 @@ impl Counts {
         self.overslept_rung += o.overslept_rung;
         self.overslept_max = self.overslept_max.max(o.overslept_max);
         self.fast += o.fast;
+        self.answered += o.answered;
         self.polls += o.polls;
         self.polled += o.polled;
         self.handled_ns += o.handled_ns;
@@ -1759,8 +1849,20 @@ impl LinuxGuest {
              * entry. */
             let edges_passed = kick.edges_passed();
             let entered_at = time::boot_time_ns();
-            let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
+            let answered_before = gc.counts.answered;
+            let entered = {
+                /* Its writes of the ICR and of the TSC deadline answered in
+                 * the world switch's own loop where they can be (`FastMsr`):
+                 * the entry after each made then and there. */
+                let pid = gc.cpu.pid();
+                let GuestCpu { index, cpu, lapic, counts, other_due, asked, .. } = &mut *gc;
+                let mut fast = FastMsr {
+                    guest: self, me: *index, pid, lapic, counts, kick, other_due: *other_due, asked,
+                };
+                cpu.enter(&self.memory, machine, Some(kick), Some(&mut fast))
+            };
             let exit_at = time::boot_time_ns();
+            gc.counts.exits += gc.counts.answered - answered_before;
             if apicv {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
                 gc.lapic.from_cpu(&irr, &isr, tpr);
