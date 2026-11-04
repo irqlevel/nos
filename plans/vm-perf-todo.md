@@ -30,6 +30,46 @@ threads writing one shared 512 MiB buffer; no record was being made then,
 and that step has next to no exits): to be run again before anything is made
 of it. What the windows measured is under each heading below.
 
+## Rounds 13-17 (vm-perf3, 2026-11-04): perf-bench, cyclictest and fio
+
+Short runs of the suite's three steps (`bench/vm/guest/run.sh`'s ONLY, staged
+by `bench-host.sh nos-stage <steps>`), each with round 12's trace windows; the
+numbers against KVM's (`bench/vm/results/kvm`) and round 12's:
+
+| | KVM | r12 a0ae873e | r13 7eaedbb5 | r17 (r16 0ca91bcf, the disk's hold off) |
+|---|---:|---:|---:|---:|
+| cyclictest avg | 31 us | 66.2 | 65.5 | **5.25** |
+| perf pipe | 6.0 us | 8.44 | 8.49 | 8.06 |
+| 4k read QD1 | 20.1k, 47 us | 17.2k, 52 | 19.4k, 45 | **20.0k, 44** |
+| 4k write QD1 | 39.9k, 23 us | 28.9k, 27 | 39.5k, 18 | **39.3k, 18** |
+| 4k read QD32 | 195k | 142k | 145k | 135k (112-145k) |
+| 4k write QD32 | 178k | 126k | 130k | 104k (99-130k) |
+| fdatasync | 620, 139 us | 708, 40 | 749, 23 | 722-749 |
+
+- **C1E auto-promotion** was on (firmware's), and is off now (c4b1af44): it
+  moved cyclictest by nothing.
+- **The disk's task spins before it sleeps** (8f8d14fa): both its wakes, a
+  QD1 request's 10 us -- reads and writes at KVM's and past it.
+- **HWP's preference** was what a just-woken CPU's slowness was: with every
+  CPU at EPP 0 (round 14, `hwp_epp=0`) the TSC deadline's write right after a
+  wake cost 1.2 us of the host's where it had cost 10.1, a timer interrupt
+  went in 0.15 us past its edge where it had 4.2, and cyclictest fell to
+  5.75 us. Held at EPP 0 now are the vCPUs' CPUs while a guest runs
+  (2398e421) -- not the disk's task's E-core: held too, every 4k request took
+  3.8 us longer to its completion's interrupt on CPU 1 (round 15-16; why, not
+  known), and without it they are back (round 17, 83f6cdbe).
+- **No kick while eight requests are out** (0ca91bcf): the notifies that were
+  41% of the QD32 job's CPU are gone -- 25 commands in flight at most, where
+  10 were. What binds QD32 now is the device's being vCPU 0's: a request
+  added waits on the ring for the round a completion's wake brings
+  (3.8 us to the disk's task at p50, 0.8 before), and every completion for
+  that round too (4.2 us back, 0.7 before); with fio's job on vCPU 0 itself
+  each completion's wake is an exit of the job's (round 15: 273 of them, the
+  job 36% in its guest). The QD32 numbers move 10-20% with where the guest
+  puts the job. The lever: the disk's task serving the device itself, as
+  QEMU's iothread with irqfd does -- the used ring written and the MSI posted
+  from there, the ring looked at as it polls, vCPU 0 out of it.
+
 ## Done since ddcbd4c6
 
 - **The fdatasync job's tail** (p99 0.7-0.9 ms and p999 ~1 ms in every run
