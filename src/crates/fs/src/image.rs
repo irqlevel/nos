@@ -138,6 +138,10 @@ const AHEAD_STEP_MS: u64 = 100;
 /// image grows ahead of it (`Direct::ask_ahead`).
 const STREAM_MIN: u64 = 2;
 
+/// How many writes in a row elsewhere end a stream (`Direct::ask_ahead`):
+/// fewer, and the guest's own between it -- its journal's -- are let by.
+const STREAM_MISSES: u64 = 8;
+
 /// The chunks of a stream's first stretch grown ahead, and the most of one
 /// after it, each twice the last's: a gigabyte of 16 MiB chunks, so that a
 /// guest's 2 GiB first write is a handful of commits made while it writes,
@@ -461,6 +465,9 @@ struct Direct {
     /// and where the stretch last given ahead of it ends, and its chunks.
     stream_at: u64,
     stream_run: u64,
+    /// Writes in a row that went on with nothing of the stream's
+    /// (`STREAM_MISSES`).
+    stream_misses: u64,
     ahead_to: u64,
     ahead_span: u64,
     /// The growth under way ahead of its guest's writes, by a task of its
@@ -1731,7 +1738,7 @@ impl Direct {
         fresh.resize(batch.pages(), false);
         let chunk = (CHUNK_BYTES / block as u64).max(1);
         Some(Direct { disk, block, batch, sectors, unwritten, fresh, pieces, stretches, map: None, chunk,
-                      grown_to: u64::MAX, span: 0, stream_at: u64::MAX, stream_run: 0,
+                      grown_to: u64::MAX, span: 0, stream_at: u64::MAX, stream_run: 0, stream_misses: 0,
                       ahead_to: 0, ahead_span: 0, ahead: None, ahead_off: false, aheads: 0,
                       ahead_blocks: 0, ahead_waits: Timed::default(), through_vfs: false, read_off: 0, written_off: 0,
                       written_through: 0, punched: 0, allocated: 0, grows: false, refused: 0,
@@ -1951,17 +1958,29 @@ impl Direct {
     /// it lacks by the image's task, and the next as soon as the stream is
     /// into the last. What is there already is left as it is, so that a disk whose
     /// free space is holes among blocks written once has its holes given
-    /// ahead of the guest as a disk of holes does. A write that begins
-    /// elsewhere ends the stream: a guest writing here and there has none
-    /// given ahead of it.
+    /// ahead of the guest as a disk of holes does. `STREAM_MISSES` writes
+    /// in a row that begin elsewhere end the stream, fewer are let by: a
+    /// guest writing here and there has none given ahead of it.
     fn ask_ahead(&mut self, vfs: &'static Vfs, handle: Handle, first: u64, n: u64, blocks: u64) {
         let end = first.saturating_add(n);
         if first == self.stream_at {
             self.stream_run = self.stream_run.saturating_add(1);
+            self.stream_at = end;
+            self.stream_misses = 0;
         } else {
-            (self.stream_run, self.ahead_to, self.ahead_span) = (0, 0, 0);
+            /* Elsewhere: a write of the guest's own between its stream's --
+             * its journal's, say -- which leaves the stream as it was, unless
+             * `STREAM_MISSES` come in a row: then this one begins the next.
+             * Every stretch a 2 GiB first write's was grown ahead by began
+             * at AHEAD_FIRST again after each, 19 commits of 5-33 ms in it
+             * where a few would do (round 25). */
+            self.stream_misses = self.stream_misses.saturating_add(1);
+            if self.stream_misses < STREAM_MISSES {
+                return;
+            }
+            (self.stream_run, self.ahead_to, self.ahead_span, self.stream_misses) = (0, 0, 0, 0);
+            self.stream_at = end;
         }
-        self.stream_at = end;
         if !self.grows || self.ahead_off || self.ahead.is_some() || self.map.is_none() || self.stream_run < STREAM_MIN
         {
             return;
