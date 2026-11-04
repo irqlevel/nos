@@ -110,6 +110,23 @@ bool Event::wait_for(unsigned long long timeout_ns)
     return signaled;
 }
 
+bool Event::poll_for(unsigned long long poll_ns)
+{
+    /* The waiter's call, as wait()'s is: one at a time */
+    BUG_ON(waiter_.get() != 0);
+
+    ulong start = get_boot_time().get_value();
+    ulong until = (poll_ns > ~0UL - start) ? ~0UL : start + (ulong)poll_ns;
+    for (;;)
+    {
+        if (signaled_.get() != 0 && signaled_.cmpxchg(0, 1) == 1)
+            return true;
+        if (get_boot_time().get_value() >= until)
+            return false;
+        cpu_relax();
+    }
+}
+
 void Event::signal()
 {
     /* Published first. A plain read before the locked operation, so a burst

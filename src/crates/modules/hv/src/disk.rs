@@ -25,7 +25,9 @@
 //! nothing on the way allocates; the vCPU looks at a count first, every time
 //! round its loop, and takes the lock only when something is there. The task
 //! sleeps on its image's queue, which a request handed over wakes as well as
-//! a command done.
+//! a command done -- spinning for it first while the guest keeps its disk
+//! busy, for as long as its waits have been short (`POLL_MAX_NS`), so that
+//! neither costs a sleep and a wake.
 //!
 //! The task is on a CPU of its own, not the vCPU's (`hv::place`): the disk
 //! works while the guest runs rather than when it stops -- a thread of the
@@ -203,6 +205,17 @@ struct Serve {
 /// how stale a look may be.
 const IDLE_SECS: u64 = 1;
 
+/// How long the task spins for what it waits for before it sleeps for it,
+/// at first and at most: grown after a wait that was short and dropped
+/// after one that was long, as a vCPU's halt poll is (`hv::run`). A guest
+/// keeping its disk busy has each request and each command done come
+/// within microseconds -- the NVMe's 4k read in 38 us on the EX44 -- and a
+/// sleep and a wake cost 5 us apiece there: two a request at QD1, 10 of
+/// its 49 us. QEMU's iothread polls likewise. The task's CPU is its own
+/// (`hv::place`), and an idle disk spins not at all.
+const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
+const POLL_MAX_NS: u64 = 100 * kcore::consts::NS_PER_US;
+
 pub struct FileDisk {
     pipe: Arc<Pipe>,
     /// The image and its buffers, which the device fills and empties --
@@ -345,6 +358,8 @@ fn serve(start: Serve) {
         return;
     }
     flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
+    /* How long the next wait spins first (POLL_FIRST_NS) */
+    let mut poll_ns = 0u64;
     loop {
         {
             let mut requests = pipe.requests.lock();
@@ -407,8 +422,21 @@ fn serve(start: Serve) {
         if finished.is_empty() {
             /* A request handed over wakes it, and so does a command done --
              * one that came since the look is not lost: the queue remembers
-             * it. */
+             * it. Spun for first, for as long as the waits before say it is
+             * likely to come (POLL_MAX_NS). */
+            let looked = kcore::time::boot_time_ns();
+            if poll_ns != 0 && queue.poll(Duration::from_nanos(poll_ns)) {
+                continue;
+            }
             queue.wait(Duration::from_secs(IDLE_SECS));
+            let waited = kcore::time::boot_time_ns().saturating_sub(looked);
+            poll_ns = if waited > POLL_MAX_NS {
+                0
+            } else if waited > poll_ns {
+                poll_ns.saturating_mul(2).clamp(POLL_FIRST_NS, POLL_MAX_NS)
+            } else {
+                poll_ns
+            };
             continue;
         }
         {
