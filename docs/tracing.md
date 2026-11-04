@@ -33,16 +33,53 @@ if (unlikely(tp::on(tp::Id::SchedSwitch)))
 ```
 
 No arguments are computed and no call is made until the event is on. One
-that is on is a call to `tp::emit()`: interrupts off, the cycle counter read,
-eight 64-bit stores and two barriers into this CPU's ring, interrupts back.
-`trace bench` measures both on the CPU it runs on -- the one that is on into
-a ring of its own, through the same path, so that what the kernel's rings
-hold is left as it was:
+that is on is straight-line code with no call in it: interrupts off by the
+CPU's own instructions (PUSHFQ and CLI; MRS and MSR of DAIF), this CPU's ring
+found by one load through its per-CPU register, the cycle counter read in
+place and unordered (RDTSC; CNTVCT_EL0 with no ISB before it -- the ring
+keeps its records' stamps in order itself, [below](#the-rings)), the slot's
+ten stores and two barriers, and the interrupts put back as they were (STI,
+not POPF). A kernel site builds its payload and writes it in line; one
+anywhere else -- Rust's, a test's -- calls `tp::record()`, every argument of
+which is in a register: the event's number and size in one, the payload's
+five words in the others, from the site that built them to the slot with no
+copy in memory between.
 
-| | off, over an empty loop's iteration | on, a record |
-|---|---:|---:|
-| arm64, Apple Silicon under HVF | 0.14-0.37 ns | 31-47 ns |
-| arm64, QEMU's TCG | 0.28 ns | 239 ns |
+`trace bench [cpu=N]` measures a CPU -- the shell's, or N's by a task pinned
+to it -- off, and on into a ring of its own through the same path, so that
+what the kernel's rings hold is left as it was; and it times a record's
+parts, each alone over an empty loop's iteration. They overlap in a record,
+so their sum is more than its cost:
+
+| | off | on, a record | interrupts off and back | the counter (ordered) | the slot's stores |
+|---|---:|---:|---:|---:|---:|
+| x86-64, the EX44's P-core (cpu 16) | 0.50-0.54 ns | 16.1 ns | 7.6-7.7 ns | 5.3-5.5 (5.3-5.6) ns | 2.3-2.4 ns |
+| x86-64, the EX44's E-core (cpus 56, 62) | 0.45-0.54 ns | 10.3 ns | 1.7 ns | 8.6 (8.6) ns | 3.2-3.4 ns |
+| arm64, Apple Silicon under HVF | 0-0.03 ns | 4.1-5.0 ns | 3.8-5.1 ns | 0 (8.6-10.8) ns | 2.1-2.6 ns |
+
+A record cost 87.8 ns on the EX44 and 23.5-25.2 under HVF before this path
+(a0ae873e), and the record a guest's exit makes (`hv bench` with `trace on
+hv`) 125-140 ns on a P-core and 270-285 on an E-core. On x86 each of
+PUSHFQ, CLI, RDTSC and POPFQ was a function of `asm.asm`'s behind a
+`-mcmodel=large` call -- a MOVABS and an indirect CALL -- and POPF, a
+microcoded instruction, put the interrupts back; the payload was copied
+twice, the second time by a REP MOVSB behind two more calls; the slot's
+write was a call of its own; and a scheduler's record copied its tasks'
+names with a `str_len` and two string instructions. On arm64 the ISB before
+every stamp was two thirds of a record.
+
+Now a guest's exit pays 55-75 ns for its record on a P-core and 130-140 on
+an E-core, of which the write into the ring is 16 and 33: with the events on
+and the rings frozen, the site does all its work and the kernel's write
+returns at its look at `frozen`, and `hv bench` says 60 and 100. The rest is
+the site's -- the payload built, the two calls into the kernel -- a few
+hundred instructions run right after the exit, the return stack just
+refilled by hvarch's stub, which `trace bench`'s loop does not see. The exit
+with every event off is 25-35 ns cheaper than it was as well: the IRQ
+wrappers in place are on its path in every IRQ-safe lock it takes. On a
+P-core the interrupts off and back -- PUSHFQ, CLI, STI -- are half a record,
+7.6 ns on Raptor Cove against 1.7 on Gracemont, whose RDTSC is the slower
+one, 8.6 ns against 5.3.
 
 There are no static keys -- the branch is not patched out of the code. The
 image is W^X, so patching would need a writable alias of the text and each
@@ -70,6 +107,27 @@ The ring wraps: once full, each record takes the slot of the oldest, and a
 writer never waits for room. Its slots are in 64 KiB chunks from the kernel
 heap, a power of two of them, so a slot is found with a shift and a mask.
 
+A record's stamp is the counter as the CPU read it, unordered -- possibly a
+few instructions early -- and never before the stamp of the ring's record
+before it: the write takes the later of the two, so a ring's records are in
+the order of their stamps as they are of their indices, which its readers
+count on (the merge, a window's start). The ISB that would order the read
+(`hal::read_cycle_counter`, what times an interval) costs more than all the
+rest of a record on arm64, and x86's RDTSC was never ordered.
+
+The ring itself -- its chunks' table, its head, the flag of a write in
+progress and its newest stamp -- is one cache line, every CPU's in one block
+from the heap's page path, so page-aligned: what a CPU writes at every
+record shares its line with no other CPU's ring and no other allocation. A
+chunk is 4 KiB pages, not physically contiguous, mapped one by one as the
+heap maps a block past its pools -- the kernel maps no 2 MiB page of its
+own; the huge pool (`hugepages=`) is guests' memory. A record touches one
+line of one page, a translation every 64 records: `trace bench`'s slot's
+stores into a ring of `trace size`'s size, against those into its 64 KiB
+one, say what the pages and the lines past the caches cost -- under HVF
+2.5-3.0 ns against 2.1-2.6 for a ring of 1 or 4 MiB, on the EX44 2.3-2.4 against 2.3-2.4 on a P-core and 3.1-4.5 against 3.2-3.4 on an E-core --
+the most a 2 MiB mapping could take off a record.
+
 A ring is freed -- `trace size`, `trace free` -- only once no CPU can still
 be writing into it. The new pointers go in first, and then every other CPU
 is sent an interrupt and waited for (`CpuTable::synchronize`): a write runs
@@ -96,7 +154,7 @@ An NMI that comes in while its CPU is writing takes nothing and is counted
 | `trace free` | every event off, every ring given back, no freeze or trigger left: as before the first `trace on` |
 | `trace freeze [wakeup>N<ns\|us\|ms\|s>]` / `thaw` | nothing more recorded until thawed, so that what is in the rings stays as it was -- at once, or when a wakeup waits longer than N ([below](#a-wakeup-that-waited-too-long)). `trace on` says so when it turns events on into frozen rings, and `trace test` refuses them |
 | `trace test [n]` | `n` records of the `test` event on this CPU, preemption off for the loop so that all of them are |
-| `trace bench` | what a tracepoint costs this CPU off and on |
+| `trace bench [cpu=N]` | what a tracepoint costs this CPU, or N, off and on, a record split into its parts, and the slot's stores into a ring of `trace size`'s size ([What a tracepoint costs](#what-a-tracepoint-costs)) |
 
 A record prints as its time since boot, its CPU, the event's name and its
 fields as `name=value` -- from the event's description, one format for all.
@@ -401,8 +459,17 @@ once by each copy of kcore -- the image's, and each module's, which reaches
 the kernel through its export table (`kernel_tp_flags`) and keeps the
 address -- and the event's byte. A module imports functions, not data, so it
 cannot read `tp::enabled` by name as the C++ does; that is the second load.
-`emit()` is the kernel's, BUG_ON and all: a payload of a size the
-description does not have stops the kernel at the first record.
+`emit()` lays the payload into a slot's five words -- copies of a size the
+compiler knows, a few loads -- and hands them to the kernel in registers with
+the event's number and size in a sixth (`kernel_tp_record`, a safe call: it
+takes values only), the kernel storing them into the slot as they are; a
+module's call is one indirect call through its export table. The checks are
+the kernel's, BUG_ON and all: a payload of a size the description does not
+have stops the kernel at the first record. The hypervisor's records of a
+guest CPU's own loop -- `hv_exit`, `hv_inject`, `hv_halt`, `hv_wake`,
+`hv_timer` -- carry the pid its `vm::Cpu` asked the kernel once, of the task
+that runs it (`note_task`, at the run loop's start), rather than a call into
+the kernel at each (`kcore::trace::pid`, which the other sites make).
 
 The boot's `test_tracepoints` has Rust write a hundred records of the test
 event (`rust_trace_emit_test`) into the ring it then reads back, beside the
@@ -552,7 +619,7 @@ too.
   under its overflow checks for half of every target's inputs -- the disk's
   and the virtio queues' among them; `fs-fuzz.py` and `net-fuzz.py` run the
   layers' own -- the image's, the block queue's, ext4's -- for half their
-  inputs, the machine's `kernel_tp_emit` holding each record to its
+  inputs, the machine's `kernel_tp_record` holding each record to its
   description, an enumeration's value one it names and every pad zero; and
   `hv-test.py` (x86-64) traces hvboot's reads of a disk it is given -- each
   taken off the ring, picked up by the disk's task, served by the image then
