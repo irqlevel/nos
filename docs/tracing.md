@@ -68,18 +68,23 @@ write was a call of its own; and a scheduler's record copied its tasks'
 names with a `str_len` and two string instructions. On arm64 the ISB before
 every stamp was two thirds of a record.
 
-Now a guest's exit pays 55-75 ns for its record on a P-core and 130-140 on
-an E-core, of which the write into the ring is 16 and 33: with the events on
-and the rings frozen, the site does all its work and the kernel's write
-returns at its look at `frozen`, and `hv bench` says 60 and 100. The rest is
-the site's -- the payload built, the two calls into the kernel -- a few
-hundred instructions run right after the exit, the return stack just
-refilled by hvarch's stub, which `trace bench`'s loop does not see. The exit
-with every event off is 25-35 ns cheaper than it was as well: the IRQ
-wrappers in place are on its path in every IRQ-safe lock it takes. On a
-P-core the interrupts off and back -- PUSHFQ, CLI, STI -- are half a record,
-7.6 ns on Raptor Cove against 1.7 on Gracemont, whose RDTSC is the slower
-one, 8.6 ns against 5.3.
+Now a guest's exit pays about 45 ns for its record on a P-core (25-60 over
+the runs) and about 105 on an E-core (95-115) -- 6ecddfef; d4170e50's path
+alone left 55-75 and 130-140. With the
+events on and the rings frozen, the site does all its work and the kernel's
+write returns at its look at `frozen`, and `hv bench` says 15-40 and 75 of
+it are the site's: the payload built and the jump into the kernel, a few
+hundred instructions run right after the exit with the return stack just
+refilled by hvarch's stub, which `trace bench`'s loop does not see. They
+were 60 and 100 before the site stopped reading the counter for `since_ns`
+(below) and before `exit_fields` and `times` went in line -- each a call
+through the module's GOT, its answer a trip through memory -- and the
+bridge's `kernel_tp_record` became a jump into `record()`. The exit with
+every event off is 25-35 ns cheaper than it was before d4170e50 as well:
+the IRQ wrappers in place are on its path in every IRQ-safe lock it takes.
+On a P-core the interrupts off and back -- PUSHFQ, CLI, STI -- are half a
+record, 7.6 ns on Raptor Cove against 1.7 on Gracemont, whose RDTSC is the
+slower one, 8.6 ns against 5.3.
 
 There are no static keys -- the branch is not patched out of the code. The
 image is W^X, so patching would need a writable alias of the text and each
