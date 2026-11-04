@@ -229,6 +229,64 @@ hundred records does not arrive whole over it; read the serial console or
 netconsole for a big window, or dump in parts -- the decode does not care
 where the lines were cut.
 
+A guest's records -- `trace on hv blk disk fs` -- are read too, after the
+scheduler's, or alone with `--hv`:
+
+```
+scripts/trace-decode.py --hv dump.txt
+```
+
+-- here of `hv-test.py`'s windows, under QEMU's TCG (twice emulated, so
+every time is long): the `smp` guest's, and hvboot reading a disk:
+
+```
+hv: 22 exits of 2 vCPUs
+  vcpu 0 (pid 11): 15 exits over 5.35ms, 5.1% of it in its guest
+  vcpu 1 (pid 12): 7 exits over 761.0us, 20.9% of it in its guest
+  reason           exits   share   out of the guest after it (the host's cost)
+  msr                 15   68.2%   p50 57.0us p99 256.0us max 306.0us
+      x2apic icr write                5   p50 41.0us p99 86.0us max 306.0us
+      x2apic id read                  2   p50 15.0us p99 15.0us max 256.0us
+      x2apic eoi write                2   p50 28.0us p99 28.0us max 78.0us
+      ...
+  hlt                  4   18.2%   p50 1.52ms p99 1.52ms max 2.53ms -- a halt's sleep, idle
+  cpuid                2    9.1%   p50 16.0us p99 16.0us max 62.0us
+      leaf 0x1                        2   p50 16.0us p99 16.0us max 62.0us
+  cr4                  1    4.5%   p50 324.0us p99 324.0us max 324.0us
+  halts: 2 (1 rung, 1 timed); halted p50 1.12ms p99 1.12ms max 2.39ms; woke past its time ...
+  timer interrupts after woke_on_time: 1, late p50 467.0us p99 467.0us max 467.0us
+  injected: apic 0x40 x1, apic 0x41 x1
+  rings rung: 6, to the vCPU's next entry p50 435.0us p99 440.0us max 598.0us
+  2 rings not paired: their vCPU's number more than one task's, or no entry after
+
+disk: 2 requests, 2 of them whole in the window
+  read              2   in all p50 119.0us p99 119.0us max 1.23ms
+      to its task   p50 50.0us p99 50.0us max 265.0us
+      served        p50 25.0us p99 25.0us max 735.0us
+      back          p50 44.0us p99 44.0us max 226.0us
+      served: 2 at_once
+  image served then and there: 2 (0 writes), p50 21.0us p99 21.0us max 476.0us
+  ext4 commits: 2, 12 journal blocks, p50 504.0us p99 504.0us max 3.57ms, checkpoints 0ns in all
+```
+
+(the two rings not paired are the stop's, after which nothing enters).
+
+What an exit cost the host is the `out_ns` of its vCPU's next record --
+from that exit to the entry after it -- by its reason and by what it was
+about: the port (named where it is one of the PC's or a virtio device's,
+its notify said), the MSR, the guest's page (the xAPIC's, the IO-APIC's),
+the vector (the host's, under VT-x). A HLT's is the halt's sleep, idle,
+said so. A ring is paired with the next entry of the vCPU it named, where
+that number is one task's alone among the records -- one VM's, or each VM a
+CPU of a number of its own. A guest disk's request is paired through its
+hand-offs by its disk, slot, op, offset and length, which the virtio
+disk's records and the disk task's both carry, and the device's commands
+with it by their buffer, which is the request's slot: its four stretches --
+to the disk's task, served, the device's share, back -- each a spread of
+its own. In the Chrome trace a vCPU is a track of its own, a slice every
+stretch in its guest and every exit out of it, named by what it was; a
+guest disk a track, a slice each request, its stretches in its arguments.
+
 ## The scheduler's events
 
 | event | group | what it records |
@@ -499,6 +557,14 @@ too.
   taken off the ring, picked up by the disk's task, served by the image then
   and there, done and given back, in that order, slot by slot, by the
   disk's own task -- and a file written, its ext4 transactions committed.
+- `trace-decode.py --hv`: `hv-test.py` dumps each of its windows and reads
+  them back with it, as shipped, held to what the guests did -- the
+  `exits` guest's exits by reason and by what each was about, the 20 outs
+  to the debug port and the one in, each with the host's time after it;
+  the `smp` guest's rings each paired with its CPU's next entry, its halts
+  and its timer interrupt; hvboot's two reads paired through every
+  hand-off with nothing left over -- and the Chrome trace of each, its
+  vCPU's track and its disk's.
 - `trace-test.py` (arm64; x86-64 where grub-mkrescue is): a kernel booted
   with `tracepoints=test`, and `trace` driven over the UDP shell -- the
   boot's events on, records shown merged and in order, rings made again at
