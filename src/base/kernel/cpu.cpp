@@ -48,6 +48,7 @@ Cpu::Cpu()
     , timer_walk_(false)
     , idle_long_run_(0)
     , idle_counts_{}
+    , latency_held_(false)
 {
     ipi_task_list_.init();
 }
@@ -149,13 +150,18 @@ void Cpu::idle_mwait(Task* self)
     ulong flags = hal::irq_save();
     ulong now = get_boot_time().get_value();
     ulong armed = timer_armed_at_;
-    bool deep = idle_long_run_ >= IDLE_LONG_RUN && armed > now && armed - now >= IDLE_DEEP_NS;
-    hal::cpu_idle_masked(deep);
+    ulong ahead = (armed > now) ? armed - now : 0;
+    hal::IdleDepth depth = hal::IdleDepth::C1;
+    if (idle_long_run_ >= IDLE_LONG_RUN && ahead >= IDLE_DEEP_NS)
+        depth = hal::IdleDepth::Deep;
+    else if (!latency_held_ && ahead >= IDLE_MID_NS)
+        depth = hal::IdleDepth::Mid;
+    hal::cpu_idle_masked(depth);
     /* The wake, before the interrupt that ended it is taken: the idle's end
        exactly, if the trace opened it */
     idle_ended(self);
     ulong woke = get_boot_time().get_value();
-    ulong kind = deep ? 1 : 0;
+    ulong kind = (depth == hal::IdleDepth::Deep) ? 2 : (depth == hal::IdleDepth::Mid) ? 1 : 0;
     idle_counts_.idles[kind]++;
     idle_counts_.ns[kind] += (woke > now) ? woke - now : 0;
     if (woke > now && woke - now >= IDLE_DEEP_NS)
@@ -173,6 +179,11 @@ void Cpu::idle_mwait(Task* self)
 Cpu::IdleCounts Cpu::get_idle_counts() const
 {
     return idle_counts_;
+}
+
+void Cpu::set_latency_held(bool held)
+{
+    latency_held_ = held;
 }
 
 ulong Cpu::get_state()

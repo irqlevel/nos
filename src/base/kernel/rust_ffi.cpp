@@ -601,10 +601,27 @@ kernel::Mutex& performance_lock()
 
 ulong performance_holds[kernel::MAX_CPUS] = {};
 
-/* hal::set_cpu_epp on the CPU the IPI lands on, its value in the word */
-void set_epp_here(void* ctx, kernel::Context*)
+/* The CPUs held to wake quickly (kernel_cpu_latency): how many hold each,
+   under the same lock. */
+ulong latency_holds[kernel::MAX_CPUS] = {};
+
+/* What the IPI sets on the CPU it lands on: its preference, where `set_epp`,
+   and whether it is held to wake quickly -- by a performance hold or a
+   latency one (Cpu::set_latency_held). On the caller's stack, which waits
+   for the IPI. */
+struct CpuHold
 {
-    hal::set_cpu_epp((u32)(ulong)ctx);
+    bool set_epp;
+    u32 epp;
+    bool held;
+};
+
+void set_hold_here(void* ctx, kernel::Context*)
+{
+    auto* hold = static_cast<const CpuHold*>(ctx);
+    if (hold->set_epp)
+        hal::set_cpu_epp(hold->epp);
+    kernel::CpuTable::get_instance().get_current_cpu().set_latency_held(hold->held);
 }
 
 }
@@ -638,7 +655,38 @@ void kernel_cpu_performance(unsigned int cpu, int hold)
     if ((was == 0) == (holds == 0))
         return;
     ulong epp = (holds != 0) ? 0 : kernel::Parameters::get_instance().get_hwp_epp();
-    kernel::IPITask task(set_epp_here, (void*)epp);
+    CpuHold set{true, (u32)epp, holds != 0 || latency_holds[cpu] != 0};
+    kernel::IPITask task(set_hold_here, &set);
+    target.queue_ipi_task(task);
+}
+
+/* CPU `cpu` held to wake quickly while `hold` holds of it are more than its
+   releases: its idles kept out of the C-state between (Cpu::IDLE_MID_NS),
+   whose wake of a hundred microseconds or two a guest's disk would wait for
+   at every request that comes after its task idled -- what a CPU a guest's
+   disk is served from asks while it is theirs. A performance hold holds it
+   so too. Set on the CPU itself, by an IPI this waits for; a CPU not
+   running, or out of range, is nothing. Task context. */
+void kernel_cpu_latency(unsigned int cpu, int hold)
+{
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+        return;
+    auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
+    ulong state = target.get_state();
+    if (!(state & kernel::Cpu::STATE_RUNNING) || (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
+        return;
+
+    stdlib::AutoLock lock(performance_lock());
+    ulong& holds = latency_holds[cpu];
+    ulong was = holds;
+    if (hold)
+        holds++;
+    else if (holds != 0)
+        holds--;
+    if ((was == 0) == (holds == 0) || performance_holds[cpu] != 0)
+        return;
+    CpuHold set{false, 0, holds != 0};
+    kernel::IPITask task(set_hold_here, &set);
     target.queue_ipi_task(task);
 }
 
