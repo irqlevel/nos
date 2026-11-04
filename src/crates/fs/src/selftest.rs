@@ -535,6 +535,83 @@ fn image_file(vfs: &'static Vfs, path: &str, report: &mut Reporter) -> bool {
     true
 }
 
+/* ---- a disk's image, written from one end ---- */
+
+/// What `image_ahead` writes through an image: a megabyte, a piece at a time
+/// from its start, in chunks of four blocks -- 16 KiB of 4 KiB blocks, 4 KiB
+/// of 1 KiB ones -- so that its growths go on one from another and the
+/// image is grown ahead of its writes by its own task (`image::Ahead`).
+const AHEAD_SIZE: usize = 1 << 20;
+const AHEAD_PIECE: usize = 16 * 1024;
+const AHEAD_CHUNK: u64 = 4;
+
+/// A guest writing its disk from one end: a file of holes written through
+/// its image a piece at a time from its start, each piece read back as it
+/// goes and the whole through the VFS once the image is let go of -- and,
+/// where its filesystem gives blocks ahead of writes, the image grown ahead
+/// of them by its own task at least once.
+fn image_ahead(vfs: &'static Vfs, base: &Path, report: &mut Reporter) -> bool {
+    let Some(file) = Path::join(base.as_str(), "ahead.bin") else {
+        report.say(base.as_str(), "path too long");
+        return false;
+    };
+    let path = file.as_str();
+    /* A filesystem that holds a file of holes at no cost but what is
+     * written: where one does not, it gives no image blocks ahead either */
+    if vfs.sparse_max(path.as_bytes()) < AHEAD_SIZE {
+        klog!(0, "fstest: {}: no sparse file that big here, the image written from one end skipped", path);
+        return true;
+    }
+    let (Some(mut piece), Some(mut got), Some(mut rbuf)) = (buffer(AHEAD_PIECE), buffer(AHEAD_PIECE), buffer(READ_CHUNK))
+    else {
+        report.say(path, "no memory for the image's buffers");
+        return false;
+    };
+    if !vfs.write_file(path.as_bytes(), b"") || !vfs.truncate(path.as_bytes(), AHEAD_SIZE) {
+        report.say(path, "the image's file could not be made");
+        return false;
+    }
+    let Some(mut image) = Image::open(vfs, path.as_bytes(), true) else {
+        report.say(path, "the file could not be held as an image");
+        return false;
+    };
+    image.set_chunk(AHEAD_CHUNK);
+    let allocates = vfs.allocates(image.handle());
+    for at in (0..AHEAD_SIZE).step_by(AHEAD_PIECE) {
+        fill(&mut piece, AHEAD_PIECE, at, SALT);
+        if !image.write_at(at as u64, &piece) || !image.read_at(at as u64, &mut got) || got != piece {
+            report.say(path, "a write from one end of the image failed, or reads back wrong");
+            return false;
+        }
+    }
+    if !image.sync() {
+        report.say(path, "the image's sync failed");
+        return false;
+    }
+    let (aheads, _) = image.grown_ahead();
+    if allocates && aheads == 0 {
+        report.say(path, "an image written from one end was never grown ahead of its writes");
+        return false;
+    }
+    /* Written over from one end again, every block the file's now: nothing
+     * to grow, and nothing grown -- a growth asked over blocks the file has
+     * cost a guest's writes over its disk two thirds of their speed (round
+     * 23 on the EX44) */
+    for at in (0..AHEAD_SIZE).step_by(AHEAD_PIECE) {
+        fill(&mut piece, AHEAD_PIECE, at, SALT);
+        if !image.write_at(at as u64, &piece) {
+            report.say(path, "a write over the image from one end failed");
+            return false;
+        }
+    }
+    if !image.sync() || image.grown_ahead().0 != aheads {
+        report.say(path, "an image written over from one end was grown ahead of its writes, or did not sync");
+        return false;
+    }
+    drop(image);
+    verify(vfs, path, &mut rbuf, AHEAD_SIZE, None, report, "after its image wrote it from one end")
+}
+
 /* ---- two mounts at once ---- */
 
 /// How long the gate holds a call before letting it go of itself: what ends
@@ -941,6 +1018,10 @@ fn body(vfs: &'static Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path
     }
 
     if !image_file(vfs, image.as_str(), report) {
+        return false;
+    }
+
+    if !image_ahead(vfs, base, report) {
         return false;
     }
 

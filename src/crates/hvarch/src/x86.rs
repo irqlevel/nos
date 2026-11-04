@@ -1,6 +1,7 @@
 //! x86-64: AMD-V and Intel VT-x behind one set of names.
 
 pub mod cpu;
+pub mod fast;
 pub mod fp;
 pub mod kick;
 pub mod msrs;

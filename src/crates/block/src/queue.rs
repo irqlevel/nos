@@ -122,6 +122,15 @@ pub fn wait(entry: usize, timeout: Duration) -> bool {
     }
 }
 
+/// `wait`'s signal looked for for up to `poll`, spinning rather than
+/// sleeping -- the owner's call, before its `wait`: whether one came.
+pub fn poll(entry: usize, poll: Duration) -> bool {
+    match DONE.get(entry).and_then(OnceBox::get) {
+        Some(done) => done.event.poll(poll),
+        None => false,
+    }
+}
+
 pub struct Queue {
     /// The disk its I/O goes to; None for a queue that has only buffers.
     disk: Option<Disk>,

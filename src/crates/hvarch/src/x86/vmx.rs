@@ -112,6 +112,19 @@ impl HostState {
     }
 }
 
+/// RFLAGS.TF: a guest single-stepping, whose #DB after an instruction the
+/// fast path leaves to the run loop.
+const RFLAGS_TF: u64 = 1 << 8;
+
+/// RFLAGS.IF: a guest's HLT with it clear waits for nothing but an NMI or
+/// INIT, which the fast path leaves to the run loop.
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// The guest interrupt status's RVI, the highest vector waiting in the
+/// virtual APIC: a HLT with one there is the run loop's to step past and
+/// enter for it, not the fast path's to spin over.
+const GUEST_INTR_STATUS_RVI: u64 = 0xFF;
+
 /// Write-back: the only memory type a VMXON region or a VMCS may be in.
 const MEM_TYPE_WB: u64 = 6;
 
@@ -426,6 +439,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use kcore::consts::MAX_CPUS;
 
+use super::fast::FastExit;
 use super::fp::GuestFp;
 use super::msrs::GuestMsrs;
 use super::svm::{GuestRegs, Kick, NotRun, Profile, Run, VECTOR_AC, VECTOR_DB, VECTOR_MC};
@@ -923,6 +937,9 @@ pub struct Guest {
     /// rather than `vmlaunch`es: set after a successful entry, cleared with
     /// the VMCS itself (a migration, a drop, or a VMfail).
     launched: AtomicBool,
+    /// Exits answered inside the entry and entered again past at once
+    /// (`super::fast`), since the guest was made.
+    answered: u64,
     /// The VMCS has been `vmclear`ed at least once. A freshly made VMCS is
     /// plain memory whose launch state is undefined, and `vmlaunch` needs it
     /// "clear"; the first entry `vmclear`s it (once VMX is known on -- a VM is
@@ -1065,6 +1082,7 @@ impl Guest {
             flush_vpid: false,
             loaded_cpu: AtomicI32::new(-1),
             launched: AtomicBool::new(false),
+            answered: 0,
             cleared: false,
             synced: Synced::default(),
             full_sync: true,
@@ -1107,6 +1125,12 @@ impl Guest {
     /// Its last entry's world switch, where it was timed ([`Run`]).
     pub fn last_run(&self) -> Run {
         self.last_run
+    }
+
+    /// Exits answered inside the entry and entered again past at once
+    /// (`super::fast`), since the guest was made.
+    pub fn answered(&self) -> u64 {
+        self.answered
     }
 
     /// The host's interrupt its last exit was for, as the exit acknowledged
@@ -2194,6 +2218,7 @@ impl Guest {
         nested: super::svm::Nested,
         host_areas: &[AtomicU64],
         kick: Option<&Kick>,
+        mut fast: Option<&mut dyn FastExit>,
     ) -> core::result::Result<u32, NotRun> {
         let vmcs_phys = self.vmcs.phys();
 
@@ -2240,7 +2265,7 @@ impl Guest {
                 if loaded >= 0 && loaded as u32 != cpu {
                     return None;
                 }
-                Some(unsafe { self.enter(entries, cpu, nested, host_areas, kick) })
+                Some(unsafe { self.enter(entries, cpu, nested, host_areas, kick, fast.as_deref_mut()) })
             });
             /* The host's interrupt an exit acknowledged, handed to its handler
              * now that the CPU's entries are let go of: its handler may
@@ -2273,6 +2298,7 @@ impl Guest {
         nested: super::svm::Nested,
         host_areas: &[AtomicU64],
         kick: Option<&Kick>,
+        fast: Option<&mut (dyn FastExit + '_)>,
     ) -> core::result::Result<u32, NotRun> {
         let vmcs_phys = self.vmcs.phys();
         let timed = super::svm::timed(self.profile.is_some());
@@ -2481,25 +2507,93 @@ impl Guest {
             r8: self.regs.r8, r9: self.regs.r9, r10: self.regs.r10, r11: self.regs.r11,
             r12: self.regs.r12, r13: self.regs.r13, r14: self.regs.r14, r15: self.regs.r15,
         };
-        let resume = self.launched.load(Ordering::Acquire);
         /* What the world switch is to do for this CPU's speculation, at
          * the last moment: its L1 data cache flushed now, where L1TF can
          * read it; VERW in the stub, just before the entry; and legacy
          * IBRS written again just after the exit (`super::spec`). */
         let spec_ctrl = speculation.spec_ctrl();
-        let flags = if resume { RUN_RESUME } else { 0 }
-            | if speculation.verw() { RUN_VERW } else { 0 }
-            | if spec_ctrl.is_some() { RUN_SPEC_CTRL } else { 0 };
-        let t3 = stamp(timed);
-        /* Its IA32_SPEC_CTRL over the host's, put back after the exit --
-         * by the stub itself for legacy IBRS (`super::spec`). */
-        let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
-        self.msrs.ran(ran_with);
-        speculation.flush_l1d();
-        let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
-        entries.spec.exited(spec_ctrl.is_some());
-        let t4 = stamp(timed);
-        self.last_run.next(timed, t3, t4);
+        /* Entered again at once after each exit `fast` answers (`super::fast`),
+         * all of it still with interrupts off and the guest's registers the
+         * CPU's: what the loop leaves out is what an exit does past the
+         * world switch, and what the run loop does after that. A kick that
+         * came meanwhile ends it as a kick's refusal of an entry would, the
+         * write answered. */
+        let mut fast = fast;
+        let mut kicked = false;
+        let (failed, t3, t4) = loop {
+            let resume = self.launched.load(Ordering::Acquire);
+            let flags = if resume { RUN_RESUME } else { 0 }
+                | if speculation.verw() { RUN_VERW } else { 0 }
+                | if spec_ctrl.is_some() { RUN_SPEC_CTRL } else { 0 };
+            let t3 = stamp(timed);
+            /* Its IA32_SPEC_CTRL over the host's, put back after the exit --
+             * by the stub itself for legacy IBRS (`super::spec`). */
+            let ran_with = entries.spec.load_guest(self.msrs.spec_ctrl());
+            self.msrs.ran(ran_with);
+            speculation.flush_l1d();
+            let failed = unsafe { vmx_launch_stub(&mut gpr, flags, spec_ctrl.unwrap_or(0)) };
+            entries.spec.exited(spec_ctrl.is_some());
+            let t4 = stamp(timed);
+            if failed != 0 {
+                break (failed, t3, t4);
+            }
+            self.launched.store(true, Ordering::Release);
+            let Some(f) = fast.as_deref_mut() else { break (0, t3, t4) };
+            /* A WRMSR, past which nothing is owed; or a HLT with interrupts
+             * on and nothing waiting in the virtual APIC, where posted
+             * interrupts are what can end it here. Neither under
+             * single-step, whose #DB after the instruction is the run loop's
+             * to give, and the HLT not with a window asked for, which means
+             * the run loop has something waiting to inject. */
+            let reason = unsafe { vmcs::vmread(vmcs::EXIT_REASON) } as u32;
+            let rflags = unsafe { vmcs::vmread(vmcs::GUEST_RFLAGS) };
+            if rflags & RFLAGS_TF != 0 {
+                break (0, t3, t4);
+            }
+            let rip = unsafe { vmcs::vmread(vmcs::GUEST_RIP) };
+            let mut ran = self.last_run;
+            ran.next(timed, t3, t4);
+            let answered = match reason {
+                vmcs::reason::WRMSR => {
+                    let value = ((gpr.rdx & 0xFFFF_FFFF) << 32) | (gpr.rax & 0xFFFF_FFFF);
+                    f.wrmsr(gpr.rcx as u32, value, rip, ran)
+                }
+                vmcs::reason::HLT => {
+                    rflags & RFLAGS_IF != 0 && self.apicv_on && self.posted.is_some() && !self.irq_window
+                        && !self.nmi_window
+                        && unsafe { vmcs::vmread(vmcs::GUEST_INTR_STATUS) } & GUEST_INTR_STATUS_RVI == 0
+                        && f.hlt(rip, ran)
+                }
+                _ => false,
+            };
+            if !answered {
+                break (0, t3, t4);
+            }
+            self.last_run = ran;
+            self.answered += 1;
+            /* Past it, and out of the shadow of a STI or MOV SS it was in,
+             * as `hv`'s step past an instruction is -- in the VMCS itself,
+             * which the guest is entered from again without the software
+             * copy being written back (`write_guest_state`). */
+            unsafe {
+                let len = vmcs::vmread(vmcs::VMEXIT_INSTRUCTION_LEN);
+                vmcs::vmwrite(vmcs::GUEST_RIP, rip.wrapping_add(len));
+                let shadows = u64::from(vmcs::INTR_BLOCK_STI | vmcs::INTR_BLOCK_MOV_SS);
+                let bits = vmcs::vmread(vmcs::GUEST_INTERRUPTIBILITY);
+                if bits & shadows != 0 {
+                    vmcs::vmwrite(vmcs::GUEST_INTERRUPTIBILITY, bits & !shadows);
+                }
+            }
+            if let Some(k) = kick {
+                if !k.entering(cpu) {
+                    kicked = true;
+                    break (0, t3, t4);
+                }
+            }
+        };
+        if !kicked {
+            self.last_run.next(timed, t3, t4);
+        }
 
         self.save.cr2 = cpu::read_cr2();
         unsafe { cpu::write_cr2(host_cr2) };
@@ -2518,6 +2612,16 @@ impl Guest {
             r12: gpr.r12, r13: gpr.r13, r14: gpr.r14, r15: gpr.r15,
         };
 
+        if kicked {
+            /* An exit answered, the next entry refused by a kick: the guest
+             * as the VMCS has it now -- past the write, its FS and GS bases
+             * read as after any WRMSR -- and no exit for the run loop. */
+            self.entry_failed = false;
+            self.exit_reason = vmcs::reason::WRMSR;
+            unsafe { self.read_guest_state() };
+            self.read_stored_kernel_gs_base();
+            return Err(NotRun::Kicked { cpu });
+        }
         if failed != 0 {
             /* VMLAUNCH/VMRESUME did not start entry (VMfail): the guest
              * state is as it was, and the error says why. VMCLEAR the VMCS
@@ -2531,8 +2635,8 @@ impl Guest {
             now_unloaded(&self.loaded_cpu, &self.launched);
         } else {
             self.entry_failed = false;
-            /* The VMCS is launched now: the next entry here resumes it. */
-            self.launched.store(true, Ordering::Release);
+            /* The VMCS is launched now -- stored as the stub returned -- and
+             * the next entry here resumes it. */
             unsafe { self.read_exit() };
             unsafe { self.read_guest_state() };
             self.read_stored_kernel_gs_base();

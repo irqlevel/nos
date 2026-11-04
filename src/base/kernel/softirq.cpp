@@ -47,7 +47,8 @@ bool SoftIrq::init()
             return false;
         }
 
-        task->set_cpu_affinity(1UL << i);
+        /* Its CPU's softirqs: on that CPU alone, for good */
+        task->pin_to_cpu(i);
         if (!task->start(&SoftIrq::task_func, &cpu_states_[i]))
         {
             task->put();

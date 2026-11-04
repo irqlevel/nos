@@ -617,6 +617,17 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     if n == 0 || placement.len() != n {
         return Err(String::from("the guest's CPUs and their places do not match"));
     }
+    /* Every CPU the guest runs on held at the performance preference for as
+     * long as it does: a guest's CPUs idle between its ticks, and with the
+     * boot's preference their clock dropped in each idle and climbed back at
+     * each wake -- the first microseconds after it five to ten times slower
+     * on the EX44, cyclictest's 66 us on average against 6 with the
+     * preference at performance (round 14). Let go of as this returns. */
+    let mut held = Vec::new();
+    held.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
+    for &host_cpu in placement {
+        held.push(kcore::cpu::Performance::hold(host_cpu));
+    }
     let mut slots = Vec::new();
     slots.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
     slots.resize(n, Counts::default());
@@ -779,10 +790,16 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         if counts.len() > 1 { " (of each CPU's, on average)" } else { "" }, total.polls, total.polled);
     /* What an exit costs the host past the world switch: its handling, and
      * the look at what is waiting before the next entry. */
-    let exits = total.exits.max(1);
+    /* Of the exits the loop saw: those answered in the world switch's own
+     * loop had none of its handling. */
+    let exits = total.exits.saturating_sub(total.answered + total.hlt_answered).max(1);
+    let msr_writes = total.msr_write.saturating_sub(total.answered).max(1);
     let _ = writeln!(out, "  loop       {} ns an exit handled and {} ns to the next entry, on average; {} ns a write of an MSR's \
-                           handling; {} entries made without the loop's round",
-        total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / total.msr_write.max(1), total.fast);
+                           handling; {} entries made without the loop's round; {} writes of the ICR or the TSC deadline \
+                           answered in the world switch's own loop, the guest entered again from there, and {} HLTs \
+                           ended there by an interrupt posted meanwhile",
+        total.handled_ns / exits, total.to_entry_ns / exits, total.msr_write_ns / msr_writes, total.fast,
+        total.answered, total.hlt_answered);
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
@@ -824,6 +841,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if posted != 0 {
         let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification sent to the CPU it ran on",
             posted, notified);
+    }
+    let served = guest.served_msis();
+    if served != 0 {
+        let _ = writeln!(out, "  served     {} MSIs its disks' tasks sent as they served, from outside every CPU -- no CPU woken or taken out of its guest to hand a completion over",
+            served);
     }
     if total.vid != 0 {
         let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",

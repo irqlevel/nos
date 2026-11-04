@@ -166,8 +166,6 @@ bool setup_cpu_performance(CpuPerformance* out)
     static const u32 REQ_MAX_SHIFT = 8;
     static const u32 REQ_DESIRED_SHIFT = 16;
     static const u32 REQ_EPP_SHIFT = 24;
-    /* intel_pstate's default preference, "balance_performance". */
-    static const u64 EPP_BALANCE_PERFORMANCE = 0x80;
 
     *out = CpuPerformance{};
     if (kernel::Parameters::get_instance().is_hwp_off())
@@ -203,16 +201,19 @@ bool setup_cpu_performance(CpuPerformance* out)
     u64 request = read_msr(HWP_REQUEST_MSR);
     request &= ~((FIELD_MASK << REQ_MIN_SHIFT) | (FIELD_MASK << REQ_MAX_SHIFT) | (FIELD_MASK << REQ_DESIRED_SHIFT));
     request |= (lowest << REQ_MIN_SHIFT) | (highest << REQ_MAX_SHIFT);
+    /* The preference hwp_epp= says, intel_pstate's balance_performance
+       (0x80) unless told */
     if (power & POWER_EAX_HWP_EPP)
     {
         request &= ~(FIELD_MASK << REQ_EPP_SHIFT);
-        request |= EPP_BALANCE_PERFORMANCE << REQ_EPP_SHIFT;
+        request |= ((u64)kernel::Parameters::get_instance().get_hwp_epp() & FIELD_MASK) << REQ_EPP_SHIFT;
     }
     write_msr(HWP_REQUEST_MSR, request);
 
     out->lowest = (u32)lowest;
     out->guaranteed = (u32)guaranteed;
     out->highest = (u32)highest;
+    out->epp = (power & POWER_EAX_HWP_EPP) ? (u32)((request >> REQ_EPP_SHIFT) & FIELD_MASK) : 0;
     return true;
 }
 
@@ -221,10 +222,12 @@ bool setup_cpu_performance(CpuPerformance* out)
    after. The line MONITOR arms is one nothing writes: an interrupt is what
    wakes an idle CPU here, as from a HLT. */
 static u32 idle_mwait_hint;
+static u32 idle_mwait_mid_hint;
+static bool idle_mwait_mid_on;
 static bool idle_mwait_on;
 static u64 idle_monitor_line[8] __attribute__((aligned(64)));
 
-bool setup_idle(u32* hint)
+bool setup_idle(u32* hint, u32* mid)
 {
     static const u32 LEAF_BASIC = 0;
     static const u32 LEAF_FEATURES = 1;
@@ -243,8 +246,11 @@ bool setup_idle(u32* hint)
     static const u32 MWAIT_STATES = 8;
     static const u32 MWAIT_STATE_BITS = 4;
     static const u32 MWAIT_STATE_MASK = 0xF;
+    /* MWAIT's C3, whose hint is 0x20: a core's C6 on Intel's parts */
+    static const u32 MWAIT_MID_STATE = 3;
 
     *hint = 0;
+    *mid = 0;
     if (!kernel::Parameters::get_instance().is_idle_mwait())
         return false;
     if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
@@ -267,6 +273,15 @@ bool setup_idle(u32* hint)
             idle_mwait_hint = ((n - 1) << MWAIT_STATE_BITS) | (subs - 1);
             idle_mwait_on = true;
             *hint = idle_mwait_hint;
+            /* The state between, where it is offered and is not the
+               deepest: its first sub-state */
+            u32 mid_subs = (states >> (MWAIT_MID_STATE * MWAIT_STATE_BITS)) & MWAIT_STATE_MASK;
+            if (n > MWAIT_MID_STATE && mid_subs != 0)
+            {
+                idle_mwait_mid_hint = (MWAIT_MID_STATE - 1) << MWAIT_STATE_BITS;
+                idle_mwait_mid_on = true;
+                *mid = idle_mwait_mid_hint;
+            }
             return true;
         }
     }
@@ -278,14 +293,118 @@ bool idle_masked()
     return idle_mwait_on;
 }
 
-void cpu_idle_masked(bool deep)
+bool set_cpu_epp(u32 epp)
+{
+    static const u32 LEAF_BASIC = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_EAX_HWP = 1U << 7;
+    static const u32 POWER_EAX_HWP_EPP = 1U << 10;
+    static const u32 PM_ENABLE_MSR = 0x770;
+    static const u64 PM_ENABLE_HWP = 1ULL << 0;
+    static const u32 HWP_REQUEST_MSR = 0x774;
+    static const u64 FIELD_MASK = 0xFF;
+    static const u32 REQ_EPP_SHIFT = 24;
+
+    /* Only where setup_cpu_performance put HWP in charge: every HWP MSR but
+       IA32_PM_ENABLE is out of bounds until HWP is on (SDM 15.4.2) */
+    if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    u32 power = cpuid(LEAF_POWER).eax;
+    if ((power & (POWER_EAX_HWP | POWER_EAX_HWP_EPP)) != (POWER_EAX_HWP | POWER_EAX_HWP_EPP))
+        return false;
+    if (!(read_msr(PM_ENABLE_MSR) & PM_ENABLE_HWP))
+        return false;
+    u64 request = read_msr(HWP_REQUEST_MSR);
+    request &= ~(FIELD_MASK << REQ_EPP_SHIFT);
+    request |= ((u64)epp & FIELD_MASK) << REQ_EPP_SHIFT;
+    write_msr(HWP_REQUEST_MSR, request);
+    return true;
+}
+
+bool read_clock_counters(ClockCounters* out)
+{
+    static const u32 LEAF_BASIC = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_ECX_APERF_MPERF = 1U << 0;
+    static const u32 MPERF_MSR = 0xE7;
+    static const u32 APERF_MSR = 0xE8;
+
+    *out = ClockCounters{};
+    if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    if (!(cpuid(LEAF_POWER).ecx & POWER_ECX_APERF_MPERF))
+        return false;
+    /* MPERF and APERF first, the TSC last and beside them: what the window
+       divides by is never narrower than what it divides */
+    out->mperf = read_msr(MPERF_MSR);
+    out->aperf = read_msr(APERF_MSR);
+    out->tsc = read_tsc();
+    return true;
+}
+
+bool setup_cpu_c1e(bool* was_on, bool* on)
+{
+    static const u32 LEAF_VENDOR = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_EAX_HWP = 1U << 7;
+    /* "GenuineIntel", as EBX, EDX and ECX give it */
+    static const u32 INTEL_EBX = 0x756E6547;
+    static const u32 INTEL_EDX = 0x49656E69;
+    static const u32 INTEL_ECX = 0x6C65746E;
+    /* MSR_POWER_CTL, every Intel core since Nehalem's; bit 1 lets the CPU
+       turn a C1 request into C1E (SDM vol. 4) */
+    static const u32 POWER_CTL_MSR = 0x1FC;
+    static const u64 POWER_CTL_C1E = 1ULL << 1;
+
+    *was_on = false;
+    *on = false;
+    /* Only where nos idles by MWAIT -- what setup_idle decided, on the BSP
+       before any AP -- and so on bare metal: a C1 it asks for is a C1 it
+       means. HWP stands for "a part with the MSR": every Intel CPU with
+       HWP has it, and one without is no part nos runs on. */
+    if (!idle_mwait_on)
+        return false;
+    CpuidResult vendor = cpuid(LEAF_VENDOR);
+    if (vendor.ebx != INTEL_EBX || vendor.edx != INTEL_EDX || vendor.ecx != INTEL_ECX || vendor.eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    if (!(cpuid(LEAF_POWER).eax & POWER_EAX_HWP))
+        return false;
+
+    u64 ctl = read_msr(POWER_CTL_MSR);
+    *was_on = (ctl & POWER_CTL_C1E) != 0;
+    if (*was_on && !kernel::Parameters::get_instance().is_c1e_firmware())
+    {
+        write_msr(POWER_CTL_MSR, ctl & ~POWER_CTL_C1E);
+        ctl = read_msr(POWER_CTL_MSR);
+    }
+    *on = (ctl & POWER_CTL_C1E) != 0;
+    return true;
+}
+
+void cpu_idle_masked(IdleDepth depth)
 {
     /* ECX bit 0: an interrupt ends the MWAIT though interrupts are off --
        one already pending ends it at once -- and is taken once they are on
        again. C1 is hint 0, as a HLT. */
     static const ulong MWAIT_INTERRUPT_BREAK = 1;
     static const ulong MWAIT_C1 = 0;
-    ulong hint = (deep && idle_mwait_on) ? (ulong)idle_mwait_hint : MWAIT_C1;
+    ulong hint = MWAIT_C1;
+    if (depth == IdleDepth::Deep && idle_mwait_on)
+        hint = idle_mwait_hint;
+    else if (depth == IdleDepth::Mid && idle_mwait_mid_on)
+        hint = idle_mwait_mid_hint;
     asm volatile("monitor" : : "a"(idle_monitor_line), "c"(0UL), "d"(0UL) : "memory");
     asm volatile("mwait" : : "a"(hint), "c"(MWAIT_INTERRUPT_BREAK) : "memory");
 }

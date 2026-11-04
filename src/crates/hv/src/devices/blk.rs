@@ -200,6 +200,14 @@ const QUEUE_SIZE: u16 = 256;
 /// for good (hv-fuzz's racing CPU). What is left is the next round's.
 const PASS: usize = QUEUE_SIZE as usize;
 
+/// How many requests with the backend let the device leave its driver
+/// unasked for a kick, the ring looked at again as each comes back
+/// (`Blk::fill`): at a disk's 38 us for a 4k read, eight out bring one back
+/// every 5 us at most, the longest a request added meanwhile waits on the
+/// ring. Below it -- a job at QD1 to QD4 -- every request is a kick, as
+/// without.
+const KICKLESS_OUT: usize = 8;
+
 /// Features: a limit on a segment's size and on the segments a request may
 /// have, flush, a disk that is read-only, and -- one that is not -- discard
 /// and a write of zeros; and the ring's EVENT_IDX, the device asking for a
@@ -327,6 +335,11 @@ pub struct Blk {
     /// A chain may be waiting on the ring for a slot: the device looks again
     /// when a buffer comes back.
     waiting: bool,
+    /// The ring was found empty with KICKLESS_OUT requests or more with the
+    /// backend, and no kick asked for: the device looks at the ring again at
+    /// every request that comes back instead (`poll`), until it finds fewer
+    /// out and asks for one.
+    kickless: bool,
     /// A pass ended at its bound, with chains perhaps still on the ring, or
     /// requests the backend served still with it: the next round goes on
     /// with them.
@@ -368,6 +381,7 @@ impl Blk {
             backend,
             slots,
             waiting: false,
+            kickless: false,
             more: false,
             moved: 0,
             id: name,
@@ -391,6 +405,11 @@ impl Blk {
     /// Its size, in sectors.
     pub fn sectors(&self) -> u64 {
         self.backend.size() / SECTOR
+    }
+
+    /// Its number among its guest's disks, vda 0.
+    pub fn index(&self) -> u8 {
+        self.index
     }
 
     /// What was wrong with the ring, if the device stopped over one.
@@ -482,6 +501,7 @@ impl Blk {
                     s.head = None;
                 }
                 self.waiting = false;
+                self.kickless = false;
                 self.more = false;
                 self.broken = None;
                 Raise::default()
@@ -516,7 +536,7 @@ impl Blk {
         if cut {
             self.stats.cut += 1;
             self.more = true;
-        } else if self.more || (back && self.waiting) {
+        } else if self.more || (back && (self.waiting || self.kickless)) {
             answered |= self.fill(mem);
         }
         if answered { self.interrupt(mem) } else { Raise::default() }
@@ -539,6 +559,7 @@ impl Blk {
     /// True when something was given back.
     fn fill(&mut self, mem: &GuestMemory) -> bool {
         self.waiting = false;
+        self.kickless = false;
         self.more = false;
         let mut answered = false;
         let mut left = PASS;
@@ -566,8 +587,21 @@ impl Blk {
                 Ok(Some(head)) => self.start(mem, slot, head, &segs),
                 Ok(None) => {
                     self.slots[slot].segs = segs;
-                    /* Every chain there was taken: a kick asked for the
-                     * next, and what came before the ask taken now. */
+                    /* Every chain there was taken. With KICKLESS_OUT or more
+                     * requests out, one comes back soon, and the ring is
+                     * looked at again then (`poll`): no kick asked for, so
+                     * that a driver keeping its disk busy adds requests
+                     * without leaving its guest for each -- the notify, an
+                     * exit of 2.8 us of the host's on the EX44, was 41% of
+                     * the job's CPU at QD32 (round 13). With fewer, a kick
+                     * asked for the next, and what came before the ask
+                     * taken now. */
+                    if self.slots.iter().filter(|s| s.out).count() >= KICKLESS_OUT
+                        && self.transport.queue(0).is_some_and(|q| q.event_idx())
+                    {
+                        self.kickless = true;
+                        break;
+                    }
                     match self.transport.queue(0).ok_or(Broken::Index).and_then(|q| q.ask_kick(mem)) {
                         Ok(true) => continue,
                         Ok(false) => break,

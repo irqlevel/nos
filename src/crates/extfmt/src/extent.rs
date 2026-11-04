@@ -183,6 +183,92 @@ pub fn map_extent(root: &[u8], lblock: u64, fs_blocks: u64, block_size: usize, i
     walk(root, lblock, fs_blocks, block_size, ino, read, true)
 }
 
+/// `map_extent` of every run from `lblock` up to `end` that the leaf
+/// holding `lblock` maps, onto `out` in order -- each as `map_extent` gives
+/// it, but for a run cut at `end` -- with one walk down the tree for all of
+/// them, where `map_extent` a run reads every node on the way again: a map
+/// of a file of many extents in its tree's leaves' worth of walks. Where
+/// the runs pushed end: `end`, or where the leaf's part of the file does,
+/// from which a call goes on. A leaf whose extents are not in order, or
+/// overlap, is refused: `map_extent` of each block alone would be the
+/// first extent's that holds it, which this does not look for.
+pub fn leaf_runs(root: &[u8], lblock: u64, end: u64, fs_blocks: u64, block_size: usize, ino: u32,
+                 read: &mut ReadBlock, out: &mut Vec<(Map, bool)>) -> Result<u64, String> {
+    if lblock >= end {
+        return Ok(lblock);
+    }
+    let mut node: Vec<u8> = root.to_vec();
+    let mut limit = u64::MAX;
+    let mut depth_wanted: Option<u16> = None;
+    loop {
+        let h = header(&node).map_err(|e| alloc::format!("inode {}: {}", ino, e))?;
+        if depth_wanted.is_some_and(|d| d != h.depth) {
+            return Err(alloc::format!("inode {}: an extent node of depth {} where {} belongs", ino, h.depth,
+                                      depth_wanted.unwrap_or(0)));
+        }
+        let entries = usize::from(h.entries);
+        if h.depth == 0 {
+            /* The descent left `limit` past `lblock`: below it, the index
+             * entry it took starts at or before it, and the next after. */
+            let stop = end.min(limit);
+            let mut at = lblock;
+            let mut prev_end = 0u64;
+            for i in 0..entries {
+                let e = leaf(&node, i);
+                let (first, len) = (u64::from(e.first), u64::from(e.len));
+                if first < prev_end {
+                    return Err(alloc::format!("inode {}: extents out of order at file block {}", ino, first));
+                }
+                prev_end = first + len;
+                if at >= stop || prev_end <= at {
+                    continue;
+                }
+                if at < first {
+                    let run = (first - at).min(stop - at);
+                    out.push((Map::Hole { run }, false));
+                    at += run;
+                    if at >= stop {
+                        continue;
+                    }
+                }
+                let run = (len - (at - first)).min(stop - at);
+                let block = e.start + (at - first);
+                if block.checked_add(run).is_none_or(|x| x > fs_blocks) {
+                    return Err(alloc::format!("inode {}: an extent at block {} past the filesystem", ino, e.start));
+                }
+                out.push((Map::Blocks { block, run }, e.unwritten));
+                at += run;
+            }
+            if at < stop {
+                /* Past the leaf's last extent: a hole, to where its part
+                 * of the file ends. */
+                out.push((Map::Hole { run: stop - at }, false));
+                at = stop;
+            }
+            return Ok(at);
+        }
+        /* The last index entry starting at or before the block. */
+        let mut child = None;
+        for i in 0..entries {
+            let e = index(&node, i);
+            if u64::from(e.first) > lblock {
+                limit = limit.min(u64::from(e.first));
+                break;
+            }
+            child = Some(e.child);
+        }
+        let Some(child) = child else {
+            let run = limit.min(end) - lblock;
+            out.push((Map::Hole { run }, false));
+            return Ok(lblock + run);
+        };
+        let mut next = vec![0u8; block_size];
+        read(child, &mut next)?;
+        node = next;
+        depth_wanted = Some(h.depth - 1);
+    }
+}
+
 /// The walk `map` and `map_extent` share: an unwritten run held inside the
 /// filesystem only with `unwritten_held`, as `map` reads one as zeros
 /// whatever blocks it names.

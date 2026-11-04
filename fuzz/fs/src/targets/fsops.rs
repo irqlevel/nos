@@ -1002,6 +1002,13 @@ impl Fs {
     fn image_map_held(&mut self, i: usize) {
         let Some(image) = self.images.get_mut(i) else { return };
         let ok = image.map_is_the_filesystems();
+        let (aheads, waits) = image.grown_ahead();
+        if aheads > 0 {
+            reached("an image grown ahead of its writes by its own task");
+        }
+        if waits > 0 {
+            reached("a write into a hole that waited for the image's growth ahead");
+        }
         self.check(ok, format_args!("image {}'s map is not its filesystem's", i));
     }
 
@@ -1922,6 +1929,29 @@ fn step_once(f: &mut Fs, r: &mut Input, block: u64) {
                 10 => {
                     let at = if r.bool() { 0 } else { offset(r, size, block, f.model.limits.span) };
                     f.image_extent(i, at);
+                }
+                6 if r.chance(4) => {
+                    /* A guest writing its disk on from one end: batches of
+                     * whole blocks through the image's queue, each going on
+                     * where the last ended -- what has an image grown ahead
+                     * of its writes by its own task, and a write meet that
+                     * growth still under way. */
+                    let mut at = offset(r, size, block, f.model.limits.span) / 4096 * 4096;
+                    for _ in 0..r.range(2, 6) {
+                        let mut reqs = Vec::new();
+                        for _ in 0..r.range(1, 8) {
+                            let len = 4096 * r.range(1, QUEUE_PAGES as u64);
+                            if at.saturating_add(len) > size {
+                                break;
+                            }
+                            reqs.push(QueueReq::Write(at, crate::input::noise(r.u32(), len as usize)));
+                            at += len;
+                        }
+                        if reqs.is_empty() {
+                            break;
+                        }
+                        f.image_queue_batch(i, &reqs, false);
+                    }
                 }
                 7 if r.chance(128) => {
                     /* A guest's disk's requests through the image's queue */

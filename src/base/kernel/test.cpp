@@ -4155,6 +4155,241 @@ bool test_wake_storm()
     return ok;
 }
 
+/* ---- affinity changed under a task (set_task_affinity) ---- */
+
+/* How long a move may take before it is a failure -- a spinner's is the
+   IPI and the decision it ends in, a sleeper's its next wakeup, a
+   millisecond -- and how long the task is watched staying where it went */
+static const ulong AFFINITY_MOVE_NS = 100 * consts::NANO_SECS_IN_MS;
+static const ulong AFFINITY_STAY_NS = 20 * consts::NANO_SECS_IN_MS;
+
+struct AffinityProbe
+{
+    /* The CPU the task last found itself on, plus one: 0 before it ran */
+    Atomic cpu;
+    Atomic stop;
+    /* A CPU watched, plus one -- 0 for none -- and how many of the task's
+       looks found it there: what a sleeper did on the CPU it was taken off */
+    Atomic watched;
+    Atomic looks_there;
+    /* Sleeps a millisecond between its looks, where the other spins */
+    bool sleeps;
+};
+
+static void affinity_task_func(void* ctx)
+{
+    auto* p = static_cast<AffinityProbe*>(ctx);
+    while (p->stop.get() == 0)
+    {
+        long cpu = (long)CpuTable::get_instance().get_current_cpu_id();
+        p->cpu.set(cpu + 1);
+        if (p->watched.get() == cpu + 1)
+            p->looks_there.inc();
+        if (p->sleeps)
+            sleep(consts::NANO_SECS_IN_MS);
+        else
+            cpu_relax();
+    }
+}
+
+/* Until the task has been seen on `cpu` and is on its queue, or `ns`: when,
+   in ns from `from`, or ~0 */
+static ulong affinity_wait_on(Task* task, AffinityProbe* p, ulong cpu, ulong from, ulong ns)
+{
+    for (;;)
+    {
+        ulong now = get_boot_time().get_value();
+        ulong home = MAX_CPUS;
+        if ((ulong)p->cpu.get() == cpu + 1 && task_home_cpu(task, home) && home == cpu)
+            return now - from;
+        if (now - from > ns)
+            return ~0UL;
+        sleep(consts::NANO_SECS_IN_MS / 10);
+    }
+}
+
+/* A spinning task and a sleeping one, each started on CPU a and given CPU b
+   for its affinity: each found on b, and staying there -- the spinner taken
+   off a by the decision its CPU is interrupted for, the sleeper at its next
+   wakeup, which used to be it running a moment there between two sleeps and
+   never moving -- and refused for an idle task, a task bound to its CPU and
+   a mask of no CPU that runs, nothing changed of any. Three CPUs or more --
+   neither a nor b the BSP's, which runs this in its idle task -- else said
+   and skipped. */
+bool test_affinity()
+{
+    auto& cpus = CpuTable::get_instance();
+    ulong running = cpus.get_running_cpus();
+    ulong self = cpus.get_current_cpu_id();
+    ulong a = MAX_CPUS;
+    ulong b = MAX_CPUS;
+    for (ulong i = 0; i < MAX_CPUS && b == MAX_CPUS; i++)
+    {
+        if (!(running & (1UL << i)) || i == self)
+            continue;
+        if (a == MAX_CPUS)
+            a = i;
+        else
+            b = i;
+    }
+    if (b == MAX_CPUS)
+    {
+        klog(0, "test_affinity: fewer than three cpus, skipped");
+        return true;
+    }
+
+    /* An idle task: refused, as it was */
+    Task* idle = cpus.get_cpu(a).get_idle_task();
+    ulong idle_was = idle->get_cpu_affinity();
+    if (set_task_affinity(idle, 1UL << b) != AffinityResult::Pinned || idle->get_cpu_affinity() != idle_was)
+    {
+        klog(0, "test_affinity: cpu %lu's idle task taken another affinity", a);
+        return false;
+    }
+
+    bool ok = true;
+    for (ulong sleeps = 0; ok && sleeps < 2; sleeps++)
+    {
+        auto* p = mm::talloc<AffinityProbe, TAG>();
+        if (p == nullptr)
+        {
+            klog(0, "test_affinity: no memory");
+            return false;
+        }
+        p->cpu.set(0);
+        p->stop.set(0);
+        p->watched.set(0);
+        p->looks_there.set(0);
+        p->sleeps = (sleeps != 0);
+        const char* what = p->sleeps ? "sleeping" : "spinning";
+        Task* task = mm::talloc<Task, TAG>(p->sleeps ? "affinity/sleep" : "affinity/spin");
+        if (task != nullptr)
+        {
+            task->set_cpu_affinity(1UL << a);
+            if (!task->start(affinity_task_func, p))
+            {
+                task->put();
+                task = nullptr;
+            }
+        }
+        if (task == nullptr)
+        {
+            klog(0, "test_affinity: could not start a task");
+            p->~AffinityProbe();
+            mm::free(p);
+            return false;
+        }
+
+        ulong start = get_boot_time().get_value();
+        if (affinity_wait_on(task, p, a, start, AFFINITY_MOVE_NS) == ~0UL)
+        {
+            klog(0, "test_affinity: the %s task never ran on cpu %lu", what, a);
+            ok = false;
+        }
+
+        /* A mask of no CPU that runs, where there is one: refused, as it was */
+        if (ok && ~running != 0)
+        {
+            ulong none = ~running & (0UL - ~running);
+            if (set_task_affinity(task, none) != AffinityResult::NoCpu || task->get_cpu_affinity() != (1UL << a))
+            {
+                klog(0, "test_affinity: the %s task taken a mask of no cpu that runs, 0x%lX", what, none);
+                ok = false;
+            }
+        }
+
+        ulong moved = 0;
+        if (ok)
+        {
+            p->looks_there.set(0);
+            p->watched.set((long)a + 1);
+            ulong from = get_boot_time().get_value();
+            if (set_task_affinity(task, 1UL << b) != AffinityResult::Set)
+            {
+                klog(0, "test_affinity: the %s task refused cpu %lu", what, b);
+                ok = false;
+            }
+            else
+            {
+                moved = affinity_wait_on(task, p, b, from, AFFINITY_MOVE_NS);
+                if (moved == ~0UL)
+                {
+                    ulong home = MAX_CPUS;
+                    bool on = task_home_cpu(task, home);
+                    klog(0, "test_affinity: the %s task not on cpu %lu %lu ms after it was given it: on cpu %lu, "
+                        "last seen on %ld", what, b, AFFINITY_MOVE_NS / consts::NANO_SECS_IN_MS, on ? home : MAX_CPUS,
+                        p->cpu.get() - 1);
+                    ok = false;
+                }
+            }
+        }
+
+        /* And stays there: never seen on another CPU while watched */
+        for (ulong from = get_boot_time().get_value(); ok && get_boot_time().get_value() - from < AFFINITY_STAY_NS;)
+        {
+            if ((ulong)p->cpu.get() != b + 1)
+            {
+                klog(0, "test_affinity: the %s task back on cpu %ld after it moved to cpu %lu", what,
+                    p->cpu.get() - 1, b);
+                ok = false;
+            }
+            sleep(consts::NANO_SECS_IN_MS / 10);
+        }
+        /* A sleeper moves at its next wakeup (TaskQueue::leave_if_outbound):
+           seen on the old CPU after the watch began twice at most -- a look
+           just before the change, and that of a wakeup under way there as it
+           came. Without that move it woke there again and again until a
+           decision happened to find it running: 30 looks there in a control
+           run, and 1.4 s before it moved in another. */
+        if (ok && p->sleeps && p->looks_there.get() > 2)
+        {
+            klog(0, "test_affinity: the sleeping task looked %ld times on cpu %lu after it was given cpu %lu: woken "
+                "there, not moved", p->looks_there.get(), a, b);
+            ok = false;
+        }
+        if (ok)
+            klog(0, "test_affinity: the %s task moved from cpu %lu to cpu %lu in %lu us", what, a, b,
+                moved / consts::NANO_SECS_IN_USEC);
+
+        p->stop.set(1);
+        task->wait();
+        task->put();
+        p->~AffinityProbe();
+        mm::free(p);
+    }
+
+    /* A task bound to its CPU, as the softirq tasks are: refused, as it was */
+    if (ok)
+    {
+        auto* p = mm::talloc<AffinityProbe, TAG>();
+        Task* task = (p != nullptr) ? mm::talloc<Task, TAG>("affinity/bound") : nullptr;
+        if (task == nullptr)
+        {
+            klog(0, "test_affinity: could not make a bound task");
+            ok = false;
+        }
+        else
+        {
+            p->cpu.set(0);
+            p->stop.set(1);
+            p->sleeps = true;
+            task->pin_to_cpu(a);
+            if (set_task_affinity(task, 1UL << b) != AffinityResult::Pinned || task->get_cpu_affinity() != (1UL << a))
+            {
+                klog(0, "test_affinity: a task bound to cpu %lu taken another affinity", a);
+                ok = false;
+            }
+            task->put();
+        }
+        if (p != nullptr)
+        {
+            p->~AffinityProbe();
+            mm::free(p);
+        }
+    }
+    return ok;
+}
+
 /* ---- tracepoints (kernel/tracepoint.h, kernel/trace_ring.h) ---- */
 
 /* What a test record of index `index` carries: anything else read back

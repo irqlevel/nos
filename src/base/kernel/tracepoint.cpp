@@ -1583,7 +1583,8 @@ void bench(stdlib::Printer& con, ulong cpu)
             con.printf("trace bench: no memory for a task on cpu %lu\n", cpu);
             return;
         }
-        task->set_cpu_affinity(1UL << cpu);
+        /* What it measures is that CPU's */
+        task->pin_to_cpu(cpu);
         if (!task->start(bench_task, &r))
         {
             task->put();

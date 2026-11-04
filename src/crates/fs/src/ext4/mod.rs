@@ -151,8 +151,9 @@ impl Ext4 {
         source::map(&mut self.reader()?, ino, raw, lblock)
     }
 
-    fn map_extent(&mut self, ino: u32, raw: &[u8], lblock: u64) -> Option<(Map, bool)> {
-        source::map_extent(&mut self.reader()?, ino, raw, lblock)
+    fn leaf_runs(&mut self, ino: u32, raw: &[u8], lblock: u64, end: u64, out: &mut Vec<(Map, bool)>)
+        -> Option<u64> {
+        source::leaf_runs(&mut self.reader()?, ino, raw, lblock, end, out)
     }
 
     /// Metadata block `b`, as a read sees it.
@@ -894,7 +895,11 @@ impl Ext4 {
 
     /// `map_blocks` as runs: an extent's blocks one run -- an unwritten
     /// extent's said so -- a hole another, each held to the blocks a file
-    /// may own as every map is (`source::map_extent`).
+    /// may own as every map is (`source::map_extent`). A leaf of the tree's
+    /// runs at a time (`source::leaf_runs`): a walk down the tree, every
+    /// node on the way held to its checksum, for each leaf rather than each
+    /// extent -- a guest's disk image is taken again whole at times, in
+    /// thousands of extents.
     pub fn map_runs(&mut self, file: NodeId, first: u64, count: u64, out: &mut Vec<MapRun>) -> bool {
         if !self.overlay.is_empty() {
             return false;
@@ -904,20 +909,31 @@ impl Ext4 {
         let sectors = (self.io.bs / self.io.sector_size) as u64;
         let Some(end) = first.checked_add(count) else { return false };
         let mut l = first;
+        let mut leaf = Vec::new();
         while l < end {
-            let (sector, run, unwritten) = match self.map_extent(ino, &raw, l) {
-                Some((Map::Blocks { block, run }, unwritten)) => (block * sectors, run, unwritten),
-                Some((Map::Hole { run }, _)) => (0, run, false),
-                None => return false,
-            };
-            /* A run is at least the block asked about, and no further than
-             * asked: a hole past the last extent reaches as far as a u64. */
-            let n = run.max(1).min(end - l);
-            if out.try_reserve(1).is_err() {
+            leaf.clear();
+            let Some(reached) = self.leaf_runs(ino, &raw, l, end, &mut leaf) else { return false };
+            for &(m, unwritten) in &leaf {
+                let (sector, run, unwritten) = match m {
+                    Map::Blocks { block, run } => (block * sectors, run, unwritten),
+                    Map::Hole { run } => (0, run, false),
+                };
+                /* A run is at least a block, and no further than asked: a
+                 * hole past the last extent reaches as far as a u64. */
+                let n = run.max(1).min(end - l);
+                if out.try_reserve(1).is_err() {
+                    return false;
+                }
+                out.push(MapRun { sector, len: n, unwritten });
+                l += n;
+                if l >= end {
+                    break;
+                }
+            }
+            if l != reached.min(end) {
+                klog!(0, "ext4: inode {}'s runs from block {} do not reach where its leaf says they end", ino, l);
                 return false;
             }
-            out.push(MapRun { sector, len: n, unwritten });
-            l += n;
         }
         true
     }

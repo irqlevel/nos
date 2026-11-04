@@ -5,6 +5,7 @@
 
 use core::sync::atomic::AtomicU64;
 
+use hvarch::x86::fast::FastExit;
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::{GuestRegs, Kick, Profile, Run};
 use hvarch::{Ext, Result};
@@ -53,12 +54,13 @@ pub enum Backend {
  * ten into one, but at the cost of the risk the convention names -- a reader
  * could not see what each does -- so they are written out. */
 impl Backend {
-    fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>,
+             fast: Option<&mut dyn FastExit>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         match self {
-            Backend::Svm(v) => v.enter(memory, host_areas, kick),
-            Backend::Vmx(v) => v.enter(memory, host_areas, kick),
+            Backend::Svm(v) => v.enter(memory, host_areas, kick, fast),
+            Backend::Vmx(v) => v.enter(memory, host_areas, kick, fast),
         }
     }
     pub fn save(&self) -> &Save {
@@ -417,13 +419,14 @@ impl Cpu {
     ///
     /// Every entry of every guest comes through here, so here is where its
     /// `hv_exit` is recorded -- a Linux guest's and a built-in one's alike.
-    pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>)
+    pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>,
+                 fast: Option<&mut dyn FastExit>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         if memory.nested().id != self.table {
             return Err(Refusal::NotItsMemory);
         }
-        let entered = self.backend.enter(memory, machine.host_areas(), kick);
+        let entered = self.backend.enter(memory, machine.host_areas(), kick, fast);
         if kcore::trace::on::<kcore::trace::HvExit>() {
             if let Ok((exit, _)) = &entered {
                 let b = &self.backend;
@@ -481,6 +484,6 @@ impl Vm {
     pub fn enter(&mut self, machine: &Machine, kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        self.cpu.enter(&self.memory, machine, kick)
+        self.cpu.enter(&self.memory, machine, kick, None)
     }
 }

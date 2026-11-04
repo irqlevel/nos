@@ -673,6 +673,9 @@ pub struct Guest {
     profile: Option<Profile>,
     /// Its last entry's world switch, timed ([`Run`]).
     last_run: Run,
+    /// Exits answered inside the entry and entered again past at once
+    /// (`super::fast`), since the guest was made.
+    answered: u64,
 }
 
 impl Guest {
@@ -688,12 +691,19 @@ impl Guest {
             flush_always: false,
             profile: None,
             last_run: Run::default(),
+            answered: 0,
         })
     }
 
     /// Its last entry's world switch, where it was timed ([`Run`]).
     pub fn last_run(&self) -> Run {
         self.last_run
+    }
+
+    /// Exits answered inside the entry and entered again past at once
+    /// (`super::fast`), since the guest was made.
+    pub fn answered(&self) -> u64 {
+        self.answered
     }
 
     /// Time each entry from now on ([`Profile`]), or stop.
@@ -830,6 +840,7 @@ impl Guest {
         nested: Nested,
         host_areas: &[AtomicU64],
         kick: Option<&Kick>,
+        mut fast: Option<&mut dyn super::fast::FastExit>,
     ) -> core::result::Result<u32, NotRun> {
         {
             let v = self.vmcb.get_mut();
@@ -861,6 +872,7 @@ impl Guest {
         let vmcb = &mut self.vmcb;
         let profile = &mut self.profile;
         let last_run = &mut self.last_run;
+        let answered = &mut self.answered;
         let stamp = |on: bool| if on { cpu::rdtsc() } else { 0 };
         /* `with` is None only on a CPU past the table, which no CPU the
          * extension is on for is. */
@@ -932,32 +944,87 @@ impl Guest {
             }
             let speculation = entries.spec.svm_entry();
             let flags = if speculation.ibpb_exit() { RUN_IBPB } else { 0 };
-            /* Its IA32_SPEC_CTRL over the host's: through the VMCB on a CPU
-             * with virtual SPEC_CTRL, whose `vmrun` loads it from there and
-             * whose exit puts the host's back; in the MSR otherwise, put
-             * back after the exit (`super::spec`). */
-            let spec_ctrl = match entries.spec.vmcb_spec_ctrl(msrs.spec_ctrl()) {
-                Some(value) => {
-                    vmcb.get_mut().save.spec_ctrl = value;
-                    Some(value)
-                }
-                None => entries.spec.load_guest(msrs.spec_ctrl()),
-            };
-            msrs.ran(spec_ctrl);
+            /* Entered again at once after each exit `fast` answers
+             * (`super::fast`), all of it with interrupts off and the guest's
+             * registers the CPU's; a kick that came meanwhile ends it as a
+             * kick's refusal of an entry would, the write answered. */
+            let mut kicked = false;
+            let (t2, t3) = loop {
+                /* Its IA32_SPEC_CTRL over the host's: through the VMCB on a
+                 * CPU with virtual SPEC_CTRL, whose `vmrun` loads it from
+                 * there and whose exit puts the host's back; in the MSR
+                 * otherwise, put back after the exit (`super::spec`). */
+                let spec_ctrl = match entries.spec.vmcb_spec_ctrl(msrs.spec_ctrl()) {
+                    Some(value) => {
+                        vmcb.get_mut().save.spec_ctrl = value;
+                        Some(value)
+                    }
+                    None => entries.spec.load_guest(msrs.spec_ctrl()),
+                };
+                msrs.ran(spec_ctrl);
 
-            /* The two VMCBs are pages this guest owns, `regs` is its own
-             * field, the checks above are the rest of what the stub needs,
-             * and RUN_IBPB is given only where `super::spec` found IBPB. */
-            let t2 = stamp(timed);
-            unsafe { vmrun_stub(guest, regs, host, flags) };
-            let t3 = stamp(timed);
-            last_run.next(timed, t2, t3);
-            if flags & RUN_IBPB != 0 {
-                speculation.count_exit_barrier(cpu);
-            }
-            entries.spec.exited(false);
-            if let Some(k) = kick {
-                k.left();
+                /* The two VMCBs are pages this guest owns, `regs` is its own
+                 * field, the checks above are the rest of what the stub
+                 * needs, and RUN_IBPB is given only where `super::spec` found
+                 * IBPB. */
+                let t2 = stamp(timed);
+                unsafe { vmrun_stub(guest, regs, host, flags) };
+                let t3 = stamp(timed);
+                if flags & RUN_IBPB != 0 {
+                    speculation.count_exit_barrier(cpu);
+                }
+                entries.spec.exited(false);
+                let exit_code = vmcb.get().control.exit_code;
+                entries.asids.entered(vmcb.get().control.tlb_control, exit_code);
+
+                /* A WRMSR, the CPU's next RIP for it, no single-step's #DB
+                 * owed after it, and no event whose delivery the exit cut
+                 * short -- which an instruction's intercept never is. */
+                let Some(f) = fast.as_deref_mut() else { break (t2, t3) };
+                let (rip, next_rip, rflags, rax, cut_short) = {
+                    let v = vmcb.get();
+                    (v.save.rip, v.control.next_rip, v.save.rflags, v.save.rax,
+                     v.control.exit_int_info & vmcb::event::VALID != 0)
+                };
+                if exit_code != vmcb::exit::MSR || vmcb.get().control.exit_info1 != 1 || rflags & RFLAGS_TF != 0
+                    || next_rip <= rip || cut_short
+                {
+                    break (t2, t3);
+                }
+                let mut ran = *last_run;
+                ran.next(timed, t2, t3);
+                /* `regs` is this guest's own field, written by the stub. */
+                let (rcx, rdx) = unsafe { ((*regs).rcx, (*regs).rdx) };
+                let value = ((rdx & 0xFFFF_FFFF) << 32) | (rax & 0xFFFF_FFFF);
+                if !f.wrmsr(rcx as u32, value, rip, ran) {
+                    break (t2, t3);
+                }
+                *last_run = ran;
+                *answered += 1;
+                /* Past it, out of a STI's shadow it was in, nothing of the
+                 * TLB to flush again -- the ASID is as it was -- and nothing
+                 * to inject: an event given at the entry was delivered,
+                 * which the CPU's #VMEXIT says by clearing the field, and
+                 * `hv` by clearing it after every exit (`requeue_event`). */
+                {
+                    let v = vmcb.get_mut();
+                    v.save.rip = next_rip;
+                    v.control.int_state &= !vmcb::int_state::SHADOW;
+                    v.control.tlb_control = vmcb::tlb::NOTHING;
+                    v.control.event_inj = 0;
+                }
+                if let Some(k) = kick {
+                    if !k.entering(cpu) {
+                        kicked = true;
+                        break (t2, t3);
+                    }
+                }
+            };
+            if !kicked {
+                last_run.next(timed, t2, t3);
+                if let Some(k) = kick {
+                    k.left();
+                }
             }
 
             /* Interrupts still off since the load, and XCR0 the guest's:
@@ -973,7 +1040,11 @@ impl Guest {
             }
 
             let exit_code = vmcb.get().control.exit_code;
-            entries.asids.entered(control, exit_code);
+            if kicked {
+                /* An exit answered, the next entry refused by a kick: no exit
+                 * for the run loop, the guest past the write in its VMCB. */
+                return Err(NotRun::Kicked { cpu });
+            }
 
             /* Still on this CPU, with interrupts off: an intercepted machine
              * check is one the host's handler has not seen, and the CPU will
@@ -993,6 +1064,10 @@ impl Guest {
 
 /// [`vmrun_stub`]'s flags: an IBPB right after the exit.
 const RUN_IBPB: u64 = 1 << 0;
+
+/// RFLAGS.TF: a guest single-stepping, whose #DB after an instruction the
+/// fast path leaves to the run loop.
+const RFLAGS_TF: u64 = 1 << 8;
 
 /// Enter the guest whose VMCB is at `guest_vmcb` with the registers in
 /// `regs`, and come back at its next `#vmexit` with the registers stored
