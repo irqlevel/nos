@@ -965,6 +965,33 @@ pub fn event_wait(h: usize, until: u64) -> bool {
     g.as_ref().expect("booted").tasks[me].woke == Woke::Signalled
 }
 
+/// `kernel_event_poll`: the signal taken if it is there now, or once the
+/// others have run -- a poll is a place another may run -- and false if
+/// still none. The waiter's call, as a wait is.
+pub fn event_poll(h: usize) -> bool {
+    check_may_wait("polls an event");
+    for look in 0..2 {
+        let mut g = lock();
+        let s = sched!(g);
+        let e = s.events.get_mut(h.wrapping_sub(1)).filter(|e| e.alive)
+            .unwrap_or_else(|| panic!("invariant: a poll of event {}, which is no event", h));
+        if let Some(w) = e.waiter {
+            panic!("invariant: event {} polled while task {} waits on it", h, w);
+        }
+        if e.signalled {
+            e.signalled = false;
+            drop(g);
+            preempt_point();
+            return true;
+        }
+        drop(g);
+        if look == 0 {
+            preempt_point();
+        }
+    }
+    false
+}
+
 pub fn event_signal(h: usize) {
     let mut g = lock();
     let s = sched!(g);

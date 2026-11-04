@@ -531,6 +531,49 @@ Idle tasks and softirq tasks are pinned to their own CPU; everything else
 runs anywhere. `top` prints the number of migrations since boot, which is
 the only way to know whether "rare" is actually true.
 
+### Changing a task's affinity
+
+`set_task_affinity(task, mask)` -- the shell's `sched affinity <pid> <cpus>`
+-- gives a task new CPUs while it runs, and a task on a CPU that is no
+longer one of them leaves it, whatever state it is in:
+
+- **Running there, or waiting there to run.** Its CPU is interrupted, and
+  the decision every IPI ends in (`Cpu::ipi`) finds the task outside its
+  mask: it does not keep the CPU -- another task takes it, the idle task if
+  nothing else can (`TaskQueue::schedule`, `evicted`) -- and
+  `switch_complete` moves it to the lightest CPU of its mask, whatever the
+  loads (`select_next_task_queue` skips `MIGRATE_THRESHOLD` for it), and
+  interrupts that CPU, which may be halted. A task waiting on the run list
+  runs there once more when it is picked, and the decision that evicts it is
+  then asked for at once (the local timer at now) rather than at its slice's
+  end or the tick's.
+- **Asleep there.** It moves at its wakeup: `drain_wakes` and `wake_due`
+  take a woken task outside its mask off the queue instead of onto its run
+  list (`leave_if_outbound`), and once the queue's lock is down --
+  `schedule`'s keep path, `switch_complete` -- it is inserted on the lightest
+  queue of its mask (`send_outbound`), whose CPU is interrupted. Without it a
+  task that only ever runs a moment between two sleeps mostly blocked again
+  before the decision that evicts a task that runs, and moved only when one
+  happened to find it running: after 1.4 s in one control run, after 30 more
+  wakeups there in another, where it moves at its next wakeup, a
+  millisecond. One asleep for good stays where it is until it wakes.
+
+A task whose mask has no CPU that runs is not evicted (`out_of_affinity`):
+it would be taken off at every decision and picked again at the next.
+`set_task_affinity` refuses such a mask, and a task bound to its CPU
+(`Task::pin_to_cpu`): the idle tasks, the softirq tasks, and a measurement's
+-- `trace bench`'s and `sched probe`'s tasks, whose numbers are that CPU's.
+A guest's vCPUs, a disk's or a network's task, the shell: any other task can
+be moved -- hvarch takes a vCPU's state along (VT-x `vmclear`s its VMCS on
+the CPU it left, AMD-V gives it an ASID on the new one, and its kick finds
+the CPU it entered on last). What hv placed with it does not follow: the
+performance hold on the CPU it was placed on, and `hv cores`'s account of
+the cores.
+
+The boot's `test_affinity` moves a spinning task and a sleeping one off
+the CPU they run on, and holds them away from it, every boot of both
+arches.
+
 ## Tasks and stacks
 
 A task's stack is 32 KiB and carries its own identity: a `Task*` and a magic

@@ -430,6 +430,11 @@ void kernel_event_signal(unsigned long handle)
     reinterpret_cast<kernel::Event*>(handle)->signal();
 }
 
+int kernel_event_poll(unsigned long handle, unsigned long long poll_ns)
+{
+    return reinterpret_cast<kernel::Event*>(handle)->poll_for(poll_ns) ? 1 : 0;
+}
+
 /* The name ps and top show for a task Rust starts: the caller's, a Rust
    string with no terminator, cut to the room a task has for one */
 static kernel::Task* new_rust_task(const unsigned char* name, unsigned long name_len)
@@ -579,6 +584,112 @@ void kernel_cpu_run_on(unsigned int cpu,
     target.queue_ipi_task(task);
 }
 
+} /* extern "C" */
+
+namespace
+{
+
+/* The CPUs held at the performance preference (kernel_cpu_performance):
+   how many hold each, and the lock both the counts and the MSR writes are
+   made under, so that a CPU's preference is always what its count says. A
+   function's statics: the link refuses a constructor at namespace scope. */
+kernel::Mutex& performance_lock()
+{
+    static kernel::Mutex m;
+    return m;
+}
+
+ulong performance_holds[kernel::MAX_CPUS] = {};
+
+/* The CPUs held to wake quickly (kernel_cpu_latency): how many hold each,
+   under the same lock. */
+ulong latency_holds[kernel::MAX_CPUS] = {};
+
+/* What the IPI sets on the CPU it lands on: its preference, where `set_epp`,
+   and whether it is held to wake quickly -- by a performance hold or a
+   latency one (Cpu::set_latency_held). On the caller's stack, which waits
+   for the IPI. */
+struct CpuHold
+{
+    bool set_epp;
+    u32 epp;
+    bool held;
+};
+
+void set_hold_here(void* ctx, kernel::Context*)
+{
+    auto* hold = static_cast<const CpuHold*>(ctx);
+    if (hold->set_epp)
+        hal::set_cpu_epp(hold->epp);
+    kernel::CpuTable::get_instance().get_current_cpu().set_latency_held(hold->held);
+}
+
+}
+
+extern "C" {
+
+/* CPU `cpu` held at the performance preference -- HWP's EPP 0 -- while
+   `hold` holds of it are more than its releases: what a CPU a guest's vCPU
+   or disk is placed on asks while it is theirs, so that its clock stays up
+   through the idles between a guest's timer ticks, which on the EX44 left
+   the first microseconds after each wake five to ten times slower (round
+   13's trace windows). The last release puts back hwp_epp='s. The MSR is
+   written on the CPU itself, by an IPI this waits for; a CPU not running,
+   or out of range, is nothing. Task context. */
+void kernel_cpu_performance(unsigned int cpu, int hold)
+{
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+        return;
+    auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
+    ulong state = target.get_state();
+    if (!(state & kernel::Cpu::STATE_RUNNING) || (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
+        return;
+
+    stdlib::AutoLock lock(performance_lock());
+    ulong& holds = performance_holds[cpu];
+    ulong was = holds;
+    if (hold)
+        holds++;
+    else if (holds != 0)
+        holds--;
+    if ((was == 0) == (holds == 0))
+        return;
+    ulong epp = (holds != 0) ? 0 : kernel::Parameters::get_instance().get_hwp_epp();
+    CpuHold set{true, (u32)epp, holds != 0 || latency_holds[cpu] != 0};
+    kernel::IPITask task(set_hold_here, &set);
+    target.queue_ipi_task(task);
+}
+
+/* CPU `cpu` held to wake quickly while `hold` holds of it are more than its
+   releases: its idles kept out of the C-state between (Cpu::IDLE_MID_NS),
+   whose wake of a hundred microseconds or two a guest's disk would wait for
+   at every request that comes after its task idled -- what a CPU a guest's
+   disk is served from asks while it is theirs. A performance hold holds it
+   so too. Set on the CPU itself, by an IPI this waits for; a CPU not
+   running, or out of range, is nothing. Task context. */
+void kernel_cpu_latency(unsigned int cpu, int hold)
+{
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+        return;
+    auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
+    ulong state = target.get_state();
+    if (!(state & kernel::Cpu::STATE_RUNNING) || (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
+        return;
+
+    stdlib::AutoLock lock(performance_lock());
+    ulong& holds = latency_holds[cpu];
+    ulong was = holds;
+    if (hold)
+        holds++;
+    else if (holds != 0)
+        holds--;
+    if ((was == 0) == (holds == 0) || performance_holds[cpu] != 0)
+        return;
+    CpuHold set{false, 0, holds != 0};
+    kernel::IPITask task(set_hold_here, &set);
+    target.queue_ipi_task(task);
+}
+
 /* An interrupt to `cpu`, now, and nothing waited for: what makes a vCPU that
    is running a guest there leave it -- a physical interrupt ends the guest's
    turn -- and costs any other CPU an interrupt with nothing to do. Sent the
@@ -722,10 +833,13 @@ void kernel_frame_free(unsigned long phys)
     kernel::mm::PageTable::get_instance().free_frame(phys);
 }
 
-/* Copy between a frame and the caller's memory through this CPU's frame
-   slot of the temp-map window (PageTable::map_frame_slot): out of the frame
-   into `buf`, or `data` into it -- exactly one of the two is given.
-   Preemption and interrupts are off from the map to the unmap: that is what
+/* Copy between a frame and the caller's memory -- out of the frame into
+   `buf`, or `data` into it, exactly one of the two given -- through the
+   huge pool's window for a page of the pool (PageTable::huge_pool_window),
+   a guest's memory mapped for as long as the machine is up; and for any
+   other frame through this CPU's frame slot of the temp-map window
+   (PageTable::map_frame_slot). Preemption and interrupts are off from the
+   map to the unmap: that is what
    makes the slot this copy's alone, and the unmap invalidates only this
    CPU's TLB, so a task moved to another CPU mid-copy would leave the slot's
    translation stale behind it. (It went through the shared slots, under
@@ -754,6 +868,21 @@ static int frame_copy(unsigned long phys, unsigned long offset,
     auto& pt = kernel::mm::PageTable::get_instance();
     if (!pt.is_frame_address(phys))
         return -1;
+
+    /* A page of the huge pool -- a guest's memory -- through the pool's
+       window, which maps it for as long as the machine is up: nothing to
+       map, flush or keep to this CPU, so no interrupts off either. Inside
+       the page, as checked above. */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        void* frame = reinterpret_cast<void*>(window + offset);
+        if (data != nullptr)
+            stdlib::mem_cpy(frame, data, len);
+        else
+            stdlib::mem_cpy(buf, frame, len);
+        return 0;
+    }
 
     /* Through this CPU's own slot of the window, which interrupts off makes
        the copy's alone: no lock, no slot to search for, no reference. */
@@ -792,7 +921,8 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
    overrun. The load is an acquire and the store a release: what a driver
    published before its index is there to be read after the index is, and
    what this side wrote before its own index is there before the index
-   says so. The same slot of the window as frame_copy's, with preemption and
+   says so. Where frame_copy goes: the huge pool's window for a page of the
+   pool, else the same slot of the tmp_map window, with preemption and
    interrupts off for the same reason. -1, and nothing done, for a word
    that is not an aligned one inside a page of RAM. */
 static bool frame_word_inside(unsigned long phys, unsigned long offset)
@@ -807,6 +937,13 @@ int kernel_frame_load16(unsigned long phys, unsigned long offset, unsigned short
         return -1;
 
     auto& pt = kernel::mm::PageTable::get_instance();
+    /* The huge pool's window where the page is the pool's, as frame_copy */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        *value = __atomic_load_n(reinterpret_cast<unsigned short*>(window + offset), __ATOMIC_ACQUIRE);
+        return 0;
+    }
     ulong flags = kernel::preempt_irq_save();
     ulong va = pt.map_frame_slot(phys);
     /* Aligned, inside the page mapped at va: checked above. */
@@ -822,6 +959,13 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
         return -1;
 
     auto& pt = kernel::mm::PageTable::get_instance();
+    /* The huge pool's window where the page is the pool's, as frame_copy */
+    ulong window = pt.huge_pool_window(phys);
+    if (window != 0)
+    {
+        __atomic_store_n(reinterpret_cast<unsigned short*>(window + offset), value, __ATOMIC_RELEASE);
+        return 0;
+    }
     ulong flags = kernel::preempt_irq_save();
     ulong va = pt.map_frame_slot(phys);
     __atomic_store_n(reinterpret_cast<unsigned short*>(va + offset), value, __ATOMIC_RELEASE);

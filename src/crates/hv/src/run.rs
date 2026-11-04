@@ -188,6 +188,11 @@ const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
 const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
 const POLL_MAX_NS: u64 = 200 * kcore::consts::NS_PER_US;
 
+/// The longest a HLT is waited out in the world switch's own loop
+/// (`FastMsr::hlt`), with the host's interrupts held off meanwhile: past it
+/// the halt is the loop's, its spin with interrupts on and its sleep.
+const HLT_SPIN_NS: u64 = 50 * kcore::consts::NS_PER_US;
+
 /// How far short of its own timer's edge a halted vCPU's sleep ends, the
 /// rest spun: what a wake costs the host's sleeper -- its timer interrupt, a
 /// schedule, a switch -- which made the EX44's guests' timer interrupts 9-10
@@ -224,6 +229,133 @@ fn sooner(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
+    }
+}
+
+/// A guest CPU's exits the world switch's own loop answers
+/// (`hvarch::x86::fast`), the guest entered again at once past them: its
+/// writes of the x2APIC's ICR that send a fixed IPI to other CPUs alone --
+/// posted or mailed, and their CPUs notified or rung, as `send` does -- and
+/// of its TSC deadline, the host's timer armed for the edge as the run
+/// loop's round arms it. KVM answers the same two so
+/// (`handle_fastpath_set_msr_irqoff`). Anything else -- an IPI to itself
+/// too, or of another kind, a guest with no APIC -- is refused, and goes the
+/// way it always went. What comes meanwhile for the CPU kicks it, and the
+/// kick refuses the entry after the write (`Kick::entering`): the run
+/// loop's round then looks.
+///
+/// With interrupts off and the guest's registers the CPU's: what it calls
+/// are atomics, IPIs and doorbells, which an interrupt handler may ring.
+struct FastMsr<'a> {
+    guest: &'a LinuxGuest,
+    me: u32,
+    pid: u32,
+    lapic: &'a mut Lapic,
+    counts: &'a mut Counts,
+    kick: &'a hvarch::x86::svm::Kick,
+    /// The CPU's deadlines but its APIC timer's (`GuestCpu::other_due`)
+    other_due: Option<u64>,
+    /// The deadline its host timer is armed for (`GuestCpu::asked`)
+    asked: &'a mut Option<u64>,
+    /// How long its halts have lately been ending within
+    /// (`GuestCpu::poll_ns`): the most `hlt` waits, to `HLT_SPIN_NS`.
+    poll_ns: u64,
+}
+
+impl hvarch::x86::fast::FastExit for FastMsr<'_> {
+    fn wrmsr(&mut self, msr: u32, value: u64, rip: u64, ran: hvarch::x86::svm::Run) -> bool {
+        if !self.guest.has_apic() {
+            return false;
+        }
+        let answered = if msr == lapic::MSR_X2APIC_ICR {
+            self.ipi(value)
+        } else if msr == lapic::MSR_TSC_DEADLINE && crate::policy::tsc_deadline() {
+            self.tsc_deadline(value)
+        } else {
+            false
+        };
+        if answered {
+            self.counts.msr_write += 1;
+            self.counts.answered += 1;
+            if trace::on::<trace::HvExit>() {
+                let regs = tp::ExitRegs { rip, rax: value & 0xFFFF_FFFF, rcx: u64::from(msr) };
+                tp::exit(self.me, self.pid, &Exit::Msr { write: true }, regs, ran, None);
+            }
+        }
+        answered
+    }
+
+    /// A HLT with interrupts on, nothing waiting in the virtual APIC and
+    /// posted interrupts in use (`hvarch::x86::fast`): what is posted for
+    /// this CPU spun for, interrupts off, for as long as its halts have
+    /// lately been ending within (`poll_ns`, to `HLT_SPIN_NS`), and true
+    /// once something is -- its notification pending here, or on its way,
+    /// for the CPU to take as it enters. False, and the halt the loop's, for
+    /// a CPU without posted interrupts, halts that have lately been long, a
+    /// kick (a ring: mail, a device, a stop), the edge the host's timer is
+    /// armed for, or the spin's time up.
+    fn hlt(&mut self, rip: u64, ran: hvarch::x86::svm::Run) -> bool {
+        let Some(shared) = self.guest.cpus.get(self.me as usize) else { return false };
+        let (true, Some(posted)) = (shared.posted_on.load(Ordering::Acquire), shared.posted.as_ref()) else {
+            return false;
+        };
+        let limit = self.poll_ns.min(HLT_SPIN_NS);
+        if limit == 0 {
+            return false;
+        }
+        let edge = self.kick.edge();
+        let from = time::boot_time_ns();
+        while !posted.outstanding() {
+            if self.kick.refuses() {
+                return false;
+            }
+            let now = time::boot_time_ns();
+            if now.saturating_sub(from) >= limit || edge.is_some_and(|edge| now >= edge) {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        self.counts.hlt += 1;
+        self.counts.hlt_answered += 1;
+        if trace::on::<trace::HvExit>() {
+            let regs = tp::ExitRegs { rip, rax: 0, rcx: 0 };
+            tp::exit(self.me, self.pid, &Exit::Hlt, regs, ran, None);
+        }
+        true
+    }
+}
+
+impl FastMsr<'_> {
+    /// A fixed IPI, to other CPUs alone, sent as `send` sends one.
+    fn ipi(&mut self, value: u64) -> bool {
+        let me = self.me;
+        let Some(ipi) = self.lapic.fixed_ipi(value, me) else { return false };
+        self.counts.ipi_sent += 1;
+        for (i, target) in self.guest.cpus.iter().enumerate() {
+            let id = i as u32;
+            if id == me || !ipi.reaches(id, target.addressing(), me) {
+                continue;
+            }
+            self.guest.post_edge(i, target, ipi.vector);
+            /* Lowest priority is one CPU's, of those it names: the first. */
+            if ipi.delivery == Delivery::LowestPriority {
+                break;
+            }
+        }
+        true
+    }
+
+    /// The TSC deadline written, and the host's timer armed for the
+    /// soonest of its edge and the CPU's other deadlines, as the round's
+    /// look before an entry made without it arms it. An edge come already
+    /// refuses the entry after (`Kick::entering`), for the round to give
+    /// its interrupt.
+    fn tsc_deadline(&mut self, value: u64) -> bool {
+        self.lapic.set_tsc_deadline(value, tsc_ns(value));
+        let now = time::boot_time_ns();
+        *self.asked = sooner(self.lapic.next_timer_ns(), self.other_due.filter(|&due| due > now));
+        self.kick.arm_at(*self.asked);
+        true
     }
 }
 
@@ -392,6 +524,14 @@ pub struct Counts {
     /// Entries made at once after a write of its TSC deadline or of an IPI
     /// to other CPUs, without the loop's round.
     pub fast: u64,
+    /// Such writes answered inside the world switch's own loop, and the
+    /// guest entered again from there (`FastMsr`): exits counted among
+    /// `exits`, none of them seen by the loop.
+    pub answered: u64,
+    /// HLTs ended there too, by an interrupt posted for the CPU while the
+    /// world switch's loop waited for one (`FastMsr::hlt`): among `exits`
+    /// and `hlt`, none of them a halt of the loop's.
+    pub hlt_answered: u64,
     /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
     /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
     /// stopped the guest after, of level-triggered vectors.
@@ -530,6 +670,8 @@ impl Counts {
         self.overslept_rung += o.overslept_rung;
         self.overslept_max = self.overslept_max.max(o.overslept_max);
         self.fast += o.fast;
+        self.answered += o.answered;
+        self.hlt_answered += o.hlt_answered;
         self.polls += o.polls;
         self.polled += o.polled;
         self.handled_ns += o.handled_ns;
@@ -821,6 +963,8 @@ pub struct LinuxGuest {
     /// ones whose notification was sent to the CPU it was in its guest on.
     posted: AtomicU64,
     notified: AtomicU64,
+    /// MSIs a disk's task sent from outside every CPU (`serve_disk`).
+    served_msi: AtomicU64,
     /// How far apart its NICs' receive interrupts are held at least
     /// (`set_rx_moderation`), and whether they offer their transmit
     /// offloads (`set_offloads`).
@@ -993,6 +1137,7 @@ impl LinuxGuest {
             apicv: None,
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
+            served_msi: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
@@ -1071,6 +1216,11 @@ impl LinuxGuest {
     /// the ones a notification was sent for (VT-x's posted interrupts).
     pub fn posted_stats(&self) -> (u64, u64) {
         (self.posted.load(Ordering::Relaxed), self.notified.load(Ordering::Relaxed))
+    }
+
+    /// MSIs its disks' tasks sent from outside every CPU (`serve_disk`).
+    pub fn served_msis(&self) -> u64 {
+        self.served_msi.load(Ordering::Relaxed)
     }
 
     /// Whether its CPUs have local APICs: a guest of more than one CPU. One
@@ -1751,8 +1901,20 @@ impl LinuxGuest {
              * entry. */
             let edges_passed = kick.edges_passed();
             let entered_at = time::boot_time_ns();
-            let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
+            let answered_before = gc.counts.answered + gc.counts.hlt_answered;
+            let entered = {
+                /* Its writes of the ICR and of the TSC deadline answered in
+                 * the world switch's own loop where they can be (`FastMsr`):
+                 * the entry after each made then and there. */
+                let pid = gc.cpu.pid();
+                let GuestCpu { index, cpu, lapic, counts, other_due, asked, poll_ns, .. } = &mut *gc;
+                let mut fast = FastMsr {
+                    guest: self, me: *index, pid, lapic, counts, kick, other_due: *other_due, asked, poll_ns: *poll_ns,
+                };
+                cpu.enter(&self.memory, machine, Some(kick), Some(&mut fast))
+            };
             let exit_at = time::boot_time_ns();
+            gc.counts.exits += gc.counts.answered + gc.counts.hlt_answered - answered_before;
             if apicv {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
                 gc.lapic.from_cpu(&irr, &isr, tpr);
@@ -2365,7 +2527,10 @@ impl LinuxGuest {
         for dev in 0..p.msix_pending.len() {
             let held = p.msix_pending[dev];
             if held != 0 {
-                let still = self.msix(p, me, lapic, counts, dev, held);
+                let still = self.msix(p, dev, held, &mut |ipi| {
+                    counts.msi += 1;
+                    self.post_msi(me, lapic, ipi);
+                });
                 if still != held {
                     p.msix_pending[dev] = still;
                     self.write_pba(p, dev);
@@ -2386,14 +2551,59 @@ impl LinuxGuest {
             p.pic.raise(line);
         }
         if r.vectors != 0 {
-            let held = self.msix(p, me, lapic, counts, dev, r.vectors);
-            if let Some(pending) = p.msix_pending.get_mut(dev) {
-                if *pending | held != *pending {
-                    *pending |= held;
-                    self.write_pba(p, dev);
-                }
+            let held = self.msix(p, dev, r.vectors, &mut |ipi| {
+                counts.msi += 1;
+                self.post_msi(me, lapic, ipi);
+            });
+            self.hold_msix(p, dev, held);
+        }
+    }
+
+    /// Device `dev`'s MSI-X entries in `held`, masked as they were sent:
+    /// kept pending, for `poll_devices` to send once their mask is off.
+    fn hold_msix(&self, p: &mut Platform, dev: usize, held: u32) {
+        if let Some(pending) = p.msix_pending.get_mut(dev) {
+            if *pending | held != *pending {
+                *pending |= held;
+                self.write_pba(p, dev);
             }
         }
+    }
+
+    /// What disk `disk` -- the guest's vda 0 and on -- has for the guest,
+    /// given to it from outside every CPU: requests its backend has served
+    /// put on the used ring, what waited on the ring taken, and its MSI-X
+    /// vectors posted to the CPUs they name, each through its mailbox --
+    /// in its guest by its posted-interrupt notification, without an exit.
+    /// What the disk's own task calls as it has served something, as QEMU's
+    /// iothread with irqfd does: the first CPU, whose round the devices'
+    /// work is, need not be woken -- nor taken out of its guest, where the
+    /// guest's job may be running -- to hand a completion over. True when
+    /// that round has to come anyway: a line raised, which is the 8259's
+    /// and the first CPU's, or a pass that ended at its bound.
+    pub fn serve_disk(&self, disk: u8) -> bool {
+        let mut p = self.platform.lock();
+        let Some(dev) = p.pci_devs.iter().position(|d| matches!(d, PciDev::Disk(b) if b.index() == disk)) else {
+            return true;
+        };
+        let (r, more) = match p.pci_devs.get_mut(dev) {
+            Some(PciDev::Disk(d)) => (d.poll(&self.memory), d.more()),
+            _ => return true,
+        };
+        /* Its line raised here, where the poll that raised it ran -- the
+         * first CPU's round, rung for it, finds the 8259's request and
+         * nothing new of the disk's */
+        if r.line {
+            p.pic.raise(DISK_IRQ);
+        }
+        if r.vectors != 0 {
+            let held = self.msix(&p, dev, r.vectors, &mut |ipi| {
+                self.served_msi.fetch_add(1, Ordering::Relaxed);
+                self.post_message(None, ipi, false);
+            });
+            self.hold_msix(&mut p, dev, held);
+        }
+        r.line || more
     }
 
     /// Device `dev`'s pending bits, as the guest reads them: a word of them
@@ -2410,7 +2620,7 @@ impl LinuxGuest {
     /// Those are held, and returned, for the caller to keep pending and send
     /// from `poll_devices` once unmasked. One the table has not got, or a
     /// message that is no interrupt, goes nowhere.
-    fn msix(&self, p: &Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, dev: usize, entries: u32) -> u32 {
+    fn msix(&self, p: &Platform, dev: usize, entries: u32, send: &mut dyn FnMut(&Ipi)) -> u32 {
         let Some((control, page)) = p.pci.msix(dev + 1) else { return 0 };
         if control & pci::MSIX_ENABLE == 0 {
             return 0;
@@ -2436,8 +2646,7 @@ impl LinuxGuest {
             }
             let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
             if let Some(ipi) = lapic::msi(address, word(8)) {
-                counts.msi += 1;
-                self.post_msi(me, lapic, &ipi);
+                send(&ipi);
             }
         }
         held
@@ -2448,7 +2657,7 @@ impl LinuxGuest {
     /// priority -- straight into `lapic` for the CPU `me` doing the device's
     /// work, and through the mailbox and a ring for any other.
     fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
-        self.post_message(me, lapic, ipi, false);
+        self.post_message(Some((me, lapic)), ipi, false);
     }
 
     /// A device's message on the APIC bus -- an MSI, an IO-APIC pin's -- to
@@ -2458,15 +2667,22 @@ impl LinuxGuest {
     /// the sender's own included, for its loop to take -- rung, so that one
     /// already on its way into its guest turns back for it. An INIT from a
     /// device is none a PC's firmware wires, and is dropped.
-    fn post_message(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi, level: bool) {
+    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) {
+        /* From outside every CPU -- a disk's task (`serve_disk`) -- no CPU
+         * is the sender's own: each one named takes it through its mailbox */
+        let me = by.as_ref().map_or(u32::MAX, |(m, _)| *m);
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
-            let addressing = if id == me { lapic.addressing() } else { target.addressing() };
+            let addressing = match by.as_ref() {
+                Some((m, lapic)) if *m == id => lapic.addressing(),
+                _ => target.addressing(),
+            };
             if !ipi.reaches(id, addressing, me) {
                 continue;
             }
-            let posted = match ipi.delivery {
-                Delivery::Fixed | Delivery::LowestPriority if id == me => {
+            let own = by.as_mut().filter(|(m, _)| *m == id).map(|(_, lapic)| lapic);
+            let posted = match (ipi.delivery, own) {
+                (Delivery::Fixed | Delivery::LowestPriority, Some(lapic)) => {
                     if level {
                         lapic.accept_level(ipi.vector);
                     } else {
@@ -2474,16 +2690,16 @@ impl LinuxGuest {
                     }
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority if !level => {
+                (Delivery::Fixed | Delivery::LowestPriority, None) if !level => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority => {
+                (Delivery::Fixed | Delivery::LowestPriority, None) => {
                     target.mail.post_level(ipi.vector);
                     true
                 }
-                Delivery::Nmi => {
+                (Delivery::Nmi, _) => {
                     target.mail.post_nmi();
                     true
                 }
@@ -2510,7 +2726,7 @@ impl LinuxGuest {
             left &= left - 1;
             if let Some(m) = io.send(pin) {
                 counts.ioapic += 1;
-                self.post_message(me, lapic, &m.ipi, m.level);
+                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level);
             }
         }
     }

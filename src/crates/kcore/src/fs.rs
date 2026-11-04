@@ -376,6 +376,14 @@ impl ImageQueue {
         fs::kernel_image_wait(self.image.handle, timeout.as_nanos()) == 1
     }
 
+    /// What `wait` sleeps for, looked for for up to `poll` with this CPU
+    /// spinning: whether it came. Before a `wait` that is likely to be short
+    /// -- a command out on a fast disk, a request expected -- so as not to
+    /// pay a sleep and a wake for it.
+    pub fn poll(&self, poll: crate::time::Duration) -> bool {
+        fs::kernel_image_poll(self.image.handle, poll.as_nanos()) == 1
+    }
+
     /// Wakes whoever waits (`wait`), from anywhere.
     pub fn wake(&self) {
         fs::kernel_image_wake(self.image.handle);

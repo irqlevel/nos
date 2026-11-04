@@ -156,7 +156,29 @@ zeros whatever their blocks held, so that no crash can show what a block
 held before it was the file's, and nothing written to them -- one
 transaction, and the guest's data then goes to the device as an overwrite,
 off the lock. Each growth is taken into the map again after it, its runs
-said unwritten. A block of one that the image has not written reads as
+said unwritten.
+
+**A guest writing on from one end has the stretch ahead of it grown**
+(`Ahead`): once `STREAM_MIN` writes in a row have each begun where the last
+ended, the stretch past the stream's end -- twice the last such stretch's
+chunks, to `GROW_MAX_CHUNKS`, within the same share of the room -- is given
+every block it lacks by a task of the image's own (`image-ahead`, one a
+growth), and the next as soon as the guest comes within half of the last
+stretch's end; so that the commit and its flushes, 5-7 ms each on the EX44,
+are made while the guest writes rather than with the disk's task stopped at
+a hole and the device idle (the EX44's disk task committed 28 times, 5-7 ms
+each, through a guest's 2 GiB first write, 18 of them in its first 150 ms).
+What is there already is left as it is, so that a disk whose free space is
+holes among blocks written once has its holes given ahead as a disk of
+holes does. `STREAM_MISSES` writes in a row elsewhere end the stream --
+fewer, the guest's own between it, its journal's, are let by -- and a guest
+writing here and there has nothing given ahead of it. The task gives the file blocks only where it has none; the image
+takes them into its map at its next request after the task is done, and
+until then they are holes to it, reading as the zeros they hold. A write that meets the hole while the
+task is giving it waits for the task -- said in the log every 10 s it goes
+on -- rather than growing the file over it; a refusal, or no task to be
+had, sends every later hole the synchronous way. The image waits for the
+task before it lets go of the file. A block of one that the image has not written reads as
 zeros, and a write over part of one takes zeros for the rest; what the
 image writes over them it keeps (`Pending`), reads from the device from
 then on, and makes written at the next sync, and as it is let go of: a

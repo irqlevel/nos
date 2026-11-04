@@ -55,10 +55,34 @@ bool setup_cpu_performance(CpuPerformance* out)
     return false;
 }
 
-bool setup_idle(u32* hint)
+bool set_cpu_epp(u32 epp)
+{
+    /* The clock is firmware's to set here (setup_cpu_performance) */
+    (void)epp;
+    return false;
+}
+
+bool read_clock_counters(ClockCounters* out)
+{
+    /* No APERF or MPERF here: the activity monitors that would stand for
+       them (ARMv8.4's AMU) are not on the machines nos runs on. */
+    *out = ClockCounters{};
+    return false;
+}
+
+bool setup_cpu_c1e(bool* was_on, bool* on)
+{
+    /* No C1E here: WFI is the only idle there is. */
+    *was_on = false;
+    *on = false;
+    return false;
+}
+
+bool setup_idle(u32* hint, u32* mid)
 {
     /* WFI, the only idle there is here without PSCI's CPU_SUSPEND. */
     *hint = 0;
+    *mid = 0;
     return false;
 }
 
@@ -67,11 +91,11 @@ bool idle_masked()
     return false;
 }
 
-void cpu_idle_masked(bool deep)
+void cpu_idle_masked(IdleDepth depth)
 {
     /* Not called: idle_masked() is false. WFI ends on a pending interrupt
        with interrupts masked too, so it would be right if it were. */
-    (void)deep;
+    (void)depth;
     cpu_halt();
 }
 

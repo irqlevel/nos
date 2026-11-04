@@ -142,6 +142,10 @@ unsafe extern "C" {
     /// is done or a wake comes or `timeout_ns` is up: 1 when one came, 0
     /// when the time ran out, -1 at once for no image with a queue.
     pub safe fn kernel_image_wait(image: usize, timeout_ns: u64) -> i32;
+    /// Spins, with no lock of the image's held, up to `poll_ns` for what
+    /// `kernel_image_wait` sleeps for: 1 when it came, 0 when the time ran
+    /// out, -1 at once for no image with a queue.
+    pub safe fn kernel_image_poll(image: usize, poll_ns: u64) -> i32;
     /// Wakes the waiter, from anywhere.
     pub safe fn kernel_image_wake(image: usize);
 }

@@ -133,6 +133,9 @@ struct CpuPerformance
     u32 lowest;
     u32 guaranteed;
     u32 highest;
+    /* The energy/performance preference asked for (hwp_epp=), 0 for a CPU
+       without the field -- whose HWP has none to ask by */
+    u32 epp;
 };
 
 /* Let this CPU run as fast as it can while it is busy, rather than at the
@@ -148,28 +151,79 @@ struct CpuPerformance
    each AP. Defined per arch. */
 bool setup_cpu_performance(CpuPerformance* out);
 
+/* This CPU's energy/performance preference set to `epp` (0 performance to
+   255 energy) where setup_cpu_performance put HWP in charge of its clock
+   with a preference to ask by: what a CPU a guest's vCPU or disk runs on is
+   asked for while it does (kernel_cpu_performance). Called on the CPU
+   itself. True when it was set; nothing on arm64. Defined per arch. */
+bool set_cpu_epp(u32 epp);
+
+/* What this CPU's clock did, as the CPU counts it: its time-stamp counter,
+   and the two counters that run only while it is in C0 -- MPERF at the
+   TSC's rate, APERF at the clock it actually runs at -- so that over a
+   window APERF's delta over MPERF's, times the TSC's rate, is the clock it
+   ran at while busy, and MPERF's delta over the TSC's the share of the
+   window it was busy (`cpufreq`). */
+struct ClockCounters
+{
+    u64 tsc;
+    u64 aperf;
+    u64 mperf;
+};
+
+/* This CPU's ClockCounters, read as close together as three reads are, into
+   `out`: x86 where CPUID says it counts them (leaf 6, ECX bit 0) and not in
+   a hypervisor's guest, whose MSRs they would be; arm64: nothing. True with
+   `out` filled. Called on the CPU itself, interrupts off. Defined per arch. */
+bool read_clock_counters(ClockCounters* out);
+
+/* Whether this CPU's C1 is C1. Intel's firmware may let a CPU turn every
+   request for C1 into C1E (MSR_POWER_CTL bit 1, "C1E enable"), its voltage
+   and clock dropped while it waits, which it takes microseconds to climb
+   back from at each wake -- a vCPU's, a disk task's, an IPI's -- and nos's
+   idle asks for C1 whenever its idles are short (Cpu::idle_mwait). x86 Intel
+   on bare metal, with HWP (a part that has the MSR) and idling by MWAIT
+   (setup_idle, which the BSP calls first): the promotion turned off --
+   the choice Linux's intel_idle makes with its c1e_promotion -- unless
+   c1e=firmware.
+   Nothing elsewhere; arm64: nothing. True when the MSR was looked at, with
+   `was_on` what firmware left and `on` what this left. Defined per arch. */
+bool setup_cpu_c1e(bool* was_on, bool* on);
+
 /* How an idle CPU sleeps (cpu_idle_masked), decided once on the BSP, before
    the APs start: on x86, by MWAIT, deep in the deepest C-state CPUID's leaf
    5 offers -- where the kernel was booted with idle=mwait, the CPU has
    MONITOR/MWAIT and takes an interrupt as the end of one though interrupts
    are masked, an APIC timer that runs in every C-state (ARAT), which is the
-   only timer this kernel is woken by, and no hypervisor under it. True when
-   it was set up, `hint` the deep MWAIT hint; false where an idle CPU halts,
-   always: HLT, or arm64's WFI. Defined per arch. */
-bool setup_idle(u32* hint);
+   only timer this kernel is woken by, and no hypervisor under it -- and in
+   between in MWAIT's C3, a core's C6 on Intel's parts, where leaf 5 offers
+   it short of the deepest. True when it was set up, `hint` the deep MWAIT
+   hint and `mid` the one between (0 for none); false where an idle CPU
+   halts, always: HLT, or arm64's WFI. Defined per arch. */
+bool setup_idle(u32* hint, u32* mid);
 
 /* Whether setup_idle set MWAIT up: an idle CPU sleeps by cpu_idle_masked
    then, and halts with interrupts on otherwise. Defined per arch. */
 bool idle_masked();
 
+/* How deep an idle sleeps (cpu_idle_masked): C1, as a HLT; the C-state
+   between that setup_idle found, a core's C6 -- out of the count of busy
+   cores a busy core's turbo is figured from, a wake of a hundred or two
+   microseconds -- or C1 where it found none; and the deepest, slower to
+   wake still. */
+enum class IdleDepth
+{
+    C1,
+    Mid,
+    Deep,
+};
+
 /* With interrupts off, and only where idle_masked(): this CPU idle until an
-   interrupt is pending -- in the C-state setup_idle chose where `deep`, the
-   CPU out of the count of busy cores a busy core's turbo is figured from
-   and slower to wake, and in C1 otherwise -- or until a spurious wake. It
+   interrupt is pending -- as deep as `depth` -- or until a spurious wake. It
    returns with interrupts still off, so that its caller can read the clock
    before the interrupt is taken; the interrupt is taken as they are turned
    back on. Defined per arch. */
-void cpu_idle_masked(bool deep);
+void cpu_idle_masked(IdleDepth depth);
 
 /* How fast read_cycle_counter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.

@@ -200,6 +200,15 @@ impl Event {
         unsafe { sync::kernel_event_signal(self.handle) }
     }
 
+    /// A signal looked for for up to `poll`, spinning on its CPU rather than
+    /// blocking: true when one came -- taken, as `wait` takes it -- false
+    /// when the time ran out. The waiter's call, task context: what one that
+    /// expects its signal within microseconds makes before `wait_for`, so as
+    /// not to pay a sleep and a wake for it.
+    pub fn poll(&self, poll: crate::time::Duration) -> bool {
+        unsafe { sync::kernel_event_poll(self.handle, poll.as_nanos()) != 0 }
+    }
+
     /// The raw handle, for an owner that keeps the event for the life of the
     /// kernel and signals it from a `static` -- which is what `wait` and
     /// `signal` need, and what `Drop` must therefore never get.

@@ -268,6 +268,146 @@ static void cmd_date(const char* args, stdlib::Printer& con)
    pinning one core reads 100%, and on a 20-CPU box the column can total
    2000%. Two samples a moment apart, because a cumulative runtime tells you
    what a task has ever done, not what it is doing. */
+/* A CPU's clock counters, as the IPI that lands on it reads them
+   (cmd_cpufreq) */
+struct ClockSample
+{
+    hal::ClockCounters counters;
+    bool ok;
+    /* What its idles asked for (Cpu::get_idle_counts), and when, on the
+       boot clock: read beside the counters, on the CPU itself */
+    Cpu::IdleCounts idle;
+    ulong at;
+};
+
+static void read_clocks_here(void* ctx, Context*)
+{
+    auto* sample = static_cast<ClockSample*>(ctx);
+    sample->ok = hal::read_clock_counters(&sample->counters);
+    sample->idle = CpuTable::get_instance().get_current_cpu().get_idle_counts();
+    sample->at = get_boot_time().get_value();
+}
+
+/* Each CPU of `mask` that runs read into `samples` -- MAX_CPUS of them -- by
+   an IPI to it that this waits for, one CPU after another; one that does
+   not run left unread */
+static void read_clocks(ClockSample* samples, ulong mask)
+{
+    auto& cpus = CpuTable::get_instance();
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        samples[i].ok = false;
+        if (!(mask & (1UL << i)))
+            continue;
+        auto& target = cpus.get_cpu(i);
+        ulong state = target.get_state();
+        if (!(state & Cpu::STATE_RUNNING) || (state & Cpu::STATE_EXITING) || target.is_parked())
+            continue;
+        IPITask task(read_clocks_here, &samples[i]);
+        target.queue_ipi_task(task);
+    }
+}
+
+/* What each CPU's clock did over a window: the clock it ran at while it was
+   busy and the share of the window it was -- its APERF and MPERF, against
+   the TSC: whether a busy core runs at its turbo clock, and whether a CPU
+   meant to idle does. */
+static void cmd_cpufreq(const char* args, stdlib::Printer& con)
+{
+    static const ulong DEFAULT_MS = 1000;
+    static const ulong MAX_MS = 10000;
+    static const ulong TAG = 'Freq';
+    static const ulong HZ_IN_KHZ = 1000;
+    static const ulong KHZ_IN_MHZ = 1000;
+    static const ulong PERMILLE = 1000;
+
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    ulong ms = DEFAULT_MS;
+    if (tok)
+    {
+        char buf[16];
+        stdlib::token_copy(tok, end, buf, sizeof(buf));
+        ulong value;
+        if (!stdlib::parse_ulong(buf, value) || value == 0 || value > MAX_MS)
+        {
+            con.printf("usage: cpufreq [ms, 1-%lu]\n", MAX_MS);
+            return;
+        }
+        ms = value;
+    }
+
+    ulong hz = hal::cycle_counter_hz();
+    if (hz == 0)
+    {
+        con.printf("cpufreq: the cycle counter's rate is not known yet\n");
+        return;
+    }
+
+    ulong bytes = MAX_CPUS * sizeof(ClockSample);
+    auto* before = (ClockSample*)mm::alloc(bytes, TAG);
+    if (!before)
+    {
+        con.printf("cpufreq: out of memory\n");
+        return;
+    }
+    auto* after = (ClockSample*)mm::alloc(bytes, TAG);
+    if (!after)
+    {
+        mm::free(before);
+        con.printf("cpufreq: out of memory\n");
+        return;
+    }
+
+    ulong mask = CpuTable::get_instance().get_running_cpus();
+    read_clocks(before, mask);
+    sleep(ms * consts::NANO_SECS_IN_MS);
+    read_clocks(after, mask);
+
+    con.printf("cpufreq: %lu ms, the cycle counter at %lu MHz\n", ms, hz / HZ_IN_KHZ / KHZ_IN_MHZ);
+    ulong shown = 0;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+    {
+        if (!before[i].ok || !after[i].ok)
+            continue;
+        const hal::ClockCounters& b = before[i].counters;
+        const hal::ClockCounters& a = after[i].counters;
+        /* Counters only go up; one that did not, written meanwhile, says
+           nothing of the window */
+        if (a.tsc <= b.tsc || a.aperf < b.aperf || a.mperf < b.mperf)
+            continue;
+        u64 dt = a.tsc - b.tsc;
+        u64 da = a.aperf - b.aperf;
+        u64 dm = a.mperf - b.mperf;
+        /* APERF over MPERF in kHz of the TSC first: a 10 s window's deltas
+           times a TSC's rate in kHz stay well inside 64 bits */
+        ulong mhz = (dm == 0) ? 0 : (ulong)(da * (hz / HZ_IN_KHZ) / dm / KHZ_IN_MHZ);
+        ulong busy = (ulong)((dm > dt ? dt : dm) * PERMILLE / dt);
+        /* Its idles' share of the window, by what they asked for: C1 and
+           deep, and how many of each */
+        ulong window = after[i].at - before[i].at;
+        ulong share[Cpu::IDLE_KINDS];
+        ulong count[Cpu::IDLE_KINDS];
+        for (ulong k = 0; k < Cpu::IDLE_KINDS; k++)
+        {
+            ulong ns = after[i].idle.ns[k] - before[i].idle.ns[k];
+            share[k] = (window == 0) ? 0 : (ulong)((u64)(ns > window ? window : ns) * PERMILLE / window);
+            count[k] = after[i].idle.idles[k] - before[i].idle.idles[k];
+        }
+        if (shown == 0)
+            con.printf("  cpu  MHz busy  busy%%  idle in C1, between, deepest: share (idles)\n");
+        con.printf("  %3lu  %8lu  %3lu.%lu%%  %3lu.%lu%% (%lu), %3lu.%lu%% (%lu), %3lu.%lu%% (%lu)\n", i, mhz,
+            busy / 10, busy % 10, share[0] / 10, share[0] % 10, count[0], share[1] / 10, share[1] % 10, count[1],
+            share[2] / 10, share[2] % 10, count[2]);
+        shown++;
+    }
+    if (shown == 0)
+        con.printf("cpufreq: no CPU here counts its clock (APERF and MPERF)\n");
+
+    mm::free(after);
+    mm::free(before);
+}
+
 static void cmd_top(const char* args, stdlib::Printer& con)
 {
     static const ulong MAX_SAMPLES = 256;
@@ -717,7 +857,8 @@ static void cmd_sched_probe(const char* args, stdlib::Printer& con)
             ok = false;
             break;
         }
-        task->set_cpu_affinity(1UL << cpu);
+        /* What it measures is that CPU's */
+        task->pin_to_cpu(cpu);
         if (!task->start((i == 0) ? sched_probe_waiter : sched_probe_spin, p))
         {
             task->put();
@@ -896,6 +1037,214 @@ static void cmd_sched_set(const char* args, stdlib::Printer& con, bool nice)
     }
 }
 
+/* A decimal number at `p`, `p` moved past it: at least a digit, and no
+   more than fit a CPU's index many times over */
+static bool parse_cpu_number(const char*& p, ulong& value)
+{
+    static const ulong DIGITS_MAX = 4;
+    ulong digits = 0;
+    value = 0;
+    while (*p >= '0' && *p <= '9')
+    {
+        if (++digits > DIGITS_MAX)
+            return false;
+        value = value * 10 + (ulong)(*p - '0');
+        p++;
+    }
+    return digits != 0;
+}
+
+/* CPUs as `sched affinity` takes them: a list of CPUs and ranges,
+   "8,9,24-25", or a mask in hex, "0x3000300" -- every CPU below MAX_CPUS,
+   and one at least. False for anything else. */
+static bool parse_cpus(const char* text, ulong& mask)
+{
+    mask = 0;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+    {
+        const char* p = text + 2;
+        if (*p == '\0')
+            return false;
+        for (; *p != '\0'; p++)
+        {
+            u8 nibble = stdlib::hex_char_to_nibble(*p);
+            /* A digit more would push bits past the 64 a mask has */
+            if (nibble == 0xFF || (mask >> 60) != 0)
+                return false;
+            mask = (mask << 4) | nibble;
+        }
+        return mask != 0;
+    }
+    const char* p = text;
+    while (*p != '\0')
+    {
+        ulong first = 0;
+        if (!parse_cpu_number(p, first))
+            return false;
+        ulong last = first;
+        if (*p == '-')
+        {
+            p++;
+            if (!parse_cpu_number(p, last))
+                return false;
+        }
+        if (first > last || last >= MAX_CPUS)
+            return false;
+        for (ulong c = first; c <= last; c++)
+            mask |= 1UL << c;
+        if (*p == ',')
+        {
+            p++;
+            if (*p == '\0')
+                return false;
+        }
+        else if (*p != '\0')
+        {
+            return false;
+        }
+    }
+    return mask != 0;
+}
+
+/* `mask` the way parse_cpus takes it: "8,9,24-25" */
+static void print_cpus(stdlib::Printer& con, ulong mask)
+{
+    bool first = true;
+    for (ulong c = 0; c < MAX_CPUS; c++)
+    {
+        if (!(mask & (1UL << c)))
+            continue;
+        ulong end = c;
+        while (end + 1 < MAX_CPUS && (mask & (1UL << (end + 1))))
+            end++;
+        if (!first)
+            con.printf(",");
+        if (end > c + 1)
+            con.printf("%lu-%lu", c, end);
+        else if (end == c + 1)
+            con.printf("%lu,%lu", c, end);
+        else
+            con.printf("%lu", c);
+        first = false;
+        c = end;
+    }
+    if (first)
+        con.printf("none");
+}
+
+/* Where a task is, for `sched affinity`: on cpu N, asleep there or not */
+static void print_task_cpu(stdlib::Printer& con, Task* task)
+{
+    ulong cpu = 0;
+    if (!task_home_cpu(task, cpu))
+    {
+        con.printf("on no cpu");
+        return;
+    }
+    con.printf("on cpu %lu%s", cpu, task->is_blocked() ? ", asleep" : "");
+}
+
+/* `sched affinity <pid> [<cpus>]`: the CPUs a task may run on, and where it
+   is -- or, with CPUs, those from now on (set_task_affinity). A task on a
+   CPU it is no longer to run on is taken off it at that CPU's next
+   decision, which this asks for, and moved to the lightest of the new
+   ones; what came of it is said after up to SETTLE_MS. One asleep there
+   moves when it next runs. A guest's vCPUs, a disk's task, the shell: any
+   task -- but the CPUs' idle and softirq tasks and a measurement's (trace
+   bench, sched probe), bound to their CPUs, which refuse it. */
+static void cmd_sched_affinity(const char* args, stdlib::Printer& con)
+{
+    static const ulong SETTLE_MS = 200;
+    static const ulong SETTLE_STEP_MS = 5;
+
+    const char* end;
+    const char* tok = stdlib::next_token(args, end);
+    char buf[24] = {};
+    ulong pid = 0;
+    if (tok)
+        stdlib::token_copy(tok, end, buf, sizeof(buf));
+    bool ok = tok && stdlib::parse_ulong(buf, pid);
+
+    ulong mask = 0;
+    bool set = false;
+    if (ok)
+    {
+        tok = stdlib::next_token(end, end);
+        if (tok)
+        {
+            char cbuf[96] = {};
+            ulong n = stdlib::token_copy(tok, end, cbuf, sizeof(cbuf));
+            ok = n < sizeof(cbuf) - 1 && parse_cpus(cbuf, mask) && stdlib::next_token(end, end) == nullptr;
+            set = true;
+        }
+    }
+    if (!ok)
+    {
+        con.printf("usage: sched affinity <pid> [<cpus>] -- cpus as a list, 8,9,24-25, or a hex mask, "
+            "0x3000300, each below %lu\n", (ulong)MAX_CPUS);
+        return;
+    }
+
+    ObjectPtr<Task> task(TaskTable::get_instance().lookup(pid));
+    if (!task)
+    {
+        con.printf("task %lu not found\n", pid);
+        return;
+    }
+
+    ulong was = task->get_cpu_affinity();
+    if (!set)
+    {
+        con.printf("%s (pid %lu): cpus ", task->get_name(), pid);
+        print_cpus(con, was & CpuTable::get_instance().get_running_cpus_no_lock());
+        con.printf("%s, ", task->is_pinned() ? " (bound to it)" : "");
+        print_task_cpu(con, task.get());
+        con.printf("\n");
+        return;
+    }
+
+    switch (set_task_affinity(task.get(), mask))
+    {
+    case AffinityResult::Pinned:
+        con.printf("%s (pid %lu) is bound to cpu ", task->get_name(), pid);
+        print_cpus(con, was);
+        con.printf(": its affinity is not for changing\n");
+        return;
+    case AffinityResult::NoCpu:
+        con.printf("no cpu of ");
+        print_cpus(con, mask);
+        con.printf(" runs: %s (pid %lu) is left as it was\n", task->get_name(), pid);
+        return;
+    case AffinityResult::Set:
+        break;
+    }
+
+    /* Watched for a moment: a task that runs, or waits to, is moved at its
+       CPU's next decision, which set_task_affinity asked for */
+    ulong cpu = 0;
+    for (ulong waited = 0; waited < SETTLE_MS; waited += SETTLE_STEP_MS)
+    {
+        if (!task_home_cpu(task.get(), cpu) || (mask & (1UL << cpu)) || task->is_blocked())
+            break;
+        sleep(SETTLE_STEP_MS * consts::NANO_SECS_IN_MS);
+    }
+
+    con.printf("%s (pid %lu): cpus ", task->get_name(), pid);
+    print_cpus(con, mask & CpuTable::get_instance().get_running_cpus_no_lock());
+    con.printf(" (were ");
+    print_cpus(con, was & CpuTable::get_instance().get_running_cpus_no_lock());
+    con.printf("), ");
+    print_task_cpu(con, task.get());
+    if (task_home_cpu(task.get(), cpu) && !(mask & (1UL << cpu)))
+    {
+        if (task->is_blocked())
+            con.printf(" -- it moves when it next runs");
+        else
+            con.printf(" -- not moved yet");
+    }
+    con.printf("\n");
+}
+
 /* What each CPU's scheduler did over a window (SchedStats): how long a woken
    task waited for the CPU -- at the median, the 99th and the 99.9th
    percentile, the buckets' bounds, and the longest since boot, exactly --
@@ -933,12 +1282,17 @@ static void cmd_sched(const char* args, stdlib::Printer& con)
             cmd_sched_set(end, con, buf[0] == 'n');
             return;
         }
+        if (stdlib::str_cmp(buf, "affinity") == 0)
+        {
+            cmd_sched_affinity(end, con);
+            return;
+        }
 
         ulong ms;
         if (!stdlib::parse_ulong(buf, ms) || ms == 0 || ms > MAX_INTERVAL_MS)
         {
             con.printf("usage: sched [interval-ms, 1-%lu] | sched probe [spinners=N] [ms=M] [cpu=N] | "
-                "sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us>\n",
+                "sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> | sched affinity <pid> [<cpus>]\n",
                 MAX_INTERVAL_MS);
             return;
         }
@@ -2013,7 +2367,8 @@ static const CmdEntry COMMANDS[] = {
     { "ps",        cmd_ps,        "ps - show tasks" },
     { "stacks",    cmd_stacks,    "stacks - stack high-water marks" },
     { "top",       cmd_top,       "top [ms] - per-task cpu use over a sampling window" },
-    { "sched",     cmd_sched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice" },
+    { "cpufreq",   cmd_cpufreq,   "cpufreq [ms] - each cpu's clock while busy, and how busy, over a window (APERF/MPERF)" },
+    { "sched",     cmd_sched,     "sched [ms] | sched probe [spinners=N] [ms=M] [cpu=N] | sched queue [cpu] | sched nice <pid> <n> | sched slice <pid> <us> | sched affinity <pid> [<cpus>] - what each cpu's scheduler did over a window; how long a woken task waits behind spinners; what EEVDF has of a cpu's tasks; a task's weight and slice; the cpus it may run on (8,9,24-25 or 0x3000300), a task off them moved" },
     { "profile",   cmd_profile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "trace",     tp::command,   "trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench - tracepoints: events recorded as they happen into each cpu's ring, and read back merged by time -- shown, dumped as JSON, or paired into how long a woken task waited for its cpu; `freeze wakeup>N` freezes the rings on a wakeup that waits longer" },
     { "watchdog",  cmd_watchdog,  "watchdog - show watchdog stats" },

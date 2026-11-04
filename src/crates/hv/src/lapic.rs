@@ -41,6 +41,8 @@ pub const MSR_APIC_BASE: u32 = 0x1B;
 pub const MSR_TSC_DEADLINE: u32 = 0x6E0;
 /// The x2APIC's registers: MSR 0x800 plus the xAPIC offset over 16.
 pub const MSR_X2APIC_FIRST: u32 = 0x800;
+/// The x2APIC's interrupt command register: an IPI a write.
+pub const MSR_X2APIC_ICR: u32 = MSR_X2APIC_FIRST + REG_ICR;
 pub const MSR_X2APIC_LAST: u32 = 0x8FF;
 
 /// Whether `msr` is one of this device's.
@@ -930,6 +932,34 @@ impl Lapic {
     /// In x2APIC mode: on, and extended.
     fn x2apic(&self) -> bool {
         self.base & (BASE_EN | BASE_EXTD) == BASE_EN | BASE_EXTD
+    }
+
+    /// A write of `value` to the x2APIC's ICR, by the CPU whose APIC ID is
+    /// `me`, that sends a fixed IPI, or a lowest-priority one, of a vector a
+    /// fixed interrupt may have, to other CPUs alone: the IPI, the ICR then
+    /// holding `value` as `wrmsr` would leave it -- `wrmsr`'s own decoding,
+    /// of a write none of whose errors it can meet. None, and nothing done,
+    /// for any other write, which is `wrmsr`'s to answer: one in xAPIC mode,
+    /// a reserved bit, a vector below 16, an NMI, INIT or start-up, and one
+    /// that reaches this CPU itself, whose own APIC is the run loop's to
+    /// take it into. What the world switch's fast path takes
+    /// (`run::FastMsr`).
+    pub fn fixed_ipi(&mut self, value: u64, me: u32) -> Option<Ipi> {
+        if !self.x2apic() || value & ICR_RESERVED != 0 || (value & ICR_VECTOR) < 16 {
+            return None;
+        }
+        if !matches!((value >> ICR_DELIVERY_SHIFT) & ICR_DELIVERY_MASK, 0 | 1) {
+            return None;
+        }
+        /* Of a write past the checks above, `write_icr` does nothing but
+         * keep it in the ICR: put back, nothing of it is left. */
+        let before = self.icr;
+        let ipi = self.write_icr(value, false).ok().flatten()?;
+        if ipi.reaches(me, self.addressing(), me) {
+            self.icr = before;
+            return None;
+        }
+        Some(ipi)
     }
 
     /// A write of `value` to `msr`, at `now`: what it did that the caller
