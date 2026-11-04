@@ -180,7 +180,12 @@ ulong cycle_counter_hz();
 #endif
 
 // Provides namespace Hal { is_interrupt_enabled, irq_save, irq_restore,
-// get_sp, set_sp, get_fp, read_cycle_counter }.
+// get_sp, set_sp, get_fp, read_cycle_counter, read_cycle_counter_unordered }.
+// read_cycle_counter_unordered: the same counter read as soon as the CPU
+// gets to it, ordered against nothing around it -- not even an earlier read
+// of it -- for a stamp that only has to be close: a trace record's, whose
+// ring keeps its records' stamps in order itself (TraceRing::write_words).
+// What times an interval reads read_cycle_counter.
 #if defined(__x86_64__)
 #include <arch/x86_64/hal_cpu_inline.h>
 #elif defined(__aarch64__)

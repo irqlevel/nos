@@ -4355,7 +4355,7 @@ static bool test_tracepoints()
     for (ulong i = 0; i < RECORDS; i++)
     {
         tp::Test t = { i, trace_test_value(i) };
-        tp::emit(tp::Id::Test, &t, sizeof(t));
+        tp::emit(tp::Id::Test, t);
     }
     u64 from_rust = rust_trace_emit_test(RECORDS, RECORDS);
     hal::irq_restore(flags);
@@ -4392,7 +4392,7 @@ static bool test_tracepoints()
     if (ok)
     {
         tp::Test t = { ALL, 0 };
-        tp::emit(tp::Id::Test, &t, sizeof(t));
+        tp::emit(tp::Id::Test, t);
         if (rust_trace_emit_test(ALL, 1) != 1 || tp::read_cpu(cpu, tp::Id::Test, records, ALL + 1) != ALL)
         {
             klog(0, "Tracepoints: a record taken while recording was frozen");

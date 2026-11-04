@@ -1397,6 +1397,8 @@ impl LinuxGuest {
     /// once to take the frame or the answer, rather than at the host's next
     /// interrupt.
     pub fn run(&self, gc: &mut GuestCpu, machine: &Machine, deadline: u64, host: &dyn Host) -> Counts {
+        /* This task runs the CPU now: its records' pid */
+        gc.cpu.note_task();
         let me = gc.index as usize;
         let (Some(bell), Some(shared)) = (self.doorbells.get(me), self.cpus.get(me)) else {
             /* `new` made one of each for every CPU it made. */
@@ -1500,7 +1502,7 @@ impl LinuxGuest {
                     Step::Ran { host: false, .. } => TimerHow::Exit,
                     Step::Other => TimerHow::Other,
                 };
-                tp::timer(gc.index, how, late);
+                tp::timer(gc.index, gc.cpu.pid(), how, late);
                 if late > LATE_NS {
                     let c = &mut gc.counts;
                     match how {
@@ -1640,7 +1642,7 @@ impl LinuxGuest {
                                 let of = tp::HaltFor {
                                     timer: gc.lapic.next_timer_ns(), pit: pit_edge, devices: devices_due, deadline,
                                 };
-                                tp::halt(gc.index, now, until, &of, if spin { gc.poll_ns } else { 0 });
+                                tp::halt(gc.index, gc.cpu.pid(), now, until, &of, if spin { gc.poll_ns } else { 0 });
                             }
                             if spin {
                                 gc.counts.polls += 1;
@@ -1649,7 +1651,7 @@ impl LinuxGuest {
                                     gc.step = Step::Spun;
                                     if trace::on::<HvWake>() {
                                         let halted = time::boot_time_ns().saturating_sub(now);
-                                        tp::wake(gc.index, WakeHow::Polled, halted, 0);
+                                        tp::wake(gc.index, gc.cpu.pid(), WakeHow::Polled, halted, 0);
                                     }
                                     continue;
                                 }
@@ -1688,7 +1690,7 @@ impl LinuxGuest {
                                 }
                             }
                             let halt = time::boot_time_ns().saturating_sub(now);
-                            tp::wake(gc.index, how, halt, over);
+                            tp::wake(gc.index, gc.cpu.pid(), how, halt, over);
                             gc.poll_ns = if halt > POLL_MAX_NS {
                                 0
                             } else if halt > gc.poll_ns {
@@ -2210,7 +2212,7 @@ impl LinuxGuest {
             if !v.event_queued() {
                 v.reflect_exception(vector, error);
                 gc.exception = None;
-                tp::inject(gc.index, InjectKind::Exception, vector);
+                tp::inject(gc.index, gc.cpu.pid(), InjectKind::Exception, vector);
             }
             return;
         }
@@ -2220,7 +2222,7 @@ impl LinuxGuest {
                 v.inject_nmi();
                 gc.nmi_pending = false;
                 gc.counts.nmi += 1;
-                tp::inject(gc.index, InjectKind::Nmi, VECTOR_NMI);
+                tp::inject(gc.index, gc.cpu.pid(), InjectKind::Nmi, VECTOR_NMI);
                 return;
             }
             /* In its handler for the last one, or in a shadow: told when it
@@ -2238,7 +2240,7 @@ impl LinuxGuest {
         if !v.interruptible() {
             gc.counts.blocked += 1;
             v.request_irq_window();
-            tp::inject(gc.index, InjectKind::Window, apic.unwrap_or(0));
+            tp::inject(gc.index, gc.cpu.pid(), InjectKind::Window, apic.unwrap_or(0));
             return;
         }
         if extint && (apic.is_none() || !gc.last_from_pic) {
@@ -2253,7 +2255,7 @@ impl LinuxGuest {
                 v.clear_irq_window();
                 gc.last_from_pic = true;
                 gc.counts.irq += 1;
-                tp::inject(gc.index, InjectKind::Pic, vector);
+                tp::inject(gc.index, gc.cpu.pid(), InjectKind::Pic, vector);
                 if irq == 0 {
                     gc.counts.irq0 += 1;
                 }
@@ -2270,7 +2272,7 @@ impl LinuxGuest {
                 v.clear_irq_window();
                 gc.last_from_pic = false;
                 gc.counts.apic += 1;
-                tp::inject(gc.index, InjectKind::Apic, vector);
+                tp::inject(gc.index, gc.cpu.pid(), InjectKind::Apic, vector);
             }
             None => v.clear_irq_window(),
         }
