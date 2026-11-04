@@ -62,6 +62,14 @@ bool set_cpu_epp(u32 epp)
     return false;
 }
 
+bool read_clock_counters(ClockCounters* out)
+{
+    /* No APERF or MPERF here: the activity monitors that would stand for
+       them (ARMv8.4's AMU) are not on the machines nos runs on. */
+    *out = ClockCounters{};
+    return false;
+}
+
 bool setup_cpu_c1e(bool* was_on, bool* on)
 {
     /* No C1E here: WFI is the only idle there is. */
