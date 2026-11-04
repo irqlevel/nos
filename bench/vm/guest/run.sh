@@ -13,6 +13,11 @@ OUT=/var/lib/bench/run
 CON=/dev/ttyS0
 QUICK=0
 [ -e $B/QUICK ] && QUICK=1
+# ONLY beside it: the steps it names alone, a word each (sysbench-cpu 7zip
+# openssl sysbench-memory perf-bench cyclictest fio kbuild pgbench) -- a run
+# of a few minutes for the step a change is about, the rest left out
+ONLY=
+[ -e $B/ONLY ] && ONLY=" $(tr -s ' \n' '  ' < $B/ONLY) "
 rm -f $B/AUTORUN
 rm -rf $OUT
 mkdir -p $OUT
@@ -21,11 +26,13 @@ exec >> $OUT/run.log 2>&1
 con() { printf '%s\n' "$*" > $CON; }
 say() { printf 'BENCH %s\n' "$*" | tee -a $OUT/summary.txt > $CON; }
 step() { con "BENCH-STEP $(date +%T) $*"; echo "== $(date +%T) $*"; }
+# want <step>: whether this run takes the step -- every one, but for ONLY
+want() { [ -z "$ONLY" ] || case "$ONLY" in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 # d <full> <quick>: a length or a count, cut short in a quick run
 d() { if [ $QUICK = 1 ]; then echo "$2"; else echo "$1"; fi; }
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
-step "start quick=$QUICK"
+step "start quick=$QUICK only=[${ONLY# }]"
 systemctl is-system-running --wait > $OUT/system-state.txt 2>&1
 systemctl --failed --no-legend > $OUT/failed-units.txt 2>&1
 sleep "$(d 60 3)"
@@ -57,6 +64,7 @@ for f in /sys/block/vda/queue/*; do [ -f "$f" ] && echo "${f##*/}: $(cat "$f" 2>
 cat /proc/interrupts > $OUT/interrupts-start.txt
 dpkg -l > $OUT/dpkg.txt
 
+if want sysbench-cpu; then
 step sysbench-cpu
 for t in 1 4; do
     for r in $(seq 1 "$(d 3 1)"); do
@@ -66,6 +74,9 @@ for t in 1 4; do
     done
 done
 
+fi
+
+if want 7zip; then
 step 7zip
 for t in 1 4; do
     if [ $QUICK = 1 ]; then
@@ -77,12 +88,18 @@ for t in 1 4; do
         avr "[$(grep '^Avr:' $OUT/7z-mt$t.txt | tr -s ' ')]"
 done
 
+fi
+
+if want openssl; then
 step openssl
 for alg in aes-256-gcm chacha20-poly1305 sha256; do
     timeout 300 openssl speed -elapsed -seconds "$(d 3 1)" -evp $alg > $OUT/openssl-$alg.txt 2>&1
     say openssl $alg 16k_bytes "$(tail -1 $OUT/openssl-$alg.txt | awk '{print $NF}')"
 done
 
+fi
+
+if want sysbench-memory; then
 step sysbench-memory
 for t in 1 4; do
     for op in read write; do
@@ -97,6 +114,9 @@ for t in 1 4; do
     say sysbench_mem rnd_read t$t "${v:-FAILED}" MiB/s
 done
 
+fi
+
+if want perf-bench; then
 step perf-bench
 PERF=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | sort -V | tail -1)
 if [ -n "$PERF" ]; then
@@ -112,10 +132,16 @@ else
     say perf_bench FAILED no perf under /usr/lib/linux-tools
 fi
 
+fi
+
+if want cyclictest; then
 step cyclictest
 timeout 600 cyclictest -m -q -t 4 -a -p 95 -i 1000 -D "$(d 60 5)" > $OUT/cyclictest.txt 2>&1
 say cyclictest "$(sed -n 's/^T: *\([0-9]*\).*Min: *\([0-9]*\).*Avg: *\([0-9]*\).*Max: *\([0-9]*\).*/T\1 min=\2 avg=\3 max=\4;/p' $OUT/cyclictest.txt | xargs)" us
 
+fi
+
+if want fio; then
 step fio
 F=/var/lib/bench/fio.dat
 SIZE=$(d 2g 256m)
@@ -150,6 +176,9 @@ fio_job randwrite_4k_fdatasync randwrite 4k 1 1 --ioengine=psync --fdatasync=1
 rm -f $F
 sync
 
+fi
+
+if want kbuild; then
 step kbuild
 cd /var/lib/bench
 rm -rf linux-*
@@ -177,6 +206,9 @@ sync
 t1=$(now_ms)
 say kbuild rm_ms $((t1 - t0))
 
+fi
+
+if want pgbench; then
 step pgbench
 SCALE=$(d 100 5)
 T=$(d 60 3)
@@ -207,6 +239,8 @@ for r in $(seq 1 "$(d 3 1)"); do
     for c in 1 4 8 16; do pg_run rw $c $r; done
 done
 psql -qXAt -d bench -c "select pg_size_pretty(pg_database_size('bench'))" > $OUT/pg-size-end.txt 2>&1
+
+fi
 
 step end
 cat /proc/interrupts > $OUT/interrupts-end.txt
