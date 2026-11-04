@@ -278,7 +278,8 @@ its notify said), the MSR, the guest's page (the xAPIC's, the IO-APIC's),
 the vector (the host's, under VT-x). A HLT's is the halt's sleep, idle,
 said so. A ring is paired with the next entry of the vCPU it named, where
 that number is one task's alone among the records -- one VM's, or each VM a
-CPU of a number of its own. A guest disk's request is paired through its
+CPU of a number of its own; a posted interrupt's notification is counted and
+not paired, the CPU taking it in the guest with no entry at all. A guest disk's request is paired through its
 hand-offs by its disk, slot, op, offset and length, which the virtio
 disk's records and the disk task's both carry, and the device's commands
 with it by their buffer, which is the request's slot: its four stretches --
