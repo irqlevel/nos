@@ -279,6 +279,38 @@ bool idle_masked()
     return idle_mwait_on;
 }
 
+bool set_cpu_epp(u32 epp)
+{
+    static const u32 LEAF_BASIC = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_EAX_HWP = 1U << 7;
+    static const u32 POWER_EAX_HWP_EPP = 1U << 10;
+    static const u32 PM_ENABLE_MSR = 0x770;
+    static const u64 PM_ENABLE_HWP = 1ULL << 0;
+    static const u32 HWP_REQUEST_MSR = 0x774;
+    static const u64 FIELD_MASK = 0xFF;
+    static const u32 REQ_EPP_SHIFT = 24;
+
+    /* Only where setup_cpu_performance put HWP in charge: every HWP MSR but
+       IA32_PM_ENABLE is out of bounds until HWP is on (SDM 15.4.2) */
+    if (cpuid(LEAF_BASIC).eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    u32 power = cpuid(LEAF_POWER).eax;
+    if ((power & (POWER_EAX_HWP | POWER_EAX_HWP_EPP)) != (POWER_EAX_HWP | POWER_EAX_HWP_EPP))
+        return false;
+    if (!(read_msr(PM_ENABLE_MSR) & PM_ENABLE_HWP))
+        return false;
+    u64 request = read_msr(HWP_REQUEST_MSR);
+    request &= ~(FIELD_MASK << REQ_EPP_SHIFT);
+    request |= ((u64)epp & FIELD_MASK) << REQ_EPP_SHIFT;
+    write_msr(HWP_REQUEST_MSR, request);
+    return true;
+}
+
 bool setup_cpu_c1e(bool* was_on, bool* on)
 {
     static const u32 LEAF_VENDOR = 0;

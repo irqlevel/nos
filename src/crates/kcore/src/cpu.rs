@@ -180,3 +180,26 @@ pub fn preempt_is_on() -> bool {
 pub fn preempt_can_block() -> bool {
     ffi::cpu::kernel_preempt_can_block() != 0
 }
+
+/// A CPU held at the performance preference -- HWP's EPP 0 -- for as long
+/// as this lives: what a CPU a guest's vCPU or disk runs on asks while it
+/// is theirs, so that its clock stays up through the idles between the
+/// guest's ticks rather than drop and climb back at every wake. Holds of
+/// one CPU are counted; the last let go puts back the boot's preference.
+/// Nothing where the CPU has no HWP. Made and dropped in task context.
+pub struct Performance {
+    cpu: u32,
+}
+
+impl Performance {
+    pub fn hold(cpu: u32) -> Self {
+        ffi::cpu::kernel_cpu_performance(cpu, 1);
+        Self { cpu }
+    }
+}
+
+impl Drop for Performance {
+    fn drop(&mut self) {
+        ffi::cpu::kernel_cpu_performance(self.cpu, 0);
+    }
+}
