@@ -1555,8 +1555,9 @@ pub fn report() {
               than 1 ms past their time", LATE_SLEPT.load(Ordering::Relaxed), LATE_OTHER.load(Ordering::Relaxed),
              OVERSLEPT.load(Ordering::Relaxed));
     println!("  platform: {} disks served from outside every CPU", SERVED.load(Ordering::Relaxed));
-    println!("  platform: {} WRMSRs answered in the world switch's own loop",
-             crate::cpu::FAST_ANSWERED.load(Ordering::Relaxed));
+    println!("  platform: {} WRMSRs answered in the world switch's own loop, {} HLTs ended there -- of {} offered it, \
+              of {} made", crate::cpu::FAST_ANSWERED.load(Ordering::Relaxed), crate::cpu::FAST_HLTS.load(Ordering::Relaxed),
+             crate::cpu::HLTS_OFFERED.load(Ordering::Relaxed), crate::cpu::HLTS_MADE.load(Ordering::Relaxed));
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
     println!("  platform: {} trace records built", crate::trace::emitted());
