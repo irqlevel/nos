@@ -157,6 +157,14 @@ impl Kick {
         true
     }
 
+    /// Whether a kick has come since the vCPU's `prepare` -- its entry to
+    /// be turned back (`entering`): for a wait made with the vCPU in its
+    /// guest as others see it (`super::fast::FastExit::hlt`), which ends
+    /// for whatever a kick brings.
+    pub fn refuses(&self) -> bool {
+        self.mode.load(Ordering::SeqCst) != IN_GUEST
+    }
+
     pub(crate) fn left(&self) {
         self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
     }

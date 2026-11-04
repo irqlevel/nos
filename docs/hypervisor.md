@@ -2493,6 +2493,22 @@ average exit; `hv-fuzz.py`'s whole-machine runs offer three in four of their
 scripted WRMSRs to it, the rest going the round, and hold both to the same
 invariants.
 
+**A HLT that an IPI ends soon is waited out there too** (`FastExit::hlt`,
+VT-x with posted interrupts): with interrupts on in the guest, nothing in
+its virtual APIC (RVI 0) and no window asked for, the run loop's `FastMsr`
+spins with the host's interrupts off -- for as long as the CPU's halts have
+lately been ending within (`poll_ns`), to `HLT_SPIN_NS`, 50 us -- until
+something is posted for the CPU, and the loop steps past the HLT and enters
+again at once: the vCPU is in its guest as posters see it, so the poster
+sends the notification, which waits on this CPU and is taken in the guest
+as it enters. On the EX44 the round after a halt's wake took 983 ns to the
+next entry, and the exit to the halt 381 more (round 22, perf's pipe). A kick -- a ring for mail, a
+device, a stop --, the host timer's armed edge, or the time up ends the wait
+with nothing done and the HLT goes the loop's way; a CPU without posted
+interrupts, and AMD-V, never wait here. The report counts the HLTs ended so
+(`hlt_answered`), among the exits and the HLTs, none of them a halt of the
+loop's.
+
 **An edge of its own timers that comes on the way in is taken a round
 later**, not at the host's next tick. The loop looks at its timers, and
 arms the host's timer for their next edge a few hundred nanoseconds later

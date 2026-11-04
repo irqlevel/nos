@@ -77,6 +77,13 @@ pub mod fast;
 /// script), over the run: what the stats line says.
 pub static FAST_ANSWERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// HLTs ended in the world switch's own loop (`FastExit::hlt`), over the run,
+/// and those offered it -- HLTs the scripts made, and those of them the
+/// backend's state let be offered.
+pub static FAST_HLTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HLTS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HLTS_OFFERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether the WRMSR of `value` at `rip` is offered to the fast path: three
 /// in four, so that the run loop's own answer to the same writes is driven
 /// too -- by the write itself, so that an input makes the same choices
@@ -898,6 +905,15 @@ pub mod vm {
         pub fn skip_hlt(&mut self) {
             self.step(1);
         }
+        /// Whether a HLT is one vmx.rs's loop offers its fast path: with
+        /// interrupts on in the guest, virtual-interrupt delivery on and
+        /// posted interrupts in use, no window asked for, and nothing in
+        /// VIRR.
+        pub fn fast_hlt_offered(&self) -> bool {
+            const RFLAGS_IF: u64 = 1 << 9;
+            self.save().rflags & RFLAGS_IF != 0 && self.apicv && self.posted.is_some() && !self.irq_window
+                && !self.nmi_window && self.virr.iter().all(|&w| w == 0)
+        }
         pub fn skip_pause(&mut self) {
             self.step(2);
         }
@@ -1425,6 +1441,15 @@ pub mod vm {
         }
     }
 
+    /// The CPU after `me`, with the CPUs on threads: who a HLT waited out
+    /// in the world switch lets run meanwhile (`enter_script`), as another
+    /// CPU of a host's runs while one spins.
+    fn next_cpu(me: usize) -> Option<usize> {
+        let b = baton();
+        let n = b.as_ref()?.cpus.len();
+        (n > 1).then(|| (me + 1) % n)
+    }
+
     /// CPU `me`, in its guest, lets `to` run first -- if `to` can run.
     fn switch_to(me: usize, to: usize) {
         {
@@ -1597,6 +1622,44 @@ pub mod vm {
                             invariant!(k.edge().is_none_or(|edge| armed <= edge),
                                        "CPU {} entered its guest again past a WRMSR with the host's timer armed for {} \
                                         ns, past the edge {:?} ns", me, armed, k.edge());
+                        }
+                        self.backend.entered();
+                        entered_at = crate::time::cycle_counter();
+                    }
+                    /* A HLT with interrupts on, nothing waiting in the virtual
+                     * APIC, posted interrupts in use and no window asked
+                     * for -- as vmx.rs's loop offers one (`FastExit::hlt`):
+                     * ended there by what is posted meanwhile, the guest
+                     * entered again past it; else the loop's halt. Here the
+                     * other CPUs wait their turn meanwhile, so it is ended
+                     * by what was posted before it, or not at all. */
+                    Some(Next::Exit(Exit::Hlt)) if fast.is_some() && {
+                        crate::cpu::HLTS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.backend.fast_hlt_offered()
+                    } => {
+                        crate::cpu::HLTS_OFFERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let rip = self.backend.save().rip;
+                        /* Now and then another CPU runs first -- and may post
+                         * for this one, which the wait then ends for. */
+                        if crate::cpu::fast_turn(rip, entered_at) {
+                            if let Some(to) = next_cpu(me) {
+                                switch_to(me, to);
+                            }
+                        }
+                        let mut ran = self.last_run;
+                        ran.next(crate::trace::on::<crate::trace::HvExit>(), entered_at, crate::time::cycle_counter());
+                        if !fast.as_deref_mut().is_some_and(|f| f.hlt(rip, ran)) {
+                            break Exit::Hlt;
+                        }
+                        self.last_run = ran;
+                        self.backend.skip_hlt();
+                        crate::cpu::FAST_HLTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        invariant!(crate::sync::held() == 0, "CPU {} ended a HLT in the world switch with {} of the \
+                                   kernel's locks held", me, crate::sync::held());
+                        if let Some(k) = kick {
+                            if !k.entering(me as u32) {
+                                return Ok((Exit::Kicked, me as u32));
+                            }
                         }
                         self.backend.entered();
                         entered_at = crate::time::cycle_counter();

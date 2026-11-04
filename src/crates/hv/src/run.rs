@@ -188,6 +188,11 @@ const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
 const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
 const POLL_MAX_NS: u64 = 200 * kcore::consts::NS_PER_US;
 
+/// The longest a HLT is waited out in the world switch's own loop
+/// (`FastMsr::hlt`), with the host's interrupts held off meanwhile: past it
+/// the halt is the loop's, its spin with interrupts on and its sleep.
+const HLT_SPIN_NS: u64 = 50 * kcore::consts::NS_PER_US;
+
 /// How far short of its own timer's edge a halted vCPU's sleep ends, the
 /// rest spun: what a wake costs the host's sleeper -- its timer interrupt, a
 /// schedule, a switch -- which made the EX44's guests' timer interrupts 9-10
@@ -252,6 +257,9 @@ struct FastMsr<'a> {
     other_due: Option<u64>,
     /// The deadline its host timer is armed for (`GuestCpu::asked`)
     asked: &'a mut Option<u64>,
+    /// How long its halts have lately been ending within
+    /// (`GuestCpu::poll_ns`): the most `hlt` waits, to `HLT_SPIN_NS`.
+    poll_ns: u64,
 }
 
 impl hvarch::x86::fast::FastExit for FastMsr<'_> {
@@ -275,6 +283,45 @@ impl hvarch::x86::fast::FastExit for FastMsr<'_> {
             }
         }
         answered
+    }
+
+    /// A HLT with interrupts on, nothing waiting in the virtual APIC and
+    /// posted interrupts in use (`hvarch::x86::fast`): what is posted for
+    /// this CPU spun for, interrupts off, for as long as its halts have
+    /// lately been ending within (`poll_ns`, to `HLT_SPIN_NS`), and true
+    /// once something is -- its notification pending here, or on its way,
+    /// for the CPU to take as it enters. False, and the halt the loop's, for
+    /// a CPU without posted interrupts, halts that have lately been long, a
+    /// kick (a ring: mail, a device, a stop), the edge the host's timer is
+    /// armed for, or the spin's time up.
+    fn hlt(&mut self, rip: u64, ran: hvarch::x86::svm::Run) -> bool {
+        let Some(shared) = self.guest.cpus.get(self.me as usize) else { return false };
+        let (true, Some(posted)) = (shared.posted_on.load(Ordering::Acquire), shared.posted.as_ref()) else {
+            return false;
+        };
+        let limit = self.poll_ns.min(HLT_SPIN_NS);
+        if limit == 0 {
+            return false;
+        }
+        let edge = self.kick.edge();
+        let from = time::boot_time_ns();
+        while !posted.outstanding() {
+            if self.kick.refuses() {
+                return false;
+            }
+            let now = time::boot_time_ns();
+            if now.saturating_sub(from) >= limit || edge.is_some_and(|edge| now >= edge) {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        self.counts.hlt += 1;
+        self.counts.hlt_answered += 1;
+        if trace::on::<trace::HvExit>() {
+            let regs = tp::ExitRegs { rip, rax: 0, rcx: 0 };
+            tp::exit(self.me, self.pid, &Exit::Hlt, regs, ran, None);
+        }
+        true
     }
 }
 
@@ -481,6 +528,10 @@ pub struct Counts {
     /// guest entered again from there (`FastMsr`): exits counted among
     /// `exits`, none of them seen by the loop.
     pub answered: u64,
+    /// HLTs ended there too, by an interrupt posted for the CPU while the
+    /// world switch's loop waited for one (`FastMsr::hlt`): among `exits`
+    /// and `hlt`, none of them a halt of the loop's.
+    pub hlt_answered: u64,
     /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
     /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
     /// stopped the guest after, of level-triggered vectors.
@@ -620,6 +671,7 @@ impl Counts {
         self.overslept_max = self.overslept_max.max(o.overslept_max);
         self.fast += o.fast;
         self.answered += o.answered;
+        self.hlt_answered += o.hlt_answered;
         self.polls += o.polls;
         self.polled += o.polled;
         self.handled_ns += o.handled_ns;
@@ -1849,20 +1901,20 @@ impl LinuxGuest {
              * entry. */
             let edges_passed = kick.edges_passed();
             let entered_at = time::boot_time_ns();
-            let answered_before = gc.counts.answered;
+            let answered_before = gc.counts.answered + gc.counts.hlt_answered;
             let entered = {
                 /* Its writes of the ICR and of the TSC deadline answered in
                  * the world switch's own loop where they can be (`FastMsr`):
                  * the entry after each made then and there. */
                 let pid = gc.cpu.pid();
-                let GuestCpu { index, cpu, lapic, counts, other_due, asked, .. } = &mut *gc;
+                let GuestCpu { index, cpu, lapic, counts, other_due, asked, poll_ns, .. } = &mut *gc;
                 let mut fast = FastMsr {
-                    guest: self, me: *index, pid, lapic, counts, kick, other_due: *other_due, asked,
+                    guest: self, me: *index, pid, lapic, counts, kick, other_due: *other_due, asked, poll_ns: *poll_ns,
                 };
                 cpu.enter(&self.memory, machine, Some(kick), Some(&mut fast))
             };
             let exit_at = time::boot_time_ns();
-            gc.counts.exits += gc.counts.answered - answered_before;
+            gc.counts.exits += gc.counts.answered + gc.counts.hlt_answered - answered_before;
             if apicv {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
                 gc.lapic.from_cpu(&irr, &isr, tpr);
