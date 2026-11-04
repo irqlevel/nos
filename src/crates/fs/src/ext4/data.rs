@@ -264,29 +264,16 @@ impl Txn<'_> {
             if self.dirty.len() > self.jnl.max_txn / 2 {
                 break;
             }
+            /* A leaf's extents at a time: what is written already, and a
+             * hole -- given back since it was written -- left as they are. */
             let lu = u32::try_from(l).ok()?;
-            match self.ext_lookup(ino, &raw, lu)? {
-                Some(e) => {
-                    let e_end = u64::from(e.first) + u64::from(e.len);
-                    let n = (e_end.min(end) - l) as u32;
-                    if e.unwritten {
-                        let m = self.ext_mark_written(ino, &mut raw, lu, n)?;
-                        changed = true;
-                        l += u64::from(m.max(1));
-                    } else {
-                        l += u64::from(n);
-                    }
-                }
-                None => {
-                    /* A hole -- given back since it was written: nothing to
-                     * make written there. */
-                    let hole = match source::map(self, ino, &raw, l)? {
-                        Map::Hole { run } => run.max(1),
-                        Map::Blocks { .. } => 1,
-                    };
-                    l += hole.min(end - l);
-                }
+            let (next, made) = self.ext_mark_written_leaf(ino, &mut raw, lu, end)?;
+            if next <= l {
+                klog!(0, "ext4: blocks of inode {} made written got nowhere at block {}", ino, l);
+                return None;
             }
+            changed |= made;
+            l = next;
         }
         if changed && !self.put_inode(ino, &mut raw) {
             return None;

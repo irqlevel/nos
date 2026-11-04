@@ -506,6 +506,50 @@ impl Txn<'_> {
         self.settle(ino, iseed, raw, path, k).then_some(m)
     }
 
+    /// `ext_mark_written` of every unwritten extent the leaf holding file
+    /// block `l` maps inside `l..end` -- each made written, split where the
+    /// range begins or ends inside it -- with one walk down the tree, and the
+    /// leaf merged and settled once, where `ext_mark_written` walks and
+    /// settles for each extent: a guest's flush converts what it wrote, in
+    /// as many extents as its image's blocks came in. Where the leaf's part
+    /// of the file, or `end`, stops -- a call from there goes on -- and
+    /// whether anything was made written.
+    pub fn ext_mark_written_leaf(&mut self, ino: u32, raw: &mut [u8], l: u32, end: u64) -> Option<(u64, bool)> {
+        let iseed = self.iseed(ino, raw)?;
+        let mut path = self.path_to(ino, iseed, raw, l)?;
+        let (from, to) = (u64::from(l), end.min(path.limit));
+        let leaf = path.nodes.last_mut()?;
+        /* Only the first extent the range takes can begin before it, and
+         * only the last end past it: two pieces more at most. */
+        let mut out: Vec<Leaf> = Vec::new();
+        if out.try_reserve_exact(leaf.leaves.len() + 2).is_err() {
+            klog!(0, "ext4: no memory to make blocks of inode {} written", ino);
+            return None;
+        }
+        let mut changed_at = None;
+        for e in leaf.leaves.drain(..) {
+            let (f, e_end) = (u64::from(e.first), u64::from(e.first) + u64::from(e.len));
+            if !e.unwritten || e_end <= from || f >= to {
+                out.push(e);
+                continue;
+            }
+            let (a, b) = (f.max(from), e_end.min(to));
+            if f < a {
+                out.push(Leaf { len: (a - f) as u32, ..e });
+            }
+            changed_at.get_or_insert(out.len());
+            out.push(Leaf { first: a as u32, len: (b - a) as u32, start: e.start + (a - f), unwritten: false });
+            if b < e_end {
+                out.push(Leaf { first: b as u32, len: (e_end - b) as u32, start: e.start + (b - f), unwritten: true });
+            }
+        }
+        leaf.leaves = out;
+        let Some(k) = changed_at else { return Some((to, false)) };
+        merge(&mut leaf.leaves);
+        let hint = k.min(leaf.leaves.len().saturating_sub(1));
+        self.settle(ino, iseed, raw, path, hint).then_some((to, true))
+    }
+
     /// Every block file `ino` (`raw`) holds: its runs -- unwritten ones
     /// among them -- and the blocks of its tree below the root, each node
     /// held to its header, depth and checksum, and no block named twice.
