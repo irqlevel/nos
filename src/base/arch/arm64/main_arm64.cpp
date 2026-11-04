@@ -581,6 +581,8 @@ extern "C" void main_arm64(void* dtb)
     /* The huge pool (hugepages=), now: the free list will never again be as
        whole as it is before the kernel's own allocations begin. */
     pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
+    /* And mapped, for the copies into and out of guests' memory (PageTable::map_huge_pool_window) */
+    pt.map_huge_pool_window();
 
     /* W^X: kernel text is RX, everything else in the image is RW+NX.
        Runs after the free-pages list so the walk sees the final image
