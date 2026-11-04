@@ -148,6 +148,19 @@ struct CpuPerformance
    each AP. Defined per arch. */
 bool setup_cpu_performance(CpuPerformance* out);
 
+/* Whether this CPU's C1 is C1. Intel's firmware may let a CPU turn every
+   request for C1 into C1E (MSR_POWER_CTL bit 1, "C1E enable"), its voltage
+   and clock dropped while it waits, which it takes microseconds to climb
+   back from at each wake -- a vCPU's, a disk task's, an IPI's -- and nos's
+   idle asks for C1 whenever its idles are short (Cpu::idle_mwait). x86 Intel
+   on bare metal, with HWP (a part that has the MSR) and idling by MWAIT
+   (setup_idle, which the BSP calls first): the promotion turned off --
+   the choice Linux's intel_idle makes with its c1e_promotion -- unless
+   c1e=firmware.
+   Nothing elsewhere; arm64: nothing. True when the MSR was looked at, with
+   `was_on` what firmware left and `on` what this left. Defined per arch. */
+bool setup_cpu_c1e(bool* was_on, bool* on);
+
 /* How an idle CPU sleeps (cpu_idle_masked), decided once on the BSP, before
    the APs start: on x86, by MWAIT, deep in the deepest C-state CPUID's leaf
    5 offers -- where the kernel was booted with idle=mwait, the CPU has

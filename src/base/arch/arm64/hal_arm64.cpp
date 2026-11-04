@@ -55,6 +55,14 @@ bool setup_cpu_performance(CpuPerformance* out)
     return false;
 }
 
+bool setup_cpu_c1e(bool* was_on, bool* on)
+{
+    /* No C1E here: WFI is the only idle there is. */
+    *was_on = false;
+    *on = false;
+    return false;
+}
+
 bool setup_idle(u32* hint)
 {
     /* WFI, the only idle there is here without PSCI's CPU_SUSPEND. */
