@@ -389,6 +389,10 @@ def exercise(shell):
                              capture_output=True, text=True)
         nb.check(out.returncode == 0,
                  "trace-decode.py read the dump" + (f": {out.stderr.strip()}" if out.returncode else ""))
+        own = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--selftest"],
+                             capture_output=True, text=True)
+        nb.check(own.returncode == 0, "trace-decode.py --selftest: its pairing of a guest's records as it should "
+                 "be" + (f": {own.stdout.strip()}" if own.returncode else ""))
         with open(chrome) as f:
             trace = json.load(f)
         slices = [e for e in trace if e.get("ph") == "X"]

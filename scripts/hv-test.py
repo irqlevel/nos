@@ -93,6 +93,7 @@ Exit code 0 = every check passed.
 import argparse
 import hashlib
 import importlib.util
+import json
 import os
 import platform
 import random
@@ -259,20 +260,29 @@ TRACE = [
     "trace on hv",          # 2
     "hv run exits 0",       # 3
     "trace show 4096 hv",   # 4
-    "trace clear",          # 5
-    "hv run smp 0",         # 6
-    "trace show 4096 hv",   # 7
-    "trace clear",          # 8
-    "trace off all",        # 9
-    "trace on blk disk fs",  # 10
-    "hv boot /hvboot mem=64 secs=120 disk=/disk.raw",  # 11
-    "write /traced.txt the disk path, traced",  # 12
-    "trace show 4096 blk disk fs",  # 13
-    "trace off all",        # 14
-    "hv run exits 0",       # 15
-    "trace show 4096 hv",   # 16
-    "rmmod hv",             # 17
+    "trace dump 4096 hv",   # 5
+    "trace clear",          # 6
+    "hv run smp 0",         # 7
+    "trace show 4096 hv",   # 8
+    "trace dump 4096 hv",   # 9
+    "trace clear",          # 10
+    "trace off all",        # 11
+    "trace on blk disk fs",  # 12
+    "hv boot /hvboot mem=64 secs=120 disk=/disk.raw",  # 13
+    "write /traced.txt the disk path, traced",  # 14
+    "trace show 4096 blk disk fs",  # 15
+    "trace dump 4096 blk disk fs",  # 16
+    "trace off all",        # 17
+    "hv run exits 0",       # 18
+    "trace show 4096 hv",   # 19
+    "rmmod hv",             # 20
 ]
+
+# The host's reader of a dump, shipped beside this (`--hv`): what the
+# phase's dumps are read back with, its findings held to what the guests did.
+decode_spec = importlib.util.spec_from_file_location("trace_decode", os.path.join(HERE, "trace-decode.py"))
+decode = importlib.util.module_from_spec(decode_spec)
+decode_spec.loader.exec_module(decode)
 
 # What the `exits` guest does (hv/src/guests.rs): says "nos: ports and
 # cpuid" a byte at a time through the debug port, reads it back once, asks
@@ -829,35 +839,37 @@ def trace_checks(out, apicv):
              all(f.get("guest_ns", -1) < 10 ** 9 and f.get("since_ns", -1) < 10 ** 9 for f in exits)
              and all(f.get("out_ns", 0) > 0 for f in exits[1:]), out[4])
 
+    decode_exits(out[5])
+
     # The `smp` guest's run: the first CPU's INIT, its de-assert and two
     # start-up IPIs written to the ICR, the second's IPI to the first; each
     # rings the CPU it is for -- but the de-assert, which does nothing.
-    recs = trace_records(out[7])
+    recs = trace_records(out[8])
     exits = [f for e, f in recs if e == "hv_exit"]
     icr = lambda cpu: [f for f in exits if f.get("vcpu") == cpu and f.get("reason") == "msr"
                        and f.get("detail") == MSR_X2APIC_ICR and f.get("info") == WRITE]
     pt.check("hv_exit records the smp guest's ICR writes: CPU 0's INIT, de-assert and two start-up IPIs, CPU 1's "
-             "IPI", len(icr(0)) == 4 and len(icr(1)) == 1, out[7])
+             "IPI", len(icr(0)) == 4 and len(icr(1)) == 1, out[8])
     pid = {cpu: {f.get("pid") for f in exits if f.get("vcpu") == cpu} for cpu in (0, 1)}
     pt.check("each CPU's records of one task of its own",
-             all(len(pid[c]) == 1 for c in (0, 1)) and pid[0] != pid[1], out[7])
+             all(len(pid[c]) == 1 for c in (0, 1)) and pid[0] != pid[1], out[8])
     rings = [f for e, f in recs if e == "hv_ring"]
     p0 = next(iter(pid[0]), None)
     p1 = next(iter(pid[1]), None)
     pt.check("hv_ring: CPU 1 rung by CPU 0's task for the INIT and both start-up IPIs",
-             len([f for f in rings if f.get("vcpu") == 1 and f.get("pid") == p0]) >= 3, out[7])
+             len([f for f in rings if f.get("vcpu") == 1 and f.get("pid") == p0]) >= 3, out[8])
     pt.check("and CPU 0 by CPU 1's for its IPI",
-             len([f for f in rings if f.get("vcpu") == 0 and f.get("pid") == p1]) >= 1, out[7])
+             len([f for f in rings if f.get("vcpu") == 0 and f.get("pid") == p1]) >= 1, out[8])
     timers = [f for e, f in recs if e == "hv_timer"]
     pt.check("hv_timer: CPU 0's one-shot APIC timer asked for once",
-             len(timers) == 1 and timers[0].get("vcpu") == 0, out[7])
+             len(timers) == 1 and timers[0].get("vcpu") == 0, out[8])
     injects = [f for e, f in recs if e == "hv_inject" and f.get("kind") == "apic"]
     if apicv:
-        pt.check("hv_inject: no APIC interrupt the host's to inject, the CPU delivering them", injects == [], out[7])
+        pt.check("hv_inject: no APIC interrupt the host's to inject, the CPU delivering them", injects == [], out[8])
     else:
         pt.check("hv_inject: the IPI and the timer's interrupt each injected into CPU 0 once",
                  sorted(f.get("vector") for f in injects) == [SMP_IPI_VECTOR, SMP_TIMER_VECTOR]
-                 and all(f.get("vcpu") == 0 for f in injects), out[7])
+                 and all(f.get("vcpu") == 0 for f in injects), out[8])
     # A halt and what woke it, one after the other, CPU by CPU.
     halts = [(e, f) for e, f in recs if e in ("hv_halt", "hv_wake")]
     alternate = True
@@ -866,12 +878,110 @@ def trace_checks(out, apicv):
         alternate = alternate and seq == ["hv_halt", "hv_wake"] * (len(seq) // 2) and len(seq) % 2 == 0
     pt.check("hv_halt and hv_wake: CPU 0 halted for its IPI and its timer, every halt ended by a wake",
              alternate and any(f.get("vcpu") == 0 and f.get("until") == "timer" for e, f in halts if e == "hv_halt"),
-             out[7])
+             out[8])
 
-    disk_checks(out[10], out[11], out[13])
+    decode_smp(out[9])
+    disk_checks(out[12], out[13], out[15])
+    decode_disk(out[16])
 
-    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[16], out[16])
-    pt.check("and hv unloads after", "hv unloaded" in out[17], out[17])
+    pt.check("with every event off, the exits guest's run records nothing", "hv_" not in out[19], out[19])
+    pt.check("and hv unloads after", "hv unloaded" in out[20], out[20])
+
+
+def decoded(dump, what):
+    """A dump's records and window, as trace-decode.py reads them -- and its
+    `--hv` report of them, run as it is shipped, which has to say `what`."""
+    lines = dump.splitlines()
+    with tempfile.NamedTemporaryFile("w", suffix=".dump", delete=False) as f:
+        f.write(dump)
+    try:
+        run = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--hv", f.name],
+                             capture_output=True, text=True)
+    finally:
+        os.unlink(f.name)
+    pt.check("trace-decode.py --hv reads the dump back: %s" % what, run.returncode == 0 and what in run.stdout,
+             run.stdout + run.stderr)
+    return decode.records(lines), decode.window_start(lines)
+
+
+def chrome_of(dump):
+    """The dump as trace-decode.py writes it in Chrome's trace format: its
+    events, or none when it could not."""
+    tmp = tempfile.mkdtemp(prefix="nos-hv-chrome-")
+    try:
+        path, out = os.path.join(tmp, "dump.txt"), os.path.join(tmp, "chrome.json")
+        with open(path, "w") as f:
+            f.write(dump)
+        run = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--chrome", out, path],
+                             capture_output=True, text=True)
+        if run.returncode != 0:
+            return []
+        with open(out) as f:
+            return json.load(f)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def decode_exits(dump):
+    """The `exits` guest's dump, decoded: its exits by reason and by what
+    they were about -- each with what it cost the host after it -- as the
+    guest made them. And first the decoder's own check of its pairing, on a
+    window it makes up of what no guest here reaches: the device's commands,
+    a refusal, an entry turned back, a vCPU's number two VMs' tasks have."""
+    run = subprocess.run([sys.executable, os.path.join(HERE, "trace-decode.py"), "--selftest"],
+                         capture_output=True, text=True)
+    pt.check("trace-decode.py --selftest: every pairing as it should be", run.returncode == 0,
+             run.stdout + run.stderr)
+    recs, start = decoded(dump, "hv: ")
+    reasons, details, vcpus = decode.hv_exits(recs, start or 0)
+    count = lambda r: reasons.get(r, {}).get("n", 0)
+    pt.check("decoded: the exits guest's 21 port accesses, its CPUID and its HLT, by reason",
+             count("io") == EXITS_OUT + 1 and count("cpuid") == 1 and count("hlt") == 1, str(reasons.keys()))
+    pt.check("and by what each was about: 20 outs to the debug port and one in",
+             details.get(("io", "debug out"), {}).get("n") == EXITS_OUT
+             and details.get(("io", "debug in"), {}).get("n") == 1, str(details.keys()))
+    pt.check("each exit but the last with the host's time after it, from the next entry",
+             len(reasons["io"]["out"]) == EXITS_OUT + 1 and all(ns > 0 for ns in reasons["io"]["out"]),
+             str(reasons.get("io")))
+    pt.check("one vCPU, in its guest part of the time", len(vcpus) == 1
+             and all(0 < v["guest_ns"] <= (v["last"] - v["first"]) for v in vcpus.values()), str(vcpus))
+    slices = [e for e in chrome_of(dump) if e.get("ph") == "X" and e.get("cat") == "hv"]
+    pt.check("and in Chrome's trace format: its vCPU's track, a slice each stretch in its guest and each exit out of it",
+             len([e for e in slices if e["name"] == "guest"]) >= EXITS_OUT + 3
+             and len([e for e in slices if e["name"] == "io debug out"]) >= EXITS_OUT - 1
+             and all(e["dur"] >= 0 for e in slices), "%d slices" % len(slices))
+
+
+def decode_smp(dump):
+    """The `smp` guest's dump, decoded: the rings between its CPUs each
+    paired with the next entry of the CPU rung, and CPU 0's halts."""
+    recs, start = decoded(dump, "rings ")
+    halts, timers, injects, rings, unpaired = decode.hv_wakes(recs, start or 0)
+    paired = [ns for row in rings.values() for ns in row["to_entry"]]
+    pt.check("decoded: the IPIs' rings each paired with its CPU's next entry, after it",
+             len(paired) >= 4 and all(ns >= 0 for ns in paired), str(rings))
+    pt.check("and CPU 0's halts and how they ended", len(halts["halted"]) >= 1
+             and sum(halts["how"].values()) == len(halts["halted"]), str(halts))
+    pt.check("and its one timer interrupt", sum(len(v) for v in timers.values()) == 1, str(timers))
+
+
+def decode_disk(dump):
+    """The disk phase's dump, decoded: hvboot's two reads each paired from
+    the virtio disk to the image and back, in its four stretches."""
+    recs, start = decoded(dump, "disk: ")
+    d = decode.disk_requests(recs, start or 0)
+    whole = [q for q in d["requests"] if q["complete"] is not None]
+    pt.check("decoded: hvboot's two reads, each paired through every hand-off, nothing left over",
+             len(whole) == 2 and len(d["requests"]) == 2 and d["stray"] == 0, str(d["requests"]))
+    pt.check("each stretch of it in order: to its task, served at once, back",
+             all(q["submit"] <= q["start"] <= q["done"] <= q["complete"] and q["how"] == "at_once" and q["ok"] == 1
+                 and q["op"] == "read" for q in whole), str(whole))
+    pt.check("and the image's synchronous path and ext4's commits read", len(d["syncs"]) == 2
+             and len(d["commits"]) >= 1, "%d syncs, %d commits" % (len(d["syncs"]), len(d["commits"])))
+    slices = [e for e in chrome_of(dump) if e.get("ph") == "X" and e.get("cat") == "disk"]
+    pt.check("and in Chrome's trace format: a slice each request on its disk's track, its stretches with it",
+             len(slices) == 2 and all(e["args"].get("how") == "at_once" and e["dur"] > 0 for e in slices),
+             str(slices))
 
 
 def disk_checks(on, boot, shown):
