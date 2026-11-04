@@ -19,4 +19,7 @@ unsafe extern "C" {
     /// out.
     pub fn kernel_event_wait_for(handle: usize, timeout_ns: u64) -> i32;
     pub fn kernel_event_signal(handle: usize);
+    /// Spins up to `poll_ns` for a signal, the waiter's call: 1 when one
+    /// came (taken), 0 when the time ran out.
+    pub fn kernel_event_poll(handle: usize, poll_ns: u64) -> i32;
 }

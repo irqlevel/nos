@@ -2058,6 +2058,17 @@ pub unsafe extern "C" fn kernel_image_reap(image: usize, out: *mut ImageDone, ma
     }
 }
 
+/// Spins up to `poll_ns` -- with no lock of the image's held -- for what
+/// `kernel_image_wait` sleeps for: 1 when one came, 0 when the time ran
+/// out, -1 at once for a word that is no image's with a queue.
+#[no_mangle]
+pub extern "C" fn kernel_image_poll(image: usize, poll_ns: u64) -> i32 {
+    match queue_of(image) {
+        Some(entry) => i32::from(block::queue::poll(entry, Duration::from_nanos(poll_ns))),
+        None => -1,
+    }
+}
+
 /// Sleeps until one of the image's commands is done, or `kernel_image_wake`
 /// wakes it, or `timeout_ns` is up -- with no lock of the image's held: 1
 /// when one came, 0 when the time ran out, -1 at once for a word that is no

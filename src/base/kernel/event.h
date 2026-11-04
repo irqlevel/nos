@@ -48,6 +48,17 @@ public:
        one does (Task::run_state_). */
     bool wait_for(unsigned long long timeout_ns);
 
+    /* A signal looked for for up to poll_ns, spinning rather than blocking:
+       true when one came -- taken, as wait() takes it -- and false when the
+       time ran out first. Task context, the one waiter's, interrupts on, so
+       that a signal() from this CPU's own interrupt is seen as one from any
+       other: it finds no waiter blocked, and only sets the flag the spin
+       reads. What a waiter that expects its signal within microseconds
+       does before wait_for(), so as not to pay a sleep and a wake -- a
+       schedule, an idle, the IPI -- for it. A plain read a time round, so
+       that the spin keeps the flag's line shared until the signal. */
+    bool poll_for(unsigned long long poll_ns);
+
     /* Any context. A signaller is done with the event only when signal()
        returns -- the waiter having taken the signal says nothing about that
        -- so the event, and the waiting task, must outlive every signal()
