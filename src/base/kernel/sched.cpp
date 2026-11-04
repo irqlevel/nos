@@ -142,6 +142,7 @@ TaskQueue::TaskQueue()
 {
     stdlib::AutoLock lock(lock_);
     task_list_.init();
+    outbound_list_.init();
     sleep_list_.init();
     exited_list_.init();
 
@@ -181,6 +182,7 @@ void TaskQueue::switch_complete(Task* curr)
     lock_.unlock();
 
     report_stall();
+    send_outbound();
 
     if (prev->state_.get() != Task::STATE_EXITED)
     {
@@ -192,6 +194,10 @@ void TaskQueue::switch_complete(Task* curr)
            itself, and it is not running. */
         bool runnable = prev->run_state_.get() == Task::RUN_QUEUED && !prev->is_idle();
         auto task_queue = runnable ? prev->select_next_task_queue() : nullptr;
+        /* Moved because this CPU is out of its affinity (set_task_affinity),
+           not for a lighter queue: the CPU it goes to may be halted, with
+           nothing to look at its queue until its next tick -- it is told */
+        bool evicted = task_queue != nullptr && out_of_affinity(prev);
 
         /* schedule()'s count should be the only one left: the locks
            TaskQueue::schedule took in prev were released above, in this
@@ -227,6 +233,8 @@ void TaskQueue::switch_complete(Task* curr)
                 tp::emit_sched_migrate(prev, from, task_queue->index());
             task_queue->insert(prev);
             prev->put();
+            if (evicted)
+                CpuTable::get_instance().get_cpu(task_queue->index()).send_ipi_self();
         }
         else
         {
@@ -444,6 +452,59 @@ void TaskQueue::enqueue(Task* task)
     note_queued(task);
 }
 
+bool TaskQueue::out_of_affinity(Task* task)
+{
+    if (task->is_idle())
+        return false;
+    ulong affinity = task->get_cpu_affinity();
+    return !(affinity & (1UL << index_)) && (affinity & CpuTable::get_instance().get_running_cpus_no_lock()) != 0;
+}
+
+bool TaskQueue::leave_if_outbound(Task* task)
+{
+    if (!out_of_affinity(task))
+        return false;
+
+    /* Off this queue as remove() takes a task off -- but for the run list,
+       which a task asleep is not on -- under the task's lock too, which
+       every write of its queue is made under; its home list's reference
+       going with it */
+    stdlib::AutoLock lock(task->lock_);
+    BUG_ON(task->task_queue_ != this);
+    BUG_ON(!task->sched_.entry.is_empty());
+    BUG_ON(!task->sleep_entry_.is_empty());
+    task->task_queue_ = nullptr;
+    task->list_entry_.remove_init();
+    task_count_.dec();
+    BUG_ON(task_count_.get() < 0);
+    outbound_list_.insert_tail(&task->list_entry_);
+    return true;
+}
+
+void TaskQueue::send_outbound()
+{
+    while (!outbound_list_.is_empty())
+    {
+        Task* task = CONTAINING_RECORD(outbound_list_.remove_head(), Task, list_entry_);
+        task->list_entry_.init();
+
+        /* On no queue now: where its affinity's lightest is -- or here, if
+           none of its CPUs runs, as a task's first placing would be */
+        TaskQueue* to = task->select_next_task_queue();
+        if (to == nullptr)
+            to = this;
+        task_migrations.inc();
+        if (unlikely(tp::on(tp::Id::SchedMigrate)))
+            tp::emit_sched_migrate(task, index_, to->index());
+        to->insert(task);
+        /* The reference the home list held here: the new one's is insert's,
+           so this is never the last */
+        task->put();
+        if (to != this)
+            CpuTable::get_instance().get_cpu(to->index()).send_ipi_self();
+    }
+}
+
 void TaskQueue::requeue(Task* task)
 {
     BUG_ON(eevdf_.current() != &task->sched_);
@@ -527,7 +588,8 @@ void TaskQueue::drain_wakes(ulong& touched)
 
         long was = task->run_state_.cmpxchg(Task::RUN_QUEUED, Task::RUN_WAKING);
         BUG_ON(was != Task::RUN_WAKING);
-        enqueue(task);
+        if (!leave_if_outbound(task))
+            enqueue(task);
     }
 }
 
@@ -557,7 +619,8 @@ void TaskQueue::wake_due(ulong now, ulong& touched)
                Before the enqueue, as unblock()'s is before its hand-over. */
             if (unlikely(tp::on(tp::Id::SchedWakeup)))
                 tp::emit_sched_wakeup(task, index_, true, nullptr, now - until);
-            enqueue(task);
+            if (!leave_if_outbound(task))
+                enqueue(task);
         }
     }
 }
@@ -694,11 +757,18 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
         BUG_ON(!exited && run != Task::RUN_QUEUED && run != Task::RUN_BLOCKING);
         bool runnable = !exited && run == Task::RUN_QUEUED;
 
+        /* On a CPU its affinity no longer has (set_task_affinity): it does
+           not keep it -- another task takes it, the idle task if nothing
+           else can -- and switch_complete moves it, whatever the loads
+           (Task::select_next_task_queue). The idle task is its CPU's for
+           good, whatever its mask. */
+        bool evicted = runnable && out_of_affinity(curr);
+
         SchedEntity* current = eevdf_.current();
         if (!eevdf_.is_empty())
         {
             SchedEntity* best;
-            if (runnable && why == ScheduleReason::Preempt && current != nullptr)
+            if (runnable && why == ScheduleReason::Preempt && current != nullptr && !evicted)
             {
                 /* An interrupt's: curr among the candidates, and it keeps
                    the CPU unless another eligible task's deadline comes
@@ -721,7 +791,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
                queue takes it only then */
             next_queued = (next != nullptr);
         }
-        else if (!(runnable && keep_over_idle) && idle_task_ != nullptr && idle_task_ != curr)
+        else if ((!(runnable && keep_over_idle) || evicted) && idle_task_ != nullptr && idle_task_ != curr)
         {
             /* The idle task takes its turn only when there is no other turn
                to take, and not over a task an interrupt landed on, or one
@@ -733,6 +803,11 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
                for whatever interrupt came next. */
             next = idle_task_;
         }
+
+        /* Evicted, and the run list gave nothing to switch to: the idle task,
+           which is always there to go to, rather than curr staying */
+        if (evicted && next == nullptr && idle_task_ != nullptr && idle_task_ != curr)
+            next = idle_task_;
 
         /* Nothing to switch to: curr keeps the CPU -- runnable, or blocking
            with no idle task to go to, when it comes back from schedule()
@@ -759,6 +834,15 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
            (switch_complete): what was passed over is now a report */
         BUG_ON(next->run_state_.get() != Task::RUN_QUEUED);
         BUG_ON(next->preempt_disable_counter_.get() != 0);
+
+        /* A task this CPU is no longer in the affinity of -- woken here, or
+           waiting here when it was changed -- runs only until the next
+           decision, which evicts it (above): that decision now, as soon as
+           interrupts are back on, rather than at the slice's end or the
+           tick's. It cannot be moved from here: its new queue's lock is not
+           to be taken under this one's, and the move is switch_complete's. */
+        if (out_of_affinity(next))
+            cpu.local_timer_wake(now);
 
         /* curr leaves the CPU. Blocking, it goes to sleep -- unless an
            unblock() made it Queued since it looked, and then it has not.
@@ -830,6 +914,7 @@ void TaskQueue::schedule(Task* curr, ScheduleReason why)
         lock_.unlock();
 
         report_stall();
+        send_outbound();
 
         /* The count down before interrupts come back on, not after: one
            waiting to be taken -- the IPI for a task woken meanwhile -- would
@@ -1130,6 +1215,35 @@ void set_task_nice(Task* task, long nice)
         if (queue->set_nice(task, nice))
             return;
     }
+}
+
+bool task_home_cpu(Task* task, ulong& cpu)
+{
+    TaskQueue* queue = queue_of(task);
+    if (queue == nullptr)
+        return false;
+    cpu = queue->index();
+    return true;
+}
+
+AffinityResult set_task_affinity(Task* task, ulong mask)
+{
+    if (task->is_pinned() || task->is_idle())
+        return AffinityResult::Pinned;
+
+    auto& cpus = CpuTable::get_instance();
+    if ((mask & cpus.get_running_cpus_no_lock()) == 0)
+        return AffinityResult::NoCpu;
+
+    task->set_cpu_affinity(mask);
+
+    /* The CPU it is on, if that is no longer one of its: interrupted, so
+       that its decision -- every IPI ends in one (Cpu::ipi) -- finds the
+       task off its mask, after the store above */
+    TaskQueue* queue = queue_of(task);
+    if (queue != nullptr && !(mask & (1UL << queue->index())))
+        cpus.get_cpu(queue->index()).send_ipi_self();
+    return AffinityResult::Set;
 }
 
 void set_task_slice(Task* task, ulong slice_ns)

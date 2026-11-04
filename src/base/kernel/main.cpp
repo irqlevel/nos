@@ -691,6 +691,12 @@ void bp_startup(void* ctx)
             return;
         }
 
+        if (!test::test_affinity())
+        {
+            PANIC("Affinity test failed");
+            return;
+        }
+
         rust_test();
 
         if (!test::test_module_bus())

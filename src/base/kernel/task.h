@@ -178,11 +178,26 @@ public:
 
     void update_runtime();
 
+    /* The CPUs it may run on, a bit each. One word, stored and loaded whole:
+       set_task_affinity changes it under a task that runs, and the
+       scheduler reads it on the task's CPU at every decision and every
+       move. */
     void set_cpu_affinity(ulong affinity);
     ulong get_cpu_affinity();
 
+    /* Bound to one CPU for what it is -- that CPU's idle task, its softirq
+       task, a measurement made on it (trace bench, sched probe): its
+       affinity that CPU's alone, from before it starts, and nothing but the
+       code that made it changes it -- set_task_affinity, the shell's
+       `sched affinity`, refuses it. A task made to run where it was placed
+       -- a guest's vCPU, a disk's task -- is not, and may be moved. */
+    void pin_to_cpu(ulong cpu);
+    bool is_pinned();
+
     /* How much lighter another CPU's queue has to be before a running task
-       is moved to it. Two, because the task is still counted where it is. */
+       is moved to it. Two, because the task is still counted where it is.
+       Not for a task on a CPU its affinity has no longer: it goes,
+       whatever the loads. */
     static const long MIGRATE_THRESHOLD = 2;
 
     /* The queue this task should be on: the lightest one its affinity
@@ -248,6 +263,9 @@ public:
     /* Shown in ps's flags while the task is blocked, as it always was; what
        says so is run_state_ */
     static const long FLAG_BLOCKED_BIT = 3;
+
+    /* Bound to its CPU (pin_to_cpu) */
+    static const long FLAG_PINNED_BIT = 5;
 
 public:
     /* On its queue's list of every task it is home to, or the exited list */

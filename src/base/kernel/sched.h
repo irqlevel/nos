@@ -199,6 +199,27 @@ private:
        placed by its lag (EevdfQueue::join), onto the run list, and counted */
     void enqueue(Task* task);
 
+    /* Whether `task` is on a CPU its affinity no longer has -- and has one
+       that runs to go to: a task whose mask has none stays, where it would
+       otherwise be evicted at every decision and picked again at the next.
+       Never the idle task, which is its CPU's for good. */
+    bool out_of_affinity(Task* task);
+
+    /* A woken task this CPU is no longer in the affinity of
+       (set_task_affinity): not onto this run list, but off this queue and
+       onto outbound_list_, to be inserted where it may run once this queue's
+       lock is down (send_outbound) -- its new queue's is not to be taken
+       under this one. A task that only ever runs a moment between its
+       sleeps would otherwise block again before the decision that evicts a
+       task that runs, and never leave. Whether it went. */
+    bool leave_if_outbound(Task* task);
+
+    /* outbound_list_ emptied, each onto the lightest queue of its affinity
+       -- whose CPU is interrupted, being perhaps halted -- or back here
+       when none of its CPUs runs. With this queue's lock down, interrupts
+       off, on this CPU: schedule's keep path, and switch_complete. */
+    void send_outbound();
+
     /* curr, current and displaced while it can still run: back on the run
        list where its virtual runtime and deadline say */
     void requeue(Task* task);
@@ -265,6 +286,12 @@ private:
 
     /* Every task this queue is home to (Task::list_entry_) */
     ListEntry task_list_;
+
+    /* Woken tasks on their way to a queue of their affinity
+       (leave_if_outbound): this CPU's alone, put on under Lock and taken off
+       with interrupts off right after it, by Task::list_entry_, each with
+       the reference the home list held */
+    ListEntry outbound_list_;
 
     /* The runnable ones (Task::sched_.Entry), the one on the CPU among them
        as the queue's current, and the rules a decision over them is made
@@ -398,5 +425,30 @@ long get_stall_report_count();
    From task context. */
 void set_task_nice(Task* task, long nice);
 void set_task_slice(Task* task, ulong slice_ns);
+
+/* What set_task_affinity did */
+enum class AffinityResult
+{
+    Set,
+    /* Bound to its CPU (Task::is_pinned): the idle task, a softirq task, a
+       measurement -- nothing changed */
+    Pinned,
+    /* No CPU of the mask runs: nothing changed */
+    NoCpu,
+};
+
+/* Task `task` to run on the CPUs of `mask` from now on, a bit each: where
+   the CPU it is on is not one of them, that CPU is interrupted for a
+   decision, which takes the task off it if it runs there or waits there
+   (TaskQueue::schedule) and moves it to the lightest of the mask's
+   (TaskQueue::switch_complete); a task asleep there runs there once more
+   when it wakes, until that decision, which comes at once. Any task but
+   one bound to its CPU -- a guest's vCPU, a disk's task, the shell -- and
+   any mask with a CPU that runs. From task context. */
+AffinityResult set_task_affinity(Task* task, ulong mask);
+
+/* The CPU whose queue `task` is on -- where it runs, waits, or sleeps --
+   into `cpu`: false for one on none, not started or exited */
+bool task_home_cpu(Task* task, ulong& cpu);
 
 }
