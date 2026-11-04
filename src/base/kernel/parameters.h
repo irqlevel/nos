@@ -71,6 +71,10 @@ public:
        than turning on hardware P-states (hal::setup_cpu_performance) */
     bool is_hwp_off();
 
+    /* c1e=firmware -- x86: leave C1E auto-promotion as firmware set it
+       rather than turning it off (hal::setup_cpu_c1e) */
+    bool is_c1e_firmware();
+
     /* x86: an idle CPU sleeps by MWAIT, deep once its idles have been long
        (hal::setup_idle, Cpu::idle_mwait): what lets a busy core run at the
        turbo of few busy cores. The default, where the CPU offers it;
@@ -207,6 +211,7 @@ private:
     bool its_enabled_;
     bool hw_rng_off_;
     bool hwp_off_;
+    bool c1e_firmware_;
     bool idle_mwait_;
     bool ucode_off_;
     WxProbeMode wx_probe_md_;

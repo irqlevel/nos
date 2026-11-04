@@ -278,6 +278,49 @@ bool idle_masked()
     return idle_mwait_on;
 }
 
+bool setup_cpu_c1e(bool* was_on, bool* on)
+{
+    static const u32 LEAF_VENDOR = 0;
+    static const u32 LEAF_FEATURES = 1;
+    static const u32 LEAF_POWER = 6;
+    static const u32 FEATURES_ECX_HYPERVISOR = 1U << 31;
+    static const u32 POWER_EAX_HWP = 1U << 7;
+    /* "GenuineIntel", as EBX, EDX and ECX give it */
+    static const u32 INTEL_EBX = 0x756E6547;
+    static const u32 INTEL_EDX = 0x49656E69;
+    static const u32 INTEL_ECX = 0x6C65746E;
+    /* MSR_POWER_CTL, every Intel core since Nehalem's; bit 1 lets the CPU
+       turn a C1 request into C1E (SDM vol. 4) */
+    static const u32 POWER_CTL_MSR = 0x1FC;
+    static const u64 POWER_CTL_C1E = 1ULL << 1;
+
+    *was_on = false;
+    *on = false;
+    /* Only where nos idles by MWAIT -- what setup_idle decided, on the BSP
+       before any AP -- and so on bare metal: a C1 it asks for is a C1 it
+       means. HWP stands for "a part with the MSR": every Intel CPU with
+       HWP has it, and one without is no part nos runs on. */
+    if (!idle_mwait_on)
+        return false;
+    CpuidResult vendor = cpuid(LEAF_VENDOR);
+    if (vendor.ebx != INTEL_EBX || vendor.edx != INTEL_EDX || vendor.ecx != INTEL_ECX || vendor.eax < LEAF_POWER)
+        return false;
+    if (cpuid(LEAF_FEATURES).ecx & FEATURES_ECX_HYPERVISOR)
+        return false;
+    if (!(cpuid(LEAF_POWER).eax & POWER_EAX_HWP))
+        return false;
+
+    u64 ctl = read_msr(POWER_CTL_MSR);
+    *was_on = (ctl & POWER_CTL_C1E) != 0;
+    if (*was_on && !kernel::Parameters::get_instance().is_c1e_firmware())
+    {
+        write_msr(POWER_CTL_MSR, ctl & ~POWER_CTL_C1E);
+        ctl = read_msr(POWER_CTL_MSR);
+    }
+    *on = (ctl & POWER_CTL_C1E) != 0;
+    return true;
+}
+
 void cpu_idle_masked(bool deep)
 {
     /* ECX bit 0: an interrupt ends the MWAIT though interrupts are off --
