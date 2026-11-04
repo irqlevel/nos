@@ -1225,6 +1225,18 @@ impl Image {
         if let Some(started) = self.start_fast(k, write, offset, len) {
             return started;
         }
+        /* A write into a hole: its chunks given first, and then to the
+         * device as any other write -- with what is in flight left to go on
+         * meanwhile, none of it a write into a hole (each went this way or
+         * the synchronous one), where the synchronous path below waits for
+         * all of it, then for the growth's commit, then writes this one: on
+         * the EX44 a guest's sequential first write stood 12 ms at every
+         * growth so, its device idle. */
+        if write && self.grow_for(offset, len) {
+            if let Some(started) = self.start_fast(k, write, offset, len) {
+                return started;
+            }
+        }
         /* The synchronous path, after everything in flight: the batch's,
          * through the image's own buffer -- with the queue out of the way
          * meanwhile, whose buffer this request's data is in. */
@@ -1251,6 +1263,26 @@ impl Image {
             });
         }
         Started::Done(ok)
+    }
+
+    /// The holes among the blocks of a write of `len` bytes at `offset`
+    /// given their chunks (`Direct::grow`), the queue's requests in flight
+    /// as they are: whether there were holes and the filesystem gave them --
+    /// a request whose blocks the image's map has not, or not whole, none.
+    fn grow_for(&mut self, offset: u64, len: usize) -> bool {
+        let (vfs, handle, size) = (self.vfs, self.handle, self.size);
+        let Some(direct) = self.direct.as_mut() else { return false };
+        let block = direct.block;
+        if !direct.grows || direct.map.is_none() || offset % block as u64 != 0 || len % block != 0 {
+            return false;
+        }
+        let (first, n) = (offset / block as u64, len / block);
+        if n == 0 || n > direct.sectors.len() || !direct.resolve(vfs, handle, first, 0, n)
+            || !direct.sectors[..n].contains(&0)
+        {
+            return false;
+        }
+        direct.grow(vfs, handle, first, n as u64, size.div_ceil(block as u64))
     }
 
     /// `start`'s asynchronous path (`Flights`): the request as commands to
