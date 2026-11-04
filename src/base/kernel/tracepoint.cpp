@@ -203,8 +203,11 @@ const Field HV_EXIT_FIELDS[] = {
        one was not timed, the event having been off */
     { "out_ns", __builtin_offsetof(HvExit, out_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
     /* From the exit to this record: the host's interrupt it was for, taken
-       first, and anything that ran in its wake */
-    { "since_ns", __builtin_offsetof(HvExit, since_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+       first, and anything that ran in its wake. Held as the counter's low
+       half at the exit (0: not timed) and read back as the nanoseconds from
+       it to the record's stamp (Kind::Since), so that the exit's site reads
+       no counter for it */
+    { "since_ns", __builtin_offsetof(HvExit, since_ns), sizeof(u32), Kind::Since, nullptr, 0 },
     { "rip", __builtin_offsetof(HvExit, rip), sizeof(u64), Kind::Hex, nullptr, 0 },
 };
 
@@ -734,6 +737,16 @@ u64 field_value(const TraceRing::Record& r, const Field& f)
     stdlib::mem_cpy(&v, reinterpret_cast<const u8*>(r.payload) + f.offset, f.size);
     if (f.kind == Kind::Signed && f.size < sizeof(v) && (v >> (8 * f.size - 1)) & 1)
         v |= ~0ULL << (8 * f.size);
+    /* A stamp's low half: the nanoseconds from it to the record's, the
+       distance taken modulo 2^32 as both halves are -- unsigned, so a wrap
+       between the two is no matter -- and 0 for none */
+    if (f.kind == Kind::Since)
+    {
+        if (f.size != sizeof(u32) || v == 0)
+            return 0;
+        u32 cycles = (u32)r.cycles - (u32)v;
+        return cycle_counter_delta_to_ns(cycles);
+    }
     return v;
 }
 
@@ -781,6 +794,7 @@ void print_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
             con.printf(" %s=0x%lX", f.name, (ulong)v);
             break;
         case Kind::Ns:
+        case Kind::Since:
             con.printf(" %s=%lu.%03luus", f.name, (ulong)v / consts::NANO_SECS_IN_USEC,
                 (ulong)v % consts::NANO_SECS_IN_USEC);
             break;
@@ -1038,6 +1052,7 @@ void dump_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
         }
         case Kind::Hex:
         case Kind::Ns:
+        case Kind::Since:
         case Kind::Unsigned:
         case Kind::Cpu:
         case Kind::Pid:

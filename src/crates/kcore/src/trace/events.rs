@@ -296,7 +296,9 @@ events! {
         guest_ns: u32,
         /// From the exit before to this entry: 0 when that one was not timed
         out_ns: u32,
-        /// From the exit to the record
+        /// From the exit to the record: held as the counter's low half at
+        /// the exit (0: not timed), the kernel reading it back as the
+        /// nanoseconds from it to the record's stamp (`Kind::Since`)
         since_ns: u32,
         /// More of it, by its reason
         info: u32,
