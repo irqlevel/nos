@@ -170,9 +170,9 @@ a hole and the device idle (the EX44's disk task committed 28 times, 5-7 ms
 each, through a guest's 2 GiB first write, 18 of them in its first 150 ms).
 What is there already is left as it is, so that a disk whose free space is
 holes among blocks written once has its holes given ahead as a disk of
-holes does. A write elsewhere
-ends the stream, and a guest writing here and there has nothing given ahead
-of it. The task gives the file blocks only where it has none; the image
+holes does. `STREAM_MISSES` writes in a row elsewhere end the stream --
+fewer, the guest's own between it, its journal's, are let by -- and a guest
+writing here and there has nothing given ahead of it. The task gives the file blocks only where it has none; the image
 takes them into its map at its next request after the task is done, and
 until then they are holes to it, reading as the zeros they hold. A write that meets the hole while the
 task is giving it waits for the task -- said in the log every 10 s it goes
