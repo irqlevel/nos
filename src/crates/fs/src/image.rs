@@ -138,6 +138,16 @@ const AHEAD_STEP_MS: u64 = 100;
 /// image grows ahead of it (`Direct::ask_ahead`).
 const STREAM_MIN: u64 = 2;
 
+/// The chunks of a stream's first stretch grown ahead, and the most of one
+/// after it, each twice the last's: a gigabyte of 16 MiB chunks, so that a
+/// guest's 2 GiB first write is a handful of commits made while it writes,
+/// each well ahead of it -- where a stretch of one chunk, 3.5 ms of a 1 MiB
+/// QD8 stream's writing on the EX44, was waited for by the writes that came
+/// to it, 8.8 ms each (round 24) -- and within the same share of the room
+/// as a growth (`GROW_SHARE`).
+const AHEAD_FIRST: u64 = 4;
+const AHEAD_MAX: u64 = 64;
+
 /// What zeros are written from, a piece at a time (`write_zeroes`).
 const ZERO_CHUNK: usize = 16 * 1024;
 static ZEROS: [u8; ZERO_CHUNK] = [0; ZERO_CHUNK];
@@ -1936,10 +1946,10 @@ impl Direct {
     /// One that begins where the last ended goes on with a guest's stream of
     /// writes from one end of its disk; once it has gone on for
     /// `STREAM_MIN` of them, the stretch ahead of it -- from where the last
-    /// one given ahead ends, or the chunk after the write, twice its chunks,
-    /// to `GROW_MAX_CHUNKS` -- is given every block it lacks by the image's
-    /// task, as soon as the write comes within half of the last stretch of
-    /// its end. What is there already is left as it is, so that a disk whose
+    /// one given ahead ends, or the chunk after the write: `AHEAD_FIRST`
+    /// chunks, then twice the last's, to `AHEAD_MAX` -- is given every block
+    /// it lacks by the image's task, and the next as soon as the stream is
+    /// into the last. What is there already is left as it is, so that a disk whose
     /// free space is holes among blocks written once has its holes given
     /// ahead of the guest as a disk of holes does. A write that begins
     /// elsewhere ends the stream: a guest writing here and there has none
@@ -1957,15 +1967,15 @@ impl Direct {
             return;
         }
         let chunk = self.chunk;
-        /* The last stretch still more than half ahead of the write: not yet */
-        if self.ahead_to > end && self.ahead_to - end > self.ahead_span.saturating_mul(chunk) / 2 {
+        /* The stream not into the last stretch yet: not yet */
+        if self.ahead_to > end && end <= self.ahead_to.saturating_sub(self.ahead_span.saturating_mul(chunk)) {
             return;
         }
         let from = self.ahead_to.max(end.div_ceil(chunk).saturating_mul(chunk));
         if from >= blocks {
             return;
         }
-        let span = self.ahead_span.saturating_mul(2).clamp(1, GROW_MAX_CHUNKS);
+        let span = if self.ahead_span == 0 { AHEAD_FIRST } else { self.ahead_span.saturating_mul(2).min(AHEAD_MAX) };
         let to = from.saturating_add(span.saturating_mul(chunk)).min(blocks);
         /* A stretch the file has every block of -- a guest writing over its
          * disk, its journal going round -- is passed over, as the image's
