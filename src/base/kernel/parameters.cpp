@@ -37,6 +37,7 @@ Parameters::Parameters()
     , its_enabled_(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , hw_rng_off_(false)
     , hwp_off_(false)
+    , hwp_epp_(HWP_EPP_DEFAULT)
     , c1e_firmware_(false)
     , idle_mwait_(true)   /* idle by MWAIT where the CPU offers it; idle=halt for HLT */
     , ucode_off_(false)
@@ -103,6 +104,11 @@ bool Parameters::is_hw_rng_off()
 bool Parameters::is_hwp_off()
 {
     return hwp_off_;
+}
+
+ulong Parameters::get_hwp_epp()
+{
+    return hwp_epp_;
 }
 
 bool Parameters::is_c1e_firmware()
@@ -449,6 +455,12 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
     else if (stdlib::str_cmp(key, "hwp") == 0)
     {
         hwp_off_ = (stdlib::str_cmp(value, "off") == 0);
+    }
+    else if (stdlib::str_cmp(key, "hwp_epp") == 0)
+    {
+        ulong epp;
+        if (stdlib::parse_ulong(value, epp) && epp <= HWP_EPP_MAX)
+            hwp_epp_ = epp;
     }
     else if (stdlib::str_cmp(key, "c1e") == 0)
     {
