@@ -438,6 +438,12 @@ impl Queue {
         }
     }
 
+    /// Whether the driver took EVENT_IDX: kicks are the device's to ask for
+    /// (`ask_kick`), and one it does not ask for never comes.
+    pub fn event_idx(&self) -> bool {
+        self.event_idx
+    }
+
     /// With EVENT_IDX, ask for a kick at the driver's next chain past what
     /// the device has seen of the ring -- which it has taken, or looked at
     /// and found short (`room_ahead`) -- and say whether the driver has made
