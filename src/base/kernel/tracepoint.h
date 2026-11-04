@@ -141,6 +141,12 @@ enum class Kind : u8
     Hex,
     /* Nanoseconds, printed as microseconds. */
     Ns,
+    /* The low 32 bits of the cycle counter at a moment before the record
+       (0: none), read back as the nanoseconds from it to the record's own
+       stamp (field_value) -- a time the site needs no counter's read for,
+       the record's write reading it anyway -- and printed as Ns is. Right
+       for any distance under 2^32 cycles, a second at least. */
+    Since,
     Cpu,
     Pid,
     /* An index into the field's names. */

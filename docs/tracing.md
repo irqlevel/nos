@@ -504,7 +504,11 @@ profile asks), so the off path is the flag's load and a branch in hvarch
 and the same in `Cpu::enter`. An exit's own time is its record's less
 `since_ns`, and the entry it ended its exit's less `guest_ns`; the host's
 time over an exit is the next record's `out_ns` -- so a trace of `hv_exit`
-alone, one record an exit, has every exit's cost in it.
+alone, one record an exit, has every exit's cost in it. `since_ns` costs the
+site no read of the counter: the record holds the exit stamp's low half,
+and the kernel reads it back as the nanoseconds from it to the record's own
+stamp, which its write reads anyway (a field of `Kind::Since`) -- `trace
+show` and `trace dump` print it in nanoseconds as any other.
 
 `hv_inject` is written in the run loop's `deliver`, as each event goes in;
 `hv_halt` and `hv_wake` around a halted CPU's spin and sleep (not a CPU

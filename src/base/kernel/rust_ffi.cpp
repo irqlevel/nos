@@ -2236,11 +2236,14 @@ unsigned long kernel_tp_count()
 /* A record of an event, its number and payload size in `id_size` and its
    payload in `w0`..`w4`, in registers: record() holds the number and the
    size to the event's description -- a BUG_ON for a site that disagrees with
-   it, and nothing written -- so any value of each is sound. */
-void kernel_tp_record(unsigned long id_size, unsigned long w0, unsigned long w1, unsigned long w2,
-    unsigned long w3, unsigned long w4)
+   it, and nothing written -- so any value of each is sound. A jump to it,
+   not a call -- musttail, which the kernel's -fno-optimize-sibling-calls
+   would otherwise forbid -- the arguments left where they came: what a
+   module's record crosses into the kernel by, at every guest exit hv
+   records. record()'s own types, which musttail holds a caller to. */
+void kernel_tp_record(ulong id_size, u64 w0, u64 w1, u64 w2, u64 w3, u64 w4)
 {
-    kernel::tp::record(id_size, w0, w1, w2, w3, w4);
+    [[clang::musttail]] return kernel::tp::record(id_size, w0, w1, w2, w3, w4);
 }
 
 /* Event `id`'s name and payload size, as its description has them: what

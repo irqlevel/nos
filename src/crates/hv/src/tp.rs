@@ -44,7 +44,10 @@ pub const NO_GPR: u64 = 0xFF;
 
 /// What `hv_exit`'s `reason`, `detail` and `info` say of `exit`: the kind,
 /// what it was about, and more of it (the fields' descriptions,
-/// kernel/tracepoint.cpp, say which for each).
+/// kernel/tracepoint.cpp, say which for each). In line in `exit`, its one
+/// caller: a call there is an indirect one, through the module's GOT, and
+/// its answer a trip through memory, right after the world switch.
+#[inline(always)]
 pub fn exit_fields(exit: &Exit, regs: &ExitRegs, host_vector: Option<u8>) -> (ExitReason, u64, u32) {
     let low = |r: u64| r & u64::from(u32::MAX);
     match *exit {
@@ -97,6 +100,7 @@ fn ns_per_cycle_asked() -> u64 {
 
 /// `cycles` of the counter in nanoseconds, as a record's field holds them:
 /// `u32::MAX` for that or more, and 0 while the counter's rate is unknown.
+#[inline]
 pub fn ns(cycles: u64) -> u32 {
     let mut factor = NS_PER_CYCLE.load(Ordering::Relaxed);
     if factor == 0 {
@@ -107,28 +111,33 @@ pub fn ns(cycles: u64) -> u32 {
 }
 
 /// What `hv_exit`'s times say of `run`, the CPU's last entry as hvarch
-/// timed it, at counter `now`: in the guest, out of it before, and since
-/// the exit. All 0 for an entry not made -- a kick turned it back -- or not
+/// timed it: in the guest, out of it before, and since the exit -- the last
+/// as the counter's low half at the exit, which the kernel reads back as
+/// the nanoseconds from it to the record's own stamp (`Kind::Since`), so
+/// that no counter is read here for it; 1 where that half is 0, which says
+/// none. All 0 for an entry not made -- a kick turned it back -- or not
 /// timed; and a count that went backwards -- another CPU's, not quite in
 /// step -- a time of 0, not a wrap.
-pub fn times(exit: &Exit, run: Run, now: u64) -> (u32, u32, u32) {
+#[inline(always)]
+pub fn times(exit: &Exit, run: Run) -> (u32, u32, u32) {
     if matches!(exit, Exit::Kicked) || run.exited == 0 {
         return (0, 0, 0);
     }
     let guest = ns(run.exited.saturating_sub(run.entered));
     let out = if run.before == 0 { 0 } else { ns(run.entered.saturating_sub(run.before)) };
-    let since = ns(now.saturating_sub(run.exited));
-    (guest, out, since)
+    /* The low half: it always fits, the high one masked off */
+    let since = u32::try_from(run.exited & u64::from(u32::MAX)).unwrap_or(1);
+    (guest, out, since.max(1))
 }
 
 /// The `hv_exit` record of `exit`, CPU `vcpu`'s -- run by the task of pid
 /// `pid` (`vm::Cpu::pid`) -- its registers `regs` as the exit left them and
 /// its world switch `run` as hvarch timed it. The caller has asked `on` --
-/// every entry's call site is `vm::Cpu::enter`. The counter is read here as
-/// hvarch reads it around the switch, in place: the TSC the kernel's is.
+/// every entry's call site is `vm::Cpu::enter`. hvarch's stamps are the
+/// TSC, the counter the kernel stamps the record with.
 pub fn exit(vcpu: u32, pid: u32, exit: &Exit, regs: ExitRegs, run: Run, host_vector: Option<u8>) {
     let (reason, detail, info) = exit_fields(exit, &regs, host_vector);
-    let (guest_ns, out_ns, since_ns) = times(exit, run, hvarch::x86::cpu::rdtsc());
+    let (guest_ns, out_ns, since_ns) = times(exit, run);
     trace::emit(&HvExit {
         detail,
         rip: regs.rip,
