@@ -121,16 +121,18 @@ pub fn times(exit: &Exit, run: Run, now: u64) -> (u32, u32, u32) {
     (guest, out, since)
 }
 
-/// The `hv_exit` record of `exit`, CPU `vcpu`'s, its registers `regs` as
-/// the exit left them and its world switch `run` as hvarch timed it. The
-/// caller has asked `on` -- every entry's call site is `vm::Cpu::enter`.
-pub fn exit(vcpu: u32, exit: &Exit, regs: ExitRegs, run: Run, host_vector: Option<u8>) {
+/// The `hv_exit` record of `exit`, CPU `vcpu`'s -- run by the task of pid
+/// `pid` (`vm::Cpu::pid`) -- its registers `regs` as the exit left them and
+/// its world switch `run` as hvarch timed it. The caller has asked `on` --
+/// every entry's call site is `vm::Cpu::enter`. The counter is read here as
+/// hvarch reads it around the switch, in place: the TSC the kernel's is.
+pub fn exit(vcpu: u32, pid: u32, exit: &Exit, regs: ExitRegs, run: Run, host_vector: Option<u8>) {
     let (reason, detail, info) = exit_fields(exit, &regs, host_vector);
-    let (guest_ns, out_ns, since_ns) = times(exit, run, kcore::time::cycle_counter());
+    let (guest_ns, out_ns, since_ns) = times(exit, run, hvarch::x86::cpu::rdtsc());
     trace::emit(&HvExit {
         detail,
         rip: regs.rip,
-        pid: trace::pid(),
+        pid,
         guest_ns,
         out_ns,
         since_ns,
@@ -151,11 +153,13 @@ pub fn ns_field(ns: u64) -> u32 {
     u32::try_from(ns).unwrap_or(u32::MAX)
 }
 
-/// `hv_inject`: `kind`, of `vector`, into CPU `vcpu` at its entry.
+/// `hv_inject`: `kind`, of `vector`, into CPU `vcpu` at its entry, by the
+/// task of pid `pid` that runs it -- as `hv_halt`, `hv_wake` and
+/// `hv_timer` are, each of a CPU's own loop (`vm::Cpu::pid`).
 #[inline]
-pub fn inject(vcpu: u32, kind: InjectKind, vector: u8) {
+pub fn inject(vcpu: u32, pid: u32, kind: InjectKind, vector: u8) {
     if trace::on::<HvInject>() {
-        trace::emit(&HvInject { pid: trace::pid(), vcpu: vcpu_field(vcpu), vector, kind: kind as u8 });
+        trace::emit(&HvInject { pid, vcpu: vcpu_field(vcpu), vector, kind: kind as u8 });
     }
 }
 
@@ -190,10 +194,10 @@ impl HaltFor {
 /// `hv_halt`: CPU `vcpu` halted with nothing to take at `now`, to spin for
 /// `poll_ns` -- 0 for no spin -- and sleep to `until`, the soonest of `of`.
 #[inline]
-pub fn halt(vcpu: u32, now: u64, until: u64, of: &HaltFor, poll_ns: u64) {
+pub fn halt(vcpu: u32, pid: u32, now: u64, until: u64, of: &HaltFor, poll_ns: u64) {
     if trace::on::<HvHalt>() {
         trace::emit(&HvHalt {
-            pid: trace::pid(),
+            pid,
             wait_ns: ns_field(until.saturating_sub(now)),
             poll_ns: ns_field(poll_ns),
             vcpu: vcpu_field(vcpu),
@@ -206,10 +210,10 @@ pub fn halt(vcpu: u32, now: u64, until: u64, of: &HaltFor, poll_ns: u64) {
 /// `hv_wake`: that halt of CPU `vcpu` over, `how`, `halted_ns` after its
 /// look and `late_ns` past the time it slept to.
 #[inline]
-pub fn wake(vcpu: u32, how: WakeHow, halted_ns: u64, late_ns: u64) {
+pub fn wake(vcpu: u32, pid: u32, how: WakeHow, halted_ns: u64, late_ns: u64) {
     if trace::on::<HvWake>() {
         trace::emit(&HvWake {
-            pid: trace::pid(),
+            pid,
             halted_ns: ns_field(halted_ns),
             late_ns: ns_field(late_ns),
             vcpu: vcpu_field(vcpu),
@@ -222,10 +226,10 @@ pub fn wake(vcpu: u32, how: WakeHow, halted_ns: u64, late_ns: u64) {
 /// `hv_timer`: CPU `vcpu`'s APIC timer interrupt asked for, `late_ns` past
 /// its edge, after `how`.
 #[inline]
-pub fn timer(vcpu: u32, how: TimerHow, late_ns: u64) {
+pub fn timer(vcpu: u32, pid: u32, how: TimerHow, late_ns: u64) {
     if trace::on::<HvTimer>() {
         trace::emit(&HvTimer {
-            pid: trace::pid(),
+            pid,
             late_ns: ns_field(late_ns),
             vcpu: vcpu_field(vcpu),
             how: how as u8,

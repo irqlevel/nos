@@ -485,6 +485,21 @@ static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its 
    emit() writes with interrupts off, so none is still inside it then. */
 TraceRing* rings[MAX_CPUS] = {};
 
+/* Where the rings are: every CPU's in a cache line of its own (TraceRing is
+   alignas(64)), together in one block from the heap's page path -- a page,
+   page-aligned -- so that what a CPU writes at every record shares its line
+   with no other ring's and no other allocation's. Rings never made -- a CPU
+   not running -- are left as constructed. */
+struct RingSet
+{
+    TraceRing ring[MAX_CPUS];
+};
+
+static_assert(sizeof(RingSet) >= consts::PAGE_SIZE / 2, "the rings' block from the heap's page path, page-aligned");
+
+/* The set rings[] points into: swapped with them, under control(). */
+RingSet* ring_set = nullptr;
+
 /* Set by `trace freeze`: every emit() takes nothing, so that what is in the
    rings stays as it was for reading. */
 u8 frozen = 0;
@@ -615,28 +630,35 @@ bool valid_ring_kib(ulong kib)
     return (chunks & (chunks - 1)) == 0;
 }
 
-/* Every ring swapped for `fresh[i]` (null for none), the old ones freed once
-   no CPU can still be writing into them. Under control(). */
-void swap_rings(TraceRing* fresh[MAX_CPUS])
+/* A set's rings given back, and the set: only once nothing can be writing
+   into them or reading them. */
+void free_set(RingSet* set)
 {
-    TraceRing* old[MAX_CPUS];
+    if (set == nullptr)
+        return;
+    for (ulong i = 0; i < MAX_CPUS; i++)
+        set->ring[i].release();
+    set->~RingSet();
+    mm::free(set);
+}
+
+/* Every ring swapped for `fresh[i]` (null for none), in `set`, the old ones
+   freed once no CPU can still be writing into them. Under control(). */
+void swap_rings(TraceRing* fresh[MAX_CPUS], RingSet* set)
+{
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
-        old[i] = __atomic_exchange_n(&rings[i], fresh[i], __ATOMIC_ACQ_REL);
+        __atomic_store_n(&rings[i], fresh[i], __ATOMIC_RELEASE);
         cleared_at[i] = 0;
     }
+    RingSet* old = ring_set;
+    ring_set = set;
     /* The new pointers seen by every CPU before the interrupt that tells
        this one it is out of any write into an old ring. */
     hal::smp_mb();
     CpuTable::get_instance().synchronize("tracepoint rings");
 
-    for (ulong i = 0; i < MAX_CPUS; i++)
-    {
-        if (old[i] == nullptr)
-            continue;
-        old[i]->release();
-        delete old[i];
-    }
+    free_set(old);
 }
 
 /* A ring of ring_kib for every running CPU, in place of what there was.
@@ -645,29 +667,36 @@ bool make_rings(stdlib::Printer& con)
 {
     ulong chunks = ring_size_kib() / MIN_RING_KIB;
     ulong running = CpuTable::get_instance().get_running_cpus();
-    TraceRing* fresh[MAX_CPUS] = {};
 
+    void* memory = mm::alloc(sizeof(RingSet), TAG);
+    if (memory == nullptr)
+    {
+        con.printf("trace: no memory for the rings\n");
+        return false;
+    }
+    if (BUG_ON(((ulong)memory & (alignof(RingSet) - 1)) != 0))
+    {
+        mm::free(memory);
+        return false;
+    }
+    RingSet* set = new (memory) RingSet;
+
+    TraceRing* fresh[MAX_CPUS] = {};
     for (ulong i = 0; i < MAX_CPUS; i++)
     {
         if (!(running & (1UL << i)))
             continue;
-        fresh[i] = new (mm::NO_THROW) TraceRing();
-        if (fresh[i] == nullptr || !fresh[i]->init(chunks, TAG))
+        if (!set->ring[i].init(chunks, TAG))
         {
             con.printf("trace: no memory for a ring of %lu KiB for cpu %lu\n", ring_size_kib(), i);
-            /* Nothing kept of a part, in the reverse order. */
-            for (ulong j = i + 1; j > 0; j--)
-            {
-                if (fresh[j - 1] == nullptr)
-                    continue;
-                fresh[j - 1]->release();
-                delete fresh[j - 1];
-            }
+            /* Nothing kept of a part */
+            free_set(set);
             return false;
         }
+        fresh[i] = &set->ring[i];
     }
 
-    swap_rings(fresh);
+    swap_rings(fresh, set);
     return true;
 }
 
@@ -1306,42 +1335,103 @@ void test_records(stdlib::Printer& con, ulong n)
     for (ulong i = 0; i < n; i++)
     {
         Test t = { i, i * 0x9E3779B97F4A7C15ULL };
-        emit(Id::Test, &t, sizeof(t));
+        emit(Id::Test, t);
     }
     preempt_enable();
     con.printf("trace: %lu test records on cpu %lu\n", n, cpu);
 }
 
-/* A record of event `n` into the ring `table` has for this CPU, as emit()
+/* A record of event `n` into the ring `table` has for this CPU, as record()
    writes one: with interrupts off, from the table's slot for the CPU it
-   runs on. The kernel's rings, or `trace bench`'s own. */
-void write_through(TraceRing** table, ulong n, const void* payload, ulong size)
+   runs on. The kernel's rings, or `trace bench`'s own. In line in every
+   caller, as everything it does is -- the CPU's own instructions for the
+   interrupts and the counter, the slot's stores -- so that a record is
+   straight-line code with no call in it. */
+inline __attribute__((always_inline)) void write_through(TraceRing* const* table, ulong n, ulong size,
+    const u64 (&words)[TraceRing::PAYLOAD_WORDS])
 {
     ulong flags = hal::irq_save();
     ulong cpu = hal::get_current_cpu_hw_id();
-    if (cpu < MAX_CPUS)
+    if (likely(cpu < MAX_CPUS))
     {
         TraceRing* ring = __atomic_load_n(&table[cpu], __ATOMIC_ACQUIRE);
-        if (ring != nullptr)
-            ring->write((u16)n, hal::read_cycle_counter(), payload, size);
+        if (likely(ring != nullptr))
+            ring->write_words((u16)n, hal::read_cycle_counter_unordered(), size, words);
     }
     hal::irq_restore(flags);
 }
 
-/* `trace bench`: what a tracepoint costs this CPU off, and on. The one that
-   is on writes into a ring of its own -- every CPU's slot of a table of its
-   own pointing at it, the shell's task its only writer -- so that what the
-   kernel's rings hold stays as it was, frozen or not. */
-void bench(stdlib::Printer& con)
+/* A record of event `n`, `size` bytes of it in `words`, into the kernel's
+   rings: what record() and the kernel's own sites' builders (put) do. */
+inline __attribute__((always_inline)) void record_in(ulong n, ulong size,
+    const u64 (&words)[TraceRing::PAYLOAD_WORDS])
 {
-    static const ulong OFF_LOOPS = 10000000;
-    static const ulong ON_LOOPS = 100000;
+    if (BUG_ON(n >= COUNT || size != EVENTS[n].size))
+        return;
+    if (unlikely(__atomic_load_n(&frozen, __ATOMIC_RELAXED)))
+        return;
+    write_through(rings, n, size, words);
+}
+
+/* What `trace bench` measured: picoseconds an iteration, and the CPU it ran
+   on, first and last -- one CPU unless the shell's task moved midway. */
+struct BenchResult
+{
+    ulong cpu_first;
+    ulong cpu_last;
+    /* A tracepoint that is off, over an empty loop's iteration */
+    ulong off_ps;
+    /* A record, all of it, into a ring of its own */
+    ulong record_ps;
+    /* Its parts, each over an empty loop's iteration: interrupts off and
+       back, the cycle counter's read, and the slot's stores alone */
+    ulong irq_ps;
+    ulong counter_ps;
+    ulong slot_ps;
+    /* The counter read ordered, as what times an interval reads it: what a
+       record would pay for its stamp without read_cycle_counter_unordered */
+    ulong ordered_ps;
+    /* The slot's stores into a ring of `trace size`'s KiB instead, round it
+       a few times: what its pages cost the TLB and its lines the caches,
+       that 64 KiB of chunk does not show. 0 KiB: not measured -- the size
+       is the chunk's, or no memory for it */
+    ulong big_kib;
+    ulong big_slot_ps;
+    /* False: no memory for the ring of its own */
+    bool ring;
+};
+
+/* How many iterations each of `trace bench`'s loops makes: the off one and
+   the empty one it is measured against; a record's; and each part's. */
+const ulong BENCH_OFF_LOOPS = 10000000;
+const ulong BENCH_ON_LOOPS = 100000;
+const ulong BENCH_PART_LOOPS = 1000000;
+
+/* `cycles` over `loops` iterations in picoseconds an iteration, the empty
+   loop's share of them -- `empty` cycles over BENCH_OFF_LOOPS -- taken off. */
+ulong per_iteration_ps(u64 cycles, ulong loops, u64 empty)
+{
+    u64 share = empty * loops / BENCH_OFF_LOOPS;
+    u64 net = (cycles > share) ? cycles - share : 0;
+    /* Nanoseconds of the whole loop first: the conversion's product of a
+       count this big times a thousand could overflow */
+    return cycle_counter_delta_to_ns(net) * 1000 / loops;
+}
+
+/* `trace bench`'s measurements, on the CPU this runs on: the tracepoint off,
+   a record on -- into a ring of its own, every CPU's slot of a table of its
+   own pointing at it, its caller its only writer, so that what the kernel's
+   rings hold stays as it was, frozen or not -- and the record's parts. */
+void measure(BenchResult& r)
+{
     bool was_on = on(Id::Test);
     ulong hits = 0;
+    auto& cpus = CpuTable::get_instance();
+    r.cpu_first = cpus.get_current_cpu_id();
 
     __atomic_store_n(&enabled[(ulong)Id::Test], 0, __ATOMIC_RELEASE);
     u64 start = hal::read_cycle_counter();
-    for (ulong i = 0; i < OFF_LOOPS; i++)
+    for (ulong i = 0; i < BENCH_OFF_LOOPS; i++)
     {
         if (unlikely(on(Id::Test)))
             hits++;
@@ -1350,38 +1440,166 @@ void bench(stdlib::Printer& con)
     u64 off_cycles = hal::read_cycle_counter() - start;
 
     start = hal::read_cycle_counter();
-    for (ulong i = 0; i < OFF_LOOPS; i++)
+    for (ulong i = 0; i < BENCH_OFF_LOOPS; i++)
         hal::compiler_barrier();
     u64 empty_cycles = hal::read_cycle_counter() - start;
 
-    ulong off_ps = cycle_counter_delta_to_ns(off_cycles > empty_cycles ? off_cycles - empty_cycles : 0) * 1000 / OFF_LOOPS;
-    con.printf("trace bench: a tracepoint that is off, %lu.%03lu ns over an empty loop's iteration (%lu loops)\n",
-        off_ps / 1000, off_ps % 1000, OFF_LOOPS);
-
+    r.off_ps = per_iteration_ps(off_cycles, BENCH_OFF_LOOPS, empty_cycles);
     __atomic_store_n(&enabled[(ulong)Id::Test], was_on ? 1 : 0, __ATOMIC_RELEASE);
     (void)hits;
 
-    TraceRing ring;
-    if (!ring.init(1, TAG))
+    /* Interrupts off and back as a record has them: on before, so that the
+       restore is the STI a site with interrupts on pays */
+    start = hal::read_cycle_counter();
+    for (ulong i = 0; i < BENCH_PART_LOOPS; i++)
     {
-        con.printf("trace bench: no memory for a ring of its own, to time one that is on\n");
+        ulong flags = hal::irq_save();
+        hal::compiler_barrier();
+        hal::irq_restore(flags);
+    }
+    r.irq_ps = per_iteration_ps(hal::read_cycle_counter() - start, BENCH_PART_LOOPS, empty_cycles);
+
+    u64 sum = 0;
+    start = hal::read_cycle_counter();
+    for (ulong i = 0; i < BENCH_PART_LOOPS; i++)
+    {
+        sum += hal::read_cycle_counter_unordered();
+        hal::compiler_barrier();
+    }
+    r.counter_ps = per_iteration_ps(hal::read_cycle_counter() - start, BENCH_PART_LOOPS, empty_cycles);
+
+    start = hal::read_cycle_counter();
+    for (ulong i = 0; i < BENCH_PART_LOOPS; i++)
+    {
+        sum += hal::read_cycle_counter();
+        hal::compiler_barrier();
+    }
+    r.ordered_ps = per_iteration_ps(hal::read_cycle_counter() - start, BENCH_PART_LOOPS, empty_cycles);
+    (void)sum;
+
+    TraceRing ring;
+    r.ring = ring.init(1, TAG);
+    if (!r.ring)
+    {
+        r.cpu_last = cpus.get_current_cpu_id();
         return;
     }
     TraceRing* table[MAX_CPUS];
     for (ulong i = 0; i < MAX_CPUS; i++)
         table[i] = &ring;
 
+    /* The slot's stores alone: interrupts left on -- the ring is this
+       loop's alone, whichever CPU it runs on -- and the counter not read */
     start = hal::read_cycle_counter();
-    for (ulong i = 0; i < ON_LOOPS; i++)
+    for (ulong i = 0; i < BENCH_ON_LOOPS; i++)
     {
         Test t = { i, i };
-        write_through(table, (ulong)Id::Test, &t, sizeof(t));
+        u64 w[TraceRing::PAYLOAD_WORDS] = {};
+        payload_words(t, w);
+        ring.write_words((u16)Id::Test, i, sizeof(t), w);
+    }
+    r.slot_ps = per_iteration_ps(hal::read_cycle_counter() - start, BENCH_ON_LOOPS, empty_cycles);
+
+    /* The same into a ring of the size records go into, round it four
+       times at least: past the first round every slot is one written a
+       ring ago, its line and its page's translation as the rest of the
+       loop left them */
+    r.big_kib = 0;
+    ulong kib = ring_size_kib();
+    if (kib > MIN_RING_KIB)
+    {
+        TraceRing big;
+        if (big.init(kib / MIN_RING_KIB, TAG))
+        {
+            const ulong ROUNDS = 4;
+            ulong loops = stdlib::max(BENCH_ON_LOOPS, ROUNDS * big.capacity());
+            start = hal::read_cycle_counter();
+            for (ulong i = 0; i < loops; i++)
+            {
+                Test t = { i, i };
+                u64 w[TraceRing::PAYLOAD_WORDS] = {};
+                payload_words(t, w);
+                big.write_words((u16)Id::Test, i, sizeof(t), w);
+            }
+            r.big_slot_ps = per_iteration_ps(hal::read_cycle_counter() - start, loops, empty_cycles);
+            r.big_kib = kib;
+            big.release();
+        }
+    }
+
+    /* A record, all of it, as the kernel's sites write one */
+    start = hal::read_cycle_counter();
+    for (ulong i = 0; i < BENCH_ON_LOOPS; i++)
+    {
+        Test t = { i, i };
+        u64 w[TraceRing::PAYLOAD_WORDS] = {};
+        payload_words(t, w);
+        write_through(table, (ulong)Id::Test, sizeof(t), w);
     }
     u64 on_cycles = hal::read_cycle_counter() - start;
-    ulong on_ps = cycle_counter_delta_to_ns(on_cycles) * 1000 / ON_LOOPS;
-    con.printf("trace bench: one that is on, %lu.%03lu ns a record (%lu records into a ring of its own)\n",
-        on_ps / 1000, on_ps % 1000, ON_LOOPS);
+    r.record_ps = cycle_counter_delta_to_ns(on_cycles) * 1000 / BENCH_ON_LOOPS;
     ring.release();
+    r.cpu_last = cpus.get_current_cpu_id();
+}
+
+/* `trace bench cpu=N`'s task: the measurements on the CPU it is pinned to. */
+void bench_task(void* ctx)
+{
+    measure(*static_cast<BenchResult*>(ctx));
+}
+
+/* The CPU `trace bench` measures on when told none: the shell's own. */
+const ulong BENCH_HERE = MAX_CPUS;
+
+/* `trace bench [cpu=N]`: what a tracepoint costs a CPU off, and on -- the
+   shell's, or N's, by a task pinned to it that the shell waits for. */
+void bench(stdlib::Printer& con, ulong cpu)
+{
+    BenchResult r = {};
+    if (cpu == BENCH_HERE)
+    {
+        measure(r);
+    }
+    else
+    {
+        Task* task = mm::talloc<Task, TAG>("trace/bench");
+        if (task == nullptr)
+        {
+            con.printf("trace bench: no memory for a task on cpu %lu\n", cpu);
+            return;
+        }
+        task->set_cpu_affinity(1UL << cpu);
+        if (!task->start(bench_task, &r))
+        {
+            task->put();
+            con.printf("trace bench: could not start a task on cpu %lu\n", cpu);
+            return;
+        }
+        task->wait();
+        task->put();
+    }
+
+    if (r.cpu_first == r.cpu_last)
+        con.printf("trace bench: on cpu %lu\n", r.cpu_first);
+    else
+        con.printf("trace bench: on cpu %lu, then cpu %lu -- moved midway\n", r.cpu_first, r.cpu_last);
+    con.printf("trace bench: a tracepoint that is off, %lu.%03lu ns over an empty loop's iteration (%lu loops)\n",
+        r.off_ps / 1000, r.off_ps % 1000, BENCH_OFF_LOOPS);
+    if (!r.ring)
+    {
+        con.printf("trace bench: no memory for a ring of its own, to time one that is on\n");
+        return;
+    }
+    con.printf("trace bench: one that is on, %lu.%03lu ns a record (%lu records into a ring of its own)\n",
+        r.record_ps / 1000, r.record_ps % 1000, BENCH_ON_LOOPS);
+    con.printf("trace bench: of it, each over an empty loop's iteration: interrupts off and back %lu.%03lu ns, "
+        "the cycle counter %lu.%03lu ns (ordered: %lu.%03lu ns), the slot's stores %lu.%03lu ns\n",
+        r.irq_ps / 1000, r.irq_ps % 1000, r.counter_ps / 1000, r.counter_ps % 1000, r.ordered_ps / 1000,
+        r.ordered_ps % 1000, r.slot_ps / 1000, r.slot_ps % 1000);
+    if (r.big_kib != 0)
+        con.printf("trace bench: the slot's stores into a ring of %lu KiB, as `trace size` makes them: %lu.%03lu ns "
+            "(into %lu KiB: %lu.%03lu ns)\n", r.big_kib, r.big_slot_ps / 1000, r.big_slot_ps % 1000, MIN_RING_KIB,
+            r.slot_ps / 1000, r.slot_ps % 1000);
 }
 
 /* The words of `args` past the first, each into `words` (up to `max`, of
@@ -1424,14 +1642,10 @@ ulong split(const char* args, char words[WORDS_MAX][WORD_LEN])
 
 }
 
-void emit(Id id, const void* payload, ulong size)
+void record(ulong id_size, u64 w0, u64 w1, u64 w2, u64 w3, u64 w4)
 {
-    ulong n = (ulong)id;
-    if (BUG_ON(n >= COUNT || size != EVENTS[n].size))
-        return;
-    if (__atomic_load_n(&frozen, __ATOMIC_RELAXED))
-        return;
-    write_through(rings, n, payload, size);
+    const u64 words[TraceRing::PAYLOAD_WORDS] = { w0, w1, w2, w3, w4 };
+    record_in(id_size & RECORD_ID_MASK, id_size >> RECORD_SIZE_SHIFT, words);
 }
 
 bool set_ring_kib(ulong kib, stdlib::Printer& con)
@@ -1474,7 +1688,7 @@ void free_rings()
        the rings the next one makes record */
     thaw();
     TraceRing* none[MAX_CPUS] = {};
-    swap_rings(none);
+    swap_rings(none, nullptr);
 }
 
 ulong read_cpu(ulong cpu, Id id, TraceRing::Record* out, ulong max)
@@ -1766,14 +1980,26 @@ void command(const char* args, stdlib::Printer& con)
     }
     else if (stdlib::str_cmp(verb, "bench") == 0)
     {
+        const ulong CPU_PREFIX_LEN = 4;
+        ulong cpu = BENCH_HERE;
+        if (n >= 2)
+        {
+            if (n > 2 || stdlib::mem_cmp(words[1], "cpu=", CPU_PREFIX_LEN) != 0
+                || !stdlib::parse_ulong(words[1] + CPU_PREFIX_LEN, cpu) || cpu >= MAX_CPUS
+                || (CpuTable::get_instance().get_running_cpus() & (1UL << cpu)) == 0)
+            {
+                con.printf("usage: trace bench [cpu=N], N a running cpu\n");
+                return;
+            }
+        }
         stdlib::AutoLock lock(control());
-        bench(con);
+        bench(con, cpu);
     }
     else
     {
         con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | "
             "dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | "
-            "size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench\n");
+            "size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench [cpu=N]\n");
     }
 }
 
@@ -1782,30 +2008,39 @@ void command(const char* args, stdlib::Printer& con)
 namespace
 {
 
-/* A task's name into a payload's field: what fits, zeroed past the name's
-   end, so that no byte of a record is whatever the stack held. Its name is
-   written once, when the task is made, and never changed after. */
-void put_comm(char* to, const char* name)
+/* A kernel site's record: its payload laid into a slot's words and written
+   in line (record_in) -- what the builders below do, where a caller of
+   emit() reaches record() with a call. */
+template <typename T>
+inline __attribute__((always_inline)) void put(Id id, const T& payload)
 {
-    stdlib::mem_set(to, 0, COMM_BYTES);
-    if (name == nullptr)
+    u64 w[TraceRing::PAYLOAD_WORDS] = {};
+    payload_words(payload, w);
+    record_in((ulong)id, sizeof(T), w);
+}
+
+static_assert(COMM_BYTES <= TASK_NAME_LEN, "a record's name is the start of a task's");
+
+/* A task's name into a payload's field: the first COMM_BYTES bytes of it,
+   which are the name and zeroes past its end -- a task's name is zeroed
+   whole before it is written (Task::Task, Task::set_name) -- so that no byte
+   of a record is whatever memory held, and a copy of a size the compiler
+   knows: two moves, where a str_len and two string instructions were. A
+   name is written once, when the task is made, before anything can find
+   the task; reading it takes no lock. */
+inline __attribute__((always_inline)) void put_comm(char* to, Task* task)
+{
+    if (task == nullptr)
+    {
+        __builtin_memset(to, 0, COMM_BYTES);
         return;
-    ulong len = stdlib::str_len(name);
-    if (len > COMM_BYTES)
-        len = COMM_BYTES;
-    stdlib::mem_cpy(to, name, len);
+    }
+    __builtin_memcpy(to, task->get_name(), COMM_BYTES);
 }
 
 u32 task_pid(Task* task)
 {
     return (task != nullptr) ? (u32)task->pid_ : NO_TASK_PID;
-}
-
-/* A task's name as a task says it, or none. Reading it takes no lock: it is
-   written when the task is made, before anything can find it. */
-const char* task_name(Task* task)
-{
-    return (task != nullptr) ? task->get_name() : nullptr;
 }
 
 }
@@ -1814,64 +2049,64 @@ void emit_sched_switch(Task* prev, Task* next, ulong cpu, u8 state, u8 reason)
 {
     SchedSwitch s = {};
     s.prev_pid = task_pid(prev);
-    put_comm(s.prev_comm, task_name(prev));
+    put_comm(s.prev_comm, prev);
     s.next_pid = task_pid(next);
-    put_comm(s.next_comm, task_name(next));
+    put_comm(s.next_comm, next);
     s.next_cpu = (u32)cpu;
     s.prev_state = state;
     s.reason = reason;
-    emit(Id::SchedSwitch, &s, sizeof(s));
+    put(Id::SchedSwitch, s);
 }
 
 void emit_sched_wakeup(Task* task, ulong cpu, bool deadline, Task* waker, ulong late_ns)
 {
     SchedWakeup w = {};
     w.pid = task_pid(task);
-    put_comm(w.comm, task_name(task));
+    put_comm(w.comm, task);
     w.cpu = (u32)cpu;
     w.deadline = deadline ? 1 : 0;
     w.waker_pid = task_pid(waker);
     w.late_ns = (u32)stdlib::min(late_ns, (ulong)~0U);
-    emit(Id::SchedWakeup, &w, sizeof(w));
+    put(Id::SchedWakeup, w);
 }
 
 void emit_sched_block(Task* task, ulong cpu, ulong ran_ns)
 {
     SchedBlock b = {};
     b.pid = task_pid(task);
-    put_comm(b.comm, task_name(task));
+    put_comm(b.comm, task);
     b.cpu = (u32)cpu;
     b.deadline = ((ulong)task->sleep_until_.get() != 0) ? 1 : 0;
     b.ran_ns = (u32)stdlib::min(ran_ns, (ulong)~0U);
-    emit(Id::SchedBlock, &b, sizeof(b));
+    put(Id::SchedBlock, b);
 }
 
 void emit_sched_migrate(Task* task, ulong from, ulong to)
 {
     SchedMigrate m = {};
     m.pid = task_pid(task);
-    put_comm(m.comm, task_name(task));
+    put_comm(m.comm, task);
     m.from = (u32)from;
     m.to = (u32)to;
-    emit(Id::SchedMigrate, &m, sizeof(m));
+    put(Id::SchedMigrate, m);
 }
 
 void emit_sched_new(Task* task, ulong cpu)
 {
     SchedNew n = {};
     n.pid = task_pid(task);
-    put_comm(n.comm, task_name(task));
+    put_comm(n.comm, task);
     n.cpu = (u32)cpu;
-    emit(Id::SchedNew, &n, sizeof(n));
+    put(Id::SchedNew, n);
 }
 
 void emit_sched_exit(Task* task, ulong cpu)
 {
     SchedExit e = {};
     e.pid = task_pid(task);
-    put_comm(e.comm, task_name(task));
+    put_comm(e.comm, task);
     e.cpu = (u32)cpu;
-    emit(Id::SchedExit, &e, sizeof(e));
+    put(Id::SchedExit, e);
 }
 
 void emit_sched_ipi(ulong cpu, ulong tasks)
@@ -1879,18 +2114,18 @@ void emit_sched_ipi(ulong cpu, ulong tasks)
     SchedIpi i = {};
     i.cpu = (u32)cpu;
     i.tasks = (u32)tasks;
-    emit(Id::SchedIpi, &i, sizeof(i));
+    put(Id::SchedIpi, i);
 }
 
 void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle)
 {
     SchedPreemptDeferred d = {};
     d.pid = task_pid(task);
-    put_comm(d.comm, task_name(task));
+    put_comm(d.comm, task);
     d.cpu = (u32)cpu;
     d.count = (u32)count;
     d.idle = idle ? 1 : 0;
-    emit(Id::SchedPreemptDeferred, &d, sizeof(d));
+    put(Id::SchedPreemptDeferred, d);
 }
 
 void emit_idle(Id id, ulong cpu, Task* idle_task)
@@ -1898,7 +2133,7 @@ void emit_idle(Id id, ulong cpu, Task* idle_task)
     Idle i = {};
     i.cpu = (u32)cpu;
     i.pid = task_pid(idle_task);
-    emit(id, &i, sizeof(i));
+    put(id, i);
 }
 
 void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable)
@@ -1908,7 +2143,7 @@ void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable)
     s.pid = task_pid(task);
     s.slice_ns = (u32)stdlib::min(slice_ns, (ulong)~0U);
     s.runnable = (u32)runnable;
-    emit(Id::SchedSlice, &s, sizeof(s));
+    put(Id::SchedSlice, s);
 }
 
 /* A wakeup's wait, from the scheduler (TaskQueue::note_run), which has it in
@@ -1933,7 +2168,7 @@ void note_wakeup(ulong waited_ns, ulong now_ns, Task* task, ulong cpu)
     __atomic_store_n(&trigger.pid_cpu, ((u64)task_pid(task) << 32) | (u64)(u32)cpu, __ATOMIC_RELAXED);
     {
         u64 words[2] = {};
-        put_comm(reinterpret_cast<char*>(words), task_name(task));
+        put_comm(reinterpret_cast<char*>(words), task);
         __atomic_store_n(&trigger.comm[0], words[0], __ATOMIC_RELAXED);
         __atomic_store_n(&trigger.comm[1], words[1], __ATOMIC_RELAXED);
     }

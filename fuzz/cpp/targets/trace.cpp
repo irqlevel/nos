@@ -4,7 +4,8 @@
 // takes a power of two of chunks and nothing else, and on an allocation that
 // fails keeps nothing; a write takes a payload of at most PAYLOAD_BYTES and
 // nothing larger; the records it holds are the newest capacity() of those
-// written, each read back as written -- its index, cycles, event, size, the
+// written, each read back as written -- its index, cycles (the later of its
+// own and the ring's newest: a ring's stamps never go back), event, size, the
 // payload's bytes and zeros after them -- and an index not written yet,
 // written over, or past a release, is no record. Now and then a writer on a
 // thread of its own and the input's thread reading as it writes: every
@@ -21,6 +22,7 @@
 
 #include <atomic>
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 namespace
@@ -79,6 +81,9 @@ void run_model(fuzz::Input& in)
 
     TraceRing ring;
     std::vector<Written> written;
+    /* The newest record's stamp: a ring's stamps never go back, a write's
+       taken as the later of its own and this (TraceRing::write) */
+    u64 newest = 0;
     ulong chunks = in.pick(CHUNKS);
     if (in.chance(32))
         fuzz::heap_fail_after(in.below(chunks + 2));
@@ -117,6 +122,10 @@ void run_model(fuzz::Input& in)
             if (took)
             {
                 memcpy(w.payload, src, w.size);
+                if (w.cycles < newest)
+                    fuzz::reached("a stamp before the ring's newest held to it");
+                w.cycles = std::max(w.cycles, newest);
+                newest = w.cycles;
                 written.push_back(w);
             }
             else
@@ -138,6 +147,8 @@ void run_model(fuzz::Input& in)
                 u64 v = written.size() * 0x9E3779B97F4A7C15ULL;
                 memcpy(w.payload, &v, sizeof(v));
                 INVARIANT(ring.write(w.id, w.cycles, &v, sizeof(v)), "a write of 8 bytes refused");
+                w.cycles = std::max(w.cycles, newest);
+                newest = w.cycles;
                 written.push_back(w);
             }
             if (written.size() > ring.capacity())

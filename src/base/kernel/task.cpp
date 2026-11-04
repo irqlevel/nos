@@ -42,7 +42,9 @@ Task::Task()
     ref_counter_.set(1);
     list_entry_.init();
     sleep_entry_.init();
-    name_[0] = '\0';
+    /* Zeroed whole, not just terminated: a record's name is the first
+       bytes of it as they are (tracepoint.cpp's put_comm) */
+    stdlib::mem_set(name_, 0, sizeof(name_));
 }
 
 Task::Task(const char* name)
@@ -705,17 +707,12 @@ void Task::diagnose_get_current_task()
 
 void Task::set_name(const char *fmt, ...)
 {
-    name_[0] = '\0';
+    stdlib::mem_set(name_, 0, sizeof(name_));
 
     va_list args;
     va_start(args, fmt);
     stdlib::vsn_printf(name_, stdlib::array_size(name_), fmt, args);
     va_end(args);
-}
-
-const char* Task::get_name()
-{
-    return name_;
 }
 
 ulong Task::get_runtime_ns()

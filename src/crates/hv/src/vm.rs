@@ -370,6 +370,11 @@ pub struct Cpu {
     table: u64,
     /// Its number in its guest, which its trace records say it by.
     index: u32,
+    /// The pid its records say the task that runs it by: asked of the
+    /// kernel once -- of the task that made it, and again by the task that
+    /// takes it to run (`note_task`) -- rather than at each record, every
+    /// one of which would be a call into the kernel for it.
+    pid: u32,
 }
 
 impl Cpu {
@@ -381,7 +386,18 @@ impl Cpu {
             Ext::Svm => Backend::Svm(crate::svm::Vcpu::new(caps, exceptions)?),
             Ext::Vmx => Backend::Vmx(crate::vmx::Vcpu::new(caps, exceptions)?),
         };
-        Ok(Self { backend, table: memory.nested().id, index })
+        Ok(Self { backend, table: memory.nested().id, index, pid: kcore::trace::pid() })
+    }
+
+    /// Note that the task calling this runs the CPU from here on: the pid
+    /// its records say from now.
+    pub fn note_task(&mut self) {
+        self.pid = kcore::trace::pid();
+    }
+
+    /// The pid of the task that runs it, as its records say it.
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     pub fn backend(&self) -> &Backend {
@@ -412,7 +428,7 @@ impl Cpu {
             if let Ok((exit, _)) = &entered {
                 let b = &self.backend;
                 let regs = crate::tp::ExitRegs { rip: b.save().rip, rax: b.save().rax, rcx: b.regs().rcx };
-                crate::tp::exit(self.index, exit, regs, b.last_run(), b.host_vector());
+                crate::tp::exit(self.index, self.pid, exit, regs, b.last_run(), b.host_vector());
             }
         }
         entered

@@ -1456,6 +1456,8 @@ pub mod vm {
         /// what vm.rs's records an exit with.
         index: u32,
         last_run: crate::x86::svm::Run,
+        /// The pid its records say its task by, as vm.rs's keeps it.
+        pid: u32,
     }
 
     impl Cpu {
@@ -1464,7 +1466,13 @@ pub mod vm {
             backend.vmx = machine.caps().vendor() == crate::Vendor::Vmx;
             backend.vapic = backend.vmx && machine.vapic;
             backend.pi_capable = backend.vapic && machine.posted;
-            Ok(Cpu { backend, index, last_run: Default::default() })
+            Ok(Cpu { backend, index, last_run: Default::default(), pid: crate::trace::pid() })
+        }
+        pub fn note_task(&mut self) {
+            self.pid = crate::trace::pid();
+        }
+        pub fn pid(&self) -> u32 {
+            self.pid
         }
         pub fn backend(&self) -> &Backend {
             &self.backend
@@ -1486,7 +1494,7 @@ pub mod vm {
                 if let Ok((exit, _)) = &entered {
                     let b = &self.backend;
                     let regs = crate::tp::ExitRegs { rip: b.save().rip, rax: b.save().rax, rcx: b.regs().rcx };
-                    crate::tp::exit(self.index, exit, regs, self.last_run, None);
+                    crate::tp::exit(self.index, self.pid, exit, regs, self.last_run, None);
                 }
             }
             entered
