@@ -364,6 +364,10 @@ def hv_wakes(recs, start):
         target = pids.get(f.get("vcpu"), set())
         row = rings.setdefault(f.get("how", "?"), {"n": 0, "to_entry": []})
         row["n"] += 1
+        if f.get("how") == "notified":
+            # A posted interrupt, taken by the CPU in the guest it was in:
+            # no entry is what delivers it, so none is paired with it.
+            continue
         if len(target) != 1:
             unpaired += 1
             continue
@@ -505,7 +509,10 @@ def hv_summary(recs, start):
                          sorted(injects.items(), key=lambda kv: -kv[1])[:8])
         print(f"  injected: {text}")
     for how, row in sorted(rings.items(), key=lambda kv: -kv[1]["n"]):
-        print(f"  rings {how}: {row['n']}, to the vCPU's next entry {spread(row['to_entry'])}")
+        if how == "notified":
+            print(f"  rings notified: {row['n']}, posted to a vCPU in its guest and taken there, no entry needed")
+        else:
+            print(f"  rings {how}: {row['n']}, to the vCPU's next entry {spread(row['to_entry'])}")
     if unpaired:
         print(f"  {unpaired} rings not paired: their vCPU's number more than one task's, or no entry after")
 
@@ -651,8 +658,10 @@ def selftest():
     exit_(2000, 10, 0, "io", 400, 300, 50, detail=0xC010, info=2)
     exit_(3000, 10, 0, "hlt", 600, 350, 40)
     exit_(9000, 10, 0, "host", 200, 5700, 60, detail=0xEC)
-    # A ring to vCPU 1 of VM A (pid 11): its next entry after the ring.
+    # A ring to vCPU 1 of VM A (pid 11): its next entry after the ring --
+    # and a posted interrupt's notification, which no entry delivers.
     rec(4000, 1, "hv_ring", vcpu=1, pid=10, how="rung")
+    rec(4100, 1, "hv_ring", vcpu=1, pid=10, how="notified")
     exit_(5500, 11, 1, "msr", 700, 0, 100, detail=0x830, info=1)
     # vCPU 0 again, in VM B (pid 20): a ring to vCPU 0 is no longer one
     # task's to pair with -- though each of the two has an entry after it.
@@ -699,6 +708,7 @@ def selftest():
     halts, timers, injects, rings, unpaired = hv_wakes(recs, 0)
     want("the ring to vCPU 1, to its next entry", rings["rung"]["to_entry"], [5500 - 100 - 700 - 4000])
     want("the ring to a number two VMs' tasks have, unpaired", unpaired, 1)
+    want("the notification, counted and never paired", (rings["notified"]["n"], rings["notified"]["to_entry"]), (1, []))
     d = disk_requests(recs, 0)
     by_op = {q["op"]: q for q in d["requests"]}
     w, r = by_op["write"], by_op["read"]

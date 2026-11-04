@@ -19,6 +19,17 @@ Behind: a new file's first write (67%), 4k I/O from one job (71-83%),
 cyclictest's average (43%), perf's pipe (73%), random reads of memory (85%),
 CPU-bound work (96-98%).
 
+**Round 12 (a0ae873e, 2026-11-04): the same, measured from inside.** The
+tracepoints' build ran the suite with a few seconds of records taken at each
+phase that is behind (`bench/vm/results/nos-a0ae873e`: `summary.txt` and the
+decoded windows in `traces.md`; the kit's `out/ex44-bench/run2/round-c12.sh`).
+Its numbers are round 11's within the noise -- cyclictest's average 66 us,
+4k reads at QD1 85%, at QD32 72% -- but one: sysbench's sequential writes of
+memory by four threads, 21.6 GB/s where every run before had 45-50 (four
+threads writing one shared 512 MiB buffer; no record was being made then,
+and that step has next to no exits): to be run again before anything is made
+of it. What the windows measured is under each heading below.
+
 ## Done since ddcbd4c6
 
 - **The fdatasync job's tail** (p99 0.7-0.9 ms and p999 ~1 ms in every run
@@ -98,6 +109,39 @@ the task woken), where KVM's ioeventfd only signals its iothread.
   round gives it to the guest (`run.rs`: the devices' rounds are the first
   CPU's): a wake more than KVM's irqfd, when the job is on another CPU.
 
+**What round 12's windows measured** (p50 of about 680 requests each, the
+stretches `trace-decode.py --hv` pairs a request through):
+
+| | in all | to the disk's task | served by the image | of it, the device | back to the vCPU |
+|---|---:|---:|---:|---:|---:|
+| 4k read, QD1 | 49.2 us | 4.9 | 43.3 | 37.9 | 1.3 |
+| 4k write, QD1 | 20.6 us | 5.0 | 14.8 | 9.4 | 0.8 |
+| 4k read, QD32 | 50.6 us | 4.1 | 44.2 | 38.2 | 1.8 |
+
+and the notify's exit costs the host 3.0 us after it, every time. So at QD1
+the host's part of a read is about 11 us of 49 and of a write 11 of 21 --
+the disk's task waking for the request (4.9-5.0), waking again for the NVMe's
+completion (most of the image's 5.4 beyond the device) and the notify (3.0);
+the vCPU's own pick-up is cheap, its halt's poll catching the ring (862 of
+963 halts ended in the spin; a ring to a polling vCPU reaches its entry in
+0.85 us, one to a sleeping vCPU in 2.4). At QD32 the device never had more
+than **9 commands at once** though the guest keeps 32 out: the job's vCPU
+made 1136 notify exits for 674 requests, 3.0 us of the host's each, and was
+in its guest 51% of the time -- the submission is that CPU's, one request at
+a time, which is fio's 6-7 us of submission latency.
+
+The levers, in the order the numbers put them:
+
+1. **The disk's task polls before it sleeps** -- for a request from the
+   device and for its image's completions, a spin grown and dropped as the
+   halt poll's (`modules/hv/src/disk.rs`'s `serve`, `ImageQueue::wait`):
+   both its wakes, about 10 us of a QD1 request. QEMU's iothread polls.
+2. **The guest kicks less**: notifications off while the disk has requests
+   out -- EVENT_IDX's `avail_event` left behind, the ring looked at again
+   at each completion (`Blk::poll`'s `fill`) -- so that a QD32 job does not
+   exit per request; then the notify's own 3 us.
+3. Multiqueue, as above.
+
 ## Waking a guest's CPU: cyclictest 72 us, perf's pipe 8.2 us
 
 cyclictest's threads average 60, 90, 59 and 78 us against KVM's 27-35; perf's
@@ -132,6 +176,29 @@ reading the clock, under nos 50-80 us and under KVM 25-30 -- the same kernel.
   before its edge with the host's timer armed for the edge, and ran on until
   a host interrupt took it out 4068 us after it -- an arming lost, as T1's
   were before ddcbd4c6, once in a run.
+
+**What round 12's windows measured.** In cyclictest's: the vCPUs' sleeps to
+their timers' edges ended **17.3 us past their time** at p50 (p99 21.8) --
+`TIMER_ADVANCE_NS`, 10 us, covers part of it -- so the guest's timer
+interrupt was asked for 8.7 us past its edge at p50, 13.1 at p99; and the
+exits right after such a wake cost the host **11.0 us** each (the TSC
+deadline's write, 887 of them) where on a busy core, in the pipe window, the
+same write costs 1.3. The host is slow for the first microseconds after an
+idle: its clock coming back up, or the idle itself deeper than nos asks --
+nos's MWAIT asks for C1, and nothing in it clears MSR_POWER_CTL's C1E
+auto-promotion, which Linux's intel_idle turns off on these CPUs. Read that
+MSR first; then spin the last stretch before an edge rather than sleep it
+(the advance as long as the wake costs, measured). In the pipe window a ring
+reaches a sleeping vCPU's entry in 3.7 us, a polling one's in 1.1.
+
+The same slowness shows on a mostly idle guest of one CPU (the panel's,
+Debian on the PIT and the 8259): 11-12 us of the host's after each of its
+port exits, 2.8 of them before the exit's record -- where in the busy pipe
+window the bench's first CPU, which runs the same devices' round after each
+exit, pays 1.4 us a port exit. So it is the idle core, not the round; the
+round is still worth leaving out after a PIT or 8259 write, as the TSC
+deadline's and the ICR's writes leave it out (W2), once the idle's cost is
+known.
 
 ## Random reads of memory: 85%
 
