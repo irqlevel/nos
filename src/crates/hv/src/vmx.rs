@@ -7,6 +7,7 @@
 
 use core::fmt::Write;
 
+use hvarch::x86::fast::FastExit;
 use hvarch::x86::vmx::{vmcs, Guest};
 use hvarch::x86::svm::vmcb::{attrib, Save, Segment};
 use hvarch::x86::svm::{GuestRegs, Kick, NotRun};
@@ -236,13 +237,14 @@ impl Vcpu {
     /// [`crate::vm::Cpu::enter`] calls this -- with the memory the CPU was
     /// made for, which the VMCS's EPT pointer, taken at the first entry,
     /// goes on naming.
-    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[core::sync::atomic::AtomicU64], kick: Option<&Kick>)
+    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[core::sync::atomic::AtomicU64], kick: Option<&Kick>,
+                        fast: Option<&mut dyn FastExit>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         /* The table is `memory`'s, which owns every page it maps and only
          * ever adds to it; `host_areas` never names a freed page
          * (`crate::machine`). */
-        let cpu = match unsafe { self.guest.run(memory.nested(), host_areas, kick) } {
+        let cpu = match unsafe { self.guest.run(memory.nested(), host_areas, kick, fast) } {
             Ok(cpu) => cpu,
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
