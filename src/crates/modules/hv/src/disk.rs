@@ -358,6 +358,10 @@ fn serve(start: Serve) {
         return;
     }
     flying.resize_with(blk::IN_FLIGHT, || None::<Request>);
+    /* Its CPU -- its own (`hv::place`), the task bound to it -- held at the
+     * performance preference while it serves, as the vCPUs' are
+     * (`guest::run_cpus`) */
+    let _held = kcore::cpu::Performance::hold(kcore::cpu::id());
     /* How long the next wait spins first (POLL_FIRST_NS) */
     let mut poll_ns = 0u64;
     loop {

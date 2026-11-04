@@ -21,6 +21,12 @@ unsafe extern "C" {
     /// `deadline_ns` on the boot clock, if it is not armed to fire sooner;
     /// nothing for a deadline past. From any context.
     pub safe fn kernel_cpu_timer_at(deadline_ns: u64);
+    /// CPU `cpu` held at the performance preference (HWP's EPP 0) while
+    /// its holds -- `hold` 1 -- outnumber its releases -- `hold` 0; the last
+    /// release puts back the boot's (hwp_epp=). Task context: it waits for
+    /// the IPI that writes the CPU's MSR. Nothing for a CPU not running or
+    /// without HWP. Values only.
+    pub safe fn kernel_cpu_performance(cpu: u32, hold: i32);
 }
 
 /* Interrupts and preemption off, and back on, for code that holds a lock of

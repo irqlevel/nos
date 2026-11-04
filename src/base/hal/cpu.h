@@ -151,6 +151,13 @@ struct CpuPerformance
    each AP. Defined per arch. */
 bool setup_cpu_performance(CpuPerformance* out);
 
+/* This CPU's energy/performance preference set to `epp` (0 performance to
+   255 energy) where setup_cpu_performance put HWP in charge of its clock
+   with a preference to ask by: what a CPU a guest's vCPU or disk runs on is
+   asked for while it does (kernel_cpu_performance). Called on the CPU
+   itself. True when it was set; nothing on arm64. Defined per arch. */
+bool set_cpu_epp(u32 epp);
+
 /* Whether this CPU's C1 is C1. Intel's firmware may let a CPU turn every
    request for C1 into C1E (MSR_POWER_CTL bit 1, "C1E enable"), its voltage
    and clock dropped while it waits, which it takes microseconds to climb
