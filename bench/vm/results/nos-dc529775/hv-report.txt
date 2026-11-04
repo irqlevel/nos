@@ -1,0 +1,33 @@
+hv: vm 1 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffffbc603fb7
+  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffffbc603fb7, after 767663 ms
+  exits      97395622 total: 328910 port in, 8426365 port out, 89982 cpuid, 301 rdmsr, 30739664 wrmsr (11 #GP), 3954 irq, 56621822 hlt, 6314 pause, 1065455 host
+  kicked     113004 entries turned back for a frame, a disk's answer or an IPI that came on the way in, or an edge of its timers -- 69102 of them
+  answered   0 #UD for instructions CPUID did not offer, 13 WBINVD stepped past, 0 CR8 from the shadow TPR, 8 CR0 writes (VT-x), 0 #DB and #AC given back
+  cr4        20 reads and writes performed (AMD-V), 0 writes refused with #GP
+  dr0-3      24 reads and writes of its own (AMD-V), 0 not made: a #GP or a #DB in their place
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  #GP        rdmsr 0x3a
+  #GP        rdmsr 0x140
+  halted     slept 1872076 ms in 1197446 sleeps, 60% of the run (of each CPU's, on average); 1693412 halts spun for a ring first, 1316331 of them woken in the spin
+  loop       938 ns an exit handled and 469 ns to the next entry, on average; 36293 ns a write of an MSR's handling; 12 entries made without the loop's round; 30739428 writes of the ICR or the TSC deadline answered in the world switch's own loop, the guest entered again from there, and 53878004 HLTs ended there by an interrupt posted meanwhile
+  irq        3954 from the 8259 (0 timer, 3954 serial), 0 edges, 3736 blocked; PIC irr 0x00 isr 0x00 imr 0xff; PIT ch0 mode 0 reload 0 run true
+  apic       0 interrupts from the local APICs, 1650940 of their timers -- late past their edges by 2 us on average, 12580 us at most, 3041 come on the way in and taken a round later, 463272 slept to short of them and spun; 27959357 IPIs sent, 2012142 taken; 898413 MSIs
+  late       2 timer interrupts more than 1 ms past their edges: 0 after a sleep that had the edge and woke more than 1 ms past its time (0 of them rung), 0 after one that woke on time, 0 after a sleep without that edge, 0 after a spin or a sleep for good, 1 with the loop round more than 1 ms after an exit, 0 after an interrupt of the host's took the guest out, 1 after an exit of its own, 0 otherwise; 0 sleeps ended more than 1 ms past their time (0 by a ring after it), 298 us at most
+  worst      12580 us past its edge, after a round more than 1 ms after an exit: the guest entered -152 us from the edge, the host's timer asked for 0 us from it, and left 1167 us from it
+  posted     38587590 interrupts posted for a CPU to take in its guest, 36690204 with a notification sent to the CPU it ran on
+  served     9724983 MSIs its disks' tasks sent as they served, from outside every CPU -- no CPU woken or taken out of its guest to hand a completion over
+  apicv      12777842 entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); 0 EOIs it stopped the guest after, of level-triggered vectors
+  cpus       4, 3 started by the guest (3 INITs, 3 start-up IPIs taken)
+  cpu 0      19910815 exits, 0 apic irq, 4301583 ipi sent, 11530890 hlt, 0 timer interrupts more than 1 ms late, slept 68% -- running, on host cpu 41
+  cpu 1      21647119 exits, 0 apic irq, 4932827 ipi sent, 10211000 hlt, 0 timer interrupts more than 1 ms late, slept 59% -- halted with interrupts off, on host cpu 40
+  cpu 2      17423474 exits, 0 apic irq, 5814638 ipi sent, 10637992 hlt, 1 timer interrupts more than 1 ms late, slept 67% -- halted with interrupts off, on host cpu 33
+  cpu 3      38414214 exits, 0 apic irq, 12910309 ipi sent, 24241940 hlt, 1 timer interrupts more than 1 ms late, slept 49% -- halted with interrupts off, on host cpu 32
+  acpi       taken by the guest's OS; 0 SCIs, the power button pressed 0 times
+  vda        8192 MiB: 23043750 reads (142547333 KiB), 7753543 writes (85719598 KiB), 20136 flushes, 0 errors; 92 discards (2198616 KiB), 0 writes of zeros (0 KiB); 8287574 notifies, 10623338 interrupts; 109813 passes cut short at 512 KiB moved
+  eth0       35 frames sent, 28 received, 0 dropped; 0 sends of TCP up to 64 KiB, 0 received whole; notifies 35 to send, 4 to receive; interrupts 35 for sends, 23 for receives; 4 of 4 queue pairs in use, 1 commands (0 refused)
+  busiest in ports 0x21:3954 0x71:105 0x2e9:3 0x2f9:3 0x3e9:3 0x20:1
