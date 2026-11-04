@@ -105,6 +105,19 @@ public:
     static const ulong IDLE_DEEP_NS = 2 * consts::NANO_SECS_IN_MS;
     static const ulong IDLE_LONG_RUN = 4;
 
+    /* What this CPU's idles by MWAIT were since boot (idle_mwait): how many
+       of them, and how long in all, in C1 (0) and in its deep C-state (1) --
+       what it asked for, which the CPU may have taken shallower. The CPU's
+       own, written with interrupts off; read on it, also with them off
+       (`cpufreq`). */
+    static const ulong IDLE_KINDS = 2;
+    struct IdleCounts
+    {
+        ulong idles[IDLE_KINDS];
+        ulong ns[IDLE_KINDS];
+    };
+    IdleCounts get_idle_counts() const;
+
     static const ulong STATE_INITED = 0x1;
     static const ulong STATE_RUNNING = 0x2;
     static const ulong STATE_EXITING = 0x4;
@@ -167,6 +180,7 @@ private:
        IDLE_LONG_RUN: what idle_mwait goes deep by. This CPU's alone, with
        interrupts off. */
     ulong idle_long_run_;
+    IdleCounts idle_counts_;
 
     /* Ticks are a period apart; an interrupt this close before the next
        is that tick, rather than one more interrupt a moment later. */
