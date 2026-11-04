@@ -584,6 +584,64 @@ void kernel_cpu_run_on(unsigned int cpu,
     target.queue_ipi_task(task);
 }
 
+} /* extern "C" */
+
+namespace
+{
+
+/* The CPUs held at the performance preference (kernel_cpu_performance):
+   how many hold each, and the lock both the counts and the MSR writes are
+   made under, so that a CPU's preference is always what its count says. A
+   function's statics: the link refuses a constructor at namespace scope. */
+kernel::Mutex& performance_lock()
+{
+    static kernel::Mutex m;
+    return m;
+}
+
+ulong performance_holds[kernel::MAX_CPUS] = {};
+
+/* hal::set_cpu_epp on the CPU the IPI lands on, its value in the word */
+void set_epp_here(void* ctx, kernel::Context*)
+{
+    hal::set_cpu_epp((u32)(ulong)ctx);
+}
+
+}
+
+extern "C" {
+
+/* CPU `cpu` held at the performance preference -- HWP's EPP 0 -- while
+   `hold` holds of it are more than its releases: what a CPU a guest's vCPU
+   or disk is placed on asks while it is theirs, so that its clock stays up
+   through the idles between a guest's timer ticks, which on the EX44 left
+   the first microseconds after each wake five to ten times slower (round
+   13's trace windows). The last release puts back hwp_epp='s. The MSR is
+   written on the CPU itself, by an IPI this waits for; a CPU not running,
+   or out of range, is nothing. Task context. */
+void kernel_cpu_performance(unsigned int cpu, int hold)
+{
+    if (cpu >= (unsigned int)kernel::MAX_CPUS)
+        return;
+    auto& target = kernel::CpuTable::get_instance().get_cpu(cpu);
+    ulong state = target.get_state();
+    if (!(state & kernel::Cpu::STATE_RUNNING) || (state & kernel::Cpu::STATE_EXITING) || target.is_parked())
+        return;
+
+    stdlib::AutoLock lock(performance_lock());
+    ulong& holds = performance_holds[cpu];
+    ulong was = holds;
+    if (hold)
+        holds++;
+    else if (holds != 0)
+        holds--;
+    if ((was == 0) == (holds == 0))
+        return;
+    ulong epp = (holds != 0) ? 0 : kernel::Parameters::get_instance().get_hwp_epp();
+    kernel::IPITask task(set_epp_here, (void*)epp);
+    target.queue_ipi_task(task);
+}
+
 /* An interrupt to `cpu`, now, and nothing waited for: what makes a vCPU that
    is running a guest there leave it -- a physical interrupt ends the guest's
    turn -- and costs any other CPU an interrupt with nothing to do. Sent the

@@ -55,6 +55,13 @@ bool setup_cpu_performance(CpuPerformance* out)
     return false;
 }
 
+bool set_cpu_epp(u32 epp)
+{
+    /* The clock is firmware's to set here (setup_cpu_performance) */
+    (void)epp;
+    return false;
+}
+
 bool setup_cpu_c1e(bool* was_on, bool* on)
 {
     /* No C1E here: WFI is the only idle there is. */

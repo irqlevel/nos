@@ -3437,6 +3437,20 @@ runs it there again -- and an `hv boot` guest until its run is over. `hv
 cores` says the rule and who holds which CPUs; `hv list` says where each
 guest's disks are served.
 
+**A guest's CPUs run at the performance preference while they are its.**
+Where HWP picks a CPU's clock (Intel since Skylake, `docs/kernel-parameters.md`'s
+`hwp_epp=`), every CPU a guest's vCPUs run on and the one its disks' task
+runs on are asked for EPP 0 for as long as the guest runs
+(`kcore::cpu::Performance`, held by `guest::run_cpus` and the disk's task),
+and given back the boot's preference -- `balance_performance` unless told --
+when the last who holds one lets go. A guest's CPUs idle between its ticks,
+and at the boot's preference HWP lowered their clock in every idle: on the
+EX44 the first microseconds after each wake ran five to ten times slower
+than on a busy core -- the TSC deadline's write that costs a busy core 1.3
+us cost 10 there -- and cyclictest in the guest saw 66 us on average, where
+the same guest under KVM saw 31 and under nos at EPP 0 saw 6 (round 14,
+`plans/vm-perf-todo.md`).
+
 What it costs: a guest's own CPUs share their core. On one core's two
 threads (13 and 12 on the AX41) two busy loops in a Debian guest took 14.7 s
 where one alone took 9.7; on two cores of one CCX (13 and 11) they took 9.7,

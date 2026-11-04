@@ -617,6 +617,17 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     if n == 0 || placement.len() != n {
         return Err(String::from("the guest's CPUs and their places do not match"));
     }
+    /* Every CPU the guest runs on held at the performance preference for as
+     * long as it does: a guest's CPUs idle between its ticks, and with the
+     * boot's preference their clock dropped in each idle and climbed back at
+     * each wake -- the first microseconds after it five to ten times slower
+     * on the EX44, cyclictest's 66 us on average against 6 with the
+     * preference at performance (round 14). Let go of as this returns. */
+    let mut held = Vec::new();
+    held.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
+    for &host_cpu in placement {
+        held.push(kcore::cpu::Performance::hold(host_cpu));
+    }
     let mut slots = Vec::new();
     slots.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
     slots.resize(n, Counts::default());
