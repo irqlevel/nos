@@ -25,7 +25,11 @@
 //! pool the kernel reserves at boot (`hugepages=`), 512 pages in a row and
 //! aligned to their size, which a guest's nested table maps with one entry.
 //! Its pages are copied into and out of a page at a time, as a frame's are
-//! ([`FramePage`]).
+//! ([`FramePage`]) -- but not through the window: the kernel maps the whole
+//! pool once at boot, write-back and never executable, in a window of its
+//! own (`PageTable::map_huge_pool_window`), which the copies of a pool's page
+//! go through with nothing mapped, flushed or turned off for each. Still no
+//! reference into it is held here: the copy is the kernel's.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -95,7 +99,8 @@ impl Frame {
 /// One page of RAM someone owns -- a [`Frame`], or a page of a
 /// [`HugeFrame`] -- borrowed from its owner, which keeps it allocated for as
 /// long as the borrow lasts: what the host copies into and out of, through
-/// the kernel's temporary window, and never holds a reference into.
+/// the kernel's temporary window -- the huge pool's, for a page of the pool
+/// -- and never holds a reference into.
 #[derive(Clone, Copy)]
 pub struct FramePage<'a> {
     phys: u64,
@@ -124,7 +129,8 @@ impl FramePage<'_> {
     /// when that is not inside the page.
     ///
     /// Through `&self`, as `read` is: the copy goes through the calling
-    /// CPU's own slot of the window with its interrupts off, so two CPUs
+    /// CPU's own slot of the window with its interrupts off -- or the huge
+    /// pool's window, which every CPU has mapped the same -- so two CPUs
     /// copying into one page at once share nothing of the kernel's -- and
     /// no reference into the page exists for them to alias. What the page
     /// holds is not the compiler's to reason about: the guest whose memory

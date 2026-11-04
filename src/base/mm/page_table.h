@@ -306,6 +306,28 @@ public:
     ulong get_huge_pool_blocks();
     ulong get_huge_pool_free();
 
+    /* The huge pool's window: every block of the pool mapped with one 2MiB
+       entry at HUGE_POOL_WINDOW plus its physical address -- RAM, so
+       write-back; data, so no-execute -- from map_huge_pool_window, right
+       after reserve_huge_pool, for as long as the machine is up. What
+       kernel_frame_read and the rest copy a guest's memory through: through
+       a CPU's frame slot every copy is a slot mapped and unmapped and its
+       TLB entry flushed, interrupts off for the copy -- on the EX44's E-cores
+       a guest disk's 256KiB read took 65 us to give back, a microsecond a
+       page, and every request's header, status and descriptors are copies
+       of their own. The pool is the guests' memory and nothing else: a block is
+       handed out zeroed (alloc_huge_frame), so what the window holds of one
+       not handed out is a guest's that has gone, as a freed frame's is.
+
+       map_huge_pool_window: the window made, once, before there is another
+       CPU; all of it or none -- a table that cannot be had, or the window's
+       top-level entry taken already, unmaps what was made and leaves the
+       copies to the frame slots, said. Whether it is made. huge_pool_window:
+       phy_addr's address in the window, or 0 when there is no window or
+       phy_addr is in no block of the pool. */
+    bool map_huge_pool_window();
+    ulong huge_pool_window(ulong phy_addr);
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -430,6 +452,27 @@ private:
     static bool huge_pool_test(const ulong* bits, ulong block);
     static void huge_pool_set(ulong* bits, ulong block, bool value);
     bool huge_block_free(ulong block);
+
+    /* Where the window is: a top-level entry of its own, 64 TiB into the
+       kernel's half -- far past the image, page_array_ and the allocators'
+       ranges, which a machine's RAM sizes -- and as big as the pool may be. */
+    static const ulong HUGE_POOL_WINDOW = 0xFFFFC00000000000UL;
+    static const ulong TOP_ENTRY_SPAN = 512 * consts::GB;
+    static_assert(HUGE_POOL_WINDOW % TOP_ENTRY_SPAN == 0, "the window starts a top-level entry");
+    static_assert(HUGE_POOL_MAX_BYTES <= TOP_ENTRY_SPAN, "the pool fits one top-level entry");
+    /* Set once by map_huge_pool_window, before there is another CPU, and
+       never again: read without the lock. */
+    bool huge_pool_window_on_;
+
+    /* The L2 table that maps virt_addr, temp-mapped -- the levels above it
+       made where they are missing -- or nullptr: no page for a table, a
+       1GiB block where a table belongs, or a full tmp_map window. Lock must
+       be held, and the caller tmp_unmap_page()s the result. */
+    PtePage* walk_to_l2_locked(ulong virt_addr);
+    /* A window cut short undone: every table under its top-level entry --
+       all the window's own, the entry having been empty -- freed, and the
+       entry cleared. Lock must be held. */
+    void unmap_huge_pool_window_locked();
 };
 
 }
