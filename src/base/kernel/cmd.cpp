@@ -274,12 +274,18 @@ struct ClockSample
 {
     hal::ClockCounters counters;
     bool ok;
+    /* What its idles asked for (Cpu::get_idle_counts), and when, on the
+       boot clock: read beside the counters, on the CPU itself */
+    Cpu::IdleCounts idle;
+    ulong at;
 };
 
 static void read_clocks_here(void* ctx, Context*)
 {
     auto* sample = static_cast<ClockSample*>(ctx);
     sample->ok = hal::read_clock_counters(&sample->counters);
+    sample->idle = CpuTable::get_instance().get_current_cpu().get_idle_counts();
+    sample->at = get_boot_time().get_value();
 }
 
 /* Each CPU of `mask` that runs read into `samples` -- MAX_CPUS of them -- by
@@ -377,9 +383,21 @@ static void cmd_cpufreq(const char* args, stdlib::Printer& con)
            times a TSC's rate in kHz stay well inside 64 bits */
         ulong mhz = (dm == 0) ? 0 : (ulong)(da * (hz / HZ_IN_KHZ) / dm / KHZ_IN_MHZ);
         ulong busy = (ulong)((dm > dt ? dt : dm) * PERMILLE / dt);
+        /* Its idles' share of the window, by what they asked for: C1 and
+           deep, and how many of each */
+        ulong window = after[i].at - before[i].at;
+        ulong share[Cpu::IDLE_KINDS];
+        ulong count[Cpu::IDLE_KINDS];
+        for (ulong k = 0; k < Cpu::IDLE_KINDS; k++)
+        {
+            ulong ns = after[i].idle.ns[k] - before[i].idle.ns[k];
+            share[k] = (window == 0) ? 0 : (ulong)((u64)(ns > window ? window : ns) * PERMILLE / window);
+            count[k] = after[i].idle.idles[k] - before[i].idle.idles[k];
+        }
         if (shown == 0)
-            con.printf("  cpu  MHz busy  busy%%\n");
-        con.printf("  %3lu  %8lu  %3lu.%lu%%\n", i, mhz, busy / 10, busy % 10);
+            con.printf("  cpu  MHz busy  busy%%  idle in C1, deep: share (idles)\n");
+        con.printf("  %3lu  %8lu  %3lu.%lu%%  %3lu.%lu%% (%lu), %3lu.%lu%% (%lu)\n", i, mhz, busy / 10, busy % 10,
+            share[0] / 10, share[0] % 10, count[0], share[1] / 10, share[1] % 10, count[1]);
         shown++;
     }
     if (shown == 0)

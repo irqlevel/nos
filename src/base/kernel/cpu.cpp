@@ -47,6 +47,7 @@ Cpu::Cpu()
     , timer_armed_at_(~0UL)
     , timer_walk_(false)
     , idle_long_run_(0)
+    , idle_counts_{}
 {
     ipi_task_list_.init();
 }
@@ -154,6 +155,9 @@ void Cpu::idle_mwait(Task* self)
        exactly, if the trace opened it */
     idle_ended(self);
     ulong woke = get_boot_time().get_value();
+    ulong kind = deep ? 1 : 0;
+    idle_counts_.idles[kind]++;
+    idle_counts_.ns[kind] += (woke > now) ? woke - now : 0;
     if (woke > now && woke - now >= IDLE_DEEP_NS)
     {
         if (idle_long_run_ < IDLE_LONG_RUN)
@@ -164,6 +168,11 @@ void Cpu::idle_mwait(Task* self)
         idle_long_run_ = 0;
     }
     hal::irq_restore(flags);
+}
+
+Cpu::IdleCounts Cpu::get_idle_counts() const
+{
+    return idle_counts_;
 }
 
 ulong Cpu::get_state()
