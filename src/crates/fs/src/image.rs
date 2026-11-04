@@ -185,6 +185,23 @@ impl Map {
         self.runs.partition_point(|r| r.first + r.len <= b)
     }
 
+    /// The first block of `from..to` that no run covers -- a hole -- or None
+    /// where the file has every one of them.
+    fn first_hole(&self, from: u64, to: u64) -> Option<u64> {
+        let mut b = from;
+        let mut i = self.index(b);
+        while b < to {
+            match self.runs.get(i) {
+                Some(r) if r.first <= b => {
+                    b = r.first + r.len;
+                    i += 1;
+                }
+                _ => return Some(b),
+            }
+        }
+        None
+    }
+
     /// Where each of `out.len()` blocks from `first` begins on the device,
     /// 0 for a hole, and whether it is an unwritten extent's, into
     /// `unwritten` beside it.
@@ -1950,6 +1967,18 @@ impl Direct {
         }
         let span = self.ahead_span.saturating_mul(2).clamp(1, GROW_MAX_CHUNKS);
         let to = from.saturating_add(span.saturating_mul(chunk)).min(blocks);
+        /* A stretch the file has every block of -- a guest writing over its
+         * disk, its journal going round -- is passed over, as the image's
+         * own map says, and the next looked at as the stream goes on: only
+         * one with a hole is worth a growth, from the chunk the hole is in.
+         * On the EX44, growths asked over blocks the file had took the
+         * guest's 1 MiB writes over its file from 4.6 GB/s to 1.5 and its
+         * fdatasync from 736 a second to 371 (round 23). */
+        let Some(hole) = self.map.as_ref().and_then(|map| map.first_hole(from, to)) else {
+            (self.ahead_to, self.ahead_span) = (to, span);
+            return;
+        };
+        let from = (hole / chunk * chunk).max(from);
         if self.start_ahead(vfs, handle, from, to) {
             (self.ahead_to, self.ahead_span) = (to, span);
         }
