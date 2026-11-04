@@ -29,7 +29,10 @@
 # status from a file (the Mac's ssh path cuts a quiet session).
 set -euo pipefail
 W=/root/bench
-NOSROOT=${NOS_ROOT:?NOS_ROOT: the partition nos's root is on, /dev/disk/by-uuid/...}
+# The message quoted: an apostrophe bare in it opened a quoted string that
+# took the lines below into the expansion's word, unrun, whenever NOS_ROOT
+# was set
+NOSROOT=${NOS_ROOT:?"NOS_ROOT: the partition nos's root is on, /dev/disk/by-uuid/..."}
 MNT=/mnt/nosroot
 IMG_URL=https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img
 IMG_SHA=04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
