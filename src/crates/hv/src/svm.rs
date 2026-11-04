@@ -9,6 +9,7 @@
 use core::fmt::Write;
 use core::sync::atomic::AtomicU64;
 
+use hvarch::x86::fast::FastExit;
 use hvarch::x86::svm::vmcb::{self, attrib, Segment};
 use hvarch::x86::svm::{self as arch, Guest, GuestRegs, Kick, NotRun, Permissions};
 use hvarch::{Caps, Result};
@@ -358,14 +359,15 @@ impl Vcpu {
     /// the memory that owns every page it maps, and only
     /// [`crate::vm::Cpu::enter`] calls this, with the memory the CPU was
     /// made for.
-    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>,
+                        fast: Option<&mut dyn FastExit>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         self.check().map_err(Refusal::Vmcb)?;
         /* The nested table is `memory`'s: it maps nothing but that guest's
          * own pages and only grows (`crate::memory`); `host_areas` never
          * names a freed page (`crate::machine`). */
-        let cpu = match unsafe { self.guest.run(&self.perms, memory.nested(), host_areas, kick) } {
+        let cpu = match unsafe { self.guest.run(&self.perms, memory.nested(), host_areas, kick, fast) } {
             Ok(cpu) => cpu,
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
