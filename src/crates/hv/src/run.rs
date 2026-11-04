@@ -821,6 +821,8 @@ pub struct LinuxGuest {
     /// ones whose notification was sent to the CPU it was in its guest on.
     posted: AtomicU64,
     notified: AtomicU64,
+    /// MSIs a disk's task sent from outside every CPU (`serve_disk`).
+    served_msi: AtomicU64,
     /// How far apart its NICs' receive interrupts are held at least
     /// (`set_rx_moderation`), and whether they offer their transmit
     /// offloads (`set_offloads`).
@@ -993,6 +995,7 @@ impl LinuxGuest {
             apicv: None,
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
+            served_msi: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
             shape: Shape::cores(cpus),
@@ -1071,6 +1074,11 @@ impl LinuxGuest {
     /// the ones a notification was sent for (VT-x's posted interrupts).
     pub fn posted_stats(&self) -> (u64, u64) {
         (self.posted.load(Ordering::Relaxed), self.notified.load(Ordering::Relaxed))
+    }
+
+    /// MSIs its disks' tasks sent from outside every CPU (`serve_disk`).
+    pub fn served_msis(&self) -> u64 {
+        self.served_msi.load(Ordering::Relaxed)
     }
 
     /// Whether its CPUs have local APICs: a guest of more than one CPU. One
@@ -2365,7 +2373,10 @@ impl LinuxGuest {
         for dev in 0..p.msix_pending.len() {
             let held = p.msix_pending[dev];
             if held != 0 {
-                let still = self.msix(p, me, lapic, counts, dev, held);
+                let still = self.msix(p, dev, held, &mut |ipi| {
+                    counts.msi += 1;
+                    self.post_msi(me, lapic, ipi);
+                });
                 if still != held {
                     p.msix_pending[dev] = still;
                     self.write_pba(p, dev);
@@ -2386,14 +2397,59 @@ impl LinuxGuest {
             p.pic.raise(line);
         }
         if r.vectors != 0 {
-            let held = self.msix(p, me, lapic, counts, dev, r.vectors);
-            if let Some(pending) = p.msix_pending.get_mut(dev) {
-                if *pending | held != *pending {
-                    *pending |= held;
-                    self.write_pba(p, dev);
-                }
+            let held = self.msix(p, dev, r.vectors, &mut |ipi| {
+                counts.msi += 1;
+                self.post_msi(me, lapic, ipi);
+            });
+            self.hold_msix(p, dev, held);
+        }
+    }
+
+    /// Device `dev`'s MSI-X entries in `held`, masked as they were sent:
+    /// kept pending, for `poll_devices` to send once their mask is off.
+    fn hold_msix(&self, p: &mut Platform, dev: usize, held: u32) {
+        if let Some(pending) = p.msix_pending.get_mut(dev) {
+            if *pending | held != *pending {
+                *pending |= held;
+                self.write_pba(p, dev);
             }
         }
+    }
+
+    /// What disk `disk` -- the guest's vda 0 and on -- has for the guest,
+    /// given to it from outside every CPU: requests its backend has served
+    /// put on the used ring, what waited on the ring taken, and its MSI-X
+    /// vectors posted to the CPUs they name, each through its mailbox --
+    /// in its guest by its posted-interrupt notification, without an exit.
+    /// What the disk's own task calls as it has served something, as QEMU's
+    /// iothread with irqfd does: the first CPU, whose round the devices'
+    /// work is, need not be woken -- nor taken out of its guest, where the
+    /// guest's job may be running -- to hand a completion over. True when
+    /// that round has to come anyway: a line raised, which is the 8259's
+    /// and the first CPU's, or a pass that ended at its bound.
+    pub fn serve_disk(&self, disk: u8) -> bool {
+        let mut p = self.platform.lock();
+        let Some(dev) = p.pci_devs.iter().position(|d| matches!(d, PciDev::Disk(b) if b.index() == disk)) else {
+            return true;
+        };
+        let (r, more) = match p.pci_devs.get_mut(dev) {
+            Some(PciDev::Disk(d)) => (d.poll(&self.memory), d.more()),
+            _ => return true,
+        };
+        /* Its line raised here, where the poll that raised it ran -- the
+         * first CPU's round, rung for it, finds the 8259's request and
+         * nothing new of the disk's */
+        if r.line {
+            p.pic.raise(DISK_IRQ);
+        }
+        if r.vectors != 0 {
+            let held = self.msix(&p, dev, r.vectors, &mut |ipi| {
+                self.served_msi.fetch_add(1, Ordering::Relaxed);
+                self.post_message(None, ipi, false);
+            });
+            self.hold_msix(&mut p, dev, held);
+        }
+        r.line || more
     }
 
     /// Device `dev`'s pending bits, as the guest reads them: a word of them
@@ -2410,7 +2466,7 @@ impl LinuxGuest {
     /// Those are held, and returned, for the caller to keep pending and send
     /// from `poll_devices` once unmasked. One the table has not got, or a
     /// message that is no interrupt, goes nowhere.
-    fn msix(&self, p: &Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, dev: usize, entries: u32) -> u32 {
+    fn msix(&self, p: &Platform, dev: usize, entries: u32, send: &mut dyn FnMut(&Ipi)) -> u32 {
         let Some((control, page)) = p.pci.msix(dev + 1) else { return 0 };
         if control & pci::MSIX_ENABLE == 0 {
             return 0;
@@ -2436,8 +2492,7 @@ impl LinuxGuest {
             }
             let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
             if let Some(ipi) = lapic::msi(address, word(8)) {
-                counts.msi += 1;
-                self.post_msi(me, lapic, &ipi);
+                send(&ipi);
             }
         }
         held
@@ -2448,7 +2503,7 @@ impl LinuxGuest {
     /// priority -- straight into `lapic` for the CPU `me` doing the device's
     /// work, and through the mailbox and a ring for any other.
     fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
-        self.post_message(me, lapic, ipi, false);
+        self.post_message(Some((me, lapic)), ipi, false);
     }
 
     /// A device's message on the APIC bus -- an MSI, an IO-APIC pin's -- to
@@ -2458,15 +2513,22 @@ impl LinuxGuest {
     /// the sender's own included, for its loop to take -- rung, so that one
     /// already on its way into its guest turns back for it. An INIT from a
     /// device is none a PC's firmware wires, and is dropped.
-    fn post_message(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi, level: bool) {
+    fn post_message(&self, mut by: Option<(u32, &mut Lapic)>, ipi: &Ipi, level: bool) {
+        /* From outside every CPU -- a disk's task (`serve_disk`) -- no CPU
+         * is the sender's own: each one named takes it through its mailbox */
+        let me = by.as_ref().map_or(u32::MAX, |(m, _)| *m);
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
-            let addressing = if id == me { lapic.addressing() } else { target.addressing() };
+            let addressing = match by.as_ref() {
+                Some((m, lapic)) if *m == id => lapic.addressing(),
+                _ => target.addressing(),
+            };
             if !ipi.reaches(id, addressing, me) {
                 continue;
             }
-            let posted = match ipi.delivery {
-                Delivery::Fixed | Delivery::LowestPriority if id == me => {
+            let own = by.as_mut().filter(|(m, _)| *m == id).map(|(_, lapic)| lapic);
+            let posted = match (ipi.delivery, own) {
+                (Delivery::Fixed | Delivery::LowestPriority, Some(lapic)) => {
                     if level {
                         lapic.accept_level(ipi.vector);
                     } else {
@@ -2474,16 +2536,16 @@ impl LinuxGuest {
                     }
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority if !level => {
+                (Delivery::Fixed | Delivery::LowestPriority, None) if !level => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority => {
+                (Delivery::Fixed | Delivery::LowestPriority, None) => {
                     target.mail.post_level(ipi.vector);
                     true
                 }
-                Delivery::Nmi => {
+                (Delivery::Nmi, _) => {
                     target.mail.post_nmi();
                     true
                 }
@@ -2510,7 +2572,7 @@ impl LinuxGuest {
             left &= left - 1;
             if let Some(m) = io.send(pin) {
                 counts.ioapic += 1;
-                self.post_message(me, lapic, &m.ipi, m.level);
+                self.post_message(Some((me, &mut *lapic)), &m.ipi, m.level);
             }
         }
     }

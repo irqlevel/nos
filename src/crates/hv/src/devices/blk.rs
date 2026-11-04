@@ -407,6 +407,11 @@ impl Blk {
         self.backend.size() / SECTOR
     }
 
+    /// Its number among its guest's disks, vda 0.
+    pub fn index(&self) -> u8 {
+        self.index
+    }
+
     /// What was wrong with the ring, if the device stopped over one.
     pub fn broken(&self) -> Option<Broken> {
         self.broken
