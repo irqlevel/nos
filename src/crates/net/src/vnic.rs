@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::trace;
+use kcore::klog;
 
 use crate::device::{NetDriver, RxQueue, TxQueue};
 use crate::frame::{Frame, FrameQueue};
@@ -214,7 +214,7 @@ fn make(name: &str, mac: [u8; 6], ip: u32, mask: u32) -> Option<usize> {
     if VNICS[slot].set(vnic).is_err() {
         return None;
     }
-    trace!(0, "vnic: {} made for a module, {}.{}.{}.{}", name,
+    klog!(0, "vnic: {} made for a module, {}.{}.{}.{}", name,
            ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
     Some(slot + 1)
 }

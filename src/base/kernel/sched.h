@@ -111,6 +111,21 @@ public:
     void insert(Task* task);
     void remove(Task* task);
 
+    /* The CPU this queue is its scheduler's: set once, by Cpu::init. What a
+       tracepoint records a task's home as. */
+    void set_index(ulong index) { index_ = index; }
+    ulong index() const { return index_; }
+
+    /* The trace's idle events (Cpu::idle): an idle_enter is open until its
+       idle_exit is written -- by Cpu::idle when the halt returns to it, or
+       by the switch that takes the CPU from its idle task first, whichever
+       comes first, the other then finding it closed. This CPU's alone, from
+       its idle task and from an interrupt's decision on it: atomics, the
+       close an exchange. */
+    void open_idle() { __atomic_store_n(&idle_open_, 1, __ATOMIC_RELAXED); }
+    bool idle_is_open() const { return __atomic_load_n(&idle_open_, __ATOMIC_RELAXED) != 0; }
+    bool close_idle() { return __atomic_exchange_n(&idle_open_, 0, __ATOMIC_RELAXED) != 0; }
+
     void schedule(Task* curr, ScheduleReason why);
 
     /* A task's nice and slice (SchedEntity), set under this queue's lock --
@@ -240,7 +255,7 @@ private:
        runnable candidate before declaring the queue broken */
     static const ulong MAX_EXITED_RETRIES = 100000000;
 
-    void switch_to(Task* next, Task* curr);
+    void switch_to(Task* next, Task* curr, ScheduleReason why, bool prev_sleeping);
 
     void switch_complete(Task* curr);
 
@@ -262,6 +277,13 @@ private:
     /* The idle task is counted -- it runs something other than its idling,
        or waits for its turn to (count_idle) */
     bool idle_counted_;
+
+    /* This queue's CPU, as Cpu::init sets it: what a tracepoint records a
+       task's home as */
+    ulong index_;
+
+    /* An idle_enter not yet closed by its idle_exit (open_idle) */
+    u8 idle_open_;
 
     /* The tasks asleep until a deadline -- sleep(), Event::wait_for() --
        soonest first (Task::sleep_entry_): what this CPU's timer is armed for,

@@ -1,7 +1,7 @@
 #include "module.h"
 #include "module_exports.h"
 #include "elf.h"
-#include "trace.h"
+#include "klog.h"
 #include "cpu.h"
 #include "atomic.h"
 #include "task.h"
@@ -510,7 +510,7 @@ void find_functions(LoadCtx& ctx)
         const ulong bytes = lines * sizeof(ModuleSymbol) + sh.size + 1;
         if (lines == 0 || bytes > MAX_IMAGE_SIZE - ctx.image_size)
         {
-            trace(MODULE_LL, "module: %lu function names left out, %lu bytes of them", lines, (ulong)sh.size);
+            klog(MODULE_LL, "module: %lu function names left out, %lu bytes of them", lines, (ulong)sh.size);
             return;
         }
 
@@ -567,7 +567,7 @@ stdlib::Error check_imports(LoadCtx& ctx, stdlib::Printer& out)
         const ulong addr = lookup_kernel(name);
         if (addr != 0)
         {
-            trace(MODULE_LL, "module: %s -> 0x%lX", name, addr);
+            klog(MODULE_LL, "module: %s -> 0x%lX", name, addr);
             ctx.imports++;
 
             for (ulong j = 0; j < stdlib::array_size(PERMANENT_IMPORTS); j++)
@@ -735,7 +735,7 @@ void build_functions(const LoadCtx& ctx, LoadedModule& module)
         if (!parse_function_line(line, offset, name) || offset >= ctx.image_size ||
             (count != 0 && offset < index[count - 1].offset))
         {
-            trace(0, "module: %s: function table bad at line %lu, left out", module.name, count + 1);
+            klog(0, "module: %s: function table bad at line %lu, left out", module.name, count + 1);
             return;
         }
 
@@ -906,7 +906,7 @@ stdlib::Error protect(const LoadCtx& ctx, stdlib::Printer& out)
 
         const bool writable = (ph.flags & elf::PF_W) != 0;
         const bool executable = (ph.flags & elf::PF_X) != 0;
-        trace(MODULE_LL, "module: [0x%lX, 0x%lX) %s%s", (ulong)(ctx.base + ph.vaddr),
+        klog(MODULE_LL, "module: [0x%lX, 0x%lX) %s%s", (ulong)(ctx.base + ph.vaddr),
             (ulong)(ctx.base + ph.vaddr + ph.memsz), writable ? "rw" : "r", executable ? "x" : "");
         ok = pt.set_range_protection(ctx.base + ph.vaddr,
             stdlib::round_up(ph.memsz, consts::PAGE_SIZE), writable, executable);
@@ -1058,7 +1058,7 @@ void run_job(void* ctx)
        the kernel log is where it can still be read */
     if (job->state.cmpxchg(JOB_DONE, JOB_RUNNING) != JOB_RUNNING)
     {
-        trace(0, "module: %s %s, done in the background, error %lu: %s",
+        klog(0, "module: %s %s, done in the background, error %lu: %s",
             job->unload ? "rmmod" : "insmod", job->arg, (ulong)job->result, job->output);
     }
 
@@ -1163,7 +1163,7 @@ stdlib::Error ModuleTable::load(const void* image, ulong size, const char* param
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
-    trace(0, "module: %s loaded at 0x%lX, %lu KiB, %lu kernel imports, %lu functions named",
+    klog(0, "module: %s loaded at 0x%lX, %lu KiB, %lu kernel imports, %lu functions named",
         name, base, kib, imports, functions);
     out.printf("module: %s loaded at 0x%lX\n", name, base);
     return make_success();
@@ -1258,7 +1258,7 @@ stdlib::Error ModuleTable::unload(const char* name, stdlib::Printer& out)
     remove(module);
     release_module(module);
 
-    trace(0, "module: %s unloaded", name);
+    klog(0, "module: %s unloaded", name);
     out.printf("module: %s unloaded\n", name);
     return make_success();
 }
@@ -1292,7 +1292,7 @@ void ModuleTable::unload_all()
         module->exit(module->instance);
         remove(module);
         release_module(module);
-        trace(0, "module: %s unloaded", name);
+        klog(0, "module: %s unloaded", name);
     }
 
     ulong left = 0;
@@ -1304,7 +1304,7 @@ void ModuleTable::unload_all()
     }
 
     if (left != 0)
-        trace(0, "module: %lu left loaded: permanent, or in another task's hands", left);
+        klog(0, "module: %lu left loaded: permanent, or in another task's hands", left);
 }
 
 /* Whether c separates insmod's words */

@@ -12,7 +12,7 @@
  * gate.  The rest is kept because the chip is not known to work without it.
  */
 
-use kcore::{io, trace};
+use kcore::{io, klog};
 
 use crate::regs::*;
 
@@ -142,7 +142,7 @@ fn wait_txrx_fifo_empty(regs: &io::MmioRegion, chip: Chip) {
     if !wait_for(100, 42, || {
         regs.read8(MCU) & MCU_RXTX_EMPTY == MCU_RXTX_EMPTY
     }) {
-        trace!(0, "r8125: FIFOs did not drain (MCU {:#04x})", regs.read8(MCU));
+        klog!(0, "r8125: FIFOs did not drain (MCU {:#04x})", regs.read8(MCU));
     }
 
     if chip == Chip::B
@@ -150,7 +150,7 @@ fn wait_txrx_fifo_empty(regs: &io::MmioRegion, chip: Chip) {
             regs.read16(INTR_MITIGATE) & MITIGATE_DRAINED == MITIGATE_DRAINED
         })
     {
-        trace!(0, "r8125: TX/RX drain flag never set");
+        klog!(0, "r8125: TX/RX drain flag never set");
     }
 }
 
@@ -164,7 +164,7 @@ fn enable_rxdvgate(regs: &io::MmioRegion, chip: Chip) {
 
 fn wait_ll_share_fifo_ready(regs: &io::MmioRegion) {
     if !wait_for(100, 42, || regs.read8(MCU) & MCU_LINK_LIST_RDY != 0) {
-        trace!(0, "r8125: link list not ready (MCU {:#04x})", regs.read8(MCU));
+        klog!(0, "r8125: link list not ready (MCU {:#04x})", regs.read8(MCU));
     }
 }
 
@@ -295,7 +295,7 @@ pub fn hw_start(regs: &io::MmioRegion, chip: Chip) {
     /* Hand the on-chip MCU its start vector and wait for it to come up. */
     mac_ocp_write(regs, 0xE098, 0xC302);
     if !wait_for(1000, 10, || mac_ocp_read(regs, 0xE00E) & (1 << 13) == 0) {
-        trace!(0, "r8125: MCU did not report ready (OCP 0xE00E)");
+        klog!(0, "r8125: MCU did not report ready (OCP 0xE00E)");
     }
 
     config_eee_mac(regs, chip);

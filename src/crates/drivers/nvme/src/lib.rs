@@ -3,7 +3,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use kcore::{trace, dma, io, msix, pci, sync};
+use kcore::{klog, dma, io, msix, pci, sync};
 use kcore::bitmap::BitMap;
 use block::{BlockDriver, Piece};
 use kcore::block::{BlockIo, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
@@ -205,7 +205,7 @@ pub fn init() {
                 && dev.subclass == PCI_SUBCLASS_NVME
                 && dev.prog_if == PCI_PROGIF_NVME
             {
-                trace!(0, "found NVMe device {:04x}:{:04x} at {:02x}:{:02x}.{:x}",
+                klog!(0, "found NVMe device {:04x}:{:04x} at {:02x}:{:02x}.{:x}",
                     dev.vendor, dev.device, dev.bus, dev.slot, dev.func);
                 init_device(dev);
             }
@@ -220,13 +220,13 @@ fn init_device(dev: pci::PciDevice) {
     /* --- Map BAR0 --- */
     let bar_phys = dev.get_bar64(0);
     if bar_phys == 0 {
-        trace!(0, "NVMe: BAR0 is 0, skipping");
+        klog!(0, "NVMe: BAR0 is 0, skipping");
         return;
     }
     let bar_mapping = match dma::PhysMapping::map(bar_phys, BAR0_MAP_PAGES) {
         Some(m) => m,
         None => {
-            trace!(0, "NVMe: failed to map BAR0 phys={:#x}", bar_phys);
+            klog!(0, "NVMe: failed to map BAR0 phys={:#x}", bar_phys);
             return;
         }
     };
@@ -240,7 +240,7 @@ fn init_device(dev: pci::PciDevice) {
     let to_raw = ((cap >> CAP_TO_SHIFT) & CAP_TO_MASK) as u64;
     let to_ms = if to_raw == 0 { MIN_TIMEOUT_MS } else { to_raw * 500 };
 
-    trace!(0, "NVMe CAP: mqes={} dstrd_bytes={} to={}ms",
+    klog!(0, "NVMe CAP: mqes={} dstrd_bytes={} to={}ms",
         mqes, db_stride, to_ms);
 
     /* The fixed-size BAR0 mapping must cover the doorbells we use (qid 0
@@ -248,7 +248,7 @@ fn init_device(dev: pci::PciDevice) {
      * trip MmioRegion's bounds assert at doorbell-ring time. */
     let max_db_end = DB_BASE + 3 * db_stride as usize + 4;
     if max_db_end > BAR0_MAP_PAGES * PAGE_SIZE {
-        trace!(0, "NVMe: doorbell stride {} exceeds BAR0 mapping, skipping", db_stride);
+        klog!(0, "NVMe: doorbell stride {} exceeds BAR0 mapping, skipping", db_stride);
         return;
     }
 
@@ -257,7 +257,7 @@ fn init_device(dev: pci::PciDevice) {
     if cc & CC_EN != 0 {
         regs.write32(REG_CC, cc & !CC_EN);
         if !wait_csts_clear(&regs, CSTS_RDY, to_ms) {
-            trace!(0, "NVMe: timeout waiting for controller disable");
+            klog!(0, "NVMe: timeout waiting for controller disable");
             return;
         }
     }
@@ -266,11 +266,11 @@ fn init_device(dev: pci::PciDevice) {
     let admin_depth = ADMIN_QUEUE_DEPTH.min(mqes);
     let admin_sq = match SubmissionQueue::new(admin_depth, 0, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: admin SQ alloc failed"); return; }
+        None => { klog!(0, "NVMe: admin SQ alloc failed"); return; }
     };
     let admin_cq = match CompletionQueue::new(admin_depth, 0, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: admin CQ alloc failed"); return; }
+        None => { klog!(0, "NVMe: admin CQ alloc failed"); return; }
     };
 
     /* --- Program AQA, ASQ, ACQ --- */
@@ -283,17 +283,17 @@ fn init_device(dev: pci::PciDevice) {
     let new_cc = CC_EN | CC_CSS_NVM | CC_MPS_4K | CC_AMS_RR | CC_IOSQES | CC_IOCQES;
     regs.write32(REG_CC, new_cc);
     if !wait_csts_set(&regs, CSTS_RDY, to_ms) {
-        trace!(0, "NVMe: timeout waiting for controller ready");
+        klog!(0, "NVMe: timeout waiting for controller ready");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
     if regs.read32(REG_CSTS) & CSTS_FATAL != 0 {
-        trace!(0, "NVMe: controller fatal status");
+        klog!(0, "NVMe: controller fatal status");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
 
-    trace!(0, "NVMe: controller ready");
+    klog!(0, "NVMe: controller ready");
 
     /* Wrap admin queues into a local structure for polling commands. */
     let mut admin = AdminCtx { sq: admin_sq, cq: admin_cq, cmd_id: 0 };
@@ -301,7 +301,7 @@ fn init_device(dev: pci::PciDevice) {
     /* --- Identify Controller --- */
     let id_buf = match dma::DmaBuffer::new(1) {
         Some(b) => b,
-        None => { trace!(0, "NVMe: identify DMA alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
+        None => { klog!(0, "NVMe: identify DMA alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
     let id_phys = id_buf.phys();
 
@@ -309,7 +309,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw10 = CNS_CONTROLLER;
     cmd.prp1  = id_phys;
     if !admin_exec(&mut admin, &regs, cmd) {
-        trace!(0, "NVMe: Identify Controller failed");
+        klog!(0, "NVMe: Identify Controller failed");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
@@ -321,7 +321,7 @@ fn init_device(dev: pci::PciDevice) {
         };
         let mdts = id_ctrl[ID_CTRL_MDTS_AT];
         let oncs = u16::from_le_bytes([id_ctrl[ID_CTRL_ONCS_AT], id_ctrl[ID_CTRL_ONCS_AT + 1]]);
-        trace!(0, "NVMe: ctrl sn={} mn={} mdts={} oncs={:#x}",
+        klog!(0, "NVMe: ctrl sn={} mn={} mdts={} oncs={:#x}",
             text(ID_CTRL_SN_AT, ID_CTRL_SN_LEN), text(ID_CTRL_MN_AT, ID_CTRL_MN_LEN), mdts, oncs);
         mdts
     };
@@ -332,7 +332,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw10 = CNS_NAMESPACE;
     cmd.prp1  = id_phys;
     if !admin_exec(&mut admin, &regs, cmd) {
-        trace!(0, "NVMe: Identify Namespace 1 failed");
+        klog!(0, "NVMe: Identify Namespace 1 failed");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
@@ -350,14 +350,14 @@ fn init_device(dev: pci::PciDevice) {
     /* lbads comes from the device; a value >= 32 would overflow the shift
      * (masked in release builds -> plausible-but-wrong sector size). */
     if lbads >= 32 {
-        trace!(0, "NVMe: invalid lbads {}, skipping", lbads);
+        klog!(0, "NVMe: invalid lbads {}, skipping", lbads);
         disable_controller_on_error(&regs, to_ms);
         return;
     }
     let sector_size: u32 = 1 << lbads;
-    trace!(0, "NVMe: ns1 capacity={} sectors sector_size={}", capacity, sector_size);
+    klog!(0, "NVMe: ns1 capacity={} sectors sector_size={}", capacity, sector_size);
     if sector_size < 512 || sector_size as usize > PAGE_SIZE {
-        trace!(0, "NVMe: unsupported sector size {}, skipping", sector_size);
+        klog!(0, "NVMe: unsupported sector size {}, skipping", sector_size);
         disable_controller_on_error(&regs, to_ms);
         return;
     }
@@ -378,27 +378,27 @@ fn init_device(dev: pci::PciDevice) {
             mdts_bytes.min((PRP_LIST_ENTRIES + 1) * PAGE_SIZE).max(2 * PAGE_SIZE)
         }
         None => {
-            trace!(0, "NVMe: no memory for PRP lists: a batch's commands are two pages at most");
+            klog!(0, "NVMe: no memory for PRP lists: a batch's commands are two pages at most");
             2 * PAGE_SIZE
         }
     };
-    trace!(0, "NVMe: a batch's commands up to {} KiB", batch_max / 1024);
+    klog!(0, "NVMe: a batch's commands up to {} KiB", batch_max / 1024);
 
     /* --- Allocate I/O queues --- */
     let io_depth = IO_QUEUE_DEPTH.min(mqes);
     let io_sq = match SubmissionQueue::new(io_depth, 1, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: I/O SQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
+        None => { klog!(0, "NVMe: I/O SQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
     let io_cq = match CompletionQueue::new(io_depth, 1, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: I/O CQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
+        None => { klog!(0, "NVMe: I/O CQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
     /* --- Setup MSI-X --- */
     let msix_table = match msix::MsixTable::new(&dev) {
         Some(t) => t,
-        None => { trace!(0, "NVMe: MSI-X setup failed"); disable_controller_on_error(&regs, to_ms); return; }
+        None => { klog!(0, "NVMe: MSI-X setup failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
     /* Enable MSI-X in PCI config space BEFORE creating the I/O CQ.
@@ -408,7 +408,7 @@ fn init_device(dev: pci::PciDevice) {
     if let Some(cap) = dev.find_capability(0x11) {
         let mc = dev.read_config16(cap as u16 + 2);
         dev.write_config16(cap as u16 + 2, mc | 0x8000);
-        trace!(0, "NVMe: pre-enabled MSI-X in PCI config (cap={:#x})", cap);
+        klog!(0, "NVMe: pre-enabled MSI-X in PCI config (cap={:#x})", cap);
     }
 
     /* --- Create I/O CQ (admin command) --- */
@@ -418,7 +418,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw10  = ((io_depth as u32 - 1) << 16) | 1; /* QSIZE | QID=1 */
     cmd.cdw11  = (0u32 << 16) | (CQ_IEN as u32) | (CQ_PC as u32); /* IV=0, IEN, PC */
     if !admin_exec(&mut admin, &regs, cmd) {
-        trace!(0, "NVMe: Create I/O CQ failed");
+        klog!(0, "NVMe: Create I/O CQ failed");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
@@ -430,21 +430,21 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw10  = ((io_depth as u32 - 1) << 16) | 1; /* QSIZE | QID=1 */
     cmd.cdw11  = (1u32 << 16) | (SQ_PC as u32);      /* CQID=1, PC */
     if !admin_exec(&mut admin, &regs, cmd) {
-        trace!(0, "NVMe: Create I/O SQ failed");
+        klog!(0, "NVMe: Create I/O SQ failed");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
 
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
-        trace!(0, "NVMe: too many devices (max {})", MAX_DEVICES);
+        klog!(0, "NVMe: too many devices (max {})", MAX_DEVICES);
         disable_controller_on_error(&regs, to_ms);
         return;
     }
 
     let mut done = Vec::new();
     if done.try_reserve_exact(IO_QUEUE_DEPTH).is_err() {
-        trace!(0, "NVMe: no memory for the waiters");
+        klog!(0, "NVMe: no memory for the waiters");
         disable_controller_on_error(&regs, to_ms);
         return;
     }
@@ -452,7 +452,7 @@ fn init_device(dev: pci::PciDevice) {
         match sync::WaitGroup::new() {
             Some(wg) => done.push(wg),
             None => {
-                trace!(0, "NVMe: wait group alloc failed");
+                klog!(0, "NVMe: wait group alloc failed");
                 disable_controller_on_error(&regs, to_ms);
                 return;
             }
@@ -480,7 +480,7 @@ fn init_device(dev: pci::PciDevice) {
     ) {
         (Some(submission), Some(completion), Some(irq)) => (submission, completion, irq),
         _ => {
-            trace!(0, "NVMe: spinlock alloc failed");
+            klog!(0, "NVMe: spinlock alloc failed");
             disable_controller_on_error(&regs, to_ms);
             return;
         }
@@ -510,12 +510,12 @@ fn init_device(dev: pci::PciDevice) {
     let handler = match msix::MsixInterrupt::register_for(&msix_table, 0, device, NvmeDevice::interrupt) {
         Some(irq) => irq,
         None => {
-            trace!(0, "NVMe: MSI-X vector registration failed");
+            klog!(0, "NVMe: MSI-X vector registration failed");
             device.quiesce();
             return;
         }
     };
-    trace!(0, "NVMe: MSI-X vector={} registered", handler.vector());
+    klog!(0, "NVMe: MSI-X vector={} registered", handler.vector());
     *device.irq.lock() = Some(Irq { _handler: handler, _table: msix_table });
 
     /* "nvme0" .. "nvme7".  Init runs single-threaded, so the provisional
@@ -533,10 +533,10 @@ fn init_device(dev: pci::PciDevice) {
             /* Registration is permanent; the handle has no Drop. */
             let _ = DEVICES[idx as usize].set(device);
             DEVICE_COUNT.store(idx + 1, Ordering::Release);
-            trace!(0, "NVMe: registered as block device, capacity={} sectors", capacity);
+            klog!(0, "NVMe: registered as block device, capacity={} sectors", capacity);
         }
         None => {
-            trace!(0, "NVMe: block device registration failed");
+            klog!(0, "NVMe: block device registration failed");
             device.shutdown();
         }
     }
@@ -544,13 +544,13 @@ fn init_device(dev: pci::PciDevice) {
 
 pub fn shutdown() {
     let count = (DEVICE_COUNT.load(Ordering::Relaxed) as usize).min(MAX_DEVICES);
-    trace!(0, "NVMe: shutdown count={}", count);
+    klog!(0, "NVMe: shutdown count={}", count);
     for slot in DEVICES[..count].iter() {
         if let Some(device) = slot.get() {
             device.shutdown();
         }
     }
-    trace!(0, "NVMe: shutdown complete");
+    klog!(0, "NVMe: shutdown complete");
 }
 
 impl NvmeDevice {
@@ -559,7 +559,7 @@ impl NvmeDevice {
         let cc = self.regs.read32(REG_CC);
         self.regs.write32(REG_CC, cc & !CC_EN);
         if !wait_csts_clear(&self.regs, CSTS_RDY, self.disable_timeout_ms) {
-            trace!(0, "NVMe: controller did not go not-ready on shutdown");
+            klog!(0, "NVMe: controller did not go not-ready on shutdown");
         }
     }
 
@@ -612,10 +612,10 @@ fn admin_exec(ctx: &mut AdminCtx, regs: &io::MmioRegion, cmd: SubmissionEntry) -
         if let Some(cqe) = ctx.cq.poll() {
             ctx.cq.ring_doorbell(regs);
             if cqe.cid != cid {
-                trace!(0, "NVMe: admin CQE cid mismatch: got {} expected {}", cqe.cid, cid);
+                klog!(0, "NVMe: admin CQE cid mismatch: got {} expected {}", cqe.cid, cid);
                 result = Some(false);
             } else if cqe.status_code() != 0 {
-                trace!(0, "NVMe: admin cmd {} status={:#x}", cid, cqe.status_code());
+                klog!(0, "NVMe: admin cmd {} status={:#x}", cid, cqe.status_code());
                 result = Some(false);
             } else {
                 result = Some(true);
@@ -625,7 +625,7 @@ fn admin_exec(ctx: &mut AdminCtx, regs: &io::MmioRegion, cmd: SubmissionEntry) -
         false
     });
     if !completed {
-        trace!(0, "NVMe: admin command {} timed out", cid);
+        klog!(0, "NVMe: admin command {} timed out", cid);
         return false;
     }
     result.unwrap_or(false)
@@ -650,7 +650,7 @@ fn disable_controller_on_error(regs: &io::MmioRegion, to_ms: u64) {
     let cc = regs.read32(REG_CC);
     regs.write32(REG_CC, cc & !CC_EN);
     if !wait_csts_clear(regs, CSTS_RDY, to_ms) {
-        trace!(0, "NVMe: controller did not go not-ready on init error");
+        klog!(0, "NVMe: controller did not go not-ready on init error");
     }
 }
 
@@ -743,7 +743,7 @@ impl NvmeDevice {
         }
         if completed == 0 {
             /* Not level 0: a shared/stray vector would otherwise spam the log */
-            trace!(3, "NVMe: IRQ spurious (no CQEs)");
+            klog!(3, "NVMe: IRQ spurious (no CQEs)");
         }
     }
 }
@@ -891,7 +891,7 @@ impl NvmeDevice {
             let (mut submission, cid) = match self.lock_with_cid() {
                 Some(held) => held,
                 None => {
-                    trace!(0, "NVMe: {}: all CID slots busy", what);
+                    klog!(0, "NVMe: {}: all CID slots busy", what);
                     return None;
                 }
             };
@@ -929,7 +929,7 @@ impl NvmeDevice {
         if offset_in_page + len > 2 * PAGE_SIZE {
             /* Would span 3+ pages: per spec the controller then treats PRP2 as
              * a PRP *list* pointer and would DMA through garbage addresses. */
-            trace!(0, "NVMe: transfer spans >2 pages (offset={} bytes={}), rejecting",
+            klog!(0, "NVMe: transfer spans >2 pages (offset={} bytes={}), rejecting",
                 offset_in_page, len);
             return false;
         }
@@ -956,7 +956,7 @@ impl NvmeDevice {
         match status {
             Some(0) => true,
             Some(status) => {
-                trace!(0, "NVMe: I/O status={:#x} sector={} count={}", status, sector, count);
+                klog!(0, "NVMe: I/O status={:#x} sector={} count={}", status, sector, count);
                 false
             }
             None => false,
@@ -1079,7 +1079,7 @@ impl NvmeDevice {
                 };
                 match held {
                     None if out == 0 => {
-                        trace!(0, "NVMe: batch: all CID slots busy");
+                        klog!(0, "NVMe: batch: all CID slots busy");
                         ok = false;
                     }
                     None => {}
@@ -1091,7 +1091,7 @@ impl NvmeDevice {
                             let run = &pieces[next..next + n];
                             let Some(cmd) = self.run_command(opcode, cid, buf_phys, base, run,
                                                              submission.prp_lists.as_mut()) else {
-                                trace!(0, "NVMe: batch: {} pieces at sector {} are no command the controller takes",
+                                klog!(0, "NVMe: batch: {} pieces at sector {} are no command the controller takes",
                                     n, run[0].sector);
                                 submission.free_cid(cid);
                                 ok = false;
@@ -1137,7 +1137,7 @@ impl NvmeDevice {
             let status = self.status[cid as usize].load(Ordering::Acquire);
             self.submission.lock().free_cid(cid);
             if status != 0 {
-                trace!(0, "NVMe: batch: I/O status={:#x}", status);
+                klog!(0, "NVMe: batch: I/O status={:#x}", status);
                 ok = false;
             }
         }
@@ -1184,7 +1184,7 @@ impl BlockDriver for NvmeDevice {
         match status {
             Some(0) => true,
             Some(status) => {
-                trace!(0, "NVMe: flush status={:#x}", status);
+                klog!(0, "NVMe: flush status={:#x}", status);
                 false
             }
             None => false,

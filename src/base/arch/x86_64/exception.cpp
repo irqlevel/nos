@@ -6,7 +6,7 @@
 #include "stdlib.h"
 #include "asm.h"
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/debug.h>
 
@@ -15,7 +15,7 @@ namespace kernel
 
 ExceptionTable::ExceptionTable()
 {
-    trace(0, "ExcTable 0x%p", this);
+    klog(0, "ExcTable 0x%p", this);
 
     for (size_t i = 0; i < stdlib::array_size(handler_); i++)
     {
@@ -102,7 +102,7 @@ bool ExceptionTable::set_handler(size_t index, ExcHandler handler)
 {
     if (index >= stdlib::array_size(handler_))
         return false;
-    trace(0, "Set handler[%lu]=0x%p", index, handler);
+    klog(0, "Set handler[%lu]=0x%p", index, handler);
     handler_[index] = handler;
     return true;
 }

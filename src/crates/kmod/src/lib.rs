@@ -133,7 +133,7 @@ fn handed_back(name: &str, made: Result<Box<dyn Module>>) -> *mut c_void {
         /* A trait object is a fat pointer, and the loader keeps a thin one. */
         Ok(module) => Box::into_raw(Box::new(module)) as *mut c_void,
         Err(e) => {
-            kcore::trace!(0, "module {}: init failed: {}", name, e);
+            kcore::klog!(0, "module {}: init failed: {}", name, e);
             core::ptr::null_mut()
         }
     }

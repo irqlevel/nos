@@ -1,7 +1,7 @@
 #include "tsc.h"
 #include "cpuid.h"
 #include "asm.h"
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/preempt.h>
 
 #include <include/const.h>
@@ -82,7 +82,7 @@ bool Tsc::calibrate()
     auto leaf1 = cpuid(CPUID_LEAF_FEATURES);
     if (!(leaf1.edx & CPUID_BIT_TSC))
     {
-        trace(0, "TSC: not present");
+        klog(0, "TSC: not present");
         return false;
     }
 
@@ -94,14 +94,14 @@ bool Tsc::calibrate()
         invariant_ = (leaf8007.edx & CPUID_BIT_INVARIANT_TSC) != 0;
     }
 
-    trace(0, "TSC: invariant=%lu", (ulong)invariant_);
+    klog(0, "TSC: invariant=%lu", (ulong)invariant_);
 
     ulong samples[CALIBRATION_ROUNDS];
 
     /* Prefer HPET calibration over PIT channel 2 */
     if (Hpet::get_instance().is_available())
     {
-        trace(0, "TSC: calibrating via HPET");
+        klog(0, "TSC: calibrating via HPET");
         for (ulong i = 0; i < CALIBRATION_ROUNDS; i++)
             samples[i] = calibrate_hpet();
     }
@@ -133,7 +133,7 @@ bool Tsc::calibrate()
 
     if (median_ticks == 0)
     {
-        trace(0, "TSC: calibration failed, zero ticks");
+        klog(0, "TSC: calibration failed, zero ticks");
         return false;
     }
 
@@ -143,7 +143,7 @@ bool Tsc::calibrate()
     base_tsc_ = read_tsc();
     calibrated_ = true;
 
-    trace(0, "TSC: frequency %lu Hz (%lu MHz)", freq_hz_, freq_hz_ / HZ_PER_MHZ);
+    klog(0, "TSC: frequency %lu Hz (%lu MHz)", freq_hz_, freq_hz_ / HZ_PER_MHZ);
 
     return true;
 }
@@ -156,7 +156,7 @@ bool Tsc::setup_kvm_clock()
     const char* kvm_str = "KVMKVMKVM\0\0\0";
     if (stdlib::mem_cmp(kvm, kvm_str, KVM_SIGNATURE_LEN) != 0)
     {
-        trace(0, "TSC: not running under KVM");
+        klog(0, "TSC: not running under KVM");
         return false;
     }
 
@@ -164,7 +164,7 @@ bool Tsc::setup_kvm_clock()
     auto feat = cpuid(KVM_CPUID_FEATURES);
     if (!(feat.eax & KVM_FEATURE_CLOCK_SOURCE2))
     {
-        trace(0, "TSC: KVM detected but no clocksource2 feature");
+        klog(0, "TSC: KVM detected but no clocksource2 feature");
         return false;
     }
 
@@ -173,7 +173,7 @@ bool Tsc::setup_kvm_clock()
         mm::alloc_map_pages(1, &pv_clock_phys_));
     if (!pv_clock_)
     {
-        trace(0, "TSC: failed to allocate pvclock page");
+        klog(0, "TSC: failed to allocate pvclock page");
         return false;
     }
 
@@ -185,7 +185,7 @@ bool Tsc::setup_kvm_clock()
 
     kvm_clock_avail_ = true;
 
-    trace(0, "TSC: kvmclock enabled, pvclock at phys 0x%lX virt 0x%lX",
+    klog(0, "TSC: kvmclock enabled, pvclock at phys 0x%lX virt 0x%lX",
         pv_clock_phys_, (ulong)pv_clock_);
 
     return true;
@@ -199,7 +199,7 @@ bool Tsc::enable_kvm_clock_self()
     ulong idx = Lapic::get_apic_id();
     if (idx >= PV_CLOCK_ENTRY_COUNT)
     {
-        trace(0, "TSC: apic id %lu exceeds pvclock entries", idx);
+        klog(0, "TSC: apic id %lu exceeds pvclock entries", idx);
         return false;
     }
 

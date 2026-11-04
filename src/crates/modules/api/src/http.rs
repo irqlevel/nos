@@ -123,7 +123,7 @@ pub fn conn_main(ctx: ConnCtx) {
             if why == Refused::UnknownKey {
                 Counters::add(&shared.counters.unknown_key);
             }
-            kcore::trace!(1, "api: {} refused in its handshake: {}", Ip(ip), why.name());
+            kcore::klog!(1, "api: {} refused in its handshake: {}", Ip(ip), why.name());
             sock.tcp.abort();
         }
         Ok(mut session) => {
@@ -644,7 +644,7 @@ fn host(shared: &Shared, who: &Who) -> Response {
 /// A line of the audit log, and of the kernel's.
 pub(super) fn audit(shared: &Shared, who: &Who, what: &str, s: Status) {
     let line = alloc::format!("{} {} {} {}", who.name, Ip(who.ip), what, s.name());
-    kcore::trace!(0, "api: {}", line);
+    kcore::klog!(0, "api: {}", line);
     shared.audit.with(|_| super::files::audit(&shared.dir, &line));
 }
 

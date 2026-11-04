@@ -5,7 +5,7 @@
 #include <hal/irqchip.h>
 #include <kernel/interrupt.h>
 #include <kernel/panic.h>
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 
 #include <lib/stdlib.h>
 
@@ -41,7 +41,7 @@ Idt::Idt()
     : base_(0)
     , limit_(0)
 {
-    trace(0, "Idt 0x%p", this);
+    klog(0, "Idt 0x%p", this);
 
     static_assert(sizeof(entry_) / sizeof(entry_[0]) == 256,
         "dummy_interrupt_stub_table holds one stub per idt entry");
@@ -119,7 +119,7 @@ void Idt::dummy_interrupt(Context* ctx, u8 vector)
     long count = dummy_interrupt_counter_.get();
     if (count <= MAX_DUMMY_REPORTS)
     {
-        trace(0, "Unknown interrupt, vector 0x%lX rip 0x%lX count %lu",
+        klog(0, "Unknown interrupt, vector 0x%lX rip 0x%lX count %lu",
             (ulong)vector, ctx->get_ret_rip(), (ulong)count);
 
         /* The screen is the only channel on a machine with no serial port */

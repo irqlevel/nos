@@ -4,7 +4,7 @@
 //! guest's disk. Read from the device table as `disks` reads it.
 
 use crate::table;
-use kcore::trace;
+use kcore::klog;
 use mgmt::{Call, Kind, Method, Params, Provider, Status};
 
 struct Block;
@@ -19,7 +19,7 @@ static METHODS: [Method; 1] = [Method { name: "disks", kind: Kind::Read }];
 pub fn init() {
     match mgmt::register("block", &METHODS, DESCRIPTOR, &BLOCK) {
         Ok(registration) => core::mem::forget(registration),
-        Err(status) => trace!(0, "block: cannot register the provider: {}", status.name()),
+        Err(status) => klog!(0, "block: cannot register the provider: {}", status.name()),
     }
 }
 

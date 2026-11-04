@@ -1,6 +1,6 @@
 #include "grub.h"
 
-#include <kernel/trace.h>
+#include <kernel/klog.h>
 #include <kernel/parameters.h>
 #include <mm/memory_map.h>
 #include <lib/stdlib.h>
@@ -82,7 +82,7 @@ static void save_acpi_rsdp(MultiBootTag* tag, bool is_new)
 
 void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
 {
-    trace(0, "mb_info %p", mb_info);
+    klog(0, "mb_info %p", mb_info);
 
     const void* mb_info_end = stdlib::mem_add(mb_info, mb_info->total_size);
     MultiBootTag * tag;
@@ -97,11 +97,11 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
         if (stdlib::mem_add(tag, tag->size) > mb_info_end ||
             tag->size < sizeof(*tag))
         {
-            trace(0, "Malformed tag %lu size %lu, stop parsing", (ulong)tag->type, (ulong)tag->size);
+            klog(0, "Malformed tag %lu size %lu, stop parsing", (ulong)tag->type, (ulong)tag->size);
             break;
         }
 
-        trace(0, "Tag %lu Size %lu", (ulong)tag->type, (ulong)tag->size);
+        klog(0, "Tag %lu Size %lu", (ulong)tag->type, (ulong)tag->size);
         switch (tag->type)
         {
         case MULTI_BOOT_TAG_TYPE_BOOT_DEV:
@@ -110,7 +110,7 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
                 break;
 
             MultiBootTagBootDev* bdev = reinterpret_cast<MultiBootTagBootDev*>(tag);
-            trace(0, "Boot dev 0x%lX 0x%lX 0x%lX",
+            klog(0, "Boot dev 0x%lX 0x%lX 0x%lX",
                 (ulong)bdev->bios_dev, (ulong)bdev->slice, (ulong)bdev->part);
             break;
         }
@@ -147,7 +147,7 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
                     if (usable != usable_pass)
                         continue;
 
-                    trace(0, "Mmap addr 0x%lX len 0x%lX type %lu",
+                    klog(0, "Mmap addr 0x%lX len 0x%lX type %lu",
                         (ulong)entry->addr, (ulong)entry->len, (ulong)entry->type);
 
                     if (usable && memory_map.get_region_count() + KERNEL_CARVE_OUTS >= kernel::mm::MemoryMap::MAX_REGIONS)
@@ -163,7 +163,7 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
             }
 
             if (dropped != 0)
-                trace(0, "mm: %lu usable regions, %lu MiB, past what the memory map holds, not used",
+                klog(0, "mm: %lu usable regions, %lu MiB, past what the memory map holds, not used",
                     dropped, dropped_bytes / consts::MB);
             break;
         }
@@ -187,11 +187,11 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
             }
             if (!terminated)
             {
-                trace(0, "Cmdline tag is not NUL-terminated, ignored");
+                klog(0, "Cmdline tag is not NUL-terminated, ignored");
                 break;
             }
 
-            trace(0, "Cmdline %s", cmd_line->string);
+            klog(0, "Cmdline %s", cmd_line->string);
             kernel::Parameters::get_instance().parse(cmd_line->string);
 
             break;
@@ -210,35 +210,35 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
                 name_len++;
             if (name_len == max_len)
             {
-                trace(0, "Module tag's command line is not NUL-terminated, ignored");
+                klog(0, "Module tag's command line is not NUL-terminated, ignored");
                 break;
             }
             if (stdlib::str_cmp(module->cmd_line, UCODE_MODULE_NAME) != 0)
             {
-                trace(0, "Module %s ignored", module->cmd_line);
+                klog(0, "Module %s ignored", module->cmd_line);
                 break;
             }
             if (module->mod_end <= module->mod_start)
             {
-                trace(0, "Module ucode is empty, ignored");
+                klog(0, "Module ucode is empty, ignored");
                 break;
             }
 
             ucode_start = module->mod_start;
             ucode_end = module->mod_end;
-            trace(0, "Module ucode 0x%lX-0x%lX", ucode_start, ucode_end);
+            klog(0, "Module ucode 0x%lX-0x%lX", ucode_start, ucode_end);
             break;
         }
         case MULTI_BOOT_TAG_TYPE_ACPI_OLD:
         {
             save_acpi_rsdp(tag, false);
-            trace(0, "Acpi old RSDP tag, size %lu", (ulong)tag->size);
+            klog(0, "Acpi old RSDP tag, size %lu", (ulong)tag->size);
             break;
         }
         case MULTI_BOOT_TAG_TYPE_ACPI_NEW:
         {
             save_acpi_rsdp(tag, true);
-            trace(0, "Acpi new RSDP tag, size %lu", (ulong)tag->size);
+            klog(0, "Acpi new RSDP tag, size %lu", (ulong)tag->size);
             break;
         }
         case MULTI_BOOT_TAG_TYPE_FRAMEBUFFER:
@@ -279,7 +279,7 @@ void parse_multi_boot_info(MultiBootInfoHeader *mb_info)
                 framebuffer.blue_size = 8;
             }
 
-            trace(0, "Framebuffer addr 0x%lX %lux%lu pitch %lu bpp %lu type %lu",
+            klog(0, "Framebuffer addr 0x%lX %lux%lu pitch %lu bpp %lu type %lu",
                 (ulong)fb->addr, (ulong)fb->width, (ulong)fb->height,
                 (ulong)fb->pitch, (ulong)fb->bpp, (ulong)fb->fb_type);
             break;

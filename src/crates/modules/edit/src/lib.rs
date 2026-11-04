@@ -243,24 +243,24 @@ impl Seat<'_> {
             return;
         }
         let Ok(data) = self.editor.contents() else {
-            kcore::trace!(0, "edit: the session ended with {} changed, and no memory to keep the changes in", self.path);
+            kcore::klog!(0, "edit: the session ended with {} changed, and no memory to keep the changes in", self.path);
             return;
         };
         for n in 0..SAVE_NAMES {
             let name = if n == 0 { format!("{}.save", self.path) } else { format!("{}.save.{}", self.path, n) };
             match kcore::fs::create(&name, &data) {
                 Ok(()) => {
-                    kcore::trace!(0, "edit: the session ended with {} changed: the changes are in {}", self.path, name);
+                    kcore::klog!(0, "edit: the session ended with {} changed: the changes are in {}", self.path, name);
                     return;
                 }
                 Err(Error::Busy) => continue,
                 Err(e) => {
-                    kcore::trace!(0, "edit: the session ended with {} changed, and {} could not be written: {}", self.path, name, e);
+                    kcore::klog!(0, "edit: the session ended with {} changed, and {} could not be written: {}", self.path, name, e);
                     return;
                 }
             }
         }
-        kcore::trace!(0, "edit: the session ended with {} changed, and {}.save to .save.9 are all taken", self.path, self.path);
+        kcore::klog!(0, "edit: the session ended with {} changed, and {}.save to .save.9 are all taken", self.path, self.path);
     }
 }
 

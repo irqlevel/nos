@@ -18,7 +18,7 @@ use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::pci;
 use kcore::sync::SpinLock;
-use kcore::trace;
+use kcore::klog;
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -101,7 +101,7 @@ impl Rng {
 
         if inner.stuck {
             if inner.queue.take_used().is_none() {
-                trace!(0, "virtio-rng: a request from before is still with the device");
+                klog!(0, "virtio-rng: a request from before is still with the device");
                 return false;
             }
             inner.stuck = false;
@@ -113,7 +113,7 @@ impl Rng {
 
             let phys = inner.dma.phys();
             if inner.queue.add(&[Buf::write(phys, chunk as u32)]).is_none() {
-                trace!(0, "virtio-rng: no descriptor for a request");
+                klog!(0, "virtio-rng: no descriptor for a request");
                 return false;
             }
             self.transport.notify(REQUEST_QUEUE);
@@ -127,7 +127,7 @@ impl Rng {
             let (_id, len) = match inner.queue.take_used() {
                 Some(used) => used,
                 None => {
-                    trace!(0, "virtio-rng: the device did not answer");
+                    klog!(0, "virtio-rng: the device did not answer");
                     inner.stuck = true;
                     return false;
                 }
@@ -137,7 +137,7 @@ impl Rng {
              * all means it has nothing to give. */
             let got = core::cmp::min(len as usize, chunk);
             if got == 0 {
-                trace!(0, "virtio-rng: the device returned nothing");
+                klog!(0, "virtio-rng: the device returned nothing");
                 return false;
             }
 
@@ -165,9 +165,9 @@ fn register(rng: Rng) {
 
     if random::register_source(name, rng) {
         DEVICES.fetch_add(1, Ordering::AcqRel);
-        trace!(0, "virtio-rng: {} is an entropy source", name);
+        klog!(0, "virtio-rng: {} is an entropy source", name);
     } else {
-        trace!(0, "virtio-rng: the entropy table would not take another source");
+        klog!(0, "virtio-rng: the entropy table would not take another source");
     }
 }
 
@@ -190,13 +190,13 @@ pub fn init() {
             let transport = match PciTransport::probe(&dev) {
                 Some(transport) => transport,
                 None => {
-                    trace!(0, "virtio-rng: {:02x}:{:02x}.{} is not a bus this speaks",
+                    klog!(0, "virtio-rng: {:02x}:{:02x}.{} is not a bus this speaks",
                         dev.bus, dev.slot, dev.func);
                     continue;
                 }
             };
 
-            trace!(0, "virtio-rng: {} virtio-pci at {:02x}:{:02x}.{}",
+            klog!(0, "virtio-rng: {} virtio-pci at {:02x}:{:02x}.{}",
                 if transport.is_legacy() { "legacy" } else { "modern" },
                 dev.bus, dev.slot, dev.func);
 
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn rust_virtio_rng_init_mmio(slots: *const Slot, count: us
             None => continue,
         };
 
-        trace!(0, "virtio-rng: virtio-mmio at {:#x}", slot.base);
+        klog!(0, "virtio-rng: virtio-mmio at {:#x}", slot.base);
 
         if let Some(rng) = Rng::start(Box::new(transport), DEVICES.load(Ordering::Acquire)) {
             register(rng);

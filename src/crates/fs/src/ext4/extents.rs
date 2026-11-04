@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use extfmt::extent::{self, Header, Index, Leaf, INIT_MAX_LEN, MAX_DEPTH, ROOT_BYTES, ROOT_MAX, UNINIT_MAX_LEN};
 use extfmt::inode::{self as xinode, Inode, EXTENTS_FL};
-use kcore::trace;
+use kcore::klog;
 
 use super::inodes as inode;
 use super::txn::{Kind, Txn};
@@ -115,7 +115,7 @@ impl Txn<'_> {
     /// and to the depth it should have.
     fn node(&mut self, ino: u32, iseed: u32, b: u64, depth: u16) -> Option<Vec<u8>> {
         if b < self.m.first_data || b >= self.m.blocks || self.m.in_system(b) {
-            trace!(0, "ext4: inode {}'s tree names block {}, which no tree may hold", ino, b);
+            klog!(0, "ext4: inode {}'s tree names block {}, which no tree may hold", ino, b);
             return None;
         }
         let made = self.dirty.contains_key(&b);
@@ -123,17 +123,17 @@ impl Txn<'_> {
         let h = match extent::header(&data) {
             Ok(h) => h,
             Err(why) => {
-                trace!(0, "ext4: inode {}'s extent block {}: {}", ino, b, why);
+                klog!(0, "ext4: inode {}'s extent block {}: {}", ino, b, why);
                 return None;
             }
         };
         if h.depth != depth || (h.entries == 0 && !made) {
-            trace!(0, "ext4: inode {}'s extent block {} is at depth {} with {} entries, below a node at {}", ino, b,
+            klog!(0, "ext4: inode {}'s extent block {} is at depth {} with {} entries, below a node at {}", ino, b,
                 h.depth, h.entries, depth + 1);
             return None;
         }
         if self.m.csum && !made && extent::stored_csum(&data) != extent::node_csum(iseed, &data) {
-            trace!(0, "ext4: inode {}'s extent block {} fails its checksum", ino, b);
+            klog!(0, "ext4: inode {}'s extent block {} fails its checksum", ino, b);
             return None;
         }
         Some(data)
@@ -152,14 +152,14 @@ impl Txn<'_> {
             for e in &n.leaves {
                 let (first, len) = (u64::from(e.first), u64::from(e.len));
                 if len == 0 || first < end || first + len > 1 << 32 || !self.m.file_may_own(e.start, len) {
-                    trace!(0, "ext4: inode {} has an extent of file blocks {}..+{} on {}, which no file may hold",
+                    klog!(0, "ext4: inode {} has an extent of file blocks {}..+{} on {}, which no file may hold",
                            ino, e.first, e.len, e.start);
                     return false;
                 }
                 end = first + len;
             }
         } else if n.index.windows(2).any(|w| w[1].first <= w[0].first) {
-            trace!(0, "ext4: inode {} has an index node whose keys do not rise", ino);
+            klog!(0, "ext4: inode {} has an index node whose keys do not rise", ino);
             return false;
         }
         true
@@ -171,7 +171,7 @@ impl Txn<'_> {
     /// transaction made or changed, which are its own.
     fn path_to(&mut self, ino: u32, iseed: u32, raw: &[u8], l: u32) -> Option<Path> {
         let Some(root) = Node::parse(None, &raw[xinode::I_BLOCK..xinode::I_BLOCK + ROOT_BYTES]) else {
-            trace!(0, "ext4: inode {}'s extent root is damaged", ino);
+            klog!(0, "ext4: inode {}'s extent root is damaged", ino);
             return None;
         };
         if !self.node_sound(ino, &root) {
@@ -184,7 +184,7 @@ impl Txn<'_> {
                 return Some(path);
             }
             if n.index.is_empty() {
-                trace!(0, "ext4: inode {} has an empty index node", ino);
+                klog!(0, "ext4: inode {} has an empty index node", ino);
                 return None;
             }
             let k = n.index.iter().rposition(|x| x.first <= l).unwrap_or(0);
@@ -242,7 +242,7 @@ impl Txn<'_> {
                     /* The root is full: what it holds into a block of its
                      * own, the root a level deeper above it. */
                     if path.nodes[0].depth >= MAX_DEPTH {
-                        trace!(0, "ext4: inode {}'s tree is as deep as the format allows", ino);
+                        klog!(0, "ext4: inode {}'s tree is as deep as the format allows", ino);
                         return false;
                     }
                     let Some(b) = self.alloc_block(goal) else { return false };
@@ -322,7 +322,7 @@ impl Txn<'_> {
     fn iseed(&self, ino: u32, raw: &[u8]) -> Option<u32> {
         let node = Inode::new(raw)?;
         if node.flags() & EXTENTS_FL == 0 {
-            trace!(0, "ext4: inode {} is mapped by blocks, which this does not change", ino);
+            klog!(0, "ext4: inode {} is mapped by blocks, which this does not change", ino);
             return None;
         }
         Some(xinode::seed(self.m.seed, ino, node.generation()))
@@ -352,7 +352,7 @@ impl Txn<'_> {
             || leaf.leaves.get(p).is_some_and(|x| end > u64::from(x.first))
             || end > limit;
         if overlaps {
-            trace!(0, "ext4: blocks {}..{} of inode {} are mapped already", e.first, end, ino);
+            klog!(0, "ext4: blocks {}..{} of inode {} are mapped already", e.first, end, ino);
             return false;
         }
         leaf.leaves.insert(p, e);
@@ -479,7 +479,7 @@ impl Txn<'_> {
         let leaf = path.nodes.last_mut()?;
         let Some(k) = leaf.leaves.iter()
             .position(|e| e.first <= l && u64::from(l) < u64::from(e.first) + u64::from(e.len)) else {
-            trace!(0, "ext4: block {} of inode {} is in no extent to make written", l, ino);
+            klog!(0, "ext4: block {} of inode {} is in no extent to make written", l, ino);
             return None;
         };
         let e = leaf.leaves[k];
@@ -513,7 +513,7 @@ impl Txn<'_> {
         let node = Inode::new(raw)?;
         if node.flags() & EXTENTS_FL == 0 {
             if inode::holds_blocks(self.m, raw) {
-                trace!(0, "ext4: inode {} is mapped by blocks, which this does not free", ino);
+                klog!(0, "ext4: inode {} is mapped by blocks, which this does not free", ino);
                 return None;
             }
             /* Nothing mapped: a device node, a fifo, a socket, a fast
@@ -523,7 +523,7 @@ impl Txn<'_> {
         let iseed = xinode::seed(self.m.seed, ino, node.generation());
         let root = node.i_block()[..ROOT_BYTES].to_vec();
         let Ok(h) = extent::header(&root) else {
-            trace!(0, "ext4: inode {}'s extent root is damaged", ino);
+            klog!(0, "ext4: inode {}'s extent root is damaged", ino);
             return None;
         };
         /* What the tree holds can be anything a disk says: every list grows
@@ -535,7 +535,7 @@ impl Txn<'_> {
         let mut seen = BTreeSet::new();
         let mut stack: Vec<(Vec<u8>, u16)> = vec![(root, h.depth)];
         let no_room = |what: &str| {
-            trace!(0, "ext4: inode {}'s tree holds more {} than there is memory for", ino, what);
+            klog!(0, "ext4: inode {}'s tree holds more {} than there is memory for", ino, what);
         };
         while let Some((n, depth)) = stack.pop() {
             let h = extent::header(&n).ok()?;
@@ -543,7 +543,7 @@ impl Txn<'_> {
                 if depth == 0 {
                     let e = extent::leaf(&n, i);
                     if !self.m.file_may_own(e.start, u64::from(e.len)) {
-                        trace!(0, "ext4: inode {} maps blocks {}..+{}, which no file may hold", ino, e.start, e.len);
+                        klog!(0, "ext4: inode {} maps blocks {}..+{}, which no file may hold", ino, e.start, e.len);
                         return None;
                     }
                     if runs.try_reserve(1).is_err() {
@@ -554,7 +554,7 @@ impl Txn<'_> {
                 } else {
                     let x = extent::index(&n, i);
                     if !seen.insert(x.child) || seen.len() as u64 > self.m.blocks {
-                        trace!(0, "ext4: inode {}'s tree names block {} twice", ino, x.child);
+                        klog!(0, "ext4: inode {}'s tree names block {} twice", ino, x.child);
                         return None;
                     }
                     let child = self.node(ino, iseed, x.child, depth - 1)?;

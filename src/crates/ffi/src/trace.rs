@@ -1,69 +1,35 @@
+//! The tracepoints (kernel/tracepoint.h): what Rust's sites -- the image's and
+//! a module's -- record into the same rings, by the same `emit()`, as the
+//! kernel's C++ ones. `kcore::trace` is the safe side.
+
 unsafe extern "C" {
-    fn kernel_trace(level: u32, msg: *const u8, len: usize);
+    /// The events' flags, a byte an event and `kernel_tp_count()` of them:
+    /// the kernel's static array, for the kernel's life, read and written
+    /// only with atomics. Values only.
+    pub safe fn kernel_tp_flags() -> *const u8;
+    /// How many events the kernel describes: the flags' length. Values only.
+    pub safe fn kernel_tp_count() -> usize;
+    /// A record of an event: its number in `id_size`'s low 16 bits and its
+    /// payload's size above them, the payload in `w0`..`w4` -- a slot's
+    /// words, the bytes past its size zero -- each in a register, so that
+    /// nothing of it goes through memory on the way to the ring. The kernel
+    /// holds the number and the size to the event's description and panics
+    /// for either wrong (BUG_ON), writing nothing. Values only.
+    pub safe fn kernel_tp_record(id_size: u64, w0: u64, w1: u64, w2: u64, w3: u64, w4: u64);
+    /// Event `id`'s name into `name` (`name_len` bytes, terminated, cut to
+    /// fit) and its payload's size into `size`: 1, or 0 for no such event.
+    pub fn kernel_tp_event(id: u16, name: *mut u8, name_len: usize, size: *mut usize) -> i32;
+    /// Field `index` of event `id`, as its description has it: its name, its
+    /// offset in the payload, its size, and how many names its values have
+    /// -- an enumeration's; 0 for any other field -- 1, or 0 past the
+    /// event's last field or for no such event.
+    pub fn kernel_tp_field(id: u16, index: usize, name: *mut u8, name_len: usize, offset: *mut usize,
+        size: *mut usize, names: *mut usize) -> i32;
+    /// What value `value` of that field is called, into `name` (`name_len`
+    /// bytes, terminated, cut to fit): 1, or 0 for a field that is no
+    /// enumeration or a value it has no name for.
+    pub fn kernel_tp_field_name(id: u16, index: usize, value: usize, name: *mut u8, name_len: usize) -> i32;
+    /// The pid a record says the running task by -- its own, or the kernel's
+    /// none (`tp::NO_TASK_PID`) off a task's stack. Values only.
+    pub safe fn kernel_tp_pid() -> u32;
 }
-
-pub fn trace(level: u32, s: &str) {
-    unsafe {
-        kernel_trace(level, s.as_ptr(), s.len());
-    }
-}
-
-pub struct TraceBuf {
-    buf: [u8; 512],
-    pos: usize,
-}
-
-impl TraceBuf {
-    pub const fn new() -> Self {
-        Self {
-            buf: [0u8; 512],
-            pos: 0,
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        /* write_str truncates byte-wise at the buffer boundary, which can
-         * split a multi-byte UTF-8 sequence; only expose the valid prefix
-         * (an unchecked conversion of the full buffer would be UB). */
-        match core::str::from_utf8(&self.buf[..self.pos]) {
-            Ok(s) => s,
-            Err(e) => {
-                let valid = e.valid_up_to();
-                unsafe { core::str::from_utf8_unchecked(&self.buf[..valid]) }
-            }
-        }
-    }
-}
-
-impl core::fmt::Write for TraceBuf {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let remaining = self.buf.len() - self.pos;
-        let n = if bytes.len() < remaining {
-            bytes.len()
-        } else {
-            remaining
-        };
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
-        Ok(())
-    }
-}
-
-#[macro_export]
-macro_rules! trace {
-    ($level:expr, $($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut buf = $crate::trace::__TraceBuf::new();
-        let f = file!();
-        let fname = match f.rfind('/') {
-            Some(i) => &f[i + 1..],
-            None => f,
-        };
-        let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
-        let _ = write!(buf, $($arg)*);
-        $crate::trace::trace($level, buf.as_str());
-    }};
-}
-
-pub use TraceBuf as __TraceBuf;
