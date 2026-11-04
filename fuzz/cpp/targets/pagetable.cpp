@@ -913,6 +913,84 @@ void reserve_pool(fuzz::Input& in)
         fuzz::reached("a huge pool");
 }
 
+/* The L2 entry that maps va, read the way the MMU reads it; Value 0 if a
+   level above it is missing, or is a block. */
+Pte l2_of(ulong va)
+{
+    write_back_all();
+    Pte none;
+    none.value = 0;
+    ulong phys = tested_pt().root_;
+    const ulong idx[] = {Pte::l4_index(va), Pte::l3_index(va), Pte::l2_index(va)};
+    for (int level = 0; level < 3; level++)
+    {
+        const PtePage* t = reinterpret_cast<const PtePage*>(machine.phys + phys);
+        Pte e = t->entry[idx[level]];
+        if (level == 2)
+            return e;
+        if (!e.present() || e.huge())
+            return none;
+        phys = e.address();
+    }
+    return none;
+}
+
+/* The pool's window, as the boot makes it right after the pool -- or later,
+   once, with the free list or the tmp_map window as the sequence has left
+   them: every block of the pool a 2MiB leaf at HUGE_POOL_WINDOW plus its
+   address, writable and never executable, and every page of a block found
+   there -- or, where it says it was not made, nothing of it at all: no
+   table left, no page of the free list gone, no page found. */
+void pool_window(fuzz::Input& in)
+{
+    (void)in;
+    if (tested_pt().huge_pool_window_on_)
+        return;
+    const ulong before = tested_pt().free_pages_count_;
+    std::set<ulong> tables_before;
+    collect_tables(tables_before);
+    const bool made = tested_pt().map_huge_pool_window();
+    std::set<ulong> tables_after;
+    collect_tables(tables_after);
+    const ulong taken = before - tested_pt().free_pages_count_;
+    if (!made)
+    {
+        INVARIANT(taken == 0, "a window not made took %lu pages off the free list", taken);
+        INVARIANT(tables_after == tables_before, "a window not made left %zu tables where there were %zu",
+            tables_after.size(), tables_before.size());
+        write_back_all();
+        const PtePage* top = reinterpret_cast<const PtePage*>(machine.phys + tested_pt().root_);
+        Pte entry = top->entry[Pte::l4_index(PageTable::HUGE_POOL_WINDOW)];
+        INVARIANT(!entry.present(), "a window not made left its top-level entry");
+        for (const auto& b : pool_blocks)
+            INVARIANT(tested_pt().huge_pool_window(b.first) == 0, "block 0x%lx found in a window not made", b.first);
+        fuzz::reached(pool_blocks.empty() ? "a window of no pool" : "a pool window not made");
+        return;
+    }
+    INVARIANT(!pool_blocks.empty(), "a window made of no pool");
+    INVARIANT(taken == tables_after.size() - tables_before.size(), "the window took %lu pages for %zu tables", taken,
+        tables_after.size() - tables_before.size());
+    for (const auto& b : pool_blocks)
+    {
+        const ulong va = PageTable::HUGE_POOL_WINDOW + b.first;
+        Pte e = l2_of(va);
+        INVARIANT(e.present() && e.huge() && e.address() == b.first, "block 0x%lx not at 0x%lx in the window",
+            b.first, va);
+        INVARIANT(writable(e) && !executable(e), "block 0x%lx in the window %s", b.first,
+            writable(e) ? "executable" : "read-only");
+        const ulong page = b.first + in.below(HUGE_PAGES) * PAGE_BYTES;
+        INVARIANT(tested_pt().huge_pool_window(page) == PageTable::HUGE_POOL_WINDOW + page,
+            "page 0x%lx of the pool found at 0x%lx", page, tested_pt().huge_pool_window(page));
+    }
+    for (ulong i = 0; i < machine.pages; i += 1 + in.below(64))
+    {
+        if (pages[i].state != PageState::Pool && pages[i].state != PageState::Huge)
+            INVARIANT(tested_pt().huge_pool_window(i * PAGE_BYTES) == 0, "page %lu, no pool's, found in the window",
+                i);
+    }
+    fuzz::reached("a pool window");
+}
+
 void alloc_huge(fuzz::Input& in)
 {
     (void)in;
@@ -1013,9 +1091,14 @@ void boot(fuzz::Input& in)
     pt.root_ = root->get_phy_address();
     pages[index(pt.root_)].state = PageState::Table;
 
-    /* The pool, right after the free list as the boot reserves it */
+    /* The pool, right after the free list as the boot reserves it, and its
+       window right after it, as the boot makes it -- or later, or never */
     if (machine.pages >= 2 * HUGE_PAGES && in.chance(192))
+    {
         reserve_pool(in);
+        if (in.chance(160))
+            pool_window(in);
+    }
 }
 
 void run(fuzz::Input& in)
@@ -1064,7 +1147,9 @@ void run(fuzz::Input& in)
                 crowd(in);
             else if (!pool_blocks.empty() && in.chance(192))
             {
-                if (in.boolean())
+                if (in.chance(16))
+                    pool_window(in);
+                else if (in.boolean())
                     alloc_huge(in);
                 else
                     free_huge(in);

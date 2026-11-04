@@ -981,6 +981,8 @@ __attribute__((noinline)) void main2(grub::MultiBootInfoHeader *mb_info)
     /* The huge pool (hugepages=), now: the free list will never again be as
        whole as it is before the kernel's own allocations begin. */
     pt.reserve_huge_pool(Parameters::get_instance().get_huge_pool_bytes(pt.get_total_pages_count() * consts::PAGE_SIZE));
+    /* And mapped, for the copies into and out of guests' memory (PageTable::map_huge_pool_window) */
+    pt.map_huge_pool_window();
 
     /* W^X: the image mapping is the one executable thing the page table
        was built with (everything else is already NX), so split it here into
