@@ -97,6 +97,18 @@ slices, since at a fixed rhythm a lag reckoned wrong slipped under the bound
 -- and a spinner of nice 0 has 2.4 to 3.9 times the CPU of one of nice 5,
 for 3.06. Its line gives both medians and the share; a control run with the
 lag reckoned wrong waited 1256 us beside one spinner and failed the boot.
+Then `test_affinity`, on two CPUs other than the boot's, gives a task that
+spins and one that sleeps a millisecond at a time another CPU for its
+affinity and fails the boot if either is not on it within 100 ms, or is
+seen back on the first in the 20 ms after; and holds an idle task, a task
+bound to its CPU and a mask of no CPU that runs to being refused
+([changing a task's affinity](scheduler.md#changing-a-tasks-affinity)). Its
+lines say how long each move took -- 108 us and 1014 us in a smoke boot.
+The sleeper is to move at its next wakeup (`leave_if_outbound`), so it is
+also failed for looking on the old CPU more than twice after the change: a
+control run without that move had it look there 30 times, woken there,
+until a decision happened to find it running -- a time bound alone let
+another such run pass, its sleeper moving after 9 ms.
 `test_line_editor` types at the console's line editor
 ([line editing](shell-commands.md#line-editing)) on a screen of text and
 Backspace, as the console is: lines run and kept, Up and Down through them

@@ -304,6 +304,12 @@ static void bp_startup_arm(void* ctx)
         return;
     }
 
+    if (!test::test_affinity())
+    {
+        PANIC("Affinity test failed");
+        return;
+    }
+
     klog(0, "After test");
     ubsan::announce();
 

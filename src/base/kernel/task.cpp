@@ -736,16 +736,28 @@ void Task::update_runtime()
     run_start_time_ = now;
 }
 
+/* Sequentially consistent: set_task_affinity interrupts the task's CPU
+   after this, for a decision that is to see it */
 void Task::set_cpu_affinity(ulong affinity)
 {
-    stdlib::AutoLock lock(lock_);
-    cpu_affinity_ = affinity;
+    __atomic_store_n(&cpu_affinity_, affinity, __ATOMIC_SEQ_CST);
 }
 
 ulong Task::get_cpu_affinity()
 {
-    stdlib::AutoLock lock(lock_);
-    return cpu_affinity_;
+    return __atomic_load_n(&cpu_affinity_, __ATOMIC_SEQ_CST);
+}
+
+void Task::pin_to_cpu(ulong cpu)
+{
+    BUG_ON(cpu >= MAX_CPUS);
+    set_cpu_affinity(1UL << cpu);
+    flags_.set_bit(FLAG_PINNED_BIT);
+}
+
+bool Task::is_pinned()
+{
+    return flags_.test_bit(FLAG_PINNED_BIT);
 }
 
 TaskQueue* Task::select_next_task_queue()
@@ -754,7 +766,8 @@ TaskQueue* Task::select_next_task_queue()
        and get_running_cpus takes the table lock and then each of the 64 CPUs'
        own locks to read one flag apiece. Nothing ever clears STATE_RUNNING,
        so the two answers agree once a CPU has published itself. */
-    ulong cpu_mask = CpuTable::get_instance().get_running_cpus_no_lock() & cpu_affinity_;
+    ulong affinity = get_cpu_affinity();
+    ulong cpu_mask = CpuTable::get_instance().get_running_cpus_no_lock() & affinity;
     if (cpu_mask == 0)
         return nullptr;
 
@@ -801,6 +814,13 @@ TaskQueue* Task::select_next_task_queue()
 
     if (best == current)
         return nullptr;
+
+    /* On a CPU its affinity no longer has (set_task_affinity): it goes, to
+       the lightest it has, whatever the loads -- with the rule below a task
+       taken off a CPU kept coming back to it while its own queue was the
+       lighter one. */
+    if (!(affinity & (1UL << current->index())))
+        return best;
 
     /* This task is runnable and still counted on its own queue, so moving
        it takes one off that side and puts one on the other: a difference of
