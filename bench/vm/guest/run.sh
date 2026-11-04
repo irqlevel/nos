@@ -163,12 +163,13 @@ SIZE=$(d 2g 256m)
 rm -f $F
 sync
 # layout-trace in ONLY (no step of its own, and in no whole run): a quiet
-# 15 s before the first write and 10 s after it, each marked, for the host
+# 40 s before the first write and 10 s after it, each marked, for the host
 # to start a trace window in the one and freeze it in the other -- the
-# write lasts under a second.
+# write lasts under a second. 15 s were missed by a host whose look came
+# late after a window of its own (rounds 23-24).
 if [ -n "$ONLY" ] && want layout-trace; then
     step layout-ready
-    sleep 15
+    sleep 40
 fi
 # The file is new: its blocks are taken in the host's image as it is laid
 # out, so the first write is the allocating one; every test after it
