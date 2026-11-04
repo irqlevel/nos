@@ -177,6 +177,14 @@ pub extern "C" fn kernel_event_signal(handle: usize) {
     sched::harness(|| sched::event_signal(handle))
 }
 
+/// A spin's worth of looking: the signal taken if it is there, or after the
+/// others have had a turn -- what a spin on another CPU sees -- and none
+/// otherwise, whatever the time asked for.
+#[no_mangle]
+pub extern "C" fn kernel_event_poll(handle: usize, _poll_ns: u64) -> i32 {
+    sched::harness(|| sched::event_poll(handle)) as i32
+}
+
 /* ---- tasks ---- */
 
 /// # Safety

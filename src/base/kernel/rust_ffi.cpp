@@ -430,6 +430,11 @@ void kernel_event_signal(unsigned long handle)
     reinterpret_cast<kernel::Event*>(handle)->signal();
 }
 
+int kernel_event_poll(unsigned long handle, unsigned long long poll_ns)
+{
+    return reinterpret_cast<kernel::Event*>(handle)->poll_for(poll_ns) ? 1 : 0;
+}
+
 /* The name ps and top show for a task Rust starts: the caller's, a Rust
    string with no terminator, cut to the room a task has for one */
 static kernel::Task* new_rust_task(const unsigned char* name, unsigned long name_len)
