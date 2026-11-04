@@ -3439,11 +3439,14 @@ guest's disks are served.
 
 **A guest's CPUs run at the performance preference while they are its.**
 Where HWP picks a CPU's clock (Intel since Skylake, `docs/kernel-parameters.md`'s
-`hwp_epp=`), every CPU a guest's vCPUs run on and the one its disks' task
-runs on are asked for EPP 0 for as long as the guest runs
-(`kcore::cpu::Performance`, held by `guest::run_cpus` and the disk's task),
+`hwp_epp=`), every CPU a guest's vCPUs run on is asked for EPP 0 for as long
+as the guest runs (`kcore::cpu::Performance`, held by `guest::run_cpus`),
 and given back the boot's preference -- `balance_performance` unless told --
-when the last who holds one lets go. A guest's CPUs idle between its ticks,
+when the last who holds one lets go. Not the CPU its disks' task runs on:
+with that E-core at EPP 0 too, its task spinning there for the NVMe, every
+4k request took 3.8 us longer from the command to its completion's
+interrupt on another CPU -- reads and writes alike, 33.5k IOPS at QD1
+against 39.5k -- and without it they are back (rounds 15-17). A guest's CPUs idle between its ticks,
 and at the boot's preference HWP lowered their clock in every idle: on the
 EX44 the first microseconds after each wake ran five to ten times slower
 than on a busy core -- the TSC deadline's write that costs a busy core 1.3
