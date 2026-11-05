@@ -479,7 +479,13 @@ keys and wrong, Hellos right and wrong, messages, bursts into a full
 mailbox, monitors, silence, a broken wire -- and catches nine of ten bugs
 planted in it. `ipc-test.py --arch x86_64` passes under TCG, from an ISO
 whose command line has the UDP shell (`make nos-test.iso
-TEST_ISO_ARGS=udpshell=9100`). Left of I4: the measurements on the boxes.
+TEST_ISO_ARGS=udpshell=9100`), and under KVM on the AX41, nos the guests
+(2026-11-06): a small message's round trip 1.1 ms at the median there, the
+megabytes 9 MB/s -- both through hub.py, a switch in Python every frame
+crosses. The UB-flavour builds of both arches boot, and ipc-test passes on
+arm64's. Left of I4: the measurements between the boxes themselves, the
+EX44 and the AX41 -- which wants the EX44 in Ubuntu, and so its VMs stopped:
+the user's word.
 
 ## Limits of the first version
 
