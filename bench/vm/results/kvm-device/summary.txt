@@ -1,0 +1,51 @@
+BENCH kernel 6.8.0-147-generic
+BENCH cpu 13th Gen Intel(R) Core(TM) i5-13500
+BENCH nproc 4 mem_kib 8131780
+BENCH clocksource kvm-clock
+BENCH cpuidle none
+BENCH hypervisor Hypervisor detected: KVM
+BENCH cmdline BOOT_IMAGE=/vmlinuz-6.8.0-147-generic root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0
+BENCH boot Startup finished in 2.385s (kernel) + 2.892s (userspace) = 5.277s 
+BENCH state running failed=[]
+BENCH vda queues=4 nr_requests=256 max_sectors_kb=1280 wc=write back discard_max=2147483136
+BENCH thp always [madvise] never
+BENCH vuln gather_data_sampling:Not affected;return thunks;itlb_multihit:Not affected;l1tf:Not affected;mds:Not affected;meltdown:Not affected;mmio_stale_data:Not affected;reg_file_data_sampling:Vulnerable: No microcode;retbleed:Not affected;spec_rstack_overflow:Not affected;spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl;swapgs barriers and __user pointer sanitization; Automatic IBRS; IBPB: conditional; PBRSB-eIBRS: SW sequence; BHI: SW loop, KVM: SW loop;srbds:Not affected;tsa:Not affected;tsx_async_abort:Not affected;vmscape:Not affected;
+BENCH flags fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves avx_vnni arat vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize flush_l1d arch_capabilities
+BENCH fio layout_seqwrite_1m_qd8 bw_mib=4762 secs=0.429
+BENCH fio randread_4k_qd1 iops=20554 bw_mib=80 lat_us=46 p99_us=51 p999_us=56
+BENCH fio randread_4k_qd32 iops=219872 bw_mib=858 lat_us=144 p99_us=209 p999_us=264
+BENCH fio randread_4k_4x16 iops=240180 bw_mib=938 lat_us=265 p99_us=325 p999_us=419
+BENCH fio randwrite_4k_qd1 iops=50839 bw_mib=198 lat_us=18 p99_us=20 p999_us=24
+BENCH fio randwrite_4k_qd32 iops=237859 bw_mib=929 lat_us=133 p99_us=211 p999_us=230
+BENCH fio read_1m_qd8 iops=2185 bw_mib=2185 lat_us=3625 p99_us=4112 p999_us=4554
+BENCH fio write_1m_qd8 iops=4867 bw_mib=4867 lat_us=1601 p99_us=5406 p999_us=5734
+BENCH fio randwrite_4k_fdatasync iops=634 bw_mib=2 lat_us=107 p99_us=138 p999_us=222
+BENCH kbuild untar_ms 6052
+BENCH kbuild make_j4_ms 317864 rc=0
+BENCH kbuild rm_ms 812
+BENCH pgbench init_s100 ms=6221 rc=0 [done in 6.19 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 4.79 s, vacuum 0.09 s, primary keys 1.31 s).]
+BENCH pgbench db_size 1503 MB
+BENCH pgbench ro c1 r1 tps=62367.357919 lat_ms=0.016
+BENCH pgbench ro c4 r1 tps=266219.554259 lat_ms=0.015
+BENCH pgbench ro c8 r1 tps=257719.750217 lat_ms=0.031
+BENCH pgbench ro c16 r1 tps=236435.144842 lat_ms=0.068
+BENCH pgbench rw c1 r1 tps=413.770811 lat_ms=2.417
+BENCH pgbench rw c4 r1 tps=1242.148016 lat_ms=3.220
+BENCH pgbench rw c8 r1 tps=2376.844803 lat_ms=3.366
+BENCH pgbench rw c16 r1 tps=4677.307856 lat_ms=3.421
+BENCH pgbench ro c1 r2 tps=62906.966093 lat_ms=0.016
+BENCH pgbench ro c4 r2 tps=270242.734120 lat_ms=0.015
+BENCH pgbench ro c8 r2 tps=255157.306229 lat_ms=0.031
+BENCH pgbench ro c16 r2 tps=235019.564532 lat_ms=0.068
+BENCH pgbench rw c1 r2 tps=425.219750 lat_ms=2.352
+BENCH pgbench rw c4 r2 tps=1232.454556 lat_ms=3.246
+BENCH pgbench rw c8 r2 tps=2388.602450 lat_ms=3.349
+BENCH pgbench rw c16 r2 tps=4726.254836 lat_ms=3.385
+BENCH pgbench ro c1 r3 tps=59578.956920 lat_ms=0.017
+BENCH pgbench ro c4 r3 tps=270848.656345 lat_ms=0.015
+BENCH pgbench ro c8 r3 tps=258503.828112 lat_ms=0.031
+BENCH pgbench ro c16 r3 tps=236252.058116 lat_ms=0.068
+BENCH pgbench rw c1 r3 tps=422.543796 lat_ms=2.367
+BENCH pgbench rw c4 r3 tps=1227.618213 lat_ms=3.258
+BENCH pgbench rw c8 r3 tps=2403.976271 lat_ms=3.328
+BENCH pgbench rw c16 r3 tps=4679.492953 lat_ms=3.419

@@ -83,6 +83,25 @@ python3 bench/vm/compare-n.py kvm=bench/vm/results/kvm/summary.txt \
     ddcbd4c6=bench/vm/results/nos-ddcbd4c6/summary.txt mytry=out/vm-bench/results-nos-mytry/archive/run/summary.txt
 ```
 
+**A device's comparison.** The same guest on a partition of its own instead
+of a file -- under KVM the partition as the guest's raw disk, under nos given
+to the VM by its id ([A device as a guest's
+disk](../../docs/hypervisor.md#a-device-as-a-guests-disk)) -- with the two
+steps on the server's Linux that stage it and run it:
+
+```sh
+bench-host.sh device-stage /dev/disk/by-partuuid/<guid> fio kbuild pgbench
+bench-host.sh kvm-device /dev/disk/by-partuuid/<guid>     # results-kvm-device
+```
+
+`device-stage` refuses a device that is mounted, swap, held by an array or a
+mapping, or smaller than `golden.raw`; gives the whole of it back
+(`blkdiscard`), writes `golden.raw` over it byte for byte and reads it back,
+and cuts the suite in it as `nos-stage` does. Staged again before nos's run,
+the device is given there by `hv create benchdev /lib/hvboot mem=8192 cpus=4
+net disk=part:<guid> force` -- `force`, since what it holds is the image's
+partition table.
+
 Every run stops the VMs nos runs (by their power buttons, as `hv stop` does)
 and reboots the server twice; `nos-run.sh ... 1` starts the stopped VMs again.
 `nos-install update --boot-once` keeps the server's kernel line, `/etc/rc` and
@@ -111,8 +130,11 @@ E-cores, a Samsung MZVL2512HCJQ NVMe), October and November 2026:
 | `nos-96281a83` | the same, the idle task looking at its queue with its flag up, and a disk's pass bound by the data it moves |
 | `nos-dc529775` | the third round (vm-perf3), the short suite -- sysbench, perf-bench, cyclictest, fio: a guest's CPUs at EPP 0, the disk's task serving its device, guest memory copied through the huge pool's window, the ICR, TSC-deadline and HLT exits answered in the world switch, C6 for the idle CPUs no guest holds, growth ahead of a guest's stream of writes |
 | `nos-dc529775-fio` | the same build again, fio alone: the first run's 1 MiB reads and writes (97%, 39%) were the device's state, back at 149% and 127% here |
+| `kvm-device` | the same QEMU with the guest's disk a partition of its own, raw (`kvm-device`: p6 of the disk nos's root is not on, 5 November) -- the reference for a device |
+| `nos-21b67b1e-device` | the guest's disk that partition, given to the VM by its id (`hv-local-disks`): fio, the kernel build and pgbench |
 
 `results/comparison.md` is `compare-n.py` over the reference and the runs
-that changed something. The same code run twice moves some numbers by 5-10%
+that changed something; `results/comparison-device.md` the two on a device,
+beside the file runs before them. The same code run twice moves some numbers by 5-10%
 (4k random I/O at QD32, the fdatasync job's tail), so a change is to be read
 across runs, not off one.

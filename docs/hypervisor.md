@@ -2000,6 +2000,16 @@ never touches`). The `vm` provider's `devices`, `disk_attach` and
 "Create" offers the devices that may be given, saying why a refused one
 was.
 
+**On the EX44** (5 November; `bench/vm/results/comparison-device.md`, one
+run each): the bench's Ubuntu guest on a 15 GiB partition of its own, under
+KVM as a raw disk and under nos given by its id, on the same CPUs. Against
+KVM on that partition nos's first write of a new file ran at 97% -- on a file
+of nos's root it ran at 78-80% of KVM -- its 4k reads at QD1 at 101% and at
+QD32 at 147%, its 1 MiB reads and writes at 100% and 95%, the kernel build at
+99%, pgbench's read-write at 111-161%; its 4k writes at QD1 at 90% and at
+QD32 at 71% (169k IOPS against 238k), the one row where KVM gained more from
+the partition than nos did.
+
 Its gate is `scripts/hv-device-test.py` (x86-64): two boots over one root
 with two NVMe drives beside it, one partitioned by the test and one blank.
 The first boot gives each its id and has `hv devices` say what is on it,
