@@ -200,7 +200,11 @@ impl State {
         };
         /* A connection of the slot's own buffer, or one that fetches in
          * bulk: its own buffer and the window scaled to it. */
-        let receive = if r.bool() { Receive::Bulk } else { Receive::Small };
+        let receive = match r.u8() % 3 {
+            0 => Receive::Small,
+            1 => Receive::Bulk,
+            _ => Receive::Both,
+        };
         let nic = self.nic;
         let ip = self.peer_ip;
         let app = App::spawn("connect", r.below(4) as u32,
