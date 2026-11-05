@@ -41,7 +41,11 @@ from the same changes.
 
 ## What changes
 
-**T1, bulk both ways for an active open, and for modules.** `TCP.connect`'s
+**T1, bulk both ways for an active open, and for modules** -- done on
+branch `ipc-raft`: `Receive::Both`, `kernel_tcp_connect_bulk`,
+`kcore::tcp::TcpStream::connect_bulk`, and net-fuzz's `tcp` target opening
+with it; the throughput between the AX41 and the EX44 is still to measure.
+`TCP.connect`'s
 `Receive::Bulk` becomes 512 KiB each way from the heap, the window scaled,
 as `bind_bulk`'s connections have. kcore gets `TcpStream::connect_bulk`
 over a `kernel_tcp_connect` that says which buffers it wants. Measured

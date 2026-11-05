@@ -11,7 +11,9 @@
 //! a round trip is 130 KiB/s at 62 ms -- what `hv forward` carried between
 //! the EX44 and a browser. One this machine opens to fetch in bulk asks for
 //! more (`Receive::Bulk`) -- a receive buffer of up to 512 KiB from the heap,
-//! and its window scaled to match (RFC 7323) when the peer agrees; a listener
+//! and its window scaled to match (RFC 7323) when the peer agrees -- and one
+//! that sends as much as it takes in, a cluster's link between hosts, asks
+//! for that much each way (`Receive::Both`); a listener
 //! that relays in bulk (`Buffers::Bulk`) has every connection it accepts
 //! given bulk buffers both ways, as `accept` hands it out, its window scaled
 //! from the SYN-ACK on when the peer's SYN offers to.
@@ -209,17 +211,24 @@ fn before_eq(a: u32, b: u32) -> bool {
 
 /* ---- what a connection may take in ---- */
 
-/// How much a connection may take in before its program reads it.
+/// How much an active open buffers: what it may take in before its program
+/// reads it, and what it may have sent and not yet had acknowledged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Receive {
-    /// The slot's own 8 KiB, the window unscaled: what a connection that
-    /// talks rather than fetches -- a shell, a request and its answer --
-    /// needs.
+    /// The slot's own 8 KiB each way, the window unscaled: what a
+    /// connection that talks rather than fetches -- a shell, a request and
+    /// its answer -- needs.
     Small,
-    /// A buffer from the heap, as big as one comes (`BULK_SIZES`), and the
-    /// window scaled to it when the peer agrees: a download. The slot's own
-    /// when the heap has none to give, or `MAX_BULK` are out already.
+    /// A receive buffer from the heap, as big as one comes (`BULK_SIZES`),
+    /// and the window scaled to it when the peer agrees: a download, whose
+    /// request fits the slot's own 8 KiB to send. The slot's own when the
+    /// heap has none to give, or `MAX_BULK` are out already.
     Bulk,
+    /// Bulk buffers both ways: a link that sends as much as it takes in --
+    /// two hosts of a cluster, whose 8 KiB in flight would hold a 1 GbE
+    /// link at a 0.3 ms round trip to some 27 MB/s. Each the slot's own
+    /// when the heap has none to give, or `MAX_BULK` are out already.
+    Both,
 }
 
 /// How many bulk buffers are out.
@@ -1982,10 +1991,11 @@ impl Tcp {
             return None;
         }
 
-        /* A bulk buffer comes from the heap before any lock is taken -- and,
-         * should the connect go no further, goes back after the last one is
-         * let go of: it is the first thing here, so the last dropped. */
-        let bulk = if receive == Receive::Bulk { BulkBuf::new() } else { None };
+        /* Bulk buffers come from the heap before any lock is taken -- and,
+         * should the connect go no further, go back after the last one is
+         * let go of: they are the first things here, so the last dropped. */
+        let bulk = if receive != Receive::Small { BulkBuf::new() } else { None };
+        let send_bulk = if receive == Receive::Both { BulkBuf::new() } else { None };
 
         /* Resolved before any lock is taken: it sleeps. Off-subnet goes to
          * the gateway. */
@@ -2055,6 +2065,10 @@ impl Tcp {
             inner.wscale_offer = Some(wscale_for(bulk.0.len()));
             inner.recv_buf.attach(bulk);
             inner.rcv_wnd = inner.recv_buf.free() as u32;
+        }
+        /* Nothing is in the send buffer before the SYN */
+        if let Some(bulk) = send_bulk {
+            inner.send_buf.attach(bulk);
         }
 
         self.send_segment(&mut inner, seg::SYN, &[]);

@@ -119,6 +119,16 @@ impl TcpStream {
         if conn.is_null() { None } else { Some(TcpStream { conn }) }
     }
 
+    /// `connect`, with bulk buffers both ways -- up to 512 KiB each, from
+    /// the heap, the window scaled when the peer offers to: a connection that
+    /// sends as much as it takes in, which 8 KiB in flight would hold to
+    /// some 27 MB/s at a data centre's 0.3 ms round trip. The slot's own 8
+    /// KiB where the heap has none to give.
+    pub fn connect_bulk(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
+        let conn = tcp::kernel_tcp_connect_bulk(nic.handle(), ip, port);
+        if conn.is_null() { None } else { Some(TcpStream { conn }) }
+    }
+
     /// Sends the whole buffer, waiting for room as long as it takes; false
     /// if the connection failed part way.
     pub fn send_all(&mut self, buf: &[u8]) -> bool {

@@ -251,6 +251,24 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
     }
 }
 
+/// `kernel_tcp_connect`, with bulk buffers both ways (`Receive::Both`): for a
+/// module whose connection carries as much as it takes in -- the cluster's
+/// link between hosts. Each buffer the slot's own when the heap has none.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let nic = match Nic::from_handle(dev) {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+    match TCP.connect(&nic, ip, port, 0, Receive::Both) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
 /// A download, for a module: what `url` answers with, by HTTP or HTTPS, in a
 /// new file at `path`, through the image's own client -- TLS, and the bulk
 /// receive window `kernel_tcp_connect` does not give -- `progress` called

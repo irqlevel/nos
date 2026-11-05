@@ -25,6 +25,11 @@ unsafe extern "C" {
     /// An active open to ip:port (host byte order) through the device, from
     /// an ephemeral port: null when nothing answered in time. Sleeps.
     pub safe fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> *mut c_void;
+    /// `kernel_tcp_connect`, with bulk buffers both ways -- up to 512 KiB
+    /// each, from the heap, the window scaled when the peer offers to: a
+    /// connection that sends as much as it takes in. Each the slot's own
+    /// 8 KiB when the heap has none to give.
+    pub safe fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> *mut c_void;
     pub safe fn kernel_tcp_accept(listener: *mut c_void, timeout_ms: u64) -> *mut c_void;
     pub safe fn kernel_tcp_close(conn: *mut c_void);
     /// A RST instead of the FIN exchange: the slot comes back at once, not
