@@ -16,15 +16,102 @@
 //! - a member stands only once its election timer has run out since it
 //!   last started over -- a vote given, a leader heard, a term changed;
 //! - no member takes a message from another as one that cannot be;
+//! - a read its disk failed stops a member: nothing it decided on it handed
+//!   out, no `Ready` after it -- the member is crashed and started again;
 //! - and, once the network is healed and every member is up, a leader and
-//!   new entries committed on every voter within so many ticks.
+//!   new entries committed on every voter within so many ticks, and every
+//!   read asked of a leader still leading in its term answered.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
 
 use raft::{
-    Body, ChangeKind, ConfChange, Config, Entry, EntryKind, MemStorage, Message, NodeId, RawNode, Role, Snapshot,
-    SnapshotBuilder, SnapshotData, Storage,
+    Body, ChangeKind, ConfChange, Config, Entry, EntryKind, MemStorage, Message, NodeId, RaftState, RawNode, Role,
+    Snapshot, SnapshotBuilder, SnapshotData, Storage, StorageError,
 };
+
+/// A member's disk: a `MemStorage` that, in some runs, fails a read now and
+/// then -- a term or entries asked for, answered `Corrupt` -- while armed,
+/// which it is only inside the member's own work (a tick, a message, a
+/// `Ready`): what the checks read of it never fails.
+#[derive(Debug)]
+pub struct Disk {
+    pub mem: MemStorage,
+    /// One read in this many fails; 0, none.
+    fail_one_in: u64,
+    rng: Cell<u64>,
+    armed: Cell<bool>,
+    /// Reads failed since the last look.
+    failed: Cell<u64>,
+}
+
+impl Disk {
+    pub fn new(mem: MemStorage, fail_one_in: u64, seed: u64) -> Disk {
+        Disk { mem, fail_one_in, rng: Cell::new(seed), armed: Cell::new(false), failed: Cell::new(0) }
+    }
+
+    fn arm(&self, on: bool) {
+        self.armed.set(on);
+    }
+
+    fn take_failed(&self) -> u64 {
+        self.failed.replace(0)
+    }
+
+    fn fails(&self) -> bool {
+        if !self.armed.get() || self.fail_one_in == 0 {
+            return false;
+        }
+        let r = mix(self.rng.get(), 1);
+        self.rng.set(r);
+        if r % self.fail_one_in == 0 {
+            self.failed.set(self.failed.get() + 1);
+            return true;
+        }
+        false
+    }
+}
+
+impl Deref for Disk {
+    type Target = MemStorage;
+    fn deref(&self) -> &MemStorage {
+        &self.mem
+    }
+}
+
+impl DerefMut for Disk {
+    fn deref_mut(&mut self) -> &mut MemStorage {
+        &mut self.mem
+    }
+}
+
+impl Storage for Disk {
+    fn initial_state(&self) -> Result<RaftState, StorageError> {
+        self.mem.initial_state()
+    }
+    fn entries(&self, lo: u64, hi: u64, max_bytes: u64, out: &mut Vec<Entry>) -> Result<(), StorageError> {
+        if self.fails() {
+            return Err(StorageError::Corrupt);
+        }
+        self.mem.entries(lo, hi, max_bytes, out)
+    }
+    fn term(&self, index: u64) -> Result<u64, StorageError> {
+        if self.fails() {
+            return Err(StorageError::Corrupt);
+        }
+        self.mem.term(index)
+    }
+    fn first_index(&self) -> u64 {
+        self.mem.first_index()
+    }
+    fn last_index(&self) -> u64 {
+        self.mem.last_index()
+    }
+    fn snapshot(&self) -> Result<Snapshot, StorageError> {
+        self.mem.snapshot()
+    }
+}
 
 use crate::rng::{hash_bytes, mix, Rng};
 
@@ -39,9 +126,12 @@ pub struct Params {
     pub max_bytes_per_msg: u64,
     pub max_inflight_msgs: usize,
     pub snapshot_piece_bytes: usize,
+    pub max_uncommitted_entries: u64,
     /// In a hundred messages delivered at random, lost and doubled.
     pub drop_pct: u64,
     pub dup_pct: u64,
+    /// One read of a disk in this many fails; 0, none.
+    pub read_fail_one_in: u64,
 }
 
 impl Params {
@@ -57,23 +147,29 @@ impl Params {
             max_bytes_per_msg: 64 * 1024,
             max_inflight_msgs: 16,
             snapshot_piece_bytes: 256,
+            max_uncommitted_entries: 256,
             drop_pct: 0,
             dup_pct: 0,
+            read_fail_one_in: 0,
         }
     }
 
     pub fn random(rng: &mut Rng) -> Params {
+        let max_entries_per_msg = rng.range(1, 8) as usize;
         Params {
             pre_vote: rng.chance(60),
             check_quorum: rng.chance(60),
             election_ticks: rng.range(4, 15) as u32,
             heartbeat_ticks: rng.range(1, 2) as u32,
-            max_entries_per_msg: rng.range(1, 8) as usize,
+            max_entries_per_msg,
             max_bytes_per_msg: rng.range(16, 4096),
             max_inflight_msgs: rng.range(1, 8) as usize,
             snapshot_piece_bytes: rng.range(16, 600) as usize,
+            /* Small at times: a follower then takes appends in part. */
+            max_uncommitted_entries: if rng.chance(30) { rng.range(max_entries_per_msg as u64, 24) } else { 256 },
             drop_pct: rng.below(20),
             dup_pct: rng.below(10),
+            read_fail_one_in: if rng.chance(20) { rng.range(30, 3000) } else { 0 },
         }
     }
 }
@@ -93,9 +189,9 @@ const SM_BYTES: usize = 16;
 pub struct Member {
     pub id: NodeId,
     /// None while it is down.
-    pub node: Option<RawNode<MemStorage>>,
+    pub node: Option<RawNode<Disk>>,
     /// Its disk while it is down.
-    pub disk: Option<MemStorage>,
+    pub disk: Option<Disk>,
     pub sm: Sm,
     /// Ticks since its election timer last started over, as the checks
     /// count them.
@@ -129,6 +225,11 @@ pub struct Sim {
     committed: BTreeMap<u64, (u64, u64, u64)>,
     state_at: BTreeMap<u64, u64>,
     reads: BTreeMap<(NodeId, u64), u64>,
+    /// Reads asked of a leader, by the term it led in: each to be answered
+    /// while it leads in it and the group is healthy.
+    leader_reads: BTreeMap<(NodeId, u64), u64>,
+    /// Members stopped by a read their disk failed.
+    pub faults: u64,
     /// Every read asked, confirmed or not: a doubled answer comes again.
     asked: BTreeSet<(NodeId, u64)>,
     max_committed: u64,
@@ -206,6 +307,8 @@ impl Sim {
             committed: BTreeMap::new(),
             state_at: BTreeMap::new(),
             reads: BTreeMap::new(),
+            leader_reads: BTreeMap::new(),
+            faults: 0,
             asked: BTreeSet::new(),
             max_committed: 0,
             to_retire: BTreeSet::new(),
@@ -235,7 +338,7 @@ impl Sim {
         c.max_bytes_per_msg = self.p.max_bytes_per_msg;
         c.max_inflight_msgs = self.p.max_inflight_msgs;
         c.snapshot_piece_bytes = self.p.snapshot_piece_bytes;
-        c.max_uncommitted_entries = 256;
+        c.max_uncommitted_entries = self.p.max_uncommitted_entries;
         c.seed = mix(self.seed, id);
         c
     }
@@ -243,6 +346,7 @@ impl Sim {
     /// A member over `disk`, started.
     pub fn add(&mut self, id: NodeId, disk: MemStorage) {
         let sm = sm_of_disk(&disk);
+        let disk = Disk::new(disk, self.p.read_fail_one_in, mix(self.seed, id ^ 0xD15C));
         match RawNode::new(self.config(id), disk) {
             Ok(node) => {
                 self.members.insert(id, Member { id, node: Some(node), disk: None, sm, since_reset: 0, retired: false });
@@ -267,11 +371,11 @@ impl Sim {
         self.members.insert(m.id, m);
     }
 
-    pub fn node(&self, id: NodeId) -> Option<&RawNode<MemStorage>> {
+    pub fn node(&self, id: NodeId) -> Option<&RawNode<Disk>> {
         self.members.get(&id).and_then(|m| m.node.as_ref())
     }
 
-    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut RawNode<MemStorage>> {
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut RawNode<Disk>> {
         self.members.get_mut(&id).and_then(|m| m.node.as_mut())
     }
 
@@ -319,7 +423,9 @@ impl Sim {
         if let (Some(node), false) = (m.node.as_mut(), m.retired) {
             let before = node.stats();
             let (r0, t0, v0) = (node.role(), node.term(), node.vote());
+            node.storage().arm(true);
             node.tick();
+            node.storage().arm(false);
             m.since_reset += 1;
             let after = node.stats();
             let stood = after.pre_campaigns + after.campaigns > before.pre_campaigns + before.campaigns;
@@ -338,6 +444,7 @@ impl Sim {
             }
         }
         self.put(m);
+        self.check_fault(id);
     }
 
     /// Message `i` of the network taken off it -- doubled or lost at the
@@ -370,7 +477,10 @@ impl Sim {
             if self.trace {
                 eprintln!("[{}] deliver {:?}", self.steps, msg);
             }
-            if let Err(raft::Error::Invalid) = node.step(msg) {
+            node.storage().arm(true);
+            let stepped = node.step(msg);
+            node.storage().arm(false);
+            if let Err(raft::Error::Invalid) = stepped {
                 self.fail(format!("member {} refused a message as one that cannot be", to));
             }
             let (r1, t1, v1) = (node.role(), node.term(), node.vote());
@@ -382,6 +492,7 @@ impl Sim {
             }
         }
         self.put(m);
+        self.check_fault(to);
     }
 
     /// What member `id` has to do, done as its program would: written,
@@ -397,7 +508,14 @@ impl Sim {
             self.put(m);
             return;
         }
+        node.storage().arm(true);
         let rd = node.ready();
+        node.storage().arm(false);
+        if node.fault().is_some() || node.storage().failed.get() > 0 {
+            self.put(m);
+            self.check_fault(id);
+            return;
+        }
         if let Some(ss) = rd.soft_state {
             if ss.role == Role::Leader {
                 let term = node.term();
@@ -435,6 +553,7 @@ impl Sim {
             self.apply(id, term_now, &mut m.sm, e);
         }
         for rs in &rd.read_states {
+            self.leader_reads.remove(&(id, rs.ctx));
             match self.reads.remove(&(id, rs.ctx)) {
                 Some(need) if rs.index < need => self.fail(format!(
                     "member {}'s read {} confirmed at {}, behind {} committed before it was asked", id, rs.ctx, rs.index, need)),
@@ -510,7 +629,7 @@ impl Sim {
         }
     }
 
-    fn check_leader(&mut self, id: NodeId, term: u64, node: &RawNode<MemStorage>) {
+    fn check_leader(&mut self, id: NodeId, term: u64, node: &RawNode<Disk>) {
         match self.leaders.get(&term) {
             Some(&other) if other != id => {
                 self.fail(format!("two leaders in term {}: members {} and {}", term, other, id));
@@ -571,6 +690,10 @@ impl Sim {
                 m.disk = Some(node.into_storage());
             }
         }
+        /* The reads asked of it are gone with what it had in memory: it may
+         * lead again in the same term, a vote it had not written given
+         * again, and owes them nothing. */
+        self.leader_reads.retain(|(m, _), _| *m != id);
         self.note(&format!("crash {}", id));
     }
 
@@ -599,11 +722,57 @@ impl Sim {
             return Err(format!("member {} back with nothing under its old id: refused, as a new incarnation is a new member", id));
         }
         self.crash(id);
+        let disk = Disk::new(disk, self.p.read_fail_one_in, mix(self.seed, id ^ 0x5EED));
         if let Some(m) = self.members.get_mut(&id) {
             m.disk = Some(disk);
         }
         self.restart(id);
         Ok(())
+    }
+
+    /// Whether member `id`'s disk failed a read in what it just did: if so
+    /// the member must have stopped on it -- `fault` said, no `Ready` left
+    /// -- and it is crashed, to be started again over its disk.
+    fn check_fault(&mut self, id: NodeId) {
+        let Some(node) = self.members.get(&id).and_then(|m| m.node.as_ref()) else { return };
+        let failed = node.storage().take_failed();
+        let fault = node.fault();
+        if failed > 0 && fault.is_none() {
+            self.fail(format!("member {}'s disk failed {} reads and the member went on", id, failed));
+            return;
+        }
+        if fault.is_none() {
+            return;
+        }
+        if node.has_ready() {
+            self.fail(format!("member {} stopped by a failed read still has a Ready", id));
+        }
+        self.faults += 1;
+        self.crash(id);
+        self.note(&format!("member {} stopped by a failed read: {:?}", id, fault));
+    }
+
+    /// Once healed and converged: an election's time and more of a healthy
+    /// group, and then every read asked of a member that still leads in the
+    /// term it was asked in answered -- a round whose own heartbeats were
+    /// lost answered by later ones.
+    fn reads_answered(&mut self) -> bool {
+        for _ in 0..2 * u64::from(self.p.election_ticks) + 4 {
+            for id in self.live() {
+                self.tick(id);
+            }
+            self.flush(64);
+        }
+        let pending: Vec<((NodeId, u64), u64)> = self.leader_reads.iter().map(|(k, t)| (*k, *t)).collect();
+        for ((id, ctx), term) in pending {
+            let leading = self.node(id).is_some_and(|n| n.role() == Role::Leader && n.term() == term);
+            if leading {
+                self.fail(format!("read {} asked of member {}, leading in term {} since, not answered in a healthy group",
+                                  ctx, id, term));
+                return false;
+            }
+        }
+        true
     }
 
     pub fn propose(&mut self, id: NodeId) -> Option<u64> {
@@ -637,10 +806,15 @@ impl Sim {
         let ctx = self.next_ctx;
         self.next_ctx += 1;
         let need = self.max_committed;
-        let ok = self.node_mut(id)?.read_index(ctx).is_ok();
+        let node = self.node_mut(id)?;
+        let ok = node.read_index(ctx).is_ok();
+        let leading = (node.role() == Role::Leader).then(|| node.term());
         if ok {
             self.reads.insert((id, ctx), need);
             self.asked.insert((id, ctx));
+            if let Some(term) = leading {
+                self.leader_reads.insert((id, ctx), term);
+            }
         }
         ok.then_some(ctx)
     }
@@ -919,6 +1093,16 @@ impl Sim {
         self.heal();
         self.p.drop_pct = 0;
         self.p.dup_pct = 0;
+        /* Healthy disks too. */
+        self.p.read_fail_one_in = 0;
+        for m in self.members.values_mut() {
+            if let Some(n) = m.node.as_mut() {
+                n.storage_mut().fail_one_in = 0;
+            }
+            if let Some(d) = m.disk.as_mut() {
+                d.fail_one_in = 0;
+            }
+        }
         for id in self.crashed() {
             self.restart(id);
         }
@@ -937,7 +1121,7 @@ impl Sim {
                 if !voters.is_empty()
                     && voters.iter().all(|v| !live.contains(v) || self.members.get(v).is_some_and(|m| m.sm.applied >= index))
                 {
-                    return true;
+                    return self.reads_answered();
                 }
             }
             if probe.is_none() || round % 64 == 63 {

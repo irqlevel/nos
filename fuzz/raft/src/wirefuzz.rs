@@ -96,13 +96,46 @@ fn read_back(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// An append about as large as a message is -- just under, or just past --
+/// in entries of odd sizes: written into an empty buffer, it must take no
+/// block past the kernel heap's (held by `guarded`), and be refused past
+/// the limit.
+fn near_limit(r: &mut Rng) -> Result<(), String> {
+    let n = r.range(2, 200);
+    let fixed = wire::HEADER_BYTES + 28 + n as usize * 21;
+    let target = (wire::MAX_MESSAGE_BYTES - fixed) as u64 + r.below(64) - 32;
+    let mut left = target;
+    let mut entries = Vec::new();
+    for k in 0..n {
+        let most = left.min(wire::MAX_ENTRY_BYTES as u64);
+        let size = if k + 1 == n { most } else { r.below(most.min(2 * target / n) + 1) };
+        left -= size;
+        entries.push(Entry { term: 1, index: 1 + k, kind: EntryKind::Normal, data: vec![k as u8; size as usize] });
+    }
+    let m = Message { from: 1, to: 2, term: 1, body: Body::Append { prev_index: 0, prev_term: 0, commit: 0, entries } };
+    let len = wire::encoded_len(&m);
+    let mut b = Vec::new();
+    match wire::encode(&m, &mut b) {
+        Ok(()) if len <= wire::MAX_MESSAGE_BYTES && b.len() == len => {}
+        Err(_) if len > wire::MAX_MESSAGE_BYTES && b.is_empty() => {}
+        other => return Err(format!("an append of {} bytes: {:?}, {} written", len, other, b.len())),
+    }
+    Ok(())
+}
+
 /// `iterations` rounds from `seed`.
 pub fn run(seed: u64, iterations: u64) -> Result<(), String> {
     let mut r = Rng::new(seed);
     for i in 0..iterations {
+        if i % 50 == 0 {
+            near_limit(&mut r).map_err(|e| format!("iteration {}: {}", i, e))?;
+        }
         let m = message(&mut r);
         let mut b = Vec::new();
         wire::encode(&m, &mut b).map_err(|e| format!("iteration {}: {:?} not written: {:?}", i, m, e))?;
+        if wire::encoded_len(&m) != b.len() {
+            return Err(format!("iteration {}: {:?} measured {} and written in {}", i, m, wire::encoded_len(&m), b.len()));
+        }
         match wire::decode(&b) {
             Ok(back) if back == m => {}
             other => return Err(format!("iteration {}: {:?} read back as {:?}", i, m, other)),

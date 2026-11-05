@@ -52,6 +52,9 @@ const MAX_APPLY_BYTES: u64 = 1024 * 1024;
 const MAX_INFLIGHT_MSGS_LIMIT: usize = 4096;
 /// Reads waiting for their round, at most: past them a read is refused.
 const MAX_PENDING_READS: usize = 1024;
+/// An election timeout's ticks, at most: the timeout drawn, up to twice it,
+/// is counted in a u32.
+const MAX_ELECTION_TICKS: u32 = 1 << 24;
 /// Messages one `Ready` hands out, at most: some 272 KiB of them, a block
 /// of the kernel's heap (`Message` is 136 bytes).
 const MAX_OUTBOX: usize = 2048;
@@ -59,7 +62,7 @@ const _: () = assert!(MAX_OUTBOX * core::mem::size_of::<Message>() <= 512 * 1024
 /// Past every term and every index a group will ever reach -- a term a
 /// microsecond for longer than the sun has: a message naming one is
 /// refused, so nothing done with them can overflow.
-const MAX_TERM_OR_INDEX: u64 = 1 << 62;
+pub(crate) const MAX_TERM_OR_INDEX: u64 = 1 << 62;
 
 /// How a member behaves: its id, its timing in ticks, and the limits it
 /// keeps -- every one of them a bound on memory or on a message.
@@ -132,8 +135,17 @@ impl Config {
         if self.heartbeat_ticks == 0 || self.election_ticks <= self.heartbeat_ticks {
             return bad("an election timeout no longer than a heartbeat");
         }
+        /* The timeout drawn is up to twice this, and a u32. */
+        if self.election_ticks > MAX_ELECTION_TICKS {
+            return bad("an election timeout of more ticks than a timer counts");
+        }
         if self.max_entries_per_msg == 0 || self.max_entries_per_msg > wire::MAX_ENTRIES {
             return bad("entries a message carries");
+        }
+        /* A follower takes an append's entries while they fit what may wait
+         * to be written: one append must fit it. */
+        if self.max_entries_per_msg as u64 > self.max_uncommitted_entries {
+            return bad("an append of more entries than may wait to be written");
         }
         /* An append carries no more than this many bytes of entries but for
          * its first, and no entry is larger than an entry the wire carries:
@@ -272,7 +284,8 @@ pub struct Stats {
     pub stale: u64,
     /// Vote requests not taken while a leader is heard from.
     pub ignored_in_lease: u64,
-    /// Appends not taken in for room: their leader sends them again.
+    /// Appends not taken in whole for room: their leader sends again what
+    /// was left.
     pub dropped: u64,
     /// Messages not sent: more than a `Ready` hands out waited for one.
     pub unsent: u64,
@@ -280,6 +293,9 @@ pub struct Stats {
     pub campaigns: u64,
     pub leaderships: u64,
     pub reads_refused: u64,
+    /// Snapshots taken in part and given up: no piece for two election
+    /// timeouts.
+    pub snapshots_abandoned: u64,
 }
 
 /// What `ready` handed out, for `advance` to mark done.
@@ -297,6 +313,10 @@ struct Incoming {
     meta: SnapshotMeta,
     total: u64,
     built: SnapshotBuilder,
+    /// Ticks since its last piece: dropped at two election timeouts, a
+    /// transfer its leader has given up -- which a term changing would
+    /// otherwise be all that frees.
+    idle: u32,
 }
 
 /// A round of reads: the requests made up to `index`, and the voters that
@@ -366,6 +386,11 @@ impl<S: Storage> RawNode<S> {
             return Err(Error::Storage(StorageError::Corrupt));
         }
         let hs = state.hard_state;
+        /* A term no group reaches, as a message's is refused: nothing done
+         * with it then overflows. */
+        if hs.term >= MAX_TERM_OR_INDEX {
+            return Err(Error::Storage(StorageError::Corrupt));
+        }
         let log = RaftLog::new(storage, hs.commit).map_err(Error::Storage)?;
         let base = Membership::from_state(&state.conf);
         let mut node = RawNode {
@@ -473,7 +498,7 @@ impl<S: Storage> RawNode<S> {
     /// The membership as of entry `index` -- what a snapshot taken there
     /// says -- or None for an index the log no longer has.
     pub fn conf_state_at(&self, index: u64) -> Option<ConfState> {
-        if index + 1 < self.log.first_index() || index > self.log.last_index() {
+        if index > self.log.last_index() || index + 1 < self.log.first_index() {
             return None;
         }
         Some(self.changes.at(index).unwrap_or(&self.base).to_state())
@@ -537,8 +562,45 @@ impl<S: Storage> RawNode<S> {
 
     /* ---- what it is asked ---- */
 
+    /// The first read its storage failed. From then on the member does
+    /// nothing -- every call refused with it, no `Ready` handed out -- since
+    /// what it read cannot be believed, and whatever it decided on it (a
+    /// vote given on a last term it could not read) is never written or
+    /// sent. It is started again over its storage, with `RawNode::new`.
+    pub fn fault(&self) -> Option<StorageError> {
+        self.log.fault()
+    }
+
+    /// `f`, refused once the storage has failed a read; and the failure,
+    /// if a read `f` made failed.
+    fn checked<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if let Some(e) = self.fault() {
+            return Err(Error::Storage(e));
+        }
+        let out = f(self);
+        match self.fault() {
+            Some(e) => Err(Error::Storage(e)),
+            None => out,
+        }
+    }
+
     /// The time has moved on by a tick.
     pub fn tick(&mut self) {
+        let _ = self.checked(|n| {
+            n.tick_now();
+            Ok(())
+        });
+    }
+
+    fn tick_now(&mut self) {
+        let give_up = self.cfg.election_ticks.saturating_mul(2);
+        if let Some(inc) = self.incoming.as_mut() {
+            inc.idle = inc.idle.saturating_add(1);
+            if inc.idle >= give_up {
+                self.incoming = None;
+                self.stats.snapshots_abandoned += 1;
+            }
+        }
         match self.role {
             Role::Leader => self.tick_leader(),
             _ => self.tick_election(),
@@ -547,6 +609,10 @@ impl<S: Storage> RawNode<S> {
 
     /// Stand now, as a timeout would have it: with PreVote, ask first.
     pub fn campaign(&mut self) -> Result<(), Error> {
+        self.checked(Self::campaign_now)
+    }
+
+    fn campaign_now(&mut self) -> Result<(), Error> {
         if !self.promotable() {
             return Err(Error::UnknownNode);
         }
@@ -559,6 +625,10 @@ impl<S: Storage> RawNode<S> {
     /// `data` appended to the log, to be committed: its index. The leader's
     /// alone to do.
     pub fn propose(&mut self, data: Vec<u8>) -> Result<u64, Error> {
+        self.checked(|n| n.propose_now(data))
+    }
+
+    fn propose_now(&mut self, data: Vec<u8>) -> Result<u64, Error> {
         self.check_proposal(data.len())?;
         let index = self.log.last_index() + 1;
         self.log.append(&[Entry { term: self.term, index, kind: EntryKind::Normal, data }]);
@@ -569,6 +639,10 @@ impl<S: Storage> RawNode<S> {
     /// A membership change appended to the log -- in force at once, on the
     /// leader and on each member as it appends it: its index.
     pub fn propose_change(&mut self, cc: ConfChange) -> Result<u64, Error> {
+        self.checked(|n| n.propose_change_now(cc))
+    }
+
+    fn propose_change_now(&mut self, cc: ConfChange) -> Result<u64, Error> {
         self.check_proposal(0)?;
         if self.log.committed < self.term_start {
             return Err(Error::ChangeRefused(Refusal::NotYetCommittedInTerm));
@@ -601,6 +675,9 @@ impl<S: Storage> RawNode<S> {
         if bytes > self.cfg.max_entry_bytes {
             return Err(Error::TooLarge);
         }
+        if self.log.last_index() + 1 >= MAX_TERM_OR_INDEX {
+            return Err(Error::Busy);
+        }
         if self.log.last_index() - self.log.committed >= self.cfg.max_uncommitted_entries {
             return Err(Error::Busy);
         }
@@ -612,9 +689,13 @@ impl<S: Storage> RawNode<S> {
     /// new as everything committed before it was asked. A follower asks the
     /// leader; nothing comes back if the leadership changes meanwhile.
     pub fn read_index(&mut self, ctx: u64) -> Result<(), Error> {
+        self.checked(|n| n.read_index_now(ctx))
+    }
+
+    fn read_index_now(&mut self, ctx: u64) -> Result<(), Error> {
         if self.role == Role::Leader {
-            self.leader_read(self.id, ctx);
-            return Ok(());
+            /* One the leader has no room for is refused to its asker. */
+            return if self.leader_read(self.id, ctx) { Ok(()) } else { Err(Error::Busy) };
         }
         if self.leader == NONE {
             return Err(Error::NotLeader(NONE));
@@ -628,6 +709,10 @@ impl<S: Storage> RawNode<S> {
     /// to stand. Proposals are refused meanwhile; given up after an
     /// election's time.
     pub fn transfer_leader(&mut self, to: NodeId) -> Result<(), Error> {
+        self.checked(|n| n.transfer_leader_now(to))
+    }
+
+    fn transfer_leader_now(&mut self, to: NodeId) -> Result<(), Error> {
         if self.role != Role::Leader {
             return Err(Error::NotLeader(self.leader));
         }
@@ -673,7 +758,11 @@ impl<S: Storage> RawNode<S> {
         }
         if self.heartbeat_elapsed >= self.cfg.heartbeat_ticks {
             self.heartbeat_elapsed = 0;
-            self.broadcast_heartbeat(0);
+            /* Every heartbeat asks for the newest round of reads, as etcd's
+             * do: a round whose own heartbeats were lost is answered by the
+             * next ones, and every round before it with it. */
+            let newest = self.reads.back().map_or(0, |r| r.round);
+            self.broadcast_heartbeat(newest, true);
         }
     }
 
@@ -731,7 +820,18 @@ impl<S: Storage> RawNode<S> {
 
     /// Whether this member could win an election in the next term: nothing
     /// changes, its term and its vote included, unless a majority says yes.
+    /// Whether its next term, and a leader's first entry, would still be
+    /// short of what a group reaches: a member a peer has driven to the
+    /// edge stands no more, so that nothing it writes is past what
+    /// `RawNode::new` takes.
+    fn may_stand(&self) -> bool {
+        self.term + 1 < MAX_TERM_OR_INDEX && self.log.last_index() + 1 < MAX_TERM_OR_INDEX
+    }
+
     fn campaign_pre(&mut self) {
+        if !self.may_stand() {
+            return;
+        }
         let term = self.term;
         self.reset(term);
         self.role = Role::PreCandidate;
@@ -748,6 +848,9 @@ impl<S: Storage> RawNode<S> {
     }
 
     fn campaign_real(&mut self, transfer: bool) {
+        if !self.may_stand() {
+            return;
+        }
         let term = self.term + 1;
         self.reset(term);
         self.vote = self.id;
@@ -835,6 +938,10 @@ impl<S: Storage> RawNode<S> {
 
     /// A message from another member.
     pub fn step(&mut self, m: Message) -> Result<(), Error> {
+        self.checked(|n| n.step_now(m))
+    }
+
+    fn step_now(&mut self, m: Message) -> Result<(), Error> {
         if m.to != self.id {
             self.stats.not_for_me += 1;
             return Err(Error::NotForMe);
@@ -933,7 +1040,9 @@ impl<S: Storage> RawNode<S> {
                 for e in entries {
                     let Some(next) = expect.checked_add(1) else { return false };
                     expect = next;
-                    if e.index != expect || e.term < last_term || e.term > m.term || e.data.len() > wire::MAX_ENTRY_BYTES {
+                    if e.index != expect || !sane(e.index) || e.term < last_term || e.term > m.term
+                        || e.data.len() > wire::MAX_ENTRY_BYTES
+                    {
                         return false;
                     }
                     if e.kind == EntryKind::Change && wire::decode_change(&e.data).is_err() {
@@ -1069,10 +1178,7 @@ impl<S: Storage> RawNode<S> {
             return;
         }
         if self.log.match_term(prev_index, prev_term) {
-            let last_new = prev_index + entries.len() as u64;
-            if !self.append_entries(prev_index, &entries) {
-                return;
-            }
+            let Some(last_new) = self.append_entries(prev_index, &entries) else { return };
             /* No further than this append has shown to match the leader's:
              * what comes after it here may be another leader's. */
             self.log.commit_to(cmp::min(commit, last_new));
@@ -1085,26 +1191,34 @@ impl<S: Storage> RawNode<S> {
     }
 
     /// `entries`, after the one at `prev_index`, put in the log over
-    /// whatever they conflict with: false where they cannot be taken now.
-    fn append_entries(&mut self, prev_index: u64, entries: &[Entry]) -> bool {
-        let Some(conflict) = self.log.find_conflict(entries) else { return true };
+    /// whatever they conflict with -- all of them, or as many as there is
+    /// room for: the index of the last of them the log now has, or None
+    /// where none can be taken now.
+    fn append_entries(&mut self, prev_index: u64, entries: &[Entry]) -> Option<u64> {
+        let all = prev_index + entries.len() as u64;
+        let Some(conflict) = self.log.find_conflict(entries) else { return Some(all) };
         if conflict <= self.log.committed {
             /* A committed entry written over: no correct leader asks it. */
             self.stats.invalid += 1;
-            return false;
+            return None;
         }
-        let Ok(start) = usize::try_from(conflict - prev_index - 1) else { return false };
-        let Some(new) = entries.get(start..) else { return false };
-        if self.log.unstable_entries().len() as u64 + new.len() as u64 > self.cfg.max_uncommitted_entries {
+        let start = usize::try_from(conflict - prev_index - 1).ok()?;
+        let new = entries.get(start..)?;
+        /* What does not fit is left for the leader to send again after the
+         * last taken -- dropping it all would leave a follower that cannot
+         * take a whole append behind for good. */
+        let room = self.cfg.max_uncommitted_entries.saturating_sub(self.log.unstable_entries().len() as u64);
+        let take = new.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        if take < new.len() {
             self.stats.dropped += 1;
-            return false;
         }
+        let new = new.get(..take).filter(|n| !n.is_empty())?;
         self.truncate_changes(conflict);
         self.log.append(new);
         for e in new.iter().filter(|e| e.kind == EntryKind::Change) {
             self.apply_change_entry(e.index, &e.data);
         }
-        true
+        Some(conflict + take as u64 - 1)
     }
 
     fn handle_heartbeat(&mut self, from: NodeId, commit: u64, ctx: u64) {
@@ -1125,6 +1239,9 @@ impl<S: Storage> RawNode<S> {
             return;
         }
         let same = self.incoming.as_ref().is_some_and(|i| i.meta == meta && i.total == total);
+        if let Some(inc) = self.incoming.as_mut().filter(|_| same) {
+            inc.idle = 0;
+        }
         if !same {
             if total > self.cfg.max_snapshot_bytes {
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: true });
@@ -1134,7 +1251,7 @@ impl<S: Storage> RawNode<S> {
                 self.send(from, Body::SnapshotResp { index, next: 0, reject: false });
                 return;
             }
-            self.incoming = Some(Incoming { meta, total, built: SnapshotBuilder::new() });
+            self.incoming = Some(Incoming { meta, total, built: SnapshotBuilder::new(), idle: 0 });
         }
         let Some(inc) = self.incoming.as_mut() else { return };
         if offset != inc.built.len() {
@@ -1197,6 +1314,9 @@ impl<S: Storage> RawNode<S> {
         let ents = self.log.entries(next, last + 1, self.cfg.max_bytes_per_msg, self.cfg.max_entries_per_msg);
         let (prev_term, entries) = match (prev_term, ents) {
             (Some(t), Ok(e)) => (t, e),
+            /* A read failed: nothing is sent on it. */
+            _ if self.log.fault().is_some() => return false,
+            /* Before the log's first entry: the snapshot has it. */
             _ => return self.start_snapshot(to),
         };
         if entries.is_empty() && !allow_empty {
@@ -1221,7 +1341,7 @@ impl<S: Storage> RawNode<S> {
     }
 
     fn start_snapshot(&mut self, to: NodeId) -> bool {
-        let Ok(snapshot) = self.log.storage.snapshot() else { return false };
+        let Some(snapshot) = self.log.snapshot() else { return false };
         if snapshot.meta.index == 0 {
             return false;
         }
@@ -1249,13 +1369,15 @@ impl<S: Storage> RawNode<S> {
         }
     }
 
-    fn broadcast_heartbeat(&mut self, ctx: u64) {
+    /// A heartbeat to every member, asking for round `ctx` of reads; on the
+    /// `regular` ones, a piece of a snapshot lost on the way sent again.
+    fn broadcast_heartbeat(&mut self, ctx: u64, regular: bool) {
         let committed = self.log.committed;
         for id in self.peers() {
             let Some(pr) = self.progress.get(&id) else { continue };
             let (commit, snapshotting) = (cmp::min(pr.matched, committed), pr.state == State::Snapshot);
             self.send(id, Body::Heartbeat { commit, ctx });
-            if snapshotting && ctx == 0 {
+            if snapshotting && regular {
                 /* A piece lost on the way, sent again. */
                 self.send_snapshot_piece(id);
             }
@@ -1321,9 +1443,12 @@ impl<S: Storage> RawNode<S> {
         if pr.state == State::Replicate && pr.inflights.full() {
             pr.inflights.free_first();
         }
-        let probing = pr.state == State::Probe;
-        if pr.matched < last || probing {
-            self.maybe_send_append(from, probing);
+        /* Behind: what comes next sent, or an empty append where all of it
+         * is on its way, as etcd's are -- a follower that has not all of it
+         * (lost, or not taken for room) refuses that, and is probed from
+         * what it has. Nothing else would tell a leader it took part. */
+        if pr.matched < last || pr.state == State::Probe {
+            self.maybe_send_append(from, true);
         }
         if ctx != 0 {
             self.ack_read(from, ctx);
@@ -1378,25 +1503,27 @@ impl<S: Storage> RawNode<S> {
 
     /* ---- reads ---- */
 
-    fn leader_read(&mut self, from: NodeId, ctx: u64) {
+    /// A read asked of the leader by `from` -- itself, or a follower --
+    /// taken, or refused for room (false).
+    fn leader_read(&mut self, from: NodeId, ctx: u64) -> bool {
         if self.log.committed < self.term_start {
             /* Not knowing yet how far the log is committed: after this
              * term's first commit. */
             if self.waiting_reads.len() < MAX_PENDING_READS {
                 self.waiting_reads.push_back((from, ctx));
-            } else {
-                self.refuse_read(from, ctx);
+                return true;
             }
-            return;
+            self.refuse_read(from, ctx);
+            return false;
         }
         let index = self.log.committed;
         if self.membership.voters().len() == 1 && self.membership.is_voter(self.id) {
             self.release_read(from, ctx, index);
-            return;
+            return true;
         }
         if self.reads.len() >= MAX_PENDING_READS {
             self.refuse_read(from, ctx);
-            return;
+            return false;
         }
         /* A round of heartbeats a majority answers proves no other leader
          * was elected meanwhile: the read is as new as `index`. */
@@ -1405,27 +1532,34 @@ impl<S: Storage> RawNode<S> {
         let mut acks = BTreeSet::new();
         acks.insert(self.id);
         self.reads.push_back(ReadRound { round, index, from, ctx, acks });
-        self.broadcast_heartbeat(round);
+        self.broadcast_heartbeat(round, false);
+        true
     }
 
     fn ack_read(&mut self, from: NodeId, round: u64) {
         if !self.membership.is_voter(from) {
             return;
         }
-        let Some(at) = self.reads.iter().position(|r| r.round == round) else { return };
+        let Some(r) = self.reads.iter_mut().find(|r| r.round == round) else { return };
+        r.acks.insert(from);
+        self.release_confirmed();
+    }
+
+    /// The newest round of reads a majority of the voters has confirmed,
+    /// released, and every round asked before it: the leadership was
+    /// confirmed after they were asked. Asked again whenever the voters
+    /// change -- a round a majority of the new ones has confirmed is
+    /// answered then, with no heartbeat left to answer it.
+    fn release_confirmed(&mut self) {
         let quorum = self.membership.quorum();
-        let confirmed = {
-            let r = &mut self.reads[at];
-            r.acks.insert(from);
-            r.acks.iter().filter(|id| self.membership.is_voter(**id)).count() >= quorum
+        let membership = &self.membership;
+        let Some(at) = self.reads.iter().rposition(|r| r.acks.iter().filter(|id| membership.is_voter(**id)).count() >= quorum)
+        else {
+            return;
         };
-        if confirmed {
-            /* And every round asked before it: the leadership was confirmed
-             * after they were asked. */
-            let done: Vec<ReadRound> = self.reads.drain(..=at).collect();
-            for r in done {
-                self.release_read(r.from, r.ctx, r.index);
-            }
+        let done: Vec<ReadRound> = self.reads.drain(..=at).collect();
+        for r in done {
+            self.release_read(r.from, r.ctx, r.index);
         }
     }
 
@@ -1475,6 +1609,7 @@ impl<S: Storage> RawNode<S> {
     fn set_membership(&mut self, m: Membership) {
         self.membership = m;
         if self.role == Role::Leader {
+            self.release_confirmed();
             let last = self.log.last_index();
             let members: Vec<NodeId> = self.membership.members().collect();
             for id in &members {
@@ -1502,6 +1637,9 @@ impl<S: Storage> RawNode<S> {
 
     /// Whether there is anything for the caller to do.
     pub fn has_ready(&self) -> bool {
+        if self.fault().is_some() {
+            return false;
+        }
         self.soft_state() != self.prev_soft
             || self.hard_state() != self.prev_hard
             || !self.msgs.is_empty()
@@ -1514,6 +1652,9 @@ impl<S: Storage> RawNode<S> {
     /// What there is to do. Call `advance` once it is done, before the next
     /// `ready` and before stepping the node again.
     pub fn ready(&mut self) -> Ready {
+        if self.fault().is_some() {
+            return Ready::default();
+        }
         let soft = self.soft_state();
         let hard = self.hard_state();
         let rd = Ready {
@@ -1525,6 +1666,10 @@ impl<S: Storage> RawNode<S> {
             committed: self.log.next_committed(self.cfg.max_apply_bytes, wire::MAX_ENTRIES),
             read_states: mem::take(&mut self.read_states),
         };
+        if self.fault().is_some() {
+            /* A read for it failed: none of it is handed out. */
+            return Ready::default();
+        }
         self.prev_soft = soft;
         self.handed = Some(Handed {
             hard,
@@ -1538,6 +1683,9 @@ impl<S: Storage> RawNode<S> {
     /// The last `Ready` done: written, sent, applied.
     pub fn advance(&mut self) {
         let Some(h) = self.handed.take() else { return };
+        if self.fault().is_some() {
+            return;
+        }
         self.prev_hard = h.hard;
         if let Some(index) = h.snapshot {
             self.log.stable_snap_to(index);
