@@ -81,6 +81,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::nic::Nic;
+use kcore::once::Once;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
 use kcore::task::TaskHandle;
 use kcore::klog;
@@ -172,6 +173,9 @@ pub const HALF_OPEN_MS: u64 = 3000;
 /// a link both of whose ends are nos, which acknowledges every segment at
 /// once, so no delayed acknowledgement waits under it (plans/tcp.md, T2).
 pub const LINK_MIN_RTO_MS: u64 = 20;
+/// The longest a receive sleeps on its event before it looks again, a
+/// signal or not: what a signal missed would cost at most.
+const RX_LOOK_MS: u64 = 100;
 /// The most networks a listener answers SYNs from when it is told which
 /// (`listen_allowed`): a cluster's hosts each by its address, with room.
 pub const ALLOW_MAX: usize = 64;
@@ -816,14 +820,27 @@ impl Inner {
     }
 }
 
-/// One connection: what its own lock guards, and the two flags a waiting
-/// task reads without it.
+/// One connection: what its own lock guards, and what a waiting task reads
+/// without it.
 pub struct Conn {
     inner: PreemptSpinLock<Inner>,
     /// Data has arrived; read without the lock by a waiting task
     data_ready: AtomicBool,
     /// The state left SYN-SENT or SYN-RECEIVED
     conn_ready: AtomicBool,
+    /// What a task waiting in `recv` sleeps on: signalled each time data,
+    /// an end or a reset comes (`ready`), and by a wake. Made at `init`; a
+    /// receive before it -- or a second task receiving at once, an event
+    /// having one waiter -- polls as receives did.
+    rx: Once<kcore::sync::Event>,
+    rx_waiting: AtomicBool,
+    /// A wake asked for (`Tcp::wake`), under the lock: the receive under
+    /// way, or the next, comes back as from a timeout.
+    kicked: AtomicBool,
+    /// Bumped, under the lock, each time the slot is handed out: what a wake
+    /// is held to, so that one asked of a connection gone since reaches
+    /// nobody -- least of all the slot's next connection.
+    generation: AtomicU64,
 }
 
 impl Conn {
@@ -832,6 +849,19 @@ impl Conn {
             inner: PreemptSpinLock::new(Inner::new()),
             data_ready: AtomicBool::new(false),
             conn_ready: AtomicBool::new(false),
+            rx: Once::new(),
+            rx_waiting: AtomicBool::new(false),
+            kicked: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Data, an end or a reset has come: said to a task waiting in `recv`.
+    #[inline]
+    fn ready(&self) {
+        self.data_ready.store(true, Ordering::Release);
+        if let Some(e) = self.rx.get() {
+            e.signal();
         }
     }
 }
@@ -1175,6 +1205,15 @@ impl Tcp {
             klog!(0, "tcp: no event for the timer's task");
             return false;
         }
+        /* Each slot's receive event: one that cannot be made leaves its
+         * slot's receives polling, as they did */
+        for conn in self.conns.iter() {
+            if conn.rx.get().is_none() {
+                if let Some(event) = kcore::sync::Event::new() {
+                    drop(conn.rx.set(event));
+                }
+            }
+        }
 
         self.initialized.store(true, Ordering::Release);
         klog!(0, "tcp: initialized, up to {} connections", MAX_CONNECTIONS);
@@ -1215,6 +1254,9 @@ impl Tcp {
         inner.init();
         conn.data_ready.store(false, Ordering::Release);
         conn.conn_ready.store(false, Ordering::Release);
+        /* A new connection: no wake asked of the last reaches it */
+        conn.generation.fetch_add(1, Ordering::AcqRel);
+        conn.kicked.store(false, Ordering::Release);
         inner
     }
 }
@@ -1505,7 +1547,7 @@ impl Tcp {
                 let written = inner.recv_buf.write(data);
                 inner.rcv_nxt = inner.rcv_nxt.wrapping_add(written as u32);
                 take_ooo(inner);
-                conn.data_ready.store(true, Ordering::Release);
+                conn.ready();
             } else {
                 let kept = inner.recv_buf.put(offset, data);
                 if kept != 0 {
@@ -1824,7 +1866,7 @@ impl Tcp {
 
             inner.state = State::Closed;
             conn.conn_ready.store(true, Ordering::Release);
-            conn.data_ready.store(true, Ordering::Release);
+            conn.ready();
             return Event::Rst;
         }
 
@@ -1943,7 +1985,7 @@ impl Tcp {
                     inner.rcv_nxt = seq.wrapping_add(len).wrapping_add(1);
                     inner.state = State::CloseWait;
                     /* Wake a reader so it sees the end of the stream */
-                    conn.data_ready.store(true, Ordering::Release);
+                    conn.ready();
                     self.send_ack(inner);
                 }
             }
@@ -2311,7 +2353,7 @@ impl Tcp {
         inner.retransmit_at.clear();
         inner.need_cleanup = true;
         conn.conn_ready.store(true, Ordering::Release);
-        conn.data_ready.store(true, Ordering::Release);
+        conn.ready();
         drop(inner);
 
         klog!(0, "tcp: icmp unreachable, {} -> {} aborted", local_port, remote_port);
@@ -2778,6 +2820,9 @@ impl Tcp {
                 if inner.recv_buf.used() == 0 {
                     conn.data_ready.store(false, Ordering::Release);
                 }
+                /* A wake is had by the first receive to come back after it,
+                 * with data or without */
+                conn.kicked.store(false, Ordering::Release);
 
                 /* If what we last advertised was too small for a segment,
                  * the peer may have stopped sending. Now that the reader has
@@ -2802,11 +2847,48 @@ impl Tcp {
             if closing {
                 return 0;
             }
-            if deadline != 0 && now_ms() > deadline {
+            /* A wake: back to the caller, who has something else to do */
+            if conn.kicked.swap(false, Ordering::AcqRel) {
                 return RECV_TIMEOUT;
             }
-            poll.sleep();
+            let now = now_ms();
+            if deadline != 0 && now > deadline {
+                return RECV_TIMEOUT;
+            }
+            let wait = if deadline != 0 { (deadline - now).max(1) } else { RX_LOOK_MS }.min(RX_LOOK_MS);
+            match conn.rx.get() {
+                Some(event) if !conn.rx_waiting.swap(true, Ordering::Acquire) => {
+                    /* What came since the look above is kept by the event:
+                     * nothing is lost between the look and the sleep */
+                    event.wait_for(kcore::time::Duration::from_millis(wait));
+                    conn.rx_waiting.store(false, Ordering::Release);
+                }
+                _ => poll.sleep(),
+            }
         }
+    }
+
+    /// A task waiting in `recv` on `conn` -- or the next to -- back at once,
+    /// as from a timeout, if `generation` is still the connection's: what a
+    /// task that waits both on its connection and on something of its own
+    /// is woken by, by whoever has that something (ipcnet's queues). The
+    /// first receive to come back after it has it, with data or without.
+    pub fn wake(&'static self, conn: &'static Conn, generation: u64) {
+        {
+            let _inner = conn.inner.lock();
+            if conn.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            conn.kicked.store(true, Ordering::Release);
+        }
+        if let Some(e) = conn.rx.get() {
+            e.signal();
+        }
+    }
+
+    /// What a wake of `conn` is held to: the connection's generation.
+    pub fn generation(&'static self, conn: &'static Conn) -> u64 {
+        conn.generation.load(Ordering::Acquire)
     }
 }
 
@@ -2896,7 +2978,7 @@ impl Tcp {
                 inner.retransmit_at.clear();
                 inner.need_cleanup = true;
                 conn.conn_ready.store(true, Ordering::Release);
-                conn.data_ready.store(true, Ordering::Release);
+                conn.ready();
             }
         }
         drop(pool);
@@ -2972,7 +3054,7 @@ impl Tcp {
         inner.retransmit_at.clear();
         inner.need_cleanup = true;
         conn.conn_ready.store(true, Ordering::Release);
-        conn.data_ready.store(true, Ordering::Release);
+        conn.ready();
         /* As close: from here the slot is the cleanup timer's */
         inner.owned_by_app = false;
     }
@@ -3028,7 +3110,7 @@ impl Tcp {
                 inner.state = State::Closed;
                 inner.need_cleanup = true;
                 conn.conn_ready.store(true, Ordering::Release);
-                conn.data_ready.store(true, Ordering::Release);
+                conn.ready();
                 any_cleanup = true;
                 continue;
             }
@@ -3106,7 +3188,7 @@ impl Tcp {
                         inner.retransmit_at.clear();
                         inner.need_cleanup = true;
                         conn.conn_ready.store(true, Ordering::Release);
-                        conn.data_ready.store(true, Ordering::Release);
+                        conn.ready();
                         any_cleanup = true;
                         /* The line goes out with the lock down: a trace is
                          * synchronous output. */

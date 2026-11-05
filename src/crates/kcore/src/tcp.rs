@@ -152,6 +152,23 @@ impl Drop for TcpListener {
     }
 }
 
+/// What wakes a task waiting in `recv` on a stream -- from another task,
+/// one with something else for it to do: that receive comes back at once,
+/// as from its timeout, or the next one does. Copied freely; a wake after the
+/// stream is gone reaches nobody, the kernel holding it to the connection's
+/// generation.
+#[derive(Clone, Copy)]
+pub struct TcpWaker {
+    conn: usize,
+    generation: u64,
+}
+
+impl TcpWaker {
+    pub fn wake(&self) {
+        tcp::kernel_tcp_wake(self.conn as *mut c_void, self.generation);
+    }
+}
+
 /// A connection a `TcpListener` accepted: closed -- the FIN exchange left
 /// to the kernel -- when dropped.
 pub struct TcpStream {
@@ -162,6 +179,11 @@ pub struct TcpStream {
 unsafe impl Send for TcpStream {}
 
 impl TcpStream {
+    /// What wakes a task waiting in this stream's `recv`, from another task.
+    pub fn waker(&self) -> TcpWaker {
+        TcpWaker { conn: self.conn as usize, generation: tcp::kernel_tcp_generation(self.conn) }
+    }
+
     /// Its own floor for its retransmission timeout, `ms` (20 to 200): for
     /// a link both of whose ends are nos, which acknowledges every segment
     /// at once, below the 200 ms a connection to anyone else keeps, whose

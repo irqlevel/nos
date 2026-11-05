@@ -288,6 +288,22 @@ pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnPtr, nets: *const 
     if done { 0 } else { -1 }
 }
 
+/// A task waiting in a receive on `conn` woken, as by a timeout, if the
+/// connection is still the one of `generation` (`Tcp::wake`).
+#[no_mangle]
+pub extern "C" fn kernel_tcp_wake(conn: ConnPtr, generation: u64) {
+    if let Some(conn) = conn_of(conn) {
+        TCP.wake(conn, generation);
+    }
+}
+
+/// What a wake of `conn` is held to (`Tcp::generation`): 0 for no
+/// connection.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_generation(conn: ConnPtr) -> u64 {
+    conn_of(conn).map_or(0, |c| TCP.generation(c))
+}
+
 /// A connection's own floor for its timeout (`Tcp::set_rto_floor`).
 #[no_mangle]
 pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnPtr, ms: u32) -> i32 {

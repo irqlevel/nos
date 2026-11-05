@@ -469,13 +469,12 @@ longer heard by itself, which the fuzz model found. `ipcwire`'s Hello
 carries the session, its assembler a bound on its pieces. `ipc-test.py` on
 `scripts/hub.py`'s LAN passes on arm64 under HVF; what it found was the
 sender's own, two messages of one pair begun at once and delivered out of
-order, which it now never does. Left of I4: net-fuzz's `ipcnet` target,
-the x86-64 run, and the links' polling -- a small message's round trip is
-some 7 ms at the median, the connection's task waking a millisecond at a
-time while things move and up to 10 ms when they do not, its socket and its
-queue each polled. A wait on one event for both -- TCP's receive path
-signalling a connection's event, as a mailbox's push signals its own -- is
-the next step, and the measurements after it.
+order, which it now never does. The links' polling is gone
+too: TCP's receive waits on an event of its connection's, which the
+receive path signals, and which a `TcpWaker` -- what ipcnet's queues hold
+-- ends early; a small message's round trip went from 7 ms at the median to
+0.4 ms on hub.py's LAN. Left of I4: net-fuzz's `ipcnet` target, the x86-64
+run, and the measurements on the boxes.
 
 ## Limits of the first version
 

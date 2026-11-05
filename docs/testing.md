@@ -589,9 +589,9 @@ on each, a `Cluster` name, and `ipc ping` is what goes between them:
   talking.
 
 What it does not reach yet: three hosts' traffic at once, a peer at its
-limits slowed while another goes on, and the measurements -- a round trip
-of a small message is some 7 ms at the median, which is the links'
-polling, not the network (docs/ipc.md).
+limits slowed while another goes on, and the measurements on the boxes --
+here a round trip of a small message is some 0.4 ms at the median, through
+a switch in Python.
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 

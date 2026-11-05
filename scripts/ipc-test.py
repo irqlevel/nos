@@ -10,11 +10,13 @@ of that. kernel.echo runs on every host, a `Cluster` name, and `ipc ping
 kernel.echo@<host>` is what is sent between them.
 
     scripts/ipc-test.py                  arm64: HVF on an Apple Silicon Mac, TCG otherwise
-    scripts/ipc-test.py --arch x86_64    KVM where the host has it
+    scripts/ipc-test.py --arch x86_64    KVM where the host has it, from nos-test.iso
     scripts/ipc-test.py --keep           keep the logs and images
 
-Needs a built tree: nos-arm64.img or nos.iso, and out/<arch>/modules/ipcnet.ko;
-openssl, for the hosts' keys.
+Needs a built tree: nos-arm64.img, or for x86-64 an ISO whose command line
+has the UDP shell -- `make nos-test.iso TEST_ISO_ARGS=udpshell=9100`, which
+--iso may name -- and out/<arch>/modules/ipcnet.ko; openssl, for the hosts'
+keys.
 """
 
 import argparse
@@ -130,7 +132,7 @@ def accel_of(arch):
     return "kvm" if os.path.exists("/dev/kvm") and platform.machine() in ("x86_64", "AMD64") else "tcg"
 
 
-def qemu(arch, accel, image, log, hub, i):
+def qemu(arch, accel, image, log, hub, i, iso):
     lan_mac = hub.mac(i)
     if arch == "aarch64":
         cpu = {"hvf": ["-accel", "hvf", "-cpu", "host"], "kvm": ["-accel", "kvm", "-cpu", "host"]}.get(
@@ -147,7 +149,7 @@ def qemu(arch, accel, image, log, hub, i):
             "-serial", "file:" + log, "-display", "none"]
     cpu = ["-enable-kvm", "-cpu", "host"] if accel == "kvm" else ["-cpu", "max"]
     return ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", "2"] + cpu + [
-        "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+        "-cdrom", iso, "-serial", "file:" + log,
         "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
         "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
         "-device", "virtio-net-pci,netdev=lan,mac=%s,disable-legacy=on,disable-modern=off" % lan_mac,
@@ -208,8 +210,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--arch", choices=["x86_64", "aarch64"], default="aarch64")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--iso", default=os.path.join(ROOT, "nos-test.iso"),
+                    help="x86-64: an ISO whose command line has udpshell=%d" % SHELL_PORT)
     args = ap.parse_args()
     accel = accel_of(args.arch)
+    if args.arch == "x86_64" and not os.path.exists(args.iso):
+        sys.exit("no %s -- make nos-test.iso TEST_ISO_ARGS=udpshell=%d" % (args.iso, SHELL_PORT))
     tmp = tempfile.mkdtemp(prefix="nos-ipc-")
     print("ipc-test: %s, %s, scratch in %s" % (args.arch, accel, tmp), flush=True)
     keys = {h: make_key(tmp, h) for h in ("a", "b", "c", "c-pinned")}
@@ -228,7 +234,7 @@ def main():
         for i in range(n):
             log = os.path.join(tmp, "serial-%s.log" % HOSTS[i])
             logs.append(log)
-            procs.append(subprocess.Popen(qemu(args.arch, accel, images[i], log, hub, i), cwd=ROOT,
+            procs.append(subprocess.Popen(qemu(args.arch, accel, images[i], log, hub, i, args.iso), cwd=ROOT,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         for i in range(n):
             if not check("%s boots" % HOSTS[i], pt.wait_log(logs[i], "boot: complete", 300)):
@@ -279,8 +285,8 @@ def main():
         check("the links' retransmissions counted", counter(a.run("tcpstat"), "retx") > 0)
 
         # -- a cut: lost within 3 s either way, a monitor told, back up after --
-        t, box = in_thread(lambda: ping(b, "kernel.echo@a", "count=5000 bytes=64 timeout=20000"))
-        time.sleep(2)
+        t, box = in_thread(lambda: ping(b, "kernel.echo@a", "count=20000 bytes=64 timeout=20000"))
+        time.sleep(1)
         hub.cut(0, 1)
         cut_at = time.time()
         lost = wait_for(lambda: "down:" in ipcnet_line(a, "b") and "down:" in ipcnet_line(b, "a"), 15, 0.25)
@@ -311,8 +317,8 @@ def main():
         check("and a and b talk on", r is not None and r["answered"] == 20, r)
 
         # -- unloaded under traffic, and back --
-        t, box = in_thread(lambda: ping(b, "kernel.echo@a", "count=5000 bytes=1000 window=4 timeout=20000"))
-        time.sleep(2)
+        t, box = in_thread(lambda: ping(b, "kernel.echo@a", "count=20000 bytes=1000 window=4 timeout=20000"))
+        time.sleep(1)
         started = time.time()
         out = a.run("rmmod ipcnet")
         check("rmmod ipcnet under traffic returns promptly", time.time() - started < 15, out)
