@@ -31,6 +31,19 @@ fn recv(conn: *mut c_void, buf: &mut [u8], timeout_ms: u64) -> isize {
     unsafe { tcp::kernel_tcp_recv(conn, buf.as_mut_ptr(), buf.len(), timeout_ms) }
 }
 
+/// The most networks an allowlisted listener answers.
+pub const ALLOW_MAX: usize = 64;
+
+/// `nets` as the C ABI takes them, on the stack.
+fn nets_of(nets: &[(u32, u8)]) -> [tcp::TcpNet; ALLOW_MAX] {
+    let mut list = [tcp::TcpNet::default(); ALLOW_MAX];
+    for (l, &(ip, prefix)) in list.iter_mut().zip(nets) {
+        l.ip = ip;
+        l.prefix = prefix;
+    }
+    list
+}
+
 /// A TCP port listened on, on one device. Dropped, it closes the port: a
 /// task waiting in `accept` gets None, and a peer that connected without
 /// being accepted yet is reset.
@@ -66,6 +79,43 @@ impl TcpListener {
     /// at 62 ms. The slot's own 8 KiB when the heap has none to give.
     pub fn bind_bulk(nic: &Nic, port: u16, backlog: usize) -> Result<Self> {
         Self::listen(nic, port, backlog, true)
+    }
+
+    /// `bind` -- `bind_bulk` with `bulk` -- answering the networks `nets`
+    /// alone, each an address (host order) and a prefix length: a segment
+    /// from any other address for the port is dropped before the backlog
+    /// and before a slot, with no SYN-ACK and no reset, so to a stranger the
+    /// port is not there at all. At most 64 networks.
+    pub fn bind_allowed(nic: &Nic, port: u16, backlog: usize, bulk: bool, nets: &[(u32, u8)]) -> Result<Self> {
+        if port == 0 || nets.len() > ALLOW_MAX {
+            return Err(Error::InvalidValue);
+        }
+        let list = nets_of(nets);
+        /* `list` holds `nets.len()` TcpNets */
+        let conn = unsafe { tcp::kernel_tcp_listen_allowed(nic.handle(), port, backlog, bulk, list.as_ptr(),
+                                                           nets.len()) };
+        if conn.is_null() {
+            Err(Error::Busy)
+        } else {
+            Ok(Self { conn, port })
+        }
+    }
+
+    /// The networks it answers from now on -- anyone, for None. What it
+    /// holds already stays.
+    pub fn set_allowed(&self, nets: Option<&[(u32, u8)]>) -> Result<()> {
+        let code = match nets {
+            None => unsafe { tcp::kernel_tcp_set_allowed(self.conn, core::ptr::null(), 0, true) },
+            Some(nets) => {
+                if nets.len() > ALLOW_MAX {
+                    return Err(Error::InvalidValue);
+                }
+                let list = nets_of(nets);
+                /* `list` holds `nets.len()` TcpNets */
+                unsafe { tcp::kernel_tcp_set_allowed(self.conn, list.as_ptr(), nets.len(), false) }
+            }
+        };
+        if code == 0 { Ok(()) } else { Err(Error::InvalidValue) }
     }
 
     fn listen(nic: &Nic, port: u16, backlog: usize, bulk: bool) -> Result<Self> {
@@ -112,6 +162,15 @@ pub struct TcpStream {
 unsafe impl Send for TcpStream {}
 
 impl TcpStream {
+    /// Its own floor for its retransmission timeout, `ms` (20 to 200): for
+    /// a link both of whose ends are nos, which acknowledges every segment
+    /// at once, below the 200 ms a connection to anyone else keeps, whose
+    /// peer may delay its acknowledgements that long. In effect from the
+    /// next round trip measured.
+    pub fn set_rto_floor(&self, ms: u32) -> Result<()> {
+        if tcp::kernel_tcp_set_rto_floor(self.conn, ms) == 0 { Ok(()) } else { Err(Error::InvalidValue) }
+    }
+
     /// An active open to `ip`:`port` (host byte order) through `nic`, from an
     /// ephemeral port: None when nothing answered in time. Sleeps.
     pub fn connect(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {

@@ -53,18 +53,21 @@ between the AX41 and the EX44: one connection's throughput, which should
 reach the 1 GbE line rate (117 MB/s) where it is 27 MB/s now.
 
 **T2, a timeout from the round trip.** Done on branch `ipc-raft` but for
-the lower floor for links between nos hosts, which comes with ipcnet (I4),
-and the measurements: the estimate, a floor of 200 ms and giving up by
-time; and the timer a task (`tcp/timer`, on CPU 0) asleep until the
+the measurements: the estimate, a floor of 200 ms and giving up by time;
+a connection's own floor, down to 20 ms, for the links between nos hosts
+(`Tcp::set_rto_floor`, a module's `TcpStream::set_rto_floor`); and the timer a task (`tcp/timer`, on CPU 0) asleep until the
 earliest retransmission any connection has or the next 200 ms sweep -- for
 TIME-WAIT, the persist timer and slots given back -- where it was a soft
 IRQ raised every 200 ms whatever was due. A deadline is set only through a
 type that tells the timer, and net-fuzz holds every connection's to being
-acted on within a tick of the machine's; of five mutants of the timer it
-catches four. The fifth -- a deadline set that does not wake the task --
-cannot show while the floor is the sweep's period: the task always wakes
-for a sweep before any deadline comes. It shows with I4's 20 ms floor,
-whose links the fuzzer is then to drive.
+acted on within a tick of the machine's; its tcp target gives
+most connections a floor of their own -- mostly the 20 ms -- and holds each
+one's timeout to its floor, the floor to what may be given, and a new
+connection to 200 whatever its slot's last had. Of the timer's five
+mutants it catches all five: the fifth -- a deadline set that does not
+wake the task -- shows only under a floor below the sweep's period, where
+a deadline the task is not told of waits for the sweep; and four mutants
+of the floor besides.
 - The round trip is measured on every acknowledged segment that was not
   sent again (Karn's rule). SRTT and RTTVAR follow RFC 6298, in integers.
 - The RTO is SRTT plus four RTTVARs, no less than 200 ms -- Linux's floor,
@@ -77,7 +80,9 @@ whose links the fuzzer is then to drive.
   acknowledges every segment at once, so a link both of whose ends are nos
   -- ipcnet's -- is given a floor of its own, as Linux's `ip route ...
   rto_min` gives a route one: 20 ms, set where the link is made (I4) and
-  measured there. A path of 50 ms, the Mac to Hetzner, gets an RTO of a few
+  measured there. It takes effect from the next round trip measured: a
+  timeout of the moment is never lowered by it, since it may be backed off
+  from a loss that only the next sample says is over (RFC 6298, 5.7). A path of 50 ms, the Mac to Hetzner, gets an RTO of a few
   hundred ms from its own measurements either way.
 - The timer is armed for the earliest deadline any connection has, to the
   millisecond, instead of a look every 200 ms. The 200 ms sweep stays, for

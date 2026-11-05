@@ -45,4 +45,32 @@ unsafe extern "C" {
     ) -> isize;
     /// The address at the other end, host byte order, and its port.
     pub fn kernel_tcp_peer(conn: *mut c_void, ip: *mut u32, port: *mut u16);
+
+    /// `kernel_tcp_listen`, answering the `count` networks at `nets` alone:
+    /// a segment from any other address for the port is dropped before the
+    /// backlog and before a slot, with no SYN-ACK and no reset. Null for more
+    /// than 64 networks or a prefix past 32, and for what kernel_tcp_listen
+    /// refuses.
+    pub fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool, nets: *const TcpNet,
+                                     count: usize) -> *mut c_void;
+    /// A listener's allowlist changed: the `count` networks at `nets` from
+    /// now on -- anyone, with `any`. What it holds already stays. 0 done,
+    /// -1 refused: no listener, more than 64 networks, a prefix past 32.
+    pub fn kernel_tcp_set_allowed(listener: *mut c_void, nets: *const TcpNet, count: usize, any: bool) -> i32;
+    /// A connection's own floor for its retransmission timeout, `ms`, from
+    /// 20 up to the 200 every connection starts with: for a link both of
+    /// whose ends are nos, which acknowledges every segment at once, where
+    /// no peer delays its acknowledgements under that floor. In effect from
+    /// the next round trip measured. 0 done, -1 refused.
+    pub safe fn kernel_tcp_set_rto_floor(conn: *mut c_void, ms: u32) -> i32;
+}
+
+/// A network an allowlisted listener answers: an address, host byte order,
+/// and how many of its leading bits count -- 32 for a host.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TcpNet {
+    pub ip: u32,
+    pub prefix: u8,
+    pub _pad: [u8; 3],
 }
