@@ -66,6 +66,22 @@ pub trait Backend: Send {
     fn discard_sectors(&self) -> u32 {
         DISCARD_ALIGNMENT
     }
+    /// Whether the backend takes a discard (`Op::Discard`) -- which the
+    /// device offers its driver only then -- and a write of zeros
+    /// (`Op::WriteZeroes`): both, unless it says not.
+    fn discards(&self) -> bool {
+        true
+    }
+    fn writes_zeroes(&self) -> bool {
+        true
+    }
+    /// The bytes of the backend's block -- `SECTOR`, or a power of two of
+    /// them up to a page -- which every request is whole ones of and starts
+    /// on: the device tells its driver (`F_BLK_SIZE`), and refuses a request
+    /// that is not. `SECTOR` unless the backend says otherwise.
+    fn block_size(&self) -> u32 {
+        SECTOR as u32
+    }
     /// Buffer `slot`'s bytes, at least `REQUEST_BYTES` of them, for `use_it`
     /// -- what a write's data is copied into before its request is handed
     /// over, and a read's taken from once it is back: its result, or false
@@ -216,6 +232,7 @@ const KICKLESS_OUT: usize = 8;
 /// and its indirect descriptors (`QUEUE_SIZE`).
 const F_SIZE_MAX: u32 = 1 << 1;
 const F_SEG_MAX: u32 = 1 << 2;
+const F_BLK_SIZE: u32 = 1 << 6;
 const F_RO: u32 = 1 << 5;
 const F_FLUSH: u32 = 1 << 9;
 const F_DISCARD: u32 = 1 << 13;
@@ -273,6 +290,7 @@ const ID_BYTES: usize = 20;
 const CFG_CAPACITY: u16 = 0;
 const CFG_SIZE_MAX: u16 = 8;
 const CFG_SEG_MAX: u16 = 12;
+const CFG_BLK_SIZE: u16 = 20;
 const CFG_MAX_DISCARD_SECTORS: u16 = 36;
 const CFG_MAX_DISCARD_SEG: u16 = 40;
 const CFG_DISCARD_ALIGNMENT: u16 = 44;
@@ -373,11 +391,18 @@ impl Blk {
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
         name[..n].copy_from_slice(&id.as_bytes()[..n]);
-        /* A disk that may only be read has nothing to give back. */
-        let ro = if backend.read_only() { F_RO } else { F_DISCARD | F_WRITE_ZEROES };
+        /* A disk that may only be read has nothing to give back; one that
+         * may be written, what its backend takes of the two. */
+        let ro = if backend.read_only() {
+            F_RO
+        } else {
+            (if backend.discards() { F_DISCARD } else { 0 }) | (if backend.writes_zeroes() { F_WRITE_ZEROES } else { 0 })
+        };
+        let bs = block_bytes(&*backend);
+        let blk_size = if bs != SECTOR { F_BLK_SIZE } else { 0 };
         Ok(Blk {
-            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC | ro,
-                                      queues),
+            transport: Transport::new(F_SIZE_MAX | F_SEG_MAX | F_FLUSH | virtio::F_EVENT_IDX | virtio::F_INDIRECT_DESC
+                                      | ro | blk_size, queues),
             backend,
             slots,
             waiting: false,
@@ -437,6 +462,8 @@ impl Blk {
         c[at..at + 4].copy_from_slice(&SIZE_MAX.to_le_bytes());
         let at = usize::from(CFG_SEG_MAX);
         c[at..at + 4].copy_from_slice(&SEG_MAX.to_le_bytes());
+        let at = usize::from(CFG_BLK_SIZE);
+        c[at..at + 4].copy_from_slice(&(block_bytes(&*self.backend) as u32).to_le_bytes());
         for (at, value) in [(CFG_MAX_DISCARD_SECTORS, MAX_RANGE_SECTORS), (CFG_MAX_DISCARD_SEG, MAX_RANGES as u32),
                             (CFG_DISCARD_ALIGNMENT, self.backend.discard_sectors().clamp(1, MAX_RANGE_SECTORS)),
                             (CFG_MAX_ZEROES_SECTORS, MAX_RANGE_SECTORS),
@@ -848,12 +875,21 @@ impl Blk {
     }
 
     /// The byte offset of `sector`, when `len` bytes from there are whole
-    /// sectors within the disk.
+    /// blocks of the backend's (`Backend::block_size`) within the disk.
     fn range(&self, sector: u64, len: u64) -> Option<u64> {
+        let bs = block_bytes(&*self.backend);
         let offset = sector.checked_mul(SECTOR)?;
         let end = offset.checked_add(len)?;
-        (len % SECTOR == 0 && end <= self.backend.size()).then_some(offset)
+        (offset % bs == 0 && len % bs == 0 && end <= self.backend.size()).then_some(offset)
     }
+}
+
+/// The backend's block in bytes (`Backend::block_size`), held to what the
+/// device takes: a power of two of sectors up to a page -- `SECTOR` for
+/// anything else, which a backend never says.
+fn block_bytes(backend: &dyn Backend) -> u64 {
+    let bs = u64::from(backend.block_size());
+    if bs.is_power_of_two() && bs >= SECTOR && bs <= SIZE_MAX as u64 { bs } else { SECTOR }
 }
 
 /// A count of bytes, as the used ring's 32 bits hold it.

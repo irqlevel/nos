@@ -41,6 +41,7 @@ import filecmp
 import json
 import os
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -847,6 +848,110 @@ def gate_iso(tmp):
 
 # ---- fuzzing ----
 
+def contents_of(path):
+    """What the harness's `contents` says a device image holds: (what, label)
+    -- what None for nothing -- or None when it did not answer."""
+    r = sh([BIN, "contents", path])
+    m = re.search(r"^contents: (.*)$", r.stdout, re.M)
+    if r.returncode != 0 or not m:
+        return None
+    if m.group(1) == "none":
+        return (None, "")
+    what, _, label = m.group(1).partition("|")
+    return (what, label)
+
+
+def gate_contents(tmp):
+    """`diskimage::contents`, what a device is seen to hold before hv gives
+    it to a guest: each kind's signature where its own documents put it --
+    an image of zeros but for it -- and whatever of the real tools the host
+    has, run as they come."""
+    size = 4 * 1024 * 1024
+
+    def made(name, puts, length=size):
+        path = os.path.join(tmp, "contents-" + name + ".img")
+        img = bytearray(length)
+        for at, data in puts:
+            at = at if at >= 0 else length + at
+            img[at:at + len(data)] = data
+        with open(path, "wb") as f:
+            f.write(img)
+        return path
+
+    def label_at(text, n):
+        return text.encode() + bytes(n - len(text))
+
+    ext_sb = lambda compat, incompat, ro: (1024, struct.pack("<56xH34xIII16x", 0xEF53, compat, incompat, ro)[:104]
+                                          + bytes(16) + label_at("disklabel", 16))
+    md_end_10 = (size - 8192) // 4096 * 4096
+    md_end_090 = size // 65536 * 65536 - 65536
+    synthetic = [
+        ("zeros", [], (None, "")),
+        ("data", [(4096, b"something")], ("data nos does not recognize", "")),
+        ("luks", [(0, b"LUKS\xba\xbe\x00\x02")], ("a LUKS volume", "")),
+        ("xfs", [(0, b"XFSB"), (108, label_at("xfslabel", 12))], ("an XFS filesystem", "xfslabel")),
+        ("squashfs", [(0, b"hsqs")], ("a squashfs", "")),
+        ("disklog", [(0, b"NOSLOG1\0")], ("nos's disk log area", "")),
+        ("nanofs", [(0, struct.pack("<I", 0x4E414E4F))], ("a nanofs filesystem", "")),
+        ("ext2", [ext_sb(0, 0x2, 0)], ("an ext2 filesystem", "disklabel")),
+        ("ext3", [ext_sb(0x4, 0x2, 0)], ("an ext3 filesystem", "disklabel")),
+        ("ext4", [ext_sb(0x4, 0x2 | 0x40 | 0x80, 0)], ("an ext4 filesystem", "disklabel")),
+        ("ext4-ro", [ext_sb(0x4, 0x2, 0x400)], ("an ext4 filesystem", "disklabel")),
+        ("journal", [ext_sb(0, 0x8, 0)], ("an ext3/4 journal device", "disklabel")),
+        ("f2fs", [(1024, struct.pack("<I", 0xF2F52010))], ("an F2FS filesystem", "")),
+        ("btrfs", [(65536 + 64, b"_BHRfS_M"), (65536 + 299, label_at("btrlabel", 256))],
+         ("a btrfs filesystem", "btrlabel")),
+        ("swap4k", [(4086, b"SWAPSPACE2"), (1024 + 28, label_at("swaplabel", 16))], ("swap", "swaplabel")),
+        ("swap64k", [(65526, b"SWAPSPACE2")], ("swap", "")),
+        ("swapold", [(4086, b"SWAP-SPACE")], ("swap", "")),
+        ("lvm", [(512, b"LABELONE"), (512 + 24, b"LVM2 001")], ("an LVM physical volume", "")),
+        ("md12", [(4096, struct.pack("<I", 0xa92b4efc))], ("a member of an md RAID array", "")),
+        ("md10", [(md_end_10, struct.pack("<I", 0xa92b4efc))], ("a member of an md RAID array", "")),
+        ("md090", [(md_end_090, struct.pack(">I", 0xa92b4efc))], ("a member of an md RAID array", "")),
+        ("iso", [(0x8001, b"CD001"), (0x8028, label_at("ISOLABEL", 32))], ("an ISO 9660 filesystem", "ISOLABEL")),
+        ("ntfs", [(3, b"NTFS    "), (510, b"\x55\xaa")], ("an NTFS filesystem", "")),
+        ("exfat", [(3, b"EXFAT   "), (510, b"\x55\xaa")], ("an exFAT filesystem", "")),
+        ("fat32", [(82, b"FAT32   "), (71, label_at("FATLABEL", 11)), (510, b"\x55\xaa")],
+         ("a FAT filesystem", "FATLABEL")),
+        ("fat16", [(54, b"FAT16   "), (43, label_at("OLDLABEL", 11)), (510, b"\x55\xaa")],
+         ("a FAT filesystem", "OLDLABEL")),
+        ("gpt", [(512, b"EFI PART")], ("a GPT partition table", "")),
+        ("mbr", [(446 + 4, b"\x83"), (510, b"\x55\xaa")], ("an MBR partition table", "")),
+        ("boot-only", [(510, b"\x55\xaa")], ("data nos does not recognize", "")),
+    ]
+    for name, puts, want in synthetic:
+        got = contents_of(made(name, puts))
+        check("contents: %s -- %s" % (name, want[0] or "nothing"), got == want, got)
+    # Smaller than what is looked at, and a tail past a head: read whole.
+    got = contents_of(made("small", [(1024 + 56, b"\x53\xef")], length=3072))
+    check("contents: a device smaller than its look, an ext2 on it", got == ("an ext2 filesystem", ""), got)
+
+    # The real tools, those the host has: what each makes is what it is.
+    real = [
+        ("mke2fs-ext2", ["mke2fs", "-q", "-F", "-t", "ext2", "-L", "nosext2"], ("an ext2 filesystem", "nosext2")),
+        ("mke2fs-ext3", ["mke2fs", "-q", "-F", "-t", "ext3", "-L", "nosext3"], ("an ext3 filesystem", "nosext3")),
+        ("mke2fs-ext4", ["mke2fs", "-q", "-F", "-t", "ext4", "-L", "nosext4"], ("an ext4 filesystem", "nosext4")),
+        ("mkswap", ["mkswap", "-L", "nosswap"], ("swap", "nosswap")),
+        ("mkfs.vfat", ["mkfs.vfat", "-F", "32", "-n", "NOSFAT"], ("a FAT filesystem", "NOSFAT")),
+        ("mkfs.xfs", ["mkfs.xfs", "-q", "-f", "-L", "nosxfs"], ("an XFS filesystem", "nosxfs")),
+        ("mkfs.btrfs", ["mkfs.btrfs", "-q", "-f", "-L", "nosbtrfs"], ("a btrfs filesystem", "nosbtrfs")),
+    ]
+    for name, argv, want in real:
+        if shutil.which(argv[0]) is None:
+            print("  (no %s here: skipped)" % argv[0])
+            continue
+        path = os.path.join(tmp, "contents-%s.img" % name)
+        with open(path, "wb") as f:
+            f.truncate(300 * 1024 * 1024 if "xfs" in name or "btrfs" in name else 64 * 1024 * 1024)
+        r = sh(argv + [path])
+        if r.returncode != 0:
+            print("  (%s failed here: skipped -- %s)" % (argv[0], (r.stdout + r.stderr).strip()[-200:]))
+            continue
+        got = contents_of(path)
+        check("contents: what %s makes -- %s" % (argv[0], want[0]), got == want, got)
+        os.remove(path)
+
+
 def gate_fuzz(args, images):
     for path in images:
         r = sh([BIN, "fuzz", path, "--seed", str(args.seed), "--iterations", str(args.iterations)], timeout=7200)
@@ -955,6 +1060,7 @@ def main():
             compressed = next(p for p in made if p.endswith("v3-64k-c.qcow2"))
             gate_refusals(tmp, plain, compressed)
             gate_iso(tmp)
+            gate_contents(tmp)
             gate_inflate(args, tmp)
             fuzzed = [p for p in made if os.path.basename(p) in
                       ("v3-64k-c.qcow2", "v2-4k.qcow2", "v3-512-c.qcow2", "v3-64k-extended.qcow2", "v2-64k-c.qcow2")]

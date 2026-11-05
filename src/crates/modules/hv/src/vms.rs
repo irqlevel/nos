@@ -63,7 +63,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -1313,12 +1313,17 @@ impl Vms {
         let mut label = String::new();
         label.try_reserve(16).map_err(|_| not_started(&"out of memory"))?;
         let _ = write!(label, "vm{}", id);
+        let owner = match name {
+            Some(n) => alloc::format!("vm {}'s disk", n),
+            None => alloc::format!("vm {}'s disk", id),
+        };
         let runner = Runner {
             wake: shared.clone(),
             name: label,
             cpu: disk_cpu,
             claims: self.claims.clone(),
             holder: Holder::Vm(id),
+            owner,
         };
 
         /* The files are read and the guest's memory filled here, with no lock

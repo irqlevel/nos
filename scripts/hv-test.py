@@ -626,7 +626,7 @@ def convert_checks(out, digest):
              out[5])
     pt.check("and leaves no disk behind", "cut.raw" not in out[6] and "img.raw" in out[6], out[6])
     pt.check("a disk that is raw already is refused, saying so", "raw disk" in out[7] and "already" in out[7], out[7])
-    pt.check("and hv convert alone says how it is used", "hv convert <image> <disk>" in out[8], out[8])
+    pt.check("and hv convert alone says how it is used", "hv convert <image> <disk|device>" in out[8], out[8])
 
 
 def rootfs(tmp, arch, rc=None):
