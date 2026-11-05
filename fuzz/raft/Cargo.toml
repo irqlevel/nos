@@ -1,0 +1,21 @@
+# The raft crate on the host: members of a group in one process over a
+# simulated network and simulated disks, held at every step to Raft's
+# properties, the known traps as scripted scenarios, and the wire's decoder
+# fed noise (scripts/raft-test.py). Its one dependency is the crate itself,
+# a path of the tree's, so it builds offline.
+[package]
+name = "raft-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+raft = { path = "../../src/crates/raft" }
+
+# Overflow checks on, as a RUSTUB=1 build has them: an overflow in the
+# protocol is a bug of its own, and in the kernel a panic.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]
