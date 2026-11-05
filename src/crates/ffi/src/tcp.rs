@@ -63,6 +63,15 @@ unsafe extern "C" {
     /// no peer delays its acknowledgements under that floor. In effect from
     /// the next round trip measured. 0 done, -1 refused.
     pub safe fn kernel_tcp_set_rto_floor(conn: *mut c_void, ms: u32) -> i32;
+
+    /// A task waiting in `kernel_tcp_recv` on `conn` -- or the next to --
+    /// back at once, as from a timeout: for one that waits on its connection
+    /// and on something of its own, woken by whoever has that something.
+    /// Nothing, unless `conn` is still the connection `generation` says.
+    pub safe fn kernel_tcp_wake(conn: *mut c_void, generation: u64);
+    /// What a wake of `conn` is held to: a number of its slot's, new for
+    /// every connection the slot is handed out for. 0 for no connection.
+    pub safe fn kernel_tcp_generation(conn: *mut c_void) -> u64;
 }
 
 /// A network an allowlisted listener answers: an address, host byte order,

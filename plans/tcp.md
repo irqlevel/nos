@@ -102,6 +102,24 @@ of the floor besides.
   Then on the boxes: request and response p50 and p99 under load, and how
   many retransmissions turn out spurious.
 
+**A receive that waits on an event.** Done on branch `ipc-raft`, for
+ipcnet (I4): `recv` slept a millisecond and then up to ten between looks,
+which is most of what a round trip between two hosts cost (7 ms at the
+median, on the QEMU LAN). Each connection now has an event, made at
+`init`, that `recv` sleeps on -- a hundred milliseconds at most, a missed
+signal's whole cost -- and that every place marking data ready signals: data,
+an end, a reset. And `Tcp::wake` (`kernel_tcp_wake`, kcore's `TcpWaker`)
+ends a receive under way, or the next, as a timeout, for a task that waits
+on its connection and on a queue of its own; it is held to the
+connection's generation, bumped under the connection's lock as its slot is
+handed out, so a wake of a connection gone reaches nobody, and the first
+receive back after it -- with data or not -- has it. net-fuzz's tcp target
+wakes connections by their own generation and by stale ones, and holds a
+receive with no timeout to coming back as one only when its connection was
+woken; three mutants (the generation not held to, a wake kept across a
+slot's handout, a wake not had by a receive with data) fail it. A round
+trip of ipcnet went from 7 ms to 0.4 ms at the median.
+
 **T3, strangers kept off before they cost anything.** Done on branch
 `ipc-raft` but for the module's way to it and the measurement, which come
 with ipcnet (I4), its first user: `Tcp::listen_allowed` and `set_allowed`

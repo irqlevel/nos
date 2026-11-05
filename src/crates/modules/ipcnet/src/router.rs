@@ -75,16 +75,22 @@ fn route(shared: &Shared, m: Pieces) {
             let left = match &peer {
                 Some(p) => p.out[class].with(|o| {
                     if o.number != peer_number || o.bytes + len > QUEUE_BYTES[class] || o.msgs.try_reserve(1).is_err() {
-                        return Some(msg);
+                        return Err(msg);
                     }
                     o.bytes += len;
                     o.msgs.push_back(msg);
-                    None
+                    Ok(o.waker)
                 }),
-                None => Some(msg),
+                None => Err(msg),
             };
-            if let Some(msg) = left {
-                unsent(shared, peer.as_deref(), peer_number, &msg);
+            match left {
+                /* Its connection's task told, out of the lock */
+                Ok(waker) => {
+                    if let Some(w) = waker {
+                        w.wake();
+                    }
+                }
+                Err(msg) => unsent(shared, peer.as_deref(), peer_number, &msg),
             }
         }
         route::MONITOR => {

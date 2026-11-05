@@ -254,12 +254,15 @@ hosts and back.
   the channel the moment it is whole (`deliver_remote`), a full mailbox a
   `Bounced` back, never a connection that stops reading; what a peer may not
   reach here is dropped and counted.
-- **What it costs, for now**: a connection's task polls -- its socket and
-  its queue -- a millisecond at a time while things move and up to 10 ms
-  when they do not, as the kernel's own TCP waits are polled: a small
-  message's round trip between two hosts is some 7 ms at the median, on the
-  QEMU LAN of `scripts/hub.py`. A wait on one event for both is the next
-  step (plans/ipc.md).
+- **One wait for both ways**: a connection's task sleeps in its socket's
+  receive, which TCP wakes the moment data comes -- its receive waits on an
+  event of the connection's, which the receive path signals -- and which
+  whoever queues something for the connection ends early (`TcpWaker`, held
+  to the connection's generation, so that a wake of one gone reaches
+  nobody). A small message's round trip between two hosts is some 0.4 ms at
+  the median on `scripts/hub.py`'s LAN under HVF, where it was 7 ms while
+  the task polled; what is left of polling is a send waiting for room in
+  TCP's buffer, a millisecond at a time.
 
 `ipcnet` says each peer's state -- up and as which number, or down and why
 -- and what went between them; `ipc ping kernel.echo@<host>` sends to a
