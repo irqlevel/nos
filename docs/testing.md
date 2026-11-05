@@ -563,7 +563,9 @@ on a Mac. See [netblk](netblk.md#using-it).
 ### `ipc-test.py` -- the channel between hosts, three kernels on a LAN
 
 Three nos, `a`, `b` and `c`, each with ipcnet.ko and a key the test made
-with openssl, on the LAN of `scripts/hub.py`: a learning switch over QEMU's
+with openssl -- on x86-64 booted from an ISO whose command line has the UDP
+shell, `make nos-test.iso TEST_ISO_ARGS=udpshell=9100` -- on the LAN of
+`scripts/hub.py`: a learning switch over QEMU's
 `-netdev dgram`, which answers each VM's DHCP with 10.9.0.<n>, relays the
 test's UDP shell to it from 10.9.0.253 -- past the impairments, which are
 the VMs' between themselves -- and drops, delays, jitters and cuts between
