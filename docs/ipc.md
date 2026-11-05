@@ -266,7 +266,9 @@ hosts and back.
 
 `ipcnet` says each peer's state -- up and as which number, or down and why
 -- and what went between them; `ipc ping kernel.echo@<host>` sends to a
-peer's echo. Its gate is `scripts/ipc-test.py` (both arches), three nos on
+peer's echo. Its gates are net-fuzz's `ipcnet` target (the module's source
+on the host against a world that is the other host, docs/testing.md) and
+`scripts/ipc-test.py` (both arches), three nos on
 `scripts/hub.py`'s LAN: keys pinned both ways, pings small and of a
 megabyte held to every byte and to their order, bounces of a name nobody
 has and of a full mailbox, the wire lossy and late, a cut seen within 3 s

@@ -398,6 +398,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "ipcwire",
+ "kcore",
+]
+
+[[package]]
+name = "ipcwire"
+version = "0.1.0"
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
@@ -467,6 +480,8 @@ dependencies = [
  "ed25519-dalek",
  "ffi",
  "fs",
+ "ipc",
+ "ipcwire",
  "kcore",
  "kmod",
  "mgmt",

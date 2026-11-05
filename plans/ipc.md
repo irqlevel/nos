@@ -473,8 +473,12 @@ order, which it now never does. The links' polling is gone
 too: TCP's receive waits on an event of its connection's, which the
 receive path signals, and which a `TcpWaker` -- what ipcnet's queues hold
 -- ends early; a small message's round trip went from 7 ms at the median to
-0.4 ms on hub.py's LAN. Left of I4: net-fuzz's `ipcnet` target, the x86-64
-run, and the measurements on the boxes.
+0.4 ms on hub.py's LAN. net-fuzz's `ipcnet` target (docs/testing.md)
+holds the module's source against a world that is the other host -- right
+keys and wrong, Hellos right and wrong, messages, bursts into a full
+mailbox, monitors, silence, a broken wire -- and catches nine of ten bugs
+planted in it. Left of I4: the x86-64 run, and the measurements on the
+boxes.
 
 ## Limits of the first version
 

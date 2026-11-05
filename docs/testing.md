@@ -1234,6 +1234,40 @@ own, TCP's flags in combinations that mean something. The targets:
   for the session's end (in `tls::server`, whose own target now sends
   one); 27 bugs planted in the module one at a time were each caught, 26 of
   them within the gate's 500 inputs;
+- `ipcnet`: the ipcnet module's own source (`modules/ipcnet`) as host `b`
+  of a cluster, over the image's channel (the `ipc` crate), its hosts.toml
+  and key on a ramfs root, and two mailboxes of the image's: `nbs.sink`, a
+  Cluster name that keeps what it gets -- paused when the input says, so
+  that it fills -- and `kernel.hidden`, a Host name; and a third, the
+  victim, closed when the input says. The world is host `a`, dialing `b` as
+  a host of nos does -- the control connection, then the bulk one once it
+  has said its Hello, and now and then both at once -- with the key `b`
+  pins, a stranger's or an impostor's, and a Hello right or of another
+  cluster, for another host, from a host `b` does not know, or none; and,
+  once up, speaking ipcwire through `tlsc.rs`'s talk: messages to the sink
+  by name and by address, by both classes, of every size, to the Host name
+  and to addresses nobody has, bursts into the paused sink, monitors of the
+  victim, its own Pings, silence, frames the wire refuses or out of their
+  place, connections closed; while the sink answers `nbs.w@a`, and the
+  console stops and starts the server. What must hold: nothing reaches the
+  Host name; what reaches the sink is the world's, each once, in order
+  within a class and a sender, and by its address only once the sink has
+  sent to `a`, with the peer's number in its sender; what reaches the world
+  is the sink's, each once and in order, from the sink's own address; a key
+  not pinned is never up, a wrong Hello never answered; a burst past the
+  sink's places bounced back for each it had no room for, and a bounce only
+  of a message the sink never got; a Down only of a monitor asked, once,
+  Closed only once the victim is closed -- and, on a perfect link, every
+  monitor of it on a session still up told; the world's Pings answered; a
+  silent world lost within 3 s and a margin; and once the module is
+  unloaded, no router and nothing left behind. Nine of ten bugs planted in
+  the module are caught -- a peer's message it may not reach bounced, a full
+  mailbox's not, two messages of one pair begun at once, silence never
+  losing the peer, a Hello of another cluster or for another host taken, a
+  Down under the router's own id or never said, a Pong never said; the
+  tenth, a loss that bounces nothing of what never went, is not: the world
+  cannot tell what was queued from what was begun, and a message begun is
+  lost with its connection by design;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
   that lines repeat and a search finds them, with runs of one key past the
