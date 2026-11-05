@@ -125,6 +125,31 @@ pub enum Reason {
     Stopped,
 }
 
+impl Reason {
+    /// The channel's code for it (IPC_DOWN_*): what a Down's payload says,
+    /// and ipcnet's Down frame.
+    pub fn code(self) -> u32 {
+        match self {
+            Reason::Closed => ipc::IPC_DOWN_CLOSED,
+            Reason::Unloaded => ipc::IPC_DOWN_UNLOADED,
+            Reason::NoSuch => ipc::IPC_DOWN_NO_SUCH,
+            Reason::HostLost => ipc::IPC_DOWN_HOST_LOST,
+            Reason::Stopped => ipc::IPC_DOWN_STOPPED,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Option<Reason> {
+        Some(match code {
+            ipc::IPC_DOWN_CLOSED => Reason::Closed,
+            ipc::IPC_DOWN_UNLOADED => Reason::Unloaded,
+            ipc::IPC_DOWN_NO_SUCH => Reason::NoSuch,
+            ipc::IPC_DOWN_HOST_LOST => Reason::HostLost,
+            ipc::IPC_DOWN_STOPPED => Reason::Stopped,
+            _ => return None,
+        })
+    }
+}
+
 /// Why a message for another host did not get there (a TAG_BOUNCED's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bounce {
@@ -138,12 +163,23 @@ pub enum Bounce {
 }
 
 impl Bounce {
-    fn code(self) -> u32 {
+    /// The channel's code for it (IPC_BOUNCE_*): what a TAG_BOUNCED says,
+    /// and ipcnet's Bounced frame.
+    pub fn code(self) -> u32 {
         match self {
             Bounce::Full => ipc::IPC_BOUNCE_FULL,
             Bounce::Gone => ipc::IPC_BOUNCE_GONE,
             Bounce::Unsent => ipc::IPC_BOUNCE_UNSENT,
         }
+    }
+
+    pub fn from_code(code: u32) -> Option<Bounce> {
+        Some(match code {
+            ipc::IPC_BOUNCE_FULL => Bounce::Full,
+            ipc::IPC_BOUNCE_GONE => Bounce::Gone,
+            ipc::IPC_BOUNCE_UNSENT => Bounce::Unsent,
+            _ => return None,
+        })
     }
 
     pub fn name(self) -> &'static str {
@@ -210,14 +246,7 @@ impl Message {
         if self.tag != TAG_DOWN || self.data.len() != 4 {
             return None;
         }
-        match u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) {
-            ipc::IPC_DOWN_CLOSED => Some(Reason::Closed),
-            ipc::IPC_DOWN_UNLOADED => Some(Reason::Unloaded),
-            ipc::IPC_DOWN_NO_SUCH => Some(Reason::NoSuch),
-            ipc::IPC_DOWN_HOST_LOST => Some(Reason::HostLost),
-            ipc::IPC_DOWN_STOPPED => Some(Reason::Stopped),
-            _ => None,
-        }
+        Reason::from_code(u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]))
     }
 
     /// A bounce's reason, the bounced message's tag and the name it went
@@ -226,12 +255,7 @@ impl Message {
         if self.tag != TAG_BOUNCED || self.data.len() < 8 {
             return None;
         }
-        let why = match u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) {
-            ipc::IPC_BOUNCE_FULL => Bounce::Full,
-            ipc::IPC_BOUNCE_GONE => Bounce::Gone,
-            ipc::IPC_BOUNCE_UNSENT => Bounce::Unsent,
-            _ => return None,
-        };
+        let why = Bounce::from_code(u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]))?;
         let tag = u32::from_le_bytes([self.data[4], self.data[5], self.data[6], self.data[7]]);
         let name = match &self.data[8..] {
             [] => None,
@@ -501,14 +525,7 @@ impl Mailbox {
 
     /// The peer `peer` says the mailbox the monitor `id` watched has gone.
     pub fn remote_down(&self, peer: u16, id: u64, reason: Reason) -> Result<(), Error> {
-        let code = match reason {
-            Reason::Closed => ipc::IPC_DOWN_CLOSED,
-            Reason::Unloaded => ipc::IPC_DOWN_UNLOADED,
-            Reason::NoSuch => ipc::IPC_DOWN_NO_SUCH,
-            Reason::HostLost => ipc::IPC_DOWN_HOST_LOST,
-            Reason::Stopped => ipc::IPC_DOWN_STOPPED,
-        };
-        Error::from_code(ipc::kernel_ipc_remote_down(self.addr, u32::from(peer), id, code))
+        Error::from_code(ipc::kernel_ipc_remote_down(self.addr, u32::from(peer), id, reason.code()))
     }
 
     /// The router's: a message from `sender` -- a mailbox here that has

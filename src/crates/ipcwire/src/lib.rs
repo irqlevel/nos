@@ -84,8 +84,10 @@ pub enum To<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Frame<'a> {
     /// The first frame each way: the version, the cluster both say they
-    /// are in, the sender's name and the name it called the other by.
-    Hello { version: u16, cluster: [u8; 16], from: &'a [u8], to: &'a [u8] },
+    /// are in, the session -- the dialing host's number for the pair of
+    /// connections this is one of, which the other end pairs them by and
+    /// says back -- the sender's name and the name it called the other by.
+    Hello { version: u16, cluster: [u8; 16], session: u64, from: &'a [u8], to: &'a [u8] },
     Ping { seq: u64 },
     Pong { seq: u64 },
     /// A message begins: its number on this connection, where it goes,
@@ -215,12 +217,13 @@ pub fn decode(buf: &[u8]) -> Result<Option<(Frame<'_>, usize)>, Error> {
             let version = r.u16()?;
             let mut cluster = [0u8; 16];
             cluster.copy_from_slice(r.take(16)?);
+            let session = r.u64()?;
             let from = r.short()?;
             let to = r.short()?;
             if !is_host(from) || !is_host(to) {
                 return Err(Error::Name);
             }
-            Frame::Hello { version, cluster, from, to }
+            Frame::Hello { version, cluster, session, from, to }
         }
         Kind::Ping => Frame::Ping { seq: r.u64()? },
         Kind::Pong => Frame::Pong { seq: r.u64()? },
@@ -305,7 +308,7 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
             if !is_host(from) || !is_host(to) {
                 return Err(Error::Name);
             }
-            (Kind::Hello, 2 + 16 + 1 + from.len() + 1 + to.len())
+            (Kind::Hello, 2 + 16 + 8 + 1 + from.len() + 1 + to.len())
         }
         Frame::Ping { .. } => (Kind::Ping, 8),
         Frame::Pong { .. } => (Kind::Pong, 8),
@@ -341,9 +344,10 @@ pub fn encode(frame: &Frame<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
     out.extend_from_slice(&(len as u32).to_be_bytes());
     let mut w = Writer { out };
     match frame {
-        Frame::Hello { version, cluster, from, to } => {
+        Frame::Hello { version, cluster, session, from, to } => {
             w.bytes(&version.to_be_bytes());
             w.bytes(cluster);
+            w.bytes(&session.to_be_bytes());
             w.short(from);
             w.short(to);
         }
@@ -426,17 +430,26 @@ struct Open {
 /// Messages put back together from their frames: at most `max_open` at
 /// once, and `max_bytes` of theirs -- what each one's head promised, held
 /// or still to come -- so that the bound is on what may be held at all, not
-/// on what has come yet.
+/// on what has come yet; and kept in at most `max_pieces` pieces between
+/// them, a piece a body, so that a sender of a byte a frame is refused long
+/// before its pieces cost more than their bytes.
 pub struct Assembler {
     open: Vec<Open>,
     bytes: usize,
+    pieces: usize,
     max_open: usize,
     max_bytes: usize,
+    max_pieces: usize,
 }
 
 impl Assembler {
-    pub fn new(max_open: usize, max_bytes: usize) -> Assembler {
-        Assembler { open: Vec::new(), bytes: 0, max_open, max_bytes }
+    pub fn new(max_open: usize, max_bytes: usize, max_pieces: usize) -> Assembler {
+        Assembler { open: Vec::new(), bytes: 0, pieces: 0, max_open, max_bytes, max_pieces }
+    }
+
+    /// The pieces its open messages are kept in.
+    pub fn pieces(&self) -> usize {
+        self.pieces
     }
 
     /// What its open messages promised, in bytes.
@@ -480,13 +493,18 @@ impl Assembler {
                 if data.len() > o.left as usize {
                     return Err(Error::Length);
                 }
+                if self.pieces >= self.max_pieces {
+                    return Err(Error::Limit);
+                }
                 o.message.pieces.push(data.to_vec());
+                self.pieces += 1;
                 o.left -= data.len() as u32;
                 if o.left > 0 {
                     return Ok(None);
                 }
                 let done = self.open.swap_remove(at);
                 self.bytes -= done.message.len();
+                self.pieces -= done.message.pieces.len();
                 Ok(Some(done.message))
             }
             _ => Err(Error::Kind),

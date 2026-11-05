@@ -82,6 +82,8 @@ ipc                     the host's counters
 ipc names [prefix]      every name: its mailbox, scope and owner
 ipc boxes               every mailbox: owner, name, what it holds and is kept
 ipc echo [start|stop]   kernel.echo, which answers what it is sent with what it was sent
+ipc ping <to> [count=N] [bytes=B] [window=W] [bulk] [timeout=MS]
+                        messages to a name, here or name@host, each answer held to what was sent
 ```
 
 ## What keeps it sound
@@ -191,26 +193,88 @@ fail the gate.
 ## Between hosts: the wire
 
 `ipcwire` (`src/crates/ipcwire`, no kernel and no `unsafe`) is what ipcnet
-is to say to another host inside their TLS session (plans/ipc.md, I4; the
-module itself is not written yet): frames of an 8-byte head -- kind, flags,
-two bytes kept at zero, a length -- and at most 16 KiB, a TLS record's
-worth. `Hello` first, both ways (the version, the cluster's id, both
-hosts' names); `Ping` and `Pong`; a message as a `Head` (its number on the
-connection, where it goes -- an address or a name -- who sent it, its tag,
-reference and length, up to 1 MiB) and `Body` frames, other messages'
-frames between them; `Bounced`, `Monitor`, `Demonitor`, `Down`. `decode`
-gives a frame once all of it has come, every length checked first -- a head
-claiming more than a frame is refused at once, not waited on -- and a frame
-it gives encodes to exactly the bytes it came from. `Assembler` puts
-messages back together, bounded in how many are open and in the bytes their
-heads promised, each body kept in pieces of a frame: no allocation larger
-than a frame, whatever a message's size. `encode` grows its buffer by
-exactly the frame. Its gate is `ipc-fuzz.py --target wire`.
+says to another host inside their TLS session (plans/ipc.md, I4): frames of
+an 8-byte head -- kind, flags, two bytes kept at zero, a length -- and at
+most 16 KiB, a TLS record's worth. `Hello` first, both ways (the version,
+the cluster's id, the session -- the dialing host's number for the pair of
+connections, which the other pairs them by -- both hosts' names); `Ping`
+and `Pong`; a message as a `Head` (its number on the connection, where it
+goes -- an address or a name -- who sent it, its tag, reference and length,
+up to 1 MiB) and `Body` frames, other messages' frames between them;
+`Bounced`, `Monitor`, `Demonitor`, `Down`. `decode` gives a frame once all
+of it has come, every length checked first -- a head claiming more than a
+frame is refused at once, not waited on -- and a frame it gives encodes to
+exactly the bytes it came from. `Assembler` puts messages back together,
+bounded in how many are open, in the bytes their heads promised, and in the
+pieces -- a body each -- they are kept in, so that a sender of a byte a
+frame is refused before its pieces cost more than their bytes: no
+allocation larger than a frame, whatever a message's size. `encode` grows
+its buffer by exactly the frame. Its gate is `ipc-fuzz.py --target wire`.
+
+## Between hosts: ipcnet
+
+`ipcnet.ko` (`src/crates/modules/ipcnet`, docs/modules.md has its commands)
+is the router: what carries the channel's messages to the cluster's other
+hosts and back.
+
+- **Its hosts** are in /etc/ipc/hosts.toml: this one's name and the
+  cluster's id, and every peer's name, address and key -- one, or two while
+  it moves to a new one -- pinned. The host's own key and certificate are
+  made at its first start, in /etc/ipc/tls.
+- **Two TCP connections a peer**, control and bulk, on one port (39240), on
+  the interface hosts.toml names (eth0 unless told; never hv0, so that no
+  guest reaches it). The listener answers the peers' addresses alone: to
+  anyone else the port is not there, no SYN-ACK and no reset, and no slot
+  taken (TCP's allowlist, plans/tcp.md T3). At most two handshakes at once,
+  one a source, each given 3 s. Each connection has a link's 20 ms floor
+  for its retransmissions (T2).
+- **TLS 1.3, both keys pinned**: the dialer is a `tls::pinned::Client` of
+  the peer's keys, the listener a `Server` of every peer's, ChaCha20-
+  Poly1305 asked for first (measured: docs/tls.md). The connection's class is
+  its ALPN, `nos-ipc/1` or `nos-ipc-bulk/1`. Then the `Hello` each way: the
+  cluster's id, the session, both names -- the name the dialer says has to
+  be the one its key is pinned under, its address that peer's.
+- **Who dials**: of two names, the one that sorts first, a session at a
+  time: the control connection, and once it has said its Hello the bulk one;
+  the other end pairs them by the session's number, a new session ending its
+  old. The peer is up -- the channel's `peer_up` -- once both have said
+  their Hello, and lost the moment either ends, a frame the wire refuses
+  comes, or nothing is heard for 3 s (a `Ping` goes every 500 ms each way):
+  what was queued for it and never went is bounced (`Unsent`), the channel
+  told (HostLost to every monitor of an address there), and the monitors it
+  had this host hold taken back. The dialer tries again after a wait that
+  doubles from 250 ms to 8 s while no session comes up.
+- **Out**: the router's task takes each message from its mailbox into the
+  peer's queue of its class, at most a megabyte (control) or four
+  (bulk) waiting -- past that, bounced. A connection's task sends small
+  frames first, then messages a frame at a time, up to eight begun at once
+  and in turn -- but never two of one pair, sender and destination, since
+  the other end hands a message over as its last frame comes and a pair is
+  promised its order. In: frames decoded as they come, a message handed to
+  the channel the moment it is whole (`deliver_remote`), a full mailbox a
+  `Bounced` back, never a connection that stops reading; what a peer may not
+  reach here is dropped and counted.
+- **What it costs, for now**: a connection's task polls -- its socket and
+  its queue -- a millisecond at a time while things move and up to 10 ms
+  when they do not, as the kernel's own TCP waits are polled: a small
+  message's round trip between two hosts is some 7 ms at the median, on the
+  QEMU LAN of `scripts/hub.py`. A wait on one event for both is the next
+  step (plans/ipc.md).
+
+`ipcnet` says each peer's state -- up and as which number, or down and why
+-- and what went between them; `ipc ping kernel.echo@<host>` sends to a
+peer's echo. Its gate is `scripts/ipc-test.py` (both arches), three nos on
+`scripts/hub.py`'s LAN: keys pinned both ways, pings small and of a
+megabyte held to every byte and to their order, bounces of a name nobody
+has and of a full mailbox, the wire lossy and late, a cut seen within 3 s
+on both sides and its monitors told, a host with the wrong key never let
+in, a stranger's SYNs dropped, and `rmmod ipcnet` under traffic.
 
 ## Limits
 
-- This host only: a message to another host's address is `NoRoute` until
-  `ipcnet` (plans/ipc.md, I3 and I4).
+- Between hosts, a message lost with its connection -- sent, or part way
+  -- is lost: a monitor's HostLost is the word of it, and a bounce
+  (`Unsent`) only of what had not begun to go.
 - Copies: a payload is copied in and out.
 - A module sends a message of one buffer, so of at most what one block of
   its heap holds (512 KiB): a send in pieces comes when a module needs one

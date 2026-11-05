@@ -678,6 +678,35 @@ the two agreed on is checked to be the one asked for (`Session::suite`).
 prints what it said; the numbers above are the AX41's, under KVM
 (docs/tls.md, "What it costs").
 
+## ipcnet
+
+`ipcnet` (`src/crates/modules/ipcnet`) is the message channel between hosts
+(docs/ipc.md, "Between hosts: ipcnet"): the channel's router, which makes a
+mailbox on another host of the cluster an address here and `name@host` a
+name. Its folder is /etc/ipc (`insmod /lib/modules/ipcnet.ko conf=` names
+another): `hosts.toml` -- this host's name, the cluster's id, its peers, each
+pinned by its key -- and `tls/key.pem` and `tls/cert.pem`, made at the first
+start.
+
+```
+$ insmod /ipcnet.ko
+$ ipcnet init a                              # this host, in a new cluster -- or cluster=<32 hex>
+$ ipcnet id                                  # its key, which every peer pins
+$ ipcnet add b 10.9.0.2 9c1e...              # a peer, by its key
+$ ipcnet start
+$ ipcnet
+ipcnet: a in cluster 0123..., on eth0 port 39240, key 5f3a... -- serving 12 s
+  b            10.9.0.2        dials -- up 10 s as host 65; sent 200 got 200, ...
+$ ipc ping kernel.echo@b count=100
+```
+
+    ipcnet [start | stop | id | init <name> [cluster=<hex>] | add <name> <ip> <key> [<key>] | remove <name>]
+
+`add` and `remove` change a running server too: a peer taken off is lost
+and its connections closed; one whose address or key changed is lost and
+dialed again. `scripts/ipc-test.py` runs three of them on a LAN of
+`scripts/hub.py`'s.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module
