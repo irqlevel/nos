@@ -230,6 +230,71 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk:
     }
 }
 
+/// The networks at `nets` (`count` of them), for an allowlist: None for a
+/// null pointer with some, or more than a list holds.
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+unsafe fn nets_of(nets: *const ffi::tcp::TcpNet, count: usize) -> Option<([(u32, u8); crate::tcp::ALLOW_MAX], usize)> {
+    if count > crate::tcp::ALLOW_MAX || (count > 0 && nets.is_null()) {
+        return None;
+    }
+    let mut out = [(0u32, 0u8); crate::tcp::ALLOW_MAX];
+    if count > 0 {
+        // SAFETY: the caller's `count` TcpNets at `nets`.
+        let given = unsafe { core::slice::from_raw_parts(nets, count) };
+        for (o, n) in out.iter_mut().zip(given) {
+            *o = (n.ip, n.prefix);
+        }
+    }
+    Some((out, count))
+}
+
+/// `kernel_tcp_listen`, answering `nets` alone (`Tcp::listen_allowed`).
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool,
+                                                   nets: *const ffi::tcp::TcpNet, count: usize) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(nic) = Nic::from_handle(dev) else { return core::ptr::null_mut() };
+    // SAFETY: the caller's contract, passed on.
+    let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return core::ptr::null_mut() };
+    let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
+    match TCP.listen_allowed(&nic, port, backlog, buffers, &list[..n]) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// A listener's allowlist changed (`Tcp::set_allowed`).
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnPtr, nets: *const ffi::tcp::TcpNet, count: usize,
+                                                any: bool) -> i32 {
+    let Some(conn) = conn_of(listener) else { return -1 };
+    let done = if any {
+        TCP.set_allowed(conn, None)
+    } else {
+        // SAFETY: the caller's contract, passed on.
+        let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return -1 };
+        TCP.set_allowed(conn, Some(&list[..n]))
+    };
+    if done { 0 } else { -1 }
+}
+
+/// A connection's own floor for its timeout (`Tcp::set_rto_floor`).
+#[no_mangle]
+pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnPtr, ms: u32) -> i32 {
+    let Some(conn) = conn_of(conn) else { return -1 };
+    if TCP.set_rto_floor(conn, u64::from(ms)) { 0 } else { -1 }
+}
+
 /// An active open, for a module: to `ip`:`port` (host byte order) through the
 /// device `dev` names -- a `kernel_net_find` handle -- from an ephemeral port.
 /// Blocks until the connection is up or the connect timeout has passed: null

@@ -125,7 +125,7 @@ const CWND_MAX: u32 = 1 << 30;
 /// The retransmission timeout before the round trip has been measured
 /// (RFC 6298 2.1).
 const INITIAL_RTO_MS: u64 = 1000;
-const MAX_RTO_MS: u64 = 8000;
+pub const MAX_RTO_MS: u64 = 8000;
 /// The least a retransmission timeout is once the round trip has been
 /// measured. RFC 6298 2.4 says a second; this is Linux's floor
 /// (TCP_RTO_MIN), and for the same reason: a peer that delays its
@@ -137,7 +137,7 @@ const MAX_RTO_MS: u64 = 8000;
 /// forward relays to over the switch, a fraction of a millisecond away.
 /// nos itself acknowledges every segment at once, so a link both of whose
 /// ends are nos may have less (plans/tcp.md, T2).
-const MIN_RTO_MS: u64 = 200;
+pub const MIN_RTO_MS: u64 = 200;
 /// The clock's granularity in a timeout computed (RFC 6298 2.3's G): its
 /// deadlines are kept in milliseconds.
 const RTO_GRANULARITY_US: u64 = 1000;
@@ -168,6 +168,10 @@ pub const SWEEP_MS: u64 = 200;
 /// SYN from an address that is nobody's held a place in its listener's
 /// backlog that long (plans/tcp.md, T3).
 pub const HALF_OPEN_MS: u64 = 3000;
+/// The least floor a connection may be given of its own (`set_rto_floor`):
+/// a link both of whose ends are nos, which acknowledges every segment at
+/// once, so no delayed acknowledgement waits under it (plans/tcp.md, T2).
+pub const LINK_MIN_RTO_MS: u64 = 20;
 /// The most networks a listener answers SYNs from when it is told which
 /// (`listen_allowed`): a cluster's hosts each by its address, with room.
 pub const ALLOW_MAX: usize = 64;
@@ -683,6 +687,9 @@ struct Inner {
     bulk_wanted: bool,
 
     rto_ms: u64,
+    /// The least its timeout is once the round trip is measured: MIN_RTO_MS,
+    /// or less for a link whose other end acknowledges at once
+    min_rto_ms: u64,
     /// When what is outstanding goes again
     retransmit_at: Deadline,
     /// Retransmits with no acknowledgement in between
@@ -736,6 +743,7 @@ impl Inner {
             cwnd: IW_BYTES, ssthresh: u32::MAX, dup_acks: 0, recovery: Recovery::None, recover: 0, retx_nxt: 0,
             bulk_wanted: false,
             rto_ms: INITIAL_RTO_MS,
+            min_rto_ms: MIN_RTO_MS,
             retransmit_at: Deadline::NONE, retransmit_count: 0, srtt_us: 0, rttvar_us: 0, rtt_seq: 0, rtt_sent_ns: 0,
             stalled_since_ms: 0, opened_ms: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
@@ -789,6 +797,7 @@ impl Inner {
         self.retx_nxt = 0;
         self.bulk_wanted = false;
         self.rto_ms = INITIAL_RTO_MS;
+        self.min_rto_ms = MIN_RTO_MS;
         self.retransmit_at.clear();
         self.retransmit_count = 0;
         self.srtt_us = 0;
@@ -1112,14 +1121,14 @@ fn rtt_sample(inner: &mut Inner, sample_us: u64) {
 }
 
 /// The retransmission timeout the estimate gives: SRTT + max(G, 4 RTTVAR),
-/// held to [MIN_RTO_MS, MAX_RTO_MS] -- the initial second before the first
-/// sample.
+/// held to the connection's floor (MIN_RTO_MS unless given its own) and
+/// MAX_RTO_MS -- the initial second before the first sample.
 fn rtt_rto(inner: &Inner) -> u64 {
     if inner.srtt_us == 0 {
         return INITIAL_RTO_MS;
     }
     let us = inner.srtt_us.saturating_add(RTO_GRANULARITY_US.max(inner.rttvar_us.saturating_mul(4)));
-    us.div_ceil(1000).clamp(MIN_RTO_MS, MAX_RTO_MS)
+    us.div_ceil(1000).clamp(inner.min_rto_ms, MAX_RTO_MS)
 }
 
 /// A wait that nothing signals -- an answer, a connection, room in the
@@ -2494,6 +2503,27 @@ impl Tcp {
         true
     }
 
+    /// A connection's own floor for its timeout, `ms`: from LINK_MIN_RTO_MS
+    /// up to the MIN_RTO_MS every connection starts with, for a link both
+    /// of whose ends are nos -- what ipcnet's are -- where no delayed
+    /// acknowledgement waits under 200 ms. It takes effect from the next
+    /// round trip measured: the timeout of the moment is never lowered by
+    /// it, which may be backed off from a loss that the next sample alone
+    /// says is over (RFC 6298, 5.7). False for a value out of that range,
+    /// or a connection that is no slot's or a listener.
+    pub fn set_rto_floor(&'static self, conn: &'static Conn, ms: u64) -> bool {
+        if !(LINK_MIN_RTO_MS..=MIN_RTO_MS).contains(&ms) || self.index_of(conn).is_none() {
+            return false;
+        }
+        let mut inner = conn.inner.lock();
+        if matches!(inner.state, State::Free | State::Listen) {
+            return false;
+        }
+        inner.min_rto_ms = ms;
+        inner.rto_ms = inner.rto_ms.max(ms);
+        true
+    }
+
     /// Whether a listener answers `ip`: None for a connection that is no
     /// listener.
     pub fn admits(&'static self, listener: &'static Conn, ip: u32) -> Option<bool> {
@@ -3209,6 +3239,8 @@ impl Tcp {
                 },
                 retransmit_at: inner.retransmit_at.at(),
                 opened_ms: inner.opened_ms,
+                rto_ms: inner.rto_ms,
+                min_rto_ms: inner.min_rto_ms,
             })
         }
     }
@@ -3259,6 +3291,10 @@ pub struct ConnInfo {
     /// When a connection a listener took had its SYN (boot ms): what
     /// giving it up half open counts from
     pub opened_ms: u64,
+    /// Its retransmission timeout of the moment, and the least the round
+    /// trip may make it (`set_rto_floor`)
+    pub rto_ms: u64,
+    pub min_rto_ms: u64,
 }
 
 impl Tcp {
