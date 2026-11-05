@@ -319,6 +319,28 @@ body {
     text-align: center;
 }
 
+/* A <details> in a page (src/lib/markdown.ts): what it folds away under its summary, boxed as the docs' list of pages is */
+/* The box's padding insets what it holds -- a .table-wrap sets its own margins -- and the summary spans the box over it */
+.prose-nos details {
+    margin: 1.5em 0;
+    padding: 0 1rem;
+    border: 1px solid var(--line);
+    border-radius: 0.5rem;
+    background: var(--card);
+}
+
+.prose-nos summary {
+    margin: 0 -1rem;
+    padding: 0.625rem 1rem;
+    cursor: pointer;
+    font-weight: 500;
+    color: var(--fg);
+}
+
+.prose-nos details[open] > summary {
+    border-bottom: 1px solid var(--line);
+}
+
 .prose-nos :where(img) {
     border-radius: 8px;
     /* A screenshot's own background is the page's: its edge would not show */
