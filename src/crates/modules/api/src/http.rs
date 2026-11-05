@@ -35,7 +35,7 @@ use core::sync::atomic::Ordering;
 use kcore::mgmt::{self as bus, Kind, Status};
 use kcore::tcp::{TcpStream, RECV_TIMEOUT};
 use kcore::time::boot_time_ns;
-use tls::server::{Flush, Read, Recv, Refused, ServerStream, Socket, HANDSHAKE_MS};
+use tls::pinned::{Flush, Read, Recv, Refused, ServerStream, Socket, HANDSHAKE_MS};
 use web::http::{Limits, Method, Parsed, Request};
 
 use alloc::sync::Arc;
@@ -100,7 +100,7 @@ pub struct Who {
     pub name: String,
     pub role: Role,
     pub ip: u32,
-    pub key: tls::server::Fingerprint,
+    pub key: tls::pinned::Fingerprint,
 }
 
 /// How a connection ends.

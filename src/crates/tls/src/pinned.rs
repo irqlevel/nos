@@ -1,23 +1,29 @@
-//! A TLS server for the host API: TLS 1.3 alone, and a client's certificate
-//! required and taken by its key alone -- the SHA-256 of its
-//! SubjectPublicKeyInfo, which has to be on the list the server was given.
+//! TLS between ends that know each other by their keys: the host API's
+//! server ([`Server`]), and the client one host connects to another's with
+//! ([`Client`], ipcnet's link, plans/ipc.md I4). TLS 1.3 alone, each end
+//! presenting a certificate and taking the other's by its key alone -- the
+//! SHA-256 of its SubjectPublicKeyInfo, which has to be on the list it was
+//! given.
 //!
 //! What is let in is decided in the handshake, before a byte of what the
-//! client says is decrypted, let alone handed to whoever reads it: a client
-//! whose key is not on the list, or that presents none, is told so with an
-//! alert, and `accept` hands its socket back for the caller to reset. The
-//! certificate's dates, its issuer and its chain are not looked at -- the key
-//! is what the list names, as an `authorized_keys` does -- but the
-//! handshake's signature is: the client has to hold the key it showed.
+//! other end says is decrypted, let alone handed to whoever reads it: a
+//! client whose key is not on the server's list, or that presents none, is
+//! told so with an alert, and `accept` hands its socket back for the caller
+//! to reset; a server whose key is not on the client's list is told so too,
+//! and `connect` hands the socket back. The certificate's dates, its issuer
+//! and its chain are not looked at -- the key is what the list names, as an
+//! `authorized_keys` does -- but the handshake's signature is: an end has to
+//! hold the key it showed.
 //!
 //! rustls drives the protocol, through its unbuffered API, as the client in
 //! lib.rs does; the loop here does the reading and writing, over a
-//! [`Socket`] whose every wait is bounded. A read with nothing to read in
-//! its time is not an error; what is encrypted waits in the session until a
-//! `flush` sends it, for as long as the caller lets it -- so one client that
-//! stops reading holds up nobody but itself.
+//! [`Socket`] whose every wait is bounded, the same for either end
+//! ([`Session`]). A read with nothing to read in its time is not an error;
+//! what is encrypted waits in the session until a `flush` sends it, for as
+//! long as the caller lets it -- so one end that stops reading holds up
+//! nobody but itself.
 //!
-//! Compiled only with the `server` feature: the kernel's own `tls`, the HTTP
+//! Compiled only with the `pinned` feature: the kernel's own `tls`, the HTTP
 //! client's, is built without it.
 
 use alloc::sync::Arc;
@@ -26,17 +32,19 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use kcore::consts::NS_PER_MS;
-use rustls::client::danger::HandshakeSignatureValid;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::{ClientConnectionData, Resumption, UnbufferedClientConnection};
 use rustls::crypto::{verify_tls13_signature, WebPkiSupportedAlgorithms};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
+use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::server::{NoServerSessionStorage, UnbufferedServerConnection};
+use rustls::server::{NoServerSessionStorage, ServerConnectionData, UnbufferedServerConnection};
 use rustls::time_provider::TimeProvider;
 use rustls::unbuffered::{ConnectionState, EncodeError, EncryptError, UnbufferedStatus};
-use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme};
+use rustls::{CertificateError, ClientConfig, CommonState, DigitallySignedStruct, DistinguishedName, Error, ServerConfig,
+             SignatureScheme};
 use sha2::{Digest, Sha256};
 
-/// A client's key, as the server knows it: the SHA-256 of the
+/// An end's key, as the other knows it: the SHA-256 of the
 /// SubjectPublicKeyInfo of the certificate it presents.
 pub type Fingerprint = [u8; 32];
 
@@ -59,8 +67,8 @@ const HANDSHAKE_TURNS: usize = 8192;
 /// How long the alert that refuses a client is given to go out.
 const ALERT_MS: u64 = 1_000;
 
-/// The key of the certificate `cert` (DER), as the server knows a client
-/// by: None for what is not a certificate webpki can read.
+/// The key of the certificate `cert` (DER), as one end knows the other by:
+/// None for what is not a certificate webpki can read.
 pub fn fingerprint(cert: &[u8]) -> Option<Fingerprint> {
     let der = CertificateDer::from(cert);
     let parsed = webpki::EndEntityCert::try_from(&der).ok()?;
@@ -89,7 +97,7 @@ pub enum Recv {
     Failed,
 }
 
-/// Why a handshake did not let the client in.
+/// Why a handshake did not let the other end in -- or was not let in by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
     /// Not finished within its time.
@@ -98,7 +106,7 @@ pub enum Refused {
     Closed,
     /// The socket failed.
     Io,
-    /// Its key is not one the server lets in.
+    /// Its key is not one this end lets in.
     UnknownKey,
     /// It presented no certificate.
     NoCertificate,
@@ -109,8 +117,11 @@ pub enum Refused {
     Incompatible,
     /// It did not speak TLS as it should.
     Protocol,
-    /// It sent an alert: it gave up on the server.
+    /// It sent an alert: the client gave up on the server.
     ClientAlert,
+    /// It sent an alert: the server gave up on the client -- its key not on
+    /// the server's list, as often as not.
+    ServerAlert,
     /// No memory for the session.
     NoMemory,
 }
@@ -127,23 +138,25 @@ impl Refused {
             Refused::Incompatible => "incompatible",
             Refused::Protocol => "protocol",
             Refused::ClientAlert => "client alert",
+            Refused::ServerAlert => "server alert",
             Refused::NoMemory => "no memory",
         }
     }
 
-    fn of(e: &Error) -> Refused {
+    /// The refusal `e` is, an alert from the other end being `alert`.
+    fn of(e: &Error, alert: Refused) -> Refused {
         match e {
             Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure) => Refused::UnknownKey,
             Error::InvalidCertificate(_) => Refused::BadCertificate,
             Error::NoCertificatesPresented => Refused::NoCertificate,
             Error::PeerIncompatible(_) | Error::NoApplicationProtocol => Refused::Incompatible,
-            Error::AlertReceived(_) => Refused::ClientAlert,
+            Error::AlertReceived(_) => alert,
             _ => Refused::Protocol,
         }
     }
 }
 
-/// Why a server could not be set up.
+/// Why a server or a client could not be set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupError {
     /// The key is not one rustls can sign with, or not the certificate's.
@@ -209,6 +222,48 @@ impl ClientCertVerifier for Pinned {
     }
 }
 
+/// The servers' keys a client lets itself be served by, and how the
+/// handshake's signature is checked: the client's side of `Pinned`.
+#[derive(Debug)]
+struct PinnedServer {
+    keys: Vec<Fingerprint>,
+    algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for PinnedServer {
+    /* The key, and nothing else: not its dates, not its issuer, and not the
+     * name it is for -- the client connects to an address whose key it was
+     * given, and the key is what it checks */
+    fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
+                          _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime)
+                          -> Result<ServerCertVerified, Error> {
+        let Some(key) = fingerprint(end_entity) else {
+            return Err(Error::InvalidCertificate(CertificateError::BadEncoding));
+        };
+        if self.keys.contains(&key) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure))
+        }
+    }
+
+    /* The client speaks TLS 1.3 alone, so rustls never asks */
+    fn verify_tls12_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct)
+                              -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::InvalidCertificate(CertificateError::BadSignature))
+    }
+
+    /* That the server holds the key its certificate has */
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct)
+                              -> Result<HandshakeSignatureValid, Error> {
+        verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
 /// The server's clock. It judges no certificate's dates -- not its own,
 /// not a client's -- so any time will do while the wall clock is not set.
 #[derive(Debug)]
@@ -258,28 +313,53 @@ impl Server {
             Ok(conn) => conn,
             Err(_) => return Err((sock, Refused::NoMemory)),
         };
-        let mut incoming = Vec::new();
-        if incoming.try_reserve_exact(RECORD_BUF).is_err() {
-            return Err((sock, Refused::NoMemory));
-        }
-        incoming.resize(RECORD_BUF, 0);
-        let mut stream = ServerStream {
-            conn,
-            sock,
-            incoming,
-            used: 0,
-            pending: Vec::new(),
-            sent: 0,
-            plain: Vec::new(),
-            plain_pos: 0,
-            client: [0; 32],
-            closed: false,
-            failed: false,
+        Session::begin(conn, sock, within_ms)
+    }
+}
+
+/// What a client presents and whose keys it lets serve it: made once, shared
+/// by every connection it makes, and made again whole when the keys change.
+pub struct Client {
+    config: Arc<ClientConfig>,
+}
+
+impl Client {
+    /// A client with `cert` (DER) and its key `key` (PKCS#8 DER), served by
+    /// the servers whose keys are `servers`, offering the protocols `alpn`
+    /// (none for no ALPN).
+    pub fn new(cert: &[u8], key: &[u8], servers: &[Fingerprint], alpn: &[&[u8]]) -> Result<Client, SetupError> {
+        let provider = Arc::new(rustls_rustcrypto::provider());
+        let verifier =
+            Arc::new(PinnedServer { keys: servers.to_vec(), algs: provider.signature_verification_algorithms });
+        let mut config = ClientConfig::builder_with_details(provider, Arc::new(AnyTime))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| SetupError::Config)?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(vec![CertificateDer::from(cert.to_vec())],
+                                   PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())))
+            .map_err(|_| SetupError::Key)?;
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        /* No resumption, as the server keeps none: every connection shows
+         * both keys afresh */
+        config.resumption = Resumption::disabled();
+        Ok(Client { config: Arc::new(config) })
+    }
+
+    /// A session with the server at `server` (its IPv4 address, host order)
+    /// that connected on `sock`, its handshake given `within_ms`: the
+    /// session, or the socket back and why -- to be reset. The address is
+    /// the name rustls is given, which sends none of an address (no SNI) and
+    /// whose certificate is judged by its key alone.
+    pub fn connect<S: Socket>(&self, sock: S, server: u32, within_ms: u64)
+        -> Result<ClientStream<S>, (S, Refused)>
+    {
+        let name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::from(server.to_be_bytes())));
+        let conn = match UnbufferedClientConnection::new(self.config.clone(), name) {
+            Ok(conn) => conn,
+            Err(_) => return Err((sock, Refused::NoMemory)),
         };
-        match stream.handshake(within_ms) {
-            Ok(()) => Ok(stream),
-            Err(why) => Err((stream.sock, why)),
-        }
+        Session::begin(conn, sock, within_ms)
     }
 }
 
@@ -325,24 +405,97 @@ enum Turn {
     NoMemory,
 }
 
-/// A session, from the handshake on. Dropped, it drops its socket and sends
-/// nothing; `close` ends it with a close_notify, and `into_socket` hands the
-/// socket back for a reset.
-pub struct ServerStream<S: Socket> {
-    conn: UnbufferedServerConnection,
+/* What `End` is sealed by: rustls's two ends, and no other */
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for rustls::server::UnbufferedServerConnection {}
+    impl Sealed for rustls::client::UnbufferedClientConnection {}
+}
+
+/// One end of a session as rustls has it -- the server's or the client's,
+/// each with its own `process_tls_records` -- and what a [`Session`] needs
+/// of it.
+pub trait End: sealed::Sealed {
+    type Data;
+    /// What an alert from the other end is refused as
+    const ALERT: Refused;
+    /// Whether `close` waits for the other end's FIN before it says to
+    /// close: the server's does, so that the client -- which closes first --
+    /// is the end left in TIME-WAIT. The client's does not: two ends each
+    /// waiting for the other's FIN would both give up and reset.
+    const WAITS_FOR_FIN: bool;
+    /// The records in `incoming` processed, and the state that leaves
+    fn process<'c, 'i>(&'c mut self, incoming: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, Self::Data>;
+    /// What both ends have: the protocol agreed, the other's certificates
+    fn common(&self) -> &CommonState;
+}
+
+impl End for UnbufferedServerConnection {
+    type Data = ServerConnectionData;
+    const ALERT: Refused = Refused::ClientAlert;
+    const WAITS_FOR_FIN: bool = true;
+
+    fn process<'c, 'i>(&'c mut self, incoming: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, ServerConnectionData> {
+        self.process_tls_records(incoming)
+    }
+
+    fn common(&self) -> &CommonState {
+        self
+    }
+}
+
+impl End for UnbufferedClientConnection {
+    type Data = ClientConnectionData;
+    const ALERT: Refused = Refused::ServerAlert;
+    const WAITS_FOR_FIN: bool = false;
+
+    fn process<'c, 'i>(&'c mut self, incoming: &'i mut [u8]) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
+        self.process_tls_records(incoming)
+    }
+
+    fn common(&self) -> &CommonState {
+        self
+    }
+}
+
+/// A session, from the handshake on, at either end. Dropped, it drops its
+/// socket and sends nothing; `close` ends it with a close_notify, and
+/// `into_socket` hands the socket back for a reset.
+pub struct Session<S: Socket, E: End> {
+    conn: E,
     sock: S,
-    /// What the client sent that rustls has not taken yet
+    /// What the other end sent that rustls has not taken yet
     incoming: Vec<u8>,
     used: usize,
     /// Encrypted, waiting to go out: from `sent` on
     pending: Vec<u8>,
     sent: usize,
-    /// What the client said, decrypted, not yet read: from `plain_pos` on
+    /// What the other end said, decrypted, not yet read: from `plain_pos` on
     plain: Vec<u8>,
     plain_pos: usize,
-    client: Fingerprint,
+    /// The other end's key, once the handshake has checked it
+    peer: Fingerprint,
     closed: bool,
     failed: bool,
+}
+
+/// A server's session with a client it let in.
+pub type ServerStream<S> = Session<S, UnbufferedServerConnection>;
+/// A client's session with a server whose key it was given.
+pub type ClientStream<S> = Session<S, UnbufferedClientConnection>;
+
+impl<S: Socket> ServerStream<S> {
+    /// The key the client showed, which is one the server lets in.
+    pub fn client(&self) -> &Fingerprint {
+        &self.peer
+    }
+}
+
+impl<S: Socket> ClientStream<S> {
+    /// The key the server showed, which is one the client was given.
+    pub fn server(&self) -> &Fingerprint {
+        &self.peer
+    }
 }
 
 /// `len` bytes more at the end of `buf`, zeroed for `fill` to overwrite:
@@ -414,15 +567,42 @@ fn left_ms(deadline: u64) -> u64 {
     if left == 0 { 0 } else { left.div_ceil(NS_PER_MS) }
 }
 
-impl<S: Socket> ServerStream<S> {
-    /// The key the client showed, which is one the server lets in.
-    pub fn client(&self) -> &Fingerprint {
-        &self.client
+impl<S: Socket, E: End> Session<S, E> {
+    /// The session over `sock` that `conn` is the start of, its handshake
+    /// done within `within_ms` -- or the socket back and why.
+    fn begin(conn: E, sock: S, within_ms: u64) -> Result<Session<S, E>, (S, Refused)> {
+        let mut incoming = Vec::new();
+        if incoming.try_reserve_exact(RECORD_BUF).is_err() {
+            return Err((sock, Refused::NoMemory));
+        }
+        incoming.resize(RECORD_BUF, 0);
+        let mut session = Session {
+            conn,
+            sock,
+            incoming,
+            used: 0,
+            pending: Vec::new(),
+            sent: 0,
+            plain: Vec::new(),
+            plain_pos: 0,
+            peer: [0; 32],
+            closed: false,
+            failed: false,
+        };
+        match session.handshake(within_ms) {
+            Ok(()) => Ok(session),
+            Err(why) => Err((session.sock, why)),
+        }
+    }
+
+    /// The other end's key: one this end was given.
+    pub fn peer(&self) -> &Fingerprint {
+        &self.peer
     }
 
     /// The protocol the two agreed on by ALPN, if any.
     pub fn alpn(&self) -> Option<&[u8]> {
-        self.conn.alpn_protocol()
+        self.conn.common().alpn_protocol()
     }
 
     /// The socket, for what only it knows: who is at the other end.
@@ -439,7 +619,7 @@ impl<S: Socket> ServerStream<S> {
     /// the session can, and taken.
     fn turn(&mut self, app_out: &mut Option<&[u8]>) -> Turn {
         let Self { conn, incoming, used, pending, plain, .. } = self;
-        let UnbufferedStatus { mut discard, state } = conn.process_tls_records(&mut incoming[..*used]);
+        let UnbufferedStatus { mut discard, state } = conn.process(&mut incoming[..*used]);
         let turn = match state {
             Err(e) => Turn::Failed(e),
             Ok(ConnectionState::ReadTraffic(mut traffic)) => {
@@ -532,8 +712,8 @@ impl<S: Socket> ServerStream<S> {
     fn handshake(&mut self, within_ms: u64) -> Result<(), Refused> {
         let until = deadline(within_ms);
         for _ in 0..HANDSHAKE_TURNS {
-            /* What a turn made goes out before the next read: the client
-             * waits for it */
+            /* What a turn made goes out before the next read: the other
+             * end waits for it */
             if self.pending() != 0 {
                 match self.send_until(until) {
                     Some(true) => {}
@@ -558,8 +738,9 @@ impl<S: Socket> ServerStream<S> {
                 /* A client with nothing to say sends its Finished and its
                  * close_notify in one flight, and rustls says it closed
                  * before it says the session is up: a handshake done, a
-                 * session let in and already over */
-                Turn::PeerClosed | Turn::Closed if !self.conn.is_handshaking() => {
+                 * session let in and already over -- and a server may close
+                 * as soon as its handshake is, likewise */
+                Turn::PeerClosed | Turn::Closed if !self.conn.common().is_handshaking() => {
                     self.closed = true;
                     return self.admitted();
                 }
@@ -567,22 +748,22 @@ impl<S: Socket> ServerStream<S> {
                 Turn::NoMemory => return Err(Refused::NoMemory),
                 Turn::Failed(e) => {
                     self.send_alert();
-                    return Err(Refused::of(&e));
+                    return Err(Refused::of(&e, E::ALERT));
                 }
             }
         }
         Err(Refused::Protocol)
     }
 
-    /// The handshake is done: the key the client showed -- which the
+    /// The handshake is done: the key the other end showed -- which the
     /// verifier let in, and whose signature it checked -- kept for the
-    /// caller. A session up without one would be a client nobody checked:
+    /// caller. A session up without one would be an end nobody checked:
     /// refused rather than trusted.
     fn admitted(&mut self) -> Result<(), Refused> {
-        let key = self.conn.peer_certificates().and_then(|certs| certs.first()).and_then(|c| fingerprint(c));
+        let key = self.conn.common().peer_certificates().and_then(|certs| certs.first()).and_then(|c| fingerprint(c));
         match key {
             Some(key) => {
-                self.client = key;
+                self.peer = key;
                 Ok(())
             }
             None => Err(Refused::NoCertificate),
@@ -590,7 +771,7 @@ impl<S: Socket> ServerStream<S> {
     }
 
     /// The alert rustls queued with its refusal, sent if it can be within
-    /// `ALERT_MS`: what tells the client why, before its reset.
+    /// `ALERT_MS`: what tells the other end why, before its reset.
     ///
     /// One more turn, and no other: what rustls has queued it hands out
     /// before it parses anything, so that turn takes the alert -- but a
@@ -601,7 +782,7 @@ impl<S: Socket> ServerStream<S> {
     /// was handed, and every call must hand it the same.)
     fn send_alert(&mut self) {
         let Self { conn, incoming, used, pending, .. } = self;
-        let UnbufferedStatus { state, .. } = conn.process_tls_records(&mut incoming[..*used]);
+        let UnbufferedStatus { state, .. } = conn.process(&mut incoming[..*used]);
         if let Ok(ConnectionState::EncodeTlsData(mut encoder)) = state {
             if matches!(append_with(pending, FLIGHT, |buf| encoder.encode(buf), encode_size), Ok(true)) {
                 let _ = self.send_until(deadline(ALERT_MS));
@@ -609,7 +790,7 @@ impl<S: Socket> ServerStream<S> {
         }
     }
 
-    /// What the client said, for at most `wait_ms`: Idle when it said
+    /// What the other end said, for at most `wait_ms`: Idle when it said
     /// nothing in that time.
     pub fn read(&mut self, buf: &mut [u8], wait_ms: u64) -> Read {
         let until = deadline(wait_ms);
@@ -641,7 +822,7 @@ impl<S: Socket> ServerStream<S> {
                         Recv::Data(_) => {}
                         Recv::Idle => return Read::Idle,
                         /* The end of the stream between two records is the
-                         * client gone; inside one, the stream was cut */
+                         * other end gone; inside one, the stream was cut */
                         Recv::End if self.used == 0 => self.closed = true,
                         Recv::End | Recv::Failed => self.failed = true,
                     }
@@ -658,9 +839,9 @@ impl<S: Socket> ServerStream<S> {
     /// would leave more than `max_pending` waiting: false then, nothing
     /// taken, and the caller flushes first. False for a session that has
     /// failed too. A `data` longer than `max_pending` never fits: it goes in
-    /// pieces. A client that has said its close_notify is still written to:
-    /// it closed its side, not the server's -- an answer to what it said
-    /// before goes out, and the server's own goodbye after.
+    /// pieces. An end that has said its close_notify is still written to:
+    /// it closed its side, not this one's -- an answer to what it said
+    /// before goes out, and this end's own goodbye after.
     pub fn write(&mut self, data: &[u8], max_pending: usize) -> bool {
         if self.failed {
             return false;
@@ -708,12 +889,14 @@ impl<S: Socket> ServerStream<S> {
         }
     }
 
-    /// A close_notify after what waits, and then the client's end of the
-    /// stream, each waited for within `wait_ms`; the socket back, and
-    /// whether both happened. True: close it -- the client closed first, so
-    /// the slot left in TIME-WAIT is the client's. False: reset it. A
-    /// server that closed on a close_notify alone would send its FIN before
-    /// the client's arrived, and both ends would keep TIME-WAIT.
+    /// A close_notify after what waits -- and, at the server's end, then the
+    /// client's end of the stream -- each waited for within `wait_ms`; the
+    /// socket back, and whether all of it happened. True: close it. At the
+    /// server's end the client closed first, so the slot left in TIME-WAIT
+    /// is the client's; a server that closed on a close_notify alone would
+    /// send its FIN before the client's arrived, and both ends would keep
+    /// TIME-WAIT. At the client's end the client closes first, and keeps
+    /// TIME-WAIT itself. False: reset it.
     pub fn close(mut self, wait_ms: u64) -> (S, bool) {
         if self.failed {
             return (self.sock, false);
@@ -722,14 +905,14 @@ impl<S: Socket> ServerStream<S> {
         let mut queued = false;
         for _ in 0..MAX_TURNS {
             let Self { conn, incoming, used, pending, .. } = &mut self;
-            let UnbufferedStatus { mut discard, state } = conn.process_tls_records(&mut incoming[..*used]);
+            let UnbufferedStatus { mut discard, state } = conn.process(&mut incoming[..*used]);
             let done = match state {
                 Ok(ConnectionState::WriteTraffic(mut writer)) => {
                     queued = matches!(append_with(pending, 64, |buf| writer.queue_close_notify(buf), encrypt_size),
                                       Ok(true));
                     true
                 }
-                /* What the client said meanwhile is not read any more */
+                /* What the other end said meanwhile is not read any more */
                 Ok(ConnectionState::ReadTraffic(mut traffic)) => {
                     while let Some(Ok(record)) = traffic.next_record() {
                         discard += record.discard;
@@ -755,6 +938,9 @@ impl<S: Socket> ServerStream<S> {
         }
         if !queued || self.send_until(until) != Some(true) {
             return (self.sock, false);
+        }
+        if !E::WAITS_FOR_FIN {
+            return (self.sock, true);
         }
         /* The client's FIN: whatever it sends before it is not read */
         let mut scratch = [0u8; 256];

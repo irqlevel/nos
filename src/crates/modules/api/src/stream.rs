@@ -32,7 +32,7 @@ use core::sync::atomic::Ordering;
 use kcore::mgmt::{self as bus, Status, Writer};
 use kcore::time::boot_time_ns;
 use mgmtwire::{json, Limits};
-use tls::server::Read;
+use tls::pinned::Read;
 use web::http::Request;
 use web::ws::{Decoder, Event, Opcode};
 

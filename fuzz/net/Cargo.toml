@@ -19,7 +19,7 @@ kcore = { path = "../../src/crates/kcore" }
 netwire = { path = "../../src/crates/netwire" }
 net = { path = "../../src/crates/net" }
 # The server too: the host API's (the tls_server target).
-tls = { path = "../../src/crates/tls", features = ["server"] }
+tls = { path = "../../src/crates/tls", features = ["pinned"] }
 # The certificates of the world's TLS clients and of the server they talk to.
 web = { path = "../../src/crates/web" }
 fs = { path = "../../src/crates/fs" }

@@ -1128,7 +1128,7 @@ own, TCP's flags in combinations that mean something. The targets:
   it -- run with none, or after a pty-req of a size and window-changes to
   others, sizes of 0 and of `u32::MAX` among them -- and must say the last
   size sent and how many changes there were, as `edit` is told them;
-- `tls_server`: the TLS server the host API serves over (`tls::server`), run
+- `tls_server`: the TLS server the host API serves over (`tls::pinned::Server`), run
   as the module runs it -- a listener and a task a connection over the
   kernel's TCP, at most four at once -- letting in one key and answering
   each line said to it; and the world's TLS clients (`tlsc.rs`, rustls'
@@ -1144,6 +1144,20 @@ own, TCP's flags in combinations that mean something. The targets:
   the protocol both prefer, every line back in order and a goodbye; the
   server is never the side left in TIME-WAIT, and once it stops nothing is
   left behind;
+- `tls_client`: the pinned client (`tls::pinned::Client`), what ipcnet's
+  link to another host will be, run as a module will -- a task that
+  connects over the kernel's TCP, says lines and reads them back -- against
+  the world's rustls server, which shows its own key, a stranger's, or its
+  own certificate signed by another key; asks for the client's certificate
+  and lets the machine's key in, asks and lets in another's, or does not
+  ask; or breaks the protocol -- an HTTP answer for a ServerHello, silence,
+  a hang-up, TLS 1.2 alone, no protocol in common, a byte flipped. Over any
+  link a session is up only with the server's own key, proved, and nothing
+  is read that was not said; over a good one each connection is refused for
+  its plan's reason, or every byte comes back and the client closes cleanly,
+  first. Five mutants of the client -- the key not checked, the signature
+  not checked, TLS 1.2 spoken, the client waiting for the server's FIN, the
+  key not kept -- each fail it;
 - `api`: the host API module's own source (`modules/api`) on a ramfs root,
   its api.toml and clients written there first, its host key found there or
   made on its first start; on the bus the kernel's system provider (its
