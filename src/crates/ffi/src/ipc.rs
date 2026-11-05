@@ -103,6 +103,21 @@ pub const IPC_SCOPE_CLUSTER: u32 = 1;
 pub const IPC_RECV_NONE: i64 = -1;
 pub const IPC_RECV_TOO_SMALL: i64 = -2;
 pub const IPC_RECV_CLOSED: i64 = -3;
+/// What `kernel_ipc_recv_part` answers for a part past its message's end,
+/// or of a message that is no longer the one its ticket names.
+pub const IPC_RECV_STALE: i64 = -4;
+
+/// Bytes somewhere in the caller's memory: one piece of a payload given in
+/// several.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcPiece {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// The most pieces a payload is given in.
+pub const IPC_PIECES_MAX: usize = 1024;
 
 unsafe extern "C" {
     /// A mailbox, held to `messages` and `bytes` queued: its address, or 0
@@ -135,6 +150,18 @@ unsafe extern "C" {
     /// its length -- or one of the IPC_RECV_*. One task receives from a
     /// mailbox at a time.
     pub fn kernel_ipc_recv(mbox: u64, timeout_ns: u64, header: *mut IpcHeader, buf: *mut u8, cap: usize) -> i64;
+
+    /// Part of `mbox`'s next message: `cap` bytes of its payload from
+    /// `offset` into `buf`, its header into `header` -- `len` its whole
+    /// length -- waiting up to `timeout_ns` for one when `offset` is 0. The
+    /// first part sets `*ticket`, which each part after it is given back, so
+    /// that every part is of the one message: it stays first until its last
+    /// byte is read, and is taken then -- with its first part, when that
+    /// is all of it. What a message larger than a module can hold in one
+    /// piece of its heap is received by. The bytes copied, or IPC_RECV_NONE,
+    /// IPC_RECV_CLOSED, IPC_RECV_STALE.
+    pub fn kernel_ipc_recv_part(mbox: u64, timeout_ns: u64, header: *mut IpcHeader, buf: *mut u8, cap: usize,
+                                offset: u64, ticket: *mut u64) -> i64;
 
     /// The task waiting in `kernel_ipc_recv` on `mbox` woken, with nothing:
     /// a module's way to tell its own server task to look at something else
@@ -177,11 +204,12 @@ unsafe extern "C" {
 
     /// A message come from the peer `peer`, the router's call: from its
     /// mailbox `from` (the peer's own address of it), to this host's mailbox
-    /// `to` -- or, with `name_len` past 0, to the `Cluster` name `name` -- its
-    /// `len` bytes copied. Delivered to a `Cluster` name, or to a mailbox that
-    /// has sent to that peer; refused otherwise. ipc's `Error::code`.
+    /// `to` -- or, with `name_len` past 0, to the `Cluster` name `name` --
+    /// its payload the `count` pieces at `pieces`, copied in order.
+    /// Delivered to a `Cluster` name, or to a mailbox that has sent to that
+    /// peer; refused otherwise. ipc's `Error::code`.
     pub fn kernel_ipc_deliver_remote(router: u64, peer: u32, from: u64, to: u64, name: *const u8, name_len: usize,
-                                     tag: u32, reference: u64, data: *const u8, len: usize) -> i32;
+                                     tag: u32, reference: u64, pieces: *const IpcPiece, count: usize) -> i32;
 
     /// The peer `peer` says the mailbox a monitor of this host's watched has
     /// gone (`reason`, an IPC_DOWN_*): the monitor `id`'s Down delivered.

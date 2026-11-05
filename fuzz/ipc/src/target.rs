@@ -159,6 +159,21 @@ fn prefix_ok(prefix: &str) -> bool {
     prefix.len() <= 48 && !body.is_empty() && body.split('.').all(part_ok)
 }
 
+/// `data` cut into one to four pieces, some of them empty, at random.
+fn split<'a>(data: &'a [u8], r: &mut Input) -> Vec<&'a [u8]> {
+    let n = 1 + r.below(4) as usize;
+    let mut cuts: Vec<usize> = (1..n).map(|_| r.below(data.len() as u64 + 1) as usize).collect();
+    cuts.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for c in cuts {
+        out.push(&data[at..c]);
+        at = c;
+    }
+    out.push(&data[at..]);
+    out
+}
+
 fn pattern(n: usize, seed: u8) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(37) ^ seed).collect()
 }
@@ -288,19 +303,9 @@ impl Model {
             return;
         }
         let addr = self.boxes[at].addr;
-        /* The table: a router's close loses every peer up */
-        let mut lost = Vec::new();
-        if self.router == Some(at) {
+        let was_router = self.router == Some(at);
+        if was_router {
             self.router = None;
-            for i in 0..self.peers.len() {
-                let host = match &self.peers[i] {
-                    Some(p) if p.up => number(i, p.epoch),
-                    _ => continue,
-                };
-                if let Some(x) = self.lose(i, host) {
-                    lost.push((x, host));
-                }
-            }
         }
         /* Its address forgotten by every peer, its remote monitors taken */
         for p in self.peers.iter_mut().flatten() {
@@ -325,6 +330,20 @@ impl Model {
                 self.watches.swap_remove(i);
             } else {
                 i += 1;
+            }
+        }
+        /* A router's close loses every peer up -- after its own watches and
+         * remote monitors went, so it hears nothing of it */
+        let mut lost = Vec::new();
+        if was_router {
+            for i in 0..self.peers.len() {
+                let host = match &self.peers[i] {
+                    Some(p) if p.up => number(i, p.epoch),
+                    _ => continue,
+                };
+                if let Some(x) = self.lose(i, host) {
+                    lost.push((x, host));
+                }
             }
         }
         for ((key, watchers), host) in lost {
@@ -649,6 +668,7 @@ fn recv(m: &mut Model, r: &mut Input) {
             }
         }
         (Owner::Image, None) => {}
+        (Owner::Module(_), _) if r.chance(80) => recv_parts(m, r, at),
         (Owner::Module(_), _) => {
             let mut h = abi::IpcHeader::default();
             let mut buf = vec![0u8; cap];
@@ -675,6 +695,69 @@ fn recv(m: &mut Model, r: &mut Input) {
             }
         }
     }
+}
+
+/// The front of a module's mailbox received in parts (`kernel_ipc_recv_part`):
+/// each part the bytes the model has there, the message taken with its last
+/// -- or left first, all of it, when the reader gives up part way -- and a
+/// part past the end, or with a ticket not the first part's, refused.
+fn recv_parts(m: &mut Model, r: &mut Input, at: usize) {
+    let addr = m.boxes[at].addr;
+    let mut h = abi::IpcHeader::default();
+    let mut ticket = 0u64;
+    let first = r.pick(&[0usize, 1, 7, 64, 1 << 16]);
+    let mut buf = vec![0u8; first];
+    // SAFETY: `h` and `ticket` are writable, `buf` has `first` bytes.
+    let got = unsafe { abi::kernel_ipc_recv_part(addr, 0, &mut h, buf.as_mut_ptr(), first, 0, &mut ticket) };
+    if !m.boxes[at].open {
+        invariant!(got == abi::IPC_RECV_CLOSED, "a closed mailbox received from in parts: {}", got);
+        return;
+    }
+    let Some(front) = m.boxes[at].queue.front().cloned() else {
+        invariant!(got == abi::IPC_RECV_NONE, "an empty mailbox gave a part: {}", got);
+        return;
+    };
+    let len = front.data.len();
+    say!("recv_parts {:x}: first {} of {} -> {}", addr, first, len, got);
+    invariant!(got >= 0 && h.len == len as u64 && h.from == front.from && h.tag == front.tag
+               && h.reference == front.reference, "the first part of {:?}: {} bytes, header {} {:x} {:x} {}", front,
+               got, h.len, h.from, h.tag, h.reference);
+    let mut offset = got as usize;
+    invariant!(offset == first.min(len) && buf[..offset] == front.data[..offset], "the first part's bytes");
+    while offset < len {
+        match r.u8() % 16 {
+            /* Given up part way: the message stays first, all of it */
+            0 => {
+                reached("a receive in parts given up part way");
+                return;
+            }
+            /* A ticket not the first part's, or a part past the end */
+            1 => {
+                /* At offset 0 a part starts the message afresh: a ticket is
+                 * held to from the second on */
+                let (o, t) = if r.bool() { (offset.max(1), ticket ^ 1) } else { (len + 1 + r.below(8) as usize, ticket) };
+                let mut t = t;
+                let mut b = [0u8; 8];
+                // SAFETY: as above, `b` has 8 bytes.
+                let got = unsafe { abi::kernel_ipc_recv_part(addr, 0, &mut h, b.as_mut_ptr(), 8, o as u64, &mut t) };
+                invariant!(got == abi::IPC_RECV_STALE, "a stale part answered {}", got);
+                reached("a stale part refused");
+            }
+            _ => {}
+        }
+        let want = r.pick(&[1usize, 3, 100, 4096, 1 << 16]).min(len - offset);
+        let mut part = vec![0u8; want];
+        // SAFETY: as above, `part` has `want` bytes.
+        let got = unsafe {
+            abi::kernel_ipc_recv_part(addr, 0, &mut h, part.as_mut_ptr(), want, offset as u64, &mut ticket)
+        };
+        invariant!(got == want as i64 && part[..] == front.data[offset..offset + want],
+                   "a part of {} bytes at {} of {}: {}", want, offset, len, got);
+        offset += want;
+    }
+    let w = take(m, at).expect("a front");
+    invariant!(w == front, "the message received in parts is not the front's");
+    reached("a message received in parts");
 }
 
 fn register(m: &mut Model, r: &mut Input) {
@@ -1046,10 +1129,14 @@ fn deliver_remote(m: &mut Model, r: &mut Input) {
             if by_name && name.is_empty() {
                 return;
             }
-            // SAFETY: the name and the data are their lengths' bytes.
+            /* The data in pieces, as an assembled message has it */
+            let cuts = split(&data, r);
+            let pieces: Vec<abi::IpcPiece> = cuts.iter().map(|c| abi::IpcPiece { data: c.as_ptr(), len: c.len() })
+                .collect();
+            // SAFETY: the name is its length's bytes, and each piece names its own.
             let code = unsafe {
                 abi::kernel_ipc_deliver_remote(m.boxes[at].addr, u32::from(host), from, to, np, nl, tag, reference,
-                                               data.as_ptr(), data.len())
+                                               pieces.as_ptr(), pieces.len())
             };
             match code {
                 0 => Ok(()),
@@ -1275,6 +1362,7 @@ fn sleep_in((addr, res, fin): SleeperCtx) {
     // SAFETY: `h` is a header, and `buf` has 4096 bytes.
     let got = unsafe { abi::kernel_ipc_recv(addr, SLEEP_NS, &mut h, buf.as_mut_ptr(), buf.len()) };
     let n = usize::try_from(got).unwrap_or(0);
+    say!("sleeper {:x}: {} from {:x} tag {:x} ref {:x} {:?}", addr, got, h.from, h.tag, h.reference, &buf[..n]);
     *res.lock().unwrap() = Some((got, buf[..n].to_vec()));
     fin.store(true, Ordering::Release);
 }

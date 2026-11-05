@@ -249,6 +249,21 @@ impl Message {
     }
 }
 
+/// A message received in pieces (`Mailbox::recv_pieces`): who sent it, its
+/// tag and reference, its bytes -- `len` of them -- in pieces of at most
+/// the size asked.
+pub struct Pieces {
+    pub from: Addr,
+    pub tag: u32,
+    pub reference: u64,
+    pub len: usize,
+    pub pieces: Vec<Vec<u8>>,
+}
+
+/// The largest piece `recv_pieces` is asked for: well under what one block
+/// of the kernel's heap gives (512 KiB).
+pub const PIECE_MAX: usize = 64 * 1024;
+
 /// How a call ended, when no answer came.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallError {
@@ -352,6 +367,46 @@ impl Mailbox {
         Some(Message { from: Addr(h.from), tag: h.tag, reference: h.reference, data })
     }
 
+    /// The next message, waiting up to `timeout` for one, in pieces of at
+    /// most `piece` bytes (1 to PIECE_MAX): what a message is received as
+    /// that may be larger than one block of the heap gives -- `recv`'s one
+    /// Vec cannot be, and leaves such a message first. None when nothing
+    /// came, or the mailbox is closed; and, the message left first to be
+    /// received again whole, when the heap had no room for a piece of it.
+    pub fn recv_pieces(&self, timeout: Duration, piece: usize) -> Option<Pieces> {
+        let piece = piece.clamp(1, PIECE_MAX);
+        let mut h = ipc::IpcHeader::default();
+        let mut ticket = 0u64;
+        /* Asked with no room first: its length, and a message of none taken
+         * whole */
+        let got = unsafe {
+            ipc::kernel_ipc_recv_part(self.addr, timeout.as_nanos(), &mut h, core::ptr::null_mut(), 0, 0,
+                                      &mut ticket)
+        };
+        if got < 0 {
+            return None;
+        }
+        let len = usize::try_from(h.len).ok()?;
+        let mut pieces: Vec<Vec<u8>> = Vec::new();
+        pieces.try_reserve_exact(len.div_ceil(piece)).ok()?;
+        let mut offset = 0usize;
+        while offset < len {
+            let want = piece.min(len - offset);
+            let mut p: Vec<u8> = Vec::new();
+            p.try_reserve_exact(want).ok()?;
+            /* `p` has room for `want` bytes; the ticket is the first part's */
+            let n = unsafe {
+                ipc::kernel_ipc_recv_part(self.addr, 0, &mut h, p.as_mut_ptr(), want, offset as u64, &mut ticket)
+            };
+            let n = usize::try_from(n).ok().filter(|&n| n > 0 && n <= want)?;
+            /* The kernel wrote `n` bytes, no more than `want` */
+            unsafe { p.set_len(n) };
+            pieces.push(p);
+            offset += n;
+        }
+        Some(Pieces { from: Addr(h.from), tag: h.tag, reference: h.reference, len, pieces })
+    }
+
     /// The next message, if there is one.
     pub fn try_recv(&self) -> Option<Message> {
         self.recv(Duration::zero())
@@ -422,19 +477,25 @@ impl Mailbox {
 
     /// What the peer `peer` said -- from its mailbox `from`, the peer's own
     /// address of it -- delivered here: to `to` (an address here, host 0),
-    /// or to the `Cluster` name `name` when one is given. `NotYours` for
-    /// anything a peer may not reach.
+    /// or to the `Cluster` name `name` when one is given, its payload the
+    /// pieces `data` in order. `NotYours` for anything a peer may not reach.
     pub fn deliver_remote(&self, peer: u16, from: u64, to: Addr, name: Option<&str>, tag: u32, reference: u64,
-                          data: &[u8]) -> Result<(), Error> {
+                          data: &[&[u8]]) -> Result<(), Error> {
         let (np, nl) = match name {
             Some("") => return Err(Error::Invalid),
             Some(n) => (n.as_ptr(), n.len()),
             None => (core::ptr::null(), 0),
         };
-        /* The name and `data` are their lengths' bytes */
+        if data.len() > ipc::IPC_PIECES_MAX {
+            return Err(Error::TooLarge);
+        }
+        let mut pieces: Vec<ipc::IpcPiece> = Vec::new();
+        pieces.try_reserve_exact(data.len()).map_err(|_| Error::NoMemory)?;
+        pieces.extend(data.iter().map(|d| ipc::IpcPiece { data: d.as_ptr(), len: d.len() }));
+        /* The name is its length's bytes, and each piece names its own */
         Error::from_code(unsafe {
             ipc::kernel_ipc_deliver_remote(self.addr, u32::from(peer), from, to.0, np, nl, tag, reference,
-                                           data.as_ptr(), data.len())
+                                           pieces.as_ptr(), pieces.len())
         })
     }
 
