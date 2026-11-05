@@ -456,6 +456,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+]
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
@@ -472,6 +480,7 @@ dependencies = [
  "fs",
  "hello",
  "igb",
+ "ipc",
  "kcore",
  "mgmt",
  "mgmtwire",

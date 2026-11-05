@@ -125,10 +125,11 @@ ax41:17.3          an address there -- slot 17, generation 3: a client's
   must show and the address to call; DNS is never asked. Its letters are a
   DNS label's (`a-z 0-9 -`, a letter first, up to 32), so that by convention
   it can be the machine's own hostname.
-- **Namespaces are owned.** A module says in its header which namespaces it
-  registers under (`kmod::module!(name: "nbs-mds", ..., names: ["nbs"])`),
-  and the loader refuses it a name outside them; `kernel`, `ipc` and `sys`
-  are the image's. Two modules may share a namespace -- `nbs-mds` and
+- **Namespaces are owned.** A module registers names under one namespace:
+  its own name up to its first `-` -- `nbs-mds`'s and `nbs-cs`'s both `nbs`.
+  The channel knows which module a caller is by an address in its code
+  (`ModuleTable::name_at`), so nothing in the module's header says it, and
+  the loader is not asked; `kernel`, `ipc` and `sys` are the image's. Two modules may share a namespace -- `nbs-mds` and
   `nbs-cs` both register under `nbs` -- but a name is one mailbox's, and a
   second registration of it is refused (`Taken`), loudly. That is against
   mistakes, not malice: a module is kernel code and can do anything
@@ -344,9 +345,10 @@ What TCP has to get first is a plan of its own, [tcp.md](tcp.md):
 
 ## Steps
 
-**I1, the channel in the image.** The `ipc` crate, the ABI and
-`kcore::ipc`; the `ipc` command, tracepoints and provider; the selftest and
-`test_module_ipc`. `fuzz/ipc` (host, in CI): the crate as it is, over the
+**I1, the channel in the image** -- done on branch `ipc-raft`
+(docs/ipc.md). The `ipc` crate, the ABI and `kcore::ipc`; the `ipc` command
+and kernel.echo; the selftest and `test_module_ipc`. Its tracepoints and its
+provider on the bus wait for I4, where there are hosts to show. `fuzz/ipc` (host, in CI): the crate as it is, over the
 fuzzers' common machine (`fuzz/common/`, tasks one at a time, the lock rules
 checked), held to a model -- every message sent `Ok` received once, in order,
 unless its mailbox closed first; every monitor firing exactly once; names

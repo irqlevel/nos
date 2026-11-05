@@ -46,6 +46,9 @@ extern "C" void rust_net_stop_netconsole();
 extern "C" void rust_mount_root_fs();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
+/* The message channel is Rust (src/crates/ipc): at the halt, after the
+   modules, no mailbox is made and no message sent */
+extern "C" void rust_ipc_stop();
 
 /* The disk log is Rust (src/crates/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
@@ -322,6 +325,12 @@ static void bp_startup_arm(void* ctx)
         return;
     }
 
+    if (!test::test_module_ipc())
+    {
+        PANIC("Module ipc test failed");
+        return;
+    }
+
     if (!SoftIrq::get_instance().init())
     {
         PANIC("Can't init softirq");
@@ -389,6 +398,10 @@ static void bp_startup_arm(void* ctx)
                took off it -- and before the files go: its jobs are told to stop and
                waited for, and nothing starts on it again */
             rust_mgmt_stop();
+
+            /* The message channel after the modules too -- whose mailboxes their
+               exits closed -- and before the files go: nothing is sent from here on */
+            rust_ipc_stop();
 
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */

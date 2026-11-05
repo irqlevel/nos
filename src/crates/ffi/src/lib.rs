@@ -26,6 +26,7 @@ pub mod http;
 pub mod acpi;
 pub mod cmd;
 pub mod mgmt;
+pub mod ipc;
 pub mod system;
 pub mod fs;
 pub mod trace;

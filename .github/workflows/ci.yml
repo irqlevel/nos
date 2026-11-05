@@ -164,6 +164,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/web-test.py
 
+      # Every service talks through the message channel -- the image's tasks
+      # and the modules alike -- and a message lost, doubled or out of
+      # order, a Down that never comes or a name that outlives its mailbox
+      # is a bug in each of them at once: the channel fuzzed on the host
+      # against a model of its own, the same inputs every run.
+      - name: Message channel fuzz (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/ipc-fuzz.py
+
       # The device tree the arm64 boot is handed, the Multiboot2 tags and
       # the ACPI tables the x86 one is, the firmware's memory map, the
       # command line, the GRUB environment block on /boot, a module's .ko:

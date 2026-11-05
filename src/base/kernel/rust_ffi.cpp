@@ -2052,6 +2052,16 @@ unsigned long kernel_module_list(kernel::ModuleTable::ModuleSnapshot* out, unsig
     return kernel::ModuleTable::get_instance().snapshot(out, max);
 }
 
+/* The name of the module whose image holds addr, into buf (size bytes, no
+   NUL written): its length, or 0 when addr is no loaded module's */
+unsigned long kernel_module_name_at(unsigned long addr, char* buf, unsigned long size)
+{
+    if (buf == nullptr || size == 0)
+        return 0;
+
+    return kernel::ModuleTable::get_instance().name_at(addr, buf, size);
+}
+
 /* What kernel_module_command collects of what insmod or rmmod says: their
    job's output and the line after it */
 static const unsigned long MODULE_COMMAND_OUTPUT = 4 * consts::KB;

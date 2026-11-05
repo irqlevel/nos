@@ -28,6 +28,10 @@
 extern "C" {
 long kernel_file_size(const char* path, ulong len);
 long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
+/* The message channel is Rust too (src/crates/ipc): after a module's exit,
+   the mailboxes it left open are closed -- each said, as the module's bug --
+   and every monitor of them told */
+void rust_ipc_module_gone(const char* name, ulong len);
 }
 
 namespace kernel
@@ -1255,6 +1259,7 @@ stdlib::Error ModuleTable::unload(const char* name, stdlib::Printer& out)
        still running (kernel_cmd_unregister waits those out). Only then may its
        code go. Nothing is held meanwhile: this may take a while. */
     module->exit(module->instance);
+    rust_ipc_module_gone(module->name, stdlib::str_len(module->name));
     remove(module);
     release_module(module);
 
@@ -1290,6 +1295,7 @@ void ModuleTable::unload_all()
         char name[NAME_LEN_MAX + 1];
         stdlib::mem_cpy(name, module->name, sizeof(name));
         module->exit(module->instance);
+        rust_ipc_module_gone(module->name, stdlib::str_len(module->name));
         remove(module);
         release_module(module);
         klog(0, "module: %s unloaded", name);
@@ -1515,6 +1521,30 @@ bool ModuleTable::describe(ulong addr, bool return_address, char* buf, ulong siz
 
     lock_.unlock_irq_restore(flags);
     return found;
+}
+
+ulong ModuleTable::name_at(ulong addr, char* buf, ulong size)
+{
+    if (buf == nullptr || size == 0)
+        return 0;
+
+    ulong len = 0;
+    const ulong flags = lock_.lock_irq_save();
+    for (stdlib::ListEntry* entry = list_.flink; entry != &list_; entry = entry->flink)
+    {
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, list_entry);
+        if (addr < module->image.base || addr >= module->image.base + module->image_size)
+            continue;
+
+        /* NUL-terminated within NAME_LEN_MAX + 1 by check_info */
+        len = stdlib::str_len(module->name);
+        if (len > size)
+            len = size;
+        stdlib::mem_cpy(buf, module->name, len);
+        break;
+    }
+    lock_.unlock_irq_restore(flags);
+    return len;
 }
 
 bool ModuleTable::describe_all(char* buf, ulong size)
