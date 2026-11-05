@@ -46,6 +46,8 @@ mod config;
 #[cfg(target_arch = "x86_64")]
 mod cores;
 #[cfg(target_arch = "x86_64")]
+mod devices;
+#[cfg(target_arch = "x86_64")]
 mod dhcp;
 #[cfg(target_arch = "x86_64")]
 mod disk;
@@ -95,12 +97,12 @@ hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]
                                    every entry, as before ASIDs, when told; profile
                                    splits an entry into its parts; mmio times MMIO
                                    loads instead, each decoded and performed
-hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended;
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu. The kernel is a bzImage, or a PVH ELF:
                                    /lib/hvboot boots the one its disk's grub.cfg names
-hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [uuid=U] [net] [network=name] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself or panics; uuid= what its
                                    SMBIOS says it is; network= the guests it reaches on the
@@ -125,6 +127,15 @@ hv delete <name> [keep-disks] [force]
                                    a stopped vm's folder taken away, all of it or all but its
                                    disks; force for one whose vm.toml says protected
 hv vms                             the vms in the vms' folder, and which of them run
+hv devices                         the partitions and disks nos has: what each is found by
+                                   at the next boot (part:<id>, disk:<id>), what holds it,
+                                   which vm names it and what is on it
+hv disk attach <vm> <device>[:ro] [force]
+                                   a device of nos's -- dev:<name>, part:<id> or disk:<id>
+                                   -- made a disk of a stopped vm's, by its id: never where
+                                   the machine boots from it or something holds it; force
+                                   for one with something on it, or another vm's
+hv disk detach <vm> <device>       a device taken off a stopped vm's vm.toml, left as it is
 hv cores [own|shared]              whether a guest's cores are its own -- whole cores no
                                    other guest has a CPU on, its CPUs filling their
                                    threads, and refused where there are none -- or may be
@@ -420,7 +431,14 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "on" => switch(state, words.next(), true, out),
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
-        "convert" => image::command(rest, &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(target_arch = "x86_64")]
+        "convert" => image::command(&state.vms_root, rest, &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(not(target_arch = "x86_64"))]
+        "convert" => image::command("", rest, &mut Shell { out, unloading: &state.unloading }),
+        #[cfg(target_arch = "x86_64")]
+        "devices" => devices::command(&state.vms_root, out),
+        #[cfg(target_arch = "x86_64")]
+        "disk" => devices::disk_command(&state.vms_root, &state.vms, rest, out),
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]

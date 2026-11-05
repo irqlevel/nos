@@ -19,7 +19,7 @@ use kcore::consts::{NS_PER_MS, NS_PER_SEC, NS_PER_US};
 use kcore::sync::Mutex;
 
 use crate::config::Options;
-use crate::disk::{FileDisk, Runner};
+use crate::disk::{QueuedDisk, Runner};
 
 /// How much of the file is read at once when streaming it into guest memory.
 const CHUNK: usize = 64 * 1024;
@@ -538,7 +538,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     for (i, (path, ro)) in spec.disks.iter().enumerate() {
         let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
         let letter = char::from(b'a'.saturating_add(index));
-        let disk = FileDisk::open(path, *ro, runner, index)?;
+        let disk = QueuedDisk::open(path, *ro, runner, index)?;
         let mut id = String::new();
         let _ = write!(id, "nos-vd{}", letter);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;

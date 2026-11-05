@@ -52,8 +52,14 @@ pub fn register_driver(name: &str, driver: &'static dyn table::BlockDriver) -> O
 /// Claim a device by handle, naming the holder a refusal reports: what the
 /// VFS does for as long as a filesystem is mounted on it. The error is who
 /// holds something overlapping.
-pub fn claim_as(device: usize, holder: &'static CStr) -> core::result::Result<usize, &'static str> {
-    table::claim(device, holder).map_err(holder_name)
+pub fn claim_as(device: usize, holder: &'static CStr) -> core::result::Result<usize, table::Holder> {
+    table::claim(device, table::Holder::of(holder))
+}
+
+/// The device whose id (`Disk::ident`) is `id`: `Found::One` -- or none,
+/// or several, none of which is taken for it.
+pub fn find_ident(id: &str) -> table::Found {
+    table::find_ident(id.as_bytes())
 }
 
 /// Give back a claim from `claim_as`. A claim of 0 is nothing to give back.
@@ -61,10 +67,6 @@ pub fn release(claim: usize) {
     if claim != 0 {
         table::release(claim);
     }
-}
-
-fn holder_name(held: &'static CStr) -> &'static str {
-    held.to_str().unwrap_or("something")
 }
 
 impl Disk {
@@ -169,6 +171,28 @@ impl Disk {
     /// where `can_submit` says there is no asynchronous path.
     pub fn submit_max(&self) -> usize {
         table::submit_max(self.handle)
+    }
+
+    /// What it is found by again at the next boot, whatever its name is
+    /// then (`find_ident`): `part:<GUID>`, `disk:nvme-<model>_<serial>`.
+    pub fn ident(&self) -> Option<&'static str> {
+        table::ident(self.handle)
+    }
+
+    /// What its partition table says it is.
+    pub fn kind(&self) -> table::PartKind {
+        table::kind(self.handle)
+    }
+
+    /// Whether it takes `discard`.
+    pub fn can_discard(&self) -> bool {
+        table::can_discard(self.handle)
+    }
+
+    /// The `count` sectors from `sector` given back to the device: a
+    /// writer's call, under its claim, as a write is.
+    pub fn discard(&self, sector: u64, count: u64) -> Result<()> {
+        if table::discard(self.handle, sector, count) { Ok(()) } else { Err(Error::IoError) }
     }
 
     fn whole_sectors(&self, len: usize) -> Result<()> {

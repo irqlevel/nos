@@ -3,8 +3,9 @@
 //! another ext2, a nanofs, something that only looks like an ext2, or
 //! nothing, some of them on the partitions of a disk; `ro`; `fstest=on`.
 //! Held to what `rootfs.rs` documents: the root the spec names, found the
-//! way it says -- the first ext2 in the table's order whose label or UUID
-//! matches -- and ext2 if it carries one, nanofs if not; with no root, a
+//! way it says -- the one ext2 whose label or UUID matches, and none where
+//! two do, a partition's UUID sometimes the other's as a copy's is -- and
+//! ext2 if it carries one, nanofs if not; with no root, a
 //! ramfs at `/`, the first ext2 read-only at `/boot`, the first nanofs at
 //! `/data`; procfs at `/proc` either way. And every filesystem it mounted
 //! for writing left clean by the unmount of everything that shutdown does.
@@ -100,8 +101,12 @@ pub fn rootfs(r: &mut Input) {
             /* Two partitions. */
             let (a, b) = (pick(r), pick(r));
             let (ma, na) = image(a, uuid, r);
+            /* Its own UUID -- or now and then the first's, as a copy of
+             * the first would have. */
             let mut ub = uuid;
-            ub[2] = 0xB;
+            if !r.chance(32) {
+                ub[2] = 0xB;
+            }
             let (mb, nb) = image(b, ub, r);
             let (sa, sb) = (na / 512, nb / 512);
             let e1 = part::MbrEntry { status: 0, kind: 0x83, start: 2048, size: sa as u32 };
@@ -160,15 +165,18 @@ pub fn rootfs(r: &mut Input) {
 
     /* What the documentation says is mounted. */
     let is_ext2 = |d: &Dev| matches!(d.carries, Carries::Ext2 { .. });
+    let matching: Vec<usize> = (0..devs.len()).filter(|&i| is_ext2(&devs[i]) && match (mode, devs[i].carries) {
+        (1, Carries::Ext2 { label }) => LABELS[label as usize % 3] == b"nos",
+        (3, Carries::Ext2 { label }) => LABELS[label as usize % 3] == value.as_slice(),
+        (4, _) => devs[i].uuid == uuid,
+        _ => false,
+    }).collect();
     let root = match mode {
         0 => None,
         2 => devs.iter().position(|d| d.name.as_bytes() == value),
-        _ => devs.iter().position(|d| is_ext2(d) && match (mode, d.carries) {
-            (1, Carries::Ext2 { label }) => LABELS[label as usize % 3] == b"nos",
-            (3, Carries::Ext2 { label }) => LABELS[label as usize % 3] == value.as_slice(),
-            (4, _) => d.uuid == uuid,
-            _ => false,
-        }),
+        /* Two that match: neither taken. */
+        _ if matching.len() == 1 => Some(matching[0]),
+        _ => None,
     };
     let mut want: Vec<(Vec<u8>, &str)> = Vec::new();
     let mut root_mounted = false;
@@ -220,6 +228,8 @@ pub fn rootfs(r: &mut Input) {
     reached(match (mode, root_mounted) {
         (0, _) => "no root asked for",
         (_, true) => "a root mounted from disk",
+        (4, false) if matching.len() > 1 => "a UUID on two devices, neither taken",
+        (_, false) if matching.len() > 1 => "a label on two devices, neither taken",
         (_, false) => "the fallback layout",
     });
 

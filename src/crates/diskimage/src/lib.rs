@@ -3,6 +3,9 @@
 //! and written out as the disk it describes, the one file a guest of hv's
 //! is given (`hv convert`, docs/hypervisor.md).
 //!
+//! - [`contents`] says what a disk or a partition holds -- a filesystem, a
+//!   partition table, an array's member -- so that a device is not given
+//!   to a guest over it without being told to;
 //! - [`detect`] says what the first bytes of a file are, so that a file of
 //!   any other kind is refused by name -- a VMDK, a gzip stream, a disk
 //!   that is raw already -- rather than as a damaged qcow2;
@@ -23,6 +26,7 @@
 
 extern crate alloc;
 
+pub mod contents;
 pub mod detect;
 pub mod inflate;
 pub mod iso;

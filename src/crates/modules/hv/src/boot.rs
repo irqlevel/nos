@@ -23,7 +23,7 @@ use crate::cores::{Cores, Hold};
 use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
-const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
+const USAGE: &str = "hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;
@@ -125,6 +125,7 @@ impl Boot {
             cpu: self.disk_cpu,
             claims: self.claims.clone(),
             holder: Holder::Boot,
+            owner: String::from("an hv boot's disk"),
         };
         let built = match guest::build(&self.machine, &self.spec, &runner, self.doorbells.clone()) {
             Ok(built) => built,

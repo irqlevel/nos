@@ -130,6 +130,47 @@ function vm(name, fields) {
     ...fields,
   });
 }
+/* The host's devices a VM's disk may be (the vm provider's `devices`): its
+ * root's disk, of which nothing is given -- the EFI System partition and the
+ * root it boots -- and a second disk, one partition empty and one holding an
+ * ext4. */
+const DEVICES = [
+  { name: 'nvme0', id: 'disk:nvme-SAMSUNG_MZVL2512HCJQ-00B00_S1', disk: null, size_bytes: 512 * 1024 * MIB, type: null,
+    boots_the_machine: null, held_by: null, in_use_by: 'a mounted filesystem', holds: null,
+    refused: 'nvme0 is in use by a mounted filesystem' },
+  { name: 'nvme01', id: 'part:2f1c3a4b-0001-4e69-94e6-46e271b44854', disk: 'nvme0', size_bytes: 256 * MIB,
+    type: 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b', boots_the_machine: 'an EFI System partition', held_by: null,
+    in_use_by: null, holds: 'a FAT filesystem', refused: 'nvme01 is an EFI System partition: the machine boots from it, and no vm is given it' },
+  { name: 'nvme02', id: 'part:2f1c3a4b-0002-4e69-94e6-46e271b44854', disk: 'nvme0', size_bytes: 16 * 1024 * MIB,
+    type: '0fc63daf-8483-4772-8e79-3d69d8477de4', boots_the_machine: null, held_by: 'a mounted filesystem',
+    in_use_by: 'a mounted filesystem', holds: null, refused: 'nvme02 is in use by a mounted filesystem' },
+  { name: 'nvme16', id: 'part:704db7dd-0006-4e69-94e6-46e271b44854', disk: 'nvme1', size_bytes: 15 * 1024 * MIB,
+    type: '0fc63daf-8483-4772-8e79-3d69d8477de4', boots_the_machine: null, held_by: null, in_use_by: null, holds: null, refused: null },
+  { name: 'nvme17', id: 'part:704db7dd-0007-4e69-94e6-46e271b44854', disk: 'nvme1', size_bytes: 8 * 1024 * MIB,
+    type: '0fc63daf-8483-4772-8e79-3d69d8477de4', boots_the_machine: null, held_by: null,
+    in_use_by: null, holds: 'an ext4 filesystem labelled "data"',
+    refused: 'nvme17 holds an ext4 filesystem labelled "data" -- the vm would have its data over it; give it anyway with force' },
+];
+
+/* What a device's disk is, as `disks` lists it: its id the word. */
+function deviceDisk(d, readOnly) {
+  return { file: d.id, size_bytes: d.size_bytes, read_only: readOnly, device: true, device_name: d.name };
+}
+
+/* The device a word names -- its id, or dev: and its name -- given as a
+ * VM's disk where it may be: refused as the host would, force over what is
+ * on it. */
+function deviceGiven(word, force) {
+  const d = DEVICES.find((x) => x.id === word || 'dev:' + x.name === word);
+  if (!d) {
+    throw new Refused('not_found', 'no device is ' + word, 'device');
+  }
+  if (d.boots_the_machine || d.in_use_by || (d.refused && !force)) {
+    throw new Refused('conflict', d.refused, 'device');
+  }
+  return d;
+}
+
 vm('panel', { protected: true, port: 0, forwards: [{ port: 39233, guest_port: 443 }] });
 vm('web', { cpus: 2, memory_mib: 2048, port: 3, forwards: [{ port: 2201, guest_port: 22 }] });
 vm('db', { memory_mib: 4096, network: 'back' });
@@ -292,7 +333,8 @@ const reads = {
       vm: vmJson(v),
       config: { kernel: v.kernel, initrd: null, cmdline: null, forward: v.forwards, restart: true, console_log: true,
         uuid: '7c1e5f3a-0000-4000-8000-' + String(v.name).padEnd(12, '0').slice(0, 12).replace(/[^0-9a-f]/g, '0') },
-      disks: v.disks.map((d) => ({ ...d, path: '/vms/' + v.name + '/' + d.file, vm: v.name })),
+      disks: v.disks.map((d) => ({ device: false, device_name: null, ...d,
+        path: d.device ? d.file : '/vms/' + v.name + '/' + d.file, vm: v.name })),
       forwards: v.state === 'running' ? v.forwards.map((f) => ({ ...f, vm: v.name, id: v.id,
         guest_ip: '10.0.100.' + ((v.port ?? 0) + 2), active: 0, accepted: 3, refused: 0, failed: 0, stalled: 0 })) : [],
     };
@@ -324,7 +366,9 @@ const reads = {
     const page = text.slice(from - oldest, from - oldest + max);
     return { from, next: from + page.length, total, text: p.terminal ? page : page.replace(/\x1b\[[0-9;]*m/g, '') };
   },
-  'vm.disks': (p) => ({ disks: vmNamed(p).disks.map((d) => ({ ...d, path: '/vms/' + p.name + '/' + d.file, vm: p.name })) }),
+  'vm.devices': () => ({ devices: DEVICES }),
+  'vm.disks': (p) => ({ disks: vmNamed(p).disks.map((d) => ({ device: false, device_name: null, ...d,
+    path: d.device ? d.file : '/vms/' + p.name + '/' + d.file, vm: p.name })) }),
   'vm.forwards': () => ({ forwards: [...vms.values()].filter((v) => v.state === 'running').flatMap((v) => v.forwards.map((f) => ({
     ...f, vm: v.name, id: v.id, guest_ip: '10.0.100.' + ((v.port ?? 0) + 2), active: 0, accepted: 3, refused: 0, failed: 0, stalled: 0 }))) }),
 };
@@ -368,6 +412,25 @@ const actions = {
     const v = vmNamed(p);
     v.disks.push({ file: need(p, 'file'), size_bytes: need(p, 'size_bytes'), read_only: false });
     return { path: '/vms/' + v.name + '/' + p.file, size_bytes: p.size_bytes };
+  },
+  'vm.disk_attach': (p) => {
+    const v = vmNamed(p);
+    const d = deviceGiven(need(p, 'device'), p.force === true);
+    if (v.state === 'running') {
+      throw new Refused('conflict', v.name + ' is on the list -- hv stop it first');
+    }
+    v.disks.push(deviceDisk(d, p.read_only === true));
+    return { vm: v.name, id: d.id, read_only: p.read_only === true };
+  },
+  'vm.disk_detach': (p) => {
+    const v = vmNamed(p);
+    const word = need(p, 'device');
+    const at = v.disks.findIndex((x) => x.device && (x.file === word || 'dev:' + x.device_name === word));
+    if (at < 0) {
+      throw new Refused('not_found', v.name + "'s vm.toml names no device " + word, 'device');
+    }
+    const [d] = v.disks.splice(at, 1);
+    return { vm: v.name, id: d.file };
   },
   'vm.disk_grow': (p) => {
     const v = vmNamed(p);
@@ -421,11 +484,22 @@ const jobMethods = {
     if (vms.has(name)) {
       throw new Refused('conflict', name + ' is there already', 'name');
     }
+    /* Onto a device: refused before anything is fetched, as the host does. */
+    const onto = p.onto ? deviceGiven(p.onto, p.force === true) : null;
+    if (onto && p.size_bytes !== undefined) {
+      throw new Refused('invalid', "size= is a file's: a device's disk is the device's size", 'size_bytes');
+    }
     return job('vm', 'create', 5, (i) => ['download: 120 MiB of 590 MiB, 20%', 'download: 590 MiB of 590 MiB, 100%',
-      'qcow2 version 3 -- into /vms/' + name + '/disk.raw', 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
+      onto ? '/vms/' + name + '/image: qcow2, a disk of 3584 MiB -- onto ' + onto.name
+        : 'qcow2 version 3 -- into /vms/' + name + '/disk.raw',
+      onto ? onto.name + ': 3584 MiB written in 4.2 s, the rest of the device given back to it'
+        : 'disk.raw: 1785 MiB written of 3584 MiB, the rest holes',
       '/vms/' + name + '/vm.toml written'][i], () => {
-      vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null });
-      return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: p.size_bytes ?? 3584 * MIB, keys: 1 };
+      vm(name, { memory_mib: p.memory_mib ?? 1024, cpus: p.cpus ?? 1, network: p.network ?? null,
+                 ...(onto ? { disks: [deviceDisk(onto, false), { file: 'seed.iso', size_bytes: 65536, read_only: true }] }
+                   : {}) });
+      return { name, file: '/vms/' + name + '/vm.toml', disk_bytes: onto ? onto.size_bytes : p.size_bytes ?? 3584 * MIB,
+               keys: 1 };
     });
   },
   'vm.clone': (p) => {

@@ -16,8 +16,8 @@ use crate::table;
 pub const NAME_MAX: usize = 16;
 
 /// Register one partition of `disk` as a device named `name` (without its
-/// NUL).
-pub fn register(disk: Disk, start: u64, count: u64, name: &[u8]) -> bool {
+/// NUL), as its table entry `id` says it is.
+pub fn register(disk: Disk, start: u64, count: u64, name: &[u8], id: &table::PartId) -> bool {
     if name.is_empty() || name.len() >= NAME_MAX {
         return false;
     }
@@ -26,7 +26,7 @@ pub fn register(disk: Disk, start: u64, count: u64, name: &[u8]) -> bool {
     terminated[..name.len()].copy_from_slice(name);
 
     match CStr::from_bytes_until_nul(&terminated) {
-        Ok(name) => table::register_partition(disk.handle(), start, count, name),
+        Ok(name) => table::register_partition(disk.handle(), start, count, name, id),
         Err(_) => false,
     }
 }
