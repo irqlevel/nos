@@ -19,8 +19,9 @@ use ffi::ipc;
 
 use crate::time::{boot_time_ns, Duration};
 
-pub use ipc::{IPC_TAG_DOWN as TAG_DOWN, IPC_TAG_NAME_DOWN as TAG_NAME_DOWN, IPC_TAG_NAME_UP as TAG_NAME_UP,
-              IPC_TAG_SYSTEM as TAG_SYSTEM, IPC_TAG_WATCH_LOST as TAG_WATCH_LOST};
+pub use ipc::{IPC_TAG_BOUNCED as TAG_BOUNCED, IPC_TAG_BULK as TAG_BULK, IPC_TAG_DOWN as TAG_DOWN,
+              IPC_TAG_NAME_DOWN as TAG_NAME_DOWN, IPC_TAG_NAME_UP as TAG_NAME_UP, IPC_TAG_SYSTEM as TAG_SYSTEM,
+              IPC_TAG_WATCH_LOST as TAG_WATCH_LOST};
 
 /// Where a mailbox is: its host (0, this one), its slot and the slot's
 /// generation, packed as the channel carries it.
@@ -124,6 +125,52 @@ pub enum Reason {
     Stopped,
 }
 
+/// Why a message for another host did not get there (a TAG_BOUNCED's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bounce {
+    /// Its mailbox there was full.
+    Full,
+    /// Its mailbox there was gone, or no mailbox had its name.
+    Gone,
+    /// It never went: the way to that host was full, or the host was lost
+    /// before it did.
+    Unsent,
+}
+
+impl Bounce {
+    fn code(self) -> u32 {
+        match self {
+            Bounce::Full => ipc::IPC_BOUNCE_FULL,
+            Bounce::Gone => ipc::IPC_BOUNCE_GONE,
+            Bounce::Unsent => ipc::IPC_BOUNCE_UNSENT,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Bounce::Full => "full",
+            Bounce::Gone => "gone",
+            Bounce::Unsent => "unsent",
+        }
+    }
+}
+
+/// What a TAG_BOUNCED says: why, the message's tag, and the name it was
+/// sent to when it went by name (`from` is then the peer's alone).
+pub struct Bounced<'a> {
+    pub why: Bounce,
+    pub tag: u32,
+    pub name: Option<&'a str>,
+}
+
+/// Where a message for a peer went there: the peer's own address of a
+/// mailbox (host 0), or a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteTo<'a> {
+    Addr(Addr),
+    Name(&'a str),
+}
+
 /// Who may reach a name: this host's tasks and modules alone, or the
 /// cluster's hosts too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +218,26 @@ impl Message {
             ipc::IPC_DOWN_STOPPED => Some(Reason::Stopped),
             _ => None,
         }
+    }
+
+    /// A bounce's reason, the bounced message's tag and the name it went
+    /// to; None for any other message.
+    pub fn bounced(&self) -> Option<Bounced<'_>> {
+        if self.tag != TAG_BOUNCED || self.data.len() < 8 {
+            return None;
+        }
+        let why = match u32::from_le_bytes([self.data[0], self.data[1], self.data[2], self.data[3]]) {
+            ipc::IPC_BOUNCE_FULL => Bounce::Full,
+            ipc::IPC_BOUNCE_GONE => Bounce::Gone,
+            ipc::IPC_BOUNCE_UNSENT => Bounce::Unsent,
+            _ => return None,
+        };
+        let tag = u32::from_le_bytes([self.data[4], self.data[5], self.data[6], self.data[7]]);
+        let name = match &self.data[8..] {
+            [] => None,
+            n => Some(core::str::from_utf8(n).ok()?),
+        };
+        Some(Bounced { why, tag, name })
     }
 
     /// A name's coming or going: the name.
@@ -381,6 +448,24 @@ impl Mailbox {
             Reason::Stopped => ipc::IPC_DOWN_STOPPED,
         };
         Error::from_code(ipc::kernel_ipc_remote_down(self.addr, u32::from(peer), id, code))
+    }
+
+    /// The router's: a message from `sender` -- a mailbox here that has
+    /// sent to the peer `peer` -- to `target` there did not get there, for
+    /// `why`: told to the sender, TAG_BOUNCED. Dropped and counted when the
+    /// sender has no room.
+    pub fn bounced(&self, peer: u16, sender: Addr, target: RemoteTo<'_>, tag: u32, reference: u64, why: Bounce)
+        -> Result<(), Error>
+    {
+        let (to, np, nl) = match target {
+            RemoteTo::Addr(a) => (a.0, core::ptr::null(), 0),
+            RemoteTo::Name("") => return Err(Error::Invalid),
+            RemoteTo::Name(n) => (0, n.as_ptr(), n.len()),
+        };
+        /* The name is its length's bytes */
+        Error::from_code(unsafe {
+            ipc::kernel_ipc_bounced(self.addr, u32::from(peer), sender.0, to, np, nl, tag, reference, why.code())
+        })
     }
 
     /// A request to `to` and its answer, from this mailbox, which takes

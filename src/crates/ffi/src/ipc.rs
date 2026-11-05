@@ -52,6 +52,25 @@ pub const IPC_TAG_WATCH_LOST: u32 = IPC_TAG_SYSTEM | 4;
 /// A message for another host, in the router's mailbox: its payload begins
 /// with ipcwire's route head (`ipcwire::route`), its own bytes after it.
 pub const IPC_TAG_ROUTE: u32 = IPC_TAG_SYSTEM | 5;
+/// A message for another host that did not reach its mailbox there, told
+/// back to its sender: `from` the mailbox it was for as this host knows it
+/// -- the peer's number in its address, or the peer's alone (slot 0) for a
+/// name there -- the reference the message's, and the payload why
+/// (IPC_BOUNCE_*), the message's tag and, for a name, the name: 4 bytes, 4
+/// bytes, little-endian, and the name's.
+pub const IPC_TAG_BOUNCED: u32 = IPC_TAG_SYSTEM | 6;
+
+/// Why a message bounced: its mailbox there was full; it was gone, or no
+/// mailbox had the name; or it never went -- the way to that host was full,
+/// or the host was lost before it did.
+pub const IPC_BOUNCE_FULL: u32 = 1;
+pub const IPC_BOUNCE_GONE: u32 = 2;
+pub const IPC_BOUNCE_UNSENT: u32 = 3;
+
+/// A tag with this bit set goes between hosts by the bulk connection, any
+/// other by the control one: order between two mailboxes holds within a
+/// class, not across the two (plans/ipc.md, ipcnet).
+pub const IPC_TAG_BULK: u32 = 0x4000_0000;
 
 /// Why a Down came.
 pub const IPC_DOWN_CLOSED: u32 = 1;
@@ -168,4 +187,14 @@ unsafe extern "C" {
     /// gone (`reason`, an IPC_DOWN_*): the monitor `id`'s Down delivered.
     /// ipc's `Error::code`.
     pub safe fn kernel_ipc_remote_down(router: u64, peer: u32, id: u64, reason: u32) -> i32;
+
+    /// The router's: a message from this host's mailbox `sender` to the
+    /// peer `peer`'s mailbox `target` (the peer's own address of it) -- or,
+    /// with `name_len` past 0, to the name `name` there -- with `tag` and
+    /// `reference`, did not get there (`why`, an IPC_BOUNCE_*): told to the
+    /// sender as IPC_TAG_BOUNCED, to a mailbox that has sent to that peer
+    /// alone. Dropped, and counted, when the sender has no room. ipc's
+    /// `Error::code`.
+    pub fn kernel_ipc_bounced(router: u64, peer: u32, sender: u64, target: u64, name: *const u8, name_len: usize,
+                              tag: u32, reference: u64, why: u32) -> i32;
 }

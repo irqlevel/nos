@@ -106,6 +106,57 @@ pub const TAG_WATCH_LOST: u32 = ffi::ipc::IPC_TAG_WATCH_LOST;
 /// A message for another host, in the router's mailbox: its payload begins
 /// with ipcwire's route head.
 pub const TAG_ROUTE: u32 = ffi::ipc::IPC_TAG_ROUTE;
+/// A message for another host that did not get there, told back to its
+/// sender: `from` the mailbox it was for as this host knows it (or the
+/// peer's alone, slot 0, for a name there), the reference the message's,
+/// the payload why (`Bounce`, 4 bytes), its tag (4) and, for a name, the
+/// name -- little-endian.
+pub const TAG_BOUNCED: u32 = ffi::ipc::IPC_TAG_BOUNCED;
+/// A tag with this bit goes between hosts by the bulk connection, any
+/// other by the control one: order between two mailboxes holds within a
+/// class, not across the two.
+pub const TAG_BULK: u32 = ffi::ipc::IPC_TAG_BULK;
+/// A bounce's payload before the name: why, and the message's tag.
+pub const BOUNCE_BYTES: usize = 8;
+
+/// Why a message for another host did not get there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bounce {
+    /// Its mailbox there was full.
+    Full,
+    /// Its mailbox there was gone, or no mailbox had its name.
+    Gone,
+    /// It never went: the way to that host was full, or the host was lost
+    /// before it did.
+    Unsent,
+}
+
+impl Bounce {
+    pub fn code(self) -> u32 {
+        match self {
+            Bounce::Full => ffi::ipc::IPC_BOUNCE_FULL,
+            Bounce::Gone => ffi::ipc::IPC_BOUNCE_GONE,
+            Bounce::Unsent => ffi::ipc::IPC_BOUNCE_UNSENT,
+        }
+    }
+
+    pub fn from_u32(code: u32) -> Option<Bounce> {
+        Some(match code {
+            ffi::ipc::IPC_BOUNCE_FULL => Bounce::Full,
+            ffi::ipc::IPC_BOUNCE_GONE => Bounce::Gone,
+            ffi::ipc::IPC_BOUNCE_UNSENT => Bounce::Unsent,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Bounce::Full => "full",
+            Bounce::Gone => "gone",
+            Bounce::Unsent => "unsent",
+        }
+    }
+}
 
 /// The namespaces only the image registers names under.
 const RESERVED: [&str; 4] = ["kernel", "ipc", "sys", "host"];
@@ -510,6 +561,10 @@ struct Stats {
     refused_remote: AtomicU64,
     peers_up: AtomicU64,
     peers_lost: AtomicU64,
+    /// Messages for other hosts told back to their senders, and those
+    /// bounces dropped for want of room
+    bounced: AtomicU64,
+    bounces_dropped: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -526,6 +581,8 @@ static STATS: Stats = Stats {
     refused_remote: AtomicU64::new(0),
     peers_up: AtomicU64::new(0),
     peers_lost: AtomicU64::new(0),
+    bounced: AtomicU64::new(0),
+    bounces_dropped: AtomicU64::new(0),
 };
 
 fn count(c: &AtomicU64) {
@@ -1392,6 +1449,25 @@ impl Mailbox {
     pub fn remote_down(&self, host: u16, id: u64, reason: Reason) -> Result<(), Error> {
         remote::remote_down(&self.mbox, host, id, reason)
     }
+
+    /// A message from `sender` -- a mailbox here that has sent to the peer
+    /// `host` -- to `target` there (the peer's own address of a mailbox, or
+    /// a name) did not get there, for `why`: told to the sender, TAG_BOUNCED.
+    /// Dropped and counted when the sender has no room.
+    pub fn bounced(&self, host: u16, sender: Addr, target: To, tag: u32, reference: u64, why: Bounce)
+        -> Result<(), Error>
+    {
+        let target = match target {
+            To::Addr(a) => remote::RemoteTo::Addr(a),
+            To::Name(n) => {
+                if !valid_name(n) {
+                    return Err(Error::Invalid);
+                }
+                remote::RemoteTo::Name(n)
+            }
+        };
+        remote::bounced(&self.mbox, host, sender, target, tag, reference, why)
+    }
 }
 
 impl Drop for Mailbox {
@@ -1559,6 +1635,8 @@ pub struct Counters {
     pub refused_remote: u64,
     pub peers_up: u64,
     pub peers_lost: u64,
+    pub bounced: u64,
+    pub bounces_dropped: u64,
     pub queued_bytes: usize,
     pub mailboxes: usize,
     pub names: usize,
@@ -1585,6 +1663,8 @@ pub fn counters() -> Counters {
         refused_remote: get(&STATS.refused_remote),
         peers_up: get(&STATS.peers_up),
         peers_lost: get(&STATS.peers_lost),
+        bounced: get(&STATS.bounced),
+        bounces_dropped: get(&STATS.bounces_dropped),
         queued_bytes: QUEUED.load(Ordering::Relaxed),
         mailboxes,
         names,
