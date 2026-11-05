@@ -164,6 +164,18 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/web-test.py
 
+      # Consensus that loses a committed entry, elects two leaders in a term
+      # or confirms a stale read looks like a group that works -- until the
+      # schedule that breaks it. The raft crate on the host: the known traps
+      # played out step by step, groups over a network that loses, doubles,
+      # reorders and cuts, members crashing, held at every step to Raft's
+      # properties, the same inputs every run.
+      - name: Raft test (host)
+        if: matrix.arch == 'aarch64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/raft-test.py
+
       # The device tree the arm64 boot is handed, the Multiboot2 tags and
       # the ACPI tables the x86 one is, the firmware's memory map, the
       # command line, the GRUB environment block on /boot, a module's .ko:
