@@ -317,6 +317,33 @@ pub unsafe extern "C" fn kernel_ipc_deliver_remote(router: u64, peer: u32, from:
     }
 }
 
+/// # Safety
+/// `name` points at `name_len` readable bytes when `name_len` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_ipc_bounced(router: u64, peer: u32, sender: u64, target: u64, name: *const u8,
+                                            name_len: usize, tag: u32, reference: u64, why: u32) -> i32 {
+    let Some(m) = module_box(router) else { return Error::Gone.code() };
+    let Ok(host) = u16::try_from(peer) else { return Error::Invalid.code() };
+    let Some(why) = crate::Bounce::from_u32(why) else { return Error::Invalid.code() };
+    if name_len > crate::NAME_MAX || (name_len > 0 && name.is_null()) {
+        return Error::Invalid.code();
+    }
+    let target = if name_len > 0 {
+        // SAFETY: the caller's `name_len` bytes at `name`.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(n) if crate::valid_name(n) => crate::remote::RemoteTo::Name(n),
+            _ => return Error::Invalid.code(),
+        }
+    } else {
+        crate::remote::RemoteTo::Addr(Addr::from_u64(target))
+    };
+    match crate::remote::bounced(&m, host, Addr::from_u64(sender), target, tag, reference, why) {
+        Ok(()) => IPC_OK,
+        Err(e) => e.code(),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_ipc_remote_down(router: u64, peer: u32, id: u64, reason: u32) -> i32 {
     let Some(m) = module_box(router) else { return Error::Gone.code() };

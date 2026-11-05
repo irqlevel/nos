@@ -21,9 +21,9 @@ use alloc::vec::Vec;
 
 use ipcwire::route;
 
-use super::{copy, count, next_id, push, push_kept, table, tell_watchers, watchers_of, Addr, Error, Mbox, Message,
-            Payload, Reason, Scope, Table, DOWN_BYTES, MAX_MONITORS, MAX_PAYLOAD, STATS, TAG_DOWN, TAG_NAME_DOWN,
-            TAG_NAME_UP, TAG_ROUTE, TAG_SYSTEM};
+use super::{copy, count, next_id, push, push_kept, table, tell_watchers, watchers_of, Addr, Bounce, Error, Mbox,
+            Message, Payload, Reason, Scope, Table, BOUNCE_BYTES, DOWN_BYTES, MAX_MONITORS, MAX_PAYLOAD, STATS,
+            TAG_BOUNCED, TAG_DOWN, TAG_NAME_DOWN, TAG_NAME_UP, TAG_ROUTE, TAG_SYSTEM};
 
 /// Peers at most: what the low bits of a number hold, less 0, this host.
 pub const MAX_PEERS: usize = 63;
@@ -481,6 +481,59 @@ pub(crate) fn remote_down(router: &Arc<Mbox>, host: u16, id: u64, reason: Reason
     };
     deliver(rec, reason);
     Ok(())
+}
+
+/// What the peer `host` says -- or the router finds -- of a message from
+/// `sender`, a mailbox here that has sent to that peer, to `target` there:
+/// it did not get there, for `why`. Told to the sender as TAG_BOUNCED, from
+/// the target as this host knows it -- the peer's number in its address, or
+/// the peer's alone (slot 0) for a name there -- if the sender has room:
+/// dropped and counted if not, since a bounce is news, and keeps no place
+/// as a Down does. Only to a mailbox that sent there, as `deliver_remote`
+/// delivers only to one: a peer cannot make a stranger hear of it.
+pub(crate) fn bounced(router: &Arc<Mbox>, host: u16, sender: Addr, target: RemoteTo<'_>, tag: u32, reference: u64,
+                      why: Bounce) -> Result<(), Error> {
+    if tag >= TAG_SYSTEM || sender.host != 0 || sender.slot == 0 {
+        return Err(Error::Invalid);
+    }
+    let (from, name) = match target {
+        RemoteTo::Addr(a) if a.host != 0 => return Err(Error::Invalid),
+        RemoteTo::Addr(a) => (Addr { host, slot: a.slot, generation: a.generation }, None),
+        RemoteTo::Name(n) => (Addr { host, slot: 0, generation: 0 }, Some(n)),
+    };
+    let mbox = {
+        let t = table().ok_or(Error::NoMemory)?.lock();
+        if t.stopped {
+            return Err(Error::Stopped);
+        }
+        if !is_router(&t, router) {
+            return Err(Error::NotYours);
+        }
+        let i = live(&t, host).ok_or(Error::NoRoute)?;
+        if !t.peers[i].as_ref().is_some_and(|p| p.sent.contains(&sender)) {
+            count(&STATS.refused_remote);
+            return Err(Error::NotYours);
+        }
+        let slot = usize::from(sender.slot);
+        if slot >= t.slots.len() {
+            return Err(Error::Gone);
+        }
+        t.slots[slot].mbox.as_ref().filter(|m| m.addr == sender).cloned().ok_or(Error::Gone)?
+    };
+    let mut head = [0u8; BOUNCE_BYTES];
+    head[..4].copy_from_slice(&why.code().to_le_bytes());
+    head[4..].copy_from_slice(&tag.to_le_bytes());
+    let payload = Payload::gather(&[&head, name.map_or(&[][..], |n| n.as_bytes())])?;
+    match push(&mbox, Message { from, tag: TAG_BOUNCED, reference, payload }) {
+        Ok(()) => {
+            count(&STATS.bounced);
+            Ok(())
+        }
+        Err((e, _)) => {
+            count(&STATS.bounces_dropped);
+            Err(e)
+        }
+    }
 }
 
 /// The peers, for `ipc peers`: number, name, whether up, how many may be

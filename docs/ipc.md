@@ -146,6 +146,23 @@ hands back what peers say.
   asked to have the peer watch (`TAG_ROUTE` again), and its `remote_down`
   hands the Down over. A peer lost ends them all with `HostLost`, needing
   nothing from the host that is gone; a router's close loses every peer.
+- **A message that did not get there** is told back to its sender
+  (`bounced`, the router's call): its mailbox there full, gone or no
+  mailbox of its name (`Full`, `Gone`), or never sent -- the way to that host
+  full, or the host lost before it went (`Unsent`). It comes as a message of
+  the channel's own, `TAG_BOUNCED`: from the mailbox it was for as this host
+  knows it (the peer's alone, slot 0, for a name there), the reference the
+  message's, the payload why, its tag and, for a name, the name
+  (`Message::bounced` in kcore reads it). Only to a mailbox that has sent to
+  that peer, as only one may be answered from there; and dropped, and
+  counted, when the sender has no room: a bounce keeps no place, as a Down
+  does. A send to another host is `Ok` once it is in the router's mailbox,
+  so a bounce is the only word there is of one that went nowhere.
+- **Two classes**: a tag with the bit `TAG_BULK` (0x4000_0000) goes between
+  hosts by the bulk connection, any other by the control one, so that a
+  megabyte of data never stands in front of a heartbeat. Order between two
+  mailboxes holds within a class, not across them -- nor between a bulk
+  message and the Down of its sender, which comes by the control one.
 - **Hosts coming and going** are told to the watchers of `host.`
   (`NameUp`/`NameDown` of `host.<name>`, from the peer's number); nobody may
   name a mailbox under `host.`.
@@ -153,8 +170,9 @@ hands back what peers say.
   peers and came from them, and what was refused.
 
 The fuzz model holds all of it to its own -- routed heads byte for byte,
-the answer rule, the epochs, HostLost in its kept place, a router's close --
-and nine mutants of it each fail the gate.
+the answer rule, the epochs, HostLost in its kept place, a router's close,
+every bounce and every refusal of one -- and sixteen mutants of it each
+fail the gate.
 
 ## Between hosts: the wire
 

@@ -8,8 +8,9 @@
 //! a call, a module's side, an unload under traffic -- is the boot's
 //! test_module_ipc, through kernel.echo.
 
-use crate::{counters, list, lookup, open, peers, register, Addr, Error, Limits, Mailbox, Owner, Payload, Reason, Scope,
-            To, MAX_PAYLOAD, PIECE, TAG_DOWN, TAG_NAME_DOWN, TAG_NAME_UP, TAG_ROUTE, TAG_SYSTEM};
+use crate::{counters, list, lookup, open, peers, register, Addr, Bounce, Error, Limits, Mailbox, Owner, Payload, Reason,
+            Scope, To, BOUNCE_BYTES, MAX_PAYLOAD, PIECE, TAG_BOUNCED, TAG_DOWN, TAG_NAME_DOWN, TAG_NAME_UP, TAG_ROUTE,
+            TAG_SYSTEM};
 use alloc::vec::Vec;
 use kcore::klog;
 
@@ -216,6 +217,23 @@ fn router() {
     check(c.register("kernel.selftest.host", Scope::Host).is_ok(), "a Host name refused");
     check(router.deliver_remote(peer, from, To::Name("kernel.selftest.host"), 6, 0, Payload::empty())
               == Err(Error::NotYours), "a Host name reached from a peer");
+    /* A message of a's that did not get there, told back: from the mailbox
+     * it was for, as this host knows it, why and its tag in the payload --
+     * and none to a mailbox that never sent there */
+    check(router.bounced(peer, a.addr(), To::Addr(Addr { host: 0, ..there }), 5, 78, Bounce::Full).is_ok(),
+          "a bounce refused");
+    let mut why = [0u8; BOUNCE_BYTES];
+    check(a.try_recv().is_some_and(|m| m.tag() == TAG_BOUNCED && m.from() == there && m.reference() == 78
+                                       && m.payload().read(0, &mut why) == BOUNCE_BYTES
+                                       && why[..4] == Bounce::Full.code().to_le_bytes() && why[4..] == 5u32.to_le_bytes()),
+          "the bounce's sender, reference or reason");
+    check(router.bounced(peer, a.addr(), To::Name("nbs.x"), 5, 79, Bounce::Gone).is_ok()
+              && a.try_recv().is_some_and(|m| m.tag() == TAG_BOUNCED && m.from() == Addr { host: peer, slot: 0,
+                                                                                            generation: 0 }
+                                          && m.payload().len() == BOUNCE_BYTES + 5),
+          "a bounce of a message sent by name");
+    check(router.bounced(peer, b.addr(), To::Addr(Addr { host: 0, ..there }), 5, 0, Bounce::Full)
+              == Err(Error::NotYours), "a bounce told to a mailbox that never sent there");
     /* A monitor of the peer's mailbox: the router asked, the peer's Down */
     let id = a.monitor(there).unwrap_or_else(|e| panic!("ipc selftest: a remote monitor: {}", e.name()));
     check(router.try_recv().is_some_and(|m| m.tag() == TAG_ROUTE), "the router not asked to watch");
