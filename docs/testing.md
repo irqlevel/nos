@@ -225,6 +225,7 @@ swallowing panic messages whole.
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
+| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -2540,6 +2541,79 @@ it; SHA-1's round constant; GeneralizedTime from 2051, a client's
 certificate for servers, a serial's top bit set; a leading zero in an
 address -- each failed it. Needs cargo and openssl; `--seed N --iters N` for
 a campaign.
+
+### `raft-test.py` -- consensus, decided on the host
+
+Consensus that loses a committed entry, elects two leaders in a term or
+confirms a stale read looks like a group that works -- until the one
+schedule of crashes and losses that breaks it. `fuzz/raft` compiles the
+raft crate, as it is, into a host program and holds it, in under five
+seconds, to:
+
+- **Known answers**: every kind of message written and read back, a vote's
+  bytes as the format has them, bytes that are not a message refused each
+  for its reason; the storage's log across its pieces, written over and
+  compacted; a lone voter that leads, commits and reads on its own; the
+  membership change rules; a member added later making the group's
+  membership of the log it is sent.
+- **The known traps**, each played out step by step: the paper's figure 8, a
+  deposed leader asked for a read, a membership change before the leader's
+  first commit (the 2015 erratum), a snapshot overtaken while it is sent and
+  its pieces lost, doubled and reordered, a member back under its old id with
+  a wiped disk -- which the checks must catch, and the harness refuses -- a
+  vote not written before it is answered, the election timer and a vote
+  given in the same term, a follower's commit past what its append showed,
+  a PreVote taken for a vote, an append after an entry of another term.
+- **The node target**, 2000 groups of one to seven, 5000 steps each: a
+  network that delays, loses, doubles, reorders and cuts; members crashing
+  and back with exactly what they wrote; members added, promoted, demoted
+  and taken out; leadership handed over; snapshots taken and sent. At every
+  step: one leader a term; a new leader holding every entry committed in an
+  earlier term; logs that agree on an entry's term agreeing on everything
+  before it; no committed entry changed, and every member applying the same
+  entries to the same state, a snapshot taken in carrying it; no read
+  confirmed behind what was committed before it was asked; no election
+  before the timer ran out since a vote, a leader or a term; no message
+  taken for one that cannot be. Then the network healed: a leader, and a new
+  entry applied by every voter, within 600 rounds.
+- **The wire target**: messages written and read back; noise and broken
+  messages read without a panic, anything taken written back to its very
+  bytes.
+- **The hostile target**, 2000 runs of 3000 steps of one member fed what no
+  correct member sends -- every kind of message, of terms and indexes about
+  its own and of any value, from members and strangers, noise the wire
+  takes, and answers to what it sent, true and false, so that it leads and
+  sends snapshots too -- crashed, compacted and started over: no panic, and
+  its term, its vote within a term and its commit never going back, nothing
+  committed past what it holds, entries handed out in order and as written,
+  a vote answered only once it is on the disk, nothing sent the wire would
+  not read back as it was.
+
+Every allocation of all of it is held to what the kernel's heap gives at
+once, 512 KiB (`fuzz/raft/src/heap.rs`): a larger block is a finding, the
+first with its backtrace. `long_log` is the test for it -- 30,000 empty
+entries and 12,000 membership changes, started over and applied again, a
+leader ticking 20,000 times with nobody taking its messages -- which, before
+the change list was kept in pieces and every batch held to a count as well
+as bytes, asked for eleven blocks past it, the largest 4 MiB.
+
+`fuzz/raft/mutants.py` takes one rule at a time out of `node.rs` -- the figure
+8 check, a vote written before it is answered, the timer started over by a
+vote, a follower's commit held to its append, a PreVote kept apart from a
+vote, an append's previous term checked, the 2015 rule, a read's round of
+heartbeats -- and each must fail the gate, and fail the scenario written for
+it on its own. Campaigns found three things the gate now holds: an
+append window filled with appends lost for good, which nothing emptied (a
+heartbeat's answer now frees one); a candidate of an older membership
+standing term after term ahead of the voters of the newer, which never
+caught up; and a leader cut off that never heard of the later term (a vote
+request and an append of an older term are both now answered with ours).
+The hostile target found the harness's own overflow first and nothing of
+the crate's since; terms and indexes no group reaches (2^62 and past) are
+refused before they are looked at, so no arithmetic on what a peer says can
+overflow. `--seed N --seconds S` for a campaign of the node target;
+`--mutants` to run the mutants after the gate; `raft-fuzz hostile --seed N`
+and `wire --seed N` run those targets by hand.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 
