@@ -161,10 +161,11 @@ fn conn_of(conn: ConnPtr) -> Option<&'static Conn> {
     TCP.by_handle(conn as usize)
 }
 
-/// Start the connection pool's timer: 0 started, -1 not.
+/// Set the connection pool up and start its timer's task: 0 started, -1
+/// not.
 #[no_mangle]
 pub extern "C" fn rust_tcp_init() -> i32 {
-    if TCP.init() { 0 } else { -1 }
+    if TCP.init() && TCP.start_timer() { 0 } else { -1 }
 }
 
 /* ---- TCP, as a module calls it ---- */

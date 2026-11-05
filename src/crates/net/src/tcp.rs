@@ -35,7 +35,11 @@
 //! 200 ms, where it was a second whatever the round trip: a peer may hold
 //! its acknowledgement that long to send it with an answer, as Linux does.
 //! A connection whose data or FIN goes unacknowledged for 100 s is given up,
-//! however many tries that took; a handshake, after eight.
+//! however many tries that took; a handshake, after eight. The timer is a
+//! task of its own that sleeps until the earliest retransmission any
+//! connection has or the next 200 ms sweep, whichever comes first, so a
+//! segment goes again at its timeout, not at the next of looks 200 ms
+//! apart; the sweeps are for the rest of what a connection owes.
 //!
 //! What is written down here rather than left to be rediscovered:
 //!
@@ -78,6 +82,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::nic::Nic;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
+use kcore::task::TaskHandle;
 use kcore::klog;
 
 use crate::abi;
@@ -153,7 +158,10 @@ const RESEND_SEGMENTS: usize = 64;
 const TIME_WAIT_MS: u64 = 60_000;
 const FIN_WAIT2_TIMEOUT_MS: u64 = 60_000;
 const CONNECT_TIMEOUT_MS: u64 = 5000;
-const TIMER_PERIOD_MS: u64 = 200;
+/// How often the timer's task runs the pass whether or not a retransmission
+/// is due: for TIME-WAIT and FIN-WAIT-2 running out, the persist timer and
+/// slots given back, none of which wants it sooner.
+const SWEEP_MS: u64 = 200;
 /// The least time between two ACKs for segments from outside the window --
 /// and for the challenges RFC 5961 answers a guess with.
 const OOW_ACK_GAP_MS: u64 = 500;
@@ -477,6 +485,118 @@ enum Recovery {
     Timeout,
 }
 
+/// A connection's retransmission deadline, in a module of its own so that
+/// its one way to be set is `set`: which tells the timer (`Timer::note`),
+/// so no deadline is set that the timer's task will not wake for in time.
+/// `inner.retransmit_at = ...` does not compile.
+mod deadline {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use kcore::once::Once;
+    use kcore::sync::Event;
+
+    /// What the timer's task sleeps to: the earliest retransmission
+    /// deadline (boot ms), u64::MAX for none -- never later than the
+    /// earliest a connection has, and earlier when one set since was
+    /// acknowledged, which costs a pass that finds nothing due -- and the
+    /// event that wakes the task when a deadline comes sooner than that.
+    pub struct Timer {
+        due: AtomicU64,
+        wake: Once<Event>,
+    }
+
+    impl Timer {
+        pub const fn new() -> Timer {
+            Timer { due: AtomicU64::new(u64::MAX), wake: Once::new() }
+        }
+
+        /// The event made, before the task is started: false when it could
+        /// not be.
+        pub fn setup(&self) -> bool {
+            if self.wake.get().is_none() {
+                match Event::new() {
+                    /* Another's made first is as good: this one is dropped */
+                    Some(event) => drop(self.wake.set(event)),
+                    None => return false,
+                }
+            }
+            true
+        }
+
+        /// The task's to wait on; None before `setup`.
+        pub fn event(&self) -> Option<&Event> {
+            self.wake.get()
+        }
+
+        /// The earliest deadline set (boot ms).
+        #[inline]
+        pub fn due(&self) -> u64 {
+            self.due.load(Ordering::SeqCst)
+        }
+
+        /// The pass's start: over from none. What its walk finds set, and
+        /// what is set meanwhile (`note`), makes it again.
+        pub fn restart(&self) {
+            self.due.store(u64::MAX, Ordering::SeqCst);
+        }
+
+        /// A deadline `at`: the earliest brought forward to it, and the task
+        /// woken, should it be sooner. Called with the connection's lock
+        /// held, which is what makes this sound against the pass's
+        /// `restart`: a deadline set while the pass walks is either one the
+        /// walk finds under the same lock, or one set after the walk had the
+        /// lock -- and so after the restart, which the load below then sees.
+        /// A plain load first, since a deadline a timeout away is seldom the
+        /// earliest: an acknowledgement that sets one costs no locked
+        /// instruction on a line every CPU's acknowledgements share.
+        #[inline]
+        pub fn note(&self, at: u64) {
+            if at < self.due.load(Ordering::SeqCst) && at < self.due.fetch_min(at, Ordering::SeqCst) {
+                if let Some(wake) = self.wake.get() {
+                    wake.signal();
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub struct Deadline(u64);
+
+    impl Deadline {
+        pub const NONE: Deadline = Deadline(0);
+
+        /// When, in boot ms; 0 for none.
+        #[inline]
+        pub fn at(self) -> u64 {
+            self.0
+        }
+
+        #[inline]
+        pub fn is_set(self) -> bool {
+            self.0 != 0
+        }
+
+        /// Set, and come by `now`.
+        #[inline]
+        pub fn due(self, now: u64) -> bool {
+            self.0 != 0 && now >= self.0
+        }
+
+        /// Set for `at`, and the timer told. Under the connection's lock.
+        #[inline]
+        pub fn set(&mut self, at: u64, timer: &Timer) {
+            self.0 = at.max(1);
+            timer.note(self.0);
+        }
+
+        #[inline]
+        pub fn clear(&mut self) {
+            self.0 = 0;
+        }
+    }
+}
+
+use deadline::{Deadline, Timer};
+
 struct Inner {
     /* Who it is between */
     local_ip: u32,
@@ -545,7 +665,8 @@ struct Inner {
     bulk_wanted: bool,
 
     rto_ms: u64,
-    retransmit_at: u64,
+    /// When what is outstanding goes again
+    retransmit_at: Deadline,
     /// Retransmits with no acknowledgement in between
     retransmit_count: u32,
     /// The smoothed round trip and its variation (RFC 6298 2), in
@@ -594,11 +715,17 @@ impl Inner {
             cwnd: IW_BYTES, ssthresh: u32::MAX, dup_acks: 0, recovery: Recovery::None, recover: 0, retx_nxt: 0,
             bulk_wanted: false,
             rto_ms: INITIAL_RTO_MS,
-            retransmit_at: 0, retransmit_count: 0, srtt_us: 0, rttvar_us: 0, rtt_seq: 0, rtt_sent_ns: 0,
+            retransmit_at: Deadline::NONE, retransmit_count: 0, srtt_us: 0, rttvar_us: 0, rtt_seq: 0, rtt_sent_ns: 0,
             stalled_since_ms: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
             accepted: false,
         }
+    }
+
+    /// What is outstanding to go again a timeout from `now`, the timer told.
+    fn retransmit_in_rto(&mut self, now: u64, timer: &Timer) {
+        let at = now + self.rto_ms;
+        self.retransmit_at.set(at, timer);
     }
 
     /// Everything but the buffers' bytes.
@@ -641,7 +768,7 @@ impl Inner {
         self.retx_nxt = 0;
         self.bulk_wanted = false;
         self.rto_ms = INITIAL_RTO_MS;
-        self.retransmit_at = 0;
+        self.retransmit_at.clear();
         self.retransmit_count = 0;
         self.srtt_us = 0;
         self.rttvar_us = 0;
@@ -853,6 +980,14 @@ pub struct Tcp {
     rx_too_short: AtomicUsize,
     retransmits: AtomicUsize,
     conn_count: AtomicUsize,
+
+    /// What the timer's task sleeps to, and what wakes it
+    timer: Timer,
+    /// Taken by the one start that makes the task: an event has one waiter
+    timer_started: AtomicBool,
+    /// The task: taken out under the lock, and dropped -- which waits for
+    /// it -- after
+    timer_task: PreemptSpinLock<Option<TaskHandle>>,
 }
 
 /// The one of these. A static, pool and all -- 64 connections with two 8 KiB
@@ -868,6 +1003,9 @@ pub static TCP: Tcp = Tcp {
     rx_too_short: AtomicUsize::new(0),
     retransmits: AtomicUsize::new(0),
     conn_count: AtomicUsize::new(0),
+    timer: Timer::new(),
+    timer_started: AtomicBool::new(false),
+    timer_task: PreemptSpinLock::new(None),
 };
 
 fn now_ms() -> u64 {
@@ -942,16 +1080,9 @@ impl Tcp {
             return true;
         }
 
-        kcore::softirq::register_for(kcore::softirq::TYPE_TCP_TIMER, self, Tcp::on_softirq);
-
-        let period = kcore::time::Duration::from_nanos(
-            TIMER_PERIOD_MS * kcore::consts::NS_PER_MS);
-        match kcore::timer::Timer::start_for(period, self, Tcp::on_tick) {
-            Some(timer) => timer.leak(),
-            None => {
-                klog!(0, "tcp: the retransmit timer could not be started");
-                return false;
-            }
+        if !self.timer.setup() {
+            klog!(0, "tcp: no event for the timer's task");
+            return false;
         }
 
         self.initialized.store(true, Ordering::Release);
@@ -1165,7 +1296,11 @@ impl Tcp {
         inner.rto_ms = rtt_rto(inner);
         inner.retransmit_count = 0;
         inner.stalled_since_ms = 0;
-        inner.retransmit_at = if inner.snd_una == inner.snd_nxt { 0 } else { now + inner.rto_ms };
+        if inner.snd_una == inner.snd_nxt {
+            inner.retransmit_at.clear();
+        } else {
+            inner.retransmit_in_rto(now, &self.timer);
+        }
         self.newly_acked(inner, acked as u32);
     }
 
@@ -1657,7 +1792,7 @@ impl Tcp {
                     }
                     inner.state = State::Established;
                     inner.rto_ms = rtt_rto(inner);
-                    inner.retransmit_at = 0;
+                    inner.retransmit_at.clear();
                     start_congestion(inner);
 
                     self.send_ack(inner);
@@ -1675,7 +1810,7 @@ impl Tcp {
                     inner.snd_wl2 = ack;
                     inner.state = State::Established;
                     inner.rto_ms = rtt_rto(inner);
-                    inner.retransmit_at = 0;
+                    inner.retransmit_at.clear();
                     start_congestion(inner);
                     conn.conn_ready.store(true, Ordering::Release);
                     return Event::Accepted;
@@ -1731,7 +1866,7 @@ impl Tcp {
                      * 4.2.2.20 wants a timer here: a peer that never sends
                      * its FIN must not pin the slot for good. */
                     inner.state = State::FinWait2;
-                    inner.retransmit_at = 0;
+                    inner.retransmit_at.clear();
                     inner.time_wait_at = now + FIN_WAIT2_TIMEOUT_MS;
                 }
             }
@@ -1970,7 +2105,7 @@ impl Tcp {
             self.send_segment(&mut inner, seg::SYN | seg::ACK_FLAG, &[]);
             /* A SYN takes a sequence number */
             inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-            inner.retransmit_at = now_ms() + inner.rto_ms;
+            inner.retransmit_in_rto(now_ms(), &self.timer);
 
             self.conn_count.fetch_add(1, Ordering::Relaxed);
             return;
@@ -2050,7 +2185,7 @@ impl Tcp {
         }
 
         inner.state = State::Closed;
-        inner.retransmit_at = 0;
+        inner.retransmit_at.clear();
         inner.need_cleanup = true;
         conn.conn_ready.store(true, Ordering::Release);
         conn.data_ready.store(true, Ordering::Release);
@@ -2161,7 +2296,7 @@ impl Tcp {
 
         self.send_segment(&mut inner, seg::SYN, &[]);
         inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-        inner.retransmit_at = now_ms() + inner.rto_ms;
+        inner.retransmit_in_rto(now_ms(), &self.timer);
         drop(inner);
         self.conn_count.fetch_add(1, Ordering::Relaxed);
 
@@ -2415,8 +2550,8 @@ impl Tcp {
                 inner.rtt_sent_ns = now_ns();
             }
 
-            if inner.retransmit_at == 0 {
-                inner.retransmit_at = now_ms() + inner.rto_ms;
+            if !inner.retransmit_at.is_set() {
+                inner.retransmit_in_rto(now_ms(), &self.timer);
             }
             drop(inner);
             sent += chunk;
@@ -2562,7 +2697,7 @@ impl Tcp {
                 count += 1;
 
                 inner.state = State::Closed;
-                inner.retransmit_at = 0;
+                inner.retransmit_at.clear();
                 inner.need_cleanup = true;
                 conn.conn_ready.store(true, Ordering::Release);
                 conn.data_ready.store(true, Ordering::Release);
@@ -2597,13 +2732,13 @@ impl Tcp {
                 inner.fin_acked = false;
                 self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
                 inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-                inner.retransmit_at = now_ms() + inner.rto_ms;
+                inner.retransmit_in_rto(now_ms(), &self.timer);
             }
             State::CloseWait => {
                 inner.state = State::LastAck;
                 self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
                 inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-                inner.retransmit_at = now_ms() + inner.rto_ms;
+                inner.retransmit_in_rto(now_ms(), &self.timer);
             }
             State::SynSent => inner.state = State::Closed,
             /* A listener was dealt with above, under the pool lock -- which
@@ -2638,7 +2773,7 @@ impl Tcp {
             _ => {}
         }
 
-        inner.retransmit_at = 0;
+        inner.retransmit_at.clear();
         inner.need_cleanup = true;
         conn.conn_ready.store(true, Ordering::Release);
         conn.data_ready.store(true, Ordering::Release);
@@ -2650,8 +2785,13 @@ impl Tcp {
 /* ---- the timer ---- */
 
 impl Tcp {
-    /// Every two hundred milliseconds, from the soft IRQ the tick raises.
-    pub fn process_retransmits(&'static self) {
+    /// The timer's task's: when a retransmission is due, and every
+    /// `SWEEP_MS` whether or not.
+    fn process_retransmits(&'static self) {
+        /* The timer's earliest, over from none: what this walk finds set,
+         * and what is set meanwhile, makes it again */
+        self.timer.restart();
+        let mut earliest = u64::MAX;
         let now = now_ms();
         let mut any_cleanup = false;
         /* Bulk buffers given back, a connection's two: taken out under the
@@ -2703,7 +2843,7 @@ impl Tcp {
                 continue;
             }
 
-            if inner.retransmit_at != 0 && now >= inner.retransmit_at {
+            if inner.retransmit_at.due(now) {
                 let mut retransmitted = false;
 
                 match inner.state {
@@ -2754,7 +2894,7 @@ impl Tcp {
                             inner.remote_port, inner.state, inner.retransmit_count);
 
                         inner.state = State::Closed;
-                        inner.retransmit_at = 0;
+                        inner.retransmit_at.clear();
                         inner.need_cleanup = true;
                         conn.conn_ready.store(true, Ordering::Release);
                         conn.data_ready.store(true, Ordering::Release);
@@ -2769,7 +2909,7 @@ impl Tcp {
                     }
                     inner.rto_ms = (inner.rto_ms * 2).min(MAX_RTO_MS);
                 }
-                inner.retransmit_at = now + inner.rto_ms;
+                inner.retransmit_in_rto(now, &self.timer);
             }
 
             /* The persist timer (RFC 9293 3.8.6.1): the peer said its window
@@ -2781,7 +2921,7 @@ impl Tcp {
              * now. */
             if matches!(inner.state, State::Established | State::CloseWait)
                 && inner.snd_wnd == 0 && inner.snd_una == inner.snd_nxt
-                && inner.retransmit_at == 0
+                && !inner.retransmit_at.is_set()
             {
                 if inner.persist_at == 0 {
                     inner.persist_at = now + inner.rto_ms;
@@ -2797,6 +2937,13 @@ impl Tcp {
             } else {
                 inner.persist_at = 0;
             }
+
+            if inner.retransmit_at.is_set() {
+                earliest = earliest.min(inner.retransmit_at.at());
+            }
+        }
+        if earliest != u64::MAX {
+            self.timer.note(earliest);
         }
 
         /* And the slots that are done with, under the pool lock: giving a
@@ -2878,6 +3025,7 @@ impl Tcp {
                 } else {
                     None
                 },
+                retransmit_at: inner.retransmit_at.at(),
             })
         }
     }
@@ -2916,16 +3064,72 @@ pub struct ConnInfo {
     pub cwnd: usize,
     /// This end's shift and the peer's, on a connection that scales
     pub scales: Option<(u8, u8)>,
+    /// When what is outstanding goes again (boot ms), 0 for never
+    pub retransmit_at: u64,
 }
 
 impl Tcp {
-    /// The periodic tick, from IPI context: it only raises the soft IRQ.
-    fn on_tick(&'static self) {
-        kcore::softirq::raise(kcore::softirq::TYPE_TCP_TIMER);
+    /// The timer's task started: by the kernel's boot after `init`, and by
+    /// a fuzzer at each input, whose machine boots with no thread. Pinned
+    /// to CPU 0, as a waiter whose wakeups are to be prompt is: one moved
+    /// as it blocks would be woken at the other CPU's next scheduling
+    /// point. False when it could not be started.
+    pub fn start_timer(&'static self) -> bool {
+        if self.timer.event().is_none() {
+            return false;
+        }
+        if self.timer_started.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        match kcore::task::spawn_on_with("tcp/timer", 1, self, Tcp::timer_task) {
+            Some(task) => {
+                *self.timer_task.lock() = Some(task);
+                true
+            }
+            None => {
+                self.timer_started.store(false, Ordering::Release);
+                klog!(0, "tcp: the timer's task could not be started");
+                false
+            }
+        }
     }
 
-    /// The soft IRQ the tick raised.
-    fn on_softirq(&'static self) {
-        self.process_retransmits();
+    /// The timer's task stopped and waited for: what a fuzzer's input ends
+    /// with, every task of its machine held to having ended. The kernel
+    /// never stops it.
+    pub fn stop_timer(&'static self) {
+        let task = self.timer_task.lock().take();
+        if let Some(task) = task {
+            task.request_stop();
+            if let Some(wake) = self.timer.event() {
+                wake.signal();
+            }
+            drop(task);
+            self.timer_started.store(false, Ordering::Release);
+        }
+    }
+
+    /// The timer's task: asleep until a retransmission is due or the sweep
+    /// is, whichever is first -- woken sooner by a deadline set before the
+    /// one it sleeps to -- and the pass run then, here.
+    fn timer_task(tcp: &'static Tcp) {
+        let Some(wake) = tcp.timer.event() else { return };
+        let mut sweep_at = 0;
+        while !kcore::task::stopping() {
+            let now = now_ms();
+            if now >= sweep_at || now >= tcp.timer.due() {
+                if now >= sweep_at {
+                    sweep_at = now + SWEEP_MS;
+                }
+                tcp.process_retransmits();
+                continue;
+            }
+            /* Both later than now: a deadline set meanwhile that is not has
+             * signalled, and the wait returns at once. Saturating all the
+             * same: a wrap here would be a sleep of ages, every
+             * retransmission stopped without a word. */
+            let until = sweep_at.min(tcp.timer.due());
+            wake.wait_for(kcore::time::Duration::from_millis(until.saturating_sub(now)));
+        }
     }
 }

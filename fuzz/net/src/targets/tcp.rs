@@ -708,6 +708,7 @@ pub fn tcp(r: &mut Input) {
         }
         st.w.pump();
         st.harvest();
+        super::check_tcp_timer();
     }
 
     wind_down(&mut st);
@@ -799,6 +800,7 @@ fn wind_down(st: &mut State) {
             }
         }
         st.w.run_for(100 * MS);
+        super::check_tcp_timer();
         st.harvest();
         reset_abandoned(st, &mut told);
         let busy = st.links.iter().any(|l| l.call.is_some()) || !st.accepts.is_empty();
@@ -891,6 +893,7 @@ fn wind_down(st: &mut State) {
             st.w.peers.tcp.read(&mut st.w.net, e, unread);
         }
         st.w.run_for(if round == 0 { 180 * SEC } else { 60 * SEC });
+        super::check_tcp_timer();
         let busy = (0..net::tcp::MAX_CONNECTIONS).any(|i| TCP.snapshot(i).is_some());
         let now_sent = TCP.stats().tx;
         if !busy || now_sent == sent || sched::now() >= give_up {

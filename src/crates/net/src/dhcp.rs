@@ -326,10 +326,13 @@ impl Dhcp {
 
     /// Waits for a message of `want`; false once the timeout passes, at
     /// once when the server says no, and when the task is asked to stop.
+    /// The timeout is the clock's: a sleep may take longer than it asks --
+    /// the CPU busy, a wakeup at a tick -- and counting sleeps instead held
+    /// a lease past its end, the wait for a renewal outlasting it.
     fn wait_for(&self, want: u8, timeout_ms: u64) -> bool {
-        let mut left = timeout_ms;
+        let deadline = now_ms().saturating_add(timeout_ms);
 
-        while left > 0 && !kcore::task::stopping() {
+        while !kcore::task::stopping() {
             let mut frame = [0u8; RX_MAX];
             let mut len = 0;
             {
@@ -353,8 +356,11 @@ impl Dhcp {
                 }
             }
 
-            kcore::task::sleep_ms(POLL_INTERVAL_MS);
-            left = left.saturating_sub(POLL_INTERVAL_MS);
+            let now = now_ms();
+            if now >= deadline {
+                break;
+            }
+            kcore::task::sleep_ms(POLL_INTERVAL_MS.min(deadline - now));
         }
 
         false
