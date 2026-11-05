@@ -37,7 +37,7 @@ pub const END: u64 = 1 << 62;
 /// the clock without sleeping ends, as it would on a machine.
 const READ_NS: u64 = 100;
 /// The scheduler's tick: every CPU has a scheduling point this often.
-const TICK: u64 = 10_000_000;
+pub const TICK: u64 = 10_000_000;
 /// That many reads with no sleep, wait or yield between is a loop that
 /// neither gets anywhere nor lets anything else run.
 const SPIN_READS: u64 = 1_000_000;

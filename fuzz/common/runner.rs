@@ -31,9 +31,16 @@ pub struct Fuzzer {
     /// Boots the machine, once, in the parent every input's process is
     /// forked from -- which must never make a thread (`sched::boot`).
     pub boot: fn(),
+    /// What each input's process starts before its target runs: the
+    /// kernel's tasks that its boot would have, which the parent may not
+    /// make. In the child, and in a replay.
+    pub begin: fn(),
     /// The variable that adds each target's slowest input to the report.
     pub stats_env: &'static str,
 }
+
+/// The fuzzer's `begin`, for `run_input`.
+static BEGIN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// SplitMix64: the seed's stream of random words.
 struct Rng(u64);
@@ -104,6 +111,9 @@ fn begin(data: &[u8]) {
 /// replay does.
 fn run_input(t: &Target, data: &[u8]) {
     begin(data);
+    if let Some(start) = BEGIN.get() {
+        start();
+    }
     let mut input = Input::new(data.get(HEADER..).unwrap_or(&[]));
     (t.run)(&mut input);
 }
@@ -348,6 +358,7 @@ pub fn main(f: &Fuzzer) {
     install_hook();
     COUNTING.store(std::env::var_os(f.stats_env).is_some(), Ordering::Relaxed);
     (f.boot)();
+    let _ = BEGIN.set(f.begin);
 
     if let Some((name, file)) = replay {
         /* One input again, here, with the panic's own report and backtrace. */

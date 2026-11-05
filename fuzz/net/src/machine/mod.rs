@@ -17,9 +17,10 @@ pub const ETH0_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 pub const POOL_FRAMES: usize = 512;
 
 /// Boots the machine, once, in the parent every input's process is forked
-/// from: the pool built, eth0 registered, TCP's timer started, the network
-/// layer's commands in the table -- as the kernel's boot does them, in its
-/// order. No thread is made and none parked: see `sched::boot`.
+/// from: the pool built, eth0 registered, TCP set up, the network layer's
+/// commands in the table -- as the kernel's boot does them, in its order.
+/// No thread is made and none parked: see `sched::boot`. TCP's timer is a
+/// task, so each input starts its own (`begin`).
 pub fn boot() {
     sched::boot();
     set_trace_sink(netconsole_log);
@@ -33,6 +34,15 @@ pub fn boot() {
         panic!("TCP would not start");
     }
     net::init();
+}
+
+/// Each input's start, in its own process: TCP's timer's task, which the
+/// kernel's boot starts after setting TCP up -- and which each input's
+/// audit stops (`targets::audit_but`).
+pub fn begin() {
+    if !sched::kernel(|| net::tcp::TCP.start_timer()) {
+        panic!("TCP's timer would not start");
+    }
 }
 
 /// Every line the tracer makes, to netconsole: from whatever context traced

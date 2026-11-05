@@ -41,6 +41,26 @@ pub fn audit() {
     audit_but(&[], &[]);
 }
 
+/// The TCP timer's promise (the timer's task in net/src/tcp.rs): no
+/// connection's retransmission is left past its deadline by more than the
+/// task's wakeup can be late -- a tick of the machine's, which rounds every
+/// sleep up to one -- with one to spare: the pass the task runs then sends
+/// again or sets a deadline anew. A closed connection's is nobody's: the
+/// pass skips it, and the slot's cleanup is all that is left of it.
+pub fn check_tcp_timer() {
+    let now_ms = crate::machine::sched::now() / 1_000_000;
+    let late = 2 * crate::machine::sched::TICK / 1_000_000 + 1;
+    for i in 0..net::tcp::MAX_CONNECTIONS {
+        if let Some(c) = net::tcp::TCP.snapshot(i) {
+            if c.retransmit_at != 0 && c.state != net::tcp::State::Closed {
+                invariant!(now_ms <= c.retransmit_at + late, "TCP slot {} ({}, port {} -> {}): its retransmission was \
+                           due at {} ms and is still not looked at, at {} ms", i, c.state.name(), c.local_port,
+                           c.remote_port, c.retransmit_at, now_ms);
+            }
+        }
+    }
+}
+
 /// `audit`, but for the TCP connections on `held`'s ports -- the machine's
 /// and the other end's -- and the tasks in `waiting`: what an attacker may
 /// hold open on purpose, as any peer may.
@@ -62,6 +82,9 @@ pub fn audit_but(held: &[(u16, u16)], waiting: &[usize]) {
         let pool = net::frame::POOL.stats();
         invariant!(pool.in_flight == 0, "{} frames out of the pool with nothing left to hold one", pool.in_flight);
     }
+    /* TCP's timer's task waits for good, as it does in the kernel: stopped
+     * here, where nothing is left for it to do */
+    net::tcp::TCP.stop_timer();
     for (id, name, kind, st, holds) in crate::machine::sched::tasks() {
         if waiting.contains(&id) {
             continue;

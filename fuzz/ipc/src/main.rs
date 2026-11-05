@@ -37,6 +37,7 @@ fn main() {
         name: "ipc-fuzz",
         targets: target::ALL,
         boot: machine::boot,
+        begin: || {},
         stats_env: "IPC_FUZZ_STATS",
     });
 }
