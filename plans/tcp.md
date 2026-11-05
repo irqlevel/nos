@@ -97,7 +97,17 @@ whose links the fuzzer is then to drive.
   Then on the boxes: request and response p50 and p99 under load, and how
   many retransmissions turn out spurious.
 
-**T3, strangers kept off before they cost anything.**
+**T3, strangers kept off before they cost anything.** Done on branch
+`ipc-raft` but for the module's way to it and the measurement, which come
+with ipcnet (I4), its first user: `Tcp::listen_allowed` and `set_allowed`
+in the image, with no C ABI yet -- an export nobody calls is not added. Any
+segment from a stranger to an allowlisted port is dropped, not only a SYN:
+an ACK's probe answered with a reset would say the port is there. nos sends
+no ICMP error, and its echo replies are not held to a rate, as Linux's are
+not: a ping is answered one for one, nothing amplified. `tcpstat` counts
+all three (`refused=`, `halfopen=`, `rstheld=`), and net-fuzz's tcp target
+holds each to a model -- a stranger, a list changed under it, floods at a
+closed port -- with eight mutants caught.
 - A listener can be given the addresses it answers (`bind_allowed`). A SYN
   from any other is dropped where the listener is found, before the backlog
   and before a slot: no SYN-ACK, no RST, no slot.

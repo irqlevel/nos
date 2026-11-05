@@ -135,8 +135,8 @@ pub fn icmpstat(_args: &str, out: &mut Output) {
 
 pub fn tcpstat(_args: &str, out: &mut Output) {
     let st = TCP.stats();
-    let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={}",
-        st.tx, st.rx, st.rx_err, st.retransmits, st.conns);
+    let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={} refused={} halfopen={} rstheld={}",
+        st.tx, st.rx, st.rx_err, st.retransmits, st.conns, st.syn_refused, st.half_open, st.rst_held);
 
     for index in 0..crate::tcp::MAX_CONNECTIONS {
         let line = match TCP.snapshot(index) {
