@@ -118,6 +118,25 @@ ipc echo [start|stop]   kernel.echo, which answers what it is sent with what it 
   channel knows a module by -- to the module's name inside its image and
   nothing outside.
 
+## Between hosts: the wire
+
+`ipcwire` (`src/crates/ipcwire`, no kernel and no `unsafe`) is what ipcnet
+is to say to another host inside their TLS session (plans/ipc.md, I4; the
+module itself is not written yet): frames of an 8-byte head -- kind, flags,
+two bytes kept at zero, a length -- and at most 16 KiB, a TLS record's
+worth. `Hello` first, both ways (the version, the cluster's id, both
+hosts' names); `Ping` and `Pong`; a message as a `Head` (its number on the
+connection, where it goes -- an address or a name -- who sent it, its tag,
+reference and length, up to 1 MiB) and `Body` frames, other messages'
+frames between them; `Bounced`, `Monitor`, `Demonitor`, `Down`. `decode`
+gives a frame once all of it has come, every length checked first -- a head
+claiming more than a frame is refused at once, not waited on -- and a frame
+it gives encodes to exactly the bytes it came from. `Assembler` puts
+messages back together, bounded in how many are open and in the bytes their
+heads promised, each body kept in pieces of a frame: no allocation larger
+than a frame, whatever a message's size. `encode` grows its buffer by
+exactly the frame. Its gate is `ipc-fuzz.py --target wire`.
+
 ## Limits
 
 - This host only: a message to another host's address is `NoRoute` until

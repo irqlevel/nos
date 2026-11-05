@@ -20,8 +20,13 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "ipc",
+ "ipcwire",
  "kcore",
 ]
+
+[[package]]
+name = "ipcwire"
+version = "0.1.0"
 
 [[package]]
 name = "kcore"

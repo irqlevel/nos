@@ -25,6 +25,7 @@ extern crate alloc;
 mod common;
 mod machine;
 mod target;
+mod wire;
 
 pub use common::input::{self, Input};
 pub use common::runner::{reached, Target};
