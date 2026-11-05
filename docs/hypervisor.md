@@ -1709,8 +1709,8 @@ Each time round the run loop what it has served is given back: a read's
 data copied into the guest, the status written, the chain on the used ring,
 an interrupt; and as it finishes each lot the task wakes a halted vCPU or
 kicks a running one out of its guest, the NICs' way ([A network](#a-network)).
-Guest memory is touched on the vCPU's task and nowhere else. At most 32
-requests are out at once, each in a 256 KiB buffer of the backend's taken
+Guest memory is touched on the vCPU's task and nowhere else. At most 64
+requests are out at once (`blk::IN_FLIGHT`), each in a 256 KiB buffer of the backend's taken
 when the disk is made (`Backend::with_buffer`) -- the driver is told a
 request carries at most 64 segments of a page (`seg_max`, `size_max`) --
 so nothing is allocated on the way, and a guest that keeps its ring full
@@ -1850,6 +1850,177 @@ size and kind, converted and held byte for byte to what qemu-img reads; the
 refusals; the decoder against zlib over streams made and broken at random;
 and the images' metadata fuzzed. `hv-test.py` converts in nos, on both
 architectures, and holds the disk to its SHA-256 ([Testing](testing.md)).
+
+## A device as a guest's disk
+
+`disk=` takes a partition or a whole disk of nos's as well as a file. The
+guest's virtio disk is then the device itself: its requests go to the block
+layer's queue for that device (`kcore::block::DiskQueue`, over
+`block/src/devq.rs`) and nothing else -- no file and no filesystem on the
+way, so no extent map looked up, no chunk grown ahead of a write, no ext4
+commit, no lock of the VFS's (`modules/hv/src/devices.rs`, `disk.rs`).
+
+**A device is named by what finds it again at the next boot.** Linux and nos
+alike number the EX44's two NVMe drives differently from one boot to the
+next, and a vm.toml that said `nvme1` would one day be given the other
+drive. So `disks` gives each device an id, and a vm.toml keeps that:
+
+```
+> disks
+vda  131072 sectors (64 MB)  512 bytes/sector
+nvme0  131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta
+nvme1  131072 sectors (64 MB)  512 bytes/sector  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb
+nvme01  16384 sectors (8 MB)  512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000001
+nvme02  32768 sectors (16 MB)  512 bytes/sector  part:6e6f7364-6576-0000-0000-000000000002
+```
+
+A partition is `part:` and its GPT unique GUID, as Linux's PARTUUID writes
+it, or its MBR's disk signature and number (`part:4e6f7331-01`); a whole
+NVMe disk is `disk:nvme-` with the model and serial number its controller
+gives. A device with neither -- the virtio disk above -- has no id, and is
+given only by its name, `dev:vda`, to what is given once: `hv boot`, `hv
+start` with a kernel. Its name is never written into a vm.toml. A vm.toml's
+id is looked up at every start, under whatever name the device has that
+boot, and two devices with one id -- a disk copied whole, partition table
+and all -- are refused rather than one taken.
+
+**`hv devices`** is what could be given, and what is in the way of each:
+
+```
+> hv devices
+vda         64 MiB  (no id)  whole disk  -- held by a mounted filesystem
+nvme0       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta  whole disk  -- holds a GPT partition table
+nvme1       64 MiB  disk:nvme-QEMU_NVMe_Ctrl_nosdevtestb  whole disk  -- empty
+nvme01       8 MiB  part:6e6f7364-...-000000000001  GPT type 0fc63daf-...  -- holds an ext4 filesystem labelled "devtest"
+nvme02      16 MiB  part:6e6f7364-...-000000000002  GPT type 0fc63daf-...  -- empty
+nvme03       4 MiB  part:6e6f7364-...-000000000003  an EFI System partition  -- empty
+nvme04      16 MiB  part:6e6f7364-...-000000000004  GPT type 0fc63daf-...  -- holds data nos does not recognize
+```
+
+What is on a device nobody holds is read off its first 72 KiB and its last
+128 KiB, where each kind keeps its mark (`diskimage::contents`): ext2, ext3
+and ext4 told apart by their features, XFS, btrfs, F2FS, swap, an LVM
+physical volume, an md RAID member of any superblock version, LUKS, ISO
+9660, NTFS, exFAT, FAT, squashfs, nanofs, nos's disk log, a GPT or an MBR --
+with its label where the kind has one -- and bytes that are none of those
+as "data nos does not recognize". Only a start of zeros is "empty".
+
+**A device is given where it may be, and the rest is refused saying why**:
+
+```
+> hv create e1 /hvboot mem=64 disk=dev:nvme03
+hv: nvme03 (part:...-000000000003) is an EFI System partition: the machine boots from it, and no vm is given it
+> hv create e2 /hvboot mem=64 disk=dev:nvme01
+hv: nvme01 (part:...-000000000001) holds an ext4 filesystem labelled "devtest" -- the vm would have its data over it; give it anyway with force
+> hv create d1 /spin.elf mem=64 disk=dev:nvme02
+hv: /vms/d1/vm.toml written -- hv start d1 boots it
+> hv create d2 /hvboot mem=64 disk=dev:nvme0
+hv: nvme0 (disk:nvme-QEMU_NVMe_Ctrl_nosdevtesta) is vm d1's disk already (its vm.toml names part:...-000000000002) -- two vms on one device wreck each other's data; give it anyway with force
+```
+
+- never an EFI System partition or a BIOS boot partition, by their GPT
+  types or the MBR's 0xEF -- not even with `force`;
+- never a device something holds -- a mounted filesystem, the disk log, a
+  guest running on it, `netblk` serving it for writing -- nor one
+  overlapping something held:
+  the disk under nos's root, a partition of a disk a guest has whole;
+- with `force` only, a device another VM's vm.toml names, or one
+  overlapping it -- the whole of a disk one of whose partitions is d1's
+  above -- and a device with anything on it.
+
+`hv create <name> ... disk=<device>` and `hv disk attach <vm> <device>[:ro]
+[force]` give a device; `hv disk detach <vm> <device>` takes it off the
+vm.toml and leaves the device as it is -- both to a VM that is stopped,
+whose next start has them. Each writes the id, not the name
+it was given by (`disks = ["part:6e6f7364-...-000000000002"]`). The checks
+are made where a device is given and not at every start: once given, what
+is on it is the guest's, the filesystem it makes included. A vm.toml
+written by hand, or by the `config_set` call, is taken as it says -- the
+EFI System partition and the claims are still refused when it starts, the
+rest is the writer's to have checked.
+
+**While its VM runs, a device is its VM's alone.** A start claims each of
+its devices for `vm <name>'s disk` in the block table, whose claims compare
+stretches of one physical disk: no mount, no disk log, no write of the
+shell's, no other guest can have that device or anything that overlaps it
+until the VM stops --
+
+```
+> diskwrite nvme02 0 55
+disk 'nvme02' is in use by vm d1's disk
+```
+
+-- and a start that cannot have its claim is refused, saying whose the
+device is. A claim is one holder's, so `:ro` makes a device read-only to its
+guest but does not let a second VM read it: a device is one VM's at a time.
+
+**The queue.** `DiskQueue` has the calls `fs::image`'s queue has -- buffers
+lent between requests, a request started on one, reaped, waited for -- so
+a device disk and a file disk share the disk task's loop
+(`modules/hv/src/disk.rs`, its `Media` trait), and the module has no
+`unsafe` of its own for either. A request longer than the device takes at
+once is split into the commands it can take and given back when the last
+is done; a device busy with nos's own I/O is waited for as an image waits
+for it; and a device without the asynchronous path -- virtio-blk and
+virtio-scsi in nos -- is served a page at a time on the spot. What the
+guest's device offers follows the backend: discard where the device can
+give blocks back -- an NVMe whose controller has Dataset Management (ONCS
+bit 2), which nos now sends -- and not on a read-only disk; no write of
+zeros, which a guest then writes itself; and a device of 4 KiB sectors
+says so (`VIRTIO_BLK_F_BLK_SIZE`), the guest's every request a multiple of
+it, refused otherwise.
+
+**A device poured from a cloud's image.** `hv convert <image> <device>
+[force]` writes an image's disk onto a device -- qcow2 converted as it
+goes, a raw image copied -- and `hv create <name> <url> onto=<device>
+[force]` makes a VM of a download that way, its seed and vm.toml in its
+folder and its first disk the device:
+
+```
+> hv convert /pour.qcow2 dev:nvme04 force
+hv: /pour.qcow2: qcow2, a disk of 6 MiB -- onto nvme04, 16 MiB
+hv: nvme04: 6 MiB written in 0.0 s, the rest of the device given back to it
+```
+
+A device does not read as zeros where nothing was written, as a file's
+hole does, so the pour writes zeros wherever the image has none -- in
+order, through the same queue -- and gives back the rest of the device
+past the image's disk where the device takes a discard; an image bigger
+than the device is refused before anything is written, and `size=` is
+refused with `onto=`, the device being the size it is. The checks are a
+given device's: `force` over what is on it, and never one in use.
+
+**What the folder's commands do with a device.** `hv clone` refuses a VM
+with one: the clone would share it, and two machines on one disk wreck it.
+`hv delete` takes away the folder and leaves the device as it is, saying
+so (`hv: part:...-000000000002 left as it is -- a device, which a delete
+never touches`). The `vm` provider's `devices`, `disk_attach` and
+`disk_detach`, and `create`'s `onto` and `force`, are the same functions
+([On the management bus](#on-the-management-bus)), and the panel's
+"Create" offers the devices that may be given, saying why a refused one
+was.
+
+**On the EX44** (5 November; `bench/vm/results/comparison-device.md`, one
+run each): the bench's Ubuntu guest on a 15 GiB partition of its own, under
+KVM as a raw disk and under nos given by its id, on the same CPUs. Against
+KVM on that partition nos's first write of a new file ran at 97% -- on a file
+of nos's root it ran at 78-80% of KVM -- its 4k reads at QD1 at 101% and at
+QD32 at 147%, its 1 MiB reads and writes at 100% and 95%, the kernel build at
+99%, pgbench's read-write at 111-161%; its 4k writes at QD1 at 90% and at
+QD32 at 71% (169k IOPS against 238k), the one row where KVM gained more from
+the partition than nos did.
+
+Its gate is `scripts/hv-device-test.py` (x86-64): two boots over one root
+with two NVMe drives beside it, one partitioned by the test and one blank.
+The first boot gives each its id and has `hv devices` say what is on it,
+refuses the EFI System partition outright and an ext4 without `force`,
+gives a partition and a whole disk by their ids, refuses the disk under the
+given partition, pours a qcow2 image onto a partition of 0xFF bytes -- the
+host holding it to the image byte for byte after, its holes zeros -- boots
+hvboot on a partition by name, holds a running VM's device against the
+shell's write, and refuses a clone. The second boot swaps the drives: every
+id is found under the other name, the VM starts on its partition by its id,
+and a delete leaves the device alone.
 
 ## A network
 
@@ -2774,9 +2945,9 @@ commands are:
 
 | | |
 |---|---|
-| reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks`, `forwards` |
-| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev`), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow` |
-| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`: with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
+| reads | `list` (every VM: its folder's, and those on the list without one), `get` (its configuration, disks and forwards), `host` (the extension, the cores, the huge pool, the switch -- and the host's address on it and each port's, the same before the switch is made), `networks`, `config_get`, `console_read` (a page of its console from a byte on -- its control sequences taken out, or for a terminal filtered as `hv attach` filters them, a sequence the page would cut in two left for the next), `disks` (a device's id and its name this boot among them), `forwards`, `devices` (every device of nos's: its id, type, size, who holds it, what is on it, and why it would be refused -- [A device as a guest's disk](#a-device-as-a-guests-disk)) |
+| actions | `config_set` (a vm.toml checked as a start checks it, the old one kept as `vm.toml.prev`), `forward_add` and `forward_del` (kept in its vm.toml, and made or taken away now when it runs), `console_write` (keys, control keys among them), `disk_add` (a new empty disk in its folder), `disk_grow`, `disk_attach` and `disk_detach` (a device given to a stopped VM by its id, `force` as `hv disk attach` takes it, and taken off again) |
+| jobs | `start`, `stop`, `restart`, `create` (a cloud's image by its URL, as `hv create <name> <url>`: with `onto` and `force`, poured onto a device of nos's; with `port`, a port of the switch of its own, checked as a clone's is -- no other VM's by its vm.toml or as it runs; `forwards`, nos's ports relayed to its own; `protected`; and `start`, started by the same job once made, which ends failed, saying it was made, if the start fails), `clone`, `delete` |
 
 A job says as it goes what the command would, as its log, and how far it
 has got; its cancel -- or the module's going -- stops a download, a

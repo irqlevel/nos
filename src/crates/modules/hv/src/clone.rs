@@ -200,6 +200,13 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     let _to = vms.reserve(to, "made")?;
     let (text, was) = store::load_text(&source)?;
     let o = store::options(&source, &was)?;
+    /* A device is the VM's own: a clone would have two VMs on it -- or,
+     * read-only, never both running, the block layer's claim on it being
+     * the one VM's. */
+    if let Some((device, _)) = o.disks.iter().find(|(p, _)| crate::devices::is_device(p)) {
+        return Err(alloc::format!("its disk {} is a device of nos's, which a clone cannot share -- give the clone a \
+                                   disk of its own", device));
+    }
 
     /* What is copied, what is shared, what is made anew: the new
      * configuration's paths are the clone's folder's, by name. */

@@ -125,6 +125,88 @@ pub trait BlockDriver: Sync + 'static {
     fn submit_max(&self) -> usize {
         0
     }
+
+    /// What the disk is known by from one boot to the next, whatever its
+    /// name is this time: what it says it is and its serial number, as one
+    /// word of `[A-Za-z0-9._-]` -- `nvme-<model>_<serial>`. None where it
+    /// says nothing of the kind, which is the default: such a disk is not
+    /// found again by id (`find_ident`).
+    fn identity(&self) -> Option<&str> {
+        None
+    }
+
+    /// Whether the device takes `discard`.
+    fn can_discard(&self) -> bool {
+        false
+    }
+
+    /// The `count` sectors from `sector` -- never none, and inside the
+    /// device: the table checked -- no longer needed, for the device to give
+    /// back, and return once it has been told. False when it failed, or the
+    /// device takes no such thing, which is the default. What a later read
+    /// of them gives is the device's to say.
+    fn discard(&'static self, _sector: u64, _count: u64) -> bool {
+        false
+    }
+}
+
+/// The longest id a device has (`Device::ident`), what a partition table
+/// says a partition is, a lookup's answer and a GUID's text: kcore's, which
+/// a module reaches a device through too.
+pub use kcore::block::{guid_text, Found, PartKind, IDENT_MAX};
+
+/// What a partition's table says it is: its type, and what it is known by
+/// from boot to boot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PartId {
+    /// A GPT entry: its unique GUID and its type GUID, as the entry has
+    /// them (the first three fields little-endian).
+    Gpt { unique: [u8; 16], kind: [u8; 16] },
+    /// An MBR entry: the disk's signature, its number (1 to 4, 5 on for
+    /// the logical ones) and its type byte. A signature of 0 says nothing.
+    Mbr { signature: u32, number: u32, kind: u8 },
+}
+
+/// The id a partition is found by again (`find_ident`), from what its
+/// table says: `part:<its unique GUID>`, or `part:<signature>-<number>` as
+/// Linux writes an MBR one -- None for an MBR with no signature, which
+/// nothing tells from another such disk's.
+fn part_ident(id: &PartId) -> Option<Box<str>> {
+    let mut text = alloc::string::String::new();
+    text.try_reserve_exact(IDENT_MAX).ok()?;
+    match id {
+        PartId::Gpt { unique, .. } => {
+            if unique.iter().all(|&b| b == 0) {
+                return None;
+            }
+            text.push_str("part:");
+            text.push_str(core::str::from_utf8(&guid_text(unique)).ok()?);
+        }
+        PartId::Mbr { signature, number, .. } => {
+            if *signature == 0 {
+                return None;
+            }
+            write!(text, "part:{:08x}-{:02x}", signature, number).ok()?;
+        }
+    }
+    Some(text.into_boxed_str())
+}
+
+/// The id a whole disk is found by again: `disk:` and what its driver says
+/// (`BlockDriver::identity`), when that is a word of `[A-Za-z0-9._-]` short
+/// enough -- None otherwise, the disk then found by its name alone.
+fn disk_ident(word: Option<&str>) -> Option<Box<str>> {
+    let word = word?;
+    if word.is_empty() || word.len() + 5 > IDENT_MAX
+        || !word.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let mut text = alloc::string::String::new();
+    text.try_reserve_exact(word.len() + 5).ok()?;
+    text.push_str("disk:");
+    text.push_str(word);
+    Some(text.into_boxed_str())
 }
 
 /// A registered device, kept for the life of the kernel because nothing
@@ -137,6 +219,11 @@ struct Device {
     /// The disk a partition is on, as its handle; 0 for a whole disk
     parent: usize,
     backend: Backend,
+    /// What it is found by again at the next boot, whatever its name is
+    /// then (`find_ident`): None when nothing says.
+    ident: Option<Box<str>>,
+    /// What its partition table says it is.
+    kind: PartKind,
 }
 
 /// What does a device's I/O.
@@ -201,17 +288,24 @@ pub fn register_driver(name: &str, parent: usize, driver: &'static dyn BlockDriv
         sector_size: driver.sector_size(),
         parent,
         backend: Backend::Driver(driver),
+        ident: disk_ident(driver.identity()),
+        kind: PartKind::Disk,
     })
 }
 
-/// One partition of the device `parent` names, as a device of its own. The
-/// asynchronous path is there exactly when the disk has one -- a caller
-/// picks its path by `can_submit`, and a partition that claimed one its disk
-/// cannot serve would have every submission refused.
-pub fn register_partition(parent: usize, start: u64, count: u64, name: &CStr) -> bool {
+/// One partition of the device `parent` names, as a device of its own, as
+/// its table entry `id` says it is. The asynchronous path is there exactly
+/// when the disk has one -- a caller picks its path by `can_submit`, and a
+/// partition that claimed one its disk cannot serve would have every
+/// submission refused.
+pub fn register_partition(parent: usize, start: u64, count: u64, name: &CStr, id: &PartId) -> bool {
     let sector_size = match device(parent) {
         Some(disk) if disk.within(start, count) && count != 0 => disk.sector_size,
         _ => return false,
+    };
+    let kind = match *id {
+        PartId::Gpt { kind, .. } => PartKind::Gpt(kind),
+        PartId::Mbr { kind, .. } => PartKind::Mbr(kind),
     };
 
     add(Device {
@@ -220,6 +314,8 @@ pub fn register_partition(parent: usize, start: u64, count: u64, name: &CStr) ->
         sector_size,
         parent,
         backend: Backend::Partition { start },
+        ident: part_ident(id),
+        kind,
     }) != 0
 }
 
@@ -338,6 +434,37 @@ pub(crate) fn flush(handle: usize) -> bool {
             Backend::Partition { .. } => flush(dev.parent),
         },
         None => false,
+    }
+}
+
+/// Whether the device takes `discard`: its disk's driver does.
+pub(crate) fn can_discard(handle: usize) -> bool {
+    match device(handle) {
+        Some(dev) => match dev.backend {
+            Backend::Driver(driver) => driver.can_discard(),
+            Backend::Partition { .. } => can_discard(dev.parent),
+        },
+        None => false,
+    }
+}
+
+/// The `count` sectors from `sector` given back to the device -- inside it,
+/// whoever worked the numbers out, as a read or a write is: whether the
+/// device was told.
+pub(crate) fn discard(handle: usize, sector: u64, count: u64) -> bool {
+    let dev = match device(handle) {
+        Some(dev) => dev,
+        None => return false,
+    };
+    if count == 0 {
+        return true;
+    }
+    if !dev.within(sector, count) {
+        return false;
+    }
+    match dev.backend {
+        Backend::Driver(driver) => driver.can_discard() && driver.discard(sector, count),
+        Backend::Partition { start } => discard(dev.parent, start + sector, count),
     }
 }
 
@@ -500,6 +627,43 @@ pub(crate) fn start(handle: usize) -> Option<u64> {
     }
 }
 
+/// What the device is found by again at the next boot (`find_ident`).
+pub(crate) fn ident(handle: usize) -> Option<&'static str> {
+    device(handle)?.ident.as_deref()
+}
+
+/// What the device's partition table says it is; `Disk` for a whole disk,
+/// and for a handle that names nothing.
+pub(crate) fn kind(handle: usize) -> PartKind {
+    device(handle).map_or(PartKind::Disk, |dev| dev.kind)
+}
+
+/// The device whose id (`ident`) is `wanted`, its letters' case aside: a
+/// GUID is written either way.
+pub(crate) fn find_ident(wanted: &[u8]) -> Found {
+    if wanted.is_empty() {
+        return Found::None;
+    }
+    let mut found = Found::None;
+    for index in 0..count() {
+        let handle = at(index);
+        let Some(id) = device(handle).and_then(|dev| dev.ident.as_deref()) else { continue };
+        if id.as_bytes().eq_ignore_ascii_case(wanted) {
+            found = match found {
+                Found::None => Found::One(handle),
+                Found::One(_) => Found::Many(2),
+                Found::Many(n) => Found::Many(n.saturating_add(1)),
+            };
+        }
+    }
+    found
+}
+
+/// Whether writing to one of the two devices can touch the other (`overlap`).
+pub(crate) fn overlaps(a: usize, b: usize) -> bool {
+    overlap(a, b)
+}
+
 /// How many partitions of the device the kernel found.
 pub(crate) fn partitions(handle: usize) -> u32 {
     if handle == 0 {
@@ -536,17 +700,68 @@ const SLOT_BITS: u32 = 8;
 const SLOT_MASK: usize = (1 << SLOT_BITS) - 1;
 const _: () = assert!(MAX_DEVICES < (1 << SLOT_BITS), "a slot must fit a claim");
 
+/// The most bytes of a holder's name a claim keeps: more is cut there.
+pub use kcore::block::HOLDER_MAX;
+
+/// Who holds a claim, as a refusal names it: the kernel's own name for the
+/// holder, or the one a module gave -- copied either way, so that it lasts
+/// as long as the claim whoever gave it, a module that may go first
+/// included.
+#[derive(Clone, Copy)]
+pub struct Holder {
+    len: u8,
+    bytes: [u8; HOLDER_MAX],
+}
+
+const _: () = assert!(HOLDER_MAX <= u8::MAX as usize, "a holder's length is a byte");
+
+impl Holder {
+    const NONE: Holder = Holder { len: 0, bytes: [0; HOLDER_MAX] };
+
+    /// `name`, cut at HOLDER_MAX bytes -- before a character the cut would
+    /// split.
+    pub fn named(name: &[u8]) -> Holder {
+        let mut len = name.len().min(HOLDER_MAX);
+        while len > 0 && len < name.len() && name[len] & 0xC0 == 0x80 {
+            len -= 1;
+        }
+        let mut bytes = [0; HOLDER_MAX];
+        bytes[..len].copy_from_slice(&name[..len]);
+        Holder { len: len as u8, bytes }
+    }
+
+    pub fn of(name: &CStr) -> Holder {
+        Holder::named(name.to_bytes())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl core::fmt::Display for Holder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(core::str::from_utf8(self.as_bytes()).unwrap_or("something"))
+    }
+}
+
+impl core::fmt::Debug for Holder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", core::str::from_utf8(self.as_bytes()).unwrap_or("something"))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ClaimEntry {
     device: usize,
     /// Who holds it: handed back to whoever is refused because of this
     /// claim.
-    holder: &'static CStr,
+    holder: Holder,
     /// 0: the slot is free
     claim: usize,
 }
 
-const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: c"", claim: 0 };
+const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: Holder::NONE, claim: 0 };
 
 struct Claims {
     entries: [ClaimEntry; MAX_DEVICES],
@@ -558,7 +773,7 @@ static CLAIMS: Once<SpinLock<Claims>> = Once::new();
 const TOO_MANY: &CStr = c"too many claims already";
 const NOT_READY: &CStr = c"the block layer, still starting up";
 const NO_DEVICE: &CStr = c"nothing -- there is no such device";
-const MODULE_HOLDER: &CStr = c"a module writing to it";
+pub(crate) const MODULE_HOLDER: &CStr = c"a module writing to it";
 
 /// Called once, from `block::init`, before anything can claim: the table
 /// needs the kernel's spinlock, which is a handle and cannot be a static.
@@ -616,14 +831,14 @@ fn overlap(a: usize, b: usize) -> bool {
 /// Claim a device against mounts, the disk log and other writers, naming
 /// the holder a refusal reports: the claim, for `release` -- or who stands
 /// in its way.
-pub(crate) fn claim(handle: usize, holder: &'static CStr) -> Result<usize, &'static CStr> {
-    if handle == 0 {
-        return Err(NO_DEVICE);
+pub(crate) fn claim(handle: usize, holder: Holder) -> Result<usize, Holder> {
+    if handle == 0 || device(handle).is_none() {
+        return Err(Holder::of(NO_DEVICE));
     }
 
     let mut claims = match CLAIMS.get() {
         Some(claims) => claims.lock(),
-        None => return Err(NOT_READY),
+        None => return Err(Holder::of(NOT_READY)),
     };
 
     let mut free = None;
@@ -637,7 +852,7 @@ pub(crate) fn claim(handle: usize, holder: &'static CStr) -> Result<usize, &'sta
         }
     }
 
-    let slot = free.ok_or(TOO_MANY)?;
+    let slot = free.ok_or(Holder::of(TOO_MANY))?;
 
     claims.generation += 1;
     let claim = (claims.generation << SLOT_BITS) | (slot + 1);
@@ -645,9 +860,17 @@ pub(crate) fn claim(handle: usize, holder: &'static CStr) -> Result<usize, &'sta
     Ok(claim)
 }
 
+/// Who holds a claim on the device or on anything overlapping it -- what a
+/// claim of it would be refused for -- if anyone: asked under the claims'
+/// lock, and nothing taken, so that a look gets in nobody's way.
+pub(crate) fn in_the_way(handle: usize) -> Option<Holder> {
+    let claims = CLAIMS.get()?.lock();
+    claims.entries.iter().find(|e| e.claim != 0 && overlap(e.device, handle)).map(|e| e.holder)
+}
+
 /// Who holds a claim on the device itself -- not on one it overlaps -- if
 /// anyone: copied under the claims' lock.
-pub(crate) fn holder(handle: usize) -> Option<&'static CStr> {
+pub(crate) fn holder(handle: usize) -> Option<Holder> {
     let claims = CLAIMS.get()?.lock();
     claims.entries.iter().find(|e| e.claim != 0 && e.device == handle).map(|e| e.holder)
 }
@@ -785,23 +1008,195 @@ pub extern "C" fn kernel_blockdev_partitions(handle: usize) -> u32 {
     partitions(handle)
 }
 
-/// The claim a module takes when it writes to a device of its own accord:
-/// the claim for `kernel_blockdev_release`, or 0 with `held_by` set to who
-/// holds an overlapping one -- a NUL-terminated name the kernel keeps.
+/// `src` into the `cap` bytes at `out`, as many as fit: how many `src` has.
 ///
 /// # Safety
-/// `held_by`, if given, is writable.
+/// `out`, unless null, takes `cap` bytes.
+pub(crate) unsafe fn copy_out(src: &[u8], out: *mut u8, cap: usize) -> usize {
+    if !out.is_null() {
+        let n = src.len().min(cap);
+        /* `out` takes `cap` bytes, and `n` is no more than that. */
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), out, n) };
+    }
+    src.len()
+}
+
+/// The claim a module takes when it writes to a device of its own accord,
+/// held by `name` -- copied, cut at HOLDER_MAX bytes; "a module writing to
+/// it" when it gives none: the claim for `kernel_blockdev_release`, or 0
+/// with who holds an overlapping one copied into `refused`, its length --
+/// HOLDER_MAX at most -- into `*refused_len`.
+///
+/// # Safety
+/// `name` points at `name_len` readable bytes; `refused`, unless null,
+/// takes `cap` bytes; `refused_len`, unless null, is writable.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize {
-    match claim(handle, MODULE_HOLDER) {
+pub unsafe extern "C" fn kernel_blockdev_claim(
+    handle: usize, name: *const u8, name_len: usize, refused: *mut u8, cap: usize, refused_len: *mut usize,
+) -> usize {
+    let holder = if name.is_null() || name_len == 0 {
+        Holder::of(MODULE_HOLDER)
+    } else {
+        Holder::named(unsafe { core::slice::from_raw_parts(name, name_len) })
+    };
+    match claim(handle, holder) {
         Ok(claim) => claim,
         Err(in_the_way) => {
-            if let Some(held_by) = unsafe { held_by.as_mut() } {
-                *held_by = in_the_way.as_ptr().cast();
+            let n = unsafe { copy_out(in_the_way.as_bytes(), refused, cap) };
+            if let Some(len) = unsafe { refused_len.as_mut() } {
+                *len = n.min(cap);
             }
             0
         }
     }
+}
+
+/// How many devices the table holds: what `kernel_blockdev_at` counts to.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_count() -> u32 {
+    count()
+}
+
+/// The index'th device's handle, or 0.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_at(index: u32) -> usize {
+    at(index)
+}
+
+/// The disk a partition is on, or 0 for a whole disk.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_parent(handle: usize) -> usize {
+    parent(handle)
+}
+
+/// The sector of its disk a partition starts at; u64::MAX for a whole disk.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_start(handle: usize) -> u64 {
+    start(handle).unwrap_or(u64::MAX)
+}
+
+/// The device's name into `out`, as much of it as fits in `cap` bytes, no
+/// NUL: how long it is -- 0 for a handle that names nothing.
+///
+/// # Safety
+/// `out`, unless null, takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_name(handle: usize, out: *mut u8, cap: usize) -> usize {
+    match device(handle) {
+        Some(dev) => unsafe { copy_out(dev.name(), out, cap) },
+        None => 0,
+    }
+}
+
+/// What the device is found by again at the next boot -- `part:...` or
+/// `disk:...` -- into `out` as `kernel_blockdev_name`'s: how long it is, 0
+/// when it has none.
+///
+/// # Safety
+/// `out`, unless null, takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_ident(handle: usize, out: *mut u8, cap: usize) -> usize {
+    match ident(handle) {
+        Some(id) => unsafe { copy_out(id.as_bytes(), out, cap) },
+        None => 0,
+    }
+}
+
+/// The device whose id is the `len` bytes at `id`: its handle -- or 0, with
+/// `*count`, unless null, set to how many have it: none, or more than one,
+/// none of which is taken for it.
+///
+/// # Safety
+/// `id` points at `len` readable bytes; `count`, unless null, is writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_find_ident(id: *const u8, len: usize, count: *mut u32) -> usize {
+    if id.is_null() {
+        return 0;
+    }
+    let (handle, n) = match find_ident(unsafe { core::slice::from_raw_parts(id, len) }) {
+        Found::None => (0, 0),
+        Found::One(handle) => (handle, 1),
+        Found::Many(n) => (0, n),
+    };
+    if let Some(count) = unsafe { count.as_mut() } {
+        *count = n;
+    }
+    handle
+}
+
+/// What the device's partition table says it is, into the 16 bytes at
+/// `out`: 1 with its GPT type GUID there, as the entry has it; 2 with its
+/// MBR type byte in the first; 0 for a whole disk, and -1 for a handle that
+/// names nothing.
+///
+/// # Safety
+/// `out`, unless null, takes 16 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_kind(handle: usize, out: *mut u8) -> i32 {
+    if device(handle).is_none() {
+        return -1;
+    }
+    match kind(handle) {
+        PartKind::Disk => 0,
+        PartKind::Gpt(guid) => {
+            unsafe { copy_out(&guid, out, 16) };
+            1
+        }
+        PartKind::Mbr(byte) => {
+            unsafe { copy_out(&[byte], out, 16) };
+            2
+        }
+    }
+}
+
+/// Who holds a claim on the device itself -- not on one it overlaps -- into
+/// `out`, as `kernel_blockdev_name`'s: the name's length, 0 for nobody.
+///
+/// # Safety
+/// `out`, unless null, takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_holder(handle: usize, out: *mut u8, cap: usize) -> usize {
+    match holder(handle) {
+        Some(h) => unsafe { copy_out(h.as_bytes(), out, cap) },
+        None => 0,
+    }
+}
+
+/// Who holds a claim on the device or anything overlapping it -- what a
+/// claim of it would be refused for -- into `out`, as
+/// `kernel_blockdev_name`'s: the name's length, 0 for nobody. Nothing is
+/// claimed by asking.
+///
+/// # Safety
+/// `out`, unless null, takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_in_the_way(handle: usize, out: *mut u8, cap: usize) -> usize {
+    match in_the_way(handle) {
+        Some(h) => unsafe { copy_out(h.as_bytes(), out, cap) },
+        None => 0,
+    }
+}
+
+/// 1 when writing to one of the two devices can touch the other: one
+/// device, a disk and a partition of it, partitions that overlap -- and a
+/// handle that names nothing, which is taken to overlap everything.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_overlaps(a: usize, b: usize) -> i32 {
+    i32::from(overlaps(a, b))
+}
+
+/// 1 when the device takes `kernel_blockdev_discard`.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_can_discard(handle: usize) -> i32 {
+    i32::from(can_discard(handle))
+}
+
+/// The `count` sectors from `sector` given back to the device -- inside it,
+/// or refused: 0 once it has been told, -1 when it failed or takes no such
+/// thing. A writer's call, as a write is: under its claim.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_discard(handle: usize, sector: u64, count: u64) -> i32 {
+    if discard(handle, sector, count) { 0 } else { -1 }
 }
 
 #[no_mangle]
@@ -826,8 +1221,12 @@ pub fn dump(_args: &str, out: &mut Output) {
         };
 
         let bytes = dev.capacity.saturating_mul(dev.sector_size);
-        let _ = writeln!(out, "{}  {} sectors ({} MB)  {} bytes/sector",
+        let _ = write!(out, "{}  {} sectors ({} MB)  {} bytes/sector",
             core::str::from_utf8(dev.name()).unwrap_or("?"),
             dev.capacity, bytes / (1024 * 1024), dev.sector_size);
+        let _ = match dev.ident.as_deref() {
+            Some(id) => writeln!(out, "  {}", id),
+            None => writeln!(out),
+        };
     }
 }

@@ -208,6 +208,7 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
+| `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`block/src/table.rs`, the NVMe's identity), the claims and their holders, `block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hv/src/devices.rs`, a device disk in `modules/hv/src/disk.rs`, the pour onto a device |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
 | `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
 | `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
@@ -274,9 +275,11 @@ Boots with an MBR disk and a GPT disk it writes itself -- no partitioning
 tool, no privileges -- and checks what the kernel made of them: the
 partitions registered and their sizes, both tables as `partitions` prints
 them, that a partition's sector 0 is its first sector on the disk and that a
-read past its end is refused, and that a filesystem mounted on a partition
-keeps writers off the disk it is on. The smoke disks carry no partition
-table at all, so nothing else reaches this code.
+read past its end is refused, that a filesystem mounted on a partition
+keeps writers off the disk it is on, and that `disks` gives every partition
+the id a VM's vm.toml names it by: a GPT partition its unique GUID as Linux
+writes a PARTUUID, an MBR one its disk signature and number. The smoke
+disks carry no partition table at all, so nothing else reaches this code.
 
 ### `ext2-test.py` -- ext2, judged by `e2fsck`
 
@@ -1517,9 +1520,12 @@ to the tree `e2fsck -fy` leaves. The targets:
   nanofs as each came; every disk no command wrote to raw clean at the end;
 - `rootfs`: `root=` none, `auto`, a device, a label, a UUID, over disks and
   partitions carrying an ext2 labelled `nos` or not, a nanofs, something that
-  only looks like ext2, or nothing; what is mounted where held to what
-  `rootfs.rs` documents, and what it mounted for writing clean after the
-  shutdown's unmount.
+  only looks like ext2, or nothing -- now and then two partitions of one UUID,
+  as a copy's would be; what is mounted where held to what `rootfs.rs`
+  documents -- a label or a UUID two devices carry taking neither, since one
+  may be a guest's -- and what it mounted for writing clean after the
+  shutdown's unmount. The rule's control, the first match taken as before,
+  fails at the 137th input.
 
 Each finding comes with the seed and iteration that make it again and the
 input in `out/fs-fuzz/findings/` -- `--replay TARGET FILE`, with `--trace` for
@@ -1992,6 +1998,43 @@ provider saying it is protected and off, then forced; the provider's list;
 and the second deleted keeping its disks, which stay in a folder `hv vms`
 no longer lists.
 
+### `hv-device-test.py` -- a partition or a disk of nos's as a guest's disk
+
+A guest's disk on a device of nos's goes past the filesystem altogether
+([A device as a guest's disk](hypervisor.md#a-device-as-a-guests-disk)),
+and what keeps it from wrecking something is all in the giving: the id that
+finds the same device at the next boot, the claims, and the refusals. None
+of that shows in a guest that boots -- a VM given the wrong drive boots
+just as well, onto somebody's data -- so this gate looks at each:
+
+- two boots of `nos.iso` over one root with two NVMe drives beside it: A,
+  a GPT of four partitions the test writes itself (an ext4's superblock
+  labelled `devtest`, zeros, an EFI System partition, bytes of 0xFF), and
+  B, blank, each with a serial of its own;
+- the first boot: `disks` gives each partition its GUID and B its model
+  and serial; `hv devices` says what each holds -- the ext4 and its label,
+  empty, an EFI System partition, data nos does not recognize, the root
+  held by its mount; `hv create` refuses the EFI System partition outright
+  and the ext4 without `force`, gives the empty partition to d1 and B to d3,
+  each vm.toml naming its device by its id and never its name, and refuses
+  the whole of A for overlapping d1's partition; `hv convert` refuses the
+  0xFF partition for the bytes on it and pours a qcow2 image onto it with
+  `force` -- read back on the host after, byte for byte the image's disk,
+  its holes zeros over the 0xFF; hvboot booted on a partition by its name
+  reads it and finds nothing to boot; d1 started holds its partition --
+  `hv devices` says so, the shell's write is refused -- and stopped lets it
+  go; a device attached to d3 with `force` and detached; a clone of d1
+  refused;
+- the second boot with the drives the other way round, as the EX44's two
+  are from boot to boot: every id found where it was under the other name,
+  d1 started on its partition by its id, `hv delete d1` leaving the device
+  as it is.
+
+x86-64, under KVM where the host has an extension and TCG otherwise (QEMU
+9.2 or later, as `hv-test.py` wants): 15 s under TCG on an M4 Pro, a
+`UBSAN=1 RUSTUB=1` build's as long; `--keep` keeps the drives and the
+serial logs.
+
 ### `hvboot-test.py` -- what hvboot would boot, decided on the host
 
 hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
@@ -2411,6 +2454,17 @@ host program, and the gate holds it to QEMU's own reading:
   hold, the end of block missing; and noise. Each is asked for a number of
   bytes, as QEMU asks for a cluster, and every answer -- good or bad, and
   the bytes of every good one -- must be zlib's;
+- what a device is seen to hold before `hv` gives it to a guest
+  (`diskimage::contents`): each kind's mark where its own documents put it,
+  on a disk of zeros -- ext2, ext3 and ext4 told apart by their features
+  and a journal device, XFS, btrfs, F2FS, swap of three page sizes and the
+  old signature, LVM, md RAID's superblocks of versions 0.90, 1.0 and 1.2,
+  LUKS, ISO 9660, NTFS, exFAT, FAT12/16 and FAT32, GPT and MBR, squashfs,
+  nanofs, nos's disk log -- each with its label where the kind has one, a
+  boot signature alone and stray bytes as data nos does not recognize, and
+  zeros as nothing; then what the host's own tools make, those it has --
+  mke2fs's ext2, ext3 and ext4, mkswap, mkfs.vfat, mkfs.xfs, mkfs.btrfs --
+  each called what it is;
 - each of five images with its header, L1 and L2 tables and clusters
   changed at random, up to eight bytes at a time, or cut short: no panic
   (overflow checks on), no read outside the image, no write outside the

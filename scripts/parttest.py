@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,6 +56,14 @@ GPT_PARTS = ((2048, 10239), (10240, 14335))
 # Data1/Data2/Data3 are stored little-endian, the rest as printed.
 LINUX_DATA_GUID = bytes.fromhex("af3dc60f" + "8384" + "7247" + "8e793d69d8477de4")
 DISK_GUID = bytes(range(16))
+# Each GPT partition's unique GUID, as its entry stores it: no two bytes the
+# same, so that its text -- what `disks` gives as its id, `part:<GUID>` --
+# shows whether the first three fields were turned round.
+def gpt_unique(i):
+    return bytes(range(0x10 * (i + 1), 0x10 * (i + 1) + 16))
+# The MBR's disk signature: what its partitions' ids are made of, as Linux's
+# PARTUUID -- `part:4e6f7331-01` for the first.
+MBR_SIGNATURE = 0x4E6F7331
 
 failures = []
 
@@ -113,6 +122,7 @@ def mbr_image(path):
         sector[at + 5:at + 8] = b"\xfe\xff\xff"
         sector[at + 8:at + 12] = struct.pack("<I", start)
         sector[at + 12:at + 16] = struct.pack("<I", count)
+    sector[440:444] = struct.pack("<I", MBR_SIGNATURE)
     sector[510:512] = b"\x55\xaa"
     put(path, 0, bytes(sector))
 
@@ -141,7 +151,7 @@ def gpt_image(path):
     for i, (first, last) in enumerate(GPT_PARTS):
         at = i * 128
         entries[at:at + 16] = LINUX_DATA_GUID
-        entries[at + 16:at + 32] = bytes([i + 1] * 16)
+        entries[at + 16:at + 32] = gpt_unique(i)
         entries[at + 32:at + 40] = struct.pack("<Q", first)
         entries[at + 40:at + 48] = struct.pack("<Q", last)
     put(path, 2, bytes(entries))
@@ -315,6 +325,19 @@ def shell_checks(sh, parts):
     check("the root disk reads as untabled", len(bare) == 1, tables)
     if not (mbr_disk and gpt_disk):
         return
+
+    # Each partition's id in `disks`: a GPT one's unique GUID as its text,
+    # an MBR one's the disk's signature and its number.
+    lines = {l.split()[0]: l for l in listing.splitlines() if l.split()}
+    for i in range(len(GPT_PARTS)):
+        name = gpt_disk[0] + str(i + 1)
+        want = "part:" + str(uuid.UUID(bytes_le=gpt_unique(i)))
+        check("disks gives %s its GUID as its id, %s" % (name, want), want in lines.get(name, ""), listing)
+    for i in range(len(MBR_PARTS)):
+        name = mbr_disk[0] + str(i + 1)
+        want = "part:%08x-%02x" % (MBR_SIGNATURE, i + 1)
+        check("disks gives %s the MBR's signature and its number as its id, %s" % (name, want),
+              want in lines.get(name, ""), listing)
 
     out = tables[mbr_disk[0]]
     check("the mbr table has both entries and their type",

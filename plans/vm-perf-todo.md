@@ -152,6 +152,51 @@ samples in `out/ex44-bench/results-nos-<sha>`; against KVM:
   code's, and a reason to read any one round's dip twice before acting on
   it. Memory random reads were at 92% (t1) and 97% (t4) in round 26.
 
+## Round 28 (hv-local-disks, 2026-11-05): the guest's disk a partition
+
+The same guest with its disk a 15 GiB partition of its own (p6, on the disk
+nos's root is not on), under KVM as a raw disk and under nos given to the VM
+by its id ([A device as a guest's disk](../docs/hypervisor.md#a-device-as-a-guests-disk)),
+the suite cut to fio, the kernel build and pgbench, one run each, KVM's first
+(`bench/vm/results/comparison-device.md`, the kit's `device-stage` and
+`kvm-device`):
+
+| | KVM, the partition | nos, the partition | KVM, a file | nos, a file (dc529775) |
+|---|---:|---:|---:|---:|
+| first write (2 GiB) | 4762 MiB/s | **4633** (97%) | 4643 | 3696 |
+| 4k read QD1 / QD32 / 4x16 | 20.6k / 220k / 240k | 20.8k / 324k / 365k | 20.1k / 195k / 217k | 20.3k / 294k / 337k |
+| 4k write QD1 / QD32 | 50.8k / 238k | 45.9k / **169k** (71%) | 39.9k / 178k | 44.9k / 160k |
+| 1 MiB read / write QD8 | 2185 / 4867 MiB/s | 2194 / 4644 | 1456 / 3694 | 2172 / 4695 |
+| fdatasync | 634 | 758 | 620 | 726 |
+
+KVM's reference is not the file's here: on the partition its 4k writes are
+28% and 34% higher, its 1 MiB reads 50% and writes 32%. The first write's gap
+is gone with the filesystem (97%, where a file's was 78-80%); the kernel
+build is at 99% and pgbench's writes at 111-161%. What is left:
+
+- **4k writes at QD32: 169k IOPS against KVM's 238k on the same partition.**
+  The device took KVM's from 178k to 238k and nos's from 160k to 169k,
+  while nos's reads at QD32 on the same path are at 324k: the ceiling is
+  the writes'. One run each -- 30 s of QD32 writes put 19-27 GiB through
+  this Samsung, enough for its cache's state to matter, and KVM's run came
+  first -- so the first step is the row again in both orders. Then a trace
+  window on it (`blk disk hv`: the notify, the disk's task, the device's
+  queue, the NVMe and back, `trace-decode.py --hv`) and a profile of the
+  disk's task on CPU 62 during the job: a write's data is copied out of the
+  guest on the vCPU at its notify, and the disk's task, an E-core's, makes
+  each command through the device's queue -- a call through the C ABI and
+  its slot's lock each, one doorbell for what it took at once
+  (`modules/hv/src/disk.rs`'s `serve`, `block/src/devq.rs`'s `start`).
+- **4k writes at QD1: 90%** (45.9k against 50.8k), the file's 88% moved
+  little: the request's host part, as under "4k I/O from one job" below.
+- **What the plan's P4 holds** (`plans/hv-local-disks.md`): a flush served
+  asynchronously -- now the disk's task waits out the device's flush, every
+  request behind it with it -- and DMA straight between the guest's memory
+  and the device, its huge-pool pages as PRP lists, in place of the copy
+  through the queue's buffers. Neither measured yet.
+- **Not run yet**: a whole disk (`disk:`) under a guest, a device of 4 KiB
+  sectors (none on the EX44), the device's runs repeated.
+
 ## Done since ddcbd4c6
 
 - **The fdatasync job's tail** (p99 0.7-0.9 ms and p999 ~1 ms in every run
