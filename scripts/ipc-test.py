@@ -251,7 +251,7 @@ def main():
         # -- up, pinned both ways --
         check("a has b up", wait_for(lambda: peer_up(a, "b"), 30, 1))
         check("b has a up", wait_for(lambda: peer_up(b, "a"), 30, 1))
-        check("a says so in its log", "ipcnet: b (%s) up" % ip(1) in a.run("dmesg"))
+        check("a says so in its log", "ipcnet: b (%s) up" % ip(1) in a.run("dmesg 1000 ipcnet:"))
         r = ping(a, "kernel.echo@b", "count=200 bytes=64")
         check("a's 200 small pings to b's echo all answered, every byte as sent, in order",
               r is not None and r["answered"] == 200 and r["wrong"] == 0 and r["reordered"] == 0, r)

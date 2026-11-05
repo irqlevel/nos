@@ -477,8 +477,9 @@ receive path signals, and which a `TcpWaker` -- what ipcnet's queues hold
 holds the module's source against a world that is the other host -- right
 keys and wrong, Hellos right and wrong, messages, bursts into a full
 mailbox, monitors, silence, a broken wire -- and catches nine of ten bugs
-planted in it. Left of I4: the x86-64 run, and the measurements on the
-boxes.
+planted in it. `ipc-test.py --arch x86_64` passes under TCG, from an ISO
+whose command line has the UDP shell (`make nos-test.iso
+TEST_ISO_ARGS=udpshell=9100`). Left of I4: the measurements on the boxes.
 
 ## Limits of the first version
 
