@@ -339,7 +339,9 @@ What TCP has to get first is a plan of its own, [tcp.md](tcp.md):
 
 - bulk buffers both ways on an active open, a module's included (T1);
 - a timeout from the measured round trip, a timer armed for the earliest
-  deadline, and a connection given up by time rather than by count (T2);
+  deadline, and a connection given up by time rather than by count (T2) --
+  with the floor Linux has, 200 ms, for any peer, and ipcnet's links, both
+  of whose ends are nos and acknowledge every segment at once, given 20 ms;
 - strangers' SYNs dropped before they take a slot, half-open connections
   timed out, and the resets to closed ports held to a rate (T3).
 

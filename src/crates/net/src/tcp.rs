@@ -30,6 +30,13 @@
 //! has more in flight than its first window, so for it nothing but a
 //! timeout changes.
 //!
+//! The timeout is the round trip's, measured a segment at a time (RFC 6298,
+//! Karn's rule: nothing timed across a retransmission) and no less than
+//! 200 ms, where it was a second whatever the round trip: a peer may hold
+//! its acknowledgement that long to send it with an answer, as Linux does.
+//! A connection whose data or FIN goes unacknowledged for 100 s is given up,
+//! however many tries that took; a handshake, after eight.
+//!
 //! What is written down here rather than left to be rediscovered:
 //!
 //! - **Nothing traces or prints under a connection's lock.** A trace is
@@ -110,9 +117,32 @@ const DUP_ACKS: u32 = 3;
 /// What the congestion window grows to at most: far past any buffer, short
 /// of where adding to it could wrap.
 const CWND_MAX: u32 = 1 << 30;
+/// The retransmission timeout before the round trip has been measured
+/// (RFC 6298 2.1).
 const INITIAL_RTO_MS: u64 = 1000;
 const MAX_RTO_MS: u64 = 8000;
+/// The least a retransmission timeout is once the round trip has been
+/// measured. RFC 6298 2.4 says a second; this is Linux's floor
+/// (TCP_RTO_MIN), and for the same reason: a peer that delays its
+/// acknowledgements holds the one for a lone segment -- the last of a
+/// request, a line of an ssh session -- 40 ms and up to 200 (Linux's
+/// delayed ACK), hoping to send it with an answer. A floor under that sends
+/// every such segment again, and Karn's rule keeps the delay out of the
+/// estimate, so it would go on doing so: here, against the Linux guests a
+/// forward relays to over the switch, a fraction of a millisecond away.
+/// nos itself acknowledges every segment at once, so a link both of whose
+/// ends are nos may have less (plans/tcp.md, T2).
+const MIN_RTO_MS: u64 = 200;
+/// The clock's granularity in a timeout computed (RFC 6298 2.3's G): its
+/// deadlines are kept in milliseconds.
+const RTO_GRANULARITY_US: u64 = 1000;
+/// A handshake given up after this many retransmits.
 const MAX_RETRANSMITS: u32 = 8;
+/// Data or a FIN unacknowledged this long, and the connection is given up
+/// (RFC 1122 4.2.3.5's R2: at least 100 s). By time, not by count: from the
+/// floor, eight doublings are over in half a minute, which would cut an ssh
+/// session off a flaky link.
+const GIVE_UP_MS: u64 = 100_000;
 /// The most segments a timeout sends again of one connection: all 8 KiB of
 /// its send buffer at an MSS of 128 bytes or more, and no storm of frames
 /// from the timer at a smaller one.
@@ -518,6 +548,19 @@ struct Inner {
     retransmit_at: u64,
     /// Retransmits with no acknowledgement in between
     retransmit_count: u32,
+    /// The smoothed round trip and its variation (RFC 6298 2), in
+    /// microseconds: 0 before the first sample.
+    srtt_us: u64,
+    rttvar_us: u64,
+    /// The segment being timed: the sequence number whose acknowledgement
+    /// ends it, and when it went out (boot ns) -- 0 when none is. Karn's
+    /// rule: nothing is timed across a retransmission, whose
+    /// acknowledgement could be the original's or the copy's.
+    rtt_seq: u32,
+    rtt_sent_ns: u64,
+    /// When the first retransmission since anything was last acknowledged
+    /// went: what giving up counts from. 0 while nothing waits.
+    stalled_since_ms: u64,
     /// Also the FIN-WAIT-2 deadline
     time_wait_at: u64,
     /// The zero-window probe's
@@ -551,7 +594,8 @@ impl Inner {
             cwnd: IW_BYTES, ssthresh: u32::MAX, dup_acks: 0, recovery: Recovery::None, recover: 0, retx_nxt: 0,
             bulk_wanted: false,
             rto_ms: INITIAL_RTO_MS,
-            retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
+            retransmit_at: 0, retransmit_count: 0, srtt_us: 0, rttvar_us: 0, rtt_seq: 0, rtt_sent_ns: 0,
+            stalled_since_ms: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
             accepted: false,
         }
@@ -599,6 +643,11 @@ impl Inner {
         self.rto_ms = INITIAL_RTO_MS;
         self.retransmit_at = 0;
         self.retransmit_count = 0;
+        self.srtt_us = 0;
+        self.rttvar_us = 0;
+        self.rtt_seq = 0;
+        self.rtt_sent_ns = 0;
+        self.stalled_since_ms = 0;
         self.time_wait_at = 0;
         self.persist_at = 0;
         self.oow_ack_at = 0;
@@ -823,6 +872,34 @@ pub static TCP: Tcp = Tcp {
 
 fn now_ms() -> u64 {
     kcore::time::boot_time().as_nanos() / kcore::consts::NS_PER_MS
+}
+
+fn now_ns() -> u64 {
+    kcore::time::boot_time().as_nanos()
+}
+
+/// A round trip measured, `sample_us`, into the connection's estimate, and
+/// the timeout it gives (RFC 6298 2.2 and 2.3).
+fn rtt_sample(inner: &mut Inner, sample_us: u64) {
+    let r = sample_us.max(1);
+    if inner.srtt_us == 0 {
+        inner.srtt_us = r;
+        inner.rttvar_us = r / 2;
+    } else {
+        inner.rttvar_us = (3 * inner.rttvar_us + inner.srtt_us.abs_diff(r)) / 4;
+        inner.srtt_us = (7 * inner.srtt_us + r) / 8;
+    }
+}
+
+/// The retransmission timeout the estimate gives: SRTT + max(G, 4 RTTVAR),
+/// held to [MIN_RTO_MS, MAX_RTO_MS] -- the initial second before the first
+/// sample.
+fn rtt_rto(inner: &Inner) -> u64 {
+    if inner.srtt_us == 0 {
+        return INITIAL_RTO_MS;
+    }
+    let us = inner.srtt_us.saturating_add(RTO_GRANULARITY_US.max(inner.rttvar_us.saturating_mul(4)));
+    us.div_ceil(1000).clamp(MIN_RTO_MS, MAX_RTO_MS)
 }
 
 /// A wait that nothing signals -- an answer, a connection, room in the
@@ -1078,8 +1155,16 @@ impl Tcp {
         inner.send_buf.consume(acked);
 
         inner.snd_una = ack;
-        inner.rto_ms = INITIAL_RTO_MS;
+        /* The segment timed, acknowledged: a round trip (RFC 6298 3) */
+        if inner.rtt_sent_ns != 0 && before_eq(inner.rtt_seq, ack) {
+            let sample_us = now_ns().saturating_sub(inner.rtt_sent_ns) / 1000;
+            rtt_sample(inner, sample_us);
+            inner.rtt_sent_ns = 0;
+        }
+        /* Something acknowledged: the backoff over (RFC 6298 5.7) */
+        inner.rto_ms = rtt_rto(inner);
         inner.retransmit_count = 0;
+        inner.stalled_since_ms = 0;
         inner.retransmit_at = if inner.snd_una == inner.snd_nxt { 0 } else { now + inner.rto_ms };
         self.newly_acked(inner, acked as u32);
     }
@@ -1216,6 +1301,8 @@ impl Tcp {
         inner.snd_nxt = seq;
         self.send_segment(inner, seg::ACK_FLAG | seg::PSH, &segment[..got]);
         inner.snd_nxt = saved;
+        /* Karn: what is timed may be what went again */
+        inner.rtt_sent_ns = 0;
         got as u32
     }
 
@@ -1225,6 +1312,7 @@ impl Tcp {
         inner.snd_nxt = seq;
         self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
         inner.snd_nxt = saved;
+        inner.rtt_sent_ns = 0;
     }
 
     /// In a timeout's recovery: more of what was outstanding when it came,
@@ -1568,7 +1656,7 @@ impl Tcp {
                         inner.snd_wscale = theirs;
                     }
                     inner.state = State::Established;
-                    inner.rto_ms = INITIAL_RTO_MS;
+                    inner.rto_ms = rtt_rto(inner);
                     inner.retransmit_at = 0;
                     start_congestion(inner);
 
@@ -1586,7 +1674,7 @@ impl Tcp {
                     inner.snd_wl1 = seq;
                     inner.snd_wl2 = ack;
                     inner.state = State::Established;
-                    inner.rto_ms = INITIAL_RTO_MS;
+                    inner.rto_ms = rtt_rto(inner);
                     inner.retransmit_at = 0;
                     start_congestion(inner);
                     conn.conn_ready.store(true, Ordering::Release);
@@ -2321,6 +2409,11 @@ impl Tcp {
 
             self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH, &segment[..len]);
             inner.snd_nxt = inner.snd_nxt.wrapping_add(len as u32);
+            /* One segment timed a round trip, from its first sending */
+            if inner.rtt_sent_ns == 0 {
+                inner.rtt_seq = inner.snd_nxt;
+                inner.rtt_sent_ns = now_ns();
+            }
 
             if inner.retransmit_at == 0 {
                 inner.retransmit_at = now_ms() + inner.rto_ms;
@@ -2642,7 +2735,16 @@ impl Tcp {
                 if retransmitted {
                     self.retransmits.fetch_add(1, Ordering::Relaxed);
                     inner.retransmit_count += 1;
-                    if inner.retransmit_count > MAX_RETRANSMITS {
+                    if inner.stalled_since_ms == 0 {
+                        inner.stalled_since_ms = now;
+                    }
+                    let handshake = matches!(inner.state, State::SynSent | State::SynReceived);
+                    let given_up = if handshake {
+                        inner.retransmit_count > MAX_RETRANSMITS
+                    } else {
+                        now.saturating_sub(inner.stalled_since_ms) >= GIVE_UP_MS
+                    };
+                    if given_up {
                         /* Nothing acknowledged after this many tries: give
                          * the slot back. Otherwise a dead peer pins it for
                          * good -- half-open handshakes, unacknowledged FINs

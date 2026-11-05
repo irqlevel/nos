@@ -52,23 +52,38 @@ over a `kernel_tcp_connect` that says which buffers it wants. Measured
 between the AX41 and the EX44: one connection's throughput, which should
 reach the 1 GbE line rate (117 MB/s) where it is 27 MB/s now.
 
-**T2, a timeout from the round trip.**
+**T2, a timeout from the round trip.** Its first half is done on branch
+`ipc-raft`: the estimate, a floor of 200 ms and giving up by time, with the
+200 ms look kept; the timer armed for the earliest deadline (a task that
+sleeps until it), the lower floor for links between nos hosts and the
+measurements are still to do.
 - The round trip is measured on every acknowledged segment that was not
   sent again (Karn's rule). SRTT and RTTVAR follow RFC 6298, in integers.
-- The RTO is SRTT plus four RTTVARs, with a floor fit for a data centre:
-  20 ms, a parameter, to be checked against spurious retransmissions on the
-  boxes. A path of 50 ms, the Mac to Hetzner, still gets an RTO of a few
-  hundred ms from its own measurements: the floor only matters where the
-  round trip is short.
+- The RTO is SRTT plus four RTTVARs, no less than 200 ms -- Linux's floor,
+  not the 20 ms first planned. A peer that delays its acknowledgements
+  holds the one for a lone segment 40 ms and up to 200 (Linux's delayed
+  ACK, longer in its interactive mode), hoping to send it with an answer: a
+  floor under that sends every last segment of a request again, against
+  the Linux guests a forward relays to over the switch first of all, and
+  Karn's rule keeps the delay out of the estimate, so it never learns. nos
+  acknowledges every segment at once, so a link both of whose ends are nos
+  -- ipcnet's -- is given a floor of its own, as Linux's `ip route ...
+  rto_min` gives a route one: 20 ms, set where the link is made (I4) and
+  measured there. A path of 50 ms, the Mac to Hetzner, gets an RTO of a few
+  hundred ms from its own measurements either way.
 - The timer is armed for the earliest deadline any connection has, to the
   millisecond, instead of a look every 200 ms. With nothing in flight
   anywhere, it does not run at all: no wakeups on an idle machine.
-- A connection is given up by time, not by count: after 60 s with nothing
-  acknowledged, whatever its RTO. At 20 ms, eight doublings are over in
-  five seconds, which would cut off an ssh session on a flaky link -- the
-  user's Wi-Fi and VPN to the servers are one.
-- Measured on `scripts/hub.py`, which drops the last segment of a burst on
-  purpose: the stall, a second today, should become the RTO -- tens of ms.
+- A connection is given up by time, not by count: after 100 s with nothing
+  acknowledged (RFC 1122's R2 for data: at least 100 s), whatever its RTO.
+  From a floor of 200 ms eight doublings are over in half a minute, from
+  20 ms in five seconds, either of which would cut off an ssh session on a
+  flaky link -- the user's Wi-Fi and VPN to the servers are one. A
+  handshake is still given up after eight tries.
+- Measured on `scripts/hub.py` (I4's harness, [ipc.md](ipc.md)), which
+  drops the last segment of a burst on purpose: the stall, a second today,
+  should become the RTO -- 200 ms, and tens of ms on a link between nos
+  hosts.
   Then on the boxes: request and response p50 and p99 under load, and how
   many retransmissions turn out spurious.
 
