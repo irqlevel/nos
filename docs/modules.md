@@ -651,6 +651,33 @@ heapbench: 200 ms a run, on 1 CPU and on 4
 - Nothing panics on a refusal: an allocation the heap refuses ends the run
   and says so.
 
+## tlsbench
+
+`tlsbench` (`src/crates/modules/tlsbench`) times TLS 1.3 on this machine's
+CPUs: both pinned ends of `tls::pinned` -- a server and a client, each with
+a key made for the run -- in one kernel, over a pipe in memory, so that
+nothing is measured but the handshake, the crypto and the sessions' own
+work. ipcnet's links between hosts are such sessions, and the kernel has no
+SSE: which suite is cheapest is this command's to say.
+
+```
+$ insmod /tlsbench.ko
+$ tlsbench mb=64
+tlsbench: 2 CPUs, both pinned ends over memory
+aes128-gcm         handshake 2.4 ms; 64 MB client->server 92.2 MB/s, server->client 93.5 MB/s
+aes256-gcm         handshake 2.4 ms; 64 MB client->server 83.1 MB/s, server->client 80.8 MB/s
+chacha20-poly1305  handshake 1.2 ms; 64 MB client->server 204.6 MB/s, server->client 201.7 MB/s
+```
+
+    tlsbench [mb=16] [suite=aes128|aes256|chacha]
+
+Each way, the sender encrypts in one task and the receiver decrypts in
+another, as two hosts would -- on two CPUs where there are two. The suite
+the two agreed on is checked to be the one asked for (`Session::suite`).
+`scripts/tlsbench.py [--arch ...] [--mb N] [--cpus N]` boots nos with it and
+prints what it said; the numbers above are the AX41's, under KVM
+(docs/tls.md, "What it costs").
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

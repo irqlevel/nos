@@ -30,7 +30,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixT
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme};
-use tls::pinned::{Client, Fingerprint, Flush, Read, Recv, Refused, Socket, HANDSHAKE_MS};
+use tls::pinned::{Client, Fingerprint, Flush, Read, Recv, Refused, Socket, Suite, HANDSHAKE_MS};
 
 use crate::machine::sched;
 use crate::world::lan::Lan;
@@ -375,7 +375,8 @@ enum Outcome {
     /// The TCP connection was never made.
     NoConnection,
     Refused(Refused),
-    Session { key: Fingerprint, alpn: Option<Vec<u8>>, got: Vec<u8>, ended: &'static str, clean: bool },
+    Session { key: Fingerprint, alpn: Option<Vec<u8>>, suite: Option<Suite>, got: Vec<u8>, ended: &'static str,
+              clean: bool },
 }
 
 /// The kernel's TCP, as a TLS session runs over it.
@@ -411,6 +412,7 @@ fn connect((client, lines): (Arc<Client>, Vec<Vec<u8>>)) -> Outcome {
     };
     let key = *s.server();
     let alpn = s.alpn().map(|a| a.to_vec());
+    let suite = s.suite();
     let want: usize = lines.iter().map(|l| l.len()).sum();
     let mut ended = "done";
     'say: for line in &lines {
@@ -459,13 +461,16 @@ fn connect((client, lines): (Arc<Client>, Vec<Vec<u8>>)) -> Outcome {
         s.into_socket().0.abort();
         false
     };
-    Outcome::Session { key, alpn, got, ended, clean }
+    Outcome::Session { key, alpn, suite, got, ended, clean }
 }
 
 /// What must hold of every connection, over any link: a session only with
-/// the server's own key, and nothing read but what was said.
-fn hold_always(p: &Plan, o: &Outcome, server: &Fingerprint) {
-    if let Outcome::Session { key, got, ended, .. } = o {
+/// the server's own key, in a suite the client offered, and nothing read but
+/// what was said.
+fn hold_always(p: &Plan, o: &Outcome, server: &Fingerprint, offered: &[Suite]) {
+    if let Outcome::Session { key, got, ended, suite, .. } = o {
+        invariant!(suite.is_some_and(|s| offered.is_empty() || offered.contains(&s)),
+                   "a session in {:?} where the client offered {:?}", suite, offered);
         invariant!(key == server, "a session with a key the client was not given: {:?}", p);
         invariant!(p.show == Show::Own, "a session with a server showing {:?}: {:?}", p.show, p.brk);
         let said = p.said();
@@ -476,8 +481,8 @@ fn hold_always(p: &Plan, o: &Outcome, server: &Fingerprint) {
 }
 
 /// What a connection must have come to, over a link that loses nothing.
-fn judge(p: &Plan, o: &Outcome, server: &Fingerprint) {
-    hold_always(p, o, server);
+fn judge(p: &Plan, o: &Outcome, server: &Fingerprint, offered: &[Suite]) {
+    hold_always(p, o, server, offered);
     let refused = |want: &[Refused]| {
         invariant!(matches!(o, Outcome::Refused(why) if want.contains(why)),
                    "a server {:?} asking {:?} {:?} speaking {:?}: {:?}, not refused as {:?}", p.show, p.ask, p.brk,
@@ -534,7 +539,18 @@ pub fn tls_client(r: &mut Input) {
 
     let keys = keys();
     let server = tls::pinned::fingerprint(&keys.server.cert).expect("the server's certificate");
-    let client = Arc::new(Client::new(&keys.known.cert, &keys.known.key, &[server], &[ALPN])
+    /* The suites the client offers: the provider's all, or some of them in
+     * an order of the input's */
+    let mut offered: Vec<Suite> = Vec::new();
+    if r.bool() {
+        for _ in 0..1 + r.below(3) {
+            let s = r.pick(&Suite::ALL);
+            if !offered.contains(&s) {
+                offered.push(s);
+            }
+        }
+    }
+    let client = Arc::new(Client::with_suites(&keys.known.cert, &keys.known.key, &[server], &[ALPN], &offered)
         .expect("the client's setup"));
 
     let link = if r.u8() < 216 { Link::perfect() } else { Link::from_input(r) };
@@ -564,9 +580,9 @@ pub fn tls_client(r: &mut Input) {
         invariant!(w.wait_app(&app, 2 * HANDSHAKE_MS * MS + 120 * SEC), "a connection's task never ended: {:?}", p);
         let outcome = app.take().expect("a connection's outcome");
         if lossless {
-            judge(&p, &outcome, &server);
+            judge(&p, &outcome, &server, &offered);
         } else {
-            hold_always(&p, &outcome, &server);
+            hold_always(&p, &outcome, &server, &offered);
         }
         if matches!(outcome, Outcome::Session { .. }) {
             crate::common::runner::reached("tls_client: a session");

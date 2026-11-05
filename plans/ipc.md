@@ -221,7 +221,11 @@ A module, `ipcnet.ko`: a host that is no cluster's needs none of it.
 - **Measured before it carries data**: TLS 1.3 in software -- the kernel has
   no SSE, so ChaCha20-Poly1305 and AES-GCM run on their portable backends --
   on the EX44's and the AX41's cores, against the 117 MB/s of their 1 GbE
-  links. An NBS write sends two copies between hosts.
+  links. An NBS write sends two copies between hosts. The AX41's, measured
+  (`tlsbench` under KVM, 2026-11-05): ChaCha20-Poly1305 203 MB/s a way with
+  sender and receiver on two CPUs, AES-128-GCM 92, AES-256-GCM 82;
+  handshakes 1.2-2.4 ms. ipcnet's links ask for ChaCha20-Poly1305 first.
+  The EX44's waits for it to run Ubuntu again.
 
 ### Who may send to whom
 
