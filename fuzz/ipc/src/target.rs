@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use crate::machine::{sched, MODULES};
 use crate::{reached, Input, Target};
 use ffi::ipc as abi;
-use ipc::{Addr, Error, Limits, Mailbox, Payload, Reason, Scope, To};
+use ipc::{Addr, Bounce, Error, Limits, Mailbox, Payload, Reason, Scope, To};
 use ipcwire as wire;
 use ipcwire::route;
 
@@ -1068,6 +1068,102 @@ fn deliver_remote(m: &mut Model, r: &mut Input) {
     }
 }
 
+/// The router says a message of one of this host's mailboxes did not get
+/// to a peer's: told to its sender -- a mailbox that sent to that peer, and
+/// that one alone -- if it has room.
+fn bounced(m: &mut Model, r: &mut Input) {
+    let Some(at) = (if r.chance(32) || m.router.is_none() {
+        (!m.boxes.is_empty()).then(|| r.below(m.boxes.len() as u64) as usize)
+    } else {
+        m.router
+    }) else { return };
+    let i = r.below(4) as usize;
+    let host = number(i, m.peers[i].as_ref().map_or(1, |p| p.epoch));
+    let sender = match m.peers[i].as_ref().and_then(|p| p.sent.front().copied()) {
+        Some(a) if r.bool() => a,
+        _ => match r.u8() % 8 {
+            0 => Addr { host: 1, slot: 3, generation: 1 }.to_u64(),
+            1 => 0,
+            _ => addr_of(m, r),
+        },
+    };
+    let by_name = r.bool();
+    let name = NAMES[r.below(NAMES.len() as u64) as usize];
+    let target = match r.u8() % 8 {
+        0 => Addr { host: 2, slot: 4, generation: 1 }.to_u64(),
+        _ => Addr { host: 0, slot: 1 + r.u16() % 16, generation: 1 + u32::from(r.u8() % 3) }.to_u64(),
+    };
+    let tag = TAGS[r.below(TAGS.len() as u64) as usize];
+    let reference = r.u64();
+    let why = r.pick(&[Bounce::Full, Bounce::Gone, Bounce::Unsent]);
+    let (s, t) = (Addr::from_u64(sender), Addr::from_u64(target));
+    let want = if by_name && !name_ok(name) {
+        Err(Error::Invalid)
+    } else if tag >= ipc::TAG_SYSTEM || s.host != 0 || s.slot == 0 {
+        Err(Error::Invalid)
+    } else if !by_name && t.host != 0 {
+        Err(Error::Invalid)
+    } else if m.stopped {
+        Err(Error::Stopped)
+    } else if m.router != Some(at) {
+        Err(Error::NotYours)
+    } else {
+        match m.live(host) {
+            None => Err(Error::NoRoute),
+            Some(pi) if !m.peers[pi].as_ref().is_some_and(|p| p.sent.contains(&sender)) => Err(Error::NotYours),
+            Some(_) => match m.find(sender) {
+                None => Err(Error::Gone),
+                Some(k) => {
+                    let from = if by_name {
+                        Addr { host, slot: 0, generation: 0 }
+                    } else {
+                        Addr { host, slot: t.slot, generation: t.generation }
+                    };
+                    let mut data = why.code().to_le_bytes().to_vec();
+                    data.extend_from_slice(&tag.to_le_bytes());
+                    if by_name {
+                        data.extend_from_slice(name.as_bytes());
+                    }
+                    m.push(k, Msg { from: from.to_u64(), tag: ipc::TAG_BOUNCED, reference, data })
+                }
+            },
+        }
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => {
+            let to = if by_name { To::Name(name) } else { To::Addr(t) };
+            mb.bounced(host, s, to, tag, reference, why)
+        }
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => {
+            /* A name of no bytes through the ABI is the address */
+            if by_name && name.is_empty() {
+                return;
+            }
+            let (np, nl) = if by_name { (name.as_ptr(), name.len()) } else { (core::ptr::null(), 0) };
+            // SAFETY: the name is its length's bytes.
+            let code = unsafe {
+                abi::kernel_ipc_bounced(m.boxes[at].addr, u32::from(host), sender, target, np, nl, tag, reference,
+                                        why.code())
+            };
+            match code {
+                0 => Ok(()),
+                c => Err(error_of(c)),
+            }
+        }
+    };
+    let want = if m.boxes[at].owner != Owner::Image && !m.boxes[at].open { Err(Error::Gone) } else { want };
+    say!("bounced {:x} {:x} -> {:x}{} {:?}: {:?}", host, sender, target, if by_name { name } else { "" }, why, got);
+    invariant!(got == want, "bounced from {:x} to {:x}:{:x}{} ({:?}): {:?}, the model {:?}", sender, host, target,
+               if by_name { name } else { "" }, why, got, want);
+    match got {
+        Ok(()) => reached("a bounce told to its sender"),
+        Err(Error::NotYours) => reached("a bounce refused for a mailbox that never sent there"),
+        Err(Error::Full) => reached("a bounce dropped for want of room"),
+        _ => {}
+    }
+}
+
 /// A peer says a mailbox a remote monitor watched has gone.
 fn remote_down(m: &mut Model, r: &mut Input) {
     let Some(at) = (if r.chance(32) || m.router.is_none() {
@@ -1296,7 +1392,13 @@ fn run(r: &mut Input) {
                     remote_down(&mut m, r)
                 }
             }
-            _ => deliver_remote(&mut m, r),
+            _ => {
+                if r.chance(64) {
+                    bounced(&mut m, r)
+                } else {
+                    deliver_remote(&mut m, r)
+                }
+            }
         }
         say!("op {}: queued {} model {}", op, ipc::counters().queued_bytes, m.queued_bytes());
         compare(&m);

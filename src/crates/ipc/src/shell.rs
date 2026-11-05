@@ -56,8 +56,9 @@ fn summary(out: &mut Output) {
     let _ = writeln!(out, "ipc: sent {}, received {}; refused full {}, gone {}, no memory {}", c.sent, c.received,
                      c.full, c.gone, c.no_memory);
     let _ = writeln!(out, "ipc: downs {}, watches lost {}, strays {}", c.downs, c.watch_lost, c.stray);
-    let _ = writeln!(out, "ipc: to peers {}, from peers {} (refused {}); peers up {}, lost {}", c.routed,
-                     c.delivered_remote, c.refused_remote, c.peers_up, c.peers_lost);
+    let _ = writeln!(out, "ipc: to peers {}, from peers {} (refused {}); peers up {}, lost {}; bounced {} (dropped {})",
+                     c.routed, c.delivered_remote, c.refused_remote, c.peers_up, c.peers_lost, c.bounced,
+                     c.bounces_dropped);
 }
 
 fn peer_list(out: &mut Output) {
