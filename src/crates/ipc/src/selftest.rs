@@ -8,8 +8,8 @@
 //! a call, a module's side, an unload under traffic -- is the boot's
 //! test_module_ipc, through kernel.echo.
 
-use crate::{counters, list, lookup, open, register, Addr, Error, Limits, Mailbox, Owner, Payload, Reason, Scope, To,
-            MAX_PAYLOAD, PIECE, TAG_DOWN, TAG_NAME_DOWN, TAG_NAME_UP, TAG_SYSTEM};
+use crate::{counters, list, lookup, open, peers, register, Addr, Error, Limits, Mailbox, Owner, Payload, Reason, Scope,
+            To, MAX_PAYLOAD, PIECE, TAG_DOWN, TAG_NAME_DOWN, TAG_NAME_UP, TAG_ROUTE, TAG_SYSTEM};
 use alloc::vec::Vec;
 use kcore::klog;
 
@@ -35,6 +35,7 @@ pub fn selftest() {
     names();
     monitors();
     watches();
+    router();
     check(counters().queued_bytes == before, "the host's queues hold more than before the test");
     klog!(0, "ipc: selftest passed");
 }
@@ -173,4 +174,66 @@ fn watches() {
     check(n.register("kernel.selftest.w2", Scope::Host).is_ok(), "a name");
     check(w.try_recv().is_none(), "an event for a watch ended");
     check(w.watch("Bad prefix").err() == Some(Error::Invalid), "a prefix that is none");
+}
+
+/// The router's side, by the image's own mailboxes: a message for a peer's
+/// address handed to the router with its head; an answer from the peer
+/// delivered, from the peer's number, to a mailbox that sent there and to
+/// no other; a Cluster name reached and a Host name not; a monitor of the
+/// peer's mailbox asked of the router, ended by the peer's Down and by the
+/// peer lost; the peer's old addresses refused once it is up again under a
+/// new number; and the peers lost with the router's close. The peer stays
+/// in the table, down, so that no address from before is ever another's.
+fn router() {
+    let router = Mailbox::new(ROOMY).unwrap_or_else(|_| panic!("ipc selftest: a router"));
+    check(router.route().is_ok(), "a router refused");
+    let peer = router.peer_up("selftest").unwrap_or_else(|e| panic!("ipc selftest: a peer up: {}", e.name()));
+    check(router.peer_up("selftest") == Ok(peer), "a peer up twice, two numbers");
+    let a = Mailbox::new(ROOMY).unwrap_or_else(|_| panic!("ipc selftest: a sender"));
+    let there = Addr { host: peer, slot: 7, generation: 1 };
+    check(a.send(To::Addr(there), 5, 77, Payload::from_slice(b"to the peer").unwrap_or_else(|_| panic!("ipc selftest")))
+              .is_ok(), "a send to a peer refused");
+    let m = router.try_recv().unwrap_or_else(|| panic!("ipc selftest: nothing at the router"));
+    let mut bytes = [0u8; ipcwire::route::HEAD + 11];
+    check(m.tag() == TAG_ROUTE && m.from() == a.addr() && m.payload().len() == bytes.len()
+              && m.payload().read(0, &mut bytes) == bytes.len(), "the routed message's tag, sender or length");
+    let head = ipcwire::route::decode(&bytes).unwrap_or_else(|_| panic!("ipc selftest: the route head"));
+    check(head.kind == ipcwire::route::SEND && head.peer == peer && head.tag == 5 && head.reference == 77
+              && head.to == ipcwire::To::Addr(Addr { host: 0, ..there }.to_u64())
+              && &bytes[ipcwire::route::HEAD..] == b"to the peer", "the route head");
+    /* The peer's answer: to a mailbox that sent there, from the peer's number */
+    let from = Addr { host: 0, slot: 9, generation: 2 }.to_u64();
+    check(router.deliver_remote(peer, from, To::Addr(a.addr()), 6, 77, Payload::empty()).is_ok(), "an answer refused");
+    check(a.try_recv().is_some_and(|m| m.from() == Addr { host: peer, slot: 9, generation: 2 } && m.tag() == 6
+                                       && m.reference() == 77), "the answer's sender or tag");
+    let b = Mailbox::new(ROOMY).unwrap_or_else(|_| panic!("ipc selftest: a mailbox"));
+    check(router.deliver_remote(peer, from, To::Addr(b.addr()), 6, 0, Payload::empty()) == Err(Error::NotYours),
+          "a mailbox that never sent there reached from a peer");
+    check(b.register("kernel.selftest.cluster", Scope::Cluster).is_ok(), "a Cluster name refused");
+    check(router.deliver_remote(peer, from, To::Name("kernel.selftest.cluster"), 6, 0, Payload::empty()).is_ok()
+              && b.try_recv().is_some(), "a Cluster name not reached from a peer");
+    let c = Mailbox::new(ROOMY).unwrap_or_else(|_| panic!("ipc selftest: a mailbox"));
+    check(c.register("kernel.selftest.host", Scope::Host).is_ok(), "a Host name refused");
+    check(router.deliver_remote(peer, from, To::Name("kernel.selftest.host"), 6, 0, Payload::empty())
+              == Err(Error::NotYours), "a Host name reached from a peer");
+    /* A monitor of the peer's mailbox: the router asked, the peer's Down */
+    let id = a.monitor(there).unwrap_or_else(|e| panic!("ipc selftest: a remote monitor: {}", e.name()));
+    check(router.try_recv().is_some_and(|m| m.tag() == TAG_ROUTE), "the router not asked to watch");
+    check(router.remote_down(peer, id, Reason::Closed).is_ok(), "the peer's Down refused");
+    check(a.try_recv().is_some_and(|m| m.reference() == id && m.down() == Some(Reason::Closed)), "the peer's Down");
+    /* Another, ended by the peer lost */
+    let id = a.monitor(there).unwrap_or_else(|_| panic!("ipc selftest: a remote monitor"));
+    let _ = router.try_recv();
+    check(router.peer_lost(peer).is_ok(), "the peer lost refused");
+    check(a.try_recv().is_some_and(|m| m.reference() == id && m.down() == Some(Reason::HostLost)), "HostLost");
+    check(a.send(To::Addr(there), 5, 0, Payload::empty()).is_err_and(|e| e.0 == Error::NoRoute),
+          "a lost peer's mailbox reached");
+    /* Up again: another number, and the old addresses still nobody's */
+    let again = router.peer_up("selftest").unwrap_or_else(|_| panic!("ipc selftest: the peer up again"));
+    check(again != peer, "a peer back up under its old number");
+    check(a.send(To::Addr(there), 5, 0, Payload::empty()).is_err_and(|e| e.0 == Error::NoRoute),
+          "an address from before the peer was lost reached");
+    /* The router closed: the peer lost with it */
+    drop(router);
+    check(peers().iter().any(|p| p.1 == "selftest" && !p.2), "the peer up past its router's close");
 }

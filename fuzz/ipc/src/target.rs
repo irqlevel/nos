@@ -21,6 +21,8 @@ use crate::machine::{sched, MODULES};
 use crate::{reached, Input, Target};
 use ffi::ipc as abi;
 use ipc::{Addr, Error, Limits, Mailbox, Payload, Reason, Scope, To};
+use ipcwire as wire;
+use ipcwire::route;
 
 pub static ALL: &[Target] = &[
     Target { name: "ipc", run: run, max_len: 4096, gate: 6000 },
@@ -38,10 +40,39 @@ macro_rules! say {
     };
 }
 
-const NAMES: [&str; 14] = ["kernel.a", "kernel.b", "nbs.mds", "nbs.cs", "nbs.cs.0", "modtest.a", "modtest.b", "sys.x",
-                           "other.y", "bad name", "Nbs.x", "nbs..x", "", "nbs.x-y_z"];
-const PREFIXES: [&str; 9] = ["", "nbs.", "nbs.cs", "kernel.", "modtest", "sys", "Bad", "nbs..", "nbs.cs.0"];
+const NAMES: [&str; 20] = ["kernel.a", "kernel.b", "nbs.mds", "nbs.cs", "nbs.cs.0", "modtest.a", "modtest.b", "sys.x",
+                           "other.y", "bad name", "Nbs.x", "nbs..x", "", "nbs.x-y_z",
+                           "host.ex44", "nbs.mds@ex44", "kernel.a@ax41", "x@", "@ex44", "nbs.mds@Bad"];
+const PREFIXES: [&str; 11] = ["", "nbs.", "nbs.cs", "kernel.", "modtest", "sys", "Bad", "nbs..", "nbs.cs.0", "host.", "host.ex44"];
 const TAGS: [u32; 5] = [1, 7, 0xFFFF_FFFF - 0x10000, ipc::TAG_SYSTEM, ipc::TAG_DOWN];
+/// Peers' names: well made, and not.
+const PEER_NAMES: [&str; 6] = ["ex44", "ax41", "a-b-1", "Bad", "", "ex44x"];
+const PEER_BITS: u32 = 6;
+
+fn number(i: usize, epoch: u16) -> u16 {
+    (epoch << PEER_BITS) | (i as u16 + 1)
+}
+
+/// A host's name, the model's own: a DNS label, lowercase.
+fn host_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 63 && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// A peer, as the model has it.
+struct PeerM {
+    name: String,
+    epoch: u16,
+    up: bool,
+    sent: VecDeque<u64>,
+}
+
+/// A monitor of a mailbox on a peer, kept on this host.
+struct RemoteM {
+    id: u64,
+    peer: u16,
+    watcher: usize,
+    target: u64,
+}
 
 /// A message as the model has it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +131,12 @@ struct Model {
     names: Vec<(String, usize, Scope)>,
     watches: Vec<WatchRec>,
     stopped: bool,
+    /// The router: a mailbox's index.
+    router: Option<usize>,
+    /// The peers, by their numbers' index.
+    peers: Vec<Option<PeerM>>,
+    /// The remote monitors, in the table's order.
+    remote: Vec<RemoteM>,
 }
 
 /// Whether `part` is one part of a name: a lowercase letter, then lowercase
@@ -129,6 +166,68 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
 impl Model {
     fn find(&self, addr: u64) -> Option<usize> {
         self.boxes.iter().position(|b| b.addr == addr && b.open)
+    }
+
+    /// The peer `host` names, up and of that epoch.
+    fn live(&self, host: u16) -> Option<usize> {
+        let i = usize::from(host & ((1 << PEER_BITS) - 1));
+        if i == 0 {
+            return None;
+        }
+        let p = self.peers.get(i - 1)?.as_ref()?;
+        (p.up && p.epoch == host >> PEER_BITS).then_some(i - 1)
+    }
+
+    fn live_by_name(&self, name: &str) -> Option<u16> {
+        self.peers.iter().enumerate().find_map(|(i, p)| {
+            let p = p.as_ref()?;
+            (p.up && p.name == name).then(|| number(i, p.epoch))
+        })
+    }
+
+    /// Whether `push` would take `len` bytes into `at`: its checks, nothing
+    /// changed.
+    fn would_push(&self, at: usize, len: usize) -> Result<(), Error> {
+        let b = &self.boxes[at];
+        if len > b.limits.bytes {
+            return Err(Error::TooLarge);
+        }
+        if !b.open {
+            return Err(Error::Gone);
+        }
+        if b.normal >= b.limits.messages || b.bytes + len > b.limits.bytes {
+            return Err(Error::Full);
+        }
+        Ok(())
+    }
+
+    /// A routed message into the router `rt`: the head, then `body`.
+    fn routed(&mut self, rt: usize, from: u64, head: &route::Head<'_>, body: &[u8]) -> Result<(), Error> {
+        let mut data = route::encode(head).expect("a head the model makes").to_vec();
+        data.extend_from_slice(body);
+        self.push(rt, Msg { from, tag: ipc::TAG_ROUTE, reference: 0, data })
+    }
+
+    /// The peer at `i` lost, as `remote::lose` does it: its monitors' Downs
+    /// and the watchers of it, for `tell`.
+    fn lose(&mut self, i: usize, host: u16) -> Option<(String, Vec<(usize, u64)>)> {
+        let p = self.peers[i].as_mut()?;
+        p.up = false;
+        p.sent.clear();
+        let name = p.name.clone();
+        let mut k = 0;
+        while k < self.remote.len() {
+            if self.remote[k].peer == host {
+                let rec = self.remote.swap_remove(k);
+                let data = (Reason::HostLost as u32).to_le_bytes().to_vec();
+                self.push_kept(rec.watcher, Msg { from: rec.target, tag: ipc::TAG_DOWN, reference: rec.id, data });
+            } else {
+                k += 1;
+            }
+        }
+        let key = format!("host.{}", name);
+        let watchers = self.watchers_of(&key);
+        Some((key, watchers))
     }
 
     /// A message into the queue's own places, as `push` does it.
@@ -189,7 +288,35 @@ impl Model {
             return;
         }
         let addr = self.boxes[at].addr;
-        /* The table: its name and the watches of it, its own watches */
+        /* The table: a router's close loses every peer up */
+        let mut lost = Vec::new();
+        if self.router == Some(at) {
+            self.router = None;
+            for i in 0..self.peers.len() {
+                let host = match &self.peers[i] {
+                    Some(p) if p.up => number(i, p.epoch),
+                    _ => continue,
+                };
+                if let Some(x) = self.lose(i, host) {
+                    lost.push((x, host));
+                }
+            }
+        }
+        /* Its address forgotten by every peer, its remote monitors taken */
+        for p in self.peers.iter_mut().flatten() {
+            p.sent.retain(|&a| a != addr);
+        }
+        let mut gone = Vec::new();
+        let mut k = 0;
+        while k < self.remote.len() {
+            if self.remote[k].watcher == at {
+                gone.push(self.remote.swap_remove(k));
+            } else {
+                k += 1;
+            }
+        }
+        let router = self.router;
+        /* Its name and the watches of it, its own watches */
         let name = self.names.iter().position(|n| n.1 == at).map(|i| self.names.swap_remove(i).0);
         let watchers = name.as_deref().map(|n| self.watchers_of(n)).unwrap_or_default();
         let mut i = 0;
@@ -198,6 +325,22 @@ impl Model {
                 self.watches.swap_remove(i);
             } else {
                 i += 1;
+            }
+        }
+        for ((key, watchers), host) in lost {
+            self.tell(&key, Addr { host, slot: 0, generation: 0 }.to_u64(), ipc::TAG_NAME_DOWN, watchers);
+        }
+        for rec in &gone {
+            let b = &mut self.boxes[at];
+            b.reserved = b.reserved.saturating_sub(1);
+            b.monitors.retain(|&(_, m)| m != rec.id);
+        }
+        if let Some(rt) = router {
+            for rec in gone {
+                let to = Addr { host: 0, ..Addr::from_u64(rec.target) }.to_u64();
+                let head = route::Head { kind: route::DEMONITOR, peer: rec.peer, tag: 0, to: wire::To::Addr(to),
+                                         reference: rec.id };
+                let _ = self.routed(rt, addr, &head, &[]);
             }
         }
         /* The mailbox itself */
@@ -253,6 +396,11 @@ fn compare(m: &Model) {
         invariant!(info.monitors == b.monitors.len() && info.monitored_by == b.monitored_by.len()
                    && info.watches == b.watches.len(), "mailbox {}: monitors, monitored by or watches", info.addr);
     }
+    let peers: Vec<(u16, String, bool, usize)> = m.peers.iter().enumerate()
+        .filter_map(|(i, p)| p.as_ref().map(|p| (number(i, p.epoch), p.name.clone(), p.up, p.sent.len()))).collect();
+    invariant!(ipc::peers() == peers, "the peers: {:?}, the model {:?}", ipc::peers(), peers);
+    let router = m.router.map(|rt| m.boxes[rt].addr);
+    invariant!(ipc::router().map(|a| a.to_u64()) == router, "the router {:?}, the model {:?}", ipc::router(), router);
     let mut got: Vec<(String, u64)> = ipc::list("").into_iter().map(|n| (n.name, n.addr.to_u64())).collect();
     let mut want: Vec<(String, u64)> = m.names.iter().map(|n| (n.0.clone(), m.boxes[n.1].addr)).collect();
     got.sort();
@@ -262,6 +410,12 @@ fn compare(m: &Model) {
 
 /// An address that is the model's mailbox `at`'s, or one that never was.
 fn addr_of(m: &Model, r: &mut Input) -> u64 {
+    /* A mailbox on a peer: of one up, or of an older epoch */
+    if r.chance(24) {
+        let i = r.below(4) as usize;
+        let epoch = m.peers[i].as_ref().map_or(1, |p| p.epoch).saturating_sub(r.below(2) as u16).max(1);
+        return Addr { host: number(i, epoch), slot: 1 + r.u16() % 8, generation: 1 + u32::from(r.u8() % 3) }.to_u64();
+    }
     if m.boxes.is_empty() || r.chance(16) {
         return match r.u8() % 3 {
             0 => 0,
@@ -355,16 +509,57 @@ fn send(m: &mut Model, r: &mut Input) {
     } else if m.stopped {
         Err(Error::Stopped)
     } else {
+        /* Where it goes: a mailbox here, or the router for a peer */
+        enum Dest<'a> {
+            Here(usize),
+            Peer(u16, wire::To<'a>),
+        }
         let target = if by_name {
-            m.names.iter().find(|n| n.0 == name).map(|n| n.1).ok_or(Error::Gone)
+            match name.split_once('@') {
+                Some((nm, host)) => {
+                    if !name_ok(nm) || !host_ok(host) {
+                        Err(Error::Invalid)
+                    } else if m.router.is_none() {
+                        Err(Error::NoRoute)
+                    } else {
+                        m.live_by_name(host).map(|h| Dest::Peer(h, wire::To::Name(nm.as_bytes()))).ok_or(Error::NoRoute)
+                    }
+                }
+                None => m.names.iter().find(|n| n.0 == name).map(|n| Dest::Here(n.1)).ok_or(Error::Gone),
+            }
         } else if Addr::from_u64(to).host != 0 {
-            Err(Error::NoRoute)
+            let host = Addr::from_u64(to).host;
+            if m.router.is_none() || m.live(host).is_none() {
+                Err(Error::NoRoute)
+            } else {
+                Ok(Dest::Peer(host, wire::To::Addr(Addr { host: 0, ..Addr::from_u64(to) }.to_u64())))
+            }
         } else {
-            m.find(to).ok_or(Error::Gone)
+            m.find(to).map(Dest::Here).ok_or(Error::Gone)
         };
-        target.and_then(|t| {
-            let msg = Msg { from: m.boxes[from].addr, tag, reference, data: data.clone() };
-            m.push(t, msg)
+        let sender = m.boxes[from].addr;
+        target.and_then(|t| match t {
+            Dest::Here(t) => m.push(t, Msg { from: sender, tag, reference, data: data.clone() }),
+            Dest::Peer(host, to) => {
+                /* The sender kept as one the peer may answer, first */
+                if let Some(i) = m.live(host) {
+                    if let Some(p) = m.peers[i].as_mut() {
+                        if !p.sent.contains(&sender) {
+                            if p.sent.len() >= ipc::MAX_SENT {
+                                p.sent.pop_front();
+                            }
+                            p.sent.push_back(sender);
+                        }
+                    }
+                }
+                let rt = m.router.expect("a router, said above");
+                let head = route::Head { kind: route::SEND, peer: host, tag, to, reference };
+                let res = m.routed(rt, sender, &head, &data);
+                if res.is_ok() {
+                    reached("a message routed to a peer");
+                }
+                res
+            }
         })
     };
     let got = match (m.boxes[from].owner, &m.image[from]) {
@@ -492,6 +687,7 @@ fn register(m: &mut Model, r: &mut Input) {
     let owner = m.boxes[at].owner;
     let namespace = name.split('.').next().unwrap_or("");
     let mine = match owner {
+        _ if namespace == "host" => false,
         Owner::Image => true,
         Owner::Module(i) => {
             let ns = MODULES[i].2.split('-').next().unwrap_or("");
@@ -554,6 +750,43 @@ fn monitor(m: &mut Model, r: &mut Input) {
         invariant!(got.is_err(), "a monitor made by a mailbox closed or at its monitors");
         return;
     }
+    let host = Addr::from_u64(target).host;
+    if host != 0 {
+        let watcher = m.boxes[w].addr;
+        match (m.router, m.live(host)) {
+            (Some(rt), Some(_)) => {
+                /* The router told; refused, the monitor is undone */
+                let would = m.would_push(rt, route::HEAD);
+                match (would, got) {
+                    (Ok(()), Ok(id)) => {
+                        let b = &mut m.boxes[w];
+                        b.reserved += 1;
+                        b.monitors.push((target, id));
+                        m.remote.push(RemoteM { id, peer: host, watcher: w, target });
+                        let to = Addr { host: 0, ..Addr::from_u64(target) }.to_u64();
+                        let head = route::Head { kind: route::MONITOR, peer: host, tag: 0, to: wire::To::Addr(to),
+                                                 reference: id };
+                        m.routed(rt, watcher, &head, &[]).expect("a push said possible");
+                        reached("a mailbox on a peer monitored");
+                    }
+                    (Err(_), Err(())) => reached("a remote monitor refused by a full router"),
+                    (would, got) => panic!("invariant: a remote monitor answered {:?}, the router taking it {:?}", got,
+                                           would),
+                }
+            }
+            _ => {
+                /* No router, or the peer not up: lost already */
+                let Ok(id) = got else { panic!("invariant: a monitor of a host lost refused") };
+                let b = &mut m.boxes[w];
+                b.reserved += 1;
+                b.monitors.push((target, id));
+                let data = (Reason::HostLost as u32).to_le_bytes().to_vec();
+                m.push_kept(w, Msg { from: target, tag: ipc::TAG_DOWN, reference: id, data });
+                reached("a monitor of a host lost");
+            }
+        }
+        return;
+    }
     let Ok(id) = got else { panic!("invariant: a monitor refused") };
     let b = &mut m.boxes[w];
     b.reserved += 1;
@@ -585,12 +818,289 @@ fn demonitor(m: &mut Model, r: &mut Input) {
     }
     let Some(i) = m.boxes[w].monitors.iter().position(|&(_, x)| x == id) else { return };
     let target = m.boxes[w].monitors.swap_remove(i).0;
+    if Addr::from_u64(target).host != 0 {
+        let Some(k) = m.remote.iter().position(|rec| rec.id == id && rec.watcher == w) else { return };
+        m.remote.swap_remove(k);
+        m.boxes[w].reserved -= 1;
+        if let Some(rt) = m.router {
+            let to = Addr { host: 0, ..Addr::from_u64(target) }.to_u64();
+            let head = route::Head { kind: route::DEMONITOR, peer: Addr::from_u64(target).host, tag: 0,
+                                     to: wire::To::Addr(to), reference: id };
+            let watcher = m.boxes[w].addr;
+            let _ = m.routed(rt, watcher, &head, &[]);
+        }
+        reached("a remote monitor dropped");
+        return;
+    }
     if let Some(t) = m.find(target) {
         if let Some(k) = m.boxes[t].monitored_by.iter().position(|rec| rec.0 == id) {
             m.boxes[t].monitored_by.swap_remove(k);
             m.boxes[w].reserved -= 1;
             reached("a monitor dropped");
         }
+    }
+}
+
+/// A mailbox made the router -- or refused, as one is while another is.
+fn make_router(m: &mut Model, r: &mut Input) {
+    if m.boxes.is_empty() {
+        return;
+    }
+    let at = r.below(m.boxes.len() as u64) as usize;
+    let want = if m.stopped {
+        Err(Error::Stopped)
+    } else if !m.boxes[at].open {
+        Err(Error::Gone)
+    } else if m.router.is_some_and(|rt| rt != at) {
+        Err(Error::Busy)
+    } else {
+        Ok(())
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => mb.route(),
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => match abi::kernel_ipc_route(m.boxes[at].addr) {
+            0 => Ok(()),
+            c => Err(error_of(c)),
+        },
+    };
+    /* A closed module mailbox through the ABI: Gone before anything else */
+    let want = if m.boxes[at].owner != Owner::Image && !m.boxes[at].open { Err(Error::Gone) } else { want };
+    say!("route {:x}: {:?}", m.boxes[at].addr, got);
+    invariant!(got == want, "route {:x}: {:?}, the model {:?}", m.boxes[at].addr, got, want);
+    if got.is_ok() {
+        m.router = Some(at);
+        reached("a router");
+    }
+}
+
+/// The router -- or another, refused -- says a peer is up: its number.
+fn peer_up(m: &mut Model, r: &mut Input) {
+    let Some(at) = (if r.chance(32) || m.router.is_none() {
+        (!m.boxes.is_empty()).then(|| r.below(m.boxes.len() as u64) as usize)
+    } else {
+        m.router
+    }) else { return };
+    let name = PEER_NAMES[r.below(PEER_NAMES.len() as u64) as usize];
+    let want = if !host_ok(name) {
+        Err(Error::Invalid)
+    } else if m.stopped {
+        Err(Error::Stopped)
+    } else if m.router != Some(at) {
+        Err(Error::NotYours)
+    } else {
+        match m.peers.iter().position(|p| p.as_ref().is_some_and(|p| p.name == name)) {
+            Some(i) => {
+                let p = m.peers[i].as_ref().expect("found");
+                if p.up {
+                    Ok(number(i, p.epoch))
+                } else {
+                    let epoch = if p.epoch >= (u16::MAX >> PEER_BITS) { 1 } else { p.epoch + 1 };
+                    Ok(number(i, epoch))
+                }
+            }
+            None => m.peers.iter().position(|p| p.is_none()).map(|i| number(i, 1)).ok_or(Error::Busy),
+        }
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => mb.peer_up(name),
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => {
+            // SAFETY: the name is its length's bytes.
+            match unsafe { abi::kernel_ipc_peer_up(m.boxes[at].addr, name.as_ptr(), name.len()) } {
+                0 => Err(Error::NotYours),
+                n => Ok(n as u16),
+            }
+        }
+    };
+    say!("peer_up {:?} by {:x}: {:?}", name, m.boxes[at].addr, got);
+    if m.boxes[at].owner != Owner::Image {
+        /* The ABI says 0 for every refusal */
+        invariant!(got.is_ok() == want.is_ok() && (got.is_err() || got == want),
+                   "peer_up {:?}: {:?}, the model {:?}", name, got, want);
+    } else {
+        invariant!(got == want, "peer_up {:?}: {:?}, the model {:?}", name, got, want);
+    }
+    let Ok(host) = want else { return };
+    let i = usize::from(host & ((1 << PEER_BITS) - 1)) - 1;
+    let was_up = m.peers[i].as_ref().is_some_and(|p| p.up);
+    if was_up {
+        return;
+    }
+    match m.peers[i].as_mut() {
+        Some(p) => {
+            p.epoch = host >> PEER_BITS;
+            p.up = true;
+        }
+        None => m.peers[i] = Some(PeerM { name: name.to_string(), epoch: 1, up: true, sent: VecDeque::new() }),
+    }
+    let key = format!("host.{}", name);
+    let watchers = m.watchers_of(&key);
+    m.tell(&key, Addr { host, slot: 0, generation: 0 }.to_u64(), ipc::TAG_NAME_UP, watchers);
+    reached("a peer up");
+}
+
+/// The router says a peer is lost.
+fn peer_lost(m: &mut Model, r: &mut Input) {
+    let Some(at) = (if r.chance(32) || m.router.is_none() {
+        (!m.boxes.is_empty()).then(|| r.below(m.boxes.len() as u64) as usize)
+    } else {
+        m.router
+    }) else { return };
+    let i = r.below(4) as usize;
+    let host = number(i, m.peers[i].as_ref().map_or(1, |p| p.epoch));
+    let want = if m.router != Some(at) {
+        Err(Error::NotYours)
+    } else if m.live(host).is_none() {
+        Err(Error::Gone)
+    } else {
+        Ok(())
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => mb.peer_lost(host),
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => match abi::kernel_ipc_peer_lost(m.boxes[at].addr, u32::from(host)) {
+            0 => Ok(()),
+            c => Err(error_of(c)),
+        },
+    };
+    let want = if m.boxes[at].owner != Owner::Image && !m.boxes[at].open { Err(Error::Gone) } else { want };
+    say!("peer_lost {:x} by {:x}: {:?}", host, m.boxes[at].addr, got);
+    invariant!(got == want, "peer_lost {:x}: {:?}, the model {:?}", host, got, want);
+    if got.is_ok() {
+        if let Some((key, watchers)) = m.lose(i, host) {
+            m.tell(&key, Addr { host, slot: 0, generation: 0 }.to_u64(), ipc::TAG_NAME_DOWN, watchers);
+        }
+        reached("a peer lost");
+    }
+}
+
+/// What a peer says, come through the router: to a name, or to an address
+/// here -- one that sent there now and then.
+fn deliver_remote(m: &mut Model, r: &mut Input) {
+    let Some(at) = (if r.chance(32) || m.router.is_none() {
+        (!m.boxes.is_empty()).then(|| r.below(m.boxes.len() as u64) as usize)
+    } else {
+        m.router
+    }) else { return };
+    let i = r.below(4) as usize;
+    let host = number(i, m.peers[i].as_ref().map_or(1, |p| p.epoch));
+    let from = match r.u8() % 8 {
+        0 => Addr { host: 1, slot: 3, generation: 1 }.to_u64(),
+        1 => 0,
+        _ => Addr { host: 0, slot: 1 + r.u16() % 16, generation: 1 + u32::from(r.u8() % 3) }.to_u64(),
+    };
+    let by_name = r.bool();
+    let name = NAMES[r.below(NAMES.len() as u64) as usize];
+    let to = match m.peers[i].as_ref().and_then(|p| p.sent.front().copied()) {
+        Some(a) if r.bool() => a,
+        _ => addr_of(m, r),
+    };
+    let tag = TAGS[r.below(TAGS.len() as u64) as usize];
+    let reference = r.u64();
+    let data = pattern(r.below(100) as usize, r.u8());
+    let want = if by_name && !name_ok(name) {
+        Err(Error::Invalid)
+    } else if tag >= ipc::TAG_SYSTEM {
+        Err(Error::Invalid)
+    } else if Addr::from_u64(from).host != 0 || Addr::from_u64(from).slot == 0 {
+        Err(Error::Invalid)
+    } else if m.stopped {
+        Err(Error::Stopped)
+    } else if m.router != Some(at) {
+        Err(Error::NotYours)
+    } else {
+        match m.live(host) {
+            None => Err(Error::NoRoute),
+            Some(pi) => {
+                let target = if by_name {
+                    match m.names.iter().find(|n| n.0 == name) {
+                        None => Err(Error::Gone),
+                        Some(n) if n.2 != Scope::Cluster => Err(Error::NotYours),
+                        Some(n) => Ok(m.boxes[n.1].addr),
+                    }
+                } else if Addr::from_u64(to).host != 0 {
+                    Err(Error::Invalid)
+                } else if !m.peers[pi].as_ref().is_some_and(|p| p.sent.contains(&to)) {
+                    Err(Error::NotYours)
+                } else {
+                    Ok(to)
+                };
+                target.and_then(|a| m.find(a).ok_or(Error::Gone)).and_then(|t| {
+                    let f = Addr::from_u64(from);
+                    let from = Addr { host, slot: f.slot, generation: f.generation }.to_u64();
+                    m.push(t, Msg { from, tag, reference, data: data.clone() })
+                })
+            }
+        }
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => {
+            let target = if by_name { To::Name(name) } else { To::Addr(Addr::from_u64(to)) };
+            mb.deliver_remote(host, from, target, tag, reference, Payload::from_slice(&data).expect("a payload"))
+        }
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => {
+            let (np, nl) = if by_name { (name.as_ptr(), name.len()) } else { (core::ptr::null(), 0) };
+            /* A name of no bytes through the ABI is the address */
+            if by_name && name.is_empty() {
+                return;
+            }
+            // SAFETY: the name and the data are their lengths' bytes.
+            let code = unsafe {
+                abi::kernel_ipc_deliver_remote(m.boxes[at].addr, u32::from(host), from, to, np, nl, tag, reference,
+                                               data.as_ptr(), data.len())
+            };
+            match code {
+                0 => Ok(()),
+                c => Err(error_of(c)),
+            }
+        }
+    };
+    let want = if m.boxes[at].owner != Owner::Image && !m.boxes[at].open { Err(Error::Gone) } else { want };
+    say!("deliver_remote {:x} {:x} -> {:x}{}: {:?}", host, from, to, if by_name { name } else { "" }, got);
+    invariant!(got == want, "deliver_remote from {:x}:{:x} to {:x}{}: {:?}, the model {:?}", host, from, to,
+               if by_name { name } else { "" }, got, want);
+    if got.is_ok() {
+        reached("a message from a peer delivered");
+    } else if got == Err(Error::NotYours) {
+        reached("a peer refused where it may not deliver");
+    }
+}
+
+/// A peer says a mailbox a remote monitor watched has gone.
+fn remote_down(m: &mut Model, r: &mut Input) {
+    let Some(at) = (if r.chance(32) || m.router.is_none() {
+        (!m.boxes.is_empty()).then(|| r.below(m.boxes.len() as u64) as usize)
+    } else {
+        m.router
+    }) else { return };
+    let (id, host) = match m.remote.get(r.below(m.remote.len() as u64 + 1) as usize) {
+        Some(rec) if r.u8() > 16 => (rec.id, rec.peer),
+        _ => (r.u64(), number(r.below(4) as usize, 1)),
+    };
+    let reason = r.pick(&[Reason::Closed, Reason::NoSuch, Reason::Unloaded]);
+    let want = if m.router != Some(at) {
+        Err(Error::NotYours)
+    } else {
+        m.remote.iter().position(|rec| rec.id == id && rec.peer == host).map(|_| ()).ok_or(Error::Gone)
+    };
+    let got = match (m.boxes[at].owner, &m.image[at]) {
+        (Owner::Image, Some(mb)) => mb.remote_down(host, id, reason),
+        (Owner::Image, None) => return,
+        (Owner::Module(_), _) => match abi::kernel_ipc_remote_down(m.boxes[at].addr, u32::from(host), id, reason as u32) {
+            0 => Ok(()),
+            c => Err(error_of(c)),
+        },
+    };
+    let want = if m.boxes[at].owner != Owner::Image && !m.boxes[at].open { Err(Error::Gone) } else { want };
+    invariant!(got == want, "remote_down {:x} {}: {:?}, the model {:?}", host, id, got, want);
+    if got.is_ok() {
+        let k = m.remote.iter().position(|rec| rec.id == id && rec.peer == host).expect("found above");
+        let rec = m.remote.swap_remove(k);
+        let data = (reason as u32).to_le_bytes().to_vec();
+        m.push_kept(rec.watcher, Msg { from: rec.target, tag: ipc::TAG_DOWN, reference: rec.id, data });
+        reached("a peer's Down delivered");
     }
 }
 
@@ -743,8 +1253,9 @@ fn sleeper(m: &mut Model, r: &mut Input) {
 
 fn run(r: &mut Input) {
     SAY.store(std::env::var_os("IPC_FUZZ_SAY").is_some(), Ordering::Relaxed);
-    let mut m = Model { boxes: Vec::new(), image: Vec::new(), names: Vec::new(), watches: Vec::new(), stopped: false };
-    while let Some(op) = r.op(13) {
+    let mut m = Model { boxes: Vec::new(), image: Vec::new(), names: Vec::new(), watches: Vec::new(), stopped: false,
+                        router: None, peers: (0..ipc::MAX_PEERS).map(|_| None).collect(), remote: Vec::new() };
+    while let Some(op) = r.op(18) {
         match op {
             0 | 1 => open(&mut m, r),
             2 => close(&mut m, r),
@@ -771,11 +1282,21 @@ fn run(r: &mut Input) {
                     sleeper(&mut m, r)
                 }
             }
-            _ => {
+            12 => {
                 let name = NAMES[r.below(NAMES.len() as u64) as usize];
                 let want = m.names.iter().find(|n| n.0 == name).map(|n| m.boxes[n.1].addr);
                 invariant!(ipc::lookup(name).map(|a| a.to_u64()) == want, "lookup {:?}", name);
             }
+            13 => make_router(&mut m, r),
+            14 => peer_up(&mut m, r),
+            15 => {
+                if r.chance(64) {
+                    peer_lost(&mut m, r)
+                } else {
+                    remote_down(&mut m, r)
+                }
+            }
+            _ => deliver_remote(&mut m, r),
         }
         say!("op {}: queued {} model {}", op, ipc::counters().queued_bytes, m.queued_bytes());
         compare(&m);

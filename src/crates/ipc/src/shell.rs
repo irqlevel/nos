@@ -6,14 +6,15 @@
 //!     ipc names [prefix]      every name: its mailbox, scope and owner
 //!     ipc boxes               every mailbox: owner, name, what it holds
 //!     ipc echo [start|stop]   kernel.echo: whether it runs, what it did
+//!     ipc peers               the router and the peers it has told of
 
-use crate::{boxes, counters, echo_start, echo_status, echo_stop, list};
+use crate::{boxes, counters, echo_start, echo_status, echo_stop, list, peers, router};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::klog;
 
-const HELP: &str = "ipc [names [prefix] | boxes | echo [start|stop]]";
+const HELP: &str = "ipc [names [prefix] | boxes | peers | echo [start|stop]]";
 
 pub(crate) fn init() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -40,6 +41,7 @@ fn run(args: &str, out: &mut Output) {
         "" => summary(out),
         "names" => names(rest, out),
         "boxes" => mailboxes(out),
+        "peers" => peer_list(out),
         "echo" => echo(rest, out),
         _ => {
             let _ = writeln!(out, "usage: {}", HELP);
@@ -54,6 +56,23 @@ fn summary(out: &mut Output) {
     let _ = writeln!(out, "ipc: sent {}, received {}; refused full {}, gone {}, no memory {}", c.sent, c.received,
                      c.full, c.gone, c.no_memory);
     let _ = writeln!(out, "ipc: downs {}, watches lost {}, strays {}", c.downs, c.watch_lost, c.stray);
+    let _ = writeln!(out, "ipc: to peers {}, from peers {} (refused {}); peers up {}, lost {}", c.routed,
+                     c.delivered_remote, c.refused_remote, c.peers_up, c.peers_lost);
+}
+
+fn peer_list(out: &mut Output) {
+    match router() {
+        Some(r) => {
+            let _ = writeln!(out, "ipc: router {}", r);
+        }
+        None => {
+            let _ = writeln!(out, "ipc: no router -- nothing carries messages to other hosts");
+        }
+    }
+    for (number, name, up, sent) in peers() {
+        let _ = writeln!(out, "{:>6} {:<24} {:<5} {} may be answered", number, name, if up { "up" } else { "down" },
+                         sent);
+    }
 }
 
 fn names(prefix: &str, out: &mut Output) {

@@ -506,3 +506,87 @@ pub fn frames<'a>(msg: u32, to: To<'a>, from: u64, tag: u32, reference: u64, dat
     let head = Frame::Head { msg, to, from, tag, reference, len: data.len() as u32 };
     Ok(core::iter::once(head).chain(data.chunks(BODY_MAX).map(move |data| Frame::Body { msg, data })))
 }
+
+/// What the channel hands the router -- ipcnet's mailbox -- for another
+/// host: a message of the channel's tag `TAG_ROUTE` whose payload begins
+/// with this head, the message's own bytes after it. Between the channel and
+/// the router on one host, not on the wire: the router reads it and says
+/// the frames. Little-endian, fixed at [`route::HEAD`] bytes.
+pub mod route {
+    use super::{is_name, Error, To, NAME_MAX};
+
+    pub const HEAD: usize = 72;
+    /// A message to send there.
+    pub const SEND: u8 = 1;
+    /// Watch a mailbox there, by the id the watcher's host gave the monitor.
+    pub const MONITOR: u8 = 2;
+    /// Stop watching it.
+    pub const DEMONITOR: u8 = 3;
+
+    /// A routed message's head.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Head<'a> {
+        pub kind: u8,
+        /// The peer, by this host's number for it.
+        pub peer: u16,
+        pub tag: u32,
+        /// Where it goes: the peer's own address of a mailbox, or a name
+        /// there.
+        pub to: To<'a>,
+        /// The message's reference, or the monitor's id.
+        pub reference: u64,
+    }
+
+    pub fn encode(h: &Head<'_>) -> Result<[u8; HEAD], Error> {
+        if !matches!(h.kind, SEND | MONITOR | DEMONITOR) {
+            return Err(Error::Kind);
+        }
+        let mut b = [0u8; HEAD];
+        b[0] = h.kind;
+        b[2..4].copy_from_slice(&h.peer.to_le_bytes());
+        b[4..8].copy_from_slice(&h.tag.to_le_bytes());
+        match h.to {
+            To::Addr(a) => b[8..16].copy_from_slice(&a.to_le_bytes()),
+            To::Name(n) => {
+                if !is_name(n) {
+                    return Err(Error::Name);
+                }
+                /* At most NAME_MAX: is_name says so */
+                b[1] = n.len() as u8;
+                b[24..24 + n.len()].copy_from_slice(n);
+            }
+        }
+        b[16..24].copy_from_slice(&h.reference.to_le_bytes());
+        Ok(b)
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Head<'_>, Error> {
+        if b.len() < HEAD {
+            return Err(Error::Length);
+        }
+        let kind = b[0];
+        if !matches!(kind, SEND | MONITOR | DEMONITOR) {
+            return Err(Error::Kind);
+        }
+        let name_len = usize::from(b[1]);
+        let u64_at = |at: usize| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[at..at + 8]);
+            u64::from_le_bytes(a)
+        };
+        let to = if name_len == 0 {
+            To::Addr(u64_at(8))
+        } else {
+            if name_len > NAME_MAX {
+                return Err(Error::Name);
+            }
+            let n = &b[24..24 + name_len];
+            if !is_name(n) {
+                return Err(Error::Name);
+            }
+            To::Name(n)
+        };
+        Ok(Head { kind, peer: u16::from_le_bytes([b[2], b[3]]), tag: u32::from_le_bytes([b[4], b[5], b[6], b[7]]), to,
+                  reference: u64_at(16) })
+    }
+}

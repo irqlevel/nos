@@ -19,6 +19,10 @@ pub struct IpcHeader {
     pub _pad: u32,
 }
 
+/// A name with its host -- `name@host`, a send's to a peer -- at most: a
+/// name's bytes, the `@`, a host's name (a DNS label).
+pub const IPC_REMOTE_NAME_MAX: usize = IPC_NAME_MAX + 1 + 63;
+
 /// A name's bytes, at most.
 pub const IPC_NAME_MAX: usize = 48;
 
@@ -45,6 +49,9 @@ pub const IPC_TAG_NAME_DOWN: u32 = IPC_TAG_SYSTEM | 3;
 /// A watch that could not deliver an event has ended; the reference is its
 /// id.
 pub const IPC_TAG_WATCH_LOST: u32 = IPC_TAG_SYSTEM | 4;
+/// A message for another host, in the router's mailbox: its payload begins
+/// with ipcwire's route head (`ipcwire::route`), its own bytes after it.
+pub const IPC_TAG_ROUTE: u32 = IPC_TAG_SYSTEM | 5;
 
 /// Why a Down came.
 pub const IPC_DOWN_CLOSED: u32 = 1;
@@ -132,4 +139,33 @@ unsafe extern "C" {
     /// The names under `prefix`, at most `max` of them, into `out`: how many
     /// were copied.
     pub fn kernel_ipc_list(prefix: *const u8, len: usize, out: *mut IpcName, max: usize) -> usize;
+
+    /// `mbox` -- a module's own -- made the router: what carries messages
+    /// to other hosts (ipcnet's). One at a time, until it closes: ipc's
+    /// `Error::code`, 0 for done.
+    pub safe fn kernel_ipc_route(mbox: u64) -> i32;
+
+    /// The peer `name` (`len` bytes, a host's name) up, the router's call:
+    /// its number -- the host part of its mailboxes' addresses here, the
+    /// same while it stays up and another after it was lost -- or 0 when
+    /// refused.
+    pub fn kernel_ipc_peer_up(router: u64, name: *const u8, len: usize) -> u32;
+
+    /// The peer `peer` lost, the router's call: every monitor of an address
+    /// there gets its Down (HostLost), and what was let reply from there no
+    /// longer is. ipc's `Error::code`.
+    pub safe fn kernel_ipc_peer_lost(router: u64, peer: u32) -> i32;
+
+    /// A message come from the peer `peer`, the router's call: from its
+    /// mailbox `from` (the peer's own address of it), to this host's mailbox
+    /// `to` -- or, with `name_len` past 0, to the `Cluster` name `name` -- its
+    /// `len` bytes copied. Delivered to a `Cluster` name, or to a mailbox that
+    /// has sent to that peer; refused otherwise. ipc's `Error::code`.
+    pub fn kernel_ipc_deliver_remote(router: u64, peer: u32, from: u64, to: u64, name: *const u8, name_len: usize,
+                                     tag: u32, reference: u64, data: *const u8, len: usize) -> i32;
+
+    /// The peer `peer` says the mailbox a monitor of this host's watched has
+    /// gone (`reason`, an IPC_DOWN_*): the monitor `id`'s Down delivered.
+    /// ipc's `Error::code`.
+    pub safe fn kernel_ipc_remote_down(router: u64, peer: u32, id: u64, reason: u32) -> i32;
 }
