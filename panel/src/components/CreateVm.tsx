@@ -1,10 +1,10 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { JobWatch } from './JobWatch';
-import { startJob } from '@/lib/client';
+import { call, startJob } from '@/lib/client';
 import type { Words } from '@/lib/i18n';
 
 /** Images a VM is made of in a click: the distributions' own cloud images,
@@ -16,6 +16,19 @@ const IMAGES = [
 const GIB = 1024 ** 3;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 
+/** A device of the host's a VM's disk may be (the vm provider's `devices`):
+ * the image poured onto it in place of a file. `refused` says why it is not
+ * given as it is -- force gives it over what is on it, or another VM's; one
+ * the machine boots from or something holds is never given. */
+interface Device {
+  name: string; id: string | null; size_bytes: number; holds: string | null; in_use_by: string | null;
+  boots_the_machine: string | null; refused: string | null;
+}
+
+function usable(d: Device): boolean {
+  return d.id !== null && d.in_use_by === null && d.boots_the_machine === null;
+}
+
 export function CreateVm({ host, locale, w }: { host: string; locale: string; w: Words }) {
   const [name, setName] = useState('');
   const [url, setUrl] = useState(IMAGES[0]!.url);
@@ -23,8 +36,20 @@ export function CreateVm({ host, locale, w }: { host: string; locale: string; w:
   const [mem, setMem] = useState('1024');
   const [cpus, setCpus] = useState('1');
   const [password, setPassword] = useState('');
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [onto, setOnto] = useState('');
+  const [force, setForce] = useState(false);
   const [error, setError] = useState('');
   const [job, setJob] = useState<number | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    call(host, 'vm', 'devices').then((r) => {
+      if (live && r.ok) setDevices(((r.data as { devices?: Device[] }).devices ?? []).filter(usable));
+    });
+    return () => { live = false; };
+  }, [host]);
+  const device = devices.find((d) => d.id === onto);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -35,7 +60,12 @@ export function CreateVm({ host, locale, w }: { host: string; locale: string; w:
     }
     setError('');
     const params: Record<string, unknown> = { name, url, memory_mib: Number(mem), cpus: Number(cpus) };
-    if (disk) params.size_bytes = Math.round(Number(disk) * GIB);
+    if (onto) {
+      params.onto = onto;
+      if (force) params.force = true;
+    } else if (disk) {
+      params.size_bytes = Math.round(Number(disk) * GIB);
+    }
     if (password) params.password = password;
     const r = await startJob(host, 'vm', 'create', params);
     if (r.ok) setJob(r.id);
@@ -58,9 +88,30 @@ export function CreateVm({ host, locale, w }: { host: string; locale: string; w:
           </select>
           <input value={url} onChange={(e) => setUrl(e.target.value)} name="url" className={input + ' font-mono text-xs'} />
         </label>
+        <label className="block text-sm text-fg-soft">{locale === 'ru' ? 'Где диск' : 'Its disk'}
+          <select value={onto} onChange={(e) => { setOnto(e.target.value); setForce(false); }} name="onto" className={input}>
+            <option value="">{locale === 'ru' ? 'Файл в папке машины' : 'A file in its folder'}</option>
+            {devices.map((d) => (
+              <option key={d.id!} value={d.id!}>
+                {d.name} · {(d.size_bytes / GIB).toFixed(1)} GiB{d.holds ? ' · ' + d.holds : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+        {device?.refused && (
+          <div className="space-y-1 rounded-lg border border-line p-2 text-sm" data-testid="onto-refused">
+            <p className="text-bad">{device.refused}</p>
+            <label className="flex items-center gap-2 text-fg-soft">
+              <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} name="force" />
+              {locale === 'ru' ? 'Записать образ поверх данных' : 'Pour the image over what is on it'}
+            </label>
+          </div>
+        )}
         <div className="grid grid-cols-3 gap-3">
           <label className="block text-sm text-fg-soft">{locale === 'ru' ? 'Диск, ГиБ' : 'Disk, GiB'}
-            <input value={disk} onChange={(e) => setDisk(e.target.value)} inputMode="numeric" name="disk" className={input} />
+            <input value={onto ? '' : disk} onChange={(e) => setDisk(e.target.value)} inputMode="numeric" name="disk"
+              disabled={onto !== ''} placeholder={onto ? (locale === 'ru' ? 'размер устройства' : "the device's") : ''}
+              className={input} />
           </label>
           <label className="block text-sm text-fg-soft">{locale === 'ru' ? 'Память, МиБ' : 'Memory, MiB'}
             <input value={mem} onChange={(e) => setMem(e.target.value)} inputMode="numeric" name="memory" className={input} />

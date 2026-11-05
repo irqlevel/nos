@@ -79,6 +79,12 @@ struct NvmeDevice {
      * init.  Shutdown honours it too. */
     disable_timeout_ms: u64,
 
+    /* What the disk is known by from boot to boot -- `nvme-<model>_<serial>`
+     * -- and whether it deallocates (Dataset Management): from Identify
+     * Controller. */
+    identity:    Option<alloc::string::String>,
+    deallocates: bool,
+
     /* capacity and geometry */
     capacity:    u64,    /* total LBA count */
     sector_size: u32,    /* bytes per LBA */
@@ -314,7 +320,7 @@ fn init_device(dev: pci::PciDevice) {
         return;
     }
 
-    let mdts = {
+    let (mdts, oncs, identity) = {
         let id_ctrl = id_buf.as_slice();
         let text = |at: usize, len: usize| {
             core::str::from_utf8(&id_ctrl[at..at + len]).unwrap_or("?").trim()
@@ -323,7 +329,9 @@ fn init_device(dev: pci::PciDevice) {
         let oncs = u16::from_le_bytes([id_ctrl[ID_CTRL_ONCS_AT], id_ctrl[ID_CTRL_ONCS_AT + 1]]);
         klog!(0, "NVMe: ctrl sn={} mn={} mdts={} oncs={:#x}",
             text(ID_CTRL_SN_AT, ID_CTRL_SN_LEN), text(ID_CTRL_MN_AT, ID_CTRL_MN_LEN), mdts, oncs);
-        mdts
+        let identity = identity_word(&id_ctrl[ID_CTRL_MN_AT..ID_CTRL_MN_AT + ID_CTRL_MN_LEN],
+                                     &id_ctrl[ID_CTRL_SN_AT..ID_CTRL_SN_AT + ID_CTRL_SN_LEN]);
+        (mdts, oncs, identity)
     };
 
     /* --- Identify Namespace 1 --- */
@@ -496,6 +504,8 @@ fn init_device(dev: pci::PciDevice) {
         completion,
         irq,
         disable_timeout_ms: to_ms,
+        identity,
+        deallocates: oncs & ONCS_DSM != 0,
         capacity,
         sector_size,
         max_transfer,
@@ -1209,5 +1219,86 @@ impl BlockDriver for NvmeDevice {
 
     fn kick(&'static self) {
         self.ring_owed();
+    }
+
+    fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    fn can_discard(&self) -> bool {
+        self.deallocates
+    }
+
+    fn discard(&'static self, sector: u64, count: u64) -> bool {
+        self.deallocate(sector, count)
+    }
+}
+
+/// What a controller is known by from boot to boot, from its Identify data:
+/// `nvme-<model>_<serial>`, each trimmed of the spaces it is padded with and
+/// anything but `[A-Za-z0-9._-]` made `_` -- as Linux's `/dev/disk/by-id`
+/// names it. None when either is empty.
+fn identity_word(model: &[u8], serial: &[u8]) -> Option<alloc::string::String> {
+    fn trim(b: &[u8]) -> &[u8] {
+        let start = b.iter().position(|&c| c != b' ' && c != 0).unwrap_or(b.len());
+        let end = b.iter().rposition(|&c| c != b' ' && c != 0).map_or(start, |i| i + 1);
+        &b[start..end.max(start)]
+    }
+    let (model, serial) = (trim(model), trim(serial));
+    if model.is_empty() || serial.is_empty() {
+        return None;
+    }
+    let mut word = alloc::string::String::new();
+    word.try_reserve_exact(5 + model.len() + 1 + serial.len()).ok()?;
+    word.push_str("nvme-");
+    let keep = |c: u8| if c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-') { char::from(c) } else { '_' };
+    word.extend(model.iter().map(|&c| keep(c)));
+    word.push('_');
+    word.extend(serial.iter().map(|&c| keep(c)));
+    Some(word)
+}
+
+impl NvmeDevice {
+    /* The `count` blocks from `sector` deallocated: Dataset Management, a
+     * page of ranges a command -- each at most u32::MAX blocks long -- one
+     * command after another, synchronously. The table has checked the
+     * range against the disk. */
+    fn deallocate(&self, sector: u64, count: u64) -> bool {
+        let Some(mut ranges) = dma::DmaBuffer::new(1) else {
+            klog!(0, "NVMe: discard: no page for its ranges");
+            return false;
+        };
+        let mut done = 0u64;
+        while done < count {
+            let page = ranges.as_mut_slice();
+            let mut n = 0usize;
+            while n < DSM_RANGES_MAX && done < count {
+                let blocks = (count - done).min(u64::from(u32::MAX)) as u32;
+                let at = n * DSM_RANGE_SIZE;
+                page[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+                page[at + 4..at + 8].copy_from_slice(&blocks.to_le_bytes());
+                page[at + 8..at + 16].copy_from_slice(&(sector + done).to_le_bytes());
+                done += u64::from(blocks);
+                n += 1;
+            }
+            let phys = ranges.phys();
+            let status = self.execute("discard", |cid| {
+                let mut cmd = SubmissionEntry::new(OPC_DSM, cid);
+                cmd.nsid = 1;
+                cmd.prp1 = phys;
+                cmd.cdw10 = (n - 1) as u32;
+                cmd.cdw11 = DSM_DEALLOCATE;
+                cmd
+            });
+            match status {
+                Some(0) => {}
+                Some(status) => {
+                    klog!(0, "NVMe: discard status={:#x} sector={} count={}", status, sector, count);
+                    return false;
+                }
+                None => return false,
+            }
+        }
+        true
     }
 }

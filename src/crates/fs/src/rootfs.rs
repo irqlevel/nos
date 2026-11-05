@@ -4,7 +4,8 @@
 //! or `auto`, which takes the ext4 or ext2 whose volume label is `nos` --
 //! an ext4 is what nos-install, scripts/mkrootfs.sh and scripts/build-disk.sh
 //! make, an ext2 what an install before ext4 made -- by the driver for it
-//! (`extfs`). A device that carries neither is tried as nanofs.
+//! (`extfs`). A device that carries neither is tried as nanofs. A label or
+//! a UUID two devices carry finds neither: one of them may be a guest's.
 //!
 //! With no root on disk there is a fallback layout instead, the one the ISO
 //! had before there was a root to boot from: a ramfs on `/`, the first of
@@ -29,13 +30,18 @@ const LABEL_AUTO: &[u8] = b"nos";
 /// smoke-test image uses; small enough not to notice at boot.
 const FSTEST_SIZE: usize = 300 * 1024;
 
-/// The device `root=` names, or None.
+/// The device `root=` names, or None -- None too where a label or a UUID is
+/// on two devices, said: a guest given a device of nos's (`hv devices`)
+/// can put an ext4 labelled `nos` on it, or a copy of nos's own root, and
+/// the next boot must not take the guest's for its root because the table
+/// happened to list it first.
 fn find_root(mode: &Root, value: &[u8], uuid: &[u8; 16]) -> Option<Disk> {
     if let Root::Device = mode {
         let name = core::str::from_utf8(value).ok()?;
         return Disk::open(name);
     }
 
+    let mut found: Option<Disk> = None;
     for index in 0..block::count() {
         let dev = match block::at(index) {
             Some(dev) => dev,
@@ -54,12 +60,18 @@ fn find_root(mode: &Root, value: &[u8], uuid: &[u8; 16]) -> Option<Disk> {
             Root::Uuid => &id.uuid == uuid,
             _ => false,
         };
-        if matches {
-            return Some(dev);
+        if !matches {
+            continue;
         }
+        if let Some(first) = &found {
+            klog!(0, "MountRootFs: {} and {} both carry the root root= asks for -- neither is taken, as one may be \
+                   a guest's or a copy", first.name(), dev.name());
+            return None;
+        }
+        found = Some(dev);
     }
 
-    None
+    found
 }
 
 /// ext4 or ext2 if the device carries one, else nanofs; false when neither

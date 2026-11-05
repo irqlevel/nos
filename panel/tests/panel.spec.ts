@@ -107,6 +107,45 @@ test('VMs: listed, created as a job, cloned, deleted with a confirm', async ({ p
   await expect(page.getByTestId('resource-vms')).not.toContainText('pw2');
 });
 
+test('a VM made onto a device: its disk the device, one with something on it given only with force', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/vms/new`);
+  /* What the host may give is offered, what it may not is not: its root's
+   * disk, its EFI System partition and its mounted root are left out. */
+  const onto = page.locator('select[name=onto]');
+  await expect(onto.locator('option')).toHaveText([/A file in its folder/, /nvme16/, /nvme17/]);
+  await page.fill('input[name=name]', 'dv1');
+  await onto.selectOption('part:704db7dd-0007-4e69-94e6-46e271b44854');
+  await expect(page.locator('input[name=disk]')).toBeDisabled();
+  await expect(page.getByTestId('onto-refused')).toContainText('holds an ext4 filesystem labelled "data"');
+  /* Refused before anything is fetched: a job that ends at once, saying why. */
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job')).toContainText('give it anyway with force', { timeout: 20_000 });
+  await expect(page.getByTestId('job-status')).not.toHaveText('ok');
+  /* With force, the form afresh. */
+  await page.goto(`/en/h/${host}/vms/new`);
+  await page.fill('input[name=name]', 'dv1');
+  await onto.selectOption('part:704db7dd-0007-4e69-94e6-46e271b44854');
+  await page.locator('input[name=force]').check();
+  await page.getByRole('button', { name: 'Create' }).click();
+  await expect(page.getByTestId('job-status')).toHaveText('ok', { timeout: 20_000 });
+  await expect(page.getByTestId('job')).toContainText('onto nvme17');
+
+  /* Its disks: the device first, by its id, this boot's name beside it. */
+  await page.goto(`/en/h/${host}/vms/dv1`);
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  await expect(page.getByTestId('vm-disks')).toContainText('part:704db7dd-0007');
+  await expect(page.getByTestId('vm-disks')).toContainText('nvme17');
+  /* And a device given as it is, then taken off again. */
+  const attach = page.getByTestId('form-vm-disk_attach');
+  await attach.locator('input[name=device]').fill('part:704db7dd-0006-4e69-94e6-46e271b44854');
+  await attach.getByRole('button', { name: 'Give to a VM' }).click();
+  await attach.getByRole('button', { name: 'Confirm' }).click();
+  await page.reload();
+  await page.getByRole('tab', { name: 'Disks' }).click();
+  await expect(page.getByTestId('vm-disks')).toContainText('nvme16');
+});
+
 test('a protected VM is not deleted without force', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/vms/panel`);

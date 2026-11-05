@@ -267,6 +267,20 @@ impl Queue {
         Ok(())
     }
 
+    /// `pieces` of buffer `buffer` read from the disk -- or with `write`
+    /// written to it -- by the synchronous path, and returned once all of
+    /// them are done (`Disk::read_pieces`): whether every one went well.
+    /// Refused while the buffer has I/O in flight, and for a queue that has
+    /// no disk.
+    pub fn now(&mut self, buffer: usize, pieces: &[crate::Piece], write: bool) -> bool {
+        let Some(disk) = self.disk else { return false };
+        if self.busy.get(buffer).is_none_or(|&n| n != 0) {
+            return false;
+        }
+        let buf = &mut self.bufs[buffer];
+        if write { disk.write_pieces(buf, pieces).is_ok() } else { disk.read_pieces(buf, pieces).is_ok() }
+    }
+
     /// The doorbell for what `start` handed the device.
     pub fn kick(&self) {
         if let Some(disk) = self.disk.filter(|_| self.max != 0) {

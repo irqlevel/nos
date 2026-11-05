@@ -1,7 +1,12 @@
 //! A guest's disk that is a file of nos's -- an image, whose size is the
-//! disk's, whole sectors of it -- held while the guest runs, and read,
+//! disk's, whole sectors of it -- or a device of nos's, a partition or a
+//! whole disk (`crate::devices`), held while the guest runs, and read,
 //! written and synced where the guest asks by a task of the disk's own, so
-//! that the guest runs on while its disk works.
+//! that the guest runs on while its disk works. A device's disk leaves the
+//! filesystem out entirely: its requests go to the block layer's queue for
+//! it (`kcore::block::DiskQueue`), as an image's go to the image's -- what
+//! follows of an image is so of a device, but for its claim, which is the
+//! block layer's.
 //!
 //! The image is held (`kcore::fs::Image`): nothing else may write the file,
 //! cut it or move it while the disk is open, and so its reads and writes go
@@ -44,7 +49,8 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hv::disk::{self as blk, Op, Request};
-use kcore::fs::{File, FileId, Image, ImageQueue, Started};
+use kcore::block::{DiskQueue, QueueError};
+use kcore::fs::{File, FileId, Image, ImageQueue, Lent, Started};
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
@@ -79,6 +85,9 @@ pub struct Runner {
     pub cpu: u32,
     pub claims: Arc<Claims>,
     pub holder: Holder,
+    /// What a device its disk is on is said to be held by, to whoever is
+    /// refused it meanwhile: `vm web's disk`.
+    pub owner: String,
 }
 
 /// Whose guest a disk is: what a disk refused its image is told, so that
@@ -205,7 +214,7 @@ struct Pipe {
 /// and the disk's number among its guest's, which its records say.
 struct Serve {
     pipe: Arc<Pipe>,
-    queue: Arc<ImageQueue>,
+    queue: Arc<dyn Media>,
     disk: u8,
     /// The CPU it is bound to, held to wake quickly while it serves.
     cpu: u32,
@@ -227,55 +236,139 @@ const IDLE_SECS: u64 = 1;
 const POLL_FIRST_NS: u64 = 10 * kcore::consts::NS_PER_US;
 const POLL_MAX_NS: u64 = 100 * kcore::consts::NS_PER_US;
 
-pub struct FileDisk {
+/// What a disk's task serves its requests with: an image's queue
+/// (`kcore::fs::ImageQueue`) for a disk that is a file, a device's
+/// (`kcore::block::DiskQueue`) for one that is a partition or a whole disk.
+/// Their calls are the same; what is not a read or a write goes to the file
+/// or the device by these too.
+trait Media: Send + Sync {
+    fn lend(&self, k: usize) -> Option<Lent<'_>>;
+    fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started>;
+    fn kick(&self);
+    fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize;
+    fn poll(&self, d: Duration) -> bool;
+    fn wait(&self, d: Duration) -> bool;
+    fn wake(&self);
+    fn flush(&self) -> bool;
+    fn discard(&self, offset: u64, len: u64) -> bool;
+    fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> bool;
+}
+
+impl Media for ImageQueue {
+    fn lend(&self, k: usize) -> Option<Lent<'_>> {
+        ImageQueue::lend(self, k)
+    }
+    fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
+        ImageQueue::start(self, k, write, offset, len)
+    }
+    fn kick(&self) {
+        ImageQueue::kick(self)
+    }
+    fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize {
+        ImageQueue::reap(self, done)
+    }
+    fn poll(&self, d: Duration) -> bool {
+        ImageQueue::poll(self, d)
+    }
+    fn wait(&self, d: Duration) -> bool {
+        ImageQueue::wait(self, d)
+    }
+    fn wake(&self) {
+        ImageQueue::wake(self)
+    }
+    fn flush(&self) -> bool {
+        self.image().sync().is_ok()
+    }
+    /* Each range's whole chunks given back, as a discard asks */
+    fn discard(&self, offset: u64, len: u64) -> bool {
+        self.image().discard(offset, len).is_ok()
+    }
+    fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> bool {
+        self.image().write_zeroes(offset, len, unmap).is_ok()
+    }
+}
+
+impl Media for DiskQueue {
+    fn lend(&self, k: usize) -> Option<Lent<'_>> {
+        DiskQueue::lend(self, k)
+    }
+    fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
+        DiskQueue::start(self, k, write, offset, len)
+    }
+    fn kick(&self) {
+        DiskQueue::kick(self)
+    }
+    fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize {
+        DiskQueue::reap(self, done)
+    }
+    fn poll(&self, d: Duration) -> bool {
+        DiskQueue::poll(self, d)
+    }
+    fn wait(&self, d: Duration) -> bool {
+        DiskQueue::wait(self, d)
+    }
+    fn wake(&self) {
+        DiskQueue::wake(self)
+    }
+    fn flush(&self) -> bool {
+        DiskQueue::flush(self).is_ok()
+    }
+    fn discard(&self, offset: u64, len: u64) -> bool {
+        DiskQueue::discard(self, offset, len).is_ok()
+    }
+    /* Never asked: the device does not offer it (`Backend::writes_zeroes`). */
+    fn write_zeroes(&self, _offset: u64, _len: u64, _unmap: bool) -> bool {
+        false
+    }
+}
+
+/// A guest's disk served by a task of its own: a file of nos's -- an image
+/// -- or a device of nos's, a partition or a whole disk (`crate::devices`).
+pub struct QueuedDisk {
     pipe: Arc<Pipe>,
-    /// The image and its buffers, which the device fills and empties --
-    /// before `_claim`, so that the image is let go of before its claim is.
-    queue: Arc<ImageQueue>,
+    /// The image's or the device's queue and its buffers, which the device
+    /// fills and empties -- before `_claim`, so that the image is let go of
+    /// before its claim is. A device's queue holds the device's claim itself.
+    queue: Arc<dyn Media>,
     size: u64,
     read_only: bool,
     /// What the device tells the guest to align its discards to
     /// (`Backend::discard_sectors`): the image's chunk.
     discard_sectors: u32,
+    /// What the virtio device offers the guest of a discard and a write of
+    /// zeros, and the block every request is whole ones of.
+    discards: bool,
+    writes_zeroes: bool,
+    block_size: u32,
     /// The disk's task: told to stop, and waited for, when the disk goes.
     task: Option<TaskHandle>,
     /// Its claim on its image (`Claims`): a field, and so given back only
-    /// after `drop` has waited for the task, the image's last user.
-    _claim: Claim,
+    /// after `drop` has waited for the task, the image's last user. None for
+    /// a device, whose queue holds the block layer's claim on it.
+    _claim: Option<Claim>,
 }
 
-impl FileDisk {
-    /// The image at `path` -- read-only to the guest with `read_only` --
-    /// served for `runner`'s guest as its disk `index` (vda 0), by a task
-    /// called after it and the disk's letter.
-    pub fn open(path: &str, read_only: bool, runner: &Runner, index: u8) -> Result<FileDisk, String> {
-        /* Which file it is, first: the claim says whose guest's disk has
-         * it, where the hold below would only refuse. */
-        let id = File::open(path, false).map_err(|e| alloc::format!("{}: {}", path, e))?
-            .identity().ok_or_else(|| alloc::format!("{}: the kernel does not know it", path))?;
-        let claim = runner.claims.claim(id, !read_only, runner.holder)
-            .map_err(|why| alloc::format!("{}: {}", path, why))?;
-        let image = Image::open(path, !read_only).map_err(|_| {
-            alloc::format!("{}: cannot be held as a disk -- nos has it open for writing, or cannot write it here", path)
-        })?;
-        let queue = image.into_queue(blk::IN_FLIGHT, blk::REQUEST_BYTES)
-            .map_err(|_| alloc::format!("{}: out of memory for its buffers", path))?;
-        let image = queue.image();
-        /* The file the claim is on, still: not one put in its place between. */
-        if image.identity() != Some(id) {
-            return Err(alloc::format!("{}: replaced while it was being opened", path));
-        }
-        let size = image.size().map_err(|e| alloc::format!("{}: {}", path, e))?;
-        let size = size - size % blk::SECTOR;
-        if size == 0 {
-            return Err(alloc::format!("{}: not a sector long", path));
-        }
-        /* What the image gives back of a discard: whole chunks, and nothing
-         * of less -- what the guest is told to align its discards to, so
-         * that its long ones are split on a chunk's edge. A block where it
-         * gives back nothing at all. */
-        let discard_sectors = u32::try_from(image.discard_unit() / blk::SECTOR).ok().filter(|&s| s != 0)
-            .unwrap_or(blk::DISCARD_ALIGNMENT);
+/// What a disk is served from, and how: the guest's view of it.
+struct Served {
+    queue: Arc<dyn Media>,
+    size: u64,
+    discard_sectors: u32,
+    discards: bool,
+    writes_zeroes: bool,
+    block_size: u32,
+    claim: Option<Claim>,
+}
+
+impl QueuedDisk {
+    /// The disk `word` names -- a file's path, or a device's id
+    /// (`part:...`, `disk:...`) or name (`dev:nvme14`) -- read-only to the
+    /// guest with `read_only`, served for `runner`'s guest as its disk
+    /// `index` (vda 0), by a task called after it and the disk's letter.
+    pub fn open(word: &str, read_only: bool, runner: &Runner, index: u8) -> Result<QueuedDisk, String> {
+        let served = match crate::devices::source(word) {
+            crate::devices::Source::File(path) => open_file(path, read_only, runner)?,
+            _ => open_device(word, read_only, runner)?,
+        };
 
         let mut todo = VecDeque::new();
         let mut done = VecDeque::new();
@@ -283,25 +376,91 @@ impl FileDisk {
         if todo.try_reserve_exact(blk::IN_FLIGHT).is_err() || done.try_reserve_exact(blk::IN_FLIGHT).is_err()
             || name.try_reserve(runner.name.len() + 8).is_err()
         {
-            return Err(alloc::format!("{}: out of memory for its queues", path));
+            return Err(alloc::format!("{}: out of memory for its queues", word));
         }
         let Some(requests) = Mutex::new(Requests { todo, done, stop: false }) else {
-            return Err(alloc::format!("{}: out of memory for its queues", path));
+            return Err(alloc::format!("{}: out of memory for its queues", word));
         };
         let pipe = Arc::new(Pipe { requests, done: AtomicUsize::new(0), wake: runner.wake.clone() });
 
         let letter = char::from(b'a'.saturating_add(index));
         let _ = write!(name, "hv/{}/vd{}", runner.name, letter);
-        let queue = Arc::new(queue);
+        let queue = served.queue.clone();
         let task = kcore::task::spawn_on_with(&name, 1u64 << runner.cpu,
                                               Serve { pipe: pipe.clone(), queue: queue.clone(), disk: index,
                                                       cpu: runner.cpu }, serve)
-            .ok_or_else(|| alloc::format!("{}: no task to serve it", path))?;
-        Ok(FileDisk { pipe, queue, size, read_only, discard_sectors, task: Some(task), _claim: claim })
+            .ok_or_else(|| alloc::format!("{}: no task to serve it", word))?;
+        Ok(QueuedDisk { pipe, queue, size: served.size, read_only, discard_sectors: served.discard_sectors,
+                        discards: served.discards, writes_zeroes: served.writes_zeroes,
+                        block_size: served.block_size, task: Some(task), _claim: served.claim })
     }
 }
 
-impl blk::Backend for FileDisk {
+/// The image at `path`, held as a disk -- for writing unless `read_only` --
+/// claimed among the guests' disks for `runner`'s.
+fn open_file(path: &str, read_only: bool, runner: &Runner) -> Result<Served, String> {
+    /* Which file it is, first: the claim says whose guest's disk has it,
+     * where the hold below would only refuse. */
+    let id = File::open(path, false).map_err(|e| alloc::format!("{}: {}", path, e))?
+        .identity().ok_or_else(|| alloc::format!("{}: the kernel does not know it", path))?;
+    let claim = runner.claims.claim(id, !read_only, runner.holder)
+        .map_err(|why| alloc::format!("{}: {}", path, why))?;
+    let image = Image::open(path, !read_only).map_err(|_| {
+        alloc::format!("{}: cannot be held as a disk -- nos has it open for writing, or cannot write it here", path)
+    })?;
+    let queue = image.into_queue(blk::IN_FLIGHT, blk::REQUEST_BYTES)
+        .map_err(|_| alloc::format!("{}: out of memory for its buffers", path))?;
+    let image = queue.image();
+    /* The file the claim is on, still: not one put in its place between. */
+    if image.identity() != Some(id) {
+        return Err(alloc::format!("{}: replaced while it was being opened", path));
+    }
+    let size = image.size().map_err(|e| alloc::format!("{}: {}", path, e))?;
+    let size = size - size % blk::SECTOR;
+    if size == 0 {
+        return Err(alloc::format!("{}: not a sector long", path));
+    }
+    /* What the image gives back of a discard: whole chunks, and nothing
+     * of less -- what the guest is told to align its discards to, so
+     * that its long ones are split on a chunk's edge. A block where it
+     * gives back nothing at all. */
+    let discard_sectors = u32::try_from(image.discard_unit() / blk::SECTOR).ok().filter(|&s| s != 0)
+        .unwrap_or(blk::DISCARD_ALIGNMENT);
+    Ok(Served { queue: Arc::new(queue), size, discard_sectors, discards: true, writes_zeroes: true,
+                block_size: blk::SECTOR as u32, claim: Some(claim) })
+}
+
+/// The device `word` names -- by its id, or for `hv boot` and a start with
+/// a kernel its name -- held as a disk: claimed in the block layer for
+/// `runner`'s guest, whether it writes it or not, so that nothing else does
+/// meanwhile -- no mount, disk log or other guest, nor anything overlapping
+/// it -- and refused outright where the machine's firmware boots from it.
+fn open_device(word: &str, read_only: bool, runner: &Runner) -> Result<Served, String> {
+    let disk = crate::devices::find(word)?;
+    if let Some(what) = disk.kind().boots_the_machine() {
+        return Err(alloc::format!("{} ({}) is {}: the machine boots from it, and no guest is given it", word,
+                                  disk.name(), what));
+    }
+    let ss = disk.sector_size();
+    if ss != blk::SECTOR && ss != 4096 {
+        return Err(alloc::format!("{} ({}) has sectors of {} bytes: a guest's disk is given 512 or 4096", word,
+                                  disk.name(), ss));
+    }
+    let name = disk.name();
+    let discards = !read_only && disk.can_discard();
+    let queue = disk.into_queue(!read_only, &runner.owner, blk::IN_FLIGHT, blk::REQUEST_BYTES).map_err(|e| match e {
+        QueueError::Held(by) => alloc::format!("{} ({}) is in use by {}", word, name, by),
+        QueueError::Refused => alloc::format!("{} ({}): no memory for its queue, or every queue is taken", word, name),
+    })?;
+    let size = queue.size();
+    if size == 0 {
+        return Err(alloc::format!("{} ({}): not a sector long", word, name));
+    }
+    Ok(Served { queue: Arc::new(queue), size, discard_sectors: blk::DISCARD_ALIGNMENT.max((ss / blk::SECTOR) as u32),
+                discards, writes_zeroes: false, block_size: ss as u32, claim: None })
+}
+
+impl blk::Backend for QueuedDisk {
     fn size(&self) -> u64 {
         self.size
     }
@@ -312,6 +471,18 @@ impl blk::Backend for FileDisk {
 
     fn discard_sectors(&self) -> u32 {
         self.discard_sectors
+    }
+
+    fn discards(&self) -> bool {
+        self.discards
+    }
+
+    fn writes_zeroes(&self) -> bool {
+        self.writes_zeroes
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
     }
 
     fn with_buffer(&mut self, slot: usize, use_it: &mut dyn FnMut(&mut [u8]) -> bool) -> bool {
@@ -340,7 +511,7 @@ impl blk::Backend for FileDisk {
     }
 }
 
-impl Drop for FileDisk {
+impl Drop for QueuedDisk {
     fn drop(&mut self) {
         self.pipe.requests.lock().stop = true;
         self.queue.wake();
@@ -418,7 +589,7 @@ fn serve(start: Serve) {
                     if core::mem::take(&mut owed) {
                         queue.kick();
                     }
-                    let ok = serve_one(queue.image(), &mut req);
+                    let ok = serve_one(&*queue, &mut req);
                     hv::tp::disk_done(disk, slot, op, DiskHow::Command, ok);
                     finished.push(req);
                 }
@@ -427,7 +598,7 @@ fn serve(start: Serve) {
         if owed {
             queue.kick();
         }
-        queue.reap(|slot, ok| match flying.get_mut(slot).and_then(Option::take) {
+        queue.reap(&mut |slot, ok| match flying.get_mut(slot).and_then(Option::take) {
             Some(mut req) => {
                 req.done(ok);
                 hv::tp::disk_done(disk, slot, req.op(), DiskHow::Async, ok);
@@ -465,16 +636,15 @@ fn serve(start: Serve) {
     }
 }
 
-/// A request that is not a read or a write, through the image: whether it
-/// went well.
-fn serve_one(image: &Image, req: &mut Request) -> bool {
+/// A request that is not a read or a write, through the file or the device:
+/// whether it went well.
+fn serve_one(media: &dyn Media, req: &mut Request) -> bool {
     let ok = match req.op() {
         /* Never here: the queue's. */
         Op::Read | Op::Write => false,
-        Op::Flush => image.sync().is_ok(),
-        /* Each range's whole chunks given back, as a discard asks */
-        Op::Discard => req.ranges().all(|r| image.discard(r.offset, r.len).is_ok()),
-        Op::WriteZeroes => req.ranges().all(|r| image.write_zeroes(r.offset, r.len, r.unmap).is_ok()),
+        Op::Flush => media.flush(),
+        Op::Discard => req.ranges().all(|r| media.discard(r.offset, r.len)),
+        Op::WriteZeroes => req.ranges().all(|r| media.write_zeroes(r.offset, r.len, r.unmap)),
     };
     req.done(ok);
     ok
