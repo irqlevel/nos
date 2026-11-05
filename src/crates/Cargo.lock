@@ -604,6 +604,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-ipcnet"
+version = "0.1.0"
+dependencies = [
+ "conf",
+ "ipcwire",
+ "kcore",
+ "kmod",
+ "tls",
+ "web",
+ "zeroize",
+]
+
+[[package]]
 name = "mod-modtest"
 version = "0.1.0"
 dependencies = [

@@ -207,6 +207,7 @@ swallowing panic messages whole.
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
+| `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `scripts/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`block/src/table.rs`, the NVMe's identity), the claims and their holders, `block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hv/src/devices.rs`, a device disk in `modules/hv/src/disk.rs`, the pour onto a device |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
@@ -558,6 +559,39 @@ disk's. It is the only test of `submit`/`kick`, of frames kept across calls
 for the disk to DMA into, and of `kcore`'s module-facing `block` and `net`.
 x86-64 runs under KVM unless `--tcg`; `--arch aarch64` is the one that runs
 on a Mac. See [netblk](netblk.md#using-it).
+
+### `ipc-test.py` -- the channel between hosts, three kernels on a LAN
+
+Three nos, `a`, `b` and `c`, each with ipcnet.ko and a key the test made
+with openssl, on the LAN of `scripts/hub.py`: a learning switch over QEMU's
+`-netdev dgram`, which answers each VM's DHCP with 10.9.0.<n>, relays the
+test's UDP shell to it from 10.9.0.253 -- past the impairments, which are
+the VMs' between themselves -- and drops, delays, jitters and cuts between
+any two. `a` and `b` pin each other; `a` pins `c` by a key `c` does not have,
+and `c` holds `b`'s key, pinning `a`; `b` pins `a` alone. kernel.echo runs
+on each, a `Cluster` name, and `ipc ping` is what goes between them:
+
+- both up, said in the log; 200 small pings each way, eight in flight, and
+  sixteen of a megabyte by the bulk connection -- every answer the bytes
+  sent, in the order sent; the links' 20 ms floor in `tcpstat`;
+- a name nobody has there bounced back (`Gone`), and messages past the
+  echo's mailbox (`Full`), every other one answered whole;
+- under 5% loss and a jittered delay, every message and every megabyte
+  answered whole and in order, the retransmissions counted;
+- the link cut: both hosts lose each other within 3 s and a margin, and a
+  ping running across it ends with its monitor's Down; healed, up and
+  talking again;
+- `c`, whose key is not the one pinned for it, never up -- its handshake
+  refused by `a`, which dials it -- and its SYNs to `b`'s port, where it is a
+  stranger, dropped and counted with no slot taken;
+- `rmmod ipcnet` on `a` under `b`'s traffic: prompt, `b`'s ping ending with
+  its Down, `b` having `a` down, `a` with no router; loaded again, up and
+  talking.
+
+What it does not reach yet: three hosts' traffic at once, a peer at its
+limits slowed while another goes on, and the measurements -- a round trip
+of a small message is some 7 ms at the median, which is the links'
+polling, not the network (docs/ipc.md).
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 
