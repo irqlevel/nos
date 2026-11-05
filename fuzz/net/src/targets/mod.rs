@@ -54,6 +54,13 @@ pub fn check_tcp_timer() {
     let late = 2 * crate::machine::sched::TICK / 1_000_000 + 1;
     for i in 0..net::tcp::MAX_CONNECTIONS {
         if let Some(c) = net::tcp::TCP.snapshot(i) {
+            /* Its timeout held to its floor, and the floor to what a
+             * connection may be given (`set_rto_floor`) */
+            invariant!((net::tcp::LINK_MIN_RTO_MS..=net::tcp::MIN_RTO_MS).contains(&c.min_rto_ms),
+                       "TCP slot {} has a floor of {} ms for its timeout", i, c.min_rto_ms);
+            invariant!((c.min_rto_ms..=net::tcp::MAX_RTO_MS).contains(&c.rto_ms), "TCP slot {} ({}, port {} -> {}): \
+                       its timeout is {} ms, its floor {} ms", i, c.state.name(), c.local_port, c.remote_port,
+                       c.rto_ms, c.min_rto_ms);
             if c.retransmit_at != 0 && c.state != net::tcp::State::Closed {
                 invariant!(now_ms <= c.retransmit_at + late, "TCP slot {} ({}, port {} -> {}): its retransmission was \
                            due at {} ms and is still not looked at, at {} ms", i, c.state.name(), c.local_port,

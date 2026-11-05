@@ -9,6 +9,12 @@
 //! accepts has its buffers grown as it is taken, what had arrived moved
 //! across, and scales its window when the peer's SYN offers to.
 //!
+//! Some connections are links of the kind ipcnet's are, given a floor
+//! of their own for their retransmission timeout (`set_rto_floor`) --
+//! mostly the 20 ms a link to another nos is given, under the timer's 200
+//! ms sweep, so a retransmission the timer is not woken for is late by
+//! most of a sweep and seen (`check_tcp_timer`).
+//!
 //! What the machine's programs are handed by `recv` must be the peer's
 //! stream, byte for byte and in order, and end only where the peer ended
 //! it; what the peer is handed must be the programs'. Segments the attacker
@@ -18,7 +24,8 @@
 
 use std::collections::BTreeMap;
 
-use net::tcp::{Buffers, Conn, Receive, ALLOW_MAX, LISTEN_BACKLOG, RST_BURST, RST_INTERVAL_US, TCP};
+use net::tcp::{Buffers, Conn, Receive, ALLOW_MAX, LINK_MIN_RTO_MS, LISTEN_BACKLOG, MIN_RTO_MS, RST_BURST,
+               RST_INTERVAL_US, TCP};
 use netwire::{icmp, tcp as seg, IP_PROTO_ICMP, IP_PROTO_TCP};
 
 use crate::input::noise;
@@ -170,6 +177,9 @@ struct Link2 {
     /// quiet, an ICMP error named it, the link lost a lot.
     fragile: bool,
     call: Option<Call>,
+    /// The floor its program gives its timeout once it has the
+    /// connection, if it gives one -- what it asks, taken or refused.
+    floor: Option<u64>,
 }
 
 struct State {
@@ -187,6 +197,17 @@ struct State {
     lossy: bool,
     /// eth1, when the input registered it.
     guest: Option<net::Nic>,
+}
+
+/// The floor a program asks for its connection's timeout, if it asks:
+/// mostly a link's 20 ms, now and then any other -- out of the range a
+/// floor may be too.
+fn floor(r: &mut Input) -> Option<u64> {
+    match r.u8() % 4 {
+        0 | 1 => None,
+        2 => Some(LINK_MIN_RTO_MS),
+        _ => Some(r.pick(&[LINK_MIN_RTO_MS, 30, 50, 100, MIN_RTO_MS, 0, 1, 19, 201, 8000, u64::MAX])),
+    }
 }
 
 fn conn_word(c: &'static Conn) -> usize {
@@ -309,8 +330,9 @@ impl State {
         let ip = self.peer_ip;
         let app = App::spawn("connect", r.below(4) as u32,
                              move || TCP.connect(&nic, ip, port, 0, receive).map(conn_word));
+        let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
-                                fragile: self.lossy, call: Some(Call::Connect(app)) });
+                                fragile: self.lossy, call: Some(Call::Connect(app)), floor });
     }
 
     fn peer_connect(&mut self, r: &mut Input) {
@@ -338,8 +360,9 @@ impl State {
         let window = r.pick(&[8192u32, 65535, 1024, 0, 600, 262_144, 1 << 20]);
         let s = iss(r);
         self.w.peers.tcp.connect(&mut self.w.net, id, port, ETH0_IP, mport, s, opts, window);
+        let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
-                                fragile: self.lossy, call: None });
+                                fragile: self.lossy, call: None, floor });
     }
 
     fn accept(&mut self, r: &mut Input) {
@@ -428,6 +451,7 @@ impl State {
                         let tainted = self.w.peers.tcp.eps.iter().any(|e| e.tainted);
                         invariant!(tainted || e.is_some(), "connection {} connected to a port nobody answered on", k);
                         self.links[k].conn = Some(conn_of(word));
+                        self.give_floor(k, true);
                     }
                     Some(None) => self.links[k].done = true,
                 },
@@ -473,6 +497,36 @@ impl State {
         });
         invariant!(ok, "accepted connection {} before the peer had the machine's SYN-ACK", k);
         self.links[k].conn = Some(c);
+        self.give_floor(k, true);
+    }
+
+    /// The floor link `k`'s program asks for, asked: taken for a value
+    /// from a link's 20 ms to the 200 every connection starts with, and
+    /// then the connection's -- refused for any other, which leaves the
+    /// connection's as it was. A connection the program has just been
+    /// given has the 200 every one starts with, whatever its slot's last
+    /// connection had.
+    fn give_floor(&mut self, k: usize, first: bool) {
+        let Some(c) = self.links[k].conn else { return };
+        let before = self.slot(k).map(|s| s.min_rto_ms);
+        if first {
+            invariant!(before.is_none_or(|b| b == MIN_RTO_MS), "connection {} starts with a floor of {:?} ms for \
+                       its timeout", k, before);
+        }
+        let Some(ms) = self.links[k].floor else { return };
+        let taken = TCP.set_rto_floor(c, ms);
+        let valid = (LINK_MIN_RTO_MS..=MIN_RTO_MS).contains(&ms);
+        invariant!(taken == valid, "set_rto_floor answered {} for {} ms", taken, ms);
+        if taken {
+            crate::common::runner::reached("tcp: a connection given a floor of its own");
+        }
+        let after = self.slot(k).map(|s| s.min_rto_ms);
+        let want = if taken { Some(ms) } else { before };
+        invariant!(after == want, "connection {}'s floor is {:?} ms after set_rto_floor({}) answered {}, {:?} before",
+                   k, after, ms, taken, before);
+        if !taken {
+            self.links[k].floor = None;
+        }
     }
 
     fn received(&mut self, k: usize, n: isize, data: &[u8]) {
@@ -812,7 +866,7 @@ pub fn tcp(r: &mut Input) {
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
                          next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest };
 
-    while let Some(op) = r.op(23) {
+    while let Some(op) = r.op(24) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
         let some = !st.links.is_empty();
         match op {
@@ -903,6 +957,15 @@ pub fn tcp(r: &mut Input) {
             18 => st.stranger(r),
             19 if r.u8() < 24 => st.flood(r),
             20 => st.set_allow(r),
+            21 => {
+                /* A program gives its connection another floor, mid-way */
+                if let Some(l) = st.links.get_mut(k) {
+                    if l.conn.is_some() && !l.done {
+                        l.floor = floor(r);
+                        st.give_floor(k, false);
+                    }
+                }
+            }
             _ => {
                 /* Time: mostly a little, now and then long enough for a
                  * timer to run out -- a connect's, TIME-WAIT, the

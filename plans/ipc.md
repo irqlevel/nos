@@ -456,8 +456,10 @@ of the router -- `remote.rs`: the peers' numbers and epochs, what is routed
 and its head (`ipcwire::route`), `deliver_remote`'s answer rule, monitors of
 peers' mailboxes and `HostLost`, the router's close -- for the image's tasks
 and through the C ABI for a module (`kcore::ipc`), held by the fuzz model
-and a self-test at every boot. Next: the TCP ABI for a module (the
-allowlist, the link's RTO floor), then the module.
+and a self-test at every boot; and the TCP ABI a module needs for it
+(`kcore::tcp`: `TcpListener::bind_allowed` and `set_allowed`, T3's
+allowlist, and `TcpStream::set_rto_floor`, the link's 20 ms, T2). Next:
+the module.
 
 ## Limits of the first version
 
