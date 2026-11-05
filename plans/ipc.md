@@ -386,6 +386,70 @@ under another name refused; a `Host` name unreachable from a peer; order;
 within 3 s of a host's QEMU killed; `rmmod ipcnet` under traffic. TLS's cost
 measured on the EX44 and the AX41.
 
+### How I4 is built (a design to confirm before it is)
+
+Written after I1 and I3, from what the channel turned out to be. The
+pieces, in the order they are to be built and gated:
+
+- **A peer's number.** ipcnet gives each peer it pins a number of this
+  host's own, 1 and up (`Addr.host`); 0 is this host, as in I1. An address
+  with a peer's number is a mailbox there, as this host knows it. On the
+  wire an address is always the host's that owns it -- host 0 -- and
+  ipcnet rewrites: a `to` going out loses its number, a `from` coming in
+  gets the sender's. So no host's numbering ever leaves it, and a peer
+  renumbered after a reboot breaks nothing but the addresses held of it,
+  which its `HostLost` ended anyway.
+- **The router** (ipc crate). `ipc::route(&mailbox)` makes one mailbox --
+  ipcnet's -- the router; there is one or none. A send to an address with a
+  peer's number, or to `name@host` (the host's name as ipcnet pinned it),
+  goes into the router's mailbox as a message of the channel's own tag
+  (`TAG_ROUTE`) whose payload begins with where it is going and who sent it.
+  The router's limits are the host's cap on what waits to go out: `Full` at
+  the send, as the plan says. With no router, `NoRoute`, as now.
+- **What comes in** (ipc crate). `ipc::deliver_remote(&router, from, to,
+  tag, reference, payload)`, the router's call alone, delivers to a
+  `Cluster` name, or to a mailbox that has sent to `from`'s host: the
+  channel keeps, for each peer, the mailboxes that sent there -- bounded,
+  dropped when a mailbox closes or the peer is lost. Anything else is
+  refused and counted, never delivered: a `Host` name is unreachable from
+  outside. A full mailbox is `Full` to the router, which sends a `Bounced`
+  back.
+- **Monitors across hosts** (ipc crate and ipcnet). A monitor of an
+  address on a peer is kept, with its `Down` made and its place kept, on
+  the watcher's host, as every monitor is; the channel tells the router
+  (`TAG_ROUTE` again), which asks the peer to watch. The peer's router
+  monitors the mailbox with a monitor of its own and sends `Down` back when
+  it goes; `ipc::remote_down(&router, host, id, reason)` hands over the
+  kept `Down`. `ipc::host_lost(&router, host)` ends every monitor of an
+  address there with `HostLost` -- on the watcher's host alone, so it needs
+  nothing from a host that is gone -- clears that peer's sent-to set, and
+  tells the watchers of `host.<name>` (`HostDown`; `HostUp` when it is back).
+- **The wire** (`ipcwire`, no kernel, no `unsafe`): frames of an 8-byte
+  head -- kind, flags, length -- and at most 16 KiB in all. `Hello` (the
+  version, the cluster's id, both names; first, after TLS), `Ping`/`Pong`
+  (500 ms), `Head` (a message: its number on this connection, `to` -- an
+  address or a name -- `from`, tag, reference, length up to 1 MiB) and
+  `Body` (its bytes, a frame at a time, other messages' frames between),
+  `Bounced`, `Monitor`, `Demonitor`, `Down`. The decoder takes bytes as they
+  come and gives frames whole, every length checked before anything is
+  kept; the assembler puts messages back together, a bounded number at once
+  and a bounded number of bytes, and refuses a frame of a message it has
+  not been told the head of. Fuzzed on the host: anything decodes or is
+  refused, never a panic; whatever is encoded decodes to itself.
+- **The module** (`modules/ipcnet`): the host key and certificate made at
+  its first start (`web::x509`), hosts.toml read with `conf`, a listener on
+  39240 with the peers' addresses as its allowlist (T3's `listen_allowed`,
+  given a C ABI then), a task a connection, the host whose name sorts first
+  connecting -- with the 20 ms RTO floor, the other half of T2, given to its
+  connections alone -- two connections a peer, the `Hello`, heartbeats and
+  the 3 s loss, `Bounced`, the shell's `ipc host` commands and `ipc hosts`.
+- **Its gates**: net-fuzz's `ipcnet` target and `ipc-test.py` on
+  `scripts/hub.py`, as the step says.
+
+The wire is written (branch `ipc-raft`): `ipcwire`, fuzzed by
+`ipc-fuzz.py --target wire`. The rest waits for this design to be
+confirmed.
+
 ## Limits of the first version
 
 - Copies: a payload is copied in and out, and into TLS records between

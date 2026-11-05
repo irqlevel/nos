@@ -13,6 +13,7 @@ edition = "2021"
 ffi = { path = "../../src/crates/ffi" }
 kcore = { path = "../../src/crates/kcore" }
 ipc = { path = "../../src/crates/ipc" }
+ipcwire = { path = "../../src/crates/ipcwire" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.

@@ -22,7 +22,10 @@ use crate::{reached, Input, Target};
 use ffi::ipc as abi;
 use ipc::{Addr, Error, Limits, Mailbox, Payload, Reason, Scope, To};
 
-pub static ALL: &[Target] = &[Target { name: "ipc", run: run, max_len: 4096, gate: 6000 }];
+pub static ALL: &[Target] = &[
+    Target { name: "ipc", run: run, max_len: 4096, gate: 6000 },
+    Target { name: "wire", run: crate::wire::run, max_len: 4096, gate: 20000 },
+];
 
 /// Each step said on stderr, with IPC_FUZZ_SAY set: for a replay.
 static SAY: AtomicBool = AtomicBool::new(false);
