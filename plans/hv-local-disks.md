@@ -99,6 +99,37 @@ growth, no ext4 commits, no flushes of its own. 4k reads and writes a little
 the E-core stays). The fair comparison is KVM on the same partition as a raw
 drive.
 
+## What was measured (EX44, 5 November)
+
+P1-P3 as 21b67b1e. A 15 GiB partition carved for it (p6, `nos-hv-test`, on
+the disk nos's root is not on; the disk log's p5 cut from 16 GiB to 1 GiB
+for the room), the bench's golden image written onto it before each run, the
+suite cut to fio, the kernel build and pgbench; under KVM the partition the
+guest's raw disk (`bench-host.sh kvm-device`), under nos the VM given it by
+its id (`hv create benchdev ... disk=part:<guid> force`), the same CPUs.
+One run each, KVM's first (`bench/vm/results/comparison-device.md`):
+
+| | KVM, the partition | nos, the partition | nos, a file (`dc529775-fio`) |
+|---|---:|---:|---:|
+| first write, 1 MiB QD8 | 4762 MiB/s | 4633 (97%) | 3696 (78%) |
+| 4k reads QD1 / QD32 / 4x16, IOPS | 20.6k / 220k / 240k | 101% / 147% / 152% | 99% / 134% / 140% |
+| 4k writes QD1 / QD32, IOPS | 50.8k / 238k | 90% / 71% | 88% / 67% |
+| 1 MiB reads / writes QD8 | 2185 / 4867 MiB/s | 100% / 95% | 99% / 96% |
+| 4k writes, an fdatasync each | 634 IOPS | 120% | 115% |
+| kernel build, make -j4 | 318 s | 320 s (99%) | -- |
+| pgbench rw c1 / c16, tps | 423 / 4679 | 161% / 111% | -- |
+
+KVM on the partition is faster than KVM on a file of nos's root (31
+October): 4k writes 128% and 134%, 1 MiB reads 150% and writes 132% -- so the
+partition's reference is higher than the file's. Against it nos's first write
+is at 97% where a file's was at 78-80%; its 4k writes at QD32 at 71%, where
+KVM gained a third from the partition and nos 5% (168.7k IOPS against a
+file's 160.1k): the row to look at next, with a trace window, before reading
+anything into it from one run. On the real machine `disks` gave both
+Samsungs their model and serial and every partition its GUID, `hv devices`
+told the EFI System partitions, Ubuntu's md members, nos's root and the disk
+log apart, and the VM held p6 for the 36 minutes it ran.
+
 ## Limits of the first version
 
 Devices are those nos found at boot; one VM a device, read-only or not; the

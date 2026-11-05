@@ -24,6 +24,15 @@
 #   bench-host.sh nos-stage [step...]
 #                            a fresh copy and its vm.toml onto nos's root, the
 #                            kit's guest/run.sh in it, cut to the steps named
+#   bench-host.sh device-stage <device> [step...]
+#                            the same onto a partition or a disk of its own
+#                            (/dev/disk/by-partuuid/...), given back whole
+#                            first so that what is past the image reads as
+#                            nothing -- the disk of both runs of the device's
+#                            comparison, nos's guest given it by its id
+#   bench-host.sh kvm-device <device>
+#                            the suite under KVM, the device the guest's disk
+#                            as it is: results-kvm-device
 #
 # Each prints what it did; the caller runs it detached and reads its exit
 # status from a file (the Mac's ssh path cuts a quiet session).
@@ -214,16 +223,25 @@ arm() {
     sha256sum golden.raw | tee golden.sha256
 }
 
+# kvm [device]: the suite under KVM, on a fresh copy on nos's root -- or on
+# the device, staged already by device-stage
 kvm() {
     cd $W
-    mount_nosroot
-    local D=$MNT/vms/bench-kvm R=$W/results-kvm pid c0 c1 c2 c3 cio rest t0 t1
-    step "a fresh copy on nos's root: $D/disk.raw"
-    mkdir -p $D
-    rm -f $D/disk.raw
-    cp --sparse=always golden.raw $D/disk.raw
-    sync
-    ls -ls $D/disk.raw
+    local D=$MNT/vms/bench-kvm R=$W/results-kvm DISK=${1:-} pid c0 c1 c2 c3 cio rest t0 t1
+    if [ -n "$DISK" ]; then
+        R=$W/results-kvm-device
+        device_free "$DISK"
+        step "the guest's disk: $DISK ($(readlink -f "$DISK"), $(blockdev --getsize64 "$DISK") bytes)"
+    else
+        mount_nosroot
+        step "a fresh copy on nos's root: $D/disk.raw"
+        mkdir -p $D
+        rm -f $D/disk.raw
+        cp --sparse=always golden.raw $D/disk.raw
+        sync
+        ls -ls $D/disk.raw
+        DISK=$D/disk.raw
+    fi
     step "8 GiB of 2 MiB pages, as nos's huge pool gives a guest"
     echo 4352 > /proc/sys/vm/nr_hugepages
     grep -E 'HugePages_(Total|Free)' /proc/meminfo
@@ -241,7 +259,7 @@ kvm() {
         -machine q35,accel=kvm,memory-backend=ram0 -cpu host -smp 4,sockets=1,cores=2,threads=2 -m 8192 \
         -object memory-backend-file,id=ram0,size=8G,mem-path=/dev/hugepages,prealloc=on \
         -object iothread,id=io0 \
-        -drive file=$D/disk.raw,format=raw,if=none,id=vd0,cache=none,aio=native,discard=unmap \
+        -drive file=$DISK,format=raw,if=none,id=vd0,cache=none,aio=native,discard=unmap \
         -device virtio-blk-pci,drive=vd0,iothread=io0 \
         -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0 \
         -display none -vga none -serial file:$W/kvm-console.log -monitor none -no-reboot \
@@ -308,6 +326,37 @@ suite_into() {
     losetup -d "$loop"
 }
 
+# device_free <device>: a block device nothing on this machine uses --
+# not mounted, not swap, not under an array or a mapping -- and big enough
+# for golden.raw, or the step stops here
+device_free() {
+    local dev real name
+    dev=$1
+    [ -b "$dev" ] || { echo "$dev is no block device"; return 1; }
+    real=$(readlink -f "$dev")
+    name=$(basename "$real")
+    [ -z "$(lsblk -no MOUNTPOINTS "$real" | tr -d '[:space:]')" ] || { echo "$real is mounted"; return 1; }
+    ! grep -q "^$real " /proc/swaps || { echo "$real is swap"; return 1; }
+    [ -z "$(ls /sys/class/block/$name/holders)" ] || { echo "$real is held: $(ls /sys/class/block/$name/holders)"; return 1; }
+    [ "$(blockdev --getsize64 "$real")" -ge "$(stat -c %s $W/golden.raw)" ] || { echo "$real is smaller than golden.raw"; return 1; }
+}
+
+# device_stage <device> [step...]: golden.raw onto the device, every byte of
+# it -- a device reads as what was last there, not as a hole -- and the rest
+# of the device given back, the suite in it cut to the steps named
+device_stage() {
+    cd $W
+    local dev=${1:?"device-stage: a device, /dev/disk/by-partuuid/..."}
+    shift
+    device_free "$dev"
+    step "$dev given back whole, then golden.raw onto it"
+    blkdiscard -f "$dev"
+    dd if=golden.raw of="$dev" bs=4M oflag=direct conv=fsync status=none
+    cmp -n "$(stat -c %s golden.raw)" golden.raw "$dev" && echo "the device holds golden.raw byte for byte"
+    suite_into "$dev" "$@"
+    sync
+}
+
 nos_stage() {
     cd $W
     mount_nosroot
@@ -341,6 +390,8 @@ case "${1:-}" in
     check) check ;;
     arm) arm ;;
     kvm) kvm ;;
+    kvm-device) kvm "${2:?"kvm-device: a device"}" ;;
     nos-stage) shift; nos_stage "$@" ;;
-    *) echo "usage: $0 info|prep|check|arm|kvm|nos-stage" >&2; exit 2 ;;
+    device-stage) shift; device_stage "$@" ;;
+    *) echo "usage: $0 info|prep|check|arm|kvm|kvm-device <device>|nos-stage|device-stage <device>" >&2; exit 2 ;;
 esac
