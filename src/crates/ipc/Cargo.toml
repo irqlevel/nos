@@ -1,0 +1,15 @@
+[package]
+name = "ipc"
+version = "0.1.0"
+edition = "2021"
+
+# The kernel's message channel, in the image: mailboxes with addresses and
+# names in the host's namespace, messages between them, monitors that say
+# when a peer is gone and watches that say when a name comes and goes --
+# for the image's tasks through the crate, and for modules through the C
+# ABI (ffi/src/ipc.rs, kcore::ipc). plans/ipc.md, docs/ipc.md.
+[lib]
+
+[dependencies]
+ffi = { path = "../ffi" }
+kcore = { path = "../kcore" }

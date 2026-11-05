@@ -1,0 +1,26 @@
+# The kernel's message channel fuzzed on the host: the `ipc` crate as it is,
+# over `kcore` and `ffi` as they are, linked into a host program that is the
+# rest of the kernel -- the C++ half the `ffi` crate declares (fuzz/common):
+# its tasks one at a time, its mutexes and events, the lock rules checked.
+# scripts/ipc-fuzz.py builds and runs it.
+[package]
+name = "ipc-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The kernel's crates, built for the host as they are for the kernel.
+ffi = { path = "../../src/crates/ffi" }
+kcore = { path = "../../src/crates/kcore" }
+ipc = { path = "../../src/crates/ipc" }
+
+# What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
+# a wrap, and core's checks of its own unsafe preconditions are made.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+# Line tables, for a replay's backtrace.
+debug = "line-tables-only"
+
+[workspace]
