@@ -9,11 +9,13 @@
 use crate::{close, demonitor, handle, list, lookup, monitor, open, owner_at, register, send, unwatch, wait, watch,
             Addr, Error, Limits, Mbox, Payload, Reason, Scope, Taken, To, MAX_PAYLOAD, NAME_MAX, OWNER_NAME_MAX};
 use alloc::sync::Arc;
-use ffi::ipc::{IpcHeader, IpcName, IPC_NAME_MAX, IPC_RECV_CLOSED, IPC_RECV_NONE, IPC_RECV_TOO_SMALL,
+use ffi::ipc::{IpcHeader, IpcName, IPC_NAME_MAX, IPC_OK, IPC_RECV_CLOSED, IPC_RECV_NONE, IPC_RECV_TOO_SMALL,
                IPC_SCOPE_CLUSTER, IPC_SCOPE_HOST};
 use kcore::time::Duration;
 
 const _: () = assert!(NAME_MAX == IPC_NAME_MAX, "a name's bytes, the crate's and the ABI's");
+const _: () = assert!(ffi::ipc::IPC_REMOTE_NAME_MAX == NAME_MAX + 1 + crate::remote::HOST_NAME_MAX,
+                      "a name with its host, the crate's and the ABI's");
 
 /// The halt's part, after the modules are unloaded: no mailbox is made and
 /// no message sent from here on.
@@ -129,7 +131,8 @@ pub unsafe extern "C" fn kernel_ipc_send(mbox: u64, to: u64, name: *const u8, na
     let target = if name_len == 0 {
         To::Addr(Addr::from_u64(to))
     } else {
-        match unsafe { text(name, name_len, IPC_NAME_MAX) } {
+        /* A name, or `name@host` on a peer */
+        match unsafe { text(name, name_len, ffi::ipc::IPC_REMOTE_NAME_MAX) } {
             Some(n) => To::Name(n),
             None => return Error::Invalid.code(),
         }
@@ -239,4 +242,88 @@ pub unsafe extern "C" fn kernel_ipc_list(prefix: *const u8, len: usize, out: *mu
         n += 1;
     }
     n
+}
+
+/* ---- the router's: ipcnet's ---- */
+
+#[no_mangle]
+pub extern "C" fn kernel_ipc_route(mbox: u64) -> i32 {
+    let Some(m) = module_box(mbox) else { return Error::Gone.code() };
+    match crate::remote::route(&m) {
+        Ok(()) => IPC_OK,
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// `name` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_ipc_peer_up(router: u64, name: *const u8, len: usize) -> u32 {
+    let Some(m) = module_box(router) else { return 0 };
+    if name.is_null() || len == 0 || len > crate::remote::HOST_NAME_MAX {
+        return 0;
+    }
+    // SAFETY: the caller's `len` bytes at `name`.
+    let bytes = unsafe { core::slice::from_raw_parts(name, len) };
+    let Ok(name) = core::str::from_utf8(bytes) else { return 0 };
+    crate::remote::peer_up(&m, name).map_or(0, u32::from)
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_ipc_peer_lost(router: u64, peer: u32) -> i32 {
+    let Some(m) = module_box(router) else { return Error::Gone.code() };
+    let Ok(host) = u16::try_from(peer) else { return Error::Invalid.code() };
+    match crate::remote::peer_lost(&m, host) {
+        Ok(()) => IPC_OK,
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// `name` points at `name_len` readable bytes when `name_len` is past 0,
+/// and `data` at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_ipc_deliver_remote(router: u64, peer: u32, from: u64, to: u64, name: *const u8,
+                                                   name_len: usize, tag: u32, reference: u64, data: *const u8,
+                                                   len: usize) -> i32 {
+    let Some(m) = module_box(router) else { return Error::Gone.code() };
+    let Ok(host) = u16::try_from(peer) else { return Error::Invalid.code() };
+    if len > crate::MAX_PAYLOAD || (len > 0 && data.is_null()) || name_len > crate::NAME_MAX
+        || (name_len > 0 && name.is_null()) {
+        return Error::Invalid.code();
+    }
+    let to = if name_len > 0 {
+        // SAFETY: the caller's `name_len` bytes at `name`.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        match core::str::from_utf8(bytes) {
+            Ok(n) if crate::valid_name(n) => crate::remote::RemoteTo::Name(n),
+            _ => return Error::Invalid.code(),
+        }
+    } else {
+        crate::remote::RemoteTo::Addr(Addr::from_u64(to))
+    };
+    let payload = if len == 0 {
+        Payload::empty()
+    } else {
+        // SAFETY: the caller's `len` bytes at `data`.
+        match Payload::from_slice(unsafe { core::slice::from_raw_parts(data, len) }) {
+            Ok(p) => p,
+            Err(e) => return e.code(),
+        }
+    };
+    match crate::remote::deliver_remote(&m, host, from, to, tag, reference, payload) {
+        Ok(()) => IPC_OK,
+        Err(e) => e.code(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_ipc_remote_down(router: u64, peer: u32, id: u64, reason: u32) -> i32 {
+    let Some(m) = module_box(router) else { return Error::Gone.code() };
+    let Ok(host) = u16::try_from(peer) else { return Error::Invalid.code() };
+    let Some(reason) = Reason::from_u32(reason) else { return Error::Invalid.code() };
+    match crate::remote::remote_down(&m, host, id, reason) {
+        Ok(()) => IPC_OK,
+        Err(e) => e.code(),
+    }
 }

@@ -57,6 +57,10 @@ impl core::fmt::Display for Addr {
     }
 }
 
+/// What the router's messages for other hosts are tagged: their data begins
+/// with ipcwire's route head.
+pub const TAG_ROUTE: u32 = ipc::IPC_TAG_ROUTE;
+
 /// Why something was refused (ipc's `Error`, by its code).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -235,7 +239,8 @@ impl Mailbox {
         })
     }
 
-    /// `data` to the mailbox `name` names on this host.
+    /// `data` to the mailbox `name` names on this host -- or, as
+    /// `name@host`, on a peer.
     pub fn send_to(&self, name: &str, tag: u32, reference: u64, data: &[u8]) -> Result<(), Error> {
         if name.is_empty() {
             return Err(Error::Invalid);
@@ -320,6 +325,62 @@ impl Mailbox {
     /// A reference for a request of this mailbox's, no other of its own.
     pub fn next_reference(&self) -> u64 {
         self.references.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /* ---- the router's: what carries messages to other hosts (ipcnet) ---- */
+
+    /// This mailbox made the router, one at a time, until it closes: what
+    /// is sent to a peer's address, or to `name@host`, comes here tagged
+    /// `TAG_ROUTE`, its data ipcwire's route head and then the message's own.
+    pub fn route(&self) -> Result<(), Error> {
+        Error::from_code(ipc::kernel_ipc_route(self.addr))
+    }
+
+    /// The peer `name` up: its number, the host part of its mailboxes'
+    /// addresses here -- the same while it stays up, another once lost.
+    pub fn peer_up(&self, name: &str) -> Result<u16, Error> {
+        if name.is_empty() {
+            return Err(Error::Invalid);
+        }
+        /* `name` is its length's bytes */
+        let n = unsafe { ipc::kernel_ipc_peer_up(self.addr, name.as_ptr(), name.len()) };
+        u16::try_from(n).ok().filter(|&n| n != 0).ok_or(Error::Refused)
+    }
+
+    /// The peer `peer` lost: every monitor of an address there gets its
+    /// Down, HostLost.
+    pub fn peer_lost(&self, peer: u16) -> Result<(), Error> {
+        Error::from_code(ipc::kernel_ipc_peer_lost(self.addr, u32::from(peer)))
+    }
+
+    /// What the peer `peer` said -- from its mailbox `from`, the peer's own
+    /// address of it -- delivered here: to `to` (an address here, host 0),
+    /// or to the `Cluster` name `name` when one is given. `NotYours` for
+    /// anything a peer may not reach.
+    pub fn deliver_remote(&self, peer: u16, from: u64, to: Addr, name: Option<&str>, tag: u32, reference: u64,
+                          data: &[u8]) -> Result<(), Error> {
+        let (np, nl) = match name {
+            Some("") => return Err(Error::Invalid),
+            Some(n) => (n.as_ptr(), n.len()),
+            None => (core::ptr::null(), 0),
+        };
+        /* The name and `data` are their lengths' bytes */
+        Error::from_code(unsafe {
+            ipc::kernel_ipc_deliver_remote(self.addr, u32::from(peer), from, to.0, np, nl, tag, reference,
+                                           data.as_ptr(), data.len())
+        })
+    }
+
+    /// The peer `peer` says the mailbox the monitor `id` watched has gone.
+    pub fn remote_down(&self, peer: u16, id: u64, reason: Reason) -> Result<(), Error> {
+        let code = match reason {
+            Reason::Closed => ipc::IPC_DOWN_CLOSED,
+            Reason::Unloaded => ipc::IPC_DOWN_UNLOADED,
+            Reason::NoSuch => ipc::IPC_DOWN_NO_SUCH,
+            Reason::HostLost => ipc::IPC_DOWN_HOST_LOST,
+            Reason::Stopped => ipc::IPC_DOWN_STOPPED,
+        };
+        Error::from_code(ipc::kernel_ipc_remote_down(self.addr, u32::from(peer), id, code))
     }
 
     /// A request to `to` and its answer, from this mailbox, which takes

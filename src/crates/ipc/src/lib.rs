@@ -39,8 +39,11 @@ extern crate alloc;
 
 mod abi;
 mod echo;
+mod remote;
 mod selftest;
 mod shell;
+
+pub use remote::{peers, router, valid_host, HOST_PREFIX, MAX_PEERS, MAX_REMOTE_MONITORS, MAX_SENT};
 
 pub use echo::{echo_start, echo_status, echo_stop, EchoStatus, TAG_ECHO_PESTER};
 pub use selftest::selftest;
@@ -100,9 +103,12 @@ pub const TAG_NAME_DOWN: u32 = ffi::ipc::IPC_TAG_NAME_DOWN;
 /// has ended: watch again, and `list` what there is. The reference is the
 /// watch's id.
 pub const TAG_WATCH_LOST: u32 = ffi::ipc::IPC_TAG_WATCH_LOST;
+/// A message for another host, in the router's mailbox: its payload begins
+/// with ipcwire's route head.
+pub const TAG_ROUTE: u32 = ffi::ipc::IPC_TAG_ROUTE;
 
 /// The namespaces only the image registers names under.
-const RESERVED: [&str; 3] = ["kernel", "ipc", "sys"];
+const RESERVED: [&str; 4] = ["kernel", "ipc", "sys", "host"];
 /// A Down's payload: the reason, as a little-endian u32.
 const DOWN_BYTES: usize = 4;
 /// How often a wait for a message looks for a receiver gone wrong.
@@ -328,11 +334,17 @@ impl Payload {
     /// The parts, one after the other, copied: what a message is built of
     /// without putting it together first.
     pub fn gather(parts: &[&[u8]]) -> Result<Payload, Error> {
+        Self::gather_within(parts, MAX_PAYLOAD)
+    }
+
+    /// `gather`, held to `limit` bytes: a message routed to another host is
+    /// its route head and a payload of up to `MAX_PAYLOAD`.
+    pub(crate) fn gather_within(parts: &[&[u8]], limit: usize) -> Result<Payload, Error> {
         let mut len = 0usize;
         for p in parts {
             len = len.checked_add(p.len()).ok_or(Error::TooLarge)?;
         }
-        if len > MAX_PAYLOAD {
+        if len > limit {
             return Err(Error::TooLarge);
         }
         let mut pieces: Vec<Box<[u8]>> = Vec::new();
@@ -489,6 +501,15 @@ struct Stats {
     downs: AtomicU64,
     watch_lost: AtomicU64,
     stray: AtomicU64,
+    /// Messages handed to the router for other hosts
+    routed: AtomicU64,
+    /// From other hosts, delivered here
+    delivered_remote: AtomicU64,
+    /// From other hosts, refused: not a Cluster name, nor a mailbox that
+    /// had sent there
+    refused_remote: AtomicU64,
+    peers_up: AtomicU64,
+    peers_lost: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -500,6 +521,11 @@ static STATS: Stats = Stats {
     downs: AtomicU64::new(0),
     watch_lost: AtomicU64::new(0),
     stray: AtomicU64::new(0),
+    routed: AtomicU64::new(0),
+    delivered_remote: AtomicU64::new(0),
+    refused_remote: AtomicU64::new(0),
+    peers_up: AtomicU64::new(0),
+    peers_lost: AtomicU64::new(0),
 };
 
 fn count(c: &AtomicU64) {
@@ -600,6 +626,12 @@ struct Table {
     watches: Vec<WatchRec>,
     /// Each module's mailboxes' bytes, by their limits.
     owners: Vec<(Owner, usize)>,
+    /// What carries messages to other hosts -- ipcnet's mailbox -- or none.
+    router: Option<Arc<Mbox>>,
+    /// The peers the router has told of, by their numbers' index.
+    peers: Vec<Option<remote::Peer>>,
+    /// Monitors of mailboxes on peers, kept here with their Downs.
+    remote_monitors: Vec<remote::RemoteMonitor>,
     stopped: bool,
 }
 
@@ -614,7 +646,11 @@ fn table() -> Option<&'static Mutex<Table>> {
         names.try_reserve_exact(MAX_NAMES).ok()?;
         let mut watches = Vec::new();
         watches.try_reserve_exact(MAX_WATCHES).ok()?;
-        let table = Mutex::new(Table { slots, names, watches, owners: Vec::new(), stopped: false })?;
+        let mut peers = Vec::new();
+        peers.try_reserve_exact(remote::MAX_PEERS).ok()?;
+        peers.resize_with(remote::MAX_PEERS, || None);
+        let table = Mutex::new(Table { slots, names, watches, owners: Vec::new(), router: None, peers,
+                                       remote_monitors: Vec::new(), stopped: false })?;
         Some(Box::new(table))
     })
 }
@@ -670,10 +706,15 @@ fn namespace(name: &str) -> &str {
 /// Whether `owner` may register `name`: the image under any namespace, a
 /// module only under its own, and never under one the image keeps.
 fn may_register(owner: &Owner, name: &str) -> bool {
+    let ns = namespace(name);
+    /* `host.` is the channel's own, for the peers' coming and going: nobody
+     * names a mailbox under it, so a watch of it says the hosts alone */
+    if ns == "host" {
+        return false;
+    }
     if owner.is_image() {
         return true;
     }
-    let ns = namespace(name);
     !RESERVED.contains(&ns) && ns == owner.namespace()
 }
 
@@ -686,24 +727,44 @@ fn find(addr: Addr) -> Option<Arc<Mbox>> {
     t.slots[usize::from(addr.slot)].mbox.as_ref().filter(|m| m.addr == addr).cloned()
 }
 
+/// Where a message goes: a mailbox here, or the router, for a peer.
+enum Target<'a> {
+    Local(Arc<Mbox>),
+    Remote { router: Arc<Mbox>, host: u16, to: remote::RemoteTo<'a> },
+}
+
 /// Where a message to `to` goes, looked up under one hold of the table's
-/// lock: the halt, another host and a mailbox gone each said.
-fn resolve(to: To) -> Result<Arc<Mbox>, Error> {
+/// lock: the halt, a host nothing reaches and a mailbox gone each said. An
+/// address of a peer's, or `name@host`, goes to the router.
+fn resolve<'a>(to: To<'a>) -> Result<Target<'a>, Error> {
     let t = table().ok_or(Error::NoMemory)?.lock();
     if t.stopped {
         return Err(Error::Stopped);
     }
     let addr = match to {
         To::Addr(a) => a,
-        To::Name(n) => t.names.iter().find(|r| r.name == n).ok_or(Error::Gone)?.addr,
+        To::Name(n) => match n.split_once('@') {
+            Some((name, host)) => {
+                if !valid_name(name) || !remote::valid_host(host) {
+                    return Err(Error::Invalid);
+                }
+                let router = t.router.clone().ok_or(Error::NoRoute)?;
+                let host = remote::live_by_name(&t, host).ok_or(Error::NoRoute)?;
+                return Ok(Target::Remote { router, host, to: remote::RemoteTo::Name(name) });
+            }
+            None => t.names.iter().find(|r| r.name == n).ok_or(Error::Gone)?.addr,
+        },
     };
     if addr.host != 0 {
-        return Err(Error::NoRoute);
+        let router = t.router.clone().ok_or(Error::NoRoute)?;
+        remote::live(&t, addr.host).ok_or(Error::NoRoute)?;
+        return Ok(Target::Remote { router, host: addr.host, to: remote::RemoteTo::Addr(addr) });
     }
     if addr.slot == 0 || usize::from(addr.slot) > MAX_MAILBOXES {
         return Err(Error::Gone);
     }
-    t.slots[usize::from(addr.slot)].mbox.as_ref().filter(|m| m.addr == addr).cloned().ok_or(Error::Gone)
+    t.slots[usize::from(addr.slot)].mbox.as_ref().filter(|m| m.addr == addr).cloned().map(Target::Local)
+        .ok_or(Error::Gone)
 }
 
 /// A mailbox made for `owner`, held to `limits`.
@@ -876,7 +937,8 @@ pub(crate) fn send(from: Addr, to: To, tag: u32, reference: u64, payload: Payloa
         return Err((Error::Invalid, payload));
     }
     let target = match resolve(to) {
-        Ok(t) => t,
+        Ok(Target::Local(t)) => t,
+        Ok(Target::Remote { router, host, to }) => return remote::send(from, router, host, to, tag, reference, payload),
         Err(e) => {
             if e == Error::Gone {
                 count(&STATS.gone);
@@ -893,7 +955,8 @@ pub(crate) fn send(from: Addr, to: To, tag: u32, reference: u64, payload: Payloa
     }
 }
 
-/// Where a message goes: an address, or a name on this host.
+/// Where a message goes: an address -- a peer's too -- or a name on this
+/// host, or `name@host` on a peer.
 #[derive(Clone, Copy)]
 pub enum To<'a> {
     Addr(Addr),
@@ -956,8 +1019,18 @@ pub(crate) fn close(mbox: &Arc<Mbox>, reason: Reason) {
     let Some(table) = table() else { return };
     /* The table first: the slot freed for another mailbox, of another
      * generation, the name and the watches taken away */
-    let (name, watchers, watches) = {
+    let (name, watchers, watches, remote_gone, router, lost) = {
         let mut t = table.lock();
+        /* A router's close: nothing carries messages to other hosts, so
+         * every peer is lost */
+        let lost = if t.router.as_ref().is_some_and(|r| Arc::ptr_eq(r, mbox)) {
+            t.router = None;
+            remote::lose_all(&mut t)
+        } else {
+            Vec::new()
+        };
+        let remote_gone = remote::forget(&mut t, mbox);
+        let router = t.router.clone();
         let slot = usize::from(mbox.addr.slot);
         /* Two closes of one mailbox -- its module's own and the sweep after
          * its exit, say -- and only the one that takes its slot gives back
@@ -987,8 +1060,17 @@ pub(crate) fn close(mbox: &Arc<Mbox>, reason: Reason) {
             }
             t.owners.retain(|(_, b)| *b != 0);
         }
-        (name, watchers, watches)
+        (name, watchers, watches, remote_gone, router, lost)
     };
+    remote::tell_lost(lost);
+    /* Its monitors of mailboxes on peers: their records gone with it, their
+     * peers asked to stop watching */
+    for rec in &remote_gone {
+        let mut i = mbox.inner.lock();
+        i.reserved = i.reserved.saturating_sub(1);
+        i.monitors.retain(|&(_, m)| m != rec.id);
+    }
+    remote::unwatch_all(router, mbox.addr, remote_gone);
     /* Then the mailbox itself */
     let (queue, monitored_by, monitors) = {
         let mut i = mbox.inner.lock();
@@ -1058,6 +1140,9 @@ pub(crate) fn register(mbox: &Arc<Mbox>, name: &str, scope: Scope) -> Result<(),
 
 /// `watcher` told once, with a Down, when `target` goes: the monitor's id.
 pub(crate) fn monitor(watcher: &Arc<Mbox>, target: Addr) -> Result<u64, Error> {
+    if target.host != 0 {
+        return remote::monitor(watcher, target);
+    }
     let id = next_id();
     let down = Message { from: target, tag: TAG_DOWN, reference: id, payload: Payload::from_slice(&[0; DOWN_BYTES])? };
     {
@@ -1114,6 +1199,10 @@ pub(crate) fn demonitor(watcher: &Arc<Mbox>, id: u64) {
         let Some(i) = w.monitors.iter().position(|&(_, m)| m == id) else { return };
         w.monitors.swap_remove(i).0
     };
+    if target.host != 0 {
+        remote::demonitor(watcher, id, target);
+        return;
+    }
     let rec = find(target).and_then(|t| {
         let mut ti = t.inner.lock();
         ti.monitored_by.iter().position(|r| r.id == id).map(|i| ti.monitored_by.swap_remove(i))
@@ -1256,6 +1345,52 @@ impl Mailbox {
     /// A reference for a request, no other's.
     pub fn next_reference(&self) -> u64 {
         next_id()
+    }
+
+    /* ---- the router's: what carries messages to other hosts ---- */
+
+    /// This mailbox made the router: one at a time, until it closes. What
+    /// is sent to a peer's address, or to `name@host`, comes here as a
+    /// message of `TAG_ROUTE`, its payload ipcwire's route head and then
+    /// the message's own bytes.
+    pub fn route(&self) -> Result<(), Error> {
+        remote::route(&self.mbox)
+    }
+
+    /// The peer `name` up: its number, the host part of its mailboxes'
+    /// addresses here -- the same while it stays up, another once lost.
+    pub fn peer_up(&self, name: &str) -> Result<u16, Error> {
+        remote::peer_up(&self.mbox, name)
+    }
+
+    /// The peer `host` lost: every monitor of an address there gets its Down
+    /// (HostLost), and what it may deliver to is forgotten.
+    pub fn peer_lost(&self, host: u16) -> Result<(), Error> {
+        remote::peer_lost(&self.mbox, host)
+    }
+
+    /// A message come from the peer `host`, from its mailbox `from` (its
+    /// own address of it), to this host's `to` -- an address here (host 0)
+    /// or a name: delivered to a `Cluster` name, or to a mailbox that has
+    /// sent to that peer, `NotYours` otherwise.
+    pub fn deliver_remote(&self, host: u16, from: u64, to: To, tag: u32, reference: u64, payload: Payload)
+        -> Result<(), Error>
+    {
+        let to = match to {
+            To::Addr(a) => remote::RemoteTo::Addr(a),
+            To::Name(n) => {
+                if !valid_name(n) {
+                    return Err(Error::Invalid);
+                }
+                remote::RemoteTo::Name(n)
+            }
+        };
+        remote::deliver_remote(&self.mbox, host, from, to, tag, reference, payload)
+    }
+
+    /// The peer `host` says the mailbox the monitor `id` watched has gone.
+    pub fn remote_down(&self, host: u16, id: u64, reason: Reason) -> Result<(), Error> {
+        remote::remote_down(&self.mbox, host, id, reason)
     }
 }
 
@@ -1419,6 +1554,11 @@ pub struct Counters {
     pub downs: u64,
     pub watch_lost: u64,
     pub stray: u64,
+    pub routed: u64,
+    pub delivered_remote: u64,
+    pub refused_remote: u64,
+    pub peers_up: u64,
+    pub peers_lost: u64,
     pub queued_bytes: usize,
     pub mailboxes: usize,
     pub names: usize,
@@ -1440,6 +1580,11 @@ pub fn counters() -> Counters {
         downs: get(&STATS.downs),
         watch_lost: get(&STATS.watch_lost),
         stray: get(&STATS.stray),
+        routed: get(&STATS.routed),
+        delivered_remote: get(&STATS.delivered_remote),
+        refused_remote: get(&STATS.refused_remote),
+        peers_up: get(&STATS.peers_up),
+        peers_lost: get(&STATS.peers_lost),
         queued_bytes: QUEUED.load(Ordering::Relaxed),
         mailboxes,
         names,

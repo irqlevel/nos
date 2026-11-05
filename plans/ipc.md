@@ -450,9 +450,14 @@ pieces, in the order they are to be built and gated:
 - **Its gates**: net-fuzz's `ipcnet` target and `ipc-test.py` on
   `scripts/hub.py`, as the step says.
 
-The wire is written (branch `ipc-raft`): `ipcwire`, fuzzed by
-`ipc-fuzz.py --target wire`. The rest waits for this design to be
-confirmed.
+Confirmed by the user (2026-11-05). Written on branch `ipc-raft`: the wire
+(`ipcwire`, fuzzed by `ipc-fuzz.py --target wire`), and the channel's side
+of the router -- `remote.rs`: the peers' numbers and epochs, what is routed
+and its head (`ipcwire::route`), `deliver_remote`'s answer rule, monitors of
+peers' mailboxes and `HostLost`, the router's close -- for the image's tasks
+and through the C ABI for a module (`kcore::ipc`), held by the fuzz model
+and a self-test at every boot. Next: the TCP ABI for a module (the
+allowlist, the link's RTO floor), then the module.
 
 ## Limits of the first version
 
