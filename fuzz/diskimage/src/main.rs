@@ -515,6 +515,26 @@ fn fuzz(path: &str, seed: u64, iterations: u64, slow_ms: u128) -> i32 {
     0
 }
 
+/// `contents <device image>`: what `diskimage::contents` says the file
+/// holds, its first `HEAD` bytes and last `TAIL` given it as the hv module
+/// reads a device's -- `contents: <what>|<label>`, or `contents: none`.
+fn contents(path: &str) -> i32 {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}: {}", path, e);
+            return 3;
+        }
+    };
+    let head = &data[..data.len().min(diskimage::contents::HEAD)];
+    let tail = &data[data.len() - data.len().min(diskimage::contents::TAIL)..];
+    match diskimage::contents::contents(head, tail, data.len() as u64) {
+        Some(f) => println!("contents: {}|{}", f.what, f.label.unwrap_or_default()),
+        None => println!("contents: none"),
+    }
+    0
+}
+
 fn main() {
     std::panic::set_hook({
         let default = std::panic::take_hook();
@@ -541,13 +561,15 @@ fn main() {
         Some("convert") if args.len() == 4 => convert(&args[2], &args[3]),
         Some("inflate") if args.len() == 4 => inflate(&args[2], &args[3]),
         Some("iso") if args.len() >= 4 => iso(&args[2], &args[3], &args[4..]),
+        Some("contents") if args.len() == 3 => contents(&args[2]),
         Some("fuzz") if args.len() >= 3 => {
             fuzz(&args[2], flag("--seed", 1), flag("--iterations", 1000), u128::from(flag("--slow-ms", 5000)))
         }
         _ => {
             eprintln!("usage: diskimage-test convert <image> <disk.raw>\n       diskimage-test inflate <cases> <answers>\n       \
                        diskimage-test fuzz <image> [--seed N] [--iterations N] [--slow-ms N]\n       \
-                       diskimage-test iso <out.iso> <label> <name>=<file>...");
+                       diskimage-test iso <out.iso> <label> <name>=<file>...\n       \
+                       diskimage-test contents <device image>");
             3
         }
     };

@@ -65,9 +65,23 @@ fn disks(call: &mut Call) -> Status {
             w.field_uint("sector_bytes", sector_bytes);
             w.field_uint("size_bytes", sectors.saturating_mul(sector_bytes));
             w.field_uint("partitions", u64::from(table::partitions(handle)));
+            w.key("id");
+            match table::ident(handle) {
+                Some(id) => w.str(id),
+                None => w.null(),
+            }
+            w.key("type");
+            match table::kind(handle) {
+                table::PartKind::Disk => w.null(),
+                table::PartKind::Gpt(guid) => w.str_lossy(&table::guid_text(&guid)),
+                table::PartKind::Mbr(byte) => {
+                    let hex = |n: u8| b"0123456789abcdef"[usize::from(n)];
+                    w.str_lossy(&[b'0', b'x', hex(byte >> 4), hex(byte & 0xF)]);
+                }
+            }
             w.key("held_by");
             match table::holder(handle) {
-                Some(holder) => w.str_lossy(holder.to_bytes()),
+                Some(holder) => w.str_lossy(holder.as_bytes()),
                 None => w.null(),
             }
             w.end_object();

@@ -41,6 +41,7 @@ pub mod cmd;
 pub mod mgmt;
 pub mod system;
 pub mod fs;
+mod lent;
 pub mod vnic;
 #[cfg(target_arch = "x86_64")]
 pub mod tco_wdt;

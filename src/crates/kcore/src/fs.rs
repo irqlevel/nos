@@ -3,10 +3,10 @@
 //! between calls; and a file held open (`File`), for a guest's disk.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, Ordering};
 use ffi::fs;
 
 use crate::error::{Error, Result};
+use crate::lent::Buffers;
 
 /// The whole of a regular file: NotFound when there is none, InvalidValue
 /// when it is longer than `max`. A `write` cut short between its two steps
@@ -233,28 +233,7 @@ impl Drop for Image {
     }
 }
 
-/// A buffer of an image's queue, as `ImageQueue` keeps it: where it is, and
-/// whose it is now.
-struct Buffer {
-    at: *mut u8,
-    state: AtomicU8,
-}
-
-/// Nobody's: to be lent, or started.
-const FREE: u8 = 0;
-/// Lent (`ImageQueue::lend`): its bytes one guard's.
-const LENT: u8 = 1;
-/// The image's: its request started and not yet reaped.
-const STARTED: u8 = 2;
-
-/// What `ImageQueue::start` did with a request.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Started {
-    /// With the device: `reap` gives it back.
-    InFlight,
-    /// Done already.
-    Done,
-}
+pub use crate::lent::{Lent, Started};
 
 /// An image held with a queue of its own (`fs::image`'s): buffers of the
 /// image's, one a request -- filled with a write's data before the request
@@ -262,24 +241,14 @@ pub enum Started {
 /// the device as many at once as are started, each given back as it is
 /// done. Shared: whoever fills and empties the buffers (a guest's vCPU)
 /// and whoever starts and reaps their requests (its disk's task) each hold
-/// it; every call but `lend` and `wake` from one task.
-///
-/// Each buffer is nobody's, lent, or the image's, and goes from one to
-/// another by a compare-and-swap of its state: so its bytes are reached
-/// through one guard at a time (`Lent`), never while its request is the
-/// image's -- whose device may be writing them -- and a request is started
-/// only on a buffer nobody has.
+/// it; every call but `lend` and `wake` from one task. A buffer is reached
+/// as `crate::lent` says: through one guard at a time, never while its
+/// request is the image's.
 pub struct ImageQueue {
+    /* Its buffers before the image, which keeps them: dropped first. */
+    buffers: Buffers,
     image: Image,
-    buffers: Vec<Buffer>,
-    len: usize,
 }
-
-/* The buffers are the kernel's, kept for as long as the image is held --
- * this holds it -- and each one's bytes are reached only by the one guard
- * its state lets have them. */
-unsafe impl Send for ImageQueue {}
-unsafe impl Sync for ImageQueue {}
 
 impl Image {
     /// The image held with a queue: `buffers` buffers of `bytes` each, a
@@ -292,10 +261,10 @@ impl Image {
         if unsafe { fs::kernel_image_queue(self.handle, buffers, bytes, at.as_mut_ptr()) } != 0 {
             return Err(Error::NoMemory);
         }
-        let mut list = Vec::new();
-        list.try_reserve_exact(buffers).map_err(|_| Error::NoMemory)?;
-        list.extend(at.into_iter().map(|at| Buffer { at, state: AtomicU8::new(FREE) }));
-        Ok(ImageQueue { image: self, buffers: list, len: bytes })
+        /* The kernel's buffers, `bytes` each, kept for as long as the image
+         * is held -- the queue holds it, and lets go of it after these. */
+        let buffers = unsafe { Buffers::new(at, bytes)? };
+        Ok(ImageQueue { buffers, image: self })
     }
 }
 
@@ -306,33 +275,30 @@ impl ImageQueue {
     }
 
     pub fn buffers(&self) -> usize {
-        self.buffers.len()
+        self.buffers.count()
     }
 
     /// A buffer's bytes.
     pub fn buffer_len(&self) -> usize {
-        self.len
+        self.buffers.len()
     }
 
     /// Buffer `k`'s bytes, while nobody else has them: None while they are
     /// lent already, or the image's.
     pub fn lend(&self, k: usize) -> Option<Lent<'_>> {
-        let b = self.buffers.get(k)?;
-        b.state.compare_exchange(FREE, LENT, Ordering::Acquire, Ordering::Relaxed).ok()?;
-        Some(Lent { queue: self, k })
+        self.buffers.lend(k)
     }
 
     /// Buffer `k`'s request -- `len` bytes from `offset` read into it, or
     /// with `write` written from it -- to the image: `InFlight` until `reap`
-    /// gives it back, or `Done`. IoError for one that failed, or a buffer
-    /// lent or started already. Its doorbell waits for `kick`.
+    /// gives it back, or `Done`. IoError for one that failed, Busy for a
+    /// buffer lent or started already. Its doorbell waits for `kick`.
     pub fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> Result<Started> {
-        let b = self.buffers.get(k).ok_or(Error::InvalidValue)?;
-        b.state.compare_exchange(FREE, STARTED, Ordering::AcqRel, Ordering::Relaxed).map_err(|_| Error::Busy)?;
+        self.buffers.take(k)?;
         match fs::kernel_image_start(self.image.handle, k, i32::from(write), offset, len) {
             1 => Ok(Started::InFlight),
             rc => {
-                b.state.store(FREE, Ordering::Release);
+                self.buffers.untake(k);
                 if rc == 0 { Ok(Started::Done) } else { Err(Error::IoError) }
             }
         }
@@ -355,12 +321,10 @@ impl ImageQueue {
             let Ok(n) = usize::try_from(n) else { return total };
             for d in &out[..n.min(BATCH)] {
                 let k = d.buffer as usize;
-                let freed = self.buffers.get(k)
-                    .is_some_and(|b| b.state.compare_exchange(STARTED, FREE, Ordering::AcqRel, Ordering::Relaxed).is_ok());
                 /* The image gives back only what was started: anything else
                  * is a broken promise of the kernel's, which no request of
                  * the caller's may be taken for. */
-                assert!(freed, "an image gave back buffer {}, which it did not have", k);
+                assert!(self.buffers.give_back(k), "an image gave back buffer {}, which it did not have", k);
                 done(k, d.ok != 0);
             }
             total += n;
@@ -387,36 +351,6 @@ impl ImageQueue {
     /// Wakes whoever waits (`wait`), from anywhere.
     pub fn wake(&self) {
         fs::kernel_image_wake(self.image.handle);
-    }
-}
-
-/// A buffer of an image's queue, lent (`ImageQueue::lend`): its bytes, until
-/// this goes.
-pub struct Lent<'a> {
-    queue: &'a ImageQueue,
-    k: usize,
-}
-
-impl core::ops::Deref for Lent<'_> {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        /* Lent: the state says these bytes are this guard's alone, and the
-         * kernel keeps them for as long as the image is held. */
-        unsafe { core::slice::from_raw_parts(self.queue.buffers[self.k].at, self.queue.len) }
-    }
-}
-
-impl core::ops::DerefMut for Lent<'_> {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        /* As `deref`, and `&mut self` is this guard's one way in. */
-        unsafe { core::slice::from_raw_parts_mut(self.queue.buffers[self.k].at, self.queue.len) }
-    }
-}
-
-impl Drop for Lent<'_> {
-    fn drop(&mut self) {
-        self.queue.buffers[self.k].state.store(FREE, Ordering::Release);
     }
 }
 

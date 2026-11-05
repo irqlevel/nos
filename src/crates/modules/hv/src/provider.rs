@@ -45,7 +45,7 @@ use crate::State;
 
 const DESCRIPTOR: &str = include_str!("vm.descriptor.json");
 
-const METHODS: [Method; 20] = [
+const METHODS: [Method; 23] = [
     Method { name: "list", kind: Kind::Read },
     Method { name: "get", kind: Kind::Read },
     Method { name: "host", kind: Kind::Read },
@@ -53,6 +53,7 @@ const METHODS: [Method; 20] = [
     Method { name: "config_get", kind: Kind::Read },
     Method { name: "console_read", kind: Kind::Read },
     Method { name: "disks", kind: Kind::Read },
+    Method { name: "devices", kind: Kind::Read },
     Method { name: "forwards", kind: Kind::Read },
     Method { name: "config_set", kind: Kind::Action },
     Method { name: "forward_add", kind: Kind::Action },
@@ -60,6 +61,8 @@ const METHODS: [Method; 20] = [
     Method { name: "console_write", kind: Kind::Action },
     Method { name: "disk_add", kind: Kind::Action },
     Method { name: "disk_grow", kind: Kind::Action },
+    Method { name: "disk_attach", kind: Kind::Action },
+    Method { name: "disk_detach", kind: Kind::Action },
     Method { name: "start", kind: Kind::Job },
     Method { name: "stop", kind: Kind::Job },
     Method { name: "restart", kind: Kind::Job },
@@ -211,6 +214,7 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "config_get" => config_get(state, p, call),
         "console_read" => console_read(state, p, call),
         "disks" => disks(state, p, call),
+        "devices" => devices(state, p, call),
         "forwards" => forwards(state, p, call),
         "config_set" => config_set(state, p, call),
         "forward_add" => forward_add(state, p, call),
@@ -218,6 +222,8 @@ fn provide(state: &State, method: &str, params: &[u8], call: &mut Call) -> Statu
         "console_write" => console_write(state, p, call),
         "disk_add" => disk_add(state, p, call),
         "disk_grow" => disk_grow(state, p, call),
+        "disk_attach" => disk_attach(state, p, call),
+        "disk_detach" => disk_detach(state, p, call),
         "start" => start(state, p, call),
         "stop" => stop(state, p, call),
         "restart" => restart(state, p, call),
@@ -461,16 +467,160 @@ fn disks_json(w: &mut Writer, name: &str, folder: &Folder, o: &Options) {
         let file = path.strip_prefix(folder.path.as_str()).and_then(|r| r.strip_prefix('/')).unwrap_or(path);
         w.field_str("file", file);
         w.field_str("path", path);
+        /* A device: its size and this boot's name, where it is there. */
+        let device = crate::devices::is_device(path).then(|| crate::devices::find(path).ok()).flatten();
         w.key("size_bytes");
-        match kcore::fs::size(path) {
-            Ok(n) => w.uint(n),
-            Err(_) => w.null(),
+        match (&device, kcore::fs::size(path)) {
+            (Some(d), _) => w.uint(d.sectors().saturating_mul(d.sector_size())),
+            (None, Ok(n)) if !crate::devices::is_device(path) => w.uint(n),
+            _ => w.null(),
+        }
+        w.field_bool("device", crate::devices::is_device(path));
+        w.key("device_name");
+        match &device {
+            Some(d) => w.str(d.name().as_str()),
+            None => w.null(),
         }
         w.field_bool("read_only", *ro);
         w.field_str("vm", name);
         w.end_object();
     }
     w.end_list();
+}
+
+/// What `devices` says of one: its name and id, its size and type, who
+/// holds it, which VMs name it, what is on it -- and whether a VM may be
+/// given it as it is, and if not why.
+fn device_json(w: &mut Writer, root: &str, disk: &kcore::block::Disk) {
+    w.begin_object();
+    w.field_str("name", disk.name().as_str());
+    w.key("id");
+    match disk.ident() {
+        Some(id) => w.str(id.as_str()),
+        None => w.null(),
+    }
+    w.key("disk");
+    match disk.parent() {
+        Some((parent, _)) => w.str(parent.name().as_str()),
+        None => w.null(),
+    }
+    w.field_uint("size_bytes", disk.sectors().saturating_mul(disk.sector_size()));
+    w.key("type");
+    match disk.kind() {
+        kcore::block::PartKind::Disk => w.null(),
+        kcore::block::PartKind::Gpt(g) => w.str_lossy(&kcore::block::guid_text(&g)),
+        kcore::block::PartKind::Mbr(b) => w.str(&alloc::format!("{:#04x}", b)),
+    }
+    w.key("boots_the_machine");
+    match disk.kind().boots_the_machine() {
+        Some(what) => w.str(what),
+        None => w.null(),
+    }
+    w.key("held_by");
+    match disk.holder() {
+        Some(h) => w.str(h.as_str()),
+        None => w.null(),
+    }
+    /* Who holds it or anything overlapping it: what no force gets past. */
+    w.key("in_use_by");
+    match disk.in_the_way() {
+        Some(h) => w.str(h.as_str()),
+        None => w.null(),
+    }
+    w.key("holds");
+    match disk.holder().is_none().then(|| crate::devices::holds(disk)) {
+        Some(Ok(Some(what))) => w.str(&alloc::format!("{}", what)),
+        _ => w.null(),
+    }
+    /* Whether a VM may have it as it is: why not, when not. */
+    w.key("refused");
+    match crate::devices::check(root, "", disk, false) {
+        Ok(()) => w.null(),
+        Err(why) => w.str(&why),
+    }
+    w.end_object();
+}
+
+fn devices(state: &State, p: Params, call: &mut Call) -> Status {
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    let mut disks = Vec::new();
+    for i in 0..kcore::block::Disk::count() {
+        if let Some(d) = kcore::block::Disk::at(i) {
+            if disks.try_reserve(1).is_err() {
+                return refuse(call, Status::Busy, "out of memory", None);
+            }
+            disks.push(d);
+        }
+    }
+    let root = state.vms_root.as_str();
+    answer(call, |w| {
+        w.begin_object();
+        w.key("devices");
+        w.begin_list();
+        for d in &disks {
+            device_json(w, root, d);
+        }
+        w.end_list();
+        w.end_object();
+    })
+}
+
+/// The longest a device's word is: `dev:` and a name, or an id.
+const DEVICE_MAX: usize = kcore::block::IDENT_MAX;
+
+fn disk_attach(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let fields = (|| -> Result<_, Invalid> {
+        let device = p.str("device", DEVICE_MAX)?;
+        let read_only = p.opt_bool("read_only")?.unwrap_or(false);
+        let force = p.opt_bool("force")?.unwrap_or(false);
+        Ok((device, read_only, force))
+    })();
+    let (device, read_only, force) = match fields {
+        Ok(f) => f,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    match crate::devices::attach(&state.vms_root, &state.vms, name, device, read_only, force) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("id", &id);
+            w.field_bool("read_only", read_only);
+            w.end_object();
+        }),
+        Err(e) => refuse(call, Status::Conflict, &e, Some("device")),
+    }
+}
+
+fn disk_detach(state: &State, mut p: Params, call: &mut Call) -> Status {
+    let name = match name_param(&mut p, "name", call) {
+        Ok(n) => n,
+        Err(s) => return s,
+    };
+    let device = match p.str("device", DEVICE_MAX) {
+        Ok(d) => d,
+        Err(e) => return invalid(call, e),
+    };
+    if let Err(s) = finish(p, call) {
+        return s;
+    }
+    match crate::devices::detach(&state.vms_root, &state.vms, name, device) {
+        Ok(id) => answer(call, |w| {
+            w.begin_object();
+            w.field_str("vm", name);
+            w.field_str("id", &id);
+            w.end_object();
+        }),
+        Err(e) => refuse(call, Status::Conflict, &e, Some("device")),
+    }
 }
 
 fn forward_json(w: &mut Writer, r: &forward::Row, name: Option<&str>) {
@@ -1104,9 +1254,11 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         let port = p.opt_uint("port", 0, net::MAX_PORTS as u64 - 1)?;
         let protected = p.opt_bool("protected")?.unwrap_or(false);
         let start = p.opt_bool("start")?.unwrap_or(false);
-        Ok((size, mem, cpus, network, password, user_data, port, protected, start))
+        let onto = p.opt_str("onto", DEVICE_MAX)?;
+        let force = p.opt_bool("force")?.unwrap_or(false);
+        Ok((size, mem, cpus, network, password, user_data, port, protected, start, onto, force))
     })();
-    let (size, mem, cpus, network, password, user_data, port, protected, start) = match fields {
+    let (size, mem, cpus, network, password, user_data, port, protected, start, onto, force) = match fields {
         Ok(f) => f,
         Err(e) => return invalid(call, e),
     };
@@ -1143,7 +1295,7 @@ fn create(state: &State, mut p: Params, call: &mut Call) -> Status {
         forwards,
         ..Options::default()
     };
-    let recipe = cloud::Recipe { url, size, password, hvboot: cloud::HVBOOT, user_data, protected };
+    let recipe = cloud::Recipe { url, size, onto, force, password, hvboot: cloud::HVBOOT, user_data, protected };
     let mut job = Job::new(call, &state.unloading);
     let created = cloud::create(&state.vms_root, &state.vms, name, &recipe, o, &mut job);
     /* Started once it is made, when asked: by the same job, its reservation
@@ -1288,6 +1440,12 @@ fn delete(state: &State, mut p: Params, call: &mut Call) -> Status {
             w.key("kept");
             w.begin_list();
             for k in &d.kept {
+                w.str(k);
+            }
+            w.end_list();
+            w.key("devices");
+            w.begin_list();
+            for k in &d.devices {
                 w.str(k);
             }
             w.end_list();
