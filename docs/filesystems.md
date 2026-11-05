@@ -24,6 +24,17 @@ directory is created on the root if it is missing). If the named root is not
 found the fallback layout is mounted and the boot continues, so a wrong
 `root=` costs a shell without persistence rather than a box without a shell.
 
+**A label or a UUID on two devices names neither.** The boot says which two
+(`MountRootFs: nvme01 and nvme12 both carry the root root= asks for --
+neither is taken`) and mounts the fallback layout, rather than the first of
+them in the table's order: a guest given a partition or a disk of nos's
+([A device as a guest's disk](hypervisor.md#a-device-as-a-guests-disk)) can
+put an ext4 labelled `nos` on it, or a copy of nos's own root, and a boot
+that took whichever came first could boot the guest's. A server the system
+image is installed on boots by `root=UUID=`, its root's own UUID: a guest
+that copied it there would find its copy refused with nos's root, the boot
+left without either rather than on the guest's.
+
 Both shipped configs say `root=auto`: the ISO (`build/grub.cfg`) so that any
 disk labelled `nos` attached to QEMU becomes the root, and the disk image
 (`build/grub-disk.cfg`), whose one partition carries that label. The label is

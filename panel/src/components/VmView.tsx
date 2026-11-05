@@ -91,12 +91,12 @@ export function VmView({ host, name, d, locale, w }: { host: string; name: strin
       {tab === 'disks' && (
         <div className="space-y-4">
           <DiskList host={host} name={name} locale={locale} d={d} w={w} />
-          {d.methods.disk_add && (
-            <div className="rounded-xl border border-line bg-card p-4">
-              <h2 className="mb-2 text-sm font-medium text-fg">{text(d.methods.disk_add.title, locale)}</h2>
-              <MethodForm host={host} provider="vm" name="disk_add" method={d.methods.disk_add} fixed={{ name }} locale={locale} w={w} />
+          {(['disk_add', 'disk_attach', 'disk_detach'] as const).map((m) => d.methods[m] && (
+            <div key={m} className="rounded-xl border border-line bg-card p-4">
+              <h2 className="mb-2 text-sm font-medium text-fg">{text(d.methods[m]!.title, locale)}</h2>
+              <MethodForm host={host} provider="vm" name={m} method={d.methods[m]!} fixed={{ name }} locale={locale} w={w} />
             </div>
-          )}
+          ))}
         </div>
       )}
 
@@ -121,18 +121,20 @@ function DiskList({ host, name, d, locale, w }: { host: string; name: string; d:
     void call(host, 'vm', 'disks', { name }).then((r) => r.ok && setDisks(((r.data as { disks: Array<Record<string, unknown>> }).disks) ?? []));
   }, [host, name]);
   const f = d.resources?.disks?.fields ?? {};
+  /* A device's disk: its id the file, and this boot's name beside it. */
+  const columns = ['file', 'size_bytes', 'read_only', 'device_name'];
   return (
-    <table className="w-full rounded-xl border border-line bg-card text-sm">
+    <table className="w-full rounded-xl border border-line bg-card text-sm" data-testid="vm-disks">
       <thead><tr className="text-left text-xs text-muted">
-        {['file', 'size_bytes', 'read_only'].map((k) => <th key={k} className="px-4 py-2">{text(f[k]?.title, locale) || k}</th>)}
+        {columns.map((k) => <th key={k} className="px-4 py-2">{text(f[k]?.title, locale) || k}</th>)}
       </tr></thead>
       <tbody>
         {disks.map((disk) => (
           <tr key={String(disk.file)} className="border-t border-line">
-            {['file', 'size_bytes', 'read_only'].map((k) => <td key={k} className="px-4 py-2 font-mono text-xs">{show(f[k], disk[k], locale)}</td>)}
+            {columns.map((k) => <td key={k} className="px-4 py-2 font-mono text-xs">{show(f[k], disk[k], locale)}</td>)}
           </tr>
         ))}
-        {disks.length === 0 && <tr><td className="px-4 py-2 text-muted" colSpan={3}>{w.nothingYet}</td></tr>}
+        {disks.length === 0 && <tr><td className="px-4 py-2 text-muted" colSpan={columns.length}>{w.nothingYet}</td></tr>}
       </tbody>
     </table>
   );

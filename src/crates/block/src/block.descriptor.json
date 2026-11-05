@@ -20,9 +20,13 @@
         "sector_bytes": {"type": "bytes", "title": {"en": "Sector", "ru": "Сектор"}},
         "size_bytes": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
         "partitions": {"type": "int", "title": {"en": "Partitions", "ru": "Разделов"}},
+        "id": {"type": "string", "title": {"en": "ID", "ru": "Идентификатор"},
+          "help": {"en": "What the device is found by from one boot to the next, whatever its name: a partition's GUID, or a disk's model and serial number. A VM names its device disks by it.", "ru": "По нему устройство находится от загрузки к загрузке, как бы оно ни называлось: GUID раздела или модель и серийный номер диска. По нему ВМ называет свои диски на устройствах."}},
+        "type": {"type": "string", "title": {"en": "Type", "ru": "Тип"},
+          "help": {"en": "What the partition table says the partition is: a GPT type GUID, or an MBR type byte.", "ru": "Чем раздел назван в таблице разделов: GUID типа GPT или байт типа MBR."}},
         "held_by": {"type": "string", "title": {"en": "Held by", "ru": "Занят"}}
       },
-      "columns": ["name", "disk", "size_bytes", "partitions", "held_by"]
+      "columns": ["name", "disk", "size_bytes", "partitions", "id", "held_by"]
     }
   }
 }

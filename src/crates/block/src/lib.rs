@@ -17,14 +17,15 @@ extern crate alloc;
 mod disk;
 mod disklog;
 mod part;
+mod devq;
 mod provider;
 pub mod queue;
 mod selftest;
 mod shell;
 mod table;
 
-pub use disk::{at, claim_as, count, register_driver, release, Disk};
-pub use table::{interrupts_started, BlockDriver, Piece};
+pub use disk::{at, claim_as, count, find_ident, register_driver, release, Disk};
+pub use table::{guid_text, interrupts_started, BlockDriver, Found, Holder, PartId, PartKind, Piece, IDENT_MAX};
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -51,6 +52,9 @@ const MBR_SIGNATURE: u16 = 0xAA55;
 const MBR_PART_OFFSET: usize = 446;
 const MBR_PART_SIZE: usize = 16;
 const MBR_PARTS: usize = 4;
+/* The disk's signature, which an MBR's partitions are known by (Linux's
+ * PARTUUID): four bytes before the entries. */
+const MBR_DISK_SIGNATURE_OFFSET: usize = 440;
 /* A GPT disk carries a protective MBR: one entry of this type covering the
  * whole disk, so a tool that only understands MBR sees an occupied disk
  * rather than an empty one. Finding it is what says to look at LBA 1. */
@@ -199,13 +203,17 @@ fn probe_disk(disk: Disk) {
         }
     }
 
+    /* What the partitions are known by from boot to boot: the disk's
+     * signature and their numbers, as Linux's PARTUUID has them. */
+    let signature = le32(sector, MBR_DISK_SIGNATURE_OFFSET);
     for i in 0..MBR_PARTS {
         let entry = mbr_entry(sector, i);
         if entry.part_type == 0 || entry.size == 0 {
             continue;
         }
 
-        if !add_partition(disk, entry.start as u64, entry.size as u64, i as u32) {
+        let id = PartId::Mbr { signature, number: i as u32 + 1, kind: entry.part_type };
+        if !add_partition(disk, entry.start as u64, entry.size as u64, i as u32, &id) {
             break;
         }
     }
@@ -273,15 +281,19 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
             None => continue,
         };
 
-        if !add_partition(disk, first, count, i as u32) {
+        let mut kind = [0u8; GPT_GUID_LEN];
+        let mut unique = [0u8; GPT_GUID_LEN];
+        kind.copy_from_slice(&entry[..GPT_GUID_LEN]);
+        unique.copy_from_slice(&entry[GPT_GUID_LEN..2 * GPT_GUID_LEN]);
+        if !add_partition(disk, first, count, i as u32, &PartId::Gpt { unique, kind }) {
             break;
         }
     }
 }
 
-/// Register one partition. False says to stop looking at this disk: there is
-/// no room for another anywhere.
-fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
+/// Register one partition, as its table entry `id` says it is. False says to
+/// stop looking at this disk: there is no room for another anywhere.
+fn add_partition(disk: Disk, start: u64, count: u64, index: u32, id: &PartId) -> bool {
     if start == 0 {
         /* Would alias the partition table itself. */
         klog!(0, "part: partition {} starts at LBA 0, skipped", index + 1);
@@ -312,7 +324,7 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
         None => return true,
     };
 
-    if !part::register(disk, start, count, &name[..len]) {
+    if !part::register(disk, start, count, &name[..len], id) {
         return true;
     }
 

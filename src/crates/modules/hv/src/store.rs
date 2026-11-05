@@ -58,10 +58,13 @@ const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + LONGEST_NAME);
 const DELETE_DEPTH: usize = 8;
 
 pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] \
-                            [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] \
-                            [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]\n\
-                            hv create <name> <http(s)://image> [size=N[K|M|G|T]] [password=...] [hvboot=path] \
-                            [the words hv start takes, but a kernel and initrd=]";
+                            [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... \
+                            [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
+                            [cmdline=...]\n\
+                            hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device>] [password=...] \
+                            [hvboot=path] [force] [the words hv start takes, but a kernel and initrd=]\n\
+                            a device is a partition or a whole disk of nos's: dev:<name>, part:<id> or disk:<id> \
+                            (hv devices); force gives one over what is on it";
 
 /// A VM's folder: the name it is known by, and its path.
 pub struct Folder {
@@ -224,9 +227,10 @@ pub fn folder_of(root: &str, name: &str) -> Result<Folder, String> {
 }
 
 /// A path of the configuration's, as nos reaches it: the folder's unless it
-/// begins with `/`.
+/// begins with `/` -- or names a device (`devices::source`), which is no
+/// path at all.
 fn resolve(folder: &Folder, path: &str) -> Result<String, String> {
-    if path.starts_with('/') {
+    if path.starts_with('/') || crate::devices::is_device(path) {
         return Ok(String::from(path));
     }
     join(&folder.path, path).ok_or_else(|| String::from("out of memory"))
@@ -266,10 +270,16 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         let _ = writeln!(work, "hv: {}", why);
         return;
     }
+    /* `force`: each device given over what is on it, or another VM's. */
+    let Some((rest, force)) = take_flag(rest, "force") else {
+        let _ = writeln!(work, "hv: out of memory");
+        return;
+    };
+    let rest = rest.as_str();
     /* A cloud's image, by its URL: downloaded, made a disk, given a seed. */
     let first = rest.split_ascii_whitespace().next().unwrap_or("");
     if crate::cloud::is_url(first) {
-        crate::cloud::command(root, vms, name, first, rest[first.len()..].trim_start(), work);
+        crate::cloud::command(root, vms, name, first, rest[first.len()..].trim_start(), force, work);
         return;
     }
     let out = work;
@@ -289,8 +299,13 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         return;
     };
     let folder = Folder { name: String::from(name), path };
-    /* Its UUID, made now: the machine its OS knows it as, at every start. */
     let mut given = given;
+    /* Each device by its id from here on, and only where it may be given. */
+    if let Err(e) = give_devices(root, name, &mut given.disks, force) {
+        let _ = writeln!(out, "hv: {}", e);
+        return;
+    }
+    /* Its UUID, made now: the machine its OS knows it as, at every start. */
     given.uuid = given.uuid.or_else(|| Some(guest::random_uuid()));
     /* Checked as a start would check it -- the paths the folder's -- before
      * anything is written: a vm.toml that cannot boot is no use kept. */
@@ -339,7 +354,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         let mut missing = Vec::new();
         missing.push(o.kernel.as_str());
         missing.extend(o.initrd.as_deref());
-        missing.extend(o.disks.iter().map(|(p, _)| p.as_str()));
+        missing.extend(o.disks.iter().map(|(p, _)| p.as_str()).filter(|p| !crate::devices::is_device(p)));
         for path in missing {
             if kcore::fs::size(path).is_err() {
                 let _ = writeln!(out, "hv: {} is not there yet", path);
@@ -354,9 +369,61 @@ pub fn options_checked(folder: &Folder, c: &Config) -> Result<guest::Spec, Strin
     guest::spec(options(folder, c)?)
 }
 
+/// The devices among `disks` given as they are -- an id kept, a name made
+/// its device's id (`devices::given`) -- each where `devices::check` lets it
+/// be given to VM `vm` under `root`, and no two of them on one stretch of a
+/// disk: why not, otherwise.
+pub fn give_devices(root: &str, vm: &str, disks: &mut [(String, bool)], force: bool) -> Result<(), String> {
+    let mut given: Vec<kcore::block::Disk> = Vec::new();
+    given.try_reserve_exact(disks.len()).map_err(|_| String::from("out of memory"))?;
+    for (word, _) in disks.iter_mut() {
+        if !crate::devices::is_device(word) {
+            continue;
+        }
+        let (disk, id) = crate::devices::given(word)?;
+        if given.iter().any(|d| d.overlaps(&disk)) {
+            return Err(alloc::format!("{} is given twice, or overlaps another of its disks", word));
+        }
+        crate::devices::check(root, vm, &disk, force)?;
+        given.push(disk);
+        *word = id;
+    }
+    Ok(())
+}
+
+/// `args` with every word `flag` before `cmdline=` taken out -- which takes
+/// the rest of the line, a word like it included -- and whether there was
+/// one; None for memory.
+pub(crate) fn take_flag(args: &str, flag: &str) -> Option<(String, bool)> {
+    let mut out = String::new();
+    out.try_reserve_exact(args.len()).ok()?;
+    let mut found = false;
+    let mut rest = args.trim_start();
+    while !rest.is_empty() {
+        if rest.starts_with("cmdline=") {
+            out.push_str(rest);
+            break;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..end];
+        rest = rest[end..].trim_start();
+        if word == flag {
+            found = true;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    Some((out, found))
+}
+
 /// What `delete` did: how many files and folders it took away, and the
 /// disks it kept.
 pub struct Deleted {
+    /// Its devices, which a delete never touches.
+    pub devices: Vec<String>,
     pub removed: usize,
     pub kept: Vec<String>,
 }
@@ -386,6 +453,9 @@ pub fn delete_command(root: &str, vms: &Vms, args: &str, out: &mut dyn Write) {
             let _ = writeln!(out, "hv: {} deleted -- {} files and folders taken away", name, d.removed);
             for disk in &d.kept {
                 let _ = writeln!(out, "hv: {} kept", disk);
+            }
+            for device in &d.devices {
+                let _ = writeln!(out, "hv: {} left as it is -- a device, which a delete never touches", device);
             }
         }
         Err(e) => {
@@ -421,6 +491,7 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
     let config = join(&folder.path, CONFIG).ok_or_else(oom)?;
     let inside = |path: &str| path.len() > folder.path.len() + 1 && path.starts_with(folder.path.as_str())
         && path.as_bytes()[folder.path.len()] == b'/';
+    let devices: Vec<String> = disks.iter().map(|(p, _)| p).filter(|p| crate::devices::is_device(p)).cloned().collect();
     let kept: Vec<String> = if keep { disks.into_iter().map(|(p, _)| p).filter(|p| inside(p)).collect() } else { Vec::new() };
 
     /* What is in it, every level down: its files, and its folders with how
@@ -470,7 +541,7 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
         kcore::fs::remove(&folder.path).map_err(|_| alloc::format!("{} could not be taken away", folder.path))?;
         removed += 1;
     }
-    Ok(Deleted { removed, kept })
+    Ok(Deleted { devices, removed, kept })
 }
 
 /// `hv vms`: the folders under `root`, and of each what its vm.toml says

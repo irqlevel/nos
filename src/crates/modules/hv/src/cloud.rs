@@ -113,6 +113,11 @@ pub fn is_url(word: &str) -> bool {
 pub struct Recipe<'a> {
     pub url: &'a str,
     pub size: Option<u64>,
+    /// A device of nos's the image is poured onto (`image::pour`) in place
+    /// of a disk in the folder: its id or name (`devices::given`) -- given
+    /// over what is on it, or another VM's, with `force`.
+    pub onto: Option<&'a str>,
+    pub force: bool,
     pub password: Option<&'a str>,
     pub hvboot: &'a str,
     pub user_data: Option<&'a str>,
@@ -129,12 +134,13 @@ pub struct Created {
     pub keys: usize,
 }
 
-/// `hv create <name> <url> [words]`, its name checked already.
-pub fn command(root: &str, vms: &Vms, name: &str, url: &str, words: &str, work: &mut dyn Work) {
+/// `hv create <name> <url> [words]`, its name checked already, and `force`
+/// taken out of its words.
+pub fn command(root: &str, vms: &Vms, name: &str, url: &str, words: &str, force: bool, work: &mut dyn Work) {
     let made = own_words(words).and_then(|(own, rest)| {
         let o = guest::words(&alloc::format!("{} {}", own.hvboot, rest), store::CREATE_USAGE)?;
-        let recipe = Recipe { url, size: own.size, password: own.password, hvboot: own.hvboot, user_data: None,
-                              protected: false };
+        let recipe = Recipe { url, size: own.size, onto: own.onto, force, password: own.password, hvboot: own.hvboot,
+                              user_data: None, protected: false };
         create(root, vms, name, &recipe, o, work)
     });
     if let Err(e) = made {
@@ -181,12 +187,13 @@ impl Drop for Made {
 /// whose words are the guest's.
 struct Own<'a> {
     size: Option<u64>,
+    onto: Option<&'a str>,
     password: Option<&'a str>,
     hvboot: &'a str,
 }
 
 fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
-    let mut own = Own { size: None, password: None, hvboot: HVBOOT };
+    let mut own = Own { size: None, onto: None, password: None, hvboot: HVBOOT };
     let mut rest = String::new();
     let mut tail = words.trim_start();
     while !tail.is_empty() {
@@ -206,6 +213,11 @@ fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
             own.password = Some(v);
         } else if let Some(v) = word.strip_prefix("hvboot=") {
             own.hvboot = v;
+        } else if let Some(v) = word.strip_prefix("onto=") {
+            if v.is_empty() {
+                return Err(String::from("onto= wants a device of nos's: dev:<name>, part:<id> or disk:<id>"));
+            }
+            own.onto = Some(v);
         } else {
             rest.push_str(word);
             rest.push(' ');
@@ -330,8 +342,27 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     o.net = true;
     o.restart = true;
     o.uuid = o.uuid.or_else(|| Some(crate::guest::random_uuid()));
-    let theirs = core::mem::take(&mut o.disks);
-    o.disks.push((String::from(DISK), false));
+    /* Its first disk: a file in its folder -- or the device the image is
+     * poured onto, by its id, where it may be given. */
+    let onto = match recipe.onto {
+        Some(word) => {
+            if recipe.size.is_some() {
+                return Err(String::from("size= is a file's: a device's disk is the device's size"));
+            }
+            let (disk, id) = crate::devices::given(word)?;
+            crate::devices::check(root, name, &disk, recipe.force)?;
+            Some((disk, id))
+        }
+        None => None,
+    };
+    let mut theirs = core::mem::take(&mut o.disks);
+    store::give_devices(root, name, &mut theirs, recipe.force)?;
+    if let Some((disk, _)) = &onto {
+        if theirs.iter().any(|(w, _)| crate::devices::find(w).is_ok_and(|d| d.overlaps(disk))) {
+            return Err(String::from("onto= is one of its disk= too, or overlaps one"));
+        }
+    }
+    o.disks.push((onto.as_ref().map_or_else(|| String::from(DISK), |(_, id)| id.clone()), false));
     o.disks.push((String::from(SEED), true));
     o.disks.extend(theirs);
     let path = store::join(root, name).ok_or_else(|| String::from("out of memory"))?;
@@ -361,15 +392,16 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
         store::make_dirs(&folder.path).map_err(|_| alloc::format!("{} could not be made", folder.path))?;
         made.folder = Some(folder.path.clone());
     }
-    let created = fill(&folder, recipe, &text, &file, &mut made, work)?;
+    let created = fill(&folder, recipe, onto.map(|(disk, _)| disk), &text, &file, &mut made, work)?;
     made.keep();
     Ok(created)
 }
 
 /// The folder's files, each kept in `made` as it is: the image, the disk
-/// made of it, the user-data and the seed, and last the vm.toml.
-fn fill(folder: &Folder, recipe: &Recipe, text: &str, file: &str, made: &mut Made, work: &mut dyn Work)
-        -> Result<Created, String> {
+/// made of it -- or poured onto the device `onto` -- the user-data and the
+/// seed, and last the vm.toml.
+fn fill(folder: &Folder, recipe: &Recipe, onto: Option<kcore::block::Disk>, text: &str, file: &str, made: &mut Made,
+        work: &mut dyn Work) -> Result<Created, String> {
     let join = |f: &str| store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"));
     let url = recipe.url;
     /* The URL's name where the path it makes is one the VFS takes. */
@@ -409,6 +441,35 @@ fn fill(folder: &Folder, recipe: &Recipe, text: &str, file: &str, made: &mut Mad
                      Rate::of(len, ns));
     made.files.push(download.clone());
 
+    /* Onto a device: poured, the download taken away after. What a pour
+     * that fails leaves on the device is the device's -- said. */
+    let poured = match onto {
+        Some(disk) => {
+            let device = disk.name();
+            let holder = alloc::format!("hv create {}", folder.name);
+            let poured = image::pour(&download, disk, &holder, work)
+                .map_err(|e| alloc::format!("{} -- {} holds part of the image now", e, device))?;
+            if kcore::fs::remove(&download).is_ok() {
+                made.files.retain(|f| *f != download);
+            }
+            Some(poured.size + poured.rest)
+        }
+        None => None,
+    };
+    let size = match poured {
+        Some(size) => size,
+        None => file_disk(&download, &disk, recipe.size, made, work)?,
+    };
+    if work.cancelled() {
+        return Err(String::from(work::STOPPED));
+    }
+    finish(folder, recipe, text, file, &user_path, &seed_path, size, made, work)
+}
+
+/// The download made the folder's disk -- converted, or renamed as it is --
+/// and grown to `size`: its size.
+fn file_disk(download: &str, disk: &str, size: Option<u64>, made: &mut Made, work: &mut dyn Work) -> Result<u64, String> {
+    let (download, disk) = (String::from(download), String::from(disk));
     /* What it is, by its first bytes: from the heap, the task's stack
      * being 64 KiB. */
     let mut head = Vec::new();
@@ -434,8 +495,15 @@ fn fill(folder: &Folder, recipe: &Recipe, text: &str, file: &str, made: &mut Mad
     if work.cancelled() {
         return Err(String::from(work::STOPPED));
     }
+    grow(&disk, size)
+}
 
-    let size = grow(&disk, recipe.size)?;
+/// The user-data, the seed and the vm.toml written, each kept in `made`:
+/// what was made, the disk's `size` said.
+#[allow(clippy::too_many_arguments)]
+fn finish(folder: &Folder, recipe: &Recipe, text: &str, file: &str, user_path: &str, seed_path: &str, size: u64,
+          made: &mut Made, work: &mut dyn Work) -> Result<Created, String> {
+    let (user_path, seed_path) = (String::from(user_path), String::from(seed_path));
     let keys = keys();
     let user = match recipe.user_data {
         Some(u) => String::from(u),

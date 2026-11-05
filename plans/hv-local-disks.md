@@ -1,0 +1,105 @@
+# hv: a VM's disk on a partition or a whole disk of nos's
+
+Asked 2026-11-05: a VM created with a partition or a disk nos sees as its
+disk, `fs/image` left out of the way entirely. Decided with the user: whole
+disks as well as partitions; a device with a filesystem on it given only with
+`force`; provisioning a device from a cloud image in the same round; a spare
+partition on the EX44 for the tests.
+
+## Where it starts
+
+A guest's disk is a file today: virtio-blk in `hv` -> `FileDisk`
+(`modules/hv/src/disk.rs`) -> `kcore::fs::ImageQueue` -> `fs::image` (the
+file's extent map, growth, growth ahead, ext4 commits) -> `block::queue` ->
+the NVMe driver. What is there to build on:
+
+- `hv::disk::Backend` is narrow (`size`, `read_only`, `with_buffer`,
+  `submit`, `take`) and a guest takes any `Box<dyn Backend>` (`guest.rs`).
+- `block::queue::Queue` is the asynchronous path `fs::image` itself uses;
+  128 queues of 256 I/Os each, where VMs have 16 x 4 disks at most.
+- The block table's claims (`block/src/table.rs`) refuse overlapping
+  stretches of one disk: a mounted partition, the disk under it and the
+  partitions over it exclude one another -- nos's root is safe already.
+
+What is missing: stable names (Linux and nos alike number the EX44's two
+NVMe drives differently from boot to boot, and the table keeps no GPT GUID
+and no serial number), a claim's holder named by the module that holds it
+(it reads "a module writing to it"), discard, and a module's way to the
+asynchronous path without `unsafe` of its own.
+
+## What it looks like
+
+- vm.toml: `disks = ["part:3f0c...", "/vms/web/seed.iso:ro"]` -- devices and
+  files mixed, `:ro` for either. `part:<PARTUUID>` is a partition: its GPT
+  unique GUID, or `<MBR signature>-<number>` as Linux writes them;
+  `disk:<id>` is a whole disk by its serial (`nvme-<serial>`). A device's
+  name (`nvme14`) is taken where a device is given and written down as its
+  id -- never stored as a name.
+- `hv devices`: what can be given to a VM -- id, name, size, who holds it,
+  which VM's vm.toml names it, what is on it.
+- `hv create <name> <url> disk=<device> [force]` pours a cloud image onto the
+  device and gives back the rest of it; `hv create <name> disk=<device>` and
+  `hv disk attach <vm> <device> [ro] [force]` give a device as it is.
+- The `vm` provider and the panel: a device list, create onto a device,
+  attach one.
+
+## Safety
+
+1. A VM's start claims each device it has, named `vm <name>`: while it runs
+   no mount, disk log, other writer or VM can have it, nor anything that
+   overlaps it.
+2. Never given: an EFI System partition, a BIOS boot partition.
+3. A device with something on it -- an ext2/3/4, XFS, btrfs, swap, FAT,
+   NTFS, LVM, md RAID, LUKS, ISO 9660, a partition table -- is given only with
+   `force`, the refusal saying what was found. Checked where a device is
+   given, not at every start: from then on its contents are the VM's.
+4. A device another VM's vm.toml names is given only with `force`.
+5. `hv clone` of a VM with a device disk is refused; `hv delete` leaves its
+   devices alone and says so.
+6. A guest can put an ext4 labelled `nos` on its disk: a machine with device
+   disks boots with `root=UUID=` (as nos-install sets it), and `root=auto`
+   refuses two candidates rather than taking the first.
+7. With a whole disk nos reads the guest's partition table at every boot
+   (and its superblocks under `root=auto`): both are fs-fuzz's already.
+
+## Steps
+
+**P1, the block layer.** Stable ids in the device table (GPT unique and type
+GUIDs, MBR signature and number, the NVMe serial), in `disks` and the
+`block` provider, and a lookup by id; a claim with a holder's name;
+`kcore::block::DiskQueue`, `ImageQueue`'s calls over a device -- a request
+split at the device's largest I/O and given back whole, done at once on a
+device without the asynchronous path, no `unsafe` in the module; discard by
+the NVMe's Dataset Management. Gates: parttest, fs-fuzz, netblk-test,
+sshd-test (the ffi digest), the smoke boots.
+
+**P2, a VM's disk on a device.** `DeviceDisk`, sharing the disk task's loop
+with `FileDisk`; the device's virtio-blk features from its backend (discard
+where the device has it, no write of zeros, `BLK_SIZE` for 4 KiB sectors);
+vm.toml's words, `hv devices`, the checks above, the provider and the panel.
+Gates: hv-test's new phase (a QEMU NVMe with a GPT: a guest's disk on a
+partition, the refusals, the partition found by PARTUUID with the drives
+swapped), hv-linux-test `--device`, hv-fuzz, api-test, web-test, the panel's
+tests.
+
+**P3, a device provisioned.** `hv create <url> disk=`: the cloud image
+converted straight onto the device, the rest of it discarded; `hv convert`
+onto a device.
+
+**P4, speed, each measured.** An asynchronous flush; DMA straight into the
+guest's memory rather than through a slot's buffer -- its memory is the huge
+pool's 2 MiB pages, a request's segments become PRP lists, and a request
+whose segments PRP cannot take goes through the copy as now.
+
+## What to expect
+
+The first write to a new file -- 80% of KVM with a file -- the most: no
+growth, no ext4 commits, no flushes of its own. 4k reads and writes a little
+(no extent lookup, no image lock). 1 MiB transfers not until P4 (the copy on
+the E-core stays). The fair comparison is KVM on the same partition as a raw
+drive.
+
+## Limits of the first version
+
+Devices are those nos found at boot; one VM a device, read-only or not; the
+old contents of a device given as it is are the guest's to read.
