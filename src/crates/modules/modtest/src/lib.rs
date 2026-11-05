@@ -323,6 +323,23 @@ fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> 
             return Err("an echo's bytes");
         }
     }
+    /* An echo received in pieces, as a message larger than one block of
+     * the heap has to be: 200 KB in 64 KiB pieces, and one of no bytes */
+    for n in [200_000, 0] {
+        let data = pattern(n);
+        mb.send(echo, 8, 99, &data).map_err(|_| "a send to kernel.echo")?;
+        let got = mb.recv_pieces(Duration::from_secs(5), kcore::ipc::PIECE_MAX).ok_or("an echo in pieces")?;
+        let mut at = 0;
+        for p in &got.pieces {
+            if p.len() > kcore::ipc::PIECE_MAX || data.get(at..at + p.len()) != Some(&p[..]) {
+                return Err("an echo's pieces");
+            }
+            at += p.len();
+        }
+        if got.tag != 8 || got.reference != 99 || got.from != echo || got.len != n || at != n {
+            return Err("an echo received in pieces");
+        }
+    }
     let gone = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?.addr();
     if mb.send(gone, 1, 0, b"x") != Err(E::Gone) {
         return Err("a message to a mailbox closed");

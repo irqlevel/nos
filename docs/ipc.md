@@ -58,11 +58,22 @@ In a module (`kcore::ipc`):
 let mb = Mailbox::new(Limits::DEFAULT)?;        // owned by this module: the kernel knows it by its code's address
 mb.register("nbs.mds", Scope::Cluster)?;
 let msg = mb.recv(Duration::from_secs(1));      // Message { from, tag, reference, data }
+let big = mb.recv_pieces(Duration::from_secs(1), PIECE_MAX);   // Pieces { .., len, pieces: Vec<Vec<u8>> }
 let answer = mb.call(lookup("kernel.echo").unwrap(), 7, b"ping", Duration::from_secs(5))?;
 ```
 
 A `call` monitors what it calls, so it ends with the answer, a `Down` or its
 timeout -- never by waiting for a peer that is gone.
+
+A module's heap gives at most 512 KiB in one block, and a message may be a
+megabyte: `recv` copies a message into one `Vec`, and leaves first one it
+has no room for; `recv_pieces` takes any message, in pieces of at most 64
+KiB, through `kernel_ipc_recv_part` -- a part of the first message at an
+offset, a ticket from its first part held to at every part after so that
+all of them are of one message, the message taken with its last byte. What
+the router hands on from a peer (`deliver_remote`) goes in pieces too. A
+module's `send` is still of one buffer: a module sends at most what its heap
+holds in one block.
 
 From the shell:
 
@@ -165,7 +176,10 @@ hands back what peers say.
   message and the Down of its sender, which comes by the control one.
 - **Hosts coming and going** are told to the watchers of `host.`
   (`NameUp`/`NameDown` of `host.<name>`, from the peer's number); nobody may
-  name a mailbox under `host.`.
+  name a mailbox under `host.`. A router's own close loses every peer, and
+  is told to every watcher but itself: its watches and remote monitors go
+  first, so the task waiting on it finds it closed, not a NameDown of its
+  own making.
 - `ipc peers` lists the router and the peers; `ipc` counts what went to
   peers and came from them, and what was refused.
 
@@ -198,6 +212,9 @@ exactly the frame. Its gate is `ipc-fuzz.py --target wire`.
 - This host only: a message to another host's address is `NoRoute` until
   `ipcnet` (plans/ipc.md, I3 and I4).
 - Copies: a payload is copied in and out.
+- A module sends a message of one buffer, so of at most what one block of
+  its heap holds (512 KiB): a send in pieces comes when a module needs one
+  (NBS's data).
 - One receiver a mailbox: a second task waiting on the same one is refused
   and said.
 - Every send takes the table's lock once to find its mailbox: one lock for
