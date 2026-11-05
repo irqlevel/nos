@@ -28,7 +28,7 @@ fn frame<'a>(r: &mut Input, data: &'a [u8]) -> Frame<'a> {
         0 => {
             let mut cluster = [0u8; 16];
             cluster.copy_from_slice(&r.bytes(16)[..16]);
-            Frame::Hello { version: r.u16(), cluster, from: r.pick(&HOSTS), to: r.pick(&HOSTS) }
+            Frame::Hello { version: r.u16(), cluster, session: r.u64(), from: r.pick(&HOSTS), to: r.pick(&HOSTS) }
         }
         1 => Frame::Ping { seq: r.u64() },
         2 => Frame::Pong { seq: r.u64() },
@@ -167,14 +167,24 @@ struct Out {
     frames: VecDeque<Vec<u8>>,
     /// Whether the assembler took its head.
     opened: bool,
+    /// The bytes of each of its bodies but the last.
+    chunk: usize,
+}
+
+/// How many bodies a message is cut into, and so pieces the assembler keeps.
+fn chunk_of(o: &Out) -> usize {
+    o.chunk
 }
 
 fn assemble(r: &mut Input) {
     let max_open = r.pick(&[1usize, 2, 8]);
     let max_bytes = r.pick(&[1usize << 10, 256 << 10, MESSAGE_MAX]);
-    let mut a = Assembler::new(max_open, max_bytes);
-    /* The model's count of what open messages promised */
+    let max_pieces = r.pick(&[3usize, 64, 4096]);
+    let mut a = Assembler::new(max_open, max_bytes, max_pieces);
+    /* The model's count of what open messages promised, and of the pieces
+     * they are kept in */
     let mut promised = 0usize;
+    let mut pieces = 0usize;
     let mut outs: Vec<Out> = Vec::new();
     for i in 0..r.below(6) {
         /* Under the machine's 512 KiB a block, as the kernel's heap holds
@@ -189,12 +199,29 @@ fn assemble(r: &mut Input) {
         let msg = i as u32 * 7 + 1;
         let from = r.u64();
         let mut fs = VecDeque::new();
-        for f in frames(msg, to, from, 3, 4, &data).expect("a message within the limit") {
+        /* Bodies as full as a frame holds, mostly, as `frames` cuts them --
+         * and now and then a sender's smaller ones, which cost the
+         * assembler a piece each */
+        /* (A message's frames are kept here a Vec each, under the machine's
+         * 512 KiB a block: small bodies for small messages alone) */
+        let chunk = if len <= 20_000 { r.pick(&[BODY_MAX, BODY_MAX, 1000, 7]) } else { BODY_MAX };
+        let head = Frame::Head { msg, to, from, tag: 3, reference: 4, len: len as u32 };
+        let mut push = |f: &Frame<'_>| {
             let mut b = Vec::new();
-            encode(&f, &mut b).expect("a message's frame");
+            encode(f, &mut b).expect("a message's frame");
             fs.push_back(b);
+        };
+        if chunk == BODY_MAX {
+            for f in frames(msg, to, from, 3, 4, &data).expect("a message within the limit") {
+                push(&f);
+            }
+        } else {
+            push(&head);
+            for d in data.chunks(chunk) {
+                push(&Frame::Body { msg, data: d });
+            }
         }
-        outs.push(Out { msg, data, to: dest, from, frames: fs, opened: false });
+        outs.push(Out { msg, data, to: dest, from, frames: fs, opened: false, chunk });
     }
     loop {
         /* One of those with frames left -- whatever the input has left */
@@ -265,6 +292,15 @@ fn assemble(r: &mut Input) {
                     invariant!(res == Err(Error::Message), "a body of a message never opened answered {:?}", res);
                     continue;
                 }
+                if pieces >= max_pieces {
+                    invariant!(res == Err(Error::Limit), "a body past {} pieces answered {:?}", max_pieces, res);
+                    reached("wire: a body past the pieces refused");
+                    /* Its message stays open, holding what it promised: the
+                     * connection ends, and nothing more of it comes */
+                    outs[i].frames.clear();
+                    continue;
+                }
+                pieces += 1;
                 if o.frames.is_empty() {
                     let want = Message { to: o.to.clone(), from: o.from, tag: 3, reference: 4, pieces: Vec::new() };
                     match &res {
@@ -277,6 +313,7 @@ fn assemble(r: &mut Input) {
                         _ => invariant!(false, "a message's last body answered {:?}", res),
                     }
                     promised -= o.data.len();
+                    pieces -= o.data.len().div_ceil(chunk_of(o));
                     outs[i].opened = false;
                 } else {
                     invariant!(res == Ok(None), "a body before the last answered {:?}", res);
@@ -286,6 +323,8 @@ fn assemble(r: &mut Input) {
         }
         invariant!(a.held() == promised && a.held() <= max_bytes, "the assembler holds {} bytes, the model {}",
                    a.held(), promised);
+        invariant!(a.pieces() == pieces && pieces <= max_pieces, "the assembler keeps {} pieces, the model {}",
+                   a.pieces(), pieces);
     }
 }
 

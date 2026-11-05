@@ -1,7 +1,9 @@
 //! `kernel.echo`: a mailbox of the image's that answers whatever it is sent
 //! with what it was sent -- the same tag, the same reference, the payload
 //! back -- for the boot's test of the module side (test_module_ipc), and a
-//! ping for whoever wants one (`ipc echo`). It runs only while started.
+//! ping for whoever wants one (`ipc echo`, `ipc ping`). It runs only while
+//! started, and its name is the cluster's: a peer's `ipc ping
+//! kernel.echo@host` reaches it through ipcnet.
 //!
 //! Sent `TAG_ECHO_PESTER`, it also monitors the sender and sends it a
 //! message every millisecond until the sender's Down comes: a module
@@ -71,7 +73,7 @@ pub fn echo_start() -> Result<(), &'static str> {
         return Err("it runs already");
     }
     let mb = Mailbox::new(LIMITS).map_err(|_| "no mailbox for it")?;
-    mb.register(NAME, Scope::Host).map_err(|_| "kernel.echo is another mailbox's")?;
+    mb.register(NAME, Scope::Cluster).map_err(|_| "kernel.echo is another mailbox's")?;
     s.addr = mb.addr();
     s.task = Some(kcore::task::spawn_with("ipc/echo", mb, serve).ok_or("no task for it")?);
     Ok(())

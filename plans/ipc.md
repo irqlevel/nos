@@ -458,8 +458,24 @@ peers' mailboxes and `HostLost`, the router's close -- for the image's tasks
 and through the C ABI for a module (`kcore::ipc`), held by the fuzz model
 and a self-test at every boot; and the TCP ABI a module needs for it
 (`kcore::tcp`: `TcpListener::bind_allowed` and `set_allowed`, T3's
-allowlist, and `TcpStream::set_rto_floor`, the link's 20 ms, T2). Next:
-the module.
+allowlist, and `TcpStream::set_rto_floor`, the link's 20 ms, T2).
+
+And then the module, `modules/ipcnet` (docs/ipc.md, "Between hosts:
+ipcnet"), with what it needed of the channel: a bounce told back to a
+sender (`TAG_BOUNCED`), the tag's bulk bit, a message received in pieces --
+a module's heap gives 512 KiB at once, and the router is handed messages of
+a megabyte -- and `deliver_remote`'s payload in pieces; a router's close no
+longer heard by itself, which the fuzz model found. `ipcwire`'s Hello
+carries the session, its assembler a bound on its pieces. `ipc-test.py` on
+`scripts/hub.py`'s LAN passes on arm64 under HVF; what it found was the
+sender's own, two messages of one pair begun at once and delivered out of
+order, which it now never does. Left of I4: net-fuzz's `ipcnet` target,
+the x86-64 run, and the links' polling -- a small message's round trip is
+some 7 ms at the median, the connection's task waking a millisecond at a
+time while things move and up to 10 ms when they do not, its socket and its
+queue each polled. A wait on one event for both -- TCP's receive path
+signalling a connection's event, as a mailbox's push signals its own -- is
+the next step, and the measurements after it.
 
 ## Limits of the first version
 
