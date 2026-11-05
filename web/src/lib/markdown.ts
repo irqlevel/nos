@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Element, ElementContent, Root as HastRoot } from "hast";
-import type { Html, Paragraph, Root as MdastRoot, Text } from "mdast";
+import type { Html, Paragraph, Parent, Root as MdastRoot, RootContent, Text } from "mdast";
+import type { Node } from "unist";
 import rehypeShiki from "@shikijs/rehype";
 import { toString } from "hast-util-to-string";
 import rehypeAutolinkHeadings from "rehype-autolink-headings";
@@ -60,6 +61,94 @@ interface FileData {
 
 function data(file: VFile): FileData {
     return file.data as unknown as FileData;
+}
+
+/* What a <details> folds away, under its summary (remarkDetails). */
+interface Details extends Parent {
+    type: "details";
+}
+
+declare module "mdast" {
+    interface RootContentMap {
+        details: Details;
+    }
+}
+
+const detailsOpenRe = /^<details>\s*<summary>([^<>]+)<\/summary>$/;
+const detailsCloseRe = /^<\/details>$/;
+const detailsTagRe = /<\/?(?:details|summary)\b/i;
+
+/*
+ * A page may fold something long away -- a table of every number -- and
+ * writes it as GitHub renders it, so the source reads the same there:
+ *
+ *     <details>
+ *     <summary>All the numbers</summary>
+ *
+ *     | ... | ... |
+ *
+ *     </details>
+ *
+ * The first two lines are one HTML block and the closing tag another, at the
+ * top level of the page. That form becomes a <details> and its <summary>, the
+ * summary taken as plain text; everything else of HTML is still shown as text
+ * (remarkHtmlAsText). A <details> or <summary> written any other way, one
+ * left open, one inside another, or a heading inside one -- the table of
+ * contents would link to what the reader cannot see -- fails the build.
+ */
+function remarkDetails() {
+    return (tree: MdastRoot, file: VFile) => {
+        const where = data(file).ctx.file;
+        const fail = (node: Node, why: string): never => {
+            throw new Error(`${where}:${node.position?.start.line ?? "?"}: ${why}`);
+        };
+        const children: RootContent[] = [];
+        let open: Details | null = null;
+        for (const node of tree.children) {
+            const value = node.type === "html" ? node.value.trim() : null;
+            if (value !== null && detailsTagRe.test(value)) {
+                const summary = detailsOpenRe.exec(value);
+                if (summary) {
+                    if (open) {
+                        fail(node, "a <details> inside another");
+                    }
+                    const text: Text = { type: "text", value: (summary[1] as string).trim() };
+                    const head: Paragraph = { type: "paragraph", data: { hName: "summary" }, children: [text] };
+                    open = { type: "details", data: { hName: "details" }, position: node.position, children: [head] };
+                } else if (detailsCloseRe.test(value)) {
+                    if (!open) {
+                        fail(node, "a </details> with no <details> before it");
+                    } else {
+                        children.push(open);
+                        open = null;
+                    }
+                } else {
+                    fail(
+                        node,
+                        "write a <details> as <details>, <summary>text</summary> on the next line, " +
+                            "then a blank line, and close it with </details> on a line of its own",
+                    );
+                }
+            } else if (open) {
+                if (node.type === "heading") {
+                    fail(node, "a heading inside <details>: the table of contents would link into it");
+                }
+                open.children.push(node);
+            } else {
+                children.push(node);
+            }
+        }
+        if (open) {
+            fail(open, "a <details> that is never closed");
+        }
+        tree.children = children;
+        // Anywhere but the top level a <details> could only be shown as text: say so instead.
+        visit(tree, "html", (node: Html) => {
+            if (detailsTagRe.test(node.value)) {
+                fail(node, "a <details> or <summary> that is not on lines of its own at the top level");
+            }
+        });
+    };
 }
 
 /*
@@ -265,6 +354,7 @@ function rehypeWrapTables() {
 const processor = unified()
     .use(remarkParse)
     .use(remarkGfm)
+    .use(remarkDetails)
     .use(remarkHtmlAsText)
     .use(remarkRehype)
     .use(rehypeSlug)
