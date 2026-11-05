@@ -13,3 +13,5 @@ edition = "2021"
 [dependencies]
 ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
+# The head of a message routed to another host, which ipcnet reads.
+ipcwire = { path = "../ipcwire" }

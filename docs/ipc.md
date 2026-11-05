@@ -118,6 +118,44 @@ ipc echo [start|stop]   kernel.echo, which answers what it is sent with what it 
   channel knows a module by -- to the module's name inside its image and
   nothing outside.
 
+## Between hosts: the router
+
+What the channel does of another host's, built before what carries it
+(ipcnet, plans/ipc.md I4): one mailbox may be the **router** (`route`), and
+the channel hands it whatever is for a peer -- the router carries it, and
+hands back what peers say.
+
+- **A peer's number** is this host's own: the router says a peer is up
+  (`peer_up`) and is given its number, the host part of the addresses of
+  its mailboxes here -- an index in the low six bits, an epoch above. Lost
+  (`peer_lost`) and up again, it has the next epoch: an address held from
+  before the loss is `NoRoute`, never another mailbox's. On the wire an
+  address is always the owning host's, and the router rewrites it.
+- **To a peer**: a send to a peer's address, or to `name@host`, goes into
+  the router's mailbox -- its limits the host's cap on what waits to go out,
+  `Full` at the send -- as a message tagged `TAG_ROUTE` whose payload begins
+  with ipcwire's route head (where it goes, its tag and reference), its own
+  bytes after. The sender is kept, first, as a mailbox the peer may answer.
+- **From a peer** (`deliver_remote`, the router's call): delivered to a
+  `Cluster` name, or to a mailbox that has sent to that peer -- the newest
+  256 a peer, forgotten when the mailbox closes or the peer is lost -- and
+  refused (`NotYours`, counted) for anything else: a `Host` name is
+  unreachable from outside. Its `from` is given the peer's number.
+- **Monitors of a peer's mailbox** are kept here, on the watcher's host, as
+  every monitor is, their Downs made and their places kept; the router is
+  asked to have the peer watch (`TAG_ROUTE` again), and its `remote_down`
+  hands the Down over. A peer lost ends them all with `HostLost`, needing
+  nothing from the host that is gone; a router's close loses every peer.
+- **Hosts coming and going** are told to the watchers of `host.`
+  (`NameUp`/`NameDown` of `host.<name>`, from the peer's number); nobody may
+  name a mailbox under `host.`.
+- `ipc peers` lists the router and the peers; `ipc` counts what went to
+  peers and came from them, and what was refused.
+
+The fuzz model holds all of it to its own -- routed heads byte for byte,
+the answer rule, the epochs, HostLost in its kept place, a router's close --
+and nine mutants of it each fail the gate.
+
 ## Between hosts: the wire
 
 `ipcwire` (`src/crates/ipcwire`, no kernel and no `unsafe`) is what ipcnet
