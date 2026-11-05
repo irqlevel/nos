@@ -7,6 +7,7 @@ mod dhcp;
 mod dns;
 mod http;
 mod icmp;
+mod ipcnet;
 mod netconsole;
 mod ssh;
 mod stack;
@@ -33,6 +34,7 @@ pub static ALL: &[Target] = &[
     Target { name: "tls_client", run: tls_client::tls_client, max_len: 1024, gate: 300 },
     Target { name: "terminal", run: terminal::terminal, max_len: 4096, gate: 20000 },
     Target { name: "api", run: api::api, max_len: 1024, gate: 500 },
+    Target { name: "ipcnet", run: ipcnet::ipcnet, max_len: 1024, gate: 2000 },
 ];
 
 /// Everything the machine still holds of what an input did, once it has
