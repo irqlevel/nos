@@ -18,9 +18,10 @@
 
 use std::collections::BTreeMap;
 
-use net::tcp::{Buffers, Conn, Receive, LISTEN_BACKLOG, TCP};
+use net::tcp::{Buffers, Conn, Receive, ALLOW_MAX, LISTEN_BACKLOG, RST_BURST, RST_INTERVAL_US, TCP};
 use netwire::{icmp, tcp as seg, IP_PROTO_ICMP, IP_PROTO_TCP};
 
+use crate::input::noise;
 use crate::machine::{sched, ETH0_MAC};
 use crate::world::frames::{self, Ip, Sum};
 use crate::world::lan::Lan;
@@ -36,11 +37,21 @@ const NEAR_IP: u32 = 0x0A00_0264;
 const NEAR_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x64];
 const FAR_IP: u32 = 0x5DB8_D822;
 
-/// The ports the machine listens on -- one of them a bulk listener's -- and
-/// where the peer's own listening ports -- one for each connect of the
-/// machine's -- begin.
-const LISTEN_PORTS: [u16; 4] = [7001, 7002, 22, BULK_PORT];
+/// The ports the machine listens on -- one of them a bulk listener's, one
+/// a listener's with an allowlist -- and where the peer's own listening
+/// ports -- one for each connect of the machine's -- begin.
+const LISTEN_PORTS: [u16; 5] = [7001, 7002, 22, BULK_PORT, ALLOW_PORT];
 const BULK_PORT: u16 = 7003;
+/// The listener with an allowlist (`listen_allowed`): which addresses it
+/// answers is the input's, and changes as the input says.
+const ALLOW_PORT: u16 = 7004;
+/// A host on the LAN no program of the machine talks to: it sends the
+/// listeners segments of every kind, and floods a port nobody listens on.
+const STRANGER_IP: u32 = 0x0A00_02C8;
+const STRANGER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0xC8];
+const STRANGER_PORT_BASE: u16 = 50000;
+/// A port nobody listens on
+const CLOSED_PORT: u16 = 9;
 const PEER_PORT_BASE: u16 = 8000;
 const PEER_SRC_BASE: u16 = 30000;
 
@@ -63,9 +74,27 @@ struct Wire {
     /// which (xorshift, from the input).
     machine_loss: u32,
     choices: u64,
+    /// The allowlisted listener's list as the model has it: None for
+    /// anyone -- no list, or no listener -- and the addresses any list of
+    /// the input has admitted. Nothing may leave its port for any other.
+    allow: Option<Vec<(u32, u8)>>,
+    admitted: Vec<u32>,
 }
 
 impl Wire {
+    /// The allowlisted listener's list from now on: `allow`, None for
+    /// anyone. What it admits of the hosts that send to it is admitted for
+    /// the rest of the input -- a connection made stays when its address
+    /// leaves the list.
+    fn allow_now(&mut self, allow: Option<Vec<(u32, u8)>>, peer_ip: u32) {
+        for ip in [peer_ip, STRANGER_IP] {
+            if admits(&allow, ip) && !self.admitted.contains(&ip) {
+                self.admitted.push(ip);
+            }
+        }
+        self.allow = allow;
+    }
+
     /// Whether the link loses a segment of the machine's carrying `data`:
     /// one with data in it, at `machine_loss` in 256. Its pure
     /// acknowledgements, its SYNs and its FINs all arrive.
@@ -86,6 +115,15 @@ impl Peers for Wire {
             return;
         }
         if let Some(p) = crate::world::check::ipv4_parts(frame) {
+            if p.proto == IP_PROTO_TCP && p.l4.len() >= seg::HDR_LEN && seg::src_port(p.l4) == ALLOW_PORT {
+                invariant!(self.admitted.contains(&p.dst), "the machine sent flags {:#04x} from port {}, which \
+                           answers its allowlist alone, to {}, which no list of this input admitted",
+                           seg::flags(p.l4), ALLOW_PORT, netwire::Ipv4(p.dst));
+            }
+            /* The stranger keeps nothing: not the peer's, nor a quote */
+            if p.dst == STRANGER_IP {
+                return;
+            }
             if p.proto == IP_PROTO_TCP && self.loses(tcp_payload_len(frame)) {
                 crate::common::runner::reached("tcp: the link lost a segment of the machine's");
                 return;
@@ -157,6 +195,68 @@ fn conn_word(c: &'static Conn) -> usize {
 
 fn conn_of(word: usize) -> &'static Conn {
     TCP.by_handle(word).expect("a connection the pool gave out")
+}
+
+/// Whether the allowlist `allow` admits `ip`, as the model reads one -- None
+/// for anyone.
+fn admits(allow: &Option<Vec<(u32, u8)>>, ip: u32) -> bool {
+    allow.as_ref().map_or(true, |nets| nets.iter().any(|&(net, prefix)| {
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(prefix.min(32))) };
+        ip & mask == net & mask
+    }))
+}
+
+/// An allowlist of the input's: nobody, everybody, the peer alone, the
+/// stranger alone, the LAN's /24 -- the near peer's and the stranger's --
+/// or as many hosts as a list holds and one more, or a prefix past 32: the
+/// last two refused.
+fn allow_list(r: &mut Input, peer_ip: u32) -> Vec<(u32, u8)> {
+    match r.u8() % 9 {
+        0 => Vec::new(),
+        1 => vec![(r.u32(), 0)],
+        2 => vec![(STRANGER_IP, 32)],
+        3 => vec![(ETH0_IP & MASK, 24)],
+        4 => {
+            let n = r.pick(&[ALLOW_MAX - 1, ALLOW_MAX, ALLOW_MAX + 1]);
+            let mut nets: Vec<(u32, u8)> = (0..n - 1).map(|i| (0xC0A8_0000 | i as u32, 32)).collect();
+            nets.push((peer_ip, 32));
+            nets
+        }
+        5 => vec![(peer_ip, r.pick(&[33u8, 255]))],
+        _ => vec![(peer_ip, r.pick(&[32u8, 31, 8]))],
+    }
+}
+
+/// The kernel's verdicts on the allowlisted listener `l` held to the
+/// model's: for the peer, the stranger, the networks' own edges and an
+/// address of the input's.
+fn check_allow(l: &'static Conn, allow: &Option<Vec<(u32, u8)>>, peer_ip: u32, r: &mut Input) {
+    let mut ips = vec![peer_ip, STRANGER_IP, r.u32(), ETH0_IP & MASK, (ETH0_IP & MASK) | 0xFF];
+    if let Some(nets) = allow {
+        for &(net, prefix) in nets.iter().take(4) {
+            let host = if prefix >= 32 { 0 } else { u32::MAX >> prefix.min(31) };
+            ips.extend([net, net | host, net.wrapping_sub(1), (net | host).wrapping_add(1)]);
+        }
+    }
+    for ip in ips {
+        let theirs = TCP.admits(l, ip);
+        invariant!(theirs == Some(admits(allow, ip)), "the allowlisted listener answers {} {:?}, the model {}",
+                   netwire::Ipv4(ip), theirs, admits(allow, ip));
+    }
+}
+
+/// Whether the kernel takes `nets` as an allowlist.
+fn allow_valid(nets: &[(u32, u8)]) -> bool {
+    nets.len() <= ALLOW_MAX && nets.iter().all(|&(_, prefix)| prefix <= 32)
+}
+
+/// The resets in `frames` whose address and source port `keep` keeps.
+fn resets(frames: &[Vec<u8>], keep: impl Fn(u32, u16) -> bool) -> u64 {
+    frames.iter().filter(|f| {
+        let Some(p) = crate::world::check::ipv4_parts(f) else { return false };
+        p.proto == IP_PROTO_TCP && p.l4.len() >= seg::HDR_LEN && seg::flags(p.l4) & seg::RST != 0
+            && keep(p.dst, seg::src_port(p.l4))
+    }).count() as u64
 }
 
 impl State {
@@ -430,6 +530,91 @@ impl State {
     /// the machine answers with a reset, and its SYN-ACK goes out on
     /// neither wire. (A guest once reached nos's sshd so, and four
     /// connections that never logged in held every slot for logging in.)
+    /// A segment of the stranger's, at a listener or at a port nobody
+    /// listens on, of any kind. A SYN a listener answers makes a connection
+    /// the stranger never completes, which must be given up half open
+    /// (`check_tcp_timer`); and from the allowlisted port, while no list
+    /// admitted the stranger, nothing at all may come back (`Wire`).
+    fn stranger(&mut self, r: &mut Input) {
+        let port = if r.u8() < 32 { CLOSED_PORT } else { r.pick(&LISTEN_PORTS) };
+        let flags = r.pick(&[seg::SYN, seg::SYN, seg::ACK_FLAG, seg::SYN | seg::ACK_FLAG, seg::FIN | seg::ACK_FLAG,
+                             seg::RST, seg::ACK_FLAG | seg::PSH]);
+        let data = if flags & seg::PSH != 0 { noise(r.u32(), r.below(100) as usize) } else { Vec::new() };
+        let sport = STRANGER_PORT_BASE + r.below(1000) as u16;
+        let s = frames::tcp(STRANGER_IP, ETH0_IP, sport, port, r.u32(), r.u32(), flags, 65535, &frames::mss(1460),
+                            &data, Sum::Right);
+        self.w.net.inject(frames::ipv4(ETH0_MAC, STRANGER_MAC, &Ip::new(STRANGER_IP, ETH0_IP, IP_PROTO_TCP), &s));
+        self.w.pump();
+        if port == ALLOW_PORT && !self.w.peers.admitted.contains(&STRANGER_IP) {
+            crate::common::runner::reached("tcp: a stranger's segment at the allowlisted port");
+        }
+    }
+
+    /// A flood from the stranger at a port nobody listens on: hundreds of
+    /// SYNs at once, each a reset the machine owes -- held to the stack's
+    /// limit (`reset_allowed`): no more than its burst and its rate let
+    /// through, every SYN either answered or counted held, and none held
+    /// that the bucket had room for after a quiet second. Into the NIC a
+    /// pool's worth at a time, past the link: the limit is what is tested,
+    /// not the link's losses or the pool's size.
+    fn flood(&mut self, r: &mut Input) {
+        /* With the NIC's transmit stalled the resets wait in its queue:
+         * the limit is the stack's, and nothing would show it */
+        if crate::machine::nic::wire().stalled[0] {
+            return;
+        }
+        let n = r.pick(&[50u64, 199, 201, 400, 1000]);
+        /* A quiet second, the bucket as full as the resets of it leave it */
+        let mark = self.w.net.sent.len();
+        self.w.run_for(1200 * MS);
+        let before = resets(&self.w.net.sent[mark..], |_, _| true);
+        let held = TCP.stats().rst_held;
+        let begun = sched::now();
+        let mark = self.w.net.sent.len();
+        for chunk in 0..n.div_ceil(64) {
+            for i in chunk * 64..(chunk * 64 + 64).min(n) {
+                let s = frames::tcp(STRANGER_IP, ETH0_IP, STRANGER_PORT_BASE + i as u16, CLOSED_PORT,
+                                    0x1000_0000 + i as u32, 0, seg::SYN, 65535, &[], &[], Sum::Right);
+                let f = frames::ipv4(ETH0_MAC, STRANGER_MAC, &Ip::new(STRANGER_IP, ETH0_IP, IP_PROTO_TCP), &s);
+                crate::machine::nic::wire().inbound[0].push_back(f);
+            }
+            sched::softirq_raise(kcore::softirq::TYPE_NET_RX);
+            self.w.pump();
+        }
+        let took_us = (sched::now() - begun) / 1000;
+        let out = &self.w.net.sent[mark..];
+        let answered = resets(out, |dst, port| dst == STRANGER_IP && port == CLOSED_PORT);
+        let others = resets(out, |dst, port| !(dst == STRANGER_IP && port == CLOSED_PORT));
+        let held = (TCP.stats().rst_held - held) as u64;
+        invariant!(answered + held >= n, "a flood of {} SYNs at a closed port: {} answered, {} held -- the rest \
+                   neither", n, answered, held);
+        let most = RST_BURST + took_us / RST_INTERVAL_US + 1;
+        invariant!(answered <= most, "a flood of {} SYNs at a closed port answered with {} resets in {} us: the \
+                   limit lets {} through", n, answered, took_us, most);
+        let least = n.min(RST_BURST.saturating_sub(before + others));
+        invariant!(answered >= least, "a flood of {} SYNs at a closed port answered with {} resets after a quiet \
+                   second that sent {} and {} meanwhile: the bucket had room for {}", n, answered, before, others,
+                   least);
+        if held > 0 {
+            crate::common::runner::reached("tcp: a flood's resets held to the limit");
+        }
+    }
+
+    /// The allowlisted listener's list changed: another of the input's, or
+    /// anyone. What the listener holds already stays.
+    fn set_allow(&mut self, r: &mut Input) {
+        let Some(l) = self.listeners.iter().find(|(p, _)| *p == ALLOW_PORT).and_then(|(_, l)| *l) else { return };
+        let list = if r.u8() < 48 { None } else { Some(allow_list(r, self.peer_ip)) };
+        let valid = list.as_deref().map_or(true, allow_valid);
+        let done = TCP.set_allowed(l, list.as_deref());
+        invariant!(done == valid, "set_allowed answered {} for {:?}", done,
+                   list.as_ref().map(|l| (l.len(), l.iter().map(|n| n.1).max())));
+        if done {
+            self.w.peers.allow_now(list, self.peer_ip);
+        }
+        check_allow(l, &self.w.peers.allow, self.peer_ip, r);
+    }
+
     fn guest_syn(&mut self, r: &mut Input) {
         if self.guest.is_none() {
             return;
@@ -586,7 +771,7 @@ pub fn tcp(r: &mut Input) {
     lan.add(NEAR_IP, NEAR_MAC);
     let choices = r.u64() | 1;
     let mut w = World::new(link, Wire { lan, tcp: Tcp::new(peer_ip, peer_mac), seen: Vec::new(), machine_loss,
-                                        choices });
+                                        choices, allow: None, admitted: Vec::new() });
     w.net.expect.ips = vec![ETH0_IP];
     /* The machine's own sequence numbers, when the input says: where they
      * wrap. */
@@ -595,9 +780,25 @@ pub fn tcp(r: &mut Input) {
         crate::machine::random_queue(&v.to_le_bytes());
     }
 
-    let listeners = LISTEN_PORTS.iter().map(|&p| {
-        (p, if p == BULK_PORT { TCP.listen_with(&nic, p, LISTEN_BACKLOG, Buffers::Bulk) } else { TCP.listen(&nic, p) })
+    /* The allowlisted listener's list: taken when the kernel would take
+     * it, and refused -- no listener at all -- when it is too long or has
+     * a prefix past 32 */
+    let first_allow = allow_list(r, peer_ip);
+    let listeners: Vec<(u16, Option<&'static Conn>)> = LISTEN_PORTS.iter().map(|&p| {
+        (p, match p {
+            BULK_PORT => TCP.listen_with(&nic, p, LISTEN_BACKLOG, Buffers::Bulk),
+            ALLOW_PORT => TCP.listen_allowed(&nic, p, LISTEN_BACKLOG, Buffers::Small, &first_allow),
+            _ => TCP.listen(&nic, p),
+        })
     }).collect();
+    let allow_listener = listeners.iter().find(|(p, _)| *p == ALLOW_PORT).and_then(|(_, l)| *l);
+    invariant!(allow_listener.is_some() == allow_valid(&first_allow), "listen_allowed answered {} for a list of {} \
+               networks, prefixes {:?}", allow_listener.is_some(), first_allow.len(),
+               first_allow.iter().map(|n| n.1).collect::<Vec<_>>());
+    w.peers.allow_now(allow_listener.map(|_| first_allow), peer_ip);
+    if let Some(l) = allow_listener {
+        check_allow(l, &w.peers.allow, peer_ip, r);
+    }
     /* Now and then the second device, which nothing listens on: the
      * hypervisor's switch, with a guest behind it. */
     let guest = if r.u8() < 96 {
@@ -611,7 +812,7 @@ pub fn tcp(r: &mut Input) {
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
                          next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest };
 
-    while let Some(op) = r.op(20) {
+    while let Some(op) = r.op(23) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
         let some = !st.links.is_empty();
         match op {
@@ -677,6 +878,12 @@ pub fn tcp(r: &mut Input) {
                 let i = r.below(st.listeners.len() as u64) as usize;
                 if let Some(l) = st.listeners[i].1.take() {
                     TCP.close(l);
+                    /* Its port is a closed one now: a reset from it to
+                     * anyone is a closed port's */
+                    if st.listeners[i].0 == ALLOW_PORT {
+                        let peer_ip = st.peer_ip;
+                        st.w.peers.allow_now(None, peer_ip);
+                    }
                 }
             }
             16 => {
@@ -693,6 +900,9 @@ pub fn tcp(r: &mut Input) {
                 }
             }
             17 => st.guest_syn(r),
+            18 => st.stranger(r),
+            19 if r.u8() < 24 => st.flood(r),
+            20 => st.set_allow(r),
             _ => {
                 /* Time: mostly a little, now and then long enough for a
                  * timer to run out -- a connect's, TIME-WAIT, the
@@ -799,6 +1009,9 @@ fn wind_down(st: &mut State) {
                 TCP.close(l);
             }
         }
+        /* Every port a closed one now, the allowlisted one's too */
+        let peer_ip = st.peer_ip;
+        st.w.peers.allow_now(None, peer_ip);
         st.w.run_for(100 * MS);
         super::check_tcp_timer();
         st.harvest();

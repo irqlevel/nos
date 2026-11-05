@@ -78,7 +78,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::nic::Nic;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
@@ -161,7 +161,25 @@ const CONNECT_TIMEOUT_MS: u64 = 5000;
 /// How often the timer's task runs the pass whether or not a retransmission
 /// is due: for TIME-WAIT and FIN-WAIT-2 running out, the persist timer and
 /// slots given back, none of which wants it sooner.
-const SWEEP_MS: u64 = 200;
+pub const SWEEP_MS: u64 = 200;
+/// How long a connection half open -- a SYN answered, its ACK not come -- is
+/// kept: a SYN-ACK and its one retransmission, at the timeout's first
+/// second. Where it was until the eighth retransmission, some 47 s, every
+/// SYN from an address that is nobody's held a place in its listener's
+/// backlog that long (plans/tcp.md, T3).
+pub const HALF_OPEN_MS: u64 = 3000;
+/// The most networks a listener answers SYNs from when it is told which
+/// (`listen_allowed`): a cluster's hosts each by its address, with room.
+pub const ALLOW_MAX: usize = 64;
+/// Resets to segments for no connection, held to RST_RATE a second with
+/// bursts of RST_BURST, over the whole stack (FreeBSD's `icmplim` is 200):
+/// a flood at closed ports, its source addresses forged, does not make this
+/// host a sender of as many resets to them.
+const RST_RATE: u64 = 200;
+pub const RST_BURST: u64 = 200;
+pub const RST_INTERVAL_US: u64 = 1_000_000 / RST_RATE;
+/// How far ahead of now the bucket's next may be and still be sent: a burst
+const RST_AHEAD_US: u64 = RST_INTERVAL_US * (RST_BURST - 1);
 /// The least time between two ACKs for segments from outside the window --
 /// and for the challenges RFC 5961 answers a guess with.
 const OOW_ACK_GAP_MS: u64 = 500;
@@ -682,6 +700,9 @@ struct Inner {
     /// When the first retransmission since anything was last acknowledged
     /// went: what giving up counts from. 0 while nothing waits.
     stalled_since_ms: u64,
+    /// When a connection a listener took was opened, its SYN come (boot
+    /// ms): what giving it up half open counts from.
+    opened_ms: u64,
     /// Also the FIN-WAIT-2 deadline
     time_wait_at: u64,
     /// The zero-window probe's
@@ -716,7 +737,7 @@ impl Inner {
             bulk_wanted: false,
             rto_ms: INITIAL_RTO_MS,
             retransmit_at: Deadline::NONE, retransmit_count: 0, srtt_us: 0, rttvar_us: 0, rtt_seq: 0, rtt_sent_ns: 0,
-            stalled_since_ms: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
+            stalled_since_ms: 0, opened_ms: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
             accepted: false,
         }
@@ -775,6 +796,7 @@ impl Inner {
         self.rtt_seq = 0;
         self.rtt_sent_ns = 0;
         self.stalled_since_ms = 0;
+        self.opened_ms = 0;
         self.time_wait_at = 0;
         self.persist_at = 0;
         self.oow_ack_at = 0;
@@ -853,8 +875,54 @@ impl Slot {
 
 /// What the pool lock guards: the identity of every slot, the hash over the
 /// connected ones, and where the next ephemeral port comes from.
+/// Who a listener answers SYNs from: anyone, or the networks it was given
+/// -- each kept as its address and mask, in host order. A fixed array, so
+/// that setting one and giving it back allocates and frees nothing under
+/// the pool's lock.
+#[derive(Clone, Copy)]
+struct Allow {
+    /// Whether `nets` is a list at all: a listener told nothing answers
+    /// anyone
+    only: bool,
+    count: u8,
+    nets: [(u32, u32); ALLOW_MAX],
+}
+
+impl Allow {
+    const ANY: Allow = Allow { only: false, count: 0, nets: [(0, 0); ALLOW_MAX] };
+
+    /// `nets` as (address, prefix length) pairs; None for more than
+    /// ALLOW_MAX of them or a prefix past 32. An address's bits past its
+    /// prefix are dropped: 10.1.2.3/8 is 10.0.0.0/8.
+    fn of(nets: &[(u32, u8)]) -> Option<Allow> {
+        if nets.len() > ALLOW_MAX {
+            return None;
+        }
+        let mut allow = Allow { only: true, count: 0, nets: [(0, 0); ALLOW_MAX] };
+        for (i, &(ip, prefix)) in nets.iter().enumerate() {
+            if prefix > 32 {
+                return None;
+            }
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            allow.nets[i] = (ip & mask, mask);
+        }
+        /* Fits a byte: ALLOW_MAX does */
+        allow.count = nets.len() as u8;
+        Some(allow)
+    }
+
+    fn admits(&self, ip: u32) -> bool {
+        !self.only || self.nets[..usize::from(self.count)].iter().any(|&(net, mask)| ip & mask == net)
+    }
+}
+
+const _: () = assert!(ALLOW_MAX <= u8::MAX as usize, "an allowlist's count is a byte");
+
 struct Pool {
     slots: [Slot; MAX_CONNECTIONS],
+    /// A listener's allowlist, by its slot: kept beside the slots rather
+    /// than in them, so that the walks of the slots stay short
+    allows: [Allow; MAX_CONNECTIONS],
     /// Head slot of each bucket
     buckets: [i8; HASH_SIZE],
     /// The chain through a bucket, per slot
@@ -867,6 +935,7 @@ impl Pool {
     const fn new() -> Pool {
         Pool {
             slots: [Slot::FREE; MAX_CONNECTIONS],
+            allows: [Allow::ANY; MAX_CONNECTIONS],
             buckets: [NONE; HASH_SIZE],
             next: [NONE; MAX_CONNECTIONS],
             hashed: [false; MAX_CONNECTIONS],
@@ -941,6 +1010,7 @@ impl Pool {
             self.hashed[index] = false;
         }
         self.slots[index] = Slot::FREE;
+        self.allows[index] = Allow::ANY;
     }
 
     /// A local port nothing is using, or 0 once all the way round without
@@ -980,6 +1050,14 @@ pub struct Tcp {
     rx_too_short: AtomicUsize,
     retransmits: AtomicUsize,
     conn_count: AtomicUsize,
+    /// Segments from an address their port's listener does not answer
+    syn_refused: AtomicUsize,
+    /// Connections given up half open
+    half_open: AtomicUsize,
+    /// Resets for no connection not sent: the bucket was empty
+    rst_held: AtomicUsize,
+    /// The reset bucket (GCRA): when its next reset is due, boot us
+    rst_due_us: AtomicU64,
 
     /// What the timer's task sleeps to, and what wakes it
     timer: Timer,
@@ -1003,6 +1081,10 @@ pub static TCP: Tcp = Tcp {
     rx_too_short: AtomicUsize::new(0),
     retransmits: AtomicUsize::new(0),
     conn_count: AtomicUsize::new(0),
+    syn_refused: AtomicUsize::new(0),
+    half_open: AtomicUsize::new(0),
+    rst_held: AtomicUsize::new(0),
+    rst_due_us: AtomicU64::new(0),
     timer: Timer::new(),
     timer_started: AtomicBool::new(false),
     timer_task: PreemptSpinLock::new(None),
@@ -1208,6 +1290,28 @@ impl Tcp {
         let saved = inner.snd_nxt;
         self.send_segment(inner, seg::ACK_FLAG, &[]);
         inner.snd_nxt = saved;
+    }
+
+    /// Whether a reset for no connection may go now -- taken from the
+    /// bucket if so: a GCRA, one word for the whole stack, each reset
+    /// moving the time the next is due on by RST_INTERVAL_US, and none sent
+    /// while that is more than a burst ahead of now.
+    fn reset_allowed(&'static self) -> bool {
+        let now = kcore::time::boot_time_ns() / 1000;
+        let mut due = self.rst_due_us.load(Ordering::Relaxed);
+        loop {
+            let from = due.max(now);
+            if from - now > RST_AHEAD_US {
+                self.rst_held.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            match self.rst_due_us.compare_exchange_weak(due, from + RST_INTERVAL_US,
+                Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(seen) => due = seen,
+            }
+        }
     }
 
     /// A reset to a peer this machine has no connection for.
@@ -2036,14 +2140,22 @@ impl Tcp {
             return;
         }
 
+        /* For a port listened on by a listener that does not answer this
+         * address: dropped, whatever it is -- no SYN-ACK, no reset, nothing
+         * kept, before the backlog and a slot -- so that to a stranger the
+         * port is not there at all, an ACK's probe answered no more than a
+         * SYN (plans/tcp.md, T3). */
+        let listener = pool.find_listener(local_ip, local_port, nic);
+        if listener.is_some_and(|l| !pool.allows[l].admits(remote_ip)) {
+            drop(pool);
+            self.syn_refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         /* A SYN for something listening -- a SYN alone: in LISTEN an ACK
          * is answered with a reset, a RST ignored (RFC 9293 3.10.7.2), and
          * a SYN that carries either, or a FIN, is no request to connect. */
-        let listener = if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN {
-            pool.find_listener(local_ip, local_port, nic)
-        } else {
-            None
-        };
+        let listener = listener.filter(|_| flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN);
         if let Some(listener) = listener {
             let mut pool = pool;
 
@@ -2073,6 +2185,7 @@ impl Tcp {
             inner.remote_ip = remote_ip;
             inner.remote_port = remote_port;
             inner.state = State::SynReceived;
+            inner.opened_ms = now_ms();
             inner.irs = seg::seq(segment);
             inner.rcv_nxt = inner.irs.wrapping_add(1);
             inner.rcv_adv = inner.rcv_nxt;
@@ -2113,8 +2226,9 @@ impl Tcp {
 
         drop(pool);
 
-        /* Nothing here for it: reset, unless it is one itself */
-        if flags & seg::RST == 0 {
+        /* Nothing here for it: reset, unless it is one itself -- or the
+         * stack has sent as many as it sends anybody for now */
+        if flags & seg::RST == 0 && self.reset_allowed() {
             let mut rst_seq = 0;
             let mut rst_ack = seg::seq(segment).wrapping_add(payload.len() as u32);
             if flags & seg::SYN != 0 {
@@ -2344,6 +2458,57 @@ impl Tcp {
     pub fn listen_with(&'static self, nic: &Nic, port: u16, backlog: usize, buffers: Buffers)
         -> Option<&'static Conn>
     {
+        self.listen_as(nic, port, backlog, buffers, Allow::ANY)
+    }
+
+    /// `listen_with`, answering `nets` alone -- each an address and a
+    /// prefix length, host order: a segment from any other address for the
+    /// port is dropped before its listener's backlog and before a slot,
+    /// with no SYN-ACK and no reset (plans/tcp.md, T3). None for more than
+    /// ALLOW_MAX networks or a prefix past 32, as for whatever `listen_with`
+    /// refuses.
+    pub fn listen_allowed(&'static self, nic: &Nic, port: u16, backlog: usize, buffers: Buffers,
+        nets: &[(u32, u8)]) -> Option<&'static Conn>
+    {
+        self.listen_as(nic, port, backlog, buffers, Allow::of(nets)?)
+    }
+
+    /// A listener's allowlist changed: `nets` from now on, anyone for None.
+    /// What it holds already is its own. False for a connection that is no
+    /// listener, or for more than ALLOW_MAX networks or a prefix past 32.
+    pub fn set_allowed(&'static self, listener: &'static Conn, nets: Option<&[(u32, u8)]>) -> bool {
+        let allow = match nets {
+            Some(nets) => match Allow::of(nets) {
+                Some(allow) => allow,
+                None => return false,
+            },
+            None => Allow::ANY,
+        };
+        let Some(index) = self.index_of(listener) else { return false };
+        let mut pool = self.pool.lock();
+        let slot = &pool.slots[index];
+        if !(slot.used && slot.listening) {
+            return false;
+        }
+        pool.allows[index] = allow;
+        true
+    }
+
+    /// Whether a listener answers `ip`: None for a connection that is no
+    /// listener.
+    pub fn admits(&'static self, listener: &'static Conn, ip: u32) -> Option<bool> {
+        let index = self.index_of(listener)?;
+        let pool = self.pool.lock();
+        let slot = &pool.slots[index];
+        if !(slot.used && slot.listening) {
+            return None;
+        }
+        Some(pool.allows[index].admits(ip))
+    }
+
+    fn listen_as(&'static self, nic: &Nic, port: u16, backlog: usize, buffers: Buffers, allow: Allow)
+        -> Option<&'static Conn>
+    {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
         }
@@ -2368,6 +2533,7 @@ impl Tcp {
             backlog: backlog.clamp(1, LISTEN_BACKLOG) as u8,
             bulk: buffers == Buffers::Bulk,
         })?;
+        pool.allows[index] = allow;
 
         let mut inner = self.take_fresh(index);
         inner.nic = Some(*nic);
@@ -2843,6 +3009,19 @@ impl Tcp {
                 continue;
             }
 
+            /* Half open past its time: given up without a word -- a SYN
+             * flood's would be a line each -- and its place in the
+             * listener's backlog with it. Nobody owns it: nobody accepted
+             * it. */
+            if inner.state == State::SynReceived && now >= inner.opened_ms.saturating_add(HALF_OPEN_MS) {
+                inner.state = State::Closed;
+                inner.retransmit_at.clear();
+                inner.need_cleanup = true;
+                any_cleanup = true;
+                self.half_open.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             if inner.retransmit_at.due(now) {
                 let mut retransmitted = false;
 
@@ -2992,6 +3171,9 @@ impl Tcp {
             rx_short: self.rx_too_short.load(Ordering::Relaxed),
             retransmits: self.retransmits.load(Ordering::Relaxed),
             conns: self.conn_count.load(Ordering::Relaxed),
+            syn_refused: self.syn_refused.load(Ordering::Relaxed),
+            half_open: self.half_open.load(Ordering::Relaxed),
+            rst_held: self.rst_held.load(Ordering::Relaxed),
         }
     }
 
@@ -3026,6 +3208,7 @@ impl Tcp {
                     None
                 },
                 retransmit_at: inner.retransmit_at.at(),
+                opened_ms: inner.opened_ms,
             })
         }
     }
@@ -3044,6 +3227,13 @@ pub struct Stats {
     pub rx_short: usize,
     pub retransmits: usize,
     pub conns: usize,
+    /// Segments -- SYNs, and any other -- from an address their port's
+    /// listener does not answer, dropped
+    pub syn_refused: usize,
+    /// Connections given up half open, their ACK never come
+    pub half_open: usize,
+    /// Resets for no connection the bucket held back
+    pub rst_held: usize,
 }
 
 pub struct ConnInfo {
@@ -3066,6 +3256,9 @@ pub struct ConnInfo {
     pub scales: Option<(u8, u8)>,
     /// When what is outstanding goes again (boot ms), 0 for never
     pub retransmit_at: u64,
+    /// When a connection a listener took had its SYN (boot ms): what
+    /// giving it up half open counts from
+    pub opened_ms: u64,
 }
 
 impl Tcp {

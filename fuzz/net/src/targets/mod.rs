@@ -57,6 +57,13 @@ pub fn check_tcp_timer() {
                            due at {} ms and is still not looked at, at {} ms", i, c.state.name(), c.local_port,
                            c.remote_port, c.retransmit_at, now_ms);
             }
+            /* And a connection half open is given up after its time --
+             * looked at by a retransmission's pass or a sweep */
+            if c.state == net::tcp::State::SynReceived {
+                let by = c.opened_ms + net::tcp::HALF_OPEN_MS + net::tcp::SWEEP_MS + late;
+                invariant!(now_ms <= by, "TCP slot {} (port {} -> {}): half open since {} ms, and still at {} ms",
+                           i, c.local_port, c.remote_port, c.opened_ms, now_ms);
+            }
         }
     }
 }

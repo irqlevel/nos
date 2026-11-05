@@ -114,6 +114,9 @@ fn connections(call: &mut Call) -> Status {
         w.field_uint("rx_errors", st.rx_err as u64);
         w.field_uint("retransmits", st.retransmits as u64);
         w.field_uint("opened", st.conns as u64);
+        w.field_uint("syn_refused", st.syn_refused as u64);
+        w.field_uint("half_open_given_up", st.half_open as u64);
+        w.field_uint("resets_held", st.rst_held as u64);
         w.key("connections");
         w.begin_list();
         for (index, c) in conns.iter().enumerate() {
