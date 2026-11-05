@@ -213,3 +213,20 @@ pool -- `entropy` in the shell says which sources exist.
   the headroom is not optional. `stacks` prints the high-water marks.
 - **Throughput**: software ChaCha20-Poly1305, several MB/s under QEMU —
   bounded by the 8 KB TCP receive window long before the cipher.
+- **The cipher, measured** (`tlsbench`, below): both pinned ends in one
+  kernel over memory, 64 MB each way, nos under KVM on the AX41's Zen 2
+  (2026-11-05). The kernel has no SSE, so every suite runs on its portable
+  backend, and AES has no AES-NI:
+
+  | Suite | sender and receiver on two CPUs | both on one | handshake |
+  |---|---|---|---|
+  | AES-128-GCM | 92 MB/s | 49 MB/s | 2.4 ms |
+  | AES-256-GCM | 82 MB/s | 42 MB/s | 1.5–2.4 ms |
+  | ChaCha20-Poly1305 | 203 MB/s | 119 MB/s | 1.2 ms |
+
+  Only ChaCha20-Poly1305 carries a 1 GbE link (117 MB/s) with room to
+  spare, so a link between hosts (ipcnet) asks for it first. On an Apple
+  M-series core under HVF, arm64's: AES-GCM 160–195 MB/s, ChaCha20 440.
+  `scripts/tlsbench.py` boots nos with the module and runs it: under KVM
+  on a server -- nos a guest, nothing rebooted -- it says what the cores
+  give; under TCG, nothing worth quoting.

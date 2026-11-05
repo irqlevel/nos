@@ -156,6 +156,48 @@ impl Refused {
     }
 }
 
+/// A cipher suite of TLS 1.3, as an end can be held to them: the kernel
+/// has no SSE, so each runs on its portable backend, and which is cheapest
+/// on a machine is a number to measure (`tlsbench`), not a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Suite {
+    Aes128Gcm,
+    Aes256Gcm,
+    ChaCha20Poly1305,
+}
+
+impl Suite {
+    pub const ALL: [Suite; 3] = [Suite::Aes128Gcm, Suite::Aes256Gcm, Suite::ChaCha20Poly1305];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Suite::Aes128Gcm => "aes128-gcm",
+            Suite::Aes256Gcm => "aes256-gcm",
+            Suite::ChaCha20Poly1305 => "chacha20-poly1305",
+        }
+    }
+
+    fn id(self) -> rustls::CipherSuite {
+        match self {
+            Suite::Aes128Gcm => rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+            Suite::Aes256Gcm => rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            Suite::ChaCha20Poly1305 => rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+        }
+    }
+}
+
+/// The kernel's provider, held to `suites` in that order -- all of its
+/// own for none.
+fn provider(suites: &[Suite]) -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls_rustcrypto::provider();
+    if !suites.is_empty() {
+        let all = core::mem::take(&mut provider.cipher_suites);
+        provider.cipher_suites =
+            suites.iter().filter_map(|s| all.iter().find(|c| c.suite() == s.id()).copied()).collect();
+    }
+    provider
+}
+
 /// Why a server or a client could not be set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupError {
@@ -288,7 +330,15 @@ impl Server {
     /// the clients whose keys are `clients`, speaking the protocols `alpn`
     /// (in the order it prefers them; none for no ALPN).
     pub fn new(cert: &[u8], key: &[u8], clients: &[Fingerprint], alpn: &[&[u8]]) -> Result<Server, SetupError> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        Self::with_suites(cert, key, clients, alpn, &[])
+    }
+
+    /// `new`, speaking `suites` alone, in that order of preference -- all
+    /// of the provider's for none.
+    pub fn with_suites(cert: &[u8], key: &[u8], clients: &[Fingerprint], alpn: &[&[u8]], suites: &[Suite])
+        -> Result<Server, SetupError>
+    {
+        let provider = Arc::new(provider(suites));
         let verifier = Arc::new(Pinned { keys: clients.to_vec(), algs: provider.signature_verification_algorithms });
         let mut config = ServerConfig::builder_with_details(provider, Arc::new(AnyTime))
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -328,7 +378,15 @@ impl Client {
     /// the servers whose keys are `servers`, offering the protocols `alpn`
     /// (none for no ALPN).
     pub fn new(cert: &[u8], key: &[u8], servers: &[Fingerprint], alpn: &[&[u8]]) -> Result<Client, SetupError> {
-        let provider = Arc::new(rustls_rustcrypto::provider());
+        Self::with_suites(cert, key, servers, alpn, &[])
+    }
+
+    /// `new`, offering `suites` alone, in that order of preference -- all
+    /// of the provider's for none.
+    pub fn with_suites(cert: &[u8], key: &[u8], servers: &[Fingerprint], alpn: &[&[u8]], suites: &[Suite])
+        -> Result<Client, SetupError>
+    {
+        let provider = Arc::new(provider(suites));
         let verifier =
             Arc::new(PinnedServer { keys: servers.to_vec(), algs: provider.signature_verification_algorithms });
         let mut config = ClientConfig::builder_with_details(provider, Arc::new(AnyTime))
@@ -603,6 +661,12 @@ impl<S: Socket, E: End> Session<S, E> {
     /// The protocol the two agreed on by ALPN, if any.
     pub fn alpn(&self) -> Option<&[u8]> {
         self.conn.common().alpn_protocol()
+    }
+
+    /// The cipher suite the two agreed on.
+    pub fn suite(&self) -> Option<Suite> {
+        let id = self.conn.common().negotiated_cipher_suite()?.suite();
+        Suite::ALL.into_iter().find(|s| s.id() == id)
     }
 
     /// The socket, for what only it knows: who is at the other end.

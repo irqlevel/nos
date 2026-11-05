@@ -646,6 +646,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-tlsbench"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+ "tls",
+ "web",
+]
+
+[[package]]
 name = "net"
 version = "0.1.0"
 dependencies = [
