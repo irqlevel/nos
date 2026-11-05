@@ -516,7 +516,7 @@ panels. `api client add <name> <role> <fingerprint>`, `api start`. Its page is
 It is the bus's first caller from a module: `kcore::mgmt::call`, `kind`,
 `providers`, `describe` and the jobs, over the bus's C ABI (`kernel_mgmt_call`
 and the rest), as well as a provider of its own (`api.status`). And it links
-the TLS server -- `tls` with its `server` feature, which the kernel's own build
+the TLS server -- `tls` with its `pinned` feature, which the kernel's own build
 leaves off -- the `web` crate's HTTP and WebSocket, and `conf` for api.toml.
 
 ## edit

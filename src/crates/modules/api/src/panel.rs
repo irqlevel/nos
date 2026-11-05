@@ -452,7 +452,7 @@ fn create<'a>(state: &State, words: impl Iterator<Item = &'a str>, out: &mut Out
     /* The panel's two identities: a client of the API's, a server to the
      * browser. Their keys go into the seed, and nowhere else. */
     let client = files::new_key("nos panel", &[], &[], CLIENT_DAYS, web::x509::Usage::Client)?;
-    let client_key = tls::server::fingerprint(&client.cert).ok_or_else(|| String::from("the panel's certificate \
+    let client_key = tls::pinned::fingerprint(&client.cert).ok_or_else(|| String::from("the panel's certificate \
                                                                                          reads as none"))?;
     let public_ips: Vec<[u8; 4]> = public.into_iter().map(u32::to_be_bytes).collect();
     let server = files::new_key("nos panel", &public_ips, &[SERVER_NAME], SERVER_DAYS, web::x509::Usage::Server)?;

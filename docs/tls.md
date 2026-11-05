@@ -87,16 +87,21 @@ tls: InvalidCertificate(ExpiredContext { time: UnixTime(1788984857),
                                          not_after: UnixTime(1428883199) })
 ```
 
-## The server, for the host API
+## Both ends pinned: the host API's server, a host's client
 
-`tls::server` (the `server` feature, which the API module's build turns on and
-the kernel's own does not) is the other side: a TLS server for the
-[host API](mgmt.md), whose clients are programs -- the panel, `nosctl`, the
-panels of other hosts -- each holding a key the host was given.
+`tls::pinned` (the `pinned` feature, which the API module's build turns on
+and the kernel's own does not) is TLS between ends that know each other's
+keys. Its server is the [host API](mgmt.md)'s, whose clients are programs --
+the panel, `nosctl`, the panels of other hosts -- each holding a key the
+host was given; its client is how one host is to reach another's (ipcnet,
+plans/ipc.md I4), the server known by its key. The two share one session
+(`Session`, a `ServerStream` or a `ClientStream`), and everything below of
+the server holds of the client turned around, but where the client is said
+apart.
 
 - **TLS 1.3 alone, and a client's certificate required.** A client is known
   by its key: the SHA-256 of the SubjectPublicKeyInfo of the certificate it
-  shows (`tls::server::fingerprint`), which has to be on the list the
+  shows (`tls::pinned::fingerprint`), which has to be on the list the
   server was made with. The certificate's dates, issuer and chain are not
   looked at -- the list names the key, as `authorized_keys` does -- but the
   handshake's signature is, with the provider's algorithms
@@ -115,7 +120,7 @@ panels of other hosts -- each holding a key the host was given.
   handshake on. The list is the server's, fixed when it is made
   (`Server::new`); the API module makes the server again when it changes,
   and a connection keeps the server it was accepted by.
-- **Every wait bounded.** The session runs over a `tls::server::Socket`,
+- **Every wait bounded.** The session runs over a `tls::pinned::Socket`,
   whose reads and sends each wait at most what they are given. `read` with
   nothing in its time answers `Idle`, which is no error; `write` encrypts
   into the session's own queue, bounded by what the caller allows, and
@@ -128,12 +133,28 @@ panels of other hosts -- each holding a key the host was given.
   `read` answers `End` once what it said before is read, and `write` still
   takes the answer to it -- a client that says goodbye with its last
   request, before the answer, is answered, and then told goodbye.
+- **The client.** `Client::new` takes the client's certificate and key, the
+  keys of the servers it lets serve it and the protocols it offers;
+  `connect` runs the handshake over a socket somebody connected, given the
+  server's address -- the name rustls is told, which sends no SNI for an
+  address and whose certificate is judged by its key alone. A server whose
+  key is not on the list is `UnknownKey`, one whose certificate is the
+  right one but whose handshake is signed by another key `BadCertificate`,
+  one that gives up on the client -- its alert -- `ServerAlert`. TLS 1.3
+  ends the client's handshake with its own Finished, before the server has
+  judged the client's certificate: a server that refuses the client's key
+  does so with an alert the session's first read then meets, and the
+  client has said nothing yet that anyone read. The client closes first --
+  its close_notify, and its FIN without waiting for the server's -- so it
+  is the end left in TIME-WAIT, as the server expects of its clients; two
+  ends each waiting for the other's FIN would both give up and reset.
 
-Its gate is `net-fuzz.py`'s `tls_server` target (docs/testing.md), which
-runs it as the module will -- a listener and a task a connection, over the
-kernel's TCP -- against the world's rustls clients; and a build of
-`tls --features server` for both kernel targets, since nothing in the
-kernel's own build compiles it. `pub mod server` is the last thing in
+Its gates are `net-fuzz.py`'s `tls_server` and `tls_client` targets
+(docs/testing.md), which run each end as a module will -- over the kernel's
+TCP -- against the world's rustls clients and servers; and a build of
+`tls --features pinned` for both kernel targets, since nothing in the
+kernel's own build compiles it (the kernel's build of either arch makes one,
+building api.ko). `pub mod pinned` is the last thing in
 `lib.rs`: with it anywhere above the client, the client's line numbers
 move -- in its debug info and its panics' locations, compiled into the
 network layer that uses it -- and the kernel's image, which has the feature

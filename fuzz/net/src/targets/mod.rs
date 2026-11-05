@@ -12,6 +12,7 @@ mod ssh;
 mod stack;
 mod tcp;
 mod terminal;
+mod tls_client;
 mod tls_server;
 mod udpshell;
 
@@ -29,6 +30,7 @@ pub static ALL: &[Target] = &[
     Target { name: "netconsole", run: netconsole::netconsole, max_len: 1024, gate: 1000 },
     Target { name: "ssh", run: ssh::ssh, max_len: 1024, gate: 300 },
     Target { name: "tls_server", run: tls_server::tls_server, max_len: 1024, gate: 300 },
+    Target { name: "tls_client", run: tls_client::tls_client, max_len: 1024, gate: 300 },
     Target { name: "terminal", run: terminal::terminal, max_len: 4096, gate: 20000 },
     Target { name: "api", run: api::api, max_len: 1024, gate: 500 },
 ];

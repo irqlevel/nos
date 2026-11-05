@@ -18,7 +18,7 @@ api panel create        the management panel, a VM of the host's (below)
 ## Who is let in
 
 HTTP/1.1 and a WebSocket, JSON, over **TLS 1.3 with a client's certificate
-required** (`tls::server`, [HTTPS](tls.md)). A client is let in by its key
+required** (`tls::pinned`, [HTTPS](tls.md)). A client is let in by its key
 alone: the SHA-256 of the SubjectPublicKeyInfo of the certificate it shows,
 which has to be in `clients`. The certificate's dates and issuer are not
 looked at -- the list names the key, as `authorized_keys` does -- but the
