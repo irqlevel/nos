@@ -81,6 +81,24 @@ of `src/lib/chart.ts` shows a block with every key it takes. A chart
 illustrates a table, which stays in the post beside it: screen readers are
 given the table and the chart's caption, not the plot.
 
+What most readers will skip, such as a long table of every number, can be
+folded away under a summary. It is written as GitHub renders it, so the file
+reads the same there:
+
+```markdown
+<details>
+<summary>All the numbers</summary>
+
+| | before | after |
+|---|---:|---:|
+
+</details>
+```
+
+The page shows the summary in a box, and the rest opens on a click. That is
+the only HTML a page may use: any other tag is shown as the text it is
+(`src/lib/markdown.ts`).
+
 Links inside content are written **without** a language: `/docs/hypervisor#a-disk`,
 `/howto/build`, `/blog/<slug>`, `/about`, `/hypervisor` -- the site adds `/en` or
 `/ru`. Source files and commits link to GitHub with full URLs.
@@ -97,6 +115,9 @@ Links inside content are written **without** a language: `/docs/hypervisor#a-dis
   that is not in the list
 - a `chart` block with a key the renderer does not know, a value off its scale
   or anything it needs missing
+- a `<details>` written in any other form than the one above, one left open,
+  one inside another, or a heading inside one (the table of contents would
+  link to what is folded away)
 - no `SITE_URL`, or one that is not a bare `https://host` origin
 
 ## Languages
