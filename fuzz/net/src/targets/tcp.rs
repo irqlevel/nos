@@ -156,7 +156,8 @@ enum Call {
     Connect(App<Option<usize>>),
     Accept(App<Option<usize>>),
     Send(App<isize>, u64),
-    Recv(App<(isize, Vec<u8>)>),
+    /// A receive, and its timeout -- 0 for none.
+    Recv(App<(isize, Vec<u8>)>, u64),
 }
 
 /// A connection, as the target knows it: the machine's end, the peer's,
@@ -180,6 +181,11 @@ struct Link2 {
     /// The floor its program gives its timeout once it has the
     /// connection, if it gives one -- what it asks, taken or refused.
     floor: Option<u64>,
+    /// The connection's generation once the program has it, what a wake is
+    /// held to; and whether one of it came since a receive last returned --
+    /// what alone may end a receive with no timeout as a timeout does.
+    generation: u64,
+    woken: bool,
 }
 
 struct State {
@@ -332,7 +338,8 @@ impl State {
                              move || TCP.connect(&nic, ip, port, 0, receive).map(conn_word));
         let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
-                                fragile: self.lossy, call: Some(Call::Connect(app)), floor });
+                                fragile: self.lossy, call: Some(Call::Connect(app)), floor, generation: 0,
+                                woken: false });
     }
 
     fn peer_connect(&mut self, r: &mut Input) {
@@ -362,7 +369,7 @@ impl State {
         self.w.peers.tcp.connect(&mut self.w.net, id, port, ETH0_IP, mport, s, opts, window);
         let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
-                                fragile: self.lossy, call: None, floor });
+                                fragile: self.lossy, call: None, floor, generation: 0, woken: false });
     }
 
     fn accept(&mut self, r: &mut Input) {
@@ -416,7 +423,7 @@ impl State {
             buf.truncate(got.max(0) as usize);
             (got, buf)
         });
-        self.links[k].call = Some(Call::Recv(app));
+        self.links[k].call = Some(Call::Recv(app, timeout));
     }
 
     fn close(&mut self, k: usize, abort: bool) {
@@ -451,6 +458,7 @@ impl State {
                         let tainted = self.w.peers.tcp.eps.iter().any(|e| e.tainted);
                         invariant!(tainted || e.is_some(), "connection {} connected to a port nobody answered on", k);
                         self.links[k].conn = Some(conn_of(word));
+                        self.links[k].generation = TCP.generation(conn_of(word));
                         self.give_floor(k, true);
                     }
                     Some(None) => self.links[k].done = true,
@@ -465,9 +473,17 @@ impl State {
                         }
                     }
                 },
-                Call::Recv(app) => match app.take() {
-                    None => self.links[k].call = Some(Call::Recv(app)),
-                    Some((n, data)) => self.received(k, n, &data),
+                Call::Recv(app, timeout) => match app.take() {
+                    None => self.links[k].call = Some(Call::Recv(app, timeout)),
+                    Some((n, data)) => {
+                        /* A receive with no timeout comes back as one only
+                         * when its connection was woken -- by its own
+                         * generation, no other's */
+                        let woken = core::mem::replace(&mut self.links[k].woken, false);
+                        invariant!(n != net::tcp::RECV_TIMEOUT || timeout != 0 || woken,
+                                   "connection {}'s receive with no timeout came back as a timeout, never woken", k);
+                        self.received(k, n, &data)
+                    }
                 },
             }
         }
@@ -497,7 +513,25 @@ impl State {
         });
         invariant!(ok, "accepted connection {} before the peer had the machine's SYN-ACK", k);
         self.links[k].conn = Some(c);
+        self.links[k].generation = TCP.generation(c);
         self.give_floor(k, true);
+    }
+
+    /// A wake of link `k`'s connection: by its generation, mostly, or by one
+    /// it never had -- and, for a link closed, by its last, which the slot
+    /// handed out again since must never feel.
+    fn wake(&mut self, r: &mut Input, k: usize) {
+        let l = &self.links[k];
+        let Some(c) = l.conn else { return };
+        let own = !l.done && r.u8() >= 32;
+        let generation = if own || l.done { l.generation } else { l.generation.wrapping_add(1 + r.below(3)) };
+        TCP.wake(c, generation);
+        if own {
+            self.links[k].woken = true;
+            crate::common::runner::reached("tcp: a receive's connection woken");
+        } else if l.done {
+            crate::common::runner::reached("tcp: a closed connection's slot woken by its old generation");
+        }
     }
 
     /// The floor link `k`'s program asks for, asked: taken for a value
@@ -866,7 +900,7 @@ pub fn tcp(r: &mut Input) {
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
                          next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest };
 
-    while let Some(op) = r.op(24) {
+    while let Some(op) = r.op(25) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
         let some = !st.links.is_empty();
         match op {
@@ -957,6 +991,7 @@ pub fn tcp(r: &mut Input) {
             18 => st.stranger(r),
             19 if r.u8() < 24 => st.flood(r),
             20 => st.set_allow(r),
+            22 if some => st.wake(r, k),
             21 => {
                 /* A program gives its connection another floor, mid-way */
                 if let Some(l) = st.links.get_mut(k) {
@@ -1105,7 +1140,7 @@ fn wind_down(st: &mut State) {
                 Call::Connect(_) => "connect",
                 Call::Accept(_) => "accept",
                 Call::Send(..) => "send",
-                Call::Recv(_) => "recv",
+                Call::Recv(..) => "recv",
             };
             let slot = st.slot(k).map(|c| format!("{} with {} bytes to send, {} in flight, {} to read",
                                                   c.state.name(), c.send_used, c.in_flight, c.recv_used))
@@ -1201,7 +1236,7 @@ fn wind_down(st: &mut State) {
         .filter(|l| st.ep(l).is_some_and(|e| st.w.peers.tcp.eps[e].tainted))
         .filter_map(|l| match &l.call {
             Some(Call::Send(app, _)) => Some(app.task()),
-            Some(Call::Recv(app)) => Some(app.task()),
+            Some(Call::Recv(app, _)) => Some(app.task()),
             Some(Call::Connect(app)) => Some(app.task()),
             _ => None,
         })

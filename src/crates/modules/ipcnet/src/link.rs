@@ -61,9 +61,6 @@ pub const OPEN_BYTES_MAX: usize = 4 << 20;
 const PIECES_MAX: usize = 2048;
 /// A read's buffer, and the most of a frame kept waiting for its rest.
 const READ_BYTES: usize = 16 * 1024;
-/// The wait for what the peer says when nothing is moving: a millisecond
-/// at first, doubling to this -- the kernel's own TCP waits are polled so.
-const IDLE_MAX_MS: u64 = 10;
 /// The goodbye's time: the close_notify, and at the server's end the FIN.
 const CLOSE_MS: u64 = 500;
 const NS_PER_MS: u64 = 1_000_000;
@@ -130,6 +127,13 @@ impl Session {
         match self {
             Session::Server(s) => s.pending(),
             Session::Client(s) => s.pending(),
+        }
+    }
+
+    fn waker(&self) -> kcore::tcp::TcpWaker {
+        match self {
+            Session::Server(s) => s.socket().tcp.waker(),
+            Session::Client(s) => s.socket().tcp.waker(),
         }
     }
 
@@ -527,20 +531,39 @@ pub fn push_frame(peer: &Peer, class: usize, frame: &Frame<'_>) -> bool {
     }
     let taken = peer.out[class].with(|o| {
         if o.number == 0 || o.frames.len() >= FRAMES_MAX || o.frames.try_reserve(1).is_err() {
-            return false;
+            return None;
         }
         o.frames.push_back(b);
-        true
+        Some(o.waker)
     });
-    if !taken {
-        add(&peer.counts.dropped, 1);
+    match taken {
+        Some(waker) => {
+            /* Its connection's task told, out of the lock */
+            if let Some(w) = waker {
+                w.wake();
+            }
+            true
+        }
+        None => {
+            add(&peer.counts.dropped, 1);
+            false
+        }
     }
-    taken
 }
 
 /// The connection's life once the peer is up: what goes out and what comes
-/// in, until it ends -- why it did.
+/// in, until it ends -- why it did. While it runs, whoever queues for it
+/// wakes it from its wait on the socket.
 fn run(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize, session: u64) -> &'static str {
+    let waker = sess.waker();
+    peer.out[class].with(|o| o.waker = Some(waker));
+    let why = serve_link(shared, sess, peer, class, session);
+    peer.out[class].with(|o| o.waker = None);
+    why
+}
+
+fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize, session: u64)
+              -> &'static str {
     let Some(number) = peer.number(session) else { return "the session ended" };
     let mut sender = Sender { open: Vec::new(), promised: 0, next_num: 1, turn: 0 };
     let mut asm = Assembler::new(OPEN_MAX, OPEN_BYTES_MAX, PIECES_MAX);
@@ -551,7 +574,6 @@ fn run(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize,
     let mut heard = now;
     let mut next_ping = now;
     let mut ping_seq = 0u64;
-    let mut idle_ms = 1;
     loop {
         if shared.stop.load(Ordering::Acquire) {
             return "stopping";
@@ -582,14 +604,18 @@ fn run(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize,
                 Flush::Done | Flush::More => {}
             }
         }
-        /* In: what came, for a millisecond while things move, longer as
-         * they do not */
+        /* In: what came -- for a millisecond while things go out, and while
+         * nothing does until the next Ping is due: the socket's wait ends
+         * the moment data comes, or something is queued here (`waker`) */
         let busy = moved || sess.pending() > 0 || !sender.open.is_empty();
-        let wait = if busy { 1 } else { idle_ms };
+        let wait = if busy {
+            1
+        } else {
+            (next_ping.saturating_sub(kcore::time::boot_time_ns()) / NS_PER_MS).clamp(1, PING_MS)
+        };
         match sess.read(&mut buf, wait) {
             Read::Data(n) => {
                 heard = kcore::time::boot_time_ns();
-                idle_ms = 1;
                 inbuf.extend_from_slice(&buf[..n]);
                 let mut at = 0;
                 loop {
@@ -609,11 +635,7 @@ fn run(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class: usize,
                 }
                 inbuf.drain(..at);
             }
-            Read::Idle => {
-                if !busy {
-                    idle_ms = (idle_ms * 2).min(IDLE_MAX_MS);
-                }
-            }
+            Read::Idle => {}
             Read::End => return "it closed its connection",
             Read::Failed => return "the session failed",
         }

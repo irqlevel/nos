@@ -79,11 +79,14 @@ pub struct Out {
     /// Messages not yet begun on the connection, oldest first.
     pub msgs: VecDeque<OutMsg>,
     pub bytes: usize,
+    /// What wakes the connection's task from its wait on the socket, while
+    /// it runs: whoever queues something here, once out of the lock.
+    pub waker: Option<kcore::tcp::TcpWaker>,
 }
 
 impl Out {
     fn new() -> Out {
-        Out { number: 0, frames: VecDeque::new(), msgs: VecDeque::new(), bytes: 0 }
+        Out { number: 0, frames: VecDeque::new(), msgs: VecDeque::new(), bytes: 0, waker: None }
     }
 }
 
