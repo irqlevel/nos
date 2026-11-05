@@ -1,4 +1,4 @@
-//! `tls_server`: the kernel's TLS server (`tls::server`) -- what the host API
+//! `tls_server`: the kernel's TLS server (`tls::pinned::Server`) -- what the host API
 //! module serves its clients over -- run as the module will run it: a
 //! listener and a task a connection, over the kernel's TCP, letting in the
 //! clients whose keys it was given and answering each line said to it.
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
-use tls::server::{Fingerprint, Read, Recv, Refused, Server, Socket, HANDSHAKE_MS};
+use tls::pinned::{Fingerprint, Read, Recv, Refused, Server, Socket, HANDSHAKE_MS};
 
 use crate::machine::sched;
 use crate::world::lan::Lan;
@@ -121,7 +121,7 @@ fn serve((side, conn, done): (Arc<Side>, TcpStream, Arc<AtomicBool>)) {
                             if b == b'\n' {
                                 let reply = [b"ok ".as_slice(), &line].concat();
                                 while !s.write(&reply, MAX_PENDING) {
-                                    if s.flush(1000) == tls::server::Flush::Failed {
+                                    if s.flush(1000) == tls::pinned::Flush::Failed {
                                         break;
                                     }
                                 }
@@ -129,7 +129,7 @@ fn serve((side, conn, done): (Arc<Side>, TcpStream, Arc<AtomicBool>)) {
                                 lines += 1;
                             }
                         }
-                        if s.flush(5000) == tls::server::Flush::Failed {
+                        if s.flush(5000) == tls::pinned::Flush::Failed {
                             break "failed";
                         }
                     }
@@ -339,7 +339,7 @@ pub fn tls_server(r: &mut Input) {
     nic.set_gw(GW_IP);
 
     let keys = keys();
-    let known = tls::server::fingerprint(&keys.known.cert).expect("the known key's certificate");
+    let known = tls::pinned::fingerprint(&keys.known.cert).expect("the known key's certificate");
     let server = Server::new(&keys.server.cert, &keys.server.key, &[known], &ALPN).expect("the server's setup");
     let side = Arc::new(Side { stop: AtomicBool::new(false), seen: Mutex::new(Vec::new()), server });
     let listener = {

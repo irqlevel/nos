@@ -190,9 +190,10 @@ A module, `ipcnet.ko`: a host that is no cluster's needs none of it.
   are in `/etc/ipc/hosts.toml`, pinned both ways (below).
 - **One fixed port, 39240** (beside the API's 39234), on the NIC the config
   names -- eth0 by default, and never hv0: no guest reaches it.
-- **TLS 1.3, pinned both ways.** The server is `tls::server`. The client side
-  is new in `tls`: the server's key pinned in place of the Mozilla roots, and
-  a certificate of the client's own.
+- **TLS 1.3, pinned both ways.** Both ends are `tls::pinned`: the server the
+  API's (`Server`), the client new in I3 (`Client`) -- the server's key
+  pinned in place of the Mozilla roots, and a certificate of the client's
+  own.
 - **Two TCP connections a pair of hosts**: control (small messages -- Raft,
   monitors, metadata) and bulk (data), chosen by a message's class, so that a
   megabyte of data or a lost segment of it never stands in front of a
@@ -364,10 +365,11 @@ made on a task's event. Gates: `netblk-test.py`, `hv-test.py`,
 
 **I3, TCP and TLS for hosts.** TCP's T1 to T3 ([tcp.md](tcp.md)), each
 measured before and after on the AX41 and the EX44; `tls`'s pinned client
-with a certificate.
-Gates: `net-fuzz.py` (`tcp`, `tls_server`, a target for the pinned client),
-`tcp-test.py`, the `tls --features server` build for both kernel targets,
-`api-test.py`.
+with a certificate. Done on branch `ipc-raft` but for the measurements on
+the boxes: `tls::server` became `tls::pinned` (feature `pinned`), one
+session for both ends, and `Client` beside `Server`.
+Gates: `net-fuzz.py` (`tcp`, `tls_server`, `tls_client`), `tcp-test.py`, the
+`tls --features pinned` build for both kernel targets, `api-test.py`.
 
 **I4, ipcnet.** The module and `ipcwire`; net-fuzz's `ipcnet` target (the
 module's source against hosts with the right key, a stranger's and none,
