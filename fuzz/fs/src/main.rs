@@ -46,6 +46,7 @@ fn main() {
         name: "fs-fuzz",
         targets: targets::ALL,
         boot: machine::boot,
+        begin: || {},
         stats_env: "FS_FUZZ_STATS",
     });
 }

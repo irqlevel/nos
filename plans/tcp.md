@@ -52,11 +52,19 @@ over a `kernel_tcp_connect` that says which buffers it wants. Measured
 between the AX41 and the EX44: one connection's throughput, which should
 reach the 1 GbE line rate (117 MB/s) where it is 27 MB/s now.
 
-**T2, a timeout from the round trip.** Its first half is done on branch
-`ipc-raft`: the estimate, a floor of 200 ms and giving up by time, with the
-200 ms look kept; the timer armed for the earliest deadline (a task that
-sleeps until it), the lower floor for links between nos hosts and the
-measurements are still to do.
+**T2, a timeout from the round trip.** Done on branch `ipc-raft` but for
+the lower floor for links between nos hosts, which comes with ipcnet (I4),
+and the measurements: the estimate, a floor of 200 ms and giving up by
+time; and the timer a task (`tcp/timer`, on CPU 0) asleep until the
+earliest retransmission any connection has or the next 200 ms sweep -- for
+TIME-WAIT, the persist timer and slots given back -- where it was a soft
+IRQ raised every 200 ms whatever was due. A deadline is set only through a
+type that tells the timer, and net-fuzz holds every connection's to being
+acted on within a tick of the machine's; of five mutants of the timer it
+catches four. The fifth -- a deadline set that does not wake the task --
+cannot show while the floor is the sweep's period: the task always wakes
+for a sweep before any deadline comes. It shows with I4's 20 ms floor,
+whose links the fuzzer is then to drive.
 - The round trip is measured on every acknowledged segment that was not
   sent again (Karn's rule). SRTT and RTTVAR follow RFC 6298, in integers.
 - The RTO is SRTT plus four RTTVARs, no less than 200 ms -- Linux's floor,
@@ -72,8 +80,10 @@ measurements are still to do.
   measured there. A path of 50 ms, the Mac to Hetzner, gets an RTO of a few
   hundred ms from its own measurements either way.
 - The timer is armed for the earliest deadline any connection has, to the
-  millisecond, instead of a look every 200 ms. With nothing in flight
-  anywhere, it does not run at all: no wakeups on an idle machine.
+  millisecond, instead of a look every 200 ms. The 200 ms sweep stays, for
+  what is not a retransmission; an idle machine still has it, as it has its
+  tick a hundred times a second -- a sweep only where something needs one is
+  for when that is worth its bookkeeping.
 - A connection is given up by time, not by count: after 100 s with nothing
   acknowledged (RFC 1122's R2 for data: at least 100 s), whatever its RTO.
   From a floor of 200 ms eight doublings are over in half a minute, from
