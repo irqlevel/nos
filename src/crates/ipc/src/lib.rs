@@ -935,15 +935,9 @@ pub(crate) enum Taken {
     Closed,
 }
 
-fn take(mbox: &Mbox, cap: usize) -> Taken {
-    let mut i = mbox.inner.lock();
-    let Some(front) = i.queue.front() else {
-        return if i.closed { Taken::Closed } else { Taken::Nothing };
-    };
-    if front.payload.len() > cap {
-        return Taken::TooSmall { len: front.payload.len() };
-    }
-    let Some(msg) = i.queue.pop_front() else { return Taken::Nothing };
+/// The first message off the queue, its place and its bytes given back.
+fn pop_front(i: &mut Inner) -> Option<Message> {
+    let msg = i.queue.pop_front()?;
     if msg.kept_room() {
         i.kept_queued = i.kept_queued.saturating_sub(1);
     } else {
@@ -958,9 +952,91 @@ fn take(mbox: &Mbox, cap: usize) -> Taken {
         i.monitors.retain(|&(a, m)| !(a == target && m == id));
     }
     i.received += 1;
+    Some(msg)
+}
+
+fn take(mbox: &Mbox, cap: usize) -> Taken {
+    let mut i = mbox.inner.lock();
+    let Some(front) = i.queue.front() else {
+        return if i.closed { Taken::Closed } else { Taken::Nothing };
+    };
+    if front.payload.len() > cap {
+        return Taken::TooSmall { len: front.payload.len() };
+    }
+    let Some(msg) = pop_front(&mut i) else { return Taken::Nothing };
     drop(i);
     count(&STATS.received);
     Taken::Message(msg)
+}
+
+/// What a receive of part of the first message came to.
+pub(crate) enum Part {
+    /// `n` of its bytes copied, from the offset asked: the message whose
+    /// sender, tag, reference and whole length these are -- taken, off the
+    /// queue, when they were its last.
+    Got { from: Addr, tag: u32, reference: u64, len: usize, n: usize },
+    Nothing,
+    Closed,
+    /// The first message is not the one the ticket names, or the offset is
+    /// past its end.
+    Stale,
+}
+
+/// Part of the first message into `out`, from `offset` -- `ticket` set at
+/// the first part (offset 0) and held to at every part after, so that all
+/// of them are of one message: the queue's count of what it has given out,
+/// which only a message taken off its front changes. The message is taken
+/// once its last byte is copied.
+fn take_part(mbox: &Mbox, offset: usize, out: &mut [u8], ticket: &mut u64) -> Part {
+    let mut i = mbox.inner.lock();
+    let Some(front) = i.queue.front() else {
+        return if i.closed { Part::Closed } else { Part::Nothing };
+    };
+    if offset == 0 {
+        *ticket = i.received;
+    } else if *ticket != i.received {
+        return Part::Stale;
+    }
+    let len = front.payload.len();
+    if offset > len {
+        return Part::Stale;
+    }
+    let n = front.payload.read(offset, out);
+    let got = Part::Got { from: front.from, tag: front.tag, reference: front.reference, len, n };
+    if offset + n < len {
+        return got;
+    }
+    let msg = pop_front(&mut i);
+    drop(i);
+    count(&STATS.received);
+    /* Its pieces given back here, out of the lock */
+    drop(msg);
+    got
+}
+
+/// `take_part`, the first part waited for up to `timeout`; a part after the
+/// first is there or is not, and is not waited for.
+pub(crate) fn wait_part(mbox: &Mbox, timeout: Duration, offset: usize, out: &mut [u8], ticket: &mut u64) -> Part {
+    let now = boot_time_ns();
+    let deadline = if offset == 0 { now.saturating_add(timeout.as_nanos()) } else { now };
+    if mbox.receiving.swap(true, Ordering::Acquire) {
+        klog!(0, "ipc: two tasks receiving from mailbox {} at once -- the second is refused", mbox.addr);
+        return Part::Nothing;
+    }
+    let got = loop {
+        match take_part(mbox, offset, out, ticket) {
+            Part::Nothing => {}
+            other => break other,
+        }
+        let now = boot_time_ns();
+        if now >= deadline {
+            break Part::Nothing;
+        }
+        /* A signal between the look and the wait is kept by the event */
+        mbox.event.wait_for(Duration::from_nanos((deadline - now).min(LOOK_NS)));
+    };
+    mbox.receiving.store(false, Ordering::Release);
+    got
 }
 
 /// `take`, waiting up to `timeout` for one.
@@ -1078,14 +1154,10 @@ pub(crate) fn close(mbox: &Arc<Mbox>, reason: Reason) {
      * generation, the name and the watches taken away */
     let (name, watchers, watches, remote_gone, router, lost) = {
         let mut t = table.lock();
-        /* A router's close: nothing carries messages to other hosts, so
-         * every peer is lost */
-        let lost = if t.router.as_ref().is_some_and(|r| Arc::ptr_eq(r, mbox)) {
+        let was_router = t.router.as_ref().is_some_and(|r| Arc::ptr_eq(r, mbox));
+        if was_router {
             t.router = None;
-            remote::lose_all(&mut t)
-        } else {
-            Vec::new()
-        };
+        }
         let remote_gone = remote::forget(&mut t, mbox);
         let router = t.router.clone();
         let slot = usize::from(mbox.addr.slot);
@@ -1117,6 +1189,12 @@ pub(crate) fn close(mbox: &Arc<Mbox>, reason: Reason) {
             }
             t.owners.retain(|(_, b)| *b != 0);
         }
+        /* A router's close: nothing carries messages to other hosts, so
+         * every peer is lost -- after its own watches and remote monitors
+         * went above, so that what the loss tells goes to everyone but the
+         * mailbox closing, which would otherwise hear it as it closes and
+         * hand it to the task waiting on it in place of the close */
+        let lost = if was_router { remote::lose_all(&mut t) } else { Vec::new() };
         (name, watchers, watches, remote_gone, router, lost)
     };
     remote::tell_lost(lost);

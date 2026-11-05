@@ -6,11 +6,13 @@
 //! never one of the image's -- is closed, named, received from or sent from
 //! through here.
 
-use crate::{close, demonitor, handle, list, lookup, monitor, open, owner_at, register, send, unwatch, wait, watch,
-            Addr, Error, Limits, Mbox, Payload, Reason, Scope, Taken, To, MAX_PAYLOAD, NAME_MAX, OWNER_NAME_MAX};
+use crate::{close, demonitor, handle, list, lookup, monitor, open, owner_at, register, send, unwatch, wait, wait_part,
+            watch, Addr, Error, Limits, Mbox, Part, Payload, Reason, Scope, Taken, To, MAX_PAYLOAD, NAME_MAX,
+            OWNER_NAME_MAX};
 use alloc::sync::Arc;
-use ffi::ipc::{IpcHeader, IpcName, IPC_NAME_MAX, IPC_OK, IPC_RECV_CLOSED, IPC_RECV_NONE, IPC_RECV_TOO_SMALL,
-               IPC_SCOPE_CLUSTER, IPC_SCOPE_HOST};
+use alloc::vec::Vec;
+use ffi::ipc::{IpcHeader, IpcName, IpcPiece, IPC_NAME_MAX, IPC_OK, IPC_PIECES_MAX, IPC_RECV_CLOSED, IPC_RECV_NONE,
+               IPC_RECV_STALE, IPC_RECV_TOO_SMALL, IPC_SCOPE_CLUSTER, IPC_SCOPE_HOST};
 use kcore::time::Duration;
 
 const _: () = assert!(NAME_MAX == IPC_NAME_MAX, "a name's bytes, the crate's and the ABI's");
@@ -179,6 +181,68 @@ pub unsafe extern "C" fn kernel_ipc_recv(mbox: u64, timeout_ns: u64, header: *mu
     }
 }
 
+/// # Safety
+/// `header` and `ticket` are writable, and `buf` writable for `cap` bytes
+/// when `cap` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_ipc_recv_part(mbox: u64, timeout_ns: u64, header: *mut IpcHeader, buf: *mut u8,
+                                              cap: usize, offset: u64, ticket: *mut u64) -> i64 {
+    if header.is_null() || ticket.is_null() || (buf.is_null() && cap != 0) {
+        return IPC_RECV_CLOSED;
+    }
+    let Some(m) = module_box(mbox) else { return IPC_RECV_CLOSED };
+    let Ok(offset) = usize::try_from(offset) else { return IPC_RECV_STALE };
+    let cap = cap.min(MAX_PAYLOAD);
+    let out: &mut [u8] = if cap == 0 { &mut [] } else { unsafe { core::slice::from_raw_parts_mut(buf, cap) } };
+    // SAFETY: the caller's writable ticket.
+    let mut t = unsafe { ticket.read() };
+    let got = wait_part(&m, Duration::from_nanos(timeout_ns), offset, out, &mut t);
+    unsafe { ticket.write(t) };
+    match got {
+        Part::Got { from, tag, reference, len, n } => {
+            let h = IpcHeader { from: from.to_u64(), reference, len: len as u64, tag, _pad: 0 };
+            unsafe { header.write(h) };
+            n as i64
+        }
+        Part::Nothing => IPC_RECV_NONE,
+        Part::Closed => IPC_RECV_CLOSED,
+        Part::Stale => IPC_RECV_STALE,
+    }
+}
+
+/// The `count` pieces at `pieces` as one payload, copied: refused for more
+/// than IPC_PIECES_MAX of them, a null one with bytes, or more than the
+/// channel's largest payload in all.
+///
+/// # Safety
+/// `pieces` points at `count` readable `IpcPiece`s when `count` is past 0,
+/// each naming `len` readable bytes.
+unsafe fn payload_of(pieces: *const IpcPiece, count: usize) -> Result<Payload, Error> {
+    if count == 0 {
+        return Ok(Payload::empty());
+    }
+    if count > IPC_PIECES_MAX || pieces.is_null() {
+        return Err(Error::Invalid);
+    }
+    // SAFETY: the caller's `count` pieces.
+    let given = unsafe { core::slice::from_raw_parts(pieces, count) };
+    let mut parts: Vec<&[u8]> = Vec::new();
+    parts.try_reserve_exact(count).map_err(|_| Error::NoMemory)?;
+    let mut total = 0usize;
+    for p in given {
+        if p.len > 0 && p.data.is_null() {
+            return Err(Error::Invalid);
+        }
+        total = total.checked_add(p.len).ok_or(Error::TooLarge)?;
+        if total > MAX_PAYLOAD {
+            return Err(Error::TooLarge);
+        }
+        // SAFETY: the caller's `len` bytes at the piece's data.
+        parts.push(if p.len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p.data, p.len) } });
+    }
+    Payload::gather(&parts)
+}
+
 #[no_mangle]
 pub extern "C" fn kernel_ipc_wake(mbox: u64) {
     if let Some(m) = module_box(mbox) {
@@ -281,15 +345,15 @@ pub extern "C" fn kernel_ipc_peer_lost(router: u64, peer: u32) -> i32 {
 
 /// # Safety
 /// `name` points at `name_len` readable bytes when `name_len` is past 0,
-/// and `data` at `len` readable bytes.
+/// and `pieces` at `count` readable `IpcPiece`s, each naming its readable
+/// bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_ipc_deliver_remote(router: u64, peer: u32, from: u64, to: u64, name: *const u8,
-                                                   name_len: usize, tag: u32, reference: u64, data: *const u8,
-                                                   len: usize) -> i32 {
+                                                   name_len: usize, tag: u32, reference: u64,
+                                                   pieces: *const IpcPiece, count: usize) -> i32 {
     let Some(m) = module_box(router) else { return Error::Gone.code() };
     let Ok(host) = u16::try_from(peer) else { return Error::Invalid.code() };
-    if len > crate::MAX_PAYLOAD || (len > 0 && data.is_null()) || name_len > crate::NAME_MAX
-        || (name_len > 0 && name.is_null()) {
+    if name_len > crate::NAME_MAX || (name_len > 0 && name.is_null()) {
         return Error::Invalid.code();
     }
     let to = if name_len > 0 {
@@ -302,14 +366,10 @@ pub unsafe extern "C" fn kernel_ipc_deliver_remote(router: u64, peer: u32, from:
     } else {
         crate::remote::RemoteTo::Addr(Addr::from_u64(to))
     };
-    let payload = if len == 0 {
-        Payload::empty()
-    } else {
-        // SAFETY: the caller's `len` bytes at `data`.
-        match Payload::from_slice(unsafe { core::slice::from_raw_parts(data, len) }) {
-            Ok(p) => p,
-            Err(e) => return e.code(),
-        }
+    // SAFETY: the caller's `count` pieces, passed on.
+    let payload = match unsafe { payload_of(pieces, count) } {
+        Ok(p) => p,
+        Err(e) => return e.code(),
     };
     match crate::remote::deliver_remote(&m, host, from, to, tag, reference, payload) {
         Ok(()) => IPC_OK,
