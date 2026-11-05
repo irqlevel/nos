@@ -126,8 +126,40 @@ fn flag(on: bool, bit: u8) -> u8 {
     if on { bit } else { 0 }
 }
 
+/// The bytes `encode` writes for `m`, whatever they come to.
+pub fn encoded_len(m: &Message) -> usize {
+    let body = match &m.body {
+        Body::Vote { .. } => 1 + 8 + 8,
+        Body::VoteResp { .. } => 1,
+        Body::Append { entries, .. } => entries
+            .iter()
+            .fold(APPEND_BYTES, |sum, e| sum.saturating_add(ENTRY_HEADER_BYTES).saturating_add(e.data.len())),
+        Body::AppendResp { .. } => 1 + 8 + 8 + 8,
+        Body::Heartbeat { .. } => 8 + 8,
+        Body::HeartbeatResp { .. } => 8,
+        Body::Snapshot { meta, data, .. } => {
+            let ids = meta.conf.voters.len().saturating_add(meta.conf.learners.len());
+            (8 + 8 + 2 + 2 + 8 + 8 + 4usize).saturating_add(ids.saturating_mul(8)).saturating_add(data.len())
+        }
+        Body::SnapshotResp { .. } => 1 + 8 + 8,
+        Body::TimeoutNow => 0,
+        Body::ReadIndex { .. } => 8,
+        Body::ReadIndexResp { .. } => 1 + 8 + 8,
+    };
+    HEADER_BYTES.saturating_add(body)
+}
+
 /// `m` as bytes, appended to `out`.
 pub fn encode(m: &Message, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /* Measured first: refused before a byte is written, and its bytes
+     * reserved at once -- a buffer grown as it is written doubles, and
+     * from an odd size past the one block of the kernel's heap that holds
+     * a message well within the limit. */
+    let len = encoded_len(m);
+    if len > MAX_MESSAGE_BYTES {
+        return Err(EncodeError::TooLarge);
+    }
+    out.reserve_exact(len);
     let start = out.len();
     out.extend_from_slice(&MAGIC);
     put8(out, VERSION);
@@ -148,13 +180,7 @@ pub fn encode(m: &Message, out: &mut Vec<u8>) -> Result<(), EncodeError> {
             KIND_VOTE_RESP
         }
         Body::Append { prev_index, prev_term, commit, entries } => {
-            /* Measured before it is written: nothing is allocated for an
-             * append that does not fit a message. */
-            let data = entries.iter().try_fold(0usize, |sum, e| {
-                if e.data.len() > MAX_ENTRY_BYTES { None } else { sum.checked_add(ENTRY_HEADER_BYTES + e.data.len()) }
-            });
-            let fits = data.is_some_and(|d| HEADER_BYTES + APPEND_BYTES + d <= MAX_MESSAGE_BYTES);
-            if entries.len() > MAX_ENTRIES || !fits {
+            if entries.len() > MAX_ENTRIES || entries.iter().any(|e| e.data.len() > MAX_ENTRY_BYTES) {
                 out.truncate(start);
                 return Err(EncodeError::TooLarge);
             }

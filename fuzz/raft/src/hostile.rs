@@ -452,7 +452,7 @@ pub fn run(seed: u64, iterations: u64) -> Result<(), String> {
     cfg.max_entries_per_msg = r.range(1, 16) as usize;
     cfg.max_bytes_per_msg = r.range(64, 4096);
     cfg.max_inflight_msgs = r.range(1, 8) as usize;
-    cfg.max_uncommitted_entries = r.range(8, 256);
+    cfg.max_uncommitted_entries = r.range(cfg.max_entries_per_msg as u64, 256);
     cfg.snapshot_piece_bytes = r.range(16, 1024) as usize;
     cfg.max_snapshot_bytes = r.range(1024, 64 * 1024);
     cfg.seed = seed;

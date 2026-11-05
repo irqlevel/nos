@@ -3,6 +3,7 @@
 //! written), and how far it is committed and applied.
 
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::cmp;
 
 use crate::storage::{Storage, StorageError};
@@ -90,13 +91,21 @@ pub(crate) struct RaftLog<S: Storage> {
     pub committed: u64,
     /// The highest entry the caller has been handed to apply.
     pub applied: u64,
+    /// The first read of the log the storage failed: nothing read after it
+    /// is believed, and the node stops (`RawNode::fault`). A `Cell`, since
+    /// the reads that find it take the log by reference.
+    fault: Cell<Option<StorageError>>,
 }
 
 impl<S: Storage> RaftLog<S> {
     pub fn new(storage: S, commit: u64) -> Result<RaftLog<S>, StorageError> {
         let first = storage.first_index();
         let last = storage.last_index();
-        if first == 0 || last + 1 < first || commit > last {
+        /* What a storage says is held to what a log can be, as a message is
+         * (`node::MAX_TERM_OR_INDEX`): nothing done with it then overflows. */
+        if first == 0 || first > crate::node::MAX_TERM_OR_INDEX || last >= crate::node::MAX_TERM_OR_INDEX
+            || last + 1 < first || commit > last
+        {
             return Err(StorageError::Corrupt);
         }
         /* The caller's state is the snapshot's: it applies from there on. */
@@ -106,7 +115,34 @@ impl<S: Storage> RaftLog<S> {
             unstable: Unstable { snapshot: None, entries: Vec::new(), offset: last + 1 },
             committed: cmp::max(commit, applied),
             applied,
+            fault: Cell::new(None),
         })
+    }
+
+    /// The first read the storage failed, if one has.
+    pub fn fault(&self) -> Option<StorageError> {
+        self.fault.get()
+    }
+
+    /// A read of what the log holds failed: kept, the first one.
+    fn failed(&self, e: StorageError) {
+        if self.fault.get().is_none() {
+            self.fault.set(Some(e));
+        }
+    }
+
+    /// The newest snapshot, to send: None while the storage has none yet
+    /// to give (`Unavailable`, asked again later); any other error is a
+    /// failed read.
+    pub fn snapshot(&self) -> Option<Snapshot> {
+        match self.storage.snapshot() {
+            Ok(s) => Some(s),
+            Err(StorageError::Unavailable) => None,
+            Err(e) => {
+                self.failed(e);
+                None
+            }
+        }
     }
 
     pub fn first_index(&self) -> u64 {
@@ -118,7 +154,9 @@ impl<S: Storage> RaftLog<S> {
     }
 
     /// The term of the entry at `index`, the snapshot's own index included;
-    /// None outside the log.
+    /// None outside the log -- and None where the storage fails to read
+    /// one it holds, which is kept as the log's fault: whatever is decided
+    /// on it is never handed out.
     pub fn term(&self, index: u64) -> Option<u64> {
         let dummy = self.first_index() - 1;
         if index < dummy || index > self.last_index() {
@@ -127,7 +165,13 @@ impl<S: Storage> RaftLog<S> {
         if let Some(t) = self.unstable.term(index) {
             return Some(t);
         }
-        self.storage.term(index).ok()
+        match self.storage.term(index) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                self.failed(e);
+                None
+            }
+        }
     }
 
     pub fn last_term(&self) -> u64 {
@@ -182,8 +226,12 @@ impl<S: Storage> RaftLog<S> {
         let hi = cmp::min(hi, lo.saturating_add(max_count as u64));
         let offset = self.unstable.offset;
         if lo < offset {
-            /* From the storage first: what is there below what is unstable. */
-            self.storage.entries(lo, cmp::min(hi, offset), max_bytes, &mut out)?;
+            /* From the storage first: what is there below what is unstable --
+             * all of it in the log, so a failure is a failed read. */
+            if let Err(e) = self.storage.entries(lo, cmp::min(hi, offset), max_bytes, &mut out) {
+                self.failed(e);
+                return Err(e);
+            }
             let got = out.len() as u64;
             if lo + got < cmp::min(hi, offset) {
                 return Ok(out);

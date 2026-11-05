@@ -89,8 +89,11 @@ pub struct MemStorage {
     hard: HardState,
     snapshot: Snapshot,
     /// The entries after the snapshot, in order, `CHUNK` a piece, every piece
-    /// full but the last.
+    /// full but the last -- the first `skip` places of the first piece held
+    /// by entries a snapshot has taken since, their data given back: so
+    /// that a snapshot drops whole pieces and moves nothing.
     chunks: Vec<Vec<Entry>>,
+    skip: usize,
     count: u64,
 }
 
@@ -132,7 +135,7 @@ impl MemStorage {
         if index < first || index > self.last_index() {
             return None;
         }
-        let at = usize::try_from(index - first).ok()?;
+        let at = usize::try_from(index - first).ok()?.checked_add(self.skip)?;
         self.chunks.get(at / CHUNK)?.get(at % CHUNK)
     }
 
@@ -140,11 +143,11 @@ impl MemStorage {
     fn truncate(&mut self, index: u64) {
         let first = self.first_index();
         let keep = index.saturating_sub(first).min(self.count);
-        let Ok(keep_n) = usize::try_from(keep) else { return };
-        let chunks = keep_n.div_ceil(CHUNK);
+        let Some(places) = usize::try_from(keep).ok().and_then(|k| k.checked_add(self.skip)) else { return };
+        let chunks = places.div_ceil(CHUNK);
         self.chunks.truncate(chunks);
         if let Some(last) = self.chunks.last_mut() {
-            last.truncate(keep_n - (chunks - 1) * CHUNK);
+            last.truncate(places - (chunks - 1) * CHUNK);
         }
         self.count = keep;
     }
@@ -188,6 +191,7 @@ impl MemStorage {
         }
         self.snapshot = snap;
         self.chunks.clear();
+        self.skip = 0;
         self.count = 0;
         if self.hard.commit < self.snapshot.meta.index {
             self.hard.commit = self.snapshot.meta.index;
@@ -205,20 +209,24 @@ impl MemStorage {
             return Err(StorageError::Unavailable);
         }
         let term = self.term(index)?;
-        /* The entries after `index`, moved down: the log starts after the
-         * snapshot. */
-        let mut rest = Vec::new();
-        let mut at = index + 1;
-        while let Some(e) = self.get(at) {
-            rest.push(e.clone());
-            at += 1;
+        /* The entries up to `index` gone: whole pieces dropped, the rest of
+         * them skipped in the first piece left and their data given back --
+         * nothing after them moved, so nothing is allocated however long
+         * the log goes on past the snapshot. */
+        let gone = index - self.snapshot.meta.index;
+        let Some(places) = usize::try_from(gone).ok().and_then(|g| g.checked_add(self.skip)) else {
+            return Err(StorageError::Corrupt);
+        };
+        let whole = (places / CHUNK).min(self.chunks.len());
+        self.chunks.drain(..whole);
+        self.skip = places - whole * CHUNK;
+        if let Some(first) = self.chunks.first_mut() {
+            for e in first.iter_mut().take(self.skip) {
+                e.data = Vec::new();
+            }
         }
+        self.count -= gone;
         self.snapshot = Snapshot { meta: SnapshotMeta { index, term, conf }, data };
-        self.chunks.clear();
-        self.count = 0;
-        for e in rest {
-            self.push(e);
-        }
         Ok(())
     }
 }

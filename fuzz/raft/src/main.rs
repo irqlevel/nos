@@ -4,23 +4,26 @@
 //!
 //! everything the gate holds: the known answers, the scripted traps, the
 //! node target over seeds 1 to 2000, the wire target over seeds 1 to 20 and
-//! the hostile target over seeds 1 to 2000 -- every allocation of every one
+//! the hostile target over seeds 1 to 2000, the storage target over seeds
+//! 1 to 20 -- every allocation of every one
 //! held to what the kernel's heap gives at once (`heap`). Exit 0 when
 //! everything held, 1 with what did not -- a finding with its seed, to run
 //! again with `node --seed N --trace` or `hostile --seed N`.
 //!
 //!     raft-fuzz unit | scenarios [name]
 //!     raft-fuzz node [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
-//!     raft-fuzz wire|hostile [--seed N] [--seeds K] [--iterations K] [--seconds T]
+//!     raft-fuzz wire|hostile|storage [--seed N] [--seeds K] [--iterations K] [--seconds T]
 //!
 //! one part at a time; with `--seconds`, seeds on from the first until the
 //! time is up -- a campaign.
 
 mod heap;
 mod hostile;
+mod review;
 mod rng;
 mod scenarios;
 mod sim;
+mod storefuzz;
 mod unit;
 mod wirefuzz;
 
@@ -42,6 +45,8 @@ const GATE_NODE_SEEDS: u64 = 2000;
 const GATE_WIRE_SEEDS: u64 = 20;
 const WIRE_ITERATIONS: u64 = 5000;
 const GATE_HOSTILE_SEEDS: u64 = 2000;
+const GATE_STORAGE_SEEDS: u64 = 20;
+const STORAGE_ITERATIONS: u64 = 300;
 const HOSTILE_ITERATIONS: u64 = 3000;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
@@ -115,7 +120,7 @@ fn unit() -> u32 {
 
 fn scenarios(only: Option<&str>) -> u32 {
     let mut failed = 0;
-    for (name, f) in scenarios::ALL {
+    for (name, f) in scenarios::ALL.iter().chain(review::ALL) {
         if only.is_some_and(|o| o != *name) {
             continue;
         }
@@ -211,6 +216,7 @@ fn main() -> ExitCode {
                 + nodes(1, GATE_NODE_SEEDS, STEPS, None, false)
                 + seeds("wire", wirefuzz::run, 1, GATE_WIRE_SEEDS, WIRE_ITERATIONS, None)
                 + seeds("hostile", hostile::run, 1, GATE_HOSTILE_SEEDS, HOSTILE_ITERATIONS, None)
+                + seeds("storage", storefuzz::run, 1, GATE_STORAGE_SEEDS, STORAGE_ITERATIONS, None)
         }
         "unit" => unit(),
         "scenarios" => scenarios(args.get(2).map(String::as_str).filter(|a| !a.starts_with("--"))),
@@ -221,9 +227,10 @@ fn main() -> ExitCode {
         }
         "wire" => target(&args, "wire", wirefuzz::run, GATE_WIRE_SEEDS, WIRE_ITERATIONS, seconds),
         "hostile" => target(&args, "hostile", hostile::run, GATE_HOSTILE_SEEDS, HOSTILE_ITERATIONS, seconds),
+        "storage" => target(&args, "storage", storefuzz::run, GATE_STORAGE_SEEDS, STORAGE_ITERATIONS, seconds),
         _ => {
             eprintln!("usage: raft-fuzz gate | unit | scenarios [name] | node [--seed N] [--seeds K] [--steps S] \
-                       [--seconds T] [--trace] | wire|hostile [--seed N] [--seeds K] [--iterations K] [--seconds T]");
+                       [--seconds T] [--trace] | wire|hostile|storage [--seed N] [--seeds K] [--iterations K] [--seconds T]");
             return ExitCode::from(2);
         }
     };

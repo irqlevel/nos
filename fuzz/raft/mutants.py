@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mutants of the raft crate the gate must catch: each one rule taken out of
-src/crates/raft/src/node.rs, the fuzzer built over it, and `raft-fuzz gate`
+src/crates/raft/src/node.rs (or the file a mutant names), the fuzzer built
+over it, and `raft-fuzz gate`
 run -- which must fail; and so must the scenario written for that rule, on
 its own. The source is put back after each, whatever happens (an exception,
 ^C, a build that fails), and checked against its hash before the next;
@@ -17,7 +18,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-NODE = os.path.join(ROOT, 'src', 'crates', 'raft', 'src', 'node.rs')
+SRC = os.path.join(ROOT, 'src', 'crates', 'raft', 'src')
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
 
@@ -63,6 +64,28 @@ MUTANTS = [
      'if self.membership.voters().len() == 1 && self.membership.is_voter(self.id) {',
      'if true {',
      'stale_leader_read'),
+    ('read_fault_ignored', "a term the storage failed to read taken as none, the member going on",
+     'match self.storage.term(index) {\n'
+     '            Ok(t) => Some(t),\n'
+     '            Err(e) => {\n'
+     '                self.failed(e);\n'
+     '                None\n'
+     '            }\n'
+     '        }',
+     'self.storage.term(index).ok()',
+     'storage_fault_vote', 'raft_log.rs'),
+    ('read_round_once', 'a round of reads asked by its own heartbeats alone',
+     'let newest = self.reads.back().map_or(0, |r| r.round);',
+     'let newest = 0;',
+     'read_round_lost'),
+    ('append_all_or_none', 'an append past the room left dropped whole',
+     'let take = new.len().min(usize::try_from(room).unwrap_or(usize::MAX));',
+     'let take = if new.len() as u64 > room { 0 } else { new.len() };',
+     'partial_append'),
+    ('snapshot_copies_tail', 'a snapshot taken that keeps no pieces of the log after it',
+     'self.chunks.drain(..whole);',
+     'self.chunks.drain(..whole);\n        self.chunks = self.chunks.concat().chunks(4096).map(|c| c.to_vec()).collect();',
+     'snapshot_long_tail', 'storage.rs'),
 ]
 
 
@@ -87,21 +110,23 @@ def run(*args):
 
 def main():
     wanted = set(sys.argv[1:])
-    with open(NODE) as f:
-        good = f.read()
-    good_digest = digest(NODE)
     tried = 0
     missed = []
-    try:
-        for name, what, old, new, scenario in MUTANTS:
-            if wanted and name not in wanted:
-                continue
-            tried += 1
-            if good.count(old) != 1:
-                print('BROKEN: %s -- its text is in node.rs %d times, not once' % (name, good.count(old)))
-                missed.append(name)
-                continue
-            with open(NODE, 'w') as f:
+    for mutant in MUTANTS:
+        name, what, old, new, scenario = mutant[:5]
+        path = os.path.join(SRC, mutant[5] if len(mutant) > 5 else 'node.rs')
+        if wanted and name not in wanted:
+            continue
+        with open(path) as f:
+            good = f.read()
+        good_digest = digest(path)
+        tried += 1
+        if good.count(old) != 1:
+            print('BROKEN: %s -- its text is in %s %d times, not once' % (name, os.path.basename(path), good.count(old)))
+            missed.append(name)
+            continue
+        try:
+            with open(path, 'w') as f:
                 f.write(good.replace(old, new))
             try:
                 if build() != 0:
@@ -119,15 +144,13 @@ def main():
                 else:
                     print('CAUGHT: %s (%s) -- %s' % (name, what, own_first[:200]))
             finally:
-                with open(NODE, 'w') as f:
+                with open(path, 'w') as f:
                     f.write(good)
-                if digest(NODE) != good_digest:
-                    sys.exit('node.rs is not what it was: restore it from git')
-    finally:
-        with open(NODE, 'w') as f:
-            f.write(good)
-    if digest(NODE) != good_digest:
-        sys.exit('node.rs is not what it was: restore it from git')
+        finally:
+            with open(path, 'w') as f:
+                f.write(good)
+            if digest(path) != good_digest:
+                sys.exit('%s is not what it was: restore it from git' % path)
     print('%d mutants, %d not caught as they must be%s' % (tried, len(missed), (': ' + ', '.join(missed)) if missed else ''))
     return 1 if missed else 0
 

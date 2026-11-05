@@ -21,6 +21,7 @@ pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("change_rules", change_rules),
     ("bootstrap_membership", bootstrap_membership),
     ("long_log", long_log),
+    ("config_extremes", config_extremes),
 ];
 
 fn ensure(ok: bool, what: &str) -> Result<(), String> {
@@ -376,4 +377,43 @@ fn long_log() -> Result<(), String> {
     }
     drain(&mut n);
     ensure(n.role() == Role::Leader, "a lone voter no longer leading")
+}
+
+/// Configurations of every value at the edges: each refused, or a group's
+/// member over it ticked, elected and asked to write without a panic.
+fn config_extremes() -> Result<(), String> {
+    let mut r = crate::rng::Rng::new(77);
+    let pick32 = |r: &mut crate::rng::Rng| [0, 1, 2, 3, 10, 1 << 24, (1 << 24) + 1, u32::MAX / 2, u32::MAX][r.below(9) as usize];
+    let pick64 = |r: &mut crate::rng::Rng| [0, 1, 7, 4096, 4097, 1 << 30, (1 << 30) + 1, u64::MAX][r.below(8) as usize];
+    for _ in 0..3000 {
+        let mut c = Config::new(1);
+        c.election_ticks = pick32(&mut r);
+        c.heartbeat_ticks = pick32(&mut r);
+        c.max_entries_per_msg = pick64(&mut r) as usize;
+        c.max_bytes_per_msg = pick64(&mut r);
+        c.max_inflight_msgs = pick64(&mut r) as usize;
+        c.max_inflight_bytes = pick64(&mut r);
+        c.max_entry_bytes = pick64(&mut r) as usize;
+        c.max_uncommitted_entries = pick64(&mut r);
+        c.max_apply_bytes = pick64(&mut r);
+        c.snapshot_piece_bytes = pick64(&mut r) as usize;
+        c.max_snapshot_bytes = pick64(&mut r);
+        if c.validate().is_err() {
+            continue;
+        }
+        let mut n = RawNode::new(c, MemStorage::bootstrap(&[1], &[])).map_err(|e| e.to_string())?;
+        for _ in 0..64 {
+            n.tick();
+            while n.has_ready() {
+                let rd = n.ready();
+                n.storage_mut().append(&rd.entries).expect("written");
+                if let Some(hs) = rd.hard_state {
+                    n.storage_mut().set_hard_state(hs);
+                }
+                n.advance();
+            }
+            let _ = n.propose(vec![1; 16]);
+        }
+    }
+    Ok(())
 }

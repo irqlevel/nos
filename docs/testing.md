@@ -2579,6 +2579,16 @@ seconds, to:
 - **The wire target**: messages written and read back; noise and broken
   messages read without a panic, anything taken written back to its very
   bytes.
+- **The node target's disks fail reads**, in a fifth of its runs, one read
+  in some hundreds: a member must stop on the first (`fault` said, no
+  `Ready` after it) and is crashed and started again, every property above
+  still held; and once healed, every read asked of a member still leading
+  in its term must be answered -- which found, besides the round asked once,
+  a round a change of voters confirmed that nothing answered.
+- **The storage target**, 20 runs of 300 operations: `MemStorage` against a
+  model of its log -- appends over its end and into it, snapshots taken in
+  logs of tens of thousands of entries and sent -- every term and range of
+  entries the model's.
 - **The hostile target**, 2000 runs of 3000 steps of one member fed what no
   correct member sends -- every kind of message, of terms and indexes about
   its own and of any value, from members and strangers, noise the wire
@@ -2597,19 +2607,28 @@ leader ticking 20,000 times with nobody taking its messages -- which, before
 the change list was kept in pieces and every batch held to a count as well
 as bytes, asked for eleven blocks past it, the largest 4 MiB.
 
-`fuzz/raft/mutants.py` takes one rule at a time out of `node.rs` -- the figure
-8 check, a vote written before it is answered, the timer started over by a
-vote, a follower's commit held to its append, a PreVote kept apart from a
-vote, an append's previous term checked, the 2015 rule, a read's round of
-heartbeats -- and each must fail the gate, and fail the scenario written for
-it on its own. Campaigns found three things the gate now holds: an
+`fuzz/raft/mutants.py` takes one rule at a time out of the crate -- the
+figure 8 check, a vote written before it is answered, the timer started
+over by a vote, a follower's commit held to its append, a PreVote kept
+apart from a vote, an append's previous term checked, the 2015 rule, a
+read's round of heartbeats, a failed read stopping the member, a round
+asked by every heartbeat, an append taken in part, a snapshot that keeps
+the log in pieces -- and each must fail the gate, and fail the scenario
+written for it on its own. Campaigns found three things the gate now holds: an
 append window filled with appends lost for good, which nothing emptied (a
 heartbeat's answer now frees one); a candidate of an older membership
 standing term after term ahead of the voters of the newer, which never
 caught up; and a leader cut off that never heard of the later term (a vote
 request and an append of an older term are both now answered with ours).
-The hostile target found the harness's own overflow first and nothing of
-the crate's since; terms and indexes no group reaches (2^62 and past) are
+The review of the first version found six things, each now a scenario
+that failed on it (`fuzz/raft/src/review.rs`): a storage's failed read
+taken as no entry (a vote given on it), an encode that grew its buffer
+past a block of the heap, a read whose round was lost never answered, a
+snapshot that copied the log after it, an append dropped whole where part
+of it fit, and a storage's or configuration's values taken unbounded --
+and a snapshot given up mid-way held until the term changed. The hostile
+target found the harness's own overflow first and nothing of the crate's
+since; terms and indexes no group reaches (2^62 and past) are
 refused before they are looked at, so no arithmetic on what a peer says can
 overflow. `--seed N --seconds S` for a campaign of the node target;
 `--mutants` to run the mutants after the gate; `raft-fuzz hostile --seed N`
