@@ -27,7 +27,11 @@ into a host program that holds it to:
     snapshots taken and sent -- held at every step to one leader a term, a
     new leader holding everything committed before it, logs that match,
     committed entries never changed and applied alike, reads never stale,
-    elections only once a timer has run out, and progress once healed;
+    elections only once a timer has run out, and progress once healed --
+    disks that fail reads in some runs, each member stopping on the first,
+    and every read asked of a leader answered once healed;
+  - the storage target: MemStorage against a model of its log, over logs
+    of tens of thousands of entries snapshotted in the middle;
   - the wire target: messages written and read back, and noise and broken
     messages read without a panic, anything taken written back to its bytes;
   - the hostile target: one member fed messages no correct member sends --
