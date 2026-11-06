@@ -18,8 +18,14 @@
 //! silence, a connection closed. What `b` does: the sink's answers to
 //! `nbs.w@a`, `ipcnet stop` and `start`, the unload.
 //!
+//! Its control mailbox, `ipcnet.ctl`, is asked as the cluster's member asks
+//! it: who this host is, and lists of peers -- among them `a` as a host
+//! invited, which may reach `nbs.sink` by that name alone until a list
+//! makes it a host again, with no connection lost either way.
+//!
 //! What must hold: nothing from `a` ever reaches `kernel.hidden`, nor the
-//! sink by its address before the sink has sent to `a`; what reaches the
+//! sink by its address before the sink has sent to `a` or while `a` may
+//! reach it by its name alone; what reaches the
 //! sink is what the world sent it, the bytes, the tag and the reference,
 //! each once and in order within a class; what reaches the world is what
 //! the sink sent, each once and in order; a key not the pinned one is never
@@ -34,11 +40,11 @@ mod ipcnet;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ipc::{Limits, Mailbox, Payload, Scope};
-use ipcwire::{Assembler, Dest, Frame, To};
+use ipcwire::{control, Assembler, Dest, Frame, To};
 use kcore::time::Duration;
 
 use crate::machine::{cmd, sched};
@@ -89,14 +95,62 @@ struct Msg {
     data: Vec<u8>,
 }
 
+/// While set, `a` is a host invited, which may reach `nbs.sink` by that name
+/// alone: set once ipcnet has taken the list that says so, cleared before
+/// it is given one that does not -- never set while `a` may reach more.
+static A_ONLY: AtomicBool = AtomicBool::new(false);
+/// How many lists making `a` a host invited ipcnet has taken: a monitor
+/// asked before one of them may meet it.
+static A_ONLY_SETS: AtomicU64 = AtomicU64::new(0);
+/// How many lists letting `a` reach more it has been given: a monitor asked
+/// while `a` was invited, with none since, met it for certain.
+static A_ONLY_LIFTS: AtomicU64 = AtomicU64::new(0);
+
+/// What a monitor of the world's may have met of `a` as a host invited:
+/// whether `a` was one as it was asked, and the lists of each kind by then.
+#[derive(Clone, Copy)]
+struct Invited {
+    only: bool,
+    sets: u64,
+    lifts: u64,
+}
+
+impl Invited {
+    fn now() -> Invited {
+        Invited { only: A_ONLY.load(Ordering::Acquire), sets: A_ONLY_SETS.load(Ordering::Acquire),
+                  lifts: A_ONLY_LIFTS.load(Ordering::Acquire) }
+    }
+
+    /// It may have been refused, and told HostLost rather than Closed.
+    fn may_have_met(self) -> bool {
+        self.only || A_ONLY_SETS.load(Ordering::Acquire) != self.sets
+    }
+
+    /// It was refused: no Closed may come for it.
+    fn met(self) -> bool {
+        self.only && A_ONLY_LIFTS.load(Ordering::Acquire) == self.lifts
+    }
+}
+
+/// `a`'s ups and the messages got from it, as `ipcnet` says them -- zero
+/// while it lists no `a`.
+fn a_counts(status: &str) -> (u64, u64) {
+    let Some(line) = status.lines().find(|l| l.trim_start().starts_with("a ")) else { return (0, 0) };
+    let after = |word: &str| -> u64 {
+        line.split(word).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse().ok()).unwrap_or(0)
+    };
+    (after("ups "), after(" got "))
+}
+
 /// What the machine's programs saw: the sink's messages, kept by its task,
 /// and whether anything reached `kernel.hidden`.
 #[derive(Default)]
 struct Seen {
     /// What the sink got, and for each whether a send of its own to `a` had
     /// been taken before it looked -- what alone lets `a` reach it by its
-    /// address.
-    sink: Vec<(Msg, bool)>,
+    /// address -- and whether `a` might reach it by its name alone then.
+    sink: Vec<(Msg, bool, bool)>,
     hidden: usize,
     /// The sink's own address, once it has one.
     sink_addr: u64,
@@ -133,9 +187,10 @@ fn sink_main(mb: Mailbox, stop: Arc<AtomicBool>, sends: Arc<Mutex<VecDeque<Msg>>
         }
         let data = m.payload().to_vec().expect("bytes");
         let msg = Msg { from: m.from().to_u64(), tag: m.tag(), reference: m.reference(), data };
+        let only = A_ONLY.load(Ordering::Acquire);
         sched::harness(|| {
             if let Some(s) = seen().as_mut() {
-                s.sink.push((msg, sent_ok));
+                s.sink.push((msg, sent_ok, only));
             }
         });
     }
@@ -462,6 +517,9 @@ pub fn ipcnet(r: &mut Input) {
     nic.set_mask(MASK);
     nic.set_gw(GW_IP);
     *seen() = Some(Seen::default());
+    A_ONLY.store(false, Ordering::Release);
+    A_ONLY_SETS.store(0, Ordering::Release);
+    A_ONLY_LIFTS.store(0, Ordering::Release);
     ipc::init();
 
     /* The machine's mailboxes: the sink, a Cluster name, and a Host one */
@@ -492,6 +550,8 @@ pub fn ipcnet(r: &mut Input) {
 
     let loaded = setup();
     invariant!(module().is_some(), "the module's source would not load: {:?}", loaded);
+    let a_key = tls::pinned::fingerprint(&keys().known.cert).expect("the world's certificate");
+    let b_key = tls::pinned::fingerprint(&keys().server.cert).expect("the machine's certificate");
     let out = cmd::run("ipcnet start");
     invariant!(out.contains("serving"), "`ipcnet start` said {:?}", out);
     /* The listener binds on its first run */
@@ -506,7 +566,9 @@ pub fn ipcnet(r: &mut Input) {
     let mut stopped = false;
     /* The monitors the world asked of the machine: id, the connection it
      * went on, and whether it was the victim's */
-    let mut monitors: Vec<(u64, usize, bool)> = Vec::new();
+    /* Each with whether it may meet `a` as a host invited, which watches
+     * nothing on `b`: answered at once with HostLost rather than Closed */
+    let mut monitors: Vec<(u64, usize, bool, Invited)> = Vec::new();
     /* Far from the ids the channel gives its own monitors: a Down said by
      * the router's own id is one nobody asked for */
     let mut next_monitor = 0x5000_0000_0000u64 + u64::from(r.u16());
@@ -683,7 +745,7 @@ pub fn ipcnet(r: &mut Input) {
                 let id = next_monitor;
                 next_monitor += 1;
                 let of_victim = r.u8() < 230;
-                monitors.push((id, j, of_victim && victim.is_some()));
+                monitors.push((id, j, of_victim && victim.is_some(), Invited::now()));
                 let target = if of_victim { victim_addr & 0xFFFF_FFFF_FFFF } else { (r.u64() & 0xFFFF_FFFF_FFFF) | 1 };
                 w.peers.links[j].speaker.borrow_mut().say(&Frame::Monitor { id, target });
                 flush(&mut w);
@@ -736,7 +798,8 @@ pub fn ipcnet(r: &mut Input) {
                     w.run_for(300 * MS);
                     /* Every monitor of it on a connection still up has had
                      * its Down by now */
-                    for &(id, j, of_victim) in &monitors {
+                    for &(id, j, of_victim, inv) in &monitors {
+                        let invited = inv.may_have_met();
                         let l = &w.peers.links[j];
                         /* Its Monitor gone out: a silent world's waits in its
                          * queue */
@@ -748,9 +811,14 @@ pub fn ipcnet(r: &mut Input) {
                          * Monitor back past the close, and NoSuch is then its
                          * answer */
                         if of_victim && alive && perfect {
-                            invariant!(l.speaker.borrow().downs.iter().any(|d| d.0 == id && d.1 == 1),
+                            let downs = &l.speaker.borrow().downs;
+                            invariant!(downs.iter().any(|d| d.0 == id && (d.1 == 1 || invited)),
                                        "the victim closed with its monitor {} up across hosts, and no Down came", id);
-                            reached("ipcnet: every monitor of a mailbox closed told, on a session that stayed up");
+                            if invited && downs.iter().any(|d| d.0 == id && d.1 != 1) {
+                                reached("ipcnet: a host invited refused a monitor, told at once");
+                            } else {
+                                reached("ipcnet: every monitor of a mailbox closed told, on a session that stayed up");
+                            }
                         }
                     }
                 }
@@ -763,6 +831,119 @@ pub fn ipcnet(r: &mut Input) {
                 invariant!(out.contains("serving") || out.contains("stopped"), "ipcnet said {:?}", out);
                 if !stopped {
                     w.run_for(200 * MS);
+                }
+            }
+            14 => {
+                /* ipcnet's control mailbox, asked as the cluster's registry
+                 * asks it (control.rs) */
+                let kind = r.u8() % 7;
+                let a = control::Peer { name: String::from("a"), ip: A_IP, keys: vec![a_key], only: None };
+                /* A list that lets `a` reach more: the flag down before it is
+                 * taken */
+                if kind == 1 || kind == 2 {
+                    A_ONLY.store(false, Ordering::Release);
+                    A_ONLY_LIFTS.fetch_add(1, Ordering::AcqRel);
+                }
+                let (tag, data) = match kind {
+                    0 => (control::TAG_ID, Vec::new()),
+                    /* The peers as they are */
+                    1 => (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone()] }.encode()),
+                    /* One more: a host the world never is */
+                    2 => {
+                        let c = control::Peer { name: String::from("c"), ip: 0x0A00_0296 + u32::from(r.u8() % 8),
+                                                keys: vec![[r.u8() | 1; 32]], only: None };
+                        (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone(), c] }.encode())
+                    }
+                    /* Refused: another cluster's, this host among its own, noise */
+                    3 => (control::TAG_PEERS, control::Peers { cluster: OTHER_CLUSTER, peers: vec![a.clone()] }.encode()),
+                    4 => {
+                        let me = control::Peer { name: String::from("b"), ip: 0x0A00_0299, keys: vec![[9; 32]],
+                                                 only: None };
+                        (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![a.clone(), me] }.encode())
+                    }
+                    /* `a` a host invited: `nbs.sink` by that name, and nothing else */
+                    6 => {
+                        let invited = control::Peer { only: Some(String::from("nbs.sink")), ..a.clone() };
+                        (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![invited] }.encode())
+                    }
+                    _ => (control::TAG_PEERS, (0..r.below(64)).map(|_| r.u8()).collect()),
+                };
+                /* `a` as ipcnet has it before: what a list that keeps it
+                 * never takes back -- its ups and messages are counted on
+                 * the peer, and a peer made anew counts from nothing */
+                let counts_before = a_counts(&cmd::run("ipcnet"));
+                let call = App::spawn("ctl", 3, move || {
+                    let before = kcore::fs::read("/etc/ipc/hosts.toml", 16384).unwrap_or_default();
+                    let mb = Mailbox::new(Limits { messages: 4, bytes: 64 << 10 }).expect("a mailbox");
+                    let p = Payload::from_slice(&data).expect("bytes");
+                    /* A list without a peer waits out that peer's dial, if one is under way: its
+                     * connect's five seconds, its address's resolution before them */
+                    let answer = ipc::call(&mb, ipc::To::Name(control::NAME), tag, p, Duration::from_millis(15_000))
+                        .ok().map(|m| (m.tag(), m.payload().to_vec().expect("bytes")));
+                    let after = kcore::fs::read("/etc/ipc/hosts.toml", 16384).unwrap_or_default();
+                    (answer, before, after)
+                });
+                let end = sched::now() + 20 * SEC;
+                w.run_until(end, || call.done());
+                let Some((answer, before, after)) = call.take() else {
+                    invariant!(false, "ipcnet's control mailbox never answered");
+                    continue;
+                };
+                let Some((got, payload)) = answer else {
+                    invariant!(false, "ipcnet's control mailbox answered nothing to request {}", kind);
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&after).into_owned();
+                match kind {
+                    0 => {
+                        let id = control::Identity::decode(&payload);
+                        let want = control::Identity { name: String::from("b"), cluster: CLUSTER, key: b_key,
+                                                       nic: String::from("eth0"), ip: ETH0_IP, port: PORT,
+                                                       serving: !stopped };
+                        invariant!(got == control::TAG_ID && id.as_ref() == Some(&want),
+                                   "ipcnet said who it is as {:?}, not {:?}", id, want);
+                        reached("ipcnet: its control mailbox said who this host is");
+                    }
+                    1 | 2 | 6 => {
+                        invariant!(got == control::TAG_OK, "ipcnet refused a list of its peers: {:?}",
+                                   String::from_utf8_lossy(&payload));
+                        let has_c = text.contains("\"c ");
+                        let line = format!("\"a {} {}{}\"", netwire::Ipv4(A_IP), hex(&a_key),
+                                           if kind == 6 { " only=nbs.sink" } else { "" });
+                        invariant!(text.contains(&line) && has_c == (kind == 2),
+                                   "hosts.toml is not the peers it was told: {:?}", text);
+                        if kind == 6 {
+                            A_ONLY.store(true, Ordering::Release);
+                            A_ONLY_SETS.fetch_add(1, Ordering::AcqRel);
+                        }
+                        /* The peer kept is kept: lost now and then for the world's
+                         * doing, never taken off by a list that has it, nor made
+                         * anew -- what it may reach changed in place */
+                        /* Stopped, ipcnet has the list in hosts.toml alone */
+                        let st = cmd::run("ipcnet");
+                        if !stopped {
+                            let line = st.lines().find(|l| l.trim_start().starts_with("a ")).unwrap_or("");
+                            invariant!(!line.is_empty() && !line.contains("taken off hosts.toml"),
+                                       "a peer kept on the list taken off by it: {:?}", st);
+                            invariant!(line.contains("(invited: nbs.sink alone)") == (kind == 6),
+                                       "a peer's line says {:?}, after a list that made it {}", line,
+                                       if kind == 6 { "a host invited" } else { "a host" });
+                            let counts = a_counts(&st);
+                            invariant!(counts.0 >= counts_before.0 && counts.1 >= counts_before.1,
+                                       "a peer kept on the list made anew: ups and messages {:?}, {:?} before",
+                                       counts, counts_before);
+                        }
+                        reached(match kind {
+                            1 => "ipcnet: told its peers as they are",
+                            2 => "ipcnet: told one more peer",
+                            _ => "ipcnet: told a peer is a host invited, which reaches one name",
+                        });
+                    }
+                    _ => {
+                        invariant!(got == control::TAG_REFUSED && after == before,
+                                   "a list of peers that is none taken: answered {}, hosts.toml {:?}", got, text);
+                        reached("ipcnet: a list of peers that is none refused, hosts.toml as it was");
+                    }
                 }
             }
             13 => {
@@ -814,7 +995,8 @@ pub fn ipcnet(r: &mut Input) {
 }
 
 /// What must hold at every step.
-fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>, asked: &[(u64, usize, bool)],
+fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>,
+         asked: &[(u64, usize, bool, Invited)],
          perfect: bool) {
     /* The kernel asked first, and the model's lock taken after: a call into
      * the kernel may hand the machine's turn to a task -- the sink's -- that
@@ -826,7 +1008,7 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
     if !s.sink.is_empty() {
         reached("ipcnet: a message of the world's delivered to the sink");
     }
-    if s.sink.iter().any(|(g, ok)| *ok && sent.iter().any(|x| !x.by_name && x.reference == g.reference)) {
+    if s.sink.iter().any(|(g, ok, _)| *ok && sent.iter().any(|x| !x.by_name && x.reference == g.reference)) {
         reached("ipcnet: the sink reached at its address, having sent there");
     }
     /* What reached the sink: the world's, each once, in order within a
@@ -835,8 +1017,8 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
         for from in [A_BOX, A_BOX2] {
             let mine: Vec<&Sent> = sent.iter().filter(|x| x.bulk == class && x.from == from).collect();
             let mut at = 0;
-            for (g, sent_ok) in s.sink.iter().filter(|(g, _)| (g.tag & TAG_BULK != 0) == class
-                                                         && (g.from & 0xFFFF_FFFF_FFFF) == from) {
+            for (g, sent_ok, only) in s.sink.iter().filter(|(g, _, _)| (g.tag & TAG_BULK != 0) == class
+                                                                 && (g.from & 0xFFFF_FFFF_FFFF) == from) {
                 let Some(k) = mine[at..].iter().position(|x| x.tag == g.tag && x.reference == g.reference && x.data == g.data)
                     else {
                         panic!("invariant: the sink got a message ({} bytes, tag {:x}, reference {:x}) the world never \
@@ -845,6 +1027,11 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
                 let x = mine[at + k];
                 invariant!(x.by_name || *sent_ok, "a message to the sink's address reached it before the sink had \
                            sent to the world's host");
+                invariant!(x.by_name || !*only, "a message to the sink's address reached it while the world's host \
+                           was a host invited, which may reach it by its name alone");
+                if *only {
+                    reached("ipcnet: a host invited reached the one name it may, by that name");
+                }
                 invariant!(g.from >> 48 != 0, "a message from another host delivered with no host in its sender");
                 at += k + 1;
             }
@@ -897,6 +1084,9 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
         for (k, (id, reason)) in sp.downs.iter().enumerate() {
             invariant!(asked.iter().any(|m| m.0 == *id) && sp.downs[..k].iter().all(|d| d.0 != *id),
                        "a Down for monitor {} said twice, or for one never asked", id);
+            invariant!(*reason != 1 || !asked.iter().any(|m| m.0 == *id && m.3.met()),
+                       "monitor {}, asked while the world's host was a host invited, which watches nothing, \
+                       told its mailbox closed", id);
             if *reason == 1 {
                 invariant!(s.victim_closed, "a Down (Closed) for monitor {} before the victim closed", id);
                 reached("ipcnet: a monitor across hosts told of its mailbox's close");
@@ -906,7 +1096,7 @@ fn check(w: &World<Wire>, sent: &[Sent], said: &[Msg], silent_since: Option<u64>
         }
         for (tag, reference) in sp.bounces.iter() {
             let ours = sent.iter().any(|x| x.tag == *tag && x.reference == *reference);
-            let got = s.sink.iter().any(|(g, _)| g.tag == *tag && g.reference == *reference);
+            let got = s.sink.iter().any(|(g, _, _)| g.tag == *tag && g.reference == *reference);
             invariant!(ours && !got, "a bounce of tag {:x} reference {:x}: the world's {} and the sink got it {}",
                        tag, reference, ours, got);
             reached("ipcnet: a message the sink had no room for bounced back");

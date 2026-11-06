@@ -596,6 +596,26 @@ impl Drop for Mailbox {
     }
 }
 
+/// A host's name at most: a DNS label's.
+const HOST_NAME_MAX: usize = 63;
+
+/// The host a message from another host came from: the name of the peer
+/// whose number `addr`'s host part is, while it is up -- None for this
+/// host's own addresses, and for a number no peer has now.
+pub fn peer_name(addr: Addr) -> Option<String> {
+    let host = addr.host();
+    if host == 0 {
+        return None;
+    }
+    let mut buf = [0u8; HOST_NAME_MAX];
+    /* `buf` takes its length's bytes */
+    let n = unsafe { ipc::kernel_ipc_peer_name(u32::from(host), buf.as_mut_ptr(), buf.len()) };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    core::str::from_utf8(&buf[..n]).ok().map(String::from)
+}
+
 /// The address `name` names on this host.
 pub fn lookup(name: &str) -> Option<Addr> {
     /* `name` is its length's bytes */

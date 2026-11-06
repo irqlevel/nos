@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+mod control;
 mod files;
 mod link;
 mod peer;
@@ -36,10 +37,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kcore::cmd::{Command, Output};
 use kcore::error::Error;
+use kcore::task::TaskHandle;
 
 use files::{Dir, Ip, PeerConf};
 use peer::Locked;
@@ -63,13 +65,16 @@ struct State {
     server: Locked<Option<Box<Server>>>,
     /// Held through every change of hosts.toml
     files: Locked<()>,
+    /// The control mailbox's task stops at it (control.rs).
+    ctl_stop: AtomicBool,
 }
 
-/* Dropped in this order: the command, waiting out a call of it; then the
-   state, and with its last reference the server, whose tasks are waited
-   for -- every peer lost on the way */
+/* Dropped in this order: the control task, stopped and waited out; the
+   server, whose tasks are waited for -- every peer lost on the way; then
+   the command, waiting out a call of it, and the state */
 struct Ipcnet {
     _cmd: Command,
+    ctl: Option<TaskHandle>,
     state: Arc<State>,
 }
 
@@ -77,6 +82,8 @@ impl kmod::Module for Ipcnet {}
 
 impl Drop for Ipcnet {
     fn drop(&mut self) {
+        self.state.ctl_stop.store(true, Ordering::Release);
+        drop(self.ctl.take());
         let server = self.state.server.with(|s| s.take());
         drop(server);
     }
@@ -98,6 +105,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
         dir: Dir::new(root.unwrap_or(files::DEFAULT_DIR)),
         server: Locked::new(None).ok_or(Error::NoMemory)?,
         files: Locked::new(()).ok_or(Error::NoMemory)?,
+        ctl_stop: AtomicBool::new(false),
     });
     let st = state.clone();
     let cmd = Command::register("ipcnet", HELP, move |args, out| {
@@ -105,7 +113,11 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
             let _ = writeln!(out, "ipcnet: {}", problem);
         }
     })?;
-    Ok(Box::new(Ipcnet { _cmd: cmd, state }))
+    let Some(ctl) = kcore::task::spawn_with("ipcnet/ctl", state.clone(), control::main) else {
+        let _ = writeln!(out, "ipcnet: could not start the control mailbox's task");
+        return Err(Error::NoMemory);
+    };
+    Ok(Box::new(Ipcnet { _cmd: cmd, ctl: Some(ctl), state }))
 }
 
 kmod::module!(name: "ipcnet", init_with_params: init);
@@ -223,7 +235,7 @@ fn add(state: &State, name: &str, ip: &str, keys: &[&str], out: &mut Output) -> 
     for k in keys {
         fingerprints.push(files::parse_key(k).ok_or_else(|| alloc::format!("\"{}\" is not a key: 64 hex digits", k))?);
     }
-    let peer = PeerConf { name: String::from(name), ip, keys: fingerprints };
+    let peer = PeerConf { name: String::from(name), ip, keys: fingerprints, only: None };
     edit_peers(state, |cfg, peers| {
         if cfg.name == name {
             return Err(alloc::format!("{} is this host", name));
@@ -292,11 +304,16 @@ fn status(state: &State, out: &mut Output) -> Result<(), String> {
     for p in &peers {
         let (name, said, number, since) = peer::describe(p);
         let c = &p.counts;
-        let state = if number != 0 {
+        let mut state = if number != 0 {
             alloc::format!("up {} s as host {}", now.saturating_sub(since) / 1_000_000_000, number)
         } else {
             alloc::format!("down: {}", said)
         };
+        p.only.with(|o| {
+            if let Some(n) = o {
+                let _ = write!(state, " (invited: {} alone)", n);
+            }
+        });
         let _ = writeln!(out, "  {:<12} {:<15} {} -- {}; sent {} got {}, bytes {} / {}, bounced {} / {}, refused {}, \
                                dropped {}, ups {}, losses {}", name, alloc::format!("{}", Ip(p.conf.ip)),
                          if p.dials { "dials" } else { "takes" }, state, get(&c.sent), get(&c.received),
