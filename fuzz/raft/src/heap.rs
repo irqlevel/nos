@@ -77,11 +77,13 @@ unsafe impl GlobalAlloc for Heap {
     }
 }
 
-/// Held while a refusal is said, which allocates.
-struct Exempt;
+/// Held while a refusal is said, which allocates -- and by the log
+/// target's disk (`logfuzz`), whose files are the fuzzer's and not the
+/// crate's: a segment of megabytes is one block of the model's.
+pub struct Exempt;
 
 impl Exempt {
-    fn new() -> Exempt {
+    pub fn new() -> Exempt {
         EXEMPT.with(|e| e.set(e.get() + 1));
         Exempt
     }

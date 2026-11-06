@@ -35,7 +35,9 @@
 //!
 //! Entries are bytes the crate does not read. [`wire`] makes every message
 //! bytes and takes it back, checking everything; [`storage`] is what a node
-//! keeps durable, with a storage in memory for tests and small groups.
+//! keeps durable, with a storage in memory for tests and small groups; and
+//! [`log`] keeps it on a disk, in files of a directory the user hands it --
+//! read back after a crash as the member left it, a torn tail cut.
 //!
 //! `no_std` with `alloc`, no `unsafe`, no dependency, and no allocation
 //! larger than the 512 KiB the kernel's heap gives at once, however long the
@@ -54,6 +56,8 @@ mod progress;
 mod raft_log;
 mod rand;
 
+pub mod crc32c;
+pub mod log;
 pub mod node;
 pub mod storage;
 pub mod types;
@@ -61,5 +65,6 @@ pub mod wire;
 
 pub use conf::{ChangeError, MAX_MEMBERS};
 pub use node::{Config, Error, Ready, RawNode, ReadState, Refusal, Role, SoftState, Stats};
+pub use log::{DiskLog, FileError, Files, LogConfig, LogError};
 pub use storage::{MemStorage, RaftState, Storage, StorageError};
 pub use types::*;
