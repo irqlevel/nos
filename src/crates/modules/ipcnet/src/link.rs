@@ -61,6 +61,9 @@ pub const OPEN_BYTES_MAX: usize = 4 << 20;
 const PIECES_MAX: usize = 2048;
 /// A read's buffer, and the most of a frame kept waiting for its rest.
 const READ_BYTES: usize = 16 * 1024;
+/// Reads a turn of the loop takes at most while the session holds more of
+/// what came: a bulk connection's receive buffer's worth of records.
+const DRAIN_READS: usize = 32;
 /// The goodbye's time: the close_notify, and at the server's end the FIN.
 const CLOSE_MS: u64 = 500;
 const NS_PER_MS: u64 = 1_000_000;
@@ -127,6 +130,13 @@ impl Session {
         match self {
             Session::Server(s) => s.pending(),
             Session::Client(s) => s.pending(),
+        }
+    }
+
+    fn buffered(&self) -> bool {
+        match self {
+            Session::Server(s) => s.buffered(),
+            Session::Client(s) => s.buffered(),
         }
     }
 
@@ -610,38 +620,51 @@ fn serve_link(shared: &Arc<Shared>, sess: &mut Session, peer: &Arc<Peer>, class:
         }
         /* In: what came -- for a millisecond while things go out, and while
          * nothing does until the next Ping is due: the socket's wait ends
-         * the moment data comes, or something is queued here (`waker`) */
+         * the moment data comes, or something is queued here (`waker`).
+         * And then, while the session holds more of it, the rest, up to a
+         * receive buffer's worth: a reader that takes one record a turn,
+         * and spends the rest of the turn on its flush, lets its buffer
+         * fill behind it and shuts the peer's window -- and with both
+         * directions busy the peer's flush waits on that, its own reading
+         * with it: the two hosts went in step, a record each a turn, a
+         * third slower than one message at a time. */
         let busy = moved || sess.pending() > 0 || !sender.open.is_empty();
-        let wait = if busy {
+        let mut wait = if busy {
             1
         } else {
             (next_ping.saturating_sub(kcore::time::boot_time_ns()) / NS_PER_MS).clamp(1, PING_MS)
         };
-        match sess.read(&mut buf, wait) {
-            Read::Data(n) => {
-                heard = kcore::time::boot_time_ns();
-                inbuf.extend_from_slice(&buf[..n]);
-                let mut at = 0;
-                loop {
-                    match ipcwire::decode(&inbuf[at..]) {
-                        Ok(Some((f, used))) => {
-                            at += used;
-                            if let Err(why) = take(shared, peer, class, number, &mut asm, &f) {
-                                return why;
+        for _ in 0..DRAIN_READS {
+            match sess.read(&mut buf, wait) {
+                Read::Data(n) => {
+                    heard = kcore::time::boot_time_ns();
+                    inbuf.extend_from_slice(&buf[..n]);
+                    let mut at = 0;
+                    loop {
+                        match ipcwire::decode(&inbuf[at..]) {
+                            Ok(Some((f, used))) => {
+                                at += used;
+                                if let Err(why) = take(shared, peer, class, number, &mut asm, &f) {
+                                    return why;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                add(&shared.counters.wire_refused, 1);
+                                return "a frame the wire refuses";
                             }
                         }
-                        Ok(None) => break,
-                        Err(_) => {
-                            add(&shared.counters.wire_refused, 1);
-                            return "a frame the wire refuses";
-                        }
                     }
+                    inbuf.drain(..at);
                 }
-                inbuf.drain(..at);
+                Read::Idle => break,
+                Read::End => return "it closed its connection",
+                Read::Failed => return "the session failed",
             }
-            Read::Idle => {}
-            Read::End => return "it closed its connection",
-            Read::Failed => return "the session failed",
+            if !sess.buffered() {
+                break;
+            }
+            wait = 1;
         }
     }
 }

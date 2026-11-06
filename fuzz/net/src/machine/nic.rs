@@ -34,6 +34,9 @@ pub struct Wire {
     /// Frames a receive pass could not have from the pool, nor the
     /// allocator: dropped, as a NIC with no buffer posted drops them.
     pub no_buffer: u64,
+    /// When each NIC's transmit side last started again: what it takes
+    /// then is what queued up while it was stopped, made any time before.
+    pub unstalled_at: [u64; NICS],
 }
 
 pub static WIRE: Mutex<Wire> = Mutex::new(Wire {
@@ -41,6 +44,7 @@ pub static WIRE: Mutex<Wire> = Mutex::new(Wire {
     inbound: [const { VecDeque::new() }; NICS],
     stalled: [false; NICS],
     no_buffer: 0,
+    unstalled_at: [0; NICS],
 });
 
 pub fn wire() -> std::sync::MutexGuard<'static, Wire> {
@@ -51,7 +55,13 @@ pub fn wire() -> std::sync::MutexGuard<'static, Wire> {
 /// down -- or starts again: and then, as its completion interrupt would, it
 /// has the stack hand it what queued up meanwhile.
 pub fn stall(index: usize, stalled: bool) {
-    wire().stalled[index] = stalled;
+    {
+        let mut w = wire();
+        if w.stalled[index] && !stalled {
+            w.unstalled_at[index] = sched::now();
+        }
+        w.stalled[index] = stalled;
+    }
     if !stalled {
         sched::softirq_raise(kcore::softirq::TYPE_NET_TX);
     }

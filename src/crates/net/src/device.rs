@@ -190,6 +190,10 @@ impl RxQueue<'_> {
             return;
         }
         self.dev.enqueue_rx(frames);
+        let left = frames.len();
+        if left != 0 {
+            self.dev.rx_full.fetch_add(left, Ordering::Relaxed);
+        }
         drop(frames.take());
     }
 }
@@ -422,6 +426,15 @@ pub struct Device {
     rx_seen: Counted,
     /// Datagrams refused for an address no packet may go to.
     tx_refused: AtomicUsize,
+    /// Frames a driver handed up that the receive queue had no room for:
+    /// dropped, as a NIC whose ring is full drops them -- and counted, where
+    /// they once went without a word, a burst's tail no protocol ever saw
+    rx_full: AtomicUsize,
+    /// Frames the stack handed down that the transmit queue had no room
+    /// for -- the driver's ring full and the queue behind it too: dropped,
+    /// and counted, where a sender that filled its own queue once lost its
+    /// own segments without a word
+    tx_full: AtomicUsize,
 }
 
 impl Device {
@@ -448,6 +461,8 @@ impl Device {
             tx_sent: Counted::new(),
             rx_seen: Counted::new(),
             tx_refused: AtomicUsize::new(0),
+            rx_full: AtomicUsize::new(0),
+            tx_full: AtomicUsize::new(0),
         }
     }
 
@@ -577,6 +592,9 @@ impl Device {
 
         /* No room for the rest: released along with what the driver
          * finishes -- or, with no lock to put them under, here. */
+        if !frames.is_empty() {
+            self.tx_full.fetch_add(frames.len(), Ordering::Relaxed);
+        }
         match guard {
             Some(mut guard) => {
                 while let Some(frame) = frames.pop() {
@@ -703,6 +721,11 @@ impl Device {
         if let Some(driver) = self.rx_driver.get() {
             driver.get(rx).process(&mut RxQueue { dev: self });
         }
+    }
+
+    /// The frames the receive queue has had no room for, so far.
+    pub fn rx_full(&self) -> usize {
+        self.rx_full.load(Ordering::Relaxed)
     }
 
     /// What the hardware has waiting, as a hint for the receive poll -- read
@@ -1031,6 +1054,8 @@ impl Device {
             tx_bytes: self.tx_sent.bytes(),
             rx_bytes: self.rx_seen.bytes(),
             tx_refused: self.tx_refused.load(Ordering::Relaxed),
+            rx_full: self.rx_full.load(Ordering::Relaxed),
+            tx_full: self.tx_full.load(Ordering::Relaxed),
             rx_drop: 0, rx_icmp: 0, rx_udp: 0, rx_tcp: 0, rx_arp: 0, rx_other: 0, rx_nat: 0,
             tx_icmp: 0, tx_udp: 0, tx_tcp: 0, tx_arp: 0, tx_other: 0,
         };
@@ -1064,6 +1089,10 @@ pub struct Stats {
     pub rx_bytes: usize,
     /// Datagrams to an address no packet may go to, never sent.
     pub tx_refused: usize,
+    /// Frames the receive queue had no room for, and the transmit queue,
+    /// dropped
+    pub rx_full: usize,
+    pub tx_full: usize,
     pub rx_drop: usize,
     pub rx_icmp: usize,
     pub rx_udp: usize,

@@ -52,6 +52,9 @@ pub fn audit() {
 /// again or sets a deadline anew. A closed connection's is nobody's: the
 /// pass skips it, and the slot's cleanup is all that is left of it.
 pub fn check_tcp_timer() {
+    /* No byte the window offered ever found the buffer without room for it */
+    let overrun = net::tcp::TCP.stats().rx_overrun;
+    invariant!(overrun == 0, "TCP: {} bytes inside a window offered found no room in the receive buffer", overrun);
     let now_ms = crate::machine::sched::now() / 1_000_000;
     let late = 2 * crate::machine::sched::TICK / 1_000_000 + 1;
     for i in 0..net::tcp::MAX_CONNECTIONS {
@@ -67,6 +70,12 @@ pub fn check_tcp_timer() {
                 invariant!(now_ms <= c.retransmit_at + late, "TCP slot {} ({}, port {} -> {}): its retransmission was \
                            due at {} ms and is still not looked at, at {} ms", i, c.state.name(), c.local_port,
                            c.remote_port, c.retransmit_at, now_ms);
+            }
+            /* Its table of what is in flight what it says of itself, and
+             * the window it offers within its receive buffer */
+            if let Some(wrong) = net::tcp::TCP.audit_sent(i) {
+                panic!("invariant: TCP slot {} ({}, port {} -> {}): {}", i, c.state.name(), c.local_port,
+                       c.remote_port, wrong);
             }
             /* And a connection half open is given up after its time --
              * looked at by a retransmission's pass or a sweep */

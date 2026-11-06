@@ -93,6 +93,14 @@ class Port:
         self.sock.setblocking(False)
         self.frames_in = 0
         self.frames_out = 0
+        # Frames to this port's QEMU the host would not take -- a send buffer
+        # or the loopback's queue full -- by errno: lost here, and counted,
+        # where they once went without a word
+        self.send_failed = {}
+        # The TCP segments this port's QEMU sent, by how much data each
+        # carried: none (an acknowledgement), under 100 bytes, under 1400,
+        # and full -- the mix of frames a transfer cost
+        self.segments = {"ack": 0, "tiny": 0, "mid": 0, "full": 0}
 
 
 class Link:
@@ -196,19 +204,24 @@ class Hub:
         try:
             p.sock.sendto(frame, ("127.0.0.1", p.qemu_port))
             p.frames_out += 1
-        except OSError:
-            pass
+        except OSError as e:
+            p.send_failed[e.errno] = p.send_failed.get(e.errno, 0) + 1
 
-    def carries_data(self, frame):
-        """A TCP segment with data in it: what drop_next drops."""
+    def tcp_data(self, frame):
+        """How many bytes of data a TCP segment carries -- None for a frame
+        that is no TCP segment."""
         if len(frame) < 14 + 20 or struct.unpack("!H", frame[12:14])[0] != ETH_IP or frame[23] != TCP:
-            return False
+            return None
         ihl = (frame[14] & 0x0F) * 4
         total = struct.unpack("!H", frame[16:18])[0]
         if len(frame) < 14 + ihl + 20:
-            return False
+            return None
         offset = (frame[14 + ihl + 12] >> 4) * 4
-        return total - ihl - offset > 0
+        return max(total - ihl - offset, 0)
+
+    def carries_data(self, frame):
+        """A TCP segment with data in it: what drop_next drops."""
+        return (self.tcp_data(frame) or 0) > 0
 
     def forward(self, src, dst, frame, now):
         with self.lock:
@@ -346,6 +359,9 @@ class Hub:
                     except (BlockingIOError, OSError):
                         break
                     p.frames_in += 1
+                    n = self.tcp_data(frame)
+                    if n is not None:
+                        p.segments["ack" if n == 0 else "tiny" if n < 100 else "mid" if n < 1400 else "full"] += 1
                     if (len(frame) < 14 or self.dhcp(p.index, frame) or self.arp(p.index, frame)
                             or self.to_shell(p.index, frame)):
                         continue
