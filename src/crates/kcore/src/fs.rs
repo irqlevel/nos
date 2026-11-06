@@ -254,11 +254,27 @@ impl Image {
     /// The image held with a queue: `buffers` buffers of `bytes` each, a
     /// whole number of pages. NoMemory when it cannot have them.
     pub fn into_queue(self, buffers: usize, bytes: usize) -> Result<ImageQueue> {
+        self.queue_on(0, buffers, bytes)
+    }
+
+    /// `into_queue`, made on `event` -- the event of a task that waits for
+    /// this and more: the queue's completions and wakes signal that event as
+    /// well as the queue's own, which `wait` and `poll` still sleep on. The
+    /// kernel holds the event for as long as the queue is open, so `event`
+    /// may be dropped first.
+    pub fn into_queue_on(self, event: &crate::events::SharedEvent, buffers: usize, bytes: usize)
+        -> Result<ImageQueue>
+    {
+        self.queue_on(event.handle(), buffers, bytes)
+    }
+
+    fn queue_on(self, event: u64, buffers: usize, bytes: usize) -> Result<ImageQueue> {
         let mut at = Vec::new();
         at.try_reserve_exact(buffers).map_err(|_| Error::NoMemory)?;
         at.resize(buffers, core::ptr::null_mut());
-        /* `at` takes `buffers` pointers, and the handle is looked up. */
-        if unsafe { fs::kernel_image_queue(self.handle, buffers, bytes, at.as_mut_ptr()) } != 0 {
+        /* `at` takes `buffers` pointers; the handle and the event are looked
+         * up. */
+        if unsafe { fs::kernel_image_queue(self.handle, buffers, bytes, at.as_mut_ptr(), event) } != 0 {
             return Err(Error::NoMemory);
         }
         /* The kernel's buffers, `bytes` each, kept for as long as the image

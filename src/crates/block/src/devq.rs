@@ -16,12 +16,18 @@
 //! is no queue's names nothing. A call holds its slot's lock for as long as
 //! it works: a queue's calls come one at a time -- its owner's -- and a
 //! wake (`kernel_blockq_wake`) takes no lock at all.
+//!
+//! A queue may be opened on a task's event (`events`, a module's handle of
+//! one): its completions and wakes signal it too, and the queue holds it
+//! until it is closed (`queue::Queue`).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use events::SharedEvent;
 use ffi::block::QueueDone;
 use kcore::block::SubmitError;
 use kcore::consts::PAGE_SIZE;
@@ -92,14 +98,15 @@ enum Started {
 impl DevQueue {
     /// `disk`'s queue -- `buffers` buffers of `bytes` each -- for writing
     /// to it with `writable`, its claim held by `holder` whether it writes
-    /// or not: a VM that reads its disk has it to itself as well. Who holds
-    /// what overlaps it, when that is in the way; None for memory.
-    fn open(disk: Disk, writable: bool, holder: Holder, buffers: usize, bytes: usize)
-        -> Result<Option<DevQueue>, Holder>
+    /// or not: a VM that reads its disk has it to itself as well; made on
+    /// `event`, a task's, when one is given. Who holds what overlaps it,
+    /// when that is in the way; None for memory.
+    fn open(disk: Disk, writable: bool, holder: Holder, buffers: usize, bytes: usize,
+            event: Option<Arc<SharedEvent>>) -> Result<Option<DevQueue>, Holder>
     {
         let claim = Claim(table::claim(disk.handle(), holder)?);
         let pages = bytes / PAGE_SIZE;
-        let Some(queue) = Queue::new(Some(disk), buffers, pages) else { return Ok(None) };
+        let Some(queue) = Queue::new(Some(disk), buffers, pages, event) else { return Ok(None) };
         let (mut flights, mut done, mut pieces) = (Vec::new(), VecDeque::new(), Vec::new());
         if flights.try_reserve_exact(buffers).is_err() || done.try_reserve_exact(buffers).is_err()
             || pieces.try_reserve_exact(pages).is_err()
@@ -289,10 +296,11 @@ fn entry_of(q: usize) -> Option<usize> {
 /// number of pages -- their addresses into `out`, the device claimed for
 /// the holder the `name_len` bytes at `name` name -- "a module writing to
 /// it" for none, as `kernel_blockdev_claim` has it -- for writing with
-/// `write` not 0: the queue's word. 0 for memory, a word that names no
-/// device or arguments past what a queue takes -- or with who holds what is
-/// in the way copied into `refused` (`cap` bytes) and its length, `cap` at
-/// most, into `*refused_len`, which is 0 otherwise.
+/// `write` not 0, made on the task's event `event` names unless it is 0:
+/// the queue's word. 0 for memory, a word that names no device or no event,
+/// or arguments past what a queue takes -- or with who holds what is in the
+/// way copied into `refused` (`cap` bytes) and its length, `cap` at most,
+/// into `*refused_len`, which is 0 otherwise.
 ///
 /// # Safety
 /// `out` takes `buffers` pointers; `name`, unless `name_len` is 0, points
@@ -301,7 +309,7 @@ fn entry_of(q: usize) -> Option<usize> {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockq_open(
     device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize, out: *mut *mut u8,
-    refused: *mut u8, cap: usize, refused_len: *mut usize,
+    refused: *mut u8, cap: usize, refused_len: *mut usize, event: u64,
 ) -> usize {
     if let Some(len) = unsafe { refused_len.as_mut() } {
         *len = 0;
@@ -312,6 +320,15 @@ pub unsafe extern "C" fn kernel_blockq_open(
         return 0;
     }
     let Some(disk) = Disk::from_handle(device) else { return 0 };
+    /* The task's event, looked up: the queue holds it from here on, so the
+     * module may let go of its handle first */
+    let event = match event {
+        0 => None,
+        handle => match events::lookup(handle) {
+            Some(e) => Some(e),
+            None => return 0,
+        },
+    };
     let out = unsafe { core::slice::from_raw_parts_mut(out, buffers) };
     let holder = if name.is_null() || name_len == 0 {
         Holder::of(table::MODULE_HOLDER)
@@ -323,7 +340,7 @@ pub unsafe extern "C" fn kernel_blockq_open(
     /* Opened before a slot is looked for: a claim refused, or memory
      * short, takes no slot -- and a slot's lock is never held across the
      * allocation. */
-    let mut queue = match DevQueue::open(disk, write != 0, holder, buffers, bytes) {
+    let mut queue = match DevQueue::open(disk, write != 0, holder, buffers, bytes, event) {
         Ok(Some(queue)) => queue,
         Ok(None) => return 0,
         Err(in_the_way) => {

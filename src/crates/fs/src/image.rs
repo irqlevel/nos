@@ -64,7 +64,9 @@
 //!
 //! A loadable module reaches one through the C ABI at the bottom -- an image
 //! is a slot of this file's table and the generation of what is in it, looked
-//! up on every call (`kcore::fs::Image`, `kcore::fs::ImageQueue`).
+//! up on every call (`kcore::fs::Image`, `kcore::fs::ImageQueue`). Its queue
+//! may be made on a task's event, which its completions and wakes then
+//! signal too (`block::queue::Queue`, plans/ipc.md I2).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -74,6 +76,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use block::queue::Queue;
 use block::{Disk, Piece};
+use events::SharedEvent;
 use kcore::block::SubmitError;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -1265,14 +1268,15 @@ impl Image {
     /* ---- the queue: a guest's disk's requests, as many at once as it has ---- */
 
     /// The image's queue (`Flights`): `buffers` buffers of `pages` pages
-    /// each, a request's at a time -- false when there is no memory for
-    /// them, or it has one already.
-    pub fn make_queue(&mut self, buffers: usize, pages: usize) -> bool {
+    /// each, a request's at a time, made on `event` -- a task's, which its
+    /// completions and wakes then signal too -- when one is given: false
+    /// when there is no memory for them, or it has one already.
+    pub fn make_queue(&mut self, buffers: usize, pages: usize, event: Option<Arc<SharedEvent>>) -> bool {
         if self.flights.is_some() || buffers == 0 || pages == 0 {
             return false;
         }
         let disk = self.direct.as_ref().map(|d| d.disk);
-        let Some(queue) = Queue::new(disk, buffers, pages) else { return false };
+        let Some(queue) = Queue::new(disk, buffers, pages, event) else { return false };
         let mut slots = Vec::new();
         let mut done = VecDeque::new();
         let mut commands = Vec::new();
@@ -2376,22 +2380,34 @@ pub extern "C" fn kernel_image_sync(image: usize) -> i32 {
  * `kernel_image_wake` from one task. */
 
 /// Its queue (`Image::make_queue`): `buffers` buffers of `bytes` each, a
-/// whole number of pages, their addresses into `out` -- 0, or -1: no
-/// memory, a queue already, a word that is no image's.
+/// whole number of pages, their addresses into `out`, made on the task's
+/// event `event` names unless it is 0 -- 0, or -1: no memory, a queue
+/// already, a word that is no image's, or no event's.
 ///
 /// # Safety
 /// `out` takes `buffers` pointers.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8) -> i32 {
+pub unsafe extern "C" fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8,
+                                            event: u64) -> i32 {
     if out.is_null() || !out.is_aligned() || buffers == 0 || buffers > IMAGE_QUEUE_MAX || bytes == 0
         || bytes % PAGE_SIZE != 0
     {
         return -1;
     }
+    /* The task's event, looked up -- before the slot's lock is taken: the
+     * queue holds it from here on, so the module may let go of its handle
+     * first */
+    let event = match event {
+        0 => None,
+        handle => match events::lookup(handle) {
+            Some(e) => Some(e),
+            None => return -1,
+        },
+    };
     let out = unsafe { core::slice::from_raw_parts_mut(out, buffers) };
     let Some(at) = (image & SLOT_MASK).checked_sub(1) else { return -1 };
     let made = with(image, |img| {
-        if !img.make_queue(buffers, bytes / PAGE_SIZE) {
+        if !img.make_queue(buffers, bytes / PAGE_SIZE, event) {
             return None;
         }
         for (k, o) in out.iter_mut().enumerate() {
