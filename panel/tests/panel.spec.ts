@@ -65,6 +65,35 @@ test('a provider\'s page is made of its descriptor, in both languages', async ({
   await expect(page.getByTestId('resource-modules')).toContainText('загружен');
 });
 
+test('the cluster: its hosts listed, a host invited and its token shown, the invitation taken back', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/cluster`);
+  await expect(page.getByRole('heading', { name: 'Cluster' })).toBeVisible();
+  await expect(page.getByTestId('resource-hosts')).toContainText('mock-a');
+  await expect(page.getByTestId('resource-hosts')).toContainText('mock-b');
+  await page.getByRole('button', { name: /Invite a host/ }).click();
+  const form = page.getByTestId('form-cluster-invite');
+  await form.locator('input[name=host]').fill('mock-c');
+  await form.locator('input[name=ip]').fill('10.9.0.3');
+  await form.locator('input[name=key]').fill('ab'.repeat(32));
+  await form.getByRole('button', { name: /Invite a host/ }).click();
+  await expect(page.getByTestId('answer')).toContainText('nos1-');
+  await page.goto(`/en/h/${host}/p/cluster`);
+  const invitations = page.getByTestId('resource-invitations');
+  await expect(invitations).toContainText('mock-c');
+  await page.goto(`/ru/h/${host}/p/cluster`);
+  await expect(page.getByRole('heading', { name: 'Кластер' })).toBeVisible();
+  await expect(page.getByTestId('resource-invitations')).toContainText('mock-c');
+  /* Taken back, with the confirm the descriptor says */
+  await page.goto(`/en/h/${host}/p/cluster`);
+  await invitations.getByRole('button', { name: 'Take back' }).click();
+  const revoke = page.getByTestId('form-cluster-revoke');
+  await revoke.getByRole('button', { name: 'Take back' }).click();
+  await expect(revoke).toContainText('good for nothing');
+  await revoke.getByRole('button', { name: 'Confirm' }).click();
+  await expect(invitations).not.toContainText('mock-c');
+});
+
 test('a read run from its form shows its answer', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/p/system`);

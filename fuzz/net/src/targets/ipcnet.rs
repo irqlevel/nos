@@ -95,6 +95,10 @@ struct Msg {
     data: Vec<u8>,
 }
 
+/// A key `a` is pinned by beside its own, as a host moving to a new key is:
+/// one the world never shows.
+const A_NEXT_KEY: [u8; 32] = [0x5A; 32];
+
 /// While set, `a` is a host invited, which may reach `nbs.sink` by that name
 /// alone: set once ipcnet has taken the list that says so, cleared before
 /// it is given one that does not -- never set while `a` may reach more.
@@ -569,6 +573,8 @@ pub fn ipcnet(r: &mut Input) {
     /* Each with whether it may meet `a` as a host invited, which watches
      * nothing on `b`: answered at once with HostLost rather than Closed */
     let mut monitors: Vec<(u64, usize, bool, Invited)> = Vec::new();
+    /* The key staged for `b`, once one is: the same one each time asked */
+    let mut staged: Option<[u8; 32]> = None;
     /* Far from the ids the channel gives its own monitors: a Down said by
      * the router's own id is one nobody asked for */
     let mut next_monitor = 0x5000_0000_0000u64 + u64::from(r.u16());
@@ -836,11 +842,11 @@ pub fn ipcnet(r: &mut Input) {
             14 => {
                 /* ipcnet's control mailbox, asked as the cluster's registry
                  * asks it (control.rs) */
-                let kind = r.u8() % 7;
+                let kind = r.u8() % 9;
                 let a = control::Peer { name: String::from("a"), ip: A_IP, keys: vec![a_key], only: None };
                 /* A list that lets `a` reach more: the flag down before it is
                  * taken */
-                if kind == 1 || kind == 2 {
+                if kind == 1 || kind == 2 || kind == 8 {
                     A_ONLY.store(false, Ordering::Release);
                     A_ONLY_LIFTS.fetch_add(1, Ordering::AcqRel);
                 }
@@ -865,6 +871,14 @@ pub fn ipcnet(r: &mut Input) {
                     6 => {
                         let invited = control::Peer { only: Some(String::from("nbs.sink")), ..a.clone() };
                         (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![invited] }.encode())
+                    }
+                    /* A key staged for this host, as `cluster rekey` stages one */
+                    7 => (control::TAG_KEY_STAGE, Vec::new()),
+                    /* `a` pinned by a second key beside its own, as a host moving
+                     * to a new one is: kept, its connections with it */
+                    8 => {
+                        let moving = control::Peer { keys: vec![a_key, A_NEXT_KEY], ..a.clone() };
+                        (control::TAG_PEERS, control::Peers { cluster: CLUSTER, peers: vec![moving] }.encode())
                     }
                     _ => (control::TAG_PEERS, (0..r.below(64)).map(|_| r.u8()).collect()),
                 };
@@ -899,17 +913,30 @@ pub fn ipcnet(r: &mut Input) {
                         let id = control::Identity::decode(&payload);
                         let want = control::Identity { name: String::from("b"), cluster: CLUSTER, key: b_key,
                                                        nic: String::from("eth0"), ip: ETH0_IP, port: PORT,
-                                                       serving: !stopped };
+                                                       serving: !stopped, next: staged };
                         invariant!(got == control::TAG_ID && id.as_ref() == Some(&want),
                                    "ipcnet said who it is as {:?}, not {:?}", id, want);
                         reached("ipcnet: its control mailbox said who this host is");
                     }
-                    1 | 2 | 6 => {
+                    7 => {
+                        /* A key, not this host's, and the same one asked again;
+                         * hosts.toml untouched */
+                        let key: Option<[u8; 32]> = payload.as_slice().try_into().ok();
+                        invariant!(got == control::TAG_KEY_STAGE && key.is_some_and(|k| k != b_key)
+                                   && (staged.is_none() || key == staged) && after == before,
+                                   "a key staged answered {} with {:?}, staged before {:?}", got, key, staged);
+                        staged = key;
+                        reached("ipcnet: a key staged for this host");
+                    }
+                    1 | 2 | 6 | 8 => {
                         invariant!(got == control::TAG_OK, "ipcnet refused a list of its peers: {:?}",
                                    String::from_utf8_lossy(&payload));
                         let has_c = text.contains("\"c ");
-                        let line = format!("\"a {} {}{}\"", netwire::Ipv4(A_IP), hex(&a_key),
-                                           if kind == 6 { " only=nbs.sink" } else { "" });
+                        let line = match kind {
+                            6 => format!("\"a {} {} only=nbs.sink\"", netwire::Ipv4(A_IP), hex(&a_key)),
+                            8 => format!("\"a {} {} {}\"", netwire::Ipv4(A_IP), hex(&a_key), hex(&A_NEXT_KEY)),
+                            _ => format!("\"a {} {}\"", netwire::Ipv4(A_IP), hex(&a_key)),
+                        };
                         invariant!(text.contains(&line) && has_c == (kind == 2),
                                    "hosts.toml is not the peers it was told: {:?}", text);
                         if kind == 6 {
@@ -936,6 +963,7 @@ pub fn ipcnet(r: &mut Input) {
                         reached(match kind {
                             1 => "ipcnet: told its peers as they are",
                             2 => "ipcnet: told one more peer",
+                            8 => "ipcnet: told a peer has a second key, its connections kept",
                             _ => "ipcnet: told a peer is a host invited, which reaches one name",
                         });
                     }

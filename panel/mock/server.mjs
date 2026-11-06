@@ -293,6 +293,20 @@ const vmNamed = (p) => {
   return v;
 };
 
+/* ---- the cluster's registry, as a member of it has it ---- */
+
+const cluster = {
+  hosts: [
+    { name: 'mock-a', node: 1, vote: 'voter', leader: true, ip: '10.9.0.1', underlay: null, public: null, maintenance: false,
+      key: crypto.createHash('sha256').update('mock-a').digest('hex'), moving_to: null },
+    { name: 'mock-b', node: 2, vote: 'voter', leader: false, ip: '10.9.0.2', underlay: null, public: '203.0.113.7',
+      maintenance: false, key: crypto.createHash('sha256').update('mock-b').digest('hex'), moving_to: null },
+  ],
+  invitations: [],
+  removed: 0,
+};
+const clusterHost = (name) => cluster.hosts.find((h) => h.name === name);
+
 const reads = {
   'system.info': () => ({
     version: '0.0.28-mock', revision: 'mock', arch: 'x86_64', cpu_model: 'AMD Ryzen 5 3600 6-Core Processor',
@@ -371,9 +385,66 @@ const reads = {
     path: d.device ? d.file : '/vms/' + p.name + '/' + d.file, vm: p.name })) }),
   'vm.forwards': () => ({ forwards: [...vms.values()].filter((v) => v.state === 'running').flatMap((v) => v.forwards.map((f) => ({
     ...f, vm: v.name, id: v.id, guest_ip: '10.0.100.' + ((v.port ?? 0) + 2), active: 0, accepted: 3, refused: 0, failed: 0, stalled: 0 }))) }),
+  'cluster.status': () => ({
+    member: true, cluster: 'test', node: 1, role: 'leader', term: 3, leader: 'mock-a', applied: 40 + cluster.invitations.length,
+    hosts: cluster.hosts.length, voters: cluster.hosts.length, learners: 0, refused: 0, stopped: null,
+  }),
+  'cluster.hosts': () => ({ hosts: cluster.hosts, invitations: cluster.invitations, removed: cluster.removed }),
 };
 
 const actions = {
+  'cluster.invite': (p) => {
+    const host = need(p, 'host');
+    if (!/^[0-9a-f]{64}$/.test(need(p, 'key'))) {
+      throw new Refused('invalid', '64 hex digits, as `ipcnet id` says them', 'key');
+    }
+    if (clusterHost(host) || cluster.invitations.some((i) => i.host === host)) {
+      throw new Refused('failed', 'a host of that name is in the cluster or invited');
+    }
+    const expires_s = Math.floor(Date.now() / 1000) + 900;
+    cluster.invitations.push({ host, ip: need(p, 'ip'), expires_s });
+    return { host, token: 'nos1-' + crypto.randomBytes(40).toString('hex'), expires_s };
+  },
+  'cluster.revoke': (p) => {
+    const at = cluster.invitations.findIndex((i) => i.host === need(p, 'host'));
+    if (at < 0) {
+      throw new Refused('not_found', 'no open invitation of ' + p.host);
+    }
+    cluster.invitations.splice(at, 1);
+    return { host: p.host };
+  },
+  'cluster.remove': (p) => {
+    const h = clusterHost(need(p, 'host'));
+    if (!h) {
+      throw new Refused('not_found', 'no host of that name');
+    }
+    cluster.hosts = cluster.hosts.filter((x) => x !== h);
+    cluster.removed += 1;
+    return { host: h.name, node: h.node };
+  },
+  'cluster.maintenance': (p) => {
+    const h = clusterHost(need(p, 'host'));
+    if (!h) {
+      throw new Refused('not_found', 'no host of that name');
+    }
+    h.maintenance = Boolean(need(p, 'on'));
+    return { host: h.name, maintenance: h.maintenance };
+  },
+  'cluster.address': (p) => {
+    const h = clusterHost(need(p, 'host'));
+    if (!h) {
+      throw new Refused('not_found', 'no host of that name');
+    }
+    const role = need(p, 'role');
+    h[role] = p.ip ?? null;
+    return { host: h.name, role, ip: p.ip ?? null };
+  },
+  'cluster.rekey': () => {
+    const me = cluster.hosts[0];
+    const old = me.key;
+    me.key = crypto.randomBytes(32).toString('hex');
+    return { old, new: me.key };
+  },
   'system.set_log_level': (p) => ({ log_level: need(p, 'level') }),
   'system.set_nice': (p) => ({ pid: need(p, 'pid'), nice: need(p, 'nice') }),
   'system.load_module': (p) => ({ loaded: need(p, 'name'), said: 'module: ' + p.name + ' loaded' }),

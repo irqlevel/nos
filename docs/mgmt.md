@@ -166,6 +166,7 @@ and this one would be waiting for the halt.
 | Provider | Registered by | Reads | Actions | Jobs |
 |---|---|---|---|---|
 | `api` | `modules/api` | `status`, `clients` | | |
+| `cluster` | `modules/cluster` | `status`, `hosts` | `invite`, `revoke`, `remove`, `maintenance`, `address`, `rekey` | |
 | `vm` | `modules/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach` | `start`, `stop`, `restart`, `create`, `clone`, `delete` |
 | `modtest` | `modules/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
 

@@ -28,6 +28,15 @@ pub const TAG_REFUSED: u32 = 4;
 /// a host joining it, which has no peers yet. Answered [`TAG_OK`], or
 /// [`TAG_REFUSED`] for a host with peers in another.
 pub const TAG_JOIN: u32 = 5;
+/// Asked with no payload: a key made and staged -- or the one staged
+/// already -- not yet this host's. Answered under the same tag with its
+/// fingerprint, 32 bytes, or [`TAG_REFUSED`].
+pub const TAG_KEY_STAGE: u32 = 6;
+/// Asked with no payload: the staged key made this host's -- every
+/// connection from now on made with it, the connections up kept. Answered
+/// under the same tag with its fingerprint, or [`TAG_REFUSED`] where none
+/// is staged.
+pub const TAG_KEY_USE: u32 = 7;
 
 /// Peers a host has at most, as ipcnet takes them.
 pub const PEERS_MAX: usize = 16;
@@ -52,6 +61,8 @@ pub struct Identity {
     pub port: u16,
     /// Whether it serves: `ipcnet start` done, and not stopped.
     pub serving: bool,
+    /// A key staged and not yet this host's, if there is one.
+    pub next: Option<[u8; 32]>,
 }
 
 /// A peer of this host's.
@@ -140,6 +151,13 @@ impl Identity {
         w.0.extend_from_slice(&self.ip.to_le_bytes());
         w.0.extend_from_slice(&self.port.to_le_bytes());
         w.0.push(u8::from(self.serving));
+        match &self.next {
+            Some(k) => {
+                w.0.push(1);
+                w.0.extend_from_slice(k);
+            }
+            None => w.0.push(0),
+        }
         w.0
     }
 
@@ -159,10 +177,15 @@ impl Identity {
             1 => true,
             _ => return None,
         };
+        let next = match r.u8()? {
+            0 => None,
+            1 => Some(r.fixed()?),
+            _ => return None,
+        };
         if !r.done() || !crate::valid_host(name) {
             return None;
         }
-        Some(Identity { name: String::from(name), cluster, key, nic: String::from(nic), ip, port, serving })
+        Some(Identity { name: String::from(name), cluster, key, nic: String::from(nic), ip, port, serving, next })
     }
 }
 
