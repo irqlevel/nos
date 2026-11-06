@@ -674,6 +674,16 @@ impl<S: Socket, E: End> Session<S, E> {
         &self.sock
     }
 
+    /// Whether some of what the other end sent is here already: plaintext
+    /// not yet read, or bytes of a record not yet opened -- with which a
+    /// read goes on without waiting for the network, or waits only for the
+    /// rest of a record that has begun to arrive. A reader that has more to
+    /// do than read uses it to tell a stream still coming from one that has
+    /// stopped, without a wait to find out.
+    pub fn buffered(&self) -> bool {
+        self.plain_pos < self.plain.len() || self.used != 0
+    }
+
     /// How many encrypted bytes wait to be sent.
     pub fn pending(&self) -> usize {
         self.pending.len() - self.sent

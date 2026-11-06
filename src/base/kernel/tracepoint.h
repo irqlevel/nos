@@ -78,6 +78,18 @@ enum class Id : u16
     BioDone,
     Ext4Commit,
 
+    /* TCP's (group "tcp"), recorded by the net layer's Rust: every segment a
+       connection sends -- a pure acknowledgement apart -- and why; every pure
+       acknowledgement, with the window it offers; every segment a connection
+       takes in, and what was made of it; what its sender made of a loss; its
+       round trips; and its program's waits, for room and for data. */
+    TcpSend,
+    TcpAck,
+    TcpRecv,
+    TcpLoss,
+    TcpRtt,
+    TcpWait,
+
     Count
 };
 
@@ -513,6 +525,96 @@ struct Ext4Commit
     u32 pid;
     u8 ok;
     u8 pad[3];
+};
+
+/* TCP's: a connection is said by its slot and its two ports */
+struct TcpSend
+{
+    u32 seq;
+    u32 ack;
+    u32 cwnd;
+    u32 pipe;
+    u32 pid;
+    u16 lport;
+    u16 rport;
+    u16 len;
+    u16 wnd;
+    u8 slot;
+    u8 flags;
+    u8 why;
+    u8 recovery;
+};
+
+struct TcpAck
+{
+    u32 ack;
+    u32 edge;
+    u32 free;
+    u16 lport;
+    u16 rport;
+    u16 wnd;
+    u8 slot;
+    u8 blocks;
+    u8 dsack;
+    u8 ooo;
+    u8 pad[2];
+};
+
+struct TcpRecv
+{
+    u32 seq;
+    u32 ack;
+    u32 rcv_nxt;
+    u32 free;
+    u32 owed;
+    u16 lport;
+    u16 rport;
+    u16 len;
+    u16 wnd;
+    u8 slot;
+    u8 flags;
+    u8 verdict;
+    u8 sacks;
+};
+
+struct TcpLoss
+{
+    u32 cwnd;
+    u32 ssthresh;
+    u32 pipe;
+    u32 sacked;
+    u32 lost;
+    u32 una;
+    u32 nxt;
+    u16 lport;
+    u16 rport;
+    u8 slot;
+    u8 what;
+    u8 pad[2];
+};
+
+struct TcpRtt
+{
+    u32 sample_us;
+    u32 srtt_us;
+    u32 rttvar_us;
+    u32 rto_ms;
+    u32 min_rtt_us;
+    u16 lport;
+    u16 rport;
+    u8 slot;
+    u8 pad[3];
+};
+
+struct TcpWait
+{
+    u32 ns;
+    u32 pid;
+    u16 lport;
+    u16 rport;
+    u8 slot;
+    u8 what;
+    u8 pad[2];
 };
 
 /* ---- the sites ----

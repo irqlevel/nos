@@ -1105,18 +1105,33 @@ own, TCP's flags in combinations that mean something. The targets:
   number, an ICMP error at every quoted one. The machine's connects are
   plain or bulk, and so is one of its listeners, and the peer scales its
   window or not, at any shift -- past RFC 7323's 14 too -- so that the
-  window the machine offers runs past 64 KiB and must never shrink, not even
-  by the rounding of its units, and what the link reorders is kept past a
-  hole and taken in when it fills; the link loses the machine's own data, a
-  little or a lot, for its sender's recovery -- fast retransmit, NewReno,
-  a timeout's slow start -- to fill every hole and keep every byte; and a
-  blind reset in the window, past the edge of everything the peer sent, must
-  change nothing (RFC 5961). And now and then a second
-  device, eth1, standing for the hypervisor's switch, from which a guest
-  sends a SYN to a port the machine listens on -- at eth1's address or at
-  eth0's: a listener takes connections from its own device alone, so no
-  SYN-ACK may go out to it on either wire (the first input of the control
-  run with the device left out of the listener's lookup got one);
+  window the machine offers runs past 64 KiB and must never shrink but by
+  less than its unit (RFC 7323 2.4's retracted window, which 55% of the
+  inputs see), never reach past the receive buffer -- every connection's
+  furthest edge audited against it, and the kernel's count of bytes inside a
+  window offered that found no room held to none; the old edge rounded up,
+  put back as a control, fails at the second input -- and what the link
+  reorders is kept past a hole and taken in when it fills; the link loses
+  the machine's own data, a little or a lot, for its sender's recovery --
+  RACK's, the loss probe's, a timeout's slow start, and NewReno's with a
+  peer that does not take SACK -- to fill every hole and keep every byte;
+  and a blind reset in the window, past the edge of everything the peer
+  sent, must change nothing (RFC 5961). Most connections take SACK, the peer
+  saying up to four blocks, fewer, or none at all, and now and then letting
+  go of what it SACKed: a SACK block of the machine's must name only what
+  had reached it, a D-SACK only what had reached it twice, and neither may
+  come on a connection that did not agree to SACK; and the machine may never
+  send again what the peer had told it it held -- cumulatively, or by SACK
+  and not let go of since -- by an acknowledgement the machine had taken in:
+  one at its RCV.NXT, which no window turns away, put on its NIC a
+  millisecond before, with its transmit side not stopped since (a frame made
+  while it took in a batch, or held by a stopped NIC, is seen later than it
+  was made). And now and then a second device, eth1, standing for the
+  hypervisor's switch, from which a guest sends a SYN to a port the machine
+  listens on -- at eth1's address or at eth0's: a listener takes connections
+  from its own device alone, so no SYN-ACK may go out to it on either wire
+  (the first input of the control run with the device left out of the
+  listener's lookup got one);
 - `http` and `https`: the HTTP client fetching through chains of redirects
   from a server that answers well -- whose result is then known exactly --
   or to break it: numbers longer than any field, chunk sizes of every

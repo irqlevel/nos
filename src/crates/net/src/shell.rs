@@ -54,9 +54,9 @@ pub fn net(_args: &str, out: &mut Output) {
             };
             let name = core::str::from_utf8(dev.name()).unwrap_or("?");
             let st = dev.stats();
-            let _ = writeln!(out, "{}  {}  ip:{}  tx:{} rx:{} drop:{}  bytes tx:{} rx:{}",
+            let _ = writeln!(out, "{}  {}  ip:{}  tx:{} rx:{} drop:{} rxfull:{} txfull:{}  bytes tx:{} rx:{}",
                 name, MacHex(dev.mac()), Ip(dev.ip()),
-                st.tx_total, st.rx_total, st.rx_drop, st.tx_bytes, st.rx_bytes);
+                st.tx_total, st.rx_total, st.rx_drop, st.rx_full, st.tx_full, st.tx_bytes, st.rx_bytes);
             let _ = writeln!(out, "  rx  icmp:{} udp:{} tcp:{} arp:{} other:{} nat:{}",
                 st.rx_icmp, st.rx_udp, st.rx_tcp, st.rx_arp, st.rx_other, st.rx_nat);
             let _ = writeln!(out, "  tx  icmp:{} udp:{} tcp:{} arp:{} other:{} refused:{}",
@@ -135,8 +135,12 @@ pub fn icmpstat(_args: &str, out: &mut Output) {
 
 pub fn tcpstat(_args: &str, out: &mut Output) {
     let st = TCP.stats();
-    let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={} refused={} halfopen={} rstheld={}",
-        st.tx, st.rx, st.rx_err, st.retransmits, st.conns, st.syn_refused, st.half_open, st.rst_held);
+    let _ = writeln!(out, "TCP stats: tx={} rx={} rxerr={} retx={} conns={} refused={} halfopen={} rstheld={} \
+        recoveries={} timeouts={} spurious={} probes={} undos={} dsacks={} reneged={} outside={} badack={} \
+        unkept={} overrun={}",
+        st.tx, st.rx, st.rx_err, st.retransmits, st.conns, st.syn_refused, st.half_open, st.rst_held,
+        st.recoveries, st.timeouts, st.spurious, st.probes, st.undos, st.dsacks, st.reneged, st.rx_outside,
+        st.rx_badack, st.rx_unkept, st.rx_overrun);
 
     for index in 0..crate::tcp::MAX_CONNECTIONS {
         let line = match TCP.snapshot(index) {
@@ -150,6 +154,12 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
         /* A link's own floor, where it was given one */
         if line.min_rto_ms != crate::tcp::MIN_RTO_MS {
             let _ = write!(out, " floor={}", line.min_rto_ms);
+        }
+        if line.sack {
+            let _ = write!(out, " sack");
+        }
+        if let Some(recovery) = line.recovery {
+            let _ = write!(out, " recovery={} sacked={} lost={}", recovery, line.sacked, line.lost);
         }
         match line.scales {
             Some((ours, theirs)) => { let _ = writeln!(out, " scale={}/{}", ours, theirs); }

@@ -274,6 +274,86 @@ names! {
         /// A flush, a discard or a write of zeros, served on its own
         Command = "command",
     }
+
+    /// What sent a TCP segment (`tcp_send`'s `why`)
+    TcpWhy {
+        /// Data the program wrote, sent for the first time
+        New = "new",
+        /// A copy of what was found lost: a recovery's, NewReno's
+        Again = "again",
+        /// A loss probe: the newest segment again (RFC 8985 7)
+        Probe = "probe",
+        /// The retransmission timeout's
+        Timeout = "timeout",
+        /// A SYN or a SYN-ACK
+        Handshake = "handshake",
+        /// The FIN
+        Close = "close",
+        Reset = "reset",
+        /// The persist timer's probe of a shut window
+        Persist = "persist",
+    }
+
+    /// The sender's recovery as a segment went (`tcp_send`'s `recovery`)
+    TcpRecovery {
+        None = "none",
+        Fast = "fast",
+        Timeout = "timeout",
+    }
+
+    /// What became of a segment a connection took in (`tcp_recv`'s
+    /// `verdict`)
+    TcpVerdict {
+        /// Taken, as the state machine has it
+        Taken = "taken",
+        /// A copy of what had come already, answered with a D-SACK
+        Copy = "copy",
+        /// Outside the window (RFC 9293 3.10.7.4), answered at most twice a
+        /// second
+        Outside = "outside",
+        /// An acknowledgement of nothing sent, or older than the peer's
+        /// largest window (RFC 5961 5.2)
+        BadAck = "bad_ack",
+        /// A SYN on a synchronized connection (RFC 5961 4.2)
+        Syn = "syn",
+        /// A reset, taken
+        Reset = "reset",
+        /// A reset not at RCV.NXT, answered (RFC 5961 3.2)
+        ResetRefused = "reset_refused",
+    }
+
+    /// What a TCP sender made of a loss (`tcp_loss`'s `what`)
+    TcpLossWhat {
+        /// RACK found a loss, and a recovery began
+        Recovery = "recovery",
+        /// Everything outstanding at its start acknowledged
+        End = "end",
+        Timeout = "timeout",
+        /// A timeout an original's arrival showed was for nothing
+        Spurious = "spurious",
+        /// A recovery every copy of which the peer said came twice
+        Undo = "undo",
+        /// A loss probe that repaired a loss: the window halved
+        ProbeRepair = "probe_repair",
+        /// A peer that let go of what it had SACKed
+        Reneged = "reneged",
+    }
+
+    /// What a program's TCP call waited for (`tcp_wait`'s `what`)
+    TcpWaitFor {
+        /// Room in the send buffer
+        Buffer = "buffer",
+        /// The peer's window
+        Window = "window",
+        /// The congestion window
+        Cwnd = "cwnd",
+        /// What was lost, going again first
+        Lost = "lost",
+        /// Room in the table of what is in flight
+        Table = "table",
+        /// Data, for a receive
+        Data = "data",
+    }
 }
 
 events! {
@@ -456,5 +536,99 @@ events! {
         pid: u32,
         ok: u8,
         _pad: [u8; 3],
+    }
+
+    /// `tcp_send`: a segment a connection sent, a pure acknowledgement apart
+    TcpSend = 27, "tcp_send" {
+        seq: u32,
+        ack: u32,
+        cwnd: u32,
+        /// What was in flight against the congestion window
+        pipe: u32,
+        pid: u32,
+        lport: u16,
+        rport: u16,
+        len: u16,
+        /// The window field it offered
+        wnd: u16,
+        slot: u8,
+        flags: u8,
+        why: u8 as TcpWhy,
+        recovery: u8 as TcpRecovery,
+    }
+
+    /// `tcp_ack`: a pure acknowledgement a connection sent
+    TcpAck = 28, "tcp_ack" {
+        ack: u32,
+        /// The right edge of the window offered
+        edge: u32,
+        /// The receive buffer's room
+        free: u32,
+        lport: u16,
+        rport: u16,
+        wnd: u16,
+        slot: u8,
+        blocks: u8,
+        dsack: u8,
+        ooo: u8,
+        _pad: [u8; 2],
+    }
+
+    /// `tcp_recv`: a segment a connection took in, and what became of it
+    TcpRecv = 29, "tcp_recv" {
+        seq: u32,
+        ack: u32,
+        rcv_nxt: u32,
+        free: u32,
+        /// How far past RCV.NXT the window last offered reaches
+        owed: u32,
+        lport: u16,
+        rport: u16,
+        len: u16,
+        wnd: u16,
+        slot: u8,
+        flags: u8,
+        verdict: u8 as TcpVerdict,
+        sacks: u8,
+    }
+
+    /// `tcp_loss`: what a connection's sender made of a loss
+    TcpLoss = 30, "tcp_loss" {
+        cwnd: u32,
+        ssthresh: u32,
+        pipe: u32,
+        sacked: u32,
+        lost: u32,
+        una: u32,
+        nxt: u32,
+        lport: u16,
+        rport: u16,
+        slot: u8,
+        what: u8 as TcpLossWhat,
+        _pad: [u8; 2],
+    }
+
+    /// `tcp_rtt`: a round trip a connection measured
+    TcpRtt = 31, "tcp_rtt" {
+        sample_us: u32,
+        srtt_us: u32,
+        rttvar_us: u32,
+        rto_ms: u32,
+        min_rtt_us: u32,
+        lport: u16,
+        rport: u16,
+        slot: u8,
+        _pad: [u8; 3],
+    }
+
+    /// `tcp_wait`: a program's send or receive that waited
+    TcpWait = 32, "tcp_wait" {
+        ns: u32,
+        pid: u32,
+        lport: u16,
+        rport: u16,
+        slot: u8,
+        what: u8 as TcpWaitFor,
+        _pad: [u8; 2],
     }
 }
