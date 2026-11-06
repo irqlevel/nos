@@ -839,13 +839,13 @@ bool name_mask(const char* word, EventMask& mask)
     return found;
 }
 
-/* The window show, dump and latency read: the newest `count` records of the
-   events in `mask` of every ring -- or of cpu `only`'s -- a Window a CPU,
-   each oldest first (read_window): how many there are across them. Under
+/* The window show, dump and latency read: the newest `count` records that
+   `select` keeps of every ring -- or of cpu `only`'s -- a Window a CPU, each
+   oldest first (read_window): how many there are across them. Under
    control(); what it holds is the caller's, given back by release_windows.
    A CPU whose part will not fit in memory is said and left out, its part
    marked COMPLETE_NEVER: no wait is paired across a CPU nobody read. */
-ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     ulong total = 0;
     for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
@@ -876,7 +876,7 @@ ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong
             continue;
         }
         u64 complete;
-        ulong kept = read_window(*ring, cleared_at[cpu], want, mask, (u32)cpu, records, complete);
+        ulong kept = read_window(*ring, cleared_at[cpu], want, select, (u32)cpu, records, complete);
         windows[cpu] = { records, kept, 0, complete };
         total += kept;
     }
@@ -958,15 +958,15 @@ void say_cut(stdlib::Printer& con, Window windows[MAX_CPUS], ulong skip, u64 now
 }
 
 /* The newest `count` records of every ring (or of cpu `only`'s), merged by
-   their cycle counts, of the events in `mask`. Takes control() to read the
+   their cycle counts, of those `select` keeps. Takes control() to read the
    rings, and prints with it let go. */
-void show(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void show(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1064,13 +1064,13 @@ void dump_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
     con.printf("}}\n");
 }
 
-void dump(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void dump(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1136,13 +1136,13 @@ void print_waits(stdlib::Printer& con, const WakePairing& pairing, WakeWait* wai
    the longest with their tasks and CPUs. Only from where every CPU's part
    of the window is whole (window_start): before, a wakeup's switch may be
    among what a ring lost. */
-void latency(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void latency(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1822,13 +1822,106 @@ void boot_on(const char* list)
         klog(0, "trace: %ld events on from boot (tracepoints=%s)", named, list);
 }
 
-/* show's, dump's and latency's arguments: [n] [cpu=N] [event|group|all...]. */
+/* show's, dump's and latency's arguments: [n] [cpu=N] [event|group|all...]
+   [field=value...]. */
 struct WindowArgs
 {
     ulong count;
     ulong only;
-    EventMask mask;
+    Select select;
 };
+
+/* A number as a field filter takes one: decimal, or hex after 0x. */
+bool parse_filter_number(const char* text, u64& value)
+{
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+    {
+        const ulong HEX_DIGITS_MAX = 16;
+        value = 0;
+        ulong digits = 0;
+        for (const char* c = text + 2; *c != '\0'; c++)
+        {
+            u8 nibble = stdlib::hex_char_to_nibble(*c);
+            if (nibble == 0xFF || ++digits > HEX_DIGITS_MAX)
+                return false;
+            value = (value << 4) | nibble;
+        }
+        return digits != 0;
+    }
+    ulong v;
+    if (!stdlib::parse_ulong(text, v))
+        return false;
+    value = v;
+    return true;
+}
+
+/* `name=value` made the next of `select`'s field filters: for each event of
+   its mask, the field called `name` -- where it lies, and the value it is to
+   be: `value` as a number, or for an enumeration the place of that name in
+   the event's own names. False, said, when no event of the mask has such a
+   field that can be such a value: a filter that would match nothing is a
+   mistake to say, as a word that names nothing is. */
+bool field_filter(const char* name, const char* value, Select& select, stdlib::Printer& con)
+{
+    if (select.filter_count >= FIELD_FILTERS_MAX)
+    {
+        con.printf("trace: %lu field filters at most\n", FIELD_FILTERS_MAX);
+        return false;
+    }
+    FieldFilter& f = select.filters[select.filter_count];
+    u64 number = 0;
+    const bool numeric = parse_filter_number(value, number);
+    bool any = false;
+    for (ulong id = 0; id < COUNT; id++)
+    {
+        f.offset[id] = 0;
+        f.size[id] = 0;
+        f.value[id] = 0;
+        if (select.mask != ALL_EVENTS && (event_bit(id) & select.mask) == 0)
+            continue;
+        const Event& e = EVENTS[id];
+        for (ulong i = 0; i < e.field_count; i++)
+        {
+            const Field& field = e.fields[i];
+            if (stdlib::str_cmp(field.name, name) != 0)
+                continue;
+            u64 v = 0;
+            bool fits = false;
+            if (numeric)
+            {
+                v = number;
+                fits = field.size >= sizeof(u64) || v < ((u64)1 << (8 * field.size));
+            }
+            else if (field.kind == Kind::Enum && field.names != nullptr)
+            {
+                for (ulong k = 0; k < field.name_count; k++)
+                {
+                    if (stdlib::str_cmp(field.names[k], value) == 0)
+                    {
+                        v = k;
+                        fits = true;
+                        break;
+                    }
+                }
+            }
+            if (fits && field.size <= sizeof(u64))
+            {
+                f.offset[id] = field.offset;
+                f.size[id] = field.size;
+                f.value[id] = v;
+                any = true;
+            }
+            break;
+        }
+    }
+    if (!any)
+    {
+        con.printf("trace: no event of the window has a field %s that can be %s\n", name, value);
+        return false;
+    }
+    select.filter_count++;
+    return true;
+}
 
 /* The window the words after the verb ask for -- false, said, for a word
    that is none of n (1 up; SHOW_MAX at most, more taken as it), cpu=N of a
@@ -1839,7 +1932,11 @@ bool window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out, stdl
     const ulong CPU_PREFIX_LEN = 4;
     out.count = SHOW_DEFAULT;
     out.only = MAX_CPUS;
-    out.mask = 0;
+    out.select.mask = 0;
+    out.select.filter_count = 0;
+    /* The words that are field filters, resolved once the events are known */
+    ulong filters[FIELD_FILTERS_MAX] = {};
+    ulong filter_words = 0;
     for (ulong w = 1; w < n; w++)
     {
         ulong value;
@@ -1862,14 +1959,39 @@ bool window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out, stdl
             }
             out.count = (value < SHOW_MAX) ? value : SHOW_MAX;
         }
-        else if (!name_mask(words[w], out.mask))
+        else if (stdlib::str_chr(words[w], '=') != nullptr)
+        {
+            if (filter_words >= FIELD_FILTERS_MAX)
+            {
+                con.printf("trace: %lu field filters at most\n", FIELD_FILTERS_MAX);
+                return false;
+            }
+            filters[filter_words++] = w;
+        }
+        else if (!name_mask(words[w], out.select.mask))
         {
             con.printf("trace: no event or group called %s\n", words[w]);
             return false;
         }
     }
-    if (out.mask == 0)
-        out.mask = ALL_EVENTS;
+    if (out.select.mask == 0)
+        out.select.mask = ALL_EVENTS;
+    for (ulong i = 0; i < filter_words; i++)
+    {
+        /* The word cut at its '=' in place: the name before, the value after */
+        char* word = words[filters[i]];
+        char* eq = word;
+        while (*eq != '=')
+            eq++;
+        *eq = '\0';
+        if (word[0] == '\0' || eq[1] == '\0')
+        {
+            con.printf("trace: a field filter is name=value\n");
+            return false;
+        }
+        if (!field_filter(word, eq + 1, out.select, con))
+            return false;
+    }
     return true;
 }
 
@@ -1914,11 +2036,11 @@ void command(const char* args, stdlib::Printer& con)
         if (!window_args(words, n, window, con))
             return;
         if (stdlib::str_cmp(verb, "show") == 0)
-            show(con, window.count, window.only, window.mask);
+            show(con, window.count, window.only, window.select);
         else if (stdlib::str_cmp(verb, "dump") == 0)
-            dump(con, window.count, window.only, window.mask);
+            dump(con, window.count, window.only, window.select);
         else
-            latency(con, window.count, window.only, window.mask);
+            latency(con, window.count, window.only, window.select);
     }
     else if (stdlib::str_cmp(verb, "stat") == 0)
     {
@@ -2013,8 +2135,8 @@ void command(const char* args, stdlib::Printer& con)
     }
     else
     {
-        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | "
-            "dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | "
+        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] "
+            "[field=value...] | dump [...] | latency [...] | stat | clear | "
             "size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench [cpu=N]\n");
     }
 }
