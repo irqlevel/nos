@@ -261,8 +261,15 @@ def main():
         r = ping(a, "kernel.echo@b", "count=16 bytes=1048576 window=4 bulk timeout=10000")
         check("a megabyte at a time by the bulk connection, every byte back",
               r is not None and r["answered"] == 16 and r["wrong"] == 0 and r["reordered"] == 0, r)
+        def links(out):
+            # A link's lines in tcpstat: ipcnet's port at one end or the other
+            return [l for l in out.splitlines() if "ESTABLISHED" in l and re.search(r":39240\b", l)]
         out = a.run("tcpstat")
-        check("a's links to b have their 20 ms floor", "floor=20" in out, out)
+        check("a's links, which it dialed, have their 20 ms floor",
+              links(out) and all("floor=20" in l for l in links(out)), out)
+        out = b.run("tcpstat")
+        check("and b's, a's among them, which b accepted", links(out) and all("floor=20" in l for l in links(out)),
+              out)
 
         # -- bounces --
         r = ping(a, "nobody@b", "count=3")

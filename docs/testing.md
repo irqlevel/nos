@@ -575,7 +575,10 @@ on each, a `Cluster` name, and `ipc ping` is what goes between them:
 
 - both up, said in the log; 200 small pings each way, eight in flight, and
   sixteen of a megabyte by the bulk connection -- every answer the bytes
-  sent, in the order sent; the links' 20 ms floor in `tcpstat`;
+  sent, in the order sent; the links' 20 ms floor in `tcpstat`, at the
+  end that dialed and at the end that accepted (the accepting end's once
+  kept the 200 every connection starts with, and waited out each of its
+  losses ten times as long);
 - a name nobody has there bounced back (`Gone`), and messages past the
   echo's mailbox (`Full`), every other one answered whole;
 - under 5% loss and a jittered delay, every message and every megabyte
