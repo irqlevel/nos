@@ -738,10 +738,36 @@ impl Fs {
         true
     }
 
-    /// A write to `path` refused for want of room: the file must be as a
-    /// write that stopped part way leaves it, and the model takes what it
-    /// is.
-    fn resync_partial(&mut self, path: &[Vec<u8>], old: &Data, at: u64, data: &[u8]) {
+    /// Bytes of the file open as `file` from `off` into `buf`, how many:
+    /// through `file`, or -- where the write being taken back was image
+    /// `image`'s -- through the image, as its guest reads them. The VFS reads
+    /// what an image wrote over unwritten extents as zeros until the image's
+    /// next sync makes them written (`Image::make_written`); the model has
+    /// what the guest wrote from its write on, as the VFS does from that
+    /// sync on.
+    fn read_back(&mut self, file: &fs::vfs::Open, image: Option<usize>, off: u64, buf: &mut [u8]) -> usize {
+        if let Some(i) = image {
+            if buf.is_empty() {
+                return 0;
+            }
+            return if self.images[i].read_vec(&mut [(off, &mut buf[..])]) { buf.len() } else { 0 };
+        }
+        let mut k = 0;
+        if file.seek(off as usize) {
+            while k < buf.len() {
+                match file.read(&mut buf[k..]) {
+                    Some(0) | None => break,
+                    Some(r) => k += r,
+                }
+            }
+        }
+        k
+    }
+
+    /// A write to `path` refused for want of room -- image `image`'s, or
+    /// one through the VFS: the file must be as a write that stopped part
+    /// way leaves it, and the model takes what it is.
+    fn resync_partial(&mut self, path: &[Vec<u8>], old: &Data, at: u64, data: &[u8], image: Option<usize>) {
         /* What the kernel has of the file: the stretch the write was at,
          * and the rest of it where it is not zeros, or should not be. */
         let p = join(path);
@@ -763,15 +789,7 @@ impl Fs {
             /* The fuzzer's own: no allocation of the kernel's to be held to
              * the kernel heap's ceiling. */
             let mut buf = crate::machine::sched::harness(|| vec![0u8; n as usize]);
-            let mut k = 0;
-            if file.seek(off as usize) {
-                while k < buf.len() {
-                    match file.read(&mut buf[k..]) {
-                        Some(0) | None => break,
-                        Some(r) => k += r,
-                    }
-                }
-            }
+            let k = self.read_back(&file, image, off, &mut buf);
             got.write(off, &buf[..k]);
         }
         drop(file);
@@ -784,9 +802,11 @@ impl Fs {
     }
 
     /// Writes of a batch to `path` refused for want of room, some of them
-    /// done and some not (`partial_writes`): the model takes what the file
-    /// is.
-    fn resync_batch(&mut self, path: &[Vec<u8>], old: &Data, writes: &[(u64, &[u8])]) {
+    /// done and some not, as the image answered each: every one answered
+    /// done there whole, and the rest as `partial_writes` has them -- read
+    /// back through image `image` while it holds the file (`read_back`) --
+    /// and the model takes what the file is.
+    fn resync_batch(&mut self, path: &[Vec<u8>], old: &Data, writes: &[(u64, &[u8], bool)], image: Option<usize>) {
         let p = join(path);
         let Some(file) = fs::vfs::Open::new(self.vfs, &p, OPEN_READ) else {
             self.check(false, format_args!("{} does not open after writes to it ran out of room", show(&p)));
@@ -795,27 +815,30 @@ impl Fs {
         let size = file.size() as u64;
         let mut got = old.clone();
         got.truncate(size);
-        let mut ranges: Vec<(u64, u64)> = writes.iter().map(|&(at, d)| (at.min(size), d.len() as u64)).collect();
+        let mut ranges: Vec<(u64, u64)> = writes.iter().map(|&(at, d, _)| (at.min(size), d.len() as u64)).collect();
         for b in old.nonzero_blocks(4096) {
             ranges.push((b * 4096, 4096));
         }
         for (off, n) in ranges {
             let n = n.min(size.saturating_sub(off));
             let mut buf = crate::machine::sched::harness(|| vec![0u8; n as usize]);
-            let mut k = 0;
-            if file.seek(off as usize) {
-                while k < buf.len() {
-                    match file.read(&mut buf[k..]) {
-                        Some(0) | None => break,
-                        Some(r) => k += r,
-                    }
-                }
-            }
+            let k = self.read_back(&file, image, off, &mut buf);
             got.write(off, &buf[..k]);
         }
         drop(file);
-        self.check(partial_writes(old, &got, writes), format_args!("{} writes to {} ({} bytes) that ran out of room \
+        let parts: Vec<(u64, &[u8])> = writes.iter().map(|&(at, d, _)| (at, d)).collect();
+        self.check(partial_writes(old, &got, &parts), format_args!("{} writes to {} ({} bytes) that ran out of room \
                    left it not the old bytes with a first part of each's new ones", writes.len(), show(&p), old.len()));
+        for &(at, d, done) in writes {
+            /* Inside the file, as every write the image takes is. */
+            let n = (d.len() as u64).min(size.saturating_sub(at));
+            self.check(!done || got.read(at, n)[..] == d[..n as usize], format_args!("a write of {} bytes at {} to {} \
+                       its image answered done is not there whole after its batch ran out of room", d.len(), at,
+                       show(&p)));
+        }
+        if writes.iter().any(|w| w.2) {
+            reached("a batch that ran out of room with writes of it done, each there whole");
+        }
         if let Some(d) = self.model.file_mut(path) {
             *d = got;
         }
@@ -1056,7 +1079,7 @@ impl Fs {
                 Some(Node::File(d)) => d.clone(),
                 _ => Data::new(),
             };
-            self.resync_partial(&path, &old, at, data);
+            self.resync_partial(&path, &old, at, data, Some(i));
             return;
         }
         self.check(got == want, format_args!("an image's write of {} bytes to {} ({} bytes) at {} {}", data.len(),
@@ -1118,7 +1141,7 @@ impl Fs {
                     Some(Node::File(d)) => d.clone(),
                     _ => Data::new(),
                 };
-                self.resync_partial(&path, &old, *at, d);
+                self.resync_partial(&path, &old, *at, d, Some(i));
             }
             return;
         }
@@ -1263,13 +1286,16 @@ impl Fs {
             }
             want_all &= want || !matches!(req, QueueReq::Write(..));
         }
-        let writes: Vec<(u64, &Vec<u8>)> = reqs.iter().filter_map(|r| match r {
-            QueueReq::Write(at, d) => Some((*at, d)),
+        /* Each write the model wants, with what the image answered it. */
+        let writes: Vec<(u64, &Vec<u8>, bool)> = reqs.iter().enumerate().filter_map(|(n, r)| match r {
+            QueueReq::Write(at, d) if want(r) => Some((*at, d, q.got[n].unwrap_or(false))),
             _ => None,
-        }).filter(|(at, d)| want(&QueueReq::Write(*at, d.to_vec()))).collect();
+        }).collect();
         if self.refused_for_room(got_all, !writes.is_empty(), mark, &saved) {
-            let parts: Vec<(u64, &[u8])> = writes.iter().map(|(at, d)| (*at, &d[..])).collect();
-            self.resync_batch(&path, &before, &parts);
+            let parts: Vec<(u64, &[u8], bool)> = writes.iter().map(|&(at, d, done)| (at, &d[..], done)).collect();
+            /* Let go of, the image made what it wrote written: the VFS reads
+             * it as the guest did. */
+            self.resync_batch(&path, &before, &parts, (!close).then_some(i));
             return;
         }
         self.check(got_all, format_args!("an image's queued writes to {} ({} bytes) failed", show(&join(&path)),
@@ -1277,7 +1303,7 @@ impl Fs {
         let _ = want_all;
         if self.takes(got_all, true) {
             if let Some(file) = self.model.file_mut(&path) {
-                for (at, d) in &writes {
+                for (at, d, _) in &writes {
                     file.write(*at, d);
                 }
             }
@@ -1349,7 +1375,7 @@ impl Fs {
                 Some(Node::File(d)) => d.clone(),
                 _ => Data::new(),
             };
-            self.resync_partial(&path, &old, at, &vec![0u8; len as usize]);
+            self.resync_partial(&path, &old, at, &vec![0u8; len as usize], Some(i));
             return;
         }
         if zeroes.is_none() && self.punch_room && self.refused_for_room(got, want, mark, &saved) {
@@ -1486,7 +1512,7 @@ impl Fs {
                 Some(Node::File(d)) => d.clone(),
                 _ => Data::new(),
             };
-            self.resync_partial(&o.path, &old, at, data);
+            self.resync_partial(&o.path, &old, at, data, None);
             return;
         }
         self.check(got == want, format_args!("a write of {} bytes to {} at {} {}, where the model {}", data.len(),
@@ -1564,7 +1590,7 @@ impl Fs {
                 Some(Node::File(d)) => d.clone(),
                 _ => Data::new(),
             };
-            self.resync_partial(&o.path, &old, at, data);
+            self.resync_partial(&o.path, &old, at, data, None);
             return;
         }
         self.check(got == want, format_args!("write_within {} of {} bytes to {} ({} bytes) {}", at, data.len(),
@@ -1674,12 +1700,12 @@ impl Fs {
             if let (Res::Node(n), Some(st)) = (self.model.resolve(p), self.vfs.stat(p)) {
                 let _ = st;
                 self.model.file_mut(&n).map(|d| d.truncate(0));
-                self.resync_partial(&n, &Data::new(), 0, data);
+                self.resync_partial(&n, &Data::new(), 0, data, None);
             } else if let (Res::Absent(dir, name), Some(_)) = (self.model.resolve(p), self.vfs.stat(p)) {
                 self.model.make(&dir, &name, Node::File(Data::new()));
                 let mut n = dir;
                 n.push(name);
-                self.resync_partial(&n, &Data::new(), 0, data);
+                self.resync_partial(&n, &Data::new(), 0, data, None);
             }
             return;
         }
