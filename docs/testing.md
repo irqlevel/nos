@@ -208,6 +208,7 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `scripts/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
+| `cluster-test.py [--arch aarch64\|x86_64] [--keep]` | both | the cluster's registry between kernels: `modules/cluster` (the member, raft over ipc, its folder, init, invite, join, remove), ipcnet's control mailbox (`ipcnet.ctl`) and hosts.toml as the registry writes it, the channel's word on which host sent a message (`kernel_ipc_peer_name`) -- three nos on `scripts/hub.py`'s LAN, as `ipc-test.py` runs them |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`block/src/table.rs`, the NVMe's identity), the claims and their holders, `block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hv/src/devices.rs`, a device disk in `modules/hv/src/disk.rs`, the pour onto a device |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
@@ -597,6 +598,41 @@ What it does not reach yet: three hosts' traffic at once, a peer at its
 limits slowed while another goes on, and the measurements on the boxes --
 here a round trip of a small message is some 0.4 ms at the median, through
 a switch in Python.
+
+### `cluster-test.py` -- the cluster's registry, three kernels on a LAN
+
+Three nos on `scripts/hub.py`'s LAN as `ipc-test.py` runs them -- on x86-64
+from `nos-test.iso` with the UDP shell -- but with no key made by the test
+and no peer pinned by hand: each root has ipcnet.ko and cluster.ko and a
+hosts.toml naming that host alone, /etc/rc loads both and starts ipcnet,
+which makes the host's key, and everything else is the registry's
+(docs/cluster.md):
+
+- each serving with no peers; `cluster init` on `a`, which leads its one
+  voter, and a second `init` refused;
+- `b` invited from `a` with the key `ipcnet id` says on `b` -- the token
+  refused by `c`, whose name is not the invitation's -- joined, a voter, and
+  `a` and `b` up to each other; the token used again refused;
+- `c` invited from `b`, which does not lead and hands the invitation to
+  `a`; a join with one byte of the secret changed refused by `b`; `c`, now
+  `b`'s peer as a host invited -- `b`'s `ipcnet` saying so -- its pings to
+  `b`'s echo never answered, each refused by `b`; then the token taken: three voters on every host, every host up to every other,
+  and `c`'s pings to `a`'s echo answered over the connection the registry
+  made;
+- `c` removed: off `a`'s and `b`'s peers, its connections gone, two voters
+  left;
+- `b`'s VM killed and booted again: back from its folder, `a` and `b`
+  agreeing on a leader again -- `a` stepped down while it heard from no
+  majority of the two, and either may be elected now;
+- that leader removed: it hands the lead to the other first, as its log
+  says -- the removal drops its connections as each member applies it, and
+  the other could otherwise never be elected -- which leads alone after; the
+  removed host's key refused when invited again;
+- nothing panicked.
+
+What it does not reach: a rekey, every host rebooted at once, two of three
+killed, `cluster recover` -- C2's (plans/cluster.md).
+
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 
@@ -1280,7 +1316,21 @@ own, TCP's flags in combinations that mean something. The targets:
   Closed only once the victim is closed -- and, on a perfect link, every
   monitor of it on a session still up told; the world's Pings answered; a
   silent world lost within 3 s and a margin; and once the module is
-  unloaded, no router and nothing left behind. Nine of ten bugs planted in
+  unloaded, no router and nothing left behind. Its control mailbox,
+  `ipcnet.ctl`, is asked by a task of the image's as the cluster's member
+  asks it: who this host is, held to `b`'s name, cluster, key and address;
+  lists of peers -- `a` alone, `a` with another, another cluster's, one
+  naming `b` itself, noise -- hosts.toml read before and after each, saying
+  exactly the list taken and nothing changed by a refusal, and `a`'s
+  connection never ended for a list that keeps it -- among the lists, `a`
+  made a host invited, which may reach `nbs.sink` by that name alone, and a
+  host again: its line in hosts.toml and in `ipcnet` saying so, the peer
+  never made anew either way (its counts never going back), and while it is
+  invited nothing of its reaching the sink by address and no monitor of its
+  answered Closed. Four bugs planted in ipcnet each fail it: a delivery past
+  the restriction (the 126th input), a monitor taken from a host invited
+  (the 281st), and a restriction lifted by dropping the peer or made by
+  making it anew (the first). Nine of ten bugs planted in
   the module are caught -- a peer's message it may not reach bounced, a full
   mailbox's not, two messages of one pair begun at once, silence never
   losing the peer, a Hello of another cluster or for another host taken, a
@@ -2756,6 +2806,39 @@ seconds, to:
   it. `RAFT_RSM_STATS=1` prints each run's operations, applied indexes and
   snapshots, and `RAFT_RSM_TRACE=1` what every member does and, for a
   history no register makes, its shortest prefix.
+- **The registry target**, 200 runs of 400 steps: the cluster's registry
+  (`src/crates/registry`, plans/cluster.md) -- raft's first user -- held to
+  a model of its own.
+  - Alone: the registry and the model take the same commands -- init,
+    invitations, joins, removes, revokes, entries that are no command --
+    under a clock that goes on and now and then back. The commands draw on
+    small pools of names, addresses, keys and invitation numbers, so that
+    they meet; on every third seed on wide pools with few removes, so that
+    the cluster fills to its sixteen and has learners. After each one, its
+    answer and everything the registry shows -- its hosts, invitations,
+    removed hosts, voters and every host's peers -- must be the model's.
+  - Its snapshot must read back as itself, and its frozen pieces must be
+    that snapshot. A snapshot changed -- a byte, cut short, more bytes,
+    noise -- must be refused, or read as a state that holds to every rule
+    and reads back as itself. A replica started from a snapshot part way
+    must end as the registry does.
+  - On every fourth seed, a group: the registry through `raft::rsm` on
+    three or five members over a network that loses, doubles, reorders and
+    cuts, and a client with a session retrying of another member after a
+    timeout. Once calm, every member's registry must be the same, and the
+    model's once it takes the commands in the order the log applied them,
+    answering each as the members did.
+
+  `mutants.py`'s six `registry_*` mutants take out:
+  - an invitation's expiry;
+  - the join's use of its invitation;
+  - the refusal of a removed host's key;
+  - nodes never given twice;
+  - the snapshot's check of keys;
+  - the voters' cut at five.
+
+  Each fails the gate and its own scenario. `RAFT_REGISTRY_STATS=1` prints
+  each run's answers by kind and how many hosts it reached.
 - **The hostile target**, 2000 runs of 3000 steps of one member fed what no
   correct member sends -- every kind of message, of terms and indexes about
   its own and of any value, from members and strangers, noise the wire

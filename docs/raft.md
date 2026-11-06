@@ -247,4 +247,6 @@ moves the session on, after which the first's answer is `Stale`.
 ## Next
 
 The crate's users: the cluster's registry ([plans/cluster.md](../plans/cluster.md),
-C1 and C2), then NBS's metadata service ([plans/nbs.md](../plans/nbs.md)).
+C1 and C2) -- its state machine is `src/crates/registry`, a `StateMachine`
+of its own, held by fuzz/raft's `registry` target -- then NBS's metadata
+service ([plans/nbs.md](../plans/nbs.md)).

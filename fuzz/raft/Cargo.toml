@@ -10,6 +10,8 @@ edition = "2021"
 
 [dependencies]
 raft = { path = "../../src/crates/raft" }
+# The cluster's registry, the crate's first user (plans/cluster.md).
+registry = { path = "../../src/crates/registry" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: an overflow in the
 # protocol is a bug of its own, and in the kernel a panic.

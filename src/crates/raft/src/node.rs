@@ -495,6 +495,17 @@ impl<S: Storage> RawNode<S> {
         self.membership.to_state()
     }
 
+    /// On a leader, the last entry member `id` is known to hold -- what a
+    /// learner is waited for to reach before it is made a voter, so that a
+    /// voter added does not take the group's majority away while it catches
+    /// up. None on any other role, or for a member it does not track.
+    pub fn matched(&self, id: NodeId) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+        self.progress.get(&id).map(|p| p.matched)
+    }
+
     /// The membership as of entry `index` -- what a snapshot taken there
     /// says -- or None for an index the log no longer has.
     pub fn conf_state_at(&self, index: u64) -> Option<ConfState> {

@@ -195,6 +195,11 @@ unsafe extern "C" {
     /// `Error::code`, 0 for done.
     pub safe fn kernel_ipc_route(mbox: u64) -> i32;
 
+    /// The name of the peer whose number `host` is now -- up, of that
+    /// epoch, the host part of a message's `from` -- into the `cap` bytes at
+    /// `out`: its length, or 0 for a number that is no peer's up now.
+    pub fn kernel_ipc_peer_name(host: u32, out: *mut u8, cap: usize) -> usize;
+
     /// The peer `name` (`len` bytes, a host's name) up, the router's call:
     /// its number -- the host part of its mailboxes' addresses here, the
     /// same while it stays up and another after it was lost -- or 0 when
