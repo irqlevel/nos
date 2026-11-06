@@ -71,7 +71,7 @@ fn module_box(addr: u64) -> Option<Arc<Mbox>> {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_ipc_open(owner: usize, messages: u32, bytes: u64) -> u64 {
+pub extern "C" fn kernel_ipc_open(owner: usize, messages: u32, bytes: u64, event: u64) -> u64 {
     let Ok(bytes) = usize::try_from(bytes) else { return 0 };
     let owner = owner_at(owner);
     if owner.is_image() {
@@ -79,7 +79,16 @@ pub extern "C" fn kernel_ipc_open(owner: usize, messages: u32, bytes: u64) -> u6
          * module's mailbox to make */
         return 0;
     }
-    match open(owner, Limits { messages, bytes }) {
+    /* The task's event, looked up: the mailbox holds it from here on, so the
+     * module may let go of its handle first */
+    let event = match event {
+        0 => None,
+        handle => match events::lookup(handle) {
+            Some(e) => Some(e),
+            None => return 0,
+        },
+    };
+    match open(owner, Limits { messages, bytes }, event) {
         /* The table keeps the mailbox; the module holds its address */
         Ok(m) => m.addr().to_u64(),
         Err(_) => 0,

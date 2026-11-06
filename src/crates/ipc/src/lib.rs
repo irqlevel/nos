@@ -32,6 +32,11 @@
 //! - **Locks**: the table's, then a mailbox's, never the other way round and
 //!   never two mailboxes' at once; both are mutexes, task context only. What
 //!   a closing mailbox held is dropped after every lock is let go of.
+//! - **The event a receiver sleeps on is held**: the mailbox's own, or the
+//!   one of the task it was made on (`Mailbox::new_on`, plans/ipc.md I2), an
+//!   `Arc` either way -- nothing signals an event that has been freed,
+//!   whoever let go of it first -- and held by one task at a time while it
+//!   waits (`SharedEvent::hold`).
 
 #![no_std]
 
@@ -53,10 +58,11 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use events::SharedEvent;
 use kcore::klog;
 use kcore::once::OnceBox;
-use kcore::sync::{Event, Mutex};
+use kcore::sync::Mutex;
 use kcore::time::{boot_time_ns, Duration};
 
 /// Mailboxes at once on this host: a slot each, numbered from 1.
@@ -650,11 +656,16 @@ pub(crate) struct Mbox {
     owner: Owner,
     limits: Limits,
     inner: Mutex<Inner>,
-    /// What its receiver sleeps on: the channel's own, so that nothing
-    /// signals an event its owner has done away with.
-    event: Event,
-    /// A receiver is waiting: two at once is a bug, said and refused.
-    receiving: AtomicBool,
+    /// What its receiver sleeps on, and whatever comes to it signals: its
+    /// own, or the event of the task it was made on (`Mailbox::new_on`) --
+    /// held either way, so that nothing signals an event that has been
+    /// freed, whoever let go of it first. A receiver holds it while it
+    /// waits (`SharedEvent::hold`): a second task waiting is a bug, said and
+    /// refused.
+    event: Arc<SharedEvent>,
+    /// Made on a task's event: a receive's wait ends at the event's first
+    /// signal, whatever it was for -- the task has other things to look at.
+    on_task_event: bool,
 }
 
 struct Entry {
@@ -824,8 +835,9 @@ fn resolve<'a>(to: To<'a>) -> Result<Target<'a>, Error> {
         .ok_or(Error::Gone)
 }
 
-/// A mailbox made for `owner`, held to `limits`.
-pub(crate) fn open(owner: Owner, limits: Limits) -> Result<Arc<Mbox>, Error> {
+/// A mailbox made for `owner`, held to `limits` -- on `event`, a task's,
+/// when one is given, and on an event of its own otherwise.
+pub(crate) fn open(owner: Owner, limits: Limits, event: Option<Arc<SharedEvent>>) -> Result<Arc<Mbox>, Error> {
     if limits.messages == 0 || limits.messages > MAX_QUEUE_MESSAGES || limits.bytes == 0
         || limits.bytes > MAX_QUEUE_BYTES {
         return Err(Error::Invalid);
@@ -847,7 +859,11 @@ pub(crate) fn open(owner: Owner, limits: Limits) -> Result<Arc<Mbox>, Error> {
         peak: 0,
     })
     .ok_or(Error::NoMemory)?;
-    let event = Event::new().ok_or(Error::NoMemory)?;
+    let on_task_event = event.is_some();
+    let event = match event {
+        Some(e) => e,
+        None => SharedEvent::new().ok_or(Error::NoMemory)?,
+    };
     let table = table().ok_or(Error::NoMemory)?;
     let mut t = table.lock();
     if t.stopped {
@@ -862,7 +878,7 @@ pub(crate) fn open(owner: Owner, limits: Limits) -> Result<Arc<Mbox>, Error> {
     }
     let slot = (1..=MAX_MAILBOXES).find(|&i| t.slots[i].mbox.is_none()).ok_or(Error::Busy)?;
     let addr = Addr { host: 0, slot: slot as u16, generation: t.slots[slot].generation };
-    let mbox = Arc::new(Mbox { addr, owner, limits, inner, event, receiving: AtomicBool::new(false) });
+    let mbox = Arc::new(Mbox { addr, owner, limits, inner, event, on_task_event });
     t.slots[slot].mbox = Some(mbox.clone());
     if !owner.is_image() {
         match t.owners.iter_mut().find(|(o, _)| *o == owner) {
@@ -1014,53 +1030,60 @@ fn take_part(mbox: &Mbox, offset: usize, out: &mut [u8], ticket: &mut u64) -> Pa
     got
 }
 
+/// What `look` finds, looked for until `deadline` with the mailbox's event
+/// slept on between looks: None when the time ran out first, another task
+/// was found waiting on the event, or -- the mailbox on a task's event -- a
+/// signal brought nothing it could find, which may have been for another of
+/// the task's things. The event is held only while this would sleep, so
+/// that a look that finds its message, or does not wait at all, never meets
+/// a task asleep on the event.
+fn look_and_wait<R>(mbox: &Mbox, deadline: u64, mut look: impl FnMut() -> Option<R>) -> Option<R> {
+    let mut held = None;
+    loop {
+        if let Some(got) = look() {
+            return Some(got);
+        }
+        let now = boot_time_ns();
+        if now >= deadline {
+            return None;
+        }
+        if held.is_none() {
+            held = mbox.event.hold();
+            if held.is_none() {
+                klog!(0, "ipc: two tasks waiting on mailbox {}'s event at once -- the second is refused", mbox.addr);
+                return None;
+            }
+        }
+        /* A signal between the look and the wait is kept by the event */
+        let signalled = held.as_ref().is_some_and(|h| h.wait_for(Duration::from_nanos((deadline - now).min(LOOK_NS))));
+        if signalled && mbox.on_task_event {
+            /* One more look, and back to the task: what woke it may be its
+             * other things' */
+            return look();
+        }
+    }
+}
+
 /// `take_part`, the first part waited for up to `timeout`; a part after the
 /// first is there or is not, and is not waited for.
 pub(crate) fn wait_part(mbox: &Mbox, timeout: Duration, offset: usize, out: &mut [u8], ticket: &mut u64) -> Part {
     let now = boot_time_ns();
     let deadline = if offset == 0 { now.saturating_add(timeout.as_nanos()) } else { now };
-    if mbox.receiving.swap(true, Ordering::Acquire) {
-        klog!(0, "ipc: two tasks receiving from mailbox {} at once -- the second is refused", mbox.addr);
-        return Part::Nothing;
-    }
-    let got = loop {
-        match take_part(mbox, offset, out, ticket) {
-            Part::Nothing => {}
-            other => break other,
-        }
-        let now = boot_time_ns();
-        if now >= deadline {
-            break Part::Nothing;
-        }
-        /* A signal between the look and the wait is kept by the event */
-        mbox.event.wait_for(Duration::from_nanos((deadline - now).min(LOOK_NS)));
+    let look = || match take_part(mbox, offset, out, ticket) {
+        Part::Nothing => None,
+        got => Some(got),
     };
-    mbox.receiving.store(false, Ordering::Release);
-    got
+    look_and_wait(mbox, deadline, look).unwrap_or(Part::Nothing)
 }
 
 /// `take`, waiting up to `timeout` for one.
 pub(crate) fn wait(mbox: &Mbox, timeout: Duration, cap: usize) -> Taken {
-    let now = boot_time_ns();
-    let deadline = now.saturating_add(timeout.as_nanos());
-    if mbox.receiving.swap(true, Ordering::Acquire) {
-        klog!(0, "ipc: two tasks receiving from mailbox {} at once -- the second is refused", mbox.addr);
-        return Taken::Nothing;
-    }
-    let got = loop {
-        match take(mbox, cap) {
-            Taken::Nothing => {}
-            other => break other,
-        }
-        let now = boot_time_ns();
-        if now >= deadline {
-            break Taken::Nothing;
-        }
-        /* A signal between the look and the wait is kept by the event */
-        mbox.event.wait_for(Duration::from_nanos((deadline - now).min(LOOK_NS)));
+    let deadline = boot_time_ns().saturating_add(timeout.as_nanos());
+    let look = || match take(mbox, cap) {
+        Taken::Nothing => None,
+        got => Some(got),
     };
-    mbox.receiving.store(false, Ordering::Release);
-    got
+    look_and_wait(mbox, deadline, look).unwrap_or(Taken::Nothing)
 }
 
 /// Messages to `to` from `from`.
@@ -1420,7 +1443,16 @@ pub struct Mailbox {
 impl Mailbox {
     /// A mailbox held to `limits`.
     pub fn new(limits: Limits) -> Result<Mailbox, Error> {
-        open(Owner::IMAGE, limits).map(|mbox| Mailbox { mbox })
+        open(Owner::IMAGE, limits, None).map(|mbox| Mailbox { mbox })
+    }
+
+    /// A mailbox held to `limits`, made on `event` -- the event of a task
+    /// that waits for this and more: whatever comes to it, a message, a
+    /// Down, a wake, its close, signals that event, and a `recv` waits on it
+    /// until its first signal. The mailbox holds the event for as long as
+    /// it is open, so the task may let go of it first.
+    pub fn new_on(limits: Limits, event: &Arc<SharedEvent>) -> Result<Mailbox, Error> {
+        open(Owner::IMAGE, limits, Some(event.clone())).map(|mbox| Mailbox { mbox })
     }
 
     pub fn addr(&self) -> Addr {
@@ -1453,7 +1485,8 @@ impl Mailbox {
     }
 
     /// The next message, waiting up to `timeout` for one -- None sooner if
-    /// woken (`wake`) or closed.
+    /// closed, and, on a task's event (`new_on`), at the event's first
+    /// signal that brought none.
     pub fn recv(&self, timeout: Duration) -> Option<Message> {
         match wait(&self.mbox, timeout, usize::MAX) {
             Taken::Message(m) => Some(m),

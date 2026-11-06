@@ -2,6 +2,7 @@ use alloc::vec::Vec;
 use ffi::block;
 
 use crate::error::{Error, Result};
+use crate::events::SharedEvent;
 use crate::lent::Buffers;
 
 pub use crate::lent::{Lent, Started};
@@ -429,7 +430,8 @@ pub struct DiskQueue {
 pub enum QueueError {
     /// Who holds the device, or something overlapping it.
     Held(Holder),
-    /// No memory, every queue taken, or arguments past what a queue takes.
+    /// No memory, every queue taken, an event that is no event's, or
+    /// arguments past what a queue takes.
     Refused,
 }
 
@@ -449,16 +451,34 @@ impl Disk {
     pub fn into_queue(self, write: bool, holder: &str, buffers: usize, bytes: usize)
         -> core::result::Result<DiskQueue, QueueError>
     {
+        self.queue_on(0, write, holder, buffers, bytes)
+    }
+
+    /// `into_queue`, made on `event` -- the event of a task that waits for
+    /// this and more: the queue's completions and wakes signal that event as
+    /// well as the queue's own, which `wait` and `poll` still sleep on. The
+    /// kernel holds the event until the queue is closed, so `event` may be
+    /// dropped first.
+    pub fn into_queue_on(self, event: &SharedEvent, write: bool, holder: &str, buffers: usize, bytes: usize)
+        -> core::result::Result<DiskQueue, QueueError>
+    {
+        self.queue_on(event.handle(), write, holder, buffers, bytes)
+    }
+
+    fn queue_on(self, event: u64, write: bool, holder: &str, buffers: usize, bytes: usize)
+        -> core::result::Result<DiskQueue, QueueError>
+    {
         let mut at = Vec::new();
         at.try_reserve_exact(buffers).map_err(|_| QueueError::Refused)?;
         at.resize(buffers, core::ptr::null_mut());
         let mut refused = Holder::EMPTY;
         let mut len = 0usize;
         /* `at` takes `buffers` pointers, `holder` is its bytes, `refused`
-         * takes HOLDER_MAX and `len` is ours; the device is looked up. */
+         * takes HOLDER_MAX and `len` is ours; the device and the event are
+         * looked up. */
         let q = unsafe {
             block::kernel_blockq_open(self.handle, i32::from(write), buffers, bytes, holder.as_ptr(), holder.len(),
-                                      at.as_mut_ptr(), refused.bytes.as_mut_ptr(), HOLDER_MAX, &mut len)
+                                      at.as_mut_ptr(), refused.bytes.as_mut_ptr(), HOLDER_MAX, &mut len, event)
         };
         if q == 0 {
             if len == 0 {

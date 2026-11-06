@@ -79,7 +79,8 @@ let answer = ipc::call(&mine, &cs, TAG_READ, &request, Duration::from_secs(5))?;
   event of the task's, and a block or image queue opened on the same event
   (one change to `kernel_blockq_open` and the image queue's open), so that a
   chunk server's worker sleeps on one thing and wakes for a request or a
-  completion alike.
+  completion alike -- `events::SharedEvent`, `Mailbox::new_on`,
+  `Disk::into_queue_on`, `Image::into_queue_on` (I2, below).
 - **Monitor**: `mb.monitor(addr)` puts exactly one `Down { addr, reason }`
   into `mb` when `addr` closes -- `Closed`, `Unloaded` (its module went),
   `HostLost` (its host stopped answering), `NoSuch` (gone already when
@@ -366,6 +367,111 @@ its caps. Gates: the smoke boots on both arches, UB builds too; `fuzz/ipc`;
 **I2, one event to wait on.** A mailbox, a `DiskQueue` and an `ImageQueue`
 made on a task's event. Gates: `netblk-test.py`, `hv-test.py`,
 `hv-device-test.py`, `fs-fuzz.py`.
+
+### How I2 is built
+
+What it has to hold to: an event a task waits on, which other objects
+signal from wherever they run -- a sender's task, a device's interrupt on
+another CPU -- is never signalled once it is freed, whoever lets go of it
+first: the task, the last object made on it, or a completion that comes
+as its queue closes. And one task waits on it; the objects only signal.
+
+- **The event is counted** (`src/crates/events`, a crate of the image's,
+  below `ipc` and `block`): `events::SharedEvent` -- the kernel's `Event`
+  and the flag of the one task that waits on it -- held as an `Arc`. The
+  task holds one, and so does every object made on it: a mailbox
+  (`ipc::Mailbox::new_on`), a device's queue and an image's (the
+  `block::queue::Queue` under both, made with one). It is freed when the
+  last of them lets go, the task first or the objects first as it falls:
+  an object signals an event it holds, so none is signalled after it is
+  freed -- the type's to keep, not a comment's.
+- **A completion signals it under a lock.** A queue's completions come in
+  its device's interrupt, through an entry of the queues' table that lives
+  for good (`block::queue::DONE`), and may come late: between a
+  completion's push onto the entry's ring and its signal is a window the
+  queue's close does not wait out. The entry keeps the task's event in an
+  interrupt-safe lock that owns it (`IrqSpinLock<Option<Arc<SharedEvent>>>`):
+  a completion signals it under the lock, and the queue's close takes it
+  out under the lock -- once the close has it, no completion is in its
+  signal -- and lets go of it, perhaps freeing it, off the lock and in task
+  context. A completion after that finds none and signals the entry's own
+  event alone. The interrupt path takes and drops no count, so nothing is
+  freed there or under the lock; and a queue on no task's event pays one
+  load for it (`on_task_event`) and takes no lock at all, not even at its
+  close.
+- **One waiter.** A task's wait (`SharedEvent::wait_for`, `poll`) and a
+  mailbox's receive hold the event's flag for as long as they would sleep
+  (`SharedEvent::hold`): a second task waiting on it, or waiting in a
+  receive from a mailbox made on it, is refused and said -- as two waiting
+  receivers of one mailbox were before -- never the kernel `Event`'s panic
+  at a second waiter. A receive that finds its message, or does not wait
+  (a module's `try_recv` is a receive of no time), holds nothing: a task
+  may look at a mailbox while another sleeps on its event.
+- **What a queue's own calls wait on.** A queue made on a task's event
+  signals both, its own event and the task's. Its `wait` and `poll` and the
+  waits inside its calls -- a drain before a flush, a device full of other
+  commands, its close waiting out its I/O -- stay on its own, so that a
+  close from whatever task drops the queue never makes a second waiter of
+  the task's event.
+- **A mailbox's receive on a task's event** ends at the event's first
+  signal, whatever it was for, with one more look: the task has other
+  sources to look at. A task on one event looks at every source before each
+  wait (`try_recv`, `reap`), so that a signal one of them took is never a
+  wakeup lost.
+- **For a module** (`kcore::events::SharedEvent`): a handle of a table in
+  `events` -- a slot and its generation, looked up on every call as the
+  image's other tables are -- so that a handle that is no event's is
+  refused, never followed: `kernel_shared_event_open`, `_close`, `_wait`,
+  `_poll` and `_signal`, the signal from any context (made under the slot's
+  interrupt-safe lock, which only the table's own calls take). The
+  mailbox's, the device queue's and the image queue's opens take an event's
+  handle -- 0 for none (`kernel_ipc_open`, `kernel_blockq_open`,
+  `kernel_image_queue`): looked up once, the object holds the event itself
+  from then on, so a module's `SharedEvent` dropped first leaves them as
+  they were. `Mailbox::new_on`, `Disk::into_queue_on`,
+  `Image::into_queue_on`; `new` and `into_queue` as before. No `unsafe` in
+  a module's use of it.
+- **Its users.** None is changed for it: the hv module's disk task sleeps
+  on its queue already, which the vCPU wakes for a request handed over --
+  one event for both. The first is NBS's chunk server, a mailbox for its
+  requests and a device's queue for their I/O.
+- **Later**: a TCP connection's receive and send events joining it -- what
+  ipcnet's link loop wants, a connection's receive and its own queue, for
+  which `TcpWaker` stands in now.
+- **Tested**: at every boot, both arches (`one_event::selftest`, in
+  `rust_test`): a mailbox and a queue on one event and one task asleep on
+  it, woken by a message, by a completion made in another CPU's interrupt
+  through the queue's own completion path (`Queue::test_command`), and by a
+  wake; a second waiter refused; the task and its owner letting go first,
+  the event kept by the two, a late message and completion harmless; the
+  event freed with the last of them. modtest's side of it first in `modtest
+  ipc` (by `test_module_ipc`): the same through the C ABI, a mailbox and a
+  device's queue on a module's event -- the device's wake, as a boot's test
+  does no I/O. `ipc-fuzz.py`: mailboxes on events of the image's and of
+  modules' (by handle, live, stale and made up), a task asleep on an event
+  woken by a message, a wake, a close, a signal and by its holder letting go
+  first and a message after -- and by nothing else -- a second waiter and a
+  receive refused at once, every event there exactly while something holds
+  it (`events::live` held to the model). `fs-fuzz.py`: images' queues on an
+  event, waited on through it for what is in flight -- every command out
+  done within the disk's latency, so a wait that runs out is a completion
+  that did not signal -- the event let go of first, gone with its image;
+  the machine's lock rules holding that nothing is freed with interrupts
+  off. Which queues are on an event is the batch's to say, not the input's:
+  the targets' inputs do what they did before.
+
+Done on branch `ipc-i2` (2026-11-06). Every gate of the step passed on the
+plain build, the controls caught: a queue that kept a pointer to the task's
+event and no count of it -- the bug the design makes impossible, which ends
+in a signal of a freed event -- stops the boot ("the event freed while a
+queue made on it was open"); a mailbox that ignored the event it was given,
+and a module's handle closed but its count kept, each fail ipc-fuzz at its
+4th input; a completion that did not signal the task's event fails fs-fuzz's
+ext4rw at its 203rd. On the way, fs-fuzz's ext4rw, with the inputs shifted
+by two bytes a batch, met a finding of the tree before I2's: the power cut
+before a request leaves a 5 GiB image neither as it was before the call nor
+after it -- the same on the base tree (f62bce37) given the same steps: not
+I2's, and left to ext4's own work.
 
 **I3, TCP and TLS for hosts.** TCP's T1 to T3 ([tcp.md](tcp.md)), each
 measured before and after on the AX41 and the EX44; `tls`'s pinned client

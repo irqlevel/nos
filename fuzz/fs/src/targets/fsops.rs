@@ -8,7 +8,14 @@
 //! Among the files open, disks' images (`fs::image`): a file held, read and
 //! written off the VFS's lock where its filesystem keeps blocks on a device
 //! -- and while it is held, everything else that would write it refused.
+//! An image's queue may be made on an event, as a task that waits for more
+//! than its disk has it (plans/ipc.md I2): its disk's completions, made in
+//! the disk's interrupt, signal the event, which the queue holds until it
+//! goes, whoever let go of it first.
 
+use std::sync::{Arc, Weak};
+
+use events::SharedEvent;
 use fs::image::{Image, Started};
 use fs::vfs::{FileStat, Handle, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE, OPEN_WRITE};
 use fs::vnode::Kind;
@@ -471,6 +478,8 @@ pub struct Fs {
     pub strict: bool,
     /// The images held: `model.holds`, one for one.
     pub images: Vec<Image>,
+    /// The event each image's queue was made on: `images`, one for one.
+    pub queue_events: Vec<QueueEvent>,
     /// Whether an image's discard may be refused for want of a block: the
     /// filesystem had fewer free when it was mounted than it keeps for a
     /// punch's split, a disk another system filled.
@@ -483,7 +492,29 @@ pub struct Fs {
 
 impl Fs {
     pub fn new(vfs: &'static Vfs, model: Model, strict: bool) -> Fs {
-        Fs { vfs, model, strict, images: Vec::new(), punch_room: false, allocates: false }
+        Fs { vfs, model, strict, images: Vec::new(), queue_events: Vec::new(), punch_room: false, allocates: false }
+    }
+}
+
+/// The event an image's queue was made on, if it was: the fuzzer's own hold
+/// of it -- let go of now and then while the queue is open, which holds it
+/// still -- and what says whether it is still there.
+#[derive(Default)]
+pub struct QueueEvent {
+    held: Option<Arc<SharedEvent>>,
+    weak: Option<Weak<SharedEvent>>,
+}
+
+impl QueueEvent {
+    /// Its image let go of, and with it the queue's hold of the event: the
+    /// fuzzer's let go of too, the event is gone -- not a moment longer.
+    fn gone_with_its_image(self) {
+        let QueueEvent { held, weak } = self;
+        drop(held);
+        if let Some(weak) = weak {
+            invariant!(weak.upgrade().is_none(), "the event an image's queue was made on outlived the image");
+            reached("the event an image's queue was made on gone with it");
+        }
     }
 }
 
@@ -970,6 +1001,7 @@ impl Fs {
                 reached("a file held as two images at once");
             }
             self.images.push(image);
+            self.queue_events.push(QueueEvent::default());
             self.model.holds.push((path, write));
             self.image_map_held(self.images.len() - 1);
         }
@@ -1016,6 +1048,7 @@ impl Fs {
         if i < self.images.len() {
             say(format_args!("image_close {}", i));
             drop(self.images.remove(i));
+            self.queue_events.remove(i).gone_with_its_image();
             self.model.holds.remove(i);
         }
     }
@@ -1149,14 +1182,34 @@ impl Fs {
     /// path's, which waits for them (a part of a block, a write into a
     /// hole), and flushes. With `close`, the image let go of with them in
     /// flight: its drop waits for them, and they are written. No two of
-    /// them reach one block (`queue_batch`), as a guest has it.
+    /// them reach one block (`queue_batch`), as a guest has it. The queue
+    /// made on an event of the fuzzer's for a first batch of an odd number
+    /// of requests, which the fuzzer then waits on for what is in flight --
+    /// and lets go of first at a batch of a multiple of four. Chosen by the
+    /// batch, not read from the input: the targets' inputs go on to do what
+    /// they did before the queues had events.
     pub fn image_queue_batch(&mut self, i: usize, reqs: &[QueueReq], close: bool) {
+        let (on_event, let_go) = (reqs.len() % 2 == 1, reqs.len() % 4 == 0);
         let Some((path, writable)) = self.model.holds.get(i).cloned() else { return };
-        say(format_args!("image_queue_batch {} requests of {}{}", reqs.len(), show(&join(&path)),
-                         if close { ", let go of with them in flight" } else { "" }));
-        if self.images[i].queue_entry().is_none() && !self.images[i].make_queue(QUEUE_BUFFERS, QUEUE_PAGES) {
-            self.check(false, format_args!("image {}'s queue could not be made", i));
-            return;
+        say(format_args!("image_queue_batch {} requests of {}{}{}", reqs.len(), show(&join(&path)),
+                         if close { ", let go of with them in flight" } else { "" },
+                         if self.queue_events[i].weak.is_some() { ", its queue on an event" } else { "" }));
+        if self.images[i].queue_entry().is_none() {
+            let event = on_event.then(|| SharedEvent::new().expect("an event"));
+            if !self.images[i].make_queue(QUEUE_BUFFERS, QUEUE_PAGES, event.clone()) {
+                self.check(false, format_args!("image {}'s queue could not be made", i));
+                return;
+            }
+            if let Some(ev) = event {
+                reached("an image's queue made on an event");
+                self.queue_events[i] = QueueEvent { weak: Some(Arc::downgrade(&ev)), held: Some(ev) };
+            }
+        }
+        if let_go && self.queue_events[i].held.take().is_some() {
+            /* The queue holds it still */
+            let there = self.queue_events[i].weak.as_ref().is_some_and(|w| w.upgrade().is_some());
+            invariant!(there, "the event image {}'s queue was made on gone with the queue open", i);
+            reached("the event an image's queue was made on let go of first");
         }
         let (mark, saved) = (crate::machine::trace_mark(), self.model.tree.clone());
         let (refused, reasons) = (self.images[i].chunks_refused(), reasons_so_far());
@@ -1236,11 +1289,12 @@ impl Fs {
                 }
             }
             drop(self.images.remove(i));
+            self.queue_events.remove(i).gone_with_its_image();
             self.model.holds.remove(i);
         } else {
             while q.flying.iter().any(Option::is_some) {
                 if !self.queue_reap(i, &mut q, reqs, &before) {
-                    self.images[i].wait(kcore::time::Duration::from_millis(1));
+                    self.queue_wait(i);
                 }
             }
             self.chunks_held(i, refused, reasons, mark);
@@ -1284,6 +1338,25 @@ impl Fs {
         }
         if !close {
             self.image_map_held(i);
+        }
+    }
+
+    /// A wait for image `i`'s queue, what it has in flight kicked: on the
+    /// event it was made on while the fuzzer holds that -- every command out
+    /// is done within its disk's latency, in the disk's interrupt, and each
+    /// signals the event, so a wait of a second that runs out is a
+    /// completion that did not -- and on the queue's own otherwise.
+    fn queue_wait(&mut self, i: usize) {
+        match self.queue_events[i].held.clone() {
+            Some(ev) => {
+                let signalled = ev.wait_for(kcore::time::Duration::from_secs(1));
+                invariant!(signalled, "image {}'s queue: a command done that did not signal the event it was made on",
+                           i);
+                reached("an image's queue waited for through the event it was made on");
+            }
+            None => {
+                self.images[i].wait(kcore::time::Duration::from_millis(1));
+            }
         }
     }
 
