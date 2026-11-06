@@ -11,16 +11,24 @@
 namespace kernel
 {
 
+/* The waits that met a signal() in its window as they let go of their task
+   (Event::let_go_waits) */
+static Atomic let_go_met;
+
 Event::Event()
     : signaled_(0)
     , waiter_(0)
     , waiter_cpu_(0)
+    , signallers_(0)
 {
 }
 
 Event::~Event()
 {
     BUG_ON(waiter_.get() != 0);
+    /* A signal() still running: the owner's bug, which a free of the event
+       turns into a write to freed memory */
+    BUG_ON(signallers_.get() != 0);
 }
 
 void Event::wait()
@@ -64,7 +72,7 @@ void Event::wait()
         hal::irq_restore(flags);
     }
 
-    waiter_.set(0);
+    let_go();
 }
 
 bool Event::wait_for(unsigned long long timeout_ns)
@@ -106,8 +114,39 @@ bool Event::wait_for(unsigned long long timeout_ns)
         hal::irq_restore(flags);
     }
 
-    waiter_.set(0);
+    let_go();
     return signaled;
+}
+
+void Event::let_go()
+{
+    /* Emptied first, then the window looked at: a signal() that comes into
+       it after this finds no waiter -- it looks at waiter_ again inside --
+       and one that was in it before is waited out. Both sides are
+       sequentially consistent atomics, so one of the two always sees the
+       other. */
+    waiter_.set(0);
+    if (signallers_.get() == 0)
+        return;
+
+    /* A signal() in its window has interrupts off and touches the task for a
+       handful of instructions -- the boot's test holds it for longer -- so
+       this is a short spin. One that does not end is a signaller wedged with
+       its interrupts off, said rather than waited for. */
+    let_go_met.inc();
+    ulong deadline = get_boot_time().get_value() + LET_GO_STUCK_NS;
+    for (ulong spins = 1; signallers_.get() != 0; spins++)
+    {
+        cpu_relax();
+        if (spins % LET_GO_CLOCK_EVERY == 0 && get_boot_time().get_value() >= deadline)
+            PANIC("event 0x%p: a signal() still inside its window after %lu s", this,
+                  LET_GO_STUCK_NS / consts::NANO_SECS_IN_SEC);
+    }
+}
+
+ulong Event::let_go_waits()
+{
+    return (ulong)let_go_met.get();
 }
 
 bool Event::poll_for(unsigned long long poll_ns)
@@ -129,6 +168,11 @@ bool Event::poll_for(unsigned long long poll_ns)
 
 void Event::signal()
 {
+    signal_holding(0);
+}
+
+void Event::signal_holding(ulong hold_ns)
+{
     /* Published first. A plain read before the locked operation, so a burst
        of signals to a busy waiter costs one locked instruction, not one
        each. */
@@ -137,17 +181,51 @@ void Event::signal()
 
     /* Then the waiter, every time -- not only by whoever set the flag: a
        waiter found blocked with a signal pending is one to wake, whoever's
-       signal it was. */
-    Task* waiter = (Task*)waiter_.get();
-    if (waiter == nullptr || !waiter->is_blocked())
+       signal it was. None in wait() -- a busy waiter's burst -- is a look at
+       the event alone. */
+    if (waiter_.get() == 0)
         return;
 
-    waiter->unblock();
+    /* The task touched inside the window only: counted before waiter_ is read
+       again, so that the wait() that set it does not return -- and its task
+       neither exits nor blocks on anything else -- before this is done with
+       it (let_go); interrupts off, so that this is done with it in a moment.
+       What the look above saw may have been another wait()'s. */
+    ulong flags = hal::irq_save();
+    signallers_.inc();
+
+    Task* waiter = (Task*)waiter_.get();
+    if (unlikely(hold_ns != 0))
+    {
+        ulong until = get_boot_time().get_value() + hold_ns;
+        while (get_boot_time().get_value() < until)
+            cpu_relax();
+    }
+
+    bool kick = false;
+    ulong cpu = 0;
+    if (waiter != nullptr)
+    {
+        /* Alive by the window: a task gone would be a wait() that let go of
+           it with this still in here */
+        BUG_ON(waiter->magic_ != Task::TASK_MAGIC);
+        if (waiter->is_blocked())
+        {
+            waiter->unblock();
+            cpu = (ulong)waiter_cpu_.get();
+            kick = true;
+        }
+    }
+
+    signallers_.dec();
+    hal::irq_restore(flags);
 
     /* Unblocked is not running: an idle CPU would not look at its queue again
        until the next tick. The IPI ends in schedule(), which finds the task
-       runnable -- the same kick SoftIrq::raise gives its tasks. */
-    hal::send_ipi((ulong)waiter_cpu_.get(), CpuTable::IPI_VECTOR);
+       runnable -- the same kick SoftIrq::raise gives its tasks. A CPU's
+       number, nothing of the task's, which may be gone by now. */
+    if (kick)
+        hal::send_ipi(cpu, CpuTable::IPI_VECTOR);
 }
 
 }
