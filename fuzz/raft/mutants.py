@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Mutants of the raft crate the gate must catch: each one rule taken out of
+"""Mutants of the raft crate -- and of the cluster's registry, its first user
+-- the gate must catch: each one rule taken out of
 src/crates/raft/src/node.rs (or the file a mutant names), the fuzzer built
 over it, and `raft-fuzz gate`
 run -- which must fail; and so must the scenario written for that rule, on
@@ -19,6 +20,8 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 SRC = os.path.join(ROOT, 'src', 'crates', 'raft', 'src')
+# The registry's mutants name their file from SRC.
+REGISTRY = os.path.join('..', '..', 'registry', 'src', 'lib.rs')
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
 BINARY = os.path.join(OUT, 'release', 'raft-fuzz')
 
@@ -130,6 +133,31 @@ MUTANTS = [
      'head.extend_from_slice(&(self.sessions.len() as u32).to_le_bytes());\n        if !b.push(&head) {\n            return false;\n        }\n        for (&client, s) in self.sessions.iter() {',
      'head.extend_from_slice(&0u32.to_le_bytes());\n        if !b.push(&head) {\n            return false;\n        }\n        for (&client, s) in self.sessions.iter().take(0) {',
      'rsm_sessions_in_snapshot', 'rsm.rs'),
+    # The cluster's registry (src/crates/registry), the crate's first user.
+    ('registry_no_expiry', "an invitation kept past its time by the entry's clock",
+     'self.invitations.retain(|i| i.expires > now);',
+     'self.invitations.retain(|_| true);',
+     'registry_expiry', REGISTRY),
+    ('registry_token_twice', 'an invitation left open by the join that used it',
+     'let inv = self.invitations.remove(at);',
+     'let inv = self.invitations[at].clone();',
+     'registry_join_once', REGISTRY),
+    ('registry_removed_key_back', "a removed host's key taken by an invitation",
+     'if self.key_removed(key) {\n                    return Err(Refusal::KeyRemoved);\n                }\n                if *expires <= *now {',
+     'if *expires <= *now {',
+     'registry_removed_key', REGISTRY),
+    ('registry_node_reused', "a removed host's node given to the next host to join",
+     'let node = self.next_node;\n                self.next_node += 1;',
+     'let node = self.hosts.len() as u64 + 1;',
+     'registry_removed_key', REGISTRY),
+    ('registry_snapshot_keys_unchecked', 'a snapshot with a key twice taken',
+     'if twice || self.key_removed(k) {',
+     'if false {',
+     'registry_snapshot_rules', REGISTRY),
+    ('registry_all_vote', 'every host a voter, none a learner',
+     'self.hosts.iter().take(VOTERS_MAX).map(|h| h.node).collect()',
+     'self.hosts.iter().map(|h| h.node).collect()',
+     'registry_voters', REGISTRY),
 ]
 
 

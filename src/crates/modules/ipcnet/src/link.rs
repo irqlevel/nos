@@ -741,6 +741,13 @@ fn deliver(shared: &Shared, peer: &Peer, number: u16, m: ipcwire::Message) {
             Err(_) => return,
         },
     };
+    /* A host invited reaches the one name it was given, and nothing else
+       until it has joined: dropped and counted, as what a peer may not
+       reach is */
+    if !peer.may_reach(name) {
+        add(&peer.counts.refused, 1);
+        return;
+    }
     let pieces: Vec<&[u8]> = m.pieces.iter().map(|p| &p[..]).collect();
     add(&peer.counts.received, 1);
     let why = match shared.router.deliver_remote(number, m.from, to, name, m.tag, m.reference, &pieces) {
@@ -769,7 +776,9 @@ fn monitor_for(shared: &Shared, peer: &Peer, id: u64, target: u64) {
     /* The record and the monitor made under the peer's lock, so that the
      * router, which takes the lock to find a Down's peer, never sees the
      * Down before the record */
-    let made = peer.st.with(|st| {
+    /* A host invited watches nothing here */
+    let invited = peer.only.with(|o| o.is_some());
+    let made = !invited && peer.st.with(|st| {
         if st.number == 0 || st.monitors.len() >= MONITORS_MAX || st.monitors.try_reserve(1).is_err() {
             return false;
         }

@@ -48,6 +48,12 @@ into a host program that holds it to:
     timeouts; every client answered once calm, and the history of every
     operation checked for linearizability (RAFT_RSM_STATS=1 says what each
     run did);
+  - the registry target: the cluster's registry (src/crates/registry) held
+    to a model of its own, alone and as a group through raft::rsm: every
+    answer, every host, invitation and removed host, the voters and every
+    host's peers; its snapshot read back, changed and refused, and a
+    replica from a snapshot part way (RAFT_REGISTRY_STATS=1 says what each
+    run did);
   - the wire target: messages written and read back, and noise and broken
     messages read without a panic, anything taken written back to its bytes;
   - the hostile target: one member fed messages no correct member sends --

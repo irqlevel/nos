@@ -578,6 +578,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-cluster"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+ "kcore",
+ "kmod",
+ "raft",
+ "registry",
+ "sha2",
+]
+
+[[package]]
 name = "mod-edit"
 version = "0.1.0"
 dependencies = [
@@ -947,6 +959,14 @@ name = "random"
 version = "0.1.0"
 dependencies = [
  "kcore",
+]
+
+[[package]]
+name = "registry"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+ "raft",
 ]
 
 [[package]]

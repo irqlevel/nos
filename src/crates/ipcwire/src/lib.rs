@@ -21,6 +21,8 @@
 
 extern crate alloc;
 
+pub mod control;
+
 use alloc::vec::Vec;
 
 /// The version a `Hello` says, and the one it must say.
@@ -132,6 +134,19 @@ fn is_name(b: &[u8]) -> bool {
 fn is_host(b: &[u8]) -> bool {
     !b.is_empty() && b.len() <= HOST_MAX
         && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// Whether `name` is a mailbox's name as the wire carries one: lowercase
+/// letters, digits, `_`, `-` and dots, up to `NAME_MAX` of them.
+pub fn valid_name(name: &str) -> bool {
+    is_name(name.as_bytes())
+}
+
+/// Whether `name` is a host's name as the wire carries one -- a DNS label's
+/// letters, lowercase, digits and dashes, up to `HOST_MAX` of them: the one
+/// rule for hosts.toml, the cluster's registry and the frames alike.
+pub fn valid_host(name: &str) -> bool {
+    is_host(name.as_bytes())
 }
 
 /// What a frame's bytes are read through: each read checked, none past the

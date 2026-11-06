@@ -317,6 +317,27 @@ pub unsafe extern "C" fn kernel_ipc_list(prefix: *const u8, len: usize, out: *mu
     n
 }
 
+/// The name of the peer whose number `host` is now -- up, of that epoch --
+/// into the `cap` bytes at `out`: its length, or 0 for a number that is no
+/// peer's up now, or a `cap` its name does not fit.
+///
+/// # Safety
+/// `out` takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_ipc_peer_name(host: u32, out: *mut u8, cap: usize) -> usize {
+    let Ok(host) = u16::try_from(host) else { return 0 };
+    if out.is_null() || host == 0 {
+        return 0;
+    }
+    let Some(name) = crate::remote::peer_name(host) else { return 0 };
+    if name.len() > cap {
+        return 0;
+    }
+    /* `out` takes `cap` bytes, and the name is no longer */
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), out, name.len()) };
+    name.len()
+}
+
 /* ---- the router's: ipcnet's ---- */
 
 #[no_mangle]
