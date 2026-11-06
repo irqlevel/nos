@@ -226,7 +226,7 @@ swallowing panic messages whole.
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
-| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
+| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -2691,6 +2691,39 @@ seconds, to:
   model of its log -- appends over its end and into it, snapshots taken in
   logs of tens of thousands of entries and sent -- every term and range of
   entries the model's.
+- **The log target**, 300 runs of 300 steps of `raft::log`'s `DiskLog` on a
+  disk of the fuzzer's own, which keeps POSIX's promises and no more. A
+  file's writes are on the medium once it is synced, a name once the
+  directory is. At a power cut every write since a file's last sync is kept,
+  lost or torn on its own (its tail zeros, noise or the file's end), and a
+  run of the directory's changes since its last sync is kept, in order. The
+  steps are:
+  - appends over the log's end and into what is not committed, the hard
+    state, syncs;
+  - snapshots taken and sent, segments rolled and compacted;
+  - power cuts, and restarts with no cut.
+
+  After each cut or restart the log must read back as the state at the last
+  sync with some first records written after it, at a record's boundary --
+  nothing synced lost, nothing torn read as an entry, nothing that was cut
+  read again -- or as the state a snapshot that failed half way would have
+  left. Other runs:
+  - calls of the disk fail, now and then, in a third of the runs: the log
+    stops on the first, says `Stopped` after, and reads back the same way;
+  - a byte of a sealed segment or of the snapshot is changed, and the log
+    refuses to open; with the byte put back, it reads back to the byte;
+  - noise named as the log names its files, some of it under a segment
+    header that checks: refused, or read as an empty log.
+
+  It found four bugs, each now one of seven scenarios (`log_*`): a leader's
+  snapshot taken below the commit; an open that used what the medium did
+  not yet hold; a leader's snapshot that stopped dropping the log before it
+  once a snapshot was taken after it; and an entry below a snapshot whose
+  truncation was skipped on replay. `RAFT_LOG_TRACE=1` prints each step and
+  the disk at each cut. `mutants.py`'s six `log_*` mutants take out the CRC
+  check, the seal of a segment before the next, the syncs at open, the
+  snapshot's sync before its rename, the compaction's bound, and the
+  installed snapshot's drop; each fails the gate and its own scenario.
 - **The hostile target**, 2000 runs of 3000 steps of one member fed what no
   correct member sends -- every kind of message, of terms and indexes about
   its own and of any value, from members and strangers, noise the wire
