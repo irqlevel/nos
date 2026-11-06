@@ -23,7 +23,7 @@ use tls::pinned::{Client, Fingerprint, Suite};
 
 use super::files::{self, Config, Dir, Identity, PeerConf};
 use super::link::{link_main, LinkCtx, Side, ALPN, HANDSHAKE_MS};
-use super::peer::{add, Locked, Peer, CONTROL, BULK};
+use super::peer::{add, Locked, Peer, BULK, CLASSES, CONTROL};
 
 /// What waits to go out to every host, at most: the router mailbox's own
 /// limits, the channel's largest -- a send past them is `Full`.
@@ -78,7 +78,10 @@ pub struct Shared {
     pub stop: AtomicBool,
     pub cfg: Config,
     pub nic: Nic,
-    pub identity: Identity,
+    /// This host's key and certificate: what its server shows and what its
+    /// clients show -- the newest, as `cluster rekey` switches it; a
+    /// connection keeps the one it was made with.
+    pub identity: Locked<Arc<Identity>>,
     /// The router: what the channel hands everything for another host.
     pub router: Mailbox,
     pub peers: Locked<Vec<Arc<Peer>>>,
@@ -94,6 +97,10 @@ pub struct Shared {
 }
 
 impl Shared {
+    pub fn identity(&self) -> Arc<Identity> {
+        self.identity.with(|i| i.clone())
+    }
+
     /// A handshake from `ip` let begin: refused past HANDSHAKES_MAX, or
     /// while `ip` has one under way.
     fn handshake_begin(&self, ip: u32) -> bool {
@@ -119,19 +126,29 @@ impl Shared {
     }
 }
 
-/// The TLS server for `peers`' keys.
-fn tls_server(identity: &Identity, peers: &[PeerConf]) -> Result<tls::pinned::Server, String> {
-    let keys: Vec<Fingerprint> = peers.iter().flat_map(|p| p.keys.iter().copied()).collect();
-    tls::pinned::Server::with_suites(&identity.cert, &identity.key, &keys, &ALPN, &SUITES)
+/// The TLS server for the peers' keys, showing `identity`.
+fn tls_server(identity: &Identity, keys: &[Fingerprint]) -> Result<tls::pinned::Server, String> {
+    tls::pinned::Server::with_suites(&identity.cert, &identity.key, keys, &ALPN, &SUITES)
         .map_err(|e| alloc::format!("the TLS server could not be made: {:?}", e))
 }
 
-fn make_peer(identity: &Identity, me: &str, conf: PeerConf) -> Result<Peer, String> {
+/// Every key of `peers`.
+fn keys_of(peers: &[PeerConf]) -> Vec<Fingerprint> {
+    peers.iter().flat_map(|p| p.keys.iter().copied()).collect()
+}
+
+/// The TLS clients to dial peer `name` with, by class: pinned to `keys`,
+/// showing `identity`.
+fn make_clients(identity: &Identity, name: &str, keys: &[Fingerprint]) -> Result<[Client; CLASSES], String> {
     let client = |class: usize| {
-        Client::with_suites(&identity.cert, &identity.key, &conf.keys, &[ALPN[class]], &SUITES)
-            .map_err(|e| alloc::format!("{}'s TLS client could not be made: {:?}", conf.name, e))
+        Client::with_suites(&identity.cert, &identity.key, keys, &[ALPN[class]], &SUITES)
+            .map_err(|e| alloc::format!("{}'s TLS client could not be made: {:?}", name, e))
     };
-    let clients = [client(CONTROL)?, client(BULK)?];
+    Ok([client(CONTROL)?, client(BULK)?])
+}
+
+fn make_peer(identity: &Identity, me: &str, conf: PeerConf) -> Result<Peer, String> {
+    let clients = make_clients(identity, &conf.name, &conf.keys)?;
     /* Of the two names, the one that sorts first dials */
     let dials = me < conf.name.as_str();
     Peer::new(conf, dials, clients).ok_or_else(|| String::from("out of memory"))
@@ -156,7 +173,7 @@ impl Server {
         }
         let router = Mailbox::new(ROUTER_LIMITS).map_err(|_| String::from("no mailbox for the router"))?;
         router.route().map_err(|e| alloc::format!("not the router: {} -- is another ipcnet running?", e.name()))?;
-        let server = tls_server(&identity, &cfg.peers)?;
+        let server = tls_server(&identity, &keys_of(&cfg.peers))?;
         let mut peers = Vec::new();
         for p in &cfg.peers {
             peers.push(Arc::new(make_peer(&identity, &cfg.name, p.clone())?));
@@ -164,7 +181,7 @@ impl Server {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             nic,
-            identity,
+            identity: Locked::new(Arc::new(identity)).ok_or_else(|| String::from("out of memory"))?,
             router,
             peers: Locked::new(peers).ok_or_else(|| String::from("out of memory"))?,
             server: Locked::new(Arc::new(server)).ok_or_else(|| String::from("out of memory"))?,
@@ -207,26 +224,44 @@ impl Server {
     }
 
     /// The peers made `peers`: one taken off lost and its dialer waited
-    /// out, one added made and dialed, one whose address or keys changed
-    /// both -- and the listener's allowlist and the TLS server's keys made
+    /// out, one added made and dialed, one whose address changed both --
+    /// one whose keys or reach changed kept as it is, its connections with
+    /// it -- and the listener's allowlist and the TLS server's keys made
     /// theirs.
     pub fn set_peers(&self, peers: &[PeerConf]) -> Result<(), String> {
         let sh = &self.shared;
-        let server = Arc::new(tls_server(&sh.identity, peers)?);
+        let identity = sh.identity();
+        let server = Arc::new(tls_server(&identity, &keys_of(peers))?);
         let old: Vec<Arc<Peer>> = sh.peers.with(|v| v.clone());
-        /* A peer is the same while its name, address and keys are: what it
-           may reach changes in place, its connections kept -- a host
-           invited joining is never cut off by its own join */
+        /* A peer is the same while its name and address are: its keys and
+           what it may reach change in place, its connections kept -- a host
+           invited joining is never cut off by its own join, nor a host
+           moving to a new key by its own rekey. Everything that can fail
+           made first, so that a failure changes nothing */
         let gone: Vec<Arc<Peer>> = old.iter().filter(|p| !peers.iter().any(|c| c.same_link(&p.conf))).cloned().collect();
         let mut new = Vec::new();
         for c in peers.iter().filter(|c| !old.iter().any(|p| p.conf.same_link(c))) {
-            new.push(Arc::new(make_peer(&sh.identity, &sh.cfg.name, c.clone())?));
+            new.push(Arc::new(make_peer(&identity, &sh.cfg.name, c.clone())?));
         }
+        let mut kept = Vec::new();
         for p in &old {
             if let Some(c) = peers.iter().find(|c| c.same_link(&p.conf)) {
-                let only = c.only.clone();
-                p.only.with(|o| *o = only);
+                let clients = if p.keys() != c.keys {
+                    Some(Arc::new(make_clients(&identity, &c.name, &c.keys)?))
+                } else {
+                    None
+                };
+                kept.push((p.clone(), c.keys.clone(), clients, c.only.clone()));
             }
+        }
+        for (p, keys, clients, only) in kept {
+            p.live.with(|l| {
+                if let Some(clients) = clients {
+                    l.keys = keys;
+                    l.clients = clients;
+                }
+                l.only = only;
+            });
         }
         for p in &gone {
             p.removed.store(true, Ordering::Release);
@@ -251,6 +286,30 @@ impl Server {
         for p in &new {
             self.dial(p)?;
         }
+        Ok(())
+    }
+
+    /// This host's identity made `id` -- the key `cluster rekey` moved it
+    /// to: the TLS server and every peer's clients made anew, showing it,
+    /// for every connection from now on; the connections up keep the key
+    /// they were made with, and nothing is lost. Everything made first, so
+    /// that a failure changes nothing.
+    pub fn use_identity(&self, id: Identity) -> Result<(), String> {
+        let sh = &self.shared;
+        let id = Arc::new(id);
+        let peers: Vec<Arc<Peer>> = sh.peers.with(|v| v.clone());
+        let keys: Vec<Fingerprint> = peers.iter().flat_map(|p| p.keys()).collect();
+        let server = Arc::new(tls_server(&id, &keys)?);
+        let mut clients = Vec::with_capacity(peers.len());
+        for p in &peers {
+            clients.push(Arc::new(make_clients(&id, &p.conf.name, &p.keys())?));
+        }
+        let old_id = sh.identity.with(|i| core::mem::replace(i, id));
+        let old_server = sh.server.with(|s| core::mem::replace(s, server));
+        for (p, c) in peers.iter().zip(clients) {
+            p.live.with(|l| l.clients = c);
+        }
+        drop((old_id, old_server));
         Ok(())
     }
 }

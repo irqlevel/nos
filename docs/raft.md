@@ -192,6 +192,27 @@ request ids it chose and by the client and sequence number of a command.
   applying goes on; the store then compacts the log. A leader's snapshot
   restores the sessions and the state.
 
+## A group of one, by force
+
+`raft::recover::force_alone(store, me)` makes a member's store -- while no
+member runs over it -- the log of a group of `me` alone, for a group whose
+majority is gone for good: a change taking out every other member, voters
+then learners, appended to it one a member, and the log committed to its
+end there and then. The member started again over the store is its group's
+one voter and elects itself. It is unsafe by design, as etcd's
+`--force-new-cluster` is: what the group had committed and this member had
+not is gone, and what this member had appended and the group never
+committed is committed now -- so the members taken out never come back with
+what they hold; the cluster's `recover` removes them from its registry for
+good (docs/cluster.md). A learner, or a member never let in, is refused
+(`NotAVoter`); nothing is written before a refusal.
+
+The scenario `force_alone_after_loss` holds it to all of that: a group of
+three voters and a learner, an entry appended to the third member alone,
+everyone else lost; the third forced alone takes out the other three,
+commits that entry, elects itself and commits on its own -- and two mutants
+(the changes left uncommitted, the learners left in) each fail it.
+
 ## Tested
 
 `scripts/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`

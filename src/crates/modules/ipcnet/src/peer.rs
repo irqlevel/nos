@@ -14,6 +14,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
@@ -22,6 +23,7 @@ use kcore::ipc::{Addr, Bounce, Mailbox, RemoteTo};
 use kcore::sync::Mutex;
 
 use super::files::PeerConf;
+use tls::pinned::Fingerprint;
 
 /// The classes of what goes to a peer, each its own connection: control --
 /// Hello, heartbeats, monitors, Downs, bounces, and every message whose
@@ -130,19 +132,28 @@ pub fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
 }
 
-pub struct Peer {
-    /// Its name, address and keys -- what its connections are made of; what
-    /// it may reach is `only`, its `conf.only` taken from it as it is made.
-    pub conf: PeerConf,
+/// What changes of a peer while it is kept, its connections with it.
+pub struct Live {
+    /// The keys it is pinned by: a connection is taken from it, or made to
+    /// it, with one of them.
+    pub keys: Vec<Fingerprint>,
+    /// The TLS clients this host dials it with, by class -- each offering
+    /// its class's protocol, pinned to `keys`, and showing this host's own
+    /// key: made anew when either changes. A dial takes them as they are.
+    pub clients: Arc<[tls::pinned::Client; CLASSES]>,
     /// The one name of this host's it may reach, by that name alone, while
-    /// it is a host invited and not yet joined; changed in place when hosts.toml's
-    /// changes, with no connection lost.
-    pub only: Locked<Option<String>>,
+    /// it is a host invited and not yet joined.
+    pub only: Option<String>,
+}
+
+pub struct Peer {
+    /// Its name and its address -- what its connections are made of. Its
+    /// keys and what it may reach are `live`'s, taken from it as it is
+    /// made: changed in place when hosts.toml's change, no connection lost.
+    pub conf: PeerConf,
+    pub live: Locked<Live>,
     /// This host dials it: of the two names, this host's sorts first.
     pub dials: bool,
-    /// The TLS clients this host dials it with, by class -- each offering
-    /// its class's protocol, both pinned to the peer's keys.
-    pub clients: [tls::pinned::Client; CLASSES],
     pub st: Locked<State>,
     pub out: [Locked<Out>; CLASSES],
     /// Its number while up, as the router looks it up -- with no lock; the
@@ -165,12 +176,11 @@ pub enum Refusal {
 
 impl Peer {
     pub fn new(mut conf: PeerConf, dials: bool, clients: [tls::pinned::Client; CLASSES]) -> Option<Peer> {
-        let only = conf.only.take();
+        let live = Live { keys: core::mem::take(&mut conf.keys), clients: Arc::new(clients), only: conf.only.take() };
         Some(Peer {
             conf,
-            only: Locked::new(only)?,
+            live: Locked::new(live)?,
             dials,
-            clients,
             st: Locked::new(State { session: 0, attached: [false; CLASSES], number: 0, up_since_ns: 0, said: "new",
                                     monitors: Vec::new() })?,
             out: [Locked::new(Out::new())?, Locked::new(Out::new())?],
@@ -184,10 +194,29 @@ impl Peer {
     /// is one it may send here: anything, for a host of the cluster; a host
     /// invited, its one name, by that name.
     pub fn may_reach(&self, name: Option<&str>) -> bool {
-        self.only.with(|o| match o {
+        self.live.with(|l| match &l.only {
             None => true,
             Some(only) => name == Some(only.as_str()),
         })
+    }
+
+    /// A host invited, which watches nothing here.
+    pub fn invited(&self) -> bool {
+        self.live.with(|l| l.only.is_some())
+    }
+
+    /// Whether `key` is one of the keys it is pinned by now.
+    pub fn pinned(&self, key: &Fingerprint) -> bool {
+        self.live.with(|l| l.keys.contains(key))
+    }
+
+    pub fn keys(&self) -> Vec<Fingerprint> {
+        self.live.with(|l| l.keys.clone())
+    }
+
+    /// The TLS clients to dial it with, as they are now.
+    pub fn clients(&self) -> Arc<[tls::pinned::Client; CLASSES]> {
+        self.live.with(|l| l.clients.clone())
     }
 
     /// A session begun by this host, dialing: only while it has none.

@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::codec::{Reader, Writer};
-use crate::Fingerprint;
+use crate::{Fingerprint, Role};
 
 /// The longest string a command carries: what its length byte counts. A
 /// name is only read here -- whether it is a name is applying's to say, and
@@ -25,6 +25,10 @@ const TAG_INVITE: u8 = 2;
 const TAG_JOIN: u8 = 3;
 const TAG_REMOVE: u8 = 4;
 const TAG_REVOKE: u8 = 5;
+const TAG_MAINTENANCE: u8 = 6;
+const TAG_ADDRESS: u8 = 7;
+const TAG_ADD_KEY: u8 = 8;
+const TAG_DROP_KEY: u8 = 9;
 
 /// A change of the registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +49,19 @@ pub enum Command {
     Remove { now: u64, host: String },
     /// An invitation taken back before it was used.
     Revoke { now: u64, invitation: u64 },
+    /// A host being worked on, or back: what every service of the cluster
+    /// reads alike -- held off counting it out, nothing new placed on it.
+    Maintenance { now: u64, host: String, on: bool },
+    /// A host's address for `role` made `ip` -- a host that moved, or one
+    /// with an address for another role -- or, for a role but `Ipc`, taken
+    /// away with `ip` 0.
+    Address { now: u64, host: String, role: Role, ip: u32 },
+    /// A key added to a host's: the one it moves to, pinned beside the one
+    /// it has until that one is dropped. Two at most.
+    AddKey { now: u64, host: String, key: Fingerprint },
+    /// A key of a host's taken off it -- never its last -- and retired:
+    /// never taken again, by it or by anyone.
+    DropKey { now: u64, host: String, key: Fingerprint },
 }
 
 impl Command {
@@ -55,7 +72,11 @@ impl Command {
             | Command::Invite { now, .. }
             | Command::Join { now, .. }
             | Command::Remove { now, .. }
-            | Command::Revoke { now, .. } => *now,
+            | Command::Revoke { now, .. }
+            | Command::Maintenance { now, .. }
+            | Command::Address { now, .. }
+            | Command::AddKey { now, .. }
+            | Command::DropKey { now, .. } => *now,
         }
     }
 
@@ -97,6 +118,31 @@ impl Command {
                 w.u64(*now);
                 w.u64(*invitation);
             }
+            Command::Maintenance { now, host, on } => {
+                w.u8(TAG_MAINTENANCE);
+                w.u64(*now);
+                w.str(host);
+                w.u8(u8::from(*on));
+            }
+            Command::Address { now, host, role, ip } => {
+                w.u8(TAG_ADDRESS);
+                w.u64(*now);
+                w.str(host);
+                w.u8(role.code());
+                w.u32(*ip);
+            }
+            Command::AddKey { now, host, key } => {
+                w.u8(TAG_ADD_KEY);
+                w.u64(*now);
+                w.str(host);
+                w.fixed(key);
+            }
+            Command::DropKey { now, host, key } => {
+                w.u8(TAG_DROP_KEY);
+                w.u64(*now);
+                w.str(host);
+                w.fixed(key);
+            }
         }
         w.buf
     }
@@ -130,6 +176,23 @@ impl Command {
             TAG_JOIN => Command::Join { now, invitation: r.u64()? },
             TAG_REMOVE => Command::Remove { now, host: String::from(r.str(STR_MAX)?) },
             TAG_REVOKE => Command::Revoke { now, invitation: r.u64()? },
+            TAG_MAINTENANCE => Command::Maintenance {
+                now,
+                host: String::from(r.str(STR_MAX)?),
+                on: match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+            },
+            TAG_ADDRESS => Command::Address {
+                now,
+                host: String::from(r.str(STR_MAX)?),
+                role: Role::from_code(r.u8()?)?,
+                ip: r.u32()?,
+            },
+            TAG_ADD_KEY => Command::AddKey { now, host: String::from(r.str(STR_MAX)?), key: r.fixed()? },
+            TAG_DROP_KEY => Command::DropKey { now, host: String::from(r.str(STR_MAX)?), key: r.fixed()? },
             _ => return None,
         };
         r.done().then_some(cmd)
@@ -171,9 +234,15 @@ pub enum Refusal {
     Full,
     /// The cluster's last host: a cluster is never left with none.
     LastHost,
+    /// A host with two keys already: one is dropped before another comes.
+    KeysFull,
+    /// Not a key of that host's.
+    NotItsKey,
+    /// A host's last key: a host is never left with none.
+    LastKey,
 }
 
-const REFUSALS: [Refusal; 15] = [
+const REFUSALS: [Refusal; 18] = [
     Refusal::Malformed,
     Refusal::NotInitialized,
     Refusal::Initialized,
@@ -189,6 +258,9 @@ const REFUSALS: [Refusal; 15] = [
     Refusal::KeyRemoved,
     Refusal::Full,
     Refusal::LastHost,
+    Refusal::KeysFull,
+    Refusal::NotItsKey,
+    Refusal::LastKey,
 ];
 
 impl Refusal {
@@ -216,15 +288,18 @@ impl Refusal {
             Refusal::InvitationGone => "no such invitation: used, taken back, past its time or never made",
             Refusal::Expired => "its time is up already",
             Refusal::KeyInUse => "a key another host of the cluster has, or an invitation",
-            Refusal::KeyRemoved => "the key of a host removed from the cluster",
+            Refusal::KeyRemoved => "the key of a host removed from the cluster, or one a host dropped",
             Refusal::Full => "as many hosts and invitations as the cluster takes",
             Refusal::LastHost => "the cluster's last host",
+            Refusal::KeysFull => "the host has two keys already: one is dropped before another comes",
+            Refusal::NotItsKey => "not a key of that host's",
+            Refusal::LastKey => "the host's last key",
         }
     }
 }
 
-/// What applying a command gave: done -- with the node of the host it made
-/// or removed, 0 for an invitation's -- or refused.
+/// What applying a command gave: done -- with the node of the host it made,
+/// removed or changed, 0 for an invitation's -- or refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
     Done { node: u64 },
