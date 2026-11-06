@@ -134,6 +134,13 @@ fn is_host(b: &[u8]) -> bool {
         && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
+/// Whether `name` is a host's name as the wire carries one -- a DNS label's
+/// letters, lowercase, digits and dashes, up to `HOST_MAX` of them: the one
+/// rule for hosts.toml, the cluster's registry and the frames alike.
+pub fn valid_host(name: &str) -> bool {
+    is_host(name.as_bytes())
+}
+
 /// What a frame's bytes are read through: each read checked, none past the
 /// end.
 struct Reader<'a> {

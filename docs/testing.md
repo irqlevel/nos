@@ -2756,6 +2756,39 @@ seconds, to:
   it. `RAFT_RSM_STATS=1` prints each run's operations, applied indexes and
   snapshots, and `RAFT_RSM_TRACE=1` what every member does and, for a
   history no register makes, its shortest prefix.
+- **The registry target**, 200 runs of 400 steps: the cluster's registry
+  (`src/crates/registry`, plans/cluster.md) -- raft's first user -- held to
+  a model of its own.
+  - Alone: the registry and the model take the same commands -- init,
+    invitations, joins, removes, revokes, entries that are no command --
+    under a clock that goes on and now and then back. The commands draw on
+    small pools of names, addresses, keys and invitation numbers, so that
+    they meet; on every third seed on wide pools with few removes, so that
+    the cluster fills to its sixteen and has learners. After each one, its
+    answer and everything the registry shows -- its hosts, invitations,
+    removed hosts, voters and every host's peers -- must be the model's.
+  - Its snapshot must read back as itself, and its frozen pieces must be
+    that snapshot. A snapshot changed -- a byte, cut short, more bytes,
+    noise -- must be refused, or read as a state that holds to every rule
+    and reads back as itself. A replica started from a snapshot part way
+    must end as the registry does.
+  - On every fourth seed, a group: the registry through `raft::rsm` on
+    three or five members over a network that loses, doubles, reorders and
+    cuts, and a client with a session retrying of another member after a
+    timeout. Once calm, every member's registry must be the same, and the
+    model's once it takes the commands in the order the log applied them,
+    answering each as the members did.
+
+  `mutants.py`'s six `registry_*` mutants take out:
+  - an invitation's expiry;
+  - the join's use of its invitation;
+  - the refusal of a removed host's key;
+  - nodes never given twice;
+  - the snapshot's check of keys;
+  - the voters' cut at five.
+
+  Each fails the gate and its own scenario. `RAFT_REGISTRY_STATS=1` prints
+  each run's answers by kind and how many hosts it reached.
 - **The hostile target**, 2000 runs of 3000 steps of one member fed what no
   correct member sends -- every kind of message, of terms and indexes about
   its own and of any value, from members and strangers, noise the wire

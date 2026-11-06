@@ -160,7 +160,14 @@ voter answers, and says what it is about to do.
 
 ## Steps
 
-**C1, the registry.** The state machine, `cluster.ko` and its commands,
+**C1, the registry.** Built in parts. C1a, done: the state machine as a
+crate of its own with no kernel in it, `src/crates/registry` -- the state,
+the commands (init, invite, join, remove, revoke) and their answers, every
+command carrying the proposer's clock and every invitation past its time let
+go of at the entry, the snapshot and the rules one read back is held to, the
+voters' policy (the first five to join) -- and `fuzz/raft`'s `registry`
+target with its scenarios and six mutants (docs/testing.md). Then:
+the state machine's module, `cluster.ko` and its commands,
 `hosts.toml` written and `ipc.net` told; ipcnet's join path (the address
 admitted while an invitation is open, the client key taken unpinned for
 `cluster.join` alone, the proof); the `registry` fuzz target, the join cases
