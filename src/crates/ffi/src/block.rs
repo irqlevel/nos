@@ -126,10 +126,13 @@ unsafe extern "C" {
     /// the holder the `name_len` bytes at `name` name, for writing with
     /// `write` not 0: the queue's word, or 0 -- with who is in the way
     /// copied into the `cap` bytes at `refused` and its length into
-    /// *refused_len when that is why (`block/src/devq.rs`).
+    /// *refused_len when that is why (`block/src/devq.rs`). `event`, unless
+    /// 0, is a task's event (kernel_shared_event_open) for the queue to be
+    /// made on -- 0 returned for one that is no event's: its completions and
+    /// wakes signal that event too, which the queue holds until it is closed.
     pub fn kernel_blockq_open(
         device: usize, write: i32, buffers: usize, bytes: usize, name: *const u8, name_len: usize,
-        out: *mut *mut u8, refused: *mut u8, cap: usize, refused_len: *mut usize,
+        out: *mut *mut u8, refused: *mut u8, cap: usize, refused_len: *mut usize, event: u64,
     ) -> usize;
 
     /// Buffer `buffer`'s request -- `len` bytes from byte `offset` of the

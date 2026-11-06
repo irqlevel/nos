@@ -21,17 +21,28 @@
 //! together goes to it in one write. A disk without the asynchronous path
 //! (`Disk::can_submit`) still has its queue and buffers -- its owner reads
 //! and writes them synchronously -- and `start` answers `Unsupported`.
+//!
+//! A queue may be made on the event of a task that waits for this and more
+//! (`events::SharedEvent`, plans/ipc.md I2): its completions and wakes then
+//! signal that event as well as its own. The entry holds the event under a
+//! lock of its own, interrupt-safe, which a completion signals it under and
+//! the queue's drop takes it out under -- so that once the drop has it, no
+//! completion is still in its signal -- and lets go of it after, off the
+//! lock: nothing signals the task's event once it may be freed, and nothing
+//! in the interrupt path takes a count of it, or drops one.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use events::SharedEvent;
 use ffi::block::BlockIo;
 use kcore::block::{SubmitError, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::once::OnceBox;
 use kcore::ring::LocklessRing;
-use kcore::sync::Event;
+use kcore::sync::{Event, IrqSpinLock};
 use kcore::time::{boot_time_ns, Duration};
 use kcore::trace::{self, BioDone, BioSubmit};
 use kcore::klog;
@@ -57,7 +68,32 @@ const DRAIN_GIVE_UP_NS: u64 = 120_000_000_000;
 struct Done {
     /// A completion: its buffer, shifted up one, and a 1 below for a failure.
     ring: LocklessRing,
+    /// The queue's own: what its `wait` sleeps on, and every wait inside its
+    /// calls -- so that a drop from any task never waits on a task's event.
     event: Event,
+    /// The event of the task the queue was made on, while it is open:
+    /// signalled under this lock with `event`, and taken out under it by
+    /// the queue's drop, which lets go of it after (`let_go_of_task_event`).
+    task_event: IrqSpinLock<Option<Arc<SharedEvent>>>,
+    /// Whether `task_event` may hold one: what a completion looks at before
+    /// it takes the lock, so that a queue on no task's event pays a load.
+    on_task_event: AtomicBool,
+}
+
+impl Done {
+    /// The queue's owner woken: its own event, and the task's it was made on.
+    /// From any context.
+    #[inline]
+    fn signal(&self) {
+        self.event.signal();
+        if self.on_task_event.load(Ordering::Acquire) {
+            /* Under the lock: the drop takes it out under the same one, and
+             * so cannot let go of it while this signal is made */
+            if let Some(e) = self.task_event.lock().as_ref() {
+                e.signal();
+            }
+        }
+    }
 }
 
 static DONE: [OnceBox<Done>; QUEUES] = [const { OnceBox::new() }; QUEUES];
@@ -79,7 +115,7 @@ extern "C" fn on_done(ctx: *mut u8, status: i32) {
         /* Never: the ring has room for every I/O the queue can have out. */
         klog!(0, "block: queue {} has no room for a completion: its owner waits for it for good", entry);
     }
-    done.event.signal();
+    done.signal();
 }
 
 /// `bio_done`: queue `entry`'s command on `buffer` done -- `ok`, or not --
@@ -102,12 +138,13 @@ fn context(entry: usize, buffer: usize) -> *mut u8 {
     (((entry + 1) << 32) | buffer) as *mut u8
 }
 
-/// Wakes whoever waits on queue `entry` (`Queue::wait`): from anywhere, with
-/// no lock -- the entry is there for good. An entry no queue has is woken
-/// for nothing.
+/// Wakes whoever waits on queue `entry` (`Queue::wait`) -- and on the event
+/// of the task it was made on: from anywhere, with no lock of the queue's
+/// -- the entry is there for good. An entry no queue has is woken for
+/// nothing.
 pub fn wake(entry: usize) {
     if let Some(done) = DONE.get(entry).and_then(OnceBox::get) {
-        done.event.signal();
+        done.signal();
     }
 }
 
@@ -147,9 +184,11 @@ pub struct Queue {
 
 impl Queue {
     /// `buffers` buffers of `pages` pages each, physically contiguous, and
-    /// asynchronous I/O to `disk` from them where it takes any: None when
+    /// asynchronous I/O to `disk` from them where it takes any -- made on
+    /// `event`, a task's, when one is given: its completions and wakes then
+    /// signal that event too, which it holds until it is dropped. None when
     /// there is no memory for them, or every queue there may be is taken.
-    pub fn new(disk: Option<Disk>, buffers: usize, pages: usize) -> Option<Queue> {
+    pub fn new(disk: Option<Disk>, buffers: usize, pages: usize, event: Option<Arc<SharedEvent>>) -> Option<Queue> {
         let len = pages.checked_mul(PAGE_SIZE)?;
         let entry = take_entry()?;
         let mut queue = Queue { disk, max: 0, entry, bufs: Vec::new(), len, busy: Vec::new(), in_flight: 0 };
@@ -168,6 +207,14 @@ impl Queue {
             if sector != 0 && PAGE_SIZE % sector == 0 {
                 queue.max = disk.submit_max().saturating_sub(PAGE_SIZE) / PAGE_SIZE * PAGE_SIZE;
             }
+        }
+        if let (Some(event), Some(done)) = (event, DONE[entry].get()) {
+            /* Last, once nothing above can fail: none of its I/O is out yet.
+             * The entry's last owner let go of its own (`Drop`), so what is
+             * taken out here is nothing -- and is dropped off the lock. */
+            let before = core::mem::replace(&mut *done.task_event.lock(), Some(event));
+            done.on_task_event.store(true, Ordering::Release);
+            drop(before);
         }
         Some(queue)
     }
@@ -314,12 +361,54 @@ impl Queue {
     }
 
     /// Sleeps until a completion comes, or a `wake`, or `timeout`: whether
-    /// one did.
+    /// one did. The queue's own event, whatever task's it was made on.
     pub fn wait(&self, timeout: Duration) -> bool {
         match DONE[self.entry].get() {
             Some(done) => done.event.wait_for(timeout),
             None => false,
         }
+    }
+
+    /// The event of the task it was made on let go of, from here on not
+    /// signalled: taken out under its lock, so that no completion is in its
+    /// signal once this has it, and dropped after -- off the lock, in task
+    /// context, where the last count of it may free it.
+    fn let_go_of_task_event(&self) {
+        let Some(done) = DONE[self.entry].get() else { return };
+        /* Never set, nothing to let go of: the flag goes up only once the
+         * event is in (`new`), and a queue on none takes no lock here */
+        if !done.on_task_event.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let taken = done.task_event.lock().take();
+        drop(taken);
+    }
+
+    /// A command the boot's test of a queue on a task's event finishes as a
+    /// device would (kernel/src/one_event.rs): buffer `buffer` taken as a
+    /// started command's is, in flight until `reap` gives it back. None for
+    /// a buffer past the queue, or one with I/O in flight.
+    pub fn test_command(&mut self, buffer: usize) -> Option<TestCommand> {
+        if *self.busy.get(buffer)? != 0 || self.in_flight >= IN_FLIGHT_MAX {
+            return None;
+        }
+        self.busy[buffer] += 1;
+        self.in_flight += 1;
+        Some(TestCommand { context: context(self.entry, buffer) as usize })
+    }
+}
+
+/// A command of `Queue::test_command`'s, which `finish` ends as its
+/// device's interrupt would end one: through the queue's own completion.
+pub struct TestCommand {
+    context: usize,
+}
+
+impl TestCommand {
+    /// From any context, an interrupt's included -- once: a second is a
+    /// completion of a buffer with nothing in flight, which `reap` says.
+    pub fn finish(&self, ok: bool) {
+        on_done(self.context as *mut u8, if ok { 0 } else { -1 });
     }
 }
 
@@ -340,10 +429,12 @@ impl Drop for Queue {
                 klog!(0, "block: queue {} gives up on {} I/O its disk never finished: its buffers are kept for \
                            good", self.entry, self.in_flight);
                 /* Kept: the device may write them yet, and the entry may be
-                 * left a completion. */
+                 * left a completion -- which signals nobody's event but the
+                 * entry's own from here on. */
                 for buf in self.bufs.drain(..) {
                     core::mem::forget(buf);
                 }
+                self.let_go_of_task_event();
                 return;
             }
             if waited >= DRAIN_SAY_NS && !said {
@@ -357,6 +448,8 @@ impl Drop for Queue {
         if let Some(done) = DONE[self.entry].get() {
             while done.ring.pop().is_some() {}
         }
+        /* Before the entry is given back: the next owner's event is its own */
+        self.let_go_of_task_event();
         TAKEN[self.entry].store(false, Ordering::Release);
     }
 }
@@ -368,7 +461,12 @@ fn take_entry() -> Option<usize> {
             continue;
         }
         let made = DONE[i].get_or_try_init(|| {
-            Some(alloc::boxed::Box::new(Done { ring: LocklessRing::new(IN_FLIGHT_MAX)?, event: Event::new()? }))
+            Some(alloc::boxed::Box::new(Done {
+                ring: LocklessRing::new(IN_FLIGHT_MAX)?,
+                event: Event::new()?,
+                task_event: IrqSpinLock::new(None),
+                on_task_event: AtomicBool::new(false),
+            }))
         });
         if made.is_none() {
             TAKEN[i].store(false, Ordering::Release);
