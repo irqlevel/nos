@@ -368,6 +368,24 @@ work already published may not look again. `schedule()` saves and restores
 interrupts per task, so a task that blocks with them off comes back with
 them off, and turns them back on itself.
 
+A waker that names its task through what the task waits on -- an `Event`'s
+waiter -- holds a pointer the task may outlive the use of: the wait ends,
+by its deadline or another signal, the task returns and exits, and its
+`Task` is freed under a waker that had read the pointer and not yet
+`unblock()`ed it. So `Event::signal` touches the task only inside a window
+-- counted, interrupts off, the waiter read again inside it -- and every way
+out of a wait (`Event::let_go`) empties the waiter's slot first and then
+waits out whatever signal is still in the window: a few instructions, or a
+panic naming the event after ten seconds. Once `wait()` returns, no signal
+of that event touches its task again -- neither a task freed nor one asleep
+on something else by then. A freed `Task` has its magic written dead, and
+the window holds the task it finds to the live one. The boot self-test
+`test_event_let_go` frees 200 short-lived waiters as they return while
+tasks on the other CPUs signal their event without a pause, each signal
+holding the task it found for 20 us inside the window
+(`Event::signal_holding`): the boot fails unless some of those waits met a
+signal still in the window and waited it out.
+
 A wakeup that is lost is a task asleep for good, which no panic reports.
 The boot self-test `test_wake_storm` makes them in every window the state has:
 a ring of tasks, two a CPU, each pinned to its own, passing one token round

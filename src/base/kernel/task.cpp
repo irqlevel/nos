@@ -62,6 +62,9 @@ Task::~Task()
     BUG_ON(!sched_.entry.is_empty());
     BUG_ON(!sleep_entry_.is_empty());
     klog(TASK_LL, "task 0x%p %s dtor", this, name_);
+    /* An atomic store: a plain one, right before the memory is freed, is one
+       the compiler may drop as dead */
+    __atomic_store_n(&magic_, TASK_DEAD_MAGIC, __ATOMIC_RELAXED);
 }
 
 void Task::release()
