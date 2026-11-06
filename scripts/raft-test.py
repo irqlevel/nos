@@ -42,6 +42,12 @@ into a host program that holds it to:
     changed and the log refusing to open; noise named as the log names its
     files, refused or read as nothing (RAFT_LOG_TRACE=1 prints each step
     and the disk at each cut);
+  - the rsm target: a register through raft::rsm in groups of three or
+    five on the log on disk over the crash disk, a network that fails,
+    members crashed and started again, clients with sessions retrying after
+    timeouts; every client answered once calm, and the history of every
+    operation checked for linearizability (RAFT_RSM_STATS=1 says what each
+    run did);
   - the wire target: messages written and read back, and noise and broken
     messages read without a panic, anything taken written back to its bytes;
   - the hostile target: one member fed messages no correct member sends --
