@@ -139,6 +139,13 @@ impl MemStorage {
         self.chunks.get(at / CHUNK)?.get(at % CHUNK)
     }
 
+    /// Every entry after the snapshot dropped: what a log read back does
+    /// with an entry below its snapshot written after entries past it --
+    /// which replaced them when it was written (`raft::log`).
+    pub(crate) fn drop_entries(&mut self) {
+        self.truncate(self.first_index());
+    }
+
     /// Keeps the entries before `index`, and drops the rest.
     fn truncate(&mut self, index: u64) {
         let first = self.first_index();
