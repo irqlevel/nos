@@ -30,6 +30,10 @@ public:
     static const ulong STACK_MAGIC2 = 0xCBDECBDE;
 
     static const ulong TASK_MAGIC = 0xCBDECBEF;
+    /* What a task's magic is once it is destroyed: a task looked at after it
+       is gone -- by whatever kept a pointer to it, such as a signal() of an
+       event it waited on -- says so while its memory is not yet another's */
+    static const ulong TASK_DEAD_MAGIC = 0xDEADCBEF;
 
     struct Stack final
     {

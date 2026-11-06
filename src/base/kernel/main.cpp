@@ -682,6 +682,12 @@ void bp_startup(void* ctx)
             return;
         }
 
+        if (!test::test_event_let_go())
+        {
+            PANIC("Event let go test failed");
+            return;
+        }
+
         if (!test::test_idle_takes_turns())
         {
             PANIC("Idle task turn test failed");

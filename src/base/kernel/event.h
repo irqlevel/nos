@@ -1,6 +1,7 @@
 #pragma once
 
 #include "atomic.h"
+#include <include/const.h>
 
 namespace kernel
 {
@@ -25,7 +26,16 @@ namespace kernel
 
    The IPI goes to the CPU the waiter blocked on. A waiter free to move may
    be moved as it blocks, and is then woken at its new CPU's next scheduling
-   point instead: pin a waiter whose wakeups have to be prompt. */
+   point instead: pin a waiter whose wakeups have to be prompt.
+
+   What signal() does to the waiting task it does inside a window: counted
+   (signallers_), with interrupts off, and the waiter looked at again inside
+   it. A wait() lets go of its task only once no signal() is left in the
+   window (let_go), so the task it returns to may exit and be freed, or block
+   on something else, at once: no signal() of this event touches it again.
+   Before, one that had read the waiter as its wait ended went on to unblock
+   the task after it had exited -- a task freed, or one by then asleep on
+   something else. */
 class Event final
 {
 public:
@@ -61,10 +71,23 @@ public:
 
     /* Any context. A signaller is done with the event only when signal()
        returns -- the waiter having taken the signal says nothing about that
-       -- so the event, and the waiting task, must outlive every signal()
-       that may still be running: whoever frees them has to know that no
-       signaller is left, not merely that the waiter woke. */
+       -- so the event must outlive every signal() that may still be running:
+       whoever frees it has to know that no signaller is left, not merely
+       that the waiter woke. The waiting task need not: its wait() returns
+       only once no signal() may touch it (let_go). */
     void signal();
+
+    /* signal(), holding the waiter it found for hold_ns inside its window --
+       interrupts off -- before it touches it: what the boot's test widens
+       the window with, so that a wait() letting go of its task meets a
+       signal() still in it at every boot (test_event_let_go). Nothing else
+       is to call it. */
+    void signal_holding(ulong hold_ns);
+
+    /* The waits that, letting go of their task, met a signal() still inside
+       its window and waited it out: what that test holds to having
+       happened. */
+    static ulong let_go_waits();
 
 private:
     Event(const Event& other) = delete;
@@ -72,9 +95,22 @@ private:
     Event& operator=(const Event& other) = delete;
     Event& operator=(Event&& other) = delete;
 
+    /* The waiter's slot emptied, and its wait() done with its task once no
+       signal() is left in its window -- every way out of a wait() */
+    void let_go();
+
+    /* A signal() in its window that has not left it after this long is one
+       wedged with its interrupts off: said, not waited for */
+    static constexpr ulong LET_GO_STUCK_NS = 10 * consts::NANO_SECS_IN_SEC;
+    /* How many turns of the spin between two looks at the clock */
+    static constexpr ulong LET_GO_CLOCK_EVERY = 1024;
+
     Atomic signaled_;
     Atomic waiter_;      /* the Task in wait(), 0 when none is */
     Atomic waiter_cpu_;
+    /* signal()s inside their window: from before their look at waiter_ to
+       after their last touch of the task it named */
+    Atomic signallers_;
 };
 
 }
