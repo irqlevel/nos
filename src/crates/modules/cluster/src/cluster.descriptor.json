@@ -1,0 +1,157 @@
+{
+  "schema": 1,
+  "provider": "cluster",
+  "title": {"en": "Cluster", "ru": "Кластер"},
+  "help": {
+    "en": "The cluster's registry as this host's member has it: the hosts, their keys and addresses, and the invitations open.",
+    "ru": "Реестр кластера, каким его видит участник на этом хосте: хосты, их ключи и адреса, открытые приглашения."
+  },
+  "ui": {"section": "system", "order": 18, "icon": "server"},
+  "methods": {
+    "status": {
+      "kind": "read",
+      "title": {"en": "Member", "ru": "Участник"},
+      "help": {
+        "en": "This host's member of the registry: its node, its role, the leader it follows and how far it has applied.",
+        "ru": "Участник реестра на этом хосте: его узел, роль, лидер, за которым он идёт, и докуда он применил журнал."
+      }
+    },
+    "hosts": {
+      "kind": "read",
+      "title": {"en": "Hosts", "ru": "Хосты"}
+    },
+    "invite": {
+      "kind": "action",
+      "title": {"en": "Invite a host", "ru": "Пригласить хост"},
+      "help": {
+        "en": "A token for the host to join with, shown this once: `cluster join` takes it there, within 15 minutes.",
+        "ru": "Токен, с которым хост войдёт в кластер; показывается один раз: его принимает `cluster join` на том хосте, в течение 15 минут."
+      },
+      "params": {
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}},
+        "ip": {"type": "ipv4", "required": true, "title": {"en": "Its address", "ru": "Его адрес"}},
+        "key": {
+          "type": "string",
+          "required": true,
+          "title": {"en": "Its key", "ru": "Его ключ"},
+          "help": {
+            "en": "64 hex digits, as `ipcnet id` says them on the host invited.",
+            "ru": "64 шестнадцатеричные цифры, как их выводит `ipcnet id` на приглашаемом хосте."
+          }
+        }
+      }
+    },
+    "revoke": {
+      "kind": "action",
+      "title": {"en": "Take back", "ru": "Отозвать"},
+      "confirm": {
+        "en": "The invitation is taken back: its token is good for nothing from now on.",
+        "ru": "Приглашение будет отозвано: его токен больше ни на что не годится."
+      },
+      "params": {
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}
+      }
+    },
+    "remove": {
+      "kind": "action",
+      "title": {"en": "Remove", "ru": "Удалить"},
+      "confirm": {
+        "en": "The host leaves the cluster for good: its key is refused everywhere from now on, and it comes back only installed anew and invited again. Type its name to go on.",
+        "ru": "Хост навсегда покинет кластер: его ключ отныне везде отвергается, а вернуться он сможет, только если его переустановить и пригласить заново. Введите его имя, чтобы продолжить."
+      },
+      "confirm_typed": "host",
+      "params": {
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}}
+      }
+    },
+    "maintenance": {
+      "kind": "action",
+      "title": {"en": "Maintenance", "ru": "Обслуживание"},
+      "help": {
+        "en": "A host being worked on, as every service of the cluster reads it: held off counting it out, nothing new placed on it.",
+        "ru": "Хост на обслуживании, как это видит каждый сервис кластера: его не списывают со счетов и ничего нового на нём не размещают."
+      },
+      "params": {
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}},
+        "on": {"type": "bool", "required": true, "title": {"en": "Being worked on", "ru": "На обслуживании"}}
+      }
+    },
+    "address": {
+      "kind": "action",
+      "title": {"en": "Set an address", "ru": "Задать адрес"},
+      "help": {
+        "en": "A host's address for a role: the one the other hosts call it at, the one networks of VMs tunnel through, or the one the world reaches it at. With no address, a role's but the first is taken away.",
+        "ru": "Адрес хоста для одной из ролей: по нему хост вызывают другие хосты, через него идут туннели сетей машин или по нему хост доступен снаружи. Без адреса адрес роли снимается — у всех ролей, кроме первой."
+      },
+      "params": {
+        "host": {"type": "string", "required": true, "title": {"en": "Host", "ru": "Хост"}},
+        "role": {
+          "type": "enum",
+          "required": true,
+          "title": {"en": "Role", "ru": "Роль"},
+          "values": {
+            "ipc": {"en": "the other hosts call it", "ru": "по нему вызывают другие хосты"},
+            "underlay": {"en": "networks of VMs tunnel through", "ru": "туннели сетей машин"},
+            "public": {"en": "the world reaches it", "ru": "доступен снаружи"}
+          }
+        },
+        "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}}
+      }
+    },
+    "rekey": {
+      "kind": "action",
+      "title": {"en": "New key", "ru": "Новый ключ"},
+      "confirm": {
+        "en": "This host moves to a new key: the other hosts pin it, then the old one is refused for good. No connection is lost.",
+        "ru": "Этот хост перейдёт на новый ключ: другие хосты закрепят его, после чего старый будет навсегда отвергаться. Ни одно соединение не потеряется."
+      }
+    }
+  },
+  "resources": {
+    "hosts": {
+      "title": {"en": "Hosts", "ru": "Хосты"},
+      "list": "hosts",
+      "items": "hosts",
+      "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "node": {"type": "int", "title": {"en": "Node", "ru": "Узел"}},
+        "vote": {
+          "type": "enum",
+          "title": {"en": "Vote", "ru": "Голос"},
+          "values": {
+            "voter": {"en": "votes", "ru": "голосует"},
+            "learner": {"en": "learns", "ru": "учится"},
+            "joining": {"en": "joining", "ru": "входит"}
+          }
+        },
+        "leader": {"type": "bool", "title": {"en": "Leads", "ru": "Лидер"}},
+        "ip": {"type": "ipv4", "title": {"en": "Address", "ru": "Адрес"}},
+        "underlay": {"type": "ipv4", "title": {"en": "Underlay", "ru": "Подложка"}},
+        "public": {"type": "ipv4", "title": {"en": "Public address", "ru": "Внешний адрес"}},
+        "maintenance": {"type": "bool", "title": {"en": "Maintenance", "ru": "Обслуживание"}},
+        "key": {"type": "string", "title": {"en": "Key", "ru": "Ключ"}},
+        "moving_to": {"type": "string", "title": {"en": "Moving to key", "ru": "Переходит на ключ"}}
+      },
+      "columns": ["name", "node", "vote", "leader", "ip", "maintenance", "key"],
+      "actions": [
+        {"method": "remove", "params": {"host": "$name"}}
+      ]
+    },
+    "invitations": {
+      "title": {"en": "Invitations", "ru": "Приглашения"},
+      "list": "hosts",
+      "items": "invitations",
+      "key": "host",
+      "fields": {
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "ip": {"type": "ipv4", "title": {"en": "From", "ru": "Откуда"}},
+        "expires_s": {"type": "time_s", "title": {"en": "Until", "ru": "До"}}
+      },
+      "columns": ["host", "ip", "expires_s"],
+      "actions": [
+        {"method": "revoke", "params": {"host": "$host"}}
+      ]
+    }
+  }
+}

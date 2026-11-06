@@ -64,10 +64,11 @@ cluster invite <host> <ip> <key>   on a member: prints a token, once -- <key> is
 cluster join <token>            on the new host
 cluster hosts                   every host: address, key, roles, connected or not
 cluster remove <host>           out, for good: its key refused everywhere
+cluster revoke <host>           its open invitation taken back
 cluster maintenance <host> on|off   a host about to be rebooted or worked on
 cluster rekey                   on a host: a new key, without losing a connection
-cluster address <host> <role> <ip>   a host that moved, or a new address of one
-cluster recover                 on the last host standing (below)
+cluster address <host> <role> <ip|none>   a host that moved, or a new address of one
+cluster recover [<cluster>]     on the last host standing (below): what it does, then -- the name given -- does it
 ```
 
 A `cluster` provider on the bus, so that the panel lists the hosts and an
@@ -181,8 +182,11 @@ voter answers, and says what it is about to do.
   - a host rebooted, starting from its folder and its `hosts.toml`;
   - the leader of two removed, the lead handed on first, its key refused
     when invited again.
-  To come with C2: a rekey with no connection lost, every host rebooted,
-  two of three killed and `cluster recover` on the last.
+  And, with C2: the provider through the bus; maintenance and an address
+  seen by every host; a rekey under 6000 pings with every one answered and
+  no connection lost, the old key refused after; every host rebooted at
+  once; two of three killed and `cluster recover` on the last -- refused
+  while the majority answered -- and a host installed anew joined after.
 
 ## Steps
 
@@ -201,8 +205,20 @@ alone writes hosts.toml. C1c: the join, with the joiner's key given at the
 invitation (above), and the channel's word on which host a message came
 from, `kernel_ipc_peer_name`. C1d: `cluster-test.py`, docs/cluster.md.
 
-**C2, the rest.** `rekey`, `address`, `maintenance` and `recover`; the
-provider and the panel's page.
+**C2, the rest.** Done. The registry's `Maintenance`, `Address`, `AddKey`
+and `DropKey` -- a key dropped retired for good, as a removed host's is --
+with the registry target's model, three scenarios and three mutants;
+`raft::recover::force_alone` and its scenario and two mutants; ipcnet's
+peers changed in place by their keys, its own key staged and switched
+(`tls/identity.pem`, `tls/next.pem`, `TAG_KEY_STAGE`, `TAG_KEY_USE`);
+`cluster maintenance`, `address`, `revoke`, `rekey` and `recover`; the
+`cluster` provider and its descriptor, which the panel builds its page of.
+As built, `recover` also removes every other host from the registry --
+their keys refused for good -- since what it forced may differ from what
+they hold (docs/cluster.md, "When the majority is gone"); and a rekey keeps
+every connection, those made with the old key going on until they end: a
+rotation, not a revocation, a key thought stolen being answered by
+`cluster remove`.
 
 ## Limits
 

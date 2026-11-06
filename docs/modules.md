@@ -689,8 +689,10 @@ prints what it said; the numbers above are the AX41's, under KVM
 mailbox on another host of the cluster an address here and `name@host` a
 name. Its folder is /etc/ipc (`insmod /lib/modules/ipcnet.ko conf=` names
 another): `hosts.toml` -- this host's name, the cluster's id, its peers, each
-pinned by its key -- and `tls/key.pem` and `tls/cert.pem`, made at the first
-start.
+pinned by its key -- and `tls/identity.pem`, its key and certificate in one
+file, made at the first start (`tls/key.pem` and `tls/cert.pem`, as openssl
+makes them, are read where there is none), and `tls/next.pem` while a key
+is staged for a rekey.
 
 ```
 $ insmod /ipcnet.ko
@@ -707,8 +709,10 @@ $ ipc ping kernel.echo@b count=100
     ipcnet [start | stop | id | init <name> [cluster=<hex>] | add <name> <ip> <key> [<key>] | remove <name>]
 
 `add` and `remove` change a running server too: a peer taken off is lost
-and its connections closed; one whose address or key changed is lost and
-dialed again. `scripts/ipc-test.py` runs three of them on a LAN of
+and its connections closed; one whose address changed is lost and dialed
+again; one whose keys changed keeps its connections -- each made with a key
+it had -- and the next is made with a key it has now (to cut a key's
+connections at once, `remove` the peer). `scripts/ipc-test.py` runs three of them on a LAN of
 `scripts/hub.py`'s.
 
 A host of a cluster has its peers from the cluster's registry instead
@@ -736,7 +740,12 @@ $ cluster hosts
 $ cluster remove b
 ```
 
-    cluster [init <name> | invite <host> <ip> <key> | join <token> | hosts | remove <host>]
+    cluster [init <name> | invite <host> <ip> <key> | join <token> | hosts | remove <host> | revoke <host>
+             | maintenance <host> on|off | address <host> <ipc|underlay|public> <ip|none> | rekey
+             | recover [<cluster>]]
+
+It is on the management bus as the `cluster` provider too, whose
+descriptor the panel builds the cluster's page of.
 
 `scripts/cluster-test.py` makes a cluster of three on `scripts/hub.py`'s
 LAN.

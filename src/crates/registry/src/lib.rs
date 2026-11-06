@@ -14,7 +14,8 @@
 //!   while a key changes), its addresses by what each is for (the one
 //!   ipcnet calls first), its labels and whether it is being worked on;
 //! - the hosts removed, kept so that a removed key and a removed node are
-//!   never taken again, whatever an old copy of the list says;
+//!   never taken again, whatever an old copy of the list says; and the keys
+//!   hosts have dropped as they moved to new ones, retired as for good;
 //! - the invitations open: a host's name, the address it will come from,
 //!   the key it will come with -- which every member's ipcnet pins from the
 //!   invitation on, so that a host joining never meets a member that takes
@@ -59,6 +60,9 @@ pub const HOSTS_MAX: usize = 16;
 pub const REMOVED_MAX: usize = 1024;
 /// Keys a host may be pinned by: its own, and the one it moves to.
 pub const KEYS_MAX: usize = 2;
+/// Keys dropped the registry keeps: past this, a drop is refused rather
+/// than a retired key forgotten.
+pub const RETIRED_MAX: usize = 1024;
 /// Labels a host has, and the longest.
 pub const LABELS_MAX: usize = 8;
 pub const LABEL_MAX: usize = 32;
@@ -71,7 +75,7 @@ pub const VOTERS_MAX: usize = 5;
 pub const SNAPSHOT_MAX: u64 = 256 * 1024;
 
 /// What a snapshot of the state begins with.
-const MAGIC: &[u8; 4] = b"REG1";
+const MAGIC: &[u8; 4] = b"REG2";
 
 /// The cluster: made once, by its first host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +100,7 @@ pub enum Role {
 const ROLES: [Role; 3] = [Role::Ipc, Role::Underlay, Role::Public];
 
 impl Role {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Role::Ipc => 1,
             Role::Underlay => 2,
@@ -104,8 +108,13 @@ impl Role {
         }
     }
 
-    fn from_code(code: u8) -> Option<Role> {
+    pub(crate) fn from_code(code: u8) -> Option<Role> {
         ROLES.iter().copied().find(|r| r.code() == code)
+    }
+
+    /// The role a word names, as the shell and the bus have them.
+    pub fn from_name(name: &str) -> Option<Role> {
+        ROLES.iter().copied().find(|r| r.name() == name)
     }
 
     pub fn name(self) -> &'static str {
@@ -159,6 +168,15 @@ pub struct Removed {
     pub removed: u64,
 }
 
+/// A key a host dropped as it moved to another: never taken again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retired {
+    pub key: Fingerprint,
+    /// The node of the host it was.
+    pub node: u64,
+    pub retired: u64,
+}
+
 /// An invitation open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invitation {
@@ -189,6 +207,8 @@ pub struct State {
     removed: Vec<Removed>,
     /// In the order they were made.
     invitations: Vec<Invitation>,
+    /// In the order they were dropped.
+    retired: Vec<Retired>,
     /// The node the next host joining gets: 0 before the cluster is made.
     next_node: u64,
 }
@@ -234,9 +254,14 @@ impl State {
         &self.removed
     }
 
-    /// Whether `key` is a removed host's: never taken again.
+    /// Whether `key` is a removed host's, or one a host dropped: never
+    /// taken again.
     pub fn key_removed(&self, key: &Fingerprint) -> bool {
-        self.removed.iter().any(|r| r.keys.contains(key))
+        self.removed.iter().any(|r| r.keys.contains(key)) || self.retired.iter().any(|r| r.key == *key)
+    }
+
+    pub fn retired(&self) -> &[Retired] {
+        &self.retired
     }
 
     pub fn invitations(&self) -> &[Invitation] {
@@ -401,6 +426,70 @@ impl State {
                 self.invitations.remove(at);
                 Ok(0)
             }
+            /* Each of these asked again answers as it did: what it asks for
+               is already so */
+            Command::Maintenance { host, on, .. } => {
+                let h = self.hosts.iter_mut().find(|h| h.name == *host).ok_or(Refusal::NoSuchHost)?;
+                h.maintenance = *on;
+                Ok(h.node)
+            }
+            Command::Address { host, role, ip, .. } => {
+                let at = self.hosts.iter().position(|h| h.name == *host).ok_or(Refusal::NoSuchHost)?;
+                if *ip == 0 && *role == Role::Ipc {
+                    return Err(Refusal::BadAddress);
+                }
+                let taken = self.hosts.iter().enumerate().any(|(i, h)| i != at && h.addrs.iter().any(|a| a.ip == *ip))
+                    || self.invitations.iter().any(|i| i.ip == *ip);
+                if *ip != 0 && taken {
+                    return Err(Refusal::AddressInUse);
+                }
+                let h = &mut self.hosts[at];
+                h.addrs.retain(|a| a.role != *role);
+                if *ip != 0 {
+                    h.addrs.push(Addr { role: *role, ip: *ip });
+                }
+                /* The ipc address first, the rest by role */
+                h.addrs.sort_by_key(|a| a.role);
+                Ok(h.node)
+            }
+            Command::AddKey { host, key, .. } => {
+                let at = self.hosts.iter().position(|h| h.name == *host).ok_or(Refusal::NoSuchHost)?;
+                if self.hosts[at].keys.contains(key) {
+                    return Ok(self.hosts[at].node);
+                }
+                if self.key_in_use(key) {
+                    return Err(Refusal::KeyInUse);
+                }
+                if self.key_removed(key) {
+                    return Err(Refusal::KeyRemoved);
+                }
+                let h = &mut self.hosts[at];
+                if h.keys.len() >= KEYS_MAX {
+                    return Err(Refusal::KeysFull);
+                }
+                h.keys.push(*key);
+                Ok(h.node)
+            }
+            Command::DropKey { now, host, key } => {
+                let at = self.hosts.iter().position(|h| h.name == *host).ok_or(Refusal::NoSuchHost)?;
+                let node = self.hosts[at].node;
+                if !self.hosts[at].keys.contains(key) {
+                    return if self.retired.iter().any(|r| r.key == *key && r.node == node) {
+                        Ok(node)
+                    } else {
+                        Err(Refusal::NotItsKey)
+                    };
+                }
+                if self.hosts[at].keys.len() == 1 {
+                    return Err(Refusal::LastKey);
+                }
+                if self.retired.len() >= RETIRED_MAX {
+                    return Err(Refusal::Full);
+                }
+                self.hosts[at].keys.retain(|k| k != key);
+                self.retired.push(Retired { key: *key, node, retired: *now });
+                Ok(node)
+            }
         }
     }
 
@@ -458,6 +547,12 @@ impl State {
             w.fixed(&i.key);
             w.fixed(&i.secret_hash);
             w.u64(i.expires);
+        }
+        w.u32(self.retired.len() as u32);
+        for r in &self.retired {
+            w.fixed(&r.key);
+            w.u64(r.node);
+            w.u64(r.retired);
         }
         w.buf
     }
@@ -521,6 +616,16 @@ impl State {
             }
             s.invitations.push(Invitation { id, host: String::from(host), ip, key, secret_hash, expires });
         }
+        let retired = r.u32().ok_or(bad)? as usize;
+        if retired > RETIRED_MAX {
+            return Err(RestoreError("more keys retired than are kept"));
+        }
+        for _ in 0..retired {
+            let key = r.fixed().ok_or(bad)?;
+            let node = r.u64().ok_or(bad)?;
+            let at = r.u64().ok_or(bad)?;
+            s.retired.push(Retired { key, node, retired: at });
+        }
         if !r.done() {
             return Err(RestoreError("bytes past the registry's state"));
         }
@@ -533,7 +638,7 @@ impl State {
     fn check(&self) -> Result<(), RestoreError> {
         if self.cluster.is_none() {
             return if self.hosts.is_empty() && self.removed.is_empty() && self.invitations.is_empty()
-                && self.next_node == 0
+                && self.retired.is_empty() && self.next_node == 0
             {
                 Ok(())
             } else {
@@ -580,7 +685,17 @@ impl State {
                 return Err(RestoreError("an invitation twice, or of a key in use or removed"));
             }
         }
-        /* Keys: each host's its own, none a removed host's */
+        /* Retired keys: each once, a node's that was, never a removed
+           host's -- what a host still has, or an invitation, the loop below
+           refuses */
+        for (i, r) in self.retired.iter().enumerate() {
+            if self.retired[..i].iter().any(|o| o.key == r.key) || r.node == 0 || r.node >= self.next_node
+                || self.removed.iter().any(|x| x.keys.contains(&r.key))
+            {
+                return Err(RestoreError("a key retired twice, of no node, or a removed host's"));
+            }
+        }
+        /* Keys: each host's its own, none a removed host's nor retired */
         for (i, h) in self.hosts.iter().enumerate() {
             for k in &h.keys {
                 let twice = self.hosts[..i].iter().any(|o| o.keys.contains(k))
@@ -684,7 +799,8 @@ impl StateMachine for State {
     fn size(&self) -> u64 {
         /* The state is small: its bytes counted roughly -- a host's, a
            removed host's and an invitation's at their most */
-        (self.hosts.len() * 512 + self.removed.len() * 160 + self.invitations.len() * 128 + 128) as u64
+        (self.hosts.len() * 512 + self.removed.len() * 160 + self.invitations.len() * 128 + self.retired.len() * 48
+         + 128) as u64
     }
 
     fn freeze(&self) -> FrozenState {

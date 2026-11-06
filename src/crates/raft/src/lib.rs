@@ -62,6 +62,7 @@ mod rand;
 pub mod crc32c;
 pub mod log;
 pub mod node;
+pub mod recover;
 pub mod rsm;
 pub mod storage;
 pub mod types;
