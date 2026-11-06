@@ -37,7 +37,10 @@
 //! bytes and takes it back, checking everything; [`storage`] is what a node
 //! keeps durable, with a storage in memory for tests and small groups; and
 //! [`log`] keeps it on a disk, in files of a directory the user hands it --
-//! read back after a crash as the member left it, a torn tail cut.
+//! read back after a crash as the member left it, a torn tail cut. [`rsm`]
+//! is what every user of it needs on top: a replicated state machine over
+//! a node, a store and the user's state, with clients' sessions, reads and
+//! snapshots taken as the log grows.
 //!
 //! `no_std` with `alloc`, no `unsafe`, no dependency, and no allocation
 //! larger than the 512 KiB the kernel's heap gives at once, however long the
@@ -59,6 +62,7 @@ mod rand;
 pub mod crc32c;
 pub mod log;
 pub mod node;
+pub mod rsm;
 pub mod storage;
 pub mod types;
 pub mod wire;
@@ -66,5 +70,6 @@ pub mod wire;
 pub use conf::{ChangeError, MAX_MEMBERS};
 pub use node::{Config, Error, Ready, RawNode, ReadState, Refusal, Role, SoftState, Stats};
 pub use log::{DiskLog, FileError, Files, LogConfig, LogError};
+pub use rsm::{Event, Frozen, LogStore, Output, RestoreError, Rsm, RsmError, SnapshotReader, StateMachine, StoreError};
 pub use storage::{MemStorage, RaftState, Storage, StorageError};
 pub use types::*;
