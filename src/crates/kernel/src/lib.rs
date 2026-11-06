@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod frames;
+mod one_event;
 mod ring;
 mod sha256;
 mod system;
@@ -133,6 +134,9 @@ pub extern "C" fn rust_test() {
     hello::test();
     mgmt::selftest();
     ipc::selftest();
+    /* A mailbox and a block queue on one task's event: once there are tasks
+       and other CPUs to wake it from */
+    one_event::selftest();
     /* Every layer has registered its provider by now: each read of each
        answered, as JSON */
     system::selftest();

@@ -75,6 +75,56 @@ the router hands on from a peer (`deliver_remote`) goes in pieces too. A
 module's `send` is still of one buffer: a module sends at most what its heap
 holds in one block.
 
+## One event to wait on
+
+A task that waits for several things -- a mailbox's requests and a device's
+completions, say: NBS's chunk server -- sleeps on one event they all signal
+(plans/ipc.md, I2). The event is the task's; a mailbox, a device's queue and
+an image's queue are made on it, and whatever comes to one of them signals
+it:
+
+```rust
+let event = events::SharedEvent::new()?;                      // in the image: an Arc
+let mb = ipc::Mailbox::new_on(ipc::DEFAULT_LIMITS, &event)?;
+let q = block::queue::Queue::new(Some(disk), 8, 64, Some(event.clone()))?;
+
+// in a module (kcore::events::SharedEvent, a handle the kernel looks up)
+let event = SharedEvent::new().ok_or(Error::NoMemory)?;
+let mb = Mailbox::new_on(Limits::DEFAULT, &event)?;
+let q = disk.into_queue_on(&event, true, "nbs-cs", 8, 1 << 20)?;  // Image::into_queue_on too
+loop {
+    while let Some(msg) = mb.try_recv() { /* a request */ }
+    q.reap(|buffer, ok| { /* a completion */ });
+    event.wait_for(Duration::from_secs(1));
+}
+```
+
+- **Counted, so never signalled once freed.** The event is held by its task
+  and by every object made on it -- an `Arc` in the image; for a module, a
+  handle of the `events` crate's table, which holds its own count until the
+  handle is closed -- and freed with the last of them, whoever that is: the
+  task may let go first, and the objects go on signalling an event that is
+  still there. A queue's completions come in its device's interrupt, through
+  an entry that lives for good and may be late: the entry keeps the task's
+  event in a lock of its own, interrupt-safe, a completion signals it under
+  that lock and the queue's close takes it out under it, so once the close
+  has it no completion is still in its signal; it is let go of -- perhaps
+  freed -- after, off the lock, in task context.
+- **One waiter.** A wait holds the event (`SharedEvent::hold`) for as long
+  as it sleeps: a second task waiting on it, or waiting in a receive from a
+  mailbox made on it, is refused and said. A receive that finds its message,
+  or does not wait, holds nothing -- so a task may look at its mailbox while
+  another sleeps on the event.
+- **Look first, then wait.** A queue made on an event signals both its own
+  and the task's; its `wait`, `poll` and the waits inside its calls (a drain,
+  its close) stay on its own. A mailbox's receive on a task's event ends at
+  the event's first signal, with one more look: what woke it may have been
+  another of the task's things. So a task on one event looks at every
+  source before each wait -- a signal one of them took is never a wakeup
+  lost.
+- A handle that is no event's -- closed, or never one -- is refused by
+  everything that takes one: a mailbox's, a queue's open, a wait.
+
 From the shell:
 
 ```
@@ -119,14 +169,26 @@ ipc ping <to> [count=N] [bytes=B] [window=W] [bulk] [timeout=MS]
   calling it with payloads up to 200 KB, its names, a `Down`, a full mailbox;
   one mailbox left open on purpose, which the sweep after the unload must
   close; and the unload done under the echo's traffic, which must see its
-  `Down` -- the host's queues empty after.
+  `Down` -- the host's queues empty after. And one event to wait on:
+  `one_event::selftest` in `rust_test` (a mailbox and a block queue made on
+  one event, a task asleep on it woken by a message, by a completion made
+  in another CPU's interrupt through the queue's own completion path, and
+  by a wake; a second waiter refused; the task and the event's owner
+  letting go first, the two keeping it; the event freed with the last of
+  them), and modtest's side of it first in `modtest ipc` (a mailbox and a
+  device's queue on a module's event, through the C ABI).
 - **`scripts/ipc-fuzz.py`** (host, in CI): the crate as it is over the
   fuzzers' common machine, against a model of its own -- every answer, every
   queue in order, every count, the `Down`s and the names; mailboxes of the
   image's and of made-up modules, receivers asleep until a message, a wake or
   a close, modules unloaded with mailboxes open, the halt. Ten mutants of the
   crate -- a `Down` lost, a byte count forgotten, a namespace not held, a
-  generation not bumped, among them -- each fail its gate.
+  generation not bumped, among them -- each fail its gate. And events:
+  mailboxes made on the image's and on modules' (by handle, live and stale),
+  a task asleep on one woken by a message to a mailbox on it, a wake, a
+  close, a signal, and its holder letting go first -- by nothing else -- a
+  second waiter refused at once, and every event there exactly while its
+  holder or a mailbox on it is (`events::live` held to the model).
 - `cpp-fuzz.py --target module` holds `ModuleTable::name_at` -- what the
   channel knows a module by -- to the module's name inside its image and
   nothing outside.
@@ -284,7 +346,9 @@ in, a stranger's SYNs dropped, and `rmmod ipcnet` under traffic.
 - A module sends a message of one buffer, so of at most what one block of
   its heap holds (512 KiB): a send in pieces comes when a module needs one
   (NBS's data).
-- One receiver a mailbox: a second task waiting on the same one is refused
-  and said.
+- One receiver a mailbox: a second task waiting on the same one -- or on the
+  event it was made on -- is refused and said.
+- A module's events are not swept at its unload, as its mailboxes are: one
+  it leaves open keeps its slot of the table, 256 of them, until the reboot.
 - Every send takes the table's lock once to find its mailbox: one lock for
   the whole host, held for a lookup.

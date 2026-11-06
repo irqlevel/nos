@@ -128,8 +128,11 @@ unsafe extern "C" {
        emptied once it is reaped, and kept off in between. Every call but
        the wake from one task. */
     /// `buffers` buffers of `bytes` each, a whole number of pages, at most
-    /// `IMAGE_QUEUE_MAX`, their addresses into `out`: 0, or -1.
-    pub fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8) -> i32;
+    /// `IMAGE_QUEUE_MAX`, their addresses into `out`: 0, or -1. `event`,
+    /// unless 0, is a task's event (kernel_shared_event_open) for the queue
+    /// to be made on -- -1 for one that is no event's: its completions and
+    /// wakes signal that event too, which the queue holds while it is open.
+    pub fn kernel_image_queue(image: usize, buffers: usize, bytes: usize, out: *mut *mut u8, event: u64) -> i32;
     /// Buffer `buffer`'s request -- `len` bytes from `offset` read into it,
     /// or with `write` not 0 written from it: 1 while it is with the device
     /// (`kernel_image_reap` gives it back), 0 done now, -1 done and failed.

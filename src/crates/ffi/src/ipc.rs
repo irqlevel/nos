@@ -122,10 +122,14 @@ pub const IPC_PIECES_MAX: usize = 1024;
 unsafe extern "C" {
     /// A mailbox, held to `messages` and `bytes` queued: its address, or 0
     /// when refused -- limits past what a mailbox takes, the module's
-    /// mailboxes at their bytes, every slot taken, the halt. `owner` is an
-    /// address in the caller's own code: the module whose image holds it
-    /// owns the mailbox, and its names are under that module's namespace.
-    pub safe fn kernel_ipc_open(owner: usize, messages: u32, bytes: u64) -> u64;
+    /// mailboxes at their bytes, every slot taken, the halt, an `event` that
+    /// is no event's. `owner` is an address in the caller's own code: the
+    /// module whose image holds it owns the mailbox, and its names are under
+    /// that module's namespace. `event`, unless 0, is a task's event
+    /// (kernel_shared_event_open) for the mailbox to be made on: whatever
+    /// comes to it signals that event, which the mailbox holds for as long
+    /// as it is open, and a receive's wait ends at the event's first signal.
+    pub safe fn kernel_ipc_open(owner: usize, messages: u32, bytes: u64, event: u64) -> u64;
 
     /// Closes it: what it holds is dropped, every monitor of it gets its
     /// Down, its monitors and watches end, its name goes. An address that is

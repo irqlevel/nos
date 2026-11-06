@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use ffi::ipc;
 
+use crate::events::SharedEvent;
 use crate::time::{boot_time_ns, Duration};
 
 pub use ipc::{IPC_TAG_BOUNCED as TAG_BOUNCED, IPC_TAG_BULK as TAG_BULK, IPC_TAG_DOWN as TAG_DOWN,
@@ -314,7 +315,21 @@ pub struct Mailbox {
 impl Mailbox {
     /// A mailbox held to `limits`.
     pub fn new(limits: Limits) -> Result<Mailbox, Error> {
-        let addr = ipc::kernel_ipc_open(here(), limits.messages, limits.bytes as u64);
+        Self::open(limits, 0)
+    }
+
+    /// A mailbox held to `limits`, made on `event` -- the event of a task
+    /// that waits for this and more: whatever comes to it, a message, a
+    /// Down, a wake, its close, signals that event, and a `recv` sleeps on
+    /// it only until its first signal, which may have been for one of the
+    /// task's other things. The kernel holds the event for as long as the
+    /// mailbox is open, so `event` may be dropped first.
+    pub fn new_on(limits: Limits, event: &SharedEvent) -> Result<Mailbox, Error> {
+        Self::open(limits, event.handle())
+    }
+
+    fn open(limits: Limits, event: u64) -> Result<Mailbox, Error> {
+        let addr = ipc::kernel_ipc_open(here(), limits.messages, limits.bytes as u64, event);
         if addr == 0 {
             return Err(Error::Refused);
         }
@@ -363,8 +378,9 @@ impl Mailbox {
     }
 
     /// The next message, waiting up to `timeout` for one: None when nothing
-    /// came, the receiver was woken (`wake`), or the mailbox is closed. One
-    /// task receives from a mailbox at a time.
+    /// came, the receiver was woken (`wake`), or the mailbox is closed -- and,
+    /// made on a task's event (`new_on`), at the event's first signal that
+    /// brought none. One task waits on a mailbox at a time.
     pub fn recv(&self, timeout: Duration) -> Option<Message> {
         let mut h = ipc::IpcHeader::default();
         /* Asked with no room first: a message with no payload comes whole,
