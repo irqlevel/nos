@@ -147,6 +147,9 @@ fn run(state: &State, args: &str, out: &mut Output) -> Result<(), String> {
                 let _ = writeln!(out, "ipcnet: a key made for {}", cfg.name);
             }
             let _ = writeln!(out, "{}", files::hex(&id.fingerprint));
+            if let Some(next) = files::staged(&state.dir)?.filter(|k| *k != id.fingerprint) {
+                let _ = writeln!(out, "ipcnet: staged, not yet used: {}", files::hex(&next));
+            }
             Ok(())
         }
         ["init", name] => init_hosts(state, name, None, out),
@@ -298,7 +301,7 @@ fn status(state: &State, out: &mut Output) -> Result<(), String> {
     let now = kcore::time::boot_time_ns();
     let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let _ = writeln!(out, "ipcnet: {} in cluster {}, on {} port {}, key {} -- serving {} s", sh.cfg.name,
-                     files::hex(&sh.cfg.cluster), sh.cfg.nic, sh.cfg.port, files::hex(&sh.identity.fingerprint),
+                     files::hex(&sh.cfg.cluster), sh.cfg.nic, sh.cfg.port, files::hex(&sh.identity().fingerprint),
                      now.saturating_sub(sh.started_ns) / 1_000_000_000);
     let peers: Vec<Arc<peer::Peer>> = sh.peers.with(|v| v.clone());
     for p in &peers {
@@ -309,8 +312,8 @@ fn status(state: &State, out: &mut Output) -> Result<(), String> {
         } else {
             alloc::format!("down: {}", said)
         };
-        p.only.with(|o| {
-            if let Some(n) = o {
+        p.live.with(|l| {
+            if let Some(n) = &l.only {
                 let _ = write!(state, " (invited: {} alone)", n);
             }
         });

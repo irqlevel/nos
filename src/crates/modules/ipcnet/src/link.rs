@@ -227,7 +227,8 @@ fn dial(shared: &Arc<Shared>, peer: Arc<Peer>, class: usize, session: u64) -> Up
     };
     let _ = stream.set_rto_floor(LINK_RTO_MS);
     let sock = Sock { tcp: stream, shared: shared.clone() };
-    let mut sess = match peer.clients[class].connect(sock, ip, HANDSHAKE_MS) {
+    let clients = peer.clients();
+    let mut sess = match clients[class].connect(sock, ip, HANDSHAKE_MS) {
         Ok(s) => Session::Client(s),
         Err((sock, why)) => {
             sock.tcp.abort();
@@ -320,7 +321,7 @@ fn accept(shared: &Arc<Shared>, stream: TcpStream, ip: u32) -> Up {
     });
     let ok = match &peer {
         Some(p) => h.version == ipcwire::VERSION && h.cluster == shared.cfg.cluster && h.session != 0
-            && h.to == shared.cfg.name.as_bytes() && p.conf.keys.contains(&key) && p.conf.ip == ip && !p.dials,
+            && h.to == shared.cfg.name.as_bytes() && p.pinned(&key) && p.conf.ip == ip && !p.dials,
         None => false,
     };
     let (Some(peer), true) = (peer, ok) else {
@@ -777,7 +778,7 @@ fn monitor_for(shared: &Shared, peer: &Peer, id: u64, target: u64) {
      * router, which takes the lock to find a Down's peer, never sees the
      * Down before the record */
     /* A host invited watches nothing here */
-    let invited = peer.only.with(|o| o.is_some());
+    let invited = peer.invited();
     let made = !invited && peer.st.with(|st| {
         if st.number == 0 || st.monitors.len() >= MONITORS_MAX || st.monitors.try_reserve(1).is_err() {
             return false;

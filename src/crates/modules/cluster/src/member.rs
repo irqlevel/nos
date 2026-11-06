@@ -81,6 +81,11 @@ pub const TAG_JOIN_REQ: u32 = 0x103;
 /// Its answer: a byte -- 1 joined, 0 not -- then `Joined`'s bytes, or why
 /// not in words.
 pub const TAG_JOINED: u32 = 0x104;
+/// Whether a member is there, from a host of the cluster: what `cluster
+/// recover` asks every other voter first, refusing while any answers.
+pub const TAG_PROBE: u32 = 0x105;
+/// Its answer: the member's node, its term and its role's byte.
+pub const TAG_PROBED: u32 = 0x106;
 /// A raft message past this goes by the bulk connection: a snapshot's piece,
 /// appends that carry much.
 const BULK_BYTES: usize = 4096;
@@ -235,6 +240,11 @@ impl Member {
     /// the cluster by `me.hosts`, as its join was answered, until its
     /// registry has the cluster.
     pub fn new(rsm: Rsm<Log, State>, me: files::Member) -> Result<Member, String> {
+        /* Request numbers from a random start, never 0: the log may hold this
+           member's own session registrations of an earlier start, applied
+           again as it starts, and one of the same number would be taken for
+           this start's -- a session long used, whose next command is stale */
+        let first = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
         let mb = Mailbox::new(LIMITS).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
         mb.register(NAME, Scope::Cluster).map_err(|e| alloc::format!("{} not named: {}", NAME, e.name()))?;
         Ok(Member {
@@ -246,7 +256,7 @@ impl Member {
             seq: 0,
             pending: BTreeMap::new(),
             forwarded: BTreeMap::new(),
-            next_request: 1,
+            next_request: first | 1,
             peers_told: None,
             peers_retry: 0,
             handing_to: None,
@@ -279,6 +289,7 @@ impl Member {
             TAG_PROPOSE => self.on_propose(&m),
             TAG_ANSWER => self.on_answer(&m),
             TAG_JOIN_REQ => self.on_join(&m),
+            TAG_PROBE => self.on_probe(&m),
             /* ipcnet's answers, from this host alone */
             control::TAG_OK if m.from.host() == 0 => {}
             control::TAG_REFUSED if m.from.host() == 0 => {
@@ -369,6 +380,24 @@ impl Member {
             Err(String::from_utf8_lossy(&m.data[9..]).into_owned())
         };
         self.finish(w, outcome);
+    }
+
+    /// A member asking whether this one is there: answered for a host of
+    /// the cluster alone.
+    fn on_probe(&mut self, m: &Message) {
+        if self.sender_node(m).is_none() {
+            self.refused += 1;
+            return;
+        }
+        let mut data = Vec::with_capacity(17);
+        data.extend_from_slice(&self.me.node.to_le_bytes());
+        data.extend_from_slice(&self.rsm.node().term().to_le_bytes());
+        data.push(match self.rsm.role() {
+            Role::Leader => 2,
+            Role::Follower => 1,
+            Role::Candidate | Role::PreCandidate => 0,
+        });
+        let _ = self.mb.send(m.from, TAG_PROBED, m.reference, &data);
     }
 
     /// A host's join: taken from the host its invitation names, with the
@@ -476,8 +505,7 @@ impl Member {
             self.finish(w, Err(String::from("no leader known yet -- ask again in a moment")));
             return;
         };
-        let request = self.next_request;
-        self.next_request += 1;
+        let request = self.take_request();
         let mut data = Vec::new();
         data.extend_from_slice(&request.to_le_bytes());
         data.extend_from_slice(&cmd.encode());
@@ -565,21 +593,35 @@ impl Member {
                 if let Some(w) = self.pending.remove(&seq) {
                     self.finish(w, Err(String::from("the member's session went -- ask again")));
                 }
-                self.session = None;
+                /* A leader is never left without one */
+                if self.rsm.role() == Role::Leader {
+                    self.register_session();
+                } else {
+                    self.session = None;
+                }
             }
             _ => {}
         }
     }
 
+    /// A request's number, this start's own.
+    fn take_request(&mut self) -> u64 {
+        let request = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1).max(1);
+        request
+    }
+
+    /// A session of its own to submit under, asked at once -- as it comes to
+    /// lead, and as one it had goes.
+    fn register_session(&mut self) {
+        self.session = None;
+        let request = self.take_request();
+        self.registering = self.rsm.register(request).is_ok().then_some(request);
+    }
+
     fn on_role(&mut self, role: Role) {
         if role == Role::Leader {
-            /* A session of its own to submit under, asked at once */
-            self.session = None;
-            let request = self.next_request;
-            self.next_request += 1;
-            if self.rsm.register(request).is_ok() {
-                self.registering = Some(request);
-            }
+            self.register_session();
         } else {
             /* What waited here is asked again by whoever waits */
             let waiting = core::mem::take(&mut self.pending);
