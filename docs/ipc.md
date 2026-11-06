@@ -290,7 +290,11 @@ hosts and back.
 - **Its hosts** are in /etc/ipc/hosts.toml: this one's name and the
   cluster's id, and every peer's name, address and key -- one, or two while
   it moves to a new one -- pinned. The host's own key and certificate are
-  made at its first start, in /etc/ipc/tls. A peer's line may end
+  made at its first start, in one file, /etc/ipc/tls/identity.pem (a pair
+  openssl made, key.pem and cert.pem, is read where there is none). A peer
+  is its name and its address: its keys change in place, a connection
+  keeping the key it was made with and the next made with a key it has
+  then. A peer's line may end
   `only=<name>`: a host invited to the cluster, which reaches that one
   `Cluster` name of this host's, by the name, and nothing else -- no
   mailbox by its address, no monitor; what it sends anywhere else is
@@ -303,8 +307,11 @@ hosts and back.
   this host is to have, in place of those it has, and a cluster to join
   while it has none. It writes hosts.toml as `ipcnet add` and `remove` do (a
   new file, synced, renamed over the old) and gives the running server the
-  list: one writer of the file. It answers while the module is loaded,
-  serving or not (docs/cluster.md).
+  list: one writer of the file. And it stages a new key for this host and
+  switches to it when asked (`TAG_KEY_STAGE`, `TAG_KEY_USE`: `cluster
+  rekey`), the server and every peer's clients made anew with it and the
+  connections up kept. It answers while the module is loaded, serving or
+  not (docs/cluster.md).
 - **Two TCP connections a peer**, control and bulk, on one port (39240), on
   the interface hosts.toml names (eth0 unless told; never hv0, so that no
   guest reaches it). The listener answers the peers' addresses alone: to

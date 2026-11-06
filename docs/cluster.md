@@ -38,9 +38,22 @@ Then, on any member:
 
 ```
 cluster                         this member: node, role, term, leader, what it applied, hosts and voters
-cluster hosts                   every host: node, voter or learner, address, key -- and the invitations open
+cluster hosts                   every host: node, voter or learner, addresses, key, maintenance -- and the invitations open
 cluster remove <host>           a host out, for good: its key refused from then on
+cluster revoke <host>           its open invitation taken back, its token good for nothing
+cluster maintenance <host> on|off   a host being worked on, or back
+cluster address <host> <role> <ip|none>   a host's address for ipc, underlay or public
+cluster rekey                   this host moved to a new key, no connection lost
+cluster recover [<cluster>]     on the last host standing: what it does, then -- the cluster's name given -- does it
 ```
+
+The same are the `cluster` provider's on the management bus -- reads
+`status` and `hosts`, actions `invite` (the token answered once, kept
+nowhere), `revoke`, `remove` (its host's name typed again), `maintenance`,
+`address` and `rekey` -- so that the panel lists the hosts and an admin
+invites one from its page (`cluster.descriptor.json`). `join` and `recover`
+are typed at the host's own shell: a token comes from another host, and a
+recover is unsafe by design.
 
 At boot, /etc/rc loads both and starts ipcnet; the member starts by itself
 over its log:
@@ -127,6 +140,55 @@ invitation instead of after: the new host's key. What the first design
 promised still holds: before its join, the host reaches the join and
 nothing past it.
 
+## A host's key, moved
+
+`cluster rekey` on a host moves it to a new key with no connection lost:
+
+1. ipcnet makes a key and stages it -- `tls/next.pem`, not yet used
+   (`ipcnet.ctl`'s `TAG_KEY_STAGE`; `ipcnet id` says it);
+2. the registry is told of it (`AddKey`): every member's ipcnet pins the
+   host by both keys as it applies the entry;
+3. ipcnet switches to it (`TAG_KEY_USE`): `tls/identity.pem` written whole
+   with it -- key and certificate in one file, so that the two never go
+   apart -- the TLS server and every peer's clients made anew with it, and
+   the connections up kept;
+4. the old key is dropped (`DropKey`) and retired: refused from then on, by
+   every member and in every invitation, as a removed host's is.
+
+A peer whose keys change keeps its connections: a connection keeps the key
+it was made with, and the next one is made with a key the peer has then --
+in ipcnet a peer is its name and its address, and its keys change in place
+(`PeerConf::same_link`). So a rekey is a rotation, not a revocation: a key
+thought stolen is answered by removing the host, which cuts its
+connections at once.
+
+Each step is asked again harmlessly, and a rekey cut short anywhere --
+a reboot between two of them -- goes on from where it stopped at the next
+`cluster rekey`: it reads where it is from the registry's keys for the host
+(the newer one last), ipcnet's key and its staged one.
+
+## When the majority is gone
+
+`cluster recover` on the last host standing makes it its cluster's one
+voter. It is refused while the member follows a leader, or while any other
+voter's member answers a probe within 3 s; without the cluster's name it
+says what it is about to do, and with it, it does it:
+
+1. the member stopped, and its log made the log of a group of itself alone
+   (`raft::recover::force_alone`, docs/raft.md): every other member taken
+   out by changes appended to it, and the log committed to its end;
+2. the member started again over it, electing itself at once;
+3. every other host removed from the registry, for good -- their keys
+   refused with them.
+
+Unsafe by design, as etcd's `--force-new-cluster` is: what the lost hosts
+had committed and this one had not is gone, and what this one had appended
+and the group had not committed is committed. That is why the others are
+removed: none of them comes back with a history that went another way; a
+host lost and found again is installed anew and invited. A minority cut
+off from a live majority cannot tell it from a majority gone -- the probe
+asks, and the typed name is the admin's word that they are gone.
+
 ## How a member runs
 
 - **One task**, `cluster/raft`: raft's `Rsm` over the log in `raft/`, a tick
@@ -140,7 +202,12 @@ nothing past it.
   taken from that leader alone, and, should another be elected meanwhile,
   given up at once to be asked of the new one. What could not be taken yet
   -- no leader, a leader without its session yet -- the shell asks again,
-  for up to 30 s.
+  for up to 30 s. A leader submits under a session of its own, asked as it
+  comes to lead and again whenever it goes; its requests are numbered from a
+  random start each time the member starts, so that a registration of an
+  earlier start, applied again as the member starts over its log, is never
+  taken for this start's (recover, which elects its member at once over the
+  whole log, found it).
 - **Raft's membership** follows the registry a change at a time, made by the
   leader: a removed host taken out, a new one in as a learner, a learner
   made a voter once it holds the log, a voter past the first five made a
@@ -183,7 +250,11 @@ nothing past it.
   `scripts/hub.py`'s LAN): a cluster made on one host; two invited and
   joined, one through a member that does not lead, after a join with a wrong
   secret refused, and while invited its pings to a member's echo refused;
-  every host up to every other and pings answered over the
+  the provider answering through the bus; maintenance and an address seen
+  by every host; a rekey under 6000 pings, every one answered and no
+  connection lost, the old key refused after; every host rebooted at once;
+  recover on the last of three, refused first, and a host installed anew
+  joined after; every host up to every other and pings answered over the
   connections the registry made; a second `init`, another host's token and
   a token used again refused; a host removed and dropped by the others
   within seconds; a member's VM restarted, back from its folder; the leader
@@ -209,5 +280,9 @@ nothing past it.
 - An invitation's fifteen minutes are the leader's clock.
 - A list of peers that drops one waits, in ipcnet, for that peer's dialer
   to end -- up to an ARP and a connect's 5 s.
-- Not yet (C2): `rekey`, `address`, `maintenance`, `recover`, and a provider
-  on the management bus for the panel.
+- A rekey is a rotation, not a revocation: connections made with the old
+  key go on until they end.
+- `recover` cannot tell a majority gone from one cut off: it is the admin's
+  to know.
+- An address for the `ipc` role is never taken away, only changed: a host
+  is always somewhere for the others to call.

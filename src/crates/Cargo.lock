@@ -584,6 +584,7 @@ dependencies = [
  "ipcwire",
  "kcore",
  "kmod",
+ "mgmtwire",
  "raft",
  "registry",
  "sha2",

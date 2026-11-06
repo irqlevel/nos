@@ -5,7 +5,7 @@
 
 use raft::{Body, ChangeKind, ConfChange, Entry, EntryKind, MemStorage, Message, NodeId, Role};
 
-use crate::sim::{Params, Sim};
+use crate::sim::{Disk, Params, Sim};
 
 pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("figure8", figure8),
@@ -18,6 +18,7 @@ pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("commit_past_match", commit_past_match),
     ("prevote_not_a_vote", prevote_not_a_vote),
     ("append_prev_term_mismatch", append_prev_term_mismatch),
+    ("force_alone_after_loss", force_alone_after_loss),
 ];
 
 fn votes(m: &Message) -> bool {
@@ -468,4 +469,67 @@ impl Sim {
 /// A Normal entry: what the unit checks append by hand.
 pub fn entry(index: u64, term: u64, data: &[u8]) -> Entry {
     Entry { index, term, kind: EntryKind::Normal, data: data.to_vec() }
+}
+
+/// Recover (plans/cluster.md, "When the majority is gone"): a group of
+/// three voters and a learner whose other members are lost for good, the
+/// third voter made a group
+/// of itself alone by `raft::recover::force_alone` -- every other member
+/// taken out by changes it appends, its log committed to its end. It
+/// elects itself and commits on its own; what it held is kept, and what it
+/// had appended that the group never committed is committed now; the two
+/// taken out never come back. A learner is no group's last voter, and is
+/// refused.
+fn force_alone_after_loss() -> Result<(), String> {
+    let mut s = Sim::new(Params::plain(), 97, &[1, 2, 3], &[4]);
+    elect(&mut s, 1)?;
+    for _ in 0..4 {
+        s.propose(1);
+    }
+    s.flush(50);
+    /* One more, on members 1 and 3 alone, and never committed */
+    s.propose_data(1, b"late").map_err(|e| e.to_string())?;
+    s.flush_only(10, |m| m.from == 1 && m.to == 3 && matches!(m.body, Body::Append { .. }));
+    s.net.clear();
+    let (last, committed) = s.node(3).map(|n| (n.last_index(), n.committed())).ok_or("member 3 down")?;
+    if last <= committed {
+        return Err(format!("the late entry not on member 3 uncommitted: last {}, committed {}", last, committed));
+    }
+    for id in [1, 2, 3, 4] {
+        s.crash(id);
+    }
+    for id in [1, 2, 4] {
+        if let Some(m) = s.members.get_mut(&id) {
+            m.retired = true;
+        }
+    }
+    let m = s.members.get_mut(&3).ok_or("member 3 gone")?;
+    let disk = m.disk.take().ok_or("member 3's disk gone")?;
+    let (mem, forced) = raft::recover::force_alone(disk.mem, 3).map_err(|e| format!("{:?}", e))?;
+    if forced.removed != [1, 2, 4] || forced.committed_before != committed || forced.last != last + 3 {
+        return Err(format!("forced {:?}, the log's last entry {} and its commit {}", forced, last, committed));
+    }
+    m.disk = Some(Disk::new(mem, 0, 97));
+    s.restart(3);
+    let n = s.node(3).ok_or("member 3 did not start again")?;
+    let conf = n.membership();
+    if conf.voters != [3] || !conf.learners.is_empty() || n.committed() != forced.last {
+        return Err(format!("member 3 forced alone: {:?}, committed {}", conf, n.committed()));
+    }
+    let late = n.entries(last, last + 1, u64::MAX).map_err(|e| e.to_string())?;
+    if late.first().map(|e| e.data.as_slice()) != Some(&b"late"[..]) {
+        return Err(String::from("the late entry not kept"));
+    }
+    elect(&mut s, 3)?;
+    let before = s.node(3).map_or(0, |n| n.committed());
+    s.propose(3);
+    s.flush(20);
+    if s.node(3).map_or(0, |n| n.committed()) <= before {
+        return Err(String::from("member 3, alone, commits nothing"));
+    }
+    match raft::recover::force_alone(MemStorage::bootstrap(&[1, 2], &[3]), 3) {
+        Err(raft::recover::ForceError::NotAVoter) => {}
+        other => return Err(format!("a learner forced alone: {:?}", other.map(|(_, f)| f))),
+    }
+    finish(s)
 }

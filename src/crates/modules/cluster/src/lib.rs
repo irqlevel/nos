@@ -24,6 +24,7 @@ extern crate alloc;
 
 mod files;
 mod member;
+mod provider;
 mod token;
 
 use alloc::boxed::Box;
@@ -37,17 +38,18 @@ use ipcwire::control::{self, Identity};
 use kcore::cmd::{Command as ShellCommand, Output};
 use kcore::error::Error;
 use kcore::ipc::{Limits, Mailbox};
+use kcore::klog;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
 use raft::{Config, LogConfig, Role, Rsm};
-use registry::{Answer, Command, State};
+use registry::{Answer, Command, Role as AddrRole, State};
 
 use files::{Dir, KFiles};
 use member::{Member, Request, Shared, Slot, View};
 use token::Token;
 
-const HELP: &str = "cluster [init | invite | join | hosts | remove] - this host in its cluster's registry";
+const HELP: &str = "cluster [init | invite | join | hosts | remove | ...] - this host in its cluster's registry";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: cluster                          this member: its node, role, leader, what it applied\n\
@@ -55,8 +57,14 @@ const USAGE: &str = "usage: cluster                          this member: its no
                      \x20      cluster invite <host> <ip> <key>   a token for `cluster join` on <host>, from <ip>,\n\
                      \x20                                     with <key> -- what `ipcnet id` says there -- once\n\
                      \x20      cluster join <token>            on the host invited: into the cluster, as the token says\n\
-                     \x20      cluster hosts                   every host: node, vote, address, key\n\
-                     \x20      cluster remove <host>           a host out, for good";
+                     \x20      cluster hosts                   every host: node, vote, addresses, key\n\
+                     \x20      cluster remove <host>           a host out, for good\n\
+                     \x20      cluster revoke <host>           its invitation taken back, unused\n\
+                     \x20      cluster maintenance <host> on|off   a host being worked on, or back\n\
+                     \x20      cluster address <host> <ipc|underlay|public> <ip|none>   a host's address for a role\n\
+                     \x20      cluster rekey                   this host moved to a new key, no connection lost\n\
+                     \x20      cluster recover [<cluster>]     on the last host standing: what it does, then -- the\n\
+                     \x20                                     cluster's name given -- this host the one voter";
 
 /// How long an invitation is good for, by the leader's clock.
 const INVITE_SECS: u64 = 15 * 60;
@@ -73,6 +81,8 @@ const JOIN_TRY_MS: u64 = 3000;
 const ASK_RETRY_MS: u64 = 250;
 /// How long a command is asked for, all its tries together.
 const ASK_TOTAL_MS: u64 = 30_000;
+/// How long `recover` waits for any other voter to answer its probe.
+const PROBE_MS: u64 = 3000;
 const ANSWER_POLL_MS: u64 = 20;
 
 /// A value under a lock of the kernel's, taken for a call.
@@ -115,10 +125,12 @@ impl Drop for Starting<'_> {
     }
 }
 
-/* Dropped in this order: the member's task, stopped and waited out -- its
-   log closed with it -- then the command, waiting out a call of it */
+/* Dropped in this order: the provider, waiting out a call of it; the
+   member's task, stopped and waited out -- its log closed with it -- then
+   the command, waiting out a call of it */
 struct Cluster {
     _cmd: ShellCommand,
+    provider: Option<kcore::mgmt::Provider>,
     state: Arc<ModState>,
 }
 
@@ -126,6 +138,7 @@ impl kmod::Module for Cluster {}
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        drop(self.provider.take());
         stop(&self.state);
     }
 }
@@ -179,7 +192,14 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
             let _ = writeln!(out, "cluster: {}", problem);
         }
     })?;
-    Ok(Box::new(Cluster { _cmd: cmd, state }))
+    let provider = match provider::register(state.clone()) {
+        Ok(p) => Some(p),
+        Err(s) => {
+            let _ = writeln!(out, "cluster: not on the management bus: {}", s.name());
+            None
+        }
+    };
+    Ok(Box::new(Cluster { _cmd: cmd, provider, state }))
 }
 
 kmod::module!(name: "cluster", init_with_params: init);
@@ -197,11 +217,20 @@ fn start(state: &ModState, me: files::Member, fresh: bool) -> Result<(), String>
         raft::DiskLog::open(files, LogConfig::default())
     }
     .map_err(|e| alloc::format!("the log in {}: {:?}", state.dir.path("raft"), e))?;
+    run_member(state, me, log, fresh)
+}
+
+/// The member started over `log`, standing for election at once when
+/// `campaign` -- its group's one voter.
+fn run_member(state: &ModState, me: files::Member, log: member::Log, campaign: bool) -> Result<(), String> {
+    if state.task.with(|t| t.is_some()) {
+        return Err(String::from("the member is running already"));
+    }
     let mut cfg = Config::new(me.node);
     cfg.seed = kcore::random::random_u64().unwrap_or(me.node);
     let nonce = kcore::random::random_u64().ok_or_else(|| String::from("no randomness for the member's start"))?;
     let mut rsm = Rsm::new(cfg, log, State::new(), nonce).map_err(|e| alloc::format!("the member: {:?}", e))?;
-    if fresh {
+    if campaign {
         /* Its group's one voter: leading at once rather than at a timeout */
         let _ = rsm.campaign();
     }
@@ -281,6 +310,219 @@ fn said(a: Answer, done: impl FnOnce(u64) -> String) -> Result<String, String> {
     }
 }
 
+/// A command's answer as a result: the node it names, or why it was refused.
+fn done(a: Answer) -> Result<u64, String> {
+    match a {
+        Answer::Done { node } => Ok(node),
+        Answer::Refused(why) => Err(String::from(why.says())),
+    }
+}
+
+fn now() -> u64 {
+    kcore::time::wall_clock_secs()
+}
+
+fn member_view(state: &ModState) -> Result<View, String> {
+    view(state).ok_or_else(|| String::from("this host is no member -- `cluster init`, or a join"))
+}
+
+/* ---- what the shell and the bus both ask: the commands, each a value ---- */
+
+fn op_remove(state: &ModState, host: &str) -> Result<u64, String> {
+    done(ask(state, &Command::Remove { now: now(), host: String::from(host) })?)
+}
+
+fn op_maintenance(state: &ModState, host: &str, on: bool) -> Result<u64, String> {
+    done(ask(state, &Command::Maintenance { now: now(), host: String::from(host), on })?)
+}
+
+fn op_address(state: &ModState, host: &str, role: AddrRole, ip: u32) -> Result<u64, String> {
+    done(ask(state, &Command::Address { now: now(), host: String::from(host), role, ip })?)
+}
+
+/// The open invitation of `host`, taken back.
+fn op_revoke(state: &ModState, host: &str) -> Result<(), String> {
+    let v = member_view(state)?;
+    let inv = v.state.invitations().iter().find(|i| i.host == host)
+        .ok_or_else(|| alloc::format!("no open invitation of {}", host))?;
+    done(ask(state, &Command::Revoke { now: now(), invitation: inv.id })?).map(|_| ())
+}
+
+/// `host` invited from `ip` with `key`: the token, which `cluster join`
+/// takes there -- shown once, and kept nowhere.
+fn op_invite(state: &ModState, host: &str, ip: u32, key: [u8; 32]) -> Result<String, String> {
+    let v = member_view(state)?;
+    let id = identity()?;
+    let me = v.state.host(&id.name).ok_or_else(|| String::from("this host is not in the registry yet"))?;
+    let cluster = v.state.cluster().ok_or_else(|| String::from("no cluster yet"))?.id;
+    let mut secret = [0u8; 32];
+    let invitation = kcore::random::random_u64().filter(|&i| i != 0);
+    let (Some(invitation), true) = (invitation, kcore::random::fill_random(&mut secret)) else {
+        return Err(String::from("no randomness for an invitation"));
+    };
+    let now = now();
+    done(ask(state, &Command::Invite { now, id: invitation, host: String::from(host), ip, key,
+                                        secret_hash: token::secret_hash(&secret), expires: now + INVITE_SECS })?)?;
+    let t = Token { cluster, member: id.name.clone(), ip: me.ipc(), port: id.port, key: id.key,
+                    host: String::from(host), invitation, secret };
+    Ok(t.encode())
+}
+
+/// This host moved to a new key, from wherever an earlier rekey stopped:
+/// a key staged by ipcnet, the registry told of it -- every member's
+/// ipcnet pinning both -- ipcnet switched to it, and the old one dropped
+/// and retired. No connection is lost: one made with the old key goes on
+/// until it ends. The old key and the new.
+fn op_rekey(state: &ModState) -> Result<([u8; 32], [u8; 32]), String> {
+    let _one = Starting::take(state)?;
+    let v = member_view(state)?;
+    let id = identity()?;
+    let me = v.state.host(&id.name).ok_or_else(|| String::from("this host is not in the registry yet"))?;
+    let (host, cur) = (id.name.clone(), id.key);
+    let add = |key| ask(state, &Command::AddKey { now: now(), host: host.clone(), key }).and_then(done);
+    let drop = |key| ask(state, &Command::DropKey { now: now(), host: host.clone(), key }).and_then(done);
+    /* The registry's keys in the order they came: a key added is the last */
+    let registered = match me.keys.as_slice() {
+        [k] if *k == cur => None,
+        [old, new] if *new == cur => {
+            /* Switched already: the old one is left to drop */
+            let old = *old;
+            drop(old)?;
+            return Ok((old, cur));
+        }
+        [k, other] if *k == cur && id.next == Some(*other) => Some(*other),
+        [k, other] if *k == cur => {
+            /* Registered, and the key staged for it is gone: taken back */
+            drop(*other)?;
+            None
+        }
+        _ => {
+            return Err(alloc::format!("ipcnet's key, {}..., is none of this host's in the registry: the other \
+                                       hosts refuse it -- `cluster remove {}` on a member, and invite it again",
+                                      files::hex(&cur[..8]), host));
+        }
+    };
+    let new = match registered {
+        Some(k) => k,
+        None => {
+            let k = key_of(&ctl(control::TAG_KEY_STAGE, &[])?)?;
+            add(k)?;
+            k
+        }
+    };
+    let used = key_of(&ctl(control::TAG_KEY_USE, &[])?)?;
+    if used != new {
+        return Err(alloc::format!("ipcnet moved to {}..., where {}... was staged", files::hex(&used[..8]),
+                                  files::hex(&new[..8])));
+    }
+    drop(cur)?;
+    Ok((cur, new))
+}
+
+fn key_of(data: &[u8]) -> Result<[u8; 32], String> {
+    data.try_into().map_err(|_| String::from("ipcnet answered with no key"))
+}
+
+/// The other voters of `hosts` that answer a probe within PROBE_MS, by
+/// name -- each answer from the host it names, as ipcnet has it.
+fn probe(hosts: &[(String, u64)]) -> Result<alloc::vec::Vec<String>, String> {
+    let mb = Mailbox::new(Limits { messages: 32, bytes: 8192 }).map_err(|e| alloc::format!("no mailbox: {}", e.name()))?;
+    for (name, _) in hosts {
+        let _ = mb.send_to(&alloc::format!("{}@{}", member::NAME, name), member::TAG_PROBE, 0, &[]);
+    }
+    let end = kcore::time::boot_time_ns() + PROBE_MS * 1_000_000;
+    let mut answered: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    while kcore::time::boot_time_ns() < end && answered.len() < hosts.len() {
+        let Some(m) = mb.recv(Duration::from_millis(ANSWER_POLL_MS)) else { continue };
+        if m.tag != member::TAG_PROBED || m.data.len() != 17 {
+            continue;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&m.data[..8]);
+        let node = u64::from_le_bytes(b);
+        let from = kcore::ipc::peer_name(m.from);
+        if let Some((name, _)) = hosts.iter().find(|(n, nd)| *nd == node && from.as_deref() == Some(n.as_str())) {
+            if !answered.contains(name) {
+                answered.push(name.clone());
+            }
+        }
+    }
+    Ok(answered)
+}
+
+/// The last host standing made its cluster's one voter (plans/cluster.md,
+/// "When the majority is gone"): refused while it follows a leader or any
+/// other voter answers; said first, done once the cluster's name is given.
+/// Unsafe by design -- what the lost hosts had committed and this one had
+/// not is gone -- so the lost hosts are removed for good, their keys with
+/// them: none of them comes back with a history that went another way.
+fn recover(state: &ModState, confirm: Option<&str>, out: &mut Output) -> Result<(), String> {
+    let _one = Starting::take(state)?;
+    let v = member_view(state)?;
+    let cluster = v.state.cluster().ok_or_else(|| String::from("no cluster yet"))?.clone();
+    let me = v.state.host_of_node(v.node).map(|h| h.name.clone())
+        .ok_or_else(|| String::from("this host is not in the registry"))?;
+    if v.leader != raft::NONE {
+        let leader = v.state.host_of_node(v.leader).map_or("a member", |h| h.name.as_str());
+        return Err(alloc::format!("this member follows a leader, {}: the majority answers -- recover is for a \
+                                   cluster whose majority is gone for good", leader));
+    }
+    let others: alloc::vec::Vec<(String, u64)> = v.state.hosts().iter().filter(|h| h.node != v.node)
+        .map(|h| (h.name.clone(), h.node)).collect();
+    let voters: alloc::vec::Vec<(String, u64)> = others.iter().filter(|(_, n)| v.membership.voters.contains(n))
+        .cloned().collect();
+    let answering = probe(&voters)?;
+    if !answering.is_empty() {
+        return Err(alloc::format!("{} answers: the majority may not be gone -- recover refused",
+                                  answering.join(", ")));
+    }
+    let names: alloc::vec::Vec<&str> = others.iter().map(|(n, _)| n.as_str()).collect();
+    let Some(given) = confirm else {
+        let _ = writeln!(out, "cluster: recover makes {} (node {}) the one voter of cluster {}, and removes every \
+                               other host for good -- their keys refused from then on; whatever they had committed \
+                               that {} had not is gone. No other voter answers. To go ahead: cluster recover {}", me,
+                         v.node, cluster.name, me, cluster.name);
+        let _ = writeln!(out, "cluster: the hosts removed: {}",
+                         if names.is_empty() { String::from("none") } else { names.join(", ") });
+        return Ok(());
+    };
+    if given != cluster.name {
+        return Err(alloc::format!("\"{}\" is not this cluster's name -- it is {}", given, cluster.name));
+    }
+    let member = files::read_member(&state.dir)?.ok_or_else(|| String::from("this host has no member file"))?;
+    stop(state);
+    let stopped = |why: String| alloc::format!("{} -- the member is stopped: `rmmod cluster` and `insmod` start it \
+                                               again", why);
+    let files = KFiles::new(&state.dir).map_err(stopped)?;
+    let log = raft::DiskLog::open(files, LogConfig::default())
+        .map_err(|e| stopped(alloc::format!("the log in {}: {:?}", state.dir.path("raft"), e)))?;
+    let (log, forced) = match raft::recover::force_alone(log, member.node) {
+        Ok(f) => f,
+        Err(e) => {
+            /* Refused before writing, or a write that failed: the member
+               started again over what the folder holds */
+            let again = start(state, member, false).err().map(|w| alloc::format!(", and the member not started \
+                                                                                 again: {}", w)).unwrap_or_default();
+            return Err(alloc::format!("recover refused: {:?}{}", e, again));
+        }
+    };
+    klog!(0, "cluster: recover: {} (node {}) alone, {:?} taken out, the log committed from {} to {}", me,
+          member.node, forced.removed, forced.committed_before, forced.last);
+    run_member(state, member, log, true)?;
+    let mut removed = alloc::vec::Vec::new();
+    for (name, _) in &others {
+        match op_remove(state, name) {
+            Ok(_) => removed.push(name.as_str()),
+            Err(why) => {
+                let _ = writeln!(out, "cluster: {} not removed: {} -- `cluster remove {}` again", name, why, name);
+            }
+        }
+    }
+    let _ = writeln!(out, "cluster: {} is cluster {}'s one voter now; removed for good: {}", me, cluster.name,
+                     if removed.is_empty() { String::from("none") } else { removed.join(", ") });
+    Ok(())
+}
+
 fn run(state: &ModState, args: &str, out: &mut Output) -> Result<(), String> {
     let words: alloc::vec::Vec<&str> = args.split_whitespace().collect();
     match words.as_slice() {
@@ -290,11 +532,45 @@ fn run(state: &ModState, args: &str, out: &mut Output) -> Result<(), String> {
         ["invite", host, ip, key] => invite(state, host, ip, key, out),
         ["join", token] => join_cluster(state, token, out),
         ["remove", host] => {
-            let a = ask(state, &Command::Remove { now: kcore::time::wall_clock_secs(), host: String::from(*host) })?;
-            let line = said(a, |node| alloc::format!("cluster: {} (node {}) removed, for good", host, node))?;
-            let _ = writeln!(out, "{}", line);
+            let node = op_remove(state, host)?;
+            let _ = writeln!(out, "cluster: {} (node {}) removed, for good", host, node);
             Ok(())
         }
+        ["revoke", host] => {
+            op_revoke(state, host)?;
+            let _ = writeln!(out, "cluster: {}'s invitation taken back", host);
+            Ok(())
+        }
+        ["maintenance", host, on @ ("on" | "off")] => {
+            let on = *on == "on";
+            op_maintenance(state, host, on)?;
+            let _ = writeln!(out, "cluster: {} {}", host, if on { "being worked on" } else { "back" });
+            Ok(())
+        }
+        ["address", host, role, ip] => {
+            let role = AddrRole::from_name(role)
+                .ok_or_else(|| alloc::format!("\"{}\" is not a role: ipc, underlay or public", role))?;
+            let ip = match *ip {
+                "none" => 0,
+                text => parse_ip(text).ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address", text))?,
+            };
+            op_address(state, host, role, ip)?;
+            if ip == 0 {
+                let _ = writeln!(out, "cluster: {}'s {} address taken away", host, role.name());
+            } else {
+                let _ = writeln!(out, "cluster: {}'s {} address is {}", host, role.name(), Ip(ip));
+            }
+            Ok(())
+        }
+        ["rekey"] => {
+            let (old, new) = op_rekey(state)?;
+            let _ = writeln!(out, "cluster: this host's key is {}... now; the old one, {}..., retired -- refused from \
+                                   now on, the connections made with it going on until they end",
+                             files::hex(&new[..8]), files::hex(&old[..8]));
+            Ok(())
+        }
+        ["recover"] => recover(state, None, out),
+        ["recover", name] => recover(state, Some(name), out),
         _ => Err(String::from(USAGE)),
     }
 }
@@ -342,23 +618,9 @@ fn invite(state: &ModState, host: &str, ip: &str, key: &str, out: &mut Output) -
     let ip = parse_ip(ip).ok_or_else(|| alloc::format!("\"{}\" is not an IPv4 address", ip))?;
     let key = files::unhex::<32>(key)
         .ok_or_else(|| alloc::format!("\"{}\" is not a key: 64 hex digits, as `ipcnet id` says them", key))?;
-    let v = view(state).ok_or_else(|| String::from("this host is no member -- `cluster init`, or a join"))?;
-    let id = identity()?;
-    let me = v.state.host(&id.name).ok_or_else(|| String::from("this host is not in the registry yet"))?;
-    let cluster = v.state.cluster().ok_or_else(|| String::from("no cluster yet"))?.id;
-    let mut secret = [0u8; 32];
-    let invitation = kcore::random::random_u64().filter(|&i| i != 0);
-    let (Some(invitation), true) = (invitation, kcore::random::fill_random(&mut secret)) else {
-        return Err(String::from("no randomness for an invitation"));
-    };
-    let now = kcore::time::wall_clock_secs();
-    let a = ask(state, &Command::Invite { now, id: invitation, host: String::from(host), ip, key,
-                                           secret_hash: token::secret_hash(&secret), expires: now + INVITE_SECS })?;
-    said(a, |_| String::new())?;
-    let t = Token { cluster, member: id.name.clone(), ip: me.ipc(), port: id.port, key: id.key,
-                    host: String::from(host), invitation, secret };
+    let token = op_invite(state, host, ip, key)?;
     let _ = writeln!(out, "cluster: {} invited from {} for {} minutes -- on it: cluster join {}", host, Ip(ip),
-                     INVITE_SECS / 60, t.encode());
+                     INVITE_SECS / 60, token);
     Ok(())
 }
 
@@ -491,9 +753,21 @@ fn hosts(state: &ModState, out: &mut Output) -> Result<(), String> {
             "joining"
         };
         let key = h.keys.first().map(|k| files::hex(&k[..8])).unwrap_or_default();
+        let mut more = String::new();
+        if h.node == v.leader {
+            more.push_str(" (leader)");
+        }
+        if h.maintenance {
+            more.push_str(" maintenance");
+        }
+        if let Some(next) = h.keys.get(1) {
+            let _ = write!(more, " moving to key {}...", files::hex(&next[..8]));
+        }
+        for a in h.addrs.iter().skip(1) {
+            let _ = write!(more, " {} {}", a.role.name(), Ip(a.ip));
+        }
         let _ = writeln!(out, "  {:<16} node {:<4} {:<8} {:<15} key {}...{}", h.name, h.node, vote,
-                         alloc::format!("{}", Ip(h.ipc())), key,
-                         if h.node == v.leader { " (leader)" } else { "" });
+                         alloc::format!("{}", Ip(h.ipc())), key, more);
     }
     for i in v.state.invitations() {
         let _ = writeln!(out, "  {:<16} invited  from {}", i.host, Ip(i.ip));
