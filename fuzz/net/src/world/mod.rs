@@ -92,6 +92,17 @@ pub trait Peers {
     fn on_timer(&mut self, _net: &mut Net) {}
 }
 
+/// The frames the machine's receive queues have dropped for want of room,
+/// every device's: a burst's tail, which no protocol saw.
+fn rx_full() -> usize {
+    (0..net::device::DEVICES.count()).filter_map(|i| net::device::DEVICES.at(i)).map(|d| d.rx_full()).sum()
+}
+
+/// How long after a frame was put on the machine's NIC a frame it sends is
+/// taken to have been made after it -- far more than its time moves in a
+/// pass over a batch.
+const TAKEN_SLACK: u64 = 1_000_000;
+
 /// The wire between the world and the machine's NIC.
 pub struct Net {
     /// Frames on their way to the machine: when each arrives.
@@ -104,21 +115,52 @@ pub struct Net {
     pub expect: check::Expect,
     /// Frames the world has put on the wire for the machine, counted.
     pub delivered: u64,
+    /// When each frame sent was put on the NIC, by its number -- the
+    /// recent ones -- and how many frames the stack's receive queues had
+    /// dropped by then: a frame put there at a time before now, with none
+    /// dropped since, has been taken in, every frame the machine sends from
+    /// now on sent after it.
+    pushed: BTreeMap<u64, (u64, usize)>,
 }
 
 impl Net {
     pub fn new(link: Link) -> Net {
         Net { arriving: BTreeMap::new(), order: 0, link, sent: Vec::new(), expect: check::Expect::default(),
-              delivered: 0 }
+              delivered: 0, pushed: BTreeMap::new() }
     }
 
-    /// `frame`, to the machine: when the link says, if it says at all.
-    pub fn send(&mut self, frame: Vec<u8>) {
+    /// `frame`, to the machine: when the link says, if it says at all --
+    /// each copy's arrival and number, none when it is lost.
+    pub fn send(&mut self, frame: Vec<u8>) -> Vec<(u64, u64)> {
         let now = sched::now();
+        let mut copies = Vec::new();
         for at in self.link.fate(now, frame.len()) {
             self.order += 1;
             self.arriving.insert((at, self.order), frame.clone());
+            copies.push((at, self.order));
         }
+        copies
+    }
+
+    /// Whether a frame the machine sends now was made after it had taken in
+    /// a frame sent to it -- arriving at `at`, number `order`: one put on
+    /// its NIC more than `TAKEN_SLACK` ago, since when its transmit side has
+    /// not stopped and started again. The machine's own time moves as it
+    /// works, so a frame it made while taking in a batch, before reaching
+    /// the one asked of, is seen a little after the batch was put there;
+    /// and one a stopped transmit side held is seen when it starts again,
+    /// however long after it was made. One long since put there that the
+    /// record no longer has counts as taken in.
+    pub fn taken_before_now(&self, at: u64, order: u64) -> bool {
+        if self.arriving.contains_key(&(at, order)) {
+            return false;
+        }
+        let now = sched::now();
+        let unstalled = crate::machine::nic::wire().unstalled_at[0];
+        let full = rx_full();
+        self.pushed.get(&order).is_none_or(|&(t, then)| {
+            t.saturating_add(TAKEN_SLACK) < now && unstalled < t && then == full
+        })
     }
 
     /// `frame`, to the machine, now and certainly: the attacker's own, or
@@ -146,6 +188,10 @@ impl Net {
                 break;
             }
             let frame = self.arriving.remove(&(at, order)).expect("the first");
+            self.pushed.insert(order, (now, rx_full()));
+            if self.pushed.len() > 1 << 16 {
+                self.pushed.pop_first();
+            }
             if machine::ECHO_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("[{:>12}] >> {}", now / 1000, check::describe(&frame));
             }

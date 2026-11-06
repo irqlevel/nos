@@ -590,6 +590,18 @@ pub mod tcp {
     /// The largest shift there is: a window of a gigabyte. A bigger one is
     /// taken as this (RFC 7323 2.3).
     pub const MAX_WSCALE: u8 = 14;
+    /// SACK permitted (RFC 2018 2): a SYN's, saying that its sender takes
+    /// selective acknowledgements once the connection is open.
+    pub const OPT_SACK_PERM: u8 = 4;
+    pub const OPT_SACK_PERM_LEN: u8 = 2;
+    /// SACK (RFC 2018 3): what its sender holds past the acknowledgement,
+    /// as blocks of a left edge and a right edge -- the first the one the
+    /// acknowledged segment came into, or a duplicate's (D-SACK, RFC 2883).
+    pub const OPT_SACK: u8 = 5;
+    pub const SACK_BLOCK_LEN: usize = 8;
+    /// The most blocks a header's 40 bytes of options carry: two NOPs, the
+    /// kind and the length, and four blocks.
+    pub const MAX_SACK_BLOCKS: usize = 4;
 
     #[inline]
     pub fn src_port(seg: &[u8]) -> u16 {
@@ -648,40 +660,58 @@ pub mod tcp {
         set_be16(seg, URGENT, 0);
     }
 
-    /// What option `kind` says, when the segment carries one `len` bytes
-    /// long: the bytes after its kind and length. The walk stops at the end
-    /// of the list, and at an option whose length runs past the header; one
-    /// of the kind but another length is passed over.
-    fn option(seg: &[u8], kind: u8, len: u8) -> Option<&[u8]> {
-        let hdr_len = header_len(seg);
-        if hdr_len <= HDR_LEN || hdr_len > seg.len() {
-            return None;
-        }
+    /// The options a segment's header carries, in order: each its kind and
+    /// the bytes after its kind and length. The walk stops at the end of the
+    /// list, and at an option whose length runs past the header or is less
+    /// than its own two bytes.
+    pub struct Options<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
 
-        let options = &seg[HDR_LEN..hdr_len];
-        let mut at = 0;
-        while at < options.len() {
-            let found = options[at];
-            if found == OPT_END {
-                break;
+    impl<'a> Iterator for Options<'a> {
+        type Item = (u8, &'a [u8]);
+
+        fn next(&mut self) -> Option<(u8, &'a [u8])> {
+            while self.at < self.bytes.len() {
+                let kind = self.bytes[self.at];
+                if kind == OPT_END {
+                    break;
+                }
+                if kind == OPT_NOP {
+                    self.at += 1;
+                    continue;
+                }
+                if self.at + 1 >= self.bytes.len() {
+                    break;
+                }
+                let len = self.bytes[self.at + 1] as usize;
+                if len < 2 || self.at + len > self.bytes.len() {
+                    break;
+                }
+                let value = &self.bytes[self.at + 2..self.at + len];
+                self.at += len;
+                return Some((kind, value));
             }
-            if found == OPT_NOP {
-                at += 1;
-                continue;
-            }
-            if at + 1 >= options.len() {
-                break;
-            }
-            let opt_len = options[at + 1] as usize;
-            if opt_len < 2 || at + opt_len > options.len() {
-                break;
-            }
-            if found == kind && opt_len == len as usize {
-                return Some(&options[at + 2..at + opt_len]);
-            }
-            at += opt_len;
+            /* Ended: and stays so */
+            self.at = self.bytes.len();
+            None
         }
-        None
+    }
+
+    /// The segment's options: none for a header that claims less than its
+    /// fixed part or more than the segment has.
+    pub fn options(seg: &[u8]) -> Options<'_> {
+        let hdr_len = header_len(seg);
+        let bytes = if hdr_len > HDR_LEN && hdr_len <= seg.len() { &seg[HDR_LEN..hdr_len] } else { &[] };
+        Options { bytes, at: 0 }
+    }
+
+    /// What option `kind` says, when the segment carries one `len` bytes
+    /// long: the bytes after its kind and length. One of the kind but
+    /// another length is passed over.
+    fn option(seg: &[u8], kind: u8, len: u8) -> Option<&[u8]> {
+        options(seg).find(|&(k, value)| k == kind && value.len() + 2 == len as usize).map(|(_, value)| value)
     }
 
     /// The peer's maximum segment size from a SYN's options, capped at ours.
@@ -702,6 +732,31 @@ pub mod tcp {
     /// scales.
     pub fn parse_wscale(seg: &[u8]) -> Option<u8> {
         option(seg, OPT_WS, OPT_WS_LEN).map(|value| value[0].min(MAX_WSCALE))
+    }
+
+    /// Whether a SYN says its sender takes SACK (RFC 2018 2).
+    pub fn sack_permitted(seg: &[u8]) -> bool {
+        option(seg, OPT_SACK_PERM, OPT_SACK_PERM_LEN).is_some()
+    }
+
+    /// The blocks of the segment's SACK option, as [left, right) in the
+    /// order they came, into `out`: how many, 0 for none. Only the first
+    /// SACK option counts, and only one whose length is a whole number of
+    /// blocks, MAX_SACK_BLOCKS at most -- the rest of a longer one, which
+    /// no header has room for, is not looked at. Nothing about the edges
+    /// is checked here: they are the peer's word, which its receiver holds
+    /// to what it sent.
+    pub fn sack_blocks(seg: &[u8], out: &mut [(u32, u32); MAX_SACK_BLOCKS]) -> usize {
+        let Some((_, value)) = options(seg).find(|&(k, _)| k == OPT_SACK) else { return 0 };
+        if value.is_empty() || value.len() % SACK_BLOCK_LEN != 0 {
+            return 0;
+        }
+        let n = (value.len() / SACK_BLOCK_LEN).min(MAX_SACK_BLOCKS);
+        for (i, block) in out.iter_mut().enumerate().take(n) {
+            let at = i * SACK_BLOCK_LEN;
+            *block = (be32(value, at), be32(value, at + 4));
+        }
+        n
     }
 
     /// The checksum a TCP segment carries: over the pseudo-header of

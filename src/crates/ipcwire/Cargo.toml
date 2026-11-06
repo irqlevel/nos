@@ -1,0 +1,9 @@
+[package]
+name = "ipcwire"
+version = "0.1.0"
+edition = "2021"
+
+# What two hosts' ipcnet say to each other inside their TLS session: frames,
+# and messages put back together from them. No kernel in it and no unsafe:
+# the ipcnet module builds it, and the fuzzers on the host (fuzz/ipc).
+[dependencies]

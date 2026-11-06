@@ -418,12 +418,12 @@ fn clients(state: &State, out: &mut Output) -> Result<(), String> {
 
 /// The key `word` names: its fingerprint, or `cert=<file>` -- the
 /// certificate's key, read off it.
-fn key_of(word: &str) -> Result<tls::server::Fingerprint, String> {
+fn key_of(word: &str) -> Result<tls::pinned::Fingerprint, String> {
     if let Some(path) = word.strip_prefix("cert=") {
         let bytes = kcore::fs::read(path, CERT_FILE_MAX).map_err(|_| alloc::format!("cannot read {}", path))?;
         let text = core::str::from_utf8(&bytes).map_err(|_| alloc::format!("{} is not text", path))?;
         let der = web::x509::pem_decode("CERTIFICATE", text).ok_or_else(|| alloc::format!("{} has no CERTIFICATE", path))?;
-        return tls::server::fingerprint(&der).ok_or_else(|| alloc::format!("{} is not a certificate", path));
+        return tls::pinned::fingerprint(&der).ok_or_else(|| alloc::format!("{} is not a certificate", path));
     }
     files::parse_hex(word).ok_or_else(|| String::from("a fingerprint is 64 hex digits: the SHA-256 of the key's \
                                                        SubjectPublicKeyInfo, or cert=<file.pem>"))

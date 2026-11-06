@@ -70,6 +70,10 @@ const LISTEN_BACKLOG: usize = 8;
 /* The longest wait for a connection, or on one, at a time: how soon a stop
    is noticed */
 const POLL_MS: u64 = 250;
+/// How long a session that got to a login waits for its client's FIN once
+/// it is over, before closing its own end: the client closes first, and
+/// keeps the TIME-WAIT itself.
+const CLIENT_FIN_MS: u64 = 2000;
 /* A client that takes none of what it is sent for this long -- its TCP
    window shut -- is not coming back for it, and its session is given up, as
    it is when it leaves its SSH window shut as long */
@@ -707,11 +711,14 @@ extern "C" fn session_main(ctx: *mut u8) {
     let mut link = KernelLink { stream, shared: &shared };
     let mut shell = KernelShell { shared: &shared, id, peer, user: None };
     let result = ssh::serve(&mut link, &mut shell, &shared.host, &CONFIG);
-    /* A session that got to a login closes the usual way: its client has
-       mostly closed first, and the TIME-WAIT is the client's. One that never
-       did -- a scanner, a login that timed out -- is reset: the server would
-       be closing first, and every such close would keep a TCP slot a minute */
+    /* A session that got to a login closes the usual way, its client first:
+       its FIN, which follows the session's end at once, waited for a moment
+       -- a server woken the moment the end comes would otherwise close
+       before the FIN arrives, and keep the TIME-WAIT itself, a TCP slot a
+       minute. One that never got to a login -- a scanner, a login that timed
+       out -- is reset */
     if shell.user.is_some() {
+        link.wait_for_end(CLIENT_FIN_MS);
         drop(link);
     } else {
         link.stream.abort();
@@ -739,6 +746,28 @@ extern "C" fn session_main(ctx: *mut u8) {
 struct KernelLink<'a> {
     stream: TcpStream,
     shared: &'a Shared,
+}
+
+impl KernelLink<'_> {
+    /// Until the client's end of the stream, at most `ms`: what it sends
+    /// meanwhile is not read.
+    fn wait_for_end(&mut self, ms: u64) {
+        let until = boot_time_ns() + ms * NS_PER_MS;
+        let mut scratch = [0u8; 256];
+        loop {
+            let now = boot_time_ns();
+            if now >= until || self.shared.stop.load(Ordering::Acquire) {
+                return;
+            }
+            let wait = ((until - now) / NS_PER_MS).clamp(1, POLL_MS);
+            match self.stream.recv(&mut scratch, wait) {
+                /* Data after the end, or nothing yet: on to the FIN */
+                n if n > 0 || n == RECV_TIMEOUT => {}
+                /* Its FIN -- or the connection gone */
+                _ => return,
+            }
+        }
+    }
 }
 
 impl ssh::Link for KernelLink<'_> {

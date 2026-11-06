@@ -67,7 +67,7 @@ const CLIENT_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x64];
 /// input sees it run out.
 const IDLE_SECS: u64 = 10;
 const IDLE: u64 = IDLE_SECS * SEC;
-const HANDSHAKE: u64 = tls::server::HANDSHAKE_MS * MS;
+const HANDSHAKE: u64 = tls::pinned::HANDSHAKE_MS * MS;
 /// How long the server may count a connection after its client is done
 /// with it: until the connection's task has ended it.
 const REAP: u64 = SEC;
@@ -1171,7 +1171,7 @@ fn clients_file(off: &[(Who, u64)]) -> String {
         }
         let cert = if who == Who::Known { &keys().known.cert } else { &keys().reader.cert };
         let (name, role) = role_of(who);
-        text.push_str(&format!("{} {} {}\n", hex(&tls::server::fingerprint(cert).expect("a certificate")), role, name));
+        text.push_str(&format!("{} {} {}\n", hex(&tls::pinned::fingerprint(cert).expect("a certificate")), role, name));
     }
     text
 }
@@ -1180,8 +1180,8 @@ fn clients_file(off: &[(Who, u64)]) -> String {
 /// once as a reader --, a role it has not got, a fingerprint that is not
 /// one, a name it does not take, a line of four words.
 fn bad_clients(which: u8) -> String {
-    let known = hex(&tls::server::fingerprint(&keys().known.cert).expect("a certificate"));
-    let reader = hex(&tls::server::fingerprint(&keys().reader.cert).expect("a certificate"));
+    let known = hex(&tls::pinned::fingerprint(&keys().known.cert).expect("a certificate"));
+    let reader = hex(&tls::pinned::fingerprint(&keys().reader.cert).expect("a certificate"));
     match which % 5 {
         0 => format!("{} admin panel\n{} read viewer\n{} read other\n", known, reader, known),
         1 => format!("{} admin panel\n{} root viewer\n", known, reader),
@@ -1195,7 +1195,7 @@ fn bad_clients(which: u8) -> String {
 fn add_back(w: &mut World<Wire>, who: Who) {
     let (name, role) = role_of(who);
     let cert = if who == Who::Known { &keys().known.cert } else { &keys().reader.cert };
-    let fp = tls::server::fingerprint(cert).expect("a certificate");
+    let fp = tls::pinned::fingerprint(cert).expect("a certificate");
     let out = console(w, &format!("api client add {} {} {}", name, role, hex(&fp)));
     invariant!(out.contains("lets in"), "`api client add {}`: {:?}", name, out);
 }
@@ -1680,8 +1680,8 @@ fn setup(limits: Limits, allow: Option<bool>, identity: bool) -> Setup {
         Some(false) => toml.push_str("allow_eth0 = [\"192.168.0.0/16\", \"10.0.2.1\"]\n"),
         None => {}
     }
-    let known = tls::server::fingerprint(&keys.known.cert).expect("the known key's certificate");
-    let reader = tls::server::fingerprint(&keys.reader.cert).expect("the reader's certificate");
+    let known = tls::pinned::fingerprint(&keys.known.cert).expect("the known key's certificate");
+    let reader = tls::pinned::fingerprint(&keys.reader.cert).expect("the reader's certificate");
     let clients = format!("{} admin panel\n{} read viewer\n", hex(&known), hex(&reader));
     let mut written = kcore::fs::create_dir("/etc").and_then(|_| kcore::fs::create_dir("/etc/api"))
         .and_then(|_| kcore::fs::create("/etc/api/api.toml", toml.as_bytes()))
@@ -1753,7 +1753,7 @@ pub fn api(r: &mut Input) {
                s.loaded, s.started);
     let pin = pin.expect("checked");
     if identity {
-        invariant!(Some(pin) == tls::server::fingerprint(&keys.server.cert), "a host key other than the one in its \
+        invariant!(Some(pin) == tls::pinned::fingerprint(&keys.server.cert), "a host key other than the one in its \
                    folder: {}", hex(&pin));
     }
     let ctx = Ctx { pin_hex: hex(&pin), limits, lossless, allowed: allow != Some(false) };

@@ -207,6 +207,7 @@ swallowing panic messages whole.
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
+| `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `scripts/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
 | `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`block/src/table.rs`, the NVMe's identity), the claims and their holders, `block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hv/src/devices.rs`, a device disk in `modules/hv/src/disk.rs`, the pour onto a device |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
@@ -225,6 +226,7 @@ swallowing panic messages whole.
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
+| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -557,6 +559,44 @@ disk's. It is the only test of `submit`/`kick`, of frames kept across calls
 for the disk to DMA into, and of `kcore`'s module-facing `block` and `net`.
 x86-64 runs under KVM unless `--tcg`; `--arch aarch64` is the one that runs
 on a Mac. See [netblk](netblk.md#using-it).
+
+### `ipc-test.py` -- the channel between hosts, three kernels on a LAN
+
+Three nos, `a`, `b` and `c`, each with ipcnet.ko and a key the test made
+with openssl -- on x86-64 booted from an ISO whose command line has the UDP
+shell, `make nos-test.iso TEST_ISO_ARGS=udpshell=9100` -- on the LAN of
+`scripts/hub.py`: a learning switch over QEMU's
+`-netdev dgram`, which answers each VM's DHCP with 10.9.0.<n>, relays the
+test's UDP shell to it from 10.9.0.253 -- past the impairments, which are
+the VMs' between themselves -- and drops, delays, jitters and cuts between
+any two. `a` and `b` pin each other; `a` pins `c` by a key `c` does not have,
+and `c` holds `b`'s key, pinning `a`; `b` pins `a` alone. kernel.echo runs
+on each, a `Cluster` name, and `ipc ping` is what goes between them:
+
+- both up, said in the log; 200 small pings each way, eight in flight, and
+  sixteen of a megabyte by the bulk connection -- every answer the bytes
+  sent, in the order sent; the links' 20 ms floor in `tcpstat`, at the
+  end that dialed and at the end that accepted (the accepting end's once
+  kept the 200 every connection starts with, and waited out each of its
+  losses ten times as long);
+- a name nobody has there bounced back (`Gone`), and messages past the
+  echo's mailbox (`Full`), every other one answered whole;
+- under 5% loss and a jittered delay, every message and every megabyte
+  answered whole and in order, the retransmissions counted;
+- the link cut: both hosts lose each other within 3 s and a margin, and a
+  ping running across it ends with its monitor's Down; healed, up and
+  talking again;
+- `c`, whose key is not the one pinned for it, never up -- its handshake
+  refused by `a`, which dials it -- and its SYNs to `b`'s port, where it is a
+  stranger, dropped and counted with no slot taken;
+- `rmmod ipcnet` on `a` under `b`'s traffic: prompt, `b`'s ping ending with
+  its Down, `b` having `a` down, `a` with no router; loaded again, up and
+  talking.
+
+What it does not reach yet: three hosts' traffic at once, a peer at its
+limits slowed while another goes on, and the measurements on the boxes --
+here a round trip of a small message is some 0.4 ms at the median, through
+a switch in Python.
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
 
@@ -1065,18 +1105,33 @@ own, TCP's flags in combinations that mean something. The targets:
   number, an ICMP error at every quoted one. The machine's connects are
   plain or bulk, and so is one of its listeners, and the peer scales its
   window or not, at any shift -- past RFC 7323's 14 too -- so that the
-  window the machine offers runs past 64 KiB and must never shrink, not even
-  by the rounding of its units, and what the link reorders is kept past a
-  hole and taken in when it fills; the link loses the machine's own data, a
-  little or a lot, for its sender's recovery -- fast retransmit, NewReno,
-  a timeout's slow start -- to fill every hole and keep every byte; and a
-  blind reset in the window, past the edge of everything the peer sent, must
-  change nothing (RFC 5961). And now and then a second
-  device, eth1, standing for the hypervisor's switch, from which a guest
-  sends a SYN to a port the machine listens on -- at eth1's address or at
-  eth0's: a listener takes connections from its own device alone, so no
-  SYN-ACK may go out to it on either wire (the first input of the control
-  run with the device left out of the listener's lookup got one);
+  window the machine offers runs past 64 KiB and must never shrink but by
+  less than its unit (RFC 7323 2.4's retracted window, which 55% of the
+  inputs see), never reach past the receive buffer -- every connection's
+  furthest edge audited against it, and the kernel's count of bytes inside a
+  window offered that found no room held to none; the old edge rounded up,
+  put back as a control, fails at the second input -- and what the link
+  reorders is kept past a hole and taken in when it fills; the link loses
+  the machine's own data, a little or a lot, for its sender's recovery --
+  RACK's, the loss probe's, a timeout's slow start, and NewReno's with a
+  peer that does not take SACK -- to fill every hole and keep every byte;
+  and a blind reset in the window, past the edge of everything the peer
+  sent, must change nothing (RFC 5961). Most connections take SACK, the peer
+  saying up to four blocks, fewer, or none at all, and now and then letting
+  go of what it SACKed: a SACK block of the machine's must name only what
+  had reached it, a D-SACK only what had reached it twice, and neither may
+  come on a connection that did not agree to SACK; and the machine may never
+  send again what the peer had told it it held -- cumulatively, or by SACK
+  and not let go of since -- by an acknowledgement the machine had taken in:
+  one at its RCV.NXT, which no window turns away, put on its NIC a
+  millisecond before, with its transmit side not stopped since (a frame made
+  while it took in a batch, or held by a stopped NIC, is seen later than it
+  was made). And now and then a second device, eth1, standing for the
+  hypervisor's switch, from which a guest sends a SYN to a port the machine
+  listens on -- at eth1's address or at eth0's: a listener takes connections
+  from its own device alone, so no SYN-ACK may go out to it on either wire
+  (the first input of the control run with the device left out of the
+  listener's lookup got one);
 - `http` and `https`: the HTTP client fetching through chains of redirects
   from a server that answers well -- whose result is then known exactly --
   or to break it: numbers longer than any field, chunk sizes of every
@@ -1128,7 +1183,7 @@ own, TCP's flags in combinations that mean something. The targets:
   it -- run with none, or after a pty-req of a size and window-changes to
   others, sizes of 0 and of `u32::MAX` among them -- and must say the last
   size sent and how many changes there were, as `edit` is told them;
-- `tls_server`: the TLS server the host API serves over (`tls::server`), run
+- `tls_server`: the TLS server the host API serves over (`tls::pinned::Server`), run
   as the module runs it -- a listener and a task a connection over the
   kernel's TCP, at most four at once -- letting in one key and answering
   each line said to it; and the world's TLS clients (`tlsc.rs`, rustls'
@@ -1144,6 +1199,20 @@ own, TCP's flags in combinations that mean something. The targets:
   the protocol both prefer, every line back in order and a goodbye; the
   server is never the side left in TIME-WAIT, and once it stops nothing is
   left behind;
+- `tls_client`: the pinned client (`tls::pinned::Client`), what ipcnet's
+  link to another host will be, run as a module will -- a task that
+  connects over the kernel's TCP, says lines and reads them back -- against
+  the world's rustls server, which shows its own key, a stranger's, or its
+  own certificate signed by another key; asks for the client's certificate
+  and lets the machine's key in, asks and lets in another's, or does not
+  ask; or breaks the protocol -- an HTTP answer for a ServerHello, silence,
+  a hang-up, TLS 1.2 alone, no protocol in common, a byte flipped. Over any
+  link a session is up only with the server's own key, proved, and nothing
+  is read that was not said; over a good one each connection is refused for
+  its plan's reason, or every byte comes back and the client closes cleanly,
+  first. Five mutants of the client -- the key not checked, the signature
+  not checked, TLS 1.2 spoken, the client waiting for the server's FIN, the
+  key not kept -- each fail it;
 - `api`: the host API module's own source (`modules/api`) on a ramfs root,
   its api.toml and clients written there first, its host key found there or
   made on its first start; on the bus the kernel's system provider (its
@@ -1185,6 +1254,40 @@ own, TCP's flags in combinations that mean something. The targets:
   for the session's end (in `tls::server`, whose own target now sends
   one); 27 bugs planted in the module one at a time were each caught, 26 of
   them within the gate's 500 inputs;
+- `ipcnet`: the ipcnet module's own source (`modules/ipcnet`) as host `b`
+  of a cluster, over the image's channel (the `ipc` crate), its hosts.toml
+  and key on a ramfs root, and two mailboxes of the image's: `nbs.sink`, a
+  Cluster name that keeps what it gets -- paused when the input says, so
+  that it fills -- and `kernel.hidden`, a Host name; and a third, the
+  victim, closed when the input says. The world is host `a`, dialing `b` as
+  a host of nos does -- the control connection, then the bulk one once it
+  has said its Hello, and now and then both at once -- with the key `b`
+  pins, a stranger's or an impostor's, and a Hello right or of another
+  cluster, for another host, from a host `b` does not know, or none; and,
+  once up, speaking ipcwire through `tlsc.rs`'s talk: messages to the sink
+  by name and by address, by both classes, of every size, to the Host name
+  and to addresses nobody has, bursts into the paused sink, monitors of the
+  victim, its own Pings, silence, frames the wire refuses or out of their
+  place, connections closed; while the sink answers `nbs.w@a`, and the
+  console stops and starts the server. What must hold: nothing reaches the
+  Host name; what reaches the sink is the world's, each once, in order
+  within a class and a sender, and by its address only once the sink has
+  sent to `a`, with the peer's number in its sender; what reaches the world
+  is the sink's, each once and in order, from the sink's own address; a key
+  not pinned is never up, a wrong Hello never answered; a burst past the
+  sink's places bounced back for each it had no room for, and a bounce only
+  of a message the sink never got; a Down only of a monitor asked, once,
+  Closed only once the victim is closed -- and, on a perfect link, every
+  monitor of it on a session still up told; the world's Pings answered; a
+  silent world lost within 3 s and a margin; and once the module is
+  unloaded, no router and nothing left behind. Nine of ten bugs planted in
+  the module are caught -- a peer's message it may not reach bounced, a full
+  mailbox's not, two messages of one pair begun at once, silence never
+  losing the peer, a Hello of another cluster or for another host taken, a
+  Down under the router's own id or never said, a Pong never said; the
+  tenth, a loss that bounces nothing of what never went, is not: the world
+  cannot tell what was queued from what was begun, and a message begun is
+  lost with its connection by design;
 - `terminal`: the session's line editor (`ssh::terminal`) on its own, typed
   at with any byte -- weighted to the keys it acts on and a few letters, so
   that lines repeat and a search finds them, with runs of one key past the
@@ -2540,6 +2643,98 @@ it; SHA-1's round constant; GeneralizedTime from 2051, a client's
 certificate for servers, a serial's top bit set; a leading zero in an
 address -- each failed it. Needs cargo and openssl; `--seed N --iters N` for
 a campaign.
+
+### `raft-test.py` -- consensus, decided on the host
+
+Consensus that loses a committed entry, elects two leaders in a term or
+confirms a stale read looks like a group that works -- until the one
+schedule of crashes and losses that breaks it. `fuzz/raft` compiles the
+raft crate, as it is, into a host program and holds it, in under five
+seconds, to:
+
+- **Known answers**: every kind of message written and read back, a vote's
+  bytes as the format has them, bytes that are not a message refused each
+  for its reason; the storage's log across its pieces, written over and
+  compacted; a lone voter that leads, commits and reads on its own; the
+  membership change rules; a member added later making the group's
+  membership of the log it is sent.
+- **The known traps**, each played out step by step: the paper's figure 8, a
+  deposed leader asked for a read, a membership change before the leader's
+  first commit (the 2015 erratum), a snapshot overtaken while it is sent and
+  its pieces lost, doubled and reordered, a member back under its old id with
+  a wiped disk -- which the checks must catch, and the harness refuses -- a
+  vote not written before it is answered, the election timer and a vote
+  given in the same term, a follower's commit past what its append showed,
+  a PreVote taken for a vote, an append after an entry of another term.
+- **The node target**, 2000 groups of one to seven, 5000 steps each: a
+  network that delays, loses, doubles, reorders and cuts; members crashing
+  and back with exactly what they wrote; members added, promoted, demoted
+  and taken out; leadership handed over; snapshots taken and sent. At every
+  step: one leader a term; a new leader holding every entry committed in an
+  earlier term; logs that agree on an entry's term agreeing on everything
+  before it; no committed entry changed, and every member applying the same
+  entries to the same state, a snapshot taken in carrying it; no read
+  confirmed behind what was committed before it was asked; no election
+  before the timer ran out since a vote, a leader or a term; no message
+  taken for one that cannot be. Then the network healed: a leader, and a new
+  entry applied by every voter, within 600 rounds.
+- **The wire target**: messages written and read back; noise and broken
+  messages read without a panic, anything taken written back to its very
+  bytes.
+- **The node target's disks fail reads**, in a fifth of its runs, one read
+  in some hundreds: a member must stop on the first (`fault` said, no
+  `Ready` after it) and is crashed and started again, every property above
+  still held; and once healed, every read asked of a member still leading
+  in its term must be answered -- which found, besides the round asked once,
+  a round a change of voters confirmed that nothing answered.
+- **The storage target**, 20 runs of 300 operations: `MemStorage` against a
+  model of its log -- appends over its end and into it, snapshots taken in
+  logs of tens of thousands of entries and sent -- every term and range of
+  entries the model's.
+- **The hostile target**, 2000 runs of 3000 steps of one member fed what no
+  correct member sends -- every kind of message, of terms and indexes about
+  its own and of any value, from members and strangers, noise the wire
+  takes, and answers to what it sent, true and false, so that it leads and
+  sends snapshots too -- crashed, compacted and started over: no panic, and
+  its term, its vote within a term and its commit never going back, nothing
+  committed past what it holds, entries handed out in order and as written,
+  a vote answered only once it is on the disk, nothing sent the wire would
+  not read back as it was.
+
+Every allocation of all of it is held to what the kernel's heap gives at
+once, 512 KiB (`fuzz/raft/src/heap.rs`): a larger block is a finding, the
+first with its backtrace. `long_log` is the test for it -- 30,000 empty
+entries and 12,000 membership changes, started over and applied again, a
+leader ticking 20,000 times with nobody taking its messages -- which, before
+the change list was kept in pieces and every batch held to a count as well
+as bytes, asked for eleven blocks past it, the largest 4 MiB.
+
+`fuzz/raft/mutants.py` takes one rule at a time out of the crate -- the
+figure 8 check, a vote written before it is answered, the timer started
+over by a vote, a follower's commit held to its append, a PreVote kept
+apart from a vote, an append's previous term checked, the 2015 rule, a
+read's round of heartbeats, a failed read stopping the member, a round
+asked by every heartbeat, an append taken in part, a snapshot that keeps
+the log in pieces -- and each must fail the gate, and fail the scenario
+written for it on its own. Campaigns found three things the gate now holds: an
+append window filled with appends lost for good, which nothing emptied (a
+heartbeat's answer now frees one); a candidate of an older membership
+standing term after term ahead of the voters of the newer, which never
+caught up; and a leader cut off that never heard of the later term (a vote
+request and an append of an older term are both now answered with ours).
+The review of the first version found six things, each now a scenario
+that failed on it (`fuzz/raft/src/review.rs`): a storage's failed read
+taken as no entry (a vote given on it), an encode that grew its buffer
+past a block of the heap, a read whose round was lost never answered, a
+snapshot that copied the log after it, an append dropped whole where part
+of it fit, and a storage's or configuration's values taken unbounded --
+and a snapshot given up mid-way held until the term changed. The hostile
+target found the harness's own overflow first and nothing of the crate's
+since; terms and indexes no group reaches (2^62 and past) are
+refused before they are looked at, so no arithmetic on what a peer says can
+overflow. `--seed N --seconds S` for a campaign of the node target;
+`--mutants` to run the mutants after the gate; `raft-fuzz hostile --seed N`
+and `wire --seed N` run those targets by hand.
 
 ### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 

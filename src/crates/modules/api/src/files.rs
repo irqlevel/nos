@@ -15,7 +15,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
-use tls::server::Fingerprint;
+use tls::pinned::Fingerprint;
 use zeroize::Zeroize;
 
 pub const DEFAULT_DIR: &str = "/etc/api";
@@ -208,7 +208,7 @@ pub fn identity(dir: &Dir, ips: &[[u8; 4]]) -> Result<(Identity, bool), String> 
         .ok_or_else(|| alloc::format!("{} has no PRIVATE KEY", key_path))?);
     let cert = web::x509::pem_decode("CERTIFICATE", &cert_pem)
         .ok_or_else(|| alloc::format!("{} has no CERTIFICATE", cert_path))?;
-    let key_fingerprint = tls::server::fingerprint(&cert).ok_or_else(|| alloc::format!("{} is not a certificate", cert_path))?;
+    let key_fingerprint = tls::pinned::fingerprint(&cert).ok_or_else(|| alloc::format!("{} is not a certificate", cert_path))?;
     let id = match read_text(&id_path)? {
         Some(t) => t.trim().to_string(),
         None => return Err(alloc::format!("{} is missing -- the host's id is made with its key", id_path)),

@@ -1,0 +1,16 @@
+[package]
+name = "mod-tlsbench"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_tlsbench"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }
+# Both pinned ends, server and client, as ipcnet's links will be.
+tls = { path = "../../tls", features = ["pinned"] }
+# The two ends' keys and certificates, made at each run.
+web = { path = "../../web" }

@@ -7,11 +7,13 @@ mod dhcp;
 mod dns;
 mod http;
 mod icmp;
+mod ipcnet;
 mod netconsole;
 mod ssh;
 mod stack;
 mod tcp;
 mod terminal;
+mod tls_client;
 mod tls_server;
 mod udpshell;
 
@@ -29,8 +31,10 @@ pub static ALL: &[Target] = &[
     Target { name: "netconsole", run: netconsole::netconsole, max_len: 1024, gate: 1000 },
     Target { name: "ssh", run: ssh::ssh, max_len: 1024, gate: 300 },
     Target { name: "tls_server", run: tls_server::tls_server, max_len: 1024, gate: 300 },
+    Target { name: "tls_client", run: tls_client::tls_client, max_len: 1024, gate: 300 },
     Target { name: "terminal", run: terminal::terminal, max_len: 4096, gate: 20000 },
     Target { name: "api", run: api::api, max_len: 1024, gate: 500 },
+    Target { name: "ipcnet", run: ipcnet::ipcnet, max_len: 1024, gate: 2000 },
 ];
 
 /// Everything the machine still holds of what an input did, once it has
@@ -39,6 +43,49 @@ pub static ALL: &[Target] = &[
 /// take and keep.
 pub fn audit() {
     audit_but(&[], &[]);
+}
+
+/// The TCP timer's promise (the timer's task in net/src/tcp.rs): no
+/// connection's retransmission is left past its deadline by more than the
+/// task's wakeup can be late -- a tick of the machine's, which rounds every
+/// sleep up to one -- with one to spare: the pass the task runs then sends
+/// again or sets a deadline anew. A closed connection's is nobody's: the
+/// pass skips it, and the slot's cleanup is all that is left of it.
+pub fn check_tcp_timer() {
+    /* No byte the window offered ever found the buffer without room for it */
+    let overrun = net::tcp::TCP.stats().rx_overrun;
+    invariant!(overrun == 0, "TCP: {} bytes inside a window offered found no room in the receive buffer", overrun);
+    let now_ms = crate::machine::sched::now() / 1_000_000;
+    let late = 2 * crate::machine::sched::TICK / 1_000_000 + 1;
+    for i in 0..net::tcp::MAX_CONNECTIONS {
+        if let Some(c) = net::tcp::TCP.snapshot(i) {
+            /* Its timeout held to its floor, and the floor to what a
+             * connection may be given (`set_rto_floor`) */
+            invariant!((net::tcp::LINK_MIN_RTO_MS..=net::tcp::MIN_RTO_MS).contains(&c.min_rto_ms),
+                       "TCP slot {} has a floor of {} ms for its timeout", i, c.min_rto_ms);
+            invariant!((c.min_rto_ms..=net::tcp::MAX_RTO_MS).contains(&c.rto_ms), "TCP slot {} ({}, port {} -> {}): \
+                       its timeout is {} ms, its floor {} ms", i, c.state.name(), c.local_port, c.remote_port,
+                       c.rto_ms, c.min_rto_ms);
+            if c.retransmit_at != 0 && c.state != net::tcp::State::Closed {
+                invariant!(now_ms <= c.retransmit_at + late, "TCP slot {} ({}, port {} -> {}): its retransmission was \
+                           due at {} ms and is still not looked at, at {} ms", i, c.state.name(), c.local_port,
+                           c.remote_port, c.retransmit_at, now_ms);
+            }
+            /* Its table of what is in flight what it says of itself, and
+             * the window it offers within its receive buffer */
+            if let Some(wrong) = net::tcp::TCP.audit_sent(i) {
+                panic!("invariant: TCP slot {} ({}, port {} -> {}): {}", i, c.state.name(), c.local_port,
+                       c.remote_port, wrong);
+            }
+            /* And a connection half open is given up after its time --
+             * looked at by a retransmission's pass or a sweep */
+            if c.state == net::tcp::State::SynReceived {
+                let by = c.opened_ms + net::tcp::HALF_OPEN_MS + net::tcp::SWEEP_MS + late;
+                invariant!(now_ms <= by, "TCP slot {} (port {} -> {}): half open since {} ms, and still at {} ms",
+                           i, c.local_port, c.remote_port, c.opened_ms, now_ms);
+            }
+        }
+    }
 }
 
 /// `audit`, but for the TCP connections on `held`'s ports -- the machine's
@@ -62,6 +109,9 @@ pub fn audit_but(held: &[(u16, u16)], waiting: &[usize]) {
         let pool = net::frame::POOL.stats();
         invariant!(pool.in_flight == 0, "{} frames out of the pool with nothing left to hold one", pool.in_flight);
     }
+    /* TCP's timer's task waits for good, as it does in the kernel: stopped
+     * here, where nothing is left for it to do */
+    net::tcp::TCP.stop_timer();
     for (id, name, kind, st, holds) in crate::machine::sched::tasks() {
         if waiting.contains(&id) {
             continue;

@@ -19,7 +19,7 @@ kcore = { path = "../../src/crates/kcore" }
 netwire = { path = "../../src/crates/netwire" }
 net = { path = "../../src/crates/net" }
 # The server too: the host API's (the tls_server target).
-tls = { path = "../../src/crates/tls", features = ["server"] }
+tls = { path = "../../src/crates/tls", features = ["pinned"] }
 # The certificates of the world's TLS clients and of the server they talk to.
 web = { path = "../../src/crates/web" }
 fs = { path = "../../src/crates/fs" }
@@ -32,6 +32,10 @@ mgmt = { path = "../../src/crates/mgmt" }
 mgmtwire = { path = "../../src/crates/mgmtwire" }
 conf = { path = "../../src/crates/conf" }
 zeroize = { version = "1", default-features = false }
+# The message channel, the image's, and what ipcnet says between hosts (the
+# ipcnet target, over the module's source).
+ipc = { path = "../../src/crates/ipc" }
+ipcwire = { path = "../../src/crates/ipcwire" }
 # The other end of the protocols the kernel speaks: the fuzzer's TLS server
 # and SSH client. The features are the kernel's own, so that the crates the
 # two share are built the same.

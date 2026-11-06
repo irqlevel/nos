@@ -456,6 +456,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "ipcwire",
+ "kcore",
+]
+
+[[package]]
+name = "ipcwire"
+version = "0.1.0"
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
@@ -472,6 +485,7 @@ dependencies = [
  "fs",
  "hello",
  "igb",
+ "ipc",
  "kcore",
  "mgmt",
  "mgmtwire",
@@ -590,6 +604,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-ipcnet"
+version = "0.1.0"
+dependencies = [
+ "conf",
+ "ipcwire",
+ "kcore",
+ "kmod",
+ "tls",
+ "web",
+ "zeroize",
+]
+
+[[package]]
 name = "mod-modtest"
 version = "0.1.0"
 dependencies = [
@@ -630,6 +657,16 @@ dependencies = [
  "kcore",
  "kmod",
  "ssh",
+]
+
+[[package]]
+name = "mod-tlsbench"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+ "tls",
+ "web",
 ]
 
 [[package]]
@@ -859,6 +896,10 @@ dependencies = [
  "kcore",
  "net",
 ]
+
+[[package]]
+name = "raft"
+version = "0.1.0"
 
 [[package]]
 name = "rand"

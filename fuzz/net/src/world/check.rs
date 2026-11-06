@@ -173,18 +173,35 @@ fn tcp_tx(src: u32, dst: u32, s: &[u8]) -> Result<(), String> {
     let payload = s.len() - hlen;
     ensure!(!(rst && payload != 0) && !(syn && payload != 0), "data on a SYN or a RST");
     ensure!(syn || rst || flags & tcp::ACK_FLAG != 0, "a TCP segment with no ACK, flags {:#04x}", flags);
-    /* The options this stack sends: an MSS on a SYN -- and a window scale
-     * after it, past a NOP and no more than RFC 7323's largest: on a SYN
-     * that opens a bulk connection of its own, and on a bulk listener's
-     * SYN-ACK. Whether that SYN-ACK answers a SYN that offered one is the
-     * TCP model's to say, which knows what the peer's SYN said. Nothing
+    /* The options this stack sends: on a SYN an MSS -- then SACK
+     * permitted, past two NOPs, and a window scale, past a NOP and no more
+     * than RFC 7323's largest: on a SYN that opens a bulk connection of its
+     * own, and on a bulk listener's SYN-ACK. Whether a SYN-ACK says SACK,
+     * or scales, answering the SYN it answers, is the TCP model's to say,
+     * which knows what the peer's SYN said. On any other segment but a
+     * reset, SACK blocks past two NOPs, one to four of them -- which the
+     * model holds to SACK having been agreed, and to what came. Nothing
      * else, anywhere. */
     if hlen > tcp::HDR_LEN {
         let o = &s[tcp::HDR_LEN..hlen];
-        let mss = o.len() >= 4 && o[0] == tcp::OPT_MSS && o[1] == tcp::OPT_MSS_LEN;
-        let ws = o.len() == 8 && o[4] == tcp::OPT_NOP && o[5] == tcp::OPT_WS && o[6] == tcp::OPT_WS_LEN
-            && o[7] <= tcp::MAX_WSCALE;
-        ensure!(syn && mss && (o.len() == 4 || ws), "TCP options {:02x?}", o);
+        if syn {
+            ensure!(o.len() >= 4 && o[0] == tcp::OPT_MSS && o[1] == tcp::OPT_MSS_LEN, "TCP options {:02x?}", o);
+            let mut rest = &o[4..];
+            if rest.starts_with(&[tcp::OPT_NOP, tcp::OPT_NOP, tcp::OPT_SACK_PERM, tcp::OPT_SACK_PERM_LEN]) {
+                rest = &rest[4..];
+            }
+            if rest.len() == 4 && rest[0] == tcp::OPT_NOP && rest[1] == tcp::OPT_WS && rest[2] == tcp::OPT_WS_LEN
+                && rest[3] <= tcp::MAX_WSCALE
+            {
+                rest = &rest[4..];
+            }
+            ensure!(rest.is_empty(), "TCP options {:02x?}", o);
+        } else {
+            let blocks = o.len().saturating_sub(4) / tcp::SACK_BLOCK_LEN;
+            ensure!(!rst && (1..=tcp::MAX_SACK_BLOCKS).contains(&blocks) && o.len() == 4 + blocks * tcp::SACK_BLOCK_LEN
+                    && o[..4] == [tcp::OPT_NOP, tcp::OPT_NOP, tcp::OPT_SACK, (2 + blocks * tcp::SACK_BLOCK_LEN) as u8],
+                    "TCP options {:02x?}", o);
+        }
     }
     Ok(())
 }

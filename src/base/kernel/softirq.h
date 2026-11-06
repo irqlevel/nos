@@ -44,7 +44,6 @@ public:
     static const ulong TYPE_NET_RX = 0;
     static const ulong TYPE_BLK_IO = 1;
     static const ulong TYPE_NET_TX = 2;
-    static const ulong TYPE_TCP_TIMER = 3;
     static const ulong MAX_TYPES = 8;
 
 private:

@@ -2846,6 +2846,132 @@ bool test_module_bus()
     return check_bus_unloaded(out).ok();
 }
 
+/* What the shell answers `cmd` with, into out, waited for until it has
+   `want` in it -- up to polls milliseconds: whether it came */
+static bool answers(const char* cmd, const char* want, stdlib::BufferPrinter& out, ulong polls)
+{
+    for (ulong i = 0; i < polls; i++)
+    {
+        out.reset();
+        Cmd::dispatch(cmd, out);
+        if (stdlib::str_str(out.get(), want) != nullptr)
+            return true;
+        sleep(consts::NANO_SECS_IN_MS);
+    }
+    return false;
+}
+
+/* modtest loaded and its `modtest ipc` run against kernel.echo, its names
+   seen, and the echo seen pestering its mailbox: whether all of it went */
+static bool check_ipc_loaded(stdlib::BufferPrinter& out)
+{
+    static const ulong PESTER_WAIT_POLLS = 2000;
+
+    out.reset();
+    Cmd::dispatch("modtest ipc", out);
+    if (stdlib::str_str(out.get(), "modtest ipc: ok") == nullptr)
+    {
+        klog(0, "test_module_ipc: the module's side: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    Cmd::dispatch("ipc names modtest.", out);
+    if (stdlib::str_str(out.get(), "modtest.ipc") == nullptr || stdlib::str_str(out.get(), "modtest.leaked") == nullptr)
+    {
+        klog(0, "test_module_ipc: the module's names: %s", out.get());
+        return false;
+    }
+
+    /* The echo takes the request in its own time: traffic before the unload */
+    if (!answers("ipc echo", "pestering 1,", out, PESTER_WAIT_POLLS))
+    {
+        klog(0, "test_module_ipc: the echo never pestered the module: %s", out.get());
+        return false;
+    }
+    return true;
+}
+
+/* After the unload, under the echo's traffic: the module's mailbox closed by
+   its drop and the echo's monitor told, the one it left open closed by the
+   sweep, its names gone, and once the echo stops, nothing queued anywhere */
+static bool check_ipc_unloaded(stdlib::BufferPrinter& out)
+{
+    static const ulong DOWN_WAIT_POLLS = 2000;
+
+    if (!answers("ipc echo", "pestering 0,", out, DOWN_WAIT_POLLS) || stdlib::str_str(out.get(), "downs 0,") != nullptr)
+    {
+        klog(0, "test_module_ipc: the echo was never told the module's mailbox went: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    Cmd::dispatch("ipc names modtest.", out);
+    if (stdlib::str_str(out.get(), "ipc: no names under modtest.") == nullptr)
+    {
+        klog(0, "test_module_ipc: names that outlived their module: %s", out.get());
+        return false;
+    }
+    return true;
+}
+
+/* The message channel's module side, once there are tasks: the echo
+   started, modtest loaded and its side run, the module unloaded under the
+   echo's traffic, the echo stopped -- and the host's queues empty. */
+bool test_module_ipc()
+{
+    static const ulong OUTPUT_SIZE = 2048;
+
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
+
+    Cmd::dispatch("ipc echo start", out);
+    if (stdlib::str_str(out.get(), "ipc echo: started") == nullptr)
+    {
+        klog(0, "test_module_ipc: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+    bool ok = err.ok();
+    if (!ok)
+        klog(0, "test_module_ipc: load failed: %s", out.get());
+    else
+    {
+        ok = check_ipc_loaded(out);
+        out.reset();
+        stdlib::Error unloaded = modules.unload("modtest", out);
+        if (!unloaded.ok() || modules.is_loaded("modtest"))
+        {
+            klog(0, "test_module_ipc: unload failed: %s", out.get());
+            ok = false;
+        }
+        else if (ok)
+            ok = check_ipc_unloaded(out);
+    }
+
+    out.reset();
+    Cmd::dispatch("ipc echo stop", out);
+    if (stdlib::str_str(out.get(), "ipc echo: stopped") == nullptr)
+    {
+        klog(0, "test_module_ipc: %s", out.get());
+        return false;
+    }
+
+    out.reset();
+    Cmd::dispatch("ipc", out);
+    if (ok && stdlib::str_str(out.get(), " 0 bytes queued") == nullptr)
+    {
+        klog(0, "test_module_ipc: bytes left queued: %s", out.get());
+        return false;
+    }
+    if (ok)
+        klog(0, "test_module_ipc: complete");
+    return ok;
+}
+
 stdlib::Error test()
 {
     stdlib::Error err;

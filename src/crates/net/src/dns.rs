@@ -385,10 +385,11 @@ impl Dns {
             return None;
         }
 
-        let mut waited = 0;
-        while waited < timeout_ms {
+        /* By the clock, not by sleeps counted: a sleep may take longer
+         * than it asks */
+        let deadline = now_ms().saturating_add(timeout_ms);
+        while now_ms() < deadline {
             kcore::task::sleep_ms(POLL_INTERVAL_MS);
-            waited += POLL_INTERVAL_MS;
 
             let (answered, ip, ttl_sec) = {
                 let state = self.state.lock();
