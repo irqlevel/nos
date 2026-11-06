@@ -18,7 +18,7 @@ use kcore::net::Nic;
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream};
-use tls::server::Fingerprint;
+use tls::pinned::Fingerprint;
 
 use super::config::{self, Allow, Config};
 use super::files::{Client, Dir, Identity, Role};
@@ -115,7 +115,7 @@ pub struct Shared {
     pub identity: Identity,
     /// The TLS server, made again whole when the clients change: a
     /// connection keeps the one it was taken with.
-    pub tls: Locked<Arc<tls::server::Server>>,
+    pub tls: Locked<Arc<tls::pinned::Server>>,
     pub clients: Locked<Vec<Client>>,
     pub conns: Locked<Vec<Conn>>,
     pub listeners: Locked<Vec<(String, Listening)>>,
@@ -130,9 +130,9 @@ pub struct Shared {
 pub const ALPN: [&[u8]; 2] = [b"nos-api/1", b"http/1.1"];
 
 /// The TLS server for `clients`' keys.
-pub fn tls_server(identity: &Identity, clients: &[Client]) -> Result<tls::server::Server, String> {
+pub fn tls_server(identity: &Identity, clients: &[Client]) -> Result<tls::pinned::Server, String> {
     let keys: Vec<Fingerprint> = clients.iter().map(|c| c.key).collect();
-    tls::server::Server::new(&identity.cert, &identity.key, &keys, &ALPN)
+    tls::pinned::Server::new(&identity.cert, &identity.key, &keys, &ALPN)
         .map_err(|e| alloc::format!("the TLS server could not be made: {:?}", e))
 }
 

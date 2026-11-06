@@ -127,6 +127,24 @@ pub fn ws(shift: u8) -> Vec<u8> {
     vec![tcp::OPT_NOP, tcp::OPT_WS, tcp::OPT_WS_LEN, shift]
 }
 
+/// SACK permitted, two NOPs before it.
+pub fn sack_perm() -> Vec<u8> {
+    vec![tcp::OPT_NOP, tcp::OPT_NOP, tcp::OPT_SACK_PERM, tcp::OPT_SACK_PERM_LEN]
+}
+
+/// A SACK option of `blocks`, two NOPs before it; none for no blocks.
+pub fn sack(blocks: &[(u32, u32)]) -> Vec<u8> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let mut o = vec![tcp::OPT_NOP, tcp::OPT_NOP, tcp::OPT_SACK, (2 + blocks.len() * tcp::SACK_BLOCK_LEN) as u8];
+    for &(l, r) in blocks {
+        o.extend_from_slice(&l.to_be_bytes());
+        o.extend_from_slice(&r.to_be_bytes());
+    }
+    o
+}
+
 pub fn icmp(kind: u8, code: u8, id: u16, seq: u16, payload: &[u8], sum: Sum) -> Vec<u8> {
     let mut m = vec![0u8; wire::ICMP_HDR_LEN];
     m.extend_from_slice(payload);

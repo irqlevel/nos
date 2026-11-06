@@ -126,6 +126,11 @@ unsafe extern "C" {
     /// Every loaded module, at most `max` of them, into `out`: how many
     /// were copied.
     pub fn kernel_module_list(out: *mut ModuleInfo, max: usize) -> usize;
+    /// The name of the module whose image holds `addr`, into `buf` (`size`
+    /// bytes, its NUL not written): its length, or 0 for an address that is
+    /// no loaded module's -- the image's, say. What ipc knows a caller of
+    /// its C ABI by (ipc::owner_at). Task context.
+    pub fn kernel_module_name_at(addr: usize, buf: *mut u8, size: usize) -> usize;
     /// insmod (`unload` 0) of the module at the path `arg`, its init handed
     /// `params`, or rmmod (1) of the module named `arg`, as the shell runs
     /// them -- what they said handed to `sink(ctx, ...)` -- answering

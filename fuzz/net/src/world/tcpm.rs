@@ -1,12 +1,17 @@
 //! A TCP of the world's: the other end of every connection the machine has,
-//! written to be right rather than fast -- in-order delivery, no SACK, no
-//! congestion control, a plain retransmit timer -- and to say, of every
-//! segment the machine sends it, what the other end can know is wrong: an
-//! acknowledgement of data never sent; data past the window, larger than
-//! the segment size it was told, or not the bytes the machine's program
-//! wrote at that place in the stream; a FIN anywhere but just after the
-//! last byte the program wrote; a SYN on a connection that has one; a
-//! SYN-ACK that acknowledges another SYN.
+//! written to be right rather than fast -- in-order delivery, no
+//! congestion control, a plain retransmit timer; SACK as a receiver (RFC
+//! 2018, 2883) when both SYNs say so, and none as a sender -- and to say,
+//! of every segment the machine sends it, what the other end can know is
+//! wrong: an acknowledgement of data never sent; data past the window,
+//! larger than the segment size it was told, or not the bytes the
+//! machine's program wrote at that place in the stream; data the peer had
+//! told it, by an acknowledgement that had reached it, it held already --
+//! cumulatively, or by SACK and not let go of since; a SACK block of
+//! anything that had not reached it, a D-SACK of anything that had not
+//! reached it twice, or SACK on a connection that did not agree to it; a
+//! FIN anywhere but just after the last byte the program wrote; a SYN on a
+//! connection that has one; a SYN-ACK that acknowledges another SYN.
 //!
 //! Each connection's two streams are a function of its number and the
 //! offset (`peer_byte`, `machine_byte`): what either end should have
@@ -124,10 +129,43 @@ pub struct Ep {
     /// The machine's stream: bytes taken in order, and where its FIN was.
     pub got: u64,
     pub fin_got: Option<u64>,
-    /// What came ahead of a hole, kept: ranges of the stream, and where a
-    /// FIN ahead of one is.
+    /// What came ahead of a hole, kept: ranges of the stream, the newest
+    /// first -- the order its SACK blocks say them in -- and where a FIN
+    /// ahead of one is.
     ooo: Vec<(u64, u64)>,
     ooo_fin: Option<u64>,
+    /// Both SYNs said SACK, and the most blocks the peer's acknowledgements
+    /// carry (a receiver may say fewer than it could)
+    pub sack: bool,
+    pub sack_blocks: usize,
+    /// The peer lets go of what it keeps past a hole every this many
+    /// segments it keeps there, once it has said them -- 0 for never -- and
+    /// whether it has: from then on the machine may send again anything it
+    /// was told by SACK, as a sender that finds a receiver reneged clears
+    /// what it was told -- Linux's, and this one's -- and is held only to
+    /// what was acknowledged
+    pub renege_every: u32,
+    kept: u32,
+    reneged: bool,
+    /// A duplicate of the machine's stream the peer received, said once,
+    /// first, in its next acknowledgement (D-SACK)
+    dsack: Option<(u64, u64)>,
+    /// What the peer has told the machine it holds -- cumulatively, or by
+    /// SACK -- in acknowledgements on their way: ranges of the machine's
+    /// stream, and the acknowledgement's arrival and number. Once it has
+    /// taken that in the machine has no reason to send any of it again --
+    /// unless the peer has let go of it since (`renege`).
+    told: Vec<(u64, u64, (u64, u64))>,
+    /// Every copy of the peer's data on its way to the machine: a range of
+    /// the peer's stream, and when it arrives. What the machine SACKs must
+    /// have arrived, what it D-SACKs twice.
+    copies: Vec<(u64, u64, u64)>,
+    /// Every copy of a segment of the peer's that takes sequence space --
+    /// data, a FIN -- by its number and when it arrives: one sent after an
+    /// acknowledgement and arriving before it moves the machine's RCV.NXT
+    /// past that acknowledgement's sequence number, and the machine drops
+    /// it, as outside its window
+    spaced: Vec<(u64, u64)>,
     /// The furthest the peer's window ever let the machine send.
     pub right_edge: u32,
     /// Both SYNs carried a window scale (RFC 7323): the machine's windows
@@ -220,6 +258,51 @@ impl Ep {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
     }
 
+    /// The peer forgets what it kept past a hole (RFC 2018 8: a receiver
+    /// may), as one short of memory does: what it told the machine of it
+    /// told no longer -- the machine has to send it again.
+    fn renege(&mut self) {
+        if !self.sack || self.ooo.is_empty() {
+            return;
+        }
+        self.ooo.clear();
+        self.ooo_fin = None;
+        self.reneged = true;
+        /* What it said it had in order stands */
+        self.told.retain(|&(a, _, _)| a == 0);
+        crate::common::runner::reached("tcp: the peer let go of what it had SACKed");
+    }
+
+    /// [from, to) of the machine's stream said held, by an acknowledgement
+    /// arriving at `copy.0`: kept unless a range said already says as much
+    /// from no later.
+    fn tell(&mut self, from: u64, to: u64, copy: (u64, u64)) {
+        if from >= to || self.told.iter().any(|&(a, b, c)| a <= from && to <= b && c <= copy) {
+            return;
+        }
+        self.told.retain(|&(a, b, c)| !(from <= a && b <= to && copy <= c));
+        if self.told.len() >= 512 {
+            self.told.remove(0);
+        }
+        self.told.push((from, to, copy));
+    }
+
+    /// [from, to) of the machine's stream, come ahead of a hole: with
+    /// every range kept that it overlaps or touches, the newest.
+    fn keep(&mut self, from: u64, to: u64) {
+        let (mut from, mut to) = (from, to);
+        self.ooo.retain(|&(a, b)| {
+            if a <= to && from <= b {
+                from = from.min(a);
+                to = to.max(b);
+                false
+            } else {
+                true
+            }
+        });
+        self.ooo.insert(0, (from, to));
+    }
+
     /// What was kept ahead of a hole, taken as far as it now joins up.
     fn drain_ooo(&mut self) {
         loop {
@@ -271,6 +354,11 @@ pub struct Tcp {
     /// The window scale the peer answers a SYN that offers one with -- sent
     /// as it is, past 14 too -- or None for a peer that does not scale.
     pub accept_ws: Option<u8>,
+    /// Whether the peer's SYN-ACK says SACK to a SYN that does, and how
+    /// many blocks its acknowledgements carry at most.
+    pub accept_sack: bool,
+    pub sack_blocks: usize,
+    pub renege_every: u32,
     /// Segments from the machine the peer took, for the statistics.
     pub segments: u64,
 }
@@ -278,27 +366,93 @@ pub struct Tcp {
 impl Tcp {
     pub fn new(ip: u32, mac: Mac) -> Tcp {
         Tcp { eps: Vec::new(), listening: Vec::new(), ignored: Vec::new(), serve: Vec::new(), next_id: 1000, ip, mac, accept_iss: 1, accept_mss: Some(1460),
-              accept_window: 8192, accept_ws: None, segments: 0 }
+              accept_window: 8192, accept_ws: None, accept_sack: false, sack_blocks: tcp::MAX_SACK_BLOCKS, renege_every: 0,
+              segments: 0 }
     }
 
     /// A segment of the peer's on `ep`. Whatever carries an ACK advertises
-    /// the window as far as it reaches: the machine may send up to there.
-    fn emit(net: &mut Net, ep: &mut Ep, flags: u8, seq: u32, opts: &[u8], data: &[u8]) {
+    /// the window as far as it reaches: the machine may send up to there --
+    /// and tells the machine, from when it arrives, that the peer holds its
+    /// stream up to there, when it is sure to take it in. Data goes down as
+    /// copies on their way. When it arrives, if it does and the machine is
+    /// sure to take it in: the earliest of its copies'.
+    fn emit(net: &mut Net, ep: &mut Ep, flags: u8, seq: u32, opts: &[u8], data: &[u8]) -> Option<(u64, u64)> {
         if ep.silent {
-            return;
+            return None;
         }
         let (field, granted) = ep.window_field(flags & tcp::SYN != 0);
         if flags & tcp::ACK_FLAG != 0 {
             ep.right_edge = later(ep.right_edge, ep.rcv_nxt.wrapping_add(granted));
         }
         let ack = if flags & tcp::ACK_FLAG != 0 { ep.rcv_nxt } else { 0 };
+        /* An acknowledgement the machine takes in, whatever its window: at
+         * its RCV.NXT -- the peer has nothing of its own outstanding, all of
+         * it acknowledged. One past what the machine has had of the peer's
+         * stream is outside its window as often as not, and dropped (RFC
+         * 9293 3.10.7.4): what it says is not the machine's to go by. */
+        let taken = data.is_empty() && seq == ep.snd_nxt && ep.snd_una == ep.snd_nxt;
         let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, seq, ack, flags, field, opts, data, Sum::Right);
-        net.send(frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s));
+        let arrives = net.send(frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s));
+        if (!data.is_empty() || flags & tcp::FIN != 0) && flags & tcp::SYN == 0 {
+            for &(at, order) in &arrives {
+                ep.spaced.push((order, at));
+            }
+            /* Kept to what an acknowledgement still told may need: past
+             * that, what was told is told no longer */
+            if ep.spaced.len() > 1024 {
+                ep.spaced.drain(..512);
+                ep.told.clear();
+            }
+        }
+        if !data.is_empty() && flags & tcp::SYN == 0 {
+            let from = u64::from(seq.wrapping_sub(ep.iss.wrapping_add(1)));
+            for &(at, _) in &arrives {
+                ep.copies.push((from, from + data.len() as u64, at));
+            }
+            /* Only what a D-SACK may still name is kept: a receive buffer
+             * or so behind what the machine acknowledges */
+            let una = u64::from(ep.snd_una.wrapping_sub(ep.iss.wrapping_add(1)));
+            if ep.copies.len() > 4096 {
+                ep.copies.retain(|&(_, b, _)| b + (1 << 20) > una);
+            }
+        }
+        let first = arrives.iter().copied().min().filter(|_| taken);
+        if let (Some(copy), true) = (first, flags & (tcp::ACK_FLAG | tcp::SYN | tcp::RST) == tcp::ACK_FLAG) {
+            let got = ep.got;
+            ep.tell(0, got, copy);
+        }
+        first
     }
 
+    /// An acknowledgement, with SACK blocks on a connection that agreed to
+    /// them: a duplicate's first, if one came (D-SACK, RFC 2883), then
+    /// what came past a hole, newest first, as many as the peer says.
     fn ack_now(net: &mut Net, ep: &mut Ep) {
         let seq = ep.snd_nxt;
-        Self::emit(net, ep, tcp::ACK_FLAG, seq, &[], &[]);
+        let mut blocks = Vec::new();
+        let mut held = Vec::new();
+        if ep.sack {
+            let base = ep.irs.wrapping_add(1);
+            if let Some((a, b)) = ep.dsack.take() {
+                blocks.push((base.wrapping_add(a as u32), base.wrapping_add(b as u32)));
+            }
+            let room = ep.sack_blocks.min(tcp::MAX_SACK_BLOCKS).saturating_sub(blocks.len());
+            for &(a, b) in ep.ooo.iter().take(room) {
+                blocks.push((base.wrapping_add(a as u32), base.wrapping_add(b as u32)));
+                held.push((a, b));
+            }
+        }
+        let opts = frames::sack(&blocks);
+        if let (Some(copy), false) = (Self::emit(net, ep, tcp::ACK_FLAG, seq, &opts, &[]), ep.reneged) {
+            for (a, b) in held {
+                ep.tell(a, b, copy);
+            }
+        }
+    }
+
+    /// The peer forgets what it kept past a hole on `i` (`Ep::renege`).
+    pub fn renege(&mut self, i: usize) {
+        self.eps[i].renege();
     }
 
     /// The peer opens a connection to the machine's `mport`: connection
@@ -312,6 +466,8 @@ impl Tcp {
             iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_wnd: 0, wl1: 0, wl2: 0, mss: DEFAULT_MSS, our_mss,
             queued: 0, fin_queued: false, fin_seq: None,
             irs: 0, rcv_nxt: 0, rcv_cap: window, unread: 0, got: 0, fin_got: None, ooo: Vec::new(), ooo_fin: None,
+            sack: false, sack_blocks: tcp::MAX_SACK_BLOCKS, renege_every: 0, kept: 0, reneged: false, dsack: None, told: Vec::new(), copies: Vec::new(),
+            spaced: Vec::new(),
             right_edge: 0, snd_shift: 0, rcv_shift: 0, machine_edge: None, peer_opened: true, hole_since: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
             silent: false, tainted: false, reset: None, syn_opts: opts, offered: 0, closed_at: None, data: None,
@@ -387,6 +543,14 @@ impl Tcp {
         /* Scaled when the machine's SYN offered a scale and the peer answers
          * with one of its own (RFC 7323 1.3): each end's past 14 taken as
          * 14, as the RFC has the other end take it. */
+        /* The machine's SYN offers SACK, always; the peer's SYN-ACK takes
+         * it as its input says */
+        invariant!(sack_perm_of(opts), "the machine's SYN does not offer SACK: options {:02x?}", opts);
+        let sack = self.accept_sack;
+        if sack {
+            our_opts.extend_from_slice(&frames::sack_perm());
+            crate::common::runner::reached("tcp: a connection the machine opened takes SACK");
+        }
         let (snd_shift, rcv_shift) = match (ws_of(opts), self.accept_ws) {
             (Some(theirs), Some(ours)) => {
                 our_opts.extend_from_slice(&[tcp::OPT_NOP, tcp::OPT_WS, tcp::OPT_WS_LEN, ours]);
@@ -402,7 +566,9 @@ impl Tcp {
             our_mss: told_mss(&self.accept_mss.map(frames::mss).unwrap_or_default()),
             queued: 0, fin_queued: false, fin_seq: None,
             irs: seq, rcv_nxt: seq.wrapping_add(1), rcv_cap: self.accept_window, unread: 0, got: 0, fin_got: None,
-            ooo: Vec::new(), ooo_fin: None,
+            ooo: Vec::new(), ooo_fin: None, sack, sack_blocks: self.sack_blocks, renege_every: self.renege_every,
+            kept: 0, reneged: false, dsack: None, told: Vec::new(),
+            copies: Vec::new(), spaced: Vec::new(),
             right_edge: seq.wrapping_add(1).wrapping_add(self.accept_window.min(0xFFFF)),
             snd_shift, rcv_shift, machine_edge: None, peer_opened: false, hole_since: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
@@ -470,6 +636,14 @@ impl Tcp {
                  * reads them unscaled are windows it never meant. */
                 invariant!(ws_of(opts).is_none() || ws_of(&ep.syn_opts).is_some(),
                            "the machine's SYN-ACK offers a window scale to a SYN that offered none");
+                /* SACK: said back exactly when the peer's SYN said it */
+                invariant!(sack_perm_of(opts) == sack_perm_of(&ep.syn_opts),
+                           "the machine's SYN-ACK says SACK {} to a SYN that says {}", sack_perm_of(opts),
+                           sack_perm_of(&ep.syn_opts));
+                ep.sack = sack_perm_of(opts);
+                if ep.sack {
+                    crate::common::runner::reached("tcp: a connection the peer opened takes SACK");
+                }
                 /* Scaled from here when both SYNs offered a scale; the
                  * SYN-ACK's own window is not. */
                 if let (Some(theirs), Some(ours)) = (ws_of(opts), ws_of(&ep.syn_opts)) {
@@ -523,7 +697,7 @@ impl Tcp {
             match ep.st {
                 S::SynRcvd => {
                     let (iss, opts) = (ep.iss, ep.syn_opts.clone());
-                    Self::emit(net, ep, tcp::SYN | tcp::ACK_FLAG, iss, &opts, &[])
+                    Self::emit(net, ep, tcp::SYN | tcp::ACK_FLAG, iss, &opts, &[]);
                 }
                 _ => Self::ack_now(net, ep),
             }
@@ -546,18 +720,59 @@ impl Tcp {
             ep.rto = RTO;
         }
 
+        /* SACK blocks, of the peer's stream: only on a connection that
+         * agreed to them; a D-SACK first, when the first is under the
+         * acknowledgement or inside the second (RFC 2883), of what had
+         * reached the machine twice; every other block above the
+         * acknowledgement, within what the peer sent, and of what had
+         * reached the machine. */
+        let sacks = if syn { Vec::new() } else { sack_of(opts) };
+        if !sacks.is_empty() && !ep.tainted {
+            invariant!(ep.sack, "the machine sent SACK blocks {:?} on connection {}, which did not agree to SACK",
+                       sacks, ep.id);
+            let base = ep.iss.wrapping_add(1);
+            let off = |x: u32| u64::from(x.wrapping_sub(base));
+            for (k, &(l, r)) in sacks.iter().enumerate() {
+                invariant!(before(l, r), "the machine's SACK block {} [{}, {}) on connection {} is empty or \
+                           backwards", k, l, r, ep.id);
+                let dsack = k == 0 && (before_eq(r, ack)
+                    || sacks.get(1).is_some_and(|&(l2, r2)| before_eq(l2, l) && before_eq(r, r2)));
+                if dsack {
+                    invariant!(arrived(&ep.copies, off(l), off(r), now, 2), "the machine D-SACKed [{}, {}) of \
+                               connection {}'s stream, which had not reached it twice", off(l), off(r), ep.id);
+                    crate::common::runner::reached("tcp: the machine D-SACKed a copy");
+                } else {
+                    invariant!(before(ack, l) && before_eq(r, ep.snd_nxt), "the machine's SACK block [{}, {}) on \
+                               connection {} is not between its acknowledgement {} and the peer's {}", l, r, ep.id,
+                               ack, ep.snd_nxt);
+                    invariant!(arrived(&ep.copies, off(l), off(r), now, 1), "the machine SACKed [{}, {}) of \
+                               connection {}'s stream, which had not reached it", off(l), off(r), ep.id);
+                    crate::common::runner::reached("tcp: the machine SACKed what came past a hole");
+                }
+            }
+        }
+
         if ackf {
             invariant!(before_eq(ack, ep.snd_nxt) || ep.tainted,
                        "the machine acknowledged {} past everything the peer sent ({})", ack, ep.snd_nxt);
             /* The window the machine offers never shrinks: its right edge
-             * never falls back (RFC 9293 3.8.6.2.2) -- with a scaled window,
-             * not even by the rounding of its units. The machine's segments
-             * reach the peer as it sent them, in order, whatever the link
-             * does to the peer's: any segment of its is judged. */
+             * never falls back (RFC 9293 3.8.6.2.2) -- but for a scaled
+             * window's, by less than its unit, when its units would not
+             * reach the old edge without reaching past the buffer (RFC 7323
+             * 2.4, the retracted window): the old edge is then still the
+             * machine's to honour, which the machine's own audit and its
+             * count of bytes that found no room hold it to. The machine's
+             * segments reach the peer as it sent them, in order, whatever
+             * the link does to the peer's: any segment of its is judged. */
             let edge = ack.wrapping_add(wnd << ep.snd_shift);
             if let (Some(was), false) = (ep.machine_edge, ep.tainted) {
-                invariant!(!before(edge, was), "the machine's window shrank on connection {}: its right edge {} \
-                           after {} (ack {}, window {} << {})", ep.id, edge, was, ack, wnd, ep.snd_shift);
+                let unit = 1u32 << ep.snd_shift;
+                invariant!(!before(edge.wrapping_add(unit - 1), was), "the machine's window shrank on connection {}: \
+                           its right edge {} after {} (ack {}, window {} << {})", ep.id, edge, was, ack, wnd,
+                           ep.snd_shift);
+                if before(edge, was) {
+                    crate::common::runner::reached("tcp: the machine's scaled window fell back by less than its unit");
+                }
             }
             ep.machine_edge = Some(ep.machine_edge.map_or(edge, |was| later(was, edge)));
             if wnd << ep.snd_shift > 0xFFFF {
@@ -621,12 +836,39 @@ impl Tcp {
                                its program wrote {:#04x}", off, ep.id, b, machine_byte(ep.id, off));
                 }
             }
+            /* Nothing the peer had told the machine it held -- by an
+             * acknowledgement that had reached it, cumulative or SACK, and
+             * not let go of since: the machine had no reason to send it
+             * again. Told this very moment, the machine may have sent it
+             * before it took the acknowledgement in. */
+            if !ep.tainted {
+                let from = ep.machine_offset(seq);
+                let to = from + payload.len() as u64;
+                if from < 1 << 31 {
+                    if let Some(&(a, b, (at, _))) = ep.told.iter().find(|&&(a, b, (at, order))| {
+                        a <= from && to <= b && net.taken_before_now(at, order)
+                            && !ep.spaced.iter().any(|&(o, t)| o > order && t < at)
+                    }) {
+                        panic!("invariant: the machine sent [{}, {}) of connection {}'s stream again, which the \
+                                peer had said it held ([{}, {}) by an acknowledgement that reached it at {} ns)",
+                               from, to, ep.id, a, b, at);
+                    }
+                }
+            }
             if ep.fin_got.is_none() {
                 /* In order, it is taken; ahead of a hole but in the window,
                  * it is kept for when the hole fills, as a receiver with a
-                 * reassembly queue keeps it. */
+                 * reassembly queue keeps it -- and what came twice is said
+                 * once, a D-SACK, on a connection that took SACK. */
                 let from = ep.machine_offset(seq);
                 let to = from + payload.len() as u64;
+                if ep.sack && from < 1 << 31 {
+                    if from < ep.got {
+                        ep.dsack = Some((from, to.min(ep.got)));
+                    } else if let Some(&(a, b)) = ep.ooo.iter().find(|&&(a, b)| a < to && from < b) {
+                        ep.dsack = Some((from.max(a), to.min(b)));
+                    }
+                }
                 if from <= ep.got && ep.got < to {
                     if let Some(since) = ep.hole_since.take() {
                         /* What the machine's sender found lost, sent again:
@@ -645,11 +887,17 @@ impl Tcp {
                     ep.take(upto);
                 } else if from > ep.got && from < 1 << 31 && before_eq(end, ep.right_edge) && ep.data.is_none() {
                     ep.hole_since.get_or_insert(now);
-                    ep.ooo.push((from, to));
+                    ep.keep(from, to);
+                    ep.kept += 1;
                 }
                 ep.drain_ooo();
             }
             Self::ack_now(net, ep);
+            /* Said, and let go of: the machine's to find out */
+            if ep.renege_every != 0 && ep.kept >= ep.renege_every {
+                ep.kept = 0;
+                ep.renege();
+            }
         }
 
         /* A segment outside the window -- an old one, a window probe --
@@ -838,8 +1086,12 @@ impl Tcp {
                 ep.rto_at = now + ep.rto;
                 let (iss, opts) = (ep.iss, ep.syn_opts.clone());
                 match ep.st {
-                    S::SynSent => Self::emit(net, ep, tcp::SYN, iss, &opts, &[]),
-                    S::SynRcvd => Self::emit(net, ep, tcp::SYN | tcp::ACK_FLAG, iss, &opts, &[]),
+                    S::SynSent => {
+                        Self::emit(net, ep, tcp::SYN, iss, &opts, &[]);
+                    }
+                    S::SynRcvd => {
+                        Self::emit(net, ep, tcp::SYN | tcp::ACK_FLAG, iss, &opts, &[]);
+                    }
                     S::Closed | S::TimeWait => ep.rto_at = 0,
                     _ => {
                         /* From the first unacknowledged byte: data, or the
@@ -904,6 +1156,62 @@ pub fn mss_of(opts: &[u8]) -> Option<u16> {
 /// well-formed one.
 pub fn ws_of(opts: &[u8]) -> Option<u8> {
     option_of(opts, tcp::OPT_WS, 3).map(|v| v[0])
+}
+
+/// Whether `opts` carries SACK permitted.
+pub fn sack_perm_of(opts: &[u8]) -> bool {
+    option_of(opts, tcp::OPT_SACK_PERM, usize::from(tcp::OPT_SACK_PERM_LEN)).is_some()
+}
+
+/// The blocks of the SACK option `opts` carries, as the machine sends one:
+/// any length that is a whole number of blocks.
+fn sack_of(opts: &[u8]) -> Vec<(u32, u32)> {
+    let mut at = 0;
+    while at < opts.len() {
+        match opts[at] {
+            tcp::OPT_END => break,
+            tcp::OPT_NOP => at += 1,
+            kind => {
+                let Some(&len) = opts.get(at + 1) else { break };
+                let len = usize::from(len);
+                if len < 2 || at + len > opts.len() {
+                    break;
+                }
+                if kind == tcp::OPT_SACK {
+                    return opts[at + 2..at + len].chunks_exact(tcp::SACK_BLOCK_LEN)
+                        .map(|b| (u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+                                  u32::from_be_bytes([b[4], b[5], b[6], b[7]])))
+                        .collect();
+                }
+                at += len;
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Whether every byte of [from, to) of a stream had arrived at least
+/// `times` times by `now`, of the copies [a, b) arriving at `at`.
+fn arrived(copies: &[(u64, u64, u64)], from: u64, to: u64, now: u64, times: i32) -> bool {
+    let mut edges: Vec<(u64, i32)> = Vec::new();
+    for &(a, b, at) in copies {
+        if at <= now && a < to && b > from {
+            edges.push((a.max(from), 1));
+            edges.push((b.min(to), -1));
+        }
+    }
+    edges.sort_unstable();
+    let (mut count, mut prev) = (0, from);
+    for (x, d) in edges {
+        if x > prev {
+            if count < times {
+                return false;
+            }
+            prev = x;
+        }
+        count += d;
+    }
+    prev >= to
 }
 
 /// The most the machine may put in a segment to a peer whose SYN carried

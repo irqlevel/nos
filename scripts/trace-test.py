@@ -178,6 +178,12 @@ def exercise(shell):
     records = test_records(shell.run("trace show 5 test"))
     nb.check(len(records) == 5 and held_in_order(records, 295, 5),
              "trace show 5 gives the newest five, oldest first, each as recorded")
+    # A field filter keeps the records whose field is the value, and no other:
+    # the newest n of those, however far back in the ring
+    records = test_records(shell.run("trace show 5 test seq=7"))
+    nb.check(len(records) == 1 and held_in_order(records, 7, 1), "trace show test seq=7 shows that record alone")
+    records = test_records(shell.run("trace show 5 test seq=0x10"))
+    nb.check(len(records) == 1 and held_in_order(records, 16, 1), "and a filter's value in hex")
 
     # The rings made again at the smallest size: what they held goes with them
     reply = shell.run(f"trace size {SMALL_KIB}")
@@ -417,6 +423,19 @@ def exercise(shell):
              "a window's word that names nothing refused")
     nb.check("a window is 1 to 4096 records" in shell.run("trace show 0"), "a window of no records refused")
     nb.check("no running cpu 63" in shell.run("trace show 5 cpu=63"), "a window of a cpu not running refused")
+    # A field filter by an enumeration's name, the event's own: every record
+    # the window shows of it has the value, and a name the field has not, a
+    # field no event of the window has, and a filter with no value are each
+    # refused, not taken as a filter that matches nothing
+    recs = sched_records(shell.run("trace show 30 sched_switch prev_state=blocked", timeout=60))
+    nb.check(len(recs) > 0 and all(n == "sched_switch" and "prev_state=blocked" in f for _, n, f in recs),
+             f"trace show sched_switch prev_state=blocked shows switches from a blocked task alone ({len(recs)})")
+    nb.check("no event of the window has a field prev_state that can be nonesuch"
+             in shell.run("trace show 5 sched_switch prev_state=nonesuch"), "a name the enumeration has not refused")
+    nb.check("no event of the window has a field nonesuch that can be 1" in shell.run("trace show 5 sched nonesuch=1"),
+             "a field no event of the window has refused")
+    nb.check("a field filter is name=value" in shell.run("trace show 5 sched next_pid="),
+             "a field filter with no value refused")
 
     # What a block says it ran is the stretch from the switch that gave the
     # task its CPU -- read from the dump, its ns whole -- not from the last

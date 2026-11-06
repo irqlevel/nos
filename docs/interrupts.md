@@ -215,7 +215,9 @@ panic path skips remote stack capture.
 
 Interrupt handlers do the minimum and raise a soft IRQ; the work runs in
 task context on the CPU that raised it, in one of the per-CPU `softirq/N`
-tasks. Four types today: `NetRx`, `NetTx`, `BlkIo`, `TcpTimer`.
+tasks. Three types today: `NetRx`, `NetTx`, `BlkIo`. TCP's timer was a
+fourth, raised every 200 ms; it is a task of its own now, asleep until the
+earliest retransmission any connection has.
 
 A type runs on at most one CPU at a time — handlers are not reentrant — so a
 CPU that loses the race keeps its pending bit set and retries, and the CPU

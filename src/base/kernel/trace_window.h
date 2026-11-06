@@ -25,6 +25,35 @@ inline EventMask event_bit(ulong id)
     return (id < COUNT) ? ((EventMask)1 << id) : 0;
 }
 
+/* A field of a record's payload held to a value: where the field lies in
+   each event's payload, and the value its bytes are to read as there, in the
+   CPU's order and widened -- a value an event, an enumeration's names being
+   each event's own. A size of 0 is an event with no such field, of which
+   the filter keeps nothing. */
+struct FieldFilter
+{
+    u8 offset[COUNT];
+    u8 size[COUNT];
+    u64 value[COUNT];
+};
+
+/* The most field filters a window takes: a record is kept when it passes
+   every one. */
+const ulong FIELD_FILTERS_MAX = 4;
+
+/* What a window keeps: the records of the events in `mask` -- of every
+   event with ALL_EVENTS, and with nothing more asked of an event this kernel
+   does not know too -- that pass each of `filters`. */
+struct Select
+{
+    EventMask mask;
+    ulong filter_count;
+    FieldFilter filters[FIELD_FILTERS_MAX];
+};
+
+/* Whether `select` keeps record `r`. */
+bool keeps(const Select& select, const TraceRing::Record& r);
+
 /* complete_from of a CPU's part of a window of which nothing could be read:
    not even its newest record. */
 const u64 COMPLETE_NEVER = ~(u64)0;
@@ -43,16 +72,15 @@ struct Window
     u64 complete_from;
 };
 
-/* Ring `ring`'s newest `want` records of the events in `mask`, of those
-   written from index `from` on (a `trace clear`'s, or 0), into `out` --
-   room for `want` -- oldest first, each marked as `cpu`'s: how many. The
-   ring is read from its newest record back while its CPU writes on: a
-   record written over as it is read ends the walk, every older one being
-   gone too. `complete_from` says from where on the window lacks none of
-   `mask`'s records (Window::complete_from). With every event in `mask`,
-   records of an event this kernel does not know are kept too. */
-ulong read_window(const TraceRing& ring, u64 from, ulong want, EventMask mask, u32 cpu, TraceRing::Record* out,
-    u64& complete_from);
+/* Ring `ring`'s newest `want` records that `select` keeps, of those written
+   from index `from` on (a `trace clear`'s, or 0), into `out` -- room for
+   `want` -- oldest first, each marked as `cpu`'s: how many. The ring is read
+   from its newest record back while its CPU writes on: a record written over
+   as it is read ends the walk, every older one being gone too.
+   `complete_from` says from where on the window lacks none of the records
+   `select` keeps (Window::complete_from). */
+ulong read_window(const TraceRing& ring, u64 from, ulong want, const Select& select, u32 cpu,
+    TraceRing::Record* out, u64& complete_from);
 
 /* The next record of `windows` (`count` of them) by cycle count, oldest
    first, the first window's of two as old: false when they are spent. */

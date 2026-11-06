@@ -52,6 +52,21 @@ tables they lack, in `kernel/pass1_tables.cpp`, a file that indexes neither.
 Anything that touches the link or symbol resolution has to keep all three
 working, and the check green.
 
+All three links take in every function the `ffi` crate declares that the
+Rust staticlib defines, by `-u` (`out/$(ARCH)/ffi_keep.rsp`, made from the
+staticlib's `nm`). A function only modules call -- the device queue's
+`kernel_blockq_*`, which hv.ko alone does -- sits in a member of the
+staticlib nothing in the image refers to, which the linker leaves out as it
+would any other; the export table, made from what pass 1 took in, then had
+no entry for it. Which members nothing refers to moves with how rustc cuts
+each crate into codegen units: the blockq functions went from both images
+with commits that never touched them, and on x86-64 hv.ko was refused by
+`insmod` while every build passed, found by api-test's panel VM. The build
+now also holds every module it makes to the kernel it makes
+(`out/$(ARCH)/modules.bound`, a prerequisite of `all` and `nocheck`): each
+function a `.ko` imports must be in the export table, or the build fails
+naming the module and the functions.
+
 **The C++ is built at -O2** -- until 2026-10 it had no -O at all, so clang's
 -O0 (`CXX_OPT` in the `Makefile`). What a stack walk needs is kept whatever
 the optimiser does: a frame pointer in every function, a leaf included

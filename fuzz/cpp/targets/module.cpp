@@ -258,6 +258,13 @@ extern "C" long kernel_file_read(const char*, ulong, void*, ulong)
     fuzz::host_hal_unreachable("kernel_file_read");
 }
 
+/* The channel's sweep after a module's exit, which this target never runs:
+   it stages and releases modules, and calls no init and no exit. */
+extern "C" void rust_ipc_module_gone(const char*, ulong)
+{
+    fuzz::host_hal_unreachable("rust_ipc_module_gone");
+}
+
 namespace
 {
 
@@ -820,6 +827,20 @@ void lookups(fuzz::Input& in, LoadedModule& m)
         if (f != nullptr)
             INVARIANT(f->offset <= addr - m.image.base && addr - m.image.base < m.text_end,
                 "find_function(+0x%lx) names a function at +0x%lx", addr - m.image.base, f->offset);
+
+        /* The channel's way to a caller's module (ipc::owner_at): the name,
+           cut to the buffer and never past it, for an address in the image,
+           and nothing for one outside */
+        memset(buf, 'x', sizeof(buf));
+        const ulong len = table.name_at(addr, buf, size);
+        const size_t whole = strlen(m.name);
+        if (addr - m.image.base < m.image_size)
+            INVARIANT(len == (whole < size ? whole : size) && memcmp(buf, m.name, len) == 0,
+                "name_at(0x%lx) gave %lu bytes of %s", addr, len, m.name);
+        else
+            INVARIANT(len == 0, "name_at(0x%lx) outside the module gave %lu bytes", addr, len);
+        for (size_t k = size; k < sizeof(buf); k++)
+            INVARIANT(buf[k] == 'x', "name_at wrote byte %zu of a %zu-byte buffer", k, size);
     }
     char all[256];
     table.describe_all(all, 1 + in.below(sizeof(all)));
