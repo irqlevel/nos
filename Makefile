@@ -323,11 +323,11 @@ RUST_SRC = $(shell find src/crates -path src/crates/target -prune -o \( -name '*
 -include $(DEPS)
 
 ifeq ($(ARCH),x86_64)
-all: check nos.iso modules hvboot
-nocheck: nos.iso modules hvboot
+all: check nos.iso modules hvboot $(OUT)/modules.bound
+nocheck: nos.iso modules hvboot $(OUT)/modules.bound
 else
-all: check nos-arm64.img modules
-nocheck: nos-arm64.img modules
+all: check nos-arm64.img modules $(OUT)/modules.bound
+nocheck: nos-arm64.img modules $(OUT)/modules.bound
 endif
 
 check: $(CXX_SRC)
@@ -417,7 +417,7 @@ $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api
+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]
@@ -486,16 +486,50 @@ $(HVBOOT): $(RUST_SRC) src/crates/hvboot/hvboot.ld $(FLAVOR_STAMP)
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
 $(OUT)/kernel/module.o: $(MODULE_ABI_SRC)
 
+# The functions the ffi crate declares in its extern blocks, one a line.
+define ffi_functions
+awk '/^(unsafe )?extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u
+endef
+
 # The functions a module may bind to: those the ffi crate declares in its
 # extern blocks that the kernel defines. Generated from pass1.elf like the
 # symbol table, and linked into the final kernel only -- kernel/module.cpp has
 # the empty weak table pass 1 gets instead.
 $(OUT)/module_exports.S: $(OUT)/pass1.elf $(MODULE_FFI_SRC) build/module-exports.awk
 	@echo "Generating module export table..."
-	@awk '/^(unsafe )?extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u > $@.ffi
+	@$(ffi_functions) > $@.ffi
 	@$(NM) -g --defined-only $< | awk 'NF == 3 && ($$2 == "T" || $$2 == "W") { print $$3 }' | LC_ALL=C sort -u > $@.defined
 	@LC_ALL=C comm -12 $@.ffi $@.defined | awk -f build/module-exports.awk > $@
 	@rm -f $@.ffi $@.defined
+
+# Each function the ffi crate declares that the Rust staticlib defines, a
+# symbol every link of the kernel must take in (-u): a function only modules
+# call -- kernel_blockq_*, which hv.ko alone does -- sits in a member of the
+# staticlib that nothing in the image refers to, which the linker leaves out
+# as it would any other, and the export table, made from what pass 1 took
+# in, then has no entry for it. Which members nothing refers to moves with
+# every change to how rustc cuts a crate into codegen units: the blockq
+# functions went from the image with commits that never touched them, and
+# hv.ko could not be loaded while every build passed.
+$(OUT)/ffi_keep.rsp: $(RUST_LIB) $(MODULE_FFI_SRC)
+	@$(ffi_functions) > $@.ffi
+	@$(NM) -g --defined-only $(RUST_LIB) 2>/dev/null | awk 'NF == 3 && ($$2 == "T" || $$2 == "W") { print $$3 }' | LC_ALL=C sort -u > $@.defined
+	@LC_ALL=C comm -12 $@.ffi $@.defined | sed 's/^/-u /' > $@
+	@rm -f $@.ffi $@.defined
+	@test -s $@ || { echo "$@: no function of the ffi crate's in $(RUST_LIB)"; rm -f $@; exit 1; }
+
+# Every module this build makes is one the kernel it makes can load: each
+# function a .ko imports is in the kernel's export table. One that is not is
+# refused by insmod at run time -- with the build green, and found only by
+# the test that loads that module, on the arch it is built for.
+$(OUT)/modules.bound: $(MODULE_KO) $(OUT)/module_exports.S
+	@grep -o '\.asciz "[A-Za-z0-9_]*"' $(OUT)/module_exports.S | sed 's/^\.asciz "//; s/"$$//' | LC_ALL=C sort -u > $@.exports
+	@fail=0; for ko in $(MODULE_KO); do \
+	    llvm-nm -u --format=just-symbols $$ko | LC_ALL=C sort -u | LC_ALL=C comm -23 - $@.exports > $@.missing; \
+	    if [ -s $@.missing ]; then fail=1; \
+	        echo "$$ko imports what the kernel this build makes does not export: $$(tr '\n' ' ' < $@.missing)"; fi; \
+	done; rm -f $@.exports $@.missing; [ $$fail = 0 ]
+	@touch $@
 
 $(OUT)/module_exports.o: $(OUT)/module_exports.S
 	$(CC) --target=$(TARGET) -c $< -o $@
@@ -582,11 +616,11 @@ smoke:
 # it last, after the staticlib: data only, it moves no code. That the final
 # image's functions are where its table says is checked after the link,
 # which fails the build if they are not.
-$(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
+$(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB) $(OUT)/ffi_keep.rsp
+	$(LD) $(LDFLAGS) -T $< -o $@ @$(OUT)/ffi_keep.rsp $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
 
-$(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB)
+$(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP) $(OUT)/ffi_keep.rsp
+	$(LD) $(LDFLAGS) -T $< -o $@ @$(OUT)/ffi_keep.rsp $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB)
 
 # The symbol table stack traces name frames by (kernel/symtab.cpp): every
 # function of an ELF's text, in address order. $(call symtab,elf,cpp)
@@ -603,8 +637,8 @@ $(OUT)/symtab_data.cpp: $(OUT)/pass2.elf
 $(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/base/kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(OUT)/symtab_data.o
+$(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP) $(OUT)/ffi_keep.rsp
+	$(LD) $(LDFLAGS) -T $< -o $@ @$(OUT)/ffi_keep.rsp $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(OUT)/symtab_data.o
 	$(call symtab,$@,$(OUT)/symtab_final.cpp)
 	@cmp -s $(OUT)/symtab_final.cpp $(OUT)/symtab_data.cpp || { \
 	    echo "$@: its functions are not where its symbol table says, and every backtrace would name the wrong ones:"; \

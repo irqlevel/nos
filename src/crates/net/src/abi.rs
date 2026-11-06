@@ -161,10 +161,11 @@ fn conn_of(conn: ConnPtr) -> Option<&'static Conn> {
     TCP.by_handle(conn as usize)
 }
 
-/// Start the connection pool's timer: 0 started, -1 not.
+/// Set the connection pool up and start its timer's task: 0 started, -1
+/// not.
 #[no_mangle]
 pub extern "C" fn rust_tcp_init() -> i32 {
-    if TCP.init() { 0 } else { -1 }
+    if TCP.init() && TCP.start_timer() { 0 } else { -1 }
 }
 
 /* ---- TCP, as a module calls it ---- */
@@ -229,6 +230,87 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16, backlog: usize, bulk:
     }
 }
 
+/// The networks at `nets` (`count` of them), for an allowlist: None for a
+/// null pointer with some, or more than a list holds.
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+unsafe fn nets_of(nets: *const ffi::tcp::TcpNet, count: usize) -> Option<([(u32, u8); crate::tcp::ALLOW_MAX], usize)> {
+    if count > crate::tcp::ALLOW_MAX || (count > 0 && nets.is_null()) {
+        return None;
+    }
+    let mut out = [(0u32, 0u8); crate::tcp::ALLOW_MAX];
+    if count > 0 {
+        // SAFETY: the caller's `count` TcpNets at `nets`.
+        let given = unsafe { core::slice::from_raw_parts(nets, count) };
+        for (o, n) in out.iter_mut().zip(given) {
+            *o = (n.ip, n.prefix);
+        }
+    }
+    Some((out, count))
+}
+
+/// `kernel_tcp_listen`, answering `nets` alone (`Tcp::listen_allowed`).
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_listen_allowed(dev: usize, port: u16, backlog: usize, bulk: bool,
+                                                   nets: *const ffi::tcp::TcpNet, count: usize) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let Some(nic) = Nic::from_handle(dev) else { return core::ptr::null_mut() };
+    // SAFETY: the caller's contract, passed on.
+    let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return core::ptr::null_mut() };
+    let buffers = if bulk { crate::tcp::Buffers::Bulk } else { crate::tcp::Buffers::Small };
+    match TCP.listen_allowed(&nic, port, backlog, buffers, &list[..n]) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// A listener's allowlist changed (`Tcp::set_allowed`).
+///
+/// # Safety
+/// `nets` points at `count` readable `TcpNet`s when `count` is past 0.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_set_allowed(listener: ConnPtr, nets: *const ffi::tcp::TcpNet, count: usize,
+                                                any: bool) -> i32 {
+    let Some(conn) = conn_of(listener) else { return -1 };
+    let done = if any {
+        TCP.set_allowed(conn, None)
+    } else {
+        // SAFETY: the caller's contract, passed on.
+        let Some((list, n)) = (unsafe { nets_of(nets, count) }) else { return -1 };
+        TCP.set_allowed(conn, Some(&list[..n]))
+    };
+    if done { 0 } else { -1 }
+}
+
+/// A task waiting in a receive on `conn` woken, as by a timeout, if the
+/// connection is still the one of `generation` (`Tcp::wake`).
+#[no_mangle]
+pub extern "C" fn kernel_tcp_wake(conn: ConnPtr, generation: u64) {
+    if let Some(conn) = conn_of(conn) {
+        TCP.wake(conn, generation);
+    }
+}
+
+/// What a wake of `conn` is held to (`Tcp::generation`): 0 for no
+/// connection.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_generation(conn: ConnPtr) -> u64 {
+    conn_of(conn).map_or(0, |c| TCP.generation(c))
+}
+
+/// A connection's own floor for its timeout (`Tcp::set_rto_floor`).
+#[no_mangle]
+pub extern "C" fn kernel_tcp_set_rto_floor(conn: ConnPtr, ms: u32) -> i32 {
+    let Some(conn) = conn_of(conn) else { return -1 };
+    if TCP.set_rto_floor(conn, u64::from(ms)) { 0 } else { -1 }
+}
+
 /// An active open, for a module: to `ip`:`port` (host byte order) through the
 /// device `dev` names -- a `kernel_net_find` handle -- from an ephemeral port.
 /// Blocks until the connection is up or the connect timeout has passed: null
@@ -246,6 +328,24 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
      * them -- someone outside may have it open, and a bulk buffer each
      * would be heap for the asking. */
     match TCP.connect(&nic, ip, port, 0, Receive::Small) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `kernel_tcp_connect`, with bulk buffers both ways (`Receive::Both`): for a
+/// module whose connection carries as much as it takes in -- the cluster's
+/// link between hosts. Each buffer the slot's own when the heap has none.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_connect_bulk(dev: usize, ip: u32, port: u16) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let nic = match Nic::from_handle(dev) {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+    match TCP.connect(&nic, ip, port, 0, Receive::Both) {
         Some(conn) => conn as *const Conn as ConnPtr,
         None => core::ptr::null_mut(),
     }

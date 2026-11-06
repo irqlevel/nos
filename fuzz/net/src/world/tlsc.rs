@@ -1,4 +1,4 @@
-//! The world's TLS clients, for the kernel's TLS server (`tls::server`, what
+//! The world's TLS clients, for the kernel's TLS server (`tls::pinned::Server`, what
 //! the host API serves over): the same rustls the server is built on, its
 //! unbuffered client driven by hand over the world's TCP -- showing the key
 //! the input chooses (the one the server lets in, a stranger's, or none),
@@ -152,7 +152,7 @@ struct PinnedServer {
 impl ServerCertVerifier for PinnedServer {
     fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
                           _name: &ServerName<'_>, _ocsp: &[u8], _now: UnixTime) -> Result<ServerCertVerified, Error> {
-        match tls::server::fingerprint(end_entity) {
+        match tls::pinned::fingerprint(end_entity) {
             Some(k) if k == self.key => Ok(ServerCertVerified::assertion()),
             _ => Err(Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)),
         }
@@ -189,7 +189,7 @@ fn config(plan: &Plan) -> Arc<ClientConfig> {
     let versions: &[&'static rustls::SupportedProtocolVersion] =
         if plan.brk == Break::Tls12 { &[&rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
     let server = plan.pin.unwrap_or_else(|| {
-        tls::server::fingerprint(&keys.server.cert).expect("the server's certificate")
+        tls::pinned::fingerprint(&keys.server.cert).expect("the server's certificate")
     });
     let builder = ClientConfig::builder_with_details(provider.clone(), Arc::new(Clock))
         .with_protocol_versions(versions)

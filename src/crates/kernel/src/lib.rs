@@ -32,6 +32,8 @@ pub extern "C" fn rust_init() {
        a module the boot's test of modules loaded; this puts its command in
        front of whoever runs one. Then the kernel's own provider. */
     mgmt::init();
+    /* The message channel: the table of mailboxes, and its `ipc` command */
+    ipc::init();
     system::init();
     /* The pool itself was seeded from Main2 (rust_random_setup); this puts
        its `random` and `entropy` commands in front of whoever runs one. */
@@ -130,6 +132,7 @@ fn tco_init() {
 pub extern "C" fn rust_test() {
     hello::test();
     mgmt::selftest();
+    ipc::selftest();
     /* Every layer has registered its provider by now: each read of each
        answered, as JSON */
     system::selftest();

@@ -11,12 +11,15 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use kcore::cmd::{Command, Output};
+use kcore::ipc::Mailbox;
 use kcore::mgmt::{Call, Kind, Method, Provider, Status};
 use kcore::error::{Error, Result};
+use kcore::sync::Mutex;
 
 /* Initialized data, zeroed data, and a table of function pointers. The first
    lands in .data, the second in .bss, and the third needs a relocation per
@@ -61,6 +64,9 @@ struct ModTest {
     _cmd: Command,
     /* Dropped with the module: its unregister waits out a job of it */
     _provider: Provider,
+    /* The mailbox `modtest ipc` keeps, which kernel.echo pesters: closed by
+     * this drop, under that traffic, after the command is gone */
+    _ipc: Arc<Mutex<Option<Mailbox>>>,
 }
 
 impl kmod::Module for ModTest {}
@@ -128,7 +134,20 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
        kernel's symbolizer -- the way a backtrace through this module would */
     let answer = given.unwrap_or(shape.area() + data);
     let probe = double as fn(u32) -> u32 as usize;
+    let ipc_kept = Arc::new(Mutex::new(None).ok_or(Error::NoMemory)?);
+    let ipc_cmd = ipc_kept.clone();
     let cmd = Command::register("modtest", "modtest - the loader self-test module's command", move |args, out| {
+        if args.trim() == "ipc" {
+            match ipc(&ipc_cmd) {
+                Ok(()) => {
+                    let _ = writeln!(out, "modtest ipc: ok");
+                }
+                Err(what) => {
+                    let _ = writeln!(out, "modtest ipc: {} went wrong", what);
+                }
+            }
+            return;
+        }
         if args.trim() == "bus" {
             match bus() {
                 Ok(()) => {
@@ -151,7 +170,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> Result<Box<dyn kmod::Module>
         .map_err(|_| Error::Busy)?;
 
     kcore::klog!(0, "modtest: loaded, every check passed");
-    Ok(Box::new(ModTest { _cmd: cmd, _provider: provider }))
+    Ok(Box::new(ModTest { _cmd: cmd, _provider: provider, _ipc: ipc_kept }))
 }
 
 /// How long `wait` waits, at most, before it says nobody told it to stop.
@@ -264,6 +283,90 @@ fn bus() -> core::result::Result<(), &'static str> {
         kcore::task::sleep_ms(1);
     }
     Err("a job that never ended")
+}
+
+/// kernel.echo's tag for "monitor me, and keep sending until I am gone"
+/// (ipc::echo's TAG_ECHO_PESTER).
+const TAG_ECHO_PESTER: u32 = 0x5045_5354;
+
+/// `n` bytes of a pattern.
+fn pattern(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i as u8).wrapping_mul(13).wrapping_add(5)).collect()
+}
+
+/// `modtest ipc`: the message channel as a module has it, through
+/// kernel.echo, which the boot's test has started -- calls of every size,
+/// its names held to its namespace, an address gone, a Down, a full
+/// mailbox, the names listed; one mailbox left open on purpose, for the
+/// sweep after the unload to close; and the one it keeps in `keep`, which
+/// it asks the echo to pester, so that the unload closes it under traffic.
+/// What went wrong first, if anything.
+fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> {
+    use kcore::ipc::{list, lookup, Error as E, Limits, Reason, Scope, TAG_DOWN};
+    use kcore::time::Duration;
+    const ROOMY: Limits = Limits { messages: 64, bytes: 1 << 20 };
+    let echo = lookup("kernel.echo").ok_or("kernel.echo, not there,")?;
+    let mb = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?;
+    mb.register("modtest.ipc", Scope::Host).map_err(|_| "a name of the module's")?;
+    if mb.register("modtest.again", Scope::Host) != Err(E::Taken) {
+        return Err("a second name");
+    }
+    let other = Mailbox::new(ROOMY).map_err(|_| "a second mailbox")?;
+    if other.register("kernel.modtest", Scope::Host) != Err(E::NotYours)
+        || other.register("nbs.modtest", Scope::Cluster) != Err(E::NotYours) {
+        return Err("a name outside the module's namespace");
+    }
+    for n in [0, 1, 4095, 4096, 4097, 200_000] {
+        let data = pattern(n);
+        let reply = mb.call(echo, 7, &data, Duration::from_secs(5)).map_err(|_| "a call of kernel.echo")?;
+        if reply.tag != 7 || reply.data != data {
+            return Err("an echo's bytes");
+        }
+    }
+    /* An echo received in pieces, as a message larger than one block of
+     * the heap has to be: 200 KB in 64 KiB pieces, and one of no bytes */
+    for n in [200_000, 0] {
+        let data = pattern(n);
+        mb.send(echo, 8, 99, &data).map_err(|_| "a send to kernel.echo")?;
+        let got = mb.recv_pieces(Duration::from_secs(5), kcore::ipc::PIECE_MAX).ok_or("an echo in pieces")?;
+        let mut at = 0;
+        for p in &got.pieces {
+            if p.len() > kcore::ipc::PIECE_MAX || data.get(at..at + p.len()) != Some(&p[..]) {
+                return Err("an echo's pieces");
+            }
+            at += p.len();
+        }
+        if got.tag != 8 || got.reference != 99 || got.from != echo || got.len != n || at != n {
+            return Err("an echo received in pieces");
+        }
+    }
+    let gone = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?.addr();
+    if mb.send(gone, 1, 0, b"x") != Err(E::Gone) {
+        return Err("a message to a mailbox closed");
+    }
+    let t = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?;
+    let id = mb.monitor(t.addr()).map_err(|_| "a monitor")?;
+    let target = t.addr();
+    drop(t);
+    match mb.recv(Duration::from_secs(1)) {
+        Some(m) if m.tag == TAG_DOWN && m.reference == id && m.from == target && m.down() == Some(Reason::Closed) => {}
+        _ => return Err("a Down"),
+    }
+    let small = Mailbox::new(Limits { messages: 2, bytes: 64 }).map_err(|_| "a small mailbox")?;
+    let s = small.addr();
+    if mb.send(s, 1, 0, b"") != Ok(()) || mb.send(s, 1, 1, b"") != Ok(()) || mb.send(s, 1, 2, b"") != Err(E::Full) {
+        return Err("a full mailbox");
+    }
+    if !list("modtest.").iter().any(|n| n.name == "modtest.ipc" && n.addr == mb.addr()) {
+        return Err("the module's name listed");
+    }
+    /* Left open on purpose: the sweep after the unload closes it */
+    let leaked = Mailbox::new(ROOMY).map_err(|_| "a mailbox to leave open")?;
+    leaked.register("modtest.leaked", Scope::Host).map_err(|_| "the left one's name")?;
+    core::mem::forget(leaked);
+    mb.send(echo, TAG_ECHO_PESTER, 0, b"").map_err(|_| "asking the echo to pester")?;
+    *keep.lock() = Some(mb);
+    Ok(())
 }
 
 kmod::module!(name: "modtest", init_with_params: init);

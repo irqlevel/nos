@@ -41,6 +41,7 @@ fn main() {
         name: "net-fuzz",
         targets: targets::ALL,
         boot: machine::boot,
+        begin: machine::begin,
         stats_env: "NET_FUZZ_STATS",
     });
 }

@@ -45,7 +45,15 @@ a prerequisite for the next):
 
 Alongside the stages, [vm-performance.md](vm-performance.md) is the plan for
 making a guest as fast under nos as under KVM, from a comparison of the two on
-the same machine.
+the same machine. [ipc.md](ipc.md) is the kernel's message channel -- named
+mailboxes for modules and tasks, on one host and between hosts --
+[tcp.md](tcp.md) what nos's TCP needs before a cluster runs on it,
+[raft.md](raft.md) consensus as a generic crate of its own,
+[cluster.md](cluster.md) the registry of a cluster's hosts that is its first
+user, and [nbs.md](nbs.md) the replicated block storage for VM disks, images
+and snapshots that is built on all of them. [vmctl.md](vmctl.md) sketches
+what comes after them: the cluster's VMs, placed by a scheduler on hosts
+with room and restarted where their host died.
 
 ### Reordering history
 

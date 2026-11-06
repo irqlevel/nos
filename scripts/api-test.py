@@ -1014,6 +1014,14 @@ def main():
         k = keys(os.path.join(tmp, "keys"))
         (arm64 if args.arch == "aarch64" else x86)(args, tmp, k)
     finally:
+        # A failure's serial log kept, wherever the run failed: what the
+        # checks print of it is theirs, and a module that did not load says
+        # why only there
+        log = os.path.join(tmp, "serial.log")
+        if pt.failures and os.path.exists(log):
+            kept = os.path.join(ROOT, "out", "api-test-%s-serial.log" % args.arch)
+            shutil.copy(log, kept)
+            print("api-test: the serial log is in %s" % kept)
         shutil.rmtree(tmp, ignore_errors=True)
     print()
     print("api-test: " + ("OK (%s)" % args.arch if not pt.failures else "FAILED: " + ", ".join(pt.failures)))

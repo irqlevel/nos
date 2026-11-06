@@ -97,6 +97,13 @@ public:
        (SymbolTable::describe_return); the offset is still addr's. */
     bool describe(ulong addr, bool return_address, char* buf, ulong size);
 
+    /* The name of the module whose image holds addr, into buf (size bytes,
+       no NUL written): its length, or 0 when addr is no loaded module's. How
+       the message channel knows which module a caller of its C ABI is
+       (ipc::owner_at): an address in the caller's own code. A module is
+       listed while its init runs, so what its init makes is its own. */
+    ulong name_at(ulong addr, char* buf, ulong size);
+
     /* The loaded modules, "name base+size" each, into buf for the panic
        report. Never waits either; false if there are none, or no telling. */
     bool describe_all(char* buf, ulong size);

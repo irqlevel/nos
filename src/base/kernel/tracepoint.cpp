@@ -402,6 +402,136 @@ const Field HV_RING_FIELDS[] = {
       HV_RING_HOW, sizeof(HV_RING_HOW) / sizeof(HV_RING_HOW[0]) },
 };
 
+/* ---- TCP's events ----
+   A connection's segments out and in, what its sender made of a loss, its
+   round trips and its program's waits (net/src/tcp.rs). A connection is said
+   by its slot -- the same in every event -- and its two ports. */
+
+static_assert(sizeof(TcpSend) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TcpAck) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TcpRecv) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TcpLoss) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TcpRtt) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(TcpWait) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* What sent a segment: new data, a recovery's copy, a loss probe, the
+   timeout's, the handshake, the close, a reset, the persist timer's probe */
+const char* const TCP_WHY[] = { "new", "again", "probe", "timeout", "handshake", "close", "reset", "persist" };
+/* The sender's recovery as the segment went */
+const char* const TCP_RECOVERY[] = { "none", "fast", "timeout" };
+/* What became of a segment taken in: taken as the state machine has it; a
+   copy of what had come already, answered with a D-SACK; outside the window
+   (RFC 9293); an acknowledgement of nothing sent or of what is too old (RFC
+   5961 5.2); a SYN on a synchronized connection; a reset taken; a reset not
+   at RCV.NXT, answered */
+const char* const TCP_VERDICT[] = { "taken", "copy", "outside", "bad_ack", "syn", "reset", "reset_refused" };
+/* What the sender made of a loss: RACK found one and a recovery began, a
+   recovery ended, a timeout, one found spurious, a recovery undone by
+   D-SACKs, a loss probe that repaired a loss, a peer that reneged */
+const char* const TCP_LOSS[] = { "recovery", "end", "timeout", "spurious", "undo", "probe_repair", "reneged" };
+/* What a program's call waited for: room in the send buffer, the peer's
+   window, the congestion window, what was lost going again first, room in
+   the table of what is in flight, or data */
+const char* const TCP_WAIT_FOR[] = { "buffer", "window", "cwnd", "lost", "table", "data" };
+
+const Field TCP_SEND_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpSend, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpSend, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpSend, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "why", __builtin_offsetof(TcpSend, why), sizeof(u8), Kind::Enum, TCP_WHY, sizeof(TCP_WHY) / sizeof(TCP_WHY[0]) },
+    { "flags", __builtin_offsetof(TcpSend, flags), sizeof(u8), Kind::Hex, nullptr, 0 },
+    { "seq", __builtin_offsetof(TcpSend, seq), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "len", __builtin_offsetof(TcpSend, len), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "ack", __builtin_offsetof(TcpSend, ack), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* The window field it offered, in units of two to this end's shift */
+    { "wnd", __builtin_offsetof(TcpSend, wnd), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* The congestion window, and what was in flight against it as it went */
+    { "cwnd", __builtin_offsetof(TcpSend, cwnd), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pipe", __builtin_offsetof(TcpSend, pipe), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "recovery", __builtin_offsetof(TcpSend, recovery), sizeof(u8), Kind::Enum, TCP_RECOVERY,
+      sizeof(TCP_RECOVERY) / sizeof(TCP_RECOVERY[0]) },
+    /* Whose: a program's task, the timer's, or none -- the receive path's */
+    { "pid", __builtin_offsetof(TcpSend, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field TCP_ACK_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpAck, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpAck, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpAck, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "ack", __builtin_offsetof(TcpAck, ack), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "wnd", __builtin_offsetof(TcpAck, wnd), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* The right edge of the window offered -- never short of an edge offered
+       before -- and the room the receive buffer has: a promise past the room
+       is data turned away */
+    { "edge", __builtin_offsetof(TcpAck, edge), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "free", __builtin_offsetof(TcpAck, free), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* Its SACK blocks, a D-SACK among them first or not, and the stretches
+       kept past a hole they are from */
+    { "blocks", __builtin_offsetof(TcpAck, blocks), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "dsack", __builtin_offsetof(TcpAck, dsack), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "ooo", __builtin_offsetof(TcpAck, ooo), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field TCP_RECV_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpRecv, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpRecv, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpRecv, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "verdict", __builtin_offsetof(TcpRecv, verdict), sizeof(u8), Kind::Enum, TCP_VERDICT,
+      sizeof(TCP_VERDICT) / sizeof(TCP_VERDICT[0]) },
+    { "flags", __builtin_offsetof(TcpRecv, flags), sizeof(u8), Kind::Hex, nullptr, 0 },
+    { "seq", __builtin_offsetof(TcpRecv, seq), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "len", __builtin_offsetof(TcpRecv, len), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "ack", __builtin_offsetof(TcpRecv, ack), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "wnd", __builtin_offsetof(TcpRecv, wnd), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "sacks", __builtin_offsetof(TcpRecv, sacks), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    /* The receiver as the segment found it: RCV.NXT, the room in its buffer,
+       and how far past RCV.NXT the window it last offered still reaches */
+    { "rcv_nxt", __builtin_offsetof(TcpRecv, rcv_nxt), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "free", __builtin_offsetof(TcpRecv, free), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "owed", __builtin_offsetof(TcpRecv, owed), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field TCP_LOSS_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpLoss, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpLoss, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpLoss, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "what", __builtin_offsetof(TcpLoss, what), sizeof(u8), Kind::Enum, TCP_LOSS,
+      sizeof(TCP_LOSS) / sizeof(TCP_LOSS[0]) },
+    /* The windows after it, and what is in flight: all of it, the part the
+       peer holds past a hole, the part lost and not sent again */
+    { "cwnd", __builtin_offsetof(TcpLoss, cwnd), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ssthresh", __builtin_offsetof(TcpLoss, ssthresh), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "pipe", __builtin_offsetof(TcpLoss, pipe), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "sacked", __builtin_offsetof(TcpLoss, sacked), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "lost", __builtin_offsetof(TcpLoss, lost), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "una", __builtin_offsetof(TcpLoss, una), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "nxt", __builtin_offsetof(TcpLoss, nxt), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field TCP_RTT_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpRtt, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpRtt, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpRtt, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    /* The round trip measured, and the estimate after it (RFC 6298) */
+    { "sample_us", __builtin_offsetof(TcpRtt, sample_us), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "srtt_us", __builtin_offsetof(TcpRtt, srtt_us), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "rttvar_us", __builtin_offsetof(TcpRtt, rttvar_us), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "rto_ms", __builtin_offsetof(TcpRtt, rto_ms), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* RACK's least round trip, what its reordering window is counted in */
+    { "min_rtt_us", __builtin_offsetof(TcpRtt, min_rtt_us), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+};
+
+const Field TCP_WAIT_FIELDS[] = {
+    { "slot", __builtin_offsetof(TcpWait, slot), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+    { "lport", __builtin_offsetof(TcpWait, lport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "rport", __builtin_offsetof(TcpWait, rport), sizeof(u16), Kind::Unsigned, nullptr, 0 },
+    { "what", __builtin_offsetof(TcpWait, what), sizeof(u8), Kind::Enum, TCP_WAIT_FOR,
+      sizeof(TCP_WAIT_FOR) / sizeof(TCP_WAIT_FOR[0]) },
+    /* How long the wait was, to the wake or the look that ended it */
+    { "ns", __builtin_offsetof(TcpWait, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "pid", __builtin_offsetof(TcpWait, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
 /* Sized by its lines, not by COUNT: an event added to tp::Id without its line
    here would be a description of zeroes -- a null name printed -- where now it
    is a build that fails. */
@@ -475,6 +605,21 @@ const Event EVENTS[] = {
       sizeof(BioDone), sizeof(BIO_DONE_FIELDS) / sizeof(BIO_DONE_FIELDS[0]), BIO_DONE_FIELDS },
     { "ext4_commit", "fs", "an ext4 transaction committed to its journal, and how long that took",
       sizeof(Ext4Commit), sizeof(EXT4_COMMIT_FIELDS) / sizeof(EXT4_COMMIT_FIELDS[0]), EXT4_COMMIT_FIELDS },
+    { "tcp_send", "tcp", "a segment a connection sent -- data, a SYN, a FIN, a reset, a probe; a pure "
+      "acknowledgement apart -- and what sent it",
+      sizeof(TcpSend), sizeof(TCP_SEND_FIELDS) / sizeof(TCP_SEND_FIELDS[0]), TCP_SEND_FIELDS },
+    { "tcp_ack", "tcp", "a pure acknowledgement a connection sent: the window it offered, the room behind it, "
+      "and its SACK blocks",
+      sizeof(TcpAck), sizeof(TCP_ACK_FIELDS) / sizeof(TCP_ACK_FIELDS[0]), TCP_ACK_FIELDS },
+    { "tcp_recv", "tcp", "a segment a connection took in, what was made of it, and the receiver as it found it",
+      sizeof(TcpRecv), sizeof(TCP_RECV_FIELDS) / sizeof(TCP_RECV_FIELDS[0]), TCP_RECV_FIELDS },
+    { "tcp_loss", "tcp", "what a connection's sender made of a loss: a recovery begun or ended, a timeout, an "
+      "undo, a peer that reneged",
+      sizeof(TcpLoss), sizeof(TCP_LOSS_FIELDS) / sizeof(TCP_LOSS_FIELDS[0]), TCP_LOSS_FIELDS },
+    { "tcp_rtt", "tcp", "a round trip a connection measured, and the estimate and timeout after it",
+      sizeof(TcpRtt), sizeof(TCP_RTT_FIELDS) / sizeof(TCP_RTT_FIELDS[0]), TCP_RTT_FIELDS },
+    { "tcp_wait", "tcp", "a program's send or receive that waited, what for and how long",
+      sizeof(TcpWait), sizeof(TCP_WAIT_FIELDS) / sizeof(TCP_WAIT_FIELDS[0]), TCP_WAIT_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
@@ -839,13 +984,13 @@ bool name_mask(const char* word, EventMask& mask)
     return found;
 }
 
-/* The window show, dump and latency read: the newest `count` records of the
-   events in `mask` of every ring -- or of cpu `only`'s -- a Window a CPU,
-   each oldest first (read_window): how many there are across them. Under
+/* The window show, dump and latency read: the newest `count` records that
+   `select` keeps of every ring -- or of cpu `only`'s -- a Window a CPU, each
+   oldest first (read_window): how many there are across them. Under
    control(); what it holds is the caller's, given back by release_windows.
    A CPU whose part will not fit in memory is said and left out, its part
    marked COMPLETE_NEVER: no wait is paired across a CPU nobody read. */
-ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     ulong total = 0;
     for (ulong cpu = 0; cpu < MAX_CPUS; cpu++)
@@ -876,7 +1021,7 @@ ulong collect(Window windows[MAX_CPUS], stdlib::Printer& con, ulong count, ulong
             continue;
         }
         u64 complete;
-        ulong kept = read_window(*ring, cleared_at[cpu], want, mask, (u32)cpu, records, complete);
+        ulong kept = read_window(*ring, cleared_at[cpu], want, select, (u32)cpu, records, complete);
         windows[cpu] = { records, kept, 0, complete };
         total += kept;
     }
@@ -958,15 +1103,15 @@ void say_cut(stdlib::Printer& con, Window windows[MAX_CPUS], ulong skip, u64 now
 }
 
 /* The newest `count` records of every ring (or of cpu `only`'s), merged by
-   their cycle counts, of the events in `mask`. Takes control() to read the
+   their cycle counts, of those `select` keeps. Takes control() to read the
    rings, and prints with it let go. */
-void show(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void show(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1064,13 +1209,13 @@ void dump_record(stdlib::Printer& con, const TraceRing::Record& r, ulong ns)
     con.printf("}}\n");
 }
 
-void dump(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void dump(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1136,13 +1281,13 @@ void print_waits(stdlib::Printer& con, const WakePairing& pairing, WakeWait* wai
    the longest with their tasks and CPUs. Only from where every CPU's part
    of the window is whole (window_start): before, a wakeup's switch may be
    among what a ring lost. */
-void latency(stdlib::Printer& con, ulong count, ulong only, EventMask mask)
+void latency(stdlib::Printer& con, ulong count, ulong only, const Select& select)
 {
     Window windows[MAX_CPUS];
     ulong total;
     {
         stdlib::AutoLock lock(control());
-        total = collect(windows, con, count, only, mask);
+        total = collect(windows, con, count, only, select);
     }
     u64 now_cycles;
     ulong now_ns;
@@ -1822,13 +1967,106 @@ void boot_on(const char* list)
         klog(0, "trace: %ld events on from boot (tracepoints=%s)", named, list);
 }
 
-/* show's, dump's and latency's arguments: [n] [cpu=N] [event|group|all...]. */
+/* show's, dump's and latency's arguments: [n] [cpu=N] [event|group|all...]
+   [field=value...]. */
 struct WindowArgs
 {
     ulong count;
     ulong only;
-    EventMask mask;
+    Select select;
 };
+
+/* A number as a field filter takes one: decimal, or hex after 0x. */
+bool parse_filter_number(const char* text, u64& value)
+{
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+    {
+        const ulong HEX_DIGITS_MAX = 16;
+        value = 0;
+        ulong digits = 0;
+        for (const char* c = text + 2; *c != '\0'; c++)
+        {
+            u8 nibble = stdlib::hex_char_to_nibble(*c);
+            if (nibble == 0xFF || ++digits > HEX_DIGITS_MAX)
+                return false;
+            value = (value << 4) | nibble;
+        }
+        return digits != 0;
+    }
+    ulong v;
+    if (!stdlib::parse_ulong(text, v))
+        return false;
+    value = v;
+    return true;
+}
+
+/* `name=value` made the next of `select`'s field filters: for each event of
+   its mask, the field called `name` -- where it lies, and the value it is to
+   be: `value` as a number, or for an enumeration the place of that name in
+   the event's own names. False, said, when no event of the mask has such a
+   field that can be such a value: a filter that would match nothing is a
+   mistake to say, as a word that names nothing is. */
+bool field_filter(const char* name, const char* value, Select& select, stdlib::Printer& con)
+{
+    if (select.filter_count >= FIELD_FILTERS_MAX)
+    {
+        con.printf("trace: %lu field filters at most\n", FIELD_FILTERS_MAX);
+        return false;
+    }
+    FieldFilter& f = select.filters[select.filter_count];
+    u64 number = 0;
+    const bool numeric = parse_filter_number(value, number);
+    bool any = false;
+    for (ulong id = 0; id < COUNT; id++)
+    {
+        f.offset[id] = 0;
+        f.size[id] = 0;
+        f.value[id] = 0;
+        if (select.mask != ALL_EVENTS && (event_bit(id) & select.mask) == 0)
+            continue;
+        const Event& e = EVENTS[id];
+        for (ulong i = 0; i < e.field_count; i++)
+        {
+            const Field& field = e.fields[i];
+            if (stdlib::str_cmp(field.name, name) != 0)
+                continue;
+            u64 v = 0;
+            bool fits = false;
+            if (numeric)
+            {
+                v = number;
+                fits = field.size >= sizeof(u64) || v < ((u64)1 << (8 * field.size));
+            }
+            else if (field.kind == Kind::Enum && field.names != nullptr)
+            {
+                for (ulong k = 0; k < field.name_count; k++)
+                {
+                    if (stdlib::str_cmp(field.names[k], value) == 0)
+                    {
+                        v = k;
+                        fits = true;
+                        break;
+                    }
+                }
+            }
+            if (fits && field.size <= sizeof(u64))
+            {
+                f.offset[id] = field.offset;
+                f.size[id] = field.size;
+                f.value[id] = v;
+                any = true;
+            }
+            break;
+        }
+    }
+    if (!any)
+    {
+        con.printf("trace: no event of the window has a field %s that can be %s\n", name, value);
+        return false;
+    }
+    select.filter_count++;
+    return true;
+}
 
 /* The window the words after the verb ask for -- false, said, for a word
    that is none of n (1 up; SHOW_MAX at most, more taken as it), cpu=N of a
@@ -1839,7 +2077,11 @@ bool window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out, stdl
     const ulong CPU_PREFIX_LEN = 4;
     out.count = SHOW_DEFAULT;
     out.only = MAX_CPUS;
-    out.mask = 0;
+    out.select.mask = 0;
+    out.select.filter_count = 0;
+    /* The words that are field filters, resolved once the events are known */
+    ulong filters[FIELD_FILTERS_MAX] = {};
+    ulong filter_words = 0;
     for (ulong w = 1; w < n; w++)
     {
         ulong value;
@@ -1862,14 +2104,39 @@ bool window_args(char words[WORDS_MAX][WORD_LEN], ulong n, WindowArgs& out, stdl
             }
             out.count = (value < SHOW_MAX) ? value : SHOW_MAX;
         }
-        else if (!name_mask(words[w], out.mask))
+        else if (stdlib::str_chr(words[w], '=') != nullptr)
+        {
+            if (filter_words >= FIELD_FILTERS_MAX)
+            {
+                con.printf("trace: %lu field filters at most\n", FIELD_FILTERS_MAX);
+                return false;
+            }
+            filters[filter_words++] = w;
+        }
+        else if (!name_mask(words[w], out.select.mask))
         {
             con.printf("trace: no event or group called %s\n", words[w]);
             return false;
         }
     }
-    if (out.mask == 0)
-        out.mask = ALL_EVENTS;
+    if (out.select.mask == 0)
+        out.select.mask = ALL_EVENTS;
+    for (ulong i = 0; i < filter_words; i++)
+    {
+        /* The word cut at its '=' in place: the name before, the value after */
+        char* word = words[filters[i]];
+        char* eq = word;
+        while (*eq != '=')
+            eq++;
+        *eq = '\0';
+        if (word[0] == '\0' || eq[1] == '\0')
+        {
+            con.printf("trace: a field filter is name=value\n");
+            return false;
+        }
+        if (!field_filter(word, eq + 1, out.select, con))
+            return false;
+    }
     return true;
 }
 
@@ -1914,11 +2181,11 @@ void command(const char* args, stdlib::Printer& con)
         if (!window_args(words, n, window, con))
             return;
         if (stdlib::str_cmp(verb, "show") == 0)
-            show(con, window.count, window.only, window.mask);
+            show(con, window.count, window.only, window.select);
         else if (stdlib::str_cmp(verb, "dump") == 0)
-            dump(con, window.count, window.only, window.mask);
+            dump(con, window.count, window.only, window.select);
         else
-            latency(con, window.count, window.only, window.mask);
+            latency(con, window.count, window.only, window.select);
     }
     else if (stdlib::str_cmp(verb, "stat") == 0)
     {
@@ -2013,8 +2280,8 @@ void command(const char* args, stdlib::Printer& con)
     }
     else
     {
-        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] | "
-            "dump [n] [cpu=N] [event|group|all...] | latency [n] [cpu=N] [event|group|all...] | stat | clear | "
+        con.printf("usage: trace [list] | on <event|group|all>... | off <...> | show [n] [cpu=N] [event|group|all...] "
+            "[field=value...] | dump [...] | latency [...] | stat | clear | "
             "size <KiB> | free | freeze [wakeup>N<ns|us|ms|s>] | thaw | test [n] | bench [cpu=N]\n");
     }
 }
