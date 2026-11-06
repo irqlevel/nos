@@ -268,6 +268,10 @@ fn accept(shared: &Arc<Shared>, stream: TcpStream, ip: u32) -> Up {
     /* The listener's count of handshakes under way, `ip`'s among them, given
      * back once the TLS handshake is over -- however it ends */
     let slot = Handshake { shared, ip };
+    /* The link's floor on this end too: the accepting host sends as much as
+     * the dialing one -- a reply, an echo -- and its losses waited out 200 ms
+     * each where the dialer's waited out 20 */
+    let _ = stream.set_rto_floor(LINK_RTO_MS);
     let server = shared.server.with(|s| s.clone());
     let sock = Sock { tcp: stream, shared: shared.clone() };
     let got = server.accept(sock, HANDSHAKE_MS);
