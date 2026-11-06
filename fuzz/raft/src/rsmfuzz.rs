@@ -1,0 +1,1057 @@
+//! The replicated state machine (`raft::rsm`) as its users run it: a group of
+//! three or five over a network that delays, loses, doubles and cuts, each
+//! member on the log on disk over the crash disk of `logfuzz`, crashed and
+//! started again over what its disk kept; clients with sessions doing a
+//! register's operations -- write, add, compare-and-set, read -- one at a
+//! time, each retried after a timeout of whichever member they think leads.
+//! The history of every operation, from its asking to its answer, is then
+//! checked for linearizability (Wing and Gong's search, with Lowe's memo):
+//! a register that took every operation once, at one point between its
+//! asking and its answer -- an add applied twice, a read of a state older
+//! than one already answered, is a finding.
+//!
+//! The register's snapshot carries ballast written a kilobyte a call, so
+//! that a snapshot spans several calls with applying going on between
+//! them; and it checks its own bytes when read back.
+
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use raft::types::Body;
+use raft::{
+    Config, DiskLog, Error, Event, Frozen, LogConfig, MemStorage, Message, NodeId, RestoreError, Rsm, RsmError,
+    SnapshotReader, StateMachine,
+};
+
+use crate::logfuzz::{Disk, SimFiles};
+use crate::rng::{mix, Rng};
+
+/* ---- the register ---- */
+
+const OP_WRITE: u8 = 1;
+const OP_ADD: u8 = 2;
+const OP_CAS: u8 = 3;
+/// What a snapshot of the register carries besides its value: small
+/// enough that the log comes to it often.
+const BALLAST: usize = 2048;
+/// What a frozen register writes in one call at most: a snapshot spans
+/// several calls of `process`.
+const WRITE_STEP: usize = 256;
+
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// The snapshot's `k`th byte for a register holding `value`.
+fn byte_at(value: u64, k: usize) -> u8 {
+    if k < 8 {
+        value.to_le_bytes()[k]
+    } else {
+        (mix(value, (k / 8) as u64) >> ((k % 8) * 8)) as u8
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Reg {
+    pub value: u64,
+}
+
+pub struct FrozenReg {
+    value: u64,
+    written: usize,
+}
+
+impl Frozen for FrozenReg {
+    fn write(&mut self, max: usize, out: &mut Vec<u8>) {
+        let n = (8 + BALLAST - self.written).min(max).min(WRITE_STEP);
+        for k in self.written..self.written + n {
+            out.push(byte_at(self.value, k));
+        }
+        self.written += n;
+    }
+}
+
+impl StateMachine for Reg {
+    type Frozen = FrozenReg;
+
+    fn apply(&mut self, _index: u64, command: &[u8]) -> Vec<u8> {
+        match command.first() {
+            Some(&OP_WRITE) if command.len() == 9 => {
+                self.value = le64(&command[1..9]);
+                Vec::new()
+            }
+            Some(&OP_ADD) if command.len() == 9 => {
+                self.value = self.value.wrapping_add(le64(&command[1..9]));
+                self.value.to_le_bytes().to_vec()
+            }
+            Some(&OP_CAS) if command.len() == 17 => {
+                if self.value == le64(&command[1..9]) {
+                    self.value = le64(&command[9..17]);
+                    vec![1]
+                } else {
+                    vec![0]
+                }
+            }
+            _ => vec![0xFF],
+        }
+    }
+
+    fn query(&self, _query: &[u8]) -> Vec<u8> {
+        self.value.to_le_bytes().to_vec()
+    }
+
+    fn size(&self) -> u64 {
+        (8 + BALLAST) as u64
+    }
+
+    fn freeze(&self) -> FrozenReg {
+        FrozenReg { value: self.value, written: 0 }
+    }
+
+    fn restore(&mut self, r: &mut SnapshotReader<'_>) -> Result<(), RestoreError> {
+        if r.remaining() != (8 + BALLAST) as u64 {
+            return Err(RestoreError("a register's snapshot of another length"));
+        }
+        let mut b = vec![0u8; 8 + BALLAST];
+        if !r.read_exact(&mut b) {
+            return Err(RestoreError("a register's snapshot cut short"));
+        }
+        let value = le64(&b[..8]);
+        if (0..8 + BALLAST).any(|k| b[k] != byte_at(value, k)) {
+            return Err(RestoreError("a register's snapshot whose bytes disagree"));
+        }
+        self.value = value;
+        Ok(())
+    }
+}
+
+/* ---- the history, and its check ---- */
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Write(u64),
+    Add(u64),
+    Cas(u64, u64),
+    Read,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Ack,
+    Value(u64),
+    Swapped(bool),
+}
+
+impl Op {
+    fn command(&self) -> Vec<u8> {
+        let mut c = Vec::with_capacity(17);
+        match *self {
+            Op::Write(v) => {
+                c.push(OP_WRITE);
+                c.extend_from_slice(&v.to_le_bytes());
+            }
+            Op::Add(v) => {
+                c.push(OP_ADD);
+                c.extend_from_slice(&v.to_le_bytes());
+            }
+            Op::Cas(a, b) => {
+                c.push(OP_CAS);
+                c.extend_from_slice(&a.to_le_bytes());
+                c.extend_from_slice(&b.to_le_bytes());
+            }
+            Op::Read => {}
+        }
+        c
+    }
+
+    /// What the register does with it: its value after, and the answer.
+    fn on(&self, value: u64) -> (u64, Answer) {
+        match *self {
+            Op::Write(v) => (v, Answer::Ack),
+            Op::Add(v) => (value.wrapping_add(v), Answer::Value(value.wrapping_add(v))),
+            Op::Cas(a, b) if value == a => (b, Answer::Swapped(true)),
+            Op::Cas(..) => (value, Answer::Swapped(false)),
+            Op::Read => (value, Answer::Value(value)),
+        }
+    }
+
+    /// The answer an applied command's bytes say.
+    fn answer(&self, bytes: &[u8]) -> Option<Answer> {
+        match *self {
+            Op::Write(_) if bytes.is_empty() => Some(Answer::Ack),
+            Op::Add(_) | Op::Read if bytes.len() == 8 => Some(Answer::Value(le64(bytes))),
+            Op::Cas(..) if bytes.len() == 1 => Some(Answer::Swapped(bytes[0] == 1)),
+            _ => None,
+        }
+    }
+}
+
+/// One operation: who asked, what, when -- and when it was answered, and
+/// how, if it was. Times are of one clock that ticks at every asking and
+/// every answer, so that no two are the same.
+#[derive(Clone, Debug)]
+pub struct Record {
+    pub client: usize,
+    pub op: Op,
+    pub asked: u64,
+    pub answered: Option<(u64, Answer)>,
+}
+
+fn bit(set: &[u64], i: usize) -> bool {
+    set[i / 64] >> (i % 64) & 1 != 0
+}
+
+fn flip(set: &mut [u64], i: usize) {
+    set[i / 64] ^= 1 << (i % 64);
+}
+
+/// Whether the history is a register's: every answered operation taking
+/// effect once, at a point between its asking and its answer, in an order
+/// in which each answer is the register's; an operation never answered
+/// taking effect so, or not at all.
+pub fn linearizable(h: &[Record]) -> Result<(), String> {
+    struct S<'a> {
+        h: &'a [Record],
+        seen: HashSet<(Vec<u64>, u64)>,
+        steps: u64,
+    }
+    fn search(s: &mut S<'_>, done: &mut Vec<u64>, value: u64, left: usize) -> Option<bool> {
+        if left == 0 {
+            return Some(true);
+        }
+        s.steps += 1;
+        if s.steps > 2_000_000 {
+            return None;
+        }
+        if !s.seen.insert((done.clone(), value)) {
+            return Some(false);
+        }
+        /* Whatever comes next was asked before the earliest answer of what
+         * is not yet placed */
+        let first_answer = s
+            .h
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| !bit(done, *i) && r.answered.is_some())
+            .filter_map(|(_, r)| r.answered.map(|a| a.0))
+            .min()
+            .unwrap_or(u64::MAX);
+        for i in 0..s.h.len() {
+            let r = &s.h[i];
+            if bit(done, i) || r.asked > first_answer {
+                continue;
+            }
+            let (after, answer) = r.op.on(value);
+            if let Some((_, want)) = r.answered {
+                if want != answer {
+                    continue;
+                }
+            }
+            flip(done, i);
+            let found = search(s, done, after, left - usize::from(r.answered.is_some()));
+            flip(done, i);
+            match found {
+                Some(true) => return Some(true),
+                None => return None,
+                Some(false) => {}
+            }
+        }
+        Some(false)
+    }
+    let mut s = S { h, seen: HashSet::new(), steps: 0 };
+    let mut done = vec![0u64; h.len().div_ceil(64)];
+    let left = h.iter().filter(|r| r.answered.is_some()).count();
+    match search(&mut s, &mut done, 0, left) {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let clients: HashSet<usize> = h.iter().map(|r| r.client).collect();
+            Err(format!("a history no register makes, of {} operations by {} clients", h.len(), clients.len()))
+        }
+        /* Too many orders to try: undecided, not a finding */
+        None => Ok(()),
+    }
+}
+
+/* ---- the group ---- */
+
+type Store = DiskLog<SimFiles>;
+
+struct Member {
+    id: NodeId,
+    disk: SimFiles,
+    rsm: Option<Rsm<Store, Reg>>,
+}
+
+/// What a client is doing.
+#[derive(Clone, Copy, Debug)]
+enum Doing {
+    Nothing,
+    /// Asking for a session: the request, of whom, until when.
+    Registering { request: u64, of: NodeId, until: u64 },
+    /// An operation: its record, its number -- a command's -- the request
+    /// of a read, of whom, until when.
+    Op { rec: usize, seq: u64, request: u64, of: NodeId, until: u64 },
+}
+
+struct Client {
+    session: Option<u64>,
+    seq: u64,
+    doing: Doing,
+    /// Whom it thinks leads.
+    leader: NodeId,
+    ops_left: u64,
+}
+
+struct Group {
+    r: Rng,
+    now: u64,
+    clock: u64,
+    members: Vec<Member>,
+    log_config: LogConfig,
+    seed: u64,
+    floor: u64,
+    /// Messages on their way: when they arrive, and to whom.
+    wire: Vec<(u64, NodeId, Message)>,
+    /// Members on each side of a cut, or none.
+    cut: Option<Vec<bool>>,
+    loss: u64,
+    clients: Vec<Client>,
+    history: Vec<Record>,
+    next_request: u64,
+    calm: bool,
+}
+
+const TIMEOUT: u64 = 40;
+
+fn config(id: NodeId, seed: u64) -> Config {
+    let mut c = Config::new(id);
+    c.seed = mix(seed, id);
+    c
+}
+
+impl Group {
+    fn member(&mut self, id: NodeId) -> Option<&mut Rsm<Store, Reg>> {
+        self.members.iter_mut().find(|m| m.id == id).and_then(|m| m.rsm.as_mut())
+    }
+
+    fn any_member(&mut self) -> NodeId {
+        self.members[self.r.below(self.members.len() as u64) as usize].id
+    }
+
+    fn tick_clock(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn separated(&self, a: NodeId, b: NodeId) -> bool {
+        self.cut.as_ref().is_some_and(|side| side[(a - 1) as usize] != side[(b - 1) as usize])
+    }
+
+    /// One step of the world: messages delivered, ticks, every member's
+    /// work done, clients acting, faults.
+    fn step(&mut self) -> Result<(), String> {
+        self.now += 1;
+        let now = self.now;
+        /* Arrivals, in an order of their own */
+        let mut due = Vec::new();
+        let mut k = 0;
+        while k < self.wire.len() {
+            if self.wire[k].0 <= now {
+                due.push(self.wire.swap_remove(k));
+            } else {
+                k += 1;
+            }
+        }
+        for _ in 0..due.len() {
+            let j = self.r.below(due.len() as u64) as usize;
+            let (_, to, m) = due.swap_remove(j);
+            if self.separated(m.from, to) {
+                continue;
+            }
+            if let Some(rsm) = self.member(to) {
+                let _ = rsm.step(m);
+            }
+        }
+        let trace = std::env::var_os("RAFT_RSM_TRACE").is_some();
+        for i in 0..self.members.len() {
+            let id = self.members[i].id;
+            let Some(rsm) = self.members[i].rsm.as_mut() else { continue };
+            rsm.tick();
+            let snap_before = rsm.node().storage().snapshot_meta().index;
+            let out = match rsm.process() {
+                Ok(out) => out,
+                Err(e) => return Err(format!("member {} stopped: {:?}", id, e)),
+            };
+            for m in out.messages {
+                if !self.calm && self.r.below(1000) < self.loss {
+                    continue;
+                }
+                let copies = if !self.calm && self.r.chance(2) { 2 } else { 1 };
+                for _ in 0..copies {
+                    let at = now + self.r.range(1, 3);
+                    self.wire.push((at, m.to, m.clone()));
+                }
+            }
+            if trace {
+                let rsm = self.members[i].rsm.as_ref().expect("the member");
+                let snap = rsm.node().storage().snapshot_meta().index;
+                if snap != snap_before {
+                    eprintln!("[{} clock {}] member {} snapshot {} -> {}, applied {}", now, self.clock, id, snap_before,
+                              snap, rsm.applied());
+                }
+                if let Some(ss) = out.soft_state {
+                    eprintln!("[{} clock {}] member {} {:?} leader {} term {}", now, self.clock, id, ss.role, ss.leader,
+                              rsm.node().term());
+                }
+                for e in out.events.iter() {
+                    match e {
+                        Event::Applied { client, seq, index, answer } => eprintln!(
+                            "[{} clock {}] member {} applied client {} seq {} at {} -> {:?}", now, self.clock, id,
+                            client, seq, index, answer),
+                        other => eprintln!("[{} clock {}] member {} {:?}", now, self.clock, id, other),
+                    }
+                }
+            }
+            for e in out.events {
+                self.event(id, e)?;
+            }
+        }
+        for c in 0..self.clients.len() {
+            self.client_step(c)?;
+        }
+        if !self.calm {
+            self.faults()?;
+        }
+        Ok(())
+    }
+
+    fn faults(&mut self) -> Result<(), String> {
+        if self.r.below(400) == 0 {
+            let i = self.r.below(self.members.len() as u64) as usize;
+            if let Some(rsm) = self.members[i].rsm.take() {
+                if std::env::var_os("RAFT_RSM_TRACE").is_some() {
+                    eprintln!("[{} clock {}] member {} crashed, applied {}", self.now, self.clock, self.members[i].id,
+                              rsm.applied());
+                }
+                /* A power cut: what the disk kept is all there is */
+                drop(rsm.into_store());
+                let mut cut_rng = Rng::new(self.r.next());
+                self.members[i].disk.0.borrow_mut().crash(&mut cut_rng);
+            }
+        }
+        for i in 0..self.members.len() {
+            if self.members[i].rsm.is_none() && self.r.below(30) == 0 {
+                self.start(i)?;
+            }
+        }
+        if self.cut.is_none() && self.r.below(500) == 0 {
+            let side: Vec<bool> = (0..self.members.len()).map(|_| self.r.chance(50)).collect();
+            self.cut = Some(side);
+        } else if self.cut.is_some() && self.r.below(80) == 0 {
+            self.cut = None;
+        }
+        Ok(())
+    }
+
+    /// A member started again over what its disk holds.
+    fn start(&mut self, i: usize) -> Result<(), String> {
+        let id = self.members[i].id;
+        let log = DiskLog::open(self.members[i].disk.clone(), self.log_config)
+            .map_err(|e| format!("member {}'s log would not open: {:?}", id, e))?;
+        let nonce = self.r.next();
+        let mut rsm = Rsm::new(config(id, self.seed), log, Reg::default(), nonce)
+            .map_err(|e| format!("member {} would not start: {:?}", id, e))?;
+        rsm.set_snapshot_floor(self.floor);
+        if std::env::var_os("RAFT_RSM_TRACE").is_some() {
+            eprintln!("[{} clock {}] member {} started, applied {} snapshot {} commit {}", self.now, self.clock, id,
+                      rsm.applied(), rsm.node().storage().snapshot_meta().index, rsm.node().committed());
+        }
+        self.members[i].rsm = Some(rsm);
+        Ok(())
+    }
+
+    fn event(&mut self, at: NodeId, e: Event) -> Result<(), String> {
+        match e {
+            Event::Registered { origin, request, client } => {
+                if origin != at {
+                    return Ok(());
+                }
+                for c in self.clients.iter_mut() {
+                    if let Doing::Registering { request: r, .. } = c.doing {
+                        if r == request {
+                            c.session = Some(client);
+                            c.doing = Doing::Nothing;
+                        }
+                    }
+                }
+            }
+            Event::Applied { client, seq, answer, .. } => {
+                let found = self.clients.iter().position(|c| {
+                    c.session == Some(client) && matches!(c.doing, Doing::Op { seq: s, .. } if s == seq)
+                });
+                if let Some(c) = found {
+                    let Doing::Op { rec, .. } = self.clients[c].doing else { return Ok(()) };
+                    let op = self.history[rec].op;
+                    let Some(a) = op.answer(&answer) else {
+                        return Err(format!("{:?} answered with {:?}", op, answer));
+                    };
+                    let t = self.tick_clock();
+                    self.history[rec].answered = Some((t, a));
+                    self.clients[c].doing = Doing::Nothing;
+                    self.clients[c].seq += 1;
+                }
+            }
+            Event::Expired { client, seq } => {
+                /* Its session gone, whether the command took effect is
+                 * not known: the operation stays unanswered */
+                for c in self.clients.iter_mut() {
+                    if c.session == Some(client) && matches!(c.doing, Doing::Op { seq: s, .. } if s == seq) {
+                        c.session = None;
+                        c.doing = Doing::Nothing;
+                    }
+                }
+            }
+            Event::Lost { client, seq } => return Err(format!("client {}'s answer to {} lost", client, seq)),
+            Event::Stale { .. } => {}
+            Event::Read { request, answer } => {
+                let found = self
+                    .clients
+                    .iter()
+                    .position(|c| matches!(c.doing, Doing::Op { request: q, of, .. } if q == request && of == at));
+                if let Some(c) = found {
+                    let Doing::Op { rec, .. } = self.clients[c].doing else { return Ok(()) };
+                    if answer.len() != 8 {
+                        return Err(format!("a read answered with {} bytes", answer.len()));
+                    }
+                    let t = self.tick_clock();
+                    self.history[rec].answered = Some((t, Answer::Value(le64(&answer))));
+                    self.clients[c].doing = Doing::Nothing;
+                }
+            }
+            Event::ReadFailed { request } => {
+                for c in self.clients.iter_mut() {
+                    if let Doing::Op { request: q, of, until, rec, seq } = c.doing {
+                        if q == request && of == at {
+                            /* Asked again at once, of whoever leads */
+                            c.doing = Doing::Op { request: q, of, until: until.min(self.now), rec, seq };
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A client's next move: a session asked for, an operation begun, one
+    /// asked again of another member after its timeout.
+    fn client_step(&mut self, c: usize) -> Result<(), String> {
+        let now = self.now;
+        match self.clients[c].doing {
+            Doing::Nothing => {
+                if self.clients[c].session.is_none() && self.clients[c].ops_left > 0 {
+                    let of = self.target(c);
+                    let request = self.next_request;
+                    self.next_request += 1;
+                    self.clients[c].doing = Doing::Registering { request, of, until: now + TIMEOUT };
+                    self.ask_register(c, of, request);
+                    return Ok(());
+                }
+                if self.clients[c].ops_left == 0 || self.r.chance(30) {
+                    return Ok(());
+                }
+                self.clients[c].ops_left -= 1;
+                let op = match self.r.below(4) {
+                    0 => Op::Write(self.r.range(1, 1 << 40)),
+                    1 => Op::Add(self.r.range(1, 10)),
+                    2 => {
+                        let seen = self.history.iter().rev().find_map(|r| match r.answered {
+                            Some((_, Answer::Value(v))) => Some(v),
+                            _ => None,
+                        });
+                        let expect = if self.r.chance(70) { seen.unwrap_or(0) } else { self.r.below(5) };
+                        Op::Cas(expect, self.r.range(1, 1 << 40))
+                    }
+                    _ => Op::Read,
+                };
+                let asked = self.tick_clock();
+                self.history.push(Record { client: c, op, asked, answered: None });
+                let rec = self.history.len() - 1;
+                let seq = self.clients[c].seq;
+                let of = self.target(c);
+                let request = self.next_request;
+                self.next_request += 1;
+                self.clients[c].doing = Doing::Op { rec, seq, request, of, until: now + TIMEOUT };
+                self.ask(c);
+            }
+            Doing::Registering { until, .. } if until <= now => {
+                let of = self.target(c);
+                let request = self.next_request;
+                self.next_request += 1;
+                self.clients[c].doing = Doing::Registering { request, of, until: now + TIMEOUT };
+                self.ask_register(c, of, request);
+            }
+            Doing::Op { rec, seq, until, .. } if until <= now => {
+                let of = self.target(c);
+                let request = self.next_request;
+                self.next_request += 1;
+                self.clients[c].doing = Doing::Op { rec, seq, request, of, until: now + TIMEOUT };
+                self.ask(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whom a client asks: whom it thinks leads, or anyone.
+    fn target(&mut self, c: usize) -> NodeId {
+        let l = self.clients[c].leader;
+        if l != 0 && self.r.chance(80) { l } else { self.any_member() }
+    }
+
+    fn note_refusal(&mut self, c: usize, e: RsmError) {
+        if let RsmError::Node(Error::NotLeader(l)) = e {
+            self.clients[c].leader = l;
+        }
+        /* Asked again at its next step */
+        if let Doing::Op { rec, seq, request, of, .. } = self.clients[c].doing {
+            self.clients[c].doing = Doing::Op { rec, seq, request, of, until: self.now + 1 };
+        }
+        if let Doing::Registering { request, of, .. } = self.clients[c].doing {
+            self.clients[c].doing = Doing::Registering { request, of, until: self.now + 1 };
+        }
+    }
+
+    fn ask_register(&mut self, c: usize, of: NodeId, request: u64) {
+        let r = match self.member(of) {
+            Some(rsm) => rsm.register(request).map(|_| ()),
+            None => Err(RsmError::Stopped),
+        };
+        if let Err(e) = r {
+            self.note_refusal(c, e);
+        }
+    }
+
+    fn ask(&mut self, c: usize) {
+        let Doing::Op { rec, seq, request, of, .. } = self.clients[c].doing else { return };
+        let op = self.history[rec].op;
+        let session = self.clients[c].session.unwrap_or(0);
+        let r = match self.member(of) {
+            Some(rsm) => match op {
+                Op::Read => rsm.read(request, Vec::new()),
+                _ => rsm.submit(session, seq, &op.command()).map(|_| ()),
+            },
+            None => Err(RsmError::Stopped),
+        };
+        if let Err(e) = r {
+            self.note_refusal(c, e);
+        }
+    }
+
+    /// Whether every client is done with what it asked.
+    fn settled(&self) -> bool {
+        self.clients.iter().all(|c| matches!(c.doing, Doing::Nothing) && (c.session.is_some() || c.ops_left == 0))
+    }
+}
+
+/// A group of `seed`'s, `steps` steps of faults and clients, then calm until
+/// every client is answered; the history checked.
+pub fn run(seed: u64, steps: u64) -> Result<(), String> {
+    let mut r = Rng::new(seed ^ 0x125A);
+    let n = if r.chance(70) { 3 } else { 5 };
+    let voters: Vec<NodeId> = (1..=n).collect();
+    let log_config = LogConfig { segment_bytes: [4096, 16384, 1 << 20][r.below(3) as usize] };
+    let floor = [256, 2048, 1 << 20][r.below(3) as usize];
+    let mut members = Vec::new();
+    for &id in &voters {
+        let disk = SimFiles(Rc::new(RefCell::new(Disk::new(mix(seed, id)))));
+        let log = DiskLog::bootstrap(disk.clone(), log_config, &voters, &[]).map_err(|e| format!("bootstrap: {:?}", e))?;
+        let mut rsm = Rsm::new(config(id, seed), log, Reg::default(), r.next()).map_err(|e| format!("start: {:?}", e))?;
+        rsm.set_snapshot_floor(floor);
+        members.push(Member { id, disk, rsm: Some(rsm) });
+    }
+    let clients = (0..r.range(2, 4))
+        .map(|_| Client { session: None, seq: 1, doing: Doing::Nothing, leader: 0, ops_left: 150 })
+        .collect();
+    let loss = [0, 20, 100][r.below(3) as usize];
+    let mut g = Group {
+        r,
+        now: 0,
+        clock: 0,
+        members,
+        log_config,
+        seed,
+        floor,
+        wire: Vec::new(),
+        cut: None,
+        loss,
+        clients,
+        history: Vec::new(),
+        next_request: 1,
+        calm: false,
+    };
+    for _ in 0..steps {
+        g.step()?;
+    }
+    /* Calm: everyone up, nothing cut or lost, until every client is
+     * answered */
+    g.calm = true;
+    g.cut = None;
+    for i in 0..g.members.len() {
+        if g.members[i].rsm.is_none() {
+            g.start(i)?;
+        }
+    }
+    for c in g.clients.iter_mut() {
+        c.ops_left = 0;
+    }
+    let mut calm_steps = 0;
+    while !g.settled() {
+        g.step()?;
+        calm_steps += 1;
+        if calm_steps > 4000 {
+            let open = g.history.iter().filter(|h| h.answered.is_none()).count();
+            return Err(format!("no progress in 4000 calm steps: {} operations unanswered", open));
+        }
+    }
+    if std::env::var_os("RAFT_RSM_STATS").is_some() {
+        let answered = g.history.iter().filter(|h| h.answered.is_some()).count();
+        let applied: Vec<u64> = g.members.iter().filter_map(|m| m.rsm.as_ref().map(|r| r.applied())).collect();
+        let snaps: Vec<u64> =
+            g.members.iter().filter_map(|m| m.rsm.as_ref().map(|r| r.node().storage().snapshot_meta().index)).collect();
+        eprintln!("seed {}: {} members, {} operations, {} answered, applied {:?}, snapshots at {:?}, {} calm steps",
+                  seed, g.members.len(), g.history.len(), answered, applied, snaps, calm_steps);
+    }
+    let verdict = linearizable(&g.history);
+    if verdict.is_err() && std::env::var_os("RAFT_RSM_TRACE").is_some() {
+        /* The shortest prefix -- by asking -- that no register makes, and
+         * its last operations */
+        let mut times: Vec<u64> = g.history.iter().flat_map(|r| [Some(r.asked), r.answered.map(|a| a.0)]).flatten().collect();
+        times.sort_unstable();
+        let mut lo = 1;
+        let mut hi = times.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let cut = times[mid - 1];
+            let prefix: Vec<Record> = g
+                .history
+                .iter()
+                .filter(|r| r.asked <= cut)
+                .map(|r| Record { answered: r.answered.filter(|a| a.0 <= cut), ..r.clone() })
+                .collect();
+            if linearizable(&prefix).is_err() { hi = mid } else { lo = mid + 1 }
+        }
+        let cut = times[lo - 1];
+        eprintln!("the shortest prefix no register makes ends at clock {}:", cut);
+        let window: Vec<&Record> = g.history.iter().filter(|r| r.asked <= cut).collect();
+        for r in window.iter().rev().take(25).rev() {
+            eprintln!("  client {} {:?} asked {} answered {:?}", r.client, r.op, r.asked, r.answered);
+        }
+    }
+    verdict
+}
+
+/* ---- scenarios, a rule of the state machine's each ---- */
+
+pub const SCENARIOS: &[(&str, fn() -> Result<(), String>)] = &[
+    ("rsm_retry_once", retry_once),
+    ("rsm_snapshot_frozen", snapshot_frozen),
+    ("rsm_sessions_in_snapshot", sessions_in_snapshot),
+    ("rsm_read_waits", read_waits),
+    ("rsm_linearizable_check", linearizable_check),
+    ("rsm_read_after_restart", read_after_restart),
+];
+
+type Lone = Rsm<MemStorage, Reg>;
+
+/// A group of one, leading, with a session: the member and the client.
+fn lone(floor: u64) -> Result<(Lone, u64), String> {
+    let mut m =
+        Rsm::new(config(1, 1), MemStorage::bootstrap(&[1], &[]), Reg::default(), 1).map_err(|e| format!("{:?}", e))?;
+    m.set_snapshot_floor(floor);
+    m.campaign().map_err(|e| format!("{:?}", e))?;
+    drain(&mut m)?;
+    m.register(7).map_err(|e| format!("{:?}", e))?;
+    let client = drain(&mut m)?
+        .into_iter()
+        .find_map(|e| match e {
+            Event::Registered { client, .. } => Some(client),
+            _ => None,
+        })
+        .ok_or("no session")?;
+    Ok((m, client))
+}
+
+/// `process` until there is nothing to do: the events.
+fn drain(m: &mut Lone) -> Result<Vec<Event>, String> {
+    let mut events = Vec::new();
+    for _ in 0..1000 {
+        let out = m.process().map_err(|e| format!("{:?}", e))?;
+        let idle = out.events.is_empty() && out.messages.is_empty() && !m.taking_snapshot();
+        events.extend(out.events);
+        if idle && !m.node().has_ready() {
+            return Ok(events);
+        }
+    }
+    Err("never idle".into())
+}
+
+fn add(m: &mut Lone, client: u64, seq: u64, v: u64) -> Result<Vec<Event>, String> {
+    m.submit(client, seq, &Op::Add(v).command()).map_err(|e| format!("{:?}", e))?;
+    drain(m)
+}
+
+/// A command retried under its number is answered from the session, not
+/// applied again.
+fn retry_once() -> Result<(), String> {
+    let (mut m, client) = lone(1 << 30)?;
+    add(&mut m, client, 1, 5)?;
+    let again = add(&mut m, client, 1, 5)?;
+    let answered = again.iter().any(|e| matches!(e, Event::Applied { seq: 1, answer, .. } if answer == &5u64.to_le_bytes()));
+    if m.state().value != 5 || !answered {
+        return Err(format!("a retry applied again: the register is {}", m.state().value));
+    }
+    Ok(())
+}
+
+/// A snapshot written over many calls, commands applied between them, is
+/// of the state at its own index: started again from it, the member comes
+/// to the same state.
+fn snapshot_frozen() -> Result<(), String> {
+    let (mut m, client) = lone(256)?;
+    let mut seq = 1;
+    let mut took = false;
+    for k in 0..600 {
+        m.submit(client, seq, &Op::Add(k % 7 + 1).command()).map_err(|e| format!("{:?}", e))?;
+        seq += 1;
+        m.process().map_err(|e| format!("{:?}", e))?;
+        took |= m.taking_snapshot();
+    }
+    drain(&mut m)?;
+    let before = m.state().value;
+    if !took || m.node().storage().snapshot_meta().index == 0 {
+        return Err("no snapshot taken".into());
+    }
+    let store = m.into_store();
+    let mut again = Rsm::new(config(1, 1), store, Reg::default(), 2).map_err(|e| format!("{:?}", e))?;
+    again.campaign().map_err(|e| format!("{:?}", e))?;
+    drain(&mut again)?;
+    if again.state().value != before {
+        return Err(format!("started again from the snapshot: {} where it was {}", again.state().value, before));
+    }
+    Ok(())
+}
+
+/// A session is in the snapshot: a retry after a start from one is
+/// answered from it.
+fn sessions_in_snapshot() -> Result<(), String> {
+    let (mut m, client) = lone(256)?;
+    add(&mut m, client, 1, 5)?;
+    let mut seq = 2;
+    while m.node().storage().snapshot_meta().index < 3 {
+        add(&mut m, client, seq, 0)?;
+        seq += 1;
+        if seq > 2000 {
+            return Err("no snapshot taken".into());
+        }
+    }
+    let last = seq - 1;
+    let store = m.into_store();
+    let mut again = Rsm::new(config(1, 1), store, Reg::default(), 2).map_err(|e| format!("{:?}", e))?;
+    again.campaign().map_err(|e| format!("{:?}", e))?;
+    drain(&mut again)?;
+    let events = add(&mut again, client, last, 0)?;
+    if !events.iter().any(|e| matches!(e, Event::Applied { seq, .. } if *seq == last)) {
+        return Err(format!("a retry after a start from a snapshot: {:?}", events));
+    }
+    Ok(())
+}
+
+/// A read confirmed by the leader is served only once applied as far: a
+/// follower that has not yet heard of a write does not answer with what
+/// was there before it.
+fn read_waits() -> Result<(), String> {
+    let voters = [1, 2, 3];
+    let mut ms: Vec<Rsm<MemStorage, Reg>> = Vec::new();
+    for &id in &voters {
+        ms.push(
+            Rsm::new(config(id, 1), MemStorage::bootstrap(&voters, &[]), Reg::default(), 1000 * id)
+                .map_err(|e| format!("{:?}", e))?,
+        );
+    }
+    /* Every member's work done and its messages delivered, fifty rounds --
+     * appends to member 3 held back while `hold` -- and every member's
+     * events, by member */
+    fn run(ms: &mut [Rsm<MemStorage, Reg>], held: &mut Vec<Message>, hold: bool) -> Result<Vec<(usize, Event)>, String> {
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            let mut wire = Vec::new();
+            for (i, m) in ms.iter_mut().enumerate() {
+                let out = m.process().map_err(|e| format!("{:?}", e))?;
+                wire.extend(out.messages);
+                events.extend(out.events.into_iter().map(|e| (i, e)));
+            }
+            for msg in wire {
+                if hold && msg.to == 3 && matches!(msg.body, Body::Append { .. } | Body::Snapshot { .. }) {
+                    held.push(msg);
+                    continue;
+                }
+                let _ = ms[(msg.to - 1) as usize].step(msg);
+            }
+        }
+        Ok(events)
+    }
+    let mut held = Vec::new();
+    ms[0].campaign().map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut held, false)?;
+    if ms[0].role() != raft::Role::Leader {
+        return Err("member 1 does not lead".into());
+    }
+    /* A session, and a write of 7 member 3 does not hear of */
+    ms[0].register(1).map_err(|e| format!("{:?}", e))?;
+    let client = run(&mut ms, &mut held, false)?
+        .into_iter()
+        .find_map(|(i, e)| match e {
+            Event::Registered { client, origin: 1, .. } if i == 0 => Some(client),
+            _ => None,
+        })
+        .ok_or("no session")?;
+    ms[0].submit(client, 1, &Op::Write(7).command()).map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut held, true)?;
+    if ms[0].state().value != 7 || ms[2].state().value != 0 {
+        return Err(format!("the write: {} on the leader, {} on member 3", ms[0].state().value, ms[2].state().value));
+    }
+    ms[2].read(99, Vec::new()).map_err(|e| format!("{:?}", e))?;
+    let early = run(&mut ms, &mut held, true)?;
+    if let Some((_, e)) = early.iter().find(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 99, .. })) {
+        return Err(format!("a read served before its index was applied: {:?}", e));
+    }
+    /* The appends let through: the read comes, the write in it */
+    for msg in std::mem::take(&mut held) {
+        let _ = ms[2].step(msg);
+    }
+    let late = run(&mut ms, &mut held, false)?;
+    match late.iter().find(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 99, .. })) {
+        Some((_, Event::Read { answer, .. })) if answer == &7u64.to_le_bytes() => Ok(()),
+        other => Err(format!("the read after the write came: {:?}", other)),
+    }
+}
+
+/// The check itself, on histories known to be a register's and not.
+fn linearizable_check() -> Result<(), String> {
+    let rec = |client, op, asked, answered: Option<(u64, Answer)>| Record { client, op, asked, answered };
+    /* Two writes at once, a read after both seeing either is fine */
+    let good = [
+        rec(0, Op::Write(1), 1, Some((4, Answer::Ack))),
+        rec(1, Op::Write(2), 2, Some((3, Answer::Ack))),
+        rec(0, Op::Read, 5, Some((6, Answer::Value(1)))),
+    ];
+    linearizable(&good)?;
+    /* An add applied twice: 1 and then 2 read after a single add of 1 */
+    let twice = [
+        rec(0, Op::Add(1), 1, Some((2, Answer::Value(1)))),
+        rec(0, Op::Read, 3, Some((4, Answer::Value(2)))),
+    ];
+    if linearizable(&twice).is_ok() {
+        return Err("an add applied twice passed".into());
+    }
+    /* A stale read: a write answered, then a read of what was before */
+    let stale = [
+        rec(0, Op::Write(5), 1, Some((2, Answer::Ack))),
+        rec(1, Op::Read, 3, Some((4, Answer::Value(0)))),
+    ];
+    if linearizable(&stale).is_ok() {
+        return Err("a stale read passed".into());
+    }
+    /* A write never answered may take effect, or not */
+    let open = [
+        rec(0, Op::Write(9), 1, None),
+        rec(1, Op::Read, 2, Some((3, Answer::Value(9)))),
+        rec(1, Op::Read, 4, Some((5, Answer::Value(9)))),
+    ];
+    linearizable(&open)
+}
+
+/// A leader's answer to a read asked before the member was started again,
+/// arriving after, is not taken for the answer to a read asked since: the
+/// new read waits for its own, and sees the write acknowledged before it.
+fn read_after_restart() -> Result<(), String> {
+    let voters = [1, 2, 3];
+    let mut ms: Vec<Rsm<MemStorage, Reg>> = Vec::new();
+    for &id in &voters {
+        ms.push(Rsm::new(config(id, 1), MemStorage::bootstrap(&voters, &[]), Reg::default(), 7)
+            .map_err(|e| format!("{:?}", e))?);
+    }
+    /* Rounds of work and delivery; what `held` says is kept back */
+    fn run(ms: &mut [Rsm<MemStorage, Reg>], kept: &mut Vec<Message>, held: &dyn Fn(&Message) -> bool)
+        -> Result<Vec<(usize, Event)>, String>
+    {
+        let mut events = Vec::new();
+        for _ in 0..50 {
+            let mut wire = Vec::new();
+            for (i, m) in ms.iter_mut().enumerate() {
+                m.tick();
+                let out = m.process().map_err(|e| format!("{:?}", e))?;
+                wire.extend(out.messages);
+                events.extend(out.events.into_iter().map(|e| (i, e)));
+            }
+            for msg in wire {
+                if held(&msg) {
+                    kept.push(msg);
+                    continue;
+                }
+                let _ = ms[(msg.to - 1) as usize].step(msg);
+            }
+        }
+        Ok(events)
+    }
+    let none = |_: &Message| false;
+    let mut kept = Vec::new();
+    ms[0].campaign().map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut kept, &none)?;
+    ms[0].register(1).map_err(|e| format!("{:?}", e))?;
+    let client = run(&mut ms, &mut kept, &none)?
+        .into_iter()
+        .find_map(|(i, e)| match e {
+            Event::Registered { client, origin: 1, .. } if i == 0 => Some(client),
+            _ => None,
+        })
+        .ok_or("no session")?;
+    ms[0].submit(client, 1, &Op::Write(1).command()).map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut kept, &none)?;
+    /* Member 3 asks a read; the leader's answer is kept back */
+    let to3_answer = |m: &Message| m.to == 3 && matches!(m.body, Body::ReadIndexResp { .. });
+    ms[2].read(50, Vec::new()).map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut kept, &to3_answer)?;
+    let stale: Vec<Message> = std::mem::take(&mut kept);
+    if stale.is_empty() {
+        return Err("no answer to member 3's read to keep back".into());
+    }
+    /* A write of 2 member 3 does not hear of */
+    let to3_append = |m: &Message| m.to == 3 && matches!(m.body, Body::Append { .. } | Body::Snapshot { .. });
+    ms[0].submit(client, 2, &Op::Write(2).command()).map_err(|e| format!("{:?}", e))?;
+    run(&mut ms, &mut kept, &to3_append)?;
+    /* Member 3 started again, and a new read asked; the answer to the old
+     * one delivered, the new one's kept back */
+    let store = ms.remove(2).into_store();
+    ms.push(Rsm::new(config(3, 1), store, Reg::default(), 7 + 1_000_000).map_err(|e| format!("{:?}", e))?);
+    /* Heartbeats let through, so that it knows whom to ask */
+    let both = |m: &Message| to3_answer(m) || to3_append(m);
+    run(&mut ms, &mut kept, &both)?;
+    ms[2].read(51, Vec::new()).map_err(|e| format!("{:?}", e))?;
+    for msg in stale {
+        let _ = ms[2].step(msg);
+    }
+    let early = run(&mut ms, &mut kept, &both)?;
+    if let Some((_, e)) = early.iter().find(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 51, .. })) {
+        return Err(format!("a read after a restart answered by an answer to one before it: {:?}", e));
+    }
+    for msg in std::mem::take(&mut kept) {
+        let _ = ms[(msg.to - 1) as usize].step(msg);
+    }
+    let late = run(&mut ms, &mut kept, &none)?;
+    match late.iter().find(|(i, e)| *i == 2 && matches!(e, Event::Read { request: 51, .. })) {
+        Some((_, Event::Read { answer, .. })) if answer == &2u64.to_le_bytes() => Ok(()),
+        other => Err(format!("the read after the restart: {:?}", other)),
+    }
+}
