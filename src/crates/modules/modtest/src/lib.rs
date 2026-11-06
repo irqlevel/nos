@@ -14,8 +14,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use kcore::cmd::{Command, Output};
+use kcore::events::SharedEvent;
 use kcore::ipc::Mailbox;
 use kcore::mgmt::{Call, Kind, Method, Provider, Status};
 use kcore::error::{Error, Result};
@@ -294,17 +295,103 @@ fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(13).wrapping_add(5)).collect()
 }
 
+/// What a module's test task and the task asleep on its event share.
+struct Waiter {
+    event: SharedEvent,
+    /// How many of its waits a signal ended.
+    woke: AtomicU32,
+    stop: AtomicBool,
+}
+
+/// How long the task sleeps at a time -- far past what a signal takes to
+/// wake it -- and how long the test waits for it to have woken.
+const NAP_SECS: u64 = 30;
+const WITHIN_MS: u64 = 5000;
+
+/// The task: asleep on the event until told to stop, counting the waits a
+/// signal ended.
+fn nap(w: Arc<Waiter>) {
+    while !w.stop.load(Ordering::Acquire) {
+        if w.event.wait_for(kcore::time::Duration::from_secs(NAP_SECS)) {
+            w.woke.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Whether the task's waits ended past `before` within WITHIN_MS.
+fn woken(w: &Waiter, before: u32) -> bool {
+    for _ in 0..WITHIN_MS {
+        if w.woke.load(Ordering::Acquire) != before {
+            return true;
+        }
+        kcore::task::sleep_ms(1);
+    }
+    false
+}
+
+/// One event to wait on, as a module has it (plans/ipc.md, I2): a mailbox
+/// and a device's queue made on an event of the module's, and a task of its
+/// asleep on it -- woken by a message and by the queue's wake; the event let
+/// go of first, the mailbox and the queue going on as they were, a message
+/// and a wake after it harmless. The device is the first nobody holds, for
+/// reading, and nothing is read from it: a boot's test does no I/O. What
+/// went wrong first, if anything.
+fn one_event() -> core::result::Result<(), &'static str> {
+    use kcore::block::Disk;
+    use kcore::ipc::Limits;
+    let event = SharedEvent::new().ok_or("an event")?;
+    let mb = Mailbox::new_on(Limits { messages: 4, bytes: 64 }, &event).map_err(|_| "a mailbox on an event")?;
+    let q = (0..Disk::count()).filter_map(Disk::at).find_map(|d| {
+        let name = d.name();
+        d.into_queue_on(&event, false, "modtest", 1, 4096).ok().map(|q| (name, q))
+    });
+    match &q {
+        Some((name, _)) => kcore::klog!(0, "modtest: one event -- a mailbox and {}'s queue made on it", name),
+        None => kcore::klog!(0, "modtest: one event -- a mailbox made on it, and no device for a queue"),
+    }
+    let w = Arc::new(Waiter { event, woke: AtomicU32::new(0), stop: AtomicBool::new(false) });
+    let task = kcore::task::spawn_with("modtest-event", w.clone(), nap).ok_or("a task to wait")?;
+    let before = w.woke.load(Ordering::Acquire);
+    let mut woke = mb.send(mb.addr(), 1, 0, b"x").is_ok() && woken(&w, before)
+        && mb.try_recv().is_some_and(|m| m.tag == 1 && m.data == b"x");
+    if let Some((_, q)) = &q {
+        let before = w.woke.load(Ordering::Acquire);
+        q.wake();
+        woke &= woken(&w, before);
+    }
+    w.stop.store(true, Ordering::Release);
+    w.event.signal();
+    drop(task);
+    if !woke {
+        return Err("a message or a queue's wake that did not wake the task waiting on their event");
+    }
+    /* The event let go of first: the kernel holds it for the mailbox and the
+     * queue, which go on as they were */
+    drop(w);
+    if mb.send(mb.addr(), 2, 0, b"late").is_err() || !mb.try_recv().is_some_and(|m| m.tag == 2) {
+        return Err("a message after the mailbox's event was let go of");
+    }
+    if let Some((_, q)) = &q {
+        q.wake();
+    }
+    drop(q);
+    drop(mb);
+    Ok(())
+}
+
 /// `modtest ipc`: the message channel as a module has it, through
-/// kernel.echo, which the boot's test has started -- calls of every size,
-/// its names held to its namespace, an address gone, a Down, a full
-/// mailbox, the names listed; one mailbox left open on purpose, for the
-/// sweep after the unload to close; and the one it keeps in `keep`, which
-/// it asks the echo to pester, so that the unload closes it under traffic.
-/// What went wrong first, if anything.
+/// kernel.echo, which the boot's test has started -- one event to wait on
+/// first (`one_event`), then calls of every size, its names held to its
+/// namespace, an address gone, a Down, a full mailbox, the names listed;
+/// one mailbox left open on purpose, for the sweep after the unload to
+/// close; and the one it keeps in `keep`, which it asks the echo to
+/// pester, so that the unload closes it under traffic. What went wrong
+/// first, if anything.
 fn ipc(keep: &Mutex<Option<Mailbox>>) -> core::result::Result<(), &'static str> {
     use kcore::ipc::{list, lookup, Error as E, Limits, Reason, Scope, TAG_DOWN};
     use kcore::time::Duration;
     const ROOMY: Limits = Limits { messages: 64, bytes: 1 << 20 };
+    one_event()?;
     let echo = lookup("kernel.echo").ok_or("kernel.echo, not there,")?;
     let mb = Mailbox::new(ROOMY).map_err(|_| "a mailbox")?;
     mb.register("modtest.ipc", Scope::Host).map_err(|_| "a name of the module's")?;

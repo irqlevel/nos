@@ -110,7 +110,7 @@ fn names() {
     check(list("kernel.selftest.").len() == 1, "the names under a prefix");
     /* A module's names: under its namespace, never the image's */
     let owner = Owner::module(b"nbs-test").unwrap_or_else(|| panic!("ipc selftest: an owner"));
-    let m = open(owner, ROOMY).unwrap_or_else(|_| panic!("ipc selftest: a module's mailbox"));
+    let m = open(owner, ROOMY, None).unwrap_or_else(|_| panic!("ipc selftest: a module's mailbox"));
     check(register(&m, "kernel.nbs", Scope::Host) == Err(Error::NotYours), "a module under the kernel's namespace");
     check(register(&m, "other.x", Scope::Host) == Err(Error::NotYours), "a module under another's");
     check(register(&m, "nbs.test", Scope::Cluster) == Ok(()), "a module under its own");

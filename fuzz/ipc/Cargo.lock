@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "events"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+]
+
+[[package]]
 name = "ffi"
 version = "0.1.0"
 
@@ -10,6 +18,7 @@ version = "0.1.0"
 name = "ipc"
 version = "0.1.0"
 dependencies = [
+ "events",
  "ffi",
  "ipcwire",
  "kcore",
@@ -19,6 +28,7 @@ dependencies = [
 name = "ipc-fuzz"
 version = "0.1.0"
 dependencies = [
+ "events",
  "ffi",
  "ipc",
  "ipcwire",
