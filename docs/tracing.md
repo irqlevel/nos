@@ -150,7 +150,7 @@ An NMI that comes in while its CPU is writing takes nothing and is counted
 | `trace [list]` | every event: on or off, its group, what it records |
 | `trace on <event\|group\|all>...` | turned on (the rings made first, if there are none); names may be comma-separated |
 | `trace off <...>` | turned off; what was recorded stays |
-| `trace show [n] [cpu=N] [event\|group\|all...] [field=value...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events or groups named, only theirs; with a field filter -- up to four, all of which a record must pass -- only the records whose field of that name is the value: a number, decimal or `0x` hex, or an enumeration's name, each event's own (`sched_switch prev_state=blocked`, `test seq=0x10`). A record of an event without the field is none the filter keeps. A word that names nothing -- or a cpu not running, `n` of 0, a field no event of the window has or a value it cannot be -- is refused, not taken for a filter that matches nothing |
+| `trace show [n] [cpu=N] [event\|group\|all...] [field=value...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events or groups named, only theirs; with a field filter -- up to four, all of which a record must pass -- only the records whose field of that name is the value: a number, decimal or `0x` hex, or an enumeration's name, each event's own (`tcp_recv verdict=outside`, `sched_switch prev_state=blocked`). A record of an event without the field is none the filter keeps. A word that names nothing -- or a cpu not running, `n` of 0, a field no event of the window has or a value it cannot be -- is refused, not taken for a filter that matches nothing |
 | `trace dump [n] [cpu=N] [event\|group\|all...] [field=value...]` | the same window as JSON, a record a line, times in exact ns, after a line saying from when the window is whole: what `scripts/trace-decode.py` reads |
 | `trace latency [n] [cpu=N] [event\|group\|all...] [field=value...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs ([below](#how-long-a-woken-task-waited)) |
 | `trace stat` | each CPU's ring: written, kept, dropped; and the wakeup trigger, armed or what it fired on |
@@ -557,6 +557,36 @@ and `disk_done` to `blk_complete` the vCPU's round coming for it. With
 `trace on hv` beside it, the notify's `hv_exit` comes before the
 `blk_submit` and the interrupt's `hv_inject` after the `blk_complete`.
 
+## TCP's events
+
+A connection's life on the wire and in its program, a record at each step,
+group `tcp` (`net/src/tcp.rs`). Every record says the connection by its
+`slot` -- the same in all of them -- and its two ports:
+
+| event | where, and what it records |
+|---|---|
+| `tcp_send` | every segment a connection sends but a pure acknowledgement (`send_segment`): `why` it went -- `new` data, `again` (a copy a recovery sent: RACK's, PRR's, NewReno's), a loss `probe`, the `timeout`'s, the `handshake`'s, the `close`'s FIN, a `reset`, the `persist` timer's probe -- its `seq`, `len`, `flags`, the window field it offered, `cwnd` and `pipe` (what was in flight against it), the sender's `recovery`, and whose task sent it |
+| `tcp_ack` | every pure acknowledgement: `ack`, the window field, the right `edge` the window offered, the receive buffer's `free` room behind it -- an edge past the room is a promise the receiver cannot keep -- and its SACK `blocks`, a D-SACK among them (`dsack`), and the stretches it holds past a hole (`ooo`) |
+| `tcp_recv` | every segment a connection takes in (`process`, around `handle`): its `seq`, `ack`, `len`, `flags`, window field and SACK blocks, the `verdict` -- `taken`, a `copy` answered with a D-SACK, `outside` the window, a `bad_ack` (RFC 5961 5.2), a `syn` on a synchronized connection, a `reset` taken or `reset_refused` -- and the receiver as the segment found it: `rcv_nxt`, its buffer's `free` room, and how far past RCV.NXT the window it last offered still reaches (`owed`) |
+| `tcp_loss` | what the sender made of a loss: a `recovery` RACK began, its `end`, a `timeout`, one found `spurious`, an `undo` by D-SACKs, a `probe_repair`, a peer that `reneged` -- each with `cwnd`, `ssthresh`, `pipe`, what the peer holds past a hole (`sacked`), what is `lost`, `una` and `nxt` after it |
+| `tcp_rtt` | a round trip measured (Karn's: the segment timed was sent once): the `sample_us`, the estimate and the timeout after it, and RACK's least round trip |
+| `tcp_wait` | a program's `send` or `recv` that waited: `what` for -- the send `buffer`, the peer's `window`, the `cwnd`, what was `lost` to go again first, room in the `table` of what is in flight, or `data` -- how long (`ns`), and whose task |
+
+So where a connection's time goes is in its records: a receive's `tcp_wait`
+for `data` is the network's share of a request, a send's for `cwnd` or
+`window` the path's or the peer's, and a `tcp_recv` `outside` the window
+beside a `tcp_ack` whose `edge` is past its `free` is a receiver that
+promised room it did not have. With a field filter, over the UDP shell's
+32 KiB, the needle is had without the hay:
+
+```
+> trace on tcp
+> trace show 50 tcp_recv verdict=outside     # what a receiver turned away
+> trace show 50 tcp_send why=again           # what was sent twice
+> trace show tcp_loss slot=3                 # one connection's recoveries
+> trace show tcp_wait what=cwnd              # sends the congestion window held
+```
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -634,6 +664,12 @@ too.
   taken off the ring, picked up by the disk's task, served by the image then
   and there, done and given back, in that order, slot by slot, by the
   disk's own task -- and a file written, its ext4 transactions committed.
+- TCP's events: every boot's `rust_test` holds their payloads to the
+  descriptions; `net-fuzz.py` (host, in CI) runs every one under its
+  overflow checks for half of each target's inputs -- `tcp` among them, its
+  peer taking SACK or not, losing and reordering -- the machine's
+  `kernel_tp_record` holding each record to its description, an
+  enumeration's value one it names and every pad zero.
 - A window's field filters: `cpp-fuzz.py --target tracewin` gives a quarter
   of its windows one or two -- a record's bytes at an offset and a size of
   its event's payload, and now and then a field of another event, at some

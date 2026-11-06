@@ -182,10 +182,16 @@ struct Link2 {
     /// connection, if it gives one -- what it asks, taken or refused.
     floor: Option<u64>,
     /// The connection's generation once the program has it, what a wake is
-    /// held to; and whether one of it came since a receive last returned --
-    /// what alone may end a receive with no timeout as a timeout does.
+    /// held to; the wakes of it so far -- what alone may end a receive with
+    /// no timeout as a timeout does -- and how many there had been as the
+    /// receive before the one under way was asked for. The kernel's
+    /// receive takes a wake at its next look: one before the receive
+    /// before began was that one's, with data or without, and so a receive
+    /// that comes back woken had a wake since the one before it began --
+    /// however late the model sees either come back.
     generation: u64,
-    woken: bool,
+    wakes: u64,
+    wakes_then: [u64; 2],
 }
 
 struct State {
@@ -325,6 +331,12 @@ impl State {
             1 => Some(r.pick(&[0u8, 1, 14, 15, 255])),
             _ => Some(r.pick(&[7u8, 2, 9])),
         };
+        /* A peer that takes SACK, mostly, as every stack of today does --
+         * saying as many blocks as fit, fewer, or none at all -- or one
+         * that does not. */
+        self.w.peers.tcp.accept_sack = r.u8() % 4 != 0;
+        self.w.peers.tcp.sack_blocks = sack_blocks(r);
+        self.w.peers.tcp.renege_every = renege_every(r);
         /* A connection of the slot's own buffer, or one that fetches in
          * bulk: its own buffer and the window scaled to it. */
         let receive = match r.u8() % 3 {
@@ -339,7 +351,7 @@ impl State {
         let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
                                 fragile: self.lossy, call: Some(Call::Connect(app)), floor, generation: 0,
-                                woken: false });
+                                wakes: 0, wakes_then: [0; 2] });
     }
 
     fn peer_connect(&mut self, r: &mut Input) {
@@ -359,17 +371,29 @@ impl State {
             /* A window scale offered: a bulk listener's connection scales */
             2 | 3 => {
                 let mut o = frames::mss(r.pick(&[1460u16, 536, 1400, 100]));
+                if r.u8() % 4 != 0 {
+                    o.extend_from_slice(&frames::sack_perm());
+                }
                 o.extend_from_slice(&frames::ws(r.pick(&[0u8, 2, 7, 14, 15])));
                 o
             }
-            _ => frames::mss(r.pick(&[1460u16, 536, 1400, 100])),
+            /* SACK offered, mostly, as stacks of today do */
+            _ => {
+                let mut o = frames::mss(r.pick(&[1460u16, 536, 1400, 100]));
+                if r.u8() % 4 != 0 {
+                    o.extend_from_slice(&frames::sack_perm());
+                }
+                o
+            }
         };
         let window = r.pick(&[8192u32, 65535, 1024, 0, 600, 262_144, 1 << 20]);
         let s = iss(r);
-        self.w.peers.tcp.connect(&mut self.w.net, id, port, ETH0_IP, mport, s, opts, window);
+        let e = self.w.peers.tcp.connect(&mut self.w.net, id, port, ETH0_IP, mport, s, opts, window);
+        self.w.peers.tcp.eps[e].sack_blocks = sack_blocks(r);
+        self.w.peers.tcp.eps[e].renege_every = renege_every(r);
         let floor = floor(r);
         self.links.push(Link2 { id, conn: None, port, sent: 0, got: 0, eof: false, done: false, aborted: false,
-                                fragile: self.lossy, call: None, floor, generation: 0, woken: false });
+                                fragile: self.lossy, call: None, floor, generation: 0, wakes: 0, wakes_then: [0; 2] });
     }
 
     fn accept(&mut self, r: &mut Input) {
@@ -417,6 +441,8 @@ impl State {
         let Some(c) = self.idle(k) else { return };
         let n = r.pick(&[1usize, 16, 1460, 8192, 20000]);
         let timeout = if r.u8() < 16 { 0 } else { r.pick(&[1u64, 10, 200, 3000]) };
+        let l = &mut self.links[k];
+        l.wakes_then = [l.wakes_then[1], l.wakes];
         let app = App::spawn("recv", r.below(4) as u32, move || {
             let mut buf = vec![0u8; n];
             let got = TCP.recv(c, &mut buf, timeout);
@@ -479,7 +505,8 @@ impl State {
                         /* A receive with no timeout comes back as one only
                          * when its connection was woken -- by its own
                          * generation, no other's */
-                        let woken = core::mem::replace(&mut self.links[k].woken, false);
+                        let l = &self.links[k];
+                        let woken = l.wakes > l.wakes_then[0];
                         invariant!(n != net::tcp::RECV_TIMEOUT || timeout != 0 || woken,
                                    "connection {}'s receive with no timeout came back as a timeout, never woken", k);
                         self.received(k, n, &data)
@@ -527,7 +554,7 @@ impl State {
         let generation = if own || l.done { l.generation } else { l.generation.wrapping_add(1 + r.below(3)) };
         TCP.wake(c, generation);
         if own {
-            self.links[k].woken = true;
+            self.links[k].wakes += 1;
             crate::common::runner::reached("tcp: a receive's connection woken");
         } else if l.done {
             crate::common::runner::reached("tcp: a closed connection's slot woken by its old generation");
@@ -839,6 +866,7 @@ fn iss(r: &mut Input) -> u32 {
 }
 
 pub fn tcp(r: &mut Input) {
+    let before = TCP.stats();
     let nic = net::Nic::find("eth0").expect("eth0");
     nic.set_ip(ETH0_IP);
     nic.set_mask(MASK);
@@ -924,8 +952,14 @@ pub fn tcp(r: &mut Input) {
             }
             10 => {
                 if let Some(e) = st.links.get(k).and_then(|l| st.ep(l)) {
-                    let n = r.pick(&[1u32, 500, 8192, 65535]);
-                    st.w.peers.tcp.read(&mut st.w.net, e, n);
+                    /* Now and then the peer lets go of what it kept past a
+                     * hole, and SACKed (RFC 2018 8) */
+                    if r.u8() < 16 {
+                        st.w.peers.tcp.renege(e);
+                    } else {
+                        let n = r.pick(&[1u32, 500, 8192, 65535]);
+                        st.w.peers.tcp.read(&mut st.w.net, e, n);
+                    }
                 }
             }
             11 => {
@@ -1019,7 +1053,33 @@ pub fn tcp(r: &mut Input) {
         super::check_tcp_timer();
     }
 
+    /* What the senders made of their losses: for the coverage report */
+    let after = TCP.stats();
+    for (n, what) in [(after.recoveries - before.recoveries, "tcp: a recovery RACK found the loss for"),
+                      (after.timeouts - before.timeouts, "tcp: a timeout's recovery on a connection that takes SACK"),
+                      (after.spurious - before.spurious, "tcp: a timeout found spurious, an original delivered after it"),
+                      (after.probes - before.probes, "tcp: a loss probe"),
+                      (after.undos - before.undos, "tcp: a recovery undone, every copy D-SACKed"),
+                      (after.dsacks - before.dsacks, "tcp: a D-SACK taken"),
+                      (after.reneged - before.reneged, "tcp: a peer found to have reneged")] {
+        if n != 0 {
+            crate::common::runner::reached(what);
+        }
+    }
     wind_down(&mut st);
+}
+
+/// How many SACK blocks the peer's acknowledgements carry at most: as many
+/// as fit, mostly; fewer; or none at all -- a peer that agreed to SACK and
+/// says nothing of it.
+fn sack_blocks(r: &mut Input) -> usize {
+    r.pick(&[4usize, 4, 4, 3, 2, 1, 0])
+}
+
+/// How often the peer lets go of what it kept past a hole and SACKed:
+/// mostly never, as a receiver with the memory does.
+fn renege_every(r: &mut Input) -> u32 {
+    r.pick(&[0u32, 0, 0, 0, 0, 2, 5, 20])
 }
 
 /// The machine's end of each connection whose peer has let its end go --
