@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "ipcwire"
+version = "0.1.0"
+
+[[package]]
 name = "raft"
 version = "0.1.0"
 
@@ -10,5 +14,14 @@ version = "0.1.0"
 name = "raft-fuzz"
 version = "0.1.0"
 dependencies = [
+ "raft",
+ "registry",
+]
+
+[[package]]
+name = "registry"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
  "raft",
 ]

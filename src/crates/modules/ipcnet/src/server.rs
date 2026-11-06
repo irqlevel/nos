@@ -214,10 +214,19 @@ impl Server {
         let sh = &self.shared;
         let server = Arc::new(tls_server(&sh.identity, peers)?);
         let old: Vec<Arc<Peer>> = sh.peers.with(|v| v.clone());
-        let gone: Vec<Arc<Peer>> = old.iter().filter(|p| !peers.contains(&p.conf)).cloned().collect();
+        /* A peer is the same while its name, address and keys are: what it
+           may reach changes in place, its connections kept -- a host
+           invited joining is never cut off by its own join */
+        let gone: Vec<Arc<Peer>> = old.iter().filter(|p| !peers.iter().any(|c| c.same_link(&p.conf))).cloned().collect();
         let mut new = Vec::new();
-        for c in peers.iter().filter(|c| !old.iter().any(|p| p.conf == **c)) {
+        for c in peers.iter().filter(|c| !old.iter().any(|p| p.conf.same_link(c))) {
             new.push(Arc::new(make_peer(&sh.identity, &sh.cfg.name, c.clone())?));
+        }
+        for p in &old {
+            if let Some(c) = peers.iter().find(|c| c.same_link(&p.conf)) {
+                let only = c.only.clone();
+                p.only.with(|o| *o = only);
+            }
         }
         for p in &gone {
             p.removed.store(true, Ordering::Release);

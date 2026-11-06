@@ -46,10 +46,12 @@ Raft first meets the kernel, the files and ipc before NBS's metadata does.
   handshake, not a way in, but the cluster would then depend on DNS being
   there.
 - **The list it keeps for ipcnet**: on every change committed, each host's
-  registry writes `hosts.toml` anew (new file, synced, renamed over the old)
-  and tells `ipc.net` to read it. A host added is pinned at once; a host
-  removed has its connections closed at once. After a reboot, ipcnet starts
-  from that file, before the registry has caught up.
+  registry tells ipcnet's control mailbox, `ipcnet.ctl`, the peers it is to
+  have, and ipcnet writes `hosts.toml` anew (new file, synced, renamed over
+  the old) and gives its server the list -- one writer of the file. A host
+  added is pinned at once; a host removed has its connections closed at
+  once. After a reboot, ipcnet starts from that file, before the registry
+  has caught up.
 - **Its members**: every host of the cluster, the first five voters and the
   rest learners, as for NBS's mds.
 
@@ -57,7 +59,8 @@ Raft first meets the kernel, the files and ipc before NBS's metadata does.
 
 ```
 cluster init <name>             on the first host: a cluster of one
-cluster invite <host> <ip>      on a member: prints a token, once
+cluster invite <host> <ip> <key>   on a member: prints a token, once -- <key> is
+                                what `ipcnet id` says on <host> (built so: "Joining")
 cluster join <token>            on the new host
 cluster hosts                   every host: address, key, roles, connected or not
 cluster remove <host>           out, for good: its key refused everywhere
@@ -74,6 +77,24 @@ admin can invite one -- the token shown once, as the command shows it.
 
 The way kubeadm joins a node: a token that carries a secret, and the
 member's key, which the joiner pins.
+
+**As built (C1c), the joiner's key is given at the invitation**: `cluster
+invite <host> <ip> <key>`, the key read with `ipcnet id` on the new host,
+and every member's ipcnet pins it while the invitation is open. Steps 2 and
+3 below were the first design and are not what was built: ipcnet takes no
+client whose key nobody pinned, for any mailbox -- every connection is
+pinned both ways, so there is no state before authentication to flood and no
+handshake from an unknown key is ever answered -- and the secret, sent only
+inside a TLS session bound to both keys, needs no HMAC over them. The member
+takes the join request only from the host the invitation names, as ipcnet
+authenticated it (`kernel_ipc_peer_name`), and only with the secret whose
+hash the invitation keeps. What step 2 promised is kept: until it has
+joined, the host invited reaches one mailbox of a member's, its
+`cluster.raft`, by that name -- no other, none by address, no monitor --
+held so by ipcnet (`only=` on its peer's line of hosts.toml), and lifted in
+place, no connection lost, when the join makes it a host. The cost: the new
+host's key carried to the inviting member, before the invitation rather
+than after. docs/cluster.md has the join as it runs.
 
 1. **`cluster invite ax41 203.0.113.7`** on any member commits an
    invitation: the host's name, the address it will come from, the hash of a
@@ -144,27 +165,41 @@ voter answers, and says what it is about to do.
   its own -- hosts, tombstones, invitations and their expiry, rekeys,
   addresses -- run on several members over the simulated network that the
   `node` target uses.
-- **net-fuzz's `ipcnet` target**, with the join path: clients with no
-  token, a wrong secret, a token used again or expired, from another
-  address or for another name, and floods of joins. It is held to letting
-  in exactly the hosts that hold good tokens, once each, and nothing past
-  `cluster.join` before that.
-- **`cluster-test.py`** (both arches, on `scripts/hub.py`):
-  - a cluster made on one host, two more invited and joined, and every host
-    reaching every other;
-  - the bad tokens refused;
+- **net-fuzz's `ipcnet` target**: as built there is no join path in ipcnet
+  to fuzz -- a key nobody pinned is never let in -- so the target holds the
+  control mailbox instead: who this host is, lists of peers, another
+  cluster's, this host among them, noise; hosts.toml saying what was asked,
+  a refusal leaving it as it was. The join's own refusals -- a wrong secret,
+  another host's token, a token used again or expired -- are the registry
+  target's and `cluster-test.py`'s.
+- **`cluster-test.py`** (both arches, on `scripts/hub.py`), C1 as built:
+  - a cluster made on one host, two more invited and joined -- one through a
+    member that does not lead -- and every host reaching every other;
+  - a wrong secret, another host's token, a token used again and a second
+    `init` refused;
   - a host removed and dropped by all within seconds;
-  - a rekey with no connection lost;
-  - every host rebooted, each starting from its `hosts.toml`;
-  - two of three killed and `cluster recover` on the last.
+  - a host rebooted, starting from its folder and its `hosts.toml`;
+  - the leader of two removed, the lead handed on first, its key refused
+    when invited again.
+  To come with C2: a rekey with no connection lost, every host rebooted,
+  two of three killed and `cluster recover` on the last.
 
 ## Steps
 
-**C1, the registry.** The state machine, `cluster.ko` and its commands,
-`hosts.toml` written and `ipc.net` told; ipcnet's join path (the address
-admitted while an invitation is open, the client key taken unpinned for
-`cluster.join` alone, the proof); the `registry` fuzz target, the join cases
-in net-fuzz's `ipcnet`, `cluster-test.py`.
+**C1, the registry.** Done, in parts. C1a: the state machine as a crate
+of its own with no kernel in it, `src/crates/registry` -- the state, the
+commands (init, invite, join, remove, revoke) and their answers, every
+command carrying the proposer's clock and every invitation past its time let
+go of at the entry, the snapshot and the rules one read back is held to, the
+voters' policy (the first five to join) -- and `fuzz/raft`'s `registry`
+target with its scenarios and six mutants (docs/testing.md). C1b:
+`cluster.ko` -- the member as a task over raft's `rsm` and a `DiskLog` in
+/etc/cluster, raft's messages over ipc, commands handed to the leader,
+raft's membership kept to the registry's -- and ipcnet's control mailbox,
+`ipcnet.ctl`, through which the registry gives ipcnet its peers and ipcnet
+alone writes hosts.toml. C1c: the join, with the joiner's key given at the
+invitation (above), and the channel's word on which host a message came
+from, `kernel_ipc_peer_name`. C1d: `cluster-test.py`, docs/cluster.md.
 
 **C2, the rest.** `rekey`, `address`, `maintenance` and `recover`; the
 provider and the panel's page.
@@ -176,5 +211,8 @@ provider and the panel's page.
   differ by minutes see a token's quarter of an hour a little longer or
   shorter.
 - `recover` is manual and can lose what the lost hosts alone had committed.
-- The bootstrap is by hand: the first host's `init`, and the token carried
-  to the new host by whoever runs the join.
+- The bootstrap is by hand: the first host's `init`, the new host's key
+  carried to the inviting member, and the token carried back to the new host
+  by whoever runs the join.
+- A removed host may not hear of its removal: the others drop its
+  connections as they apply it, maybe before it has applied it itself.

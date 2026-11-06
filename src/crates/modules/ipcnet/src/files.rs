@@ -89,11 +89,9 @@ pub fn parse_key(text: &str) -> Option<Fingerprint> {
     unhex::<32>(text)
 }
 
-/// A host's name, as the channel and the wire take one: a DNS label's
-/// letters, lowercase, digits and dashes, up to 63 of them.
+/// A host's name, as the channel and the wire take one (`ipcwire::valid_host`).
 pub fn valid_host(name: &str) -> bool {
-    !name.is_empty() && name.len() <= ipcwire::HOST_MAX
-        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    ipcwire::valid_host(name)
 }
 
 fn nic_name(name: &str) -> bool {
@@ -137,6 +135,10 @@ pub struct PeerConf {
     pub name: String,
     pub ip: u32,
     pub keys: Vec<Fingerprint>,
+    /// The one name of this host's it may reach, by that name alone: a host
+    /// invited to the cluster, which reaches the cluster's member and
+    /// nothing else until it has joined (`only=<name>` in hosts.toml).
+    pub only: Option<String>,
 }
 
 impl PeerConf {
@@ -147,7 +149,18 @@ impl PeerConf {
             s.push(' ');
             s.push_str(&hex(k));
         }
+        if let Some(n) = &self.only {
+            s.push_str(" only=");
+            s.push_str(n);
+        }
         s
+    }
+
+    /// Whether `other` is the same peer at the same address with the same
+    /// keys: what its connections are made of. What it may reach is not,
+    /// and changes with no connection lost.
+    pub fn same_link(&self, other: &PeerConf) -> bool {
+        self.name == other.name && self.ip == other.ip && self.keys == other.keys
     }
 }
 
@@ -161,7 +174,7 @@ pub struct Config {
     pub peers: Vec<PeerConf>,
 }
 
-/// A peer's entry: `name ip key [key]`.
+/// A peer's entry: `name ip key [key] [only=<mailbox>]`.
 fn parse_peer(line: usize, text: &str) -> Result<PeerConf, String> {
     let mut words = text.split_whitespace();
     let (Some(name), Some(ip)) = (words.next(), words.next()) else {
@@ -173,7 +186,15 @@ fn parse_peer(line: usize, text: &str) -> Result<PeerConf, String> {
     }
     let ip = parse_ip(ip).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not an IPv4 address", ip)))?;
     let mut keys = Vec::new();
+    let mut only = None;
     for w in words {
+        if let Some(n) = w.strip_prefix("only=") {
+            if only.is_some() || !ipcwire::valid_name(n) {
+                return Err(error(line, &alloc::format!("\"{}\": `only=` names one mailbox, once", w)));
+            }
+            only = Some(n.to_string());
+            continue;
+        }
         let k = parse_key(w).ok_or_else(|| error(line, &alloc::format!("\"{}\" is not a key: 64 hex digits", w)))?;
         if keys.len() == KEYS_MAX || keys.contains(&k) {
             return Err(error(line, &alloc::format!("{} has more than {} keys, or one twice", name, KEYS_MAX)));
@@ -184,7 +205,7 @@ fn parse_peer(line: usize, text: &str) -> Result<PeerConf, String> {
     if keys.is_empty() {
         return Err(error(line, &alloc::format!("{} has no key", name)));
     }
-    Ok(PeerConf { name: name.to_string(), ip, keys })
+    Ok(PeerConf { name: name.to_string(), ip, keys, only })
 }
 
 struct Reader {
@@ -263,6 +284,20 @@ pub fn render_new(name: &str, cluster: &[u8; 16]) -> String {
     conf::put(&mut s, "cluster", &hex(cluster));
     s.push_str("peers = []\n");
     s
+}
+
+/// hosts.toml's text with its cluster made `cluster`, every other line as
+/// it was.
+pub fn with_cluster(text: &str, cluster: &[u8; 16]) -> Result<String, String> {
+    let mut line = String::new();
+    conf::put(&mut line, "cluster", &hex(cluster));
+    let mut r = Reader { name: None, cluster: None, nic: DEFAULT_NIC.to_string(), port: DEFAULT_PORT,
+                         peers: Vec::new() };
+    let text = conf::edit(text, "hosts.toml", &mut r, &[conf::Edit { key: "cluster", line: Some(line) }])?;
+    if parse(&text)?.cluster != *cluster {
+        return Err(String::from("hosts.toml would not read back as written"));
+    }
+    Ok(text)
 }
 
 /// hosts.toml's text with its peers made `peers`, every other line as it
