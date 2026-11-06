@@ -19,3 +19,5 @@ registry = { path = "../../registry" }
 ipcwire = { path = "../../ipcwire" }
 # An invitation's secret kept as its hash.
 sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+# The `cluster` provider's parameters, as the management bus has them.
+mgmtwire = { path = "../../mgmtwire" }

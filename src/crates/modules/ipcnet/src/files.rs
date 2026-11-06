@@ -156,11 +156,12 @@ impl PeerConf {
         s
     }
 
-    /// Whether `other` is the same peer at the same address with the same
-    /// keys: what its connections are made of. What it may reach is not,
-    /// and changes with no connection lost.
+    /// Whether `other` is the same peer at the same address: what its
+    /// connections are made of. Its keys and what it may reach are not, and
+    /// change with no connection lost -- a connection keeps the key it was
+    /// made with, and the next is made with a key the peer has then.
     pub fn same_link(&self, other: &PeerConf) -> bool {
-        self.name == other.name && self.ip == other.ip && self.keys == other.keys
+        self.name == other.name && self.ip == other.ip
     }
 }
 
@@ -355,35 +356,112 @@ fn read_text(path: &str) -> Result<Option<String>, String> {
     }
 }
 
+/// The host's key and certificate, one after the other in one file, so
+/// that the two never go apart: written whole, by rename, as hosts.toml is.
+const IDENTITY: &str = "tls/identity.pem";
+/// A key made and not yet the host's: the one `cluster rekey` moves it to.
+const STAGED: &str = "tls/next.pem";
+/// The key and certificate as two files, as openssl makes them: read where
+/// there is no identity.pem, and taken away when a staged key becomes the
+/// host's.
+const KEY: &str = "tls/key.pem";
+const CERT: &str = "tls/cert.pem";
+
+/// An identity from the PEM text of its key and of its certificate --
+/// `what` says where they came from.
+fn parse_identity(key_text: &str, cert_text: &str, what: &str) -> Result<Identity, String> {
+    let key = zeroize::Zeroizing::new(web::x509::pem_decode("PRIVATE KEY", key_text)
+        .ok_or_else(|| alloc::format!("{} has no PRIVATE KEY", what))?);
+    let cert = web::x509::pem_decode("CERTIFICATE", cert_text)
+        .ok_or_else(|| alloc::format!("{} has no CERTIFICATE", what))?;
+    let fingerprint = tls::pinned::fingerprint(&cert).ok_or_else(|| alloc::format!("{} is not a certificate", what))?;
+    Ok(Identity { key, cert, fingerprint })
+}
+
+/// The identity a file of both holds.
+fn read_identity(path: &str) -> Result<Option<Identity>, String> {
+    let Some(text) = read_text(path)? else { return Ok(None) };
+    let text = zeroize::Zeroizing::new(text);
+    parse_identity(&text, &text, path).map(Some)
+}
+
 /// The identity in the folder, made first if it has none -- for the host
 /// `name`. Refused while the wall clock is not set, since the certificate
 /// would start in 1970, and while the kernel's pool has no randomness.
 pub fn identity(dir: &Dir, name: &str) -> Result<(Identity, bool), String> {
-    let key_path = dir.path("tls/key.pem");
-    let cert_path = dir.path("tls/cert.pem");
-    let made = match (read_text(&key_path)?, read_text(&cert_path)?) {
-        (Some(_), Some(_)) => false,
-        (None, None) => {
-            make(dir, name)?;
-            true
+    if let Some(id) = read_identity(&dir.path(IDENTITY))? {
+        return Ok((id, false));
+    }
+    let (key_path, cert_path) = (dir.path(KEY), dir.path(CERT));
+    match (read_text(&key_path)?, read_text(&cert_path)?) {
+        (Some(key_text), Some(cert_text)) => {
+            let key_text = zeroize::Zeroizing::new(key_text);
+            let what = alloc::format!("{} and {}", key_path, cert_path);
+            Ok((parse_identity(&key_text, &cert_text, &what)?, false))
         }
-        _ => return Err(alloc::format!("{} or {} is there without the other -- remove the other too, and a new \
-                                        key is made (every peer then pins it anew)", key_path, cert_path)),
-    };
-    let key_text = zeroize::Zeroizing::new(read_text(&key_path)?.unwrap_or_default());
-    let cert_pem = read_text(&cert_path)?.unwrap_or_default();
-    let key = zeroize::Zeroizing::new(web::x509::pem_decode("PRIVATE KEY", &key_text)
-        .ok_or_else(|| alloc::format!("{} has no PRIVATE KEY", key_path))?);
-    let cert = web::x509::pem_decode("CERTIFICATE", &cert_pem)
-        .ok_or_else(|| alloc::format!("{} has no CERTIFICATE", cert_path))?;
-    let fingerprint = tls::pinned::fingerprint(&cert)
-        .ok_or_else(|| alloc::format!("{} is not a certificate", cert_path))?;
-    Ok((Identity { key, cert, fingerprint }, made))
+        (None, None) => {
+            let pem = make(name)?;
+            let path = dir.path(IDENTITY);
+            let _ = kcore::fs::create_dir(&dir.root);
+            let _ = kcore::fs::create_dir(&dir.path("tls"));
+            match kcore::fs::create(&path, pem.as_bytes()) {
+                /* Made by another meanwhile: its, read as it is */
+                Ok(()) | Err(kcore::error::Error::Busy) => {}
+                Err(_) => return Err(alloc::format!("cannot write {}", path)),
+            }
+            let id = read_identity(&path)?.ok_or_else(|| alloc::format!("{} is gone", path))?;
+            Ok((id, true))
+        }
+        _ => Err(alloc::format!("{} or {} is there without the other -- remove the other too, and a new key is \
+                                 made (every peer then pins it anew)", key_path, cert_path)),
+    }
 }
 
-/// A new key, and a certificate of it for the host `name`. Pinned TLS
-/// looks at the key alone, so its usage and dates are for whoever reads it.
-fn make(dir: &Dir, name: &str) -> Result<(), String> {
+/// The key staged and not yet the host's, if there is one: its fingerprint.
+pub fn staged(dir: &Dir) -> Result<Option<Fingerprint>, String> {
+    Ok(read_identity(&dir.path(STAGED))?.map(|id| id.fingerprint))
+}
+
+/// A new key staged -- or the one staged already -- for the host `name`,
+/// whose key is `current`: its fingerprint, and whether it was made now. A
+/// staged key that is the host's own already -- a switch cut short after
+/// identity.pem took it -- is taken away first.
+pub fn stage(dir: &Dir, name: &str, current: &Fingerprint) -> Result<(Fingerprint, bool), String> {
+    let path = dir.path(STAGED);
+    if let Some(id) = read_identity(&path)? {
+        if id.fingerprint != *current {
+            return Ok((id.fingerprint, false));
+        }
+        kcore::fs::remove(&path).map_err(|_| alloc::format!("cannot remove {}", path))?;
+    }
+    let pem = make(name)?;
+    let _ = kcore::fs::create_dir(&dir.path("tls"));
+    kcore::fs::create(&path, pem.as_bytes()).map_err(|_| alloc::format!("cannot write {}", path))?;
+    let id = read_identity(&path)?.ok_or_else(|| alloc::format!("{} is gone", path))?;
+    Ok((id.fingerprint, true))
+}
+
+/// The staged key made the host's: identity.pem written whole with it --
+/// the one step that switches -- then next.pem, and the two files openssl
+/// makes, taken away. The new identity.
+pub fn promote(dir: &Dir) -> Result<Identity, String> {
+    let path = dir.path(STAGED);
+    let text = zeroize::Zeroizing::new(read_text(&path)?
+        .ok_or_else(|| String::from("no key staged -- `cluster rekey` stages one"))?);
+    let id = parse_identity(&text, &text, &path)?;
+    kcore::fs::write(&dir.path(IDENTITY), text.as_bytes())
+        .map_err(|_| alloc::format!("cannot write {}", dir.path(IDENTITY)))?;
+    /* What is left of the old: read never again, identity.pem being there */
+    for old in [STAGED, KEY, CERT] {
+        let _ = kcore::fs::remove(&dir.path(old));
+    }
+    Ok(id)
+}
+
+/// A new key, and a certificate of it for the host `name`, as the PEM text
+/// of both. Pinned TLS looks at the key alone, so its usage and dates are
+/// for whoever reads it.
+fn make(name: &str) -> Result<zeroize::Zeroizing<String>, String> {
     let now = kcore::time::wall_clock_secs();
     if now == 0 {
         return Err(String::from("the wall clock is not set: the host's certificate would start in 1970 -- set it \
@@ -427,13 +505,8 @@ fn make(dir: &Dir, name: &str) -> Result<(), String> {
     }
     secret.zeroize();
     let id = made.ok_or_else(|| String::from("no randomness for the host's key"))?;
-    let key_pem = zeroize::Zeroizing::new(web::x509::pem("PRIVATE KEY", &id.key)
+    let mut pem = zeroize::Zeroizing::new(web::x509::pem("PRIVATE KEY", &id.key)
         .map_err(|_| String::from("out of memory"))?);
-    let cert_pem = web::x509::pem("CERTIFICATE", &id.cert).map_err(|_| String::from("out of memory"))?;
-    let _ = kcore::fs::create_dir(&dir.root);
-    let _ = kcore::fs::create_dir(&dir.path("tls"));
-    kcore::fs::create(&dir.path("tls/key.pem"), key_pem.as_bytes())
-        .map_err(|_| alloc::format!("cannot write {}", dir.path("tls/key.pem")))?;
-    kcore::fs::create(&dir.path("tls/cert.pem"), cert_pem.as_bytes())
-        .map_err(|_| alloc::format!("cannot write {}", dir.path("tls/cert.pem")))
+    pem.push_str(&web::x509::pem("CERTIFICATE", &id.cert).map_err(|_| String::from("out of memory"))?);
+    Ok(pem)
 }

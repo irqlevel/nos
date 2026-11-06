@@ -60,6 +60,8 @@ pub fn main(state: Arc<State>) {
                 Ok(cluster) => join(&state, &cluster).map(|()| (control::TAG_OK, Vec::new())),
                 Err(_) => Err(String::from("not a cluster's id")),
             },
+            control::TAG_KEY_STAGE => stage_key(&state).map(|k| (control::TAG_KEY_STAGE, k.to_vec())),
+            control::TAG_KEY_USE => use_key(&state).map(|k| (control::TAG_KEY_USE, k.to_vec())),
             _ => Err(String::from("not a request of ipcnet's")),
         };
         let _ = match answer {
@@ -77,9 +79,43 @@ fn identity(state: &State) -> Result<Identity, String> {
     if made {
         klog!(0, "ipcnet: a key made for {}: {}", cfg.name, files::hex(&id.fingerprint));
     }
-    let serving = state.server.with(|s| s.is_some());
+    /* The key the peers meet: the running server's, should a switch have
+       written the file and not reached it */
+    let running = state.server.with(|s| s.as_ref().map(|s| s.shared.identity().fingerprint));
+    let serving = running.is_some();
+    let key = running.unwrap_or(id.fingerprint);
     let ip = Nic::find(&cfg.nic).map_or(0, |n| n.ip());
-    Ok(Identity { name: cfg.name, cluster: cfg.cluster, key: id.fingerprint, nic: cfg.nic, ip, port: cfg.port, serving })
+    let next = files::staged(&state.dir)?.filter(|k| *k != key);
+    Ok(Identity { name: cfg.name, cluster: cfg.cluster, key, nic: cfg.nic, ip, port: cfg.port, serving, next })
+}
+
+/// A key staged for this host -- or the one staged already: its
+/// fingerprint. Made under the folder's lock, as hosts.toml is written.
+fn stage_key(state: &State) -> Result<[u8; 32], String> {
+    state.files.with(|_| {
+        let cfg = config(state)?;
+        let (id, _) = files::identity(&state.dir, &cfg.name)?;
+        let (key, made) = files::stage(&state.dir, &cfg.name, &id.fingerprint)?;
+        if made {
+            klog!(0, "ipcnet: a key staged for {}: {}", cfg.name, files::hex(&key));
+        }
+        Ok(key)
+    })
+}
+
+/// The staged key made this host's, in its folder and in the server
+/// running: every connection from now on made with it, those up kept.
+fn use_key(state: &State) -> Result<[u8; 32], String> {
+    let id = state.files.with(|_| files::promote(&state.dir))?;
+    let key = id.fingerprint;
+    /* A server not running takes it as it starts */
+    state.server.with(|s| match s.as_ref() {
+        Some(server) => server.use_identity(id),
+        None => Ok(()),
+    }).map_err(|why| alloc::format!("{} -- the key is this host's on disk, and the server running still shows the \
+                                     old one: `ipcnet stop` and `ipcnet start` take it up", why))?;
+    klog!(0, "ipcnet: this host's key is {} from now on", files::hex(&key));
+    Ok(key)
 }
 
 /// This host's cluster made `cluster`: the one it joins -- refused for a

@@ -616,22 +616,32 @@ which makes the host's key, and everything else is the registry's
 - `c` invited from `b`, which does not lead and hands the invitation to
   `a`; a join with one byte of the secret changed refused by `b`; `c`, now
   `b`'s peer as a host invited -- `b`'s `ipcnet` saying so -- its pings to
-  `b`'s echo never answered, each refused by `b`; then the token taken: three voters on every host, every host up to every other,
-  and `c`'s pings to `a`'s echo answered over the connection the registry
-  made;
-- `c` removed: off `a`'s and `b`'s peers, its connections gone, two voters
-  left;
-- `b`'s VM killed and booted again: back from its folder, `a` and `b`
-  agreeing on a leader again -- `a` stepped down while it heard from no
-  majority of the two, and either may be elected now;
-- that leader removed: it hands the lead to the other first, as its log
-  says -- the removal drops its connections as each member applies it, and
-  the other could otherwise never be elected -- which leads alone after; the
-  removed host's key refused when invited again;
+  `b`'s echo never answered, each refused by `b`; then the token taken:
+  three voters on every host, every host up to every other, and `c`'s pings
+  to `a`'s echo answered over the connection the registry made;
+- the `cluster` provider called through the bus (`mgmt call cluster
+  hosts`), answering the three hosts;
+- `b`'s maintenance on and off, and `c`'s public address set and taken
+  away, as every host's `cluster hosts` says them; `c`'s ipc address never
+  taken away;
+- `c` moved to a new key (`cluster rekey`) while `b` pings `c`'s echo 6000
+  times across it: every ping answered as sent, and `a`'s and `b`'s counts
+  of `c`'s connections up unmoved -- none lost; `c`'s new key the registry's
+  on every host and the old one gone; `c`'s connections made again with the
+  new key alone (`ipcnet stop`, `start`); the old key refused when invited
+  again;
+- all three VMs killed and booted again at once: back from their folders,
+  a leader agreed on, three voters, every host up to every other;
+- `cluster recover` on `a` refused while the majority answers; `b` and `c`
+  killed for good, `a` following no leader once CheckQuorum has it step
+  down; the plan said first, a name not the cluster's refused, then `a` the
+  one voter and `b` and `c` removed -- `a` leading alone; `c`'s key refused,
+  and `c` installed anew joined as node 4 with a new key, two voters;
+- the leader of those two removed: it hands the lead to the other first,
+  as its log says -- the removal drops its connections as each member
+  applies it, and the other could otherwise never be elected -- which leads
+  alone after; the removed host's key refused when invited again;
 - nothing panicked.
-
-What it does not reach: a rekey, every host rebooted at once, two of three
-killed, `cluster recover` -- C2's (plans/cluster.md).
 
 
 ### `netload-test.py` -- the receive path, the frame pool, a module on both
@@ -1327,10 +1337,13 @@ own, TCP's flags in combinations that mean something. The targets:
   host again: its line in hosts.toml and in `ipcnet` saying so, the peer
   never made anew either way (its counts never going back), and while it is
   invited nothing of its reaching the sink by address and no monitor of its
-  answered Closed. Four bugs planted in ipcnet each fail it: a delivery past
-  the restriction (the 126th input), a monitor taken from a host invited
-  (the 281st), and a restriction lifted by dropping the peer or made by
-  making it anew (the first). Nine of ten bugs planted in
+  answered Closed; `a` pinned by a second key beside its own, kept with its
+  connections; and a key staged for `b`, the same one each time asked and
+  said by `TAG_ID`. Five bugs planted in ipcnet each fail it: a delivery
+  past the restriction (the 126th input), a monitor taken from a host
+  invited (the 281st), a restriction lifted by dropping the peer or made by
+  making it anew, and a peer made anew for a change of its keys (the
+  first). Nine of ten bugs planted in
   the module are caught -- a peer's message it may not reach bounced, a full
   mailbox's not, two messages of one pair begun at once, silence never
   losing the peer, a Hello of another cluster or for another host taken, a
@@ -2829,13 +2842,22 @@ seconds, to:
     model's once it takes the commands in the order the log applied them,
     answering each as the members did.
 
-  `mutants.py`'s six `registry_*` mutants take out:
+  The commands include a host's maintenance, its addresses by role and the
+  keys it moves between -- one added beside its own, the old one dropped and
+  retired -- and the scenarios `registry_keys`, `registry_addresses` and
+  `registry_maintenance` play each out, a snapshot giving a host a retired
+  key refused among them.
+
+  `mutants.py`'s nine `registry_*` mutants take out:
   - an invitation's expiry;
   - the join's use of its invitation;
   - the refusal of a removed host's key;
   - nodes never given twice;
   - the snapshot's check of keys;
-  - the voters' cut at five.
+  - the voters' cut at five;
+  - the refusal of a key a host dropped;
+  - the refusal to drop a host's last key;
+  - the refusal of an address another host has.
 
   Each fails the gate and its own scenario. `RAFT_REGISTRY_STATS=1` prints
   each run's answers by kind and how many hosts it reached.
@@ -2863,8 +2885,9 @@ over by a vote, a follower's commit held to its append, a PreVote kept
 apart from a vote, an append's previous term checked, the 2015 rule, a
 read's round of heartbeats, a failed read stopping the member, a round
 asked by every heartbeat, an append taken in part, a snapshot that keeps
-the log in pieces -- and each must fail the gate, and fail the scenario
-written for it on its own. Campaigns found three things the gate now holds: an
+the log in pieces, and of `raft::recover::force_alone` the commit of what it
+appends and the learners it takes out (`force_alone_after_loss`) -- and each
+must fail the gate, and fail the scenario written for it on its own. Campaigns found three things the gate now holds: an
 append window filled with appends lost for good, which nothing emptied (a
 heartbeat's answer now frees one); a candidate of an older membership
 standing term after term ahead of the voters of the newer, which never
