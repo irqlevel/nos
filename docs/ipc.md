@@ -244,6 +244,14 @@ hands back what peers say.
   is told to every watcher but itself: its watches and remote monitors go
   first, so the task waiting on it finds it closed, not a NameDown of its
   own making.
+- **Which host sent it**: a message from another host has that peer's
+  number in its `from`, and `kcore::ipc::peer_name(from)` (the C ABI's
+  `kernel_ipc_peer_name`) says the peer's name -- the one the router came up
+  with it under, so with ipcnet the name the key its connection showed is
+  pinned under. It is what a service takes as the word of who is asking: the
+  cluster's member takes Raft's messages only from the host whose node they
+  claim, and a join only from the host invited (docs/cluster.md). None for
+  this host's own mailboxes and for a number whose peer is gone.
 - `ipc peers` lists the router and the peers; `ipc` counts what went to
   peers and came from them, and what was refused.
 
@@ -282,7 +290,21 @@ hosts and back.
 - **Its hosts** are in /etc/ipc/hosts.toml: this one's name and the
   cluster's id, and every peer's name, address and key -- one, or two while
   it moves to a new one -- pinned. The host's own key and certificate are
-  made at its first start, in /etc/ipc/tls.
+  made at its first start, in /etc/ipc/tls. A peer's line may end
+  `only=<name>`: a host invited to the cluster, which reaches that one
+  `Cluster` name of this host's, by the name, and nothing else -- no
+  mailbox by its address, no monitor; what it sends anywhere else is
+  dropped and counted as refused. A new list that keeps the peer's name,
+  address and keys changes that in place, its connections kept.
+- **Its control mailbox**, `ipcnet.ctl` (`ipcwire::control`), a `Host`
+  name, which nothing from another host reaches: this host's modules ask it
+  who this host is -- its name, its cluster, its key, the interface and its
+  address, serving or not -- and the cluster's registry tells it the peers
+  this host is to have, in place of those it has, and a cluster to join
+  while it has none. It writes hosts.toml as `ipcnet add` and `remove` do (a
+  new file, synced, renamed over the old) and gives the running server the
+  list: one writer of the file. It answers while the module is loaded,
+  serving or not (docs/cluster.md).
 - **Two TCP connections a peer**, control and bulk, on one port (39240), on
   the interface hosts.toml names (eth0 unless told; never hv0, so that no
   guest reaches it). The listener answers the peers' addresses alone: to

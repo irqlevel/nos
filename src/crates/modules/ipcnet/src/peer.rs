@@ -131,7 +131,13 @@ pub fn add(c: &AtomicU64, n: u64) {
 }
 
 pub struct Peer {
+    /// Its name, address and keys -- what its connections are made of; what
+    /// it may reach is `only`, its `conf.only` taken from it as it is made.
     pub conf: PeerConf,
+    /// The one name of this host's it may reach, by that name alone, while
+    /// it is a host invited and not yet joined; changed in place when hosts.toml's
+    /// changes, with no connection lost.
+    pub only: Locked<Option<String>>,
     /// This host dials it: of the two names, this host's sorts first.
     pub dials: bool,
     /// The TLS clients this host dials it with, by class -- each offering
@@ -158,9 +164,11 @@ pub enum Refusal {
 }
 
 impl Peer {
-    pub fn new(conf: PeerConf, dials: bool, clients: [tls::pinned::Client; CLASSES]) -> Option<Peer> {
+    pub fn new(mut conf: PeerConf, dials: bool, clients: [tls::pinned::Client; CLASSES]) -> Option<Peer> {
+        let only = conf.only.take();
         Some(Peer {
             conf,
+            only: Locked::new(only)?,
             dials,
             clients,
             st: Locked::new(State { session: 0, attached: [false; CLASSES], number: 0, up_since_ns: 0, said: "new",
@@ -169,6 +177,16 @@ impl Peer {
             number_now: AtomicU16::new(0),
             removed: AtomicBool::new(false),
             counts: Counts::default(),
+        })
+    }
+
+    /// Whether a message for `name` -- None for one sent to an address --
+    /// is one it may send here: anything, for a host of the cluster; a host
+    /// invited, its one name, by that name.
+    pub fn may_reach(&self, name: Option<&str>) -> bool {
+        self.only.with(|o| match o {
+            None => true,
+            Some(only) => name == Some(only.as_str()),
         })
     }
 

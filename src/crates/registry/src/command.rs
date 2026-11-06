@@ -32,13 +32,15 @@ pub enum Command {
     /// The cluster made, with its first host -- the one entry an empty
     /// registry takes.
     Init { now: u64, cluster: [u8; 16], name: String, host: String, key: Fingerprint, ip: u32 },
-    /// A host invited: `host` may join from `ip` until `expires`, proving
-    /// the secret whose hash is `secret_hash`. `id` is the proposer's, a
-    /// random number the token carries.
-    Invite { now: u64, id: u64, host: String, ip: u32, secret_hash: [u8; 32], expires: u64 },
-    /// The host invitation `invitation` named, joined with `key`: the key
-    /// its connection showed when it proved the secret.
-    Join { now: u64, invitation: u64, key: Fingerprint },
+    /// A host invited: `host` may join from `ip`, with the key `key` --
+    /// pinned by every member's ipcnet from now on, as its own pins the
+    /// inviting member's from the token -- until `expires`, proving the
+    /// secret whose hash is `secret_hash`. `id` is the proposer's, a random
+    /// number the token carries.
+    Invite { now: u64, id: u64, host: String, ip: u32, key: Fingerprint, secret_hash: [u8; 32], expires: u64 },
+    /// The host invitation `invitation` named, joined: it proved the secret
+    /// over a connection pinned by the invitation's key.
+    Join { now: u64, invitation: u64 },
     /// A host out, for good: its key and its node never taken again.
     Remove { now: u64, host: String },
     /// An invitation taken back before it was used.
@@ -70,20 +72,20 @@ impl Command {
                 w.fixed(key);
                 w.u32(*ip);
             }
-            Command::Invite { now, id, host, ip, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
                 w.u8(TAG_INVITE);
                 w.u64(*now);
                 w.u64(*id);
                 w.str(host);
                 w.u32(*ip);
+                w.fixed(key);
                 w.fixed(secret_hash);
                 w.u64(*expires);
             }
-            Command::Join { now, invitation, key } => {
+            Command::Join { now, invitation } => {
                 w.u8(TAG_JOIN);
                 w.u64(*now);
                 w.u64(*invitation);
-                w.fixed(key);
             }
             Command::Remove { now, host } => {
                 w.u8(TAG_REMOVE);
@@ -121,10 +123,11 @@ impl Command {
                 id: r.u64()?,
                 host: String::from(r.str(STR_MAX)?),
                 ip: r.u32()?,
+                key: r.fixed()?,
                 secret_hash: r.fixed()?,
                 expires: r.u64()?,
             },
-            TAG_JOIN => Command::Join { now, invitation: r.u64()?, key: r.fixed()? },
+            TAG_JOIN => Command::Join { now, invitation: r.u64()? },
             TAG_REMOVE => Command::Remove { now, host: String::from(r.str(STR_MAX)?) },
             TAG_REVOKE => Command::Revoke { now, invitation: r.u64()? },
             _ => return None,
@@ -159,7 +162,7 @@ pub enum Refusal {
     InvitationGone,
     /// An invitation whose time is up by the proposer's clock already.
     Expired,
-    /// A key a host of the cluster has.
+    /// A key a host of the cluster has, or an open invitation.
     KeyInUse,
     /// A key of a host removed: never taken again.
     KeyRemoved,
@@ -212,7 +215,7 @@ impl Refusal {
             Refusal::InvitationExists => "an invitation of that number is open",
             Refusal::InvitationGone => "no such invitation: used, taken back, past its time or never made",
             Refusal::Expired => "its time is up already",
-            Refusal::KeyInUse => "a key another host of the cluster has",
+            Refusal::KeyInUse => "a key another host of the cluster has, or an invitation",
             Refusal::KeyRemoved => "the key of a host removed from the cluster",
             Refusal::Full => "as many hosts and invitations as the cluster takes",
             Refusal::LastHost => "the cluster's last host",
