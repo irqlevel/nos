@@ -1490,7 +1490,11 @@ to the tree `e2fsck -fy` leaves. The targets:
   out loses nothing -- and the walk goes forward, inside the file. A
   call the filesystem refused for want of room is held to having changed
   nothing -- a write to having left the file its size, a first part of the
-  new data in it at most -- and now and then the filesystem is filled to its
+  new data in it at most, and a batch of a disk's image's requests to every
+  write the image answered done there whole, read back as its guest reads
+  it: through the image, since the VFS reads what an image wrote over
+  unwritten extents as zeros until the image's next sync makes them
+  written -- and now and then the filesystem is filled to its
   last block first, so that writes run out of room part way. Now and then
   `find` runs over the tree as the shell runs it, with an expression of the
   input's -- or words that are none, nested too deep, too long -- and what
