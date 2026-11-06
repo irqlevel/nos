@@ -12,17 +12,28 @@
 //! its monitors, a name each of its watches -- it does so in the order the
 //! channel keeps them in, which the model keeps the same way: a list each
 //! is added to at its end and taken from by moving its last into the hole.
+//!
+//! And the events tasks wait on (plans/ipc.md I2): mailboxes made on events
+//! of the image's and of made-up modules', a task asleep on one woken by
+//! each thing that signals it -- a message, a wake, a close, a signal, its
+//! holder letting go and a message after -- and by nothing else, a second
+//! waiter refused, handles gone stale refused; every event there for as
+//! long as its holder or a mailbox made on it is, and not a moment longer,
+//! and the events counted (`events::live`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::machine::{sched, MODULES};
 use crate::{reached, Input, Target};
+use events::SharedEvent;
+use ffi::events as abi_ev;
 use ffi::ipc as abi;
 use ipc::{Addr, Bounce, Error, Limits, Mailbox, Payload, Reason, Scope, To};
 use ipcwire as wire;
 use ipcwire::route;
+use kcore::time::Duration;
 
 pub static ALL: &[Target] = &[
     Target { name: "ipc", run: run, max_len: 4096, gate: 6000 },
@@ -113,6 +124,23 @@ struct Box_ {
     monitored_by: Vec<(u64, usize)>,
     /// Its watches' ids, in the channel's order.
     watches: Vec<u64>,
+    /// The event it was made on, the model's index: None for its own.
+    event: Option<usize>,
+}
+
+/// An event tasks wait on, as the model has it: the image's, held by the
+/// model's own `Arc` until it lets go, or a made-up module's, held by the
+/// table for its handle until that is closed -- and either way by every open
+/// mailbox made on it.
+struct EventM {
+    /// The image's: the model's count of it, None once let go of.
+    image: Option<Arc<SharedEvent>>,
+    /// A module's handle; 0 for the image's.
+    handle: u64,
+    /// Its holder has not let go of it: the model's `Arc`, the open handle.
+    held: bool,
+    /// What says whether it is still there.
+    weak: Weak<SharedEvent>,
 }
 
 /// A watch, as the table keeps it.
@@ -137,6 +165,8 @@ struct Model {
     peers: Vec<Option<PeerM>>,
     /// The remote monitors, in the table's order.
     remote: Vec<RemoteM>,
+    /// The events, in the order they were made.
+    events: Vec<EventM>,
 }
 
 /// Whether `part` is one part of a name: a lowercase letter, then lowercase
@@ -181,6 +211,17 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
 impl Model {
     fn find(&self, addr: u64) -> Option<usize> {
         self.boxes.iter().position(|b| b.addr == addr && b.open)
+    }
+
+    /// Whether event `e` must be there: its holder has it, or an open
+    /// mailbox made on it does.
+    fn event_held(&self, e: usize) -> bool {
+        self.events[e].held || self.boxes.iter().any(|b| b.open && b.event == Some(e))
+    }
+
+    /// The open mailboxes made on event `e`.
+    fn on_event(&self, e: usize) -> Vec<usize> {
+        (0..self.boxes.len()).filter(|&i| self.boxes[i].open && self.boxes[i].event == Some(e)).collect()
     }
 
     /// The peer `host` names, up and of that epoch.
@@ -425,6 +466,17 @@ fn compare(m: &Model) {
     got.sort();
     want.sort();
     invariant!(got == want, "the names: {:?}, the model {:?}", got, want);
+    /* Every event there while it is held, and gone once nothing holds it;
+     * the events counted: one of its own for each open mailbox on none */
+    for e in 0..m.events.len() {
+        let there = m.events[e].weak.upgrade().is_some();
+        invariant!(there == m.event_held(e), "event {}: there {}, held {} -- by its holder {}, by {} mailboxes", e,
+                   there, m.event_held(e), m.events[e].held, m.on_event(e).len());
+    }
+    let own = m.boxes.iter().filter(|b| b.open && b.event.is_none()).count();
+    let held = (0..m.events.len()).filter(|&e| m.event_held(e)).count();
+    invariant!(events::live() == own + held, "{} events, the model {} of mailboxes' own and {} held", events::live(),
+               own, held);
 }
 
 /// An address that is the model's mailbox `at`'s, or one that never was.
@@ -455,20 +507,59 @@ fn limits(r: &mut Input) -> Limits {
     }
 }
 
+/// A handle that names no event: 0, a slot past the table's, or one of a
+/// module's event let go of -- whose slot may be another's since, of a later
+/// generation.
+fn stale_handle(m: &Model, r: &mut Input) -> u64 {
+    let closed: Vec<u64> = m.events.iter().filter(|e| e.handle != 0 && !e.held).map(|e| e.handle).collect();
+    match r.u8() % 3 {
+        0 if !closed.is_empty() => closed[r.below(closed.len() as u64) as usize],
+        1 => 0,
+        _ => (u64::from(r.u32()) << 32) | (events::MAX_EVENTS as u64 + 1 + r.below(1000)),
+    }
+}
+
 fn open(m: &mut Model, r: &mut Input) {
     let l = limits(r);
     let module = r.bool();
     let valid = l.messages != 0 && l.messages <= ipc::MAX_QUEUE_MESSAGES && l.bytes != 0;
-    let (addr, owner) = if module {
+    /* Now and then on an event: a module's by its handle -- one held, or one
+     * that names none, which refuses the mailbox -- the image's by its Arc */
+    let on = r.chance(4);
+    let (addr, owner, event) = if module {
         let which = r.below(MODULES.len() as u64) as usize;
         let at = MODULES[which].0 + r.below(MODULES[which].1 as u64) as usize;
-        (abi::kernel_ipc_open(at, l.messages, l.bytes as u64), Owner::Module(which))
+        let held: Vec<usize> = (0..m.events.len()).filter(|&e| m.events[e].handle != 0 && m.events[e].held).collect();
+        let (handle, event) = match on {
+            true if !held.is_empty() && r.chance(8) => (stale_handle(m, r), None),
+            true if !held.is_empty() => {
+                let e = held[r.below(held.len() as u64) as usize];
+                (m.events[e].handle, Some(e))
+            }
+            _ => (0, None),
+        };
+        let addr = abi::kernel_ipc_open(at, l.messages, l.bytes as u64, handle);
+        if handle != 0 && event.is_none() {
+            invariant!(addr == 0, "a mailbox made on handle {:x}, which names no event", handle);
+            if addr != 0 {
+                abi::kernel_ipc_close(addr);
+            }
+            reached("a mailbox refused an event that is none");
+            return;
+        }
+        (addr, Owner::Module(which), event)
     } else {
-        match Mailbox::new(l) {
+        let held: Vec<usize> = (0..m.events.len()).filter(|&e| m.events[e].image.is_some()).collect();
+        let event = (on && !held.is_empty()).then(|| held[r.below(held.len() as u64) as usize]);
+        let made = match event.and_then(|e| m.events[e].image.as_ref()) {
+            Some(ev) => Mailbox::new_on(l, ev),
+            None => Mailbox::new(l),
+        };
+        match made {
             Ok(mb) => {
                 let a = mb.addr().to_u64();
                 m.image.push(Some(mb));
-                (a, Owner::Image)
+                (a, Owner::Image, event)
             }
             Err(e) => {
                 invariant!(!valid || m.stopped, "a mailbox refused: {:?}", e);
@@ -481,13 +572,16 @@ fn open(m: &mut Model, r: &mut Input) {
         return;
     }
     invariant!(valid && !m.stopped, "a mailbox made with limits {:?} after the halt {}", l, m.stopped);
+    if event.is_some() {
+        reached("a mailbox made on an event");
+    }
     invariant!(m.find(addr).is_none(), "address {:x} given to two mailboxes", addr);
     if owner != Owner::Image {
         m.image.push(None);
     }
     say!("open {:x} {:?} {:?}", addr, owner, l);
     m.boxes.push(Box_ { addr, owner, limits: l, open: true, queue: VecDeque::new(), normal: 0, bytes: 0, reserved: 0,
-                        kept_queued: 0, monitors: Vec::new(), monitored_by: Vec::new(), watches: Vec::new() });
+                        kept_queued: 0, monitors: Vec::new(), monitored_by: Vec::new(), watches: Vec::new(), event });
     reached("a mailbox made");
 }
 
@@ -1370,8 +1464,11 @@ fn sleep_in((addr, res, fin): SleeperCtx) {
 /// A task asleep in a module mailbox's receive, and what wakes it: a
 /// message, a wake, the mailbox closed, or its time running out.
 fn sleeper(m: &mut Model, r: &mut Input) {
+    /* Not one on an event: a receive's wait there ends at the event's first
+     * signal, which may be another mailbox's -- the event sleeper's to try */
     let candidates: Vec<usize> = (0..m.boxes.len())
-        .filter(|&i| m.boxes[i].open && m.boxes[i].owner != Owner::Image && m.boxes[i].queue.is_empty()).collect();
+        .filter(|&i| m.boxes[i].open && m.boxes[i].owner != Owner::Image && m.boxes[i].queue.is_empty()
+                && m.boxes[i].event.is_none()).collect();
     if candidates.is_empty() {
         return;
     }
@@ -1435,11 +1532,239 @@ fn sleeper(m: &mut Model, r: &mut Input) {
     }
 }
 
+/// The events an input makes at most: a few, shared by its mailboxes.
+const MAX_MODEL_EVENTS: usize = 8;
+
+/// An event made -- the image's, or a made-up module's through the ABI --
+/// let go of by its holder, or a handle that names none used: refused, and
+/// nothing signalled or waited for.
+fn event_op(m: &mut Model, r: &mut Input) {
+    match r.u8() % 4 {
+        0 | 1 if m.events.len() < MAX_MODEL_EVENTS => {
+            if r.bool() {
+                let ev = SharedEvent::new().expect("an event");
+                let weak = Arc::downgrade(&ev);
+                say!("event {} the image's", m.events.len());
+                m.events.push(EventM { image: Some(ev), handle: 0, held: true, weak });
+            } else {
+                let handle = abi_ev::kernel_shared_event_open();
+                invariant!(handle != 0, "a module's event refused");
+                let weak = events::lookup(handle).map(|e| Arc::downgrade(&e)).expect("the handle just made");
+                say!("event {} a module's: {:x}", m.events.len(), handle);
+                m.events.push(EventM { image: None, handle, held: true, weak });
+            }
+            reached("an event made");
+        }
+        2 if !m.events.is_empty() => {
+            let e = r.below(m.events.len() as u64) as usize;
+            say!("event {} let go of (held {})", e, m.events[e].held);
+            if m.events[e].handle != 0 {
+                /* A second close of it is nothing */
+                abi_ev::kernel_shared_event_close(m.events[e].handle);
+            }
+            m.events[e].image = None;
+            m.events[e].held = false;
+            if !m.on_event(e).is_empty() {
+                reached("an event let go of with mailboxes made on it open");
+            }
+        }
+        _ => {
+            let h = stale_handle(m, r);
+            abi_ev::kernel_shared_event_signal(h);
+            let waited = abi_ev::kernel_shared_event_wait(h, 1_000_000);
+            let polled = abi_ev::kernel_shared_event_poll(h, 0);
+            invariant!(waited == -1 && polled == -1, "handle {:x}, which names no event, waited on: {} {}", h, waited,
+                       polled);
+            invariant!(events::lookup(h).is_none(), "handle {:x}, which names no event, looked up", h);
+        }
+    }
+}
+
+/// A mailbox made on event `e`, which its holder has: the image's by its
+/// `Arc`, a made-up module's by its handle.
+fn open_on(m: &mut Model, r: &mut Input, e: usize) {
+    if m.stopped {
+        return;
+    }
+    let l = Limits { messages: 1 + u32::from(r.u8() % 4), bytes: 64 + r.below(512) as usize };
+    let (addr, owner) = match &m.events[e].image {
+        Some(ev) => {
+            let mb = Mailbox::new_on(l, ev).expect("a mailbox on an event");
+            let a = mb.addr().to_u64();
+            m.image.push(Some(mb));
+            (a, Owner::Image)
+        }
+        None => {
+            let which = r.below(MODULES.len() as u64) as usize;
+            let a = abi::kernel_ipc_open(MODULES[which].0, l.messages, l.bytes as u64, m.events[e].handle);
+            invariant!(a != 0, "a mailbox on a module's event refused");
+            m.image.push(None);
+            (a, Owner::Module(which))
+        }
+    };
+    invariant!(m.find(addr).is_none(), "address {:x} given to two mailboxes", addr);
+    say!("open {:x} {:?} {:?} on event {}", addr, owner, l, e);
+    m.boxes.push(Box_ { addr, owner, limits: l, open: true, queue: VecDeque::new(), normal: 0, bytes: 0, reserved: 0,
+                        kept_queued: 0, monitors: Vec::new(), monitored_by: Vec::new(), watches: Vec::new(),
+                        event: Some(e) });
+    reached("a mailbox made on an event");
+}
+
+/// An event sleeper's event -- the image's by its `Arc`, or a module's by
+/// its handle -- and where it says what its wait answered and that it is
+/// done.
+type EventSleeperCtx = (Option<Arc<SharedEvent>>, u64, Arc<Mutex<Option<i32>>>, Arc<AtomicBool>);
+
+/// The sleeper: a wait of up to `SLEEP_NS` on the event, its answer handed
+/// back -- 1 signalled, 0 the time ran out, -1 refused.
+fn sleep_on((image, handle, res, fin): EventSleeperCtx) {
+    let got = match &image {
+        Some(ev) => i32::from(ev.wait_for(Duration::from_nanos(SLEEP_NS))),
+        None => abi_ev::kernel_shared_event_wait(handle, SLEEP_NS),
+    };
+    say!("event sleeper {:x}: {}", handle, got);
+    *res.lock().unwrap() = Some(got);
+    fin.store(true, Ordering::Release);
+}
+
+/// A task asleep on an event, and what wakes it: a message to a mailbox made
+/// on it, a wake of one, one closed, a signal of the event's own -- or its
+/// holder letting go and then a message, which the mailboxes still holding
+/// it bring -- and nothing else: a second waiter refused at once, and time.
+fn event_sleeper(m: &mut Model, r: &mut Input) {
+    let candidates: Vec<usize> = (0..m.events.len()).filter(|&e| m.events[e].held).collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let e = candidates[r.below(candidates.len() as u64) as usize];
+    if m.on_event(e).is_empty() && r.bool() {
+        open_on(m, r, e);
+    }
+    let (image, handle) = (m.events[e].image.clone(), m.events[e].handle);
+    /* Whatever signalled it before is not this sleep's to see */
+    let drained = match &image {
+        Some(ev) => i32::from(ev.poll(Duration::zero())),
+        None => abi_ev::kernel_shared_event_poll(handle, 0),
+    };
+    invariant!(drained >= 0, "event {} refused a look with nobody waiting on it: {}", e, drained);
+    let result: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let ctx = (image.clone(), handle, result.clone(), done.clone());
+    let Some(task) = kcore::task::spawn_with("ipc-event-sleeper", ctx, sleep_on) else { return };
+    /* Let it get to its sleep */
+    sched::world_wait(sched::now() + 1_000_000);
+    let on = m.on_event(e);
+    let pick = |r: &mut Input| (!on.is_empty()).then(|| on[r.below(on.len() as u64) as usize]);
+    let how = r.u8() % 7;
+    say!("event sleeper on {} ({:x}), how {}, {} mailboxes on it", e, handle, how, on.len());
+    let mut want = 0;
+    match how {
+        0 | 5 => {
+            if how == 5 {
+                /* Its holder lets go first: what sleeps on it, and the
+                 * mailboxes made on it, hold it still */
+                if handle != 0 {
+                    abi_ev::kernel_shared_event_close(handle);
+                }
+                m.events[e].image = None;
+                m.events[e].held = false;
+            }
+            if let Some(at) = pick(r) {
+                let data = pattern(r.below(64) as usize, r.u8());
+                let addr = m.boxes[at].addr;
+                let sent = match (m.boxes[at].owner, &m.image[at]) {
+                    (Owner::Image, Some(mb)) => mb.send(To::Addr(Addr::from_u64(addr)), 3, 9,
+                                                        Payload::from_slice(&data).expect("a payload")).is_ok(),
+                    _ => {
+                        // SAFETY: the data is its length's bytes; no name.
+                        let code = unsafe {
+                            abi::kernel_ipc_send(addr, addr, core::ptr::null(), 0, 3, 9, data.as_ptr(), data.len())
+                        };
+                        code == 0
+                    }
+                };
+                let model = if m.stopped { Err(Error::Stopped) } else { m.push(at, Msg { from: addr, tag: 3,
+                                                                                          reference: 9, data }) };
+                invariant!(sent == model.is_ok(), "a message to a mailbox on an event: {} {:?}", sent, model);
+                if sent {
+                    want = 1;
+                }
+            }
+        }
+        1 => {
+            if let Some(at) = pick(r) {
+                match m.boxes[at].owner {
+                    Owner::Image => ipc::wake(Addr::from_u64(m.boxes[at].addr)),
+                    Owner::Module(_) => abi::kernel_ipc_wake(m.boxes[at].addr),
+                }
+                want = 1;
+            }
+        }
+        2 => {
+            if let Some(at) = pick(r) {
+                match m.boxes[at].owner {
+                    Owner::Image => m.image[at] = None,
+                    Owner::Module(_) => abi::kernel_ipc_close(m.boxes[at].addr),
+                }
+                m.close(at, Reason::Closed);
+                want = 1;
+            }
+        }
+        3 => {
+            match &image {
+                Some(ev) => ev.signal(),
+                None => abi_ev::kernel_shared_event_signal(handle),
+            }
+            want = 1;
+        }
+        4 => {
+            /* A second waiter, refused at once -- in a few reads of the
+             * clock, nowhere near its wait: on the event itself, and in a
+             * receive from a mailbox made on it with nothing to take */
+            let now = sched::now();
+            let at_once = || sched::now() - now < SLEEP_NS / 50;
+            let second = match &image {
+                Some(ev) => if ev.wait_for(Duration::from_nanos(SLEEP_NS)) { 1 } else { -1 },
+                None => abi_ev::kernel_shared_event_wait(handle, SLEEP_NS),
+            };
+            invariant!(second == -1 && at_once(), "a second waiter on event {}: {}", e, second);
+            let empty: Vec<usize> = on.iter().copied()
+                .filter(|&at| m.boxes[at].owner != Owner::Image && m.boxes[at].queue.is_empty()).collect();
+            if let Some(&at) = empty.first() {
+                let mut h = abi::IpcHeader::default();
+                // SAFETY: `h` is a header; no buffer.
+                let got = unsafe { abi::kernel_ipc_recv(m.boxes[at].addr, SLEEP_NS, &mut h, core::ptr::null_mut(), 0) };
+                invariant!(got == abi::IPC_RECV_NONE && at_once(),
+                           "a receive on a mailbox whose event a task waits on: {} after {} ns", got,
+                           sched::now() - now);
+                reached("a receive refused on an event a task waits on");
+            }
+            reached("a second waiter on an event refused");
+        }
+        _ => {}
+    }
+    while !done.load(Ordering::Acquire) {
+        sched::world_wait(sched::now() + SLEEP_NS);
+    }
+    drop(task);
+    let got = result.lock().unwrap().take().expect("the sleeper's answer");
+    invariant!(got == want, "a task asleep on event {} woke with {}, the model {} (how {})", e, got, want, how);
+    reached(match (how, want) {
+        (0, 1) => "an event sleeper woken by a message",
+        (1, 1) => "an event sleeper woken by a wake",
+        (2, 1) => "an event sleeper woken by a close",
+        (3, _) => "an event sleeper woken by a signal",
+        (5, 1) => "an event sleeper woken after its holder let go",
+        _ => "an event sleeper woken by nothing",
+    });
+}
+
 fn run(r: &mut Input) {
     SAY.store(std::env::var_os("IPC_FUZZ_SAY").is_some(), Ordering::Relaxed);
     let mut m = Model { boxes: Vec::new(), image: Vec::new(), names: Vec::new(), watches: Vec::new(), stopped: false,
-                        router: None, peers: (0..ipc::MAX_PEERS).map(|_| None).collect(), remote: Vec::new() };
-    while let Some(op) = r.op(18) {
+                        router: None, peers: (0..ipc::MAX_PEERS).map(|_| None).collect(), remote: Vec::new(),
+                        events: Vec::new() };
+    while let Some(op) = r.op(20) {
         match op {
             0 | 1 => open(&mut m, r),
             2 => close(&mut m, r),
@@ -1473,6 +1798,8 @@ fn run(r: &mut Input) {
             }
             13 => make_router(&mut m, r),
             14 => peer_up(&mut m, r),
+            18 => event_op(&mut m, r),
+            19 => event_sleeper(&mut m, r),
             15 => {
                 if r.chance(64) {
                     peer_lost(&mut m, r)
@@ -1502,9 +1829,18 @@ fn run(r: &mut Input) {
         }
         m.close(at, Reason::Closed);
     }
+    /* And every event let go of by its holder: nothing holds one now */
+    for e in 0..m.events.len() {
+        if m.events[e].handle != 0 {
+            abi_ev::kernel_shared_event_close(m.events[e].handle);
+        }
+        m.events[e].image = None;
+        m.events[e].held = false;
+    }
     compare(&m);
     let c = ipc::counters();
     invariant!(c.queued_bytes == 0 && c.mailboxes == 0 && c.names == 0 && c.watches == 0,
                "left at the end: {} bytes, {} mailboxes, {} names, {} watches", c.queued_bytes, c.mailboxes,
                c.names, c.watches);
+    invariant!(events::live() == 0, "{} events left at the end", events::live());
 }
