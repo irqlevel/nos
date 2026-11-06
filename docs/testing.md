@@ -226,7 +226,7 @@ swallowing panic messages whole.
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
 | `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
-| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
+| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, a register through the replicated state machine checked for linearizability, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -2724,6 +2724,34 @@ seconds, to:
   check, the seal of a segment before the next, the syncs at open, the
   snapshot's sync before its rename, the compaction's bound, and the
   installed snapshot's drop; each fails the gate and its own scenario.
+- **The rsm target**, 100 runs of 1500 steps. A register goes through
+  `raft::rsm`, in groups of three or five on the log on disk over the crash
+  disk. The world:
+  - a network that delays, loses, doubles and cuts;
+  - members crashed and started again over what their disks kept;
+  - two to four clients, with sessions, doing writes, adds -- which a
+    double application shows -- compare-and-sets and linearizable reads,
+    one at a time, each retried of another member after a timeout;
+  - snapshots every few hundred entries, written over several calls with
+    applying going on between them.
+
+  Once calm, every client must be answered. Every operation's history, from
+  its asking to its answer, must then be a register's (Wing and Gong's
+  search with Lowe's memo, held to known histories by
+  `rsm_linearizable_check`). `mutants.py`'s five `rsm_*` mutants take out:
+  - the session's answer to a retry;
+  - the read's wait for its index;
+  - the snapshot's index as frozen;
+  - the start's nonce in a read's context;
+  - the sessions in the snapshot.
+
+  Each fails its own scenario. The target alone catches every one but the
+  nonce within forty runs. The nonce's bug -- a leader's answer to a read
+  asked before a restart taken for a later one's -- was a campaign's
+  finding at one run in 130,000, and has `rsm_read_after_restart` to hold
+  it. `RAFT_RSM_STATS=1` prints each run's operations, applied indexes and
+  snapshots, and `RAFT_RSM_TRACE=1` what every member does and, for a
+  history no register makes, its shortest prefix.
 - **The hostile target**, 2000 runs of 3000 steps of one member fed what no
   correct member sends -- every kind of message, of terms and indexes about
   its own and of any value, from members and strangers, noise the wire
