@@ -89,11 +89,9 @@ pub fn parse_key(text: &str) -> Option<Fingerprint> {
     unhex::<32>(text)
 }
 
-/// A host's name, as the channel and the wire take one: a DNS label's
-/// letters, lowercase, digits and dashes, up to 63 of them.
+/// A host's name, as the channel and the wire take one (`ipcwire::valid_host`).
 pub fn valid_host(name: &str) -> bool {
-    !name.is_empty() && name.len() <= ipcwire::HOST_MAX
-        && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    ipcwire::valid_host(name)
 }
 
 fn nic_name(name: &str) -> bool {
