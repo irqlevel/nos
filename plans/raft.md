@@ -186,7 +186,55 @@ the gate; `--seed N --seconds S` runs a campaign.
     rename, the compaction's bound, the installed snapshot's drop -- each
     taken out, the gate and its scenario fail.
 - **R3, the state machine**: sessions, reads, snapshots; the linearizability
-  check through it.
+  check through it. As built, on branch `raft-rsm` (from `raft-log`):
+  - **`Rsm<S, M>`** drives a `RawNode` over a store `S` (`LogStore`:
+    `MemStorage`, or R2's `DiskLog`) and the user's `StateMachine` `M`. Its
+    caller hands it ticks, messages and clients' requests; `process()`
+    writes and syncs what the node's `Ready` says, applies what is
+    committed, serves the reads that may be served, takes the next steps of
+    a snapshot, and hands back the messages to send and the events to answer
+    clients with. Still no clock and no network.
+  - **The state machine**: `apply(index, command)` -- the answer --,
+    `query(query)` against the state as it is, `size()`, `freeze()` -- a
+    view that applying does not change, written a piece at a time -- and
+    `restore` from a snapshot's bytes.
+  - **Sessions** (the dissertation's 6.3). A client registers, and the
+    entry's index is its id. Each command carries the client and a sequence
+    number, one command at a time per client. A command retried -- after a
+    leader changed, a timeout -- under the number last applied is answered
+    from the session and not applied again. One under that is `Stale`, one
+    of a session gone `Expired`. Sessions are part of the replicated state:
+    in the snapshot, evicted least recently used past 1024 in log order, so
+    every member evicts alike, and an answer longer than 1 KiB is not kept
+    (`Lost` on a retry).
+  - **Reads**: linearizable by ReadIndex, served once applied to the index
+    it confirms, and failed back to the caller if the leadership changes
+    first. Or at an index the client names -- say its last write's -- on
+    any member, once it has applied that far.
+  - **Snapshots**: begun once the log applied since the last is as large as
+    the state, with a floor. Frozen at the index applied then, written over
+    several calls while applying goes on, and handed to the store
+    (`create_snapshot`), which compacts the log. A leader's snapshot
+    restores the sessions and the state machine.
+  - **Tested**: a register through `Rsm` in a group over a network that
+    fails, members crashing on R2's log over the crash disk, clients that
+    time out and retry; the history of every client's operations checked
+    for linearizability (Wing and Gong's search). Mutants: the session's
+    answer for a retry, the read's wait for its index, the freeze at the
+    snapshot's index, the sessions in the snapshot. As run:
+    - fuzz/raft's `rsm` target: 100 runs of 1500 steps, 300 to 600
+      operations each, snapshots every few hundred entries;
+    - five scenarios, one of them the check itself held to known
+      histories;
+    - each mutant caught by its scenario and by the target alone within
+      forty runs.
+    - What a campaign found: a member restarted named its reads' contexts
+      from 1 again. A leader's answer to a read asked before the restart,
+      arriving after it, matched a read asked since, and that read was
+      served at the old index, older than a write already acknowledged
+      (one run in 130,000). `Rsm::new` now takes a nonce, a number of the
+      start's own that every context carries; the scenario
+      `rsm_read_after_restart` and the mutant `rsm_ctx_reused` hold it.
 
 Then the cluster's registry is its first user ([cluster.md](cluster.md)),
 and `nbs-mds` its second ([nbs.md](nbs.md)).
