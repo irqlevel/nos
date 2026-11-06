@@ -711,6 +711,36 @@ and its connections closed; one whose address or key changed is lost and
 dialed again. `scripts/ipc-test.py` runs three of them on a LAN of
 `scripts/hub.py`'s.
 
+A host of a cluster has its peers from the cluster's registry instead
+(below): ipcnet's control mailbox, `ipcnet.ctl` (`ipcwire::control`, a Host
+name, so that nothing from another host reaches it), says who this host is
+and takes the list of peers it is to have, which it writes into hosts.toml
+as `add` and `remove` do -- one writer of the file.
+
+## cluster
+
+`cluster` (`src/crates/modules/cluster`) is the cluster's registry
+(docs/cluster.md): every host of the cluster, its key and its address,
+kept through Raft by a member on each host, which gives ipcnet its peers.
+It needs ipcnet loaded first. Its folder is /etc/cluster (`insmod
+/lib/modules/cluster.ko conf=` names another): `member` and the log in
+`raft/`.
+
+```
+$ insmod /cluster.ko
+$ cluster init test                                # the first host
+$ cluster invite b 10.9.0.2 dcbe3e82...            # on a member: b's key, from `ipcnet id` on b
+cluster: b invited from 10.9.0.2 for 15 minutes -- on it: cluster join nos1-...
+$ cluster join nos1-...                            # on b
+$ cluster hosts
+$ cluster remove b
+```
+
+    cluster [init <name> | invite <host> <ip> <key> | join <token> | hosts | remove <host>]
+
+`scripts/cluster-test.py` makes a cluster of three on `scripts/hub.py`'s
+LAN.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

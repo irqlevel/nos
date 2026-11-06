@@ -43,6 +43,7 @@ struct MInvite {
     id: u64,
     host: String,
     ip: u32,
+    key: Fingerprint,
     hash: [u8; 32],
     expires: u64,
 }
@@ -95,7 +96,8 @@ impl Model {
                 Answer::Done { node: 1 }
             }
             _ if self.cluster.is_none() => refuse(Refusal::NotInitialized),
-            Command::Invite { now, id, host, ip, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
+                let key_used = self.hosts.iter().any(|h| h.keys.contains(key)) || self.invites.iter().any(|i| i.key == *key);
                 if !m_name(host) {
                     refuse(Refusal::BadName)
                 } else if *ip == 0 {
@@ -106,30 +108,35 @@ impl Model {
                     refuse(Refusal::InvitationExists)
                 } else if self.hosts.iter().any(|h| h.ip == *ip) || self.invites.iter().any(|i| i.ip == *ip) {
                     refuse(Refusal::AddressInUse)
+                } else if key_used {
+                    refuse(Refusal::KeyInUse)
+                } else if self.removed.iter().any(|r| r.keys.contains(key)) {
+                    refuse(Refusal::KeyRemoved)
                 } else if *expires <= *now {
                     refuse(Refusal::Expired)
                 } else if self.hosts.len() + self.invites.len() >= M_HOSTS_MAX {
                     refuse(Refusal::Full)
                 } else {
-                    self.invites.push(MInvite { id: *id, host: host.clone(), ip: *ip, hash: *secret_hash,
+                    self.invites.push(MInvite { id: *id, host: host.clone(), ip: *ip, key: *key, hash: *secret_hash,
                                                 expires: *expires });
                     Answer::Done { node: 0 }
                 }
             }
-            Command::Join { now, invitation, key } => {
+            Command::Join { now, invitation } => {
                 let Some(at) = self.invites.iter().position(|i| i.id == *invitation) else {
                     return refuse(Refusal::InvitationGone);
                 };
-                if self.hosts.iter().any(|h| h.keys.contains(key)) {
+                let key = self.invites[at].key;
+                if self.hosts.iter().any(|h| h.keys.contains(&key)) {
                     return refuse(Refusal::KeyInUse);
                 }
-                if self.removed.iter().any(|r| r.keys.contains(key)) {
+                if self.removed.iter().any(|r| r.keys.contains(&key)) {
                     return refuse(Refusal::KeyRemoved);
                 }
                 let inv = self.invites.remove(at);
                 let node = self.next;
                 self.next += 1;
-                self.hosts.push(MHost { name: inv.host, node, keys: vec![*key], ip: inv.ip, joined: *now });
+                self.hosts.push(MHost { name: inv.host, node, keys: vec![key], ip: inv.ip, joined: *now });
                 Answer::Done { node }
             }
             Command::Remove { now, host } => {
@@ -174,7 +181,8 @@ fn differs(s: &State, m: &Model) -> Option<String> {
         return Some(String::from("a host with an address, a label or maintenance nothing gave it"));
     }
     let invites: Vec<MInvite> = s.invitations().iter()
-        .map(|i| MInvite { id: i.id, host: i.host.clone(), ip: i.ip, hash: i.secret_hash, expires: i.expires })
+        .map(|i| MInvite { id: i.id, host: i.host.clone(), ip: i.ip, key: i.key, hash: i.secret_hash,
+                           expires: i.expires })
         .collect();
     if invites != m.invites {
         return Some(format!("the invitations {:?}, the model's {:?}", invites, m.invites));
@@ -193,9 +201,11 @@ fn differs(s: &State, m: &Model) -> Option<String> {
     }
     for h in &m.hosts {
         let peers = s.peers_of(&h.name);
-        let want: Vec<(&str, u32, &Vec<Fingerprint>)> =
-            m.hosts.iter().filter(|o| o.name != h.name).map(|o| (o.name.as_str(), o.ip, &o.keys)).collect();
-        let got: Vec<(&str, u32, &Vec<Fingerprint>)> = peers.iter().map(|p| (p.name.as_str(), p.ip, &p.keys)).collect();
+        /* Every other host, and every host invited, by the key it will come with */
+        let mut want: Vec<(String, u32, Vec<Fingerprint>)> = m.hosts.iter().filter(|o| o.name != h.name)
+            .map(|o| (o.name.clone(), o.ip, o.keys.clone())).collect();
+        want.extend(m.invites.iter().filter(|i| i.host != h.name).map(|i| (i.host.clone(), i.ip, vec![i.key])));
+        let got: Vec<(String, u32, Vec<Fingerprint>)> = peers.into_iter().map(|p| (p.name, p.ip, p.keys)).collect();
         if got != want {
             return Some(format!("{}'s peers {:?}, the model's {:?}", h.name, got, want));
         }
@@ -303,9 +313,9 @@ fn command(r: &mut Rng, p: &Pools, m: &Model, now: &mut u64) -> Command {
         let mut hash = [0u8; 32];
         hash[..8].copy_from_slice(&r.next().to_le_bytes());
         let expires = if r.chance(10) { now.saturating_sub(r.below(60)) } else { now + r.range(1, 1800) };
-        Command::Invite { now, id: p.id(r), host: p.name(r), ip: p.ip(r), secret_hash: hash, expires }
+        Command::Invite { now, id: p.id(r), host: p.name(r), ip: p.ip(r), key: p.key(r), secret_hash: hash, expires }
     } else if pick < 73 {
-        Command::Join { now, invitation: invitation(r), key: p.key(r) }
+        Command::Join { now, invitation: invitation(r) }
     } else if pick < 73 + removes {
         let host = match m.hosts.get(r.below(m.hosts.len() as u64 + 1) as usize) {
             Some(h) if r.chance(80) => h.name.clone(),
@@ -694,27 +704,28 @@ fn init(s: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-fn invite(s: &mut State, now: u64, id: u64, host: &str, ip: u32, expires: u64) -> Answer {
-    s.apply_command(&Command::Invite { now, id, host: host.into(), ip, secret_hash: [9; 32], expires })
+fn invite(s: &mut State, now: u64, id: u64, host: &str, ip: u32, k: Fingerprint, expires: u64) -> Answer {
+    s.apply_command(&Command::Invite { now, id, host: host.into(), ip, key: k, secret_hash: [9; 32], expires })
 }
 
-/// A token is good once: the second join on its invitation is refused, and
-/// so is one with the key a host already has.
+/// A token is good once: the second join on its invitation is refused; and
+/// a host is invited only with a key nobody has, nor is invited with.
 fn join_once() -> Result<(), String> {
     let mut s = State::new();
     init(&mut s)?;
-    if invite(&mut s, 110, 5, "ax41", IPS[1], 1000) != (Answer::Done { node: 0 }) {
+    if invite(&mut s, 110, 5, "ax41", IPS[1], key(2), 1000) != (Answer::Done { node: 0 }) {
         return Err(String::from("the invitation refused"));
     }
-    let first = s.apply_command(&Command::Join { now: 120, invitation: 5, key: key(2) });
-    let again = s.apply_command(&Command::Join { now: 121, invitation: 5, key: key(3) });
+    let first = s.apply_command(&Command::Join { now: 120, invitation: 5 });
+    let again = s.apply_command(&Command::Join { now: 121, invitation: 5 });
     if first != (Answer::Done { node: 2 }) || again != Answer::Refused(Refusal::InvitationGone) {
         return Err(format!("a join and its token again answered {:?} and {:?}", first, again));
     }
-    let _ = invite(&mut s, 130, 6, "box3", IPS[2], 1000);
-    let taken = s.apply_command(&Command::Join { now: 131, invitation: 6, key: key(2) });
-    if taken != Answer::Refused(Refusal::KeyInUse) {
-        return Err(format!("a join with a host's key answered {:?}", taken));
+    let taken = invite(&mut s, 130, 6, "box3", IPS[2], key(2), 1000);
+    let _ = invite(&mut s, 131, 7, "box4", IPS[3], key(4), 1000);
+    let twice = invite(&mut s, 132, 8, "box5", IPS[4], key(4), 1000);
+    if taken != Answer::Refused(Refusal::KeyInUse) || twice != Answer::Refused(Refusal::KeyInUse) {
+        return Err(format!("invitations with a host's key and an invitation's answered {:?} and {:?}", taken, twice));
     }
     Ok(())
 }
@@ -725,35 +736,35 @@ fn join_once() -> Result<(), String> {
 fn expiry() -> Result<(), String> {
     let mut s = State::new();
     init(&mut s)?;
-    let _ = invite(&mut s, 200, 5, "ax41", IPS[1], 500);
+    let _ = invite(&mut s, 200, 5, "ax41", IPS[1], key(2), 500);
     /* Refused, and its clock lets the invitation go */
     let _ = s.apply_command(&Command::Remove { now: 500, host: "nobody".into() });
     if s.invitation(5).is_some() {
         return Err(String::from("an invitation past its time kept"));
     }
-    let late = s.apply_command(&Command::Join { now: 300, invitation: 5, key: key(2) });
+    let late = s.apply_command(&Command::Join { now: 300, invitation: 5 });
     if late != Answer::Refused(Refusal::InvitationGone) {
         return Err(format!("a join on an invitation let go of answered {:?}", late));
     }
     Ok(())
 }
 
-/// A removed host's key never joins again, by a new invitation and under a
-/// new name; its node is never given again.
+/// A removed host's key is never invited again, under a new name; its node
+/// is never given again.
 fn removed_key() -> Result<(), String> {
     let mut s = State::new();
     init(&mut s)?;
-    let _ = invite(&mut s, 110, 5, "ax41", IPS[1], 1000);
-    let _ = s.apply_command(&Command::Join { now: 120, invitation: 5, key: key(2) });
+    let _ = invite(&mut s, 110, 5, "ax41", IPS[1], key(2), 1000);
+    let _ = s.apply_command(&Command::Join { now: 120, invitation: 5 });
     if s.apply_command(&Command::Remove { now: 130, host: "ax41".into() }) != (Answer::Done { node: 2 }) {
         return Err(String::from("the remove refused"));
     }
-    let _ = invite(&mut s, 140, 6, "ax41-new", IPS[1], 1000);
-    let back = s.apply_command(&Command::Join { now: 150, invitation: 6, key: key(2) });
+    let back = invite(&mut s, 140, 6, "ax41-new", IPS[1], key(2), 1000);
     if back != Answer::Refused(Refusal::KeyRemoved) {
-        return Err(format!("a removed key joining again answered {:?}", back));
+        return Err(format!("a removed key invited again answered {:?}", back));
     }
-    let fresh = s.apply_command(&Command::Join { now: 151, invitation: 6, key: key(3) });
+    let _ = invite(&mut s, 141, 6, "ax41-new", IPS[1], key(3), 1000);
+    let fresh = s.apply_command(&Command::Join { now: 151, invitation: 6 });
     if fresh != (Answer::Done { node: 3 }) {
         return Err(format!("a new key's join answered {:?}, node 3 expected", fresh));
     }
@@ -771,9 +782,9 @@ fn removed_key() -> Result<(), String> {
 fn snapshot_rules() -> Result<(), String> {
     let mut s = State::new();
     init(&mut s)?;
-    let _ = invite(&mut s, 110, 5, "ax41", IPS[1], 1000);
-    let _ = s.apply_command(&Command::Join { now: 120, invitation: 5, key: key(2) });
-    let _ = invite(&mut s, 130, 6, "box3", IPS[2], 1000);
+    let _ = invite(&mut s, 110, 5, "ax41", IPS[1], key(2), 1000);
+    let _ = s.apply_command(&Command::Join { now: 120, invitation: 5 });
+    let _ = invite(&mut s, 130, 6, "box3", IPS[2], key(3), 1000);
     let sound = s.encode();
     if State::decode(&sound).as_ref() != Ok(&s) {
         return Err(String::from("a sound snapshot refused"));
@@ -815,9 +826,8 @@ fn voters() -> Result<(), String> {
     for k in 0..6u64 {
         let host = format!("h{}", k);
         let ip = 0x0a00_0100 + k as u32;
-        if invite(&mut s, 110 + k, 10 + k, &host, ip, 10_000) != (Answer::Done { node: 0 })
-            || s.apply_command(&Command::Join { now: 120 + k, invitation: 10 + k, key: key(100 + k) })
-                != (Answer::Done { node: 2 + k })
+        if invite(&mut s, 110 + k, 10 + k, &host, ip, key(100 + k), 10_000) != (Answer::Done { node: 0 })
+            || s.apply_command(&Command::Join { now: 120 + k, invitation: 10 + k }) != (Answer::Done { node: 2 + k })
         {
             return Err(format!("{} not let in", host));
         }

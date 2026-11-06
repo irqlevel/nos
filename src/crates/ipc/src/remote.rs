@@ -553,6 +553,16 @@ pub fn peers() -> Vec<(u16, String, bool, usize)> {
     out
 }
 
+/// The name of the peer `host` names, while it is up and of that epoch:
+/// whom a message from another host came from -- what a cluster's members
+/// know each other by (plans/cluster.md).
+pub fn peer_name(host: u16) -> Option<String> {
+    let table = table()?;
+    let t = table.lock();
+    let i = live(&t, host)?;
+    copy(&t.peers.get(i)?.as_ref()?.name).ok()
+}
+
 /// The router's address, if there is one.
 pub fn router() -> Option<Addr> {
     table()?.lock().router.as_ref().map(|r| r.addr)

@@ -16,7 +16,10 @@
 //! - the hosts removed, kept so that a removed key and a removed node are
 //!   never taken again, whatever an old copy of the list says;
 //! - the invitations open: a host's name, the address it will come from,
-//!   the hash of the secret it must prove and when that runs out.
+//!   the key it will come with -- which every member's ipcnet pins from the
+//!   invitation on, so that a host joining never meets a member that takes
+//!   a key it does not know -- the hash of the secret it must prove, and
+//!   when that runs out.
 //!
 //! Applying is the same on every member: a command carries the proposer's
 //! clock (`now`), and every invitation past its time by that clock is let
@@ -162,6 +165,8 @@ pub struct Invitation {
     pub id: u64,
     pub host: String,
     pub ip: u32,
+    /// The key the host will come with: its ipcnet's.
+    pub key: Fingerprint,
     pub secret_hash: [u8; 32],
     pub expires: u64,
 }
@@ -253,13 +258,21 @@ impl State {
         self.hosts.iter().skip(VOTERS_MAX).map(|h| h.node).collect()
     }
 
-    /// Host `me`'s peers: every other host, by its `Ipc` address and keys.
+    /// Host `me`'s peers: every other host, by its `Ipc` address and keys,
+    /// and every host invited, by the address and the key it will come
+    /// with -- pinned before it comes, so that its join meets a member that
+    /// knows it.
     pub fn peers_of(&self, me: &str) -> Vec<Peer> {
-        self.hosts
-            .iter()
-            .filter(|h| h.name != me)
-            .map(|h| Peer { name: h.name.clone(), ip: h.ipc(), keys: h.keys.clone() })
-            .collect()
+        let hosts = self.hosts.iter().filter(|h| h.name != me)
+            .map(|h| Peer { name: h.name.clone(), ip: h.ipc(), keys: h.keys.clone() });
+        let invited = self.invitations.iter().filter(|i| i.host != me)
+            .map(|i| Peer { name: i.host.clone(), ip: i.ip, keys: alloc::vec![i.key] });
+        hosts.chain(invited).collect()
+    }
+
+    /// Whether `key` is a host's or an open invitation's.
+    fn key_in_use(&self, key: &Fingerprint) -> bool {
+        self.host_of_key(key).is_some() || self.invitations.iter().any(|i| i.key == *key)
     }
 
     /// `command`, applied: what its proposer is answered.
@@ -303,7 +316,7 @@ impl State {
         }
         match command {
             Command::Init { .. } => Err(Refusal::Initialized),
-            Command::Invite { now, id, host, ip, secret_hash, expires } => {
+            Command::Invite { now, id, host, ip, key, secret_hash, expires } => {
                 if !valid_name(host) {
                     return Err(Refusal::BadName);
                 }
@@ -321,6 +334,12 @@ impl State {
                 {
                     return Err(Refusal::AddressInUse);
                 }
+                if self.key_in_use(key) {
+                    return Err(Refusal::KeyInUse);
+                }
+                if self.key_removed(key) {
+                    return Err(Refusal::KeyRemoved);
+                }
                 if *expires <= *now {
                     return Err(Refusal::Expired);
                 }
@@ -331,18 +350,22 @@ impl State {
                     id: *id,
                     host: host.clone(),
                     ip: *ip,
+                    key: *key,
                     secret_hash: *secret_hash,
                     expires: *expires,
                 });
                 Ok(0)
             }
-            Command::Join { now, invitation, key } => {
+            Command::Join { now, invitation } => {
                 let at = self.invitations.iter().position(|i| i.id == *invitation)
                     .ok_or(Refusal::InvitationGone)?;
-                if self.host_of_key(key).is_some() {
+                /* Its key was checked as it was invited, and kept from any
+                   other invitation since: looked at again all the same */
+                let key = self.invitations[at].key;
+                if self.host_of_key(&key).is_some() {
                     return Err(Refusal::KeyInUse);
                 }
-                if self.key_removed(key) {
+                if self.key_removed(&key) {
                     return Err(Refusal::KeyRemoved);
                 }
                 let inv = self.invitations.remove(at);
@@ -351,7 +374,7 @@ impl State {
                 self.hosts.push(Host {
                     name: inv.host,
                     node,
-                    keys: alloc::vec![*key],
+                    keys: alloc::vec![inv.key],
                     addrs: alloc::vec![Addr { role: Role::Ipc, ip: inv.ip }],
                     labels: Vec::new(),
                     maintenance: false,
@@ -432,6 +455,7 @@ impl State {
             w.u64(i.id);
             w.str(&i.host);
             w.u32(i.ip);
+            w.fixed(&i.key);
             w.fixed(&i.secret_hash);
             w.u64(i.expires);
         }
@@ -489,12 +513,13 @@ impl State {
             let id = r.u64().ok_or(bad)?;
             let host = r.str(ipcwire::HOST_MAX).ok_or(bad)?;
             let ip = r.u32().ok_or(bad)?;
+            let key = r.fixed().ok_or(bad)?;
             let secret_hash = r.fixed().ok_or(bad)?;
             let expires = r.u64().ok_or(bad)?;
             if !valid_name(host) || ip == 0 {
                 return Err(RestoreError("an invitation of no host or no address"));
             }
-            s.invitations.push(Invitation { id, host: String::from(host), ip, secret_hash, expires });
+            s.invitations.push(Invitation { id, host: String::from(host), ip, key, secret_hash, expires });
         }
         if !r.done() {
             return Err(RestoreError("bytes past the registry's state"));
@@ -549,9 +574,10 @@ impl State {
             }
         }
         for (i, v) in self.invitations.iter().enumerate() {
-            let twice = self.invitations[..i].iter().any(|o| o.id == v.id || o.host == v.host || o.ip == v.ip);
-            if twice {
-                return Err(RestoreError("an invitation twice"));
+            let twice = self.invitations[..i].iter()
+                .any(|o| o.id == v.id || o.host == v.host || o.ip == v.ip || o.key == v.key);
+            if twice || self.host_of_key(&v.key).is_some() || self.key_removed(&v.key) {
+                return Err(RestoreError("an invitation twice, or of a key in use or removed"));
             }
         }
         /* Keys: each host's its own, none a removed host's */
