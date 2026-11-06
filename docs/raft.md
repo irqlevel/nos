@@ -141,14 +141,67 @@ As etcd does, the log since the snapshot is held in memory (`MemStorage`,
 in pieces), and the files are for its durability. After a snapshot, segments
 are removed oldest first while none holds an entry past it.
 
+## The replicated state machine
+
+`raft::rsm::Rsm` is what every user of the crate needs on top of a node:
+- the node itself, over a store (`MemStorage`, or `DiskLog`);
+- the user's `StateMachine`;
+- clients' sessions, reads, and snapshots taken as the log grows.
+
+It is still driven, with no clock and no network:
+
+```
+let mut rsm = Rsm::new(config, store, State::new(), nonce)?;   // the store's snapshot restored, the log after it applied again
+every tick:          rsm.tick()
+a message arrives:   rsm.step(m)
+a client asks:       rsm.register(request), rsm.submit(client, seq, &command),
+                     rsm.read(request, query), rsm.read_at(request, index, query)
+then:                let out = rsm.process()?;
+                     send out.messages; answer clients with out.events
+```
+
+`process` writes and syncs what the node's `Ready` says before it hands out
+a message. It applies what is committed, serves the reads that may be
+served, and takes the next steps of a snapshot. Every member applies every
+entry and says so: the caller answers the clients that are its own, by the
+request ids it chose and by the client and sequence number of a command.
+
+- **The state machine.** `apply(index, command)` gives the answer, and must
+  give the same on every member: nothing in it may depend on a clock or the
+  member's id. `query` reads the state as it is, `size` says about how
+  large a snapshot of it is, `freeze` gives a view of it that applying does
+  not change (copy-on-write, cheap), written a piece at a time, and
+  `restore` reads one back.
+- **Sessions.** A client registers -- an entry, whose index is its id --
+  and numbers its commands, one at a time. A command retried under the
+  number last applied is answered from the session (`Applied`) and not
+  applied again; one under that is `Stale`; one of a session that is gone,
+  `Expired`, after which the client registers again. Sessions are part of
+  the state, carried by the snapshot.
+- **Reads.** `read` is linearizable: the leader confirms it with a round of
+  heartbeats (ReadIndex), and it is served once applied as far, or failed
+  back (`ReadFailed`) if the leadership changes first. Its context carries
+  `nonce`, a number of this start's own -- random, or a count of starts --
+  so that a leader's answer to a read the member asked before it was
+  started again, arriving after, is never taken for a later read's. `read_at` is served
+  on any member once it has applied as far as the index the client names --
+  its own last write's, so that it reads its writes.
+- **Snapshots** are taken once the entries applied since the last are as
+  large as the state, with a floor (`SNAPSHOT_FLOOR`, 1 MiB). The state is
+  frozen at the index applied then and written a few pieces a call while
+  applying goes on; the store then compacts the log. A leader's snapshot
+  restores the sessions and the state.
+
 ## Tested
 
 `scripts/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`
 and holds the crate to known answers, the known traps played out, groups
 fuzzed over a network that fails in every way, checked at every step against
-Raft's properties, a member fed messages no correct member sends, and the
-log on disk through power cuts, torn writes and lost ones -- every
-allocation of it to the 512 KiB one block of the kernel's heap is;
+Raft's properties, a member fed messages no correct member sends, the log
+on disk through power cuts, torn writes and lost ones, and a register
+through the replicated state machine whose clients' histories are checked
+for linearizability -- every allocation of it to the 512 KiB one block of
+the kernel's heap is;
 `fuzz/raft/mutants.py` holds the gate to catching each rule taken out.
 
 ## Limits
@@ -184,7 +237,14 @@ taken as having written nothing -- the log stops -- but a file system that
 then marks the pages clean and lets a later sync succeed (Linux's "fsync
 gate") is outside what it can know.
 
+The replicated state machine keeps at most 1024 sessions, evicting the
+least recently used in the log's order. It keeps an answer for a retry only
+up to 1 KiB: a retry of a longer one is told `Lost`. It keeps at most 4096
+reads waiting. A client has one command at a time; a second before the
+first is answered is the first's retry if it has its number, and otherwise
+moves the session on, after which the first's answer is `Stale`.
+
 ## Next
 
-The replicated state machine with client sessions and reads at an index
-(`raft::rsm`, R3), as [plans/raft.md](../plans/raft.md) has it.
+The crate's users: the cluster's registry ([plans/cluster.md](../plans/cluster.md),
+C1 and C2), then NBS's metadata service ([plans/nbs.md](../plans/nbs.md)).
