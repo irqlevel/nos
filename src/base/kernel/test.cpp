@@ -4281,6 +4281,170 @@ bool test_wake_storm()
     return ok;
 }
 
+/* ---- a wait()'s task let go of while signal()s are at its event ---- */
+
+/* Waiters on one event, each freed the moment it returns, while tasks on
+   other CPUs signal it -- each signal() holding the waiter it found for
+   LET_GO_HOLD_NS inside its window (Event::signal_holding). A waiter is
+   asleep on the event before the signals are let go, so they find it; on
+   even rounds its deadline comes inside a hold, so that its way out of
+   wait_for meets a signal() still in the window, and on odd ones a hold's
+   unblock ends its wait. Every wait() must let go of its task only once no
+   signal() is in the window (Event::let_go): one still holding the task
+   after it was freed would find its magic dead (TASK_DEAD_MAGIC) -- nothing
+   allocates a task again for two holds after the free -- and fail the boot
+   there. The waiters run on a CPU of their own, not this one: an exited
+   task's last reference is its queue's, let go of by its CPU's idle loop
+   (TaskQueue::reap_exited), and this CPU's idle task is the one running
+   the test. */
+struct LetGoProbe
+{
+    Event ev;
+    Atomic stop;
+    /* The signallers signal while it is 1 */
+    Atomic armed;
+    /* The round under way: its waiter's deadline is chosen by it */
+    Atomic round;
+    Atomic woken;       /* waits a signal ended */
+    Atomic timed_out;   /* waits their deadline ended */
+};
+
+static const ulong LET_GO_ROUNDS = 16;
+static const ulong LET_GO_HOLD_NS = 2 * consts::NANO_SECS_IN_MS;
+/* A waiter's deadline on even rounds -- inside a hold, with room for the
+   signals to be let go after it fell asleep -- and on odd ones */
+static const ulong LET_GO_SHORT_NS = 500 * consts::NANO_SECS_IN_USEC;
+static const ulong LET_GO_LONG_NS = 50 * consts::NANO_SECS_IN_MS;
+static const ulong LET_GO_SIGNALLERS_MAX = 3;
+
+static void let_go_signaller(void* ctx)
+{
+    auto* p = static_cast<LetGoProbe*>(ctx);
+    while (p->stop.get() == 0)
+    {
+        if (p->armed.get() == 0)
+        {
+            cpu_relax();
+            continue;
+        }
+        p->ev.signal_holding(LET_GO_HOLD_NS);
+    }
+}
+
+static void let_go_waiter(void* ctx)
+{
+    auto* p = static_cast<LetGoProbe*>(ctx);
+    /* A signal left from the round before taken first, so that the wait
+       sleeps until this round's */
+    p->ev.poll_for(0);
+    ulong deadline = (p->round.get() % 2 == 0) ? LET_GO_SHORT_NS : LET_GO_LONG_NS;
+    if (p->ev.wait_for(deadline))
+        p->woken.inc();
+    else
+        p->timed_out.inc();
+}
+
+bool test_event_let_go()
+{
+    auto& cpus = CpuTable::get_instance();
+    ulong self = cpus.get_current_cpu_id();
+    ulong others = cpus.get_running_cpus() & ~(1UL << self);
+    ulong home = MAX_CPUS;
+    for (ulong cpu = 0; cpu < MAX_CPUS && home == MAX_CPUS; cpu++)
+    {
+        if (others & (1UL << cpu))
+            home = cpu;
+    }
+    if (home != MAX_CPUS)
+        others &= ~(1UL << home);
+    if (others == 0)
+    {
+        klog(0, "test_event_let_go: fewer than three CPUs -- this one, the waiters' and a signaller's: not run");
+        return true;
+    }
+
+    auto* p = mm::talloc<LetGoProbe, TAG>();
+    if (p == nullptr)
+    {
+        klog(0, "test_event_let_go: no memory");
+        return false;
+    }
+
+    Task* signallers[LET_GO_SIGNALLERS_MAX] = {};
+    ulong count = 0;
+    bool ok = true;
+    for (ulong cpu = 0; ok && cpu < MAX_CPUS && count < LET_GO_SIGNALLERS_MAX; cpu++)
+    {
+        if (!(others & (1UL << cpu)))
+            continue;
+
+        char name[TASK_NAME_LEN];
+        stdlib::sn_printf(name, sizeof(name), "letgo-sig%lu", cpu);
+        signallers[count] = storm_start(name, cpu, let_go_signaller, p);
+        ok = (signallers[count] != nullptr);
+        if (ok)
+            count++;
+    }
+
+    ulong met_before = Event::let_go_waits();
+    ulong rounds = 0;
+    for (; ok && rounds < LET_GO_ROUNDS; rounds++)
+    {
+        p->round.set((long)rounds);
+        Task* waiter = storm_start("letgo-wait", home, let_go_waiter, p);
+        if (waiter == nullptr)
+        {
+            ok = false;
+            break;
+        }
+        /* Asleep on the event -- or gone, a stray signal having ended its
+           wait at once -- before the signals are let go */
+        while (!waiter->is_blocked() && waiter->state_.get() != Task::STATE_EXITED)
+            schedule();
+        p->armed.set(1);
+        while (waiter->state_.get() != Task::STATE_EXITED)
+            schedule();
+        /* Let go of the moment it is gone, the signallers still at it: freed
+           with its queue's reference, which its CPU's idle loop lets go of */
+        waiter->put();
+        p->armed.set(0);
+        /* Two holds: whatever signal() is still in its window is done before
+           the next task is allocated -- in the memory of this one, perhaps */
+        sleep(2 * LET_GO_HOLD_NS);
+    }
+
+    p->stop.set(1);
+    for (ulong i = 0; i < count; i++)
+    {
+        signallers[i]->wait();
+        signallers[i]->put();
+    }
+
+    ulong met = Event::let_go_waits() - met_before;
+    if (!ok)
+    {
+        klog(0, "test_event_let_go: could not start its tasks");
+    }
+    else if (met < rounds / 4)
+    {
+        /* The even rounds' waits each end inside a hold: half of them at the
+           least, or the window was not what was tested */
+        klog(0, "test_event_let_go: %lu of %lu waits met a signal() in its window, too few to have tested it",
+             met, rounds);
+        ok = false;
+    }
+    else
+    {
+        klog(0, "test_event_let_go: %lu waiters freed as they returned under %lu signallers -- %lu woken, %lu timed "
+             "out -- %lu of them let go only once a signal() left its window", rounds, count,
+             (ulong)p->woken.get(), (ulong)p->timed_out.get(), met);
+    }
+
+    p->~LetGoProbe();
+    mm::free(p);
+    return ok;
+}
+
 /* ---- affinity changed under a task (set_task_affinity) ---- */
 
 /* How long a move may take before it is a failure -- a spinner's is the

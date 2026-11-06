@@ -18,6 +18,11 @@ bool test_task_locate();
    none lost: once, from the BSP, with every CPU up */
 bool test_wake_storm();
 
+/* A wait()'s task let go of only once no signal() of its event is still at
+   it: short-lived waiters freed as they return, under signal()s that hold
+   what they found -- once, from the BSP, with every CPU up */
+bool test_event_let_go();
+
 /* The boot, run in the idle task, takes its turns beside a task that never
    blocks: from the BSP */
 bool test_idle_takes_turns();
