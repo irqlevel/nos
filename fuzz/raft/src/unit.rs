@@ -22,7 +22,31 @@ pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
     ("bootstrap_membership", bootstrap_membership),
     ("long_log", long_log),
     ("config_extremes", config_extremes),
+    ("crc32c_known", crc32c_known),
 ];
+
+/// CRC-32C's known answers: the check value of "123456789", and RFC 3720's
+/// vectors (B.4) -- 32 zeros, 32 ones, 32 bytes counting up and down -- each
+/// whole and carried on in two parts across every split.
+fn crc32c_known() -> Result<(), String> {
+    use raft::crc32c::{crc32c, update};
+    let up: Vec<u8> = (0u8..32).collect();
+    let down: Vec<u8> = (0u8..32).rev().collect();
+    let cases: [(&[u8], u32); 5] = [
+        (b"123456789", 0xE306_9283),
+        (&[0u8; 32], 0x8A91_36AA),
+        (&[0xFFu8; 32], 0x62A8_AB43),
+        (&up, 0x46DD_794E),
+        (&down, 0x113F_DB5C),
+    ];
+    for (bytes, want) in cases {
+        ensure(crc32c(bytes) == want, &format!("crc32c of {} bytes is {:08x}, not {:08x}", bytes.len(), crc32c(bytes), want))?;
+        for k in 0..=bytes.len() {
+            ensure(update(crc32c(&bytes[..k]), &bytes[k..]) == want, "crc32c carried on across a split")?;
+        }
+    }
+    ensure(crc32c(&[]) == 0, "crc32c of nothing")
+}
 
 fn ensure(ok: bool, what: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(what.to_string()) }

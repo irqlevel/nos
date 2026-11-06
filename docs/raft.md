@@ -80,13 +80,75 @@ What it does not do: there is no clock, network, thread or lock in it, no
 leader leases (a read costs a round of heartbeats), no joint consensus (one
 server at a time), and no machinery for thousands of groups at once.
 
+## The log on disk
+
+`raft::log::DiskLog` keeps what a member must not lose -- its entries, its
+hard state and its newest snapshot -- in a directory its user hands it as
+`Files`: list, length, read at, append, truncate, sync a file, sync the
+directory, rename, remove. The promises it is held to are POSIX's: a file's
+writes are on the medium once that file is synced, a name made, renamed or
+removed once the directory is. In nos, `kcore::fs` gives every call, and a
+`File::sync` flushes the whole file system, so there the two syncs are one.
+
+```
+let mut log = DiskLog::open(files, LogConfig::default())?;        // or DiskLog::bootstrap(files, config, voters, learners)
+let mut node = RawNode::new(config, log ...)                      // DiskLog is a Storage
+...
+let rd = node.ready();
+if let Some(s) = rd.snapshot { log.apply_snapshot(s)? }           // durable when it returns
+log.append(&rd.entries)?;
+if let Some(hs) = rd.hard_state { log.set_hard_state(hs)? }
+log.sync()?;                                                      // one sync for all of it
+send rd.messages ...
+```
+
+A snapshot of the state machine's own goes in with `create_snapshot(index,
+conf, data)`, durable when it returns; the log then drops what it made
+needless. An error stops the log -- every call after says `Stopped` -- and
+`DiskLog::open` over the same files starts it again from what they hold.
+
+How it is laid out:
+- **Segments** (`wal.<seq>`) are written only at their end, as etcd's WAL
+  is. Each is a header, then records: a length, a CRC32C over the length and
+  the payload, and the payload. A payload is an entry, the hard state, or a
+  snapshot's marker.
+- **Entries that replace others** are written after them, not over them.
+  Reading the log back replays the records in order, so nothing is ever cut
+  and then written again in place.
+- **The hard state rides the `Ready`'s one sync.** It is a record, and every
+  segment begins with it as it stood.
+- **A snapshot** is a file of its own (`snap.<index>`), in pieces with a CRC
+  each. It is written as `.tmp`, synced and renamed, and the directory
+  synced, before a marker in the log names it, as taken or as installed.
+
+Opening the log reads it twice:
+1. **The first pass checks every record.** It cuts the last segment's tail
+   at the first record that does not check -- a crash's torn write is never
+   read as an entry -- and finds the newest marker and hard state. Any other
+   segment was synced before the next was begun, so a bad record there is
+   corruption, and the log refuses to open.
+2. **Everything read is then made the medium's.** Every segment, the
+   snapshot and the directory are synced before anything is told of them. A
+   program started over after a failure, with no power cut, sees what was
+   written and never synced, and a member that answered for it would lose it
+   at the next cut.
+3. **The second pass replays the entries past the snapshot.** It skips
+   everything before the newest installed snapshot, which dropped it. An
+   entry in the snapshot that comes after entries past it drops them again,
+   as it did when it was written.
+
+As etcd does, the log since the snapshot is held in memory (`MemStorage`,
+in pieces), and the files are for its durability. After a snapshot, segments
+are removed oldest first while none holds an entry past it.
+
 ## Tested
 
 `scripts/raft-test.py` ([Tests and gates](testing.md)) builds `fuzz/raft`
 and holds the crate to known answers, the known traps played out, groups
 fuzzed over a network that fails in every way, checked at every step against
-Raft's properties, and a member fed messages no correct member sends --
-every allocation of it to the 512 KiB one block of the kernel's heap is;
+Raft's properties, a member fed messages no correct member sends, and the
+log on disk through power cuts, torn writes and lost ones -- every
+allocation of it to the 512 KiB one block of the kernel's heap is;
 `fuzz/raft/mutants.py` holds the gate to catching each rule taken out.
 
 ## Limits
@@ -110,8 +172,19 @@ for two election timeouts -- is dropped. Raft trusts its members: one that lies 
 agree to anything, and the crate's promise to it is only that it does not
 panic, keeps its own term, vote and commit, and stays within those limits.
 
+The log on disk reads at most a record or a piece at a time and gathers its
+writes in 128 KiB; it keeps up to 8192 segments (`MAX_SEGMENTS`, 8 MiB each
+by default), and past them it stops (`Full`) until a snapshot compacts it.
+It refuses a leader's snapshot below what is committed, as a node never
+restores one there. It cannot tell a byte of the last segment that went
+bad after it was synced from a torn write: either is cut there, so a disk
+that corrupts what it has written can cost the newest entries. In any other
+segment, or in the snapshot, the log refuses to open. A sync that fails is
+taken as having written nothing -- the log stops -- but a file system that
+then marks the pages clean and lets a later sync succeed (Linux's "fsync
+gate") is outside what it can know.
+
 ## Next
 
-The durable log over a caller's files (`raft::log`, R2) and the replicated
-state machine with client sessions and reads at an index (`raft::rsm`, R3),
-as [plans/raft.md](../plans/raft.md) has them.
+The replicated state machine with client sessions and reads at an index
+(`raft::rsm`, R3), as [plans/raft.md](../plans/raft.md) has it.

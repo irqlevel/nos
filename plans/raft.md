@@ -126,7 +126,65 @@ the gate; `--seed N --seconds S` runs a campaign.
 
 - **R1, the core and its wire**: `node`, `wire`, a storage in memory; the
   `node` and `wire` targets, the traps, the mutants.
-- **R2, the log**: `log` and its target.
+- **R2, the log**: `log` and its target. As built, on branch `raft-log`:
+  - **What the user gives it.** A directory of its own, as `Files`: list,
+    length, read at, append, truncate, sync a file, sync the directory,
+    rename, remove. A POSIX file system needs both syncs; nos's `File::sync`
+    flushes the whole file system, so there the two are one.
+  - **Segments.** `wal.<seq>`, written only at their end, as etcd's WAL is.
+    Each has a header (magic, version, its seq, CRC32C), then records: a
+    length, a CRC32C over the length and the payload, and the payload --
+    an entry (`wire::encode_entry`), the hard state, or a snapshot's
+    marker. An entry that replaces others is written after them, never over
+    them: reading the log back replays the records in order, as
+    `MemStorage::append` does. So nothing is cut and then written again in
+    place, where a crash in between could bring back what was cut.
+  - **The hard state is a record of the log, not a file of its own.** The
+    plan above had a file, written anew, synced and renamed. That is two
+    syncs and a directory's on every `Ready` whose commit moved, which is
+    nearly every one. As a record it rides the one sync that makes the
+    `Ready`'s entries durable. Every segment begins with the hard state as
+    it stood, so the newest is never in a segment that compaction removes.
+  - **Snapshots** go to `snap.<index>`: written as `.tmp` in pieces with a
+    CRC each, synced, renamed, and the directory synced. Only then is a
+    marker record written to the log. A marker says the snapshot was either
+    taken (the state machine's, the entries up to it compacted) or
+    installed (a leader's, the whole log dropped). Reading the log back,
+    the newest marker names the snapshot to load, and a snapshot file with
+    no marker -- a crash between the rename and the marker -- is removed.
+  - **The cut.** On opening the log, the last segment's tail is cut at the
+    first record that does not check: its length, its CRC, its decoding, or
+    an index past the last and one. The cut is synced before anything is
+    written after it. Any other segment was synced before the next was
+    made, so a bad record there is corruption, and the log refuses to open.
+  - **Compaction.** After a marker, segments are removed oldest first:
+    those that come before the marker's segment and hold no entry past the
+    snapshot. Once one would hold a live entry, removal stops, so what
+    remains replays to the same log.
+  - **Never larger than a block of the kernel's heap.** A record or a piece
+    is read at a time. Writes go through a buffer of 128 KiB. The list of
+    segments is capped, and past the cap appends are refused until a
+    snapshot.
+  - **What opening adds**: every segment, the snapshot and the directory
+    synced before the log is used -- a program started over after a failure,
+    the machine never down, sees what was written and never synced.
+  - **The fuzzer** (`fuzz/raft`'s `log` target, on a disk of its own with
+    POSIX's promises and no more) found four bugs, each now a scenario:
+    1. A leader's snapshot below the commit was taken. The log then
+       committed past its own end, and refused to open.
+    2. An open that used what was not yet durable. A segment whose
+       directory sync had failed, used after a restart without a power cut,
+       lost entries that had been synced at the next cut.
+    3. An installed snapshot was honoured only while it was the newest
+       marker. Once a snapshot had been taken after it, the log before it
+       came back from segments whose removal had failed.
+    4. An entry below a taken snapshot, written after entries past it, was
+       skipped on replay together with the truncation it had made. The
+       entries it had replaced came back.
+  - **Mutants** (`fuzz/raft/mutants.py`, `log_*`): the CRC check, the seal
+    before a new segment, the syncs at open, the snapshot's sync before its
+    rename, the compaction's bound, the installed snapshot's drop -- each
+    taken out, the gate and its scenario fail.
 - **R3, the state machine**: sessions, reads, snapshots; the linearizability
   check through it.
 

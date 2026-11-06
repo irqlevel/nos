@@ -32,6 +32,16 @@ into a host program that holds it to:
     and every read asked of a leader answered once healed;
   - the storage target: MemStorage against a model of its log, over logs
     of tens of thousands of entries snapshotted in the middle;
+  - the log target: raft::log's DiskLog on a disk of the fuzzer's own that
+    keeps POSIX's promises and no more -- every write since a file's last
+    sync kept, lost or torn at a power cut, a run of the directory's changes
+    kept -- read back after each cut as the state at the last sync with some
+    first records written after it, at a record's boundary, or as a snapshot
+    that failed half way would have left it; disks that fail calls, the log
+    stopping on the first; a byte of a sealed segment or of the snapshot
+    changed and the log refusing to open; noise named as the log names its
+    files, refused or read as nothing (RAFT_LOG_TRACE=1 prints each step
+    and the disk at each cut);
   - the wire target: messages written and read back, and noise and broken
     messages read without a panic, anything taken written back to its bytes;
   - the hostile target: one member fed messages no correct member sends --
