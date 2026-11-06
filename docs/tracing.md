@@ -150,9 +150,9 @@ An NMI that comes in while its CPU is writing takes nothing and is counted
 | `trace [list]` | every event: on or off, its group, what it records |
 | `trace on <event\|group\|all>...` | turned on (the rings made first, if there are none); names may be comma-separated |
 | `trace off <...>` | turned off; what was recorded stays |
-| `trace show [n] [cpu=N] [event\|group\|all...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events or groups named, only theirs. A word that names nothing -- or a cpu not running, or `n` of 0 -- is refused, not taken for a filter that matches nothing |
-| `trace dump [n] [cpu=N] [event\|group\|all...]` | the same window as JSON, a record a line, times in exact ns, after a line saying from when the window is whole: what `scripts/trace-decode.py` reads |
-| `trace latency [n] [cpu=N] [event\|group\|all...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs ([below](#how-long-a-woken-task-waited)) |
+| `trace show [n] [cpu=N] [event\|group\|all...] [field=value...]` | the newest `n` records (50; 4096 at most) of every CPU, or one, merged by time, oldest first; with events or groups named, only theirs; with a field filter -- up to four, all of which a record must pass -- only the records whose field of that name is the value: a number, decimal or `0x` hex, or an enumeration's name, each event's own (`sched_switch prev_state=blocked`, `test seq=0x10`). A record of an event without the field is none the filter keeps. A word that names nothing -- or a cpu not running, `n` of 0, a field no event of the window has or a value it cannot be -- is refused, not taken for a filter that matches nothing |
+| `trace dump [n] [cpu=N] [event\|group\|all...] [field=value...]` | the same window as JSON, a record a line, times in exact ns, after a line saying from when the window is whole: what `scripts/trace-decode.py` reads |
+| `trace latency [n] [cpu=N] [event\|group\|all...] [field=value...]` | the window's wakeups, each paired with the switch that answered it: p50/p90/p99/max and the longest five, with the task and the CPUs ([below](#how-long-a-woken-task-waited)) |
 | `trace stat` | each CPU's ring: written, kept, dropped; and the wakeup trigger, armed or what it fired on |
 | `trace clear` | what is recorded forgotten: `show` starts after it |
 | `trace size <KiB>` | the rings' size, 64 KiB times a power of two up to 64 MiB; rings there are made again at it, what they held with them -- and a freeze, or a trigger armed to keep it |
@@ -634,6 +634,14 @@ too.
   taken off the ring, picked up by the disk's task, served by the image then
   and there, done and given back, in that order, slot by slot, by the
   disk's own task -- and a file written, its ext4 transactions committed.
+- A window's field filters: `cpp-fuzz.py --target tracewin` gives a quarter
+  of its windows one or two -- a record's bytes at an offset and a size of
+  its event's payload, and now and then a field of another event, at some
+  place, holding some value -- and holds each CPU's part to the model's own
+  reading of those bytes. Control: `keeps` passing a record whatever its
+  field's value is caught at the first input. `trace-test.py` filters by a
+  number, decimal and hex, and by an enumeration's name, and has each kind
+  of filter that would match nothing refused.
 - `trace-decode.py --hv`: `hv-test.py` dumps each of its windows and reads
   them back with it, as shipped, held to what the guests did -- the
   `exits` guest's exits by reason and by what each was about, the 20 outs

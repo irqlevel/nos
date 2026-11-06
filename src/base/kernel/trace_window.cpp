@@ -5,8 +5,30 @@ namespace kernel
 namespace tp
 {
 
-ulong read_window(const TraceRing& ring, u64 from, ulong want, EventMask mask, u32 cpu, TraceRing::Record* out,
-    u64& complete_from)
+bool keeps(const Select& select, const TraceRing::Record& r)
+{
+    if (select.mask != ALL_EVENTS && (event_bit(r.id) & select.mask) == 0)
+        return false;
+    for (ulong i = 0; i < select.filter_count && i < FIELD_FILTERS_MAX; i++)
+    {
+        const FieldFilter& f = select.filters[i];
+        /* An event this kernel does not know has no field of any name */
+        if (r.id >= COUNT)
+            return false;
+        ulong offset = f.offset[r.id];
+        ulong size = f.size[r.id];
+        if (size == 0 || size > sizeof(u64) || offset + size > sizeof(r.payload) || offset + size > r.size)
+            return false;
+        u64 v = 0;
+        stdlib::mem_cpy(&v, reinterpret_cast<const u8*>(r.payload) + offset, size);
+        if (v != f.value[r.id])
+            return false;
+    }
+    return true;
+}
+
+ulong read_window(const TraceRing& ring, u64 from, ulong want, const Select& select, u32 cpu,
+    TraceRing::Record* out, u64& complete_from)
 {
     complete_from = 0;
     const u64 head = ring.head();
@@ -24,7 +46,7 @@ ulong read_window(const TraceRing& ring, u64 from, ulong want, EventMask mask, u
         cut = true;
     }
 
-    const bool everything = (mask == ALL_EVENTS);
+    const bool everything = (select.mask == ALL_EVENTS && select.filter_count == 0);
     ulong kept = 0;
     u64 oldest_read = COMPLETE_NEVER;
     for (u64 index = head; index > oldest; index--)
@@ -40,7 +62,7 @@ ulong read_window(const TraceRing& ring, u64 from, ulong want, EventMask mask, u
             break;
         }
         oldest_read = r.cycles;
-        if (!everything && (event_bit(r.id) & mask) == 0)
+        if (!everything && !keeps(select, r))
             continue;
         r.cpu = cpu;
         kept++;

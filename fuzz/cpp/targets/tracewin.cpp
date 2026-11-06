@@ -452,9 +452,30 @@ void play(Sim& sim, fuzz::Input& in)
     }
 }
 
+/* Whether the window keeps `x`, by the model: its event in the mask, and
+   for every filter its bytes where the filter says its event's field lies,
+   read little-end first, the filter's value. */
+bool model_keeps(const tp::Select& select, const Written& x)
+{
+    if (select.mask != tp::ALL_EVENTS && (tp::event_bit(x.id) & select.mask) == 0)
+        return false;
+    for (ulong i = 0; i < select.filter_count; i++)
+    {
+        const tp::FieldFilter& f = select.filters[i];
+        if (x.id >= tp::COUNT || f.size[x.id] == 0 || (ulong)f.offset[x.id] + f.size[x.id] > x.size)
+            return false;
+        u64 v = 0;
+        for (ulong k = 0; k < f.size[x.id]; k++)
+            v |= (u64)x.payload[f.offset[x.id] + k] << (8 * k);
+        if (v != f.value[x.id])
+            return false;
+    }
+    return true;
+}
+
 /* What the window's part of `cpu` must be: the newest `want` records the
-   ring still holds of those written since the clear, that `mask` keeps. */
-std::vector<const Written*> model_part(const Sim& sim, ulong cpu, ulong want, tp::EventMask mask)
+   ring still holds of those written since the clear, that `select` keeps. */
+std::vector<const Written*> model_part(const Sim& sim, ulong cpu, ulong want, const tp::Select& select)
 {
     const auto& w = sim.written[cpu];
     u64 head = w.size();
@@ -466,7 +487,7 @@ std::vector<const Written*> model_part(const Sim& sim, ulong cpu, ulong want, tp
     for (u64 i = head; i > from && part.size() < want; i--)
     {
         const Written& x = w[i - 1];
-        if (mask == tp::ALL_EVENTS || (tp::event_bit(x.id) & mask) != 0)
+        if (model_keeps(select, x))
             part.push_back(&x);
     }
     std::reverse(part.begin(), part.end());
@@ -508,6 +529,48 @@ void run_window(fuzz::Input& in)
     tp::EventMask mask = in.pick(masks);
     ulong count = in.chance(64) ? 4096 : in.range(1, 3000);
 
+    /* Now and then a field filter or two (`trace show ... field=value`): the
+       bytes of a record the schedule wrote, at an offset and a size inside
+       its payload, which its event's records are held to -- and now and
+       then, as well, a field another event has at some place, holding a
+       value of the input's */
+    tp::Select select = {};
+    select.mask = mask;
+    if (in.chance(64))
+    {
+        ulong filters = in.range(1, 2);
+        for (ulong i = 0; i < filters; i++)
+        {
+            ulong c = in.below(sim.cpus);
+            if (sim.written[c].empty())
+                continue;
+            const Written& x = sim.written[c][in.below(sim.written[c].size())];
+            static const ulong SIZES[] = {1, 2, 4, 8};
+            ulong size = in.pick(SIZES);
+            if (x.id >= tp::COUNT || size > x.size)
+                continue;
+            tp::FieldFilter& f = select.filters[select.filter_count];
+            f = {};
+            ulong offset = in.below(x.size - size + 1);
+            u64 v = 0;
+            for (ulong k = 0; k < size; k++)
+                v |= (u64)x.payload[offset + k] << (8 * k);
+            f.offset[x.id] = (u8)offset;
+            f.size[x.id] = (u8)size;
+            f.value[x.id] = v;
+            if (in.chance(128))
+            {
+                ulong other = in.below(tp::COUNT);
+                f.size[other] = (u8)in.pick(SIZES);
+                f.offset[other] = (u8)in.below(TraceRing::PAYLOAD_BYTES - f.size[other] + 1);
+                f.value[other] = in.chance(128) ? 0 : in.u64();
+            }
+            select.filter_count++;
+        }
+        if (select.filter_count != 0)
+            fuzz::reached("a window with field filters");
+    }
+
     tp::Window windows[MAX_SIM_CPUS] = {};
     std::vector<std::vector<TraceRing::Record>> storage(sim.cpus);
     ulong total = 0;
@@ -520,12 +583,12 @@ void run_window(fuzz::Input& in)
         ulong want = std::min<u64>(std::min<u64>(count, ring.capacity()), head - sim.cleared[c]);
         storage[c].resize(want);
         u64 complete;
-        ulong kept = tp::read_window(ring, sim.cleared[c], want, mask, (u32)c, storage[c].data(), complete);
+        ulong kept = tp::read_window(ring, sim.cleared[c], want, select, (u32)c, storage[c].data(), complete);
         windows[c] = {storage[c].data(), kept, 0, complete};
         total += kept;
 
         /* The part: the model's, record for record */
-        auto model = model_part(sim, c, want, mask);
+        auto model = model_part(sim, c, want, select);
         INVARIANT(kept == model.size(), "cpu %lu's part holds %lu records, the model's %zu (want %lu)", c, kept,
                   model.size(), want);
         for (ulong i = 0; i < kept; i++)
@@ -545,7 +608,7 @@ void run_window(fuzz::Input& in)
         for (u64 i = sim.cleared[c]; i < sim.written[c].size(); i++)
         {
             const Written& x = sim.written[c][i];
-            if (mask != tp::ALL_EVENTS && (tp::event_bit(x.id) & mask) == 0)
+            if (!model_keeps(select, x))
                 continue;
             if (x.cycles < complete)
                 continue;
@@ -637,7 +700,7 @@ void run_window(fuzz::Input& in)
               superseded);
     /* With switches in the window, one whole from `start` lost none: a task
        is woken again only after a switch to it */
-    if ((mask & tp::event_bit((ulong)tp::Id::SchedSwitch)) != 0)
+    if ((mask & tp::event_bit((ulong)tp::Id::SchedSwitch)) != 0 && select.filter_count == 0)
         INVARIANT(superseded == 0, "a task woken twice with no switch between, in a window whole from %lu",
                   (ulong)start);
 
@@ -699,7 +762,9 @@ void run_threads(fuzz::Input& in)
     for (int round = 0; round < 200; round++)
     {
         u64 complete;
-        ulong kept = tp::read_window(ring, 0, want, tp::ALL_EVENTS, 0, out.data(), complete);
+        tp::Select all = {};
+        all.mask = tp::ALL_EVENTS;
+        ulong kept = tp::read_window(ring, 0, want, all, 0, out.data(), complete);
         for (ulong i = 0; i < kept; i++)
         {
             const TraceRing::Record& x = out[i];
