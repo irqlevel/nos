@@ -14,13 +14,25 @@ pub struct KFiles {
     mark: String,
 }
 
+/// Every folder of `path` that is not there made, from the root down:
+/// `/nbs/mds` on a host with no `/nbs`. One that cannot be made is the
+/// next call's to say.
+pub fn create_dirs(path: &str) {
+    let mut at = 0;
+    while let Some(i) = path[at + 1..].find('/').map(|i| i + at + 1) {
+        let _ = kcore::fs::create_dir(&path[..i]);
+        at = i;
+    }
+    let _ = kcore::fs::create_dir(path);
+}
+
 impl KFiles {
     /// The log's folder, `<root>/<sub>`, and the root, made where they are
     /// not there; `<root>/.sync`, an empty file a sync of the folder syncs --
     /// nos's file system makes everything durable at any file's sync.
     pub fn new(root: &str, sub: &str) -> Result<KFiles, String> {
         let root = root.trim_end_matches('/');
-        let _ = kcore::fs::create_dir(root);
+        create_dirs(root);
         let dir = alloc::format!("{}/{}", root, sub);
         kcore::fs::create_dir(&dir).map_err(|_| alloc::format!("cannot make {}", dir))?;
         let mark = alloc::format!("{}/.sync", root);
