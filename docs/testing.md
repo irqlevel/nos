@@ -2048,7 +2048,9 @@ what its header says it does:
   input's, is held to what the schedule did: each CPU's part the newest
   records its ring holds that the filter keeps; nothing the CPU wrote
   missing from where the part says it is whole; the merge in time order;
-  every wait paired one the schedule had, none it had left out. Then the
+  every wait paired one the schedule had, none it had left out -- through a
+  field filter, the first switch to the task the window kept, which a filter
+  that dropped the one that answered the wakeup makes a later one. Then the
   heapsort against `std::sort` on orders made to be a quicksort's worst,
   the five longest, a duration's parse, and a ring's window read while a
   thread writes it. The quicksort it replaced is a panic at the 48th input,
