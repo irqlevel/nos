@@ -91,7 +91,6 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 | блочном слое, таблицах разделов | `parttest.py [--arch aarch64\|x86_64]` | обе, в CI |
 | асинхронном пути блочного слоя, C ABI, через который до него добираются модули | `netblk-test.py [--arch x86_64\|aarch64]` | обе |
 | ext2 | `ext2-test.py` (образ проверяет `e2fsck`) | arm64, в CI |
-| nanofs | `nanofs-test.py` | arm64, в CI |
 | журнале на диске | `disklog-test.py` | arm64 |
 | пути трассировки, сетевом устройстве, netconsole | `netconsole-test.py` | arm64, в CI |
 | TCP, HTTP-клиенте | `tcp-test.py` | arm64, в CI |
@@ -105,7 +104,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 | Linux-госте: загрузчике, политике, устройствах, нескольких CPU, ACPI, сети | `hv-linux-test.py --bzimage <bzImage> --initrd <cpio>` с `--disk`, `--net`, `--cpus N`, `--acpi`, `--attach` по необходимости | x86-64, вручную |
 | том, с чем сталкивается ядро дистрибутива | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <raw>]` | x86-64, вручную |
 | всём, что ядру отдаёт сеть: стеке, DHCP, DNS, HTTP и TLS, UDP-шелле, netconsole, `ssh`, `sshd` | `net-fuzz.py` | хост, в CI |
-| всём, что ядру отдаёт диск: таблицах разделов, ext2, nanofs, VFS, `root=` | `fs-fuzz.py` | хост, в CI |
+| всём, что ядру отдаёт диск: таблицах разделов, ext2, ext4, VFS, `root=` | `fs-fuzz.py` | хост, в CI |
 | том, что прошивка, загрузчик или диск отдают C++-части, а также таблицах страниц и куче, на которых держится всё остальное | `cpp-fuzz.py` | хост, в CI |
 | системном образе, `nos-install`, `root=UUID=` | `image-test.py` | x86-64, в CI |
 | примитиве ожидания, выборе планировщиком задачи idle | `idle-wait-test.py` (нужны 12 или больше CPU и KVM) | x86-64 |
@@ -121,7 +120,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 |---|---|---|
 | `hv-fuzz.py` | всё, до чего гость дотягивается в гипервизоре: устройства, локальный APIC и IO-APIC, MMIO, загрузчик Linux и таблицы ACPI, политику CPUID и MSR, цикл выполнения на каждом CPU гостя, коммутатор гостей, DHCP и NAT, а также размещение гостей | `cargo` |
 | `net-fuzz.py` | всё, что ядру отдаёт сеть: кадры любого вида, TCP, HTTP и HTTPS, DNS, DHCP, ICMP и ARP, UDP-шелл, netconsole, SSH | `cargo` |
-| `fs-fuzz.py` | всё, что ядру отдаёт диск: MBR и GPT, журнал на диске, исправные и повреждённые образы ext2 и nanofs, VFS, команды работы с хранилищем, `root=` | `cargo` |
+| `fs-fuzz.py` | всё, что ядру отдаёт диск: MBR и GPT, журнал на диске, исправные и повреждённые образы ext2 и ext4, VFS, команды работы с хранилищем, `root=` | `cargo` |
 | `cpp-fuzz.py` | C++-часть под ASan и UBSan: дерево устройств, теги Multiboot2, таблицы ACPI, карту памяти, командную строку, блок окружения GRUB, загрузчик модулей, `printf`, таблицы страниц и кучу | `clang` с санитайзерами, `make` |
 
 Без аргументов фаззер работает как **гейт**: он прогоняет фиксированные входные данные из фиксированного seed, одни и те же при каждом запуске. `hv-fuzz.py` справляется гораздо быстрее, чем за минуту, а `net-fuzz.py` и `fs-fuzz.py` работают пару минут. В **кампании** каждая цель получает заданное число секунд и собственный seed:
@@ -129,7 +128,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 ```sh
 python3 scripts/hv-fuzz.py
 python3 scripts/net-fuzz.py --seed 7 --seconds 300
-python3 scripts/fs-fuzz.py --target ext2 --target nanofs
+python3 scripts/fs-fuzz.py --target ext2 --target ext4
 python3 scripts/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
 ```
 
@@ -144,7 +143,7 @@ python3 scripts/net-fuzz.py --replay tcp out/net-fuzz/findings/X.hex --trace
 
 - **Оба задания** выполняют `make check` (cppcheck, который падает на любой находке), `make nocheck ARCH=<arch>`, smoke-загрузку, `parttest.py --arch <arch> --tcg`, а последним шагом собирают ядро с `UBSAN=1 RUSTUB=1` и прогоняют на нём свою smoke-загрузку.
 - **Задание x86-64** добавляет `make image` с `image-test.py`, `insn-test.py`, `hv-fuzz.py` и `fs-fuzz.py`.
-- **Задание aarch64** добавляет `net-fuzz.py`, `cpp-fuzz.py`, а также `ext2-test.py`, `nanofs-test.py`, `netconsole-test.py`, `tcp-test.py` и `netload-test.py`, каждый с `--tcg`.
+- **Задание aarch64** добавляет `net-fuzz.py`, `cpp-fuzz.py`, а также `ext2-test.py`, `netconsole-test.py`, `tcp-test.py` и `netload-test.py`, каждый с `--tcg`.
 
 Остальные гейты из таблицы вы запускаете сами, когда изменение затрагивает то, что они проверяют. Среди них гейты гипервизора с Linux и дистрибутивами (`bzImage` весит мегабайты, а образы дистрибутивов нужно скачивать), `hv-test.py`, `idle-wait-test.py` и гейты аппаратных сетевых карт.
 
