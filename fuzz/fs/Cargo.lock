@@ -6,11 +6,16 @@ version = 4
 name = "block"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "events",
  "ffi",
  "kcore",
  "mgmt",
 ]
+
+[[package]]
+name = "crc"
+version = "0.1.0"
 
 [[package]]
 name = "events"
@@ -23,6 +28,9 @@ dependencies = [
 [[package]]
 name = "extfmt"
 version = "0.1.0"
+dependencies = [
+ "crc",
+]
 
 [[package]]
 name = "ffi"
@@ -33,6 +41,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "crc",
  "events",
  "extfmt",
  "ffi",
@@ -45,6 +54,7 @@ name = "fs-fuzz"
 version = "0.1.0"
 dependencies = [
  "block",
+ "crc",
  "events",
  "ffi",
  "fs",

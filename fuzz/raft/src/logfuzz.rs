@@ -841,7 +841,7 @@ fn noise(seed: u64) -> Result<(), String> {
             bytes.extend_from_slice(b"RAFTWAL\0");
             bytes.extend_from_slice(&1u32.to_le_bytes());
             bytes.extend_from_slice(&seq.to_le_bytes());
-            let crc = raft::crc32c::crc32c(&bytes);
+            let crc = crc::crc32c::checksum(&bytes);
             bytes.extend_from_slice(&crc.to_le_bytes());
         }
         for _ in 0..r.below(2000) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""The host API's wire crates on the host: src/crates/web and
-src/crates/mgmtwire, as the API module links them (fuzz/web).
+"""The host API's wire crates on the host: src/crates/common/net/web and
+src/crates/common/ipc/mgmtwire, as the API module links them (fuzz/web).
 
 1. Known answers: SHA-1's FIPS 180 vectors, RFC 6455's accept key and
    frames, requests, frames, JSON texts, parameters, networks and

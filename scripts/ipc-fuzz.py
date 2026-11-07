@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ipc fuzz: the kernel's message channel, fuzzed on the host.
 
-Every service of the kernel's talks through the channel (src/crates/ipc,
+Every service of the kernel's talks through the channel (src/crates/layers/ipc,
 docs/ipc.md) -- the image's tasks and the modules alike -- so a message
 lost, doubled or out of order, a Down that never comes, a name that outlives
 its mailbox or a queue that holds more than it says is a bug in each of them

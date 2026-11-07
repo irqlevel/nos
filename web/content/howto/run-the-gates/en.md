@@ -95,11 +95,11 @@ What a smoke boot cannot notice has a test of its own in `scripts/`. Each one ex
 | the disk log | `disklog-test.py` | arm64 |
 | the trace path, a net device, netconsole | `netconsole-test.py` | arm64, in CI |
 | TCP, the HTTP client | `tcp-test.py` | arm64, in CI |
-| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/sshd` | `sshd-test.py [--arch aarch64\|x86_64]` | both |
-| the receive path, the frame pool, `modules/netload` | `netload-test.py [--arch aarch64\|x86_64]` (about seven minutes on arm64, by design) | both; arm64 in CI |
-| `drivers/igb`, the interface between NIC drivers and the network layer | `tcp-test.py --nic igb`, `netload-test.py --nic igb` (QEMU 8.0 or later) | by hand |
+| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/net/sshd` | `sshd-test.py [--arch aarch64\|x86_64]` | both |
+| the receive path, the frame pool, `modules/net/netload` | `netload-test.py [--arch aarch64\|x86_64]` (about seven minutes on arm64, by design) | both; arm64 in CI |
+| `drivers/net/igb`, the interface between NIC drivers and the network layer | `tcp-test.py --nic igb`, `netload-test.py --nic igb` (QEMU 8.0 or later) | by hand |
 | `drivers/usb/` | `usb-test.py` | x86-64 |
-| the hypervisor: `hv`, `hvarch`, `modules/hv` | `hv-test.py [--arch x86_64\|aarch64]` | both |
+| the hypervisor: `hv`, `hvarch`, `modules/hypervisor/hv` | `hv-test.py [--arch x86_64\|aarch64]` | both |
 | the hypervisor's MMIO decoder and guest page walker | `insn-test.py` | host, in CI |
 | anything a guest reaches in `hv`: devices, APICs, MMIO, the loader, ACPI, the CPUID and MSR policy, the run loop, the guests' switch and NAT | `hv-fuzz.py` | host, in CI |
 | a Linux guest: the loader, the policy, the devices, more than one CPU, ACPI, the network | `hv-linux-test.py --bzimage <bzImage> --initrd <cpio>`, with `--disk`, `--net`, `--cpus N`, `--acpi`, `--attach` as needed | x86-64, by hand |
@@ -109,7 +109,7 @@ What a smoke boot cannot notice has a test of its own in `scripts/`. Each one ex
 | what firmware, a bootloader or a disk hands the C++, and the page tables and heap under everything | `cpp-fuzz.py` | host, in CI |
 | the system image, `nos-install`, `root=UUID=` | `image-test.py` | x86-64, in CI |
 | a wait primitive, the scheduler's choice of the idle task | `idle-wait-test.py` (needs 12 or more CPUs and KVM) | x86-64 |
-| `drivers/r8168`, `drivers/r8125` | nothing emulates them, so only the compiler and then the real machine | — |
+| `drivers/net/r8168`, `drivers/net/r8125` | nothing emulates them, so only the compiler and then the real machine | — |
 
 This table is a summary. The authoritative version, with the exact files each row covers, is in the project's [`CLAUDE.md`](https://github.com/irqlevel/nos/blob/master/CLAUDE.md#gates), and [Tests and gates](/docs/testing) explains every gate. The hypervisor gates that boot a real Linux need a guest kernel and an initramfs; [Boot a Linux guest](/howto/linux-guest) shows how to build them.
 

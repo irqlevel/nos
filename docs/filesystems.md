@@ -7,7 +7,7 @@ is in [Shell commands](shell-commands.md).
 
 ## What is mounted at boot
 
-`rust_mount_root_fs()` (`src/crates/fs/src/rootfs.rs`) runs late in the boot, after the disks
+`rust_mount_root_fs()` (`src/crates/layers/fs/src/rootfs.rs`) runs late in the boot, after the disks
 that appear during `rust_init` (NVMe) have been probed for partitions, and
 does what `root=` on the command line asks:
 
@@ -46,7 +46,7 @@ mount; the smoke tests boot with it and assert `fstest: passed`.
 
 ## The file API
 
-Rust reaches files through `crate::vfs_instance()` (`src/crates/fs/src/vfs.rs`),
+Rust reaches files through `crate::vfs_instance()` (`src/crates/layers/fs/src/vfs.rs`),
 and C++ through the `kernel_vfs_*` calls it exports -- there is no C++ view
 of the layer, so a file that needs one declares the calls it makes where it
 makes them (`kernel/module.cpp` reading a `.ko`, `kernel/cmd.cpp` for
@@ -109,7 +109,7 @@ time, each for the whole of it -- a journal replayed or written home
 included -- while calls on the mounts there are go on. The locks are taken
 in that order -- the mounting, a mount's, the table -- never two mounts' at
 once, and an open file's handle names its mount, so a read or a write
-through one takes that mount's lock and no other (`fs/src/vfs.rs`).
+through one takes that mount's lock and no other (`layers/fs/src/vfs.rs`).
 
 The mutex is the kernel's: a task that finds it held gives its CPU to any
 other task that can run there, and spins only when none can -- which a
@@ -334,7 +334,7 @@ pointer and a length.
 
 ## ext2
 
-`src/crates/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
+`src/crates/layers/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
 direct, single-, double- and triple-indirect blocks, sparse files, files past
 4 GiB (`large_file`, a regular file's size in both of its inode's words),
 directories of any size. A file is as big as Linux's ext2 lets one be
@@ -454,8 +454,8 @@ a sequential pass does not re-read its indirect blocks per data block.
 
 ## ext4
 
-`src/crates/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
--- through `src/crates/extfmt`, the on-disk format and its checksums as a
+`src/crates/layers/fs/src/ext4/` reads ext4 -- and ext3, and an ext2 with a journal
+-- through `src/crates/common/storage/extfmt`, the on-disk format and its checksums as a
 crate with no kernel in it, and writes it through its journal: names and
 data, and what a remove, a cut or a punch gives back, however much -- in
 transactions of a bounded share, through the orphan list, which a mount for
@@ -728,8 +728,9 @@ Each of these is left until a measurement or a need asks for it:
 - **Discard.** What a remove, a cut or a punch gives back is not discarded
   on the device: the block layer has no discard, and an SSD under a
   filesystem that grows and shrinks never hears of the free space.
-- **CRC32C by the CPU.** Every checksum is computed a byte at a time from
-  a table (`extfmt::crc`); arm64's CRC32C instructions and x86's SSE4.2
+- **CRC32C by the CPU.** Every checksum is computed in software, eight
+  bytes a step from tables made at compile time (the tree's `crc` crate,
+  which `extfmt::crc` names); arm64's CRC32C instructions and x86's SSE4.2
   `crc32` are not used.
 - **Writing what the installs do not make.** A filesystem without a
   journal, without extents or without metadata_csum, or with quotas, stays
@@ -737,7 +738,7 @@ Each of these is left until a measurement or a need asks for it:
 
 ## nanofs, ramfs, procfs
 
-nanofs (`src/crates/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
+nanofs (`src/crates/layers/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
 1024 inodes, 64 MiB of data, files up to 1 MiB, every write copy-on-write
 with the inode committed last. It predates ext2 write support and remains
 for what it is good at — a small, self-verifying store (`format nanofs`,
@@ -750,7 +751,7 @@ piece. Mounted read-only it writes nothing, not even the bitmap repair the
 mount makes of a reachable inode or block marked free. `format` and `mount`
 refuse a device smaller than the layout (69 MB) before touching it.
 
-ramfs (`src/crates/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
+ramfs (`src/crates/layers/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
 layout puts on `/`, and what `test_vfs` exercises at every boot: a file is
 one buffer that doubles as it grows. procfs (`procfs.rs`) is a ramfs whose
 `/proc/interrupts` is regenerated on each lookup -- the VFS looks a file up
@@ -798,7 +799,7 @@ journal.
 
 `fstest [dir] [size]` from the shell (`size` at least 8 KiB), or `fstest=on`
 at boot, runs
-The self-test (`src/crates/fs/src/selftest.rs`) runs in a directory it makes and removes: write
+The self-test (`src/crates/layers/fs/src/selftest.rs`) runs in a directory it makes and removes: write
 and read back, append, write at an offset, truncate both ways with the gap
 checked for zeros, rename, move into a subdirectory, `readdir`, the
 operations that must fail, a file of `size` bytes (300 KiB by default)

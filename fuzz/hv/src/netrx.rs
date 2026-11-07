@@ -1,5 +1,5 @@
 //! The `netrx` target: what a guest's NIC puts into the buffers its driver
-//! posts (`hv/src/devices/net.rs`), held to a model of its own -- a frame
+//! posts (`hypervisor/hv/src/devices/net.rs`), held to a model of its own -- a frame
 //! into one chain, or, once the driver takes mergeable buffers, spread over
 //! as many as it needs with their count in its header; a send of TCP carried
 //! whole, with the header that says how to cut it. The driver here is a

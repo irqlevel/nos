@@ -305,7 +305,7 @@ pub mod cmd {
 }
 
 /// kcore's tracepoints, as hv's sites reach them: the payloads from kcore's
-/// own list (`kcore/src/trace/events.rs`, `crate::trace_events` here),
+/// own list (`base/kcore/src/trace/events.rs`, `crate::trace_events` here),
 /// built as the kernel's sites build them and handed to an `emit` that holds
 /// each to what its description says it holds -- every enumeration's value
 /// one it has a name for, every pad zero. A target says whether the events

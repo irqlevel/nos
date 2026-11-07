@@ -150,7 +150,7 @@ const Field SCHED_SLICE_FIELDS[] = {
 };
 
 /* ---- the hypervisor's events ----
-   Their sites are the hv module's Rust, whose payloads (kcore/src/trace/
+   Their sites are the hv module's Rust, whose payloads (base/kcore/src/trace/
    events.rs) every boot holds to these, an enumeration's names included:
    a name changed here alone, or there alone, is a failed boot. Each field's
    order here is the order it prints in; its offset is the payload's own. A
@@ -163,7 +163,7 @@ static_assert(sizeof(HvWake) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot
 static_assert(sizeof(HvTimer) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
 static_assert(sizeof(HvRing) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
 
-/* hv's `Exit`, a value a kind (src/crates/hv/src/svm.rs) */
+/* hv's `Exit`, a value a kind (src/crates/hypervisor/hv/src/svm.rs) */
 const char* const HV_EXIT_REASONS[] = { "host", "kicked", "io", "hlt", "cpuid", "msr", "hypercall", "irq_window",
     "nmi_window", "npf", "exception", "machine_check", "shutdown", "invalid", "cr8", "cr0", "cr4", "dr", "eoi",
     "pause", "undefined", "other" };
@@ -276,7 +276,7 @@ static_assert(sizeof(BioSubmit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a s
 static_assert(sizeof(BioDone) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
 static_assert(sizeof(Ext4Commit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
 
-/* hv's `Op`, a request's (src/crates/hv/src/devices/blk.rs) */
+/* hv's `Op`, a request's (src/crates/hypervisor/hv/src/devices/blk.rs) */
 const char* const BLK_OPS[] = { "read", "write", "flush", "discard", "write_zeroes" };
 /* How the disk's task served a request: with the device and reaped, done
    by the image's start then and there, or a command served on its own */
@@ -404,7 +404,7 @@ const Field HV_RING_FIELDS[] = {
 
 /* ---- TCP's events ----
    A connection's segments out and in, what its sender made of a loss, its
-   round trips and its program's waits (net/src/tcp.rs). A connection is said
+   round trips and its program's waits (layers/net/src/tcp.rs). A connection is said
    by its slot -- the same in every event -- and its two ports. */
 
 static_assert(sizeof(TcpSend) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");

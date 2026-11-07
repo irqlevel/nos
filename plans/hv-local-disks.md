@@ -9,7 +9,7 @@ partition on the EX44 for the tests.
 ## Where it starts
 
 A guest's disk is a file today: virtio-blk in `hv` -> `FileDisk`
-(`modules/hv/src/disk.rs`) -> `kcore::fs::ImageQueue` -> `fs::image` (the
+(`modules/hypervisor/hv/src/disk.rs`) -> `kcore::fs::ImageQueue` -> `fs::image` (the
 file's extent map, growth, growth ahead, ext4 commits) -> `block::queue` ->
 the NVMe driver. What is there to build on:
 
@@ -17,7 +17,7 @@ the NVMe driver. What is there to build on:
   `submit`, `take`) and a guest takes any `Box<dyn Backend>` (`guest.rs`).
 - `block::queue::Queue` is the asynchronous path `fs::image` itself uses;
   128 queues of 256 I/Os each, where VMs have 16 x 4 disks at most.
-- The block table's claims (`block/src/table.rs`) refuse overlapping
+- The block table's claims (`layers/block/src/table.rs`) refuse overlapping
   stretches of one disk: a mounted partition, the disk under it and the
   partitions over it exclude one another -- nos's root is safe already.
 

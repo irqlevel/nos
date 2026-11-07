@@ -13,13 +13,17 @@ edition = "2021"
 
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/crates/ffi" }
-kcore = { path = "../../src/crates/kcore" }
-block = { path = "../../src/crates/block" }
-fs = { path = "../../src/crates/fs" }
+ffi = { path = "../../src/crates/base/ffi" }
+kcore = { path = "../../src/crates/base/kcore" }
+block = { path = "../../src/crates/layers/block" }
+fs = { path = "../../src/crates/layers/fs" }
 # The events tasks wait on, which an image's queue may be made on
 # (plans/ipc.md I2).
-events = { path = "../../src/crates/events" }
+events = { path = "../../src/crates/base/events" }
+# The CRC-32 the partition tables, nanofs and the disk log are checked by,
+# for the images the fuzzer makes and judges. (Its ext4 judge's CRC32C is
+# its own, by design: it shares nothing with the code it judges.)
+crc = { path = "../../src/crates/common/crc" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.

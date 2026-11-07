@@ -1,17 +1,19 @@
 # hvboot's parsers on the host: its partition tables, ext2/3/4 reader, GRUB
-# configuration and bzImage header (src/crates/hvboot/src/{gpt,ext,grub,
-# bzimage,crc32}.rs), compiled from their own sources and run over a disk
-# image -- what hvboot would boot off it, and the kernel and initrd read out
-# by its own reader, to compare with what e2fsprogs reads -- and over random
-# inputs (scripts/hvboot-test.py). Its one dependency is the format crate
-# ext.rs reads through, a path of the tree's, so it builds offline.
+# configuration and bzImage header (src/crates/hypervisor/hvboot/src/{gpt,ext,grub,
+# bzimage}.rs), compiled from their own sources and run over a disk image --
+# what hvboot would boot off it, and the kernel and initrd read out by its
+# own reader, to compare with what e2fsprogs reads -- and over random inputs
+# (scripts/hvboot-test.py). Its dependencies are the format crate ext.rs
+# reads through and the CRC-32 gpt.rs checks by, paths of the tree's, so it
+# builds offline.
 [package]
 name = "hvboot-test"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-extfmt = { path = "../../src/crates/extfmt" }
+extfmt = { path = "../../src/crates/common/storage/extfmt" }
+crc = { path = "../../src/crates/common/crc" }
 
 # Overflow checks on, as a RUSTUB=1 build has them: hvboot reads what the
 # guest's disk says, and an overflow there is a bug of its own.

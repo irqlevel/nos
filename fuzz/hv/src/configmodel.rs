@@ -1,4 +1,4 @@
-//! A VM's `vm.toml` (`modules/hv/src/config.rs`): text an operator writes
+//! A VM's `vm.toml` (`modules/hypervisor/hv/src/config.rs`): text an operator writes
 //! by hand, so whatever it is, `parse` must not panic -- and what it reads,
 //! `render` must write back so that `parse` reads the same again. A
 //! configuration made up the input's way -- its strings full of quotes,

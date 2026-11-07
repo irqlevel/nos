@@ -3,7 +3,7 @@
 //! area's length, the boot's sequence number, how much text there is, a
 //! CRC -- and the text from the second sector on.
 
-use kcore::crc32::crc32_update;
+use crc::crc32::update as crc32_update;
 
 pub const MAGIC: u64 = 0x0031_474F_4C53_4F4E;
 pub const VERSION: u32 = 1;

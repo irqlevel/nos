@@ -45,7 +45,7 @@ pub fn audit() {
     audit_but(&[], &[]);
 }
 
-/// The TCP timer's promise (the timer's task in net/src/tcp.rs): no
+/// The TCP timer's promise (the timer's task in layers/net/src/tcp.rs): no
 /// connection's retransmission is left past its deadline by more than the
 /// task's wakeup can be late -- a tick of the machine's, which rounds every
 /// sleep up to one -- with one to spare: the pass the task runs then sends

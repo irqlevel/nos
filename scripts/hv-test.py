@@ -233,7 +233,7 @@ SCRIPT = [
     "rmmod hv",             # 29
     "lsmod",                # 30
     "dmesg 400 hv:",        # 31
-    # A PVH image (hv/src/pvh.rs): hvboot, started at its 32-bit entry with
+    # A PVH image (hypervisor/hv/src/pvh.rs): hvboot, started at its 32-bit entry with
     # paging off -- under VT-x, by unrestricted guest -- and given no disk.
     "insmod /hv.ko",        # 32
     "hv on",                # 33
@@ -284,7 +284,7 @@ decode_spec = importlib.util.spec_from_file_location("trace_decode", os.path.joi
 decode = importlib.util.module_from_spec(decode_spec)
 decode_spec.loader.exec_module(decode)
 
-# What the `exits` guest does (hv/src/guests.rs): says "nos: ports and
+# What the `exits` guest does (hypervisor/hv/src/guests.rs): says "nos: ports and
 # cpuid" a byte at a time through the debug port, reads it back once, asks
 # CPUID once and halts.
 EXITS_PORT = 0xE9
@@ -295,7 +295,7 @@ EXITS_CPUID_LEAF = 0x4E4F5300
 MSR_X2APIC_ICR = 0x830
 SMP_IPI_VECTOR = 0x40
 SMP_TIMER_VECTOR = 0x41
-# hv_exit's info for a port access's IN, and for a write (hv/src/tp.rs).
+# hv_exit's info for a port access's IN, and for a write (hypervisor/hv/src/tp.rs).
 IO_IN = 0x100
 WRITE = 0x1
 # What the trace says a pid off a task's stack is (tp::NO_TASK_PID).

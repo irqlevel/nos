@@ -1,5 +1,5 @@
 //! The `offload` target: a guest NIC's transmit offloads
-//! (`hv/src/devices/offload.rs`) held to a model of their own, written from
+//! (`hypervisor/hv/src/devices/offload.rs`) held to a model of their own, written from
 //! virtio's and the RFCs' words and not from that code -- a send of TCP over
 //! IPv4 the driver leaves to be cut, a frame whose checksum it leaves to be
 //! completed, and bytes that are neither, each well made or not. What comes

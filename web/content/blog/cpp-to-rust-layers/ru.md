@@ -69,7 +69,7 @@ unsafe impl Send for ArpTable {}
         let cache = unsafe { &mut *self.cache.get() };
 ```
 
-А вот после, в [`net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/arp.rs):
+А вот после, в [`layers/net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/layers/net/src/arp.rs):
 
 ```rust
 pub struct ArpTable {
@@ -81,7 +81,7 @@ pub struct ArpTable {
         let cache = self.cache.lock();
 ```
 
-Теперь `unsafe` встречается по одному разу на каждый тип блокировки, в `Deref` её guard'а в [`kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/sync.rs). И это была не косметика. TCP читал состояние чужих соединений под блокировкой пула, не беря их собственных блокировок, а старая форма прятала это за тем же `unsafe`, что и всё остальное. Теперь порядок такой: сначала пул, потом соединение.
+Теперь `unsafe` встречается по одному разу на каждый тип блокировки, в `Deref` её guard'а в [`base/kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/sync.rs). И это была не косметика. TCP читал состояние чужих соединений под блокировкой пула, не беря их собственных блокировок, а старая форма прятала это за тем же `unsafe`, что и всё остальное. Теперь порядок такой: сначала пул, потом соединение.
 
 Для каждого приёма, которому раньше требовался `unsafe`, в `kcore` появился свой тип, и в комментарии к типу записано, почему он корректен. `Once` нужен для того, что существует в единственном экземпляре, `CpuLocal` для состояния отдельного CPU, `RxOwned` для того, чего касается только путь приёма, а `kcore::pod` для структур на диске. (Суперблок ext2 один раз объявляет `unsafe impl Pod`, и после этого каждое чтение проверяет границы.) Дерево файловой системы стало ареной идентификаторов, каждый из которых состоит из номера слота и поколения, так что устаревший ничего не находит. Хэндл, пришедший снаружи, не разыменовывается, а ищется:
 

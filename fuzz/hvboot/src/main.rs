@@ -22,15 +22,13 @@ extern crate alloc;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-#[path = "../../../src/crates/hvboot/src/crc32.rs"]
-mod crc32;
-#[path = "../../../src/crates/hvboot/src/gpt.rs"]
+#[path = "../../../src/crates/hypervisor/hvboot/src/gpt.rs"]
 mod gpt;
-#[path = "../../../src/crates/hvboot/src/ext.rs"]
+#[path = "../../../src/crates/hypervisor/hvboot/src/ext.rs"]
 mod ext;
-#[path = "../../../src/crates/hvboot/src/grub.rs"]
+#[path = "../../../src/crates/hypervisor/hvboot/src/grub.rs"]
 mod grub;
-#[path = "../../../src/crates/hvboot/src/bzimage.rs"]
+#[path = "../../../src/crates/hypervisor/hvboot/src/bzimage.rs"]
 mod bzimage;
 
 /// What bzimage.rs reaches of the start info: the memory map's entry.

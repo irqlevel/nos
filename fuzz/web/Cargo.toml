@@ -11,8 +11,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-web = { path = "../../src/crates/web" }
-mgmtwire = { path = "../../src/crates/mgmtwire" }
+web = { path = "../../src/crates/common/net/web" }
+mgmtwire = { path = "../../src/crates/common/ipc/mgmtwire" }
 # To read back what web::x509 wrote: the key out of its PKCS#8, and the
 # certificate's signature checked against it.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }

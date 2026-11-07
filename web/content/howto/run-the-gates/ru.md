@@ -95,11 +95,11 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 | журнале на диске | `disklog-test.py` | arm64 |
 | пути трассировки, сетевом устройстве, netconsole | `netconsole-test.py` | arm64, в CI |
 | TCP, HTTP-клиенте | `tcp-test.py` | arm64, в CI |
-| слушающей стороне TCP, загрузчике модулей, объявлениях `ffi`, `ssh`, `modules/sshd` | `sshd-test.py [--arch aarch64\|x86_64]` | обе |
-| пути приёма, пуле кадров, `modules/netload` | `netload-test.py [--arch aarch64\|x86_64]` (на arm64 около семи минут, так задумано) | обе; arm64 в CI |
-| `drivers/igb`, интерфейсе между сетевыми драйверами и сетевым слоем | `tcp-test.py --nic igb`, `netload-test.py --nic igb` (QEMU 8.0 или новее) | вручную |
+| слушающей стороне TCP, загрузчике модулей, объявлениях `ffi`, `ssh`, `modules/net/sshd` | `sshd-test.py [--arch aarch64\|x86_64]` | обе |
+| пути приёма, пуле кадров, `modules/net/netload` | `netload-test.py [--arch aarch64\|x86_64]` (на arm64 около семи минут, так задумано) | обе; arm64 в CI |
+| `drivers/net/igb`, интерфейсе между сетевыми драйверами и сетевым слоем | `tcp-test.py --nic igb`, `netload-test.py --nic igb` (QEMU 8.0 или новее) | вручную |
 | `drivers/usb/` | `usb-test.py` | x86-64 |
-| гипервизоре: `hv`, `hvarch`, `modules/hv` | `hv-test.py [--arch x86_64\|aarch64]` | обе |
+| гипервизоре: `hv`, `hvarch`, `modules/hypervisor/hv` | `hv-test.py [--arch x86_64\|aarch64]` | обе |
 | декодере MMIO гипервизора и обходе страниц гостя | `insn-test.py` | хост, в CI |
 | всём, до чего гость дотягивается в `hv`: устройствах, APIC, MMIO, загрузчике, ACPI, политике CPUID и MSR, цикле выполнения, коммутаторе гостей и NAT | `hv-fuzz.py` | хост, в CI |
 | Linux-госте: загрузчике, политике, устройствах, нескольких CPU, ACPI, сети | `hv-linux-test.py --bzimage <bzImage> --initrd <cpio>` с `--disk`, `--net`, `--cpus N`, `--acpi`, `--attach` по необходимости | x86-64, вручную |
@@ -109,7 +109,7 @@ make nocheck ARCH=aarch64 UBSAN=1 RUSTUB=1
 | том, что прошивка, загрузчик или диск отдают C++-части, а также таблицах страниц и куче, на которых держится всё остальное | `cpp-fuzz.py` | хост, в CI |
 | системном образе, `nos-install`, `root=UUID=` | `image-test.py` | x86-64, в CI |
 | примитиве ожидания, выборе планировщиком задачи idle | `idle-wait-test.py` (нужны 12 или больше CPU и KVM) | x86-64 |
-| `drivers/r8168`, `drivers/r8125` | их ничто не эмулирует, поэтому остаются только компилятор, а затем настоящая машина | — |
+| `drivers/net/r8168`, `drivers/net/r8125` | их ничто не эмулирует, поэтому остаются только компилятор, а затем настоящая машина | — |
 
 Эта таблица — сводка. Первоисточник — таблица в [`CLAUDE.md`](https://github.com/irqlevel/nos/blob/master/CLAUDE.md#gates) проекта, где для каждой строки перечислены точные файлы, а [Tests and gates](/docs/testing) описывает каждый гейт. Гейтам гипервизора, которые загружают настоящий Linux, нужны ядро гостя и initramfs. Как их собрать, описано в руководстве [Linux-гость под гипервизором nos](/howto/linux-guest).
 

@@ -4,7 +4,7 @@ nos is managed through a structured API: a host API module serves it, and
 the panel, `nosctl` and other hosts' panels are its clients. That API needs
 something to call. Modules cannot call each other: each is linked on its
 own against the kernel's export table. So the bus lives in the kernel image,
-which every module reaches (`src/crates/mgmt`).
+which every module reaches (`src/crates/layers/mgmt`).
 
 On the bus, a **provider** answers by name what it is asked:
 
@@ -141,9 +141,9 @@ that guards it, and written out with no lock held.
 | Provider | Registered by | Reads | Actions |
 |---|---|---|---|
 | `system` | `src/crates/kernel/src/system.rs` | `info` (version, revision, arch, CPU model, CPUs, uptime, the wall clock, the log level, the command line), `cpus` (each CPU's time in its idle task, the stretch it is in now included), `memory`, `tasks`, `log` (`since`, `max_bytes`), `modules`, `interrupts` | `set_log_level`, `set_nice`, `load_module` (a module of `/lib/modules` by its name, and its parameters), `unload_module`, `power_off`, `reboot` |
-| `net` | `src/crates/net/src/provider.rs` | `interfaces` (addresses, and the frames and bytes each has moved), `tcp` (the slots, those used, and each connection), `arp`, `pool` | |
-| `block` | `src/crates/block/src/provider.rs` | `disks` (every disk and partition: its size, the disk it is on and where, who holds it, the id a VM's vm.toml finds it by and a partition's type) | |
-| `fs` | `src/crates/fs/src/provider.rs` | `mounts` (where, which filesystem, on which device, and its size and free space, from `FileSystem::space`) | |
+| `net` | `src/crates/layers/net/src/provider.rs` | `interfaces` (addresses, and the frames and bytes each has moved), `tcp` (the slots, those used, and each connection), `arp`, `pool` | |
+| `block` | `src/crates/layers/block/src/provider.rs` | `disks` (every disk and partition: its size, the disk it is on and where, who holds it, the id a VM's vm.toml finds it by and a partition's type) | |
+| `fs` | `src/crates/layers/fs/src/provider.rs` | `mounts` (where, which filesystem, on which device, and its size and free space, from `FileSystem::space`) | |
 
 What the C++ holds it copies out through `kcore::system`, into the
 caller's buffer and with nothing allocated: the tasks
@@ -165,10 +165,10 @@ and this one would be waiting for the halt.
 
 | Provider | Registered by | Reads | Actions | Jobs |
 |---|---|---|---|---|
-| `api` | `modules/api` | `status`, `clients` | | |
-| `cluster` | `modules/cluster` | `status`, `hosts` | `invite`, `revoke`, `remove`, `maintenance`, `address`, `rekey` | |
-| `vm` | `modules/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach` | `start`, `stop`, `restart`, `create`, `clone`, `delete` |
-| `modtest` | `modules/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
+| `api` | `modules/mgmt/api` | `status`, `clients` | | |
+| `cluster` | `modules/cluster/cluster` | `status`, `hosts` | `invite`, `revoke`, `remove`, `maintenance`, `address`, `rekey` | |
+| `vm` | `modules/hypervisor/hv` (x86-64) | `list`, `get`, `host`, `networks`, `config_get`, `console_read`, `disks`, `forwards`, `devices` | `config_set`, `forward_add`, `forward_del`, `console_write`, `disk_add`, `disk_grow`, `disk_attach`, `disk_detach` | `start`, `stop`, `restart`, `create`, `clone`, `delete` |
+| `modtest` | `modules/test/modtest`, the loader's self-test | `echo` | | `wait`, `nap` |
 
 A module's provider is unregistered with the module, which waits out its
 calls and jobs -- told to stop -- before anything they use goes: hv drops
@@ -219,7 +219,7 @@ through the bus's C ABI, as a provider's answers do the other way.
 - `describe(provider, sink)` -- a descriptor;
 - `job_start`, `job(id, notes_since, sink)`, `jobs(sink)`, `job_cancel`.
 
-The JSON is the bus's own (`mgmt/src/view.rs`), written so it is handed on as
+The JSON is the bus's own (`layers/mgmt/src/view.rs`), written so it is handed on as
 it is: a job's result is embedded as the JSON it is once the bus has read it
 as such, and as a string if it is not. Every length a module hands over is
 checked before a slice is made of it; the sink is called only while its call

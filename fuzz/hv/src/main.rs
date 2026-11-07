@@ -58,13 +58,13 @@ mod kernel;
 pub use kernel::{cmd, consts, dma, sync, time, trace};
 /// The kernel's events, as kcore declares them for its sites: the payloads
 /// hv's sites build, held by `trace`'s emit to their descriptions.
-#[path = "../../../src/crates/kcore/src/trace/events.rs"]
+#[path = "../../../src/crates/base/kcore/src/trace/events.rs"]
 pub mod trace_events;
 mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
 pub use devices::offload;
 pub use netwire as wire;
-#[path = "../../../src/crates/kcore/src/pod.rs"]
+#[path = "../../../src/crates/base/kcore/src/pod.rs"]
 pub mod pod;
 mod cpu;
 pub use cpu::{machine, svm, vm, x86, Caps, Error, Ext, Result, Vendor};
@@ -73,58 +73,58 @@ pub mod memory;
 /* ---- the hypervisor's own sources ---- */
 
 pub mod devices;
-#[path = "../../../src/crates/hv/src/acpi.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/acpi.rs"]
 pub mod acpi;
-#[path = "../../../src/crates/hv/src/cr.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/cr.rs"]
 pub mod cr;
-#[path = "../../../src/crates/hv/src/dr.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/dr.rs"]
 pub mod dr;
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
-#[path = "../../../src/crates/modules/hv/src/dhcp.rs"]
+#[path = "../../../src/crates/modules/hypervisor/hv/src/dhcp.rs"]
 pub mod dhcp;
-#[path = "../../../src/crates/hv/src/insn.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/insn.rs"]
 pub mod insn;
-#[path = "../../../src/crates/hv/src/lapic.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/lapic.rs"]
 pub mod lapic;
-#[path = "../../../src/crates/hv/src/linux.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/linux.rs"]
 pub mod linux;
-#[path = "../../../src/crates/hv/src/pvh.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/pvh.rs"]
 pub mod pvh;
-#[path = "../../../src/crates/hv/src/mmio.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/mmio.rs"]
 pub mod mmio;
 /// NAT, from the net crate: what a guest's packets for the world, and the
 /// world's answers, go through. Its `use kcore::klog` is the kernel's macro;
 /// here `klog!` is the one above, in scope already, and the import unused.
 #[allow(unused_imports)]
-#[path = "../../../src/crates/net/src/nat.rs"]
+#[path = "../../../src/crates/layers/net/src/nat.rs"]
 pub mod nat;
-#[path = "../../../src/crates/hv/src/place.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/place.rs"]
 pub mod place;
-#[path = "../../../src/crates/hv/src/policy.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/policy.rs"]
 pub mod policy;
-#[path = "../../../src/crates/hv/src/run.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/run.rs"]
 pub mod run;
-#[path = "../../../src/crates/hv/src/smbios.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/smbios.rs"]
 pub mod smbios;
-#[path = "../../../src/crates/hv/src/smp.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/smp.rs"]
 pub mod smp;
 /// hv's records of what its guests' CPUs do (`kcore::trace`'s events, group
 /// `hv`): built from every exit the scripts make, and every halt, wake,
 /// injection and ring the run loop meets, when a target turns them on.
-#[path = "../../../src/crates/hv/src/tp.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/tp.rs"]
 pub mod tp;
 /// `hv forward`'s relay, from the module: two streams carried both ways.
-#[path = "../../../src/crates/modules/hv/src/relay.rs"]
+#[path = "../../../src/crates/modules/hypervisor/hv/src/relay.rs"]
 pub mod relay;
 /// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
-#[path = "../../../src/crates/modules/hv/src/net.rs"]
+#[path = "../../../src/crates/modules/hypervisor/hv/src/net.rs"]
 pub mod switch;
 /// A VM's vm.toml, from the module: what an operator writes, read and
 /// written back.
-#[path = "../../../src/crates/modules/hv/src/config.rs"]
+#[path = "../../../src/crates/modules/hypervisor/hv/src/config.rs"]
 pub mod vmconfig;
-#[path = "../../../src/crates/hv/src/walk.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/walk.rs"]
 pub mod walk;
 
 mod configmodel;

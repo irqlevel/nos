@@ -14,7 +14,7 @@ inside it at boot. What it found, and what the work on it changed, is in
   is), and nos holds it as a disk's image in its run. The same NVMe, the same
   ext4, a fresh copy of the same golden image each time.
 - **The CPUs.** nos's hv puts a lone 4-CPU guest on two whole fast cores and
-  its disks' task on a slow core of its own (`hv/src/place.rs`). KVM's vCPU
+  its disks' task on a slow core of its own (`hypervisor/hv/src/place.rs`). KVM's vCPU
   threads are pinned to the same four CPUs, its iothread to the same slow
   core, and the rest of QEMU to the other slow cores (`host/bench-host.sh`).
   The guest sees two cores of two threads under both.

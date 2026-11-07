@@ -1,0 +1,15 @@
+[package]
+name = "raft"
+version = "0.1.0"
+edition = "2021"
+
+# Raft as a crate of its own (plans/raft.md): the protocol with no I/O, its
+# messages as bytes and a storage in memory -- nothing of nos in it, no
+# unsafe and no dependency but the tree's own `crc` (the log's CRC32C), so
+# that whatever needs a replicated state links it as it is: the cluster's
+# registry and NBS's metadata service, as modules. fuzz/raft builds it on
+# the host and holds it to Raft's properties.
+[lib]
+
+[dependencies]
+crc = { path = "../../crc" }

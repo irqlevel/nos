@@ -1,0 +1,21 @@
+[package]
+name = "mod-ipcnet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_ipcnet"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+# Both pinned ends: the server a peer dials, the client this host dials with.
+tls = { path = "../../../layers/tls", features = ["pinned"] }
+# The host's key and its certificate, made at the first start.
+web = { path = "../../../common/net/web" }
+# What two hosts say inside their session.
+ipcwire = { path = "../../../common/ipc/ipcwire" }
+# hosts.toml.
+conf = { path = "../../../common/text/conf" }
+zeroize = { version = "1", default-features = false }

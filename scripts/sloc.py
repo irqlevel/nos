@@ -5,8 +5,9 @@ Every file under src/ is lexed just far enough to tell a line of code from a
 comment from a blank one -- `//` and `/* */` (nested, in Rust), with string,
 char and raw string literals skipped over so that a "//" inside one is not
 taken for a comment -- and the counts are summed per component: a directory
-of src/base (arch/ split by architecture), a crate of src/crates (drivers/ and
-modules/ split by crate). A line holding both code and a comment is code.
+of src/base (arch/ split by architecture), a crate of src/crates (named by its
+directory there: layers/net, drivers/net/igb). A line holding both code and a
+comment is code.
 
 The vendored crates (src/crates/vendor) and cargo's output (target/) are not
 the kernel's own code and are not counted.
@@ -214,12 +215,21 @@ def classify(path, lang, ext):
     return classify_c_like(text, rust=(lang == "rust"))
 
 
+def crate_of(parts):
+    """The crate a file of src/crates is in: the nearest directory above it
+    with a Cargo.toml, as a path under src/crates."""
+    for k in range(len(parts) - 1, 1, -1):
+        if os.path.isfile(os.path.join(ROOT, *parts[:k], "Cargo.toml")):
+            return "/".join(parts[1:k])
+    return parts[1]
+
+
 def component(rel):
     """src-relative path -> the component the file is counted under."""
     parts = rel.split(os.sep)
+    if parts[0] == "crates" and len(parts) > 2:
+        return crate_of(parts)
     top = parts[1] if len(parts) > 2 else "."
-    if top in ("arch", "drivers", "modules") and parts[0] == "crates" and len(parts) > 3:
-        return top + "/" + parts[2]
     if top == "arch" and len(parts) > 3:
         return top + "/" + parts[2]
     return top

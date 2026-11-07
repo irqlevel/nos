@@ -33,7 +33,7 @@
 //! the time and a margin -- and the world dials again; and once the module
 //! is unloaded, the machine holds nothing.
 
-#[path = "../../../../src/crates/modules/ipcnet/src/lib.rs"]
+#[path = "../../../../src/crates/modules/cluster/ipcnet/src/lib.rs"]
 #[allow(unused_attributes, dead_code, clippy::all)]
 mod ipcnet;
 

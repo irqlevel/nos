@@ -42,7 +42,7 @@ bool test_affinity();
    rust_test. */
 bool test_module_bus();
 
-/* The message channel's module side (src/crates/ipc): modtest talking to
+/* The message channel's module side (src/crates/layers/ipc): modtest talking to
    kernel.echo, then unloaded under the echo's traffic -- its mailbox closed
    and the echo's monitor told, the one it left open closed by the sweep
    after its exit. Needs tasks: run after rust_test. */

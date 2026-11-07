@@ -59,7 +59,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
-- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/net/src/device.rs`)
+- `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/crates/layers/net/src/device.rs`)
 
 ## Devices and filesystems
 

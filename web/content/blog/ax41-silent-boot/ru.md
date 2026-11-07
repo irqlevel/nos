@@ -48,7 +48,7 @@ sudo ./scripts/disklog.py read /dev/nvme0n1p1      # read the last boot
 
 Номер не изменился. (Тогда лог писался при каждой загрузке машины, на которой подготовлена его область. Начиная с [0d70452](https://github.com/irqlevel/nos/commit/0d704526d5d421c69576d2e79a1af453a4e666df) для этого нужен параметр `disklog=on`, и без него неизменный номер ничего не значит, так что сначала проверьте командную строку записи GRUB.)
 
-Второй счётчик ведёт сама ext2. Когда драйвер ext2 в nos (тогда на C++, теперь на Rust) монтирует раздел на запись, он делает то же, что Linux ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/fs/src/ext2.rs)):
+Второй счётчик ведёт сама ext2. Когда драйвер ext2 в nos (тогда на C++, теперь на Rust) монтирует раздел на запись, он делает то же, что Linux ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/layers/fs/src/ext2.rs)):
 
 ```rust
             self.sb.state &= !STATE_VALID;
