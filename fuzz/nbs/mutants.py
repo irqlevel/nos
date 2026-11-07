@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The nbs fuzzer's mutants: one rule of NBS's metadata
-(src/crates/common/storage/nbsmeta) or of its chunk server's engine
-(src/crates/common/storage/nbscs) taken out at a time, and the gate
+(src/crates/common/storage/nbsmeta), of its chunk server's engine
+(src/crates/common/storage/nbscs) or of their wire (nbswire) taken out at a
+time, and the gate
 (`nbs-fuzz gate`) must fail -- a rule the gate does not catch the loss of is
 one it does not hold the crate to.
 
@@ -145,6 +146,14 @@ MUTANTS = [
      'nbscs/src/store.rs',
      'let this = fences_stale || fences != self.fences;',
      'let this = fences != self.fences;'),
+    ('wire_whole', 'a request read whole, nothing past its end',
+     'nbswire/src/lib.rs',
+     'r.done().then_some(Request { id, volume, generation, op })',
+     'Some(Request { id, volume, generation, op })'),
+    ('wire_flags', 'a flag read as 0 or 1 alone',
+     'nbswire/src/lib.rs',
+     '            4 => Reply::Closed(match r.u8()? {\n                0 => false,\n                1 => true,\n                _ => return None,\n            }),',
+     '            4 => Reply::Closed(r.u8()? != 0),'),
     ('cs_slot_given_back', 'a freed slot given back to the free list',
      'nbscs/src/store.rs',
      '        self.devs[dv].free.push(slot);\n        Ok(())',

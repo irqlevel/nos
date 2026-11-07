@@ -6,7 +6,7 @@ members = [
     "drivers/block/nvme", "drivers/block/virtio_blk", "drivers/block/virtio_scsi", "drivers/net/igb", "drivers/net/r8125", "drivers/net/r8168", "drivers/net/virtio_net", "drivers/rng/virtio_rng", "drivers/usb", "drivers/virtio",
     "hypervisor/hv", "hypervisor/hvarch", "hypervisor/hvboot",
     "modules/cluster/cluster", "modules/cluster/ipcnet", "modules/cluster/raftmember", "modules/hypervisor/hv", "modules/mgmt/api", "modules/net/netload", "modules/net/sshd", "modules/net/tlsbench", "modules/storage/blkload", "modules/storage/nbs-mds", "modules/storage/netblk", "modules/test/heapbench", "modules/test/hello", "modules/test/modtest", "modules/test/slowexit", "modules/tools/edit",
-    "common/cluster/raft", "common/cluster/registry", "common/codec", "common/crc", "common/ipc/ipcwire", "common/ipc/mgmtwire", "common/net/netwire", "common/net/ssh", "common/net/web", "common/storage/diskimage", "common/storage/extfmt", "common/storage/nbscs", "common/storage/nbsmeta", "common/text/conf", "common/text/edit",
+    "common/cluster/raft", "common/cluster/registry", "common/codec", "common/crc", "common/ipc/ipcwire", "common/ipc/mgmtwire", "common/net/netwire", "common/net/ssh", "common/net/web", "common/storage/diskimage", "common/storage/extfmt", "common/storage/nbscs", "common/storage/nbsmeta", "common/storage/nbswire", "common/text/conf", "common/text/edit",
 ]
 # What a plain `cargo build` builds: the crates the kernel links. A loadable
 # module is built on its own, one package at a time and with the

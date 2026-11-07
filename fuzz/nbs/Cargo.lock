@@ -69,6 +69,7 @@ version = "0.1.0"
 dependencies = [
  "nbscs",
  "nbsmeta",
+ "nbswire",
  "raft",
 ]
 
@@ -88,6 +89,15 @@ dependencies = [
  "ipcwire",
  "raft",
  "sha2",
+]
+
+[[package]]
+name = "nbswire"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "nbscs",
+ "nbsmeta",
 ]
 
 [[package]]
