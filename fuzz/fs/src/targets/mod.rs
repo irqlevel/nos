@@ -10,7 +10,6 @@ mod ext4rw;
 mod ext4sys;
 mod find;
 mod fsops;
-mod nanofs;
 mod part;
 mod rootfs;
 mod shell;
@@ -50,8 +49,6 @@ pub static ALL: &[Target] = &[
     Target { name: "ext4rw", run: audited!(ext4rw::ext4rw), max_len: 8192, gate: 3000 },
     Target { name: "ext4sys", run: audited!(ext4sys::ext4sys), max_len: 256, gate: 300 },
     Target { name: "ext4judge", run: audited!(ext4::ext4judge), max_len: 16, gate: 1 },
-    Target { name: "nanofs", run: audited!(nanofs::nanofs), max_len: 8192, gate: 2000 },
-    Target { name: "nanofsbad", run: audited!(nanofs::nanofsbad), max_len: 2048, gate: 5000 },
     Target { name: "vfs", run: audited!(vfs::vfs), max_len: 8192, gate: 4000 },
     Target { name: "shell", run: audited!(shell::shell), max_len: 2048, gate: 2000 },
     Target { name: "rootfs", run: audited!(rootfs::rootfs), max_len: 256, gate: 3000 },

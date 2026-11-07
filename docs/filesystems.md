@@ -14,8 +14,8 @@ does what `root=` on the command line asks:
 | Command line | What ends up on `/` |
 |---|---|
 | nothing | nothing; the VFS starts empty and filesystems are mounted from the shell |
-| `root=auto` | the ext4 -- or ext2 -- filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/`, the first of the ext family found read-only on `/boot`, the first nanofs found read-write on `/data` (the layout the ISO had before there was a root on disk) |
-| `root=vda1`, `root=nvme01` | that block device, ext4 or ext2 if it carries one, else nanofs |
+| `root=auto` | the ext4 -- or ext2 -- filesystem whose volume label is `nos`, read-write. Without one: a ramfs on `/` and the first of the ext family found read-only on `/boot` (the layout the ISO had before there was a root on disk) |
+| `root=vda1`, `root=nvme01` | that block device: the ext4 or ext2 it carries |
 | `root=LABEL=nos` | the ext4 or ext2 filesystem with that label |
 | `root=UUID=…` | the ext4 or ext2 filesystem with that UUID, as `blkid` prints it |
 
@@ -87,8 +87,8 @@ and the handles it abandons stop naming anything.
 
 A mounted filesystem claims its block device (`kernel_blockdev_claim_as`) until
 it is unmounted, and so do the disk log and a module writing to a device
-direct (`blkload`'s write tests) -- and the shell's `format` and `diskwrite`,
-for as long as they write. A claim is refused while another overlaps
+direct (`blkload`'s write tests) -- and the shell's `diskwrite`, for as
+long as it writes. A claim is refused while another overlaps
 it — a stretch of the same disk: the same device, the disk a partition is on,
 a partition of that disk, or another partition of it that the disk's table
 has overlap (the table is whoever wrote the disk's to choose) — so a mount fails (`vfs: the device is in use by a mounted filesystem`
@@ -150,8 +150,8 @@ to the file ABI's close, which a word guessed or kept too long could
 otherwise reach. A part of a block -- a guest's sector in a block of 4 KiB
 -- is read, changed and written back whole, which an image may do because
 its calls come one at a time and nobody else writes the file. A filesystem
-that keeps no blocks of its own on a device (`data_block_size` 0: ramfs,
-and nanofs for now) has its images read and written through the VFS whole.
+that keeps no blocks of its own on a device (`data_block_size` 0: ramfs)
+has its images read and written through the VFS whole.
 
 **A write into a hole grows the file a chunk at a time** (`CHUNK_BYTES`, 16
 MiB) -- or more: a hole that begins where the last growth ended is given
@@ -736,20 +736,13 @@ Each of these is left until a measurement or a need asks for it:
   journal, without extents or without metadata_csum, or with quotas, stays
   read-only, and the refused features stay refused (above).
 
-## nanofs, ramfs, procfs
+## ramfs, procfs
 
-nanofs (`src/crates/layers/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
-1024 inodes, 64 MiB of data, files up to 1 MiB, every write copy-on-write
-with the inode committed last. It predates ext2 write support and remains
-for what it is good at — a small, self-verifying store (`format nanofs`,
-`mount nanofs`, `scripts/mkfs_nanofs.py`) — and takes the whole file API,
-including writes at an offset and truncates, by rewriting the file. The
-mount reads the whole tree, by a walk with a stack of its own, so a tree as
-deep as the inodes allow reads back whole; a read checks the file's data
-against its checksum the first time after a mount or a write, not on every
-piece. Mounted read-only it writes nothing, not even the bitmap repair the
-mount makes of a reachable inode or block marked free. `format` and `mount`
-refuse a device smaller than the layout (69 MB) before touching it.
+nanofs, the kernel's own small checksummed filesystem from before ext2 could
+be written, is gone: ext4 and ext2 are what a disk carries. A disk an older
+kernel formatted with it is still known for what it is -- `blkload`'s write
+test asks for `force` there, and a device's contents (`diskimage`) name it
+-- but nothing mounts it.
 
 ramfs (`src/crates/layers/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
 layout puts on `/`, and what `test_vfs` exercises at every boot: a file is
@@ -808,7 +801,7 @@ middle, cut short, grown back, and a recursive remove. `fstest / 5M` at
 4 KiB blocks reaches the doubly-indirect blocks; the smoke tests get there at
 300 KiB by using 1 KiB blocks. And where the filesystem holds a sparse file
 that big at no cost but what is written (`FileSystem::sparse_max`: ext2,
-and not ramfs or nanofs, which pay for a file's whole size), a far file:
+and not ramfs, which pays for a file's whole size), a far file:
 grown past 5 GiB with holes, patches written across 2 and 4 GiB and twice
 past them -- under the triple indirect block, of 1 KiB blocks all of them --
 read back with the holes around them, cut in the middle of one and grown

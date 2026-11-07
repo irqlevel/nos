@@ -83,11 +83,8 @@ def shell_checks(sh):
         return None
 
     # The claim is the point: nothing else may write where the log goes.
-    refused = sh.run("format nanofs %s" % disk)
-    pt.check("nothing else may format the disk it claimed",
-             "in use by the disk log" in refused, refused)
     refused = sh.run("diskwrite %s 4 55" % disk)
-    pt.check("nor write to it raw",
+    pt.check("nothing else may write to the disk it claimed raw",
              "in use by the disk log" in refused, refused)
     refused = sh.run("mount ext2 %s /x" % disk)
     pt.check("nor mount it", "failed" in refused.lower(), refused)

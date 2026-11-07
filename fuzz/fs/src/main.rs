@@ -7,7 +7,7 @@
 //! never ends, a write where nothing may write, anywhere on the paths that
 //! read a disk, is one somebody else can cause. This program is the
 //! kernel's own crates -- `block` (the device table, the partition tables,
-//! the claims, the disk log) and `fs` (the VFS, ext2, nanofs, ramfs,
+//! the claims, the disk log) and `fs` (the VFS, ext2, ext4, ramfs,
 //! procfs, the file ABI, the shell's commands), over `kcore` and `ffi` as
 //! they are -- linked with the rest of a kernel written for the purpose
 //! (`machine`: the fuzzers' common one, and disks whose media are the
@@ -15,7 +15,7 @@
 //! that fail).
 //!
 //! Each target turns random bytes into disks -- images made from the
-//! format (`image`: ext2 and nanofs made and checked the way mke2fs and
+//! format (`image`: ext2 and ext4 made and checked the way mke2fs and
 //! e2fsck do it, partition tables, the disk log's area), and then damaged
 //! -- and into what the kernel is asked to do with them, and holds what
 //! comes of it to what the format and the layer's own documentation say:

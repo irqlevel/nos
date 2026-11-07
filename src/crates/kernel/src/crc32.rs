@@ -1,7 +1,7 @@
 //! The `crc32` shell command, which checks a file against its copy on the
 //! host (`python3 -c "import zlib,sys; print(hex(zlib.crc32(open(sys.argv[1],'rb').read())))" file`),
 //! over the tree's one CRC-32 (the `crc` crate) -- the CRC the partition
-//! tables, nanofs and the disk log are checked by.
+//! tables and the disk log are checked by.
 
 use core::fmt::Write;
 

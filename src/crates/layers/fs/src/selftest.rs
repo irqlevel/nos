@@ -1,8 +1,8 @@
 //! The filesystem self-test: what `fstest` runs from the shell, and what
 //! `fstest=on` runs over the root filesystem at boot.
 //!
-//! It uses nothing but the file API, so it is the same test over ext2,
-//! nanofs and ramfs alike -- and what it is really checking is that each of
+//! It uses nothing but the file API, so it is the same test over ext4,
+//! ext2 and ramfs alike -- and what it is really checking is that each of
 //! them means the same thing by a write at an offset, a truncate that grows,
 //! a rename across directories and a recursive remove. And one promise of
 //! the VFS's own, over a filesystem of the test's: a call held up on one
