@@ -596,6 +596,7 @@ dependencies = [
 name = "mod-cluster"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "ipcwire",
  "kcore",
  "kmod",
@@ -663,6 +664,18 @@ version = "0.1.0"
 dependencies = [
  "kcore",
  "kmod",
+]
+
+[[package]]
+name = "mod-nbs-mds"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "kcore",
+ "kmod",
+ "nbsmeta",
+ "raft",
+ "raftmember",
 ]
 
 [[package]]
@@ -958,6 +971,7 @@ dependencies = [
 name = "raftmember"
 version = "0.1.0"
 dependencies = [
+ "ipcwire",
  "kcore",
  "raft",
 ]

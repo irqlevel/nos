@@ -51,7 +51,7 @@ src/crates/   The Rust half, one cargo workspace, a directory an area: what the 
     hypervisor/  hv (the hypervisor -- its guests, their devices, and their switch with its DHCP server)
     mgmt/        api (the host API; docs/api.md)
     net/         sshd (an SSH server), netload (a UDP load test from either end), tlsbench (what TLS 1.3 costs this machine)
-    storage/     netblk (a disk served over UDP, zero-copy), blkload (a block I/O load test)
+    storage/     netblk (a disk served over UDP, zero-copy), blkload (a block I/O load test), nbs-mds (NBS's metadata service: the NBS cluster's members through raft over ipc, on raftmember; docs/nbs.md)
     tools/       edit (a text editor for an SSH session with a terminal)
     test/        hello; modtest, which the boot test loads; slowexit, an exit that takes its time; heapbench, what the kernel heap costs the Rust that allocates from it
   common/     The crates with no kernel in them and no unsafe (each `forbid`s it), by area: what a module, hvboot and the host's fuzzers link as they are, since a module is linked on its own and cannot link a layer

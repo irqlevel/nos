@@ -422,7 +422,7 @@ $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster
+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster nbs-mds
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]
@@ -458,7 +458,7 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/crates/base/kmod/module.ver $(FLAVOR_STAMP)
 	    --target $(RUST_TARGET) -p mod-$* --target-dir target/modules \
 	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
-	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/crates/target/modules/$(RUST_TARGET)/release/libmod_$*.a
+	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/crates/target/modules/$(RUST_TARGET)/release/libmod_$(subst -,_,$*).a
 	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); print a " " $$0 }' > $@.syms
 	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
 	@rm -f $@.elf $@.syms

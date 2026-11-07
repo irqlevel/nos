@@ -62,26 +62,7 @@ pub struct Known {
     pub keys: Vec<[u8; 32]>,
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
-
-pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    let b = text.as_bytes();
-    if b.len() != 2 * N {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (i, pair) in b.chunks(2).enumerate() {
-        let digit = |x: u8| (x as char).to_digit(16);
-        out[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
-    }
-    Some(out)
-}
+pub use codec::{hex, unhex};
 
 /// The member file, if there is one: None for a host in no cluster.
 pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
