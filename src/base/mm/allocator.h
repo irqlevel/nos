@@ -45,6 +45,13 @@ public:
 	   block costs. */
 	void* alloc_uninit(size_t size, ulong tag);
 
+	/* What an allocation of size takes of RAM: its pool's block with the
+	   pool's header in front of it, or the run of pages the page allocator
+	   hands out for it -- a power of two of them, every one backed. 0 for a
+	   size the heap refuses however much is free. What a caller counts
+	   (HeapUsage), worked out as alloc_block works it out. */
+	static size_t footprint(size_t size);
+
 	/* Give back to the page allocator what the heap keeps for its next
 	   allocations -- the pools' empty pages, then the freed blocks the page
 	   allocator holds mapped; whether there was any. Called without a spin
@@ -61,7 +68,7 @@ private:
 
 	static const u32 MAGIC = 0xCBDECBDE;
 
-	size_t log2(size_t size);
+	static size_t log2(size_t size);
 	bool log_by_size(size_t size, size_t& log);
 	/* zero_pages: whether a block past the pools comes back zeroed */
 	void* alloc_block(size_t size, ulong tag, bool zero_pages);

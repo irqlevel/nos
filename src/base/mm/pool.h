@@ -44,6 +44,13 @@ public:
     static void claim(void* ptr, ulong tag);
     static void mark_freed(void* ptr);
 
+    /* What a block of block_size takes of its page: the block, and the
+       header in front of it (Block) */
+    static constexpr size_t footprint(size_t block_size)
+    {
+        return block_size + sizeof(Block);
+    }
+
 private:
 
     using ListEntry = stdlib::ListEntry;

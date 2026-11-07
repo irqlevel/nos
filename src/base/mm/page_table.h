@@ -146,6 +146,10 @@ public:
     ulong virt_to_phys_locked(ulong virt_addr);
 
     ulong get_free_pages_count();
+    /* The fewest pages there have been free since the free list was built:
+       how near the machine has come to none, guests' frames and the huge
+       pool's reserve included */
+    ulong get_free_pages_lowest();
     ulong get_total_pages_count();
 
     ulong get_va_end();
@@ -531,6 +535,9 @@ private:
     stdlib::ListEntry free_pages_list_;
     stdlib::ListEntry zeroed_pages_list_;
     ulong free_pages_count_;
+    /* The least free_pages_count_ has been since setup_free_pages_list:
+       lowered where the count is, under Lock */
+    ulong free_pages_lowest_;
     ulong zeroed_pages_count_;
     ulong total_pages_count_;
 
