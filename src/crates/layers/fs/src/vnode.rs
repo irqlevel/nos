@@ -76,7 +76,7 @@ pub struct Node {
     pub data: Vec<u8>,
     /// A file's size; a directory's is 0
     pub size: usize,
-    /// The on-disk inode number (nanofs, ext2); 0 where there is none
+    /// The on-disk inode number (ext2, ext4); 0 where there is none
     pub ino: usize,
     /// Set on a directory once its entries are its children: the in-memory
     /// filesystems are born complete, ext2 reads a directory on first use.

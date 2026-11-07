@@ -33,11 +33,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 SECTOR = 512
-# The MBR disk holds a partition big enough for a nanofs (17409 blocks of
-# 4 KiB, fs/nanofs.h), so a filesystem can be mounted on it; both images are
-# sparse, so their size costs nothing.
+# The MBR disk's first partition carries an ext4 of PART_FS_MB, made on the
+# host as a root is (scripts/mkrootfs.sh), so a filesystem can be mounted on
+# it; both images are sparse, so their size costs nothing.
 MBR_DISK_MB = 128
 GPT_DISK_MB = 64
+PART_FS_MB = 64
+# Not "nos": root=auto takes the filesystem of that label, and none where two
+# carry it
+PART_FS_LABEL = "parttest"
 SHELL_PORT = 9100
 
 # The UDP shell's framing (scripts/udpsh.py)
@@ -240,19 +244,41 @@ def dump_bytes(out):
     return rows
 
 
-def mkrootfs(image, fstype="ext4"):
+def mkrootfs(image, fstype="ext4", label="nos", size_mb=64):
     """A root image of 64 MiB and 1 KiB blocks: ext4, as new installs get,
     or ext2, as the roots made before it are."""
-    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", "", "1024"],
-                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL, env=dict(os.environ, FSTYPE=fstype))
+    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, str(size_mb), "", "1024"],
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL,
+                   env=dict(os.environ, FSTYPE=fstype, LABEL=label))
+
+
+def copy_in(src, dst, lba):
+    """src's bytes into dst from sector lba on, its runs of zeros left as the
+    holes they are"""
+    chunk = 1 << 20
+    with open(src, "rb") as s, open(dst, "r+b") as d:
+        at = lba * SECTOR
+        while True:
+            data = s.read(chunk)
+            if not data:
+                break
+            if data.count(0) != len(data):
+                d.seek(at)
+                d.write(data)
+            at += len(data)
 
 
 def disks_of(tmp):
     root = os.path.join(tmp, "root.img")
     mbr = os.path.join(tmp, "mbr.img")
     gpt = os.path.join(tmp, "gpt.img")
+    part_fs = os.path.join(tmp, "part1.img")
     mkrootfs(root)
     mbr_image(mbr)
+    mkrootfs(part_fs, label=PART_FS_LABEL, size_mb=PART_FS_MB)
+    start, count, _type = MBR_PARTS[0]
+    assert PART_FS_MB * 1024 * 1024 <= count * SECTOR, "the ext4 is bigger than its partition"
+    copy_in(part_fs, mbr, start)
     gpt_image(gpt)
     return root, mbr, gpt
 
@@ -373,10 +399,8 @@ def shell_checks(sh, parts):
     # a filesystem mounted on the partition keeps writers off both.
     fs = disk + "1"
     sh.run("mkdir /mnt")
-    formatted = sh.run("format nanofs " + fs)
-    check("formatting %s" % fs, "error" not in formatted.lower(), formatted)
-    mounted = sh.run("mount nanofs %s /mnt" % fs)
-    check("mounting %s" % fs, "mounted" in mounted, mounted)
+    mounted = sh.run("mount ext4 %s /mnt" % fs)
+    check("mounting the ext4 on %s" % fs, "mounted ext4 on /mnt (rw)" in mounted, mounted)
 
     refused = sh.run("diskwrite %s %d 55" % (disk, parts[fs][0]))
     check("a write to the disk under a mounted partition is refused",
