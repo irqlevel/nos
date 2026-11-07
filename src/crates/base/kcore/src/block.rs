@@ -597,6 +597,76 @@ impl DiskQueue {
     pub fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if block::kernel_blockq_discard(self.q, offset, len) == 0 { Ok(()) } else { Err(Error::IoError) }
     }
+
+    /// `buf.len()` bytes from byte `offset` read through buffer `k`, a piece
+    /// at a time, each waited for: for a task that has nothing else in
+    /// flight on the queue. IoError for a request that failed, or was not
+    /// done within `timeout` -- its buffer the device's still.
+    pub fn read_wait(&self, k: usize, offset: u64, buf: &mut [u8], timeout: crate::time::Duration) -> Result<()> {
+        let piece = self.buffer_len();
+        let mut at = 0usize;
+        while at < buf.len() {
+            let n = (buf.len() - at).min(piece);
+            self.one(k, false, offset + at as u64, n, timeout)?;
+            let lent = self.lend(k).ok_or(Error::Busy)?;
+            buf[at..at + n].copy_from_slice(&lent[..n]);
+            at += n;
+        }
+        Ok(())
+    }
+
+    /// `data` written at byte `offset` through buffer `k`, as `read_wait`
+    /// reads. The device's write cache may hold it: `flush` makes it durable.
+    pub fn write_wait(&self, k: usize, offset: u64, data: &[u8], timeout: crate::time::Duration) -> Result<()> {
+        let piece = self.buffer_len();
+        let mut at = 0usize;
+        while at < data.len() {
+            let n = (data.len() - at).min(piece);
+            {
+                let mut lent = self.lend(k).ok_or(Error::Busy)?;
+                lent[..n].copy_from_slice(&data[at..at + n]);
+            }
+            self.one(k, true, offset + at as u64, n, timeout)?;
+            at += n;
+        }
+        Ok(())
+    }
+
+    /// The first `len` bytes of buffer `k`, as they are, written at byte
+    /// `offset` and waited for: for what is written again and again from
+    /// one buffer -- zeros -- with no copy each time.
+    pub fn write_wait_lent(&self, k: usize, offset: u64, len: usize, timeout: crate::time::Duration) -> Result<()> {
+        if len > self.buffer_len() {
+            return Err(Error::InvalidValue);
+        }
+        self.one(k, true, offset, len, timeout)
+    }
+
+    /// Buffer `k`'s request started and waited for.
+    fn one(&self, k: usize, write: bool, offset: u64, len: usize, timeout: crate::time::Duration) -> Result<()> {
+        if self.start(k, write, offset, len)? == Started::Done {
+            return Ok(());
+        }
+        self.kick();
+        let end = crate::time::boot_time_ns().saturating_add(timeout.as_nanos());
+        loop {
+            let mut ok = None;
+            self.reap(|done, good| {
+                if done == k {
+                    ok = Some(good);
+                }
+            });
+            match ok {
+                Some(true) => return Ok(()),
+                Some(false) => return Err(Error::IoError),
+                None => {}
+            }
+            if crate::time::boot_time_ns() >= end {
+                return Err(Error::IoError);
+            }
+            self.wait(crate::time::Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for DiskQueue {

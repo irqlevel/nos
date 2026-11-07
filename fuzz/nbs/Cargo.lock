@@ -67,8 +67,18 @@ version = "0.1.0"
 name = "nbs-fuzz"
 version = "0.1.0"
 dependencies = [
+ "nbscs",
  "nbsmeta",
+ "nbswire",
  "raft",
+]
+
+[[package]]
+name = "nbscs"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "nbsmeta",
 ]
 
 [[package]]
@@ -79,6 +89,15 @@ dependencies = [
  "ipcwire",
  "raft",
  "sha2",
+]
+
+[[package]]
+name = "nbswire"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "nbscs",
+ "nbsmeta",
 ]
 
 [[package]]

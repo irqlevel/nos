@@ -786,6 +786,31 @@ descriptor the panel builds the cluster's page of.
 `scripts/cluster-test.py` makes a cluster of three on `scripts/hub.py`'s
 LAN.
 
+## nbs-mds and nbs-cs
+
+NBS, the replicated block storage (docs/nbs.md), is two modules on every
+host of the cluster registry. `nbs-mds` (`src/crates/modules/storage/nbs-mds`)
+is its metadata service: a member on each host, through Raft over ipc --
+raftmember's, as cluster.ko's is -- of the NBS cluster's members, each host's
+chunk server and its devices, and the volumes. Its folder is /nbs/mds
+(`dir=` names another). `nbs-cs` (`src/crates/modules/storage/nbs-cs`) is the
+host's chunk server: it asks the host's mds which devices are its, takes them
+in with queues of its own, and serves the chunks on them. It takes no
+parameters, and is loaded after nbs-mds.
+
+```
+$ insmod /nbs-mds.ko
+$ insmod /nbs-cs.ko
+$ nbs init store                                   # the first host
+$ nbs host add b                                   # on a member: b, a host of the registry
+$ nbs devices add part:4f7661ab-...                # on each host: a device for its cs
+$ nbs volume create disk1 64
+$ nbs io write disk1 0 65536 0x5a                  # a volume's bytes, through the cs's
+$ nbscs                                            # the cs: its devices, what it served
+```
+
+`scripts/nbs-test.py` runs both on three hosts of `scripts/hub.py`'s LAN.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

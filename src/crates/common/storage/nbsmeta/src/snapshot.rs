@@ -18,7 +18,8 @@ use crate::pieces::Pieces;
 use crate::storage::*;
 use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX};
 
-const MAGIC: [u8; 4] = *b"NBM2";
+/* NBM3: chunks carry their incarnation */
+const MAGIC: [u8; 4] = *b"NBM3";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
 /// How much a digest asks of the stream at a time.
@@ -146,6 +147,7 @@ impl FrozenState {
                     w.u32(ch.set);
                     w.u16(ch.count);
                     w.u8(ch.flags);
+                    w.u32(ch.incarnation);
                 }
                 At::Chunks(end)
             }
@@ -363,7 +365,8 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
         let set = r.u32().ok_or(BAD)?;
         let count = r.u16().ok_or(BAD)?;
         let flags = r.u8().ok_or(BAD)?;
-        s.chunks.push(Chunk { set, count, flags });
+        let incarnation = r.u32().ok_or(BAD)?;
+        s.chunks.push(Chunk { set, count, flags, incarnation });
     }
     let n = r.u32().ok_or(BAD)? as usize;
     if n > VOLUMES_MAX {
@@ -416,6 +419,13 @@ impl State {
         {
             return Err(RestoreError("what is stored of no cluster"));
         }
+        /* The counters as applying keeps them: devices and volumes numbered
+           from 1, a digest no sooner than CHECK_EVERY. Without this a state
+           of no volumes and a next number of 0 passed, and its next volume
+           was numbered 0 (found by fuzz/nbs's meta target) */
+        if self.next_device == 0 || self.next_volume == 0 || self.next_check < crate::CHECK_EVERY {
+            return Err(RestoreError("a counter of the state's at a value applying never leaves it at"));
+        }
         let mut idents: Vec<&str> = Vec::new();
         let mut devices: Vec<u32> = Vec::new();
         for (i, c) in self.cs.iter().enumerate() {
@@ -458,6 +468,9 @@ impl State {
         let mut free = 0u64;
         for (i, ch) in self.chunks.iter().enumerate() {
             let n = named.get(i).copied().unwrap_or(0);
+            if ch.incarnation == 0 {
+                return Err(RestoreError("a chunk of incarnation 0, which none is"));
+            }
             if ch.is_free() {
                 if ch.count != 0 || n != 0 || ch.flags != CHUNK_FREE {
                     return Err(RestoreError("a free chunk in use"));

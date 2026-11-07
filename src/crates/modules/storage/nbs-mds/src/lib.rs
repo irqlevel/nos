@@ -14,15 +14,18 @@
 //!     nbs host replace <host>    on a member: a host that lost its state, back as a new member
 //!     nbs hosts                  every member: its incarnation, its vote, the leader
 //!     nbs                        this host's member: role, term, leader, what it applied
-//!     nbs devices add <id|name>  a device of this host's for its chunk server
+//!     nbs devices add <id|name> [wipe]   a device of this host's for its chunk server
 //!     nbs devices drain <id>     given no new chunks
 //!     nbs cs                     every host's chunk server: its devices and room
 //!     nbs volume create <name> <size> [host=<h>], delete <name>, resize <name> <size>
 //!     nbs volumes, nbs volume <name>
+//!     nbs io attach|write|read|flush|close|held|detach <volume> ...   its bytes, through the cs's (io.rs)
 //!
 //! The same is on the management bus as the `nbs` provider (provider.rs). A
-//! device is recorded, not yet written: the cs (N7) claims and formats what
-//! its host has in the metadata.
+//! device is recorded here, and written by its host's cs (nbs-cs.ko), which
+//! asks this host's mds -- this module's member -- what it is to take in, and
+//! whether a request it has not checked is the metadata's (member.rs).
+//! `nbs io` is a client of the cs's, for the shell and the tests.
 //!
 //! `compact=` is how many bytes of entries the log holds past its snapshot
 //! before it is compacted into a new one -- or the state's size, should that
@@ -49,6 +52,7 @@
 extern crate alloc;
 
 mod files;
+mod io;
 mod member;
 mod provider;
 mod store;
@@ -75,7 +79,7 @@ use raftmember::{KFiles, Locked};
 use files::Known;
 use member::{Lost, Offer, Shared, View};
 
-const HELP: &str = "nbs [init | host | hosts | devices | cs | volume | volumes] - NBS's metadata service";
+const HELP: &str = "nbs [init | host | hosts | devices | cs | volume | volumes | io] - NBS's metadata service";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const USAGE: &str = "usage: nbs                          this host's member: incarnation, role, leader, what it applied\n\
@@ -85,14 +89,20 @@ const USAGE: &str = "usage: nbs                          this host's member: inc
                      \x20                                 until it holds the log, then a voter while fewer than five vote\n\
                      \x20      nbs host remove <host>     <host>'s member out, for good\n\
                      \x20      nbs host replace <host>    <host>, which lost its state, back as a new member\n\
-                     \x20      nbs devices add <id|name>  a device of this host's for its chunk server\n\
+                     \x20      nbs devices add <id|name> [wipe]   a device of this host's for its chunk server: \
+                     with wipe,\n\
+                     \x20                                 even one with something else on it\n\
                      \x20      nbs devices drain <id>     given no new chunks\n\
                      \x20      nbs cs                     every host's chunk server: its devices and room\n\
                      \x20      nbs volumes                every volume\n\
                      \x20      nbs volume <name>          one, and which hosts hold its replicas\n\
                      \x20      nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G, T\n\
                      \x20      nbs volume delete <name>\n\
-                     \x20      nbs volume resize <name> <size>";
+                     \x20      nbs volume resize <name> <size>\n\
+                     \x20      nbs io write <volume> <offset> <bytes> <byte>   through the cs's; read <volume> \
+                     <offset> <bytes>,\n\
+                     \x20                                 attach <volume> [force], flush, close, held and detach \
+                     <volume>";
 pub(crate) const NO_MEMBER: &str = "this host is in no NBS cluster -- `nbs init <name>`, or `nbs host add <this host>` \
                                     on a member";
 
@@ -122,6 +132,8 @@ struct ModState {
     /// An `init` or an offer under way: the one at a time that may start a
     /// member.
     starting: AtomicBool,
+    /// The volumes `nbs io` attached here for writing.
+    io: Locked<io::Attachments>,
 }
 
 /// The right to start a member, held for an `init` or an offer.
@@ -204,6 +216,7 @@ fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn
         idle: Locked::new(None).ok_or(Error::NoMemory)?,
         idle_stop: AtomicBool::new(false),
         starting: AtomicBool::new(false),
+        io: Locked::new(BTreeMap::new()).ok_or(Error::NoMemory)?,
     });
     /* A member already: started over its log. None: the listener, for an
        offer. A member file that cannot be read: neither -- the host is said
@@ -303,6 +316,7 @@ fn idle_run((state, mb): (Arc<ModState>, Mailbox)) {
                 }
             }
             raftmember::TAG_RAFT => no_member(&mb, &m, &mut told),
+            nbswire::TAG_QUERY => no_mds(&mb, &m),
             _ => {}
         }
     }
@@ -327,6 +341,17 @@ fn no_member(mb: &Mailbox, m: &Message, told: &mut BTreeMap<String, u64>) {
     }
     told.insert(host, now);
     let _ = mb.send(m.from, member::TAG_NO_MEMBER, 0, &member::encode_id(&cluster, rm.to));
+}
+
+/// A question of this host's cs, while there is no member to answer it:
+/// answered so, rather than left to time out.
+fn no_mds(mb: &Mailbox, m: &Message) {
+    if m.from.host() != 0 {
+        return;
+    }
+    let Some(q) = nbswire::Query::decode(&m.data) else { return };
+    let told = nbswire::Told::Refused(nbswire::Refusal::NoMds);
+    let _ = mb.send(m.from, nbswire::TAG_TOLD, 0, &nbswire::Answered { id: q.id, told }.encode());
 }
 
 /// An offer taken, where it can be: this host's incarnation made, its
@@ -528,11 +553,16 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             let _ = writeln!(out, "nbs: {}'s member {} removed, and {} is member {} now", host, old, host, new);
             Ok(())
         }
-        ["devices", "add", word] => {
-            let (ident, slots, id) = store::device_add(state, word).map_err(|f| f.says())?;
-            let _ = writeln!(out, "nbs: device {} of this host's chunk server, {} -- device {} in the metadata; \
-                                   nothing is written to it before the cs (N7) takes it", ident,
-                             store::Mib(u64::from(slots) * u64::from(nbsmeta::CHUNK_MIB)), id);
+        ["devices", "add", word, rest @ ..] => {
+            let wipe = match rest {
+                [] => false,
+                ["wipe"] => true,
+                _ => return Err(String::from(USAGE)),
+            };
+            let (ident, slots, id, wiped) = store::device_add(state, word, wipe).map_err(|f| f.says())?;
+            let _ = writeln!(out, "nbs: device {} of this host's chunk server, {} -- device {} in the metadata{}; its \
+                                   cs takes it in", ident, store::Mib(u64::from(slots) * u64::from(nbsmeta::CHUNK_MIB)),
+                             id, if wiped { ", its first pages wiped" } else { "" });
             Ok(())
         }
         ["devices", "drain", ident] => {
@@ -578,6 +608,7 @@ fn run(state: &Arc<ModState>, args: &str, out: &mut Output) -> Result<(), String
             Ok(())
         }
         ["volume", name] => store::show_volume(&member_view(state)?, name, out),
+        ["io", rest @ ..] => io::run(state, rest, out),
         _ => Err(String::from(USAGE)),
     }
 }

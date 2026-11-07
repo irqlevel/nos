@@ -1,0 +1,20 @@
+[package]
+name = "mod-nbs-cs"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's chunk server on this host (plans/nbs.md, N7): the devices the
+# metadata gives this host's cs, each held with a queue of its own and run
+# by nbscs's engine, and the requests of NBS's clients served from them --
+# `nbs.cs`, on every host of the cluster -- each checked with this host's
+# mds where the cs has not checked it yet.
+[lib]
+name = "mod_nbs_cs"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+nbscs = { path = "../../../common/storage/nbscs" }
+nbswire = { path = "../../../common/storage/nbswire" }
+codec = { path = "../../../common/codec" }

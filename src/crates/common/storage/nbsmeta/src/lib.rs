@@ -424,7 +424,7 @@ impl StateMachine for State {
         let maps: u64 = self.volumes.iter().map(|v| v.map.len() as u64 * 4 + 160).sum();
         let cs: u64 = self.cs.iter().map(|c| 80 + c.devices.len() as u64 * 80).sum();
         128 + (self.members.len() + self.removed.len()) as u64 * 96 + cs + self.sets.len() as u64 * 23
-            + self.chunks.len() as u64 * 7 + maps
+            + self.chunks.len() as u64 * 11 + maps
     }
 
     fn freeze(&self) -> FrozenState {
