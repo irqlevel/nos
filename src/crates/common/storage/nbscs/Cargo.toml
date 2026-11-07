@@ -1,0 +1,18 @@
+[package]
+name = "nbscs"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's chunk server, as its devices hold it (plans/nbs.md, "The cs"; N7):
+# the format of a cs's device -- its superblock, the volumes' fences, the
+# table of slots kept twice, the 4 MiB slots -- and the cs's engine over a
+# device of the caller's: fences, open marks, reads, writes, flushes, the
+# chunks freed. No kernel in it and no unsafe: nbs-cs.ko runs it over its
+# devices' queues, nbs-mds.ko takes a device's slots from it, and fuzz/nbs's
+# cs target runs it over disks that lose and tear what they were not told to
+# flush.
+[lib]
+
+[dependencies]
+crc = { path = "../../crc" }
+nbsmeta = { path = "../nbsmeta" }
