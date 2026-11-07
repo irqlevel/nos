@@ -17,7 +17,6 @@
 #include "trace_ring.h"
 #include <hal/cpu.h>
 
-#include <lib/checksum.h>
 #include <lib/error.h>
 #include <lib/grub_env.h>
 #include <lib/stdlib.h>
@@ -1775,26 +1774,6 @@ stdlib::Error test_mem_routines()
     return make_success();
 }
 
-/* CRC-32 against the check value every implementation of it is held to, and
-   the streaming form fed in pieces against the whole */
-stdlib::Error test_crc32()
-{
-    static const char CHECK[] = "123456789";
-    static const u32 CHECK_CRC = 0xCBF43926;
-    const ulong len = sizeof(CHECK) - 1;
-
-    u32 whole = stdlib::crc32(CHECK, len);
-    u32 pieces = 0;
-    for (ulong at = 0; at < len; at += 2)
-        pieces = stdlib::crc32_update(pieces, CHECK + at, (len - at < 2) ? len - at : 2);
-    if (whole != CHECK_CRC || pieces != CHECK_CRC || stdlib::crc32(CHECK, 0) != 0)
-    {
-        klog(0, "test_crc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CHECK_CRC);
-        return make_error(stdlib::Error::UNSUCCESSFUL);
-    }
-    return make_success();
-}
-
 stdlib::Error test_sn_printf()
 {
     klog(0, "test_sn_printf: started");
@@ -2983,10 +2962,6 @@ stdlib::Error test()
         return err;
 
     err = test_mem_routines();
-    if (!err.ok())
-        return err;
-
-    err = test_crc32();
     if (!err.ok())
         return err;
 

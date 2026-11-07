@@ -22,8 +22,6 @@ extern crate alloc;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-#[path = "../../../src/crates/hvboot/src/crc32.rs"]
-mod crc32;
 #[path = "../../../src/crates/hvboot/src/gpt.rs"]
 mod gpt;
 #[path = "../../../src/crates/hvboot/src/ext.rs"]

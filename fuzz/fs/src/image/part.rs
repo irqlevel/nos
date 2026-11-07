@@ -2,7 +2,7 @@
 //! and what the kernel should register from a disk's first sectors, read
 //! the way `block`'s probe documents it -- and no other way.
 
-use kcore::crc32::crc32_update;
+use crc::crc32::update as crc32_update;
 
 use crate::machine::disk::Media;
 

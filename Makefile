@@ -182,7 +182,6 @@ CXX_SRC_x86_64 =   \
     src/base/lib/stdlib.cpp  \
     src/base/lib/format.cpp \
     src/base/lib/bitmap.cpp \
-    src/base/lib/checksum.cpp \
     src/base/lib/grub_env.cpp \
     src/base/lib/list_entry.cpp  \
     src/base/lib/error.cpp   \
@@ -259,7 +258,6 @@ CXX_SRC_aarch64 = \
     src/base/lib/format.cpp \
     src/base/lib/error.cpp \
     src/base/lib/bitmap.cpp \
-    src/base/lib/checksum.cpp \
     src/base/lib/grub_env.cpp \
     src/base/lib/list_entry.cpp \
     src/base/mm/memory_map.cpp \
@@ -306,10 +304,8 @@ RUST_LIB = $(RUST_LIB_$(ARCH))
 # source too -- a descriptor changed alone rebuilt nothing, and hv.ko went on
 # registering the one it was built with.
 RUST_SRC = $(shell find src/crates -path src/crates/target -prune -o \( -name '*.rs' -o -path '*/src/*' \) -type f -print) \
-    $(wildcard src/crates/Cargo.toml src/crates/Cargo.lock src/crates/*/Cargo.toml \
-        src/crates/drivers/*/Cargo.toml src/crates/modules/*/Cargo.toml \
-        src/crates/.cargo/config.toml \
-        src/crates/rust-toolchain.toml)
+    $(shell find src/crates \( -path src/crates/target -o -path src/crates/vendor \) -prune -o -name Cargo.toml -print) \
+    $(wildcard src/crates/Cargo.lock src/crates/.cargo/config.toml src/crates/rust-toolchain.toml)
 
 .PHONY: all check nocheck clean rust smoke modules image hvboot
 

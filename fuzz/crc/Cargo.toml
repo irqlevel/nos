@@ -1,0 +1,19 @@
+# The tree's CRCs (src/crates/common/crc) on the host: known answers, every
+# function held to the CRC computed from its definition a bit at a time, and
+# CRC-32 to zlib's (scripts/crc-test.py). Nothing but the crate itself, a
+# path of the tree's, so it builds offline.
+[package]
+name = "crc-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crc = { path = "../../src/crates/common/crc" }
+
+# Overflow checks on, as a RUSTUB=1 build has them.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]

@@ -18,7 +18,7 @@ src/base/
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, timers, the timekeeping seam (time.h), locks (spinlock, mutex, seqlock, rwlock), panic and backtrace, the dmesg ring buffer, the command line (parameters.cpp), the interactive shell (cmd.cpp) and its line editor (line_editor.cpp), the input layer (input.cpp), the boot self-tests (test.cpp), the module loader (module.cpp), the Rust FFI bridge (rust_ffi.cpp), the symbol table
   drivers/    Hardware: serial, the console (screen.cpp picks EGA text on BIOS or the 8x16-font pixel framebuffer under UEFI), PIT, HPET, RTC, the 8042 keyboard, PCI, MSI-X, ACPI. No virtio and no USB: both are Rust (src/crates/virtio, src/crates/drivers)
   mm/         Memory: 4-level page tables (the virt_to_phys walk, protect_range), the page allocator (fixed-size block allocators), the pool allocator, the VA allocator, new/delete
-  lib/        Freestanding stdlib equivalents (stdlib::): list, vector, ring buffer, bitmap, CRC32, formatting, errors and results, smart pointers. mem_set/mem_cpy/str_len and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
+  lib/        Freestanding stdlib equivalents (stdlib::): list, vector, ring buffer, bitmap, formatting, errors and results, smart pointers. mem_set/mem_cpy/str_len and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
   include/    Shared headers
 src/crates/
   ffi/        Raw extern "C" FFI declarations for kernel services

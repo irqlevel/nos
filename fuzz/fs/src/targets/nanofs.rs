@@ -9,8 +9,6 @@
 
 use std::collections::BTreeMap;
 
-use kcore::crc32::crc32_with_hole;
-
 use crate::image::nanofs::{self as img, ino, sb};
 use crate::machine::disk::{self, Media};
 use crate::model::{Data, Node};
@@ -240,7 +238,6 @@ fn damage(r: &mut Input, m: &mut Media, inodes: &[u32]) {
             }
         }
     }
-    let _ = crc32_with_hole;
 }
 
 pub fn nanofsbad(r: &mut Input) {

@@ -5,8 +5,9 @@ group of members that agree on one log, so that every member applies the same
 entries in the same order and none applied is lost while a majority of them
 lives. It is what the cluster's registry and NBS's metadata service are to
 run on ([plans/raft.md](../plans/raft.md)); nothing of nos is in it -- no
-kcore, no `unsafe`, no dependency -- so a module links it as it is and
-`fuzz/raft` runs it on the host.
+kcore, no `unsafe`, no dependency but the tree's own `crc` (the log's
+CRC32C) -- so a module links it as it is and `fuzz/raft` runs it on the
+host.
 
 ## Driving a member
 

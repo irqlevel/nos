@@ -19,6 +19,8 @@ block = { path = "../block" }
 fs = { path = "../fs" }
 net = { path = "../net" }
 hello = { path = "../hello" }
+# For the crc32 shell command and its check at boot.
+crc = { path = "../common/crc" }
 nvme = { path = "../drivers/nvme" }
 usb = { path = "../drivers/usb" }
 virtio-rng = { path = "../drivers/virtio_rng" }

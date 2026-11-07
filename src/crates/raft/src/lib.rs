@@ -42,7 +42,8 @@
 //! a node, a store and the user's state, with clients' sessions, reads and
 //! snapshots taken as the log grows.
 //!
-//! `no_std` with `alloc`, no `unsafe`, no dependency, and no allocation
+//! `no_std` with `alloc`, no `unsafe`, no dependency but the tree's `crc`
+//! (the log's CRC32C), and no allocation
 //! larger than the 512 KiB the kernel's heap gives at once, however long the
 //! log or busy the group: a list that grows with the log is kept in pieces,
 //! every batch is held to a count as well as to bytes, a message fits one
@@ -59,7 +60,6 @@ mod progress;
 mod raft_log;
 mod rand;
 
-pub mod crc32c;
 pub mod log;
 pub mod node;
 pub mod recover;

@@ -35,7 +35,6 @@ extern crate alloc;
 mod console;
 mod boot;
 mod bzimage;
-mod crc32;
 mod disk;
 mod ext;
 mod gpt;

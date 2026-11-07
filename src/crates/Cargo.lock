@@ -59,6 +59,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "block"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "events",
  "ffi",
  "kcore",
@@ -143,6 +144,10 @@ checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crc"
+version = "0.1.0"
 
 [[package]]
 name = "crypto-bigint"
@@ -303,6 +308,9 @@ dependencies = [
 [[package]]
 name = "extfmt"
 version = "0.1.0"
+dependencies = [
+ "crc",
+]
 
 [[package]]
 name = "ff"
@@ -341,6 +349,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "crc",
  "events",
  "extfmt",
  "ffi",
@@ -445,6 +454,7 @@ dependencies = [
 name = "hvboot"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "extfmt",
 ]
 
@@ -492,6 +502,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "block",
+ "crc",
  "events",
  "ffi",
  "fs",
@@ -925,6 +936,9 @@ dependencies = [
 [[package]]
 name = "raft"
 version = "0.1.0"
+dependencies = [
+ "crc",
+]
 
 [[package]]
 name = "rand"

@@ -39,7 +39,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::conf::MAX_MEMBERS;
-use crate::crc32c;
+use crc::crc32c;
 use crate::storage::{bootstrap_entries, MemStorage, RaftState, Storage, StorageError, BOOTSTRAP_TERM};
 use crate::types::{
     ConfState, Entry, HardState, NodeId, Snapshot, SnapshotBuilder, SnapshotData, SnapshotMeta, MAX_SNAPSHOT_BYTES,
@@ -185,7 +185,7 @@ fn le64(b: &[u8]) -> u64 {
 
 /// A record's CRC: over its length's bytes, then its payload.
 fn record_crc(payload: &[u8]) -> u32 {
-    crc32c::update(crc32c::crc32c(&(payload.len() as u32).to_le_bytes()), payload)
+    crc32c::update(crc32c::checksum(&(payload.len() as u32).to_le_bytes()), payload)
 }
 
 fn wal_header(seq: u64) -> [u8; WAL_HEADER] {
@@ -193,7 +193,7 @@ fn wal_header(seq: u64) -> [u8; WAL_HEADER] {
     h[..8].copy_from_slice(&WAL_MAGIC);
     h[8..12].copy_from_slice(&FORMAT.to_le_bytes());
     h[12..20].copy_from_slice(&seq.to_le_bytes());
-    let crc = crc32c::crc32c(&h[..20]);
+    let crc = crc32c::checksum(&h[..20]);
     h[20..].copy_from_slice(&crc.to_le_bytes());
     h
 }
@@ -598,7 +598,7 @@ impl<F: Files> DiskLog<F> {
         }
         let mut conf_bytes = vec![0u8; conf_len];
         if !self.read_exact(&name, SNAP_HEADER as u64, &mut conf_bytes, len)?
-            || crc32c::update(crc32c::crc32c(&h[..40]), &conf_bytes) != le32(&h[40..44])
+            || crc32c::update(crc32c::checksum(&h[..40]), &conf_bytes) != le32(&h[40..44])
         {
             return Err(LogError::Corrupt("a snapshot's header does not check"));
         }
@@ -835,7 +835,7 @@ impl<F: Files> DiskLog<F> {
         head.extend_from_slice(&snap.meta.term.to_le_bytes());
         head.extend_from_slice(&snap.data.len().to_le_bytes());
         head.extend_from_slice(&(conf.len() as u32).to_le_bytes());
-        let crc = crc32c::update(crc32c::crc32c(&head), &conf);
+        let crc = crc32c::update(crc32c::checksum(&head), &conf);
         head.extend_from_slice(&crc.to_le_bytes());
         head.extend_from_slice(&conf);
         self.io(|f| f.append(&tmp, &head))?;

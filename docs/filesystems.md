@@ -728,8 +728,9 @@ Each of these is left until a measurement or a need asks for it:
 - **Discard.** What a remove, a cut or a punch gives back is not discarded
   on the device: the block layer has no discard, and an SSD under a
   filesystem that grows and shrinks never hears of the free space.
-- **CRC32C by the CPU.** Every checksum is computed a byte at a time from
-  a table (`extfmt::crc`); arm64's CRC32C instructions and x86's SSE4.2
+- **CRC32C by the CPU.** Every checksum is computed in software, eight
+  bytes a step from tables made at compile time (the tree's `crc` crate,
+  which `extfmt::crc` names); arm64's CRC32C instructions and x86's SSE4.2
   `crc32` are not used.
 - **Writing what the installs do not make.** A filesystem without a
   journal, without extents or without metadata_csum, or with quotas, stays

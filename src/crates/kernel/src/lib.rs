@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod crc32;
 mod frames;
 mod one_event;
 mod ring;
@@ -46,6 +47,7 @@ pub extern "C" fn rust_init() {
     fs::init();
     net::init();
     sha256::init();
+    crc32::init();
     nvme::init();
     usb::init();
     virtio_rng::init();
@@ -142,6 +144,7 @@ pub extern "C" fn rust_test() {
     system::selftest();
     random::selftest();
     sha256::selftest();
+    crc32::selftest();
     frames::selftest();
     ring::selftest();
     trace::selftest();

@@ -29,7 +29,7 @@ pub const ALL: &[(&str, fn() -> Result<(), String>)] = &[
 /// vectors (B.4) -- 32 zeros, 32 ones, 32 bytes counting up and down -- each
 /// whole and carried on in two parts across every split.
 fn crc32c_known() -> Result<(), String> {
-    use raft::crc32c::{crc32c, update};
+    use crc::crc32c::{checksum as crc32c, update};
     let up: Vec<u8> = (0u8..32).collect();
     let down: Vec<u8> = (0u8..32).rev().collect();
     let cases: [(&[u8], u32); 5] = [

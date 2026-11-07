@@ -59,6 +59,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "block"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "events",
  "ffi",
  "kcore",
@@ -138,6 +139,10 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 [[package]]
 name = "cpufeatures"
 version = "0.2.17"
+
+[[package]]
+name = "crc"
+version = "0.1.0"
 
 [[package]]
 name = "crypto-bigint"
@@ -290,6 +295,9 @@ dependencies = [
 [[package]]
 name = "extfmt"
 version = "0.1.0"
+dependencies = [
+ "crc",
+]
 
 [[package]]
 name = "ff"
@@ -328,6 +336,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "crc",
  "events",
  "extfmt",
  "ffi",

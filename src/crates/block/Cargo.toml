@@ -15,3 +15,5 @@ mgmt = { path = "../mgmt" }
 # The events tasks wait on: a queue made on one signals it with its
 # completions, and holds it until the last of them is done.
 events = { path = "../events" }
+# GPT's and the disk log's CRC-32: the tree's one, with no kernel in it.
+crc = { path = "../common/crc" }

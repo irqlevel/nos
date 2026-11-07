@@ -6,7 +6,6 @@ pub mod barrier;
 mod callback;
 pub mod const_init;
 pub mod consts;
-pub mod crc32;
 pub mod error;
 pub mod klog;
 pub mod time;

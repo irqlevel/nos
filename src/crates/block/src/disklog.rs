@@ -41,7 +41,7 @@ use crate::disk::{self as block, Disk};
 use kcore::cmd::Output;
 use kcore::const_init::ConstInit;
 use kcore::cpu;
-use kcore::crc32::crc32_update;
+use crc::crc32::update as crc32_update;
 use kcore::dma::DmaBuffer;
 use kcore::once::Once;
 use kcore::static_ring::Mailbox;
