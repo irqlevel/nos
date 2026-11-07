@@ -11,6 +11,7 @@
 #include <kernel/panic.h>
 #include <kernel/klog.h>
 #include <kernel/time.h>
+#include <kernel/tracepoint.h>
 #include <hal/irqchip.h>
 
 /* Per-CPU scheduler tick over the ARM generic (virtual) timer: 100 Hz on
@@ -110,6 +111,12 @@ void GenericTimer::arm_self()
 
 void GenericTimer::local_tick(Context* ctx)
 {
+    /* Its records (tp::Irq), ended before the reschedule it ends in, as
+       x86's Cpu::timer_tick ends its own */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin((u32)timer_int_id_, tp::IrqKind::Timer);
+
     auto& cpus = CpuTable::get_instance();
     auto& cpu = cpus.get_current_cpu();
 
@@ -124,11 +131,19 @@ void GenericTimer::local_tick(Context* ctx)
         return;
     }
 
-    if (!cpu.local_timer_fired(get_boot_time().get_value()))
+    ulong now = get_boot_time().get_value();
+
+    /* How late it came, for its irq_exit: past the deadline it was armed
+       for, read before local_timer_fired arms it again */
+    if (unlikely(irq.timed()))
+        irq.late(cpu.local_timer_late(now));
+
+    if (!cpu.local_timer_fired(now))
     {
         /* A sleeper's deadline, not the tick: only the reschedule */
         InterruptStats::inc(IrqTimerWake);
         hal::irq_eoi((u8)timer_int_id_);
+        irq.end();
         preempt();
         return;
     }
@@ -153,6 +168,9 @@ void GenericTimer::local_tick(Context* ctx)
        (the IPI path does the same for the SGI). Preempt, not Schedule: a
        task that can still run is never handed over to the idle task. */
     hal::irq_eoi((u8)timer_int_id_);
+
+    /* Its irq_exit before the reschedule */
+    irq.end();
 
     preempt();
 }

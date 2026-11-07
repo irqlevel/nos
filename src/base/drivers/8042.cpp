@@ -6,6 +6,7 @@
 #include <kernel/klog.h>
 #include <arch/x86_64/asm.h>
 #include <kernel/interrupt.h>
+#include <kernel/tracepoint.h>
 #include <mm/memory_map.h>
 
 namespace kernel
@@ -64,6 +65,10 @@ void IO8042::read_data()
 void IO8042::interrupt(Context* ctx)
 {
     (void)ctx;
+    /* Its records (tp::Irq), the handler done as this returns */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin((u32)int_vector_, tp::IrqKind::Kbd);
 
     interrupt_counter_.inc();
     read_data();

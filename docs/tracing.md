@@ -607,6 +607,156 @@ its CPU up to another is in the records: `trace on mm`, then `trace show
 mm_zero` -- or `trace show mm_zero end=busy` for the batches another task cut
 short. A batch that zeroed nothing is no record.
 
+## The interrupts' events
+
+Group `irq`, the hardware interrupts, recorded where each architecture's
+dispatch takes one ([Interrupts](interrupts.md)); group `softirq`, the work
+their handlers put off, recorded by `kernel/softirq.cpp`:
+
+| event | what it records |
+|---|---|
+| `irq_entry` | an interrupt taken: its `vector` -- x86's; the INTID on arm64 -- its `kind`, and the `pid` of the task it landed on, whose time it takes (its CPU's idle task when it had nothing to run) |
+| `irq_exit` | its handler done: the same three, how long the handler took (`ns`, from the entry), and for the local timer how far past the deadline it was armed for the interrupt was taken (`late_ns`; 0 for any other kind, whose raise is a device's and unseen) |
+| `softirq_raise` | a soft IRQ raised for its CPU's softirq task: its `type` (`net_rx`, `blk_io`, `net_tx`) and what the raise did (`how`): joined a run already owed (`pending`), left to the softirq task because it is the one running there -- its handler asking for another pass, or an interrupt that landed on it (`running`) -- woke the task and kicked its CPU (`kicked`), or found no task to run it (`none`, before they are made or once they are stopped) |
+| `softirq_entry` | a type's handler about to run on the softirq task: how long the work waited for it (`wait_ns`), from the raise that made the type pending; 0 when that raise was not timed |
+| `softirq_exit` | that handler done: how long it ran (`ns`) -- a preemption of the task in it counted in, which the scheduler's events show -- and whether it was raised again meanwhile (`again`), so that the task's loop runs it again |
+
+The `kind` says where the dispatch took it:
+
+| kind | what | x86 | arm64 |
+|---|---|---|---|
+| `timer` | this CPU's local timer: its tick, or a sleeper's deadline | vector 0xFD | the timer's PPI (27) |
+| `ipi` | another CPU's interrupt -- a wakeup's reschedule, queued work, a TLB shootdown -- or a soft IRQ's kick to its own CPU | 0xFE | SGI 1 |
+| `msi` | a device's message-signalled interrupt | MSI-X, 0x40 on | an LPI, 8192 on |
+| `line` | a device's line | a driver's INTx, 0x38-0x3F | a GIC SPI |
+| `shared` | a line several drivers' handlers share | the first in service | -- |
+| `pit`, `hpet` | the boot CPU's timekeeping | 0x20 | -- |
+| `kbd`, `serial` | the 8042, the UART | 0x21, 0x24 | -- |
+| `posted` | a posted interrupt's notification that found its vCPU out of its guest | 0xFC | -- |
+| `stray`, `spurious` | a vector or INTID no handler has; the controller's "nothing" | the vector's own, 0xFF | its INTID |
+
+Each record says enough alone. An exit carries its handler's time, its
+kind and vector and the task it took the time from: `trace on irq_exit`
+alone is the cheap way to have them, one record an interrupt. A soft IRQ's
+entry carries the deferred work's wait for its task -- the time from the
+interrupt that raised it to the handler, the latency the soft IRQ adds --
+and its exit the handler's run:
+
+```
+> trace on irq softirq
+> trace show 20 irq_exit kind=timer        # every CPU's tick, and how late it came
+> trace show 20 irq_exit kind=msi          # the devices' interrupts and their handlers' time
+> trace show softirq_entry type=net_rx     # how long received frames waited for their task
+> trace on sched
+> trace dump 2000 irq softirq sched        # and on the host, trace-decode.py --irq
+```
+
+`trace-decode.py --irq` reads them back: each kind and vector's count and
+its handlers' p50, p99 and most, each CPU's share of the window's time in
+handlers, how late the local timer's interrupts came, and the tasks the
+interrupts took their time from; each soft IRQ's runs, waits and raises.
+Here an arm64 boot under HVF, four CPUs, a `sched probe` and the UDP shell's
+own datagrams, every CPU's part dumped in turn from frozen rings:
+
+```
+irq: 359 interrupts on 4 cpus, 0.17% of their time in handlers
+  kind        vector   count   handler                                     in all
+  timer         0x1b     251   p50 1.5us p99 11.4us max 27.4us            730.0us
+  line          0x4e      22   p50 5.8us p99 15.1us max 27.5us            189.2us
+  ipi            0x1      86   p50 1.1us p99 12.7us max 13.0us            144.0us
+  cpu 0: 61 interrupts, 336.9us in handlers, 0.22% of 156.23ms
+  ...
+  the local timer, past the deadline it was armed for: p50 3.5us p99 2.01ms max 2.23ms (251)
+softirq: 44 handler runs, 0.01% of the cpus' time
+  type      runs   waited for its task                   ran                                       in all  again
+  net_rx      22   p50 6.2us p99 16.1us max 26.3us       p50 958ns p99 13.7us max 17.6us           80.0us      0
+  net_tx      22   p50 9.4us p99 26.3us max 28.6us       p50 41ns p99 83ns max 166ns                1.2us      0
+  raises of net_rx: 22 -- 22 kicked
+```
+
+-- the virtio-net card's line, whose handler's reads and writes of its
+registers each exit to the hypervisor, 5.8 us; a tick 3.5 us late at the
+median and 2 ms at the 99th percentile, those of CPUs halted in WFI, which
+HVF wakes late; a received frame's work 6.2 us from the interrupt's raise to
+its handler: the rest of the card's handler, the kick's IPI to its own CPU
+and the switch to `softirq/0`, which `trace show` has in that order:
+
+```
+    3.192663  0 softirq_raise: type=net_rx how=kicked
+    3.192664  0 softirq_raise: type=net_tx how=kicked
+    3.192669  0 softirq_entry: type=net_rx wait_ns=6.125us
+    3.192673  0 softirq_exit: type=net_rx ns=4.166us again=0
+    3.192673  0 softirq_entry: type=net_tx wait_ns=9.375us
+```
+
+With the scheduler's records beside them it says what the interrupts and
+the soft IRQs did to the tasks: of each of the longest waits for a CPU, how
+much was that CPU's interrupts' handlers, and how much its softirq task's
+runs -- which the interrupts inside them are counted in too:
+
+```
+  the longest waits for a CPU, and what of them was its interrupts and its softirq task:
+       17.9us pid 10 udpsh (cpu 2 -> 2): interrupts 1.5us (1), softirq 0ns (0)
+       14.0us pid 10 udpsh (cpu 2 -> 2): interrupts 1.2us (1), softirq 0ns (0)
+```
+
+-- the shell's task woken onto an idle CPU, its wait the wakeup's IPI
+reaching a CPU halted in WFI, not that CPU's work. Its Chrome trace has,
+under each CPU's track, a row of its interrupts and one of its soft IRQs.
+
+Where each sits, and why there. On x86 each IDT stub's C entry --
+`ip_interrupt`, `lapic_timer_interrupt`, `posted_interrupt`,
+`dispatch_rust_msix`, `dispatch_rust_interrupt`, the shared dispatch, the
+PIT's, the HPET's, the 8042's and the serial port's `interrupt()`,
+`dummy_interrupt_dispatch` and `spurious_interrupt`; on arm64 the loop of
+`arm_irq_entry` -- each INTID it acknowledges, its LPIs', its lines', a
+stray or spurious one -- but for the IPI, which is `ip_interrupt`'s on both,
+and the timer, `GenericTimer::local_tick`'s. The site is a `tp::Irq` on the
+entry's stack (`kernel/tracepoint.h`), whose exit is written as it goes out
+of scope -- past the EOI -- or before then: the IPI's and the timer's
+handlers end in `preempt()`, which may switch to another task and come back
+to this one only later, so `Cpu::ipi`, `Cpu::timer_tick` and `local_tick`
+end the record before it. The reschedule is the scheduler's to record. The
+exit's `ns` costs the handler no read of the counter: the entry's stamp's
+low half is the field (`Kind::Since`), right for any handler under 2^32
+cycles. The task the interrupt landed on is the one whose stack it runs on
+-- every interrupt here does -- as a wakeup's waker is found. `late_ns` is
+what cyclictest measures, with no task in it: how far past the deadline its
+CPU took the timer's interrupt, read before the interrupt arms the timer
+again -- interrupts off, a deep idle's exit, a hypervisor's delivery.
+
+A soft IRQ's wait is counted from a stamp the raise that made the type
+pending writes, per CPU and type, while `softirq_entry` is on; the run that
+takes the type reads it -- while the bit is still up, when no raise writes
+one -- and zeroes it whether the event is on or not, so that no stamp
+outlives its pending. A raise that finds the type pending leaves the stamp
+that is there, and one that wrote a stamp and then lost the bit to another
+-- an interrupt's raise, landing between a task's look and its bit -- takes
+its own back: the run says it was not timed, rather than a wait from a
+stamp of its own. A raise is recorded before the hand-off: from the
+softirq task's wakeup on, its handler may run, and its entry must come
+after.
+
+What they cost when off was counted in the code, as `switch_to`'s was
+above, from the objects of the build before them and after, both
+architectures, function by function. A site on x86 is the entry's frame
+for its `tp::Irq` and four stores zeroing it, the flags' address, the two
+flags' bytes or'ed and a branch, and the destructor's byte compared and a
+branch: thirteen instructions on an MSI-X interrupt's path
+(`dispatch_rust_msix`), its slot's handler still in line in it; fourteen on
+the IPI's and the local timer's entries, which hand the scope on, and three
+more in `Cpu::ipi` and five in `Cpu::timer_tick` -- the scope's reference
+kept, its end's look, and the timer's look at whether the exit is timed.
+On arm64 the flags' address is the loop's, loaded once: each interrupt
+`arm_irq_entry` takes pays three stores, two loads, an `orr`, a `cbnz`, and
+the destructor's load and `cbz` -- nine instructions. A soft IRQ's raise is
+a flag's load and a branch for the stamp, a register cleared, and a flag's
+load and a branch for its record on whichever way it goes out; a run, a
+flag's load and a branch, the stamp zeroed, and a branch on the two flags
+before its handler. On, an interrupt is two records (`trace bench`'s cost
+of one, above), the task's lookup and a read of the counter; `irq_exit`
+alone is one record.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in
@@ -690,6 +840,26 @@ too.
   peer taking SACK or not, losing and reordering -- the machine's
   `kernel_tp_record` holding each record to its description, an
   enumeration's value one it names and every pad zero.
+- The interrupts' and the soft IRQs' events: `trace-test.py` turns them on
+  over a probe and the shell's own datagrams and holds what it reads back
+  to what the kernel did -- every kind one it has and every interrupt
+  landed on a task; per CPU each exit after its entry, the same vector and
+  kind, none inside another; no exit's `ns` past the distance from its
+  entry, and nine in ten of them that distance less the entry record's
+  tail; the local timer's interrupts on every CPU, each `late_ns` under a
+  second and some of them late; a device's interrupt, a line's or an
+  MSI's; per CPU each soft IRQ's exit after its entry; each receive run's
+  `wait_ns` reaching back to the raise that made the type pending, which
+  is recorded before the run; a filter by an interrupt's kind; and
+  `trace-decode.py --irq` reading the dump. `trace-decode.py --selftest`
+  holds the report to a made-up window -- a task woken halfway through the
+  softirq task's run, its wait split into the CPU's interrupts and that
+  run from the wakeup on, and an idle CPU's one interrupt a share of the
+  window's whole stretch. Controls: the share of a wait counted without
+  clipping to it, an exit with no time taken as an interrupt of none, and a
+  CPU's share of its own records' span, each fail it. `trace-test.py
+  --arch x86_64`, where grub-mkrescue is, holds x86-64's interrupts to the
+  same phase.
 - A window's field filters: `cpp-fuzz.py --target tracewin` gives a quarter
   of its windows one or two -- a record's bytes at an offset and a size of
   its event's payload, and now and then a field of another event, at some

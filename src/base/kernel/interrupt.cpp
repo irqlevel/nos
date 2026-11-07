@@ -3,6 +3,7 @@
 #include "cpu.h"
 #include "irq_balance.h"
 #include "klog.h"
+#include "tracepoint.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
 #include <hal/irq_stubs.h>
@@ -136,6 +137,21 @@ void Interrupt::register_level(InterruptHandler& handler, u8 irq, u8 vector)
 
 void Interrupt::shared_dispatch(Context* ctx)
 {
+    /* Its records (tp::Irq), by the first of the shared vectors in service
+       -- which the loop below finds again: looked for only when they are on,
+       an ISR read a shared vector */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+    {
+        u32 vector = 0;
+        for (ulong v = 0; v < MAX_VECTORS && vector == 0; v++)
+        {
+            if (vectors_[v].handler_count > 1 && hal::irq_is_in_service((u8)v))
+                vector = (u32)v;
+        }
+        irq.begin(vector, tp::IrqKind::Shared);
+    }
+
     InterruptStats::inc(IrqShared);
 
     for (ulong v = 0; v < MAX_VECTORS; v++)

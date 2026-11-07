@@ -39,8 +39,17 @@ disk fs`) are read too, with `--hv` for them alone:
   coming for it (to `blk_complete`); the image's synchronous path and its
   conversions, ext4's commits.
 
+The interrupts' records (`trace on irq softirq`) are read too, with `--irq`
+for them alone: what each kind and vector of interrupt took, each CPU's
+share of its time in handlers, how late the local timer's interrupts came,
+which tasks they took the time from; each soft IRQ's runs, how long the work
+waited for its task and how long its handler ran, what its raises did; and,
+with the scheduler's records beside them, how much of each of the longest
+waits for a CPU was that CPU's interrupts and its softirq task. An exit says
+its handler's time alone, so none is paired with its entry.
+
 Usage: scripts/trace-decode.py [--chrome FILE] [--json FILE] [--latency]
-                               [--hv] [--cpu N] [FILE...]
+                               [--hv] [--irq] [--cpu N] [FILE...]
        scripts/trace-decode.py --selftest
 
 Reads stdin when no file is named. Exit code 0 when it read at least one
@@ -51,15 +60,20 @@ makes up, whose answers are known -- what no live gate reaches among them
 
 import argparse
 import bisect
+import contextlib
+import io
 import json
 import sys
 
 # Chrome's clock is microseconds, and its tracks are named by a process id:
 # one per CPU, past the pids a kernel task has; one per vCPU, by its task's
-# pid; one per guest disk.
+# pid; one per guest disk. A CPU's interrupts and its soft IRQs are rows of
+# its track, by a thread id each.
 CHROME_PID_BASE = 1000
 CHROME_VCPU_BASE = 100000
 CHROME_DISK_BASE = 200000
+CHROME_IRQ_TID_BASE = 300000
+CHROME_SOFTIRQ_TID_BASE = 400000
 
 
 def objects(lines):
@@ -100,7 +114,8 @@ def window_start(lines):
 
 def latencies(recs, start):
     """Every wakeup a switch answered, from `start` on: (ns, pid, comm,
-    woken_cpu, ran_cpu) each, and how many were answered, are still
+    woken_cpu, ran_cpu, switched) each -- `switched` the answering switch's
+    time, where the wait ends -- and how many were answered, are still
     waiting, and were woken again before any switch to them."""
     waiting = {}
     waits = []
@@ -122,7 +137,7 @@ def latencies(recs, start):
             pid = f.get("next_pid")
             if pid in waiting:
                 t0, woken_cpu = waiting.pop(pid)
-                waits.append((r["t"] - t0, pid, f.get("next_comm", "?"), woken_cpu, r["cpu"]))
+                waits.append((r["t"] - t0, pid, f.get("next_comm", "?"), woken_cpu, r["cpu"], r["t"]))
     return waits, len(waits), len(waiting), superseded
 
 
@@ -189,7 +204,7 @@ def summarize(recs, start):
         print(f"  wait: {answered} wakeups answered, {pending} not run in the window -- "
               f"p50 {ns_text(percentile(waits_ns, 50))} p90 {ns_text(percentile(waits_ns, 90))} "
               f"p99 {ns_text(percentile(waits_ns, 99))} max {ns_text(waits_ns[-1])}")
-        for ns, pid, comm, woken_cpu, run_cpu in sorted(waits, reverse=True)[:5]:
+        for ns, pid, comm, woken_cpu, run_cpu, _ in sorted(waits, reverse=True)[:5]:
             print(f"    {ns_text(ns):>9} pid {pid} {comm} (cpu {woken_cpu} -> {run_cpu})")
     elif pending:
         print(f"  wait: no wakeup of the window was followed by its switch ({pending} still waiting)")
@@ -551,11 +566,183 @@ def hv_summary(recs, start):
         print(f"  {d['stray']} records whose request is not in the window")
 
 
+# ---- the interrupts' and the soft IRQs' records (groups irq, softirq) ----
+
+def interrupts(recs, start):
+    """Every interrupt the window's irq_exit records, from `start` on: (cpu,
+    began, ended, vector, kind, pid, late_ns) each -- the exit's `ns` is its
+    handler's time from the entry -- and how many exits had none (the event
+    turned on while the handler ran). An exit says it all: no entry is
+    needed to pair it with."""
+    out = []
+    untimed = 0
+    for r in recs:
+        if r["ev"] != "irq_exit" or r["t"] < start:
+            continue
+        f = r.get("f", {})
+        ns = f.get("ns", 0)
+        if ns <= 0:
+            untimed += 1
+            continue
+        out.append((r["cpu"], r["t"] - ns, r["t"], f.get("vector", 0), f.get("kind", "?"), f.get("pid"),
+                    f.get("late_ns", 0)))
+    return out, untimed
+
+
+def softirqs(recs, start):
+    """The soft IRQs' records from `start` on: each handler's run (cpu,
+    began, ended, type, again) from its softirq_exit, each run's wait for its
+    task (cpu, type, wait_ns) from its softirq_entry, the raises by (type,
+    what the raise did), and how many entries had no wait timed."""
+    runs, waits, raises = [], [], {}
+    untimed = 0
+    for r in recs:
+        if r["t"] < start:
+            continue
+        f = r.get("f", {})
+        ev = r["ev"]
+        if ev == "softirq_exit":
+            runs.append((r["cpu"], r["t"] - f.get("ns", 0), r["t"], f.get("type", "?"), f.get("again", 0)))
+        elif ev == "softirq_entry":
+            if f.get("wait_ns", 0) > 0:
+                waits.append((r["cpu"], f.get("type", "?"), f["wait_ns"]))
+            else:
+                untimed += 1
+        elif ev == "softirq_raise":
+            key = (f.get("type", "?"), f.get("how", "?"))
+            raises[key] = raises.get(key, 0) + 1
+    return runs, waits, raises, untimed
+
+
+def covered(spans, cpu, t0, t1):
+    """How much of [t0, t1] on `cpu` the spans -- (cpu, began, ended, ...)
+    each -- cover, and how many of them reach into it."""
+    total, n = 0, 0
+    for s in spans:
+        if s[0] != cpu:
+            continue
+        lo, hi = max(s[1], t0), min(s[2], t1)
+        if hi > lo:
+            total += hi - lo
+            n += 1
+    return total, n
+
+
+def cpu_windows(recs, start):
+    """Each CPU's stretch of the window: every CPU's the same -- from
+    `start`, from which on no CPU's part lacks a record (the first record of
+    all when nothing was cut), to the newest record of all, where the dump
+    was taken. A CPU with no record in some of it had nothing happen there:
+    an idle CPU's records reach back further than a busy one's, not less
+    far."""
+    times = [r["t"] for r in recs]
+    if not times:
+        return {}
+    lo = start if start > 0 else min(times)
+    hi = max(times)
+    return {cpu: (lo, hi) for cpu in {r["cpu"] for r in recs}}
+
+
+def task_names(recs):
+    """A pid's name, from whatever record names it: a switch's two, a
+    wakeup's, a block's, a new task's."""
+    names = {}
+    for r in recs:
+        f = r.get("f", {})
+        for pid_key, comm_key in (("pid", "comm"), ("prev_pid", "prev_comm"), ("next_pid", "next_comm")):
+            if pid_key in f and comm_key in f:
+                names[f[pid_key]] = f[comm_key]
+    return names
+
+
+def irq_summary(recs, start):
+    """The interrupts' and the soft IRQs' records, said: what `--irq` prints,
+    and the summary after the scheduler's when there are any. What they took
+    -- of each CPU's time, from which task -- and, with the scheduler's
+    records beside them, how much of a woken task's wait for its CPU was that
+    CPU's interrupts and its softirq task."""
+    since = start or 0
+    irqs, untimed = interrupts(recs, since)
+    runs, waits, raises, wait_untimed = softirqs(recs, since)
+    windows = cpu_windows(recs, since)
+    span_all = sum(hi - lo for lo, hi in windows.values())
+    names = task_names(recs)
+
+    if irqs or untimed:
+        total = sum(t1 - t0 for _, t0, t1, *_ in irqs)
+        share = f", {100.0 * total / span_all:.2f}% of their time in handlers" if span_all > 0 else ""
+        lost = f" ({untimed} not timed)" if untimed else ""
+        print(f"irq: {len(irqs)} interrupts on {len({c for c, *_ in irqs})} cpus{share}{lost}")
+        rows = {}
+        for cpu, t0, t1, vector, kind, pid, late in irqs:
+            rows.setdefault((kind, vector), []).append(t1 - t0)
+        print(f"  {'kind':<10}{'vector':>8}{'count':>8}   {'handler':<40}{'in all':>10}")
+        for (kind, vector), times in sorted(rows.items(), key=lambda kv: -sum(kv[1])):
+            print(f"  {kind:<10}{vector:>#8x}{len(times):>8}   {spread(times):<40}{ns_text(sum(times)):>10}")
+        for cpu in sorted(windows):
+            lo, hi = windows[cpu]
+            mine = [(max(t0, lo), t1) for c, t0, t1, *_ in irqs if c == cpu]
+            if not mine:
+                continue
+            took = sum(t1 - t0 for t0, t1 in mine)
+            share = f", {100.0 * took / (hi - lo):.2f}% of {ns_text(hi - lo)}" if hi > lo else ""
+            print(f"  cpu {cpu}: {len(mine)} interrupts, {ns_text(took)} in handlers{share}")
+        lates = [late for _, _, _, _, kind, _, late in irqs if kind == "timer"]
+        if lates:
+            print(f"  the local timer, past the deadline it was armed for: {spread(lates)} ({len(lates)})")
+        taken = {}
+        for _, t0, t1, _, _, pid, _ in irqs:
+            n, ns = taken.get(pid, (0, 0))
+            taken[pid] = (n + 1, ns + t1 - t0)
+        top = sorted(taken.items(), key=lambda kv: -kv[1][1])[:5]
+        # A pid's name where a record of the scheduler's says it
+        named = lambda pid: f"{names[pid]} (pid {pid})" if pid in names else f"pid {pid}"
+        text = ", ".join(f"{named(pid)} {ns_text(ns)} in {n}" for pid, (n, ns) in top)
+        print(f"  the tasks they landed on, by the time they took: {text}")
+
+    if runs or waits or raises:
+        ran = sum(t1 - t0 for _, t0, t1, *_ in runs)
+        share = f", {100.0 * ran / span_all:.2f}% of the cpus' time" if span_all > 0 else ""
+        lost = f" ({wait_untimed} runs' waits not timed)" if wait_untimed else ""
+        print(f"softirq: {len(runs)} handler runs{share}{lost}")
+        types = sorted({t for _, _, _, t, _ in runs} | {t for _, t, _ in waits})
+        print(f"  {'type':<8}{'runs':>6}   {'waited for its task':<38}{'ran':<38}{'in all':>10}{'again':>7}")
+        for typ in types:
+            mine = [r for r in runs if r[3] == typ]
+            waited = [w for _, t, w in waits if t == typ]
+            again = sum(1 for r in mine if r[4])
+            print(f"  {typ:<8}{len(mine):>6}   {spread(waited):<38}{spread([t1 - t0 for _, t0, t1, _, _ in mine]):<38}"
+                  f"{ns_text(sum(t1 - t0 for _, t0, t1, _, _ in mine)):>10}{again:>7}")
+        by_type = {}
+        for (typ, how), n in raises.items():
+            by_type.setdefault(typ, {})[how] = n
+        for typ, hows in sorted(by_type.items()):
+            text = ", ".join(f"{n} {how}" for how, n in sorted(hows.items(), key=lambda kv: -kv[1]))
+            print(f"  raises of {typ}: {sum(hows.values())} -- {text}")
+
+    # What a woken task's wait for its CPU was made of: the interrupts its
+    # CPU took meanwhile, and its softirq task's runs -- which the
+    # interrupts inside them are counted in too.
+    if start is None or not (irqs or runs):
+        return
+    waited, answered, _, _ = latencies(recs, start)
+    if not answered:
+        return
+    print("  the longest waits for a CPU, and what of them was its interrupts and its softirq task:")
+    for ns, pid, comm, woken_cpu, run_cpu, end in sorted(waited, reverse=True)[:5]:
+        in_irq, n_irq = covered(irqs, run_cpu, end - ns, end)
+        in_soft, n_soft = covered(runs, run_cpu, end - ns, end)
+        print(f"    {ns_text(ns):>9} pid {pid} {comm} (cpu {woken_cpu} -> {run_cpu}): "
+              f"interrupts {ns_text(in_irq)} ({n_irq}), softirq {ns_text(in_soft)} ({n_soft})")
+
+
 def chrome(recs, path):
     """Chrome's trace format: a slice a (switch in, switch out) pair, an
-    instant event for a wakeup, a block or a migration; and for the
-    hypervisor a track a vCPU, its time in the guest and each exit's out of
-    it, and a guest disk's requests as slices of their own."""
+    instant event for a wakeup, a block or a migration; for the hypervisor
+    a track a vCPU, its time in the guest and each exit's out of it, and a
+    guest disk's requests as slices of their own; and under each CPU's
+    track a row of its interrupts' handlers and one of its soft IRQs'
+    runs."""
     events = []
     open_at = {}
     for r in recs:
@@ -591,6 +778,28 @@ def chrome(recs, path):
         pid = CHROME_PID_BASE + cpu
         events.insert(0, {"name": "process_name", "ph": "M", "pid": pid, "tid": pid,
                           "args": {"name": f"cpu {cpu}"}})
+
+    # Under each CPU's track, a row of its interrupts' handlers and one of
+    # its soft IRQs' runs: the time each took from what the row above ran.
+    irqs, _ = interrupts(recs, 0)
+    for cpu, t0, t1, vector, kind, task_pid, late in irqs:
+        pid = CHROME_PID_BASE + cpu
+        events.append({"name": f"{kind} {vector:#x}", "cat": "irq", "ph": "X", "ts": t0 / 1000.0,
+                       "dur": (t1 - t0) / 1000.0, "pid": pid, "tid": CHROME_IRQ_TID_BASE + cpu,
+                       "args": {"landed_on": task_pid, "late_ns": late}})
+    runs, _, _, _ = softirqs(recs, 0)
+    for cpu, t0, t1, typ, again in runs:
+        pid = CHROME_PID_BASE + cpu
+        events.append({"name": typ, "cat": "softirq", "ph": "X", "ts": t0 / 1000.0, "dur": (t1 - t0) / 1000.0,
+                       "pid": pid, "tid": CHROME_SOFTIRQ_TID_BASE + cpu, "args": {"again": again}})
+    for cpu in sorted({c for c, *_ in irqs}):
+        pid = CHROME_PID_BASE + cpu
+        events.append({"name": "thread_name", "ph": "M", "pid": pid, "tid": CHROME_IRQ_TID_BASE + cpu,
+                       "args": {"name": "interrupts"}})
+    for cpu in sorted({c for c, *_ in runs}):
+        pid = CHROME_PID_BASE + cpu
+        events.append({"name": "thread_name", "ph": "M", "pid": pid, "tid": CHROME_SOFTIRQ_TID_BASE + cpu,
+                       "args": {"name": "softirq"}})
 
     # A vCPU a track, by its task's pid: its guest's stretches, and each
     # exit's out of the guest, named by what it was.
@@ -640,8 +849,9 @@ def chrome(recs, path):
 def selftest():
     """The pairing held to a made-up window whose answers are known: what no
     live gate reaches -- the device's commands, a refusal, an entry turned
-    back, a vCPU's number two VMs' tasks have -- beside what one does. The
-    first that comes out otherwise is said, and the exit code is 1."""
+    back, a vCPU's number two VMs' tasks have -- beside what one does; and
+    the interrupts' and soft IRQs' share of a woken task's wait. The first
+    that comes out otherwise is said, and the exit code is 1."""
     recs = []
 
     def rec(t, cpu, ev, **f):
@@ -718,6 +928,71 @@ def selftest():
     want("the read's device time, its refused command left out", (r["device"], r["commands"]), (2000, 1))
     want("the device's commands done, the refusal not one", sorted(ns for ns, _ in d["device"]), [2000, 6100, 6900])
     want("what had no request in the window", d["stray"], 1)
+
+    # The interrupts' and the soft IRQs', on a CPU of their own: a device's
+    # interrupt raises the receive soft IRQ and its kick's IPI follows; the
+    # softirq task's run wakes a task (pid 9) halfway, which then waits for
+    # the CPU through the rest of that run -- a timer interrupt inside it --
+    # until its switch. And an exit with no time, a run whose wait was not
+    # timed.
+    irq_recs = []
+
+    def irec(t, ev, **f):
+        irq_recs.append({"t": t, "cpu": 0, "ev": ev, "f": f})
+
+    irec(100, "sched_switch", prev_pid=1, prev_comm="idle0", next_pid=5, next_comm="worker", next_cpu=0,
+         prev_state="runnable", reason="preempt")
+    irec(1000, "irq_entry", vector=0xFD, kind="timer", pid=5)
+    irec(1500, "irq_exit", vector=0xFD, kind="timer", pid=5, ns=500, late_ns=2000)
+    irec(5700, "softirq_raise", type="net_rx", how="kicked")
+    irec(5800, "irq_exit", vector=0x41, kind="msi", pid=5, ns=800, late_ns=0)
+    irec(6200, "irq_exit", vector=0xFE, kind="ipi", pid=5, ns=150, late_ns=0)
+    irec(6300, "sched_switch", prev_pid=5, prev_comm="worker", next_pid=3, next_comm="softirq/0", next_cpu=0,
+         prev_state="runnable", reason="preempt")
+    irec(6500, "softirq_entry", type="net_rx", wait_ns=800)
+    irec(7000, "sched_wakeup", pid=9, comm="udpsh", cpu=0, deadline=0, waker_pid=3, late_ns=0)
+    irec(8000, "irq_exit", vector=0xFD, kind="timer", pid=3, ns=300, late_ns=100)
+    irec(9000, "softirq_raise", type="net_rx", how="pending")
+    irec(9500, "softirq_exit", type="net_rx", ns=3000, again=0)
+    irec(10000, "sched_switch", prev_pid=3, prev_comm="softirq/0", next_pid=9, next_comm="udpsh", next_cpu=0,
+         prev_state="blocked", reason="voluntary")
+    irec(11000, "irq_exit", vector=0xFE, kind="ipi", pid=9, ns=0, late_ns=0)
+    irec(12000, "softirq_entry", type="net_tx", wait_ns=0)
+    irec(12500, "softirq_exit", type="net_tx", ns=500, again=1)
+    # An idle CPU's one interrupt: its share is of the window's whole
+    # stretch, not of its own records' few nanoseconds
+    irq_recs.append({"t": 12000, "cpu": 1, "ev": "irq_exit",
+                     "f": {"vector": 0xFD, "kind": "timer", "pid": 2, "ns": 200, "late_ns": 50}})
+    irq_recs.sort(key=lambda r: (r["t"], r["cpu"]))
+
+    irqs, untimed = interrupts(irq_recs, 0)
+    want("the interrupts' handlers, each from its exit alone",
+         sorted((kind, vector, t1 - t0) for _, t0, t1, vector, kind, _, _ in irqs),
+         sorted([("timer", 0xFD, 500), ("msi", 0x41, 800), ("ipi", 0xFE, 150), ("timer", 0xFD, 300),
+                 ("timer", 0xFD, 200)]))
+    want("an exit with no time, counted and not taken", untimed, 1)
+    want("the local timer's lateness", sorted(late for _, _, _, _, kind, _, late in irqs if kind == "timer"),
+         [50, 100, 2000])
+    runs, soft_waits, soft_raises, soft_untimed = softirqs(irq_recs, 0)
+    want("the soft IRQs' runs", [(typ, t1 - t0, again) for _, t0, t1, typ, again in runs],
+         [("net_rx", 3000, 0), ("net_tx", 500, 1)])
+    want("their waits for their task", soft_waits, [(0, "net_rx", 800)])
+    want("a run whose wait was not timed", soft_untimed, 1)
+    want("the raises, by what they did", soft_raises, {("net_rx", "kicked"): 1, ("net_rx", "pending"): 1})
+    waited, _, _, _ = latencies(irq_recs, 0)
+    want("the woken task's wait, and the switch that ended it",
+         [(ns, pid, end) for ns, pid, _, _, _, end in waited], [(3000, 9, 10000)])
+    want("the interrupts inside that wait", covered(irqs, 0, 7000, 10000), (300, 1))
+    want("the softirq task's run inside it, from the wakeup on", covered(runs, 0, 7000, 10000), (2500, 1))
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        irq_summary(irq_recs, 0)
+    for line in ("irq: 5 interrupts on 2 cpus", "softirq: 2 handler runs", "raises of net_rx: 2",
+                 "pid 9 udpsh (cpu 0 -> 0): interrupts 300ns (1), softirq 2.5us (1)",
+                 "worker (pid 5) 1.4us in 3", "cpu 0: 4 interrupts, 1.8us in handlers, 14.11% of 12.4us",
+                 "cpu 1: 1 interrupts, 200ns in handlers, 1.61% of 12.4us"):
+        want(f"the summary says `{line}`", line in said.getvalue(), True)
+
     for f in failures:
         print(f"trace-decode: selftest: {f}")
     print(f"trace-decode: selftest: {'failed' if failures else 'every pairing as it should be'}")
@@ -731,6 +1006,7 @@ def main():
     parser.add_argument("--json", metavar="FILE", help="write the records as a JSON array")
     parser.add_argument("--latency", action="store_true", help="only the wakeup waits")
     parser.add_argument("--hv", action="store_true", help="only the hypervisor's and a guest disk's records")
+    parser.add_argument("--irq", action="store_true", help="only the interrupts' and the soft IRQs' records")
     parser.add_argument("--cpu", type=int, help="only this cpu's records")
     parser.add_argument("--selftest", action="store_true", help="hold the pairing to a made-up window, and exit")
     args = parser.parse_args()
@@ -762,12 +1038,14 @@ def main():
 
     if args.hv:
         hv_summary(recs, start)
+    elif args.irq:
+        irq_summary(recs, start)
     elif args.latency:
         if start is None:
             print("trace-decode: a cpu's part could not be read: no wait is paired across it")
             return 0
         waits, answered, pending, superseded = latencies(recs, start)
-        for ns, pid, comm, woken_cpu, run_cpu in sorted(waits, reverse=True):
+        for ns, pid, comm, woken_cpu, run_cpu, _ in sorted(waits, reverse=True):
             print(f"{ns:>12}ns pid {pid} {comm} (cpu {woken_cpu} -> {run_cpu})")
         print(f"trace-decode: {answered} answered, {pending} not run in the window, "
               f"{superseded} woken again before a switch")
@@ -775,6 +1053,8 @@ def main():
         summarize(recs, start)
         if any(r["ev"].startswith(("hv_", "blk_", "disk_", "bio_", "image_", "ext4_")) for r in recs):
             hv_summary(recs, start)
+        if any(r["ev"].startswith(("irq_", "softirq_")) for r in recs):
+            irq_summary(recs, start)
     return 0
 
 

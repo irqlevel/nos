@@ -64,6 +64,13 @@ private:
     {
         Atomic pending; /* bitmask of pending soft IRQ types */
         Task* task_ptr;
+        /* A type's: the cycle counter at the raise that made it pending, for
+           the wait its run's softirq_entry records -- written by that raise
+           alone, while softirq_entry is on, and zeroed by the run that takes
+           it whether it is on or not, so that none outlives its pending.
+           Atomics: a raise on this CPU writes one while its task may read
+           it. */
+        u64 raised_at[MAX_TYPES];
     };
 
     Handler handlers_[MAX_TYPES];
@@ -78,6 +85,11 @@ private:
 
     static void task_func(void* ctx);
     void run(CpuState& state);
+
+    /* A type's handler, run once with its records (softirq_entry and
+       softirq_exit) where they are on: `raised` the stamp of the raise its
+       wait is counted from, 0 for none. */
+    void run_handler(CpuState& state, ulong type, u64 raised);
 
     /* Whether this CPU has a pending type that is not already running
        somewhere else -- the condition its task blocks on. */
