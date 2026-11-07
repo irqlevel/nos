@@ -227,7 +227,7 @@ const en: Dictionary = {
             },
             {
                 title: "Storage",
-                text: "An asynchronous block layer with NVMe and virtio drivers, MBR and GPT partitions, read-write ext2, nanofs (our own checksummed filesystem), and a VFS on top.",
+                text: "An asynchronous block layer with NVMe and virtio drivers, MBR and GPT partitions, read-write ext4 and ext2, and a VFS on top.",
                 href: "/docs/filesystems",
             },
             {
@@ -461,7 +461,7 @@ const ru: Dictionary = {
             },
             {
                 title: "Хранилище",
-                text: "Асинхронный блочный слой с драйверами NVMe и virtio, разделы MBR и GPT, ext2 на чтение и запись, nanofs (наша файловая система с контрольными суммами) и VFS поверх всего этого.",
+                text: "Асинхронный блочный слой с драйверами NVMe и virtio, разделы MBR и GPT, ext4 и ext2 на чтение и запись и VFS поверх всего этого.",
                 href: "/docs/filesystems",
             },
             {
