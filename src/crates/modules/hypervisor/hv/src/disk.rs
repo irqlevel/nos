@@ -34,6 +34,15 @@
 //! busy, for as long as its waits have been short (`POLL_MAX_NS`), so that
 //! neither costs a sleep and a wake.
 //!
+//! A volume of NBS's (`nbs:<volume>`, plans/nbs.md, N8) is a disk the same
+//! way: its media is the volume's session (nbsdrive's `Drive`), attached
+//! as the disk opens -- for writing at a new generation, every cs fenced,
+//! what its last writer left open reconciled -- whose requests the task
+//! starts and whose answers it takes as an image's, its buffers the
+//! session's own, its waits on the session's mailbox and the guest's
+//! requests alike. The disk going lets the volume go: flushed, its chunks
+//! closed, detached.
+//!
 //! The task is on a CPU of its own, not the vCPU's (`hv::place`): the disk
 //! works while the guest runs rather than when it stops -- a thread of the
 //! guest's own core where it has one free, since its cores are its own. It is the disk's for
@@ -41,7 +50,7 @@
 //! request it is serving, if any -- and waits for it, and what it had not
 //! served goes with the queues.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -50,8 +59,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hv::disk::{self as blk, Op, Request};
 use kcore::block::{DiskQueue, QueueError};
+use kcore::events::SharedEvent;
 use kcore::fs::{File, FileId, Image, ImageQueue, Lent, Started};
-use kcore::sync::Mutex;
+use kcore::sync::{Mutex, MutexGuard};
 use kcore::task::TaskHandle;
 use kcore::time::Duration;
 use kcore::trace::DiskHow;
@@ -242,7 +252,7 @@ const POLL_MAX_NS: u64 = 100 * kcore::consts::NS_PER_US;
 /// Their calls are the same; what is not a read or a write goes to the file
 /// or the device by these too.
 trait Media: Send + Sync {
-    fn lend(&self, k: usize) -> Option<Lent<'_>>;
+    fn lend(&self, k: usize) -> Option<Buf<'_>>;
     fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started>;
     fn kick(&self);
     fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize;
@@ -254,9 +264,36 @@ trait Media: Send + Sync {
     fn write_zeroes(&self, offset: u64, len: u64, unmap: bool) -> bool;
 }
 
+/// A buffer of a disk's lent to its device between requests: a queue's of
+/// the kernel's (`Lent`), or one of a volume's session's own.
+enum Buf<'a> {
+    Kernel(Lent<'a>),
+    Own(MutexGuard<'a, Vec<u8>>),
+}
+
+impl core::ops::Deref for Buf<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Buf::Kernel(l) => l,
+            Buf::Own(v) => v.as_slice(),
+        }
+    }
+}
+
+impl core::ops::DerefMut for Buf<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            Buf::Kernel(l) => l,
+            Buf::Own(v) => v.as_mut_slice(),
+        }
+    }
+}
+
 impl Media for ImageQueue {
-    fn lend(&self, k: usize) -> Option<Lent<'_>> {
-        ImageQueue::lend(self, k)
+    fn lend(&self, k: usize) -> Option<Buf<'_>> {
+        ImageQueue::lend(self, k).map(Buf::Kernel)
     }
     fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
         ImageQueue::start(self, k, write, offset, len)
@@ -289,8 +326,8 @@ impl Media for ImageQueue {
 }
 
 impl Media for DiskQueue {
-    fn lend(&self, k: usize) -> Option<Lent<'_>> {
-        DiskQueue::lend(self, k)
+    fn lend(&self, k: usize) -> Option<Buf<'_>> {
+        DiskQueue::lend(self, k).map(Buf::Kernel)
     }
     fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
         DiskQueue::start(self, k, write, offset, len)
@@ -322,8 +359,158 @@ impl Media for DiskQueue {
     }
 }
 
+/// A volume of NBS's as a disk's media: its session -- the disk's task's
+/// alone, but for the take at the end -- a buffer a request the device can
+/// have out, each request's slot by the session's tag for it, and the
+/// event the session's mailbox is made on, which a request handed over
+/// signals too.
+struct Volume {
+    name: String,
+    drive: Mutex<Option<nbsdrive::Drive>>,
+    slots: Vec<Mutex<Vec<u8>>>,
+    tags: Mutex<BTreeMap<u64, usize>>,
+    event: SharedEvent,
+}
+
+impl Volume {
+    /// Volume `name` attached on this host -- read-only, or for writing and
+    /// with `force` taken from a writer elsewhere -- its session serving.
+    fn open(name: &str, read_only: bool, force: bool) -> Result<Volume, String> {
+        let me = nbsdrive::this_host()?;
+        let event = SharedEvent::new().ok_or_else(|| String::from("no event for its session"))?;
+        let drive = nbsdrive::Drive::open_on(name, &me, !read_only, force, &event)?;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(blk::IN_FLIGHT).map_err(|_| String::from("out of memory for its buffers"))?;
+        for _ in 0..blk::IN_FLIGHT {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(blk::REQUEST_BYTES).map_err(|_| String::from("out of memory for its buffers"))?;
+            buf.resize(blk::REQUEST_BYTES, 0);
+            slots.push(Mutex::new(buf).ok_or_else(|| String::from("out of memory for its buffers"))?);
+        }
+        Ok(Volume {
+            name: String::from(name),
+            drive: Mutex::new(Some(drive)).ok_or_else(|| String::from("out of memory"))?,
+            slots,
+            tags: Mutex::new(BTreeMap::new()).ok_or_else(|| String::from("out of memory"))?,
+            event,
+        })
+    }
+
+    /// The session's size, its volume's number and generation.
+    fn shape(&self) -> (u64, u32, u64) {
+        self.drive.lock().as_ref().map_or((0, 0, 0), |d| {
+            let s = d.session();
+            (s.size(), s.volume(), s.generation())
+        })
+    }
+
+    /// What the session has done, each back in its slot -- a read's bytes
+    /// copied into it, a write's buffer put back -- and said by `done`.
+    fn take(&self, d: &mut nbsdrive::Drive, done: &mut dyn FnMut(usize, bool)) -> usize {
+        let mut n = 0;
+        while let Some(t) = d.take_done() {
+            let Some(k) = self.tags.lock().remove(&t.tag) else { continue };
+            if let Some(slot) = self.slots.get(k) {
+                let mut buf = slot.lock();
+                if buf.is_empty() {
+                    /* A write's: its own buffer, whole again */
+                    *buf = t.data;
+                    buf.resize(blk::REQUEST_BYTES, 0);
+                } else if let Some(to) = buf.get_mut(..t.data.len()) {
+                    to.copy_from_slice(&t.data);
+                }
+            }
+            done(k, t.ok);
+            n += 1;
+        }
+        n
+    }
+}
+
+impl Media for Volume {
+    fn lend(&self, k: usize) -> Option<Buf<'_>> {
+        self.slots.get(k).map(|s| Buf::Own(s.lock()))
+    }
+
+    fn start(&self, k: usize, write: bool, offset: u64, len: usize) -> kcore::error::Result<Started> {
+        use kcore::error::Error;
+        let slot = self.slots.get(k).ok_or(Error::InvalidValue)?;
+        let mut d = self.drive.lock();
+        let d = d.as_mut().ok_or(Error::IoError)?;
+        let tag = if write {
+            /* The slot's buffer goes with the write, and comes back with it */
+            let mut data = core::mem::take(&mut *slot.lock());
+            data.truncate(len);
+            match d.submit(nbsdrive::Op::Write { offset }, data) {
+                Ok(tag) => tag,
+                Err(_) => {
+                    slot.lock().resize(blk::REQUEST_BYTES, 0);
+                    return Err(Error::NoMemory);
+                }
+            }
+        } else {
+            let len = u32::try_from(len).map_err(|_| Error::InvalidValue)?;
+            d.submit(nbsdrive::Op::Read { offset, len }, Vec::new()).map_err(|_| Error::NoMemory)?
+        };
+        self.tags.lock().insert(tag, k);
+        Ok(Started::InFlight)
+    }
+
+    fn kick(&self) {}
+
+    fn reap(&self, done: &mut dyn FnMut(usize, bool)) -> usize {
+        let mut d = self.drive.lock();
+        let Some(d) = d.as_mut() else { return 0 };
+        d.turn(0);
+        self.take(d, done)
+    }
+
+    fn poll(&self, wait: Duration) -> bool {
+        self.wait(wait)
+    }
+
+    fn wait(&self, wait: Duration) -> bool {
+        let mut d = self.drive.lock();
+        let Some(d) = d.as_mut() else { return false };
+        d.turn(wait.as_nanos());
+        d.has_done()
+    }
+
+    fn wake(&self) {
+        self.event.signal();
+    }
+
+    fn flush(&self) -> bool {
+        self.drive.lock().as_mut().is_some_and(|d| d.flush().is_ok())
+    }
+
+    /* Neither offered: the device does not (`Backend::discards`). */
+    fn discard(&self, _offset: u64, _len: u64) -> bool {
+        false
+    }
+
+    fn write_zeroes(&self, _offset: u64, _len: u64, _unmap: bool) -> bool {
+        false
+    }
+}
+
+impl Drop for Volume {
+    /// The volume let go of: what is out done, flushed, its chunks closed,
+    /// detached -- or said, where the session cannot.
+    fn drop(&mut self) {
+        let d = self.drive.lock().take();
+        if let Some(d) = d {
+            match d.stop() {
+                Ok(()) => kcore::klog!(1, "hv: nbs:{} let go of", self.name),
+                Err(e) => kcore::klog!(0, "hv: nbs:{} not let go of cleanly: {}", self.name, e),
+            }
+        }
+    }
+}
+
 /// A guest's disk served by a task of its own: a file of nos's -- an image
-/// -- or a device of nos's, a partition or a whole disk (`crate::devices`).
+/// -- a device of nos's, a partition or a whole disk (`crate::devices`), or
+/// a volume of NBS's.
 pub struct QueuedDisk {
     pipe: Arc<Pipe>,
     /// The image's or the device's queue and its buffers, which the device
@@ -346,6 +533,9 @@ pub struct QueuedDisk {
     /// after `drop` has waited for the task, the image's last user. None for
     /// a device, whose queue holds the block layer's claim on it.
     _claim: Option<Claim>,
+    /// What the guest's GET_ID says, where it is not the disk's letter: a
+    /// volume's `nbs-<number>`.
+    serial: Option<String>,
 }
 
 /// What a disk is served from, and how: the guest's view of it.
@@ -357,16 +547,21 @@ struct Served {
     writes_zeroes: bool,
     block_size: u32,
     claim: Option<Claim>,
+    serial: Option<String>,
 }
 
 impl QueuedDisk {
-    /// The disk `word` names -- a file's path, or a device's id
-    /// (`part:...`, `disk:...`) or name (`dev:nvme14`) -- read-only to the
-    /// guest with `read_only`, served for `runner`'s guest as its disk
-    /// `index` (vda 0), by a task called after it and the disk's letter.
-    pub fn open(word: &str, read_only: bool, runner: &Runner, index: u8) -> Result<QueuedDisk, String> {
+    /// The disk `word` names -- a file's path, a device's id (`part:...`,
+    /// `disk:...`) or name (`dev:nvme14`), or a volume of NBS's
+    /// (`nbs:<volume>`, taken from a writer elsewhere with `force`) --
+    /// read-only to the guest with `read_only`, served for `runner`'s guest
+    /// as its disk `index` (vda 0), by a task called after it and the
+    /// disk's letter.
+    pub fn open(word: &str, read_only: bool, force: bool, runner: &Runner, index: u8)
+        -> Result<QueuedDisk, String> {
         let served = match crate::devices::source(word) {
             crate::devices::Source::File(path) => open_file(path, read_only, runner)?,
+            crate::devices::Source::Volume(name) => open_volume(name, read_only, force)?,
             _ => open_device(word, read_only, runner)?,
         };
 
@@ -392,8 +587,29 @@ impl QueuedDisk {
             .ok_or_else(|| alloc::format!("{}: no task to serve it", word))?;
         Ok(QueuedDisk { pipe, queue, size: served.size, read_only, discard_sectors: served.discard_sectors,
                         discards: served.discards, writes_zeroes: served.writes_zeroes,
-                        block_size: served.block_size, task: Some(task), _claim: served.claim })
+                        block_size: served.block_size, task: Some(task), _claim: served.claim,
+                        serial: served.serial })
     }
+
+    /// What the guest's GET_ID says of it, where not the disk's letter.
+    pub fn serial(&self) -> Option<&str> {
+        self.serial.as_deref()
+    }
+}
+
+/// Volume `name` of NBS's as a disk: its session started -- attached, the
+/// cs's fenced, what its last writer left open reconciled -- its blocks
+/// the volume's 4 KiB, which every request is whole ones of.
+fn open_volume(name: &str, read_only: bool, force: bool) -> Result<Served, String> {
+    let v = Volume::open(name, read_only, force).map_err(|e| alloc::format!("nbs:{}: {}", name, e))?;
+    let (size, number, generation) = v.shape();
+    if size == 0 {
+        return Err(alloc::format!("nbs:{}: no blocks", name));
+    }
+    kcore::klog!(1, "hv: nbs:{} (volume {}) attached, generation {}", name, number, generation);
+    Ok(Served { queue: Arc::new(v), size, discard_sectors: blk::DISCARD_ALIGNMENT, discards: false,
+                writes_zeroes: false, block_size: nbsdrive::BLOCK as u32, claim: None,
+                serial: Some(alloc::format!("nbs-{}", number)) })
 }
 
 /// The image at `path`, held as a disk -- for writing unless `read_only` --
@@ -427,7 +643,7 @@ fn open_file(path: &str, read_only: bool, runner: &Runner) -> Result<Served, Str
     let discard_sectors = u32::try_from(image.discard_unit() / blk::SECTOR).ok().filter(|&s| s != 0)
         .unwrap_or(blk::DISCARD_ALIGNMENT);
     Ok(Served { queue: Arc::new(queue), size, discard_sectors, discards: true, writes_zeroes: true,
-                block_size: blk::SECTOR as u32, claim: Some(claim) })
+                block_size: blk::SECTOR as u32, claim: Some(claim), serial: None })
 }
 
 /// The device `word` names -- by its id, or for `hv boot` and a start with
@@ -457,7 +673,7 @@ fn open_device(word: &str, read_only: bool, runner: &Runner) -> Result<Served, S
         return Err(alloc::format!("{} ({}): not a sector long", word, name));
     }
     Ok(Served { queue: Arc::new(queue), size, discard_sectors: blk::DISCARD_ALIGNMENT.max((ss / blk::SECTOR) as u32),
-                discards, writes_zeroes: false, block_size: ss as u32, claim: None })
+                discards, writes_zeroes: false, block_size: ss as u32, claim: None, serial: None })
 }
 
 impl blk::Backend for QueuedDisk {

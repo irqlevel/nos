@@ -1,8 +1,8 @@
-# NBS: its metadata service and its chunk servers
+# NBS: its metadata service, its chunk servers and its client
 
 NBS is the replicated block storage for VM disks, images and snapshots
-planned in [plans/nbs.md](../plans/nbs.md). As built (steps N5 to N7), it is
-two modules on every host:
+planned in [plans/nbs.md](../plans/nbs.md). As built (steps N5 to N8), it is
+two modules on every host, and a client:
 
 - `nbs-mds.ko` (`src/crates/modules/storage/nbs-mds`), its metadata
   service: the state every host of an NBS cluster holds alike through Raft --
@@ -14,8 +14,12 @@ two modules on every host:
   written, read, fenced and freed as the metadata says ("The chunk server",
   below).
 
-The client that gives a VM its disk from them comes with N8; until then
-`nbs io` writes and reads a volume from the shell.
+- the client (`src/crates/common/storage/nbsclient`, no kernel in it): a
+  volume's session -- attached, its cs's fenced, its open chunks reconciled,
+  read and written through the cs's, flushed, closed, detached -- driven over
+  ipc by `nbsdrive` (`src/crates/modules/storage/nbsdrive`) in the modules
+  that use a volume: hv.ko's `nbs:` disks, `nbs io`, nbsload.ko ("The
+  client", below).
 
 The state is `nbsmeta::State` (`src/crates/common/storage/nbsmeta`, no kernel
 in it), the state machine of the raft crate's `rsm` ([raft.md](raft.md)). The
@@ -407,39 +411,138 @@ Every 30 s the cs asks its mds which of the chunks it holds are gone -- freed,
 or their number another chunk's now -- and gives their slots back, and which
 of the volumes it fences are gone, and takes their fences off.
 
+A client's requests and their answers go between hosts by ipcnet's bulk
+connection, all of them, so that they keep their order and their data do not
+hold up raft's messages. A request carries 256 KiB at most. One to a host
+with no cs -- nbs-cs not loaded there -- comes back from the channel as a
+bounce, and the client takes the cs for one that does not answer.
+
+## The client
+
+A volume is used through a session of it (`nbsclient::Session`): a state
+machine that is handed what comes -- its host's mds's answers, the cs's --
+and the time, and says what to send and which of its driver's operations
+are done. No kernel is in it; `nbsdrive::Drive` drives it over a mailbox of
+its own in the kernel, and fuzz/nbs's `cluster` target over a network of
+its own.
+
+A session's life:
+1. **Attach** at the host's mds (`nbs.mds`, `TAG_ASK`): for writing at a new
+   generation -- `force` takes the volume from a writer on another host --
+   or read-only, which a writer elsewhere refuses. The attach carries the
+   session's token: asked again, its answer late or lost, it is answered with
+   the generation it gave, not another. One not answered in 10 s fails the
+   session.
+2. **The map**, read from the mds at the attach's entry or later: each
+   place's chunk and incarnation, its set, the set's cs's and their states,
+   each cs's host.
+3. **Fences**: every cs a set of the volume writes to fenced at the
+   generation, from which on an older writer's requests -- writes, reads,
+   closes, flushes -- are refused.
+4. **Reconcile**: each chunk any replica holds open -- left so by a writer
+   that stopped uncleanly -- read from one replica, this host's if it has
+   one, and written to every one, 256 KiB at a time, then closed.
+5. **Serve**, until **stop**: what was asked before it done, a flush, every
+   chunk written closed, detached.
+
+What it holds to (plans/nbs.md, "Replication: the rules"):
+- **A write is done once every replica in has it.** One that has not
+  answered in 0.5 s is asked out at the mds (decision 6): the leader looks at
+  the cs (`Op::Ping`, 250 ms) and takes it out of its set -- the set's
+  version up, and with it every chunk's epoch -- only if the cs does not
+  answer it either; otherwise the ask is refused for now and asked again. A
+  cs that refuses as failed is taken out as it is, with no look. Only the
+  volume's writer of now takes a replica out, and only of a set of its
+  volume's: a writer fenced since is refused (`NotTheWriter`), its session
+  failed -- else a write of its would be done by taking out the replicas
+  that refuse it. The set's last active replica is never taken out: writes
+  wait for it.
+- **Two writes that overlap are never out at once.** A read goes to one
+  active replica, this host's where it has one, and to another when it does
+  not answer.
+- **A flush** waits for every write before it, then asks every cs that has
+  acknowledged a write since the last flush began to make its writes
+  durable. It is done once they have and once every flush before it is,
+  since each takes the cs's dirty when it begins; one that fails fails those
+  out after it. A close is a flush, then every chunk written closed at once.
+- **A replica that restarted** with a chunk open at the writer's generation
+  may have lost what was written since the last flush, which the others
+  have: it refuses that writer's requests of the chunk -- and its flushes --
+  as failed, which takes it out. Where it is the chunk's last active replica
+  the session fails (`LOST_LAST`): the volume is to be attached again, whose
+  reconcile takes what the replica holds.
+- A chunk written, flushed and idle for 3 s is closed on its replicas, so
+  that a crash leaves few to reconcile. An operation not done in a minute
+  fails, said.
+- A writer that follows another -- by force, or after a crash -- holds what
+  that one had done and not flushed as a crash would leave it: there or
+  not, as the replica its reconcile read had it.
+
 ### `nbs io`
 
-nbs-mds's `nbs io` (`io.rs`) is a client of the cs's, for the shell and the
-tests until N8's:
+nbs-mds's `nbs io` (`io.rs`) is a session of the volume's for the shell and
+the tests:
 
 ```
-nbs io attach <volume> [force]                  attached for writing here, a new generation; force takes it from another host
-nbs io write <volume> <offset> <bytes> <byte>   <bytes> of <byte> at <offset>, to every replica
+nbs io attach <volume> [force]                  attached for writing here: a new generation; force takes it from another host
+nbs io write <volume> <offset> <bytes> <byte>   <bytes> of <byte> at <offset>, to every replica in
 nbs io read <volume> <offset> <bytes>           from one replica: this host's where it has one
-nbs io flush <volume>                           what was written durable on every replica
-nbs io close <volume>                           every chunk written here closed on every replica
-nbs io held <volume>                            the volume's chunks each cs holds open
-nbs io detach <volume>
+nbs io flush <volume>                           what was written durable on every replica in
+nbs io close <volume>                           that, and every chunk written closed on its replicas
+nbs io held <volume>                            the volume's chunks each cs holds open: asked of each, not of a session
+nbs io detach <volume>                          flushed, closed, let go of
 ```
 
-The first write attaches the volume for writing on this host, unless
-`attach` did, and fences each cs at the generation before its first write
-there. A read on a host that has not attached the volume is a read-only one,
-of generation 0. Offsets and sizes are whole 4 KiB. For example:
+The first write attaches the volume for writing on this host unless
+`attach` did; the session is kept for the commands after, until `detach` or
+another `attach`, and moves only while a command drives it. A read on a host
+with no session of the volume's attaches read-only for itself and lets go
+after -- refused while another host writes. Offsets and sizes are whole
+4 KiB. For example:
 
 ```
 a$ nbs io write disk1 0 65536 0x5a
-nbs: 65536 bytes of 0x5a written at 0 of disk1, generation 1: 1 chunks, each to its 3 replicas
-b$ nbs io read disk1 0 65536
-nbs: 65536 bytes at 0 of disk1, from b: 0x5ax65536
+nbs: 65536 bytes of 0x5a written at 0 of disk1, generation 1: 1 chunks, to every replica in
+a$ nbs io read disk1 0 65536
+nbs: 65536 bytes at 0 of disk1, from a: 0x5ax65536
 ```
 
-A client's requests and their answers go between hosts by ipcnet's bulk
-connection, all of them, so that they keep their order and their data do not
-hold up raft's messages. A request carries 256 KiB at most. It is asked again
-for up to 30 s while the answer is that it cannot be done yet; one to a host
-with no cs -- nbs-cs not loaded there -- comes back from the channel as a
-bounce, and is said at once.
+### nbsload
+
+`nbsload.ko` is blkload's for a volume: a load test through a session,
+IOPS, bandwidth and latency down to the percentiles (`common/latency`, the
+histogram they share).
+
+```
+nbsload <volume> [randread|randwrite|read|write|verify] [bs=4k] [qd=8] [secs=5] [span=<MiB>] [force]
+```
+
+The command's own task keeps qd operations out at once; a write test
+attaches for writing -- `force` takes the volume -- and destroys what is
+on it. `verify` writes blocks each of which says which block and which of
+its writes it is, holds every read as it goes to the block's last write
+done, and after a flush reads every block it wrote back: one that does not
+hold its last write is said, with where.
+
+### A guest's disk: `nbs:<volume>`
+
+hv's guests take a volume as a disk: `disk=nbs:<volume>` on `hv start`, or
+in a vm.toml's `disk`. The disk is a virtio block device of 4 KiB blocks,
+the volume's size, its serial `nbs-<number>`; its task drives the session --
+attached as the guest starts, every cs fenced, the open chunks reconciled --
+and the guest stopped lets the volume go: flushed, closed, detached. `hv
+start <name> force` takes the VM's volumes from a writer elsewhere: a VM
+moved off a host that is gone. No vm.toml says force.
+
+An image is poured onto a volume made beforehand (`nbs volume create`):
+
+```
+hv convert <image> nbs:<volume> [force]         a qcow2 image or a raw disk, written through a session, flushed, let go of
+hv create <name> <url> onto=nbs:<volume>        a cloud's image downloaded and poured onto it, the VM's first disk
+```
+
+A volume never written before reads as zeros, so a pour onto one leaves the
+image's zeros out.
 
 ## Tested
 
@@ -463,8 +566,22 @@ bounce, and is said at once.
   Its `wire` target holds nbswire's messages to their encoding, and reads
   noise as none.
 
-  `--mutants` takes thirty-five rules out one at a time -- eighteen of the
-  metadata's, fifteen of the cs's, two of the wire's -- each caught.
+  Its `cluster` target is the whole of it end to end (N8): the client's
+  session writing, reading, flushing and closing a volume through six
+  hosts' cs's -- nbswire's `serve` over nbscs, as nbs-cs.ko runs it -- asking
+  its host's mds, whose answers are nbswire's `mds` over nbsmeta's state,
+  over a network that delivers in any order of pairs, with hosts that crash
+  -- their disks' caches kept, lost or torn -- and come back, writers lost
+  with them, and writers taken over by force: now, or at rest, the old one
+  asked on to write and flush. Every write done held on every replica in,
+  every read to what a write done or out since may have left, every replica
+  that comes back to what a flush made durable, the replicas the same once a
+  writer serves and at the end, and no active replica doing an older
+  generation's write or flush once a newer writer serves.
+
+  `--mutants` takes fifty-four rules out one at a time -- twenty of the
+  metadata's, nineteen of the cs's and its `serve`'s, three of the wire's,
+  twelve of the client's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
@@ -510,7 +627,18 @@ bounce, and is said at once.
     - the volume deleted, and every cs giving its chunks and its fence back;
     - a host's nbs-cs unloaded: a request to it said at once, the others
       answering; loaded again, serving its devices;
+  - the client (N8), through `nbs io`'s sessions: a reader refused while a
+    host writes, a forced writer's fences failing the old session, a host's
+    closed chunks and data kept over its reboot; nbsload's `verify` holding
+    every block to its last write, and a read load on another host;
   - nothing panicked.
+- **`scripts/hv-nbs-test.py`** (x86-64, manual: a guest kernel and an
+  initrd): Linux guests of hv's on volumes -- an image poured with `hv
+  convert` read by a guest on another host; a guest's writes read back past
+  its page cache, and by a guest on another host after it stops; a start
+  refused while another host's guest has the volume, then forced, the old
+  guest's writes failing; a host killed under a guest's write, the write
+  done and read back.
 
 ## Limits
 
@@ -526,9 +654,14 @@ bounce, and is said at once.
   is removed once it applied the entry.
 - `nbs host remove` refuses only the last member. It is NBS's data, not its
   metadata, that needs three hosts.
-- Only `nbs io` attaches a volume, for the shell. Its reads at generation 0
-  are not readers in the metadata, and nothing reconciles the replicas of a
-  chunk left open: N8's client attaches, reconciles and flushes.
+- A replica taken out stays out: bringing it back, or a new one in its
+  place, is N9's repair. Until then each host lost takes a replica out of
+  the sets it is in, and a set whose last active replica is lost waits for
+  it.
+- A reconcile copies a chunk left open whole, 4 MiB, from one replica --
+  this host's, or the first in -- whether the replicas differ or not.
+- A guest's disk offers no discards and no writes of zeros, and copies a
+  read's data out of the session's buffer into the guest's.
 - A cs serves one request at a time, each waited for on its device, and
   copies the data into a message and out of one. Measuring, and pages that
   move instead, are N11's.

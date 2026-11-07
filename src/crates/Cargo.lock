@@ -490,6 +490,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipcctl"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+ "kcore",
+]
+
+[[package]]
 name = "ipcwire"
 version = "0.1.0"
 
@@ -536,6 +544,10 @@ dependencies = [
  "ffi",
  "kcore",
 ]
+
+[[package]]
+name = "latency"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
@@ -590,6 +602,7 @@ version = "0.1.0"
 dependencies = [
  "kcore",
  "kmod",
+ "latency",
 ]
 
 [[package]]
@@ -642,6 +655,7 @@ dependencies = [
  "kcore",
  "kmod",
  "mgmtwire",
+ "nbsdrive",
  "netwire",
 ]
 
@@ -685,11 +699,24 @@ dependencies = [
  "kcore",
  "kmod",
  "mgmtwire",
+ "nbsclient",
  "nbscs",
+ "nbsdrive",
  "nbsmeta",
  "nbswire",
  "raft",
  "raftmember",
+]
+
+[[package]]
+name = "mod-nbsload"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+ "latency",
+ "nbsclient",
+ "nbsdrive",
 ]
 
 [[package]]
@@ -738,11 +765,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nbsclient"
+version = "0.1.0"
+dependencies = [
+ "nbscs",
+ "nbsmeta",
+ "nbswire",
+]
+
+[[package]]
 name = "nbscs"
 version = "0.1.0"
 dependencies = [
  "crc",
  "nbsmeta",
+]
+
+[[package]]
+name = "nbsdrive"
+version = "0.1.0"
+dependencies = [
+ "ipcctl",
+ "kcore",
+ "nbsclient",
+ "nbswire",
 ]
 
 [[package]]
@@ -1003,7 +1049,7 @@ dependencies = [
 name = "raftmember"
 version = "0.1.0"
 dependencies = [
- "ipcwire",
+ "ipcctl",
  "kcore",
  "raft",
 ]

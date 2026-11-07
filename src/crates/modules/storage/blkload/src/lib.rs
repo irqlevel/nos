@@ -39,6 +39,7 @@ use kcore::block::Disk;
 use kcore::cmd::{Command, Output};
 use kcore::dma::DmaBuffer;
 use kcore::time::boot_time_ns;
+use latency::Histogram;
 
 const HELP: &str = "blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force] - disk load test";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
@@ -75,18 +76,6 @@ const DISKLOG_MAGIC: u64 = 0x0031_474F_4C53_4F4E;
 const NANOFS_MAGIC: u32 = 0x4E41_4E4F;
 /* Enough of a device's start to hold every one of them */
 const PEEK_BYTES: u64 = 4 * KIB;
-
-/* Latency histogram: 2^SUB_BITS buckets to each power of two, so a
-   percentile comes out within 1/16 of the truth */
-const SUB_BITS: u32 = 4;
-const SUB: usize = 1 << SUB_BITS;
-const BUCKETS: usize = 64 * SUB;
-
-/* The ten-thousandths the report gives the latency at */
-const P50: u64 = 5_000;
-const P90: u64 = 9_000;
-const P99: u64 = 9_900;
-const P999: u64 = 9_990;
 
 struct BlkLoad {
     _cmd: Command,
@@ -209,81 +198,25 @@ impl fmt::Display for BsArg {
     }
 }
 
-/* Nanoseconds, shown in microseconds to a tenth */
-struct Micros(u64);
-
-impl fmt::Display for Micros {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.0 / NS_PER_US, (self.0 % NS_PER_US) / 100)
-    }
-}
-
-fn bucket(ns: u64) -> usize {
-    if ns < SUB as u64 {
-        return ns as usize;
-    }
-    let msb = 63 - ns.leading_zeros();
-    let shift = msb - SUB_BITS;
-    let sub = ((ns >> shift) as usize) & (SUB - 1);
-    (shift as usize + 1) * SUB + sub
-}
-
-/* [low, high) of a bucket, in nanoseconds */
-fn bucket_range(b: usize) -> (u64, u64) {
-    if b < SUB {
-        return (b as u64, b as u64 + 1);
-    }
-    let shift = (b / SUB - 1) as u32;
-    let sub = (b % SUB) as u64;
-    ((SUB as u64 + sub) << shift, (SUB as u64 + sub + 1) << shift)
-}
-
+/* A worker's latencies (common/latency's histogram), and where an error
+   stopped it */
 struct Stats {
-    ios: u64,
-    min: u64,
-    max: u64,
-    sum: u64,
+    lat: Histogram,
     error_at: Option<u64>,
-    hist: [u32; BUCKETS],
 }
 
 impl Stats {
     fn new() -> Self {
-        Self { ios: 0, min: u64::MAX, max: 0, sum: 0, error_at: None, hist: [0; BUCKETS] }
+        Self { lat: Histogram::new(), error_at: None }
     }
 
     fn record(&mut self, ns: u64) {
-        self.ios += 1;
-        self.sum += ns;
-        self.min = self.min.min(ns);
-        self.max = self.max.max(ns);
-        self.hist[bucket(ns)] += 1;
+        self.lat.record(ns);
     }
 
     fn merge(&mut self, other: &Stats) {
-        self.ios += other.ios;
-        self.sum += other.sum;
-        self.min = self.min.min(other.min);
-        self.max = self.max.max(other.max);
+        self.lat.merge(&other.lat);
         self.error_at = self.error_at.or(other.error_at);
-        for (mine, theirs) in self.hist.iter_mut().zip(other.hist.iter()) {
-            *mine += *theirs;
-        }
-    }
-
-    /* The latency per10k ten-thousandths of the ios came in under: the
-       middle of the bucket that holds it */
-    fn percentile(&self, per10k: u64) -> u64 {
-        let rank = ((self.ios * per10k + 9_999) / 10_000).max(1);
-        let mut seen = 0u64;
-        for (b, &n) in self.hist.iter().enumerate() {
-            seen += n as u64;
-            if seen >= rank {
-                let (low, high) = bucket_range(b);
-                return low + (high - low) / 2;
-            }
-        }
-        self.max
     }
 }
 
@@ -557,14 +490,14 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
 }
 
 fn report(out: &mut Output, opts: &Options, disk: &Disk, total: &Stats, elapsed: u64) {
-    let iops = (total.ios as u128 * NS_PER_SEC as u128 / elapsed as u128) as u64;
-    let bytes = total.ios as u128 * opts.bs as u128;
+    let iops = (total.lat.ios as u128 * NS_PER_SEC as u128 / elapsed as u128) as u64;
+    let bytes = total.lat.ios as u128 * opts.bs as u128;
     let tenths_mib = (bytes * 10 * NS_PER_SEC as u128 / elapsed as u128 / MIB as u128) as u64;
 
     let _ = writeln!(
         out,
         "  {} ios in {}.{:02} s: {} IOPS, {}.{} MiB/s",
-        total.ios,
+        total.lat.ios,
         elapsed / NS_PER_SEC,
         (elapsed % NS_PER_SEC) / (NS_PER_SEC / 100),
         iops,
@@ -572,18 +505,8 @@ fn report(out: &mut Output, opts: &Options, disk: &Disk, total: &Stats, elapsed:
         tenths_mib % 10
     );
 
-    if total.ios != 0 {
-        let _ = writeln!(
-            out,
-            "  latency us: min {}, avg {}, p50 {}, p90 {}, p99 {}, p99.9 {}, max {}",
-            Micros(total.min),
-            Micros(total.sum / total.ios),
-            Micros(total.percentile(P50)),
-            Micros(total.percentile(P90)),
-            Micros(total.percentile(P99)),
-            Micros(total.percentile(P999)),
-            Micros(total.max)
-        );
+    if total.lat.ios != 0 {
+        let _ = writeln!(out, "  latency us: {}", total.lat.line());
     }
 
     if let Some(sector) = total.error_at {
@@ -591,7 +514,7 @@ fn report(out: &mut Output, opts: &Options, disk: &Disk, total: &Stats, elapsed:
 
         /* Nothing went through at all: most likely more in one I/O than the
            driver takes -- say what it does take */
-        if total.ios == 0 {
+        if total.lat.ios == 0 {
             if let Some(size) = largest_transfer(disk, opts.bs) {
                 let _ = writeln!(
                     out,
