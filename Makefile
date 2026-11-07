@@ -188,6 +188,7 @@ CXX_SRC_x86_64 =   \
     src/base/mm/memory_map.cpp   \
     src/base/mm/new.cpp  \
     src/base/mm/allocator.cpp   \
+    src/base/mm/heap_usage.cpp   \
     src/base/mm/page_allocator.cpp  \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp    \
@@ -264,6 +265,7 @@ CXX_SRC_aarch64 = \
     src/base/mm/memory_map.cpp \
     src/base/mm/new.cpp \
     src/base/mm/allocator.cpp \
+    src/base/mm/heap_usage.cpp \
     src/base/mm/page_allocator.cpp \
     src/base/mm/va_allocator.cpp \
     src/base/mm/pool.cpp \

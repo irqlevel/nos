@@ -68,6 +68,7 @@ PageTable::PageTable()
     , page_array_count_(0)
     , highest_phy_addr_(0)
     , free_pages_count_(0)
+    , free_pages_lowest_(0)
     , zeroed_pages_count_(0)
     , total_pages_count_(0)
     , huge_pool_count_(0)
@@ -795,6 +796,8 @@ bool PageTable::setup_free_pages_list()
         excluded_pages_ = 0;
     }
 
+    /* The lowest from here: before, the count only grew from nothing */
+    free_pages_lowest_ = free_pages_count_;
     klog(0, "free_pages_count_ %lu", free_pages_count_);
     return true;
 }
@@ -940,6 +943,7 @@ Page* PageTable::take_free_page_no_lock(bool zeroed_first, bool& zeroed)
     page->set_zeroed(false);
     BUG_ON(free_pages_count_ == 0);
     free_pages_count_--;
+    free_pages_lowest_ = stdlib::min(free_pages_lowest_, free_pages_count_);
     if (zeroed)
     {
         BUG_ON(zeroed_pages_count_ == 0);
@@ -954,6 +958,7 @@ void PageTable::unlist_free_page_no_lock(Page* page)
     page->list_entry.remove_init();
     BUG_ON(free_pages_count_ == 0);
     free_pages_count_--;
+    free_pages_lowest_ = stdlib::min(free_pages_lowest_, free_pages_count_);
     if (page->is_zeroed())
     {
         BUG_ON(zeroed_pages_count_ == 0);
@@ -2206,6 +2211,12 @@ ulong PageTable::get_free_pages_count()
 {
     stdlib::AutoLock lock(lock_);
     return free_pages_count_;
+}
+
+ulong PageTable::get_free_pages_lowest()
+{
+    stdlib::AutoLock lock(lock_);
+    return free_pages_lowest_;
 }
 
 ulong PageTable::get_total_pages_count()

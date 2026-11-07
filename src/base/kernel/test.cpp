@@ -25,6 +25,8 @@
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 #include <mm/new.h>
+#include <mm/allocator.h>
+#include <mm/heap_usage.h>
 
 namespace kernel
 {
@@ -60,6 +62,131 @@ stdlib::Error test_allocator()
 
     klog(0, "test_allocator: complete");
     return make_error(stdlib::Error::SUCCESS);
+}
+
+/* What the heap takes for an allocation of size, as alloc_block takes it */
+static bool check_footprint(size_t size, size_t want)
+{
+    const size_t got = mm::AllocatorImpl::footprint(size);
+    if (got != want)
+        klog(0, "test_heap_usage: an allocation of %lu takes %lu, not %lu", size, got, want);
+    return got == want;
+}
+
+/* A read of usage, against what the test put into it */
+static bool check_usage(mm::HeapUsage& usage, const char* when, const mm::HeapUsage::Totals& want)
+{
+    mm::HeapUsage::Totals got;
+    usage.read(got);
+    const bool ok = got.bytes == want.bytes && got.taken == want.taken && got.blocks == want.blocks &&
+        got.bytes_peak == want.bytes_peak && got.taken_peak == want.taken_peak &&
+        got.blocks_peak == want.blocks_peak && got.allocs == want.allocs && got.frees == want.frees &&
+        got.refused == want.refused;
+    if (!ok)
+        klog(0, "test_heap_usage: %s: asked/taken/blocks %ld/%ld/%ld, peaks %ld/%ld/%ld, allocs/frees/refused "
+             "%lu/%lu/%lu; want %ld/%ld/%ld, %ld/%ld/%ld, %lu/%lu/%lu", when,
+             got.bytes, got.taken, got.blocks, got.bytes_peak, got.taken_peak, got.blocks_peak,
+             got.allocs, got.frees, got.refused,
+             want.bytes, want.taken, want.blocks, want.bytes_peak, want.taken_peak, want.blocks_peak,
+             want.allocs, want.frees, want.refused);
+    return ok;
+}
+
+/* The heap's counters (mm::HeapUsage, the Rust heap's behind memusage):
+   what an allocation takes, and what goes in coming out of a read -- now,
+   the peaks, the counts -- through a slot's folds by bytes and by blocks.
+   On one CPU, so every read is exact; test_heap_usage_cpus is all of them
+   at once. */
+stdlib::Error test_heap_usage()
+{
+    const size_t page = consts::PAGE_SIZE;
+    const size_t largest = mm::PageTable::MAX_CONTIGUOUS_PAGES * page;
+    bool ok = true;
+
+    /* Below half a page a pool's block -- the allocator's 8-byte header in
+       it, 16 bytes the least -- and the pool's header in front of it */
+    ok = check_footprint(1, mm::Pool::footprint(16)) && ok;
+    ok = check_footprint(8, mm::Pool::footprint(16)) && ok;
+    ok = check_footprint(9, mm::Pool::footprint(32)) && ok;
+    ok = check_footprint(page / 2 - 9, mm::Pool::footprint(page / 2)) && ok;
+    /* From there a run of pages, a power of two of them */
+    ok = check_footprint(page / 2 - 8, page) && ok;
+    ok = check_footprint(page, page) && ok;
+    ok = check_footprint(page + 1, 2 * page) && ok;
+    ok = check_footprint(5 * page, 8 * page) && ok;
+    ok = check_footprint(largest, largest) && ok;
+    /* Nothing past the largest class, or for nothing */
+    ok = check_footprint(largest + 1, 0) && ok;
+    ok = check_footprint(0, 0) && ok;
+
+    /* log2_clz, which footprint takes its class by, is log2 -- which
+       alloc_block takes it by -- by another road: every value to four
+       pages, and either side of every power of two */
+    for (size_t v = 0; v <= 4 * page && ok; v++)
+    {
+        ok = (stdlib::log2_clz(v) == stdlib::log2(v));
+        if (!ok)
+            klog(0, "test_heap_usage: log2_clz(%lu) %lu, log2 %lu", v, stdlib::log2_clz(v), stdlib::log2(v));
+    }
+    for (size_t shift = 1; shift < stdlib::size_of_in_bits<size_t>() && ok; shift++)
+    {
+        const size_t p = static_cast<size_t>(1) << shift;
+        ok = stdlib::log2_clz(p - 1) == stdlib::log2(p - 1) && stdlib::log2_clz(p) == stdlib::log2(p) &&
+            stdlib::log2_clz(p + 1) == stdlib::log2(p + 1);
+        if (!ok)
+            klog(0, "test_heap_usage: log2_clz and log2 part at 2^%lu", shift);
+    }
+    /* And so the footprint of every size alloc_block puts in a pool -- its
+       8-byte header added, 16 bytes the least -- and of every run of pages
+       to the largest class */
+    for (size_t size = 1; size + 8 < page / 2 && ok; size++)
+        ok = check_footprint(size, mm::Pool::footprint(static_cast<size_t>(1) << stdlib::max<size_t>(4, stdlib::log2(size + 8))));
+    for (size_t pages = 1; pages <= mm::PageTable::MAX_CONTIGUOUS_PAGES && ok; pages++)
+        ok = check_footprint(pages * page, (static_cast<size_t>(1) << stdlib::log2(pages)) * page);
+
+    /* Counters of the test's own: the Rust heap's go on counting under it */
+    static mm::HeapUsage usage;
+    const long fold = mm::HeapUsage::FOLD_BYTES;
+    const long fold_blocks = mm::HeapUsage::FOLD_BLOCKS;
+    ok = check_usage(usage, "at first", {0, 0, 0, 0, 0, 0, 0, 0, 0}) && ok;
+
+    for (ulong i = 0; i < 10; i++)
+        usage.add(100, 136);
+    ok = check_usage(usage, "ten in", {1000, 1360, 10, 1000, 1360, 10, 10, 0, 0}) && ok;
+
+    /* Down, the peaks where they were */
+    for (ulong i = 0; i < 4; i++)
+        usage.sub(100, 136);
+    ok = check_usage(usage, "four out", {600, 816, 6, 1000, 1360, 10, 10, 4, 0}) && ok;
+
+    /* A block of a slot's worth: folded in, and out again -- the peaks of
+       the bytes from the fold, the blocks' still the ten */
+    usage.add(fold, fold);
+    usage.sub(fold, fold);
+    ok = check_usage(usage, "a fold in and out",
+        {600, 816, 6, 600 + fold, 816 + fold, 10, 11, 5, 0}) && ok;
+
+    /* A slot's worth of blocks of a byte: folded by their count */
+    for (long i = 0; i < fold_blocks; i++)
+        usage.add(1, 1);
+    ok = check_usage(usage, "a fold of blocks",
+        {600 + fold_blocks, 816 + fold_blocks, 6 + fold_blocks, 600 + fold, 816 + fold, 6 + fold_blocks,
+         11 + static_cast<ulong>(fold_blocks), 5, 0}) && ok;
+    for (long i = 0; i < fold_blocks; i++)
+        usage.sub(1, 1);
+
+    /* All out, and two the heap had nothing for */
+    for (ulong i = 0; i < 6; i++)
+        usage.sub(100, 136);
+    usage.refuse();
+    usage.refuse();
+    const ulong all = 11 + static_cast<ulong>(fold_blocks);
+    ok = check_usage(usage, "all out", {0, 0, 0, 600 + fold, 816 + fold, 6 + fold_blocks, all, all, 2}) && ok;
+
+    if (!ok)
+        return make_error(stdlib::Error::UNSUCCESSFUL);
+    klog(0, "test_heap_usage: complete");
+    return make_success();
 }
 
 stdlib::Error test_ring_buffer()
@@ -3205,6 +3332,10 @@ stdlib::Error test()
     if (!err.ok())
         return err;
 
+    err = test_heap_usage();
+    if (!err.ok())
+        return err;
+
     err = test_mem_routines();
     if (!err.ok())
         return err;
@@ -5169,6 +5300,85 @@ static bool test_tracepoints()
     return ok;
 }
 
+/* test_heap_usage_cpus: each CPU's task puts this many blocks in and takes
+   them out again, this many times -- past a slot's worth of bytes and of
+   blocks each time, so that every CPU folds into the totals the others
+   fold into */
+static const ulong HEAP_USAGE_ROUNDS = 64;
+static const long HEAP_USAGE_BLOCKS = 256;
+static const ulong HEAP_USAGE_ASKED = 3000;
+static const ulong HEAP_USAGE_TAKEN = 4096;
+
+static void heap_usage_task(void* ctx)
+{
+    auto* usage = static_cast<mm::HeapUsage*>(ctx);
+    for (ulong round = 0; round < HEAP_USAGE_ROUNDS; round++)
+    {
+        for (long i = 0; i < HEAP_USAGE_BLOCKS; i++)
+            usage->add(HEAP_USAGE_ASKED, HEAP_USAGE_TAKEN);
+        for (long i = 0; i < HEAP_USAGE_BLOCKS; i++)
+            usage->sub(HEAP_USAGE_ASKED, HEAP_USAGE_TAKEN);
+    }
+}
+
+/* The heap's counters changed on every CPU at once: nothing lost between
+   the slots and the totals -- all of it back to zero, every allocation and
+   free counted -- and the peak of what was taken between one task's blocks
+   and every task's, give or take a slot's worth a CPU */
+static bool test_heap_usage_cpus()
+{
+    /* Counters of the test's own: the Rust heap's go on counting under it */
+    static mm::HeapUsage usage;
+
+    auto& cpus = CpuTable::get_instance();
+    const ulong mask = cpus.get_running_cpus();
+    Task* tasks[MAX_CPUS] = {};
+    ulong started = 0;
+    bool ok = true;
+    for (ulong cpu = 0; cpu < MAX_CPUS && ok; cpu++)
+    {
+        if ((mask & (1UL << cpu)) == 0)
+            continue;
+        Task* task = mm::talloc<Task, TAG>("heapusage");
+        ok = (task != nullptr);
+        if (ok)
+            task->set_cpu_affinity(1UL << cpu);
+        if (ok && !task->start(heap_usage_task, &usage))
+        {
+            task->put();
+            ok = false;
+        }
+        if (ok)
+            tasks[started++] = task;
+    }
+    for (ulong i = 0; i < started; i++)
+    {
+        tasks[i]->wait();
+        tasks[i]->put();
+    }
+    if (!ok || started == 0)
+    {
+        klog(0, "test_heap_usage_cpus: a task not started, %lu were", started);
+        return false;
+    }
+
+    mm::HeapUsage::Totals t;
+    usage.read(t);
+    const ulong changes = started * HEAP_USAGE_ROUNDS * static_cast<ulong>(HEAP_USAGE_BLOCKS);
+    const long one = HEAP_USAGE_BLOCKS * static_cast<long>(HEAP_USAGE_TAKEN);
+    const long slack = static_cast<long>(started) * mm::HeapUsage::FOLD_BYTES;
+    ok = t.bytes == 0 && t.taken == 0 && t.blocks == 0 && t.allocs == changes && t.frees == changes &&
+        t.refused == 0 && t.taken_peak >= one - slack && t.taken_peak <= static_cast<long>(started) * one + slack;
+    if (!ok)
+        klog(0, "test_heap_usage_cpus: on %lu cpus: asked/taken/blocks %ld/%ld/%ld, allocs/frees %lu/%lu of %lu, "
+             "taken at most %ld (want %ld to %ld)", started, t.bytes, t.taken, t.blocks, t.allocs, t.frees, changes,
+             t.taken_peak, one - slack, static_cast<long>(started) * one + slack);
+    else
+        klog(0, "test_heap_usage_cpus: %lu changes on %lu cpus, all counted; taken at most %ld KiB",
+             2 * changes, started, t.taken_peak / static_cast<long>(consts::KB));
+    return ok;
+}
+
 bool test_multi_tasking()
 {
     if (!test_spin_lock_preempt())
@@ -5195,6 +5405,10 @@ bool test_multi_tasking()
        under another's emit() and read back made the read find nothing. */
     auto& cpus = CpuTable::get_instance();
     if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_tracepoints())
+        return false;
+
+    /* Once too, from the boot CPU, a task on every CPU */
+    if (cpus.get_current_cpu_id() == cpus.get_bsp_index() && !test_heap_usage_cpus())
         return false;
 
     Task *task[2] = {0};

@@ -68,6 +68,23 @@ void* AllocatorImpl::alloc_uninit(size_t size, ulong tag)
 	return alloc_block(size, tag, false);
 }
 
+size_t AllocatorImpl::footprint(size_t size)
+{
+	if (size == 0 || size > static_cast<size_t>(-1) - sizeof(Header))
+		return 0;
+
+	size_t req_size = size + sizeof(Header);
+	if (req_size >= (consts::PAGE_SIZE / 2))
+		return PageAllocatorImpl::footprint(stdlib::size_in_pages(size));
+
+	/* The class log2() picks -- a request is 9 bytes at the least, the
+	   header's 8 and one, so its 16 bytes the least come to the same -- by
+	   the count of leading zeros: this runs twice for every block Rust
+	   allocates and frees. test_heap_usage holds the two to the same
+	   answers. */
+	return Pool::footprint(static_cast<size_t>(1) << stdlib::log2_clz(req_size));
+}
+
 void* AllocatorImpl::alloc_block(size_t size, ulong tag, bool zero_pages)
 {
 	BUG_ON(size == 0);
