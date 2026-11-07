@@ -1070,7 +1070,7 @@ static void schedule_current(ScheduleReason why)
         /* Preemption is off -- a spinlock, most likely -- so not now; but
            remembered, and made the moment the count is back to zero (see
            preempt_enable). It used to be dropped, and with it whatever the
-           reschedule was for: the IPI SoftIrq::raise sends to run a softirq
+           reschedule was for: the IPI SoftIrq::raise_mask sends to run a softirq
            task it has just woken, landing on an idle task inside the lock
            reap_exited takes, left that idle task to halt with the softirq task
            runnable -- and every raise after it found the bit already up and

@@ -3,9 +3,21 @@ pub const TYPE_BLK_IO: usize = 1;
 pub const TYPE_NET_TX: usize = 2;
 pub const MAX_TYPES: usize = 8;
 
-/// Raise a soft IRQ type. Safe to call from a hard IRQ handler.
+/// Raise a soft IRQ type. Safe to call from a hard IRQ handler. One past
+/// the types is none.
 pub fn raise(typ: usize) {
-    ffi::softirq::kernel_softirq_raise(typ)
+    if typ < MAX_TYPES {
+        raise_mask(1 << typ);
+    }
+}
+
+/// Raise every type `mask` has a bit of (`1 << TYPE_*`) at once: one wake
+/// and at most one kick of this CPU's softirq task for all of them, where a
+/// `raise` each kicks it once each -- an IPI to this CPU each. What an
+/// interrupt with work for more than one type -- a NIC's, for both its
+/// queues -- raises them by. Safe to call from a hard IRQ handler.
+pub fn raise_mask(mask: usize) {
+    ffi::softirq::kernel_softirq_raise_mask(mask)
 }
 
 /// Have `handler(target)` run for a soft IRQ type: in task context, on one

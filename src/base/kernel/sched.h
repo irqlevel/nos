@@ -177,7 +177,7 @@ public:
        context, a hard IRQ handler's included, without a lock -- pushed onto
        a stack this queue's CPU takes whole at its next schedule() and puts
        on the run list (drain_wakes). That schedule() is the waker's to bring
-       about, as it always was: Event::signal and SoftIrq::raise send the IPI. */
+       about, as it always was: Event::signal and SoftIrq::raise_mask send the IPI. */
     void push_wake(Task* task);
 
 private:

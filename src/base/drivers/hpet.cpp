@@ -5,6 +5,7 @@
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>
+#include <kernel/tracepoint.h>
 #include <hal/cpu.h>
 #include <hal/context.h>
 #include <hal/irq_stubs.h>
@@ -170,6 +171,10 @@ InterruptHandlerFn Hpet::get_handler_fn()
 void Hpet::interrupt(Context* ctx)
 {
     (void)ctx;
+    /* Its records (tp::Irq), the handler done as this returns */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin((u32)int_vector_, tp::IrqKind::Hpet);
 
     /* Clear the interrupt status for timer 0 */
     write_reg(REG_GEN_INT_STS, 1ULL);

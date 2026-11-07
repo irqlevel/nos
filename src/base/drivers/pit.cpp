@@ -4,6 +4,7 @@
 
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>
+#include <kernel/tracepoint.h>
 
 namespace kernel
 {
@@ -56,6 +57,11 @@ InterruptHandlerFn Pit::get_handler_fn()
 void Pit::interrupt(Context* ctx)
 {
     (void)ctx;
+    /* Its records (tp::Irq), the handler done as this returns */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin((u32)int_vector_, tp::IrqKind::Pit);
+
     {
         time_lock_.write_begin();
 
