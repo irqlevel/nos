@@ -58,21 +58,6 @@ pub const CHUNK_FREE: u8 = 0x80;
 /// A chunk written to at least once (the cs's say so, from N7 on).
 pub const CHUNK_WRITTEN: u8 = 0x01;
 
-/// The bytes a slot's record takes in a cs's table on its device, which is
-/// kept twice (plans/nbs.md, "The cs").
-const SLOT_RECORD: u64 = 64;
-
-/// The slots a device of `bytes` holds: 4 MiB each, after what the cs
-/// keeps of its own at the device's start -- a slot for its superblock,
-/// then its table of slots, twice, rounded up to slots -- so that the
-/// metadata counts what the device will hold.
-pub fn device_slots(bytes: u64) -> u32 {
-    let slot = u64::from(CHUNK_MIB) << 20;
-    let all = bytes / slot;
-    let own = 1 + (all * SLOT_RECORD * 2).div_ceil(slot);
-    all.saturating_sub(own).min(u64::from(SLOTS_MAX)) as u32
-}
-
 /// The chunks a volume of `size_mib` MiB has.
 pub fn chunks_for(size_mib: u64) -> u64 {
     size_mib.div_ceil(u64::from(CHUNK_MIB))
@@ -164,6 +149,12 @@ pub struct Chunk {
     /// clones'.
     pub count: u16,
     pub flags: u8,
+    /// Which of the chunks its number has been this is: 1 for the first, one
+    /// more each time the number is taken off the free list again, kept while
+    /// it is free. A cs holds a chunk by its number and incarnation, so that
+    /// a slot of the chunk the number was before -- one a cs that missed its
+    /// free still has -- is never taken for the chunk it is now.
+    pub incarnation: u32,
 }
 
 impl Chunk {
@@ -508,18 +499,19 @@ impl State {
                 c.reserved += 1;
             }
         }
-        let record = Chunk { set, count: 1, flags: 0 };
         if self.free_head != NO_CHUNK {
             let id = self.free_head;
             if let Some(ch) = self.chunks.get_mut(id as usize) {
                 self.free_head = ch.set;
-                *ch = record;
+                /* The number's next chunk: never 0, which no chunk is */
+                let incarnation = ch.incarnation.wrapping_add(1).max(1);
+                *ch = Chunk { set, count: 1, flags: 0, incarnation };
             }
             self.free_count -= 1;
             return id;
         }
         let id = self.chunks.len() as u32;
-        self.chunks.push(record);
+        self.chunks.push(Chunk { set, count: 1, flags: 0, incarnation: 1 });
         id
     }
 
@@ -535,7 +527,7 @@ impl State {
             return;
         }
         let set = ch.set;
-        *ch = Chunk { set: self.free_head, count: 0, flags: CHUNK_FREE };
+        *ch = Chunk { set: self.free_head, count: 0, flags: CHUNK_FREE, incarnation: ch.incarnation };
         self.free_head = id;
         self.free_count += 1;
         let cs = match self.sets.get_mut(set as usize) {
