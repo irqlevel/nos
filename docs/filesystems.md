@@ -2,7 +2,8 @@
 
 How files work in `nos`: what gets mounted at boot and how the root is
 chosen, the file API kernel code uses, what the ext2 driver does and does
-not do, and how a root filesystem image is made and checked. The shell side
+not do, how a root filesystem image is made and checked, and how the shell's
+`format` makes one on a disk. The shell side
 is in [Shell commands](shell-commands.md).
 
 ## What is mounted at boot
@@ -787,6 +788,83 @@ or the ext2 one an install before ext4 made, which keeps it; named on the
 is the check that the driver left it as it should -- for an ext4 nos left
 without unmounting it, after Ubuntu's mount or `e2fsck`'s replay of its
 journal.
+
+## Making one from the shell
+
+`format ext4 <disk>` -- or `format ext2` -- makes a filesystem on a disk or
+a partition from nos's own shell, nothing of the host's needed:
+
+```
+format ext4 vdb label=data          # a whole disk
+format ext2 nvme0n1p3 bs=4096 force # a partition, over what it holds
+```
+
+The command is `src/crates/layers/fs/src/format.rs`; the layout and every
+block of it is `extfmt::mkfs` (`src/crates/common/storage/extfmt/src/mkfs.rs`),
+in the format crate the drivers read through, with no kernel in it:
+
+- ext4 has what its driver writes (`features::classify`'s `Writable`):
+  has_journal, extent, filetype, sparse_super, large_file, dir_nlink,
+  extra_isize and metadata_csum, with 256-byte inodes and an internal
+  journal of mke2fs's size for the filesystem's (1024 blocks to 32768), v2
+  with v3's checksums. No 64bit and no flex_bg: descriptors are 32 bytes,
+  every group carries its own bitmaps and inode table, a filesystem is at
+  most 2^32 blocks, and with no resize_inode it does not grow in place.
+  ext2 is revision 1 with filetype, sparse_super and large_file, 128-byte
+  inodes.
+- Blocks are 1 KiB below 512 MiB and 4 KiB from there, an inode for every
+  4 KiB of a small device and every 16 KiB of a bigger one, as mke2fs's
+  `small` and default types have them; `bs=` asks for 1024, 2048 or 4096
+  bytes -- no smaller than the device's sector. ext4 needs room for its
+  journal: about 2 MiB at least.
+- `label=` is up to 16 printable characters, the last one given if several
+  are; the UUID and the directory hash's seed come from the kernel's random
+  pool (`kcore::random`), the UUID a version 4 one.
+- The inode tables and the journal are written whole, zeros where nothing
+  is yet, as `mkrootfs.sh` has mke2fs write them: nothing an earlier use of
+  the blocks left is ever read as either, and no group is left for a driver
+  to initialise.
+
+The order of its writes is what makes one cut short harmless. The first
+zeros the device's first block, where a superblock was, and is flushed
+before anything else is written; then the inode tables, lost+found and the
+root, the journal, the bitmaps and the descriptors, the superblock's copies,
+and a flush; then the primary superblock, and a flush. A power cut or a
+failed request anywhere leaves no superblock -- nothing anything would mount
+-- or the whole filesystem, never a superblock over half of one; a request
+that failed is said ("what is on it now is no filesystem").
+
+What it refuses, before a byte is written: a filesystem it does not make;
+an option, a block size, a label it does not take; a device too small, or
+whose sectors are bigger than the block asked for; a device in use -- a
+mount's, the disk log's, a disk under a partition that is, or a partition of
+a disk that is (the claim, `block::claim_as`, taken for the whole of the
+command); a whole disk the kernel knows partitions of, whose table the
+partitions would go on being named from; and unless told `force`, a device
+that holds anything a look at its two ends finds (`diskimage::contents`, as
+`hv` looks before it gives a device to a guest): a filesystem, a partition
+table, a RAID or LVM member, an encrypted volume, named with its label where
+it has one -- or any byte of its first 72 KiB that is not a zero.
+
+The writes go a batch of 32 pages at a time through the device's queue
+(`Disk::write_pieces`), so a disk that takes several requests at once has
+them. A filesystem is a `Maker` in the table at the top of `format.rs`: its
+name, the options it takes, and the `Plan` it makes for a device of a given
+size and sector -- the writes, in order, that leave the device holding it. A
+new filesystem is a `Maker` and a line in that table; finding the device,
+the claim, the refusals and the writing are the command's, the same for
+every one.
+
+What holds it: `extfmt-test.py` holds `extfmt::mkfs`'s filesystems, of
+geometries small and large, made over noise, to `e2fsck -fn`, dumpe2fs and
+debugfs, and its refusals to what they say; `fs-fuzz.py`'s `format` target
+runs the command on the fuzzer's disks -- holding nothing, noise, an ext2 or
+ext4 of the fuzzer's own, a partition table -- with options right and
+wrong, mounted or not, requests failing and the power going at any of them,
+and holds what it made to the fuzzer's own judges and the kernel's drivers
+(and `fs-fuzz.py --e2fsck` to e2fsck); `ext4-test.py` formats two disks of
+noise in a boot, writes them and has e2fsck, dumpe2fs, debugfs and Linux
+read them after ([Testing](testing.md)).
 
 ## Checking it
 
