@@ -222,14 +222,15 @@ impl<D: Device> Store<D> {
         if d.read(SUPER_PAGES[0] * PAGE, &mut a).is_err() || d.read(SUPER_PAGES[1] * PAGE, &mut b).is_err() {
             return Err((d, OpenError::Io));
         }
-        let sup = match choose(Super::decode(&a), Super::decode(&b), |s: &Super| s.seq) {
-            Some(Decoded::Valid(s)) => s,
-            Some(Decoded::Empty) => {
-                /* Zeros where the superblock goes: a blank device, or one
-                   whose format was cut short */
-                return Err((d, OpenError::Blank));
+        let sup = match holds(&a, &b) {
+            Holds::Nbs(s) => s,
+            /* Zeros where the superblock goes: a blank device, or one whose
+               format was cut short */
+            Holds::Nothing => return Err((d, OpenError::Blank)),
+            Holds::Other => {
+                return Err((d, OpenError::Corrupt("its first pages are neither an NBS superblock nor zeros: \
+                                                   something else's")));
             }
-            _ => return Err((d, OpenError::Corrupt("neither copy of its superblock is NBS's"))),
         };
         if sup.identity != expect {
             return Err((d, OpenError::Foreign(sup.identity)));
@@ -630,6 +631,10 @@ impl<D: Device> Store<D> {
             return Ok(());
         };
         self.span(Some(dv), offset, buf.len())?;
+        /* Nothing of one volume's is read through another's */
+        if r.volume != volume {
+            return Err(Error::NotTheVolumes);
+        }
         if r.known != c.epoch && !verified {
             return Err(Error::Epoch { known: r.known });
         }

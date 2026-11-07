@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""NBS's metadata service between real kernels (plans/nbs.md, N5 and N6):
-three nos on a LAN of scripts/hub.py's, each with ipcnet.ko, cluster.ko and
-nbs-mds.ko and a pool disk of three partitions -- the cluster registry made
-first, so that the hosts trust each other, then an NBS cluster of its
-members, then what it stores.
+"""NBS between real kernels (plans/nbs.md, N5 to N7): three nos on a LAN of
+scripts/hub.py's, each with ipcnet.ko, cluster.ko, nbs-mds.ko and nbs-cs.ko
+and a pool disk of three partitions -- the cluster registry made first, so
+that the hosts trust each other, then an NBS cluster of its members, then
+what it stores, then a volume's bytes through the chunk servers.
 
 - `nbs` on a host in no NBS cluster says so; `nbs init` on a makes one, a
   its leader and one voter; a second init refused;
@@ -26,6 +26,16 @@ members, then what it stores.
   the bus as the command does; the state's digest taken at the same entry
   on every host, the same, the leader's held to it; every host's log
   compacted into a snapshot (`compact=`);
+- the chunk servers (N7): every host's cs takes its devices in, formatting
+  them; a device with something else on it refused, and taken with `wipe`;
+  a volume written to its three replicas and read back -- across a chunk's
+  end, from the writer's host and read-only from the others -- flushed, its
+  chunks open on every cs, then closed; a writer on another host refused,
+  then forced: its fences refuse the old writer's writes and reads; a host
+  booted again with its data, its fence and its open marks; the volume
+  deleted, and every cs gives its chunks and its fence back; a host's
+  nbs-cs unloaded -- a request to it bounced and said at once -- and loaded
+  again, serving;
 - the leader killed: the other two elect one of themselves and commit; the
   killed host booted again, back from its snapshot and log -- three voters
   again, every host agreeing on the leader and on what is stored;
@@ -48,7 +58,7 @@ members, then what it stores.
 
 Needs a built tree: nos-arm64.img, or for x86-64 an ISO whose command line
 has the UDP shell (`make nos-test.iso TEST_ISO_ARGS=udpshell=9100`), and
-out/<arch>/modules/{ipcnet,cluster,nbs-mds}.ko.
+out/<arch>/modules/{ipcnet,cluster,nbs-mds,nbs-cs}.ko.
 """
 
 import argparse
@@ -82,7 +92,7 @@ HOSTS = ["a", "b", "c"]
 SHELL_PORT = ipct.SHELL_PORT
 HUB_BASE = 47900
 FAILED = []
-MODULES = ("ipcnet", "cluster", "nbs-mds")
+MODULES = ("ipcnet", "cluster", "nbs-mds", "nbs-cs")
 # Each host's pool: a sparse GPT disk of three partitions of 300 MiB
 POOL_MB = 1024
 PART_SECTORS = 300 * 2048
@@ -136,7 +146,7 @@ def rootfs(tmp, arch, name, cluster):
         f.write('# nbs-test.py\nname = "%s"\ncluster = "%s"\npeers = []\n' % (name, cluster))
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# nbs-test.py\ninsmod /ipcnet.ko\nipcnet start\ninsmod /cluster.ko\ninsmod /nbs-mds.ko compact=%d\n"
-                % COMPACT)
+                "insmod /nbs-cs.ko\n" % COMPACT)
     image = os.path.join(tmp, "root-%s.img" % name)
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"], cwd=ROOT, check=True,
                    stdout=subprocess.DEVNULL)
@@ -150,6 +160,46 @@ def pool(tmp, name, guids):
     pt.gpt_image(path, size_mb=POOL_MB, parts=POOL_PARTS, unique=lambda i: guids[i].bytes_le,
                  disk_guid=uuid.uuid4().bytes_le, marked=False)
     return path
+
+
+def scribble(path, part):
+    """Something that is not NBS's on partition `part` of pool `path`: the
+    magic of an ext filesystem's superblock, 1 KiB in."""
+    with open(path, "r+b") as f:
+        f.seek(POOL_PARTS[part][0] * 512 + 1024 + 56)
+        f.write(b"\x53\xef")
+
+
+def cs_of(sh):
+    """`nbscs` on `sh`: (state, held, open, fenced) and its devices' lines,
+    each (device, id, MiB, free MiB, lost, what) -- None for a cs with no
+    number yet."""
+    out = sh.run("nbscs")
+    m = re.search(r"^nbscs: cs \d+ -- (.*?): (\d+) chunks held, (\d+) open, (\d+) volumes fenced", out, re.M)
+    if not m:
+        return None
+    devs = re.findall(r"^\s+device (\d+)\s+(\S+)\s+(\d+) MiB, (\d+) MiB free, (\d+) slots lost, (\w+)$", out, re.M)
+    return ((m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))),
+            [(int(d), i, int(mib), int(free), int(lost), what) for d, i, mib, free, lost, what in devs])
+
+
+def chunks_of(sh):
+    """`nbscs chunks` on `sh`: (chunk, incarnation, state, volume,
+    generation) each."""
+    return [(int(c), int(i), s, int(v), int(g)) for c, i, s, v, g in
+            re.findall(r"^\s+chunk (\d+)\.(\d+) (\w+) volume (\d+) generation (\d+) device \d+$",
+                       sh.run("nbscs chunks"), re.M)]
+
+
+def fences_of(sh):
+    """`nbscs fences` on `sh`: {volume: generation}."""
+    return {int(v): int(g) for v, g in re.findall(r"^\s+volume (\d+) fenced at generation (\d+)$",
+                                                  sh.run("nbscs fences"), re.M)}
+
+
+# How long a cs may take to take a device in, or to give back what the
+# metadata no longer has: it asks its mds every 5 s, and every 30 s
+CS_S = 45
 
 
 def disks(sh):
@@ -300,6 +350,9 @@ def main():
     guids["c"][2] = guids["a"][0]
     ids = {h: ["part:%s" % g for g in guids[h]] for h in HOSTS}
     pools = [pool(tmp, h, guids[h]) for h in HOSTS]
+    # a's second partition with a filesystem's magic on it: refused as a
+    # device until wiped
+    scribble(pools[0], 1)
     n = len(HOSTS)
     hub = hubmod.Hub(n, HUB_BASE, shell_port=SHELL_PORT).start()
     procs, logs = [None] * n, []
@@ -491,6 +544,124 @@ def main():
         check("every host says the same of the volumes and the chunk servers",
               ipct.wait_for(lambda: stored_alike(sh), APPLIED_S, 0.5))
         check("every host's log compacted into a snapshot", all(compacted(x) for x in sh))
+
+        # -- the chunk servers (N7): the devices taken in, a volume's bytes through them --
+        def devices_of(x):
+            return (cs_of(x) or (None, []))[1]
+
+        def serving(i, want):
+            got = cs_of(sh[i])
+            return got is not None and got[0][0] == "serving" and len(got[1]) == want and \
+                all(d[2] == room and d[4] == 0 for d in got[1])
+        need("every host's cs takes its devices in -- formatted, %d MiB each, nothing lost -- and serves" % room,
+             ipct.wait_for(lambda: all(serving(i, 2 if HOSTS[i] == "c" else 1) for i in range(n)), CS_S, 1),
+             [x.run("nbscs") for x in sh])
+        out = c.run("nbscs")
+        check("c's first device draining, its second active",
+              re.search(r"device %d\s+%s\s+%d MiB, %d MiB free, 0 slots lost, draining$"
+                        % (dev["c"], re.escape(ids["c"][0]), room, room), out, re.M) is not None
+              and re.search(r"%s\s+%d MiB, %d MiB free, 0 slots lost, active$" % (re.escape(ids["c"][1]), room, room),
+                            out, re.M) is not None, out)
+        out = a.run("nbs devices add %s" % ids["a"][1])
+        check("a's second partition, a filesystem's magic on it, refused", "not NBS's" in out and "wipe" in out, out)
+        out = a.run("nbs devices add %s wipe" % ids["a"][1])
+        check("and taken with wipe", "in the metadata, its first pages wiped" in out, out)
+        out = a.run("nbs devices add %s" % ids["a"][0])
+        check("a device its cs holds, added again: the same device", ("device %d in the metadata" % dev["a"]) in out,
+              out)
+        check("a's cs takes the wiped device in too, formatting it",
+              ipct.wait_for(lambda: serving(0, 2) and all(d[5] == "active" for d in devices_of(a)), CS_S, 1),
+              a.run("nbscs"))
+
+        out = a.run("nbs io write disk1 0 65536 0x5a")
+        m = re.search(r"65536 bytes of 0x5a written at 0 of disk1, generation (\d+): 1 chunks, each to its 3 replicas",
+                      out)
+        need("64 KiB written to disk1's first chunk, to its three replicas: attached for writing on a", m is not None,
+             out)
+        gen1 = int(m.group(1))
+        # What `nbscs` shows is what the cs's task last made of it: a second old at most
+        check("every cs fences disk1 at a's generation",
+              ipct.wait_for(lambda: all(fences_of(x).get(vol1) == gen1 for x in sh), 5, 0.5),
+              [x.run("nbscs") for x in sh])
+        end = CHUNK_MIB << 20
+        out = a.run("nbs io write disk1 %d 8192 0x33" % (end - 4096))
+        check("8 KiB across a chunk's end: two chunks", "8192 bytes of 0x33" in out and ": 2 chunks" in out, out)
+        out = a.run("nbs io read disk1 0 65536")
+        check("read back on a, from its own replica", "65536 bytes at 0 of disk1, from a: 0x5ax65536" in out, out)
+        out = a.run("nbs io read disk1 %d 16384" % (end - 8192))
+        check("and across the chunk's end", "from a: 0x00x4096 0x33x8192 0x00x4096" in out, out)
+        for x, h in ((b, "b"), (c, "c")):
+            out = x.run("nbs io read disk1 0 65536")
+            check("read on %s, read-only, from its own replica" % h, ("from %s: 0x5ax65536" % h) in out, out)
+        out = a.run("nbs io flush disk1")
+        check("flushed on the three hosts", "disk1 flushed on 3 hosts" in out, out)
+        out = a.run("nbs io held disk1")
+        check("its two chunks open on every cs, at a's generation",
+              all(re.search(r"^\s+%s\s+2 chunks of disk1 open:.*@%d" % (h, gen1), out, re.M) for h in HOSTS), out)
+        out = a.run("nbs io close disk1")
+        check("closed: the six replicas were open",
+              "6 of the 6 replicas of the chunks of disk1 written here were open" in out, out)
+        out = a.run("nbs io held disk1")
+        check("and none is now", all(re.search(r"^\s+%s\s+0 chunks of disk1 open:" % h, out, re.M) for h in HOSTS),
+              out)
+
+        out = b.run("nbs io write disk1 0 4096 0x77")
+        check("a write on b refused while a has disk1 attached", "attached for writing on another host" in out, out)
+        out = b.run("nbs io attach disk1 force")
+        m = re.search(r"disk1 attached for writing here, generation (\d+)", out)
+        need("b takes disk1 with force: a newer generation", m is not None and int(m.group(1)) > gen1, out)
+        gen2 = int(m.group(1))
+        out = b.run("nbs io write disk1 0 4096 0x77")
+        check("b writes, fencing every cs at its generation", ("generation %d: 1 chunks" % gen2) in out, out)
+        out = a.run("nbs io write disk1 0 4096 0x11")
+        check("a's write at its older generation refused by the fences",
+              "fenced: the volume is attached at a newer generation" in out, out)
+        out = a.run("nbs io read disk1 0 4096")
+        check("and a's read", "fenced: the volume is attached at a newer generation" in out, out)
+        out = b.run("nbs io read disk1 0 8192")
+        check("b reads its write, and a's after it", "from b: 0x77x4096 0x5ax4096" in out, out)
+        check("every cs fences disk1 at b's generation",
+              ipct.wait_for(lambda: all(fences_of(x).get(vol1) == gen2 for x in sh), 5, 0.5),
+              [x.run("nbscs") for x in sh])
+
+        # c booted again: its cs takes its devices back as they were
+        kill(2)
+        need("c boots again", pt.wait_log(boot(2), "boot: complete", 300) and addressed(2))
+        sh[2] = c = ipct.Shell(hub.shell(2))
+        need("c back: three voters, one leader", ipct.wait_for(lambda: agreed(sh, 3), 90, 1))
+        need("c's cs serving again", ipct.wait_for(lambda: serving(2, 2), CS_S, 1), c.run("nbscs"))
+        check("c's fence kept: disk1 at b's generation", fences_of(c).get(vol1) == gen2, fences_of(c))
+        held = [x for x in chunks_of(c) if x[3] == vol1]
+        check("c's chunks of disk1 kept: the first open at b's generation, the second closed at a's",
+              sorted((x[2], x[4]) for x in held) == sorted([("open", gen2), ("closed", gen1)]), held)
+        out = c.run("nbs io read disk1 0 8192")
+        check("and their data: read on c, from its own replica", "from c: 0x77x4096 0x5ax4096" in out, out)
+
+        # the volume deleted: every cs gives its chunks and its fence back
+        out = a.run("nbs volume delete disk1")
+        check("disk1 not deleted while b has it attached", "attached" in out and "deleted" not in out, out)
+        out = b.run("nbs io detach disk1")
+        check("b detaches it", ("disk1 detached (generation %d)" % gen2) in out, out)
+        out = a.run("nbs volume delete disk1")
+        check("disk1 deleted", "deleted" in out, out)
+        check("every cs gives its chunks and its fence back",
+              ipct.wait_for(lambda: all((cs_of(x) or ((None, 1, 1, 1), []))[0][1:] == (0, 0, 0) for x in sh), CS_S, 2),
+              [x.run("nbscs") for x in sh])
+        check("their slots free again", all(d[3] == d[2] for x in sh for d in devices_of(x)),
+              [x.run("nbscs") for x in sh])
+
+        # c's cs unloaded: a client told at once that it is not there; loaded again, it takes its devices back
+        c.run("rmmod nbs-cs")
+        start = time.time()
+        out = a.run("nbs io held disk2")
+        took = time.time() - start
+        check("c's cs unloaded: a request to it bounced and said at once (%.1f s)" % took,
+              re.search(r"^\s+c\s+nbs\.cs@c is not there", out, re.M) is not None and took < 10, out)
+        check("and the other hosts' answered all the same",
+              all(re.search(r"^\s+%s\s+0 chunks of disk2 open:" % h, out, re.M) for h in ("a", "b")), out)
+        c.run("insmod /nbs-cs.ko")
+        check("c's cs loaded again: its devices opened as they were, serving",
+              ipct.wait_for(lambda: serving(2, 2), CS_S, 1), c.run("nbscs"))
 
         # -- the leader killed, and booted again --
         name = leader_of(a)
