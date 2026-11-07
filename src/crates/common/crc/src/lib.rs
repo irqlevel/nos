@@ -2,8 +2,8 @@
 //! one place:
 //!
 //! - [`crc32`]: CRC-32 (IEEE 802.3, the polynomial reflected as 0xEDB88320),
-//!   what zlib computes -- GPT's header and partition array, nanofs's
-//!   blocks, the disk log's header, the `crc32` command;
+//!   what zlib computes -- GPT's header and partition array, the disk
+//!   log's header, the `crc32` command;
 //! - [`crc32c`]: CRC-32C (Castagnoli, reflected as 0x82F63B78) -- ext4's
 //!   metadata_csum and its journal, raft's log;
 //! - [`crc16`]: CRC-16 (x^16 + x^15 + x^2 + 1, reflected as 0xA001) -- ext4's
@@ -81,7 +81,7 @@ fn slice8(t: &[[u32; 256]; 8], mut c: u32, data: &[u8]) -> u32 {
     c
 }
 
-/// CRC-32 (IEEE 802.3), zlib's: GPT, nanofs, the disk log.
+/// CRC-32 (IEEE 802.3), zlib's: GPT, the disk log.
 pub mod crc32 {
     static TABLES: [[u32; 256]; 8] = super::tables(0xEDB8_8320);
 
