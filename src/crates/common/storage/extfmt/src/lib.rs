@@ -32,6 +32,7 @@ pub mod features;
 pub mod group;
 pub mod inode;
 pub mod jbd2;
+pub mod mkfs;
 pub mod recovery;
 pub mod sb;
 pub mod xattr;
