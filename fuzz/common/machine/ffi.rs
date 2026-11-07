@@ -633,6 +633,13 @@ pub extern "C" fn kernel_cmd_unregister(handle: usize) {
     sched::harness(|| cmd::unregister(handle))
 }
 
+/// No module is ever being taken down by a loader here: a target's module
+/// is dropped by the target (`kmod::unload`), with nothing of it to refuse.
+#[no_mangle]
+pub extern "C" fn kernel_module_unloading_at(_addr: usize) -> i32 {
+    0
+}
+
 /// # Safety
 /// `out` is a printer this fuzzer handed a command; `buf` is `len` bytes.
 #[no_mangle]

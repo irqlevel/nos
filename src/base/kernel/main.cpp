@@ -715,6 +715,12 @@ void bp_startup(void* ctx)
             return;
         }
 
+        if (!test::test_module_unload())
+        {
+            PANIC("Module unload test failed");
+            return;
+        }
+
         if (!test::test_module_ipc())
         {
             PANIC("Module ipc test failed");

@@ -17,6 +17,22 @@ pub extern "C" fn rust_mgmt_stop() {
     crate::stop();
 }
 
+/// The loader's, as it takes a module down (ModuleTable::take_down): every
+/// provider of the module whose image is `lo..hi` closed -- no call or job of
+/// it starts from here on, and its jobs are told to stop. Never waits.
+#[no_mangle]
+pub extern "C" fn rust_mgmt_close_range(lo: usize, hi: usize) {
+    crate::close_range(lo, hi);
+}
+
+/// The loader's: returns once no call or job of those providers runs; with
+/// `take` nonzero, then takes off what of them is still registered, said as
+/// its module's leaving it behind. Task context: it sleeps.
+#[no_mangle]
+pub extern "C" fn rust_mgmt_drain_range(lo: usize, hi: usize, take: i32) {
+    crate::drain_range(lo, hi, take != 0);
+}
+
 fn kind(k: u32) -> Option<Kind> {
     match k {
         MGMT_READ => Some(Kind::Read),

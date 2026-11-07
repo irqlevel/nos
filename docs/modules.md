@@ -66,7 +66,10 @@ the task that runs `rmmod` drops what the task that ran `insmod` built.
 Dropping a handle is enough because every unregister the kernel offers waits
 out a callback still running on another CPU before it returns: a command
 (`kernel_cmd_unregister`), a timer, a legacy or MSI-X interrupt, a task
-(`TaskHandle` joins it). One registration has no unregister at all: a softirq
+(`TaskHandle` joins it). And the drop never runs beside a call of the
+module's own commands or bus providers: the loader takes those back first
+([Unloading](#unloading)), so whatever the drop stops -- its tasks above all
+-- stays stopped, whatever order its fields go in. One registration has no unregister at all: a softirq
 handler (`kcore::softirq::register_for`) is the kernel's to call for as long
 as it runs. A module that imports it is **permanent**: the loader sees the
 import, `lsmod` says so, and `rmmod` refuses it -- the way Linux keeps a
@@ -234,9 +237,9 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
    `GLOB_DAT` relocations and arm64 ones `RELATIVE` and `JUMP_SLOT` -- calls
    through the PLT, whose slots are bound now rather than lazily.
 5. **checks the header**, `nos_module_info`, now that its pointers are real:
-   the magic, the layout version, the name, init and exit pointing into the
-   module's own code -- and the kernel interface the module was built
-   against (below).
+   the magic, the layout version, the name, init, stop and exit pointing
+   into the module's own code -- and the kernel interface the module was
+   built against (below).
 6. **protects it**: each segment gets the permissions its program header
    asks for -- read-only, read-execute or read-write -- every CPU's TLB is
    shot down, and on arm64 the new code is cleaned from the data cache and
@@ -244,14 +247,42 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
    which x86 does not need.
 7. **runs its init**, lending it the parameters and `insmod`'s output
    ([Parameters](#parameters)). A second module by the same name is refused
-   before this, and an init that fails leaves nothing behind.
+   before this, and an init that fails leaves nothing behind: what it left
+   registered is taken back as an unload's is, below, before its pages go.
 
-`rmmod <name>` runs the module's exit -- dropping its state -- and only then
-unmaps and frees its pages. A command the module registered is taken away
-with it, and `kernel_cmd_unregister` waits for any call of it still running
-before it returns, so the code under a running command is never freed.
-`rmmod` must not be run from the module's own command, which would wait for
-itself.
+### Unloading
+
+A shell command and a bus provider each run the module's code on the
+caller's task -- the console's, an SSH session's, a job's -- whenever a call
+comes, so a call can be running in a module at the moment it is told to go.
+Were the module's state dropped under it, a call could start a task after the
+drop had stopped the module's tasks -- a `cluster init` still running when
+`rmmod cluster` came could, as a read of the code found -- and that task
+would run on in code about to be freed. So
+`rmmod <name>`, the halt and an init that failed all take a module down in
+one order (`ModuleTable::take_down`), whatever module it is:
+
+1. **its commands and providers are closed** -- those whose handler is in
+   its image: no call of them starts from here on, their jobs are told to
+   stop, and none of the kind can be registered while the module goes
+   (`ModuleTable::unloading_at`);
+2. **its stop runs** (`kmod::Module::stop`, nothing unless the module says
+   otherwise): what a call still running may be blocked on that only the
+   module's going would end is told to end. sshd and api tell their servers
+   to stop, so that a call whose output a client is not taking gives up; hv
+   stops its guests, so that an `hv boot`, `hv wait` or `hv exec` returns;
+3. **the calls still running are waited out**, for as long as they take --
+   one still running is in the module's code. A wait past ten seconds is
+   said in the log, as a join's is (`Task::wait`), again each time it has
+   doubled: which commands and providers, how many calls, and on which task
+   (`bt <pid>` shows where it is);
+4. **the module is dropped**, with no call of its commands or providers
+   running or able to start;
+5. **what the drop left registered is taken off**, each said in the log as
+   the module's leaving it behind, and the mailboxes it left open are closed;
+
+and only then are its pages unmapped and freed. `rmmod` must not be run from
+the module's own command, which would wait for itself.
 
 Loads and unloads run in task context: a module's init and exit may sleep,
 and an exit that waits out a command still running may take as long as that
@@ -317,8 +348,9 @@ A module cannot call another module. What it offers others -- the host API
 above all -- it offers on the [management bus](mgmt.md): `kcore::mgmt::
 Provider::register(name, methods, descriptor, handler)` registers it, and the
 `Provider` kept in the module's state unregisters it when the module is
-dropped. The unregister waits out the provider's calls and jobs, so an unload
-never leaves a call in code that is gone. modtest has one, which the boot's
+dropped. The loader has closed it before that and waited out its calls and
+jobs ([Unloading](#unloading)), as the unregister would, so an unload never
+leaves a call in code that is gone. modtest has one, which the boot's
 `test_module_bus` calls and unloads under a running job.
 
 ## blkload
@@ -603,10 +635,10 @@ turning off, load again and ask the CPUs.
 
 Before any of that, its guests stop. A guest `hv start`ed runs on a vCPU task
 of its own until it is stopped, and an `hv boot` may be minutes into its
-time; the `Drop` stops both first -- which is also what lets an `hv exec` or
-`hv wait` still waiting on one return, since the command's unregistration
-waits for every call still running -- then unregisters the command, and only
-then turns the extension off. An `hv start` still reading its files when the
+time; the module's stop stops both -- which is also what lets an `hv exec` or
+`hv wait` still waiting on one return, since the loader waits for every call
+of the command still running before it drops the module -- and the `Drop`
+then unregisters the command, and only then turns the extension off. An `hv start` still reading its files when the
 unload begins finds the module going when it comes to add its guest, and
 stops that guest itself before it returns. `scripts/hv-linux-test.py` unloads with a
 guest running and checks the order in the log
@@ -795,6 +827,14 @@ than 255 bytes by the loader; and last feeds the loader damaged copies -- trunca
 machine's, an import the kernel lacks, no header, a bad magic, another kernel
 interface -- each of which it must refuse.
 
+`test_module_unload`, once there are tasks, holds the unload to its order
+([Unloading](#unloading)): it starts `modtest hold` on a task of its own, a
+call that returns only once the module's stop has run, and unloads modtest
+under it. The stop must find modtest's command and provider closed already
+-- a call of the one says "not found", of the other `no_provider` -- the
+call says so as it returns, and modtest's drop panics if a call of its
+command is still running.
+
 `slowexit` (`src/crates/modules/test/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
 shell's wait by hand or from a script.
@@ -806,9 +846,11 @@ shell's wait by hand or from a script.
   they are mapped from holds 63 such runs at a time.
 - A module that registers a block device, a net device or a softirq handler
   cannot be unloaded (above).
-- An unload waits for a running call of the module's commands for as long as
-  it runs -- in a task of its own, so it holds up nothing else, but a command
-  that never returns leaves its module unloading for good.
+- An unload waits for a running call of the module's commands and providers
+  for as long as it runs -- in a task of its own, so it holds up nothing
+  else, and saying so in the log every so often; but a call that never
+  returns, and that the module's stop does not end, leaves its module
+  unloading for good.
 - Modules cannot call each other; each carries its own `kcore`, so they share
   no statics either.
 - Only the functions `ffi` declares are exported -- not C++ classes, not

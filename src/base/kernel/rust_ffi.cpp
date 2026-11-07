@@ -2064,6 +2064,13 @@ unsigned long kernel_module_name_at(unsigned long addr, char* buf, unsigned long
     return kernel::ModuleTable::get_instance().name_at(addr, buf, size);
 }
 
+/* 1 when addr is in the image of a module that is going: what the bus
+   refuses a module's provider by once the loader has begun to close them */
+int kernel_module_unloading_at(unsigned long addr)
+{
+    return kernel::ModuleTable::get_instance().unloading_at(addr) ? 1 : 0;
+}
+
 /* What kernel_module_command collects of what insmod or rmmod says: their
    job's output and the line after it */
 static const unsigned long MODULE_COMMAND_OUTPUT = 4 * consts::KB;
