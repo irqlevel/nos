@@ -90,6 +90,10 @@ enum class Id : u16
     TcpRtt,
     TcpWait,
 
+    /* The memory's (group "mm"): the zeroing of free pages, a batch of a
+       zeroing task's at a time (mm/page_zeroer.cpp). */
+    MmZero,
+
     Count
 };
 
@@ -617,6 +621,31 @@ struct TcpWait
     u8 pad[2];
 };
 
+/* mm_zero: a zeroing task's batch -- the free pages it zeroed, 4 KiB ones
+   and pages of the huge pool, how long it took, and what ended it
+   (MmZeroEnd) */
+struct MmZero
+{
+    u32 cpu;
+    u32 pages;
+    u32 huge_pages;
+    u32 ns;
+    u8 end;
+    u8 pad[3];
+};
+
+enum MmZeroEnd : u8
+{
+    /* As many as a batch has */
+    MmZeroFull,
+    /* Nothing left to zero */
+    MmZeroNone,
+    /* Another task wanted the CPU */
+    MmZeroBusy,
+    /* The task told to stop */
+    MmZeroStop,
+};
+
 /* ---- the sites ----
    One function an event, building its payload off what the scheduler has in
    its hands, so that a site is a line: the check, and the call with the
@@ -633,6 +662,7 @@ void emit_sched_ipi(ulong cpu, ulong tasks);
 void emit_sched_preempt_deferred(Task* task, ulong cpu, ulong count, bool idle);
 void emit_idle(Id id, ulong cpu, Task* idle_task);
 void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable);
+void emit_mm_zero(ulong cpu, ulong pages, ulong huge_pages, ulong ns, MmZeroEnd end);
 
 /* The wakeup trigger: `trace freeze wakeup>N` arms it, and a task that gets
    its CPU later than that after a wakeup freezes the rings where they are,

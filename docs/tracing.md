@@ -592,6 +592,21 @@ promised room it did not have. With a field filter, over the UDP shell's
 > trace show tcp_wait what=cwnd              # sends the congestion window held
 ```
 
+## The memory's events
+
+Group `mm`: the zeroing of free pages ahead of their allocation
+([Paging](paging.md#zeroed-ahead-free-pages-and-the-two-lists)), a record a
+zeroing task's batch (`mm/page_zeroer.cpp`):
+
+| event | what it records |
+|---|---|
+| `mm_zero` | a batch: the `cpu` it ran on, the 4 KiB `pages` it moved onto the zeroed list and the `huge_pages` of the pool's free blocks it zeroed, how long it took (`ns`), and what ended it -- `full` (256 pages), `none` left to zero, the CPU `busy` with another task, or the task told to `stop` |
+
+So how fast free memory is zeroed, on which CPUs, and how often a task gave
+its CPU up to another is in the records: `trace on mm`, then `trace show
+mm_zero` -- or `trace show mm_zero end=busy` for the batches another task cut
+short. A batch that zeroed nothing is no record.
+
 ## An event of its own
 
 An event is four things in `kernel/tracepoint.{h,cpp}`: its number in

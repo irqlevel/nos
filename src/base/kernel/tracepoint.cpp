@@ -532,6 +532,24 @@ const Field TCP_WAIT_FIELDS[] = {
     { "pid", __builtin_offsetof(TcpWait, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
 };
 
+/* ---- the memory's events ---- */
+
+static_assert(sizeof(MmZero) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* What ended a zeroing task's batch (MmZeroEnd) */
+const char* const MM_ZERO_END[] = { "full", "none", "busy", "stop" };
+
+const Field MM_ZERO_FIELDS[] = {
+    { "cpu", __builtin_offsetof(MmZero, cpu), sizeof(u32), Kind::Cpu, nullptr, 0 },
+    /* 4 KiB pages off the other free list onto the zeroed one */
+    { "pages", __builtin_offsetof(MmZero, pages), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    /* Pages of the huge pool's free blocks */
+    { "huge_pages", __builtin_offsetof(MmZero, huge_pages), sizeof(u32), Kind::Unsigned, nullptr, 0 },
+    { "ns", __builtin_offsetof(MmZero, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    { "end", __builtin_offsetof(MmZero, end), sizeof(u8), Kind::Enum, MM_ZERO_END,
+      sizeof(MM_ZERO_END) / sizeof(MM_ZERO_END[0]) },
+};
+
 /* Sized by its lines, not by COUNT: an event added to tp::Id without its line
    here would be a description of zeroes -- a null name printed -- where now it
    is a build that fails. */
@@ -620,6 +638,9 @@ const Event EVENTS[] = {
       sizeof(TcpRtt), sizeof(TCP_RTT_FIELDS) / sizeof(TCP_RTT_FIELDS[0]), TCP_RTT_FIELDS },
     { "tcp_wait", "tcp", "a program's send or receive that waited, what for and how long",
       sizeof(TcpWait), sizeof(TCP_WAIT_FIELDS) / sizeof(TCP_WAIT_FIELDS[0]), TCP_WAIT_FIELDS },
+    { "mm_zero", "mm", "a batch of the free pages' zeroing: the 4 KiB pages and the huge pool's it zeroed, how "
+      "long it took and what ended it",
+      sizeof(MmZero), sizeof(MM_ZERO_FIELDS) / sizeof(MM_ZERO_FIELDS[0]), MM_ZERO_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
@@ -2417,6 +2438,17 @@ void emit_idle(Id id, ulong cpu, Task* idle_task)
     i.cpu = (u32)cpu;
     i.pid = task_pid(idle_task);
     put(id, i);
+}
+
+void emit_mm_zero(ulong cpu, ulong pages, ulong huge_pages, ulong ns, MmZeroEnd end)
+{
+    MmZero z = {};
+    z.cpu = (u32)cpu;
+    z.pages = (u32)stdlib::min(pages, (ulong)~0U);
+    z.huge_pages = (u32)stdlib::min(huge_pages, (ulong)~0U);
+    z.ns = (u32)stdlib::min(ns, (ulong)~0U);
+    z.end = end;
+    put(Id::MmZero, z);
 }
 
 void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable)

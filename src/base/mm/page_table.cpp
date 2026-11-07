@@ -68,11 +68,16 @@ PageTable::PageTable()
     , page_array_count_(0)
     , highest_phy_addr_(0)
     , free_pages_count_(0)
+    , zeroed_pages_count_(0)
     , total_pages_count_(0)
     , huge_pool_count_(0)
     , huge_pool_free_count_(0)
+    , huge_pool_zeroed_count_(0)
+    , huge_zero_block_(NO_HUGE_BLOCK)
+    , huge_zero_next_(0)
     , huge_pool_hint_(0)
     , huge_pool_window_on_(false)
+    , zero_check_(false)
 {
     klog(0, "PageTable 0x%p", this);
     for (size_t i = 0; i < stdlib::array_size(tmp_map_page_array_); i++)
@@ -84,6 +89,7 @@ PageTable::PageTable()
     {
         huge_pool_in_[i] = 0;
         huge_pool_free_bits_[i] = 0;
+        huge_pool_zeroed_bits_[i] = 0;
     }
 }
 
@@ -258,12 +264,12 @@ void PageTable::drain_early_free_list()
 
         free_pages_ = *(ulong *)virt_addr;
 
-        /* Nothing is zeroed on the way to the list. alloc_page_no_lock zeroes
-           every page it hands out and free_page_no_lock does not, so a page
-           sitting on the free list is not expected to be clean by anyone.
-           Zeroing here was a write pass over every byte of RAM the machine
-           has -- two thirds of the time this took, and all of it redone at
-           the first allocation. */
+        /* Nothing is zeroed on the way to the list. A page goes onto the
+           other list, as its last owner left it -- here, whatever the
+           firmware, the loader or the last boot left -- and an allocation
+           zeroes it, or the zeroing tasks do first (zero_free_page). Zeroing
+           here was a write pass over every byte of RAM the machine has --
+           two thirds of the time this took, on the one CPU the boot has. */
         Page* page = get_page(phy_addr);
         BUG_ON(!page);
         /* get_page's +1 was only for the lookup; a page on the free list must
@@ -802,6 +808,7 @@ void PageTable::check_free_list(stdlib::Printer& printer)
     const ulong kernel_phys_end = bpt.virt_to_phys(mmap.get_kernel_end());
 
     ulong on_list = 0;
+    ulong marked = 0;
     ulong in_reserved = 0;
     ulong in_kernel = 0;
     ulong outside_ram = 0;
@@ -839,6 +846,10 @@ void PageTable::check_free_list(stdlib::Printer& printer)
             continue;
         }
 
+        /* Zeroed, or on its way to the zeroed list (zero_free_page) */
+        if (page->is_zeroed())
+            marked++;
+
         /* A self-pointing ListEntry means the page is not on the free list,
            the same test alloc_contiguous_pages uses. */
         if (page->list_entry.flink == &page->list_entry)
@@ -854,8 +865,10 @@ void PageTable::check_free_list(stdlib::Printer& printer)
             outside_ram++;
     }
 
-    printer.printf("pages: %lu descriptors, %lu on the free list (counter says %lu)\n",
+    printer.printf("pages: %lu descriptors, %lu on the free lists (counter says %lu)\n",
         page_array_count_, on_list, free_pages_count_);
+    printer.printf("zeroed or being zeroed: %lu (counter says %lu on the zeroed list)\n",
+        marked, zeroed_pages_count_);
     printer.printf("free pages inside a reserved region: %lu\n", in_reserved);
     printer.printf("free pages inside the kernel image:  %lu\n", in_kernel);
     printer.printf("free pages outside usable RAM:       %lu\n", outside_ram);
@@ -876,47 +889,161 @@ void PageTable::check_free_list(stdlib::Printer& printer)
 Page* PageTable::alloc_page()
 {
     Page* page;
+    bool zeroed = false;
     {
         stdlib::AutoLock lock(lock_);
-        page = take_free_page_no_lock();
+        page = take_free_page_no_lock(false, zeroed);
     }
     if (page)
-        zero_page(page);
+        zero_unless_zeroed(page, zeroed);
     return page;
 }
 
 Page* PageTable::alloc_page_keeping(ulong keep)
 {
     Page* page = nullptr;
+    bool zeroed = false;
     {
         stdlib::AutoLock lock(lock_);
         if (free_pages_count_ > keep)
-            page = take_free_page_no_lock();
+            page = take_free_page_no_lock(true, zeroed);
     }
     if (page)
-        zero_page(page);
+        zero_unless_zeroed(page, zeroed);
     return page;
 }
 
 Page* PageTable::alloc_page_no_lock()
 {
-    Page* page = take_free_page_no_lock();
+    bool zeroed = false;
+    Page* page = take_free_page_no_lock(false, zeroed);
     if (page)
-        zero_page(page);
+        zero_unless_zeroed(page, zeroed);
     return page;
 }
 
-Page* PageTable::take_free_page_no_lock()
+Page* PageTable::take_free_page_no_lock(bool zeroed_first, bool& zeroed)
 {
-    if (free_pages_list_.is_empty())
-    {
+    stdlib::ListEntry* list = zeroed_first ? &zeroed_pages_list_ : &free_pages_list_;
+    if (list->is_empty())
+        list = zeroed_first ? &free_pages_list_ : &zeroed_pages_list_;
+    if (list->is_empty())
         return nullptr;
+
+    Page* page = CONTAINING_RECORD(list->remove_head(), Page, list_entry);
+    page->list_entry.init(); /* Self-pointing = not on any list */
+    zeroed = (list == &zeroed_pages_list_);
+    /* The mark and the list are changed together, under Lock: a page on the
+       zeroed list without it, or on the other with it, is the two come
+       apart -- a page handed out as zero that is not */
+    BUG_ON(page->is_zeroed() != zeroed);
+    page->set_zeroed(false);
+    BUG_ON(free_pages_count_ == 0);
+    free_pages_count_--;
+    if (zeroed)
+    {
+        BUG_ON(zeroed_pages_count_ == 0);
+        zeroed_pages_count_--;
+    }
+    return page;
+}
+
+void PageTable::unlist_free_page_no_lock(Page* page)
+{
+    BUG_ON(page->list_entry.flink == &page->list_entry);
+    page->list_entry.remove_init();
+    BUG_ON(free_pages_count_ == 0);
+    free_pages_count_--;
+    if (page->is_zeroed())
+    {
+        BUG_ON(zeroed_pages_count_ == 0);
+        zeroed_pages_count_--;
+        page->set_zeroed(false);
+    }
+}
+
+void PageTable::zero_unless_zeroed(Page* page, bool zeroed)
+{
+    if (!zeroed)
+    {
+        zero_page(page);
+        return;
+    }
+    if (!zero_check_)
+        return;
+
+    /* Mapped as zero_page maps it, and for the same reason */
+    Task* task = preempt_disable_task();
+    ulong va = tmp_map_page(page->get_phy_address());
+    if (va == 0)
+        PANIC("zero_unless_zeroed: no tmp_map slot for page 0x%lX: the window's %lu shared slots are all held",
+            page->get_phy_address(), (ulong)TMP_MAP_SHARED_COUNT);
+    check_zeroed(va, page->get_phy_address());
+    tmp_unmap_page(va);
+    preempt_enable_task(task);
+}
+
+void PageTable::check_zeroed(ulong va, ulong phy_addr)
+{
+    const ulong* words = reinterpret_cast<const ulong*>(va);
+    for (ulong i = 0; i < consts::PAGE_SIZE / sizeof(ulong); i++)
+    {
+        if (words[i] != 0)
+            PANIC("mm: free page 0x%lX written after it was zeroed: 0x%lX at offset 0x%lX -- a use after free",
+                phy_addr, words[i], i * sizeof(ulong));
+    }
+}
+
+void PageTable::set_zero_check(bool on)
+{
+    zero_check_ = on;
+}
+
+bool PageTable::is_zero_check()
+{
+    return zero_check_;
+}
+
+bool PageTable::zero_free_page(ulong keep)
+{
+    ulong flags = preempt_irq_save();
+    Page* page = nullptr;
+    {
+        stdlib::AutoLock lock(lock_);
+        if (free_pages_count_ > keep && !free_pages_list_.is_empty())
+        {
+            page = CONTAINING_RECORD(free_pages_list_.remove_tail(), Page, list_entry);
+            page->list_entry.init(); /* on no list: no run takes it */
+            BUG_ON(page->is_zeroed());
+            /* Marked while on its way: a free of it is a page freed twice,
+               and panics (free_page_no_lock). Still counted free. */
+            page->set_zeroed(true);
+        }
+    }
+    if (page == nullptr)
+    {
+        preempt_irq_restore(flags);
+        return false;
     }
 
-    Page* page = CONTAINING_RECORD(free_pages_list_.remove_head(), Page, list_entry);
-    page->list_entry.init(); /* Self-pointing = not on any list */
-    free_pages_count_--;
-    return page;
+    const ulong va = map_frame_slot(page->get_phy_address());
+    stdlib::mem_set(reinterpret_cast<void*>(va), 0, consts::PAGE_SIZE);
+    unmap_frame_slot(va);
+
+    {
+        stdlib::AutoLock lock(lock_);
+        BUG_ON(!page->is_zeroed() || page->list_entry.flink != &page->list_entry);
+        zeroed_pages_list_.insert_head(&page->list_entry);
+        zeroed_pages_count_++;
+    }
+    preempt_irq_restore(flags);
+    return true;
+}
+
+ulong PageTable::get_zeroed_pages_count()
+{
+    stdlib::AutoLock lock(lock_);
+    return zeroed_pages_count_;
 }
 
 /* Preemption is off from the map to the unmap, as a spinlock kept it when
@@ -940,7 +1067,7 @@ Page* PageTable::alloc_contiguous_pages(ulong count)
 {
     stdlib::AutoLock lock(lock_);
 
-    if (count == 0 || count > MAX_CONTIGUOUS_PAGES || free_pages_list_.is_empty())
+    if (count == 0 || count > MAX_CONTIGUOUS_PAGES || (free_pages_list_.is_empty() && zeroed_pages_list_.is_empty()))
         return nullptr;
 
     /* Walk the free list and for each free page, check if the next
@@ -956,61 +1083,73 @@ Page* PageTable::alloc_contiguous_pages(ulong count)
     static const ulong LONG_SEARCH_ENTRIES = 1024;
     ulong examined = 0;
 
-    auto* entry = free_pages_list_.flink;
-    while (entry != &free_pages_list_)
+    /* A run starts on one of the two lists and may go on across both: its
+       first page is looked for on each, and the rest only have to be free */
+    stdlib::ListEntry* const lists[] = { &free_pages_list_, &zeroed_pages_list_ };
+    for (stdlib::ListEntry* list : lists)
     {
-        examined++;
-        Page* first = CONTAINING_RECORD(entry, Page, list_entry);
-        ulong base_phy_addr = first->get_phy_address();
-        ulong base_index = (ulong)(first - page_array_);
-
-        if (base_index + count > page_array_count_)
+        auto* entry = list->flink;
+        while (entry != list)
         {
-            entry = entry->flink;
-            continue;
-        }
+            examined++;
+            Page* first = CONTAINING_RECORD(entry, Page, list_entry);
+            ulong base_phy_addr = first->get_phy_address();
+            ulong base_index = (ulong)(first - page_array_);
 
-        bool ok = true;
-        for (ulong j = 0; j < count; j++)
-        {
-            Page* p = &page_array_[base_index + j];
-            if (p->get_phy_address() != base_phy_addr + j * consts::PAGE_SIZE)
+            if (base_index + count > page_array_count_)
             {
-                ok = false;
-                break;
+                entry = entry->flink;
+                continue;
             }
-            /* Self-pointing ListEntry means the page is NOT on the free list. */
-            if (p->list_entry.flink == &p->list_entry)
+
+            bool ok = true;
+            for (ulong j = 0; j < count; j++)
             {
-                ok = false;
-                break;
+                Page* p = &page_array_[base_index + j];
+                if (p->get_phy_address() != base_phy_addr + j * consts::PAGE_SIZE)
+                {
+                    ok = false;
+                    break;
+                }
+                /* Self-pointing ListEntry means the page is on neither list:
+                   handed out, or being zeroed (zero_free_page). */
+                if (p->list_entry.flink == &p->list_entry)
+                {
+                    ok = false;
+                    break;
+                }
             }
+
+            if (!ok)
+            {
+                entry = entry->flink;
+                continue;
+            }
+
+            /* Found a contiguous run.  Remove all pages from the free lists
+               and zero those not known zero. */
+            for (ulong j = 0; j < count; j++)
+            {
+                Page* p = &page_array_[base_index + j];
+                const bool zeroed = p->is_zeroed();
+                unlist_free_page_no_lock(p);
+                if (zeroed && !zero_check_)
+                    continue;
+                ulong va = tmp_map_page(p->get_phy_address());
+                BUG_ON(!va);
+                if (zeroed)
+                    check_zeroed(va, p->get_phy_address());
+                else
+                    stdlib::mem_set((void*)va, 0, consts::PAGE_SIZE);
+                tmp_unmap_page(va);
+            }
+
+            if (examined > LONG_SEARCH_ENTRIES)
+                klog(0, "alloc_contiguous_pages: %lu pages found after %lu entries",
+                    count, examined);
+
+            return first;
         }
-
-        if (!ok)
-        {
-            entry = entry->flink;
-            continue;
-        }
-
-        /* Found a contiguous run.  Remove all pages from the free list
-           and zero them. */
-        for (ulong j = 0; j < count; j++)
-        {
-            Page* p = &page_array_[base_index + j];
-            p->list_entry.remove_init();
-            free_pages_count_--;
-            ulong va = tmp_map_page(p->get_phy_address());
-            BUG_ON(!va);
-            stdlib::mem_set((void*)va, 0, consts::PAGE_SIZE);
-            tmp_unmap_page(va);
-        }
-
-        if (examined > LONG_SEARCH_ENTRIES)
-            klog(0, "alloc_contiguous_pages: %lu pages found after %lu entries",
-                count, examined);
-
-        return first;
     }
 
     klog(0, "alloc_contiguous_pages: no run of %lu pages in %lu entries",
@@ -1020,6 +1159,13 @@ Page* PageTable::alloc_contiguous_pages(ulong count)
 
 void PageTable::free_page_no_lock(Page* page)
 {
+    /* A page handed out has no mark (take_free_page_no_lock,
+       unlist_free_page_no_lock): one with it is free already -- zeroed, or
+       being zeroed -- and freed a second time. */
+    if (page->is_zeroed())
+        PANIC("free_page: page 0x%lX is free already: freed twice", page->get_phy_address());
+    /* Back as its owner left it: onto the other list, whose hot end the
+       allocations take from */
     free_pages_count_++;
     free_pages_list_.insert_head(&page->list_entry);
 }
@@ -1119,6 +1265,7 @@ ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
         return 0;
 
     stdlib::AutoLock lock(lock_);
+    stdlib::AutoLock pool_lock(huge_pool_lock_);
 
     /* Once: a second call would find the bitmaps another CPU may be
        reading without the lock. */
@@ -1130,9 +1277,10 @@ ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
             break;
         if (!huge_block_free(block))
             continue;
+        /* Off whichever list each page is on, its mark and the counts with
+           it: the block is not known zero, whatever its pages were */
         for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
-            page_array_[block * HUGE_FRAME_PAGES + i].list_entry.remove_init();
-        free_pages_count_ -= HUGE_FRAME_PAGES;
+            unlist_free_page_no_lock(&page_array_[block * HUGE_FRAME_PAGES + i]);
         huge_pool_set(huge_pool_in_, block, true);
         huge_pool_set(huge_pool_free_bits_, block, true);
         huge_pool_count_++;
@@ -1145,45 +1293,82 @@ ulong PageTable::reserve_huge_pool_keeping(ulong bytes, ulong keep_pages)
     return huge_pool_count_;
 }
 
+bool PageTable::huge_pool_find(const ulong* bits, const ulong* minus, ulong& block)
+{
+    for (ulong n = 0; n < HUGE_POOL_WORDS; n++)
+    {
+        const ulong w = (huge_pool_hint_ + n) % HUGE_POOL_WORDS;
+        const ulong word = bits[w] & ~(minus != nullptr ? minus[w] : 0UL);
+        if (word == 0)
+            continue;
+        /* word is not 0: its lowest set bit is a block */
+        block = w * HUGE_POOL_WORD_BITS + static_cast<ulong>(__builtin_ctzl(word));
+        return true;
+    }
+    return false;
+}
+
+void PageTable::zero_huge_page(ulong phy_addr)
+{
+    ulong flags = preempt_irq_save();
+    ulong va = map_frame_slot(phy_addr);
+    stdlib::mem_set(reinterpret_cast<void*>(va), 0, consts::PAGE_SIZE);
+    unmap_frame_slot(va);
+    preempt_irq_restore(flags);
+}
+
+void PageTable::check_huge_page_zeroed(ulong phy_addr)
+{
+    ulong flags = preempt_irq_save();
+    ulong va = map_frame_slot(phy_addr);
+    check_zeroed(va, phy_addr);
+    unmap_frame_slot(va);
+    preempt_irq_restore(flags);
+}
+
 ulong PageTable::alloc_huge_frame()
 {
     ulong block = 0;
+    bool zeroed = false;
     {
-        stdlib::AutoLock lock(lock_);
+        stdlib::AutoLock lock(huge_pool_lock_);
         if (huge_pool_free_count_ == 0)
             return 0;
-        bool found = false;
-        for (ulong n = 0; n < HUGE_POOL_WORDS && !found; n++)
-        {
-            const ulong w = (huge_pool_hint_ + n) % HUGE_POOL_WORDS;
-            const ulong bits = huge_pool_free_bits_[w];
-            if (bits == 0)
-                continue;
-            /* bits is not 0: its lowest set bit is a free block. */
-            block = w * HUGE_POOL_WORD_BITS + static_cast<ulong>(__builtin_ctzl(bits));
-            found = true;
-        }
-        /* The count said one was free and no bit says which: the two have
-           come apart, and a block handed out of that is anyone's. */
-        if (!found)
+        /* A block known zero first, handed out as it is; else any free one,
+           zeroed below. A count that says there is one and no bit that says
+           which is the two come apart, and a block handed out of that is
+           anyone's. */
+        zeroed = huge_pool_zeroed_count_ != 0;
+        if (zeroed && !huge_pool_find(huge_pool_zeroed_bits_, nullptr, block))
+            PANIC("alloc_huge_frame: %lu blocks known zero by the count, none by the bitmap", huge_pool_zeroed_count_);
+        if (!zeroed && !huge_pool_find(huge_pool_free_bits_, nullptr, block))
             PANIC("alloc_huge_frame: %lu blocks free by the count, none by the bitmap", huge_pool_free_count_);
-        BUG_ON(!huge_pool_test(huge_pool_in_, block));
+        BUG_ON(!huge_pool_test(huge_pool_in_, block) || !huge_pool_test(huge_pool_free_bits_, block));
         huge_pool_set(huge_pool_free_bits_, block, false);
         huge_pool_free_count_--;
+        if (zeroed)
+        {
+            BUG_ON(huge_pool_zeroed_count_ == 0);
+            huge_pool_set(huge_pool_zeroed_bits_, block, false);
+            huge_pool_zeroed_count_--;
+        }
+        /* The block the zeroing is part way through is the new owner's, and
+           zeroed whole below; the zeroing goes on with another */
+        if (block == huge_zero_block_)
+            huge_zero_block_ = NO_HUGE_BLOCK;
         huge_pool_hint_ = block / HUGE_POOL_WORD_BITS;
     }
 
-    /* Zeroed off the lock, a page at a time through this CPU's frame slot,
-       as kernel_frame_read copies: interrupts off for one page's stores and
-       no longer, and no tmp_map_lock_ for each of the 512. */
+    /* Zeroed off the lock, a page at a time */
     const ulong phys = block * HUGE_FRAME_SIZE;
+    if (zeroed && !zero_check_)
+        return phys;
     for (ulong i = 0; i < HUGE_FRAME_PAGES; i++)
     {
-        ulong flags = preempt_irq_save();
-        ulong va = map_frame_slot(phys + i * consts::PAGE_SIZE);
-        stdlib::mem_set(reinterpret_cast<void*>(va), 0, consts::PAGE_SIZE);
-        unmap_frame_slot(va);
-        preempt_irq_restore(flags);
+        if (zeroed)
+            check_huge_page_zeroed(phys + i * consts::PAGE_SIZE);
+        else
+            zero_huge_page(phys + i * consts::PAGE_SIZE);
     }
     return phys;
 }
@@ -1194,12 +1379,45 @@ void PageTable::free_huge_frame(ulong phy_addr)
     if (phy_addr % HUGE_FRAME_SIZE != 0 || !huge_pool_block_of(phy_addr, block))
         PANIC("free_huge_frame: 0x%lX is no block of the huge pool", phy_addr);
 
-    stdlib::AutoLock lock(lock_);
+    stdlib::AutoLock lock(huge_pool_lock_);
     if (huge_pool_test(huge_pool_free_bits_, block))
         PANIC("free_huge_frame: block 0x%lX freed twice", phy_addr);
     BUG_ON(huge_pool_free_count_ >= huge_pool_count_);
+    /* Only a free block is known zero */
+    BUG_ON(huge_pool_test(huge_pool_zeroed_bits_, block));
     huge_pool_set(huge_pool_free_bits_, block, true);
     huge_pool_free_count_++;
+}
+
+bool PageTable::zero_free_huge_page()
+{
+    stdlib::AutoLock lock(huge_pool_lock_);
+    if (huge_zero_block_ == NO_HUGE_BLOCK)
+    {
+        ulong block = 0;
+        /* Every free block known zero, or none free: nothing to do */
+        if (huge_pool_zeroed_count_ == huge_pool_free_count_)
+            return false;
+        if (!huge_pool_find(huge_pool_free_bits_, huge_pool_zeroed_bits_, block))
+            PANIC("zero_free_huge_page: %lu blocks free and %lu known zero by the counts, none other by the bitmaps",
+                huge_pool_free_count_, huge_pool_zeroed_count_);
+        huge_zero_block_ = block;
+        huge_zero_next_ = 0;
+    }
+
+    /* Free, and not known zero, for as long as it is the zeroing's: an
+       allocation of it ends that (alloc_huge_frame) */
+    BUG_ON(!huge_pool_test(huge_pool_free_bits_, huge_zero_block_) ||
+        huge_pool_test(huge_pool_zeroed_bits_, huge_zero_block_));
+    zero_huge_page(huge_zero_block_ * HUGE_FRAME_SIZE + huge_zero_next_ * consts::PAGE_SIZE);
+    huge_zero_next_++;
+    if (huge_zero_next_ == HUGE_FRAME_PAGES)
+    {
+        huge_pool_set(huge_pool_zeroed_bits_, huge_zero_block_, true);
+        huge_pool_zeroed_count_++;
+        huge_zero_block_ = NO_HUGE_BLOCK;
+    }
+    return true;
 }
 
 ulong PageTable::get_huge_pool_blocks()
@@ -1210,8 +1428,14 @@ ulong PageTable::get_huge_pool_blocks()
 
 ulong PageTable::get_huge_pool_free()
 {
-    stdlib::AutoLock lock(lock_);
+    stdlib::AutoLock lock(huge_pool_lock_);
     return huge_pool_free_count_;
+}
+
+ulong PageTable::get_huge_pool_zeroed()
+{
+    stdlib::AutoLock lock(huge_pool_lock_);
+    return huge_pool_zeroed_count_;
 }
 
 PtePage* PageTable::walk_to_l2_locked(ulong virt_addr)
