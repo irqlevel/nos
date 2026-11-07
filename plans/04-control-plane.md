@@ -51,7 +51,7 @@ and service the virtqueues from the device side.
 ### 4.2 Guest networking
 - ~~A simple L2 bridge between guests' virtio-net and the physical NIC, **or** NAT
   using the existing IP stack.~~ Done as NAT: the guests' switch is behind
-  `hv0`, a virtual NIC in nos's stack, and `net/src/nat.rs` masquerades them
+  `hv0`, a virtual NIC in nos's stack, and `layers/net/src/nat.rs` masquerades them
   out through the default route's device (docs/hypervisor.md, "The way out").
 - ~~Give each guest a MAC; optionally run the existing DHCP logic host-side to
   hand out guest addresses, or bridge to the upstream DHCP.~~ A port is a MAC

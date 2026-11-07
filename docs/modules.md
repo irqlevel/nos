@@ -23,8 +23,9 @@ against that API and refuses anything it does not recognise.
 
 ## Writing one
 
-A module lives in `src/crates/modules/<name>/`. `hello` is the smallest one
-worth reading:
+A module lives in `src/crates/modules/<area>/<name>/`, its area what it is
+for: `cluster/`, `hypervisor/`, `mgmt/`, `net/`, `storage/`, `tools/`, `test/`.
+`hello` (`modules/test/hello`) is the smallest one worth reading:
 
 ```rust
 #![no_std]
@@ -85,10 +86,12 @@ shell](udp-shell.md); the handler gets the rest of the command line and an
 
 To add a module:
 
-1. `src/crates/modules/<name>/Cargo.toml`, a `staticlib` whose library is named
-   `mod_<name>`, depending on `kmod` and `kcore` (copy `hello`'s);
-2. add `modules/<name>` to the workspace `members` in `src/crates/Cargo.toml`
-   -- not to `default-members`, which is what the kernel's own build compiles;
+1. `src/crates/modules/<area>/<name>/Cargo.toml`, a `staticlib` whose library
+   is named `mod_<name>`, depending on `kmod` and `kcore` (copy `hello`'s: at
+   the same depth its paths to them are right as they are);
+2. add `modules/<area>/<name>` to the workspace `members` in
+   `src/crates/Cargo.toml` -- not to `default-members`, which is what the
+   kernel's own build compiles;
 3. add `<name>` to `MODULES` in the `Makefile`.
 
 ### Parameters
@@ -298,7 +301,7 @@ it up.
 A module compiled against one version of those declarations and loaded into
 a kernel built from another would call functions with arguments they no
 longer take. The build hashes the `ffi` crate's sources -- and the
-tracepoints' payloads kcore declares (`kcore/src/trace/events.rs`), bytes a
+tracepoints' payloads kcore declares (`base/kcore/src/trace/events.rs`), bytes a
 module's sites hand the kernel's `emit()` ([tracing](tracing.md#tracepoints-from-rust))
 -- into a digest that goes into every module's header and into the kernel,
 and the loader refuses a module whose digest is not the kernel's:
@@ -320,7 +323,7 @@ never leaves a call in code that is gone. modtest has one, which the boot's
 
 ## blkload
 
-`blkload` (`src/crates/modules/blkload`) runs a short load test against a block
+`blkload` (`src/crates/modules/storage/blkload`) runs a short load test against a block
 device -- a disk, or one of its partitions, by the name `disks` gives it --
 and reports IOPS, bandwidth and latency. Under QEMU, against its emulated
 NVMe disk:
@@ -388,7 +391,7 @@ release, or build both from one tree.
 
 ## netload
 
-`netload` (`src/crates/modules/netload`) is a UDP load test from either end of
+`netload` (`src/crates/modules/net/netload`) is a UDP load test from either end of
 the wire, so that [`profile`](profiler.md) has something to look at other
 than an idle machine: an idle twenty-CPU box spends about 0.06% of a core on
 anything at all, and the paths worth seeing -- the frame pool, the driver
@@ -481,7 +484,7 @@ are the `netwire` crate's, which the network layer is built on too.
 
 ## netblk
 
-`netblk` (`src/crates/modules/netblk`) serves an NVMe disk, or a partition of
+`netblk` (`src/crates/modules/storage/netblk`) serves an NVMe disk, or a partition of
 one, over UDP, zero-copy both ways: `netblk start nvme0 7000`, then
 `scripts/netblk.py <host> 7000 ...` from anywhere else. Its own page is
 [netblk](netblk.md). It takes its requests through the same listener netload
@@ -493,9 +496,9 @@ an interrupt handler still on its way out of the module's code.
 
 ## sshd
 
-`sshd` (`src/crates/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
+`sshd` (`src/crates/modules/net/sshd`) is an SSH server: `sshd allow <key>`, `sshd
 start`, and an OpenSSH client logs in to the kernel's shell. The protocol is a
-crate of its own, `src/crates/ssh`, which knows nothing of the kernel; the
+crate of its own, `src/crates/common/net/ssh`, which knows nothing of the kernel; the
 module is the kernel's side -- a listener task, a task for each connection,
 the files it keeps under `/etc/ssh`. Its page is [sshd](sshd.md). Nothing loads
 a module at boot by itself, so a machine that is to be reached only through
@@ -511,7 +514,7 @@ kernel but the exported functions.
 
 ## api
 
-`api` (`src/crates/modules/api`) is the host API: the management bus served
+`api` (`src/crates/modules/mgmt/api`) is the host API: the management bus served
 over HTTP/1.1 and a WebSocket, TLS 1.3 with a client's certificate required,
 to the programs that manage the machine -- the panel, `nosctl`, other hosts'
 panels. `api client add <name> <role> <fingerprint>`, `api start`. Its page is
@@ -525,12 +528,12 @@ leaves off -- the `web` crate's HTTP and WebSocket, and `conf` for api.toml.
 
 ## edit
 
-`edit` (`src/crates/modules/edit`) is a text editor, for a person at an SSH
+`edit` (`src/crates/modules/tools/edit`) is a text editor, for a person at an SSH
 session with a terminal: `edit /etc/rc`, from the shell `ssh <host>` gives,
 or `ssh -t <host> edit /etc/rc`. The image's `/etc/rc` loads it after sshd;
 on a machine whose `/etc/rc` came before that, `insmod /lib/modules/edit.ko`
 does, and a line saying so in `/etc/rc` keeps it -- an edit, now, of `/etc/rc`
-itself. The editor is a crate with no kernel in it, `src/crates/edit`, which
+itself. The editor is a crate with no kernel in it, `src/crates/common/text/edit`, which
 `scripts/edit-test.py` runs on the host; the module is its seat in the
 kernel: the command, the file read and written, and the session's terminal
 -- the keys typed (`Output::read_input`) and its size, which the session
@@ -578,7 +581,7 @@ so, rather than panic the kernel.
 
 ## hv
 
-`hv` (`src/crates/modules/hv`) is the [hypervisor](hypervisor.md), the
+`hv` (`src/crates/modules/hypervisor/hv`) is the [hypervisor](hypervisor.md), the
 beginning of [stage 3](../plans/03-hypervisor.md). It is two crates --
 `hvarch`, the CPU's virtualization extension and all of the hypervisor's
 `unsafe`, and `hv`, everything above it, which has three sites -- plus this
@@ -617,7 +620,7 @@ is sound because `run_on` does not return until the handler has run.
 
 ## heapbench
 
-`heapbench` (`src/crates/modules/heapbench`) times the kernel heap as Rust code
+`heapbench` (`src/crates/modules/test/heapbench`) times the kernel heap as Rust code
 reaches it -- `Box`, `Vec`, `String` go through the global allocator to
 `kernel_alloc`, and so does everything it allocates. Each workload runs on
 one CPU and then on N at once, a task bound to each CPU, and reports the
@@ -657,7 +660,7 @@ heapbench: 200 ms a run, on 1 CPU and on 4
 
 ## tlsbench
 
-`tlsbench` (`src/crates/modules/tlsbench`) times TLS 1.3 on this machine's
+`tlsbench` (`src/crates/modules/net/tlsbench`) times TLS 1.3 on this machine's
 CPUs: both pinned ends of `tls::pinned` -- a server and a client, each with
 a key made for the run -- in one kernel, over a pipe in memory, so that
 nothing is measured but the handshake, the crypto and the sessions' own
@@ -684,7 +687,7 @@ prints what it said; the numbers above are the AX41's, under KVM
 
 ## ipcnet
 
-`ipcnet` (`src/crates/modules/ipcnet`) is the message channel between hosts
+`ipcnet` (`src/crates/modules/cluster/ipcnet`) is the message channel between hosts
 (docs/ipc.md, "Between hosts: ipcnet"): the channel's router, which makes a
 mailbox on another host of the cluster an address here and `name@host` a
 name. Its folder is /etc/ipc (`insmod /lib/modules/ipcnet.ko conf=` names
@@ -723,7 +726,7 @@ as `add` and `remove` do -- one writer of the file.
 
 ## cluster
 
-`cluster` (`src/crates/modules/cluster`) is the cluster's registry
+`cluster` (`src/crates/modules/cluster/cluster`) is the cluster's registry
 (docs/cluster.md): every host of the cluster, its key and its address,
 kept through Raft by a member on each host, which gives ipcnet its peers.
 It needs ipcnet loaded first. Its folder is /etc/cluster (`insmod
@@ -775,7 +778,7 @@ could not name.
 ## Testing
 
 The boot self-test loads a module on both architectures. `modtest`
-(`src/crates/modules/modtest`) is built with the kernel and embedded in its
+(`src/crates/modules/test/modtest`) is built with the kernel and embedded in its
 image (`out/<arch>/modtest_blob.S`); `test_modules` in `kernel/test.cpp` loads
 it, and its init checks what a loader can get wrong -- initialised data,
 `.bss` (a megabyte of it, past the 512 KiB images were once held to), a
@@ -792,7 +795,7 @@ than 255 bytes by the loader; and last feeds the loader damaged copies -- trunca
 machine's, an import the kernel lacks, no header, a bad magic, another kernel
 interface -- each of which it must refuse.
 
-`slowexit` (`src/crates/modules/slowexit`) is never loaded by the kernel itself:
+`slowexit` (`src/crates/modules/test/slowexit`) is never loaded by the kernel itself:
 its exit takes eight seconds, for testing an `rmmod` that outlasts the
 shell's wait by hand or from a script.
 

@@ -23,7 +23,7 @@ updated: 2026-10-22
 
 ## Самый маленький настоящий модуль: `hello`
 
-В `src/crates/modules/hello/` два файла. Первый — `Cargo.toml`:
+В `src/crates/modules/test/hello/` два файла. Первый — `Cargo.toml`:
 
 ```toml
 [package]
@@ -36,11 +36,11 @@ name = "mod_hello"
 crate-type = ["staticlib"]
 
 [dependencies]
-kmod = { path = "../../kmod" }
-kcore = { path = "../../kcore" }
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
 ```
 
-Второй — [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hello/src/lib.rs), здесь он показан без doc-комментария:
+Второй — [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/test/hello/src/lib.rs), здесь он показан без doc-комментария:
 
 ```rust
 #![no_std]
@@ -62,7 +62,7 @@ impl kmod::Module for Hello {}
 
 impl Drop for Hello {
     fn drop(&mut self) {
-        kcore::trace!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
+        kcore::klog!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
     }
 }
 
@@ -73,7 +73,7 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         let _ = writeln!(out, "hello, {} -- call {} since the module was loaded", who, calls);
     })?;
 
-    kcore::trace!(0, "hello: loaded");
+    kcore::klog!(0, "hello: loaded");
     Ok(Box::new(Hello { _cmd: cmd }))
 }
 
@@ -93,13 +93,13 @@ kmod::module!(name: "hello", init: init);
 
 ## Свой модуль
 
-Скопируйте `hello` и дайте копии своё имя. Пусть это будет `greet`:
+Скопируйте `hello` и дайте копии своё имя. Модуль лежит в области `src/crates/modules/`, названной по тому, для чего он нужен (`net/`, `storage/`, `tools/`, `test/` и другие). Это руководство кладёт `greet` в `tools/`, на ту же глубину, что и `hello`, чтобы пути в его `Cargo.toml` остались верными:
 
 ```sh
-cp -r src/crates/modules/hello src/crates/modules/greet
+cp -r src/crates/modules/test/hello src/crates/modules/tools/greet
 ```
 
-В `src/crates/modules/greet/Cargo.toml` переименуйте пакет в `mod-<name>`, а библиотеку в `mod_<name>`. Makefile рассчитывает именно на такие имена: он собирает пакет `mod-greet` и линкует `libmod_greet.a`.
+В `src/crates/modules/tools/greet/Cargo.toml` переименуйте пакет в `mod-<name>`, а библиотеку в `mod_<name>`. Makefile рассчитывает именно на такие имена: он собирает пакет `mod-greet` и линкует `libmod_greet.a`.
 
 ```diff
  [package]
@@ -114,21 +114,21 @@ cp -r src/crates/modules/hello src/crates/modules/greet
  crate-type = ["staticlib"]
 ```
 
-Добавьте крейт в `members` рабочего пространства в `src/crates/Cargo.toml` (здесь строка сокращена). `default-members` не трогайте: по этому списку собирается само ядро.
+Добавьте крейт в `members` рабочего пространства в `src/crates/Cargo.toml`, в строку его области (здесь она сокращена). `default-members` не трогайте: по этому списку собирается само ядро.
 
 ```diff
--members = [..., "modules/hv", "modules/heapbench"]
-+members = [..., "modules/hv", "modules/heapbench", "modules/greet"]
+-    "modules/cluster/cluster", ..., "modules/tools/edit",
++    "modules/cluster/cluster", ..., "modules/tools/edit", "modules/tools/greet",
 ```
 
 Добавьте имя в `MODULES` в `Makefile`:
 
 ```diff
--MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench
-+MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench greet
+-MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster
++MODULES = hello modtest slowexit blkload netblk netload sshd hv heapbench edit api tlsbench ipcnet cluster greet
 ```
 
-Наконец, в `src/crates/modules/greet/src/lib.rs` поменяйте имя и текст справки команды, а имя модуля задайте в `kmod::module!(name: "greet", init: init)`.
+Наконец, в `src/crates/modules/tools/greet/src/lib.rs` поменяйте имя и текст справки команды, а имя модуля задайте в `kmod::module!(name: "greet", init: init)`.
 
 ### Ядро доступно через `kcore`
 
@@ -137,7 +137,7 @@ cp -r src/crates/modules/hello src/crates/modules/greet
 | `kcore::` | Что даёт модулю |
 |---|---|
 | `cmd` | `Command::register`, а также `Output::read_input` для команды, которая читает то, что печатает пользователь SSH |
-| `trace` | `trace!(level, ...)` пишет в лог ядра; уровень 0 виден всегда |
+| `klog` | `klog!(level, ...)` пишет в лог ядра; уровень 0 виден всегда |
 | `sync` | блокировки, которые владеют защищаемыми данными (`Mutex<T>`, `SpinLock<T>`, `IrqSpinLock<T>` и другие), а также `Event` и `WaitGroup` |
 | `task` | задачи: `spawn_with` и `spawn_on_with` запускают задачу, которая держит `Arc` на состояние модуля; `TaskHandle` при drop дожидается своей задачи; `sleep_ms` |
 | `time`, `random`, `cpu` | часы, пул случайных чисел ядра, номера CPU и межпроцессорные прерывания (IPI) |
@@ -154,11 +154,11 @@ let cmd = Command::register("hv", HELP, move |args, out| command(&for_cmd, args,
 
 На модули распространяются соглашения проекта. Вот главные правила:
 
-- **Пишите без `unsafe`.** Сначала ищите подходящий тип в `kcore`. Если такого нет, добавьте его в `kcore` один раз и объясните в комментарии, почему он корректен. Места с `unsafe` считает `scripts/unsafe-count.py modules/greet`.
+- **Пишите без `unsafe`.** Сначала ищите подходящий тип в `kcore`. Если такого нет, добавьте его в `kcore` один раз и объясните в комментарии, почему он корректен. Места с `unsafe` считает `scripts/unsafe-count.py mod-greet`.
 - **Не выделяйте и не освобождайте память, держа спин-блокировку.** Аллокатор страниц сбрасывает TLB на всех остальных CPU и ждёт ответа от каждого. CPU, который крутится на вашей блокировке, работает с выключенными прерываниями и ответить не может. Они ждут друг друга, пока через десять секунд ядро не запаникует и не назовёт CPU, которые так и не ответили. Поэтому соберите под блокировкой то, что нужно освободить, отпустите её и только потом освобождайте.
 - **Осторожнее с объектами, которые ждут при уничтожении.** UDP-слушатель, `TaskHandle` или обработчик прерывания при drop дожидаются своих обратных вызовов. Держите каждый такой объект в собственном `Lock<Option<..>>`: забирайте его через `take()` под блокировкой, а уничтожайте уже после того, как её отпустили. Если уничтожить его под блокировкой, которая нужна его ожиданию, получится взаимоблокировка.
 - **Никогда не вызывайте `rmmod` из собственной команды модуля.** Выгрузка ждала бы эту команду, а команда ждала бы выгрузку.
-- **Модуль может вызывать только то, что объявлено в `ffi`.** Новый сервис ядра добавляется в три шага: функция на C++ в `src/base/kernel/rust_ffi.cpp`, её объявление в `src/crates/ffi` и безопасная обёртка в `src/crates/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). От этого меняется хеш интерфейса, поэтому ядро и все модули пересобираются вместе.
+- **Модуль может вызывать только то, что объявлено в `ffi`.** Новый сервис ядра добавляется в три шага: функция на C++ в `src/base/kernel/rust_ffi.cpp`, её объявление в `src/crates/base/ffi` и безопасная обёртка в `src/crates/base/kcore` ([Adding a kernel service](/docs/rust#adding-a-kernel-service)). От этого меняется хеш интерфейса, поэтому ядро и все модули пересобираются вместе.
 
 ## Сборка
 

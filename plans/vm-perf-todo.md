@@ -186,7 +186,7 @@ build is at 99% and pgbench's writes at 111-161%. What is left:
   guest on the vCPU at its notify, and the disk's task, an E-core's, makes
   each command through the device's queue -- a call through the C ABI and
   its slot's lock each, one doorbell for what it took at once
-  (`modules/hv/src/disk.rs`'s `serve`, `block/src/devq.rs`'s `start`).
+  (`modules/hypervisor/hv/src/disk.rs`'s `serve`, `layers/block/src/devq.rs`'s `start`).
 - **4k writes at QD1: 90%** (45.9k against 50.8k), the file's 88% moved
   little: the request's host part, as under "4k I/O from one job" below.
 - **What the plan's P4 holds** (`plans/hv-local-disks.md`): a flush served
@@ -236,7 +236,7 @@ I/O completion, and many in one journal commit. pgbench's init (67%) is the
 same writes.
 
 - Where: `image.rs` (`grow`, `make_written`, `GROW_MAX_CHUNKS`),
-  `src/crates/fs/src/ext4/data.rs` (`allocate`, `mark_written`), `journal.rs`.
+  `src/crates/layers/fs/src/ext4/data.rs` (`allocate`, `mark_written`), `journal.rs`.
 - Levers: growing ahead of a sequential writer in the background, so that its
   write finds the blocks there; conversions of several guest flushes in one
   commit -- a flush still waits for the commit that makes its blocks written,
@@ -301,7 +301,7 @@ The levers, in the order the numbers put them:
 
 1. **The disk's task polls before it sleeps** -- for a request from the
    device and for its image's completions, a spin grown and dropped as the
-   halt poll's (`modules/hv/src/disk.rs`'s `serve`, `ImageQueue::wait`):
+   halt poll's (`modules/hypervisor/hv/src/disk.rs`'s `serve`, `ImageQueue::wait`):
    both its wakes, about 10 us of a QD1 request. QEMU's iothread polls.
 2. **The guest kicks less**: notifications off while the disk has requests
    out -- EVENT_IDX's `avail_event` left behind, the ring looked at again
@@ -325,7 +325,7 @@ reading the clock, under nos 50-80 us and under KVM 25-30 -- the same kernel.
   IPI a write of the ICR.
 - Not the paravirtual features KVM's guest has and nos's has not. nos offers
   KVM's signature, NOP_IO_DELAY and PV EOI (03e3ede8) and leaves the rest
-  out on purpose (`src/crates/hv/src/policy.rs`): PV TLB flushes, PV sched
+  out on purpose (`src/crates/hypervisor/hv/src/policy.rs`): PV TLB flushes, PV sched
   yield and PV spinlocks stand on steal time and help a guest whose CPUs get
   preempted, which a guest on cores of its own is not; kvmclock does what
   the invariant TSC does. KVM's PV IPIs spare a guest in physical x2APIC mode
@@ -335,7 +335,7 @@ reading the clock, under nos 50-80 us and under KVM 25-30 -- the same kernel.
   `tsc_known_freq`; under nos it is told the TSC's frequency on its command
   line (`tsc_early_khz`, which hvboot adds), runs on `tsc`, and its CPUID says
   nothing of it (KVM's leaf 0x40000010, or leaf 0x15;
-  `src/crates/hv/src/policy.rs`).
+  `src/crates/hypervisor/hv/src/policy.rs`).
 - What the exit costs past the world switch: 1011 ns handled and 545 to the
   next entry on average (`hv`'s report, `loop`); `hv bench profile` splits
   the rest.
@@ -372,8 +372,8 @@ known.
 sysbench's random reads of memory with one thread, 804 MiB/s against 949; 92%
 with four. Not the clock (MWAIT idle moved it by nothing). The nested walk:
 what the EPT's leaves say (2 MiB, their memory type, accessed and dirty
-flags), and what the EPT pointer asks of the walk (`src/crates/hv/src/npt.rs`,
-`src/crates/hvarch/src/x86/vmx.rs`). `perf stat -e dTLB-load-misses` in the
+flags), and what the EPT pointer asks of the walk (`src/crates/hypervisor/hv/src/npt.rs`,
+`src/crates/hypervisor/hvarch/src/x86/vmx.rs`). `perf stat -e dTLB-load-misses` in the
 guest under each would say whether it is the TLB.
 
 ## CPU-bound work: 96-98%

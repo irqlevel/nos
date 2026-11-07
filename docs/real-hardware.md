@@ -49,7 +49,7 @@ destination and the whole CPU mask.
 
 Networking works on the real internet, and this is the first machine to
 exercise the Rust **RTL8125** driver against silicon rather than a datasheet —
-QEMU has no model of that chip, so until this boot `drivers/r8125` had never
+QEMU has no model of that chip, so until this boot `drivers/net/r8125` had never
 seen the hardware it was written for. The DHCP client takes a public /26 lease
 from the host's network, the DNS resolver comes up on the server handed out
 with it, the box answers pings from anywhere, and the [UDP shell](udp-shell.md)
@@ -84,7 +84,7 @@ unlike the EX44 its only NIC is an **Intel I210** (`8086:1533`), so the
 driver being brought up was also the only channel there was to report
 through.
 
-**Network.** The Rust **igb** driver (`drivers/igb`, developed against QEMU's
+**Network.** The Rust **igb** driver (`drivers/net/igb`, developed against QEMU's
 82576 model) brings up the I210: DHCP takes an address, ARP and TCP flow, and
 the [UDP shell](udp-shell.md) and [netconsole](netconsole.md) are reachable
 across the internet. The I210 wanted four things the 82576 never did, and

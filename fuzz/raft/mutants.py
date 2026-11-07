@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mutants of the raft crate -- and of the cluster's registry, its first user
 -- the gate must catch: each one rule taken out of
-src/crates/raft/src/node.rs (or the file a mutant names), the fuzzer built
+src/crates/common/cluster/raft/src/node.rs (or the file a mutant names), the fuzzer built
 over it, and `raft-fuzz gate`
 run -- which must fail; and so must the scenario written for that rule, on
 its own. The source is put back after each, whatever happens (an exception,
@@ -19,7 +19,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-SRC = os.path.join(ROOT, 'src', 'crates', 'raft', 'src')
+SRC = os.path.join(ROOT, 'src', 'crates', 'common', 'cluster', 'raft', 'src')
 # The registry's mutants name their file from SRC.
 REGISTRY = os.path.join('..', '..', 'registry', 'src', 'lib.rs')
 OUT = os.path.join(ROOT, 'out', 'raft-mutants')
@@ -133,7 +133,7 @@ MUTANTS = [
      'head.extend_from_slice(&(self.sessions.len() as u32).to_le_bytes());\n        if !b.push(&head) {\n            return false;\n        }\n        for (&client, s) in self.sessions.iter() {',
      'head.extend_from_slice(&0u32.to_le_bytes());\n        if !b.push(&head) {\n            return false;\n        }\n        for (&client, s) in self.sessions.iter().take(0) {',
      'rsm_sessions_in_snapshot', 'rsm.rs'),
-    # The cluster's registry (src/crates/registry), the crate's first user.
+    # The cluster's registry (src/crates/common/cluster/registry), the crate's first user.
     ('registry_no_expiry', "an invitation kept past its time by the entry's clock",
      'self.invitations.retain(|i| i.expires > now);',
      'self.invitations.retain(|_| true);',

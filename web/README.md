@@ -101,7 +101,12 @@ the only HTML a page may use: any other tag is shown as the text it is
 
 Links inside content are written **without** a language: `/docs/hypervisor#a-disk`,
 `/howto/build`, `/blog/<slug>`, `/about`, `/hypervisor` -- the site adds `/en` or
-`/ru`. Source files and commits link to GitHub with full URLs.
+`/ru`. Source files and commits link to GitHub with full URLs. A link to a
+source file on master (`https://github.com/irqlevel/nos/blob/master/<path>`)
+is held to the tree by the repository's `make check` (`scripts/check-links.py`),
+not by the site's build, which a clone of web/ and docs/ alone has to run: a
+file renamed or moved with a post still linking to it fails CI, where it used to
+be a 404 on the site.
 
 ### What a build refuses
 

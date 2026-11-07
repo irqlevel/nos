@@ -17,7 +17,7 @@ Writing TLS ourselves was never the plan. It is a certificate parser, a chain bu
 
 ## rustls without std
 
-The kernel's Rust is `no_std`. It links `core` and `alloc` but not the standard library, so there are no files, sockets, clocks or OS randomness to call. rustls works in this mode, but its usual `read_tls` and `write_tls` take `std::io` traits. So the [`tls` crate](https://github.com/irqlevel/nos/blob/master/src/crates/tls/src/lib.rs) drives rustls's unbuffered API instead. `process_tls_records` returns one state at a time, such as bytes to send or a handshake waiting for the peer. Our loop does the reading, writing and buffering that `std::io` would have done.
+The kernel's Rust is `no_std`. It links `core` and `alloc` but not the standard library, so there are no files, sockets, clocks or OS randomness to call. rustls works in this mode, but its usual `read_tls` and `write_tls` take `std::io` traits. So the [`tls` crate](https://github.com/irqlevel/nos/blob/master/src/crates/layers/tls/src/lib.rs) drives rustls's unbuffered API instead. `process_tls_records` returns one state at a time, such as bytes to send or a handshake waiting for the peer. Our loop does the reading, writing and buffering that `std::io` would have done.
 
 One rule matters more than the rest: call `process_tls_records` once per turn. It consumes records as it goes. Calling it again just to ask "are we blocked?" processes the next record twice, and the connection dies a round trip later with `InappropriateMessage { got_type: ChangeCipherSpec }` ([HTTPS](/docs/tls#the-unbuffered-api)). The primitives come from rustls-rustcrypto, a provider built on the RustCrypto crates, which implement them in plain Rust.
 
@@ -40,7 +40,7 @@ pub trait Transport {
 }
 ```
 
-[`http.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/http.rs) hands `TlsStream` a `TcpPipe`, a wrapper around its connection that calls TCP directly. Dropping the TLS stream only sends close_notify, the message that ends a TLS session cleanly, and the HTTP client closes the connection itself.
+[`http.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/layers/net/src/http.rs) hands `TlsStream` a `TcpPipe`, a wrapper around its connection that calls TCP directly. Dropping the TLS stream only sends close_notify, the message that ends a TLS session cleanly, and the HTTP client closes the connection itself.
 
 ## Certificates and the clock
 

@@ -10,12 +10,12 @@ edition = "2021"
 
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/crates/ffi" }
-kcore = { path = "../../src/crates/kcore" }
-ipc = { path = "../../src/crates/ipc" }
+ffi = { path = "../../src/crates/base/ffi" }
+kcore = { path = "../../src/crates/base/kcore" }
+ipc = { path = "../../src/crates/layers/ipc" }
 # The events tasks wait on, which mailboxes may be made on (plans/ipc.md I2).
-events = { path = "../../src/crates/events" }
-ipcwire = { path = "../../src/crates/ipcwire" }
+events = { path = "../../src/crates/base/events" }
+ipcwire = { path = "../../src/crates/common/ipc/ipcwire" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.
