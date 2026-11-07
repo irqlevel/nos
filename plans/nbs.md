@@ -316,9 +316,13 @@ Ceph's BlueStore keeps that in RocksDB.
    a chunk moved to another set takes that set's. The set and its version
    are the chunk's epoch.
 2. A write is answered to the guest only once every replica of the chunk's
-   current set has it. A replica that has not answered in 2 s is taken out of
-   its set (the set's version up, committed) before the write is answered: a
-   write is never answered on a set the mds would not vouch for.
+   current set has it. A replica that has not answered in 0.5 s is taken out
+   of its set (the set's version up, committed) before the write is
+   answered: a write is never answered on a set the mds would not vouch for.
+   The client asks; the leader takes it out only once the cs does not answer
+   the leader either -- a client whose own way to a healthy cs is broken
+   waits, rather than strip that cs from sets other volumes share. With one
+   replica left, writes go on to it, said loudly in the log and in `nbs`.
 3. A cs refuses a request whose epoch is older than its own, answering with
    the newer one and the index it was committed at; a newer epoch it checks
    with its own host's mds at that index before it takes it and writes it
@@ -675,8 +679,12 @@ each new gate.
       deleted with every cs giving its chunks and fence back, and a host's
       nbs-cs unloaded and loaded again.
 - **N8, the client.** `nbsclient`; hv's `nbs:` disks; attach, fence,
-  reconcile, flush; `nbsload.ko`; the `cluster` target; nbs-test's I/O
-  phases, `hv-nbs-test.py`.
+  reconcile, flush; a replica taken out of its set after 0.5 s, the leader
+  looking at the cs first (decision 6); a cloud image poured into a new
+  volume (`hv create <name> <url> nbs size=...`, decided 2026-11-07), so that
+  a VM boots off NBS; `nbsload.ko`; the `cluster` target; nbs-test's I/O
+  phases, `hv-nbs-test.py`. A replica taken out stays out until N9 brings it
+  back.
 - **N9, repair.** A host or a device lost, epochs, a rebuild under writes, a
   host back; a scrub comparing replicas by checksum.
 - **N10.** Snapshots, images and clones.
@@ -695,29 +703,37 @@ each new gate.
   guest to the client's buffer, to a message, to the cs's buffer.
 - **The first write to a cold chunk** waits for the open mark's sync, 1 to 4
   ms on these drives.
-- **A host lost**: the writes to its chunks stall 2 s and a commit, then go
-  on to two replicas.
+- **A host lost**: the writes to its chunks stall 0.5 s, the leader's look
+  at the cs and a commit, then go on to two replicas.
 
 ## Decisions to confirm
 
-1. ipc across hosts, Erlang's way (recommended) -- or on one host only, with
-   NBS carrying its own traffic between hosts.
-2. TCP with TLS 1.3, keys pinned both ways, on one port, 39240; no UDP in the
-   first version.
-3. The mds off the data path: the client to the cs's directly.
+1. Built as recommended (I4): ipc across hosts, Erlang's way -- not on one
+   host only with NBS carrying its own traffic between hosts.
+2. Built as recommended (I3, I4): TCP with TLS 1.3, keys pinned both ways, on
+   one port, 39240; no UDP in the first version.
+3. Decided (N7): the mds off the data path, the client to the cs's
+   directly, each cs checking what it has not checked with its own host's
+   mds.
 4. Decided: one writer a volume, the attach fenced; a VM moved by a forced
    attach.
 5. Decided: 4 MiB chunks; room reserved at create, a clone's too; data on
    write.
-6. The client writes to all three at once and is answered when all three
-   have it; a replica silent for 2 s is taken out of the set first.
-7. Up to five voters, the rest learners.
-8. A third host for the runs on the hardware: a third server, or a small
-   cloud VM running nos as a voter with a small cs. A fourth for the
-   cluster to get back to three replicas by itself after a host is lost.
-9. The mds's state on disk as the Raft log and snapshots of the state held
-   in memory, not an LSM tree. An on-disk structure comes in only if the
-   state ever outgrows memory.
+6. Decided (2026-11-07): the client writes to all three at once and is
+   answered when all three have it; a replica silent for 0.5 s -- not the
+   2 s first written -- is taken out of the set first, and only once the
+   leader finds the cs silent too (rule 2). Writes answered by two of three
+   without waiting for the third, and a quorum with versions on every
+   replica, were weighed and left for the numbers to ask for (N11).
+7. Built as recommended (N5): up to five voters, the rest learners.
+8. Decided (2026-11-07): the runs on the hardware are nos on the EX44's
+   bare metal, one of the hosts and the one the VMs on NBS run on, and nos
+   VMs under KVM on the AX41 for the others. A fourth host, for the cluster
+   to get back to three replicas by itself after a host is lost, is another
+   VM there.
+9. Built as recommended (N6): the mds's state on disk as the Raft log and
+   snapshots of the state held in memory, not an LSM tree. An on-disk
+   structure comes in only if the state ever outgrows memory.
 10. Decided: the cluster's hosts and keys in a registry of their own, a
     small Raft group joined with a one-time token, built right after the
     raft crate and before NBS ([cluster.md](cluster.md)).
