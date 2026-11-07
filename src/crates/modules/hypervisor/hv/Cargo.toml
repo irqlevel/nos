@@ -1,0 +1,28 @@
+[package]
+name = "mod-hv"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_hv"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+# The hypervisor itself, and through it the CPU's extension. Neither crate is
+# in the kernel's own build (they are workspace members, not default ones):
+# they exist only inside this module, so a kernel without it carries none of
+# the hypervisor at all.
+hv = { path = "../../../hypervisor/hv" }
+# The frame formats: the guests' switch answers DHCP itself, and a module
+# cannot link the network layer to borrow them.
+netwire = { path = "../../../common/net/netwire" }
+# A cloud's qcow2 image made a raw disk (`hv convert`): no kernel in it, so
+# fuzz/diskimage runs the same code on the host.
+diskimage = { path = "../../../common/storage/diskimage" }
+# vm.toml's text: the strict TOML the host API's api.toml is written in too.
+conf = { path = "../../../common/text/conf" }
+# The vm provider's side of the management bus: the parameters a call is
+# handed, read strictly.
+mgmtwire = { path = "../../../common/ipc/mgmtwire" }

@@ -1,5 +1,5 @@
 //! The disk image converter on the host, from its own sources
-//! (src/crates/diskimage), as `hv convert` runs it (scripts/diskimage-test.py
+//! (src/crates/common/storage/diskimage), as `hv convert` runs it (scripts/diskimage-test.py
 //! drives this):
 //!
 //!     diskimage-test convert <image> <disk.raw>
@@ -271,36 +271,6 @@ impl Input for Stream<'_> {
     }
 }
 
-/// CRC-32 as zlib's crc32() has it.
-struct Crc {
-    table: [u32; 256],
-    value: u32,
-}
-
-impl Crc {
-    fn new() -> Crc {
-        let mut table = [0u32; 256];
-        for (n, slot) in table.iter_mut().enumerate() {
-            let mut c = n as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-            }
-            *slot = c;
-        }
-        Crc { table, value: 0xFFFF_FFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        for &b in data {
-            self.value = self.table[((self.value ^ u32::from(b)) & 0xFF) as usize] ^ (self.value >> 8);
-        }
-    }
-
-    fn finish(&self) -> u32 {
-        self.value ^ 0xFFFF_FFFF
-    }
-}
-
 fn inflate(cases: &str, answers: &str) -> i32 {
     let bytes = match std::fs::read(cases) {
         Ok(b) => b,
@@ -320,18 +290,18 @@ fn inflate(cases: &str, answers: &str) -> i32 {
         let data = &bytes[pos + 8..pos + 8 + len];
         pos += 8 + len;
 
-        let mut crc = Crc::new();
+        let mut crc = 0u32;
         let mut got = 0u64;
         let mut emit = |piece: &[u8]| {
             got += piece.len() as u64;
-            crc.update(piece);
+            crc = crc::crc32::update(crc, piece);
             Ok(())
         };
         let answer = inflater.inflate(&mut Stream { data, pos: 0 }, limit, &mut emit);
         match answer {
             Ok(()) => {
                 assert!(got == limit, "case {}: {} bytes out, of {}", n, got, limit);
-                out.push_str(&format!("ok {:08x}\n", crc.finish()));
+                out.push_str(&format!("ok {:08x}\n", crc));
             }
             Err(Stop::Fault(fault)) => out.push_str(&format!("fault {:?}\n", fault)),
             Err(_) => unreachable!("a stream in memory fails neither its reads nor its writes"),

@@ -48,7 +48,7 @@ sudo ./scripts/disklog.py read /dev/nvme0n1p1      # read the last boot
 
 It had not moved. (At the time the log ran on every boot of a machine with a prepared area. Since [0d70452](https://github.com/irqlevel/nos/commit/0d704526d5d421c69576d2e79a1af453a4e666df) it needs `disklog=on`, and without it an unchanged number says nothing, so check the entry's command line first.)
 
-The second counter is ext2's own. When nos's ext2 driver (C++ then, Rust now) mounts a filesystem read-write, it does what Linux does ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/fs/src/ext2.rs)):
+The second counter is ext2's own. When nos's ext2 driver (C++ then, Rust now) mounts a filesystem read-write, it does what Linux does ([`ext2.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/layers/fs/src/ext2.rs)):
 
 ```rust
             self.sb.state &= !STATE_VALID;

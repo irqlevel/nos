@@ -9,7 +9,7 @@
    function here is unreachable on arm64.
 
    The virtio bus stubs that used to be here are gone with the C++ virtio
-   drivers; the bus is Rust now (src/crates/virtio), and compiled for x86
+   drivers; the bus is Rust now (src/crates/drivers/virtio), and compiled for x86
    only. */
 
 namespace kernel

@@ -13,7 +13,7 @@ namespace kernel
 struct LoadedModule;
 
 /* Loadable kernel modules, written in Rust (docs/modules.md). A module is a
-   crate built on src/crates/kmod and linked into a position-independent ELF
+   crate built on src/crates/base/kmod and linked into a position-independent ELF
    shared object, a .ko: code that runs in the kernel, reaches it only through
    the functions the ffi crate declares, and can be put into a running kernel
    and taken out of it again.

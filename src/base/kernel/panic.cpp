@@ -16,7 +16,7 @@
 #include <hal/power.h>
 
 
-/* The disk log is Rust (src/crates/block/src/disklog.rs). */
+/* The disk log is Rust (src/crates/layers/block/src/disklog.rs). */
 extern "C" {
 void rust_disklog_log(const char* line);
 void rust_netconsole_log(const char* line, unsigned long len);

@@ -28,12 +28,14 @@ Safety here is not something tested for afterwards. Every design and every line 
 The source tree has two halves with a hard line between them. **C++ covers the fundamentals**: booting and bringing up each architecture, the HAL (hardware abstraction layer), page tables and allocators, the scheduler, locks, interrupt dispatch, timers, the core of the shell, the module loader, and the few drivers that everything else stands on (serial, consoles, timers, the 8042, PCI, MSI-X, ACPI). **Everything built on top of them is Rust**: the drivers for disks, network cards, USB and virtio, the block layer, the network stack, the filesystems, TLS, SSH, the random pool and the hypervisor. There is no `src/base/net`, `src/base/fs` or `src/base/block` any more. Those layers moved to Rust on 18 September 2026 ([how](/blog/cpp-to-rust-layers)).
 
 ```text
-modules/*     sshd, netblk, netload, blkload, hv ...   loadable .ko, Rust only
+modules/      sshd, netblk, hv, api, cluster ...   loadable .ko, Rust only
 ------------------------------------------------------------------------------
-drivers/*     nvme, virtio_{blk,net,scsi,rng}, r8168, r8125, igb, usb
-layers        block   net (over netwire)   fs   virtio   tls   random
-kcore         safe wrappers around kernel services
-ffi           raw extern "C" declarations, nothing else
+drivers/      block/ nvme virtio_blk virtio_scsi   net/ igb r8125 r8168
+              virtio_net   rng/ virtio_rng   usb/   virtio/
+layers/       block   net   fs   tls   mgmt   ipc
+common/       netwire, ssh, web, raft, extfmt, crc ...  no kernel in them
+base/         kcore: safe wrappers around kernel services; ffi: raw
+              extern "C" declarations, nothing else; random
 ========================== C ABI: rust_ffi.cpp ===============================
 C++ and asm   boot, hal/ over arch/x86_64 and arch/arm64, mm/, scheduler,
               interrupts, timers, locks, ACPI, PCI, MSI-X, consoles,
@@ -44,7 +46,7 @@ A kernel service reaches Rust in three steps: a C++ function in `rust_ffi.cpp` (
 
 **Modules** are how optional things ship: a server, a load generator, a diagnostic tool. A module is a Rust crate built into a `.ko` file and loaded into a running kernel with `insmod`. The loader links it against an export table generated from the `ffi` declarations. It gives each segment the permissions its header asks for, but never writable and executable at once. It also refuses a module built against a different kernel interface. The SSH server is a module. So is `netblk`, which serves an NVMe disk over UDP with zero copies, and so is the hypervisor.
 
-**The hypervisor** is three crates. `hvarch` drives the CPU's virtualization extension and holds nearly all of the hypervisor's `unsafe`: 203 sites. `hv` holds everything above it (guest memory, the loop that handles guest exits, the emulated devices): about 13,000 lines of code with 4 `unsafe` sites. `modules/hv` holds the shell commands and has no `unsafe` at all. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor whatsoever.
+**The hypervisor** is three crates. `hvarch` drives the CPU's virtualization extension and holds nearly all of the hypervisor's `unsafe`: 203 sites. `hv` holds everything above it (guest memory, the loop that handles guest exits, the emulated devices): about 13,000 lines of code with 4 `unsafe` sites. `modules/hypervisor/hv` holds the shell commands and has no `unsafe` at all. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor whatsoever.
 
 The details are in [Rust in the kernel](/docs/rust) and [Project layout](/docs/project-layout).
 

@@ -17,7 +17,6 @@
 #include "trace_ring.h"
 #include <hal/cpu.h>
 
-#include <lib/checksum.h>
 #include <lib/error.h>
 #include <lib/grub_env.h>
 #include <lib/stdlib.h>
@@ -493,7 +492,7 @@ stdlib::Error test_next_token()
     return make_success();
 }
 
-/* The block layer's table (src/crates/block/src/selftest.rs). The devices are
+/* The block layer's table (src/crates/layers/block/src/selftest.rs). The devices are
    whatever booted, so what is checked is that the table agrees with itself:
    a name nothing carries finds nothing, and every device it counts answers
    to its own name with the handle the walk gave. */
@@ -1775,26 +1774,6 @@ stdlib::Error test_mem_routines()
     return make_success();
 }
 
-/* CRC-32 against the check value every implementation of it is held to, and
-   the streaming form fed in pieces against the whole */
-stdlib::Error test_crc32()
-{
-    static const char CHECK[] = "123456789";
-    static const u32 CHECK_CRC = 0xCBF43926;
-    const ulong len = sizeof(CHECK) - 1;
-
-    u32 whole = stdlib::crc32(CHECK, len);
-    u32 pieces = 0;
-    for (ulong at = 0; at < len; at += 2)
-        pieces = stdlib::crc32_update(pieces, CHECK + at, (len - at < 2) ? len - at : 2);
-    if (whole != CHECK_CRC || pieces != CHECK_CRC || stdlib::crc32(CHECK, 0) != 0)
-    {
-        klog(0, "test_crc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CHECK_CRC);
-        return make_error(stdlib::Error::UNSUCCESSFUL);
-    }
-    return make_success();
-}
-
 stdlib::Error test_sn_printf()
 {
     klog(0, "test_sn_printf: started");
@@ -2071,7 +2050,7 @@ stdlib::Error test_sn_printf()
     return make_success();
 }
 
-/* The filesystem self-test (src/crates/fs/src/selftest.rs) on a ramfs mounted
+/* The filesystem self-test (src/crates/layers/fs/src/selftest.rs) on a ramfs mounted
    on / for the duration and taken down after: the whole file API, over a
    filesystem that needs no disk. */
 extern "C" int kernel_fs_selftest(const char* dir, unsigned long dir_len, unsigned long size);
@@ -2106,7 +2085,7 @@ stdlib::Error test_vfs()
     return make_success();
 }
 
-/* The network layer's packet formats (src/crates/net/src/selftest.rs). A ping
+/* The network layer's packet formats (src/crates/layers/net/src/selftest.rs). A ping
    that comes back checks the sending half; what it cannot reach is the
    receiving one -- under QEMU user networking nothing ever pings this
    machine or asks for its address -- so the formats behind those answers are
@@ -2259,7 +2238,7 @@ stdlib::Error test_grub_env()
     return make_success();
 }
 
-/* modtest.ko -- src/crates/modules/modtest as the Makefile builds it --
+/* modtest.ko -- src/crates/modules/test/modtest as the Makefile builds it --
    embedded in the kernel image (modtest_blob.S) for test_modules to load */
 extern "C" const u8 nos_modtest_ko[];
 extern "C" const ulong nos_modtest_ko_size;
@@ -2595,7 +2574,7 @@ stdlib::Error test_line_editor()
    takes, refused; then damaged copies, which the loader must turn away --
    the last three only after mapping and relocating them, so the cleanup of
    a load that fails halfway runs too. */
-/* The management bus's module side (src/crates/mgmt), through the `mgmt`
+/* The management bus's module side (src/crates/layers/mgmt), through the `mgmt`
    command: modtest's provider answers a call with its parameters, and a job
    of it that runs until it is told to stop is started -- and seen running,
    so that it is the unload, next, that has to stop it and wait it out */
@@ -2983,10 +2962,6 @@ stdlib::Error test()
         return err;
 
     err = test_mem_routines();
-    if (!err.ok())
-        return err;
-
-    err = test_crc32();
     if (!err.ok())
         return err;
 

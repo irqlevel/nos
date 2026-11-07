@@ -17,7 +17,7 @@ use crate::{Error, Result, Vendor};
 const PAGE: u64 = 4096;
 /// A block of the huge pool, as kcore::frame has it.
 const HUGE: u64 = 2 << 20;
-/// As hv/src/memory.rs has them.
+/// As hypervisor/hv/src/memory.rs has them.
 pub const MAX_GPA: u64 = 1 << 48;
 const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
 const MAX_ABSENT_PAGES: usize = 64;

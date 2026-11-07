@@ -32,7 +32,7 @@ explains them at length.
 **It is a loadable module, not part of the image.** `hvarch` (the CPU's
 extension, all of the `unsafe`) and `hv` (everything above it) are workspace
 members but not *default* members, so the kernel's own build does not compile
-them; they exist only inside `modules/hv` → `hv.ko`. A machine that runs no
+them; they exist only inside `modules/hypervisor/hv` → `hv.ko`. A machine that runs no
 guests therefore carries none of it, and above all leaves its CPUs in the
 state they booted in. The iteration loop is `insmod`/`rmmod` rather than
 rebuild-and-boot, which matters most for exactly the part this document says
@@ -69,7 +69,7 @@ Done so far, against **3.1**:
 - `hv`: the machine, the per-CPU pages (allocated in task context, because
   the IPI that hands one over may not allocate) and the enabled mask, both
   under one lock, freed only after the CPU says it is done.
-- `modules/hv`: the `hv` command, and a `Drop` that turns the extension off
+- `modules/hypervisor/hv`: the `hv` command, and a `Drop` that turns the extension off
   and reads back what is left.
 - `scripts/hv-test.py`, on both architectures.
 

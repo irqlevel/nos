@@ -6,7 +6,7 @@
 // connections a host, each one request at a time, as the API serves them --
 // and the stream, a WebSocket of RFC 6455's over a connection of its own.
 //
-// Within what a host lets in at once (modules/api/src/config.rs): two
+// Within what a host lets in at once (modules/mgmt/api/src/config.rs): two
 // connections in their handshake, of all its clients, and four of one key --
 // one past either is reset, which a page's requests read as ECONNRESET. So
 // the panel makes one connection to a host at a time, keeps two for

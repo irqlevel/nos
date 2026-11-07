@@ -11,7 +11,7 @@ tags: [safety, debugging, hypervisor, testing, x86-64, arm64]
 
 ## Join под каждой остановкой
 
-Join — это когда одна задача ждёт завершения другой. В nos это `Task::Wait`, и через него проходит каждый путь остановки в ядре. `TaskHandle` на стороне Rust ждёт свою задачу, когда его уничтожают ([task.rs](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/task.rs)). `hv stop` ждёт задачу гостя в `finish()`. Диск гостя, `FileDisk`, при удалении ждёт свою дисковую задачу. `rmmod` и выключение хоста тоже заканчиваются join'ом.
+Join — это когда одна задача ждёт завершения другой. В nos это `Task::Wait`, и через него проходит каждый путь остановки в ядре. `TaskHandle` на стороне Rust ждёт свою задачу, когда его уничтожают ([task.rs](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/task.rs)). `hv stop` ждёт задачу гостя в `finish()`. Диск гостя, `FileDisk`, при удалении ждёт свою дисковую задачу. `rmmod` и выключение хоста тоже заканчиваются join'ом.
 
 Вот старый join целиком:
 

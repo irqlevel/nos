@@ -101,7 +101,7 @@ SHELL_MARKERS = [
 # What no boot may say, with ACPI or without: that its kernel took an MSR
 # for there and was refused it at an access not ready for a refusal -- the
 # policy answers what the guest's CPUID says it has and refuses the rest
-# (`hv/src/policy.rs`) -- and the panic a refused read of a machine-check
+# (`hypervisor/hv/src/policy.rs`) -- and the panic a refused read of a machine-check
 # register is.
 NEVER = [
     r"unchecked MSR access error",
@@ -271,7 +271,7 @@ def vm_commands(args):
     claim_lines = ["hv cores shared", claim_rw, claim_rw, claim_ro, claim_stop[0],
                    claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2], "hv cores own"]
     # A guest whose console goes to nos's log, printing as fast as it can:
-    # the log takes a boot's worth and then a rate (`modules/hv/src/guest.rs`,
+    # the log takes a boot's worth and then a rate (`modules/hypervisor/hv/src/guest.rs`,
     # LogLine), and says how many it left out; the guest's own console keeps
     # all of it. dmesg's count of the lines it has pushed out is read just
     # before the flood and just after (`flood_checks`).
@@ -286,7 +286,7 @@ def vm_commands(args):
     flood_stop = "hv stop %d secs=0" % fv
     flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
                    flood_console, flood_stop]
-    # A VM kept in a folder (`modules/hv/src/store.rs`): /vms/t0/vm.toml
+    # A VM kept in a folder (`modules/hypervisor/hv/src/store.rs`): /vms/t0/vm.toml
     # written by hv create -- and not written over -- started by its name,
     # which every command then takes, refused a second time while it is on
     # the list, its console in console.log there with hv's lines around it,
@@ -1001,7 +1001,7 @@ def disk(args):
           x("grep virtio /proc/interrupts"),
           "hv list"]
     # Several of the guest's requests at once, as a disk's tasks serve them
-    # (`modules/hv/src/disk.rs`): four files written side by side and their
+    # (`modules/hypervisor/hv/src/disk.rs`): four files written side by side and their
     # sums taken; then, the page cache gone with a remount, read back side
     # by side off the device -- the image's reads in lanes of their own, its
     # writes one at a time -- and the sums the same.
