@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NBS fuzz: NBS's crates on the host (fuzz/nbs, plans/nbs.md, "Tested"),
-each held to a model of its own -- for now the metadata's state machine, the
-`meta` target (src/crates/common/storage/nbsmeta, N6):
+each held to a model of its own. The metadata's state machine, the `meta`
+target (src/crates/common/storage/nbsmeta, N6):
   - random histories of every command -- members, devices, volumes made,
     grown and deleted, attaches and detaches, the leader's digests -- spoiled
     bytes among them, every answer held to a model written from the plan's
@@ -23,9 +23,21 @@ each held to a model of its own -- for now the metadata's state machine, the
 and every allocation the crate makes held to the 512 KiB one block of the
 kernel's heap gives (fuzz/raft's heap.rs, which the crate shares).
 
-    python3 scripts/nbs-fuzz.py                  # the gate
-    python3 scripts/nbs-fuzz.py --seconds 600    # a meta campaign from seed 1
-    python3 scripts/nbs-fuzz.py --mutants        # and fuzz/nbs/mutants.py
+The chunk server's engine, the `cs` target (src/crates/common/storage/nbscs,
+N7): fences, writes, reads, flushes, closes and frees over disks with a write
+cache, the power cut within and between them -- each write not yet flushed
+kept, lost or torn, a sector of the cs's own torn inside now and then, a bit
+of a copy rotted -- and the cs opened again after every cut, held to every
+fence and open mark answered, every chunk closed reading what it held, every
+sector a value it may have, no record lost; a disk with something else on it
+never taken for blank. NBS's messages, the `wire` target (nbswire): every
+message read back as itself, and spoiled bytes read as none or as a message
+that encodes to them.
+
+    python3 scripts/nbs-fuzz.py                              # the gate: every target
+    python3 scripts/nbs-fuzz.py --seconds 600                # a meta campaign from seed 1
+    python3 scripts/nbs-fuzz.py --target cs --seconds 600    # a cs campaign
+    python3 scripts/nbs-fuzz.py --mutants                    # and fuzz/nbs/mutants.py
 
 fuzz/nbs/mutants.py takes one rule at a time out of the crate and must see the
 gate fail. Needs cargo on the host. Exit code 0 = every check held.
@@ -46,7 +58,8 @@ VENDOR = os.path.join(ROOT, "src", "crates", "vendor")
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--seed", type=int, default=1, help="the campaign's first seed (1)")
-    p.add_argument("--seconds", type=int, help="a meta campaign this long, instead of the gate")
+    p.add_argument("--seconds", type=int, help="a campaign this long, instead of the gate")
+    p.add_argument("--target", choices=["meta", "cs", "wire"], default="meta", help="the campaign's target (meta)")
     p.add_argument("--mutants", action="store_true", help="the mutants too, after the gate")
     args = p.parse_args()
 
@@ -60,7 +73,7 @@ def main():
         sys.exit("nbs-fuzz: fuzz/nbs did not build")
     binary = os.path.join(OUT, "release", "nbs-fuzz")
     if args.seconds is not None:
-        run = [binary, "meta", "--seed", str(args.seed), "--seconds", str(args.seconds)]
+        run = [binary, args.target, "--seed", str(args.seed), "--seconds", str(args.seconds)]
     else:
         run = [binary, "gate"]
     code = subprocess.run(run, cwd=ROOT).returncode

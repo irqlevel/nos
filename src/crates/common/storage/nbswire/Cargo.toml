@@ -1,0 +1,16 @@
+[package]
+name = "nbswire"
+version = "0.1.0"
+edition = "2021"
+
+# What NBS's services say to each other over the message channel
+# (plans/nbs.md, N7): a client's requests to a chunk server and its
+# answers, and a chunk server's questions to its own host's mds. No kernel
+# in it and no unsafe: nbs-cs.ko and nbs-mds.ko speak it, the client in hv
+# will (N8), and fuzz/nbs's wire target reads it from noise.
+[lib]
+
+[dependencies]
+codec = { path = "../../codec" }
+nbscs = { path = "../nbscs" }
+nbsmeta = { path = "../nbsmeta" }

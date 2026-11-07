@@ -667,6 +667,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-nbs-cs"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "kcore",
+ "kmod",
+ "nbscs",
+ "nbswire",
+]
+
+[[package]]
 name = "mod-nbs-mds"
 version = "0.1.0"
 dependencies = [
@@ -674,7 +685,9 @@ dependencies = [
  "kcore",
  "kmod",
  "mgmtwire",
+ "nbscs",
  "nbsmeta",
+ "nbswire",
  "raft",
  "raftmember",
 ]
@@ -725,6 +738,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nbscs"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "nbsmeta",
+]
+
+[[package]]
 name = "nbsmeta"
 version = "0.1.0"
 dependencies = [
@@ -732,6 +753,15 @@ dependencies = [
  "ipcwire",
  "raft",
  "sha2",
+]
+
+[[package]]
+name = "nbswire"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "nbscs",
+ "nbsmeta",
 ]
 
 [[package]]
