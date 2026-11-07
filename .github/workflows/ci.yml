@@ -197,6 +197,18 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/raft-test.py
 
+      # A metadata that places a chunk's two replicas on one host, reserves
+      # room twice or forks between members looks like one that works --
+      # until the host is lost, or the pool runs out. NBS's metadata on the
+      # host: random histories of every command held to a model of the
+      # plan's placement rules, snapshots read back and spoiled, replicas
+      # held to the same digests.
+      - name: NBS fuzz (host)
+        if: matrix.arch == 'aarch64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/nbs-fuzz.py
+
       # The device tree the arm64 boot is handed, the Multiboot2 tags and
       # the ACPI tables the x86 one is, the firmware's memory map, the
       # command line, the GRUB environment block on /boot, a module's .ko:

@@ -672,6 +672,7 @@ dependencies = [
  "codec",
  "kcore",
  "kmod",
+ "mgmtwire",
  "nbsmeta",
  "raft",
  "raftmember",
@@ -729,6 +730,7 @@ dependencies = [
  "codec",
  "ipcwire",
  "raft",
+ "sha2",
 ]
 
 [[package]]
