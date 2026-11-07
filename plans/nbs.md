@@ -557,7 +557,69 @@ each new gate.
     registry made among them first.
 - **N6, the metadata.** `nbsmeta` and its target: volumes, hosts, devices,
   placement, the snapshot of the state, the digest; the commands and the
-  `nbs` provider.
+  `nbs` provider. Done (docs/nbs.md), with decisions 4, 5 and 11 taken as
+  written. As built:
+  - **What is stored** (`nbsmeta`'s `storage.rs`) is as "What is stored"
+    has it:
+    - a cs a host, kept by the host's name, so a member replaced keeps its
+      cs and devices;
+    - a device by its id, with its slots: 4 MiB each, after a slot for the
+      cs's superblock and its table of slots twice (`device_slots`);
+    - replica sets shared by every chunk on the same three cs's;
+    - a chunk in 8 bytes (its set, its count, its flags), a freed one
+      chained onto a free list through its set;
+    - a volume with its own host, its writer by generation, its readers,
+      and its map.
+
+    Every table is bounded, and every count is held to its rules again
+    when a snapshot is read back.
+  - **Placement** (`place.rs`) is "Where replicas go", in integers:
+    - the volume's own host first, then the most room left, ties broken by
+      a hash of the volume, the chunk and the cs;
+    - found whole on a copy of the room, then made, so a volume that does
+      not fit takes nothing;
+    - with four hosts or more, refused where it leaves too little room to
+      rebuild the biggest host, counted in sum;
+    - refused as too few hosts when fewer than three take new chunks at
+      all, as no room when three or more do and are full.
+  - **The commands** are a device added and drained; a volume made (made
+    again the same is answered as it is), deleted (one gone already
+    answered so), grown (never shrunk); an attach (a new generation each
+    time, another host's writer refused unless forced) and a detach by
+    generation; and the digest. The attach and the detach are in the
+    state for N8, and nothing asks for them yet.
+  - **The snapshot is a stream.** `FrozenState` writes the tables a piece
+    at a time from the copy-on-write handles taken at its index, and a
+    restore reads them back through `codec::Stream`, held to every rule
+    (`check_storage`: the counts, the free list walked, each cs's room).
+    The state is never in one buffer, which the kernel's heap would refuse
+    past 512 KiB.
+  - **The digest** is the SHA-256 of the snapshot's bytes, taken every 64
+    entries. The leader proposes its own, every member holds its own to
+    it, and a member whose own differs stops (raftmember's `App::halt`)
+    and says where.
+  - **Read your writes**: a change is answered once the host it was typed
+    at has applied it too (raftmember's `ask`, the leader's answer carrying
+    the entry's index). nbs-test's x86-64 run found the gap: the member
+    fills in an answer during its turn and publishes its view only at the
+    turn's end, so a volume made and then read on one host could be missing.
+  - **When the log is compacted**: raft's floor of 1 MiB, not the 64 MiB
+    "The mds's state on disk" has. A small state is cheap to write, and a
+    start then replays less. `compact=` changes it; nbs-test gives 4096.
+  - **The shell and the bus**: `nbs devices add|drain`, `nbs cs`, `nbs
+    volume create|delete|resize`, `nbs volumes`, `nbs volume <name>`, and
+    the `nbs` provider with its descriptor.
+    - Reads are this member's view.
+    - `nbs devices add` finds the device on this host by its id or its
+      name, and refuses one with no id or one that something holds.
+      Nothing is written to it before N7.
+  - **Tests**:
+    - `fuzz/nbs`'s `meta` target against a model of its own (its own
+      placement, an fsck of its own, snapshots read back, spoiled and
+      continued, and two members' digests), with fifteen mutants;
+    - `fuzz/raft`'s `nbsmeta` target, taken along;
+    - nbs-test's N6 phase on three hosts' pools, through restarts, a host
+      replaced by a snapshot, and a member removed.
 - **N7, the cs.** `nbscs` and its target; `nbs-cs.ko`: its pool (ids,
   claims, `DiskQueue`, refusals), fences, open marks, reads and writes,
   garbage.
@@ -592,8 +654,10 @@ each new gate.
 2. TCP with TLS 1.3, keys pinned both ways, on one port, 39240; no UDP in the
    first version.
 3. The mds off the data path: the client to the cs's directly.
-4. One writer a volume, the attach fenced; a VM moved by a forced attach.
-5. 4 MiB chunks; room reserved at create, a clone's too; data on write.
+4. Decided: one writer a volume, the attach fenced; a VM moved by a forced
+   attach.
+5. Decided: 4 MiB chunks; room reserved at create, a clone's too; data on
+   write.
 6. The client writes to all three at once and is answered when all three
    have it; a replica silent for 2 s is taken out of the set first.
 7. Up to five voters, the rest learners.
@@ -606,8 +670,8 @@ each new gate.
 10. Decided: the cluster's hosts and keys in a registry of their own, a
     small Raft group joined with a one-time token, built right after the
     raft crate and before NBS ([cluster.md](cluster.md)).
-11. Placement and repair as in "Where replicas go" and "How three are
-    kept":
+11. Decided: placement and repair as in "Where replicas go" and "How three
+    are kept":
     - the volume's own host first, then the hosts with the most room;
     - a cs down after 5 s, out after 10 min;
     - rebuilds at a third of a link;

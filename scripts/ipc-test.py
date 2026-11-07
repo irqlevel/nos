@@ -132,8 +132,16 @@ def accel_of(arch):
     return "kvm" if os.path.exists("/dev/kvm") and platform.machine() in ("x86_64", "AMD64") else "tcg"
 
 
-def qemu(arch, accel, image, log, hub, i, iso):
+def qemu(arch, accel, image, log, hub, i, iso, disks=()):
+    """Host i's QEMU: its root `image`, and each of `disks` -- raw images --
+    a virtio disk of its own after it."""
     lan_mac = hub.mac(i)
+    more = []
+    for k, d in enumerate(disks):
+        tag = "more%d" % k
+        dev = "virtio-blk-device,drive=%s" % tag if arch == "aarch64" else \
+            "virtio-blk-pci,drive=%s,disable-legacy=on,disable-modern=off" % tag
+        more += ["-drive", "file=%s,format=raw,id=%s,if=none" % (d, tag), "-device", dev]
     if arch == "aarch64":
         cpu = {"hvf": ["-accel", "hvf", "-cpu", "host"], "kvm": ["-accel", "kvm", "-cpu", "host"]}.get(
             accel, ["-accel", "tcg", "-cpu", "cortex-a72"])
@@ -146,7 +154,7 @@ def qemu(arch, accel, image, log, hub, i, iso):
             "-device", "virtio-net-device,netdev=lan,mac=%s" % lan_mac,
             "-netdev", hub.netdev(i),
             "-device", "virtio-rng-device",
-            "-serial", "file:" + log, "-display", "none"]
+            "-serial", "file:" + log, "-display", "none"] + more
     cpu = ["-enable-kvm", "-cpu", "host"] if accel == "kvm" else ["-cpu", "max"]
     return ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", "2"] + cpu + [
         "-cdrom", iso, "-serial", "file:" + log,
@@ -154,7 +162,7 @@ def qemu(arch, accel, image, log, hub, i, iso):
         "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
         "-device", "virtio-net-pci,netdev=lan,mac=%s,disable-legacy=on,disable-modern=off" % lan_mac,
         "-netdev", hub.netdev(i),
-        "-device", "virtio-rng-pci"]
+        "-device", "virtio-rng-pci"] + more
 
 
 PING = re.compile(r"ipc ping: to=\S+ sent=(\d+) answered=(\d+) wrong=(\d+) bounced=(\d+) timeouts=(\d+) "

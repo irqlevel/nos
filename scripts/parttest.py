@@ -134,11 +134,13 @@ def mbr_image(path):
         put(path, start, marker(i + 1))
 
 
-def gpt_image(path):
+def gpt_image(path, size_mb=GPT_DISK_MB, parts=GPT_PARTS, unique=gpt_unique, disk_guid=DISK_GUID, marked=True):
     """A GPT disk: the protective MBR that says to look at LBA 1, a header
-    with the checksum the kernel verifies, and an entry array."""
-    total = GPT_DISK_MB * 1024 * 1024 // SECTOR
-    sparse(path, GPT_DISK_MB * 1024 * 1024)
+    with the checksum the kernel verifies, and an entry array -- this test's
+    two partitions, or `parts` (first and last LBA each) of `size_mb`, the
+    i-th's unique GUID `unique(i)`, as nbs-test.py makes its hosts' pools."""
+    total = size_mb * 1024 * 1024 // SECTOR
+    sparse(path, size_mb * 1024 * 1024)
 
     # The protective MBR: one entry of type 0xEE over the whole disk
     sector = bytearray(SECTOR)
@@ -152,10 +154,10 @@ def gpt_image(path):
     put(path, 0, bytes(sector))
 
     entries = bytearray(128 * 128)
-    for i, (first, last) in enumerate(GPT_PARTS):
+    for i, (first, last) in enumerate(parts):
         at = i * 128
         entries[at:at + 16] = LINUX_DATA_GUID
-        entries[at + 16:at + 32] = gpt_unique(i)
+        entries[at + 16:at + 32] = unique(i)
         entries[at + 32:at + 40] = struct.pack("<Q", first)
         entries[at + 40:at + 48] = struct.pack("<Q", last)
     put(path, 2, bytes(entries))
@@ -169,7 +171,7 @@ def gpt_image(path):
     header[32:40] = struct.pack("<Q", total - 1)     # the backup, not written
     header[40:48] = struct.pack("<Q", 34)
     header[48:56] = struct.pack("<Q", total - 34)
-    header[56:72] = DISK_GUID
+    header[56:72] = disk_guid
     header[72:80] = struct.pack("<Q", 2)             # the entry array
     header[80:84] = struct.pack("<I", 128)           # slots
     header[84:88] = struct.pack("<I", 128)           # bytes each
@@ -177,8 +179,9 @@ def gpt_image(path):
     header[16:20] = struct.pack("<I", zlib.crc32(bytes(header)) & 0xFFFFFFFF)
     put(path, 1, bytes(header))
 
-    for i, (first, _last) in enumerate(GPT_PARTS):
-        put(path, first, marker(i + 1))
+    if marked:
+        for i, (first, _last) in enumerate(parts):
+            put(path, first, marker(i + 1))
 
 
 class Shell:

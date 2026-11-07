@@ -1,0 +1,140 @@
+{
+  "schema": 1,
+  "provider": "nbs",
+  "title": {"en": "Block storage", "ru": "Блочное хранилище"},
+  "help": {
+    "en": "NBS's metadata as this host's member has it: the members, each host's chunk server and its devices, and the volumes, each chunk of them on three hosts.",
+    "ru": "Метаданные NBS, какими их видит участник на этом хосте: участники, сервер чанков каждого хоста и его устройства, тома, каждый чанк которых лежит на трёх хостах."
+  },
+  "ui": {"section": "storage", "order": 20, "icon": "database"},
+  "methods": {
+    "status": {
+      "kind": "read",
+      "title": {"en": "Member", "ru": "Участник"},
+      "help": {
+        "en": "This host's member of the metadata service: its role, the leader, how far it has applied, and its state's newest digest.",
+        "ru": "Участник службы метаданных на этом хосте: его роль, лидер, докуда он применил журнал, и последний дайджест его состояния."
+      }
+    },
+    "hosts": {
+      "kind": "read",
+      "title": {"en": "Members", "ru": "Участники"}
+    },
+    "cs": {
+      "kind": "read",
+      "title": {"en": "Chunk servers", "ru": "Серверы чанков"}
+    },
+    "volumes": {
+      "kind": "read",
+      "title": {"en": "Volumes", "ru": "Тома"}
+    },
+    "volume": {
+      "kind": "read",
+      "title": {"en": "Volume", "ru": "Том"},
+      "help": {
+        "en": "One volume, and which hosts hold its replicas: a VM started on the first reads its own.",
+        "ru": "Один том и хосты, на которых лежат его реплики: ВМ, запущенная на первом, читает свои."
+      },
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}}
+      }
+    },
+    "volume_create": {
+      "kind": "action",
+      "title": {"en": "New volume", "ru": "Новый том"},
+      "help": {
+        "en": "Made again with the same name and size, the volume is answered as it is; with another size, refused.",
+        "ru": "Если том с тем же именем и размером уже есть, он возвращается как есть; с другим размером — отказ."
+      },
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
+        "size_mib": {"type": "int", "required": true, "title": {"en": "Size, MiB", "ru": "Размер, МиБ"}},
+        "host": {
+          "type": "string",
+          "title": {"en": "Its own host", "ru": "Его хост"},
+          "help": {
+            "en": "Where one replica of each chunk goes, and its VM runs: this host when none is given.",
+            "ru": "Куда ложится одна реплика каждого чанка и где работает его ВМ: этот хост, если не указан."
+          }
+        }
+      }
+    },
+    "volume_delete": {
+      "kind": "action",
+      "title": {"en": "Delete", "ru": "Удалить"},
+      "confirm": {
+        "en": "The volume and everything on it are gone for good. Type its name to go on.",
+        "ru": "Том и всё, что на нём, будут удалены навсегда. Введите его имя, чтобы продолжить."
+      },
+      "confirm_typed": "name",
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}}
+      }
+    },
+    "volume_resize": {
+      "kind": "action",
+      "title": {"en": "Grow", "ru": "Увеличить"},
+      "params": {
+        "name": {"type": "string", "required": true, "title": {"en": "Name", "ru": "Имя"}},
+        "size_mib": {"type": "int", "required": true, "title": {"en": "New size, MiB", "ru": "Новый размер, МиБ"}}
+      }
+    }
+  },
+  "resources": {
+    "volumes": {
+      "title": {"en": "Volumes", "ru": "Тома"},
+      "list": "volumes",
+      "items": "volumes",
+      "key": "name",
+      "fields": {
+        "name": {"type": "string", "title": {"en": "Name", "ru": "Имя"}},
+        "volume": {"type": "int", "title": {"en": "Number", "ru": "Номер"}},
+        "size": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "chunks": {"type": "int", "title": {"en": "Chunks", "ru": "Чанки"}},
+        "host": {"type": "string", "title": {"en": "Its host", "ru": "Его хост"}},
+        "writer": {"type": "string", "title": {"en": "Attached on", "ru": "Подключён на"}},
+        "generation": {"type": "int", "title": {"en": "Generation", "ru": "Поколение"}}
+      },
+      "columns": ["name", "size", "chunks", "host", "writer"],
+      "actions": [
+        {"method": "volume_resize", "params": {"name": "$name"}},
+        {"method": "volume_delete", "params": {"name": "$name"}}
+      ]
+    },
+    "cs": {
+      "title": {"en": "Chunk servers", "ru": "Серверы чанков"},
+      "list": "cs",
+      "items": "cs",
+      "key": "host",
+      "fields": {
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "member": {"type": "bool", "title": {"en": "Member", "ru": "Участник"}},
+        "size": {"type": "bytes", "title": {"en": "Size", "ru": "Размер"}},
+        "reserved": {"type": "bytes", "title": {"en": "Reserved", "ru": "Занято"}},
+        "free": {"type": "bytes", "title": {"en": "Free", "ru": "Свободно"}}
+      },
+      "columns": ["host", "member", "size", "reserved", "free"]
+    },
+    "hosts": {
+      "title": {"en": "Members", "ru": "Участники"},
+      "list": "hosts",
+      "items": "hosts",
+      "key": "host",
+      "fields": {
+        "host": {"type": "string", "title": {"en": "Host", "ru": "Хост"}},
+        "member": {"type": "int", "title": {"en": "Incarnation", "ru": "Воплощение"}},
+        "vote": {
+          "type": "enum",
+          "title": {"en": "Vote", "ru": "Голос"},
+          "values": {
+            "voter": {"en": "votes", "ru": "голосует"},
+            "learner": {"en": "learns", "ru": "учится"},
+            "joining": {"en": "joining", "ru": "входит"}
+          }
+        },
+        "leader": {"type": "bool", "title": {"en": "Leads", "ru": "Лидер"}}
+      },
+      "columns": ["host", "member", "vote", "leader"]
+    }
+  }
+}

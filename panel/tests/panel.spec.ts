@@ -94,6 +94,56 @@ test('the cluster: its hosts listed, a host invited and its token shown, the inv
   await expect(invitations).not.toContainText('mock-c');
 });
 
+test('block storage: volumes listed, one made, grown, refused smaller, deleted with its name typed', async ({ page }) => {
+  const host = await login(page);
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await expect(page.getByRole('heading', { name: 'Block storage' })).toBeVisible();
+  await expect(page.getByTestId('resource-volumes')).toContainText('web-root');
+  await expect(page.getByTestId('resource-cs')).toContainText('mock-d');
+  await expect(page.getByTestId('resource-hosts')).toContainText('mock-b');
+  await page.getByRole('button', { name: /New volume/ }).click();
+  const form = page.getByTestId('form-nbs-volume_create');
+  await form.locator('input[name=name]').fill('pw-vol');
+  await form.locator('input[name=size_mib]').fill('64');
+  await form.getByRole('button', { name: /New volume/ }).click();
+  await expect(page.getByTestId('answer')).toContainText('"volume"');
+  /* Made again with another size: refused, said in the form */
+  await form.locator('input[name=size_mib]').fill('65');
+  await form.getByRole('button', { name: /New volume/ }).click();
+  await expect(form.getByRole('alert')).toContainText('another size');
+
+  await page.goto(`/en/h/${host}/p/nbs`);
+  const volumes = page.getByTestId('resource-volumes');
+  await expect(volumes).toContainText('pw-vol');
+  await volumes.getByRole('row', { name: /pw-vol/ }).getByRole('button', { name: 'Grow' }).click();
+  const grow = page.getByTestId('form-nbs-volume_resize');
+  await grow.locator('input[name=size_mib]').fill('32');
+  await grow.getByRole('button', { name: 'Grow' }).click();
+  await expect(grow.getByRole('alert')).toContainText('never made smaller');
+  await grow.locator('input[name=size_mib]').fill('128');
+  await grow.getByRole('button', { name: 'Grow' }).click();
+  await expect(page.getByTestId('answer')).toContainText('"volume"');
+
+  await page.goto(`/ru/h/${host}/p/nbs`);
+  await expect(page.getByRole('heading', { name: 'Блочное хранилище' })).toBeVisible();
+  await expect(page.getByTestId('resource-volumes')).toContainText('128');
+
+  /* Deleted only once its name is typed again */
+  await page.goto(`/en/h/${host}/p/nbs`);
+  await volumes.getByRole('row', { name: /pw-vol/ }).getByRole('button', { name: 'Delete' }).click();
+  const del = page.getByTestId('form-nbs-volume_delete');
+  await del.getByRole('button', { name: 'Delete' }).click();
+  await expect(del).toContainText('gone for good');
+  const confirm = del.getByRole('button', { name: 'Confirm' });
+  await expect(confirm).toBeDisabled();
+  await del.getByLabel('Type it here').fill('pw-vo');
+  await expect(confirm).toBeDisabled();
+  await del.getByLabel('Type it here').fill('pw-vol');
+  await confirm.click();
+  await expect(volumes).not.toContainText('pw-vol');
+  await expect(volumes).toContainText('web-root');
+});
+
 test('a read run from its form shows its answer', async ({ page }) => {
   const host = await login(page);
   await page.goto(`/en/h/${host}/p/system`);

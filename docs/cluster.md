@@ -207,7 +207,17 @@ asks, and the typed name is the admin's word that they are gone.
   random start each time the member starts, so that a registration of an
   earlier start, applied again as the member starts over its log, is never
   taken for this start's (recover, which elects its member at once over the
-  whole log, found it).
+  whole log, found it). The leader's answer says the entry the command was
+  applied at, and the shell is answered once this host's member has
+  published a view that far, for 5 s at most: what is read next on the host
+  it was typed at holds the change. Without that, an answer could come
+  before the view that holds its change. The member fills in the answer
+  during its turn and publishes its view at the turn's end, and a member
+  that does not lead can have the leader's answer before the append that
+  commits the entry: one over 4 KiB goes by the bulk connection, which is
+  not ordered with the other. nbs-test's x86-64 run, under TCG on a busy
+  host, read the chunk servers on the host a volume was just made at, and
+  the volume was not there.
 - **Raft's membership** follows the registry a change at a time, made by the
   leader: a removed host taken out, a new one in as a learner, a learner
   made a voter once it holds the log, a voter past the first five made a

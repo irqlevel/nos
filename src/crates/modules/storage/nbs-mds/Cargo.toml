@@ -3,11 +3,13 @@ name = "mod-nbs-mds"
 version = "0.1.0"
 edition = "2021"
 
-# NBS's metadata service on this host (plans/nbs.md, N5): raft's replicated
-# state machine over NBS's metadata (nbsmeta), its log on this host's root,
-# its messages over ipc to `nbs.mds` on every member -- raftmember's member,
-# with NBS's own: the cluster's id on every message, a host offered the
-# cluster, a host that lost its state told apart from the member it was.
+# NBS's metadata service on this host (plans/nbs.md, N5 and N6): raft's
+# replicated state machine over NBS's metadata (nbsmeta), its log on this
+# host's root, its messages over ipc to `nbs.mds` on every member --
+# raftmember's member, with NBS's own: the cluster's id on every message, a
+# host offered the cluster, a host that lost its state told apart from the
+# member it was, the state's digest held to the leader's; the devices and
+# volumes of the shell's commands and of the `nbs` provider on the bus.
 [lib]
 name = "mod_nbs_mds"
 crate-type = ["staticlib"]
@@ -19,3 +21,5 @@ raft = { path = "../../../common/cluster/raft" }
 raftmember = { path = "../../cluster/raftmember" }
 nbsmeta = { path = "../../../common/storage/nbsmeta" }
 codec = { path = "../../../common/codec" }
+# The provider's parameters, read as the bus reads JSON.
+mgmtwire = { path = "../../../common/ipc/mgmtwire" }
