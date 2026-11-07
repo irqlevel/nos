@@ -656,7 +656,7 @@ void CpuTable::invalidate_tlb_range(ulong virt_addr, ulong count)
     send_tlb_ipi(cpu_mask, tasks);
 }
 
-void Cpu::ipi(Context* ctx)
+void Cpu::ipi(Context* ctx, tp::Irq& irq)
 {
     ipi_conter_.inc();
 
@@ -706,6 +706,10 @@ void Cpu::ipi(Context* ctx)
     }
 
     hal::irq_eoi(CpuTable::IPI_VECTOR);
+
+    /* The handler done: its irq_exit before the reschedule, which may switch
+       to another task and come back to this one only later */
+    irq.end();
 
     /* Not schedule(): a task this lands on while it can still run keeps the
        CPU -- see Preempt */
@@ -785,6 +789,15 @@ void Cpu::local_timer_wake(ulong deadline)
     local_timer_arm(deadline, get_boot_time().get_value());
 }
 
+ulong Cpu::local_timer_late(ulong now) const
+{
+    /* timer_armed_at_ is ~0 while the timer is not armed: no deadline, and
+       nothing to be late for */
+    if (!timer_one_shot_ || now <= timer_armed_at_)
+        return 0;
+    return now - timer_armed_at_;
+}
+
 void Cpu::local_timer_tick()
 {
     if (!timer_one_shot_)
@@ -803,7 +816,7 @@ void Cpu::local_timer_tick()
    interrupts. A CPU that wedges now stops only its own tick, and the others
    go on ticking and notice. One-shot, and also for a sleeper's deadline
    (local_timer_start): such an interrupt only reschedules. */
-void Cpu::timer_tick(Context* ctx)
+void Cpu::timer_tick(Context* ctx, tp::Irq& irq)
 {
     if (Panicker::get_instance().is_active())
     {
@@ -814,10 +827,18 @@ void Cpu::timer_tick(Context* ctx)
         return;
     }
 
-    if (!local_timer_fired(get_boot_time().get_value()))
+    ulong now = get_boot_time().get_value();
+
+    /* How late it came, for its irq_exit: past the deadline it was armed
+       for, read before local_timer_fired arms it again */
+    if (unlikely(irq.timed()))
+        irq.late(local_timer_late(now));
+
+    if (!local_timer_fired(now))
     {
         InterruptStats::inc(IrqTimerWake);
         hal::irq_eoi(CpuTable::TIMER_VECTOR);
+        irq.end();
         preempt();
         return;
     }
@@ -847,6 +868,9 @@ void Cpu::timer_tick(Context* ctx)
     SoftIrq::get_instance().tick_kick(index_);
 
     hal::irq_eoi(CpuTable::TIMER_VECTOR);
+
+    /* Its irq_exit before the reschedule, as the IPI's */
+    irq.end();
 
     /* Round-robin among the runnable, and never the idle task over a task
        that can still run -- see Preempt */
@@ -928,11 +952,17 @@ TaskQueue& Cpu::get_task_queue()
     return task_queue_;
 }
 
+/* The IPI: x86's from its IDT stub, arm64's from arm_irq_entry -- its
+   records here for both, ended by Cpu::ipi before its reschedule. */
 extern "C" void ip_interrupt(Context* ctx)
 {
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin(CpuTable::IPI_VECTOR, tp::IrqKind::Ipi);
+
     InterruptStats::inc(IrqIPI);
     auto& cpu = CpuTable::get_instance().get_current_cpu();
-    cpu.ipi(ctx);
+    cpu.ipi(ctx, irq);
 }
 
 /* A posted interrupt's notification that found its vCPU out of its guest
@@ -941,14 +971,23 @@ extern "C" void ip_interrupt(Context* ctx)
 extern "C" void posted_interrupt(Context* ctx)
 {
     (void)ctx;
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin(hal::POSTED_VECTOR, tp::IrqKind::Posted);
+
     InterruptStats::inc(IrqPosted);
     hal::irq_eoi(hal::POSTED_VECTOR);
 }
 
+/* x86's local timer (arm64's is GenericTimer::local_tick) */
 extern "C" void lapic_timer_interrupt(Context* ctx)
 {
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin(CpuTable::TIMER_VECTOR, tp::IrqKind::Timer);
+
     auto& cpu = CpuTable::get_instance().get_current_cpu();
-    cpu.timer_tick(ctx);
+    cpu.timer_tick(ctx, irq);
 }
 
 void Cpu::send_ipi_self()

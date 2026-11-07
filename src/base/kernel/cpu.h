@@ -13,6 +13,11 @@
 namespace kernel
 {
 
+namespace tp
+{
+class Irq;
+}
+
 /* Upper bound on the CPUs the kernel tracks.  64 is a ceiling rather than a
    tuning knob: CPU sets travel as a ulong bitmask (get_running_cpus,
    Task::cpu_affinity_, SoftIrq), so index 63 is the last one that fits.
@@ -70,8 +75,10 @@ public:
        whichever CPU panics. */
     bool is_parked();
 
-    void ipi(Context* ctx);
-    void timer_tick(Context* ctx);
+    /* The IPI's and the local timer's handlers, `irq` the interrupt's
+       records (tp::Irq), ended before the reschedule each ends in. */
+    void ipi(Context* ctx, tp::Irq& irq);
+    void timer_tick(Context* ctx, tp::Irq& irq);
 
     /* This CPU's local timer, one-shot: armed for the earlier of its next
        tick, on a TICK_HZ grid, and the soonest deadline of a task asleep on
@@ -95,6 +102,11 @@ public:
     bool local_timer_take_walk();
     void local_timer_wake(ulong deadline);
     void local_timer_tick();
+    /* How far `now` is past the deadline the timer was last armed for: what
+       its interrupt, taken at `now`, says of how late it came -- 0 when it is
+       not one-shot or not armed, or for an interrupt ahead of it. Read by
+       the interrupt before local_timer_fired arms the timer again. */
+    ulong local_timer_late(ulong now) const;
 
     /* How long an idle has to be for the next to sleep deep, and its next
        timer as far off (idle_mwait): past the residency a deep C-state takes

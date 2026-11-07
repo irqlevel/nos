@@ -550,6 +550,80 @@ const Field MM_ZERO_FIELDS[] = {
       sizeof(MM_ZERO_END) / sizeof(MM_ZERO_END[0]) },
 };
 
+/* ---- the hardware interrupts' and the soft IRQs' events ----
+   An interrupt is two records, where its CPU's dispatch took it and as its
+   handler is done (tp::Irq); a soft IRQ three, its raise, and its handler's
+   run on its CPU's softirq task begun and done. Each says enough alone: the
+   exit what the handler took and from which task, the entry how long the
+   work waited for it. */
+
+static_assert(sizeof(IrqEntry) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(IrqExit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SoftirqRaise) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SoftirqEntry) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+static_assert(sizeof(SoftirqExit) <= TraceRing::PAYLOAD_BYTES, "a payload fits a slot");
+
+/* IrqKind's, value by value: none a number's shape, which a field filter
+   would take for a number (`trace show irq_exit kind=msi`) */
+const char* const IRQ_KINDS[] = { "timer", "ipi", "msi", "line", "shared", "pit", "hpet", "kbd", "serial", "posted",
+    "stray", "spurious" };
+static_assert(sizeof(IRQ_KINDS) / sizeof(IRQ_KINDS[0]) == (ulong)IrqKind::Spurious + 1, "every kind has its name");
+
+/* SoftIrq's types, by their numbers (SoftIrq::TYPE_*): one past them prints
+   as its number */
+const char* const SOFTIRQ_TYPES[] = { "net_rx", "blk_io", "net_tx" };
+/* What a raise did (SoftirqHow) */
+const char* const SOFTIRQ_HOW[] = { "pending", "running", "kicked", "none" };
+static_assert(sizeof(SOFTIRQ_HOW) / sizeof(SOFTIRQ_HOW[0]) == SoftirqNone + 1, "every raise's outcome named");
+
+const Field IRQ_ENTRY_FIELDS[] = {
+    /* The vector on x86, the INTID on arm64 */
+    { "vector", __builtin_offsetof(IrqEntry, vector), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "kind", __builtin_offsetof(IrqEntry, kind), sizeof(u8), Kind::Enum, IRQ_KINDS,
+      sizeof(IRQ_KINDS) / sizeof(IRQ_KINDS[0]) },
+    /* The task it landed on, whose time it takes */
+    { "pid", __builtin_offsetof(IrqEntry, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+};
+
+const Field IRQ_EXIT_FIELDS[] = {
+    { "vector", __builtin_offsetof(IrqExit, vector), sizeof(u32), Kind::Hex, nullptr, 0 },
+    { "kind", __builtin_offsetof(IrqExit, kind), sizeof(u8), Kind::Enum, IRQ_KINDS,
+      sizeof(IRQ_KINDS) / sizeof(IRQ_KINDS[0]) },
+    { "pid", __builtin_offsetof(IrqExit, pid), sizeof(u32), Kind::Pid, nullptr, 0 },
+    /* The handler's time, from the entry to this record: the entry's stamp's
+       low half, read back as the nanoseconds to this record's (Kind::Since),
+       so that the exit reads no counter for it -- right under 2^32 cycles,
+       a second at least */
+    { "ns", __builtin_offsetof(IrqExit, ns), sizeof(u32), Kind::Since, nullptr, 0 },
+    /* The local timer's: how far past the deadline it was armed for */
+    { "late_ns", __builtin_offsetof(IrqExit, late_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field SOFTIRQ_RAISE_FIELDS[] = {
+    { "type", __builtin_offsetof(SoftirqRaise, type), sizeof(u8), Kind::Enum, SOFTIRQ_TYPES,
+      sizeof(SOFTIRQ_TYPES) / sizeof(SOFTIRQ_TYPES[0]) },
+    /* pending: joined the run already owed; running: left to the softirq
+       task this raise ran on; kicked: the task woken and its CPU kicked;
+       none: no softirq task, before they are made or once stopped */
+    { "how", __builtin_offsetof(SoftirqRaise, how), sizeof(u8), Kind::Enum, SOFTIRQ_HOW,
+      sizeof(SOFTIRQ_HOW) / sizeof(SOFTIRQ_HOW[0]) },
+};
+
+const Field SOFTIRQ_ENTRY_FIELDS[] = {
+    { "type", __builtin_offsetof(SoftirqEntry, type), sizeof(u8), Kind::Enum, SOFTIRQ_TYPES,
+      sizeof(SOFTIRQ_TYPES) / sizeof(SOFTIRQ_TYPES[0]) },
+    /* From the raise that made it pending to this run: 0 when not timed */
+    { "wait_ns", __builtin_offsetof(SoftirqEntry, wait_ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+};
+
+const Field SOFTIRQ_EXIT_FIELDS[] = {
+    { "type", __builtin_offsetof(SoftirqExit, type), sizeof(u8), Kind::Enum, SOFTIRQ_TYPES,
+      sizeof(SOFTIRQ_TYPES) / sizeof(SOFTIRQ_TYPES[0]) },
+    { "ns", __builtin_offsetof(SoftirqExit, ns), sizeof(u32), Kind::Ns, nullptr, 0 },
+    /* 1: raised again while it ran, so run again */
+    { "again", __builtin_offsetof(SoftirqExit, again), sizeof(u8), Kind::Unsigned, nullptr, 0 },
+};
+
 /* Sized by its lines, not by COUNT: an event added to tp::Id without its line
    here would be a description of zeroes -- a null name printed -- where now it
    is a build that fails. */
@@ -641,6 +715,20 @@ const Event EVENTS[] = {
     { "mm_zero", "mm", "a batch of the free pages' zeroing: the 4 KiB pages and the huge pool's it zeroed, how "
       "long it took and what ended it",
       sizeof(MmZero), sizeof(MM_ZERO_FIELDS) / sizeof(MM_ZERO_FIELDS[0]), MM_ZERO_FIELDS },
+    { "irq_entry", "irq", "a hardware interrupt, where its CPU's dispatch took it: its vector and kind, and the task "
+      "it landed on",
+      sizeof(IrqEntry), sizeof(IRQ_ENTRY_FIELDS) / sizeof(IRQ_ENTRY_FIELDS[0]), IRQ_ENTRY_FIELDS },
+    { "irq_exit", "irq", "that interrupt's handler done, before the reschedule it may end in: how long it took, and "
+      "for the local timer how late it came",
+      sizeof(IrqExit), sizeof(IRQ_EXIT_FIELDS) / sizeof(IRQ_EXIT_FIELDS[0]), IRQ_EXIT_FIELDS },
+    { "softirq_raise", "softirq", "a soft IRQ raised for its CPU's softirq task, and what the raise did: joined a run "
+      "already owed, left to the task running, or woke it",
+      sizeof(SoftirqRaise), sizeof(SOFTIRQ_RAISE_FIELDS) / sizeof(SOFTIRQ_RAISE_FIELDS[0]), SOFTIRQ_RAISE_FIELDS },
+    { "softirq_entry", "softirq", "a soft IRQ's handler about to run on its CPU's softirq task, and how long the "
+      "work waited for it",
+      sizeof(SoftirqEntry), sizeof(SOFTIRQ_ENTRY_FIELDS) / sizeof(SOFTIRQ_ENTRY_FIELDS[0]), SOFTIRQ_ENTRY_FIELDS },
+    { "softirq_exit", "softirq", "that handler done: how long it ran, and whether it was raised again meanwhile",
+      sizeof(SoftirqExit), sizeof(SOFTIRQ_EXIT_FIELDS) / sizeof(SOFTIRQ_EXIT_FIELDS[0]), SOFTIRQ_EXIT_FIELDS },
 };
 static_assert(sizeof(EVENTS) / sizeof(EVENTS[0]) == COUNT, "every event has its description, in tp::Id's order");
 
@@ -2459,6 +2547,79 @@ void emit_sched_slice(ulong cpu, Task* task, ulong slice_ns, ulong runnable)
     s.slice_ns = (u32)stdlib::min(slice_ns, (ulong)~0U);
     s.runnable = (u32)runnable;
     put(Id::SchedSlice, s);
+}
+
+/* ---- the interrupts' sites ---- */
+
+void Irq::begin(u32 vector, IrqKind kind)
+{
+    vector_ = vector;
+    kind_ = (u8)kind;
+    /* The task the interrupt landed on: the one whose stack it runs on, as a
+       wakeup's waker is found from an interrupt -- and none before the
+       scheduler is up, whose stacks are not yet tasks' */
+    pid_ = task_pid(preempt_is_on() ? Task::try_get_current_task() : nullptr);
+
+    if (tp::on(Id::IrqEntry))
+    {
+        IrqEntry e = {};
+        e.vector = vector_;
+        e.pid = pid_;
+        e.kind = kind_;
+        put(Id::IrqEntry, e);
+    }
+
+    /* After the entry's record, so that the time the exit says is the
+       handler's own */
+    if (tp::on(Id::IrqExit))
+    {
+        stamp_ = hal::read_cycle_counter_unordered();
+        open_ = true;
+    }
+}
+
+void Irq::finish()
+{
+    open_ = false;
+    if (!tp::on(Id::IrqExit))
+        return;
+
+    IrqExit x = {};
+    x.vector = vector_;
+    x.pid = pid_;
+    /* The entry's stamp's low half: the record's write reads the counter,
+       and the distance is taken from its own stamp (field_value) */
+    x.ns = (u32)stamp_;
+    x.late_ns = late_ns_;
+    x.kind = kind_;
+    put(Id::IrqExit, x);
+}
+
+/* ---- the soft IRQs' sites ---- */
+
+void emit_softirq_raise(ulong type, SoftirqHow how)
+{
+    SoftirqRaise r = {};
+    r.type = (u8)type;
+    r.how = how;
+    put(Id::SoftirqRaise, r);
+}
+
+void emit_softirq_entry(ulong type, ulong wait_ns)
+{
+    SoftirqEntry e = {};
+    e.type = (u8)type;
+    e.wait_ns = (u32)stdlib::min(wait_ns, (ulong)~0U);
+    put(Id::SoftirqEntry, e);
+}
+
+void emit_softirq_exit(ulong type, ulong ns, bool again)
+{
+    SoftirqExit x = {};
+    x.type = (u8)type;
+    x.ns = (u32)stdlib::min(ns, (ulong)~0U);
+    x.again = again ? 1 : 0;
+    put(Id::SoftirqExit, x);
 }
 
 /* A wakeup's wait, from the scheduler (TaskQueue::note_run), which has it in

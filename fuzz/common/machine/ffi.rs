@@ -333,9 +333,17 @@ pub extern "C" fn kernel_tp_pid() -> u32 {
 
 /* ---- soft IRQs and timers ---- */
 
+/// Each type `mask` has a bit of, as the kernel raises them at once; a bit
+/// past the types is the model's invariant broken, as a raise of one is.
 #[no_mangle]
-pub extern "C" fn kernel_softirq_raise(typ: usize) {
-    sched::harness(|| sched::softirq_raise(typ))
+pub extern "C" fn kernel_softirq_raise_mask(mask: usize) {
+    sched::harness(|| {
+        let mut rest = mask;
+        while rest != 0 {
+            sched::softirq_raise(rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
+    })
 }
 
 #[no_mangle]

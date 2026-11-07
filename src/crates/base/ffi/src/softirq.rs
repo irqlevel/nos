@@ -1,5 +1,8 @@
 unsafe extern "C" {
-    pub safe fn kernel_softirq_raise(typ: usize);
+    /// Every type `mask` has a bit of (1 << type) raised at once: one wake
+    /// and at most one kick of this CPU's softirq task. A bit past the types
+    /// is none.
+    pub safe fn kernel_softirq_raise_mask(mask: usize);
     /// Whether that soft IRQ is already asked for.
     pub safe fn kernel_softirq_pending(typ: usize) -> i32;
     pub fn kernel_softirq_register(

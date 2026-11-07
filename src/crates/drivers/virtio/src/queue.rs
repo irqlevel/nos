@@ -7,6 +7,9 @@
 //! the compiler. Forming a `&mut [u8]` over that memory would be unsound,
 //! which is why nothing below does.
 
+use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use kcore::barrier::{dma_rmb, dma_wmb};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -50,7 +53,11 @@ impl Buf {
 }
 
 pub struct Queue {
-    mem: DmaBuffer,
+    /// The three rings, for good: a device given their addresses keeps them
+    /// -- it may write the used ring until it is reset, after a bring-up
+    /// that failed as well -- and an interrupt handler may read the used
+    /// index with no queue in its hands (`watch`).
+    mem: &'static DmaBuffer,
     size: u16,
 
     /// Byte offsets into mem
@@ -63,6 +70,41 @@ pub struct Queue {
     num_free: u16,
     /// The used index the driver has consumed up to
     last_used: u16,
+    /// `last_used` as a `UsedWatch` reads it, once one is made: published by
+    /// every `take_used`
+    taken: Option<&'static AtomicU16>,
+}
+
+/// A queue's completions as an interrupt handler sees them, with no queue in
+/// its hands: whether the device has published one the driver has not taken
+/// yet. The queue is its owner's -- lent to whoever serialises the driver's
+/// calls, a soft IRQ or a lock -- and an interrupt one device's queues share
+/// (one MSI-X entry, or a line whose ISR byte says only that some queue has
+/// completions) is told which it was for by asking each, as Linux's
+/// `vring_interrupt` does. A completion taken between the two reads makes it
+/// say yes for nothing -- a pass that finds nothing -- and never no for one
+/// that is there: the device's index only grows, and `taken` never passes it.
+#[derive(Clone, Copy)]
+pub struct UsedWatch {
+    mem: &'static DmaBuffer,
+    /// The used ring's index, a u16 the device writes, at this offset
+    idx: usize,
+    taken: &'static AtomicU16,
+}
+
+impl UsedWatch {
+    #[inline]
+    pub fn pending(&self) -> bool {
+        /* After whatever brought the caller here -- an interrupt the device
+         * raised once its index was written -- as `has_used` reads it. */
+        dma_rmb();
+        match self.mem.load::<u16>(self.idx) {
+            Some(idx) => idx != self.taken.load(Ordering::Relaxed),
+            /* Not a u16 there: never, by construction -- and yes, rather than
+             * a completion missed */
+            None => true,
+        }
+    }
 }
 
 impl Queue {
@@ -82,7 +124,8 @@ impl Queue {
         let used_bytes = 2 + 2 + size as usize * USED_ELEM_SIZE + 2;
         let pages = (used_off + used_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
 
-        let mem = DmaBuffer::new(pages)?;
+        /* For good, as `mem` says: never freed, so a `&'static` to it is one */
+        let mem: &'static DmaBuffer = Box::leak(Box::new(DmaBuffer::new(pages)?));
 
         let mut queue = Self {
             mem,
@@ -93,6 +136,7 @@ impl Queue {
             free_head: 0,
             num_free: size,
             last_used: 0,
+            taken: None,
         };
 
         /* The pages come zeroed; all that is left is to thread the free
@@ -177,6 +221,20 @@ impl Queue {
         dma_wmb();
     }
 
+    /// What an interrupt handler asks of this queue without it: see
+    /// `UsedWatch`. Made once, and the same one each call after.
+    pub fn watch(&mut self) -> UsedWatch {
+        let taken = match self.taken {
+            Some(taken) => taken,
+            None => {
+                let taken: &'static AtomicU16 = Box::leak(Box::new(AtomicU16::new(self.last_used)));
+                self.taken = Some(taken);
+                taken
+            }
+        };
+        UsedWatch { mem: self.mem, idx: self.used + 2, taken }
+    }
+
     /// Whether the device has published a completion the driver has not
     /// taken yet.
     pub fn has_used(&self) -> bool {
@@ -204,6 +262,11 @@ impl Queue {
         let id = self.read_u32(at);
         let len = self.read_u32(at + 4);
         self.last_used = self.last_used.wrapping_add(1);
+        /* Taken, for a watch to see: nothing is handed over by it -- whoever
+         * the watch moves to look reads the ring itself -- so relaxed */
+        if let Some(taken) = self.taken {
+            taken.store(self.last_used, Ordering::Relaxed);
+        }
 
         /* id and len are the device's to say. A head outside the ring would
          * index past the descriptor table and poison the free list, so the

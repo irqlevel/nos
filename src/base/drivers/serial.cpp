@@ -5,6 +5,7 @@
 #include <arch/x86_64/asm.h>
 #include <arch/x86_64/idt.h>
 #include <kernel/interrupt.h>
+#include <kernel/tracepoint.h>
 #include <lib/stdlib.h>
 
 namespace kernel
@@ -247,6 +248,10 @@ InterruptHandlerFn Serial::get_handler_fn()
 void Serial::interrupt(Context* ctx)
 {
     (void)ctx;
+    /* Its records (tp::Irq), the handler done as this returns */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin((u32)int_vector_, tp::IrqKind::Serial);
 
     /* Check for received data (LSR bit 0 = Data Ready) */
     while (inb(PORT + 5) & 0x01)

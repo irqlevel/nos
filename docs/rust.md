@@ -235,7 +235,7 @@ able to say why.
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI) and `run_on_with(cpu, &arg, f)` (the same, the context a borrowed value rather than a word to cast -- sound because the call waits for the handler), `synchronize` (returns once every interrupt handler running at the call has returned), `with_interrupts_off(\|cpu\| ..)` (the scoped `irq_save`/`irq_restore`: a check of this CPU's state and the step that relies on it, with nothing in between) |
 | `msix` | `MsixTable`, `MsixInterrupt::register_for(table, index, &'static T, handler)` (16 slots, shared by every Rust driver) |
 | `interrupt` | `LegacyInterrupt::register_level_for(dev, &'static T, handler)` / `register_irq_for(irq, …)` (INTx, 8 slots) |
-| `softirq` | `raise`, `register_for(type, &'static T, handler)` (`TYPE_NET_RX`, `TYPE_BLK_IO`, …). There is no unregister, which makes a module that registers one permanent |
+| `softirq` | `raise`, `raise_mask` (several types at once: one wake and one kick of the softirq task), `register_for(type, &'static T, handler)` (`TYPE_NET_RX`, `TYPE_BLK_IO`, …). There is no unregister, which makes a module that registers one permanent |
 | `timer` | `Timer::start_for(period, &'static T, handler)` (periodic, 8 slots, fires on CPU 0 via IPI) |
 | `pci` | device scan, config r/w, BARs (`get_bar`, `get_bar64`) |
 | `io` | `MmioRegion` (8/16/32/64-bit, `window(offset)` for a register block inside it), `Port<T>` |
