@@ -1,0 +1,18 @@
+[package]
+name = "mod-nbsload"
+version = "0.1.0"
+edition = "2021"
+
+# A load test on an NBS volume through NBS's client (plans/nbs.md, N8): IOPS,
+# bandwidth and latency, and a check that every block holds what was last
+# written to it -- blkload's for a volume of the cluster's.
+[lib]
+name = "mod_nbsload"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
+nbsclient = { path = "../../../common/storage/nbsclient" }
+nbsdrive = { path = "../nbsdrive" }
+latency = { path = "../../../common/latency" }

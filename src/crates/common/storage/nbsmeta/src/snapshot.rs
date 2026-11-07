@@ -18,8 +18,8 @@ use crate::pieces::Pieces;
 use crate::storage::*;
 use crate::{Cluster, Member, Removed, State, MEMBERS_MAX, NAME_MAX, REMOVED_MAX};
 
-/* NBM3: chunks carry their incarnation */
-const MAGIC: [u8; 4] = *b"NBM3";
+/* NBM3: chunks carry their incarnation; NBM4: a writer its client's token */
+const MAGIC: [u8; 4] = *b"NBM4";
 /// Chunks or map entries a record of the stream carries at most.
 const BATCH: usize = 256;
 /// How much a digest asks of the stream at a time.
@@ -169,6 +169,7 @@ impl FrozenState {
                             w.u8(1);
                             w.str(&a.host);
                             w.u64(a.generation);
+                            w.u64(a.token);
                         }
                         None => w.u8(0),
                     }
@@ -384,7 +385,8 @@ pub(crate) fn read<S: Source>(r: &mut Stream<S>) -> Result<State, RestoreError> 
             0 => None,
             1 => {
                 let host = r.str(ipcwire::HOST_MAX).ok_or(BAD)?;
-                Some(Attach { host, generation: r.u64().ok_or(BAD)? })
+                let generation = r.u64().ok_or(BAD)?;
+                Some(Attach { host, generation, token: r.u64().ok_or(BAD)? })
             }
             _ => return Err(BAD),
         };
@@ -448,6 +450,10 @@ impl State {
         for set in self.sets.iter() {
             if set.version == 0 || !set.cs.windows(2).all(|w| w[0] < w[1]) || set.cs[REPLICAS - 1] as usize >= self.cs.len() {
                 return Err(RestoreError("a set not of three chunk servers in order"));
+            }
+            /* A replica taken out never takes the last active one with it */
+            if !set.replicas.contains(&Replica::Active) {
+                return Err(RestoreError("a set with no active replica"));
             }
         }
         /* Every chunk in use: in a set, counted by as many maps as name it;

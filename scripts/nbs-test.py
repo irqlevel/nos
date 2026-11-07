@@ -92,7 +92,7 @@ HOSTS = ["a", "b", "c"]
 SHELL_PORT = ipct.SHELL_PORT
 HUB_BASE = 47900
 FAILED = []
-MODULES = ("ipcnet", "cluster", "nbs-mds", "nbs-cs")
+MODULES = ("ipcnet", "cluster", "nbs-mds", "nbs-cs", "nbsload")
 # Each host's pool: a sparse GPT disk of three partitions of 300 MiB
 POOL_MB = 1024
 PART_SECTORS = 300 * 2048
@@ -574,10 +574,10 @@ def main():
               a.run("nbscs"))
 
         out = a.run("nbs io write disk1 0 65536 0x5a")
-        m = re.search(r"65536 bytes of 0x5a written at 0 of disk1, generation (\d+): 1 chunks, each to its 3 replicas",
+        m = re.search(r"65536 bytes of 0x5a written at 0 of disk1, generation (\d+): 1 chunks, to every replica in",
                       out)
-        need("64 KiB written to disk1's first chunk, to its three replicas: attached for writing on a", m is not None,
-             out)
+        need("64 KiB written to disk1's first chunk, to its replicas: a session attached for writing on a",
+             m is not None, out)
         gen1 = int(m.group(1))
         # What `nbscs` shows is what the cs's task last made of it: a second old at most
         check("every cs fences disk1 at a's generation",
@@ -590,17 +590,16 @@ def main():
         check("read back on a, from its own replica", "65536 bytes at 0 of disk1, from a: 0x5ax65536" in out, out)
         out = a.run("nbs io read disk1 %d 16384" % (end - 8192))
         check("and across the chunk's end", "from a: 0x00x4096 0x33x8192 0x00x4096" in out, out)
-        for x, h in ((b, "b"), (c, "c")):
-            out = x.run("nbs io read disk1 0 65536")
-            check("read on %s, read-only, from its own replica" % h, ("from %s: 0x5ax65536" % h) in out, out)
+        out = b.run("nbs io read disk1 0 65536")
+        check("a read on b -- read-only, a session of its own -- refused while a writes",
+              "attached for writing" in out, out)
         out = a.run("nbs io flush disk1")
-        check("flushed on the three hosts", "disk1 flushed on 3 hosts" in out, out)
+        check("flushed", "nbs: disk1 flushed" in out, out)
         out = a.run("nbs io held disk1")
         check("its two chunks open on every cs, at a's generation",
               all(re.search(r"^\s+%s\s+2 chunks of disk1 open:.*@%d" % (h, gen1), out, re.M) for h in HOSTS), out)
         out = a.run("nbs io close disk1")
-        check("closed: the six replicas were open",
-              "6 of the 6 replicas of the chunks of disk1 written here were open" in out, out)
+        check("closed", "every chunk written here closed on its replicas" in out, out)
         out = a.run("nbs io held disk1")
         check("and none is now", all(re.search(r"^\s+%s\s+0 chunks of disk1 open:" % h, out, re.M) for h in HOSTS),
               out)
@@ -614,15 +613,19 @@ def main():
         out = b.run("nbs io write disk1 0 4096 0x77")
         check("b writes, fencing every cs at its generation", ("generation %d: 1 chunks" % gen2) in out, out)
         out = a.run("nbs io write disk1 0 4096 0x11")
-        check("a's write at its older generation refused by the fences",
-              "fenced: the volume is attached at a newer generation" in out, out)
+        check("a's write at its older generation refused by the fences: its session failed",
+              "attached elsewhere: this attach is fenced" in out, out)
         out = a.run("nbs io read disk1 0 4096")
-        check("and a's read", "fenced: the volume is attached at a newer generation" in out, out)
+        check("and a's read, read-only now, refused while b writes", "attached for writing" in out, out)
         out = b.run("nbs io read disk1 0 8192")
         check("b reads its write, and a's after it", "from b: 0x77x4096 0x5ax4096" in out, out)
         check("every cs fences disk1 at b's generation",
               ipct.wait_for(lambda: all(fences_of(x).get(vol1) == gen2 for x in sh), 5, 0.5),
               [x.run("nbscs") for x in sh])
+        # b's chunks closed before c goes: one a writer has open on a host that
+        # restarts is taken out of its set at the writer's next flush (N8)
+        out = b.run("nbs io close disk1")
+        check("b closes what it wrote", "every chunk written here closed on its replicas" in out, out)
 
         # c booted again: its cs takes its devices back as they were
         kill(2)
@@ -632,16 +635,27 @@ def main():
         need("c's cs serving again", ipct.wait_for(lambda: serving(2, 2), CS_S, 1), c.run("nbscs"))
         check("c's fence kept: disk1 at b's generation", fences_of(c).get(vol1) == gen2, fences_of(c))
         held = [x for x in chunks_of(c) if x[3] == vol1]
-        check("c's chunks of disk1 kept: the first open at b's generation, the second closed at a's",
-              sorted((x[2], x[4]) for x in held) == sorted([("open", gen2), ("closed", gen1)]), held)
-        out = c.run("nbs io read disk1 0 8192")
-        check("and their data: read on c, from its own replica", "from c: 0x77x4096 0x5ax4096" in out, out)
+        check("c's chunks of disk1 kept: the first closed at b's generation, the second at a's",
+              sorted((x[2], x[4]) for x in held) == sorted([("closed", gen2), ("closed", gen1)]), held)
 
         # the volume deleted: every cs gives its chunks and its fence back
         out = a.run("nbs volume delete disk1")
         check("disk1 not deleted while b has it attached", "attached" in out and "deleted" not in out, out)
         out = b.run("nbs io detach disk1")
         check("b detaches it", ("disk1 detached (generation %d)" % gen2) in out, out)
+        out = c.run("nbs io read disk1 0 8192")
+        check("c's data kept: read on c, read-only now nobody writes, from its own replica",
+              "from c: 0x77x4096 0x5ax4096" in out, out)
+        # nbsload: the client driven by a module of its own
+        a.run("insmod /nbsload.ko")
+        out = a.run("nbsload disk1 verify secs=3 qd=8 span=8")
+        check("nbsload verify through the client: every block read back as last written",
+              re.search(r"verify: \d+ reads held to their blocks' last writes as it went, \d+ blocks read back", out)
+              is not None and "WRONG" not in out and "nbsload:" not in out, out)
+        out = b.run("insmod /nbsload.ko")
+        out = b.run("nbsload disk1 randread secs=2 qd=8 span=8")
+        check("and reads on b, read-only", re.search(r"\d+ reads: \d+ IOPS", out) is not None and "nbsload:" not in out,
+              out)
         out = a.run("nbs volume delete disk1")
         check("disk1 deleted", "deleted" in out, out)
         check("every cs gives its chunks and its fence back",

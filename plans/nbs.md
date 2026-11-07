@@ -684,7 +684,52 @@ each new gate.
   volume (`hv create <name> <url> nbs size=...`, decided 2026-11-07), so that
   a VM boots off NBS; `nbsload.ko`; the `cluster` target; nbs-test's I/O
   phases, `hv-nbs-test.py`. A replica taken out stays out until N9 brings it
-  back.
+  back. As built:
+  - **The client** (`nbsclient`, no kernel in it) is a session of a volume's,
+    sans I/O: attach, the map, fences, the reconcile, serve, stop. It is
+    driven over ipc by `nbsdrive` in hv.ko, nbs-mds.ko's `nbs io` and
+    nbsload.ko, and over the fuzzer's own network by the `cluster` target.
+  - **The client's asks** of its host's mds (`TAG_ASK` on `nbs.mds`): attach,
+    detach, the map in pages, a replica out. A replica out is asked by the
+    volume's writer of now, with its generation, of a set of its volume's:
+    the metadata refuses a writer fenced since (`NotTheWriter`).
+  - **The attach carries the session's token**, so that one asked again --
+    its answer lost -- is answered with the generation it gave. Without it a
+    retry took a second generation and fenced its own session out. The
+    snapshot's format is NBM4.
+  - **A replica out** (`ReplicaDown`): silent 0.5 s to the client, then the
+    leader's look (`Op::Ping`, 250 ms) -- out only where it does not answer
+    the leader either -- or refused as failed by the cs itself, taken as it
+    is. The set's version moves on. The last active replica is never taken
+    out; writes go on to it alone. Decided 2026-11-07, with decision 6.
+  - **What the `cluster` target found**, and each has its mutant now:
+    - a fenced writer's write done by taking out, through the leader's look,
+      the healthy replicas that refused it;
+    - a flush not fenced -- an old writer told its writes were durable after
+      a newer writer's reconcile;
+    - a cs that restarted with a chunk open refusing that writer's writes but
+      not its flushes;
+    - a flush done before the one ahead of it, which had taken the dirty
+      cs's;
+    - a cs counted dirty when sent a write rather than when it acknowledged
+      it;
+    - a stop that left a write queued behind an overlapping one, or a chunk
+      a read held open, for good;
+    - the last replica's loss of a writer's unflushed writes, which now
+      fails the session (`LOST_LAST`) rather than leaving it waiting.
+  - **hv's `nbs:<volume>` disks**: a third media of the disk's task's, the
+    session's buffers lent to the device as an image's are; serial
+    `nbs-<number>`, 4 KiB blocks; `hv start <name> force`; the pour, `hv
+    convert <image> nbs:<volume>` and `hv create ... onto=nbs:<volume>` onto a
+    volume made with `nbs volume create` -- a fresh volume's zeros left out.
+    There is no `hv create ... nbs size=`: the volume is made first, by
+    `nbs`, so that hv asks nbs-mds for nothing a client does not.
+  - **Tests**: the `cluster` target (six hosts, crashes, takeovers now and
+    at rest), fifty-four mutants in all, twelve of them the client's;
+    nbs-test's I/O phase on sessions, and nbsload's verify; hv-nbs-test.py,
+    Linux guests on volumes under KVM on the AX41, nested -- a pour read
+    elsewhere, a volume moved between hosts, a forced start fencing the old
+    guest, a host killed under a write.
 - **N9, repair.** A host or a device lost, epochs, a rebuild under writes, a
   host back; a scrub comparing replicas by checksum.
 - **N10.** Snapshots, images and clones.

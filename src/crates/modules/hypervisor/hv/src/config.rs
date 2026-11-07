@@ -49,6 +49,10 @@ pub struct Options {
     pub log: bool,
     pub restart: bool,
     pub net: bool,
+    /// Its volumes of NBS's taken from a writer elsewhere as it starts: a
+    /// start's word, no key in the file -- a VM is moved off a host that is
+    /// gone by asking, never by its folder.
+    pub force: bool,
     /// Its port on the guests' switch, for an address and a MAC that are the
     /// same at every start; the first free one when not said.
     pub port: Option<u32>,

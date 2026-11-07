@@ -61,7 +61,7 @@ pub(crate) const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus
                             [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... \
                             [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [force] \
                             [cmdline=...]\n\
-                            hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device>] [password=...] \
+                            hv create <name> <http(s)://image> [size=N[K|M|G|T] | onto=<device|nbs:volume>] [password=...] \
                             [hvboot=path] [force] [the words hv start takes, but a kernel and initrd=]\n\
                             a device is a partition or a whole disk of nos's: dev:<name>, part:<id> or disk:<id> \
                             (hv devices); force gives one over what is on it";
@@ -227,10 +227,10 @@ pub fn folder_of(root: &str, name: &str) -> Result<Folder, String> {
 }
 
 /// A path of the configuration's, as nos reaches it: the folder's unless it
-/// begins with `/` -- or names a device (`devices::source`), which is no
-/// path at all.
+/// begins with `/` -- or names a device or a volume (`devices::source`),
+/// which is no path at all.
 fn resolve(folder: &Folder, path: &str) -> Result<String, String> {
-    if path.starts_with('/') || crate::devices::is_device(path) {
+    if path.starts_with('/') || !crate::devices::is_file(path) {
         return Ok(String::from(path));
     }
     join(&folder.path, path).ok_or_else(|| String::from("out of memory"))
@@ -354,7 +354,7 @@ pub fn create(root: &str, vms: &Vms, args: &str, work: &mut dyn Work) {
         let mut missing = Vec::new();
         missing.push(o.kernel.as_str());
         missing.extend(o.initrd.as_deref());
-        missing.extend(o.disks.iter().map(|(p, _)| p.as_str()).filter(|p| !crate::devices::is_device(p)));
+        missing.extend(o.disks.iter().map(|(p, _)| p.as_str()).filter(|p| crate::devices::is_file(p)));
         for path in missing {
             if kcore::fs::size(path).is_err() {
                 let _ = writeln!(out, "hv: {} is not there yet", path);
@@ -491,7 +491,7 @@ pub fn delete(root: &str, vms: &Vms, name: &str, keep: bool, force: bool) -> Res
     let config = join(&folder.path, CONFIG).ok_or_else(oom)?;
     let inside = |path: &str| path.len() > folder.path.len() + 1 && path.starts_with(folder.path.as_str())
         && path.as_bytes()[folder.path.len()] == b'/';
-    let devices: Vec<String> = disks.iter().map(|(p, _)| p).filter(|p| crate::devices::is_device(p)).cloned().collect();
+    let devices: Vec<String> = disks.iter().map(|(p, _)| p).filter(|p| !crate::devices::is_file(p)).cloned().collect();
     let kept: Vec<String> = if keep { disks.into_iter().map(|(p, _)| p).filter(|p| inside(p)).collect() } else { Vec::new() };
 
     /* What is in it, every level down: its files, and its folders with how

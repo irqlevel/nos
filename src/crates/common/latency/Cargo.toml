@@ -1,0 +1,10 @@
+[package]
+name = "latency"
+version = "0.1.0"
+edition = "2021"
+
+# What a load test says of the times its operations took: a histogram of
+# nanoseconds and its percentiles, and microseconds as it shows them. No
+# kernel in it and no unsafe: blkload.ko's and nbsload.ko's one copy.
+[lib]
+name = "latency"

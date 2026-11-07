@@ -29,7 +29,8 @@
 extern crate alloc;
 
 mod files;
-pub mod ipcnet;
+/// ipcnet's control mailbox: ipcctl's, by the name the groups' modules know it.
+pub use ipcctl as ipcnet;
 
 pub use files::{create_dirs, KFiles};
 
@@ -155,8 +156,10 @@ pub trait App: Sized {
         Ok(())
     }
 
-    /// The outcome of a command a waiter of the group's own waits for.
-    fn finish(&mut self, _core: &mut Core<Self>, _w: Self::Waiter, _outcome: Outcome<Self>) {}
+    /// The outcome of a command a waiter of the group's own waits for, and
+    /// the entry it was applied at -- 0 where it was not: what a waiter that
+    /// reads the state after it waits for this member to have applied.
+    fn finish(&mut self, _core: &mut Core<Self>, _w: Self::Waiter, _outcome: Outcome<Self>, _index: u64) {}
 
     /// What the group does at every turn, after raft's work.
     fn turn(&mut self, _core: &mut Core<Self>) {}
@@ -450,7 +453,7 @@ impl<A: App> Core<A> {
         match w {
             Pending::Local(slot) => slot.with(|s| *s = Some((outcome, index))),
             Pending::Remote { to, request } => self.answer_remote(app, to, request, outcome, index),
-            Pending::App(w) => app.finish(self, w, outcome),
+            Pending::App(w) => app.finish(self, w, outcome, index),
         }
     }
 

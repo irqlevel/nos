@@ -34,8 +34,9 @@ use kcore::time::Duration;
 
 use crate::work::{self, Work};
 
-const USAGE: &str = "hv convert <image> <disk|device> [force] -- a qcow2 image made a raw disk, its holes kept, or \
-                     poured onto a device of nos's (part:<id>, disk:<id>, dev:<name>): force over what is on it";
+const USAGE: &str = "hv convert <image> <disk|device|nbs:volume> [force] -- a qcow2 image made a raw disk, its holes \
+                     kept, or poured onto a device of nos's (part:<id>, disk:<id>, dev:<name>) or a volume of NBS's: \
+                     force over what is on it, or a writer elsewhere";
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 /// How far apart the progress lines are, as wget's: a tenth of the time
@@ -102,7 +103,9 @@ pub fn command(root: &str, args: &str, work: &mut dyn Work) {
             return;
         }
     };
-    let result = if names_device(to) {
+    let result = if let Some(volume) = to.strip_prefix("nbs:").filter(|v| !v.is_empty()) {
+        onto_volume(from, volume, force, work)
+    } else if names_device(to) {
         onto_device(root, from, to, force, work)
     } else if force {
         Err(String::from("force is for a device: a file is never written over"))
@@ -138,6 +141,18 @@ fn onto_device(root: &str, from: &str, to: &str, force: bool, work: &mut dyn Wor
 #[cfg(not(target_arch = "x86_64"))]
 fn onto_device(_root: &str, _from: &str, to: &str, _force: bool, _work: &mut dyn Work) -> Result<(), String> {
     Err(alloc::format!("{}: a device is given to a guest on x86-64 alone, so far", to))
+}
+
+/// `hv convert <image> nbs:<volume> [force]`: the image poured onto the
+/// volume through its session (`pour_volume`).
+#[cfg(target_arch = "x86_64")]
+fn onto_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -> Result<(), String> {
+    pour_volume(from, volume, force, work).map(|_| ())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn onto_volume(_from: &str, volume: &str, _force: bool, _work: &mut dyn Work) -> Result<(), String> {
+    Err(alloc::format!("nbs:{}: a volume is given to a guest on x86-64 alone, so far", volume))
 }
 
 /* ---- onto a device ---- */
@@ -295,6 +310,226 @@ impl diskimage::Sink for Onto<'_> {
         self.put(offset - self.at, None)?;
         self.put(data.len() as u64, Some(data))
     }
+}
+
+/* ---- onto a volume of NBS's ---- */
+
+#[cfg(target_arch = "x86_64")]
+/// How much of the disk a write onto a volume carries -- a request's of the
+/// session's, and well under the most the kernel's heap gives at once (512
+/// KiB) -- and how many the pour has out at once: 4 MiB.
+const VOLUME_POUR_BYTES: usize = 256 * 1024;
+#[cfg(target_arch = "x86_64")]
+const VOLUME_POUR_OUT: usize = 16;
+
+/// A volume of NBS's the image's disk is poured onto, through its session:
+/// every byte of `[0, size)` written in order, `VOLUME_POUR_OUT` writes out
+/// at once -- what the converter leaves out zeros, which a fresh volume
+/// reads as already and so is not written them -- and nothing more once
+/// `stopped` is set.
+#[cfg(target_arch = "x86_64")]
+struct OntoVolume<'a> {
+    d: &'a mut nbsdrive::Drive,
+    size: u64,
+    at: u64,
+    /// The write being filled, and where its run starts.
+    buf: Vec<u8>,
+    run: u64,
+    out: usize,
+    failed: bool,
+    /// Never written before: what is not written reads as zeros.
+    fresh: bool,
+    stopped: &'a Cell<bool>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl OntoVolume<'_> {
+    /// The writes the session is done with taken: waiting while as many as
+    /// it may have are out, with `wait`.
+    fn reap(&mut self, wait: bool) {
+        loop {
+            while let Some(done) = self.d.take_done() {
+                self.out = self.out.saturating_sub(1);
+                self.failed |= !done.ok;
+            }
+            if !wait || self.out < VOLUME_POUR_OUT {
+                return;
+            }
+            self.d.turn(nbsdrive::TURN_NS);
+        }
+    }
+
+    /// The write being filled sent -- left out where it is all zeros on a
+    /// fresh volume.
+    fn send(&mut self) -> kcore::error::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut next = Vec::new();
+        next.try_reserve_exact(VOLUME_POUR_BYTES).map_err(|_| kcore::error::Error::NoMemory)?;
+        let data = core::mem::replace(&mut self.buf, next);
+        if self.fresh && data.iter().all(|&b| b == 0) {
+            return Ok(());
+        }
+        self.d.submit(nbsdrive::Op::Write { offset: self.run }, data).map_err(|_| kcore::error::Error::NoMemory)?;
+        self.out += 1;
+        self.reap(true);
+        Ok(())
+    }
+
+    /// `len` bytes after what is written so far -- of `data`, or zeros.
+    fn put(&mut self, mut len: u64, data: Option<&[u8]>) -> kcore::error::Result<()> {
+        let mut from = 0usize;
+        while len > 0 {
+            if self.stopped.get() || self.failed {
+                return Err(kcore::error::Error::IoError);
+            }
+            if self.buf.is_empty() {
+                self.run = self.at;
+            }
+            let n = (len as usize).min(VOLUME_POUR_BYTES - self.buf.len());
+            match data {
+                Some(d) => self.buf.extend_from_slice(&d[from..from + n]),
+                None => self.buf.resize(self.buf.len() + n, 0),
+            }
+            self.at += n as u64;
+            from += n;
+            len -= n as u64;
+            if self.buf.len() == VOLUME_POUR_BYTES {
+                self.send()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The rest of the disk zeros, everything sent and done, the volume
+    /// flushed.
+    fn finish(&mut self) -> kcore::error::Result<()> {
+        self.put(self.size - self.at, None)?;
+        self.send()?;
+        while self.out > 0 {
+            self.d.turn(nbsdrive::TURN_NS);
+            self.reap(false);
+        }
+        if self.failed {
+            return Err(kcore::error::Error::IoError);
+        }
+        self.d.flush().map_err(|_| kcore::error::Error::IoError)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl diskimage::Sink for OntoVolume<'_> {
+    type Error = kcore::error::Error;
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> kcore::error::Result<()> {
+        /* In order, as the converter writes: what it left out between, zeros. */
+        if offset < self.at || offset.checked_add(data.len() as u64).is_none_or(|end| end > self.size) {
+            return Err(kcore::error::Error::InvalidValue);
+        }
+        self.put(offset - self.at, None)?;
+        self.put(data.len() as u64, Some(data))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+/// `from` -- a qcow2 image, or a raw disk -- poured onto volume `volume` of
+/// NBS's through its session, attached for writing here -- taken from a
+/// writer elsewhere with `force` -- and let go of after: Ok once every byte
+/// of the image's disk is on the volume's replicas, flushed, or why not,
+/// the volume then holding part of it, which is the caller's to say.
+pub fn pour_volume(from: &str, volume: &str, force: bool, work: &mut dyn Work) -> Result<Poured, String> {
+    let file = File::open(from, false).map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let len = file.size().map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let mut image = Image { file, len };
+    let mut head = Vec::new();
+    let take = len.min(diskimage::detect::HEAD as u64) as usize;
+    head.try_reserve_exact(take).map_err(|_| String::from("out of memory"))?;
+    head.resize(take, 0);
+    diskimage::Source::read_at(&mut image, 0, &mut head).map_err(|e| alloc::format!("{}: {}", from, e))?;
+    let format = detect(&head);
+    drop(head);
+    let name = alloc::format!("nbs:{}", volume);
+    let img = match format {
+        Format::Qcow2 => Some(Qcow2::open(&mut image).map_err(|e| said(e, from, &name))?),
+        Format::Raw | Format::Unknown => None,
+        format => return Err(refused(from, format)),
+    };
+    let size = img.as_ref().map_or(len, |i| i.size());
+    let me = nbsdrive::this_host()?;
+    let mut d = nbsdrive::Drive::open(volume, &me, true, force).map_err(|e| alloc::format!("{}: {}", name, e))?;
+    let (room, fresh) = (d.session().size(), d.session().generation() == 1);
+    /* The disk whole blocks of the volume's: a last part of one, zeros after */
+    let disk = size.div_ceil(nbsdrive::BLOCK) * nbsdrive::BLOCK;
+    if disk > room {
+        let _ = d.stop();
+        return Err(alloc::format!("{}'s disk is {} MiB, and {} is {} MiB", from, size.div_ceil(MIB), name,
+                                  room / MIB));
+    }
+    let _ = writeln!(work, "hv: {}: {} a disk of {} MiB -- onto {}, {} MiB{}", from,
+                     if img.is_some() { "qcow2," } else { "raw," }, size.div_ceil(MIB), name, room / MIB,
+                     if fresh { ", fresh: its zeros left out" } else { "" });
+    let started = kcore::time::boot_time_ns();
+    let stopped = Cell::new(false);
+    let poured = {
+        let mut onto = OntoVolume { d: &mut d, size: disk, at: 0, buf: Vec::new(), run: 0, out: 0, failed: false,
+                                    fresh, stopped: &stopped };
+        let mut reported = started;
+        let mut progress = |at: u64| {
+            if work.cancelled() {
+                stopped.set(true);
+                return;
+            }
+            work.progress(at, size);
+            let now = kcore::time::boot_time_ns();
+            let every = (now.saturating_sub(started) / REPORT_SHARE).clamp(REPORT_MIN_NS, REPORT_MAX_NS);
+            if now.saturating_sub(reported) >= every && at < size {
+                reported = now;
+                let _ = writeln!(work, "hv: {} of {} MiB of the disk, {} s", at / MIB, size.div_ceil(MIB),
+                                 now.saturating_sub(started) / NS_PER_SEC);
+            }
+        };
+        let copied = match &img {
+            Some(img) => img.convert(&mut image, &mut onto, &mut progress).map(|_| ()).map_err(|e| said(e, from, &name)),
+            None => {
+                /* Raw: read as it is, a write's worth at a time. */
+                let mut chunk = Vec::new();
+                match chunk.try_reserve_exact(VOLUME_POUR_BYTES) {
+                    Err(_) => Err(String::from("out of memory")),
+                    Ok(()) => {
+                        chunk.resize(VOLUME_POUR_BYTES, 0);
+                        let mut at = 0u64;
+                        let mut r = Ok(());
+                        while at < size {
+                            let n = (size - at).min(VOLUME_POUR_BYTES as u64) as usize;
+                            if let Err(e) = diskimage::Source::read_at(&mut image, at, &mut chunk[..n]) {
+                                r = Err(alloc::format!("{}: reading it failed -- {}", from, e));
+                                break;
+                            }
+                            if let Err(e) = diskimage::Sink::write_at(&mut onto, at, &chunk[..n]) {
+                                r = Err(alloc::format!("{}: writing it failed -- {}", name, e));
+                                break;
+                            }
+                            at += n as u64;
+                            progress(at);
+                        }
+                        r
+                    }
+                }
+            }
+        };
+        copied.and_then(|()| onto.finish().map_err(|e| alloc::format!("{}: writing it failed -- {}", name, e)))
+    };
+    /* Let go of either way: the VM attaches it as it starts */
+    let let_go = d.stop().map_err(|e| alloc::format!("{}: not let go of -- {}", name, e));
+    if let Err(e) = poured {
+        return Err(if stopped.get() { String::from(work::STOPPED) } else { e });
+    }
+    let_go?;
+    let ns = kcore::time::boot_time_ns().saturating_sub(started);
+    let _ = writeln!(work, "hv: {}: {} MiB written in {}.{} s, flushed and let go of", name, size.div_ceil(MIB),
+                     ns / NS_PER_SEC, ns % NS_PER_SEC / NS_PER_TENTH);
+    Ok(Poured { size: disk, rest: room - disk })
 }
 
 #[cfg(target_arch = "x86_64")]

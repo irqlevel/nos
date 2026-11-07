@@ -1,5 +1,11 @@
-//! ipcnet's control mailbox (`ipcnet.ctl`), as a group's module asks it:
-//! who this host is, its peers, its key.
+//! ipcnet's control mailbox (`ipcnet.ctl`), as a module asks it: who this
+//! host is, its peers, its key -- for raftmember's groups and NBS's client
+//! (nbsdrive) alike.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;

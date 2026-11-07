@@ -11,6 +11,10 @@
 //!   metadata has them, which of its chunks and volumes are gone -- and is
 //!   told (`TAG_TOLD`). The mds answers from its applied state, once it has
 //!   applied as far as a request's index: before that, `Behind`.
+//! - **A client and its host's mds** (N8): the client asks `nbs.mds` on its
+//!   own host an `Asking` (`TAG_ASK`) -- a volume attached or detached, its
+//!   map from a place on, a replica that did not answer taken out -- and is
+//!   told a `Saying` (`TAG_SAID`).
 //!
 //! Every message is read whole and held to its limits: one that is not a
 //! message of these, or has bytes past its end, is none (`None`).
@@ -19,6 +23,9 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+pub mod mds;
+pub mod serve;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -37,6 +44,9 @@ pub const TAG_TOLD: u32 = 0x111;
 
 /// The cs's mailbox's name, on every host that has one.
 pub const CS_NAME: &str = "nbs.cs";
+/// The mds's -- its member's -- the same on every host of the NBS cluster:
+/// what a client of this host's asks (`TAG_ASK`).
+pub const MDS_NAME: &str = "nbs.mds";
 
 /// The most a write carries, or a read asks for: a request is one message.
 pub const DATA_MAX: u32 = 256 * 1024;
@@ -60,6 +70,9 @@ pub enum Op<'a> {
     Close { chunk: ChunkRef, position: u32, index: u64 },
     /// The volume's chunks the cs holds open, for a reconcile.
     Held,
+    /// Whether the cs is there and serving: the leader's look at a cs a client
+    /// says did not answer it (N8).
+    Ping,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +338,7 @@ impl Request<'_> {
                 w.u64(*index);
             }
             Op::Held => w.u8(6),
+            Op::Ping => w.u8(7),
         }
         w.buf
     }
@@ -358,6 +372,7 @@ impl<'a> Request<'a> {
             4 => Op::Flush,
             5 => Op::Close { chunk: read_chunk_ref(&mut r)?, position: r.u32()?, index: r.u64()? },
             6 => Op::Held,
+            7 => Op::Ping,
             _ => return None,
         };
         r.done().then_some(Request { id, volume, generation, op })
@@ -592,5 +607,313 @@ impl Answered {
             _ => return None,
         };
         r.done().then_some(Answered { id, told })
+    }
+}
+
+/* ---- a client and its host's mds (N8) ---- */
+
+/// A client's ask of its host's mds, on `nbs.mds`, and what it is told:
+/// past the tags of the cs's questions.
+pub const TAG_ASK: u32 = 0x112;
+pub const TAG_SAID: u32 = 0x113;
+/// The most places of a volume's map an ask is told at once.
+pub const MAP_MAX: u32 = 4096;
+/// The longest reason a refusal is told, in bytes: past it, cut short at a
+/// character's edge.
+pub const REASON_MAX: usize = 255;
+
+fn reason(s: &str) -> &str {
+    let mut n = s.len().min(REASON_MAX);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s[..n]
+}
+
+/// A replica of a chunk's set, as a client is told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaState {
+    /// Written and read.
+    Active,
+    /// Being copied onto: written, not read (N9).
+    Rebuilding,
+    /// Taken out: neither.
+    Down,
+}
+
+/// A place of a volume's map: the chunk there, as a request names it, and
+/// its set's three cs's, each with its state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub chunk: ChunkRef,
+    pub cs: [u32; nbsmeta::REPLICAS],
+    pub replicas: [ReplicaState; nbsmeta::REPLICAS],
+}
+
+/// What a client -- hv's disk, `nbs io`, nbsload -- asks its host's mds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ask {
+    /// Volume `name` attached on this host: for writing, at a new generation
+    /// -- `force` takes it from whoever has it -- or read-only; `token` the
+    /// session's own, so that the attach asked again is answered as it was.
+    Attach { name: String, writable: bool, force: bool, token: u64 },
+    /// Volume `name` let go of: the writer of `generation`, or with 0 a
+    /// reader.
+    Detach { name: String, generation: u64 },
+    /// `count` places of volume `name`'s map from place `from`, as the
+    /// metadata has them at entry `index` at least.
+    Map { name: String, from: u32, count: u32, index: u64 },
+    /// Replica `cs` of set `set` taken out: it did not answer the client --
+    /// or, `refused`, it refused as failed. Asked as volume `name`'s writer
+    /// at `generation`.
+    Down { set: u32, cs: u32, refused: bool, name: String, generation: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asking {
+    pub id: u64,
+    pub ask: Ask,
+}
+
+/// What a client is told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// Attached: the generation -- 0 read-only -- and the entry it was
+    /// applied at.
+    Attached { generation: u64, index: u64 },
+    /// Let go of, at entry `index`.
+    Detached { index: u64 },
+    /// Volume `volume`, `size_mib` MiB of `places` places: those asked for,
+    /// from place `from`, at entry `index`; and the hosts of the cs's they
+    /// name.
+    Map { volume: u32, size_mib: u64, places: u32, index: u64, from: u32, map: Vec<Place>, hosts: Vec<(u32, String)> },
+    /// The replica is out: its set's version now, at entry `index`.
+    Down { version: u32, index: u64 },
+    /// The mds has not applied as far as the ask's entry: asked again.
+    Behind { applied: u64 },
+    /// Not done now, and why -- no leader yet, the leader looking at the cs,
+    /// the cs answering the leader: asked again in a moment.
+    NotNow(String),
+    /// Refused, and why.
+    Refused(String),
+    /// The replica asked out is its set's last active one: it stays in.
+    LastReplica,
+    /// The one asking is not the volume's writer: attached elsewhere since.
+    NotTheWriter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saying {
+    pub id: u64,
+    pub said: Said,
+}
+
+fn replica_state(s: ReplicaState) -> u8 {
+    match s {
+        ReplicaState::Active => 0,
+        ReplicaState::Rebuilding => 1,
+        ReplicaState::Down => 2,
+    }
+}
+
+fn read_replica_state(c: u8) -> Option<ReplicaState> {
+    Some(match c {
+        0 => ReplicaState::Active,
+        1 => ReplicaState::Rebuilding,
+        2 => ReplicaState::Down,
+        _ => return None,
+    })
+}
+
+/// A place's bytes: its chunk, its three cs's and their states.
+const PLACE_BYTES: usize = 16 + 4 * nbsmeta::REPLICAS + nbsmeta::REPLICAS;
+
+impl Asking {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u64(self.id);
+        match &self.ask {
+            Ask::Attach { name, writable, force, token } => {
+                w.u8(1);
+                w.str(name);
+                w.u8(u8::from(*writable) | u8::from(*force) << 1);
+                w.u64(*token);
+            }
+            Ask::Detach { name, generation } => {
+                w.u8(2);
+                w.str(name);
+                w.u64(*generation);
+            }
+            Ask::Map { name, from, count, index } => {
+                w.u8(3);
+                w.str(name);
+                w.u32(*from);
+                w.u32(*count);
+                w.u64(*index);
+            }
+            Ask::Down { set, cs, refused, name, generation } => {
+                w.u8(4);
+                w.u32(*set);
+                w.u32(*cs);
+                w.u8(u8::from(*refused));
+                w.str(name);
+                w.u64(*generation);
+            }
+        }
+        w.buf
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Asking> {
+        let mut r = Reader::new(b);
+        let id = r.u64()?;
+        let ask = match r.u8()? {
+            1 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                let flags = r.u8()?;
+                if flags & !3 != 0 {
+                    return None;
+                }
+                Ask::Attach { name, writable: flags & 1 != 0, force: flags & 2 != 0, token: r.u64()? }
+            }
+            2 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::Detach { name, generation: r.u64()? }
+            }
+            3 => {
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                let (from, count, index) = (r.u32()?, r.u32()?, r.u64()?);
+                if count > MAP_MAX {
+                    return None;
+                }
+                Ask::Map { name, from, count, index }
+            }
+            4 => {
+                let (set, cs) = (r.u32()?, r.u32()?);
+                let refused = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                let name = String::from(r.str(nbsmeta::VOLUME_NAME_MAX)?);
+                Ask::Down { set, cs, refused, name, generation: r.u64()? }
+            }
+            _ => return None,
+        };
+        r.done().then_some(Asking { id, ask })
+    }
+}
+
+impl Saying {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u64(self.id);
+        match &self.said {
+            Said::Attached { generation, index } => {
+                w.u8(1);
+                w.u64(*generation);
+                w.u64(*index);
+            }
+            Said::Detached { index } => {
+                w.u8(2);
+                w.u64(*index);
+            }
+            Said::Map { volume, size_mib, places, index, from, map, hosts } => {
+                w.u8(3);
+                w.u32(*volume);
+                w.u64(*size_mib);
+                w.u32(*places);
+                w.u64(*index);
+                w.u32(*from);
+                w.u32(map.len() as u32);
+                for p in map {
+                    chunk_ref(&mut w, &p.chunk);
+                    for &c in &p.cs {
+                        w.u32(c);
+                    }
+                    for &s in &p.replicas {
+                        w.u8(replica_state(s));
+                    }
+                }
+                w.u8(hosts.len() as u8);
+                for (cs, host) in hosts {
+                    w.u32(*cs);
+                    w.str(host);
+                }
+            }
+            Said::Down { version, index } => {
+                w.u8(4);
+                w.u32(*version);
+                w.u64(*index);
+            }
+            Said::Behind { applied } => {
+                w.u8(5);
+                w.u64(*applied);
+            }
+            Said::NotNow(why) => {
+                w.u8(6);
+                w.str(reason(why));
+            }
+            Said::Refused(why) => {
+                w.u8(7);
+                w.str(reason(why));
+            }
+            Said::LastReplica => w.u8(8),
+            Said::NotTheWriter => w.u8(9),
+        }
+        w.buf
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Saying> {
+        let mut r = Reader::new(b);
+        let id = r.u64()?;
+        let said = match r.u8()? {
+            1 => {
+                let generation = r.u64()?;
+                Said::Attached { generation, index: r.u64()? }
+            }
+            2 => Said::Detached { index: r.u64()? },
+            3 => {
+                let (volume, size_mib, places, index, from) = (r.u32()?, r.u64()?, r.u32()?, r.u64()?, r.u32()?);
+                let n = r.u32()?;
+                /* A count past what is there, or past what is told at once, is none */
+                if n > MAP_MAX || n as usize * PLACE_BYTES > r.remaining() {
+                    return None;
+                }
+                let mut map = Vec::new();
+                for _ in 0..n {
+                    let chunk = read_chunk_ref(&mut r)?;
+                    let mut cs = [0u32; nbsmeta::REPLICAS];
+                    for c in cs.iter_mut() {
+                        *c = r.u32()?;
+                    }
+                    let mut replicas = [ReplicaState::Active; nbsmeta::REPLICAS];
+                    for s in replicas.iter_mut() {
+                        *s = read_replica_state(r.u8()?)?;
+                    }
+                    map.push(Place { chunk, cs, replicas });
+                }
+                let k = usize::from(r.u8()?);
+                if k > nbsmeta::CS_MAX {
+                    return None;
+                }
+                let mut hosts = Vec::new();
+                for _ in 0..k {
+                    let cs = r.u32()?;
+                    hosts.push((cs, String::from(r.str(nbsmeta::NAME_MAX)?)));
+                }
+                Said::Map { volume, size_mib, places, index, from, map, hosts }
+            }
+            4 => {
+                let version = r.u32()?;
+                Said::Down { version, index: r.u64()? }
+            }
+            5 => Said::Behind { applied: r.u64()? },
+            6 => Said::NotNow(String::from(r.str(REASON_MAX)?)),
+            7 => Said::Refused(String::from(r.str(REASON_MAX)?)),
+            8 => Said::LastReplica,
+            9 => Said::NotTheWriter,
+            _ => return None,
+        };
+        r.done().then_some(Saying { id, said })
     }
 }

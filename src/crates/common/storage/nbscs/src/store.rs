@@ -143,6 +143,11 @@ pub struct Store<D: Device> {
     fence_of: BTreeMap<u32, u32>,
     /// The table's places no volume has, the lowest on top.
     fence_free: Vec<u32>,
+    /// The chunks found open when their device was taken in -- each at its
+    /// incarnation and the generation that wrote it last -- and not written
+    /// again since: what this cs held of them in its device's write cache
+    /// may be gone (`found_open`).
+    found: BTreeMap<u32, (u32, u64)>,
 }
 
 impl<D: Device> Default for Store<D> {
@@ -164,6 +169,7 @@ impl<D: Device> Store<D> {
             fences: vec![Fence::default(); FENCES_MAX],
             fence_of: BTreeMap::new(),
             fence_free: (0..FENCES_MAX as u32).rev().collect(),
+            found: BTreeMap::new(),
         }
     }
 
@@ -340,6 +346,13 @@ impl<D: Device> Store<D> {
                 }
             }
         }
+        /* The chunks it holds open, as it was when it stopped */
+        let open: Vec<(u32, u32, u64)> = self.at.iter().filter(|(_, &(dv, _))| dv == index)
+            .map(|(&c, &(dv, s))| (c, self.record(dv, s))).filter(|(_, r)| r.state == SlotState::Open)
+            .map(|(c, r)| (c, r.incarnation, r.generation)).collect();
+        for (c, incarnation, generation) in open {
+            self.found.insert(c, (incarnation, generation));
+        }
         /* Its fences joined with the cs's: the newer generation of each
            volume, in the cs's place for it. The devices taken in before all
            hold the table as it was; the table written again onto them if
@@ -489,6 +502,15 @@ impl<D: Device> Store<D> {
     /// Slot `slot` of device `dv` holding `r`, its page written in copy A,
     /// flushed, then in copy B, flushed.
     fn put(&mut self, dv: usize, slot: u32, r: Record) -> Result<(), Error> {
+        /* Written again in this run: no longer as it was found -- the chunk
+           the slot held, and the one it holds now */
+        let old = self.record(dv, slot);
+        if old.state != SlotState::Free {
+            self.found.remove(&old.chunk);
+        }
+        if r.state != SlotState::Free {
+            self.found.remove(&r.chunk);
+        }
         let dev = &mut self.devs[dv];
         if let Some(cur) = dev.records.get_mut(slot as usize) {
             *cur = r;
@@ -647,6 +669,16 @@ impl<D: Device> Store<D> {
         Ok(())
     }
 
+    /// Everything written so far durable, for `volume`'s attach at
+    /// `generation`: refused to an older one the fence has taken the volume
+    /// from -- its flush done would tell its writer that what it wrote is
+    /// durable where a newer writer's reconcile may have put other data
+    /// (found by fuzz/nbs's cluster target).
+    pub fn flush_for(&mut self, volume: u32, generation: u64) -> Result<(), Error> {
+        self.check_fence(volume, generation)?;
+        self.flush()
+    }
+
     /// Everything written so far, durable.
     pub fn flush(&mut self) -> Result<(), Error> {
         let mut failed = false;
@@ -700,6 +732,29 @@ impl<D: Device> Store<D> {
             Holding { chunk, incarnation: r.incarnation, state: r.state, volume: r.volume,
                       generation: r.generation, device: self.devs[dv].sup.identity.device }
         }).collect()
+    }
+
+    /// The generation of chunk `chunk`'s writer at incarnation `incarnation`
+    /// where its record was open when its device was taken in, and has not
+    /// been written since. Its data written but not flushed when the cs
+    /// stopped may be gone where the replicas that stayed up have it: a
+    /// request of that same writer's is not to be done with it (nbswire's
+    /// `serve` refuses it as `Failed`); a newer writer's reconcile makes the
+    /// replicas the same.
+    pub fn found_open(&self, chunk: u32, incarnation: u32) -> Option<u64> {
+        self.found.get(&chunk).filter(|(i, _)| *i == incarnation).map(|&(_, g)| g)
+    }
+
+    /// Whether some chunk of `volume`'s is found open at `generation` (as
+    /// `found_open`): that writer's flush cannot make durable what may be
+    /// gone here.
+    pub fn found_open_in(&self, volume: u32, generation: u64) -> bool {
+        self.found.iter().any(|(&chunk, &(incarnation, g))| {
+            g == generation && self.at.get(&chunk).is_some_and(|&(dv, slot)| {
+                let r = self.record(dv, slot);
+                r.volume == volume && r.incarnation == incarnation
+            })
+        })
     }
 
     /// The chunk's record, where the cs holds it at this incarnation.

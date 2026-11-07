@@ -26,3 +26,6 @@ conf = { path = "../../../common/text/conf" }
 # The vm provider's side of the management bus: the parameters a call is
 # handed, read strictly.
 mgmtwire = { path = "../../../common/ipc/mgmtwire" }
+# A guest's disk that is a volume of NBS's (`nbs:<volume>`): NBS's client,
+# driven over ipc.
+nbsdrive = { path = "../../storage/nbsdrive" }
