@@ -353,6 +353,7 @@ name = "fs"
 version = "0.1.0"
 dependencies = [
  "block",
+ "diskimage",
  "events",
  "extfmt",
  "ffi",

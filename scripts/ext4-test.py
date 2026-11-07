@@ -36,6 +36,14 @@ e2fsck -D indexed, a name too long for the kernel's tree, a symlink:
     extents a few transactions at a time -- the cut file reading to its cut
     and, grown again, zeros past it; after the boot e2fsck -fn must find
     nothing, the list empty, debugfs's extents of the cut file ending at it;
+  - two disks of seeded garbage made filesystems by the kernel's own
+    `format`: refused a bad option, the root it is running on, garbage
+    or a filesystem already there without `force`, a mounted one with it;
+    one made ext4 then ext2 over it, the other ext4 with a label, each
+    mounted, written, put through `fstest` and unmounted; after the boot
+    e2fsck -fn must find nothing in either, dumpe2fs must name the label,
+    the features and the block size asked for, debugfs must read the
+    files written, and Linux must mount the ext4 and read them too;
   - then nos powers off, and nothing panicked on the way;
   - a second boot changes names and writes data on a fresh copy of mke2fs's
     image and is killed, never unmounted: e2fsck must replay its journal
@@ -84,6 +92,15 @@ ORPHAN_MIB = 72
 # a 128 MiB journal, was refused that way).
 BIG_MIB = 1 << 20
 BIG_TEXT = "written-on-a-TiB"
+# The disks the kernel's `format` makes filesystems on: sizes no other disk
+# of the boot has (the root's is 64 MiB), full of a seeded PRNG's bytes.
+ROOT_MIB = 64
+FORMAT4_MIB = 56
+FORMAT2_MIB = 40
+FORMAT4_LABEL = "made"
+FORMAT2_LABEL = "two"
+FORMAT_FILE = "format.txt"
+FORMAT_TEXT = "written-by-nos"
 
 
 def e2(tmp, *args):
@@ -435,6 +452,120 @@ def linux_mount(tmp, name):
     return r.returncode == 0, listed, sums, (r.stdout + r.stderr)[-2000:]
 
 
+def garbage(tmp, name, mib, rng):
+    """An image of `mib` MiB of a seeded PRNG's bytes: what a filesystem
+    made on it must leave nothing to."""
+    img = os.path.join(tmp, name)
+    with open(img, "wb") as f:
+        for _ in range(mib):
+            f.write(rng.randbytes(1 << 20))
+    return img
+
+
+def format_phase(sh, root_disk, f4, f2):
+    """The kernel's `format` on two disks of garbage: refusals first, then
+    ext4 and ext2 made, mounted, written and unmounted."""
+    out = sh.run("format xfs %s" % f2)
+    pt.check("format: a filesystem it does not make is refused, the ones it does named",
+             "no filesystem 'xfs'" in out and "ext2" in out and "ext4" in out, out)
+    # The options and the device's size are the plan's, said before the
+    # device is read: these are refused on a disk of garbage without force.
+    out = sh.run("format ext4 %s colour=red" % f2)
+    pt.check("format: an option ext4 does not take is refused", "takes no 'colour=red'" in out, out)
+    out = sh.run("format ext4 %s label=a-label-past-sixteen" % f2)
+    pt.check("format: a label longer than the superblock's is refused", "at most 16" in out, out)
+    out = sh.run("format ext4 %s bs=8192" % f2)
+    pt.check("format: a block size ext4 does not have is refused", "formatted" not in out and "1024" in out, out)
+    out = sh.run("format ext4 %s force" % root_disk)
+    pt.check("format: the disk the root is mounted from is refused, force or not", "in use by" in out, out)
+    out = sh.run("format ext4 nosuchdisk")
+    pt.check("format: a disk that is not there", "not found" in out, out)
+    out = sh.run("format ext4 %s" % f2)
+    pt.check("format: a disk of garbage is refused without force, as data it does not know",
+             "holds data nos does not recognize" in out and "force" in out and "formatted" not in out, out)
+
+    out = sh.run("format ext4 %s force" % f2)
+    pt.check("format: ext4 made over the garbage with force",
+             ("formatted %s as ext4: " % f2) in out and "a journal of" in out, out)
+    out = sh.run("format ext2 %s label=%s bs=2048" % (f2, FORMAT2_LABEL))
+    pt.check("format: the ext4 it made is not formatted over without force",
+             "holds an ext4 filesystem" in out and "force" in out and "formatted" not in out, out)
+    out = sh.run("format ext2 %s label=%s bs=2048 force" % (f2, FORMAT2_LABEL))
+    pt.check("format: ext2 of 2 KiB blocks made over it with force",
+             ("formatted %s as ext2: " % f2) in out and "of 2048 bytes" in out and "journal" not in out, out)
+    out = sh.run("mount ext2 %s /f2" % f2)
+    pt.check("format: its ext2 mounted for writing", "mounted ext2 on /f2" in out and "(ro)" not in out, out)
+    sh.run("write /f2/%s %s" % (FORMAT_FILE, FORMAT_TEXT))
+    sh.run("mkdir /f2/fst")
+    out = sh.run("fstest /f2/fst")
+    pt.check("format: fstest passes on the ext2 it made", "fstest: passed" in out, out[-1500:])
+    sh.run("rm /f2/fst")
+    out = sh.run("umount /f2")
+    pt.check("format: its ext2 unmounted", "unmounted /f2" in out, out)
+
+    out = sh.run("format ext4 %s label=%s force" % (f4, FORMAT4_LABEL))
+    pt.check("format: ext4 with a label made on the other disk", ("formatted %s as ext4: " % f4) in out
+             and "a journal of" in out, out)
+    out = sh.run("format ext4 %s" % f4)
+    pt.check("format: refused over it, naming what it holds",
+             ('holds an ext4 filesystem labelled "%s"' % FORMAT4_LABEL) in out and "formatted" not in out, out)
+    out = sh.run("mount ext4 %s /f4" % f4)
+    if not pt.check("format: its ext4 mounted for writing", "mounted ext4 on /f4" in out and "(ro)" not in out, out):
+        return
+    out = sh.run("format ext2 %s force" % f4)
+    pt.check("format: a mounted disk is refused, force or not", "in use by" in out and "formatted" not in out, out)
+    sh.run("write /f4/%s %s" % (FORMAT_FILE, FORMAT_TEXT))
+    sh.run("mkdir /f4/dir")
+    sh.run("write /f4/dir/a.txt %s" % FORMAT4_LABEL)
+    sh.run("mkdir /f4/fst")
+    out = sh.run("fstest /f4/fst")
+    pt.check("format: fstest passes on the ext4 it made", "fstest: passed" in out, out[-1500:])
+    sh.run("rm /f4/fst")
+    out = sh.run("mounts")
+    pt.check("format: mounts shows its journal", re.search(r"/f4.*journal=\d+/\d+ seq=\d+", out) is not None, out)
+    out = sh.run("umount /f4")
+    pt.check("format: its ext4 unmounted", "unmounted /f4" in out, out)
+    out = sh.run("mount ext4 %s /f4 ro" % f4)
+    pt.check("format: mounted again, read-only", "mounted ext4 on /f4 (ro)" in out, out)
+    got = crc_of(sh, "/f4/%s" % FORMAT_FILE)
+    want = (zlib.crc32(FORMAT_TEXT.encode()), len(FORMAT_TEXT))
+    pt.check("format: the file written reads back after the remount", got == want, "%s, want %s" % (got, want))
+    out = sh.run("umount /f4")
+    pt.check("format: unmounted again", "unmounted /f4" in out, out)
+
+
+def format_after(tmp):
+    """The host's look at what `format` made, after the boot."""
+    fsck_clean(tmp, "format4.img", "format's ext4, written and unmounted")
+    fsck_clean(tmp, "format2.img", "format's ext2, written and unmounted")
+    _, stats = e2(tmp, "dumpe2fs", "-h", "{}/format4.img")
+    features = re.search(r"Filesystem features:\s*(.*)", stats)
+    features = set(features.group(1).split()) if features else set()
+    pt.check("format's ext4: its label, a journal, extents and metadata_csum",
+             re.search(r"Filesystem volume name:\s*%s$" % FORMAT4_LABEL, stats, re.M) is not None
+             and {"has_journal", "extent", "metadata_csum"} <= features, stats[:1500])
+    _, stats = e2(tmp, "dumpe2fs", "-h", "{}/format2.img")
+    features = re.search(r"Filesystem features:\s*(.*)", stats)
+    features = set(features.group(1).split()) if features else set()
+    pt.check("format's ext2: its label, 2 KiB blocks, no journal and nothing of ext4's",
+             re.search(r"Filesystem volume name:\s*%s$" % FORMAT2_LABEL, stats, re.M) is not None
+             and re.search(r"Block size:\s*2048$", stats, re.M) is not None
+             and not features & {"has_journal", "extent", "metadata_csum", "64bit", "flex_bg"}, stats[:1500])
+    for img in ("format4.img", "format2.img"):
+        code, out = e2(tmp, "debugfs", "-R", "cat /%s" % FORMAT_FILE, "{}/" + img)
+        pt.check("%s: debugfs reads the file the kernel wrote" % img, code == 0 and FORMAT_TEXT in out, out[-600:])
+    linux = linux_mount(tmp, "format4.img")
+    if linux is None:
+        print("SKIP: Linux's loop mount of format's ext4 (neither sudo nor docker)")
+        return
+    ok, listed, sums, said = linux
+    pt.check("format's ext4: Linux mounts it, and e2fsck finds nothing after", ok, said)
+    want = {FORMAT_FILE: hashlib.md5(FORMAT_TEXT.encode()).hexdigest(),
+            "dir/a.txt": hashlib.md5(FORMAT4_LABEL.encode()).hexdigest()}
+    pt.check("format's ext4: Linux reads the files the kernel wrote", all(sums.get(k) == v for k, v in want.items()),
+             "%s\n%s" % (sums, listed))
+
+
 def disk_named(sh, mib):
     out = sh.run("disks")
     for line in out.splitlines():
@@ -462,6 +593,8 @@ def main():
     bimg = make_big(tmp)
     if ext4 is None or jimg is None or oimg is None or bimg is None:
         return 1
+    f4img = garbage(tmp, "format4.img", FORMAT4_MIB, rng)
+    f2img = garbage(tmp, "format2.img", FORMAT2_MIB, rng)
     with open(jimg, "rb") as f:
         before = hashlib.sha256(f.read()).hexdigest()
 
@@ -486,7 +619,7 @@ def main():
         return subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     model = Model(files)
-    p = qemu([ext4, jimg, oimg, bimg], log)
+    p = qemu([ext4, jimg, oimg, bimg, f4img, f2img], log)
     try:
         if not pt.check("boots to its shell", pt.wait_log(log, "boot: complete", 300)):
             return 1
@@ -570,6 +703,10 @@ def main():
         out = sh.run("umount /b4")
         pt.check("the TiB filesystem unmounted", "unmounted /b4" in out, out)
 
+        f4, f2, rootd = disk_named(sh, FORMAT4_MIB), disk_named(sh, FORMAT2_MIB), disk_named(sh, ROOT_MIB)
+        if pt.check("the two disks of garbage and the root's found", None not in (f4, f2, rootd), sh.run("disks")):
+            format_phase(sh, rootd, f4, f2)
+
         sh.sock.settimeout(5)
         try:
             sh.run("poweroff")
@@ -603,6 +740,7 @@ def main():
     blocks = (o_size + 4095) // 4096
     pt.check("debugfs's extents of the cut file end at its cut, its regrowth a hole",
              code == 0 and bool(ext) and all(a + n <= blocks for a, n in ext), out)
+    format_after(tmp)
 
     # The second boot: names changed, and the machine killed under them.
     klog = os.path.join(tmp, "kill.log")
