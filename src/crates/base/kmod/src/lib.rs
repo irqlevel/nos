@@ -43,13 +43,31 @@ fn alloc_error(layout: core::alloc::Layout) -> ! {
 /// commands it registered, the tasks it started. `Send`, because the task
 /// that drops it is not the one that made it; nothing shares it, so it need
 /// not be `Sync`.
-pub trait Module: Send {}
+///
+/// The loader takes a module down in one order (`take_down` in
+/// kernel/module.cpp): its shell commands and bus providers are closed --
+/// no call of them starts -- then [`Module::stop`] runs, then the calls of
+/// them still running are waited out, and only then is it dropped. So the
+/// drop runs with no call of the module's commands or providers running or
+/// able to start: what it stops stays stopped, in whatever order its fields
+/// go.
+pub trait Module: Send {
+    /// As the unload begins, its commands and providers closed and their
+    /// calls not yet waited out: what such a call may be blocked on that
+    /// only the module's going would end, told to end -- a server's
+    /// sessions, whose output a client is not taking; a guest an `hv wait`
+    /// waits on. It may wait for that, but it is not the drop: a call still
+    /// running may start something after it, which the drop, after the
+    /// calls are done, is the one to stop. Nothing, for a module none of
+    /// whose calls waits on anything of its own.
+    fn stop(&mut self) {}
+}
 
 /// `"NOSM"`, the first field of [`ModuleInfo`].
 pub const MAGIC: u32 = 0x4D53_4F4E;
 /// The layout of [`ModuleInfo`]; bumped with any change to it. 2: the init
-/// is handed the module's parameters and `insmod`'s output.
-pub const INFO_VERSION: u32 = 2;
+/// is handed the module's parameters and `insmod`'s output. 3: a stop.
+pub const INFO_VERSION: u32 = 3;
 pub const NAME_LEN: usize = 32;
 pub const ABI_LEN: usize = 64;
 
@@ -73,6 +91,8 @@ pub struct ModuleInfo {
     /// it; `out`: the `stdlib::Printer` its output goes to. Both valid while
     /// the init runs (`ModuleInfo` in kernel/module.cpp).
     pub init: unsafe extern "C" fn(params: *const u8, len: usize, out: *mut c_void) -> *mut c_void,
+    /// [`Module::stop`] of what the init made.
+    pub stop: unsafe extern "C" fn(state: *mut c_void),
     pub exit: unsafe extern "C" fn(state: *mut c_void),
 }
 
@@ -175,6 +195,15 @@ pub unsafe fn __init(name: &str, params: *const u8, len: usize, out: *mut c_void
     handed_back(name, init(&Params { text }, &mut out))
 }
 
+/// `state` is what the init handed back, not yet given to `__exit`: the
+/// loader's alone, so nothing else holds a reference into it.
+#[doc(hidden)]
+pub unsafe fn __stop(state: *mut c_void) {
+    if !state.is_null() {
+        unsafe { (*(state as *mut Box<dyn Module>)).stop() }
+    }
+}
+
 #[doc(hidden)]
 pub unsafe fn __exit(state: *mut c_void) {
     if !state.is_null() {
@@ -208,6 +237,7 @@ macro_rules! module {
             abi: $crate::padded($crate::ABI),
             name: $crate::fixed($name),
             init: __nos_module_init,
+            stop: __nos_module_stop,
             exit: __nos_module_exit,
         };
 
@@ -218,6 +248,10 @@ macro_rules! module {
         ) -> *mut core::ffi::c_void {
             /* What the loader hands an init: ModuleInfo's comment. */
             unsafe { $crate::__init($name, params, len, out, $init) }
+        }
+
+        unsafe extern "C" fn __nos_module_stop(state: *mut core::ffi::c_void) {
+            unsafe { $crate::__stop(state) }
         }
 
         unsafe extern "C" fn __nos_module_exit(state: *mut core::ffi::c_void) {

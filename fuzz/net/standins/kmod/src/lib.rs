@@ -9,7 +9,20 @@ extern crate alloc;
 pub use kcore;
 
 /// A module while it is loaded, as the real crate has it.
-pub trait Module: Send {}
+pub trait Module: Send {
+    fn stop(&mut self) {}
+}
+
+/// `rmmod`, as the loader takes a module down: its stop, then its drop.
+/// Between the two the loader waits out the calls of the module's commands
+/// and providers still running, of which the fuzzer's targets have none by
+/// the time they unload one.
+pub fn unload(module: Option<alloc::boxed::Box<dyn Module>>) {
+    if let Some(mut m) = module {
+        m.stop();
+        drop(m);
+    }
+}
 
 /// The ffi digest a module was built against: on the fuzzer's bench there
 /// is no loader to compare it with.

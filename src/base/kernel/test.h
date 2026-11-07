@@ -42,6 +42,13 @@ bool test_affinity();
    rust_test. */
 bool test_module_bus();
 
+/* The loader's take-down order (ModuleTable::take_down) on modtest: a call
+   of its command running as the unload begins, which only the module's
+   stop lets return -- the stop finding the command and the provider closed
+   already, the drop coming after the call has returned. Needs tasks: run
+   after rust_test. */
+bool test_module_unload();
+
 /* The message channel's module side (src/crates/layers/ipc): modtest talking to
    kernel.echo, then unloaded under the echo's traffic -- its mailbox closed
    and the echo's monitor told, the one it left open closed by the sweep
