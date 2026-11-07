@@ -70,7 +70,8 @@ pub const MODULE_LIVE: u32 = 0;
 pub const MODULE_LOADING: u32 = 1;
 pub const MODULE_UNLOADING: u32 = 2;
 
-/// The page allocator's pages and the huge pool's blocks.
+/// The page allocator's pages and the huge pool's blocks; the fewest pages
+/// free since boot; and Rust's heap.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct MemInfo {
@@ -80,7 +81,27 @@ pub struct MemInfo {
     pub huge_block_bytes: u64,
     pub huge_blocks: u64,
     pub huge_free: u64,
+    /// The fewest pages free since the free list was built.
+    pub free_lowest_pages: u64,
+    /// What Rust's global allocator holds (`mm::HeapUsage`): the bytes
+    /// asked for, what they took of RAM once the heap rounded them up, the
+    /// blocks -- now, and the most of each at once, to within a slot's
+    /// worth a CPU.
+    pub rust_asked: u64,
+    pub rust_taken: u64,
+    pub rust_blocks: u64,
+    pub rust_asked_peak: u64,
+    pub rust_taken_peak: u64,
+    pub rust_blocks_peak: u64,
+    /// Since boot: its allocations, its frees, and the allocations the heap
+    /// had nothing for.
+    pub rust_allocs: u64,
+    pub rust_frees: u64,
+    pub rust_refused: u64,
 }
+
+/* As many words as the C++'s RustMemInfo, which checks the same */
+const _: () = assert!(core::mem::size_of::<MemInfo>() == 16 * 8);
 
 /// How `kernel_module_command` ended.
 pub const MODULE_DONE: i32 = 0;

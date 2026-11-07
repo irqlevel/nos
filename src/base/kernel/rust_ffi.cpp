@@ -23,6 +23,8 @@
 #include "tracepoint.h"
 #include "cmd.h"
 #include <mm/new.h>
+#include <mm/allocator.h>
+#include <mm/heap_usage.h>
 #include <mm/page_allocator.h>
 #include <mm/page_table.h>
 #include <lib/stdlib.h>
@@ -236,24 +238,51 @@ void kernel_klog(unsigned int level, const unsigned char* msg, unsigned long len
         level, time.get_secs(), time.get_usecs(), buf);
 }
 
+} /* extern "C" */
+
+/* What kernel_alloc asks the heap for, for a block of size bytes aligned to
+   align: the size itself -- mm::alloc guarantees 8-byte alignment -- or,
+   over-aligned (#[repr(align)] / SIMD types), room to align it and to
+   stash the heap's own pointer just below for kernel_free. False when that
+   is past what a size can say. kernel_free works it out again from the
+   same two, as Rust hands it the layout it allocated with, to know what
+   the block took. */
+static bool rust_heap_request(unsigned long size, unsigned long align, unsigned long& request)
+{
+    if (align <= 8)
+    {
+        request = size;
+        return true;
+    }
+    if (size > (unsigned long)-1 - align - sizeof(void*))
+        return false;
+    request = size + align + sizeof(void*);
+    return true;
+}
+
+extern "C" {
+
 void* kernel_alloc(unsigned long size, unsigned long align)
 {
     if (align == 0 || (align & (align - 1)) != 0)
         PANIC("kernel_alloc: bad align %lu", align);
 
-    /* mm::alloc guarantees 8-byte alignment. alloc_uninit: GlobalAlloc::alloc
-       promises nothing about the contents, and alloc_zeroed zeroes them on
-       the Rust side. */
-    if (align <= 8)
-        return kernel::mm::alloc_uninit(size, RUST_ALLOC_TAG);
-
-    /* Over-aligned (#[repr(align)] / SIMD types): over-allocate and stash
-       the original pointer just below the aligned address for kernel_free */
-    if (size > (unsigned long)-1 - align - sizeof(void*))
-        return nullptr;
-    void* raw = kernel::mm::alloc_uninit(size + align + sizeof(void*), RUST_ALLOC_TAG);
+    /* alloc_uninit: GlobalAlloc::alloc promises nothing about the contents,
+       and alloc_zeroed zeroes them on the Rust side. */
+    auto& usage = kernel::mm::rust_heap_usage();
+    unsigned long request = 0;
+    void* raw = nullptr;
+    if (rust_heap_request(size, align, request))
+        raw = kernel::mm::alloc_uninit(request, RUST_ALLOC_TAG);
     if (raw == nullptr)
+    {
+        usage.refuse();
         return nullptr;
+    }
+    usage.add(size, kernel::mm::AllocatorImpl::footprint(request));
+
+    if (align <= 8)
+        return raw;
     unsigned long aligned =
         stdlib::round_up((unsigned long)raw + sizeof(void*), align);
     ((void**)aligned)[-1] = raw;
@@ -262,9 +291,21 @@ void* kernel_alloc(unsigned long size, unsigned long align)
 
 void kernel_free(void* ptr, unsigned long size, unsigned long align)
 {
-    (void)size;
     if (ptr == nullptr)
         return;
+
+    /* What kernel_alloc took for this layout. One the heap could never have
+       handed out -- a request past what a size can say, or past the largest
+       block -- has no block to free: a layout that is not the one Rust
+       allocated with. Checked here, so that the counts never take in a size
+       the heap would not have given. */
+    unsigned long request = 0;
+    const size_t taken = rust_heap_request(size, align, request) ?
+        kernel::mm::AllocatorImpl::footprint(request) : 0;
+    if (BUG_ON(taken == 0))
+        return;
+    kernel::mm::rust_heap_usage().sub(size, taken);
+
     if (align > 8)
         ptr = ((void**)ptr)[-1];
     kernel::mm::free(ptr);
@@ -1955,7 +1996,8 @@ unsigned long long kernel_cpu_idle_ns(unsigned int cpu)
     return (idle != nullptr) ? idle->get_runtime_ns() : 0;
 }
 
-/* The page allocator's pages and the huge pool's blocks: ffi::system::MemInfo */
+/* The page allocator's pages and the huge pool's blocks; the fewest pages
+   free since boot; and Rust's heap: ffi::system::MemInfo, field for field */
 struct RustMemInfo
 {
     unsigned long long page_bytes;
@@ -1964,7 +2006,32 @@ struct RustMemInfo
     unsigned long long huge_block_bytes;
     unsigned long long huge_blocks;
     unsigned long long huge_free;
+    unsigned long long free_lowest_pages;
+    unsigned long long rust_asked;
+    unsigned long long rust_taken;
+    unsigned long long rust_blocks;
+    unsigned long long rust_asked_peak;
+    unsigned long long rust_taken_peak;
+    unsigned long long rust_blocks_peak;
+    unsigned long long rust_allocs;
+    unsigned long long rust_frees;
+    unsigned long long rust_refused;
 };
+
+/* As many words as ffi::system::MemInfo, which checks the same */
+static_assert(sizeof(RustMemInfo) == 16 * sizeof(unsigned long long), "RustMemInfo is not ffi's MemInfo");
+
+} /* extern "C" */
+
+/* A count of the heap's as MemInfo carries it: a free nobody allocated
+   would take one below zero, which memusage shows as it is and this as
+   none */
+static unsigned long long heap_count(long value)
+{
+    return (value > 0) ? static_cast<unsigned long long>(value) : 0;
+}
+
+extern "C" {
 
 void kernel_mem_info(RustMemInfo* out)
 {
@@ -1978,6 +2045,19 @@ void kernel_mem_info(RustMemInfo* out)
     out->huge_block_bytes = kernel::mm::PageTable::HUGE_FRAME_SIZE;
     out->huge_blocks = pt.get_huge_pool_blocks();
     out->huge_free = pt.get_huge_pool_free();
+    out->free_lowest_pages = pt.get_free_pages_lowest();
+
+    kernel::mm::HeapUsage::Totals rust;
+    kernel::mm::rust_heap_usage().read(rust);
+    out->rust_asked = heap_count(rust.bytes);
+    out->rust_taken = heap_count(rust.taken);
+    out->rust_blocks = heap_count(rust.blocks);
+    out->rust_asked_peak = heap_count(rust.bytes_peak);
+    out->rust_taken_peak = heap_count(rust.taken_peak);
+    out->rust_blocks_peak = heap_count(rust.blocks_peak);
+    out->rust_allocs = rust.allocs;
+    out->rust_frees = rust.frees;
+    out->rust_refused = rust.refused;
 }
 
 /* The length of what buf holds up to its NUL, never past len */

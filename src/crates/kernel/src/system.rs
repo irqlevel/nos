@@ -203,6 +203,20 @@ fn memory(call: &mut Call) -> Status {
         w.field_uint("huge_block_bytes", m.huge_block_bytes);
         w.field_uint("huge_total_bytes", m.huge_blocks.saturating_mul(m.huge_block_bytes));
         w.field_uint("huge_free_bytes", m.huge_free.saturating_mul(m.huge_block_bytes));
+        /* The fewest free since boot: how near the machine came to none */
+        w.field_uint("free_lowest_bytes", m.free_lowest_pages.saturating_mul(m.page_bytes));
+        /* Rust's heap: what it takes of RAM, what its allocations asked
+         * for, how many they are -- now and at the most -- and its counts
+         * since boot (memusage shows the same) */
+        w.field_uint("rust_heap_taken_bytes", m.rust_taken);
+        w.field_uint("rust_heap_asked_bytes", m.rust_asked);
+        w.field_uint("rust_heap_blocks", m.rust_blocks);
+        w.field_uint("rust_heap_peak_taken_bytes", m.rust_taken_peak);
+        w.field_uint("rust_heap_peak_asked_bytes", m.rust_asked_peak);
+        w.field_uint("rust_heap_peak_blocks", m.rust_blocks_peak);
+        w.field_uint("rust_heap_allocations", m.rust_allocs);
+        w.field_uint("rust_heap_frees", m.rust_frees);
+        w.field_uint("rust_heap_refused", m.rust_refused);
         w.end_object();
     })
 }
@@ -505,8 +519,33 @@ pub fn selftest() {
     if checked == 0 {
         panic!("system selftest: no provider of the image's answered");
     }
+    memory_selftest();
     log_selftest();
     klog!(0, "system: selftest passed, {} reads of the image's providers answered", checked);
+}
+
+/// The memory method's numbers through the C ABI, held to what every read
+/// of them guarantees while the CPUs go on allocating -- a field the C++
+/// writes where ffi does not read it would break one: a peak is never under
+/// what the same read found now (the read raises it to that first), the
+/// fewest free never over the free (read after them), and Rust has
+/// allocated by now.
+fn memory_selftest() {
+    let m = system::memory();
+    let held = m.page_bytes != 0
+        && m.free_lowest_pages <= m.free_pages
+        && m.rust_allocs > 0
+        && m.rust_taken_peak >= m.rust_taken
+        && m.rust_asked_peak >= m.rust_asked
+        && m.rust_blocks_peak >= m.rust_blocks;
+    if !held {
+        panic!(
+            "system selftest: memory's numbers do not hold together: free {} lowest {} pages; rust heap \
+             taken {} (peak {}), asked {} (peak {}), {} blocks (peak {}), {} allocations",
+            m.free_pages, m.free_lowest_pages, m.rust_taken, m.rust_taken_peak, m.rust_asked, m.rust_asked_peak,
+            m.rust_blocks, m.rust_blocks_peak, m.rust_allocs
+        );
+    }
 }
 
 /// The log read by number: a line logged now comes back after the number

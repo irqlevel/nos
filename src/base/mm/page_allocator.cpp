@@ -205,6 +205,18 @@ PageAllocatorImpl::~PageAllocatorImpl()
     klog(0, "0x%p dtor", this);
 }
 
+size_t PageAllocatorImpl::footprint(size_t num_pages)
+{
+    if (num_pages == 0)
+        return 0;
+
+    /* As alloc picks the class, by the count of leading zeros */
+    size_t log = stdlib::log2_clz(num_pages);
+    if (log >= PAGE_LOG_LIMIT)
+        return 0;
+    return (static_cast<size_t>(1) << log) * consts::PAGE_SIZE;
+}
+
 void* PageAllocatorImpl::alloc(size_t num_pages, bool zero)
 {
     BUG_ON(num_pages == 0);

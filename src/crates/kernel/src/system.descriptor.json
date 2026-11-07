@@ -105,6 +105,8 @@
     "cpu_idle": {"title": {"en": "CPU idle", "ru": "Простой ЦП"}, "method": "cpus", "items": "cpus", "key": "cpu",
       "field": "idle_ns", "kind": "rate", "unit": "ns"},
     "memory_free": {"title": {"en": "Free memory", "ru": "Свободная память"}, "method": "memory",
-      "field": "free_bytes", "kind": "gauge", "unit": "B"}
+      "field": "free_bytes", "kind": "gauge", "unit": "B"},
+    "rust_heap": {"title": {"en": "Rust heap", "ru": "Куча Rust"}, "method": "memory",
+      "field": "rust_heap_taken_bytes", "kind": "gauge", "unit": "B"}
   }
 }
