@@ -1013,9 +1013,12 @@ void kernel_frames_unmap(unsigned long va, unsigned long count)
 
 /* ---- Soft IRQ ---- */
 
-void kernel_softirq_raise(unsigned long type)
+/* Every soft IRQ type `mask` has a bit of, raised at once: one wake and at
+   most one kick of this CPU's softirq task for all of them (SoftIrq::
+   raise_mask). Values only, and a bit past the types is none. */
+void kernel_softirq_raise_mask(unsigned long mask)
 {
-    kernel::SoftIrq::get_instance().raise(type);
+    kernel::SoftIrq::get_instance().raise_mask(mask);
 }
 
 /* Whether that soft IRQ is already asked for. What lets a poll tell a pass
