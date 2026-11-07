@@ -15,6 +15,7 @@ edition = "2021"
 nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
 nbscs = { path = "../../src/crates/common/storage/nbscs" }
 nbswire = { path = "../../src/crates/common/storage/nbswire" }
+nbsclient = { path = "../../src/crates/common/storage/nbsclient" }
 raft = { path = "../../src/crates/common/cluster/raft" }
 
 # No CPU features, as net-fuzz has it and for its reason: the RustCrypto

@@ -242,7 +242,7 @@ impl App for Registry {
         Err(String::from(why))
     }
 
-    fn finish(&mut self, core: &mut Core<Registry>, w: Joiner, outcome: Outcome<Registry>) {
+    fn finish(&mut self, core: &mut Core<Registry>, w: Joiner, outcome: Outcome<Registry>, _index: u64) {
         let Joiner { to, invitation } = w;
         self.joining.retain(|&i| i != invitation);
         let joined = match outcome {

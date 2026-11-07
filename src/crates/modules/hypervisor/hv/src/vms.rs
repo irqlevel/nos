@@ -63,7 +63,7 @@ use crate::store::{self, Folder};
 use crate::vmlog::Log;
 
 const START_USAGE: &str =
-    "hv start <name|folder> | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
+    "hv start <name|folder> | <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=<path|device>[:ro]]... [input=...] [log] [restart] [force] [net] [port=N] [forward=nos:guest]... [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -1158,12 +1158,17 @@ impl Vms {
         let (first, rest) = after_word(args);
         let started = match store::find(root, first) {
             Ok(Some(folder)) => {
-                if !rest.is_empty() {
-                    let _ = writeln!(out, "hv: a vm started from its folder is started as its {} says -- no words after \
-                                           its name", store::CONFIG);
-                    return;
-                }
-                self.start_from(machine, cores, forwards, folder, out)
+                /* As its vm.toml says -- but `force`, which no file says */
+                let force = match rest.trim() {
+                    "" => false,
+                    "force" => true,
+                    _ => {
+                        let _ = writeln!(out, "hv: a vm started from its folder is started as its {} says -- no words \
+                                               after its name but force, for its volumes of NBS's", store::CONFIG);
+                        return;
+                    }
+                };
+                self.start_forced(machine, cores, forwards, folder, force, out)
             }
             Ok(None) => match guest::parse(args, START_USAGE) {
                 Ok(spec) if spec.secs.is_none() => self.launch(machine, cores, forwards, spec, None, out),
@@ -1185,10 +1190,18 @@ impl Vms {
     /// comes to.
     pub fn start_from(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, folder: Folder,
                       out: &mut dyn Write) -> Result<u32, String> {
+        self.start_forced(machine, cores, forwards, folder, false, out)
+    }
+
+    /// As `start_from`, its volumes of NBS's taken from a writer elsewhere
+    /// with `force`.
+    fn start_forced(&self, machine: &Arc<Machine>, cores: &Cores, forwards: &Forwards, folder: Folder, force: bool,
+                    out: &mut dyn Write) -> Result<u32, String> {
         hv::run::ensure_runnable(machine).map_err(|e| alloc::format!("no guest can run here -- {}", e))?;
         let config = store::load(&folder)?;
-        let spec = store::options_checked(&folder, &config)
+        let mut spec = store::options_checked(&folder, &config)
             .map_err(|e| alloc::format!("{}/{}: {}", folder.path, store::CONFIG, e))?;
+        spec.force = force;
         let log = config.console_log;
         self.launch(machine, cores, forwards, spec, Some((folder, log)), out)
     }

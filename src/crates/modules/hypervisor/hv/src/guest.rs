@@ -90,6 +90,10 @@ pub struct Spec {
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
     pub restart: bool,
+    /// `force`, for `hv start`: its volumes of NBS's (`disk=nbs:<volume>`)
+    /// attached for writing even where a host writes them now -- that
+    /// host's writes fenced from then on.
+    pub force: bool,
     /// `net`, for `hv start`: a NIC on the guests' switch. Which port is
     /// `nic`'s, once `hv start` has claimed one.
     pub net: bool,
@@ -208,6 +212,8 @@ pub fn words(args: &str, usage: &str) -> Result<Options, String> {
             o.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
             o.restart = true;
+        } else if word == "force" {
+            o.force = true;
         } else if word == "net" {
             o.net = true;
         } else if o.kernel.is_empty() && !word.contains('=') {
@@ -280,6 +286,7 @@ pub fn spec(o: Options) -> Result<Spec, String> {
         nooffload: o.nooffload,
         log: o.log,
         restart: o.restart,
+        force: o.force,
         net: o.net,
         port,
         network: o.network,
@@ -538,9 +545,14 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     for (i, (path, ro)) in spec.disks.iter().enumerate() {
         let index = u8::try_from(i).map_err(|_| String::from("more disks than a guest has"))?;
         let letter = char::from(b'a'.saturating_add(index));
-        let disk = QueuedDisk::open(path, *ro, runner, index)?;
+        let disk = QueuedDisk::open(path, *ro, spec.force, runner, index)?;
         let mut id = String::new();
-        let _ = write!(id, "nos-vd{}", letter);
+        match disk.serial() {
+            Some(s) => id.push_str(s),
+            None => {
+                let _ = write!(id, "nos-vd{}", letter);
+            }
+        }
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
 

@@ -202,10 +202,10 @@ pub fn clone(root: &str, vms: &Vms, from: &str, to: &str, port: Option<u32>, wor
     let o = store::options(&source, &was)?;
     /* A device is the VM's own: a clone would have two VMs on it -- or,
      * read-only, never both running, the block layer's claim on it being
-     * the one VM's. */
-    if let Some((device, _)) = o.disks.iter().find(|(p, _)| crate::devices::is_device(p)) {
-        return Err(alloc::format!("its disk {} is a device of nos's, which a clone cannot share -- give the clone a \
-                                   disk of its own", device));
+     * the one VM's. So is a volume of NBS's, whose writer is one. */
+    if let Some((device, _)) = o.disks.iter().find(|(p, _)| !crate::devices::is_file(p)) {
+        return Err(alloc::format!("its disk {} is a device of nos's or a volume of NBS's, which a clone cannot \
+                                   share -- give the clone a disk of its own", device));
     }
 
     /* What is copied, what is shared, what is made anew: the new
