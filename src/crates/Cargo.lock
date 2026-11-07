@@ -127,6 +127,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec"
+version = "0.1.0"
+
+[[package]]
 name = "conf"
 version = "0.1.0"
 
@@ -592,11 +596,13 @@ dependencies = [
 name = "mod-cluster"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "ipcwire",
  "kcore",
  "kmod",
  "mgmtwire",
  "raft",
+ "raftmember",
  "registry",
  "sha2",
 ]
@@ -661,6 +667,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-nbs-mds"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "kcore",
+ "kmod",
+ "nbsmeta",
+ "raft",
+ "raftmember",
+]
+
+[[package]]
 name = "mod-netblk"
 version = "0.1.0"
 dependencies = [
@@ -703,6 +721,15 @@ dependencies = [
  "kmod",
  "tls",
  "web",
+]
+
+[[package]]
+name = "nbsmeta"
+version = "0.1.0"
+dependencies = [
+ "codec",
+ "ipcwire",
+ "raft",
 ]
 
 [[package]]
@@ -941,6 +968,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "raftmember"
+version = "0.1.0"
+dependencies = [
+ "ipcwire",
+ "kcore",
+ "raft",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +1016,7 @@ dependencies = [
 name = "registry"
 version = "0.1.0"
 dependencies = [
+ "codec",
  "ipcwire",
  "raft",
 ]

@@ -1,12 +1,25 @@
-//! What the registry's commands, answers and snapshots are made of:
-//! little-endian integers, and strings with their lengths in front -- every
-//! read checked, none past the end, and a length never taken on trust.
+//! Bytes in order: little-endian integers, and strings with their lengths
+//! in front -- every read checked, none past the end, and a length never
+//! taken on trust. What a replicated state's commands, answers and snapshots
+//! are made of: the cluster's registry's and NBS's metadata's.
 
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Bytes written in order.
-pub(crate) struct Writer {
+pub struct Writer {
     pub buf: Vec<u8>,
+}
+
+impl Default for Writer {
+    fn default() -> Writer {
+        Writer::new()
+    }
 }
 
 impl Writer {
@@ -31,8 +44,8 @@ impl Writer {
         self.buf.extend_from_slice(b);
     }
 
-    /// A string, its length in front: one the registry wrote, so at most
-    /// what a `u8` counts -- every string it keeps is shorter than that.
+    /// A string, its length in front: at most what a `u8` counts -- the
+    /// writer keeps none longer.
     pub fn str(&mut self, s: &str) {
         debug_assert!(s.len() <= usize::from(u8::MAX));
         self.buf.push(s.len().min(usize::from(u8::MAX)) as u8);
@@ -41,7 +54,7 @@ impl Writer {
 }
 
 /// Bytes read in order: None for any read past the end.
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     buf: &'a [u8],
     at: usize,
 }
@@ -93,4 +106,31 @@ impl<'a> Reader<'a> {
     pub fn done(&self) -> bool {
         self.at == self.buf.len()
     }
+}
+
+/// Bytes as lowercase hex, two digits a byte: how ids and keys are written in
+/// the files and the shell.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from(DIGITS[usize::from(b >> 4)]));
+        s.push(char::from(DIGITS[usize::from(b & 0xf)]));
+    }
+    s
+}
+
+/// `N` bytes from their hex, exactly `2 * N` digits of either case: None for
+/// anything else.
+pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let b = text.as_bytes();
+    if b.len() != 2 * N {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, pair) in b.chunks(2).enumerate() {
+        let digit = |x: u8| (x as char).to_digit(16);
+        out[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
+    }
+    Some(out)
 }

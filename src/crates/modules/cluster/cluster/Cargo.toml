@@ -14,6 +14,10 @@ crate-type = ["staticlib"]
 kmod = { path = "../../../base/kmod" }
 kcore = { path = "../../../base/kcore" }
 raft = { path = "../../../common/cluster/raft" }
+# The member's engine: raft over ipc, shared with nbs-mds.ko.
+raftmember = { path = "../raftmember" }
+# Ids and keys in hex.
+codec = { path = "../../../common/codec" }
 registry = { path = "../../../common/cluster/registry" }
 # ipcnet's control mailbox, which this host's peers are given through.
 ipcwire = { path = "../../../common/ipc/ipcwire" }

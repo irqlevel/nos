@@ -9,7 +9,8 @@
 //!   joins it, and never written over: the mark that this host is a member,
 //!   so that a log in `raft/` with no `member` beside it is what an `init`
 //!   or a `join` that did not finish left, and the next one clears it;
-//! - `raft/`, the member's log (`raft::log::DiskLog`), over [`KFiles`];
+//! - `raft/`, the member's log (`raft::log::DiskLog`), over raftmember's
+//!   `KFiles`;
 //! - `.sync`, an empty file a sync of the directory syncs: nos's file
 //!   system makes everything durable at any file's sync.
 
@@ -18,8 +19,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use kcore::error::Error;
-use kcore::fs::File;
-use raft::log::{FileError, Files};
+use raftmember::KFiles;
 
 pub const DEFAULT_DIR: &str = "/etc/cluster";
 /// The member file's most bytes: its first line, and a line of each host
@@ -62,26 +62,7 @@ pub struct Known {
     pub keys: Vec<[u8; 32]>,
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
-
-pub fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    let b = text.as_bytes();
-    if b.len() != 2 * N {
-        return None;
-    }
-    let mut out = [0u8; N];
-    for (i, pair) in b.chunks(2).enumerate() {
-        let digit = |x: u8| (x as char).to_digit(16);
-        out[i] = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
-    }
-    Some(out)
-}
+pub use codec::{hex, unhex};
 
 /// The member file, if there is one: None for a host in no cluster.
 pub fn read_member(dir: &Dir) -> Result<Option<Member>, String> {
@@ -159,93 +140,5 @@ pub fn clear_log(dir: &Dir) -> Result<(), String> {
     if read_member(dir)?.is_some() {
         return Err(alloc::format!("{} names a member: its log is not cleared", dir.path("member")));
     }
-    let mut files = KFiles::new(dir)?;
-    let mut names = Vec::new();
-    files.list(&mut names).map_err(|_| alloc::format!("cannot list {}", dir.path("raft")))?;
-    for name in &names {
-        files.remove(name).map_err(|_| alloc::format!("cannot remove {}/{}", dir.path("raft"), name))?;
-    }
-    if !names.is_empty() {
-        files.sync_dir().map_err(|_| alloc::format!("cannot sync {}", dir.path("raft")))?;
-    }
-    Ok(())
-}
-
-/// A raft log's folder, as `raft::log::Files` has one: its calls are
-/// kcore::fs's, its paths under `dir`.
-pub struct KFiles {
-    dir: String,
-    /// What a sync of the folder syncs.
-    mark: String,
-}
-
-impl KFiles {
-    /// The log's folder, `<root>/raft`, made where it is not there.
-    pub fn new(root: &Dir) -> Result<KFiles, String> {
-        let _ = kcore::fs::create_dir(&root.root);
-        let dir = root.path("raft");
-        kcore::fs::create_dir(&dir).map_err(|_| alloc::format!("cannot make {}", dir))?;
-        let mark = root.path(".sync");
-        match kcore::fs::create(&mark, b"") {
-            Ok(()) | Err(Error::Busy) => {}
-            Err(_) => return Err(alloc::format!("cannot make {}", mark)),
-        }
-        Ok(KFiles { dir, mark })
-    }
-
-    fn path(&self, name: &str) -> String {
-        alloc::format!("{}/{}", self.dir, name)
-    }
-}
-
-fn file_error(e: Error) -> FileError {
-    if e == Error::NotFound { FileError::NotFound } else { FileError::Io }
-}
-
-impl Files for KFiles {
-    fn list(&mut self, out: &mut Vec<String>) -> Result<(), FileError> {
-        for e in kcore::fs::list(&self.dir).map_err(file_error)? {
-            if e.dir {
-                continue;
-            }
-            /* The log names its files in ASCII: anything else is not its */
-            if let Ok(name) = String::from_utf8(e.name) {
-                out.push(name);
-            }
-        }
-        Ok(())
-    }
-
-    fn len(&mut self, name: &str) -> Result<u64, FileError> {
-        kcore::fs::size(&self.path(name)).map_err(file_error)
-    }
-
-    fn read_at(&mut self, name: &str, offset: u64, buf: &mut [u8]) -> Result<usize, FileError> {
-        kcore::fs::read_at(&self.path(name), offset, buf).map_err(file_error)
-    }
-
-    fn append(&mut self, name: &str, data: &[u8]) -> Result<(), FileError> {
-        kcore::fs::append(&self.path(name), data).map_err(file_error)
-    }
-
-    fn truncate(&mut self, name: &str, len: u64) -> Result<(), FileError> {
-        File::open(&self.path(name), true).and_then(|f| f.set_len(len)).map_err(file_error)
-    }
-
-    fn sync(&mut self, name: &str) -> Result<(), FileError> {
-        File::open(&self.path(name), false).and_then(|f| f.sync()).map_err(file_error)
-    }
-
-    fn sync_dir(&mut self) -> Result<(), FileError> {
-        /* A file's sync is the whole file system's on nos */
-        File::open(&self.mark, false).and_then(|f| f.sync()).map_err(file_error)
-    }
-
-    fn rename(&mut self, from: &str, to: &str) -> Result<(), FileError> {
-        kcore::fs::rename(&self.path(from), &self.path(to)).map_err(file_error)
-    }
-
-    fn remove(&mut self, name: &str) -> Result<(), FileError> {
-        kcore::fs::remove(&self.path(name)).map_err(file_error)
-    }
+    KFiles::new(&dir.root, "raft")?.clear()
 }

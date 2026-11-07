@@ -1,0 +1,16 @@
+[package]
+name = "nbsmeta"
+version = "0.1.0"
+edition = "2021"
+
+# NBS's metadata (plans/nbs.md): the state every host's mds keeps
+# replicated through raft's rsm, and the commands that change it -- for now
+# the NBS cluster's identity and its members (N5); volumes, devices and
+# placement come with N6. No kernel in it and no unsafe: nbs-mds.ko builds
+# it, and fuzz/raft's nbsmeta target holds it to a model of its own.
+[lib]
+
+[dependencies]
+raft = { path = "../../cluster/raft" }
+ipcwire = { path = "../../ipc/ipcwire" }
+codec = { path = "../../codec" }

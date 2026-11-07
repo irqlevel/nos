@@ -1,0 +1,10 @@
+[package]
+name = "codec"
+version = "0.1.0"
+edition = "2021"
+
+# Bytes a replicated state's commands, answers and snapshots are made of:
+# little-endian integers and strings with their lengths in front, every read
+# checked. The registry's and NBS's metadata's alike (plans/nbs.md).
+[lib]
+name = "codec"
