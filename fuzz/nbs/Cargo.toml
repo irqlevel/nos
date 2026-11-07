@@ -1,7 +1,8 @@
 # NBS on the host (plans/nbs.md, "Tested"): its crates as they are, each
-# held to a model of its own (scripts/nbs-fuzz.py). For now the metadata's
-# state machine -- the `meta` target (N6); the cs's device format, whole
-# clusters over a simulated channel and the wire come with N7 and N8. Built
+# held to a model of its own (scripts/nbs-fuzz.py): the metadata's state
+# machine -- the `meta` target (N6) -- and the cs's engine over disks that
+# power cuts lose and tear -- `cs` (N7); whole clusters over a simulated
+# channel come with N8. Built
 # outside src/crates, whose .cargo/config.toml would make it a kernel build;
 # its one crate from outside the tree, sha2, is the kernel's vendored copy.
 [package]
@@ -11,6 +12,7 @@ edition = "2021"
 
 [dependencies]
 nbsmeta = { path = "../../src/crates/common/storage/nbsmeta" }
+nbscs = { path = "../../src/crates/common/storage/nbscs" }
 raft = { path = "../../src/crates/common/cluster/raft" }
 
 # No CPU features, as net-fuzz has it and for its reason: the RustCrypto

@@ -2,18 +2,20 @@
 //!
 //!     nbs-fuzz gate
 //!
-//! everything the gate holds: the meta target over seeds 1 to 300, every
-//! allocation held to what the kernel's heap gives at once (fuzz/raft's
-//! `heap`). Exit 0 when everything held, 1 with what did not -- a finding
-//! with its seed, to run again with `meta --seed N --trace`.
+//! everything the gate holds: the meta target over seeds 1 to 300 and the cs
+//! target over 1 to 200, every allocation held to what the kernel's heap
+//! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
+//! what did not -- a finding with its seed, to run again with
+//! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
 
 #[path = "../../raft/src/heap.rs"]
 mod heap;
+mod cs;
 mod meta;
 /* Shared with fuzz/raft, of which this crate takes what it needs */
 #[allow(dead_code)]
@@ -29,6 +31,8 @@ use std::time::{Duration, Instant};
 
 const GATE_META_SEEDS: u64 = 300;
 const META_STEPS: u64 = 400;
+const GATE_CS_SEEDS: u64 = 200;
+const CS_STEPS: u64 = 300;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
 /// that the kernel's heap would not give.
@@ -52,9 +56,10 @@ fn arg(args: &[String], name: &str) -> Option<u64> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok())
 }
 
-/// Seeds `first..first + seeds` of the meta target, or on until `seconds`
-/// are up: how many failed, each said.
-fn meta(first: u64, seeds: u64, steps: u64, seconds: Option<u64>, trace: bool) -> u32 {
+/// Seeds `first..first + seeds` of target `name`, run by `run`, or on until
+/// `seconds` are up: how many failed, each said.
+fn target(name: &str, run: fn(u64, u64, bool) -> Result<(), String>, first: u64, seeds: u64, steps: u64,
+          seconds: Option<u64>, trace: bool) -> u32 {
     let start = Instant::now();
     let mut failed = 0;
     let mut seed = first;
@@ -65,8 +70,8 @@ fn meta(first: u64, seeds: u64, steps: u64, seconds: Option<u64>, trace: bool) -
             None if ran >= seeds => break,
             _ => {}
         }
-        if let Err(e) = guarded(|| meta::run(seed, steps, trace)) {
-            println!("FAIL: meta seed {} -- {}", seed, e);
+        if let Err(e) = guarded(|| run(seed, steps, trace)) {
+            println!("FAIL: {} seed {} -- {}", name, seed, e);
             failed += 1;
             if failed >= 5 {
                 break;
@@ -75,8 +80,8 @@ fn meta(first: u64, seeds: u64, steps: u64, seconds: Option<u64>, trace: bool) -
         seed += 1;
         ran += 1;
     }
-    println!("{}: meta seeds {}..{} ({} x {} steps, {} failed, {:.1} s)", if failed == 0 { "PASS" } else { "FAIL" },
-             first, seed, ran, steps, failed, start.elapsed().as_secs_f64());
+    println!("{}: {} seeds {}..{} ({} x {} steps, {} failed, {:.1} s)", if failed == 0 { "PASS" } else { "FAIL" },
+             name, first, seed, ran, steps, failed, start.elapsed().as_secs_f64());
     failed
 }
 
@@ -86,12 +91,19 @@ fn main() -> ExitCode {
     panic::set_hook(Box::new(|_| {}));
     let args: Vec<String> = std::env::args().skip(1).collect();
     let trace = args.iter().any(|a| a == "--trace");
+    let one = |name: &str, run: fn(u64, u64, bool) -> Result<(), String>, steps: u64| {
+        target(name, run, arg(&args, "--seed").unwrap_or(1), arg(&args, "--seeds").unwrap_or(1),
+               arg(&args, "--steps").unwrap_or(steps), arg(&args, "--seconds"), trace)
+    };
     let failed = match args.first().map(String::as_str) {
-        Some("gate") | None => meta(1, GATE_META_SEEDS, META_STEPS, None, false),
-        Some("meta") => meta(arg(&args, "--seed").unwrap_or(1), arg(&args, "--seeds").unwrap_or(1),
-                             arg(&args, "--steps").unwrap_or(META_STEPS), arg(&args, "--seconds"), trace),
+        Some("gate") | None => {
+            target("meta", meta::run, 1, GATE_META_SEEDS, META_STEPS, None, false)
+                + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
+        }
+        Some("meta") => one("meta", meta::run, META_STEPS),
+        Some("cs") => one("cs", cs::run, CS_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs", other);
             return ExitCode::from(2);
         }
     };

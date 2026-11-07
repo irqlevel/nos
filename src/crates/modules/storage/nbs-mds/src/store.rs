@@ -83,7 +83,7 @@ pub fn device_add(state: &ModState, word: &str) -> Result<(String, u32, u32), Fa
     };
     let ident = String::from(ident.as_str());
     let bytes = disk.sectors().saturating_mul(disk.sector_size());
-    let slots = nbsmeta::device_slots(bytes);
+    let slots = nbscs::device_slots(bytes);
     if slots == 0 {
         return Err(Failure::Other(alloc::format!("{} is too small for a chunk server: {} MiB", ident, bytes >> 20)));
     }

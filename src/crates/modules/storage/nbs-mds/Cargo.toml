@@ -20,6 +20,8 @@ kcore = { path = "../../../base/kcore" }
 raft = { path = "../../../common/cluster/raft" }
 raftmember = { path = "../../cluster/raftmember" }
 nbsmeta = { path = "../../../common/storage/nbsmeta" }
+# A device's slots, as the cs's format lays it out.
+nbscs = { path = "../../../common/storage/nbscs" }
 codec = { path = "../../../common/codec" }
 # The provider's parameters, read as the bus reads JSON.
 mgmtwire = { path = "../../../common/ipc/mgmtwire" }

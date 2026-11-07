@@ -501,8 +501,43 @@ fn differs(s: &State, m: &Model) -> Option<String> {
 /// cs's reserved its sets' chunks, each set's chunks those in it, each chunk
 /// in use counted by the maps that name it, and the free list every free
 /// chunk once, through free ones only.
+/// The chunks' numbers through a run: each number's newest incarnation, and
+/// whether that chunk is in use. A number's first chunk is incarnation 1; it
+/// keeps its incarnation while in use and while free, and the next chunk
+/// taking the number has one more -- so a cs never takes one for another.
+fn incarnations(s: &State, lives: &mut Vec<(u32, bool)>) -> Option<String> {
+    let chunks = s.chunks();
+    if chunks.len() < lives.len() {
+        return Some(format!("the chunk table went from {} to {}", lives.len(), chunks.len()));
+    }
+    for (id, ch) in chunks.iter().enumerate() {
+        let live = !ch.is_free();
+        match lives.get_mut(id) {
+            None => {
+                if ch.incarnation != 1 {
+                    return Some(format!("chunk {}, a number new, at incarnation {}", id, ch.incarnation));
+                }
+                lives.push((ch.incarnation, live));
+            }
+            Some((inc, was_live)) => {
+                let want = if !*was_live && live { inc.wrapping_add(1).max(1) } else { *inc };
+                if ch.incarnation != want {
+                    return Some(format!("chunk {} at incarnation {}, {} expected (it was {} and {})", id,
+                                        ch.incarnation, want, inc, if *was_live { "in use" } else { "free" }));
+                }
+                *inc = ch.incarnation;
+                *was_live = live;
+            }
+        }
+    }
+    None
+}
+
 fn fsck(s: &State) -> Option<String> {
     let chunks = s.chunks();
+    if let Some(i) = chunks.iter().position(|c| c.incarnation == 0) {
+        return Some(format!("chunk {} of incarnation 0", i));
+    }
     let mut named = vec![0u64; chunks.len()];
     for v in s.volumes().iter() {
         for &c in v.map.iter() {
@@ -666,6 +701,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut replica = State::new();
     let mut restored: Option<State> = None;
     let mut answers: BTreeMap<String, u64> = BTreeMap::new();
+    let mut lives: Vec<(u32, bool)> = Vec::new();
     let false_digest_at = if r.chance(50) { Some(r.range(steps / 2, steps)) } else { None };
     let mut diverged_expected: Option<u64> = None;
     for step in 1..=steps {
@@ -716,7 +752,7 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
         *answers.entry(kind).or_default() += 1;
         let differ = {
             let _model = Exempt::new();
-            differs(&s, &m).or_else(|| fsck(&s))
+            differs(&s, &m).or_else(|| fsck(&s)).or_else(|| incarnations(&s, &mut lives))
         };
         if let Some(d) = differ {
             return Err(format!("step {} after {:?}: {}", step, decoded, d));
@@ -764,7 +800,14 @@ pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
                     break;
                 }
                 let at = r.below(spoiled.len() as u64) as usize;
-                spoiled[at] = r.below(256) as u8;
+                if r.chance(30) {
+                    /* A short run of zeros: how a count, an incarnation or
+                       a number becomes 0, which random bytes seldom make */
+                    let end = (at + 1 + r.below(4) as usize).min(spoiled.len());
+                    spoiled[at..end].fill(0);
+                } else {
+                    spoiled[at] = r.below(256) as u8;
+                }
             }
             if r.chance(20) {
                 spoiled.truncate(r.below(spoiled.len() as u64 + 1) as usize);
