@@ -654,10 +654,36 @@ void run_window(fuzz::Input& in)
     };
     std::sort(fed_at.begin(), fed_at.end());
 
+    /* The switches to each task fed from `start` on, in the order they came.
+       What the pairing has answer a wakeup is the first of them after it:
+       in a window whole from `start` with nothing filtered, the switch that
+       did answer it, which is held below; through a filter that dropped
+       that switch and kept a later one to the task -- once it had been
+       displaced and run again -- the later one, which is all the window
+       says. */
+    std::vector<std::vector<std::pair<u64, u16>>> switches_in(tp::WakePairing::PID_SLOTS);
+    for (const TraceRing::Record* x : fed)
+    {
+        if (x->cycles < start || x->id != (u16)tp::Id::SchedSwitch || x->size != sizeof(tp::SchedSwitch))
+            continue;
+        tp::SchedSwitch sw;
+        memcpy(&sw, x->payload, sizeof(sw));
+        if (sw.next_pid < tp::WakePairing::PID_SLOTS)
+            switches_in[sw.next_pid].push_back({x->cycles, (u16)x->cpu});
+    }
+    const bool unfiltered = (mask & tp::event_bit((ulong)tp::Id::SchedSwitch)) != 0 && select.filter_count == 0;
+
     /* Per task, its wakeups fed from `start` on, in order: each answered by
-       its first switch if that was fed; one whose switch was not, followed
-       by another of the task's, superseded by it; the last, pending */
-    std::vector<const Truth*> expect;
+       the first switch to it fed after it, if that comes before its next
+       wakeup fed; one with none, followed by another of the task's,
+       superseded by it; the last, pending */
+    struct Expect
+    {
+        const Truth* truth;
+        u64 switch_cycles;
+        u16 ran_cpu;
+    };
+    std::vector<Expect> expect;
     ulong fed_wakeups = 0, fed_strange = 0, pending = 0, superseded = 0;
     std::vector<std::vector<const Truth*>> by_pid(tp::WakePairing::PID_SLOTS);
     for (const Truth& t : sim.truth)
@@ -677,8 +703,20 @@ void run_window(fuzz::Input& in)
         for (size_t i = 0; i < list.size(); i++)
         {
             const Truth& t = *list[i];
-            if (t.switch_cycles != 0 && was_fed(t.switch_cycles, t.ran_cpu))
-                expect.push_back(&t);
+            const u64 next_wake = (i + 1 < list.size()) ? list[i + 1]->wake_cycles : ~(u64)0;
+            const auto& in_t = switches_in[t.pid];
+            auto sw = std::upper_bound(in_t.begin(), in_t.end(), std::make_pair(t.wake_cycles, (u16)0xFFFF));
+            if (sw != in_t.end() && sw->first < next_wake)
+            {
+                if (unfiltered)
+                    INVARIANT(sw->first == t.switch_cycles && sw->second == t.ran_cpu,
+                              "pid %u woken at %lu: the switch after it at %lu on cpu %u, where the one that answered "
+                              "it was at %lu on cpu %u, in a whole window", t.pid, (ulong)t.wake_cycles,
+                              (ulong)sw->first, sw->second, (ulong)t.switch_cycles, t.ran_cpu);
+                else if (sw->first != t.switch_cycles)
+                    fuzz::reached("a wakeup paired through a filter with a later switch");
+                expect.push_back({&t, sw->first, sw->second});
+            }
             else if (i + 1 < list.size())
                 superseded++;
             else
@@ -686,7 +724,7 @@ void run_window(fuzz::Input& in)
         }
     }
     std::sort(expect.begin(), expect.end(),
-              [](const Truth* a, const Truth* b) { return a->switch_cycles < b->switch_cycles; });
+              [](const Expect& a, const Expect& b) { return a.switch_cycles < b.switch_cycles; });
 
     ulong before = 0;
     for (const TraceRing::Record* x : fed)
@@ -700,7 +738,7 @@ void run_window(fuzz::Input& in)
               superseded);
     /* With switches in the window, one whole from `start` lost none: a task
        is woken again only after a switch to it */
-    if ((mask & tp::event_bit((ulong)tp::Id::SchedSwitch)) != 0 && select.filter_count == 0)
+    if (unfiltered)
         INVARIANT(superseded == 0, "a task woken twice with no switch between, in a window whole from %lu",
                   (ulong)start);
 
@@ -712,16 +750,16 @@ void run_window(fuzz::Input& in)
     INVARIANT(pairing.pending() == pending, "%lu wakeups pending, the truth %lu", pairing.pending(), pending);
     for (ulong i = 0; i < paired; i++)
     {
-        const Truth& t = *expect[i];
+        const Truth& t = *expect[i].truth;
         const tp::WakeWait& w = waits[i];
-        u64 ns = t.switch_cycles - t.wake_cycles + t.late;
+        u64 ns = expect[i].switch_cycles - t.wake_cycles + t.late;
         u32 want_ns = (u32)std::min<u64>(ns, 0xFFFFFFFFULL);
         char comm[tp::COMM_BYTES + 1] = {};
         comm_of(t.pid, comm);
-        INVARIANT(w.pid == t.pid && w.ns == want_ns && w.woken_cpu == t.woken_cpu && w.ran_cpu == t.ran_cpu &&
+        INVARIANT(w.pid == t.pid && w.ns == want_ns && w.woken_cpu == t.woken_cpu && w.ran_cpu == expect[i].ran_cpu &&
                       strcmp(w.comm, comm) == 0,
                   "wait %lu is pid %u %u ns from cpu %u to %u (%s), the truth pid %u %u ns from %u to %u", i, w.pid,
-                  w.ns, w.woken_cpu, w.ran_cpu, w.comm, t.pid, want_ns, t.woken_cpu, t.ran_cpu);
+                  w.ns, w.woken_cpu, w.ran_cpu, w.comm, t.pid, want_ns, t.woken_cpu, expect[i].ran_cpu);
     }
     if (paired != 0)
         fuzz::reached(start != 0 ? "waits paired from a cut window" : "waits paired");
