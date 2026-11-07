@@ -199,7 +199,12 @@ and the next switch to its task -- after it was displaced and put back --
 would be taken for it. So the walk starts there, and what is older is
 counted and left out (`the oldest 120 left out: cpu 2 holds nothing before
 ...`). A task woken again before any switch to it says the window lost one,
-and is said too.
+and is said too. A field filter is another way for a window to lose a
+switch, and one the walk cannot see: a filter that drops the switch that
+answered a wakeup and keeps a later one to the task -- after it was displaced
+and put back -- has the wakeup paired with that later switch, its wait longer
+than it was. Through a filter, the waits are the window's, not necessarily
+the schedule's.
 
 ```
 > trace on sched
