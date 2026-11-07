@@ -4,11 +4,14 @@
 //! commands, asked of the member; every read is this host's member's view,
 //! at the entry it has applied.
 //!
-//! A device is recorded here, not yet written: the cs (N7) claims and
-//! formats the devices its host has in the metadata. `nbs devices add` finds
-//! the device on this host -- by its id, or by its name -- takes its id and
-//! its size in slots, and refuses one that something else holds: a mounted
-//! filesystem, the disk log, a guest of hv's.
+//! A device is recorded here, and taken in by its host's cs (nbs-cs.ko),
+//! which formats it where it is blank. `nbs devices add` finds the device on
+//! this host -- by its id, or by its name -- takes its id and its size in
+//! slots, and refuses one that something else holds -- a mounted filesystem,
+//! the disk log, a guest of hv's -- or that has something on it that is not
+//! this NBS cluster's: a filesystem, a partition table, another cluster's
+//! cs. `wipe` takes such a device all the same, its first pages zeroed once
+//! the metadata has it, and what was on it gone.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -16,6 +19,9 @@ use core::fmt::Write;
 
 use kcore::block::{Disk, Found};
 use kcore::cmd::Output;
+use kcore::consts::PAGE_SIZE;
+use kcore::dma::DmaBuffer;
+use nbscs::Holds;
 use nbsmeta::{Answer, Command, DeviceState, Refusal, State, Volume, CHUNK_MIB};
 
 use crate::member::View;
@@ -70,11 +76,52 @@ fn find(word: &str) -> Result<Disk, String> {
     Disk::open(word).ok_or_else(|| alloc::format!("no device of this host's is called {} -- `disks` lists them", word))
 }
 
-/// Device `word` of this host's added to its cs: its id, its slots and its
-/// number in the metadata.
-pub fn device_add(state: &ModState, word: &str) -> Result<(String, u32, u32), Failure> {
+/// A cs's page -- its superblock's two are what is read of a device before
+/// it is taken, and zeroed by `wipe` -- moved a kernel page at a time.
+const PAGE: usize = nbscs::PAGE as usize;
+const _: () = assert!(PAGE == PAGE_SIZE, "a cs's page is the kernel's");
+
+/// The sectors of `disk` a page is: the device read and written a page at a
+/// time, through a page of the kernel's that the driver DMAs into (Disk's
+/// own rule).
+fn page_sectors(disk: &Disk) -> Result<u64, String> {
+    match disk.sector_size() {
+        ss if ss != 0 && PAGE as u64 % ss == 0 => Ok(PAGE as u64 / ss),
+        ss => Err(alloc::format!("{} has sectors of {} bytes", disk.name(), ss)),
+    }
+}
+
+/// What device `disk` holds where a cs's superblock goes.
+fn contents(disk: &Disk, page: &mut DmaBuffer) -> Result<Holds, String> {
+    let per = page_sectors(disk)?;
+    let mut first: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    for (k, copy) in first.iter_mut().enumerate() {
+        copy.try_reserve_exact(PAGE).map_err(|_| String::from("no memory to read it"))?;
+        disk.read(k as u64 * per, &mut page.as_mut_slice()[..PAGE])
+            .map_err(|e| alloc::format!("{}: its page {} not read -- {}", disk.name(), k, e))?;
+        copy.extend_from_slice(&page.as_slice()[..PAGE]);
+    }
+    Ok(nbscs::holds(&first[0], &first[1]))
+}
+
+/// The superblock's two pages zeroed, past the device's write cache.
+fn wipe_first(disk: &Disk, page: &mut DmaBuffer) -> Result<(), String> {
+    let per = page_sectors(disk)?;
+    page.as_mut_slice()[..PAGE].fill(0);
+    for k in 0..2u64 {
+        disk.write(k * per, &page.as_slice()[..PAGE], true)
+            .map_err(|e| alloc::format!("{}: its page {} not zeroed -- {}", disk.name(), k, e))?;
+    }
+    disk.flush().map_err(|e| alloc::format!("{} not flushed -- {}", disk.name(), e))
+}
+
+/// Device `word` of this host's added to its cs -- with `wipe`, whatever is
+/// on it: its id, its slots and its number in the metadata, and whether it
+/// was wiped.
+pub fn device_add(state: &ModState, word: &str, wipe: bool) -> Result<(String, u32, u32, bool), Failure> {
     let v = caught_up(state)?;
     let host = this_host(&v)?;
+    let cluster = v.state.cluster().map(|c| c.id).ok_or_else(|| String::from("no NBS cluster yet"))?;
     let disk = find(word)?;
     let Some(ident) = disk.ident() else {
         return Err(Failure::Other(alloc::format!(
@@ -87,14 +134,40 @@ pub fn device_add(state: &ModState, word: &str) -> Result<(String, u32, u32), Fa
     if slots == 0 {
         return Err(Failure::Other(alloc::format!("{} is too small for a chunk server: {} MiB", ident, bytes >> 20)));
     }
-    /* Nothing else holds it now; the cs takes and keeps it from N7 on */
-    if let Err(holder) = disk.claim_as("nbs") {
-        return Err(Failure::Other(alloc::format!("{} is held by {}", ident, holder)));
+    /* This host's already, as it is: the same device -- its cs's, which
+       holds it -- answered as it is, nothing read or written */
+    if let Some((_, d)) = v.state.device(&ident).filter(|(c, d)| c.host == host && d.slots == slots) {
+        return Ok((ident, slots, d.id, false));
     }
-    match ask(state, &Command::DeviceAdd { host, ident: ident.clone(), slots })? {
-        Answer::Device { id } => Ok((ident, slots, id)),
-        other => Err(Failure::Other(alloc::format!("answered {:?}", other))),
+    /* Nothing else holds it while it is looked at, recorded and wiped; then
+       the cs takes it, and keeps it */
+    let claim = disk.claim_as("nbs").map_err(|holder| alloc::format!("{} is held by {}", ident, holder))?;
+    let mut page = DmaBuffer::new(1).ok_or_else(|| String::from("no memory for a page to read it through"))?;
+    let other = match contents(&disk, &mut page)? {
+        Holds::Nothing => None,
+        Holds::Nbs(s) if s.identity.cluster == cluster => None,
+        Holds::Nbs(s) => Some(alloc::format!("is NBS's, of another NBS cluster ({}...)", codec::hex(&s.identity.cluster[..4]))),
+        Holds::Other => Some(String::from("has something on it that is not NBS's -- a filesystem, a partition table?")),
+    };
+    if let (Some(what), false) = (&other, wipe) {
+        return Err(Failure::Other(alloc::format!("{} {} -- `nbs devices add {} wipe` takes it all the same, and what \
+                                                  is on it is lost", ident, what, word)));
     }
+    let id = match ask(state, &Command::DeviceAdd { host, ident: ident.clone(), slots })? {
+        Answer::Device { id } => id,
+        other => return Err(Failure::Other(alloc::format!("answered {:?}", other))),
+    };
+    /* Wiped once the metadata has it, and not before: a refusal leaves what
+       is on it as it was */
+    let wiped = other.is_some();
+    if wiped {
+        if let Err(why) = wipe_first(&disk, &mut page) {
+            return Err(Failure::Other(alloc::format!("{} is device {} in the metadata, and was not wiped: {} -- its \
+                                                      cs leaves it alone", ident, id, why)));
+        }
+    }
+    drop(claim);
+    Ok((ident, slots, id, wiped))
 }
 
 /// Device `ident` of this host's given no new chunks.

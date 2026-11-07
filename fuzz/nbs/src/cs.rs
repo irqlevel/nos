@@ -17,13 +17,16 @@
 //! - no record lost: one copy of a page is ever in flight.
 //!
 //! And between cuts: every read exactly the last write, every refusal the
-//! one the request deserves.
+//! one the request deserves. Before each run: a disk with anything at all
+//! past a superblock's bytes in its first two pages -- a boot sector, a
+//! filesystem, a partition table -- is never taken for blank, nor written;
+//! a cs's of another identity is told apart.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, SlotState, Store, PAGE, SLOT};
+use nbscs::{ChunkRef, Device, Epoch, Error, Identity, IoError, OpenError, SlotState, Store, PAGE, SLOT};
 
 use crate::rng::{mix, Rng};
 
@@ -683,6 +686,23 @@ impl Run {
                 let want = m.sectors.get(&k).map_or(0, |s| s.now());
                 let mut buf = vec![0u8; self.sector as usize];
                 let cref = self.cref(c);
+                /* Now and then by another volume's read-only attach: refused
+                   where the cs holds the chunk -- nothing of one volume's
+                   is read through another's -- zeros where it does not */
+                if self.r.chance(10) {
+                    let other = 1 + v % VOLUMES;
+                    let held = self.store.holding(c).is_some_and(|h| h.incarnation == cref.incarnation);
+                    match self.store.read(other, 0, cref, k * self.sector as u32, &mut buf, true) {
+                        Err(Error::NotTheVolumes) if held => {}
+                        Ok(()) if !held && buf.iter().all(|&x| x == 0) => {}
+                        got => {
+                            return Err(format!("step {}: chunk {} of volume {} read by volume {} (held {}): {:?}",
+                                               step, c, v, other, held, got));
+                        }
+                    }
+                    self.count("reads by another volume");
+                    return Ok(());
+                }
                 let g = self.fenced[v as usize];
                 match self.store.read(v, g, cref, k * self.sector as u32, &mut buf, true) {
                     Err(Error::Io) if self.dead() => {}
@@ -811,9 +831,57 @@ impl Run {
     }
 }
 
+/// What a disk that is not a cs's of this identity opens as: blank where it
+/// is zeros, refused and left as it is where it has anything else in its
+/// first two pages, told apart where it is another cs's.
+fn strangers(r: &mut Rng, sector: u64) -> Result<(), String> {
+    let id = Identity { cluster: [7; 16], cs: 3, device: 99 };
+    let d = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    match Store::new().open_device(Handle(d.clone()), id) {
+        Err((_, OpenError::Blank)) => {}
+        other => return Err(format!("a blank disk opened as {:?}", other.map(|(_, rep)| rep).map_err(|(_, e)| e))),
+    }
+    /* One byte past a superblock's: a boot sector's signature, a GPT
+       header, ext's superblock at 1 KiB, or anywhere in the two pages */
+    let at = match r.below(4) {
+        0 => 510,
+        1 => 512,
+        2 => 1024 + 56,
+        _ => 128 + r.below(2 * PAGE - 128),
+    };
+    {
+        let mut disk = d.borrow_mut();
+        let mut v = vec![0u8; sector as usize];
+        v[(at % sector) as usize] = 1 + r.below(255) as u8;
+        disk.durable.insert(at / sector, v);
+    }
+    let before = d.borrow().durable.clone();
+    match Store::new().open_device(Handle(d.clone()), id) {
+        Err((_, OpenError::Corrupt(_))) => {}
+        other => {
+            return Err(format!("a disk with a byte at {} of its first pages opened as {:?}", at,
+                               other.map(|(_, rep)| rep).map_err(|(_, e)| e)));
+        }
+    }
+    if d.borrow().durable != before || !d.borrow().pending.is_empty() {
+        return Err(format!("a disk with a byte at {} of its first pages was written by its open", at));
+    }
+    /* Another cs's: formatted as its, opened as this one's */
+    let other = Rc::new(RefCell::new(Disk::new(sector, 12 * SLOT)));
+    let theirs = Identity { cluster: [7; 16], cs: 4, device: 99 };
+    if let Err((_, e)) = Store::new().format_device(Handle(other.clone()), theirs, 5) {
+        return Err(format!("a disk not formatted: {:?}", e));
+    }
+    match Store::new().open_device(Handle(other.clone()), id) {
+        Err((_, OpenError::Foreign(i))) if i == theirs => Ok(()),
+        got => Err(format!("another cs's disk opened as {:?}", got.map(|(_, rep)| rep).map_err(|(_, e)| e))),
+    }
+}
+
 pub fn run(seed: u64, steps: u64, trace: bool) -> Result<(), String> {
     let mut r = Rng::new(mix(seed, 0x6373));
     let sector = if r.chance(30) { PAGE } else { 512 };
+    strangers(&mut r, sector)?;
     let disks = 1 + r.below(3) as usize;
     let mut identities = Vec::new();
     let mut handles = Vec::new();

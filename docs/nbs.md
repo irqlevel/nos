@@ -1,16 +1,21 @@
-# NBS's metadata service
+# NBS: its metadata service and its chunk servers
 
-`nbs-mds.ko` (`src/crates/modules/storage/nbs-mds`) is the first piece of NBS,
-the replicated block storage for VM disks, images and snapshots planned in
-[plans/nbs.md](../plans/nbs.md): its metadata service, the state every host of
-an NBS cluster holds alike through Raft. As built (steps N5 and N6), that
-state is:
-- the NBS cluster's identity and its members;
-- each host's chunk server and its devices;
-- the volumes, and on which three hosts each of their chunks is.
+NBS is the replicated block storage for VM disks, images and snapshots
+planned in [plans/nbs.md](../plans/nbs.md). As built (steps N5 to N7), it is
+two modules on every host:
 
-It is recorded and not yet written: the chunk servers that store the chunks
-come with N7, the client with N8.
+- `nbs-mds.ko` (`src/crates/modules/storage/nbs-mds`), its metadata
+  service: the state every host of an NBS cluster holds alike through Raft --
+  - the NBS cluster's identity and its members;
+  - each host's chunk server and its devices;
+  - the volumes, and on which three hosts each of their chunks is;
+- `nbs-cs.ko` (`src/crates/modules/storage/nbs-cs`), its chunk server (cs):
+  the host's devices, formatted as NBS's own, and the chunks on them --
+  written, read, fenced and freed as the metadata says ("The chunk server",
+  below).
+
+The client that gives a VM its disk from them comes with N8; until then
+`nbs io` writes and reads a volume from the shell.
 
 The state is `nbsmeta::State` (`src/crates/common/storage/nbsmeta`, no kernel
 in it), the state machine of the raft crate's `rsm` ([raft.md](raft.md)). The
@@ -27,6 +32,7 @@ on each host:
 
 ```
 $ insmod /lib/modules/nbs-mds.ko           # dir=/nbs/mds unless dir= names another
+$ insmod /lib/modules/nbs-cs.ko            # after it: the cs asks this host's mds what it is to take in
 ```
 
 `compact=<bytes>` is how much log the member keeps past its snapshot before
@@ -59,7 +65,7 @@ nbs host replace <host>    <host>, which lost its state, back as a new member
 What is stored, on any member:
 
 ```
-nbs devices add <id|name>  a device of this host's for its chunk server, by its id or its name
+nbs devices add <id|name> [wipe]   a device of this host's for its chunk server, by its id or its name
 nbs devices drain <id>     the device takes no new chunks
 nbs cs                     every host's chunk server: its devices, its room, what of it is reserved
 nbs volume create <name> <size> [host=<host>]   size in MiB, or with M, G or T after it; its own host this one
@@ -73,7 +79,7 @@ For example:
 
 ```
 a$ nbs devices add part:4f7661ab-0525-4f56-9d6b-9283d322e47c
-nbs: device part:4f7661ab-... of this host's chunk server, 292 MiB -- device 3 in the metadata; nothing is written to it before the cs (N7) takes it
+nbs: device part:4f7661ab-... of this host's chunk server, 292 MiB -- device 3 in the metadata; its cs takes it in
 a$ nbs volume create disk1 64
 nbs: volume disk1 (1), 64 MiB
 a$ nbs volume disk1
@@ -83,8 +89,18 @@ nbs: volume disk1 (1), 64 MiB, 16 chunks of 4 MiB, its own host a, detached
 
 `nbs devices add` finds the device on this host by its id or by its name. It
 records the device's id, never its name: names change between boots, ids do
-not. A device with no id is refused, as is one that something holds at the
-time: a mounted filesystem, the disk log, a guest of hv's.
+not. Refused:
+- a device with no id;
+- one that something holds at the time: a mounted filesystem, the disk log, a
+  guest of hv's;
+- one with something on it that is not this NBS cluster's -- anything at all
+  in its first two pages but zeros or a cs's superblock of this cluster: a
+  filesystem, a partition table, a boot sector, another cluster's cs. `wipe`
+  takes it all the same: its first 8 KiB are zeroed once the metadata has
+  it, and its cs formats it.
+
+A device added again as it is -- the one its cs holds -- is answered with its
+number, nothing read or written.
 
 The same is on the management bus as the `nbs` provider (`provider.rs`,
 `nbs.descriptor.json`), which the panel shows:
@@ -275,6 +291,156 @@ commits `Init`, and only then writes `member`. Should any of it fail, the
 member is stopped, its log and `member` removed, and the listener started
 again.
 
+## The chunk server
+
+`nbs-cs.ko` is a host's cs: one task, `nbs/cs`, that holds the host's devices
+and serves `nbs.cs`, a `Cluster` name, to NBS's clients on any host of the
+registry. What it does to its devices is `nbscs`
+(`src/crates/common/storage/nbscs`, no kernel in it), which `fuzz/nbs` runs
+over disks that lose power. What a client says to a cs, and a cs to its mds,
+is `nbswire` (`src/crates/common/storage/nbswire`).
+
+```
+nbscs              the cs: what it is doing, its devices, the requests it served
+nbscs chunks       the chunks it holds: each one's state, volume and generation
+nbscs fences       the volumes it fences, each at its generation
+```
+
+For example:
+
+```
+a$ nbscs
+nbscs: cs 0 -- serving: 2 chunks held, 2 open, 1 volumes fenced, 9 requests served, 0 refused
+  device 3    part:4f7661ab-0525-4f56-9d6b-9283d322e47c 292 MiB, 284 MiB free, 0 slots lost, active
+```
+
+What `nbscs` shows is what the cs's task last made of itself: at the end of
+a turn that fenced, closed, freed or took a device in, and once a second
+otherwise -- the shell never waits on the cs's devices.
+
+### Its devices
+
+Every 5 s the cs asks this host's mds which cs it is and which devices it
+has. The mds answers from its applied state; no other host's is asked. The
+cs takes each device in:
+- held with a queue of its own (`DiskQueue`) and claimed as `nbs-cs`, so
+  that nothing else writes it while the cs has it;
+- opened where it is this cs's: its records and fences read back, and a torn
+  copy of either written again from the other;
+- formatted where it is blank;
+- left as it is where it is anything else -- NBS's of another cluster, cs or
+  device number (a disk moved here), not NBS's at all, or another size than
+  the metadata's. Said in the log once and in `nbscs`, and tried again every
+  5 s.
+
+It serves only once every device the metadata gives it is taken in. With one
+missing, a chunk on that device would read as nothing, and its first write
+would put it in a second slot, which the device coming back would contend
+with. Until then every request is refused `NotReady`, and the client asks
+again.
+
+### A cs's device
+
+No filesystem: a format of NBS's own (`nbscs`'s `format.rs`).
+
+```
+slot 0     page 0, 1    the superblock, twice: the cluster, cs and device it is, its size, its format's id
+           page 2..34   the volumes' fences, copy A
+           page 34..66  the volumes' fences, copy B
+slot 1..   the table of slots, copy A, then copy B: a record a slot
+then       the slots, 4 MiB each: the chunks' data
+```
+
+- Every record, a fence's or a slot's, has a sequence number and a CRC32C
+  seeded with the format's id -- 64 random bits made at the format -- so that
+  a record of an earlier format, or of another device, never passes.
+- A record is changed in copy A, which is flushed, then in copy B, flushed
+  too. One copy is ever being written, so a power cut leaves the other good.
+  Of two good copies the newer is the record; zeros in both, it was never
+  written.
+- A record neither of whose copies is good is lost: its slot is never used
+  again, and that is said.
+- A device is blank where its first two pages are zeros. Anything past a
+  superblock's 128 bytes in them is not a cs's, since a format never writes
+  there: a filesystem whose first bytes are zeros is never taken for blank.
+
+### What a request leans on
+
+- **A fence is durable before it is answered**, on every device of the cs. A
+  volume's fence is the newest attach generation the cs has been told. A
+  request of an older one is refused (`fenced`), after a crash too.
+- **An open mark is durable before the first write of a generation** to a
+  chunk. After a crash, every chunk whose replicas may differ says it is
+  open, at the generation that wrote it last: what N8's reconcile goes by.
+- **A chunk is held by its number and its incarnation.** The metadata gives a
+  freed chunk's number to the next chunk made, at the next incarnation. A
+  slot of the chunk a number was is never read or written for the one it is
+  now, and is freed at the new one's first write; a request of the older
+  incarnation is refused.
+- **A slot is zeros before a chunk takes it**, the zeros flushed before the
+  record that gives it the slot: what was freed is never read through another
+  chunk.
+- **A close is durable only after the chunk's data is**: it flushes first.
+- **Nothing of one volume's is read or written through another's.**
+
+### Checked with the host's mds
+
+A request names the volume, the attach's generation and the chunk: its
+number, its incarnation, its epoch -- its replica set and the set's version
+-- its place in the volume's map, and the entry of the metadata the client
+read the map at. What its engine has checked already, the cs does. A chunk
+it does not hold yet, or at an epoch other than the one it knows, it asks its
+own host's mds about first -- the mds off the data path, and a cs that trusts
+no other host's (decision 3 of plans/nbs.md). The mds answers from its applied
+state once it has applied as far as the request's entry, `Behind` until then,
+which the client asks again. It vouches that:
+- the chunk is in that place of that volume's map, at that incarnation;
+- this host's cs is in the chunk's set, at the set's version;
+- a write is the volume's writer's, at its attach's generation; a read of
+  generation 0 is a read-only one's.
+
+What the mds vouched for is kept, up to 65536 of them.
+
+### What is freed
+
+Every 30 s the cs asks its mds which of the chunks it holds are gone -- freed,
+or their number another chunk's now -- and gives their slots back, and which
+of the volumes it fences are gone, and takes their fences off.
+
+### `nbs io`
+
+nbs-mds's `nbs io` (`io.rs`) is a client of the cs's, for the shell and the
+tests until N8's:
+
+```
+nbs io attach <volume> [force]                  attached for writing here, a new generation; force takes it from another host
+nbs io write <volume> <offset> <bytes> <byte>   <bytes> of <byte> at <offset>, to every replica
+nbs io read <volume> <offset> <bytes>           from one replica: this host's where it has one
+nbs io flush <volume>                           what was written durable on every replica
+nbs io close <volume>                           every chunk written here closed on every replica
+nbs io held <volume>                            the volume's chunks each cs holds open
+nbs io detach <volume>
+```
+
+The first write attaches the volume for writing on this host, unless
+`attach` did, and fences each cs at the generation before its first write
+there. A read on a host that has not attached the volume is a read-only one,
+of generation 0. Offsets and sizes are whole 4 KiB. For example:
+
+```
+a$ nbs io write disk1 0 65536 0x5a
+nbs: 65536 bytes of 0x5a written at 0 of disk1, generation 1: 1 chunks, each to its 3 replicas
+b$ nbs io read disk1 0 65536
+nbs: 65536 bytes at 0 of disk1, from b: 0x5ax65536
+```
+
+A client's requests and their answers go between hosts by ipcnet's bulk
+connection, all of them, so that they keep their order and their data do not
+hold up raft's messages. A request carries 256 KiB at most. It is asked again
+for up to 30 s while the answer is that it cannot be done yet; one to a host
+with no cs -- nbs-cs not loaded there -- comes back from the channel as a
+bounce, and is said at once.
+
 ## Tested
 
 - **`scripts/nbs-fuzz.py`** (host, in CI; [testing.md](testing.md)): `fuzz/nbs`'s
@@ -286,7 +452,19 @@ again.
     from;
   - two members' digests compared, and a divergence said.
 
-  `--mutants` takes fifteen rules out one at a time, each caught.
+  Its `cs` target is the chunk server's engine over disks with a write
+  cache, through histories of fences, writes, reads, flushes, closes and
+  frees, and power cuts: each write not yet flushed kept, lost or torn at a
+  sector's edge, and now and then a record's sector torn inside or a bit
+  rotted. After every cut the cs is opened again and held to every fence and
+  open mark answered, every chunk closed reading what it held, every sector
+  one of the values it may have, no record lost; before each run, a disk with
+  something else on it never taken for blank, and another cs's told apart.
+  Its `wire` target holds nbswire's messages to their encoding, and reads
+  noise as none.
+
+  `--mutants` takes thirty-five rules out one at a time -- eighteen of the
+  metadata's, fifteen of the cs's, two of the wire's -- each caught.
 - **`fuzz/raft`'s `nbsmeta` target**: the members' part of the state, its
   commands from pools of names and incarnations that meet and from wide ones
   that fill the cluster. There are four scenarios and six mutants.
@@ -318,6 +496,20 @@ again.
     - every log compacted into a snapshot;
     - the killed host back from its snapshot and log, the replaced one sent
       the snapshot, and a removed host's cs taking no new chunks;
+  - the chunk servers (N7):
+    - every host's cs taking its devices in, formatting them;
+    - a device with a filesystem's magic on it refused, and taken with
+      `wipe`;
+    - a volume written to its three replicas and read back, across a
+      chunk's end, from the writer's host and read-only from the others;
+      flushed, its chunks open on every cs, then closed;
+    - a writer on another host refused, then forced: its fences refuse the
+      old writer's writes and reads;
+    - a host booted again, its cs back with its data, its fence and its open
+      marks;
+    - the volume deleted, and every cs giving its chunks and its fence back;
+    - a host's nbs-cs unloaded: a request to it said at once, the others
+      answering; loaded again, serving its devices;
   - nothing panicked.
 
 ## Limits
@@ -333,12 +525,20 @@ again.
   votes, which PreVote keeps from disturbing the others. `nbs` on it says it
   is removed once it applied the entry.
 - `nbs host remove` refuses only the last member. It is NBS's data, not its
-  metadata, that will need three hosts (N7).
-- What is stored is recorded, not written. N7's cs claims and formats the
-  devices: until then, `nbs devices add` refuses only a device that
-  something holds when it is asked.
-- No command attaches a volume yet. The attach and the detach are in the
-  state for the client (N8).
+  metadata, that needs three hosts.
+- Only `nbs io` attaches a volume, for the shell. Its reads at generation 0
+  are not readers in the metadata, and nothing reconciles the replicas of a
+  chunk left open: N8's client attaches, reconciles and flushes.
+- A cs serves one request at a time, each waited for on its device, and
+  copies the data into a message and out of one. Measuring, and pages that
+  move instead, are N11's.
+- A cs serves only with every device the metadata gives it. A device that
+  fails while it serves fails the requests of its chunks; one that is never
+  taken in stops the cs serving. Taking a device out, and rebuilding what was
+  on it, is N9's.
+- A chunk's data has no checksum of the cs's: a sector is taken to be
+  written whole, as NVMe's atomic write unit promises. A scrub comparing the
+  replicas is N9's.
 - A device drained stays draining, and neither a device nor a cs is ever
   removed. A placement never moves: moving chunks is N9's.
 - Bounds, each refused past:

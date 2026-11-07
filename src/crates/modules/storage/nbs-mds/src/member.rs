@@ -30,7 +30,8 @@ use codec::{Reader, Writer};
 use kcore::ipc::{Message, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
-use nbsmeta::{Answer, Command, State};
+use nbsmeta::{Answer, Command, DeviceState, State};
+use nbswire::{Answered, Device as CsDevice, Identity as CsIdentity, Query, Question, Refusal as CsRefusal, Told};
 use raft::{Role, Rsm};
 use raftmember::{App, Core, Locked, Pending};
 
@@ -188,6 +189,7 @@ impl App for Mds {
         match m.tag & !TAG_BULK {
             TAG_OFFER => self.on_offer(core, m),
             TAG_NO_MEMBER => self.on_no_member(core, m),
+            nbswire::TAG_QUERY => self.on_cs_query(core, m),
             _ => {}
         }
     }
@@ -221,6 +223,72 @@ impl App for Mds {
 }
 
 impl Mds {
+    /// A question of this host's cs, answered from the member's applied
+    /// state (plans/nbs.md, "The cs"): this host's alone -- another host's
+    /// cs asks its own host's mds.
+    fn on_cs_query(&mut self, core: &mut Core<Mds>, m: &Message) {
+        if m.from.host() != 0 {
+            return;
+        }
+        let Some(q) = Query::decode(&m.data) else { return };
+        let told = self.cs_answer(core, &q.question);
+        let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
+    }
+
+    fn cs_answer(&self, core: &Core<Mds>, q: &Question) -> Told {
+        let s = core.state();
+        let Some(cluster) = s.cluster() else { return Told::Refused(CsRefusal::NoMds) };
+        let mine = s.cs_of(&self.me.host);
+        match q {
+            Question::Identity => Told::Identity(mine.map(|cs| CsIdentity {
+                cluster: cluster.id,
+                cs: cs.id,
+                devices: cs.devices.iter().map(|d| CsDevice { ident: d.ident.clone(), device: d.id, slots: d.slots,
+                                                                draining: d.state != DeviceState::Active })
+                    .collect(),
+            })),
+            Question::Verify { volume, generation, chunk, position, index, writing } => {
+                let applied = core.rsm().applied();
+                if applied < *index {
+                    return Told::Refused(CsRefusal::Behind { applied });
+                }
+                let Some(v) = s.volumes().iter().find(|v| v.id == *volume) else {
+                    return Told::Refused(CsRefusal::NotTheMap);
+                };
+                if v.map.get(*position as usize) != Some(&chunk.chunk) {
+                    return Told::Refused(CsRefusal::NotTheMap);
+                }
+                let Some(ch) = s.chunks().get(chunk.chunk as usize).filter(|c| !c.is_free()) else {
+                    return Told::Refused(CsRefusal::NotTheMap);
+                };
+                if ch.incarnation != chunk.incarnation {
+                    return Told::Refused(CsRefusal::NotTheMap);
+                }
+                let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
+                    return Told::Refused(CsRefusal::NotHere);
+                };
+                if !set.cs.contains(&me.id) {
+                    return Told::Refused(CsRefusal::NotHere);
+                }
+                let known = nbscs::Epoch { set: ch.set, version: set.version };
+                if known != chunk.epoch {
+                    return Told::Refused(CsRefusal::Epoch { known });
+                }
+                /* A write, or a read of a writer's, at the volume's attach for
+                   writing; a read of generation 0 is a read-only one's */
+                if (*writing || *generation != 0) && v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
+                    return Told::Refused(CsRefusal::NotAttached);
+                }
+                Told::Verified
+            }
+            Question::Live { chunks } => Told::Gone(chunks.iter()
+                .filter(|(c, inc)| s.chunks().get(*c as usize).is_none_or(|ch| ch.is_free() || ch.incarnation != *inc))
+                .map(|&(c, _)| c).collect()),
+            Question::Volumes { volumes } => Told::Gone(volumes.iter()
+                .filter(|&&v| !s.volumes().iter().any(|x| x.id == v)).copied().collect()),
+        }
+    }
+
     /// An offer to this host, a member already: answered with its
     /// incarnation where it is the cluster's -- an add asked again -- and
     /// declined where it is another's.

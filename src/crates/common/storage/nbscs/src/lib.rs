@@ -24,7 +24,8 @@ mod format;
 mod store;
 
 pub use device::{Device, IoError};
-pub use format::{device_slots, layout, Decoded, Epoch, Identity, Layout, Record, SlotState, Super, FENCES_MAX};
+pub use format::{device_slots, holds, layout, Decoded, Epoch, Holds, Identity, Layout, Record, SlotState, Super,
+                 FENCES_MAX};
 pub use store::{ChunkRef, DeviceInfo, Error, Holding, OpenError, Repairs, Store};
 
 /// A chunk's slot: 4 MiB, as the metadata's chunks are.
