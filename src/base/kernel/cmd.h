@@ -63,8 +63,9 @@ public:
 
     /* A handle for unregister_dynamic, or 0: the name is empty, too long or
        not one printable word, it is taken -- by a built-in command or by
-       another module's -- or the table is full. The name and help are
-       copied. */
+       another module's -- the table is full, or the handler is the code of
+       a module being unloaded (ModuleTable::unloading_at), whose commands
+       are closed. The name and help are copied. */
     ulong register_dynamic(const char* name, ulong name_len, const char* help, ulong help_len,
         DynamicHandler handler, void* ctx);
 
@@ -73,6 +74,18 @@ public:
        a call runs, so task context only -- and never from that command's own
        handler, which would wait for itself. */
     void unregister_dynamic(ulong handle);
+
+    /* A module's commands, the ones whose handler is in [lo, hi) -- its
+       image -- as the loader takes them back before the module's state and
+       code go (ModuleTable::take_down). close_range: no call of one starts
+       from here on; never waits. drain_range: returns once no call of one is
+       running, saying while it waits -- after Task::JOIN_REPORT_NS, and
+       each time the wait has doubled -- which are and on which task; with
+       take, every one still registered then is taken off, and said by name
+       as the module's leaving it behind. Sleeps, so task context only, and
+       never on the task of a call it waits for. */
+    static void close_range(ulong lo, ulong hi);
+    static void drain_range(ulong lo, ulong hi, const char* module, bool take);
 
     /* The help lines of the commands added at run time */
     void dynamic_help(stdlib::Printer& out);
@@ -127,8 +140,28 @@ private:
         DynamicHandler handler;
         void* ctx;
         ulong running;      /* calls in progress */
+        ulong caller;       /* the pid of the task the latest of them began on */
         bool removing;      /* no call may start */
     };
+
+    /* A module's commands drain_range found still running: their count, and
+       the first few by name and the pid of the latest call's task */
+    struct Draining
+    {
+        static const ulong NAMED_MAX = 4;
+
+        ulong calls;
+        ulong commands;
+        ulong named;
+        char names[NAMED_MAX][DYNAMIC_NAME_MAX + 1];
+        ulong callers[NAMED_MAX];
+    };
+
+    /* Whether a handler is in [lo, hi) */
+    static bool in_range(DynamicHandler handler, ulong lo, ulong hi);
+    void close_dynamic(ulong lo, ulong hi);
+    void count_draining(ulong lo, ulong hi, Draining& d);
+    void take_dynamic(ulong lo, ulong hi, const char* module);
 
     DynamicCmd dynamic_[DYNAMIC_MAX];
     ulong dynamic_generation_;

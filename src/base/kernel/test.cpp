@@ -3069,6 +3069,94 @@ bool test_module_bus()
     return check_bus_unloaded(out).ok();
 }
 
+/* What test_module_unload's task runs: `modtest hold` through the
+   dispatcher, what it says kept for the test to read once the task is done */
+struct HoldCall
+{
+    static const ulong OUTPUT_SIZE = 512;
+
+    HoldCall()
+    {
+        output[0] = '\0';
+    }
+
+    char output[OUTPUT_SIZE];
+};
+
+static void hold_call_task(void* ctx)
+{
+    auto* hold = static_cast<HoldCall*>(ctx);
+    stdlib::BufferPrinter out(hold->output, sizeof(hold->output));
+    Cmd::dispatch("modtest hold", out);
+}
+
+bool test_module_unload()
+{
+    static const ulong OUTPUT_SIZE = 1024;
+    static const ulong HOLD_WAIT_POLLS = 5000;
+
+    auto& modules = ModuleTable::get_instance();
+    char output[OUTPUT_SIZE];
+    stdlib::BufferPrinter out(output, sizeof(output));
+
+    stdlib::Error err = modules.load(nos_modtest_ko, nos_modtest_ko_size, "", out);
+    if (!err.ok())
+    {
+        klog(0, "test_module_unload: load failed: %s", out.get());
+        return false;
+    }
+
+    /* The call, running on a task of its own, and seen running */
+    auto* hold = mm::talloc<HoldCall, TAG>();
+    Task* task = (hold != nullptr) ? mm::talloc<Task, TAG>("modhold") : nullptr;
+    const bool started = (task != nullptr && task->start(hold_call_task, hold));
+    bool holding = false;
+    for (ulong i = 0; started && !holding && i < HOLD_WAIT_POLLS; i++)
+    {
+        out.reset();
+        Cmd::dispatch("modtest holding", out);
+        holding = (stdlib::str_str(out.get(), "modtest holding: 1") != nullptr);
+        if (!holding)
+            sleep(consts::NANO_SECS_IN_MS);
+    }
+
+    /* Unloaded whatever came of that: the call returns only once the stop
+       has run, and the unload, only once the call has returned */
+    out.reset();
+    stdlib::Error unloaded = modules.unload("modtest", out);
+    bool ok = unloaded.ok() && !modules.is_loaded("modtest");
+    if (!ok)
+        klog(0, "test_module_unload: unload failed: %s", out.get());
+    if (!holding)
+    {
+        klog(0, "test_module_unload: the call never ran: started %u", started ? 1U : 0U);
+        ok = false;
+    }
+
+    if (started)
+    {
+        task->wait();
+        if (stdlib::str_str(hold->output,
+                "modtest hold: released by the stop, its command and provider closed before it") == nullptr)
+        {
+            klog(0, "test_module_unload: the call said: %s", hold->output);
+            ok = false;
+        }
+    }
+
+    if (task != nullptr)
+        task->put();
+    if (hold != nullptr)
+    {
+        hold->~HoldCall();
+        mm::free(hold);
+    }
+
+    if (ok)
+        klog(0, "test_module_unload: complete");
+    return ok;
+}
+
 /* What the shell answers `cmd` with, into out, waited for until it has
    `want` in it -- up to polls milliseconds: whether it came */
 static bool answers(const char* cmd, const char* want, stdlib::BufferPrinter& out, ulong polls)

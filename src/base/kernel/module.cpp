@@ -1,5 +1,6 @@
 #include "module.h"
 #include "module_exports.h"
+#include "cmd.h"
 #include "elf.h"
 #include "klog.h"
 #include "cpu.h"
@@ -32,6 +33,11 @@ long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
    the mailboxes it left open are closed -- each said, as the module's bug --
    and every monitor of them told */
 void rust_ipc_module_gone(const char* name, ulong len);
+/* And the management bus (src/crates/layers/mgmt): a module's providers --
+   those whose handler is in [lo, hi), its image -- closed and drained as its
+   shell commands are (Cmd::close_range, Cmd::drain_range) */
+void rust_mgmt_close_range(ulong lo, ulong hi);
+void rust_mgmt_drain_range(ulong lo, ulong hi, int take);
 }
 
 namespace kernel
@@ -72,6 +78,7 @@ struct LoadedModule
         , imports(0)
         , permanent_by(nullptr)
         , instance(nullptr)
+        , stop(nullptr)
         , exit(nullptr)
     {
         list_entry.init();
@@ -92,6 +99,7 @@ struct LoadedModule
     ulong imports;                /* kernel functions it binds to */
     const char* permanent_by;      /* what keeps it from being unloaded, if anything */
     void* instance;               /* what its init returned; its exit takes it back */
+    void (*stop)(void* instance);
     void (*exit)(void* instance);
 };
 
@@ -103,9 +111,10 @@ const ulong TAG = 'Kmod';
 /* kmod::ModuleInfo (src/crates/base/kmod/src/lib.rs): the header the module! macro
    puts in every module and exports as nos_module_info. Version 2: the init
    is handed the module's parameters, and insmod's output to say why it
-   refuses them. */
+   refuses them. Version 3: a stop, which the unload calls before it waits
+   out the calls of the module's commands and providers (take_down). */
 const u32 INFO_MAGIC = 0x4D534F4E; /* "NOSM" */
-const u32 INFO_VERSION = 2;
+const u32 INFO_VERSION = 3;
 const ulong INFO_ABI_LEN = 64;
 const ulong INFO_NAME_LEN = 32;
 const char INFO_SYMBOL[] = "nos_module_info";
@@ -119,10 +128,14 @@ struct ModuleInfo
     /* params: what insmod's line had after the path, params_len bytes of
        it, NUL-terminated; it and out are valid while the init runs */
     void* (*init)(const char* params, ulong params_len, stdlib::Printer* out);
+    /* As the unload begins, the module's commands and providers closed and
+       their calls not yet waited out: what one of those may be blocked on
+       that only the module's going would end, told to end */
+    void (*stop)(void* instance);
     void (*exit)(void* instance);
 };
 
-static_assert(sizeof(ModuleInfo) == 120, "kmod::ModuleInfo layout");
+static_assert(sizeof(ModuleInfo) == 128, "kmod::ModuleInfo layout");
 static_assert(INFO_NAME_LEN == ModuleTable::NAME_LEN_MAX + 1, "kmod::NAME_LEN");
 
 const char KERNEL_ABI[] = NOS_MODULE_ABI;
@@ -862,9 +875,10 @@ stdlib::Error check_info(const LoadCtx& ctx, const ModuleInfo& info, LoadedModul
     module.name[len] = '\0';
 
     if (!in_executable_segment(ctx, reinterpret_cast<ulong>(info.init)) ||
+        !in_executable_segment(ctx, reinterpret_cast<ulong>(info.stop)) ||
         !in_executable_segment(ctx, reinterpret_cast<ulong>(info.exit)))
     {
-        out.printf("module: %s: init or exit is not in the module's code\n", module.name);
+        out.printf("module: %s: init, stop or exit is not in the module's code\n", module.name);
         return make_error(stdlib::Error::DATA_CORRUPT);
     }
 
@@ -1100,6 +1114,53 @@ void ModuleTable::remove(LoadedModule* module)
     lock_.unlock_irq_restore(flags);
 }
 
+/* A shell command and a bus provider each run the module's code on the
+   caller's task -- the shell's, an SSH session's, a job's -- whenever a call
+   comes. So a module goes in this order, and in no other, wherever it goes
+   from -- rmmod, the halt, its own init failing:
+   1. its commands and providers closed (those whose handler is in its
+      image): no call of them starts from here on, and none of the kind can
+      be registered (unloading_at);
+   2. its stop: what a call of them still running may be blocked on that
+      only the module's going would end -- a server's sessions, a guest --
+      told to end;
+   3. those calls waited out, however long they take, and said while they
+      do (Cmd::drain_range, the bus's alike);
+   4. its exit, its state dropped: with no call of its commands or
+      providers running or able to start, what it stops there -- its tasks
+      above all -- stays stopped. A call that started one after the exit
+      had stopped them was the race this order closes;
+   5. what the exit left registered taken off, said as the module's bug;
+      the mailboxes it left open closed (rust_ipc_module_gone);
+   and then it is off the list and its code freed. An init that failed has
+   no instance: steps 2 and 4 are not its. */
+void ModuleTable::take_down(LoadedModule* module, bool live)
+{
+    const ulong lo = module->image.base;
+    const ulong hi = lo + module->image_size;
+    const ulong len = stdlib::str_len(module->name);
+
+    Cmd::close_range(lo, hi);
+    rust_mgmt_close_range(lo, hi);
+    if (live)
+    {
+        module->stop(module->instance);
+        Cmd::drain_range(lo, hi, module->name, false);
+        rust_mgmt_drain_range(lo, hi, 0);
+        module->exit(module->instance);
+    }
+
+    /* What is left of it -- closed in step 1, since nothing of the module's
+       has been registered after; an init that failed may have left a call
+       of one running, which this waits out too */
+    Cmd::drain_range(lo, hi, module->name, true);
+    rust_mgmt_drain_range(lo, hi, 1);
+    rust_ipc_module_gone(module->name, len);
+
+    remove(module);
+    release_module(module);
+}
+
 stdlib::Error ModuleTable::load(const void* image, ulong size, const char* params, stdlib::Printer& out)
 {
     const ulong params_len = stdlib::str_len(params);
@@ -1147,23 +1208,23 @@ stdlib::Error ModuleTable::load(const void* image, ulong size, const char* param
     const ulong imports = module->imports;
     const ulong functions = module->symbol_count;
 
+    module->stop = info->stop;
     module->exit = info->exit;
     module->instance = info->init(params, params_len, &out);
     const bool live = (module->instance != nullptr);
 
+    /* Live -- or, for an init that failed, going: what it may have left
+       registered is taken back before its code is freed, as an unload's is */
     {
         const ulong flags = lock_.lock_irq_save();
-        if (live)
-            module->phase = ModulePhase::Live;
-        else
-            module->list_entry.remove_init();
+        module->phase = live ? ModulePhase::Live : ModulePhase::Unloading;
         lock_.unlock_irq_restore(flags);
     }
 
     if (!live)
     {
         out.printf("module: %s: init failed\n", name);
-        release_module(module);
+        take_down(module, false);
         return make_error(stdlib::Error::UNSUCCESSFUL);
     }
 
@@ -1254,14 +1315,8 @@ stdlib::Error ModuleTable::unload(const char* name, stdlib::Printer& out)
         return make_error(stdlib::Error::INVALID_STATE);
     }
 
-    /* The module's state goes, and everything the module holds with it: exit
-       returns once the commands it registered are gone and no call into it is
-       still running (kernel_cmd_unregister waits those out). Only then may its
-       code go. Nothing is held meanwhile: this may take a while. */
-    module->exit(module->instance);
-    rust_ipc_module_gone(module->name, stdlib::str_len(module->name));
-    remove(module);
-    release_module(module);
+    /* Nothing is held meanwhile: this may take a while */
+    take_down(module, true);
 
     klog(0, "module: %s unloaded", name);
     out.printf("module: %s unloaded\n", name);
@@ -1294,10 +1349,7 @@ void ModuleTable::unload_all()
 
         char name[NAME_LEN_MAX + 1];
         stdlib::mem_cpy(name, module->name, sizeof(name));
-        module->exit(module->instance);
-        rust_ipc_module_gone(module->name, stdlib::str_len(module->name));
-        remove(module);
-        release_module(module);
+        take_down(module, true);
         klog(0, "module: %s unloaded", name);
     }
 
@@ -1545,6 +1597,23 @@ ulong ModuleTable::name_at(ulong addr, char* buf, ulong size)
     }
     lock_.unlock_irq_restore(flags);
     return len;
+}
+
+bool ModuleTable::unloading_at(ulong addr)
+{
+    bool going = false;
+    const ulong flags = lock_.lock_irq_save();
+    for (stdlib::ListEntry* entry = list_.flink; entry != &list_; entry = entry->flink)
+    {
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, list_entry);
+        if (addr >= module->image.base && addr < module->image.base + module->image_size)
+        {
+            going = (module->phase == ModulePhase::Unloading);
+            break;
+        }
+    }
+    lock_.unlock_irq_restore(flags);
+    return going;
 }
 
 bool ModuleTable::describe_all(char* buf, ulong size)

@@ -2405,6 +2405,9 @@ bool Cmd::dispatch_dynamic(const char* cmd, stdlib::Printer& out)
     void* ctx = nullptr;
     const char* args = "";
     ulong slot = 0;
+    /* Who calls, for what an unload waiting on the call says (drain_range) */
+    Task* task = Task::try_get_current_task();
+    const ulong caller = (task != nullptr) ? task->pid_ : 0;
 
     {
         stdlib::AutoLock lock(dynamic_lock_);
@@ -2423,6 +2426,7 @@ bool Cmd::dispatch_dynamic(const char* cmd, stdlib::Printer& out)
                 continue;
 
             entry.running++;
+            entry.caller = caller;
             handler = entry.handler;
             ctx = entry.ctx;
             slot = i;
@@ -2466,6 +2470,14 @@ ulong Cmd::register_dynamic(const char* name, ulong name_len, const char* help, 
 
     stdlib::AutoLock lock(dynamic_lock_);
 
+    /* Not a command of a module whose commands the loader is closing: asked
+       under the lock close_range marks them under, and the module made
+       Unloading before that, so a registration either comes first and is
+       marked with the rest, or comes after and is refused here. Never one
+       that a call can start in while the module's state and code go. */
+    if (ModuleTable::get_instance().unloading_at(reinterpret_cast<ulong>(handler)))
+        return 0;
+
     DynamicCmd* entry = nullptr;
     ulong slot = 0;
     for (ulong i = 0; i < DYNAMIC_MAX; i++)
@@ -2498,6 +2510,7 @@ ulong Cmd::register_dynamic(const char* name, ulong name_len, const char* help, 
     entry->handler = handler;
     entry->ctx = ctx;
     entry->running = 0;
+    entry->caller = 0;
     entry->removing = false;
     dynamic_generation_++;
     entry->handle = (dynamic_generation_ << DYNAMIC_SLOT_BITS) | (slot + 1);
@@ -2537,6 +2550,113 @@ void Cmd::unregister_dynamic(ulong handle)
             }
         }
         sleep(DYNAMIC_POLL_NS);
+    }
+}
+
+bool Cmd::in_range(DynamicHandler handler, ulong lo, ulong hi)
+{
+    const ulong at = reinterpret_cast<ulong>(handler);
+    return at >= lo && at < hi;
+}
+
+void Cmd::close_range(ulong lo, ulong hi)
+{
+    get_instance().close_dynamic(lo, hi);
+}
+
+void Cmd::close_dynamic(ulong lo, ulong hi)
+{
+    stdlib::AutoLock lock(dynamic_lock_);
+    for (ulong i = 0; i < DYNAMIC_MAX; i++)
+    {
+        DynamicCmd& entry = dynamic_[i];
+        if (entry.handle != 0 && in_range(entry.handler, lo, hi))
+            entry.removing = true;
+    }
+}
+
+void Cmd::count_draining(ulong lo, ulong hi, Draining& d)
+{
+    d.calls = 0;
+    d.commands = 0;
+    d.named = 0;
+
+    stdlib::AutoLock lock(dynamic_lock_);
+    for (ulong i = 0; i < DYNAMIC_MAX; i++)
+    {
+        const DynamicCmd& entry = dynamic_[i];
+        if (entry.handle == 0 || entry.running == 0 || !in_range(entry.handler, lo, hi))
+            continue;
+
+        d.calls += entry.running;
+        d.commands++;
+        if (d.named < Draining::NAMED_MAX)
+        {
+            stdlib::mem_cpy(d.names[d.named], entry.name, sizeof(entry.name));
+            d.callers[d.named] = entry.caller;
+            d.named++;
+        }
+    }
+}
+
+void Cmd::drain_range(ulong lo, ulong hi, const char* module, bool take)
+{
+    Cmd& self = get_instance();
+
+    /* The calls running out, however long that takes: one still running is
+       in the module's code, which is about to go. Said as Task::wait says a
+       join that takes long, so that an unload that does not end says why. */
+    ulong start = 0;
+    ulong report_at = Task::JOIN_REPORT_NS;
+    for (;;)
+    {
+        Draining d;
+        self.count_draining(lo, hi, d);
+        if (d.calls == 0)
+            break;
+
+        const ulong now = get_boot_time().get_value();
+        if (start == 0)
+            start = now;
+        const ulong waited = now - start;
+        if (waited >= report_at)
+        {
+            klog(0, "module: %s's unload has waited %lu ms for %lu calls of %lu of its commands to return",
+                module, waited / consts::NANO_SECS_IN_MS, d.calls, d.commands);
+            for (ulong i = 0; i < d.named; i++)
+                klog(0, "module:   %s, its latest call on pid %lu", d.names[i], d.callers[i]);
+            report_at = waited + stdlib::min(waited, Task::JOIN_REPORT_MAX_NS);
+        }
+        sleep(DYNAMIC_POLL_NS);
+    }
+
+    if (take)
+        self.take_dynamic(lo, hi, module);
+}
+
+void Cmd::take_dynamic(ulong lo, ulong hi, const char* module)
+{
+    /* What is still registered of the module's: closed before the calls
+       were waited out -- registered after, it would have been refused -- so
+       none of it runs, nor can start. Taken off, a slot at a time, and said
+       out of the lock: the module was to have unregistered it itself. */
+    for (ulong i = 0; i < DYNAMIC_MAX; i++)
+    {
+        char name[DYNAMIC_NAME_MAX + 1];
+        name[0] = '\0';
+        {
+            stdlib::AutoLock lock(dynamic_lock_);
+            DynamicCmd& entry = dynamic_[i];
+            if (entry.handle != 0 && in_range(entry.handler, lo, hi))
+            {
+                BUG_ON(entry.running != 0 || !entry.removing);
+                stdlib::mem_cpy(name, entry.name, sizeof(name));
+                entry.handle = 0;
+            }
+        }
+
+        if (name[0] != '\0')
+            klog(0, "module: %s left its command %s registered: taken off", module, name);
     }
 }
 

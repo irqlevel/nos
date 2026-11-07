@@ -1011,7 +1011,7 @@ pub fn ipcnet(r: &mut Input) {
     w.run_for(SEC);
     check(&w, &sent, &said, silent_since, &monitors, perfect);
     let m = module().take();
-    drop(m);
+    kmod::unload(m);
     drop(victim);
     stop.store(true, Ordering::Release);
     invariant!(w.wait_app(&sink_task, 10 * SEC) && w.wait_app(&hidden_task, 10 * SEC), "the mailboxes' tasks would not end");
