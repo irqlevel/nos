@@ -395,13 +395,14 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
 Reads are always allowed. A write test destroys what is on the device, so it
 has to be asked for by name, and it claims the device first
 (`kernel_blockdev_claim_as`, which mounts and the disk log take too, and the
-shell's `format` and `diskwrite` while they write). The claim is refused
+shell's `diskwrite` while it writes). The claim is refused
 while a mounted filesystem, the disk log or another writer holds the device
 -- or the disk it is a partition of, or one of its partitions -- whatever
 else is said; once taken, it holds all of those off until the test is done,
 so nothing can be mounted under it midway. Unless `force` is given the test
 is also refused on a disk with partitions, and on a device that starts with
-an ext2 or nanofs superblock, a partition table, a boot sector or a prepared
+a superblock of the ext family or of a nanofs an older kernel made, a
+partition table, a boot sector or a prepared
 disk log area. A write test ends with a flush, timed.
 
 To try a spare partition on a machine's NVMe disk, find it with `disks` --

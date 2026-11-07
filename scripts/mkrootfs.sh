@@ -2,9 +2,11 @@
 # Make a root filesystem image for nos: ext4, as new installs get one -- or,
 # with FSTYPE=ext2, ext2, as the roots made before ext4 are.
 #
-#   [FSTYPE=ext2] scripts/mkrootfs.sh <image> <size-MiB> [dir] [block-size]
+#   [FSTYPE=ext2] [LABEL=name] scripts/mkrootfs.sh <image> <size-MiB> [dir] [block-size]
 #
-# The image gets the label "nos", which is what root=auto looks for. ext4's
+# The image gets the label LABEL, "nos" unless given -- which is what
+# root=auto looks for, so a filesystem a test puts beside a root of that
+# label needs another: two that carry it find neither. ext4's
 # features are named one by one from none (EXT4_FEATURES, as nos-install
 # names them), so that what this machine's mke2fs.conf would add -- orphan_file
 # and metadata_csum_seed among them, which nos mounts read-only and GRUB 2.06
@@ -22,7 +24,7 @@
 set -eu
 
 if [ $# -lt 2 ]; then
-    echo "usage: [FSTYPE=ext2] $0 <image> <size-MiB> [dir] [block-size]" >&2
+    echo "usage: [FSTYPE=ext2] [LABEL=name] $0 <image> <size-MiB> [dir] [block-size]" >&2
     exit 1
 fi
 
@@ -31,6 +33,17 @@ SIZE=$2
 DIR=${3:-}
 BS=${4:-4096}
 FSTYPE=${FSTYPE:-ext4}
+LABEL=${LABEL:-nos}
+
+# A label goes into mke2fs's options unquoted: letters, digits, - and _
+# only, and no more than the 16 bytes the superblock holds
+case "$LABEL" in
+    *[!A-Za-z0-9_-]*) echo "mkrootfs: LABEL is letters, digits, - and _, not '$LABEL'" >&2; exit 1 ;;
+esac
+if [ ${#LABEL} -gt 16 ]; then
+    echo "mkrootfs: LABEL is 16 bytes at the most, not ${#LABEL}" >&2
+    exit 1
+fi
 
 # What nos's ext4 writes, and GRUB 2.06 reads: e2fsprogs 1.46's ext4, but
 # for nothing a newer one adds. nos-install makes new installs with the same.
@@ -40,8 +53,8 @@ EXT4_FEATURES=none,has_journal,ext_attr,resize_inode,dir_index,filetype,extent,6
 # label, block size, its features
 mkfs_opts() {
     case "$FSTYPE" in
-        ext4) echo "-t ext4 -F -q -L nos -b $BS -O $EXT4_FEATURES -E lazy_itable_init=0,lazy_journal_init=0" ;;
-        ext2) echo "-t ext2 -F -q -L nos -b $BS -O ^dir_index" ;;
+        ext4) echo "-t ext4 -F -q -L $LABEL -b $BS -O $EXT4_FEATURES -E lazy_itable_init=0,lazy_journal_init=0" ;;
+        ext2) echo "-t ext2 -F -q -L $LABEL -b $BS -O ^dir_index" ;;
         *) echo "mkrootfs: FSTYPE is ext4 or ext2, not $FSTYPE" >&2; exit 1 ;;
     esac
 }
@@ -74,4 +87,4 @@ else
     fi
 fi
 
-echo "mkrootfs: $IMG (${SIZE} MiB, $FSTYPE, label nos, block size $BS)"
+echo "mkrootfs: $IMG (${SIZE} MiB, $FSTYPE, label $LABEL, block size $BS)"

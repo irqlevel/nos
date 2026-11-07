@@ -952,8 +952,8 @@ impl Vfs {
                 klog!(0, "vfs: a name in that path is longer than {} bytes", NAME_MAX - 1);
                 return None;
             }
-            /* No filesystem here keeps one: ext2's format forbids it, and
-             * nanofs's names end at the first. */
+            /* No filesystem here keeps one: the ext family's format
+             * forbids it. */
             if component.contains(&0) {
                 klog!(0, "vfs: a name in that path has a NUL in it");
                 return None;
