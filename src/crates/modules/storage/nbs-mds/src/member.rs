@@ -20,6 +20,15 @@
 //!   state's digest every `nbsmeta::CHECK_EVERY` entries; the leader proposes
 //!   its own (`Command::Digest`) as it takes it, and a member whose own
 //!   differs stops -- a determinism bug said, not a silent fork.
+//! - **This host's clients** (N8; `TAG_ASK`): a volume attached or let go
+//!   of, a replica that did not answer taken out -- each a command, told its
+//!   outcome and the entry it was applied at -- and a volume's map, told
+//!   from the applied state once it has applied as far as the client read.
+//! - **A replica taken out only once the leader finds its cs silent too**
+//!   (decision 6): the leader looks at the cs (`Op::Ping`) before it
+//!   proposes the change, and refuses it while the cs answers -- a client
+//!   whose own way to a healthy cs is broken waits, rather than take a
+//!   replica out of sets other volumes share.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -27,18 +36,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use codec::{Reader, Writer};
-use kcore::ipc::{Message, TAG_BULK};
+use kcore::ipc::{Addr, Message, TAG_BOUNCED, TAG_BULK};
 use kcore::klog;
 use kcore::time::boot_time_ns;
-use nbsmeta::{Answer, Command, DeviceState, State};
-use nbswire::{Answered, Device as CsDevice, Identity as CsIdentity, Query, Question, Refusal as CsRefusal, Told};
+use nbsmeta::{Answer, Command, Refusal, Replica, State};
+use nbswire::{Answered, Ask, Asking, Op, Query, Request, Said, Saying};
 use raft::{Role, Rsm};
-use raftmember::{App, Core, Locked, Pending};
+use raftmember::{App, Core, Locked, Outcome, Pending};
 
 use crate::files::{self, Known};
 
 /// The member's mailbox, the same on every host of the cluster.
-pub const NAME: &str = "nbs.mds";
+pub const NAME: &str = nbswire::MDS_NAME;
 /// An offer of the cluster: its id and name, then its members (a host and
 /// its incarnation each) -- what the host offered knows them by until its
 /// log has caught up.
@@ -52,6 +61,12 @@ pub const TAG_DECLINED: u32 = raftmember::TAG_APP + 2;
 pub const TAG_NO_MEMBER: u32 = raftmember::TAG_APP + 3;
 /// How often a host's lost member is said in the log at most.
 const LOST_SAY_NS: u64 = 60_000_000_000;
+/// How long the leader waits for a cs it looks at, and how long what it
+/// found stands before a replica's taking out looks again.
+const PROBE_NS: u64 = 250_000_000;
+const VERDICT_NS: u64 = 2_000_000_000;
+/// The leader's look at a cs, as it goes.
+const PROBE: u32 = nbswire::TAG_REQUEST | TAG_BULK;
 
 pub type Member = raftmember::Member<Mds>;
 pub type Shared = raftmember::Shared<Mds>;
@@ -128,19 +143,47 @@ pub struct Mds {
     dir: String,
     /// The newest checkpoint whose digest this member proposed as leader.
     proposed: u64,
+    /// The leader's looks at cs's in flight, and what each look found: the
+    /// cs answered and serves, or not, and when.
+    probes: Vec<Probe>,
+    verdicts: BTreeMap<u32, (bool, u64)>,
+    next_probe: u64,
+}
+
+/// A look at a cs, waiting for its answer.
+struct Probe {
+    cs: u32,
+    id: u64,
+    until: u64,
+}
+
+/// What a command of NBS's own is waited for by.
+pub enum Waiter {
+    /// The leader's digest.
+    Digest,
+    /// A client of this host's, told the outcome as its ask's kind is.
+    Client { to: Addr, id: u64, kind: Kind },
+}
+
+#[derive(Clone, Copy)]
+pub enum Kind {
+    Attach,
+    Detach,
+    Down,
 }
 
 /// The member over its log in `dir`, its mailbox named.
 pub fn new(rsm: Rsm<raftmember::Log, State>, me: files::Member, lost: Lost, dir: &str) -> Result<Member, String> {
     let id = me.id;
-    raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0 }, rsm, id)
+    raftmember::Member::new(Mds { me, lost, dir: String::from(dir), proposed: 0, probes: Vec::new(),
+                                  verdicts: BTreeMap::new(), next_probe: 1 }, rsm, id)
 }
 
 impl App for Mds {
     type State = State;
     type Command = Command;
     type Answer = Answer;
-    type Waiter = ();
+    type Waiter = Waiter;
 
     const NAME: &'static str = NAME;
     const LOG: &'static str = "nbs";
@@ -190,8 +233,61 @@ impl App for Mds {
             TAG_OFFER => self.on_offer(core, m),
             TAG_NO_MEMBER => self.on_no_member(core, m),
             nbswire::TAG_QUERY => self.on_cs_query(core, m),
+            nbswire::TAG_ASK => self.on_client(core, m),
+            nbswire::TAG_ANSWER => self.on_probe_answer(m),
+            TAG_BOUNCED => self.on_bounce(m),
             _ => {}
         }
+    }
+
+    /// As the leader, a replica's taking out proposed only once its cs is
+    /// found silent: a look at it started, and the change refused for now,
+    /// asked again by the client once the look has an answer.
+    fn before_submit(&mut self, core: &mut Core<Mds>, cmd: &Command) -> Result<(), String> {
+        /* The cs's own refusal as failed is taken as it is: it answers, and
+           what it refused is what is wrong */
+        let Command::ReplicaDown { set, cs, refused: false, name, generation } = cmd else { return Ok(()) };
+        /* What applying refuses or does again anyway -- not the writer's, no
+           such set or replica, one out already, the last active one -- is
+           applied as it is, with no look */
+        let s = core.state();
+        if s.volume(name).and_then(|v| v.writer.as_ref()).is_none_or(|w| w.generation != *generation) {
+            return Ok(());
+        }
+        let Some(st) = s.sets().get(*set as usize) else { return Ok(()) };
+        let Some(at) = st.cs.iter().position(|c| c == cs) else { return Ok(()) };
+        if st.replicas[at] == Replica::Down
+            || !st.replicas.iter().enumerate().any(|(i, r)| i != at && *r == Replica::Active)
+        {
+            return Ok(());
+        }
+        let now = boot_time_ns();
+        match self.verdicts.get(cs) {
+            Some(&(false, when)) if now < when + VERDICT_NS => return Ok(()),
+            Some(&(true, when)) if now < when + VERDICT_NS => {
+                return Err(alloc::format!("cs {} answers the leader: the client's own way to it is broken, and it is \
+                                           not taken out -- the client waits", cs));
+            }
+            _ => {}
+        }
+        self.probe(core, *cs);
+        Err(alloc::format!("the leader is looking at cs {} -- ask again", cs))
+    }
+
+    fn finish(&mut self, core: &mut Core<Mds>, w: Waiter, outcome: Outcome<Mds>, index: u64) {
+        let Waiter::Client { to, id, kind } = w else { return };
+        let said = match (outcome, kind) {
+            (Ok(Answer::Attached { generation }), Kind::Attach) => Said::Attached { generation, index },
+            (Ok(Answer::Attached { .. }), Kind::Detach) => Said::Detached { index },
+            (Ok(Answer::Set { version }), Kind::Down) => Said::Down { version, index },
+            (Ok(Answer::Refused(Refusal::LastReplica)), Kind::Down) => Said::LastReplica,
+            (Ok(Answer::Refused(Refusal::NotTheWriter)), Kind::Down) => Said::NotTheWriter,
+            (Ok(Answer::Refused(why)), _) => Said::Refused(String::from(why.says())),
+            (Ok(other), _) => Said::Refused(alloc::format!("answered {:?}", other)),
+            /* The engine's: no leader, the leader not ready, its look */
+            (Err(why), _) => Said::NotNow(why),
+        };
+        let _ = core.mailbox().send(to, nbswire::TAG_SAID, 0, &Saying { id, said }.encode());
     }
 
     /// A host whose member is no longer the one that said it lost its state
@@ -203,10 +299,21 @@ impl App for Mds {
         if core.role() != Role::Leader {
             return;
         }
+        /* A look not answered in time: the cs is silent */
+        let now = boot_time_ns();
+        let verdicts = &mut self.verdicts;
+        self.probes.retain(|p| {
+            if now < p.until {
+                return true;
+            }
+            verdicts.insert(p.cs, (false, now));
+            false
+        });
+        self.verdicts.retain(|_, &mut (_, when)| now < when + VERDICT_NS);
         if let Some((at, digest)) = core.state().checks().latest() {
             if at > self.proposed {
                 self.proposed = at;
-                core.ask(self, Command::Digest { at, digest }, Pending::App(()));
+                core.ask(self, Command::Digest { at, digest }, Pending::App(Waiter::Digest));
             }
         }
     }
@@ -223,6 +330,75 @@ impl App for Mds {
 }
 
 impl Mds {
+    /// A look at cs `cs` started, unless one is under way: its `Ping`, from
+    /// the member's mailbox, the answer looked for in `on_probe_answer`.
+    fn probe(&mut self, core: &Core<Mds>, cs: u32) {
+        if self.probes.iter().any(|p| p.cs == cs) {
+            return;
+        }
+        let now = boot_time_ns();
+        let Some(host) = core.state().cs().get(cs as usize).map(|c| c.host.clone()) else { return };
+        let to = if host == self.me.host {
+            String::from(nbswire::CS_NAME)
+        } else {
+            alloc::format!("{}@{}", nbswire::CS_NAME, host)
+        };
+        let id = self.next_probe;
+        self.next_probe += 1;
+        let ping = Request { id, volume: 0, generation: 0, op: Op::Ping }.encode();
+        if core.mailbox().send_to(&to, PROBE, id, &ping).is_err() {
+            /* Nothing there to look at: silent */
+            self.verdicts.insert(cs, (false, now));
+            return;
+        }
+        self.probes.push(Probe { cs, id, until: now + PROBE_NS });
+    }
+
+    /// A cs's answer to the leader's look: there, and serving, or not.
+    fn on_probe_answer(&mut self, m: &Message) {
+        let Some(a) = nbswire::Answer::decode(&m.data) else { return };
+        let Some(at) = self.probes.iter().position(|p| p.id == a.id) else { return };
+        let p = self.probes.swap_remove(at);
+        let serving = matches!(a.reply, nbswire::Reply::Done);
+        self.verdicts.insert(p.cs, (serving, boot_time_ns()));
+    }
+
+    /// A look the channel gave back: the cs is not there.
+    fn on_bounce(&mut self, m: &Message) {
+        let Some(b) = m.bounced() else { return };
+        if b.tag != PROBE {
+            return;
+        }
+        let Some(at) = self.probes.iter().position(|p| p.id == m.reference) else { return };
+        let p = self.probes.swap_remove(at);
+        self.verdicts.insert(p.cs, (false, boot_time_ns()));
+    }
+
+    /// An ask of a client of this host's (nbswire's `Asking`): a command
+    /// asked, told its outcome by `finish` -- or a map told now.
+    fn on_client(&mut self, core: &mut Core<Mds>, m: &Message) {
+        if m.from.host() != 0 {
+            return;
+        }
+        let Some(a) = Asking::decode(&m.data) else { return };
+        let host = self.me.host.clone();
+        let (cmd, kind) = match a.ask {
+            Ask::Attach { name, writable, force, token } => {
+                (Command::Attach { name, host, writable, force, token }, Kind::Attach)
+            }
+            Ask::Detach { name, generation } => (Command::Detach { name, host, generation }, Kind::Detach),
+            Ask::Down { set, cs, refused, name, generation } => {
+                (Command::ReplicaDown { set, cs, refused, name, generation }, Kind::Down)
+            }
+            Ask::Map { name, from, count, index } => {
+                let said = nbswire::mds::map(core.state(), core.rsm().applied(), &name, from, count, index);
+                let _ = core.mailbox().send(m.from, nbswire::TAG_SAID, 0, &Saying { id: a.id, said }.encode());
+                return;
+            }
+        };
+        core.ask(self, cmd, Pending::App(Waiter::Client { to: m.from, id: a.id, kind }));
+    }
+
     /// A question of this host's cs, answered from the member's applied
     /// state (plans/nbs.md, "The cs"): this host's alone -- another host's
     /// cs asks its own host's mds.
@@ -231,62 +407,8 @@ impl Mds {
             return;
         }
         let Some(q) = Query::decode(&m.data) else { return };
-        let told = self.cs_answer(core, &q.question);
+        let told = nbswire::mds::told(core.state(), &self.me.host, core.rsm().applied(), &q.question);
         let _ = core.mailbox().send(m.from, nbswire::TAG_TOLD, 0, &Answered { id: q.id, told }.encode());
-    }
-
-    fn cs_answer(&self, core: &Core<Mds>, q: &Question) -> Told {
-        let s = core.state();
-        let Some(cluster) = s.cluster() else { return Told::Refused(CsRefusal::NoMds) };
-        let mine = s.cs_of(&self.me.host);
-        match q {
-            Question::Identity => Told::Identity(mine.map(|cs| CsIdentity {
-                cluster: cluster.id,
-                cs: cs.id,
-                devices: cs.devices.iter().map(|d| CsDevice { ident: d.ident.clone(), device: d.id, slots: d.slots,
-                                                                draining: d.state != DeviceState::Active })
-                    .collect(),
-            })),
-            Question::Verify { volume, generation, chunk, position, index, writing } => {
-                let applied = core.rsm().applied();
-                if applied < *index {
-                    return Told::Refused(CsRefusal::Behind { applied });
-                }
-                let Some(v) = s.volumes().iter().find(|v| v.id == *volume) else {
-                    return Told::Refused(CsRefusal::NotTheMap);
-                };
-                if v.map.get(*position as usize) != Some(&chunk.chunk) {
-                    return Told::Refused(CsRefusal::NotTheMap);
-                }
-                let Some(ch) = s.chunks().get(chunk.chunk as usize).filter(|c| !c.is_free()) else {
-                    return Told::Refused(CsRefusal::NotTheMap);
-                };
-                if ch.incarnation != chunk.incarnation {
-                    return Told::Refused(CsRefusal::NotTheMap);
-                }
-                let (Some(set), Some(me)) = (s.sets().get(ch.set as usize), mine) else {
-                    return Told::Refused(CsRefusal::NotHere);
-                };
-                if !set.cs.contains(&me.id) {
-                    return Told::Refused(CsRefusal::NotHere);
-                }
-                let known = nbscs::Epoch { set: ch.set, version: set.version };
-                if known != chunk.epoch {
-                    return Told::Refused(CsRefusal::Epoch { known });
-                }
-                /* A write, or a read of a writer's, at the volume's attach for
-                   writing; a read of generation 0 is a read-only one's */
-                if (*writing || *generation != 0) && v.writer.as_ref().is_none_or(|w| w.generation != *generation) {
-                    return Told::Refused(CsRefusal::NotAttached);
-                }
-                Told::Verified
-            }
-            Question::Live { chunks } => Told::Gone(chunks.iter()
-                .filter(|(c, inc)| s.chunks().get(*c as usize).is_none_or(|ch| ch.is_free() || ch.incarnation != *inc))
-                .map(|&(c, _)| c).collect()),
-            Question::Volumes { volumes } => Told::Gone(volumes.iter()
-                .filter(|&&v| !s.volumes().iter().any(|x| x.id == v)).copied().collect()),
-        }
     }
 
     /// An offer to this host, a member already: answered with its
@@ -332,3 +454,4 @@ impl Mds {
         }
     }
 }
+

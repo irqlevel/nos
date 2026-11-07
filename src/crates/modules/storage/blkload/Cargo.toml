@@ -10,3 +10,5 @@ crate-type = ["staticlib"]
 [dependencies]
 kmod = { path = "../../../base/kmod" }
 kcore = { path = "../../../base/kcore" }
+# Its latency histogram, nbsload's too.
+latency = { path = "../../../common/latency" }

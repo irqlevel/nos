@@ -472,7 +472,7 @@ fn disks_json(w: &mut Writer, name: &str, folder: &Folder, o: &Options) {
         w.key("size_bytes");
         match (&device, kcore::fs::size(path)) {
             (Some(d), _) => w.uint(d.sectors().saturating_mul(d.sector_size())),
-            (None, Ok(n)) if !crate::devices::is_device(path) => w.uint(n),
+            (None, Ok(n)) if crate::devices::is_file(path) => w.uint(n),
             _ => w.null(),
         }
         w.field_bool("device", crate::devices::is_device(path));
