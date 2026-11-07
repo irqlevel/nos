@@ -36,8 +36,8 @@ name = "mod_hello"
 crate-type = ["staticlib"]
 
 [dependencies]
-kmod = { path = "../../kmod" }
-kcore = { path = "../../kcore" }
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
 ```
 
 The second is [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/test/hello/src/lib.rs), shown here without its doc comment:
@@ -62,7 +62,7 @@ impl kmod::Module for Hello {}
 
 impl Drop for Hello {
     fn drop(&mut self) {
-        kcore::trace!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
+        kcore::klog!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
     }
 }
 
@@ -73,7 +73,7 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         let _ = writeln!(out, "hello, {} -- call {} since the module was loaded", who, calls);
     })?;
 
-    kcore::trace!(0, "hello: loaded");
+    kcore::klog!(0, "hello: loaded");
     Ok(Box::new(Hello { _cmd: cmd }))
 }
 
@@ -137,7 +137,7 @@ A module can use whatever `kcore` wraps. The full map is in [What `kcore` has](/
 | `kcore::` | What it gives a module |
 |---|---|
 | `cmd` | `Command::register`, and `Output::read_input` for a command that reads what an SSH user types |
-| `trace` | `trace!(level, ...)`, which writes to the kernel log; level 0 is always visible |
+| `klog` | `klog!(level, ...)`, which writes to the kernel log; level 0 is always visible |
 | `sync` | locks that own the data they guard (`Mutex<T>`, `SpinLock<T>`, `IrqSpinLock<T>` and others), plus `Event` and `WaitGroup` |
 | `task` | tasks: `spawn_with` and `spawn_on_with` start a task that holds an `Arc` of the module's state; a `TaskHandle` waits for its task when dropped; `sleep_ms` |
 | `time`, `random`, `cpu` | the clock, the kernel's random pool, CPU ids and inter-processor interrupts (IPIs) |

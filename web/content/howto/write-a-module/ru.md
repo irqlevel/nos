@@ -36,8 +36,8 @@ name = "mod_hello"
 crate-type = ["staticlib"]
 
 [dependencies]
-kmod = { path = "../../kmod" }
-kcore = { path = "../../kcore" }
+kmod = { path = "../../../base/kmod" }
+kcore = { path = "../../../base/kcore" }
 ```
 
 Второй — [`src/lib.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/test/hello/src/lib.rs), здесь он показан без doc-комментария:
@@ -62,7 +62,7 @@ impl kmod::Module for Hello {}
 
 impl Drop for Hello {
     fn drop(&mut self) {
-        kcore::trace!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
+        kcore::klog!(0, "hello: unloaded after {} calls", CALLS.load(Ordering::Relaxed));
     }
 }
 
@@ -73,7 +73,7 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         let _ = writeln!(out, "hello, {} -- call {} since the module was loaded", who, calls);
     })?;
 
-    kcore::trace!(0, "hello: loaded");
+    kcore::klog!(0, "hello: loaded");
     Ok(Box::new(Hello { _cmd: cmd }))
 }
 
@@ -137,7 +137,7 @@ cp -r src/crates/modules/test/hello src/crates/modules/tools/greet
 | `kcore::` | Что даёт модулю |
 |---|---|
 | `cmd` | `Command::register`, а также `Output::read_input` для команды, которая читает то, что печатает пользователь SSH |
-| `trace` | `trace!(level, ...)` пишет в лог ядра; уровень 0 виден всегда |
+| `klog` | `klog!(level, ...)` пишет в лог ядра; уровень 0 виден всегда |
 | `sync` | блокировки, которые владеют защищаемыми данными (`Mutex<T>`, `SpinLock<T>`, `IrqSpinLock<T>` и другие), а также `Event` и `WaitGroup` |
 | `task` | задачи: `spawn_with` и `spawn_on_with` запускают задачу, которая держит `Arc` на состояние модуля; `TaskHandle` при drop дожидается своей задачи; `sleep_ms` |
 | `time`, `random`, `cpu` | часы, пул случайных чисел ядра, номера CPU и межпроцессорные прерывания (IPI) |

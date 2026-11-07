@@ -20,7 +20,11 @@ area's directory under `src/crates/` -- `base/`, `layers/`, `drivers/`,
 `hypervisor/`, `modules/`, `common/`, `kernel/` the one crate at the top --
 and a member of the workspace; and every crate under `common/` with no
 kernel in it -- no path dependency outside `common/` -- and
-`#![forbid(unsafe_code)]` in its `lib.rs`. `make smoke` builds in Docker and runs the
+`#![forbid(unsafe_code)]` in its `lib.rs`. And it holds every link into the
+tree to naming something there (`scripts/check-links.py`): the site's links
+to the source on GitHub's master, which a move or a rename would leave a 404
+nobody is told of, and the relative links of `docs/`, `plans/` and the
+top's documents. `make smoke` builds in Docker and runs the
 headless boot smoke test (`scripts/smoke-test.sh`).
 
 ## Four things the Makefile will not tell you
