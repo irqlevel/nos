@@ -67,8 +67,17 @@ version = "0.1.0"
 name = "nbs-fuzz"
 version = "0.1.0"
 dependencies = [
+ "nbscs",
  "nbsmeta",
  "raft",
+]
+
+[[package]]
+name = "nbscs"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "nbsmeta",
 ]
 
 [[package]]

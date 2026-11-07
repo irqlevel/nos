@@ -96,12 +96,14 @@ CHUNK_MIB = 4
 
 def part_slots(sectors):
     """The 4 MiB slots a device of `sectors` gives its chunk server, after
-    what plans/nbs.md has the cs keep at its start: a slot for its
-    superblock, then its table of slots -- 64 bytes a slot -- twice, rounded
-    up to slots."""
+    what the cs keeps at its start (nbscs's format.rs): a slot for its
+    superblock and fences, then its table of slots -- 64 bytes a slot of the
+    device, each copy rounded up to pages of 64 -- twice, rounded up to
+    slots."""
     slot = CHUNK_MIB << 20
     every = sectors * 512 // slot
-    return every - (1 + -(-every * 64 * 2 // slot))
+    records = -(-every // 64) * 64
+    return every - (1 + -(-2 * records * 64 // slot))
 
 
 class Stop(Exception):

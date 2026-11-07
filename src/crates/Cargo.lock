@@ -673,6 +673,7 @@ dependencies = [
  "kcore",
  "kmod",
  "mgmtwire",
+ "nbscs",
  "nbsmeta",
  "raft",
  "raftmember",
@@ -721,6 +722,14 @@ dependencies = [
  "kmod",
  "tls",
  "web",
+]
+
+[[package]]
+name = "nbscs"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "nbsmeta",
 ]
 
 [[package]]
