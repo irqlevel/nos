@@ -387,7 +387,21 @@ fn interrupt(net: &'static Net) {
      *
      * And both in one raise when both are due -- a reply's transmit done as
      * the next request comes in, one interrupt for the two: a raise each
-     * kicked the softirq task once each. */
+     * kicked the softirq task once each.
+     *
+     * Why nothing is missed: the device was asked for no EVENT_IDX and no
+     * queue sets NO_INTERRUPT, so it interrupts after every used-ring
+     * update; the ISR byte above is read and acknowledged -- read-to-clear
+     * on PCI, a write to InterruptACK on mmio -- before the rings are read
+     * below, so a completion published after that raises an interrupt of
+     * its own, and one published before it is in the index read; and a
+     * queue's index equal to what its owner took means the owner has every
+     * completion in hand. The one assumption is mmio's: its ACK reaches the
+     * device before the read -- what an MMIO write's trap gives, and
+     * virtio-mmio is only ever under a hypervisor here -- the order Linux's
+     * vm_interrupt keeps too (writel of the ACK, then vring_interrupt's
+     * more_used for each queue). Every interrupt asks both rings, so a
+     * completion that came without one of its own is taken at the next. */
     let mut due = 0;
     if net.rx_used.pending() || net.rx_empty.load(Ordering::Relaxed) != 0 {
         due |= 1 << softirq::TYPE_NET_RX;
