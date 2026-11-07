@@ -6,4 +6,4 @@ edition = "2021"
 [lib]
 
 [dependencies]
-kcore = { path = "../../kcore" }
+kcore = { path = "../../base/kcore" }

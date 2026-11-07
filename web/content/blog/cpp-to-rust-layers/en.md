@@ -69,7 +69,7 @@ unsafe impl Send for ArpTable {}
         let cache = unsafe { &mut *self.cache.get() };
 ```
 
-And after, in [`net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/net/src/arp.rs):
+And after, in [`layers/net/src/arp.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/layers/net/src/arp.rs):
 
 ```rust
 pub struct ArpTable {
@@ -81,7 +81,7 @@ pub struct ArpTable {
         let cache = self.cache.lock();
 ```
 
-The `unsafe` now appears once per lock type, in the guard's `Deref` in [`kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/kcore/src/sync.rs). This was not cosmetic. TCP had been reading other connections' state under the pool lock without taking their own locks, and the old shape hid that behind the same `unsafe` as everything else. The lock order is now pool, then connection.
+The `unsafe` now appears once per lock type, in the guard's `Deref` in [`base/kcore/src/sync.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/base/kcore/src/sync.rs). This was not cosmetic. TCP had been reading other connections' state under the pool lock without taking their own locks, and the old shape hid that behind the same `unsafe` as everything else. The lock order is now pool, then connection.
 
 Each pattern that used to need `unsafe` got a type in `kcore`, and the type's own comment explains why it is sound. `Once` is for something there is only one of, `CpuLocal` for per-CPU state, `RxOwned` for what only the receive path touches, and `kcore::pod` for on-disk structures. (ext2's superblock says `unsafe impl Pod` once, and every read after that is bounds-checked.) A filesystem's tree became an arena of ids, each a slot plus a generation, so a stale id finds nothing. A handle that comes from outside is looked up, never dereferenced:
 

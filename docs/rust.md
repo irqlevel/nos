@@ -18,13 +18,13 @@ has now, a map of `kcore`, and how a driver is written.
 ## The layers
 
 ```
-ffi/                              raw extern "C" declarations, and nothing else
-kcore/                            safe RAII wrappers around kernel services
-netwire/                          the frame formats, with no kernel in them
-block/  net/  fs/  tls/  virtio/  the layers
-drivers/*                         over block, net, virtio and kcore
-kernel/                           entry points, the global allocator: what C++ calls
-kmod/ + modules/*                 loadable, each linked on its own, over kcore
+base/ffi/                           raw extern "C" declarations, and nothing else
+base/kcore/                         safe RAII wrappers around kernel services
+common/                             no kernel in them: the frame formats, the wires, raft, the formats, the CRCs
+layers/{block,net,fs,tls,mgmt,ipc}  the layers
+drivers/                            by what they drive, over block, net, virtio (drivers/virtio) and kcore
+kernel/                             entry points, the global allocator: what C++ calls
+base/kmod/ + modules/               loadable, by area, each linked on its own, over kcore
 ```
 
 Inside the kernel image the crates call each other as crates: a disk's
@@ -33,12 +33,15 @@ driver depends on `block` and a NIC's on `net`, `fs` depends on `block`,
 takes the connection it speaks over as a trait, `tls::Transport`, which
 `net`'s HTTP client implements over a TCP connection.
 
-Two crates have no kernel in them at all, and that is what they are for:
-`netwire` (the frame formats and the internet checksum) and `ssh` (the
-protocol). A loadable module is linked on its own and cannot link a layer --
-the layer's statics would be a second copy -- but it can link these, so what
-the network layer and the `netload` module both need of a frame is written
-once.
+The crates under `common/` have no kernel in them at all, and that is what
+they are for: `netwire` (the frame formats and the internet checksum), `ssh`
+(the protocol), `crc` (every CRC a format is checked by) and the rest. A
+loadable module is linked on its own and cannot link a layer -- the layer's
+statics would be a second copy -- but it can link these, so what the
+network layer and the `netload` module both need of a frame is written once;
+and so can hvboot, which runs in a guest, and the host's fuzzers, which
+cannot link the kernel either. None of them has `unsafe`, and each says so
+(`#![forbid(unsafe_code)]`): what needs it belongs in `kcore`.
 
 The C ABI is for what is on the other side of a link: C++, and a module,
 which is linked on its own and can share no other seam with the kernel.
@@ -89,12 +92,12 @@ Three steps, and a module gets the service by the same three, because the
 module export table is generated from the `ffi` declarations:
 
 1. the C++ function in `src/base/kernel/rust_ffi.cpp`;
-2. its raw declaration in `src/crates/ffi/src/<module>.rs` (+ `pub mod` in
-   `ffi/src/lib.rs`);
-3. the safe wrapper in `src/crates/kcore/src/<module>.rs` (+ `pub mod` in
-   `kcore/src/lib.rs`).
+2. its raw declaration in `src/crates/base/ffi/src/<module>.rs` (+ `pub mod` in
+   `base/ffi/src/lib.rs`);
+3. the safe wrapper in `src/crates/base/kcore/src/<module>.rs` (+ `pub mod` in
+   `base/kcore/src/lib.rs`).
 
-**`ffi/`** holds `extern "C"` declarations and `#[repr(C)]` structs and no
+**`base/ffi/`** holds `extern "C"` declarations and `#[repr(C)]` structs and no
 logic. Every pointer is raw (`*mut u8`, `*const u8`): no reference crosses
 the boundary. A kernel object is an opaque `usize` handle, 0 for null or
 failure. The blocks are `unsafe extern "C" { .. }` -- **at the start of a
@@ -115,7 +118,7 @@ declarations changes the digest every module's header carries, so modules
 are rebuilt with the kernel ([What a module may
 call](modules.md#what-a-module-may-call)).
 
-**`kcore/`** is where a handle becomes a type. Whatever needs cleanup
+**`base/kcore/`** is where a handle becomes a type. Whatever needs cleanup
 implements `Drop` calling the matching `kernel_*_destroy` / `kernel_*_stop`
 / `kernel_*_put`; a handle that must not be `Send`/`Sync` carries
 `PhantomData<*const ()>`; ownership crosses to C++ by value, inside the
@@ -131,7 +134,7 @@ saved to register or unregister. Handles are raw pointers cast to
 
 ## Where `unsafe` goes
 
-`block/`, `net/`, `fs/` and the drivers are ordinary Rust. What is left of
+The layers (`layers/block/`, `layers/net/`, `layers/fs/`) and the drivers are ordinary Rust. What is left of
 `unsafe` in them is where a pointer and a length arrive from C++ or from a
 module, an `unsafe impl` saying a structure is plain words, and the entry
 point C++ calls a crate by. Everything else that used to need it has a
@@ -169,7 +172,7 @@ able to say why.
   interrupts off, which CPU this is, interrupts back on -- so a hot path
   keeps what it needs of its CPU in one `CpuLocal` and takes it once: the
   hypervisor's entry had three, one a table, and they cost every exit on the
-  EX44 400 ns of its 2.2 µs (`Entries` in `hvarch/src/x86.rs` is the one
+  EX44 400 ns of its 2.2 µs (`Entries` in `hypervisor/hvarch/src/x86.rs` is the one
   now).
 - **What only the receive path touches** is an `RxOwned<T>`, reached with
   the `&mut RxContext` the receive pass makes once and lends down: a
@@ -202,7 +205,7 @@ able to say why.
   `fn(&'static T)` named directly (`Nic::interrupt`), never a closure that
   captures. `kcore` checks at compile time that it has no bytes and stamps
   out the trampoline per handler type, so the context word *is* the target
-  (`kcore/src/callback.rs`).
+  (`base/kcore/src/callback.rs`).
 - **Device memory is cells, not `read_volatile` through a cast pointer**: a
   descriptor is a `#[repr(C)]` struct of `Volatile<u32>`
   (`unsafe impl Descriptor` says so once), a ring is
@@ -221,7 +224,7 @@ able to say why.
 | `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
 | `klog` | `klog!(level, "fmt {}", arg)` -- a line of the kernel log; level 0 is always visible |
 | `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()`, `cycle_counter()` |
-| `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/crates/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
+| `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/crates/base/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
 | `events` | **for a module.** `SharedEvent` — one event for a task that waits for several things: a mailbox (`ipc::Mailbox::new_on`), a device's queue (`block::Disk::into_queue_on`) and an image's (`fs::Image::into_queue_on`) made on it signal it, and the kernel holds it for each of them, so it may be dropped first and is never signalled once freed; `wait_for`/`poll` (one task at a time: a second, or a receive waiting on a mailbox made on it, refused), `signal` from anywhere. A handle of the `events` crate's table, looked up on every call. The image uses `events::SharedEvent` itself, an `Arc` ([docs/ipc.md](ipc.md#one-event-to-wait-on)) |
 | `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (made on first use; racing makers get the same one) |
@@ -251,10 +254,10 @@ able to say why.
 
 ## Writing a driver
 
-The traits' own comments (`block/src/table.rs`, `net/src/device.rs`,
-`random/src/lib.rs`) are the contract, and the smallest real driver of
-each kind is the example: `drivers/virtio_blk` (block; `drivers/nvme` for
-the asynchronous path), `drivers/r8168` (a NIC), `drivers/virtio_rng` (an
+The traits' own comments (`layers/block/src/table.rs`, `layers/net/src/device.rs`,
+`base/random/src/lib.rs`) are the contract, and the smallest real driver of
+each kind is the example: `drivers/block/virtio_blk` (block; `drivers/block/nvme` for
+the asynchronous path), `drivers/net/r8168` (a NIC), `drivers/rng/virtio_rng` (an
 entropy source).
 
 **The device lives for good.** It is `Box::leak`ed, so it is `&'static`:

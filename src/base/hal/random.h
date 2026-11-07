@@ -7,7 +7,7 @@
 // arch/x86_64/hal_random.cpp and arch/arm64/hal_random.cpp.
 //
 // This is a source of entropy, not the kernel's generator: everything reads
-// randomness from the pool (src/crates/random), which mixes this with the other
+// randomness from the pool (src/crates/base/random), which mixes this with the other
 // sources and reaches it through rust_ffi.cpp. A CPU instruction is the only
 // source the bare-metal machines this kernel boots on all share, which is why
 // it gets a HAL seam of its own.

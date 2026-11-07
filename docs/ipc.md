@@ -5,8 +5,8 @@ kernel's export table ([Loadable modules](modules.md)). The channel is where
 services meet anyway: **mailboxes** with addresses, **names** for them in a
 namespace public to the host, **messages** between them, **monitors** that
 say when a peer is gone and **watches** that say when a name comes and goes.
-The image's tasks reach it through the `ipc` crate (`src/crates/ipc`), a
-module through `kcore::ipc` over the C ABI (`ffi/src/ipc.rs`). It is the
+The image's tasks reach it through the `ipc` crate (`src/crates/layers/ipc`), a
+module through `kcore::ipc` over the C ABI (`base/ffi/src/ipc.rs`). It is the
 first step of [plans/ipc.md](../plans/ipc.md): this host only, for now; the
 module that carries messages between hosts, `ipcnet`, comes next.
 
@@ -262,7 +262,7 @@ fail the gate.
 
 ## Between hosts: the wire
 
-`ipcwire` (`src/crates/ipcwire`, no kernel and no `unsafe`) is what ipcnet
+`ipcwire` (`src/crates/common/ipc/ipcwire`, no kernel and no `unsafe`) is what ipcnet
 says to another host inside their TLS session (plans/ipc.md, I4): frames of
 an 8-byte head -- kind, flags, two bytes kept at zero, a length -- and at
 most 16 KiB, a TLS record's worth. `Hello` first, both ways (the version,
@@ -283,7 +283,7 @@ its buffer by exactly the frame. Its gate is `ipc-fuzz.py --target wire`.
 
 ## Between hosts: ipcnet
 
-`ipcnet.ko` (`src/crates/modules/ipcnet`, docs/modules.md has its commands)
+`ipcnet.ko` (`src/crates/modules/cluster/ipcnet`, docs/modules.md has its commands)
 is the router: what carries the channel's messages to the cluster's other
 hosts and back.
 

@@ -1,4 +1,4 @@
-//! Where guests are put on the host's cores (`hv/src/place.rs`), held to
+//! Where guests are put on the host's cores (`hypervisor/hv/src/place.rs`), held to
 //! what it promises, by a reckoning of the fuzzer's own: under `Cores::Own`
 //! no core with CPUs of two guests on it -- vCPUs or the task that serves a
 //! guest's disks -- a guest's vCPUs filling the threads of its cores before

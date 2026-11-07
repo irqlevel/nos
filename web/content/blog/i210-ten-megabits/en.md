@@ -9,7 +9,7 @@ tags: [hardware, networking, drivers, debugging, performance, rust]
 
 The AX41 is the second Hetzner server nos runs on. It has an AMD Ryzen 5 3600, no serial port, no IPMI, and a single network card, an Intel I210 (`8086:1533`). So the driver we were bringing up was also the only channel the machine could report through ([Real hardware](/docs/real-hardware#hetzner-ax41-1-ltd-dedicated-server)).
 
-We developed `drivers/igb` on QEMU's emulated 82576 on purpose ([f773b8a](https://github.com/irqlevel/nos/commit/f773b8a)). The two chips share a register map that Intel publishes. As the commit puts it, "the driver that can be debugged under gdb with a packet capture is the same one that will have to come up on hardware whose only console is the NIC it is bringing up".
+We developed `drivers/net/igb` on QEMU's emulated 82576 on purpose ([f773b8a](https://github.com/irqlevel/nos/commit/f773b8a)). The two chips share a register map that Intel publishes. As the commit puts it, "the driver that can be debugged under gdb with a packet capture is the same one that will have to come up on hardware whose only console is the NIC it is bringing up".
 
 QEMU caught the first problem. Nothing on the MAC side starts auto-negotiation: the driver has to request it through the PHY. Until negotiation completes, the receiver drops every frame, and the only sign is a single trace event:
 
@@ -144,4 +144,4 @@ Here is where things stand now ([8b64625](https://github.com/irqlevel/nos/commit
 
 QEMU's 82576 is still the only place the igb driver runs outside a Hetzner rack. So its gate, the tests a change to the driver has to pass, is `tcp-test.py --nic igb` and `netload-test.py --nic igb`, run by hand because CI's QEMU lacks the device ([Tests and gates](/docs/testing#the-hardware-nic-drivers)). None of the bugs above would have shown up there. The emulated MAC latches the right speed, `ASDV` reads zero, no firmware shares the MDIO bus, and receive works even with the prefetch thresholds at zero. The model also has its interrupt mask only at the old e1000 offsets, so the link-change vector has never fired under QEMU ([7868565](https://github.com/irqlevel/nos/commit/7868565)).
 
-What made the real chip debuggable was a dump that prints the PHY's view next to the MAC's, and the chip's counters next to the driver's ([source](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/igb/src/lib.rs)). We read it on a machine whose only console was the very NIC we were debugging.
+What made the real chip debuggable was a dump that prints the PHY's view next to the MAC's, and the chip's counters next to the driver's ([source](https://github.com/irqlevel/nos/blob/master/src/crates/drivers/net/igb/src/lib.rs)). We read it on a machine whose only console was the very NIC we were debugging.

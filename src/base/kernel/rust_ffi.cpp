@@ -1696,7 +1696,7 @@ void kernel_msix_unregister_handler(unsigned long handle)
 
 /* ---- The CPU's random instruction ---- */
 
-/* hal/random.h for the pool, which is Rust (src/crates/random): which
+/* hal/random.h for the pool, which is Rust (src/crates/base/random): which
    instruction the CPU has, and one draw from it. Values in and values out,
    and safe at any time: a draw reads only the flags probe_hw_random sets, so on
    a CPU with no instruction, or before the probe, it fails rather than
@@ -1746,7 +1746,7 @@ HwRandomDraw kernel_hw_random_seed()
 /* ---- Net device bridge ---- */
 
 /* The net devices, the frames and the queues between them are Rust
-   (src/crates/net/src/device.rs and frame.rs), and so is the C ABI a driver
+   (src/crates/layers/net/src/device.rs and frame.rs), and so is the C ABI a driver
    registers through: the kernel_netdev_* and kernel_netframe_* names are
    defined there now. Nothing of them is left here. */
 
@@ -2371,7 +2371,7 @@ int kernel_root_fstest()
 }
 
 /* Net devices from Rust, both sides of them -- the driver's and the
-   consumer's -- are defined in src/crates/net/src/device.rs, alongside the
+   consumer's -- are defined in src/crates/layers/net/src/device.rs, alongside the
    devices themselves. Nothing of them is left here. */
 
 /* ---- the tracepoints (kernel/tracepoint.h), for Rust's sites: kcore::trace ---- */

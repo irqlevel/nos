@@ -46,7 +46,7 @@ MNT=/mnt/nosroot
 IMG_URL=https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img
 IMG_SHA=04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
 # Where nos's hv puts a guest of four CPUs on this machine with nothing else
-# running (hv/src/place.rs: whole cores, the faster kind, the highest first,
+# running (hypervisor/hv/src/place.rs: whole cores, the faster kind, the highest first,
 # its disks' task on a slow core of its own) -- on the EX44 its vCPUs 0-3 on
 # the CPUs of APIC IDs 41,40 (one P-core) and 33,32 (another), the disks on
 # 62 (an E-core). KVM's threads are pinned to the same CPUs.

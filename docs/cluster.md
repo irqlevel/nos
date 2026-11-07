@@ -1,10 +1,10 @@
 # The cluster's registry
 
-`cluster.ko` (`src/crates/modules/cluster`) keeps one list of a nos
+`cluster.ko` (`src/crates/modules/cluster/cluster`) keeps one list of a nos
 cluster's hosts -- their names, keys and addresses -- on every host of it,
 through Raft, so that a host is let in once and every other host learns of
 it, instead of `hosts.toml` written by hand on each ([plans/cluster.md](../plans/cluster.md),
-C1). The list is `registry::State` (`src/crates/registry`, no kernel in it),
+C1). The list is `registry::State` (`src/crates/common/cluster/registry`, no kernel in it),
 the state machine of the raft crate's `rsm` ([raft.md](raft.md)); the
 messages go over the message channel between hosts, ipcnet
 ([ipc.md](ipc.md)), and ipcnet is told the peers the list gives it.

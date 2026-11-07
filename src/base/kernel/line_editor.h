@@ -22,7 +22,7 @@ namespace kernel
    character off what is searched for, Enter runs what was found, ^G puts the
    line from before the search back, and any other key keeps what was found,
    to be edited, and is then the key it is. The SSH session's editor
-   (src/crates/ssh/src/terminal.rs) does the same on a terminal that knows ANSI.
+   (src/crates/common/net/ssh/src/terminal.rs) does the same on a terminal that knows ANSI.
 
    Not thread-safe: one task types at it. */
 class LineEditor final

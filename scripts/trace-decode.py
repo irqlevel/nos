@@ -199,7 +199,7 @@ def summarize(recs, start):
 
 # ---- the hypervisor's records (group hv) ----
 
-# A PC's ports, as hv's guest has them (hv/src/run.rs, hv/src/devices):
+# A PC's ports, as hv's guest has them (hypervisor/hv/src/run.rs, hypervisor/hv/src/devices):
 # (first, last, name).
 PORTS = [
     (0x20, 0x21, "pic"), (0xA0, 0xA1, "pic"), (0x40, 0x43, "pit"), (0x61, 0x61, "port61"),

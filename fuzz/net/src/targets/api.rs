@@ -34,7 +34,7 @@
 //! port in TIME-WAIT; and once every client has gone and the module is
 //! unloaded, the machine holding nothing.
 
-#[path = "../../../../src/crates/modules/api/src/lib.rs"]
+#[path = "../../../../src/crates/modules/mgmt/api/src/lib.rs"]
 #[allow(unused_attributes, dead_code, clippy::all)]
 mod api;
 
@@ -114,8 +114,8 @@ fn descriptor_of(name: &str) -> Option<&'static str> {
         "fuzzp" => Some(FUZZP_DESCRIPTOR),
         "vm" => Some(FVM_DESCRIPTOR),
         "system" => Some(include_str!("../../../../src/crates/kernel/src/system.descriptor.json")),
-        "net" => Some(include_str!("../../../../src/crates/net/src/net.descriptor.json")),
-        "api" => Some(include_str!("../../../../src/crates/modules/api/src/api.descriptor.json")),
+        "net" => Some(include_str!("../../../../src/crates/layers/net/src/net.descriptor.json")),
+        "api" => Some(include_str!("../../../../src/crates/modules/mgmt/api/src/api.descriptor.json")),
         _ => None,
     }
 }

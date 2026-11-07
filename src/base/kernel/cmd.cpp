@@ -30,14 +30,14 @@
 #include <lib/unique_ptr.h>
 #include <lib/grub_env.h>
 
-/* The network layer is Rust (src/crates/net); its commands register
+/* The network layer is Rust (src/crates/layers/net); its commands register
    themselves. These two are boot's, run by the shell's own task. */
 extern "C" {
 void rust_net_dhcp_auto(void* printer);
 void rust_net_dhcp_stop();
 }
 
-/* The filesystem layer is Rust (src/crates/fs). These are the calls the shell
+/* The filesystem layer is Rust (src/crates/layers/fs). These are the calls the shell
    makes on it -- a script to read and rewrite, a file to checksum, a download
    to write -- taking paths as bytes and a length rather than a C string.
 

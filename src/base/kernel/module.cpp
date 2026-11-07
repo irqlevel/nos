@@ -23,12 +23,12 @@
 #endif
 
 
-/* The filesystem layer is Rust (src/crates/fs): a module's file is read whole,
+/* The filesystem layer is Rust (src/crates/layers/fs): a module's file is read whole,
    through the same calls a module itself reads a file by. */
 extern "C" {
 long kernel_file_size(const char* path, ulong len);
 long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
-/* The message channel is Rust too (src/crates/ipc): after a module's exit,
+/* The message channel is Rust too (src/crates/layers/ipc): after a module's exit,
    the mailboxes it left open are closed -- each said, as the module's bug --
    and every monitor of them told */
 void rust_ipc_module_gone(const char* name, ulong len);
@@ -100,7 +100,7 @@ namespace
 
 const ulong TAG = 'Kmod';
 
-/* kmod::ModuleInfo (src/crates/kmod/src/lib.rs): the header the module! macro
+/* kmod::ModuleInfo (src/crates/base/kmod/src/lib.rs): the header the module! macro
    puts in every module and exports as nos_module_info. Version 2: the init
    is handed the module's parameters, and insmod's output to say why it
    refuses them. */

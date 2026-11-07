@@ -1,5 +1,5 @@
 //! The disk image converter on the host, from its own sources
-//! (src/crates/diskimage), as `hv convert` runs it (scripts/diskimage-test.py
+//! (src/crates/common/storage/diskimage), as `hv convert` runs it (scripts/diskimage-test.py
 //! drives this):
 //!
 //!     diskimage-test convert <image> <disk.raw>

@@ -1,6 +1,6 @@
 # Raft
 
-`src/crates/raft` is Raft, the consensus protocol, as a crate of its own: a
+`src/crates/common/cluster/raft` is Raft, the consensus protocol, as a crate of its own: a
 group of members that agree on one log, so that every member applies the same
 entries in the same order and none applied is lost while a majority of them
 lives. It is what the cluster's registry and NBS's metadata service are to
@@ -269,6 +269,6 @@ moves the session on, after which the first's answer is `Stale`.
 ## Next
 
 The crate's users: the cluster's registry ([plans/cluster.md](../plans/cluster.md),
-C1 and C2) -- its state machine is `src/crates/registry`, a `StateMachine`
+C1 and C2) -- its state machine is `src/crates/common/cluster/registry`, a `StateMachine`
 of its own, held by fuzz/raft's `registry` target -- then NBS's metadata
 service ([plans/nbs.md](../plans/nbs.md)).

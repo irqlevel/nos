@@ -95,7 +95,7 @@ hv/                  everything else: the machine (machine.rs), guest memory
                      VMCB as this hypervisor fills it in and the exits it
                      comes back with (svm.rs), the VM (vm.rs), and the
                      built-in guests (guests.rs).
-modules/hv/          the module: the shell command, the task a guest's CPU
+modules/hypervisor/hv/          the module: the shell command, the task a guest's CPU
                      runs on, and the lifetime of it all.
 ```
 
@@ -702,7 +702,7 @@ back.
 ### The nested page table
 
 AMD's nested table has the host's own long-mode format, four levels of 512
-entries (`hv/src/npt.rs`), with one difference that bites: a nested walk is
+entries (`hypervisor/hv/src/npt.rs`), with one difference that bites: a nested walk is
 a user-mode access at every level, so every entry has U/S set or the guest
 faults on memory it was given. It is built from the host's side only and
 walked by software only through its own indices -- an arena of tables, each
@@ -715,7 +715,7 @@ refused rather than moved.
 
 ### What entering a guest cannot be told to do
 
-The VMCB is laid out in `hvarch/src/x86/svm/vmcb.rs` field by field from
+The VMCB is laid out in `hypervisor/hvarch/src/x86/svm/vmcb.rs` field by field from
 appendix B of the AMD manual, and every field anything touches has its
 offset checked against the manual at compile time.
 
@@ -746,7 +746,7 @@ on on every entry, whatever the VMCB says:
   guest's triple fault, as the exit has it -- and the host never hears of
   it. What the guest believes CR4 holds is the policy's to keep: `hv`
   intercepts its reads of CR4 as well, and answers them, and performs its
-  writes, from the CR4 the guest wrote (`hv/src/cr.rs`, `crate::cr`) -- the
+  writes, from the CR4 the guest wrote (`hypervisor/hv/src/cr.rs`, `crate::cr`) -- the
   instruction fetched by the guest's paging and decoded, as an MMIO
   access's is, since a CPU without decode assists (QEMU's, a nested
   hypervisor's) does not name the register. A write of a bit the guest's
@@ -779,7 +779,7 @@ on on every entry, whatever the VMCB says:
   there, and a breakpoint it set would be moved by the next guest's write,
   or left behind when its vCPU moved to another CPU. Each `Guest` keeps its
   own four, from which the policy answers the guest's `mov`s and into which
-  it performs them (`hv/src/dr.rs`, `crate::dr`, the instruction decoded as
+  it performs them (`hypervisor/hv/src/dr.rs`, `crate::dr`, the instruction decoded as
   CR4's is); its own DR7, which `vmrun` loads, arms them. A record per CPU
   of what its four hold (`LoadedDebugAddrs`) has an entry write only the
   ones that differ -- nothing else in the kernel writes them, the guest
@@ -826,9 +826,9 @@ The TLB tags every translation a guest makes with the ASID it ran under and
 keeps it until something flushes it. Every entry flushed the whole TLB at
 first, because every guest ran under ASID 1: always right, and every exit
 cost the guest its translations and the host its own. Now each CPU hands its
-ASIDs out itself, the way KVM does -- `Asids` in `hvarch/src/x86/svm.rs`,
+ASIDs out itself, the way KVM does -- `Asids` in `hypervisor/hvarch/src/x86/svm.rs`,
 the CPU's own, in the one `CpuLocal` both `Guest::run`s take once an entry
-with interrupts off (`Entries` in `hvarch/src/x86.rs`, beside the CPU's
+with interrupts off (`Entries` in `hypervisor/hvarch/src/x86.rs`, beside the CPU's
 debug addresses and its speculation state):
 
 - each ASID is handed out at most once a **generation**, and a generation
@@ -846,7 +846,7 @@ debug addresses and its speculation state):
 
 What lets a guest keep its translations at all is that its nested table only
 grows: an entry is written once, where there was none, and stays until the
-table goes (`hv/src/npt.rs`), so a translation the TLB still holds is one
+table goes (`hypervisor/hv/src/npt.rs`), so a translation the TLB still holds is one
 the table would still make. Every table has an id no other table has, and an
 entry that took a mapping away or narrowed it would give the table a new one
 -- moving its guest onto a fresh ASID, clear of the old translation. None
@@ -925,7 +925,7 @@ is needed. When `vmrun` refuses anyway, the report dumps the guest's state.
 ## The built-in guests
 
 Each is a handful of instructions, assembled once -- with NASM, or with
-clang for `mmio` and `ioapic` -- and kept in `hv/src/guests.rs` as bytes
+clang for `mmio` and `ioapic` -- and kept in `hypervisor/hv/src/guests.rs` as bytes
 beside the source they came from, run in a VM of its own and checked
 against what it was told to do. All start in long mode
 at CPL 0 with paging on, 1 MiB of memory with a GDT, a TSS and a page table
@@ -1055,7 +1055,7 @@ And while a guest runs:
   
   The guest's own XSETBV always exits -- AMD-V's intercept, which `hvarch`
   sets on every entry; VT-x's, unconditional -- and the run loop performs it
-  as a CPU does (`hv/src/cr.rs`, `xsetbv`): a #UD without CR4.OSXSAVE, a #GP
+  as a CPU does (`hypervisor/hv/src/cr.rs`, `xsetbv`): a #UD without CR4.OSXSAVE, a #GP
   above CPL 0, for any register but XCR0, and for a value XCR0 does not
   take -- the x87 left out, AVX without SSE, anything not offered.
   `GuestFp::set_xcr0` holds a value to the same rules before it is ever
@@ -1346,7 +1346,7 @@ The first build with them took three `CpuLocal`s an entry -- the CPU's
 debug registers, the last guest it entered, its mitigations -- and its
 checks were 418 ns, each `with` being calls into the kernel to turn
 interrupts off and on and to ask which CPU this is. They are one now
-(`Entries` in `hvarch/src/x86.rs`), which the entry takes once as what
+(`Entries` in `hypervisor/hvarch/src/x86.rs`), which the entry takes once as what
 holds it on its CPU, as AMD-V's did with its ASIDs alone.
 
 `mmio` has the guest make MMIO loads instead -- `mov eax, [rdi]` from a
@@ -1609,7 +1609,7 @@ hv: vm 1 not started -- /disk.img: vm 0's disk writes it
 ```
 
 -- and the claim goes with the disk, when its VM stops. It holds among the
-VMs only: nos's own shell is not held to it (`modules/hv/src/disk.rs`).
+VMs only: nos's own shell is not held to it (`modules/hypervisor/hv/src/disk.rs`).
 
 **Legacy virtio over PCI, reached by port I/O** -- so still no instruction
 decoded anywhere. PCI's configuration space is the PC's mechanism #1, an
@@ -1700,7 +1700,7 @@ serves them on a task of its own, on a CPU other than the vCPU's: each
 request started the moment the task finds it, a read or a write of blocks
 its image has with the device asynchronously and a flush, a discard or a
 write of zeros served then and there, once the image's I/O in flight is
-done (`modules/hv/src/disk.rs`; the image's queue, [A disk's
+done (`modules/hypervisor/hv/src/disk.rs`; the image's queue, [A disk's
 image](filesystems.md#a-disks-image)). So the disk has every request the
 guest has out, as under KVM, and each comes back when it is done rather
 than with the slowest of a lot -- where the lot was the guest's unit, it
@@ -1797,7 +1797,7 @@ legacy virtio-pci, virtio-blk and ext4.
 A cloud image comes as QEMU's qcow2 -- Ubuntu's
 `ubuntu-24.04-server-cloudimg-amd64.img`, Debian's `genericcloud`,
 Fedora's -- and a guest's disk here is a raw file. `hv convert <image>
-<disk>` makes the one the other (`modules/hv/src/image.rs`, over the
+<disk>` makes the one the other (`modules/hypervisor/hv/src/image.rs`, over the
 `diskimage` crate, which has no kernel in it):
 
 ```
@@ -1821,7 +1821,7 @@ header, wherever the disk ends.
 clusters stored whole, compressed by zlib -- 27,971 of the 28,663 that
 Ubuntu's image has data in -- all zeros, or not there; and extended L2 entries, their
 subclusters each of those. A compressed cluster is inflated by a DEFLATE
-decoder of the crate's own (`diskimage/src/inflate.rs`) whose every rule is
+decoder of the crate's own (`common/storage/diskimage/src/inflate.rs`) whose every rule is
 zlib's, checked in zlib's order -- what it needs of a stream's bits before it
 calls a code bad included: QEMU reads those clusters through zlib, so a
 cluster QEMU reads must give its bytes here and one QEMU refuses must be
@@ -1856,9 +1856,9 @@ architectures, and holds the disk to its SHA-256 ([Testing](testing.md)).
 `disk=` takes a partition or a whole disk of nos's as well as a file. The
 guest's virtio disk is then the device itself: its requests go to the block
 layer's queue for that device (`kcore::block::DiskQueue`, over
-`block/src/devq.rs`) and nothing else -- no file and no filesystem on the
+`layers/block/src/devq.rs`) and nothing else -- no file and no filesystem on the
 way, so no extent map looked up, no chunk grown ahead of a write, no ext4
-commit, no lock of the VFS's (`modules/hv/src/devices.rs`, `disk.rs`).
+commit, no lock of the VFS's (`modules/hypervisor/hv/src/devices.rs`, `disk.rs`).
 
 **A device is named by what finds it again at the next boot.** Linux and nos
 alike number the EX44's two NVMe drives differently from one boot to the
@@ -1957,7 +1957,7 @@ guest but does not let a second VM read it: a device is one VM's at a time.
 **The queue.** `DiskQueue` has the calls `fs::image`'s queue has -- buffers
 lent between requests, a request started on one, reaped, waited for -- so
 a device disk and a file disk share the disk task's loop
-(`modules/hv/src/disk.rs`, its `Media` trait), and the module has no
+(`modules/hypervisor/hv/src/disk.rs`, its `Media` trait), and the module has no
 `unsafe` of its own for either. A request longer than the device takes at
 once is split into the commands it can take and given back when the last
 is done; a device busy with nos's own I/O is waited for as an image waits
@@ -2167,7 +2167,7 @@ driver that takes none, a send whole to one that takes none, the switch not
 told what a driver takes, a partial checksum or a whole send handed to
 every port -- each failed within 17 inputs.
 
-**nos's end is a virtual NIC, `hv0`, in its own stack** (`net/src/vnic.rs`).
+**nos's end is a virtual NIC, `hv0`, in its own stack** (`layers/net/src/vnic.rs`).
 A module cannot register a NIC -- there is no C name for a driver to be bound
 by -- so the device is registered from inside the image, the first time a
 module asks for it by name, and stays; the module trades frames with it
@@ -2177,7 +2177,7 @@ module hands in arrives as if received, on the next receive pass. A detach
 waits out any call of the sink still running, so the module can go after --
 the UDP listeners' way.
 
-**The switch is the module's** (`modules/hv/src/net.rs`). A guest's NIC is a
+**The switch is the module's** (`modules/hypervisor/hv/src/net.rs`). A guest's NIC is a
 port, and a port's number is its address and its MAC (02:00:00:00:64:NN), so
 frames go by their destination MAC with nothing learned: to a port, to `hv0`,
 or to everyone for a broadcast or a MAC no port has. A port's inbox holds
@@ -2361,7 +2361,7 @@ nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15); 4 of 4096 mappings, port
 out 53  back 744  mapped 4  taken from the most 0  no room 0  no next hop 0  no frame 0  refused 0  denied 0
 ```
 
-**NAT is the network layer's** (`net/src/nat.rs`), not the module's: it is
+**NAT is the network layer's** (`layers/net/src/nat.rs`), not the module's: it is
 forwarding between two of the stack's devices, and it has to look at every
 packet either of them receives before the protocols do. While the switch
 exists it holds NAT on (`kcore::net::Nat`, a guard: dropped with the switch,
@@ -2432,7 +2432,7 @@ the gateway and an on-link DNS server are asked for when NAT goes on, so a
 guest's first packet does not find them missing (`no next hop` counts those
 that did). A request goes out at most every 100 ms whatever a guest floods.
 
-**The switch answers DHCP** (`modules/hv/src/dhcp.rs`). A guest's DHCP
+**The switch answers DHCP** (`modules/hypervisor/hv/src/dhcp.rs`). A guest's DHCP
 message never leaves its port: the switch answers it in place with the
 port's address -- the same as `ip=` gives -- a day's lease, the /24 mask, nos
 as the router, and nos's DNS server. Nothing is remembered, because there is
@@ -2494,7 +2494,7 @@ hv: vm 0 stopped -- on request -- nothing in it listens to its power button
 (From the gate's run under TCG, where the guest is at its shell a second
 after it starts.)
 
-**A VM is a task and a shared record** (`modules/hv/src/vms.rs`). The guest
+**A VM is a task and a shared record** (`modules/hypervisor/hv/src/vms.rs`). The guest
 -- its memory, its vCPU, its devices -- belongs to the vCPU task (`hv/vm<N>`)
 alone, and is freed there when the guest stops. What the task and the
 commands share is the console, its last 64 KiB in a ring; the bytes waiting to
@@ -2599,7 +2599,7 @@ guests on the AX41's twelve CPUs -- four of them carrying two -- keep the
 machine 1.6% busy, 0.1% a vCPU.
 
 **A halt that ends soon is spun through** (halt polling, KVM's way: the
-`POLL_*` constants in `hv/src/run.rs`). Before its task sleeps, a halted
+`POLL_*` constants in `hypervisor/hv/src/run.rs`). Before its task sleeps, a halted
 vCPU spins on its doorbell for a while (`Doorbell::poll`) -- on a host CPU
 that is its guest's own -- so that a ring that comes within the spin, an IPI
 from another of the guest's CPUs or a disk's answer, costs no wakeup and no
@@ -2727,7 +2727,7 @@ the guest computing for 10 ms (7ae441c4, whose `worst` line said: "10009
 us past its edge, after an interrupt of the host's took the guest out: the
 guest entered 0 us from the edge, the host's timer asked for 0 us from it").
 hv-fuzz's platform target runs hvarch's `Kick` as it is
-(`hvarch/src/x86/kick.rs`, kept apart from the backends for that), has the
+(`hypervisor/hvarch/src/x86/kick.rs`, kept apart from the backends for that), has the
 host's tick land on the way in, re-arming its timer so, and the clock reach
 the deadline `timer_at` is asked for now and then as it is asked, and holds
 every entry to a timer armed no later than the edge its loop asked for: the
@@ -2764,7 +2764,7 @@ start` says them all again. A VM kept in a folder is not. Its folder under
 `/vms` -- or wherever `insmod` was told to keep them ([below](#where-the-folders-are))
 -- holds what to boot it with -- `vm.toml` -- and beside it whatever the
 file names: its kernel, its initrd, its disks; and its console's log. `hv
-start <name>` boots it as the file says (`modules/hv/src/store.rs`), and
+start <name>` boots it as the file says (`modules/hypervisor/hv/src/store.rs`), and
 every command that reaches a VM takes the name as well as the number:
 
 ```
@@ -2797,7 +2797,7 @@ folders under `/vms`, what each boots, and which run.
 ### A VM of a cloud's image
 
 `hv create <name> <url>` makes the folder of a distribution's cloud image
-(`modules/hv/src/cloud.rs`), for `hv start <name>` to boot it as a cloud
+(`modules/hypervisor/hv/src/cloud.rs`), for `hv start <name>` to boot it as a cloud
 does -- with nothing done anywhere but on nos:
 
 ```
@@ -2873,7 +2873,7 @@ seed's password, nos's key in its authorized_keys.
 
 ### Cloned, deleted, changed
 
-`hv clone <from> <to> [port=N]` (`modules/hv/src/clone.rs`) copies a VM's
+`hv clone <from> <to> [port=N]` (`modules/hypervisor/hv/src/clone.rs`) copies a VM's
 folder into a new one: a VM of the same machine, its disks as they are now,
 that boots as a machine of its own.
 
@@ -2938,7 +2938,7 @@ it out -- and so do the host API's edits ([below](#on-the-management-bus)).
 
 ### On the management bus
 
-The `vm` provider (`modules/hv/src/provider.rs`, x86-64) is the VMs as the
+The `vm` provider (`modules/hypervisor/hv/src/provider.rs`, x86-64) is the VMs as the
 host API ([The host API](api.md)), the management panel and `mgmt` reach
 them -- each by its folder's name -- through the same functions the
 commands are:
@@ -2994,7 +2994,7 @@ VM's name of up to 32 and the longest file hv writes there,
 parameter, and refuses one. How a module is handed its parameters is in
 [Loadable modules](modules.md#parameters).
 
-**The file** is a strict subset of TOML (`modules/hv/src/config.rs`): a
+**The file** is a strict subset of TOML (`modules/hypervisor/hv/src/config.rs`): a
 `key = value` a line, `#` to the end of a line a comment, and for a value a
 string -- `"basic"`, with TOML's escapes, or `'literal'` -- a whole number,
 `true` or `false`, or a list of strings in brackets, over as many lines as it
@@ -3045,7 +3045,7 @@ disks are claimed as any guest's are (`disk::Claims`), so no other guest
 writes them meanwhile. A number is a VM's number before it is a name: a VM
 named by digits alone is found by its name only where no VM has that number.
 
-**`console.log`** (`modules/hv/src/vmlog.rs`) is the guest's console as it
+**`console.log`** (`modules/hypervisor/hv/src/vmlog.rs`) is the guest's console as it
 wrote it, control sequences and all, appended a second at a time by a task
 of the VM's own (`hv/vm<N>/log`) from the console's ring -- never by the
 guest's CPUs, whose exits would otherwise wait on the disk. Between the
@@ -3058,7 +3058,7 @@ than 64 KiB in a second, is lost to the log, and the log says how much. Past
 
 What it reaches the folder with is three calls of the file ABI made for it:
 `kcore::fs::list`, `append` and `rename` (`kernel_dir_entry`,
-`kernel_file_append`, `kernel_file_rename` in `fs/src/files.rs`), and
+`kernel_file_append`, `kernel_file_rename` in `layers/fs/src/files.rs`), and
 `remove`, which was there already.
 
 **What it does not do yet:** read the file again at `hv restart`, which
@@ -3538,7 +3538,7 @@ class made from its input, the start info to what the guest was given --
 its magic, its one module, a memory map of RAM up to the guest's last byte
 in order -- and the entry to paging off. hv's unsafe count is still 4.
 
-**hvboot** (`src/crates/hvboot`, built by `make` and kept as `/lib/hvboot`
+**hvboot** (`src/crates/hypervisor/hvboot`, built by `make` and kept as `/lib/hvboot`
 in the system image) is a PVH ELF of 164 KiB, linked at 1 MiB, that runs in
 the guest. It reads:
 
@@ -3557,7 +3557,7 @@ the guest. It reads:
   descriptors, flex_bg, htree directories read as the linear ones they
   also are, inline data, symlinks, holes; an incompatible feature it does
   not read is refused by name, and the journal is not replayed, as GRUB
-  does not replay it (`ext.rs`, over the format crate `src/crates/extfmt`,
+  does not replay it (`ext.rs`, over the format crate `src/crates/common/storage/extfmt`,
   which the kernel's ext4 driver reads through too);
 - the first `/boot/grub/grub.cfg` or `/grub/grub.cfg` (or grub2's) on
   them, and grubenv beside it: the menu, submenus too, each entry's `linux`,
@@ -3643,7 +3643,7 @@ the task waits on the disk, and a fast core is a guest's; it then holds that
 core as well -- then beside a vCPU of its own. A guest
 that would need a core another has -- `cpu=` on one, or more CPUs than the
 free cores have threads -- is refused, saying so. The place and the hold on
-it are taken under one lock (`modules/hv/src/cores.rs`), so two guests
+it are taken under one lock (`modules/hypervisor/hv/src/cores.rs`), so two guests
 started at once from two shells cannot both be given a core; an `hv start`
 guest holds its cores until `hv stop` -- parked too, for the restart that
 runs it there again -- and an `hv boot` guest until its run is over. `hv
@@ -4833,7 +4833,7 @@ someone else's; then speed.
 5. ~~**CR4.MCE is the guest's.**~~ Done -- under AMD-V: `hvarch`'s
    `Guest::run` sets MCE in the CR4 the guest runs with and intercepts
    every write of CR4, whatever the policy asks; `hv` intercepts the reads
-   too, keeps the CR4 the guest wrote and answers from it (`hv/src/cr.rs`:
+   too, keeps the CR4 the guest wrote and answers from it (`hypervisor/hv/src/cr.rs`:
    the instruction fetched and decoded, `insn::decode_mov_cr`, since QEMU's
    and a nested hypervisor's CPUs give no decode assists), refuses with #GP
    a bit the guest's CPUID does not offer -- PKE where its PKRU is not
@@ -4931,7 +4931,7 @@ someone else's; then speed.
    does. What it was: the VT-x I/O exit's `next_rip` is
    `rip + length` with no wrap, where everything else wraps: an `in` at the
    top of the address space is a host panic in a `RUSTUB=1` build. The
-   fuzzer does not compile `hv/src/vmx.rs`, which is why it went unseen.
+   fuzzer does not compile `hypervisor/hv/src/vmx.rs`, which is why it went unseen.
 
 #### Before other people's guests
 
@@ -4992,7 +4992,7 @@ someone else's; then speed.
    not reach: the sibling's guest reads the cache meanwhile, and only a
    guest's whole cores with the host's work kept off them would.
 2. ~~**The CPUID and MSR policy is a block-list, and it swallows.**~~ Done:
-   both are allow-lists (`hv/src/policy.rs`, [A Linux
+   both are allow-lists (`hypervisor/hv/src/policy.rs`, [A Linux
    guest](#a-linux-guest)). A leaf the policy does not name is all zeros,
    as is every leaf past the tops it reports, 0x16 and 0x8000_0021; of
    leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths,
@@ -5040,7 +5040,7 @@ someone else's; then speed.
    offered while the EFER bit that turns it on was refused -- which Linux
    does not notice, and ran with neither AutoIBRS nor retpolines.
 3. ~~**The guests reach the host's own TCP services.**~~ Done: a TCP
-   listener and a connection belong to their device (`net/src/tcp.rs`, a
+   listener and a connection belong to their device (`layers/net/src/tcp.rs`, a
    slot's `device`) -- a listener takes a SYN only from the device it was
    opened on, as `kcore::tcp::TcpListener` always said it did, and a
    connection a segment or an ICMP error only from its own -- so sshd and
@@ -5128,7 +5128,7 @@ someone else's; then speed.
    fired the first's breakpoint; hv-fuzz's platform target holds every
    `mov` of them -- a read, a write, at CPL 3, under general detect -- to a
    model of its own, and
-   seven mutants of `hv/src/dr.rs` each failed within 145 inputs. What it
+   seven mutants of `hypervisor/hv/src/dr.rs` each failed within 145 inputs. What it
    was: DR0-3 switched by neither backend, one guest's breakpoint addresses
    the next's to read and to move. Under VT-x every `mov` of a debug
    register exits and `crate::dr` answers it -- DR0-3 from the guest's own
@@ -5156,7 +5156,7 @@ someone else's; then speed.
    external-interrupt or NMI exit gone missing would have gone unnoticed.
 9. ~~**A guest's console is the host's log.**~~ Done: a guest's console
    goes to the kernel log a boot's worth at once -- a thousand lines --
-   and fifty lines a second after that, per VM (`modules/hv/src/guest.rs`,
+   and fifty lines a second after that, per VM (`modules/hypervisor/hv/src/guest.rs`,
    `LogLine::admit`); what is left out is counted, and said once a second
    at most, before the next line logged, and when the boot ends -- a notice
    for every line logged after a gap would have doubled the rate -- and the
@@ -5335,7 +5335,7 @@ someone else's; then speed.
 - `hv-linux-test.py` and `hv-distro-test.py` are run by hand; a pinned
   tinyconfig bzImage and a BusyBox cpio, built once and cached, would put
   the first in CI.
-- `fuzz/hv` compiles neither `hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
+- `fuzz/hv` compiles neither `hypervisor/hv/src/{svm,vmx,vm,machine,npt,ept}.rs` nor
   any of `hvarch` but the VMCB's layout, nor the module's `vms`, `guest`,
   `disk` and `forward`, and puts its own `memory.rs` in the real one's
   place. Three targets would have caught this review's bugs: the exit

@@ -6,7 +6,7 @@ needs a replicated state later.
 
 ## What it is
 
-- `src/crates/raft`: `#![no_std]` with `alloc`, `#![forbid(unsafe_code)]`,
+- `src/crates/common/cluster/raft`: `#![no_std]` with `alloc`, `#![forbid(unsafe_code)]`,
   and no dependency on any crate of nos's -- not kcore, not ipc -- or on any
   outside it. It knows nothing of NBS, of files, of the network or of the
   clock: it is the algorithm, driven by whoever uses it.

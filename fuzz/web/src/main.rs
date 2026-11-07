@@ -1,4 +1,4 @@
-//! The host API's wire crates (src/crates/web, src/crates/mgmtwire) on the
+//! The host API's wire crates (src/crates/common/net/web, src/crates/common/ipc/mgmtwire) on the
 //! host, as the API module links them:
 //!
 //! - `web-test vectors`: known answers -- SHA-1's FIPS 180 vectors, RFC

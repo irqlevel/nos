@@ -36,7 +36,7 @@ is what catches it: a ring whose sequences were relaxed failed eight boots
 of eight under HVF, while TCG on an x86 host may never show it. Its line
 says what a push and a pop cost on one CPU and how long each run took
 (`ring selftest: passed ...`): a number every boot prints is noticed when it
-moves. The [management bus](mgmt.md)'s (`mgmt/src/selftest.rs`) uses a
+moves. The [management bus](mgmt.md)'s (`layers/mgmt/src/selftest.rs`) uses a
 provider of its own:
 
 - a descriptor that does not say what the provider has refused: an empty
@@ -206,17 +206,17 @@ swallowing panic messages whole.
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations, the terminal a session lends a command, `edit` in nos; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through; the asynchronous path as the image's queue uses it (`block::queue`) is fs-fuzz's too, whose disks take it |
-| `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
-| `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `scripts/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
-| `cluster-test.py [--arch aarch64\|x86_64] [--keep]` | both | the cluster's registry between kernels: `modules/cluster` (the member, raft over ipc, its folder, init, invite, join, remove), ipcnet's control mailbox (`ipcnet.ctl`) and hosts.toml as the registry writes it, the channel's word on which host sent a message (`kernel_ipc_peer_name`) -- three nos on `scripts/hub.py`'s LAN, as `ipc-test.py` runs them |
+| `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/net/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
+| `ipc-test.py [--arch aarch64\|x86_64] [--keep]` | both | the channel between hosts: `modules/cluster/ipcnet`, the router's side of `ipc` (`remote.rs`, bounces, a message received in pieces), `ipcwire` as two kernels speak it, TCP's allowlist and a link's floor as ipcnet uses them, `tls::pinned` both ways -- three nos on `scripts/hub.py`'s LAN, which answers their DHCP, relays the test's UDP shell to each, and drops, delays and cuts between them |
+| `cluster-test.py [--arch aarch64\|x86_64] [--keep]` | both | the cluster's registry between kernels: `modules/cluster/cluster` (the member, raft over ipc, its folder, init, invite, join, remove), ipcnet's control mailbox (`ipcnet.ctl`) and hosts.toml as the registry writes it, the channel's word on which host sent a message (`kernel_ipc_peer_name`) -- three nos on `scripts/hub.py`'s LAN, as `ipc-test.py` runs them |
 | `usb-test.py` | x86-64 | `drivers/usb/`; what a keyboard sends the shell's line editor |
-| `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`block/src/table.rs`, the NVMe's identity), the claims and their holders, `block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hv/src/devices.rs`, a device disk in `modules/hv/src/disk.rs`, the pour onto a device |
-| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
-| `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
-| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
+| `hv-device-test.py [--tcg] [--keep]` | x86-64 | a guest's disk on a device of nos's: the devices' ids (`layers/block/src/table.rs`, the NVMe's identity), the claims and their holders, `layers/block/src/devq.rs` and `kcore::block::DiskQueue`, `diskimage::contents`, `modules/hypervisor/hv/src/devices.rs`, a device disk in `modules/hypervisor/hv/src/disk.rs`, the pour onto a device |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hypervisor/hv` -- the hypervisor; on x86-64 a PVH image too, hvboot started at its 32-bit entry, `hv create` of VMs from a web server's images, `hv clone` and `hv delete`, and the `vm` provider's actions through `mgmt`; on both, `hv convert` |
+| `edit-test.py [--seed N] [--sessions N] [--seconds S] [--session N]` | host (CI) | the editor (`src/crates/common/text/edit`), from its own sources: key sessions held to what they leave in the file and on the screen, files read and saved back byte for byte, random sessions on a terminal of the test's own |
+| `diskimage-test.py [--image <qcow2>] [--iterations N]` | host (CI) | the disk image converter (`src/crates/common/storage/diskimage`, `hv convert`), from its own sources: qcow2 images qemu-img and qemu-io write -- versions 2 and 3, clusters of 512 bytes to 2 MiB, stored, compressed, extended, zero, discarded, preallocated, snapshotted, dirty -- converted and held byte for byte to what qemu-img reads, its holes kept; what it must refuse; its DEFLATE decoder against zlib; each image's metadata fuzzed; and the cloud-init seed's ISO 9660, read back by xorriso or bsdtar, blkid and Linux's isofs |
 | `hvboot-test.py [--image <disk.raw>] [--iterations N]` | host (CI) | hvboot's partition, ext2/3/4 and GRUB readers and its bzImage header, from their own sources: on disks it makes -- GPT, MBR and none, ext4, ext3 and 1 KiB-block ext2, a grub-mkconfig grub.cfg and grubenv -- the entry GRUB would boot and its files byte for byte, then each disk's metadata fuzzed |
-| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed |
-| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
+| `extfmt-test.py [--iterations N] [--trials N]` | host (CI) | the ext2/3/4 format crate (`src/crates/common/storage/extfmt`) hvboot reads through and the kernel's ext4 driver is to: every checksum of filesystems mke2fs makes -- ext4 by default, with metadata_csum_seed, with 1 KiB blocks and 128-byte inodes and no 64bit, with gdt_csum, ext3, ext2 -- held to extfmt's, bytes they cover changed one at a time with extfmt and `e2fsck -fn` held to both saying so, and each image fuzzed; then journals debugfs leaves unreplayed, replayed by extfmt's planner and by `e2fsck -E journal_only` to the same image byte for byte, their ring turned so the log wraps, damaged and refused, and fuzzed |
+| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hypervisor/hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and its ACPI and SMBIOS tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on; and the virtio notifications, kicks and interrupts with EVENT_IDX and without, held to a Linux driver's every request served (`virtq`) |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate, and the session's line editor -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
@@ -226,9 +226,9 @@ swallowing panic messages whole.
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `trace-test.py [--arch aarch64\|x86_64]` | arm64 (x86-64 where grub-mkrescue is) | the tracepoints and the `trace` command: a boot's `tracepoints=`, records shown merged and in order, the rings made again, wrapped, cleared, frozen, freed -- [Tracepoints](tracing.md) |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install` and its `--panel`, `root=UUID=` |
-| `web-test.py` | host (CI) | the host API's wire: `src/crates/web`, `src/crates/mgmtwire`, a provider's descriptor |
+| `web-test.py` | host (CI) | the host API's wire: `src/crates/common/net/web`, `src/crates/common/ipc/mgmtwire`, a provider's descriptor |
 | `crc-test.py [--seed N] [--cases N]` | host (CI) | the tree's CRCs (`src/crates/common/crc`) -- CRC-32, CRC-32C and CRC-16, which GPT, nanofs, the disk log, ext4 and raft's log are checked by -- from the crate's own sources: the known answers, every form held to the CRC computed from its definition a bit at a time, and CRC-32 to zlib's |
-| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, a register through the replicated state machine checked for linearizability, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
+| `raft-test.py [--seed N --seconds S] [--mutants]` | host (CI) | the raft crate (`src/crates/common/cluster/raft`): known answers, the known traps played out, groups fuzzed over a network that fails in every way and held to Raft's properties at every step, the wire fed noise, a member fed what no correct member sends, the log on disk through power cuts, torn writes and lost ones, a register through the replicated state machine checked for linearizability, every allocation held to a block of the kernel's heap -- [Raft](raft.md) |
 | `api-test.py [--arch aarch64\|x86_64]` | both (arm64 in CI) | the host API module, `nosctl`, the bus's caller side for modules; on x86-64 the `vm` provider through it and `api panel create` |
 | `panel/`: `npx playwright test` | host (CI) | the management panel against the mock API, both themes and both languages |
 | `panel-appliance-test.py <bundle>` | host (CI), Docker | the panel's bundle (`scripts/panel-bundle.py`, `panel/appliance/`) run as its VM runs it |
@@ -798,10 +798,10 @@ MSI-X tables, the instruction behind an MMIO fault, when it halts and with
 what masked -- so a panic, an overflow or a loop that never ends anywhere in
 them is one a guest can cause, on the host, under everyone else's guests.
 `fuzz/hv` is a host program built from the hypervisor's own sources
-as they are -- `hv/src/devices/*`, `lapic`, `acpi`, `insn`, `walk`,
+as they are -- `hypervisor/hv/src/devices/*`, `lapic`, `acpi`, `insn`, `walk`,
 `linux`, `mmio`, `policy`, `smp` and `run`, hvarch's VMCB layout, the
-module's switch and DHCP server (`modules/hv/src/{net,dhcp}.rs`) and NAT
-(`net/src/nat.rs`) -- over stand-ins for the kernel (a clock the fuzzer
+module's switch and DHCP server (`modules/hypervisor/hv/src/{net,dhcp}.rs`) and NAT
+(`layers/net/src/nat.rs`) -- over stand-ins for the kernel (a clock the fuzzer
 moves, the locks, a vCPU's wait), for its network layer (the net devices,
 their frames, ARP, `hv0`'s end of the switch) and for the CPU, with
 overflow checks on as a `RUSTUB=1` kernel has them. Each target turns random bytes into what a guest does to
@@ -856,14 +856,14 @@ SMBIOS tables (`smbios`) from any name, version and UUID -- read back as
 Linux's `dmi_scan` reads them, the entry point where it scans, every string
 there and printable, the UUID and the serial as the model says -- and the
 DHCP server over the frames a guest's client sends, well formed and not.
-`config` holds a VM's `vm.toml` (`modules/hv/src/config.rs`): whatever the
+`config` holds a VM's `vm.toml` (`modules/hypervisor/hv/src/config.rs`): whatever the
 text, the parser does not panic, and what it reads `render` writes back so
 that it reads the same again; a configuration made up the input's way --
 its strings full of quotes, backslashes, control characters and characters
 past ASCII -- comes back from its own rendering whole, and that rendering
 cut, spliced and scribbled on is still read without a panic. A control run
 with backslashes left unescaped was found at the 4th input.
-`relay` holds `hv forward`'s relay (`modules/hv/src/relay.rs`) between two
+`relay` holds `hv forward`'s relay (`modules/hypervisor/hv/src/relay.rs`) between two
 sides a script drives (`fuzz/hv/src/relaymodel.rs`): what each sends and
 when, a window shut for a while and open again, a side that ends or goes, a
 clock that jumps, a stop. Every byte one side sent reaches the other in
@@ -878,7 +878,7 @@ and every join of it, for good), the stall check gone, early or late,
 progress not timed, a read with bytes held, the stop, an end or a gone
 side ignored, a partial send taken whole, one direction drained before the
 other -- each failed within the first 40 inputs.
-`place` holds where guests are put on the host's cores (`hv/src/place.rs`)
+`place` holds where guests are put on the host's cores (`hypervisor/hv/src/place.rs`)
 to a model of its own (`fuzz/hv/src/placemodel.rs`), over hosts made up an
 input -- one, two or four threads a core, caches shared by one to sixteen
 cores, CPUs missing from the numbering and the extension off on some -- on
@@ -1025,7 +1025,7 @@ one made at CPL 3 -- which a CPU faults before the exit -- that is not a
 #GP, or one under DR7's general detect that is not a #DB with DR6.BD set
 and GD clear, the instruction not run either way; and the guest's four, at
 every one of its entries after, other than its writes made them. (Seven
-mutants of `hv/src/dr.rs` -- a write into another register, a read of 0,
+mutants of `hypervisor/hv/src/dr.rs` -- a write into another register, a read of 0,
 no CPL check, no general detect, GD left set, a write in 32-bit code
 keeping its high half, the instruction not stepped past -- each failed
 within 145 inputs; the first run of the checks found the script's model
@@ -1074,7 +1074,7 @@ a guest that sent one packet of another guest's flow, with that guest's
 address, took the flow, and the world's answers to it came to its port.
 The same frames could tell `hv0`'s ARP table another guest's address was
 its own. The switch now checks what comes in at each port, as a cloud's
-virtual switch does (`ingress` in `modules/hv/src/net.rs`): IPv4 or ARP
+virtual switch does (`ingress` in `modules/hypervisor/hv/src/net.rs`): IPv4 or ARP
 only, from the port's MAC, an IPv4 packet from the port's address and an
 ARP message with the port's MAC and address -- or none yet, a probe's --
 as its sender; the one packet with no address yet is a DHCP client's,
@@ -1260,7 +1260,7 @@ own, TCP's flags in combinations that mean something. The targets:
   first. Five mutants of the client -- the key not checked, the signature
   not checked, TLS 1.2 spoken, the client waiting for the server's FIN, the
   key not kept -- each fail it;
-- `api`: the host API module's own source (`modules/api`) on a ramfs root,
+- `api`: the host API module's own source (`modules/mgmt/api`) on a ramfs root,
   its api.toml and clients written there first, its host key found there or
   made on its first start; on the bus the kernel's system provider (its
   source too), the network layer's, the module's own and one of the
@@ -1301,7 +1301,7 @@ own, TCP's flags in combinations that mean something. The targets:
   for the session's end (in `tls::server`, whose own target now sends
   one); 27 bugs planted in the module one at a time were each caught, 26 of
   them within the gate's 500 inputs;
-- `ipcnet`: the ipcnet module's own source (`modules/ipcnet`) as host `b`
+- `ipcnet`: the ipcnet module's own source (`modules/cluster/ipcnet`) as host `b`
   of a cluster, over the image's channel (the `ipc` crate), its hosts.toml
   and key on a ramfs root, and two mailboxes of the image's: `nbs.sink`, a
   Cluster name that keeps what it gets -- paused when the input says, so
@@ -2212,7 +2212,7 @@ hvboot reads a guest's partition table, its ext2/3/4 /boot and its GRUB
 configuration, and boots the entry GRUB would: get any of that wrong and
 the guest boots something else -- an older kernel, the recovery entry --
 with nothing to say so. `fuzz/hvboot` compiles that code, its own sources
-(`src/crates/hvboot/src/{gpt,ext,grub,bzimage}.rs`, over extfmt and the
+(`src/crates/hypervisor/hvboot/src/{gpt,ext,grub,bzimage}.rs`, over extfmt and the
 tree's `crc`), into a host
 program, and the gate runs it over disks it makes: a GPT whose /boot is a
 partition of its own (an XBOOTLDR, as Ubuntu's image has, beside an ESP), an
@@ -2470,7 +2470,7 @@ cannot run here and names the exception level, and refuses `hv on` and
 
 ### `extfmt-test.py` -- the ext2/3/4 format, held to e2fsprogs
 
-`src/crates/extfmt` is the ext2/3/4 on-disk format as bytes -- views of the
+`src/crates/common/storage/extfmt` is the ext2/3/4 on-disk format as bytes -- views of the
 superblock, the group descriptors, inodes, extent trees and block maps,
 directory and extended attribute blocks -- and every checksum metadata_csum,
 and gdt_csum before it, puts on them. hvboot reads a guest's /boot through it,
@@ -2538,9 +2538,9 @@ python3 scripts/extfmt-test.py`), where it takes under a minute.
 
 ### `edit-test.py` -- the editor, decided on the host
 
-`edit` is a full-screen editor run in the kernel (`src/crates/modules/edit`,
+`edit` is a full-screen editor run in the kernel (`src/crates/modules/tools/edit`,
 [edit](modules.md#edit)) over a crate with no kernel in it,
-`src/crates/edit`. `fuzz/edit` compiles that crate, as it is, into a host
+`src/crates/common/text/edit`. `fuzz/edit` compiles that crate, as it is, into a host
 program that runs it the way the module does -- the bytes a terminal sends
 through the key decoder, its saves and quits answered, its frames drawn on a
 terminal of the test's own, which does with them what xterm does: wraps text
@@ -2616,7 +2616,7 @@ host program, and the gate holds it to QEMU's own reading:
   stream, halfway through its clusters, and before its L2 table, each as
   "is the image whole?"; a raw disk, an ISO, a gzip stream, a VMDK, VHDX,
   VDI and VHD; and a disk that is there already, which is not written over;
-- the DEFLATE decoder (`diskimage/src/inflate.rs`) against Python's zlib --
+- the DEFLATE decoder (`common/storage/diskimage/src/inflate.rs`) against Python's zlib --
   the zlib QEMU decodes compressed clusters with: streams zlib makes at
   every level and strategy, with flushes inside, asked for the bytes they
   hold, fewer and more; the same with a bit, a byte or the end changed;
@@ -2645,7 +2645,7 @@ host program, and the gate holds it to QEMU's own reading:
   must give the same answer every time, and where both convert one, the
   same disk.
 
-And the seed `hv create` gives cloud-init (`diskimage/src/iso.rs`): ISO 9660
+And the seed `hv create` gives cloud-init (`common/storage/diskimage/src/iso.rs`): ISO 9660
 images of a cloud-init seed, of an empty file beside names alike in 8.3,
 and of eight files of 1 MiB in all, each read back by Rock Ridge's names
 -- by xorriso, or libarchive's bsdtar where there is no xorriso -- every
@@ -2858,7 +2858,7 @@ seconds, to:
   snapshots, and `RAFT_RSM_TRACE=1` what every member does and, for a
   history no register makes, its shortest prefix.
 - **The registry target**, 200 runs of 400 steps: the cluster's registry
-  (`src/crates/registry`, plans/cluster.md) -- raft's first user -- held to
+  (`src/crates/common/cluster/registry`, plans/cluster.md) -- raft's first user -- held to
   a model of its own.
   - Alone: the registry and the model take the same commands -- init,
     invitations, joins, removes, revokes, entries that are no command --
@@ -3405,7 +3405,7 @@ way, and logged in as the password.
 three hardware NIC drivers runs anywhere but on a Hetzner box -- MSI-X with
 two vectors, the descriptor rings, the receive poll and its interrupt
 throttle -- so run `tcp-test.py --nic igb` and `netload-test.py --nic igb`
-after touching `drivers/igb` or the driver seam in `net/src/device.rs`.
+after touching `drivers/net/igb` or the driver seam in `layers/net/src/device.rs`.
 
 `r8168` and `r8125` have no emulation at all. A change to either is checked
 by the compiler and then on the EX44, whose only console is that NIC: a

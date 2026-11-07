@@ -12,7 +12,7 @@ and between hosts.
 - **Modules cannot call one another**: each is linked on its own against the
   kernel's export table (docs/modules.md). What they share today is the shell
   (`kcore::cmd::dispatch`), files, the log, and the management bus
-  (`src/crates/mgmt`): providers by name, JSON calls and jobs, at most 32
+  (`src/crates/layers/mgmt`): providers by name, JSON calls and jobs, at most 32
   providers and 256 KiB an answer -- made for an administrator's requests,
   not for a service's traffic.
 - **No loopback**: the network stack has no `lo` and does not deliver to the
@@ -168,9 +168,9 @@ ax41:17.3          an address there -- slot 17, generation 3: a client's
 
 ## In the kernel
 
-- `src/crates/ipc`, in the image as the bus is: the mailbox table, the names,
-  monitors and watches, the pool. The C ABI in `ipc/src/abi.rs`, declared in
-  `ffi/src/ipc.rs`, wrapped in `kcore::ipc` (`Mailbox`, `Message`, `Addr`,
+- `src/crates/layers/ipc`, in the image as the bus is: the mailbox table, the names,
+  monitors and watches, the pool. The C ABI in `layers/ipc/src/abi.rs`, declared in
+  `base/ffi/src/ipc.rs`, wrapped in `kcore::ipc` (`Mailbox`, `Message`, `Addr`,
   `Name`, `call`); Rust in the image uses the crate itself. The C++ half
   needs none of it.
 - `ipc` in the shell: names (and whose), mailboxes (owner, depth, limits,
@@ -376,7 +376,7 @@ another CPU -- is never signalled once it is freed, whoever lets go of it
 first: the task, the last object made on it, or a completion that comes
 as its queue closes. And one task waits on it; the objects only signal.
 
-- **The event is counted** (`src/crates/events`, a crate of the image's,
+- **The event is counted** (`src/crates/base/events`, a crate of the image's,
   below `ipc` and `block`): `events::SharedEvent` -- the kernel's `Event`
   and the flag of the one task that waits on it -- held as an `Arc`. The
   task holds one, and so does every object made on it: a mailbox
@@ -546,7 +546,7 @@ pieces, in the order they are to be built and gated:
   and a bounded number of bytes, and refuses a frame of a message it has
   not been told the head of. Fuzzed on the host: anything decodes or is
   refused, never a panic; whatever is encoded decodes to itself.
-- **The module** (`modules/ipcnet`): the host key and certificate made at
+- **The module** (`modules/cluster/ipcnet`): the host key and certificate made at
   its first start (`web::x509`), hosts.toml read with `conf`, a listener on
   39240 with the peers' addresses as its allowlist (T3's `listen_allowed`,
   given a C ABI then), a task a connection, the host whose name sorts first
@@ -566,7 +566,7 @@ and a self-test at every boot; and the TCP ABI a module needs for it
 (`kcore::tcp`: `TcpListener::bind_allowed` and `set_allowed`, T3's
 allowlist, and `TcpStream::set_rto_floor`, the link's 20 ms, T2).
 
-And then the module, `modules/ipcnet` (docs/ipc.md, "Between hosts:
+And then the module, `modules/cluster/ipcnet` (docs/ipc.md, "Between hosts:
 ipcnet"), with what it needed of the channel: a bounce told back to a
 sender (`TAG_BOUNCED`), the tag's bulk bit, a message received in pieces --
 a module's heap gives 512 KiB at once, and the router is handed messages of
@@ -646,7 +646,7 @@ What it will stand on, and what is kept ready for it now:
   the private ranges (`nat.rs`'s `kept`). A one-to-one mapping, and the
   overlay's ranges let through to the tunnel instead of the world, are what
   it gains.
-- **The switch** (`modules/hv/src/net.rs`) gets ports that live on other
+- **The switch** (`modules/hypervisor/hv/src/net.rs`) gets ports that live on other
   hosts: a frame for one goes into the tunnel. ARP and ND for them are
   answered locally, and its DHCP server gives the network's MTU (option 26),
   which it gives none of today.

@@ -495,7 +495,7 @@ an ARP wait at 1 -- shorter waits, and more wakeups. TCP's blocking calls --
 connect, accept, send and recv, which nothing signals -- polled at 1 ms
 too, and on the EX44 an idle nos with sshd up and two sessions open woke
 2,220 times a second, 1.2% busy over its 20 CPUs; they back off now, 1 ms
-doubling to 10 (`Poll` in `net/src/tcp.rs`), and the same nos woke 741 times
+doubling to 10 (`Poll` in `layers/net/src/tcp.rs`), and the same nos woke 741 times
 a second, 0.4% busy, most of it the USB poll.
 
 ## Load balancing

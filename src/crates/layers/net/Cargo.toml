@@ -1,0 +1,21 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+kcore = { path = "../../base/kcore" }
+# The frame formats, shared with the modules that build their own frames:
+# `net::wire` is this crate.
+netwire = { path = "../../common/net/netwire" }
+# ICMP tells the C++ TCP about an unreachable; that declaration lives here.
+ffi = { path = "../../base/ffi" }
+# The HTTP client speaks plain TCP or TLS over it.
+tls = { path = "../tls" }
+# `wget` saves to a file: the filesystem layer itself, not the C ABI a module
+# reaches it by.
+fs = { path = "../fs" }
+# The management bus, which the layer's provider registers on.
+mgmt = { path = "../mgmt" }

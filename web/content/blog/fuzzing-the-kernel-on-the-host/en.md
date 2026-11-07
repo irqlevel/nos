@@ -25,10 +25,10 @@ Most of the code that needed fuzzing was already portable. The block, network an
 ```toml
 [dependencies]
 # The kernel's crates, built for the host as they are for the kernel.
-ffi = { path = "../../src/crates/ffi" }
-kcore = { path = "../../src/crates/kcore" }
-block = { path = "../../src/crates/block" }
-fs = { path = "../../src/crates/fs" }
+ffi = { path = "../../src/crates/base/ffi" }
+kcore = { path = "../../src/crates/base/kcore" }
+block = { path = "../../src/crates/layers/block" }
+fs = { path = "../../src/crates/layers/fs" }
 
 # What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
 # a wrap, and core's checks of its own unsafe preconditions are made.
@@ -47,12 +47,12 @@ extern crate self as hv;
 extern crate self as hvarch;
 extern crate self as kcore;
 // ...
-#[path = "../../../src/crates/hv/src/acpi.rs"]
+#[path = "../../../src/crates/hypervisor/hv/src/acpi.rs"]
 pub mod acpi;
 // ...
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
-#[path = "../../../src/crates/modules/hv/src/dhcp.rs"]
+#[path = "../../../src/crates/modules/hypervisor/hv/src/dhcp.rs"]
 pub mod dhcp;
 ```
 
@@ -128,13 +128,13 @@ Each fuzzer was merged together with the fixes for what it found. Here is a sele
 
 The `guestnet` target wires the switch and NAT together the way the hv module does. On its very first input, it found that a guest could send traffic as another guest. The switch passed on frames from any MAC and any address. NAT sends a flow's replies to the MAC that the flow's last packet came from. So a single packet with another guest's address and the ports of one of its flows took that flow over, and the outside world's replies went to the impostor.
 
-The fix ([d1aeecf](https://github.com/irqlevel/nos/commit/d1aeecf09004bba80ed5301eea6b25d60f1dc1d6)) is what a cloud's virtual switch does. [`ingress`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hv/src/net.rs) checks every frame from a guest as it comes in. Only IPv4 and ARP get through, and only from the port's own MAC and address. The one exception is a DHCP client that has no address yet, and the switch answers that one itself. Everything else is dropped and counted against the guest in `hv list`.
+The fix ([d1aeecf](https://github.com/irqlevel/nos/commit/d1aeecf09004bba80ed5301eea6b25d60f1dc1d6)) is what a cloud's virtual switch does. [`ingress`](https://github.com/irqlevel/nos/blob/master/src/crates/modules/hypervisor/hv/src/net.rs) checks every frame from a guest as it comes in. Only IPv4 and ARP get through, and only from the port's own MAC and address. The one exception is a DHCP client that has no address yet, and the switch answers that one itself. Everything else is dropped and counted against the guest in `hv list`.
 
 One control run, with the check taken out, showed the actual harm: a connection through `hv forward` (which forwards a port of nos to a guest) to one guest's web server landed on the other guest. Now `hv-linux-test.py --net` has a real Linux guest claim its neighbour's address and checks that nothing comes back.
 
 ### An address past the top of memory
 
-A guest could put a virtio buffer at the very top of its address space. When the emulated disk then wrote the request's status, it computed an address past 2^64. Under `RUSTUB=1` that was a panic, and in a plain kernel the address silently wrapped around to page 0. The fix is a type rather than a check at every call site. A segment's address is private, and the only way to reach it does the addition with an overflow check ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hv/src/devices/virtio.rs)):
+A guest could put a virtio buffer at the very top of its address space. When the emulated disk then wrote the request's status, it computed an address past 2^64. Under `RUSTUB=1` that was a panic, and in a plain kernel the address silently wrapped around to page 0. The fix is a type rather than a check at every call site. A segment's address is private, and the only way to reach it does the addition with an overflow check ([`virtio.rs`](https://github.com/irqlevel/nos/blob/master/src/crates/hypervisor/hv/src/devices/virtio.rs)):
 
 ```rust
 pub struct Seg {

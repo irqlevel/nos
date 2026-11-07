@@ -1,0 +1,16 @@
+[package]
+name = "events"
+version = "0.1.0"
+edition = "2021"
+
+# The events tasks wait on, in the kernel image: one a task, which the
+# kernel's objects made on it -- a mailbox, a device's queue, an image's --
+# signal, so that a task that waits for several things sleeps on one; and
+# the table a module's are held in, for the C ABI (base/ffi/src/events.rs,
+# kcore::events). Below `ipc` and `block`, which make objects on one.
+# plans/ipc.md (I2), docs/ipc.md.
+[lib]
+
+[dependencies]
+ffi = { path = "../ffi" }
+kcore = { path = "../kcore" }

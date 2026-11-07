@@ -1,4 +1,4 @@
-//! The CPUID and MSR policy (`hv/src/policy.rs`) held to a model of its
+//! The CPUID and MSR policy (`hypervisor/hv/src/policy.rs`) held to a model of its
 //! own, for a host CPU made up an input (`cpu::set_host`):
 //!
 //! - every leaf a guest can ask -- of the basic range, the extended one and

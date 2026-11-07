@@ -442,7 +442,7 @@ void some_task_routine(void *ctx)
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
-/* The network layer is Rust (src/crates/net): the recycled frame pool, the
+/* The network layer is Rust (src/crates/layers/net): the recycled frame pool, the
    log over UDP armed as soon as the command line is known, TCP, and the
    services boot starts once there is a device and a shell. */
 extern "C" int rust_netframe_pool_setup(unsigned long count);
@@ -457,38 +457,38 @@ extern "C" void rust_usb_init();
 extern "C" int rust_usb_start();
 extern "C" void rust_usb_stop();
 
-/* The block layer is Rust (src/crates/block): before this, a synchronous I/O
+/* The block layer is Rust (src/crates/layers/block): before this, a synchronous I/O
    has to poll its device, because there is nothing yet to wake a waiter. */
 extern "C" void kernel_blockdev_set_interrupts_started();
 
-/* The filesystem layer is Rust (src/crates/fs): what boot mounts where, and
+/* The filesystem layer is Rust (src/crates/layers/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
 extern "C" void kernel_vfs_unmount_all();
 extern "C" void rust_mgmt_stop();
-/* The message channel is Rust (src/crates/ipc): at the halt, after the
+/* The message channel is Rust (src/crates/layers/ipc): at the halt, after the
    modules, no mailbox is made and no message sent */
 extern "C" void rust_ipc_stop();
 
-/* The disk log is Rust (src/crates/block/src/disklog.rs). */
+/* The disk log is Rust (src/crates/layers/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
 
-/* The random pool is Rust (src/crates/random): seeded at boot from what the
+/* The random pool is Rust (src/crates/base/random): seeded at boot from what the
    machine itself can be measured for, before anything asks it for bytes,
    and again once the devices that can do better are up. */
 extern "C" bool rust_random_setup();
 extern "C" void rust_random_reseed();
-/* The partition table reader (src/crates/block): registers a block device for
+/* The partition table reader (src/crates/layers/block): registers a block device for
    every partition of every disk the kernel has not looked at yet. */
 extern "C" void rust_partitions_probe();
-/* The virtio-blk driver (src/crates/drivers/virtio_blk): the disks come up
+/* The virtio-blk driver (src/crates/drivers/block/virtio_blk): the disks come up
    here, before the partitions on them are looked at. */
 extern "C" void rust_virtio_blk_init();
-/* The virtio-net driver (src/crates/drivers/virtio_net) */
+/* The virtio-net driver (src/crates/drivers/net/virtio_net) */
 extern "C" void rust_virtio_net_init();
-/* The virtio-scsi driver (src/crates/drivers/virtio_scsi) */
+/* The virtio-scsi driver (src/crates/drivers/block/virtio_scsi) */
 extern "C" void rust_virtio_scsi_init();
 
 void bp_startup(void* ctx)
