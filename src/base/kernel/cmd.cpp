@@ -1500,8 +1500,10 @@ static void cmd_memusage(const char* args, stdlib::Printer& con)
     auto& pt = mm::PageTable::get_instance();
 
     con.printf("free_pages: %lu\n", pt.get_free_pages_count());
+    con.printf("zeroedPages: %lu\n", pt.get_zeroed_pages_count());
     con.printf("totalPages: %lu\n", pt.get_total_pages_count());
-    con.printf("hugePages: %lu free of %lu\n", pt.get_huge_pool_free(), pt.get_huge_pool_blocks());
+    con.printf("hugePages: %lu free of %lu, %lu of them zeroed\n", pt.get_huge_pool_free(), pt.get_huge_pool_blocks(),
+        pt.get_huge_pool_zeroed());
 }
 
 static void cmd_memcheck(const char* args, stdlib::Printer& con)
@@ -1543,15 +1545,19 @@ static void cmd_meminfo(const char* args, stdlib::Printer& con)
         (usable - unused) / consts::MB, map_limit);
     if (unused != 0)
         con.printf("unused: %lu MiB above the bootstrap map\n", unused / consts::MB);
-    con.printf("pages: %lu free of %lu\n",
-        pt.get_free_pages_count(), pt.get_total_pages_count());
+    /* Of the free, those zeroed already -- by the zeroing tasks
+       (PageZeroer), while nothing else wanted the CPU: what an allocation of
+       a guest's memory takes first, and need not zero */
+    con.printf("pages: %lu free of %lu, %lu of them zeroed\n",
+        pt.get_free_pages_count(), pt.get_total_pages_count(), pt.get_zeroed_pages_count());
     /* The huge pool is neither: its pages left the free list at boot, for
        guests' memory alone (hugepages=). */
     if (pt.get_huge_pool_blocks() != 0)
-        con.printf("huge pool: %lu 2MiB pages free of %lu (%lu MiB of %lu)\n",
+        con.printf("huge pool: %lu 2MiB pages free of %lu (%lu MiB of %lu), %lu of them zeroed\n",
             pt.get_huge_pool_free(), pt.get_huge_pool_blocks(),
             pt.get_huge_pool_free() * mm::PageTable::HUGE_FRAME_SIZE / consts::MB,
-            pt.get_huge_pool_blocks() * mm::PageTable::HUGE_FRAME_SIZE / consts::MB);
+            pt.get_huge_pool_blocks() * mm::PageTable::HUGE_FRAME_SIZE / consts::MB,
+            pt.get_huge_pool_zeroed());
 }
 
 static void cmd_irqstat(const char* args, stdlib::Printer& con)

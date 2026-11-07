@@ -53,6 +53,7 @@ Parameters::Parameters()
     , net_frame_count_(0)
     , huge_pool_percent_(0)
     , huge_pool_bytes_(0)
+    , zero_free_md_(ZeroFreeOn)
     , rx_poll_(false)
     , log_level_(DEFAULT_LOG_LEVEL)
     , dns_enabled_(false)
@@ -204,6 +205,16 @@ ulong Parameters::get_netconsole_tail_kb()
 ulong Parameters::get_net_frame_count()
 {
     return net_frame_count_;
+}
+
+bool Parameters::is_zero_free_off()
+{
+    return zero_free_md_ == ZeroFreeOff;
+}
+
+bool Parameters::is_zero_free_verify()
+{
+    return zero_free_md_ == ZeroFreeVerify;
 }
 
 ulong Parameters::get_huge_pool_bytes(ulong total_bytes)
@@ -529,6 +540,17 @@ bool Parameters::parse_parameter(const char *cmdline, size_t start, size_t end)
         {
             klog(0, "Unknown value %s, key %s", value, key);
         }
+    }
+    else if (stdlib::str_cmp(key, "zerofree") == 0)
+    {
+        if (stdlib::str_cmp(value, "on") == 0)
+            zero_free_md_ = ZeroFreeOn;
+        else if (stdlib::str_cmp(value, "off") == 0)
+            zero_free_md_ = ZeroFreeOff;
+        else if (stdlib::str_cmp(value, "verify") == 0)
+            zero_free_md_ = ZeroFreeVerify;
+        else
+            klog(0, "Unknown value %s, key %s", value, key);
     }
     else if (stdlib::str_cmp(key, "dhcp") == 0)
     {

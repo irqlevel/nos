@@ -117,12 +117,70 @@ access goes through `tmp_map`. The drain holds a single `tmp_map` slot across
 the whole walk instead of using the general pair — one TLB invalidation and
 one lock round trip per page instead of two of each.
 
-Nothing is zeroed on the way to the list: `alloc_page_no_lock` zeroes every page
-it hands out, so a page sitting on the free list is not expected to be clean.
+Nothing is zeroed on the way to the list: a page goes on as the firmware,
+the loader or the last boot left it, and is zeroed before anyone is handed it
+-- by the allocation, or by the zeroing tasks first ([below](#zeroed-ahead-free-pages-and-the-two-lists)).
 Even so, building the list touches every page twice, about 0.6 µs each, so a
 64 GiB machine spends roughly ten seconds of its boot here — hence the
 `mm: … MiB onto the free list` progress lines, one per 8 GiB, so a long boot
 does not look like a hang.
+
+## Zeroed ahead: free pages and the two lists
+
+Every page is handed out zeroed -- `alloc_page`, `alloc_page_keeping` (a
+guest's memory, through `kernel_frame_alloc`), `alloc_contiguous_pages`, a
+block of the huge pool -- so what one owner of a page finds in it is never
+what the last one left. What a page held stays in RAM, though, from its free
+until it is next handed out: a guest's memory, once the guest is gone, is
+there for as long as nothing asks for it. So free pages are zeroed ahead, by
+two tasks of the lowest priority (`mm/page_zeroer.cpp`, `zerofree=`), and
+the free pages are on two lists:
+
+- the **other list**, `free_pages_list_` -- pages as their last owner left
+  them. A free goes on its head; `alloc_page` and the kernel's own
+  allocations take from there first and zero what they take, while it is
+  still in the cache.
+- the **zeroed list**, `zeroed_pages_list_` -- pages known to read as zeros,
+  each marked (bit 0 of its descriptor's address, `Page::ZEROED_BIT`, which a
+  page-aligned address leaves free). `alloc_page_keeping` takes from there
+  first and does not zero; the kernel's own allocations take from it only
+  when the other list is empty.
+
+`zero_free_page(keep)` moves a page from the other list's cold end to the
+zeroed one: the page is taken off under the page-table lock, zeroed off it
+through the CPU's frame slot, and put on the zeroed list, interrupts off from
+the take to the put -- a microsecond. Meanwhile it is on neither list but
+still counted free (it is nobody's), and marked, so that a free of it -- a
+page freed twice -- panics (`free_page_no_lock`: a page handed out never has
+the mark). A page is taken only while more than `keep` are free; the tasks
+keep the kernel's reserve, where the one page off the lists can make no
+allocation fail. `alloc_contiguous_pages` finds a run across both lists and
+zeroes only the pages of it that are not marked.
+
+The huge pool has a third bitmap, `huge_pool_zeroed_bits_`, of its free blocks
+known zero. `zero_free_huge_page` zeroes a page of a free block a call, under
+the pool's own lock (`huge_pool_lock_`, so that it keeps no 4 KiB allocation
+waiting), the block staying free throughout; once all 512 are done the block
+is known zero, and `alloc_huge_frame`, which takes such a block first, hands
+it out as it is. An allocation of the block the zeroing is part way through
+takes it like any block not known zero -- zeroing it whole -- and the zeroing
+goes on with another.
+
+The tasks (`PageZeroer`): one starts with the huge pool, the other with the 4
+KiB pages, each going on to the other's work when its own has none. They are
+free to move, so the load balancer takes one displaced from a busy CPU to an
+idle one, and nice 19; a task zeroes only while its CPU runs nothing else --
+the runnable count, looked at between pages -- in batches of 256 pages, and
+waits a second when there is nothing left, so that its CPU sleeps deep. On a
+2 GiB arm64 machine under HVF they had all 1.94 GiB of free memory zeroed
+within a second of `boot: complete`, a batch of 256 pages taking 280-460 us.
+Each batch is a record (`trace on mm`, [Tracing](tracing.md#the-memorys-events)).
+
+`zerofree=off` starts no task: nothing is zeroed ahead, and every page is
+zeroed as it is handed out, as before. `zerofree=verify` reads every page and
+block an allocation takes as known zero before handing it out, and a word that
+is not zero is a panic naming the page: something wrote to a free page -- a
+use after free -- caught where it would otherwise have reached a guest.
 
 ## Page descriptors and refcounting
 
@@ -295,8 +353,9 @@ machine.
 
 - `meminfo` — the firmware memory map, and how much of it the kernel
   actually uses (RAM reported vs. RAM reachable).
-- `memusage` — free and total page counts, and the huge pool's free and
-  total blocks.
+- `memusage` — free and total page counts and how many of the free are
+  zeroed, and the huge pool's free and total blocks and how many of the free
+  are known zero.
 - `meminfo` and the huge pool: with `hugepages=`, a line for the pool --
   2 MiB blocks reserved at boot right after the free list is built, kept for
   guests' memory and out of every other allocation ([The
@@ -304,7 +363,7 @@ machine.
 - `heapbench` (a module, `insmod /heapbench.ko`; [Modules](modules.md)) —
   what an allocation and a free cost, size by size, on one CPU and on all.
 - `memcheck` — `check_free_list` walks every descriptor and reports any page
-  that is on the free list but must not be: inside a reserved region, inside
+  that is on a free list but must not be: inside a reserved region, inside
   the kernel image, or outside usable RAM. That invariant is what the whole
   carve-out scheme rests on, and its violation is silent until something
   overwrites `page_array_` or an ACPI table.
