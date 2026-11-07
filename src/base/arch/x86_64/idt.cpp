@@ -1,11 +1,13 @@
 #include "idt.h"
 #include "asm.h"
+#include "lapic.h"
 #include <drivers/screen.h>
 #include <hal/context.h>
 #include <hal/irqchip.h>
 #include <kernel/interrupt.h>
 #include <kernel/panic.h>
 #include <kernel/klog.h>
+#include <kernel/tracepoint.h>
 
 #include <lib/stdlib.h>
 
@@ -135,12 +137,21 @@ void Idt::dummy_interrupt(Context* ctx, u8 vector)
 
 extern "C" void dummy_interrupt_dispatch(Context* ctx, u32 vector)
 {
+    /* A vector no handler has: its records too (tp::Irq), as any other's */
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin(vector, tp::IrqKind::Stray);
+
     InterruptStats::inc(IrqDummy);
     Idt::get_instance().dummy_interrupt(ctx, (u8)vector);
 }
 
 extern "C" void spurious_interrupt()
 {
+    tp::Irq irq;
+    if (unlikely(tp::Irq::on()))
+        irq.begin(Lapic::SPURIOUS_VECTOR, tp::IrqKind::Spurious);
+
     /* LAPIC spurious-interrupt vector (Lapic::SPURIOUS_VECTOR). Per the SDM a
        spurious interrupt must NOT be acknowledged with an EOI -- just count
        it and return, rather than falling through to dummy_interrupt's panic. */

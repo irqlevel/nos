@@ -240,3 +240,9 @@ architecture that came for a sleeper's deadline and not the tick. The `msix` and
 "has this card stopped interrupting, or has it stopped receiving?" — a
 question that was unanswerable on a running machine until they were counted,
 and most of why the EX44 receive stall took as long as it did to corner.
+
+What a count cannot say -- how long each handler took, which task's time it
+was, how late the local timer's interrupt came, how long a soft IRQ's work
+waited for its task -- the `irq` and `softirq` tracepoints record
+([Tracepoints](tracing.md#the-interrupts-events)): `trace on irq softirq`,
+then `trace show irq_exit` or, on the host, `trace-decode.py --irq`.
