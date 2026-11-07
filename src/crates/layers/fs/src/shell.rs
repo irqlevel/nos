@@ -487,6 +487,7 @@ pub fn fstest(args: &str, out: &mut Output) {
 
 pub fn register_all() {
     let commands: &[(&str, &str, fn(&str, &mut Output))] = &[
+        ("format", "format <ext2|ext4> <disk> [label=<name>] [bs=N] [force] - make a filesystem on a disk", crate::format::format),
         ("mount", "mount <ramfs|ext2|ext4> ... - mount filesystem", mount),
         ("umount", "umount <path> - unmount filesystem", umount),
         ("mounts", "mounts - list mount points", mounts),

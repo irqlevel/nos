@@ -22,6 +22,7 @@ pub mod ext4;
 pub mod extfs;
 pub mod files;
 pub mod find;
+pub mod format;
 pub mod image;
 pub mod paths;
 pub mod procfs;

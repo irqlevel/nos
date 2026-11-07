@@ -78,6 +78,35 @@ IMAGES = [
     ("ext2-1k", ["-t", "ext2", "-b", "1024"], []),
 ]
 
+# What the kernel's `format` makes -- extfmt's mkfs -- judged by e2fsprogs: a
+# device of each size and block size whose geometry differs (one group and
+# many, a last group cut short, 1, 2 and 4 KiB blocks, a journal across
+# groups), made over bytes of garbage where it is small, so that nothing is
+# left to a device's former zeros: (kind, bytes, block size or None, label).
+MKFS = [
+    ("ext4", 2 << 20, None, "tiny"),
+    ("ext4", 8 << 20, None, "small"),
+    ("ext4", (64 << 20) + 12345, None, "odd"),
+    ("ext4", 64 << 20, 4096, "fourk"),
+    ("ext4", 300 << 20, 2048, "twok"),
+    ("ext4", 520 << 20, None, "big"),
+    ("ext4", 1 << 30, 1024, "groups"),
+    ("ext4", 3 << 30, None, "threeg"),
+    ("ext2", 64 << 10, None, "emin"),
+    ("ext2", 1 << 20, None, "etiny"),
+    ("ext2", 8 << 20, None, "esmall"),
+    ("ext2", 64 << 20, 4096, "efourk"),
+    ("ext2", 700 << 20, None, "ebig"),
+]
+MKFS_GARBAGE_MAX = (64 << 20) + 12345
+# And what it must refuse, saying why: (kind, bytes, block size, sector, why).
+MKFS_REFUSED = [
+    ("ext4", 1 << 20, None, 512, "too small"),
+    ("ext2", 16 << 10, None, 512, "too small"),
+    ("ext4", 64 << 20, 1024, 4096, "smaller than the device's sector"),
+    ("ext4", 64 << 20, 8192, 512, "other than 1024"),
+]
+
 failures = []
 
 
@@ -170,6 +199,51 @@ def verify(img):
         elif w[:1] == ["region"]:
             regions.append((w[1], int(w[2]), int(w[3])))
     return r, counts, regions
+
+
+def mkfs_tests(tmp):
+    """extfmt's mkfs -- what the kernel's `format` writes -- over each of
+    MKFS: e2fsck -fn passes what it made, extfmt's own walk finds every
+    checksum right, dumpe2fs says the features and the label asked for,
+    debugfs finds lost+found in the root; and MKFS_REFUSED refused."""
+    for kind, size, bs, label in MKFS:
+        name = "mkfs-%s-%s" % (kind, label)
+        img = os.path.join(tmp, name + ".img")
+        argv = [BIN, "mkfs", kind, str(size), img, "--label", label]
+        if bs:
+            argv += ["--bs", str(bs)]
+        if size <= MKFS_GARBAGE_MAX:
+            argv.append("--garbage")
+        r = run(argv)
+        if not check("%s: made (%s)" % (name, r.stdout.strip()), r.returncode == 0, r.stdout + r.stderr):
+            continue
+        r = run(["e2fsck", "-fn", img])
+        check("%s: e2fsck -fn passes it" % name, r.returncode == 0, r.stdout + r.stderr)
+        r, counts, _ = verify(img)
+        check("%s: every checksum matches, every structure parses (%s)" % (name, ", ".join(
+              "%s %d" % kv for kv in sorted(counts.items()))), r.returncode == 0, r.stdout + r.stderr)
+        r = run(["dumpe2fs", "-h", img])
+        features = next((l.split(":", 1)[1].split() for l in r.stdout.splitlines()
+                         if l.startswith("Filesystem features:")), [])
+        want = (["has_journal", "extent", "metadata_csum", "filetype"] if kind == "ext4"
+                else ["filetype", "sparse_super", "large_file"])
+        unwanted = [] if kind == "ext4" else ["has_journal", "extent", "metadata_csum"]
+        check("%s: dumpe2fs says %s" % (name, " ".join(features)),
+              all(f in features for f in want) and not any(f in features for f in unwanted), r.stdout + r.stderr)
+        check("%s: labelled %s" % (name, label),
+              any(l.startswith("Filesystem volume name:") and l.split(":", 1)[1].strip() == label
+                  for l in r.stdout.splitlines()), r.stdout)
+        r = run(["debugfs", "-R", "ls -l /", img])
+        check("%s: lost+found in the root" % name, "lost+found" in r.stdout, r.stdout + r.stderr)
+        os.remove(img)
+    for kind, size, bs, sector, why in MKFS_REFUSED:
+        img = os.path.join(tmp, "refused.img")
+        argv = [BIN, "mkfs", kind, str(size), img, "--sector", str(sector)]
+        if bs:
+            argv += ["--bs", str(bs)]
+        r = run(argv)
+        check("mkfs refuses %s of %d bytes (block %s, sector %d): %s" % (kind, size, bs, sector, r.stdout.strip()),
+              r.returncode == 1 and why in r.stdout, r.stdout + r.stderr)
 
 
 def damage(tmp, name, img, regions, rng, trials):
@@ -405,7 +479,7 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep the images made")
     args = ap.parse_args()
 
-    for t in ("cargo", "mke2fs", "e2fsck", "debugfs", "tune2fs"):
+    for t in ("cargo", "mke2fs", "e2fsck", "debugfs", "tune2fs", "dumpe2fs"):
         if shutil.which(t) is None:
             sys.exit("extfmt-test needs %s (on a Mac, run it in the nos-builder container)" % t)
     r = subprocess.run(["cargo", "build", "--release", "--offline", "--quiet", "--target-dir", OUT], cwd=FUZZ)
@@ -440,6 +514,7 @@ def main():
             check("%s: %d images damaged at random walked: no panic, every walk ending (%s)"
                   % (name, args.iterations, r.stdout.strip()), r.returncode == 0, r.stdout + r.stderr)
         journal_tests(tmp, rng, args)
+        mkfs_tests(tmp)
     finally:
         if args.keep or failures:
             print("images in " + tmp)
