@@ -301,11 +301,45 @@ const cluster = {
       key: crypto.createHash('sha256').update('mock-a').digest('hex'), moving_to: null },
     { name: 'mock-b', node: 2, vote: 'voter', leader: false, ip: '10.9.0.2', underlay: null, public: '203.0.113.7',
       maintenance: false, key: crypto.createHash('sha256').update('mock-b').digest('hex'), moving_to: null },
+    { name: 'mock-d', node: 4, vote: 'voter', leader: false, ip: '10.9.0.4', underlay: null, public: null,
+      maintenance: false, key: crypto.createHash('sha256').update('mock-d').digest('hex'), moving_to: null },
   ],
   invitations: [],
   removed: 0,
 };
 const clusterHost = (name) => cluster.hosts.find((h) => h.name === name);
+
+/* ---- NBS's metadata, as this host's member has it: the registry's three
+   hosts its members, a chunk server of one device on each, and the volumes
+   -- every chunk on all three, as there is nowhere else ---- */
+
+const SLOT = 4 * MIB;
+const NBS_SLOTS = 1022;
+const NBS_NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const nbs = {
+  hosts: cluster.hosts.map((h, i) => ({ host: h.name, member: 4096 + i, vote: 'voter', leader: i === 0 })),
+  volumes: [{ name: 'web-root', volume: 1, size_mib: 2048, host: 'mock-a', writer: null, generation: 0, readers: [] }],
+  next: 2,
+};
+const nbsChunks = (size) => Math.ceil(size / 4);
+const nbsTaken = () => nbs.volumes.reduce((n, v) => n + nbsChunks(v.size_mib), 0);
+const nbsVolume = (p) => {
+  const v = nbs.volumes.find((x) => x.name === need(p, 'name'));
+  if (!v) {
+    throw new Refused('not_found', 'no volume of that name', 'name');
+  }
+  return v;
+};
+const nbsRoom = (more) => {
+  if (nbsTaken() + more > NBS_SLOTS) {
+    throw new Refused('failed', 'not room for its chunks on three hosts');
+  }
+};
+const nbsJson = (v, replicas) => ({
+  name: v.name, volume: v.volume, size: v.size_mib * MIB, chunks: nbsChunks(v.size_mib), host: v.host, writer: v.writer,
+  generation: v.generation, readers: v.readers,
+  ...(replicas ? { replicas: nbs.hosts.map((h) => ({ host: h.host, chunks: nbsChunks(v.size_mib) })) } : {}),
+});
 
 const reads = {
   'system.info': () => ({
@@ -390,9 +424,63 @@ const reads = {
     hosts: cluster.hosts.length, voters: cluster.hosts.length, learners: 0, refused: 0, stopped: null,
   }),
   'cluster.hosts': () => ({ hosts: cluster.hosts, invitations: cluster.invitations, removed: cluster.removed }),
+  'nbs.status': () => ({
+    member: true, cluster: 'store', node: nbs.hosts[0].member, role: 'leader', term: 2, leader: nbs.hosts[0].host,
+    applied: 70 + nbs.next, members: nbs.hosts.length, volumes: nbs.volumes.length, chunks: nbsTaken(), digest_at: 64,
+    digest: crypto.createHash('sha256').update('nbs').digest('hex'), stopped: null,
+  }),
+  'nbs.hosts': () => ({ hosts: nbs.hosts }),
+  'nbs.cs': () => ({ cs: nbs.hosts.map((h, i) => ({
+    host: h.host, member: true, size: NBS_SLOTS * SLOT, reserved: nbsTaken() * SLOT, free: (NBS_SLOTS - nbsTaken()) * SLOT,
+    devices: [{ device: i + 1, id: 'part:' + crypto.createHash('sha256').update(h.host).digest('hex').slice(0, 8)
+      + '-0000-4000-8000-000000000001', size: NBS_SLOTS * SLOT, state: 'active' }],
+  })) }),
+  'nbs.volumes': () => ({ volumes: nbs.volumes.map((v) => nbsJson(v, false)) }),
+  'nbs.volume': (p) => nbsJson(nbsVolume(p), true),
 };
 
 const actions = {
+  'nbs.volume_create': (p) => {
+    const name = need(p, 'name');
+    if (!NBS_NAME.test(name)) {
+      throw new Refused('invalid', 'lowercase letters, digits, . _ and -, up to 63', 'name');
+    }
+    const size = Number(need(p, 'size_mib'));
+    const had = nbs.volumes.find((v) => v.name === name);
+    if (had) {
+      if (had.size_mib !== size) {
+        throw new Refused('conflict', 'a volume of that name is there already, of another size or kind');
+      }
+      return { volume: had.volume };
+    }
+    nbsRoom(nbsChunks(size));
+    const host = p.host || nbs.hosts[0].host;
+    if (!nbs.hosts.some((h) => h.host === host)) {
+      throw new Refused('not_found', 'the host is no member of the NBS cluster', 'host');
+    }
+    const v = { name, volume: nbs.next, size_mib: size, host, writer: null, generation: 0, readers: [] };
+    nbs.next += 1;
+    nbs.volumes.push(v);
+    return { volume: v.volume };
+  },
+  'nbs.volume_resize': (p) => {
+    const v = nbsVolume(p);
+    const size = Number(need(p, 'size_mib'));
+    if (size < v.size_mib) {
+      throw new Refused('invalid', 'a volume is never made smaller');
+    }
+    nbsRoom(nbsChunks(size) - nbsChunks(v.size_mib));
+    v.size_mib = size;
+    return { volume: v.volume };
+  },
+  'nbs.volume_delete': (p) => {
+    const at = nbs.volumes.findIndex((v) => v.name === need(p, 'name'));
+    if (at < 0) {
+      return { volume: 0 };
+    }
+    const [v] = nbs.volumes.splice(at, 1);
+    return { volume: v.volume };
+  },
   'cluster.invite': (p) => {
     const host = need(p, 'host');
     if (!/^[0-9a-f]{64}$/.test(need(p, 'key'))) {
