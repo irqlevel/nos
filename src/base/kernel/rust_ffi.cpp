@@ -797,8 +797,10 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 unsigned long kernel_frame_alloc()
 {
     auto& pt = kernel::mm::PageTable::get_instance();
-    /* alloc_page_keeping zeroes what it hands out, through the temp map, as
-       alloc_page does; it leaves the kernel its reserve (get_kernel_reserve_pages). */
+    /* alloc_page_keeping hands out a page zeroed -- one the zeroing tasks
+       cleared while it was free, if there is one (PageTable::zero_free_page),
+       else zeroed there through the temp map, as alloc_page does -- and leaves
+       the kernel its reserve (get_kernel_reserve_pages). */
     kernel::mm::Page* page = pt.alloc_page_keeping(pt.get_kernel_reserve_pages());
     return page ? page->get_phy_address() : 0;
 }

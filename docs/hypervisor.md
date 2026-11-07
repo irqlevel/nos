@@ -600,7 +600,14 @@ kernel hands out by their address and puts in no table of its own, so that
 a guest of any size costs pages and no kernel address space, and the
 guest's nested table is the only mapping they have. They are zeroed before
 the guest can see them, so that what a guest finds in its memory is what it
-was given and never what the host left there.
+was given and never what the host left there -- or another guest: a guest's
+memory, once it is gone, goes back as its pages were, and is zeroed before
+anything is handed it again. Free pages are zeroed ahead, too, while CPUs are
+idle ([Paging](paging.md#zeroed-ahead-free-pages-and-the-two-lists),
+`zerofree=`): so that what the last guest left is gone from RAM within
+seconds of its end rather than whenever the page is next handed out, and a
+guest's frames and huge blocks, taken from those known zero first
+(`alloc_page_keeping`, `alloc_huge_frame`), are not zeroed as it starts.
 
 Two rules make it the one place that decides what a guest can reach:
 
@@ -670,7 +677,7 @@ the highest first, and never so many that less than twice the kernel's
 reserve is left (`PageTable::reserve_huge_pool`, [Kernel
 parameters](kernel-parameters.md#memory)) -- and every guest's memory is
 the pool's: a block every 2 MiB (`kcore::frame::HugeFrame`, a `Run` of
-them), zeroed when it is handed out, and mapped with one entry of the level
+them), zeroed ahead or when it is handed out, and mapped with one entry of the level
 above the last -- PS in AMD's nested table, bit 7 in Intel's EPT, where the
 CPU says its walk takes them (`IA32_VMX_EPT_VPID_CAP` bit 16;
 `Caps::nested_2m`, which `hv info` reports) and 512 entries where it does

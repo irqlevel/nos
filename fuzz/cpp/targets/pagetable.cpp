@@ -26,6 +26,16 @@
 // (hugepages=), its 2MiB blocks handed out and given back: a block of it
 // never on the free list, never another's, zeroed when handed out, and the
 // pool's counts its bitmaps'.
+//
+// Free pages are zeroed ahead, as the zeroing tasks do it (zerofree=): a
+// page off the other free list onto the zeroed one, and a free block of the
+// pool a page at a time -- each page so zeroed reading as zeros, and every
+// page on the zeroed list, and every block known zero, still reading so
+// while free; every free page on exactly one of the two lists, marked iff
+// on the zeroed one, and no page that is not free marked; a guest's
+// allocation (alloc_page_keeping, alloc_huge_frame) taking a page or block
+// known zero before any other and the kernel's (alloc_page) one that is
+// not; and zerofree=verify's reading of what it takes, on for some inputs.
 #include "host.h"
 
 /* The page table and the memory map are singletons with private
@@ -221,6 +231,8 @@ struct PageState
     Kind state;
     long ref;
     bool frame;
+    /* Free, and on the zeroed list */
+    bool zeroed;
 };
 
 std::vector<PageState> pages;
@@ -241,6 +253,8 @@ std::map<ulong, std::pair<bool, bool>> prot;
 /* The pool's blocks, by their first page's address: whether the sequence
    holds each */
 std::map<ulong, bool> pool_blocks;
+/* The free ones known zero */
+std::set<ulong> pool_zeroed;
 
 const ulong RESERVED_PAGES = 8;
 const ulong HUGE_PAGES = PageTable::HUGE_FRAME_PAGES;
@@ -324,24 +338,53 @@ Pte leaf_of(ulong va)
     return none;
 }
 
-/* Everything the model says, against the machine. */
-void check(const char* after)
+/* A free list walked: each page a page, once on the two lists, marked iff
+   the list is the zeroed one. Its length. */
+ulong walk_free_list(stdlib::ListEntry* head, bool zeroed_list, std::set<ulong>& free, std::set<ulong>& zeroed,
+    const char* after)
 {
-    /* Every page on the free list is a free one, once, and the count is
-       the list's length */
     ulong on_list = 0;
-    std::set<ulong> free;
-    for (stdlib::ListEntry* e = tested_pt().free_pages_list_.flink; e != &tested_pt().free_pages_list_; e = e->flink)
+    for (stdlib::ListEntry* e = head->flink; e != head; e = e->flink)
     {
         Page* p = CONTAINING_RECORD(e, Page, list_entry);
         ulong i = static_cast<ulong>(p - machine.page_array);
-        INVARIANT(i < machine.pages, "the free list holds a page that is no page, after %s", after);
-        INVARIANT(free.insert(i).second, "page %lu twice on the free list, after %s", i, after);
+        INVARIANT(i < machine.pages, "a free list holds a page that is no page, after %s", after);
+        INVARIANT(free.insert(i).second, "page %lu twice on the free lists, after %s", i, after);
+        INVARIANT(p->is_zeroed() == zeroed_list, "page %lu on the %s list %s the mark, after %s", i,
+            zeroed_list ? "zeroed" : "other", zeroed_list ? "without" : "with", after);
+        if (zeroed_list)
+            zeroed.insert(i);
         on_list++;
-        INVARIANT(on_list <= machine.pages, "the free list loops, after %s", after);
+        INVARIANT(on_list <= machine.pages, "a free list loops, after %s", after);
     }
-    INVARIANT(tested_pt().free_pages_count_ == on_list, "free_pages_count_ %lu with %lu on the list, after %s",
-        tested_pt().free_pages_count_, on_list, after);
+    return on_list;
+}
+
+/* Pages from phys on known to be zeros, read every 509 bytes: nothing has
+   written to a free page since it was zeroed. Physical memory as it is: the
+   caller has written the window back. */
+void check_sampled_zero(ulong phys, ulong count, const char* what, const char* after)
+{
+    for (ulong b = 0; b < count * PAGE_BYTES; b += 509)
+        INVARIANT(machine.phys[phys + b] == 0, "%s at 0x%lx is not zeros at +%lu, after %s", what, phys, b, after);
+}
+
+/* Everything the model says, against the machine. */
+void check(const char* after)
+{
+    write_back_all();
+
+    /* Every page on a free list is a free one, once, on one of the two,
+       marked iff on the zeroed one; the counts are the lists' lengths */
+    std::set<ulong> free;
+    std::set<ulong> zeroed;
+    const ulong on_other = walk_free_list(&tested_pt().free_pages_list_, false, free, zeroed, after);
+    const ulong on_zeroed = walk_free_list(&tested_pt().zeroed_pages_list_, true, free, zeroed, after);
+    INVARIANT(tested_pt().free_pages_count_ == on_other + on_zeroed,
+        "free_pages_count_ %lu with %lu on the lists, after %s", tested_pt().free_pages_count_, on_other + on_zeroed,
+        after);
+    INVARIANT(tested_pt().zeroed_pages_count_ == on_zeroed, "zeroed_pages_count_ %lu with %lu on the zeroed list, after %s",
+        tested_pt().zeroed_pages_count_, on_zeroed, after);
 
     /* The pool as the model has it, in its counts and its bitmaps */
     ulong pool_free = 0;
@@ -353,10 +396,30 @@ void check(const char* after)
         INVARIANT(tested_pt().huge_pool_test(tested_pt().huge_pool_free_bits_, block) == !b.second, "block 0x%lx %s by the bitmap, after %s",
             b.first, b.second ? "free" : "held", after);
         pool_free += !b.second;
+        const bool known_zero = pool_zeroed.count(b.first) != 0;
+        INVARIANT(!known_zero || !b.second, "block 0x%lx held and known zero, after %s", b.first, after);
+        INVARIANT(tested_pt().huge_pool_test(tested_pt().huge_pool_zeroed_bits_, block) == known_zero,
+            "block 0x%lx %s by the bitmap, after %s", b.first, known_zero ? "not known zero" : "known zero", after);
+        if (known_zero)
+            check_sampled_zero(b.first, HUGE_PAGES, "a block known zero", after);
     }
     INVARIANT(tested_pt().get_huge_pool_blocks() == pool_blocks.size() && tested_pt().get_huge_pool_free() == pool_free,
         "the pool says %lu blocks, %lu free, where it has %zu, %lu free, after %s", tested_pt().get_huge_pool_blocks(),
         tested_pt().get_huge_pool_free(), pool_blocks.size(), pool_free, after);
+    INVARIANT(tested_pt().get_huge_pool_zeroed() == pool_zeroed.size(), "the pool says %lu blocks known zero, where it has %zu, after %s",
+        tested_pt().get_huge_pool_zeroed(), pool_zeroed.size(), after);
+    /* The block the zeroing is part way through: free, not known zero, and
+       the pages done of it zeros */
+    if (tested_pt().huge_zero_block_ != PageTable::NO_HUGE_BLOCK)
+    {
+        const ulong at = tested_pt().huge_zero_block_ * HUGE_BYTES;
+        auto it = pool_blocks.find(at);
+        INVARIANT(it != pool_blocks.end() && !it->second && !pool_zeroed.count(at),
+            "the zeroing is part way through block 0x%lx, no free block of the pool not known zero, after %s", at, after);
+        INVARIANT(tested_pt().huge_zero_next_ > 0 && tested_pt().huge_zero_next_ < HUGE_PAGES,
+            "the zeroing at page %lu of block 0x%lx, after %s", tested_pt().huge_zero_next_, at, after);
+        check_sampled_zero(at, tested_pt().huge_zero_next_, "the block being zeroed", after);
+    }
 
     /* Tables the walk from the root finds are pages that left the free list
        for the kernel itself: the model learns of them here */
@@ -368,6 +431,7 @@ void check(const char* after)
         if (s.state == PageState::Free)
         {
             s.state = PageState::Table;
+            s.zeroed = false;
             fuzz::reached("a table allocated on the way down");
         }
         INVARIANT(s.state == PageState::Table, "page 0x%lx is a table, and %s's too (state %d), after %s", phys,
@@ -376,13 +440,32 @@ void check(const char* after)
 
     for (ulong i = 0; i < machine.pages; i++)
     {
-        const PageState& s = pages[i];
+        PageState& s = pages[i];
         Page& p = machine.page_array[i];
         INVARIANT(p.get_phy_address() == i * PAGE_BYTES, "page %lu's descriptor says 0x%lx", i, p.get_phy_address());
         if (s.state == PageState::Free)
+        {
             INVARIANT(free.count(i), "page %lu is free and not on the free list, after %s", i, after);
+            /* A zeroed page the kernel took for a table on the way down a walk
+               and gave back -- a map that failed, a window cut short -- is on
+               the other list now, unmarked, as it should be: the model did not
+               see it go. The other way round, only zero_free_page puts a page
+               on the zeroed list, and the model sees each. */
+            if (s.zeroed && !zeroed.count(i))
+            {
+                s.zeroed = false;
+                fuzz::reached("a zeroed page through a table and back");
+            }
+            INVARIANT(zeroed.count(i) == (s.zeroed ? 1u : 0u), "page %lu is on the zeroed list, and the model never saw "
+                "it zeroed, after %s", i, after);
+            if (s.zeroed)
+                check_sampled_zero(i * PAGE_BYTES, 1, "a page on the zeroed list", after);
+        }
         else
+        {
             INVARIANT(!free.count(i), "page %lu (state %d) is on the free list, after %s", i, s.state, after);
+            INVARIANT(!p.is_zeroed(), "page %lu (state %d) carries the zeroed mark, after %s", i, s.state, after);
+        }
         if (s.state == PageState::Table)
             INVARIANT(tables.count(i * PAGE_BYTES), "table page %lu is in no table, after %s", i, after);
         INVARIANT(p.ref_count.get() == s.ref, "page %lu's reference count is %ld where the rules make it %ld, "
@@ -486,9 +569,32 @@ void check_zeroed(ulong phys, const char* by)
         INVARIANT(machine.phys[phys + b] == 0, "page 0x%lx handed out by %s is not zeroed at +%lu", phys, by, b);
 }
 
+/* The page an allocation should take: the head of the list it prefers,
+   else of the other; nullptr when both are empty */
+Page* expected_page(bool zeroed_first)
+{
+    stdlib::ListEntry* first = zeroed_first ? &tested_pt().zeroed_pages_list_ : &tested_pt().free_pages_list_;
+    stdlib::ListEntry* second = zeroed_first ? &tested_pt().free_pages_list_ : &tested_pt().zeroed_pages_list_;
+    stdlib::ListEntry* list = !first->is_empty() ? first : second;
+    return list->is_empty() ? nullptr : CONTAINING_RECORD(list->flink, Page, list_entry);
+}
+
+/* A page an allocation took, as the model has it: held, and whether it was
+   one known zero */
+void took(ulong phys, const char* by)
+{
+    PageState& s = pages[index(phys)];
+    INVARIANT(s.state == PageState::Free, "%s handed out page 0x%lx, which is not free (state %d)", by, phys, s.state);
+    s.state = PageState::Held;
+    s.zeroed = false;
+    check_zeroed(phys, by);
+}
+
 void alloc(fuzz::Input& in)
 {
     (void)in;
+    Page* want = expected_page(false);
+    const bool want_zeroed = want != nullptr && pages[static_cast<ulong>(want - machine.page_array)].zeroed;
     Page* p = tested_pt().alloc_page();
     if (p == nullptr)
     {
@@ -496,12 +602,106 @@ void alloc(fuzz::Input& in)
         fuzz::reached("memory exhausted");
         return;
     }
-    ulong phys = p->get_phy_address();
-    PageState& s = pages[index(phys)];
-    INVARIANT(s.state == PageState::Free, "alloc_page handed out page 0x%lx, which is not free (state %d)", phys,
-        s.state);
-    s.state = PageState::Held;
-    check_zeroed(phys, "alloc_page");
+    INVARIANT(p == want, "alloc_page took page 0x%lx, not the head of the list it prefers", p->get_phy_address());
+    took(p->get_phy_address(), "alloc_page");
+    fuzz::reached(want_zeroed ? "alloc_page took a zeroed page" : "alloc_page took one to zero");
+}
+
+/* A guest's allocation: a page known zero first, and none once `keep` or
+   fewer are free */
+void alloc_keeping(fuzz::Input& in)
+{
+    const ulong free_now = tested_pt().free_pages_count_;
+    const ulong keep = in.chance(8) ? free_now : in.below(free_now + 1);
+    Page* want = expected_page(true);
+    const bool want_zeroed = want != nullptr && pages[static_cast<ulong>(want - machine.page_array)].zeroed;
+    Page* p = tested_pt().alloc_page_keeping(keep);
+    if (free_now <= keep)
+    {
+        INVARIANT(p == nullptr, "alloc_page_keeping(%lu) took a page with %lu free", keep, free_now);
+        fuzz::reached("alloc_page_keeping kept its pages");
+        return;
+    }
+    INVARIANT(p != nullptr && p == want, "alloc_page_keeping(%lu) with %lu free took %s, not the head of the list it "
+        "prefers", keep, free_now, p == nullptr ? "nothing" : "another page");
+    took(p->get_phy_address(), "alloc_page_keeping");
+    fuzz::reached(want_zeroed ? "alloc_page_keeping took a zeroed page" : "alloc_page_keeping took one to zero");
+}
+
+/* The zeroing tasks' work, a step or a run of them: a page off the other
+   list's cold end onto the zeroed list, while more than `keep` are free;
+   and a page of a free block of the pool not known zero, a block known zero
+   once all its pages are */
+void zero_step(fuzz::Input& in)
+{
+    /* The pool's zeroing now and then with no pool: nothing to do */
+    const bool huge = pool_blocks.empty() ? in.chance(16) : in.boolean();
+    /* Now and then a block's worth and more, for the pool's oftener: what
+       makes a block known zero, and an allocation that takes one */
+    const ulong steps = in.chance(huge ? 96 : 8) ? HUGE_PAGES + in.below(64) : 1 + in.below(16);
+    const ulong free_now = tested_pt().free_pages_count_;
+    const ulong keep = in.chance(8) ? free_now : in.below(free_now + 1);
+    for (ulong n = 0; n < steps; n++)
+    {
+        if (!huge)
+        {
+            stdlib::ListEntry* other = &tested_pt().free_pages_list_;
+            Page* tail = other->is_empty() ? nullptr : CONTAINING_RECORD(other->blink, Page, list_entry);
+            const bool want = tested_pt().free_pages_count_ > keep && tail != nullptr;
+            const bool did = tested_pt().zero_free_page(keep);
+            INVARIANT(did == want, "zero_free_page(%lu) with %lu free %s", keep, tested_pt().free_pages_count_,
+                did ? "zeroed a page" : "zeroed none");
+            if (!did)
+                break;
+            Page* head = CONTAINING_RECORD(tested_pt().zeroed_pages_list_.flink, Page, list_entry);
+            INVARIANT(head == tail, "zero_free_page put another page than the other list's tail on the zeroed list");
+            const ulong i = static_cast<ulong>(head - machine.page_array);
+            INVARIANT(pages[i].state == PageState::Free && !pages[i].zeroed, "zero_free_page zeroed page %lu (state %d, "
+                "%s)", i, pages[i].state, pages[i].zeroed ? "zeroed" : "not");
+            pages[i].zeroed = true;
+            check_zeroed(i * PAGE_BYTES, "zero_free_page");
+            fuzz::reached("a free page zeroed");
+            continue;
+        }
+
+        const ulong block_before = tested_pt().huge_zero_block_;
+        const ulong next_before = tested_pt().huge_zero_next_;
+        bool any = false;
+        for (const auto& b : pool_blocks)
+            any = any || (!b.second && !pool_zeroed.count(b.first));
+        const bool did = tested_pt().zero_free_huge_page();
+        INVARIANT(did == any, "zero_free_huge_page %s with %s", did ? "zeroed a page" : "zeroed none",
+            any ? "a free block not known zero" : "none");
+        if (!did)
+            break;
+        ulong block = block_before;
+        ulong page = next_before;
+        if (block_before == PageTable::NO_HUGE_BLOCK)
+        {
+            block = tested_pt().huge_zero_block_;
+            page = 0;
+            INVARIANT(block != PageTable::NO_HUGE_BLOCK && tested_pt().huge_zero_next_ == 1,
+                "zero_free_huge_page started a block and is not at its second page");
+            auto it = pool_blocks.find(block * HUGE_BYTES);
+            INVARIANT(it != pool_blocks.end() && !it->second && !pool_zeroed.count(block * HUGE_BYTES),
+                "zero_free_huge_page started on block %lu, no free block not known zero", block);
+        }
+        check_zeroed(block * HUGE_BYTES + page * PAGE_BYTES, "zero_free_huge_page");
+        if (page + 1 == HUGE_PAGES)
+        {
+            INVARIANT(tested_pt().huge_zero_block_ == PageTable::NO_HUGE_BLOCK, "a block's last page zeroed, and the "
+                "zeroing still on it");
+            pool_zeroed.insert(block * HUGE_BYTES);
+            check_sampled_zero(block * HUGE_BYTES, HUGE_PAGES, "a block just zeroed", "zero_free_huge_page");
+            fuzz::reached("a block of the pool zeroed");
+        }
+        else
+        {
+            INVARIANT(tested_pt().huge_zero_block_ == block && tested_pt().huge_zero_next_ == page + 1,
+                "the zeroing went from block %lu page %lu to block %lu page %lu", block, page,
+                tested_pt().huge_zero_block_, tested_pt().huge_zero_next_);
+        }
+    }
 }
 
 void alloc_run(fuzz::Input& in)
@@ -519,10 +719,9 @@ void alloc_run(fuzz::Input& in)
     {
         ulong phys = base + i * PAGE_BYTES;
         INVARIANT(in_ram(phys) && &first[i] == page_of(phys), "run page %lu is no page", i);
-        PageState& s = pages[index(phys)];
-        INVARIANT(s.state == PageState::Free, "alloc_contiguous_pages handed out page 0x%lx, not free", phys);
-        s.state = PageState::Held;
-        check_zeroed(phys, "alloc_contiguous_pages");
+        if (pages[index(phys)].zeroed)
+            fuzz::reached("a run with a zeroed page in it");
+        took(phys, "alloc_contiguous_pages");
     }
     fuzz::reached("a contiguous run");
 }
@@ -537,6 +736,7 @@ void exhaust(fuzz::Input& in)
         Page* p = tested_pt().alloc_page();
         INVARIANT(p != nullptr, "alloc_page failed with %lu pages free", tested_pt().free_pages_count_);
         pages[index(p->get_phy_address())].state = PageState::Held;
+        pages[index(p->get_phy_address())].zeroed = false;
     }
     fuzz::reached("memory taken to its last pages");
 }
@@ -557,6 +757,7 @@ void free_one(fuzz::Input& in)
         tested_pt().free_page(page_of(phys));
     }
     s.state = PageState::Free;
+    s.zeroed = false;
 }
 
 void map(fuzz::Input& in)
@@ -887,6 +1088,7 @@ void reserve_pool(fuzz::Input& in)
             INVARIANT(pages[i].state == PageState::Free, "page %lu reserved for the pool, and not free (state %d)", i,
                 pages[i].state);
             pages[i].state = PageState::Pool;
+            pages[i].zeroed = false;
         }
         pool_blocks[block * HUGE_BYTES] = false;
     }
@@ -997,6 +1199,7 @@ void alloc_huge(fuzz::Input& in)
     ulong pool_free = 0;
     for (const auto& b : pool_blocks)
         pool_free += !b.second;
+    const ulong zeroing = tested_pt().huge_zero_block_;
     const ulong phys = tested_pt().alloc_huge_frame();
     if (phys == 0)
     {
@@ -1006,6 +1209,19 @@ void alloc_huge(fuzz::Input& in)
     auto it = pool_blocks.find(phys);
     INVARIANT(it != pool_blocks.end() && !it->second, "alloc_huge_frame handed out 0x%lx, no free block of the pool",
         phys);
+    /* A block known zero first */
+    INVARIANT(pool_zeroed.empty() || pool_zeroed.count(phys), "alloc_huge_frame handed out 0x%lx with %zu blocks known "
+        "zero, and it none of them", phys, pool_zeroed.size());
+    fuzz::reached(pool_zeroed.count(phys) ? "a huge frame known zero" : "a huge frame to zero");
+    pool_zeroed.erase(phys);
+    /* The block the zeroing was part way through is the new owner's, and the
+       zeroing goes on with another */
+    if (zeroing == phys / HUGE_BYTES)
+    {
+        INVARIANT(tested_pt().huge_zero_block_ == PageTable::NO_HUGE_BLOCK, "block 0x%lx handed out part way through "
+            "its zeroing, and the zeroing still on it", phys);
+        fuzz::reached("a huge frame taken from under the zeroing");
+    }
     it->second = true;
     for (ulong i = 0; i < HUGE_PAGES; i++)
     {
@@ -1072,7 +1288,9 @@ void boot(fuzz::Input& in)
     pt.total_pages_count_ = machine.pages;
     pt.tmp_map_start_ = reinterpret_cast<ulong>(machine.window);
     pt.tmp_map_l1_page_ = machine.window_l1;
-    pages.assign(machine.pages, {PageState::Machine, 1, false});
+    pages.assign(machine.pages, {PageState::Machine, 1, false, false});
+    /* zerofree=verify: what an allocation takes as known zero, read */
+    pt.set_zero_check(in.chance(4));
     /* What drain_early_free_list leaves: every usable page on the list, at
        reference count 1 */
     for (ulong i = machine.pages; i-- > RESERVED_PAGES;)
@@ -1110,9 +1328,13 @@ void run(fuzz::Input& in)
         switch (in.u8() % 16)
         {
         case 0:
-        case 1:
-        case 2:
             alloc(in);
+            break;
+        case 1:
+            alloc_keeping(in);
+            break;
+        case 2:
+            zero_step(in);
             break;
         case 3:
             alloc_run(in);
@@ -1176,6 +1398,7 @@ void reset()
     mmio.clear();
     prot.clear();
     pool_blocks.clear();
+    pool_zeroed.clear();
     pages.clear();
     if (machine.window != nullptr)
     {
