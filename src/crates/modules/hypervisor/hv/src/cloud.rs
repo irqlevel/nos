@@ -115,7 +115,9 @@ pub struct Recipe<'a> {
     pub size: Option<u64>,
     /// A device of nos's the image is poured onto (`image::pour`) in place
     /// of a disk in the folder: its id or name (`devices::given`) -- given
-    /// over what is on it, or another VM's, with `force`.
+    /// over what is on it, or another VM's, with `force` -- or a volume of
+    /// NBS's (`nbs:<volume>`, `image::pour_volume`), taken from a writer
+    /// elsewhere with `force`.
     pub onto: Option<&'a str>,
     pub force: bool,
     pub password: Option<&'a str>,
@@ -214,8 +216,9 @@ fn own_words<'a>(words: &'a str) -> Result<(Own<'a>, String), String> {
         } else if let Some(v) = word.strip_prefix("hvboot=") {
             own.hvboot = v;
         } else if let Some(v) = word.strip_prefix("onto=") {
-            if v.is_empty() {
-                return Err(String::from("onto= wants a device of nos's: dev:<name>, part:<id> or disk:<id>"));
+            if v.is_empty() || v == "nbs:" {
+                return Err(String::from("onto= wants a device of nos's -- dev:<name>, part:<id> or disk:<id> -- or a \
+                                         volume of NBS's, nbs:<volume>"));
             }
             own.onto = Some(v);
         } else {
@@ -343,23 +346,34 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     o.restart = true;
     o.uuid = o.uuid.or_else(|| Some(crate::guest::random_uuid()));
     /* Its first disk: a file in its folder -- or the device the image is
-     * poured onto, by its id, where it may be given. */
+     * poured onto, by its id, where it may be given -- or the volume. */
     let onto = match recipe.onto {
         Some(word) => {
             if recipe.size.is_some() {
-                return Err(String::from("size= is a file's: a device's disk is the device's size"));
+                return Err(String::from("size= is a file's: a device's disk is the device's size, a volume's the \
+                                         volume's"));
             }
-            let (disk, id) = crate::devices::given(word)?;
-            crate::devices::check(root, name, &disk, recipe.force)?;
-            Some((disk, id))
+            match crate::devices::source(word) {
+                crate::devices::Source::Volume(v) => Some((Onto::Volume(v), String::from(word))),
+                _ => {
+                    let (disk, id) = crate::devices::given(word)?;
+                    crate::devices::check(root, name, &disk, recipe.force)?;
+                    Some((Onto::Device(disk), id))
+                }
+            }
         }
         None => None,
     };
     let mut theirs = core::mem::take(&mut o.disks);
     store::give_devices(root, name, &mut theirs, recipe.force)?;
-    if let Some((disk, _)) = &onto {
+    if let Some((Onto::Device(disk), _)) = &onto {
         if theirs.iter().any(|(w, _)| crate::devices::find(w).is_ok_and(|d| d.overlaps(disk))) {
             return Err(String::from("onto= is one of its disk= too, or overlaps one"));
+        }
+    }
+    if let Some((Onto::Volume(v), _)) = &onto {
+        if theirs.iter().any(|(w, _)| crate::devices::source(w) == crate::devices::Source::Volume(v)) {
+            return Err(String::from("onto= is one of its disk= too"));
         }
     }
     o.disks.push((onto.as_ref().map_or_else(|| String::from(DISK), |(_, id)| id.clone()), false));
@@ -397,10 +411,17 @@ pub fn create(root: &str, vms: &Vms, name: &str, recipe: &Recipe, mut o: Options
     Ok(created)
 }
 
+/// Where the image's disk is poured, in place of a file in the folder.
+enum Onto<'a> {
+    Device(kcore::block::Disk),
+    /// A volume of NBS's, by its name.
+    Volume(&'a str),
+}
+
 /// The folder's files, each kept in `made` as it is: the image, the disk
-/// made of it -- or poured onto the device `onto` -- the user-data and the
-/// seed, and last the vm.toml.
-fn fill(folder: &Folder, recipe: &Recipe, onto: Option<kcore::block::Disk>, text: &str, file: &str, made: &mut Made,
+/// made of it -- or poured onto the device or the volume `onto` -- the
+/// user-data and the seed, and last the vm.toml.
+fn fill(folder: &Folder, recipe: &Recipe, onto: Option<Onto<'_>>, text: &str, file: &str, made: &mut Made,
         work: &mut dyn Work) -> Result<Created, String> {
     let join = |f: &str| store::join(&folder.path, f).ok_or_else(|| String::from("out of memory"));
     let url = recipe.url;
@@ -444,11 +465,19 @@ fn fill(folder: &Folder, recipe: &Recipe, onto: Option<kcore::block::Disk>, text
     /* Onto a device: poured, the download taken away after. What a pour
      * that fails leaves on the device is the device's -- said. */
     let poured = match onto {
-        Some(disk) => {
+        Some(Onto::Device(disk)) => {
             let device = disk.name();
             let holder = alloc::format!("hv create {}", folder.name);
             let poured = image::pour(&download, disk, &holder, work)
                 .map_err(|e| alloc::format!("{} -- {} holds part of the image now", e, device))?;
+            if kcore::fs::remove(&download).is_ok() {
+                made.files.retain(|f| *f != download);
+            }
+            Some(poured.size + poured.rest)
+        }
+        Some(Onto::Volume(v)) => {
+            let poured = image::pour_volume(&download, v, recipe.force, work)
+                .map_err(|e| alloc::format!("{} -- nbs:{} holds part of the image now", e, v))?;
             if kcore::fs::remove(&download).is_ok() {
                 made.files.retain(|f| *f != download);
             }

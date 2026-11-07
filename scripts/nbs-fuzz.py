@@ -32,11 +32,15 @@ fence and open mark answered, every chunk closed reading what it held, every
 sector a value it may have, no record lost; a disk with something else on it
 never taken for blank. NBS's messages, the `wire` target (nbswire): every
 message read back as itself, and spoiled bytes read as none or as a message
-that encodes to them.
+that encodes to them. NBS end to end, the `cluster` target (nbsclient, N8):
+the client's session through six hosts' cs's and mds, hosts that crash and
+writers taken over, held to every write done on every replica in, every
+read, what a crash may leave, the fences, and the replicas alike.
 
     python3 scripts/nbs-fuzz.py                              # the gate: every target
     python3 scripts/nbs-fuzz.py --seconds 600                # a meta campaign from seed 1
     python3 scripts/nbs-fuzz.py --target cs --seconds 600    # a cs campaign
+    python3 scripts/nbs-fuzz.py --target cluster --seconds 600   # the client's
     python3 scripts/nbs-fuzz.py --mutants                    # and fuzz/nbs/mutants.py
 
 fuzz/nbs/mutants.py takes one rule at a time out of the crate and must see the
@@ -59,7 +63,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--seed", type=int, default=1, help="the campaign's first seed (1)")
     p.add_argument("--seconds", type=int, help="a campaign this long, instead of the gate")
-    p.add_argument("--target", choices=["meta", "cs", "wire"], default="meta", help="the campaign's target (meta)")
+    p.add_argument("--target", choices=["meta", "cs", "wire", "cluster"], default="meta",
+                   help="the campaign's target (meta)")
     p.add_argument("--mutants", action="store_true", help="the mutants too, after the gate")
     args = p.parse_args()
 

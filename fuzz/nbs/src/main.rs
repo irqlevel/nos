@@ -3,19 +3,21 @@
 //!     nbs-fuzz gate
 //!
 //! everything the gate holds: the meta target over seeds 1 to 300, the cs
-//! target over 1 to 200 and the wire target over 1 to 100, every allocation
+//! target over 1 to 200, the wire target over 1 to 100 and the cluster
+//! target over 1 to 100, every allocation
 //! held to what the kernel's heap
 //! gives at once (fuzz/raft's `heap`). Exit 0 when everything held, 1 with
 //! what did not -- a finding with its seed, to run again with
 //! `<target> --seed N --trace`.
 //!
-//!     nbs-fuzz meta|cs|wire [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
+//!     nbs-fuzz meta|cs|wire|cluster [--seed N] [--seeds K] [--steps S] [--seconds T] [--trace]
 //!
 //! one target; with `--seconds`, seeds on from the first until the time is
 //! up -- a campaign.
 
 #[path = "../../raft/src/heap.rs"]
 mod heap;
+mod cluster;
 mod cs;
 mod meta;
 mod wire;
@@ -37,6 +39,8 @@ const GATE_CS_SEEDS: u64 = 200;
 const CS_STEPS: u64 = 300;
 const GATE_WIRE_SEEDS: u64 = 100;
 const WIRE_STEPS: u64 = 500;
+const GATE_CLUSTER_SEEDS: u64 = 100;
+const CLUSTER_STEPS: u64 = 2000;
 
 /// A run's outcome, a panic included as a finding, and a block asked for
 /// that the kernel's heap would not give.
@@ -104,12 +108,14 @@ fn main() -> ExitCode {
             target("meta", meta::run, 1, GATE_META_SEEDS, META_STEPS, None, false)
                 + target("cs", cs::run, 1, GATE_CS_SEEDS, CS_STEPS, None, false)
                 + target("wire", wire::run, 1, GATE_WIRE_SEEDS, WIRE_STEPS, None, false)
+                + target("cluster", cluster::run, 1, GATE_CLUSTER_SEEDS, CLUSTER_STEPS, None, false)
         }
         Some("meta") => one("meta", meta::run, META_STEPS),
         Some("cs") => one("cs", cs::run, CS_STEPS),
         Some("wire") => one("wire", wire::run, WIRE_STEPS),
+        Some("cluster") => one("cluster", cluster::run, CLUSTER_STEPS),
         Some(other) => {
-            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire", other);
+            eprintln!("nbs-fuzz: no target {} -- gate, meta, cs, wire, cluster", other);
             return ExitCode::from(2);
         }
     };

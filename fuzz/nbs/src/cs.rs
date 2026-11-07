@@ -37,7 +37,7 @@ enum Op {
 }
 
 /// A disk: what is durable, and the writes since the last flush.
-struct Disk {
+pub(crate) struct Disk {
     sector: u64,
     bytes: u64,
     /// Where the cs's own ends -- its superblock, fences and table -- and
@@ -63,7 +63,7 @@ struct Disk {
 }
 
 impl Disk {
-    fn new(sector: u64, bytes: u64) -> Disk {
+    pub(crate) fn new(sector: u64, bytes: u64) -> Disk {
         let l = nbscs::layout(bytes);
         let own_end = l.map_or(bytes, |l| l.data);
         let table = l.map_or((0, 0), |l| (l.table[0], l.table[1] - l.table[0]));
@@ -138,7 +138,7 @@ impl Disk {
         }
     }
 
-    fn cut(&mut self, r: &mut Rng) {
+    pub(crate) fn cut(&mut self, r: &mut Rng) {
         self.fuse = None;
         self.dead = false;
         let pending = std::mem::take(&mut self.pending);
@@ -216,7 +216,7 @@ impl Disk {
 }
 
 /// The engine's handle on a disk the fuzzer keeps too.
-struct Handle(Rc<RefCell<Disk>>);
+pub(crate) struct Handle(pub(crate) Rc<RefCell<Disk>>);
 
 impl Device for Handle {
     fn bytes(&self) -> u64 {
